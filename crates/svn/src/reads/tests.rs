@@ -16,6 +16,12 @@ use std::collections::BTreeMap;
 /// A transaction name of the form §4.17.4 item 3.1 gives.
 const TRANSACTION: &str = "0-1z";
 
+/// The recorded repository's UUID (`make-fixtures.py` `UUID`).
+const UUID: &str = "00000000-0000-4000-8000-00000000a613";
+
+/// The recorded repository's URL (`make-fixtures.py` `URL`): a session's base is the path past it.
+const URL: &str = "svn://127.0.0.1:36913/repo";
+
 /// The recorder's record of the repository the transcripts were made against.
 const REPOSITORY: &str = include_str!("../../fixtures/reads/repository.txt");
 
@@ -294,11 +300,7 @@ fn items(bytes: &[u8]) -> Vec<Value<'_>> {
 fn normalized(value: &Value<'_>) -> String {
   match value {
     Value::List(items) => {
-      let pairs = !items.is_empty()
-        && items.iter().all(|item| {
-          matches!(item, Value::List(pair) if pair.len() == 2
-            && matches!((&pair[0], &pair[1]), (Value::String(_), Value::String(_))))
-        });
+      let pairs = !items.is_empty() && items.iter().all(|item| matches!(item, Value::List(_)));
       let mut written: Vec<String> = items.iter().map(normalized).collect();
       if pairs {
         written.sort();
@@ -314,7 +316,7 @@ fn normalized(value: &Value<'_>) -> String {
 }
 
 /// The commands whose answers hold property lists, compared as sets.
-const PROPERTY_LISTS: [&str; 2] = ["rev-proplist", "get-iprops"];
+const PROPERTY_LISTS: [&str; 4] = ["rev-proplist", "get-iprops", "get-dir", "get-locations"];
 
 /// Replays a recorded session through the handler: each client command after the handshake answered, each answer
 /// `svnserve`'s, the commands in `elsewhere` (another piece's) skipped with their two items, a malformed command ending
@@ -322,20 +324,18 @@ const PROPERTY_LISTS: [&str; 2] = ["rev-proplist", "get-iprops"];
 fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize {
   let fixture = Fixture::new();
   let answers = items(server);
+  let commands = items(client);
+  let base = session_base(&commands[0]);
+  let session = Session {
+    base: &base,
+    uuid: UUID,
+  };
   let mut at = 4;
   let mut answered = 0;
-  for command in items(client).iter().skip(2) {
+  for command in commands.iter().skip(2) {
     let word = command_word(name, command);
     let mut out = Vec::new();
-    match answer(
-      &fixture.index,
-      &fixture.green,
-      &Session { base: "/" },
-      command,
-      &mut out,
-    )
-    .unwrap()
-    {
+    match answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap() {
       Outcome::Answered => {
         at = same_answer(name, word, &items(&out), &answers, at);
         answered += 1;
@@ -356,6 +356,22 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
     "{name}: svnserve answered more than was replayed"
   );
   answered
+}
+
+/// The session's base: the path of the client's URL past the repository's (its greeting's third item).
+fn session_base(greeting: &Value<'_>) -> String {
+  let Value::List(parts) = greeting else {
+    panic!("a greeting that is no list");
+  };
+  let Some(Value::String(url)) = parts.get(2) else {
+    panic!("a greeting without its URL");
+  };
+  let path = std::str::from_utf8(url).unwrap().strip_prefix(URL).unwrap();
+  if path.is_empty() {
+    "/".to_owned()
+  } else {
+    path.to_owned()
+  }
 }
 
 /// A client command's word.
@@ -381,8 +397,8 @@ fn same_answer(
   let theirs = &answers[at..at + mine.len()];
   let (mine, theirs): (Vec<String>, Vec<String>) = if PROPERTY_LISTS.contains(&word) {
     (
-      mine.iter().map(normalized).collect(),
-      theirs.iter().map(normalized).collect(),
+      sorted(mine.iter().map(normalized).collect()),
+      sorted(theirs.iter().map(normalized).collect()),
     )
   } else {
     (
@@ -392,6 +408,12 @@ fn same_answer(
   };
   assert_eq!(mine, theirs, "{name}: {word}");
   at + mine.len()
+}
+
+/// Items in byte order of their written form: an answer `svnserve` writes in hash order, compared as a set.
+fn sorted(mut written: Vec<String>) -> Vec<String> {
+  written.sort();
+  written
 }
 
 /// A malformed command: `svnserve` wrote nothing after it; answers the commands answered before it.
@@ -430,6 +452,9 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("stat"), 7),
     (transcript!("get-mergeinfo"), 9),
     (transcript!("get-iprops"), 6),
+    (transcript!("get-dir"), 7),
+    (transcript!("get-locations"), 8),
+    (transcript!("hostile-locations"), 0),
     (transcript!("unknown-command"), 2),
     (transcript!("hostile-malformed"), 0),
   ];
@@ -447,6 +472,8 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("svn-info-dated"), 4),
     (transcript!("svn-revprop-get"), 1),
     (transcript!("svn-revprop-list"), 1),
+    (transcript!("svn-info-file"), 5),
+    (transcript!("svn-proplist-inherited"), 4),
   ];
   for ((name, client, server), commands) in sessions {
     assert_eq!(
@@ -463,6 +490,11 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "get-dir",
+    "get-locations",
+    "hostile-locations",
+    "svn-info-file",
+    "svn-proplist-inherited",
     "latest-and-dated",
     "revision-properties",
     "check-path",
@@ -497,7 +529,10 @@ fn answered(command: &[u8]) -> (Outcome, Vec<u8>) {
   let outcome = answer(
     &fixture.index,
     &fixture.green,
-    &Session { base: "/" },
+    &Session {
+      base: "/",
+      uuid: UUID,
+    },
     &value,
     &mut out,
   )
@@ -678,7 +713,7 @@ proptest! {
     };
     let fixture = Fixture::new();
     let mut out = Vec::new();
-    let outcome = answer(&fixture.index, &fixture.green, &Session { base: "/" }, &value, &mut out)
+    let outcome = answer(&fixture.index, &fixture.green, &Session { base: "/", uuid: UUID }, &value, &mut out)
       .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
     match outcome {
       Outcome::Close | Outcome::Elsewhere => prop_assert!(out.is_empty()),

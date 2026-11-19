@@ -1,0 +1,22 @@
+data/FOO.i
+data/foo.i
+data/directory.one/seventh.directory/third.directory/fourth.dir./fifth.directory/sixth.directory/eighth.directory/ninth.directory/deep-file-name.txt.i
+data/.leading.i
+data/con.i
+data/Capital_Under.txt.i
+data/x.i.hg/inside.txt.i
+data/colon:quest?star*.txt.i
+data/trailing .i
+data/com1.i
+data/plain.txt.i
+data/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt.i
+data/ space.i
+data/z.hg.hg/inside.txt.i
+data/quote"lt<gt>pipe|back\slash.txt.i
+data/tilde~é.txt.i
+data/prn.d.i
+data/y.d.hg/inside.txt.i
+data/trailing..i
+data/UPPER_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ.txt.i
+data/lpt9.x.i
+data/aux.txt.i
