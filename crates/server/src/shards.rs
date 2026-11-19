@@ -42,8 +42,9 @@
 //! - its backend's tables for a snapshot of the VM, and their restore (Shards' D176 part 5; A-303). A SAVE, sent while
 //!   the device is paused and so between requests, is held while the guest's stores through its maps reach the volume,
 //!   then answered with the tables of the child module `tables`: a snapshot of the volume at the cut, taken for the
-//!   stream's own principal and made durable first, the inodes the guest holds with their references and opens, its
-//!   scope and its owner view. A RESTORE is taken only as a fresh stream's first frame, and only onto the volume saved,
+//!   stream's own principal and made durable first (published, and on a live-shipped volume held at its candidates as a
+//!   guest's `fsync` is, A-516), the inodes the guest holds with their references and opens, its scope and its owner
+//!   view. A RESTORE is taken only as a fresh stream's first frame, and only onto the volume saved,
 //!   unchanged since the cut, or a clone of the cut's snapshot, presenting the same directory: the stream's attachment
 //!   is then given what the saved one held, its owner view too. Anything else is refused in the form Shards reads, a
 //!   control answer with its reason, and changes nothing.
@@ -349,9 +350,10 @@ pub(crate) struct ShardsStream {
   /// What the owed reply waits for before it is sent: every FUSE mount of the volume told through the newest record its
   /// request made (AC-3.3, A-196). Shards' VMM asks one request at a time, so nothing else waits behind it.
   told: Option<crate::told::Owed>,
-  /// The owed reply is an `FSYNC` whose barrier published a live-shipped volume not yet durable there (A-200): it is
-  /// sent once the volume's log is durable at this position, and replaced by `EIO` (to request `unique`) if it is not
-  /// within the liveness budget, since a guest's `fsync` must not claim what no candidate holds.
+  /// The owed reply is an `FSYNC` whose barrier published a live-shipped volume not yet durable there (A-200), or a
+  /// SAVE's tables naming a snapshot whose publication did (A-516): it is sent once the volume's log is durable at this
+  /// position, and replaced (by `EIO`, or by the SAVE's refusal) if it is not within the liveness budget, since neither
+  /// may claim what no candidate holds.
   durable: Option<DurableOwed>,
   /// How the guest is shown the volume's owners (A-281): the identity until its root names the run's owner with
   /// Shards' owner word, then a swap of the root's owner then and the run's. Kept for the stream's life; a restart ends
@@ -459,12 +461,23 @@ impl ShardsStream {
   }
 }
 
-/// What an owed `FSYNC` reply waits for on a live-shipped volume (A-200): the log position its barrier published, and
-/// the request it answers.
+/// What an owed reply waits for on a live-shipped volume: the log position its publication put the volume at, and what
+/// the reply becomes if the log is not durable there within the bound (A-200, A-516).
 #[derive(Clone, Copy, Debug)]
 struct DurableOwed {
   target: u64,
-  unique: u64,
+  undurable: Undurable,
+}
+
+/// What a reply held for its volume's durability becomes when the log is not durable where it waits: the answer must not
+/// claim what no candidate holds.
+#[derive(Clone, Copy, Debug)]
+enum Undurable {
+  /// A guest's `FSYNC` (A-200): `EIO` to the request `unique`.
+  Errno { unique: u64 },
+  /// A SAVE (A-516): refused with its reason, so the VM's snapshot never names a slates snapshot that the owner's loss
+  /// would take with it.
+  Save,
 }
 
 impl std::fmt::Debug for ShardsStream {
@@ -1711,8 +1724,9 @@ fn durable_owed(stream: &mut ShardsStream) -> Option<u64> {
   stream.durable.map(|owed| owed.target)
 }
 
-/// Settles the owed `FSYNC` of stream `attachment` once its wait for durability is over: sent as it is when the log
-/// became durable at its position, replaced by `EIO` when it did not (counted).
+/// Settles the reply stream `attachment` held for its volume's durability once the wait is over: sent as it is when the
+/// log became durable at its position; when it did not, an `FSYNC`'s replaced by `EIO` and a SAVE's tables by its
+/// refusal (A-516). Each counted.
 fn settle_durable(s: &mut ShardState, attachment: u64, durable: bool) {
   let Some(stream) = s.shards_streams.get_mut(&attachment) else {
     return;
@@ -1720,10 +1734,21 @@ fn settle_durable(s: &mut ShardState, attachment: u64, durable: bool) {
   let Some(owed) = stream.durable.take() else {
     return;
   };
-  if !durable {
-    stream.owed = refuse(owed.unique, EIO, &mut stream.outbound);
-    stream.sent = 0;
-    s.count(LIVE_FSYNC_REFUSED, 1);
+  let counted = match (owed.undurable, durable) {
+    (Undurable::Errno { .. }, true) => None,
+    (Undurable::Errno { unique }, false) => {
+      stream.owed = refuse(unique, EIO, &mut stream.outbound);
+      stream.sent = 0;
+      Some(LIVE_FSYNC_REFUSED)
+    }
+    (Undurable::Save, true) => Some(SAVED),
+    (Undurable::Save, false) => {
+      owe(stream, &control_refusal(SAVE_UNDURABLE));
+      Some(SAVE_REFUSED)
+    }
+  };
+  if let Some(counter) = counted {
+    s.count(counter, 1);
   }
 }
 
@@ -1891,17 +1916,29 @@ fn held_save(stream: &ShardsStream, total: usize) -> bool {
 
 /// Answers a SAVE (A-303; Shards' D176 part 5) with the stream's tables, owed as its reply, or a refusal with its
 /// reason. The guest's stores through its maps reached the volume first, unless `stores_refused`: then the cut would
-/// lack them, and the SAVE is refused.
+/// lack them, and the SAVE is refused. On a live-shipped volume the tables wait until its log is durable where the
+/// save's publication put it, as a guest's `FSYNC` waits (A-516; [`settle_durable`]): the VM's snapshot names the
+/// slates snapshot, which must outlive the owner's loss as it outlives the daemon's restart.
 fn answer_save(s: &mut ShardState, stream: &mut ShardsStream, stores_refused: bool) {
   let saved = if stores_refused {
     Err(SAVE_STORES_REFUSED)
   } else {
     save(s, stream).and_then(|tables| control_answer(&tables).ok_or(SAVE_TOO_LONG))
   };
+  stream.durable = None;
   match saved {
     Ok(answer) => {
-      s.count(SAVED, 1);
       owe(stream, &answer);
+      match crate::live_ship::durable_target(s, stream.volume) {
+        Some(target) => {
+          stream.durable = Some(DurableOwed {
+            target,
+            undurable: Undurable::Save,
+          });
+          s.count(SAVE_HELD, 1);
+        }
+        None => s.count(SAVED, 1),
+      }
     }
     Err(reason) => {
       s.count(SAVE_REFUSED, 1);
@@ -2289,7 +2326,9 @@ fn serve_request(
   {
     stream.durable = Some(DurableOwed {
       target,
-      unique: answered.unique,
+      undurable: Undurable::Errno {
+        unique: answered.unique,
+      },
     });
     s.count(LIVE_FSYNC_HELD, 1);
     // A held `fsync` claims nothing until its log is durable: resent, it is served again, as FUSE's is.
