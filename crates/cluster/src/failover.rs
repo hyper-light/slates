@@ -40,10 +40,13 @@
 //!   reader tells a prior from a measurement.
 //!
 //! **Laptop.** With `f = 0` there is no peer to detect it and no council to confirm, so `E` is absent, and `D` is the one
-//! detector it has: its anchor's supervision, which ends a stuck daemon after the watchdog's window and starts it again
-//! (A-232), so `D` is that window ([`Failover::supervised`], A-405). `F` is then the window and the recovery: the same
-//! derivation at its degenerate inputs (R8), never a branch; a node whose peers' detector has run a period takes that
-//! detector's term instead.
+//! detector it has: its anchor's supervision (A-232, A-405). Its watchdog finds a stuck shard once the window it judges
+//! that shard by has passed since the shard last moved, and withholds the beat; its anchor kills the daemon once that
+//! beat is its lapse bound old, and starts it again. So `D` is the watchdog's widest window over the daemon's shards
+//! (A-455) and then the anchor's lapse bound (A-467), both what this deployment measures of its own lateness, read at
+//! every beat ([`supervision`], [`Failover::supervise`], A-574), never the bare liveness window. `F` is then that and
+//! the recovery: the same derivation at its degenerate inputs (R8), never a branch. Every node reads its supervision the
+//! same way; one whose peers' detector has run a period takes that detector's term in its place.
 //!
 //! What it does not do yet (A-363, owed): the waits that bound a failover (a forward's bound, the location round's cap,
 //! a live takeover's fetch, the takeover's attempts) and the lease terms still read the operator's placeholder; each
@@ -202,11 +205,19 @@ pub fn confirmation(timing: &ElectionTiming, periods: &RunningDuration, heartbea
   }
 }
 
-/// The detection a node's anchor gives it where no peer's detector judges it.
-pub fn supervision(widest_window_ns: u64, _lapse_bound_ns: Option<u64>, _samples: u64) -> Term {
+/// The detection a node's anchor gives it where no peer's detector judges it (A-405, A-574): the watchdog's verdict on a
+/// stuck shard, which comes once the widest window it judges any of the daemon's shards by has passed since that shard
+/// last moved (`widest_window_ns`: A-455's per-shard window, the liveness window raised to the scheduler overrun the
+/// shard measured, within the observation budget), and then the anchor's lapse of the beat the watchdog withholds from
+/// the verdict on (`lapse_bound_ns`: A-467's bound, the liveness window plus the anchor's own measured lateness p99,
+/// within the same ceiling, which the anchor publishes in the supervision block). A wedged daemon is beaten for until
+/// its stuck shard's window passes and is killed once its last beat is the anchor's bound old, so detection is the two
+/// in turn, each the deployment's own measurement. With no anchor publishing a bound (a daemon run alone) its own
+/// watchdog ends it at the verdict: the window alone. `samples`: the readings of the two behind the term.
+pub fn supervision(widest_window_ns: u64, lapse_bound_ns: Option<u64>, samples: u64) -> Term {
   Term {
-    ns: widest_window_ns,
-    samples: 0,
+    ns: widest_window_ns.saturating_add(lapse_bound_ns.unwrap_or(0)),
+    samples,
   }
 }
 
@@ -241,8 +252,10 @@ pub struct Failover {
   recovery: Recovery,
   detection: Option<Term>,
   confirmation: Option<Term>,
-  /// The detection a node has with no peer's detector to judge it: its anchor's supervision window ([`Failover::supervised`]).
+  /// The detection a node has with no peer's detector to judge it: its anchor's, as last read ([`Failover::supervise`]).
   supervision: Option<Term>,
+  /// The readings of the watchdog's widest window and the anchor's lapse bound behind `supervision`.
+  supervision_reads: u64,
 }
 
 impl Default for Failover {
@@ -261,24 +274,23 @@ impl Failover {
       detection: None,
       confirmation: None,
       supervision: None,
+      supervision_reads: 0,
     }
   }
 
-  /// This estimator for a node its anchor supervises within `window_ns` (A-405): a stuck daemon is ended by its watchdog
-  /// after that window and started again by its anchor (A-232), so where no peer's detector judges the node (a laptop, a
-  /// fleet node before its detector's first period) its detection term is that window, with no measurement behind it.
-  #[must_use]
-  pub fn supervised(mut self, window_ns: u64) -> Failover {
-    self.supervision = Some(Term {
-      ns: window_ns,
-      samples: 0,
-    });
-    self
-  }
-
-  /// The detection this node's anchor gives it, read from the watchdog's widest window and the anchor's lapse bound.
+  /// Reads the detection this node's anchor gives it ([`supervision`], A-405, A-574): the widest window the watchdog
+  /// judges the daemon's shards by now, `widest_window_ns`, then the lapse bound its anchor publishes now,
+  /// `lapse_bound_ns` (`None` where no anchor publishes one). Where no peer's detector judges the node (a laptop at
+  /// `f = 0`, a fleet node before its detector's first period) this is its detection term. Read at every beat on every
+  /// node, laptop or fleet: one derivation whose inputs a laptop has too, never a branch (R8). Until A-574 it was set
+  /// once at boot to the liveness window (`supervised`), whatever the watchdog and the anchor measured.
   pub fn supervise(&mut self, widest_window_ns: u64, lapse_bound_ns: Option<u64>) {
-    self.supervision = Some(supervision(widest_window_ns, lapse_bound_ns, 0));
+    self.supervision_reads = self.supervision_reads.saturating_add(1);
+    self.supervision = Some(supervision(
+      widest_window_ns,
+      lapse_bound_ns,
+      self.supervision_reads,
+    ));
   }
 
   /// A coordinator period began at `now_ns`: the time since the one before is a sample of the period's length. A clock
@@ -545,48 +557,6 @@ mod tests {
     );
   }
 
-  /// A-405. Do: ask a supervised estimator with no peer detection, then refresh it with a detector's term, then with
-  /// none again. Expect the supervision window as its detection (the laptop's degenerate: its anchor detects it), its
-  /// failover delay that window and the recovery prior; the detector's own term in its place once measured; and the
-  /// supervision again when no peer detects.
-  #[test]
-  fn a_node_no_peer_detects_is_detected_by_its_supervision_window() {
-    let window = 10 * HEARTBEAT;
-    let mut failover = Failover::new().supervised(window);
-    let laptop = failover.estimate();
-    assert_eq!(
-      laptop.detection,
-      Some(Term {
-        ns: window,
-        samples: 0,
-      })
-    );
-    assert_eq!(laptop.confirmation, None);
-    assert_eq!(
-      laptop.total_ns(),
-      window + slates_db::replay::RECOVERY_BUDGET_NS
-    );
-    let peers = Some(Term {
-      ns: 900_000_000,
-      samples: 7,
-    });
-    assert_eq!(
-      failover
-        .refresh(peers, &ElectionTiming::floor(), HEARTBEAT)
-        .detection,
-      peers
-    );
-    assert_eq!(
-      failover
-        .refresh(None, &ElectionTiming::floor(), HEARTBEAT)
-        .detection,
-      Some(Term {
-        ns: window,
-        samples: 0,
-      })
-    );
-  }
-
   /// A-574 (A-405's laptop detection, derived; A-455, A-467). Do: read a node's supervision with its shards on a quiet
   /// host (the watchdog's widest window the liveness window) and its anchor's lapse bound a window and a fifth, then
   /// with a shard the host held two and a half windows, then with no anchor publishing a bound (a daemon run alone).
@@ -632,8 +602,8 @@ mod tests {
   /// node's (refreshed each period with its detector's term, none before the detector's first period); compare their
   /// estimates before and after the detector's term. Expect the laptop's delay to be its supervision and the recovery;
   /// the fleet node's, before its detector's term, the same supervision with the council's confirmation and the same
-  /// recovery, and after it the detector's term in the supervision's place: one estimator and one sum, the laptop's
-  /// inputs degenerate, never a branch.
+  /// recovery, and after it the detector's term in the supervision's place, the supervision again once no peer detects:
+  /// one estimator and one sum, the laptop's inputs degenerate, never a branch.
   #[test]
   fn a_laptop_and_a_fleet_node_derive_their_failover_delay_by_one_sum() {
     let window = 10 * HEARTBEAT;
@@ -667,6 +637,13 @@ mod tests {
     assert_eq!(
       after.total_ns(),
       900_000_000 + confirmation.ns + slates_db::replay::RECOVERY_BUDGET_NS
+    );
+    assert_eq!(
+      fleet
+        .refresh(None, &ElectionTiming::floor(), HEARTBEAT)
+        .detection,
+      Some(supervised),
+      "the supervision again once no peer detects"
     );
   }
 

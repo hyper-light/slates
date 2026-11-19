@@ -3418,9 +3418,10 @@ impl Daemon {
   /// shard at once (A-363, A-414): the bound of every wait that bounds a failover (a forward, the location round, a held
   /// reply, a takeover's attempts) and the term of the leases that read it (the write lease, a landing's target lease,
   /// a staging buffer), for a test whose subject is that bound's or term's rule. `None` returns to the estimate at the
-  /// control shard's next period, which the fan carries to the others.
+  /// control shard's next beat, which its fan carries to the others (A-574).
   pub fn inject_failover(&self, ns: Option<u64>) -> Result<(), ObserveError> {
-    // On every shard at once: a laptop runs no coordinator to fan it, and a fleet's fan carries the same value.
+    // On every shard at once, so a wait on any shard reads it before the control shard's next beat fans the same value
+    // (A-574).
     for shard in self.shards.iter().copied() {
       self.observe(Some(shard), move |s| {
         s.injected_failover_ns = ns;
@@ -3827,12 +3828,8 @@ impl Daemon {
     // The window the log writer's drain is judged by (A-552): the widest this daemon's shards are judged by now (A-455),
     // read while they still run. A host that keeps the shards off their CPUs that long keeps the writer's thread off its
     // own as long, so a narrower window would give up a writer that is only starved.
-    let log_window_ns = self
-      .shards
-      .iter()
-      .map(|shard| crate::watchdog::shard_window_ns(shard.0))
-      .max()
-      .unwrap_or_else(|| crate::watchdog::watch_window_ns(0));
+    let shard_ids: Vec<u16> = self.shards.iter().map(|shard| shard.0).collect();
+    let log_window_ns = crate::watchdog::widest_window_ns(&shard_ids);
     // The FUSE mounts end with each shard's serve loop (`EndMounts`), on the shard's own thread as the
     // shutdown cancels it — never as a question queued behind the shard's work, which would answer every
     // question already waiting there instead of terminating it (§4.6; AUD-29-64).
@@ -4448,6 +4445,18 @@ async fn init_shard(
   // The client session secret (`crate::session_key`), published before any shard starts: a client's key is checked
   // on the shard that serves it.
   let session_secret = crate::session_key::secret_of(&segment)?;
+  // The detection this node's anchor gives it, read at boot as the control shard reads it at every beat (A-574,
+  // `fleet::refresh_supervision`): the widest window the watchdog judges this daemon's shards by, then the lapse bound
+  // the anchor publishes. Before any peer's detector judges the node, its failover delay is that and the recovery.
+  let mut failover = slates_cluster::failover::Failover::new();
+  failover.supervise(
+    crate::watchdog::widest_window_ns(config_shards),
+    segment
+      .supervision()
+      .ok()
+      .and_then(|supervision| supervision.lapse_bound_ns()),
+  );
+  let failover_ns = crate::fleet::failover_in_periods(failover.estimate().total_ns());
   // The attachment counter starts past every attachment recovered with the partition — a host mount's
   // survives a restart (AUD-01) — so a fresh mint never meets a kept record's id.
   let next_attachment = verbs::next_attachment_counter(db.partition());
@@ -4687,14 +4696,8 @@ async fn init_shard(
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
-    // Supervised by its anchor within the liveness window (A-405): the detection a node has before any peer judges it.
-    failover: slates_cluster::failover::Failover::new().supervised(LIVENESS_BUDGET_NS),
-    failover_ns: crate::fleet::failover_in_periods(
-      slates_cluster::failover::Failover::new()
-        .supervised(LIVENESS_BUDGET_NS)
-        .estimate()
-        .total_ns(),
-    ),
+    failover,
+    failover_ns,
     injected_failover_ns: None,
     attachment_paces: std::collections::BTreeMap::new(),
     council,
@@ -6496,9 +6499,9 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
       log_late_beat(now.saturating_sub(beat), &before, &counters);
     }
     last = Some((now, counters));
-    let requested = match segment.supervision() {
-      Ok(sup) => sup.stop_requested_at().is_some(),
-      Err(_) => false,
+    let (requested, lapse_bound_ns) = match segment.supervision() {
+      Ok(sup) => (sup.stop_requested_at().is_some(), sup.lapse_bound_ns()),
+      Err(_) => (false, None),
     };
     state::with_state(|s| {
       if let Some(watch) = s.stop_watch.as_ref()
@@ -6507,7 +6510,12 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
         // Bounded by one: a reason already sent and not yet taken is the same news.
         let _full_or_gone = watch.wake.try_send(());
       }
+      // This node's detection by its anchor (A-574): the watchdog's widest window and the anchor's published lapse bound,
+      // read at every beat on every node, laptop or fleet, and the failover delay published from them.
+      crate::fleet::refresh_supervision(s, lapse_bound_ns);
     });
+    // The delay to every shard where it moved: a laptop's other shards read it as a fleet's do (A-574).
+    crate::fleet::fan_failover();
     pace(HEARTBEAT_NS).await;
   }
 }

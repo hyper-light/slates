@@ -1943,8 +1943,12 @@ landing constants are in §4.15.
 > `DaemonConfig::failover_slo_ns`): a move's overdue bound and the telemetry horizon read the failover delay, the
 > anchor's crash-loop cap is the NFSv4 lease its daemon grants, a FUSE helper is waited for as long as its shard's
 > helpers have taken (learned, backed off to the failover delay), and a status capture is held the failover delay from
-> its capture. The operator's failover SLO above is now a check against the published delay
-> (`FleetReport::failover`), not an input.
+> its capture. **Since A-574 a laptop's detection is measured, not the liveness window**: where no peer's detector judges
+> a node (a laptop at `f = 0`, a fleet node before its detector's first period), `D` is the widest window the watchdog
+> judges the daemon's shards by (A-455) and then the lapse bound its anchor publishes (A-467, `SUP_LAPSE_BOUND`), read
+> at every beat on every node, laptop or fleet, and the delay goes to every shard by the beat's own fan, which a laptop
+> runs too (on a quiet laptop about three seconds of `F`, where A-405's fixed window gave two). The operator's failover
+> SLO above is now a check against the published delay (`FleetReport::failover`), not an input.
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -37655,3 +37659,49 @@ paths), `crates/merge/src/engine/branch.rs` and `branch/tests.rs` (new: `Lineage
   a green at a commit that is no version's head (piece 3's trees); and §4.17.4's `Copy` (g292, A-542's second half),
   which grafts with `subtree` and `graft` on these maps and needs a per-prefix appearance record under the one history
   rule (a grafted key has no history, and must not read as present before the copy).
+
+### A-574 — A laptop's failover detection is what its watchdog and its anchor measure: the widest shard window, then the anchor's lapse bound, read at every beat on every node (2026-11-19, UI goal 86 via g076b; R3's class D, its last fixed-window term; R8; §4.4 "Derived constants", §4.14 `daemon.alive`; A-363, A-405, A-455, A-467)
+Applied in the same change to: §4.4's status (the failover delay's paragraph), GAPS (the failover delay's entry: A-405's
+sentence and the class D line), `docs/cli.md` (an unrenewed CLI attachment's lapse on a laptop),
+`crates/anchor/src/{layout,segment}.rs` (`SUP_LAPSE_BOUND`, `Supervision::record_lapse_bound`, `lapse_bound_ns`, the
+word declared), `crates/api/src/role/anchor.rs` (`publish_lapse_bound` in the observation loop),
+`crates/cluster/src/failover.rs` (`supervision`, `Failover::supervise`, its readings; `Failover::supervised` deleted;
+the laptop paragraph; two tests), `crates/server/src/watchdog.rs` (`widest_window_ns`), `crates/server/src/fleet.rs`
+(`refresh_supervision`, `publish_failover`, `fan_failover` and its counters; the configuration fan no longer carries the
+delay; its test), `crates/server/src/daemon.rs` (the boot reading in `init_shard`, the beat's reading and fan in
+`heartbeat_loop`, `stop_parts` over `widest_window_ns`, `inject_failover`'s note, the test) and `crates/cli/tests/cli.rs`
+(formation's allowed counters: `fleet.failover_fan.sent`).
+- **What was there.** A node no peer's detector judges (a laptop at `f = 0`, a fleet node before its detector's first
+  period) took the liveness window `W` as its detection term (A-405: `Failover::supervised(LIVENESS_BUDGET_NS)`), set
+  once at boot, whatever the host. And a laptop never refreshed its failover estimate at all: the estimate is refreshed
+  by the fleet's record-plane coordinator and fanned with the fleet's configuration, neither of which a laptop runs, so
+  every shard of a laptop held the value its boot computed, for good.
+- **What detection is there.** A laptop's detector is its supervision (A-232). Its watchdog judges a shard stuck once
+  the window it judges that shard by has passed since the shard last moved (A-455: `W` raised to the scheduler overrun
+  the shard measured, within the observation budget), and only then withholds the beat; its anchor kills the daemon
+  once that beat is its lapse bound old (A-467: `W` plus the anchor's own measured lateness p99, within the same
+  ceiling) and starts it again. So a wedge is detected after the stuck shard's window and then the anchor's lapse, in
+  turn: A-405's single window left the anchor's lapse out, and on a quiet host undercounted by a window.
+- **The rule.** `D` where no peer's detector judges the node is the widest window the watchdog judges the daemon's
+  shards by, then the anchor's lapse bound (`slates_cluster::failover::supervision`); a daemon run alone, whose watchdog
+  ends it at the verdict, has no lapse, the window alone. The anchor publishes its lapse bound in its supervision block
+  whenever it moves (`SUP_LAPSE_BOUND`, zero where no anchor wrote one; no layout change, as the anchor's other words).
+  The control shard reads both at every beat (`heartbeat_loop`, `fleet::refresh_supervision`), on every node, laptop or
+  fleet, and publishes the delay (`fleet::publish_failover`, the same publication the coordinator's refresh uses); a
+  shard reads the same at its boot. The beat then fans the delay to every other shard where it moved
+  (`fleet::fan_failover`, counted `fleet.failover_fan.sent` and `.refused`), so the configuration fan no longer carries
+  it: one fan on every node.
+- **R8.** One estimator and one sum on every node: a laptop's detection and confirmation are its degenerate inputs (no
+  detector's term, no council's), never a branch, and a fleet node's supervision is read the same way and stands until
+  its detector's term replaces it.
+- **What changes.** A laptop's failover delay at rest is the window, the anchor's lapse and the recovery prior, about
+  three seconds where it was two, and it follows the machine: a host that holds a shard off its CPU, or an anchor whose
+  own waits run late, lengthens it as long as they lengthen detection. Every wait that reads the delay follows on a
+  laptop: an unrenewed CLI attachment's term, a write lease's, a staging buffer's, a status capture's, a FUSE helper's
+  ceiling, a taken-back copy's claim. A test's injected delay is held on every shard by the same beat.
+- **Tests.** `a_nodes_supervision_is_its_watchdogs_widest_window_then_its_anchors_lapse` and
+  `a_laptop_and_a_fleet_node_derive_their_failover_delay_by_one_sum` (`crates/cluster/src/failover.rs`),
+  `a_laptops_failover_delay_follows_its_watchdogs_window_and_its_anchors_lapse` (`crates/server/src/daemon.rs`: a
+  two-shard daemon with no fleet, the lapse bound published in its block as its anchor does; every shard's delay comes to
+  hold it, the control shard's detection the widest window and then exactly the lapse), and
+  `a_shard_is_fanned_the_failover_delay_when_it_moves` (`crates/server/src/fleet.rs`, now the beat's fan).

@@ -4048,8 +4048,10 @@
 > reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
 > its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
-> end with their client); since A-405 a laptop's failover delay counts its anchor's supervision window as its detection
-> (two seconds there); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
+> end with their client); since A-405 a laptop's failover delay counts its anchor's supervision as its detection, and
+> **since A-574 that detection is measured**: the widest window the watchdog judges the daemon's shards by and then the
+> lapse bound its anchor publishes, read at every beat on every node and fanned to every shard by the beat (about three
+> seconds of `F` on a quiet laptop, where the fixed window gave two); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
 > take the failover delay as their term**, and a write lease stays its holder's while any of its write attachments
 > lives (renewed at each lapse; another principal refused `LeaseHeld` meanwhile), where before it ran out at its term
 > under a live writer. **Since A-425 the NFSv4 lease is derived**: an idle Linux client's renewal floor (5 s,
@@ -4135,9 +4137,9 @@
 > the term its holder's write lease runs for (A-414), and A-554's keeper sleeps to the earliest taken back plus the
 > delay held at each pass, where it mirrored the client's old two-second reconnect budget (the wiring is Linux-only,
 > built by main). D-c is closed by these.
-> Still on `W` itself, each owed its own change (class D): the reap loop's tick (`reap_loop`, leaving a job at a time
-> in the event-driven reaper series), and a laptop's
-> failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
+> Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
+> series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
+> the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
