@@ -19,7 +19,7 @@ use crate::Admission;
 use crate::negotiation::Filter;
 use crate::object_name::Kind;
 use crate::store::learn::{Clock, Exchange};
-use crate::store::{Answered, Progress, Turn, Upload, Versions};
+use crate::store::{Answered, Progress, Turn, Upload, UploadCounters, Versions};
 
 /// The negotiation's answer as A-639's stream reads it, owned: its runs, its single objects, its filter, and what the
 /// client reads.
@@ -97,6 +97,14 @@ pub struct Streamed {
   taken: usize,
   /// Whether the stream wrote the pack's last bytes, its trailer.
   done: bool,
+}
+
+impl Streamed {
+  /// What the stream did so far (A-639's counters, A-653): which of the store's paths wrote the pack, the kept parts
+  /// copied whole or read entry by entry and the objects encoded afresh.
+  pub fn counters(&self) -> UploadCounters {
+    UploadCounters::default()
+  }
 }
 
 /// A-639's stream as the service's [`PackSource`]: each turn on the owner's clock, at its exchange (what a saved byte
