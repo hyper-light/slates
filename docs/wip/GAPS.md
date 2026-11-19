@@ -1001,6 +1001,15 @@
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
 > main measures it.
 
+> **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
+> Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part
+> read, listed every bookmark naming a held changeset; 7.2's `listbinbookmarks` (`bookmarks.py` 475-484) leaves out a
+> divergent name (`isdivergent`, 471-472: an `@` not as its last byte). Reproduced by use with stock 7.2 first (a
+> bookmark diverged in a clone and pulled back: `hg serve` answers `@` and `feature`, slates' view of the same
+> repository answered `feature@1` too); now the rule is `crate::bookmarks::divergent`, shared with the push's refusal;
+> red first (r340), green (r356) on macOS arm64, the other platforms owed
+> (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
+
 > **Fixed (g300, 2026-11-19, A-667; found by g304 against stock 7.2): Mercurial's branch heads were judged by a child on
 > the branch.** `serve::discovery::branch_head_revs` took a revision for its branch's head when no child of it was on
 > its branch; 7.2's rule (`branchmap.py` 422-424) ends every revision a later one on its branch descends from, through
