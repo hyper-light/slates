@@ -37,4 +37,5 @@ pub mod migration;
 pub mod ra_svn;
 pub mod reads;
 pub mod report;
+pub mod serve;
 pub mod svndiff;
