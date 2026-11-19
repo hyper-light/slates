@@ -30,11 +30,12 @@
 
 use slates_db::catalog::{
   BaseRecord, BranchRecord, MemberOrigin, MemberRecord, NamePolicy as DbNamePolicy, PolicyRecord,
-  RepositoryId, RepositoryRecord, Role, SnapshotId as DbSnapshotId, VolumeId as DbVolumeId,
-  VolumeRecord, VolumeState,
+  Principal, RepositoryId, RepositoryRecord, Role, SnapshotId as DbSnapshotId,
+  VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::op::Op;
-use slates_ipc::protocol::{ObjectFormat, Principal, Refusal, ReplyBody, VcsTool, VolumeId};
+use slates_ipc::protocol::{ObjectFormat, Refusal, ReplyBody, VcsTool, VolumeId};
+use slates_vfs::clock::Clock;
 
 use crate::error::refusal_of_db;
 use crate::greens::ReleaseProgress;
@@ -567,8 +568,9 @@ pub(crate) async fn run_releases() {
 
 #[cfg(test)]
 mod tests {
+  use slates_db::catalog::Principal;
   use slates_ipc::protocol::{
-    ObjectFormat, Principal, Refusal, ReplyBody, RequestBody, VcsTool, VolumeId, VolumeRefusal,
+    ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool, VolumeId, VolumeRefusal,
   };
 
   use crate::greens::ReleaseProgress;
