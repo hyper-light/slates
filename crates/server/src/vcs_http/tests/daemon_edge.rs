@@ -4,6 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream as ClientStream;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -545,6 +546,156 @@ fn a_stock_git_push_over_the_daemons_edge_lands_through_the_push_driver() {
   assert_eq!(last, after);
 }
 
+/// Shape: more turns than the `states` fixture's import takes, so an import that never ends fails the test.
+const IMPORT_TURNS_AT_MOST: u64 = 1 << 16;
+
+/// A clock one nanosecond on at each reading, so every turn of an import passes its quantum of one nanosecond.
+struct Ticking(u64);
+
+impl slates_hg::import::Clock for Ticking {
+  fn now_ns(&mut self) -> u64 {
+    self.0 = self.0.saturating_add(1);
+    self.0
+  }
+}
+
+/// A Mercurial repository's name that routes to [`REPOSITORY`]'s partition.
+fn hg_name_on_the_repositorys_partition() -> String {
+  (0u32..)
+    .map(|serial| format!("hg-{serial}"))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == REPOSITORY)
+    .expect("a name routes there")
+}
+
+/// Creates the Mercurial repository `name` on its partition, owned by [`owner`], and imports `fixtures/state`'s
+/// `states` repository into its store there (A-675), a unit a turn to its end: the heads `heads` answers of the history
+/// its store then holds, every changeset served while its register holds no phase root, each a revision no other names
+/// as a parent, newest first, in hexadecimal, as 7.2 lists them.
+fn create_hg_from_states(daemon: &Daemon, name: &str) -> Vec<u8> {
+  let name = name.to_owned();
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.clone(),
+        tool: VcsTool::Mercurial,
+        format: ObjectFormat::Sha1,
+        default_branch: "branch:default:0".to_owned(),
+        green: None,
+      },
+    );
+    assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+    let repositories = state.db.partition().repositories();
+    let id = repositories.repository_named(&name).expect("the record").id;
+    let (host, directory) =
+      crate::hg_base::tests::laid_out(crate::hg_base::tests::STATES.iter().copied());
+    assert_eq!(
+      crate::vcs_store::hg_import::begin(state, id, (Box::new(host), directory)),
+      Ok(())
+    );
+    let mut clock = Ticking(0);
+    let ended = (0..IMPORT_TURNS_AT_MOST).find_map(|_| {
+      match crate::vcs_store::hg_import::turn(state, id, (&mut clock, 1)) {
+        Some(Ok(crate::vcs_store::hg_import::Turned::More)) => None,
+        other => Some(other),
+      }
+    });
+    assert!(
+      matches!(
+        ended,
+        Some(Some(Ok(crate::vcs_store::hg_import::Turned::Done(_))))
+      ),
+      "the import did not end: {ended:?}"
+    );
+    let (content, store) = state.vcs_stores.mercurial_ref(id).expect("the store");
+    let changelog = slates_hg::index::Log::Changelog;
+    let rows: Vec<_> = (0..store.index.len(content, changelog))
+      .map(|rev| {
+        store
+          .index
+          .changeset(content, rev)
+          .expect("a changelog row")
+      })
+      .collect();
+    let named = |rev: u32| rows.iter().any(|row| row.p1 == rev || row.p2 == rev);
+    let heads: Vec<String> = (0..rows.len())
+      .rev()
+      .filter(|rev| !named(u32::try_from(*rev).unwrap()))
+      .map(|rev| {
+        rows[rev]
+          .node
+          .iter()
+          .map(|byte| format!("{byte:02x}"))
+          .collect()
+      })
+      .collect();
+    let mut answer = heads.join(" ").into_bytes();
+    answer.push(b'\n');
+    answer
+  })
+}
+
+/// The status and body of `GET /<name>?cmd=<command>` by the owner's bearer token, as stock hg asks a command.
+fn hg_command(edge: (u16, &CertificateDer<'static>), name: &str, command: &str) -> (u16, Vec<u8>) {
+  let (port, certificate) = edge;
+  let request = format!(
+    "GET /{name}?cmd={command} HTTP/1.1\r\nHost: localhost\r\nAccept: application/mercurial-0.1\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  exchange(port, certificate, request.as_bytes())
+}
+
+/// A-680 part 2 (main's ruling, 2026-11-19: Mercurial's site on the daemon's edge beside its lender). Do: start a
+/// two-shard daemon whose configuration asks for an edge on loopback with a self-signed identity; on the second shard's
+/// partition create a Mercurial repository and import `fixtures/state`'s `states` repository into its store, and create
+/// a git repository; enroll the owner's token; then, each on a new TLS connection with the owner's bearer token, ask the
+/// Mercurial repository for `capabilities` and `heads` as stock hg asks them (`GET /<name>?cmd=...`), ask the git
+/// repository for `capabilities` the same way, and ask the git repository for upload-pack's advertisement. Expect: the
+/// two Mercurial commands `200`, the capabilities naming `getbundle` and the `httpheader` bound HTTP's transport adds,
+/// and `heads` the heads of the history the store holds, newest first; the git repository asked as Mercurial asks
+/// `404`, a repository of another tool answered as one that does not exist; the git request still git's, answered as
+/// its upload-pack half answers (`503` until A-682 lends its store, `200` after), never Mercurial's `404`.
+#[test]
+fn a_mercurial_repositorys_store_is_served_over_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let hg = hg_name_on_the_repositorys_partition();
+  let git = name_on_the_repositorys_partition();
+  let expected_heads = create_hg_from_states(&daemon, &hg);
+  create(&daemon, &git);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let capabilities = hg_command(edge, &hg, "capabilities");
+  let heads = hg_command(edge, &hg, "heads");
+  let git_as_hg = hg_command(edge, &git, "capabilities").0;
+  let git_advertisement = status_of(
+    port,
+    &certificate,
+    &format!("/{git}/info/refs?service=git-upload-pack"),
+    &[&owner_bearer()],
+  );
+  daemon.stop();
+  let line = String::from_utf8_lossy(&capabilities.1).into_owned();
+  assert_eq!(capabilities.0, 200, "{line}");
+  assert!(
+    line.split(' ').any(|cap| cap == "getbundle")
+      && line.split(' ').any(|cap| cap.starts_with("httpheader=")),
+    "{line}"
+  );
+  assert_eq!(
+    (heads.0, String::from_utf8_lossy(&heads.1).into_owned()),
+    (200, String::from_utf8_lossy(&expected_heads).into_owned())
+  );
+  assert_eq!(git_as_hg, 404);
+  assert!(
+    matches!(git_advertisement, 200 | 503),
+    "git's request answered {git_advertisement}"
+  );
+}
+
 /// A plain connection to the edge on loopback `port`, its reads waiting [`PATIENCE_NS`].
 fn cleartext_client(port: u16) -> ClientStream {
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
@@ -665,5 +816,92 @@ fn basic_proves_its_principal_on_a_daemons_loopback_cleartext_edge() {
     ),
     (Some(200), served_advertisement(&[]), Some(401), 1),
     "{basic_head}"
+  );
+}
+
+/// Shape: the variable naming the command that runs stock Mercurial 7.2, its words split at spaces: on the Mac Studio
+/// `uvx --quiet --python 3.12 --from mercurial==7.2 hg`, as `crates/hg/fixtures/make-fixtures.sh` runs it. Unset, `hg`
+/// on the path.
+const STOCK_HG: &str = "SLATES_TEST_HG";
+/// Shape: the digits of a changeset's id stock hg names it by, its short form (`hg identify`).
+const SHORT_ID_DIGITS: usize = 12;
+
+/// Stock Mercurial 7.2's command, its words as [`STOCK_HG`] names them, or `None` when this host runs none, which the
+/// caller skips loudly: the command must answer `--version` with 7.2's line.
+fn stock_hg() -> Option<Vec<String>> {
+  let line = std::env::var(STOCK_HG).unwrap_or_else(|_| "hg".to_owned());
+  let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+  let (program, leading) = words.split_first()?;
+  let version = Command::new(program)
+    .args(leading)
+    .arg("--version")
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .stdin(Stdio::null())
+    .output()
+    .ok()?;
+  let said = String::from_utf8_lossy(&version.stdout);
+  (version.status.success() && said.contains("(version 7.2")).then_some(words)
+}
+
+/// Runs stock hg (its command's `words`) with `args`, outside any user's configuration (`HGRCPATH` empty), in its plain
+/// words (`HGPLAIN`), with no terminal to prompt on and each of its socket's waits bounded by [`PATIENCE_NS`]
+/// (`http.timeout`): its exit code and both outputs.
+fn hg_run(words: &[String], args: &[&str]) -> (Option<i32>, String, String) {
+  let (program, leading) = words.split_first().expect("a command");
+  let timeout = format!(
+    "http.timeout={}",
+    Duration::from_nanos(PATIENCE_NS).as_secs_f64()
+  );
+  let output = Command::new(program)
+    .args(leading)
+    .args(["--config", &timeout])
+    .args(args)
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .stdin(Stdio::null())
+    .output()
+    .expect("stock hg runs");
+  (
+    output.status.code(),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
+/// A-686 with A-680 part 2a (main's ruling, 2026-11-19: Basic with the token as the password taken on the loopback
+/// cleartext edge as over TLS, Basic's challenge first). Do: start a two-shard daemon whose edge serves loopback
+/// cleartext (no identity); on the second shard's partition create a Mercurial repository from `fixtures/state`'s
+/// `states` and enroll its owner's token; run stock Mercurial 7.2's `hg identify` against the repository with the
+/// token as Basic's password in the URL. Expect: hg reads the edge's `401`, whose first challenge is Basic's, sends
+/// Basic, which the loopback edge takes, and is served from the repository's owner shard: exit 0, naming the
+/// repository's tip first, the newest of its heads. Before A-686 the cleartext edge's `401` offered Bearer alone, on
+/// which 7.2's urllib digest handler, reading the first challenge alone, raised (`** unknown exception`, exit 1).
+/// Skips loudly without stock hg 7.2 ([`STOCK_HG`]).
+#[test]
+fn stock_hg_identifies_a_repository_on_a_daemons_loopback_edge_by_basic() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg against the daemon's edge: no Mercurial 7.2 here \
+       (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let (daemon, _) = daemon_named(None);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  let heads = create_hg_from_states(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let url = format!("http://hg:{OWNER_TOKEN}@127.0.0.1:{port}/{name}");
+  let (code, out, err) = hg_run(&hg, &["identify", &url]);
+  daemon.stop();
+  let tip: String = String::from_utf8_lossy(&heads)
+    .chars()
+    .take(SHORT_ID_DIGITS)
+    .collect();
+  assert_eq!(
+    (code, out.split_whitespace().next()),
+    (Some(0), Some(tip.as_str())),
+    "{out}{err}"
   );
 }

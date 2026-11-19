@@ -1,25 +1,17 @@
 use std::io::{Read, Write as _};
 use std::net::TcpStream as ClientStream;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-use slates_db::HostId;
-use slates_db::catalog::{
-  ObjectFormat, Principal, RepositoryId, RepositoryPolicy, RepositoryRecord, VcsTool,
-};
 use slates_http::head::Head;
 use slates_http::reply::Status;
 use slates_http_edge::connection::{Fields, Phase};
-use slates_http_edge::credential::Credential;
 use slates_http_edge::tls::ServingIdentity;
 use slates_rt::control::Control;
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
 
-use super::git::{Authenticator, Located, Proven, Repositories, Unproven};
-use super::hg::{HgSite, NoStores};
 use super::{
   Answer, Bounds, Counts, Decided, EdgeState, Exchange, Failed, Site, admits_cleartext, serve,
 };
@@ -205,24 +197,6 @@ where
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
 {
-  served_by(seats, identity, || Echoes, client)
-}
-
-/// Serves an edge of `seats` presenting `identity` (cleartext on loopback without one) with the sites `site` makes,
-/// runs `client` against it on a thread of its own, and stops the shard once the client returns: what the client
-/// returned, and what the edge then held.
-fn served_by<S, M, C, R>(
-  seats: usize,
-  identity: Option<ServingIdentity>,
-  site: M,
-  client: C,
-) -> (R, Seen)
-where
-  S: Site + 'static,
-  M: Fn() -> S + Clone + Send + 'static,
-  C: FnOnce(SocketAddrV4) -> R + Send + 'static,
-  R: Send + 'static,
-{
   let runtime = runtime();
   let bounds = Bounds::of_shard(seats, ROOM_BYTES, TIMER_TICK_NS);
   let (listener, address) = listener(bounds);
@@ -232,7 +206,7 @@ where
     .expect("the edge's state kept on its shard");
   runtime
     .spawn(async move {
-      let _ = serve(listener, state, site).await;
+      let _ = serve(listener, state, || Echoes).await;
     })
     .expect("the listener's task");
   let shard = runtime.shard_id().0;
@@ -669,162 +643,5 @@ fn a_service_names_its_reply_fields_once_and_a_failure_there_is_the_status() {
       String::from_utf8_lossy(refused.as_bytes()),
       true
     )
-  );
-}
-
-/// Shape: the variable naming the command that runs stock Mercurial 7.2, its words split at spaces: on the Mac Studio
-/// `uvx --quiet --python 3.12 --from mercurial==7.2 hg`, as `crates/hg/fixtures/make-fixtures.sh` runs it. Unset, `hg`
-/// on the path.
-const STOCK_HG: &str = "SLATES_TEST_HG";
-/// Shape: the realm Mercurial's site names in its challenges here.
-const HG_REALM: &str = "slates";
-/// Shape: the Mercurial repository [`OneMercurial`] holds.
-const HG_REPOSITORY: &str = "hg";
-/// Shape: the token that proves [`HG_REPOSITORY`]'s owner, which stock hg sends as Basic's password.
-const HG_OWNER_TOKEN: &str = "owner-token";
-/// Shape: the uid of [`HG_REPOSITORY`]'s owner.
-const HG_OWNER: u32 = 1;
-
-/// [`HG_REPOSITORY`]'s owner: uid [`HG_OWNER`] on host 0.
-fn hg_owner() -> Principal {
-  Principal::Uid {
-    host: HostId(0),
-    uid: HG_OWNER,
-  }
-}
-
-/// Proves [`HG_OWNER_TOKEN`], as Basic's password or a bearer token, the owner of [`HG_REPOSITORY`]; any other token
-/// proves no one.
-struct OwnerToken;
-
-impl Authenticator for OwnerToken {
-  async fn prove(&self, credential: &Credential) -> Result<Proven, Unproven> {
-    let token = match credential {
-      Credential::Basic { password, .. } => password,
-      Credential::Bearer(token) => token,
-    };
-    if token.as_slice() == HG_OWNER_TOKEN.as_bytes() {
-      Ok(Proven {
-        principal: hg_owner(),
-        bearer_expires_ns: None,
-      })
-    } else {
-      Err(Unproven::Unknown)
-    }
-  }
-}
-
-/// Holds one Mercurial repository here, [`HG_REPOSITORY`], under no rule but its owner's.
-struct OneMercurial;
-
-impl Repositories for OneMercurial {
-  fn locate(&self, _name: &str) -> Located {
-    Located::Here
-  }
-
-  fn find(&self, name: &str) -> Option<RepositoryRecord> {
-    (name == HG_REPOSITORY).then(|| RepositoryRecord {
-      id: RepositoryId { bytes: [0; 16] },
-      name: name.to_owned(),
-      tool: VcsTool::Mercurial,
-      format: ObjectFormat::Sha1,
-      default_branch: None,
-      owner: hg_owner(),
-      policy: RepositoryPolicy {
-        version: 1,
-        rules: Vec::new(),
-        hooks: Vec::new(),
-        hooks_env: Vec::new(),
-        signers: Vec::new(),
-      },
-    })
-  }
-}
-
-/// Mercurial's site over [`OwnerToken`] and [`OneMercurial`], holding no repository's store (`NoStores`), as the hg
-/// site holds none until A-680's lender: every request it admits is answered `503`.
-fn hg_site() -> HgSite<OwnerToken, OneMercurial, NoStores> {
-  let room = u64::try_from(ROOM_BYTES).expect("a request's room");
-  HgSite::new(
-    HG_REALM.to_owned(),
-    room,
-    OwnerToken,
-    OneMercurial,
-    NoStores,
-  )
-}
-
-/// Stock Mercurial 7.2's command, its words as [`STOCK_HG`] names them, or `None` when this host runs none, which the
-/// caller skips loudly: the command must answer `--version` with 7.2's line.
-fn stock_hg() -> Option<Vec<String>> {
-  let line = std::env::var(STOCK_HG).unwrap_or_else(|_| "hg".to_owned());
-  let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
-  let (program, leading) = words.split_first()?;
-  let version = Command::new(program)
-    .args(leading)
-    .arg("--version")
-    .env("HGPLAIN", "1")
-    .env("HGRCPATH", "")
-    .stdin(Stdio::null())
-    .output()
-    .ok()?;
-  let said = String::from_utf8_lossy(&version.stdout);
-  (version.status.success() && said.contains("(version 7.2")).then_some(words)
-}
-
-/// Runs stock hg (its command's `words`) with `args`, outside any user's configuration (`HGRCPATH` empty), in its plain
-/// words (`HGPLAIN`), with no terminal to prompt on and each of its socket's waits bounded by [`PATIENCE_NS`]
-/// (`http.timeout`): its exit code and both outputs.
-fn hg_run(words: &[String], args: &[&str]) -> (Option<i32>, String, String) {
-  let (program, leading) = words.split_first().expect("a command");
-  let timeout = format!(
-    "http.timeout={}",
-    Duration::from_nanos(PATIENCE_NS).as_secs_f64()
-  );
-  let output = Command::new(program)
-    .args(leading)
-    .args(["--config", &timeout])
-    .args(args)
-    .env("HGPLAIN", "1")
-    .env("HGRCPATH", "")
-    .stdin(Stdio::null())
-    .output()
-    .expect("stock hg runs");
-  (
-    output.status.code(),
-    String::from_utf8_lossy(&output.stdout).into_owned(),
-    String::from_utf8_lossy(&output.stderr).into_owned(),
-  )
-}
-
-/// A-686 (main's ruling, 2026-11-19; §4.17.3 "Access"). Do: serve Mercurial's site on a loopback cleartext edge, no
-/// repository's store held ([`hg_site`]); run stock Mercurial 7.2's `hg identify` against its repository with the
-/// owner's token as Basic's password in the URL. Expect: hg reads the edge's `401`, whose first challenge is Basic's,
-/// sends Basic, which the loopback edge takes, and reaches the site, which answers `503` for the store it does not
-/// hold: `abort: HTTP Error 503: Service Unavailable`, never hg's crash report nor `authorization failed`. Why the
-/// order: 7.2's opener hands a `401` to urllib's digest handler before its Basic one (`handler_order` 490), and that
-/// handler reads the first `WWW-Authenticate` field alone and raises on any scheme but Digest and Basic (Python
-/// 3.12.16's `urllib/request.py` lines 1112-1129, through hg's `url.py` line 418): a Bearer first was "** unknown
-/// exception". Skips loudly without stock hg 7.2 ([`STOCK_HG`]).
-#[test]
-fn stock_hg_meets_basic_first_on_a_loopback_edge_and_reaches_the_hg_site() {
-  let Some(hg) = stock_hg() else {
-    eprintln!(
-      "skipping stock hg against the edge: no Mercurial 7.2 here \
-       (set {STOCK_HG} to the command that runs it)"
-    );
-    return;
-  };
-  let ((code, out, err), _) = served_by(TWO_SEATS, None, hg_site, move |address| {
-    let url = format!("http://hg:{HG_OWNER_TOKEN}@{address}/{HG_REPOSITORY}");
-    hg_run(&hg, &["identify", &url])
-  });
-  assert!(
-    !err.contains("unknown exception") && !err.contains("authorization failed"),
-    "stock hg did not get past the edge's 401 (exit {code:?}): {out}{err}"
-  );
-  assert!(
-    err.contains("abort: HTTP Error 503: Service Unavailable"),
-    "exit {code:?}: {out}{err}"
   );
 }

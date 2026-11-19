@@ -13539,12 +13539,30 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
 /// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
 /// each read: the answer's head, lowercased, or why there was none (a refused connection among them).
 fn bare_request(port: u16, patience: Duration) -> std::io::Result<String> {
+  answer_head(
+    port,
+    "GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    patience,
+  )
+}
+
+/// Asks the version-control edge at loopback `port` for `target` with `token` as a bearer token, waiting [`WAIT_FOR`]
+/// for each read: the answer's head, lowercased, or why there was none.
+fn bearer_request(port: u16, target: &str, token: &str) -> std::io::Result<String> {
+  answer_head(
+    port,
+    &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"),
+    WAIT_FOR,
+  )
+}
+
+/// Sends `request` to the version-control edge at loopback `port`, waiting `patience` for each read: the answer's head,
+/// lowercased, or why there was none (a refused connection among them).
+fn answer_head(port: u16, request: &str, patience: Duration) -> std::io::Result<String> {
   use std::io::{Read, Write};
   let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
   stream.set_read_timeout(Some(patience))?;
-  stream.write_all(
-    b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
-  )?;
+  stream.write_all(request.as_bytes())?;
   let mut head = Vec::new();
   let mut chunk = [0u8; 1024];
   while !head.windows(4).any(|end| end == b"\r\n\r\n") {
@@ -13838,22 +13856,17 @@ fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
   );
 }
 
-/// A-650 part 1 and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a Basic challenge,
-/// which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial 7.2, given no
-/// credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort: http
-/// authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
-/// stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass. As of main 34d10acb5 the daemon's edge serves git's site
-/// alone (`DaemonSite`), so hg's request is answered `404` (hg: `abort: HTTP Error 404: Not Found`; Mac Studio, kiln
-/// r174): the hg site's stores and lender are A-680 (g303). That site's `401` offered Bearer alone, which crashed 7.2
-/// ("** unknown exception encountered", `ValueError: AbstractDigestAuthHandler does not support the following scheme:
-/// 'Bearer'`, raised at Python 3.12's `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1; measured on
-/// the Mac Studio on 2026-11-19 against a stub answering that `401`), since urllib's digest handler reads the first
-/// challenge alone and refuses any scheme but Digest and Basic. Since A-686 (g258) Basic's challenge comes first on
-/// every connection and stock 7.2 reads it (`slates-server`'s
-/// `stock_hg_meets_basic_first_on_a_loopback_edge_and_reaches_the_hg_site`, stock hg against the edge serving the hg
-/// site).
+/// A-650 part 1, A-680 part 2a and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a
+/// Basic challenge, which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial
+/// 7.2, given no credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort:
+/// http authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]). Its waits, as they ended: the daemon's edge served git's site alone, so hg's request
+/// met `404` (`abort: HTTP Error 404: Not Found`; Mac Studio, kiln r174), until A-680 part 2a put Mercurial's site
+/// beside it; that site's `401` offered Bearer alone, which crashed 7.2 ("** unknown exception encountered",
+/// `ValueError: AbstractDigestAuthHandler does not support the following scheme: 'Bearer'`, raised at Python 3.12's
+/// `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1), since urllib's digest handler reads the first
+/// challenge alone, until A-686 put Basic's challenge first on every connection.
 #[test]
-#[ignore = "waits on A-680 (g303: the hg site's stores and lender)"]
 fn stock_hg_without_credentials_is_refused_in_its_own_words() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13886,14 +13899,12 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 /// Mercurial repository through the CLI ([`create_hg_repository`]) and a token (`credential token`); with the token as
 /// Basic's password (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and
 /// pull it back ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips
-/// loudly without stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass: as of main 34d10acb5 the CLI has no
-/// `repository create` (A-685, g305; `unknown flag --tool`, kiln r174), and the daemon's edge serves git's site alone
-/// and the hg site holds no store (A-680, g303: the hg site's stores and lender, its pushes' `unbundle` with them). The
-/// edge's own part is built (A-686, g258): Basic's challenge first, and Basic with the token as its password taken on
-/// the loopback edge as over TLS ([`stock_hg_without_credentials_is_refused_in_its_own_words`]).
+/// loudly without stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass: the hg site's pushes (`unbundle` through
+/// `hg_push`) are A-680 part 2b (g303); `slates repository create` (A-685), the hg site on the daemon's edge (A-680
+/// part 2a) and the edge's Basic, its challenge first and taken on the loopback edge (A-686,
+/// [`stock_hg_without_credentials_is_refused_in_its_own_words`]), are built.
 #[test]
-#[ignore = "waits on A-685 (g305: slates repository create <name> --tool hg) and A-680 (g303: the hg site's stores \
-            and lender)"]
+#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push)"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13984,4 +13995,145 @@ fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   let config = vec!["--config".to_owned(), ssh];
   let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
   hg_round_trip(&hg, &scratch.path, &url, &config);
+}
+
+/// Starts an anchor whose daemon serves the version-control HTTP edge on loopback, on a port the system picks
+/// (`--vcs-http 127.0.0.1:0`), and waits for it as [`start_anchor_with_issuer_surface`] does, its consensus group
+/// bootstrapped: the anchor, the issuer surface's exports where this platform prints them ([`PRINTS_ISSUER_SURFACE`]),
+/// and the edge's port, which the daemon names before it says it serves.
+fn start_anchor_with_vcs_http(
+  instance: &str,
+) -> (AnchorProcess, Option<Vec<(String, String)>>, u16) {
+  use std::io::{BufRead, Write};
+  let mut child = slates()
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-http",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let (mut port, mut exports, mut serving) = (None, None, false);
+  let mut line = String::new();
+  while !serving || (PRINTS_ISSUER_SURFACE && exports.is_none()) {
+    line.clear();
+    let read = stderr.read_line(&mut line).unwrap();
+    assert!(
+      read > 0,
+      "the anchor ended before its daemon served (its lines are above)"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    port = port.or_else(|| {
+      line
+        .strip_prefix(VCS_HTTP_CLEARTEXT_LINE)
+        .and_then(|rest| rest.trim().parse::<u16>().ok())
+    });
+    serving |= line.starts_with(&serving_line);
+    exports = exports.or_else(|| issuer_exports(&line));
+  }
+  anchor.drain = Some(echo_the_rest(stderr));
+  await_stable_daemon(instance, true);
+  let port = port.expect("the daemon named its edge's port before it served");
+  (anchor, exports, port)
+}
+
+/// A-685 (§4.17.1 "The repository and its greens"; §4.17.2 "Transports" item 1): `slates repository create` against
+/// a real anchor. Do: start an anchor whose daemon serves the version-control HTTP edge on loopback; create git
+/// repository `NAME` from the command line; create `NAME` again, for Mercurial; create one repository of each other
+/// tool with its defaults, and one with `--json`; enroll an HTTP token for this account (`slates credential token`, the
+/// issuer's verb) and ask the edge, with it as a bearer token, for `NAME`'s receive-pack advertisement and for a name
+/// no repository has. Expect: the create answers the repository and its root green's id; the second create is refused
+/// `AlreadyExists` (exit 1), a name being taken whatever the tool; each tool's create answers with its defaults; the
+/// edge answers `200` for the repository by its name and `404` for the unknown name. Where this platform publishes no
+/// issuer surface (Linux: a descriptor only the anchor's children hold) the token's leg is skipped, loudly; the creates
+/// run everywhere.
+#[test]
+fn a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge() {
+  let instance = format!("cli-repository-{}", std::process::id());
+  let (anchor, issuer, port) = start_anchor_with_vcs_http(&instance);
+  let name = "made-by-the-cli";
+  let (code, out, err) = run(&instance, &["repository", "create", name, "--tool", "git"]);
+  assert_eq!(code, 0, "the create answers: {err}");
+  assert_eq!(value_of(&out, "repository"), name, "{out}");
+  assert_eq!(value_of(&out, "id").len(), 32, "the root green's id: {out}");
+  the_name_is_taken_whatever_the_tool(&instance, name);
+  each_tool_creates_with_its_defaults(&instance);
+  let Some(issuer) = issuer else {
+    println!(
+      "SKIP the edge's leg: this platform publishes no issuer surface through the environment, so a separate process \
+       cannot enroll a token (on Linux the anchor's segment is a descriptor its children hold). The creates ran."
+    );
+    return;
+  };
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "token"]);
+  assert_eq!(code, 0, "a token for this account: {err}");
+  let token = value_of(&out, "token");
+  let found = bearer_request(
+    port,
+    &format!("/{name}/info/refs?service=git-receive-pack"),
+    &token,
+  )
+  .expect("the edge answered for the repository");
+  let unknown = bearer_request(
+    port,
+    "/no-such-repository/info/refs?service=git-receive-pack",
+    &token,
+  )
+  .expect("the edge answered for the unknown name");
+  drop(anchor);
+  assert!(found.starts_with("http/1.1 200 "), "found by name: {found}");
+  assert!(
+    unknown.starts_with("http/1.1 404 "),
+    "no repository of that name: {unknown}"
+  );
+}
+
+/// `repository create NAME` again, for another tool than the first: refused `AlreadyExists`, exit 1 (a repository's
+/// name is unique whatever its tool, §4.17.1 item 1).
+fn the_name_is_taken_whatever_the_tool(instance: &str, name: &str) {
+  let (code, out, err) = run(instance, &["repository", "create", name, "--tool", "hg"]);
+  assert_eq!(code, 1, "the name is taken: {out}{err}");
+  assert!(err.contains("AlreadyExists"), "{err}");
+}
+
+/// A repository of each tool, with its defaults, and one created with `--json`: each answers (exit 0), the JSON one with
+/// its name and its root green's id.
+fn each_tool_creates_with_its_defaults(instance: &str) {
+  for (name, tool) in [("an-hg-one", "hg"), ("an-svn-one", "svn")] {
+    let (code, out, err) = run(instance, &["repository", "create", name, "--tool", tool]);
+    assert_eq!(code, 0, "{tool}'s create answers: {err}");
+    assert_eq!(value_of(&out, "repository"), name, "{out}");
+  }
+  let (code, out, err) = run(
+    instance,
+    &[
+      "repository",
+      "create",
+      "a-sha256-one",
+      "--tool",
+      "git",
+      "--format",
+      "sha256",
+      "--json",
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("\"repository\":\"a-sha256-one\"") && out.contains("\"id\":\""),
+    "{out}"
+  );
 }

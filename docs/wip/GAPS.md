@@ -26,13 +26,25 @@
 > claim (main's ruling), the read waiting for room on the partition's channel and one never answered refusing the
 > submit `Overloaded`, unrecorded; every submit carrying its message (`Authorship`; `RequestBody::submit` the one
 > constructor, `with_message` the builder); the green's owner refusing `MessageRequired` and `IdentityRequired` beside
-> `EvidenceRequired`, before any work is built (the api's contract 51). OWED: the clients' surfaces
+> `EvidenceRequired`, before any work is built (the api's contract 51). Part 3's first piece BUILT
+> (`crates/server/src/vcs_store/paths.rs` and its tests; A-664 part 3's entry has the runs, on macOS arm64): each member
+> green of a git repository keeps the map of paths to git's files of its head (A-647's path map of `FileClass` entries
+> over the shard's content store, one a green, its root held once by the store), made as each version commits on the
+> owner (a submit's after its record is appended, a push's after its entry is applied): derived from the one before over
+> the change index and the hard links naming each changed file (`Green::links_naming`; the index names a change to a
+> regular file at the file alone), built whole where no map of the version before is kept or a copy names a tree by its
+> destination alone (`Green::copied_after`, A-586); given back as the green leaves its lineage
+> (`repository::retire_member`), made again from the head by a recovery and a rebuild, freed with the repository; the
+> live store held equal to one made again after a branch's destroy. OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); part 3, the made
 > commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
-> it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
-> `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
+> it and the branch's head names it, derived from the maps part 3's first piece keeps; the maps' whole builds and a
+> whole map's release sliced a unit at a time (each is one step, as A-662's replay of a record is); a branch's first
+> map derived from its source's where the source's head is the version it was made at; the holders' maps (A-636's
+> fleet half); a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
+> (A-626 part 4); a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
 > `.gitmodules` link, a name past 4096 bytes); a `.gitmodules` blob's own checks; blob ids read by content from the git
 > store's rows, so a rename or a revert hashes nothing; a derivation's transient listings charged to the store; then
 > Mercurial's changesets the server makes (§4.17.3 decision 7, piece 6) and Subversion's revisions (§4.17.4's revision
@@ -87,6 +99,15 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-685 (2026-11-19, g305; piece 1's client half):** a repository is made from the command line, `slates repository
+> create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]`, through
+> `Client::create_repository`; each tool's defaults are the server crate's (`object_formats`, `root_binding`: git SHA-1
+> on `main`, Mercurial SHA-1 on `default`'s first line, Subversion's revisions bound to `root`); a format or branch the
+> tool cannot have is usage (exit 2), a name taken `AlreadyExists` (exit 1). Tests: the grammar's two and a real
+> anchor's CLI test (the A-685 entry has the runs). OWED: the other repository verbs on the command line (`CreateBranch`,
+> `BindBranch`, `RetireBranch`, `SetRepositoryPolicy`, `ImportRepository`), the SDKs' and MCP's words, and the
+> server's own refusal of a format its tool does not name (it records the repository today and makes no git store for
+> `--tool git` in revisions; the CLI refuses it before asking).
 > **A-600 (2026-11-19, g230; piece 2's object names):** `slates-git` names objects. It reads and writes the object
 > header within git's 32 bytes, its size charged to the caller's admission first, and refuses `ofs-delta` and
 > `ref-delta` by kind. It maps `object-format` both ways. It hashes in either format: SHA-1 through RustCrypto's
@@ -572,6 +593,9 @@
 > main 770ae8826): `slates-http-edge --lib credential` 10 of 10, `slates-server --lib vcs_http::` 46 of 46 (stock hg
 > 7.2 against the edge serving the hg site: `abort: HTTP Error 503`, the site reached), `slates-cli --test cli
 > vcs_http` 2 of 2, fmt clean; over main 693bc8feb (kiln r361, Subversion's site deciding alike) 10, 51 and 2 of each.
+> Over main b288b412e, with Mercurial's site on the daemon's edge (A-680 part 2a): stock hg 7.2's `hg identify` by
+> Basic on a daemon's loopback cleartext edge served from the repository's store, and g083's clone with no credentials
+> against a real anchor un-ignored, refused in hg's own words. RUNS_PENDING
 > Owed: the daemon serving the hg site beside git's (its site is git's alone, so stock hg against a running anchor
 > meets git's `404`; A-680 part 2 and the sites' composition), then g083's stock-hg anchor tests un-ignored; stock
 > svn over the loopback edge (A-681); the Windows and Linux runs (main's).
@@ -1004,6 +1028,14 @@
 > manifest::` 61 of 61 (red first, 6 of the view's 9 failing against a stub), `slates-server --lib vcs_http::hg` 7 of 7
 > and fmt clean on macOS arm64 (Mac Studio, kiln r256, 2026-11-19), the two `fixtures/state` repositories held to stock
 > 7.2's `served` answers; the other platforms owed.
+> **Built (A-680 part 2a):** Mercurial's site on the daemon's edge (`vcs_http::ToolSites`: a request whose query names a
+> command is Mercurial's, as hgweb tells a wire request, every other git's), each repository's served view lent afresh
+> for each step from its store on its owner shard with its register's phase roots and bookmarks
+> (`vcs_store::hg_view::ServedViews`, which both edges reach a Mercurial store through; `NoStores` removed), made within
+> the request's room, a store an import is filling not lent; every repository publishing until its record carries
+> `phases.publish`. `slates-server --lib` filtered 51 of 51 and fmt clean on macOS arm64 (Mac Studio, kiln r357,
+> 2026-11-19): a daemon's edge answers `capabilities` and `heads` of a repository on another shard holding
+> `fixtures/state`'s `states` by an import; the other platforms owed.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -1023,16 +1055,15 @@
 > stock Mercurial 7.2 (`SLATES_TEST_HG`, skipping loudly without it) against a real anchor: a clone with no credentials
 > refused in hg's own words, and a round trip (a fresh history pushed, cloned, a changeset pushed from the clone and
 > pulled back) over the HTTP edge and over the SSH edge. Each is ignored naming the pieces it waits on, and the last
-> of them to land un-ignores it as its integration test: the daemon's edge serves git's site alone, so hg's request
-> meets `404` (A-680, g303: the hg site's stores and lender); `slates repository create <name> --tool hg` (A-685,
-> g305); `--vcs-ssh <addr>` (A-684, g299); hg's `serve --stdio` on the SSH edge (A-679, g304). The site's `401`
+> of them to land un-ignores it as its integration test. The clone with no credentials runs since A-686 (g258), its
+> last wait: the daemon's edge served git's site alone until A-680 part 2a (hg met `404`), and the site's `401`
 > offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
-> first challenge alone): since A-686 (g258, main's ruling) Basic's challenge goes first on every connection and Basic
-> with the token as password is taken on the loopback edge, and stock hg 7.2 gets past the edge's `401`.
+> first challenge alone), until A-686 put Basic's challenge first and took Basic with the token as password on the
+> loopback edge. The HTTP round trip waits on the hg site's pushes (A-680 part 2b, g303); the SSH one on `--vcs-ssh
+> <addr>` (A-684, g299) and hg's `serve --stdio` on the SSH edge (A-679, g304).
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
-> g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site with the served view over
-> them (A-680 part 2, g303, running) and that loop
-> (their home on each owner shard is built); the learned
+> g304, running; the edge itself is A-651's, built); A-662's stores lent to that loop through the lender the HTTP site
+> reads them by (`vcs_store::hg_view::ServedViews`, built, A-680 part 2a); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
@@ -1041,8 +1072,8 @@
 > the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
 > (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
 > it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
-> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the site's use of the served view over them
-> (A-680 part 2; the view is built, A-680 part 1);
+> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the HTTP site's pushes through them (A-680 part
+> 2b; the served view and the site's lender are built);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
@@ -1176,8 +1207,8 @@
 > served, so `svn log` and `svn checkout` reach a repository (part 1's next slices); (2) the write side (part 2); (3)
 > the daemon composing the site beside git's and handing it the stores, `503` until then; (4) a repository whose name
 > holds a slash, which `SVNParentPath`'s first-segment rule cannot reach over HTTP without a longest-prefix search
-> across partitions; (5) a browser's `?p=` and `?r=` and a directory's HTML listing (`501`); (6) Basic on the cleartext
-> loopback edge (A-686). A-531 (2026-11-19): the ra_svn item codec, its
+> across partitions; (5) a browser's `?p=` and `?r=` and a directory's HTML listing (`501`). Basic on the cleartext
+> loopback edge, offered first, is built (A-686). A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its
@@ -1407,7 +1438,8 @@
 > first missing piece (r293: `--vcs-svn` and `--vcs-ssh` unknown flags; `repository create` refused as usage):
 > `svn://` on A-689 and its repository lookup (g234), A-685 (g305) and CRAM-MD5's secrets (A-599's owed (3), no piece
 > yet: the test's user, a token's id, and its password, the token, are its assumption); `http://`'s round trip on
-> A-681's reads and commits (g297), A-686 (g258) and A-685, and its lock session on A-681's `LOCK` and `UNLOCK`;
+> A-681's reads and commits (g297) and A-685 (A-686's Basic is built), and its lock session on A-681's `LOCK` and
+> `UNLOCK`;
 > `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
 > no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
 > differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
