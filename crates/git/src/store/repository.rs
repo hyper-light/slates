@@ -600,6 +600,31 @@ impl Repository {
       .ok_or(StoreRefused::NotACommit { id: *id })
   }
 
+  /// A tree's entries' objects with their names, in the tree's order, a submodule's commit left out (A-640 part 4: what
+  /// a sparse filter asks its patterns of).
+  fn tree_named_references(
+    &self,
+    store: &ContentStore,
+    id: &ObjectId,
+    place: &Place,
+  ) -> Result<Vec<(ObjectId, Vec<u8>)>, StoreRefused> {
+    let bytes = Repository::bytes_of(store, id, place)?;
+    let malformed = StoreRefused::Malformed { id: *id };
+    let tree =
+      Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
+    tree
+      .entries()
+      .iter()
+      .filter(|entry| entry.kind() != Kind::Commit)
+      .map(|entry| {
+        entry
+          .object_id(self.format)
+          .map(|object| (object, entry.name.to_vec()))
+          .ok_or(malformed)
+      })
+      .collect()
+  }
+
   /// A tree's entries' objects, a submodule's commit left out.
   fn tree_references(
     &self,

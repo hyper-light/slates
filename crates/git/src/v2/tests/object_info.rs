@@ -179,13 +179,14 @@ impl Entries for Loose<'_> {
 
   fn next_entry(&mut self) -> Option<Result<Incoming<'_>, Infallible>> {
     let rest = self.bytes.get(self.at..).filter(|rest| !rest.is_empty())?;
-    let (header, took) = read_header(rest, &mut Admission::new(u64::MAX)).unwrap();
-    let end = took + usize::try_from(header.size).unwrap();
-    self.at += end;
+    let (header, took) = read_header(rest, &mut Admission::new(u64::MAX)).ok()?;
+    let end = took.checked_add(usize::try_from(header.size).ok()?)?;
+    let content = rest.get(took..end)?;
+    self.at = self.at.checked_add(end)?;
     Some(Ok(Incoming {
       kind: header.kind,
       claimed: None,
-      content: &rest[took..end],
+      content,
       depth: 0,
     }))
   }

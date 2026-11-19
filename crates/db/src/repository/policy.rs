@@ -4,13 +4,16 @@
 //! A rule's pattern names what its repository's tool has (git's refs, Mercurial's branches, bookmarks and topics,
 //! Subversion's paths), is not empty and holds no NUL, and a Subversion path starts at the root, `/path` or
 //! `:glob:/path`; these are the same rules the server's matcher reads a pattern by (`slates_server`'s `vcs_policy`,
-//! A-597), so a recorded policy always compiles. A hook is at one of its repository's tool's points, under a name the
+//! A-597), so a recorded policy always compiles. A rule's right is one its repository's tool has: the requirements
+//! (merge commits, unsigned commits; A-644) are git's alone, the one push path that judges them, so a rule no push
+//! would enforce never enters the log. A hook is at one of its repository's tool's points, under a name the
 //! point allows (Mercurial's `pretxnchangegroup` or `pretxnchangegroup.suffix`, one hook a name; git's and Subversion's
 //! the point's own name, one hook a point, as each keeps one hook file a point), and runs a program by an absolute path
 //! holding no NUL. A Subversion repository's hooks-env (A-648) holds sections named by something, holding no NUL, whose
 //! variables are each one variable of a hook's environment: a name not empty, holding no `=` and no NUL, and a value
 //! holding no NUL; any other repository holds none, since git's and Mercurial's hooks inherit the server's environment.
-//! A policy is charged its rules', hooks' and hooks-env sections' encoded bytes, so an empty one costs nothing.
+//! A policy is charged its rules', hooks', hooks-env sections' and trusted signers' encoded bytes, so an empty one costs
+//! nothing. The signers are the server's to read (each an SSH key its verb parsed, A-644), as a volume's are (A-321).
 
 use std::collections::BTreeSet;
 
@@ -53,8 +56,8 @@ pub(super) fn check(tool: VcsTool, policy: &RepositoryPolicy) -> Result<(), DbEr
   Ok(())
 }
 
-/// The bytes a policy is charged: its rules', hooks' and hooks-env sections' encoded bytes, what the partition holds of
-/// it beyond an empty one.
+/// The bytes a policy is charged: its rules', hooks', hooks-env sections' and trusted signers' encoded bytes, what the
+/// partition holds of it beyond an empty one.
 pub(super) fn bytes(policy: &RepositoryPolicy) -> usize {
   let rules = policy
     .rules
@@ -66,11 +69,16 @@ pub(super) fn bytes(policy: &RepositoryPolicy) -> usize {
     .iter()
     .map(|hook| hook.to_bytes().len())
     .fold(rules, usize::saturating_add);
-  policy
+  let sections = policy
     .hooks_env
     .iter()
     .map(|section| section.to_bytes().len())
-    .fold(hooks, usize::saturating_add)
+    .fold(hooks, usize::saturating_add);
+  policy
+    .signers
+    .iter()
+    .map(|key| key.to_bytes().len())
+    .fold(sections, usize::saturating_add)
 }
 
 /// An item's index among its part of the policy, as a refusal names it.
@@ -82,6 +90,7 @@ fn index_of(index: usize) -> u32 {
 fn rule_holds(tool: VcsTool, rule: &PolicyRule) -> bool {
   let pattern = rule.pattern.as_str();
   rule.names.of(tool)
+    && rule.right.of(tool)
     && !pattern.is_empty()
     && !pattern.contains('\0')
     && (rule.names != PolicyNames::Paths
@@ -172,6 +181,7 @@ mod tests {
       rules,
       hooks,
       hooks_env: Vec::new(),
+      signers: Vec::new(),
     }
   }
 
@@ -299,6 +309,67 @@ mod tests {
     let section = env_section("default", &[("LANG", b"en_US.UTF-8")]);
     let encoded = slates_wire::Wire::to_bytes(&section).len();
     assert_eq!(bytes(&with_env(vec![section])), encoded);
+  }
+
+  /// A rule of `right`, denied to everyone, over git's `refs/heads/main` or another tool's own name for its main line.
+  fn requirement(tool: VcsTool, right: PolicyRight) -> PolicyRule {
+    let (names, pattern) = match tool {
+      VcsTool::Git => (PolicyNames::Refs, "refs/heads/main"),
+      VcsTool::Mercurial => (PolicyNames::Branches, "default"),
+      VcsTool::Subversion => (PolicyNames::Paths, "/trunk"),
+    };
+    PolicyRule {
+      right,
+      effect: PolicyEffect::Deny,
+      ..rule(names, pattern)
+    }
+  }
+
+  /// A-644 (§4.17.2 "Protected branches": the requirements are git's push path's alone). Do: check a policy denying
+  /// merge commits and one denying unsigned commits on each tool's main line, each after a rule every tool holds. Expect:
+  /// git holds both; Mercurial and Subversion refuse each, naming its index (1), since no push of theirs would judge it.
+  #[test]
+  fn a_requirement_is_held_by_git_alone() {
+    for right in [PolicyRight::MergeCommit, PolicyRight::UnsignedCommit] {
+      let answers: Vec<Result<(), DbError>> =
+        [VcsTool::Git, VcsTool::Mercurial, VcsTool::Subversion]
+          .into_iter()
+          .map(|tool| {
+            let mut held = requirement(tool, PolicyRight::Submit);
+            held.effect = PolicyEffect::Allow;
+            check(
+              tool,
+              &policy(vec![held, requirement(tool, right)], Vec::new()),
+            )
+          })
+          .collect();
+      let refused = Err(DbError::PolicyRuleMalformed { index: 1 });
+      assert_eq!(answers, vec![Ok(()), refused.clone(), refused], "{right:?}");
+    }
+  }
+
+  /// A-644 (the charge). Do: weigh a policy of one trusted signer, and one of a rule and two signers. Expect: each
+  /// signer's encoded bytes, beside the rule's, so a key list is held in the partition's budget as rules are.
+  #[test]
+  fn a_policy_is_charged_its_trusted_signers() {
+    use slates_wire::Wire;
+    let (first, second) = (vec![7u8; 51], vec![9u8; 83]);
+    let signed = |rules: Vec<PolicyRule>, signers: Vec<Vec<u8>>| RepositoryPolicy {
+      signers,
+      ..policy(rules, Vec::new())
+    };
+    let one = rule(PolicyNames::Refs, "refs/heads/main");
+    assert_eq!(
+      bytes(&signed(Vec::new(), vec![first.clone()])),
+      first.to_bytes().len()
+    );
+    assert_eq!(
+      bytes(&signed(
+        vec![one.clone()],
+        vec![first.clone(), second.clone()]
+      )),
+      one.to_bytes().len() + first.to_bytes().len() + second.to_bytes().len()
+    );
   }
 
   /// A-622 (the rules the log keeps). Do: check rules of every kind against each tool. Expect: git takes refs alone,

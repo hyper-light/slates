@@ -12319,6 +12319,17 @@ is one more version, and the chain itself is never rewritten.
 > always reaped (a run whose task is dropped kills the group and hands the child to a reaper task). The run's lesson
 > goes back to its caller, which teaches the hook's times on the shard. Owed: the Windows driver (a job object, the
 > handle-list spawn of `slates_ipc::win_spawn`), the launcher's namespace on Linux (§4.6), and the push pieces' calls.
+>
+> **Status (2026-11-19, A-644 part 2: a protected name's requirements in the policy).** A rule's right may be a
+> requirement as well as a permission: bringing a name a merge commit (`PolicyRight::MergeCommit`) or a commit no
+> trusted signer signed (`UnsignedCommit`). A rule denying one imposes it (a linear history, signed commits), a later
+> rule allowing it lifts it for whom it names, and where no rule speaks nothing is required, so a policy that names
+> neither asks no more of a push than before. The policy holds the keys trusted to sign the repository's commits
+> (`signers`, set whole with it; each a key A-321's verifier reads, kept once, a git repository's alone). The
+> requirements are git's alone: the database's guard refuses one for Mercurial or Subversion, whose pushes do not judge
+> them. `vcs_policy::admit` judges a change's own right, then a linear history, then signed commits, each where a rule
+> imposes it, asking what the change brings (`Brings`) only then, and refuses typed (`MergeCommit`, `UnsignedCommit`,
+> `Unjudged`). The git side is `crate::git_protect` (§4.17.2's status).
 
 > **Status (2026-11-19, A-671: the matcher's home).** git's `wildmatch` is `slates_vcs::wildmatch`
 > (`crates/vcs/src/wildmatch.rs`), moved whole from `crates/server`, behaviour unchanged: slates-vcs is the crate every
@@ -13016,6 +13027,16 @@ engine: the verdict, rebase, position mapping, the register).
 > stateless answers and its one-round sessions. Those goldens found A-615's object choice missing git's rule for a
 > thin pack in a shallow exchange (`--objects-edge-aggressive`), now kept and held by the oracle. A stateful v0
 > session, an SSH client's, is owed.
+>
+> **Status (2026-11-19, A-644 part 2: protected branches through the policy, end to end).** `crates/server`
+> (`git_protect`) composes them: a ref's change read from A-614's store gives the right it needs (a create or a
+> fast-forward submits, a rewrite rewrites, a delete deletes); `vcs_policy::admit` judges it with what the change brings
+> (`StoreBrings`, the store's answers), each commit's SSH signature verified by A-321's code under git's namespace
+> (`signed_work::verify_in`, `GIT_NAMESPACE`) against the policy's trusted keys (`CommitKeys`); and a refusal is
+> answered in git's words (`declined`: a denied rewrite or delete as git's own, every other refusal as git's update hook
+> would). Proven by the twelve pushes of A-644's golden vectors answered through the policy with every byte stock git
+> wrote, and by the commit signatures stock git made verifying under git's namespace alone. Owed: receive-pack's server
+> half asking it for each command (A-620 part 2's judge composed with the server's greens and appends).
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -13024,6 +13045,15 @@ engine: the verdict, rebase, position mapping, the register).
 > matches, a segment pattern anywhere and a slashed one from the root, globbed by `slates_vcs::wildmatch` (A-671). The
 > filter is still refused as not served: the walk by path with git's tree frames, the graph's named entries and the
 > blob's name resolved are its next slices.
+
+> **Status (2026-11-19, A-640 part 4, second slice: the walk by path).** A `sparse:oid` filter served alone, with the
+> patterns the request carries (`negotiation::Request::sparse`), walks each sent commit's tree, and each wanted tree,
+> by path as git's `filter_sparse` does (`negotiation::objects`): every tree reached is sent, and a blob when a path it
+> is met at is matched (an undecided path taking its tree's verdict, the root's base not matched); a tree no blob
+> below which was left out is done, and any other is walked again wherever it is met. The graph gives each tree's
+> entries their names (`Graph::named_entries`, A-614's store reading them from the tree's bytes). Refused: a
+> `sparse:oid` without its patterns, which the service does not read yet (the next slice), and one within a
+> `combine:`, where git's answer turns on its order of walk.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -14431,16 +14461,17 @@ and export by landing).
 >
 > **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
 > `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
-> (`reads::Repository`: entries, property lists, revision properties, texts in runs), the session's `Guards` (its locks)
-> and its one compiled read rule, which its read commands ask too (A-656 continued (2)): an explicit stack of frames,
-> never recursion, a step at a time under the caller's budget, the report read one path ahead as `reporter.c` reads it;
-> entry properties, lock tokens removed, property differences, absent entries, deletions with `svn_repos_deleted_rev`'s
-> revision, depth upgrades and exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve`
-> makes in its words. Held to every drive `svnserve` made in the recorded sessions (27, the early answer's being the
-> handler's), replayed from each session's own report over `history.txt` rebuilt into an index and a green and checked
-> against `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by
-> what its delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base
-> (`xdelta.c`), sent today as new data; and the handler.
+> (`reads::Repository`: entries, property lists, revision properties, texts in runs), A-602's lock table at the call's
+> instant, the one record of locks (A-656 continued (3)), and the session's one compiled read rule, which its read
+> commands ask too (A-656 continued (2)): an explicit stack of frames, never recursion, a step at a time under the
+> caller's budget, the report read one path ahead as `reporter.c` reads it; entry properties, lock tokens removed,
+> property differences, absent entries, deletions with `svn_repos_deleted_rev`'s revision, depth upgrades and
+> exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve` makes in its words. Held to
+> every drive `svnserve` made in the recorded sessions (27, the early answer's being the handler's), replayed from each
+> session's own report over `history.txt` rebuilt into an index and a green and checked against `svnlook changed`: call
+> for call, a node's own properties and a directory's deletions as sets, each text by what its delta makes of its base;
+> red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`), sent today as new data; and
+> the handler.
 >
 > **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
 > (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
@@ -49971,6 +50002,159 @@ comment where `published` chooses a new shipper's holders); GAPS (the register n
     `a_successors_live_log_goes_on_past_every_position_durable_before_it` and
     `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to`.
   - The Linux and Windows runs are owed.
+
+### A-656, continued (3) — One record of locks: an update reads A-602's lock table (bug, 2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (A-616 part 2's second slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/report/drive.rs` (`Guards` removed, `Sources::locks` and `Sources::now`, `held_token`),
+`report/drive/green.rs` (`FixtureGuards` removed, `locks_of`, `NOW`) and the drive's tests;
+`crates/svn/src/report/exchange.rs` and its tests; `crates/svn/src/serve.rs` (`Sources::guards` removed,
+`Sources::now`) and its tests;
+`docs/bugs/2026-11-19-an-update-judged-locks-by-the-callers-guards-not-the-lock-table.md`.
+
+- **Found** while landing A-656 continued (2): an update's drive asked the caller's `Guards::lock_token` for the lock
+  held on a path (`reporter.c`'s `svn_fs_get_lock` in `update_entry` and `delta_files`), while a commit's checks, the
+  lock verbs and DAV's lock answers read A-602's lock table: two sources for one fact. With a lock the table held and
+  the guards did not, an update told the client its lock was gone (`svn:entry:lock-token` with no value) though a
+  commit with that token is honored; the reverse kept a token the table no longer held.
+- **One record.** The drive reads the lock table (`Sources::locks`) at the instant the caller gives with every call
+  (`Sources::now`, as a commit's `CommitStart::now`): `LockTable::get_lock`, which leaves an expired lock out as
+  `svn_fs_get_lock` does. `Guards` and `serve::Sources::guards` are gone, with the generic parameter every function
+  carried for them; the connection hands the drive the table its `Sources` hold.
+- **Tests.** `an_update_keeps_a_lock_the_lock_table_holds_and_takes_away_one_it_does_not` (`serve/tests.rs`): an
+  update of `/trunk` from a working copy at r6 whose `a.txt` holds a token, once with the table holding that lock and
+  once with it holding none: `a.txt` left alone, then its token taken away. Red before the change (macOS arm64, Mac
+  Studio, 2026-11-19, over main at `901be4f52`, the guards holding no lock): `( open-file ( 5:a.txt 2:d0 2:c1 ( 6 ) )
+  )` and `( change-file-prop ( 2:c1 20:svn:entry:lock-token ( ) ) )` where the table held the lock. The recorded
+  `update-with-lock` session's lock, which the fixtures' guards held by hand, is now a lock in the table its replays
+  read (`green::locks_of`). Run (macOS arm64, Mac Studio): `cargo test --locked -p slates-svn --lib -- commit::
+  serve:: lock:: report::` 130 of 130 on the tree landed over main at `bb535bd4d` (126 of 126 before main's
+  `a5ceb9c02`, whose new tests read the lock table too), `cargo fmt -p slates-svn -- --check` clean; the crate has no
+  integration target.
+- **Owed.** The commit drive's second compile of `Policy::authz` (it should take the session's set: main's next
+  piece); the Windows run and red-checks (main's).
+
+### A-644 part 2 — Protected branches through A-622's policy: two requirement rights and the trusted commit signers, judged at the check point after the change's own right, the commits' SSH signatures verified by A-321's code under git's namespace, and every refusal in git's words (2026-11-19, g230, UI goal 93; §4.17.1 "Policy", §4.17.2 "Protected branches, in git's terms" and "Pieces (git)" piece 11; after A-321, A-622 and A-644 part 1)
+Applied in the same change to: §4.17.1's status (the policy's requirements and signers) and §4.17.2's (the server's
+half); GAPS (the §4.17 entry); `crates/db` (`catalog.rs`: `PolicyRight::MergeCommit` and `UnsignedCommit`, appended,
+with `PolicyRight::of`; `RepositoryPolicy::signers`, appended; `repository/policy.rs`, the guard and the charge;
+`tests/wire_order.txt`, the two tags published); `crates/ipc` (`protocol.rs`: the same rights and
+`SetRepositoryPolicy::signers`, appended; `tests/wire_order.txt`); `crates/server` (`vcs_policy.rs`: the requirement
+rights, `Brings`, `admit`'s order and three refusals; `signed_work.rs`: `verify_in`, `GIT_NAMESPACE`;
+`repository.rs`: the verb's signers; `verbs.rs`; `git_protect.rs` and its tests, new; `lfs.rs`, whose asks bring
+nothing; `Cargo.toml`: `slates-vcs`, which names the store's content, a dependency beside its dev-dependency (A-625
+part 3), so the lock is unchanged; `svn_hooks`'s and `vcs_http`'s tests, whose records trust no signer);
+`crates/git`'s tests of A-600, A-604 and A-624 (their generators without `prop_oneof!`, R2, and their helpers without
+`unwrap`).
+- **How a protection is configured.** In A-622's rules, as §4.17.1 sets policy "per repository and per green, by name
+  pattern". A rewrite and a delete were rights already (`Rewrite`, `Delete`): a rule denying them is
+  `receive.denyNonFastForwards` and `receive.denyDeletes` on the names it covers. A linear history and signed commits
+  are two new rights that work as requirements (`MergeCommit`, `UnsignedCommit`). A rule denying one imposes it. A later
+  rule allowing it lifts it for whom it names, by git's precedence, the last covering rule (a bypass list). Where no
+  rule speaks nothing is required: unlike a permission, which a policy that leaves it unruled keeps for the owner
+  (A-575), a requirement no one configured binds no one, so every policy written before asks no more of a push than it
+  did. The keys trusted to sign commits are the policy's own (`signers`), set whole with it by the owner, as a volume's
+  signers are its launcher's (A-321): the verb keeps each key A-321's verifier reads, once, in order, and refuses one it
+  cannot read or any for a repository that is not git's (`BadRequest`). The database's guard holds the requirement
+  rights to git, the one tool whose push judges them (Mercurial's linear history waits for its push path to judge it),
+  so a rule no push would enforce never enters the log.
+- **The check point.** `vcs_policy::admit` stays the one function a push asks. It judges each change's own right first
+  (the store's change, A-644 part 1: a create or a fast-forward submits, a rewrite rewrites, a delete deletes). Then, in
+  the design's order, a linear history, then signed commits, each only where a rule imposes it; the change's `Brings` is
+  asked then and not before, so a name no requirement covers costs no walk and no signature (counted in the tests). The
+  record's signers are read once a push. The refusals are typed: `MergeCommit` and `UnsignedCommit` name the change, the
+  rule and the commit (and why it is not a trusted signer's), and `Unjudged` carries the store's refusal, a damaged
+  store never judged around. The requirements are git's alone, so these name git's commits.
+- **The server's git half** (`git_protect`). `StoreBrings` answers `Brings` from A-614's store (part 1's walks).
+  `CommitKeys` is A-321's verifier over the policy's keys: the commit's armour dearmoured, verified under git's
+  namespace (`verify_in`, `GIT_NAMESPACE`; git signs with `ssh-keygen -Y sign -n git`), with words for each of A-321's
+  refusals. `declined` answers the check point's refusals in git's words: a denied rewrite or delete as git's own
+  (`non-fast-forward`, `deletion prohibited`), a merge commit and an unsigned commit as part 1's hook words, and every
+  other refusal as git's update hook would (`hook declined`, after `denying the update of <ref> (<why>)`).
+- **Tests** (Mac Studio M3 Ultra, kiln r1125, 2026-11-19, debug, load 9 to 16): `cargo test --locked -p slates-db --lib`
+  140 of 140; `-p slates-ipc --lib` 74 passed, 2 ignored; `-p slates-server --lib` 621 passed, 3 ignored, and one failed
+  that fails on main too:
+  `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` failed 3 of 3 at
+  8b3297fe0 (main, without this change) and 5 of 5 here, alone; `cargo fmt -p slates-db -p slates-ipc -p slates-server
+  -- --check` clean. Twelve pushes of part 1's golden vectors are answered through the policy with every byte stock git
+  wrote: a git record denying `main`'s rewrite, delete, merge commits and unsigned commits, trusting the fixtures' key,
+  its commits verified by A-321's code. The commit signatures stock git made verify under git's namespace alone (as
+  signed work they are `Namespace`, under the other key `UnregisteredKey`, over a changed payload `BadSignature`). A
+  requirement binds only where a rule imposes it and lifts for whom a later rule names, never asked where none does;
+  signatures are judged under exactly the record's keys; a linear history before signatures; a store's refusal typed;
+  the verb keeps a git repository's signers once and refuses a Mercurial repository's, and its requirement rule.
+  - Red first (on the Studio, at 1c6ec1f1e, the entry points stubbed): slates-db 2 of 2 new tests failed; slates-server
+    6 of 7 new (the seventh, that a push no requirement names is applied, holds of the stubs too). A first red run met a
+    target directory shared with main's tree: cargo took main's crates as fresh (`git archive` stamps a file with its
+    commit's time, older than the last build), so the run failed to compile against them; `cargo clean -p` for the four
+    crates, then the run above.
+  - Red eight ways by mutation (kiln r1169, and the guard's mutation again after its first pattern missed), each caught:
+    a lifted requirement still binding; the record's signers not read; signatures judged before a linear history; the
+    namespace ignored; signers kept twice; the guard holding the requirements for every tool; a denied rewrite answered
+    as a hook's; the untrusted words changed.
+  - The tree it lands from (fe2533225: main 92ffda926 and this change), on the Mac Studio (macOS arm64, kiln r14 and
+    r31, 2026-11-19, debug, load 9 to 11): `cargo fmt --check` clean for slates-db, slates-ipc, slates-git and
+    slates-server; `cargo test --locked -p slates-db --lib repository::` 23 of 23; `-p slates-ipc --lib protocol::` 5
+    passed, 1 ignored; `-p slates-git --lib` over the four test modules this change edits 49 of 49;
+    `-p slates-db --test wire_order every_` and `-p slates-ipc --test wire_order every_` 2 of 2 each (the appended
+    tags); `-p slates-server --test signed_work` over its signed merges, signed landings, trusted signers and a
+    landing's signature, 8 of 8 (A-321's verifier through a daemon, its namespace now a parameter); and
+    `-p slates-server --lib` over `git_protect::`, `vcs_policy::`, `signed_work::`, `repository::`, `lfs::`,
+    `svn_hooks::` and `vcs_http::git::tests` 62 of 62 at 4 threads, the seven new tests among them, compiled with
+    main's own break of that lib's tests patched in the run's copy alone (its HTTP tests' stub pack source returned
+    `PackRefused::Stalled`, which A-640 part 3 removed; main's 93bd6e807 fixed it).
+- **Owed:** receive-pack's server half asking all of this for each command (A-620 part 2's judge over the store,
+  composed with the server's greens and appends), and its hooks (A-622 part 3); Mercurial's linear history on its push
+  path (A-641); OpenPGP and X.509 commit signatures; a push's commits judged in slices under the shard's budget.
+
+### A-640 part 4, second slice — The walk by path: git's sparse frames over named tree entries (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-615 part 2, A-640 part 4 first slice)
+Applied in the same change to:
+- §4.17.2's statuses (a status after the first slice's);
+- GAPS (the A-640 entries);
+- `crates/git/src/negotiation/mod.rs` (`Graph::named_entries`, `Request::sparse`, the served check, the module doc),
+  `negotiation/filter.rs` (`check_served`, `Refusal::SparseCombined`, the module doc), `negotiation/objects.rs` (the
+  sparse walk), `store/graph.rs` and `store/repository.rs` (named entries from the store), `upload/fetch.rs` and
+  `upload/v0.rs` (no patterns yet);
+- the tests: `negotiation/tests/mod.rs` (the oracle and three cases), `negotiation/tests/filter.rs`,
+  `tests/store_graph.rs`.
+
+- **What git does** [C: `list-objects-filter.c` `filter_sparse`; `list-objects.c` `process_tree`,
+  `process_tree_contents` and `process_blob`; git v2.50.1]. Walking each tree with its path, the filter keeps a frame
+  for each tree: at `LOFS_BEGIN_TREE` the tree's path is asked as a directory, an undecided verdict taking its parent
+  frame's, and the tree is shown the first time it is met; at `LOFS_BLOB` a matched blob is shown and marked seen, and
+  any other is left out for now (`child_prov_omit`) and asked again wherever else it is met; at `LOFS_END_TREE` a tree
+  no blob below which was left out is marked seen, never walked again. What is shown is what some path decides,
+  whatever order the trees are met in.
+- **The walk** (`objects::Chosen::walk_sparse`): the same frames on an explicit stack (`SparseWalk`, `Frame`), with no
+  recursion; each frame, each entry with its name, each path byte and each tree done charged to the request's
+  admission, which so bounds the walk's work as well as what it keeps (a tree met at many paths is walked at each until
+  it is done). A wanted tree is walked from its own root, its path empty, as git walks a tree a client named.
+- **Named entries** (`Graph::named_entries`): the store reads a tree's entries with their names from its bytes
+  (`Repository::tree_named_references`, beside `tree_references`), a submodule's commit left out as before.
+- **Served alone.** Inside a `combine:`, git's answer turns on its order of walk: each other filter marks a blob seen
+  at the first path it is met at (`process_subfilter`), so the combination never sends it at a later path the
+  patterns match. The walk keeps no such order, so a `combine:` holding `sparse:oid` is refused
+  (`filter::Refusal::SparseCombined`), as is `sparse:oid` without its patterns (`filter::Refusal::SparseOid`) until the
+  service reads them (the next slice).
+- **Tests.** The negotiation's oracle states the rule over every path unfolded (`oracle_sparse`: every tree reached,
+  a blob when a path to it is matched, an undecided path taking the nearest decided tree's verdict), with no frames,
+  no done trees and no order, and holds every generated history to it: entries named from a table, patterns built
+  from eight lines chosen by the plan, one plan in eight without patterns and some within a `combine:`; its census now
+  requires a served sparse pack, and one that left a blob out of a tree it holds. Three cases: a blob left out at one
+  path and sent through another; a tree walked once when done and twice while a blob below it was left out (the count
+  of trees opened is the witness); and the two refusals. Over the real store, a sparse clone under `*` sends exactly
+  stock git's clone pack, and under no pattern the same less every blob.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r6, over main bb535bd4d with this
+  slice (`agents/g296-a640-p4b` at b991ab570): `cargo test --locked -p slates-git --lib -- negotiation::
+  store::repository::graph::tests:: upload::tests::refused::` 39 of 39, the oracle over 4,096 histories among them;
+  `cargo fmt -p slates-git -- --check` clean. Failing first (kiln r213, over main 2dc39bd60 with this slice, in the
+  clone): with `walk_sparse` and `named_entries_of` stubbed, the two walk cases, the store's sparse clone and the
+  oracle failed, 4 of 39, the refusals and the rest passing; restored, 39 of 39. Nothing outside slates-git names
+  what changed (no other crate implements `Graph`, builds a negotiation `Request` or matches a filter refusal), and no
+  integration target reaches it. The Linux and Windows runs are owed.
+- **Next slice.** The service (`upload`): `<blob-ish>` resolved (a full id, or `<rev>:<path>` through the refs'
+  rules; other forms refused by kind), its blob read within the request's admission and its patterns given to the
+  negotiation, git's two refusals' words ("unable to access sparse blob in '%s'", "unable to parse sparse filter data
+  in %s"), and a stock git `sparse:oid` exchange recorded as a golden.
 
 ### A-601, continued (2) — The lease's half: a deposed owner past its lease never answers a read older than an acknowledged commit, proven by tests that already stand (2026-11-19, g229, main's piece for UI goal 82; §4.8 "Leases and reads"; AUD-08, A-351)
 Applied in the same change to: §4.10's live-log status (the lease's half cited). No code changed.
