@@ -528,6 +528,8 @@ fn a_stack_lands_as_its_works_applied_in_order_to_whole_trees_over_every_history
     panic!("{failure}");
   }
   let census = census.into_inner();
+  // The figures the evidence quotes (`-- --nocapture`).
+  eprintln!("stack oracle census: {census:?}");
   let met = [
     census.remapped,
     census.unmoved,
@@ -622,6 +624,8 @@ fn a_work_over_a_tree_lands_as_its_whole_file_model_does_over_every_history() {
     panic!("{failure}");
   }
   let census = census.into_inner();
+  // The figures the evidence quotes (`-- --nocapture`).
+  eprintln!("tree oracle census: {census:?}");
   assert!(
     census.tree_applied > 0 && census.tree_refused > 0,
     "an answer never met: {census:?}"
