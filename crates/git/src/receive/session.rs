@@ -8,7 +8,9 @@
 //! `receive-pack --stateless-rpc` for each.
 //!
 //! **Nothing is held across calls.** The repository a thin pack's bases and the connectivity check
-//! read is handed to each call that reads, and the judge to the call that decides. Between the two
+//! read is handed to each call that reads, and the judge to the call that decides. The session owns
+//! its advertisement (a copy) and its hidden refs, so a caller keeps it across its own steps, as a
+//! connection's task keeps it between the bytes it is handed (A-654). Between the two
 //! the push waits checked ([`Session::checked`]): the caller admits its objects to its store's
 //! quarantine there, which needs the store the repository's view borrowed (A-638), and then
 //! decides it.
@@ -46,20 +48,20 @@ enum State<'s> {
 }
 
 /// One push over one connection, sans-io.
-pub struct Session<'s, H: ?Sized> {
+pub struct Session<'s, H> {
   /// What the server advertises.
-  advertised: &'s Advertised<'s>,
+  advertised: Advertised<'s>,
   /// The refs hidden from this pusher.
-  hidden: &'s H,
+  hidden: H,
   /// What comes next.
   state: State<'s>,
 }
 
-impl<'s, H: HiddenRefs + ?Sized> Session<'s, H> {
+impl<'s, H: HiddenRefs> Session<'s, H> {
   /// A session of a push to a server that advertises `advertised`, hiding what `hidden` hides.
-  pub fn new(advertised: &'s Advertised<'s>, hidden: &'s H) -> Self {
+  pub fn new(advertised: &Advertised<'s>, hidden: H) -> Self {
     Self {
-      advertised,
+      advertised: *advertised,
       hidden,
       state: State::Request(RequestReader::new(advertised)),
     }
@@ -68,7 +70,7 @@ impl<'s, H: HiddenRefs + ?Sized> Session<'s, H> {
   /// Writes the advertisement of `refs` (in git's order, by name) a pusher may see: every one
   /// `hidden` does not hide.
   pub fn advertise(&self, refs: &[(ObjectId, &[u8])], out: &mut impl Out) -> Result<(), Refusal> {
-    write_advertisement(&visible(refs, self.hidden), self.advertised, out)
+    write_advertisement(&visible(refs, &self.hidden), &self.advertised, out)
   }
 
   /// Takes the client's next bytes, a thin pack's bases and the connectivity check read from
@@ -106,7 +108,7 @@ impl<'s, H: HiddenRefs + ?Sized> Session<'s, H> {
       };
       let request = reader.request()?;
       if !request.wants_pack() {
-        let checked = check(request, None, repository, self.hidden, admission)?;
+        let checked = check(request, None, repository, &self.hidden, admission)?;
         self.state = State::Checked(checked);
         return Ok(true);
       }
@@ -189,7 +191,7 @@ impl<'s, H: HiddenRefs + ?Sized> Session<'s, H> {
       return Ok(false);
     };
     let unpacked = checked_pack(reader, read, repository, admission);
-    let checked = check(request, Some(unpacked), repository, self.hidden, admission)?;
+    let checked = check(request, Some(unpacked), repository, &self.hidden, admission)?;
     self.state = State::Checked(checked);
     Ok(true)
   }

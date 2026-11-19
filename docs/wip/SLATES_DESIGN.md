@@ -12911,6 +12911,12 @@ engine: the verdict, rebase, position mapping, the register).
 > five fetches are answered from the store's parts, every version encoded and a base pack made, each object once; and
 > `Streamed::counters` tells which of the store's paths wrote a pack (A-653 continued (1)).
 >
+> **Status (2026-11-19, A-653 continued (2): the fragments' encoding sliced).** A version's two fragments and a green's
+> base pack are encoded a unit at a time under the owner's quantum (`store::Encoding`, turned as upload-pack's stream
+> is): one pair of trees walked for the bases a reference delta may name, a window's worth of rows read into the
+> encoding's order, or one object encoded, a unit; both parts kept last. Between turns it holds no borrow, and over any
+> turns it writes the bytes one pass writes. Owed: one object, a pair of trees and a part's put each still one unit.
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -48833,6 +48839,90 @@ credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`
   `crates/merge/src/engine/compute_tests.rs` (new), `crates/merge/tests/rebase.rs` (a binding no longer mutable),
   `crates/merge/tests/engine.rs` (`symlink_merges`' last base), `crates/server/src/verbs.rs` (`map_rebase`:
   `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry; GAPS' A-645 entry.
+
+### A-653, continued (2) — A version's fragments and a base pack encoded a unit at a time under the owner's quantum (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 4; CLAUDE.md §3 "Bounded work everywhere"; A-614 part 2, A-639)
+
+Applied in the same change to: §4.17.2 (a status block), GAPS (the A-653 entry), `crates/git` (`store::encoding`,
+new: `Encoding`, `EncodingCounters`; `store::repository`: `encode_fragments` and `rebuild_base` one-call drivers over
+it, the walk, the reading of every object first and the batch order moved into it, its accessors; `store::fragment`:
+the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` shared; the store's module docs;
+`tests::store::encoding`, new).
+
+- **What was unbounded.** `encode_fragments` and `rebuild_base` each encoded in one call: every object's bytes read
+  first, sorted, then every delta trial and deflate, then both parts kept. A version brings any number of objects and
+  a base pack holds every object its head reaches, so one call's work had no bound but the repository's size, where
+  CLAUDE.md §3 chunks every loop over user-scaled data under the shard's budget.
+- **The encoding in turns.** `Encoding::fragments` or `Encoding::base`, then `advance` a turn at a time: units until
+  the owner's quantum (§4.3) is spent, at least one, as `Upload::advance` does. A unit is one pair of trees walked for
+  the bases a reference delta may name; a window's worth of handles of rows read into the order (by type, the largest
+  first, then by id: a row gives the type and the length, so no object's bytes are read before it is encoded); one
+  object encoded through the part's encoder; or, last, both parts kept and recorded. Between turns the encoding holds
+  no borrow: objects by id and position, the order as two sets, the walk's pending pairs and bases, the part's bytes so
+  far and the encoder's recent entries. Each unit learns into the repository's own window and levels. A version whose
+  fragments were kept meanwhile keeps those; a base pack is made from the head version and reach the making began
+  with; a refusal is every later turn's. `encode_fragments` and `rebuild_base` drive an encoding to its end in one
+  turn, the one-call form for tests and tools: there is no second encoder.
+- **Tests**, failing first against `Encoding`'s first state, today's encoding whole in its first unit:
+  `a_versions_fragments_are_encoded_an_object_a_unit_as_one_pass_encodes_them` (green 1 at two versions of 300 files,
+  the second changing 150 at their paths: its fragments encoded a turn at a time with a quantum of nothing, each turn
+  one unit, none encoding more than one object, walking more than one pair of trees or reading more than a window's
+  worth of rows, the rows read over more than one unit, and both fragments those of a twin encoded in one pass, byte
+  for byte) and `a_base_pack_is_made_an_object_a_unit_as_one_pass_makes_it` (the same for the base pack of every
+  object the head reaches). The store's other tests (A-614 part 2's fragments and base packs read back through A-608's
+  reader, A-639's and A-653's oracles over them) now run through the encoding.
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1), `cargo test --locked -p slates-git --lib --
+  store:: upload::`: with the first state, 120 passed, 2 failed (the two tests above, each at its first turn's
+  one-object check), 4 ignored; with the encoding, 122 passed, 0 failed, 4 ignored; over the tree landed, merged with
+  main's A-662 and A-671 (slates-git's store and slates-vcs), 123 passed, 0 failed, 4 ignored, 375 filtered out;
+  `cargo fmt -p slates-git -- --check` clean. No integration target reaches the store's encoding.
+- **Owed.** Within an encoding, one object's unit is bounded by that object and the learned window rather than by a
+  window of bytes (with A-639's owed delta search past a window), a pair of trees is read whole, and the last unit puts
+  each part whole into the content store, which has no put by pieces; the owner driving encodings by turns once it
+  holds a git repository (A-625 part 3); a turn's span measured on the owner (main's); the red-checks and the other
+  platforms' runs (main's).
+
+### A-654 part 1 — receive-pack's session owns its parts, and its verdicts are read only beside the appends (2026-11-19, g258, UI goal 93; §4.17.1 "A push is a work" items 1 to 5; §4.17.2 "A push" items 6 and 7; A-620, A-642, A-645, A-662)
+
+- **What was there.** A-620's `Session` borrowed its advertisement and its hidden refs for its life, and `Works` held
+  the greens shared and the appends exclusive at once; a create's work was built over an empty green. Neither fits
+  the server: a connection's task keeps its session between the bytes its edge hands it, and on the owner shard the
+  greens, the appends and the push's object view are one `ShardState`, which A-662's `push_sealed` changes.
+- **The decision.** (1) A create is made at the version of the green its new value's first parent heads, where one
+  can still be branched from, else at the default branch's head, its work the whole difference against that
+  version's tree; over an empty green only while the default branch is unborn (main's ruling of 2026-11-19).
+  (2) A green is lent to the judge for one call, by closure (`Greens::read`, `Greens::base_of_create`), as the server
+  lends one member of a lineage at a time (A-575). (3) `Session` keeps a copy of its advertisement (`Advertised` is
+  `Copy`) and owns its hidden refs, so a caller keeps it across its own steps; `HiddenRefs for &T` keeps callers that
+  hold the predicate themselves. (4) `Verdicts` judges a command and appends nothing; `Works` pairs it with an
+  `Appends`; a server whose greens and appends are one state judges through `Verdicts` between its own appends and
+  answers in git's words through `append_declined` and `atomic_declined`. (5) `Unappended::Refused { at, why }`: an
+  append's own refusal (the shard's budget, the register's capacity, an approval the branch requires) under git's
+  `failed to update ref`, slates' reason on band 2.
+- **Tests** (`crates/git/src/receive/tests/`): a create made at its first parent's version and an orphan create
+  stating the whole difference from the default head (`works.rs`); a session made from parts that go out of scope at
+  once, kept in a caller's struct and fed the create push in pieces, answering byte for byte as a borrowing one
+  (`session.rs`); an entry the append refused for its own reason answered in git's words with slates' on band 2,
+  alone and atomic (`works.rs`).
+- **Evidence.** macOS arm64, Mac Studio (kiln, debug, 2026-11-19), on the merged tree 6f2d690eb: `cargo test --locked
+  -p slates-git --lib receive::` 42 of 42, the five A-654 tests among them; `--lib protected_fixtures` 5 of 5 and
+  `--lib store::views` 7 of 7 (the other users of the reader and the judge); `cargo fmt --all -- --check` clean; no
+  warning in `receive`. The first run (r131) failed the annotated tag's test alone, written for A-620's create over an
+  empty green: under (1) a tag of a root commit is made at the default head and its work is the head alone, so the
+  test now submits it to a green holding that version. slates-git has no integration target, and nothing outside it
+  calls the session or the judge until part 2. Main's: clippy, `xtask check`, the doc gates and the other platforms.
+- **Owed (part 2): the server's driver** (`crates/server/src/git_push.rs`, one entry point for the HTTP edge, g299,
+  and the SSH edge, g294): `start` writes the advertisement of the branches whose greens hold a git head, a ref the
+  pusher may not read under A-622's policy hidden; `input` and `end` feed the session over A-638's `IndexedObjects`
+  lent the shard's room (A-662's `lent_to_read`); `answer` admits the checked objects to A-662's `GitPush` and seals
+  it, asks A-622's `admit` (Submit, Rewrite for a move A-614's admission finds no fast-forward, Delete), refuses
+  typed while a git hook is configured and its view is owed (A-665 part 2), and decides through a server judge:
+  `Verdicts` over the shard's greens, whose `version_of` answers only a green's current head until A-664's
+  server-made commits allow a push based on an older version, then `push_sealed` for each entry, or once for all
+  under `atomic`; the report written to the caller's bytes.
+- **Applied in the same change to:** `crates/git/src/receive/works.rs` (`Verdicts`, `Works`, `Greens`,
+  `Entry::Create::from`, `Unappended::Refused`, `append_declined`, `atomic_declined`, module docs),
+  `receive/session.rs`, `receive/request.rs` (`RequestReader` keeps a copy), `receive/mod.rs` (`HiddenRefs for &T`),
+  and their tests; GAPS (the §4.17 entry).
 
 ### A-650 (part 1) — Mercurial over HTTP: HTTP version 1 answered as stock Mercurial 7.2 frames it, from the daemon's site on the shared edge, the answer's media type named as its reply begins (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Access" and piece 4; §4.17.2 "Transports" item 1; A-569, A-619, A-625, A-597, A-622; the stores it reads are A-662's)
 Applied in the same change to: §4.17.3 (its status, and piece 4's line), §4.17.2 (a status for the edge's change),
