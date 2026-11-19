@@ -38,6 +38,7 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
+slates-ssh = { workspace = true }
 # Mercurial (§4.17.3): slates-hg answers HTTP version 1 for the edge (A-650, `crate::vcs_http::hg`), and reads, verifies
 # and places a push landed on the repository's logs (A-657, `crate::repository::hg_push`); its index and content
 # store are slates-vcs's.
