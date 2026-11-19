@@ -1222,6 +1222,93 @@ fn a_copy_from_a_folded_version_is_refused_typed() {
   );
 }
 
+/// Submits `increment` to `green`, which must accept it: what its version applied, as its chain entry records it.
+fn accepted_effects(green: &mut Green, increment: &Increment) -> Vec<chain_entry::Applied> {
+  let (outcome, applied) = green.submit_resolved(increment);
+  assert!(
+    matches!(outcome, Outcome::Accepted { .. }),
+    "not accepted: {outcome:?}"
+  );
+  applied.expect("an accepted version's effects")
+}
+
+/// Replays `increment`'s chain entry (`applied`, encoded and decoded) on `replica`, reading nothing of its identity: the
+/// new head.
+fn replay_entry(
+  replica: &mut Green,
+  increment: &Increment,
+  applied: &[chain_entry::Applied],
+) -> u64 {
+  let entry = chain_entry::encode(&increment.encode(), increment, applied, None, None, None);
+  let decoded = chain_entry::decode(&entry).expect("the entry decodes");
+  replica.apply_recorded(&decoded.increment, &decoded.applied)
+}
+
+/// A-626 part 3 (the replica's half of the copy oracle's seed `cc ef9d3557…`, found by reading): a green restored at a
+/// checkpoint taken after its trunk changed and before a copy of the trunk from earlier replays the copy, then a change
+/// to a file the copy brought, its identity read only after both. Do: checkpoint [`trunk_changed_after_1`] at 3, copy
+/// the trunk at 1 to `b` as version 4 and overwrite `b/a` as 5; restore the checkpoint and replay 4 and 5, each entry
+/// encoded and decoded. Expect: the replica hashes as its owner at 5, its identity equals its recount, and its
+/// checkpoint at 3 carries its owner's sum there. Before, each read what the copy gave `b/a` from the trunk's history at
+/// 1, which the restored green does not hold: it read nothing there, so the replica hashed otherwise than its owner and
+/// its checkpoint carried another sum.
+#[test]
+fn a_replica_restored_after_a_copys_source_version_hashes_as_its_owner() {
+  let mut green = trunk_changed_after_1();
+  let checkpoint = green.checkpoint(3).expect("a checkpoint at the head");
+  let mut copy = Work::exclusive();
+  copy.copy("trunk", "b", 1);
+  let copy = copy.at(4, 3);
+  let copied = accepted_effects(&mut green, &copy);
+  let mut edit = Work::default();
+  edit.overwrite("b/a", 0, b"Z");
+  let edit = edit.at(5, 4);
+  let edited = accepted_effects(&mut green, &edit);
+  let mut replica = Green::restore(Origin::default(), &checkpoint);
+  assert_eq!(replay_entry(&mut replica, &copy, &copied), 4);
+  assert_eq!(replay_entry(&mut replica, &edit, &edited), 5);
+  assert_eq!(
+    replica.head_identity(),
+    green.head_identity(),
+    "the replica's identity at 5"
+  );
+  assert_eq!(
+    replica.head_identity(),
+    replica.head_identity_from_scratch()
+  );
+  let sum = |green: &Green| green.checkpoint(3).expect("a checkpoint at 3").sum;
+  assert!(
+    sum(&replica) == sum(&green),
+    "the replica's checkpoint at 3 carries another sum"
+  );
+}
+
+/// A-626 part 3 (found by reading): as above with the edit in the copy's own increment, whose value for `b/a` stood at
+/// no version, so only the copy's graft holds it. Do: checkpoint [`trunk_changed_after_1`] at 3, then in one increment
+/// copy the trunk at 1 to `b` and overwrite `b/a` at its fourth byte as version 4; restore the checkpoint and replay 4.
+/// Expect: the replica hashes as its owner, and its identity equals its recount. Before, both read the trunk's history
+/// at 1, which the restored green does not hold.
+#[test]
+fn a_replica_replaying_a_copy_edited_in_its_own_version_hashes_as_its_owner() {
+  let mut green = trunk_changed_after_1();
+  let checkpoint = green.checkpoint(3).expect("a checkpoint at the head");
+  let mut work = Work::exclusive();
+  work.copy("trunk", "b", 1).overwrite("b/a", 3, b"HA");
+  let increment = work.at(4, 3);
+  let applied = accepted_effects(&mut green, &increment);
+  let mut replica = Green::restore(Origin::default(), &checkpoint);
+  assert_eq!(replay_entry(&mut replica, &increment, &applied), 4);
+  assert_eq!(
+    replica.head_identity(),
+    green.head_identity(),
+    "the replica's identity"
+  );
+  assert_eq!(
+    replica.head_identity(),
+    replica.head_identity_from_scratch()
+  );
+}
+
 /// The attribute every file of the oracle's histories carries.
 const NAME: &str = "n";
 
@@ -2079,7 +2166,9 @@ fn every_copy_reads_as_its_model_over_every_history() {
     cases: slates_test_seeds::cases(128),
     ..Config::default()
   };
-  let mut runner = TestRunner::new(slates_test_seeds::unseeded(config));
+  // The reviewed seeds replay first: A-626 part 3's restore at every version met a copy from before the checkpoint.
+  let seeds = include_str!("copy_tests.proptest-regressions");
+  let mut runner = TestRunner::new(slates_test_seeds::seeded(config, seeds).unwrap());
   let result = runner.run(&prop::collection::vec(step(), 1..24), |steps| {
     run(&steps, &mut census.borrow_mut())
   });
