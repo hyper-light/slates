@@ -1939,10 +1939,12 @@ landing constants are in §4.15.
 > meanwhile). **Since A-425 the NFSv4 lease is derived** from what the clients it serves need, not the failover delay:
 > an idle Linux client's renewal floor (five seconds) and a liveness window, in whole seconds (6 s); the delegation
 > recall's wait, the quiet period, the NFSv3 gate's wait and a landing's recall wait all read it (`nfs::v4_lease_ns`).
-> **Since A-525 a move's overdue bound and the telemetry horizon read the failover delay, and the anchor's crash-loop
-> cap is the NFSv4 lease its daemon grants.** Two bounds that are not leases (the FUSE helpers' and the status
-> capture's) still read the operator's 10 s placeholder above until each takes a term of its own (A-414's owed list;
-> GAPS, the `LIVENESS_BUDGET_NS` entry).
+> **Since A-525 the operator's 10 s placeholder is gone** (`FAILOVER_SLO_NS`, `with_failover_slo`,
+> `DaemonConfig::failover_slo_ns`): a move's overdue bound and the telemetry horizon read the failover delay, the
+> anchor's crash-loop cap is the NFSv4 lease its daemon grants, a FUSE helper is waited for as long as its shard's
+> helpers have taken (learned, backed off to the failover delay), and a status capture is held the failover delay from
+> its capture. The operator's failover SLO above is now a check against the published delay
+> (`FleetReport::failover`), not an input.
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -11000,7 +11002,10 @@ xattr changes on one path. Fetch, outside the pure core: the candidates' bytes b
 two: memcmp; equal bytes are `AcceptIdentical`, unequal are `Conflict`. Neither pass performs
 I/O, reads a clock, draws randomness, or calls the system allocator (a lint and a test enforce
 it). Fast path: if `last_changed[path] <= base` for every path in the increment, the verdict is
-`Accept` with no range work at all; this is what a basis buys, and it never decides a conflict.
+`Accept` with no range work at all; this is what a basis buys, and it never decides a conflict. An operation marked
+node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 item 3, A-542) is judged whole instead: any
+change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
+Subversion client's commit needs.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -12183,13 +12188,19 @@ and export by landing).
 > **Status (2026-11-18, A-500).** Designed. Built: the svndiff codec (`crates/svn`, `slates-svn`: versions 0 and 2,
 > the decoder with every refusal Subversion's own decoder makes plus the 64-bit overflow it lets through, the encoder,
 > and the reference applier, held to `notes/svndiff`'s worked example as golden vectors). Everything else is owed, in
-> the pieces at the end.
+> the pieces at the end. The reading notes, with every source's revision, hash and quoted lines, are
+> `research/vcs-servers-subversion.md` (cited below as "notes §n").
 >
 > **Status (2026-11-19, A-531).** Built: the ra_svn item codec (`slates-svn`'s `ra_svn`): a parser that reads words,
 > numbers, strings and lists from a buffer the caller holds, resuming where it stopped so a byte is read once, within
 > bounds the caller gives and none of its own, and a writer that writes as `svnserve` writes, held to the protocol
-> document's items as golden vectors (piece 2 below). The reading notes, with every source's revision, hash and quoted lines, are
-> `research/vcs-servers-subversion.md` (cited below as "notes §n").
+> document's items as golden vectors (piece 2 below).
+>
+> **Status (2026-11-19, A-542, its first half).** Built: node-exclusive operations in the merge engine
+> (`slates-merge`): `NODE_EXCLUSIVE`, the high bit of an operation's flags, and the verdict's pass that refuses a
+> node-exclusive path changed in any dimension after the base, a move's source among them (item 3, rules 1 and 2).
+> Owed, its second half: `Copy`, sharing the source by reference through the persistent radix tree of A-534
+> (`crates/merge/src/ptrie.rs`, its `subtree` and `graft`), with the copied keys' history beginning at the copy.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12560,8 +12571,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 2. The ra_svn item codec (built, A-531): the resumable parser and the writer, with the protocol's examples as golden
    vectors and hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream
    cut anywhere).
-3. The engine's node-exclusive operations and `Copy` that shares a subtree by reference (with §4.17.1's pieces 1 and
-   4).
+3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (owed, on A-534's
+   persistent radix tree: `graft` of the source's `subtree` at the destination; with §4.17.1's pieces 1 and 4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts.
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
@@ -35635,12 +35646,33 @@ Applied in the same change to: §4.4's status (A-363's paragraph), GAPS (the fai
   idle Linux client's renewal floor and a liveness window, A-425; `restart_policy` in `crates/api/src/role/anchor.rs`):
   once the cause clears the daemon is back before a client renewing at its floor sees its lease run out. The backoff is
   still never shorter than the failed start's own life (A-311).
-- **Left on the placeholder, each owed a term of its own:** the FUSE mount and unmount helpers' bounds (Linux, a helper
-  process's wait: unit-tested on Linux) and the status capture's deadline (released at it on the shard's timing wheel
-  since A-522, but the deadline is still the request's time plus the placeholder; it should count from the capture).
-  Then `FAILOVER_SLO_NS`, `with_failover_slo` and
-  `DaemonConfig::failover_slo_ns` go (L-h), with the integration tests that still size outages by them
-  (`crates/server/tests/fleet.rs`, `crates/cli/tests/fs_server.rs`, `crates/cli/tests/live_chaos.rs`).
+- **Part 2 (the same day): the last readers, then the placeholder gone (L-h).**
+  - *The FUSE helpers.* A mount's and an unmount's `fusermount3` (`crate::fuse`, Linux) are one exec of a small setuid
+    program and one system call each, so how long they take is the machine's to measure: each shard learns its helpers'
+    runs as `learned_wait` learns a wait (`crate::helper_runs`, cfg-free so every host's tests run the rule: RFC 6298's
+    estimator over the runs that finished, the bound their tail plus a liveness window; a run given up at its bound is no
+    sample and doubles the next bound, backed off no further than the failover delay). A helper past its bound is
+    killed and reaped and its mount refused, typed, as before.
+  - *The status capture.* Its deadline is set at the capture, the failover delay from it, never at the request
+    (`send_reply`; `StatusPages::capture` takes it, `begin` sets none), so a scatter that a starved daemon took long to
+    gather takes nothing from its client's time to page it; the failover delay is the term the daemon holds every
+    other thing a client leaves waiting for its next request to (a staging buffer, A-414). A capture still awaiting
+    its scatter holds no bytes or credit and has no deadline; it ends with the next capture or its seat (A-475). A
+    capture its first page leaves held is entered in A-522's index, whose keeper lets it go at the deadline.
+  - *L-h.* `config::FAILOVER_SLO_NS`, `DaemonConfig::failover_slo_ns` and `with_failover_slo` are deleted: nothing
+    read them any more, and nothing replaces them. The integration tests that sized outages by the placeholder read
+    the fleet's own delay: the link-cut flow (`crates/cli/tests/fs_server.rs`) and the partition flows
+    (`crates/cli/tests/live_chaos.rs`, `live_failover`) from each node's status (`fleet_failover: total_ns=`), and the
+    burst backstop (`crates/server/tests/fleet.rs`) from `Daemon::failover_ns`. The chaos flows now require the
+    takeover within the delay the fleet measured before the partition, where they allowed ten seconds.
+  - *Tests (red first).* `a_helpers_wait_follows_the_runs_this_shard_measured_and_backs_off_to_the_failover_delay`
+    (`helper_runs`: a window before any run, a little past it after quick runs, doubled for a run given up and held at
+    the delay, back once a run finishes; the placeholder's ten seconds failed it) and
+    `a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` (`deadlines`: the report captured
+    two delays after the request, made several pages long; the first page served at the capture, the capture let go a
+    delay after it; counted from the request by the placeholder it was held ten seconds), with
+    `a_captures_deadline_counts_from_its_capture` (`status_pages`) and A-522's capture test made through the capture.
+    The NFSv4 lease test now holds the failover delay short, not the placeholder.
 - **Tests.** `an_unreported_move_is_overdue_past_the_live_failover_delay_and_not_before` (`moves`: with the delay at two
   windows, a move begun three windows ago is overdue and one begun a window ago is not),
   `a_chokepoint_silent_past_the_live_failover_delay_is_reported_absent` (`telemetry`: a span three windows old is not
@@ -36252,3 +36284,40 @@ Applied in the same change to: GAPS (the folding-drive entry: part 1 built, part
 - **Tests.** `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (`crates/bridge-core/src/
   lib.rs`): three spellings on a folding volume name `\Src\Main.RS`, an exact volume finds only its own spelling. Red
   with the open named as asked on the Mac Studio; green with the walk.
+
+### A-542 — Node-exclusive operations in the merge engine: a path a node-exclusive operation changes conflicts when it changed after the base, whatever the bytes (2026-11-19, g292 for UI goal 91; §4.16 "The verdict", §4.17.4 item 3 and piece 3; A-500, A-534)
+Applied in the same change to: §4.16 (the verdict's node-exclusive exception), §4.17.4 (a status block, piece 3; the
+A-500 status block's last sentence restored to it, which A-531's edit had moved), GAPS (the §4.17.4 entry),
+`crates/merge/src/ops_doc.rs` (`NODE_EXCLUSIVE`, `Op::is_node_exclusive`), `crates/merge/src/engine.rs`
+(`decide_node_exclusive`, `changed_after`, `node_exclusive_paths`), `crates/merge/src/engine/node_exclusive_tests.rs`
+(new).
+- **What was there.** §4.16's verdict accepts a change disjoint by range from what landed since the base, and an
+  identical one. A stock Subversion client cannot take either: FSFS fails a node changed on both sides, "even an
+  identical replacement", and holds that "two additions are not auto-mergeable" (`libsvn_fs_fs/tree.c` `merge()`), and
+  the client records each node it committed as made at the new revision with its own bytes and properties.
+- **The decision.** An operation may be marked node-exclusive by the high bit of its flags, which no kind set before, so
+  every document written before means what it meant. After the dimension verdicts, one pass judges each path a
+  node-exclusive operation changes, a move's source among them, once: if its last change in the change index is past
+  the increment's base, it is a conflict, named by the operation's kind (an edit `Overlap`, an addition `CreateCreate`,
+  a removal `DeleteModify`, a move `RenameRename`, metadata `MetaMeta`). It only refuses what the dimension verdicts
+  would accept, and touches none of the green's state. The rule's directory half (a directory whose properties changed
+  meanwhile against any change beneath it; a directory's own property change against a change of its entries; FSFS's
+  subtree-wide last change) is §4.17.4's piece 5, with its FSFS oracle.
+- **Copy, the second half, owed.** The green's per-path state is plain ordered maps today, so a copy by reference needs
+  A-534's persistent radix tree (g261, in progress, `crates/merge/src/ptrie.rs`): the copy will move the source's own
+  key to the destination and `graft` the source's `subtree` under it in each current-value map, O(path length) per
+  map, and begin each copied key's history at the copy's version with its source recorded. Building a second
+  persistent structure here was ruled out, and g261 built its tree so a prefix is one shared node.
+- **Tests** (`node_exclusive_tests.rs`, a module of the engine). Seven cases, each running one work plain and
+  node-exclusive against the same change since its base (§4.16 accepts the plain one, the flag refuses it): an
+  identical overwrite, a disjoint one, a property change against a text change, an identical addition, a move whose
+  source changed, a delete against a change (refused both ways), and nodes unchanged (accepted both ways); and a
+  property against a reference written apart from the engine: generated histories of plain changes to five files'
+  text and property lists, then a node-exclusive work at a generated base, which must conflict on exactly the paths
+  it changes whose last change is past its base.
+- **Evidence** (the Mac Studio, kiln, 2026-11-18 16:53 and 16:57 PST, load 19 to 23, debug builds of fresh clones of
+  the branch). Failing first: with the pass removed from a copy of the tree, `cargo test --locked -p slates-merge --lib
+  node_exclusive` failed 6 of 8, the two passes the cases the plain verdict already decides alike (the delete against a
+  change, refused; nodes unchanged, accepted). With it, 8 of 8, and the crate's whole `--lib` suite 11 of 11, before
+  and after `cargo fmt`. The crate's integration suites (`crates/merge/tests/`), its clippy and `cargo xtask check` are
+  main's (the run-request queue); no test there sets the flag, so their verdicts are the ones they were.

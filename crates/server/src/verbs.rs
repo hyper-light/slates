@@ -2867,7 +2867,7 @@ fn run_forwarded(
 }
 
 /// Applies the channel-local status cursor discipline before dispatching ordinary verbs.
-fn status_on_channel(
+pub(crate) fn status_on_channel(
   state: &mut ShardState,
   client: Handle<ClientSlot>,
   request: u64,
@@ -2886,15 +2886,8 @@ fn status_on_channel(
   }
   slot.status_pages.clear(&mut state.store.metadata);
   if matches!(body, RequestBody::DaemonStatus) {
-    let expires = state
-      .clock
-      .monotonic_ns()
-      .saturating_add(state.config.failover_slo_ns);
-    slot
-      .status_pages
-      .begin(request, expires, &mut state.store.metadata);
-    // The capture's deadline is the shard's keeper's to keep (A-522).
-    crate::deadlines::capture_set(state, client, expires);
+    // No deadline yet: the capture's counts from the capture, once its scatter has made it (A-525, [`send_reply`]).
+    slot.status_pages.begin(request, &mut state.store.metadata);
     return Some(scatter_status(state, client.index(), request));
   }
   None
@@ -15359,7 +15352,7 @@ fn remember_forwarded_ring(
 
 /// Writes a reply into the client's completion ring; false when the ring is full (the reply
 /// is kept and retried; never dropped).
-fn send_reply(
+pub(crate) fn send_reply(
   state: &mut ShardState,
   client_index: u32,
   request: u64,
@@ -15379,22 +15372,40 @@ fn send_reply(
   if client.retiring || client.client_id != RequestId::from_word(request).client {
     return true;
   }
+  let mut held_until = None;
   if matches!(reply, ReplyBody::DaemonStatus { .. }) {
     let capacity = slates_ipc::status::snapshot_capacity(client.end.region());
     let page = slates_ipc::status::page_capacity(client.end.region());
     let now = state.clock.monotonic_ns();
+    // Held the failover delay from the capture (A-525): the bound the daemon holds every other thing a client leaves
+    // waiting for its next request to (a staging buffer, A-414), counted from when the report was made, so a scatter a
+    // starved daemon took long to gather takes nothing from its client's time to page it.
+    let deadline = now.saturating_add(state.failover_ns);
     // Replace the deferred reply itself: a full ring retries these exact page bytes,
     // including the final page whose retained snapshot has already been released.
     *reply = client
       .status_pages
-      .capture(request, reply, capacity, &mut state.store.metadata)
+      .capture(
+        request,
+        reply,
+        (capacity, deadline),
+        &mut state.store.metadata,
+      )
       .and_then(|()| {
         client
           .status_pages
           .page(request, 0, page, now, &mut state.store.metadata)
       })
       .unwrap_or_else(refused);
+    held_until = client.status_pages.deadline();
   }
+  // A capture its first page left held is the shard's keeper's to let go at its deadline (A-522).
+  if let Some(at) = held_until {
+    crate::deadlines::capture_set(state, handle, at);
+  }
+  let Ok(client) = state.clients.get_mut(handle) else {
+    return true;
+  };
   // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
   // over the bulk body of the oldest reply the client had not taken.
   match client.end.reply_message(request, reply) {
