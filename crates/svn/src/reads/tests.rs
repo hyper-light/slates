@@ -1218,6 +1218,54 @@ fn revision_properties_are_gathered_as_fill_log_entry_gathers_them() {
   );
 }
 
+/// The revisions of a log's entries in order, each with whether it closes a revision's children (`invalid-revnum`).
+fn entry_revisions(out: &[u8]) -> Vec<(u64, bool)> {
+  items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match (parts.get(1), parts.get(6)) {
+        (Some(Value::Number(revision)), Some(Value::Word(invalid))) => {
+          Some((*revision, *invalid == "true"))
+        }
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect()
+}
+
+/// A-613 part 2 (`log`, `send_log`'s `nested_merges`): oldest first no search is recorded, so r4, merged into trunk
+/// in r5 and taken from the tag in r11, is reached twice; it is sent once, as the first child of r5, and r11's walk of
+/// it ends with the entry closing its children alone.
+#[test]
+fn a_merged_revision_is_sent_once() {
+  let fixture = Fixture::new();
+  let command = b"( log ( ( 7:tags/t1 5:trunk ) ( 0 ) ( 11 ) false false 0 true revprops ( ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  let revisions = entry_revisions(&out);
+  let fours = revisions.iter().filter(|entry| **entry == (4, false)).count();
+  assert_eq!(fours, 1, "{revisions:?}");
+  let eleven = revisions.iter().position(|entry| *entry == (11, false)).unwrap();
+  assert_eq!(revisions.get(eleven + 1), Some(&(0, true)), "{revisions:?}");
+}
+
+/// A-613 part 2 (`log`, `handle_merged_revisions`): a revision merging two separate runs from one source, here r12
+/// adding r3 and r9 of `/branches/b1` to trunk's `/branches/b1:4`, has its runs sorted and walked from the last: r9's
+/// entry before r3's, then the entry closing them.
+#[test]
+fn a_merge_of_two_runs_walks_the_younger_run_first() {
+  let mut fixture = Fixture::new();
+  let name = "svn:mergeinfo".bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+  let value = "/branches/b1:3-4,9".bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+  fixture.commit(&[format!("row 12 /trunk dir change props {name}={value}").as_str()]);
+  let command = b"( log ( ( 5:trunk ) ( 12 ) ( 12 ) false false 0 true revprops ( ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    entry_revisions(&out),
+    [(12, false), (9, false), (3, false), (0, true)]
+  );
+}
+
 /// A-613 part 2 (`log`): a path past `MAX_OPEN_HISTORIES` has its history opened again at each step
 /// (`get_history`), one step past the last location and two after the first time; its log is the same as the same
 /// path's with its history kept open, across a copy.

@@ -563,3 +563,49 @@ pub(super) fn store_search(
   }
   *processed = processed.merge(&searched);
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A-613 part 2 (`svn_mergeinfo__mergeinfo_from_segments`): a segment from revision S to E at a path is the source of
+  /// the revisions after S - 1 through E, so S itself lies in the log's own history; a gap, and revision 0 alone, add
+  /// nothing.
+  #[test]
+  fn segments_are_the_revisions_from_their_starts() {
+    let segment = |start, end, path: Option<&str>| Segment {
+      start,
+      end,
+      path: path.map(str::to_owned),
+    };
+    let history = from_segments(&[
+      segment(7, 11, Some("tags/t1")),
+      segment(6, 6, None),
+      segment(1, 5, Some("trunk")),
+      segment(0, 0, Some("")),
+    ]);
+    let outside = |revision, path| outside_history(&history, revision, path);
+    assert!(!outside(7, "/tags/t1/a.txt"));
+    assert!(outside(6, "/tags/t1"));
+    assert!(!outside(1, "/trunk/a.txt"));
+    assert!(outside(0, "/trunk"));
+    assert!(outside(3, "/branches/b1"));
+  }
+
+  /// A-613 part 2 (`combine_mergeinfo_path_lists`): two sources sharing a first range give one run with both, then
+  /// the source with more ranges its rest; the source whose last range is used up is the one removed (where the C
+  /// code removes the first of its array, which its seeded hash order decides).
+  #[test]
+  fn runs_combine_as_combine_mergeinfo_path_lists_means() {
+    let mergeinfo = Mergeinfo::parse(b"/a:3-5,8-9\n/b:3-5").unwrap();
+    let mut runs = Vec::new();
+    combine(&mergeinfo, true, &mut runs);
+    let run = |paths: &[&str], start, end| PathListRange {
+      paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+      start,
+      end,
+      reverse: true,
+    };
+    assert_eq!(runs, [run(&["/a", "/b"], 3, 5), run(&["/a"], 8, 9)]);
+  }
+}
