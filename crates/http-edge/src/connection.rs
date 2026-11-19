@@ -10,10 +10,15 @@
 //!
 //! **The reply's head** is written when the service's first bytes are passed in, or at its end, from the decision's
 //! fields and then any the service names as its reply begins ([`Connection::reply_fields`]: a reply whose fields follow
-//! from its outcome, as Mercurial's media type follows from its command's): `200`, those fields, chunked to HTTP/1.1
-//! and framed by the close to HTTP/1.0, `Connection: close` when the connection ends after it. A field a reply cannot
-//! carry fails the request `500` before any of it is sent: the decision's at the decision, the service's as it names
-//! them. `100 Continue` is sent when a decision admits a request whose client waits for it: it sent
+//! from its outcome, as Mercurial's media type follows from its command's): its status, those fields, chunked to
+//! HTTP/1.1 and framed by the close to HTTP/1.0, `Connection: close` when the connection ends after it. The status is
+//! the route's to decide, at its head or after its body ([`StatusMode`]; main's ruling, 2026-11-19: per route): a
+//! streamed route's is `200`, fixed by the decision, as git's services stream their replies; one decided after the body
+//! is the service's to name as its reply begins ([`Connection::reply_status`]), as Git LFS answers `201`, `409`, `422`,
+//! `413` and `507` once it has read the request (A-629). A field a reply cannot carry, a status no reply's content may
+//! follow, or a status named for a streamed route fails the request `500` before any of it is sent: the decision's at the
+//! decision, the service's as it names them. `100 Continue` is sent when a decision admits a request whose client waits
+//! for it: it sent
 //! `Expect: 100-continue` and none of its body has come (RFC 9110 §10.1.1: "A server MAY omit sending a 100 (Continue)
 //! response if it has already received some or all of the content").
 //!
@@ -63,15 +68,28 @@ pub enum Next<'a> {
   Close,
 }
 
+/// When a served reply's status is decided (the module doc; main's ruling, 2026-11-19: per route).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusMode {
+  /// At the head: `200`, the reply streamed as the service writes it (git's services, Mercurial's commands).
+  Streamed,
+  /// After the request's body: the service names it as its reply begins ([`Connection::reply_status`]), `200` when it
+  /// names none (Git LFS, A-629).
+  AfterBody,
+}
+
 /// A site's answer to a request's head.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-  /// Serve it: the reply is `200` with `fields`; `head_only` for a `HEAD` request, whose reply has no body.
+  /// Serve it: the reply carries `fields`, its status `200` or the service's as `status` says; `head_only` for a `HEAD`
+  /// request, whose reply has no body.
   Serve {
     /// The reply's fields (its content type, cache fields and the like), in order.
     fields: Fields,
     /// Whether the reply is the head alone.
     head_only: bool,
+    /// When the reply's status is decided.
+    status: StatusMode,
   },
   /// Refuse it with `status` and `fields` (`WWW-Authenticate`, `Allow` and the like), no body.
   Refuse {
@@ -168,6 +186,10 @@ struct Reply {
   head_only: bool,
   /// Whether any of the reply has been sent: the head goes with its first bytes, and a failure after this aborts.
   started: bool,
+  /// Its status: `200` until a route that decides it after the body names it.
+  status: Status,
+  /// When its status is decided.
+  mode: StatusMode,
 }
 
 /// Where the loop is.
@@ -552,15 +574,19 @@ impl Connection {
     };
     self.consume(head_len);
     match decision {
-      Decision::Serve { fields, head_only } => self.serve(request, fields, head_only),
+      Decision::Serve {
+        fields,
+        head_only,
+        status,
+      } => self.serve(request, fields, (head_only, status)),
       Decision::Refuse { status, fields } => self.refuse(request, status, &fields),
     }
   }
 
   /// Serves a request: its reply's fields judged now (a decision whose fields a reply cannot carry is refused 500),
   /// `100 Continue` sent to a client waiting for it, and its body read, if it has one.
-  fn serve(&mut self, request: Request, fields: Fields, head_only: bool) {
-    if rendered(request, &fields, &mut Vec::new()).is_err() {
+  fn serve(&mut self, request: Request, fields: Fields, (head_only, mode): (bool, StatusMode)) {
+    if rendered(request, Status::OK, &fields, &mut Vec::new()).is_err() {
       self.refuse_staged(Status::INTERNAL_SERVER_ERROR);
       return;
     }
@@ -568,6 +594,8 @@ impl Connection {
       fields,
       head_only,
       started: false,
+      status: Status::OK,
+      mode,
     };
     if !request.has_body() {
       self.state = State::BodyEnded { request, reply };
@@ -706,10 +734,28 @@ impl Connection {
       return;
     }
     reply.fields.extend(fields);
-    let carried = rendered(*request, &reply.fields, &mut Vec::new()).is_ok();
+    let carried = rendered(*request, reply.status, &reply.fields, &mut Vec::new()).is_ok();
     if !carried {
       self.fail(Status::INTERNAL_SERVER_ERROR);
     }
+  }
+
+  /// The status the service names for its reply as its reply begins, on a route that decides it after the body
+  /// ([`StatusMode::AfterBody`], the module doc). Taken only before any of the reply is sent, and only while a reply is
+  /// under way; one no reply's content may follow (`1xx`, `204`, `205`, `304`, or no status at all) or one named for a
+  /// streamed route fails the request `500`, in stages.
+  pub fn reply_status(&mut self, status: Status) {
+    let State::Reply { reply, .. } = &mut self.state else {
+      return;
+    };
+    if reply.started {
+      return;
+    }
+    if reply.mode == StatusMode::AfterBody && carries_content(status) {
+      reply.status = status;
+      return;
+    }
+    self.fail(Status::INTERNAL_SERVER_ERROR);
   }
 
   /// A reply under way: its request, whether it is the head alone, and its head's bytes when they are still to be sent
@@ -720,7 +766,7 @@ impl Connection {
     };
     let mut head = Vec::new();
     if !reply.started {
-      if let Err(bad) = rendered(*request, &reply.fields, &mut head) {
+      if let Err(bad) = rendered(*request, reply.status, &reply.fields, &mut head) {
         return Some(Err(bad));
       }
       reply.started = true;
@@ -814,12 +860,37 @@ impl Connection {
 /// Renders a served reply's head for `request` into `out`: `200`, `fields`, chunked to HTTP/1.1 and framed by the
 /// close to HTTP/1.0, `Connection: close` when the connection ends after it. Refused, writing nothing, where a field
 /// cannot be carried.
-fn rendered(request: Request, fields: &Fields, out: &mut Vec<u8>) -> Result<(), BadField> {
+fn rendered(
+  request: Request,
+  status: Status,
+  fields: &Fields,
+  out: &mut Vec<u8>,
+) -> Result<(), BadField> {
   let body = match request.version {
     Version::Http11 => Body::Chunked,
     Version::Http10 => Body::UntilClose,
   };
-  reply::head(Status::OK, &borrowed(fields), body, !request.kept(), out)
+  reply::head(status, &borrowed(fields), body, !request.kept(), out)
+}
+
+/// Format: `204 No Content` (RFC 9110 §15.3.5), a reply without content.
+const NO_CONTENT: u16 = 204;
+
+/// Format: `205 Reset Content` (RFC 9110 §15.3.6), a reply without content.
+const RESET_CONTENT: u16 = 205;
+
+/// Format: `304 Not Modified` (RFC 9110 §15.4.5), a reply without content.
+const NOT_MODIFIED: u16 = 304;
+
+/// Format: the last code of RFC 9110 §15's classes, the end of `5xx`.
+const LAST_CODE: u16 = 599;
+
+/// Whether a reply of `status` may carry content, as every served reply's framing does: RFC 9110 §6.4.1, "All 1xx
+/// (Informational), 204 (No Content), and 304 (Not Modified) responses do not include content"; §15.3.6, "a server
+/// MUST NOT generate content in a 205 response"; and a code outside §15's classes is no status.
+fn carries_content(status: Status) -> bool {
+  (Status::OK.code..=LAST_CODE).contains(&status.code)
+    && ![NO_CONTENT, RESET_CONTENT, NOT_MODIFIED].contains(&status.code)
 }
 
 /// `fields` as `slates-http`'s reply writer takes them.

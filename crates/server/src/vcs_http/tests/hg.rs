@@ -526,6 +526,7 @@ fn served<S: HgStores + Clone>(
       fields,
       head_only,
       exchange,
+      ..
     } => {
       assert!(fields.is_empty() && !head_only);
       exchange

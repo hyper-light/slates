@@ -655,6 +655,20 @@
 > main's `deadlines` test failing as on main. Owed: the edge's answer whose status follows the body; the durable
 > object store on the owner shard (A-581); locks by others than the owner once the push's policy check lands;
 > principals' names for people (§4.13).
+> **A-629 part 2c (2026-11-19, g230; Git LFS on the shared HTTP edge):** git's HTTP site routes `<repo>/info/lfs`
+> through `slates_git::lfs::serve::route` and the edge's authentication (a route's refusal whoever asks; `401` with
+> `LFS-Authenticate`; the owner shard, `404`, `403`; `503` at the head for an endpoint the service does not serve), and
+> a served LFS request decides its status after its body (`StatusMode::AfterBody`, `Connection::reply_status`; a `1xx`,
+> `204`, `205` or `304`, or a status on a streamed route, fails it `500`), its actions expiring with the bearer token
+> that asked. The daemon serves the locks API over the locks log (`ShardLfs`); the batch API and the transfers answer
+> `503` at their head until A-581, so no upload is acknowledged that a restart would forget. Closes A-625 part 3's
+> "LFS's routes on the site" and part 2b-ii's "the edge's answer whose status follows the body". macOS arm64 (Mac
+> Studio, kiln r109): `slates-http-edge --lib connection::` 18 of 18, the new test failing first with the status never
+> taken; `slates-git --lib lfs::` 73 of 73; `slates-server --lib vcs_http:: lfs:: credentials::` 55 of 55; the CLI's
+> edge test 1 of 1.
+> Owed: A-581's durable LFS objects on the owner shard, and the batch API and the transfers served over them; locks by
+> others than the owner (A-635's policy check); principals' names for people (§4.13); the stock git-lfs client end to
+> end against the daemon (main's).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still

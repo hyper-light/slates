@@ -23,17 +23,25 @@
 //!
 //! **What is served.** git's services as the server has them: upload-pack once each repository's store lives on its
 //! owner shard (A-662, whose map this site then lends a step at a time), receive-pack once its session lands (A-654);
-//! until then both answer `503`.
+//! until then both answer `503`. Git LFS's locks API ([`ShardLfs`], A-629 part 2c), answered on the repository's owner
+//! shard over its locks log (`crate::lfs::answer`), which is durable as the partition's log is; the batch API and the
+//! transfers answer `503` at their head until the owner shard keeps LFS objects durably (A-581), so no upload is
+//! acknowledged that a restart would forget.
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
+use slates_git::lfs::serve::{Answer as LfsAnswer, Endpoint};
+use slates_http::reply::Status;
 use slates_http_edge::credential::Credential;
 use slates_rt::tcp::TcpListener;
 use slates_rt::{RtError, Runtime, ShardId, futures};
 use slates_vfs::clock::Clock;
 
-use super::git::{Authenticator, GitSite, Located, Proven, Repositories, Unproven, Unserved};
+use super::git::{
+  Authenticator, GitSite, LfsService, Located, Proven, Repositories, Unproven, Unserved,
+};
 use super::{Bounds, EdgeState, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
+use crate::lfs::{LfsCall, NoObjects};
 
 /// Counter: an edge whose listener's task the control shard's arena refused.
 const NOT_STARTED: &str = "vcs_http.not_started";
@@ -132,8 +140,29 @@ impl Repositories for ShardRepositories {
   }
 }
 
+/// Git LFS as the daemon serves it, on the shard its connection reached the repository's owner on (the module doc): the
+/// locks API over the repository's locks log; the batch API and the transfers not until the owner shard keeps LFS
+/// objects durably (A-581).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ShardLfs;
+
+impl LfsService for ShardLfs {
+  fn serves(&self, endpoint: &Endpoint) -> bool {
+    matches!(
+      endpoint,
+      Endpoint::CreateLock | Endpoint::ListLocks | Endpoint::VerifyLocks | Endpoint::Unlock { .. }
+    )
+  }
+
+  fn answer(&mut self, call: &LfsCall<'_>) -> LfsAnswer {
+    // A borrow of the shard's state refused is counted where it is refused; the request fails as the server's.
+    crate::state::with_state_counted(|state| crate::lfs::answer(state, &mut NoObjects, call))
+      .unwrap_or_else(|| crate::lfs::bare(Status::INTERNAL_SERVER_ERROR))
+  }
+}
+
 /// git's site as the daemon serves it.
-pub(crate) type DaemonSite = GitSite<RecordedCredentials, ShardRepositories, Unserved>;
+pub(crate) type DaemonSite = GitSite<RecordedCredentials, ShardRepositories, Unserved, ShardLfs>;
 
 /// What makes the daemon's git site on any shard: its challenges name `realm`, and it charges each route's path to the
 /// request's `room`.
@@ -146,6 +175,7 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       ShardRepositories,
       Unserved,
     )
+    .with_lfs(ShardLfs)
   }
 }
 

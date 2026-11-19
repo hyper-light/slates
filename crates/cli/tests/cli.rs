@@ -13475,14 +13475,15 @@ fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
 const VCS_HTTP_CLEARTEXT_LINE: &str =
   "slates daemon: the version-control HTTP edge serves cleartext on 127.0.0.1:";
 
-/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: start an anchor whose daemon is asked for the version-control HTTP
-/// edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the daemon names; ask that
-/// port for a repository's refs with no credentials. Expect: the daemon names the edge's port before it says it serves,
-/// and the edge answers `401` with a Bearer challenge and no Basic one (Basic's password is taken over TLS alone): the
-/// flag went from the anchor to its daemon, which started the shared edge.
+/// A-625 part 3 (§4.17.2 "Transports" item 1), A-629 part 2c. Do: start an anchor whose daemon is asked for the
+/// version-control HTTP edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the daemon
+/// names; ask that port for a repository's refs with no credentials, then for its Git LFS locks. Expect: the daemon names
+/// the edge's port before it says it serves, and the edge answers each `401` with a Bearer challenge and no Basic one
+/// (Basic's password is taken over TLS alone), the LFS request's in `LFS-Authenticate` too: the flag went from the anchor
+/// to its daemon, which started the shared edge, and git's site routes Git LFS through its authentication.
 #[test]
 fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
-  use std::io::{BufRead, Read, Write};
+  use std::io::{BufRead, Write};
   let instance = format!("cli-vcs-http-{}", std::process::id());
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
@@ -13525,11 +13526,24 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   }
   anchor.drain = Some(echo_the_rest(stderr));
   let port = port.expect("the daemon named its edge's port before it served");
+  let refs = edge_head(
+    port,
+    b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
+  );
+  assert!(bearer_alone(&refs, "www-authenticate"), "{refs}");
+  let locks = edge_head(
+    port,
+    b"GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n",
+  );
+  assert!(bearer_alone(&locks, "lfs-authenticate"), "{locks}");
+}
+
+/// The head of the edge's answer on loopback `port` to `request`, sent on a connection of its own, in lower case.
+fn edge_head(port: u16, request: &[u8]) -> String {
+  use std::io::{Read, Write};
   let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
   stream.set_read_timeout(Some(WAIT_FOR)).unwrap();
-  stream
-    .write_all(b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n")
-    .unwrap();
+  stream.write_all(request).unwrap();
   let mut head = Vec::new();
   let mut chunk = [0u8; 1024];
   while !head.windows(4).any(|end| end == b"\r\n\r\n") {
@@ -13541,8 +13555,12 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
     );
     head.extend_from_slice(&chunk[..read]);
   }
-  let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
-  assert!(head.starts_with("http/1.1 401 "), "{head}");
-  assert!(head.contains("www-authenticate: bearer realm="), "{head}");
-  assert!(!head.contains("basic"), "{head}");
+  String::from_utf8_lossy(&head).to_ascii_lowercase()
+}
+
+/// Whether `head`, in lower case, is a `401` whose `field` offers Bearer's challenge and no Basic one anywhere.
+fn bearer_alone(head: &str, field: &str) -> bool {
+  head.starts_with("http/1.1 401 ")
+    && head.contains(&format!("{field}: bearer realm="))
+    && !head.contains("basic")
 }

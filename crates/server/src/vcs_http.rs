@@ -70,7 +70,7 @@ use std::task::{Poll, Waker};
 
 use slates_http::head::Head;
 use slates_http::reply::Status;
-use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase};
+use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase, StatusMode};
 use slates_http_edge::tls::{HttpsSession, ServingIdentity};
 use slates_rt::TaskId;
 use slates_rt::error::RtError;
@@ -193,6 +193,12 @@ pub(crate) trait Exchange {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed>;
   /// The request's body has ended.
   async fn body_end(&mut self) -> Result<(), Failed>;
+  /// The status the reply's head carries, asked once as the reply begins, after the body has ended, on a route that
+  /// decides it after the body ([`StatusMode::AfterBody`]): none for `200`, every streamed route's, as git's and
+  /// Mercurial's services leave theirs; Git LFS names the status its answer decided (A-629).
+  async fn reply_status(&mut self) -> Result<Option<Status>, Failed> {
+    Ok(None)
+  }
   /// The fields the reply's head carries after the decision's, asked once as the reply begins, after the body has
   /// ended: none unless the reply's outcome decides them, as a Mercurial command's decides its media type (A-650).
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
@@ -204,12 +210,15 @@ pub(crate) trait Exchange {
 
 /// How a site answers a request's head.
 pub(crate) enum Answer<E> {
-  /// Serve it: `200` with `fields`, its body to `exchange` and its reply from it; the head alone when `head_only`.
+  /// Serve it: `fields`, its body to `exchange` and its reply from it; the head alone when `head_only`; its status `200`
+  /// or, on a route that decides it after the body, the one `exchange` names ([`Exchange::reply_status`]).
   Serve {
     /// The reply's fields.
     fields: Fields,
     /// Whether the reply is the head alone (`HEAD`).
     head_only: bool,
+    /// When the reply's status is decided (main's ruling, 2026-11-19: per route).
+    status: StatusMode,
     /// The service's exchange.
     exchange: E,
   },
@@ -917,6 +926,7 @@ impl<S: Site> Parts<S> {
       Answer::Serve {
         fields,
         head_only,
+        status,
         exchange,
       } => {
         self.service = Some(Started {
@@ -924,7 +934,11 @@ impl<S: Site> Parts<S> {
           head_only,
           fields_given: false,
         });
-        connection.decide(Decision::Serve { fields, head_only });
+        connection.decide(Decision::Serve {
+          fields,
+          head_only,
+          status,
+        });
       }
       Answer::Refuse { status, fields } => {
         self.service = None;
@@ -969,7 +983,7 @@ impl<S: Site> Parts<S> {
   }
 
   /// Passes the service's next reply run to the engine, or the reply's end, then yields: one run a turn. The service's
-  /// reply fields go to the engine first, once, before any of the reply.
+  /// reply status, where it names one, and its reply fields go to the engine first, once, before any of the reply.
   async fn reply(&mut self, connection: &mut Connection) -> Flow {
     let Some(started) = self.service.as_mut() else {
       connection.fail(Status::INTERNAL_SERVER_ERROR);
@@ -977,6 +991,20 @@ impl<S: Site> Parts<S> {
     };
     if !started.fields_given {
       started.fields_given = true;
+      match started.exchange.reply_status().await {
+        Ok(Some(status)) => connection.reply_status(status),
+        Ok(None) => {}
+        Err(Failed(status)) => {
+          self.service = None;
+          connection.fail(status);
+          return Flow::Go;
+        }
+      }
+      // A status the engine refused (a streamed route's, or one no reply's content may follow) failed the request.
+      if connection.phase() != Phase::Reply {
+        self.service = None;
+        return Flow::Go;
+      }
       match started.exchange.reply_fields().await {
         Ok(fields) => connection.reply_fields(fields),
         Err(Failed(status)) => {

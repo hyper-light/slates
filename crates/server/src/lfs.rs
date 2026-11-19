@@ -25,18 +25,23 @@
 //!
 //! **The objects** are a seam the caller hands in: the daemon holds no durable object store for a
 //! repository yet (A-581's use on the owner shard is owed), and a store that forgot its objects at
-//! a restart would lose them.
+//! a restart would lose them. So the daemon's edge serves the locks API alone, handing in
+//! [`NoObjects`], and answers the batch API and the transfers `503` at their head
+//! (`vcs_http::daemon_edge::ShardLfs`, A-629 part 2c): no upload is acknowledged that a restart
+//! would forget.
 
 use slates_db::catalog::{
   Principal, RepositoryCheck, RepositoryId, RepositoryRecord, StateChange, StateLog,
 };
-use slates_git::lfs::Timestamp;
+use slates_git::lfs::objects::{Admitted, ObjectRefused};
 use slates_git::lfs::serve::{
   Access, Answer, Context, Kind, LockRecord, Locks, LocksRefused, Need, Objects, Request, Routed,
   Server, Taken, base_url,
 };
+use slates_git::lfs::{Oid, Timestamp};
 use slates_http::reply::Status;
 use slates_ipc::protocol::Refusal;
+use slates_vcs::ContentRefused;
 use slates_vfs::clock::Clock;
 use slates_wire::Wire;
 
@@ -288,8 +293,27 @@ pub(crate) struct LfsCall<'a> {
   pub(crate) room: u64,
 }
 
+/// The objects of a repository whose owner shard keeps none durably yet (the module doc): the
+/// daemon's edge hands them in with the locks API's requests alone, which never ask them. Asked,
+/// they hold nothing and keep nothing, so no upload is acknowledged that a restart would forget.
+pub(crate) struct NoObjects;
+
+impl Objects for NoObjects {
+  fn held(&self, _oid: &Oid) -> Option<u64> {
+    None
+  }
+
+  fn bytes(&self, _oid: &Oid) -> Option<Vec<u8>> {
+    None
+  }
+
+  fn admit(&mut self, _oid: &Oid, _bytes: &[u8]) -> Result<Admitted, ObjectRefused> {
+    Err(ObjectRefused::Store(ContentRefused::NotHeld))
+  }
+}
+
 /// An answer with `status` and no body.
-fn bare(status: Status) -> Answer {
+pub(crate) fn bare(status: Status) -> Answer {
   Answer {
     status,
     kind: Kind::Empty,
