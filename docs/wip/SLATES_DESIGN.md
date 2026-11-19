@@ -12575,6 +12575,14 @@ engine: the verdict, rebase, position mapping, the register).
 > daemon starting an edge (address, identity, an authenticator over §4.13's keys, the lookup across partitions),
 > receive-pack's session (A-654), then the live `git clone`.
 >
+> **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
+> engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
+> service names as its reply begins (`Connection::reply_fields`, asked once through `Exchange::reply_fields`, none by
+> default, so git's site is unchanged): a Mercurial answer's media type follows from its command's outcome, as a push's
+> answer will and Subversion's WebDAV statuses will. A field a reply cannot carry fails the request `500` before any of
+> it is sent, the decision's at the decision and the service's as it names them. Mercurial's site is §4.17.3's
+> (`vcs_http::hg`, A-650 part 1); Subversion's is owed.
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -13435,6 +13443,32 @@ signature verification).
 > checked, the repository's state read; no borrow held between turns; abandoned, it gives back everything. `import`
 > is its thin facade. Proven by three stores imported a unit a turn equal row for row to one call, and an import
 > abandoned or refused midway holding nothing (Windows x86_64, jupiter: 278 of 278, red 2 failed; macOS owed).
+>
+> **Status (2026-11-19, A-650 part 1: HTTP version 1 served).** `serve::http` answers a request as 7.2's `_callhttp`
+> does: its command the query's last `cmd`, as hgweb's `multidict` reads it (A-569's codec read the first, corrected);
+> its arguments by 7.2's spec from the query and the `X-HgArg` headers or the body's front; the command answered by the
+> session's dispatch over the HTTP transport (the capabilities with `compression`, `httpheader` and `httpmediatype` and
+> without `protocaps`; a bundle1 `getbundle` refused in 7.2's own `bundle2required` words); and the answer framed in
+> 7.2's media types: a string in `application/mercurial-0.1`, an error in `application/hg-error`, a stream in
+> `application/mercurial-0.2` in an engine the client reads (an abort part uncompressed, as 7.2 sends it), else in
+> `0.1` in zlib. The engine and level are the caller's (`Compressor`), and each answer is charged at its engine's
+> documented bound before it is made (zlib's, stock zlib's `compressBound`, is outgrown by the linked zlib-rs's level 1
+> on bytes that do not compress: GAPS, its own piece). `getbundle` judges the bundle capabilities before what is
+> missing, in 7.2's order, so a bundle1 client is never sent a bundle2 abort. The daemon's site (`vcs_http::hg`) routes
+> a repository's URL as hgweb does, proves credentials as git's site does, judges the policy in hgweb's order (read for
+> every request; a push also `POST` and a right to submit, rewrite or delete), and names the answer's media type as the
+> reply begins (the edge's `reply_fields`); hgweb's pages, and a repository whose store the shard does not hold, are
+> `503` until piece 12 and A-662. Until the estimator below lands, a stream takes the design's first value, the fastest
+> form the client reads (`none` where it reads it, else its first engine at its fastest level; zlib at level 0 to a
+> `0.1` client). Proven by `slates-hg --lib` 293 of 293, `slates-http-edge --lib` 32 of 32 and
+> `slates-server --lib vcs_http` 36 of 36 on macOS arm64 (Mac Studio, kiln r6, r33 and r48, 2026-11-19; the other
+> platforms owed): a stock 7.2 client's clone, pull and incoming over HTTP against stock `hg serve`
+> (`crates/hg/fixtures/serve-http`), each answer as 7.2 meant it (strings byte for byte in 7.2's media types, the
+> capabilities a subset of 7.2's, each `getbundle`'s zstd stream inflated and compared as the session's golden compares
+> one); 7.2's own words for what it refuses; the abort and zlib framings; a chooser past the client's engines refused;
+> hostile requests; the site's statuses in hgweb's order; the edge's late fields. Owed of piece 4: the estimator (the
+> connection's delivery rate, and this repository's compression speed and ratio), the answers sliced within the shard's
+> budget, the process around `slates hg serve --stdio`, held deltas, the index's kept heads.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13843,8 +13877,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
-   3), and the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`); owed: the process
-   around it, HTTP.
+   3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
+   (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site); owed: the process around the stdio
+   session, the learned response compression (the first value until then), and the stores (A-662).
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -47943,3 +47978,75 @@ the store's module docs; three tests in `tests::store::upload`; and A-665's test
   made (A-640's small.git clone and A-582's five fetches), each object once, and a plan past its admission refused:
   the next piece, with `Streamed::counters()`; the red-checks of the marking and the other platforms' runs (main's); a
   delta search for an object past a window; the fragments' encoding sliced.
+
+### A-650 (part 1) — Mercurial over HTTP: HTTP version 1 answered as stock Mercurial 7.2 frames it, from the daemon's site on the shared edge, the answer's media type named as its reply begins (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Access" and piece 4; §4.17.2 "Transports" item 1; A-569, A-619, A-625, A-597, A-622; the stores it reads are A-662's)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), §4.17.2 (a status for the edge's change),
+`crates/hg` (new: `serve::http` with `answer`, `Answered`, `Compression`, `Compressor`, `Media`, `Permission`,
+`permission` and `command`; the session's `dispatch`, `Transport`, `Answer` and `spec_of`, and `Refused::Http`,
+`NotAvailable`, `Compression` and `EngineNotRead`; `http::Fields::command` reads the last `cmd`;
+`compression::Engine::wire_name`, `for_wire_name` and `bound`, `EncodeRefusal` now `Copy`; `serve::getbundle` judges
+the bundle capabilities first; `fixtures/serve-http` and its script, kept as captured by `.gitattributes`),
+`crates/http-edge` (`Connection::reply_fields`, the head rendered with the reply's first bytes), `crates/server`
+(`vcs_http::hg`: `HgSite`, `HgStores`, `NoStores`, `Fastest`, `HgExchange`; `Exchange::reply_fields`; a dependency on
+`slates-hg`), GAPS (the §4.17 edge entry and the §4.17.3 entry), `research/mercurial-server.md` (§24).
+- **What it does.** `serve::http::answer(store, request, header_line, compressor, admission)` answers an HTTP version 1
+  request as 7.2's `_callhttp` answers it: the query's last `cmd`, its arguments by 7.2's spec (A-569's codecs), the
+  command through the session's dispatch over the HTTP transport, and the answer in 7.2's media types: a string in
+  `application/mercurial-0.1`, an error in `application/hg-error` (ended by a line end as 7.2 forwards an abort, or in
+  7.2's own words where it has them), a stream in `application/mercurial-0.2` behind its engine's name in an engine the
+  client reads, else in `0.1` in zlib. The daemon's `HgSite` decides each head in hgweb's order and serves a command
+  through an `HgExchange`, which holds the request's `X-Hg` fields, query and body within the request's room and names
+  the answer's `Content-Type` as its reply begins.
+- **Decided.** The media type is the answer's, so the edge renders a reply's head with its first bytes and takes a
+  service's fields until then (`reply_fields`); a push's answer and Subversion's WebDAV statuses need the same. The
+  compression's engine and level are the caller's; until §4.17.3's estimator lands the site takes the design's first
+  value, the fastest form the client reads (`none` where read, which costs no compression time; else its first engine
+  at its fastest level; zlib level 0 to a `0.1` client). `httpheader` is the edge's line bound, 8000 (a client's count
+  holds the line end the edge's leaves out). A principal whose credentials hold and whom the policy refuses is `403`,
+  where hgweb answers `401`. hgweb's pages are `503` until piece 12; a repository whose store the shard lacks is `503`
+  until A-662, and that path goes when it lands. A path past the request's room is `414`, as git's routes answer a
+  target past theirs, and a query's fields past it are `400` for now (`414` is its own piece); `X-Hg` fields past it are
+  `431`; a body past it is `413`; a policy holding a rule the repository's tool cannot read (a damaged record) is `500`,
+  never judged without the rule.
+- **Found, and fixed here, failing tests first.** A-569's `Fields::command` read a query's first `cmd`, where hgweb's
+  `multidict` answers the last, which 7.2 serves (`hgweb/request.py`). A-619's `getbundle` computed what is missing
+  before it judged the bundle capabilities, so a bundle1 client naming a head the view lacks was answered with a bundle2
+  abort it cannot read; 7.2 refuses bundle1 first (`wireprotov1server.getbundle`), and so does this now, over SSH and
+  HTTP alike. And a trap: `.gitattributes`' `* text=auto eol=lf` normalized the captures' CRLF heads on their first
+  commit; `crates/hg/fixtures/serve-http/** -text` keeps them as captured, as A-569's are kept.
+- **Found, and left to its own piece** (main's to start, its failing test first). The room an answer is charged before
+  it is compressed counts zlib's at stock zlib's `compressBound`, which the linked backend outgrows: zlib-rs's level 1
+  (zlib-ng's `deflate_quick`) writes fixed codes, nine bits for the bytes 144 to 255, and never falls back to stored
+  blocks, so 65,536 such bytes came to 73,721 against that bound's 65,569 (Windows x86_64, jupiter, kiln r92,
+  2026-11-19). Nothing served today meets it: the site's first value compresses zlib only at level 0, stored, within the
+  bound (GAPS).
+- **Tests** (macOS arm64, Mac Studio, 2026-11-19: `cargo test --locked -p slates-hg --lib` 293 of 293, kiln r33;
+  `-p slates-http-edge --lib` 32 of 32, r6; `-p slates-server --lib vcs_http` 36 of 36 on the merged tree, r48: git's
+  site 10, Mercurial's 6, the edge's serving 11 and the waits 9; `cargo fmt --check` clean on the three crates. The
+  first run, r6, failed the golden alone: its helper inflated 7.2's zstd frames, which name a 2 MiB window and no
+  content size (2,490,432 bytes charged for the decoder), in the 1 MiB request room, and now has `INFLATE_ROOM`. No
+  integration target reaches `vcs_http`, private to its crate, or `slates-hg`. The other platforms owed). slates-hg: the
+  13 HTTP exchanges of a stock 7.2 client's clone, pull and incoming against stock `hg serve` (`fixtures/serve-http`)
+  answered as 7.2 meant them: each in 7.2's media type, `batch` and `listkeys` byte for byte, the capabilities a subset
+  of 7.2's with its values, each `getbundle` a `0.2` zstd stream inflating to what 7.2's meant, the chooser asked once a
+  stream with the client's engines in its order; a command 7.2's table lacks, none at all, and A-569's capture of a
+  bundle1 `getbundle` refused in 7.2's words and bytes; a stream charged its engine's bound before it is compressed
+  (each compressing engine refused at the least room that serves `none`, and served at the whole room); the abort part
+  uncompressed in `0.2`, and `0.1` in zlib to a client reading `0.1` alone or naming no engine this crate writes; a
+  chooser past what the client reads, or past an engine's levels, refused; `known` without its nodes, post arguments
+  past the body and a request past its room answered out of band; arbitrary requests answered in a media type, never a
+  panic (generated); each command's permission as 7.2's table; a repeated `cmd` read last and an argument first.
+  slates-http-edge: a service's field written after the decision's as its reply begins, a field no reply can carry
+  refused `500` in stages, and a field named after the first run never written. slates-server: hgweb's order a step at a
+  time (twelve requests on an open and a strict site, each judged before any is compared); the refusals' `Allow` and
+  challenge; a path past the room `414`, `X-Hg` fields past it `431`, a damaged policy `500`; a served command's media
+  type named as its reply begins; a body past the room `413` and a store gone `503`; nothing served until the stores
+  land, and the first value's fastest forms; the late fields over a real loopback connection, asked once, a failure
+  there `503` in stages.
+- **Owed.** The stores the site reads (A-662, g258), and with them the `503` path's removal; the learned response
+  compression; the answers sliced within the shard's step budget (a `getbundle` is made whole in one step, bounded by
+  the request's room); the daemon starting the edge with Mercurial's site beside git's; pushes over HTTP (piece 5's
+  rest: `unbundle` and `pushkey`, whose permission checks are in place and which are answered out of band until then);
+  the live `hg clone` and `hg pull` over HTTPS against the daemon (main's run); and two pieces of their own, each with
+  its failing test first: zlib's bound as the linked zlib-rs states it (`compress_bound`), and a query's fields past the
+  request's room `414`, as a path's are.

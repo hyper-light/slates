@@ -625,3 +625,69 @@ fn a_get_over_tls_is_served_and_its_basic_credentials_read() {
   };
   assert_eq!(seen, Some(basic));
 }
+
+/// Drives one GET through a connection whose decision names `Cache-Control` alone and whose service answers one run,
+/// naming `late` as its reply begins, or after its first run when `after_first`; what the connection wrote.
+fn served_with_late_fields(late: Fields, after_first: bool) -> String {
+  let mut connection = Connection::clear(ROOM);
+  let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
+  let mut late = Some(late);
+  loop {
+    match connection.next() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Read if fed => connection.peer_closed(),
+      Next::Read => {
+        fed = true;
+        connection.receive(b"GET /r?cmd=heads HTTP/1.1\r\nHost: h\r\n\r\n");
+      }
+      Next::Decide => connection.decide(Decision::Serve {
+        fields: fields(&[("Cache-Control", "no-cache")]),
+        head_only: false,
+      }),
+      Next::Body(_) => connection.body_taken(),
+      Next::BodyEnd => {}
+      Next::Reply if !after_first && late.is_some() => {
+        connection.reply_fields(late.take().unwrap_or_default());
+      }
+      Next::Reply if runs == 0 => {
+        runs += 1;
+        connection.reply(b"answer");
+        if after_first {
+          connection.reply_fields(late.take().unwrap_or_default());
+        }
+      }
+      Next::Reply => connection.reply_end(),
+      Next::CloseWrite | Next::Drain | Next::Close => {
+        return String::from_utf8_lossy(&written).into_owned();
+      }
+    }
+  }
+}
+
+/// A-650: do serve a GET whose service names its reply's media type as its reply begins, then one naming a field no
+/// reply can carry, then one naming a field after its first run went out. Expect the first head to carry the service's
+/// field after the decision's; the second refused `500` in stages, nothing of a `200` written; and the third's late
+/// field never written, its head the decision's alone.
+#[test]
+fn a_service_names_its_reply_fields_as_its_reply_begins() {
+  let media = fields(&[("Content-Type", "application/mercurial-0.1")]);
+  let body = "6\r\nanswer\r\n0\r\n\r\n";
+  let late = format!(
+    "{}{}{body}",
+    "HTTP/1.1 200 OK\r\nCache-Control: no-cache\r\n",
+    "Content-Type: application/mercurial-0.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+  );
+  let refused =
+    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  let decided = format!(
+    "HTTP/1.1 200 OK\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n{body}"
+  );
+  assert_eq!(
+    (
+      served_with_late_fields(media.clone(), false),
+      served_with_late_fields(fields(&[("Content-Type", "a\r\nb")]), false),
+      served_with_late_fields(media, true),
+    ),
+    (late, refused.to_owned(), decided)
+  );
+}

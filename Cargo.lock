@@ -1901,6 +1901,7 @@ dependencies = [
  "slates-conformance",
  "slates-db",
  "slates-git",
+ "slates-hg",
  "slates-http",
  "slates-http-edge",
  "slates-image",

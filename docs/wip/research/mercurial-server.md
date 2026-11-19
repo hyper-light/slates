@@ -768,3 +768,53 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **Mutable state and immutable rows.** The shared index never rewrites a row, while the phase roots and bookmarks move
   with every push, so they are the register's (A-642), and the import hands them back typed; markers, never changed once
   made, are the index's rows.
+
+## 24. Found while serving HTTP version 1 (A-650 part 1, 2026-11-19; 7.2's code [C] in the wheel `uv` installs on the Mac Studio, `mercurial==7.2`, `__version__.py` reading `7.2`; a stock 7.2 client's clone, pull and incoming over HTTP against stock `hg serve`, `fixtures/serve-http`)
+
+- **What is a wire request** (`wireprotoserver.handlewsgirequest`). One whose query holds `cmd` naming a command of
+  the version 1 table (`iscmd`); any other request is hgweb's. `req.qsparams[b'cmd']` reads a `multidict`, whose
+  `__getitem__` "Returns the last set value for a key" (`hgweb/request.py`), so 7.2 serves a query's last `cmd`:
+  A-569's codec read the first, and is corrected in A-650. A wire `cmd` on a path within the repository (a
+  `dispatchpath`) is answered `404` with `0\nNot Found\n`; a permission refusal (`ErrorResponse`) with its status and
+  `0\n<message>\n`.
+- **The answer** (`_callhttp`). A command the table holds that the transport does not is `200` `application/hg-error`
+  "requested wire protocol command is not available over HTTP"; the command's permission is checked before it runs;
+  then a string is `200 Script output follows` in `application/mercurial-0.1`; a stream (`streamres`) is compressed as
+  `_httpresponsetype` chooses and, for `0.2`, framed by `genversion2` (one byte giving the engine's name's length, then
+  the name); a push's answer is `<result>\n<output>`, a push's refusal `0\n<message>\n` with the body drained; an
+  out-of-band error is `application/hg-error`, its message the body.
+- **The compression** (`_httpresponsetype`). To a client whose `X-HgProto` holds `0.2`: `none` where the answer prefers
+  uncompressed ("All clients are expected to support uncompressed data"), else the first engine of the server's list
+  (`supportedcompengines` for the server's role: engines whose server priority is above 0, zstd then zlib) that the
+  client names (`clientcompressionsupport`: the first `comp=` token's list, else `zlib` and `none`), at
+  `server.<engine>level` (`zstdlevel` 3, `zliblevel` -1 by `configitems.toml`); with no engine shared, or to a client
+  that does not read `0.2`, `application/mercurial-0.1` in zlib at `server.zliblevel`.
+- **The capabilities** (`httpv1protocolhandler.addcapabilities`) add to `_capabilities`' list `batch`,
+  `httpheader=<server.maxhttpheaderlen>` (1024 by default), `httppostargs` when `experimental.httppostargs` is set,
+  `httpmediatype=0.1rx,0.1tx,0.2tx` and `compression=` the server's engines by wire name; `capabilities` answers the
+  list sorted and joined by spaces. `protocaps` is advertised over SSH alone. The arguments (`_args`): the query's
+  fields as a dictionary of lists, updated by the `X-HgArgs-Post` front of the body or the `X-HgArg-<N>` values
+  joined, a name both carry taking the later's list; `getargs` reads each list's first value.
+- **`getbundle` judges bundle1 first** (`wireprotov1server.getbundle`). A request naming no bundle capability that
+  starts `HG2` is refused before anything else: over HTTP `ooberror(bundle2required)`, the message "incompatible
+  Mercurial client; bundle2 required" and the hint "(see https://www.mercurial-scm.org/wiki/IncompatibleClient)", each
+  ended by a line end; over SSH an abort. Then `exchange.getbundlechunks` decodes the bundle2 capabilities before it
+  runs the parts' generators, the changegroup's among them, which compute what is missing. A-619's `getbundle`
+  computed what is missing first, so a bundle1 client naming a head the view lacks was answered with a bundle2 abort it
+  cannot read; A-650 judges the capabilities first, in 7.2's order. An abort of a bundle2 request is an `error:abort`
+  part with its message and hint, sent uncompressed (`prefer_uncompressed`).
+- **hgweb's permissions** (`hgweb/common.py` `checkauthz`, run for every wire command with its table's permission:
+  `unbundle` and `pushkey` push, every other pull). `deny_read`, then `allow_read`: `401` "read not authorized"; a pull
+  where pulls are off: `401` "pull not authorized"; a push by any method but `POST`: `405` "push requires POST
+  request"; `push_ssl` without HTTPS: `403` "ssl required"; `deny_push`, then `allow-push`: `401` "push not
+  authorized". The status line carries the message (`statusmessage`). slates keeps the order and answers a principal
+  its policy refuses `403`, since its credentials were proved.
+- **Measured** (`fixtures/serve-http`, `make-http-fixtures.sh`, the repository of `fixtures/serve` made the same way;
+  its states, bookmarks and incoming output equal byte for byte). The clone: `capabilities` (582 bytes:
+  `batch branchmap bundle2=… changegroupsubset compression=zstd,zlib getbundle httpheader=1024
+  httpmediatype=0.1rx,0.1tx,0.2tx known lookup pushkey streamreqs=… unbundle=HG10GZ,HG10BZ,HG10UN unbundlehash`), a
+  `batch` of `heads` and an empty `known`, and `getbundle` answered `application/mercurial-0.2` in zstd (1,952 bytes).
+  The pull: the same three, the `batch`'s `known` naming the client's three heads, the `getbundle` 716 bytes. The
+  incoming: the same three (its `getbundle` 338 bytes) and `listkeys` of the phases. The client sent
+  `X-HgProto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull` with every command after `capabilities`, and its
+  arguments in `X-HgArg-1` alone, each request by `GET`.
