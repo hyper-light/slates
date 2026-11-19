@@ -13410,12 +13410,15 @@ signature verification).
 > name under the one before it, never a path string; a name the host does not find is a file that is not there, every
 > other refusal carried through typed (an S3 base's pending fetch among them), and a name that is not UTF-8 refused by
 > kind before the host is asked. A file is opened once a lend and read within its length when it was opened, each read
-> charged what the file holds before a byte is held; at most the last file's directory and a revlog's two files are
-> held whatever a path's depth, and everything a lend opened is closed when the lend ends, so the host can be lent a
-> turn at a time. Proven by two stores 7.2 kept (`states`, with its phases, bookmarks and markers, and the file index
-> store, eight directories deep) imported through the simulated host equal to the same files read from memory, each
-> file opened once; a sliced import lent the host afresh each turn equal to the whole; the refusals and the bounds
-> each by a test.
+> charged what the file holds before a byte is held; a host's short answer is read on from where it stopped and its
+> refusal carried through, never taken for the file's end (an S3 base answers from the chunks it has cached, then
+> names the fetch it waits on); at most the last file's directory and a revlog's two files are held whatever a path's
+> depth, and everything a lend opened is closed when the lend ends, so the host can be lent a turn at a time. Proven
+> by two stores 7.2 kept (`states`, with its phases, bookmarks and markers, and the file index store, eight
+> directories deep) imported through the simulated host equal to the same files read from memory, each file opened
+> once; a sliced import lent the host afresh each turn equal to the whole; a file grown or cut in place while held
+> read within its length when opened; a read answered three bytes a call read whole, and refused with the fetch where
+> a piece is still being fetched; the refusals and the bounds each by a test.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -47348,6 +47351,12 @@ the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the se
 - **A file's length is its length when it was opened.** A file is opened once a lend and its length taken by `fstat`
   then, and its reads end there: a revlog another process appends to is read as the prefix it held, and a file replaced
   while held (a save by rename) is read as it was opened, its descriptor keeping its bytes.
+- **A host's short answer is not the file's end.** A read asks the host again from where its answer stopped until the
+  range is read or the host answers nothing, since a host may answer fewer bytes than asked before a file ends: the S3
+  base (`slates_base`'s S3 host, A-555) copies the chunks it has cached and refuses the next read with the fetch it
+  waits on, and Linux transfers at most 0x7ffff000 bytes a `pread` (read(2), NOTES). The fetch's refusal is carried
+  through, so the import's caller runs the import again once it lands (`ImportRefused::Host`), never a revlog refused
+  as truncated because its last chunk was not yet fetched. A length the host refuses closes the file its open made.
 - **Bounds.** A read is charged to the import's room before a byte is held, and charged at most what the file holds
   from its offset. At most the last file's directory and two files are held (`FILES_HELD`: a revlog's index and data
   file, which its reader reads in turn), every other directory closed as soon as the one under it is open, so a path

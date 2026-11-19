@@ -726,8 +726,9 @@
 > turn equal to one call; the macOS run owed.
 > **Built (A-649 part 4):** the server's adapter from §4.15's host seam to the import's (`slates-server`'s `hg_base`):
 > one name at a time under the repository's directory, an absent file `None`, the host's refusals carried through, a
-> name not UTF-8 refused by kind, a file read within its length when it was opened, at most a directory and two files
-> held whatever a path's depth, everything closed when the lend ends; red first, then green against two stores imported
+> name not UTF-8 refused by kind, a file read within its length when it was opened, a host's short answer read on and
+> an S3 base's pending fetch carried through (never read as the file's end), at most a directory and two files held
+> whatever a path's depth, everything closed when the lend ends; red first, then green against two stores imported
 > through the simulated host equal to the same files read from memory.
 > Owed, in order, after §4.17.1's seven
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,

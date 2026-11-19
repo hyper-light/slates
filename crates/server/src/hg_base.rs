@@ -24,6 +24,13 @@
 //! as it was opened, since its descriptor keeps its bytes; a file cut short while held (a strip) ends where it now
 //! ends, so a read past that returns fewer bytes and the revlog reader refuses the revlog as truncated.
 //!
+//! **A host's short answer is not the file's end.** A read asks the host again from where its answer stopped until the
+//! range is read or the host answers nothing, since a host may answer fewer bytes than asked before a file ends: an S3
+//! base answers from the chunks it has cached and refuses the next read with the fetch it waits on (A-555), and Linux
+//! transfers at most 0x7ffff000 bytes a `pread` (read(2), NOTES). The S3 base's refusal is carried through, never taken
+//! for the file's end, so the import's caller runs the import again once the fetch lands (`ImportRefused::Host`) rather
+//! than the revlog being refused as truncated.
+//!
 //! **Bounds.** A read is charged to the import's room before a byte is held, and charged at most what the file holds
 //! from its offset, so an index entry pointing a chunk past its data file's end costs nothing. The handles held at once
 //! are bounded whatever a path's depth: the last file's directory, and the two files a revlog's reader reads in turn
@@ -213,7 +220,10 @@ impl<'h, H: HostFs + ?Sized> HgBase<'h, H> {
     let Some(directory) = self.walk(first, rest)? else {
       return Ok(None);
     };
-    self.directory = Some((names.iter().map(|name| Box::from(*name)).collect(), directory));
+    self.directory = Some((
+      names.iter().map(|name| Box::from(*name)).collect(),
+      directory,
+    ));
     Ok(Some(directory))
   }
 
@@ -235,7 +245,11 @@ impl<'h, H: HostFs + ?Sized> HgBase<'h, H> {
   }
 
   /// The directory `name` under `parent`, counted; `None` when it is not there.
-  fn open_directory(&mut self, parent: HostDir, name: &str) -> Result<Option<HostDir>, BaseRefused> {
+  fn open_directory(
+    &mut self,
+    parent: HostDir,
+    name: &str,
+  ) -> Result<Option<HostDir>, BaseRefused> {
     match self.host.open_dir(parent, name) {
       Ok(directory) => {
         self.opened.directories = self.opened.directories.saturating_add(1);
@@ -345,7 +359,10 @@ mod tests {
   use slates_hg::{Admission, Node, PastAdmission};
   use slates_vcs::ContentStore;
   use slates_vfs::host::sim::{Interference, SimHost, SimVerb};
-  use slates_vfs::host::{FetchId, HostDir, HostError, HostFs};
+  use slates_vfs::host::{
+    BaseEntry, FetchId, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, WatchState,
+  };
+  use slates_vfs::inode::Fingerprint;
 
   use super::{BaseRefused, HgBase, Opened};
 
@@ -451,6 +468,9 @@ mod tests {
 
   /// Shape: a nesting deeper than every handle the base holds at once.
   const DEPTH: usize = 32;
+
+  /// Shape: the fetch an S3 base's read waits on, any number.
+  const PENDING: HostError = HostError::Pending(FetchId(7));
 
   /// A new content store.
   fn store() -> ContentStore {
@@ -678,7 +698,10 @@ mod tests {
     let (mut host, repository) = laid_out(STATES.iter().copied());
     let open_before = host.open_handles();
     let mut store = store();
-    let start = Import::start(&mut HgBase::new(&mut host, repository), Admission::new(ROOM));
+    let start = Import::start(
+      &mut HgBase::new(&mut host, repository),
+      Admission::new(ROOM),
+    );
     let mut import = start.unwrap();
     let mut clock = Ticking(0);
     let mut closed_after_every_turn = host.open_handles() == open_before;
@@ -741,7 +764,10 @@ mod tests {
     let mut room = Admission::new(ROOM);
     let tail = base.read(&path, 8, 5, &mut room);
     let past_end = base.read(&path, 12, 5, &mut room);
-    assert_eq!((tail, past_end), (Ok(Some(b"89".to_vec())), Ok(Some(Vec::new()))));
+    assert_eq!(
+      (tail, past_end),
+      (Ok(Some(b"89".to_vec())), Ok(Some(Vec::new())))
+    );
     assert_eq!(room.left(), ROOM - 2);
     let mut small = Admission::new(9);
     let refused = base.read(&path, 0, 10, &mut small);
@@ -777,6 +803,28 @@ mod tests {
     let mut base = HgBase::new(&mut host, repository);
     let new = (base.len(&path), base.read(&path, 0, ROOM, &mut room));
     assert_eq!(new, (Ok(Some(16)), Ok(Some(replaced.to_vec()))));
+  }
+
+  /// A-649 part 4: do take a file's length, have an outsider append to it in place (a commit's append to a revlog, one
+  /// inode), read it whole, then have the outsider cut it short in place (a strip) and read it whole again. Expect the
+  /// read after the append the bytes the file held when it was opened, charged for those alone, and the read after the
+  /// cut the bytes the file still holds.
+  #[test]
+  fn a_file_grown_or_cut_while_held_is_read_within_its_length_when_opened() {
+    let (mut host, repository) = laid_out(TEN_BYTES.iter().copied());
+    let at = format!("/{REPOSITORY}/.hg/store/data/a.i");
+    let path = names("store/data/a.i");
+    let mut room = Admission::new(ROOM);
+    let mut base = HgBase::new(&mut host, repository);
+    let opened = base.len(&path);
+    base.host.write_in_place(&at, b"0123456789abcdef", 0);
+    let grown = base.read(&path, 0, ROOM, &mut room);
+    let charged = ROOM.saturating_sub(room.left());
+    base.host.write_in_place(&at, b"01234", 0);
+    let cut = base.read(&path, 0, ROOM, &mut room);
+    let read_as_opened = (Ok(Some(10)), Ok(Some(b"0123456789".to_vec())), 10);
+    assert_eq!((opened, grown, charged), read_as_opened);
+    assert_eq!(cut, Ok(Some(b"01234".to_vec())));
   }
 
   /// What a lend holds open beside the `open_before` handles open before it, and what it has opened.
@@ -824,14 +872,147 @@ mod tests {
   fn a_host_refusal_is_carried_through_and_nothing_is_left_open() {
     let (mut host, repository) = laid_out(STATES.iter().copied());
     let open_before = host.open_handles();
-    let pending = HostError::Pending(FetchId(7));
     let manifest = format!("/{REPOSITORY}/.hg/store/00manifest.i");
-    host.fail(SimVerb::OpenFile, &manifest, pending, 1);
+    host.fail(SimVerb::OpenFile, &manifest, PENDING, 1);
     let mut store = store();
     let mut base = HgBase::new(&mut host, repository);
     let refused = import::import(&mut base, &mut store, Admission::new(ROOM)).err();
     drop(base);
-    let expected = ImportRefused::Host(BaseRefused::Host(pending));
-    assert_eq!((refused, host.open_handles()), (Some(expected), open_before));
+    let expected = ImportRefused::Host(BaseRefused::Host(PENDING));
+    assert_eq!(
+      (refused, host.open_handles()),
+      (Some(expected), open_before)
+    );
+  }
+
+  /// The simulated host answering as an S3 base does (`slates_base`'s S3 host, A-555): a read answers at most `piece`
+  /// bytes and none from `cached` on, where the chunks it has cached end, and a read from there is refused with the
+  /// fetch it waits on (`PENDING`); a length is refused with `fstat` while one is armed, once. Every other call is the
+  /// simulated host's.
+  struct Fetching<'s> {
+    /// The simulated host.
+    sim: &'s mut SimHost,
+    /// The next length's refusal, once.
+    fstat: Option<HostError>,
+    /// The most bytes a read answers.
+    piece: usize,
+    /// Where the cached bytes end.
+    cached: u64,
+  }
+
+  impl<'s> Fetching<'s> {
+    /// `sim` answering every read whole and refusing nothing, until a test arms it.
+    fn over(sim: &'s mut SimHost) -> Self {
+      Fetching {
+        sim,
+        fstat: None,
+        piece: usize::MAX,
+        cached: u64::MAX,
+      }
+    }
+  }
+
+  impl HostFs for Fetching<'_> {
+    fn facts(&mut self, dir: HostDir) -> Result<HostFacts, HostError> {
+      self.sim.facts(dir)
+    }
+
+    fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
+      self.sim.fingerprint_dir(dir)
+    }
+
+    fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
+      self.sim.list(dir)
+    }
+
+    fn open_dir(&mut self, parent: HostDir, name: &str) -> Result<HostDir, HostError> {
+      self.sim.open_dir(parent, name)
+    }
+
+    fn open_file(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+      self.sim.open_file(dir, name)
+    }
+
+    fn fstat(&mut self, file: HostFile) -> Result<Fingerprint, HostError> {
+      match self.fstat.take() {
+        Some(refused) => Err(refused),
+        None => self.sim.fstat(file),
+      }
+    }
+
+    fn read_at(&mut self, file: HostFile, off: u64, buf: &mut [u8]) -> Result<usize, HostError> {
+      if off >= self.cached {
+        return Err(PENDING);
+      }
+      let cached = usize::try_from(self.cached.saturating_sub(off)).unwrap_or(usize::MAX);
+      let answered = buf.len().min(self.piece).min(cached);
+      let Some(piece) = buf.get_mut(..answered) else {
+        return Ok(0);
+      };
+      self.sim.read_at(file, off, piece)
+    }
+
+    fn read_link(&mut self, dir: HostDir, name: &str) -> Result<Box<str>, HostError> {
+      self.sim.read_link(dir, name)
+    }
+
+    fn close_file(&mut self, file: HostFile) {
+      self.sim.close_file(file);
+    }
+
+    fn close_dir(&mut self, dir: HostDir) {
+      self.sim.close_dir(dir);
+    }
+
+    fn watch(&mut self, dir: HostDir) -> WatchState {
+      self.sim.watch(dir)
+    }
+
+    fn hints(&mut self) -> Vec<Hint> {
+      self.sim.hints()
+    }
+
+    fn now_ns(&mut self) -> i64 {
+      self.sim.now_ns()
+    }
+  }
+
+  /// A-649 part 4: do take the length of a file whose length the host refuses (an S3 base's fetch still pending), then
+  /// take it again. Expect the host's refusal carried through with the file it opened closed at once, then the file's
+  /// length, and nothing left open when the lend ends.
+  #[test]
+  fn a_refused_length_closes_the_file_it_opened_and_is_carried_through() {
+    let (mut sim, repository) = laid_out(TEN_BYTES.iter().copied());
+    let open_before = sim.open_handles();
+    let mut host = Fetching::over(&mut sim);
+    host.fstat = Some(PENDING);
+    let mut base = HgBase::new(&mut host, repository);
+    let path = names("store/data/a.i");
+    let refused = base.len(&path);
+    let held_after = base.host.sim.open_handles().saturating_sub(open_before);
+    let again = base.len(&path);
+    drop(base);
+    let directory_alone = (Err(by_host(PENDING)), 1, Ok(Some(10)));
+    assert_eq!((refused, held_after, again), directory_alone);
+    assert_eq!(sim.open_handles(), open_before);
+  }
+
+  /// A-649 part 4: do read a file of ten bytes whole from a host that answers three bytes a read (an S3 base answers
+  /// from its cached chunks), first with every byte cached, then with only its first six cached and a fetch pending for
+  /// the rest. Expect the whole file read in pieces, then the read refused with the fetch, never answered with the six
+  /// bytes before it as though the file ended there.
+  #[test]
+  fn a_read_answered_in_pieces_is_read_whole_and_a_pending_piece_refuses_it() {
+    let (mut sim, repository) = laid_out(TEN_BYTES.iter().copied());
+    let mut host = Fetching::over(&mut sim);
+    host.piece = 3;
+    let mut base = HgBase::new(&mut host, repository);
+    let path = names("store/data/a.i");
+    let mut room = Admission::new(ROOM);
+    let whole = base.read(&path, 0, 10, &mut room);
+    base.host.cached = 6;
+    let pending = base.read(&path, 0, 10, &mut room);
+    let expected = (Ok(Some(b"0123456789".to_vec())), Err(by_host(PENDING)));
+    assert_eq!((whole, pending), expected);
   }
 }
