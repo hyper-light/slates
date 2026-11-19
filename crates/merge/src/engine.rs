@@ -4442,6 +4442,9 @@ mod node_exclusive_tests;
 mod unseen_bytes_tests;
 
 #[cfg(test)]
+mod replaced_node_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
 
