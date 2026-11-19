@@ -1098,8 +1098,12 @@
 >   touch since is a `ModifyModify` conflict (a refusal, never a loss) until the clone keeps what it landed as its base
 >   (a mark snapshot plus the per-path bases of what a filter left out); (2) stage 2 is built (A-503): a move carries
 >   the captured state of every path its clone changed in the volume's catalog, and the new owner keeps the moved head as
->   its mark, so a moved clone lands against its capture; owed of it, the fleet's own three-daemon test (filed for main)
->   and a captured clone taken over after its owner's loss, which carries nothing and still lands as a scratch volume;
+>   its mark, so a moved clone lands against its capture; and since A-544 every head a captured clone places carries its
+>   record, so a takeover after its owner's loss lands it against its capture too (refused by kind where the adopted
+>   head has no record, and a move waits for its head's record); owed of it, the fleet's own three-daemon tests of a
+>   move and a takeover (filed for main), a live-shipped clone's record for a head its log rebuilt, and a clone whose
+>   owner dies before its first snapshot is placed, which its successor serves as an empty tree (sealed at its making,
+>   or its catalog naming its capture, A-544);
 >   (3) a kind
 >   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
 >   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a
