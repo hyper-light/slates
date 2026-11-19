@@ -13536,6 +13536,7 @@ pub(crate) fn finish_making(
   region: Vec<u64>,
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
+  let from_live_log = taken.takeover.from_live_log;
   let Some(making) = state.making_volumes.remove(&id) else {
     return Err(Box::new(refused(Refusal::NotFound)));
   };
@@ -13658,7 +13659,7 @@ pub(crate) fn finish_making(
   // live log, whose tree may have run past the seal it names, so its landings are refused rather than judged from a
   // tree that is not the moved one.
   if let Some(carried) = catalog.carried.clone() {
-    let moved_head = head.manifest == Some(carried.head) && !taken.takeover.from_live_log;
+    let moved_head = head.manifest == Some(carried.head) && !from_live_log;
     let mark = moved_head.then_some(to_db_snapshot(snapshot));
     let op = Op::CaptureAdopted {
       volume: id,
@@ -20279,6 +20280,7 @@ mod tests {
       write: None,
       write_version: 0,
       signers: Vec::new(),
+      carried: None,
     }
   }
 
