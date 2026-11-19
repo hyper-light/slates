@@ -28,9 +28,9 @@
 
 use super::stream::{Progress, Stream};
 use super::{
-  AUTHOR_PROPERTY, DATE_PROPERTY, DIRECTORY_SIZE, DIRENT_FIELDS, DONE, Failure, Outcome, Reads, Repository,
-  SEPARATOR, SVN_ERR_FS_NOT_FOUND, bool_word, c_string_of, child_path, format_time, kind_word, parse_time,
-  path_and_revision,
+  AUTHOR_PROPERTY, DATE_PROPERTY, DIRECTORY_SIZE, DIRENT_FIELDS, DONE, Failure, Outcome, Reads,
+  Repository, SEPARATOR, SVN_ERR_FS_NOT_FOUND, bool_word, c_string_of, child_path, format_time,
+  kind_word, parse_time, path_and_revision,
 };
 use crate::authz::fnmatch;
 use crate::index::{Node, NodeKind, Revision};
@@ -288,7 +288,13 @@ impl ListStream {
       if self.walk == Walk::Ended {
         return Ok(Progress::Done);
       }
-      if reads.out.len().saturating_sub(start).saturating_add(visited) >= room {
+      if reads
+        .out
+        .len()
+        .saturating_sub(start)
+        .saturating_add(visited)
+        >= room
+      {
         return Ok(Progress::More);
       }
     }
@@ -500,7 +506,9 @@ impl ListDirent {
           .has_properties
           .then_some(Value::Word(bool_word(self.has_properties))),
       ));
-      items.push(optional(fields.created.then_some(Value::Number(self.created))));
+      items.push(optional(
+        fields.created.then_some(Value::Number(self.created)),
+      ));
       items.push(optional(
         fields.time.then_some(Value::String(self.date.as_bytes())),
       ));

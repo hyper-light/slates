@@ -923,7 +923,10 @@ fn a_listing_streams_a_slice_at_a_time_in_the_room_given() {
   assert_eq!(narrow, wide);
   assert_eq!(wide_slices, 1);
   let dirents = items(&wide).len().saturating_sub(3);
-  assert!(narrow_slices > dirents, "{narrow_slices} slices, {dirents} dirents");
+  assert!(
+    narrow_slices > dirents,
+    "{narrow_slices} slices, {dirents} dirents"
+  );
 }
 
 /// A-613 part 2 (`list`): `fill_dirent` parses each created revision's date, and one that does not parse refuses the
