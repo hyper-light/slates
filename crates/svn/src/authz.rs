@@ -33,25 +33,24 @@
 //! ending in `**` eclipses every rule beneath its own prefix that was defined before it (`trim_tree`). Without a rule at
 //! the root, nobody may do anything there. A recursive question (`svn_authz_recursive`: may the principal do this at
 //! the path and everywhere beneath it?) is answered by the least access among the path's own and that of every rule
-//! that could govern a path beneath it, whether or not such a path exists, as Subversion answers it. A question
-//! without a path (anywhere in the repository?) is answered by the most access any rule for the principal grants
+//! that could govern a path beneath it (at the root, every rule), whether or not such a path exists ("Potential
+//! because we don't verify that the respective paths actually exist", `authz.c`). A question without a path (anywhere
+//! in the repository?) is answered by the most access any rule for the principal grants
 //! (`svn_authz__get_global_rights`).
 //!
 //! **Where Subversion's code and its own documentation part**, this module follows the documentation, and each case
 //! is a named test: (1) the root has no segments, where `lookup` walks `/` as one empty segment, so that `[:glob:/*]`
 //! and its kin decide the root's access there although `*` "Matches any single non-empty path segment" (`authz.h`);
-//! (2) so a recursive question at the root weighs every rule, where Subversion's weighs only the rules an empty segment
-//! matches and grants recursive access at a root above a denied subtree; (3) matching a suffix pattern leaves the
-//! segment as it was, where `lookup` reverses the segment in place for the rest of its level, so another node's rules
-//! at that level meet it reversed; (4) a section whose path starts with two slashes is refused as the non-canonical
-//! path it is ("A path with two consecutive slashes is not canonical"), where `parse_rule_path` takes it for the root
-//! and ignores the rest. Where Subversion's outcome depends on hash order or on bytes past its buffer, this module
-//! decides one way: (5) a group whose membership leads back to itself through other groups is refused whichever group
-//! is met first, where Subversion refuses only a cycle through the group it happens to expand first and otherwise
-//! recurses until its stack runs out; (6) an option with nothing before its separator is refused; (7) a NUL byte is
-//! refused, where Subversion's C strings cut a name or a header at it; (8) a file with several errors is refused at the
-//! first in file order, and a refusal found after the reading (an undefined group, a cycle) at the line of the
-//! definition or entry that names it.
+//! (2) matching a suffix pattern leaves the segment as it was, where `lookup` reverses the segment in place for the rest
+//! of its level, so another node's rules at that level meet it reversed; (3) a section whose path starts with two
+//! slashes is refused as the non-canonical path it is ("A path with two consecutive slashes is not canonical"), where
+//! `parse_rule_path` takes it for the root and ignores the rest. Where Subversion's outcome depends on hash order or on
+//! bytes past its buffer, this module decides one way: (4) a group whose membership leads back to itself through other
+//! groups is refused whichever group is met first, where Subversion refuses only a cycle through the group it happens
+//! to expand first and otherwise recurses until its stack runs out; (5) an option with nothing before its separator is
+//! refused; (6) a NUL byte is refused, where Subversion's C strings cut a name or a header at it; (7) a file with
+//! several errors is refused at the first in file order, and a refusal found after the reading (an undefined group, a
+//! cycle) at the line of the definition or entry that names it.
 //!
 //! **Bounds**: one, given by the caller ([`Bounds`]): the bytes a file may hold, checked before anything is read; every
 //! structure built is proportional to the bytes read. Nothing recurses: groups, rule paths and the rule tree are walked
@@ -146,7 +145,7 @@ pub enum AuthzFile {
 }
 
 /// Why a file was refused: one kind for each distinct refusal Subversion makes (its message quoted), and the few this
-/// module adds (module documentation, items 4 to 7).
+/// module adds (module documentation: the bounds, items 5 and 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthzRefusal {
   /// The file holds more bytes than [`Bounds::file_bytes`].
@@ -315,7 +314,7 @@ impl Authz {
   ///
   /// # Errors
   /// [`AuthzRefused`] for the first refusal in file order, then for those found after reading (module documentation,
-  /// item 8).
+  /// item 7).
   pub fn parse(rules: &[u8], groups: Option<&[u8]>, bounds: Bounds) -> Result<Self, AuthzRefused> {
     Ok(Self {
       model: model::Model::parse(rules, groups, bounds)?,

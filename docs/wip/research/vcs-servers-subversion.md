@@ -379,14 +379,12 @@ the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `
     subtrees of the level's nodes ("Potential because we don't verify that the respective paths actually exist").
   - Where the code departs from its own documentation: (1) `lookup` strips `/` to the empty string and walks it as
     one empty segment (1284-1319), so `[:glob:/*]` (`add_next_node(... ->any)`, 1354, for any segment, the empty one
-    too) decides the root although `authz.h` 210 says `*` "Matches any single non-empty path segment"; (2) for the
-    same reason a recursive question at the root weighs only rules an empty segment matches: with `[/] * = rw` and
-    `[/secret] * =`, a recursive read at `/` is granted, and a commit that copies `/` (a recursive read of its source,
-    `commit.c`) would pass over `/secret`; (3) a suffix match reverses the segment in place (1375) and nothing restores
-    it, so the next node of the same level meets it reversed (`[:glob:/*.secret]` beside `[:glob:/**/public]` leaves
-    `/public` unmatched and matches `/cilbup`); (4) `parse_rule_path` returns the root for any path whose first segment
-    is empty (`authz_parse.c` 505-512), so `[//secret]` is the root's rule, though the next lines say "A path with two
-    consecutive slashes is not canonical". Two more outcomes depend on hash order: group expansion
+    too) decides the root although `authz.h` 210 says `*` "Matches any single non-empty path segment"; (2) a suffix
+    match reverses the segment in place (1375) and nothing restores it, so the next node of the same level meets it
+    reversed (`[:glob:/*.secret]` beside `[:glob:/**/public]` leaves `/public` unmatched and matches `/cilbup`);
+    (3) `parse_rule_path` returns the root for any path whose first segment is empty (`authz_parse.c` 505-512), so
+    `[//secret]` is the root's rule, though the next lines say "A path with two consecutive slashes is not
+    canonical". Two more outcomes depend on hash order: group expansion
     (`expand_group_callback`, 1062-1127) detects a cycle only through the group it expands first and otherwise
     recurses until its stack runs out, and several refusals in one file are reported in hash order.
 
