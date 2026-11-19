@@ -3898,8 +3898,11 @@
 >   runs on the target and whose answer a stopped shard loses after it: a direct map's send to its client, closed by
 >   A-505 (2026-11-19, g225: the client's shard records each map it sent until its reply arrives, a second ask is
 >   answered from the record, and a hand-off whose answers were all lost keeps its copy as handed;
->   `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`); open: the Shards route's take
->   of an offer, and recovery's `rebuild_remote_works` (its docs accept a non-answering shard's works left unbuilt).
+>   `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`); the Shards route's take of
+>   an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for its exchange and answers copies of its
+>   ends, kept on the owner shard until the exchange settles the claim, retired once handed or claimable again;
+>   `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice`); open: recovery's
+>   `rebuild_remote_works` (its docs accept a non-answering shard's works left unbuilt).
 >   **Class C, the rendezvous's
 >   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
