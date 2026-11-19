@@ -43859,5 +43859,8 @@ Applied in the same change to:
   in its order with each status and field; the gate.
 - **Owed.** The daemon starting an edge (its listen address, the operator's certificate and key, an authenticator over
   §4.13's principals and keys, a repositories' lookup that reaches each repository's partition); the services behind
-  `GitServices` (A-615's upload-pack, A-620 part 2's commit); Mercurial's (§4.17.3) and Subversion's (§4.17.4) sites;
-  the MCP edge onto this engine; the live `git clone` over HTTPS (main's run, once upload-pack serves).
+  `GitServices` (A-615's and A-640's upload-pack, A-620 part 2's commit); serving across shards at A-645's scale (one
+  shard's seats bound this edge: a connection moves to its repository's owner shard once its head names the repository,
+  as the NFS export moves a mount's connection, or each shard listens); the authenticator handing a bearer credential's
+  expiry with its principal, which LFS's actions carry (A-629 part 2); Mercurial's (§4.17.3) and Subversion's (§4.17.4)
+  sites; the MCP edge onto this engine; the live `git clone` over HTTPS (main's run, once upload-pack serves).

@@ -272,9 +272,11 @@
 > (`vcs_policy::reaches`), `503` while a service has not landed (both today). `slates-git` gives its reply fields as
 > data. `cargo test -p slates-server --lib vcs_` 46 of 46 and `-p slates-git --lib http` 18 of 18 on the Mac Studio, red
 > first on stubs (20 and 2 failing). Owed: the daemon starting an edge (address, identity, an authenticator over
-> §4.13's keys, the repositories' lookup on their partitions); upload-pack (A-615) and receive-pack's commit (A-620
-> part 2) behind `GitServices`; Mercurial's and Subversion's sites; the MCP edge onto this engine; the live `git clone`
-> over HTTPS (main's, once upload-pack serves).
+> §4.13's keys, the repositories' lookup on their partitions); upload-pack (A-615, A-640) and receive-pack's commit
+> (A-620 part 2) behind `GitServices`; serving across shards at A-645's scale (a connection moved to its repository's
+> owner shard once its head names it, or a listener on each shard); a bearer credential's expiry handed with its
+> principal for LFS's actions (A-629 part 2); Mercurial's and Subversion's sites; the MCP edge onto this engine; the
+> live `git clone` over HTTPS (main's, once upload-pack serves).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
