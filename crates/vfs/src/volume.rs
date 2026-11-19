@@ -7975,7 +7975,11 @@ mod clone_count_tests {
     let mut store = store();
     let (mut origin, cut, held) = origin_that_changed_since_its_cut(&mut store);
     let mut clone = Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)).unwrap();
-    counted_as_its_tree(&clone, &store, "the clone of a snapshot its origin changed since");
+    counted_as_its_tree(
+      &clone,
+      &store,
+      "the clone of a snapshot its origin changed since",
+    );
     let root = clone.root_inode(&store).unwrap();
     clone
       .create_file_no(&mut store, root, "clone-made", FILE_MODE)
