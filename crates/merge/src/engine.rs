@@ -2150,6 +2150,16 @@ impl Green {
       .into_iter()
       .filter(|(link, target)| named_link(link, target))
       .collect();
+    // Each copy the journal declares, in its order, brings its source's tree at the copy's version to its destination,
+    // in place of what the destination's tree held there (A-626 part 4, `copy_restate`).
+    for op in journal {
+      if let crate::increment::VolumeOp::Copy {
+        from, to, version, ..
+      } = op
+      {
+        self.copied_base((from, to, *version), &mut base);
+      }
+    }
     base
   }
 
@@ -4705,17 +4715,6 @@ impl Green {
     }
     let to = self.head();
     let resolved = Green::resolve(inc);
-    // A journal has no copy to restate one as (A-586; owed with the deriver's copy): each copy is named, typed, and the
-    // green is not judged.
-    if !resolved.copies.is_empty() {
-      return Rebased::Conflict {
-        windows: resolved
-          .copies
-          .keys()
-          .map(|dst| Green::window(dst, MergeConflictClass::TypeChanged))
-          .collect(),
-      };
-    }
     // The verdict shares `submit`'s decision but must not perturb the green; the only field `decide`
     // writes is the fast-path counter (through `merge_content`), which a rebase restores.
     let fast_path_before = self.fast_path_hits;
@@ -4743,6 +4742,9 @@ impl Green {
     // The head's links the effects remove themselves (a link's rename over one): a link made at such a name follows
     // that removal and needs none of its own.
     let removed_links = removed_links(&effects);
+    // The copies restated so far, each destination with its source's version: a file set beneath one from its source
+    // is the work's edit there, restated over what the copy brings (A-626 part 4, `copy_restate`).
+    let mut copies: Vec<(String, u64)> = Vec::new();
     for effect in in_replay_order(effects) {
       match effect {
         Effect::Special(path, node) => {
@@ -4755,21 +4757,14 @@ impl Green {
         Effect::RemoveSpecial(path) => journal.push(VolumeOp::Unlink { path }),
         // A rename is restated as the rename it is, in head coordinates, as the composer states one (one `Rename`,
         // replacing whatever the head holds there): its whole-file insert stands for bytes supplied by the move, and
-        // replayed over a head that holds the destination it would add them to that file's own.
-        Effect::SetContent(path, bytes, _, ContentSource::Copied(from, edits)) => {
-          journal.push(VolumeOp::Rename {
-            from: from.clone(),
-            to: path.clone(),
-          });
-          // The edits the work made after the rename follow it, over the bytes it moved (A-547).
-          let moved_len = self
-            .content
-            .get(&from)
-            .map_or(0, |moved| moved.len() as u64);
-          journal.extend(content_volume_ops(&path, &edits, moved_len));
-          moved_from.insert(from);
-          changed.insert(path, Some(bytes));
-        }
+        // replayed over a head that holds the destination it would add them to that file's own. A file beneath a copy
+        // names its source in the copied tree too, and is the work's edit there (`Green::restate_sourced`).
+        Effect::SetContent(path, bytes, _, ContentSource::Copied(from, edits)) => self
+          .restate_sourced(
+            (path, bytes, from, edits),
+            (&copies, &mut moved_from),
+            (&mut journal, &mut changed),
+          ),
         Effect::SetContent(path, bytes, ops, _) => {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
@@ -4803,8 +4798,23 @@ impl Green {
           journal.push(VolumeOp::SetXattr { path, name, value });
         }
         Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
-        // `Green::rebase` answers a work holding a copy before it restates anything (A-586).
-        Effect::CopyTree { .. } => {}
+        // A copy as the deriver's copy (A-626 part 4): the verdict's copies come first, so what the work does beneath
+        // one is restated after it, against what it brings.
+        Effect::CopyTree {
+          dst,
+          from,
+          version,
+          replace,
+          ..
+        } => {
+          copies.push((dst.clone(), version));
+          journal.push(VolumeOp::Copy {
+            from,
+            to: dst,
+            version,
+            replace,
+          });
+        }
       }
     }
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
@@ -4852,8 +4862,13 @@ fn in_replay_order(effects: Vec<Effect>) -> Vec<Effect> {
 /// such place keeps its own; both bounds cross only in a document the deriver never composes (a link's own rename over
 /// a held name, whose node another rename moves first), where the link keeps the verdict's order as before.
 fn link_places(effects: &[Effect]) -> BTreeMap<usize, usize> {
+  // A file set beneath a copy names its source in the copied tree, and moves no node (A-626 part 4).
+  let roots = copy_restate::copy_roots(effects);
   let mut unhomed: BTreeMap<&str, usize> = BTreeMap::new();
   for (index, effect) in effects.iter().enumerate() {
+    if copy_restate::copied_edit(effect, &roots) {
+      continue;
+    }
     for home in effect.unhomes().into_iter().flatten() {
       unhomed.entry(home).or_insert(index);
     }
@@ -5018,6 +5033,8 @@ pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 mod copy;
 
 mod copy_checkpoint;
+
+mod copy_restate;
 
 #[cfg(test)]
 mod copy_tests;
