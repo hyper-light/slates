@@ -16,7 +16,7 @@ use crate::wire::{WireRefusal, put_string};
 /// The algorithm name of an Ed25519 host key and of its signatures (RFC 8709 §4, §6).
 pub const ED25519: &str = "ssh-ed25519";
 
-/// The bytes of an Ed25519 seed, the private key RFC 8032 §5.1.5 names.
+/// Format: the bytes of an Ed25519 seed, the private key RFC 8032 §5.1.5 names.
 pub const ED25519_SEED_LEN: usize = 32;
 
 /// A host key AWS-LC refused to build.
