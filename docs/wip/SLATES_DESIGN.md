@@ -35684,7 +35684,10 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   at a tenth of it. Now it spins for the client's wake estimate (the daemon drains its ring in microseconds), then
   parks, each pause twice the last from the wake estimate and never past the next look, the looks on A-443's doubling.
   A wait of `t` wakes about `log2(t / wake)` times; a slot that frees wakes nothing, so it is found at the next try,
-  within the time already waited (owed in GAPS: the daemon waking a client that waits for room).
+  within the time already waited (owed in GAPS: the daemon waking a client that waits for room). Checks (Mac Studio,
+  debug, 2026-11-18, load 16 to 19): `slates-client --lib` green with
+  `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`; red with the old spin through a
+  reply deadline put back: "spun at 3000 ns, past the wake estimate".
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
