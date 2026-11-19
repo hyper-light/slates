@@ -12227,7 +12227,11 @@ is one more version, and the chain itself is never rewritten.
 > any tier computes, keeps and serves it with no coordination; computed eagerly as each version is recorded or lazily
 > when first read, by the type's own declaration, a unit a step under the shard's slices. Its first type is a version's
 > map of paths to contents (`derived/paths.rs`). A-614's D(k) and reached sets are one since A-647 part 2
-> (`crates/git/src/store/reach.rs`). Owed: A-553's and A-588's stores as types, and the server's use (A-647's entries).
+> (`crates/git/src/store/reach.rs`). Ancestry is one since A-666 part 1 (`derived/ancestry.rs`): each version's value
+> holds Mononoke's commit-graph fields (its generation, first-parent and skip-tree skew jumps, its run bottom and its
+> skip-tree parent, a dominator), so is-ancestor, the merge bases and bisect's midpoint are answered from the values,
+> logarithmic along runs and linear only in the merges a question must open. Owed: A-553's and A-588's stores as types,
+> and the server's use (A-647's and A-666's entries).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -44206,7 +44210,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
   - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
     Native workflows keep few long-lived greens.
   - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
-    client.
+    client. (Built, A-666 part 1: is-ancestor, the merge bases as `git merge-base --all` answers them, and bisect's
+    midpoint, from a type of derived data under A-647 holding Mononoke's commit-graph fields; no exact answer is
+    constant-time on histories of merges (Pǎtraşcu 2011), so each costs a search logarithmic along runs and a step for
+    each merge it must open. Owed: path history and blame; the server's verbs over the type.)
   - **Fetches name immutable objects.** A native client asks only for what it wants, never states what it has, and each
     request is resumable and cacheable at every tier. The tiers are strict, so a failed tier never floods the one
     above it (with goal 91's federation).
@@ -46740,3 +46747,104 @@ Applied in the same change to:
   deriver composes the removal alone and the green hands the link the head's bytes; the oracle's first run found it,
   so its works now leave it out); the restatement makes a symbolic link over the head's with no removal of it
   (`SymlinkOverExisting` on the next submit), and directories after the files made in them.
+
+### A-666 part 1 — Ancestry as derived data: is-ancestor, the merge bases and bisect's midpoint answered from each version's value, logarithmic along runs and linear only in the merges a question opens; Mononoke's commit-graph fields as one A-647 type (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Queries by API", part 1; A-647; §4.17.1 "Reads")
+
+- **Why.** A-645: "Blame, history, merge bases and bisect are answered from derived data, with no repository on the
+  client." This part is the ancestry questions; path history and blame are later parts.
+- **The bound the literature allows** (`research/ancestry-queries.md` §3). No exact answer is constant-time: a
+  reachability oracle in space S needs Ω(lg n / lg(Sw/n)) time even on subgraphs of butterfly graphs, histories of
+  two-parent merges, and constant time needs n^(1+Ω(1)) space \[A: Pǎtraşcu 2011, Theorem 2\]. What is provable is
+  logarithmic along chains: Myers' skew-binary jumps find any ancestor on a chain of N in at most 3⌊lg(N + 1)⌋ - 2 steps,
+  tight, and add a cell in O(1) from its parent and its parent's jump alone \[A: Myers 1983, PUSH, FIND, Corollary 5\].
+  So each question's bound has a part logarithmic along runs and a part linear in the merges it must open.
+- **The value** (`crates/vcs/src/derived/ancestry.rs`, `Ancestry`, the type `slates-vcs ancestry 1`, no parameter):
+  Mononoke's commit-graph fields \[C: Mononoke `commit_graph_types/src/edges.rs`\] as one derived node. It names its
+  parents' values, its first-parent skew jump, its run bottom (for a version of one parent: the nearest merge or root on
+  its first-parent chain) and its skip-tree parent and skip-tree jump, then holds its count of parents, a skip byte, its
+  generation (git's topological level), its first-parent depth, its skip-tree depth and its name. Each field is a
+  function of its parents' values and what they name: a jump by Myers' rule reads the parent's jump's jump through the
+  parent's value (the caution A-647 part 1 left), and the skip-tree parent is the parents' skip-tree lowest common
+  ancestor \[C: Mononoke `core.rs` 79-86\], which by induction is the immediate dominator. So the value is the same on
+  every tier, its identity a hash over its whole history; a version of one parent reads at most three values to derive,
+  a merge of k parents O(k lg n).
+- **The questions** (each over the values in the store alone, each value read once a question into an arena named by
+  handles, everything kept charged to the store and refused past its budget; L = 3⌊lg(n + 1)⌋, P the parents of the
+  merges a question opens):
+  - **Is-ancestor**: Mononoke's lowering \[C: `lib.rs` 519-531, `frontier.rs` 120-160\]. Each version on the frontier
+    jumps along the skip tree to its lowest skip-tree ancestor still at the ancestor's generation; one whose skip-tree
+    parent lies below it, a merge, is opened once. Safe because the skip-tree parent dominates: every ancestor is the
+    dominator's ancestor or of greater generation. At most 2 + (1 + P)(2L + 3) visits; O(lg n) on a linear history, and
+    on a history of pull requests P counts only the branches open across the target.
+  - **Merge bases**: git's paint-down, its sides, its stale paint and both of its exits (only stale entries left; one
+    side exhausted with no pending candidate) \[C: git `paint-down-to-common.adoc`\], over runs instead of commits. The
+    entries are grouped by run bottom and each run's are joined into one virtual tree over the first-parent tree:
+    sorted in a depth-first order a meet decides (Myers' lowest common ancestor returns the two children under the
+    meeting point), then the standard stack construction, so two chains meet without a walk. A merge's paint jumps
+    along the skip tree to its lowest skip-tree ancestor at or above every pending entry's generation: the region it
+    skips is above every version any pending entry reaches, so no paint can meet there unseen (a bound on the entries
+    below the merge alone let a higher entry's paint meet in the region, found by the first green run, below). The
+    answer is git's `--all` set, every common
+    ancestor that is no ancestor of another, the greatest generation first then by name, its first git's single
+    answer; Mononoke's `common_base` answers only the highest generation's. At most
+    4 + T(2L + 4) + 3L·E(⌈lg E⌉ + 1) + 2P visits for E entries in T runs.
+  - **Bisect's midpoint**: the same paint, bad and good; every run of candidates a segment whose weight grows by one a
+    version, a merge's weight its parents' segments' union (bitsets over the K segments), and the exact best by git's
+    rule, `min(weight, candidates - weight)` \[C: `bisect.c` 187-207\], then the greater generation, then the lesser
+    name. git stops within a thousandth of the half and breaks ties by its listing; this answer is exact and the same
+    on every tier. The paint's visits with a seed for the bad version and each good one (2(1 + G) for G good ones,
+    where merge bases' two seeds give the 4), P and L a segment more; K² bits.
+- **Rejected** (`research/ancestry-queries.md` §4): generation numbers alone (pruning, no bound); GRAIL, FERRARI and
+  2-hop labels (each label a function of the whole graph, a traversal's ranks, an interval assignment under a size
+  budget or a greedy cover, so two tiers would hold different values for one version, which A-647 refuses as
+  `Diverged`); segmented changelog's ids for the generic type (a position in the order commits were added); a
+  persistent set of ancestors per version (O(n lg n) space, a merge of a long-lived branch paying for the whole fork).
+- **Typed refusals** (`AncestryRefused`): `NoVersion`, `Parents`, `Malformed` (bytes, or a depth, a generation or a
+  run that does not follow the value naming it), `Exhausted`, `Lost` (a handle the question did not make), `Content`.
+- **Tests** (`crates/vcs/src/derived/ancestry/tests.rs`; `cargo test --locked -p slates-vcs --lib`, Windows x86_64,
+  jupiter, 2026-11-19, a fresh clone of the pushed branch and a target directory of its own each run; the Mac Studio was
+  offline that day, so the macOS run is owed).
+  - Red first. The first build (53ea3710a) stopped at 17 borrow errors in the tests: a store lent mutably to a question
+    while the same call read a fixture's roots. With that fixed and the type's derivation and its three questions
+    refusing at once (ecb0c2d54, a branch not for main, 10:50 UTC), 7 of the 8 new tests failed and the reader's
+    hostile-bytes test passed: 47 passed, main's 46 and that one.
+  - The first green (33f58f903, 10:53 UTC) found two faults. Merge bases answered the root where a higher common
+    ancestor was the answer (the oracle's versions 436 and 520: 0, not 299; the merge-heavy test: 0, not 807): a merge's
+    skip-tree jump was bounded only by the pending entries below the merge, and a higher entry's paint met in the region
+    it skipped. And bisect's stated bound counted two seeds where bisect has one for the bad version and each good one
+    (6 visits against 4, no run joined). Both fixed at 1f4562a0d.
+  - Green at 1f4562a0d (11:03 UTC): 54 of 54, the new tests' run 33.56 s.
+  - The oracle (`t_a666_every_answer_equals_a_naive_walk_within_its_bound`, 32 cases): generated histories of up to
+    2,000 versions (runs of up to 800 versions and short ones, merges of two and three, branches opened anywhere,
+    criss-cross merges, unrelated roots, merges of old versions), every version derived eagerly and again lazily in
+    another order, and every question asked of generated pairs and of neighbouring branch tips. Every value's fields
+    equal their definitions (Myers' J by its digits, the immediate dominator by the intersection of the parents'
+    dominator sets, the run bottom, the depths); the lazy values are the eager ones, identity for identity; every answer
+    is the naive walk's (ancestor bitsets; the merge bases as the common ancestors that are no common ancestor's proper
+    ancestor; bisect's weights counted); every question is within its bound, the parents it takes in within the merges
+    in its reach; and the store is empty after. Its census: 40,631 versions, 209 merges, 8 octopus merges, 62 roots;
+    is-ancestor 417 times true and 681 false; one merge base 483 times, several 18 (criss-cross), none 48; 549 bisects,
+    182 with no candidates and 219 over two segments or more; 218 skip-tree jumps; 56 lowerings that took in fewer
+    parents than the merges the model put above the target; 1,000 questions a walk by generation would have cost four
+    times over; at most 452 visits for any question.
+  - Beside it: a linear history of 2^17 versions with a branch of 5,000, answered in fewer than 1,000 visits a question
+    where a walk visits over 60,000 (is-ancestor both ways, merge bases 50,000 and 60,000, bisect version 65,536 of
+    131,071 candidates, weighing 65,536); a history of 1,000 pull requests whose lowering opens at most eight merges for
+    a commit inside open branches, and whose merge base with a branch off that commit is found with skip-tree jumps;
+    Myers' bound exactly (every search of a 512-version chain lands, within 3⌊lg(D + 1)⌋ - 2, met from D = 2^k - k, and
+    a search to the root within ⌊lg(D + 1)⌋ + 1); the format's bytes written by hand and named by BLAKE3's key
+    derivation over them; hostile bytes refused by the reader seven ways; forged values refused, typed, by every
+    question that reads what they contradict, the charge given back; `Parents`, `NoVersion` and the store's
+    `OverBudget`, the store as it was.
+  - A mutation (2b20fc969, a branch not for main, 11:27 UTC): every skew-jump search stepping parent by parent, a walk.
+    3 failed and 51 passed: Myers' test (from depth 4, the search to the root past its bound), the long history
+    (is-ancestor 195,114 visits against its bound of 107), and the oracle (is-ancestor 338 visits for versions 62 and
+    285, no merge above them, past its bound). A regression to walking fails the bounds.
+  - Main's: the macOS run on the Mac Studio, clippy, `xtask check` and the doc gate (the run-request queue).
+- **Owed.** Path history and blame (A-645's later parts); the server's verbs over the type, each repository's values on
+  its owner shard (A-662) and a `Graph` over each tool's commits (git's store, Mercurial's index) so stock clients' ids
+  are the versions; corrected commit dates where a history has dates; a green's versions numbered as segmented changelog
+  numbers them; questions cut into the shard's slices.
+- **Applied in the same change to:** `crates/vcs/src/derived/ancestry.rs` and `derived/ancestry/tests.rs` (new),
+  `crates/vcs/src/derived.rs` (the module and its docs); `docs/wip/research/ancestry-queries.md` (new); A-645's entry
+  ("Queries by API"); §4.17.1 "Reads"' status; GAPS' A-645 line.

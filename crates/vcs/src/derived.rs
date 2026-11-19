@@ -4,7 +4,8 @@
 //! fragments, Mercurial's manifests, Subversion's node revisions, a version's map of paths to contents, blame, merge
 //! bases. A-645 asks for one mechanism for all of them, as Scion keeps (A-645's source, Anthropic's "Redesigning source
 //! control") and as Sapling's server keeps under `eden/mononoke/derived_data` \[C\]: `research/edenfs-scale-distribution.md`
-//! §2.1. This module is that mechanism; [`paths`] is its first type.
+//! §2.1. This module is that mechanism; [`paths`] is its first type, and [`ancestry`] (A-666) the type that answers
+//! is-ancestor, merge bases and bisect's midpoint.
 //!
 //! **A type** ([`DerivedType`]) is a pure function of a version's change and its parents' values of the same type: its
 //! [`DerivedType::derive`] reads the change from the history ([`Graph`]) and the parents' values from the store, and
@@ -55,6 +56,7 @@ use std::mem::size_of;
 use crate::content::{ContentId, ContentRefused, ContentStore};
 use crate::index::{Index, IndexRefused, Inserted, NewRow};
 
+pub mod ancestry;
 pub mod paths;
 
 #[cfg(test)]
