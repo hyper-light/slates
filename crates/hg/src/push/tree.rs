@@ -19,7 +19,9 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use slates_merge::Green;
-use slates_merge::push::{self, Built, EntryKind, ObjectKey, Push, PushObjects, PushRefused, TreeEntry, Unavailable};
+use slates_merge::push::{
+  self, Built, EntryKind, ObjectKey, Push, PushObjects, PushRefused, TreeEntry, Unavailable,
+};
 
 use super::verify::{Held, Verified, manifest_text};
 use crate::manifest::{self, Flag};
@@ -149,11 +151,17 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
   }
 
   /// Lays out the manifest `node`'s files as directories: the root directory's name.
-  pub fn lay_out(&mut self, node: &Node, admission: &mut Admission) -> Result<ObjectKey, LayoutRefusal> {
+  pub fn lay_out(
+    &mut self,
+    node: &Node,
+    admission: &mut Admission,
+  ) -> Result<ObjectKey, LayoutRefusal> {
     let verified = self.verified;
     let held = self.held;
-    let text = manifest_text(verified, held, node).ok_or(LayoutRefusal::MissingManifest { node: *node })?;
-    let entries = manifest::decode(&text).map_err(|fault| LayoutRefusal::Manifest { node: *node, fault })?;
+    let text =
+      manifest_text(verified, held, node).ok_or(LayoutRefusal::MissingManifest { node: *node })?;
+    let entries =
+      manifest::decode(&text).map_err(|fault| LayoutRefusal::Manifest { node: *node, fault })?;
     let mut stack = vec![Open {
       path: Vec::new(),
       entries: Vec::new(),
@@ -179,7 +187,10 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
           id,
         });
       }
-      self.paths.entry(entry.node).or_insert_with(|| entry.path.to_vec());
+      self
+        .paths
+        .entry(entry.node)
+        .or_insert_with(|| entry.path.to_vec());
     }
     while stack.len() > 1 {
       self.close(&mut stack, admission)?;
@@ -189,7 +200,11 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
   }
 
   /// Closes the innermost open directory: kept under its name, and entered in its parent.
-  fn close(&mut self, stack: &mut Vec<Open>, admission: &mut Admission) -> Result<(), LayoutRefusal> {
+  fn close(
+    &mut self,
+    stack: &mut Vec<Open>,
+    admission: &mut Admission,
+  ) -> Result<(), LayoutRefusal> {
     let Some(open) = stack.pop() else {
       return Ok(());
     };
@@ -211,7 +226,11 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
   }
 
   /// Keeps a directory's entries under their name, charged first.
-  fn keep(&mut self, entries: Vec<TreeEntry>, admission: &mut Admission) -> Result<ObjectKey, LayoutRefusal> {
+  fn keep(
+    &mut self,
+    entries: Vec<TreeEntry>,
+    admission: &mut Admission,
+  ) -> Result<ObjectKey, LayoutRefusal> {
     admission.charge_items::<(ObjectKey, Vec<TreeEntry>)>(1)?;
     let id = directory_id(&entries).ok_or(LayoutRefusal::Unnamed)?;
     self.dirs.entry(id).or_insert(entries);
@@ -259,14 +278,19 @@ impl<H: Held + ?Sized> PushObjects for Trees<'_, H> {
 
 /// Whether the directory `open` holds the directory `dir`: it is `dir`, or the root, or one of `dir`'s ancestors.
 fn holds(open: &[u8], dir: &[u8]) -> bool {
-  open.is_empty()
-    || open == dir
-    || (dir.starts_with(open) && dir.get(open.len()) == Some(&SLASH))
+  open.is_empty() || open == dir || (dir.starts_with(open) && dir.get(open.len()) == Some(&SLASH))
 }
 
 /// Opens the directories between the innermost open one and `dir`, outermost first.
-fn open_down_to(stack: &mut Vec<Open>, dir: &[u8], admission: &mut Admission) -> Result<(), PastAdmission> {
-  let top = stack.last().map(|open| open.path.clone()).unwrap_or_default();
+fn open_down_to(
+  stack: &mut Vec<Open>,
+  dir: &[u8],
+  admission: &mut Admission,
+) -> Result<(), PastAdmission> {
+  let top = stack
+    .last()
+    .map(|open| open.path.clone())
+    .unwrap_or_default();
   if top.as_slice() == dir {
     return Ok(());
   }

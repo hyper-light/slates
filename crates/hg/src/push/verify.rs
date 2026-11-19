@@ -340,7 +340,11 @@ impl<'g, H: Held + ?Sized> Group<'g, H> {
   }
 
   /// The revision's text: its delta applied to its base's text.
-  fn rebuild(&self, revision: &Revision<'_>, admission: &mut Admission) -> Result<Vec<u8>, Unverified> {
+  fn rebuild(
+    &self,
+    revision: &Revision<'_>,
+    admission: &mut Admission,
+  ) -> Result<Vec<u8>, Unverified> {
     let base = self
       .text(&revision.base)
       .ok_or_else(|| Unverified::UnknownDeltaBase {
@@ -381,7 +385,8 @@ pub fn verify(
   held: &(impl Held + ?Sized),
   admission: &mut Admission,
 ) -> Result<Verified, Unverified> {
-  let group = Changegroup::decode(&part.payload, part.version, admission).map_err(Unverified::Changegroup)?;
+  let group =
+    Changegroup::decode(&part.payload, part.version, admission).map_err(Unverified::Changegroup)?;
   if !group.trees.is_empty() {
     return Err(Unverified::TreeManifests);
   }
@@ -406,12 +411,12 @@ fn changelog(
     log.take(revision, &mut verified.passed_over, admission)?;
   }
   for arrived in &log.arrived {
-    changeset::decode(&arrived.text).and_then(|read| read.manifest_node()).map_err(|fault| {
-      Unverified::Changeset {
+    changeset::decode(&arrived.text)
+      .and_then(|read| read.manifest_node())
+      .map_err(|fault| Unverified::Changeset {
         node: arrived.node,
         fault,
-      }
-    })?;
+      })?;
   }
   verified.changesets = log.arrived;
   verified.changeset_at = log.by_node.clone();
@@ -465,10 +470,17 @@ fn file_logs(
         fault,
       })?;
     }
+    // A file log whose every revision the repository held brought nothing: kept only where something arrived.
+    if log.arrived.is_empty() {
+      continue;
+    }
     let index = verified.files.len();
-    admission.charge(to_u64(path.len()).saturating_mul(to_u64(log.arrived.len()).saturating_add(1)))?;
+    admission
+      .charge(to_u64(path.len()).saturating_mul(to_u64(log.arrived.len()).saturating_add(1)))?;
     for (node, at) in &log.by_node {
-      verified.file_at.insert((path.to_vec(), *node), (index, *at));
+      verified
+        .file_at
+        .insert((path.to_vec(), *node), (index, *at));
     }
     verified.files.push((path.to_vec(), log.arrived));
   }
@@ -563,9 +575,7 @@ pub fn audit(path: &[u8]) -> Result<(), Unverified> {
   }
   let mut components = path.split(|byte| *byte == SLASH);
   let first = components.next().unwrap_or_default();
-  let dot_hg = DOT_HG
-    .iter()
-    .any(|name| first.eq_ignore_ascii_case(name));
+  let dot_hg = DOT_HG.iter().any(|name| first.eq_ignore_ascii_case(name));
   let drive = first.len() == DRIVE_LEN
     && first.first().is_some_and(u8::is_ascii_alphabetic)
     && first.last() == Some(&DRIVE);

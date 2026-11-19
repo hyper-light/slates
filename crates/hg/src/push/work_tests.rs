@@ -42,11 +42,17 @@ struct Kept {
 
 impl Held for Kept {
   fn changeset_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
-    self.changesets.get(node).map(|text| Cow::Borrowed(text.as_slice()))
+    self
+      .changesets
+      .get(node)
+      .map(|text| Cow::Borrowed(text.as_slice()))
   }
 
   fn manifest_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
-    self.manifests.get(node).map(|text| Cow::Borrowed(text.as_slice()))
+    self
+      .manifests
+      .get(node)
+      .map(|text| Cow::Borrowed(text.as_slice()))
   }
 
   fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>> {
@@ -60,15 +66,25 @@ impl Held for Kept {
 impl Kept {
   /// Keeps what `verified` brought whose changeset `keeps` names: the repository after that much of the push landed.
   fn keep(&mut self, verified: &Verified, keeps: impl Fn(&Node) -> bool) {
-    for arrived in verified.changesets.iter().filter(|arrived| keeps(&arrived.node)) {
+    for arrived in verified
+      .changesets
+      .iter()
+      .filter(|arrived| keeps(&arrived.node))
+    {
       self.changesets.insert(arrived.node, arrived.text.clone());
     }
-    for arrived in verified.manifests.iter().filter(|arrived| keeps(&arrived.link)) {
+    for arrived in verified
+      .manifests
+      .iter()
+      .filter(|arrived| keeps(&arrived.link))
+    {
       self.manifests.insert(arrived.node, arrived.text.clone());
     }
     for (path, arrived) in &verified.files {
       for arrived in arrived.iter().filter(|arrived| keeps(&arrived.link)) {
-        self.files.insert((path.clone(), arrived.node), arrived.text.clone());
+        self
+          .files
+          .insert((path.clone(), arrived.node), arrived.text.clone());
       }
     }
   }
@@ -162,7 +178,10 @@ fn holds_checkout(green: &Green, rev: u32) {
     .map(|(path, bytes)| (path, bytes.to_vec()))
     .collect();
   assert_eq!(files, checked_out(rev), "revision {rev}");
-  assert_eq!(green.xattr(ROOT, HEAD_ATTRIBUTE), Some(log_node(rev).as_slice()));
+  assert_eq!(
+    green.xattr(ROOT, HEAD_ATTRIBUTE),
+    Some(log_node(rev).as_slice())
+  );
 }
 
 /// A-641 part 2, AC-HG.2 and AC-HG.3 (golden). Do: verify the whole repository stock 7.2 bundled, in changegroup
@@ -173,10 +192,19 @@ fn holds_checkout(green: &Green, rev: u32) {
 fn each_line_of_a_stock_bundle_lands_holding_exactly_what_hg_checks_out() {
   for version in [Version::V01, Version::V02, Version::V03] {
     let verified = verify::verify(&stock_part(version), &Kept::default(), &mut room()).unwrap();
-    assert_eq!((verified.changesets.len(), verified.passed_over), (7, 0), "{version:?}");
+    assert_eq!(
+      (verified.changesets.len(), verified.passed_over),
+      (7, 0),
+      "{version:?}"
+    );
     for rev in [7, 2] {
       let mut green = Green::new();
-      land(&mut green, None, &log_node(rev), (&verified, &Kept::default()));
+      land(
+        &mut green,
+        None,
+        &log_node(rev),
+        (&verified, &Kept::default()),
+      );
       holds_checkout(&green, rev);
     }
   }
@@ -213,8 +241,19 @@ fn a_push_repeated_after_its_answer_was_lost_brings_nothing_new() {
   let again = verify::verify(&stock_part(Version::V03), &kept, &mut room()).unwrap();
   let total = first.changesets.len()
     + first.manifests.len()
-    + first.files.iter().map(|(_, arrived)| arrived.len()).sum::<usize>();
-  assert_eq!((again.changesets.len(), again.manifests.len(), again.files.len()), (0, 0, 0));
+    + first
+      .files
+      .iter()
+      .map(|(_, arrived)| arrived.len())
+      .sum::<usize>();
+  assert_eq!(
+    (
+      again.changesets.len(),
+      again.manifests.len(),
+      again.files.len()
+    ),
+    (0, 0, 0)
+  );
   assert_eq!(again.passed_over, u64::try_from(total).unwrap());
 }
 
@@ -233,7 +272,12 @@ fn a_push_partly_held_verifies_the_rest_against_the_repository() {
   let mut green = Green::new();
   land(&mut green, None, &log_node(3), (&all, &Kept::default()));
   let version = green.head();
-  land(&mut green, Some((version, &log_node(3))), &log_node(7), (&rest, &kept));
+  land(
+    &mut green,
+    Some((version, &log_node(3))),
+    &log_node(7),
+    (&rest, &kept),
+  );
   holds_checkout(&green, 7);
 }
 
@@ -309,13 +353,27 @@ impl Made3 {
     let mut made3 = Made3::default();
     let manifests: Vec<(&str, Node, &str)> = files
       .iter()
-      .map(|(path, bytes, flag)| (*path, made(bytes, NULL_NODE, NULL_NODE, NULL_NODE).node, *flag))
+      .map(|(path, bytes, flag)| {
+        (
+          *path,
+          made(bytes, NULL_NODE, NULL_NODE, NULL_NODE).node,
+          *flag,
+        )
+      })
       .collect();
     let manifest = made(&manifest_of(&manifests), NULL_NODE, NULL_NODE, NULL_NODE);
     let paths: Vec<&str> = files.iter().map(|(path, ..)| *path).collect();
-    let changeset = made(&changeset_of(&manifest.node, &paths, "made"), *parent, NULL_NODE, NULL_NODE);
+    let changeset = made(
+      &changeset_of(&manifest.node, &paths, "made"),
+      *parent,
+      NULL_NODE,
+      NULL_NODE,
+    );
     let link = changeset.node;
-    made3.changesets.push(Made { link, ..changeset.clone() });
+    made3.changesets.push(Made {
+      link,
+      ..changeset.clone()
+    });
     made3.manifests.push(Made { link, ..manifest });
     for (path, bytes, _) in files {
       let file = made(bytes, NULL_NODE, NULL_NODE, link);
@@ -336,8 +394,16 @@ impl Made3 {
     };
     let changelog = range(self.changesets.len());
     let manifests = range(self.manifests.len());
-    let tree_ranges: Vec<_> = self.trees.iter().map(|(name, made)| (name, range(made.len()))).collect();
-    let file_ranges: Vec<_> = self.files.iter().map(|(name, made)| (name, range(made.len()))).collect();
+    let tree_ranges: Vec<_> = self
+      .trees
+      .iter()
+      .map(|(name, made)| (name, range(made.len())))
+      .collect();
+    let file_ranges: Vec<_> = self
+      .files
+      .iter()
+      .map(|(name, made)| (name, range(made.len())))
+      .collect();
     for (made, data) in self.all().zip(&data) {
       revisions.push(Revision {
         node: made.node,
@@ -356,7 +422,11 @@ impl Made3 {
       .into_iter()
       .map(|(name, revisions)| Group { name, revisions })
       .collect();
-    groups.extend(file_ranges.into_iter().map(|(name, revisions)| Group { name, revisions }));
+    groups.extend(
+      file_ranges
+        .into_iter()
+        .map(|(name, revisions)| Group { name, revisions }),
+    );
     let mut payload = Vec::new();
     Changegroup {
       version: Version::V03,
@@ -410,23 +480,45 @@ fn a_changegroup_breaking_a_rule_is_refused_by_kind() {
   assert!(verify_made(&good).is_ok());
   let mut bent = good.clone();
   bent.files[0].1[0].node[19] ^= 1;
-  assert!(matches!(verify_made(&bent), Err(Unverified::Node { log: LogOf::File(_), .. })));
+  assert!(matches!(
+    verify_made(&bent),
+    Err(Unverified::Node {
+      log: LogOf::File(_),
+      ..
+    })
+  ));
   let stranger = [9; 20];
   let mut orphan = good.clone();
   orphan.manifests[0].p1 = stranger;
-  assert!(matches!(verify_made(&orphan), Err(Unverified::UnknownParent { parent, .. }) if parent == stranger));
+  assert!(
+    matches!(verify_made(&orphan), Err(Unverified::UnknownParent { parent, .. }) if parent == stranger)
+  );
   let mut baseless = good.clone();
   baseless.files[0].1[0].base = stranger;
-  assert!(matches!(verify_made(&baseless), Err(Unverified::UnknownDeltaBase { base, .. }) if base == stranger));
+  assert!(
+    matches!(verify_made(&baseless), Err(Unverified::UnknownDeltaBase { base, .. }) if base == stranger)
+  );
   let mut flagged = good.clone();
   flagged.files[0].1[0].flags = 1 << 15;
-  assert!(matches!(verify_made(&flagged), Err(Unverified::Flags { flags: 32768, .. })));
+  assert!(matches!(
+    verify_made(&flagged),
+    Err(Unverified::Flags { flags: 32768, .. })
+  ));
   let mut unlinked = good.clone();
   unlinked.manifests[0].link = stranger;
-  assert!(matches!(verify_made(&unlinked), Err(Unverified::UnknownLink { log: LogOf::Manifests, .. })));
+  assert!(matches!(
+    verify_made(&unlinked),
+    Err(Unverified::UnknownLink {
+      log: LogOf::Manifests,
+      ..
+    })
+  ));
   let mut fileless = good.clone();
   fileless.files.clear();
-  assert!(matches!(verify_made(&fileless), Err(Unverified::MissingFile { .. })));
+  assert!(matches!(
+    verify_made(&fileless),
+    Err(Unverified::MissingFile { .. })
+  ));
   let mut manifestless = good.clone();
   manifestless.manifests.clear();
   assert_eq!(
@@ -458,9 +550,19 @@ fn a_path_mercurials_audit_refuses_is_refused() {
     b"\xff",
   ];
   for path in refused {
-    assert_eq!(verify::audit(path), Err(Unverified::Path { path: path.to_vec() }));
+    assert_eq!(
+      verify::audit(path),
+      Err(Unverified::Path {
+        path: path.to_vec()
+      })
+    );
   }
-  for path in [b".hgignore".as_slice(), b"a/.hg/b", b"src/deep/mod.rs", b"c"] {
+  for path in [
+    b".hgignore".as_slice(),
+    b"a/.hg/b",
+    b"src/deep/mod.rs",
+    b"c",
+  ] {
     assert_eq!(verify::audit(path), Ok(()));
   }
   let (mut hidden, _) = Made3::one(&NULL_NODE, &[("a", b"x\n", "")]);
@@ -489,14 +591,30 @@ fn a_flat_manifest_is_laid_out_so_unchanged_directories_are_never_read() {
   assert_eq!(green.symlink("link"), Some("bin/run"));
   let mut kept = Kept::default();
   kept.keep(&verified, |_| true);
-  let changed = [files[0], files[1], files[2], ("src/b", b"two\n".as_slice(), "")];
+  let changed = [
+    files[0],
+    files[1],
+    files[2],
+    ("src/b", b"two\n".as_slice(), ""),
+  ];
   let (second, next) = Made3::one(&top, &changed);
   let verified_next = verify::verify(&second.part(), &kept, &mut room()).unwrap();
   let version = green.head();
-  let built = land(&mut green, Some((version, &top)), &next, (&verified_next, &kept));
+  let built = land(
+    &mut green,
+    Some((version, &top)),
+    &next,
+    (&verified_next, &kept),
+  );
   assert_eq!((built.reads.trees, built.reads.skipped), (4, 2));
-  let files: BTreeMap<String, Vec<u8>> = green.files().map(|(path, bytes)| (path, bytes.to_vec())).collect();
-  assert_eq!(files.get("src/b").map(Vec::as_slice), Some(b"two\n".as_slice()));
+  let files: BTreeMap<String, Vec<u8>> = green
+    .files()
+    .map(|(path, bytes)| (path, bytes.to_vec()))
+    .collect();
+  assert_eq!(
+    files.get("src/b").map(Vec::as_slice),
+    Some(b"two\n".as_slice())
+  );
 }
 
 /// A-641 part 2. Do: make a work whose head changeset nobody holds. Expect: refused by kind, naming it.
@@ -509,10 +627,18 @@ fn a_work_whose_head_nobody_holds_is_refused() {
     base: None,
     head: &stranger,
   };
-  let refused = tree::work(&moved, &Green::new(), (&Verified::default(), &Kept::default()), WORK_ROOM, &mut room());
+  let refused = tree::work(
+    &moved,
+    &Green::new(),
+    (&Verified::default(), &Kept::default()),
+    WORK_ROOM,
+    &mut room(),
+  );
   assert_eq!(
     refused.map(|built| built.reads),
-    Err(WorkRefused::Layout(LayoutRefusal::MissingChangeset { node: stranger }))
+    Err(WorkRefused::Layout(LayoutRefusal::MissingChangeset {
+      node: stranger
+    }))
   );
 }
 
