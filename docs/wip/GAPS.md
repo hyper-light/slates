@@ -625,8 +625,8 @@
 > sessions waiting on them replayed whole; its second slice (g297), `get-file`, its text streamed a slice at a time in
 > the caller's room, red-checked six ways, the fixtures recorded again for every command still owed; its third slice
 > (g297), `list`, `svn_repos_list`'s walk streamed, red-checked eight ways; its fourth slice (g297),
-> `get-location-segments`, red-checked five ways. Owed from it: `log` with merged revisions, `get-file-revs`,
-> `get-deleted-rev`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> `get-location-segments`, red-checked five ways; its fifth slice (g297), `get-deleted-rev`, red-checked five ways.
+> Owed from it: `log` with merged revisions, `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
@@ -2379,22 +2379,21 @@
 > merge crate's integration suites and clippy.
 > Bug record: `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
 
-> **Three siblings of A-643's verdicts, open (2026-11-19, A-643's sweep, g267; §4.16 "The verdict"; POSIX
-> `rename`).**
-> 1. A rename over a symbolic link, a hard link or an IPC node is refused `TypeChanged` even with no concurrent change:
->    `merge_rename` reads `occupied_by_nonfile` before any base. POSIX `rename` replaces any non-directory destination,
->    and does nothing for two links to one file, so `mv file link`, `mv link link`, and a hard link renamed over
->    another link to its own file can never land. These are false conflicts, not broken states. Found by reading.
-> 2. A hard link names its target by path. The head's removal of a file that hard links name is accepted (only an IPC
->    node's removal reads the links naming it), and the links then name a path with nothing, or the file made there
->    next. POSIX keeps a removed file's bytes under its remaining names. A-643's oracle generates this and follows the
->    engine: its remake of `TARGET` is accepted while `HARDLINK` names it. A question of the model, for its owner.
-> 3. `merge_unlink`'s IPC-node branch scans every attribute change and every hard link for each unlink
->    (`xattr_changed.iter().any`, `hardlinks.values().any`): O(changes) per op on the verdict's path. `changed_after`
->    and `links_to` answer both by lookup. Found by reading.
->
-> Owed: a failing test of each, then the rule: for 1, the destination replaced as A-643 replaces a file, and two links
-> to one file a no-op; for 2, the model's decision; for 3, the lookups, with a counter test.
+> **Three siblings of A-643's verdicts: the first and third fixed by A-646 part 1, the second owed (2026-11-19, A-643's
+> sweep, g267; §4.16 "The verdict"; POSIX `rename`).**
+> 1. Fixed (A-646 part 1): a rename over a symbolic link, a hard link or an IPC node with no concurrent change replaces
+>    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
+>    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
+>    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
+> 2. Owed, A-646 part 2: a hard link names its target by path, so the head's removal of a file that hard links name is
+>    accepted and the links then name a path with nothing, or the file made there next. A-646 decides it from
+>    principle: a hard link names its target's node, as a POSIX inode does, never a path. A removed name leaves the node
+>    to its other names, its content kept while any name holds it, and a later file at the path is a different node.
+>    The engine and the ops document will say so, the document's version changed as A-621 changed it.
+> 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
+>    (`links_to`), two lookups where it scanned every attribute change and every hard link. A counter test shows 2
+>    entries examined where the scan examined 2,000 (r960).
+> Bug record (1, 3): `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found
 > by A-621's reading; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` and `take_applied` found a
