@@ -8619,6 +8619,12 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 > - **Greens (2026-11-07).** A green ships its catalog register too, and no merge record of it ships before the
 >   register's current version is committed. Its successor waits for the adopted register and rebuilds the green with
 >   its access list (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
+> - **A repository's state logs (2026-11-19, A-636 part 2a).** A repository's four state logs (its names, Mercurial's
+>   phase roots and markers, Git LFS's locks) are registers of the repository, as a volume's catalog is of the volume
+>   (`RegisterClass`, `ObjectId::in_class`): the counter's second bit marks one and its top and third bits name which,
+>   so the catalog's bit and every id with the second bit clear are as they were. They are placed and taken over as the
+>   repository is, so its state moves as one. Three class bits in place of one: a partition mints at most 2^45 − 1 ids
+>   (`MAX_OBJECT_COUNTER`).
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -11964,15 +11970,20 @@ decides the details.
 > in memory, secures retention, holds every work's verdict (`Green::judge`), judges the whole entry with its new greens
 > counted held (`Partition::check_creating`), and only then commits the verdicts (`Green::commit_judged`) and records
 > the new greens and the entry as one log record; a refusal names every change refused and why, or the entry's
-> refusal, and gives back what it held. The fleet half's protocol is built (A-636 part 1, `crates/db/src/ledger/logs.rs`,
-> the fenced ledger over a repository's logs): each log is a register of its own, placed by its own object id and
-> committing at `f + 1` of its own holders; a record is committed once every log it moves holds it on `f + 1` and every
-> record before it is committed, so the repository's committed state is the greatest cut at or below each log's
-> committed length that holds every record whole; holders apply that cut at their joins; a replica answers a read at a
-> vector of positions and refuses one past what it applied or one that splits a record; a takeover fences every log's
-> quorum or none, adopts each log, and keeps a record only where every log's read holds it whole, dropping it and what
-> follows it otherwise. Owed: the live plane (A-636 part 2: each log's register on the wire, the state logs' register
-> class, the server's takeover by this rule); and the repository policy's check before the verdict (A-622's next part).
+> refusal, and gives back what it held. The fleet half's protocol is built (A-636 part 1,
+> `crates/db/src/ledger/logs.rs`, the fenced ledger over a repository's logs): each log is a register of its own,
+> committing at `f + 1` of its own holders and placed by its register's id, a green's log by the green's and the state
+> logs by their repository's, whose register class they are (A-636 part 2a), so a repository's state moves as one; a
+> record is committed once every log it moves holds it on `f + 1` and every record before it is committed, so the
+> repository's committed state is the greatest cut at or below each log's committed length that holds every record
+> whole; holders apply that cut at their joins; a replica answers a read at a vector of positions and refuses one past
+> what it applied or one that splits a record; a takeover runs a log at a time, as a live round does (A-636 part 2a):
+> each log's holders answer on the wire with that log's promise alone, which only that log's round counts, and the
+> repository is adopted only once every log's round has read its quorum, a refusal leaving the logs read before it
+> fenced; it keeps a record only where every log's read holds it whole, dropping it and what follows it otherwise. Owed:
+> the live plane's rest (A-636 part 2b, the partition's records shipped to each log's holders; 2c, the server's takeover
+> by this rule, every log of a repository, its greens' included, following one successor); and the repository policy's
+> check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12482,8 +12493,10 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3). Built on the owner, its recovery included
    (A-603), rebuilt to A-642's logs with the push that judges several works before any commits (A-635); the fleet
    half's protocol built as the fenced ledger over a repository's logs (A-636 part 1: each log replicated on its own,
-   holders applying records at their joins, replicas refusing split cuts, takeovers fencing every log or none and
-   keeping each record whole); owed: its live plane (A-636 part 2).
+   holders applying records at their joins, replicas refusing split cuts, takeovers keeping each record whole), and its
+   live plane's first piece (A-636 part 2a: the state logs a register class of the repository, placed and taken over as
+   it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
+   every log or none); owed: the rest of the live plane (A-636 parts 2b and 2c).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -50379,6 +50392,102 @@ at start).
   (`admit_right` visible to the crate), `repository.rs` (`branch_version` visible to the crate),
   `crates/git/src/upload/mod.rs` (`AGENT` public); §4.17.2's status; GAPS (the A-654 entry, and A-644 part 2's owed
   line).
+
+### A-636 part 2a — The state logs' register class, and each log's promise on the wire a log at a time: a repository's state moves as one, and a takeover reads every log or adopts none (2026-11-19, g261, UI goal 93; §4.17.1 shared piece 2, the fleet half's live plane; §4.8 "Data model" and "Promotion and takeover"; AUD-29-17; after A-636 part 1 and A-642)
+
+- **Why.** A-636 part 1 built the fleet half's protocol over object ids its caller named, with holders read in memory
+  and a takeover that asked every log's round before fencing any. The live plane needs every log of a repository to be a
+  register the fleet places and takes over (a green's log is the green's own register; the four state logs had none),
+  each log's holders answering a takeover on the wire, and a takeover rule a live round can keep. This is the first of
+  part 2's three pieces (g306's split): (2a) this; (2b) the partition's records shipped to each log's holders a log at a
+  time; (2c) the server's takeover by this rule.
+- **The register class** (`crates/db/src/register.rs`: `RegisterClass`, `ObjectId::class`, `ObjectId::in_class`;
+  `crates/db/src/catalog.rs`: `LogName::register`). An object's registers are its own (a volume's head and chain, a
+  green's log of versions), its catalog (AUD-29-17) and, for a repository, its four state logs (its names, Mercurial's
+  phase roots and markers, Git LFS's locks). The class is in the counter's top byte (byte 10 of the id): the catalog
+  keeps the top bit alone, as AUD-29-17 laid it; a state log sets the second bit, and the top and third bits name which
+  (names 0x40, phases 0x60, markers 0xC0, locks 0xE0). `placement_key` clears the class: the top bit alone while the
+  second is clear, so every id with the second bit clear keeps its class, its placement and its catalog's round trip
+  exactly (`the_catalog_class_is_as_it_was_for_every_id_it_named_before`, over all 128 such values of the byte); all
+  three bits otherwise. A state log's register is its repository's id in the log's class: it is placed on the
+  repository's candidates and taken over by the repository's successor, as a volume's catalog is by its volume's.
+  - Why the repository's placement and not each state log's own: a takeover hands the repository's state to one writer
+    (§4.17.1: a repository lives on one owner shard), so all four must name one successor; and a record over several
+    state logs then needs one copyset's quorum, not several. The greens' logs keep their own ids, so pushes to different
+    greens still land on different copysets (A-642).
+  - The cost: three class bits in place of one, so a partition mints at most 2^45 − 1 ids (`MAX_OBJECT_COUNTER`, 2^47 −
+    1 before; about 35 trillion, eleven years of minting at a hundred thousand log entries a second on one partition).
+    Three bits is the least that holds six classes (own, catalog, four state logs). An id minted under the cap carries
+    no class bit, so each of its registers leads back to it; one minted past it does not (tested), which is why the
+    minter refuses past it (`slates_server::verbs::fresh_volume_id`, unchanged but for the cap it reads).
+- **Each log's promise on the wire** (`crates/db/src/ledger.rs`). A holder answers a takeover's phase one as a live
+  holder does: its fence raised to the round's epoch, then its whole log in a `LedgerPromise` naming its register, as
+  bytes (`Cohort::promise`; a refusal is the empty reply `slates_cluster::serve_ledger_promotion` gives). The successor
+  counts a reply toward one register's round only when it decodes, names the host it came from, binds the round's
+  prepare (register, epoch, generation) and comes from a candidate not counted before (`PhaseOne::hear`, answering
+  `Heard::{Counted, Malformed, Forged, Unbound, NotCandidate, Twice}`), and adopts at `f + 1` by `ledger::adopt`, the
+  cluster plane's rule. The state logs share holders, so a holder answers each state log's round with that log alone,
+  and the class is what keeps one log's promise from counting in another's round (tested: a phases promise offered to
+  the names round is `Unbound`). `Owner::take_over` runs through these, so the ledger's own tests and models run the
+  codec and the counting.
+- **A takeover a log at a time** (`crates/db/src/ledger/logs.rs`, `LogsOwner::take_over`). Part 1 asked every log's
+  round first and fenced none unless all could run. A live round cannot do that: a holder raises its fence as it
+  promises, and no message lowers it. So the takeover now runs each log's round in turn and adopts the repository only
+  once every log's round has read `f + 1`; a log whose round cannot run refuses it with nothing adopted, naming the logs
+  fenced before it (`LogsTakeoverRefused::fenced`), which stay fenced. That is safe: a fence only stops the superseded
+  owner on those logs (StaleNeverCommits, a log at a time), and a later takeover's epochs are above it. The model test
+  now meets such refusals and holds each to the rule (the logs it names fenced are exactly those before the log it
+  stopped at). `Cohort::can_take_over` is gone with the rule it served.
+  - A holder's join under such a refusal (found by the model test's first green run, a holder that applied part of a
+    record): a holder fenced on one log of a record refuses the superseded owner's offer there while it acknowledges
+    the record's other logs, so its join applies the owner's committed cut only as far as the logs it did not
+    acknowledge leave every record whole (`LogsCohort::apply`): a record that also moves a fenced log waits until the
+    holder acknowledges that log, under the next owner. No holder applies part of a record, and a replica's read is
+    never refused for its own applied cut
+    (`a_holder_fenced_on_one_log_of_a_record_applies_none_of_it_until_it_holds_the_rest`).
+- **Tests** (macOS arm64, Mac Studio, kiln, debug, `CARGO_BUILD_JOBS=2`).
+  - Red first, r27 at 5b362ef20 (`agents/g261-a636p2a-red`: the tests with the change stubbed, the encoding and cap
+    before it, a round that counts nothing, part 1's ask-first takeover), `cargo test --locked -p slates-db --lib --
+    register::class_tests ledger::`: 6 failed, 11 passed. Failed, each on its rule: the state logs placed apart from
+    their repository (12 registers); registers misnamed; every log off its register's home (the four state logs); the
+    state logs' holders apart in the wire test; the refused takeover naming no log fenced; and the model test, on the
+    two-step history `Partition { mask: 12521 }, TakeOver { host: 0 }` at `f = 1` ("fenced, wrongly"). Passed: part 1's
+    eleven unchanged tests but one replaced, and the catalog guard, as a guard does before and after.
+  - Red for the holder's join, r98 and r113 (2026-11-19, over main b5231f0ff: this change with `LogsCohort::apply` as
+    before its fix, taken from `agents/g261-a636p2a-red2`), `cargo test --locked -p slates-db --lib --
+    ledger::logs::tests::a_holder_fenced_on_one_log ledger::logs::tests::every_history_of_crashes`: 2 of 2 failed both
+    times. The unit test: `HostId(1)`, a holder of both logs, applied the record's names position and none of A's.
+    r98 caught it only at the test's second check, since a replica's read of a holder's applied cut judges a split
+    among the logs the cut names, and a log the holder never applied is not named; both checks, the model test's
+    included, now judge a holder's cut over every log it holds, a log it never applied at position 0 (`held_cut`), and
+    r113 failed at the first. The model test: "`HostId(5)` applied Split" of record 1 after a six-step history (r98),
+    and "`HostId(4)` applied Split" after four steps with the stronger check (r113: `Append { logs: 196 }`,
+    `Partition { mask: 9304 }`, `TakeOver { host: 0 }`, `Announce` at `f = 1`).
+  - Green, r98 at 5244e6762 and r113 at c8f10b413 (this change over main b5231f0ff; r113's tree differs from r98's by
+    the two checks alone; main's next three commits, 2410011da, touch no file of slates-db and use nothing it
+    changed): `cargo test --locked -p slates-db --lib -- register ledger catalog mirror` 116 of 116, 51 filtered out,
+    both times. The model test's census in r113, over 128 histories at `f` from 0 to 2, each run twice: 482 records of
+    one log committed and 429 of several, 293 waited, 14 interleaved, 175 refused `Moved`, 85 stale, 187 takeovers,
+    142 refused (29 of them after fencing some logs), 11 records dropped whole and 84 kept and finished, 1,270 applied
+    at joins, reads 239 served, 60 `Split`, 23 `NotApplied` and 538 `NotHeld`. In r98: `--test ledger` 16 of 16 and
+    `--test mirror` 6 of 6, both driving `Owner::take_over`, now over the wire and `PhaseOne`; `--test wire_order` 2
+    of 2 and 1 ignored (no wire type changed, so nothing was published); and slates-server's lib tests whose fixture
+    ids set the class byte's second bit, by name, 11 of 11 (`readmission`, `moves`, `repository::push` and eight in
+    `verbs`; `fuse.rs`'s is Linux's, owed). `cargo fmt -p slates-db -- --check` clean both times.
+- **Owed.** (2b) the partition's records shipped to each log's holders a log at a time (the state logs have registers
+  now; nothing ships to them yet); (2c) the server's takeover adopting a repository's logs by this rule. Found while
+  building this, for 2c: a repository's greens still each follow their own id's successor
+  (`RegionalConfiguration::successor` ranks by the object's own placement key), so a takeover can hand one repository's
+  greens to different hosts while its state logs go to the repository's successor; one writer needs every log of a
+  repository to follow one successor (one route: a green that joins a repository moved onto its line by the
+  configuration, D-14's home change). Also for 2b and 2c: the server tells a register's class by `is_catalog` alone
+  (the takeover's routing of each adopted object to its owner shard and its adoption of the record, `takeover.rs`; the
+  shipper's head sessions, `fleet.rs`; the mirror's page of heads, `mirror.rs`), so a state log's register would be
+  handled there as its repository's own head; each such site must read `ObjectId::class` before a state log's record is
+  shipped. Nothing ships one yet, so none reaches them now. Main's gates (clippy, xtask, the doc build, other
+  platforms) and the db and server suites whole.
+- **Applied in the same change to:** §4.8's catalog-class status (the state logs' class); §4.17.1's status and shared
+  piece 2; GAPS (A-642's headline, the §4.17 entry); `crates/db/src/register/class_tests.rs` (new); this entry.
 
 ### A-665 part 2 — The hook's view on the owner shard: opened over the repository's store, sealed in the shard's slices, and handed to the hook driver with receive-pack's variables (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-597, A-622, A-662, A-665)
 Applied in the same change to:

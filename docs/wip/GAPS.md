@@ -38,7 +38,7 @@
 > Mercurial's changesets the server makes (§4.17.3 decision 7, piece 6) and Subversion's revisions (§4.17.4's revision
 > record) by the same rule, main to start them.
 >
-> **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts, takeovers fencing every log or none. OWED: its live plane (A-636 part 2, g261).
+> **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. OWED: the partition's records shipped a log at a time (A-636 part 2b) and the server's takeover by the rule, every log of a repository following one successor (2c).
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304) and Subversion's (g268), refused `Owed` until then; the Subversion index charged by its bytes once slates-svn measures them; a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the `StoreLender` for upload-pack over this map (A-625 part 3); the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
@@ -344,6 +344,25 @@
 > records of several logs committed whole, 12 dropped whole and 25 kept and finished by takeovers, 72 split reads
 > refused); red eight ways. Owed: the live plane (A-636 part 2: each log's register on the wire, the state logs'
 > register class, the server's takeover by this rule).
+> **A-636 part 2a (2026-11-19, g261; the live plane's first piece):** a repository's four state logs are registers of
+> the repository's class (`crates/db/src/register.rs`, `RegisterClass`, `ObjectId::in_class`; `LogName::register`): the
+> counter's second bit marks one and its top and third bits name which, so they are placed and taken over as the
+> repository is and its state moves as one, while the catalog's bit and every id with the second bit clear are as they
+> were; a partition mints at most 2^45 − 1 ids (was 2^47 − 1). A holder answers a takeover's round on the wire with one
+> log's promise (`Cohort::promise`), which the successor counts only for that log's round (`PhaseOne`, `Heard`), and a
+> takeover runs a log at a time, adopting every log or none, the logs read before a refusal staying fenced as a live
+> holder's fence does (part 1's ask-first rule replaced; `LogsTakeoverRefused::fenced`). A holder fenced on one log of
+> a record by such a refusal applies none of the record at its join until it holds the rest (`LogsCohort::apply`;
+> found by the model test, which now judges each holder's cut over every log it holds). Tests (macOS arm64, Mac Studio,
+> kiln r27, r98, r113): red first, six rules failing against the change stubbed and the holder's join failing 2 of 2
+> with its fix out; green, slates-db's lib filtered to register, ledger, catalog and mirror 116 of 116, `--test
+> ledger` 16 of 16, `--test mirror` 6 of 6, `--test wire_order` 2 of 2 (no wire type changed), the 11 slates-server
+> lib tests whose fixture ids set the class byte's second bit 11 of 11, fmt clean. Owed: the partition's records
+> shipped to each log's holders (2b); the server's takeover by this rule (2c), which must also give a repository's
+> greens their repository's successor (each green still follows its own id's, so a takeover can split one
+> repository's greens across hosts); before 2b ships a state log's record, the server's sites that tell a register's
+> class by `is_catalog` alone (`takeover.rs`, `fleet.rs`, `mirror.rs`) reading `ObjectId::class`; `fuse.rs`'s
+> fixture test on Linux.
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -1263,6 +1282,14 @@
 > (`Sources::now`), where it had asked the caller's `Guards::lock_token`; `Guards` removed. Red then green (macOS
 > arm64, Mac Studio, 130 of 130). Owed: the commit drive's second compile of `Policy::authz`; the Windows run and
 > red-checks (main's).
+> Its instant tested, 2026-11-19: a lock with an expiry binds at its expiry and lapses a microsecond past it (`lock.c`
+> `lock_expired`, strictly past). An update through the connection from a working copy holding the lock's token
+> writes, byte for byte, a never-expiring lock's update at the expiry (the token kept) and an empty table's past it
+> (the token taken away) (`an_update_keeps_a_lock_until_it_expires_and_takes_its_token_away_after`); alice's commit
+> naming bob's lock is refused `E160039` at `apply-textdelta` at the expiry and taken past it
+> (`a_commit_naming_a_lock_meets_it_until_it_expires_and_not_after`). Both passed at once, no drive change (macOS
+> arm64, Mac Studio, over main `3612d1ef9`: `cargo test --locked -p slates-svn --lib -- commit:: serve:: lock::
+> report::` 132 of 132, fmt clean). Owed: the Windows run and red-checks (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
