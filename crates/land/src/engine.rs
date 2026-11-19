@@ -1675,11 +1675,15 @@ impl<H: LandFs> Landing<'_, H> {
   fn written_of(&mut self, attempted: Result<Written, WriteFailure>) -> Written {
     match attempted {
       Ok(w) => w,
-      // No room fails its entry alone, and the landing goes on (A-539: the seam names it, whatever the platform numbers).
-      Err(WriteFailure::Host(HostError::NoSpace(code))) => Written {
-        outcome: Outcome::Failed { code: Some(code) },
-        window_ns: None,
-      },
+      // No room fails its entry alone, and the landing goes on (A-539: the seam names it, whatever the platform numbers);
+      // so does a privilege this process does not hold, which slates never asks for (R10, A-568): a link on a Windows
+      // account without the link privilege is that entry's refusal, never the host's end.
+      Err(WriteFailure::Host(HostError::NoSpace(code) | HostError::Unprivileged(code))) => {
+        Written {
+          outcome: Outcome::Failed { code: Some(code) },
+          window_ns: None,
+        }
+      }
       // Any other refusal the host names a code for — a name in use or a verb missing where the landing expected
       // neither, or anything it could not serve — ends the landing, whatever the code's number.
       Err(WriteFailure::Host(
@@ -1706,7 +1710,7 @@ impl<H: LandFs> Landing<'_, H> {
       },
       // A landing's target is a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to,
       // that entry fails alone, with no code to name.
-      Err(WriteFailure::Host(HostError::Pending)) => Written {
+      Err(WriteFailure::Host(HostError::Pending(_))) => Written {
         outcome: Outcome::Failed { code: None },
         window_ns: None,
       },
@@ -3332,13 +3336,14 @@ fn named_code(error: HostError) -> Option<OsCode> {
     HostError::Exists(code)
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
-    | HostError::Unavailable(code) => Some(code),
+    | HostError::Unavailable(code)
+    | HostError::Unprivileged(code) => Some(code),
     HostError::NotFound
     | HostError::NotDirectory
     | HostError::NotFile
     | HostError::StaleHandle
     | HostError::OwnMount(_)
-    | HostError::Pending => None,
+    | HostError::Pending(_) => None,
   }
 }
 

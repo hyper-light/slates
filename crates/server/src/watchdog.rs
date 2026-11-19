@@ -1079,6 +1079,17 @@ pub fn shard_window_ns(shard: u16) -> u64 {
   watch_window_ns(overrun_of_shard(shard))
 }
 
+/// The widest window the watchdog judges any of `shards` by now ([`shard_window_ns`]): how long a daemon whose shards
+/// these are may hold any one of them stuck before its watchdog says so (A-552's log-writer drain, A-574's failover
+/// detection). The liveness window for none.
+pub fn widest_window_ns(shards: &[u16]) -> u64 {
+  shards
+    .iter()
+    .map(|shard| shard_window_ns(*shard))
+    .max()
+    .unwrap_or_else(|| watch_window_ns(0))
+}
+
 /// The window the watchdog judges the calling thread's shard by now ([`shard_window_ns`]): what a shard thread's own
 /// wait inside one poll reads, since its shard is judged by it all the while (A-552). The liveness window on a thread
 /// that is no shard's.

@@ -45,3 +45,43 @@ name into one in place, with `set_child`), so only a recovery reached that count
 
 Evidence: red first with the test alone on main's `volume.rs` and `recover.rs` (6 counted against 3), green
 with the change, and `cargo test --locked -p slates-vfs --lib` 85 passed, 1 ignored, on the Mac Studio, 2026-11-19.
+
+## 2. A clone was admitted with no entry allowance
+
+### Description
+
+The server's clone admission set a clone's inode allowance but no entry allowance. A create's admission
+(`admit_dimensions`) and a restart's re-admission both set it. So a clone's namespace dimension had no bound until the
+daemon's next restart, and a clone could make names, hard links and new names alike, past its quota's share.
+
+Measured on the Mac Studio (2026-11-19), with the test alone on main. The origin was bounded at 64 KiB, whose share is
+4,096 entries. Its snapshot held 4,104 names (the share and 8 past it), and its clone carried an entry allowance of
+`u64::MAX`.
+
+### Root cause
+
+`admit_clone` (`crates/server/src/verbs.rs`) called `set_inode_allowance` alone. Since A-549 the clone's entry count is
+its snapshot's, so there was a count to floor an allowance at, but nothing set one.
+
+### Impact
+
+- Until a restart, every clone could hold any number of names. Only the shard's directory-block slab bounded them, which
+  is the pressure §4.2's namespace allowance exists to keep one volume from putting on the rest: hard-link fan-out and
+  name churn.
+- A restart did set the allowance, so a clone's limit changed across a restart.
+
+### Exact edits
+
+- `crates/server/src/verbs.rs`, `admit_clone`: after the inode allowance, the clone's entry allowance. It is a
+  create's share (`entry_allowance(size)`), never below the entries the clone holds, which are its snapshot's (A-549),
+  as a restart's re-admission floors it. A refusal is counted as `volume.allowance_refused` (there is none, since the
+  floor is the count). It reserves nothing, so it is set from the clone's own count once the clone exists.
+- The lib test `a_clone_is_admitted_with_an_entry_allowance_never_below_its_snapshots_entries` (`clone_admission_tests`):
+  - A bounded origin has its allowance raised past its share, is linked up to the share plus 8 names, is snapshotted,
+    and is left one under the share, then cloned. The clone's allowance must be its snapshot's 4,104 entries, and its
+    count must equal a walk of its namespace.
+  - A small origin's clone must get the share.
+  - No allowance may be refused.
+
+Evidence: red first with the fix's lines taken out (`u64::MAX` against 4,104), green with them; `cargo test --locked -p
+slates-server --lib clone` 11 passed, 1 ignored (main's open-bug test of a live clone), on the Mac Studio, 2026-11-19.
