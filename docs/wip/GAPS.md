@@ -3895,9 +3895,10 @@
 > `fs/nfs/nfs4renewd.c`) and a liveness window, in whole seconds (6 s), one number for the lease advertised, the
 > delegation recall's and quiet period's waits, the NFSv3 gate's and a landing's recall wait (`nfs::v4_lease_ns`).
 > Owed beside it: the client table's lapse judged per client, from each client's own renewal gaps (A-384's accrual), so
-> a client slower than Linux's floor keeps its state too. Still on the placeholder, each owed a term of its own: the
-> anchor's restart cap, the FUSE helpers' bounds, the status capture's deadline (it should count from the capture, not
-> the request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
+> a client slower than Linux's floor keeps its state too. **Since A-525** a move's overdue bound and the telemetry
+> freshness horizon read the failover delay, and the anchor's crash-loop cap is the NFSv4 lease. Still on the
+> placeholder, each owed a term of its own: the FUSE helpers' bounds and the status capture's deadline (it should
+> count from the capture, not the request). Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running overrun for the rest of class D; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets
@@ -19168,7 +19169,17 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   staged as a metadata entry is, to measure before it lands); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
-  that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.
+  that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it,
+  **built by A-527 the same day** (`HostError::Win32`, a refusal in Win32's numbering beside `Unavailable`'s errno; the
+  Windows writer's rule pure in `crates/land/src/windows_codes.rs`, a name that exists and a full disk given their
+  errnos and every other code kept as itself; the Windows base host's codes typed so; the engine reading one as no kind
+  it tells apart; its unit tests ran on the Mac Studio, the Windows lanes filed for main; still owed with it: past the
+  seam one number field still holds either numbering — the landing report's `Failed { errno }`, the volume's
+  `BaseUnavailable`, the wire's `TargetRefusal::Host`, `HostAnswer::Errno` and `BaseUnavailable` — so a reader there
+  told the host is Windows' reads a Win32 code, and any other reads an errno; typing them is the wire's own piece, a
+  contract change; and the engine's own errnos are Linux's and macOS's numbers side by side, so an errno one platform
+  numbers as the other's kind (Linux's 45 `EL2NSYNC` as macOS's `ENOTSUP`, 69 `ESRMNT` as macOS's `EDQUOT`) would read
+  as that kind, which no call the writer makes is known to answer).
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with

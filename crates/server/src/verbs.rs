@@ -6814,6 +6814,11 @@ fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal 
       path: path.to_owned(),
       errno: code,
     },
+    // A Win32 code as its own number (A-527; typing it is the wire's own piece, GAPS).
+    slates_vfs::host::HostError::Win32(code) => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    },
     _ => Refusal::BaseUnavailable {
       path: path.to_owned(),
       errno: 0,
