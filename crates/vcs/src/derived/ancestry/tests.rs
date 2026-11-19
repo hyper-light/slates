@@ -210,13 +210,13 @@ impl Grower {
   }
 }
 
-/// The history the steps grow.
-fn grown(ops: &[Op]) -> History {
+/// The history the steps grow, and its open branches' tips.
+fn grown(ops: &[Op]) -> (History, Vec<u64>) {
   let mut grower = Grower::new();
   for op in ops {
     grower.apply(*op);
   }
-  grower.history
+  (grower.history, grower.tips)
 }
 
 /// A bitset over a history's versions.
@@ -664,10 +664,25 @@ fn same_however_filled(history: &History, eager: &Fixture, stride: usize) {
   lazy.finish();
 }
 
-/// One case of the oracle: a history grown from `ops`, every value checked, the lazy filling compared, and each query
-/// asked every way.
+/// Asks every question of one pair: is-ancestor both ways, the merge bases, and a bisect of the second against the
+/// first, or against nothing, or against the first and a third.
+fn ask_all(fixture: &mut Fixture, model: &Model, (one, two, three): (usize, usize, usize), census: &mut Census) {
+  ask_ancestor(fixture, model, (one, two), census);
+  ask_ancestor(fixture, model, (two, one), census);
+  ask_bases(fixture, model, (one, two), census);
+  let goods = match three % 4 {
+    0 => Vec::new(),
+    1 => vec![one],
+    _ => vec![one, three % model.len()],
+  };
+  ask_bisect(fixture, model, two, &goods, census);
+}
+
+/// One case of the oracle: a history grown from `ops`, every value checked, the lazy filling compared, and every
+/// question asked of each generated pair and of each two neighbouring branch tips (where criss-cross merges and
+/// unrelated histories leave their marks).
 fn case(ops: &[Op], queries: &[(usize, usize, usize)]) -> Census {
-  let history = grown(ops);
+  let (history, tips) = grown(ops);
   let model = Model::of(&history);
   let mut fixture = Fixture::eager(&history);
   let mut census = Census::default();
@@ -675,16 +690,10 @@ fn case(ops: &[Op], queries: &[(usize, usize, usize)]) -> Census {
   check_values(&fixture, &model);
   same_however_filled(&history, &fixture, ops.len() * 7 + 1);
   for (x, y, z) in queries {
-    let (one, two) = (x % model.len(), y % model.len());
-    ask_ancestor(&mut fixture, &model, (one, two), &mut census);
-    ask_ancestor(&mut fixture, &model, (two, one), &mut census);
-    ask_bases(&mut fixture, &model, (one, two), &mut census);
-    let goods = match z % 4 {
-      0 => Vec::new(),
-      1 => vec![one],
-      _ => vec![one, z % model.len()],
-    };
-    ask_bisect(&mut fixture, &model, two, &goods, &mut census);
+    ask_all(&mut fixture, &model, (x % model.len(), y % model.len(), *z), &mut census);
+  }
+  for pair in tips.windows(2) {
+    ask_all(&mut fixture, &model, (index(pair[0]), index(pair[1]), index(pair[0])), &mut census);
   }
   fixture.finish();
   census

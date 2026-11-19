@@ -283,13 +283,16 @@ fn skew_jump_depth(depth: u64) -> u64 {
   depth.saturating_sub(last)
 }
 
+/// A value's skip-tree parent and skip-tree jump, when it has a skip-tree parent.
+type SkipLinks = Option<(ContentId, ContentId)>;
+
 /// A version's value as it is written: everything but its root, which its bytes decide.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Made {
   parents: Vec<ContentId>,
   jump: Option<ContentId>,
   bottom: Option<ContentId>,
-  skip: Option<(ContentId, ContentId)>,
+  skip: SkipLinks,
   generation: u64,
   depth: u64,
   skip_depth: u64,
@@ -782,10 +785,7 @@ fn pushed(walk: &mut Walk<'_>, tree: Tree, parent: usize) -> Result<ContentId, A
 
 /// The skip-tree parent and jump of a version whose parents are `parents`, and its skip-tree depth: the parents'
 /// skip-tree lowest common ancestor, if they have one \[C: Mononoke `core.rs` 79-86\].
-fn skip_of(
-  walk: &mut Walk<'_>,
-  parents: &[usize],
-) -> Result<(Option<(ContentId, ContentId)>, u64), AncestryRefused> {
+fn skip_of(walk: &mut Walk<'_>, parents: &[usize]) -> Result<(SkipLinks, u64), AncestryRefused> {
   let mut parents = parents.iter().copied();
   let Some(mut lowest) = parents.next() else {
     return Ok((None, 0));
@@ -854,18 +854,28 @@ fn lowered(
     if at == target {
       return Ok(true);
     }
-    if generation == floor {
-      continue;
-    }
-    let lowest = skip_lowest(walk, at, floor)?;
-    if lowest == target {
+    if generation > floor && lower(walk, (&mut frontier, &mut opened), (at, target, floor))? {
       return Ok(true);
     }
-    if walk.node(lowest)?.made.generation > floor && opened.insert(lowest) {
-      walk.charge(1)?;
-      for parent in parents_of(walk, lowest)? {
-        hold(walk, &mut frontier, parent, floor)?;
-      }
+  }
+  Ok(false)
+}
+
+/// Lowers `at` to its lowest skip-tree ancestor at or above `floor`: whether that is the target; else a merge above the
+/// floor is opened, once, and its parents held.
+fn lower(
+  walk: &mut Walk<'_>,
+  (frontier, opened): (&mut BTreeSet<(u64, usize)>, &mut BTreeSet<usize>),
+  (at, target, floor): (usize, usize, u64),
+) -> Result<bool, AncestryRefused> {
+  let lowest = skip_lowest(walk, at, floor)?;
+  if lowest == target {
+    return Ok(true);
+  }
+  if walk.node(lowest)?.made.generation > floor && opened.insert(lowest) {
+    walk.charge(1)?;
+    for parent in parents_of(walk, lowest)? {
+      hold(walk, frontier, parent, floor)?;
     }
   }
   Ok(false)
@@ -893,11 +903,17 @@ struct Entry {
   paint: Paint,
 }
 
+/// A run's key: its bottom's generation, then its bottom's root.
+type RunKey = (u64, ContentId);
+
+/// A run's entries, by their versions' handles.
+type Run = BTreeMap<usize, Entry>;
+
 /// The paint's pending entries, a run each, keyed by the run's bottom (its generation, then its root), with the count
 /// of entries at each generation and of those painted one side alone, the other alone, or both and not stale.
 #[derive(Debug, Default)]
 struct Pending {
-  runs: BTreeMap<(u64, ContentId), BTreeMap<usize, Entry>>,
+  runs: BTreeMap<RunKey, Run>,
   generations: BTreeMap<u64, u64>,
   only_one: u64,
   only_two: u64,
@@ -925,19 +941,7 @@ impl Pending {
     let bottom = bottom_of(walk, at)?;
     let key = (walk.node(bottom)?.made.generation, walk.node(bottom)?.root);
     let generation = walk.node(at)?.made.generation;
-    let run = self.runs.entry(key).or_default();
-    let before = match run.get_mut(&at) {
-      Some(entry) => {
-        let before = entry.paint;
-        entry.paint |= paint;
-        Some(before)
-      }
-      None => {
-        run.insert(at, Entry { generation, paint });
-        None
-      }
-    };
-    let after = before.map_or(paint, |before| before | paint);
+    let before = self.paint_entry(key, at, Entry { generation, paint });
     match before {
       Some(before) => self.tally(before, false),
       None => {
@@ -946,12 +950,29 @@ impl Pending {
         *count = count.saturating_add(1);
       }
     }
-    self.tally(after, true);
+    self.tally(before.map_or(paint, |before| before | paint), true);
     Ok(())
   }
 
+  /// Paints the entry `at` of the run `key` with `entry`'s paint, or makes it `entry`: the paint it had, if it was
+  /// there.
+  fn paint_entry(&mut self, key: RunKey, at: usize, entry: Entry) -> Option<Paint> {
+    let run = self.runs.entry(key).or_default();
+    match run.get_mut(&at) {
+      Some(kept) => {
+        let before = kept.paint;
+        kept.paint |= entry.paint;
+        Some(before)
+      }
+      None => {
+        run.insert(at, entry);
+        None
+      }
+    }
+  }
+
   /// The run with the highest bottom, taken out of the pending entries.
-  fn pop(&mut self) -> Option<((u64, ContentId), BTreeMap<usize, Entry>)> {
+  fn pop(&mut self) -> Option<(RunKey, Run)> {
     let (key, entries) = self.runs.pop_last()?;
     for entry in entries.values() {
       self.tally(entry.paint, false);
@@ -1104,11 +1125,7 @@ fn met(
 /// Joins one run's entries (module docs, [`merge_bases`]): sorted in depth-first order, then the standard stack
 /// construction over the sorted entries, which meets each with the stack's top and closes the chains below the meeting
 /// point: a virtual tree, every meeting point of two entries among its versions.
-fn joined(
-  walk: &mut Walk<'_>,
-  bottom: usize,
-  entries: &BTreeMap<usize, Entry>,
-) -> Result<Joined, AncestryRefused> {
+fn joined(walk: &mut Walk<'_>, bottom: usize, entries: &Run) -> Result<Joined, AncestryRefused> {
   let mut meets = Meets::new();
   let tops: Vec<usize> = entries.keys().copied().filter(|at| *at != bottom).collect();
   let tops = sorted(tops, &mut |one, two| preorder(walk, &mut meets, *one, *two))?;
@@ -1170,11 +1187,7 @@ fn join_one(
 }
 
 /// Paints a joined run: each version its entry's paint, then each its children's, deepest first.
-fn paint_joined(
-  walk: &Walk<'_>,
-  joined: &mut Joined,
-  entries: &BTreeMap<usize, Entry>,
-) -> Result<(), AncestryRefused> {
+fn paint_joined(walk: &Walk<'_>, joined: &mut Joined, entries: &Run) -> Result<(), AncestryRefused> {
   let mut members: Vec<(u64, usize)> = Vec::with_capacity(joined.parents.len().saturating_add(1));
   members.push((walk.node(joined.bottom)?.made.depth, joined.bottom));
   for child in joined.parents.keys() {
@@ -1187,8 +1200,8 @@ fn paint_joined(
   members.sort_unstable();
   for (_, at) in members.iter().rev() {
     if let Some(parent) = joined.parents.get(at).copied() {
-      let paint = joined.paint(*at);
-      joined.painted.insert(parent, joined.paint(parent) | paint);
+      let paint = joined.paint(*at) | joined.paint(parent);
+      joined.painted.insert(parent, paint);
     }
   }
   Ok(())
@@ -1204,11 +1217,11 @@ fn carry(
   paint: Paint,
   may_jump: bool,
 ) -> Result<(), AncestryRefused> {
-  let (root, generation) = {
+  let (is_root, generation) = {
     let node = walk.node(bottom)?;
     (node.made.parents.is_empty(), node.made.generation)
   };
-  if root {
+  if is_root {
     return Ok(());
   }
   if may_jump {
@@ -1393,8 +1406,9 @@ impl Segments {
     Ok((lowest, highest))
   }
 
-  /// The best candidate (see [`bisect`]).
-  fn best(&self, walk: &mut Walk<'_>) -> Result<Option<Midpoint>, AncestryRefused> {
+  /// The segments holding a version of the best rank, the score `min(weight, candidates - weight)` then the
+  /// generation, each with that version's weight.
+  fn ties(&self, walk: &Walk<'_>) -> Result<Vec<(usize, u64)>, AncestryRefused> {
     let mut best: Option<(u64, u64)> = None;
     let mut ties: Vec<(usize, u64)> = Vec::new();
     for index in 0..self.segments.len() {
@@ -1408,8 +1422,13 @@ impl Segments {
         ties.push((index, weight));
       }
     }
+    Ok(ties)
+  }
+
+  /// The best candidate (see [`bisect`]): among the versions of the best rank, the least name.
+  fn best(&self, walk: &mut Walk<'_>) -> Result<Option<Midpoint>, AncestryRefused> {
     let mut answer: Option<Midpoint> = None;
-    for (index, weight) in ties {
+    for (index, weight) in self.ties(walk)? {
       let found = self.version_at(walk, index, weight)?;
       if answer
         .as_ref()
@@ -1497,8 +1516,8 @@ fn reached_sets(
   segments: &[Segment],
   tops: &BTreeMap<usize, usize>,
   words: usize,
-) -> Result<Vec<Vec<u64>>, AncestryRefused> {
-  let mut sets: Vec<Vec<u64>> = Vec::with_capacity(segments.len());
+) -> Result<Bitsets, AncestryRefused> {
+  let mut sets: Bitsets = Vec::with_capacity(segments.len());
   for (index, segment) in segments.iter().enumerate() {
     let mut set = vec![0_u64; words];
     set_bit(&mut set, index);
@@ -1524,6 +1543,9 @@ fn reached_sets(
   }
   Ok(sets)
 }
+
+/// One bitset over the segments for each segment.
+type Bitsets = Vec<Vec<u64>>;
 
 /// Sets bit `index` of `set`.
 fn set_bit(set: &mut [u64], index: usize) {
