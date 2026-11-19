@@ -27,11 +27,13 @@
 //! own previous revision, or its copy source, or the copy source of a directory copied above it), a directory's
 //! deletions written when it closes, a replacement by a copy a deletion record and an addition. A range that starts
 //! after revision 0 is written incrementally, every revision replayed, as a migration in parts needs; the whole tree
-//! `svnadmin dump` writes for a range that is not incremental is not offered. Format 3 (`--deltas`) is owed with
-//! Subversion's own deltifier (part 2), since only its windows make `svnadmin`'s bytes.
+//! `svnadmin dump` writes for a range that is not incremental is not offered. In format 3 (`--deltas`) a change's or a
+//! copy's property list is written as a change to its comparison's and every text as the windows of Subversion's own
+//! deltifier against its comparison's text ([`crate::svndiff::deltas`], A-652), so `svnadmin dump --deltas`'s bytes
+//! too.
 //!
 //! **The gate**: import(export(R)) is R, and export(import(D)) is D byte for byte for the golden dumps stock
-//! `svnadmin` 1.15.0 wrote (A-593's `fixtures/dump`).
+//! `svnadmin` 1.15.0 wrote (A-593's `fixtures/dump`), in both formats.
 //!
 //! The evidence: `docs/wip/research/vcs-servers-subversion.md` §15. No I/O, no clock, no randomness, no panic.
 
@@ -158,8 +160,6 @@ pub enum MigrationRefusal {
     /// The youngest revision.
     youngest: Revision,
   },
-  /// An export in format 3, owed with Subversion's deltifier (`SVN_ERR_UNSUPPORTED_FEATURE`).
-  DeltasOwed,
 }
 
 /// `SVN_ERR_BAD_UUID`.
@@ -198,9 +198,6 @@ const SVN_ERR_REPOS_BAD_ARGS: u32 = 165_004;
 /// `SVN_ERR_CHECKSUM_MISMATCH`.
 /// Format: the miscellaneous category's start, 200,000, plus 14 (`svn_error_codes.h`).
 const SVN_ERR_CHECKSUM_MISMATCH: u32 = 200_014;
-/// `SVN_ERR_UNSUPPORTED_FEATURE`.
-/// Format: the miscellaneous category's start plus 7 (`svn_error_codes.h`).
-const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
 
 impl MigrationRefusal {
   /// The number of the Subversion error the same refusal is in Subversion's own load or dump.
@@ -223,7 +220,6 @@ impl MigrationRefusal {
       Self::Room { .. } => SVN_ERR_FS_GENERAL,
       Self::Corrupt => SVN_ERR_FS_CORRUPT,
       Self::BadRange { .. } => SVN_ERR_REPOS_BAD_ARGS,
-      Self::DeltasOwed => SVN_ERR_UNSUPPORTED_FEATURE,
     }
   }
 }

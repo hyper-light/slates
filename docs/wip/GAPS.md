@@ -336,6 +336,11 @@
 > only while every seat is taken and a new connection needs one, the reap teaching nothing and backing the phase off
 > once per bound (g294's SSH rule). `slates-server --lib vcs_` 69 of 69 and `slates-rt --lib round_trip` 2 of 2 on the
 > Mac Studio, red first twice (3 + 2, then 8 of 8). Owed: the Linux and Windows readers compiled and run.
+> **A-625 part 3, first slice (2026-11-19, g299):** git's site serves upload-pack (A-640 part 2) from a repository's
+> store a step at a time (`vcs_http::git::UploadServices` over a `StoreLender` that lends `Served` afresh each step);
+> receive-pack and a store not held answer `503`. `slates-server --lib vcs_` 76 of 76 on the Mac Studio, red first (3
+> of 3). Owed: the server's store per repository and its lender (with A-653's pack source), the daemon starting an edge,
+> receive-pack's session (A-654), the live `git clone`.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -405,6 +410,11 @@
 > Owed (part 2): the lock log in slates-db, guarded then applied (A-642); `Access` over vcs_policy and the lock owner
 > rule in slates-server; each repository's LFS index; the call A-625's edge makes. Then a streaming put in
 > `slates-vcs`, so an upload is not held whole; the stock client end to end against slates (main's run).
+> **A-629 part 2b-i (2026-11-19, g293; transfers judged on their batch's ref):** an LFS href carries the batch's ref
+> (`?refspec=`) and its transfer is judged on it; `Locks` reads owned records from A-635's locks log, a page charging
+> their text; `LocksRefused` tells `507` from `500`. `cargo test -p slates-git --lib` on the Mac Studio: 387 passed, 2
+> ignored, red first. Owed: part 2b-ii (the server's `Access`, `Locks` through `RepositoryLogs::append`, the edge's
+> call).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
@@ -497,8 +507,9 @@
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
 > objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
 > 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
-> (A-619); piece 5's first part, a push's bundle read, its race checks and its reply (A-641 part 1) (2026-11-19; UI
-> goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079 for A-598 and A-619, g301 for A-641).**
+> (A-619), and the session over a byte channel (A-650 part 2); piece 5's first part, a push's bundle read, its race
+> checks and its reply (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079
+> for A-598 and A-619, g301 for A-641, g303 for A-650).**
 > Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -607,8 +618,13 @@
 > bookmarks returned typed for the register, the repository's mutable state (an import is not served before the
 > register's entry holds them); the markers kept as the index's `M` rows in the obsstore's order; red first (5 failed),
 > 261 of 261, against a history 7.2 kept with drafts, an amend, a secret changeset, bookmarks and markers
-> (`crates/hg/fixtures/state`). Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
-> `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
+> (`crates/hg/fixtures/state`). **Built (A-650 part 2):** the session over a byte channel (`serve::stdio`), the entry
+> point the daemon's SSH edge (A-651) calls with the session channel's bytes: one answer held at a time, standard error
+> before standard output, the consumed bytes given back to the window, a request needing more than the window refused
+> out of band; proven by 259 of 259 on the Mac Studio (red 5 of 5 with the step held waiting), the three captured
+> sessions handed in at every cut down to a byte. Owed, in order, after §4.17.1's seven pieces: (4, rest) read
+> serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump, the process around
+> `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
 > the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
 > (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
@@ -763,8 +779,12 @@
 > again byte for byte after import, every revision's changed paths `svnlook changed`'s, import(export(R)) = R for them
 > and for generated histories held to a model tree; `cargo test -p slates-svn --lib --locked` 313 of 313 on the Mac
 > Studio, and 357 of 358 on the tree merged with main, the one failure main's own A-613 `reads` proptest, which fails
-> alone on main from its seed (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
-> deltifier, `text_delta.c` and `xdelta.c`, ported); the wiring (a `CreateRepository` repository's records on its
+> alone on main from its seed (see A-628). The export in format 3 built by A-652 (2026-11-19, g264): Subversion's
+> deltifier ported as `svndiff::deltas(source, target, window room)`, the crate's one delta generator, remaking every
+> window `svnadmin dump --deltas` wrote, `deltas.dump` and `part2.dump` written again byte for byte (413 of 413 on the
+> Mac Studio, red first 4 of 413); A-616's drive takes its changed texts' deltas from it. Owed from it: the wiring, after
+> A-655's owner commit step, since an imported revision commits through it (A-652's third part; a
+> `CreateRepository` repository's records on its
 > shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
 > shard's budget); main's: clippy and `xtask` over the module. Found by it and fixed by A-652 (2026-11-19, g264): the
 > index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
@@ -2508,22 +2528,37 @@
 > merge crate's integration suites and clippy.
 > Bug record: `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
 
+> **A rebased work restates its links after its own renames and removals: found open (2026-11-19, A-646's sweep, g267,
+> by reading; §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).** A clean rebase restates the verdict's
+> effects as the work's journal in the verdict's order: content first (renames, creates, unlinks), then the metadata
+> dimensions, hard links among them. A volume has real inodes, so a link restated after a rename or removal of the node
+> it names meets the path afterwards. Three cases go wrong:
+> - `ln g l; mv f g` would put `l` on `f`'s file, not `g`'s old one;
+> - a link to a node the work renames would be restated after the node left its path (A-646's made node resolved to
+>   the rename's source);
+> - a link to a node the work also removes would meet an empty path.
+>
+> The verdict and the commit are right; only the restatement's order is wrong. Owed: a failing test of each, then
+> restating a work's links after its creates and before its renames and removals, and a rebased journal replayed into a
+> volume compared with the green.
+
 > **Three siblings of A-643's verdicts: the first and third fixed by A-646 part 1, the second owed (2026-11-19, A-643's
 > sweep, g267; §4.16 "The verdict"; POSIX `rename`).**
 > 1. Fixed (A-646 part 1): a rename over a symbolic link, a hard link or an IPC node with no concurrent change replaces
 >    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
 >    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
 >    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
-> 2. The engine's half fixed (A-646 part 2a; §4.16's decision): a hard link names its node, never a path. A removed or
->    replaced home hands the node to its least surviving link, with its content or IPC node, mode and attributes. A
->    renamed home's links follow it, and a later file at the path is another node. A link a work makes names the node
->    at its target at the work's base, or the work's own. Red on kiln r1019 (9 failed: links left naming an empty path,
->    a new file, or a link); green on r1019, 124 of 124, and merged with main on r1032, 126 of 126. Owed, part 2b: the ops document says so, a node table a link
->    names, under a new format version with golden vectors re-derived (A-621's way). Bug record:
->    `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+> 2. Fixed (A-646 parts 2a and 2b; §4.16's decision): a hard link names its node, never a path. In the engine (2a), a
+>    removed or replaced home hands the node to its least surviving link, with its content or IPC node, mode and
+>    attributes; a renamed home's links follow it; a later file at the path is another node (red on kiln r1019; green
+>    124 of 124, merged 126 of 126 on r1032). In the ops document (2b), version 3 holds a node table a link names, the
+>    node at its target at the work's base or the one the work makes, its golden vectors re-derived independently
+>    (218 bytes, `553a422f…6c0d92`) and the determinism gate holding with nodes (red on r1104, 12 failed; green 134
+>    of 134; merged with main on r1111, 141 of 141). Bug record: `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
->    (`links_to`), two lookups where it scanned every attribute change and every hard link. A counter test shows 2
->    entries examined where the scan examined 2,000 (r960).
+>    (`links_to`), two lookups where it scanned every attribute change and every hard link; a counter test shows 2
+>    entries examined where the scan examined 2,000 (r960). Since part 2a it is one lookup, its last change: the links
+>    naming the node keep it rather than refuse its removal.
 > Bug record (1, 3): `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found
