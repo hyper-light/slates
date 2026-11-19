@@ -11924,6 +11924,19 @@ engine: the verdict, rebase, position mapping, the register).
 > detection (RustCrypto's `sha1-checked`, detection on and safe hash off as `git_SHA1DCInit`), which refuses git's own
 > t0013 SHAttered vector by type and names its plain SHA-1 as git's refusal does; and SHA-256 through aws-lc-rs. Proven
 > against every object type and the empty blob as stock git 2.50.1 named them in a SHA-1 and a SHA-256 repository.
+>
+> **Status (2026-11-19, A-590: piece 4 built).** `crates/git` (`objects`) reads a tree as git's `decode_tree_entry` does,
+> and a commit and a tag by their headers, each with its continuation lines (`gpgsig`, `gpgsig-sha256` and `mergetag`;
+> any header git gives no meaning is kept as written), and writes each back byte for byte. It knows git's entry order,
+> the five modes git writes in git's text (a subtree is `40000`) and the type of object an entry names; a commit's tree,
+> parents and identities, the payload its signature covers and the tag a `mergetag` carries; a tag's object, type, name,
+> tagger and where its signature begins. Every message id of git's `fsck.h` is a typed finding at its default severity,
+> and the checks of `fsck_tree`, `fsck_commit`, `fsck_ident` and `fsck_tag_standalone` run in git's order, under
+> `git fsck`'s strictness or a push's (`index-pack --strict`, where a warning refuses). Proven against 360 objects stock
+> git 2.50.1 wrote and judged: what slates reports of each, at each level and in order, is what `git fsck` and
+> `git fsck --strict` printed. slates parts from git once, on purpose: a tag whose malformed tagger is followed by an
+> extra header, which git reports and then accepts, is refused. Owed: the `.gitmodules` and `.gitattributes` blob
+> checks over the ids a tree's check hands on; the push's use of these checks is piece 6's.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -39288,3 +39301,70 @@ Applied in the same change to:
   - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
   - with the size not charged, a header naming 100 bytes read under an admission of 99.
 - **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.
+
+### A-590 — git's tree, commit and tag objects: read and written back byte for byte, and checked as git's fsck checks them (2026-11-19, g225, UI goal 92; §4.17.2 "Pieces (git)" piece 4, "A push" step 4, "The repository in git's terms" item 5; after A-600)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git` (`objects/`, new: `mod.rs`, `tree.rs`, `commit.rs`, `tag.rs`, `fsck.rs`, `headers.rs`, `ident.rs`,
+  `dotgit.rs`, `refname.rs`, `hex.rs`; its tests in `src/tests/objects/`; `fixtures/fsck` with
+  `make-fsck-fixtures.sh`; one `mod` line in `lib.rs`).
+- **Trees.** An entry is read as `decode_tree_entry` reads it (tree-walk.c): the bytes left must end in a NUL and an
+  id, the mode is octal digits up to a space, read into 32 bits with the low 16 kept as `parse_mode` keeps them (so
+  `1100644` is a file), and an empty name is refused. The mode's text is kept, so a zero-padded `040000` is served as
+  written. Entries order as `base_name_compare` orders them, a subtree's name read as if it ended with `/`. A new entry
+  takes one of the five modes git writes, in git's text (`%o`, so a subtree is `40000`); an entry names a tree, a
+  commit or a blob by its mode, as `object_type` says.
+- **Commits and tags.** Headers are read only once `verify_headers` passes; a line that begins with a space continues
+  the header before it. A commit's tree and parents are read where `parse_commit_buffer` reads them; its signature is
+  `gpgsig` in a SHA-1 repository and `gpgsig-sha256` in a SHA-256 one, and the payload it covers is the commit without
+  either header (`parse_buffer_signed_by_header`); a `mergetag` header unfolds to the whole tag. A tag's headers are read
+  at their places (`object`, `type`, `tag`, `tagger`), and it splits at the last line that starts a signature block git
+  recognizes, OpenPGP, X.509 or SSH (`parse_signed_buffer`), scanning the whole tag as git does. An identity reads into
+  name, email, seconds and zone through the same scan that checks it.
+- **The checks.** Each of fsck.h's 71 message ids, at its default severity, is a typed finding; a report keeps every
+  finding once, ignored ones too, in git's order, and says which refuses and which warns. The tree check is
+  `fsck_tree`'s: the first entry decoded before the walk, the next decoded before the current entry's mode and order
+  are judged (so an entry before an unreadable one is never judged), `verify_ordered`'s stack for duplicates that do not
+  sit together (`x`, `x.1`, `x/`), `.git` and the special files under every HFS+ and NTFS spelling (`is_hfs_dot_generic`
+  with its ignored code points and git's UTF-8 reader, which refuses U+FFFE and U+FFFF where UTF-8 allows them;
+  `is_ntfs_dotgit` and `is_ntfs_dot_generic` with the 8.3 short names, and the rest of the name after each backslash,
+  not the part up to the next), and the ids of `.gitmodules` and `.gitattributes` files handed on to be checked as
+  those files. The commit and tag checks are `fsck_commit`'s, `fsck_ident`'s (dates past `i64::MAX` overflow, as
+  `date_overflows` judges them on a 64-bit `time_t`) and `fsck_tag_standalone`'s, a tag's name judged as
+  `check_refname_format` judges `refs/tags/<name>`.
+- **Strictness.** `git fsck` runs non-strict. A push git checks runs `index-pack --strict` (or `unpack-objects
+  --strict`), whose options are `FSCK_OPTIONS_MISSING_GITMODULES` (or `_STRICT`), both `.strict = 1`
+  (builtin/index-pack.c, builtin/unpack-objects.c): a warning refuses, an info stays a warning, and mode 100664 is a bad
+  mode. Both strictnesses are the caller's to choose; §4.17.2's push takes the strict one.
+- **Where slates and git part.** git's tag check does not look at the tagger's result before its extra-header check,
+  whose finding is ignored by default and overwrites the result with success: git prints the tagger's error and
+  accepts the tag (stock `git hash-object` printed `missingEmail` of `bad-tag-tagger-extra-header` and wrote it). slates
+  refuses it. And among git's builds, git for Windows' HFS+ check also takes a backslash as a separator; slates takes
+  only `/`, as git on Linux and macOS, since HFS+ itself never reads a backslash as one.
+- **Golden vectors.** `make-fsck-fixtures.sh`, run on the MacBook with git 2.50.1 (Apple Git-155) on 2026-11-19, twice,
+  byte for byte the same both times: in a SHA-1 and a SHA-256 repository, 90 trees, commits and tags each, those git's
+  commands write and every malformed object of t1450-fsck with one more for each check fsck.c makes; and in the SHA-1
+  repository 180 objects, one for each spelling of `.gitmodules`, `.gitattributes`, `.gitignore` and `.mailmap` in
+  t0060-path-utils (each a symbolic link, whose name fsck reports), 42 spellings of `.git` on either side of the rules,
+  and 37 tag names on either side of refs.c's. For each, the manifest keeps what `git fsck`, `git fsck --strict` and
+  `git hash-object` said; `SHA256SUMS` keeps each file's SHA-256. The 158 objects an earlier run of the script made
+  came out of this one byte for byte.
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio, 51 of 51, 29 of them this piece's, 16.65 s): every
+  fixture against its SHA-256 and its id; every object read and written back byte for byte, or refused for git's reason
+  where git cannot read it; every object judged as `git fsck` and `git fsck --strict` judged it, and as
+  `git hash-object` did, but for the one divergence; trees, commits and tags by use (modes, order, the handed-on ids,
+  signatures and their payload, the mergetag, encodings, extra headers, every identity finding); git's `.git` check held
+  to a transliteration of utf8.c and path.c over 645,120 names; every cut (39,617) and every bit flip (250,840) of the
+  corpus read or refused by kind, the check agreeing with the parse; mebibyte names, lines and tag names, a
+  100,000-digit mode and date, 100,000 headers charged before they are kept; and proptests over any bytes and over
+  header-shaped bytes. `cargo fmt --check` clean. Red on the Studio:
+  - with the commit check answering at once with nothing found, 8 of the 29 failed;
+  - with U+FFFE and U+FFFF read as UTF-8 reads them, the golden judgments (the corpus's `.git` then U+FFFE) and the
+    UTF-8 oracle failed;
+  - with a backslash's part up to the next backslash checked instead of the rest of the name, the golden judgments
+    failed (the corpus's `x\.gitmodules\x` and `x\gitmod~1\x`, which git says are not `.gitmodules`);
+  - with duplicates sought only between neighbours, the golden judgments, the corpus's names and the sorted-trees
+    proptest failed.
+- **Owed.** The `.gitmodules` and `.gitattributes` blob checks (`fsck_blob`: `gitmodulesUrl`, `gitmodulesPath` and the
+  rest), over the ids a tree's check hands on; the push path's use of these checks (piece 6); per-id severities from
+  configuration (`fsck.<id>`), if policy ever needs them.

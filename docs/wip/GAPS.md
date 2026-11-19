@@ -53,6 +53,16 @@
 > object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
 > `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
 > entry's header and the delta instructions (others' parts).
+> **A-590 (2026-11-19, g225; piece 4):** `slates-git` reads trees, commits and tags as git reads them and writes each
+> back byte for byte (`objects`): entries, modes and git's order; headers with their continuation lines, signatures and
+> the payload they cover, the tag a `mergetag` carries. Every message id of git's `fsck.h` is a typed finding at its
+> default severity, and the tree, commit, identity and tag checks run in git's order under `git fsck`'s strictness or a
+> push's (`index-pack --strict`). Golden vectors: 360 objects stock git 2.50.1 wrote and judged (t1450-fsck's malformed
+> objects, t0060's spellings of the special files, spellings of `.git`, tag names), each reported as `git fsck` and
+> `git fsck --strict` reported it (`fixtures/fsck`, `make-fsck-fixtures.sh`, two runs byte for byte the same). One
+> divergence on purpose: a malformed tagger before an extra header, which git accepts, is refused.
+> `cargo test --locked -p slates-git --lib`: 51 of 51, red four ways. Owed: the `.gitmodules` and `.gitattributes`
+> blob checks over the ids a tree's check hands on; the push's use of the checks (piece 6).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's
