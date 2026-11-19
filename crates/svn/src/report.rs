@@ -52,7 +52,7 @@ pub mod drive;
 pub mod editor;
 pub mod exchange;
 #[cfg(test)]
-mod recorded;
+pub(crate) mod recorded;
 mod tuple;
 
 use crate::handshake::{self, Session};
@@ -502,7 +502,7 @@ fn canonical_fspath(path: &str) -> String {
 }
 
 /// `relpath` joined beneath the repository path `base`, as `svn_fspath__join` joins them.
-fn join_fspath(base: &str, relpath: &str) -> String {
+pub(crate) fn join_fspath(base: &str, relpath: &str) -> String {
   match (base == "/", relpath.is_empty()) {
     (_, true) => base.to_owned(),
     (true, false) => format!("/{relpath}"),
@@ -512,7 +512,7 @@ fn join_fspath(base: &str, relpath: &str) -> String {
 
 /// `url` decoded as `svn_path_uri_decode` decodes it: each `%` with two hexadecimal digits the byte
 /// they name, and `+` a space past a `?`.
-fn uri_decode(url: &str) -> Vec<u8> {
+pub(crate) fn uri_decode(url: &str) -> Vec<u8> {
   let bytes = url.as_bytes();
   let mut decoded = Vec::with_capacity(bytes.len());
   let mut query = false;
@@ -549,7 +549,7 @@ fn hex_pair(high: u8, low: u8) -> Option<u8> {
 /// `get_fs_path` finds it, the two decoded: what follows the repository's URL, `/` for nothing; a
 /// URL that does not begin with the repository's, followed by a `/` or by nothing, is not the
 /// repository's.
-fn repository_path(root_url: &[u8], url: &str) -> Result<String, ReportFailure> {
+pub(crate) fn repository_path(root_url: &[u8], url: &str) -> Result<String, ReportFailure> {
   let root = uri_decode(&String::from_utf8_lossy(root_url));
   let decoded = uri_decode(url);
   let not_ours = || ReportFailure::NotSameRepository {
@@ -658,7 +658,7 @@ impl ReportFailure {
   }
 
   /// Appends the failure as a release build of `svnserve` writes a command failure.
-  fn write(&self, out: &mut Vec<u8>) -> Result<(), Refused> {
+  pub(crate) fn write(&self, out: &mut Vec<u8>) -> Result<(), Refused> {
     handshake::write_command_failure(self.subversion_code(), self.message().as_bytes(), out)
       .map_err(|_| Refused::Malformed)
   }
@@ -781,6 +781,10 @@ pub struct Context<'a> {
   pub youngest: Revision,
   /// For `update`: whether the principal may read the target (`must_have_access`).
   pub readable: bool,
+  /// For `update`: whether the client has just authenticated for this command (`must_have_access`
+  /// asked, `serve.c` 826-836), so that no trivial auth request is written before the answer: the
+  /// authentication's request was the command's.
+  pub authenticated_now: bool,
   /// The most bytes the report may hold.
   pub room: usize,
   /// The most bytes one report command's item may take.
@@ -826,7 +830,9 @@ impl Reporter {
       ReportFailure::NotAuthorized.write(out)?;
       return Ok(Begun::Failed(ReportFailure::NotAuthorized));
     }
-    write_trivial_auth(out)?;
+    if !context.authenticated_now {
+      write_trivial_auth(out)?;
+    }
     let anchor = canonical_fspath(context.session_path);
     let target_path = match (&request.url, request.kind) {
       (Some(url), RequestKind::Switch | RequestKind::Diff) => {
@@ -1126,14 +1132,14 @@ fn refused_with(failure: ReportFailure, out: &mut Vec<u8>) -> Result<Begun, Refu
 
 /// Appends a trivial auth request, `( success ( ( ) 0: ) )`: no authentication needed
 /// (`serve.c` `trivial_auth_request`).
-fn write_trivial_auth(out: &mut Vec<u8>) -> Result<(), Refused> {
+pub(crate) fn write_trivial_auth(out: &mut Vec<u8>) -> Result<(), Refused> {
   let params = Value::List(vec![Value::List(Vec::new()), Value::String(&[])]);
   ra_svn::write(&Value::List(vec![Value::Word(SUCCESS), params]), out)
     .map_err(|_| Refused::Malformed)
 }
 
 /// Appends an empty command response, `( success ( ) )`.
-fn write_empty_success(out: &mut Vec<u8>) -> Result<(), Refused> {
+pub(crate) fn write_empty_success(out: &mut Vec<u8>) -> Result<(), Refused> {
   let params = Value::List(Vec::new());
   ra_svn::write(&Value::List(vec![Value::Word(SUCCESS), params]), out)
     .map_err(|_| Refused::Malformed)

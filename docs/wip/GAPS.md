@@ -3,7 +3,7 @@
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
-> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). Part 2 BUILT (A-647): A-614's D(k) and reached sets are a type (`slates-git`'s `store::ReachSets`), each version recording the version its set was remade from; over A-614's generated histories every derived value is the store's own sets and the value it kept, and each derivation walks what its admission walked (`slates-git --lib` 446 of 446). Queries by API, part 1 BUILT (A-666, g302, 2026-11-19): `slates-vcs`'s `derived::ancestry`, a type whose value holds Mononoke's commit-graph fields (generation, first-parent and skip-tree skew jumps by Myers' rule, run bottom, skip-tree parent: a dominator), and is-ancestor, the merge bases (git's `--all` set) and bisect's midpoint answered from the values, logarithmic along runs and linear only in the merges a question opens; held to a naive walk over generated histories, to Myers' bound and to the immediate dominator (`research/ancestry-queries.md`). Part 2 BUILT (A-666 part 2, g302, 2026-11-19): `slates-vcs`'s `derived::history`, a type whose value names a version's path map and a history tree of each path's node (Mononoke's unodes), a path keeping the node of the first parent it is TREESAME to (git's default mode exactly; a directory compared by its files, a removal a node), renames and copies as the works recorded them (`PathSources`; a copy from an older version read through `DerivedType::inputs`), and `log <path>` and `--follow` reading at most one node more than the versions they list; held to git's walk over generated histories (`research/path-history.md`; Windows x86_64, jupiter, 65 of 65; the macOS run owed). OWED: the git store serving D(k) from its values; A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position; queries by API's last part (blame), git's other simplification modes as types, and the server's verbs over A-666's types (each repository's values on its owner shard, A-662; a `PathSources` over each green's versions), with corrected commit dates where a history has them and questions cut into the shard's slices; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
+> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). Part 2 BUILT (A-647): A-614's D(k) and reached sets are a type (`slates-git`'s `store::ReachSets`), each version recording the version its set was remade from; over A-614's generated histories every derived value is the store's own sets and the value it kept, and each derivation walks what its admission walked (`slates-git --lib` 446 of 446). Queries by API, part 1 BUILT (A-666, g302, 2026-11-19): `slates-vcs`'s `derived::ancestry`, a type whose value holds Mononoke's commit-graph fields (generation, first-parent and skip-tree skew jumps by Myers' rule, run bottom, skip-tree parent: a dominator), and is-ancestor, the merge bases (git's `--all` set) and bisect's midpoint answered from the values, logarithmic along runs and linear only in the merges a question opens; held to a naive walk over generated histories, to Myers' bound and to the immediate dominator (`research/ancestry-queries.md`). Part 2 BUILT (A-666 part 2, g302, 2026-11-19): `slates-vcs`'s `derived::history`, a type whose value names a version's path map and a history tree of each path's node (Mononoke's unodes), a path keeping the node of the first parent it is TREESAME to (git's default mode exactly; a directory compared by its files, a removal a node), renames and copies as the works recorded them (`PathSources`; a copy from an older version read through `DerivedType::inputs`), and `log <path>` and `--follow` reading at most one node more than the versions they list; held to git's walk over generated histories (`research/path-history.md`; Windows x86_64, jupiter, 65 of 65; the macOS run owed). Part 3 BUILT (A-666 part 3, g302, 2026-11-19): `slates-vcs`'s `derived::blame`, a type whose value keeps each file's blame (runs of lines, each naming its introducing version, the file's path there and its first line there), kept from the first parent whose file holds the same content, else made from the parents' blames, the recorded rename's or copy's source, and one diff with each (Myers' linear-space diff), never a diff of the history; a line both parents of a merge changed attributed by the merge's recorded content (D-27); a question reads the path's trie nodes and the file's spans; held to blame recomputed by replaying every version, each derivation's lines read to the replay's (`research/path-history.md` §6; Windows x86_64, jupiter, 75 of 75; the macOS run owed). OWED: the git store serving D(k) from its values; A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position; a blame's spans shared between versions by identity, git's other simplification modes as types, and the server's verbs over A-666's types (each repository's values on its owner shard, A-662; a `PathSources` over each green's versions), with corrected commit dates where a history has them and questions cut into the shard's slices; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
 >
 > **A-664 (2026-11-19, g308; §4.17.1 "A push is a work" items 3 and 4; §4.17.2 piece 13; §4.17.3 decision 7 and piece
 > 6): the commits the server makes.** Part 2 BUILT (main 78a670256): `slates-git`'s `derived` module makes a version's git objects as
@@ -147,10 +147,8 @@
 > over its lower and restated as it lands; the lower's base held as a live reader of the fold floor while an upper over
 > it is unlanded); the whole-file identity check for an upper's length-changing operation that meets a change (refused
 > today); a copy in a stack; a stack whose bottom is a tree; clippy, `xtask` and the lint matrix over the change
-> (main's, run requests). **Finding, registered as A-668 (landing next):** the verdict's walk stops at the first delta
-> operation starting at or after a range's end, so a work's insert at an offset where the delta overwrites or truncates
-> and inserts too is accepted before both, while the two works in the other order conflict as two inserts at one
-> point; D-27 makes them a conflict in both orders.
+> (main's, run requests). The verdict's walk that met two inserts at one point in one order only, which A-659 found,
+> is fixed by A-668 (below, with A-612's).
 > **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
 > BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
 > no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held
@@ -228,6 +226,17 @@
 > refused with `ERR` until then, v0's ref names held to A-615's rule); `sparse:oid` (part 4); the pack from A-639's
 > fragments behind `PackSource`; `packfile-uris` and `bundle-uri` from the store's URI packs and bundle list;
 > progress on band 2; the walk in cooperative slices; hidden refs, which are policy.
+> **A-640 part 3 (2026-11-19, g296; protocol v0 and v1):** `upload::serve` answers v0 and v1 as git's smart HTTP does
+> (`upload::v0`): the ref advertisement in `send_ref`'s order, and each request whole and stateless, the shallow-update
+> first, the acknowledgments as `get_common_commits` writes them under `multi_ack`, `multi_ack_detailed` (`no-done`
+> too) and neither, and the pack on side-band-64k, side-band (995 bytes a packet) or bare. Held to stock git 2.50.1's
+> six stateless answers and nine one-round sessions packet for packet (424 of 424 on the Mac Studio, red nine ways).
+> The goldens found A-615's bug (`docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`): a thin
+> pack in a shallow exchange leaves out every had commit's tree, as `pack-objects --objects-edge-aggressive` does, and
+> only then (its oracle states it too). v0's advertised ref names are held to `refname::is_valid`. The service's pack
+> now comes from A-639's stream (`upload::Fragments`, a turn of it a call on the owner's clock, one call a step and its
+> packets framed full), closing part 2's owed pack: 460 of 460 on Windows x86_64 (jupiter; 3 ignored; red four ways;
+> the macOS run owed). Owed in A-640: `sparse:oid` (part 4); a stateful v0 session, an SSH client's.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -980,6 +989,21 @@
 > replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
 > them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
 > A-652's generator.
+> A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
+> command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
+> land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.
+> Continued (1), 2026-11-19: `commit` through the connection (A-655's entry point and drive; the hooks the drive waits
+> for, A-661, handed to the caller; the accepted work answered with its revision, or refused at `close-edit` in A-655's
+> step's words, the client's commands then dropped until `abort-edit` or `success`; the crate's tests commit through
+> A-655 part 2a's step, the daemon refuses every work 200007 until part 2b), and `svnserve`'s authentication for one
+> command (`must_have_access`) for `commit` and `update`, held to every recorded commit connection and to `svnserve`'s
+> own for `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s
+> `get-dir`, compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at
+> once, where `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH
+> tunnel's entry point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's
+> commit once A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their
+> authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
+> for anonymous): the read commands' authorization is owed (A-606).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
@@ -2601,6 +2625,25 @@
 > a shorter truncate conflicts; the same truncate identical). Red on the Mac Studio with the fix reversed (kiln r613:
 > the file `<1>\n` each time), green with it (43 of 43). A-596's oracle bases truncating works behind the head again.
 > Bug record: `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
+
+> **Two inserts at one point conflicted in one order only: fixed (2026-11-19, A-668, g306; found by A-659's
+> restatement; §4.16 "Position mapping", "The verdict"; D-27).** Two works insert at one point, each based before the
+> other, one of them also overwriting the bytes from that point or truncating from it. Landed first, that one made the
+> plain insert accepted ahead of both its changes; landed second, the two conflicted as inserts at one point. The walk
+> through a delta (`crate::map::map_through_one`) stopped at the first operation starting at or after a range's end,
+> and a point's end is its start, so canonical order (overwrite and truncate before insert at one offset) hid the
+> insert behind it. D-27 decides it: a conflict in both orders, since accepting one ahead of the other chooses an order.
+> Now the walk stops at an operation starting after the range's end, or at its end for a range that is not a point
+> (`crate::map::lies_past`), and A-659's restatement walks the same way. Tests: `crates/merge/src/map/tests.rs` (the
+> point meets an insert behind an overwrite and behind a truncate at it; both orders conflict at the verdict); A-659's
+> stack oracle generates the shape, and a work between that a replica refuses must still land alone over the stack's
+> works below. Windows x86_64 on jupiter (the macOS run owed): red with the fix out, 3 of 4 failing (the map test, the
+> verdict's both orders, and the stack oracle, which met the pair by itself); green `slates-merge --lib` 166 of 166, fmt
+> clean. The merged tree (A-668 at 92038d5aa over main e3234e618, r81): 179 of 180 (main's 178 and A-668's 2, both
+> passing), fmt clean; the one failure, A-626's copy oracle census meeting no nested copy whose inner copy replaced a
+> tree (0 of 30 nested pairs), is not A-668's, since that oracle bases every work at the head and so never reaches the
+> walk A-668 changed, and it passed alone again (r131, 3 of 37); its owner's, filed. Bug record:
+> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
 
 > **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
 > A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name
@@ -6028,7 +6071,20 @@
 > 0.47–0.66 µs (BENCHMARKS, "What a verdict compares and copies"). At the 3,000-client rung's 21 KiB files the owner's
 > CPU a verdict is even (W1: 21.3–22.0 against 21.1–22.1 µs). **Open:** an accept still follows the file (`apply` writes
 > the new file, 37 µs at 1 MiB); the rung's engine verdict is 13 µs where the bench's is under 2.5 µs (82% of the rung's
-> verdicts are conflicts); and the large-file daemon A/B is owed to the supervisor's measurement.
+> verdicts are conflicts). The large-file daemon A/B was even (the measurer, 2026-11-18: owner CPU a verdict 84–102 µs
+> before, 93–110 after, 747 files of 256 KiB–1 MiB at 1,000 clients), but the rung's slot overwrites take pass two's
+> memcmp and never this check, so it could not show it; every run also hit `TableAtCapacity` on edits.
+>
+> **Merge: a verdict makes no file until it accepts (§4.16 "The verdict"; 2026-11-19, g222, from perf's unpushed
+> 1a4c6646 ported onto main's commit).** A clean path's new file was built in the verdict (`apply` over the head's file),
+> before the increment's other paths were judged, so a conflict built files and threw them away: in W1's 3,000-client
+> profile 91 of the engine's 283 verdict samples were that `apply` (memmove and the vector's growth), and 82% of those
+> verdicts conflicted (perf, 2026-11-11, a diagnostic not on main). Now a mapped file is made once the whole verdict
+> accepts, at the start of the commit (live and replayed) or of a rebase's restatement, from the head the verdict judged
+> (a held verdict commits only there, A-635) and the increment's post-state (`Green::make_mapped`), before any copy or
+> node move. Counted: `Green::mapped_files_made`; `a_conflicting_verdict_makes_no_file_and_an_accept_makes_each_once`
+> (`crates/merge/tests/engine.rs`); every merge suite's oracle holds the bytes. **Owed (the supervisor's measurement):**
+> the owner's CPU a verdict at the 3,000-client and 1,000-client rungs, main before and after, interleaved.
 >
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
 > identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from

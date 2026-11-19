@@ -5,8 +5,8 @@
 //! bases. A-645 asks for one mechanism for all of them, as Scion keeps (A-645's source, Anthropic's "Redesigning source
 //! control") and as Sapling's server keeps under `eden/mononoke/derived_data` \[C\]: `research/edenfs-scale-distribution.md`
 //! §2.1. This module is that mechanism; [`paths`] is its first type, [`ancestry`] (A-666) the type that answers
-//! is-ancestor, merge bases and bisect's midpoint, and [`history`] (A-666 part 2) the one that answers each path's
-//! history, `log <path>` and `--follow`.
+//! is-ancestor, merge bases and bisect's midpoint, [`history`] (A-666 part 2) the one that answers each path's
+//! history, `log <path>` and `--follow`, and [`blame`] (A-666 part 3) each line's introducing version.
 //!
 //! **A type** ([`DerivedType`]) is a pure function of a version's change and its parents' values of the same type: its
 //! [`DerivedType::derive`] reads the change from the history ([`Graph`]) and the parents' values from the store, and
@@ -46,9 +46,8 @@
 //! derivations counted against the versions it had to fill.
 //!
 //! **Owed:** the other stores as types (A-553's node revisions, A-588's manifests; A-614's D(k) is one since A-647 part
-//! 2, in `slates-git`); blame (A-666 part 3); dropping a value no version needs, and releasing a value a slice at a time
-//! (one call today, as A-581's releases); a derivation larger than a slice derived in parts; values replicated between
-//! tiers by identity.
+//! 2, in `slates-git`); dropping a value no version needs, and releasing a value a slice at a time (one call today, as
+//! A-581's releases); a derivation larger than a slice derived in parts; values replicated between tiers by identity.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -60,6 +59,7 @@ use crate::content::{ContentId, ContentRefused, ContentStore};
 use crate::index::{Index, IndexRefused, Inserted, NewRow};
 
 pub mod ancestry;
+pub mod blame;
 pub mod history;
 pub mod paths;
 
