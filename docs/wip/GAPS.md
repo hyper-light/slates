@@ -145,10 +145,8 @@
 > over its lower and restated as it lands; the lower's base held as a live reader of the fold floor while an upper over
 > it is unlanded); the whole-file identity check for an upper's length-changing operation that meets a change (refused
 > today); a copy in a stack; a stack whose bottom is a tree; clippy, `xtask` and the lint matrix over the change
-> (main's, run requests). **Finding, registered as A-668 (landing next):** the verdict's walk stops at the first delta
-> operation starting at or after a range's end, so a work's insert at an offset where the delta overwrites or truncates
-> and inserts too is accepted before both, while the two works in the other order conflict as two inserts at one
-> point; D-27 makes them a conflict in both orders.
+> (main's, run requests). The verdict's walk that met two inserts at one point in one order only, which A-659 found,
+> is fixed by A-668 (below, with A-612's).
 > **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
 > BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
 > no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held
@@ -226,6 +224,17 @@
 > refused with `ERR` until then, v0's ref names held to A-615's rule); `sparse:oid` (part 4); the pack from A-639's
 > fragments behind `PackSource`; `packfile-uris` and `bundle-uri` from the store's URI packs and bundle list;
 > progress on band 2; the walk in cooperative slices; hidden refs, which are policy.
+> **A-640 part 3 (2026-11-19, g296; protocol v0 and v1):** `upload::serve` answers v0 and v1 as git's smart HTTP does
+> (`upload::v0`): the ref advertisement in `send_ref`'s order, and each request whole and stateless, the shallow-update
+> first, the acknowledgments as `get_common_commits` writes them under `multi_ack`, `multi_ack_detailed` (`no-done`
+> too) and neither, and the pack on side-band-64k, side-band (995 bytes a packet) or bare. Held to stock git 2.50.1's
+> six stateless answers and nine one-round sessions packet for packet (424 of 424 on the Mac Studio, red nine ways).
+> The goldens found A-615's bug (`docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`): a thin
+> pack in a shallow exchange leaves out every had commit's tree, as `pack-objects --objects-edge-aggressive` does, and
+> only then (its oracle states it too). v0's advertised ref names are held to `refname::is_valid`. The service's pack
+> now comes from A-639's stream (`upload::Fragments`, a turn of it a call on the owner's clock, one call a step and its
+> packets framed full), closing part 2's owed pack: 460 of 460 on Windows x86_64 (jupiter; 3 ignored; red four ways;
+> the macOS run owed). Owed in A-640: `sparse:oid` (part 4); a stateful v0 session, an SSH client's.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -978,6 +987,21 @@
 > replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
 > them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
 > A-652's generator.
+> A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
+> command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
+> land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.
+> Continued (1), 2026-11-19: `commit` through the connection (A-655's entry point and drive; the hooks the drive waits
+> for, A-661, handed to the caller; the accepted work answered with its revision, or refused at `close-edit` in A-655's
+> step's words, the client's commands then dropped until `abort-edit` or `success`; the crate's tests commit through
+> A-655 part 2a's step, the daemon refuses every work 200007 until part 2b), and `svnserve`'s authentication for one
+> command (`must_have_access`) for `commit` and `update`, held to every recorded commit connection and to `svnserve`'s
+> own for `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s
+> `get-dir`, compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at
+> once, where `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH
+> tunnel's entry point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's
+> commit once A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their
+> authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
+> for anonymous): the read commands' authorization is owed (A-606).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
@@ -2599,6 +2623,25 @@
 > a shorter truncate conflicts; the same truncate identical). Red on the Mac Studio with the fix reversed (kiln r613:
 > the file `<1>\n` each time), green with it (43 of 43). A-596's oracle bases truncating works behind the head again.
 > Bug record: `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
+
+> **Two inserts at one point conflicted in one order only: fixed (2026-11-19, A-668, g306; found by A-659's
+> restatement; §4.16 "Position mapping", "The verdict"; D-27).** Two works insert at one point, each based before the
+> other, one of them also overwriting the bytes from that point or truncating from it. Landed first, that one made the
+> plain insert accepted ahead of both its changes; landed second, the two conflicted as inserts at one point. The walk
+> through a delta (`crate::map::map_through_one`) stopped at the first operation starting at or after a range's end,
+> and a point's end is its start, so canonical order (overwrite and truncate before insert at one offset) hid the
+> insert behind it. D-27 decides it: a conflict in both orders, since accepting one ahead of the other chooses an order.
+> Now the walk stops at an operation starting after the range's end, or at its end for a range that is not a point
+> (`crate::map::lies_past`), and A-659's restatement walks the same way. Tests: `crates/merge/src/map/tests.rs` (the
+> point meets an insert behind an overwrite and behind a truncate at it; both orders conflict at the verdict); A-659's
+> stack oracle generates the shape, and a work between that a replica refuses must still land alone over the stack's
+> works below. Windows x86_64 on jupiter (the macOS run owed): red with the fix out, 3 of 4 failing (the map test, the
+> verdict's both orders, and the stack oracle, which met the pair by itself); green `slates-merge --lib` 166 of 166, fmt
+> clean. The merged tree (A-668 at 92038d5aa over main e3234e618, r81): 179 of 180 (main's 178 and A-668's 2, both
+> passing), fmt clean; the one failure, A-626's copy oracle census meeting no nested copy whose inner copy replaced a
+> tree (0 of 30 nested pairs), is not A-668's, since that oracle bases every work at the head and so never reaches the
+> walk A-668 changed, and it passed alone again (r131, 3 of 37); its owner's, filed. Bug record:
+> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
 
 > **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
 > A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name
