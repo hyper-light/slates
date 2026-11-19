@@ -2567,7 +2567,9 @@
 > (`crate::map::lies_past`), and A-659's restatement walks the same way. Tests: `crates/merge/src/map/tests.rs` (the
 > point meets an insert behind an overwrite and behind a truncate at it; both orders conflict at the verdict); A-659's
 > stack oracle generates the shape, and a work between that a replica refuses must still land alone over the stack's
-> works below. EVIDENCE-PENDING. Bug record: `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
+> works below. Windows x86_64 on jupiter (the macOS run owed): red with the fix out, 3 of 4 failing (the map test, the
+> verdict's both orders, and the stack oracle, which met the pair by itself); green `slates-merge --lib` 166 of 166, fmt
+> clean. Bug record: `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
 
 > **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
 > A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name

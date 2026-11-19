@@ -46989,7 +46989,15 @@ Applied in the same change to:
   an insert, at one offset), which it had avoided, and now requires a work between that a replica refuses to land alone
   over the stack's works below it, so a pair judged in one order only fails the oracle rather than passing as an order
   the verdict depends on.
-- **Evidence.** EVIDENCE-PENDING (Windows x86_64, jupiter; the macOS run owed).
+- **Evidence** (Windows x86_64, jupiter, kiln, debug, 2026-11-19; the macOS run owed). Red (r1445, 04:13 PST) at
+  1ce46ee9a with `map.rs` and `stack/moved.rs` restored to f238bff73's, before the fix, in the scratch clone:
+  `cargo test -p slates-merge --lib -- map:: stack::oracle`, 3 of 4 failing: the map test (the point `Shifted` to 4
+  where it must meet the insert), the verdict's both orders, and the stack oracle, which met the pair by itself (the
+  green refused a bottom where every work between landed over it); the tree oracle passed. Green (r1448, 04:41 PST) at
+  1ce46ee9a: `cargo test -p slates-merge --lib -- --nocapture`, 166 of 166 in 36.3 s; `cargo fmt -p slates-merge --
+  --check` clean. The stack oracle's census: stacks through depths one to four 664, 405, 230 and 97 times; uppers moved
+  38, unmoved 694; uppers refused 147, bottoms 300; works between 1,266; collapsed 0. The tree oracle's: applied 178,
+  refused 142.
 - **Applied in the same change to:** §4.16 "Position mapping" (the status); GAPS (A-668's entry beside A-612's, and
   A-659's paragraph); `crates/merge/src/map.rs`, `map/tests.rs` (new), `engine/stack/moved.rs`,
   `engine/stack/oracle.rs`; `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md` (new).

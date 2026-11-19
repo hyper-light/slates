@@ -53,4 +53,7 @@ A-659's moved changes. A comment's whole lines are never a point, so review reco
 - A-659's stack oracle generates the shape (an overwrite or a truncate, then an insert, at one offset), which it had
   avoided.
 
-EVIDENCE-PENDING: the runs on jupiter (Windows x86_64), red with the fix out, green with it.
+Windows x86_64 on jupiter (kiln, debug, 2026-11-19; the macOS run owed): red (r1445) with the two files restored to
+their state before the fix in a scratch clone, 3 of 4 failing (the map test: the point `Shifted` to 4 where it must
+meet the insert; the verdict's both orders; and the stack oracle, which met the pair by itself); green (r1448)
+`cargo test -p slates-merge --lib` 166 of 166, `cargo fmt -p slates-merge -- --check` clean.
