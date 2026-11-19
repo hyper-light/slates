@@ -7,18 +7,22 @@
 //! receives earlier. This crate reads and writes the three framings ([`bundle2`], [`bundle1`], [`changegroup`]) and
 //! the deltas inside them ([`delta`]), and the part payloads a push and a pull carry ([`phases`], [`bookmarks`],
 //! [`heads`], [`obsmarkers`], [`pushkey`]; A-545), and the wire protocol's version 1 framings both transports use
-//! ([`ssh`], [`http`], their arguments [`wire`], the [`capabilities`] and [`batch`]; A-569), byte for byte as Mercurial
-//! 7.2 writes them, and nothing more: it hashes no node (piece 3), handles no part (piece 5), and serves no command
-//! (piece 4). A bundle compressed with `GZ`, `BZ` or `ZS` is made plain by [`compression`] (A-598): its zlib, bzip2
-//! or zstd stream inflated within the caller's admission, a compression bomb refused by kind; and a plain bundle is
-//! compressed as 7.2 compresses one.
+//! ([`ssh`], [`http`], their arguments [`wire`], the [`capabilities`] and [`batch`]; A-569), and the objects a
+//! repository holds with their nodes ([`changeset`], [`manifest`], [`filerev`], [`node`]; A-588), byte for byte as
+//! Mercurial 7.2 writes them, and nothing more: it keeps no index (piece 3's next part), handles no part (piece 5),
+//! and serves no command (piece 4). A bundle compressed with `GZ`, `BZ` or `ZS` is made plain by [`compression`]
+//! (A-598): its zlib, bzip2 or zstd stream inflated within the caller's admission, a compression bomb refused by kind;
+//! and a plain bundle is compressed as 7.2 compresses one.
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
 //! `internals.bundle2`, `internals.bundles` and `internals.changegroups` [B], and its code [C], which is what clients
 //! run and is followed where the two disagree: `bundle2.py` (every size a signed 32-bit integer; a part type of
 //! `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter; the interrupt), `changegroup.py` (the delta headers
 //! of versions `01` to `05`; a chunk length of 1 to 4 refused as a negative one is; the tree-manifest list every
-//! version from `03` carries, empty or not) and `mpatch.c` (a delta's hunks).
+//! version from `03` carries, empty or not) and `mpatch.c` (a delta's hunks); for the objects (A-588), `changelog.py`
+//! (a changeset's text and its extras' escapes), `cext/manifest.c` (a manifest's lines), `utils/storageutil.py` and
+//! `filelog.py` (a file revision's metadata block, its copy and its parents' order), `utils/hashutil.py` and
+//! `thirdparty/sha1dc/cext.c` (the node's SHA-1).
 //!
 //! **Hostile input (§4.9).** Every byte is untrusted. Every length is read as Mercurial reads it, a signed big-endian
 //! 32-bit integer, so `0xFFFF_FFFF` is −1: a refused length, or in a bundle2 payload the interrupt. Every length is
@@ -39,10 +43,19 @@
 //! from the deltas, and encode each bundle back to its own bytes. `fixtures/payloads/` (A-545) holds what 7.2's client
 //! sent and its server answered in three pushes over SSH, captured on the wire, and two obsstores 7.2 wrote, made by
 //! `fixtures/payloads/make-payload-fixtures.sh` the same way; every part payload in them is decoded to what 7.2's
-//! listings and logs say and encoded back to its bytes. `fixtures/compressed/` (A-598) holds the bundles 7.2 wrote of
-//! the same repository compressed (bundle1 with gzip and bzip2, bundle2 with gzip, bzip2 and zstd), made by
-//! `fixtures/compressed/make-compressed-fixtures.sh` and checked by its `SHA256SUMS`; each is made plain to exactly the
-//! uncompressed bundle 7.2 wrote.
+//! listings and logs say and encoded back to its bytes. `fixtures/objects/` (A-588) holds every revision of one
+//! repository's changelog, manifest log and file logs as 7.2's `debugdata` wrote it, each log as its `debugindex
+//! --debug` lists it, and what 7.2's own readers (`changectx`, `manifest`, `filelog.renamed`) read from each, made by
+//! `fixtures/objects/make-object-fixtures.sh` twice, byte for byte alike; every node is computed from its parents and
+//! text and every object read as 7.2 reads it and written back to its bytes. `fixtures/compressed/` (A-598) holds the
+//! bundles 7.2 wrote of the repository `fixtures/cg01.hg` and `cg02.hg` hold, compressed (bundle1 with gzip and bzip2,
+//! bundle2 with gzip, bzip2 and zstd), made by `fixtures/compressed/make-compressed-fixtures.sh` and checked by its
+//! `SHA256SUMS`; each is made plain to exactly the uncompressed bundle 7.2 wrote.
+//!
+//! **Nodes are SHA-1 with collision detection** (A-588, [`node`]), as 7.2's `hashutil.sha1` is sha1dc's wherever its C
+//! extension is built (the fixtures' runs printed it): a known collision attack is refused by kind, as 7.2 raises on
+//! one, and `fixtures/sha1dc/` holds SHAttered's two prefixes (git's t0013 vector and its twin, as A-600 cut them) that
+//! prove it.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt;
 // out-of-bounds indexing and slicing are denied workspace-wide.
@@ -57,12 +70,16 @@ pub mod bundle1;
 pub mod bundle2;
 pub mod capabilities;
 pub mod changegroup;
+pub mod changeset;
 pub mod compression;
 mod decimal;
 pub mod delta;
+pub mod filerev;
 pub mod heads;
 pub mod http;
 mod lines;
+pub mod manifest;
+pub mod node;
 pub mod obsmarkers;
 mod out;
 pub mod phases;
@@ -108,3 +125,7 @@ mod payload_tests;
 #[cfg(test)]
 #[path = "tests/wire.rs"]
 mod wire_tests;
+
+#[cfg(test)]
+#[path = "tests/objects.rs"]
+mod object_tests;
