@@ -102,7 +102,11 @@ def pump_up(server_stdin, client_record, race):
                 write_all_fd(server_stdin.fileno(), data[:before])
                 server_stdin.flush()
                 time.sleep(RACE_SETTLE_SECONDS)
-                subprocess.run(race, shell=True, check=True, timeout=STEP_SECONDS)
+                # The race must not write into this session's stream nor race again in its own tunnel.
+                quiet = dict(os.environ)
+                quiet.pop("SVN_FIXTURE_RACE", None)
+                subprocess.run(race, shell=True, check=True, timeout=STEP_SECONDS, env=quiet,
+                               stdin=subprocess.DEVNULL, capture_output=True)
                 raced = True
                 write_all_fd(server_stdin.fileno(), data[before:])
                 continue
