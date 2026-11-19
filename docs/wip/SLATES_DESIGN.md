@@ -44336,7 +44336,8 @@ requirements reader, now strict, and its plain encoding; `fixtures/import/` and 
   main: `import`, `file_index::read_docket` and `paths`, `store::plain_encode` and `Layout::read` returning at once),
   `cargo test --locked -p slates-hg --lib` 203 passed and 21 failed, every new test but the property test failing by
   its assertion, and part 1's golden (its requirements stubbed). Green: 224 of 224 at cb5455896, the first build;
-  rustfmt's layout taken from that run. Golden: the five stores import to five indexes equal row for row, every
+  rustfmt's layout taken from that run; 249 of 249 with rustfmt clean on the tree merged with main (A-619 part 2's and
+  A-641 part 1's modules among its newest) at a2eec04d9, load 11.6 to 13.0. Golden: the five stores import to five indexes equal row for row, every
   changeset's, manifest's and file revision's text 7.2's `debugdata` and every node computed from its parents and text
   7.2's, and the host asked only for files each repository holds, each once. Hostile: a listed log gone (fncache, file
   index, version 1 file index store), logs that disagree (no manifest log, a path the fncache lacks, an empty named

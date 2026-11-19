@@ -507,7 +507,8 @@
 > or behind a docket), appended in 7.2's order, each log whole or refused, each text held to its node; 7.2's cheap
 > `verify` checks across the logs; censored, ellipsis, externally stored and unknown flags refused by kind; a refused
 > import releasing its index and every hold. Proven by `cargo test --locked -p slates-hg --lib`, 224 of 224 on the Mac
-> Studio (2026-11-19, debug, load 3.5), red first against stubs (21 failed), against one history stock 7.2 stored five
+> Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against
+> one history stock 7.2 stored five
 > ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's `debugdata`, every node 7.2's, five
 > indexes equal row for row, nothing read but the files each holds. Owed of the import, with later pieces: the phase
 > roots, bookmarks and markers beside the logs (pieces 5 and 7; until then an import holds every changeset, secret ones
