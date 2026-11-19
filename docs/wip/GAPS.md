@@ -214,6 +214,12 @@
 > 203 of 203 (25 new), red first against a codec that refused everything (24 of 25 failed) and nine ways by mutation.
 > Owed of piece 14: serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and neither, `no-done`,
 > the stateless HTTP rounds), then `packfile-uris` and `bundle-uri`.
+> **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
+> digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
+> case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
+> encodes back byte for byte. This is main's answer to A-604's question: v0 and v2 read alike. Red first (2 of 39 v2
+> tests), then `cargo test -p slates-git --lib` 205 of 205. Owed of A-624: `object-info` and `bundle-uri` read and
+> answered over a store trait, and the server's `packfile-uris` choice (piece 14's rest).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
