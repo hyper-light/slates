@@ -13246,8 +13246,20 @@ and export by landing).
 > writes it; texts passed in pieces with their MD5 and SHA-1 checked through aws-lc-rs, deltas window by window through
 > the svndiff codec, a deletion and the addition of its path read as the one replacement FSFS records. Held to four
 > dumps stock `svnadmin` 1.15.0 wrote (golden, SHA-256 checked), to `svnlook changed`, to format 3 rebuilding format
-> 2's trees, to every cut and bit flip. Owed of piece 6: the verbs over it (`svnadmin create`, `load`, `dump`,
-> `setrevprop`, `setlog`, `info`, `uuid`, `youngest`) and the dump round trip.
+> 2's trees, to every cut and bit flip. Owed of piece 6 then: the import and export over it, built by A-628.
+>
+> **Status (2026-11-19, A-628, its first part).** Built: the repository's import and export (`slates-svn`'s
+> `migration`, piece 6's rest as Ada scoped it: slates offers the server portion, stock tools stay stock). A
+> repository's records: the index, each revision's properties, every text and property list held once by its BLAKE3
+> identity, the UUID, all within the caller's room. A dump is imported as its history as `svnadmin load` makes it
+> through FSFS (`load-fs-vtable.c`'s calls applied to a transaction, the changed paths FSFS records and folds, every
+> checksum the stream carries checked, revisions kept at their numbers); a range of revisions is exported in format 2 as
+> `svn_repos_dump_fs4` writes it (its replay's path driver, `dump_node`'s comparisons by representation, deletions at
+> their directory's close). Held to the golden dumps: `full.dump` and `part1.dump` exported again byte for byte,
+> `deltas.dump` and `part1.dump` then `part2.dump` importing to `full.dump`'s history, every revision's changed paths
+> `svnlook changed`'s account of the repository `svnadmin` dumped, and import(export(R)) equal to R for those and for
+> generated histories held to a model tree. Owed: the export in format 3 (Subversion's deltifier, its second part), and
+> the wiring (a `CreateRepository` repository's records held by its shard, the two verbs on the control channel).
 >
 > **Status (2026-11-19, A-613, its first part).** Built: the ra_svn read commands' handler (`slates-svn`'s `reads`,
 > piece 7's second part): a sans-io answer to one parsed command of a session after its handshake, the session taken
@@ -13709,8 +13721,13 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
    must give the same accept or conflict, and the same conflicting path (built, A-592, with the drive's out-of-date
    test, the lock table's check after the merge, and `verify_locks` in the oracle).
-6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format; its codec built, A-593),
-   `setrevprop`, `setlog`, `info`, `uuid`, `youngest`; the dump round trip is their gate.
+6. The repository's import and export (Ada, 2026-11-19: slates offers the server portion only, and stock clients and
+   tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
+   as its history, and a history exported as a dump for migration, each a server verb over the index and the records
+   with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
+   gate (the dump codec built, A-593; the verbs built for format 2, A-628; format 3's export and the wiring owed).
+   `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
+   property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
    the plain reads; the reporter (update, switch, status, diff, checkout); commit; log, locations, segments, file
    revisions, deleted revision, replay; revision properties.
@@ -42544,3 +42561,84 @@ Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`sto
 - **Owed of A-630.** The import (each revlog the fncache names read through `revlog` and appended to `index`, links by
   changelog number, through §4.15's read seam; golden: every changeset's node and every file's bytes equal to the
   fixtures' `debugdata`), then version 2's file index (`store_utils/file_index.py`).
+
+### A-628 — The repository's import and export: a dump made into a repository's history as FSFS's load makes it, and a history written as `svnadmin dump` writes it (2026-11-19, g264, UI goal 93; §4.17.4 "Pieces that follow" piece 6's rest, rescoped by Ada; A-553, A-575, A-593)
+Applied in the same change to:
+- §4.17.4 (a status block; piece 6 restated as Ada scoped it) and GAPS (the §4.17.4 entry);
+- `research/vcs-servers-subversion.md` §14 (new: the replay, load and FSFS sources the verbs follow, each with its
+  sha256, and what each decided);
+- `crates/svn` (`migration.rs` and `migration/` new: `paths.rs`, `properties.rs`, `records.rs`, `import.rs`,
+  `export.rs`, `tests.rs`, `tests/`; `lib.rs`'s module line and its module list; `Cargo.toml`), and the lock
+  (`slates-svn` gains `blake3`, the workspace's, nothing re-resolved). A-593's codec and tests kept to the lint habits
+  in a sibling change (`as_chunks`, a byte string, no `prop_oneof!`, no panic in a test function returning `Result`).
+- **What was there.** Piece 6 named `svnadmin`'s verbs (`create`, `load`, `dump`, `setrevprop`, `setlog`, `info`,
+  `uuid`, `youngest`), and A-628 was first assigned as those verbs with `svnadmin`'s output and errors. Ada's scope
+  (2026-11-19): slates offers the server portion only, and stock clients and tools stay stock; no `svnadmin` command
+  line and no matching of its text; A-628 is the server's import and export. The work done toward the command line
+  (golden output of stock `svnadmin` 1.15.0's verbs, a transcription of its messages) is parked unmerged on
+  `agents/g264-a628-svnadmin`.
+- **The records** (`Repository`): the index (A-553), each revision's properties, every text and property list held once
+  by its content identity (BLAKE3 of the bytes; a property list in FSFS's own form, `K`/`V` entries in name order and
+  `END`, so equal lists share an identity as FSFS shares their representation), and the UUID. `Repository::new` is what
+  `CreateRepository` leaves: revision 0, an empty root, `svn:date` its caller's time. A `Room` the caller derives bounds
+  the index's entries and the bytes held; an import past it is refused, typed, before the bytes past it are kept.
+- **The import** (`Importer`) reads a dump through A-593's reader as its bytes arrive and makes each revision as `svnadmin
+  load` makes it through `load-fs-vtable.c` and FSFS: a transaction on the youngest revision, named as FSFS names one
+  (the base, `-`, the repository's count of transactions in base 36, design item 3.1's form); each record's path read
+  through `svn_relpath_canonicalize` (checked against `dirent_uri.c` at `d434dc14`); `change` makes no call, `delete`
+  deletes, `add` makes or copies, `replace` does both; a whole property section removes each property the node has and
+  sets each it lists, a format-3 section deletes and sets what it names; a text is set whole or a delta applied window by
+  window to the node's text; the changed path FSFS records is kept, folded as `fold_change` folds one path's calls (an
+  addition after a deletion a replacement, a deletion of an addition nothing, a modification keeping an addition's
+  action, a deletion dropping what the revision did beneath it), and a property change recorded where a call was made,
+  a text change where a text was set. Then the revision is appended to the index with exactly the stream's revision
+  properties. Every checksum the stream carries is checked: a whole text's by the reader, a delta's base and result and
+  a copy source's text here, SHA-1 beside MD5.
+- **Where it keeps what `svnadmin load` would change.** A revision keeps the number the stream gives it: a stream
+  continues the history (revision 0 into an empty repository, else the one after the youngest) or is refused
+  (`OutOfSequence`), so a dump made in parts loads part after part; a UUID record names a repository that holds no
+  revision but 0 and is refused when it names another than one that holds history (`ForeignRepository`), where
+  `svnadmin load` ignores it. Properties are kept byte for byte, where `svnadmin load` by default validates `svn:`
+  properties and rewrites `svn:mergeinfo` into its canonical form, so the history imported is the one its source served.
+  The mergeinfo flag of a changed path says whether `svn:mergeinfo`'s value changed (what `svn log -g` reads it for);
+  FSFS's own load sets it for every rewrite of a whole list that holds `svn:mergeinfo`, which no dump carries.
+- **The export** (`Exporter`) writes a range as `svn_repos_dump_fs4` writes it: the version and UUID records, each
+  revision's record with its properties (a section even when empty), and each revision but 0 replayed as
+  `svn_repos_replay2` drives `dump.c`'s editor: the changed paths in `svn_path_compare_paths` order through the path
+  driver; a deletion written when its directory closes, a directory's in byte order; a replacement by a copy a deletion
+  record and an addition; an addition's whole property list and text; a change's or a copy's property list and text when
+  they differ from the node it is compared with, itself in the revision before, its copy source, or the place beneath a
+  directory copied in the same revision. `dump.c` compares representation keys (`svn_fs_props_changed`,
+  `svn_fs_contents_changed`) and FSFS shares equal representations, so equal content identities compare unchanged. A
+  range starting after revision 0 is written incrementally; the whole tree `svnadmin dump` writes for a range that is
+  not incremental is not offered. Format 3 is refused (`DeltasOwed`) until Subversion's deltifier is ported, since only
+  its windows make `svnadmin dump --deltas`'s bytes.
+- **Refusals**, each typed with the Subversion error the same refusal is: the stream's (A-593's, its own number), a
+  delta's (svndiff's), `OutOfSequence`, `CopyFromFuture` (`E160006`), `ForeignRepository` (`E125008`), `PathSyntax`
+  (`E160005`), `RootChange` (`E160021`), `NotFound` (`E160013`), `AlreadyExists` (`E160020`), `NotDirectory`
+  (`E160016`), `KindMismatch` (`E145001`), the three checksum mismatches (`E200014`), the index's (its own), `Room`
+  (`E160000`), `Corrupt` (`E160004`), `BadRange` (`E165004`) and `DeltasOwed` (`E200007`). A refused import keeps the
+  revisions committed before it and nothing of the one being read, and answers every later call the same.
+- **Tests** (`crates/svn/src/migration/tests*`, 27; Mac Studio, 2026-11-19, kiln, debug). Red first: the 27 over the
+  two verbs stubbed to refuse failed 27 of 27 (dfc714085); then `cargo test -p slates-svn --lib --locked` 313 of 313 at
+  7156ebc0e and again at f4dc10b69, rustfmt's layout taken from that run (the first green run had shared its target
+  directory with the red tree and reused its binary; the rerun touched the sources). Golden: `full.dump` and
+  `part1.dump` imported and exported again byte for byte; `deltas.dump`, `part1.dump` then `part2.dump`, and the two as
+  one stream, whole, a byte at a time and in pieces of 7 and 4,096, each importing to `full.dump`'s history and
+  exporting as `full.dump`; every revision's changed paths equal, line for line, to `svnlook changed --copy-info` of the
+  repository `svnadmin` dumped (FSFS's text and property flags among them); the history exported in two incremental
+  parts importing to the same; import(export(R)) = R. Rules: a change that makes no call records nothing; a text set to
+  its own bytes is a change written without its text; one path's records fold as `fold_change` folds them; a change
+  beneath a later deletion is dropped; the mergeinfo flag; changes beneath a copy written against its source; deletions
+  at their directory's close in byte order. Refusals: each above. Generated: up to seven revisions of additions,
+  changes, deletions, copies from any earlier revision and replacements, written as `svnadmin` writes them, imported in
+  pieces and held to the model's tree path by path in every revision, then import(export(R)) = R, the export's export
+  the same bytes, and an export in two parts the same history.
+- **Found, not this change's to fix.** The index refuses a replacement by a copy of the node-revision it replaces
+  (`CopyOntoItself`), which FSFS records when the deletion comes first (`tree.c` `copy_helper` makes a copy onto the very
+  node a no-op only while the destination still holds it); a dump holding one is refused here with the index's refusal.
+  Reported to main for A-553's owner; the generated histories keep a copy off the node it would replace.
+- **Owed of A-628.** The export in format 3 (`text_delta.c`'s windowing and `xdelta.c` ported, so `deltas.dump` and
+  `part2.dump` are written again byte for byte); the wiring: a repository `CreateRepository` made holding these records
+  on its shard, its texts in the shared object store, the import and export on the control channel, a revision a
+  version of the repository's green, and an import or export sliced under the shard's budget.

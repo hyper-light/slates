@@ -414,9 +414,9 @@
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
 > **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index, its lock table, its
-> mergeinfo, its commit rule, ra_svn's greeting and authentication, its HTTP bodies, its authorization and its dump
-> codec built (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599, A-609, A-606 and A-593, D-28; UI goals 91,
-> 92 and 93; g292, g250, g262, g268, g234, g229, g264).** A-592 (2026-11-19, g268): the commit rule, `slates-svn`'s
+> mergeinfo, its commit rule, ra_svn's greeting and authentication, its HTTP bodies, its authorization, its dump
+> codec and its import and export built (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599, A-609, A-606,
+> A-593 and A-628, D-28; UI goals 91, 92 and 93; g292, g250, g262, g268, g234, g229, g264).** A-592 (2026-11-19, g268): the commit rule, `slates-svn`'s
 > `commit`: the drive's out-of-date test, and the verdict (FSFS's `merge()` stated on the index, over the work's
 > transaction as the index's own builder makes it on its base, then the lock table's check); its oracle FSFS's `merge()`
 > and `verify_locks` transcribed over the index tests' naive filesystem, equal to the verdict with the lock table's real
@@ -484,9 +484,18 @@
 > three departures confirmed against stock Subversion (run request). A-593 (2026-11-19, g264, UI goal 92): the dump
 > format's codec, formats 2 and 3, read as the stream arrives within the caller's admission and written byte for byte as
 > `svnadmin dump` writes it, golden vectors from stock `svnadmin` 1.15.0, `cargo test -p slates-svn --lib` on the Mac
-> Studio (see A-593). Owed from it: the administration verbs over it; a format-3 dump is `svnadmin dump --deltas`'s
-> bytes only given its windows, which are Subversion's deltifier's (slates' dump verb will write its own, which
-> `svnadmin load` reads alike); a version-1 (zlib) delta inside a dump is refused, which no stock writer makes. Designed
+> Studio (see A-593). Owed from it then: the verbs over it, built by A-628; a version-1 (zlib) delta inside a dump is
+> refused, which no stock writer makes. A-628 (2026-11-19, g264, UI goal 93; piece 6's rest as Ada scoped it, the
+> server's import and export, stock tools staying stock): `slates-svn`'s `migration`, a repository's records (the
+> index, revision properties, contents by BLAKE3, the UUID, within the caller's room), a dump imported as FSFS's load
+> makes each revision and a range exported in format 2 as `svn_repos_dump_fs4` writes it; the golden dumps exported
+> again byte for byte after import, every revision's changed paths `svnlook changed`'s, import(export(R)) = R for them
+> and for generated histories held to a model tree; `cargo test -p slates-svn --lib --locked` 313 of 313 on the Mac
+> Studio (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
+> deltifier, `text_delta.c` and `xdelta.c`, ported); the wiring (a `CreateRepository` repository's records on its
+> shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
+> shard's budget); main's: clippy and `xtask` over the module. Found by it, for A-553's owner: the index refuses a
+> replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion comes first. Designed
 > from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the head,
 > FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision

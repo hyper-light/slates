@@ -10,8 +10,11 @@
 //! out-of-date test and FSFS's merge at commit stated on that index, whether a work built on a base revision commits on
 //! the head or which conflict refuses it, its lock check the table's ([`commit`], A-592); the HTTP side's bodies, the
 //! XML stock clients send over `http://` and `mod_dav_svn` answers, read within bounds and written byte for byte
-//! ([`dav`], A-609); and authorization, the authz file read as Subversion reads it and evaluated with its precedence
-//! for each principal ([`authz`], A-606).
+//! ([`dav`], A-609); authorization, the authz file read as Subversion reads it and evaluated with its precedence for
+//! each principal ([`authz`], A-606); the dump format, Subversion's portable stream of a repository's history, read as
+//! it arrives and written byte for byte as `svnadmin dump` writes it ([`dump`], A-593); and the repository's import and
+//! export, a dump made into a repository's history as FSFS's load makes it and a history written as `svnadmin dump`
+//! writes it ([`migration`], A-628).
 //!
 //! Nothing here performs I/O, reads a clock or draws randomness; every refusal is a typed value that names the
 //! Subversion error a client is answered with. The evidence is `docs/wip/research/vcs-servers-subversion.md`.

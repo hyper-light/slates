@@ -33,7 +33,7 @@
 //! **The gate**: import(export(R)) is R, and export(import(D)) is D byte for byte for the golden dumps stock
 //! `svnadmin` 1.15.0 wrote (A-593's `fixtures/dump`).
 //!
-//! The evidence: `docs/wip/research/vcs-servers-subversion.md` §13. No I/O, no clock, no randomness, no panic.
+//! The evidence: `docs/wip/research/vcs-servers-subversion.md` §14. No I/O, no clock, no randomness, no panic.
 
 mod export;
 mod import;
