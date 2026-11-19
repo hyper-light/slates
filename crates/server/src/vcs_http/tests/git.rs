@@ -475,6 +475,12 @@ struct EmptyRepository {
   store: ContentStore,
 }
 
+/// What [`NoPacks`] answers if asked: no exchange of these tests begins a pack, so the refusal is never read. Past
+/// admission is the plainest one slates-git has (A-640 part 3 removed the stall these tests gave before).
+fn no_pack() -> PackRefused {
+  PackRefused::PastAdmission(slates_git::PastAdmission { asked: 1, left: 0 })
+}
+
 /// A pack source no exchange of these tests begins: an empty repository has nothing to pack.
 #[derive(Clone, Copy, Debug)]
 struct NoPacks;
@@ -488,7 +494,7 @@ impl PackSource for NoPacks {
     _plan: &PackPlan<'_>,
     _admission: &mut slates_git::Admission,
   ) -> Result<(), PackRefused> {
-    Err(PackRefused::Stalled)
+    Err(no_pack())
   }
 
   fn write(
@@ -498,7 +504,7 @@ impl PackSource for NoPacks {
     _out: &mut Vec<u8>,
     _room: usize,
   ) -> Result<bool, PackRefused> {
-    Err(PackRefused::Stalled)
+    Err(no_pack())
   }
 }
 
