@@ -10,28 +10,26 @@
 //! - Otherwise the search is `svn_repos_deleted_rev`'s binary search: below a middle revision where the path is absent,
 //!   holds another line, or holds the line through a copy younger than the start (the start the search has moved to);
 //!   above it otherwise; found when the end is one past the middle. The node is compared with the older revision's as
-//!   the search began, the copy with the start as it moves, as the C code compares them.
+//!   the search began, the copy with the start as it moves, as the C code compares them. The search, and the closest
+//!   copy it asks, are the crate's one walk of copy roots (`crate::report::drive::history`, A-616), which the drive
+//!   asks too.
 //! - Found, the answer is `( success ( rev ) )`. Not found, `svnserve` answers the refusal a newer client reads as no
 //!   revision: `SVN_ERR_ENTRY_MISSING_REVISION`, its message naming the path and the two revisions as given.
 //!
-//! The search halves its range each turn, so it ends within [`SEARCH_TURNS`] turns; a search that would not (an index
-//! that contradicts itself) is refused as a corrupt filesystem, never looped on.
+//! The search halves its range each turn, so it ends within one turn a bit of a revision number and one more; the walk
+//! answers none past that rather than loop (an index that contradicts itself).
 
 use super::{
   Failure, Outcome, Reads, Repository, SVN_ERR_FS_NO_SUCH_REVISION, c_string, full_path, revnum,
 };
-use crate::index::{Node, Revision};
+use crate::index::Revision;
 use crate::ra_svn::{ItemError, Value};
+use crate::report::drive::history as copies;
 
 /// `SVN_ERR_ENTRY_MISSING_REVISION`, the refusal `svnserve` answers for a path not deleted in the range.
 /// Format: the entry category's start, 120,000 + 6 × 5,000 = 150,000, plus 3 (`svn_error_codes.h`); recorded (fixture
 /// `get-deleted-rev`).
 const SVN_ERR_ENTRY_MISSING_REVISION: u32 = 150_003;
-
-/// The most turns the search can take.
-/// Derived: each turn halves the range between the start and the end, and a range of revisions is at most 2^64 wide,
-/// so the search ends within 64 turns and one more for the turn that finds it.
-const SEARCH_TURNS: u32 = u64::BITS.saturating_add(1);
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
   /// `get-deleted-rev ( path peg-rev end-rev )` (`serve.c` `get_deleted_rev`).
@@ -58,8 +56,8 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     }
   }
 
-  /// `svn_repos_deleted_rev`: the revision the node at `path` in the older revision was first deleted in, at or before
-  /// the younger; `None` when it was not.
+  /// `svn_repos_deleted_rev`: its refusals of a negative revision here, then the search over the crate's one walk of
+  /// copy roots (`crate::report::drive::history::deleted_revision`); `None` when the path was not deleted.
   fn deletion(&self, path: &str, start: i64, end: i64) -> Result<Option<Revision>, Failure> {
     if start < 0 {
       let message = format!("Invalid start revision {start}");
@@ -69,61 +67,8 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       let message = format!("Invalid end revision {end}");
       return Err(Failure::new(SVN_ERR_FS_NO_SUCH_REVISION, message));
     }
-    let (start, end) = (start.min(end), start.max(end));
-    let start = self.existing(start)?;
-    let Some(first) = self.node(path, start)? else {
-      return Ok(None);
-    };
-    let end = self.existing(end)?;
-    if let Some(last) = self.node(path, end)?
-      && last.node_id() == first.node_id()
-      && !self.copied_after(path, end, start)?
-    {
-      return Ok(None);
-    }
-    self.search(path, &first, start, end).map(Some)
+    let revision = |revision: i64| Revision::try_from(revision).map_err(|_| Failure::corrupt());
+    copies::deleted_revision(self.index, path, revision(start)?, revision(end)?)
+      .map_err(|refusal| Failure::of_index(&refusal))
   }
-
-  /// Whether the closest copy of `path` in `revision` was made after `start`.
-  fn copied_after(&self, path: &str, revision: Revision, start: Revision) -> Result<bool, Failure> {
-    Ok(
-      self
-        .closest_copy(path, revision)?
-        .is_some_and(|(copied_in, _)| copied_in > start),
-    )
-  }
-
-  /// `svn_repos_deleted_rev`'s binary search between `start`, where `first` stands, and `end`, where it does not.
-  fn search(
-    &self,
-    path: &str,
-    first: &Node<'_>,
-    mut start: Revision,
-    mut end: Revision,
-  ) -> Result<Revision, Failure> {
-    let mut middle = midpoint(start, end);
-    for _ in 0..SEARCH_TURNS {
-      let lower = match self.node(path, middle)? {
-        None => true,
-        Some(node) => {
-          node.node_id() != first.node_id() || self.copied_after(path, middle, start)?
-        }
-      };
-      if lower {
-        end = middle;
-        middle = midpoint(start, middle);
-      } else if end.saturating_sub(middle) == 1 {
-        return Ok(end);
-      } else {
-        start = middle;
-        middle = midpoint(start, end);
-      }
-    }
-    Err(Failure::corrupt())
-  }
-}
-
-/// `(start + end) / 2` without overflow, for `start <= end`.
-fn midpoint(start: Revision, end: Revision) -> Revision {
-  start.saturating_add(end.saturating_sub(start) / 2)
 }

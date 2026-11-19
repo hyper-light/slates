@@ -11,26 +11,27 @@
 //! one node at a path at most.
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::{Green, Increment, Outcome};
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
 use crate::origin::Origin;
 use crate::special::{SpecialKind, SpecialNode};
 use crate::verdict::MergeConflictClass;
 
 /// An increment under construction, laid out as the deriver lays one out.
 #[derive(Default)]
-struct Work {
+pub(super) struct Work {
   doc: OpsDoc,
   post: Vec<u8>,
 }
 
 impl Work {
   /// Adds `kind` on `path` with `at`, `len` and the source `src` as given.
-  fn op(mut self, kind: OpKind, path: &str, (at, len, src): (u64, u64, u64)) -> Work {
+  pub(super) fn op(mut self, kind: OpKind, path: &str, (at, len, src): (u64, u64, u64)) -> Work {
     let path = self.doc.paths.intern(path);
     self.doc.ops.push(Op {
       kind,
@@ -43,19 +44,38 @@ impl Work {
     self
   }
 
-  /// Adds a namespace op on `path` naming `other` (a rename's source, a link's target).
-  fn naming(mut self, kind: OpKind, path: &str, other: &str) -> Work {
+  /// Adds a namespace op on `path` naming `other` (a rename's source; a link's target, the node at
+  /// it at the work's base, A-646).
+  pub(super) fn naming(self, kind: OpKind, path: &str, other: &str) -> Work {
+    self.named(kind, path, (other, NodeOrigin::Base))
+  }
+
+  /// Adds a hard link at `path` to the node the work makes at `target` (A-646).
+  pub(super) fn link_made(self, path: &str, target: &str) -> Work {
+    self.named(OpKind::Link, path, (target, NodeOrigin::Made))
+  }
+
+  /// Adds a namespace op on `path` naming `other`; a link names the node at it, from `origin`.
+  fn named(mut self, kind: OpKind, path: &str, (other, origin): (&str, NodeOrigin)) -> Work {
     let other = self.doc.paths.intern(other);
-    self.op(kind, path, (0, 0, other))
+    let src = if kind == OpKind::Link {
+      self.doc.nodes.intern(NodeRef {
+        path: other,
+        origin,
+      })
+    } else {
+      other
+    };
+    self.op(kind, path, (0, 0, src))
   }
 
   /// Adds a mode change of `path`.
-  fn mode(self, path: &str, mode: u32) -> Work {
+  pub(super) fn mode(self, path: &str, mode: u32) -> Work {
     self.op(OpKind::SetMode, path, (0, u64::from(mode), u64::MAX))
   }
 
   /// Adds `name` set to `value` on `path`.
-  fn set_xattr(mut self, path: &str, name: &str, value: &[u8]) -> Work {
+  pub(super) fn set_xattr(mut self, path: &str, name: &str, value: &[u8]) -> Work {
     let name = self.doc.paths.intern(name);
     let src = self.post.len() as u64;
     self.post.extend_from_slice(value);
@@ -63,13 +83,13 @@ impl Work {
   }
 
   /// Adds `name` removed from `path`.
-  fn remove_xattr(mut self, path: &str, name: &str) -> Work {
+  pub(super) fn remove_xattr(mut self, path: &str, name: &str) -> Work {
     let name = self.doc.paths.intern(name);
     self.op(OpKind::RemoveXattr, path, (name, 0, u64::MAX))
   }
 
   /// Adds `path` made a file holding `bytes`.
-  fn create(mut self, path: &str, bytes: &[u8]) -> Work {
+  pub(super) fn create(mut self, path: &str, bytes: &[u8]) -> Work {
     let src = self.post.len() as u64;
     self.post.extend_from_slice(bytes);
     self.op(OpKind::Create, path, (0, 0, u64::MAX)).op(
@@ -80,7 +100,7 @@ impl Work {
   }
 
   /// The increment `id` of this work based at `base`.
-  fn at(self, base: u64, id: u64) -> Increment {
+  pub(super) fn at(self, base: u64, id: u64) -> Increment {
     let mut identity = [0u8; 32];
     identity[..8].copy_from_slice(&id.to_le_bytes());
     Increment {
@@ -95,23 +115,23 @@ impl Work {
 
 /// Shape: the file the tests change, the file the links name, the symlink, the hard link and
 /// the directory.
-const FILE: &str = "f";
+pub(super) const FILE: &str = "f";
 /// Shape: see `FILE`.
-const TARGET: &str = "g";
+pub(super) const TARGET: &str = "g";
 /// Shape: see `FILE`.
-const SYMLINK: &str = "l";
+pub(super) const SYMLINK: &str = "l";
 /// Shape: see `FILE`.
-const HARDLINK: &str = "h";
+pub(super) const HARDLINK: &str = "h";
 /// Shape: see `FILE`.
-const DIR: &str = "d";
+pub(super) const DIR: &str = "d";
 /// Shape: the attribute the tests set and remove.
-const NAME: &str = "user.k";
+pub(super) const NAME: &str = "user.k";
 /// Shape: the IPC node (a FIFO) the green holds.
-const SPECIAL: &str = "p";
+pub(super) const SPECIAL: &str = "p";
 
 /// A green of `FILE` (mode 0o644, with `NAME`), `TARGET`, `SYMLINK` and `HARDLINK` to `TARGET`,
 /// the empty `DIR` and the FIFO `SPECIAL`.
-fn green() -> Green {
+pub(super) fn green() -> Green {
   let mut origin = Origin::default();
   origin.files.push((FILE.to_owned(), b"<f>\n".to_vec()));
   origin.files.push((TARGET.to_owned(), b"<g>\n".to_vec()));
@@ -142,7 +162,7 @@ fn green() -> Green {
 }
 
 /// Submits `work` at the head of `green` as increment `id`, expecting it accepted.
-fn accept(green: &mut Green, work: Work, id: u64) -> Result<(), String> {
+pub(super) fn accept(green: &mut Green, work: Work, id: u64) -> Result<(), String> {
   let head = green.head();
   match green.submit(&work.at(head, id)) {
     Outcome::Accepted { version } if version == head + 1 => Ok(()),
@@ -172,7 +192,7 @@ fn remake(green: &mut Green, path: &str, id: u64) -> Result<(), String> {
 }
 
 /// The classes `outcome`'s windows name on `path`, or `None` for an accept.
-fn classes_on(outcome: &Outcome, path: &str) -> Option<Vec<MergeConflictClass>> {
+pub(super) fn classes_on(outcome: &Outcome, path: &str) -> Option<Vec<MergeConflictClass>> {
   match outcome {
     Outcome::Conflict { windows } => Some(
       windows
@@ -482,7 +502,7 @@ fn no_work_changes_a_node_removed_after_its_base() {
 
 /// What stands at a path: a whole state holds one node a path at most (A-643).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
   #[default]
   Absent,
   File,
@@ -493,7 +513,7 @@ enum Kind {
 }
 
 /// Every node standing at `path` in `green`, by kind: one at most in a whole state.
-fn kinds_at(green: &Green, path: &str) -> Vec<Kind> {
+pub(super) fn kinds_at(green: &Green, path: &str) -> Vec<Kind> {
   [
     (green.content(path).is_some(), Kind::File),
     (green.symlink(path).is_some(), Kind::Symlink),
@@ -516,7 +536,7 @@ fn link_kind(link: &str) -> Kind {
 }
 
 /// The removal of the node of kind `kind` at `path`: a directory's `Rmdir`, any other's `Unlink`.
-fn removal_of(path: &str, kind: Kind) -> Work {
+pub(super) fn removal_of(path: &str, kind: Kind) -> Work {
   let removal = if kind == Kind::Dir {
     OpKind::Rmdir
   } else {
@@ -718,7 +738,7 @@ fn a_hard_link_to_a_target_removed_after_its_base_conflicts() -> Result<(), Stri
   let own = Work::default()
     .op(OpKind::Unlink, TARGET, (0, 0, u64::MAX))
     .create(TARGET, b"<its own>\n")
-    .naming(OpKind::Link, "linked", TARGET);
+    .link_made("linked", TARGET);
   let answer = green.submit(&own.at(0, 9));
   let linked = green.hardlink("linked");
   if !matches!(answer, Outcome::Accepted { .. }) || linked != Some(TARGET) {
@@ -852,8 +872,6 @@ const LINKABLE: [usize; 2] = [0, 1];
 const RENAMEABLE: [usize; 3] = [0, 2, 3];
 /// Shape: the indices in `PATHS` of the nodes a rename replaces: the files and the two links.
 const REPLACEABLE: [usize; 4] = [0, 1, 2, 3];
-/// Shape: the index in `PATHS` of `TARGET`, the file every hard link of `PATHS` names.
-const LINKED: usize = 1;
 
 /// One generated event of A-643's oracle; an index names a path of `PATHS`, and `back` the
 /// versions behind the head a work is based.
@@ -914,6 +932,10 @@ struct Answers {
   /// A rename over a symlink or a hard link the base held unchanged, accepted: the node replaced
   /// it (A-646).
   over_link: u64,
+  /// A node whose home was removed or replaced handed to its least surviving link (A-646).
+  handed_over: u64,
+  /// A renamed home's links naming it at its new path (A-646).
+  repointed: u64,
 }
 
 impl Answers {
@@ -929,7 +951,7 @@ impl Answers {
   }
 
   /// Every count, in the order the fields name them.
-  fn counts(&self) -> [u64; 10] {
+  fn counts(&self) -> [u64; 12] {
     [
       self.removal_refused,
       self.removal_accepted,
@@ -941,20 +963,24 @@ impl Answers {
       self.over_accepted,
       self.over_unchanged,
       self.over_link,
+      self.handed_over,
+      self.repointed,
     ]
   }
 }
 
 /// A-643's model of a green under generated events: what stands at each of `PATHS` at every
 /// version; the last version each path changed at in any dimension, its bytes changed at, and its
-/// node was removed at (0: never after the origin); and the hard links works made.
+/// node was removed at (0: never after the origin); every hard link's home (A-646: a link names
+/// its node, held at its home); and what stands at the paths works linked, besides `PATHS`.
 struct Whole {
   green: Green,
   kinds: Vec<[Kind; 5]>,
   changed: [u64; 5],
   bytes_changed: [u64; 5],
   removed: [u64; 5],
-  links: Vec<(String, &'static str)>,
+  targets: BTreeMap<String, String>,
+  others: BTreeMap<String, Kind>,
   works: u64,
 }
 
@@ -966,9 +992,99 @@ impl Whole {
       changed: [0; 5],
       bytes_changed: [0; 5],
       removed: [0; 5],
-      links: Vec::new(),
+      targets: BTreeMap::from([(HARDLINK.to_owned(), TARGET.to_owned())]),
+      others: BTreeMap::new(),
       works: 0,
     }
+  }
+
+  /// What stands at `path` now, among `PATHS` or the paths works linked.
+  fn kind_of(&self, path: &str) -> Kind {
+    match PATHS.iter().position(|known| *known == path) {
+      Some(index) => self.now(index),
+      None => self.others.get(path).copied().unwrap_or_default(),
+    }
+  }
+
+  /// The links naming the node at `home` now.
+  fn links_of(&self, home: &str) -> BTreeSet<String> {
+    self
+      .targets
+      .iter()
+      .filter(|(_, target)| *target == home)
+      .map(|(link, _)| link.clone())
+      .collect()
+  }
+
+  /// The home now of the node at `path`, as the verdict resolves a link to it made at `base`
+  /// (`Green::node_home`): a link's home while the link stood unchanged since, a file's own path
+  /// while it was not removed since; else the class it is refused by.
+  fn home_of(&self, path: &str, base: u64) -> Result<String, MergeConflictClass> {
+    let index = PATHS.iter().position(|known| *known == path);
+    let changed = index.is_some_and(|index| self.changed[index] > base);
+    let removed = index.is_some_and(|index| self.removed[index] > base);
+    match self.kind_of(path) {
+      Kind::Hardlink if !changed => self
+        .targets
+        .get(path)
+        .cloned()
+        .ok_or(MergeConflictClass::DeleteModify),
+      Kind::File if !removed => Ok(path.to_owned()),
+      Kind::Dir | Kind::Symlink => Err(MergeConflictClass::TypeChanged),
+      _ => Err(MergeConflictClass::DeleteModify),
+    }
+  }
+
+  /// Records at the head version that `path` holds a node of `kind`, among `PATHS` or not.
+  fn set_kind_of(&mut self, path: &str, kind: Kind) {
+    match PATHS.iter().position(|known| *known == path) {
+      Some(index) => self.set_kind(index, kind),
+      None => {
+        self.others.insert(path.to_owned(), kind);
+      }
+    }
+  }
+
+  /// Records at the head version a change to `path`, for the paths of `PATHS`.
+  fn touched(&mut self, path: &str, removed: bool) {
+    let version = self.green.head();
+    if let Some(index) = PATHS.iter().position(|known| *known == path) {
+      self.changed[index] = version;
+      if removed {
+        self.removed[index] = version;
+        self.bytes_changed[index] = version;
+      }
+    }
+  }
+
+  /// Records that the head version's removal or replacement of `home` handed its node to the
+  /// least of `survivors`, its links, which became the node's home, the others naming it there
+  /// (`Green::node_moves`). Nothing when no link survives.
+  fn hand_over(&mut self, survivors: BTreeSet<String>, answers: &mut Answers) {
+    let mut survivors = survivors.into_iter();
+    let Some(heir) = survivors.next() else {
+      return;
+    };
+    self.targets.remove(&heir);
+    self.set_kind_of(&heir, Kind::File);
+    self.touched(&heir, true);
+    for link in survivors {
+      self.targets.insert(link.clone(), heir.clone());
+      self.touched(&link, false);
+    }
+    answers.handed_over += 1;
+  }
+
+  /// Records that the head version renamed the home `from` to `to`: its links name it there.
+  fn repoint(&mut self, links: BTreeSet<String>, to: &str, answers: &mut Answers) {
+    if links.is_empty() {
+      return;
+    }
+    for link in links {
+      self.targets.insert(link.clone(), to.to_owned());
+      self.touched(&link, false);
+    }
+    answers.repointed += 1;
   }
 
   /// What stood at `PATHS[index]` at `version`.
@@ -1033,7 +1149,7 @@ impl Whole {
 
   fn apply(&mut self, event: Event, answers: &mut Answers) -> Result<(), TestCaseError> {
     match event {
-      Event::Remake(index) => self.remake(index),
+      Event::Remake(index) => self.remake(index, answers),
       Event::Mode(index) => self.metadata(index, false),
       Event::Attribute(index) => self.metadata(index, true),
       Event::Remove(index, back) => self.remove(index, back, answers),
@@ -1042,33 +1158,62 @@ impl Whole {
     }
   }
 
-  /// At the head: whatever stands at `PATHS[index]` removed, then the path made again as its
-  /// original kind; both accepted, since nothing changed after their base.
-  fn remake(&mut self, index: usize) -> Result<(), TestCaseError> {
+  /// At the head: whatever stands at `PATHS[index]` removed, its node handed to its links when
+  /// it was their home, then the path made again as its original kind, a hard link to `TARGET`'s
+  /// node; both accepted, since nothing changed after their base, but a link to a node `TARGET`
+  /// does not hold, which is refused and leaves the path empty.
+  fn remake(&mut self, index: usize, answers: &mut Answers) -> Result<(), TestCaseError> {
     let path = PATHS[index];
     let standing = self.now(index);
     if standing != Kind::Absent {
       let head = self.green.head();
-      let answer = self.submit(removal_of(path, standing), head);
-      prop_assert!(
-        matches!(answer, Outcome::Accepted { .. }),
-        "removing {path} at the head: {answer:?}"
-      );
-      self.removed_now(index);
+      self.remove_at(index, (standing, head), answers)?;
     }
+    let head = self.green.head();
     let made = match ORIGINAL[index] {
       Kind::Symlink => Work::default().naming(OpKind::Symlink, path, TARGET),
       Kind::Hardlink => Work::default().naming(OpKind::Link, path, TARGET),
       Kind::Dir => Work::default().op(OpKind::Mkdir, path, (0, 0, u64::MAX)),
       _ => Work::default().create(path, b"<made again>\n"),
     };
-    let head = self.green.head();
+    let home = (ORIGINAL[index] == Kind::Hardlink).then(|| self.home_of(TARGET, head));
     let answer = self.submit(made, head);
+    if let Some(Err(class)) = home {
+      prop_assert!(
+        classes_on(&answer, path) == Some(vec![class]),
+        "linking {path} to {TARGET} at the head: {answer:?}"
+      );
+      return Ok(());
+    }
     prop_assert!(
       matches!(answer, Outcome::Accepted { .. }),
       "making {path} at the head: {answer:?}"
     );
     self.made_now(index, ORIGINAL[index]);
+    if let Some(Ok(home)) = home {
+      self.targets.insert(path.to_owned(), home);
+    }
+    Ok(())
+  }
+
+  /// Submits the removal of what stands at `PATHS[index]` (`standing`), based at `base`, expecting
+  /// it accepted; records it, and its node's hand-over to its links when it was their home.
+  fn remove_at(
+    &mut self,
+    index: usize,
+    (standing, base): (Kind, u64),
+    answers: &mut Answers,
+  ) -> Result<(), TestCaseError> {
+    let path = PATHS[index];
+    let answer = self.submit(removal_of(path, standing), base);
+    prop_assert!(
+      matches!(answer, Outcome::Accepted { .. }),
+      "removing {path} from {base}: {answer:?}"
+    );
+    let links = self.links_of(path);
+    self.removed_now(index);
+    self.targets.remove(path);
+    self.hand_over(links, answers);
     Ok(())
   }
 
@@ -1108,25 +1253,26 @@ impl Whole {
     let path = PATHS[index];
     let stands = self.now(index) != Kind::Absent;
     let ruled = stands && self.changed[index] > base;
-    let answer = self.submit(removal_of(path, saw), base);
-    if ruled {
-      let classes = classes_on(&answer, path);
-      prop_assert!(
-        classes == Some(vec![MergeConflictClass::DeleteModify]),
-        "removing {path} from {base}: {answer:?}"
-      );
-    } else {
-      prop_assert!(
-        matches!(answer, Outcome::Accepted { .. }),
-        "removing {path} from {base}: {answer:?}"
-      );
-      if stands {
-        self.removed_now(index);
-      }
-    }
     if stands {
       answers.removal(saw == Kind::Dir, ruled);
     }
+    if !ruled {
+      return if stands {
+        self.remove_at(index, (saw, base), answers)
+      } else {
+        let answer = self.submit(removal_of(path, saw), base);
+        prop_assert!(
+          matches!(answer, Outcome::Accepted { .. }),
+          "removing {path} from {base}: {answer:?}"
+        );
+        Ok(())
+      };
+    }
+    let answer = self.submit(removal_of(path, saw), base);
+    prop_assert!(
+      classes_on(&answer, path) == Some(vec![MergeConflictClass::DeleteModify]),
+      "removing {path} from {base}: {answer:?}"
+    );
     Ok(())
   }
 
@@ -1139,33 +1285,35 @@ impl Whole {
       return Ok(());
     }
     let (path, name) = (PATHS[index], format!("linked-{}", self.works));
-    let ruled = self.removed[index] > base;
+    let home = self.home_of(path, base);
     let answer = self.submit(Work::default().naming(OpKind::Link, &name, path), base);
-    if ruled {
-      let classes = classes_on(&answer, &name);
-      prop_assert!(
-        classes == Some(vec![MergeConflictClass::DeleteModify]),
-        "linking {name} to {path} from {base}: {answer:?}"
-      );
-      answers.link_refused += 1;
-    } else {
-      prop_assert!(
-        matches!(answer, Outcome::Accepted { .. }),
-        "linking {name} to {path} from {base}: {answer:?}"
-      );
-      self.links.push((name, path));
-      answers.link_accepted += 1;
+    match home {
+      Err(class) => {
+        prop_assert!(
+          classes_on(&answer, &name) == Some(vec![class]),
+          "linking {name} to {path} from {base}: {answer:?}"
+        );
+        answers.link_refused += 1;
+      }
+      Ok(home) => {
+        prop_assert!(
+          matches!(answer, Outcome::Accepted { .. }),
+          "linking {name} to {path} from {base}: {answer:?}"
+        );
+        self.targets.insert(name.clone(), home);
+        self.others.insert(name, Kind::Hardlink);
+        answers.link_accepted += 1;
+      }
     }
     Ok(())
   }
 
-  /// The file the node at `PATHS[index]` names now: `TARGET` for a hard link, else its own path.
-  fn file_named(&self, index: usize) -> usize {
-    if self.now(index) == Kind::Hardlink {
-      LINKED
-    } else {
-      index
-    }
+  /// The home of the node at `PATHS[index]` now: a hard link's target, else its own path.
+  fn file_named(&self, index: usize) -> &str {
+    self
+      .targets
+      .get(PATHS[index])
+      .map_or(PATHS[index], String::as_str)
   }
 
   /// The class a rename of the node at `PATHS[index]` over the node at `PATHS[over]`, based at
@@ -1228,19 +1376,32 @@ impl Whole {
   }
 
   /// Records that the head version moved the node at `PATHS[index]` over `PATHS[over]`, replacing
-  /// what stood there.
+  /// what stood there: a link moved names its home from the new path, a home moved takes its
+  /// links with it, and a home replaced hands its node to its links (A-646).
   fn replaced(&mut self, index: usize, over: usize, answers: &mut Answers) {
+    let (from, to) = (PATHS[index], PATHS[over]);
     let (moved, stood) = (self.now(index), self.now(over));
     match stood {
       Kind::Absent => {}
       Kind::File => answers.over_accepted += 1,
       _ => answers.over_link += 1,
     }
+    let (followers, survivors) = (self.links_of(from), self.links_of(to));
     if stood != Kind::Absent {
       self.removed_now(over);
     }
     self.made_now(over, moved);
     self.removed_now(index);
+    self.targets.remove(to);
+    if let Some(home) = self.targets.remove(from) {
+      self.targets.insert(to.to_owned(), home);
+    }
+    if moved == Kind::File {
+      self.repoint(followers, to, answers);
+    }
+    if stood == Kind::File {
+      self.hand_over(survivors, answers);
+    }
   }
 
   /// The green whole and as the model holds it: each of `PATHS` holds the one node the model
@@ -1257,12 +1418,20 @@ impl Whole {
         "{path}: {found:?}, the model {expected:?}"
       );
     }
-    for (name, target) in &self.links {
+    for (name, kind) in &self.others {
       let found = kinds_at(&self.green, name);
-      let names = self.green.hardlink(name);
       prop_assert!(
-        found == vec![Kind::Hardlink] && names == Some(*target),
-        "{name}: {found:?} naming {names:?}"
+        found == vec![*kind],
+        "{name}: {found:?}, the model {kind:?}"
+      );
+    }
+    for (link, home) in &self.targets {
+      let (found, names) = (kinds_at(&self.green, link), self.green.hardlink(link));
+      let held = kinds_at(&self.green, home);
+      let whole = found == vec![Kind::Hardlink] && names == Some(home.as_str());
+      prop_assert!(
+        whole && matches!(held.as_slice(), [Kind::File | Kind::Special]),
+        "{link}: {found:?} naming {names:?}, the model {home} holding {held:?}"
       );
     }
     Ok(())

@@ -78,6 +78,8 @@ pub(super) const SESSIONS: &[Recorded] = &[
   recorded!("hostile-report-malformed-set-path.1"),
   recorded!("hostile-report-early-edit-response.1"),
   recorded!("hostile-report-client-refuses-the-edit.1"),
+  recorded!("hostile-update-copy-sources.1"),
+  recorded!("hostile-checkout-copy-sources.1"),
 ];
 
 /// The recorded connection named `name`.
@@ -163,6 +165,9 @@ pub(super) fn command(item: &[u8]) -> Option<(String, Vec<Value<'_>>)> {
 /// The youngest revision of `history.txt`'s repository.
 pub(super) const YOUNGEST: Revision = 6;
 
+/// The most nodes a recorded session's drive holds open: past the fixtures' deepest path.
+pub(super) const MOST_OPEN: usize = 64;
+
 /// The repository path a URL names, for the tests' own bookkeeping of the session's path.
 pub(super) fn path_of(url: &[u8]) -> String {
   let rest = &url[ROOT_URL.len()..];
@@ -215,6 +220,7 @@ pub(super) fn context<'a>(
     readable: true,
     room: client.len() * PATH_INFO_BYTES,
     item_bytes: client.len() * PARSED_ITEM_BYTES,
+    most_open: MOST_OPEN,
   }
 }
 

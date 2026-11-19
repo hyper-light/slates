@@ -10,7 +10,8 @@
 //! turn, and every cut of every report.
 
 use super::recorded::{
-  ROOT_URL, Recorded, YOUNGEST, context, items, recorded, report_command, session, value_of,
+  MOST_OPEN, ROOT_URL, Recorded, YOUNGEST, context, items, recorded, report_command, session,
+  value_of,
 };
 use super::*;
 use crate::handshake::Session;
@@ -662,6 +663,7 @@ fn trunk_context(session: &Session, room: usize) -> Context<'_> {
     readable: true,
     room,
     item_bytes: 1 << 16,
+    most_open: MOST_OPEN,
   }
 }
 

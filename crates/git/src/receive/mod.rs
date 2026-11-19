@@ -45,6 +45,11 @@
 //! every verdict has accepted, one append moves every ref or none ([`ATOMIC_TRANSACTION_FAILED`]
 //! when one moved since its verdict read it).
 //!
+//! **A protected branch's refusals** ([`protected`], A-644) are answered in git's own words:
+//! `non-fast-forward` and `deletion prohibited` as git refuses them itself, and `hook declined`
+//! after the words of what git leaves to a hook (a linear history, signed commits), relayed as git
+//! relays a hook's.
+//!
 //! **Stricter than git, by the documents' own words.** `atomic` is "Either all refs are updated or
 //! none" (gitprotocol-capabilities); git 2.50.1 still updates the other refs when one fails a check
 //! before the atomic transaction begins, and this refuses them all (main approved, 2026-11-19). The
@@ -61,9 +66,11 @@
 mod advertisement;
 mod connect;
 pub mod fsck;
+pub mod protected;
 mod report;
 mod request;
 mod session;
+pub mod works;
 
 pub use advertisement::{Advertised, write_advertisement};
 pub use connect::{Connected, connectivity};
@@ -158,6 +165,9 @@ pub trait Judge {
 pub struct Declined {
   /// Why, in git's words: the report's `ng <ref> <reason>`.
   pub reason: Vec<u8>,
+  /// What a hook wrote of it, relayed on band 2 before `message` as git relays a hook's words: in pieces of at most
+  /// [`protected::HOOK_PIECE`] bytes, as `copy_to_sideband` reads them (A-644). Empty when no hook spoke.
+  pub hook: Vec<u8>,
   /// The line git's `rp_error` sends on band 2 for it, made by [`message`], if any.
   pub message: Option<Vec<u8>>,
 }
@@ -640,6 +650,7 @@ fn verdict<J: Judge + ?Sized>(
   .concat();
   Err(Declined {
     reason: FUNNY_REFNAME.to_vec(),
+    hook: Vec::new(),
     message: Some(message(&line)),
   })
 }
@@ -648,6 +659,7 @@ fn verdict<J: Judge + ?Sized>(
 fn refused(reason: &[u8], message: Option<Vec<u8>>) -> Outcome {
   Outcome::Ng(Declined {
     reason: reason.to_vec(),
+    hook: Vec::new(),
     message,
   })
 }

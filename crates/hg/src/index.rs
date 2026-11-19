@@ -7,9 +7,12 @@
 //! ("references *always* refer to a previous entry"). Here every log is rows of one `slates-vcs` [`Index`], so the logs
 //! are immutable content tables under a tail, shared by a fork, and folded by the shared rule; nothing of a log is held
 //! anywhere else. The objects' bytes are content a push's quarantine admitted by [`HgNaming`], whose object rows (the
-//! node, its content, its kind and length) are the quarantine's, in the repository's object index.
+//! node, its content, its kind and length) [`HgIndex::commit_objects`] writes into the same index.
 //!
-//! **Rows.** Two kinds, in key spaces that never meet each other or an object row's 20-byte key:
+//! **Rows.** Three kinds, each key beginning with its kind's tag, so a key of one kind never equals a key of another,
+//! whatever a path's length (A-649; git's rows keep the same rule, `o` and `p`). A raw node is never a key here: a file
+//! log row of a 13-byte path is 20 bytes long, as a node is, so the quarantine's own `commit`, which keys an object's row
+//! by its raw id, is never run on these rows.
 //! - a log row: `L`, then the log's key (`c` the changelog, `m` the manifest log, `f`, a path and a NUL a file's log; a
 //!   path holds no NUL, so one file's rows are contiguous and sort before a longer path's), then the revision's number
 //!   big-endian, so a log's rows sort by number. Its payload: the node, the parents' numbers (none, [`NONE`], for the
@@ -18,6 +21,14 @@
 //!   Its contents: a changeset's or manifest's text, or a file revision's bytes and then its block.
 //! - a node row: `N`, the node, then the log's key: the revision's number in that log. One file node can stand in
 //!   several file logs (two paths whose first revisions hold the same bytes hash alike), so a node row names its log.
+//! - an object row: `O`, then the node. It names the object's root content, and its payload is the shared store's
+//!   object payload, the kind and the length (`slates_vcs::object_payload`), so a node's kind and size are answered
+//!   without its log.
+//! - a marker row: `M`, then the marker's number, big-endian (A-649): the repository's obsolescence markers numbered in
+//!   the order they arrived, as a log numbers its revisions, each naming a content that holds it alone in its format
+//!   (`obsmarkers`' encoding: the version byte, then the marker). A marker is a fact never changed once made, so it is
+//!   a row; the phase roots and bookmarks move with every push, and the shared index never rewrites a row, so they are
+//!   the register's, not the index's.
 //!
 //! **Appending** ([`HgIndex::append_changesets`], [`HgIndex::append_revisions`]). A group is taken in the order it
 //! arrives, as 7.2's `revlog.addgroup` takes a changegroup's \[C\]: a node the log holds already is passed over ("this
@@ -35,7 +46,10 @@
 
 use std::collections::BTreeMap;
 
-use slates_vcs::{ContentId, ContentStore, Index, IndexRefused, Naming, NewRow, RowRef};
+use slates_vcs::{
+  Batch, ContentId, ContentStore, Index, IndexRefused, Naming, NewRow, Quarantine, RowRef,
+  object_payload, object_row,
+};
 
 use crate::node::{self, CollisionAttack};
 use crate::{NODE_LEN, NULL_NODE, Node};
@@ -57,6 +71,12 @@ const LOG_ROW: u8 = b'L';
 
 /// Format: the first byte of a node row's key.
 const NODE_ROW: u8 = b'N';
+
+/// Format: the first byte of an object row's key, which the node follows.
+const OBJECT_ROW: u8 = b'O';
+
+/// Format: the first byte of a marker row's key, which the marker's number follows, big-endian.
+const MARKER_ROW: u8 = b'M';
 
 /// Format: the changelog's log key.
 const CHANGELOG_KEY: u8 = b'c';
@@ -238,6 +258,11 @@ pub enum Refused {
   LogFull,
   /// The shared index refused (its budget, or a row it holds that differs).
   Index(IndexRefused),
+  /// An object whose id is not a node's twenty bytes.
+  NotANode {
+    /// The id's length.
+    len: u64,
+  },
 }
 
 impl From<IndexRefused> for Refused {
@@ -339,6 +364,90 @@ impl HgIndex {
     self.rows.release(store)
   }
 
+  /// Commits a push's admitted objects as object rows (`O`, the node) in one batch, then gives back the quarantine's
+  /// holds, leaving it empty: the rows hold the contents now. Each id must be a node. Refused, nothing is written and
+  /// the quarantine keeps every object, for its caller to abandon.
+  pub fn commit_objects(
+    &mut self,
+    store: &mut ContentStore,
+    quarantine: &mut Quarantine,
+  ) -> Result<Batch, Refused> {
+    let mut keys = Vec::with_capacity(quarantine.len());
+    let mut bodies = Vec::with_capacity(quarantine.len());
+    for (id, kind, content, len) in quarantine.objects() {
+      let node = <[u8; NODE_LEN]>::try_from(id).map_err(|_| Refused::NotANode {
+        len: crate::read::to_u64(id.len()),
+      })?;
+      keys.push(object_key(&node));
+      bodies.push(([content], object_payload(kind, len)));
+    }
+    let rows: Vec<NewRow<'_>> = keys
+      .iter()
+      .zip(&bodies)
+      .map(|(key, (contents, payload))| NewRow {
+        key,
+        contents,
+        payload,
+      })
+      .collect();
+    let batch = self.rows.insert_all(store, &rows)?;
+    quarantine
+      .abandon(store)
+      .map_err(|refused| Refused::Index(IndexRefused::Content(refused)))?;
+    Ok(batch)
+  }
+
+  /// The object row of `node`: its kind, its length and its root content, if the index holds one.
+  pub fn object(&self, store: &ContentStore, node: &Node) -> Option<(u8, u64, ContentId)> {
+    object_row(&self.rows.get(store, &object_key(node))?)
+  }
+
+  /// Appends obsolescence markers in the order they arrived, each a content holding it alone in its format, numbered
+  /// after the markers the index holds; their numbers. One batch: refused, nothing is written.
+  pub fn append_markers(
+    &mut self,
+    store: &mut ContentStore,
+    markers: &[ContentId],
+  ) -> Result<Vec<u64>, Refused> {
+    let first = self.markers_len(store);
+    let mut numbers = Vec::with_capacity(markers.len());
+    for offset in 0..markers.len() {
+      let number = first
+        .checked_add(crate::read::to_u64(offset))
+        .filter(|number| *number != u64::MAX)
+        .ok_or(Refused::LogFull)?;
+      numbers.push(number);
+    }
+    let keys: Vec<Vec<u8>> = numbers.iter().map(|number| marker_key(*number)).collect();
+    let contents: Vec<[ContentId; 1]> = markers.iter().map(|marker| [*marker]).collect();
+    let rows: Vec<NewRow<'_>> = keys
+      .iter()
+      .zip(&contents)
+      .map(|(key, contents)| NewRow {
+        key,
+        contents,
+        payload: &[],
+      })
+      .collect();
+    self.rows.insert_all(store, &rows)?;
+    Ok(numbers)
+  }
+
+  /// How many markers the index holds: the first number with no row.
+  pub fn markers_len(&self, store: &ContentStore) -> u64 {
+    first_missing(u64::MAX, |number| {
+      self.rows.get(store, &marker_key(number)).is_some()
+    })
+  }
+
+  /// The content of the marker numbered `number`: the marker alone in its format.
+  pub fn marker(&self, store: &ContentStore, number: u64) -> Option<ContentId> {
+    let row = self.rows.get(store, &marker_key(number))?;
+    let mut contents = row.contents();
+    let marker = contents.next()?;
+    contents.next().is_none().then_some(marker)
+  }
+
   /// The number `node` has in `log`, if the log holds it.
   pub fn rev(&self, store: &ContentStore, log: Log<'_>, node: &Node) -> Option<u32> {
     let row = self.rows.get(store, &log.node_key(node))?;
@@ -346,26 +455,12 @@ impl HgIndex {
     Some(u32::from_le_bytes(bytes))
   }
 
-  /// How many revisions `log` holds: the first number with no row, found by doubling and then halving.
+  /// How many revisions `log` holds: the first number with no row.
   pub fn len(&self, store: &ContentStore, log: Log<'_>) -> u32 {
-    let held = |rev: u32| rev != NONE && self.rows.get(store, &log.row_key(rev)).is_some();
-    if !held(0) {
-      return 0;
-    }
-    let (mut low, mut high) = (0_u32, 1_u32);
-    while held(high) {
-      low = high;
-      high = high.checked_mul(2).unwrap_or(NONE);
-    }
-    while high.saturating_sub(low) > 1 {
-      let middle = low.saturating_add(high.saturating_sub(low) / 2);
-      if held(middle) {
-        low = middle;
-      } else {
-        high = middle;
-      }
-    }
-    high
+    let held = |rev: u64| {
+      u32::try_from(rev).is_ok_and(|rev| self.rows.get(store, &log.row_key(rev)).is_some())
+    };
+    u32::try_from(first_missing(u64::from(NONE), held)).unwrap_or(NONE)
   }
 
   /// Whether `log` holds no revision.
@@ -558,6 +653,46 @@ impl<'i> Planner<'i> {
     self.revs.push(rev);
     Ok(Some((rev, p1, p2)))
   }
+}
+
+/// The first number with no row among numbers held from 0 without a gap, none at `ceiling` or past it: found by
+/// doubling, then halving, in twice the logarithm of the count lookups.
+fn first_missing(ceiling: u64, held: impl Fn(u64) -> bool) -> u64 {
+  if !held(0) {
+    return 0;
+  }
+  let (mut low, mut high) = (0_u64, 1_u64);
+  while high < ceiling && held(high) {
+    low = high;
+    high = high
+      .checked_mul(2)
+      .map_or(ceiling, |doubled| doubled.min(ceiling));
+  }
+  while high.saturating_sub(low) > 1 {
+    let middle = low.saturating_add(high.saturating_sub(low) / 2);
+    if held(middle) {
+      low = middle;
+    } else {
+      high = middle;
+    }
+  }
+  high
+}
+
+/// The key of the marker numbered `number`.
+fn marker_key(number: u64) -> Vec<u8> {
+  let mut key = Vec::with_capacity(core::mem::size_of::<u64>().saturating_add(1));
+  key.push(MARKER_ROW);
+  key.extend_from_slice(&number.to_be_bytes());
+  key
+}
+
+/// The key of `node`'s object row.
+fn object_key(node: &Node) -> Vec<u8> {
+  let mut key = Vec::with_capacity(NODE_LEN.saturating_add(1));
+  key.push(OBJECT_ROW);
+  key.extend_from_slice(node);
+  key
 }
 
 /// A log row's payload's common part.

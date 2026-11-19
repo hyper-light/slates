@@ -878,3 +878,70 @@ pub(crate) mod import {
     find(name).unwrap_or_else(|| panic!("no import fixture {name}"))
   }
 }
+
+/// The state's golden vectors (A-649 part 2): one history with phases, bookmarks and obsolescence markers stored by
+/// stock 7.2 in two repositories (`states`, bookmarks in `.hg/bookmarks`; `states-store`, bookmarks in the store), each
+/// store whole with its requirements, `.hg/bookmarks` where it is kept there, and 7.2's own listings of every changeset's
+/// phase, every bookmark and every marker, as `fixtures/state/make-state-fixtures.sh` wrote them (its header names the
+/// run), compiled in by name.
+pub(crate) mod state {
+  /// Lists each file's name with its bytes.
+  macro_rules! stored {
+    ($($name:literal),* $(,)?) => {
+      /// Every file, by its name.
+      const FILES: &[(&str, &[u8])] = &[$(($name, include_bytes!(concat!("../../fixtures/state/", $name)))),*];
+    };
+  }
+
+  stored![
+    "states-bookmarks",
+    "states-bookmarks.txt",
+    "states-files.txt",
+    "states-hg-requires.txt",
+    "states-markers.txt",
+    "states-phases.txt",
+    "states-requires.txt",
+    "states-store-bookmarks.txt",
+    "states-store-files.txt",
+    "states-store-hg-requires.txt",
+    "states-store-markers.txt",
+    "states-store-phases.txt",
+    "states-store-requires.txt",
+    "states-store/00changelog.d",
+    "states-store/00changelog.i",
+    "states-store/00manifest.i",
+    "states-store/bookmarks",
+    "states-store/data/a.i",
+    "states-store/data/b.i",
+    "states-store/data/c.i",
+    "states-store/data/d.i",
+    "states-store/fncache",
+    "states-store/obsstore",
+    "states-store/phaseroots",
+    "states-store/requires",
+    "states/00changelog.d",
+    "states/00changelog.i",
+    "states/00manifest.i",
+    "states/data/a.i",
+    "states/data/b.i",
+    "states/data/c.i",
+    "states/data/d.i",
+    "states/fncache",
+    "states/obsstore",
+    "states/phaseroots",
+    "states/requires",
+  ];
+
+  /// The file named `name`, if there is one.
+  pub(crate) fn find(name: &str) -> Option<&'static [u8]> {
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
+  }
+
+  /// The file named `name`.
+  pub(crate) fn file(name: &str) -> &'static [u8] {
+    find(name).unwrap_or_else(|| panic!("no state fixture {name}"))
+  }
+}
