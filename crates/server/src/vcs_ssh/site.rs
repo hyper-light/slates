@@ -108,6 +108,9 @@ pub(crate) trait SshSite {
   type Command: Command;
   /// The lookup for one connection.
   fn keys(&mut self) -> Self::Keys;
+  /// Who holds `key` (its blob `blob`) for `user`, when the connection's lookup could not say yet
+  /// (`Holding::Unknown`): the record's answer, looked up where the record lives (A-651 part 3).
+  async fn lookup(&mut self, user: &[u8], key: &UserKey, blob: &[u8]) -> Holding<Principal>;
   /// Dispatches `command` for `principal`, with the `GIT_PROTOCOL` value sent before it.
   fn dispatch(
     &mut self,
@@ -404,6 +407,12 @@ where
 
   fn keys(&mut self) -> K {
     self.keys.clone()
+  }
+
+  /// Nobody, counted, until the credentials record lands: [`NoKeyRecord`] never asks, so this is not reached yet.
+  async fn lookup(&mut self, _user: &[u8], _key: &UserKey, _blob: &[u8]) -> Holding<Principal> {
+    crate::fleet::count_refusal(NO_KEY_RECORD);
+    Holding::Nobody
   }
 
   fn dispatch(
