@@ -1214,18 +1214,39 @@ pub enum MountFault {
     /// Why taking the mount down again failed.
     unmount: Box<MountFault>,
   },
-  /// The OS program that removes a mount (`umount`, `fusermount3 -u`) could not run, or refused: the path is still
-  /// in use, or nothing is mounted there.
+  /// The OS refused the unmount and the mount stays: on macOS and the BSDs `unmount(2)`'s error number (A-507); on
+  /// Linux the exit code of `fusermount3 -u`, or the error number of starting it.
   Unmount {
     /// The mount point.
     path: String,
-    /// The program's exit code, when it ran and exited.
+    /// The helper's exit code, when it ran and exited (Linux).
     status: Option<i32>,
-    /// The OS error number of starting it, when it could not run.
+    /// The OS error number: the unmount call's (macOS and the BSDs), or starting the helper's (Linux).
     errno: Option<i32>,
   },
-  /// No volume that reported its mounts is mounted at the path (Windows, where a drive is the daemon's own and is
-  /// removed by detaching its attachment): the volumes that could not report theirs.
+  /// The mount is busy and stays (`EBUSY`, A-507): a process holds a reference to a file on it, an open file or a
+  /// working directory there (`unmount(2)`). End that process, or let go of the mount anyway with
+  /// [`crate::mount::unmount_busy`].
+  Busy {
+    /// The mount point.
+    path: String,
+  },
+  /// The unmount answered done, but the kernel's mount table still lists the mount (A-507): an unmount is believed
+  /// only when the table agrees.
+  StillMounted {
+    /// The mount point.
+    path: String,
+  },
+  /// The kernel's mount table could not be read (A-507), so the unmount could not be judged: the mount may remain.
+  MountTable {
+    /// The mount point.
+    path: String,
+    /// The OS error number, when the kernel gave one.
+    errno: Option<i32>,
+  },
+  /// Nothing is mounted at the path: on macOS and Linux the kernel's mount table lists no mount there (A-507); on
+  /// Windows, where a drive is the daemon's own and is removed by detaching its attachment, no volume that reported its
+  /// mounts is mounted there, and the volumes that could not report theirs are named.
   NotMounted {
     /// The path asked.
     path: String,
@@ -1350,12 +1371,22 @@ impl fmt::Display for MountFault {
           f,
           "unmounting {path} failed (exit {status}); is the path still in use?"
         ),
-        (None, errno) => write!(
-          f,
-          "unmounting {path}: the unmount program could not run: {}",
-          errno_text(*errno)
-        ),
+        (None, errno) => write!(f, "unmounting {path} was refused: {}", errno_text(*errno)),
       },
+      Self::Busy { path } => write!(
+        f,
+        "{path} is busy: a process holds a file open on it or its working directory there; end it, or let go of \
+         the mount anyway (`slates_api::mount::unmount_busy`)"
+      ),
+      Self::StillMounted { path } => write!(
+        f,
+        "the unmount of {path} answered done, but the kernel's mount table still lists it"
+      ),
+      Self::MountTable { path, errno } => write!(
+        f,
+        "the kernel's mount table could not be read to judge the unmount of {path}: {}",
+        errno_text(*errno)
+      ),
       Self::NotMounted { path, unreported } if unreported.is_empty() => {
         write!(f, "no slates volume is mounted at {path}")
       }

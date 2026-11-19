@@ -1066,6 +1066,14 @@
 >   a busy unmount of a path where nothing is mounted is refused with the program's status, on each OS. By use, with a
 >   kernel mount: `a_busy_mount_is_let_go_of_the_oss_way` (`crates/api/tests/api.rs`, run with `SLATES_TEST_MOUNT=1`,
 >   filed for main's run);
+> - **an unmount with no program and no `PATH`, fixed 2026-11-18 (A-507, `CONTRACT` = 42; g264's kiln runner, whose
+>   `PATH` lacked `/sbin`):** `mount::unmount` and `unmount_busy` ran `umount`/`umount -f` by name, so that runner could
+>   take no mount down. macOS and the BSDs now call `unmount(2)` (`MNT_FORCE` for the busy one), and every Unix host
+>   judges an unmount by the kernel's mount table: nothing mounted at the path is `NotMounted` before any call,
+>   `EBUSY` is `MountFault::Busy`, and the table still listing the mount after a call that said done is
+>   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`). Owed:
+>   naming the processes that hold a busy mount; Linux's busy refusal typed (`fusermount3` reports no error number);
+>   the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
 > - built 2026-11-18: the serving clause's DAX half through the library: the Shards stream end `serve_shards` hands
 >   keeps a `dax=inode` guest's `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` at `INIT`, with the host's page as the
 >   alignment, and marks a file of a DAX range or more `FUSE_ATTR_DAX` and a small one not

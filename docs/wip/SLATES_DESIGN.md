@@ -8993,6 +8993,13 @@ it builds against the contract and adds to it rather than around it.
 > not let WinFsp's driver make a mount's drive (`MountUseMountmgrFromFSD`, A-369), by the driver's own rule over the
 > value it reads at every mount. Until then such a machine was told it could mount, and each mount was refused
 > `MountManagerNotAllowed` after the host had made the volume it was for (kiln's bare-metal starts).
+> **`CONTRACT` = 42 (A-507):** an unmount runs no program on macOS and the BSDs and is judged by the kernel's mount
+> table. `mount::unmount` and `mount::unmount_busy` call `unmount(2)` there (`MNT_FORCE` for the busy one); until then
+> they ran `umount` found on the `PATH`, so a kiln runner whose `PATH` lacked `/sbin` could not unmount, and kiln kept
+> the volume (g264). A path the table lists no mount at is `MountFault::NotMounted` before any call; `EBUSY` is
+> `MountFault::Busy`; a call that said done while the table still lists the mount is `MountFault::StillMounted`; a
+> table that could not be read is `MountFault::MountTable`. Linux keeps `fusermount3 -u`, the setuid helper its FUSE
+> mount is made through (`umount2(2)` needs `CAP_SYS_ADMIN`), under the same table judgment.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -33125,3 +33132,35 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 Applied in the same change to: §4.8 "Lookup" (the owner location status) and learners, A-489's owed item, GAPS (the
 location test's entry), `crates/server/src/{owner_location,fleet,verbs}.rs`, and the bug record
 `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
+
+### A-507 — An unmount runs no program on macOS and the BSDs and is believed only when the kernel's mount table agrees (2026-11-18, UI goal 85 via g071, found by g264 on a kiln runner; §4.6; `CONTRACT` = 42)
+- **The bug.** `mount::unmount` and `mount::unmount_busy` ran `umount` and `umount -f` found on the `PATH`. A kiln
+  runner's `PATH` held only `/usr/bin` and `/bin`, so `/sbin/umount` was never found: no mount could be taken down, and
+  kiln (which then destroyed the volume anyway) now keeps it instead (g264's 6e1d95f32).
+- **The rule.** macOS and the BSDs call `unmount(2)` itself, `MNT_FORCE` for the busy one ("forcibly unmounted even if
+  files are still active", `man 2 unmount`): no program, no `PATH`, and no privilege, since only "the caller is not the
+  super-user, and the mount() was not done by the user" is refused `EPERM`. Linux keeps `fusermount3 -u` (`-z` for the
+  busy one), the setuid helper its FUSE mount is made through: `umount2(2)` "requires appropriate privilege (Linux: the
+  `CAP_SYS_ADMIN` capability)" (man7.org, umount(2)), so an unprivileged caller's own call is refused `EPERM`.
+- **Judged by the table.** Before the call the mount at the path is found in the kernel's table
+  (`slates_bridge_oci::mount_table`: `getfsstat(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo` on Linux, neither touching
+  a mount), the last listed there, since a later mount shadows an earlier one; none there is `NotMounted` and no call is
+  made. After it, the unmount is done only once that mount's identity is gone from the table: still listed, it is the
+  call's refusal, or `StillMounted` when the call said done. The path's entry is named without touching the mount (the
+  parent's real path with its name), since a lookup on a `hard` NFS mount whose daemon has gone waits forever.
+- **Typed refusals.** `unmount(2)`'s error numbers as its man page gives them: `EBUSY` ("a process is holding a
+  reference to a file located on the filesystem") is `Busy`, naming `unmount_busy` as the way to let go; `EINVAL`
+  ("the requested directory is not in the mount table") is `NotMounted`; `ENOENT` and `ENOTDIR` are `MountPoint`; any
+  other is `Unmount` with its number. A path no call can name (a NUL byte) is `MountPoint`, never a panic.
+- **Tests.** `crates/api/src/mount.rs`: `an_unmount_is_asked_as_the_os_takes_it`,
+  `the_kernels_unmount_refusals_are_typed`, `an_unmount_is_believed_only_when_the_table_agrees`, and
+  `an_unmount_of_a_path_where_nothing_is_mounted_is_refused_not_mounted` (the host's own table, no call made);
+  `a_busy_mount_is_let_go_of_the_oss_way` (`crates/api/tests/api.rs`, a kernel mount) takes `Busy` on macOS.
+- **Owed.** Naming the processes that hold a busy mount (libproc's `proc_listpidspath` on macOS, `/proc` on Linux);
+  Linux's busy `fusermount3 -u` stays `Unmount` with its exit, since the helper reports no error number.
+
+Applied in the same change to: §4.6's contract log (`CONTRACT` = 42), GAPS (the library's mount entry), `docs/bugs/`
+(a record), `docs/library.md`, `crates/api/src/mount.rs`, `crates/api/src/error.rs` (`MountFault::Busy`,
+`StillMounted`, `MountTable`; `Unmount` and `NotMounted` restated), `crates/api/src/lib.rs` (`CONTRACT` = 42),
+`crates/api/Cargo.toml` and `Cargo.lock` (`slates-bridge-oci` on Unix), `crates/api/tests/api.rs`, and
+`crates/cli/src/verbs.rs` (a doc line).
