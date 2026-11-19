@@ -412,10 +412,12 @@ impl HgPolicy {
   ) -> Verdict {
     let speaking = self.speaking(namespace, name, principal, right);
     let first = |effect: Effect| {
-      speaking
-        .iter()
-        .copied()
-        .find(|&position| self.rules.get(position).is_some_and(|rule| rule.effect == effect))
+      speaking.iter().copied().find(|&position| {
+        self
+          .rules
+          .get(position)
+          .is_some_and(|rule| rule.effect == effect)
+      })
     };
     if let Some(rule) = first(Effect::Deny) {
       return Verdict::Denied { rule };
@@ -654,8 +656,8 @@ mod tests {
   use slates_db::HostId;
 
   use super::{
-    Effect, Entry, GitPolicy, HgPattern, HgPolicy, Namespace, PathPattern, PatternRefused, Principal,
-    RefPattern, Right, Rule, SvnPolicy, Verdict, Who,
+    Effect, Entry, GitPolicy, HgPattern, HgPolicy, Namespace, PathPattern, PatternRefused,
+    Principal, RefPattern, Right, Rule, SvnPolicy, Verdict, Who,
   };
   use crate::wildmatch::reference;
 
@@ -714,8 +716,16 @@ mod tests {
       ("refs/heads/mas", "refs/heads/master", false),
       ("refs/heads/", "refs/heads/main", true),
       ("refs/heads/release/*", "refs/heads/release/1.0", true),
-      ("refs/heads/release/*", "refs/heads/release/1.0/hotfix", false),
-      ("refs/heads/release/**", "refs/heads/release/1.0/hotfix", true),
+      (
+        "refs/heads/release/*",
+        "refs/heads/release/1.0/hotfix",
+        false,
+      ),
+      (
+        "refs/heads/release/**",
+        "refs/heads/release/1.0/hotfix",
+        true,
+      ),
       ("refs/tags/v[0-9]*", "refs/tags/v1.2", true),
       ("refs/tags/v[0-9]*", "refs/tags/vx", false),
     ];
@@ -792,12 +802,32 @@ mod tests {
   fn acls_documented_example_reads_as_acl_reads_it() {
     let branch = |name: &str| HgPattern::parse(Namespace::Branch, name).unwrap();
     let policy = HgPolicy::new(vec![
-      rule(branch("frozen-branch"), Right::Submit, Effect::Deny, Who::Anyone),
+      rule(
+        branch("frozen-branch"),
+        Right::Submit,
+        Effect::Deny,
+        Who::Anyone,
+      ),
       rule(branch("*"), Right::Submit, Effect::Deny, only(&[BAD])),
-      rule(branch("branch-a"), Right::Submit, Effect::Allow, only(&[USER_1, USER_2, USER_3])),
-      rule(branch("branch-b"), Right::Submit, Effect::Allow, only(&[USER_1])),
+      rule(
+        branch("branch-a"),
+        Right::Submit,
+        Effect::Allow,
+        only(&[USER_1, USER_2, USER_3]),
+      ),
+      rule(
+        branch("branch-b"),
+        Right::Submit,
+        Effect::Allow,
+        only(&[USER_1]),
+      ),
       rule(branch("*"), Right::Submit, Effect::Allow, only(&[SUPER])),
-      rule(branch("branch-for-tests"), Right::Submit, Effect::Allow, Who::Anyone),
+      rule(
+        branch("branch-for-tests"),
+        Right::Submit,
+        Effect::Allow,
+        Who::Anyone,
+      ),
     ]);
     let ask = |name: &str, uid: u32| {
       policy.verdict(Namespace::Branch, name, &principal(uid), Right::Submit)
@@ -811,7 +841,12 @@ mod tests {
     assert_eq!(ask("branch-for-tests", OTHER), Verdict::Allowed { rule: 5 });
     assert_eq!(ask("default", OTHER), Verdict::NotListed);
     assert_eq!(
-      policy.verdict(Namespace::Bookmark, "default", &principal(OTHER), Right::Submit),
+      policy.verdict(
+        Namespace::Bookmark,
+        "default",
+        &principal(OTHER),
+        Right::Submit
+      ),
       Verdict::Unruled
     );
   }
@@ -866,7 +901,10 @@ mod tests {
       svn(&[("/trunk/secret", Effect::Deny), ("/trunk", Effect::Allow)]),
     ] {
       let ask = |path: &str| policy.verdict(path.as_bytes(), &anyone, Right::Submit);
-      assert!(matches!(ask("/trunk/secret/plans.txt"), Verdict::Denied { .. }));
+      assert!(matches!(
+        ask("/trunk/secret/plans.txt"),
+        Verdict::Denied { .. }
+      ));
       assert!(matches!(ask("/trunk/secret"), Verdict::Denied { .. }));
       assert!(matches!(ask("/trunk/src/main.c"), Verdict::Allowed { .. }));
       assert!(matches!(ask("//trunk//src/"), Verdict::Allowed { .. }));
@@ -883,7 +921,10 @@ mod tests {
   #[test]
   fn at_one_depth_the_subversion_rule_defined_last_decides_and_a_double_star_reaches_deeper() {
     let anyone = principal(OTHER);
-    let eclipsed = svn(&[("/trunk/a", Effect::Deny), (":glob:/trunk/**", Effect::Allow)]);
+    let eclipsed = svn(&[
+      ("/trunk/a", Effect::Deny),
+      (":glob:/trunk/**", Effect::Allow),
+    ]);
     assert_eq!(
       eclipsed.verdict(b"/trunk/a", &anyone, Right::Submit),
       Verdict::Allowed { rule: 1 }
@@ -892,7 +933,10 @@ mod tests {
       eclipsed.verdict(b"/trunk", &anyone, Right::Submit),
       Verdict::Allowed { rule: 1 }
     );
-    let not_eclipsed = svn(&[(":glob:/trunk/**", Effect::Allow), ("/trunk/a", Effect::Deny)]);
+    let not_eclipsed = svn(&[
+      (":glob:/trunk/**", Effect::Allow),
+      ("/trunk/a", Effect::Deny),
+    ]);
     assert_eq!(
       not_eclipsed.verdict(b"/trunk/a", &anyone, Right::Submit),
       Verdict::Denied { rule: 1 }
@@ -912,7 +956,12 @@ mod tests {
     let anyone = principal(OTHER);
     for pattern in [":glob:/*/**/*", ":glob:/**/*/*", ":glob:/*/*/**"] {
       let policy = svn(&[(pattern, Effect::Allow)]);
-      for (path, covered) in [("/a", false), ("/a/b", true), ("/a/b/c", true), ("/a/b/c/d", true)] {
+      for (path, covered) in [
+        ("/a", false),
+        ("/a/b", true),
+        ("/a/b/c", true),
+        ("/a/b/c/d", true),
+      ] {
         assert_eq!(
           policy.verdict(path.as_bytes(), &anyone, Right::Submit) != Verdict::Unruled,
           covered,
@@ -945,7 +994,10 @@ mod tests {
       HgPattern::parse(Namespace::Bookmark, "a\0b"),
       Err(PatternRefused::HoldsNul)
     );
-    assert_eq!(PathPattern::parse("trunk"), Err(PatternRefused::NotAbsolute));
+    assert_eq!(
+      PathPattern::parse("trunk"),
+      Err(PatternRefused::NotAbsolute)
+    );
     assert_eq!(
       PathPattern::parse(":glob:trunk/**"),
       Err(PatternRefused::NotAbsolute)
@@ -983,7 +1035,12 @@ mod tests {
 
   /// A generated right.
   fn right() -> impl Strategy<Value = Right> {
-    prop::sample::select(vec![Right::Read, Right::Submit, Right::Rewrite, Right::Delete])
+    prop::sample::select(vec![
+      Right::Read,
+      Right::Submit,
+      Right::Rewrite,
+      Right::Delete,
+    ])
   }
 
   /// A generated effect.
@@ -1028,8 +1085,8 @@ mod tests {
   ) -> Verdict {
     let mut verdict = Verdict::Unruled;
     for (position, (pattern, right, effect, who)) in rules.iter().enumerate() {
-      let covers = oracle_literal(pattern.as_bytes(), name)
-        || reference::wildmatch(pattern.as_bytes(), name);
+      let covers =
+        oracle_literal(pattern.as_bytes(), name) || reference::wildmatch(pattern.as_bytes(), name);
       if covers && *right == asked && who.names(asker) {
         verdict = match effect {
           Effect::Allow => Verdict::Allowed { rule: position },
@@ -1068,11 +1125,9 @@ mod tests {
         return Verdict::Denied { rule: position };
       }
     }
-    let listed = rules
-      .iter()
-      .any(|(namespace, _, right, effect, _)| {
-        *namespace == asked_in && *right == asked && *effect == Effect::Allow
-      });
+    let listed = rules.iter().any(|(namespace, _, right, effect, _)| {
+      *namespace == asked_in && *right == asked && *effect == Effect::Allow
+    });
     if !listed {
       return Verdict::Unruled;
     }
@@ -1149,7 +1204,9 @@ mod tests {
         .rev()
         .find(|&depth| oracle_segments(&pattern, &path[..depth]));
       if let Some(depth) = deepest {
-        if best.is_none_or(|(best_depth, best_position, _)| (depth, position) > (best_depth, best_position)) {
+        if best.is_none_or(|(best_depth, best_position, _)| {
+          (depth, position) > (best_depth, best_position)
+        }) {
           best = Some((depth, position, *effect));
         }
       }

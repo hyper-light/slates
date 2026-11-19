@@ -130,7 +130,10 @@ fn run(text: &[u8], from: &[bool], to: &mut [bool], crosses_slash: bool) {
   let mut carried = false;
   for (at, slot) in to.iter_mut().enumerate() {
     *slot = carried || from.get(at).copied().unwrap_or(false);
-    carried = *slot && text.get(at).is_some_and(|&byte| crosses_slash || byte != b'/');
+    carried = *slot
+      && text
+        .get(at)
+        .is_some_and(|&byte| crosses_slash || byte != b'/');
   }
 }
 
@@ -162,9 +165,9 @@ fn escaped(pattern: &[u8], at: usize) -> (Token, usize) {
 /// The stars from `at`: one is [`Token::Run`]; two or more (any more are the same) are read by where they stand, as
 /// `dowild` reads them with `WM_PATHNAME` (the module doc).
 fn stars(pattern: &[u8], at: usize) -> (Token, usize) {
-  let count = pattern
-    .get(at..)
-    .map_or(0, |rest| rest.iter().take_while(|&&byte| byte == b'*').count());
+  let count = pattern.get(at..).map_or(0, |rest| {
+    rest.iter().take_while(|&&byte| byte == b'*').count()
+  });
   let end = at.saturating_add(count);
   if pattern.get(at.saturating_add(1)) != Some(&b'*') {
     return (Token::Run, end);
@@ -263,7 +266,10 @@ fn range(pattern: &[u8], at: usize, low: u8, set: &mut ByteSet) -> Option<Member
 /// that `]` do not end in `:`, a plain `[` member (`dowild`: "Didn't find ":]", so treat like a normal set").
 fn class(pattern: &[u8], open: usize, set: &mut ByteSet) -> Option<Member> {
   let name_start = open.saturating_add(2);
-  let offset = pattern.get(name_start..)?.iter().position(|&byte| byte == b']')?;
+  let offset = pattern
+    .get(name_start..)?
+    .iter()
+    .position(|&byte| byte == b']')?;
   let close = name_start.saturating_add(offset);
   let colon = close
     .checked_sub(1)
@@ -614,7 +620,11 @@ pub(crate) mod reference {
           *t += 1;
         }
         if t_ch != p_ch {
-          return Some(if match_slash { ABORT_ALL } else { ABORT_TO_STARSTAR });
+          return Some(if match_slash {
+            ABORT_ALL
+          } else {
+            ABORT_TO_STARSTAR
+          });
         }
       }
       let matched = dowild(pat, *p, text, *t);
@@ -985,7 +995,9 @@ mod tests {
 
   /// The bytes generated texts are made of.
   fn text_byte() -> impl Strategy<Value = u8> {
-    prop::sample::select(vec![b'a', b'b', b'/', b'1', b'-', b']', b'[', b'\\', b':', b'!'])
+    prop::sample::select(vec![
+      b'a', b'b', b'/', b'1', b'-', b']', b'[', b'\\', b':', b'!',
+    ])
   }
 
   proptest! {

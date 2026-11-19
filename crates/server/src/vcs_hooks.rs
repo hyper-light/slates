@@ -130,7 +130,9 @@ impl HookPoint {
   /// The streams its words come from.
   pub(crate) fn words_from(self) -> WordsFrom {
     match self {
-      Self::SvnPreCommit | Self::SvnPreRevpropChange | Self::SvnPostCommit => WordsFrom::ErrorStream,
+      Self::SvnPreCommit | Self::SvnPreRevpropChange | Self::SvnPostCommit => {
+        WordsFrom::ErrorStream
+      }
       _ => WordsFrom::BothStreams,
     }
   }
@@ -218,7 +220,12 @@ fn push_option_env(options: Option<&[Vec<u8>]>) -> Vec<(String, EnvValue)> {
   let mut env: Vec<(String, EnvValue)> = options
     .iter()
     .enumerate()
-    .map(|(at, option)| (format!("GIT_PUSH_OPTION_{at}"), EnvValue::Bytes(option.clone())))
+    .map(|(at, option)| {
+      (
+        format!("GIT_PUSH_OPTION_{at}"),
+        EnvValue::Bytes(option.clone()),
+      )
+    })
     .collect();
   env.push((
     "GIT_PUSH_OPTION_COUNT".to_owned(),
@@ -290,7 +297,11 @@ const HG_SOURCE_SERVE: &str = "serve";
 
 /// The `HG_*` environment a Mercurial hook reads for a changegroup: its type and configured name, the changesets and
 /// where they came from.
-fn changegroup_env(point: HookPoint, hook_name: &str, changes: &Changegroup) -> Vec<(String, EnvValue)> {
+fn changegroup_env(
+  point: HookPoint,
+  hook_name: &str,
+  changes: &Changegroup,
+) -> Vec<(String, EnvValue)> {
   let bytes = |text: &str| EnvValue::Bytes(text.as_bytes().to_vec());
   vec![
     ("HG_HOOKTYPE".to_owned(), bytes(point.name())),
@@ -322,7 +333,11 @@ pub(crate) fn hg_pretxnchangegroup(
 
 /// Mercurial's `changegroup`, the hook configured as `hook_name`: the changegroup's environment, over the committed
 /// version.
-pub(crate) fn hg_changegroup(view: CommittedView, hook_name: &str, changes: &Changegroup) -> HookInput {
+pub(crate) fn hg_changegroup(
+  view: CommittedView,
+  hook_name: &str,
+  changes: &Changegroup,
+) -> HookInput {
   HookInput {
     point: HookPoint::HgChangegroup,
     args: Vec::new(),
@@ -359,7 +374,10 @@ pub(crate) fn svn_pre_commit(
   stdin.push(b'\n');
   HookInput {
     point: HookPoint::SvnPreCommit,
-    args: vec![repository.as_bytes().to_vec(), transaction.as_bytes().to_vec()],
+    args: vec![
+      repository.as_bytes().to_vec(),
+      transaction.as_bytes().to_vec(),
+    ],
     env: Vec::new(),
     stdin,
     view: View::Pending(view),
@@ -753,7 +771,11 @@ impl HookRun {
         self.output_open = false;
         self.finish_exit(status, false)
       }
-      Event::Timer { now_ns } if self.deadline_ns().is_some_and(|deadline| now_ns >= deadline) => {
+      Event::Timer { now_ns }
+        if self
+          .deadline_ns()
+          .is_some_and(|deadline| now_ns >= deadline) =>
+      {
         self.finish_exit(status, true)
       }
       Event::ClientLeft => self.finish(Outcome::Abandoned, true),
@@ -811,10 +833,10 @@ mod tests {
   use proptest::prelude::*;
 
   use super::{
-    Changegroup, CommittedView, EnvValue, Event, ExitStatus, HookPoint, HookRun, HookTimes, LockToken,
-    Outcome, PendingView, Phase, RefUpdate, RevpropAction, StartRefused, Step, Unconfigured, View,
-    Words, WordsFrom, git_post_receive, git_pre_receive, git_update, hg_changegroup,
-    hg_pretxnchangegroup, svn_post_commit, svn_pre_commit, svn_pre_revprop_change,
+    Changegroup, CommittedView, EnvValue, Event, ExitStatus, HookPoint, HookRun, HookTimes,
+    LockToken, Outcome, PendingView, Phase, RefUpdate, RevpropAction, StartRefused, Step,
+    Unconfigured, View, Words, WordsFrom, git_post_receive, git_pre_receive, git_update,
+    hg_changegroup, hg_pretxnchangegroup, svn_post_commit, svn_pre_commit, svn_pre_revprop_change,
   };
   use crate::daemon::LIVENESS_BUDGET_NS;
 
@@ -833,7 +855,12 @@ mod tests {
     for _ in 0..8 {
       let (mut run, _) = HookRun::started(START_NS, &times, CAP);
       let step = run.on(Event::OutputEnded, &mut times);
-      assert_eq!(step, Step::Wait { wake_at_ns: run.deadline_ns() });
+      assert_eq!(
+        step,
+        Step::Wait {
+          wake_at_ns: run.deadline_ns()
+        }
+      );
       run.on(
         Event::Exited {
           status: ExitStatus::Code(0),
@@ -861,14 +888,54 @@ mod tests {
   #[test]
   fn every_point_is_its_tools_own() {
     let points = [
-      (HookPoint::GitPreReceive, Phase::Admission, "pre-receive", WordsFrom::BothStreams),
-      (HookPoint::GitUpdate, Phase::Admission, "update", WordsFrom::BothStreams),
-      (HookPoint::GitPostReceive, Phase::Observing, "post-receive", WordsFrom::BothStreams),
-      (HookPoint::HgPretxnchangegroup, Phase::Admission, "pretxnchangegroup", WordsFrom::BothStreams),
-      (HookPoint::HgChangegroup, Phase::Observing, "changegroup", WordsFrom::BothStreams),
-      (HookPoint::SvnPreCommit, Phase::Admission, "pre-commit", WordsFrom::ErrorStream),
-      (HookPoint::SvnPreRevpropChange, Phase::Admission, "pre-revprop-change", WordsFrom::ErrorStream),
-      (HookPoint::SvnPostCommit, Phase::Observing, "post-commit", WordsFrom::ErrorStream),
+      (
+        HookPoint::GitPreReceive,
+        Phase::Admission,
+        "pre-receive",
+        WordsFrom::BothStreams,
+      ),
+      (
+        HookPoint::GitUpdate,
+        Phase::Admission,
+        "update",
+        WordsFrom::BothStreams,
+      ),
+      (
+        HookPoint::GitPostReceive,
+        Phase::Observing,
+        "post-receive",
+        WordsFrom::BothStreams,
+      ),
+      (
+        HookPoint::HgPretxnchangegroup,
+        Phase::Admission,
+        "pretxnchangegroup",
+        WordsFrom::BothStreams,
+      ),
+      (
+        HookPoint::HgChangegroup,
+        Phase::Observing,
+        "changegroup",
+        WordsFrom::BothStreams,
+      ),
+      (
+        HookPoint::SvnPreCommit,
+        Phase::Admission,
+        "pre-commit",
+        WordsFrom::ErrorStream,
+      ),
+      (
+        HookPoint::SvnPreRevpropChange,
+        Phase::Admission,
+        "pre-revprop-change",
+        WordsFrom::ErrorStream,
+      ),
+      (
+        HookPoint::SvnPostCommit,
+        Phase::Observing,
+        "post-commit",
+        WordsFrom::ErrorStream,
+      ),
     ];
     for (point, phase, name, from) in points {
       assert_eq!(point.phase(), phase, "{name}");
@@ -903,7 +970,11 @@ mod tests {
       name: "refs/heads/main".to_owned(),
     };
     let options = [b"ci.skip".to_vec(), b"reviewer=ada".to_vec()];
-    let pre = git_pre_receive(PendingView(7), &[create.clone(), moved.clone()], Some(&options));
+    let pre = git_pre_receive(
+      PendingView(7),
+      &[create.clone(), moved.clone()],
+      Some(&options),
+    );
     assert_eq!(pre.point, HookPoint::GitPreReceive);
     assert!(pre.args.is_empty());
     assert_eq!(pre.view, View::Pending(PendingView(7)));
@@ -918,9 +989,18 @@ mod tests {
     assert_eq!(
       pre.env,
       vec![
-        ("GIT_PUSH_OPTION_0".to_owned(), EnvValue::Bytes(b"ci.skip".to_vec())),
-        ("GIT_PUSH_OPTION_1".to_owned(), EnvValue::Bytes(b"reviewer=ada".to_vec())),
-        ("GIT_PUSH_OPTION_COUNT".to_owned(), EnvValue::Bytes(b"2".to_vec())),
+        (
+          "GIT_PUSH_OPTION_0".to_owned(),
+          EnvValue::Bytes(b"ci.skip".to_vec())
+        ),
+        (
+          "GIT_PUSH_OPTION_1".to_owned(),
+          EnvValue::Bytes(b"reviewer=ada".to_vec())
+        ),
+        (
+          "GIT_PUSH_OPTION_COUNT".to_owned(),
+          EnvValue::Bytes(b"2".to_vec())
+        ),
       ]
     );
     let bare = git_pre_receive(PendingView(7), &[moved.clone()], None);
@@ -968,7 +1048,10 @@ mod tests {
     };
     let bytes = |text: &str| Some(EnvValue::Bytes(text.as_bytes().to_vec()));
     assert_eq!(value(&pending, "HG_HOOKTYPE"), bytes("pretxnchangegroup"));
-    assert_eq!(value(&pending, "HG_HOOKNAME"), bytes("pretxnchangegroup.check"));
+    assert_eq!(
+      value(&pending, "HG_HOOKNAME"),
+      bytes("pretxnchangegroup.check")
+    );
     assert_eq!(value(&pending, "HG_NODE"), bytes(&"aa".repeat(20)));
     assert_eq!(value(&pending, "HG_NODE_LAST"), bytes(&"bb".repeat(20)));
     assert_eq!(value(&pending, "HG_SOURCE"), bytes("serve"));
@@ -1038,6 +1121,17 @@ mod tests {
     assert_eq!(deleted.args.get(2), Some(&Vec::new()));
     assert_eq!(deleted.args.get(4), Some(&b"D".to_vec()));
     assert!(deleted.stdin.is_empty());
+    let added = svn_pre_revprop_change(
+      CommittedView(2),
+      "/srv/repos/x",
+      40,
+      "ada",
+      "ci:status",
+      RevpropAction::Added,
+      b"green",
+    );
+    assert_eq!(added.args.get(4), Some(&b"A".to_vec()));
+    assert_eq!(added.stdin, b"green".to_vec());
     let post = svn_post_commit(CommittedView(3), "/srv/repos/x", 41, "40-1a");
     assert_eq!(
       post.args,
@@ -1054,8 +1148,14 @@ mod tests {
     assert_eq!(times.bound_ns(), None);
     let (mut run, step) = HookRun::started(START_NS, &times, CAP);
     assert_eq!(step, Step::Wait { wake_at_ns: None });
-    assert_eq!(run.on(Event::Output(b"checked\n"), &mut times), Step::Wait { wake_at_ns: None });
-    assert_eq!(run.on(Event::OutputEnded, &mut times), Step::Wait { wake_at_ns: None });
+    assert_eq!(
+      run.on(Event::Output(b"checked\n"), &mut times),
+      Step::Wait { wake_at_ns: None }
+    );
+    assert_eq!(
+      run.on(Event::OutputEnded, &mut times),
+      Step::Wait { wake_at_ns: None }
+    );
     let ran_ns = 5 * LIVENESS_BUDGET_NS;
     assert_eq!(
       run.on(
@@ -1094,12 +1194,27 @@ mod tests {
     );
     let (mut run, step) = HookRun::started(START_NS, &times, CAP);
     let deadline = START_NS + bound;
-    assert_eq!(step, Step::Wait { wake_at_ns: Some(deadline) });
     assert_eq!(
-      run.on(Event::Timer { now_ns: deadline - 1 }, &mut times),
-      Step::Wait { wake_at_ns: Some(deadline) }
+      step,
+      Step::Wait {
+        wake_at_ns: Some(deadline)
+      }
     );
-    assert_eq!(run.on(Event::Timer { now_ns: deadline }, &mut times), Step::Kill);
+    assert_eq!(
+      run.on(
+        Event::Timer {
+          now_ns: deadline - 1
+        },
+        &mut times
+      ),
+      Step::Wait {
+        wake_at_ns: Some(deadline)
+      }
+    );
+    assert_eq!(
+      run.on(Event::Timer { now_ns: deadline }, &mut times),
+      Step::Kill
+    );
     run.on(Event::Output(b"still checking"), &mut times);
     assert_eq!(
       run.on(
@@ -1117,7 +1232,11 @@ mod tests {
         end_leftovers: false,
       }
     );
-    assert_eq!(times.bound_ns(), Some(2 * bound), "a run cut at its bound doubles the next");
+    assert_eq!(
+      times.bound_ns(),
+      Some(2 * bound),
+      "a run cut at its bound doubles the next"
+    );
     assert_eq!((times.finished_runs(), times.cut_runs()), (8, 1));
     let (mut run, _) = HookRun::started(START_NS, &times, CAP);
     run.on(Event::OutputEnded, &mut times);
@@ -1198,7 +1317,11 @@ mod tests {
       },
       &mut first,
     );
-    assert_eq!(first.bound_ns(), None, "a run its client cut short is no sample");
+    assert_eq!(
+      first.bound_ns(),
+      None,
+      "a run its client cut short is no sample"
+    );
   }
 
   /// A-597 (bounded words). Do: with a cap of 64 bytes, let a hook write 40 bytes, then 40 more, then exit 1. Expect:
@@ -1244,10 +1367,20 @@ mod tests {
       status: ExitStatus::Code(0),
       at_ns: START_NS + QUICK_NS,
     };
-    assert_eq!(run.on(exit, &mut times), Step::Wait { wake_at_ns: Some(START_NS + bound) });
+    assert_eq!(
+      run.on(exit, &mut times),
+      Step::Wait {
+        wake_at_ns: Some(START_NS + bound)
+      }
+    );
     run.on(Event::Output(b"daemon started"), &mut times);
     assert_eq!(
-      run.on(Event::Timer { now_ns: START_NS + bound }, &mut times),
+      run.on(
+        Event::Timer {
+          now_ns: START_NS + bound
+        },
+        &mut times
+      ),
       Step::Done {
         outcome: Outcome::Accepted {
           words: words(b"ok daemon started"),
@@ -1271,15 +1404,18 @@ mod tests {
     );
   }
 
-  /// A-597. Do: report a hook's program as not found. Expect: unstartable by that cause, and no run, so nothing taught.
+  /// A-597. Do: report a hook's program as not found, not permitted, short of room, and failing with another error.
+  /// Expect: each unstartable by its own cause, and no run, so nothing taught.
   #[test]
   fn a_hook_that_cannot_start_is_unstartable_by_its_cause() {
-    assert_eq!(
-      HookRun::unstartable(StartRefused::NotFound),
-      Outcome::Unstartable {
-        cause: StartRefused::NotFound
-      }
-    );
+    for cause in [
+      StartRefused::NotFound,
+      StartRefused::NotPermitted,
+      StartRefused::NoRoom,
+      StartRefused::Other(5),
+    ] {
+      assert_eq!(HookRun::unstartable(cause), Outcome::Unstartable { cause });
+    }
   }
 
   /// One generated event, its times as offsets from the run's start.
@@ -1343,7 +1479,10 @@ mod tests {
   impl Driven {
     /// Reports `event`, recording the step, and the bytes written while the run is not over.
     fn report(&mut self, event: Event<'_>) {
-      let over = self.steps.iter().any(|step| matches!(step, Step::Done { .. }));
+      let over = self
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Done { .. }));
       if let (Event::Output(bytes), false) = (event, over) {
         self.written += bytes.len();
       }
