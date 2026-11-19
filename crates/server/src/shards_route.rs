@@ -699,7 +699,7 @@ mod tests {
           &[origin],
           batch,
           CLIENT,
-          crate::daemon::LIVENESS_BUDGET_NS,
+          |_| crate::daemon::LIVENESS_BUDGET_NS,
         )
         .await;
         let left = state::with_state(|s| {

@@ -1,13 +1,17 @@
 //! A clone of a captured base landed against its capture (§4.15 `capture_base`, A-291's landing, stage 1; GAPS g267),
 //! end to end over the simulated host: planned as the change since the capture, every entry judged by content, written
 //! where the target still holds what the capture held, refused whole where an outsider changed it, and the clone left a
-//! scratch volume.
+//! scratch volume. And a clone that moved to another member (A-503, stage 2): its head made again in a volume of its
+//! own, as the new owner materializes it, and landed there against what its move carried of the capture and its mark,
+//! with the same entries as the clone's own landing against the capture.
 
 use slates_mem::Handle;
+use slates_vfs::captured::{CaptureBase, CarryWalk, FrozenTree, Held};
 use slates_vfs::dir::{Child, DirNode};
 use slates_vfs::host::HostFs;
 use slates_vfs::host::sim::SimHost;
 use slates_vfs::ids::SnapshotId;
+use slates_vfs::names::NameEquivalence;
 use slates_vfs::volume::{Store, Volume};
 
 use crate::engine::{
@@ -128,10 +132,23 @@ fn land(
   Box<crate::engine::Presented>,
   Result<LandingReport, LandingRefusal>,
 ) {
-  let base = origin.frozen_tree(captured).unwrap();
+  let base = CaptureBase::Tree(origin.frozen_tree(captured).unwrap());
+  land_against(host, target, store, (base, clone))
+}
+
+/// Presents `clone`'s landing against `base`, grants what was presented, and lands it.
+fn land_against(
+  host: &mut SimHost,
+  target: &LandingTarget,
+  store: &mut Store,
+  (base, clone): (CaptureBase, &mut Volume),
+) -> (
+  Box<crate::engine::Presented>,
+  Result<LandingReport, LandingRefusal>,
+) {
   let mut grants = Grants::default();
   let mut audit = Audit::new(1 << 10);
-  let presenting = Beginning::against_capture(clone, target, &request(None), base).unwrap();
+  let presenting = Beginning::against_capture(clone, target, &request(None), base.clone()).unwrap();
   let presented = match begin_landing_from(
     presenting,
     HostSlot::Lent(&mut *host),
@@ -494,4 +511,291 @@ fn a_captured_clones_replacement_already_on_the_disk_still_lands_its_mode() {
     !host.holds_unsynced_metadata("/target/src/edit.rs"),
     "synced by its batch's barrier (A-472)"
   );
+}
+
+/// Shape: the inode-number prefix of the volume a move makes on its new owner (the origin's is 1, the clone's 2).
+const MOVED_PREFIX: u16 = 3;
+
+/// `from`'s whole tree made again in `to`, every directory, file and link with its mode and bytes, no node shared with
+/// it: the volume a move's new owner materializes from the head it was handed (A-291).
+fn copy_tree(store: &mut Store, from: FrozenTree, to: &mut Volume) {
+  let mut stack = vec![(String::from("/"), from.root)];
+  while let Some((at, node)) = stack.pop() {
+    let entries: Vec<(String, Child)> = store
+      .dirs
+      .get(node)
+      .unwrap()
+      .iter(&store.blocks)
+      .map(|entry| (entry.name.to_owned(), entry.child))
+      .collect();
+    for (name, child) in entries {
+      let path = if at == "/" {
+        format!("/{name}")
+      } else {
+        format!("{at}/{name}")
+      };
+      let parent = dir(to, store, &at);
+      match slates_vfs::captured::held_at(store, from, NameEquivalence::Exact, &path).unwrap() {
+        Held::Dir { mode, .. } => {
+          to.mkdir(store, parent, &name, mode).unwrap();
+          if let Child::Dir(child) = child {
+            stack.push((path, child));
+          }
+        }
+        Held::File { no, size, mode, .. } => {
+          let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
+          let read = slates_vfs::captured::read_file(store, from, no, 0, &mut bytes).unwrap();
+          bytes.truncate(read);
+          let made = to.create_file(store, parent, &name, mode).unwrap();
+          to.write(store, made, 0, &bytes).unwrap();
+        }
+        Held::Symlink { target, .. } => {
+          to.symlink(store, parent, &name, &target).unwrap();
+        }
+        other => panic!("{path} holds {other:?}, which no test tree has"),
+      }
+    }
+  }
+}
+
+/// The clone of [`captured_clone`] moved to another member (A-291's move, A-503's carry): the capture carried against
+/// the head the move hands over, that head made again in a volume of the new owner's, and the snapshot of it the new
+/// owner keeps as its mark. Returns the moved volume and its capture base.
+fn move_clone(
+  store: &mut Store,
+  origin: &Volume,
+  captured: SnapshotId,
+  clone: &mut Volume,
+) -> (Volume, CaptureBase) {
+  let handed = clone.snapshot(store).unwrap();
+  let handed_tree = clone.frozen_tree(handed).unwrap();
+  let mut walk = CarryWalk::new(
+    CaptureBase::Tree(origin.frozen_tree(captured).unwrap()),
+    handed_tree,
+  );
+  let carried = loop {
+    if let Some(carried) = walk.unit(store, NameEquivalence::Exact).unwrap() {
+      break carried;
+    }
+  };
+  let mut moved = Volume::create(store, config(MOVED_PREFIX)).unwrap();
+  copy_tree(store, handed_tree, &mut moved);
+  let mark = moved.snapshot(store).unwrap();
+  let base = CaptureBase::Carried {
+    mark: moved.frozen_tree(mark).unwrap(),
+    carried,
+  };
+  (moved, base)
+}
+
+/// `bytes` written over `path` of `vol`, as an agent's tool rewrites a file.
+fn rewrite(vol: &mut Volume, store: &mut Store, path: &str, bytes: &[u8]) {
+  let no = vol.resolve(store, path).unwrap().inode;
+  vol.truncate(store, no, 0).unwrap();
+  vol.write(store, no, 0, bytes).unwrap();
+}
+
+/// A manifest's entries as a landing judges them, one line each: path, action, the identity each is judged against, and
+/// what it writes (bytes, size and mode; a moved volume's own modification times are its own).
+fn judged(manifest: &crate::manifest::Manifest) -> Vec<String> {
+  manifest
+    .entries
+    .iter()
+    .map(|e| {
+      format!(
+        "{} {:?} {:?} {:?}",
+        e.path,
+        e.action,
+        e.witnessed.as_ref().map(|w| w.identity),
+        e.overlay.as_ref().map(|o| (o.hash, o.size, o.mode))
+      )
+    })
+    .collect()
+}
+
+/// `vol`'s head planned against `base` alone, as a presentation plans it.
+fn planned(vol: &mut Volume, store: &mut Store, base: CaptureBase) -> crate::manifest::Manifest {
+  let mut host = SimHost::new();
+  let mut walk = crate::manifest::PlanWalk::against_capture(vol, Source::Head, base).unwrap();
+  loop {
+    if let Some(manifest) = walk
+      .unit(vol, store, &mut host, &Filter::default())
+      .unwrap()
+    {
+      return manifest;
+    }
+  }
+}
+
+/// The presentation of [`a_moved_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`]: judged by
+/// content, the change since the capture before the move and after it, in landing order, every entry to apply.
+fn assert_planned_since_the_capture_across_the_move(presented: &crate::engine::Presented) {
+  assert_eq!(presented.manifest.basis, Judged::Content);
+  let planned: Vec<(&str, &Action)> = presented
+    .manifest
+    .entries
+    .iter()
+    .map(|e| (e.path.as_ref(), &e.action))
+    .collect();
+  assert_eq!(
+    planned,
+    vec![
+      ("/src/made.rs", &Action::Create),
+      ("/src/edit.rs", &Action::Replace),
+      ("/src/keep.rs", &Action::Replace),
+      ("/olddir/f.rs", &Action::Delete),
+      ("/gone.rs", &Action::Delete),
+      ("/olddir", &Action::Rmdir),
+    ],
+    "the change since the capture, before the move and after it, in landing order"
+  );
+  assert!(
+    presented
+      .preliminary
+      .iter()
+      .all(|r| r.verdict == Some(Verdict::Apply)),
+    "{:?}",
+    presented.preliminary
+  );
+}
+
+/// The target [`a_moved_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`] leaves: the
+/// rewritten, the later and the made file written, the removed file and directory gone, the outsider's file as it was.
+fn assert_the_moved_change_landed_and_the_outsiders_passed(host: &SimHost) {
+  let bytes = |path: &str| host.bytes(path);
+  assert_eq!(
+    bytes("/target/src/edit.rs").as_deref(),
+    Some(&b"the agent's body"[..])
+  );
+  assert_eq!(
+    bytes("/target/src/made.rs").as_deref(),
+    Some(&b"made by the agent"[..])
+  );
+  assert_eq!(
+    bytes("/target/src/keep.rs").as_deref(),
+    Some(&b"changed on the new runner"[..])
+  );
+  assert_eq!(bytes("/target/gone.rs"), None);
+  let paths = host.paths();
+  assert!(
+    !paths.iter().any(|(p, _)| p.starts_with("/target/olddir")),
+    "{paths:?}"
+  );
+  assert_eq!(
+    bytes("/target/src/outsider.rs").as_deref(),
+    Some(&b"an outsider's edit"[..])
+  );
+}
+
+/// A-503 (stage 2). Do: move the agent's clone to another member before landing it (its capture carried, its head made
+/// again in a volume of the new owner's and kept there as the mark), change one more file there, then present and land
+/// the moved volume into a target an outsider edited since the capture. Expect: the plan judged by content holds the
+/// agent's changes since the capture alone, before the move and after it (the rewritten and the later file replaced,
+/// the made one created, the removed file and directory removed), every entry applied; the landing writes them and
+/// passes the outsider's file by; and the moved volume stays a scratch volume. Before A-503 the new owner held no
+/// capture and planned the moved volume as a scratch volume: every file a create, no removal.
+#[test]
+fn a_moved_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders() {
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let (mut moved, base) = move_clone(&mut store, &origin, captured, &mut clone);
+  rewrite(
+    &mut moved,
+    &mut store,
+    "/src/keep.rs",
+    b"changed on the new runner",
+  );
+  let (mut host, target) = disk(&[("/src/outsider.rs", b"an outsider's edit".as_slice())]);
+  let (presented, result) = land_against(&mut host, &target, &mut store, (base, &mut moved));
+  assert_planned_since_the_capture_across_the_move(&presented);
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  assert_the_moved_change_landed_and_the_outsiders_passed(&host);
+  assert!(
+    !moved.is_overlay(),
+    "the moved volume took a base from the target"
+  );
+}
+
+/// A-503, the oracle. Do: make the same later change in the clone on its first runner and in the moved volume, then
+/// plan each: the clone against its capture (stage 1), the moved volume against what its move carried and its mark.
+/// Expect: the same entries, each judged against the same captured identity and writing the same bytes; and the moved
+/// volume planned as the scratch volume it was before A-503 differs (every file a create, nothing removed), so the
+/// equality is no accident of a plan that judges nothing.
+#[test]
+fn a_moved_clone_plans_what_its_clone_plans_on_its_first_runner() {
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let (mut moved, base) = move_clone(&mut store, &origin, captured, &mut clone);
+  for vol in [&mut clone, &mut moved] {
+    rewrite(vol, &mut store, "/src/keep.rs", b"changed after the move");
+    rewrite(vol, &mut store, "/src/edit.rs", b"old body");
+  }
+  let first = planned(
+    &mut clone,
+    &mut store,
+    CaptureBase::Tree(origin.frozen_tree(captured).unwrap()),
+  );
+  let there = planned(&mut moved, &mut store, base);
+  assert_eq!(judged(&there), judged(&first));
+  assert!(
+    !first
+      .entries
+      .iter()
+      .any(|e| e.path.as_ref() == "/src/edit.rs"),
+    "a file changed and changed back is no change: {:?}",
+    judged(&first)
+  );
+  let mut host = SimHost::new();
+  let mut scratch = crate::manifest::PlanWalk::new(&moved, Source::Head).unwrap();
+  let scratch = loop {
+    if let Some(manifest) = scratch
+      .unit(&mut moved, &mut store, &mut host, &Filter::default())
+      .unwrap()
+    {
+      break manifest;
+    }
+  };
+  assert_ne!(
+    judged(&scratch),
+    judged(&there),
+    "a scratch plan of the moved volume equals the carried one"
+  );
+}
+
+/// A-501 (a base directory's mode alone, in a captured clone). Do: in a captured clone, `chmod` the directory `/src` to
+/// 0700, nothing else changed beyond the clone's own edits, and land it against its capture. Expect the change since the
+/// capture to hold the directory, the landing `Done`, and the target's directory at 0700 under its own inode, synced.
+/// Before A-501 a captured clone's plan made nothing of a directory that both held.
+#[test]
+fn a_captured_clones_directory_mode_change_alone_lands() {
+  /// Shape: the directory made private to its owner.
+  const PRIVATE_DIR_MODE: u32 = 0o040_700;
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let src = clone.resolve(&store, "/src").unwrap().inode;
+  clone.chmod(&mut store, src, PRIVATE_DIR_MODE).unwrap();
+  let (mut host, target) = disk(&[]);
+  let before = host.fingerprint("/target/src").unwrap();
+  let (presented, result) = land(
+    &mut host,
+    &target,
+    &mut store,
+    (&origin, captured, &mut clone),
+  );
+  assert!(
+    presented
+      .manifest
+      .entries
+      .iter()
+      .any(|e| e.path.as_ref() == "/src"),
+    "{:?}",
+    presented.manifest.entries
+  );
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  let after = host.fingerprint("/target/src").unwrap();
+  assert_eq!(after.mode & PERMISSIONS, PRIVATE_DIR_MODE & PERMISSIONS);
+  assert_eq!(after.ino, before.ino);
+  assert!(!host.holds_unsynced_metadata("/target/src"));
 }

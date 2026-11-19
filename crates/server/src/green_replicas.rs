@@ -1,10 +1,10 @@
 //! A green's replicas on the shards that may hold its works (A-457 and A-465, A-273 steps 5a and 5b; §4.16 "Rebase off
 //! the owner"). A green's owner shard makes a replica of it on every other shard of the node, up to the derived limit
 //! ([`crate::DaemonConfig::replica_limit`]), before the first change it makes to the green after the green is
-//! installed; it feeds every replica each change it makes, in order; and it makes every replica leave before it gives
-//! the green's engine up. A work's shard answers from its replica what the work would ask the owner for its base (its
-//! files, a page, every file's length, at its base version) and its rebase ([`serving`], `crate::work_home`'s
-//! `answered_by_replica`), with no hop to the owner.
+//! installed; it feeds every replica each change it makes, in order, a turn's changes in one message after the turn's
+//! replies (A-502); and it makes every replica leave before it gives the green's engine up. A work's shard answers from
+//! its replica what the work would ask the owner for its base (its files, a page, every file's length, at its base
+//! version) and its rebase ([`serving`], `crate::work_home`'s `answered_by_replica`), with no hop to the owner.
 //!
 //! **Serving (step 5b, A-465).** A replica serves a version it holds, no older than its fold floor and no newer than its
 //! head, by the very function the owner answers by (`verbs::base_files`, `base_page`, `base_sizes`, `rebase_on`) over
@@ -31,19 +31,34 @@
 //! the owner makes one replica for each other shard (`Green::replica`, refused past the limit:
 //! `ReplicaRefusal::Full`) and moves it there whole: every index cloned, the content named by the owner's sealed blocks
 //! and read in place, never copied (D-7; `slates_mem::sealed`). After each version it commits ([`feed_version`]) and
-//! each fold of its history ([`feed_fold`]) it takes the message that carries the change and sends it to every shard
-//! it fed, in the order it made them. At each settle of its retention it sets its held limit
-//! ([`hold_within`], `slates_merge::replica::held_limit`): past it the slowest replica is evicted. It records which
-//! shards hold a replica of each green it owns, and a shard leaves that record only when its replica's registration
-//! has come home. Making the replicas before the first change rather than at the install costs a recovered green's
-//! clones only if it changes, and needs no other shard to be running while the daemon recovers.
+//! each fold of its history ([`feed_fold`]) it takes the message that carries the change, in the same step, as the
+//! sealed blocks' one-message rule asks, and queues it; the turn's flush sends every shard it fed one message with the
+//! turn's messages, in the order it made them ("The turn's feed", below). At each settle of its retention it sets its
+//! held limit ([`hold_within`], `slates_merge::replica::held_limit`): past it the slowest replica is evicted. It records
+//! which shards hold a replica of each green it owns, and a shard leaves that record only when its replica's
+//! registration has come home. Making the replicas before the first change rather than at the install costs a recovered
+//! green's clones only if it changes, and needs no other shard to be running while the daemon recovers.
+//!
+//! **The turn's feed (A-502, measured).** Until A-502 the owner sent each message to every replica's shard as it took
+//! it, inside the verb that made the change, so a submit's reply waited for one message to each other shard for each of
+//! its changes (its settle's fold and its version), and each replica acknowledged each message, a task on the owner
+//! apiece. The supervisor's A/B at 1,000 clients (r406 on the Mac Studio, 2026-11-18: three rounds, load 11 to 22) found
+//! accepted submits' p99 at a 20 ms think 0.81, 3.88 and 13.6 ms without the replicas and 60.8, 88.9 and 78.0 ms with
+//! them, conflicting submits and head reads worse alike. So the owner queues each message ([`queue_feed`]), and one task
+//! a shard ([`flush`]), queued behind every task the turn ran or admitted, sends each fed shard the turn's messages in
+//! one message once the turn's replies have gone (`merge.replica.feed_sent`); its replica applies them in order and
+//! acknowledges once (`merge.replica.acknowledged`), the acknowledgement of the last covering every one before. The
+//! owner's sends and the acknowledgements it takes are one a replica a turn, however many changes the turn made, and
+//! none goes before a reply. A shard whose arena refuses the flush's task flushes at once, counted
+//! (`merge.replica.flush_unarmed`).
 //!
 //! **A replica's shard.** It holds the replica within `slates_merge::replica::replica_budget` (the per-green budget,
 //! `PartitionCaps::green_chain_bytes`, and the room its shard's memory class has now) and charges the replica's
 //! metadata to its shard's budget as memory held for another owner (`ShardBudget::charge_replicated`), recharged after
-//! every message. A replica that refuses a message (a gap, an eviction, a replay not its owner's), or whose charge its
-//! shard cannot take, leaves: its charge is credited, its registration goes home with why, and it is counted; its work
-//! is asked of the owner, and its owner makes it again before its next change unless it left for its budget (A-465).
+//! every message of the feed it takes. A replica that refuses a message (a gap, an eviction, a replay not its owner's),
+//! or whose charge its shard cannot take, leaves: its charge is credited, its registration goes home with why, and it
+//! is counted; its work is asked of the owner, and its owner makes it again before its next change unless it left for
+//! its budget (A-465).
 //!
 //! **Giving the owner up.** A destroyed, fenced or re-installed green's engine is kept, retiring, until every replica
 //! of it has left ([`give_up`]); only then is it dropped, so its blocks are freed with no reader left to read them
@@ -125,6 +140,16 @@ pub(crate) const ROUTE_IDLE: &str = "merge.replica.route_idle";
 /// Counter: a shard's idle check that could not be started (its task arena full): the replicas wait for their next use
 /// to arm it again, holding their charge meanwhile.
 pub(crate) const IDLE_CHECK_REFUSED: &str = "merge.replica.idle_check_refused";
+/// Counter: a turn's feed its owner sent to a replica's shard: one message carrying the feed's messages of every change
+/// the owner made to the green in the turn, in order (A-502); one a replica's shard a turn, however many versions the
+/// turn committed.
+pub(crate) const FEED_SENT: &str = "merge.replica.feed_sent";
+/// Counter: a turn's feed sent at once, before the turn's later replies, because the task that sends it after them could
+/// not be started (the shard's task arena full) (A-502).
+pub(crate) const FLUSH_UNARMED: &str = "merge.replica.flush_unarmed";
+/// Counter: a replica's acknowledgement that came home to its owner: one for each turn's feed it applied any message of
+/// (A-502).
+pub(crate) const ACKNOWLEDGED: &str = "merge.replica.acknowledged";
 
 /// This shard's part in the replicas of greens (module docs): as an owner, the shards it fed and the engines it is
 /// retiring; as a replica's shard, the replicas it holds.
@@ -136,6 +161,12 @@ pub(crate) struct GreenReplicas {
   /// As an owner: engines given up while a replica still held them, by green and install, each kept until its last
   /// replica left. Bounded by the greens this shard gave up while replicas held them.
   retiring: BTreeMap<(VolumeId, u64), Green>,
+  /// As an owner: by green and install, the feed's messages its engine made this turn, in order, for the turn's flush to
+  /// send each shard holding a replica of it in one message once the turn's replies have gone ([`flush`], A-502).
+  /// Bounded by the changes one turn of this shard makes: the first message queued arms the flush, which takes them all.
+  pending: BTreeMap<(VolumeId, u64), Vec<FeedMessage>>,
+  /// Whether this shard's flush is armed (A-502): set by the first message queued after a flush, cleared by the flush.
+  flush_armed: bool,
   /// As a replica's shard: by green, the replica held here. Bounded by the greens of the node.
   held: BTreeMap<VolumeId, Held>,
   /// As a replica's shard: by green, why the replica it held left, and whose it was, for the reason a later request is
@@ -228,8 +259,8 @@ impl Held {
   }
 }
 
-/// What one shard sends another about a green's replicas. The engine and the feed message are boxed: each message is
-/// moved whole between shards, and the small ones need not carry their size.
+/// What one shard sends another about a green's replicas. The engine is boxed: each message is moved whole between
+/// shards, and the small ones need not carry its size.
 #[derive(Debug)]
 enum Message {
   /// Owner to a replica's shard: a replica of install `install` of `green`, owned on shard `owner`.
@@ -239,11 +270,11 @@ enum Message {
     owner: u16,
     replica: Box<Green>,
   },
-  /// Owner to a replica's shard: the next message of the green's feed.
+  /// Owner to a replica's shard: the next messages of the green's feed, one turn's, in order (A-502).
   Feed {
     green: VolumeId,
     install: u64,
-    message: Box<FeedMessage>,
+    messages: Vec<FeedMessage>,
   },
   /// Owner to a replica's shard: the owner gives the engine up, and the replica leaves.
   Leave { green: VolumeId, install: u64 },
@@ -372,8 +403,8 @@ fn handle(state: &mut ShardState, message: Message) {
     Message::Feed {
       green,
       install,
-      message,
-    } => apply(state, (green, install), &message),
+      messages,
+    } => apply(state, (green, install), &messages),
     Message::Leave { green, install } => leave_held(state, (green, install)),
     Message::Passed {
       green,
@@ -499,13 +530,25 @@ fn fed_shards(state: &ShardState, green: VolumeId) -> Option<(u64, Vec<u16>)> {
     .map(|fed| (fed.install, fed.shards.iter().copied().collect()))
 }
 
-/// Whether `green`'s installed engine has a replica, so its changes are taken and fed.
-pub(crate) fn has_replicas(state: &ShardState, green: VolumeId) -> bool {
-  fed_shards(state, green).is_some()
+/// The install number of `green`'s installed engine when it has a replica, so its changes are taken and fed; none
+/// otherwise.
+fn fed_install(state: &ShardState, green: VolumeId) -> Option<u64> {
+  state
+    .green_replicas
+    .fed
+    .get(&green)
+    .filter(|fed| !fed.shards.is_empty())
+    .map(|fed| fed.install)
 }
 
-/// The owner feeds version `version`, just committed from `increment` as `applied` resolved it and recorded with
-/// `signature`, to `green`'s replicas. `applied` is `None` beside an idempotent accept, which changed nothing.
+/// Whether `green`'s installed engine has a replica, so its changes are taken and fed.
+pub(crate) fn has_replicas(state: &ShardState, green: VolumeId) -> bool {
+  fed_install(state, green).is_some()
+}
+
+/// The owner takes the message that feeds version `version`, just committed from `increment` as `applied` resolved it
+/// and recorded with `signature`, to `green`'s replicas, and queues it for the turn's flush (A-502). `applied` is `None`
+/// beside an idempotent accept, which changed nothing.
 pub(crate) fn feed_version(
   state: &mut ShardState,
   green: VolumeId,
@@ -514,7 +557,7 @@ pub(crate) fn feed_version(
   signature: Option<Signature>,
 ) {
   settle_owed(state);
-  let (Some(applied), Some((install, targets))) = (applied, fed_shards(state, green)) else {
+  let (Some(applied), Some(install)) = (applied, fed_install(state, green)) else {
     return;
   };
   let message = state
@@ -522,37 +565,103 @@ pub(crate) fn feed_version(
     .get_mut(&green)
     .and_then(|engine| engine.feed_version(version, increment.clone(), applied, signature));
   if let Some(message) = message {
-    broadcast(state, (green, install), &targets, message);
+    queue_feed(state, (green, install), message);
   }
 }
 
-/// The owner feeds the fold that `message` carries ([`Green::fold_to_budget_and_feed`]) to `green`'s replicas.
+/// The owner queues the fold that `message` carries ([`Green::fold_to_budget_and_feed`]) for the turn's flush to
+/// `green`'s replicas (A-502).
 pub(crate) fn feed_fold(state: &mut ShardState, green: VolumeId, message: Option<FeedMessage>) {
   settle_owed(state);
-  let (Some(message), Some((install, targets))) = (message, fed_shards(state, green)) else {
+  let (Some(message), Some(install)) = (message, fed_install(state, green)) else {
     return;
   };
-  broadcast(state, (green, install), &targets, message);
+  queue_feed(state, (green, install), message);
 }
 
-/// Sends `message` to every one of `targets`.
-fn broadcast(
+/// Queues `message`, taken from install `install` of `green` in the step that made its change (so the sealed blocks'
+/// one-message rule holds whatever waits here), behind the turn's others, and arms the turn's flush (A-502).
+fn queue_feed(state: &mut ShardState, key: (VolumeId, u64), message: FeedMessage) {
+  state
+    .green_replicas
+    .pending
+    .entry(key)
+    .or_default()
+    .push(message);
+  arm_flush(state);
+}
+
+/// Arms this shard's flush, unless it is armed (A-502): one task, queued behind the tasks this turn ran and admitted, so
+/// every reply the turn sends goes before the feed. A shard whose arena refuses the task flushes now, counted: the feed
+/// then goes before the turn's later replies, as every message did before A-502, rather than wait for a change that may
+/// never come.
+fn arm_flush(state: &mut ShardState) {
+  if state.green_replicas.flush_armed {
+    return;
+  }
+  let flushing = async {
+    let _ = state::with_state_counted(flush);
+  };
+  match slates_rt::futures::spawn(flushing) {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+      state.green_replicas.flush_armed = true;
+    }
+    Err(_) => {
+      state.count(FLUSH_UNARMED, 1);
+      flush(state);
+    }
+  }
+}
+
+/// The turn's flush (A-502): each engine's queued messages, in order, to every shard holding a replica of it, in one
+/// message a shard, counted (`merge.replica.feed_sent`). An engine given up since, or whose replicas have all left, is
+/// sent nothing.
+fn flush(state: &mut ShardState) {
+  state.green_replicas.flush_armed = false;
+  let pending = std::mem::take(&mut state.green_replicas.pending);
+  for ((green, install), messages) in pending {
+    let Some((_, targets)) = fed_shards(state, green).filter(|(fed, _)| *fed == install) else {
+      continue;
+    };
+    send_feed(state, (green, install), &targets, messages);
+  }
+}
+
+/// Sends `messages`, one turn's of install `install` of `green`, to every one of `targets` in one message each: a copy to
+/// each but the last, which takes them.
+fn send_feed(
   state: &mut ShardState,
   (green, install): (VolumeId, u64),
   targets: &[u16],
-  message: FeedMessage,
+  messages: Vec<FeedMessage>,
 ) {
-  for target in targets {
-    send(
-      state,
-      *target,
-      Message::Feed {
-        green,
-        install,
-        message: Box::new(message.clone()),
-      },
-    );
+  let Some((last, others)) = targets.split_last() else {
+    return;
+  };
+  for target in others {
+    send_turn(state, *target, (green, install), messages.clone());
   }
+  send_turn(state, *last, (green, install), messages);
+}
+
+/// Sends `target` one turn's `messages` of install `install` of `green`, counted (`merge.replica.feed_sent`).
+fn send_turn(
+  state: &mut ShardState,
+  target: u16,
+  (green, install): (VolumeId, u64),
+  messages: Vec<FeedMessage>,
+) {
+  state.count(FEED_SENT, 1);
+  send(
+    state,
+    target,
+    Message::Feed {
+      green,
+      install,
+      messages,
+    },
+  );
 }
 
 /// Sets `engine`'s held limit (`slates_merge::replica::held_limit`): the room `budget`, its per-green budget, leaves
@@ -695,40 +804,77 @@ fn held_mut(state: &mut ShardState, (green, install): (VolumeId, u64)) -> Option
     .filter(|held| held.install == install)
 }
 
-/// A replica's shard applies the feed's next `message` to the replica of `green` it holds: an applied message is
-/// acknowledged to the owner and the replica's charge trued up; a refused one, or a charge the shard cannot take, gives
-/// the replica back.
-fn apply(state: &mut ShardState, key: (VolumeId, u64), message: &FeedMessage) {
+/// A replica's shard applies the feed's next `messages`, one turn of its owner's, in order, to the replica of `green` it
+/// holds (A-502): once they are applied, the replica's charge is trued up and the owner told once what it passed, which
+/// covers every message before; a refused one, or a charge the shard cannot take, gives the replica back, and the
+/// messages after a refused one are not applied.
+fn apply(state: &mut ShardState, key: (VolumeId, u64), messages: &[FeedMessage]) {
   let Some(held) = held_mut(state, key) else {
     state.count(UNHELD, 1);
     return;
   };
   let owner = held.owner;
-  match held.replica.apply(message) {
-    Ok(Fed::Applied { passed }) => {
-      state.count(APPLIED, 1);
-      if recharge(state, key.0) {
-        send(
-          state,
-          owner,
-          Message::Passed {
-            green: key.0,
-            install: key.1,
-            passed,
-          },
-        );
+  let replayed = replay(&mut held.replica, messages);
+  state.count(APPLIED, replayed.applied);
+  if let Some(refusal) = replayed.refused {
+    state.count(REFUSED, 1);
+    give_back(state, key.0, gone_for(refusal));
+    return;
+  }
+  if let Some(passed) = replayed.passed
+    && recharge(state, key.0)
+  {
+    send(
+      state,
+      owner,
+      Message::Passed {
+        green: key.0,
+        install: key.1,
+        passed,
+      },
+    );
+  }
+}
+
+/// What a replica made of one turn's messages of its feed (A-502).
+struct Replayed {
+  /// The messages it applied.
+  applied: u64,
+  /// What it passed after the last it applied: its owner frees by it.
+  passed: Option<Passed>,
+  /// Why it refused the message it stopped at, if it did.
+  refused: Option<FeedRefusal>,
+}
+
+/// Applies `messages` to `replica` in order, stopping at the first it refuses (A-502).
+fn replay(replica: &mut Replica, messages: &[FeedMessage]) -> Replayed {
+  let mut replayed = Replayed {
+    applied: 0,
+    passed: None,
+    refused: None,
+  };
+  for message in messages {
+    match replica.apply(message) {
+      Ok(Fed::Applied { passed }) => {
+        replayed.applied = replayed.applied.saturating_add(1);
+        replayed.passed = Some(passed);
+      }
+      Ok(Fed::PassedOver) => {}
+      Err(refusal) => {
+        replayed.refused = Some(refusal);
+        break;
       }
     }
-    Ok(Fed::PassedOver) => {}
-    Err(refusal) => {
-      state.count(REFUSED, 1);
-      let gone = match refusal {
-        FeedRefusal::Evicted => Gone::Evicted,
-        FeedRefusal::OverBudget { .. } => Gone::OverBudget,
-        _ => Gone::Refused,
-      };
-      give_back(state, key.0, gone);
-    }
+  }
+  replayed
+}
+
+/// Why a replica that refused a feed message with `refusal` leaves (A-465).
+fn gone_for(refusal: FeedRefusal) -> Gone {
+  match refusal {
+    FeedRefusal::Evicted => Gone::Evicted,
+    FeedRefusal::OverBudget { .. } => Gone::OverBudget,
+    _ => Gone::Refused,
   }
 }
 
@@ -788,6 +934,7 @@ fn leave_held(state: &mut ShardState, key: (VolumeId, u64)) {
 /// The owner takes what a replica of its installed engine passed; one of a retiring engine is not needed, since that
 /// engine waits only for its replicas to leave.
 fn acknowledged(state: &mut ShardState, (green, install): (VolumeId, u64), passed: Passed) {
+  state.count(ACKNOWLEDGED, 1);
   let installed = state
     .green_replicas
     .fed
@@ -834,10 +981,11 @@ fn left_home(
   }
 }
 
-/// The daemon's stop on this shard (module docs, "Giving the owner up"): no replica is made from now on, and every one
-/// held here is given back.
+/// The daemon's stop on this shard (module docs, "Giving the owner up"): no replica is made from now on, the feed this
+/// turn queued goes nowhere, since every replica leaves, and every one held here is given back.
 pub(crate) fn close(state: &mut ShardState) {
   state.green_replicas.closed = true;
+  state.green_replicas.pending.clear();
   let held: Vec<VolumeId> = state.green_replicas.held.keys().copied().collect();
   for green in held {
     give_back(state, green, Gone::Asked);
@@ -1576,5 +1724,80 @@ mod tests {
     });
     assert!(held_again.is_some(), "held again");
     daemon.stop();
+  }
+
+  /// The owner's counts of the feed's messages it sent and of its replicas' acknowledgements that came home.
+  fn sent_and_acknowledged(state: &mut ShardState) -> [u64; 2] {
+    [FEED_SENT, ACKNOWLEDGED].map(|counter| state.refusals.get(counter).copied().unwrap_or(0))
+  }
+
+  /// The owner's head of `green` and its identity.
+  fn head_of(state: &mut ShardState, green: VolumeId) -> (u64, [u8; 32]) {
+    let engine = state.greens.get_mut(&green).unwrap();
+    (engine.head(), engine.head_identity())
+  }
+
+  /// Whether the replicas on the second and third shards both hold `head` of `green`, within an observation's budget
+  /// each. A replica sends its acknowledgement in the step that applies the feed, so once both hold it, an observation
+  /// of the owner made after this sees every acknowledgement of that feed home.
+  fn both_hold(daemon: &crate::daemon::Daemon, green: VolumeId, head: (u64, [u8; 32])) -> bool {
+    [1, 2]
+      .into_iter()
+      .all(|at| eventually(daemon, at, move |state| held_at(state, green, head)).is_some())
+  }
+
+  /// A-502. Do: on a three-shard daemon, a green on the first shard with one version, held at its head by the replicas
+  /// on the other two shards; then, in one turn of the owner, three more versions submitted, each reply read before the
+  /// next submit. Expect: no message of the feed sent before any of the turn's replies (before A-502 each reply waited
+  /// for one message a replica for each of the version's changes); once the turn is over, both replicas at the owner's
+  /// head, the turn's changes sent to each replica's shard in one message, two in all, and one acknowledgement come home
+  /// from each.
+  #[test]
+  fn a_turns_changes_go_to_each_replica_in_one_message_after_the_turns_replies() {
+    let daemon = crate::daemon::audit_daemon_of(3);
+    let (green, work, first) = crate::daemon::observe_first(&daemon, |state| {
+      let (green, work) = green_and_work(state, "turned");
+      submit_one(state, work, 1);
+      (green, work, head_of(state, green))
+    });
+    assert!(
+      both_hold(&daemon, green, first),
+      "both replicas hold version 1"
+    );
+    let before = crate::daemon::observe_first(&daemon, sent_and_acknowledged);
+    let (sent_before_replies, head) = crate::daemon::observe_first(&daemon, move |state| {
+      let mut sent_before_replies = Vec::new();
+      for byte in [2, 3, 4] {
+        let [sent, _] = sent_and_acknowledged(state);
+        submit_one(state, work, byte);
+        let [sent_by_the_reply, _] = sent_and_acknowledged(state);
+        sent_before_replies.push(sent_by_the_reply.saturating_sub(sent));
+      }
+      (sent_before_replies, head_of(state, green))
+    });
+    assert_eq!(
+      sent_before_replies,
+      [0, 0, 0],
+      "no message of the feed sent before any of the turn's replies"
+    );
+    assert!(
+      both_hold(&daemon, green, head),
+      "both replicas at the owner's head"
+    );
+    let after = crate::daemon::observe_first(&daemon, sent_and_acknowledged);
+    assert_eq!(
+      [
+        after[0].saturating_sub(before[0]),
+        after[1].saturating_sub(before[1])
+      ],
+      [2, 2],
+      "the turn's changes in one message to each replica's shard, one acknowledgement back from each"
+    );
+    daemon.stop();
+    assert_eq!(
+      slates_mem::sealed::dropped_with_readers(),
+      0,
+      "no owner dropped with a replica registered"
+    );
   }
 }

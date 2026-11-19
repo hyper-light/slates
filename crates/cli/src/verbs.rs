@@ -236,8 +236,8 @@ fn name_the_unasked(unreported: &[slates_api::Unreported]) {
   }
 }
 
-/// `unmount` off Windows is the OS's own (`umount`, `fusermount3 -u`): it needs no daemon, so a stale mount is
-/// unmountable even after its daemon has gone.
+/// `unmount` off Windows is the OS's own (`unmount(2)` on macOS, A-507; `fusermount3 -u` on Linux), judged by the
+/// kernel's mount table: it needs no daemon, so a stale mount is unmountable even after its daemon has gone.
 #[cfg(not(windows))]
 fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
   slates_api::mount::unmount(path)

@@ -633,11 +633,15 @@ mod tests {
     /// archive to decode, and its manifest's identity to be the one the layout named.
     #[test]
     fn a_streamed_archive_is_the_whole_buffer_encoders_byte_for_byte(
+      // A chunk of repeated or of varied bytes, generated as a plain tuple so the strategy needs no `Arc`-backed
+      // `prop_oneof!` (R2).
       contents in proptest::collection::vec(
-        prop_oneof![
-          (1usize..2048, any::<u8>()).prop_map(|(len, byte)| vec![byte; len]),
+        (
+          any::<bool>(),
+          (1usize..2048, any::<u8>()),
           proptest::collection::vec(any::<u8>(), 1..2048),
-        ],
+        )
+          .prop_map(|(repeated, (len, byte), varied)| if repeated { vec![byte; len] } else { varied }),
         0..12,
       ),
       threshold in 1usize..4096,

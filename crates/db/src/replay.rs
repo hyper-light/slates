@@ -674,8 +674,13 @@ mod tests {
   const RECOVERIES: usize = 5;
 
   fn segment() -> AnchorSegment {
+    segment_named("slates-db-replay-unit")
+  }
+
+  /// A segment of its own for a test, named `prefix` and the process id, so tests running side by side never share one.
+  fn segment_named(prefix: &str) -> AnchorSegment {
     AnchorSegment::create(
-      &format!("slates-db-replay-unit-{}", std::process::id()),
+      &format!("{prefix}-{}", std::process::id()),
       &Identity {
         cpu: "test".into(),
         os: "test".into(),
@@ -840,5 +845,127 @@ mod tests {
       "a tail the commits measured at {measured_ns} ns of replay work replayed in {replay_ns} ns past the baseline \
        ({noise_ns} ns of noise): the trigger would let it run past its budget"
     );
+  }
+
+  /// A-503 (stage 2 of a captured clone's landing). Do: make a volume with two snapshots; record what a move carried of
+  /// its capture with the first as its mark; ask the same naming a snapshot the partition does not hold; record the
+  /// carried capture adopted again with the second as the mark; recover the database from its log, then from a snapshot;
+  /// destroy the mark's snapshot; release the volume; recover once more. Expect: the carried record and its mark read
+  /// back as recorded, the carry raising the catalog's sequence by one and the adoption leaving it; the unheld mark
+  /// refused `NotFound` with nothing recorded; both recoveries agreeing; the mark gone with its snapshot and the record
+  /// kept; and the record gone with its volume, the last recovery agreeing.
+  #[test]
+  fn a_carried_capture_is_kept_with_its_volume_and_its_mark_goes_with_its_snapshot() {
+    use crate::catalog::{CarriedRecord, PlacementState, SnapshotRecord};
+    let mut segment = segment_named("slates-db-replay-carried");
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    let record = volume();
+    let id = record.id;
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    let taken = |value: u64| Op::SnapshotTaken {
+      record: SnapshotRecord {
+        id: SnapshotId { value },
+        volume: id,
+        epoch: value,
+        identity: Some([u8::try_from(value).unwrap(); 32]),
+        placed: PlacementState::Local,
+        taken_ns: 0,
+      },
+    };
+    db.mutate(&mut segment, &taken(1), 0).unwrap();
+    db.mutate(&mut segment, &taken(2), 0).unwrap();
+    let (first, second) = (SnapshotId { value: 1 }, SnapshotId { value: 2 });
+    let carried = CarriedRecord {
+      head: [1; 32],
+      entries: vec![7; 5],
+    };
+    let version = |db: &Db| db.partition().volume(id).unwrap().catalog_version;
+    let before = version(&db);
+    db.mutate(
+      &mut segment,
+      &Op::CaptureCarried {
+        volume: id,
+        carried: carried.clone(),
+        mark: Some(first),
+      },
+      0,
+    )
+    .unwrap();
+    assert_eq!(db.partition().carried(id), Some((&carried, Some(first))));
+    assert_eq!(
+      version(&db),
+      before + 1,
+      "the catalog ships what the move carries"
+    );
+    assert_eq!(
+      db.mutate(
+        &mut segment,
+        &Op::CaptureCarried {
+          volume: id,
+          carried: carried.clone(),
+          mark: Some(SnapshotId { value: 9 }),
+        },
+        0,
+      ),
+      Err(DbError::NotFound),
+      "a mark names a snapshot the partition holds"
+    );
+    assert_eq!(db.partition().carried(id), Some((&carried, Some(first))));
+    db.mutate(
+      &mut segment,
+      &Op::CaptureAdopted {
+        volume: id,
+        carried: carried.clone(),
+        mark: Some(second),
+      },
+      0,
+    )
+    .unwrap();
+    assert_eq!(db.partition().carried(id), Some((&carried, Some(second))));
+    assert_eq!(
+      version(&db),
+      before + 1,
+      "an adopted catalog's sequence stays"
+    );
+    drop(db);
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    assert_eq!(
+      db.partition().carried(id),
+      Some((&carried, Some(second))),
+      "replayed from the log"
+    );
+    db.snapshot(&mut segment).unwrap();
+    drop(db);
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    assert_eq!(
+      db.partition().carried(id),
+      Some((&carried, Some(second))),
+      "restored from a snapshot"
+    );
+    db.mutate(
+      &mut segment,
+      &Op::SnapshotDestroyed {
+        volume: id,
+        id: second,
+      },
+      0,
+    )
+    .unwrap();
+    assert_eq!(
+      db.partition().carried(id),
+      Some((&carried, None)),
+      "the mark goes with its snapshot"
+    );
+    db.mutate(&mut segment, &Op::VolumeReleased { id }, 0)
+      .unwrap();
+    assert_eq!(
+      db.partition().carried(id),
+      None,
+      "the record goes with its volume"
+    );
+    drop(db);
+    let db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    assert_eq!(db.partition().carried(id), None);
   }
 }
