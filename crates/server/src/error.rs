@@ -284,6 +284,9 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::PolicyHookMalformed { index } => {
       database(DatabaseRefusal::PolicyHookMalformed { index: *index })
     }
+    DbError::PolicyHooksEnvMalformed { index } => {
+      database(DatabaseRefusal::PolicyHooksEnvMalformed { index: *index })
+    }
   }
 }
 

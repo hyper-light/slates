@@ -34,8 +34,9 @@
 //! the mode of a file or directory (`SetMode`), symbolic links (`Symlink`; the target is stored
 //! in the path table), and extended attributes (`SetXattr`/`RemoveXattr`, composed against the
 //! base value; the value is laid out in the post-state after the file content, the name in the
-//! path table), and hard links (`Link`, composed like symlinks; the target file is named in the
-//! path table). IPC creations (`Mknod`, A-26) carry canonical metadata without content; their
+//! path table), and hard links (`Link`, composed like symlinks; the node a link names is a record
+//! of the node table, the node at the target at the base or the one the increment makes there,
+//! A-646). IPC creations (`Mknod`, A-26) carry canonical metadata without content; their
 //! modes compose independently and a create/unlink cancels. IPC renames, metadata declarations
 //! through aliases, and primary-name removal while aliases exist are typed refusals pending
 //! an inode-aware namespace journal. The remaining edges — a
@@ -47,7 +48,7 @@
 //! never a panic. This module is pure: no I/O, no clock, no randomness.
 
 use crate::derive::{ContentOp, compose_content_sized};
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
 
 /// One declared operation, as the journal records it (§4.5). Content coordinates are current-file
 /// at the moment the operation happened.
@@ -896,10 +897,50 @@ fn symlink_op(link: u64, target: u64) -> Op {
 
 /// A hard link the increment declares.
 enum LinkEmission {
-  /// A hard link at this path to this target (a new or retargeted link).
-  Made(String, String),
+  /// A hard link at this path to the node at this target, the one at the base or the one the
+  /// increment makes there (A-646): a new or retargeted link.
+  Made(String, String, NodeOrigin),
   /// A base hard link removed at this path.
   Removed(String),
+}
+
+/// A link path's state as the journal composes it: whether a link stands there, the target it
+/// names, and where that target's node is (A-646).
+type LinkState = (bool, String, NodeOrigin);
+
+/// Notes the paths a journal operation makes (A-646): a file created, an IPC node made, a rename's
+/// destination, a link made; and forgets a path removed or renamed away.
+fn note_made(op: &VolumeOp, made: &mut std::collections::BTreeSet<String>) {
+  match op {
+    VolumeOp::Create { path } | VolumeOp::Mknod { path, .. } | VolumeOp::Link { path, .. } => {
+      made.insert(path.clone());
+    }
+    VolumeOp::Rename { from, to } => {
+      made.remove(from);
+      made.insert(to.clone());
+    }
+    VolumeOp::Unlink { path } => {
+      made.remove(path);
+    }
+    _ => {}
+  }
+}
+
+/// The path a journal operation removes or moves, or moves something onto, when a link the
+/// increment made earlier names the node the increment made there (A-646): that link's node record
+/// names the path, so its later move is a composition owed (`DeriveError::Unsupported`).
+fn made_target_moved<'a>(
+  op: &'a VolumeOp,
+  linked_made: &std::collections::BTreeSet<String>,
+) -> Option<&'a str> {
+  match op {
+    VolumeOp::Unlink { path } => linked_made.contains(path).then_some(path.as_str()),
+    VolumeOp::Rename { from, to } => [from, to]
+      .into_iter()
+      .find(|path| linked_made.contains(*path))
+      .map(String::as_str),
+    _ => None,
+  }
 }
 
 /// The paths this increment treats as hard links: those a `Link` op names, and the base hard
@@ -928,23 +969,35 @@ fn compose_hardlinks(
   journal: &[VolumeOp],
   paths: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<LinkEmission>, DeriveError> {
-  let mut state: std::collections::BTreeMap<String, (bool, String)> =
-    std::collections::BTreeMap::new();
-  let initial = |path: &str| -> (bool, String) {
+  let mut state: std::collections::BTreeMap<String, LinkState> = std::collections::BTreeMap::new();
+  let initial = |path: &str| -> LinkState {
     match base_hardlink_target(base, path) {
-      Some(target) => (true, target.to_owned()),
-      None => (false, String::new()),
+      Some(target) => (true, target.to_owned(), NodeOrigin::Base),
+      None => (false, String::new(), NodeOrigin::Base),
     }
   };
+  // The paths the increment has made so far, and the targets of the links it made to a node it
+  // made (A-646): a link names the node at its target when it is made, the increment's own or the
+  // base's.
+  let mut made = std::collections::BTreeSet::new();
+  let mut linked_made = std::collections::BTreeSet::new();
   for op in journal {
+    if let Some(moved) = made_target_moved(op, &linked_made) {
+      return Err(DeriveError::Unsupported(moved.to_owned()));
+    }
     match op {
       VolumeOp::Link { path, target } => {
         let here = state.entry(path.clone()).or_insert_with(|| initial(path));
         if here.0 {
           return Err(DeriveError::LinkOverExisting(path.clone()));
         }
-        here.0 = true;
-        here.1 = target.clone();
+        let origin = if made.contains(target) {
+          linked_made.insert(target.clone());
+          NodeOrigin::Made
+        } else {
+          NodeOrigin::Base
+        };
+        *here = (true, target.clone(), origin);
       }
       VolumeOp::Unlink { path } if paths.contains(path) => {
         let here = state.entry(path.clone()).or_insert_with(|| initial(path));
@@ -955,30 +1008,43 @@ fn compose_hardlinks(
       }
       _ => {}
     }
+    note_made(op, &mut made);
   }
+  Ok(link_emissions(base, state))
+}
+
+/// The links a composed state declares: a link standing where the base had none, or another, or
+/// one naming a node the increment made (another node, whatever its path); a base link no longer
+/// standing, removed.
+fn link_emissions(
+  base: &Base,
+  state: std::collections::BTreeMap<String, LinkState>,
+) -> Vec<LinkEmission> {
   let mut emissions = Vec::new();
-  for (path, (here, target)) in state {
+  for (path, (here, target, origin)) in state {
     let base_target = base_hardlink_target(base, &path);
     if here {
-      if base_target != Some(target.as_str()) {
-        emissions.push(LinkEmission::Made(path, target));
+      let unchanged = origin == NodeOrigin::Base && base_target == Some(target.as_str());
+      if !unchanged {
+        emissions.push(LinkEmission::Made(path, target, origin));
       }
     } else if base_target.is_some() {
       emissions.push(LinkEmission::Removed(path));
     }
   }
-  Ok(emissions)
+  emissions
 }
 
-/// A `Link` op: `path` is the link's index, `src` the target file's index into the table.
-fn link_op(link: u64, target: u64) -> Op {
+/// A `Link` op: `path` is the link's index, `src` the index of the node it names in the node table
+/// (A-646).
+fn link_op(link: u64, node: u64) -> Op {
   Op {
     kind: OpKind::Link,
     flags: 0,
     path: link,
     at: 0,
     len: 0,
-    src: target,
+    src: node,
   }
 }
 
@@ -1337,7 +1403,7 @@ fn document_names(
   }
   for link in hardlinks {
     match link {
-      LinkEmission::Made(path, target) => {
+      LinkEmission::Made(path, target, _) => {
         names.push(path.clone());
         names.push(target.clone());
       }
@@ -1397,8 +1463,12 @@ fn emit_namespace(
   }
   for link in hardlinks {
     match link {
-      LinkEmission::Made(path, target) => {
-        doc.ops.push(link_op(index_of(&path), index_of(&target)));
+      LinkEmission::Made(path, target, origin) => {
+        let node = doc.nodes.intern(NodeRef {
+          path: index_of(&target),
+          origin,
+        });
+        doc.ops.push(link_op(index_of(&path), node));
       }
       LinkEmission::Removed(path) => {
         doc.ops.push(namespace_op(OpKind::Unlink, index_of(&path)));
@@ -1514,3 +1584,6 @@ fn push_content(
     doc.ops.push(op);
   }
 }
+
+#[cfg(test)]
+mod tests;

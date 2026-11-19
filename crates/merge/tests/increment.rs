@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_merge::increment::{Base, DeriveError, VolumeOp, compose_volume};
-use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
+use slates_merge::ops_doc::{NodeOrigin, Op, OpKind, OpsDoc};
 
 use proptest::prelude::*;
 
@@ -1304,7 +1304,12 @@ fn creating_a_hard_link_is_one_link() {
     .find(|op| op.kind == OpKind::Link)
     .expect("a link");
   assert_eq!(doc.paths.path(op.path), Some("b"), "the new name");
-  assert_eq!(doc.paths.path(op.src), Some("a"), "the target");
+  let node = doc
+    .nodes
+    .node(op.src)
+    .expect("the link's node record (A-646)");
+  assert_eq!(doc.paths.path(node.path), Some("a"), "the target");
+  assert_eq!(node.origin, NodeOrigin::Base, "the base file's node");
 }
 
 /// A hard link created then unlinked cancels.

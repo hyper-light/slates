@@ -10,6 +10,10 @@
 //! `discovery.py` (`outgoing`), `phases.py` (`listphases`), `bookmarks.py` (`listbookmarks`, `listbinbookmarks`),
 //! `pushkey.py` (the namespaces), and `setdiscovery.py`, whose sampling the tests drive against these answers.
 //!
+//! **Transports.** [`session`] answers SSH version 1's requests one at a time from a buffer (A-619 part 3), and
+//! [`stdio`] runs such a session over a byte channel, the SSH server's session channel or any other carrier of
+//! `hg serve --stdio`'s standard streams (A-650 part 2).
+//!
 //! **The served view.** A [`Repository`] numbers the changesets it serves `0` to `count() - 1`, every parent before
 //! its child, as a revlog numbers them; it holds no secret and no hidden changeset (§4.17.3 "Pull and clone" item 2),
 //! and since a visible changeset's ancestors are visible, that numbering is the served view's own.
@@ -24,6 +28,7 @@ pub mod discovery;
 pub mod getbundle;
 pub mod pull;
 pub mod session;
+pub mod stdio;
 
 use crate::read::to_u64;
 use crate::{Admission, NODE_LEN, Node, PastAdmission, phases::Phase, pushkey};

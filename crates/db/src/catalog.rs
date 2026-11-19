@@ -1422,6 +1422,9 @@ pub struct RepositoryPolicy {
   pub rules: Vec<PolicyRule>,
   /// The hooks, in the order given: the hooks of one point run in that order.
   pub hooks: Vec<HookConfig>,
+  /// A Subversion repository's hooks-env (A-648), its sections in the order given: what each of its hooks' environment
+  /// is. Empty for git and Mercurial, whose hooks inherit the server's environment. Appended.
+  pub hooks_env: Vec<HooksEnvSection>,
 }
 
 /// What a policy rule's pattern names (§4.17.1; A-597): the names its repository's tool has, each in its tool's form.
@@ -1538,6 +1541,18 @@ pub enum HookPointName {
   SvnPreRevpropChange,
   /// Subversion's `post-commit`.
   SvnPostCommit,
+  /// Subversion's `start-commit` (A-648). Appended.
+  SvnStartCommit,
+  /// Subversion's `post-revprop-change` (A-648). Appended.
+  SvnPostRevpropChange,
+  /// Subversion's `pre-lock` (A-648). Appended.
+  SvnPreLock,
+  /// Subversion's `post-lock` (A-648). Appended.
+  SvnPostLock,
+  /// Subversion's `pre-unlock` (A-648). Appended.
+  SvnPreUnlock,
+  /// Subversion's `post-unlock` (A-648). Appended.
+  SvnPostUnlock,
 }
 
 impl HookPointName {
@@ -1546,7 +1561,15 @@ impl HookPointName {
     match self {
       Self::GitPreReceive | Self::GitUpdate | Self::GitPostReceive => VcsTool::Git,
       Self::HgPretxnchangegroup | Self::HgChangegroup => VcsTool::Mercurial,
-      Self::SvnPreCommit | Self::SvnPreRevpropChange | Self::SvnPostCommit => VcsTool::Subversion,
+      Self::SvnPreCommit
+      | Self::SvnPreRevpropChange
+      | Self::SvnPostCommit
+      | Self::SvnStartCommit
+      | Self::SvnPostRevpropChange
+      | Self::SvnPreLock
+      | Self::SvnPostLock
+      | Self::SvnPreUnlock
+      | Self::SvnPostUnlock => VcsTool::Subversion,
     }
   }
 
@@ -1561,6 +1584,12 @@ impl HookPointName {
       Self::SvnPreCommit => "pre-commit",
       Self::SvnPreRevpropChange => "pre-revprop-change",
       Self::SvnPostCommit => "post-commit",
+      Self::SvnStartCommit => "start-commit",
+      Self::SvnPostRevpropChange => "post-revprop-change",
+      Self::SvnPreLock => "pre-lock",
+      Self::SvnPostLock => "post-lock",
+      Self::SvnPreUnlock => "pre-unlock",
+      Self::SvnPostUnlock => "post-unlock",
     }
   }
 }
@@ -1575,6 +1604,28 @@ pub struct HookConfig {
   pub name: String,
   /// The program it runs: an absolute path on the host that runs the repository's hooks, holding no NUL.
   pub program: String,
+}
+
+/// A variable of a Subversion repository's hooks-env (A-648): one `NAME = value` line of a section of the file
+/// `svnserve.conf`'s `hooks-env` names.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HooksEnvVariable {
+  /// Its name: not empty, holding no `=` and no NUL, so that it is one variable of a hook's environment.
+  pub name: String,
+  /// Its value, holding no NUL, since a hook's environment is C strings.
+  pub value: Vec<u8>,
+}
+
+/// A section of a Subversion repository's hooks-env (A-648; `run_hook_cmd`, `hooks.c`): the variables the hook named as
+/// the section runs with, or, in the section named `default`, those of every hook with no section of its own. A hook
+/// gets its section alone and never the server's environment; a section named twice is one, and one with no variables
+/// is none, as Subversion's configuration reads the file.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HooksEnvSection {
+  /// Its name, a hook's or `default`: not empty, holding no NUL.
+  pub name: String,
+  /// Its variables, in the order given; a variable set twice keeps its last value.
+  pub variables: Vec<HooksEnvVariable>,
 }
 
 /// How a green joined its repository's lineage (§4.17.1 item 4, A-575): a repository's greens share the nodes of their
