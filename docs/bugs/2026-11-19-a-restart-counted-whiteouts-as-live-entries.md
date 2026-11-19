@@ -45,3 +45,84 @@ name into one in place, with `set_child`), so only a recovery reached that count
 
 Evidence: red first with the test alone on main's `volume.rs` and `recover.rs` (6 counted against 3), green
 with the change, and `cargo test --locked -p slates-vfs --lib` 85 passed, 1 ignored, on the Mac Studio, 2026-11-19.
+
+## 2. A clone was admitted with no entry allowance
+
+### Description
+
+The server's clone admission set a clone's inode allowance but no entry allowance. A create's admission
+(`admit_dimensions`) and a restart's re-admission both set it. So a clone's namespace dimension had no bound until the
+daemon's next restart, and a clone could make names, hard links and new names alike, past its quota's share.
+
+Measured on the Mac Studio (2026-11-19), with the test alone on main. The origin was bounded at 64 KiB, whose share is
+4,096 entries. Its snapshot held 4,104 names (the share and 8 past it), and its clone carried an entry allowance of
+`u64::MAX`.
+
+### Root cause
+
+`admit_clone` (`crates/server/src/verbs.rs`) called `set_inode_allowance` alone. Since A-549 the clone's entry count is
+its snapshot's, so there was a count to floor an allowance at, but nothing set one.
+
+### Impact
+
+- Until a restart, every clone could hold any number of names. Only the shard's directory-block slab bounded them, which
+  is the pressure §4.2's namespace allowance exists to keep one volume from putting on the rest: hard-link fan-out and
+  name churn.
+- A restart did set the allowance, so a clone's limit changed across a restart.
+
+### Exact edits
+
+- `crates/server/src/verbs.rs`, `admit_clone`: after the inode allowance, the clone's entry allowance. It is a
+  create's share (`entry_allowance(size)`), never below the entries the clone holds, which are its snapshot's (A-549),
+  as a restart's re-admission floors it. A refusal is counted as `volume.allowance_refused` (there is none, since the
+  floor is the count). It reserves nothing, so it is set from the clone's own count once the clone exists.
+- The lib test `a_clone_is_admitted_with_an_entry_allowance_never_below_its_snapshots_entries` (`clone_admission_tests`):
+  - A bounded origin has its allowance raised past its share, is linked up to the share plus 8 names, is snapshotted,
+    and is left one under the share, then cloned. The clone's allowance must be its snapshot's 4,104 entries, and its
+    count must equal a walk of its namespace.
+  - A small origin's clone must get the share.
+  - No allowance may be refused.
+
+Evidence: red first with the fix's lines taken out (`u64::MAX` against 4,104), green with them; `cargo test --locked -p
+slates-server --lib clone` 11 passed, 1 ignored (main's open-bug test of a live clone), on the Mac Studio, 2026-11-19.
+
+## 3. A resize left the entry allowance at the size the volume was made with
+
+### Description
+
+A resize moved a volume's inode allowance with its new policy but left its entry allowance at the share of the policy
+the volume was made with. A volume grown from 64 KiB to 1 MiB kept an entry allowance of 4,096 where its new policy's
+share is 65,536, so, by `dir_insert`'s admission, its 4,097th name was refused `NoSpace` far inside the quota it was
+resized to (read from the code, not run). A volume shrunk kept the larger allowance of its first size. Measured on the
+Mac Studio (2026-11-19), with the test alone on main: after the resize up, the allowance was 4,096 where 65,536 was
+owed.
+
+### Root cause
+
+`resize` (`crates/server/src/verbs.rs`) re-derives the inode allowance from the new policy (`inode_allowance`, floored at
+the live count) and sets it. It never re-derived the entry allowance, which only a create (`admit_dimensions`) and a
+restart set.
+
+### Impact
+
+- A grown volume refused names (`NoSpace`) at its old share; a shrunk one kept the larger share until a restart re-derived
+  it.
+- A restart re-derives it from the policy the catalog acknowledged, so the allowance also changed across a restart.
+
+### Exact edits
+
+- `crates/server/src/verbs.rs`, `resize`: after the inode allowance, the entry allowance. It is the new policy's share
+  (`entry_allowance(size)`), never below the entries the volume holds, as a create derives it and a restart floors it.
+  It reserves nothing, so it is set once the core has accepted the new limit. A refusal is counted as
+  `volume.allowance_refused` (there is none, since the floor is the count).
+- The lib test module `resize_admission_tests` is new, using `clone_admission_tests`' helpers, which are now visible to
+  it. Its test `a_resize_moves_the_entry_allowance_with_the_policy_never_below_the_entries_held` sets up a bounded
+  volume holding a file and names linked to it past the smallest policy's share:
+  - Resized up, its allowance must be the larger policy's share.
+  - Resized down, it must be the smallest policy's share floored at the entries it holds, which equals a walk of its
+    namespace.
+  - No allowance may be refused.
+
+Evidence: red first with the test alone on main (4,096 against 65,536 after the resize up), green with the change;
+`cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored, and `resize_admission_tests` 1 of 1, on the Mac
+Studio, 2026-11-19.

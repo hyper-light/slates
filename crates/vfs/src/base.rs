@@ -563,6 +563,7 @@ pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> 
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
     | HostError::Unavailable(code)
+    | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => Some(code),
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       Some(GONE_DIRECTORY)
@@ -886,6 +887,7 @@ fn host_refusal(e: HostError) -> VfsError {
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
     | HostError::Unavailable(code)
+    | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => VfsError::BaseUnavailable(Some(code)),
     HostError::Pending(fetch) => VfsError::BasePending(fetch),
   }
@@ -4727,7 +4729,7 @@ mod tests {
   ) -> Result<Vec<u8>, VfsError> {
     let mut o = vol.with_host(host);
     let size = o.stat(store, no)?.size;
-    let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+    let mut buf = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
     let n = o.read(store, no, 0, &mut buf)?;
     buf.truncate(n);
     Ok(buf)
@@ -4897,6 +4899,152 @@ mod tests {
       walked(|visit| successor.visit_head_inodes(&kept, None, visit)).contains(&file.0),
       "the takeover names the base file the kernel cached the old bytes of"
     );
+  }
+
+  /// Shape: the inode numbers the A-578 tests' store reserves ahead of a volume's counter (A-150): nonzero, so a
+  /// publication's live counter and its reserved ceiling differ (with none they coincide, and no number is unrecorded),
+  /// and past the few numbers each scene issues after its publication.
+  const RESERVE: u64 = 16;
+
+  /// The A-578 scene: with a nonzero reserve, an overlay over a base holding `/dir/notes` is published; after the
+  /// publication a file `draft` is made and `/dir/notes` looked up, its directory loaded for the first time, each
+  /// issuing numbers no publication records; the daemon dies, and a successor rebuilds from the publication. Returns
+  /// the publication, the successor, its store and host, and `draft`'s and `notes`' numbers.
+  fn issued_after_the_publication() -> (
+    crate::recover::VolumeImage,
+    Volume,
+    Store,
+    SimHost,
+    [InodeNo; 2],
+  ) {
+    let mut host = SimHost::new();
+    host.mkdir("/dir");
+    host.replace_file("/dir/notes", OPENED);
+    host.advance_ns(STEP_NS);
+    let mut store = store();
+    store.inode_reserve = RESERVE;
+    let mut vol = overlay(&mut host, &mut store);
+    let image = vol.to_image(&store, Some(&mut host)).unwrap();
+    let root = vol.root_inode(&store).unwrap();
+    let draft = vol
+      .with_host(&mut host)
+      .create_file_no(&mut store, root, "draft", 0o644)
+      .unwrap();
+    let notes = vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/dir/notes")
+      .unwrap()
+      .inode;
+    host.close_files();
+    let (successor, kept) = rebuilt(&store, &image, &mut host);
+    (image, successor, kept, host, [draft, notes])
+  }
+
+  /// A-578 (§4.6, a mount taken over by a restarted daemon; A-150, A-573). Do: the A-578 scene
+  /// ([`issued_after_the_publication`]). Expect: the successor holds neither number the dead daemon issued after its
+  /// last publication, each refused `NotFound` and never served, and its takeover walk of the head names both, so a
+  /// descriptor a kernel opened on one before the death drops its pages. Before A-578 no publication recorded the
+  /// counter they were issued above, and the walk named only what the successor holds.
+  #[test]
+  fn a_number_issued_after_the_last_publication_is_refused_and_named_by_the_takeover() {
+    let (_, mut successor, mut kept, mut host, issued) = issued_after_the_publication();
+    let named = walked(|visit| successor.visit_head_inodes(&kept, None, visit));
+    for no in issued {
+      assert_eq!(
+        successor.with_host(&mut host).stat(&mut kept, no).err(),
+        Some(VfsError::NotFound),
+        "the successor never had {no:?}: refused, never served"
+      );
+      assert!(
+        named.contains(&no.0),
+        "the takeover names {no:?}, issued after the last publication"
+      );
+    }
+  }
+
+  /// A-578. Do: the A-578 scene, then make a file on the successor (a number past the reserved ceiling, its own); walk
+  /// the takeover set whole, and in slices that break after k numbers for k from 1 to 5, each resuming past the last
+  /// number the slice before was given. Expect: the whole walk in ascending counter order, each number once, holding
+  /// every counter from the publication's live counter up to its ceiling and the successor's own file; and every
+  /// slicing joined to the whole walk, across the restored inodes, the unrecorded counters and the successor's own.
+  #[test]
+  fn the_takeover_walk_in_slices_joins_whole_across_the_unrecorded_counters() {
+    let (image, mut successor, mut kept, mut host, issued) = issued_after_the_publication();
+    let root = successor.root_inode(&kept).unwrap();
+    let own = successor
+      .with_host(&mut host)
+      .create_file_no(&mut kept, root, "own", 0o644)
+      .unwrap();
+    let whole = walked(|visit| successor.visit_head_inodes(&kept, None, visit));
+    let counters: Vec<u64> = whole.iter().map(|&no| InodeNo(no).counter()).collect();
+    assert!(
+      counters.windows(2).all(|pair| pair[0] < pair[1]),
+      "ascending counters, each once: {counters:?}"
+    );
+    let unrecorded = image.live_counter..image.next_counter;
+    assert!(
+      !unrecorded.is_empty(),
+      "a nonzero reserve leaves numbers unrecorded"
+    );
+    assert_eq!(
+      counters
+        .iter()
+        .filter(|&&counter| unrecorded.contains(&counter))
+        .count(),
+      usize::try_from(unrecorded.end - unrecorded.start).unwrap(),
+      "every unrecorded counter"
+    );
+    assert!(whole.contains(&own.0), "the successor's own file");
+    assert!(issued.iter().all(|no| whole.contains(&no.0)));
+    for per_slice in 1..=5 {
+      let mut joined = Vec::new();
+      let mut after = None;
+      loop {
+        let mut taken = 0;
+        let finished = successor.visit_head_inodes(&kept, after, &mut |no| {
+          joined.push(no);
+          after = Some(no);
+          taken += 1;
+          if taken == per_slice {
+            std::ops::ControlFlow::Break(())
+          } else {
+            std::ops::ControlFlow::Continue(())
+          }
+        });
+        if finished {
+          break;
+        }
+        assert!(joined.len() <= whole.len(), "the walk ends");
+      }
+      assert_eq!(
+        joined, whole,
+        "slices of {per_slice} join to the whole walk"
+      );
+    }
+  }
+
+  /// A-578, hostile input. Do: take a publication's image, move its live counter past its reserved ceiling, and rebuild
+  /// from it. Expect: refused `RecoveryIncomplete`, never a volume told numbers it could not have issued.
+  #[test]
+  fn an_image_whose_live_counter_passes_its_ceiling_is_refused() {
+    let mut host = SimHost::new();
+    let mut store = store();
+    store.inode_reserve = RESERVE;
+    let vol = overlay(&mut host, &mut store);
+    let mut image = vol.to_image(&store, Some(&mut host)).unwrap();
+    image.live_counter = image.next_counter + 1;
+    let mut kept = surviving(&store);
+    let claims = crate::recover::Claims::prepare(&mut kept, std::iter::once(&image)).unwrap();
+    let root = host.root();
+    let refused = Volume::from_image(
+      &mut kept,
+      &image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      1 << 16,
+      Some((&mut host, root)),
+    );
+    assert_eq!(refused.err(), Some(VfsError::RecoveryIncomplete));
   }
 
   /// A base file opened as a mount's `OPEN` does, its directory's listing current, then a digest of its path with an

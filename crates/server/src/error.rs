@@ -287,6 +287,7 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
     | H::NoSpace(code)
     | H::Unsupported(code)
     | H::Unavailable(code)
+    | H::Unprivileged(code)
     | H::OwnMount(code) => match code {
       slates_vfs::host::OsCode::Win32(code) => TargetRefusal::HostWin32 { code: *code },
       slates_vfs::host::OsCode::Errno(errno) => TargetRefusal::Host { errno: *errno },

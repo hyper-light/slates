@@ -834,7 +834,7 @@ impl Merge {
         *root = Some(clone.root_inode(store)?);
       }
       self.phase = match self.policy {
-        NameEquivalence::Fold => Phase::Index { node: 0, entry: 0 },
+        NameEquivalence::Fold | NameEquivalence::Upcase => Phase::Index { node: 0, entry: 0 },
         NameEquivalence::Exact => Phase::Plan { node: 0, entry: 0 },
       };
       return Ok(1);
@@ -1071,7 +1071,7 @@ impl Merge {
         .tree
         .find(id, name.as_bytes())
         .map(|(index, child)| (index, child.index())),
-      NameEquivalence::Fold => {
+      NameEquivalence::Fold | NameEquivalence::Upcase => {
         let key = (image_dir, self.policy.fold(name).into_owned());
         let index = *self.folded.get(&key)?;
         Some((index, self.target.tree.entry(id, index)?.1.index()))
