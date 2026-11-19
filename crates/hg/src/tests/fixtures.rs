@@ -129,3 +129,45 @@ pub(crate) fn descriptions() -> Vec<String> {
   out.reverse();
   out
 }
+
+/// The part payloads' golden vectors (A-545): what 7.2's client sent with `unbundle` in three pushes over SSH, the
+/// server's replies, 7.2's `debugbundle --all` of each, two obsstores 7.2 wrote, and the logs and server state they
+/// are judged by. Made by `fixtures/payloads/make-payload-fixtures.sh` (its header names the exact command).
+pub(crate) mod payloads {
+  /// The modern push: bookmarks, check:bookmarks, check:phases, check:updated-heads, changegroup 03, obsmarkers.
+  pub(crate) const PUSH_MODERN: &[u8] = include_bytes!("../../fixtures/payloads/push-modern.hg");
+  /// The server's reply to it.
+  pub(crate) const PUSH_MODERN_REPLY: &[u8] =
+    include_bytes!("../../fixtures/payloads/push-modern-reply.hg");
+  /// The legacy push: a bookmark and a phase moved by pushkey parts.
+  pub(crate) const PUSH_LEGACY: &[u8] = include_bytes!("../../fixtures/payloads/push-legacy.hg");
+  /// The server's reply to it.
+  pub(crate) const PUSH_LEGACY_REPLY: &[u8] =
+    include_bytes!("../../fixtures/payloads/push-legacy-reply.hg");
+  /// The push to the strict server: check:heads.
+  pub(crate) const PUSH_STRICT: &[u8] = include_bytes!("../../fixtures/payloads/push-strict.hg");
+  /// 7.2's `debugbundle --all` of the legacy push.
+  pub(crate) const PUSH_LEGACY_LISTING: &str =
+    include_str!("../../fixtures/payloads/push-legacy.hg.debug");
+  /// 7.2's `debugbundle --all` of the modern push's reply.
+  pub(crate) const PUSH_MODERN_REPLY_LISTING: &str =
+    include_str!("../../fixtures/payloads/push-modern-reply.hg.debug");
+  /// 7.2's `debugbundle --all` of the legacy push's reply.
+  pub(crate) const PUSH_LEGACY_REPLY_LISTING: &str =
+    include_str!("../../fixtures/payloads/push-legacy-reply.hg.debug");
+  /// An obsstore 7.2 wrote in format 0 (`format.obsstore-version=0`).
+  pub(crate) const OBSSTORE_V0: &[u8] = include_bytes!("../../fixtures/payloads/obsstore-v0.bin");
+  /// The same markers 7.2 wrote in format 1.
+  pub(crate) const OBSSTORE_V1: &[u8] = include_bytes!("../../fixtures/payloads/obsstore-v1.bin");
+  /// 7.2's `debugobsolete` of each (the two listings are the same bytes).
+  pub(crate) const OBSSTORE_LISTING: &str =
+    include_str!("../../fixtures/payloads/obsstore-v1.debug");
+  /// The format 0 listing.
+  pub(crate) const OBSSTORE_V0_LISTING: &str =
+    include_str!("../../fixtures/payloads/obsstore-v0.debug");
+  /// The client's log after the three pushes, newest first: rev, node, phase, description.
+  pub(crate) const CLIENT_LOG: &str = include_str!("../../fixtures/payloads/client-log-2.txt");
+  /// The server's bookmarks before the first push (`debugpushkey`).
+  pub(crate) const SERVER_BOOKMARKS_BEFORE: &str =
+    include_str!("../../fixtures/payloads/server-bookmarks-before.txt");
+}

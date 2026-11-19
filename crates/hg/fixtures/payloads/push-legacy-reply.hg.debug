@@ -1,0 +1,4 @@
+Stream params: {}
+reply:pushkey -- {in-reply-to: 3, return: 1} (mandatory: True)
+reply:obsmarkers -- {in-reply-to: 4, new: 0} (mandatory: True)
+reply:pushkey -- {in-reply-to: 5, return: 1} (mandatory: True)

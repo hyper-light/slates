@@ -5,7 +5,8 @@
 //! parameters and chunked payloads; the legacy bundle1 (`HG10`) is one changegroup. A changegroup carries the
 //! revisions of the changelog, the manifests and every file, each a delta against a base the receiver holds or
 //! receives earlier. This crate reads and writes the three framings ([`bundle2`], [`bundle1`], [`changegroup`]) and
-//! the deltas inside them ([`delta`]), byte for byte as Mercurial 7.2 writes them, and nothing more: it hashes no node
+//! the deltas inside them ([`delta`]), and the part payloads a push and a pull carry ([`phases`], [`bookmarks`],
+//! [`heads`], [`obsmarkers`], [`pushkey`]; A-545), byte for byte as Mercurial 7.2 writes them, and nothing more: it hashes no node
 //! (piece 3), runs no compression engine (a stream compressed with `GZ`, `BZ` or `ZS` is refused by kind until the
 //! engines are wired, D-17), and handles no part (piece 5).
 //!
@@ -35,11 +36,16 @@
 //! from the deltas, and encode each bundle back to its own bytes.
 
 mod admission;
+pub mod bookmarks;
 pub mod bundle1;
 pub mod bundle2;
 pub mod changegroup;
 pub mod delta;
+pub mod heads;
+pub mod obsmarkers;
 mod out;
+pub mod phases;
+pub mod pushkey;
 mod read;
 
 pub use admission::{Admission, PastAdmission};
@@ -70,3 +76,7 @@ pub struct Truncated {
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
 pub(crate) mod fixtures;
+
+#[cfg(test)]
+#[path = "tests/payloads.rs"]
+mod payload_tests;
