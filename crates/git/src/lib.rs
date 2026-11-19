@@ -58,6 +58,7 @@ pub mod refname;
 pub mod sideband;
 pub mod store;
 pub mod unpack;
+pub mod upload;
 pub mod v0;
 pub mod v2;
 

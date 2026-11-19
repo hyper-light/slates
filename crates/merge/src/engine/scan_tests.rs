@@ -1,8 +1,9 @@
-//! The verdict decides an IPC node's removal by lookups, whatever the green holds (A-646; A-643's
+//! The verdict decides an IPC node's removal by a lookup, whatever the green holds (A-646; A-643's
 //! third sibling). It had scanned every attribute change and every hard link of the green for each
 //! removal, O(changes) for one operation on the verdict's path, where the change index
-//! (`latest_change`, through `changed_after`) and the reverse map of the links (`links_to`) answer
-//! by lookup. A counter of the entries the verdict examines, kept in test builds, is the proof.
+//! (`latest_change`, through `changed_after`) answers by lookup; and since hard links name nodes
+//! (A-646 part 2), the links naming the node keep it rather than refuse its removal. A counter of
+//! the entries the verdict examines, kept in test builds, is the proof.
 
 use std::cell::Cell;
 
@@ -17,8 +18,7 @@ thread_local! {
   static EXAMINED: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Counts one entry the verdict examined: a lookup of a path's last change, or of the links naming
-/// it (test builds).
+/// Counts one entry the verdict examined: a lookup of a path's last change (test builds).
 pub(super) fn count_examined() {
   EXAMINED.with(|count| count.set(count.get().saturating_add(1)));
 }
@@ -31,9 +31,9 @@ fn examined() -> u64 {
 /// Shape: the files of the green, each named by a hard link and with an attribute changed after
 /// the origin: the entries a scan of the green examined for every removal.
 const FILES: usize = 1_000;
-/// Shape: the entries the verdict examines deciding an IPC node's removal: its last change and the
-/// links naming it.
-const LOOKUPS: u64 = 2;
+/// Shape: the entries the verdict examines deciding an IPC node's removal: its last change. The
+/// links naming it no longer refuse it, since they keep the node (A-646 part 2).
+const LOOKUPS: u64 = 1;
 /// Shape: the IPC node the works remove.
 const NODE: &str = "p";
 /// Shape: the attribute the works set.
@@ -121,11 +121,10 @@ fn accept(green: &mut Green, increment: &Increment) -> Result<(), String> {
 
 /// A-646 (A-643's third sibling). Do: in a green of a thousand files, each named by a hard link,
 /// set an attribute on every file; then remove the FIFO by a work based at the head, counting the
-/// entries the verdict examines. Expect it accepted, the FIFO gone, and two entries examined, its
-/// last change and the links naming it, where a scan of every attribute change and every hard link
-/// examined two thousand.
+/// entries the verdict examines. Expect it accepted, the FIFO gone, and one entry examined, its
+/// last change, where a scan of every attribute change and every hard link examined two thousand.
 #[test]
-fn an_ipc_nodes_removal_examines_two_entries_whatever_the_green_holds() -> Result<(), String> {
+fn an_ipc_nodes_removal_examines_one_entry_whatever_the_green_holds() -> Result<(), String> {
   let mut green = green_of(FILES);
   let names: Vec<String> = (0..FILES).map(|number| format!("x{number:04}")).collect();
   let doc = set_attribute(names.iter().map(String::as_str));

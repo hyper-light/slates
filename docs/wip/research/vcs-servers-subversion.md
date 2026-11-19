@@ -50,6 +50,12 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | httpd 2.4.66 `modules/dav/main/mod_dav.h`, `mod_dav.c` (A-609) | `ad8361ef4e7e311c`, `2cab686b045e2237` | C |
 | `subversion/mod_dav_svn/reports/list.c`, `file-revs.c`, `mod_dav_svn/lock.c` (A-627) | `9c852cb6ba67f446`, `6efa4630426dabd0`, `c5bc4498df507c4f` | C |
 | httpd 2.4.66 `modules/dav/main/util_lock.c`, `props.c` (A-627) | `6b26b0425b33ea20`, `92a3201fa69632e6` | C |
+| `subversion/libsvn_repos/replay.c`, `libsvn_delta/path_driver.c` (A-627, the replay's calls) | `eb42d8bd06a5eb07`, `1139deea567fcfe8` | C |
+| `subversion/libsvn_ra_serf/replay.c`, `lock.c`, `get_lock.c` (A-627, what the client reads) | `6d30fbb7ecc59f10`, `d680419957383888`, `33123342971c83c9` | C |
+| `subversion/include/svn_error.h`, `include/private/svn_fs_util.h`, `include/private/svn_fspath.h` (A-627) | `3c0818af46aaf0b1`, `b1f1221b87609113`, `e549235c83765458` | B |
+| `subversion/libsvn_subr/checksum.c` (A-627, `svn__digest_to_cstring`) | `907299438410f21b` | C |
+| httpd 2.4.66 `modules/dav/main/util.c` (A-627, `dav_get_timeout`, `dav_validate_resource_state`) | `175813443fc6fb35` | C |
+| apr-util 1.6.3 `xml/apr_xml.c` (A-627, `start_handler`, `write_elem`), from `raw.githubusercontent.com/apache/apr-util/1.6.3/` | `2611d4992c9ce92d` | C |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
@@ -62,6 +68,8 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_ra_svn/internal_auth.c` | `61f373448a9c878c` (A-599) | C |
 | `subversion/libsvn_ra_svn/client.c` | `3c3b9263dd7223a9` (A-599) | C |
 | `subversion/libsvn_ra_svn/editorp.c` (read 2026-11-19 for A-617; 1.15.0's is the same bytes) | `610cffcd14b17ecf` | C |
+| `subversion/include/private/svn_fs_util.h` (read 2026-11-19 for A-617) | `b1f1221b87609113` | C |
+| `subversion/libsvn_subr/checksum.c` (read 2026-11-19 for A-617) | `907299438410f21b` | C |
 | `subversion/mod_dav_svn/repos.c` | `940bc5282be7b763` | C |
 | `subversion/libsvn_repos/hooks.c` | `96392d3013a7f6bb` | C |
 | `subversion/libsvn_repos/log.c` | `d5f97de3e455314b` | C |
@@ -206,6 +214,26 @@ changed texts, owed), and `libsvn_ra_svn/marshal.c` at 1.15.0 for the editor com
     - Base64 lines are 76 characters, the last line ended by a line feed too (`base64.c` 47, 171-204).
     - `svn_xml_fuzzy_escape` writes `?\NNN`.
     - `apr_xml_quote_string` escapes `&`, `<`, `>`, and `"` only when asked.
+- **The lock verbs and the editor drives' answers** (read 2026-11-19 for A-627's rest; §4.17.4 piece 13).
+  - **Recorded requests** [M: svn 1.15.0, Homebrew, the Mac Studio, 2026-11-19, against a recorded responder that
+    reports a lock to a lockdiscovery PROPFIND]. `svn lock` sends LOCK with no `Depth`, `Timeout` or
+    `X-SVN-Version-Name` for a URL, `X-SVN-Options: lock-steal` with `--force`, and the comment XML-escaped in
+    `owner`; `svn unlock` and `svn unlock --force` first PROPFIND `lockdiscovery` at `Depth: 0`, then UNLOCK with
+    `Lock-Token: <opaquelocktoken:…>`, `X-SVN-Options: lock-break` with `--force`; `svn info` PROPFINDs
+    `lockdiscovery`. The LOCK and PROPFIND bodies equal the earlier fixtures byte for byte.
+  - **What the client reads** [C: `libsvn_ra_serf/lock.c` 88-212, 216-403; `get_lock.c` 81-337]: from LOCK's answer
+    `D:timeout`, `D:locktoken/D:href` (spaces collapsed) and `D:owner`'s text, and the headers `X-SVN-Lock-Owner` and
+    `X-SVN-Creation-Date`; a status as an error: 400 `E160040`, 403 `E160039`, 405 `E160042`, 423 the server's
+    filesystem error or `E160035`, 404, 409 and 500 the server's error. A PROPFIND's lockdiscovery at 207 alone.
+  - **What `mod_dav` and `mod_dav_svn` write** [C: httpd `mod_dav.c` 3178-3460, `util_lock.c` 42-251, `util.c`
+    542-574 and 899-1420, `props.c` 355-451; `mod_dav_svn/lock.c`, `util.c` 100-170 and 765-801]: as the module
+    documentation of `slates-svn`'s `dav::locking` states, line by line; DAV:'s owner element echoed through
+    `apr_xml_to_text` with `APR_XML_X2T_FULL_NS_LANG` (`apr_xml.c` 795-905), declaring every namespace of the body,
+    `DAV:` first and an element's own declarations last to first (162-169, 200-225, 399).
+  - **The replay's calls** [C: `libsvn_repos/replay.c` 452-795, 918-990; `path_driver.c` 66-117, 234-300]: the root,
+    every directory and file opened, and every deletion, with `SVN_INVALID_REVNUM`; `set_target_revision` always
+    first; revision 0 that call alone; no `close_edit`; with deltas off, a nameless property removal and a delta of the
+    window handler's end alone.
 - **svndiff over HTTP** [C: `mod_dav_svn/repos.c` 1784-1851]: the response's version follows the request's
   `Accept-Encoding` and the server's compression level (svndiff2 when the client lists it and the level is 1, else the
   client's preference, else 0). What a client sends in PUT bodies follows the server's advertised capabilities
@@ -802,3 +830,23 @@ the first 16 hex digits of each file's sha256:
   makes; the golden vectors' stock round trip (`svnadmin load` then `dump` of each, recorded on the parked branch
   `agents/g264-a628-svnadmin`, `fixtures/svnadmin/redumps.txt`) gives `full.dump` byte for byte, the bar the export is
   held to.
+- **The drive's checks** [C: `commit.c` 413-882; `tree.c`; `svn_fs_util.h` 82-107; `checksum.c` 688-694; `lock.c`
+  605-630]: `open-root` past the youngest is "No such revision %ld (HEAD is %ld)" (428-431), the transaction begun on
+  the youngest; `delete-entry` checks the path in the transaction, then (absent) "'%s' is out of date", then the
+  out-of-date test when it names a revision (487-509); an add with a copy refuses a present target unless its directory
+  was copied, then a source outside the repository ("Source url '%s' is from different repository"), then the source's
+  revision and path (323-366); an add without one is FSFS's "File already exists: filesystem '%s', transaction '%s',
+  path '%s'"; `open-dir` of an absent path is "Path '%s' not present", the relpath as the client named it (550-554);
+  `open-file` reads the created revision, "File not found: transaction '%s', path '%s'" for an absent one, then the
+  out-of-date test (627-634); a directory's out-of-date test runs at its first property change only (710-727);
+  `close-file` compares the text's MD5, "Checksum mismatch for resulting fulltext\n(%s)" in
+  `svn_checksum_mismatch_err`'s layout (679-694); `close-edit` without `open-root` is `E165002` (811-813).
+- **Locks at each call** [C: `tree.c`, with `SVN_FS_TXN_CHECK_LOCKS`]: `fs_delete_node`, `fs_make_dir` and `copy_helper`
+  check every lock at or beneath the path, `fs_make_file` and `fs_apply_textdelta` the path's own, `fs_change_node_prop`
+  at or beneath a directory and a file's own; a commit against another's lock is refused at the first such call
+  (`verify_lock`'s order: no user, then the owner, then the token), the same words the verdict would give at
+  `close-edit`.
+- **Words without a message** [C: `marshal.c` `svn_ra_svn__write_cmd_failure`]: an error created without a message is
+  written with its code's own (`svn_err_best_message`): `svn_checksum_parse_hex`'s refusal is "Invalid character in hex
+  checksum" and an undecodable LZ4 block "LZ4 decompression failed" (`svn_error_codes.h` 221, 1498). A checksum is read
+  as its first 32 hexadecimal digits, the rest ignored, and the all-zero digest is no checksum at all.

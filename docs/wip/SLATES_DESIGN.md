@@ -11452,6 +11452,25 @@ against what that copy brings there.
 > oracle renames a file or a link over a file or a link. Owed, as A-646 part 2: a hard link names its target's node,
 > never a path.
 
+> **Decision (2026-11-19, A-646): a hard link names its node, never a path.** As a POSIX inode is named by every link
+> to it, a node is named by its home, the one path holding its content or IPC node, and by the hard links naming it
+> there.
+> - Removing or replacing the home leaves the node to its links. The least surviving link becomes its home, holding
+>   its content or IPC node, its mode and its attributes, and the other links name it there; its bytes go only with
+>   its last name.
+> - Renaming the home moves the node, and its links name it at the new path.
+> - A later file at a path the node left is another node, which no link names.
+> - A link a work makes names a node: the one at the target at the work's base (a link's home while that link stood
+>   unchanged since, a file while it was not removed since), or the one the work makes.
+>
+> The engine holds a node at its home and keeps every link's target there. The moves are derived in the commit from the
+> head and the version's own effects (`Green::node_moves`), never recorded: a replay derives the same, and a rebase
+> restates only the work's operations. A minted inode number was rejected: it would have to be persisted in every
+> checkpoint and carried through copies and branches, for no difference anyone can observe, since the home is unique at
+> every version and moves with its node. Status: the engine since A-646 part 2a (`crates/merge/src/engine/
+> node_tests.rs`; the whole-state oracle follows nodes). Owed, part 2b: the ops document says so, a node table that a
+> link names, under a new format version.
+
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
 into the increment's post-state chunks (`Extent{src: Chunk{chunk, off}}`, sub-chunk offsets
@@ -11470,9 +11489,11 @@ that host, and issued only when every identity the version references is placed.
 increment id already in `seen` returns its original result (the completion record holds the
 reply); retries are always safe. A signed submit's verdict rides the version's chain entry and the green's accepted
 record, a checkpoint keeping it once it folds the entry (A-321): the version's provenance, read back by `MergeRecord`
-and answering every later reply that names the version. A green that is a member of a repository commits each version
-as an entry of the repository's register, which one step can share with the repository's other greens' versions, its
-namespace and its own state (§4.17.1 shared piece 2, A-603).
+and answering every later reply that names the version. A green keeps its own log, its chain: each version is an
+append to it, and a push of several greens' versions is one entry appended to each green it moves only while each is
+at the position the push read, kept as one atomic record those positions point to (§4.17.1 shared piece 2; A-603,
+rebuilt by A-635 per A-642). A push is judged whole before anything is applied: `Green::judge` holds each work's verdict
+and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -11809,6 +11830,28 @@ decides the details.
 > mismatch refuses the repository on that holder; a takeover adopts whole entries; and the repository record's own
 > replication rides it (A-515's owed half). Until then each member's version still ships on its green's own register,
 > so in a fleet an entry of several greens is atomic on its owner and not across a takeover of it.
+>
+> **Status (2026-11-19, A-635: the push over several works, and A-603's entry rebuilt per A-642).** The repository-wide
+> position is gone: each green keeps its own log (its chain), and the repository's own state is kept in logs of its own,
+> the names log (the namespace and the lineage's joins), the phases, markers and locks logs, each at its own position
+> and moved only by its own changes; the policy's version is its own log's position (A-622). A version appends only
+> while its green is at the position the push read, refused `Moved` naming the green, the position read and the one
+> it is at; a check of an unmoved green compares its position the same way; `RepositoryCheck::Log` compares a state
+> log's. An entry that moves two logs or more, a green's among them, is one atomic record (`AtomicRecord`): each
+> position it took on each green's log points to it; a holder applies it only at its join (`AtomicRecord::join`: every
+> log at its predecessor); a cut that holds part of it is refused (`Repositories::split_by`); a recovery, which replays
+> the partition's log, rebuilds it whole, and a snapshot carries each record with the positions still pointing to it.
+> Records go once no green's log points to them (its checkpoint, its destroy). Git LFS's locks are state changes of
+> their own (`LockTaken`, `LockReleased`). The push itself is `crates/server/src/repository/push.rs`: one interface,
+> `RepositoryLogs::append`, which the shard's state implements, takes each branch a push changes (a work A-618's
+> `push::build` made, a new branch made at a version and moved by a work, a delete at the version read) beside the
+> entry's checks, names and state; it plans every change by its rules and each green's merge gates, makes new branches
+> in memory, secures retention, holds every work's verdict (`Green::judge`), judges the whole entry with its new greens
+> counted held (`Partition::check_creating`), and only then commits the verdicts (`Green::commit_judged`) and records
+> the new greens and the entry as one log record; a refusal names every change refused and why, or the entry's
+> refusal, and gives back what it held. Owed: the fleet half (A-636): each green's log and each state log replicated on
+> its own, holders applying atomic records at their joins, replicas refusing split cuts, takeovers adopting each log
+> and each record whole; and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -11820,10 +11863,11 @@ decides the details.
    changesets and moves bookmarks are each one durable step, with no coordination call on the write path (§2 ban 10).
    Repositories spread across the fleet; one repository's greens serialize on its owner shard. §4.16 gives each green a
    register of its own; a register shared by a repository's greens, whose entry carries one or more of their merge
-   records, is the change this needs (shared piece 2; built on the owner by A-603, its fleet half owed: status above).
+   records, was A-603's answer. A-642 replaced it: each green keeps its own log, and a push of several is one entry on
+   each green it moves, an atomic record (built on the owner by A-635, its fleet half owed: status above).
 3. The namespace changes ride the same register: creating a branch, deleting one and moving the default are entries
-   of it, so two clients creating one name race on one append and one of them is refused (built, A-603: every change of
-   a repository takes one position of its register).
+   of it, so two clients creating one name race on one append and one of them is refused (built: A-603, and A-635's
+   names log, A-642).
 4. Creating a branch creates a green whose origin is a version of another green or one commit of the tool, shared by
    identity, so creating it costs no walk of the tree. (The engine makes a green at another green's version without a
    walk since A-534, §4.16; the verb, `CreateGreen { base }`, still walks its base until piece 1's repository verbs use
@@ -12233,8 +12277,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
    them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
    `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3). Built on the owner, its recovery included
-   (A-603); owed: the push that judges several works before any commits, and the fleet half (the register as one ledger
-   object, holders recomputing whole entries, takeovers adopting them).
+   (A-603), rebuilt to A-642's logs with the push that judges several works before any commits (A-635); owed: the
+   fleet half (A-636: each log replicated on its own, holders applying atomic records at their joins, replicas refusing
+   split cuts, takeovers adopting each log and each record whole).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -12505,9 +12550,13 @@ engine: the verdict, rebase, position mapping, the register).
 > appends). `Session` runs them over one connection, sans-io: bytes in as they arrive, the repository handed to each call
 > that reads, the push then waiting checked while the caller admits its objects to the store's quarantine, and decided
 > through the judge and answered to the caller's sink. Proven byte for byte against eleven pushes stock git 2.50.1
-> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2
-> implements `Judge`: each ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable
-> versions (A-645), appended per A-642.
+> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2's
+> judge is built (`works::Works`): each ref's update a work through A-618's `build` over A-638's `PushedObjects`, each
+> green read as the push found it (`Greens`), immutable (A-645). An update's base is the version whose head is its old
+> value, a ref that moved when none held it; a create is built over an empty green; a delete retires the green at its
+> head; a tag names its commit's tree. Each work is appended on its green's own log through `Appends`, A-642's stand-in
+> until g261's append lands, all or none under `atomic`. Owed: the server's push path that admits the checked objects
+> to the quarantine and drives the session with g261's appends and A-614's store commit.
 >
 > **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
 > answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
@@ -12557,6 +12606,15 @@ engine: the verdict, rebase, position mapping, the register).
 > two pushes moving one link apart from one base conflict `CreateCreate`. A path changing to or from a link is a typed
 > kind change (GAPS §8f). A link's form in a volume and in a checkout is owed (git checks a submodule out as an empty
 > directory).
+>
+> **Status (2026-11-19, A-640 part 2: upload-pack's v2 service behind one entry point).** `crates/git` (`upload`)
+> answers each exchange a transport hands it through `upload::serve`: the advertisement this section's "The wire"
+> names; a request held to it as `serve.c` holds one; `ls-refs` from the served refs, read at one position, each prefix
+> a run of the sorted refs; `fetch` mapped onto A-615's negotiation over part 1's graph, its sections in the document's
+> order and its pack framed on band 1 from a pack source (A-639 writes it); and `object-info` over A-624's answer.
+> Refusals are answered in git's words. The answer is written a slice at a time within the caller's room, the
+> repository lent afresh each step. Proven against stock git 2.50.1's own answers, and against a stock clone's own
+> requests served from the repository it cloned, rebuilt in the store. Protocol v0 and v1 are A-640's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -13176,6 +13234,10 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   a log's rows are contiguous and in order (`L`, the log's key, the number) and a node finds its number in each log
   that holds it (`N`, the node, the log's key); a changeset's branch is kept as its name, and a file revision's block
   and bytes as two contents of its row.
+- Every key begins with its kind's tag (A-649): a log row's `L`, a node row's `N`, and an object row's `O` and the node
+  (`HgIndex::commit_objects`, a push's quarantine committed tagged), so no key of one kind equals one of another
+  whatever a path's length. A raw node is never a key: a file log row of a 13-byte path is twenty bytes long, as a node
+  is, and the shared quarantine's own `commit`, which keys an object's row by its raw id, is never run on these rows.
 
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
@@ -13541,9 +13603,9 @@ and export by landing).
 > refusal is the verdict's and whose entries are its accepted answer. Every refusal typed and named by its Subversion
 > error. Its oracle transcribes `merge()`, `compare_dir_structure`, `verify_locks`, `verify_lock` and
 > `svn_path_compare_paths` over the naive FSFS of the index's tests and equals the verdict, with the lock table's real
-> check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. Owed with the server
-> (piece 7): the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each
-> command arrives, over a transaction built a command at a time.
+> check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. The drive asking the
+> out-of-date test, and the lock check FSFS also makes at each editor call, as each command arrives, are A-617's (part
+> 2b).
 >
 > **Status (2026-11-19, A-599).** Built: ra_svn's greeting and authentication (`slates-svn`'s `handshake`, piece 7's
 > first part), a state machine that does no I/O, from the greeting to `repos-info`: the client's answer read as
@@ -13651,10 +13713,29 @@ and export by landing).
 > recorded on the Mac Studio, four of them refused by `svnserve`: stock `svn` 1.15.0 against stock `svnserve` 1.15.0
 > through a relay (`crates/svn/fixtures/commit`, its `make-fixtures.py`, each file's SHA-256 in `SHA256SUMS`), every
 > command read and written back byte for byte, every text delta decoded whole and applied to its file's text; and to
-> `vparse_tuple` transcribed over generated items for every prototype. Owed (part 2b): the drive, each command checked
-> as it arrives (the tokens, the paths, the out-of-date test, the lock check) and declared on a trial built a command at
-> a time, the texts through the svndiff codec with their MD5 checked, `close-edit`'s verdict, and the answers `svnserve`
-> writes: after a failure, the commands read and dropped until `abort-edit` (`editorp.c` 1149-1208).
+> `vparse_tuple` transcribed over generated items for every prototype. The drive is part 2b's, below.
+>
+> **Status (2026-11-19, A-617, part 2b).** Built: the commit's drive (`slates-svn`'s `commit::drive`, piece 7's commit,
+> its second part). `commit` is answered up to its drive as `serve.c` answers it, the lock tokens joined to the
+> session's path. Each editor command is checked as `svnserve`'s commit editor checks it, in its order and words:
+> `open-root` past the youngest; the out-of-date test at `delete-entry`, `open-file` and a directory's first property
+> change (A-592's); a deletion of an absent path, an add over a present one, a copy onto one unless its directory was
+> copied, a copy's source outside this repository or absent at its revision, `open-dir` and `open-file` of absent paths;
+> and FSFS's lock check at each call that changes a path (A-602's, over that one path, at or beneath it for a deletion,
+> a directory's addition, a copy and a directory's property change). Text deltas are decoded and applied a window at a
+> time against the file's text in the transaction by the svndiff codec, the base and resulting MD5 checked (`E200014`),
+> the new text's MD5 and SHA-1 taken as it is written (aws-lc-rs); a property change is one new list. `close-edit` runs
+> A-592's verdict and hands the accepted work to the owner, who commits it and writes `svnserve`'s answer. Token faults
+> and a client's failure end the connection; a refusal is written at once and every item after it dropped until
+> `abort-edit`. The drive keeps the revision's rows, folded as FSFS folds them, and reads them over the index at its
+> base, borrowing nothing between commands, since the owner appends other commits while drives run. Held to the
+> seventeen recorded commits replayed in their order (bob's lock taken with its recorded token, bob's race landing
+> during alice's drive), every answer from `commit` on byte for byte as `svnserve` wrote it, revisions 1 to 13 and the
+> out-of-date, lock and conflict refusals among them; and to hostile drives, each refusal in `svnserve`'s number and
+> words, every guard red-checked. Owed (A-617's next part): `svn_repos__validate_prop`'s property checks, the
+> authorization checks (`check_authz`, A-606's rules), an added path's validation (`svn_repos__validate_new_path`), a
+> session that must authenticate for write before `commit`, and the owner's commit step with the connection task that
+> runs the drive.
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -13680,6 +13761,26 @@ and export by landing).
 > `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by what its
 > delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`),
 > sent today as new data; and the handler.
+>
+> **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
+> (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
+> writes too, and writes the update-report's answer as `reports/update.c` writes it, in send-all mode and outside it,
+> and the replay report's as `reports/replay.c` writes it, byte for byte against their format strings: the
+> update-report names an entry by its basename and builds the checked-in href and an added directory's `bc-url` from
+> the drive's facts (`dav_svn__build_uri`, the path encoded as `svn_path_uri_encode` encodes it); the replay names
+> whole paths, sends every property value in base64 and the -1 its path driver passes as each base revision; a delta's
+> windows stream into base64 a group at a time; a call out of the drive's order is refused typed; an aborted drive
+> sends nothing. LOCK and UNLOCK are read into A-602's guards in `mod_dav`'s and `mod_dav_svn`'s order (stealing by
+> `X-SVN-Options: lock-steal`, breaking by `lock-break`), each refusal before the guard at their status (400, 403, 405,
+> 409, 412, 501), and answered as they answer: LOCK's `D:lockdiscovery` with the owner element `mod_dav` keeps (every
+> namespace the body declared, in APR's order), `Lock-Token`, `X-SVN-Creation-Date` and `X-SVN-Lock-Owner`; each
+> guard refusal as `append_locks` and `remove_lock` map it (423 with FSFS's message for a lock held or another's, 404
+> for no such revision, 501 for no principal, else 500 with FSFS's message or "Failed to create new lock." and "Failed
+> to remove a lock."); and the PROPFIND's `DAV:lockdiscovery` that `svn unlock` and `svn info` read. Held to stock svn
+> 1.15.0's own LOCK and UNLOCK heads and bodies, recorded on the Mac Studio. Owed: the resource walk a pre-1.2 client
+> asks for; the facts' revision as `dav_svn__get_safe_cr` gives it (A-616's facts carry `svn_fs_node_created_rev`'s,
+> which names a path that did not yet exist for a node beneath a copy not changed since); main's live capture against
+> Apache with `mod_dav_svn`.
 >
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
@@ -14205,8 +14306,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    `get-mergeinfo`, `log` and segments). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
-    (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH, LOCK's request and the update-report drive are
-    built (A-627), and the replay drive, LOCK's answer and LOCK and UNLOCK onto the lock table are owed.
+    (A-609); so is its second (A-627): `list-report`, `file-revs-report`, PROPPATCH, the update-report's and the replay
+    report's answers from A-616's one drive, and LOCK and UNLOCK onto the lock table with their answers and the
+    `DAV:lockdiscovery` property.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -43034,14 +43136,43 @@ Applied in the same change to:
     by mutation four ways: the checked push lost (4 failed), its objects hidden (2), a delete-only push waiting for a
     pack (4); the fourth, `end` discarding a waiting push, passed every test, so the new test now ends the input first
     and catches it (1 failed). Then 377 of 377 again (load 6.9, 16.5 s), `cargo fmt --check` clean.
-- **Owed.** Part 2, `Judge` over the engine: each command's ref the green its name maps to; its update a work through
-  A-618's `build` over A-638's `PushedObjects` (the index, then the push's quarantine), judged pure over immutable
-  versions (A-645), several judged together under `atomic` (A-635); appended per A-642 through a trait until g261's
-  per-green append lands. Then:
+- **Then, part 2's second piece (2026-11-19): the judge over the store** (`receive::works`). `Works` is receive-pack's
+  `Judge`. It reads each green as the push found it (`Greens`: the green a ref names, at the position its own log was
+  read, and the version whose head is a given commit), immutable, so the work is computed anywhere (A-645):
+  - an update's base is the version whose head is the command's old value (§4.17.1 item 1). A value no version held is
+    answered as git answers a ref that moved, `failed to update ref`, before any work is built;
+  - its work is A-618's `build` against that green, reading the push's trees and blobs through A-638's `PushedObjects`
+    (the index, then the push's quarantine, which the caller admits from `Checked::objects` and seals);
+  - a create's work is built over an empty green, and a create of a ref that names a green is a ref that moved; a delete
+    retires the green, its old value the green's head;
+  - a ref's tree is its commit's, or the tree it names; an annotated tag (a tag is a green, §4.17.1 item 6) names its
+    commit's tree. A tag of a tag, or a ref naming a blob, is `ref names no tree` (owed: git peels any chain).
+  The verdict's entry is appended through `Appends`, A-642's stand-in until g261's per-green append lands: one entry on
+  the green's own log, only while it is at the position read, or under `atomic` every entry or none. A green that moved,
+  or a conflict on the head at the append, is `failed to update ref` (under `atomic`, `atomic transaction failed`), its
+  band-2 line naming the ref. A-618's refusals answer in git's words where git has them (a moved base or one the green
+  disagrees with: a ref that moved; an object the store cannot give: `missing necessary objects`) and in slates' own
+  otherwise, one reason each (`path not held`, `duplicate entries`, `link target not held`, `path changes kind`, `push
+  past its room`, `path without bytes`), the band-2 line naming the path.
+  - Tests (seven, over a real store and engine, through a session): an update appended at the position read, its work
+    the green's next version holding the client's bytes and head; an old value no version held, and a create of a ref
+    that exists, each a ref that moved; a create a new green; an annotated tag a green of its commit's tree; a delete
+    retired at its head and refused at another value; a branch another push moved before the append, alone and under
+    `atomic` beside a create; a file made a directory refused `path changes kind` naming it.
+  - Checks on the Mac Studio (2026-11-19): the first build met main's A-637, which made a submodule link a served node,
+    so that refusal's words went. Then 386 of 386 under `--locked` (two of main's ignored; load 12.2, 14.3 s). Failing
+    first: with the judge stubbed to read no green, six of the seven failed, all but the moved-ref test, which mutation 1
+    guards. Red five ways: any base taken (1 failed), a delete retiring anywhere (1), the atomic line naming the wrong ref
+    (1), a kind change answered as a moved ref (1), a tag's tree read from the tag (1). `cargo fmt` (brought back by
+    blob hash), `cargo fmt --check` clean.
+- **Owed.** The server's push path: the caller that admits `Checked::objects` to a store quarantine and seals it, then
+  answers through `Works` with g261's per-green append (A-642) and A-614's `Repository::admit` and `commit` beside it;
+  several works judged together under `atomic` (A-635); the policy's checks (fast-forward, deletes, linear history,
+  signatures, evidence; A-622's check point) and the admission hooks. Then:
   - review requests over `refs/for/` with report-status-v2's option lines (piece 10), and signed pushes (`push-cert`);
   - the `.have` lines of objects a fork shares (git's alternates);
-  - the warnings git's strict check writes on band 2, and A-590's checks of the `.gitmodules` and `.gitattributes`
-    blobs.
+  - the warnings git's strict check writes on band 2, A-590's checks of the `.gitmodules` and `.gitattributes` blobs,
+    and a tag of a tag peeled.
 
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`receive/`, new, with its
 tests; `unpack.rs`'s `Outside`, `NoObjects` and `Reader::finish_with`, and its test; `lib.rs`'s module line);
@@ -43833,6 +43964,110 @@ versions and D(k) the store keeps, and neither module names the other's internal
 Part 1 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`store/graph.rs`,
 new; `store/repository.rs`, the child module's line; `store/mod.rs`, its re-export; `tests/store_graph.rs` and
 `tests/served.rs`, new; `lib.rs`, the test module's line).
+
+**Part 2: upload-pack's v2 service behind one entry point** (`crates/git/src/upload`; §4.17.2 "The wire", "A fetch"
+items 1 to 4, "Pieces (git)" piece 7). Sources, read 2026-11-19 at git v2.50.1: `serve.c`
+(`protocol_v2_advertise_capabilities`, `process_request`, `parse_command`, `receive_client_capability`), `ls-refs.c`
+(`ls_refs`, `send_ref`, `send_possibly_unborn_head`), `upload-pack.c` (`upload_pack_advertise`, `upload_pack_v2`,
+`process_args`, `parse_want`, `parse_want_ref`, `process_shallow`, `process_deepen_not`, `send_acks`,
+`process_haves_and_send_acks`, `send_shallow_info`, `send_wanted_ref_info`, `create_pack_file`), `refs.c`
+(`expand_ref`, `ref_rev_parse_rules`) and `pkt-line.c` (`packet_writer_error`) [C]; `gitprotocol-v2` [B].
+
+- **One entry point**, for the HTTPS edge (A-625 part 2) and the SSH server's `git-upload-pack` command (A-633):
+
+  ```rust
+  pub fn serve<P: PackSource>(
+    served: &Served<'_>,
+    version: http::Version,
+    asked: Asked<'_>,
+    packs: &mut P,
+    admission: &mut Admission,
+  ) -> Answer<P::Pack>
+  ```
+
+  `Served` lends the repository, its content, the refs a client may see (in name order, each naming its green) and
+  `HEAD`'s branch. `Asked` is the advertisement, or one request held whole: an HTTP `POST`'s body, or what
+  `v2::request::whole_len` measured of an SSH session's input. The `Answer` borrows nothing.
+  `Answer::write(&served, &mut packs, &mut out, room)` writes at most `room` bytes and lends the repository afresh
+  each step, so a shard never holds its state across a wait; it answers `Written::End` once the answer is whole.
+  `refusal()`, `counters()` (one round or walked) and `ends_session()` (a flush alone, an SSH session's last request)
+  say what happened.
+- **Everything but the pack at one position.** `serve` decides and encodes everything but the pack in one turn over
+  the repository, each list and the bytes charged to the request's admission before they are made.
+  - The advertisement, in `serve.c`'s order: `agent`, `ls-refs=unborn`, `fetch=shallow wait-for-done filter
+    ref-in-want sideband-all packfile-uris`, `server-option`, `object-format`, `session-id`, `object-info`.
+    `bundle-uri` waits for a bundle list.
+  - A request is held to the advertisement as `serve.c` holds one: a command not advertised is `invalid command`, a
+    capability not advertised (`promisor-remote`) is `unknown capability`, and an object format other than the
+    repository's is `mismatched object format`.
+  - `ls-refs`: `HEAD` first where a prefix takes it, `unborn` with its target only when both `unborn` and `symrefs`
+    were asked, as git lists it; then each ref a prefix takes, in name order, an annotated tag peeled through every
+    tag it names. The refs are in name order, so each prefix is a run found by a search, and a prefix a shorter one
+    begins is dropped, so no ref comes twice.
+  - `fetch`: `want-ref` is looked up by its full name, `HEAD` read through to the default branch. `deepen-not` is
+    tried as each of git's patterns (`ref_rev_parse_rules`) and must name exactly one ref. The filter is parsed, and
+    the rest go to A-615's negotiation. The sections follow the document's order: acknowledgments, `shallow-info`
+    (its lines without an LF, as git writes them), `wanted-refs`, then the packfile section's header.
+- **The pack**, through `PackSource`, which A-639 implements: `begin` takes the plan (runs of versions, single objects,
+  the filter for the runs, `thin-pack`, `ofs-delta`); then `write` gives a packet's data at a time. The answer frames
+  it on band 1 in full packets of 65,515 bytes (the format's limit), then the flush. A source that refuses, or writes
+  nothing while saying more is coming, ends the response with git's band-3 words: "aborting due to possible
+  repository corruption on the remote side." Until A-639 lands, the tests' source writes whole objects.
+- **Refusals** are answered with `ERR <words>`, or on band 3 under `sideband-all`, git's words where it has them:
+  `upload-pack: not our ref <id>`, `unknown ref <name>`, `invalid command '<name>'`, and git's `deepen-not` words.
+- **Stricter than git, by the document's words.** A `want-ref` sent twice is refused ("It is a protocol error to send
+  want-ref for the same ref more than once"); git 2.50.1 answers it. And `shallow-info` comes before `wanted-refs`,
+  the document's order and the one git's client requires (A-582 part 2).
+- **Tests** (`src/upload/tests/`, 30):
+  - Golden against stock git 2.50.1's own answers from the repository it served (A-582's fixtures):
+    - `ls-refs`, byte for byte;
+    - the five fetch exchanges (clone, a have, `deepen 1`, `want-ref`, progress), section for section, each pack
+      holding exactly the objects git's held;
+    - the advertisement, holding every key git advertised, in its order.
+  - A stock clone's own requests (A-595's `fixtures/http`, exchanges 04 and 05), served from small.git rebuilt in the
+    store. The rebuild is held to the clone's 31 wants, one sent twice for `HEAD` and `main`. Its `ls-refs` lists
+    every branch, `HEAD` first; its fetch gets all 32 objects.
+  - The `ls-refs` oracle: 256 generated repositories and prefix lists against a filter of every ref.
+  - The negotiation's paths: one round for a client versions behind, the walk for a clone. Also `sideband-all`,
+    the section order, `want-ref HEAD`, `deepen-not` by a short name, acknowledgments alone, `wait-for-done`, and no
+    want at all.
+  - `object-info`, against the sizes git's `cat-file -s` printed.
+  - Steps: rooms at every edge, rooms generated, and a 200,000-byte pack in full packets.
+  - Refusals:
+    - not our ref, plain and on band 3;
+    - an unknown `want-ref`, and one sent twice;
+    - a `deepen-not` that names no ref, and one that names two;
+    - the filters;
+    - admissions too small;
+    - v0 and v1;
+    - a flush alone, and refs out of order;
+    - a pack failing or stalling midway;
+    - every cut and every bit flip of a request.
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 368 of 368 (2 of main's ignored),
+  `cargo fmt --check` clean with rustfmt's layout taken from the Studio. Failing first: with `serve` stubbed to answer
+  nothing, 25 of the first 27 tests failed. The two that passed compared a stepped answer with a whole one, which an
+  empty answer satisfies, so both are now held to stock git's answers first. Under the stub, 29 of the final 30 fail;
+  the one that passes reads only the clone's request. Red eight ways, one guard at a time:
+  - prefixes not deduplicated: 2 tests failed;
+  - `HEAD` always listed: 2;
+  - a `want-ref` sent twice taken: 1;
+  - `wanted-refs` before `shallow-info`: 1;
+  - `unborn` listed without `symrefs`: 1, the oracle alone;
+  - every ref peeled: 3, git's golden among them;
+  - an ambiguous `deepen-not` taken: 1;
+  - band 3 never used: 1.
+- **Next** (A-640's parts):
+  - v0 and v1 behind the same entry point (part 3, refused with `ERR` until then), with v0's ref names held to
+    A-615's rule;
+  - `sparse:oid` (part 4);
+  - `packfile-uris` and `bundle-uri` answered from the store's URI packs and bundle list (A-624's choice is built);
+  - progress on band 2;
+  - the walk in cooperative slices;
+  - hidden refs, which are policy (§4.17.2 "Access").
+
+Part 2 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload`, new:
+`mod.rs`, `advertise.rs`, `refs.rs`, `fetch.rs`, `answer.rs` and `tests/`; `store/graph.rs`, `StoreGraph::new` made
+infallible through `ObjectId::null` and `head` added, with `tests/store_graph.rs`; the `mod` line in `lib.rs`).
 
 ### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
 Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and
@@ -44728,6 +44963,233 @@ sources); `crates/svn` (`report/drive.rs`'s `Drive`, `Guards`, `DriveFailure` an
 - **Owed** (GAPS): the deltas of changed texts against their base, `xdelta.c` ported; the handler that writes the
   drive, reads the client's early answer and its answers to `close-edit` and `abort-edit`, and answers the command;
   one copy-root walk for `reads` and the drive.
+
+### A-635 — The push over several works, all or none, and A-603's entry rebuilt to A-642's logs: each green its own log, an atomic record a holder applies at its join, a cut that splits one refused (2026-11-19, g261 for UI goal 93; §4.17.1 items 2 and 3 and shared piece 2; §4.16 "Commit"; §4.17.2 "A push" steps 6 and 7; §4.17.3 decision 6; A-642; after A-603, A-618)
+Applied in the same change to: §4.16 ("Commit"), §4.17.1 (a status block, items 2 and 3, the pieces list's item 2),
+GAPS (the §4.17 entry), `crates/merge/src/engine.rs` (`Judged`, `Judgment`, `HeadMoved`, `Green::judge`,
+`Green::commit_judged`; `submit_resolved` made of them) and `engine/judge_tests.rs` (new), `crates/merge/src/lib.rs`,
+`crates/db/src/{catalog,error,lib,partition,repository}.rs` and `repository/entry.rs` with its tests (rewritten),
+`crates/db/tests/wire_order.{rs,txt}`, `crates/ipc/src/protocol.rs` (`DatabaseRefusal::Moved`, appended; `OutOfOrder`
+superseded, kept on the wire), `crates/ipc/tests/wire_order.txt`, `crates/server/src/{error,repository,verbs}.rs` and
+`crates/server/src/repository/push.rs` with its tests (new).
+- **What was there.** A-603's register gave every change of a repository the next position of one repository-wide
+  register; a push of several greens had no verdict that judged all of its works before any committed; A-618 made a
+  client's push into one work per green. Ada's A-642 (2026-11-19, worst case: a huge push to one green would stall
+  every other green's commits behind it until it replicated) replaced the register with each green's own log.
+- **The verdict split.** `Green::judge` decides an increment as a submit does and holds the verdict (`Judged`: the
+  increment, the head it was judged at, its effects and what the chain records of them), applying nothing but a
+  conflict's entry in the rejected-result cache; `Green::commit_judged` commits it as the version after that head, or
+  refuses `HeadMoved` with nothing applied once the green moved. `submit_resolved` is a judgment committed at once, so a
+  submit and a push run one verdict.
+- **The push.** `crates/server/src/repository/push.rs`, one interface: `RepositoryLogs::append(principal, repository,
+  changes, parts) -> Result<Appended, AppendRefused>`, implemented by the shard's state (`push`), and fakeable by a
+  tool's tests. Each change is `BranchChange::Update { green, work }` (A-618's work against the branch's green),
+  `Create { name, from, version, work }` (a new branch made at `version` of member `from`, moved by a work made against
+  `from` at `version`, which applies to the new green at its version 0) or `Delete { name, version }` (retired, its green
+  kept, unless it moved past the version the client saw); `EntryParts` carries checks, names and state changes. Nothing
+  is applied until everything passed: each change's rules (a member, a free or bound name, a version a branch can be made
+  at, one change a green or a name, each green's write policy, evidence and signature gates, A-285 and A-321); the new
+  branches made in memory (`Lineage::branch`); each green's retention secured; every work's verdict held; the whole
+  entry judged by the register's guard with its new greens counted held (`Partition::check_creating`, which judges
+  their records and then the entry before either is recorded). Then the verdicts commit, at the heads they were judged
+  at, and the new greens' records and the entry are one log record. A refusal names every change refused and why
+  (`ChangeRefused { index, why }`: the verdict's windows, `Moved`, `Twice`, `ApprovalRequired` naming the work an
+  approver would approve, or the wire's typed refusal) or the entry's (`AppendRefused::Entry`), and gives back what it
+  held: a branch made in memory is retired, every retention trued up. A work sent again is answered its version and
+  records nothing.
+- **A-642's logs.** No position of a whole repository: each green keeps its own log (its chain), and the repository's
+  own state is kept in logs of its own, the names log (the namespace and the lineage's joins), the phases, markers and
+  locks logs, each at its own position, moved only by its own changes; the policy's version is its own (A-622). A
+  version appends only while its green is at the position the push read, else the entry is refused `Moved { green,
+  read, at }`; a head check compares a green's position the same way; `RepositoryCheck::Log` compares a state log's.
+  Git LFS's locks are state changes (`LockTaken`, refused on a locked path; `LockReleased`, refused unless the path
+  holds exactly that lock). A member's version alone is again `Op::GreenAdvanced`, its own log's append.
+- **Atomic records.** An entry that moves two logs or more, a green's among them, is an `AtomicRecord`: its spans list
+  each log it moved, from the position it found to the one it left. Each position it took on each green's log points to
+  it (`Repositories::atomic_at`); a holder applies it only at its join (`AtomicRecord::join`: `Ready` with every log at
+  its predecessor, `Waiting`, `Applied`, `Diverged`); a cut that holds part of it is refused
+  (`Repositories::split_by`); a recovery replays the partition's log, which holds the record whole, and a snapshot
+  carries each record with the positions still pointing to it (`AtomicHeld`): the model test's first run found a
+  restore that derived the pointers from the spans bring back one a checkpoint had folded. A record goes once no green's
+  log points to it (its checkpoints and destroys).
+- **Tests** (Mac Studio, 2026-11-19, on the tree merged with main at 06d05cbca): `cargo test -p slates-merge --lib`
+  94 of 94, `-p slates-db --lib` 138 of 138, `-p slates-ipc --lib` 74 passed and 2 ignored, `-p slates-server --lib`
+  577 passed, 3 ignored, 1 failed (main's status-capture deadline test); `cargo fmt --all` applied from the Studio's
+  diff. The engine's oracle holds judging then committing equal to a submit over 256 generated histories (census: 1,977
+  accepts, 251 works sent again, 609 conflicts). The db's unit tests drive each rule (several greens together or none,
+  `Moved` naming the green; checks of heads, names and state logs; the state's logs and locks; the budget; no change
+  waiting on another log's position; a holder's join and a split cut; a record's life), and its model test runs 128
+  generated histories through a database over a real anchor segment with crashes at random points: Agreement (every
+  answer and the whole repository equal to the rules over plain maps, an entry all or none by construction),
+  StaleNeverCommits (an entry made against a moved green refused naming it, nothing of it applied) and NoLoss (every
+  recovered partition equal to the live one whole); census: 181 atomic records over several greens, 344 single-green
+  appends interleaved with records, 408 state moves with versions and 153 alone, 119 stale entries refused, 134 by a
+  check, 50 by a state change, 398 by a rule, 76 records folded, 18 members destroyed, and 307 recoveries from a snapshot
+  and 32 from the log with a record held. The server's tests push A-618's works built over a store: two branches in one
+  record, the same push again recording nothing, a stale work refusing the whole push with nothing applied and its
+  retention given back; a create, a delete and a move in one record; every refused change named by its index and kind;
+  a conflict retiring the branch made for it; the gates (forbidding and asking policies, a failed check, a stranger, no
+  repository). Red sixteen ways: in the engine, a commit without its head check and a verdict held at the wrong head; in
+  the database, the version's position, the head check's `Moved`, the state log check, the record kept, its fold, the
+  snapshot's pointers, the join, the split, the names log and the lock's precondition; in the server, a refused verdict
+  ignored, a branch made in memory kept, a delete's version unchecked and a retention not given back.
+- **Owed.** The fleet half (A-636): each green's log and each state log replicated on its own, holders applying atomic
+  records at their joins, replicas refusing split cuts, takeovers adopting each log and each record whole; the
+  repository policy's check before the verdict (A-622's next part); a stack of several works on one green in one push
+  (works over works, piece 5).
+
+### A-617 part 2b — The commit's drive: each editor command checked as `svnserve`'s commit editor checks it, in its order and words, the transaction read over the index at its base, held to stock `svn` 1.15.0's commits replayed in their order (2026-11-19, g268 for UI goal 93; §4.17.4 items 3.2 to 3.4, "5. The wire", piece 7)
+Applied in the same change to: §4.17.4's status (A-617, part 2b; A-592's, whose owed drive is built), GAPS (the §4.17.4
+entry), the research notes (§1's `svn_fs_util.h` and `checksum.c` rows; §14's drive), `crates/svn/src/commit.rs` (`pub
+mod drive`, its doc sentence), `crates/svn/src/commit/drive.rs` and `crates/svn/src/commit/drive/tests.rs` (new).
+- **What was there.** Part 2a read the commit's request and each editor command. A-592's out-of-date test and verdict
+  waited for a drive to ask them.
+- **The decision.** `Drive::command` takes one item and writes what `svnserve` writes for it: `begin` answers `commit`
+  up to its drive, `write_commit_info` answers an accepted work once the owner committed it. The green is a seam
+  (`Green`: texts and property lists by identity, and the identities the work's new ones get). Refusals are
+  `DriveRefusal`, each with `svnserve`'s number and words, an error that has no message given the code's own
+  (`svn_err_best_message`: "Invalid character in hex checksum", "LZ4 decompression failed"). The transaction is the
+  drive's rows read over the index at its base, not A-592's `Trial`: a trial borrows the index for the whole drive, and
+  the owner must append other commits during it (the recorded race does), so the drive borrows nothing between commands
+  and the verdict builds the full trial once. Departures, each for an input no stock client sends: a path that is not
+  UTF-8 is refused; a copy source continuing the root URL without a `/` is from another repository; "File already
+  exists" names the green where FSFS names its directory on disk; a file closed with its delta open keeps its text; the
+  room the work's texts and lists may hold is the caller's.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the pushed branch, its own target
+  directory). First build (06:12 UTC): one error, a closure's lifetime, made a function. First run (06:13 UTC): the
+  replay of every recorded commit passed; one hostile case was wrong in the test (the import's `gone/` stands at
+  revision 3) and was fixed there. Red (06:17 to 06:19 UTC), each guard removed in the Studio's copy: `open-file`'s
+  out-of-date test, 3 of 5 tests failed; the drop after a refusal, 3 of 5; the lock check at each call, the lock test
+  alone (the verdict refuses the same bytes at `close-edit`, so the replay cannot tell them apart); the read through a
+  copy, the copy test alone (no recorded commit opens a path beneath a copy). Green (99674c480, 06:20 UTC, load 7.1):
+  `cargo test --locked -p slates-svn --lib` 321 of 321 in 9.27 s, `cargo fmt -p slates-svn -- --check` clean. On the
+  tree merged with main (c715685db, 06:34 UTC): 365 of 365 in 8.12 s, rustfmt clean. Clippy, `xtask check` and the doc
+  gate are main's (the run-request queue).
+- **Owed.** `svn_repos__validate_prop`, the authorization checks (A-606), `svn_repos__validate_new_path`, authenticating
+  for write before `commit`, the owner's commit step and the connection task (A-617's next part).
+
+### A-627, completed — The replay answer and the update-report's from A-616's one drive, and LOCK and UNLOCK onto A-602's guards, each answered as mod_dav and mod_dav_svn answer it (2026-11-19, g298, UI goal 93; §4.17.4 piece 13's second part; with A-616 part 2 and A-602)
+Applied in the same change to: §4.17.4's status and piece 13; GAPS (the §4.17.4 entry); the research notes (§1's sources,
+§3); `crates/svn` (`dav/drive.rs` and its tests, rewritten; `dav/locking.rs` and its tests, rewritten; `dav/xml.rs`'s
+`Document`, `parse_document` and `Base64Stream`; `dav/response.rs`'s `Body::left`; `dav.rs`'s three refusals; the
+fixtures `lock-steal.xml` and five request heads).
+
+- **One drive, two answers.** `dav::Drive` takes A-616's `report::drive::Call`s (`Drive::call`, a `match` onto one
+  method a call), so the drive ra_svn's editor writes feeds both HTTP answers. Agreed with g234 through main: a call
+  carries the editor's own arguments and its node's raw facts; the svndiff version is the answer's.
+  - The update-report (`reports/update.c` at `d434dc14`): an entry's basename (`make_child_baton`); its checked-in href
+    and an added directory's `bc-url` built by `dav_svn__build_uri` from the facts, the path encoded as
+    `svn_path_uri_encode` encodes it, `rvr` by HTTPv2's me resource, `ver` otherwise; a deletion with no revision
+    written -1, as `reporter.c` passes one (1015-1029), which the drive's earlier `u64` could not write; outside
+    send-all mode, an addition's properties held unless inline, a copied addition's removals kept for its close (their
+    bytes held against the room as they are kept), no delta, and a changed file fetched with its base and SHA-1.
+  - The replay report (`reports/replay.c`): its header at the first call; each call an empty element with its whole
+    path; the -1 `svn_repos_replay2`'s path driver passes as every base revision; every property value in base64 with
+    line breaks, a removal `del`; `S:apply-textdelta` with its base checksum, ended where `replay.c` ends it in every
+    order a drive may make; nothing for an absent entry; `S:close-file` with the MD5.
+  - A delta streams: each window encoded as it comes (each version-2 section LZ4 when shorter, `svndiff.c` 196-233),
+    its base64 written a whole group at a time and the rest carried (`Base64Stream`), the same text however the
+    windows split. An all-zero digest is none, as `svn_checksum_to_cstring` reads it.
+  - Stricter, stated: a call out of the drive's order refused typed before a byte is written; an aborted drive's
+    answer refused whole, so the server answers the drive's refusal, as `mod_dav` answers an error met before it has
+    sent a byte; a root path or special URI that is not canonical and URI-safe refused.
+- **LOCK and UNLOCK onto the guards** (`dav_method_lock`, `dav_lock_parse_lockinfo`, `dav_get_timeout`,
+  `dav_validate_resource_state`, `dav_method_unlock` in httpd 2.4.66; `open_lockdb`, `get_locks`, `append_locks`,
+  `remove_lock`, `remove_lock_svn_output` in `mod_dav_svn`'s `lock.c`):
+  - `lock_request` reads in their order: the body's XML; `Depth` 0 or `infinity`; the parent a directory (409);
+    `X-SVN-Version-Name`; a refresh (no body) refused 400; `D:lockinfo`'s children by local name, anything it does not
+    take 412; `Timeout`'s first understood word, `atol`'s seconds after the clock's whole second, never before it
+    (`DAVMinTimeout` 0); no principal 501; nothing at the path 405; not write, not exclusive 400. Then A-602's
+    `LockRequest`: the path, the comment, the expiry, `steal` from `lock-steal`.
+  - `lock_answer`: 200 with the activelock (the request's depth, its owner element as `apr_xml_to_text` writes it with
+    every namespace the body declared, in APR's order, the seconds left, the token escaped) after the header and a
+    blank line, no line feed after `D:prop`; `X-SVN-Creation-Date`, `X-SVN-Lock-Owner`, `Lock-Token`. A guard refusal:
+    no principal 501 with no body; a lock error in `D:error` with FSFS's message (`svn_fs_util.h`, `lock.c`,
+    `fs-loader.c`), any other as "Failed to create new lock.", each at `dav_svn__convert_err`'s status.
+  - `unlock_request`: `Lock-Token` present and bracketed; the path's unexpired lock with that token (400 otherwise);
+    an anonymous request that does not break it 403. `unlock_answer`: 204; another's lock 423 with FSFS's message; no
+    principal 501 with `mod_dav`'s error id 405; any other "Failed to remove a lock.".
+  - `lockdiscovery`: the PROPFIND's property with depth 0 and the comment quoted in `D:owner`, and the two headers.
+  - Stricter, stated: an owner holding markup, a `Timeout` past `apr_time_t`, an `X-SVN-Version-Name` that is no
+    revision, each 400; a header value with a control character refused as httpd refuses one.
+- **Evidence.** Stock svn 1.15.0 (Homebrew, the Mac Studio, 2026-11-19) recorded against a responder: `svn lock`,
+  `svn lock --force` with markup in its comment, `svn unlock` and `svn unlock --force` (each after the PROPFIND that
+  finds the token), `svn info`; the bodies equal the earlier fixtures byte for byte, and the heads are the fixtures.
+  Every source read is in the notes' §1 with its hash.
+- **Tests and the run.** 33 tests in `dav::drive` (12) and `dav::locking` (21). `cargo test --locked -p slates-svn
+  --lib` on the Mac Studio, 2026-11-19: 351 of 351 on the branch (65078aed2), then 357 of 357 on the tree merged with
+  main (585458a4c), and 390 of 390 merged again with A-616's drive over the index in (2b4ccaaef); `cargo fmt -p
+  slates-svn -- --check` clean each time. Red on a copy with six mutations (replay's `dir` named
+  `directory`, no revision written 0, LOCK's blank line dropped, a held lock not 423, the floor under `Timeout` gone,
+  a body's namespaces in tag order): 7 of 351 failed, each mutation's tests among them but the last's, whose test
+  declared one new namespace on an element, where both orders agree. With two declared, the namespace mutation alone
+  failed that test on the merged tree (1 of the 62 `dav` tests).
+- **Owed.** The update-report's resource walk (`S:resource-walk`, a pre-1.2 client's); the facts' revision as
+  `dav_svn__get_safe_cr` gives it, since `svn_fs_node_created_rev` names a path that did not exist yet for a node
+  beneath a copy not changed since (A-616's facts); main's live capture against Apache with `mod_dav_svn`.
+
+### A-649 part 1 — Every key of Mercurial's index tagged by its kind, so no log row can meet an object's id (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The repository's index"; A-588 part 2's sibling, found by A-630)
+Applied in the same change to: §4.17.3 (the index's as-built rule), `crates/hg` (`index`: the `O` tag,
+`HgIndex::commit_objects`, `HgIndex::object`, `Refused::NotANode`), GAPS (the §4.17.3 entry).
+- **The fault.** A-588 part 2 keyed a log row `L`, the log's key and the number, and left a push's object rows to the
+  shared quarantine, which keys each by its raw id. A file log row of a 13-byte path is twenty bytes long (`L`, `f`, the
+  13 bytes, a NUL and four bytes of number), a node's length, so a node chosen to spell one (about 2^48 SHA-1 tries for
+  a number a pusher can reach, by arithmetic, not measured) would make the two rows one key, and the second written
+  would be refused `RowDiffers`: a path's history blocked by a push. No code wrote such object rows yet.
+- **The rule.** Every key begins with its kind's tag: `L` a log row, `N` a node row, `O` an object row; a raw node is
+  never a key. `HgIndex::commit_objects` writes a quarantine's objects as `O` rows in one batch and gives back the
+  quarantine's holds (refused, nothing is written and the quarantine keeps them), and `HgIndex::object` reads one back:
+  its kind, length and root content. An id that is not a node's twenty bytes is refused (`NotANode`). git's rows keep
+  the same rule (`o`, `p`).
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-tags-red` (d947583cc, not for main:
+  the two functions stubbed back to the quarantine's raw keys), `cargo test --locked -p slates-hg --lib` 249 passed and
+  2 failed, the object whose id is a 13-byte path's row refused `RowDiffers` and a five-byte id accepted. Green: 251 of
+  251 at ceb19f2bd, in a target directory of its own (its log compiled slates-hg); rustfmt's layout from that run.
+
+### A-646 part 2a — a hard link names its node, never a path: the engine (2026-11-19, g267, UI goal 93; §4.16 "The verdict" and "Commit"; A-643's second sibling, decided from principle)
+Applied in the same change to:
+- §4.16: A-646's decision; GAPS (A-643's second sibling, the engine's half fixed, the ops document's owed as part 2b);
+- `crates/merge/src/engine.rs`: `node_moves`, `surviving_links` and `hand_over`, derived at the start of `commit`;
+  `merge_hardlink` with `node_home` and `Resolved::link_node`; an IPC node's removal no longer refused for its links;
+- `crates/merge/src/engine/node_tests.rs`, new; the whole-state oracle's model in `replaced_node_tests.rs` follows nodes;
+  `scan_tests.rs` counts one lookup;
+- `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+- **The defect.** A hard link was an edge from one path to another. Removing a file's first name left its other names
+  naming an empty path, its bytes lost. A later file at that path became their file. Renaming the file broke its
+  links. A FIFO's link stopped its removal, and a link to a link named the link.
+- **The decision**, from principle: a hard link names its node, as a POSIX inode is named by its links. A node is its
+  home and the links naming it there. A removed or replaced home hands the node to its least surviving link, which
+  takes its content or IPC node, mode and attributes, the others naming it there. A renamed home's links follow it. A
+  later file at a path the node left is another node.
+- **Derived, never recorded.** The moves are computed in the commit from the head and the version's own effects:
+  - a version's chain entry is taken before the commit (`submit_resolved`), so the moves are never recorded;
+  - `apply_recorded` runs the same commit, so a replay derives the same moves;
+  - `rebased_from` restates the verdict's effects alone, so a rebased work's journal holds only the work's own
+    operations, and a volume, which has real inodes, needs none of the moves.
+- **The home as the identity.** A minted inode number was rejected. It would have to be persisted in every checkpoint
+  and carried through copies (A-586 refuses a tree holding links) and branches, for no observable difference, since a
+  home is unique at every version and moves with its node.
+- **A link a work makes** names the node at its target at the work's base: a link's home while that link stood
+  unchanged since, or a file or IPC node while it was not removed since. Through the links the work makes itself, it
+  names the work's own node. Otherwise it is `DeleteModify`, or `TypeChanged` for a target holding no file. A-643's
+  rule for a target removed after the base is kept within this.
+- **Kept conservative:** a work based before a hand-over that touches the link which became the home meets
+  `file_removed` (the link's removal is recorded), as it meets any removal.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 5 to 12), green on kiln r1019 and, merged with main, r1032:
+  `cargo test -p slates-merge --lib`, 124 of 124 and 126 of 126; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests:
+  - a removed file's links keep its node, its bytes, mode and attribute at the least link;
+  - a file made again where a node was is another node;
+  - a renamed file's links name it at its new path;
+  - a file replaced by a rename leaves its node to its links;
+  - an IPC node's links keep it;
+  - a link to a link names its node;
+  - a link based before its target moved conflicts (the guard);
+  - a replay derives the same node moves: identities equal on both greens and to the recount, after every version;
+  - the whole-state oracle follows nodes: every link's home, the hand-overs and re-points counted, and every link held
+    to name a standing file or IPC node.
+
+  Red on r1019 with part 2a's engine change reversed: 9 failed, the guard passing either way; the oracle shrank to one
+  removal of `TARGET`, which left `h` a link naming nothing.
 
 ### A-616, continued (3) — One report command's exchange on an ra_svn connection (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
 Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/exchange.rs` and its

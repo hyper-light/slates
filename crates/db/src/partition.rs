@@ -183,9 +183,11 @@ pub struct PartitionSnapshot {
   pub review_comments: Vec<crate::catalog::ReviewCommentRecord>,
   /// Their approvals (A-596; appended), by repository, request and approver.
   pub review_approvals: Vec<crate::catalog::ReviewApprovalRecord>,
-  /// Every repository's register: its next position and its own state (§4.17.1 shared piece 2, A-603; appended), by
-  /// repository order.
+  /// Every repository's own state: its state logs' positions and what they hold (§4.17.1 shared piece 2, A-603 rebuilt
+  /// by A-642; appended), by repository order.
   pub repository_registers: Vec<crate::catalog::RegisterRecord>,
+  /// The atomic records kept, by key, each with the positions pointing to it still (A-642; appended).
+  pub atomic_records: Vec<crate::catalog::AtomicHeld>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -638,6 +640,8 @@ impl Partition {
     self
       .green_checkpoints
       .insert(green, (version, bytes.to_vec()));
+    // The green's log below the checkpoint is folded: its pointers to atomic records there go with it (A-642).
+    self.repositories.fold_atomic(green, version);
   }
 
   /// A green volume's encoded origin (§4.16), or `None` for a green that started from scratch
@@ -1520,16 +1524,7 @@ impl Partition {
       ),
       // An entry of a repository's register (A-603): its rules, then its versions' chain entries and the state it adds
       // within the merge budget, less the state it removes.
-      Op::RepositoryAdvanced { entry } => {
-        self.repositories.check(
-          op,
-          self.caps.volumes,
-          |id| self.held(id),
-          |green| self.green_head(green),
-        )?;
-        let bytes = crate::repository::Repositories::entry_bytes(entry);
-        self.merge_bytes_fit(bytes.released, bytes.added)
-      }
+      Op::RepositoryAdvanced { entry } => self.check_entry(entry, &[]),
       // A repository's policy, set whole (A-622): `crate::repository`; its rules and hooks fit the merge byte budget,
       // the policy it replaces given back.
       Op::RepositoryPolicySet { repository, policy } => {
@@ -1807,6 +1802,60 @@ impl Partition {
       // A green adopted by its successor is recorded by its adoption (A-333): a new volume, checked as a creation is.
       Op::GreenAdopted { record, .. } => self.check_volume_created(record),
     }
+  }
+
+  /// The guard for recording `made`, new volumes, and then `entry` (A-635): judged whole before the first is recorded,
+  /// since what a transaction records before a refusal commits with it. Each made volume is checked as its creation is,
+  /// with the ids and names of those made before it and the volumes table's room for all of them; then the entry, each
+  /// made green counted one the partition holds, at no version yet. A push that makes new branches records them so.
+  pub fn check_creating(
+    &self,
+    made: &[crate::catalog::VolumeRecord],
+    entry: &crate::catalog::RepositoryEntry,
+  ) -> Result<(), DbError> {
+    for (index, record) in made.iter().enumerate() {
+      self.check_volume_created(record)?;
+      if made
+        .iter()
+        .take(index)
+        .any(|earlier| earlier.id == record.id || earlier.name == record.name)
+      {
+        return Err(DbError::AlreadyExists {
+          existing: record.id.bytes,
+        });
+      }
+    }
+    if self.volume_slots_used().saturating_add(made.len()) > self.caps.volumes {
+      return Err(DbError::Capacity { table: "volumes" });
+    }
+    self.check_entry(entry, made)
+  }
+
+  /// The guard for an entry of a repository's register (A-603): its rules, then its versions' chain entries and the
+  /// state it adds within the merge budget, less the state it removes. `made` are volumes recorded before it in its
+  /// transaction (A-635), each held as its record says, a green at no version yet.
+  fn check_entry(
+    &self,
+    entry: &crate::catalog::RepositoryEntry,
+    made: &[crate::catalog::VolumeRecord],
+  ) -> Result<(), DbError> {
+    let held = |id: VolumeId| match made.iter().find(|record| record.id == id) {
+      Some(record) if matches!(record.policy.role, crate::catalog::Role::Green { .. }) => {
+        crate::repository::Held::Green
+      }
+      Some(_) => crate::repository::Held::NotGreen,
+      None => self.held(id),
+    };
+    let head = |green: VolumeId| {
+      if made.iter().any(|record| record.id == green) {
+        0
+      } else {
+        self.green_head(green)
+      }
+    };
+    self.repositories.check_entry(entry, held, head)?;
+    let bytes = crate::repository::Repositories::entry_bytes(entry);
+    self.merge_bytes_fit(bytes.released, bytes.added)
   }
 
   /// The check of a volume's creation, and of a green's by its adoption (A-333): the id and the name free here (a name
@@ -2370,8 +2419,6 @@ impl Partition {
           .entry(*green)
           .or_default()
           .push(increment.clone());
-        // A member's version recorded alone is an entry of its repository's register (A-603).
-        self.repositories.versioned(*green);
         Ok(())
       }
       Op::GreenOriginated { green, origin } => {
@@ -2440,7 +2487,15 @@ impl Partition {
   /// the greens' chain entries, each charged to the merge budget with what the repositories' state gained, less what it
   /// released.
   fn apply_repository(&mut self, op: &Op) -> Result<(), DbError> {
-    let bytes = self.repositories.apply(op)?;
+    let bytes = match op {
+      // Each green an entry moves goes from its head before it (A-642): what its atomic record holds of its log.
+      Op::RepositoryAdvanced { entry } => {
+        let greens =
+          crate::repository::Repositories::green_spans(entry, |green| self.green_head(green));
+        self.repositories.apply_advanced(entry, greens)?
+      }
+      _ => self.repositories.apply(op)?,
+    };
     if let Op::RepositoryAdvanced { entry } = op {
       for version in &entry.versions {
         self.green_chain_bytes = self.green_chain_bytes.saturating_add(version.entry.len());
@@ -2733,6 +2788,7 @@ impl Partition {
       review_comments: self.reviews.comment_records().cloned().collect(),
       review_approvals: self.reviews.approval_records().cloned().collect(),
       repository_registers: self.repositories.registers().collect(),
+      atomic_records: self.repositories.atomic_held(),
       work_logs: self
         .work_logs
         .iter()
@@ -2982,6 +3038,7 @@ impl Partition {
       &snapshot.repository_branches,
       &snapshot.repository_members,
       &snapshot.repository_registers,
+      &snapshot.atomic_records,
     )?;
     // The repositories' own state is charged to the merge budget as it was when recorded (A-603).
     p.green_chain_bytes = p
