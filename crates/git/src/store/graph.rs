@@ -142,6 +142,35 @@ impl<'r> StoreGraph<'r> {
     }
   }
 
+  /// The entries of the tree at `position`, each with its name, read from its bytes: none when it is no tree or the
+  /// store cannot read it (kept as a fault).
+  fn named_entries_of(&self, position: u64) -> Vec<(u64, Vec<u8>)> {
+    let Some((id, _)) = self.row(position) else {
+      return Vec::new();
+    };
+    let Some((row, content)) = self.repository.indexed(self.store, &id) else {
+      self.failed(GraphFault::NoRow { position });
+      return Vec::new();
+    };
+    if row.kind != Kind::Tree {
+      return Vec::new();
+    }
+    let place = Place::Indexed { row, content };
+    match self
+      .repository
+      .tree_named_references(self.store, &id, &place)
+    {
+      Ok(named) => named
+        .into_iter()
+        .filter_map(|(id, name)| self.position_of(&id).map(|position| (position, name)))
+        .collect(),
+      Err(refused) => {
+        self.failed(GraphFault::Store(refused));
+        Vec::new()
+      }
+    }
+  }
+
   /// The position of `id`, a fault when the store does not hold it.
   fn position_of(&self, id: &ObjectId) -> Option<u64> {
     let position = self
@@ -227,6 +256,10 @@ impl Graph for StoreGraph<'_> {
 
   fn entries(&self, tree: u64) -> impl Iterator<Item = u64> {
     self.named(tree).into_iter()
+  }
+
+  fn named_entries(&self, tree: u64) -> impl Iterator<Item = (u64, Vec<u8>)> {
+    self.named_entries_of(tree).into_iter()
   }
 
   fn size(&self, blob: u64) -> u64 {
