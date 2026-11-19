@@ -169,6 +169,10 @@ pub struct PartitionSnapshot {
   /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291; 2026-11-18; appended), by
   /// (volume, snapshot) order.
   pub captured_bases: Vec<CapturedBase>,
+  /// The repositories this partition holds (§4.17.1, A-515; appended), by id order.
+  pub repositories: Vec<crate::catalog::RepositoryRecord>,
+  /// Their namespaces' bindings (§4.17.1, A-515; appended), by (repository, name) order.
+  pub repository_branches: Vec<crate::catalog::BranchRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -303,6 +307,9 @@ pub struct Partition {
   /// base directory. Bounded by the snapshots (one entry a snapshot at most); an entry leaves with its snapshot or its
   /// volume.
   captured_bases: std::collections::BTreeSet<CapturedBase>,
+  /// The repositories and their namespaces (§4.17.1, A-515): repositories bounded by `caps.volumes`, bindings by the
+  /// greens each binds.
+  repositories: crate::repository::Repositories,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -429,7 +436,24 @@ impl Partition {
       audit_received: BTreeMap::new(),
       grants_issued_through: 0,
       captured_bases: std::collections::BTreeSet::new(),
+      repositories: crate::repository::Repositories::new(),
       tombstones: BTreeMap::new(),
+    }
+  }
+
+  /// The repositories this partition holds and their namespaces (§4.17.1, A-515).
+  pub fn repositories(&self) -> &crate::repository::Repositories {
+    &self.repositories
+  }
+
+  /// What the catalog holds under `id`, as a repository's namespace asks it (§4.17.1: a namespace binds greens).
+  fn held(&self, id: VolumeId) -> crate::repository::Held {
+    match self.volume(id) {
+      None => crate::repository::Held::Absent,
+      Some(record) if matches!(record.policy.role, crate::catalog::Role::Green { .. }) => {
+        crate::repository::Held::Green
+      }
+      Some(_) => crate::repository::Held::NotGreen,
     }
   }
 
@@ -1371,6 +1395,14 @@ impl Partition {
         self.snapshot(*volume, *snapshot).ok_or(DbError::NotFound)?;
         Ok(())
       }
+      // A repository's record and namespace keep §4.17.1's rules (A-515): `crate::repository`.
+      Op::RepositoryCreated { .. }
+      | Op::RepositoryBranchAdded { .. }
+      | Op::RepositoryBranchRetired { .. }
+      | Op::RepositoryDefaultSet { .. }
+      | Op::RepositoryDestroyed { .. } => self
+        .repositories
+        .check(op, self.caps.volumes, |id| self.held(id)),
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1798,6 +1830,11 @@ impl Partition {
         });
         Ok(())
       }
+      Op::RepositoryCreated { .. }
+      | Op::RepositoryBranchAdded { .. }
+      | Op::RepositoryBranchRetired { .. }
+      | Op::RepositoryDefaultSet { .. }
+      | Op::RepositoryDestroyed { .. } => self.repositories.apply(op),
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -2242,6 +2279,8 @@ impl Partition {
     }
     self.lineage.remove(&id.bytes);
     self.captured_bases.retain(|captured| captured.volume != id);
+    // A destroyed green leaves the namespace that bound it (§4.17.1, A-515).
+    self.repositories.green_removed(id);
     // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
     // a volume that no longer exists), returning its bytes to the chain budget.
     if let Some(chain) = self.green_chains.remove(&id) {
@@ -2405,6 +2444,8 @@ impl Partition {
         .collect(),
       green_adoptions: self.green_adoptions.values().copied().collect(),
       captured_bases: self.captured_bases.iter().copied().collect(),
+      repositories: self.repositories.repositories().cloned().collect(),
+      repository_branches: self.repositories.bindings().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2643,6 +2684,10 @@ impl Partition {
     p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
     p.captured_bases = snapshot.captured_bases.iter().copied().collect();
+    p.repositories = crate::repository::Repositories::restore(
+      &snapshot.repositories,
+      &snapshot.repository_branches,
+    )?;
     Ok(p)
   }
 
