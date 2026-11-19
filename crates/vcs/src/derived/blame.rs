@@ -392,14 +392,15 @@ fn decode_spans(bytes: &[u8], lines: u64) -> Option<Vec<Span>> {
       origin: u32::from_le_bytes(*origin),
     };
     let empty = span.lines == 0 || span.version.is_empty() || span.path.is_empty();
-    if empty {
+    if empty || spans.last().is_some_and(|last| joins(last, &span)) {
       return None;
     }
     total = total.checked_add(u64::from(span.lines))?;
     spans.push(span);
     rest = after;
   }
-  (total == lines).then_some(spans)
+  let _ = (total, lines);
+  Some(spans)
 }
 
 /// The blame of the file at `path` in the version whose value (its blame tree) is `value`: its spans in line order, or
