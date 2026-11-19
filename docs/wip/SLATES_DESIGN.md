@@ -11935,6 +11935,17 @@ engine: the verdict, rebase, position mapping, the register).
 > its target is charged and made. Proven on the offset-delta and reference-delta packs stock git 2.50.1 wrote: every
 > entry's header reads as `git verify-pack -v` lists it and writes back to git's bytes, and each delta, applied to its
 > base, makes the object git named.
+>
+> **Status (2026-11-19, A-591: the pack index and a pack's header and trailer built).** `crates/git` (`pack`,
+> `pack::idx`) reads a pack's header as a stream delivers it: `PACK` is refused at its first wrong byte, versions 2 and
+> 3 are read, and the count follows. It checks a whole pack's trailer before any byte it guards, and writes a pack's
+> header at version 2 and its trailer as the bytes stream out. It decodes the index, version 2, in place once the
+> index's own checksum holds: the fanout never goes down and agrees with the ids, the ids strictly ascend, the 8-byte
+> table is whole and every large offset names one of its entries, and no offset lies inside a pack's header. It holds an
+> index to its pack as `git verify-pack` does, short of inflating (one count, one trailer, the objects back to back,
+> each CRC32 over its bytes), and writes an index byte for byte as git 2.50.1 does. Every checksum runs through
+> `object_name` (A-600); the CRC32 is zlib's, through `crc32fast`, the crate flate2 computes it with. Proven against the
+> packs, indexes and `verify-pack -v` listings stock git 2.50.1 wrote, one of them with its 8-byte table in use.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12259,6 +12270,19 @@ signature verification).
 > (`crates/hg/fixtures/wire`, the command in `make-wire-fixtures.sh`): a clone, a pull, a push, `debugwireargs` through
 > each way of carrying arguments, and a refused bundle1 client, every request and answer read and written again to its
 > bytes. Compression engines (D-17) and serving the commands (piece 4) are not this piece's.
+>
+> **Status (2026-11-19, A-588: piece 3's objects and nodes built).** `slates-hg` reads and writes a repository's three
+> kinds of object byte for byte as 7.2 stores them, each reader and its writer accepting exactly the same objects: a
+> changeset's text (`changeset`: its fields in place, its extras unescaped as 7.2's `decodeextra` reads them and
+> escaped as `encodeextra` writes them), a flat manifest (`manifest`: sorted lines of a path, a lower-case node and an
+> `x` or `l` flag, refused where 7.2's C reader refuses), and a file revision (`filerev`: its metadata block apart from
+> its bytes, the copy 7.2's `renamed` reads, and the parents in the order 7.2 stores them). It computes each node
+> (`node`) as 7.2 does: the SHA-1 of the lower parent, the higher and the text, with sha1collisiondetection on, since
+> 7.2's `hashutil.sha1` is sha1dc's wherever its C extension is built, so a known collision attack is refused
+> (`CollisionAttack`). Proven against every revision of one repository stock 7.2 stored (`crates/hg/fixtures/objects`:
+> each text from `hg debugdata`, each log from `hg debugindex --debug`, and what 7.2's own readers read; the command
+> in `make-object-fixtures.sh`, run twice, byte for byte alike) and against SHAttered's two prefixes. Still owed from
+> piece 3: the index's tables, and an existing store's import, whose zlib and zstd chunks A-607's engines now inflate.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12361,7 +12385,15 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   does), then the file's bytes. The row keeps them apart, so the bytes are the same content as the file in every tree
   (§4.17.1 "Objects", item 1) and only the block is kept beside them.
 - Each node is checked on arrival as Mercurial computes it: the SHA-1 of the two parents in ascending order and then
-  the text [B: `internals.revlogs` "Hash Computation"].
+  the text [B: `internals.revlogs` "Hash Computation"], with sha1collisiondetection on, as 7.2's `hashutil.sha1` is
+  sha1dc's wherever its C extension is built, set to detect and never to mend [C: `utils/hashutil.py`,
+  `thirdparty/sha1dc/cext.c`]. A revision whose hashing shows a known collision attack is refused (`CollisionAttack`),
+  as 7.2 raises "sha1 collision attack detected" on it.
+- A file revision's parents are kept in the order 7.2 stores them: with a metadata block and one null parent, the null
+  one first; without a block, second (7.2's fix-up for issue6528, applied to every incoming file revision [C:
+  `revlogutils/rewrite.py` `_has_bad_parents`]). Its copy is read as 7.2's `renamed` reads it, only from a revision
+  whose first parent is null and whose block names both `copy` and `copyrev` [C: `filelog.py`]. Reordering parents
+  never changes a node, which hashes them in order of value.
 - The tail is folded into a new table when the lookups it served since the last fold cost more than a fold (the table
   of learned tunables).
 
@@ -12529,7 +12561,8 @@ limit, so slates answers with one `dump0` key, and a client splits its own pushe
 
 **Failure matrix (Mercurial's, beside §4.17.1's).** A push whose answer was lost after its commit: the client's repeat
 is answered accepted with nothing new (above). A hostile or damaged bundle: refused by kind before any effect, nothing
-indexed. A revision whose node does not hash: `ObjectIdMismatch`. A marker obsoleting a public changeset: refused. A
+indexed. A revision whose node does not hash: `ObjectIdMismatch`; one whose hashing shows a known SHA-1 collision
+attack: `CollisionAttack`. A marker obsoleting a public changeset: refused. A
 client gone during a stream clone: the held view is unaffected, and the next request starts again. An owner restart:
 the index, the phase roots and the markers replay with the greens from the register (§4.16); the revlog view, the
 linelogs and the delta cache are held artefacts, made again on demand.
@@ -12538,9 +12571,11 @@ linelogs and the delta cache are held artefacts, made again on demand.
 `Corrupt`, `UnknownMandatory` for a part or a parameter, `PastAdmission`); `UnknownDeltaBase { node }`;
 `MissingObject { node }` (a parent, a link, a manifest's file revision); `PathRefused { path, rule }`;
 `PhaseRefused { phase }`; `ObsoletesPublic { node }`; `NewHead { branch }`; `RewriteRefused { node }` (a rewrite that
-would drop a public changeset, or a draft no marker obsoletes). Each is answered in Mercurial's words: the race abort,
-`error:abort` with message and hint, `error:pushkey` (and `reply:pushkey` 0) for a bookmark or phase that did not move,
-`<hook> hook exited with status <n>` for a refusing hook [C: `hook.py`, `utils/procutil.py`], and hgweb's statuses.
+would drop a public changeset, or a draft no marker obsoletes); `CollisionAttack { node }` (a revision in which SHA-1's
+collision detection finds a known attack, which 7.2's own hashing raises on). Each is answered in Mercurial's words:
+the race abort, `error:abort` with message and hint, `error:pushkey` (and `reply:pushkey` 0) for a bookmark or phase
+that did not move, `<hook> hook exited with status <n>` for a refusing hook [C: `hook.py`, `utils/procutil.py`], and
+hgweb's statuses.
 
 **Worked example.** Repository `linux` (Mercurial, publishing) has line `default` at version 412, whose head is
 changeset h412. Alice and Bob have pulled it. Alice pushes a1, which edits `kernel/fork.c`, with `check:updated-heads`
@@ -12629,7 +12664,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    string and the bundle2 capability blob, and `batch` escaping. Built (A-569, `crates/hg`: `ssh`, `http`,
    `capabilities`, `batch`, `wire`).
 3. The objects and the index: changeset texts, flat manifests and file metadata parsed and written, nodes checked, the
-   index's tables, and an existing repository's store imported as a base.
+   index's tables, and an existing repository's store imported as a base. Built (A-588, `crates/hg`: `changeset`,
+   `manifest`, `filerev`, `node`): the objects and their nodes. Owed: the index's tables, then the import, whose zlib
+   and zstd revlog chunks A-607's engines inflate (flate2 over zlib-rs, and zstd), its tests holding inflated bytes.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
@@ -39497,3 +39534,158 @@ Applied in the same change to:
 - **Applied in the same change to:** Cargo.toml (`flate2` in `[workspace.dependencies]`, with the measurement),
   docs/wip/BENCHMARKS.md, §4.17.2 piece 3.
 
+### A-591 — git's pack index, version 2, and a pack's header and trailer, read and written as git 2.50.1 does (2026-11-19, g293, UI goal 92; §4.17.2 "Pieces (git)" pieces 2 and 3, "The repository in git's terms" item 4; after A-600)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git` (`pack.rs` and `pack/idx.rs`, new; their tests `tests/pack.rs` and `tests/pack_idx.rs`; the golden
+  vectors `fixtures/ofs-large.idx`, `sha256.pack`, `sha256.idx` and their `verify-pack` listings, with
+  `make-index-fixtures.sh`; `lib.rs`'s `mod` line; `Cargo.toml`);
+- the workspace manifest and lock (`crc32fast` 1.5.5, whose one dependency, `cfg-if`, was there already; nothing else
+  re-resolved).
+- **A pack's header and trailer** [B: `gitformat-pack.adoc`; C: `pack.h`, `index-pack.c`'s `parse_pack_header`,
+  `packfile.c`'s `open_packed_git_1`; git v2.50.1, each string cited here checked against its source on 2026-11-19].
+  `read_header` reads the twelve bytes as a stream delivers them: a signature byte other than `PACK`'s is refused as
+  soon as it arrives, a version other than 2 and 3 as soon as its four bytes have, and the answer is `None` until the
+  count has arrived. `check` holds a whole pack in memory: it must be at least a header and a trailer long, and its
+  trailer must be the checksum of every byte before it, verified before any of them is read; then its header is read.
+  `Writer` writes git's header at version 2 and the trailer computed as the objects pass, so a fetch's pack needs no
+  second pass (§4.17.2 "A fetch", item 3). The header's length is one number for the pack and its entries, A-582 part
+  3's `entry::PACK_HEADER_LEN`: part 3 landed first, so `pack` and `pack::idx` use its constant, as main asked
+  (2026-11-19).
+- **The index** [B: `gitformat-pack.adoc`, "Version 2 pack-*.idx files"; C: `pack-write.c`'s `write_idx_file` and
+  `need_large_offset`, `packfile.c`'s `load_idx` and `nth_packed_object_offset`, `pack-check.c`'s `verify_packfile`].
+  `Idx::decode` verifies the index's own checksum first, then the magic `\377tOc` and version 2, then the layout:
+  - the fanout never goes down (git's "non-monotonic index");
+  - the file is exactly as long as its count and its 8-byte table make it, the table whole entries and at most one
+    fewer than the objects (git's "wrong index v2 file size");
+  - the ids strictly ascend, a duplicate refused apart from a step down;
+  - each fanout count is the number of ids whose first byte is at most its byte;
+  - every large offset names an entry of the table, and no offset lies inside a pack's header.
+  It then answers by position and by id in place, building nothing: the fanout narrows a lookup, then a binary search,
+  and `offset_of` gives the lookup from id to offset that the pack reader resolves a reference delta's base by (A-608).
+  `Idx::check_pack` holds an index to its pack as `git verify-pack` does short of inflating. It checks one hash, one
+  count and one trailer, in `open_packed_git_1`'s order. It orders the objects by offset in a table charged to the
+  caller's admission first, and refuses an offset at or past the trailer, two objects at one offset, or bytes after the
+  header no object covers. Each object's CRC32 is taken over its span, from its offset to the next object's, the last
+  to the trailer, as `verify_packfile` takes it. `write` writes an index as `write_idx_file` does: the entries sorted by
+  id in place, every check made before the first byte, an offset past 2^31 - 1 in the 8-byte table, and that table's
+  entries numbered in id order.
+- **Stricter than git, where git trusts files it wrote.** A server reads indexes it did not write (an imported
+  repository's, piece 15), so each of these is refused by kind, though git's reader passes it:
+  - a large offset naming a slot past its table (git's `check_pack_index_ptr` keeps only the read inside the file);
+  - a fanout that disagrees with the ids;
+  - an 8-byte table that is not whole entries;
+  - an offset inside a pack's header;
+  - a duplicate id, as git refuses one only when strict.
+  The writer refuses whatever the reader refuses, so it never writes an index slates would not read. Version 1, which
+  has no magic, is refused as `Magic`; slates writes version 2 only.
+- **Checksums** run through `object_name::Hasher` (A-600), so a SHA-1 checksum runs git's collision detection as an
+  object name does, and a checksum whose input carries a known attack's disturbance is refused by kind (`Collision`).
+  git 2.50.1 hashes its own files' checksums with `unsafe_hash_algo` (`csum-file.c`), which `hash.h` makes the
+  collision-detecting SHA-1 unless a build names a separate fast one, so a default build of git refuses such a checksum
+  too. No published collision begins with a pack's or an index's first bytes, so no golden vector reaches that refusal.
+- **The CRC32 and its crate.** Each index entry keeps zlib's CRC32 (the IEEE polynomial, reflected; `index-pack.c`
+  takes zlib's `crc32()` over each entry's bytes as they are used), and slates had
+  only CRC32C (`slates_wire::crc32c`). Main approved `crc32fast` (2026-11-19) for one reason: it is the crate flate2
+  itself computes zlib's CRC32 with, and flate2 is the workspace's deflate API (A-607), so it brings no code the tree
+  would not hold once a crate takes flate2. Its `std` feature picks ARMv8's CRC instructions or x86-64's carry-less
+  multiply at run time, with a table for the rest, and slates-git keeps no `unsafe` of its own.
+- **Golden vectors.** The packs, indexes and `git verify-pack -v` listings A-582's `make-fixtures.sh` captured
+  (`ofs` and `ref`, SHA-1, with offset and with reference deltas), and `make-index-fixtures.sh`'s, run with git 2.50.1
+  (Apple Git-155) on 2026-11-19:
+  - `ofs-large.idx`, `ofs.pack`'s index made by `git index-pack --index-version=2,0x200`, git's own switch (its
+    t5302 uses `--index-version=2,0x40000`) that puts the eight objects past 0x200 in the 8-byte table, since no small
+    pack has an offset past 2^31 - 1;
+  - `sha256.pack`, `sha256.idx` and their listing, the same history in a SHA-256 repository.
+  The same day each index was made again by hand with the same git on another Mac, byte for byte, and both listings
+  came out again exactly. The empty pack's bytes are `git pack-objects --stdout < /dev/null`'s (trailer `029d0882…`).
+- **Tests** (`cargo test -p slates-git --lib`, Mac Studio M3 Ultra, 2026-11-19 03:52Z, debug, load 20.6 at the start:
+  54 of 54, the 32 new among them; `cargo fmt --check` clean). Red first: on the Studio's clone alone, never committed,
+  the eight entry points were stubbed to answers that build nothing, and 32 of 32 new tests failed. The tests:
+  - each index reads as git listed it, every object found at git's offset and spanning git's size-in-pack, the 8-byte
+    table read for `ofs-large.idx`, the pack held and the exact room charged;
+  - each index is written back byte for byte, `ofs-large.idx` at git's forced limit, from entries handed over in
+    reverse; each pack is written back byte for byte, and the empty pack is git's;
+  - every single-bit flip of a SHA-1 and a SHA-256 pack and index is refused by its checksum, before its header is read;
+  - the brief's hostile set, each re-signed so only the change is judged: a fanout that goes down, a count past the
+    file, offsets past the pack (at the trailer, at 2^31 - 1, at 2^40 through the table), a large index one past its
+    table and into a table of none, and a bit flipped in each checksum (the pack's trailer, the index's own, and its
+    copy of the pack's: refused by the index's checksum, and once re-signed refused against the pack);
+  - and the rest by kind: truncation at every length short of the smallest file, another magic and version, a table of
+    the wrong size, unsorted and duplicated ids, a miscounting fanout, offsets in the header, a pack not the index's
+    (another pack, the other hash, another count), a wrong CRC32, shared offsets, bytes before the first object, a check
+    past its admission, and the writer's refusals;
+  - two proptests: a model (a map from id to CRC32 and offset) that any entries written in any order decode to, every id
+    found and an absent one not; and an oracle pack of opaque objects whose index, made from their spans, holds, and
+    with one CRC32 changed is refused naming that object.
+- **Owed.** The pack reader (piece 3): entries, inflation and deltas, the trailer checked as a stream arrives, and an
+  index's ids checked against its pack's objects. `Idx::decode` and `Idx::check_pack` run whole, hashing and CRC-ing
+  every byte in one call, so a caller on a shard gives them what its slice admits; a sliced form comes with the import
+  of a repository on disk (piece 15), which also remakes a version 1 index from its pack.
+
+### A-588 — Mercurial's objects and nodes: changesets, flat manifests and file revisions read and written byte for byte as stock Mercurial 7.2 stores them, each node computed with SHA-1's collision detection as 7.2 computes it (2026-11-19, g291 for UI goal 92 (kiln 51cef9f7); §4.17.3 piece 3; §4.9; A-514, A-600, A-607)
+Applied in the same change to: §4.17.3 (its status, the index's node and parents lines, the failure matrix, the
+refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node`, new; `fixtures/objects/` and its
+`make-object-fixtures.sh`; `fixtures/sha1dc/`, SHAttered's two prefixes; `sha1-checked` as its dependency), `Cargo.toml`
+(`sha1-checked`'s comment names Mercurial's nodes), `.gitattributes` (the objects' fixtures kept as stored), GAPS (the
+§4.17.3 entry), `research/mercurial-server.md` (§15).
+- **What it does.** `changeset`: a changeset's text read in place as 7.2's `changelogrevision` cuts it (the manifest's
+  node in hexadecimal, the user, the date line's time, timezone and extras, the files, the description); its extras
+  unescaped into the caller's buffer as `decodeextra` reads them (7.2's `\0` fix-up, then Python's `escape_decode`),
+  their bytes and items charged to the admission first, and written as `encodeextra` writes them (sorted by key,
+  escaped, joined by NUL). `manifest`: a flat manifest's lines (a path, a NUL, forty lower-case digits, an `x` or `l`
+  flag) checked whole, read in place and written back. `filerev`: a file revision's text split into its metadata block
+  and its bytes; the block's entries; the copy 7.2's `renamed` reads; the parents in the order 7.2 stores them; a split
+  written back to its bytes; and `pack`, a new text as `filelog.add` writes one. `node`: a node computed and checked,
+  and a node's hexadecimal read and written. Every reader and its writer accept exactly the same objects, so whatever
+  is read writes back to its bytes and whatever is written reads back as itself.
+- **Decided: SHA-1 with collision detection, not aws-lc-rs (main approved, 2026-11-19).** The piece's brief named
+  aws-lc-rs, then the workspace's one cryptographic library. Stock 7.2 hashes every node through sha1dc instead:
+  `utils/hashutil.py` takes `sha1 = sha1dc.sha1` and falls back to `hashlib.sha1` only when the C extension does not
+  import, and the PyPI 7.2 printed `hashutil.sha1 is <class 'sha1dc.sha1'>` in both fixture runs. Its binding detects
+  and refuses: `SHA1DCSetSafeHash(&(self->ctx), 0)` ("We don't want "safe" sha1s ... We just want to detect
+  collisions") and, in `finalize`, `PyErr_SetString(PyExc_OverflowError, "sha1 collision attack detected")`
+  (`mercurial/thirdparty/sha1dc/cext.c`, lines 36 and 83-84 of `mercurial-7.2.tar.gz`, SHA-256 `a250227e…`). So
+  aws-lc-rs would accept revisions 7.2 refuses. Nodes go through `sha1-checked`, configured as A-600 configures it for
+  git (detection on, the safe hash off), and an attack is refused as `CollisionAttack`, named by its plain SHA-1.
+- **From the sources (`research/mercurial-server.md` §15).** 7.2's `changelog.py` (`changelogrevision`, `readfiles`,
+  `add`, `encodeextra`, `decodeextra`, `_string_escape`, `_string_unescape`), `cext/manifest.c` (`find_lines`),
+  `utils/storageutil.py` (`hashrevisionsha1`, `parsemeta`, `packmeta`), `filelog.py` (`add`, `has_meta`, `renamed`),
+  `revlogutils/rewrite.py` (`_has_bad_parents`), `utils/hashutil.py` and `thirdparty/sha1dc/cext.c`. A copy is read
+  only from a revision whose first parent is null and whose block names both `copy` and `copyrev` ("In rare cases due
+  to old bugs, one can occur without the other"), half a pair being no copy; 7.2 reorders a file revision's parents on
+  the way in (issue6528's fix-up) and changegroup `04` flags a block (`REVIDX_HASMETA`) and swaps them the other way;
+  7.2's own `_string_unescape`, run on the tests' escapes, reads `\777` as `0xFF` and keeps `\q`, and `decodeextra`
+  keeps the later of a key given twice.
+- **Stricter than 7.2, on purpose.** An empty changeset text (7.2's null changeset); an empty user, which 7.2's writer
+  refuses, since its line is the first blank one `readfiles` finds and 7.2's two readers then disagree on the files; a
+  manifest field that is not forty hexadecimal digits; a time that is not a decimal number (7.2 takes any `float()`
+  when asked); a manifest's upper-case digits and its tree flag `t`, and its other errors when the text is read rather
+  than when an entry is; a `copyrev` that is not forty digits. A writer refuses what its reader would read back as
+  something else: a key holding `:` or given twice, a field holding its line's end, a block holding its closing marker.
+- **Golden vectors.** `crates/hg/fixtures/objects`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 at 03:52 and
+  03:54 UTC, by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the branch at ea134bdf6,
+  exactly: `bash crates/hg/fixtures/objects/make-object-fixtures.sh "$D/out"` with `D` a new directory under
+  `~/.cache`. One repository of eleven changesets (flags `x` and `l`, a copy, a file beginning as the block does, a
+  named branch, a timezone of -3600, a description of several lines, a merge, a closed head, a user beyond ASCII,
+  extras holding every escaped byte): each log's `hg debugindex --debug`, every revision's `hg debugdata`, and 7.2's own
+  readings, 42 files, the two runs byte for byte alike, each SHA-256 checked equal after the copy; the 30 texts are the
+  bytes the storage API's `revision()` gave the script's first version. `crates/hg/fixtures/sha1dc`: SHAttered's two
+  320-byte prefixes, the bytes of A-600's cuts (SHA-256 `cac8644d…` and `842a2c7d…`), sharing the plain SHA-1
+  `f92d74e3…`.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 158 of 158 in 0.97 s (load
+  3.0), 32 of them this piece's; `cargo fmt -p slates-hg` left nothing to change. The first build's one error was a
+  property test borrowing a temporary (E0716). Golden: every node of the 30 revisions computed from the parents
+  `debugindex` lists and the text `debugdata` wrote, each text as long as 7.2's index says, no flag set; every
+  changeset's fields and extras as 7.2's `changectx` reads them, each written back to its bytes; every manifest's
+  entries as 7.2 reads them, each file node held by its path's log, each written back; every file revision's copy as
+  `renamed` reads it, its split and its packed text equal to the stored one, and 7.2's parents' order a fixed point on
+  7.2's own store. The hasher: SHAttered's two prefixes refused as one attack named by their shared plain SHA-1, their
+  first 192 bytes hashed without a refusal. Hostile and properties: cut and malformed changesets, an empty user, a
+  non-decimal time, extras 7.2 cannot read, an admission too small (nothing charged), fields that would read back as
+  others, a manifest with any byte changed or cut, blocks unclosed or holding a line without `: `, generated objects
+  written and read back, arbitrary bytes never panicking and anything read written back byte for byte. Red: not run
+  (one run, §8); the first draft's own tests asserted what these replace (a lone `copy` refused; no collision
+  detection), so they could not pass on it.
+- **Owed of piece 3.** The index's tables on §4.17.1's shared tables; then an existing store's import, its zlib and
+  zstd revlog chunks inflated by A-607's engines, its tests holding inflated bytes.
