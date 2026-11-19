@@ -83,5 +83,9 @@ mod pack_fixtures;
 mod v2_rest_fixtures;
 
 #[cfg(test)]
+#[path = "tests/protected_fixtures.rs"]
+mod protected_fixtures;
+
+#[cfg(test)]
 #[path = "tests/served.rs"]
 mod served;
