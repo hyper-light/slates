@@ -125,9 +125,29 @@ impl<S: HgStores> Command for HgCommand<S> {
   }
 
   async fn step(&mut self) -> Result<Stepped, Refused> {
+    let Self {
+      stores,
+      repository,
+      room,
+      stdio,
+      dropped,
+      ..
+    } = self;
+    let progress = stores
+      .lend(*repository, |store| stdio.step(store, *room))
+      .ok_or_else(unheld)?;
+    let (consumed, next) = match progress {
+      Progress::Stepped { consumed, .. } => (consumed, Next::More),
+      Progress::Waiting => (0, Next::Input),
+    };
+    let next = if stdio.finished() {
+      Next::Exited(EXIT_STATUS)
+    } else {
+      next
+    };
     Ok(Stepped {
-      consumed: 0,
-      next: Next::Input,
+      consumed: consumed.saturating_add(std::mem::take(dropped)),
+      next,
     })
   }
 

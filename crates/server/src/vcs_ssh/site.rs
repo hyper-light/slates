@@ -236,6 +236,14 @@ impl<L: StoreLender + Clone, H: HgStores + Clone> Services for ToolServices<L, H
           self.room,
         )))
       }
+      (Service::Mercurial { hidden }, Some(repository)) if self.hg.holds(repository.id) => {
+        Ok(ToolCommand::Mercurial(HgCommand::new(
+          self.hg.clone(),
+          repository.id,
+          self.room,
+          hidden.then_some(start.principal),
+        )))
+      }
       _ => Err(Unserved),
     }
   }
@@ -523,6 +531,9 @@ where
     git_protocol: Option<&[u8]>,
   ) -> Dispatched<S::Command> {
     let (service, path) = asked(command);
+    if let Some(refused) = path.and_then(|path| unsafe_invocation(service, path)) {
+      return Dispatched::Refuse(refused);
+    }
     let repository = match path.map(|path| self.reachable(service, path, principal)) {
       Some(Ok(repository)) => Some(repository),
       Some(Err(refused)) => return Dispatched::Refuse(refused),
