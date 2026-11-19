@@ -1315,7 +1315,7 @@ fn parents<R>(
 
 /// A changeset's branch and whether it closes it, as 7.2 reads its extras: the last `branch`, else `default`; any
 /// `close`.
-fn branch_of(
+pub(crate) fn branch_of(
   read: &Changeset<'_>,
   room: &mut Admission,
 ) -> Result<(Vec<u8>, bool), changeset::Refusal> {

@@ -112,6 +112,9 @@ pub struct Verified {
   pub files: Vec<(Vec<u8>, Vec<Arrived>)>,
   /// The revisions the repository held already, passed over.
   pub passed_over: u64,
+  /// The changesets among them, in the bundle's order: what 7.2's `changegroup.apply` calls `duprevs`, which a publishing
+  /// repository publishes with the new ones (A-657).
+  pub held_changesets: Vec<Node>,
   /// Each new changeset's position, by node.
   changeset_at: BTreeMap<Node, usize>,
   /// Each new manifest's position, by node.
@@ -334,17 +337,21 @@ impl<'g, H: Held + ?Sized> Group<'g, H> {
     *node == NULL_NODE || self.by_node.contains_key(node) || self.held_text(node).is_some()
   }
 
-  /// Takes one revision: passed over when the log holds it; otherwise its parents and base found, its text rebuilt and
-  /// its node checked.
+  /// Takes one revision: passed over when the log holds it or the group brought it earlier; otherwise its parents and
+  /// base found, its text rebuilt and its node checked. Whether the log held it already.
   fn take(
     &mut self,
     revision: &Revision<'_>,
     passed_over: &mut u64,
     admission: &mut Admission,
-  ) -> Result<(), Unverified> {
-    if self.by_node.contains_key(&revision.node) || self.held_text(&revision.node).is_some() {
+  ) -> Result<bool, Unverified> {
+    if self.by_node.contains_key(&revision.node) {
       *passed_over = passed_over.saturating_add(1);
-      return Ok(());
+      return Ok(false);
+    }
+    if self.held_text(&revision.node).is_some() {
+      *passed_over = passed_over.saturating_add(1);
+      return Ok(true);
     }
     self.check_known(revision)?;
     let text = self.rebuild(revision, admission)?;
@@ -365,7 +372,7 @@ impl<'g, H: Held + ?Sized> Group<'g, H> {
       link: revision.link,
       text,
     });
-    Ok(())
+    Ok(false)
   }
 
   /// Refuses a revision with a flag, or one whose parent this log does not know.
@@ -459,7 +466,10 @@ fn changelog(
 ) -> Result<BTreeMap<Node, usize>, Unverified> {
   let mut log = Group::new(LogOf::Changelog, held);
   for revision in group.group(&group.changelog) {
-    log.take(revision, &mut verified.passed_over, admission)?;
+    if log.take(revision, &mut verified.passed_over, admission)? {
+      admission.charge_items::<Node>(1)?;
+      verified.held_changesets.push(revision.node);
+    }
   }
   for arrived in &log.arrived {
     changeset::decode(&arrived.text)
