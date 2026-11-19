@@ -25,6 +25,13 @@
 //! A served request is `200`: its body is the command's answer and its media type the one the answer names
 //! (`application/mercurial-0.1`, `-0.2` or `application/hg-error`), given as the reply begins.
 //!
+//! **A push** (A-680 part 2b). An `unbundle` the policy admitted has its `heads` argument and its bundle read from the
+//! request (`slates_hg::serve::http::unbundle_request`; arguments that cannot be read are answered out of band) and is
+//! handed to the lender ([`HgStores::push`]), which lands it on the repository's owner shard
+//! (`crate::repository::hg_push::unbundle`); what it came to is framed as 7.2 frames `unbundle`'s answers
+//! (`slates_hg::serve::http::pushed`). A repository whose store the shard does not lend is `503`. A `pushkey` command is
+//! answered as one not served, out of band: the bundle2 a 7.2 client pushes moves its bookmarks and phases.
+//!
 //! **Names.** A repository is the one whose name is the URL's path, decoded, its slashes at either end dropped as
 //! hgwebdir drops them (`req.dispatchpath.strip(b'/')`): a client reaches `name` at `/name?cmd=...` and at
 //! `/name/?cmd=...`. No other spelling is tried.
@@ -42,8 +49,11 @@
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_hg::compression::Engine;
+use slates_hg::push::Outcome;
 use slates_hg::serve::getbundle::Store;
-use slates_hg::serve::http::{self as hg_http, Compression, Compressor, Media, Permission};
+use slates_hg::serve::http::{
+  self as hg_http, Answered, Compression, Compressor, Media, Permission,
+};
 use slates_hg::{Admission, http as hg_wire};
 use slates_http::head::{Head, Target};
 use slates_http::percent::{self, Plus};
@@ -53,6 +63,7 @@ use slates_http_edge::credential;
 
 use super::git::{Authenticator, Located, Repositories, Unproven};
 use super::{Answer, Decided, Exchange, Failed, Site};
+use crate::repository::hg_push::Pushing;
 use crate::vcs_policy::{self, Right};
 
 /// Format: the methods a wire request may use, as `Allow` lists them: 7.2's client sends `GET`, and `POST` with a body.
@@ -110,6 +121,15 @@ pub(crate) trait HgStores {
     room: &mut Admission,
     step: impl for<'s> FnOnce(&Self::Store<'s>, &mut Admission) -> R,
   ) -> Option<R>;
+  /// Lands a push on repository `id` (the module doc's push): `pushing`'s principal, `heads` argument and bundle,
+  /// everything it builds charged to `room`; what it came to, none when the store is not lent here or no view of it
+  /// could be made.
+  fn push(
+    &mut self,
+    id: RepositoryId,
+    pushing: Pushing<'_>,
+    room: &mut Admission,
+  ) -> Option<Outcome>;
 }
 
 /// The design's first value for a stream's compression (§4.17.3 "Learned tunables": "each named engine at its fastest
@@ -138,6 +158,8 @@ struct Routed {
   name: String,
   /// The permission the query's command needs, `None` where it names no command of 7.2's table (hgweb's pages).
   permission: Option<Permission>,
+  /// Whether the command is `unbundle`, a push's bundle (the module doc's push).
+  unbundle: bool,
 }
 
 /// What a request's credentials came to.
@@ -217,7 +239,8 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     if !self.stores.holds(repository.id) {
       return refused_with(Status::SERVICE_UNAVAILABLE, Fields::new(), true);
     }
-    match HgExchange::new(self.stores.clone(), repository, head, self.room) {
+    let pusher = routed.unbundle.then_some(principal);
+    match HgExchange::new(self.stores.clone(), (repository, pusher), head, self.room) {
       Some(exchange) => Decided {
         answer: Answer::Serve {
           fields: Fields::new(),
@@ -342,6 +365,7 @@ fn route(head: &Head<'_>, room: u64) -> Result<Routed, Status> {
   Ok(Routed {
     name,
     permission: command.as_deref().and_then(hg_http::permission),
+    unbundle: command.as_deref() == Some(hg_http::UNBUNDLE),
   })
 }
 
@@ -390,6 +414,8 @@ pub(crate) struct HgExchange<S> {
   stores: S,
   /// The repository.
   repository: RepositoryRecord,
+  /// Who pushes, where the request is an `unbundle` (the module doc's push).
+  pusher: Option<Principal>,
   /// The request's query.
   query: Vec<u8>,
   /// The request's `X-Hg` fields, name and value.
@@ -403,8 +429,14 @@ pub(crate) struct HgExchange<S> {
 }
 
 impl<S> HgExchange<S> {
-  /// The exchange for `head` on `repository`, its arguments copied and charged to `room`; none past it.
-  fn new(stores: S, repository: RepositoryRecord, head: &Head<'_>, room: u64) -> Option<Self> {
+  /// The exchange for `head` on `repository`, by `pusher` where it is a push, its arguments copied and charged to
+  /// `room`; none past it.
+  fn new(
+    stores: S,
+    (repository, pusher): (RepositoryRecord, Option<Principal>),
+    head: &Head<'_>,
+    room: u64,
+  ) -> Option<Self> {
     let mut admission = Admission::new(room);
     let query = match head.target {
       Target::Path { query, .. } => query.unwrap_or_default(),
@@ -431,6 +463,7 @@ impl<S> HgExchange<S> {
     Some(Self {
       stores,
       repository,
+      pusher,
       query: query.to_vec(),
       fields,
       body: Vec::new(),
@@ -462,12 +495,14 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       body: &self.body,
     };
     let mut admission = self.room;
-    let answered = self
-      .stores
-      .lend(self.repository.id, &mut admission, |store, room| {
+    let id = self.repository.id;
+    let answered = match &self.pusher {
+      Some(principal) => answered_push(&mut self.stores, (id, principal), &request, &mut admission),
+      None => self.stores.lend(id, &mut admission, |store, room| {
         hg_http::answer(store, &request, header_line(), &mut Fastest, room)
-      })
-      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+      }),
+    }
+    .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     self.answered = Some((answered.media_type, answered.body));
     Ok(())
   }
@@ -486,6 +521,23 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     }
     Ok(false)
   }
+}
+
+/// The answer to an `unbundle` by `principal` on repository `id` (the module doc's push): its `heads` and bundle read
+/// from `request`, the push landed through `stores`, and what it came to framed as 7.2 frames it; none when the store is
+/// not lent.
+fn answered_push<S: HgStores>(
+  stores: &mut S,
+  (id, principal): (RepositoryId, &Principal),
+  request: &hg_wire::Request<'_>,
+  admission: &mut Admission,
+) -> Option<Answered> {
+  let (heads, bundle) = match hg_http::unbundle_request(request, admission) {
+    Ok(read) => read,
+    Err(answered) => return Some(answered),
+  };
+  let outcome = stores.push(id, (principal, &heads, bundle), admission)?;
+  Some(hg_http::pushed(&outcome, admission))
 }
 
 #[cfg(test)]

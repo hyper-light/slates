@@ -109,7 +109,10 @@ const BUNDLE2_SERVED_HTTP: [(&[u8], &[&[u8]]); 9] = [
   (b"bookmarks", &[]),
   (b"changegroup", &[b"01", b"02", b"03"]),
   (b"checkheads", &[b"related"]),
-  (b"error", &[b"abort", b"unsupportedcontent", b"pushraced", b"pushkey"]),
+  (
+    b"error",
+    &[b"abort", b"unsupportedcontent", b"pushraced", b"pushkey"],
+  ),
   (b"listkeys", &[]),
   (b"obsmarkers", &[b"V0", b"V1"]),
   (b"phases", &[b"heads"]),

@@ -46,8 +46,8 @@ use super::session::{self, Answer, BUNDLE2_REQUIRED, Refused, Transport, dispatc
 use crate::compression::{self, Engine};
 use crate::http::{self, MEDIA_TYPE_ERROR, MEDIA_TYPE_V1, MEDIA_TYPE_V2, ProtocolCaps, Request};
 use crate::push::Outcome;
-use crate::push::reply::Reply;
 use crate::push::check::{self, HeadsArgument, HeadsArgumentRefusal};
+use crate::push::reply::Reply;
 use crate::read::to_u64;
 use crate::{Admission, PastAdmission};
 
@@ -202,7 +202,8 @@ pub fn unbundle_request<'r>(
   admission: &mut Admission,
 ) -> Result<(HeadsArgument, &'r [u8]), Answered> {
   let mut buffer = Vec::new();
-  let fields = http::fields(request, admission, &mut buffer).map_err(|refusal| error(Refused::Http(refusal)))?;
+  let fields = http::fields(request, admission, &mut buffer)
+    .map_err(|refusal| error(Refused::Http(refusal)))?;
   let spec = spec_of(UNBUNDLE).ok_or_else(not_available)?;
   let arguments = fields
     .arguments(spec, admission)

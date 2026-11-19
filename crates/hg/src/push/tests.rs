@@ -1153,8 +1153,14 @@ fn bundles_7_2_does_not_read_are_answered_in_its_words() {
   });
   let parameter = with_stream_parameter(b"Xyz");
   let cases: [(&[u8], Result<Unbundle, Outcome>); 8] = [
-    (b"", unprocessed("stream ended unexpectedly (got 0 bytes, expected 4)")),
-    (b"HG", unprocessed("stream ended unexpectedly (got 2 bytes, expected 4)")),
+    (
+      b"",
+      unprocessed("stream ended unexpectedly (got 0 bytes, expected 4)"),
+    ),
+    (
+      b"HG",
+      unprocessed("stream ended unexpectedly (got 2 bytes, expected 4)"),
+    ),
     (b"HG10UN\0\0\0\0", Err(Outcome::Bundle1)),
     (b"\0\0\0\x10", Err(Outcome::Bundle1)),
     (b"PK\x03\x04", unprocessed("stream: not a Mercurial bundle")),
