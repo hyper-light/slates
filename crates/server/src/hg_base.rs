@@ -260,9 +260,9 @@ impl<'h, H: HostFs + ?Sized> HgBase<'h, H> {
 impl<H: HostFs + ?Sized> RepositoryFiles for HgBase<'_, H> {
   type Refused = BaseRefused;
 
-  fn len(&mut self, path: &[&[u8]]) -> Result<Option<u64>, FileRefused<BaseRefused>> {
-    let held = self.held(path).map_err(FileRefused::Host)?;
-    Ok(held.map(|(_, len)| len))
+  fn len(&mut self, _path: &[&[u8]]) -> Result<Option<u64>, FileRefused<BaseRefused>> {
+    // Red (not for main): a stub that finds no file.
+    Ok(None)
   }
 
   fn read(
@@ -272,6 +272,10 @@ impl<H: HostFs + ?Sized> RepositoryFiles for HgBase<'_, H> {
     len: u64,
     room: &mut Admission,
   ) -> Result<Option<Vec<u8>>, FileRefused<BaseRefused>> {
+    // Red (not for main): a stub that finds no file.
+    if !path.is_empty() {
+      return Ok(None);
+    }
     let Some((file, file_len)) = self.held(path).map_err(FileRefused::Host)? else {
       return Ok(None);
     };
