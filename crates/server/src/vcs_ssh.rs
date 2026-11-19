@@ -45,11 +45,13 @@
 //!
 //! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the host key's keeping, the key store
 //! over §4.13's principals, the repositories' lookup on their partitions); the four services' server halves, each refused
-//! as not served until it lands (git's upload-pack, A-640; receive-pack, A-620; Mercurial's `serve --stdio`, A-650;
-//! Subversion's tunnel, §4.17.4 piece 12); the live `git clone` over SSH (main's run).
+//! as not served until it lands (git's upload-pack, A-640; receive-pack, A-620; Mercurial's `serve --stdio`, A-650); the
+//! lenders of the stores git's upload-pack and Subversion's tunnel (`svn`, A-688) are served from, over A-662's map; the
+//! live `git clone` and `svn checkout svn+ssh://` over SSH (main's runs).
 
 mod git;
 pub(crate) mod site;
+mod svn;
 mod waits;
 
 use std::cell::{Cell, RefCell};
