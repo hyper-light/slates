@@ -1061,7 +1061,17 @@
 > over main 5c0a522f1 on macOS arm64 (Mac Studio, kiln r40) the focused runs green: slates-merge lib 73 of 73 filtered
 > to the copy, checkpoint, branch, node, reanchor and stack tests, the fixed history meeting all 13 census cases,
 > `--test checkpoint` 4 of 4, `--test chain_replay` 3 of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 5 of 5
-> (a segment of layout 11 refused at start, new); Linux owed. Owed from A-626: a rebase restating a copy (part 4); a
+> (a segment of layout 11 refused at start, new); Linux owed. A-626 part 3, continued (1) (2026-11-19, g307; a
+> regression part 3 made, found by g258, bisected by main): version 4 wrote the identity's 2,048-byte sum into every
+> checkpoint, so the service's doubling rule waited on that many bytes of increments for every green, and slates-server's
+> `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log` met its root's first version
+> unfolded (194 bytes to fold against a 2,233-byte checkpoint, kiln r122, Mac Studio); fixed by version 5, the copies'
+> section and the sum each behind a presence byte and written beside a copy's record alone, the anchor's layout 13
+> (`docs/bugs/2026-11-19-every-checkpoint-carried-the-identitys-sum-so-a-small-green-folded-late.md`); on macOS arm64
+> (kiln r146) the repository test passes, its root's checkpoint at 1 now 155 bytes, slates-merge lib 76 of 76 filtered
+> to the copy, checkpoint, branch, node, reanchor and stack tests, `--test checkpoint` 4 of 4, `--test chain_replay` 3
+> of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 6 of 6 (layout 12 refused at start, new); Windows and Linux
+> owed. Owed from A-626: a rebase restating a copy (part 4); a
 > restore that grafts
 > a copied tree whose source is unchanged since its version by reference, where the checkpoint now lists it key by key,
 > if measured worth it; the replaced tree held by reference rather than removed key by

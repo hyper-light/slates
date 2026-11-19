@@ -11676,9 +11676,12 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > each copied tree's keys holding then what the copy above them gave them (set by a restore with no history, so each
 > reads by its record again), and the identity's running sum, moved to the version as a branch moves it, which the
 > restore takes (what it holds beyond the restored state's entries is kept for the recount). The anchor's layout is 12:
-> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Owed: a rebase that
-> restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since its version, where the
-> checkpoint lists it key by key (the A-626 part 3 entry).
+> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Since A-626 part 3,
+> continued (1), the copies' section and the sum each sit behind a presence byte, written beside a copy's record alone
+> (version 5, the anchor's layout 13): a green that never copied pays two bytes for them, where version 4's sum in
+> every checkpoint, 2,048 bytes, had held the service's doubling rule from folding a small green's early versions.
+> Owed: a rebase that restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since
+> its version, where the checkpoint lists it key by key (the A-626 part 3 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -14111,8 +14114,9 @@ and export by landing).
 > room it needs derived before the verdict. Owed: a checkpoint of a green holding a copy, and a rebase restating one.
 >
 > **Status (2026-11-19, A-626 part 3).** Built: a green holding copies is checkpointed (format version 4, the anchor's
-> layout 12), so a repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a
-> rebase restating a copy (part 4).
+> layout 12; version 5 and layout 13 since its continuation (1), the sum carried beside a copy's record alone), so a
+> repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a rebase restating a
+> copy (part 4).
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -49009,3 +49013,48 @@ the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` sha
   `crates/client/src/client.rs`; the submit sites of `crates/server/tests/{daemon,fleet,verdict_pages,works_off_owner}.rs`,
   `crates/client/tests/edit_and_submit.rs`, `crates/client/examples/load_bench.rs`; §4.17.1 "A push is a work"'s
   status; GAPS' §4.17 entry.
+
+### A-626 part 3, continued (1) — A checkpoint carries its copies' section and the identity's sum beside a copy's record alone: version 5, the anchor's layout 13 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); a regression A-626 part 3 made, found by g258's run of slates-server's lib and bisected by main to 637a65d69; §4.16 "Deltas older than the derived retention fold into checkpoint deltas", W3's doubling rule)
+Applied in the same change to: §4.16 and §4.17.4 (A-626 part 3's status blocks), GAPS (the §4.17.4 entry),
+`crates/merge/src/checkpoint.rs` (version 5: `Checkpoint::sum` an `Option`, `encode_copies_into`, `take_copies_section`,
+`take_sum`; the module docs) and its tests (`src/checkpoint/tests.rs`: the golden vectors derived again, a golden
+checkpoint of a green that never copied), `crates/merge/src/engine.rs` (`Green::checkpoint` taking the sum beside a
+copy's record alone, the restore taking one only where carried), `crates/merge/src/engine/copy_checkpoint.rs` (the module
+docs), `crates/merge/src/engine/copy_tests.rs` (the replica test's comparison below the copy),
+`crates/merge/tests/checkpoint.rs` (main's, by reading), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 13),
+`crates/anchor/tests/anchor.rs` (a segment of layout 12 refused at start), and the bug record
+`docs/bugs/2026-11-19-every-checkpoint-carried-the-identitys-sum-so-a-small-green-folded-late.md`.
+- **What was there.** Version 4 wrote the identity's running sum, 2,048 bytes, into every checkpoint, though a restore
+  needs it only beside a copy's record: without one, the sum holds nothing beyond the entries the restore makes as it
+  places the state. The service's doubling rule (`merge_service::checkpoint_green_when`) takes a checkpoint once the
+  increments it would fold reach the size of the checkpoint it holds, so every green's chain then waited on 2,048 bytes
+  of increments before its next fold. slates-server's
+  `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log` met it: its root, written
+  twice with no reader left, kept version 1 (the second increment, 194 bytes, under the 2,233-byte checkpoint at 1;
+  kiln r122, Mac Studio), and a branch there was made where the test expects `UnknownBase`.
+- **The fix.** Version 5: the copies' section (the copies' records and the copied tables) and the sum each sit behind a
+  presence byte, as the head check does, and are written beside a copy's record alone; the engine computes the sum only
+  then, and the restore takes one only where the checkpoint carries it. A green that never copied checkpoints in
+  version 3's tables and two bytes more. The anchor's layout is 13, so a segment of version 4 checkpoints is refused at
+  adoption, typed, as part 3's layout refused version 3's.
+- **Rejected.** *The test as stale*: it states the rule as the service holds it, a fold taken once the increments
+  outweigh the checkpoint; what changed was the size of every green's checkpoint, by bytes only a copy needs. *An
+  exception in the doubling rule* (the sum's bytes left out of the held size): the bytes would stay in every checkpoint,
+  in the partition's log and its snapshots, and the rule would carry a detail of one format.
+- **Tests.** The red: the repository test on main. Golden vectors derived again by A-626 part 3's pure-Python BLAKE3,
+  which still reproduces version 4's pinned vector (2,497 bytes, `13b881c8…51df3`): the checkpoint holding a copy,
+  2,499 bytes, `05c1e7f6…3865f09`; a new one of a green that never copied, 115 bytes, `dfa590d1…6de08c04`, each of its
+  presence bytes refused `BadKind` when neither. A version 4 header refused `BadVersion`. Part 3's replica test compared
+  the sums carried at 3, below the copy, where none is carried now: it compares the identity each moves to 3
+  (`Green::sum_at`) and the whole checkpoints there. A segment of layout 12 refused at start.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Windows x86_64 and Linux runs owed). Red: the
+  repository test on main (main's bisect, kiln r104; r122 at 3329211, the doubling rule's inputs printed into its
+  clone alone: a 2,233-byte checkpoint at 1, 194 bytes to fold, no checkpoint at 2). Green, kiln r146 at 189ab8dc3
+  over main 545181b30, the code landed here: the repository test 1 passed, and printed again the checkpoint at 1 is
+  155 bytes and the one at 2 is taken (195); `cargo test --locked -p slates-merge --lib -- copy checkpoint
+  engine::branch engine::node_tests engine::reanchor engine::stack::tests` 76 passed, none failed, the copy oracle's
+  fixed history meeting all 13 census cases (279 checkpoints carrying copies and 275 listing copied keys over its run,
+  each restored and replayed to its owner's identity); `--test checkpoint checkpoint` 4 of 4; `--test chain_replay
+  checkpoint` 3 of 3; `cargo test --locked -p slates-anchor --lib layout` 2 of 2 and `--test anchor a_segment_` 6 of 6,
+  the layout 12 refusal among them; both crates' fmt checks clean.
+- **For A-626 part 4**, not yet landed: its logged copy takes the anchor's layout 14.
