@@ -7658,7 +7658,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > successor's shipper named fresh members as holders, which the daemon's successor does not (it ships to the record's
 > holders), so a later phase one could count `f + 1` holders that held nothing; the model now takes the superseded
 > shipper's committed holders (A-601). What a superseded owner answers from its own state is the owner lease's to stop
-> (§4.8 "Leases and reads"); this is the log's half: what a successor reads and then serves.
+> (§4.8 "Leases and reads"); this is the log's half: what a successor reads and then serves. The lease's half, that a
+> deposed owner's lease lapses before any successor can commit and a lapsed lease answers no latest-state read, is
+> proven by the tests A-601, continued (2) cites.
 >
 > **Holders follow the candidates (2026-11-07, A-200's amendment of that date).** The shipper's holder set changes by a
 > joint transition (`Shipper::begin_transition`, `transferred`, `activate`); the daemon begins one whenever the
@@ -11706,6 +11708,15 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > every checkpoint, 2,048 bytes, had held the service's doubling rule from folding a small green's early versions.
 > Owed: a rebase that restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since
 > its version, where the checkpoint lists it key by key (the A-626 part 3 entry).
+>
+> **Status (2026-11-19, A-626 part 4).** Built: a rebase restates a copy (`crates/merge/src/engine/copy_restate.rs`), as
+> the deriver's `VolumeOp::Copy` and, after it, every operation its work made in the copied tree as the work made it:
+> a file edited there as edits over what the copy brings, never a rename. The deriver composes a journal holding a copy
+> against a base holding the copied tree at its destination (`Green::base_for`: the source's tree at the copy's version,
+> re-rooted), refusing an operation in a destination's tree before its copy (`Unsupported`). A work's logged journal
+> holds a copy (`LoggedOp::Copy`, the anchor's layout 14); a work's own shard leaves such a journal to the green's owner
+> to compose. Owed: the work model resolving copies, so a rebased work sees the copied files it left alone (the A-626
+> part 4 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -13044,6 +13055,15 @@ engine: the verdict, rebase, position mapping, the register).
 > filter is still refused as not served: the walk by path with git's tree frames, the graph's named entries and the
 > blob's name resolved are its next slices.
 
+> **Status (2026-11-19, A-640 part 4, second slice: the walk by path).** A `sparse:oid` filter served alone, with the
+> patterns the request carries (`negotiation::Request::sparse`), walks each sent commit's tree, and each wanted tree,
+> by path as git's `filter_sparse` does (`negotiation::objects`): every tree reached is sent, and a blob when a path it
+> is met at is matched (an undecided path taking its tree's verdict, the root's base not matched); a tree no blob
+> below which was left out is done, and any other is walked again wherever it is met. The graph gives each tree's
+> entries their names (`Graph::named_entries`, A-614's store reading them from the tree's bytes). Refused: a
+> `sparse:oid` without its patterns, which the service does not read yet (the next slice), and one within a
+> `combine:`, where git's answer turns on its order of walk.
+
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
 commands are `ls-refs`, `fetch`, `object-info` and `bundle-uri` [B: gitprotocol-v2]; it defines no push, so a push
@@ -14293,6 +14313,9 @@ and export by landing).
 > layout 12; version 5 and layout 13 since its continuation (1), the sum carried beside a copy's record alone), so a
 > repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a rebase restating a
 > copy (part 4).
+>
+> **Status (2026-11-19, A-626 part 4).** Built: a work holding a copy rebases, its copy and its edits in the copied tree
+> restated, and composes again over the head. Owed: the work model resolving copies.
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -43720,6 +43743,12 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
     crate's. Red first (kiln r149): the three serve tests failed, answered "Authorization failed" where `svnserve`
     asks. The fold's tests were written beside it and not run red: the ASCII fold they replace leaves `Ärger.txt` as it
     is, which the oracle's first name refuses.
+- **The fixtures' sums** (2026-11-19, g297): `crates/svn/src/fixture_sums.rs` holds every file under
+  `crates/svn/fixtures` to its directory's `SHA256SUMS` (a stale sum, a sum whose file is gone, a file no sum names
+  but its recorder's inputs, and a fixture directory no recorder's inputs are named for each fail), where only the
+  names a sum lists were tested before. Red first on main (macOS arm64, Mac Studio, kiln r13): one problem in seven
+  directories, `reads/sessions.txt`, whose sum predated bdc73e368's appended `get-file-revs-svndiff0` line; its sum
+  made again.
 - **Owed**: the 58 code points Unicode 18 assigned that utf8proc 2.12.0 folds and the fold here keeps, until
   `unicode-normalization`'s tables are Unicode 18's (the oracle test prints them); red-checks of the seventh slice, the
   eighth and step 7 (the `get-file-revs-svndiff0` recording landed with A-616 continued (7)).
@@ -50105,6 +50134,153 @@ part 3), so the lock is unchanged; `svn_hooks`'s and `vcs_http`'s tests, whose r
 - **Owed:** receive-pack's server half asking all of this for each command (A-620 part 2's judge over the store,
   composed with the server's greens and appends), and its hooks (A-622 part 3); Mercurial's linear history on its push
   path (A-641); OpenPGP and X.509 commit signatures; a push's commits judged in slices under the shard's budget.
+
+### A-640 part 4, second slice — The walk by path: git's sparse frames over named tree entries (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-615 part 2, A-640 part 4 first slice)
+Applied in the same change to:
+- §4.17.2's statuses (a status after the first slice's);
+- GAPS (the A-640 entries);
+- `crates/git/src/negotiation/mod.rs` (`Graph::named_entries`, `Request::sparse`, the served check, the module doc),
+  `negotiation/filter.rs` (`check_served`, `Refusal::SparseCombined`, the module doc), `negotiation/objects.rs` (the
+  sparse walk), `store/graph.rs` and `store/repository.rs` (named entries from the store), `upload/fetch.rs` and
+  `upload/v0.rs` (no patterns yet);
+- the tests: `negotiation/tests/mod.rs` (the oracle and three cases), `negotiation/tests/filter.rs`,
+  `tests/store_graph.rs`.
+
+- **What git does** [C: `list-objects-filter.c` `filter_sparse`; `list-objects.c` `process_tree`,
+  `process_tree_contents` and `process_blob`; git v2.50.1]. Walking each tree with its path, the filter keeps a frame
+  for each tree: at `LOFS_BEGIN_TREE` the tree's path is asked as a directory, an undecided verdict taking its parent
+  frame's, and the tree is shown the first time it is met; at `LOFS_BLOB` a matched blob is shown and marked seen, and
+  any other is left out for now (`child_prov_omit`) and asked again wherever else it is met; at `LOFS_END_TREE` a tree
+  no blob below which was left out is marked seen, never walked again. What is shown is what some path decides,
+  whatever order the trees are met in.
+- **The walk** (`objects::Chosen::walk_sparse`): the same frames on an explicit stack (`SparseWalk`, `Frame`), with no
+  recursion; each frame, each entry with its name, each path byte and each tree done charged to the request's
+  admission, which so bounds the walk's work as well as what it keeps (a tree met at many paths is walked at each until
+  it is done). A wanted tree is walked from its own root, its path empty, as git walks a tree a client named.
+- **Named entries** (`Graph::named_entries`): the store reads a tree's entries with their names from its bytes
+  (`Repository::tree_named_references`, beside `tree_references`), a submodule's commit left out as before.
+- **Served alone.** Inside a `combine:`, git's answer turns on its order of walk: each other filter marks a blob seen
+  at the first path it is met at (`process_subfilter`), so the combination never sends it at a later path the
+  patterns match. The walk keeps no such order, so a `combine:` holding `sparse:oid` is refused
+  (`filter::Refusal::SparseCombined`), as is `sparse:oid` without its patterns (`filter::Refusal::SparseOid`) until the
+  service reads them (the next slice).
+- **Tests.** The negotiation's oracle states the rule over every path unfolded (`oracle_sparse`: every tree reached,
+  a blob when a path to it is matched, an undecided path taking the nearest decided tree's verdict), with no frames,
+  no done trees and no order, and holds every generated history to it: entries named from a table, patterns built
+  from eight lines chosen by the plan, one plan in eight without patterns and some within a `combine:`; its census now
+  requires a served sparse pack, and one that left a blob out of a tree it holds. Three cases: a blob left out at one
+  path and sent through another; a tree walked once when done and twice while a blob below it was left out (the count
+  of trees opened is the witness); and the two refusals. Over the real store, a sparse clone under `*` sends exactly
+  stock git's clone pack, and under no pattern the same less every blob.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r6, over main bb535bd4d with this
+  slice (`agents/g296-a640-p4b` at b991ab570): `cargo test --locked -p slates-git --lib -- negotiation::
+  store::repository::graph::tests:: upload::tests::refused::` 39 of 39, the oracle over 4,096 histories among them;
+  `cargo fmt -p slates-git -- --check` clean. Failing first (kiln r213, over main 2dc39bd60 with this slice, in the
+  clone): with `walk_sparse` and `named_entries_of` stubbed, the two walk cases, the store's sparse clone and the
+  oracle failed, 4 of 39, the refusals and the rest passing; restored, 39 of 39. Nothing outside slates-git names
+  what changed (no other crate implements `Graph`, builds a negotiation `Request` or matches a filter refusal), and no
+  integration target reaches it. The Linux and Windows runs are owed.
+- **Next slice.** The service (`upload`): `<blob-ish>` resolved (a full id, or `<rev>:<path>` through the refs'
+  rules; other forms refused by kind), its blob read within the request's admission and its patterns given to the
+  negotiation, git's two refusals' words ("unable to access sparse blob in '%s'", "unable to parse sparse filter data
+  in %s"), and a stock git `sparse:oid` exchange recorded as a golden.
+
+### A-601, continued (2) — The lease's half: a deposed owner past its lease never answers a read older than an acknowledged commit, proven by tests that already stand (2026-11-19, g229, main's piece for UI goal 82; §4.8 "Leases and reads"; AUD-08, A-351)
+Applied in the same change to: §4.10's live-log status (the lease's half cited). No code changed.
+
+- **The question.** A-601's goal reads "a stale owner never answers a read older than an acknowledged commit". Its
+  check covers what a successor reads; what a deposed owner answers from its own state is the owner lease's to stop.
+  Does a test prove that an owner whose lease lapsed refuses reads, typed, before any successor can commit?
+- **Yes: four rules, each tested, read together.** A successor commits only after phase one gathers its promotion
+  quorum.
+  - A holder promises a departed owner's object only once its own last answer to that owner, which may feed the
+    owner's lease, is older than the membership horizon. Tested by
+    `a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease` (`crates/server/src/daemon.rs`),
+    with the gate's rule in `crates/server/src/lease.rs`:
+    `a_promotion_waits_for_the_departed_owners_silence_or_acknowledgement` and
+    `a_former_members_last_answer_holds_its_promotion_until_its_horizon`.
+  - Every promotion quorum contains a holder whose confirmation the lease needs, and one confirmation fewer would
+    leave some quorum unconfirmed: `every_promotion_quorum_meets_the_lease_confirmations_and_no_fewer_suffice`
+    (lease.rs, over every cohort and live set up to its largest `f`).
+  - The lease holds only on `f` fresh confirmations naming the owner's standing, and lapses one nanosecond past its
+    bound, measured from the probe's send time: `f_other_fresh_recognized_confirmations_hold_the_lease`. The bound
+    sits strictly inside the holder's horizon, by the clock-rate tolerance: `the_owner_bound_sits_inside_the_horizon`.
+  - So by the time any successor holds its quorum, some holder in it last confirmed the owner more than a horizon
+    before, past the owner's bound: the owner's lease lapsed before any successor could commit, and while it held,
+    no successor had committed anything the owner's reads could miss.
+- **And a lapsed lease answers no latest-state read.** A read meeting an unconfirmed lease is parked, not answered
+  (`crate::lease_wait`), and is refused `LeaseUnconfirmed` if the bound passes first. End to end, in a three-node
+  `f = 1` fleet, `an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green` isolates the
+  owner on the probe plane and pauses its control shard past a lease bound. Its lease lapses by the clock, the
+  successor takes the green over and commits version 4, and the deposed owner's head version and head read are
+  refused `Refusal::LeaseUnconfirmed`, while its pinned version-1 read is still served.
+  `a_status_meeting_a_lapsed_lease_waits_and_is_served_once_the_lease_confirms` shows the park's other side: a status
+  meeting a lapsed lease waits, and is answered once the lease confirms, never refused at once.
+- **Tests** macOS arm64, Mac Studio, 2026-11-19, kiln r10, on main bb535bd4d (this change is documentation alone, so
+  main's tree is the one it describes), `--test-threads=4`.
+  - `cargo test --locked -p slates-server --lib`, filtered to `lease::` and the holder's deferral: 13 of 13, every
+    unit test cited above among them.
+  - `cargo test --locked -p slates-server --test fleet` with the isolated owner's test, the parked status's and
+    `a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`: 3 of 3.
+  - The Linux and Windows runs are owed.
+
+### A-626 part 4 — A rebase restates a copy: the deriver's `VolumeOp::Copy`, composed against the copied tree, and a work's logged journal holding one, the anchor's layout 14 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); §4.16 "Rebase, the only corrective path" and "Composition at seal", §4.17.4 item 3 and piece 3; A-586, A-626 parts 1 to 3, A-663, A-247)
+Applied in the same change to: §4.16 and §4.17.4 (status blocks), GAPS (the §4.17.4 entry), `crates/merge/src/increment.rs`
+(`VolumeOp::Copy`, `check_copies`, `emit_copies`), `crates/merge/src/engine/copy_restate.rs` (new: `copied_base`,
+`restate_sourced`, `copy_roots`, `copied_edit`), `crates/merge/src/engine.rs` (`base_for` laying in each copied tree,
+`Green::rebase` restating a copy where it refused one, `rebased_from`'s copy arm, `link_places` moving no link for a
+copied tree's edit), `crates/server/src/work_log.rs` (`LoggedOp::Copy`, appended last), `crates/server/src/work_home.rs`
+(`holds_copy`, `COPY_COMPOSED_BY_OWNER`), `crates/server/src/verbs.rs` (the count, where the owner composes),
+`crates/server/src/listing.rs` (a replacing copy's arm), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 14), and the
+tests (`src/increment/tests.rs`, `src/engine/copy_restate_tests.rs`, new; `copy_tests.rs` without the refusal's test;
+`crates/server/src/work_home.rs`'s, the owner's count; `crates/anchor/tests/anchor.rs`, a segment of layout 13 refused
+at start).
+- **What was there.** `Green::rebase` refused a work holding a copy (`TypeChanged` on its destination): a journal had no
+  operation to restate one as, and the deriver composed none.
+- **The deriver.** `VolumeOp::Copy { from, to, version, replace }` composes to one `Copy` (`REPLACE` where it replaces),
+  laid out by destination. What the journal does in the copied tree after it composes against the copied tree, which
+  `Green::base_for` puts at the destination for each copy the journal declares, in its order: the source's tree at the
+  copy's version, re-rooted, in place of whatever the destination's tree held. An operation in a destination's tree
+  before its copy is refused `Unsupported`: it would be composed against what the copy brings.
+- **The restatement.** A copy is restated as `VolumeOp::Copy`, before every operation in its tree; a file set beneath it
+  from its source (`ContentSource::Copied`, which a rename's edited destination names too) is the work's edit there,
+  restated over the bytes the copy brings, never a rename, and moves no node for A-663's link placement.
+- **The server.** A work's logged journal carries a copy (`LoggedOp::Copy`, appended so every tag before it stands;
+  the layout 14, one bump a landing by main's ruling, after A-626 part 3, continued (1) took 13). A work's own shard composes no journal holding a copy, since the
+  entries it fetches are a path's each and never a tree (A-247): it fetches nothing for one, and the green's owner
+  composes it against `Green::base_for`, counted `merge.work.copy_composed_by_owner`. A replacing copy takes the
+  journal's declared directories and symbolic links in its destination's tree out of the work's listing.
+- **The owner's extra cost** (main's ruling: the owner composing beats a refusal, which would answer nothing). A work
+  whose journal holds a copy is composed on its green's owner, as every work was before A-247: its sealed journal and
+  files go to the owner's shard, and the composition reads each copied tree once, every key at the copy's version
+  (`copied_base`, O(the copied trees' keys)), beside the deriver's own pass over the journal. A work with no copy is
+  composed where it was. `merge.work.copy_composed_by_owner` counts each such composition, and a test holds it moved.
+- **Owed.** The work model resolving copies: `Rebased::changed` names the files a rebased work changed, so its reads
+  and its listing do not yet show the copied files it left alone.
+- **Tests.** The deriver: a copy and an edit beneath it composed, the replace flag, an operation before its copy
+  refused, copies laid out by destination. The restatement: a copy of `trunk` at version 1 with an edit beneath it
+  rebased past a change to its source, restated as the copy and the edit. The oracle: generated works over the fixture
+  (copies of `trunk`, `trunk/d` or the root at version 1 or the head to `b` or `tags/t`, edits and files made in the
+  copied tree, a rename out of it, a link into it), each rebased as it submits: refused alike, a type change among the
+  windows, where it renames out or links in (A-586), else its restated journal composed again over the head and
+  submitted giving the green the original submit gives; a census of copies, edits and made files restated, renames out
+  and links in refused. Its first run (kiln r193) met a work that edits a copied file and renames one out: refused
+  alike, two type changes and a delete against modify on the rename's destination, whose source the base never held;
+  the oracle had asked type changes alone, and that work is now a fixed test. The owner's count
+  (`crates/server/src/work_home.rs`): a sealed work whose journal copies the root, handed to the owner's rebase step
+  composed nowhere, counts once whatever the owner answers it; one making a directory rebases clean and counts nothing.
+  A segment of layout 13 refused at start.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Windows x86_64 and Linux runs owed). The oracle's first
+  run (kiln r193, over main 7d020df47) failed on the work above, now a fixed test, and the owner's count had asked a
+  clean rebase of a copy the work model does not yet carry; after both, over main bb535bd4d with A-677 (kiln r15, at
+  3c5ad384f): `cargo test --locked -p slates-merge --lib -- increment copy restate rebase base_for` 67 passed, none
+  failed, the copy oracle's fixed history meeting all 13 census cases; `--test increment` 42 of 42, `--test rebase` 3
+  of 3, `--test base_for` 3 of 3; `cargo test --locked -p slates-server --lib -- work_log work_home listing` 7 of 7,
+  the owner's count moving once for the copy and not for the directory (the owner answered the root copy, handed with
+  no files, `TypeChanged` on `b`: the owed work model); `cargo test --locked -p slates-anchor --lib layout` 2 of 2 and
+  `--test anchor a_segment_` 7 of 7, the layout 13 refusal among them; the three crates' fmt checks clean. The same
+  runs over main ee5cbed4c, after A-644 part 2's server, db and ipc changes (kiln r40, at 15ba6b078): 67 of 67, 42 of
+  42, 3 of 3, 3 of 3, 7 of 7, 2 of 2 and 7 of 7, fmt clean.
 
 ### A-678 — The import verb: a client asks the daemon to import a Mercurial repository's directory, answered when the import ends (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.12; A-675)
 Applied in the same change to: §4.17.3 (its status, piece 3), `crates/ipc` (`RequestBody::ImportRepository`,

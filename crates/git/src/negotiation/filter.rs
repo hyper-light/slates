@@ -10,9 +10,9 @@
 //! - `object:type=<type>`: objects of that type alone (`filter_object_type`), commits and tags included.
 //! - `combine:<spec>+<spec>...`: what every spec sends. Each sub-spec is percent-decoded, and refused, as git refuses it,
 //!   when its encoded form holds a space, a control byte or one of ``~`!@#$^&*()[]{}\;'",<>?``.
-//! - `sparse:oid=<blob-ish>`: read, and refused as not served until the walk takes it: its blob's patterns are read and
-//!   asked as git reads and asks them ([`super::sparse`], A-640 part 4), and the walk by path, with the tree frames
-//!   git's filter keeps, and the blob's name resolved are owed. `sparse:path=`, which git dropped, is refused as git
+//! - `sparse:oid=<blob-ish>`: served with the patterns the server read from its blob ([`super::sparse`], A-640 part 4),
+//!   alone: every tree is sent, and a blob when some path it is met at is matched. Refused without them, and within a
+//!   `combine:`, where git's answer turns on its order of walk. `sparse:path=`, which git dropped, is refused as git
 //!   refuses it.
 //!
 //! Commits and tags are sent under every filter but `object:type`; the objects a request names, and what their tags
@@ -108,8 +108,12 @@ pub enum Refusal {
   NestedCombine,
   /// `sparse:path=`, which git dropped ("sparse:path filters support has been dropped").
   SparsePath,
-  /// `sparse:oid=`, read and not served.
+  /// `sparse:oid=` whose blob's patterns the server has not read: the request carries none.
   SparseOid,
+  /// `sparse:oid=` within a `combine:`. git's answer then turns on the order it walks commits in: each other filter
+  /// marks a blob seen at the first path it is met at, so a later path the patterns match cannot send it
+  /// (`filter_combine`, `process_subfilter`), and this walk keeps no such order.
+  SparseCombined,
 }
 
 impl Filter {
@@ -158,11 +162,19 @@ impl Filter {
   }
 }
 
-/// Refused when `filter` is one this negotiation reads but does not serve: `sparse:oid`.
-pub(super) fn check_served(filter: &Filter) -> Result<(), Refusal> {
+/// Refused when `filter` is one this negotiation reads but does not serve: `sparse:oid` without its patterns (`patterns`
+/// says whether the request carries them), or within a `combine:`.
+pub(super) fn check_served(filter: &Filter, patterns: bool) -> Result<(), Refusal> {
   match filter {
+    Filter::SparseOid(_) if patterns => Ok(()),
     Filter::SparseOid(_) => Err(Refusal::SparseOid),
-    Filter::Combine(filters) => filters.iter().try_for_each(check_served),
+    Filter::Combine(filters)
+      if filters
+        .iter()
+        .any(|filter| matches!(filter, Filter::SparseOid(_))) =>
+    {
+      Err(Refusal::SparseCombined)
+    }
     _ => Ok(()),
   }
 }

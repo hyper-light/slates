@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
+use super::sparse::Verdict;
 use super::{
-  Acknowledgments, Answer, CommitRow, Deepen, Filter, Graph, INFINITE_DEPTH, Pack, Refusal,
-  Request, Run, ShallowInfo, negotiate,
+  Acknowledgments, Answer, CommitRow, Deepen, Filter, Graph, INFINITE_DEPTH, Pack, Patterns,
+  Refusal, Request, Run, ShallowInfo, filter, negotiate,
 };
 use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
@@ -31,6 +32,7 @@ struct Object {
   entries: Vec<u32>,
   size: u64,
   target: Option<u32>,
+  names: Vec<Vec<u8>>,
 }
 
 /// A green's versions: version `v` is `heads[v - 1]`.
@@ -65,11 +67,15 @@ impl TestGraph {
       entries: vec![],
       size,
       target: None,
+      names: Vec::new(),
     })
   }
 
   fn new_tree(&mut self, entries: &[u32]) -> u32 {
     let entries = entries.to_vec();
+    let names = (0..entries.len())
+      .map(|index| index.to_string().into_bytes())
+      .collect();
     self.add(Object {
       kind: Kind::Tree,
       parents: vec![],
@@ -79,6 +85,7 @@ impl TestGraph {
       entries,
       size: 0,
       target: None,
+      names,
     })
   }
 
@@ -99,6 +106,7 @@ impl TestGraph {
       entries: vec![],
       size: 0,
       target: None,
+      names: Vec::new(),
     })
   }
 
@@ -113,6 +121,7 @@ impl TestGraph {
       entries: vec![],
       size: 0,
       target,
+      names: Vec::new(),
     })
   }
 
@@ -212,6 +221,15 @@ impl Graph for TestGraph {
     self.objects[at(tree)].entries.iter().copied()
   }
 
+  fn named_entries(&self, tree: u32) -> impl Iterator<Item = (u32, Vec<u8>)> {
+    let object = &self.objects[at(tree)];
+    object
+      .entries
+      .iter()
+      .copied()
+      .zip(object.names.iter().cloned())
+  }
+
   fn size(&self, blob: u32) -> u64 {
     self.objects[at(blob)].size
   }
@@ -290,6 +308,7 @@ struct Asks {
   filter: Option<Filter>,
   include_tag: bool,
   thin: bool,
+  sparse: Option<Patterns>,
 }
 
 /// A deepening, owned.
@@ -317,6 +336,7 @@ impl Asks {
       filter: self.filter.as_ref(),
       include_tag: self.include_tag,
       thin: self.thin,
+      sparse: self.sparse.as_ref(),
     }
   }
 }
@@ -472,8 +492,12 @@ fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
   }
   let common = held(graph, &asks.haves);
   let client = oracle_client(graph, &asks.shallow)?;
-  if let Some(filter) = &asks.filter {
-    super::filter::check_served(filter).map_err(Refusal::Filter)?;
+  if let Some(refused) = asks
+    .filter
+    .as_ref()
+    .and_then(|filter| oracle_filter_refusal(filter, asks.sparse.is_some()))
+  {
+    return Err(Refusal::Filter(refused));
   }
   let (runs, one_round) = oracle_runs(graph, asks, &wants, &common, &client);
   let walk_wants: Vec<u32> = wants
@@ -883,6 +907,78 @@ fn oracle_tags(graph: &TestGraph, carried: &BTreeSet<u32>, chosen: &mut BTreeSet
   }
 }
 
+/// The filter refusal the oracle expects (A-640 part 4, stated here): `sparse:oid` without its patterns, and any
+/// `combine:` holding one.
+fn oracle_filter_refusal(filter: &Filter, patterns: bool) -> Option<filter::Refusal> {
+  match filter {
+    Filter::SparseOid(_) if !patterns => Some(filter::Refusal::SparseOid),
+    Filter::Combine(filters)
+      if filters
+        .iter()
+        .any(|sub| matches!(sub, Filter::SparseOid(_))) =>
+    {
+      Some(filter::Refusal::SparseCombined)
+    }
+    _ => None,
+  }
+}
+
+/// The trees the walked wants name, through their tags.
+fn wanted_trees(graph: &TestGraph, walk_wants: &[u32]) -> Vec<u32> {
+  walk_wants
+    .iter()
+    .filter_map(|want| peeled(graph, *want))
+    .filter(|node| graph.objects[at(*node)].kind == Kind::Tree)
+    .collect()
+}
+
+/// git's sparse filter over every path unfolded (A-640 part 4; the objects module's item 3 stated without its frames,
+/// its done trees or its order): every tree reached from `tops` that nothing left out holds, and each blob a path to
+/// which is matched, a path the patterns leave undecided taking the verdict of the nearest tree above it that is
+/// decided, and nothing above a top being matched.
+fn oracle_sparse(
+  graph: &TestGraph,
+  patterns: &Patterns,
+  tops: &[u32],
+  left_out: &BTreeSet<u32>,
+) -> BTreeSet<u32> {
+  let decided = |verdict: Verdict, above: bool| match verdict {
+    Verdict::Matched => true,
+    Verdict::NotMatched => false,
+    Verdict::Undecided => above,
+  };
+  let mut shown = BTreeSet::new();
+  let mut stack: Vec<(u32, Vec<u8>, bool)> =
+    tops.iter().map(|top| (*top, Vec::new(), false)).collect();
+  while let Some((node, path, above)) = stack.pop() {
+    if left_out.contains(&node) {
+      continue;
+    }
+    let object = &graph.objects[at(node)];
+    match object.kind {
+      Kind::Tree => {
+        shown.insert(node);
+        let matched = decided(patterns.decide(&path, true), above);
+        for (entry, name) in object.entries.iter().zip(&object.names) {
+          let child = if path.is_empty() {
+            name.clone()
+          } else {
+            [&path[..], b"/", &name[..]].concat()
+          };
+          stack.push((*entry, child, matched));
+        }
+      }
+      Kind::Blob => {
+        if decided(patterns.decide(&path, false), above) {
+          shown.insert(node);
+        }
+      }
+      Kind::Commit | Kind::Tag => {}
+    }
+  }
+  shown
+}
+
 /// The oracle's objects, from the module's rules over full reachability.
 fn oracle_objects(
   graph: &TestGraph,
@@ -908,10 +1004,23 @@ fn oracle_objects(
   for want in walk_wants {
     oracle_want(graph, *want, &mut chosen, &mut roots);
   }
-  for (node, depth) in oracle_least_depths(graph, roots, &left_out) {
-    let object = &graph.objects[at(node)];
-    if admitted(filter, object.kind, object.size, depth) {
-      chosen.insert(node);
+  let sparse = match filter {
+    Some(Filter::SparseOid(_)) => asks.sparse.as_ref(),
+    _ => None,
+  };
+  if let Some(patterns) = sparse {
+    let mut tops: Vec<u32> = sent
+      .iter()
+      .map(|commit| graph.objects[at(*commit)].tree)
+      .collect();
+    tops.extend(wanted_trees(graph, walk_wants));
+    chosen.extend(oracle_sparse(graph, patterns, &tops, &left_out));
+  } else {
+    for (node, depth) in oracle_least_depths(graph, roots, &left_out) {
+      let object = &graph.objects[at(node)];
+      if admitted(filter, object.kind, object.size, depth) {
+        chosen.insert(node);
+      }
     }
   }
   if asks.include_tag {
@@ -1031,6 +1140,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
   let mut asks = build_asks(&graph, plan, &greens, &commits);
   asks.deepen = build_deepen(&graph, plan, &commits);
   asks.filter = build_filter(plan);
+  asks.sparse = build_sparse(plan, asks.filter.as_ref());
   if plan.mode % 3 == 0 {
     one_round_friendly(&graph, plan, &greens.current, &greens.chains, &mut asks);
   }
@@ -1050,7 +1160,11 @@ fn build_history(graph: &mut TestGraph, plan: &Plan) -> (Vec<u32>, Vec<u32>, Vec
     let mut chosen: Vec<u32> = entries.iter().map(|choice| pick(&pool, *choice)).collect();
     chosen.sort();
     chosen.dedup();
-    trees.push(graph.new_tree(&chosen));
+    let tree = graph.new_tree(&chosen);
+    graph.objects[at(tree)].names = (0..chosen.len())
+      .map(|index| NAMES[(trees.len() * 2 + index + usize::from(plan.mode)) % NAMES.len()].to_vec())
+      .collect();
+    trees.push(tree);
   }
   let mut commits: Vec<u32> = Vec::new();
   for (index, (parents, tree, date, skew)) in plan.commits.iter().enumerate() {
@@ -1187,6 +1301,7 @@ fn build_asks(graph: &TestGraph, plan: &Plan, greens: &Greens, commits: &[u32]) 
     filter: None,
     include_tag: plan.flags & 32 != 0,
     thin: plan.flags & 64 != 0,
+    sparse: None,
   }
 }
 
@@ -1215,6 +1330,39 @@ fn build_deepen(graph: &TestGraph, plan: &Plan, commits: &[u32]) -> Option<Owned
 }
 
 /// A plan's filter, if any: each kind, and a combination of a limit and a depth.
+/// The names a generated tree's entries take, in turn (A-640 part 4): letters, a directory's usual names, endings the
+/// patterns ask of, and a dot-file.
+const NAMES: [&[u8]; 6] = [b"a", b"src", b"b.c", b"doc", b"x.c", b".sparse"];
+
+/// The lines a generated `sparse:oid` blob is made of, each kept when its bit is set (A-640 part 4): git's non-cone
+/// example, an ending, a tree by name, a negation, a doubled star and a slashed glob.
+const PATTERN_LINES: [&[u8]; 8] = [
+  b"/*", b"!/*/", b"*.c", b"src/", b"!a", b"doc/**", b"/src/*", b"b*",
+];
+
+/// The patterns of a plan's `sparse:oid` filter, alone or in a combination: none for one plan in eight, which the
+/// negotiation refuses.
+fn build_sparse(plan: &Plan, filter: Option<&Filter>) -> Option<Patterns> {
+  let sparse = match filter {
+    Some(Filter::SparseOid(_)) => true,
+    Some(Filter::Combine(filters)) => filters
+      .iter()
+      .any(|sub| matches!(sub, Filter::SparseOid(_))),
+    _ => false,
+  };
+  if !sparse || plan.filter_value % 8 == 1 {
+    return None;
+  }
+  let bits = plan.depth ^ plan.since.rotate_left(4);
+  let lines: Vec<&[u8]> = PATTERN_LINES
+    .iter()
+    .enumerate()
+    .filter(|(bit, _)| bits & (1 << bit) != 0)
+    .map(|(_, line)| *line)
+    .collect();
+  Patterns::read(&lines.join(&b'\n'), &mut Admission::new(u64::MAX)).ok()
+}
+
 fn build_filter(plan: &Plan) -> Option<Filter> {
   let value = u64::from(plan.filter_value);
   match plan.filter % 9 {
@@ -1228,6 +1376,10 @@ fn build_filter(plan: &Plan) -> Option<Filter> {
     7 => Some(Filter::Combine(vec![
       Filter::BlobLimit(value),
       Filter::TreeDepth(value % 3 + 1),
+    ])),
+    _ if plan.filter_value % 5 == 0 => Some(Filter::Combine(vec![
+      Filter::BlobNone,
+      Filter::SparseOid(b"main:.sparse".to_vec()),
     ])),
     _ => Some(Filter::SparseOid(b"main:.sparse".to_vec())),
   }
@@ -1282,13 +1434,15 @@ struct Census {
   nothing_selected: u64,
   zero_depth: u64,
   sparse: u64,
+  sparse_served: u64,
+  sparse_blob_left_out: u64,
   packs_checked: u64,
   runs_checked: u64,
 }
 
 impl Census {
   /// Each count, named, so a test can say which was never met.
-  fn counts(&self) -> [(&'static str, u64); 23] {
+  fn counts(&self) -> [(&'static str, u64); 25] {
     [
       ("nothing", self.nothing),
       ("not_ready", self.not_ready),
@@ -1311,6 +1465,8 @@ impl Census {
       ("nothing_selected", self.nothing_selected),
       ("zero_depth", self.zero_depth),
       ("sparse", self.sparse),
+      ("sparse_served", self.sparse_served),
+      ("sparse_blob_left_out", self.sparse_blob_left_out),
       ("packs_checked", self.packs_checked),
       ("runs_checked", self.runs_checked),
     ]
@@ -1342,20 +1498,29 @@ impl Census {
       self.unshallow += u64::from(!info.unshallow.is_empty());
       self.shallow_section_empty += u64::from(info.shallow.is_empty() && info.unshallow.is_empty());
     }
-    match &asks.filter {
-      Some(Filter::BlobNone) => self.blob_none += 1,
-      Some(Filter::BlobLimit(_)) => self.blob_limit += 1,
-      Some(Filter::TreeDepth(_)) => self.tree_depth += 1,
-      Some(Filter::ObjectType(_)) => self.object_type += 1,
-      Some(Filter::Combine(_)) => self.combine += 1,
-      _ => {}
-    }
+    self.filter(graph, asks.filter.as_ref(), pack);
     let wanted: Vec<u32> = held(graph, &asks.wants);
     let tag_included = pack
       .objects
       .iter()
       .any(|node| graph.objects[at(*node)].kind == Kind::Tag && !wanted.contains(node));
     self.tags_included += u64::from(asks.include_tag && tag_included);
+  }
+
+  /// Counts the filter a pack was made under, and a sparse pack that left a blob out of a tree it holds.
+  fn filter(&mut self, graph: &TestGraph, filter: Option<&Filter>, pack: &Pack<u32, u32>) {
+    match filter {
+      Some(Filter::BlobNone) => self.blob_none += 1,
+      Some(Filter::BlobLimit(_)) => self.blob_limit += 1,
+      Some(Filter::TreeDepth(_)) => self.tree_depth += 1,
+      Some(Filter::ObjectType(_)) => self.object_type += 1,
+      Some(Filter::Combine(_)) => self.combine += 1,
+      Some(Filter::SparseOid(_)) => {
+        self.sparse_served += 1;
+        self.sparse_blob_left_out += u64::from(left_a_blob(graph, pack));
+      }
+      None => {}
+    }
   }
 
   /// Counts a refusal.
@@ -1429,7 +1594,7 @@ fn every_answer_is_the_oracles() {
   let unmet: Vec<&str> = census
     .counts()
     .iter()
-    .take(21)
+    .take(23)
     .filter(|(_, count)| *count == 0)
     .map(|(name, _)| *name)
     .collect();
@@ -1724,4 +1889,113 @@ fn a_tree_met_again_shallower_is_opened_again_under_a_depth_filter() {
   ];
   expected.sort();
   assert_eq!(pack.objects, expected);
+}
+
+/// Whether `pack` holds a tree without one of the blobs in it: a sparse filter left that blob out (A-640 part 4).
+fn left_a_blob(graph: &TestGraph, pack: &Pack<u32, u32>) -> bool {
+  pack.objects.iter().any(|node| {
+    let object = &graph.objects[at(*node)];
+    object.kind == Kind::Tree
+      && object
+        .entries
+        .iter()
+        .any(|entry| graph.objects[at(*entry)].kind == Kind::Blob && !pack.objects.contains(entry))
+  })
+}
+
+/// A tree of `entries`, each with its name.
+fn named_tree(graph: &mut TestGraph, entries: &[(u32, &[u8])]) -> u32 {
+  let nodes: Vec<u32> = entries.iter().map(|(node, _)| *node).collect();
+  let tree = graph.new_tree(&nodes);
+  graph.objects[at(tree)].names = entries.iter().map(|(_, name)| name.to_vec()).collect();
+  tree
+}
+
+/// The answer to a clone of `commit` under `filter`, the request carrying `patterns` when given.
+fn sparse_clone(
+  graph: &TestGraph,
+  commit: u32,
+  filter: &Filter,
+  patterns: Option<&[u8]>,
+) -> Result<(Vec<u32>, u64), Refusal> {
+  let patterns = patterns.and_then(|blob| Patterns::read(blob, &mut Admission::new(u64::MAX)).ok());
+  let wants = [graph.id(commit)];
+  let request = Request {
+    wants: &wants,
+    haves: &[],
+    done: true,
+    wait_for_done: false,
+    shallow: &[],
+    deepen: None,
+    filter: Some(filter),
+    sparse: patterns.as_ref(),
+    include_tag: false,
+    thin: false,
+  };
+  let outcome = negotiate(graph, &request, &mut Admission::new(u64::MAX))?;
+  match outcome.answer {
+    Answer::Pack(pack) => Ok((pack.objects, outcome.counters.trees)),
+    _ => Ok((Vec::new(), outcome.counters.trees)),
+  }
+}
+
+/// A-640 part 4 (git's `filter_sparse`: a blob left out at one path is asked again at the next). Do clone a commit
+/// whose root holds `drop` (a blob and another) before `keep` (the first blob again), under `keep/`. Expect: every tree
+/// sent; the shared blob sent through `keep/x`, though `drop/x` left it out first; the other, matched at no path, left
+/// out.
+#[test]
+fn a_blob_left_out_at_one_path_is_sent_when_another_is_matched() {
+  let mut graph = TestGraph::default();
+  let shared = graph.new_blob(1);
+  let other = graph.new_blob(2);
+  let drop = named_tree(&mut graph, &[(shared, b"x"), (other, b"y")]);
+  let keep = named_tree(&mut graph, &[(shared, b"x")]);
+  let root = named_tree(&mut graph, &[(drop, b"drop"), (keep, b"keep")]);
+  let commit = graph.new_commit(&[], root, 1);
+  let sparse = Filter::SparseOid(b"main:.sparse".to_vec());
+  let (objects, _) = sparse_clone(&graph, commit, &sparse, Some(b"keep/\n")).unwrap();
+  assert_eq!(objects, vec![shared, drop, keep, root, commit]);
+}
+
+/// A-640 part 4 (git marks a tree seen when no blob below it was left out, and walks any other again wherever it is
+/// met). Do clone a root holding one tree under `a` and again under `b`, under `*`, then under `b/`. Expect: under `*`,
+/// the blob sent and the tree opened once, done after its first path; under `b/`, the blob left out under `a` and sent
+/// under `b`, the tree opened twice (the counter of trees opened is the path's witness).
+#[test]
+fn a_tree_is_walked_again_only_while_a_blob_below_it_was_left_out() {
+  let mut graph = TestGraph::default();
+  let blob = graph.new_blob(1);
+  let twice = named_tree(&mut graph, &[(blob, b"x")]);
+  let root = named_tree(&mut graph, &[(twice, b"a"), (twice, b"b")]);
+  let commit = graph.new_commit(&[], root, 1);
+  let sparse = Filter::SparseOid(b"main:.sparse".to_vec());
+  let all = vec![blob, twice, root, commit];
+  assert_eq!(
+    sparse_clone(&graph, commit, &sparse, Some(b"*\n")),
+    Ok((all.clone(), 2))
+  );
+  assert_eq!(
+    sparse_clone(&graph, commit, &sparse, Some(b"b/\n")),
+    Ok((all, 3))
+  );
+}
+
+/// A-640 part 4 (`filter::check_served`): do clone under a `sparse:oid` filter without its patterns, then under one
+/// within a combination, with patterns. Expect: refused, the first as not read, the second as combined.
+#[test]
+fn a_sparse_filter_without_its_patterns_or_combined_is_refused() {
+  let mut graph = TestGraph::default();
+  let blob = graph.new_blob(1);
+  let root = named_tree(&mut graph, &[(blob, b"x")]);
+  let commit = graph.new_commit(&[], root, 1);
+  let sparse = Filter::SparseOid(b"main:.sparse".to_vec());
+  let combined = Filter::Combine(vec![Filter::BlobNone, sparse.clone()]);
+  assert_eq!(
+    sparse_clone(&graph, commit, &sparse, None),
+    Err(Refusal::Filter(filter::Refusal::SparseOid))
+  );
+  assert_eq!(
+    sparse_clone(&graph, commit, &combined, Some(b"*\n")),
+    Err(Refusal::Filter(filter::Refusal::SparseCombined))
+  );
 }
