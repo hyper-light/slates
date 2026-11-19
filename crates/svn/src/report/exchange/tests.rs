@@ -347,7 +347,7 @@ type AnswerCase = (&'static [u8], &'static [u8]);
 
 /// The answers `svn_ra_svn__read_cmd_response` and `svn_ra_svn__handle_failure_status` tell apart,
 /// each with what follows `close-edit`.
-const CLOSE_ANSWERS: [AnswerCase; 13] = [
+const CLOSE_ANSWERS: [AnswerCase; 14] = [
   (b"( success ( ) ) ", b"( success ( ) ) "),
   (b"( success ( 5:extra ) ) ", b"( success ( ) ) "),
   (
@@ -376,6 +376,10 @@ const CLOSE_ANSWERS: [AnswerCase; 13] = [
   ),
   (
     b"( failure ( ( five 4:mine 0: 0 ) ) ) ",
+    b"( abort-edit ( ) ) ( failure ( ( 210004 22:Malformed network data 0: 0 ) ) ) ",
+  ),
+  (
+    b"( failure ( 5 ( five 4:mine 0: 0 ) ) ) ",
     b"( abort-edit ( ) ) ( failure ( ( 210004 22:Malformed network data 0: 0 ) ) ) ",
   ),
   (
