@@ -10,10 +10,10 @@
 //! - `update`, `switch`, `status` and `diff`: the reporter's exchange (A-616's [`Exchange`]), its
 //!   drive written within the caller's room and steps;
 //! - `commit`: A-655's entry point and drive (**A commit**, below);
-//! - every other command of `svnserve`'s set, until its piece lands (the lock verbs,
-//!   `get-file-revs`, `replay`, `replay-range`, `change-rev-prop`): answered as a command
-//!   `svnserve` does not know, "Unknown editor command '…'" (210001), which a stock client reads as
-//!   a server without it, and counted ([`Turn::Unserved`]); the connection goes on;
+//! - every other command of `svnserve`'s set, until its piece lands (the lock verbs, `replay`,
+//!   `replay-range`, `change-rev-prop`): answered as a command `svnserve` does not know, "Unknown
+//!   editor command '…'" (210001), which a stock client reads as a server without it, and counted
+//!   ([`Turn::Unserved`]); the connection goes on;
 //! - an item that is no command ends the connection, as `svnserve` ends it.
 //!
 //! **Authentication for one command.** Where a command needs access the session's principal lacks,
@@ -945,6 +945,7 @@ impl Connection {
     let session = reads::Session {
       base: &established.base,
       uuid: &established.uuid,
+      capabilities: established.session.capabilities,
     };
     let outcome = reads::answer(sources.index, sources.repository, &session, &value, out)
       .map_err(Refused::Item)?;
@@ -1329,6 +1330,7 @@ impl Connection {
     let session = reads::Session {
       base: &established.base,
       uuid: &established.uuid,
+      capabilities: established.session.capabilities,
     };
     let progress = stream
       .resume(
