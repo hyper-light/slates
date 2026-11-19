@@ -1133,6 +1133,18 @@ impl Volume {
     self.journal.close_reader(key);
   }
 
+  /// What the rounds of the journal reader of transport attachment `key` found since this was last asked, `None` when
+  /// none is open (A-548, [`crate::journal::OpLog::take_rounds`]): what its owner learns the reader's patience from.
+  pub fn take_journal_rounds(&mut self, key: u64) -> Option<crate::journal::ReaderRounds> {
+    self.journal.take_rounds(key)
+  }
+
+  /// Names the patience of the journal reader of transport attachment `key` again (A-548): its owner's learned bound. A
+  /// key with no reader open is left alone.
+  pub fn set_journal_patience(&mut self, key: u64, patience: crate::journal::Patience) {
+    self.journal.set_patience(key, patience);
+  }
+
   /// The number of live snapshots.
   pub fn snapshot_count(&self) -> usize {
     self.snapshots.len()

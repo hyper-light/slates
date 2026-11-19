@@ -2167,7 +2167,8 @@ drift check `fstat`s.
   shard's metadata ledger when a record a reader has not read would otherwise leave. A reader's
   owner names its patience by what the reader's reads wait on (A-548): the NFS write-back tracker,
   consumed at the change itself on the volume's own shard, holds its records while it is open; a
-  reader whose rounds wait on a mount's kernel is presumed gone past its transport's liveness, and
+  reader whose rounds wait on a mount's kernel is presumed gone once it falls a liveness window
+  behind the pace its own rounds measured (RFC 6298's estimator, backed off at each overrun), and
   pins nothing then. A refused growth is counted.
 
 **Failure matrix.** Hash collision on equivalence (two names fold equal): Refused (`EEXIST`),
@@ -2837,10 +2838,11 @@ Two other ways were measured and rejected:
 
 **A mount that falls behind the journal is told everything** (A-141). The journal keeps what its live readers still
 owe (A-157), so a mount falls behind it only when the shard's metadata ledger refuses the journal's growth, or when the
-mount has been silent past its liveness. Then the gather reports an overrun instead of walking from the oldest record
-still held, which silently skipped the rest. The mount then invalidates every node and name its
-kernel holds, which it knows by following the FUSE lookup protocol as each reply reaches the kernel. Writers never wait
-on a mount that falls behind; an overrun costs a cold cache instead, counted as `fuse.journal_overruns`.
+mount has fallen a liveness window behind the pace its own rounds measured (A-548). Then the gather reports an overrun
+instead of walking from the oldest record still held, which silently skipped the rest. The mount then invalidates every
+node and name its kernel holds, which it knows by following the FUSE lookup protocol as each reply reaches the kernel.
+Writers never wait on a mount that falls behind; an overrun costs a cold cache instead, counted as
+`fuse.journal_overruns`.
 
 **A mount taken over by a restarted daemon is told what its predecessor may not have told it** (A-158). A daemon that
 dies in the ~82 µs between a change's reply and the mount's round has made the change durable without telling the
@@ -36968,7 +36970,9 @@ and:
 Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
 `crates/vfs/src/{journal,volume}.rs` (`Patience`), `crates/vfs/tests/journal_cost.rs`,
 `crates/server/src/nfs_writeback.rs`, `crates/server/src/{fuse,winfsp}.rs` (the typed patience; their rule unchanged
-until part 2), `crates/bridge-core/tests/invalidation.rs`.
+until part 2), `crates/bridge-core/tests/invalidation.rs`. Part 2: §4.5, §4.6 (A-141's mount that falls behind), GAPS,
+`crates/vfs/src/{journal,volume}.rs` (`ReaderRounds`, `take_rounds`, `set_patience`),
+`crates/server/src/reader_patience.rs` (new), `crates/server/src/{fuse,winfsp,learned_wait,lib}.rs`.
 - **What was there.** Every journal reader was opened with one patience, the daemon's liveness window `W` (a second on
   the wall): a record a reader had not read for `W` was dropped at the next append past the budget, and the reader
   overran when it came back (A-157). A-359 listed three class C waits left in C-c once A-492 and A-493 landed: the FUSE
@@ -36994,6 +36998,29 @@ until part 2), `crates/bridge-core/tests/invalidation.rs`.
   reader stays open. The retention oracle (`retention_keeps_what_a_live_reader_needs_as_the_model_does`) generates
   both, its model stating each rule, and checks directly that while no growth was refused no record a reader held
   while open has not read has left.
+- **Part 2, the FUSE and WinFsp readers** (`fuse.rs` and `winfsp.rs` `open_journal_reader`). A mount reads its
+  volume's journal in rounds its own task gathers when the volume changes, and a round goes out to the mount's kernel
+  and back before the next is gathered, so a record's wait for its reader is that kernel's pace, which a live mount on
+  a loaded host stretches. With a patience of one window, a live mount slower than that overran at every round that met
+  a full budget, its kernel told that anything it held may be stale (A-141: a whole cold cache) each time, and no
+  slower mount was ever waited for. Now each reader's patience is learned from its own rounds by the rule every learned
+  wait shares (`learned_wait`, RFC 6298's estimator; A-431, A-442, A-525): the journal keeps each open reader's rounds
+  for its owner (`OpLog::take_rounds`: the longest wait of the rounds that found every record they owed still held, and
+  the overruns since the last such round); after every turn the mount folds them in, a held round's wait a sample and
+  each overrun a back-off (Karn's rule, RFC 6298 §5.5), and names the reader's patience again (`OpLog::set_patience`):
+  the samples' tail plus a liveness window, the back-off never past the failover delay. Before its first round a reader
+  has the prior, one window. The bound stays, learned, because a mount's kernel can stall while the mount stays open,
+  and the journal's growth comes from the shard's metadata ledger, which every volume on the shard draws from.
+  `crate::reader_patience` holds the rule, cfg-free; the two mounts call it (Linux and Windows only, so their wiring is
+  main's to build).
+- **Tests (part 2).** `a_live_mount_slower_than_a_window_is_kept_up_with_once_its_pace_is_learned` (`reader_patience.rs`:
+  six rounds whose records wait a window and a half for the reader, each round folded and the patience named again),
+  `each_overrun_backs_the_patience_off_and_a_held_round_ends_it`, `a_readers_rounds_are_kept_for_its_owner_until_taken`
+  (`journal.rs`), and the retention oracle's new steps (a patience named again, a reader's rounds taken, each round's
+  records, overrun and wait against the model's). On the Mac Studio (debug, 2026-11-19, load 17 to 21):
+  `slates-vfs --lib journal` 12 of 12, `slates-server --lib reader_patience` 2 of 2 and `learned_wait` 2 of 2; red with
+  the fold made a no-op (the patience kept at the one-window prior): all six rounds overran, where only the first
+  should. The mounts' wiring (`fuse.rs` on Linux, `winfsp.rs` on Windows) is not compiled on macOS: main's lanes.
 
 ### A-563 — A deferred reply that says its request was not started is never recorded as its completion (2026-11-19, goal 85 via g225; §4.9 RIFL, "Status (2026-11-17, an `Overloaded` verb is never its own completion)"; A-557's sibling, A-533)
 

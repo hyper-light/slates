@@ -144,6 +144,9 @@ mod deadlines;
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;
 mod reap;
+// A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
+// (A-548).
+mod reader_patience;
 // Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
 pub mod local_dumps;
 mod recovery_slices;
