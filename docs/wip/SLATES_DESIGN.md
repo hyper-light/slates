@@ -9940,6 +9940,30 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > `HostFs` implementation, its parked misses and `SimS3`, its oracle, and the library's way to name an S3 base and hand
 > its credential.
 
+> **Status (2026-11-18, A-471 part 2: the network client).** Built in `crates/base/src/s3` on the runtime's own TCP and
+> timers, rustls over aws-lc-rs, and slates' own HTTP/1.1:
+> - `client`: `HeadObject`, ranged `GetObject` bound by `If-Match` (or a version id) and `ListObjectsV2` pages, each
+>   signed by `sigv4`, one request at a time on a kept-alive connection. Every answer is typed: `412` on a bound read
+>   is `Changed`; `404` `Missing`; `403` `Denied` with S3's code; `400 ExpiredToken` `CredentialExpired`; `416`
+>   `RangeNotSatisfiable`; a range or a head other than asked a `Mismatch`, never data; `503 SlowDown`, `503` and `500`
+>   retried, then `SlowDown` or `Unavailable` past the ceiling.
+> - `http`: a request's head refused past its cap or with a line break in any field (an ETag decoded from a hostile
+>   listing could carry one); a response read as its bytes arrive, its head past its cap refused, its body by length or
+>   chunks refused past what the request asked or an error document may hold, before the excess is held; both framings
+>   at once (the smuggling shape), another coding, no framing, interim statuses and the invalid ones below them (RFC
+>   9110 §15), folded or malformed fields refused.
+> - `wait`: each request's bound is the path's measured round trips (RFC 9002's estimator, to the response's head)
+>   plus the caller's liveness window, doubled per request that ran out (Karn's rule, RFC 6298 §5.5) to the caller's
+>   ceiling; a retry S3 asks for pauses with full jitter up to the tail doubled per retry, within the ceiling (AWS's
+>   advice for `SlowDown`).
+> - `tls`: the server's certificate verified against the authorities the endpoint names; plain HTTP refused off
+>   loopback.
+>
+> Owed: the platform's trust roots for an endpoint on the public internet (part 3 chooses their source: compiled-in
+> roots or the operating system's store); name resolution (the caller resolves the endpoint's address; the runtime has
+> no resolver); a live run against a real S3-compatible store, which also reads the longest continuation token a
+> listing names (`Counts::longest_token`) against the caps' assumption that none is longer than an encoded key.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -34297,6 +34321,64 @@ counter `image.archive_import_stage_past_bound`, `BadLayout` classed `Malformed`
   a stream refused at its header (fed to the refusal, not to its end); that seed is kept
   (`crates/archive/src/archive.proptest-regressions`). The tests' red-checks, the archive and api suites and the lints
   are filed for main (run-requests.md, 2026-11-19).
+
+### A-471 — The S3 base's network client: signed requests over the runtime's TCP and rustls, every length capped and every wait learned (2026-11-18, goal g268; Mantle's CP-T10.5 part 2; §4.15 "An S3 base"; §4.9 hostile input; D-9, R3, R6; RFC 9112, RFC 9002, RFC 6298; A-442, A-464)
+Applied in the same change to: `crates/base/src/s3` (`client`, `http`, `tls` and `wait`, each with its tests;
+`sigv4::amz_timestamp` and `sigv4::canonical_query` made public; `ResponseReader::has_head`); `crates/base/Cargo.toml`
+(`rustls`, `slates-rt` and `slates-transport` dependencies, `rcgen` for the tests); §4.15's status; GAPS (A-464's
+entry, part 2 built). And, for what main's workspace clippy and `cargo xtask check` found in this goal's earlier
+landings (r413): the streamed archive's and streamed export's oracles generate their bytes from plain tuples
+(`crates/archive/src/stream.rs`, `crates/vfs/src/export.rs`; `prop_oneof!` holds its arms in an `Arc`, R2); the
+archive export and import tests of `crates/api/tests/api.rs` judge through helpers (cognitive complexity); A-464's
+`list.rs` names its radix and escape length and marks its entry overhead, and its test cuts the page by `get`; and the
+archive job's identity suffix is read by its type's width (`crates/server/src/image.rs`).
+
+- **Why.** Part 1 signed and parsed; nothing sent a request. Part 3's base host needs a client that reads objects
+  bounded by their identity and lists directories, over slates' own runtime, every length and every wait bounded.
+- **The shape.** One client per endpoint and credential: one request at a time on a kept-alive connection, opened on
+  first use and again after a failure or `Connection: close`. A request is the method, the key's path encoded once
+  and the canonical query (the same strings `sigv4` signs, so what is sent is what was signed), the signed fields
+  (`host`, `x-amz-content-sha256`, `x-amz-date`, a temporary credential's session token, the range and `If-Match`)
+  and the `Authorization` header. TLS is rustls' client driven sans-io, as the network export drives its server.
+- **Caps (R3).** A request's head: its line (a key's longest encoding as path and as listing prefix, a continuation
+  token assumed as long) and S3's documented 8 KB request header. A response's head: the stored headers a PUT may set
+  (held to that 8 KB) and S3's own lines, 12 KiB. A body: a range's length, a listing page's cap (A-464), or an error
+  document's: `SignatureDoesNotMatch` echoes the canonical request (at most a request's head) and its bytes at three
+  characters a byte, four request heads, and the rest of the document is under S3's own response lines, which are
+  added. The bytes held before framing: a head's cap and one read, the read one TLS 1.2 record's ciphertext at its
+  largest. Every status a base meets is named by RFC 9110's name (`http::PRECONDITION_FAILED` and its kin).
+- **Waits (R3, A-442).** RFC 9002's estimator over the round trips to each response's head (the transport's
+  `RttEstimator`, the law A-442's learned wait folds), the bound its tail plus the caller's liveness window, doubled per
+  request that ran out (no sample: Karn's rule) to the caller's ceiling, ended by the next answer. A retry S3 asks for
+  (`503 SlowDown`, `503`, `500`) pauses uniformly up to the tail doubled per retry in a row, within the ceiling. Both
+  bounds are the caller's (`client::Limits`): part 3 states the ceiling as the liveness budget the bounds above name
+  (`LIVENESS_BUDGET_NS`), past which a read is refused `BaseUnavailable`.
+- **Typed answers.** From S3's error responses (fetched 2026-11-18): `412 PreconditionFailed`, `404 NoSuchKey` and
+  `NoSuchBucket`, `403 AccessDenied` and its kin, `400 ExpiredToken`, `416 InvalidRange`, `500 InternalError`,
+  `503 SlowDown` and `ServiceUnavailable`, each its kind; a `HEAD`'s answers carry no body, so their kinds come from the
+  status alone.
+- **Rejected.** A body ending at the connection's close (RFC 9112 allows one for a response): it cannot be told from
+  one cut short, and S3 always frames its bodies. Both framings at once, which §6.3 lets a recipient treat as an error:
+  it is the shape request smuggling takes.
+- **The token's length.** S3 calls continuation tokens obfuscated and states no length, and both caps assume a token
+  no longer than an encoded key (3,072 bytes). The client keeps the longest token a listing named
+  (`Counts::longest_token`); part 3's live run lists a prefix of more than a thousand keys, so every page but the last
+  is truncated and names one, and records the longest against the assumption. A longer one fails the run, not a
+  volume: its next request is refused `RequestTooLarge` before it is sent.
+- **Owed.** The platform's trust roots (a dependency decision for part 3); name resolution (the caller's); a live run
+  against a real S3-compatible store; the cross-target lint (main's).
+- **Evidence.** Mac Studio (debug, kiln r447, 2026-11-18): `cargo test --locked -p slates-base --lib -- s3`, 30 of
+  30 in 7.1 s. The client's seven run against an in-process fake store on loopback that answers recorded bytes: a
+  ranged read over TLS whose signature, recomputed from the request's own fields by the signing page's rules, matches
+  the one it carries; a listing, its continuation, a head and a chunked range on one kept-alive connection; seven
+  refusals each typed and none retried; `SlowDown` retried twice and then past the ceiling; a silent store timed out,
+  reconnected, and then past the ceiling; a certificate the endpoint does not name refused; plain HTTP off loopback
+  and an empty range refused. With them the framing's five (twenty-three hostile answers by kind, arbitrary bytes and
+  answers cut anywhere), the waits' three, the calendar's one and A-464's fourteen. Red once each (2026-11-18): with
+  the `412` arm gone the refusals came back `Unexpected { status: 412 }`; with `If-Match` not sent the request carried
+  none; with no back-off the bound stayed 53 ms where 106 ms was due; with a length let through to twice its cap the
+  answer waited for a body instead of `BodyTooLong`. `cargo xwin check -p slates-base` for `x86_64-pc-windows-msvc`
+  clean; `cargo xtask check` names no literal of this change's files (its fourteen are other crates').
 
 ### A-503 — A captured clone that moved lands against its capture: its move carries the paths it changed, and its new owner keeps the moved head as the mark (2026-11-18, g267, kiln goal 95101ef3; §4.15 `capture_base` and "Plan", §4.10 "Ownership follows the writer"; A-291, A-424, A-450, A-463)
 
