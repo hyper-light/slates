@@ -7647,6 +7647,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > unauthorized before checking its fence, so that owner never learned it was fenced and shipped on. The fence is now
 > checked first.
 >
+> **ReadSafety over the live log (2026-11-19, A-601, g229).** The nemesis now judges ReadSafety too, by
+> `FencedLedger.tla`'s rule as `crates/db/src/register_nemesis.rs` judges the register. After every step and every
+> settling delivery, every read phase one could make were the current owner lost adopts a state that holds every
+> durable write at its position. A read is any `f + 1` of the holders phase one counts, with any other live candidate it
+> asks, adopting the greatest head as `adopt` does. NoLoss judged only the one read each takeover made.
+> @@STATUS@@ What a superseded owner answers from its own state is the owner lease's to stop (§4.8 "Leases and reads");
+> this is the log's half: what a successor reads and then serves.
+>
 > **Holders follow the candidates (2026-11-07, A-200's amendment of that date).** The shipper's holder set changes by a
 > joint transition (`Shipper::begin_transition`, `transferred`, `activate`); the daemon begins one whenever the
 > configuration names other candidates for the volume (`fleet.live.holders_transition`) and switches once the new set
@@ -48626,3 +48634,29 @@ the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the se
   crates. No integration test reaches the adapter: nothing calls it outside its own tests until the daemon's import
   (owed). Main's (§8): the red run against a stub (`len` and `read` finding no file; all 11 must fail) and a mutation
   of each guard.
+
+### A-601 — ReadSafety judged over the live log under its nemesis: every read phase one could make holds every durable write (2026-11-19, g229, goal 82's chaos part; §4.8 "Leases and reads", §4.10 "Live shipping"; A-200, A-240; `FencedLedger.tla`)
+Applied in the same change to: `crates/db/tests/live.rs` (the check, its two red checks, the nemesis's counters);
+§4.10's live-log status; GAPS (the register nemesis's entry: the live log's half built).
+
+- **What was owed.** The register's nemesis checks ReadSafety by `FencedLedger.tla`'s per-position rule. The live log's
+  nemesis checked Agreement, NoLoss, StaleNeverCommits and Convergence, but not ReadSafety. So a state in which some
+  quorum of holders would read a stale chain went unjudged unless a takeover happened to pick that quorum.
+- **The rule over the live log.** A holder keeps one hash chain and reports its head. Phase one asks the live
+  candidates and adopts the greatest head, by `(epoch, position)`, once `f + 1` reports come from the holders it counts
+  (A-240). So a head can be adopted whenever `f + 1` counted holders, itself among them if it is one, report no greater
+  head; a holder with no copy reports nothing. ReadSafety: every such head's state holds every durable write, at its
+  position, unchanged. It is judged after every step and every settling delivery. NoLoss stays the check of the one
+  read each takeover makes.
+- **Reported last.** The first violation is kept with its step, the read and the position, and the run reports it at
+  its end, after Convergence and the final NoLoss. So the mutation tests that expect a named check (StaleNeverCommits,
+  Agreement, NoLoss, Convergence) still meet it in every seed it broke.
+- **Its scope.** What a superseded owner answers from its own state is the owner lease's to stop (§4.8 "Leases and
+  reads", `crates/server/src/lease.rs`). This check is the log's half: no successor reads, and then serves, a state
+  older than a write already acknowledged.
+- **Red first.** Two tests judge a built state; each failed against the check stubbed and passes with it:
+  - `the_read_safety_check_finds_a_read_that_adopts_a_head_without_a_durable_write`: a durable write on one holder,
+    the other holding a later owner's chain without it. The violation names position 0.
+  - `a_read_past_a_holder_without_a_durable_write_adopts_the_head_that_holds_it`: the write on one holder, the other
+    holding no copy. No violation, and the judgement is counted as one past a holder without the write.
+- **Tests** @@TESTS@@
