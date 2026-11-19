@@ -15,13 +15,14 @@
 //! as git's is. The client's end of input checks a push whose pack was cut short, which the report answers with git's
 //! `unpack` words; the end of a request cut short is refused, as git's reader refuses it.
 //!
-//! **Refusals**, each on standard error with git's `die` status, as git's receive-pack dies: a repository gone since the
-//! site found it, in the site's words for a missing one (git's own after `enter_repo`, line 2547); a store not held
-//! here, or a shard whose state is out of reach, in the site's words for a service not served; a policy git's matcher
-//! cannot read, in the site's words for it; and an exchange the driver refused, in git's own words where git dies with
-//! fixed ones \[C: git v2.50.1 `pkt-line.c` lines 158, 371, 433, 450 and 458 (sha256 `a8a3cf58e3026ddd…`); `receive-pack.c`
-//! lines 2052, 2111, 2143 and 2164\], without the bytes git quotes after some, which the driver has read and the command
-//! no longer holds, and in slates' words where git has none (a push past its room, memory the system refused).
+//! **Refusals**, each on standard error with git's `die` status, as git's receive-pack dies: a repository gone since
+//! the site found it, in the site's words for a missing one (git's own after `enter_repo`, line 2547); a store not
+//! held here, or a shard whose state is out of reach, in the site's words for a service not served; a policy git's
+//! matcher cannot read, in the site's words for it; and an exchange the driver refused, in git's own words where git
+//! dies with fixed ones \[C: git v2.50.1 `pkt-line.c` lines 158, 371, 433, 450 and 458, sha256 `a8a3cf58e3026ddd…`;
+//! `receive-pack.c` lines 2052, 2111, 2143 and 2164\], without the bytes git quotes after some, which the driver has
+//! read and the command no longer holds, and in slates' words where git has none (a push past its room, memory the
+//! system refused).
 //!
 //! **Bounds.** The client's input held is at most the channel's window, which the session refuses to exceed; each step
 //! hands all of it to the driver, which keeps what it must within the push's room (the edge's request room, as each of

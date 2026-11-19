@@ -1,8 +1,8 @@
-//! A-654 part 3's tests (§4.17.2 "A push" and "Transports" item 2; the SSH receive-pack module's docs): stock git
-//! 2.50.1's push, captured by `crates/git/fixtures/push/make-push-fixtures.sh`, sent over an SSH session to the edge's
-//! production site and services on an audit daemon's shard, the repository's owner shard, where A-654 part 2's driver
-//! lands it; and the session's protocols, v1's `version 1` line and v2 answered at v0, with a flush alone, git's push of
-//! nothing, answered with nothing.
+//! A-683's tests (A-654's SSH call; §4.17.2 "A push" and "Transports" item 2; the SSH receive-pack module's docs):
+//! stock git 2.50.1's push, captured by `crates/git/fixtures/push/make-push-fixtures.sh`, sent over an SSH session to
+//! the edge's production site and services on an audit daemon's shard, the repository's owner shard, where A-654 part
+//! 2's driver lands it; and the session's protocols, v1's `version 1` line and v2 answered at v0, with a flush alone,
+//! git's push of nothing, answered with nothing.
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_git::PastAdmission;
@@ -211,7 +211,7 @@ fn exited_cleanly(out: Vec<u8>) -> Transcript {
   }
 }
 
-/// A-654 part 3 (§4.17.2 "A push" items 1 to 7 over "Transports" item 2; golden vectors: stock git 2.50.1's `create`
+/// A-683 (§4.17.2 "A push" items 1 to 7 over "Transports" item 2; golden vectors: stock git 2.50.1's `create`
 /// push, captured by `make-push-fixtures.sh`). Do: on an audit daemon's shard, make an empty git repository and serve
 /// the SSH edge with the production site and services; connect with a key proving the repository's owner, run
 /// `git-receive-pack '/pushed'`, send the request stock git sent to create `main` (its commands, then its pack) a few
@@ -220,7 +220,7 @@ fn exited_cleanly(out: Vec<u8>) -> Transcript {
 /// error; exit status 0, then EOF and close; and `main` then holding the fixture's first text, the tree the pushed
 /// commit names.
 #[test]
-fn t_a654_p3_stock_gits_push_over_ssh_lands_through_the_driver() {
+fn t_a683_stock_gits_push_over_ssh_lands_through_the_driver() {
   let daemon = audit_daemon();
   let (repository, address, advertised) = observe_first(&daemon, serving);
   let [(create, _), ..] = chain();
@@ -232,13 +232,13 @@ fn t_a654_p3_stock_gits_push_over_ssh_lands_through_the_driver() {
   assert_eq!(landed, vec![("text".to_owned(), text(false))]);
 }
 
-/// A-654 part 3 (the session's protocols; git v2.50.1 `builtin/receive-pack.c` lines 2558-2577 and 2643-2649). Do:
+/// A-683 (the session's protocols; git v2.50.1 `builtin/receive-pack.c` lines 2558-2577 and 2643-2649). Do:
 /// with the edge served as above, run three sessions: one asking for no protocol (v0), one for `version=1`, one for
 /// `version=2`; each sends a flush alone, git's push of nothing to update. Expect: each exits 0 after the advertisement
 /// the driver makes the owner, preceded by a `version 1` line for v1 alone, v2 answered at v0 (receive-pack has no v2),
 /// and nothing after it; and nothing landed: `main` holds no file.
 #[test]
-fn t_a654_p3_each_protocol_is_advertised_as_gits_and_a_push_of_nothing_writes_nothing() {
+fn t_a683_each_protocol_is_advertised_as_gits_and_a_push_of_nothing_writes_nothing() {
   let daemon = audit_daemon();
   let (repository, address, advertised) = observe_first(&daemon, serving);
   let mut flush = Vec::new();

@@ -18,7 +18,7 @@ use super::waits::PHASES;
 use super::{Bounds, Counts, EdgeState, serve};
 use crate::daemon::LIVENESS_BUDGET_NS;
 
-/// A-654 part 3: git's receive-pack over this edge, through these tests' client (`receive.rs`).
+/// A-683: git's receive-pack over this edge, through these tests' client (`receive.rs`).
 #[path = "receive.rs"]
 mod receive;
 
