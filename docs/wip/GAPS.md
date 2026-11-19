@@ -506,10 +506,9 @@
 > byte is read a window at a time. Held to stock git's fixtures (`fixtures/view`) and to an oracle reading every object
 > of the store and the push back through the view's packs, counted (Windows x86_64, jupiter: red 13 of 15, then the
 > two vacuous ones made to read and red 2 of 2; green 15 of 15, the crate 462 of 462 with 4 ignored; macOS owed). Found: stock receive-pack sets
-> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unset it (fixed, below). Owed: part 2, the view presented to the hook
-> driver on the owner shard (after A-662), seals kept as derived data; a seal made at encoding; `packed-refs` by ranges
-> from the register; the cover as derived data and fragments merged into fewer packs; main's run of stock git over a
-> mounted view.
+> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unset it (fixed, below). Owed: seals kept as derived data (part 2 handed
+> the view to the driver, below); a seal made at encoding; `packed-refs` by ranges from the register; the cover as
+> derived data and fragments merged into fewer packs; main's run of stock git over a mounted view.
 > **Fixed (2026-11-19, g293; found by A-665): a git hook given no push options is handed `GIT_PUSH_OPTION_COUNT=0`,**
 > as stock receive-pack 2.50.1 hands it (`cmd_receive_pack` always passes its option list, so `run_and_feed_hook` sets
 > the count; `githooks.adoc` says unset), where `vcs_hooks::push_option_env` had unset it; `EnvValue::Unset`, its one
@@ -517,11 +516,24 @@
 > three pushes; Windows x86_64, jupiter: red 2 of 2 new failing, green vcs_hooks 33 of 33; the Unix driver's test
 > filed); `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`. The sweep of the other
 > hooks' variables for a stock value slates leaves unset: git's push-certificate variables are set only with a
-> certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2;
+> certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2
+> (built, below);
 > Subversion's environment is its hooks-env section alone (A-623). Owed, Mercurial 7.2's: `_exthook` always sets
 > `HGPLAIN` (`1` by default, `hooks.<name>:run-with-plain`, `configitems.toml`; empty when off) and `shellenviron` sets
 > `HG` to hg's executable, both unset under slates; and the transaction's `HG_TXNID` and `HG_TXNNAME`
 > (`research/mercurial-server.md` §6), which slates' changegroup hooks lack.
+> **A-665 part 2 (2026-11-19, g293; piece 10's view handed to the hook driver on the owner shard):** `slates-server`
+> (`git_hooks`) opens part 1's view over the repository's store in the shard's `vcs_stores` (A-662), the push
+> quarantined for `pre-receive`, among the packs for `update`, none for `post-receive`, each ref named by its green and
+> the version of it the push read (a version no push made refused, `NotInStore`); charges the view's tables to the
+> shard's budget while it lives; seals its packs in the shard's slices, each lent the room `HookView::seal_len` names;
+> and runs the configured hook in the view's root with `GIT_DIR=.` and, for `pre-receive`, the quarantine's three
+> variables beside its point's own, refusing a view the point would not see. Held by running the test binary as each
+> point's hook in a view the tests write into a scratch directory, stock `git` reading the pushed commit there
+> (@@RUNS-GAPS@@). Owed: part 3, the view presented at a path (a read-only attachment the mount edges serve a read at a
+> time; on Linux in the launcher's namespace, §4.6); seals kept as derived data across views; receive-pack's calls
+> (A-654); git's words for each outcome. Found, reported to main: a git hook inherits the daemon's `GIT_*` repository
+> variables, which `update` and `post-receive` would read in place of the view's objects.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;

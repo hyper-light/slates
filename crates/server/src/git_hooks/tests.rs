@@ -455,7 +455,7 @@ fn ran(
       };
       let running = run(&site, &input, None, std::future::pending());
       let answered = slates_rt::futures::within(TEST_BOUND_NS, running).await;
-      let _ = sent.send(answered.ok());
+      let _ = sent.send(answered.ok().flatten());
     })
     .expect("the run's task");
   runtime.run_until_idle();
@@ -626,16 +626,11 @@ fn a_git_hook_runs_in_its_view_at_each_of_receive_packs_points() {
 #[test]
 fn a_view_the_store_cannot_show_is_refused_by_kind_and_holds_nothing() {
   let refused = crate::daemon::audit_on_shard(|state| {
-    let (repository, main) = repository(state, "hooked", VcsTool::Git);
+    let (hooked, main) = repository(state, "hooked", VcsTool::Git);
     let (other, _) = repository(state, "other", VcsTool::Git);
     let (mercurial, _) = repository(state, "hg", VcsTool::Mercurial);
     let (first, old) = commit_of(&[(b"README".to_vec(), b"first\n".to_vec())], &[], FIRST_DATE);
-    let read = push_through(
-      state,
-      (repository, main),
-      &first,
-      (None, old, tree_of(&first)),
-    );
+    let read = push_through(state, (hooked, main), &first, (None, old, tree_of(&first)));
     let at = |version| ReadRef {
       name: MAIN,
       green: main,
@@ -645,12 +640,12 @@ fn a_view_the_store_cannot_show_is_refused_by_kind_and_holds_nothing() {
     let before = footprint(state);
     let mut refused = Vec::new();
     for (refs, pushed, on) in [
-      (vec![at(read + 1)], None, repository),
-      (vec![at(read), at(read + 1)], None, repository),
-      (vec![at(read)], Some(ShownPush::Quarantined(&foreign)), repository),
+      (vec![at(read + 1)], None, hooked),
+      (vec![at(read), at(read + 1)], None, hooked),
+      (vec![at(read)], Some(ShownPush::Quarantined(&foreign)), hooked),
       (Vec::new(), None, mercurial),
     ] {
-      refused.push(GitHookView::open(state, on, (&refs, MAIN), pushed).err());
+      refused.push(GitHookView::open(state, on, (refs.as_slice(), MAIN), pushed).err());
       assert_eq!(footprint(state), before);
     }
     foreign.abandon(state);
