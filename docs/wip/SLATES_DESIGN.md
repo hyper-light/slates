@@ -12379,14 +12379,19 @@ engine: the verdict, rebase, position mapping, the register).
 > so it gives its slot back as it ends, and is cancelled and joined when the listener ends, so none outlives it. The
 > bounds come from the shard's budget: as many connections at once as the shard seats clients (`clients_per_shard`,
 > AC-2.6), each request the bytes of one client region, so together they hold at most the client share of the shard's
-> reserve. At the bound the listener stops accepting until a connection ends, and the kernel's backlog is the same
-> bound: over HTTPS a refusal could be answered only after a handshake, which costs the task and buffers the bound
-> limits. Each phase's wait on a client is learned with `LearnedWait` (RFC 6298, Karn's rule, the back-off). The
+> reserve. Each phase's wait on a client is learned with `LearnedWait` (RFC 6298, Karn's rule, the back-off). The
 > handshake, idleness, a head and the drain are waited for whole, so a client trickling bytes is held to the phase's
 > learned length; a body's and a reply's silences are waited for one at a time, since their length is the push's or the
-> clone's size. A phase has no bound until one of its waits has completed, and only a connection whose credentials
-> proved a principal teaches the bounds: its waits before the proof are folded in at the proof, each phase's longest,
-> and a stranger's cut backs nothing off. git's site routes as `http-backend` routes (A-595), then answers `401` with the
+> clone's size. Before a phase has learned, a wait's bound is RFC 6298's first RTO from the connection's own
+> measurement: the TCP handshake's round trip as the kernel measured it at accept (`TcpStream::round_trip`), the edge's
+> own TLS work added while a handshake runs, then the handshake's whole duration, floored by the clock's measured
+> granularity. A wait past its bound marks its connection overdue and goes on, since a git client may be silent for long
+> mid-request; a late wait is still a sample. The listener takes the next connection whenever it comes and, with every
+> seat taken, reaps the most overdue connection for it; a reap teaches nothing and backs the phase off (main's rulings,
+> 2026-11-19, the rule g294 found for SSH). So a silent client never holds a seat a new connection needs and none is cut
+> while seats are free; no connection is answered `503` at the bound, since over HTTPS only a handshake could carry it.
+> Only a connection whose credentials proved a principal teaches the bounds: its waits before the proof are folded in
+> at the proof, each phase's longest, and a stranger's reap backs nothing off. git's site routes as `http-backend` routes (A-595), then answers `401` with the
 > challenges the connection accepts, `404` for no git repository of that name, `403` when the repository's policy lets
 > the principal reach it for none of the service's rights (`vcs_policy::reaches`, A-597, A-622), and `503` while the
 > service's server half has not landed, which today is both (upload-pack, A-615; receive-pack's commit, A-620 part 2).
@@ -12753,7 +12758,7 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Cache shares (fragments, kept compressed objects, commit rows, index tables) | shares of the shard's memory budget (§4.2) that equalize each cache's marginal misses saved per byte, from miss-ratio curves sampled online | the shard's budget | equal shares until the first curves exist (no literal: an equal split of a measured budget) |
 | Push bytes in flight and pushes per shard | the shard's memory budget over the measured inflate and hash rate | the shard's budget, typed refusal | the first push's own size |
 | Keepalive during a held push (git's own: "The default is 5 seconds" [B: config `receive.keepAlive`]) | silence shorter than the shortest silent gap after which this deployment's connections were seen to drop, learned from the drops | the client's own deadline when it sent one | the connection's measured round trip |
-| Reaping a stalled client (A-625 part 2) | per phase of the exchange: the handshake, idleness, a head and the drain waited for whole, a body's and a reply's silences one at a time; RFC 6298's estimator over the phase's completed waits (`LearnedWait`: the tail plus the liveness window, Karn's rule, the back-off), fed only by connections whose credentials proved a principal | the shard's connection seats: a stalled client holds one seat | none: until a phase's first completed wait, its waits end only when the client leaves, as a hook's first run is bounded by its client alone (§4.17.1) |
+| Reaping a stalled client (A-625 part 2) | per phase of the exchange: the handshake, idleness, a head and the drain waited for whole, a body's and a reply's silences one at a time; RFC 6298's estimator over the phase's completed waits, late ones included (`LearnedWait`: the tail plus the liveness window, Karn's rule, the back-off), fed only by connections whose credentials proved a principal; a wait past its bound marks its connection overdue, and the most overdue is reaped only when every seat is taken and a new connection needs one, a reap backing the phase off | the shard's connection seats | RFC 6298 §2.2's first RTO from the connection's own measurement, `R + max(G, 2R)`: the TCP handshake's round trip as the kernel measured it at accept, the edge's own TLS work added while a handshake runs, then the TLS handshake's whole duration; `G` the timer's tick, the scheduler's lateness or the kernel clock's resolution |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
 | Index table merges (§4.17.1's rule, A-581: the git store's index is `slates-vcs`'s, A-614) | for each `j`, merge the newest `j` runs only this index holds once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, the largest due `j`); a table is one window of the content plane and the tail seals once its rows no longer fit one | the store's budget, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
 | SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
@@ -44432,3 +44437,48 @@ Applied in the same change to:
   Red on r960, with the old rename rule and the old scans restored (the scans counting): 4 of the 7 tests the run
   selected failed, and the guards passed either way. The file over the symlink, and the file over its own link, were
   each `TypeChanged`; the oracle shrank to the hard link renamed over the symlink; the removal examined 2,000 entries.
+
+### A-625 part 2, continued — no wait unbounded, and an overdue connection reaped only when a new one needs its seat (2026-11-19, g299 under main's rulings, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1 and its tunables; after A-625 part 2)
+Applied in the same change to: §4.17.2's A-625 part 2 status and its "Reaping a stalled client" row; GAPS (the §4.17
+entry); `crates/rt` (`tcp::RoundTrip`, `TcpStream::round_trip`; `netsys`'s readers of each kernel's record);
+`crates/server` (`vcs_http`, `vcs_http::waits`, their tests).
+- **Main's two rulings** (2026-11-19). First: a silent client must never hold a seat unbounded, so before a phase has
+  learned, its waits are bounded by the connection's own first measurement under RFC 6298 §2.2 (`SRTT = R`,
+  `RTTVAR = R/2`, so `R + max(G, 2R)`), floored by the clock's measured granularity. Then, the rule g294 found for SSH:
+  a git client can be silent for long mid-request (compressing a large push, a credential helper prompting), so a wait
+  past its bound only marks its connection overdue, and the edge reaps overdue connections, most overdue first, only
+  while every seat is taken; a reap teaches nothing and backs off. Main confirmed the other decision of part 2: at the
+  bound no `503`, since over HTTPS only a handshake could carry it.
+- **`R`, from the connection itself.** The kernel times the TCP handshake (its SYN-ACK to the client's ACK) before accept
+  returns, so `TcpStream::round_trip` reads it from the kernel's own record: Linux `tcpi_rtt` (microseconds, byte 68 of
+  `struct tcp_info`), macOS `tcpi_srtt` (milliseconds, byte 44 of `struct tcp_connection_info`; xnu's `TCP_RETRANSHZ`),
+  Windows `RttUs` (`SIO_TCP_INFO`). The record's clock resolution is part of `G` (RFC 6298 §2.3), so a macOS loopback
+  round trip read as zero milliseconds still yields a millisecond. While a TLS handshake runs, the edge's own work on it
+  (the time its session took over each flight) is added to `R`: the client's share is the same work (a key exchange, a
+  signature checked), and a loopback round trip of microseconds would otherwise mark every first handshake overdue at
+  once. Once the handshake ends, its whole duration from acceptance is `R`.
+- **Overdue, not cut.** A wait races its I/O against its deadline without ever dropping the I/O: a `write_all` past its
+  deadline keeps its place in the reply. The seat carries the mark (the deadline that passed, the phase, the back-offs
+  it was armed under, whether the connection proved a principal); a wait that ends clears it, and a late wait is still
+  a completed one, so a slow client teaches the bound. The listener accepts the next connection whenever it comes; with
+  every seat taken it cancels the task of the most overdue (the earliest deadline passed), whose seat comes back as the
+  cancellation drops its guard, and with none overdue it waits until a seat comes back or a connection becomes overdue.
+  So it holds at most one accepted connection beyond the seats.
+- **The back-off, once per bound.** A reap backs its phase off only for a proven connection whose wait was armed under
+  the bound now in force (RFC 6298 §5.5 doubles the timer that expired): connections reaped together back it off once.
+  Every cut once doubled the shared bound, so a burst of them could arm a deadline years away. Before a phase has
+  samples, a reap doubles that phase's first RTO.
+- **Seen on the way (hypothesis, for main):** with the first RTO stubbed unbounded, the red run's HTTPS test failed with
+  an empty reply while the cleartext tests, whose reads never had to wait, passed: a timer armed near `u64::MAX` reaches
+  `kevent` as a park timeout of centuries, which macOS may refuse, stalling the shard's I/O. Unconfirmed by logs; no
+  deadline the edge arms now comes near it.
+- **Tests** (`cargo test --locked`, Mac Studio, debug, 2026-11-19, kiln): red first at 2d2749b1a (the first RTO and the
+  round-trip readers: 2 of 2 rt tests and 3 server tests failing on stubs) and at 41698f336 (the reaping: 8 of 8 failing:
+  marks ignored, nothing reaped, reaps neither counted nor backing off); green at 2559aa2fd: `slates-rt --lib round_trip`
+  2 of 2, `slates-server --lib vcs_` 69 of 69, `cargo fmt --check` clean. Over real loopback sockets: a silent client kept
+  while another seat is free (marked overdue); one reaped when a new connection needs its seat, which is then answered;
+  the most overdue of two reaped first; a proven client past its learned idle bound kept until its seat is needed, then
+  reaped, idleness learning from both clients; HTTPS's first handshake served under the first RTO with the edge's work
+  added. Pure: the first RTO's three cases, the TLS handshake's work then duration, a reap's back-off and its doubling
+  of a first RTO, a stranger's reap backing nothing off, reaps together backing off once.
+- **Owed.** As part 2, plus the Linux and Windows round-trip readers compiled and run (main's lint matrix).

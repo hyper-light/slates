@@ -290,6 +290,13 @@
 > owner shard once its head names it, or a listener on each shard); a bearer credential's expiry handed with its
 > principal for LFS's actions (A-629 part 2); Mercurial's and Subversion's sites; the MCP edge onto this engine; the
 > live `git clone` over HTTPS (main's, once upload-pack serves).
+> **A-625 part 2, continued (2026-11-19, g299 under main's rulings):** no wait is unbounded: before a phase has learned,
+> RFC 6298's first RTO from the connection's own handshake round trip (`slates_rt::tcp::TcpStream::round_trip`, the
+> kernel's record on Linux, macOS and Windows), the edge's TLS work added, then the handshake's duration, floored by the
+> clock's measured granularity. A wait past its bound marks its connection overdue; the listener reaps the most overdue
+> only while every seat is taken and a new connection needs one, the reap teaching nothing and backing the phase off
+> once per bound (g294's SSH rule). `slates-server --lib vcs_` 69 of 69 and `slates-rt --lib round_trip` 2 of 2 on the
+> Mac Studio, red first twice (3 + 2, then 8 of 8). Owed: the Linux and Windows readers compiled and run.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
