@@ -4484,9 +4484,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   process the ask names, once the handle that process names is shown to be this stream's own object;
 - a VM's save and restore (Shards' D176 part 5; A-303): a SAVE, which the device sends while it is paused and so
   between requests, waits for the guest's stores through its maps to reach the volume, then takes a snapshot of the
-  volume for the attachment's own principal, publishes it, and is answered with the stream's tables, opaque to Shards
-  and checked by a CRC-32C: the volume and the snapshot, the directory presented, the owner view, the form of SETXATTR
-  the guest's kernel sends (A-378), and each inode the guest holds with its references and opens. A RESTORE is taken
+  volume for the attachment's own principal, publishes it, waits on a live-shipped volume until its log is durable
+  where that publication put it, as a guest's `fsync` waits (A-516; refused with its reason when it is not within the
+  liveness budget), and is answered with the stream's tables, opaque to Shards and checked by a CRC-32C: the volume
+  and the snapshot, the directory presented, the owner view, the form of SETXATTR the guest's kernel sends (A-378),
+  and each inode the guest holds with its references and opens. A RESTORE is taken
   only as a fresh stream's first frame, onto the volume saved while unchanged since the cut or a clone of the cut's
   snapshot, presenting the same directory; the stream's attachment then holds what the saved one did, a file the guest
   held with no name left included, its guest is shown the same owners and its requests are read in the same form. A handle the restored guest's kernel kept gives its open back at its release, as one from
@@ -4698,6 +4700,10 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > (`crates/server/tests/shards.rs`; the tables' codec `crates/server/src/shards/tables.rs`; `Volume::held_by` and
 > `Volume::adopt_held`, `crates/vfs/tests/held.rs`). Owed on Shards' side: `shards restore` handing a restored VM a
 > served share (`--slates-fs-fd`, `--slates-fs-handle`), and its real-VM test of a save and a restore over slates.
+> **Since A-516 (2026-11-19)** a SAVE of a live-shipped volume answers its tables only once the volume's log is durable
+> where the save's publication put it (`shards.save_held`), and is refused with its reason when it is not within the
+> liveness budget; a volume shipped nowhere is answered at once, as before (the server's lib test
+> `a_save_names_its_snapshot_only_once_the_volume_is_durable_where_the_save_put_it`).
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -25426,9 +25432,10 @@ Applied in the same change to:
   refused restore changes nothing. The live volume holds no file the saved guest held with no name once the saved
   stream ended (its sweep reclaimed it), so such a guest is restored onto a clone of the cut.
 - **Not here.** A SAVE's snapshot is published on the owner shard; a live-shipped volume's candidates (§4.10) are not
-  waited for, as a `FSYNC`'s durable reply waits. A clone keeps no orphan record for a nameless file it carries from
-  its snapshot, so once a restored guest lets such a file go nothing reclaims it until the clone is destroyed; that is
-  so for any clone of a snapshot taken while a file was held with no name, restored or not (GAPS).
+  waited for, as a `FSYNC`'s durable reply waits (built since, A-516, 2026-11-19: the tables wait for them). A clone
+  keeps no orphan record for a nameless file it carries from its snapshot, so once a restored guest lets such a file go
+  nothing reclaims it until the clone is destroyed; that is so for any clone of a snapshot taken while a file was held
+  with no name, restored or not (GAPS).
 - **Evidence.** The tables' unit tests (a round trip, the same bytes twice, every cut, every bit flipped, another
   format, trailing bytes, a vector of `u32::MAX` entries, the bound's arithmetic), the volume's three tests, and the two
   by-use tests over a real daemon named above. Owed on Shards' side: `shards restore` taking a served share and its
@@ -33235,3 +33242,40 @@ Unix sibling built); and:
   a turn that owes a refill sends nothing, and a later turn tells it. `held_turn.rs`'s `1_u64`,
   which the literal check reads as `1_`, main fixed meanwhile with its `Derived:` line (`cf61d54e4`), so this landing
   leaves it.
+
+### A-516 — A SAVE's tables wait until a live-shipped volume's log is durable where the save put it (2026-11-19, goal 90; what Shards needs from slates; A-303's first "Not here"; §4.6 the Shards form, §4.10, A-200; Shards' D176 part 5)
+Applied in the same change to: §4.6, the Shards form's save-and-restore bullet and A-303's status; A-303's entry (its
+"Not here", the first item marked built); GAPS, A-281's entry (A-303's paragraph); and:
+- `crates/server`: `shards.rs` (`answer_save` holds the tables on `live_ship::durable_target`; `DurableOwed` names what
+  a held reply becomes, `Undurable::Errno` for a guest's `FSYNC` and `Undurable::Save`; `settle_durable` sends the
+  tables or refuses the SAVE; the counter `shards.save_held`; the module's notes; the lib test module, new);
+  `live_ship.rs` (`ship_to_silent_holders`, test support under `cfg(test)`).
+
+- **What was there.** A SAVE took its snapshot at the cut and published the owner shard before answering, so the
+  slates snapshot the VM's snapshot names survived a daemon restart. On a live-shipped volume it did not wait for the
+  volume's candidates, as a guest's `FSYNC` on the same stream waits (A-200): its tables went out while the publication
+  that holds the snapshot was on the owner alone. Shards keeps the tables in the VM's snapshot and hands them back at
+  its restore (Shards' coordinator's contract, 2026-11-18: SAVE answers `[0, tables]` and names a slates snapshot taken
+  at the cut; RESTORE accepts that snapshot, a clone of it, or the live volume unchanged since the cut, else
+  `[1, why]`). An owner lost after the answer left a successor without the snapshot the saved VM names, so its
+  restore had nothing to stand on.
+- **The rule.** After the publication captures the volume, the SAVE asks where the volume's log must be durable before
+  a verb that just published it may answer (`live_ship::durable_target`). Where nothing need wait (a volume shipped
+  nowhere, every laptop: `f = 0` is the same code with nothing to wait for, R8) it is answered at once, as before.
+  Otherwise its tables are owed and held (`shards.save_held`); the stream's task waits as a held `FSYNC` waits
+  (`live_ship::wait_durable`, the one bound every transport judges a held durable reply by), and then sends them
+  (`shards.saved`), or, when the log did not become durable there, replaces them with the SAVE's refusal and its
+  reason, "the save's snapshot could not be made durable" (`shards.save_refused`). Shards' wire is unchanged: a SAVE
+  is still answered `[0, tables]` or `[1, why]`, only later. A refused SAVE leaves its snapshot, as a SAVE refused
+  after its snapshot was taken always has.
+- **Tests.** The server's lib test
+  `a_save_names_its_snapshot_only_once_the_volume_is_durable_where_the_save_put_it` (Unix): on an audit daemon, a
+  volume shipped nowhere and one shipped live to two holders at `f = 1` that never answer
+  (`live_ship::ship_to_silent_holders`), a Shards stream attached to each and a SAVE sent on it as Shards' device
+  sends one. The first is answered its tables at once and counted saved, nothing held; the second is held, then
+  refused with the undurable reason once its wait gives up, never answered with tables, counted held and refused.
+- **Evidence.** Red first, on main `6696fda78` with the test alone, on the Mac Studio (2026-11-19): the second SAVE was
+  answered at once, `(0, [2, 0, 0, 0, 187, ...])`, its tables, where the test asks for the refusal. Green with the
+  change, the same machine: `cargo test --locked -p slates-server --lib -- shards:: live_ship::` 29 of 29 in 2.79 s, the
+  new test among them (its hold given up within the bound). Filed for main: the Windows build, the server's Shards
+  suites, and Shards' own run of a save and a restore over a live-shipped share.

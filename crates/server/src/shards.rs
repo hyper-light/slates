@@ -3018,7 +3018,10 @@ mod tests {
 
   /// Sends a SAVE as Shards' device sends one, on a stream attached to `volume` for [`owner`], and reads its answer: the
   /// answer's first byte (granted or refused) and what follows it.
-  fn saved(daemon: &Daemon, volume: slates_ipc::protocol::VolumeId) -> Result<(u8, Vec<u8>), String> {
+  fn saved(
+    daemon: &Daemon,
+    volume: slates_ipc::protocol::VolumeId,
+  ) -> Result<(u8, Vec<u8>), String> {
     let (sent, received) = std::sync::mpsc::sync_channel(1);
     daemon
       .attach_shards_stream(
@@ -3098,7 +3101,10 @@ mod tests {
     let after_live = counts(&daemon);
     daemon.stop();
     let (granted, tables) = plain_answer.expect("the plain volume's SAVE was answered");
-    assert_eq!(granted, GRANTED, "a volume shipped nowhere is saved at once");
+    assert_eq!(
+      granted, GRANTED,
+      "a volume shipped nowhere is saved at once"
+    );
     assert!(!tables.is_empty(), "its answer brings the tables");
     assert_eq!(
       after_plain,

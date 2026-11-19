@@ -808,7 +808,12 @@
 > the volume saved while unchanged since the cut or a clone of the cut's snapshot, else `[1, why]` with nothing changed.
 > Found with it: a clone keeps no orphan record for a nameless file it carries from its snapshot, so nothing reclaims
 > it until the clone is destroyed (any clone of a snapshot taken while a file was held with no name). A SAVE's snapshot
-> is published on the owner shard, not yet waited for at a live-shipped volume's candidates (§4.10).
+> was published on the owner shard and not waited for at a live-shipped volume's candidates (§4.10). **Built since
+> (A-516, 2026-11-19):** a SAVE of a live-shipped volume answers its tables only once the volume's log is durable where
+> the save's publication put it, as a guest's `FSYNC` on the stream waits (A-200), and is refused with its reason when
+> it is not within the liveness budget (`shards.save_held`, `shards.save_refused`); a volume shipped nowhere is
+> answered at once. Proven by the server's lib test over a real stream; Shards' own run of a save and a restore over a
+> live-shipped share is owed with its `shards restore` below. Still open of A-303's: the clone's orphan record above.
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
