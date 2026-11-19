@@ -343,7 +343,7 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
       .command(&replay.index, &replay.green, &replay.locks, item, &mut out)
       .unwrap();
     if let Step::Accepted(work) = step {
-      commit(
+      commit_work(
         replay,
         *work,
         user,
