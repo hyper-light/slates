@@ -13111,12 +13111,18 @@ mod state_log_tests {
       };
       super::record_acks_in(state, register, 2, FIRST_EPOCH, placement.clone());
       let owed = super::owed_state_log_parts(state, &config, local);
+      let holding = |acked: &[HostId]| {
+        let mut acked = acked.to_vec();
+        acked.sort_unstable();
+        acked
+      };
       assert_eq!(
         owed
           .iter()
-          .map(|head| (head.record.sequence, head.acked.clone()))
+          .map(|head| (head.record.sequence, holding(&head.acked)))
           .collect::<Vec<_>>(),
-        vec![(2, vec![b]), (4, Vec::new())]
+        vec![(2, holding(&[local, b])), (4, Vec::new())],
+        "the owner's own hold and b's"
       );
       let placement = Placement {
         acked: vec![c],

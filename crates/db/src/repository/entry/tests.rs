@@ -2024,7 +2024,7 @@ fn record_of(
 }
 
 /// `record`'s log, span and changes, as the test names them.
-fn moved(record: &crate::catalog::StateLogRecord) -> (StateLog, u64, u64, usize) {
+fn spanned(record: &crate::catalog::StateLogRecord) -> (StateLog, u64, u64, usize) {
   (record.log, record.from, record.to, record.changes.len())
 }
 
@@ -2042,7 +2042,7 @@ fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
   let (mut partition, repo, [a, b, c, ..]) = three_branches(caps(ROOMY));
   let first = partition.take_state_log_records();
   assert_eq!(
-    first.iter().map(moved).collect::<Vec<_>>(),
+    first.iter().map(spanned).collect::<Vec<_>>(),
     vec![(StateLog::Names, 0, 6, 6)]
   );
   assert_eq!(
@@ -2087,7 +2087,7 @@ fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
     run(&mut partition, &op).unwrap();
     let records = partition.take_state_log_records();
     assert_eq!(
-      records.iter().map(moved).collect::<Vec<_>>(),
+      records.iter().map(spanned).collect::<Vec<_>>(),
       vec![expected]
     );
     assert!(identities.insert(records[0].identity), "{op:?}");
@@ -2109,7 +2109,7 @@ fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
   advance(&mut partition, release).unwrap();
   let released = partition.take_state_log_records();
   assert_eq!(
-    released.iter().map(moved).collect::<Vec<_>>(),
+    released.iter().map(spanned).collect::<Vec<_>>(),
     vec![(StateLog::Locks, 1, 2, 1)]
   );
   assert!(identities.insert(released[0].identity));
@@ -2123,7 +2123,7 @@ fn assert_a_push_names_itself_on_every_log_it_moved(
   [a, b]: [VolumeId; 2],
 ) {
   assert_eq!(
-    pushed.iter().map(moved).collect::<Vec<_>>(),
+    pushed.iter().map(spanned).collect::<Vec<_>>(),
     vec![
       (StateLog::Names, 6, 7, 1),
       (StateLog::Phases, 0, 1, 1),
@@ -2186,7 +2186,7 @@ fn a_transactions_state_log_records_go_on_only_once_it_is_durable() {
     .unwrap();
   let alone = db.take_state_log_records();
   assert_eq!(
-    alone.iter().map(moved).collect::<Vec<_>>(),
+    alone.iter().map(spanned).collect::<Vec<_>>(),
     vec![(StateLog::Names, 0, 4, 4)]
   );
   assert!(db.take_state_log_records().is_empty(), "handed on once");
@@ -2214,7 +2214,7 @@ fn a_transactions_state_log_records_go_on_only_once_it_is_durable() {
   db.commit(&mut seg).unwrap();
   let committed = db.take_state_log_records();
   assert_eq!(
-    committed.iter().map(moved).collect::<Vec<_>>(),
+    committed.iter().map(spanned).collect::<Vec<_>>(),
     vec![(StateLog::Names, 4, 5, 1)]
   );
   assert!(db.take_state_log_records().is_empty(), "handed on once");

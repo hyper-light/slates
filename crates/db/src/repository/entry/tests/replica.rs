@@ -202,7 +202,8 @@ impl Replica {
         );
       }
       StateChange::LockReleased { path, lock } => {
-        prop_assert_eq!(self.locks.remove(path).as_ref(), Some(lock), "{:?}", change);
+        let released = self.locks.remove(path);
+        prop_assert_eq!(released.as_ref(), Some(lock), "{:?}", change);
       }
     }
     Ok(())
