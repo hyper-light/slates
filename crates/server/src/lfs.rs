@@ -101,6 +101,7 @@ impl Access for LfsAccess<'_> {
     let asked = Asked {
       name: Name::Ref(named.as_bytes()),
       right: right_of(need),
+      brings: None,
     };
     admit(self.record, principal, &[asked]).is_ok()
   }

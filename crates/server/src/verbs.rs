@@ -5130,11 +5130,12 @@ fn dispatch_inner(
       rules,
       hooks,
       hooks_env,
+      signers,
     } => crate::repository::set_policy(
       state,
       principal,
       (&repository, read),
-      (&rules, &hooks, &hooks_env),
+      (&rules, &hooks, &hooks_env, &signers),
     ),
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {

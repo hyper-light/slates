@@ -63,8 +63,8 @@
 //! appended, and answers what a [`Turn`] asks: resolves the client's URL ([`Connection::open`] or
 //! [`Connection::refuse`]), gives a CRAM-MD5 challenge's parts ([`Connection::challenge`]) and a
 //! user's key ([`Connection::key`]), begins a commit and makes or refuses its work, and from the
-//! session's establishment on hands over the repository's [`Sources`] with every call, the guards
-//! (the locks) the principal's. What the connection waits on its client for, which the caller's
+//! session's establishment on hands over the repository's [`Sources`] with every call, with the
+//! instant its locks are judged at. What the connection waits on its client for, which the caller's
 //! waits are learned by, is [`Connection::waiting`].
 //!
 //! **Bounds.** Every bound is the caller's: one item's bytes, the report's room and the nodes a
@@ -91,7 +91,6 @@ use crate::index::{Index, Revision};
 use crate::lock::{AprTime, LockTable};
 use crate::ra_svn::{self, Bounds, ItemError, Parsed, Parser, Value};
 use crate::reads::{self, Outcome, Stream};
-use crate::report::drive::Guards;
 use crate::report::exchange::{Awaiting, Budget, Exchange, Opened, Turn as ExchangeTurn};
 use crate::report::{
   self, Context, ReportFailure, Request, RequestKind, join_fspath, repository_path, uri_decode,
@@ -155,17 +154,17 @@ pub struct Limits {
 
 /// What a connection reads after the session's establishment, handed over with every call.
 #[derive(Debug)]
-pub struct Sources<'s, R: ?Sized, G: ?Sized> {
+pub struct Sources<'s, R: ?Sized> {
   /// The repository's index (A-553).
   pub index: &'s Index,
   /// The repository's green: entries, texts, property lists and revision properties, and the names
   /// it gives new content.
   pub repository: &'s R,
-  /// The session's principal's guards: the locks it holds. What it may read is `policy`'s
-  /// authorization file's rules, which the connection compiles for the principal.
-  pub guards: &'s G,
-  /// The repository's lock table (A-602).
+  /// The repository's lock table (A-602), the one record of its locks: a commit's checks, the lock
+  /// verbs and an update's drive all read it (A-656 continued (3)).
   pub locks: &'s LockTable,
+  /// The owner's instant at this call, at which a lock is judged expired or not.
+  pub now: AprTime,
   /// Who may do what in the repository.
   pub policy: Policy<'s>,
 }
@@ -267,8 +266,8 @@ pub enum Turn<'a> {
     consumed: usize,
   },
   /// The client authenticated as `principal`, at the handshake's end or for one command: from here
-  /// on every call hands over the repository's sources, the guards (the locks) the principal's.
-  /// After an authentication for one command, the next call runs the command again.
+  /// on every call hands over the repository's sources. After an authentication for one command,
+  /// the next call runs the command again.
   Established {
     /// Who.
     principal: Principal,
@@ -651,16 +650,15 @@ impl Connection {
   /// [`Refused`] for client bytes that end the connection, and for the caller's own errors: a call
   /// out of turn (where a commit's start, a hook's answer or its work's verdict is awaited, or
   /// after the end), or one without sources, which ends the connection.
-  pub fn receive<'a, R, G>(
+  pub fn receive<'a, R>(
     &mut self,
-    sources: Option<&Sources<'_, R, G>>,
+    sources: Option<&Sources<'_, R>>,
     input: &'a [u8],
     out: &mut Vec<u8>,
     budget: Budget,
   ) -> Result<Turn<'a>, Refused>
   where
     R: reads::Repository + commit_drive::Green + ?Sized,
-    G: Guards + ?Sized,
   {
     if matches!(
       self.phase,
@@ -800,15 +798,14 @@ impl Connection {
   /// # Errors
   /// [`Refused::OutOfTurn`] unless the client just asked for a commit; [`Refused::Malformed`] for
   /// parameters `svnserve` cannot read, which end the connection.
-  pub fn commit<R, G>(
+  pub fn commit<R>(
     &mut self,
     start: CommitStart,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     out: &mut Vec<u8>,
   ) -> Result<(), Refused>
   where
     R: ?Sized,
-    G: ?Sized,
   {
     let (established, command) = match std::mem::replace(&mut self.phase, Phase::Ended) {
       Phase::CommitAsked(established, command) => (established, command),
@@ -838,15 +835,14 @@ impl Connection {
   /// # Errors
   /// [`Refused::OutOfTurn`] unless a hook's answer is awaited; [`Refused::Item`] where the failure
   /// cannot be written.
-  pub fn answer_hook<R, G>(
+  pub fn answer_hook<R>(
     &mut self,
     answer: Result<(), Vec<(u32, String)>>,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     out: &mut Vec<u8>,
   ) -> Result<Turn<'static>, Refused>
   where
     R: commit_drive::Green + ?Sized,
-    G: ?Sized,
   {
     let (established, mut drive) = match std::mem::replace(&mut self.phase, Phase::Ended) {
       Phase::Hooked(established, drive) => (established, drive),
@@ -927,17 +923,16 @@ impl Connection {
   }
 
   /// A phase of the established session, on, with the repository's sources.
-  fn established<'a, R, G>(
+  fn established<'a, R>(
     &mut self,
     phase: Phase,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     input: &'a [u8],
     out: &mut Vec<u8>,
     budget: Budget,
   ) -> Result<Turn<'a>, Refused>
   where
     R: reads::Repository + commit_drive::Green + ?Sized,
-    G: Guards + ?Sized,
   {
     match phase {
       Phase::Commands(established) => self.command(established, sources, input, out),
@@ -1054,16 +1049,15 @@ impl Connection {
   }
 
   /// The client's next command, answered.
-  fn command<'a, R, G>(
+  fn command<'a, R>(
     &mut self,
     mut established: Box<Established>,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     input: &'a [u8],
     out: &mut Vec<u8>,
   ) -> Result<Turn<'a>, Refused>
   where
     R: reads::Repository + ?Sized,
-    G: Guards + ?Sized,
   {
     let (value, consumed) = match self.parse(input)? {
       Parsed::NeedMore { needed } => {
@@ -1126,10 +1120,10 @@ impl Connection {
 
   /// A command the read commands hand over, whose item is `item`: `reparent`, `commit`, a report
   /// command, or one not served yet.
-  fn elsewhere<R, G>(
+  fn elsewhere<R>(
     &self,
     established: &mut Established,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     name: &str,
     params: &[Value<'_>],
     item: &[u8],
@@ -1137,7 +1131,6 @@ impl Connection {
   ) -> Result<Answered, Refused>
   where
     R: ?Sized,
-    G: Guards + ?Sized,
   {
     if name == REPARENT {
       reparent(established, params, out)?;
@@ -1227,16 +1220,15 @@ impl Connection {
   /// A read an authentication interrupted, run again with the principal the client proved and no
   /// trivial auth request before its answer (`must_have_access` after its `auth_request`): between
   /// commands after it, or streaming its answer.
-  fn read_again<R, G>(
+  fn read_again<R>(
     &mut self,
     mut established: Box<Established>,
     command: &[u8],
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     out: &mut Vec<u8>,
   ) -> Result<(), Refused>
   where
     R: reads::Repository + ?Sized,
-    G: ?Sized,
   {
     let value = self.whole_item(command)?;
     let session = established.reads_session(&sources.policy, reads::Authentication::Done);
@@ -1286,16 +1278,15 @@ impl Connection {
 
   /// The command an authentication for it interrupted, run again with the principal the client
   /// proved and no trivial auth request before its answer.
-  fn resume<'a, R, G>(
+  fn resume<'a, R>(
     &mut self,
     mut established: Box<Established>,
     interrupted: Interrupted,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     out: &mut Vec<u8>,
   ) -> Result<Turn<'a>, Refused>
   where
     R: reads::Repository + ?Sized,
-    G: Guards + ?Sized,
   {
     match interrupted {
       Interrupted::Read { command } => self.read_again(established, &command, sources, out)?,
@@ -1405,17 +1396,16 @@ impl Connection {
   }
 
   /// A commit's drive takes the client's next editor command.
-  fn editing<'a, R, G>(
+  fn editing<'a, R>(
     &mut self,
     established: Box<Established>,
     mut drive: Box<Drive>,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     input: &'a [u8],
     out: &mut Vec<u8>,
   ) -> Result<Turn<'a>, Refused>
   where
     R: commit_drive::Green + ?Sized,
-    G: ?Sized,
   {
     let (value, consumed) = match self.parse(input)? {
       Parsed::NeedMore { needed } => {
@@ -1494,17 +1484,16 @@ impl Connection {
   }
 
   /// A read's answer resumed within the room.
-  fn stream<'a, R, G>(
+  fn stream<'a, R>(
     &mut self,
     mut established: Box<Established>,
     mut stream: Box<Stream>,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     out: &mut Vec<u8>,
     budget: Budget,
   ) -> Result<Turn<'a>, Refused>
   where
     R: reads::Repository + ?Sized,
-    G: ?Sized,
   {
     let authentication = established.reads_authentication(&sources.policy);
     let session = established.reads_session(&sources.policy, authentication);
@@ -1526,23 +1515,23 @@ impl Connection {
   }
 
   /// A report command's exchange, on.
-  fn exchange<'a, R, G>(
+  fn exchange<'a, R>(
     &mut self,
     mut established: Box<Established>,
     mut exchange: Box<Exchange>,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     input: &'a [u8],
     out: &mut Vec<u8>,
     budget: Budget,
   ) -> Result<Turn<'a>, Refused>
   where
     R: reads::Repository + ?Sized,
-    G: Guards + ?Sized,
   {
     let drive_sources = report::drive::Sources {
       index: sources.index,
       repository: sources.repository,
-      guards: sources.guards,
+      locks: sources.locks,
+      now: sources.now,
       rules: established.compiled_read_rules(&sources.policy),
     };
     let turn = exchange

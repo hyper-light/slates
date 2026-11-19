@@ -1,78 +1,82 @@
 //! git's push on its repository's owner shard (A-654 part 2; §4.17.1 "A push is a work" items 1 to 5 and "Policy";
 //! §4.17.2 "A push" items 1 to 7, "Access", "Protected branches, in git's terms" and "Hooks, in git's terms"; A-620's
-//! session, A-622's policy, A-635's append, A-638's views, A-642, A-644, A-662's store): the one driver both edges
-//! call, the HTTP site (A-625) and the SSH channel (A-651).
+//! session, A-622's policy, A-635's append, A-638's views, A-642, A-644 and its part 2's check point, A-662's store):
+//! the one driver both edges call, the HTTP site (A-625) and the SSH channel (A-651).
 //!
 //! **A step at a time.** [`ReceivePack::start`] makes one push's session for a principal and writes the advertisement
 //! when the edge's transport opens with it (SSH; smart HTTP's `info/refs`, whose session then ends);
-//! [`ReceivePack::input`] and [`ReceivePack::end`] hand it the client's bytes as they arrive, a thin pack's bases and the
-//! connectivity check read from the repository's index through A-638's view; [`ReceivePack::answer`] decides the checked
-//! push and writes git's report to the edge's bytes. Each call is one step on the owner shard and holds nothing of the
-//! shard after it, so an edge's task keeps the driver across its own awaits. Every read of the store is lent the room
-//! the shard can admit now (`vcs_store::with_room`), since A-614's store parses within its content store's room and a
-//! settled store has none (A-662); the request, the pack and what reading and answering them builds are charged to the
-//! room the edge gives the push, as each request on the HTTP site is (A-625).
+//! [`ReceivePack::input`] and [`ReceivePack::end`] hand it the client's bytes as they arrive, a thin pack's bases and
+//! the connectivity check read from the repository's index through A-638's view; [`ReceivePack::answer`] decides the
+//! checked push and writes git's report to the edge's bytes. Each call is one step on the owner shard and holds nothing
+//! of the shard after it, so an edge's task keeps the driver across its own awaits. Every read of the store is lent the
+//! room the shard can admit now (`vcs_store::with_room`), since A-614's store parses within its content store's room
+//! and a settled store has none (A-662); the request, the pack and what reading and answering them builds are charged
+//! to the room the edge gives the push, as each request on the HTTP site is (A-625).
 //!
 //! **What is advertised** (item 1). Each branch whose green holds a git head in the repository's store (A-662), by its
-//! ref, in git's order: a namespace name `N` is the ref `refs/heads/N`, a name beginning `refs/` is the ref of that name
-//! (a pushed tag `refs/tags/v1` is bound under that name), and a name beginning `refs/heads/` is no git ref, since its
-//! ref is another name's; so names and refs map one to one. A green no push gave a git head (a new repository's default
-//! branch, a branch the CLI made) is not advertised: git sees an unborn branch. A ref the pusher may not read under the
-//! repository's policy (A-622's Read) is hidden as git's `receive.hideRefs` hides one: left out, and a command naming it
-//! refused `deny updating a hidden ref`. The policy that hides is the one the push started under, as git reads its
-//! configuration once a run.
+//! ref, in git's order: a namespace name `N` is the ref `refs/heads/N`, a name beginning `refs/` is the ref of that
+//! name (a pushed tag `refs/tags/v1` is bound under that name), and a name beginning `refs/heads/` is no git ref, since
+//! its ref is another name's; so names and refs map one to one. A green no push gave a git head (a new repository's
+//! default branch, a branch the CLI made) is not advertised: git sees an unborn branch. A ref the pusher may not read
+//! under the repository's policy (A-622's Read) is hidden as git's `receive.hideRefs` hides one: left out, and a
+//! command naming it refused `deny updating a hidden ref`. The policy that hides is the one the push started under, as
+//! git reads its configuration once a run.
 //!
 //! **Answering**, in this order:
-//! 1. A git hook configured for the repository (`pre-receive`, `update`, `post-receive`) refuses every command,
-//!    `hook not run` with a line naming the hook, until its read-only view is served to the hook driver (A-665 part 2):
-//!    no ref moves that a configured hook was not asked about, and no hook is skipped without a word.
+//! 1. A git hook configured for the repository (`pre-receive`, `update`, `post-receive`) refuses every command, `hook
+//!    not run` with a line naming the hook, until its read-only view is served to the hook driver (A-665 part 2): no
+//!    ref moves that a configured hook was not asked about, and no hook is skipped without a word.
 //! 2. The pushed objects are admitted to the repository's quarantine and sealed (A-662's `GitPush`); a push whose every
 //!    command the protocol's checks refused admits none. A store that does not admit them (the shard's budget) refuses
 //!    every command, `objects not admitted`, with why.
-//! 3. Each command's right under the policy (A-622): Submit for a create or a fast-forward, Rewrite for a move A-644's
-//!    store finds no fast-forward of its ref, Delete for a delete; refused in git's own words, `non-fast-forward` and
-//!    `deletion prohibited` as git refuses them itself, and a submission refused as git answers an update hook refusing
-//!    it (`hook declined`), slates' line naming the rule (A-644's words). The policy is asked before the work is built,
-//!    as git's `update()` refuses before it runs its hook: the cheaper refusal first, where §4.17.2's item 6 lists the
-//!    work first.
+//! 3. Each command under the policy, through A-644 part 2's check point (`git_protect`): A-644's store answers how the
+//!    change moves its ref and so the right it needs (Submit for a create or a fast-forward, Rewrite for a move that is
+//!    no fast-forward, Delete for a delete), and A-622's `admit` judges that right and, where a rule imposes them, the
+//!    requirements on what the change brings (a linear history, commits a trusted key signed). A refusal is in git's
+//!    words (`git_protect::declined`): `non-fast-forward` and `deletion prohibited` as git refuses them itself, every
+//!    other as git answers an update hook refusing it. A change whose ref names no born green is judged against a key
+//!    no green has, so a create brings every commit its head reaches, as A-644 judges one. The policy is asked before
+//!    the work is built, as git's `update()` refuses before it runs its hook: the cheaper refusal first, where
+//!    §4.17.2's item 6 lists the work first.
 //! 4. Each command's verdict, A-654 part 1's `Verdicts` over the shard's greens ([`ShardGreens`]), the repository's
 //!    index and the quarantine, each work built within the room the shard can admit now.
 //! 5. The append: each accepted command's entry made A-635's change and A-662's store move and appended through
 //!    `push_sealed`, one entry each without `atomic`, all as one entry under it, each green first held to the position
-//!    its verdict read (compare and swap, below). A refusal is git's `failed to update ref` (`atomic transaction failed`
-//!    under `atomic`): a ref that moved for a conflict, a green moved, or a name taken or gone since the push read it;
-//!    the append's own reason, in slates' words, for anything else.
+//!    its verdict read (compare and swap, below). A refusal is git's `failed to update ref` (`atomic transaction
+//!    failed` under `atomic`): a ref that moved for a conflict, a green moved, or a name taken or gone since the push
+//!    read it; the append's own reason, in slates' words, for anything else.
 //! 6. The report, in git's words (A-620's writer); then the sealed push is given back, holding only what no append
 //!    committed.
 //!
 //! **A ref's base is its green's head.** A command's old value names a version only when it is the head of the newest
-//! of the store's versions of its green and that version is the green's head now. A push that read an older version,
-//! or a green that moved without git (a submit), is a ref that moved until A-664's server-made commits give every
-//! version a commit, so that a work based on an older version can be composed and its result named. An annotated tag's
-//! tree is that of the commit or tree it names.
+//! of the store's versions of its green and that version is the green's head now. A push that read an older version, or
+//! a green that moved without git (a submit), is a ref that moved until A-664's server-made commits give every version
+//! a commit, so that a work based on an older version can be composed and its result named. An annotated tag's tree is
+//! that of the commit or tree it names.
 //!
-//! **A create** is made at the version of the member whose head its first parent is, where it can still be branched from
-//! (the default branch's first, then the members as they joined), else at the default branch's newest version (A-654
-//! part 1), and appended as A-635's new branch made at that version, its work moving it to the pushed tree. While the
-//! default branch is unborn, a create is built over an empty green and made from the default branch's green, which must
-//! be empty at its version 0: the default branch itself is moved by the work, any other ref is a new branch made at that
-//! empty version. A default branch that holds files no git commit names refuses it, typed: its commit is A-664's.
+//! **A create** is made at the version of the member whose head its first parent is, where it can still be branched
+//! from (the default branch's first, then the members as they joined), else at the default branch's newest version
+//! (A-654 part 1), and appended as A-635's new branch made at that version, its work moving it to the pushed tree.
+//! While the default branch is unborn, a create is built over an empty green and made from the default branch's green,
+//! which must be empty at its version 0: the default branch itself is moved by the work, any other ref is a new branch
+//! made at that empty version. A default branch that holds files no git commit names refuses it, typed: its commit is
+//! A-664's.
 //!
 //! **A push's name** (A-618: two submits of one push carry one name, and every work's identity begins with it) is
 //! hashed from its repository and its commands, so a push sent again makes the same works, and A-635 answers each the
 //! version it made before.
 //!
 //! **Tests** (`git_push/tests.rs`): six pushes stock git 2.50.1 made, each advertisement and answer held to the bytes
-//! git's server wrote and each ref's green to the tree its commit names; the policy hiding, refusing a delete and a
-//! submission in git's words, and a configured hook refusing typed, each refusal recording nothing; `atomic` all or
-//! none, at the verdict and at the append, and a push without it a ref at a time.
+//! git's server wrote and each ref's green to the tree its commit names; the policy hiding a ref and refusing a delete
+//! and a submission in git's words through the check point, and a configured hook refusing typed, each refusal
+//! recording nothing; `atomic` all or none, at the verdict and at the append, and a push without it a ref at a time. A
+//! protected name's linear history and signed commits are A-644 part 2's own tests (`git_protect/tests.rs`).
 //!
 //! **Owed** (GAPS' §4.17 entry): the edges' calls (g299's `GitServices` for the HTTP site, g294's channel for SSH); the
 //! hooks run over A-665 part 2's view; a push based on an older version (A-664); a principal the policy allows who is
 //! not the repository's owner, whom A-635's append refuses `Forbidden` until its owner check gives way to the policy;
-//! linear history and signed commits once the policy's record holds them (A-644's answers are built); push options;
-//! review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (item 8); a tag of a
-//! tag.
+//! push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (item
+//! 8); a tag of a tag.
 
 use core::convert::Infallible;
 
@@ -86,21 +90,22 @@ use slates_git::out::Out;
 use slates_git::receive::works::{self, Entry, GreenRead, Unappended, Verdicts, Version};
 use slates_git::receive::{
   self, Advertised, Checked, Command, Declined, HiddenRefs, Judge, Pushed, Received, Reported,
-  Repository as _, Request, Session, protected,
+  Repository as _, Request, Session,
 };
 use slates_git::refname;
+use slates_git::store::Incoming;
 use slates_git::store::views::{IndexedObjects, PushedObjects};
-use slates_git::store::{Change, Incoming};
 use slates_git::unpack::Object;
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::Increment;
 use slates_vcs::ContentStore;
 
+use crate::git_protect::{StoreBrings, declined, right_of};
 use crate::repository::push::{
   AppendRefused, BranchChange, ChangeRefusal, ChangeRefused, EntryParts, StoreMove, push_sealed,
 };
 use crate::state::ShardState;
-use crate::vcs_policy::{Asked, Compiled, Name, PushRefusal, Right};
+use crate::vcs_policy::{Asked, Brings, Compiled, Name, PushRefusal, Right, admit, admit_right};
 use crate::vcs_store::{GitPush, GitRefused, GitStore, SealedPush, Target, green_key, with_room};
 use crate::verbs::to_wire_volume;
 
@@ -273,17 +278,12 @@ impl ReceivePack {
     } = self;
     let answered = match prepared {
       Prepared::Declined(mut declining) => session.answer(&mut declining, out, admission),
-      Prepared::Sealed {
-        mut sealed,
-        policy,
-        name,
-      } => {
+      Prepared::Sealed { mut sealed, name } => {
         let mut judge = ServerJudge {
           state: &mut *state,
           push: &mut sealed,
           record: &record,
           principal,
-          policy: &policy,
           name,
         };
         let answered = session.answer(&mut judge, out, admission);
@@ -360,6 +360,27 @@ fn bound(state: &ShardState, repository: RepositoryId, name: &[u8]) -> Option<Db
     .branch(repository, namespace)
 }
 
+/// The key of the green the ref `name` names in `repository`, where it is born: bound, and holding a git head in the
+/// store.
+fn born(
+  state: &ShardState,
+  (repository, name): (RepositoryId, &[u8]),
+  store: (&ContentStore, &GitStore),
+) -> Option<u64> {
+  let key = green_key(bound(state, repository, name)?);
+  git_head(store, key).map(|_| key)
+}
+
+/// A key no green of `repository` has in its git store, which a change is judged against where its ref names no born
+/// green: the repository's own id's, minted by the counter its greens' ids are (`verbs::fresh_volume_id`), so it is no
+/// green's key. A create is so judged against no position of its own, as A-644 judges one: it brings every commit its
+/// head reaches.
+fn unheld_key(repository: RepositoryId) -> u64 {
+  green_key(DbVolumeId {
+    bytes: repository.bytes,
+  })
+}
+
 /// The member of `repository` its git store keys `key` (`vcs_store::green_key`).
 fn keyed(state: &ShardState, repository: RepositoryId, key: u64) -> Option<DbVolumeId> {
   let repositories = state.db.partition().repositories();
@@ -374,8 +395,8 @@ fn keyed(state: &ShardState, repository: RepositoryId, key: u64) -> Option<DbVol
 struct PolicyHidden {
   /// The policy the push started under, compiled.
   policy: Compiled,
-  /// The repository's owner, who holds what no rule grants.
-  owner: Principal,
+  /// The repository's record it was read from: its owner holds what no rule grants.
+  record: RepositoryRecord,
   /// Who pushes.
   principal: Principal,
 }
@@ -385,7 +406,7 @@ impl PolicyHidden {
   fn of(record: &RepositoryRecord, principal: &Principal) -> Result<PolicyHidden, PushRefusal> {
     Ok(PolicyHidden {
       policy: Compiled::of(record)?,
-      owner: record.owner.clone(),
+      record: record.clone(),
       principal: principal.clone(),
     })
   }
@@ -393,14 +414,12 @@ impl PolicyHidden {
 
 impl HiddenRefs for PolicyHidden {
   fn is_hidden(&self, name: &[u8]) -> bool {
-    let asked = [Asked {
+    let asked = Asked {
       name: Name::Ref(name),
       right: Right::Read,
-    }];
-    self
-      .policy
-      .admits(&self.owner, &self.principal, &asked)
-      .is_err()
+      brings: None,
+    };
+    admit_right(&self.policy, &self.record, &self.principal, &asked, 0).is_err()
   }
 }
 
@@ -412,8 +431,6 @@ enum Prepared {
   Sealed {
     /// The sealed push.
     sealed: SealedPush,
-    /// The repository's policy, compiled once for the push.
-    policy: Compiled,
     /// The push's name (module docs).
     name: [u8; 32],
   },
@@ -430,7 +447,6 @@ fn prepare(
   if let Some(hook) = git_hook(record) {
     return Ok(Prepared::Declined(Declining::hook(hook)));
   }
-  let policy = Compiled::of(record).map_err(PushFailed::Policy)?;
   let mut push = GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?;
   let judged = checked.early.iter().any(Option::is_none);
   let objects = if judged { checked.objects() } else { &[] };
@@ -442,7 +458,6 @@ fn prepare(
   match push.seal(state) {
     Ok(sealed) => Ok(Prepared::Sealed {
       sealed,
-      policy,
       name: push_name(record.id, &checked.request),
     }),
     Err(refused) => Ok(Prepared::Declined(Declining::unadmitted(&refused))),
@@ -564,8 +579,6 @@ struct ServerJudge<'j> {
   record: &'j RepositoryRecord,
   /// Who pushes.
   principal: &'j Principal,
-  /// The repository's policy, compiled once for the push.
-  policy: &'j Compiled,
   /// The push's name.
   name: [u8; 32],
 }
@@ -574,15 +587,7 @@ impl Judge for ServerJudge<'_> {
   type Accepted = Entry;
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
-    let right = self.right(command)?;
-    let asked = [Asked {
-      name: Name::Ref(&command.name),
-      right,
-    }];
-    self
-      .policy
-      .admits(&self.record.owner, self.principal, &asked)
-      .map_err(|refusal| policy_declined(&command.name, right, &refusal))?;
+    self.admitted(command)?;
     self.verdict(command, pushed)
   }
 
@@ -613,37 +618,45 @@ impl Judge for ServerJudge<'_> {
 }
 
 impl ServerJudge<'_> {
-  /// The right `command`'s change needs (A-622 part 2; module docs, "Answering", item 3).
-  fn right(&mut self, command: &Command) -> Result<Right, Declined> {
-    if command.is_delete() {
-      return Ok(Right::Delete);
-    }
-    if command.is_create() {
-      return Ok(Right::Submit);
-    }
+  /// The policy's verdict on `command` (module docs, "Answering", item 3): A-644's store answers how the change moves
+  /// its ref and so the right it needs, and A-622's check point judges that right and, where a rule imposes one, the
+  /// requirements on what the change brings (A-644 part 2's `StoreBrings`: a linear history, signed commits); a
+  /// refusal in git's words (`git_protect::declined`).
+  fn admitted(&mut self, command: &Command) -> Result<(), Declined> {
     let Self {
       state,
       push,
       record,
+      principal,
       ..
     } = self;
-    let change = with_room(state, |state| {
-      let store = state.vcs_stores.git_ref(record.id)?;
-      let key = green_key(bound(state, record.id, &command.name)?);
-      git_head(store, key)?;
+    let name = command.name.as_slice();
+    with_room(state, |state| {
+      let Some(store) = state.vcs_stores.git_ref(record.id) else {
+        return Err(refused_declined(name, words(&GitRefused::NoStore)));
+      };
       let (content, git) = store;
-      Some(
-        git
-          .repository
-          .change(content, push.quarantine(), key, Some(command.new)),
-      )
-    });
-    match change {
-      None | Some(Ok(Change::Create | Change::FastForward)) => Ok(Right::Submit),
-      Some(Ok(Change::Rewrite)) => Ok(Right::Rewrite),
-      Some(Ok(Change::Delete)) => Ok(Right::Delete),
-      Some(Err(refused)) => Err(refused_declined(&command.name, words(&refused))),
-    }
+      let green = born(state, (record.id, name), store).unwrap_or_else(|| unheld_key(record.id));
+      let to = (!command.is_delete()).then_some(command.new);
+      let change = git
+        .repository
+        .change(content, push.quarantine(), green, to)
+        .map_err(|refused| refused_declined(name, words(&refused)))?;
+      let right = right_of(change);
+      let brings = to.map(|to| StoreBrings {
+        repository: &git.repository,
+        store: content,
+        push: push.quarantine(),
+        green,
+        to,
+      });
+      let asked = [Asked {
+        name: Name::Ref(name),
+        right,
+        brings: brings.as_ref().map(|brings| brings as &dyn Brings),
+      }];
+      admit(record, principal, &asked).map_err(|refusal| declined(&refusal, name, right))
+    })
   }
 
   /// `command`'s entry (module docs, "Answering", item 4): A-654 part 1's verdicts over the shard's greens, the
@@ -856,31 +869,6 @@ fn refused_at(at: usize, why: &[u8]) -> Unappended {
 /// The refusal of `name`'s command for a reason of slates' own, `why`: git's `failed to update ref`, `why` on band 2.
 fn refused_declined(name: &[u8], why: Vec<u8>) -> Declined {
   works::append_declined(name, &Unappended::Refused { at: 0, why })
-}
-
-/// The policy's refusal of the change `right` names on `name` (module docs, "Answering", item 3), in git's words.
-fn policy_declined(name: &[u8], right: Right, refusal: &PushRefusal) -> Declined {
-  match right {
-    Right::Rewrite => protected::non_fast_forward(name),
-    Right::Delete => protected::deletion_prohibited(name),
-    Right::Submit | Right::Read => protected::hook_declined(name, policy_words(name, refusal)),
-  }
-}
-
-/// Slates' words for the policy's refusal of a submission to `name`, as an update hook writes them: one line naming the
-/// rule that decided, or that no rule allows it.
-fn policy_words(name: &[u8], refusal: &PushRefusal) -> Vec<u8> {
-  let why = match refusal {
-    PushRefusal::Denied { rule, .. } => {
-      format!(": denied by rule {rule} of the repository's policy\n")
-    }
-    PushRefusal::NotPermitted { .. } => {
-      ": no rule of the repository's policy allows it, and only its owner holds what no rule grants\n"
-        .to_owned()
-    }
-    other => format!(": refused by the repository's policy: {other:?}\n"),
-  };
-  [b"denying push to ".as_slice(), name, why.as_bytes()].concat()
 }
 
 /// Slates' words for a typed refusal: its kind and fields as its type names them, as Mercurial's push words its own
