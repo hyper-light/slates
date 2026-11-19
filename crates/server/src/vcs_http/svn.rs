@@ -42,7 +42,10 @@ use slates_http_edge::connection::Fields;
 use slates_http_edge::credential;
 use slates_svn::authz::PrincipalRules;
 use slates_svn::dav::Bounds as XmlBounds;
-use slates_svn::dav::site::{self, Answer as SiteAnswer, Headers, Request, Served};
+use slates_rt::futures::yield_now;
+use slates_svn::dav::site::{
+  self, Answer as SiteAnswer, Headers, Report, ReportProgress, Request, Served,
+};
 use slates_svn::dav::xml::Element;
 use slates_svn::index::{Index, Text};
 use slates_svn::lock::{AprTime, LockTable};
@@ -378,6 +381,73 @@ enum Answered {
     /// How much of it the reply has given.
     offset: u64,
   },
+  /// A REPORT's answer, a slice a reply run.
+  Report {
+    /// The headers.
+    headers: Headers,
+    /// The report.
+    report: Report,
+    /// What its first slices wrote, until the first reply run takes it.
+    pending: Vec<u8>,
+    /// Whether the answer is whole.
+    done: bool,
+  },
+}
+
+/// The repository as `site` reads it for one step: what `lent` lends, under the repository root's URL path `root`.
+fn served_of<'a, R: ?Sized>(lent: &'a Lent<'a, R>, root: &'a str) -> Served<'a, R> {
+  Served {
+    index: lent.index,
+    repository: lent.repository,
+    root,
+    uuid: lent.uuid,
+    locks: lent.locks,
+    rules: lent.rules,
+    now: lent.now,
+  }
+}
+
+/// Steps `report` until its first bytes or its end, the store lent for each slice of `room` and the task yielding
+/// between them (§4.3): what they come to decides the status the reply begins with, as `dav_method_report` answers a
+/// report's error only while it has sent nothing. A refusal after its first bytes, within these slices, fails the
+/// request `500` before any of it is sent, where `mod_dav` would have sent the bytes and ended the connection.
+async fn first_slices<S: SvnStores>(
+  stores: &mut S,
+  asker: (RepositoryId, &Principal, &str),
+  mut report: Report,
+  room: usize,
+) -> Result<Answered, Failed> {
+  let (repository, principal, root) = asker;
+  let mut pending = Vec::new();
+  loop {
+    let progress = stores
+      .lend(repository, principal, |lent| {
+        report.resume(&served_of(lent, root), &mut pending, room)
+      })
+      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    let done = match progress {
+      ReportProgress::More if pending.is_empty() => {
+        yield_now().await;
+        continue;
+      }
+      ReportProgress::More => false,
+      ReportProgress::Done => true,
+      ReportProgress::Refused(answer) => {
+        return Ok(Answered::Whole {
+          status: status_of(answer.status),
+          headers: answer.headers,
+          body: answer.body,
+        });
+      }
+      ReportProgress::Broken => return Err(Failed(Status::INTERNAL_SERVER_ERROR)),
+    };
+    return Ok(Answered::Report {
+      headers: report.headers(),
+      report,
+      pending,
+      done,
+    });
+  }
 }
 
 /// A served request's exchange (the module doc's bounds): its route, method and depth copied from the head, its body,
@@ -484,19 +554,10 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
     let answer = self
       .stores
       .lend(self.repository, &self.principal, |lent| {
-        let served = Served {
-          index: lent.index,
-          repository: lent.repository,
-          root,
-          uuid: lent.uuid,
-          locks: lent.locks,
-          rules: lent.rules,
-          now: lent.now,
-        };
-        site::answer(&served, &request, &bounds, room)
+        site::answer(&served_of(lent, root), &request, &bounds, room)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-    self.answered = Some(match answer {
+    let answered = match answer {
       SiteAnswer::Whole(whole) => Answered::Whole {
         status: status_of(whole.status),
         headers: whole.headers,
@@ -507,21 +568,30 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         text,
         offset: 0,
       },
-    });
+      SiteAnswer::Report(report) => {
+        let asker = (self.repository, &self.principal, root);
+        first_slices(&mut self.stores, asker, report, room).await?
+      }
+    };
+    self.answered = Some(answered);
     Ok(())
   }
 
   fn reply_status(&self) -> Status {
     match &self.answered {
       Some(Answered::Whole { status, .. }) => *status,
-      Some(Answered::Text { .. }) => Status::OK,
+      Some(Answered::Text { .. } | Answered::Report { .. }) => Status::OK,
       None => Status::INTERNAL_SERVER_ERROR,
     }
   }
 
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
     let headers = match &self.answered {
-      Some(Answered::Whole { headers, .. } | Answered::Text { headers, .. }) => headers,
+      Some(
+        Answered::Whole { headers, .. }
+        | Answered::Text { headers, .. }
+        | Answered::Report { headers, .. },
+      ) => headers,
       None => return Err(Failed(Status::INTERNAL_SERVER_ERROR)),
     };
     Ok(
@@ -553,6 +623,35 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         *offset = at.saturating_add(to_u64(piece.len()));
         out.extend_from_slice(&piece);
         Ok(!piece.is_empty() && *offset < text.size)
+      }
+      Some(Answered::Report {
+        report,
+        pending,
+        done,
+        ..
+      }) => {
+        if !pending.is_empty() || *done {
+          out.append(pending);
+          return Ok(!*done);
+        }
+        let (root, room) = (self.root.as_str(), to_usize(self.request_room));
+        let progress = self
+          .stores
+          .lend(self.repository, &self.principal, |lent| {
+            report.resume(&served_of(lent, root), out, room)
+          })
+          .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+        match progress {
+          ReportProgress::More => Ok(true),
+          ReportProgress::Done => {
+            *done = true;
+            Ok(false)
+          }
+          // Its first slices wrote its header, so a refusal now can only end the connection.
+          ReportProgress::Refused(_) | ReportProgress::Broken => {
+            Err(Failed(Status::INTERNAL_SERVER_ERROR))
+          }
+        }
       }
       None => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
     }

@@ -22,9 +22,10 @@
 //!
 //! **Methods.**
 //! - OPTIONS: `200`, the `DAV` lines and, when the body asks for the activity collection, the HTTPv2 headers
-//!   (`version.c` `get_option`, A-609's writer), listing only what this site serves: none of `mod_dav_svn`'s
-//!   capabilities yet (each names a report or a commit), and `SVN-Repository-MergeInfo: no`, since a `mergeinfo-report`
-//!   is not served; so a stock client lists a directory by PROPFIND and asks no report it would be refused.
+//!   (`version.c` `get_option`, A-609's writer), listing only what this site serves: of `mod_dav_svn`'s capabilities
+//!   (each names a report or a commit's form) `log-revprops` alone, and `SVN-Repository-MergeInfo: no`, since a
+//!   `mergeinfo-report` is not served; so a stock client lists a directory by PROPFIND and asks no report it would be
+//!   refused.
 //! - PROPFIND (`mod_dav.c` `dav_method_propfind`, `props.c` `dav_get_allprops` and `dav_get_props`): `207`, one response
 //!   for the resource and, at depth 1 on a directory, one for each child the principal may read, in name order; a
 //!   collection's href ends in a slash, as `mod_dav_svn`'s walker writes it. `allprop` is the node's own properties
@@ -35,8 +36,13 @@
 //! - GET and HEAD (`repos.c` `set_headers`, `deliver`): a file's text, streamed by the caller from the green a piece at
 //!   a time, with `Cache-Control` (a week for a resource whose URL names its revision, none for a public URL),
 //!   `Last-Modified` for a public URL, its `ETag` and `Content-Type` (its valid `svn:mime-type`, else `text/plain`).
-//! - Every other method, each REPORT among them: `501`, `SVN_ERR_UNSUPPORTED_FEATURE` (200007), a REPORT in
-//!   `mod_dav_svn`'s words for one it does not know ("The requested report is unknown").
+//! - REPORT (`mod_dav.c` `dav_method_report`, `version.c` `deliver_report`; part 1's second slice): its body read as
+//!   A-609 reads it, then the resource's node, `404` without one; a `log-report` answered `200`, `text/xml`, from
+//!   A-613's log walk with `mod_dav_svn`'s receivers (`crate::reads::DavLog`), which the caller streams a slice a reply
+//!   run ([`Report`]): a walk refused before its first byte is answered with its error, `dav_svn__convert_err`'s status
+//!   and the error in `D:error`, and one refused after it ends the connection. Every other report is `501` in
+//!   `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
+//! - Every other method: `501`, `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
 //!
 //! **Read access** (`mod_authz_svn`'s questions with HTTP, §4.17.4 item 10). A request whose node's path the
 //! principal's rules do not let it read is `403`; a directory's children it may not read are left out of a depth-1
@@ -56,15 +62,15 @@
 mod tests;
 
 use super::drive::uri_encode;
-use super::locking::{DAV_XML_CONTENT_TYPE, HttpAnswer, error_answer, lockdiscovery};
-use super::request::{self, PropertyName, PropfindRequest, svn_time};
-use super::response::{self, Body, BulkUpdates, Httpv2, live_prop};
+use super::locking::{DAV_XML_CONTENT_TYPE, HttpAnswer, convert_status, error_answer, lockdiscovery};
+use super::request::{self, PropertyName, PropfindRequest, Report as Asked, svn_time};
+use super::response::{self, Body, BulkUpdates, Capability, Httpv2, live_prop};
 use super::xml::{base64_lines, is_xml_safe, quote};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
 use crate::authz::{PrincipalRules, may_read};
 use crate::index::{Index, Node, NodeKind, NodeRelation, PropertyList, Revision, Text};
 use crate::lock::{AprTime, LockTable};
-use crate::reads::Repository;
+use crate::reads::{DavLog, DavLogProgress, Repository};
 use crate::report::drive::history as copies;
 
 /// The special URI's name: where `mod_dav_svn` keeps every resource that is no node's public URL.
@@ -162,6 +168,16 @@ const EPOCH_WEEKDAY: u64 = 4;
 /// Format: `apr_time_t` counts microseconds.
 const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
 
+/// The capabilities this site serves, which its OPTIONS answer lists: `log-revprops`, a `log-report`'s revision
+/// properties named or all of them, which a client asks for only where it is listed.
+/// Format: `version.c` `get_vsn_options`' names (`svn_dav.h`), those whose report or form is served here.
+const SERVED_CAPABILITIES: [Capability; 1] = [Capability::LogRevprops];
+
+/// The status a `log-report` refused before its first byte is answered with, where `dav_svn__convert_err` maps the
+/// error to none of its own.
+/// Format: `reports/log.c` `dav_svn__log_report`, `dav_svn__convert_err(serr, HTTP_BAD_REQUEST, ...)`.
+const LOG_REFUSED_STATUS: u16 = HTTP_BAD_REQUEST;
+
 /// The repository as one request is answered from it, lent by the edge's site for the request's step.
 pub struct Served<'a, R: ?Sized> {
   /// The index.
@@ -210,6 +226,60 @@ pub enum Answer {
     /// The text.
     text: Option<Text>,
   },
+  /// A REPORT's answer, which the caller streams a slice at a time ([`Report::resume`]), its status decided by its
+  /// first slices.
+  Report(Report),
+}
+
+/// A REPORT's answer still to write, the repository lent again for each slice (§4.17.4 item 11: long reads are sliced
+/// under the shard's budget): a `log-report`'s walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+  /// The log's walk.
+  log: DavLog,
+}
+
+/// How far a REPORT's answer is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportProgress {
+  /// More follows: resume it again.
+  More,
+  /// The answer is whole.
+  Done,
+  /// Refused before any of it was written: this is the answer instead (`dav_method_report`'s error for a report that
+  /// sent nothing).
+  Refused(HttpAnswer),
+  /// Refused after some of it was written: the connection ends there (`dav_method_report` aborts it).
+  Broken,
+}
+
+impl Report {
+  /// The answer's headers: its content type (`dav_method_report`'s `DAV_XML_CONTENT_TYPE`).
+  pub fn headers(&self) -> Headers {
+    vec![("Content-Type", String::from(DAV_XML_CONTENT_TYPE))]
+  }
+
+  /// Writes the answer's next slice into `out` from `served`, until what it wrote and the steps it took reach `room`,
+  /// at least one step, or the answer ends.
+  pub fn resume<R: Repository + ?Sized>(
+    &mut self,
+    served: &Served<'_, R>,
+    out: &mut Vec<u8>,
+    room: usize,
+  ) -> ReportProgress {
+    let progress = self
+      .log
+      .resume(served.index, served.repository, served.rules, out, room);
+    match progress {
+      DavLogProgress::More => ReportProgress::More,
+      DavLogProgress::Done => ReportProgress::Done,
+      DavLogProgress::Refused { .. } if self.log.begun() => ReportProgress::Broken,
+      DavLogProgress::Refused { code, message } => {
+        let status = convert_status(code, LOG_REFUSED_STATUS);
+        ReportProgress::Refused(error_answer(status, true, code, &message))
+      }
+    }
+  }
 }
 
 /// A node's place: its path and the revision it is read in, whether its URL is public (moving with the youngest), and
@@ -262,6 +332,7 @@ pub fn answer<R: Repository + ?Sized>(
     "OPTIONS" => Answer::Whole(options(served, request, bounds, room)),
     "PROPFIND" => Answer::Whole(propfind(served, &resource, request, bounds, room)),
     "GET" | "HEAD" => get(served, &resource),
+    "REPORT" => report(served, &resource, request, bounds),
     method => Answer::Whole(unserved_method(method)),
   }
 }
@@ -398,7 +469,7 @@ fn options<R: ?Sized>(
     uuid: Some(served.uuid.to_owned()),
     mergeinfo: Some(false),
     bulk_updates: BulkUpdates::On,
-    served: Vec::new(),
+    served: SERVED_CAPABILITIES.to_vec(),
   };
   let mut headers = response::options_headers(&facts, asked);
   headers.push(("Content-Type", String::from(DAV_XML_CONTENT_TYPE)));
@@ -454,6 +525,36 @@ fn get<R: Repository + ?Sized>(served: &Served<'_, R>, resource: &Resource) -> A
       text: node.text(),
     },
     Err(refused) => Answer::Whole(refused),
+  }
+}
+
+/// The REPORT answer (the module doc): the body read first, then the resource's node; a `log-report` streamed, any
+/// other report `501`.
+fn report<R: Repository + ?Sized>(
+  served: &Served<'_, R>,
+  resource: &Resource,
+  request: &Request<'_>,
+  bounds: &Bounds,
+) -> Answer {
+  let Resource::Node(place) = resource else {
+    return Answer::Whole(unserved_method("REPORT"));
+  };
+  let asked = match request::report(request.body, bounds) {
+    Ok(asked) => asked,
+    Err(DavRefusal::UnknownReport { .. }) => return Answer::Whole(unserved_method("REPORT")),
+    Err(refused) => return Answer::Whole(refused_body(&refused)),
+  };
+  match node_at(served, place) {
+    Ok(Some(_)) => {}
+    Ok(None) => return Answer::Whole(bare(HTTP_NOT_FOUND)),
+    Err(refused) => return Answer::Whole(refused),
+  }
+  match asked {
+    Asked::Log(log) => match DavLog::new(&log, &place.path) {
+      Some(log) => Answer::Report(Report { log }),
+      None => Answer::Whole(bare(HTTP_BAD_REQUEST)),
+    },
+    _ => Answer::Whole(unserved_method("REPORT")),
   }
 }
 

@@ -2099,3 +2099,329 @@ proptest! {
     hostile_command_holds(&command)?;
   }
 }
+
+/// A log request both writers answer in [`a_log_report_answers_the_entries_svnserve_answers`]: the paths, relative to
+/// the root; the start and the end (none: the youngest); whether changed paths are sent; strict history; the limit (0:
+/// none); merged revisions; and the revision properties asked for (none: every one).
+#[derive(Debug)]
+struct LogCase {
+  /// The paths.
+  paths: &'static [&'static str],
+  /// The start.
+  start: Option<u64>,
+  /// The end.
+  end: Option<u64>,
+  /// Whether changed paths are sent.
+  changed: bool,
+  /// Whether histories stop at copies.
+  strict: bool,
+  /// The limit.
+  limit: u64,
+  /// Whether merged revisions are included.
+  merged: bool,
+  /// The revision properties named; none for every one.
+  revprops: Option<&'static [&'static str]>,
+}
+
+/// The standard three revision properties a stock client names.
+const STANDARD_THREE: &[&str] = &["svn:author", "svn:date", "svn:log"];
+
+/// The cases, each with whether it is read by the `locked` repository's anonymous rules: the root's shortcut over every
+/// revision with every property; a file's history with its merged revisions; a branch oldest first with a limit,
+/// crossing its copy; the branch's history stopping at its copy, no property; two paths with a custom property named;
+/// under the rules, the root refused and the trunk censored; a missing path and a revision past the youngest refused.
+const DAV_LOG_CASES: [(LogCase, bool); 9] = [
+  (LogCase { paths: &[""], start: None, end: None, changed: true, strict: false, limit: 0, merged: false, revprops: None }, false),
+  (LogCase { paths: &["trunk/a.txt"], start: None, end: Some(1), changed: true, strict: false, limit: 0, merged: true, revprops: Some(STANDARD_THREE) }, false),
+  (LogCase { paths: &["branches/b1"], start: Some(1), end: None, changed: true, strict: false, limit: 3, merged: false, revprops: Some(STANDARD_THREE) }, false),
+  (LogCase { paths: &["branches/b1"], start: None, end: Some(0), changed: false, strict: true, limit: 0, merged: false, revprops: Some(&[]) }, false),
+  (LogCase { paths: &["trunk/a.txt", "tags/t1"], start: Some(11), end: Some(2), changed: true, strict: false, limit: 0, merged: false, revprops: Some(&["svn:author", "x-ticket"]) }, false),
+  (LogCase { paths: &[""], start: None, end: None, changed: true, strict: false, limit: 0, merged: false, revprops: None }, true),
+  (LogCase { paths: &["trunk"], start: None, end: None, changed: true, strict: false, limit: 0, merged: false, revprops: None }, true),
+  (LogCase { paths: &["missing.txt"], start: None, end: None, changed: true, strict: false, limit: 0, merged: false, revprops: None }, false),
+  (LogCase { paths: &["trunk"], start: Some(99), end: None, changed: false, strict: false, limit: 0, merged: false, revprops: None }, false),
+];
+
+/// What a log came to, written the same way whichever writer wrote it: each entry (its revision, -1 for one closing a
+/// run of merged revisions; its changed paths; its revision properties in name order; its two flags), then the error
+/// number and message of a refusal.
+type LogAnswer = (Vec<String>, Option<(u64, String)>);
+
+/// One entry as [`LogAnswer`] writes it.
+fn log_line(
+  revision: i64,
+  changed: &[String],
+  revprops: &BTreeMap<String, String>,
+  flags: (bool, bool),
+) -> String {
+  let (children, subtractive) = flags;
+  format!("r{revision} {changed:?} {revprops:?} children={children} subtractive={subtractive}")
+}
+
+/// An ra_svn item's text: a string's bytes, lossily, a word or a number.
+fn item_text(value: &Value<'_>) -> String {
+  match value {
+    Value::String(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+    Value::Word(word) => (*word).to_owned(),
+    Value::Number(number) => number.to_string(),
+    Value::List(_) => String::from("( )"),
+  }
+}
+
+/// `svnserve`'s changed path `( path action ( copy-path copy-rev ) ( kind text-mod prop-mod ) )` as [`LogAnswer`]
+/// writes it.
+fn items_changed(change: &Value<'_>) -> String {
+  let Value::List(parts) = change else {
+    panic!("not a changed path: {change:?}");
+  };
+  let [path, action, Value::List(copy), Value::List(flags)] = parts.as_slice() else {
+    panic!("not a changed path: {change:?}");
+  };
+  let copy = match copy.as_slice() {
+    [source, revision] => format!("{}@{}", item_text(source), item_text(revision)),
+    _ => String::new(),
+  };
+  let flags: Vec<String> = flags.iter().map(item_text).collect();
+  format!("{} {} {} {copy}", item_text(action), item_text(path), flags.join(" "))
+}
+
+/// One of `svnserve`'s log entries as [`LogAnswer`] writes it.
+fn items_line(entry: &[Value<'_>]) -> String {
+  let [Value::List(changed), revision, Value::List(author), Value::List(date), Value::List(message), children, invalid, _, Value::List(rest), subtractive] =
+    entry
+  else {
+    panic!("not a log entry: {entry:?}");
+  };
+  let mut revprops = BTreeMap::new();
+  for (name, value) in [("svn:author", author), ("svn:date", date), ("svn:log", message)] {
+    if let Some(value) = value.first() {
+      revprops.insert(name.to_owned(), item_text(value));
+    }
+  }
+  for pair in rest {
+    if let Value::List(pair) = pair
+      && let [name, value] = pair.as_slice()
+    {
+      revprops.insert(item_text(name), item_text(value));
+    }
+  }
+  let revision = if item_text(invalid) == "true" {
+    -1
+  } else {
+    item_text(revision).parse().unwrap()
+  };
+  let changed: Vec<String> = changed.iter().map(items_changed).collect();
+  let flags = (item_text(children) == "true", item_text(subtractive) == "true");
+  log_line(revision, &changed, &revprops, flags)
+}
+
+/// `svnserve`'s whole `log` answer (its authentication request, the entries, `done` and its answer) as [`LogAnswer`].
+fn items_answer(out: &[u8]) -> LogAnswer {
+  let (mut entries, mut refusal) = (Vec::new(), None);
+  for value in items(out).iter().skip(1) {
+    let Value::List(parts) = value else {
+      continue;
+    };
+    match parts.first() {
+      Some(Value::Word("success")) => {}
+      Some(Value::Word("failure")) => {
+        let error = &parts[1];
+        let Value::List(errors) = error else { panic!("{error:?}") };
+        let Value::List(first) = &errors[0] else { panic!("{error:?}") };
+        refusal = Some((item_text(&first[0]).parse().unwrap(), item_text(&first[1])));
+      }
+      _ => entries.push(items_line(parts)),
+    }
+  }
+  (entries, refusal)
+}
+
+/// `case` as `svnserve`'s `log` command.
+fn items_log_command(case: &LogCase) -> String {
+  let string = |text: &str| format!("{}:{text}", text.len());
+  let revision = |revision: Option<u64>| revision.map_or_else(|| String::from("( )"), |r| format!("( {r} )"));
+  let paths: Vec<String> = case.paths.iter().map(|path| string(path)).collect();
+  let (word, names) = match case.revprops {
+    None => ("all-revprops", Vec::new()),
+    Some(names) => ("revprops", names.iter().map(|name| string(name)).collect()),
+  };
+  format!(
+    "( log ( ( {} ) {} {} {} {} {} {} {word} ( {} ) ) ) ",
+    paths.join(" "),
+    revision(case.start),
+    revision(case.end),
+    case.changed,
+    case.strict,
+    case.limit,
+    case.merged,
+    names.join(" ")
+  )
+}
+
+/// `case` as `svnserve` answers it at the root, with `rules`, resumed in the smallest room.
+fn items_log(fixture: &Fixture, case: &LogCase, rules: Option<&PrincipalRules>) -> LogAnswer {
+  let session = Session {
+    authz: rules,
+    ..ROOT_SESSION
+  };
+  let command = items_log_command(case);
+  let value = items(command.as_bytes()).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(&fixture.index, &fixture.green, &session, &value, &mut out).unwrap();
+  let Outcome::Streaming(mut stream) = outcome else {
+    panic!("log streams: {outcome:?}");
+  };
+  while stream
+    .resume(&fixture.index, &fixture.green, &session, &mut out, SLICE_ROOM)
+    .unwrap()
+    == Progress::More
+  {}
+  items_answer(&out)
+}
+
+/// `case` as the `log-report` stock svn sends.
+fn dav_log_body(case: &LogCase) -> String {
+  let mut body = String::from("<S:log-report xmlns:S=\"svn:\">");
+  let mut element = |name: &str, text: Option<String>| match text {
+    Some(text) => body.push_str(&format!("<S:{name}>{text}</S:{name}>")),
+    None => body.push_str(&format!("<S:{name}/>")),
+  };
+  for (name, revision) in [("start-revision", case.start), ("end-revision", case.end)] {
+    if let Some(revision) = revision {
+      element(name, Some(revision.to_string()));
+    }
+  }
+  if case.limit > 0 {
+    element("limit", Some(case.limit.to_string()));
+  }
+  for (name, set) in [
+    ("discover-changed-paths", case.changed),
+    ("strict-node-history", case.strict),
+    ("include-merged-revisions", case.merged),
+  ] {
+    if set {
+      element(name, None);
+    }
+  }
+  match case.revprops {
+    None => element("all-revprops", None),
+    Some([]) => element("no-revprops", None),
+    Some(names) => names.iter().for_each(|name| element("revprop", Some((*name).to_owned()))),
+  }
+  for path in case.paths {
+    element("path", Some((*path).to_owned()));
+  }
+  body.push_str("</S:log-report>");
+  body
+}
+
+/// What the DAV log's tests read a body or an answer of `bytes` with.
+fn dav_bounds(bytes: usize) -> crate::dav::Bounds {
+  crate::dav::Bounds {
+    body_bytes: bytes,
+    depth: 8,
+    name_bytes: 64,
+    attributes: 8,
+    elements: bytes,
+  }
+}
+
+/// A `log-report`'s changed path as [`LogAnswer`] writes it.
+fn dav_changed(change: &crate::dav::xml::Element) -> String {
+  let action = match change.name.as_str() {
+    "added-path" => "A",
+    "replaced-path" => "R",
+    "deleted-path" => "D",
+    _ => "M",
+  };
+  let copy = match (change.attribute("copyfrom-path"), change.attribute("copyfrom-rev")) {
+    (Some(source), Some(revision)) => format!("{source}@{revision}"),
+    _ => String::new(),
+  };
+  let flags = ["node-kind", "text-mods", "prop-mods"].map(|name| change.attribute(name).unwrap_or_default());
+  format!("{action} {} {} {copy}", change.text(), flags.join(" "))
+}
+
+/// A `log-report`'s item as [`LogAnswer`] writes it.
+fn dav_line(item: &crate::dav::xml::Element) -> String {
+  let (mut changed, mut revprops) = (Vec::new(), BTreeMap::new());
+  let (mut revision, mut children, mut subtractive) = (0, false, false);
+  for child in item.elements() {
+    let name = match child.name.as_str() {
+      "version-name" => {
+        revision = child.text().parse().unwrap();
+        continue;
+      }
+      "has-children" => {
+        children = true;
+        continue;
+      }
+      "subtractive-merge" => {
+        subtractive = true;
+        continue;
+      }
+      "creator-displayname" => "svn:author",
+      "date" => "svn:date",
+      "comment" => "svn:log",
+      "revprop" => child.attribute("name").unwrap(),
+      _ => {
+        changed.push(dav_changed(child));
+        continue;
+      }
+    };
+    revprops.insert(name.to_owned(), child.text());
+  }
+  log_line(revision, &changed, &revprops, (children, subtractive))
+}
+
+/// `case` as a `log-report` answers it at the root with `rules`, a slice of the smallest room at a time; a refusal must
+/// come before any of the answer is written.
+fn dav_log(fixture: &Fixture, case: &LogCase, rules: Option<&PrincipalRules>) -> LogAnswer {
+  let body = dav_log_body(case);
+  let asked = crate::dav::request::report(body.as_bytes(), &dav_bounds(body.len())).unwrap();
+  let crate::dav::request::Report::Log(report) = asked else {
+    panic!("not a log-report: {asked:?}");
+  };
+  let mut log = DavLog::new(&report, ROOT).unwrap();
+  let mut out = Vec::new();
+  loop {
+    match log.resume(&fixture.index, &fixture.green, rules, &mut out, SLICE_ROOM) {
+      DavLogProgress::More => {}
+      DavLogProgress::Done => break,
+      DavLogProgress::Refused { code, message } => {
+        assert!(out.is_empty() && !log.begun(), "{case:?} refused after its first byte");
+        return (Vec::new(), Some((u64::from(code), message)));
+      }
+    }
+  }
+  let root = crate::dav::xml::parse(&out, &dav_bounds(out.len())).unwrap();
+  assert!(root.is("svn:", "log-report"), "{root:?}");
+  (root.elements().map(dav_line).collect(), None)
+}
+
+/// A-681 (`reports/log.c` over `svn_repos_get_logs5`, part 1's second slice): do run each of [`DAV_LOG_CASES`] as
+/// `svnserve`'s `log` (held to its transcripts above) and as a `log-report`, each resumed in the smallest room; expect
+/// the same entries, changed paths, revision properties and flags from both, the report well formed, and each refusal
+/// the same error, the report's before any of it is written.
+#[test]
+fn a_log_report_answers_the_entries_svnserve_answers() {
+  let fixture = Fixture::new();
+  let rules = locked_rules();
+  for (case, locked) in &DAV_LOG_CASES {
+    let rules = locked.then_some(&rules);
+    let (expected, found) = (items_log(&fixture, case, rules), dav_log(&fixture, case, rules));
+    assert_eq!(found, expected, "{case:?}");
+  }
+}
+
+/// A-681 (`dav_svn__log_report`; the module doc's departure): do ask a `log-report` with a negative `S:limit`, which
+/// `svn_repos_get_logs5` would read as two limits; expect no walk, the site refusing it as malformed.
+#[test]
+fn a_negative_log_limit_is_no_walk() {
+  let body = b"<S:log-report xmlns:S=\"svn:\"><S:limit>-1</S:limit><S:path></S:path></S:log-report>";
+  let asked = crate::dav::request::report(body, &dav_bounds(body.len())).unwrap();
+  let crate::dav::request::Report::Log(report) = asked else {
+    panic!("not a log-report: {asked:?}");
+  };
+  assert_eq!(DavLog::new(&report, ROOT), None);
+}

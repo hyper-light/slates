@@ -403,13 +403,19 @@ fn basic(user: &str, token: &str) -> String {
   format!("Authorization: Basic {encoded}")
 }
 
-/// Runs `future`, which the tests' sites and exchanges finish without waiting.
+/// Shape: the polls the tests give a future that yields between its slices, far more than any of theirs takes.
+const POLLS: usize = 10_000;
+
+/// Runs `future`, which the tests' sites and exchanges finish without waiting on anything but their own yields.
 fn ready<F: Future>(future: F) -> F::Output {
   let mut context = Context::from_waker(Waker::noop());
-  match std::pin::pin!(future).poll(&mut context) {
-    Poll::Ready(value) => value,
-    Poll::Pending => panic!("the tests' exchanges answer at once"),
+  let mut future = std::pin::pin!(future);
+  for _ in 0..POLLS {
+    if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+      return value;
+    }
   }
+  panic!("the tests' exchanges answer within {POLLS} polls");
 }
 
 /// How the site decided `method target` with `fields`, on a TLS connection: moved to a shard, refused with a status,
@@ -555,6 +561,40 @@ fn the_exchange_answers_from_the_lent_store_by_the_principals_rules() {
   );
 }
 
+/// Shape: the `log-report` `svn log -v` sends for revision 1 down (A-609's fixture's form).
+const LOG_VERBOSE: &[u8] = b"<S:log-report xmlns:S=\"svn:\"><S:start-revision>1</S:start-revision>\
+<S:end-revision>0</S:end-revision><S:discover-changed-paths/><S:revprop>svn:author</S:revprop>\
+<S:revprop>svn:date</S:revprop><S:revprop>svn:log</S:revprop><S:path></S:path><S:encode-binary-props/>\
+</S:log-report>";
+
+/// A-681 part 1's second slice (`reports/log.c` through the edge's exchange; `mod_authz_svn`'s questions): do REPORT
+/// `svn log -v`'s body on the trunk's revision root as the owner, whose rules hide `/trunk/secret`, then a log naming a
+/// missing path; expect `200`, `text/xml`, the one entry `log.c` writes with the secret's two changed paths left out and
+/// the author and date alone (revision 1 is the owner's in part), and the second `404` with FSFS's "File not found".
+#[test]
+fn a_log_report_is_streamed_by_the_principals_rules() {
+  let (status, fields, reply, _) = exchanged("REPORT", "/repo/!svn/rvr/1/trunk", None, LOG_VERBOSE);
+  let expected = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<S:log-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n\
+<S:log-item>\n<S:added-path node-kind=\"dir\" text-mods=\"false\" prop-mods=\"false\">/trunk</S:added-path>\n\
+<S:added-path node-kind=\"file\" text-mods=\"true\" prop-mods=\"true\">/trunk/a.txt</S:added-path>\n\
+<D:version-name>1</D:version-name>\n<D:creator-displayname>alice</D:creator-displayname>\n<S:date>{DATE}</S:date>\n\
+</S:log-item>\n</S:log-report>\n"
+  );
+  let content_type = (b"Content-Type".to_vec(), b"text/xml; charset=\"utf-8\"".to_vec());
+  assert_eq!(
+    (status, fields, String::from_utf8(reply).unwrap()),
+    (200, vec![content_type], expected)
+  );
+  let missing = b"<S:log-report xmlns:S=\"svn:\"><S:path>missing</S:path></S:log-report>";
+  let (status, _, reply, _) = exchanged("REPORT", "/repo/!svn/rvr/1/trunk", None, missing);
+  let words = "File not found: revision 1, path '/trunk/missing'";
+  assert_eq!(
+    (status, String::from_utf8(reply).unwrap().contains(words)),
+    (404, true)
+  );
+}
+
 /// A-681 (`repos.c` `deliver`; §4.17.4 item 11: a read streams from chunks): do GET a file whose green hands its text
 /// over [`PIECE`] bytes at a time; expect `200`, the text whole, given over as many reply runs as pieces, and the
 /// file's headers.
@@ -682,9 +722,10 @@ fn svn_present() -> bool {
 
 /// A-681, the stock client against the site (the brief's oracle): do serve the tests' repository over HTTPS on loopback
 /// and run stock svn's `info`, `cat`, `ls`, `proplist -v` against it as alice, then `cat` a file her authorization file
-/// hides; expect svn to read the file's node kind, revision, UUID and author, its text, the trunk's listing without the
-/// hidden directory and the file's `svn:eol-style`, and the hidden file refused as forbidden. Skips loudly where svn is
-/// not installed.
+/// hides, then `log` and `log -v` of the trunk; expect svn to read the file's node kind, revision, UUID and author, its
+/// text, the trunk's listing without the hidden directory and the file's `svn:eol-style`, the hidden file refused as
+/// forbidden, and revision 1's entry by alice with neither its message nor the hidden paths (she reads the revision in
+/// part), its readable changed paths listed. Skips loudly where svn is not installed.
 #[test]
 fn stock_svn_reads_a_repository_through_the_site_over_https() {
   if !svn_present() {
@@ -718,11 +759,13 @@ fn stock_svn_reads_a_repository_through_the_site_over_https() {
       svn(&config, &["ls", &url("/trunk")]),
       svn(&config, &["proplist", "-v", &url("/trunk/a.txt")]),
       svn(&config, &["cat", &url("/trunk/secret/s.txt")]),
+      svn(&config, &["log", &url("/trunk")]),
+      svn(&config, &["log", "-v", &url("/trunk")]),
     ]
   });
   runtime.context().run();
-  let [info, cat, ls, proplist, hidden] = client.join().expect("the client's thread");
-  for (ran, output) in [&info, &cat, &ls, &proplist, &hidden] {
+  let [info, cat, ls, proplist, hidden, log, verbose] = client.join().expect("the client's thread");
+  for (ran, output) in [&info, &cat, &ls, &proplist, &hidden, &log, &verbose] {
     eprintln!("svn (success {ran}):\n{output}");
   }
   let read = |(ran, output): &(bool, String), wanted: &[&str]| {
@@ -754,5 +797,15 @@ fn stock_svn_reads_a_repository_through_the_site_over_https() {
       true,
       (false, true),
     )
+  );
+  let unseen =
+    |(_, output): &(bool, String), hidden: &[&str]| hidden.iter().all(|word| !output.contains(word));
+  assert_eq!(
+    (
+      read(&log, &["r1 | alice |"]) && unseen(&log, &["the first"]),
+      read(&verbose, &["r1 | alice |", "A /trunk", "A /trunk/a.txt"])
+        && unseen(&verbose, &["secret", "the first"]),
+    ),
+    (true, true)
   );
 }
