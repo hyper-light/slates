@@ -260,6 +260,26 @@ fn deletions_are_written_when_their_directory_closes_in_byte_order() {
   assert!(order.is_sorted(), "{record}");
 }
 
+/// A-652 (rules): do import a revision that deletes `f` and copies `f` of the revision before back to it, as `svnadmin`
+/// writes a replacement by a copy of the node it replaces. Expect one replacement by that copy, which FSFS records once
+/// the deletion comes first, and the export to import to the same history.
+#[test]
+fn a_replacement_by_a_copy_of_the_node_it_replaces_imports_and_round_trips() {
+  let mut dump = first_revision();
+  dump
+    .revision(2, &revision_properties(2))
+    .node(&Node::delete("f"))
+    .node(&Node::add("f", NodeKind::File).copied(1, "f"));
+  let repository = imported(&dump);
+  let changes = youngest_changes(&repository);
+  assert_eq!(actions(&changes), vec![("/f", Action::Replace)]);
+  assert_eq!(
+    changes[0].copy_from.as_ref().map(|source| (source.path.as_str(), source.revision)),
+    Some(("/f", 1))
+  );
+  same_history_through_its_export(&repository);
+}
+
 /// Holds `repository` to the history its own export imports to.
 fn same_history_through_its_export(repository: &Repository) {
   let mut again = created();
