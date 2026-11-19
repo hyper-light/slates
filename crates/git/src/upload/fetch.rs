@@ -1,0 +1,382 @@
+//! `fetch`, served (A-640 part 2; §4.17.2 "A fetch" items 2 and 3; `upload-pack.c` `upload_pack_v2`, `process_args`,
+//! `parse_want`, `parse_want_ref`, `process_deepen_not`, `send_acks`, `process_haves_and_send_acks`,
+//! `send_shallow_info` and `send_wanted_ref_info`): a request's arguments mapped onto A-615's negotiation over A-640 part
+//! 1's graph, and the answer's sections written in the document's order, its pack begun.
+//!
+//! **The arguments.** Each `want` and `have` is passed on as named, each `want-ref` looked up among the refs (its id a
+//! want, and its line in `wanted-refs`), each `deepen-not` resolved by git's patterns, and the `filter` parsed. A
+//! `deepen` with `deepen-relative` counts from the client's shallow commits; `deepen-relative` alone deepens nothing,
+//! as git's `send_shallow_list` reads it. `thin-pack` and `ofs-delta` go to the pack's source, `sideband-all`
+//! multiplexes the whole answer, and `include-tag` goes to the negotiation. `no-progress` asks for what is never sent
+//! (no progress is written yet), and `packfile-uris` for what the store does not keep (no URI packs yet), so both are
+//! read and change nothing. A later `deepen`, `deepen-since` or `filter` replaces an earlier one, as in git.
+//!
+//! **The sections** (gitprotocol-v2 "fetch" `output`). No want and no `wait-for-done`: nothing at all, as git answers.
+//! Not ready: the acknowledgments (`NAK`, or an `ACK` for each common have) and the flush; the client asks again. Ready,
+//! or `done`: the acknowledgments with `ready` and a delimiter (none after `done`), `shallow-info` where the client is
+//! shallow or deepens (its `shallow` and `unshallow` lines without an LF, as git writes them), `wanted-refs` where
+//! refs were wanted by name, then the packfile section's header; the pack follows as the answer is stepped.
+
+use super::answer::Answer;
+use super::{PackPlan, PackSource, Refused, Refusal, Served, Sink, charged, refs};
+use crate::Admission;
+use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, Pack, ShallowInfo};
+use crate::object_name::{ObjectFormat, ObjectId};
+use crate::store::StoreGraph;
+use crate::v2::fetch::{Argument, Event, Response, Section, WantedRef};
+use crate::v2::{Ending, Line};
+
+/// What a `fetch` asks for that is a choice, not a list.
+#[derive(Clone, Copy, Debug, Default)]
+struct Flags {
+  /// `done`.
+  done: bool,
+  /// `wait-for-done`.
+  wait_for_done: bool,
+  /// `include-tag`.
+  include_tag: bool,
+  /// `thin-pack`.
+  thin: bool,
+  /// `ofs-delta`.
+  ofs_delta: bool,
+  /// `deepen-relative`.
+  relative: bool,
+  /// `sideband-all`.
+  multiplexed: bool,
+}
+
+impl Flags {
+  /// These choices with `flag`'s; an argument that is no choice changes nothing.
+  fn with(self, flag: Argument<'_>) -> Flags {
+    match flag {
+      Argument::Done => Flags { done: true, ..self },
+      Argument::WaitForDone => Flags {
+        wait_for_done: true,
+        ..self
+      },
+      Argument::IncludeTag => Flags {
+        include_tag: true,
+        ..self
+      },
+      Argument::ThinPack => Flags { thin: true, ..self },
+      Argument::OfsDelta => Flags {
+        ofs_delta: true,
+        ..self
+      },
+      Argument::DeepenRelative => Flags {
+        relative: true,
+        ..self
+      },
+      Argument::SidebandAll => Flags {
+        multiplexed: true,
+        ..self
+      },
+      _ => self,
+    }
+  }
+}
+
+/// A `fetch` request, read: the lists the negotiation reads, and the choices the answer is written with.
+#[derive(Debug, Default)]
+struct Asked<'a> {
+  /// The objects wanted: each `want`'s, then each `want-ref`'s, in the order sent.
+  wants: Vec<ObjectId>,
+  /// The objects the client has.
+  haves: Vec<ObjectId>,
+  /// The client's shallow commits.
+  shallow: Vec<ObjectId>,
+  /// What each `deepen-not` names.
+  not: Vec<ObjectId>,
+  /// The refs wanted by name, and what each names, in the order sent.
+  wanted: Vec<WantedRef<'a>>,
+  /// `deepen <depth>`.
+  depth: Option<u32>,
+  /// `deepen-since <time>`.
+  since: Option<u64>,
+  /// `filter <spec>`, parsed.
+  filter: Option<Filter>,
+  /// The choices.
+  flags: Flags,
+}
+
+impl Asked<'_> {
+  /// How the request deepens a shallow history (`send_shallow_list`): by depth, or by a cut at a time or at what refs
+  /// reach; `deepen-relative` alone deepens nothing.
+  fn deepen(&self) -> Option<Deepen<'_>> {
+    match self.depth {
+      Some(depth) => Some(Deepen::Depth {
+        depth,
+        relative: self.flags.relative,
+      }),
+      None if self.since.is_some() || !self.not.is_empty() => Some(Deepen::Cut {
+        since: self.since,
+        not: &self.not,
+      }),
+      None => None,
+    }
+  }
+}
+
+/// Answers a `fetch` request's `arguments` (`upload_pack_v2`): its pack, when it carries one, from `packs`; refused on
+/// band 3 when it asked for `sideband-all`.
+pub(super) fn answer<P: PackSource>(
+  graph: &StoreGraph<'_>,
+  served: &Served<'_>,
+  arguments: &[Line<Argument<'_>>],
+  packs: &mut P,
+  admission: &mut Admission,
+) -> Result<Answer<P::Pack>, Refused> {
+  let multiplexed = arguments
+    .iter()
+    .any(|line| line.value == Argument::SidebandAll);
+  let refused = |refusal: Refusal| Refused {
+    refusal,
+    multiplexed,
+  };
+  let asked = read(graph, served, arguments, admission).map_err(refused)?;
+  let request = negotiation::Request {
+    wants: &asked.wants,
+    haves: &asked.haves,
+    done: asked.flags.done,
+    wait_for_done: asked.flags.wait_for_done,
+    shallow: &asked.shallow,
+    deepen: asked.deepen(),
+    filter: asked.filter.as_ref(),
+    include_tag: asked.flags.include_tag,
+  };
+  let outcome = negotiation::negotiate(graph, &request, admission)
+    .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?;
+  let answer = written(served, &asked, outcome, packs, admission).map_err(refused)?;
+  match graph.fault() {
+    Some(fault) => Err(refused(Refusal::Store(fault))),
+    None => Ok(answer),
+  }
+}
+
+/// Reads `arguments` (`process_args`): every list charged to `admission` before it is made, each `want-ref` and
+/// `deepen-not` looked up among the refs, a `want-ref` sent twice refused.
+fn read<'a>(
+  graph: &StoreGraph<'_>,
+  served: &Served<'_>,
+  arguments: &[Line<Argument<'a>>],
+  admission: &mut Admission,
+) -> Result<Asked<'a>, Refusal> {
+  let mut asked = with_room(arguments, admission)?;
+  for line in arguments {
+    take(&mut asked, line.value, graph, served)?;
+  }
+  once_each(&asked.wanted, admission)?;
+  Ok(asked)
+}
+
+/// An empty request whose lists have room for what `arguments` name, charged to `admission` first.
+fn with_room<'a>(
+  arguments: &[Line<Argument<'a>>],
+  admission: &mut Admission,
+) -> Result<Asked<'a>, Refusal> {
+  let count = |kind: fn(&Argument<'_>) -> bool| arguments.iter().filter(|line| kind(&line.value)).count();
+  let haves = count(|argument| matches!(argument, Argument::Have(_)));
+  let shallow = count(|argument| matches!(argument, Argument::Shallow(_)));
+  let not = count(|argument| matches!(argument, Argument::DeepenNot(_)));
+  let wanted = count(|argument| matches!(argument, Argument::WantRef(_)));
+  let wants = count(|argument| matches!(argument, Argument::Want(_))).saturating_add(wanted);
+  let ids = wants
+    .saturating_add(haves)
+    .saturating_add(shallow)
+    .saturating_add(not);
+  admission
+    .charge_items::<ObjectId>(ids)
+    .and_then(|()| admission.charge_items::<WantedRef<'a>>(wanted))
+    .map_err(Refusal::PastAdmission)?;
+  Ok(Asked {
+    wants: Vec::with_capacity(wants),
+    haves: Vec::with_capacity(haves),
+    shallow: Vec::with_capacity(shallow),
+    not: Vec::with_capacity(not),
+    wanted: Vec::with_capacity(wanted),
+    ..Asked::default()
+  })
+}
+
+/// Takes one argument into `asked`.
+fn take<'a>(
+  asked: &mut Asked<'a>,
+  argument: Argument<'a>,
+  graph: &StoreGraph<'_>,
+  served: &Served<'_>,
+) -> Result<(), Refusal> {
+  match argument {
+    Argument::Want(id) => asked.wants.push(id),
+    Argument::WantRef(name) => {
+      let id = refs::wanted(graph, served, name)?;
+      asked.wants.push(id);
+      asked.wanted.push(WantedRef { id, name });
+    }
+    Argument::Have(id) => asked.haves.push(id),
+    Argument::Shallow(id) => asked.shallow.push(id),
+    Argument::Deepen(depth) => asked.depth = Some(depth),
+    Argument::DeepenSince(time) => asked.since = Some(time),
+    Argument::DeepenNot(rev) => asked.not.push(refs::deepen_not(graph, served, rev)?),
+    Argument::Filter(spec) => asked.filter = Some(Filter::parse(spec).map_err(Refusal::Filter)?),
+    flag => asked.flags = asked.flags.with(flag),
+  }
+  Ok(())
+}
+
+/// Refused when a ref is wanted by name twice ("It is a protocol error to send want-ref for the same ref more than
+/// once"), the names sorted in a list charged to `admission` first.
+fn once_each(wanted: &[WantedRef<'_>], admission: &mut Admission) -> Result<(), Refusal> {
+  admission
+    .charge_items::<&[u8]>(wanted.len())
+    .map_err(Refusal::PastAdmission)?;
+  let mut names: Vec<&[u8]> = wanted.iter().map(|wanted| wanted.name).collect();
+  names.sort_unstable();
+  match names
+    .windows(2)
+    .find_map(|pair| match pair {
+      [earlier, later] if earlier == later => Some(*later),
+      _ => None,
+    }) {
+    Some(name) => Err(Refusal::WantRefTwice {
+      name: name.to_vec(),
+    }),
+    None => Ok(()),
+  }
+}
+
+/// The answer to `outcome`: its sections encoded, and its pack begun from `packs`.
+fn written<P: PackSource>(
+  served: &Served<'_>,
+  asked: &Asked<'_>,
+  outcome: Outcome<u64, u64>,
+  packs: &mut P,
+  admission: &mut Admission,
+) -> Result<Answer<P::Pack>, Refusal> {
+  let format = served.repository.format();
+  let multiplexed = asked.flags.multiplexed;
+  match outcome.answer {
+    negotiation::Answer::Nothing => Ok(Answer::whole(Vec::new()).counted(outcome.counters)),
+    negotiation::Answer::Acknowledgments(acknowledgments) => {
+      let (bytes, _) = charged(admission, |out| {
+        let mut writer = Writer::new(format, multiplexed, out);
+        writer.acknowledgments(&acknowledgments)?;
+        writer.event(&Event::Flush)?;
+        Ok(writer.finish())
+      })?;
+      Ok(Answer::whole(bytes).counted(outcome.counters))
+    }
+    negotiation::Answer::Pack(pack) => {
+      let plan = PackPlan {
+        runs: &pack.runs,
+        objects: &pack.objects,
+        filter: asked.filter.as_ref(),
+        thin: asked.flags.thin,
+        ofs_delta: asked.flags.ofs_delta,
+      };
+      let source = packs.begin(served, &plan, admission).map_err(Refusal::Pack)?;
+      let (bytes, (response, at)) = charged(admission, |out| {
+        before_pack(&pack, &asked.wanted, format, multiplexed, out)
+      })?;
+      Answer::streaming(bytes, response, at, source, admission)
+        .map(|answer| answer.counted(outcome.counters))
+    }
+  }
+}
+
+/// Writes the sections before a pack and the packfile section's header: the response's grammar after them, and how
+/// many bytes they took.
+fn before_pack(
+  pack: &Pack<u64, u64>,
+  wanted: &[WantedRef<'_>],
+  format: ObjectFormat,
+  multiplexed: bool,
+  out: &mut Sink<'_>,
+) -> Result<(Response, u64), Refusal> {
+  let mut writer = Writer::new(format, multiplexed, out);
+  if let Some(acknowledgments) = &pack.acknowledgments {
+    writer.acknowledgments(acknowledgments)?;
+    writer.event(&Event::Delim)?;
+  }
+  if let Some(shallow_info) = &pack.shallow_info {
+    writer.shallow_info(shallow_info)?;
+  }
+  if !wanted.is_empty() {
+    writer.wanted_refs(wanted)?;
+  }
+  writer.event(&Event::Header(Line::lf(Section::Packfile)))?;
+  Ok(writer.finish())
+}
+
+/// Writes a response's events through its grammar ([`Response`]), counting the bytes.
+struct Writer<'o, 's> {
+  /// The grammar.
+  response: Response,
+  /// The bytes written so far.
+  at: u64,
+  /// Where they go.
+  out: &'o mut Sink<'s>,
+}
+
+impl<'o, 's> Writer<'o, 's> {
+  /// A writer of a response whose ids are in `format`, multiplexed throughout under `sideband-all`.
+  fn new(format: ObjectFormat, multiplexed: bool, out: &'o mut Sink<'s>) -> Writer<'o, 's> {
+    Writer {
+      response: Response::new(format, multiplexed),
+      at: 0,
+      out,
+    }
+  }
+
+  /// Writes `event` next.
+  fn event(&mut self, event: &Event<'_>) -> Result<(), Refusal> {
+    let wrote = self
+      .response
+      .write(event, self.at, self.out)
+      .map_err(Refusal::Wire)?;
+    self.at = self.at.saturating_add(wrote);
+    Ok(())
+  }
+
+  /// The grammar where the writing stopped, and the bytes written.
+  fn finish(self) -> (Response, u64) {
+    (self.response, self.at)
+  }
+
+  /// The acknowledgments section (`send_acks`): `NAK`, or an `ACK` for each common have, then `ready` where ready.
+  fn acknowledgments(&mut self, acknowledgments: &Acknowledgments) -> Result<(), Refusal> {
+    self.event(&Event::Header(Line::lf(Section::Acknowledgments)))?;
+    if acknowledgments.common.is_empty() {
+      self.event(&Event::Nak(Ending::Lf))?;
+    }
+    for id in &acknowledgments.common {
+      self.event(&Event::Ack(Line::lf(*id)))?;
+    }
+    if acknowledgments.ready {
+      self.event(&Event::Ready(Ending::Lf))?;
+    }
+    Ok(())
+  }
+
+  /// The shallow-info section (`send_shallow_info`) and its delimiter: each `shallow`, then each `unshallow`, without an
+  /// LF, as git writes them.
+  fn shallow_info(&mut self, shallow_info: &ShallowInfo) -> Result<(), Refusal> {
+    self.event(&Event::Header(Line::lf(Section::ShallowInfo)))?;
+    for id in &shallow_info.shallow {
+      self.event(&Event::Shallow(Line::bare(*id)))?;
+    }
+    for id in &shallow_info.unshallow {
+      self.event(&Event::Unshallow(Line::bare(*id)))?;
+    }
+    self.event(&Event::Delim)
+  }
+
+  /// The wanted-refs section (`send_wanted_ref_info`) and its delimiter: each ref wanted by name and its id, in the order
+  /// wanted.
+  fn wanted_refs(&mut self, wanted: &[WantedRef<'_>]) -> Result<(), Refusal> {
+    self.event(&Event::Header(Line::lf(Section::WantedRefs)))?;
+    for wanted_ref in wanted {
+      self.event(&Event::WantedRef(Line::lf(*wanted_ref)))?;
+    }
+    self.event(&Event::Delim)
+  }
+}
