@@ -4079,9 +4079,14 @@
 >   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
 >   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
 >   C-b: the reply deadline's other users,
->   each a wait that cannot see the departure yet: the wait for a slot on a full ring (a slot that frees wakes nothing),
->   a delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
->   borrows the reply deadline for its own. The async driver's tick since A-523 (2026-11-18, g251b; the rest of class
+>   each a wait that cannot see the departure yet: a delivery's read (Linux: the socket's readability), the macOS
+>   route's claim steps and the CLI's MCP edge, which borrows the reply deadline for its own. The synchronous send's
+>   wait for a slot on a full ring since A-523 (2026-11-18, g251b): it spun for a whole reply deadline (a second),
+>   asked the daemon's liveness at each one and paced its tries at a tenth of it; it now spins for the client's wake
+>   estimate, then parks, each pause twice the last and never past the next look, the looks on A-443's doubling
+>   (`RoomWait`, `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`). Owed: a slot that
+>   frees still wakes nothing, so a wait finds it within the time already waited; the daemon waking a client that
+>   waits for room, as it wakes one that waits for a reply, would end the wait at the slot. The async driver's tick since A-523 (2026-11-18, g251b; the rest of class
 >   C): each call asked the daemon's liveness at every reply deadline (a second); it now asks on A-443's doubling
 >   (`slates_ipc::looks`, shared with the synchronous reply wait), first at twice the longer of its wait when first
 >   judged and the client's wake estimate, so a departure is seen within the time waited and a call answered sooner
