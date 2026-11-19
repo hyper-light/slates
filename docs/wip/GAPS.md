@@ -79,6 +79,19 @@
 > a vector that reaches the checksums' collision refusal (no published collision begins with `PACK` or `\377tOc`).
 > A pack header's length is one number, A-582 part 3's `entry::PACK_HEADER_LEN`, which `pack` uses. Clippy, `xtask` and
 > the lint matrix over the change are main's (run requests).
+> **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers
+> it: the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
+> exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
+> applier once its base is resolved (an offset delta's by offset; a reference delta's through an index, `Locate`, which
+> A-591's `Idx` answers, or by name among the pack's objects; a later base waits, resolved at the end from sorted tables
+> with no recursion), and the trailer checked. A base found nowhere, one that is no entry, one an index misplaced, and a
+> chain that loops are refused by kind; every size is charged to the admission before it is built, so a chain's depth
+> is bounded by the admission. It holds an index's names to the objects read, which A-591 left to it. Golden vectors:
+> the `ofs`, `ref` and `sha256` packs stock git 2.50.1 wrote, every object as `verify-pack -v` lists it, read whole, a
+> byte at a time and through git's own index. `cargo test -p slates-git --lib`: 96 of 96 on the Mac Studio, the 20 new
+> failing first against a stub, red four ways. Owed: a thin pack's bases from the repository and an object too large to
+> hold, streamed into content (pieces 5 and 6); a duplicate object refused where the repository's index is built (git's
+> strict "appears twice", piece 5). Clippy, `xtask` and the lint matrix over the change are main's (run requests).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) (2026-11-19; UI goals 91 and

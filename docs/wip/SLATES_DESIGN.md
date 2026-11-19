@@ -11946,6 +11946,20 @@ engine: the verdict, rebase, position mapping, the register).
 > each CRC32 over its bytes), and writes an index byte for byte as git 2.50.1 does. Every checksum runs through
 > `object_name` (A-600); the CRC32 is zlib's, through `crc32fast`, the crate flate2 computes it with. Proven against the
 > packs, indexes and `verify-pack -v` listings stock git 2.50.1 wrote, one of them with its 8-byte table in use.
+>
+> **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
+> delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
+> inflated through flate2 over zlib-rs (A-607) into room for exactly the size its header names, then the trailer, which
+> must be the checksum of every byte before it. A stream that inflates past that size, ends short of it, never ends, or
+> that the inflater refuses (its Adler-32 included) is refused by kind. Each delta goes through A-582's applier once its
+> base is resolved: an offset delta's base by its offset in the pack, a reference delta's through an index (`Locate`,
+> which A-591's `Idx` answers) or among the pack's own objects by name. A delta whose base comes later waits, and is
+> resolved when the pack ends from tables sorted by base, with no recursion. One whose base is found nowhere, is no
+> entry, sits at an object of another name, or leads back to itself is refused by kind. Every size is charged to the
+> caller's admission before it is built, so a chain's depth is bounded by the admission, never by a number. It also
+> holds an index's names to the objects read. Proven against the three packs stock git 2.50.1 wrote: every object's
+> type, size, name, base and depth as `verify-pack -v` lists them, read whole, a byte at a time and through git's own
+> index.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -39689,3 +39703,83 @@ refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node
   detection), so they could not pass on it.
 - **Owed of piece 3.** The index's tables on §4.17.1's shared tables; then an existing store's import, its zlib and
   zstd revlog chunks inflated by A-607's engines, its tests holding inflated bytes.
+
+### A-608 — git's pack reader: a pack read as its bytes arrive, each entry inflated to exactly its size, deltas resolved through the applier, the trailer checked (2026-11-19, g258, UI goal 93 (kiln 51cef9f7); §4.17.2 "Pieces (git)" piece 3, "A push" item 3; after A-582 part 3, A-591, A-600, A-607)
+
+- **What.** `crates/git` (`unpack`). `Reader::read` takes the bytes a stream has delivered, in any cuts, and reads as
+  far as they go: the pack's header (A-591's `pack::read_header`), each entry's header (A-582 part 3's `entry::read`),
+  its data inflated through flate2 over zlib-rs (A-607) into room for exactly the size its header names, then the
+  trailer, which must be the checksum of every byte before it. An object stored whole is named (A-600's `name_of`) as
+  soon as its data ends. A delta is applied through A-582's applier as soon as its base is resolved: an offset delta's
+  base always lies before it; a reference delta's base is placed by the caller's index (`Locate`, which A-591's `Idx`
+  answers) or found among the pack's own objects by name. A delta whose base is not yet resolved waits. `Reader::finish`
+  resolves the waiting deltas from tables sorted by their base's entry and by their base's name, with an explicit stack
+  in place of recursion, as `index-pack`'s `resolve_deltas` finds a base's children; it then answers every object in
+  pack order with its place, its stored length and, for a delta, its base and depth. `read_whole` reads a pack held
+  whole, and `check_index` holds an index's names to the objects read from its pack (the same trailer, the same count,
+  each name at its own object's offset), which A-591 left to this piece.
+- **Sources** (git v2.50.1, read 2026-11-19). The document [B]: `gitformat-pack.adoc`, a pack's layout (lines 35-68) and
+  its deltas (95-175). The code [C]: `builtin/index-pack.c`, whose `unpack_entry_data` (476-518) inflates each entry
+  into a buffer of exactly its size and refuses it unless the stream ends there ("inflate returned %d");
+  `parse_pack_objects` hashes every byte before the trailer and compares it ("pack is corrupted (SHA1 mismatch)",
+  "premature end of pack file", "pack has junk at the end"); `resolve_deltas`; `conclude_pack` ("pack has %d unresolved
+  deltas").
+- **Refusals**, each typed and naming where it stopped:
+  - `Inflate`: no zlib stream the inflater accepts, its Adler-32 included. `LongerThanSize` and `ShorterThanSize`: data
+    past the header's size, judged before the stream's own error, or a stream ending short of it. `Truncated`: the
+    bytes ended inside the pack, a stream that never ends included.
+  - `BaseNotAnEntry`: a base offset, the delta's own or an index's, names no entry's first byte. `DeltaBaseMissing`: a
+    reference delta's base is in neither the pack nor the index. `BaseMisplaced`: the index placed a base at an object
+    of another name. `Cycle`: a chain whose bases lead back to itself, which only an index can make (an offset delta's
+    base always lies before it).
+  - The pack's header and trailer as A-591 refuses them, an entry's header as A-582 refuses it, a delta as the applier
+    refuses it, a collision attack in an object's content (A-600), and `TrailingBytes` after a pack given whole.
+- **Bounds.** The input bounds what is read and the caller's admission what is built, each size charged before it is
+  allocated (`try_reserve_exact`, so no allocation can panic): a record for each object the header counts, charged when
+  its twelve bytes are in; each entry's size, charged when its header is whole; each delta's target, charged by the
+  applier; and the tables of waiting deltas and of the answer. So a chain's depth is bounded by the admission, never by
+  a number: each delta in a chain is a target charged. The inflater's own state is one fixed size for a reader, not
+  scaled by the input, and is not charged.
+- **Golden vectors.** The three packs stock git 2.50.1 wrote: `ofs.pack` and `ref.pack` (A-582 part 1, offset and
+  reference deltas, SHA-1) and `sha256.pack` (A-591, offset deltas, SHA-256), with `git verify-pack -v`'s listing and
+  `git index-pack`'s index of each. Two deflate engines need not write the same compressed bytes, so the tests hold what
+  each stream means, its inflated bytes and the object's name, never a compressed byte of their own; the small packs the
+  tests build are deflated by this crate's engine.
+- **Tests** (`cargo test -p slates-git --lib`, 20 new):
+  - every object of the three packs reads as the listing says: its offset and stored length, its type, its name (and
+    the name `name_of` gives its content), and for a delta its base and depth (a chain of two in each), the trailer the
+    pack's own; the same read a byte at a time and in chunks of 2, 3, 7, 64 and 4096 bytes, and through git's own index,
+    which then holds to the objects read; another pack's index refused, one placing an object elsewhere refused, one of
+    another count refused;
+  - every cut of a small pack (SHA-1 and SHA-256), and each captured pack cut at each entry's edges and inside its
+    trailer, refused as `Truncated` at the cut; every bit flip of the small pack refused, among them the signature, the
+    version, an entry's header, the inflater, a base that is no entry, and the trailer;
+  - a missing base, a chain looping through an index (two deltas, and one placed at itself), a base that is no entry
+    (by offset, and by an index before and past the pack's end), a base an index misplaced (before and after the
+    delta), deltas before their bases, streams one byte long and one short, an unended stream (at the bytes' end, then
+    followed by a block the inflater refuses, then by one byte more), a changed byte under its Adler-32, the header and
+    the trailer, the admission (exact, one byte short, a header counting 2^32 - 1 objects under a mebibyte), a chain
+    300 deep (six times git's default `pack.depth`) read and refused under half its targets' admission, and bytes after
+    the trailer;
+  - a model oracle: any blobs and deltas in any order, offset deltas where the base lies before and reference deltas
+    where it lies after, read with no index, with an index placing every object, and fed in chunks of any size.
+- **Checks.** On the Mac Studio (kiln, debug, 2026-11-19). Failing first: the 20 new tests against a stub that refused
+  everything (r562, load 8.0) all failed, and the crate's other 76 passed. Then 96 of 96 under `--locked` (r581, load
+  8.4 to 9.2, 15.3 s), and `cargo fmt --check` was clean. Red four ways:
+  - the past-the-size guard removed: a stream one byte long was cut to its size and read as a blob `six b`, where
+    `LongerThanSize` was due, and the unended stream then fed a byte more read as `Inflate`;
+  - the trailer's comparison removed: a changed trailer read whole, where `Pack(Checksum)` was due;
+  - the misplaced-base check removed: the delta was applied to the wrong object and only the applier's `SourceSize`
+    caught it, where `BaseMisplaced` was due;
+  - the header's charge removed: a header counting 2^32 - 1 objects passed under a mebibyte, where `PastAdmission` was
+    due.
+- **Owed.** A thin pack's bases outside the pack, from the repository, with receive-pack and the object store (pieces 5
+  and 6). A duplicate object refused where the repository's index is built, as git's strict index-pack refuses it ("The
+  same object %s appears twice in the pack", piece 5). An object too large for the admission streamed into content
+  rather than held whole, as git streams a blob past `core.bigFileThreshold` (piece 5). The checks main runs: clippy,
+  the cross-target lint, `xtask` and the doc builds (run requests).
+
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`unpack.rs`, new, and its tests;
+`tests/pack_fixtures.rs`, the SHA-256 pack, each pack's format and index and the listing's depth;
+`entry::longest_header`; `lib.rs`'s module line; `Cargo.toml`, flate2 from the workspace); `Cargo.lock` (flate2 1.1.11
+and zlib-rs 0.6.8 alone).
