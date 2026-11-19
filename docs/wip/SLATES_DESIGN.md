@@ -37778,3 +37778,18 @@ a `more` that never stops them.
 - **What stays whole.** The gather's base-plane half (the loaded entries of each hinted directory) runs whole in the
   slice whose journal half reaches the head, and the byte states take every record through the head at a round's first
   slice. Both are in GAPS.
+- **Tests**, each on every host. `delivery`'s `a_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing`:
+  ten files made elsewhere, rounds of three records, the mount's own request served after the first; four rounds or
+  more, every file told once and in order, one round outgrown and every later slice resumed. `coherence`'s
+  `an_overrun_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing` (six slices of at most
+  three items, with forgets, handouts and an unlink between them), `falling_behind_again_mid_lap_owes_a_whole_lap_after_it`,
+  and the oracle `every_item_held_at_an_overrun_is_told_after_it_or_given_back` (2,000 generated histories of lookups,
+  forgets, unlinks, renames, overruns and slices against the lookup protocol's model). `journal`'s
+  `the_charge_after_any_sequence_crosses_segments_exactly`, with A-157's `every_rounds_backlog_equals_the_models`
+  unchanged. Green on the Mac Studio (M3 Ultra, kiln r260, 2026-11-19): vfs `journal::` 13 of 13, bridge-core
+  `delivery::` 1 of 1, bridge-fuse `kernel_holds` 5 of 5. Red three ways on the same run: the gather never asking
+  `more` (the old whole gather) failed the delivery test; the overrun walk never asking it (the old `everything_told`)
+  told all nineteen items in its first slice where six slices were due; and the ring's later segments credited with no
+  charge before them answered 13,503 bytes after sequence 128 where 105 waited. The Linux and Windows halves
+  (`channel.rs`, the server's `fuse.rs` and `winfsp.rs`) and the integration suites were not compiled here; they are
+  filed for main's lanes.
