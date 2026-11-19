@@ -252,6 +252,18 @@
 > encodes back byte for byte. This is main's answer to A-604's question: v0 and v2 read alike. Red first (2 of 39 v2
 > tests), then `cargo test -p slates-git --lib` 221 of 221 over main with it. Owed of A-624: `object-info` and `bundle-uri` read and
 > answered over a store trait, and the server's `packfile-uris` choice (piece 14's rest).
+> **A-624 part 2 (2026-11-19, g230; piece 14's rest):** `slates-git` (`v2`) reads `object-info` and `bundle-uri`
+> requests and answers them over traits: `object-info` as git 2.50.1 answers (`size` only when asked, an unknown
+> object's space alone, ids alone without `size`, no LF) from `ObjectSizes`, which A-614's store answers by its rows
+> (`Stored`); `bundle-uri` from a `BundleList` as git's server writes the same configuration, its answer read as git's
+> client reads it. And it makes the server's `packfile-uris` choice: the longest suffix of a fetch's units that eligible
+> URI packs tile, in the fewest packs, since git's client indexes the inline pack before any URI's; eligible under a
+> listed protocol then `:`, under `sideband-all`, and self-contained without `thin-pack`, as git's server and client
+> rule. Golden vectors (`fixtures/v2-rest`, SHA-256 checked): git's own answers in SHA-1 and SHA-256, a stock clone
+> through `bundle-uri` teed whole, and git's four `packfile-uris` decisions. Red first (21 tests against refusing
+> modules), then `cargo test -p slates-git --lib` 292 of 292, red ten ways by mutation. Owed: the store's own bundle
+> list and URI packs (each a run of A-614 part 2's fragments, its hash and URI) and the fetch path that asks for them
+> (piece 7); `object-info`'s `type`, which git's master adds, when a release ships it.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes

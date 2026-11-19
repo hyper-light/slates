@@ -12231,6 +12231,15 @@ engine: the verdict, rebase, position mapping, the register).
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
+>
+> **Status (2026-11-19, A-624 part 2: `object-info`, `bundle-uri` and the `packfile-uris` choice built).** `v2` reads
+> and answers `object-info` as git 2.50.1 does (the `size` line only when asked, an object the server lacks with its
+> space alone, ids alone without `size`, no LF), from `ObjectSizes`, which A-614's store answers by its rows; reads
+> `bundle-uri`'s answer as git's client reads it and writes a repository's `BundleList` as git's server writes the same
+> configuration; and chooses what a fetch sends by URI: the longest suffix of its units that eligible packs tile, in the
+> fewest packs, a pack eligible under a listed protocol and `sideband-all`, and self-contained without `thin-pack`.
+> Proven against stock git 2.50.1's own answers, a stock clone through `bundle-uri`, and its four `packfile-uris`
+> decisions. Owed: the store's bundle list and URI packs, and the fetch path that asks for them.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12281,7 +12290,8 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
 - Side band: during a pack, channel 1 carries the pack, 2 progress and 3 a fatal error [B: gitprotocol-v2 "packfile
   section"]; `ERR <text>` is the pack protocol's error line [B: gitprotocol-pack].
 - v2 capabilities advertised: `agent`, `ls-refs=unborn`, `fetch=shallow filter ref-in-want sideband-all packfile-uris
-  wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and `object-info`. `ls-refs` lists
+  wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and `object-info`, and `bundle-uri`
+  where the repository offers a bundle list (A-624). `ls-refs` lists
   only `unborn`, as git does (`ls-refs.c` `ls_refs_advertise`): `symrefs`, `peel` and `ref-prefix` are the command's
   base arguments, which need no feature [B: gitprotocol-v2 "ls-refs"]. A v0 or v1 fetch (the old ref advertisement and
   its negotiation) is piece 14; its codecs are built (A-604), and serving one is owed.
@@ -12388,8 +12398,10 @@ create or update a reference named "refs/for/master", but may create or update a
      `tree:<depth>`, `sparse:oid` and `combine:` choose objects by their index rows (size, depth, path).
    - `include-tag`, `ofs-delta`, `no-progress` and `sideband-all` behave as the protocol defines. With `packfile-uris`
      or `bundle-uri` the server may name the base pack and runs of fragments as static, content-addressed URIs that any
-     cache can hold.
-4. `object-info` answers type and size from the index rows.
+     cache can hold. git's client indexes the inline pack before it downloads any URI's (`fetch-pack.c`), so the inline
+     pack carries a prefix of the fetch's units, and the URI packs tile the rest, in order (A-624).
+4. `object-info` answers size from the index rows, git 2.50.1's one attribute; `type`, which git's master adds, when a
+   release ships it.
 
 **Large files.** Git LFS's batch API [B: git-lfs `docs/api/batch.md`, `basic-transfers.md`, `locking.md`]: a
 `POST` to `<repo>.git/info/lfs/objects/batch` names an `operation` (upload or download) and objects by SHA-256 `oid` and
@@ -41898,3 +41910,68 @@ Applied in the same change to:
   upper-cases an id's digit as the same id, written back as the original byte.
 - **Owed of A-624:** `object-info` and `bundle-uri`, read and answered over a store trait (A-614 builds the store), and
   the server's `packfile-uris` choice.
+
+### A-624 part 2 — v2's `object-info` and `bundle-uri`, read and answered over store traits, and the server's `packfile-uris` choice (2026-11-19, g230, UI goal 93; §4.17.2 "Pieces (git)" piece 14's rest, "The wire", "A fetch" items 3 and 4; after A-582 part 2, A-614 part 1 and A-624 part 1)
+Applied in the same change to:
+- §4.17.2's status, "The wire" (`bundle-uri` advertised where a repository offers a list), "A fetch" item 3 (the
+  inline pack a prefix of the units, the URI packs tiling the rest) and item 4 (`object-info` answers size, git 2.50.1's
+  one attribute); GAPS (the §4.17 entry); `research/vcs-servers.md` §5.6, and §5.4's owed reading discharged;
+- `crates/git/src/v2` (`object_info.rs`, `bundle_uri.rs` and `packfile_uris.rs`, new; `request.rs` reads both
+  commands; `mod.rs`); their tests, and the shared golden tests (`tests/mod.rs`: two message kinds, nineteen new golden
+  streams through every cut, every bit flip and random streams); `crates/git/fixtures/v2-rest` with
+  `make-v2-rest-fixtures.sh`, and `tests/v2_rest_fixtures.rs`.
+- **`object-info`, as git 2.50.1 answers** (`protocol-caps.c`). The arguments are `size` and `oid <id>`. A request
+  naming no object gets the flush alone; otherwise `size` where it was asked for, then each object's line in the order
+  named, its id and size, an object the server lacks as its id and a space, ids alone without `size`, every line
+  without an LF where the grammar puts one. A request git answers with an `ERR` line and goes on (an argument it does not
+  know, an id it cannot read) is refused here by kind before any answer, as `fetch`'s and `ls-refs`'s are. git echoes
+  each id as its client wrote it; this writes `oid_to_hex`'s lower case, A-624's rule, the same bytes for every client
+  git ships. The answer asks a repository one thing (`ObjectSizes`); A-614's store answers it by its rows (`Stored`,
+  an object with no row unknown, so a push's objects stay hidden until its verdict, as git's quarantine hides them).
+  git's master adds a `type` attribute; it is owed when a release ships it.
+- **`bundle-uri`** (`bundle-uri.c`, `connect.c`). The request takes no argument and one is refused, as git's server
+  dies on it. The answer's lines are read as git's client reads them: split at the first `=`; a line with no `=`, an
+  empty key or value, a key outside `bundle.`, a version other than 1 (canonical decimal), a mode other than `all` and
+  `any` is refused by kind; keys and heuristics git does not know are kept by name. A bundle's second `uri`, which git's
+  client also refuses, is a rule of the list, not of a line; `answer` cannot write one. `answer` writes a repository's
+  `BundleList` as git's server writes the same configuration: `bundle.version=1`, `bundle.mode`, `bundle.heuristic`
+  where there is one, then each bundle's `uri` and `creationtoken`, keys in git's configuration case, no LF; a
+  repository offering no list gets the flush alone. An id that is empty or holds `=`, or an empty URI, is refused, since
+  git's client could not read it back.
+- **The `packfile-uris` choice.** §4.17.2 let the server name the base pack and runs of fragments by URI; this states
+  which. git's client indexes the inline pack first and only then downloads each URI's pack, in the order listed, each
+  indexed with the inline pack's arguments (`fetch-pack.c`), so a delta's base is completed from the repository
+  (`--fix-thin`, under `thin-pack` only) but never from a URI pack still to come. So the inline pack carries a prefix of
+  the fetch's units (the base pack where it is a clone, then each version's fragment), and the URI packs tile the rest
+  exactly, in order; without `thin-pack` only a self-contained pack may go by URI. A pack goes to a client only as git's
+  server allows: its URI begins with a protocol the request lists, then `:` (`pack-objects.c`), and only under
+  `sideband-all` (`upload-pack.c` clears the list without it). Of the tilings, the longest suffix in the fewest packs,
+  found from the run's end back over the offered packs by their first unit, in time and room in proportion to the packs
+  offered whatever the run's length, charged to the caller's admission first. So a base pack offered alone is never
+  sent by URI to a clone that needs the fragments after it: they would have to come inline, after it.
+- **Golden vectors.** `make-v2-rest-fixtures.sh` (git 2.50.1, Apple Git-155, on the MacBook, 2026-11-19; run twice, 30
+  files byte for byte alike, no local path in any byte, the bundle's URI relative). git ships no `object-info` client,
+  so its requests are written by the script and answered by `upload-pack --stateless-rpc`: sizes of a blob, a tree, a
+  commit, a larger blob and an object the server lacks; ids alone; no id; an upper-case id; and the same in a SHA-256
+  repository. A stock clone with `transfer.bundleURI` on, its whole session teed: the client asked for the list,
+  downloaded the bundle by its relative URI, filed it as `refs/bundles/heads/base`, and fetched with the bundle's commit
+  as a `have`. A stateless `bundle-uri` exchange. Fetches from a server naming the larger blob's pack by URI
+  (`uploadpack.blobPackfileUri`), taken as `https`, as `http` only, without `sideband-all`, and as `ftp,https`. Every
+  object of the SHA-1 repository as loose bytes, for the store test.
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 292 of 292, fmt clean).
+  Each answer is the one stock git wrote from the same objects, from a plain list and from A-614's store itself (every
+  object pushed, a branch moved, the answer read from the rows); an upper-case id is read and answered in lower case,
+  where git echoed it; the bundle list is answered with every byte git wrote, and the stock clone's session reads and
+  writes back message by message; git's four `packfile-uris` decisions are made here and the section's lines are the
+  ones git wrote; the choice equals a brute-force oracle over generated runs, offers and requests; refusal tables for
+  each grammar; nothing written on a refusal; admissions charged exactly.
+  - Red first: the tests against modules whose every entry point refuses, 21 failed (the 18 new and three shared golden
+    tests that carry the new streams); the checksum test passes alone.
+  - Red ten ways by mutation, each on a copy and caught by the test that names its rule: the `size` line written with no
+    object named; an unknown object written without its space; the store's size read off by one; a size read with no
+    `size` line before it; a bundle list of version 2 read; the creation token's key in the documentation's case
+    (`creationToken`, where git's configuration writes `creationtoken`); URIs offered without `sideband-all`; a
+    protocol taken as a bare prefix (`http` for `https`); a thin pack offered without `thin-pack`; the shortest tiled
+    suffix chosen instead of the longest. A control passed 59 of 59.
+- **Owed:** the store's own bundle list and URI packs (each a run of A-614 part 2's fragments, with its hash and URI),
+  and the fetch path that asks for them (piece 7); `object-info`'s `type` when a git release ships it.
