@@ -37741,3 +37741,39 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
   `host.rs` and the server's `winfsp.rs`, and the drive tests
   `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` and
   `an_exact_drive_keeps_two_spellings_two_files` (`crates/cli/tests/winfsp_semantics.rs`).
+
+### A-562 — Every round a mount builds on its serving thread is sliced under one turn budget: the journal gather by record, A-141's overrun round by node then name, with A-158's takeover round (2026-11-18, g230, UI goal 85's B9; §4.6 "Cache posture", CLAUDE.md bounded work; amends A-141, A-158)
+Applied in the same change to: GAPS (the whole rounds' entry closed; the two walks still whole recorded), §4.6,
+`crates/bridge-core/src/lib.rs` (`Bridge::invalidations` takes `more`), `delivery.rs` (`Coherence::deliver` takes
+`more`; `Delivered::cut`, `Coherence::owes`, `Coherence::take_sliced_counts`; `served_own_request` moves the cursor only
+after a whole round), `scoped.rs`, `volume_bridge.rs` (the gather walks one record at a time), `crates/vfs/src/journal.rs`
+(the ring's per-segment running charges; `note_round` costs a segment's records at most),
+`crates/bridge-fuse/src/coherence.rs` (`OverrunRound`; `KernelHolds::invalidate_everything` gone, `name_after`),
+`channel.rs` (`everything_told` gone; one `TurnSlice` a turn shared by the three rounds; `ServeState::owes_round_now`
+replaces `owes_takeover_round`; `take_sliced_counts`; `told_through` bounded while an overrun round is owed; the byte
+states fed once a record across slices, `states_fed_through`, and a write-back's pending records counted from it;
+`slice_ns` is `None`, rounds whole, until an owner bounds it), `crates/server/src/fuse.rs` (the wake while any round is
+owed; the turn's budget is `copy_slice_ns`, `TAKEOVER_SLICE_PERMILLE` gone; `fuse.rounds_outgrown`,
+`fuse.slices_resumed`), `winfsp.rs` (the gather sliced the same way, `Turned::Continued`, `winfsp.rounds_outgrown`,
+`winfsp.slices_resumed`), `config.rs` (`copy_slice_ns` names the rounds), and the integration tests' gathers, which pass
+a `more` that never stops them.
+- **What was there.** A mount that fell behind the journal's retention built its whole overrun round in one turn: every
+  node and name its kernel held, tens of thousands for a tree a build walked, each message built on the serving thread.
+  Every round's gather walked the whole backlog since its cursor in one turn too, resolving each record's path, and
+  measured the backlog by walking it once more (`note_round`). The takeover round alone was sliced (A-158).
+- **The rule.** One budget bounds a turn's rounds together, half the shard's live step quantum: the takeover round's
+  slice, the gather's and the overrun round's take what is left of it in that order, and at least one item each, so
+  every round owed moves on at every turn. The gather asks before each record after its first and hands back the cursor
+  through the last record it took; the overrun round walks the root, the nodes by id, then the names by
+  `(parent, name)`, taking each name away as it is told. Neither loses an item: the cursor never passes a record not
+  gathered, and an item the kernel held at an overrun stays in the set until the walk tells it, unless the kernel gives
+  it back, which needs nothing. An item handed out after the overrun was answered fresh. A mount that falls behind again
+  mid-lap owes a whole lap after it, so every item is told within two laps of any overrun. The mount turns at once while
+  a round is owed and none is out. Until its overrun round is told whole, `told_through` answers where the mount fell
+  behind, so a writer outside FUSE waits on it (AC-3.3). A request the mount serves after a cut gather leaves the cursor
+  where it is, so the rest of the round is not skipped. A round's backlog is measured at each slice from per-segment
+  running charges: the charge after a point is the charge pushed less the charge before that point's segment, less a
+  segment's records at most.
+- **What stays whole.** The gather's base-plane half (the loaded entries of each hinted directory) runs whole in the
+  slice whose journal half reaches the head, and the byte states take every record through the head at a round's first
+  slice. Both are in GAPS.
