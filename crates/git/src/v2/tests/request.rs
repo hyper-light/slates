@@ -304,7 +304,6 @@ fn a_request_out_of_its_grammar_is_refused_by_kind() {
   let fetch = Packet::Data(b"command=fetch\n");
   let ls = Packet::Data(b"command=ls-refs\n");
   let want = format!("want {MAIN}\n");
-  let upper = format!("want {}\n", MAIN.to_uppercase());
   let trailing = format!("want {MAIN} side\n");
   let short = format!("want {}\n", &MAIN[..39]);
   let cases = [
@@ -401,18 +400,6 @@ fn a_request_out_of_its_grammar_is_refused_by_kind() {
         Packet::Flush,
       ]),
       Refusal::UnknownArgument { at: 22 },
-    ),
-    (
-      wire(&[
-        fetch,
-        Packet::Delim,
-        Packet::Data(upper.as_bytes()),
-        Packet::Flush,
-      ]),
-      Refusal::ObjectId {
-        at: 22,
-        refusal: HexRefusal::NotHex { at: 0 },
-      },
     ),
     (
       wire(&[

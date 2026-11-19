@@ -134,7 +134,7 @@ fn an_upper_case_id_in_an_answer_is_read_and_written_back_in_lower_case() {
 
 /// A-582 part 2: do decode answer lines out of the grammar, one fault each. Expect: each refused by its kind at the
 /// line: an attribute twice, an attribute git does not write, a line with no name, a name or target that is no ref
-/// name, an id in upper case, a delimiter, the bytes ending early or going on.
+/// name, a peeled id too short, a delimiter, the bytes ending early or going on.
 #[test]
 fn an_answer_line_out_of_its_grammar_is_refused_by_kind() {
   let line = |text: String| wire(&[Packet::Data(text.as_bytes()), Packet::Flush]);
@@ -166,13 +166,6 @@ fn an_answer_line_out_of_its_grammar_is_refused_by_kind() {
     (
       line(format!("{MAIN} HEAD symref-target:main\n")),
       Refusal::Refname { at: 0 },
-    ),
-    (
-      line(format!("{} refs/heads/main\n", MAIN.to_uppercase())),
-      Refusal::ObjectId {
-        at: 0,
-        refusal: HexRefusal::NotHex { at: 0 },
-      },
     ),
     (
       line(format!("{MAIN} refs/tags/v1 peeled:{}\n", &MAIN[..20])),
