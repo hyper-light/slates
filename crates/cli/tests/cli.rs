@@ -13546,3 +13546,84 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   assert!(head.contains("www-authenticate: bearer realm="), "{head}");
   assert!(!head.contains("basic"), "{head}");
 }
+
+/// Format: the start of the daemon's line naming where its svn:// listener serves (`crates/api/src/role/daemon.rs`),
+/// here on the loopback address the test asks for; the port follows.
+const VCS_SVN_LINE: &str = "slates daemon: the svn:// listener serves on 127.0.0.1:";
+
+/// Format: `svnserve`'s greeting, the server's first bytes on every connection, as stock `svnserve` 1.15.0 wrote it
+/// (`crates/svn/fixtures/handshake/no-repository.server.bin`, recorded on the Mac Studio, 2026-11-19).
+const SVNSERVE_GREETING: &str = "( success ( 2 2 ( ) ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries \
+  commit-revprops depth log-revprops atomic-revprops partial-replay inherited-props ephemeral-txnprops \
+  file-revs-reverse list ) ) ) ";
+
+/// A-656 part 2 (§4.17.4 piece 7: the svn:// listener). Do: start an anchor whose daemon is asked for the svn://
+/// listener on loopback, on a port the system picks (`--vcs-svn 127.0.0.1:0`); read the port the daemon names; connect
+/// as stock `svn` 1.15.0 does and answer the greeting with its capabilities and a URL naming the repository `missing`
+/// (`crates/svn/fixtures/handshake/no-repository.client.bin`, the URL's port the listener's). Expect: the daemon names
+/// the listener's port before it says it serves; the connection greets as `svnserve` greets, byte for byte; the answer
+/// is refused as `svnserve` refuses a URL no repository holds, "No repository found" (210005), and the connection
+/// ends: the flag went from the anchor to its daemon, which runs A-656's connection on each connection it accepts.
+#[test]
+fn an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener() {
+  use std::io::{BufRead, Read, Write};
+  let instance = format!("cli-vcs-svn-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-svn",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let mut port = None;
+  let mut line = String::new();
+  loop {
+    line.clear();
+    let read = stderr.read_line(&mut line).unwrap();
+    assert!(
+      read > 0,
+      "the anchor ended before its daemon served (its lines are above)"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    if let Some(rest) = line.strip_prefix(VCS_SVN_LINE) {
+      port = rest.trim().parse::<u16>().ok();
+    }
+    if line.starts_with(&serving_line) {
+      break;
+    }
+  }
+  anchor.drain = Some(echo_the_rest(stderr));
+  let port = port.expect("the daemon named its svn:// listener's port before it served");
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  stream.set_read_timeout(Some(WAIT_FOR)).unwrap();
+  let mut greeting = vec![0u8; SVNSERVE_GREETING.len()];
+  stream.read_exact(&mut greeting).unwrap();
+  assert_eq!(String::from_utf8_lossy(&greeting), SVNSERVE_GREETING);
+  let url = format!("svn://127.0.0.1:{port}/missing");
+  let answer = format!(
+    "( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) {}:{url} \
+     39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ",
+    url.len()
+  );
+  stream.write_all(answer.as_bytes()).unwrap();
+  let mut refusal = Vec::new();
+  stream.read_to_end(&mut refusal).unwrap();
+  let words = format!("No repository found in '{url}'");
+  let expected = format!("( failure ( ( 210005 {}:{words} 0: 0 ) ) ) ", words.len());
+  assert_eq!(String::from_utf8_lossy(&refusal), expected);
+}
