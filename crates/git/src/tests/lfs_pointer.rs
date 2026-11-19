@@ -314,7 +314,8 @@ fn the_empty_file_is_the_empty_pointer() {
 fn a_blob_of_1024_bytes_or_more_is_no_pointer() {
   let text = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{OID}\nsize 12345\n");
   let padded = |len: usize| format!("{text}{}", " ".repeat(len - text.len()));
-  let read_padded = read(padded(CUTOFF - 1).as_bytes()).unwrap();
+  let below = padded(CUTOFF - 1);
+  let read_padded = read(below.as_bytes()).unwrap();
   assert_eq!(
     (read_padded.pointer, read_padded.canonical),
     (plain(), false)
@@ -358,7 +359,8 @@ fn sizes_are_read_as_go_reads_them() {
     ("-0", 0, false),
     ("9223372036854775807", i64::MAX.unsigned_abs(), true),
   ] {
-    let read = read(with(size).as_bytes()).unwrap();
+    let text = with(size);
+    let read = read(text.as_bytes()).unwrap();
     assert_eq!(
       (read.pointer.size, read.canonical),
       (value, canonical),

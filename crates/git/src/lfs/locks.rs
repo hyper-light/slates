@@ -132,7 +132,7 @@ fn once(seen: bool, field: Field, at: u64) -> Result<(), Refusal> {
 }
 
 /// Validates `body` and enters its object: the cursor, and where the body begins.
-fn open(body: &[u8], admission: &mut Admission) -> Result<(Cursor<'_>, u64), Refusal> {
+fn open<'a>(body: &'a [u8], admission: &mut Admission) -> Result<(Cursor<'a>, u64), Refusal> {
   json::validate(body, admission).map_err(Refusal::Json)?;
   let mut cursor = Cursor::new(body);
   let start = cursor.position();

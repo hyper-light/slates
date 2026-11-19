@@ -66,7 +66,7 @@ const CONTINUATION: u8 = 0x80;
 const MAX_UTF8_LEN: usize = 4;
 
 /// The version URL a pointer named.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Version {
   /// `https://git-lfs.github.com/spec/v1`, the one git-lfs writes.
   V1,
