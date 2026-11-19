@@ -12187,8 +12187,10 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
 >     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
 >     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
->   - A-555's remainder: parking a FUSE request (Linux: held off the device and dispatched again when its fetch lands;
->     answered `EAGAIN` until then); WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
+>   - A-555's third piece written (Linux-only, not compiled by its author, filed for main's build): a FUSE request that
+>     met a pending fetch is kept off the device by its mount, waits on a task of the shard for that fetch, and is
+>     dispatched again before the device is read (`crate::fuse`'s `keep`, `slates_bridge_fuse::channel::dispatch_kept`).
+>   - A-555's remainder: WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
 >     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of
 >     a volume over an S3 base through a daemon, its fetch answered by `SimS3`, once a volume over an S3 base can be
 >     made. A volume destroyed (or its host replaced) while requests wait on its fetches leaves them to their deadline,
