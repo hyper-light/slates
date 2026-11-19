@@ -12710,6 +12710,22 @@ signature verification).
 > (`crates/hg/fixtures/serve`): eight answers byte for byte. Owed of piece 4: the changegroup the choice names (its
 > manifests and files, held deltas or full texts), the bundle2 a `getbundle` answers, then `slates hg serve --stdio`'s
 > loop and HTTP version 1; the heads the index keeps will replace the walks over the whole view.
+>
+> **Status (2026-11-19, A-619 part 2: a `getbundle`'s answer).** `serve::getbundle` writes the bundle2 stream 7.2's
+> `getbundlechunks` writes, over a `Store` (the served view with its changeset texts, its manifest and file logs and its
+> markers): `CHANGEGROUP` in the highest version among `02` and `03` the client reads, carrying the missing changesets,
+> every manifest they name (7.2 prunes none outside an ellipsis clone) and the file revisions at the paths they list
+> whose file log's link the client lacks, each as its full text against the null base; `BOOKMARKS`, a `LISTKEYS` part
+> for each namespace asked, `OBSMARKERS` (the relevant markers in 7.2's order, in the newest format both read) and
+> `PHASE-HEADS`. A part the client cannot read is refused by kind, as 7.2 aborts, and a bundle1 is not served. Proven by
+> `cargo test --locked -p slates-hg --lib` on the Mac Studio, 208 of 208, red first (9 of 9 failed against stubs): three
+> sessions of a stock 7.2 client against stock `hg serve --stdio` 7.2 (`crates/hg/fixtures/serve`: a clone, a pull, an
+> incoming), each `getbundle` answered as 7.2 meant it (the same parts and parameters, every payload but the changegroup
+> byte for byte, the changegroup revision by revision, every node the hash of its parents and text); a model of 7.2's
+> packer (each manifest's delta read against a parent, or whole) on generated histories, equal on every manifest and
+> every file revision the client lacks; hostile requests. Owed of piece 4: `slates hg serve --stdio`'s loop (a bundle2
+> request's abort answered as an `error:abort` part), HTTP version 1, held deltas in place of full texts, and the
+> index's kept heads in place of the walks.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13102,8 +13118,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
    Mercurial's naming as its `Naming`. Owed: the import's walk of a store.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
-   (A-619 part 1, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets and its
-   phase heads and bookmarks; owed: the changegroup and bundle2 assembly, the stdio loop, HTTP.
+   (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
+   with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; owed: the stdio loop,
+   HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
@@ -42430,3 +42447,60 @@ Applied in the same change to:
   and the green; one post-state assembly for pushes and the server's works (`verbs::assemble_post_state`); the
   server's checkout reads `slates.vcs.head` as a difference it cannot write (`checkout.rs` `unwritten_of`), which a
   checkout of a repository's green must pass over.
+
+### A-619 (part 2) — Mercurial's read serving, part 2: a `getbundle`'s answer, its bundle2 stream and changegroup over a store, held to three captured sessions of stock Mercurial 7.2 (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone" items 2 to 4, piece 4; §4.9; A-545, A-569, A-598, A-619 part 1)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve::getbundle`, new: the
+`Store` trait, `Logged`, `Asked`, `getbundle`, `changegroup`; `serve::Refusal` gains `NoBundle2`, `NoCommonExchange` and
+`Store`; `fixtures/serve/` gains the three sessions with their states and bookmarks and `incoming.txt`, `SHA256SUMS` now
+twenty lines), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (§19).
+- **What it does.** `getbundle(store, asked, admission, out)` writes the bundle2 stream of 7.2's `getbundlechunks` for a
+  request's arguments as the wire carried them, over a `Store`: the served view (A-619 part 1's `Repository`) with its
+  changeset texts, manifest and file revisions (each with its log position, parents, link, flags and text), the node a
+  manifest names at a path, and the markers. Parts in 7.2's order, each where asked: `CHANGEGROUP` (the highest of `02`
+  and `03` the client lists, `version` mandatory, `nbchanges` advisory), `BOOKMARKS`, a `LISTKEYS` part per namespace
+  (`csv`: an empty item is a namespace), `OBSMARKERS` and `PHASE-HEADS`; every part's bytes and the stream's length
+  charged to the request's admission first.
+- **The changegroup.** The missing changesets oldest first; every manifest they name, linked to the first that names it,
+  none left out (7.2's `_prunemanifests` keeps every one outside an ellipsis clone); then, by path, for each path a
+  missing changeset lists, the file revisions the missing changesets' manifests name there, each linked to the first,
+  those whose file log's link the client holds left out (`generatefiles`); each group in its log's order. Every revision
+  is its full text against the null base, which every reader takes; held and computed deltas are the learned delta
+  choice's, owed.
+- **Decided: the paths listed, not the manifests' deltas.** 7.2 finds file revisions by reading each sent manifest's
+  delta against a parent (`read_delta_parents(exact=False)`, the whole manifest where its revlog stored it otherwise),
+  which depends on its revlog's delta choices. Taking the node each missing changeset's manifest names at each path it
+  lists yields the same revisions with the same links, except that 7.2 now and then resends a revision the client holds,
+  when its file log links it to a changeset neither held nor sent and a whole-stored manifest yields it; the model's
+  hand-built case reaches it. The client keeps one copy either way.
+- **From the sources.** 7.2's `exchange.py` (`getbundlechunks`, `bundle2requested`, `_getbundlechangegrouppart`,
+  `_getbundlebookmarkpart`, `_getbundlelistkeysparts`, `_getbundleobsmarkerpart`, `_getbundlephasespart`,
+  `_getbundletagsfnodes`), `changegroup.py` (`cgpacker`: `lookupcl`, `generatemanifests`, `_prunemanifests`,
+  `lookupmflinknode`, `generatefiles`, `deltagroup`), `manifest.py` (`read_delta_parents`), `obsolete.py`
+  (`relevantmarkers`, `commonversion`), `obsutil.py` (`sortedmarkers`), `bundle2.py` (`buildobsmarkerspart`) and
+  `wireprotov1server.py` (`getbundle`'s argument types, its abort answer), read from the wheel `uv` installs on the Mac
+  Studio (`mercurial==7.2`).
+- **Stricter than 7.2, or apart from it, on purpose.** A bundle1 (no bundle capability starting `HG2`) and version 01 (a
+  client listing no served version) are refused, not served. An unknown head is refused before any part (7.2 fails
+  inside the first part that reads it, and its markers part passes it over). `HGTAGSFNODES`, advisory, is never sent
+  (7.2 sends only what its tag cache holds). Markers sort by 7.2's whole tuple; a format 0 marker by its metadata as
+  held (7.2 lifts its date and parents out first; it writes format 1).
+- **Golden vectors.** `crates/hg/fixtures/serve`: the script's three sessions, a stock 7.2 client (PyPI through `uvx`,
+  CPython 3.12) cloning, pulling after a public commit under the `main` bookmark, and asking `incoming` after a draft
+  commit, through an ssh stand-in that records both directions, each with the served view and bookmarks dumped before
+  it, on the Mac Studio, 2026-11-19; brought here by a kiln program as `tar | base64` and every file checked against the
+  Studio's `SHA256SUMS`, 20 of 20.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 208 of 208 (load 8.4), 9 of
+  them this part's; red first against stubs of `getbundle` and `changegroup`, 9 of 9 failed (199 passed); `cargo fmt -p
+  slates-hg -- --check` clean. Golden: each session's `getbundle` asked again of a store rebuilt from what 7.2 had sent
+  up to it, the same parts with the same ids and parameters, every payload but the changegroup byte for byte, the
+  changegroup revision by revision (node, parents, link, flags, full text), every node the hash of its parents and text;
+  the incoming's `listkeys phases` byte for byte. Model (proptest): generated histories filled with files (branches
+  making one revision alike, merges taking a side's revision unlisted, empty changesets reusing their parent's manifest,
+  each manifest's delta stored against a parent or whole), packed by this module and by 7.2's packer stated literally,
+  equal on every manifest and every file revision the client lacks; its non-vacuity a hand-built history where 7.2
+  resends a held revision. Hostile: a bundle1, version 01 alone or unlisted, bookmarks, phases and markers a client
+  cannot read, a store that lost a changeset's text, a manifest or a file revision, every admission short of the answer,
+  and arbitrary arguments: each refused by kind, none panicking.
+- **Owed.** `slates hg serve --stdio`'s loop over the SSH version 1 codec (`hello`, `between`, `protocaps`, `batch` and
+  the commands built, a bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas,
+  `obsolete`'s `listkeys` dump, and the index's kept heads in place of the walks.

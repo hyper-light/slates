@@ -359,12 +359,19 @@
 > a graph naming a parent after its child refused; proven by `cargo test --locked -p slates-hg --lib`, 182 of 182 on the
 > Mac Studio (2026-11-19, debug, load 6.5), red first against stubs (7 of 7 failed), against a naive oracle on generated
 > histories, 7.2's set discovery driven to the shared set (its rounds counted), and a probe of stock `hg serve --stdio`
-> 7.2 (`crates/hg/fixtures/serve/make-serve-fixtures.sh`): eight answers byte for byte. Owed, in order, after §4.17.1's
+> 7.2 (`crates/hg/fixtures/serve/make-serve-fixtures.sh`): eight answers byte for byte. **Built (A-619 part 2):** a
+> `getbundle`'s answer over a `Store` (changeset texts, manifest and file logs, markers): the bundle2 parts in 7.2's
+> order through the built codecs, the changegroup of full texts (every manifest the missing changesets name, file
+> revisions left out where their log's link is common), markers in `sortedmarkers`' order, a part the client cannot read
+> refused by kind; proven by `cargo test --locked -p slates-hg --lib`, 208 of 208 on the Mac Studio (2026-11-19, debug,
+> load 8.4), red first against stubs (9 of 9 failed), against three captured sessions of stock 7.2 (a clone, a pull, an
+> incoming) by meaning, a model of 7.2's packer on generated histories, and hostile requests. Owed, in order, after
+> §4.17.1's
 > seven pieces: (3, rest) the import's walk of a store (the fncache, the path encodings, a version 2 store's file index)
-> and censored, ellipsis and externally stored revisions; (4, rest) read serving: the changegroup and the bundle2 a
-> `getbundle` answers (A-619 part 2), `obsolete`'s `listkeys` dump and the `obsmarkers` part, `slates hg serve
-> --stdio`'s loop, HTTP version 1, the `0.2` answers compressed by A-598's engines at the learned level, and the index's
-> kept heads in place of the walks over the whole view; (5) pushes, a compressed bundle inflated in slices within the
+> and censored, ellipsis and externally stored revisions; (4, rest) read serving: `obsolete`'s `listkeys` dump, `slates
+> hg serve --stdio`'s loop (a bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas in
+> place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads
+> in place of the walks over the whole view; (5) pushes, a compressed bundle inflated in slices within the
 > shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the changesets
 > the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream
 > clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
