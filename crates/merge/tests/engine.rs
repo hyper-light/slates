@@ -1307,3 +1307,38 @@ fn assert_walks_match_from(green: &Green) {
   }
   assert_eq!(green.changes_recounted(), green.changes_bytes());
 }
+
+/// §4.16 "The verdict" (perf's deferral, 2026-11-11). Do: a green holding `a` and `b`; another work overwrites `b`'s
+/// first byte; then a work based before it overwrites `a` (clean) and `b`'s first byte with other bytes (a conflict).
+/// Expect: the conflict, `a` unchanged, and no mapped file made, though `a`'s merge was clean. Then a work overwriting
+/// `a` alone is accepted: one mapped file made, holding exactly the bytes the overwrite gives. Made in the verdict, the
+/// conflict had built `a`'s new file and thrown it away.
+#[test]
+fn a_conflicting_verdict_makes_no_file_and_an_accept_makes_each_once() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("a", b"aaaa").at(1, 0));
+  green.submit(&Build::new().create("b", b"bbbb").at(2, 1));
+  green.submit(&Build::new().overwrite("b", 0, b"X").at(3, 2));
+  let before = green.mapped_files_made();
+  let outcome = green.submit(
+    &Build::new()
+      .overwrite("a", 1, b"A")
+      .overwrite("b", 0, b"Y")
+      .at(4, 2),
+  );
+  assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
+  assert_eq!(green.content("a"), Some(b"aaaa".as_slice()));
+  assert_eq!(
+    green.mapped_files_made(),
+    before,
+    "a conflict makes no file"
+  );
+  let outcome = green.submit(&Build::new().overwrite("a", 1, b"A").at(5, 3));
+  assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+  assert_eq!(green.content("a"), Some(b"aAaa".as_slice()));
+  assert_eq!(
+    green.mapped_files_made(),
+    before + 1,
+    "an accept makes its one file once"
+  );
+}
