@@ -1,0 +1,6 @@
+object zz
+type commit
+tag v
+tagger T A Gger <tagger@example.com> 1234567890 -0000
+
+m
