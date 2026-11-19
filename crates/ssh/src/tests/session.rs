@@ -10,7 +10,7 @@ use crate::packet::MAX_PACKET_EVERY_PEER_ACCEPTS;
 use crate::session::{Session, SessionConfig, SessionEvent, SessionRefusal, SessionUse};
 use crate::support::{Seeded, hex_array};
 use crate::transport::TransportConfig;
-use crate::userauth::{AuthRefusal, Authenticated};
+use crate::userauth::{AuthRefusal, Authenticated, Holding};
 use crate::userauth_tests::{Holders, ed_signature, first_key, query, request, signed};
 
 /// The session channel's window in these tests, unless a test sets its own.
@@ -49,6 +49,7 @@ fn config() -> SessionConfig {
 fn store() -> Holders {
   Holders {
     entries: vec![(b"git".to_vec(), first_key().blob, 7, 1)],
+    unknown: false,
   }
 }
 
@@ -58,16 +59,25 @@ struct Pair {
   client: Client,
   events: Vec<SessionEvent<u32>>,
   now: u64,
+  /// The client's bytes the server has not taken: kept until it reads again, as the SSH edge keeps them, since `receive`
+  /// takes fewer than all while an event or a key lookup waits on its caller.
+  unread: Vec<u8>,
 }
 
 impl Pair {
   fn new(config: SessionConfig, options: ClientOptions) -> Self {
-    let server = Session::new(config, host_key(), Seeded::new(1), store(), 0).unwrap();
+    Self::with_holders(config, options, store())
+  }
+
+  /// A pair whose server's key lookup is `holders`.
+  fn with_holders(config: SessionConfig, options: ClientOptions, holders: Holders) -> Self {
+    let server = Session::new(config, host_key(), Seeded::new(1), holders, 0).unwrap();
     Self {
       server,
       client: Client::new(options),
       events: Vec::new(),
       now: 0,
+      unread: Vec::new(),
     }
   }
 
@@ -102,19 +112,28 @@ impl Pair {
       }
       stalls += u32::from(!moved);
     }
+    self.unread = rest.to_vec();
     Ok(())
   }
 
-  /// Moves bytes both ways until neither side sends anything.
+  /// Moves bytes both ways until neither side sends anything, or the server takes none of the client's held bytes and
+  /// so waits on its caller (a key lookup).
   fn pump(&mut self) -> Result<(), SessionRefusal> {
     for _ in 0..1_000 {
       let sent = self.to_client();
-      let input = self.client.take_output();
-      if !sent && input.is_empty() {
+      let fresh = self.client.take_output();
+      let held = self.unread.len();
+      if !sent && fresh.is_empty() && held == 0 {
         self.take_events();
         return Ok(());
       }
+      let mut input = std::mem::take(&mut self.unread);
+      input.extend_from_slice(&fresh);
       self.to_server(&input)?;
+      if !sent && fresh.is_empty() && self.unread.len() == held {
+        self.take_events();
+        return Ok(());
+      }
     }
     Ok(())
   }
@@ -688,5 +707,66 @@ fn an_open_failure_says_why() {
   assert_eq!(
     (failure[0], read_string(&failure, &mut at)),
     (OPEN_FAILURE, b"no forwarding".to_vec())
+  );
+}
+
+/// A-651 (a key lookup that must wait). Do: with holders that cannot say yet, query the first key and, before the server
+/// answers, send a `none` probe; answer the wanted key as held; then sign and answer again. Expect: the query raises the
+/// wanted key and nothing is answered or read until then; once answered, `PK_OK`, then the probe's failure, in order; the
+/// signature waits the same way and then succeeds, raising the principal's authentication; and answering with nothing
+/// wanted is a typed misuse.
+#[test]
+fn a_key_lookup_that_must_wait_defers_its_request() {
+  let asking = Holders {
+    entries: Vec::new(),
+    unknown: true,
+  };
+  let options = ClientOptions::openssh_like("chacha20-poly1305@openssh.com", true);
+  let mut pair = Pair::with_holders(config(), options, asking);
+  pair.pump().unwrap();
+  let mut service = vec![5];
+  put_string(&mut service, b"ssh-userauth");
+  pair.exchange(&service).unwrap();
+  let key = first_key();
+  let before = pair.client.received.len();
+  pair.client.send(&query(b"git", "ssh-ed25519", &key.blob));
+  pair.exchange(&request(b"git", "none")).unwrap();
+  let waiting = (
+    pair.client.received.len() - before,
+    matches!(pair.events.last(), Some(SessionEvent::KeyWanted(wanted)) if wanted.blob == key.blob),
+  );
+  let held = Holding::Holds {
+    principal: 7,
+    keys_required: 1,
+  };
+  pair.server.key_resolved(held.clone()).unwrap();
+  pair.pump().unwrap();
+  let answered: Vec<u8> = pair.client.received[before..]
+    .iter()
+    .map(|payload| payload[0])
+    .collect();
+  let session_id = pair.client.session_id.unwrap();
+  pair
+    .exchange(&signed(
+      b"git",
+      "ssh-ed25519",
+      &key.blob,
+      &ed_signature(&key, &session_id, b"git"),
+    ))
+    .unwrap();
+  pair.server.key_resolved(held.clone()).unwrap();
+  pair.pump().unwrap();
+  let authenticated = SessionEvent::Authenticated(Authenticated {
+    user: b"git".to_vec(),
+    principal: 7,
+  });
+  assert_eq!((waiting, answered), ((0, true), vec![60, 51]));
+  assert_eq!(
+    (
+      pair.last(),
+      pair.events.contains(&authenticated),
+      pair.server.key_resolved(held)
+    ),
+    (vec![52], true, Err(SessionUse::NoKeyWanted))
   );
 }

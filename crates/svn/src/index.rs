@@ -856,6 +856,15 @@ impl Index {
     self.youngest
   }
 
+  /// Derived: the fewest bytes an entry of the index takes in memory, the smaller of a node row's and a deletion's
+  /// history entry's as the compiler lays them out: what an owner deriving the room's entries from bytes divides by
+  /// (A-655 part 2b), so that the entries alone can never pass the bytes the room was derived from.
+  pub const ENTRY_BYTES: usize = if size_of::<Row>() < size_of::<HistoryEntry>() {
+    size_of::<Row>()
+  } else {
+    size_of::<HistoryEntry>()
+  };
+
   /// The entries the index holds, node rows and deletions: what the room given to [`Index::append`] bounds.
   pub fn entries(&self) -> usize {
     self.rows.len().saturating_add(self.deletions)

@@ -44,6 +44,8 @@ const ENTRY_LEAST: usize = 3;
 const LAST_OCTAL_DIGIT: u8 = b'7';
 /// Format: the bits one octal digit carries (`parse_mode`: `mode << 3`).
 const OCTAL_DIGIT_BITS: u32 = 3;
+/// Format: the byte between a path's components (`find_tree_entry`: "name[entrylen] != '/'").
+const PATH_SEPARATOR: &[u8] = b"/";
 
 /// A mode git writes: one of the five `fsck_tree` takes as standard. Each is written as git writes it (`%o`: no
 /// leading zero, so a subtree is `40000`).
@@ -245,6 +247,34 @@ impl<'a> Tree<'a> {
   /// The entries in the order written.
   pub fn entries(&self) -> &[Entry<'a>] {
     &self.entries
+  }
+
+  /// The entry git's tree walk finds for `path`, and the path left below it (`tree-walk.c` `find_tree_entry`, git
+  /// v2.50.1; A-640 part 4, a `sparse:oid` filter's `<rev>:<path>`): the entry named `path`, nothing left; or the
+  /// directory named `path`'s first component, what follows its `/` left (nothing for a trailing `/`). The entries are
+  /// searched in the order written, as git searches them: one longer than `path` or before its start is passed over,
+  /// and one after its start ends the search, as does a file or a submodule where a directory is wanted, so in a tree
+  /// whose entries are out of order this finds what git finds.
+  pub fn find<'p>(&self, path: &'p [u8]) -> Option<(&Entry<'a>, &'p [u8])> {
+    for entry in &self.entries {
+      let Some(start) = path.get(..entry.name.len()) else {
+        continue;
+      };
+      match start.cmp(entry.name) {
+        Ordering::Greater => continue,
+        Ordering::Less => return None,
+        Ordering::Equal => {}
+      }
+      let after = path.get(entry.name.len()..).unwrap_or_default();
+      if after.is_empty() {
+        return Some((entry, after));
+      }
+      let Some(below) = after.strip_prefix(PATH_SEPARATOR) else {
+        continue;
+      };
+      return entry.is_dir().then_some((entry, below));
+    }
+    None
   }
 
   /// Writes the tree as it was read.

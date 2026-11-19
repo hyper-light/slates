@@ -85,7 +85,8 @@ pub enum Filter {
   TreeDepth(u64),
   /// `object:type=<type>`.
   ObjectType(Kind),
-  /// `sparse:oid=<blob-ish>`, its value as sent; read, never served.
+  /// `sparse:oid=<blob-ish>`, its value as sent: served alone, with the patterns the service reads from its blob
+  /// (A-640 part 4).
   SparseOid(Vec<u8>),
   /// `combine:`: what every filter sends.
   Combine(Vec<Filter>),

@@ -645,6 +645,62 @@ fn assert_counted(counters: ViewCounters, built: &Built) {
   assert_eq!(counters, expected);
 }
 
+/// A-665 part 2 (the room a seal keeps, which its owner lends before making it). Do: open the
+/// view of [`built`]'s repository with its push quarantined, SHA-1 and SHA-256; seal each pack,
+/// noting what the store charges beside its contents before and after. Expect: each pack's
+/// `seal_len` is its index's length as the view lists it and the charge its seal added, a sum for
+/// each object the pack holds whole; some pack holds objects whole, so not every charge is zero;
+/// and a name the view shows no pack by has none.
+#[test]
+fn a_seal_keeps_its_index_and_a_sum_for_each_object_held_whole() {
+  for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+    let mut built = built(format);
+    let refs = shown(&built.refs);
+    let pushed = Some(Pushed::Quarantined(&built.push));
+    let view = open(&built.repository, &mut built.store, &refs, pushed);
+    let (seals, summed) = sealed_measured(&view, &mut built);
+    assert!(summed > 0, "no pack holds an object whole");
+    assert_eq!(view.seal_len(&ObjectId::null(format)), None);
+    close(view, seals, &mut built.store);
+  }
+}
+
+/// Every pack of `view` sealed, each one's `seal_len` held to its index's length as the view
+/// lists it and the charge its seal added beside the store's contents: the seals, and those
+/// charges added together.
+fn sealed_measured(view: &HookView, built: &mut Built) -> (BTreeMap<ObjectId, Seal>, u64) {
+  let mut seals = BTreeMap::new();
+  let mut summed = 0;
+  for path in pack_paths(view) {
+    let (name, index_len) = pack_named(view, &path);
+    let charged = built.store.charged();
+    let seal = seal_one(view, &built.repository, &mut built.store, &name).unwrap();
+    let sums = built.store.charged() - charged;
+    assert_eq!(view.seal_len(&name), Some(index_len + sums));
+    summed += sums;
+    seals.insert(name, seal);
+  }
+  (seals, summed)
+}
+
+/// The name of the pack whose file is at `path`, and its index's length as the view lists it.
+fn pack_named(view: &HookView, path: &[u8]) -> (ObjectId, u64) {
+  let named = |name: &ObjectId| {
+    let mut file = b"pack-".to_vec();
+    name.write_hex(&mut file);
+    file.extend_from_slice(b".pack");
+    path.ends_with(&file)
+  };
+  let (name, _) = view
+    .packs()
+    .find(|(name, _)| named(name))
+    .expect("the pack the path names");
+  let Some(Node::File { len }) = view.node(&index_path(path)) else {
+    panic!("{} has no index", String::from_utf8_lossy(path));
+  };
+  (name, len)
+}
+
 /// A-665 (lazy, a window a read). Do: before any seal, read each of the five packs' trailers and
 /// indexes, and the base pack up to its trailer; seal; read `HEAD`, `config`, `packed-refs` and
 /// every pack file in windows of 1, 13, a content window and the whole, and from its end. Expect:
