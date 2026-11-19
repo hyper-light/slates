@@ -817,3 +817,115 @@ fn a_branch_past_the_head_below_the_floor_or_of_a_retired_green_is_refused_by_it
   assert_ne!(again, branch, "a reused seat is a new handle");
   assert_eq!(lineage.with(branch, |_| ()), Err(LineageRefused::Stale));
 }
+
+/// One version's ops for [`a_branch_sets_back_every_dimension`]: each `(kind, path, argument)`, the argument a target or
+/// attribute name where the kind takes one, else empty.
+fn version_of(green: &Green, id: u8, ops: &[(OpKind, &str, &str)]) -> Increment {
+  let mut work = Work::default();
+  for (kind, path, argument) in ops {
+    match kind {
+      OpKind::Overwrite => {
+        let src = work.stash(b"NEW");
+        work.op(*kind, path, 0, 3, src);
+      }
+      OpKind::SetMode => work.op(*kind, path, 0, 0o755, 0),
+      OpKind::Symlink | OpKind::Link => {
+        let src = work.name(argument);
+        work.op(*kind, path, 0, 0, src);
+      }
+      OpKind::SetXattr => {
+        let name = work.name(argument);
+        let src = work.stash(b"2");
+        work.op(*kind, path, name, 1, src);
+      }
+      OpKind::RemoveXattr => {
+        let name = work.name(argument);
+        work.op(*kind, path, name, 0, 0);
+      }
+      OpKind::Mknod => {
+        let node = fifo(2).encode();
+        let src = work.stash(&node);
+        work.op(*kind, path, 0, node.len() as u64, src);
+      }
+      _ => work.op(*kind, path, 0, 0, u64::MAX),
+    }
+  }
+  Increment {
+    id: [id; 32],
+    base: green.head(),
+    doc: work.doc,
+    post_state: work.post,
+    evidence: Vec::new(),
+  }
+}
+
+/// A-534. Do: seed a green with a file of each kind of metadata (a mode, an attribute, a symbolic and a hard link naming
+/// it), a file to remove, a directory, an IPC node and a second file's attribute; at version 2 overwrite the file,
+/// remove the other, make a directory, remove the first and retarget the symbolic link; at version 3 change the mode,
+/// retarget the hard link, remove the second file's attribute and replace the IPC node; at version 4 change the file's
+/// attribute; then branch at versions 1, 2 and 4. Expect: each branch reads as a green seeded from a copy of the source
+/// at its version, and sets back exactly the keys changed after it (ten, five and none) without a walk.
+#[test]
+fn a_branch_sets_back_every_dimension() {
+  let origin = Origin {
+    files: vec![
+      ("f".to_owned(), b"0123".to_vec()),
+      ("gone".to_owned(), b"x".to_vec()),
+      ("keep".to_owned(), b"k".to_vec()),
+    ],
+    dirs: vec!["dir1".to_owned()],
+    modes: vec![("f".to_owned(), 0o644)],
+    symlinks: vec![("s".to_owned(), "f".to_owned())],
+    hardlinks: vec![("h".to_owned(), "f".to_owned())],
+    specials: vec![("p".to_owned(), fifo(1))],
+    xattrs: vec![
+      ("f".to_owned(), "user.x".to_owned(), b"1".to_vec()),
+      ("keep".to_owned(), "user.y".to_owned(), b"y".to_vec()),
+    ],
+  };
+  let mut source = Green::with_origin(origin);
+  let versions: [&[(OpKind, &str, &str)]; 4] = [
+    &[(OpKind::Mkdir, "unrelated", "")],
+    &[
+      (OpKind::Overwrite, "f", ""),
+      (OpKind::Unlink, "gone", ""),
+      (OpKind::Mkdir, "dir2", ""),
+      (OpKind::Rmdir, "dir1", ""),
+      (OpKind::Symlink, "s", "keep"),
+    ],
+    &[
+      (OpKind::SetMode, "f", ""),
+      (OpKind::Link, "h", "keep"),
+      (OpKind::RemoveXattr, "keep", "user.y"),
+      (OpKind::Mknod, "p", ""),
+    ],
+    &[(OpKind::SetXattr, "f", "user.x")],
+  ];
+  for (index, ops) in versions.iter().enumerate() {
+    let id = u8::try_from(index).unwrap() + 1;
+    let inc = version_of(&source, id, ops);
+    assert_eq!(
+      source.submit(&inc),
+      Outcome::Accepted {
+        version: u64::from(id)
+      },
+      "version {id}"
+    );
+  }
+  let mut expected: Vec<View> = [1, 2, 4]
+    .into_iter()
+    .map(|version| view(&mut Green::with_origin(copy_at(&source, version))))
+    .collect();
+  let (mut lineage, root) = Lineage::new(source);
+  for ((version, reverts), expected) in [(1, 10), (2, 5), (4, 0)].into_iter().zip(expected.drain(..)) {
+    let (walked, before) = (lineage.walked(), lineage.reverted());
+    let branch = lineage.branch(root, version).unwrap();
+    assert_eq!(lineage.walked(), walked, "the branch at {version} walked a map");
+    assert_eq!(
+      lineage.reverted() - before,
+      reverts,
+      "the keys changed after {version}"
+    );
+    assert_eq!(lineage.with(branch, view).unwrap(), expected, "the branch at {version}");
+  }
+}
