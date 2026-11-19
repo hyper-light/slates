@@ -3586,6 +3586,27 @@
 >     - **Open, the owner's one thread:** a first touch of a base file, a verdict, a rebase and a read of the green each
 >       still cross to the green's owner and queue there. A-273's replicas, which took the reads and rebases off it,
 >       were measured and rejected (A-528, 2026-11-19): what keeps the p99 above 1 ms under contention is next.
+>     - **Hypothesis, not yet measured: the server's 10 to 75 ms is its shard threads off their CPUs (2026-11-19, g083,
+>       A-579, stopped when goal 87's performance work was paused; branch `agents/g083-a579-shard-qos-hypothesis`, this
+>       note only).** Main's A/A with the split (r278, the Mac Studio, eight runs, 1,000 clients, 23 shards, 8 workers
+>       over 32 connections, about 3,456 verdicts a second at a 20 ms think mean, load 15 rising to 42 on 32 logical CPUs
+>       from other agents' builds) charges the tail to the server: `harness_bound` 0 in every run, the noise floor 15 µs
+>       to 6.4 ms. Server parts: an edit's p50 0.17 to 1.0 ms and p99 9 to 37 ms (p999 69 to 86 ms in the runs read);
+>       an accepted submit's p99 12 to 75 ms, a read of the head's 12 to 71 ms, a rebase's 25 to 32 ms. The reading:
+>       an edit has run wholly on its client's shard since A-400, with no hop and no ask, yet its server p99 is 50 times
+>       its p50, and the trace diagnostic above measured every shard but the owner at 13 to 28% of a core, too idle for a
+>       queue of turns to hold a request for 15 ms. The harness's own threads, in the same process class, went 35 to
+>       60 ms between sweeps in the same runs. Every thread the daemon starts there has no scheduling preference: read on
+>       the Studio, a process kiln starts runs nice 20 with its main thread at QoS `UTILITY` (0x11) and every thread it
+>       spawns at `DEFAULT` (0x15), and `slates-rt` spawns its shard threads with a plain `std::thread::Builder` and only
+>       an affinity tag (`crates/rt/src/runtime.rs`, `crates/machine/src/probes.rs`), so about 31 spinning threads of the
+>       run's own, plus the builds, time-share 32 CPUs at the kernel's 10 ms quantum. A shard off its CPU for one to
+>       several quanta matches the 10 to 75 ms. **To test it first:** the A/B's daemon prints each shard's `pulse`
+>       counters (`long_steps` against `preempted_steps` and `blocked_steps`, `crates/rt/src/attribution.rs`); r278
+>       printed none. **The fix it points to, not built:** the shard threads take a scheduling class from a cfg-free rule
+>       beside the placement rule (`crates/machine/src/placement.rs`): on macOS `pthread_set_qos_class_self_np` at
+>       `USER_INTERACTIVE` in `run_worker`, read back by `qos_class_self` in a `--lib` test; Linux raises no priority
+>       without a privilege (R10), so its rule is none; Windows keeps A-361's parked-thread priority.
 >
 >     **The rung's starved clients were the harness's hot set, and the round is reported, not judged (2026-11-18, g083,
 >     A-416).** Every 1,000-client run had 16 to 29 clients starved, and the bound requires none: the harness drew its
