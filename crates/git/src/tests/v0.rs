@@ -1513,10 +1513,10 @@ fn reread(client: bool, data: &[u8]) -> Option<Vec<u8>> {
   let mut out = Vec::new();
   if client {
     let line = ClientLine::read(data, ObjectFormat::Sha1).ok()?;
-    line.write(&mut out).unwrap();
+    line.write(&mut out).ok()?;
   } else {
     let line = ServerLine::read(data, ObjectFormat::Sha1).ok()?;
-    line.write(&mut out).unwrap();
+    line.write(&mut out).ok()?;
   }
   Some(data_of(&out).to_vec())
 }
@@ -1715,9 +1715,12 @@ type OwnedRef = (ObjectId, Vec<u8>, Option<ObjectId>);
 /// An advertisement's parts, owned.
 type OwnedAdvertisement = (Version, Vec<OwnedCapability>, Vec<OwnedRef>, Vec<ObjectId>);
 
+/// Shape: the bytes a generated capability's name takes, as git's names do.
+const NAME_BYTES: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+
 /// A capability a generated list may hold: a name in the grammar, and maybe a value of bytes a ref name may hold.
 fn any_capability() -> impl Strategy<Value = OwnedCapability> {
-  let name_byte = prop_oneof![b'a'..=b'z', b'0'..=b'9', Just(b'-'), Just(b'_')];
+  let name_byte = (0..NAME_BYTES.len()).prop_map(|at| NAME_BYTES[at]);
   (
     proptest::collection::vec(name_byte, 1..12),
     proptest::option::of(proptest::collection::vec(any_word_byte(), 0..12)),
@@ -1742,7 +1745,13 @@ fn any_id(format: ObjectFormat) -> impl Strategy<Value = ObjectId> {
 
 /// Either object format.
 fn any_format() -> impl Strategy<Value = ObjectFormat> {
-  prop_oneof![Just(ObjectFormat::Sha1), Just(ObjectFormat::Sha256)]
+  any::<bool>().prop_map(|sha256| {
+    if sha256 {
+      ObjectFormat::Sha256
+    } else {
+      ObjectFormat::Sha1
+    }
+  })
 }
 
 /// A client line's parts, owned, from which a test borrows the line.
@@ -1759,23 +1768,51 @@ enum OwnedClientLine {
   Error(Vec<u8>),
 }
 
-/// Any client line a writer takes, in `format`.
+/// A client line's parts, before its kind is chosen: an id and maybe capabilities, a depth and a time, and three runs
+/// of bytes (a ref name's, a filter's, an error's).
+type ClientLineParts = (
+  u8,
+  (ObjectId, Option<Vec<OwnedCapability>>),
+  (u32, u64),
+  (Vec<u8>, Vec<u8>, Vec<u8>),
+);
+
+/// Shape: the kinds of client line a selector chooses among, one each.
+const CLIENT_LINE_KINDS: u8 = 9;
+
+/// Any client line a writer takes, in `format`: its kind chosen by a selector over parts made for every kind (no
+/// `prop_oneof!`, whose strategy is reference-counted, R2).
 fn any_client_line(format: ObjectFormat) -> impl Strategy<Value = OwnedClientLine> {
-  prop_oneof![
+  let parts = (
+    0..CLIENT_LINE_KINDS,
     (
       any_id(format),
-      proptest::option::of(proptest::collection::vec(any_capability(), 1..6))
-    )
-      .prop_map(|(id, capabilities)| OwnedClientLine::Want(id, capabilities)),
-    any_id(format).prop_map(OwnedClientLine::Have),
-    Just(OwnedClientLine::Done),
-    any_id(format).prop_map(OwnedClientLine::Shallow),
-    (1..=i32::MAX.unsigned_abs()).prop_map(OwnedClientLine::Deepen),
-    (0..u64::MAX).prop_map(OwnedClientLine::DeepenSince),
-    proptest::collection::vec(any_word_byte(), 1..20).prop_map(OwnedClientLine::DeepenNot),
-    proptest::collection::vec(any_text_byte(), 1..20).prop_map(OwnedClientLine::Filter),
-    proptest::collection::vec(any_text_byte(), 0..20).prop_map(OwnedClientLine::Error),
-  ]
+      proptest::option::of(proptest::collection::vec(any_capability(), 1..6)),
+    ),
+    (1..=i32::MAX.unsigned_abs(), 0..u64::MAX),
+    (
+      proptest::collection::vec(any_word_byte(), 1..20),
+      proptest::collection::vec(any_text_byte(), 1..20),
+      proptest::collection::vec(any_text_byte(), 0..20),
+    ),
+  );
+  parts.prop_map(client_line_of)
+}
+
+/// The client line `parts` makes, of the kind its selector names.
+fn client_line_of(parts: ClientLineParts) -> OwnedClientLine {
+  let (selector, (id, capabilities), (depth, since), (not, filter, error)) = parts;
+  match selector {
+    0 => OwnedClientLine::Want(id, capabilities),
+    1 => OwnedClientLine::Have(id),
+    2 => OwnedClientLine::Done,
+    3 => OwnedClientLine::Shallow(id),
+    4 => OwnedClientLine::Deepen(depth),
+    5 => OwnedClientLine::DeepenSince(since),
+    6 => OwnedClientLine::DeepenNot(not),
+    7 => OwnedClientLine::Filter(filter),
+    _ => OwnedClientLine::Error(error),
+  }
 }
 
 /// The capabilities `owned` lists, borrowed.
@@ -1833,7 +1870,7 @@ fn any_ref(format: ObjectFormat) -> impl Strategy<Value = OwnedRef> {
 fn any_advertisement() -> impl Strategy<Value = OwnedAdvertisement> {
   any_format().prop_flat_map(|format| {
     (
-      prop_oneof![Just(Version::V0), Just(Version::V1)],
+      any::<bool>().prop_map(|v1| if v1 { Version::V1 } else { Version::V0 }),
       proptest::collection::vec(
         any_capability().prop_filter("object-format is the format's", |(name, _)| {
           name != b"object-format"
@@ -1852,6 +1889,14 @@ fn any_advertisement() -> impl Strategy<Value = OwnedAdvertisement> {
     )
   })
 }
+
+/// Every status an `ACK` line may carry.
+const ACK_STATUSES: [AckStatus; 4] = [
+  AckStatus::Plain,
+  AckStatus::Continue,
+  AckStatus::Common,
+  AckStatus::Ready,
+];
 
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
@@ -1878,9 +1923,7 @@ proptest! {
   #[test]
   fn any_server_line_written_reads_back_as_itself(
     id in any_format().prop_flat_map(any_id),
-    status in prop_oneof![
-      Just(AckStatus::Plain), Just(AckStatus::Continue), Just(AckStatus::Common), Just(AckStatus::Ready)
-    ],
+    status in (0..ACK_STATUSES.len()).prop_map(|at| ACK_STATUSES[at]),
     text in proptest::collection::vec(any_text_byte(), 0..30),
   ) {
     for line in [ServerLine::Nak, ServerLine::Ack { id, status }, ServerLine::Error(&text)] {
