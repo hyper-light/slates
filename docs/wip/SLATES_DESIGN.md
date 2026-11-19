@@ -12510,6 +12510,13 @@ engine: the verdict, rebase, position mapping, the register).
 > is the server's: the lock log in slates-db, guarded then applied; `Access` over vcs_policy and the owner rule; each
 > repository's LFS index beside the shared store; the call A-625's edge makes.
 >
+> **Status (2026-11-19, A-629 part 2b-i: transfers judged on their batch's ref).** An href names the ref its batch
+> was asked for (`?refspec=`), so its `PUT`, `GET` or verification is judged on the ref the batch was judged on and
+> a principal allowed on one branch alone can push that branch's objects. `Locks` reads its records from the
+> repository's locks log (A-642, A-635) as owned values, a page charging each record's text; a store that fails to
+> record a change is `500`, apart from one at its capacity (`507`). Part 2b-ii is the server's: `Access`, `Locks`
+> over the locks log through `RepositoryLogs::append`, and the call A-625's edge makes.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
@@ -44980,3 +44987,21 @@ fixtures `lock-steal.xml` and five request heads).
 - **Owed.** The update-report's resource walk (`S:resource-walk`, a pre-1.2 client's); the facts' revision as
   `dav_svn__get_safe_cr` gives it, since `svn_fs_node_created_rev` names a path that did not exist yet for a node
   beneath a copy not changed since (A-616's facts); main's live capture against Apache with `mod_dav_svn`.
+
+### A-629 part 2b-i — LFS transfers judged on the ref their batch named; the `Locks` seam shaped for A-642's locks log (2026-11-19, g293, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files" and "Access"; after A-629 part 1 and A-635)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`lfs/serve.rs`,
+`tests/lfs_serve.rs`).
+- **Why.** A transfer authenticates at the edge as its batch did, but names no ref, and the repository's policy is
+  per ref (A-597, A-622). Judged on no ref, a principal allowed on one branch alone was handed upload actions and then
+  refused at the `PUT`. An href now carries the batch's ref as `?refspec=` (the key the locks listing already reads),
+  escaped as a query value (RFC 3986 §2.1, §3.4), its bytes charged with the hrefs'; the transfer reads it within its
+  admission and is judged on it. The ref a client names is its claim, as a batch's is: an object is the repository's,
+  not a branch's, so a read rule scoped to refs gates the refs a principal may name, not the objects it may fetch.
+- **The seam** (A-635 landed a repository's locks as one of its own state logs, A-642). `Locks::find` and
+  `Locks::listed_from` answer owned records, which the server decodes from the log's bytes; a page charges each
+  record's text beside its place and slots. `LocksRefused` tells a store at its capacity (`507`) from one that did not
+  record a change (`500`).
+- **Tests.** A transfer judged on its batch's ref (the `PUT` at the handed-out href answered, the same href without its
+  query refused `403`); the paging model charges each record's text. On the Mac Studio (2026-11-19): red at 06:59Z
+  with `transfer_allowed` stubbed, 2 failing (that test and the reader's); green at 07:00Z on 440f9d646,
+  `cargo test -p slates-git --lib` 387 passed, 2 ignored; fmt clean.
