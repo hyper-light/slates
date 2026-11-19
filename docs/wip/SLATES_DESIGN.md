@@ -13605,25 +13605,24 @@ signature verification).
 > 7.2's media types: a string in `application/mercurial-0.1`, an error in `application/hg-error`, a stream in
 > `application/mercurial-0.2` in an engine the client reads (an abort part uncompressed, as 7.2 sends it), else in `0.1`
 > in zlib. The engine and level are the caller's (`Compressor`), and each answer is charged at its engine's documented
-> bound before it is made (zlib's, stock zlib's `compressBound`, is outgrown by the linked zlib-rs's level 1 on bytes
-> that do not compress: GAPS, its own piece). `getbundle` judges the bundle capabilities before what is missing, in
-> 7.2's order, so a bundle1 client is never sent a bundle2 abort. The daemon's site (`vcs_http::hg`) routes a
-> repository's URL as hgweb does, proves credentials as git's site does (by A-625 part 3's record), moves a proven
-> request for a repository another shard holds there (A-625 part 3), judges the policy in hgweb's order (read for every
-> request; a push also `POST` and a right to submit, rewrite or delete), and names the answer's media type as the reply
-> begins (the edge's `reply_fields`); hgweb's pages, and a repository whose store the shard does not hold, are `503`
-> until piece 12 and until the site is handed A-662's stores. Until the estimator below lands, a stream takes the
-> design's first value, the fastest form the client reads (`none` where it reads it, else its first engine at its
-> fastest level; zlib at level 0 to a `0.1` client). Proven by `slates-hg --lib` 306 of 306 (this piece's 9 among them),
-> `slates-http-edge --lib` 32 of 32 and `slates-server --lib vcs_http` 40 of 40 on macOS arm64 (Mac Studio, kiln r137 on
-> the tree that lands and r6 for the edge, 2026-11-19; the other platforms owed): a stock 7.2 client's clone, pull and
-> incoming over HTTP against stock `hg serve` (`crates/hg/fixtures/serve-http`), each answer as 7.2 meant it (strings
-> byte for byte in 7.2's media types, the capabilities a subset of 7.2's, each `getbundle`'s zstd stream inflated and
-> compared as the session's golden compares one); 7.2's own words for what it refuses; the abort and zlib framings; a
-> chooser past the client's engines refused; hostile requests; the site's statuses in hgweb's order; a proven request
-> moved to its repository's shard; the edge's late fields. Owed of piece 4: the estimator (the connection's delivery
-> rate, and this repository's compression speed and ratio), the answers sliced within the shard's budget, the process
-> around `slates hg serve --stdio`, held deltas, the index's kept heads.
+> bound before it is made (zlib's as the linked zlib-rs states it, A-673). `getbundle` judges the bundle capabilities
+> before what is missing, in 7.2's order, so a bundle1 client is never sent a bundle2 abort. The daemon's site
+> (`vcs_http::hg`) routes a repository's URL as hgweb does, proves credentials as git's site does (by A-625 part 3's
+> record), moves a proven request for a repository another shard holds there (A-625 part 3), judges the policy in
+> hgweb's order (read for every request; a push also `POST` and a right to submit, rewrite or delete), and names the
+> answer's media type as the reply begins (the edge's `reply_fields`); hgweb's pages, and a repository whose store the
+> shard does not hold, are `503` until piece 12 and until the site is handed A-662's stores. Until the estimator below
+> lands, a stream takes the design's first value, the fastest form the client reads (`none` where it reads it, else its
+> first engine at its fastest level; zlib at level 0 to a `0.1` client). Proven by `slates-hg --lib` 306 of 306 (this
+> piece's 9 among them), `slates-http-edge --lib` 32 of 32 and `slates-server --lib vcs_http` 40 of 40 on macOS arm64
+> (Mac Studio, kiln r137 on the tree that lands and r6 for the edge, 2026-11-19; the other platforms owed): a stock 7.2
+> client's clone, pull and incoming over HTTP against stock `hg serve` (`crates/hg/fixtures/serve-http`), each answer as
+> 7.2 meant it (strings byte for byte in 7.2's media types, the capabilities a subset of 7.2's, each `getbundle`'s zstd
+> stream inflated and compared as the session's golden compares one); 7.2's own words for what it refuses; the abort and
+> zlib framings; a chooser past the client's engines refused; hostile requests; the site's statuses in hgweb's order; a
+> proven request moved to its repository's shard; the edge's late fields. Owed of piece 4: the estimator (the
+> connection's delivery rate, and this repository's compression speed and ratio), the answers sliced within the shard's
+> budget, the process around `slates hg serve --stdio`, held deltas, the index's kept heads.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -49317,3 +49316,30 @@ docs), `crates/merge/src/engine/copy_tests.rs` (the replica test's comparison be
   commits after b13a6e05f change only manifest comments, the server's Mercurial site over HTTP and slates-svn's report
   editor, none of which slates-merge or slates-anchor builds from or the repository test reaches.
 - **For A-626 part 4**, not yet landed: its logged copy takes the anchor's layout 14.
+
+### A-673 — An answer's room charged at the linked zlib-rs's own bound, where stock zlib's `compressBound` was outgrown (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface"; A-650 part 1's "Found, and left to its own piece"; A-607)
+Applied in the same change to: `crates/hg` (`compression::bound`'s zlib arm and its constants; the oracle
+`the_longest_codes_stay_within_every_engines_bound` and `arbitrary_bytes_stay_within_every_engines_bound` in
+`tests/compression.rs`), §4.17.3 (A-650 part 1's status sentence on the bound), GAPS (§4.17.3: the open item closed, a
+Fixed line), `research/mercurial-server.md` (§25's bullet on the bound: the macOS run beside jupiter's).
+- **What was wrong.** `compression::bound`, the room an HTTP answer is charged before it is compressed, counted zlib at
+  stock zlib's `compressBound` (`len + (len >> 12) + (len >> 14) + (len >> 25) + 13`), which counts stored blocks. The
+  workspace links zlib-rs (A-607), whose level 1 is zlib-ng's `deflate_quick`: every literal in fixed codes, nine bits
+  for the bytes 144 to 255 (RFC 1951 §3.2.6), and no fallback to a stored block. Bytes that do not compress outgrew
+  their charge by up to about an eighth: 65,536 of those bytes came to 73,721 against 65,569. Nothing served met it,
+  since the site's first value takes zlib at level 0 (stored), but the `Compressor` contract lets a caller choose any
+  level.
+- **Decided.** zlib's arm is zlib-rs 0.6.8's own `compress_bound` (`src/deflate.rs`; zlib-ng's `compressBound`):
+  `len + ceil(len / 8) + 3 + 6`, a byte more below 9 bytes and one more for none. It is the worst case itself, with
+  nothing to spare: level 1 meets it exactly at 4,095 and 4,096 bytes. The constants name the backend and its version
+  they come from, so a change of backend (A-607) is a change of the bound with it.
+- **Tests** (macOS arm64, Mac Studio, kiln r181, 2026-11-19, on main b04c552b0). Red first, the oracle alone:
+  `cargo test --locked -p slates-hg --lib compression` 16 passed and 2 failed, the table at zlib level 1 alone (64 bytes
+  in 80 against stock zlib's 77, 4,095 in 4,616 against 4,108, 4,096 in 4,617 against 4,110, 65,536 in 73,721 against
+  65,569: jupiter's r92 numbers) and the generated bytes shrunk to 47 written in 61 against 60. Green, with the fix:
+  `cargo test --locked -p slates-hg --lib` 308 of 308; `cargo fmt -p slates-hg -- --check` clean. The oracle: every
+  engine at every level the bound is checked at (every zlib level, bzip2's ends, zstd's fastest, default and strongest)
+  over runs that zlib's level 1 writes nine bits each, at lengths about its rounding and past 4 KiB and 64 KiB, and over
+  arbitrary bytes (generated), none past `bound`.
+- **Owed.** The other platforms' runs (main's). The proptest's failing seed from the red run is not kept: its block has
+  no seed file, and the table holds the same case.
