@@ -983,17 +983,16 @@
 > land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.
 > Continued (1), 2026-11-19: `commit` through the connection (A-655's entry point and drive; the hooks the drive waits
 > for, A-661, handed to the caller; the accepted work answered with its revision, or refused at `close-edit` in A-655's
-> step's words, the client's commands then dropped until `abort-edit`; the crate's tests commit through A-655 part 2a's
-> step, the daemon refuses every work 200007 until part 2b), and `svnserve`'s authentication for one command
-> (`must_have_access`) for `commit` and `update`, held to every recorded commit connection and to `svnserve`'s own for
-> `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s `get-dir`,
-> compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at once, where
-> `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH tunnel's entry
-> point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's commit once
-> A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their authorization
-> (A-606). Found: A-613's `get-dir` lists an entry
-> `svnserve` hides from the principal (`/trunk/secret` for anonymous): the read commands' authorization is owed
-> (A-606).
+> step's words, the client's commands then dropped until `abort-edit` or `success`; the crate's tests commit through
+> A-655 part 2a's step, the daemon refuses every work 200007 until part 2b), and `svnserve`'s authentication for one
+> command (`must_have_access`) for `commit` and `update`, held to every recorded commit connection and to `svnserve`'s
+> own for `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s
+> `get-dir`, compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at
+> once, where `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH
+> tunnel's entry point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's
+> commit once A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their
+> authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
+> for anonymous): the read commands' authorization is owed (A-606).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

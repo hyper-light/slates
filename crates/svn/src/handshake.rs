@@ -550,8 +550,8 @@ impl CramKey {
   }
 }
 
-/// What the repository allows and tells, kept from [`Server::open`] (or [`Server::for_command`]) for
-/// the rest of the exchange.
+/// What the repository allows and tells, kept from [`Server::open`] (or [`Server::for_command`])
+/// for the rest of the exchange.
 #[derive(Clone, Debug)]
 struct Offer {
   capabilities: ClientCapabilities,

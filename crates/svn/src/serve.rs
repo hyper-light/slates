@@ -36,15 +36,15 @@
 //! at `open-root` and pre-commit at `close-edit` (A-661), the drive waits ([`Turn::Hook`]): the
 //! caller runs it over the transaction ([`Connection::pending`]) and answers
 //! ([`Connection::answer_hook`]); a failure is the command's, and the client's commands are then
-//! dropped until its `abort-edit`. Once pre-commit passed, `close-edit`'s verdict accepts the work
-//! ([`Turn::Accepted`]): the caller makes it through the owner's commit step (A-655's revision of
-//! the work and the repository's commit) and answers with the revision made
-//! ([`Connection::committed`]: `close-edit`'s success, the trivial auth request and the new
-//! revision, `serve.c` 1555-1577 and `editorp.c` 888-905), or refuses it in the step's words
-//! ([`Connection::not_committed`], [`Uncommitted::Step`]): the refusal is `close-edit`'s failure,
-//! and the client's commands are then read and dropped until its `abort-edit` or `success`, as
-//! `svn_ra_svn_drive_editor2` drops them (`editorp.c` 1149-1208). Until the owner's step appends
-//! through the repository's logs (A-655 part 2b), the daemon refuses every work
+//! dropped until its `abort-edit` or `success` (`editorp.c` 1149-1208). Once pre-commit passed,
+//! `close-edit`'s verdict accepts the work ([`Turn::Accepted`]): the caller makes it through the
+//! owner's commit step (A-655's revision of the work and the repository's commit) and answers with
+//! the revision made ([`Connection::committed`]: `close-edit`'s success, the trivial auth request
+//! and the new revision, `serve.c` 1555-1577 and `editorp.c` 888-905), or refuses it in the step's
+//! words ([`Connection::not_committed`], [`Uncommitted::Step`]): the refusal is `close-edit`'s
+//! failure, and the client's commands are then read and dropped until its `abort-edit` or
+//! `success`, as `svn_ra_svn_drive_editor2` drops them (`editorp.c` 1149-1208). Until the owner's
+//! step appends through the repository's logs (A-655 part 2b), the daemon refuses every work
 //! ([`Uncommitted::NotServed`]); nothing else applies one.
 //!
 //! **One connection, two transports.** The same connection serves `svn://` over TCP and
@@ -275,8 +275,8 @@ pub enum Turn<'a> {
   },
   /// The commit's drive waits for a hook `svnserve` runs inside the command it just took,
   /// `consumed` bytes (A-661): start-commit at `open-root`, pre-commit at `close-edit`. The caller
-  /// runs it over the transaction ([`Connection::pending`]) and answers ([`Connection::answer_hook`])
-  /// before anything else.
+  /// runs it over the transaction ([`Connection::pending`]) and answers
+  /// ([`Connection::answer_hook`]) before anything else.
   Hook {
     /// The hook.
     due: Due,
@@ -520,8 +520,8 @@ impl Connection {
   ///
   /// # Errors
   /// [`Refused`] for client bytes that end the connection, and for the caller's own errors: a call
-  /// out of turn (where a commit's start, a hook's answer or its work's verdict is awaited, or after
-  /// the end), or one without sources, which ends the connection.
+  /// out of turn (where a commit's start, a hook's answer or its work's verdict is awaited, or
+  /// after the end), or one without sources, which ends the connection.
   pub fn receive<'a, R, G>(
     &mut self,
     sources: Option<&Sources<'_, R, G>>,
@@ -702,9 +702,9 @@ impl Connection {
 
   /// Answers the hook the drive waits for: `Ok` lets the command go on; `Err` holds the hook's
   /// failure, outermost first, written as the command's failure, after which the client's commands
-  /// are dropped until its `abort-edit` (A-655's [`Drive::resume`]). The turn is the drive's next
-  /// step's, none of the client's input taken: [`Turn::Took`] with nothing consumed, or
-  /// [`Turn::Accepted`] where pre-commit's answer let `close-edit`'s verdict accept the work.
+  /// are dropped until its `abort-edit` or `success` (A-655's [`Drive::resume`]). The turn is the
+  /// drive's next step's, none of the client's input taken: [`Turn::Took`] with nothing consumed,
+  /// or [`Turn::Accepted`] where pre-commit's answer let `close-edit`'s verdict accept the work.
   ///
   /// # Errors
   /// [`Refused::OutOfTurn`] unless a hook's answer is awaited; [`Refused::Item`] where the failure

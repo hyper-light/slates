@@ -87,7 +87,8 @@ const ROOT: &[u8] = b"svn+fixture://fixture/repo";
 /// The repository's identity, which is also its realm (`make-fixtures.py` `UUID`).
 const IDENTITY: &[u8] = b"00000000-0000-4000-8000-00000000a617";
 
-/// The file bob locks (`make-fixtures.py`'s `lock-bob` step, `svn lock -m bob's WORK/wc-bob/a.txt`).
+/// The file bob locks (`make-fixtures.py`'s `lock-bob` step,
+/// `svn lock -m bob's WORK/wc-bob/a.txt`).
 const LOCKED: &str = "/trunk/project/a.txt";
 
 /// The prefix of a lock token (`lock.c`'s `opaquelocktoken:` URI).

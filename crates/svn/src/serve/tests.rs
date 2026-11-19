@@ -1,21 +1,21 @@
 //! The connection's tests (A-656; §4.17.4 "5. The wire", piece 7).
 //!
 //! The oracle is stock `svnserve` 1.15.0's whole sessions recorded for the reporter
-//! (`crates/svn/fixtures/report/`, each file's SHA-256 in `SHA256SUMS`): each session's client bytes
-//! are handed over an item at a time, each when the connection asks for more, as a stock client
-//! sends them after reading each answer; what the connection writes over the fixtures' repository
-//! must be what `svnserve` wrote: its greeting less `svndiff1`, every item byte for byte (property
-//! lists as sets: `svnserve` writes them in APR's seeded hash order), its drive call for call; up to
-//! the first command slates does not serve yet, which must be answered as one `svnserve` does not
-//! know. Stock `svnserve` 1.15.0's recorded commits are replayed the same way in `commit`
-//! (`crates/svn/fixtures/commit/`, through `svnserve -t`), every item byte for byte but one
-//! property list in that order, counted. Beside them: `reparent` inside and outside the repository,
-//! commands not served yet, items that are no command, calls without the repository's sources, the
-//! smallest budget, what the connection waits for, a tunnel's user, a repository that admits no
-//! one; the authentication for one command (`must_have_access`) for `update` and `commit`, where it
-//! helps and where it cannot; a commit answered with the revision made, and refused at `close-edit`
-//! in the drive's words and as not made yet, the client's commands then dropped until `abort-edit`
-//! or `success`; and calls out of turn.
+//! (`crates/svn/fixtures/report/`, each file's SHA-256 in `SHA256SUMS`): each session's client
+//! bytes are handed over an item at a time, each when the connection asks for more, as a stock
+//! client sends them after reading each answer; what the connection writes over the fixtures'
+//! repository must be what `svnserve` wrote: its greeting less `svndiff1`, every item byte for byte
+//! (property lists as sets: `svnserve` writes them in APR's seeded hash order), its drive call for
+//! call; up to the first command slates does not serve yet, which must be answered as one
+//! `svnserve` does not know. Stock `svnserve` 1.15.0's recorded commits are replayed the same way
+//! in `commit` (`crates/svn/fixtures/commit/`, through `svnserve -t`), every item byte for byte but
+//! one property list in that order, counted. Beside them: `reparent` inside and outside the
+//! repository, commands not served yet, items that are no command, calls without the repository's
+//! sources, the smallest budget, what the connection waits for, a tunnel's user, a repository that
+//! admits no one; the authentication for one command (`must_have_access`) for `update` and
+//! `commit`, where it helps and where it cannot; a commit answered with the revision made, and
+//! refused at `close-edit` in the drive's words and as not made yet, the client's commands then
+//! dropped until `abort-edit` or `success`; and calls out of turn.
 
 use super::*;
 use crate::index::{Action, Index};
@@ -321,9 +321,9 @@ fn assert_as_svnserve(
 /// A-656 (`serve.c`'s command loop against stock `svnserve` 1.15.0): replay every recorded session
 /// from its first byte through a connection over the fixtures' repository, the client's items
 /// handed over as a stock client sends them; expect `svnserve`'s greeting less `svndiff1`, every
-/// item as a tree, the drive call for call, up to a command not served yet, answered "Unknown editor
-/// command"; and every recorded session met, the listing that shows an entry `svnserve` hides the
-/// one place they differ.
+/// item as a tree, the drive call for call, up to a command not served yet, answered "Unknown
+/// editor command"; and every recorded session met, the listing that shows an entry `svnserve`
+/// hides the one place they differ.
 #[test]
 fn every_recorded_session_is_answered_as_svnserve_answered_it() {
   let fixture = fixture();
