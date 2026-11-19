@@ -66,10 +66,11 @@
 //! and packs from the base packs and fragments, each whole by itself, with the push's objects in
 //! git's quarantine; every file's bytes made when a read reaches them.
 //!
-//! **Owed (A-614's part 3, and later pieces):** the changed-path Bloom filters of the commit rows (part 3); the walks
-//! and a commit sliced under the shard's budget, and their transient sets charged; within an encoding, one object, a
-//! pair of trees and a part's put each still a unit whole (`encoding`'s docs); a delta search for an object past a
-//! window; the versions' records kept as content, replicated as the index's tables are.
+//! **Owed (later pieces):** the walks and a commit sliced under the shard's budget, and their transient sets charged;
+//! within an encoding, one object, a pair of trees and a part's put each still a unit whole (`encoding`'s docs); a
+//! delta search for an object past a window; the versions' records kept as content, replicated as the index's tables
+//! are. A-614 part 3, the commit rows' changed-path Bloom filters, is superseded: a path's history and blame are
+//! A-666's derived types, and no walk here reads paths.
 
 mod deltas;
 mod encoding;

@@ -12909,6 +12909,12 @@ engine: the verdict, rebase, position mapping, the register).
 > encoding's order, or one object encoded, a unit; both parts kept last. Between turns it holds no borrow, and over any
 > turns it writes the bytes one pass writes. Owed: one object, a pair of trees and a part's put each still one unit.
 >
+> **Status (2026-11-19, A-614 part 3 superseded by A-666).** The commit rows keep no changed-path Bloom filter: no
+> path-limited walk the server makes needs one (the amendment lists the walks checked). slates' API answers a path's
+> `log`, `--follow` and blame from A-666's derived types, the version their unit; upload-pack walks no path's history,
+> receive-pack judges ref names, a hook's git walks the hook view itself, and Subversion's path reads walk its own node
+> history over revisions. A-614 is complete with parts 1 and 2.
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -13007,8 +13013,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    hashes `<type> <length>\0<content>`; the store keeps the content, and for a blob that content is the file's bytes in
    the checkout (§4.17.1, objects item 1).
 2. **Index rows.** Each object's row (§4.17.1, objects item 3) holds its type, length, content identity and the version
-   that brought it. A commit's row adds what git's commit-graph keeps: its parents by position, root tree, commit date,
-   generation number and the Bloom filter of the paths it changed against its first parent [B: gitformat-commit-graph].
+   that brought it. A commit's row adds what git's commit-graph keeps for walks: its parents by position, root tree,
+   commit date and generation number [B: gitformat-commit-graph]. The changed-path Bloom filter a commit-graph may add
+   is not kept: a path's history and blame are A-666's derived types, and no walk here reads paths (A-614 part 3,
+   superseded).
    The rows are computed when the push that brings the commits is admitted, in time proportional to the new commits;
    nothing rewrites them later.
 3. **What each version brought.** Version k records D(k): the objects reachable from its head and not from version k-1's
@@ -13139,9 +13147,10 @@ presents it to the hook driver on the owner shard.
 **Operations on the server.** Merging a review request is §4.17.1's merge: on accept the server makes the merge commit
 (parents: the target's head and the request's head; tree: the accepted version's; author and committer the person who
 merged, at the merge record's time) or rebases the request's commits, keeping their authors, by the policy's method.
-`log` and `blame` of a path through slates' API: the change index and `last_changed` narrow the path's history to
-versions, and the commit rows' Bloom filters narrow it to commits. Blame's line attribution uses git's own diff
-algorithm, so its answer equals `git blame`'s; it is a read of history, decides no write, and never feeds a verdict.
+`log` and `blame` of a path through slates' API are A-666's derived types (A-645 "Queries by API"): a path's history
+reads one node a version it lists and blame each file's spans, the version their unit, so a stock push's several
+commits are one version there and a history inside one push is its client's own, over its clone (A-614 part 3,
+superseded); each is a read of history, decides no write, and never feeds a verdict.
 
 **Tunables, each learned (§4.17.1's rule).**
 
@@ -13227,8 +13236,8 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 4. The tree, commit and tag parsers with the fsck checks.
 5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack
    (part 1 built, A-614: naming, rows, commit rows, D(k) and reached sets, a version read as a tree; part 2 built:
-   the fragments and the base pack, their window, depth, zlib level and rebuild point learned; part 3 the commit rows'
-   changed-path Bloom filters).
+   the fragments and the base pack, their window, depth, zlib level and rebuild point learned; part 3, the commit
+   rows' changed-path Bloom filters, superseded by A-666's path history and blame).
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
    report-status-v2, atomic; a create's green made from its commit's tree, its maps (A-534) built from a commit that is no
    version's head.
@@ -48886,3 +48895,40 @@ the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` sha
   `Entry::Create::from`, `Unappended::Refused`, `append_declined`, `atomic_declined`, module docs),
   `receive/session.rs`, `receive/request.rs` (`RequestReader` keeps a copy), `receive/mod.rs` (`HiddenRefs for &T`),
   and their tests; GAPS (the §4.17 entry).
+
+### A-614 part 3 — superseded by A-666: the commit rows keep no changed-path Bloom filters (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 2, "Operations on the server", piece 5; A-645 "Queries by API"; A-666 parts 2 and 3)
+
+Applied in the same change to: §4.17.2 (item 2, "Operations on the server", piece 5's line, a status block), GAPS
+(A-614's entry), `crates/git`'s store module docs (their owed list).
+
+- **What part 3 was for.** git's commit-graph may keep, for each commit, a Bloom filter of the paths it changed against
+  its first parent, so a path-limited walk skips the commits that cannot have touched the path \[B:
+  gitformat-commit-graph\]. §4.17.2 planned them for one walk: `log` and `blame` of a path through slates' API, the
+  change index narrowing a path's history to versions and the filters narrowing it to the commits within them.
+- **Why superseded.** Since A-645 (Ada, 2026-11-19, "Queries by API"), history and blame are answered from derived
+  data, and A-666 built both: part 2's history reads one node a version it lists, under git's default-mode
+  simplification exactly, and part 3's blame reads the path's trie nodes and the file's spans, never a diff of the
+  history. Neither walks commits, so a filter has nothing to skip. Their unit is the version, a ref's head move: a stock
+  push's several commits are listed as that one version, and a commit-granular history inside one push is the client's
+  own computation over its clone, with its own commit-graph and filters (`git commit-graph write --changed-paths`),
+  which the server portion does not rebuild. The commits the server makes are one a version (A-664), so for native
+  work the version is the commit.
+- **The walks checked** (the server's code at main e50757a1a, read, not run):
+  - upload-pack walks no path's history: `sparse:oid` filters objects by path patterns over trees (A-640 part 4), and
+    the negotiation (A-615) walks commits by generation, never by path.
+  - receive-pack judges ref names (`vcs_policy`, A-597); a protected branch's questions walk D(k)'s commits for a merge
+    or an unsigned commit (A-644), not paths.
+  - A hook's git walks the read-only view itself (A-665), which serves no commit-graph: that walk is git's, in the
+    hook's process.
+  - Subversion's `log`, `get-file-revs`, `get-deleted-rev` and the report's drive walk FSFS's node history over
+    revisions on the Subversion index (`crates/svn/src/reads/history.rs`, A-613 part 2); a revision is a version, and
+    git's commit rows hold nothing for them.
+  - Mercurial's server walks no path's history: its clients hold theirs.
+  - slates' API answers `log <path>`, `--follow` and blame from A-666's types; no server verb over them exists yet
+    (A-666's owed "the server's verbs over the types"), and when built they read those types.
+- **What stays.** The commit rows keep what the walks above read: parents by position, root tree, commit date and
+  generation number. Should a server walk ever need a commit's changed paths (a per-commit path rule, a commit-granular
+  history the API is asked for), a type of A-647's derived data per commit is the place for it, not a field of the
+  rows.
+- **Owed.** Nothing of A-614: parts 1 and 2 built, part 3 superseded. The server's verbs over A-666's types stay
+  A-666's.
