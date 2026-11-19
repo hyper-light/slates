@@ -38879,7 +38879,8 @@ Applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `
 ### A-575 — A repository's greens are one lineage on its partition: the repository verbs, a member lent for one borrow, a member's release sliced, and memberships recovered from the log and the snapshot (2026-11-19, g261 for UI goal 91; §4.17.1 items 1 to 5 and shared piece 1's last part; §4.16 "The state's maps"; D-28; A-515, A-534)
 Applied in the same change to: §4.16 (the subsection's status), §4.17.1 (a status block, the pieces list's item 1), GAPS
 (the §4.17 entry), `crates/merge/src/ptrie.rs` (`Releasing`, `Nodes::release_step`), `crates/merge/src/dims.rs`
-(`GreenRelease`, `Arenas::release_step`), `crates/merge/src/engine/branch.rs` (`Lineage::take`, `put_back`, `create`,
+(`GreenRelease`, `Arenas::release_step`) and A-542's copy tests (`crates/merge/src/dims/copy/tests.rs`: `release_all`
+steps, since a map's whole release is gone), `crates/merge/src/engine/branch.rs` (`Lineage::take`, `put_back`, `create`,
 `retire` returning a `Release`, `release_step`, `len`; `Lent`; `LineageRefused::Busy`) and its tests,
 `crates/db/src/{catalog,op,error,partition,repository}.rs` (`MemberOrigin`, `MemberRecord`, `Op::RepositoryGreenJoined`,
 `DbError::BranchedFrom`, the snapshot's `repository_members`), `crates/db/tests/wire_order.{rs,txt}`,
