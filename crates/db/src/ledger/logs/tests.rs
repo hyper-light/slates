@@ -588,14 +588,29 @@ fn applied_beside(world: &Apart, log: LogName, other: LogName) -> Vec<HostId> {
     .collect()
 }
 
-/// The hosts whose applied cut a replica's read refuses: one holding part of a record and not the rest.
+/// The hosts that applied part of a record and not the rest: a replica's read of what each applied over every log it
+/// holds (`held_cut`) refuses it as split.
 fn split_holders(world: &Apart) -> Vec<HostId> {
   hosts(1)
     .into_iter()
     .filter(|host| {
-      let applied = world.cohort.applied(*host);
+      let applied = held_cut(&world.cohort, *host);
       world.cohort.read(*host, &applied).is_err()
     })
+    .collect()
+}
+
+/// What `host` applied over every log it holds a copy of, a log it never applied at position 0: the cut its joins must
+/// keep whole (A-636 part 2a). `LogsCohort::applied` names only the logs the host applied something of, and a replica's
+/// read judges a split only among the logs its vector names, so judged by it alone a holder that applied a record's
+/// position on one log and never applied the record's other log would read whole.
+fn held_cut(cohort: &LogsCohort, host: HostId) -> Cut {
+  let applied = cohort.applied(host);
+  cohort
+    .logs
+    .iter()
+    .filter(|(_, log)| log.held(host).is_some())
+    .map(|(name, _)| (*name, applied.get(name).copied().unwrap_or(0)))
     .collect()
 }
 
@@ -1390,10 +1405,11 @@ impl World {
     }
   }
 
-  /// A holder's applied cut: answered whole at itself (no record split, the committed history), never behind what it
-  /// applied before; its records of several logs counted as applied at their joins.
+  /// A holder's applied cut over every log it holds, a log it never applied at position 0 (`held_cut`, A-636 part 2a):
+  /// answered whole at itself (no record split, the committed history), never behind what it applied before; its
+  /// records of several logs counted as applied at their joins.
   fn check_holder(&mut self, host: HostId) -> Result<(), TestCaseError> {
-    let applied = self.cohort.applied(host);
+    let applied = held_cut(&self.cohort, host);
     let before = self.applied.get(&host).cloned().unwrap_or_default();
     for (log, position) in &before {
       let now = applied.get(log).copied().unwrap_or(0);
