@@ -1533,8 +1533,14 @@
 > work to the same answer and head as the same work submitted, after a generated work merged ahead of it: 400 cases,
 > red-checked on each fix. `docs/bugs/2026-11-09-a-rebased-work-was-restated-into-other-bytes.md`.
 >
-> **Open and owed (found by perf, 2026-11-09, §4.16 "Composition at seal"): an edit after a rename is accepted and
-> lost.** A work renames `a` over `b`, writes at the end of `b`, and submits. It is accepted, and `b` holds `a`'s head
+> **An edit after a rename was accepted and lost: fixed (2026-11-19, A-547, g225; found by perf, 2026-11-09, §4.16
+> "Composition at seal").** The verdict now maps the destination's ops through what changed the source since the work's
+> base and splices them into the bytes the rename moves (`Green::edits_after_rename`; an edit meeting such a change is
+> an overlap conflict, never dropped); the chain entry's `Copied` carries them (tag `COPIED_SPLICED`, a rename alone
+> encoding as before), replay applies them, and the rebase restates them after the `Rename`
+> (`an_edit_after_a_rename_over_a_file_is_merged_with_the_renamed_bytes`, `crates/merge/src/engine.rs`; the parked
+> server test is no longer ignored). Owed: the rebase oracle's generator still stays out of this case. What was there:
+> A work renames `a` over `b`, writes at the end of `b`, and submits. It is accepted, and `b` holds `a`'s head
 > bytes alone. This is on main with no rebase involved. The verdict skips a renamed-into path's content ops
 > (`decide_content`) and copies the source's head bytes (`merge_rename`). The chain entry's `Applied::Copied { dst, from }`
 > has no ops to replay, and replay maps an entry's effects before committing any, so a second `Spliced` effect cannot
@@ -4022,6 +4028,13 @@
 > shard's keeper on its timing wheel (`crate::deadlines`), off the tick. Still on the tick: leases, lapsed CLI
 > attachments, destroys, grants, the owed audit, departed hosts' attachments (A-222), held copies, the pressure hold,
 > NFS purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
+> **Since A-536 (piece 3)** write leases, lapsed CLI attachments and destroys are off the tick too: the keeper sleeps to
+> the lease wheel's next deadline and to the partition's new index of CLI terms, woken by whatever records an earlier one
+> (each state borrow hands it the partition's note); a takeover's relinquish wakes the serve loop that steps destroys,
+> and a refused destroy record is retried at its own deadline; a deadline still past after a pass is retried a window
+> on, never spun on (job 3's red check found that spin). Still on the tick: grants, the owed audit (piece 4), departed
+> hosts' attachments (A-222), held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the
+> idle seal and the huge-page re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
@@ -11666,6 +11679,17 @@ dead daemon left: 72 pipelined writes across six kills answered on one connectio
 Open:
 - Linux connections are not held: Linux may take part of a send, so a successor needs the exact written-byte check
   against a ledger of the send in flight (A-113) before it may resume one.
+  - **Built, part 1 (2026-11-18, A-550, goal 85, g079): the adoption's judgment.** `crate::held_send::resume` judges a
+    held connection from the bytes the kernel says its writer handed it against the ledger of the send in flight:
+    exactly the bytes before that send (`Untouched`) or those and the whole send (`Whole`) serve on, any other count is
+    `Torn` and ends the connection. Held by `a_held_connection_is_served_on_only_on_a_records_boundary` (the server's
+    unit tests, every host), red with today's rule on the Mac Studio.
+  - **Owed, part 2 (Linux-only, main's to write and compile; run-requests.md):** the ledger in anchor-owned RAM (per
+    held connection, `committed` and `in_flight` written before each send and `committed` advanced after it, each
+    record checksummed so a torn write reads as torn); the kernel's count at adoption (`TCP_INFO`'s
+    `tcpi_bytes_acked`, measured for whether it counts the SYN, plus `SIOCOUTQ`); `make_sends_whole` answering held on
+    Linux once both are there, and `nfs::adopt_held` ending a `Torn` connection before it reads; then the Linux kill
+    run of `crates/cli/tests/nfs_held.rs`.
 - The kernel client under kills has not been re-run with the fix: it repeats the experiment that panicked the machine,
   so it waits for Ada.
   - **2026-11-18 (g079), Ada's go.** On Adas-Mac-Studio-2 (b24c5c95: M4 Max, macOS 26.2, no memory tagging),
@@ -11804,7 +11828,7 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; part 3 owed)
+### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; its host, oracle and naming built, A-524; the volume over it owed)
 
 > - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
 >   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
@@ -11825,14 +11849,31 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   store on loopback, over TLS and in the clear; the framing's five, twenty-three hostile answers among them; the
 >   waits' three); red once each (a `412` untyped, `If-Match` not sent, no back-off, a length past its cap let
 >   through); `cargo xwin check -p slates-base` (Windows x86_64) clean.
+> - **Built (part 3, A-524).** `S3Host` (`crates/base/src/s3/host.rs`), the host seam over the base's objects, sans-io:
+>   a miss answers `HostError::Pending` (`VfsError::BasePending`, `Unpublished` on the wire) and names its fetch, one
+>   however many calls miss on it; a directory is its delimited listing, serving one learned round trip and listed again
+>   after it while it answers; a file bound to its object by `If-Match` and its version (a versioned bucket's replaced
+>   object still reads its own version; elsewhere `412` or `404` makes the handle stale); chunks and listings cached
+>   within the caller's budget. `SimS3` (`sim.rs`) is its oracle; `S3Base` (`name.rs`) the library's naming, exported by
+>   `slates-api` (contract 43). Proven (Mac Studio, debug, 2026-11-19): `cargo test --locked -p slates-base --lib -- s3`
+>   49 of 49 (the host's eight, the oracle over 256 generated histories on versioned and unversioned buckets, `SimS3`'s
+>   two, the naming's four); the api's naming and contract tests 2 of 2; red first four ways (a landed range unkept, a
+>   `412` taken for an unavailable store, a version unbound, a stale listing never listed again).
 > - **Owed.**
 >   - Part 2's remainder: the platform's trust roots (a source of roots to choose: compiled-in or the operating
 >     system's store), name resolution (the caller resolves the endpoint today), the read-ahead from the measured
 >     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
 >     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
->   - Part 3: the `HostFs` implementation from a RAM cache with misses parked and run again, `SimS3` as its oracle and
->     the N=1 differential, the library's way to name an S3 base and hand its credential, the anchor's hold of the
->     credential across a restart.
+>   - The volume over an S3 base (A-524's status in §4.15): the wire's create naming a base and the credential's
+>     hand-off, held in RAM by the owner shard and by the anchor across a restart; the shard's driver running the host's
+>     fetches on the client; the server parking a request on `BasePending` and running it again when its fetch lands,
+>     for every bridge (each answers it by its catch-all until then: FUSE `EIO`, NFS `NFS3ERR_SERVERFAULT`); the base
+>     plane's host calls audited for a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s
+>     `open_file(..).ok()?`); recovery over an S3 base (a pending reacquisition marks its directory unavailable, errno
+>     0); and the N=1 differential through `SimS3`.
+>   - The fetches under way are bounded by the parked requests, not yet by the cache: many concurrent misses on a cache
+>     of a few chunks could shed each other's landed runs before their requests run again (the server's parking piece
+>     holds a landed run until its waiters have run).
 >   - The listing page and request caps assume a continuation token no longer than an encoded key (S3 states no
 >     length): the client counts the longest a listing names (`Counts::longest_token`); the live run reads it.
 >   - The cross-target lint of `slates-base` with its new `aws-lc-rs`, `rustls`, `slates-rt` and `slates-transport`

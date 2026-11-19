@@ -65,7 +65,7 @@ fn components<'a>(prefix: &str, key: &'a str) -> Result<(Vec<&'a str>, bool), Re
 }
 
 /// Whether `name` can be one POSIX name: not empty, not `.` or `..`, no NUL, at most `NAME_MAX` bytes.
-fn check_name(name: &str) -> Result<(), Refused> {
+pub(crate) fn check_name(name: &str) -> Result<(), Refused> {
   if name.is_empty() {
     return Err(Refused::EmptyComponent);
   }
