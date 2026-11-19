@@ -12102,6 +12102,26 @@ is one more version, and the chain itself is never rewritten.
 > verdict"): a work based before its file was replaced was spliced into the replacement, and a truncate based before an
 > append dropped the appended bytes. Owed: the server's verbs (write, move each comment as its request gets a version, approve, stale,
 > close), their wire refusals typed, and a comment's version held as a live reader of its green's fold floor.
+>
+> **Status (2026-11-19, A-659; shared piece 5).** Works over works and bases given as trees are built in the engine
+> (`crates/merge/src/engine/stack.rs` and its modules). An upper (`slates_merge::engine::Upper`) is a work whose ops
+> document was composed against another work's post-state. It is restated over the version its lower landed as
+> (`Green::restate`): the green's changes between the lower's base and its landing are read for the paths the upper
+> names, and moved over the lower's operations by the walk the verdict mapped the lower with, so the moved changes and
+> the lower's landed operations come from one decision (the landed operations are held to the delta the green recorded,
+> a guard). The upper is mapped through the moved changes and judged as the verdict judges a work against the changes
+> after its base, in every dimension; what landed after that version is the verdict's, as for any work. A change the
+> lower made too is in the upper's base already (a same-span overwrite, a metadata value); one the lower met in another
+> shape (an identical replacement the verdict accepted whole) makes the file a conflict for the upper, never a guess.
+> `Green::land_stack` lands a stack of any depth in order, each work all or none, in one call: a work that does not
+> land leaves the ones above it unjudged (`Landed::LowerRefused`), and a stack landed again is answered each work's
+> version. A work over a tree (item 6) is judged by whole-value differences between the tree and the head at the paths
+> it names (`Green::restate_over_tree`). The oracles hold a stack to a replica where its works landed first, at its base,
+> and the other works after them, which is the rule below made plain, and a work over a tree to a whole-file model.
+> Owed: the server's verbs (an upper held over its lower and restated as the lower lands; the lower's base held as a
+> live reader of the green's fold floor while an upper over it is unlanded); the whole-file identity check for an
+> upper's length-changing operation that meets a change (refused today, since the upper's base file is no version's);
+> a copy in a stack; a stack whose bottom is a tree.
 - A review request (git's pull request; §4.17.3 and §4.17.4 say what one is for their tools) is a work held
   unsubmitted, with a review record: comments anchored to the work, one of its versions, a path and a byte range;
   approvals; and the evidence the policy requires (status checks, signatures).
@@ -12303,7 +12323,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    sliced, comes with each server's object pieces).
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
    client-fidelity test (an accepted push's paths hold exactly the client's bytes).
-5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
+5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree
+   (built in the engine, A-659: `Green::land_stack`, `Green::restate` and `Green::restate_over_tree`; the server's verbs
+   owed).
 6. Review records: comments anchored and moved by position mapping; approvals as evidence (built in the engine and the
    metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
@@ -45914,3 +45936,76 @@ three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/s
   `crates/vcs/src/content.rs` (`Form::Derived`, `put_derived`, `derived`, `DerivedNode`, `encode_derived`, the release
   cascade, `NotNameable`, `ContentCounters::derived`); `crates/vcs/src/lib.rs`; A-645's entry; §4.17.1 "Reads"; GAPS'
   §4.17 entry.
+
+### A-659 — Works over works: an upper restated over the version its lower landed as, a stack landed in order with each work all or none, and a base given as a tree judged by whole-value differences (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.17.1 "Works over works", "A push is a work" item 6 and shared piece 5; §4.16 "Position mapping" and "The verdict")
+
+- **What was there.** §4.16 based a work on a version of the green only. A request built on another request, a stack of
+  topics, or an agent's next work on its last before that one landed had nowhere to stand: its base is a work's
+  post-state, which no version holds until the lower lands, and when the lower lands mapped (other works landed first)
+  no version ever holds it.
+- **The decision.** An upper (`slates_merge::engine::Upper`) holds its ops document as the deriver composed it against
+  its lower's post-state, and names no version. `Green::land_stack(bottom, uppers)` lands a stack in order: the bottom as
+  any work; each upper, once the work below it landed, restated over that version (`Green::restate`) and judged as a
+  work based on it, all or none; a work that does not land leaves every work above it unjudged
+  (`Landed::LowerRefused`, naming the first that did not land). No client round trip, and the lower is never judged
+  again. An upper restated over a version is judged under an identity derived from its own and that version, so a stack
+  landed again is answered each work's version and commits nothing.
+- **Restating, by the walk the verdict used.** The version a lower landed as differs from its post-state by what the
+  green's other works changed between the lower's base and its landing, which the verdict mapped the lower through.
+  Those changes are read from the green for the paths the upper names: the deltas at the versions the path's content
+  history names in that span, and each dimension's history, at the cost of the path's own changes. They are moved over
+  the lower's operations by the walk `crate::map` maps a range with: an operation ending at or before another's start
+  shifts it, and the first starting at or after its end ends the walk. Delta and work are both sorted, so the delta
+  operations each work operation passes are a prefix that only grows, and one decision gives both sides: the lower's
+  operations as the verdict landed them, and the changes as they stand over the lower's post-state. The first are held
+  to the delta the green recorded when the lower landed (`RestateRefused::Diverged` otherwise, a guard that never fires
+  on a correct engine). The upper's ranges are then mapped through the moved changes as a work's are through the deltas
+  since its base. A stack of any depth repeats this a level at a time, following a path through each lower's renames
+  (a renamed file's bytes from its source, A-547; its mode and attributes with its path, A-618), and a path a lower
+  made holds only its own content.
+- **What a lower absorbed.** A change the lower made too, which the verdict accepted as identical, is in the upper's
+  base already, so the upper does not meet it: a same-span overwrite, and a mode, attribute, link or IPC node the lower
+  set. Any other meeting the verdict accepted (an identical replacement of another shape, which it accepts whole) moves
+  by no position mapping, so every operation of an upper on that file is a conflict, never a guess.
+- **The upper's verdict.** Restated over a version, the upper is judged by the verdict as a work based on it, which
+  checks the head's state and the changes after it. Every check the verdict makes of a work against the changes after
+  its base is made against the moved changes too, in the words of the `Green::merge_*` it mirrors: a rename's source
+  removed (`RenameRename`) or its destination changed; a removal of a node changed in any dimension (`DeleteModify`,
+  A-643); a mode or an attribute another work set otherwise (`MetaMeta`), a symbolic link, a hard link or an IPC node
+  (`CreateCreate`); a hard link's node removed; a node-exclusive operation's paths changed at all (A-542). A value the
+  new base holds as the upper sets it is the identical case and accepted. A content operation no change met lands at
+  its moved place, a truncate the green's appends outgrew as the delete of what it saw (A-612); one a change met is a
+  conflict unless it overwrites exactly the new base's bytes there. A length-changing one a change met is a conflict:
+  the verdict's whole-file check would rebuild the upper's base file, which is no version's (owed).
+- **A base given as a tree** (`Green::restate_over_tree`, `land_over_tree`; the `TreeBase` a tool's store implements,
+  answering what the tree holds at a path in the green's terms). What the green changed since the tree is read as
+  whole-value differences between the tree and the head at the paths the work names: a file the head holds as the tree
+  held it keeps the work's operations in the same coordinates; one the head holds otherwise is an overlap over the whole
+  file unless the work makes exactly the head's bytes; a removal, a mode, an attribute and a link are judged against the
+  difference of their whole values. One lookup in the tree and one in the head a path, never a walk of the tree.
+- **Typed refusals** (`RestateRefused`): a work below that has not landed (`NotLanded`, its place); history a lower was
+  mapped through folded below the checkpoint or fold floor (`Folded`); a copy in a stack (`Copy`, owed with the
+  deriver's copy, as a rebase); a lower's landing the green recorded otherwise (`Diverged`).
+- **Tests** (`crates/merge/src/engine/stack/`): 11 worked cases (a stack on the head as its works applied in order; an
+  upper mapped through what its lower was mapped through; an upper meeting a change its lower never saw, with the rest
+  unjudged; a refused bottom; a stack landed again; an upper landed after its lower; a lower's rename and make followed;
+  removals and metadata judged; a change the lower made too; one it met in another shape; a truncate keeping an append;
+  every refusal), 3 tree cases, and two oracles. The stack's oracle runs generated histories of works at and behind the
+  head and stacks of one to four works with works landing between a stack's base and its landing, and holds each work of
+  each stack to a replica in which the stack's works below it landed first at its base and the works between after
+  them: the verdict then judges each upper against exactly "the green's deltas except the lower work's own", and
+  disjoint changes commute, so the green must land each work where its replica does and hold the replica's files byte
+  for byte. Its census counts every depth, uppers moved and unmoved, and every refusal. The tree's oracle holds a work
+  over a tree some versions back to a whole-file model. EVIDENCE-PENDING (the Mac Studio was offline when this was
+  written; the runs are recorded here when it answers).
+- **Finding** (filed in GAPS, owed): the verdict's walk stops at the first delta operation starting at or after a range's
+  end, so a work's insert at an offset where a delta overwrites or truncates and inserts too (canonical order puts the
+  overwrite or truncate first) never meets the delta's insert: it is accepted before both, while the same two works in
+  the other order conflict as two inserts at one point. The oracles generate no two operations at one offset; the
+  engine's rule for that case is owed a decision.
+- **Owed.** The server's verbs: an upper held over its lower, restated as the lower lands or is rebased, and the lower's
+  base held as a live reader of the green's fold floor while an upper over it is unlanded. The whole-file identity check
+  for an upper's length-changing operation. A copy in a stack. A stack whose bottom is a tree.
+- **Applied in the same change to:** §4.17.1's "Works over works" status and shared piece 5's text; GAPS' §4.17 entry;
+  `crates/merge/src/engine/stack.rs` and `stack/{moved,levels,judge,tree}.rs` with `stack/{tests,oracle,tree_tests}.rs`
+  (new); `crates/merge/src/engine.rs` (the module's two lines).

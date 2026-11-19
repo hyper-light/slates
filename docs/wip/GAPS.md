@@ -98,6 +98,24 @@
 > green's fold floor; following a renamed file with the engine's path remapping; the integration suites, clippy and
 > `xtask` over the change (main's; `crates/db/tests/wire_order.rs` against `Op` 90 to 95, published by hand). Two
 > verdict findings, below, were fixed by A-612 (2026-11-19).
+> **A-659 (2026-11-19, g306; shared piece 5, works over works and bases given as trees):** built in the engine
+> (`crates/merge/src/engine/stack.rs` and its modules). An upper, a work composed against another work's post-state,
+> is restated over the version its lower landed as (`Green::restate`): the green's changes between the lower's base and
+> its landing are read for the paths the upper names and moved over the lower's operations by the walk the verdict
+> mapped the lower with, the lower's landed operations held to the delta the green recorded; the upper is mapped
+> through them and judged against them in every dimension as the verdict judges a work against the changes after its
+> base. `Green::land_stack` lands a stack of any depth in order, each work all or none, a refused work leaving those
+> above it unjudged, a stack landed again answered each version. A work over a tree is judged by whole-value
+> differences between the tree and the head (`Green::restate_over_tree`). Tests: 11 worked cases, 3 tree cases, the
+> stack's oracle against a replica in which its works landed first and the works between after them, and the tree's
+> against a whole-file model (EVIDENCE-PENDING: the Mac Studio was offline). Owed: the server's verbs (an upper held
+> over its lower and restated as it lands; the lower's base held as a live reader of the fold floor while an upper over
+> it is unlanded); the whole-file identity check for an upper's length-changing operation that meets a change (refused
+> today); a copy in a stack; a stack whose bottom is a tree; clippy, `xtask` and the lint matrix over the change
+> (main's, run requests). **Finding, open:** the verdict's walk stops at the first delta operation starting at or after
+> a range's end, so a work's insert at an offset where the delta overwrites or truncates and inserts too is accepted
+> before both, while the two works in the other order conflict as two inserts at one point; the oracles avoid two
+> operations at one offset until the engine's rule for it is decided.
 > **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
 > BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
 > no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held
