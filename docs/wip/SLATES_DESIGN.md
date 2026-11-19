@@ -12163,6 +12163,16 @@ engine: the verdict, rebase, position mapping, the register).
 > stock git 2.50.1's own HTTP traffic with `http-backend` (its heads and inflated bodies, SHA-256 checked) and hostile
 > input at every cut. Owed: the edge that reads sockets (TLS, authentication, `100 Continue`, the services' bodies
 > streamed through, the staged close).
+>
+> **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
+> reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
+> server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
+> peeled line folded into the tag before it, the shallow lines), the client's `want` (the first with its capabilities),
+> `have`, `done`, `shallow`, `deepen`, `deepen-since`, `deepen-not` and `filter`, the server's `NAK` and `ACK` (plain,
+> `continue`, `common`, `ready`), the shallow-update, and `ERR` from either side. Each line is written with or without
+> its LF as git writes that line, and read either way, as git's readers read it. A capability git does not define is
+> kept by name; a malformed object name or line is refused by kind and place. Proven against fifteen exchanges and six
+> advertisements stock git wrote under protocol.version 0 and 1. Serving a v0 or v1 fetch is piece 14's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12216,7 +12226,7 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
   wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and `object-info`. `ls-refs` lists
   only `unborn`, as git does (`ls-refs.c` `ls_refs_advertise`): `symrefs`, `peel` and `ref-prefix` are the command's
   base arguments, which need no feature [B: gitprotocol-v2 "ls-refs"]. A v0 or v1 fetch (the old ref advertisement and
-  its negotiation) is a later piece.
+  its negotiation) is piece 14; its codecs are built (A-604), and serving one is owed.
 - receive-pack capabilities: `report-status`, `report-status-v2`, `delete-refs`, `ofs-delta`, `atomic`,
   `push-options`, `side-band-64k`, `quiet`, `object-format` and `agent`.
 
@@ -13144,7 +13154,9 @@ for Subversion.)
    lock at or beneath it, as FSFS's `verify_locks` checks: a lock kept through its file's deletion can stand beneath a
    path added later. A lock held by another principal is `E160039`, checked first. A lock whose token the commit did
    not present is `E160037`, wherever in the commit the token was presented. A commit with no principal that meets a
-   lock is `E160034`. An accept releases every presented lock whose token and owner match, paths it did not change
+   lock is `E160034`. The first lock that fails answers, in the order FSFS's `verify_locks` meets them: the changed
+   paths in Subversion's path order, a path's children right after it, so `/t/a/b` before `/t/a-b` (A-617). An accept
+   releases every presented lock whose token and owner match, paths it did not change
    among them, unless the client asked to keep them. The check and the release are in the verdict's one step on the
    owner, so no lock changes between them (A-602).
 5. **What the version records.** The revision's changed-path rows as the drive declared them (add; delete; replace, a
@@ -41141,3 +41153,97 @@ Applied in the same change to:
   challenge, 403), `100 Continue`, each service's body streamed into upload-pack and receive-pack and the replies out
   in chunks, the staged close of RFC 9112 §9.6; the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's
   DAV reading their requests through it.
+
+### A-617 part 1 — A-602's lock check answers the first failing lock in Subversion's path order, as FSFS's `verify_locks` does (2026-11-19, g268 for UI goal 93; §4.17.4 item 3.4; A-592's finding, A-602)
+Applied in the same change to: §4.17.4 item 3.4 (the order the first failing lock answers in), GAPS (the §4.17.4
+entry: A-592's finding fixed), `crates/svn/src/lock.rs` (`LockTable::verdict` through `met`, `in_path_order` and
+`path_order`), `crates/svn/src/lock/tests.rs` (the model returns at the first failing check; the census counts the
+commits the order decided), `crates/svn/src/commit/tests.rs` (A-592's scratch case, committed; the transcription's
+order beneath a path read whole).
+- **What was there.** `LockTable::verdict` gathered the locks a commit's changes meet into a map by the locks' paths and
+  verified them in its byte order. FSFS's `verify_locks` sorts the changed paths with `svn_sort_compare_items_as_paths`
+  (`path.c` `svn_path_compare_paths`: a path's children right after it, before its later siblings) and returns at the
+  first path whose check fails (`transaction.c` 3537-3539, 3578). So a commit refused by locks at both `/t/a/b` and
+  `/t/a-b` was answered at `/t/a-b`, where `svnserve` answers `/t/a/b` (A-592's finding). A-602's oracle let it pass:
+  it accepted any lock that could refuse the commit anywhere, though only the order beneath one path read whole, a
+  hash table's in FSFS, is free.
+- **The decision.** `met` gives the locks in `verify_locks`' order: the changed paths in that path order, a modified
+  path's own lock and every lock at or beneath a path added, deleted or replaced, a path beneath one so read skipped,
+  each lock once; beneath a path read whole the same path order, the path's own lock first, as FSFS's walk sends it.
+  `path_order` compares names one by one, which equals `svn_path_compare_paths` on canonical paths (A-592's oracle held
+  the two equal over prefixes and bytes either side of `/`). The model of A-602's oracle returns at the first failing
+  path, so the table must answer one of that path's locks.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the branch). Failing first (04:39
+  UTC, load 8.7): with the tests and lock.rs before the fix, `cargo test --locked -p slates-svn --lib` failed 2 of 155:
+  A-592's case answered `/t/a-b`, and A-602's oracle met a commit modifying `/a-b` and `/a/f` refused at `/a-b`, none
+  of the first failing path's `{/a/f}`. Green (04:39 UTC): 155 of 155 in 1.14 s; A-602's census: 408 refused commits,
+  38 of them decided by the order; A-592's census unchanged in kind. `cargo fmt` clean. Clippy, `xtask check` and the
+  doc gate are main's (the run-request queue).
+
+### A-604 — protocols v0 and v1's codecs: the ref advertisement, a fetch's request and negotiation, and the shallow-update, read and written as stock git 2.50.1 does (2026-11-19, g230, UI goal 92; §4.17.2 "Pieces (git)" piece 14, its first part, and "The wire"; after A-582 and A-600)
+Applied in the same change to:
+- §4.17.2's status and "The wire", and GAPS (the §4.17 entry);
+- `crates/git` (`v0.rs`, new; its tests; `fixtures/v0` with `make-v0-fixtures.sh` and `SHA256SUMS`; `object_name.rs`:
+  the null name, a hex writer, and the decimal reader and writer it now shares with `v0`; `lib.rs`).
+- **The lines, and how git ends them.** With LF, as git writes them: the advertisement's lines (`version 1`, the first
+  ref with its capabilities after a NUL, `capabilities^{}` for a repository with no refs, the other refs, peeled lines,
+  `shallow`; `upload-pack.c`'s `write_v0_ref`, `receive-pack.c`'s `show_ref`), `want`, `have` and `done`
+  (`fetch-pack.c`), `ACK` and `NAK` (`get_common_commits`). Without: the request's `shallow` (`shallow.c`'s
+  `write_shallow_commits`), `deepen`, `deepen-since`, `deepen-not` and `filter` (`fetch-pack.c`), the shallow-update's
+  `shallow` and `unshallow` (`send_shallow`, `send_unshallow`), and `ERR` (`packet_writer_error`).
+- **What a reader takes.** One LF off a line's end and object names of either case, as git's readers take them and as
+  gitprotocol-pack asks ("the receiver MUST NOT complain if it is not present"; "both MUST treat obj-id as
+  case-insensitive"). It is stricter than git's readers where they take what no git writes, each refused by kind:
+  - bytes after an object name (`get_oid_hex` reads the digits it needs and ignores the rest);
+  - a depth or a time in octal or hexadecimal, or with a sign (`strtol` and `parse_timestamp` with base 0);
+  - `ACK` followed by any word that merely contains a status (`get_ack` searches with `strstr`);
+  - a peeled line that does not follow its ref ("MUST be immediately after the ref itself");
+  - a ref line after the first carrying capabilities (`connect.c` warns and ignores them), a first line with no NUL,
+    an empty capability list (the grammar's `capability *(SP capability)`).
+  `deepen 0` is refused as `upload-pack` refuses it ("Invalid deepen"), although the document calls a depth of 0 no
+  request; `deepen-since` refuses the one time git refuses, its `-1`.
+- **Capabilities.** Kept by name, in their order, unknown ones included, each checked against the grammar: a name of
+  `a-z`, `0-9`, `-` and `_`; a value of any byte above space but DEL (an agent and a session id are printable ASCII,
+  a symref's target is a ref name that may hold UTF-8, and git's `parse_feature_value` ends a value at a space or a
+  tab). The first `object-format` names the advertisement's format, SHA-1 when there is none; one naming no format git
+  knows is refused. A list read from a line borrows its bytes; a list to write may be the caller's own
+  (`Capabilities::listed`), and both compare and write alike. Whether a server refuses a client's capability it never
+  advertised is the serving piece's decision: gitprotocol-capabilities says it MUST, and git 2.50.1's `upload-pack`
+  does not.
+- **Messages.** The advertisement and the shallow-update are decoded whole: walked once to check them and count their
+  lists, the exact total charged to the caller's admission, and walked again to build. Given part of one, a reader
+  answers `None`. A message that breaks its grammar is refused where its packet begins: `Unexpected` (a special packet
+  in its body, a peeled line out of place, a ref after the shallow lines or after `capabilities^{}`, a `shallow` after
+  an `unshallow`), `Version` (`version 2` is protocol v2's advertisement, and git refuses `version 0`), `ServerError`
+  (`ERR` where a line was due), or `Line` with the line's own refusal. A writer checks a whole message in a measuring
+  pass before it writes its first byte, so a refusal writes nothing.
+- **Golden vectors.** `make-v0-fixtures.sh` (git 2.50.1, Apple Git-155, on the MacBook, 2026-11-19) records six
+  advertisements (v0, v1, an empty repository's, a shallow one's, a SHA-256 one's, `receive-pack`'s), nine whole
+  exchanges between stock `fetch-pack` and `upload-pack` under protocol.version 0 and 1 copied by a tee, and six
+  requests written by the script with `upload-pack`'s stateless answers (`multi_ack`, `multi_ack_detailed` ending
+  `done` and reaching `ready`, the plain mode, `unshallow`, an unknown want's `ERR`), with `SHA256SUMS`, which the
+  tests check every file against first. The first run's deepening fetch kept only its second round, which followed a
+  tag, because the tee wrote both rounds under one name: the capture now refuses a second `upload-pack` under one name
+  and that fetch runs with `--no-tags`, so the vector holds `deepen-relative`, `deepen 1` and a shallow-update with
+  `unshallow`. Two further runs wrote the same 39 files. gitprotocol-pack's own examples are vectors too, each long
+  line as its length counts it.
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 203 of 203 over main
+  with this change, 25 new; `cargo fmt -p slates-git -- --check` clean; each test and helper read against the lint
+  wall's cognitive-complexity threshold of 10 by count, every `assert_eq!` counting one). Every advertisement decodes to the refs `refs.txt` recorded and writes back; every line of every exchange
+  reads and writes back; each depth request is answered by its shallow-update; the document's examples read and write
+  as printed; unknown capabilities are kept; lines read with or without LF and in either case; refusal tables for
+  client lines, server lines, advertisements and shallow-updates; writers refuse and write nothing; every cut of a
+  message waits and every cut of a line reads as its bytes say; every bit flip is refused by kind or reads as its
+  bytes say; the admission is charged exactly; generated lines, advertisements and shallow-updates round-trip.
+  - Red first: the tests against the module with every entry point refusing, 24 of 25 failed (the checksum test alone
+    passes).
+  - Red nine ways by mutation, each on a copy and caught by the test that names its rule: a peeled line taken after
+    any ref; the request's `shallow` written with LF; bytes after an object name ignored; `deepen-since` taking `-1`;
+    capability names of either case; `ERR` inside a message read as a ref; the advertisement's lists not charged; the
+    advertisement written without its checking pass (a refused write left its first lines in the output); a `shallow`
+    after an `unshallow` taken. A comment-only control passed 25 of 25.
+  - A trap, recorded: red and green checkouts of one workspace built in one `CARGO_TARGET_DIR` gave green the red
+    binary, because cargo's fingerprint for the path package named the red checkout's files; green reported red's
+    failures until `cargo clean -p slates-git`. One target directory per arm, as the later red runs used.
+- **Owed of piece 14:** serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and
+  neither, `no-done`, the stateless rounds over HTTP), then `packfile-uris` and `bundle-uri`.
