@@ -280,9 +280,9 @@ fn read_negotiation<'a>(name: &str, rest: &'a [u8]) -> (Vec<ServerLine<'a>>, Vec
   let mut pack = Vec::new();
   let mut in_pack = false;
   let mut ended = false;
-  for packet in packets(rest) {
+  for received in packets(rest) {
     assert!(!ended, "{name}: a packet after the pack's flush");
-    match packet {
+    match received {
       Packet::Data(data) if !in_pack && !matches!(data.first(), Some(1..=3)) => {
         let line = ServerLine::read(data, ObjectFormat::Sha1)
           .unwrap_or_else(|refusal| panic!("{name}: {refusal:?}"));
@@ -1787,7 +1787,8 @@ proptest! {
     let bytes = written(|out| advertisement.write(out));
     prop_assert_eq!(decoded(&bytes), (advertisement.clone(), bytes.len()));
     if advertisement.refs.is_empty() {
-      prop_assert!(bytes.windows(16).any(|window| window == b"capabilities^{}\0"));
+      let no_refs: &[u8] = b"capabilities^{}\0";
+      prop_assert!(bytes.windows(no_refs.len()).any(|window| window == no_refs), "no capabilities^ line");
     }
     let format = unshallow.first().map_or(ObjectFormat::Sha1, ObjectId::format);
     let update = ShallowUpdate { shallow: Vec::new(), unshallow };
