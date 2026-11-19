@@ -4,26 +4,27 @@
 //! 1's graph, and the answer's sections written in the document's order, its pack begun.
 //!
 //! **The arguments.** Each `want` and `have` is passed on as named, each `want-ref` looked up among the refs (its id a
-//! want, and its line in `wanted-refs`), each `deepen-not` resolved by git's patterns, and the `filter` parsed. A
-//! `deepen` with `deepen-relative` counts from the client's shallow commits; `deepen-relative` alone deepens nothing,
-//! as git's `send_shallow_list` reads it. `thin-pack` and `ofs-delta` go to the pack's source, `sideband-all`
-//! multiplexes the whole answer, and `include-tag` goes to the negotiation. `no-progress` asks for what is never sent
-//! (no progress is written yet), and `packfile-uris` for what the store does not keep (no URI packs yet), so both are
-//! read and change nothing. A later `deepen`, `deepen-since` or `filter` replaces an earlier one, as in git.
+//! want, and its line in `wanted-refs`), each `deepen-not` resolved by git's patterns, and the `filter` parsed, a
+//! `sparse:oid` filter's blob resolved and read (A-640 part 4, the `sparse` module). A `deepen` with `deepen-relative`
+//! counts from the client's shallow commits; `deepen-relative` alone deepens nothing, as git's `send_shallow_list`
+//! reads it. `thin-pack` and `ofs-delta` go to the pack's source, `sideband-all` multiplexes the whole answer, and
+//! `include-tag` goes to the negotiation. `no-progress` asks for what is never sent (no progress is written yet), and
+//! `packfile-uris` for what the store does not keep (no URI packs yet), so both are read and change nothing but the
+//! answer to a pack git's `pack-objects` dies of, whose packfile section's header git leaves out under `sideband-all`
+//! with `packfile-uris`. A later `deepen`, `deepen-since` or `filter` replaces an earlier one, as in git.
 //!
 //! **The sections** (gitprotocol-v2 "fetch" `output`). No want and no `wait-for-done`: nothing at all, as git answers.
 //! Not ready: the acknowledgments (`NAK`, or an `ACK` for each common have) and the flush; the client asks again. Ready,
 //! or `done`: the acknowledgments with `ready` and a delimiter (none after `done`), `shallow-info` where the client is
 //! shallow or deepens (its `shallow` and `unshallow` lines without an LF, as git writes them), `wanted-refs` where
-//! refs were wanted by name, then the packfile section's header; the pack follows as the answer is stepped.
+//! refs were wanted by name, then the packfile section's header; the pack follows as the answer is stepped, or, when
+//! the request's `sparse:oid` filter's blob was not resolved or read, git's words for it (the `answer` module).
 
 use super::answer::{Answer, Framing};
-use super::sparse::{self, Sparse};
+use super::sparse;
 use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
 use crate::Admission;
-use crate::negotiation::{
-  self, Acknowledgments, Deepen, Filter, Outcome, Pack, Patterns, ShallowInfo,
-};
+use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, Pack, ShallowInfo};
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::store::StoreGraph;
 use crate::v2::fetch::{Argument, Event, Response, Section, WantedRef};
@@ -46,6 +47,8 @@ struct Flags {
   relative: bool,
   /// `sideband-all`.
   multiplexed: bool,
+  /// `packfile-uris`: the protocols the client takes a pack's URI by.
+  uris: bool,
 }
 
 impl Flags {
@@ -74,6 +77,7 @@ impl Flags {
         multiplexed: true,
         ..self
       },
+      Argument::PackfileUris(_) => Flags { uris: true, ..self },
       _ => self,
     }
   }
@@ -137,15 +141,7 @@ pub(super) fn answer<P: PackSource>(
     multiplexed,
   };
   let asked = read(graph, served, arguments, admission).map_err(refused)?;
-  let (patterns, dies) =
-    match sparse::read(graph, served, asked.filter.as_ref(), admission).map_err(refused)? {
-      Some(Sparse::Patterns(patterns)) => (Some(patterns), None),
-      Some(Sparse::Dies(refusal)) => (
-        Patterns::read(&[], &mut Admission::new(0)).ok(),
-        Some(refusal),
-      ),
-      None => (None, None),
-    };
+  let sparse = sparse::read(graph, served, asked.filter.as_ref(), admission).map_err(refused)?;
   let request = negotiation::Request {
     wants: &asked.wants,
     haves: &asked.haves,
@@ -154,13 +150,13 @@ pub(super) fn answer<P: PackSource>(
     shallow: &asked.shallow,
     deepen: asked.deepen(),
     filter: asked.filter.as_ref(),
-    sparse: patterns.as_ref(),
+    sparse: sparse.patterns.as_ref(),
     include_tag: asked.flags.include_tag,
     thin: asked.flags.thin,
   };
   let outcome = negotiation::negotiate(graph, &request, admission)
     .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?;
-  let answer = written(served, &asked, outcome, packs, dies, admission).map_err(refused)?;
+  let answer = written(served, &asked, outcome, packs, sparse.dies, admission).map_err(refused)?;
   match graph.fault() {
     Some(fault) => Err(refused(Refusal::Store(fault))),
     None => Ok(answer),
@@ -258,7 +254,8 @@ fn once_each(wanted: &[WantedRef<'_>], admission: &mut Admission) -> Result<(), 
 }
 
 /// The answer to `outcome`: its sections encoded, and its pack begun from `packs`; or, when its `sparse:oid` filter's
-/// blob `dies` unread, the pack answered as git answers it (A-640 part 4).
+/// blob `dies` unread, the pack answered as git answers it (A-640 part 4), the packfile section's header left out where
+/// git leaves it to the pack's start, which never comes: under `sideband-all` with `packfile-uris` (`upload_pack_v2`).
 fn written<P: PackSource>(
   served: &Served<'_>,
   asked: &Asked<'_>,
@@ -282,10 +279,11 @@ fn written<P: PackSource>(
     }
     negotiation::Answer::Pack(pack) => {
       if let Some(refusal) = dies {
+        let header = !(multiplexed && asked.flags.uris);
         let (bytes, _) = charged(admission, |out| {
-          before_pack(&pack, &asked.wanted, format, multiplexed, out)
+          before_pack(&pack, &asked.wanted, format, multiplexed, header, out)
         })?;
-        return Answer::died(bytes, refusal, admission)
+        return Answer::died(bytes, refusal, true, admission)
           .map(|answer| answer.counted(outcome.counters));
       }
       let plan = PackPlan {
@@ -299,7 +297,7 @@ fn written<P: PackSource>(
         .begin(served, &plan, admission)
         .map_err(Refusal::Pack)?;
       let (bytes, (response, at)) = charged(admission, |out| {
-        before_pack(&pack, &asked.wanted, format, multiplexed, out)
+        before_pack(&pack, &asked.wanted, format, multiplexed, true, out)
       })?;
       Answer::streaming(bytes, Framing::V2(response), at, source, admission)
         .map(|answer| answer.counted(outcome.counters))
@@ -307,13 +305,14 @@ fn written<P: PackSource>(
   }
 }
 
-/// Writes the sections before a pack and the packfile section's header: the response's grammar after them, and how
-/// many bytes they took.
+/// Writes the sections before a pack, and the packfile section's header where `header` asks for it: the response's
+/// grammar after them, and how many bytes they took.
 fn before_pack(
   pack: &Pack<u64, u64>,
   wanted: &[WantedRef<'_>],
   format: ObjectFormat,
   multiplexed: bool,
+  header: bool,
   out: &mut Sink<'_>,
 ) -> Result<(Response, u64), Refusal> {
   let mut writer = Writer::new(format, multiplexed, out);
@@ -327,7 +326,9 @@ fn before_pack(
   if !wanted.is_empty() {
     writer.wanted_refs(wanted)?;
   }
-  writer.event(&Event::Header(Line::lf(Section::Packfile)))?;
+  if header {
+    writer.event(&Event::Header(Line::lf(Section::Packfile)))?;
+  }
   Ok(writer.finish())
 }
 

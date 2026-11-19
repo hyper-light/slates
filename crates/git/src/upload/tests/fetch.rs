@@ -8,8 +8,11 @@ use crate::fixtures::{
   FETCH_CLONE_REQUEST, FETCH_CLONE_RESPONSE, FETCH_HAVES_REQUEST, FETCH_HAVES_RESPONSE,
   FETCH_PROGRESS_REQUEST, FETCH_PROGRESS_RESPONSE, FETCH_REF_IN_WANT_REQUEST,
   FETCH_REF_IN_WANT_RESPONSE, FETCH_SHALLOW_REQUEST, FETCH_SHALLOW_RESPONSE,
-  FETCH_SPARSE_MISSING_REQUEST, FETCH_SPARSE_MISSING_RESPONSE, FETCH_SPARSE_REQUEST,
-  FETCH_SPARSE_RESPONSE, FETCH_SPARSE_TREE_REQUEST, FETCH_SPARSE_TREE_RESPONSE, FETCH_URIS_REQUEST,
+  FETCH_SPARSE_LONG_REQUEST, FETCH_SPARSE_LONG_RESPONSE, FETCH_SPARSE_MISSING_REQUEST,
+  FETCH_SPARSE_MISSING_RESPONSE, FETCH_SPARSE_REQUEST, FETCH_SPARSE_RESPONSE,
+  FETCH_SPARSE_SIDEBAND_ALL_REQUEST, FETCH_SPARSE_SIDEBAND_ALL_RESPONSE, FETCH_SPARSE_TREE_REQUEST,
+  FETCH_SPARSE_TREE_RESPONSE, FETCH_SPARSE_URIS_REQUEST, FETCH_SPARSE_URIS_RESPONSE,
+  FETCH_URIS_REQUEST,
 };
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::served::{self, FIRST, SECOND, TAG, THIRD, id};
@@ -273,35 +276,78 @@ fn object_info_answers_the_sizes_stock_git_printed() {
   assert_eq!(bytes, expected);
 }
 
-/// A-640 part 4 (git's `filter_sparse_oid__init` dies as `pack-objects` begins; stock git's `fetch-sparse-main-missing`
-/// and `fetch-sparse-main-dir` exchanges): do send git's clone under `sparse:oid=main:missing`, a path that is not
-/// there, and under `sparse:oid=main:dir`, one that names a tree. Expect: each answer byte for byte the one stock git
-/// 2.50.1 sent (the packfile section's header, git's `fatal:` words on band 2, its band-3 words, no flush), and refused
-/// with why.
+/// Format: the tree `main:dir` names, which a `sparse:oid` filter cannot read patterns from (`fixtures/objects.txt`).
+const DIR_TREE: &str = "cc01dbca1db1ab97354bc849d5631a785fcb68ab";
+
+/// Shape: how many `a`s the path of stock git's `fetch-sparse-long` exchange holds (`make-fixtures.sh`).
+const LONG_PATH: usize = 140;
+
+/// The `<blob-ish>` of stock git's `fetch-sparse-long` exchange: `main:`, the `a`s, a tab, a control byte, DEL and `z`.
+fn long_name() -> Vec<u8> {
+  [b"main:".as_slice(), &[b'a'; LONG_PATH], b"\t\x01\x7fz"].concat()
+}
+
+/// Stock git's answers to a pack its `pack-objects` dies of as it begins (`fixtures/make-fixtures.sh`), each named, its
+/// request and answer, and the refusal ours keeps: a path that is not there, a path naming a tree, a name whose words
+/// take more than one of git's 128-byte reads, and a path that is not there under `sideband-all`, alone and with
+/// `packfile-uris`.
+fn deaths() -> [(&'static str, &'static [u8], &'static [u8], Refusal); 5] {
+  let missing = || Refusal::SparseBlob {
+    name: b"main:missing".to_vec(),
+  };
+  [
+    (
+      "fetch-sparse-main-missing",
+      FETCH_SPARSE_MISSING_REQUEST,
+      FETCH_SPARSE_MISSING_RESPONSE,
+      missing(),
+    ),
+    (
+      "fetch-sparse-main-dir",
+      FETCH_SPARSE_TREE_REQUEST,
+      FETCH_SPARSE_TREE_RESPONSE,
+      Refusal::SparseData { id: id(DIR_TREE) },
+    ),
+    (
+      "fetch-sparse-long",
+      FETCH_SPARSE_LONG_REQUEST,
+      FETCH_SPARSE_LONG_RESPONSE,
+      Refusal::SparseBlob { name: long_name() },
+    ),
+    (
+      "fetch-sparse-sideband-all",
+      FETCH_SPARSE_SIDEBAND_ALL_REQUEST,
+      FETCH_SPARSE_SIDEBAND_ALL_RESPONSE,
+      missing(),
+    ),
+    (
+      "fetch-sparse-uris",
+      FETCH_SPARSE_URIS_REQUEST,
+      FETCH_SPARSE_URIS_RESPONSE,
+      missing(),
+    ),
+  ]
+}
+
+/// A-640 part 4 (git's `filter_sparse_oid__init` dies as `pack-objects` begins, and `create_pack_file` relays its error
+/// stream on band 2 a 128-byte read at a time; stock git's five `fetch-sparse-*` refusals): do send git's clone under
+/// `sparse:oid=` a path that is not there, a path naming a tree, a long name holding a tab, a control byte and DEL, and
+/// a path that is not there under `sideband-all`, alone and with `packfile-uris`. Expect: each answer byte for byte the
+/// one stock git 2.50.1 sent (the sections before the pack; the packfile section's header, but under `sideband-all`
+/// with `packfile-uris`; git's `fatal:` line on band 2, in packets of 128 bytes and the rest, the tab kept and the
+/// others shown as `?`; git's band-3 words; no flush), and refused with why.
 #[test]
-fn a_sparse_blob_that_is_not_there_or_no_blob_is_refused_as_git_refuses_it() {
+fn a_sparse_blob_git_dies_of_is_answered_byte_for_byte_as_git_answered_it() {
   let fixture = served::served();
-  let (bytes, answer) = answer_v2(&fixture, FETCH_SPARSE_MISSING_REQUEST);
-  assert_eq!(
-    bytes,
-    FETCH_SPARSE_MISSING_RESPONSE,
-    "{}",
-    String::from_utf8_lossy(&bytes)
-  );
-  assert_eq!(
-    answer.refusal(),
-    Some(&Refusal::SparseBlob {
-      name: b"main:missing".to_vec()
-    })
-  );
-  let (bytes, answer) = answer_v2(&fixture, FETCH_SPARSE_TREE_REQUEST);
-  assert_eq!(
-    bytes,
-    FETCH_SPARSE_TREE_RESPONSE,
-    "{}",
-    String::from_utf8_lossy(&bytes)
-  );
-  assert!(matches!(answer.refusal(), Some(Refusal::SparseData { .. })));
+  for (name, request, response, refusal) in deaths() {
+    let (bytes, answer) = answer_v2(&fixture, request);
+    assert_eq!(
+      (bytes.as_slice(), answer.refusal()),
+      (response, Some(&refusal)),
+      "{name}: {}",
+      String::from_utf8_lossy(&bytes)
+    );
+  }
 }
 
 /// A-640 part 4 (git reads a sparse filter's blob only as `pack-objects` begins): do send a round no `done` closes,
