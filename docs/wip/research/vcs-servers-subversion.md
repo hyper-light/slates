@@ -373,7 +373,14 @@ and `libsvn_subr/dirent_uri.c` `fe05687a2dedb22c`, `path.c` `413c3a8a740ae18c` a
   `M` or `D`; the new value on stdin) and post-revprop-change (the old value on stdin), pre/post-lock and
   pre/post-unlock. With no pre-revprop-change hook "default to MASSIVE PARANOIA" (670): every revision property change
   is refused, `SVN_ERR_REPOS_DISABLED_FEATURE`. Hooks get their stdin from a temporary file (`create_temp_file`), which
-  slates replaces with a pipe (R1).
+  slates replaces with a pipe (R1). Recorded from stock `svnserve` 1.15.0 [M: `crates/svn/fixtures/hooks`, A-623]: a
+  `LOCK-TOKENS:` line names the client's own path, relative to its commit's base (`serve.c` `add_lock_tokens` hands the
+  filesystem the path as sent), escaped by `svn_path_uri_autoescape`'s ten bytes and nothing past ASCII; pre-commit
+  reads the null device when no token was presented; a hook's environment is its own hooks-env section, else the
+  default one, and a section with no variables is none (`parse_hooks_env_option`); a hook `exec` refuses exits 255 with
+  nothing written (`svn_io_start_cmd3` leaves APR's error check off); post-lock's and post-unlock's failures come
+  wrapped in `E165008` and `E165009`, post-commit's as `commit-info`'s `post-commit-err`; a commit's release of its
+  locks runs pre-unlock and post-unlock, whose failures `unlock_paths` logs and drops.
 - **CRAM-MD5** [B: RFC 2195 102-107, 205-212]: keyed MD5's precomputed intermediate results "make it possible to avoid
   explicit cleartext storage of the shared secret on the server system by instead storing the intermediate results
   which are known as "contexts"", and "servers that store the secrets or contexts must both be protected": a context is
@@ -617,6 +624,46 @@ Read 2026-11-19 by g262 at §1's revision: `svnserve/serve.c` (sha256 `acb1cac75
   the copy's revision is another line or was made fresh there) back to its source, keeps a revision after the peg
   while the line reaches back to the same path (refused when the path is absent in it), and ends where the path holds
   another line or none.
+
+Read 2026-11-19 by g297 for A-613 part 2, from `raw.githubusercontent.com/apache/subversion/1.15.0/<path>` (the release
+the fixtures were recorded with; the first 16 hex digits of each file's sha256): `svnserve/serve.c` `8154654e07aa4eb4`
+(as §1), `libsvn_repos/rev_hunt.c` `5acc827a362d11f4` (as above), `libsvn_repos/log.c` `673c9f4b42515315`,
+`libsvn_repos/list.c` `6ef0f62c00210b13`, `libsvn_ra_svn/marshal.c` `361702975baa8c70` (as §1), `libsvn_ra_svn/protocol`
+`b117e0ccc2008627` (as §1), `libsvn_fs_fs/tree.c` `f507210992ec9736`, `libsvn_fs_fs/dag.c` `9efbb054b8818693` (as §1),
+`libsvn_subr/mergeinfo.c` `afee0be02f1374d6`, `libsvn_repos/fs-wrap.c` `126ab4670c8c23e0` (as §1),
+`libsvn_delta/svndiff.c` `311b0286b38d7d6d`, `libsvn_delta/text_delta.c` `88686a46845f5b8e`, `libsvn_delta/xdelta.c`
+`2e7b6226acfa9078`, `include/svn_repos.h` `941491e450489ee4`, `include/svn_error_codes.h` `f5b2c11d407e752f`; the
+fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remaining command's sessions.
+- **`get-file`** [C: `serve.c` `get_file`, `get_props`; `dag.c` `svn_fs_fs__dag_file_checksum`; recorded]: parameters
+  `c(?r)bb?B` (a fifth item that is no boolean ends the connection); the authentication request, the revision, then
+  the checksum: absent "File not found", a directory "Attempted to get checksum of a *non*-file node" (160017); the
+  answer `( ( md5 ) rev ( props ) [ ( iprops ) ] )`, the property list present even when not wanted, the inherited
+  list only when asked (empty when no ancestor has properties); the text as strings of `get_file`'s 4,096-byte
+  buffer, then the empty string and `( success ( ) )` (a read error there: the empty string and the refusal).
+- **`list`** [C: `serve.c` `list`, `parse_dirent_fields`; `list.c` `svn_repos_list`, `do_list`, `fill_dirent`;
+  `marshal.c` `svn_ra_svn__write_dirent`; `types.c` `svn_depth_from_word` (`8c9fe593b18d24cf`); `utf8proc.c`
+  `svn_utf__fuzzy_glob_match`, `normalize_cstring` (`d5fab817b5ea6d87`); recorded]: the revision is opened before
+  `done` (a revision past the youngest refused with no `done`); the depth refused after it, 165002; paths absolute;
+  `unknown` for a kind not asked; a dirent's lists empty for fields not asked; a directory's size 2^64 - 1; the date
+  parsed and written again (time 0's when none). Recorded: `README.TXT` matches `read*` (the name folded, the pattern
+  as the client sent it); `dir` matching neither `a*` nor `*.txt` walked, its `b.txt` reported.
+- **`get-location-segments`** [C: `serve.c` `get_location_segments`, `gls_receiver`; `rev_hunt.c`
+  `svn_repos_node_location_segments`, `maybe_crop_and_send_segment`, `svn_repos__prev_location`; `tree.c`
+  `fs_closest_copy`, `fs_node_origin_rev`; recorded]: `serve.c` settles a missing or negative peg and start to the
+  youngest and end to 0, and refuses end > start and start > peg after `done` in its own words; the library refuses a
+  peg past the youngest. The loop crops each segment to the range in place before the gap is computed from it.
+  Recorded: `branches/b1/a.txt`@11 is 9-11 there (its replacement by a copy of `trunk/a.txt`@5), a gap 6-8, then 1-5
+  at `trunk/a.txt`; `tags/t1/a.txt` 7-11, gap 6-6, 1-5; the root 0-11 with an empty path.
+- **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
+  name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
+  `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
+  `get-deleted-rev` are `rev_hunt.c`'s (segments cropped and gaps reported; the deleted revision found by a binary search
+  over node relation and closest copy, its absence answered `SVN_ERR_ENTRY_MISSING_REVISION`); `log` is
+  `svn_repos_get_logs5` (FSFS's node history, `tree.c` `history_prev`, walked per path; changed paths in the
+  revision's stored order, which is byte order; merged revisions from `fs_mergeinfo_changed` and
+  `combine_mergeinfo_path_lists`); `get-file-revs` is `svn_repos_get_file_revs2` (the delta's bytes are FSFS's own
+  windows re-encoded as svndiff 2 for a client that accepts it, so slates' deltas made from extents are compared by
+  the text they make).
 
 ## 14. The commit's request and its editor commands (A-617; §4.17.4 "5. The wire", piece 7)
 

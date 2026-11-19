@@ -119,6 +119,8 @@ pub(crate) struct Client {
   pub(crate) host_key: Option<Vec<u8>>,
   /// Payloads the client opened that it does not handle itself (everything but KEXINIT, the reply and NEWKEYS).
   pub(crate) received: Vec<Vec<u8>>,
+  /// For each payload in `received`, how many of the server's NEWKEYS had come before it.
+  pub(crate) received_epochs: Vec<usize>,
   pub(crate) server_newkeys: usize,
   pub(crate) cipher_client_to_server: String,
   pub(crate) cipher_server_to_client: String,
@@ -150,6 +152,7 @@ impl Client {
       exchange_hashes: Vec::new(),
       host_key: None,
       received: Vec::new(),
+      received_epochs: Vec::new(),
       server_newkeys: 0,
       cipher_client_to_server: String::new(),
       cipher_server_to_client: String::new(),
@@ -268,13 +271,17 @@ impl Client {
       20 => self.on_server_kexinit(payload),
       31 => self.on_reply(&payload),
       21 => self.on_server_newkeys(),
-      _ => self.received.push(payload),
+      _ => {
+        self.received.push(payload);
+        self.received_epochs.push(self.server_newkeys);
+      }
     }
   }
 
   fn on_server_kexinit(&mut self, payload: Vec<u8>) {
     if !self.options.answer_kexinit && self.exchanges > 0 && !self.in_exchange {
       self.received.push(payload);
+      self.received_epochs.push(self.server_newkeys);
       return;
     }
     let server = parse_kexinit(&payload);
