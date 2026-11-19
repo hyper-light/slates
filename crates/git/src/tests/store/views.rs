@@ -54,7 +54,7 @@ fn empty() -> (ContentStore, Repository) {
   )
 }
 
-/// Admits `content` as a `kind` to `push`: its id.
+/// Admits `content` as a `kind` to `push`, whole (no delta chain): its id.
 fn admit(
   store: &mut ContentStore,
   repository: &Repository,
@@ -66,6 +66,7 @@ fn admit(
     kind,
     claimed: None,
     content,
+    depth: 0,
   };
   let naming = repository.naming();
   push
