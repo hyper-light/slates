@@ -414,3 +414,49 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **The fixtures are deterministic.** The payload fixture script, run a second time on 2026-11-19 from a clean clone,
   made every file the first run made byte for byte (the pushes, the obsstores, every listing and log) but the three
   replies, whose cut it had changed.
+
+## 14. Found while building piece 2, the protocol codecs (A-569, 2026-11-19; captures of stock `hg` 7.2 on the Mac Studio, `fixtures/wire`)
+
+- **Arguments arrive as the bytes the client meant, every way.** `debugwireargs un deux --three 'a b=c&d+e%f;g,h:i'
+  --four café` was echoed `un deux a b=c&d+e%f;g,h:i café None` (UTF-8 intact) over SSH, in `X-HgArg` headers, behind
+  `X-HgArgs-Post` and in the query (`fixtures/wire/*.answer`, four files byte for byte alike): 7.2's HTTP server reads a
+  field's escapes as the bytes they name, as slates-hg does.
+- **Where 7.2's client puts HTTP arguments.** With the server advertising `httpheader=1024` (its default): in
+  `x-hgarg-1`, `x-hgarg-2`, ... (sent lower-case; a server matches them without case), the form split at 1009 bytes
+  (`encodevalueinheaders`: the limit less `X-HgArg-000` and `: ` with the line end), the query only `cmd`. With
+  `httppostargs` advertised: a `POST` whose body begins with the form, `x-hgargs-post` its length. With `httpheader=0`:
+  after `cmd` in the query. Either way the fields are sorted by name and form-encoded (`quote_plus`: a space as `+`, `/`
+  quoted). Every request also sends `x-hgproto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull` and a `vary` naming
+  the `x-hg` headers it sent.
+- **What 7.2's SSH client sends.** `hello` and `between` (`pairs` of forty zeros, a dash, forty zeros) together, then
+  `protocaps` (`caps`: the same list as `x-hgproto-1` without `0.1 0.2`), each command's arguments sorted by name so the
+  dictionary (`*`) comes first, its entries in the client's order; `batch` as `* 0` and `cmds` (discovery's `heads
+  ;known nodes=<hex>`, `heads` with its space and no arguments); `getbundle` as a dictionary of seven entries
+  (`bundlecaps`, `common`, `heads`, `cg`, `phases`, `bookmarks`, `listkeys`, in that order); `unbundle`'s input in
+  chunks after the server's empty string (one chunk of 973 bytes in the capture), ended by `0\n`. No empty line ends a
+  session; the client closes its end.
+- **A bundle2 push always sends `heads=force`.** Both pushes (SSH and HTTP, neither forced) sent `heads` = `666f726365`,
+  `force` in hex: with bundle2 the race check travels in the `check:` parts (A-545), so `unbundle`'s own heads argument
+  no longer carries it.
+- **What 7.2's SSH server answers.** `hello`: `capabilities: ` and its capabilities sorted by name, then a newline;
+  `between`: one empty line per pair; `protocaps`: `OK`; `batch`: the answers escaped and joined by `;` (`heads`: hex
+  nodes and a newline, `known`: `0` or `1` per node); `getbundle` and a bundle2 `unbundle`: the stream unframed
+  (`_sshv1respondstream`, `wireprotoserver.py:378-382`), so the next answer follows the stream's end at once. The
+  bundle2 capability blob is sorted by name, `HG20` first, each `name=value1,value2` quoted, and the whole quoted again
+  in `bundle2=`.
+- **A bundle1 client is refused differently over SSH and over HTTP.** Over HTTP, `getbundle` answered
+  `application/hg-error`, its body `incompatible Mercurial client; bundle2 required` and the hint, which the client
+  printed after `abort: remote error:`. Over SSH the server wrote `abort: incompatible Mercurial client; bundle2
+  required` and the hint on stderr and ended the session, and the client reported `stream ended unexpectedly (got 0
+  bytes, expected 4)` (`ssh-oob.*`): the out-of-band form (an empty line on stdout, the message and `\n-\n` on stderr)
+  was not used. slates-hg writes that form for SSH errors (`ssh::respond_error`); which refusals use it is the serving
+  piece's to decide.
+- **Media types.** `capabilities`, `batch`, `listkeys`, `branchmap`, `debugwireargs` and a push's `unbundle` were
+  answered `application/mercurial-0.1`; `getbundle` `application/mercurial-0.2`, its first byte the engine name's
+  length: `zstd` by default (the server's first engine the client named, `_httpresponsetype`), `none` when the server
+  offers only that (`server.compressionengines=none`), its payload then a plain bundle2 stream. String answers carry a
+  `Content-Length`; the streams (`getbundle`, and a bundle2 push's `unbundle` answer, which was `0.1`) were sent
+  `Transfer-Encoding: chunked`, and the fixtures hold their bodies de-chunked.
+- **The captures are reproducible but for the HTTP heads.** The SSH captures depend only on the script's fixed
+  configuration; the HTTP requests carry the run's port (`host`) and the answers its date (`Date`), so those heads
+  differ from run to run and the tests read only their fields.

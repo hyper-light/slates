@@ -8704,3 +8704,168 @@ mod clone_count_tests {
     );
   }
 }
+
+#[cfg(test)]
+mod upcase_name_tests {
+  //! A-576: a volume that folds names by Windows' upcase table, through its own verbs and across a restart.
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+
+  use super::*;
+  use crate::clock::StepClock;
+  use crate::recover::Claims;
+
+  /// Shape: the test store's page, the machine's usual one.
+  const PAGE: usize = 4096;
+  /// Shape: table caps ample for the few entries below.
+  const CAP: usize = 256;
+  /// Shape: the arena's pages: the test writes no bytes, so a few.
+  const ARENA_PAGES: usize = 16;
+  /// Shape: the volume's quota, well above what the entries take.
+  const QUOTA: u64 = 1 << 20;
+  /// Shape: the volume's journal.
+  const JOURNAL: usize = 1 << 16;
+  /// Format: the mode the test's files are made with.
+  const MODE: u32 = 0o644;
+
+  fn store() -> Store {
+    let mut arena = ChunkArena::new(PAGE);
+    arena
+      .add_region(Region::map(PAGE * ARENA_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    Store::new(
+      &StoreConfig {
+        page: PAGE,
+        cache_line: 64,
+        max_dirs: CAP,
+        max_inodes: CAP,
+        max_chunks: CAP,
+        max_dir_blocks: CAP,
+        dir_cutover: 4,
+      },
+      arena,
+      0,
+    )
+  }
+
+  fn volume(store: &mut Store, names: NameEquivalence) -> Volume {
+    Volume::create(
+      store,
+      VolumeConfig {
+        prefix: 1,
+        names,
+        quota: Quota::Bounded { limit: QUOTA },
+        journal_bytes: JOURNAL,
+        clock: Box::new(StepClock::new(0, 1)),
+      },
+    )
+    .unwrap()
+  }
+
+  /// The root's entries, by name.
+  fn listed(volume: &Volume, store: &Store) -> Vec<(String, InodeNo)> {
+    let mut rows: Vec<(String, InodeNo)> = volume
+      .readdir(store, volume.root())
+      .unwrap()
+      .into_iter()
+      .map(|row| (row.name.to_owned(), row.inode))
+      .collect();
+    rows.sort();
+    rows
+  }
+
+  /// A-576, T-4.6 on a WinFsp drive's volume. Do: on a volume folding by Windows' upcase table, make `σ.txt`, then make
+  /// `ς.txt`, link `Σ.TXT` to another file, and rename that file onto `ς.txt`; make a precomposed and a decomposed `é`;
+  /// then make `σ.txt` and `ς.txt` on a `Fold` volume. Expect: under `Upcase` the make and the link refused `EEXIST`,
+  /// every spelling finding the one entry, the rename replacing that entry so one name is left, and the two `é` two
+  /// files, as on NTFS; under `Fold` two files, which a WinFsp drive takes for one name (A-551's third case).
+  #[test]
+  fn a_name_windows_folds_alike_to_an_entry_is_that_entry() {
+    let mut store = store();
+    let mut upcase = volume(&mut store, NameEquivalence::Upcase);
+    let root = upcase.root();
+    let sigma = upcase
+      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .unwrap();
+    assert_eq!(
+      upcase.create_file(&mut store, root, "\u{3c2}.txt", MODE),
+      Err(VfsError::AlreadyExists)
+    );
+    for spelling in ["\u{3c2}.txt", "\u{3a3}.TXT", "\u{3c3}.Txt"] {
+      assert_eq!(
+        upcase
+          .lookup(&store, root, spelling)
+          .map(|found| found.inode),
+        Ok(sigma),
+        "{spelling:?}"
+      );
+    }
+    let other = upcase.create_file(&mut store, root, "other", MODE).unwrap();
+    assert_eq!(
+      upcase.link(&mut store, root, "\u{3a3}.TXT", other),
+      Err(VfsError::AlreadyExists)
+    );
+    upcase
+      .rename(&mut store, root, "other", root, "\u{3c2}.txt")
+      .unwrap();
+    let left = listed(&upcase, &store);
+    assert_eq!(left.len(), 1, "one name is left: {left:?}");
+    assert_eq!(
+      upcase
+        .lookup(&store, root, "\u{3c3}.txt")
+        .map(|found| found.inode),
+      Ok(other)
+    );
+    upcase
+      .create_file(&mut store, root, "caf\u{e9}", MODE)
+      .unwrap();
+    upcase
+      .create_file(&mut store, root, "cafe\u{301}", MODE)
+      .unwrap();
+    assert_eq!(listed(&upcase, &store).len(), 3);
+
+    let mut store = self::store();
+    let mut fold = volume(&mut store, NameEquivalence::Fold);
+    let root = fold.root();
+    fold
+      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .unwrap();
+    fold
+      .create_file(&mut store, root, "\u{3c2}.txt", MODE)
+      .unwrap();
+    assert_eq!(listed(&fold, &store).len(), 2);
+  }
+
+  /// A-576. Do: make `σ.txt` on a volume folding by Windows' upcase table, image it, and rebuild it in a fresh store as
+  /// a restart does; then make `ς.txt` and look `Σ.TXT` up there. Expect: the rebuilt volume folds as the table does, so
+  /// the make is refused `EEXIST` and the look-up finds the file: the image keeps the policy and the rebuilt directory
+  /// is ordered and found by the table's hash.
+  #[test]
+  fn a_rebuilt_volume_folds_as_windows_upcase_table_does() {
+    let mut store = store();
+    let mut upcase = volume(&mut store, NameEquivalence::Upcase);
+    let root = upcase.root();
+    upcase
+      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .unwrap();
+    let image = upcase.to_image(&store, None).unwrap();
+    let mut fresh = self::store();
+    let claims = Claims::prepare(&mut fresh, [&image]).unwrap();
+    let mut rebuilt = Volume::from_image(
+      &mut fresh,
+      &image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      JOURNAL,
+      None,
+    )
+    .unwrap();
+    let root = rebuilt.root();
+    assert_eq!(rebuilt.policy(), NameEquivalence::Upcase);
+    assert_eq!(
+      rebuilt.create_file(&mut fresh, root, "\u{3c2}.txt", MODE),
+      Err(VfsError::AlreadyExists)
+    );
+    assert!(rebuilt.lookup(&fresh, root, "\u{3a3}.TXT").is_ok());
+  }
+}

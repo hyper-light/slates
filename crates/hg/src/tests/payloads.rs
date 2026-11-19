@@ -386,7 +386,7 @@ fn the_servers_pushkey_replies_are_the_parts_slates_writes() {
     .collect();
   assert_eq!(answered, [(3, 1), (5, 1)]);
   for (part, reply) in sent.iter().zip(&replies) {
-    let text = pushkey::ReplyText::new(reply).unwrap();
+    let text = pushkey::ReplyText::new(reply);
     assert_eq!(&&pushkey::reply_part(part.id, &text), part);
   }
   assert!(

@@ -1,0 +1,9 @@
+GET /?cmd=listkeys HTTP/1.1
+Accept-Encoding: identity
+vary: X-HgArg-1,X-HgProto-1
+x-hgarg-1: namespace=phases
+x-hgproto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull
+accept: application/mercurial-0.1
+host: 127.0.0.1:51590
+user-agent: mercurial/proto-1.0 (Mercurial 7.2)
+
