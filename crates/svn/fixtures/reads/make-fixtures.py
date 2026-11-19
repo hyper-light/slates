@@ -365,15 +365,47 @@ def main():
     shutil.rmtree(workdir, ignore_errors=True)
 
 
+def item_end(data, start):
+    """Where the ra_svn item starting at `start` (after any spaces) ends, its trailing space included."""
+    position, depth = start, 0
+    while position < len(data):
+        byte = data[position:position + 1]
+        if byte in (b" ", b"\n"):
+            position += 1
+        elif byte == b"(":
+            depth += 1
+            position += 1
+        elif byte == b")":
+            depth -= 1
+            position += 1
+            if depth == 0:
+                return position + 1 if data[position:position + 1] in (b" ", b"\n") else position
+        elif byte.isdigit():
+            digits = position
+            while data[position:position + 1].isdigit():
+                position += 1
+            if data[position:position + 1] == b":":
+                position += 1 + int(data[digits:position])
+            if depth == 0:
+                return position + 1
+        else:
+            while position < len(data) and data[position:position + 1] not in (b" ", b"\n", b"(", b")"):
+                position += 1
+            if depth == 0:
+                return position + 1
+    sys.exit("an item ran past the data: %r" % data[start:start + 200])
+
+
 def opening_items(greeting):
-    """The stock client's first two items: its greeting answer and its ANONYMOUS answer, as it sent them."""
+    """The stock client's first two items, its greeting answer and its authentication answer, as it sent them."""
     if not greeting:
         sys.exit("no stock session recorded the client's greeting")
-    marker = b"( ANONYMOUS ( 0: ) ) "
-    end = greeting.find(marker)
-    if end < 0:
-        sys.exit("the stock client did not answer ANONYMOUS")
-    return greeting[: end + len(marker)]
+    first = item_end(greeting, 0)
+    second = item_end(greeting, first)
+    opening = greeting[:second]
+    if b"ANONYMOUS" not in opening[first:]:
+        sys.exit("the stock client's second item is not ANONYMOUS: %r" % opening)
+    return opening
 
 
 def write_pair(outdir, stem, record):
