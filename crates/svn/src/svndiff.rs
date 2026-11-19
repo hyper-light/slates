@@ -264,7 +264,9 @@ impl SvndiffError {
       Self::InvalidHeader | Self::VersionNotOffered => SVN_ERR_SVNDIFF_INVALID_HEADER,
       Self::WindowTooLarge | Self::CorruptWindowHeader => SVN_ERR_SVNDIFF_CORRUPT_WINDOW,
       Self::BackwardSourceView => SVN_ERR_SVNDIFF_BACKWARD_VIEW,
-      Self::InvalidInstruction { .. } | Self::TargetNotFilled | Self::NewDataUnused => SVN_ERR_SVNDIFF_INVALID_OPS,
+      Self::InvalidInstruction { .. } | Self::TargetNotFilled | Self::NewDataUnused => {
+        SVN_ERR_SVNDIFF_INVALID_OPS
+      }
       Self::UnexpectedEnd => SVN_ERR_SVNDIFF_UNEXPECTED_END,
       Self::InvalidCompressedData => SVN_ERR_SVNDIFF_INVALID_COMPRESSED_DATA,
       Self::SourceShort => SVN_ERR_INCOMPLETE_DATA,
@@ -316,10 +318,16 @@ fn write_integer(value: u64, out: &mut Vec<u8>) {
       break;
     }
   }
-  let digits = digits.get(INTEGER_LIMIT.saturating_sub(used)..).unwrap_or(&[]);
+  let digits = digits
+    .get(INTEGER_LIMIT.saturating_sub(used)..)
+    .unwrap_or(&[]);
   let last = digits.len().saturating_sub(1);
   for (index, &digit) in digits.iter().enumerate() {
-    out.push(if index < last { digit | CONTINUATION } else { digit });
+    out.push(if index < last {
+      digit | CONTINUATION
+    } else {
+      digit
+    });
   }
 }
 
@@ -354,8 +362,21 @@ impl WindowHeader {
         None => return Ok(None),
       }
     }
-    let [source_offset, source_len, target_len, instructions_len, new_len] = fields;
-    Ok(Some(Self { source_offset, source_len, target_len, instructions_len, new_len, encoded_len: at }))
+    let [
+      source_offset,
+      source_len,
+      target_len,
+      instructions_len,
+      new_len,
+    ] = fields;
+    Ok(Some(Self {
+      source_offset,
+      source_len,
+      target_len,
+      instructions_len,
+      new_len,
+      encoded_len: at,
+    }))
   }
 
   /// Refuses what Subversion's decoder refuses of a window's header, in its order (`svndiff.c` 714-737): a view or a
@@ -372,7 +393,10 @@ impl WindowHeader {
     if self.source_offset > SOURCE_OFFSET_LIMIT {
       return Err(SvndiffError::CorruptWindowHeader);
     }
-    let view = SourceView { offset: self.source_offset, len: self.source_len };
+    let view = SourceView {
+      offset: self.source_offset,
+      len: self.source_len,
+    };
     view.check_after(previous)
   }
 
@@ -383,7 +407,10 @@ impl WindowHeader {
       .checked_add(self.new_len)
       .and_then(|body| usize::try_from(body).ok())
       .ok_or(SvndiffError::CorruptWindowHeader)?;
-    self.encoded_len.checked_add(body).ok_or(SvndiffError::CorruptWindowHeader)
+    self
+      .encoded_len
+      .checked_add(body)
+      .ok_or(SvndiffError::CorruptWindowHeader)
   }
 }
 
@@ -397,7 +424,10 @@ struct SourceView {
 impl SourceView {
   /// Refuses a view that overflows, and a view that is not empty yet starts before `previous` or ends before it.
   fn check_after(self, previous: Self) -> Result<(), SvndiffError> {
-    let end = self.offset.checked_add(self.len).ok_or(SvndiffError::CorruptWindowHeader)?;
+    let end = self
+      .offset
+      .checked_add(self.len)
+      .ok_or(SvndiffError::CorruptWindowHeader)?;
     let previous_end = previous.offset.saturating_add(previous.len);
     if self.len > 0 && (self.offset < previous.offset || end < previous_end) {
       return Err(SvndiffError::BackwardSourceView);
@@ -484,13 +514,18 @@ impl Decoder {
       _ => return Err(SvndiffError::InvalidHeader),
     };
     self.version = Some(version);
-    Ok(Decoded::Header { version, consumed: HEADER_LEN })
+    Ok(Decoded::Header {
+      version,
+      consumed: HEADER_LEN,
+    })
   }
 
   /// Reads one window, or says how many bytes it needs.
   fn read_window(&mut self, version: Version, input: &[u8]) -> Result<Decoded, SvndiffError> {
     let Some(header) = WindowHeader::read(input)? else {
-      return Ok(Decoded::NeedMore { needed: input.len().saturating_add(1) });
+      return Ok(Decoded::NeedMore {
+        needed: input.len().saturating_add(1),
+      });
     };
     header.check(self.previous)?;
     let total = header.total_len()?;
@@ -498,16 +533,28 @@ impl Decoder {
       return Ok(Decoded::NeedMore { needed: total });
     };
     let window = decode_body(version, &header, body)?;
-    self.previous = SourceView { offset: header.source_offset, len: header.source_len };
-    Ok(Decoded::Window { window, consumed: total })
+    self.previous = SourceView {
+      offset: header.source_offset,
+      len: header.source_len,
+    };
+    Ok(Decoded::Window {
+      window,
+      consumed: total,
+    })
   }
 }
 
 /// Decodes a window's two sections and checks its instructions against its header.
-fn decode_body(version: Version, header: &WindowHeader, body: &[u8]) -> Result<Window, SvndiffError> {
-  let instructions_len = usize::try_from(header.instructions_len).map_err(|_| SvndiffError::CorruptWindowHeader)?;
-  let (instruction_section, new_section) =
-    body.split_at_checked(instructions_len).ok_or(SvndiffError::CorruptWindowHeader)?;
+fn decode_body(
+  version: Version,
+  header: &WindowHeader,
+  body: &[u8],
+) -> Result<Window, SvndiffError> {
+  let instructions_len =
+    usize::try_from(header.instructions_len).map_err(|_| SvndiffError::CorruptWindowHeader)?;
+  let (instruction_section, new_section) = body
+    .split_at_checked(instructions_len)
+    .ok_or(SvndiffError::CorruptWindowHeader)?;
   let new_data = read_section(version, new_section, WINDOW_LIMIT)?;
   let instruction_bytes = read_section(version, instruction_section, INSTRUCTION_SECTION_LIMIT)?;
   let shape = Shape {
@@ -527,7 +574,11 @@ fn decode_body(version: Version, header: &WindowHeader, body: &[u8]) -> Result<W
 
 /// Reads one section: as it is in version 0; in version 2, its original length then the bytes, stored when their
 /// length is the original's and an LZ4 block otherwise (`compress_lz4.c` `svn__decompress_lz4`), refused past `limit`.
-fn read_section(version: Version, section: &[u8], limit: u64) -> Result<Cow<'_, [u8]>, SvndiffError> {
+fn read_section(
+  version: Version,
+  section: &[u8],
+  limit: u64,
+) -> Result<Cow<'_, [u8]>, SvndiffError> {
   if version == Version::Zero {
     return Ok(Cow::Borrowed(section));
   }
@@ -539,7 +590,9 @@ fn read_section(version: Version, section: &[u8], limit: u64) -> Result<Cow<'_, 
     return Err(SvndiffError::InvalidCompressedData);
   }
   let original = usize::try_from(original).map_err(|_| SvndiffError::InvalidCompressedData)?;
-  let rest = section.get(length..).ok_or(SvndiffError::InvalidCompressedData)?;
+  let rest = section
+    .get(length..)
+    .ok_or(SvndiffError::InvalidCompressedData)?;
   if rest.len() == original {
     return Ok(Cow::Borrowed(rest));
   }
@@ -573,27 +626,51 @@ impl Progress {
     if length == 0 {
       return Err(InstructionFault::ZeroLength);
     }
-    let room = shape.target_len.checked_sub(self.target).ok_or(InstructionFault::PastTarget)?;
+    let room = shape
+      .target_len
+      .checked_sub(self.target)
+      .ok_or(InstructionFault::PastTarget)?;
     if length > room {
       return Err(InstructionFault::PastTarget);
     }
     let new_data = self.copied(instruction, shape)?;
-    Ok(Self { target: self.target.saturating_add(length), new_data })
+    Ok(Self {
+      target: self.target.saturating_add(length),
+      new_data,
+    })
   }
 
   /// Checks what the instruction copies from, and gives the new data used once it has.
   fn copied(self, instruction: Instruction, shape: Shape) -> Result<u64, InstructionFault> {
     match instruction {
       Instruction::Source { offset, length } => {
-        let left = shape.source_len.checked_sub(offset).ok_or(InstructionFault::PastSource)?;
-        if length > left { Err(InstructionFault::PastSource) } else { Ok(self.new_data) }
+        let left = shape
+          .source_len
+          .checked_sub(offset)
+          .ok_or(InstructionFault::PastSource)?;
+        if length > left {
+          Err(InstructionFault::PastSource)
+        } else {
+          Ok(self.new_data)
+        }
       }
       Instruction::Target { offset, .. } => {
-        if offset >= self.target { Err(InstructionFault::TargetNotBehind) } else { Ok(self.new_data) }
+        if offset >= self.target {
+          Err(InstructionFault::TargetNotBehind)
+        } else {
+          Ok(self.new_data)
+        }
       }
       Instruction::New { length } => {
-        let left = shape.new_len.checked_sub(self.new_data).ok_or(InstructionFault::PastNewData)?;
-        if length > left { Err(InstructionFault::PastNewData) } else { Ok(self.new_data.saturating_add(length)) }
+        let left = shape
+          .new_len
+          .checked_sub(self.new_data)
+          .ok_or(InstructionFault::PastNewData)?;
+        if length > left {
+          Err(InstructionFault::PastNewData)
+        } else {
+          Ok(self.new_data.saturating_add(length))
+        }
       }
     }
   }
@@ -653,7 +730,10 @@ fn read_instruction(bytes: &[u8]) -> Result<(Instruction, usize), InstructionFau
 
 /// Reads an instruction's length or offset, which must end inside its section.
 fn read_operand(bytes: &[u8]) -> Result<(u64, usize), InstructionFault> {
-  read_integer(bytes).ok().flatten().ok_or(InstructionFault::Undecodable)
+  read_integer(bytes)
+    .ok()
+    .flatten()
+    .ok_or(InstructionFault::Undecodable)
 }
 
 /// Appends one instruction: its selector with a length under 64 in the same byte, else the length after it, then the
@@ -686,7 +766,10 @@ pub struct Encoder {
 impl Encoder {
   /// An encoder of the given version that has written nothing.
   pub fn new(version: Version) -> Self {
-    Self { version, previous: SourceView::default() }
+    Self {
+      version,
+      previous: SourceView::default(),
+    }
   }
 
   /// The delta's header.
@@ -699,8 +782,16 @@ impl Encoder {
   ///
   /// # Errors
   /// The refusal a decoder would make of the window ([`SvndiffError`]); nothing is appended then.
-  pub fn window(&mut self, window: &Window, compression: Compression, out: &mut Vec<u8>) -> Result<(), SvndiffError> {
-    let view = SourceView { offset: window.source_offset, len: window.source_len };
+  pub fn window(
+    &mut self,
+    window: &Window,
+    compression: Compression,
+    out: &mut Vec<u8>,
+  ) -> Result<(), SvndiffError> {
+    let view = SourceView {
+      offset: window.source_offset,
+      len: window.source_len,
+    };
     check_window(window, self.previous)?;
     let mut instruction_bytes = Vec::new();
     for &instruction in &window.instructions {
@@ -708,12 +799,19 @@ impl Encoder {
     }
     let instructions = self.write_section(&instruction_bytes, compression)?;
     let new_data = self.write_section(&window.new_data, compression)?;
-    let instructions_len = u64::try_from(instructions.len()).map_err(|_| SvndiffError::WindowTooLarge)?;
+    let instructions_len =
+      u64::try_from(instructions.len()).map_err(|_| SvndiffError::WindowTooLarge)?;
     let new_len = u64::try_from(new_data.len()).map_err(|_| SvndiffError::WindowTooLarge)?;
     if instructions_len > INSTRUCTION_SECTION_LIMIT || new_len > NEW_DATA_SECTION_LIMIT {
       return Err(SvndiffError::WindowTooLarge);
     }
-    for value in [window.source_offset, window.source_len, window.target_len, instructions_len, new_len] {
+    for value in [
+      window.source_offset,
+      window.source_len,
+      window.target_len,
+      instructions_len,
+      new_len,
+    ] {
       write_integer(value, out);
     }
     out.extend_from_slice(&instructions);
@@ -724,16 +822,27 @@ impl Encoder {
 
   /// One section as this version writes it: as it is in version 0; in version 2, its original length and then the
   /// bytes, an LZ4 block when asked for and shorter.
-  fn write_section(&self, section: &[u8], compression: Compression) -> Result<Vec<u8>, SvndiffError> {
+  fn write_section(
+    &self,
+    section: &[u8],
+    compression: Compression,
+  ) -> Result<Vec<u8>, SvndiffError> {
     if self.version == Version::Zero {
       return Ok(section.to_vec());
     }
     let mut out = Vec::new();
-    write_integer(u64::try_from(section.len()).map_err(|_| SvndiffError::WindowTooLarge)?, &mut out);
+    write_integer(
+      u64::try_from(section.len()).map_err(|_| SvndiffError::WindowTooLarge)?,
+      &mut out,
+    );
     if compression == Compression::Lz4 {
       let mut block = vec![0u8; lz4_flex::block::get_maximum_output_size(section.len())];
-      let written = lz4_flex::block::compress_into(section, &mut block).map_err(|_| SvndiffError::Lz4)?;
-      if let Some(compressed) = block.get(..written).filter(|compressed| compressed.len() < section.len()) {
+      let written =
+        lz4_flex::block::compress_into(section, &mut block).map_err(|_| SvndiffError::Lz4)?;
+      if let Some(compressed) = block
+        .get(..written)
+        .filter(|compressed| compressed.len() < section.len())
+      {
         out.extend_from_slice(compressed);
         return Ok(out);
       }
@@ -747,17 +856,28 @@ impl Encoder {
 /// past the signed offsets or sliding backward, and its instructions as [`Progress::take`] judges them.
 fn check_window(window: &Window, previous: SourceView) -> Result<(), SvndiffError> {
   let new_len = u64::try_from(window.new_data.len()).map_err(|_| SvndiffError::WindowTooLarge)?;
-  if window.target_len > WINDOW_LIMIT || window.source_len > WINDOW_LIMIT || new_len > WINDOW_LIMIT {
+  if window.target_len > WINDOW_LIMIT || window.source_len > WINDOW_LIMIT || new_len > WINDOW_LIMIT
+  {
     return Err(SvndiffError::WindowTooLarge);
   }
   if window.source_offset > SOURCE_OFFSET_LIMIT {
     return Err(SvndiffError::CorruptWindowHeader);
   }
-  SourceView { offset: window.source_offset, len: window.source_len }.check_after(previous)?;
-  let shape = Shape { source_len: window.source_len, target_len: window.target_len, new_len };
+  SourceView {
+    offset: window.source_offset,
+    len: window.source_len,
+  }
+  .check_after(previous)?;
+  let shape = Shape {
+    source_len: window.source_len,
+    target_len: window.target_len,
+    new_len,
+  };
   let mut progress = Progress::default();
   for (index, &instruction) in window.instructions.iter().enumerate() {
-    progress = progress.take(instruction, shape).map_err(|fault| SvndiffError::InvalidInstruction { index, fault })?;
+    progress = progress
+      .take(instruction, shape)
+      .map_err(|fault| SvndiffError::InvalidInstruction { index, fault })?;
   }
   progress.finish(shape)
 }
@@ -769,10 +889,16 @@ fn check_window(window: &Window, previous: SourceView) -> Result<(), SvndiffErro
 /// # Errors
 /// [`SvndiffError::SourceShort`] when `source_view` is shorter than the window's view, and the refusal a decoder would
 /// make of a window that does not hold together; `target` is unchanged then.
-pub fn apply(window: &Window, source_view: &[u8], target: &mut Vec<u8>) -> Result<(), SvndiffError> {
+pub fn apply(
+  window: &Window,
+  source_view: &[u8],
+  target: &mut Vec<u8>,
+) -> Result<(), SvndiffError> {
   check_window(window, SourceView::default())?;
   let view_len = usize::try_from(window.source_len).map_err(|_| SvndiffError::SourceShort)?;
-  let view = source_view.get(..view_len).ok_or(SvndiffError::SourceShort)?;
+  let view = source_view
+    .get(..view_len)
+    .ok_or(SvndiffError::SourceShort)?;
   let target_len = usize::try_from(window.target_len).map_err(|_| SvndiffError::WindowTooLarge)?;
   let mut made: Vec<u8> = Vec::with_capacity(target_len);
   let mut new_data = window.new_data.as_slice();
@@ -780,14 +906,18 @@ pub fn apply(window: &Window, source_view: &[u8], target: &mut Vec<u8>) -> Resul
     let refuse = |fault| SvndiffError::InvalidInstruction { index, fault };
     match instruction {
       Instruction::Source { offset, length } => {
-        made.extend_from_slice(span(view, offset, length).ok_or(refuse(InstructionFault::PastSource))?);
+        made.extend_from_slice(
+          span(view, offset, length).ok_or(refuse(InstructionFault::PastSource))?,
+        );
       }
       Instruction::Target { offset, length } => {
         copy_behind(&mut made, offset, length).ok_or(refuse(InstructionFault::TargetNotBehind))?;
       }
       Instruction::New { length } => {
         let count = usize::try_from(length).map_err(|_| refuse(InstructionFault::PastNewData))?;
-        let (taken, left) = new_data.split_at_checked(count).ok_or(refuse(InstructionFault::PastNewData))?;
+        let (taken, left) = new_data
+          .split_at_checked(count)
+          .ok_or(refuse(InstructionFault::PastNewData))?;
         made.extend_from_slice(taken);
         new_data = left;
       }
@@ -826,7 +956,10 @@ pub fn decode_all(input: &[u8]) -> Result<(Version, Vec<Window>), SvndiffError> 
   let mut windows = Vec::new();
   while version.is_none() || !rest.is_empty() {
     let consumed = match decoder.decode(rest)? {
-      Decoded::Header { version: read, consumed } => {
+      Decoded::Header {
+        version: read,
+        consumed,
+      } => {
         version = Some(read);
         consumed
       }
@@ -851,7 +984,8 @@ pub fn decode_all(input: &[u8]) -> Result<(Version, Vec<Window>), SvndiffError> 
 pub fn apply_all(source: &[u8], windows: &[Window]) -> Result<Vec<u8>, SvndiffError> {
   let mut target = Vec::new();
   for window in windows {
-    let view = span(source, window.source_offset, window.source_len).ok_or(SvndiffError::SourceShort)?;
+    let view =
+      span(source, window.source_offset, window.source_len).ok_or(SvndiffError::SourceShort)?;
     apply(window, view, &mut target)?;
   }
   Ok(target)

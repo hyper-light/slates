@@ -33435,6 +33435,9 @@ Applied in the same change to: §4.17.4 (new), `research/vcs-servers-subversion.
   shape (headers, limits, signed offsets, overlong integers, each instruction fault, backward views with Subversion's
   rule for empty views, bad version-2 sections, a delta cut at every byte), and three properties (round trip in every
   encoding against a reference applier written apart; any bytes decode to a typed answer; a delta fed in any pieces
-  decodes the same).
+  decodes the same). Proven on the Mac Studio (kiln, 2026-11-18 16:21 PST, load 13.4 to 15.8, debug build, a fresh
+  clone of the branch): `cargo test --locked -p slates-svn --lib`, 18 of 18 in 0.08 s, and 18 of 18 again after `cargo
+  fmt`. The one-crate clippy, `cargo xtask check` (literals, structure, the unsafe budget) and the cross-target lint of
+  the new crate are main's (the run-request queue, 2026-11-18).
 - **Owed.** §4.17.4's pieces 2 to 14, after §4.17.1's shared pieces they need; then main's runs: Subversion's Python
   suite over both URLs, the differential run, and the order-of-magnitude measurements.
