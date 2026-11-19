@@ -177,8 +177,9 @@ fn heads_follow_the_rule_whatever_a_cache_s_history() {
   assert_eq!(heads(&history), [3, 4]);
 }
 
-/// A-667: do take the heads where `stable` 1 on `default` 0 closes its branch and `default` 2 is on 1. Expect `stable`'s
-/// closed head 1 kept beside `default`'s 2, `default`'s 0 ended through it, as `branchheads(closed=True)` keeps one.
+/// A-667: do take the heads where `stable` 1 on `default` 0 closes its branch and `default` 2 is on 1. Expect
+/// `stable`'s closed head 1 kept beside `default`'s 2, `default`'s 0 ended through it, as `branchheads(closed=True)`
+/// keeps one.
 #[test]
 fn a_closed_head_is_kept_and_ends_a_head_through_it() {
   let mut history = history_of(&[
@@ -212,7 +213,9 @@ proptest! {
   /// earlier revisions, an ancestor of the other parent among them, with closes. Expect exactly the revisions no later
   /// revision on their branch descends from, oldest first.
   #[test]
-  fn heads_are_the_revisions_no_later_one_on_their_branch_descends_from(history in interleaved_history()) {
+  fn heads_are_the_revisions_no_later_one_on_their_branch_descends_from(
+    history in interleaved_history(),
+  ) {
     prop_assert_eq!(heads(&history), naive(&history));
   }
 }
