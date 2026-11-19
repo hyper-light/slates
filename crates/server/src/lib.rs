@@ -43,6 +43,7 @@ pub mod daemon;
 pub mod deploy;
 mod direct_map;
 pub mod discovery;
+mod pressure;
 mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
 // A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.
