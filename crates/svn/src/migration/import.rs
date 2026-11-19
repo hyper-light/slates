@@ -268,7 +268,11 @@ impl Importer {
     self.in_flight = 0;
     match open.transaction {
       None => repository.set_revision_zero(open.properties),
-      Some(transaction) => repository.commit(transaction, open.properties).map(drop),
+      Some(transaction) => {
+        let revision = repository.revision_of(transaction, open.properties)?;
+        repository.commit(revision)?;
+        Ok(())
+      }
     }
   }
 

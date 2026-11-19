@@ -273,7 +273,10 @@ fn take_flag(reader: &mut Reader<'_>) -> Result<bool, DocDecodeError> {
 /// many records of `least` bytes each.
 fn take_table(reader: &mut Reader<'_>, least: usize) -> Result<usize, DocDecodeError> {
   let count = reader.u32()? as usize;
-  if count > reader.remaining() / least.max(1) {
+  // A record takes at least one byte, so the divisor is never zero; the checked division keeps the decoder free of
+  // panics, and its impossible None refuses rather than admits.
+  let room = reader.remaining().checked_div(least.max(1)).unwrap_or(0);
+  if count > room {
     return Err(DocDecodeError::Truncated);
   }
   Ok(count)

@@ -1,0 +1,21 @@
+cwd $ROOT
+stdin 33fe42efddfc1a347d07378a9d7a54b90c682312 45201ee21cfd7ea78bdc7a35aad7d89e6213b7d2 refs/heads/main
+env GIT_ALTERNATE_OBJECT_DIRECTORIES=$ROOT/./objects
+env GIT_AUTHOR_DATE=1112911993 +0000
+env GIT_AUTHOR_EMAIL=test@example.com
+env GIT_AUTHOR_NAME=test
+env GIT_COMMITTER_DATE=1112911993 +0000
+env GIT_COMMITTER_EMAIL=test@example.com
+env GIT_COMMITTER_NAME=test
+env GIT_CONFIG_GLOBAL=/dev/null
+env GIT_CONFIG_NOSYSTEM=1
+env GIT_DIR=.
+env GIT_EXEC_PATH=$EXEC_PATH
+env GIT_OBJECT_DIRECTORY=$ROOT/./objects/tmp_objdir-incoming-XXXXXX
+env GIT_PUSH_OPTION_COUNT=0
+env GIT_QUARANTINE_PATH=$ROOT/./objects/tmp_objdir-incoming-XXXXXX
+quarantine pack
+quarantine pack/pack-7ada7d60068cc4e23c61df40ee89ae6f19a60efe.idx
+quarantine pack/pack-7ada7d60068cc4e23c61df40ee89ae6f19a60efe.keep
+quarantine pack/pack-7ada7d60068cc4e23c61df40ee89ae6f19a60efe.pack
+quarantine pack/pack-7ada7d60068cc4e23c61df40ee89ae6f19a60efe.rev

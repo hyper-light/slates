@@ -29,6 +29,8 @@
 //! base or a parent after its revision, a chunk past its file, bytes after a compressed stream, version 0, and revision
 //! flags whose texts do not hash to their nodes (censored, ellipsis, externally stored: owed with their pieces).
 
+use std::borrow::Cow;
+
 use crate::compression::{self, Engine, StreamRefusal};
 use crate::delta;
 use crate::node;
@@ -360,19 +362,72 @@ fn take<'b>(rest: &mut &'b [u8], count: usize) -> Result<&'b [u8], Refused> {
   Ok(taken)
 }
 
-/// A revlog read in place: its index's entries and its chunks.
-#[derive(Clone, Debug)]
-pub struct Revlog<'a> {
+/// Where a revlog's bytes come from (A-649 part 3): its index's and its data's, each read by offset and length. A
+/// revlog's whole bytes are one source ([`Slices`], what [`Revlog`] reads); a revlog too large to hold is read by ranges
+/// through another (the import's), so the reader's one algorithm ([`Outline`]) serves both.
+pub trait Source {
+  /// What the source refuses: the reader's refusals, and its own.
+  type Error: From<Refused>;
+
+  /// `len` bytes of the index from `at`, what the source holds charged to `admission`; fewer are refused.
+  fn index(
+    &mut self,
+    at: u64,
+    len: usize,
+    admission: &mut Admission,
+  ) -> Result<Cow<'_, [u8]>, Self::Error>;
+
+  /// `len` bytes of the data from `at` (an inline revlog's index), likewise.
+  fn data(
+    &mut self,
+    at: u64,
+    len: usize,
+    admission: &mut Admission,
+  ) -> Result<Cow<'_, [u8]>, Self::Error>;
+}
+
+/// A revlog's whole bytes as its source, borrowed and charged nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct Slices<'a> {
+  /// The index file's bytes, an inline revlog's chunks among them.
+  pub index: &'a [u8],
+  /// The data file's bytes, or the index again for an inline revlog.
+  pub data: &'a [u8],
+}
+
+impl Source for Slices<'_> {
+  type Error = Refused;
+
+  fn index(&mut self, at: u64, len: usize, _: &mut Admission) -> Result<Cow<'_, [u8]>, Refused> {
+    span(self.index, at, len)
+      .map(Cow::Borrowed)
+      .ok_or(Refused::Truncated { what: "an entry" })
+  }
+
+  fn data(&mut self, at: u64, len: usize, _: &mut Admission) -> Result<Cow<'_, [u8]>, Refused> {
+    span(self.data, at, len)
+      .map(Cow::Borrowed)
+      .ok_or(Refused::Truncated { what: "a chunk" })
+  }
+}
+
+/// `len` bytes of `bytes` from `at`.
+fn span(bytes: &[u8], at: u64, len: usize) -> Option<&[u8]> {
+  let start = usize::try_from(at).ok()?;
+  bytes.get(start..start.checked_add(len)?)
+}
+
+/// What a revlog is apart from its bytes (A-649 part 3): its format, whether it is inline and uses generaldelta, how
+/// many revisions it holds, where an inline one's entries begin, and its docket's default engine. The reader's one
+/// algorithm, over any [`Source`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outline {
   /// Its format.
   format: Format,
   /// Whether its chunks follow their entries in the index.
   inline: bool,
   /// Whether a delta's base is its entry's (else the revision before).
   general_delta: bool,
-  /// The index's entries (the index file, the docket's part of it).
-  index: &'a [u8],
-  /// The chunks: the data file, or the index itself when inline.
-  data: &'a [u8],
   /// How many revisions.
   count: u32,
   /// Where each entry of an inline index begins, found once by its scan; empty otherwise.
@@ -381,32 +436,45 @@ pub struct Revlog<'a> {
   default_header: Option<u8>,
 }
 
-impl<'a> Revlog<'a> {
-  /// Opens a version 1 revlog: its `.i` and, when it is not inline, its `.d` (empty otherwise). An inline index's
-  /// entry positions are found once and charged to `admission`.
-  pub fn open(
-    index: &'a [u8],
-    data: &'a [u8],
-    admission: &mut Admission,
-  ) -> Result<Revlog<'a>, Refused> {
+/// A version 1 header's inline and generaldelta flags, or its refusal: another version, or flags version 1 lacks.
+fn v1_flags(header: u32) -> Result<(bool, bool), Refused> {
+  let flags = header & !VERSION_MASK;
+  if header & VERSION_MASK != VERSION_1 || flags & !V1_FLAGS != 0 {
+    return Err(Refused::Version { header });
+  }
+  Ok((flags & FLAG_INLINE != 0, flags & FLAG_GENERAL_DELTA != 0))
+}
+
+/// A docket's format, or its refusal: a version no docket holds, or flags version 2 lacks (inline among them).
+fn docket_format(header: u32) -> Result<Format, Refused> {
+  let format = match header & VERSION_MASK {
+    VERSION_2 => Format::V2,
+    CHANGELOG_V2 => Format::ChangelogV2,
+    _ => return Err(Refused::Version { header }),
+  };
+  let flags = header & !VERSION_MASK;
+  if flags & !V2_FLAGS != 0 || flags & FLAG_INLINE != 0 {
+    return Err(Refused::Version { header });
+  }
+  Ok(format)
+}
+
+impl Outline {
+  /// A version 1 revlog's outline from its whole index file: an inline one's entries found once by its scan, their
+  /// positions charged to `admission`.
+  pub fn of_index(index: &[u8], admission: &mut Admission) -> Result<Outline, Refused> {
     if index.is_empty() {
-      return Ok(Revlog {
+      return Ok(Outline {
         format: Format::V1,
         inline: true,
         general_delta: true,
-        index,
-        data,
         count: 0,
         positions: Vec::new(),
         default_header: None,
       });
     }
     let header = be32(index, 0).ok_or(Refused::Truncated { what: "a header" })?;
-    let flags = header & !VERSION_MASK;
-    if header & VERSION_MASK != VERSION_1 || flags & !V1_FLAGS != 0 {
-      return Err(Refused::Version { header });
-    }
-    let inline = flags & FLAG_INLINE != 0;
+    let (inline, general_delta) = v1_flags(header)?;
     let (count, positions) = if inline {
       let count = scan_inline(index, None)?;
       admission.charge_items::<usize>(usize::try_from(count).unwrap_or(usize::MAX))?;
@@ -416,48 +484,51 @@ impl<'a> Revlog<'a> {
     } else {
       (whole_entries(index.len(), ENTRY_V1)?, Vec::new())
     };
-    Ok(Revlog {
+    Ok(Outline {
       format: Format::V1,
       inline,
-      general_delta: flags & FLAG_GENERAL_DELTA != 0,
-      index,
-      data: if inline { index } else { data },
+      general_delta,
       count,
       positions,
       default_header: None,
     })
   }
 
-  /// Opens a version 2 revlog or a changelog of version 2 from its docket and the index and data files it names.
-  pub fn open_docketed(
-    docket: &Docket<'_>,
-    index: &'a [u8],
-    data: &'a [u8],
-  ) -> Result<Revlog<'a>, Refused> {
-    let header = docket.header;
-    let format = match header & VERSION_MASK {
-      VERSION_2 => Format::V2,
-      CHANGELOG_V2 => Format::ChangelogV2,
-      _ => return Err(Refused::Version { header }),
-    };
-    let flags = header & !VERSION_MASK;
-    if flags & !V2_FLAGS != 0 || flags & FLAG_INLINE != 0 {
-      return Err(Refused::Version { header });
+  /// A version 1 revlog that is not inline, from its header and its index file's length alone, its entries read by
+  /// ranges. An inline revlog's entries are found only by a scan of its whole file, so its header is refused here.
+  pub fn of_split(header: u32, index_len: u64) -> Result<Outline, Refused> {
+    let (inline, general_delta) = v1_flags(header)?;
+    if inline {
+      return Err(Refused::Corrupt {
+        what: "an inline revlog outlined from its length",
+        rev: NONE,
+      });
     }
-    let end = |bytes: &'a [u8], end: u64, what: &'static str| {
-      usize::try_from(end)
-        .ok()
-        .and_then(|end| bytes.get(..end))
-        .ok_or(Refused::Truncated { what })
-    };
-    let index = end(index, docket.index_end, "an index file")?;
-    Ok(Revlog {
+    let len = usize::try_from(index_len).map_err(|_| Refused::Corrupt {
+      what: "more revisions than a number names",
+      rev: NONE,
+    })?;
+    Ok(Outline {
+      format: Format::V1,
+      inline: false,
+      general_delta,
+      count: whole_entries(len, ENTRY_V1)?,
+      positions: Vec::new(),
+      default_header: None,
+    })
+  }
+
+  /// A revlog behind a docket (version 2, or the changelog's version 2): its entries the docket's index's.
+  pub fn of_docket(docket: &Docket<'_>) -> Result<Outline, Refused> {
+    let format = docket_format(docket.header)?;
+    let len = usize::try_from(docket.index_end).map_err(|_| Refused::Truncated {
+      what: "an index file",
+    })?;
+    Ok(Outline {
       format,
       inline: false,
       general_delta: true,
-      index,
-      data: end(data, docket.data_end, "a data file")?,
-      count: whole_entries(index.len(), ENTRY_V2)?,
+      count: whole_entries(len, ENTRY_V2)?,
       positions: Vec::new(),
       default_header: Some(docket.default_header),
     })
@@ -466,6 +537,11 @@ impl<'a> Revlog<'a> {
   /// Its format.
   pub fn format(&self) -> Format {
     self.format
+  }
+
+  /// Whether its chunks follow their entries in its index file.
+  pub fn inline(&self) -> bool {
+    self.inline
   }
 
   /// How many revisions it holds.
@@ -478,29 +554,6 @@ impl<'a> Revlog<'a> {
     self.count == 0
   }
 
-  /// An entry's bytes, size and position.
-  fn entry_bytes(&self, rev: u32) -> Result<&'a [u8], Refused> {
-    if rev >= self.count {
-      return Err(Refused::NoRevision { rev });
-    }
-    let size = self.entry_size();
-    let at = if self.inline {
-      usize::try_from(rev)
-        .ok()
-        .and_then(|rev| self.positions.get(rev))
-        .copied()
-        .ok_or(Refused::NoRevision { rev })?
-    } else {
-      usize::try_from(rev)
-        .ok()
-        .and_then(|rev| rev.checked_mul(size))
-        .ok_or(Refused::NoRevision { rev })?
-    };
-    at.checked_add(size)
-      .and_then(|end| self.index.get(at..end))
-      .ok_or(Refused::Truncated { what: "an entry" })
-  }
-
   /// The size of one entry.
   fn entry_size(&self) -> usize {
     match self.format {
@@ -509,9 +562,39 @@ impl<'a> Revlog<'a> {
     }
   }
 
-  /// Revision `rev`'s entry.
-  pub fn entry(&self, rev: u32) -> Result<Entry, Refused> {
-    let bytes = self.entry_bytes(rev)?;
+  /// Where revision `rev`'s entry begins in the index.
+  fn entry_at(&self, rev: u32) -> Result<u64, Refused> {
+    if rev >= self.count {
+      return Err(Refused::NoRevision { rev });
+    }
+    let at = if self.inline {
+      usize::try_from(rev)
+        .ok()
+        .and_then(|rev| self.positions.get(rev))
+        .copied()
+    } else {
+      usize::try_from(rev)
+        .ok()
+        .and_then(|rev| rev.checked_mul(self.entry_size()))
+    };
+    at.map(crate::read::to_u64)
+      .ok_or(Refused::NoRevision { rev })
+  }
+
+  /// Revision `rev`'s entry, read from `source`.
+  pub fn entry<S: Source>(
+    &self,
+    source: &mut S,
+    rev: u32,
+    admission: &mut Admission,
+  ) -> Result<Entry, S::Error> {
+    let at = self.entry_at(rev)?;
+    let bytes = source.index(at, self.entry_size(), admission)?;
+    Ok(self.parse_entry(&bytes, rev)?)
+  }
+
+  /// An entry's fields from its bytes, checked as 7.2 would not read them otherwise.
+  fn parse_entry(&self, bytes: &[u8], rev: u32) -> Result<Entry, Refused> {
     let entry = match self.format {
       Format::V1 | Format::V2 => {
         let mode = match self.format {
@@ -565,72 +648,90 @@ impl<'a> Revlog<'a> {
   }
 
   /// Revision `rev`'s chunk as stored.
-  fn segment(&self, rev: u32, entry: &Entry) -> Result<&'a [u8], Refused> {
-    let mut start =
-      usize::try_from(entry.offset).map_err(|_| Refused::Truncated { what: "a chunk" })?;
+  fn segment<'s, S: Source>(
+    &self,
+    source: &'s mut S,
+    rev: u32,
+    entry: &Entry,
+    admission: &mut Admission,
+  ) -> Result<Cow<'s, [u8]>, S::Error> {
+    let mut start = entry.offset;
     if self.inline {
-      let entries = usize::try_from(rev)
-        .ok()
-        .and_then(|rev| rev.checked_add(1))
-        .and_then(|count| count.checked_mul(ENTRY_V1))
+      let before = u64::from(rev)
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(crate::read::to_u64(ENTRY_V1)))
         .ok_or(Refused::Truncated { what: "a chunk" })?;
       start = start
-        .checked_add(entries)
+        .checked_add(before)
         .ok_or(Refused::Truncated { what: "a chunk" })?;
     }
-    usize::try_from(entry.compressed)
-      .ok()
-      .and_then(|len| start.checked_add(len))
-      .and_then(|end| self.data.get(start..end))
-      .ok_or(Refused::Truncated { what: "a chunk" })
+    let len =
+      usize::try_from(entry.compressed).map_err(|_| Refused::Truncated { what: "a chunk" })?;
+    source.data(start, len, admission)
   }
 
   /// Revision `rev`'s chunk, decompressed: a full text or a delta. Its bytes are charged to `admission` as they are
   /// made.
-  pub fn chunk(&self, rev: u32, admission: &mut Admission) -> Result<Vec<u8>, Refused> {
-    let entry = self.entry(rev)?;
-    self.chunk_of(rev, &entry, admission)
+  pub fn chunk<S: Source>(
+    &self,
+    source: &mut S,
+    rev: u32,
+    admission: &mut Admission,
+  ) -> Result<Vec<u8>, S::Error> {
+    let entry = self.entry(source, rev, admission)?;
+    self.chunk_of(source, rev, &entry, admission)
   }
 
   /// A chunk, decompressed, of an entry read already.
-  fn chunk_of(
+  fn chunk_of<S: Source>(
     &self,
+    source: &mut S,
     rev: u32,
     entry: &Entry,
     admission: &mut Admission,
-  ) -> Result<Vec<u8>, Refused> {
-    let stored = self.segment(rev, entry)?;
+  ) -> Result<Vec<u8>, S::Error> {
+    let default = self.default_header;
+    let stored = self.segment(source, rev, entry, admission)?;
     let route = match entry.mode {
       Mode::Plain => None,
-      Mode::Default => Some(self.default_header.ok_or(Refused::Corrupt {
+      Mode::Default => Some(default.ok_or(Refused::Corrupt {
         what: "a default mode with no docket",
         rev,
       })?),
       Mode::Inline => stored.first().copied(),
     };
-    match route {
-      None => copy(stored, admission),
-      Some(RAW_NUL) => copy(stored, admission),
-      Some(RAW) => copy(stored.get(1..).unwrap_or_default(), admission),
-      Some(ZLIB) => inflate(rev, Engine::Zlib, stored, admission),
-      Some(ZSTD) => inflate(rev, Engine::Zstd, stored, admission),
-      Some(header) => Err(Refused::Compression { rev, header }),
-    }
+    Ok(match route {
+      None | Some(RAW_NUL) => copy(&stored, admission)?,
+      Some(RAW) => copy(stored.get(1..).unwrap_or_default(), admission)?,
+      Some(ZLIB) => inflate(rev, Engine::Zlib, &stored, admission)?,
+      Some(ZSTD) => inflate(rev, Engine::Zstd, &stored, admission)?,
+      Some(header) => return Err(Refused::Compression { rev, header }.into()),
+    })
   }
 
-  /// The revisions whose chunks rebuild `rev`'s text, the full text first (7.2's `_deltachain`).
-  pub fn chain(&self, rev: u32, admission: &mut Admission) -> Result<Vec<u32>, Refused> {
+  /// The revisions whose chunks rebuild `rev`'s text, the full text first (7.2's `_deltachain`), and whether the walk
+  /// stopped at `stop` (7.2's `stoprev`), whose text then comes before them.
+  pub fn chain<S: Source>(
+    &self,
+    source: &mut S,
+    rev: u32,
+    stop: Option<u32>,
+    admission: &mut Admission,
+  ) -> Result<(Vec<u32>, bool), S::Error> {
     let mut chain = Vec::new();
     let mut at = rev;
-    loop {
-      let entry = self.entry(at)?;
+    let stopped = loop {
+      if Some(at) == stop {
+        break true;
+      }
+      let entry = self.entry(source, at, admission)?;
       if entry.base == at {
-        admission.charge_items::<u32>(1)?;
+        admission.charge_items::<u32>(1).map_err(Refused::from)?;
         chain.push(at);
-        break;
+        break false;
       }
       if entry.compressed > 0 {
-        admission.charge_items::<u32>(1)?;
+        admission.charge_items::<u32>(1).map_err(Refused::from)?;
         chain.push(at);
       }
       at = if self.general_delta {
@@ -641,47 +742,170 @@ impl<'a> Revlog<'a> {
           rev: at,
         })?
       };
-    }
+    };
     chain.reverse();
-    Ok(chain)
+    Ok((chain, stopped))
+  }
+
+  /// Revision `rev`'s text: its chain rebuilt, from `cached`'s text where the chain passes through that revision (7.2's
+  /// revision cache), its length and its node checked; and whether the cached text began it. Every chunk and every
+  /// patched text is charged to `admission`.
+  pub fn text<S: Source>(
+    &self,
+    source: &mut S,
+    rev: u32,
+    cached: Option<(u32, &[u8])>,
+    admission: &mut Admission,
+  ) -> Result<(Vec<u8>, bool), S::Error> {
+    let entry = self.entry(source, rev, admission)?;
+    if entry.flags & UNHASHED_FLAGS != 0 {
+      return Err(
+        Refused::Flags {
+          rev,
+          flags: entry.flags,
+        }
+        .into(),
+      );
+    }
+    let (chain, stopped) = self.chain(source, rev, cached.map(|(at, _)| at), admission)?;
+    let mut text: Option<Cow<'_, [u8]>> = cached
+      .filter(|_| stopped)
+      .map(|(_, text)| Cow::Borrowed(text));
+    for link in chain {
+      let link_entry = self.entry(source, link, admission)?;
+      let piece = self.chunk_of(source, link, &link_entry, admission)?;
+      text = Some(Cow::Owned(match text {
+        None => piece,
+        Some(base) => apply(&base, &piece, link, admission)?,
+      }));
+    }
+    let text = text.map(Cow::into_owned).unwrap_or_default();
+    if u64::try_from(text.len()).ok() != Some(u64::from(entry.uncompressed)) {
+      return Err(Refused::Length { rev }.into());
+    }
+    let p1 = self.node_of(source, entry.p1, admission)?;
+    let p2 = self.node_of(source, entry.p2, admission)?;
+    node::check(&entry.node, &p1, &p2, &text).map_err(|refusal| Refused::Node { rev, refusal })?;
+    Ok((text, stopped))
+  }
+
+  /// The node of revision `rev`, the null node for none.
+  fn node_of<S: Source>(
+    &self,
+    source: &mut S,
+    rev: u32,
+    admission: &mut Admission,
+  ) -> Result<Node, S::Error> {
+    if rev == NONE {
+      return Ok(NULL_NODE);
+    }
+    Ok(self.entry(source, rev, admission)?.node)
+  }
+}
+
+/// A delta applied by slates-hg's applier, its refusal in the reader's terms.
+fn apply(
+  base: &[u8],
+  piece: &[u8],
+  rev: u32,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refused> {
+  delta::apply(base, piece, admission).map_err(|refusal| match refusal {
+    delta::Refusal::PastAdmission(past) => Refused::PastAdmission(past),
+    refusal => Refused::Delta { rev, refusal },
+  })
+}
+
+/// A revlog read in place from its whole bytes: its [`Outline`] over its [`Slices`].
+#[derive(Clone, Debug)]
+pub struct Revlog<'a> {
+  /// What it is.
+  outline: Outline,
+  /// Its bytes.
+  source: Slices<'a>,
+}
+
+impl<'a> Revlog<'a> {
+  /// Opens a version 1 revlog: its `.i` and, when it is not inline, its `.d` (empty otherwise). An inline index's
+  /// entry positions are found once and charged to `admission`.
+  pub fn open(
+    index: &'a [u8],
+    data: &'a [u8],
+    admission: &mut Admission,
+  ) -> Result<Revlog<'a>, Refused> {
+    let outline = Outline::of_index(index, admission)?;
+    let data = if outline.inline { index } else { data };
+    Ok(Revlog {
+      outline,
+      source: Slices { index, data },
+    })
+  }
+
+  /// Opens a version 2 revlog or a changelog of version 2 from its docket and the index and data files it names.
+  pub fn open_docketed(
+    docket: &Docket<'_>,
+    index: &'a [u8],
+    data: &'a [u8],
+  ) -> Result<Revlog<'a>, Refused> {
+    docket_format(docket.header)?;
+    let end = |bytes: &'a [u8], end: u64, what: &'static str| {
+      usize::try_from(end)
+        .ok()
+        .and_then(|end| bytes.get(..end))
+        .ok_or(Refused::Truncated { what })
+    };
+    let index = end(index, docket.index_end, "an index file")?;
+    let data = end(data, docket.data_end, "a data file")?;
+    Ok(Revlog {
+      outline: Outline::of_docket(docket)?,
+      source: Slices { index, data },
+    })
+  }
+
+  /// What it is.
+  pub fn outline(&self) -> &Outline {
+    &self.outline
+  }
+
+  /// Its format.
+  pub fn format(&self) -> Format {
+    self.outline.format
+  }
+
+  /// How many revisions it holds.
+  pub fn len(&self) -> u32 {
+    self.outline.count
+  }
+
+  /// Whether it holds no revision.
+  pub fn is_empty(&self) -> bool {
+    self.outline.count == 0
+  }
+
+  /// Revision `rev`'s entry.
+  pub fn entry(&self, rev: u32) -> Result<Entry, Refused> {
+    let mut source = self.source;
+    self.outline.entry(&mut source, rev, &mut Admission::new(0))
+  }
+
+  /// Revision `rev`'s chunk, decompressed: a full text or a delta. Its bytes are charged to `admission` as they are
+  /// made.
+  pub fn chunk(&self, rev: u32, admission: &mut Admission) -> Result<Vec<u8>, Refused> {
+    let mut source = self.source;
+    self.outline.chunk(&mut source, rev, admission)
+  }
+
+  /// The revisions whose chunks rebuild `rev`'s text, the full text first (7.2's `_deltachain`).
+  pub fn chain(&self, rev: u32, admission: &mut Admission) -> Result<Vec<u32>, Refused> {
+    let mut source = self.source;
+    Ok(self.outline.chain(&mut source, rev, None, admission)?.0)
   }
 
   /// Revision `rev`'s text: its chain rebuilt, its length and its node checked. Every chunk and every patched text is
   /// charged to `admission`.
   pub fn text(&self, rev: u32, admission: &mut Admission) -> Result<Vec<u8>, Refused> {
-    let entry = self.entry(rev)?;
-    if entry.flags & UNHASHED_FLAGS != 0 {
-      return Err(Refused::Flags {
-        rev,
-        flags: entry.flags,
-      });
-    }
-    let chain = self.chain(rev, admission)?;
-    let mut text: Option<Vec<u8>> = None;
-    for link in chain {
-      let piece = self.chunk_of(link, &self.entry(link)?, admission)?;
-      text = Some(match text {
-        None => piece,
-        Some(base) => delta::apply(&base, &piece, admission).map_err(|refusal| match refusal {
-          delta::Refusal::PastAdmission(past) => Refused::PastAdmission(past),
-          refusal => Refused::Delta { rev: link, refusal },
-        })?,
-      });
-    }
-    let text = text.unwrap_or_default();
-    if u64::try_from(text.len()).ok() != Some(u64::from(entry.uncompressed)) {
-      return Err(Refused::Length { rev });
-    }
-    let parent = |number: u32| -> Result<Node, Refused> {
-      if number == NONE {
-        Ok(NULL_NODE)
-      } else {
-        Ok(self.entry(number)?.node)
-      }
-    };
-    node::check(&entry.node, &parent(entry.p1)?, &parent(entry.p2)?, &text)
-      .map_err(|refusal| Refused::Node { rev, refusal })?;
-    Ok(text)
+    let mut source = self.source;
+    Ok(self.outline.text(&mut source, rev, None, admission)?.0)
   }
 }
 
