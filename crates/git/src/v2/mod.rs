@@ -50,9 +50,12 @@
 //! nothing.
 
 pub mod advertisement;
+pub mod bundle_uri;
 pub mod fetch;
 mod line;
 pub mod ls_refs;
+pub mod object_info;
+pub mod packfile_uris;
 pub mod request;
 
 pub use line::{Ending, Line};

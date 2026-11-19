@@ -1,0 +1,2 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 26:svn://127.0.0.1/repo/trunk 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( ANONYMOUS ( 45:YW5vbnltb3VzQEFkYXMtTWFjLVN0dWRpby5sb2NhbA==
+ ) ) ( lock-many ( ( 4:held ) false ( ( 5:a.txt ( 6 ) ) ) ) ) ( CRAM-MD5 ( ) ) 38:alice 6fc6658f073ae775580da7f1c3a52f5d 
