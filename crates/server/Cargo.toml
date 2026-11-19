@@ -44,6 +44,10 @@ slates-ssh = { workspace = true }
 # (A-662, `crate::vcs_store`): the content store every tool's store holds its objects in, and Mercurial's and
 # Subversion's indexes beside git's.
 slates-hg = { workspace = true }
+# The version-control servers' shared crate (§4.17.1 shared piece 3): Mercurial's index and content store (A-657);
+# git's wildmatch glob, which the policy (`crate::vcs_policy`) reads ref and path patterns by (A-597, A-671); and,
+# in tests, the content store an upload-pack test's empty repository is kept in (A-625 part 3;
+# `crate::vcs_http::git::upload`).
 slates-vcs = { workspace = true }
 slates-svn = { workspace = true }
 blake3 = { workspace = true }
