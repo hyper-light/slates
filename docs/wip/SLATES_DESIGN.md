@@ -12198,7 +12198,7 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 2. The object codecs: the object header and identity (collision-detecting SHA-1 and SHA-256), a pack entry's header,
    and delta instructions with an applier; golden vectors from packs stock git wrote, recorded with the commands.
 3. The pack reader: streaming, bounded, inflating, resolving deltas against the pack and the index, checking the
-   trailer; hostile input. (A deflate implementation enters the workspace here, chosen by measurement.)
+   trailer; hostile input. (The deflate implementation, chosen by measurement: zlib-rs through flate2's API, A-607.)
 4. The tree, commit and tag parsers with the fsck checks.
 5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack.
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
@@ -39479,3 +39479,21 @@ Applied in the same change to:
   - the room derived from the shard's (item 12).
 
   Main's: clippy and `cargo xtask check` on `slates-svn`.
+
+### A-607 — the deflate engine for the version-control servers: zlib-rs through flate2, chosen by measurement (2026-11-19, main, UI goal 93 (kiln 51cef9f7); §4.17.2 piece 3; §4.17.3 piece 1's GZ streams and piece 3's zlib revlog chunks)
+
+- **What.** One deflate engine for every zlib stream the servers read or write: git's pack entries and loose objects,
+  smart HTTP's gzip request bodies, Mercurial's GZ bundles and zlib revlog chunks. It is flate2's API over zlib-rs (pure
+  Rust), named once in the workspace's `[workspace.dependencies]`; a crate takes it as `flate2.workspace = true` and
+  never picks a backend.
+- **Why, measured.** Against miniz_oxide (also pure Rust) on the Mac Studio M3 Ultra, 2026-11-19, over slates' own
+  4,742 files at e85c17f9f, each its own zlib stream as git stores objects, five interleaved pairs: at git's level 6,
+  deflate 135.0 against 79.4 MB/s and inflate 956.4 against 497.5 MB/s (best of five), output 0.255 against 0.257 of
+  the input; at level 1 both directions faster too. The table, every run and the command are in docs/wip/BENCHMARKS.md
+  ("The deflate engine for the version-control servers"). Measured and rejected: miniz_oxide. Not measured: zlib-ng (C;
+  its build needs cmake).
+- **Consequence for tests.** Two deflate engines need not write the same compressed bytes for one input, so a golden
+  test holds an inflated stream's meaning (its bytes, its object id), never a stock tool's compressed bytes.
+- **Applied in the same change to:** Cargo.toml (`flate2` in `[workspace.dependencies]`, with the measurement),
+  docs/wip/BENCHMARKS.md, §4.17.2 piece 3.
+
