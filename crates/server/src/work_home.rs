@@ -78,6 +78,15 @@ const PENDING_STUCK: &str = "merge.work.pending_stuck";
 const PENDING_UNREADABLE: &str = "merge.work.pending_unreadable";
 /// Format: a work's increment composed on its own shard (A-247), the non-vacuity count of `composed`.
 pub(crate) const COMPOSED_ON_WORK: &str = "merge.work.composed_on_work";
+/// Counter: a work's journal holding a copy (A-626 part 4) composed by its green's owner, against `Green::base_for`,
+/// which puts each copied tree at its destination. The work's own shard composes none: the entries it fetches are a
+/// path's each, never a tree (A-247), so it fetches nothing for such a journal and leaves its composition to the owner.
+pub(crate) const COPY_COMPOSED_BY_OWNER: &str = "merge.work.copy_composed_by_owner";
+
+/// Whether a work's journal declares a copy (A-626 part 4).
+pub(crate) fn holds_copy(journal: &[VolumeOp]) -> bool {
+  journal.iter().any(|op| matches!(op, VolumeOp::Copy { .. }))
+}
 /// Format: a submit held on its work's shard until the work's catalog register, its route, was committed, before the
 /// green's owner was asked for a verdict (A-298), the non-vacuity count of [`await_route`].
 pub(crate) const AWAITED_ROUTE: &str = "merge.work.awaited_route";
@@ -481,7 +490,8 @@ fn declare_need(fetched: bool, op: &WorkOp) -> Option<Need> {
 /// path whose base entries it has not fetched, or one it neither holds nor has fetched the bytes of. `None` when it has
 /// all it needs, and after this verb's fetch.
 fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
-  if state.work_home.fetched.is_some() {
+  // A journal holding a copy is composed by the owner, which holds the copied trees (`COPY_COMPOSED_BY_OWNER`).
+  if state.work_home.fetched.is_some() || holds_copy(&sealed.journal) {
     return None;
   }
   let w = state.works.get(&sealed.work)?;
@@ -506,6 +516,9 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
   let Some(w) = state.works.get(&sealed.work) else {
     return sealed;
   };
+  if holds_copy(&sealed.journal) {
+    return sealed;
+  }
   let named: std::collections::BTreeSet<&str> = sealed
     .journal
     .iter()
