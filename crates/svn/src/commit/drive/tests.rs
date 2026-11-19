@@ -321,23 +321,19 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
   let Some(Value::List(params)) = parts.get(1) else {
     panic!("{name}: params")
   };
-  let request = CommitRequest::read(params).unwrap();
   let mut out = Vec::new();
-  let locks = begin(&request, &base_path, Some(user), &mut out)
-    .unwrap()
-    .unwrap();
   replay.transactions += 1;
-  let setup = Setup {
-    base_path,
-    repository_url: REPOSITORY.to_owned(),
-    filesystem: "fixture".to_owned(),
+  let start = Start {
     transaction: format!("{}-{}", replay.index.youngest(), replay.transactions),
-    locks,
     now: AprTime(0),
     room: ROOM,
-    rules: None,
+    authenticated_now: false,
   };
-  let mut drive = Drive::new(setup);
+  let session = recorded_session(&base_path, Some(user), None);
+  let begun = commit(params, &session, start, &mut out).unwrap();
+  let Begun::Driving(mut drive) = begun else {
+    panic!("{name}: {begun:?}")
+  };
   for (item, _) in &client[at + 1..] {
     if let Some(race) = race.filter(|_| is_command(item, "close-edit")) {
       let answered = replay_commit(replay, race, None);
@@ -625,6 +621,7 @@ fn check_hostile(replay: &Replay, case: &Hostile) {
     now: AprTime(0),
     room: ROOM,
     rules: None,
+    revision_properties: Vec::new(),
   };
   let mut drive = Drive::new(setup);
   let mut out = Vec::new();
@@ -693,6 +690,7 @@ fn a_resulting_text_whose_md5_is_not_the_clients_is_refused() {
     now: AprTime(0),
     room: ROOM,
     rules: None,
+    revision_properties: Vec::new(),
   });
   let mut out = Vec::new();
   for (item, _) in items(commands) {
@@ -725,6 +723,7 @@ fn a_work_past_its_room_is_refused() {
     now: AprTime(0),
     room: 4,
     rules: None,
+    revision_properties: Vec::new(),
   });
   let mut out = Vec::new();
   for (item, _) in items(commands) {
@@ -765,6 +764,7 @@ fn a_lock_in_the_way_refuses_the_call_that_meets_it() {
     now: AprTime(0),
     room: ROOM,
     rules: None,
+    revision_properties: Vec::new(),
   });
   let mut out = Vec::new();
   let mut last = Last::Taken;
@@ -823,6 +823,7 @@ fn a_path_beneath_a_copy_reads_the_copys_source() {
     now: AprTime(0),
     room: ROOM,
     rules: None,
+    revision_properties: Vec::new(),
   });
   let mut out = Vec::new();
   let mut rows = Vec::new();
@@ -1024,6 +1025,7 @@ fn check_case(replay: &Replay, case: &Check) {
     now: AprTime(0),
     room: ROOM,
     rules: case.authz.then(alice_rules),
+    revision_properties: Vec::new(),
   };
   let mut drive = Drive::new(setup);
   let mut out = Vec::new();
@@ -1053,4 +1055,101 @@ fn the_commits_remaining_checks_refuse_as_svnserve_refuses() {
   for case in CHECKS {
     check_case(&replay, case);
   }
+}
+
+/// A session as the recordings' `svnserve.conf` makes one (`make-fixtures.py`: `anon-access = none`, `auth-access =
+/// write`, the tunnel's user authenticating).
+fn recorded_session<'s>(
+  base_path: &'s str,
+  user: Option<&'s str>,
+  authz: Option<(&'s authz::Authz, &'s [u8])>,
+) -> Session<'s> {
+  Session {
+    base_path,
+    repository_url: REPOSITORY,
+    filesystem: "fixture",
+    user,
+    anonymous: authz::Access::None,
+    authenticated: authz::Access::Write,
+    can_authenticate: true,
+    authz,
+  }
+}
+
+/// A `commit`'s parameters: a log message, the lock tokens given, keep-locks false, no revision properties.
+fn commit_params(tokens: &[(&'static [u8], &'static [u8])]) -> Vec<Value<'static>> {
+  let pairs = tokens
+    .iter()
+    .map(|(path, token)| Value::List(vec![Value::String(path), Value::String(token)]));
+  vec![
+    Value::String(b"log"),
+    Value::List(pairs.collect()),
+    Value::Word("false"),
+  ]
+}
+
+/// A start of the transaction `3-1`.
+fn start(authenticated_now: bool) -> Start {
+  Start {
+    transaction: "3-1".to_owned(),
+    now: AprTime(0),
+    room: ROOM,
+    authenticated_now,
+  }
+}
+
+/// What a commit began as, every error of the failure it wrote, if any, and what it wrote.
+type Began = (&'static str, Option<Vec<(u64, String)>>, Vec<u8>);
+
+/// Begins a commit on `session` with `params`.
+fn begun(session: &Session<'_>, params: &[Value<'_>], now: bool) -> Began {
+  let mut out = Vec::new();
+  let kind = match commit(params, session, start(now), &mut out).unwrap() {
+    Begun::Driving(_) => "driving",
+    Begun::Authenticate => "authenticate",
+    Begun::Answered => "answered",
+    Begun::Close => "close",
+  };
+  let failure = items(&out).into_iter().find_map(|(item, _)| errors_of(&item));
+  (kind, failure, out)
+}
+
+/// A-655 (`serve.c` `must_have_access` 807-850, `lookup_access` 760-791). Do: begin a commit on an anonymous session
+/// whose `svnserve.conf` lets only the authenticated write, then again as alice once she authenticated. Expect: the
+/// first asks the client to authenticate, writing nothing; the second drives, writing `( success ( ) )` alone, no
+/// trivial authentication request after a real one.
+#[test]
+fn an_anonymous_session_authenticates_for_write_before_its_commit() {
+  let params = commit_params(&[]);
+  let anonymous = recorded_session("/trunk/project", None, None);
+  assert_eq!(begun(&anonymous, &params, false), ("authenticate", None, Vec::new()));
+  let alice = recorded_session("/trunk/project", Some("alice"), None);
+  let driving = ("driving", None, b"( success ( ) ) ".to_vec());
+  assert_eq!(begun(&alice, &params, true), driving);
+}
+
+/// The rules of `text`, read whole.
+fn ruled(text: &'static [u8]) -> authz::Authz {
+  authz::Authz::parse(text, None, authz::Bounds::of(text, None)).unwrap()
+}
+
+/// A-655 (`serve.c` 840-844 and `add_lock_tokens` 1388-1390). Do: begin commits as alice where she may not write: her
+/// `auth-access` only reads; the rules let her read alone; a lock token on a file the rules let her read alone.
+/// Expect: each refused "Authorization failed" (`E170001`), the last after the trivial authentication request.
+#[test]
+fn a_commit_alice_may_not_write_is_refused_authorization() {
+  let refused = Some(vec![(170_001, "Authorization failed".to_owned())]);
+  let mut reading = recorded_session("/trunk/project", Some("alice"), None);
+  reading.authenticated = authz::Access::Read;
+  let (kind, failure, _) = begun(&reading, &commit_params(&[]), false);
+  assert_eq!((kind, failure), ("answered", refused.clone()));
+  let read_only = ruled(b"[/]\nalice = r\n");
+  let only = recorded_session("/trunk/project", Some("alice"), Some((&read_only, b"repo")));
+  assert_eq!(begun(&only, &commit_params(&[]), false).1, refused.clone());
+  let file = ruled(b"[/]\nalice = rw\n[/trunk/project/a.txt]\nalice = r\n");
+  let locked = recorded_session("/trunk/project", Some("alice"), Some((&file, b"repo")));
+  let token = commit_params(&[(b"a.txt", b"opaquelocktoken:x")]);
+  let (kind, failure, out) = begun(&locked, &token, false);
+  assert_eq!((kind, failure), ("answered", refused));
+  assert!(out.starts_with(b"( success ( ( ) 0: ) ) "));
 }
