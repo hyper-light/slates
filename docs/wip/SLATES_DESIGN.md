@@ -11747,6 +11747,14 @@ signature verification).
 > **Status (2026-11-18, A-499).** Designed; nothing is built. Built on §4.17.1 without redefining it, from Mercurial
 > 7.2's own documents and code and hg-evolve 12.0.0 (the topic and evolve extensions). The reading notes, every source
 > named to its file, are `research/mercurial-server.md`. The pieces are listed at the end, after the shared ones.
+>
+> **Status (2026-11-19, A-514: piece 1's framings built).** `crates/hg` (`slates-hg`) decodes and encodes bundle2,
+> bundle1, changegroups `01` to `05` and their deltas as pure functions over bytes: every length read as 7.2 reads it
+> (signed 32-bit, so `0xFFFF_FFFF` is −1), checked against the bytes left, every structure counted before it is built
+> and charged exactly to the caller's admission, no recursion however deep bundle2's interruptions nest. Proven against
+> golden vectors stock Mercurial 7.2 made (`crates/hg/fixtures`, the command in `make-fixtures.sh`): each bundle decodes
+> as 7.2's own `debugbundle` lists it, every text rebuilds from its deltas, each encodes back to its bytes. Still owed
+> from piece 1: the parts' own payloads (phase-heads, bookmarks, the check parts, markers, pushkey values).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12110,7 +12118,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
    interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
    parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
-   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties.
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, `crates/hg`): the framings,
+   bundle1 and the deltas; owed: the parts' payloads, from phase-heads to pushkey values.
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
    string and the bundle2 capability blob, and `batch` escaping.
@@ -12140,7 +12149,12 @@ and export by landing).
 > **Status (2026-11-18, A-500).** Designed. Built: the svndiff codec (`crates/svn`, `slates-svn`: versions 0 and 2,
 > the decoder with every refusal Subversion's own decoder makes plus the 64-bit overflow it lets through, the encoder,
 > and the reference applier, held to `notes/svndiff`'s worked example as golden vectors). Everything else is owed, in
-> the pieces at the end. The reading notes, with every source's revision, hash and quoted lines, are
+> the pieces at the end.
+>
+> **Status (2026-11-19, A-531).** Built: the ra_svn item codec (`slates-svn`'s `ra_svn`): a parser that reads words,
+> numbers, strings and lists from a buffer the caller holds, resuming where it stopped so a byte is read once, within
+> bounds the caller gives and none of its own, and a writer that writes as `svnserve` writes, held to the protocol
+> document's items as golden vectors (piece 2 below). The reading notes, with every source's revision, hash and quoted lines, are
 > `research/vcs-servers-subversion.md` (cited below as "notes §n").
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
@@ -12304,10 +12318,13 @@ for Subversion.)
 - `get-mergeinfo` (item 8).
 
 *5. The wire.* Every connection is a task on a shard of slates' own runtime (D-9, R6); nothing blocks a shard.
-- **ra_svn.** The item codec (grammar in notes §2) parses bytes in whatever pieces they arrive, with each item's cap
-  checked before a byte is held: a word at most 24 characters (what a stock 1.14 parser accepts; the protocol text's 31
-  is older), nesting at most 64, a number at most 2^64 - 1, a string's length against the cap of the field it fills (an
-  svndiff chunk: one window's largest encoding; a path or a property value: the connection's memory share, the table).
+- **ra_svn.** The item codec (grammar in notes §2; built, A-531) parses bytes in whatever pieces they arrive, resuming
+  where it stopped, with every length checked before a byte is held, against bounds the caller derives and the codec
+  never fixes: the bytes an item may take (the connection's memory share, the table; a string's declared length is
+  checked against it at its `:`), the longest word (the longest a stock 1.14 parser accepts, 24, since no peer can send
+  a 1.14 server a longer one; the protocol text's 31 is older), the deepest list (the deepest prototype the server
+  reads), and the item count (the bytes bound over the two bytes the smallest item takes, and the memory a parsed item
+  costs); a number is at most 2^64 - 1, refused exactly past it.
   The greeting is `svnserve`'s, version 2 with the capabilities `edit-pipeline`, `accepts-svndiff2`, `absent-entries`,
   `commit-revprops`, `depth`, `log-revprops`, `atomic-revprops`, `partial-replay`, `inherited-props`,
   `ephemeral-txnprops`, `file-revs-reverse` and `list`, without
@@ -12506,9 +12523,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 
 *Pieces that follow* (in order, each one piece with its own tests, after §4.17.1's shared pieces it needs).
 1. The svndiff codec (built here).
-2. The ra_svn item codec: the resumable parser and the writer, with the protocol's examples as golden vectors and
-   hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream cut
-   anywhere).
+2. The ra_svn item codec (built, A-531): the resumable parser and the writer, with the protocol's examples as golden
+   vectors and hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream
+   cut anywhere).
 3. The engine's node-exclusive operations and `Copy` that shares a subtree by reference (with §4.17.1's pieces 1 and
    4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
@@ -26711,7 +26728,8 @@ Applied in the same change to:
   waited for, as a `FSYNC`'s durable reply waits (built since, A-516, 2026-11-19: the tables wait for them). A clone
   keeps no orphan record for a nameless file it carries from its snapshot, so once a restored guest lets such a file go
   nothing reclaims it until the clone is destroyed; that is so for any clone of a snapshot taken while a file was held
-  with no name, restored or not (GAPS).
+  with no name, restored or not (GAPS; built since, A-532, 2026-11-19: the snapshot keeps the orphans it froze, and a
+  clone carries each with an orphan record).
 - **Evidence.** The tables' unit tests (a round trip, the same bytes twice, every cut, every bit flipped, another
   format, trailing bytes, a vector of `u32::MAX` entries, the bound's arithmetic), the volume's three tests, and the two
   by-use tests over a real daemon named above. Owed on Shards' side: `shards restore` taking a served share and its
@@ -35681,6 +35699,15 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   longer of its wait when a tick first judged it and the client's wake estimate, each later look at twice the time
   waited, the timer naming the earliest. A call answered before its first look asks nothing; a departure is seen within
   the time waited. Every place a call's clock restarts (`Call::rearm`) restarts its schedule.
+- **The synchronous send's wait for a ring slot** (`Client::send`, `RoomWait`). On a full command ring the wait spun
+  for a whole reply deadline, a second of a core, then asked the daemon's liveness at each deadline and paced its tries
+  at a tenth of it. Now it spins for the client's wake estimate (the daemon drains its ring in microseconds), then
+  parks, each pause twice the last from the wake estimate and never past the next look, the looks on A-443's doubling.
+  A wait of `t` wakes about `log2(t / wake)` times; a slot that frees wakes nothing, so it is found at the next try,
+  within the time already waited (owed in GAPS: the daemon waking a client that waits for room). Checks (Mac Studio,
+  debug, 2026-11-18, load 16 to 19): `slates-client --lib` green with
+  `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`; red with the old spin through a
+  reply deadline put back: "spun at 3000 ns, past the wake estimate".
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
@@ -35736,6 +35763,157 @@ its works: measured and rejected"); `unsafe-budget.toml` (`slates-mem` 68 → 63
   --lib budget` 13 of 13 (the library compiles without `sealed`); rustfmt changes nothing of this change's.
 - **Owed.** Main's next A/B is the owner-shard path against itself; goal 87's next piece is what keeps its p99 above
   1 ms in the contended rounds (0.23 to 32.9 ms across r100's), which main profiles.
+
+### A-532 — A clone carries the nameless files its snapshot froze with their orphan records, so it reclaims them by the orphan rule and a restart finds them (2026-11-19, goal 90; what Shards needs from slates; A-303's second "Not here"; §4.2 retention, §4.4 snapshots and clones, §4.8 recovery, D-5)
+Applied in the same change to: A-303's entry (its "Not here", the second item marked built); GAPS, A-281's entry
+(A-303's paragraph); and:
+- `crates/vfs`: `snapshot.rs` (`Snapshot::orphans`); `volume.rs` (`Volume::snapshot` keeps the head's orphans,
+  `clone_inner` gives each an orphan record; the notes of both; the lib test module `clone_orphan_tests`, new);
+  `recover.rs` (`SnapshotImage::orphans`, written by `capture_snapshots` and read back by `rebuild_snapshot` through
+  `snapshot_orphans`, which refuses a list that is not rising or names what the snapshot's tree does not hold unlinked;
+  `IMAGE_VERSION` 32).
+
+- **What was there.** A file held open with its last name gone is an orphan of its volume: a record keeps it, and
+  its last reference's release reclaims it, as a restart's settle reclaims one no surviving holder holds (A-61). A
+  snapshot taken meanwhile freezes the file in its tree, and a clone of the snapshot carries it, which is how a VM
+  saved while its guest held such a file is restored onto a clone of the cut (A-303). The clone kept no record for it:
+  once its restored guest let it go nothing reclaimed it, nor did a restart, and a clone never restored kept it too,
+  each until the clone's destroy.
+- **The rule.** A snapshot keeps the head's orphans then (their numbers, in number order; O(1) in the volume's size,
+  bounded by the files held open with no name), and a clone of it gives each an orphan record, as the head's own
+  orphans have. The clone then reclaims such a file by the orphan rule and no other: at the release of its last
+  reference (a restored guest's), or at a restart's settle when no surviving attachment holds it, a file that a mount
+  surviving a takeover may hold waiting for that mount's end as any orphan does (U10). Nothing of the clone's was
+  secured for it, since its content is the snapshot's; the reclaim releases nothing the clone retains. The clone's
+  image carries the records (its orphan list), so a restart finds them, and a snapshot's image carries the orphans it
+  froze, so a clone made after a restart carries them too; recovery checks each against the snapshot's rebuilt tree.
+  A clone made for a restore that has not come yet keeps its carried files until a restart: from then a restore needs
+  a fresh clone of the cut, which carries them again.
+- **Tests.** The lib tests of `crates/vfs/src/volume.rs`, `clone_orphan_tests`: a clone of a snapshot that froze a
+  file held with no name, restored to an attachment (`adopt_held`) that reads the file and lets it go, reclaims it at
+  the let-go, its space no longer counted
+  (`a_clone_reclaims_the_nameless_file_its_snapshot_froze_once_its_restored_holder_lets_go`); and a clone never
+  restored keeps the record in its image, its restart rebuilt beside its origin settles it (one orphan reclaimed, its
+  space no longer counted), and a clone of the recovered snapshot carries it again
+  (`a_restart_finds_a_clones_carried_orphan_and_settles_it_by_the_orphan_rule`).
+- **Evidence.** Red first, on main `1d2723e51` with the tests alone, on the Mac Studio (2026-11-19): the restored
+  clone still held the file after its let-go, and the clone's image named no orphan (`left: []`). Green with the
+  change, the same machine: `cargo test --locked -p slates-vfs --lib` 77 passed, 1 ignored, the two among them.
+- **Found beside it, not changed here.** A clone's live-inode count starts as its origin's head count at the clone,
+  not its snapshot's (`clone_inner`'s `live_inodes`), so a clone made after its origin changed counts the inodes
+  against its allowance wrongly until a restart recounts them; a carried orphan's reclaim moves that count as any
+  reclaim does. Filed for main.
+
+### A-531 — The ra_svn item codec: words, numbers, strings and lists read resumably within bounds the caller derives, and written as svnserve writes them (2026-11-19, g292 for UI goal 91; §4.17.4 "5. The wire" and piece 2; A-500)
+Applied in the same change to: §4.17.4 (a status block, the ra_svn paragraph's bounds, piece 2), GAPS (the §4.17.4
+entry), `crates/svn` (`src/lib.rs`, `src/ra_svn.rs` and `src/ra_svn/tests.rs`, new).
+- **What was there.** §4.17.4 named the item codec as its next piece and gave it fixed limits taken from the deployed
+  parser (a word of 24 characters, nesting of 64).
+- **The decision.** The codec holds no number of its own: every bound is the caller's (`Bounds`): the bytes an item may
+  take, the longest word, the deepest list and the item count, derived by the server from the data they govern (its
+  vocabulary, its prototypes) and from the deployment (the connection's memory share). `Bounds::of` gives the tightest
+  bounds a value needs, which is how a bound is derived from data. A string's declared length is checked against the
+  bytes bound at its `:`, before one byte of it is waited for; a word's length as it grows; a list's depth when it
+  opens; the count as each item starts. The parser keeps its place and the lists it has opened, never the bytes, so a
+  peer that sends a byte at a time costs a step a byte, and a string's bytes are skipped in one step. It accepts what
+  the deployed parser accepts (`marshal.c` `read_item`: whitespace after `(` optional, any amount between items) and the
+  writer writes what the deployed writer writes (`( `, `) `, one space after each item), so a value written and read is
+  the same value. Each refusal carries its offset and the number of the Subversion error a client is answered with
+  (`E210004` malformed, `E210009` too large, `E210002` cut short).
+- **Tests.** Golden vectors from the protocol document (§1's example, ended by a space and by its line feed; §1's
+  failure response; §2's greeting as `svnserve` announces it, the client's response, the auth request and response;
+  §3.1.1's `get-latest-rev` and `commit-info` in the form `svnserve` writes, which wraps date and author in optional
+  tuples the document does not show; §3.1.2's `open-root` and a binary `textdelta-chunk`; §3.1.3's `set-path` with
+  §4.2's empty tuple), each read within the tightest bounds of its value and each bound shown exactly enough (lowered by
+  one, it refuses); hostile input: a string declaring 4,294,967,295 bytes and 2^64 - 1 bytes refused at its colon, a
+  number past 64 bits, every truncation of every vector, nesting past the bound (a million `(` refused at the first past
+  it in one pass), foreign bytes, items not followed by whitespace, a word past its bound, too many items, too many
+  bytes; and three properties: any item written reads back within exactly its bounds, any item fed in any pieces reads
+  the same with every call for more bounded, and any bytes read to a typed answer.
+- **Evidence** (the Mac Studio, kiln, 2026-11-18 16:39 and 16:42 PST, load 16 to 25, debug builds of fresh clones of the
+  branch). Failing first: against a stub with the codec's interface and no behaviour, `cargo test --locked -p slates-svn
+  --lib ra_svn` failed 13 of 15; the bounds test had passed the stub because a measure of nothing lowered no bound, so
+  it now requires the two bounds every item has to be lowered and refused, and the second red run failed 14 of 15, the
+  one pass the never-panics property, which a stub that panics nowhere passes by design. Then `cargo test --locked -p
+  slates-svn --lib` 33 of 33 (15 of the item codec, 18 of svndiff) before and after `cargo fmt`, and `cargo fmt --check`
+  clean. The one-crate clippy and `cargo xtask check` are main's (the run-request queue).
+- **Owed.** §4.17.4's pieces 3 to 14; the server derives each bound when it reads commands (piece 7).
+
+### A-535 — A loopback mount is offered only where no one but root can capture loopback traffic (2026-11-18, goal 85, g079; §4.6 "macOS", §4.13 the mount capability; AUD-01, A-34)
+Applied in the same change to: GAPS (the 2026-10-04 loopback confidentiality entry), `crates/api/src/error.rs`
+(`MountMissing::PrivateLoopback`), `crates/api/src/mount.rs` (`available` on macOS and the BSDs, `bpf_devices`,
+`capture_open`, `loopback_available`, the unit test), `crates/api/src/lib.rs` (contract 43), `docs/library.md`, and
+the bug record `docs/bugs/2026-11-18-a-macos-mounts-capability-was-readable-by-any-group-granted-loopback-capture.md`.
+- **What was there.** A loopback NFS mount's capability (AUD-01: the attachment and its 16-byte token) rides every
+  file handle in the clear, and the macOS kernel client speaks neither RPC-with-TLS (RFC 9289) nor RPCSEC_GSS, so that
+  leg cannot be encrypted. macOS lets only root capture loopback by default, but a host that gives `/dev/bpf*` to a
+  group (Wireshark's ChmodBPF, `access_bpf`) lets each member read every mount's capability off loopback and replay it
+  from a client of its own, with a uid of its choosing (AUTH_SYS is a claim). The mount was offered anyway.
+- **The rule.** The loopback mount is a host fact only where capture is root's alone: every BPF device
+  (`/dev/bpf`, `/dev/bpf<n>`) is read by root alone, by its mode (no group or other read bit) and its owner (root).
+  Elsewhere `mount::available` answers `Unsupported { PrivateLoopback }`, and so does every mount, before anything is
+  attached; the words name the devices and the fix (give them back to root).
+- **Rejected.** (1) Refusing calls on a connection a user process owns: a daemon running as the user cannot tell
+  another user's process from the kernel's socket, since `proc_pidfdinfo` refuses other users' processes, and the
+  kernel's port is unprivileged because the mount clears `NFS_MFLAG_RESVPORT` (R10). (2) Rotating the token per
+  mount: each mount's attachment has its own token already. (3) Binding a token to the first connection that uses it:
+  it breaks clients that open several connections on one mount (the hostile suite's honest clients, Linux's
+  `nconnect`), and a mount's first call still races a sniffer.
+- **Cost.** A host whose BPF devices a group may read cannot mount until they are root's again. Measured: none of the
+  five Macs slates runs on (2026-11-18) is such a host.
+- **Tests.** `a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback` (`crates/api/src/mount.rs`,
+  the lib's unit tests, every host): devices as macOS and as ChmodBPF leave them, read by anyone, owned by a user, and
+  none; the availability under each answer. Red with the old rule on the Mac Studio; the module 12 of 12 with the new.
+
+### A-514 — Mercurial's bundle2, bundle1, changegroups and deltas, decoded and encoded as a pure core and held to golden vectors stock Mercurial 7.2 made (2026-11-19, g291 for UI goal 91; §4.17.3 piece 1; §4.9; A-16, A-499)
+Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (new, `slates-hg`: `bundle2`, `bundle1`,
+`changegroup`, `delta`, the cursor and the admission, with `fixtures/` and its `make-fixtures.sh`), `Cargo.lock`,
+`unsafe-budget.toml` (`slates-hg = 0`), `.gitattributes` (the fixtures' bundles binary), GAPS (the §4.17.3 entry),
+`research/mercurial-server.md` (§12).
+- **What it does.** Reads and writes the three framings a Mercurial exchange uses, byte for byte as 7.2 writes them:
+  a bundle2 stream (`HG20`: stream parameters, parts with mandatory and advisory parameters, chunked payloads, the
+  interrupt), a bundle1 (`HG10UN` and a changegroup `01`), and changegroups `01` to `05` (the changelog's group, the
+  manifest's, from `03` the tree-manifest list, the file list; each version's delta header from 7.2's code), with the
+  deltas inside them (mpatch's hunks, checked by its C rules, applied into one vector of the exact length). Nothing
+  else: no node is hashed (piece 3), no part is handled (piece 5), and a stream compressed with `GZ`, `BZ` or `ZS` is
+  refused by kind until the engines are wired (D-17).
+- **From the sources (read 2026-11-18 and 2026-11-19, `research/mercurial-server.md` §2, §3 and §12).** Every length is
+  a signed big-endian 32-bit integer as 7.2 reads it, so `0xFFFF_FFFF` is −1: a refused length, or in a bundle2
+  payload the interrupt. A changegroup chunk length from 1 to 4 is refused, not read as empty. The tree-manifest list is
+  in every changegroup from `03`, empty or not, though `internals.changegroups` says otherwise. Changegroup `04` is
+  7.2's 130-byte delta-information header (its code), not the sidedata version its document describes (moved to `05`).
+  A part type is 1 to 255 bytes of `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter. A stream parameter
+  is matched without case, and only `Compression` is known.
+- **Stricter than 7.2, on purpose.** A part header whose parameters run past it, or that leaves bytes unread, is
+  refused (7.2 slices short and ignores the rest); a repeated parameter key is refused (the document's "MUST be
+  unique"; 7.2 keeps the last); an empty part type and bytes after a stream's or a changegroup's end are refused.
+- **Caps, none a literal.** The input (a length past the bytes left is `Truncated`) and the caller's `Admission`, the
+  room its request's budget gives (A-16): a decode walks its input once to check and count it, charges the exact
+  total, then builds every vector once at its final size. Interruptions nest without recursion, counted, so ten
+  thousand nested parts decode within their admission and are refused one byte short of it.
+- **Golden vectors.** Made once on the Mac Studio (macOS 26.4, arm64) on 2026-11-19 by stock Mercurial 7.2 from PyPI
+  through `uvx` (CPython 3.12.16), exactly: `OUT=$(mktemp -d ~/.cache/g291-fixtures.XXXXXX) &&
+  ~/.cache/g291-scratch/make-fixtures.sh "$OUT"`, the script checked in as `crates/hg/fixtures/make-fixtures.sh`: one
+  repository (a named branch, a copy, a bookmark, a merge, a subdirectory, a draft amended under evolution), bundled as
+  `none-v1` and `none-v2;cg.version=02|03|04;phases=true;obsolescence=true`, with 7.2's `debugbundle` of each and its
+  log. The ten files' SHA-256 matched after the copy. Two of 7.2's own listing limits showed up and are recorded there:
+  `debugbundle --all` fails on a `04` bundle's full texts (`TypeError` at `debugcommands.py:398`) and lists no file of
+  a `03` bundle.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug, load 18.9 to 26.4).** `cargo test --locked -p slates-hg --lib`: 39 of
+  39 in 1.2 s; `cargo fmt -p slates-hg --check` clean. Golden: the three bundle2 streams hold the parts 7.2 lists and
+  encode back to their bytes; changegroups `01` and `02` decode as 7.2 lists every revision (nodes, parents, link,
+  delta base, delta length), `03` and `04` as far as 7.2's listing goes and equal to `02` beyond it; every file text,
+  the copy's metadata block included, rebuilds from its deltas in all four versions alike, each changeset's text
+  beginning with its manifest's node and ending with its description; every changegroup encodes back to its bytes.
+  Hostile: foreign magics; `len = u32::MAX` and `i32::MAX` in every length; every cut of every fixture; every bit of a
+  fixture flipped one at a time (refused, or read and encoded back: to itself for a stream, to the same bytes for a
+  changegroup); stream parameters as 7.2 judges them;
+  misread part headers; nesting past the admission; arbitrary bytes (property tests). An oracle: `apply` equals a splice
+  model over generated hunks. Red-checked once in a disposable copy: with the chunk-length rule, the trailing-bytes
+  check and mpatch's start-past-end rule removed, the four tests written for them failed and 35 passed.
+- **Owed.** The parts' payloads (phase-heads, bookmarks, the check parts, markers in formats 0 and 1, pushkey values),
+  compressed bundle streams once the D-17 engines are wired, and a golden `05` changegroup (7.2's bundle types offer
+  `01` to `04`; `05` is held to its layout in 7.2's code by a round trip).
 
 ### A-533 — A work left unbuilt at recovery answers `Unpublished`, never recorded, and is asked for again as clients are let in, by messages, never a timer (2026-11-19, goal 85 via g225; A-513's remainder; §4.16 "Recovery"; A-207, A-247)
 

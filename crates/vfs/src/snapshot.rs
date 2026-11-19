@@ -11,7 +11,7 @@ use slates_mem::Handle;
 use crate::content::Chunk;
 use crate::dir::DirNode;
 use crate::dirblocks::BlockRef;
-use crate::ids::{Epoch, SnapshotId};
+use crate::ids::{Epoch, InodeNo, SnapshotId};
 use crate::inode::Inode;
 use crate::trie::TrieNode;
 
@@ -76,7 +76,7 @@ impl Deadlist {
   }
 }
 
-/// A snapshot record: O(1) to take.
+/// A snapshot record: O(1) in the volume's size to take (its orphans are copied, A-532).
 #[derive(Clone, Debug)]
 pub struct Snapshot {
   /// The epoch the snapshot froze (the head moved to the next).
@@ -99,6 +99,10 @@ pub struct Snapshot {
   pub seq: u64,
   /// The Merkle identity, computed lazily (Phase 7) and `None` until then.
   pub identity: Option<[u8; 32]>,
+  /// The files the head held with no name left when the snapshot was taken (its orphans then, A-532), in number order:
+  /// the snapshot keeps them, so a clone of it carries them, and keeps an orphan record for each so it reclaims them by
+  /// the orphan rule. Bounded by the head's orphans, the files held open with no name.
+  pub orphans: Vec<InodeNo>,
 }
 
 /// Derived: the initial capacity of a volume's snapshot slab, one page of records

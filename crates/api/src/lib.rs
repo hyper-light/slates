@@ -234,9 +234,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`MountFault::NotMounted`] before any call, and the new refusals are [`MountFault::Busy`] (`EBUSY`: a process holds
 /// a file on the mount), [`MountFault::StillMounted`] (the call said done and the table disagrees) and
 /// [`MountFault::MountTable`] (the table could not be read) (the same day).
+/// 43: a macOS or BSD host whose loopback anyone but root can capture (a `/dev/bpf` device a group or another user may
+/// read, as Wireshark's ChmodBPF leaves them) is told [`mount::available`] `Unsupported`, and refused the loopback
+/// mount, typed [`MountMissing::PrivateLoopback`]: a mount's capability rides every file handle in the clear, which the
+/// kernel's NFS client cannot encrypt (A-535; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 42;
+pub const CONTRACT: u32 = 43;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

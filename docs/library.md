@@ -186,7 +186,9 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   (Linux), `detach(attachment)`.
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
   and through what (`MountKind`), or what is missing (`MountMissing`; on Windows that includes
-  `MountManager`, the one-time setting that lets WinFsp's driver make the drive). `slates_api::mount::unmount_busy(path)`
+  `MountManager`, the one-time setting that lets WinFsp's driver make the drive; on macOS and the BSDs,
+  `PrivateLoopback` where someone besides root can capture loopback traffic, since a mount's capability crosses it in
+  the clear). `slates_api::mount::unmount_busy(path)`
   lets go of a mount that a leftover process still uses, with no daemon and no privilege, and answers how
   (`LetGo`): `Detached` on Linux (`fusermount3 -u -z`: the holder reads on until it closes), `Forced` on macOS and
   the BSDs (`unmount(2)` with `MNT_FORCE`: the holder's next call fails; the loopback NFS mount is `hard`, so this is
