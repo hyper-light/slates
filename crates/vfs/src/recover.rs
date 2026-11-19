@@ -2772,12 +2772,14 @@ impl Volume {
           .ok_or(VfsError::RecoveryIncomplete)?;
         Ok((source_root, kind_image(store.inodes.get(handle)?.kind)))
       }
+      // The head's table, rebuilt first, holds every number the head holds. For a clone that includes the records it
+      // still shares with its origin, which its image carries by number alone (`origin_shared`, A-64), so they have no
+      // image among the head's own; a snapshot of the clone that holds one shares it with the head all the same. So the
+      // entry resolves through the table, as an origin's does, and its kind is the inode's (A-561).
       SharedSource::Head => {
-        let image = refs
-          .head_images
-          .get(&entry.number)
+        let handle = trie::get(&store.tries, refs.head_inode_root, InodeNo(entry.number))
           .ok_or(VfsError::RecoveryIncomplete)?;
-        Ok((refs.head_inode_root, image.kind))
+        Ok((refs.head_inode_root, kind_image(store.inodes.get(handle)?.kind)))
       }
       SharedSource::Snapshot { at } => {
         let image = refs
