@@ -789,6 +789,10 @@ pub struct ShardState {
   /// How long this shard's writers waited for their volume's FUSE mounts to be told, and the back-off after overdue
   /// waits: what the told bound is learned from (AC-3.3, A-431; `crate::told::bound_ns`). Two words and an estimator.
   pub(crate) told_times: crate::told::ToldTimes,
+  /// How long the kernel took, after sending each `UMNT` this shard confirmed, to take the mount out of its mount table,
+  /// and the back-off after confirmations that ran out: what the confirmation's bound is learned from (A-493;
+  /// `crate::nfs::unmount_bound_ns`), as the told bound is. Two words and an estimator.
+  pub(crate) unmount_times: crate::learned_wait::LearnedWait,
   /// What each NFS connection's client cache holds of the files it touched, by volume (A-192; `crate::nfs_writeback`).
   /// Bounded by the metadata ledger and the listener's connections.
   pub(crate) nfs_writeback: crate::nfs_writeback::WritebackStates,

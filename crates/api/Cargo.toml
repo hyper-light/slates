@@ -55,8 +55,10 @@ rustix = { workspace = true }
 slates-bridge-nfs = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# The roles' stop flag: the console control handler (`role::signal`).
-windows-sys = { workspace = true }
+# The roles' stop flag: the console control handler (`role::signal`). And a fleet node's nameservers, the DNS servers
+# its network adapters list (`role::fleet::windows_dns`, A-490): IP Helper's `GetAdaptersAddresses`, whose adapter
+# entry needs NDIS's interface types.
+windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
 # The WinFsp mounts' purge client, a role of the executable the daemon runs from (§4.6: no daemon thread opens a volume
 # it serves).
 slates-bridge-winfsp = { workspace = true }

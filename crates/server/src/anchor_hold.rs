@@ -9,7 +9,9 @@
 //! channel keeps each send whole whichever thread makes it (`slates_anchor::held`). The descriptors handed back are
 //! adopted here, once, before anything else in the process could claim their numbers, and every one is made
 //! close-on-exec: the anchor cleared that flag to hand them across its spawn, and nothing this daemon starts may hold
-//! a copy (an unaccounted copy of a connection would keep it open after its release).
+//! a copy (an unaccounted copy of a connection would keep it open after its release). What the anchor handed back comes
+//! in one table, read from the sealed object [`ENV_HELD`] names, never from the environment itself, which a table at the
+//! bounds would pass (A-462: Linux's `MAX_ARG_STRLEN`, macOS's `ARG_MAX`).
 //!
 //! A daemon without a supervising anchor (a test harness, a standalone start) has no channel: its sends are answered
 //! `None`, and its mounts and connections end with it, as before A-61 and A-113.
@@ -17,7 +19,9 @@
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::sync::OnceLock;
 
-use slates_anchor::held::{self, ENV_CONNECTIONS, ENV_COPIES, ENV_DEVICES, HoldRefusal, Outgoing};
+use slates_anchor::held::{
+  self, ENV_HELD, HoldRefusal, Inherited, InheritedConnection, InheritedCopy, Outgoing,
+};
 
 /// The channel to the anchor, adopted once at start; unset without a supervising anchor.
 static CHANNEL: OnceLock<OwnedFd> = OnceLock::new();
@@ -66,21 +70,66 @@ pub(crate) struct Handed {
   pub(crate) copies: Vec<HandedCopy>,
 }
 
-/// Adopts what the anchor handed this daemon in [`ENV_DEVICES`] and [`ENV_CONNECTIONS`]: the channel, every held
-/// device and every held connection. A value that does not parse adopts nothing of its kind and is reported, and a
-/// connection whose descriptor number the devices' variable also names is not adopted (its number has another owner);
-/// the daemon then runs without what it could not account for. Called once, at start.
-pub(crate) fn adopt(_mount_bound: usize) -> Handed {
+/// The table's parts as the anchor handed them (A-462): the devices, read whole or the table refused, and the
+/// connections and the copies, each refused alone.
+struct HandedParts {
+  /// The channel and every held device.
+  devices: Inherited,
+  /// Every held connection, or why the part was refused.
+  connections: Result<Vec<InheritedConnection>, HoldRefusal>,
+  /// Every held copy, or why the part was refused.
+  copies: Result<Vec<InheritedCopy>, HoldRefusal>,
+}
+
+/// The parts of the table `pointer` names (A-462): its descriptor and length checked against what the anchor may hold
+/// for this daemon (`config`'s bounds, as the anchor derives them) before a byte is read; the object taken as this
+/// process's own and closed once read; its checksum and lines checked; and refused whole where a part names the table's
+/// own descriptor again. Nothing a refused table names is taken.
+fn handed_table(
+  pointer: &str,
+  config: &crate::config::DaemonConfig,
+) -> Result<HandedParts, HoldRefusal> {
+  let bounds = held::TableBounds {
+    devices: config.held_device_bound(),
+    connections: config.held_connection_bound(),
+    copies: config.held_copy_bound(),
+  };
+  let (table_fd, len) = held::parse_pointer(pointer, bounds)?;
+  let table = held::decode_table(&held::read_table(adopted(table_fd), len)?)?;
+  let devices = held::parse_devices(&table.devices)?;
+  let connections = held::parse_connections(&table.connections);
+  let copies = held::parse_copies(&table.copies);
+  held::check_table_owner(
+    table_fd,
+    &devices,
+    connections.as_deref().unwrap_or_default(),
+    copies.as_deref().unwrap_or_default(),
+  )?;
+  Ok(HandedParts {
+    devices,
+    connections,
+    copies,
+  })
+}
+
+/// Adopts what the anchor handed this daemon in the table [`ENV_HELD`] names: the channel, every held device, every held
+/// connection and every held copy. A table that does not read adopts nothing and is reported; a part that does not
+/// parse adopts nothing of its kind and is reported, and a connection or copy whose descriptor number another part also
+/// names is not adopted (its number has another owner); the daemon then runs without what it could not account for.
+/// Called once, at start.
+pub(crate) fn adopt(config: &crate::config::DaemonConfig) -> Handed {
   let mut handed = Handed::default();
-  let Ok(value) = std::env::var(ENV_DEVICES) else {
+  let Ok(pointer) = std::env::var(ENV_HELD) else {
     return handed;
   };
-  let inherited = match held::parse_env(&value) {
-    Ok(inherited) => inherited,
+  let HandedParts {
+    devices: inherited,
+    connections,
+    copies,
+  } = match handed_table(&pointer, config) {
+    Ok(parts) => parts,
     Err(refusal) => {
-      slates_machine::log_line!(
-        "slates-server: the anchor's device handoff was refused: {refusal}"
-      );
+      slates_machine::log_line!("slates-server: the anchor's handoff table was refused: {refusal}");
       return handed;
     }
   };
@@ -101,8 +150,7 @@ pub(crate) fn adopt(_mount_bound: usize) -> Handed {
       session: device.session,
     })
     .collect();
-  let connections = std::env::var(ENV_CONNECTIONS).unwrap_or_default();
-  match held::parse_connections_env(&connections) {
+  match connections {
     Ok(connections) => {
       for connection in connections {
         if taken.contains(&connection.fd) {
@@ -124,19 +172,22 @@ pub(crate) fn adopt(_mount_bound: usize) -> Handed {
       );
     }
   }
-  adopt_copies(&mut handed, taken);
+  adopt_copies(&mut handed, copies, taken);
   handed
 }
 
-/// Adopts the copies the anchor handed back in [`ENV_COPIES`] (A-197, A-365), none of whose descriptor numbers may be
-/// one the devices' or connections' handoffs named (`taken`).
-fn adopt_copies(handed: &mut Handed, mut taken: Vec<RawFd>) {
+/// Adopts the copies the anchor handed back in the table's copies part (A-197, A-365), none of whose descriptor numbers
+/// may be one the devices' or connections' parts named (`taken`).
+fn adopt_copies(
+  handed: &mut Handed,
+  copies: Result<Vec<InheritedCopy>, HoldRefusal>,
+  mut taken: Vec<RawFd>,
+) {
   taken.extend(handed.connections.iter().map(|connection| {
     use std::os::fd::AsRawFd;
     connection.socket.as_raw_fd()
   }));
-  let copies = std::env::var(ENV_COPIES).unwrap_or_default();
-  match held::parse_copies_env(&copies) {
+  match copies {
     Ok(copies) => {
       for copy in copies {
         if taken.contains(&copy.fd) {

@@ -2003,7 +2003,9 @@ async fn locate_within_budget(query: crate::owner_location::Query) -> Option<Hos
 
 /// [`locate_within_budget`]'s loop: a look every poll interval (the direct route, a round, and the direct route again,
 /// with what the shard read while the round waited), until an owner is found, a look begun after the membership
-/// horizon has found none, or the failover SLO has passed.
+/// horizon has found none, or the failover SLO has passed. Each round asks under the root this node holds at its look
+/// (`owner_location::Query::under_held_root`, A-504), so a newer root a peer's refusal sent its learner to fetch is the
+/// view the next round asks under; before, every round asked under the root the lookup began with.
 async fn locate_within_horizon(query: crate::owner_location::Query) -> Option<HostId> {
   let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   let began = slates_rt::futures::now_ns();
@@ -2016,7 +2018,10 @@ async fn locate_within_horizon(query: crate::owner_location::Query) -> Option<Ho
     if let Some(owner) = known() {
       return Some(owner);
     }
-    if let Ok(owner) = crate::owner_location::locate(query).await {
+    // Asked under the root this node holds now: one a peer's refusal sent its root learner to fetch since the lookup
+    // began is the view its peers answer under (A-504).
+    let asked = crate::state::with_state(|state| query.under_held_root(state)).unwrap_or(query);
+    if let Ok(owner) = crate::owner_location::locate(asked).await {
       return Some(owner);
     }
     // The round waited on its peers while the shard ran its other work: a refutation read meanwhile is seen now.

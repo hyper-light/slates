@@ -61,11 +61,11 @@ pub const WHAT_SHARDS_RESYNC: u8 = 2;
 /// Format: the handles a Shards stream's resync hold names: the daemon's end of its resync pipe.
 pub const SHARDS_RESYNC_HANDLES: usize = 1;
 
-/// Format: what a hold holds, its `what` byte: a Shards stream's DAX section (A-448; A-365's object on Windows): a
-/// duplicate of the confined section one file of the stream's guest is mapped from, which maps read and write and may
-/// ask its size, its record the stream's attachment and the file, which a successor adopts the section by. Its id is the
-/// section's backing named apart from every attachment's id (the server's `dax_hold::section_id`), since a release and
-/// an answer name an entry by id alone.
+/// A Shards stream's DAX section (A-448; A-365's object on Windows): a duplicate of the confined section one file of the
+/// stream's guest is mapped from, mapping read and write and asking its size, its record the stream's attachment and the
+/// file, by which a successor adopts it. Its id is its backing's, named apart from every attachment's (the server's
+/// `dax_hold::marked`), since a release and an answer name an entry by id alone.
+/// Format: what a hold holds, its `what` byte, the third kind.
 pub const WHAT_SHARDS_DAX: u8 = 3;
 
 /// Format: the handles a Shards stream's DAX section hold names: the section.
@@ -1167,33 +1167,53 @@ mod tests {
       sections: 3,
     };
     assert_eq!(bounds.total(), 5);
-    for held in 0..3 {
+    sections_fill_their_own_bound(bounds);
+    attachments_fill_theirs_beside_full_sections(bounds);
+    kinds_share_a_bound_by_class();
+    nothing_fits_bounds_of_none();
+  }
+
+  /// Sections fit `bounds` one by one up to their own bound, and the next is refused.
+  fn sections_fill_their_own_bound(bounds: HoldBounds) {
+    for held in 0..bounds.sections {
       assert!(
         bounds.admits_another(WHAT_SHARDS_DAX, held),
         "section {held}"
       );
     }
     assert!(
-      !bounds.admits_another(WHAT_SHARDS_DAX, 3),
+      !bounds.admits_another(WHAT_SHARDS_DAX, bounds.sections),
       "past the sections' bound"
     );
+  }
+
+  /// Mounts and resync ends fit `bounds` up to the attachments' bound, whatever the sections hold, and the next is
+  /// refused.
+  fn attachments_fill_theirs_beside_full_sections(bounds: HoldBounds) {
     for what in [WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC] {
-      assert!(
-        bounds.admits_another(what, 0),
+      let fitting = (0..bounds.attachments)
+        .filter(|held| bounds.admits_another(what, *held))
+        .count();
+      assert_eq!(
+        fitting, bounds.attachments,
         "kind {what} beside full sections"
       );
       assert!(
-        bounds.admits_another(what, 1),
-        "kind {what} beside full sections"
-      );
-      assert!(
-        !bounds.admits_another(what, 2),
+        !bounds.admits_another(what, bounds.attachments),
         "kind {what} past its bound"
       );
     }
+  }
+
+  /// A mount and a resync end share a bound; a DAX section shares one with its own kind alone.
+  fn kinds_share_a_bound_by_class() {
     assert!(HoldBounds::shared(WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC));
     assert!(!HoldBounds::shared(WHAT_SHARDS_DAX, WHAT_SHARDS_RESYNC));
     assert!(HoldBounds::shared(WHAT_SHARDS_DAX, WHAT_SHARDS_DAX));
+  }
+
+  /// No kind fits bounds of none.
+  fn nothing_fits_bounds_of_none() {
     let none = HoldBounds {
       attachments: 0,
       sections: 0,
@@ -1263,11 +1283,10 @@ mod tests {
     );
     let section = 0x2d8;
     let pointer = encode_handoff(section, table.len());
-    assert!(pointer.len() <= HANDOFF_TEXT_CAP);
-    assert!(HANDOFF_TEXT_CAP < ENVIRONMENT_VARIABLE_CHARACTERS);
+    assert!(pointer.len() <= HANDOFF_TEXT_CAP && pointer.len() < ENVIRONMENT_VARIABLE_CHARACTERS);
     let (named, len) = parse_handoff(&pointer, bounds.total()).unwrap();
     assert_eq!((named, len), (section, table.len()));
-    let (handed_channel, handed) = parse_env(&table[..len], bounds.total()).unwrap();
+    let (handed_channel, handed) = parse_env(table.get(..len).unwrap(), bounds.total()).unwrap();
     assert_eq!(handed_channel, channel);
     assert_eq!(handed, entries);
     check_owners(named, handed_channel, &handed).unwrap();
