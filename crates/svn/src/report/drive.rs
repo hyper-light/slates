@@ -50,7 +50,7 @@
 
 #[cfg(test)]
 mod green;
-mod history;
+pub(crate) mod history;
 #[cfg(test)]
 mod tests;
 
