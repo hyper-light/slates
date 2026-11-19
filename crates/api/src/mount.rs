@@ -482,17 +482,12 @@ pub(crate) fn mount_args(
   ]
 }
 
-/// Derived: how long the mount waits for the daemon's MOUNT service on each of connect, send and receive: one liveness
-/// budget (`slates_server::daemon::LIVENESS_BUDGET_NS`). A daemon that cannot answer one loopback call within the
-/// budget the anchor gives it to beat is not serving. macOS only, as the `mount(2)` path that makes the call is.
-#[cfg(target_os = "macos")]
-const MOUNT_CALL_DEADLINE: std::time::Duration =
-  std::time::Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-
 /// Mounts the volume on macOS without the capability leaving this process (§4.6 A-34): the root handle comes from the
 /// daemon's MOUNT service over this process's own loopback socket, and goes to the kernel in `mount(2)`'s XDR
 /// arguments (`NFS_MATTR_FH`), with a source name that holds no secret (`slates:/<name>`). Nothing another user can
-/// read (`ps`, the mount table) carries the token.
+/// read (`ps`, the mount table) carries the token. The MOUNT call waits while its connection lives, as the hard mount
+/// it makes does: a daemon gone ends it at once and a stuck one is ended by its watchdog or its anchor (A-517,
+/// `slates_bridge_nfs::client::exchange`); until A-517 it was bounded by one liveness budget.
 #[cfg(target_os = "macos")]
 fn mount_volume(
   port: u16,
@@ -509,28 +504,23 @@ fn mount_volume(
       .map(|groups| groups.into_iter().map(|gid| gid.as_raw()).collect())
       .unwrap_or_default(),
   };
-  let handle = fetch_root_handle(
-    port,
-    &caller,
-    &export_path(name, capability),
-    MOUNT_CALL_DEADLINE,
-  )
-  .map_err(|error| {
-    Error::Mount(match error {
-      FetchError::Io(io) => MountFault::RootHandle {
-        errno: io.raw_os_error(),
-        status: None,
-      },
-      FetchError::Malformed => MountFault::RootHandle {
-        errno: None,
-        status: None,
-      },
-      FetchError::Refused(status) => MountFault::RootHandle {
-        errno: None,
-        status: Some(status),
-      },
-    })
-  })?;
+  let handle =
+    fetch_root_handle(port, &caller, &export_path(name, capability)).map_err(|error| {
+      Error::Mount(match error {
+        FetchError::Io(io) => MountFault::RootHandle {
+          errno: io.raw_os_error(),
+          status: None,
+        },
+        FetchError::Malformed => MountFault::RootHandle {
+          errno: None,
+          status: None,
+        },
+        FetchError::Refused(status) => MountFault::RootHandle {
+          errno: None,
+          status: Some(status),
+        },
+      })
+    })?;
   // `nosuid` and `nodev` whoever mounts (A-94): a volume is shared, so a setuid binary or a device node one writer
   // plants must not run or open with its privilege for another. xnu adds both for an unprivileged caller only.
   let mut mnt_flags = libc::MNT_NOSUID | libc::MNT_NODEV;

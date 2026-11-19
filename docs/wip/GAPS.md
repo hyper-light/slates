@@ -3973,7 +3973,14 @@
 >   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
 >   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
 >   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
->   borrows the reply deadline for its own; and macOS's `MOUNT_CALL_DEADLINE` (part 3). The reconnect since A-468
+>   borrows the reply deadline for its own. macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
+>   part): the mount's MOUNT call for the root handle (`slates_bridge_nfs::client::exchange`) bounded each of its
+>   connect, send and receive by one liveness budget, so a live daemon that answered later failed the mount; it now
+>   waits while its connection lives, as the hard NFS mount it makes does (Apple's `mount_nfs(8)`), a daemon gone
+>   ending it at once (`connect(2)`'s `ECONNREFUSED`; the close `recv(2)` reads as 0, since a process's exit frees its
+>   descriptors, `close(2)`) and a stuck one ended by its watchdog or anchor
+>   (`a_mount_call_answered_past_the_old_deadline_is_served`, `a_mount_call_whose_daemon_goes_unanswered_ends_at_once`,
+>   `a_mount_call_to_a_port_nothing_listens_on_is_refused_at_once`). The reconnect since A-468
 >   (2026-11-18, g251b; C-b's second part): a client whose daemon was gone reconnected for the reconnect budget
 >   (`Deadlines::reconnect_ns`, the recovery budget and a liveness window, two seconds), and a claim under a live anchor
 >   waited at most that budget, so a restart slower than it failed the anchor's clients and a daemon nothing would
