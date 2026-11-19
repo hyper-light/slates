@@ -1063,8 +1063,9 @@
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
 > - **Kiln's runners as members: the network each needs (written 2026-11-18, `docs/deploy.md` "What a node's firewall
 >   must let through").** Each runner's node takes inbound UDP at its manifest's base port (probes) and the next
->   (records) from the other runners; TCP at the base port only for the network export, which kiln does not use (its
->   agents mount their volumes on their own runner). As the supervisor reported on 2026-11-18, adacachy's `ufw` drops
+>   (records) from the other runners; TCP at the base port only for the network export, which kiln's Kubernetes
+>   engine uses for a pod's volume from its home runner (its W10, designed 2026-11-19; A-521 the library's verb), while
+>   a runner's own agents mount their volumes on that runner. As the supervisor reported on 2026-11-18, adacachy's `ufw` drops
 >   inbound UDP but kiln's own ports and adacachy2's passes LAN UDP 17202 and 17212 alone, so neither passes a slates
 >   block yet: each needs `ufw allow proto udp from <the LAN> to any port <base>:<base+1>` once, an operator's (root)
 >   step slates never takes (R10). The Macs' firewalls were not checked.
@@ -1239,6 +1240,20 @@
 >   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
 >   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
 >   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+> - **a volume exported to one client, built 2026-11-19 (A-521, `CONTRACT` = 50; kiln's Kubernetes engine, kiln goal
+>   28e73c34's part 01a1f124, its `docs/agentic.md` W10):** §4.6's export was the command line's (`slates export`) and
+>   the raw client's alone, so a host that drives slates through the library alone (kiln) could not serve a pod's volume
+>   over its node's export. `Instance::export(volume, uid, &ExportOptions)` and the seam's verb attach the volume bound
+>   to the client's Unix identity (A-115), read-only or beneath a directory as asked, and answer an `Exported`: the
+>   export's attachment, whose detach ends the capability, and the path the capability authorizes, which the client's
+>   mount names; its `Debug` never shows the token; an answer without a capability is a protocol fault. The simulator
+>   answers a path of its own per export and ends it at its detach or with its volume. Unit tests: `export::tests` (the
+>   path, its redaction, the protocol fault) and `sim::tests` (one capability per client, ended at its detach and with
+>   its volume; the stranger and a full table refused typed). By use over a real daemon: the conformance suite's
+>   stranger and `expect_an_export_is_one_clients_and_ends_at_its_detach` (`crates/api/tests/api.rs`), filed for main.
+>   Owed: a report of the network export's address (today the deployer's own plan: the probe plane's address, over
+>   TCP); and `slates export` over this verb, since it prints the loopback port beside the path, which a
+>   PersistentVolume must not name;
 > - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
 >   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
 >   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as

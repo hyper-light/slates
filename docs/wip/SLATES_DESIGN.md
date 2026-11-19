@@ -2407,6 +2407,15 @@ Build order: the server side of RFC 9289 on the NFS edge, with its oracle; the n
 the token root; the KIND workload pod with an `nfs` PersistentVolume and `tlshd` in the node image, on the CI
 Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 
+> **Status (2026-11-19, A-521): the export is a verb of the library.** `Instance::export(volume, uid, &ExportOptions)`
+> and the seam's `export` attach the volume bound to the client's Unix identity (A-115), read-only or beneath a
+> directory as asked, and answer an `Exported`: the export's attachment, whose detach ends its capability, and the path
+> that capability authorizes, `/<name>@<attachment>.<token>`, which the client's mount names (a PersistentVolume's
+> `nfs.path`). One export per client, never one path shared. Until then the export was the command line's `slates
+> export` and the raw client's alone, so a host that drives slates through the library alone (kiln's Kubernetes engine,
+> its `docs/agentic.md` W10) could not serve a pod's volume. The network export's own address is the node's plan (the
+> probe plane's address, over TCP), which its deployer wrote; no report names it yet (owed, GAPS).
+
 > **Status (2026-09-30, A-48).** The base plane's witnesses, their disk homes, and the fingerprints behind
 > whiteouts and redirects are versioned by epoch like the tree and the inode table: a snapshot, and a
 > clone made from one, reads them as the snapshot froze them. A write overwrites a version no live
@@ -9259,6 +9268,11 @@ it builds against the contract and adds to it rather than around it.
 > code; the wire's `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
 > `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone. An `OsCode` is
 > put in the OS's words only in its own numbering.
+> **`CONTRACT` = 50 (A-521):** a volume exported to one client is a verb of the contract: `Instance::export(volume,
+> uid, &ExportOptions)` and the seam's `export` answer an `Exported`, the export's attachment (its detach ends the
+> capability) and the path the capability authorizes, bound to the client's uid (A-115), its `Debug` showing the path
+> without its token. Until then §4.6's export was the command line's and the raw client's alone, and kiln, which
+> reaches slates only through this library, could not serve a pod's volume over its node's export.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -37871,6 +37885,47 @@ commit a part, in order of harm.
     image (the names its directories carry that name a child) must all be equal.
   - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (3 counted live, 6 after the
     restart); green with the rule; `cargo test --locked -p slates-vfs --lib` 85 passed, 1 ignored.
+
+### A-521 — A volume exported to one client is a verb of the library, so a host that reaches slates only through it serves a pod's volume over its node's export (2026-11-19, g294, UI goal 88's kiln Kubernetes engine, kiln goal 28e73c34's part 01a1f124; §4.6 "Kubernetes publication without privilege", A-115, §4.12; `CONTRACT` = 50)
+Applied in the same change to: §4.6 (the Kubernetes publication's status: the export through the library), §4.12's
+contract log (`CONTRACT` = 50), GAPS (the library's entry; the runners-as-members entry, whose network export kiln's
+Kubernetes engine uses), `docs/library.md` (the seam's verbs, the serving list, what is owed), `crates/api/src/export.rs`
+(new: `ExportOptions`, `Exported` and its `Debug`, `Instance::export`, and their test), `crates/api/src/seam.rs` (the
+verb on `Volumes`), `crates/api/src/sim.rs` (the simulator's export, its record and token, and the tests),
+`crates/api/src/lib.rs` (`CONTRACT` = 50, the module and its re-exports) and `crates/api/tests/api.rs` (the conformance
+suite's stranger, and an export's lifetime over both).
+- **Why.** kiln reaches slates through this library alone (A-278), and its Kubernetes engine (kiln's `docs/agentic.md`
+  W10) runs each agent's pod on the agent's volume, which kubelet mounts as an `nfs` PersistentVolume from the network
+  export of the runner that holds it (§4.6 "Kubernetes publication without privilege"): one capability per pod, bound
+  to one Unix identity (A-115), ended at the pod's end. The export was the command line's `slates export` and the raw
+  client's `attach_bound_mount` alone.
+- **The verb.** `Instance::export(volume, uid, &ExportOptions { read_only, subtree })` reads the volume's name from its
+  raw status (a base the status could not read now does not stop it), attaches the bound host mount
+  (`AttachRequest::BoundHostMount`), and answers an `Exported`: the export's attachment and the path its capability
+  authorizes (`mount::export_path`). The uid is required: an export is to one client, and A-115's binding is what keeps
+  what one uid's kernel cached (a link's target) from every other user of the client's machine. Its refusals are the
+  daemon's, typed as the contract already types them (`NotFound` for the volume; a subtree that names nothing or no
+  directory; a volume another node owns; the caller's rights). An answer without a capability is a protocol fault
+  (`ProtocolFault::UnexpectedReply`), since the daemon mints one for every bound host mount (`capability_token`), and
+  never a path made up. `Exported`'s `Debug` shows the path without its token, a bearer secret on the network
+  export's path.
+- **Where it is served.** Nowhere new: the daemon's NFS listeners serve every capability it issued, the loopback one
+  and, on a fleet node with an operator authority (Unix), the network export over RPC-with-TLS on the probe plane's
+  address (`crates/server/src/deploy.rs`). That address is the deployer's own plan (kiln's listed base port; Slates' KIND
+  proof's `base_port`); no report names it, and the command line's `slates export` prints the loopback port beside the
+  path, which a PersistentVolume must not name: both owed (GAPS).
+- **The simulator.** An export is a record: an attachment of its own per client and the path the daemon would answer,
+  its token the attachment's id (unique to the export, and no secret, since nothing serves it). It takes the uid, the
+  intent and a subtree as given, since it holds no files to judge a subtree by (as for a stream's), and the export ends
+  at its detach or with its volume, never with a mount.
+- **Tests.** `crates/api/src/export.rs`: `an_export_is_the_path_its_capability_authorizes_and_never_shows_its_token`;
+  `crates/api/src/sim.rs`: `an_export_is_one_clients_capability_and_ends_at_its_detach` and
+  `an_export_the_daemon_would_refuse_is_refused_typed_and_holds_nothing`, written first (bda17c0: the library had no
+  export to ask). By use over a real daemon, filed for main: the conformance suite's stranger and
+  `expect_an_export_is_one_clients_and_ends_at_its_detach` (`crates/api/tests/api.rs`).
+- **Owed.** The daemon naming its network export's address in a report, so a host reads it rather than derives it from
+  its plan; the command line's `slates export` over this verb, printing the network export's port where the node has
+  one; kiln's side of W10 (its pods' PersistentVolumes, claims and reaper).
 
 ### A-553 — The Subversion index: every node-revision with the identities FSFS gives it, computed from each revision's changed-path rows and held to a naive filesystem (2026-11-19, g292 for UI goal 91; §4.17.4 item 2 and piece 4; A-500, A-531, A-542)
 Applied in the same change to: §4.17.4 (a status block; item 2's copy-identity rules made FSFS's, every revision's
