@@ -253,6 +253,14 @@
 > 10 and the slates-vcs test). `sparse:oid` stays refused until the next slices: the walk by path with git's tree
 > frames and the graph's named entries; `<blob-ish>` resolved and its blob read by the service, git's two refusals'
 > words, and a stock git exchange recorded. Owed (main): the Linux and Windows runs, clippy, xtask, docs.
+> **A-640 part 4, second slice (2026-11-19, g296; the walk by path):** under a `sparse:oid` filter served alone, with
+> the patterns the request carries, the negotiation walks trees by path with git's frames (`filter_sparse`): every
+> tree sent, a blob when a path to it is matched, a done tree never walked again and any other again at each path;
+> the graph names its entries (`Graph::named_entries`, the store reading them). Refused: `sparse:oid` without its
+> patterns, and within `combine:` (git's answer there turns on its order of walk). 39 of 39 on the Mac Studio (r6
+> over main bb535bd4d; failing first in r213, 4 of 39 with the walk stubbed; the oracle's census now requires the
+> sparse path). Owed: the service's slice (`<blob-ish>` resolved, its blob read, git's two refusals' words, a stock
+> git exchange recorded); main's Linux and Windows runs, clippy, xtask, docs.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation

@@ -3,7 +3,8 @@ use crate::object_name::Kind;
 
 /// A-615 part 2 (`list-objects-filter-options.c` `gently_parse_list_objects_filter`; rev-list-options "--filter"): do
 /// parse every spec git reads, units included, and a combination with percent-encoded sub-specs. Expect: each filter, a
-/// unit multiplying by 2^10, 2^20 or 2^30, the combination's sub-specs decoded, and `sparse:oid` read but not served.
+/// unit multiplying by 2^10, 2^20 or 2^30, the combination's sub-specs decoded; `sparse:oid` served with its patterns
+/// alone (A-640 part 4), refused without them and within a combination.
 #[test]
 fn every_spec_git_reads_parses_to_its_filter() {
   let cases: [(&[u8], Filter); 13] = [
@@ -33,16 +34,13 @@ fn every_spec_git_reads_parses_to_its_filter() {
   for (spec, filter) in cases {
     assert_eq!(Filter::parse(spec), Ok(filter), "{spec:?}");
   }
+  let sparse = Filter::parse(b"sparse:oid=abc").unwrap();
+  assert_eq!(check_served(&sparse, true), Ok(()));
+  assert_eq!(check_served(&sparse, false), Err(Refusal::SparseOid));
+  let combined = Filter::parse(b"combine:blob:none+sparse:oid=abc").unwrap();
+  assert_eq!(check_served(&combined, true), Err(Refusal::SparseCombined));
   assert_eq!(
-    check_served(&Filter::parse(b"sparse:oid=abc").unwrap()),
-    Err(Refusal::SparseOid)
-  );
-  assert_eq!(
-    check_served(&Filter::parse(b"combine:blob:none+sparse:oid=abc").unwrap()),
-    Err(Refusal::SparseOid)
-  );
-  assert_eq!(
-    check_served(&Filter::parse(b"combine:blob:none+tree:1").unwrap()),
+    check_served(&Filter::parse(b"combine:blob:none+tree:1").unwrap(), false),
     Ok(())
   );
 }
