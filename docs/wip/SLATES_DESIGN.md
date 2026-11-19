@@ -13527,16 +13527,44 @@ copy and commits the result as any commit. The server never merges file contents
   review; approving it submits the work under item 3 and makes the revision, and the author's next `svn update` meets
   its own edits as the incoming change. A held commit built on another is a work over a work (§4.17.1).
 
-*9. Hooks* (§4.17.1's hook rule). start-commit (the repository's path, the user, the client's capabilities joined by
-`:`, the transaction), pre-commit (path, transaction; on standard input `LOCK-TOKENS:` and a `path|token` line per
-presented token), post-commit (path, revision, transaction), pre- and post-revprop-change (path, revision, author,
-property, action `A`, `M` or `D`; the new value, or the old one, on standard input) and the four lock hooks, each with
-`hooks.c`'s arguments (notes §7). A hook's standard input is a pipe, never Subversion's temporary file (R1). A stock
-hook reads the transaction with `svnlook -t TXN REPOS`, so slates installs its own `svnlook` (the subcommands hooks use:
-`author`, `cat`, `changed`, `date`, `diff`, `dirs-changed`, `filesize`, `history`, `info`, `lock`, `log`, `propget`,
-`proplist`, `tree`, `uuid`, `youngest`) first on the hook's `PATH`, answering from the work or the revision through the
-client channel and never from a disk, and REPOS is the repository's configured directory. A refusing pre-hook's
-standard error is the client's message (`E165001`); post-commit's becomes `commit-info`'s `post-commit-err`.
+*9. Hooks* (§4.17.1's hook rule; A-623). The server's nine hook points as stock `svnserve` 1.15 runs them, and nothing
+of Subversion's client side: slates offers the server alone, and a hook that reads its transaction runs the stock
+`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). Each hook runs through §4.17.1's
+driver over a read-only attachment of the work or the revision, and gets `hooks.c`'s arguments, standard input and
+environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
+- start-commit: the repository's directory (REPOS, its configured directory), the user, the client's capabilities
+  joined by `:`, the transaction.
+- pre-commit: REPOS and the transaction. On standard input, when the commit presented lock tokens, `LOCK-TOKENS:`, a
+  `path|token` line a token and a blank line; the path is the client's own, relative to its commit's base (`b.txt` for
+  `/trunk/with space/b.txt`), escaped as `svn_path_uri_autoescape` escapes (ten bytes: `%20` for a space, `%7C` for
+  `|`; `%` and every byte past ASCII kept). Otherwise nothing.
+- post-commit: REPOS, the revision, the transaction.
+- pre- and post-revprop-change: REPOS, the revision, the author, the property, the action `A`, `M` or `D`; the new
+  value, or the old one, on standard input.
+- pre-lock: REPOS, the path, the user, the comment, `1` for a stolen lock; its standard output, when it writes one, is
+  the lock's token. pre-unlock: REPOS, the path, the user, the token, `1` for a broken lock. post-lock and post-unlock:
+  REPOS and the user, the paths on standard input a line each. A commit that releases its locks runs pre-unlock for each
+  with its token, not broken, then post-unlock.
+
+Every argument is a C string that ends at its first NUL. A hook's environment is its own hooks-env section, else the
+default section, else nothing, and never the server's; a section named twice is one, and a section with no variables is
+none. Its directory is `/` and a hook with no input of its own reads the null device, as under `svnserve -d`; standard
+input is a pipe, never Subversion's temporary file (R1).
+
+What the client is told is `svnserve`'s own words, byte for byte (`check_hook_result`, `fs-wrap.c`, `serve.c`). A
+refusing pre-hook is `E165001` "Commit blocked by pre-commit hook (exit code 2)" (start-commit and pre-commit "Commit",
+pre-revprop-change "Revprop change", pre-lock "Lock", pre-unlock "Unlock"), then " with output:" and its standard error
+up to its first NUL when that is UTF-8, `[Error output could not be translated from the native locale to UTF-8.]` when
+it is not, or " with no output.". A hook a signal ended, or one slates killed past its learned bound, is "'pre-commit'
+hook failed (did not exit cleanly: apr_exit_why_e was 2, exitcode was 9). " and the same tail: `svnserve` has no
+deadline, so its words have no place for the bound. A program that cannot be executed is told as exit code 255 with no
+output, since `svnserve` learns of a failed `exec` only from its child's exit; one with no room to start is `E165002`
+"Failed to start '<program>' hook" over "Can't start process". Start-commit's refusal answers `open-root`, pre-commit's
+`close-edit`, and pre-lock's and pre-unlock's their own path among `lock-many`'s or `unlock-many`'s. A failed
+post-revprop-change is the command's `E165001`, the change standing; post-lock's and post-unlock's are `E165008`
+"Locking succeeded, but post-lock hook failed" and `E165009` "Unlock succeeded, but post-unlock hook failed" over
+`E165001`, after the `done`; post-commit's is `commit-info`'s `post-commit-err`, the commit standing. The unlock hooks a
+commit's release runs are logged and never told, as `svnserve` drops them.
 
 *10. Who may do what.* The transport proves the principal (§4.13): over `svn://` the SASL mechanisms `ANONYMOUS`,
 `CRAM-MD5` and, through the tunnel, `EXTERNAL`; over `https://` a TLS client certificate or Basic credentials inside
@@ -13573,6 +13601,23 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > Owed: the server's questions (piece 7: every path sent, every path a commit changes); the file read from the
 > repository (`authz-db` as a `^/` URL) and compiled per file identity; `svnserve`'s `force-username-case`; and
 > `mod_authz_svn`'s questions with HTTP (piece 13).
+>
+> **Status (2026-11-19, A-623: the hook points, item 9).** Built in `crates/server`'s `vcs_hooks`, pure and not yet
+> called: Subversion's nine points, each hook's input (`svn_start_commit` to `svn_post_unlock`, `SvnHooksEnv`), and what
+> the client is told of each outcome (`svn_told`, `svn_told_unconfigured`). Held to stock `svnserve` 1.15.0's own runs
+> on the Mac Studio, recorded by `crates/svn/fixtures/hooks/make-fixtures.py`: 33 cases, 64 hook runs and every byte
+> `svnserve` sent, SHA-256 checked. Every recorded input is rebuilt byte for byte, and every refusal's words are found
+> in the bytes `svnserve` sent. `cargo test -p slates-server --lib vcs_hooks`: 28 of 28; red ten ways, each guard broken
+> in a copy failing the tests that hold it. slates ships no `svnlook`; the rebuilt one was stopped by Ada's scope, and
+> its recordings stay on the unmerged branch `agents/g229-a623-svnlook`.
+> Owed: the record's six new points (`HookPointName` names pre-commit, pre-revprop-change and post-commit alone; the
+> others need wire tags, A-622); a hooks-env the owner can set (until then every hook runs with an empty environment,
+> as `svnserve` with no hooks-env file); the driver (A-622 part 3): hooks started in `/` with the null device as input,
+> pre-lock's standard output read as the token and a bad one refused as `svn_fs_lock_many` refuses it (`E160037`, "Lock
+> token '…' is not ASCII or is a control character at byte 31" for a trailing newline, recorded), a dangling link told
+> apart (`svnserve`'s "Failed to run '…' hook; broken symlink", recorded), no core dumps (`apr_exit_why_e` 6); the
+> server's calls at commit, lock, unlock and revision-property change; Windows' `svnserve`, whose words for a program
+> `CreateProcess` refuses differ.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -13650,7 +13695,9 @@ refused, naming the hook. A lock in the way: refused as item 3.4 says. A holder 
 another `E160039`, a bad token `E160037`, already locked `E160035`, no such lock `E160040`, out of date for a lock
 `E160042`, an expired lock `E160041`, no principal `E160034`, a directory to lock `E160017`, a path to lock the head
 lacks `E160013`, a lock comment XML cannot carry `E130004`, a negative expiry `E200004`; a revision property's old value
-differs `E160049`; hook refused `E165001`; revision properties not enabled `E165006`; post-commit failed `E165007`; not
+differs `E160049`; hook refused `E165001`; a hook that could not start `E165002`; revision properties not enabled
+`E165006`; post-lock or post-unlock failed `E165008`, `E165009` (a failed post-commit is `commit-info`'s
+`post-commit-err`, never a failure: item 9); not
 authorized `E170001`; unreadable `E220001`, unwritable `E220004`; checksum `E200014`; property value `E125005`;
 mergeinfo `E200020`; malformed `E210004`; unknown command `E210001`; request too large `E210009`; svndiff `E185000` to
 `E185005`; LZ4 `E200046`. §4.17.1's typed refusals map onto these.
@@ -42498,3 +42545,57 @@ Applied in the same change to:
   and the request room derived from the shard's budget, refusals counted; git's site: `slates-git`'s routes, the
   authenticator from a credential to a principal of §4.13, the policy's decision (§4.17.1, A-597, A-622), and
   upload-pack and receive-pack as services (A-620, A-624); the live run with a stock `git clone` over HTTPS (main's).
+
+### A-623 — Subversion's hook points as stock svnserve runs them: each hook's input and what the client is told, byte for byte (2026-11-19, g229, UI goal 93; §4.17.4 item 9 and piece 11; after A-597 and A-622)
+Applied in the same change to:
+- §4.17.4 item 9 (rewritten), its refusals list (`E165002`, `E165008`, `E165009`; post-commit's failure no failure)
+  and a status;
+- GAPS (the §4.17 entry); the Subversion research notes §7 (the recorded facts);
+- `crates/server` (`vcs_hooks.rs`: start-commit, post-revprop-change and the four lock hooks added to the points;
+  `SvnHooksEnv`; every argument a C string and a lock token's path escaped; `svn_told` and `svn_told_unconfigured`;
+  `Outcome::TimedOut` keeps the status its process was reaped with);
+- `crates/svn/fixtures/hooks` (new: `make-fixtures.py` and the 325 files it wrote).
+
+- **Scope.** Ada's correction (2026-11-19, relayed by main): slates offers the server portion only, and stock clients
+  and tools stay stock. The piece first rebuilt `svnlook`'s commands; that stopped, and its recordings stay on the
+  unmerged branch `agents/g229-a623-svnlook`. Item 9's "slates installs its own `svnlook`" is gone: a hook that reads
+  its transaction runs the stock `svnlook` itself. The piece is now the server's nine hook points: their arguments,
+  standard input and environment as `svnserve` passes them, run through A-597's runner and A-622's driver over a
+  read-only attachment, and each hook's refusal returned to the client as `svnserve` returns it.
+- **The evidence.** `make-fixtures.py` runs stock `svnserve` 1.15.0 on the Mac Studio in `/` with the null device as
+  its input, as a daemon starts its hooks, with nine generated hooks that record their arguments, standard input,
+  environment and directory, and a relay that logs each connection. 33 cases: commits by two users, locks taken,
+  stolen, broken, taken from a working copy with a token the pre-lock hook chose and given back with their tokens, a
+  commit that releases its lock and one that keeps two, three revision-property changes; then each pre-hook refusing
+  with output and without, killed by a signal, writing bytes UTF-8 refuses or a NUL; pre-revprop-change missing; each
+  post-hook failing; a hook not executable, a broken link, and a pre-lock token with a newline. Before any Rust ran,
+  each refusal's predicted bytes were looked for in what `svnserve` sent: 17 of 17 found.
+- **Found by the recording.** (1) A `LOCK-TOKENS:` line names the client's own path, relative to its commit's base
+  (`b.txt` for `/trunk/with space/b.txt`), escaped by `svn_path_uri_autoescape`, whose table escapes ten bytes and none
+  past ASCII; `LockToken` took a pre-escaped path, and now the builder escapes. (2) With no token presented,
+  pre-commit reads the null device: A-597's builder wrote `LOCK-TOKENS:` and a blank line, and its test asserted it.
+  (3) A hooks-env section with no variables is no section, so its hook takes the default one; a section named twice
+  is one. (4) `svn_io_start_cmd3` leaves APR's error check off, so a program `exec` refuses is told as exit code 255
+  with no output, never "Failed to start", which only a failed `fork` gives. (5) `svnserve` releases a commit's locks
+  through pre-unlock and post-unlock and drops their failures. (6) post-lock's and post-unlock's failures come wrapped
+  in `E165008` and `E165009` after the `done`; post-commit's is `commit-info`'s `post-commit-err`.
+- **Decided.** A hook slates kills past its learned bound is told as `svnserve` tells of a hook a signal ended, from
+  the status it was reaped with (`Outcome::TimedOut` now keeps it): `svnserve` has no deadline, so its words have no
+  place for the bound. The server speaks UTF-8, so a hook's standard error is told as it is when it is UTF-8 and as
+  `check_hook_result`'s notice otherwise, as `svnserve` does under a UTF-8 locale; a character the runner's cap cut in
+  two is left out, so a cut does not turn the whole into the notice. Every argument ends at its first NUL, as
+  `svnserve`'s C strings do, so none holds a NUL no `execve` could pass.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19): `cargo test --locked -p slates-server --lib vcs_hooks` 28 of
+  28 and `cargo fmt -p slates-server -- --check` clean, on a fresh clone of the branch. Red ten ways, each on a copy of
+  the module in the Studio's clone, each failing the tests that guard it and nothing else: an argument kept past its NUL
+  (1 test), nothing escaped (2), an empty section kept (2), sections not merged (6), a cut character kept (1),
+  `apr_exit_why_e` 1 for a signal (2), exit 1 for a failed `exec` (2), post-lock's failure unwrapped (1), standard error
+  read past its NUL (2), and A-597's `LOCK-TOKENS:` with no token (2: the token test and the recorded commits); the file
+  put back, 28 of 28 again.
+- **Owed.** The record's six new points (`HookPointName` names three; the rest need wire tags, A-622); a hooks-env the
+  owner can set, until which every hook runs with an empty environment, as `svnserve` with no hooks-env file; A-622
+  part 3's driver: hooks in `/` with the null device as input, pre-lock's standard output read as the token and a bad
+  one refused as `svn_fs_lock_many` refuses it (recorded: `E160037` for a trailing newline), a dangling link told
+  apart as `svnserve`'s "broken symlink" (recorded), no core dumps; the server's calls at commit, lock, unlock and
+  revision-property change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ. Main's:
+  clippy, `xtask` and the lint matrix over the module.

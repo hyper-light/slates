@@ -205,6 +205,18 @@
 > first refused the push's typed `PushRefusal` (denied by rule n, not listed, not permitted, another tool's name, an
 > unreadable rule); unruled changes are the owner's alone. Server lib `vcs_policy::` on the Mac Studio, red first.
 > Owed: the git, Mercurial and Subversion push pieces calling it, each with its tool's words; the hook driver (part 3).
+> **A-623 (2026-11-19, g229; §4.17.4 item 9, Subversion's hook points):** `vcs_hooks` holds Subversion's nine points
+> with each hook's arguments, standard input and environment as stock `svnserve` 1.15 hands them, and `svn_told`,
+> `svnserve`'s own words for every outcome; slates ships no `svnlook` (Ada's scope: a hook runs the stock one). Held to
+> 33 cases recorded from stock `svnserve` 1.15.0 on the Mac Studio (`crates/svn/fixtures/hooks`, 325 files, SHA-256
+> checked): `cargo test -p slates-server --lib vcs_hooks` 28 of 28, red ten ways. Found by the recording: lock-token
+> lines carry the client's relative path; no token, no input (A-597's builder and its test had `LOCK-TOKENS:` and a
+> blank line); an empty hooks-env section is none; a program that cannot be executed is exit 255 with no output. Owed:
+> the record's six new points (`HookPointName`, A-622's wire tags); a hooks-env the owner can set; the driver (A-622
+> part 3): hooks in `/` with the null device as input, pre-lock's output read as the token and a bad one refused as
+> `svn_fs_lock_many` refuses it (recorded), a dangling link told apart (recorded), no core dumps; the server's calls;
+> Windows' `svnserve` words for a program `CreateProcess` refuses. Main's: clippy, `xtask` and the lint matrix over the
+> module.
 > **A-595 (2026-11-19, g076b; piece 8's first part):** HTTP/1.1's request codec is its own crate, `crates/http`
 > (`slates-http`), which the Mercurial and Subversion servers share without depending on git's: a head read as it
 > arrives, each byte scanned once, lines held to RFC 9112 §3's 8000 octets, its bytes and field index charged to the

@@ -350,7 +350,14 @@ the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `
   `M` or `D`; the new value on stdin) and post-revprop-change (the old value on stdin), pre/post-lock and
   pre/post-unlock. With no pre-revprop-change hook "default to MASSIVE PARANOIA" (670): every revision property change
   is refused, `SVN_ERR_REPOS_DISABLED_FEATURE`. Hooks get their stdin from a temporary file (`create_temp_file`), which
-  slates replaces with a pipe (R1).
+  slates replaces with a pipe (R1). Recorded from stock `svnserve` 1.15.0 [M: `crates/svn/fixtures/hooks`, A-623]: a
+  `LOCK-TOKENS:` line names the client's own path, relative to its commit's base (`serve.c` `add_lock_tokens` hands the
+  filesystem the path as sent), escaped by `svn_path_uri_autoescape`'s ten bytes and nothing past ASCII; pre-commit
+  reads the null device when no token was presented; a hook's environment is its own hooks-env section, else the
+  default one, and a section with no variables is none (`parse_hooks_env_option`); a hook `exec` refuses exits 255 with
+  nothing written (`svn_io_start_cmd3` leaves APR's error check off); post-lock's and post-unlock's failures come
+  wrapped in `E165008` and `E165009`, post-commit's as `commit-info`'s `post-commit-err`; a commit's release of its
+  locks runs pre-unlock and post-unlock, whose failures `unlock_paths` logs and drops.
 - **CRAM-MD5** [B: RFC 2195 102-107, 205-212]: keyed MD5's precomputed intermediate results "make it possible to avoid
   explicit cleartext storage of the shared secret on the server system by instead storing the intermediate results
   which are known as "contexts"", and "servers that store the secrets or contexts must both be protected": a context is
