@@ -12974,6 +12974,12 @@ engine: the verdict, rebase, position mapping, the register).
 > receive-pack judges ref names, a hook's git walks the hook view itself, and Subversion's path reads walk its own node
 > history over revisions. A-614 is complete with parts 1 and 2.
 >
+> **Status (2026-11-19, A-653 continued (3): git's delta search a bounded amount a step).** `store::Search` indexes
+> the source and then scans the target a step at a time, each step at most its budget's blocks of the source or its
+> budget of the target, one copy and the target's last bytes past it, and writes the delta one pass writes, byte for
+> byte; `delta_of` is one search run to its end. Owed: its users, upload's objects past a window (part 2) and the
+> fragment encoder's per-object unit (`Encoder::put` stepping its trials through a search).
+>
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
 > volume serves as a hook's bare repository, each file's bytes made when a read reaches them. `HEAD`, `config` and
@@ -13651,8 +13657,28 @@ signature verification).
 > `push-plain` raced at the append by another client's push answered as 7.2's `push-race`; a stock bundle of two
 > branches, a merge and an amended draft placed on an empty repository as 7.2 lists it; a naive oracle over generated
 > histories (macOS arm64, Mac Studio: slates-hg's push tests 36 of 36, the server's 7 of 7; other platforms owed).
-> Owed: the policy and the hooks at their points (part 4), the server's home for each repository's index and the
-> served view over it (with A-650), the bundle read in slices, the pushkey and part hooks, markers (piece 7).
+> Owed: the server's home for each repository's index and the served view over it (with A-650), the bundle read in
+> slices, the pushkey and part hooks, markers (piece 7).
+>
+> **Status (2026-11-19, A-657 part 4: a push's admission).** Before its verdict a prepared push asks the repository's
+> policy about every name it changes (`hg_push::admitted` over A-622 part 2's `vcs_policy::admit`: a line moved,
+> merged away or made on a new branch submits to its branch, a line made beside another head rewrites it, a bookmark
+> moved forward or made submits, moved elsewhere rewrites, deleted deletes), refused in `acl`'s words naming the
+> principal, the name and its changeset as 7.2's `acl` names it (a branch's first new changeset in `short`'s twelve
+> digits, the branches asked in the order the push brings them, as `acl` walks revisions; a bookmark's new node in all
+> forty, none for a deletion), or in hgweb's for a principal no rule lets push. Then the repository's
+> `pretxnchangegroup` hooks run in their order through A-622's hook driver over
+> the push's pending view, `HG_NODE` and `HG_NODE_LAST` its first and last new changesets and none when it adds none,
+> the first that does not accept stopping the rest and answering `<name> hook exited with status <n>` (or `killed by
+> signal <n>`) with every hook's words salvaged as `output` parts after the changegroup's reply; the `changegroup`
+> hooks run after the commit and change no answer. Each hook's environment is the one stock 7.2 hands it, recorded from
+> 7.2 itself (`crates/hg/fixtures/hooks`): beside A-597's, `HG`, `HGPLAIN` 1, `HG_BUNDLE2` 1, `HG_TXNNAME` `serve`, and
+> one `HG_TXNID` for both hooks of a push. Proven on the fixtures' repository (a rule denying `default`, a list leaving
+> the owner out on bookmarks, a bookmark deleted, a push opening `stable` before moving `default`), against the
+> recorded environments, and through the driver with the test binary playing each hook (macOS arm64, Mac Studio:
+> red with the five variables removed, then the server's 47 of 47 and slates-hg's 36 of 36). Owed: the principal's
+> Mercurial identity in `acl`'s words (§4.13), the pending view itself (piece 9's revlog view), the hooks' learned
+> times kept per hook on the shard.
 >
 > **Status (2026-11-19, A-650 part 1: HTTP version 1 served).** `serve::http` answers a request as 7.2's `_callhttp`
 > does: its command the query's last `cmd`, as hgweb's `multidict` reads it (A-569's codec read the first, corrected);
@@ -14101,7 +14127,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    through A-618's builder over laid-out flat manifests. Built (A-657, part 3; `push::classify`, `push::held`,
    `push::commit`, slates-server's `repository::hg_push`): which lines, bookmarks and phases a push moves, its names
    (`branch:<label>:<number>`, `bookmark:<label>:`), its race checks as positions, the landing through A-635's append on
-   each green's log with the phase roots in the same entry, the index kept; owed: the policy and the hooks (part 4).
+   each green's log with the phase roots in the same entry, the index kept. Built (A-657 part 4): the policy before the
+   verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -14394,16 +14421,16 @@ and export by landing).
 >
 > **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
 > `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
-> (`reads::Repository`: entries, property lists, revision properties, texts in runs) and the session's `Guards` (its
-> locks and what its principal may read): an explicit stack of frames, never recursion, a step at a time under the
-> caller's budget, the report read one path ahead as `reporter.c` reads it; entry properties, lock tokens removed,
-> property differences, absent entries, deletions with `svn_repos_deleted_rev`'s revision, depth upgrades and
-> exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve` makes in its words. Held to
-> every drive `svnserve` made in the recorded sessions (27, the early answer's being the handler's), replayed from
-> each session's own report over `history.txt` rebuilt into an index and a green and checked against
-> `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by what its
-> delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`),
-> sent today as new data; and the handler.
+> (`reads::Repository`: entries, property lists, revision properties, texts in runs), the session's `Guards` (its locks)
+> and its one compiled read rule, which its read commands ask too (A-656 continued (2)): an explicit stack of frames,
+> never recursion, a step at a time under the caller's budget, the report read one path ahead as `reporter.c` reads it;
+> entry properties, lock tokens removed, property differences, absent entries, deletions with `svn_repos_deleted_rev`'s
+> revision, depth upgrades and exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve`
+> makes in its words. Held to every drive `svnserve` made in the recorded sessions (27, the early answer's being the
+> handler's), replayed from each session's own report over `history.txt` rebuilt into an index and a green and checked
+> against `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by
+> what its delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base
+> (`xdelta.c`), sent today as new data; and the handler.
 >
 > **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
 > (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
@@ -49644,6 +49671,120 @@ Fixed line), `research/mercurial-server.md` (§25's bullet on the bound: the mac
   arbitrary bytes (generated), none past `bound`.
 - **Owed.** The other platforms' runs (main's). The proptest's failing seed from the red run is not kept: its block has
   no seed file, and the table holds the same case.
+
+### A-657 part 4 (A-641 part 4) — a Mercurial push's admission: the repository's policy asked before the verdict in acl's words, and the hooks at pretxnchangegroup and changegroup through the hook driver (2026-11-19, g304, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" step 5, "Hooks", piece 5; A-622 parts 2 and 3, A-597; after A-657 part 3)
+
+- **What.** `hg_push::admitted(state, (principal, repository), &prepared)`: `vcs_policy::admit` over `Prepared::asks`, each
+  `Ask` a namespace, a label, a right and the changeset `acl` names; `admission_hooks` and `observing_hooks` (the
+  policy's hooks at `pretxnchangegroup` and `changegroup`, in its order, through A-597's `hg_pretxnchangegroup` and
+  `hg_changegroup`), `run_hooks` (A-622 part 3's driver, the first refusal answering in 7.2's words, each run's lesson
+  handed back), `Prepared::with_output` (the hooks' `output` parts after the changegroup's reply);
+  `classify::Plan::firsts`; `vcs_hooks::changegroup_env` adds `HG`, `HGPLAIN`, `HG_BUNDLE2`, `HG_TXNID`
+  (`Changegroup::transaction`, `hg_push::transaction_id`) and `HG_TXNNAME`. Part 3's interning of a push's branches
+  scanned every branch per changeset (quadratic in a push that brings a branch a changeset); `classify` now finds a name
+  in a map, and `Plan::firsts` and the asks are kept through maps and a set.
+- **Read from 7.2's code** (research §24): `hook.py` `_exthook` and `procutil.explainexit` (`%s hook %s`, `exited with
+  status %d`, `killed by signal %d`; a non-throwing point only warns), `changegroup.apply` (`pretxnchangegroup` runs
+  only when changesets were added, `node` and `node_last` the first and last); `hgext/acl.py` and
+  `bundle2_part_handlers.handlebookmark` (Homebrew's 7.2 on the MacBook, 2026-11-19): `_txnhook` walks the new
+  changesets in revision order and names the first it refuses by `short` (twelve digits), `_pkhook` a bookmark by the
+  pushkey's `new`, which `handlebookmark` hands `prepushkey` under `server.bookmarks-pushkey-compat` (true by default):
+  all forty digits, empty for a deletion.
+- **Recorded from 7.2 itself** (`crates/hg/fixtures/hooks/make-hook-fixtures.sh`, Homebrew's 7.2 on the MacBook): what
+  7.2 set for `pretxnchangegroup` and `changegroup` on a push of two changesets over an SSH stand-in, beyond the
+  server's own environment, publishing and not (byte-identical): `HG`, `HGPLAIN=1`, `HG_BUNDLE2=1`, `HG_HOOKNAME`,
+  `HG_HOOKTYPE`, `HG_NODE`, `HG_NODE_LAST`, `HG_SOURCE=serve`, `HG_TXNID` (one for both hooks), `HG_TXNNAME=serve` and
+  `HG_URL`, with `HG_PENDING` at `pretxnchangegroup` alone; no `HG_PHASES_MOVED`.
+- **Decided.** The rights a Mercurial push asks (a forced push's new head is a rewrite of its branch; a merge that
+  retires a line submits); `acl`'s user the principal's record until §4.13 names its Mercurial identity; a hook past its
+  learned bound, unstartable, or ended by its client leaving refuses in slates' words, as a throwing hook would; `HG`
+  is `hg` (slates runs no hg of its own, so a hook's `$HG` is the first on its search path); `HG_TXNID` is `TXN:` and
+  forty digits of a BLAKE3 key derived from the push's name (7.2's hashes its transaction's start: one value a push,
+  which no hook can predict).
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug): red then green in kiln r192 on 924888d14, green again in
+  kiln r202 on d49e5484f, the merged tree that lands (r175 and r184 alike before). Red first: `changegroup_env`
+  without the five variables, `cargo test --locked -p slates-server --lib
+  vcs_hooks::tests::mercurials_hooks_get_the_environment_stock_7_2_hands_them` failed, 7 names against 7.2's recorded
+  12. Green: `cargo test --locked -p slates-server --lib -- hg_push vcs_hooks --test-threads=4` 47 of 47, its build
+  warning-free; `cargo test --locked -p slates-hg --lib -- push::` 36 of 36; `cargo fmt -p slates-hg -p slates-server
+  -- --check` clean. The first builds found three faults, each fixed: `hg_push` called slates-hg's crate-private
+  `node::write_hex` (now the server's `hex_of`); the hooks test's runtime returned at its first idle poll, no timer
+  being armed, and the test hung (its run now goes under `futures::within`, as `hook_driver`'s and `svn_hooks`' tests
+  do); and `Prepared`'s hook inputs were never read (a test now lands a push with a hook's words and reads its reply
+  as a client does). No integration target reaches the hook driver's Mercurial path. Further reds, clippy and the
+  other platforms are main's; `run_hooks` and the hook builders it uses are Unix's.
+- **Applied in the same change to:** §4.17.3's status (part 4) and piece 5's line; GAPS' §4.17.3 entry and its
+  Mercurial hook variables (owed, now closed); `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs`;
+  `crates/server/src/vcs_hooks.rs`; `crates/hg/src/push/classify.rs` and `classify_tests.rs`;
+  `crates/hg/fixtures/hooks/` (new).
+
+### A-653, continued (3) — git's delta search a bounded amount a step: `store::Search` (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 4; CLAUDE.md §3 "Bounded work everywhere"; A-614 part 2's `deltas.rs`; part 1 of "a delta search for an object past a window")
+
+Applied in the same change to: §4.17.2 (a status block), GAPS (the A-653 entry), `crates/git` (`store::deltas`:
+`Search`, `SearchStep`, `SearchCounters`, `delta_of` one search run to its end; their re-export from `store`;
+`tests::store::deltas`, new).
+
+- **Why.** A-639's stream sends an object past a window whole, with no delta trial, since `delta_of` searched a whole
+  source and a whole target in one call, which no unit bounded by a window could do (A-653's owed "a delta search for
+  an object past a window"). Main's split (2026-11-19): part 1, the search itself a bounded amount a step; part 2, the
+  stream's objects past a window searched through it, their buffers and the source's index charged to the request's
+  own admission, sent whole only where the admission cannot hold them, that case counted, and git's rule read from
+  `pack-objects.c` at v2.50.1 before it is relied on. No constant of git's (its 512 MiB `core.bigFileThreshold`) is
+  taken: a number from one tool is still arbitrary under R3.
+- **The search in steps.** `Search::step(source, target, budget)` indexes the source's whole blocks, at most the
+  budget's and one at least, each hash keeping its first offset as one pass keeps it; once the index is whole, it
+  writes the sizes and scans the target from where the last step stopped, with the one pass's own loop, until the scan
+  has passed the budget. A match found at the step's last position carries it one copy further (64 KiB at most, git's
+  longest copy), and the target's last bytes, short of a block, go with the step that reaches them. Between steps it
+  holds the index, the delta so far, the scan's place and rolling hash, and the lengths the first step was handed: a
+  step handed others ends the search with no delta. Its end lets the index go. `delta_of` runs one search to its end
+  at a budget of every byte, a stage a step, so every caller of A-614 part 2's search writes what it wrote.
+- **Tests**, failing first against `Search`'s first state, the whole search in its first step:
+  `a_delta_is_searched_a_budget_a_step_as_one_pass_searches_it` (a 2,000-line text against itself with three lines
+  edited, 64 bytes a step: no step past its budget, a step at least for each budget of the source, and the delta the
+  one-pass reference's, byte for byte, applying back to the target) and
+  `every_search_at_any_budget_writes_the_reference_delta` (targets cut from random sources with random inserts, as
+  A-614 part 2's delta property builds them, at random budgets and at one for the whole: every step bounded, the delta
+  the reference's). The reference is A-614 part 2's search kept whole in the test module, the specification.
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1), `cargo test --locked -p slates-git --lib --
+  store:: upload::`: with the first state, 123 passed, 2 failed (the two tests above, the bounded one at its first
+  step past the budget, the property at a case it found), 4 ignored; with the search, 125 passed, 0 failed, 4
+  ignored, every store and upload test that deltas now searching through it; over the tree landed, merged with
+  main's A-677 (slates-merge), the same 125; `cargo fmt -p slates-git -- --check` clean. No integration target
+  reaches the search.
+- **Owed.** Part 2, as main ruled it (above); the fragment encoder's per-object unit, once `Encoder::put` steps its
+  trials through a search; the red-checks and the other platforms' runs (main's).
+
+### A-656, continued (2) — One read rule for a session: an update, its drive and the reads judge paths alike (bug, 2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (A-616 part 2's second slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/authz.rs` (`may_read`); `crates/svn/src/reads.rs`; `crates/svn/src/report/drive.rs` (`Guards`,
+`Sources::rules`, `Drive::next`), `report/drive/green.rs` (`FixtureGuards`, `AUTHZ`, `rules_of`) and the drive's
+tests; `crates/svn/src/report/exchange.rs` and its tests; `crates/svn/src/serve.rs` (`ReadRules::for_principal`,
+`Established::compiled_read_rules`) and its tests;
+`docs/bugs/2026-11-19-an-update-read-by-the-callers-guards-where-the-reads-used-the-sessions-rules.md`.
+
+- **Found** by g297 (A-613's eighth slice, step 6): `update` judged its target, and its drive every path, by the
+  caller's `Guards::may_read`, while the read commands judged by the rules `Policy::authz` gives the session's
+  principal, compiled by the connection (A-606): two sources for one principal's read rule, which could disagree. With
+  guards that hid less than the rules, an anonymous `update` of `/trunk/secret` began its report and an update of
+  `/trunk` added `secret`, while `check-path secret` was refused "Authorization failed".
+- **One rule.** `authz::may_read(rules, path)` is a session's one read rule, `authz_check_access` for
+  `svn_authz_read`: every path where the repository names no authorization file; with rules, a path they give read or
+  write access; a path that is no repository path, never. The connection compiles the principal's rules once
+  (`ReadRules::for_principal`, again only after an authentication changes the principal) and hands the same set to the
+  read commands (`reads::Session::authz`), to `update`'s target check and to the report drive
+  (`drive::Sources::rules`), which judges the edit's root, each entry and each copy source by it. `Guards` keeps the
+  locks alone.
+- **Tests.** `an_update_and_the_reads_judge_one_path_by_the_one_rule_set` (`serve/tests.rs`): an anonymous session
+  whose guards carry no read rule, on the fixtures' repository whose rules keep `/trunk/secret` from all but alice:
+  `check-path secret` and `update secret` both refused "Authorization failed" where users hold no keys, and an update
+  of `/trunk` from nothing sends `secret` absent and never adds it. Red before the change (macOS arm64, Mac Studio,
+  2026-11-19, over main at `733e6de6b`): the check refused, the update answered `( success ( ( ) 0: ) )` and awaited
+  its report. The drive's and the exchange's tests judge reads by the recorder's own rules compiled for the anonymous
+  principal (`green::rules_of`), where they had guards hiding `/trunk/secret` by hand. Run (macOS arm64, Mac Studio,
+  2026-11-19): `cargo test --locked -p slates-svn --lib -- report:: reads:: serve:: authz::` 158 of 158, `cargo fmt -p
+  slates-svn -- --check` clean; the crate has no integration target.
+- **Owed.** The Windows run and red-checks (main's).
 
 ### A-674 — A query past the request's room answered `414`, as a path past it and git's routes answer a target past theirs (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Access"; A-650 part 1's "Decided"; RFC 9110 §15.5.15)
 Applied in the same change to: `crates/server` (`vcs_http::hg`: `route` and `query_refused`, the module doc's order; the
