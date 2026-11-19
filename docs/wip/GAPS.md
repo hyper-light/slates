@@ -2508,6 +2508,20 @@
 > merge crate's integration suites and clippy.
 > Bug record: `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
 
+> **A rebased work restates its links after its own renames and removals: found open (2026-11-19, A-646's sweep, g267,
+> by reading; §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).** A clean rebase restates the verdict's
+> effects as the work's journal in the verdict's order: content first (renames, creates, unlinks), then the metadata
+> dimensions, hard links among them. A volume has real inodes, so a link restated after a rename or removal of the node
+> it names meets the path afterwards. Three cases go wrong:
+> - `ln g l; mv f g` would put `l` on `f`'s file, not `g`'s old one;
+> - a link to a node the work renames would be restated after the node left its path (A-646's made node resolved to
+>   the rename's source);
+> - a link to a node the work also removes would meet an empty path.
+>
+> The verdict and the commit are right; only the restatement's order is wrong. Owed: a failing test of each, then
+> restating a work's links after its creates and before its renames and removals, and a rebased journal replayed into a
+> volume compared with the green.
+
 > **Three siblings of A-643's verdicts: the first and third fixed by A-646 part 1, the second owed (2026-11-19, A-643's
 > sweep, g267; §4.16 "The verdict"; POSIX `rename`).**
 > 1. Fixed (A-646 part 1): a rename over a symbolic link, a hard link or an IPC node with no concurrent change replaces
