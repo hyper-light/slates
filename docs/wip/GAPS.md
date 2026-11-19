@@ -180,12 +180,12 @@
 > first, the acknowledgments as `get_common_commits` writes them under `multi_ack`, `multi_ack_detailed` (`no-done`
 > too) and neither, and the pack on side-band-64k, side-band (995 bytes a packet) or bare. Held to stock git 2.50.1's
 > six stateless answers and nine one-round sessions packet for packet (424 of 424 on the Mac Studio, red nine ways).
-> The goldens corrected A-615's object choice: a thin pack in a shallow exchange leaves out every had commit's tree,
-> as `pack-objects --objects-edge-aggressive` does, and only then (its oracle states it too). v0's advertised ref names
-> are held to `refname::is_valid`. The service's pack now comes from A-639's stream (`upload::Fragments`, a turn of it
-> a call on the owner's clock, one call a step and its packets framed full), closing part 2's owed pack: 460 of 460
-> on Windows x86_64 (jupiter; 3 ignored; red four ways; the macOS run owed). Owed in A-640: `sparse:oid` (part 4); a
-> stateful v0 session, an SSH client's.
+> The goldens found A-615's bug (`docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`): a thin
+> pack in a shallow exchange leaves out every had commit's tree, as `pack-objects --objects-edge-aggressive` does, and
+> only then (its oracle states it too). v0's advertised ref names are held to `refname::is_valid`. The service's pack
+> now comes from A-639's stream (`upload::Fragments`, a turn of it a call on the owner's clock, one call a step and its
+> packets framed full), closing part 2's owed pack: 460 of 460 on Windows x86_64 (jupiter; 3 ignored; red four ways;
+> the macOS run owed). Owed in A-640: `sparse:oid` (part 4); a stateful v0 session, an SSH client's.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
