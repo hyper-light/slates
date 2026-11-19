@@ -11038,9 +11038,10 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// The consumer an attachment in `form` belongs to (§4.6, §4.13; AUD-01), which is its lifetime: a
 /// host kernel mount's attachment is the OS filesystem bridge's (`Consumer::Bridge`) — it outlives the
 /// ring client that requested it (`slates mount` exits after `mount_nfs`) and the daemon (the anchor
-/// keeps the listener across a restart), ending with the kernel's `UMNT`, a `detach`, or the volume's
-/// destroy. A root record is the ring client's. OCI requires a verified source dependency,
-/// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
+/// keeps the listener across a restart), ending when the kernel unmounts it (seen through the kernel's own unmount
+/// event, A-511), with a `detach`, or with the volume's destroy. A root record is the ring client's. OCI requires a
+/// verified source dependency, constructed separately by `oci::Binding::consumer`; a guest requires its owned device
+/// seam.
 pub(crate) fn consumer_of(
   form: &AttachRequest,
   client_id: u32,
@@ -11479,9 +11480,11 @@ fn bind_mount(
     now,
   ) {
     Ok(_) => {
+      // The mount is watched from here: the kernel's unmount of it ends this attachment whenever it comes (A-511).
       #[cfg(target_os = "macos")]
       if let Some(own) = own {
         state.own_nfs_mounts.insert(attachment, own);
+        crate::own_nfs::watch(state);
       }
       ReplyBody::MountBound
     }
@@ -11627,11 +11630,12 @@ pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
   ended
 }
 
-/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
-/// mount's (§4.6, §4.13; AUD-01): the record removed as a recorded operation, a green pin dropped, and,
+/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's unmount of a host
+/// mount's (§4.6, §4.13; AUD-01; A-511): the record removed as a recorded operation, a green pin dropped, and,
 /// when it was the holder's last attachment of the volume and the holder holds the write lease, the
-/// lease released (D-16). The caller has authorized the end — the verb by the principal, the `UMNT` by
-/// the mount capability. The typed database refusal when the removal could not be recorded.
+/// lease released (D-16). The caller has authorized the end — the verb by the principal, an unmount by the
+/// kernel's own table no longer naming the mount (`own_nfs`). The typed database refusal when the removal could not
+/// be recorded.
 pub(crate) fn end_attachment(
   state: &mut ShardState,
   record: &AttachmentRecord,

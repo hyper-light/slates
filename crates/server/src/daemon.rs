@@ -4553,6 +4553,8 @@ async fn init_shard(
     learned_fuse: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]
     own_nfs_mounts: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "macos")]
+    unmount_watch: false,
     #[cfg(windows)]
     winfsp_mounts: std::collections::BTreeMap::new(),
     #[cfg(windows)]
@@ -4615,7 +4617,6 @@ async fn init_shard(
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
     told_times: crate::told::ToldTimes::default(),
-    unmount_times: crate::learned_wait::LearnedWait::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
@@ -4825,6 +4826,10 @@ async fn init_shard(
   // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
   let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(keeper);
+  // The NFS mounts this shard learned from its predecessor end their attachments when the kernel lets them go, as a
+  // mount bound later does (A-511): the shard's watch of the kernel's unmounts starts once it holds an own mount.
+  #[cfg(target_os = "macos")]
+  let _ = state::with_state_counted(crate::own_nfs::watch);
   Ok(slices.finish())
 }
 
