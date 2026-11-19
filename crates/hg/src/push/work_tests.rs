@@ -10,7 +10,7 @@ use slates_merge::push::{Built, HEAD_ATTRIBUTE, ROOT};
 use slates_merge::{Green, Outcome};
 
 use super::tree::{self, LayoutRefusal, Move, WorkRefused};
-use super::verify::{self, Held, LogOf, Unverified, Verified};
+use super::verify::{self, Held, LogOf, PathFault, Unverified, Verified};
 use super::{ChangegroupPart, read};
 use crate::bundle1;
 use crate::bundle2::Bundle2;
@@ -533,37 +533,44 @@ fn a_changegroup_breaking_a_rule_is_refused_by_kind() {
   assert_eq!(verify_made(&treed), Err(Unverified::TreeManifests));
 }
 
-/// A-641 part 2 (§4.17.3 "Push" step 2; `pathutil.pathauditor`). Do: push a file at each path Mercurial's audit or a
-/// slates path refuses, and at ones they hold. Expect: `.hg` at the top in any case, `..`, `.`, an empty component, a
-/// drive, NUL and bytes not UTF-8 refused naming the path; `.hgignore`, `a/.hg/b` and a nested path taken.
+/// A-641 part 2 (§4.17.3 "Push" step 2; 7.2's `pathutil.pathauditor`, lines 87 to 118, and `encoding.hfsignoreclean`).
+/// Do: audit paths each of 7.2's checks refuses, paths a slates path cannot hold, and paths both take; and push a file
+/// under `.hg`. Expect: a separator at the end; `.hg` and `.hg.` at the top in any case and with code points HFS+
+/// ignores inside, an absolute path, `..`, a drive and Windows short names of `.hg` refused as illegal components; `.hg`
+/// further down refused as a nested repository naming the components before it; an empty or `.` component, NUL and
+/// bytes not UTF-8 refused as not held; `.hgignore`, `.hgtags` in a directory and short names of other stems taken; the
+/// push refused before anything is kept.
 #[test]
 fn a_path_mercurials_audit_refuses_is_refused() {
-  let refused: [&[u8]; 9] = [
+  let fault = |path: &[u8]| match verify::audit(path) {
+    Err(Unverified::Path { fault, .. }) => Some(fault),
+    _ => None,
+  };
+  let illegal: [&[u8]; 10] = [
     b".hg/hgrc",
     b".HG/x",
-    b"a/../b",
-    b"./a",
-    b"a//b",
+    b".hg./x",
+    "\x2eh\u{200c}g/x".as_bytes(),
     b"/a",
+    b"a/../b",
     b"c:/a",
-    b"a\0b",
-    b"\xff",
+    b"HG~1/x",
+    b"a/hg8b6c~2/y",
+    b"..",
   ];
-  for path in refused {
-    assert_eq!(
-      verify::audit(path),
-      Err(Unverified::Path {
-        path: path.to_vec()
-      })
-    );
+  for path in illegal {
+    assert_eq!(fault(path), Some(PathFault::IllegalComponent), "{path:?}");
   }
-  for path in [
-    b".hgignore".as_slice(),
-    b"a/.hg/b",
-    b"src/deep/mod.rs",
-    b"c",
-  ] {
-    assert_eq!(verify::audit(path), Ok(()));
+  assert_eq!(fault(b"a/"), Some(PathFault::EndsInSeparator));
+  let nested = |base: &[u8]| Some(PathFault::NestedRepository { base: base.to_vec() });
+  assert_eq!(fault(b"a/.hg/b"), nested(b"a"));
+  assert_eq!(fault("x/y/.H\u{feff}G./z".as_bytes()), nested(b"x/y"));
+  let unheld: [&[u8]; 5] = [b"a//b", b"./a", b"a/./b", b"a\0b", b"\xff"];
+  for path in unheld {
+    assert_eq!(fault(path), Some(PathFault::NotHeld), "{path:?}");
+  }
+  for path in [".hgignore", "a/.hgtags", "x~1/y", "HG~a", "hg~", "src/deep/mod.rs", "c"] {
+    assert_eq!(verify::audit(path.as_bytes()), Ok(()), "{path}");
   }
   let (mut hidden, _) = Made3::one(&NULL_NODE, &[("a", b"x\n", "")]);
   hidden.files[0].0 = b".hg/hgrc".to_vec();

@@ -31,8 +31,8 @@ use crate::{Admission, NULL_NODE, Node, PastAdmission, changeset, delta, filerev
 
 use super::ChangegroupPart;
 
-/// Format: the bytes of the name a repository's own directory takes at a path's top, which no tracked path enters
-/// (`pathutil.pathauditor`: `.hg`, and `.hg.` as Windows reads it).
+/// Format: the names a repository's own directory takes, after `_lowerclean` (`pathutil.pathauditor`: `.hg`, and
+/// `.hg.` as Windows reads it).
 const DOT_HG: [&[u8]; 2] = [b".hg", b".hg."];
 
 /// Format: the separator of a tracked path's components.
@@ -43,6 +43,37 @@ const DRIVE: u8 = b':';
 
 /// Format: the bytes of a drive's name at a path's front: its letter and [`DRIVE`].
 const DRIVE_LEN: usize = 2;
+
+/// Format: the byte between a Windows short name's stem and its number (`HG~1`), and the stems 7.2 refuses there
+/// (`pathauditor`: `first.upper() in [b"HG", b"HG8B6C"]`).
+const SHORT_NAME: u8 = b'~';
+/// Format: see [`SHORT_NAME`].
+const SHORT_STEMS: [&[u8]; 2] = [b"HG", b"HG8B6C"];
+
+/// Format: the UTF-8 of the code points HFS+ ignores, which `encoding.hfsignoreclean` removes before a name is compared
+/// (U+200C to U+200F, U+202A to U+202E, U+206A to U+206F, U+FEFF; `encoding.py` `_ignore`).
+const HFS_IGNORED: [[u8; 3]; 16] = [
+  [0xe2, 0x80, 0x8c],
+  [0xe2, 0x80, 0x8d],
+  [0xe2, 0x80, 0x8e],
+  // Format: U+200F, then U+202A to U+202E.
+  [0xe2, 0x80, 0x8f],
+  [0xe2, 0x80, 0xaa],
+  [0xe2, 0x80, 0xab],
+  [0xe2, 0x80, 0xac],
+  // Format: U+202D and U+202E, then U+206A and U+206B.
+  [0xe2, 0x80, 0xad],
+  [0xe2, 0x80, 0xae],
+  [0xe2, 0x81, 0xaa],
+  [0xe2, 0x81, 0xab],
+  // Format: U+206C to U+206F.
+  [0xe2, 0x81, 0xac],
+  [0xe2, 0x81, 0xad],
+  [0xe2, 0x81, 0xae],
+  [0xe2, 0x81, 0xaf],
+  // Format: U+FEFF, the byte-order mark.
+  [0xef, 0xbb, 0xbf],
+];
 
 /// What a repository already holds, as a push's verification reads it: each log's full texts by node.
 pub trait Held {
@@ -183,6 +214,8 @@ pub enum Unverified {
   Path {
     /// The path.
     path: Vec<u8>,
+    /// What the audit found.
+    fault: PathFault,
   },
   /// A changeset text 7.2's reader refuses.
   Changeset {
@@ -230,6 +263,24 @@ impl From<PastAdmission> for Unverified {
   fn from(past: PastAdmission) -> Self {
     Self::PastAdmission(past)
   }
+}
+
+/// What a path's audit found (`pathutil.pathauditor`, whose words a reply gives each).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathFault {
+  /// It ends in a separator (7.2: "path ends in directory separator: %s").
+  EndsInSeparator,
+  /// A drive at its front, `.hg` or `.hg.` or nothing as its first component, a `..` component, or a Windows short
+  /// name of `.hg` (7.2: "path contains illegal component: %s").
+  IllegalComponent,
+  /// `.hg` or `.hg.` as a later component, the path under it a nested repository (7.2: "path '%s' is inside nested
+  /// repo %r").
+  NestedRepository {
+    /// The components before it, joined.
+    base: Vec<u8>,
+  },
+  /// What 7.2 takes and a slates path cannot hold: bytes not UTF-8, NUL, or an empty or `.` component past the first.
+  NotHeld,
 }
 
 /// One log's group as it is verified: what arrived so far, by node.
@@ -564,24 +615,75 @@ pub fn manifest_text<'v>(
   }
 }
 
-/// Mercurial's audit of a tracked path (`pathutil.pathauditor`), and what a slates path holds: UTF-8, no NUL, no empty,
-/// `.` or `..` component, no `.hg` at the top, no drive at the front.
+/// Mercurial's audit of a tracked path, as `pathutil.pathauditor` audits one (lines 87 to 118 of 7.2's `pathutil.py`),
+/// and what a slates path holds. 7.2's checks, in its order: no separator at the end; no drive at the front, no `.hg`,
+/// `.hg.` or nothing as the first component and no `..` anywhere; no Windows short name of `.hg` (`HG~<digits>`,
+/// `HG8B6C~<digits>`, in any case); no `.hg` or `.hg.` as a later component. A component is compared lower-cased with
+/// the code points HFS+ ignores removed (`_lowerclean`). A drive is refused whatever the server's system, so every
+/// platform judges a path alike (R8), where 7.2's `splitdrive` finds one only on Windows. Then slates': UTF-8, no NUL,
+/// and no empty or `.` component, which 7.2 takes and a slates path cannot hold.
 pub fn audit(path: &[u8]) -> Result<(), Unverified> {
-  let refused = || Unverified::Path {
+  audited(path).map_err(|fault| Unverified::Path {
     path: path.to_vec(),
-  };
-  if core::str::from_utf8(path).is_err() || path.contains(&0) {
-    return Err(refused());
+    fault,
+  })
+}
+
+/// The fault [`audit`] finds in `path`, if any.
+fn audited(path: &[u8]) -> Result<(), PathFault> {
+  if path.last() == Some(&SLASH) {
+    return Err(PathFault::EndsInSeparator);
   }
-  let mut components = path.split(|byte| *byte == SLASH);
-  let first = components.next().unwrap_or_default();
-  let dot_hg = DOT_HG.iter().any(|name| first.eq_ignore_ascii_case(name));
-  let drive = first.len() == DRIVE_LEN
+  let parts: Vec<&[u8]> = path.split(|byte| *byte == SLASH).collect();
+  let first = parts.first().copied().unwrap_or_default();
+  let drive = first.len() >= DRIVE_LEN
     && first.first().is_some_and(u8::is_ascii_alphabetic)
-    && first.last() == Some(&DRIVE);
-  let bad = |component: &[u8]| component.is_empty() || component == b"." || component == b"..";
-  if dot_hg || drive || bad(first) || components.any(bad) {
-    return Err(refused());
+    && first.get(1) == Some(&DRIVE);
+  let top_reserved = first.is_empty() || DOT_HG.contains(&lower_clean(first).as_slice());
+  if drive || top_reserved || parts.contains(&b"..".as_slice()) || parts.iter().any(|part| short_name(part)) {
+    return Err(PathFault::IllegalComponent);
+  }
+  let lowered: Vec<Vec<u8>> = parts.iter().map(|part| lower_clean(part)).collect();
+  for reserved in DOT_HG {
+    if let Some(at) = lowered.iter().skip(1).position(|part| part.as_slice() == reserved) {
+      let base = parts.get(..at.saturating_add(1)).unwrap_or_default().join(&SLASH);
+      return Err(PathFault::NestedRepository { base });
+    }
+  }
+  let unheld = core::str::from_utf8(path).is_err()
+    || path.contains(&0)
+    || parts.iter().any(|part| part.is_empty() || *part == b".");
+  if unheld {
+    return Err(PathFault::NotHeld);
   }
   Ok(())
+}
+
+/// Whether `part` is a Windows short name 7.2 refuses: a stem of [`SHORT_STEMS`] in any case, `~`, and digits.
+fn short_name(part: &[u8]) -> bool {
+  let Some(at) = part.iter().position(|byte| *byte == SHORT_NAME) else {
+    return false;
+  };
+  let (stem, number) = (
+    part.get(..at).unwrap_or_default(),
+    part.get(at.saturating_add(1)..).unwrap_or_default(),
+  );
+  !number.is_empty()
+    && number.iter().all(u8::is_ascii_digit)
+    && SHORT_STEMS.iter().any(|known| stem.eq_ignore_ascii_case(known))
+}
+
+/// `part` lower-cased as Python lower-cases bytes (ASCII alone), with the code points HFS+ ignores removed
+/// (`_lowerclean`, `encoding.hfsignoreclean`).
+fn lower_clean(part: &[u8]) -> Vec<u8> {
+  let mut cleaned = part.to_ascii_lowercase();
+  for ignored in HFS_IGNORED {
+    while let Some(at) = cleaned
+      .windows(ignored.len())
+      .position(|window| window == ignored)
+    {
+      cleaned.drain(at..at.saturating_add(ignored.len()));
+    }
+  }
+  cleaned
 }
