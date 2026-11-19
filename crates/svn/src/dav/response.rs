@@ -519,6 +519,21 @@ pub struct LogItem {
   pub subtractive_merge: bool,
 }
 
+/// The start of a `log-report` answer: the XML declaration, then the report's element.
+/// Format: `reports/log.c` `maybe_send_header`: `DAV_XML_HEADER DEBUG_CR` and the element, then `DEBUG_CR`.
+pub(crate) const LOG_REPORT_START: [&str; 2] = [
+  XML_HEADER,
+  "<S:log-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n",
+];
+
+/// A log item's start, written before its first changed path or its revision.
+/// Format: `reports/log.c` `maybe_start_log_item`.
+pub(crate) const LOG_ITEM_START: &str = "<S:log-item>\n";
+
+/// The end of a `log-report` answer.
+/// Format: `reports/log.c` `dav_svn__log_report`.
+pub(crate) const LOG_REPORT_END: &str = "</S:log-report>\n";
+
 /// A `log-report` answer (`log.c`), its items written as the client asked: a revision property in base64 when it asked
 /// for binary properties encoded and XML cannot carry it.
 pub fn log(
@@ -527,34 +542,58 @@ pub fn log(
   room: usize,
 ) -> Result<Vec<u8>, DavRefusal> {
   let mut body = Body::new(room);
-  body.push(XML_HEADER)?;
-  body.push("<S:log-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n")?;
+  for part in LOG_REPORT_START {
+    body.push(part)?;
+  }
   for item in items {
-    body.push("<S:log-item>\n")?;
+    body.push(LOG_ITEM_START)?;
     for changed in &item.changed {
       body.push(&changed_path(changed))?;
     }
-    let revision = item
-      .revision
-      .map_or_else(|| String::from("-1"), |revision| revision.to_string());
-    body.push(&format!("<D:version-name>{revision}</D:version-name>\n"))?;
-    for (name, value) in &item.revprops {
-      body.push(&revprop(name, value, encode_binary_props))?;
-    }
-    if item.has_children {
-      body.push("<S:has-children/>")?;
-    }
-    if item.subtractive_merge {
-      body.push("<S:subtractive-merge/>")?;
-    }
-    body.push("</S:log-item>\n")?;
+    let revprops: Vec<(&str, &[u8])> = item
+      .revprops
+      .iter()
+      .map(|(name, value)| (name.as_str(), value.as_slice()))
+      .collect();
+    let flags = (item.has_children, item.subtractive_merge);
+    body.push(&log_item_end(
+      item.revision,
+      &revprops,
+      flags,
+      encode_binary_props,
+    ))?;
   }
-  body.push("</S:log-report>\n")?;
+  body.push(LOG_REPORT_END)?;
   Ok(body.into_bytes())
 }
 
+/// What `log_revision_receiver` writes of an item after its changed paths: the revision (`-1` for none, the entry
+/// closing a run of merged revisions), each revision property in `revprops`' order, `S:has-children` and
+/// `S:subtractive-merge` when `flags` (in that order) set them, and the item's end.
+pub(crate) fn log_item_end(
+  revision: RevisionArg,
+  revprops: &[(&str, &[u8])],
+  flags: (bool, bool),
+  encode_binary_props: bool,
+) -> String {
+  let revision = revision.map_or_else(|| String::from("-1"), |revision| revision.to_string());
+  let mut text = format!("<D:version-name>{revision}</D:version-name>\n");
+  for (name, value) in revprops {
+    text.push_str(&revprop(name, value, encode_binary_props));
+  }
+  let (has_children, subtractive_merge) = flags;
+  if has_children {
+    text.push_str("<S:has-children/>");
+  }
+  if subtractive_merge {
+    text.push_str("<S:subtractive-merge/>");
+  }
+  text.push_str("</S:log-item>\n");
+  text
+}
+
 /// One changed path as `log_change_receiver` writes it.
-fn changed_path(changed: &ChangedPath) -> String {
+pub(crate) fn changed_path(changed: &ChangedPath) -> String {
   let element = match changed.change {
     Change::Added => "S:added-path",
     Change::Replaced => "S:replaced-path",
