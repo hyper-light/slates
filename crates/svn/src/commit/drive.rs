@@ -64,8 +64,8 @@ use aws_lc_rs::digest::{Context, MD5_FOR_LEGACY_USE_ONLY, SHA1_FOR_LEGACY_USE_ON
 use super::edit::{CommitRequest, CopiedFrom, EditCommand, EditRefusal, LockTokensRefusal};
 use super::{CommitRefusal, check_out_of_date, verdict};
 use crate::index::{
-  Action, ChangedPath, ContentIdentity, CopySource, Index, IndexRefusal, NodeKind, PropertyList, Revision,
-  RevisionRecord, Text,
+  Action, ChangedPath, ContentIdentity, CopySource, Index, IndexRefusal, NodeKind, PropertyList,
+  Revision, RevisionRecord, Text,
 };
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockRefusal, LockTable};
 use crate::ra_svn::{ItemError, Value, write};
@@ -491,14 +491,26 @@ impl Digests {
 
   /// Takes `bytes` in.
   fn update(&mut self, bytes: &[u8]) -> Result<(), DriveRefusal> {
-    self.md5.try_update(bytes).map_err(|_| DriveRefusal::DigestFailed)?;
-    self.sha1.try_update(bytes).map_err(|_| DriveRefusal::DigestFailed)
+    self
+      .md5
+      .try_update(bytes)
+      .map_err(|_| DriveRefusal::DigestFailed)?;
+    self
+      .sha1
+      .try_update(bytes)
+      .map_err(|_| DriveRefusal::DigestFailed)
   }
 
   /// The two digests.
   fn finish(self) -> Result<([u8; 16], [u8; 20]), DriveRefusal> {
-    let md5 = self.md5.try_finish().map_err(|_| DriveRefusal::DigestFailed)?;
-    let sha1 = self.sha1.try_finish().map_err(|_| DriveRefusal::DigestFailed)?;
+    let md5 = self
+      .md5
+      .try_finish()
+      .map_err(|_| DriveRefusal::DigestFailed)?;
+    let sha1 = self
+      .sha1
+      .try_finish()
+      .map_err(|_| DriveRefusal::DigestFailed)?;
     Ok((
       <[u8; 16]>::try_from(md5.as_ref()).map_err(|_| DriveRefusal::DigestFailed)?,
       <[u8; 20]>::try_from(sha1.as_ref()).map_err(|_| DriveRefusal::DigestFailed)?,
@@ -537,12 +549,18 @@ pub fn begin(
   let mut presented = BTreeMap::new();
   for (path, token) in tokens {
     let (Ok(path), Ok(token)) = (std::str::from_utf8(path), std::str::from_utf8(token)) else {
-      write_failure(&DriveRefusal::LockTokens(LockTokensRefusal::PathNotString), out)?;
+      write_failure(
+        &DriveRefusal::LockTokens(LockTokensRefusal::PathNotString),
+        out,
+      )?;
       return Ok(None);
     };
     presented.insert(joined(base_path, &relative(path)), token.to_owned());
   }
-  write(&Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]), out)?;
+  write(
+    &Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]),
+    out,
+  )?;
   Ok(Some(CommitLocks {
     user: user.map(str::to_owned),
     presented,
@@ -552,9 +570,19 @@ pub fn begin(
 
 /// The revision properties a commit records but its date (`serve.c` 1526-1541): the client's, or its log message
 /// alone when it sent none; `svn:author` always the principal, never the client's word, and absent for none.
-pub fn revision_properties(request: &CommitRequest<'_, '_>, user: Option<&str>) -> Vec<(Vec<u8>, Vec<u8>)> {
-  let mut properties: BTreeMap<Vec<u8>, Vec<u8>> = match request.rest.as_ref().and_then(|rest| rest.revision_properties.as_ref()) {
-    Some(sent) => sent.iter().map(|(name, value)| (name.to_vec(), value.to_vec())).collect(),
+pub fn revision_properties(
+  request: &CommitRequest<'_, '_>,
+  user: Option<&str>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+  let mut properties: BTreeMap<Vec<u8>, Vec<u8>> = match request
+    .rest
+    .as_ref()
+    .and_then(|rest| rest.revision_properties.as_ref())
+  {
+    Some(sent) => sent
+      .iter()
+      .map(|(name, value)| (name.to_vec(), value.to_vec()))
+      .collect(),
     None => BTreeMap::from([(REVISION_LOG.to_vec(), request.log_message.to_vec())]),
   };
   properties.remove(REVISION_AUTHOR);
@@ -577,7 +605,10 @@ pub fn write_commit_info(
   post_commit_error: Option<&str>,
   out: &mut Vec<u8>,
 ) -> Result<(), ItemError> {
-  write(&Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]), out)?;
+  write(
+    &Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]),
+    out,
+  )?;
   write(&trivial_auth(), out)?;
   write(
     &Value::List(vec![
@@ -592,7 +623,12 @@ pub fn write_commit_info(
 
 /// An optional C string as `"(?c)"` writes it: a list of it, or an empty list.
 fn optional_string(text: Option<&str>) -> Value<'_> {
-  Value::List(text.map(|text| Value::String(text.as_bytes())).into_iter().collect())
+  Value::List(
+    text
+      .map(|text| Value::String(text.as_bytes()))
+      .into_iter()
+      .collect(),
+  )
 }
 
 /// `trivial_auth_request`: `( success ( ( ) 0: ) )`.
@@ -611,7 +647,9 @@ fn write_failure(refusal: &DriveRefusal, out: &mut Vec<u8>) -> Result<(), ItemEr
 /// The words of a refusal that needs nothing of the drive's (`serve.c` `add_lock_tokens` 1374-1395).
 fn default_message(refusal: &DriveRefusal) -> String {
   match refusal {
-    DriveRefusal::LockTokens(LockTokensRefusal::NotListOfLists) => "Lock tokens aren't a list of lists".to_owned(),
+    DriveRefusal::LockTokens(LockTokensRefusal::NotListOfLists) => {
+      "Lock tokens aren't a list of lists".to_owned()
+    }
     DriveRefusal::LockTokens(LockTokensRefusal::TokenNotString | LockTokensRefusal::ShortPair) => {
       "Lock token isn't a string".to_owned()
     }
@@ -642,12 +680,16 @@ fn joined(base: &str, relative: &str) -> String {
 
 /// The value of one hexadecimal digit.
 fn hex_digit(byte: u8) -> Option<u8> {
-  char::from(byte).to_digit(u32::from(HEX)).and_then(|digit| u8::try_from(digit).ok())
+  char::from(byte)
+    .to_digit(u32::from(HEX))
+    .and_then(|digit| u8::try_from(digit).ok())
 }
 
 /// A byte from its two hexadecimal digits.
 fn hex_byte(high: u8, low: u8) -> Option<u8> {
-  hex_digit(high)?.checked_mul(HEX)?.checked_add(hex_digit(low)?)
+  hex_digit(high)?
+    .checked_mul(HEX)?
+    .checked_add(hex_digit(low)?)
 }
 
 /// A URL percent-decoded as `svn_path_uri_decode` decodes it: an escape that is not two hexadecimal digits is kept.
@@ -706,7 +748,9 @@ fn mismatch(description: &str, expected: &[u8], actual: &[u8]) -> String {
 /// last's words are written.
 fn delta_message(refusal: SvndiffError) -> String {
   match refusal {
-    SvndiffError::InvalidHeader | SvndiffError::VersionNotOffered => "Svndiff has invalid header".to_owned(),
+    SvndiffError::InvalidHeader | SvndiffError::VersionNotOffered => {
+      "Svndiff has invalid header".to_owned()
+    }
     SvndiffError::WindowTooLarge => "Svndiff contains a too-large window".to_owned(),
     SvndiffError::CorruptWindowHeader => "Svndiff contains corrupt window header".to_owned(),
     SvndiffError::BackwardSourceView => "Svndiff has backwards-sliding source views".to_owned(),
@@ -714,7 +758,9 @@ fn delta_message(refusal: SvndiffError) -> String {
     SvndiffError::TargetNotFilled => "Delta does not fill the target window".to_owned(),
     SvndiffError::NewDataUnused => "Delta does not contain enough new data".to_owned(),
     SvndiffError::UnexpectedEnd => "Unexpected end of svndiff input".to_owned(),
-    SvndiffError::InvalidCompressedData => "Size of uncompressed data does not match stored original length".to_owned(),
+    SvndiffError::InvalidCompressedData => {
+      "Size of uncompressed data does not match stored original length".to_owned()
+    }
     SvndiffError::Lz4 => "LZ4 decompression failed".to_owned(),
     SvndiffError::SourceShort => "Delta source ended unexpectedly".to_owned(),
   }
@@ -730,7 +776,10 @@ fn instruction_message(index: usize, fault: InstructionFault) -> String {
     InstructionFault::TargetNotBehind => "[tgt] insn {} starts beyond the target view position",
     InstructionFault::PastNewData => "[new] insn {} overflows the new data section",
   };
-  format!("Invalid diff stream: {}", what.replacen("{}", &index.to_string(), 1))
+  format!(
+    "Invalid diff stream: {}",
+    what.replacen("{}", &index.to_string(), 1)
+  )
 }
 
 /// A node as the transaction holds it when a command arrives.
@@ -823,12 +872,19 @@ impl Drive {
         return self.refuse(&DriveRefusal::UnknownCommand { name }, out);
       }
     };
-    let world = World { index, green, locks };
+    let world = World {
+      index,
+      green,
+      locks,
+    };
     match self.run(&world, &command) {
       Ok(Outcome::Taken) => Ok(Step::Taken),
       Ok(Outcome::Aborted) => {
         self.phase = Phase::Done;
-        write(&Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]), out)?;
+        write(
+          &Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]),
+          out,
+        )?;
         Ok(Step::Ended)
       }
       Ok(Outcome::Accepted(work)) => {
@@ -847,22 +903,41 @@ impl Drive {
   pub fn message(&self, refusal: &DriveRefusal) -> String {
     match refusal {
       DriveRefusal::Commit(refusal) => self.commit_message(refusal),
-      DriveRefusal::PastHead { revision, youngest } => format!("No such revision {revision} (HEAD is {youngest})"),
+      DriveRefusal::PastHead { revision, youngest } => {
+        format!("No such revision {revision} (HEAD is {youngest})")
+      }
       DriveRefusal::NotPresent { path } => format!("Path '{path}' not present"),
       DriveRefusal::NotFound { path } => {
-        format!("File not found: transaction '{}', path '{path}'", self.setup.transaction)
+        format!(
+          "File not found: transaction '{}', path '{path}'",
+          self.setup.transaction
+        )
       }
-      DriveRefusal::SourceNotFound { path, revision } => format!("File not found: revision {revision}, path '{path}'"),
+      DriveRefusal::SourceNotFound { path, revision } => {
+        format!("File not found: revision {revision}, path '{path}'")
+      }
       DriveRefusal::SourceRevision { revision } => format!("No such revision {revision}"),
       DriveRefusal::AlreadyExists { path } => format!(
         "File already exists: filesystem '{}', transaction '{}', path '{path}'",
         self.setup.filesystem, self.setup.transaction
       ),
-      DriveRefusal::ForeignSource { url } => format!("Source url '{url}' is from different repository"),
-      DriveRefusal::BaseChecksum { path, expected, actual } => {
-        mismatch(&format!("Base checksum mismatch on '{path}'"), expected, actual)
+      DriveRefusal::ForeignSource { url } => {
+        format!("Source url '{url}' is from different repository")
       }
-      DriveRefusal::ResultChecksum { path, expected, actual } => mismatch(
+      DriveRefusal::BaseChecksum {
+        path,
+        expected,
+        actual,
+      } => mismatch(
+        &format!("Base checksum mismatch on '{path}'"),
+        expected,
+        actual,
+      ),
+      DriveRefusal::ResultChecksum {
+        path,
+        expected,
+        actual,
+      } => mismatch(
         &format!("Checksum mismatch for resulting fulltext\n({path})"),
         expected,
         actual,
@@ -871,7 +946,9 @@ impl Drive {
       DriveRefusal::Delta(refusal) => delta_message(*refusal),
       DriveRefusal::NoTransaction => "No valid transaction supplied to close_edit".to_owned(),
       DriveRefusal::UnknownCommand { name } => format!("Unknown editor command '{name}'"),
-      DriveRefusal::Room { .. } => "The client request size exceeds the configured limit".to_owned(),
+      DriveRefusal::Room { .. } => {
+        "The client request size exceeds the configured limit".to_owned()
+      }
       other => default_message(other),
     }
   }
@@ -920,7 +997,9 @@ impl Drive {
   /// (`editorp.c` 1193-1208).
   fn drop_one(&mut self, item: &Value<'_>) -> Step {
     let ends = match item {
-      Value::List(parts) => matches!(parts.first(), Some(Value::Word(word)) if *word == ABORT_EDIT || *word == SUCCESS),
+      Value::List(parts) => {
+        matches!(parts.first(), Some(Value::Word(word)) if *word == ABORT_EDIT || *word == SUCCESS)
+      }
       _ => false,
     };
     if ends {
@@ -932,34 +1011,84 @@ impl Drive {
   }
 
   /// Runs one command.
-  fn run<G: Green + ?Sized>(&mut self, world: &World<'_, G>, command: &EditCommand<'_>) -> Result<Outcome, Stop> {
+  fn run<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    command: &EditCommand<'_>,
+  ) -> Result<Outcome, Stop> {
     match *command {
       EditCommand::TargetRev { .. } => Ok(Outcome::Taken),
       EditCommand::OpenRoot { revision, root } => self.open_root(world.index, revision, root),
-      EditCommand::DeleteEntry { path, revision, directory } => self.delete_entry(world, path, revision, directory),
-      EditCommand::AddDir { path, parent, child, copied_from } => {
-        self.add(world, Added { path, parent, child, copied_from, kind: NodeKind::Directory })
-      }
-      EditCommand::AddFile { path, directory, file, copied_from } => {
-        self.add(world, Added { path, parent: directory, child: file, copied_from, kind: NodeKind::File })
-      }
-      EditCommand::OpenDir { path, parent, child, revision } => self.open_dir(world, path, parent, child, revision),
-      EditCommand::ChangeDirProp { directory, name, value } => self.change_dir_prop(world, directory, name, value),
+      EditCommand::DeleteEntry {
+        path,
+        revision,
+        directory,
+      } => self.delete_entry(world, path, revision, directory),
+      EditCommand::AddDir {
+        path,
+        parent,
+        child,
+        copied_from,
+      } => self.add(
+        world,
+        Added {
+          path,
+          parent,
+          child,
+          copied_from,
+          kind: NodeKind::Directory,
+        },
+      ),
+      EditCommand::AddFile {
+        path,
+        directory,
+        file,
+        copied_from,
+      } => self.add(
+        world,
+        Added {
+          path,
+          parent: directory,
+          child: file,
+          copied_from,
+          kind: NodeKind::File,
+        },
+      ),
+      EditCommand::OpenDir {
+        path,
+        parent,
+        child,
+        revision,
+      } => self.open_dir(world, path, parent, child, revision),
+      EditCommand::ChangeDirProp {
+        directory,
+        name,
+        value,
+      } => self.change_dir_prop(world, directory, name, value),
       EditCommand::CloseDir { directory } => self.close_dir(directory),
       EditCommand::AbsentDir { parent, .. } | EditCommand::AbsentFile { parent, .. } => {
         self.directory(parent).map(|_| Outcome::Taken)
       }
-      EditCommand::OpenFile { path, directory, file, revision } => {
-        self.open_file(world, path, directory, file, revision)
-      }
-      EditCommand::ApplyTextdelta { file, base_checksum } => self.apply_textdelta(world, file, base_checksum),
+      EditCommand::OpenFile {
+        path,
+        directory,
+        file,
+        revision,
+      } => self.open_file(world, path, directory, file, revision),
+      EditCommand::ApplyTextdelta {
+        file,
+        base_checksum,
+      } => self.apply_textdelta(world, file, base_checksum),
       EditCommand::TextdeltaChunk { file, chunk } => self.textdelta_chunk(world.green, file, chunk),
       EditCommand::TextdeltaEnd { file } => self.textdelta_end(world.green, file),
       EditCommand::ChangeFileProp { file, name, value } => {
         let path = self.file(file)?.path.clone();
         self.change_property(world, &path, name, value)
       }
-      EditCommand::CloseFile { file, text_checksum } => self.close_file(world, file, text_checksum),
+      EditCommand::CloseFile {
+        file,
+        text_checksum,
+      } => self.close_file(world, file, text_checksum),
       EditCommand::CloseEdit => self.close_edit(world),
       EditCommand::AbortEdit => Ok(Outcome::Aborted),
       EditCommand::FinishReplay | EditCommand::Failure => Err(Stop::Close),
@@ -967,7 +1096,12 @@ impl Drive {
   }
 
   /// `open-root` (`commit.c` 413-466): the transaction begun on the youngest.
-  fn open_root(&mut self, index: &Index, revision: Option<u64>, root: &[u8]) -> Result<Outcome, Stop> {
+  fn open_root(
+    &mut self,
+    index: &Index,
+    revision: Option<u64>,
+    root: &[u8],
+  ) -> Result<Outcome, Stop> {
     let youngest = index.youngest();
     if let Some(revision) = revision.filter(|revision| *revision > youngest) {
       return Err(DriveRefusal::PastHead { revision, youngest }.into());
@@ -981,7 +1115,9 @@ impl Drive {
       base: revision,
       checked: false,
     };
-    self.tokens.insert(root.to_vec(), Baton::Directory(directory));
+    self
+      .tokens
+      .insert(root.to_vec(), Baton::Directory(directory));
     Ok(Outcome::Taken)
   }
 
@@ -996,7 +1132,13 @@ impl Drive {
     self.directory(directory)?;
     let full = self.full_path(path)?;
     let Some(node) = self.view(world.index, &full)? else {
-      return Err(CommitRefusal::OutOfDate { path: full, kind: None }.into());
+      return Err(
+        CommitRefusal::OutOfDate {
+          path: full,
+          kind: None,
+        }
+        .into(),
+      );
     };
     if let Some(revision) = revision {
       check_out_of_date(&full, node.kind, revision, node.created, self.base)?;
@@ -1007,10 +1149,20 @@ impl Drive {
   }
 
   /// `add-dir` and `add-file` (`commit.c` 296-407; `tree.c` `fs_make_dir`, `fs_make_file`, `copy_helper`).
-  fn add<G: Green + ?Sized>(&mut self, world: &World<'_, G>, added: Added<'_>) -> Result<Outcome, Stop> {
+  fn add<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    added: Added<'_>,
+  ) -> Result<Outcome, Stop> {
     let copied = self.directory(added.parent)?.copied;
     if added.kind == NodeKind::File {
-      self.tokens.insert(added.child.to_vec(), Baton::File(File { path: String::new(), delta: None }));
+      self.tokens.insert(
+        added.child.to_vec(),
+        Baton::File(File {
+          path: String::new(),
+          delta: None,
+        }),
+      );
     }
     let full = self.full_path(added.path)?;
     let present = self.view(world.index, &full)?;
@@ -1032,7 +1184,10 @@ impl Drive {
         base: None,
         checked: true,
       }),
-      NodeKind::File => Baton::File(File { path: full, delta: None }),
+      NodeKind::File => Baton::File(File {
+        path: full,
+        delta: None,
+      }),
     };
     self.tokens.insert(added.child.to_vec(), baton);
     Ok(Outcome::Taken)
@@ -1051,27 +1206,58 @@ impl Drive {
     if let Some(node) = present
       && !copied
     {
-      return Err(CommitRefusal::OutOfDate { path: full.to_owned(), kind: Some(node.kind) }.into());
+      return Err(
+        CommitRefusal::OutOfDate {
+          path: full.to_owned(),
+          kind: Some(node.kind),
+        }
+        .into(),
+      );
     }
     let path = self.source_path(source.path)?;
     if source.revision > world.index.youngest() {
-      return Err(DriveRefusal::SourceRevision { revision: source.revision }.into());
+      return Err(
+        DriveRefusal::SourceRevision {
+          revision: source.revision,
+        }
+        .into(),
+      );
     }
     if world.index.node(&path, source.revision)?.is_none() {
-      return Err(DriveRefusal::SourceNotFound { path, revision: source.revision }.into());
+      return Err(
+        DriveRefusal::SourceNotFound {
+          path,
+          revision: source.revision,
+        }
+        .into(),
+      );
     }
     self.check_lock(world.locks, full, true)?;
-    Ok(CopySource { path, revision: source.revision })
+    Ok(CopySource {
+      path,
+      revision: source.revision,
+    })
   }
 
   /// A copy source's path in the repository: its URL decoded, less the repository's root URL (`commit.c` 346-353).
   fn source_path(&self, url: &[u8]) -> Result<String, Stop> {
     let decoded = uri_decoded(url);
     let Ok(decoded) = String::from_utf8(decoded) else {
-      return Err(DriveRefusal::PathSyntax { path: String::from_utf8_lossy(url).into_owned() }.into());
+      return Err(
+        DriveRefusal::PathSyntax {
+          path: String::from_utf8_lossy(url).into_owned(),
+        }
+        .into(),
+      );
     };
-    let foreign = || Stop::Refused(DriveRefusal::ForeignSource { url: decoded.clone() });
-    let rest = decoded.strip_prefix(self.setup.repository_url.as_str()).ok_or_else(foreign)?;
+    let foreign = || {
+      Stop::Refused(DriveRefusal::ForeignSource {
+        url: decoded.clone(),
+      })
+    };
+    let rest = decoded
+      .strip_prefix(self.setup.repository_url.as_str())
+      .ok_or_else(foreign)?;
     if rest.is_empty() {
       return Ok(ROOT.to_owned());
     }
@@ -1100,7 +1286,9 @@ impl Drive {
       base: revision,
       checked: false,
     };
-    self.tokens.insert(child.to_vec(), Baton::Directory(directory));
+    self
+      .tokens
+      .insert(child.to_vec(), Baton::Directory(directory));
     Ok(Outcome::Taken)
   }
 
@@ -1117,8 +1305,16 @@ impl Drive {
     if !directory.checked {
       if let Some(base) = directory.base {
         let node = self.view(world.index, &directory.path)?;
-        let node = node.ok_or_else(|| DriveRefusal::NotFound { path: directory.path.clone() })?;
-        check_out_of_date(&directory.path, NodeKind::Directory, base, node.created, self.base)?;
+        let node = node.ok_or_else(|| DriveRefusal::NotFound {
+          path: directory.path.clone(),
+        })?;
+        check_out_of_date(
+          &directory.path,
+          NodeKind::Directory,
+          base,
+          node.created,
+          self.base,
+        )?;
       }
       if let Some(Baton::Directory(directory)) = self.tokens.get_mut(token) {
         directory.checked = true;
@@ -1144,7 +1340,13 @@ impl Drive {
     revision: Option<u64>,
   ) -> Result<Outcome, Stop> {
     self.directory(directory)?;
-    self.tokens.insert(file.to_vec(), Baton::File(File { path: String::new(), delta: None }));
+    self.tokens.insert(
+      file.to_vec(),
+      Baton::File(File {
+        path: String::new(),
+        delta: None,
+      }),
+    );
     let full = self.full_path(path)?;
     let Some(node) = self.view(world.index, &full)? else {
       return Err(DriveRefusal::NotFound { path: full }.into());
@@ -1152,7 +1354,13 @@ impl Drive {
     if let Some(revision) = revision {
       check_out_of_date(&full, NodeKind::File, revision, node.created, self.base)?;
     }
-    self.tokens.insert(file.to_vec(), Baton::File(File { path: full, delta: None }));
+    self.tokens.insert(
+      file.to_vec(),
+      Baton::File(File {
+        path: full,
+        delta: None,
+      }),
+    );
     Ok(Outcome::Taken)
   }
 
@@ -1176,7 +1384,14 @@ impl Drive {
     if let (Some(expected), Some(text)) = (expected, node.text)
       && expected != text.md5
     {
-      return Err(DriveRefusal::BaseChecksum { path, expected, actual: text.md5 }.into());
+      return Err(
+        DriveRefusal::BaseChecksum {
+          path,
+          expected,
+          actual: text.md5,
+        }
+        .into(),
+      );
     }
     let delta = Delta {
       decoder: Decoder::new(),
@@ -1192,23 +1407,36 @@ impl Drive {
   }
 
   /// `textdelta-chunk` (`editorp.c` 788-805): the chunk read on, every whole window applied to the file's text.
-  fn textdelta_chunk<G: Green + ?Sized>(&mut self, green: &G, token: &[u8], chunk: &[u8]) -> Result<Outcome, Stop> {
+  fn textdelta_chunk<G: Green + ?Sized>(
+    &mut self,
+    green: &G,
+    token: &[u8],
+    chunk: &[u8],
+  ) -> Result<Outcome, Stop> {
     let held = self.held;
     let room = self.setup.room;
     if held.saturating_add(chunk.len()) > room {
       return Err(DriveRefusal::Room { room }.into());
     }
     let texts = &self.texts;
-    let Some(Baton::File(File { delta: Some(delta), .. })) = self.tokens.get_mut(token) else {
+    let Some(Baton::File(File {
+      delta: Some(delta), ..
+    })) = self.tokens.get_mut(token)
+    else {
       return Err(Stop::Close);
     };
     let before = delta.pending.len().saturating_add(delta.target.len());
     delta.pending.extend_from_slice(chunk);
     let source = match delta.source {
-      Some(identity) => texts.get(&identity).map(Vec::as_slice).or_else(|| green.text(&identity)),
+      Some(identity) => texts
+        .get(&identity)
+        .map(Vec::as_slice)
+        .or_else(|| green.text(&identity)),
       None => Some(&[][..]),
     };
-    let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(IndexRefusal::Corrupt)))?;
+    let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(
+      IndexRefusal::Corrupt,
+    )))?;
     read_windows(delta, source)?;
     let after = delta.pending.len().saturating_add(delta.target.len());
     let held = held.saturating_sub(before).saturating_add(after);
@@ -1230,9 +1458,16 @@ impl Drive {
     let path = file.path.clone();
     delta.decoder.finish(&delta.pending)?;
     let (md5, sha1) = delta.digests.finish()?;
-    let size = u64::try_from(delta.target.len()).map_err(|_| DriveRefusal::Room { room: self.setup.room })?;
+    let size = u64::try_from(delta.target.len()).map_err(|_| DriveRefusal::Room {
+      room: self.setup.room,
+    })?;
     let identity = green.name_text(&delta.target);
-    let text = Text { identity, md5, sha1, size };
+    let text = Text {
+      identity,
+      md5,
+      sha1,
+      size,
+    };
     self.texts.insert(identity, delta.target);
     self.record(&path, NodeKind::File, |row| row.text = Some(text));
     Ok(Outcome::Taken)
@@ -1247,7 +1482,9 @@ impl Drive {
   ) -> Result<Outcome, Stop> {
     let path = self.file(token)?.path.clone();
     if let Some(checksum) = text_checksum {
-      let node = self.view(world.index, &path)?.ok_or_else(|| DriveRefusal::NotFound { path: path.clone() })?;
+      let node = self
+        .view(world.index, &path)?
+        .ok_or_else(|| DriveRefusal::NotFound { path: path.clone() })?;
       let actual = match node.text {
         Some(text) => text.md5,
         None => md5_of(&[])?,
@@ -1255,7 +1492,14 @@ impl Drive {
       if let Some(expected) = parsed_md5(checksum)?
         && expected != actual
       {
-        return Err(DriveRefusal::ResultChecksum { path, expected, actual }.into());
+        return Err(
+          DriveRefusal::ResultChecksum {
+            path,
+            expected,
+            actual,
+          }
+          .into(),
+        );
       }
     }
     self.tokens.remove(token);
@@ -1274,7 +1518,13 @@ impl Drive {
     let commit = &self.setup.locks;
     let now = self.setup.now;
     let lock_entries = verdict(world.index, self.base, &record, |changes| {
-      world.locks.verdict(changes.iter().map(|change| (change.path.as_str(), change.action)), commit, now)
+      world.locks.verdict(
+        changes
+          .iter()
+          .map(|change| (change.path.as_str(), change.action)),
+        commit,
+        now,
+      )
     })?;
     Ok(Outcome::Accepted(Box::new(Work {
       record,
@@ -1292,7 +1542,11 @@ impl Drive {
     name: &[u8],
     value: Option<&[u8]>,
   ) -> Result<Outcome, Stop> {
-    let node = self.view(world.index, path)?.ok_or_else(|| DriveRefusal::NotFound { path: path.to_owned() })?;
+    let node = self
+      .view(world.index, path)?
+      .ok_or_else(|| DriveRefusal::NotFound {
+        path: path.to_owned(),
+      })?;
     self.check_lock(world.locks, path, node.kind == NodeKind::Directory)?;
     let mut list = self.property_list(world.green, node.properties)?;
     list.retain(|(held, _)| held.as_slice() != name);
@@ -1322,26 +1576,40 @@ impl Drive {
       return Ok(list.clone());
     }
     let list = green.properties(&identity).ok_or(IndexRefusal::Corrupt)?;
-    let mut list: Vec<(Vec<u8>, Vec<u8>)> = list.into_iter().map(|(name, value)| (name.to_vec(), value.to_vec())).collect();
+    let mut list: Vec<(Vec<u8>, Vec<u8>)> = list
+      .into_iter()
+      .map(|(name, value)| (name.to_vec(), value.to_vec()))
+      .collect();
     list.sort();
     Ok(list)
   }
 
   /// A new property list named by the green and kept, within the room.
-  fn held_list<G: Green + ?Sized>(&mut self, green: &G, list: Vec<(Vec<u8>, Vec<u8>)>) -> Result<PropertyList, DriveRefusal> {
+  fn held_list<G: Green + ?Sized>(
+    &mut self,
+    green: &G,
+    list: Vec<(Vec<u8>, Vec<u8>)>,
+  ) -> Result<PropertyList, DriveRefusal> {
     if list.is_empty() {
       return Ok(PropertyList::Empty);
     }
     let identity = green.name_properties(&list);
     let has_mergeinfo = list.iter().any(|(name, _)| name.as_slice() == MERGEINFO);
-    let bytes = list.iter().fold(0_usize, |sum, (name, value)| sum.saturating_add(name.len()).saturating_add(value.len()));
+    let bytes = list.iter().fold(0_usize, |sum, (name, value)| {
+      sum.saturating_add(name.len()).saturating_add(value.len())
+    });
     let held = self.held.saturating_add(bytes);
     if held > self.setup.room {
-      return Err(DriveRefusal::Room { room: self.setup.room });
+      return Err(DriveRefusal::Room {
+        room: self.setup.room,
+      });
     }
     self.held = held;
     self.property_lists.insert(identity, list);
-    Ok(PropertyList::Held { identity, has_mergeinfo })
+    Ok(PropertyList::Held {
+      identity,
+      has_mergeinfo,
+    })
   }
 
   /// A path deleted, folded into the rows as FSFS folds its changes (module documentation): what the drive added
@@ -1352,8 +1620,14 @@ impl Drive {
     let prior = self.rows.remove(path);
     self.rows.retain(|row, _| !row.starts_with(&beneath));
     let deleted_kind = match prior {
-      Some(ChangedPath { action: Action::Add, .. }) => None,
-      Some(ChangedPath { action: Action::Replace, .. }) => self.replaced.remove(path).or(Some(kind)),
+      Some(ChangedPath {
+        action: Action::Add,
+        ..
+      }) => None,
+      Some(ChangedPath {
+        action: Action::Replace,
+        ..
+      }) => self.replaced.remove(path).or(Some(kind)),
       _ => Some(kind),
     };
     if let Some(kind) = deleted_kind {
@@ -1371,7 +1645,11 @@ impl Drive {
     if let Some(replaced) = deleted {
       self.replaced.insert(path.to_owned(), replaced);
     }
-    let action = if replaces || deleted.is_some() { Action::Replace } else { Action::Add };
+    let action = if replaces || deleted.is_some() {
+      Action::Replace
+    } else {
+      Action::Add
+    };
     self.rows.insert(
       path.to_owned(),
       ChangedPath {
@@ -1388,22 +1666,29 @@ impl Drive {
 
   /// Sets what a row carries, making it a modification when the drive had none at `path`.
   fn record(&mut self, path: &str, kind: NodeKind, set: impl FnOnce(&mut ChangedPath)) {
-    let row = self.rows.entry(path.to_owned()).or_insert_with(|| ChangedPath {
-      path: path.to_owned(),
-      action: Action::Modify,
-      kind,
-      copy_from: None,
-      text: None,
-      properties: None,
-      mergeinfo_modified: false,
-    });
+    let row = self
+      .rows
+      .entry(path.to_owned())
+      .or_insert_with(|| ChangedPath {
+        path: path.to_owned(),
+        action: Action::Modify,
+        kind,
+        copy_from: None,
+        text: None,
+        properties: None,
+        mergeinfo_modified: false,
+      });
     set(row);
   }
 
   /// A path's locks met as FSFS meets them at a call (`svn_fs_fs__allow_locked_operation`): at or beneath it when
   /// `recursive`, its own otherwise.
   fn check_lock(&self, locks: &LockTable, path: &str, recursive: bool) -> Result<(), DriveRefusal> {
-    let action = if recursive { Action::Delete } else { Action::Modify };
+    let action = if recursive {
+      Action::Delete
+    } else {
+      Action::Modify
+    };
     let commit = CommitLocks {
       keep: true,
       ..self.setup.locks.clone()
@@ -1425,7 +1710,9 @@ impl Drive {
     let under = match (row.action, &row.copy_from) {
       (Action::Delete, _) => return Ok(None),
       (Action::Add | Action::Replace, None) => None,
-      (Action::Add | Action::Replace, Some(source)) => index.node(&source.path, source.revision)?.map(|node| View::of(&node)),
+      (Action::Add | Action::Replace, Some(source)) => index
+        .node(&source.path, source.revision)?
+        .map(|node| View::of(&node)),
       (Action::Modify, _) => self.beneath_rows(index, path)?,
     };
     let kind = under.map_or(row.kind, |under| under.kind);
@@ -1433,7 +1720,10 @@ impl Drive {
       kind,
       created: None,
       text: row.text.or_else(|| under.and_then(|under| under.text)),
-      properties: row.properties.or_else(|| under.map(|under| under.properties)).unwrap_or(PropertyList::Empty),
+      properties: row
+        .properties
+        .or_else(|| under.map(|under| under.properties))
+        .unwrap_or(PropertyList::Empty),
     }))
   }
 
@@ -1442,14 +1732,22 @@ impl Drive {
   fn beneath_rows(&self, index: &Index, path: &str) -> Result<Option<View>, DriveRefusal> {
     let mut ancestor = path;
     while let Some(end) = ancestor.rfind(SEPARATOR) {
-      ancestor = if end == 0 { ROOT } else { ancestor.get(..end).unwrap_or(ROOT) };
+      ancestor = if end == 0 {
+        ROOT
+      } else {
+        ancestor.get(..end).unwrap_or(ROOT)
+      };
       if let Some(row) = self.rows.get(ancestor) {
         match (row.action, &row.copy_from) {
           (Action::Delete, _) | (Action::Add | Action::Replace, None) => return Ok(None),
           (Action::Add | Action::Replace, Some(source)) => {
             let rest = path.get(ancestor.len()..).unwrap_or_default();
             let inside = joined(&source.path, rest.trim_start_matches(SEPARATOR));
-            return Ok(index.node(&inside, source.revision)?.map(|node| View::of(&node)));
+            return Ok(
+              index
+                .node(&inside, source.revision)?
+                .map(|node| View::of(&node)),
+            );
           }
           (Action::Modify, _) => {}
         }
@@ -1467,13 +1765,19 @@ impl Drive {
       return !self.rows.is_empty();
     }
     let beneath = format!("{path}{SEPARATOR}");
-    self.rows.range(beneath.clone()..).next().is_some_and(|(row, _)| row.starts_with(&beneath))
+    self
+      .rows
+      .range(beneath.clone()..)
+      .next()
+      .is_some_and(|(row, _)| row.starts_with(&beneath))
   }
 
   /// An editor path joined to the session's (`svn_relpath_canonicalize`, `svn_fspath__join`).
   fn full_path(&self, path: &[u8]) -> Result<String, DriveRefusal> {
     let Ok(path) = std::str::from_utf8(path) else {
-      return Err(DriveRefusal::PathSyntax { path: String::from_utf8_lossy(path).into_owned() });
+      return Err(DriveRefusal::PathSyntax {
+        path: String::from_utf8_lossy(path).into_owned(),
+      });
     };
     Ok(joined(&self.setup.base_path, &relative(path)))
   }
@@ -1553,17 +1857,22 @@ fn read_windows(delta: &mut Delta, source: &[u8]) -> Result<(), DriveRefusal> {
     match delta.decoder.decode(rest)? {
       Decoded::Header { consumed, .. } => consumed_total = consumed_total.saturating_add(consumed),
       Decoded::Window { window, consumed } => {
-        let offset = usize::try_from(window.source_offset).map_err(|_| SvndiffError::SourceShort)?;
+        let offset =
+          usize::try_from(window.source_offset).map_err(|_| SvndiffError::SourceShort)?;
         let view = source.get(offset..).unwrap_or_default();
         let start = delta.target.len();
         svndiff::apply(&window, view, &mut delta.target)?;
-        delta.digests.update(delta.target.get(start..).unwrap_or_default())?;
+        delta
+          .digests
+          .update(delta.target.get(start..).unwrap_or_default())?;
         consumed_total = consumed_total.saturating_add(consumed);
       }
       Decoded::NeedMore { .. } => break,
     }
   }
-  delta.pending.drain(..consumed_total.min(delta.pending.len()));
+  delta
+    .pending
+    .drain(..consumed_total.min(delta.pending.len()));
   Ok(())
 }
 
@@ -1575,7 +1884,10 @@ fn write_failure_words(code: u32, message: &str, out: &mut Vec<u8>) -> Result<()
     Value::String(b""),
     Value::Number(0),
   ]);
-  write(&Value::List(vec![Value::Word(FAILURE), Value::List(vec![error])]), out)
+  write(
+    &Value::List(vec![Value::Word(FAILURE), Value::List(vec![error])]),
+    out,
+  )
 }
 
 #[cfg(test)]

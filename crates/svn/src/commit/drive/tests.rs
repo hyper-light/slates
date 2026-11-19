@@ -34,23 +34,108 @@ const ROOM: usize = 1 << 30;
 /// The commits, the lock and the race, in the order `make-fixtures.py` ran them (`sessions.txt`); the race is bob's
 /// commit `svnserve` took while alice's `conflict` drive was held at `close-edit`.
 const CONNECTIONS: [Connection; 17] = [
-  ("mkdir", "alice", include_bytes!("../../../fixtures/commit/mkdir.1.client.bin"), include_bytes!("../../../fixtures/commit/mkdir.1.server.bin")),
-  ("import", "alice", include_bytes!("../../../fixtures/commit/import.1.client.bin"), include_bytes!("../../../fixtures/commit/import.1.server.bin")),
-  ("edit", "alice", include_bytes!("../../../fixtures/commit/edit.1.client.bin"), include_bytes!("../../../fixtures/commit/edit.1.server.bin")),
-  ("edit-large", "alice", include_bytes!("../../../fixtures/commit/edit-large.1.client.bin"), include_bytes!("../../../fixtures/commit/edit-large.1.server.bin")),
-  ("propset", "alice", include_bytes!("../../../fixtures/commit/propset.1.client.bin"), include_bytes!("../../../fixtures/commit/propset.1.server.bin")),
-  ("propdel", "alice", include_bytes!("../../../fixtures/commit/propdel.1.client.bin"), include_bytes!("../../../fixtures/commit/propdel.1.server.bin")),
-  ("root-prop-stale", "alice", include_bytes!("../../../fixtures/commit/root-prop-stale.1.client.bin"), include_bytes!("../../../fixtures/commit/root-prop-stale.1.server.bin")),
-  ("root-prop", "alice", include_bytes!("../../../fixtures/commit/root-prop.1.client.bin"), include_bytes!("../../../fixtures/commit/root-prop.1.server.bin")),
-  ("add-delete", "alice", include_bytes!("../../../fixtures/commit/add-delete.1.client.bin"), include_bytes!("../../../fixtures/commit/add-delete.1.server.bin")),
-  ("replace", "alice", include_bytes!("../../../fixtures/commit/replace.1.client.bin"), include_bytes!("../../../fixtures/commit/replace.1.server.bin")),
-  ("copy-url", "alice", include_bytes!("../../../fixtures/commit/copy-url.1.client.bin"), include_bytes!("../../../fixtures/commit/copy-url.1.server.bin")),
-  ("copy-modify", "alice", include_bytes!("../../../fixtures/commit/copy-modify.1.client.bin"), include_bytes!("../../../fixtures/commit/copy-modify.1.server.bin")),
-  ("out-of-date", "alice", include_bytes!("../../../fixtures/commit/out-of-date.1.client.bin"), include_bytes!("../../../fixtures/commit/out-of-date.1.server.bin")),
-  ("lock-bob", "bob", include_bytes!("../../../fixtures/commit/lock-bob.1.client.bin"), include_bytes!("../../../fixtures/commit/lock-bob.1.server.bin")),
-  ("locked-by-other", "alice", include_bytes!("../../../fixtures/commit/locked-by-other.1.client.bin"), include_bytes!("../../../fixtures/commit/locked-by-other.1.server.bin")),
-  ("commit-with-lock", "bob", include_bytes!("../../../fixtures/commit/commit-with-lock.1.client.bin"), include_bytes!("../../../fixtures/commit/commit-with-lock.1.server.bin")),
-  ("conflict", "alice", include_bytes!("../../../fixtures/commit/conflict.1.client.bin"), include_bytes!("../../../fixtures/commit/conflict.1.server.bin")),
+  (
+    "mkdir",
+    "alice",
+    include_bytes!("../../../fixtures/commit/mkdir.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/mkdir.1.server.bin"),
+  ),
+  (
+    "import",
+    "alice",
+    include_bytes!("../../../fixtures/commit/import.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/import.1.server.bin"),
+  ),
+  (
+    "edit",
+    "alice",
+    include_bytes!("../../../fixtures/commit/edit.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/edit.1.server.bin"),
+  ),
+  (
+    "edit-large",
+    "alice",
+    include_bytes!("../../../fixtures/commit/edit-large.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/edit-large.1.server.bin"),
+  ),
+  (
+    "propset",
+    "alice",
+    include_bytes!("../../../fixtures/commit/propset.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/propset.1.server.bin"),
+  ),
+  (
+    "propdel",
+    "alice",
+    include_bytes!("../../../fixtures/commit/propdel.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/propdel.1.server.bin"),
+  ),
+  (
+    "root-prop-stale",
+    "alice",
+    include_bytes!("../../../fixtures/commit/root-prop-stale.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/root-prop-stale.1.server.bin"),
+  ),
+  (
+    "root-prop",
+    "alice",
+    include_bytes!("../../../fixtures/commit/root-prop.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/root-prop.1.server.bin"),
+  ),
+  (
+    "add-delete",
+    "alice",
+    include_bytes!("../../../fixtures/commit/add-delete.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/add-delete.1.server.bin"),
+  ),
+  (
+    "replace",
+    "alice",
+    include_bytes!("../../../fixtures/commit/replace.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/replace.1.server.bin"),
+  ),
+  (
+    "copy-url",
+    "alice",
+    include_bytes!("../../../fixtures/commit/copy-url.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/copy-url.1.server.bin"),
+  ),
+  (
+    "copy-modify",
+    "alice",
+    include_bytes!("../../../fixtures/commit/copy-modify.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/copy-modify.1.server.bin"),
+  ),
+  (
+    "out-of-date",
+    "alice",
+    include_bytes!("../../../fixtures/commit/out-of-date.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/out-of-date.1.server.bin"),
+  ),
+  (
+    "lock-bob",
+    "bob",
+    include_bytes!("../../../fixtures/commit/lock-bob.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/lock-bob.1.server.bin"),
+  ),
+  (
+    "locked-by-other",
+    "alice",
+    include_bytes!("../../../fixtures/commit/locked-by-other.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/locked-by-other.1.server.bin"),
+  ),
+  (
+    "commit-with-lock",
+    "bob",
+    include_bytes!("../../../fixtures/commit/commit-with-lock.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/commit-with-lock.1.server.bin"),
+  ),
+  (
+    "conflict",
+    "alice",
+    include_bytes!("../../../fixtures/commit/conflict.1.client.bin"),
+    include_bytes!("../../../fixtures/commit/conflict.1.server.bin"),
+  ),
 ];
 
 /// Bob's commit that landed during alice's `conflict` drive.
@@ -83,7 +168,12 @@ impl Green for TestGreen {
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
     let list = self.lists.get(identity)?;
-    Some(list.iter().map(|(name, value)| (name.as_slice(), value.as_slice())).collect())
+    Some(
+      list
+        .iter()
+        .map(|(name, value)| (name.as_slice(), value.as_slice()))
+        .collect(),
+    )
   }
 
   fn name_text(&self, text: &[u8]) -> ContentIdentity {
@@ -178,15 +268,28 @@ fn session_path(client: &[Read<'_>], before: usize) -> String {
       _ => {}
     }
   }
-  let rest = std::str::from_utf8(url).unwrap().strip_prefix(REPOSITORY).unwrap();
-  if rest.is_empty() { "/".to_owned() } else { rest.to_owned() }
+  let rest = std::str::from_utf8(url)
+    .unwrap()
+    .strip_prefix(REPOSITORY)
+    .unwrap();
+  if rest.is_empty() {
+    "/".to_owned()
+  } else {
+    rest.to_owned()
+  }
 }
 
 /// The date of the revision a recorded commit answered, its last item's.
 fn recorded_date(server: &[Read<'_>]) -> String {
-  let Some((Value::List(parts), _)) = server.last() else { panic!("no commit-info") };
-  let Some(Value::List(date)) = parts.get(1) else { panic!("no date") };
-  let Some(Value::String(date)) = date.first() else { panic!("no date") };
+  let Some((Value::List(parts), _)) = server.last() else {
+    panic!("no commit-info")
+  };
+  let Some(Value::List(date)) = parts.get(1) else {
+    panic!("no date")
+  };
+  let Some(Value::String(date)) = date.first() else {
+    panic!("no date")
+  };
   String::from_utf8(date.to_vec()).unwrap()
 }
 
@@ -206,13 +309,22 @@ fn commit(replay: &mut Replay, work: Work, user: &str, date: &str, out: &mut Vec
 fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Connection>) -> Vec<u8> {
   let (name, user, client, server) = connection;
   let client = items(client);
-  let at = client.iter().position(|(item, _)| is_command(item, "commit")).unwrap();
+  let at = client
+    .iter()
+    .position(|(item, _)| is_command(item, "commit"))
+    .unwrap();
   let base_path = session_path(&client, at);
-  let Value::List(parts) = &client[at].0 else { panic!("{name}: commit") };
-  let Some(Value::List(params)) = parts.get(1) else { panic!("{name}: params") };
+  let Value::List(parts) = &client[at].0 else {
+    panic!("{name}: commit")
+  };
+  let Some(Value::List(params)) = parts.get(1) else {
+    panic!("{name}: params")
+  };
   let request = CommitRequest::read(params).unwrap();
   let mut out = Vec::new();
-  let locks = begin(&request, &base_path, Some(user), &mut out).unwrap().unwrap();
+  let locks = begin(&request, &base_path, Some(user), &mut out)
+    .unwrap()
+    .unwrap();
   replay.transactions += 1;
   let setup = Setup {
     base_path,
@@ -229,9 +341,17 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
       let answered = replay_commit(replay, race, None);
       check_tail(race.0, race.3, &answered);
     }
-    let step = drive.command(&replay.index, &replay.green, &replay.locks, item, &mut out).unwrap();
+    let step = drive
+      .command(&replay.index, &replay.green, &replay.locks, item, &mut out)
+      .unwrap();
     if let Step::Accepted(work) = step {
-      commit(replay, *work, user, &recorded_date(&items(server)), &mut out);
+      commit(
+        replay,
+        *work,
+        user,
+        &recorded_date(&items(server)),
+        &mut out,
+      );
     }
   }
   out
@@ -241,8 +361,15 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
 fn check_tail(name: &str, server: &[u8], answered: &[u8]) {
   let server = items(server);
   let count = items(answered).len();
-  let tail: Vec<u8> = server[server.len() - count..].iter().flat_map(|(_, bytes)| bytes.iter().copied()).collect();
-  assert_eq!(String::from_utf8_lossy(answered), String::from_utf8_lossy(&tail), "{name}");
+  let tail: Vec<u8> = server[server.len() - count..]
+    .iter()
+    .flat_map(|(_, bytes)| bytes.iter().copied())
+    .collect();
+  assert_eq!(
+    String::from_utf8_lossy(answered),
+    String::from_utf8_lossy(&tail),
+    "{name}"
+  );
 }
 
 /// Takes bob's lock as `svnserve` did, with the token it drew (A-602's guard over the token's UUID).
@@ -251,7 +378,12 @@ fn take_lock(replay: &mut Replay, server: &[u8]) {
     .iter()
     .find_map(|(item, _)| find_token(item))
     .expect("the lock's answer carries its token");
-  let uuid: Vec<u8> = token.strip_prefix("opaquelocktoken:").unwrap().bytes().filter(|byte| *byte != b'-').collect();
+  let uuid: Vec<u8> = token
+    .strip_prefix("opaquelocktoken:")
+    .unwrap()
+    .bytes()
+    .filter(|byte| *byte != b'-')
+    .collect();
   let drawn: Vec<u8> = uuid
     .chunks(2)
     .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
@@ -260,21 +392,36 @@ fn take_lock(replay: &mut Replay, server: &[u8]) {
   let request = LockRequest {
     user: Some("bob".to_owned()),
     comment: Some(b"bob's".to_vec()),
-    targets: BTreeMap::from([(LOCKED.to_owned(), LockTarget { current: None, token: None })]),
+    targets: BTreeMap::from([(
+      LOCKED.to_owned(),
+      LockTarget {
+        current: None,
+        token: None,
+      },
+    )]),
     ..LockRequest::default()
   };
-  let decision = replay.locks.lock(&request, &Head(&replay.index), AprTime(0), ROOM, &mut draw).unwrap();
+  let decision = replay
+    .locks
+    .lock(&request, &Head(&replay.index), AprTime(0), ROOM, &mut draw)
+    .unwrap();
   for entry in &decision.entries {
     replay.locks.apply(entry).unwrap();
   }
   let held = replay.locks.get_lock(LOCKED, AprTime(0)).unwrap();
-  assert_eq!(held.token.as_str(), token, "the drawn token is the recorded one");
+  assert_eq!(
+    held.token.as_str(),
+    token,
+    "the drawn token is the recorded one"
+  );
 }
 
 /// The first lock token in `item`.
 fn find_token(item: &Value<'_>) -> Option<String> {
   match item {
-    Value::String(bytes) if bytes.starts_with(b"opaquelocktoken:") => String::from_utf8(bytes.to_vec()).ok(),
+    Value::String(bytes) if bytes.starts_with(b"opaquelocktoken:") => {
+      String::from_utf8(bytes.to_vec()).ok()
+    }
     Value::List(parts) => parts.iter().find_map(find_token),
     _ => None,
   }
@@ -469,7 +616,10 @@ fn check_hostile(replay: &Replay, case: &Hostile) {
     repository_url: REPOSITORY.to_owned(),
     filesystem: "fixture".to_owned(),
     transaction: "3-1".to_owned(),
-    locks: CommitLocks { user: Some("alice".to_owned()), ..CommitLocks::default() },
+    locks: CommitLocks {
+      user: Some("alice".to_owned()),
+      ..CommitLocks::default()
+    },
     now: AprTime(0),
     room: ROOM,
   };
@@ -477,19 +627,35 @@ fn check_hostile(replay: &Replay, case: &Hostile) {
   let mut out = Vec::new();
   let mut last = Last::Taken;
   for (item, _) in items(case.commands) {
-    last = kind_of(&drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out).unwrap());
+    last = kind_of(
+      &drive
+        .command(&replay.index, &replay.green, &replay.locks, &item, &mut out)
+        .unwrap(),
+    );
   }
-  let failure = items(&out).into_iter().find_map(|(item, _)| failure_of(&item));
-  let expected = case.failure.map(|(code, words)| (u64::from(code), words.to_owned()));
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| failure_of(&item));
+  let expected = case
+    .failure
+    .map(|(code, words)| (u64::from(code), words.to_owned()));
   assert_eq!((failure, last), (expected, case.last), "{}", case.name);
 }
 
 /// The number and words of a failure item.
 fn failure_of(item: &Value<'_>) -> Option<(u64, String)> {
-  let Value::List(parts) = item else { return None };
-  let [Value::Word("failure"), Value::List(errors)] = parts.as_slice() else { return None };
-  let Some(Value::List(error)) = errors.first() else { return None };
-  let [Value::Number(code), Value::String(words), ..] = error.as_slice() else { return None };
+  let Value::List(parts) = item else {
+    return None;
+  };
+  let [Value::Word("failure"), Value::List(errors)] = parts.as_slice() else {
+    return None;
+  };
+  let Some(Value::List(error)) = errors.first() else {
+    return None;
+  };
+  let [Value::Number(code), Value::String(words), ..] = error.as_slice() else {
+    return None;
+  };
   Some((*code, String::from_utf8_lossy(words).into_owned()))
 }
 
@@ -526,12 +692,16 @@ fn a_resulting_text_whose_md5_is_not_the_clients_is_refused() {
   });
   let mut out = Vec::new();
   for (item, _) in items(commands) {
-    drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out).unwrap();
+    drive
+      .command(&replay.index, &replay.green, &replay.locks, &item, &mut out)
+      .unwrap();
   }
   let words = format!(
     "Checksum mismatch for resulting fulltext\n(/trunk/project/a.txt):\n   expected:  00000000000000000000000000000001\n     actual:  {actual}\n"
   );
-  let failure = items(&out).into_iter().find_map(|(item, _)| failure_of(&item));
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| failure_of(&item));
   assert_eq!(failure, Some((200_014, words)));
 }
 
@@ -553,11 +723,50 @@ fn a_work_past_its_room_is_refused() {
   });
   let mut out = Vec::new();
   for (item, _) in items(commands) {
-    drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out).unwrap();
+    drive
+      .command(&replay.index, &replay.green, &replay.locks, &item, &mut out)
+      .unwrap();
   }
-  let failure = items(&out).into_iter().find_map(|(item, _)| failure_of(&item));
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| failure_of(&item));
   assert_eq!(
     failure,
-    Some((210_009, "The client request size exceeds the configured limit".to_owned()))
+    Some((
+      210_009,
+      "The client request size exceeds the configured limit".to_owned()
+    ))
   );
+}
+
+/// A-617 (module documentation: locks at each call; `tree.c` `fs_apply_textdelta`). Do: after bob locks `a.txt`, let
+/// alice open it and apply a text delta, then send a malformed item. Expect: `E160039` at `apply-textdelta`, before
+/// `close-edit`, so the malformed item after it is dropped with the rest of the drive rather than ending the
+/// connection.
+#[test]
+fn a_lock_in_the_way_refuses_the_call_that_meets_it() {
+  let replay = replayed_until("locked-by-other");
+  let commands = b"( open-root ( ( ) 2:d0 ) ) ( open-file ( 5:a.txt 2:d0 2:c1 ( ) ) ) \
+( apply-textdelta ( 2:c1 ( ) ) ) ( 5 ) ";
+  let mut drive = Drive::new(Setup {
+    base_path: "/trunk/project".to_owned(),
+    repository_url: REPOSITORY.to_owned(),
+    filesystem: "fixture".to_owned(),
+    transaction: "11-1".to_owned(),
+    locks: CommitLocks {
+      user: Some("alice".to_owned()),
+      ..CommitLocks::default()
+    },
+    now: AprTime(0),
+    room: ROOM,
+  });
+  let mut out = Vec::new();
+  let mut last = Last::Taken;
+  for (item, _) in items(commands) {
+    let step = drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out);
+    last = kind_of(&step.unwrap());
+  }
+  let failure = items(&out).into_iter().find_map(|(item, _)| failure_of(&item));
+  let words = "User 'alice' does not own lock on path '/trunk/project/a.txt' (currently locked by 'bob')";
+  assert_eq!((failure, last), (Some((160_039, words.to_owned())), Last::Dropped));
 }
