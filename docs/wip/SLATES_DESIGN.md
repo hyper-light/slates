@@ -42306,12 +42306,11 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   decomposition, case folding and mark stripping, composed again; over ASCII the letters lowered), through A-606's
   `apr_fnmatch` port, now re-exported to the crate. The walk is a `Stream`: it keeps one level of sorted names per
   directory on its path, and a slice ends when the bytes it wrote and the entries it visited reach the caller's room.
-  Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 322 of 322 plus the empty pattern list's,
-  `cargo fmt --check` clean; the `list` session (16 commands), its hostile one and `svn ls -v -R` replayed whole;
+  Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 323 of 323, `cargo fmt --check` clean; the `list` session (16 commands), its hostile one and `svn ls -v -R` replayed whole;
   slicing; a date that does not parse; the parameters; a pattern read to its NUL. Red-checked eight ways (entries in
   reverse, names not folded, the kind `none` when not asked, `exclude` walked, dates never read, directories kept at
-  `files`, recursion at every depth: each failed named tests; an empty pattern list walked passed until the test of
-  its one slice was added, since its answer is the same).
+  `files`, recursion at every depth: each failed named tests; the eighth, an empty pattern list walked, answers the
+  same bytes and failed once the test of its one slice was added).
 - **Owed** (the next slices): `log` with merged revisions, `get-location-segments`, `get-file-revs`,
   `get-deleted-rev`, each replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
   (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and

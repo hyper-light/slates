@@ -939,7 +939,10 @@ fn an_empty_pattern_list_answers_without_a_walk() {
   let (_, out, slices) = streamed(&fixture, &fixture.green, command, 1);
   assert_eq!(
     (out.as_slice(), slices),
-    (b"( success ( ( ) 0: ) ) done ( success ( ) ) ".as_slice(), 1)
+    (
+      b"( success ( ( ) 0: ) ) done ( success ( ) ) ".as_slice(),
+      1
+    )
   );
 }
 
