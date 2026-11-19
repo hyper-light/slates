@@ -34,16 +34,16 @@ use crate::packet::Cipher;
 use crate::to_u64;
 use crate::wire::{Reader, UINT32_LEN, WireRefusal, put_byte, put_mpint_unsigned, put_string};
 
-/// `SSH_MSG_KEX_ECDH_INIT` (RFC 5656 §7.1).
+/// Format: `SSH_MSG_KEX_ECDH_INIT` (RFC 5656 §7.1).
 pub const KEX_ECDH_INIT: u8 = 30;
 
-/// `SSH_MSG_KEX_ECDH_REPLY` (RFC 5656 §7.1).
+/// Format: `SSH_MSG_KEX_ECDH_REPLY` (RFC 5656 §7.1).
 pub const KEX_ECDH_REPLY: u8 = 31;
 
-/// The bytes of an X25519 key, public or private (RFC 7748 §5; RFC 8731 §3: "strings of 32 bytes for Curve25519").
+/// Format: the bytes of an X25519 key, public or private (RFC 7748 §5; RFC 8731 §3: "strings of 32 bytes for Curve25519").
 pub const X25519_LEN: usize = 32;
 
-/// The bytes of a SHA-256 hash (FIPS 180-4): the exchange hash and the session id.
+/// Format: the bytes of a SHA-256 hash (FIPS 180-4): the exchange hash and the session id.
 pub const HASH_LEN: usize = 32;
 
 /// Why the key exchange was refused.

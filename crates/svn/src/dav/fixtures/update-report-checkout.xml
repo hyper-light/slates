@@ -1,0 +1,11 @@
+<S:update-report
+   xmlns:S="svn:"
+   send-all="true">
+<S:src-path>/repo/trunk</S:src-path>
+<S:target-revision>5</S:target-revision>
+<S:depth>unknown</S:depth>
+<S:entry
+   depth="infinity"
+   start-empty="true"
+   rev="5"></S:entry>
+</S:update-report>
