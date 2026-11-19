@@ -642,7 +642,11 @@ fn held<H: KeyHolders>(
   };
   match holders.holding(user, &key, blob) {
     Holding::Nobody => Held::Nobody,
-    Holding::Unknown => Held::Nobody,
+    Holding::Unknown => Held::Wanted(Wanted {
+      user: user.to_vec(),
+      key,
+      blob: blob.to_vec(),
+    }),
     holding => Held::Holds(kind, key, holding),
   }
 }

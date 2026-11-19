@@ -27,9 +27,10 @@
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
 //! begin `svnserve: ` and exit `EXIT_FAILURE` [C: `svnserve.c` at `d434dc14`]).
 
-use slates_db::catalog::{CredentialRecord, Principal, RepositoryRecord, VcsTool};
+use slates_db::catalog::{CredentialKind, CredentialRecord, Principal, RepositoryRecord, VcsTool};
 use slates_ssh::command::Command as Asked;
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
+use slates_vfs::clock::Clock;
 
 use super::git::UploadCommand;
 use crate::vcs_http::git::Repositories;
@@ -148,7 +149,7 @@ impl KeyHolders for RecordKeys {
   type Principal = Principal;
 
   fn holding(&mut self, _user: &[u8], _key: &UserKey, _blob: &[u8]) -> Holding<Principal> {
-    Holding::Nobody
+    Holding::Unknown
   }
 }
 
@@ -189,8 +190,37 @@ pub(crate) fn key_holder(
   blob: &[u8],
   now_ns: u64,
 ) -> Result<Principal, KeyUnproven> {
-  let _ = (record, blob, now_ns);
-  Err(KeyUnproven::Unknown)
+  match &record.kind {
+    CredentialKind::SshKey { blob: held, .. } if held.as_slice() == blob => {}
+    _ => return Err(KeyUnproven::NotThisKey),
+  }
+  if !record.live_at(now_ns) {
+    return Err(KeyUnproven::Expired);
+  }
+  Ok(record.principal.clone())
+}
+
+/// The principal the credential record proves for the key `blob` (the module doc): its record looked up on the
+/// partition the key's id routes to, from any shard (`crate::credentials::find`), decided by [`key_holder`] at the wall
+/// clock's now, and, for a consumer's key, the consumer's enrollment asked of its own partition, as the HTTP edge asks
+/// it (`crate::credentials::consumer_revoked`; §4.13: "every later effect refuses").
+async fn recorded_holder(blob: &[u8]) -> Result<Principal, KeyUnproven> {
+  let record = crate::credentials::find(crate::credentials::ssh_key_id(blob))
+    .await
+    .map_err(|_| KeyUnproven::Unanswered)?
+    .ok_or(KeyUnproven::Unknown)?;
+  let now_ns = crate::state::with_state(|state| state.clock.wall_ns())
+    .and_then(|ns| u64::try_from(ns).ok())
+    .ok_or(KeyUnproven::Unanswered)?;
+  let principal = key_holder(&record, blob, now_ns)?;
+  if let Principal::Consumer { consumer, .. } = &principal
+    && crate::credentials::consumer_revoked(*consumer)
+      .await
+      .map_err(|_| KeyUnproven::Unanswered)?
+  {
+    return Err(KeyUnproven::Revoked);
+  }
+  Ok(principal)
 }
 
 /// A service an `exec` names.
@@ -466,9 +496,20 @@ where
     self.keys.clone()
   }
 
-  /// Nobody yet (the red's stub).
-  async fn lookup(&mut self, _user: &[u8], _key: &UserKey, _blob: &[u8]) -> Holding<Principal> {
-    Holding::Nobody
+  /// The credential record's answer for the key (the module doc): the principal it proves, with its one key to sign, or
+  /// nobody, counted by why ([`KeyUnproven`]). The user name the client gave plays no part: the key alone names who
+  /// connects, as `git@` is everyone's user name on a git host.
+  async fn lookup(&mut self, _user: &[u8], _key: &UserKey, blob: &[u8]) -> Holding<Principal> {
+    match recorded_holder(blob).await {
+      Ok(principal) => Holding::Holds {
+        principal,
+        keys_required: KEYS_REQUIRED,
+      },
+      Err(unproven) => {
+        crate::fleet::count_refusal(unproven.counter());
+        Holding::Nobody
+      }
+    }
   }
 
   fn dispatch(
