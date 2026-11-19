@@ -646,8 +646,8 @@ fn ask_ancestor(
   (one, two): (usize, usize),
   census: &mut Census,
 ) {
-  let (answer, cost) =
-    is_ancestor(&mut fixture.store, fixture.root(one), fixture.root(two)).unwrap();
+  let (ancestor, descendant) = (fixture.root(one), fixture.root(two));
+  let (answer, cost) = is_ancestor(&mut fixture.store, ancestor, descendant).unwrap();
   assert_eq!(
     answer,
     model.is_ancestor(one, two),
@@ -681,8 +681,8 @@ fn ask_bases(
   (one, two): (usize, usize),
   census: &mut Census,
 ) {
-  let (found, cost) =
-    merge_bases(&mut fixture.store, fixture.root(one), fixture.root(two)).unwrap();
+  let (first, second) = (fixture.root(one), fixture.root(two));
+  let (found, cost) = merge_bases(&mut fixture.store, first, second).unwrap();
   let versions = versions_of(&found);
   assert_eq!(
     versions,
@@ -731,7 +731,8 @@ fn ask_bisect(
   census: &mut Census,
 ) {
   let good_roots: Vec<ContentId> = goods.iter().map(|good| fixture.root(*good)).collect();
-  let (midpoint, cost) = bisect(&mut fixture.store, fixture.root(bad), &good_roots).unwrap();
+  let bad_root = fixture.root(bad);
+  let (midpoint, cost) = bisect(&mut fixture.store, bad_root, &good_roots).unwrap();
   let answer = midpoint.map(|midpoint| {
     (
       version_of(&midpoint.found),
@@ -955,8 +956,8 @@ fn long_history() -> (Derived, u64, u64) {
 /// The merge bases of `one` and `two` in a derived history, and whether the paint stayed within its bound and under a
 /// thousand visits.
 fn bases_within(derived: &mut Derived, (one, two): (u64, u64), l: u64) -> (Vec<usize>, bool, bool) {
-  let (bases, cost) =
-    merge_bases(&mut derived.store, derived.root(one), derived.root(two)).unwrap();
+  let (first, second) = (derived.root(one), derived.root(two));
+  let (bases, cost) = merge_bases(&mut derived.store, first, second).unwrap();
   (
     versions_of(&bases),
     cost.visits <= paint_bound(&cost, l),
@@ -974,14 +975,14 @@ fn bases_within(derived: &mut Derived, (one, two): (u64, u64), l: u64) -> (Vec<u
 fn t_a666_a_long_linear_history_is_answered_in_logarithmic_visits() {
   let (mut derived, tip, side) = long_history();
   let l = 3 * floor_lg(LONG_HISTORY + 1);
-  let (yes, cost) =
-    is_ancestor(&mut derived.store, derived.root(1_000), derived.root(tip)).unwrap();
+  let (early, tip_root) = (derived.root(1_000), derived.root(tip));
+  let (yes, cost) = is_ancestor(&mut derived.store, early, tip_root).unwrap();
   assert_eq!(
     (yes, cost.visits <= ancestor_bound(&cost, l)),
     (true, true),
     "{cost:?}"
   );
-  let (no, cost) = is_ancestor(&mut derived.store, derived.root(tip), derived.root(1_000)).unwrap();
+  let (no, cost) = is_ancestor(&mut derived.store, tip_root, early).unwrap();
   assert_eq!((no, cost.visits <= 2), (false, true), "{cost:?}");
   assert_eq!(
     bases_within(&mut derived, (tip, 50_000), l),
@@ -991,7 +992,8 @@ fn t_a666_a_long_linear_history_is_answered_in_logarithmic_visits() {
     bases_within(&mut derived, (side, tip), l),
     (vec![60_000], true, true)
   );
-  let (midpoint, cost) = bisect(&mut derived.store, derived.root(tip), &[derived.root(0)]).unwrap();
+  let root = derived.root(0);
+  let (midpoint, cost) = bisect(&mut derived.store, tip_root, &[root]).unwrap();
   let midpoint = midpoint.unwrap();
   let answer = (
     version_of(&midpoint.found),
@@ -1039,13 +1041,13 @@ fn t_a666_a_merge_heavy_history_opens_only_the_branches_open_across_the_target()
   let (mut derived, main) = pull_request_history();
   let tip = *main.last().unwrap();
   let target = main[403];
-  let (yes, cost) =
-    is_ancestor(&mut derived.store, derived.root(target), derived.root(tip)).unwrap();
+  let (target_root, tip_root) = (derived.root(target), derived.root(tip));
+  let (yes, cost) = is_ancestor(&mut derived.store, target_root, tip_root).unwrap();
   let bounded = cost.opened <= 2 * number(FORK_BACK);
   assert_eq!((yes, bounded), (true, true), "{cost:?}");
   let feature = derived.run(target, 10);
-  let (bases, cost) =
-    merge_bases(&mut derived.store, derived.root(tip), derived.root(feature)).unwrap();
+  let feature_root = derived.root(feature);
+  let (bases, cost) = merge_bases(&mut derived.store, tip_root, feature_root).unwrap();
   assert_eq!(
     (versions_of(&bases), cost.jumps > 0),
     (vec![index(target)], true),
