@@ -66,6 +66,7 @@
 //! for an object past a window; the versions' records kept as content, replicated as the index's tables are.
 
 mod deltas;
+mod encoding;
 mod fragment;
 pub mod hook_view;
 pub mod learn;
@@ -78,6 +79,7 @@ mod upload;
 pub mod views;
 
 pub use deltas::delta_of;
+pub use encoding::{Encoding, EncodingCounters};
 pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
