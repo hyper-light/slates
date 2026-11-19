@@ -105,7 +105,9 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     for _ in 0..SEARCH_TURNS {
       let lower = match self.node(path, middle)? {
         None => true,
-        Some(node) => node.node_id() != first.node_id() || self.copied_after(path, middle, start)?,
+        Some(node) => {
+          node.node_id() != first.node_id() || self.copied_after(path, middle, start)?
+        }
       };
       if lower {
         end = middle;
