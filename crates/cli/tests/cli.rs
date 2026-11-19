@@ -13905,8 +13905,8 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 /// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
 /// [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
 #[test]
-#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push) and A-686 (g258: Basic \
-            with the token as password on the loopback edge, Basic's challenge first)"]
+#[ignore = "waits on A-686 (g258: Basic with the token as password on the loopback edge, Basic's challenge first); \
+            A-680 part 2b (the hg site's pushes) has landed"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
     eprintln!(

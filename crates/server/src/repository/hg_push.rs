@@ -35,19 +35,38 @@
 //!
 //! **Two steps.** [`prepare`] reads the repository once (its lines, the bookmarks the push names, the view the caller
 //! made) and builds every work, holding nothing of the repository; [`land`] keeps the push's revisions in a fork of the
-//! index, appends the entry, and puts the fork in the index's place once the entry committed, or releases it. The
-//! admission (the repository's policy and its hooks) runs between the two.
+//! repository's index in its store on this shard (A-662's Mercurial arm, `crate::vcs_store`), appends the entry, and
+//! puts the fork in the index's place once the entry committed, or releases it, each step over the store lent the
+//! shard's room and settled after, so what the push brings is charged to the shard as the store's. The admission (the
+//! repository's policy and its hooks) runs between the two.
+//!
+//! **The driver** ([`unbundle`], A-680 part 2b; 7.2's `wireprotov1server.unbundle` and `exchange.unbundle`): what both
+//! edges call with a push's principal, its `heads` argument and its bundle, in one step on the repository's owner
+//! shard, so nothing moves between what the push read and its entry. In 7.2's order: the `heads` argument judged
+//! against the served view (`crate::vcs_store::hg_view`, the view every client is answered from), a race or a view
+//! that cannot be judged answered before the bundle is read (7.2's `pusherr`); the bundle read (`push::read_bundle`);
+//! then [`prepare`] over that view and what the store's index holds, [`admitted`], the hook gate, and [`land`]. Its
+//! name is hashed from its repository and its bundle, so a push sent again after a lost answer makes the same works.
+//!
+//! **The hook gate** (§4.17.3 "Hooks"). A repository whose policy configures a Mercurial hook refuses every push,
+//! naming the hook, until the hook's view of the push is served (piece 9's revlog view): no push lands that a configured
+//! hook was not asked about, and no hook is passed over without a word, as git's push refuses (`crate::git_push`).
+//!
+//! **Not yet durable** (GAPS §4.17.3). The entry a push appends holds its lines', bookmarks' and phase roots' moves,
+//! and no record of its revisions: a Mercurial record kind is A-687's (the import's), and recording a push's objects
+//! with it is A-680 part 2c. Until then a recovery replays no Mercurial record, so the store's index after a restart
+//! lacks what pushes brought while the register keeps their moves.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[cfg(unix)]
 use slates_db::catalog::{HookPointName, RepositoryPolicy};
 use slates_db::catalog::{
-  NameBinding, Principal, RepositoryCheck, RepositoryId, StateChange, StateLog,
+  NameBinding, Principal, RepositoryCheck, RepositoryId, StateChange, StateLog, VcsTool,
   VolumeId as DbVolumeId,
 };
 use slates_hg::index::HgIndex;
-use slates_hg::push::check::{self, CheckRefusal, RACED};
+use slates_hg::push::check::{self, CheckRefusal, HeadsArgument, Moment, RACED};
 use slates_hg::push::classify::{
   self, BookmarkMove, BookmarkRead, DRAFT, LineMove, LineRead, Plan, RootChange,
 };
@@ -55,13 +74,13 @@ use slates_hg::push::commit::{self, Unindexed};
 use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::tree::{self, Move};
 use slates_hg::push::verify::{self, Held, Unverified, Verified};
-use slates_hg::push::{Asks, Unbundle};
+use slates_hg::push::{Asks, Outcome, Unbundle, read_bundle};
 use slates_hg::serve::Repository;
 use slates_hg::{Admission, Node};
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::engine::Increment;
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
-use slates_vcs::{ContentStore, IndexRefused};
+use slates_vcs::IndexRefused;
 
 use super::push::{AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
 #[cfg(unix)]
@@ -70,10 +89,13 @@ use crate::state::ShardState;
 #[cfg(unix)]
 use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outcome, PendingView};
 use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
+use crate::vcs_store::hg_view::{self, PUBLISHING};
+use crate::vcs_store::{self, VcsStores};
 use crate::verbs::hex_of;
 
+// Its history builders serve the edge's push tests too (`crate::vcs_http`'s daemon edge, A-680 part 2b).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Format: the tag a line's name begins with, before its branch's label, `:` and its number (module docs).
 pub(crate) const LINE_TAG: &str = "branch:";
@@ -123,6 +145,17 @@ const SHORT_DIGITS: usize = 12;
 const NOT_AUTHORIZED: &[u8] = b"push not authorized";
 /// Slates' words: the repository's policy holds a rule its matcher cannot read (the guard keeps such rules out).
 const POLICY_UNREADABLE: &[u8] = b"the repository's policy cannot be read";
+/// Slates' words: the repository's store is not held on this shard (the lender lends none it does not hold).
+const NO_STORE: &[u8] = b"the repository's store is not held here";
+/// Slates' words for a push refused while a Mercurial hook is configured (module docs, "The hook gate"), before the
+/// hook's configured name and after it.
+const HOOK_NOT_RUN: &[u8] = b"the repository's ";
+/// See [`HOOK_NOT_RUN`].
+const HOOK_NOT_RUN_AFTER: &[u8] = b" hook cannot run here yet: its view of the push is not served";
+
+/// Format: the BLAKE3 context a Mercurial push's name is derived in, from its repository and its bundle (module docs,
+/// "The driver").
+const PUSH_NAME_CONTEXT: &str = "slates 2026-11-19 a Mercurial push's name (A-680)";
 
 /// Appends `byte` escaped.
 fn escape(byte: u8, out: &mut String) {
@@ -1119,40 +1152,189 @@ pub(crate) struct Landed {
   pub(crate) released: Result<(), IndexRefused>,
 }
 
-/// The repository's objects a landing keeps the push's revisions in: its index and the store of its contents.
-pub(crate) type Objects<'o> = (&'o mut HgIndex, &'o mut ContentStore);
-
-/// Lands `prepared` on `repository`'s logs by `principal` (module docs): its revisions kept in a fork of the index, its
-/// entry appended, and the fork put in the index's place once the entry committed, or released.
+/// Lands `prepared` on `repository` by `principal` (module docs, "Two steps"): its revisions kept in a fork of the
+/// repository's index in its store on this shard, its entry appended, and the fork put in the index's place once the
+/// entry committed, or released.
 pub(crate) fn land(
-  logs: &mut impl RepositoryLogs,
+  state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   prepared: Prepared,
-  (index, store): Objects<'_>,
   admission: &mut Admission,
 ) -> Landed {
-  let fork = match commit::fork_with(index, store, &prepared.verified, admission) {
+  let Prepared {
+    changes,
+    parts,
+    verified,
+    replied,
+    wanted,
+    ..
+  } = prepared;
+  let forked = vcs_store::within_budget(state, brought(&verified), |stores| {
+    let (content, store) = stores.mercurial(repository).ok_or(Unforked::NoStore)?;
+    commit::fork_with(&mut store.index, content, &verified, admission).map_err(Unforked::Unindexed)
+  });
+  let fork = match forked {
     Ok(fork) => fork,
-    Err(fault) => {
+    Err(why) => {
       return Landed {
-        answer: Err(abort(unindexed_words(&fault))),
+        answer: Err(abort(unforked_words(&why))),
         released: Ok(()),
       };
     }
   };
-  match logs.append(principal, repository, prepared.changes, prepared.parts) {
-    Ok(_) => {
-      let replaced = core::mem::replace(index, fork);
-      Landed {
-        answer: Ok(Reply::accepted(&prepared.replied, prepared.wanted)),
-        released: replaced.release(store),
-      }
-    }
+  match RepositoryLogs::append(state, principal, repository, changes, parts) {
+    Ok(_) => Landed {
+      answer: Ok(Reply::accepted(&replied, wanted)),
+      released: replace_index(state, repository, fork),
+    },
     Err(refused) => Landed {
       answer: Err(append_refused(&refused)),
-      released: fork.release(store),
+      released: release_index(state, fork),
     },
   }
+}
+
+/// Why a landing's fork of the index was not made.
+#[derive(Debug)]
+enum Unforked {
+  /// No Mercurial store of the repository is held here.
+  NoStore,
+  /// The index could not keep the revisions.
+  Unindexed(Unindexed),
+}
+
+/// Slates' words for a fork not made.
+fn unforked_words(why: &Unforked) -> Vec<u8> {
+  match why {
+    Unforked::NoStore => NO_STORE.to_vec(),
+    Unforked::Unindexed(fault) => unindexed_words(fault),
+  }
+}
+
+/// What a push's revisions bring to the content store, their texts' bytes: the room its fork is lent from the arena's
+/// pool beyond what the shard could admit already (`vcs_store::within_budget`).
+fn brought(verified: &Verified) -> u64 {
+  verified
+    .changesets
+    .iter()
+    .chain(&verified.manifests)
+    .chain(verified.files.iter().flat_map(|(_, revisions)| revisions))
+    .fold(0, |total: u64, arrived| {
+      total.saturating_add(u64::try_from(arrived.text.len()).unwrap_or(u64::MAX))
+    })
+}
+
+/// Puts `fork` in repository `repository`'s index's place and gives back the index it replaces, settling the shard's
+/// charge; a store no longer held gives the fork back instead.
+fn replace_index(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  fork: HgIndex,
+) -> Result<(), IndexRefused> {
+  vcs_store::within_budget(state, 0, |stores| match stores.mercurial(repository) {
+    Some((content, store)) => core::mem::replace(&mut store.index, fork).release(content),
+    None => release_in(stores, fork),
+  })
+}
+
+/// Gives back a fork no entry committed, settling the shard's charge.
+fn release_index(state: &mut ShardState, index: HgIndex) -> Result<(), IndexRefused> {
+  vcs_store::within_budget(state, 0, |stores| release_in(stores, index))
+}
+
+/// Gives back `index`'s holds in the content store, where one is made.
+fn release_in(stores: &mut VcsStores, index: HgIndex) -> Result<(), IndexRefused> {
+  stores
+    .content_mut()
+    .map_or(Ok(()), |content| index.release(content))
+}
+
+/// What a push brings over a transport (module docs, "The driver"): who sends it, its `heads` argument read, and its
+/// bundle's bytes.
+pub(crate) type Pushing<'p> = (&'p Principal, &'p HeadsArgument, &'p [u8]);
+
+/// One `unbundle` on `repository`'s owner shard (module docs, "The driver"): what it came to, as 7.2 answers it before
+/// a transport frames the answer; none when no served view of the repository could be made.
+pub(crate) fn unbundle(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  pushing: Pushing<'_>,
+  room: &mut Admission,
+) -> Option<Outcome> {
+  let (principal, ..) = pushing;
+  let prepared = match judged(state, repository, pushing, room)? {
+    Ok(prepared) => prepared,
+    Err(outcome) => return Some(outcome),
+  };
+  let landed = land(state, (principal, repository), prepared, room);
+  if landed.released.is_err() {
+    state.count(vcs_store::RELEASE_REFUSED, 1);
+  }
+  Some(match landed.answer {
+    Ok(reply) => Outcome::Accepted(reply),
+    Err(refused) => Outcome::refused(&refused),
+  })
+}
+
+/// [`unbundle`]'s judging over the served view, in 7.2's order (module docs, "The driver"): the push prepared and
+/// admitted, or what refused it; none when no view could be made.
+fn judged(
+  state: &ShardState,
+  repository: RepositoryId,
+  (principal, heads, bundle): Pushing<'_>,
+  room: &mut Admission,
+) -> Option<Result<Prepared, Outcome>> {
+  hg_view::with_view(state, repository, room, |view, held, room| {
+    heads_hold(heads, view, room)?;
+    let unbundle = read_bundle(bundle, room)?;
+    let terms = (PUBLISHING, push_name(repository, bundle), room.left());
+    let prepared = prepare(state, repository, &unbundle, (view, &held), terms, room)
+      .map_err(|refused| Outcome::refused(&refused))?;
+    admitted(state, (principal, repository), &prepared)
+      .map_err(|refused| Outcome::refused(&refused))?;
+    match hook_refused(state, repository) {
+      Some(refused) => Err(Outcome::refused(&refused)),
+      None => Ok(prepared),
+    }
+  })
+}
+
+/// Whether `unbundle`'s `heads` argument holds at `view` before the bundle is read (7.2's `check_heads`, "preparing
+/// changes"): a race, and a view that cannot be judged, are refused before the bundle is processed, as 7.2's `pusherr`.
+fn heads_hold(
+  heads: &HeadsArgument,
+  view: &impl Repository,
+  room: &mut Admission,
+) -> Result<(), Outcome> {
+  check::judge_heads_argument(heads, view, Moment::Preparing, room).map_err(|refused| match refused
+  {
+    CheckRefusal::Raced { words } => Outcome::Unprocessed(words),
+    CheckRefusal::View(_) => Outcome::Unprocessed(VIEW_REFUSED.to_vec()),
+  })
+}
+
+/// A push's name (module docs, "The driver"; A-618: every work's identity begins with it), hashed from its repository
+/// and its bundle's bytes.
+fn push_name(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_derive_key(PUSH_NAME_CONTEXT);
+  hasher.update(&repository.bytes);
+  hasher.update(bundle);
+  *hasher.finalize().as_bytes()
+}
+
+/// The refusal of a push to `repository` while its policy configures a Mercurial hook (module docs, "The hook gate"),
+/// naming the first.
+fn hook_refused(state: &ShardState, repository: RepositoryId) -> Option<Refused> {
+  let record = state.db.partition().repositories().repository(repository)?;
+  let hook = record
+    .policy
+    .hooks
+    .iter()
+    .find(|hook| hook.point.tool() == VcsTool::Mercurial)?;
+  let mut words = HOOK_NOT_RUN.to_vec();
+  words.extend_from_slice(hook.name.as_bytes());
+  words.extend_from_slice(HOOK_NOT_RUN_AFTER);
+  Some(abort(words))
 }
 
 /// Slates' words for revisions the index could not keep.

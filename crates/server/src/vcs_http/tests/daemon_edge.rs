@@ -1,6 +1,7 @@
 //! Tests of the daemon's HTTP edge (A-625 part 3): a daemon in-process starts it from its configuration, and a rustls
 //! client over loopback TLS asks for a repository another shard's partition holds, with each kind of credential;
-//! pushes to it the bytes stock git sent (A-654 part 3); and fetches back what it pushed (A-682).
+//! pushes to it the bytes stock git sent (A-654 part 3); fetches back what it pushed (A-682); and pushes to it the
+//! bundle stock Mercurial pushed (A-680 part 2b).
 
 use std::io::{Read, Write};
 use std::net::TcpStream as ClientStream;
@@ -17,6 +18,8 @@ use slates_git::object_name::{ObjectFormat as GitFormat, ObjectId};
 use slates_git::pktline::{self, Packet};
 use slates_git::receive::{Advertised, write_advertisement};
 use slates_git::unpack::{self, NoIndex};
+use slates_hg::bookmarks::{self as hg_bookmarks, Bookmark};
+use slates_hg::bundle2::{Bundle2, Event, Param, Part};
 use slates_ipc::protocol::{
   CredentialMaterial, ObjectFormat, PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho,
   ReplyBody, RequestBody, VcsTool,
@@ -25,6 +28,7 @@ use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 
 use crate::config::{EdgeIdentity, VcsHttpConfig};
 use crate::daemon::{Daemon, SegmentSource};
+use crate::repository::hg_push::tests::{Commit, changegroup, history_of};
 use crate::vcs_http::{Counts, EdgeState, here};
 
 /// Shape: the daemon's shards: two, so a repository can live on a shard other than the listener's.
@@ -406,6 +410,17 @@ fn body_of(stream: &mut impl Read, head: &str) -> Vec<u8> {
 
 /// The status and body of the answer to `request`, sent whole on a new TLS connection to the edge on `port`.
 fn exchange(port: u16, certificate: &CertificateDer<'static>, request: &[u8]) -> (u16, Vec<u8>) {
+  let (status, _, body) = typed_exchange(port, certificate, request);
+  (status, body)
+}
+
+/// The status, `Content-Type` (empty where none is named) and body of the answer to `request`, sent whole on a new TLS
+/// connection to the edge on `port`.
+fn typed_exchange(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  request: &[u8],
+) -> (u16, String, Vec<u8>) {
   let mut stream = tls_client(port, certificate);
   stream.write_all(request).expect("the request is sent");
   let mut head = Vec::new();
@@ -418,7 +433,16 @@ fn exchange(port: u16, certificate: &CertificateDer<'static>, request: &[u8]) ->
     .nth(1)
     .and_then(|code| code.parse().ok())
     .unwrap_or_else(|| panic!("no status line: {head:?}"));
-  (status, body_of(&mut stream, &head))
+  let media_type = head
+    .lines()
+    .find_map(|field| {
+      let (name, value) = field.split_once(':')?;
+      name
+        .eq_ignore_ascii_case("content-type")
+        .then(|| value.trim().to_owned())
+    })
+    .unwrap_or_default();
+  (status, media_type, body_of(&mut stream, &head))
 }
 
 /// Format: the content type of receive-pack's requests (gitprotocol-http), as stock git sends it.
@@ -853,4 +877,196 @@ fn a_mercurial_repositorys_store_is_served_over_the_daemons_edge() {
     matches!(git_advertisement, 200 | 503),
     "git's request answered {git_advertisement}"
   );
+}
+
+/// Format: stock 7.2's push over HTTP (`crates/hg/fixtures/wire`, `make-wire-fixtures.sh`'s `http-push`): the request
+/// its client sent with `unbundle` (`fourth` onto `third`, published), the body its server answered, and its answer to
+/// `listkeys phases` after it.
+const HG_PUSH_REQUEST: &[u8] = include_bytes!("../../../../hg/fixtures/wire/http-push.07.request");
+/// Format: see [`HG_PUSH_REQUEST`].
+const HG_PUSH_REPLY: &[u8] =
+  include_bytes!("../../../../hg/fixtures/wire/http-push.07.response-body");
+/// Format: see [`HG_PUSH_REQUEST`].
+const HG_PHASES_AFTER: &[u8] =
+  include_bytes!("../../../../hg/fixtures/wire/http-push.08.response-body");
+/// Format: the history the captured server held before that push, as `make-wire-fixtures.sh` made it with stock 7.2
+/// (user `test`, date `0 0`): `base`, `second` and `third`, each adding one file to the one before.
+const WIRE_HISTORY: [Commit; 3] = [
+  ("base", "a", b"a\n", None, "default"),
+  ("second", "b", b"b\n", Some(0), "default"),
+  ("third", "c", b"c\n", Some(1), "default"),
+];
+/// Format: `third`, the captured server's head before the push (its `branchmap`), and `fourth`, the changeset the push
+/// carried (its changegroup's).
+const THIRD: &str = "d62662368ebecf4e7b3e39404f37e3b36d25a79e";
+/// Format: see [`THIRD`].
+const FOURTH: &str = "4658fce07b287c6ebe1bba3d950e5d0b3e978631";
+/// Format: an empty bundle2 stream (`HG20`, no stream parameter, no part): the reply to a push that asked for none.
+const EMPTY_REPLY: &[u8] = b"HG20\0\0\0\0\0\0\0\0";
+/// Format: stock 7.2's `unbundle` fields over HTTP but its body's length and the credential (`http-push`'s request):
+/// `heads` `force` (in hexadecimal) as a bundle2 push sends it.
+const HG_PUSH_FIELDS: &str = "Accept-Encoding: identity\r\nContent-Type: application/mercurial-0.1\r\n\
+  Vary: X-HgArg-1,X-HgProto-1\r\nX-HgArg-1: heads=666f726365\r\n\
+  X-HgProto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull\r\nAccept: application/mercurial-0.1\r\n";
+
+/// Creates the empty Mercurial repository `name` on its partition, owned by [`owner`].
+fn create_empty_hg(daemon: &Daemon, name: &str) {
+  let name = name.to_owned();
+  let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.clone(),
+        tool: VcsTool::Mercurial,
+        format: ObjectFormat::Sha1,
+        default_branch: "branch:default:0".to_owned(),
+        green: None,
+      },
+    )
+  });
+  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+}
+
+/// A bundle2 holding [`WIRE_HISTORY`] (a changegroup 03, every revision its full text) and `main` at `base`, asking no
+/// reply: the captured server's state, pushed into an empty repository.
+fn wire_history_bundle() -> Vec<u8> {
+  let made = history_of(&WIRE_HISTORY);
+  assert_eq!(
+    crate::verbs::hex_of(&made[2].node),
+    THIRD,
+    "the history rebuilt is the captured server's"
+  );
+  let group = changegroup(&made, &[0, 1, 2]);
+  let mut marks = Vec::new();
+  hg_bookmarks::encode(
+    &[Bookmark {
+      name: b"main",
+      node: Some(made[0].node),
+    }],
+    &mut marks,
+  )
+  .expect("a bookmarks payload");
+  let part = |kind: &'static [u8], id: u32, params: Vec<Param<'static>>| Part {
+    kind,
+    id,
+    mandatory_params: params.len(),
+    params,
+    depth: 0,
+  };
+  let bundle = Bundle2 {
+    params: Vec::new(),
+    parts: vec![
+      part(
+        b"CHANGEGROUP",
+        0,
+        vec![Param {
+          key: b"version",
+          value: b"03",
+        }],
+      ),
+      part(b"BOOKMARKS", 1, Vec::new()),
+    ],
+    events: vec![
+      Event::Open(0),
+      Event::Chunk(&group.payload),
+      Event::Close,
+      Event::Open(1),
+      Event::Chunk(&marks),
+      Event::Close,
+    ],
+  };
+  let mut out = Vec::new();
+  bundle.encode(&mut out).expect("a bundle2");
+  out
+}
+
+/// `bundle` pushed to Mercurial repository `name` by its owner as stock hg 7.2 pushes over HTTP: the answer's status,
+/// `Content-Type` and body.
+fn hg_unbundle(
+  edge: (u16, &CertificateDer<'static>),
+  name: &str,
+  bundle: &[u8],
+) -> (u16, String, Vec<u8>) {
+  let (port, certificate) = edge;
+  let mut sent = format!(
+    "POST /{name}?cmd=unbundle HTTP/1.1\r\nHost: localhost\r\n{}\r\n{HG_PUSH_FIELDS}\
+     Content-Length: {}\r\n\r\n",
+    owner_bearer(),
+    bundle.len()
+  )
+  .into_bytes();
+  sent.extend_from_slice(bundle);
+  typed_exchange(port, certificate, &sent)
+}
+
+/// The parts of the bundle2 `stream`, each its type and parameters, its `output` parts left out unless `outputs`: what
+/// 7.2's server prints while it takes a push, which it captures there over HTTP (`slates_hg::serve::http`'s module doc).
+fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> {
+  let bundle =
+    Bundle2::decode(stream, &mut slates_hg::Admission::new(u64::MAX)).expect("a bundle2");
+  bundle
+    .parts
+    .iter()
+    .filter(|part| outputs || !part.kind.eq_ignore_ascii_case(b"output"))
+    .map(|part| {
+      let params = part
+        .params
+        .iter()
+        .map(|param| (param.key.to_vec(), param.value.to_vec()))
+        .collect();
+      (part.kind.to_vec(), params)
+    })
+    .collect()
+}
+
+/// A-680 part 2b (main's ruling, 2026-11-19: a stock `hg push` over HTTP lands on its repository's owner shard; golden:
+/// stock 7.2's push over HTTP, `crates/hg/fixtures/wire`'s `http-push`). Do: start a two-shard daemon whose edge serves
+/// loopback TLS; create an empty Mercurial repository on the second shard's partition and enroll its owner's token;
+/// then, each on a new connection with the owner's bearer token and stock hg's fields (`POST ?cmd=unbundle`, `heads`
+/// `force`): push the captured server's history (`base`, `second`, `third`; `main` at `base`), then the very bundle
+/// stock 7.2's client pushed to that server (`fourth` onto `third`, with its race checks); then ask `heads` and
+/// `listkeys phases`. Expect: both pushes `200` in `application/mercurial-0.1`, the first an empty reply (it asked for
+/// none), the second 7.2's own reply but its progress words (`reply:changegroup` naming the changegroup part, the heads
+/// one as before); `heads` `fourth` alone, the served view of the repository's store, so the push's revisions are kept
+/// there; `listkeys phases` 7.2's own answer after the push, byte for byte.
+#[test]
+fn a_stock_mercurial_push_over_the_daemons_edge_lands_on_its_repositorys_shard() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let history = hg_unbundle(edge, &name, &wire_history_bundle());
+  let body_at = HG_PUSH_REQUEST
+    .windows(4)
+    .position(|four| four == b"\r\n\r\n")
+    .expect("the request's head ends")
+    + 4;
+  let stock = hg_unbundle(edge, &name, &HG_PUSH_REQUEST[body_at..]);
+  let heads = hg_command(edge, &name, "heads");
+  let phases = hg_command(edge, &name, "listkeys&namespace=phases");
+  daemon.stop();
+  let mercurial = "application/mercurial-0.1".to_owned();
+  assert_eq!(
+    (history.0, history.1.as_str(), history.2.as_slice()),
+    (200, mercurial.as_str(), EMPTY_REPLY),
+    "{}",
+    String::from_utf8_lossy(&history.2)
+  );
+  assert_eq!(
+    (stock.0, stock.1.as_str()),
+    (200, mercurial.as_str()),
+    "{}",
+    String::from_utf8_lossy(&stock.2)
+  );
+  assert_eq!(
+    reply_parts(&stock.2, true),
+    reply_parts(HG_PUSH_REPLY, false)
+  );
+  assert_eq!(heads, (200, format!("{FOURTH}\n").into_bytes()));
+  assert_eq!(phases, (200, HG_PHASES_AFTER.to_vec()));
 }
