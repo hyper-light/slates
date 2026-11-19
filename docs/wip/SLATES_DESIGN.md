@@ -41392,7 +41392,10 @@ unknown).
   A hash relative to the copy's own frame was weighed and set aside. It moves a subtree's sum in one step only when the
   source's own relative sum is kept. That holds for a source that is itself a copy, not for a trunk built commit by
   commit, which would need a sum per directory, a Merkle tree of the radix tree. A Merkle tree would make the
-  identity a function of the state alone and a copy O(its path); it is a change of A-202's format, recorded as owed.
+  identity a function of the state alone and a copy O(its path), at the cost of a change of A-202's format.
+  Decided (main, 2026-11-19): one entry a copy stays. In Subversion a copy's history is part of the repository (`svn
+  log` and `svn blame` follow it), so an identity of the state and its copies is the faithful one, and it costs O(1)
+  a copy; a Merkle identity would change A-202's format for no gain Subversion can see.
   A green made at another's version inherits its source's sum, which holds the entries of copies made at or before the
   version, and not their records. So its own recount differs from its identity, and a holder replaying the branch from
   the same record computes the same identity.

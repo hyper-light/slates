@@ -414,7 +414,8 @@
 > holding a copy (its tree listed, the identity's sum carried; `None` today, the chain kept whole), a rebase restating
 > a copy (the deriver's `VolumeOp::Copy`), a copy from a version its source changed after (refused today), Subversion's
 > replace with history, moves and second copies into a copied tree in one increment, the server's change-index
-> consumers treating a copy's destination as its tree, and a Merkle identity over the radix trees (weighed in A-586).
+> consumers treating a copy's destination as its tree (a Merkle identity over the radix trees was weighed and declined,
+> A-586).
 > Owed, in order: the administration verbs
 > (`svnadmin`, the dump round trip); the ra_svn server's commands (its greeting and authentication built, A-599), with
 > the lock verbs; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over
