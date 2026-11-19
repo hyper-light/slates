@@ -422,3 +422,107 @@ fn push_words(writer: &mut XdrWriter, words: &[u32]) {
     writer.u32(*word);
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use std::io::{Read, Write};
+  use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+  use std::time::{Duration, Instant};
+
+  use super::{FetchError, exchange};
+  use crate::rpc::write_record;
+
+  /// Shape: the bound the mount call put on each of its connect, send and receive before A-517: one liveness budget
+  /// (`slates_server::daemon::LIVENESS_BUDGET_NS`, a second).
+  const OLD_MOUNT_CALL_DEADLINE_NS: u64 = 1_000_000_000;
+  /// Shape: how long the late stand-in daemon holds its answer: half again the old deadline.
+  const LATE_ANSWER_NS: u64 = OLD_MOUNT_CALL_DEADLINE_NS + OLD_MOUNT_CALL_DEADLINE_NS / 2;
+  /// Shape: the most of a call a stand-in daemon reads before it answers or goes: the test's calls are a few bytes.
+  const CALL_READ_BYTES: usize = 64;
+
+  /// A stand-in daemon's MOUNT service on a loopback port nobody else holds: the listener and its port.
+  fn loopback_service() -> std::io::Result<(TcpListener, u16)> {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, port))
+  }
+
+  /// A-517 (R3's class C, C-b's third part). Do: send a MOUNT call to a stand-in daemon that reads it and answers half
+  /// again the old deadline later. Expect: the answer, deframed. Before A-517 each of the call's reads was bounded by
+  /// one liveness budget, so a daemon alive and slow to answer (a busy machine, a long start) failed the mount.
+  #[test]
+  fn a_mount_call_answered_past_the_old_deadline_is_served() {
+    let (listener, port) = loopback_service().unwrap();
+    let daemon = std::thread::spawn(move || -> std::io::Result<()> {
+      let (mut stream, _) = listener.accept()?;
+      let mut call = [0u8; CALL_READ_BYTES];
+      let _read = stream.read(&mut call)?;
+      #[allow(clippy::disallowed_methods)]
+      // the stand-in daemon holds its answer on purpose: the hold is what is tested.
+      std::thread::sleep(Duration::from_nanos(LATE_ANSWER_NS));
+      stream.write_all(&write_record(b"late answer"))
+    });
+    let asked = Instant::now();
+    let answered = exchange(
+      port,
+      b"call",
+      Duration::from_nanos(OLD_MOUNT_CALL_DEADLINE_NS),
+    );
+    let took = asked.elapsed();
+    assert!(
+      matches!(&answered, Ok(message) if message == b"late answer"),
+      "the late answer was served: {answered:?} after {took:?}"
+    );
+    assert!(
+      took >= Duration::from_nanos(LATE_ANSWER_NS),
+      "answered after {took:?}"
+    );
+    daemon.join().unwrap().unwrap();
+  }
+
+  /// A-517. Do: send a MOUNT call to a stand-in daemon that reads it and goes, its socket closed unanswered. Expect:
+  /// the call ends at once, unanswered: the peer's close (`recv(2)`: "the return value 0 means the peer has closed its
+  /// half side of the connection") ends a call no daemon will answer, as a dead daemon's process exit closes its sockets
+  /// (`close(2)`: "When a process exits, all associated file descriptors are freed").
+  #[test]
+  fn a_mount_call_whose_daemon_goes_unanswered_ends_at_once() {
+    let (listener, port) = loopback_service().unwrap();
+    let daemon = std::thread::spawn(move || -> std::io::Result<()> {
+      let (mut stream, _) = listener.accept()?;
+      let mut call = [0u8; CALL_READ_BYTES];
+      let _read = stream.read(&mut call)?;
+      Ok(())
+    });
+    let asked = Instant::now();
+    let ended = exchange(
+      port,
+      b"call",
+      Duration::from_nanos(OLD_MOUNT_CALL_DEADLINE_NS),
+    );
+    let took = asked.elapsed();
+    daemon.join().unwrap().unwrap();
+    assert!(ended.is_err(), "a call no daemon answered ended {ended:?}");
+    assert!(
+      took < Duration::from_nanos(OLD_MOUNT_CALL_DEADLINE_NS),
+      "the call ended {took:?} after it began, not at its daemon's going"
+    );
+  }
+
+  /// A-517. Do: send a MOUNT call to a loopback port nothing listens on (a stand-in daemon's, let go). Expect: refused at
+  /// once, `ECONNREFUSED` (`connect(2)`: "The attempt to connect was ignored (because the target is not listening for
+  /// connections) or explicitly rejected").
+  #[test]
+  fn a_mount_call_to_a_port_nothing_listens_on_is_refused_at_once() {
+    let (listener, port) = loopback_service().unwrap();
+    drop(listener);
+    let ended = exchange(
+      port,
+      b"call",
+      Duration::from_nanos(OLD_MOUNT_CALL_DEADLINE_NS),
+    );
+    assert!(
+      matches!(&ended, Err(FetchError::Io(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused),
+      "{ended:?}"
+    );
+  }
+}
