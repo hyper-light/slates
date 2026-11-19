@@ -143,7 +143,7 @@ impl Head {
     Head {
       files: green
         .files()
-        .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
+        .map(|(path, bytes)| (path, bytes.to_vec()))
         .collect(),
       dirs: base.dirs.iter().cloned().collect(),
       modes: base.modes.iter().cloned().collect(),

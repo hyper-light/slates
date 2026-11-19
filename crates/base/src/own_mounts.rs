@@ -170,17 +170,35 @@ fn recorded(set: &Set, id: u64) -> bool {
     .any(|slot| slot.load(Ordering::Acquire) == id)
 }
 
-/// One daemon's learning gate (A-227): its shards still learning the mounts they keep across a restart, and how long
-/// a check waits for them. A successor learns its predecessor's surviving mounts from each shard's catalog as the shard
-/// starts, and one shard's base may lie under another's mount, so none of the daemon's crossings is judged until every
-/// shard of that daemon has learned. The gate is the daemon's, never the process's: a check waits on its own daemon's
-/// shards alone (a process that starts many daemons, as a test binary does, once made every check wait on every
-/// starting daemon's shards, 1.00 s at a time).
+/// One daemon's learning gate (A-227): its shards still learning the mounts they keep across a restart, and how a check
+/// waits for them. A successor learns its predecessor's surviving mounts from each shard's catalog as the shard starts,
+/// and one shard's base may lie under another's mount, so none of the daemon's crossings is judged until every shard of
+/// that daemon has learned. The gate is the daemon's, never the process's: a check waits on its own daemon's shards
+/// alone (a process that starts many daemons, as a test binary does, once made every check wait on every starting
+/// daemon's shards, 1.00 s at a time).
+///
+/// **A check waits while the learning goes on (A-552).** Each shard that ends its learning wakes every waiting check,
+/// and a check gives up only once the window it is given passes with no shard ending its learning: the daemon makes
+/// that window the waiting shard's own (the window its watchdog judges it by, A-455), read at each look. Between looks a
+/// check parks, a look apart, never spinning: the waiting shard runs no poll's worth of CPU, which its watchdog would
+/// judge a spin, and each look shows it moving, so it is never judged still. Until A-552 a check spun one liveness
+/// window in all and gave up while shards were still ending their learning, each in its turn.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Gate {
+  /// The daemon's shards still learning.
   learning: AtomicUsize,
-  budget_ns: u64,
+  /// The learnings ended so far: a check that sees it move knows its daemon's learning goes on.
+  ended: AtomicU64,
+  /// The daemon's shard threads, each set as it enters ([`Gate::enter`]) and unparked at every learning's end, so a
+  /// check waiting on one looks at once.
+  threads: Box<[OnceLock<std::thread::Thread>]>,
+  /// The shard threads entered so far: the next slot of `threads`.
+  entered: AtomicUsize,
+  /// The window a check gives its daemon's learning to end one more shard's, read at each look.
+  window_ns: fn() -> u64,
+  /// The pause between a waiting check's looks.
+  look_ns: u64,
 }
 
 #[cfg(unix)]
@@ -192,13 +210,17 @@ thread_local! {
 
 #[cfg(unix)]
 impl Gate {
-  /// A daemon's gate, made once at its start; a check waits at most `budget_ns` (the daemon's liveness budget: a start
-  /// that takes longer is a daemon the anchor replaces). It lives as long as the process, which starts one daemon
-  /// outside tests.
-  pub fn new(budget_ns: u64) -> &'static Self {
+  /// A daemon's gate, made once at its start for its `threads` shard threads. A check gives the learning `window_ns()`,
+  /// read at each look, to end one more shard's, and looks `look_ns` apart. It lives as long as the process, which starts
+  /// one daemon outside tests.
+  pub fn new(threads: usize, window_ns: fn() -> u64, look_ns: u64) -> &'static Self {
     Box::leak(Box::new(Self {
       learning: AtomicUsize::new(0),
-      budget_ns,
+      ended: AtomicU64::new(0),
+      threads: (0..threads).map(|_| OnceLock::new()).collect(),
+      entered: AtomicUsize::new(0),
+      window_ns,
+      look_ns,
     }))
   }
 
@@ -208,8 +230,13 @@ impl Gate {
     Learning(self)
   }
 
-  /// Makes this thread's crossing checks wait on this gate: each of the daemon's shard threads, as it starts.
+  /// Makes this thread's crossing checks wait on this gate: each of the daemon's shard threads, as it starts. A thread
+  /// past the gate's `threads` is not woken at a learning's end, so its check sees it at its next look.
   pub fn enter(&'static self) {
+    let slot = self.entered.fetch_add(1, Ordering::AcqRel);
+    if let Some(thread) = self.threads.get(slot) {
+      let _set = thread.set(std::thread::current());
+    }
     GATE.set(Some(self));
   }
 }
@@ -224,29 +251,42 @@ pub struct Learning(&'static Gate);
 impl Drop for Learning {
   fn drop(&mut self) {
     self.0.learning.fetch_sub(1, Ordering::AcqRel);
+    self.0.ended.fetch_add(1, Ordering::AcqRel);
+    // Every check waiting on the gate looks at once. A thread not waiting keeps the token, which its next wait here
+    // passes over; nothing else parks a shard's thread, whose runtime waits in its driver.
+    for thread in self.0.threads.iter().filter_map(OnceLock::get) {
+      thread.unpark();
+    }
   }
 }
 
 /// Waits until no shard of this thread's daemon is learning its kept mounts, so a crossing is judged against every
-/// mount the daemon serves; refused `EAGAIN` past the budget, never judged against a partial record. A thread that is
-/// no daemon's shard waits on nothing.
+/// mount the daemon serves, while the learning goes on ([`Gate`]): refused `EAGAIN` once the gate's window passes with
+/// no shard ending its learning, never judged against a partial record. A thread that is no daemon's shard waits on
+/// nothing.
 #[cfg(unix)]
 fn await_learned() -> Result<(), HostError> {
   let Some(gate) = GATE.get() else {
     return Ok(());
   };
-  if gate.learning.load(Ordering::Acquire) == 0 {
-    return Ok(());
-  }
-  let budget = std::time::Duration::from_nanos(gate.budget_ns);
-  let started = std::time::Instant::now();
+  let mut ended = gate.ended.load(Ordering::Acquire);
+  let mut still_since = std::time::Instant::now();
   while gate.learning.load(Ordering::Acquire) > 0 {
-    if started.elapsed() >= budget {
+    let now_ended = gate.ended.load(Ordering::Acquire);
+    if now_ended != ended {
+      ended = now_ended;
+      still_since = std::time::Instant::now();
+    }
+    let window = std::time::Duration::from_nanos((gate.window_ns)());
+    let Some(left) = window
+      .checked_sub(still_since.elapsed())
+      .filter(|left| !left.is_zero())
+    else {
       return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
         rustix::io::Errno::AGAIN.raw_os_error(),
       )));
-    }
-    std::thread::yield_now();
+    };
+    std::thread::park_timeout(left.min(std::time::Duration::from_nanos(gate.look_ns)));
   }
   Ok(())
 }
@@ -895,5 +935,86 @@ mod tests {
     assert!(!recorded(&set, 5));
     record_into(&set, 6).unwrap();
     record_into(&set, 8).unwrap();
+  }
+
+  /// Shape: the window the gate test's gates judge a still learning by. A std timed wait under a launchd job's timer
+  /// policy (kiln's agents, CI's macOS runner) comes back about eight times late, at most about 150 ms late (measured
+  /// 2026-10-26), so the window is long enough for a learning that ends that late to end inside it.
+  #[cfg(unix)]
+  const GATE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+  /// Shape: the gate test's shards still learning when its check begins: each finishes a quarter window after the last,
+  /// so the six take a window and a half.
+  #[cfg(unix)]
+  const LEARNING_SHARDS: usize = 6;
+  /// Shape: the pause between a waiting check's looks: a tenth of the window, as the watchdog's looks are of its own.
+  #[cfg(unix)]
+  const GATE_LOOK: std::time::Duration = std::time::Duration::from_millis(60);
+
+  /// The window the gate test's gates give a learning, read at each look.
+  #[cfg(unix)]
+  fn gate_window_ns() -> u64 {
+    u64::try_from(GATE_WINDOW.as_nanos()).unwrap()
+  }
+
+  /// A gate for the test's one checking thread.
+  #[cfg(unix)]
+  fn test_gate() -> &'static Gate {
+    Gate::new(
+      1,
+      gate_window_ns,
+      u64::try_from(GATE_LOOK.as_nanos()).unwrap(),
+    )
+  }
+
+  /// A-552 (R3's class D: `start_with_fleet`'s learning gate). Do: make a gate with six shards learning, check a crossing
+  /// on a thread that entered it, and let the shards finish one every quarter window; then make a second gate whose one
+  /// shard never finishes and check it the same way. Expect the first check to wait while the shards go on finishing, a
+  /// window and a half in all, and answer once the last has; the second to give up `EAGAIN` once a window passes with
+  /// none finishing. Before, a check waited one window in all, so a daemon whose shards were still learning, each in its
+  /// turn, had its crossings refused while every shard was alive.
+  #[cfg(unix)]
+  #[test]
+  fn a_crossing_waits_while_its_daemons_shards_go_on_learning_and_gives_up_on_a_still_window() {
+    let gate = test_gate();
+    let mut learning: Vec<Learning> = (0..LEARNING_SHARDS).map(|_| gate.learning()).collect();
+    let check = std::thread::spawn(move || {
+      gate.enter();
+      let began = std::time::Instant::now();
+      (await_learned(), began.elapsed())
+    });
+    while let Some(shard) = learning.pop() {
+      // The point of the fixture: a shard finishing its learning a quarter window after the last.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(GATE_WINDOW / 4);
+      drop(shard);
+    }
+    let (answer, took) = check.join().unwrap();
+    assert_eq!(
+      answer,
+      Ok(()),
+      "the check waited while the shards went on learning: {took:?}"
+    );
+    assert!(
+      took > GATE_WINDOW,
+      "the learning took more than a window: {took:?}"
+    );
+    let stuck = test_gate();
+    let never = stuck.learning();
+    let (answer, took) = std::thread::spawn(move || {
+      stuck.enter();
+      let began = std::time::Instant::now();
+      (await_learned(), began.elapsed())
+    })
+    .join()
+    .unwrap();
+    drop(never);
+    assert_eq!(
+      answer,
+      Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
+        rustix::io::Errno::AGAIN.raw_os_error()
+      ))),
+      "a still window gives the check up"
+    );
+    assert!(took >= GATE_WINDOW, "after a window: {took:?}");
   }
 }

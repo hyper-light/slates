@@ -21,6 +21,10 @@
 //! - `CreateHardLinkW` must give a file a second name (A-360), as git's local clone links its objects; WinFsp's driver as
 //!   released refuses the link itself (`STATUS_NOT_SUPPORTED`), so the test skips loudly there and runs where the
 //!   driver carries `docs/wip/winfsp-patches`; `SLATES_WINFSP_HARD_LINKS=1` makes a refusal fail there.
+//! - Every spelling of a file on a folding volume's drive (`--fold`) must be one file to Windows (A-551, B2): an open
+//!   that shares nothing under one spelling refuses another with `ERROR_SHARING_VIOLATION`, as NTFS does, and the
+//!   file's final path is the spelling it was made with; the drive declared every volume `CaseSensitiveSearch`, so each
+//!   spelling was a file node of its own. An exact volume's drive keeps two spellings two files.
 //!
 //! Windows only, and gated on `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`, as `tests/winfsp.rs` is; without them
 //! each test skips loudly and passes. CI's Windows lanes install WinFsp and set both.
@@ -55,6 +59,9 @@ const START_ATTEMPTS: u32 = 60;
 const SERVING_LINE: &str = "slates daemon: instance ";
 /// Format: Win32's `ERROR_ALREADY_EXISTS` (winerror.h): what `MoveFileExW` answers for a name taken, unasked to replace.
 const ERROR_ALREADY_EXISTS: i32 = 183;
+/// Format: Win32's `ERROR_SHARING_VIOLATION` (winerror.h): what an open answers while another handle holds the file and
+/// shares nothing, under any spelling of its name on a case-insensitive volume, as NTFS answers it.
+const ERROR_SHARING_VIOLATION: i32 = 32;
 /// Format: Win32's `ERROR_ACCESS_DENIED` (winerror.h): what `MoveFileExW` answers for a directory asked to be replaced.
 const ERROR_ACCESS_DENIED: i32 = 5;
 /// Format: Win32's `ERROR_NOT_SUPPORTED` (winerror.h): what `CreateHardLinkW` answers where WinFsp's driver refuses
@@ -227,9 +234,16 @@ struct Drive {
 
 impl Drive {
   fn mount(tag: &str) -> Drive {
+    Drive::mount_with(tag, &[])
+  }
+
+  /// [`Drive::mount`] of a volume made with `create`'s further switches (`--fold`).
+  fn mount_with(tag: &str, create: &[&str]) -> Drive {
     let instance = format!("ws{tag}{}", std::process::id());
     let anchor = start_anchor(&instance);
-    let (code, out, err) = run(&instance, &["volume", "create", tag, "--bounded", "64MiB"]);
+    let mut verb = vec!["volume", "create", tag, "--bounded", "64MiB"];
+    verb.extend_from_slice(create);
+    let (code, out, err) = run(&instance, &verb);
     assert_eq!(code, 0, "{err}");
     let id = value_of(&out, "id");
     let letter = free_drive_letter();
@@ -1639,4 +1653,77 @@ fn git_with_its_symbolic_links_on_works_on_the_drive() {
   let (found, words) = git(&["-C", &repository, "rev-parse", "--show-toplevel"]);
   assert!(found, "git rev-parse on the drive: {words}");
   assert_eq!(words.trim(), format!("{}/repo", drive.letter));
+}
+
+/// An open of `path` that reads and shares nothing, as an editor's exclusive open does.
+fn open_unshared(path: &str) -> std::io::Result<std::fs::File> {
+  use std::os::windows::fs::OpenOptionsExt;
+  std::fs::OpenOptions::new()
+    .read(true)
+    .share_mode(0)
+    .open(path)
+}
+
+/// `path`'s final path, as Windows resolves it (`GetFinalPathNameByHandleW` through `canonicalize`), or the Win32
+/// error.
+fn final_path(path: &str) -> Result<String, Option<i32>> {
+  std::fs::canonicalize(path)
+    .map(|path| path.display().to_string())
+    .map_err(|error| error.raw_os_error())
+}
+
+/// A-551 (B2), §4.4 name policy, T-4.6. Do: on a folding volume's drive (`--fold`), make `A.TXT`, open it sharing
+/// nothing, and open `a.txt` while it is held; let it go, and resolve `a.txt`'s final path; make `Café.txt`, then
+/// resolve `CAFÉ.TXT`'s final path and read `café.TXT`. Expect: `a.txt` refused `ERROR_SHARING_VIOLATION`, as NTFS
+/// refuses it, since every spelling is one of WinFsp's file nodes; the final paths `\\?\X:\A.TXT` and
+/// `\\?\X:\Café.txt`, the spellings the files were made with (the second also shows the system's upcase table in the
+/// daemon agrees with the driver's, or the driver would refuse the open's name); the bytes made. Before A-551 every
+/// drive declared `CaseSensitiveSearch`, so `a.txt` opened as a second node of the same file, and its final path was
+/// `a.txt`.
+#[test]
+fn every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount_with("fold", &["--fold"]);
+  std::fs::write(drive.path("A.TXT"), b"made as A.TXT").unwrap();
+  let held = open_unshared(&drive.path("A.TXT")).unwrap();
+  let second = std::fs::File::open(drive.path("a.txt"))
+    .map(|_| ())
+    .map_err(|error| error.raw_os_error());
+  eprintln!("A-551 `a.txt` opened while `A.TXT` is held sharing nothing: {second:?}");
+  assert_eq!(second, Err(Some(ERROR_SHARING_VIOLATION)));
+  drop(held);
+  let canonical = final_path(&drive.path("a.txt"));
+  eprintln!("A-551 the final path of `a.txt`: {canonical:?}");
+  assert_eq!(canonical, Ok(format!("\\\\?\\{}\\A.TXT", drive.letter)));
+  std::fs::write(drive.path("Caf\u{e9}.txt"), "made as Caf\u{e9}.txt").unwrap();
+  let canonical = final_path(&drive.path("CAF\u{c9}.TXT"));
+  eprintln!("A-551 the final path of `CAF\u{c9}.TXT`: {canonical:?}");
+  assert_eq!(
+    canonical,
+    Ok(format!("\\\\?\\{}\\Caf\u{e9}.txt", drive.letter))
+  );
+  assert_eq!(
+    std::fs::read_to_string(drive.path("caf\u{e9}.TXT")).unwrap(),
+    "made as Caf\u{e9}.txt"
+  );
+}
+
+/// A-551. Do: on an exact volume's drive, make `a.txt` and `A.TXT` with different bytes, open `A.TXT` sharing nothing
+/// and open `a.txt` while it is held. Expect: two files, each with its own bytes, and the second open granted, since an
+/// exact volume's drive still declares `CaseSensitiveSearch` and each spelling is a file of its own.
+#[test]
+fn an_exact_drive_keeps_two_spellings_two_files() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("exact");
+  std::fs::write(drive.path("a.txt"), b"lower").unwrap();
+  std::fs::write(drive.path("A.TXT"), b"upper").unwrap();
+  assert_eq!(std::fs::read(drive.path("a.txt")).unwrap(), b"lower");
+  assert_eq!(std::fs::read(drive.path("A.TXT")).unwrap(), b"upper");
+  let held = open_unshared(&drive.path("A.TXT")).unwrap();
+  assert_eq!(std::fs::read(drive.path("a.txt")).unwrap(), b"lower");
+  drop(held);
 }
