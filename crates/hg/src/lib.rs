@@ -9,10 +9,11 @@
 //! [`heads`], [`obsmarkers`], [`pushkey`]; A-545), and the wire protocol's version 1 framings both transports use
 //! ([`ssh`], [`http`], their arguments [`wire`], the [`capabilities`] and [`batch`]; A-569), and the objects a
 //! repository holds with their nodes ([`changeset`], [`manifest`], [`filerev`], [`node`]; A-588), and the revlogs an
-//! existing store keeps them in ([`revlog`]; A-611: its zlib and zstd chunks inflated through A-607's engines), byte
-//! for byte as Mercurial 7.2 writes them, and nothing more: it keeps no index (piece 3's next part), decompresses no
-//! bundle stream (a stream compressed with `GZ`, `BZ` or `ZS` is refused by kind until A-598 wires them), handles no
-//! part (piece 5), and serves no command (piece 4).
+//! existing store keeps them in ([`revlog`]; A-611: their zlib and zstd chunks inflated through A-607's engines), byte
+//! for byte as Mercurial 7.2 writes them, and nothing more: it keeps no index (piece 3's next part), handles no part
+//! (piece 5), and serves no command (piece 4). A bundle compressed with `GZ`, `BZ` or `ZS` is made plain by
+//! [`compression`] (A-598): its zlib, bzip2 or zstd stream inflated within the caller's admission, a compression bomb
+//! refused by kind; and a plain bundle is compressed as 7.2 compresses one.
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
 //! `internals.bundle2`, `internals.bundles` and `internals.changegroups` [B], and its code [C], which is what clients
@@ -47,7 +48,10 @@
 //! repository's changelog, manifest log and file logs as 7.2's `debugdata` wrote it, each log as its `debugindex
 //! --debug` lists it, and what 7.2's own readers (`changectx`, `manifest`, `filelog.renamed`) read from each, made by
 //! `fixtures/objects/make-object-fixtures.sh` twice, byte for byte alike; every node is computed from its parents and
-//! text and every object read as 7.2 reads it and written back to its bytes.
+//! text and every object read as 7.2 reads it and written back to its bytes. `fixtures/compressed/` (A-598) holds the
+//! bundles 7.2 wrote of the repository `fixtures/cg01.hg` and `cg02.hg` hold, compressed (bundle1 with gzip and bzip2,
+//! bundle2 with gzip, bzip2 and zstd), made by `fixtures/compressed/make-compressed-fixtures.sh` and checked by its
+//! `SHA256SUMS`; each is made plain to exactly the uncompressed bundle 7.2 wrote.
 //!
 //! **Nodes are SHA-1 with collision detection** (A-588, [`node`]), as 7.2's `hashutil.sha1` is sha1dc's wherever its C
 //! extension is built (the fixtures' runs printed it): a known collision attack is refused by kind, as 7.2 raises on
@@ -68,6 +72,7 @@ pub mod bundle2;
 pub mod capabilities;
 pub mod changegroup;
 pub mod changeset;
+pub mod compression;
 mod decimal;
 pub mod delta;
 pub mod filerev;

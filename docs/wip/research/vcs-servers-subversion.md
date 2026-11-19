@@ -34,6 +34,20 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_subr/xml.c` (read 2026-11-19 for A-602) | `aeffb5c3effa073f` | C |
 | `subversion/libsvn_subr/ctype.c` (read 2026-11-19 for A-602) | `8c00533a27dc55f5` | C |
 | `subversion/include/svn_ctype.h` (read 2026-11-19 for A-602) | `2928f028e729a7b1` | B |
+| `subversion/libsvn_fs_fs/fs_fs.c` (read 2026-11-19 for A-592) | `b12b91eb0418577d` | C |
+| `subversion/libsvn_fs_fs/dag.c` (read 2026-11-19 for A-592) | `9efbb054b8818693` | C |
+| `subversion/libsvn_subr/path.c` (read 2026-11-19 for A-592) | `b234d99acb31b426` | C |
+| `subversion/libsvn_subr/sorts.c` (read 2026-11-19 for A-592) | `4fe2371630f6f71a` | C |
+| `subversion/libsvn_subr/dirent_uri.c` (read 2026-11-19 for A-592) | `fe05687a2dedb22c` | C |
+| `subversion/include/svn_dav.h` (read 2026-11-19 for A-609) | `f4740ee24bf1864d` | B |
+| `subversion/include/private/svn_dav_protocol.h` (A-609) | `10fa33c966fe4a8f` | B |
+| `subversion/libsvn_ra_serf/update.c`, `merge.c`, `get_deleted_rev.c` (A-609) | `b78f28a0945d7499`, `ac378386d20faff9`, `b7f6704777bccf62` | C |
+| `subversion/mod_dav_svn/version.c`, `merge.c`, `util.c`, `liveprops.c` (A-609) | `3904f5a2f4028987`, `e8a9d878febb05d2`, `e27d11d47e16b983`, `f96288c11c209fe6` | C |
+| `subversion/mod_dav_svn/reports/update.c`, `log.c`, `replay.c`, `get-locks.c` (A-609) | `172174063d0d87bc`, `3b2ec519b33951f9`, `af77144b5161ebf3`, `1279f8eb1374d28e` | C |
+| `subversion/mod_dav_svn/reports/mergeinfo.c`, `inherited-props.c`, `get-locations.c`, `get-location-segments.c` (A-609) | `094b9d34c12744ea`, `a1ed27b41e1cd5b9`, `681da4c234580a41`, `a5127778d80cac58` | C |
+| `subversion/mod_dav_svn/reports/dated-rev.c`, `deleted-rev.c` (A-609) | `c45708c8997cfbf5`, `639915799a79a818` | C |
+| `subversion/libsvn_subr/base64.c`, `time.c` (A-609) | `5e7c46c46c4ea17f`, `c58645b206f847e8` | C |
+| httpd 2.4.66 `modules/dav/main/mod_dav.h`, `mod_dav.c` (A-609) | `ad8361ef4e7e311c`, `2cab686b045e2237` | C |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
@@ -42,6 +56,9 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_ra_svn/marshal.c` | `908ccdd914cae15b` | C |
 | `subversion/svnserve/svnserve.c` | `43155c2bd557492f` | C |
 | `subversion/svnserve/serve.c` | `acb1cac75ea86ba7` | C |
+| `subversion/libsvn_ra_svn/cram.c` | `64e6271eacf19286` (A-599) | C |
+| `subversion/libsvn_ra_svn/internal_auth.c` | `61f373448a9c878c` (A-599) | C |
+| `subversion/libsvn_ra_svn/client.c` | `3c3b9263dd7223a9` (A-599) | C |
 | `subversion/mod_dav_svn/repos.c` | `940bc5282be7b763` | C |
 | `subversion/libsvn_repos/hooks.c` | `96392d3013a7f6bb` | C |
 | `subversion/libsvn_repos/log.c` | `d5f97de3e455314b` | C |
@@ -54,6 +71,13 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
 (`subversion.apache.org/docs/release-notes/1.10.html`, `1.14.html`, tier B); the book's path-based authorization page
 (`svnbook.red-bean.com/en/1.7/svn.serverconfig.pathbasedauthz.html`, tier B); RFC 2195, CRAM-MD5
 (`www.rfc-editor.org/rfc/rfc2195.txt`, tier B).
+
+For the handshake (A-599, 2026-11-19), RFC 2104 (HMAC, sha256 `64d5245a91019290`) and RFC 2202 (its HMAC-MD5 test
+cases, `c19effeca47e801b`), tier B; and the files of the release the fixtures were recorded with, Subversion 1.15.0,
+from `raw.githubusercontent.com/apache/subversion/1.15.0/<path>`, tier C: `libsvn_ra_svn/cram.c`, `internal_auth.c` and
+the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `8154654e07aa4eb4`, which differs from
+`d434dc14`'s by a Windows include and a comment; `libsvn_ra_svn/marshal.c` `361702975baa8c70`; `client.c`
+`b1d9607af70baf9c`; `cyrus_auth.c` `3bd4ba09916282fd`.
 
 ## 2. The wire: ra_svn (`svn://`, and `svn+ssh://` through a tunnel)
 
@@ -75,6 +99,23 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   with `edit-pipeline svndiff1 accepts-svndiff2 absent-entries commit-revprops depth log-revprops atomic-revprops
   partial-replay inherited-props ephemeral-txnprops file-revs-reverse list`; `mergeinfo` is a repository capability, in
   `repos-info` (`protocol` 169-176, 201-202).
+- **Authentication** [B: `protocol` 98-176; C: `serve.c` 580-721 and 4209-4433, `cram.c`, `internal_auth.c`;
+  M: `crates/svn/fixtures/handshake/`, stock 1.15.0's sessions, A-599]. The auth request lists `ANONYMOUS` (anonymous
+  read allowed), `EXTERNAL` (a tunnel's user, authenticated read allowed) and `CRAM-MD5` (a password database,
+  authenticated read allowed), in that order (`send_mechs`); a repository allowing none is refused "No access allowed
+  to this repository" (170001) before any request. `auth` takes `EXTERNAL` as the tunnel's user unless its token names
+  another ("Requested username does not match"), `ANONYMOUS` as no one, its token ignored, and `CRAM-MD5` by a
+  challenge `<random.microseconds@host>` (`cram.c` 154-156), the response a string `user hexdigest` split at its last
+  space with exactly 32 lowercase digits after it ("Malformed client response in authentication"), then "Username not
+  found" or "Password incorrect"; a response that is no string is passed over without a word. Any other mechanism is
+  "Must authenticate with listed mechanism". A failure lets the client answer again, with no limit
+  (`internal_auth_request`'s loop); a success writes `( success ( ) )` and `repos-info`. The answer to the greeting is
+  read as `nlc?c(?c)`: a `ra-client` without the client list after it is "Malformed network data" (recorded), and every
+  refusal before `find_repos` ends the connection with nothing written, the ones after it with a command failure whose
+  file is empty and line 0 in a release build (recorded). HMAC-MD5 in `compute_digest` hashes a password longer than 64
+  bytes first, as RFC 2104 does (recorded with 64- and 70-byte secrets). A client built with Cyrus SASL, as Homebrew's
+  1.15.0 is, sends `ANONYMOUS` base64 of `anonymous@` and its host with a line feed, and `CRAM-MD5` unencoded
+  (`cyrus_auth.c` 498-505, 553-555).
 - **Commands** [B: `protocol` 216-607]: the main set (reparent, get-latest-rev, get-dated-rev, change-rev-prop(2),
   rev-proplist, rev-prop, commit, get-file, get-dir, check-path, stat, get-mergeinfo, update, switch, status, diff, log,
   get-locations, get-location-segments, get-file-revs, lock(-many), unlock(-many), get-lock(s), replay(-range),
@@ -105,6 +146,35 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   `send-all`, dated-rev-report, get-locks-report, get-locations, log-report, mergeinfo-report, and others) with
   examples; a GET with `X-SVN-VR-Base` and `Accept-Encoding: svndiff1;q=0.9,svndiff;q=0.8` "may choose not to return
   svndiff content but return full-text".
+- **The bodies, the code** (read 2026-11-19 for A-609; §4.17.4 piece 13).
+  - **Recorded requests** [M: svn 1.15.0, Homebrew, the Mac Studio, 2026-11-19]. Stock svn was run against a recorded
+    responder (responder sha256 prefix `5b21b680f1ce2c21`). It sends:
+    - REPORT bodies with no XML declaration;
+    - OPTIONS, PROPFIND and MERGE bodies with one;
+    - update-report bodies indented by `svn_xml_make_open_tag`, their attributes in a hash table's order, which
+      differed between two runs;
+    - an empty `<D:options xmlns:D="DAV:" />` as the chunked probe;
+    - a MERGE with `X-SVN-Options: no-merge-response`;
+    - every report but `get-deleted-rev-report` for the commands run.
+  - **The handlers** [C: `mod_dav_svn/reports/*.c`]:
+    - Each report finds `svn:` with `dav_svn__find_ns` or refuses: "The request does not contain the 'svn:'
+      namespace".
+    - Each skips children in another namespace (`if (child->ns != ns) continue`) and ignores unknown names.
+    - Revisions are `SVN_STR_TO_REV`, which is `atol`.
+    - Paths pass `dav_svn__test_canonical`: empty, a canonical URL, absolute path or relative path; refused with error
+      id 0.
+    - `get-locks.c` refuses a depth other than empty, files, immediates or infinity.
+    - `replay.c` refuses a second revision and a missing low-water mark.
+    - `update.c` requires `src-path` and an entry's `rev`, and honours `send-all="true"` only with bulk updates on.
+    - `version.c` pairs a lock-token list's `lock-path` and `lock-token` by local name in any namespace; ra_serf writes
+      both unprefixed.
+  - **The answers** [C: the same files; httpd `mod_dav.h` 63-77]:
+    - `DEBUG_CR` is `"\n"` (`#if 1`).
+    - The format strings are as each test's vector shows, among them `"<S:owner %s>"` and the bare `DEBUG_CR` after a
+      MERGE's absent post-commit error.
+    - Base64 lines are 76 characters, the last line ended by a line feed too (`base64.c` 47, 171-204).
+    - `svn_xml_fuzzy_escape` writes `?\NNN`.
+    - `apr_xml_quote_string` escapes `&`, `<`, `>`, and `"` only when asked.
 - **svndiff over HTTP** [C: `mod_dav_svn/repos.c` 1784-1851]: the response's version follows the request's
   `Accept-Encoding` and the server's compression level (svndiff2 when the client lists it and the level is 1, else the
   client's preference, else 0). What a client sends in PUT bodies follows the server's advertised capabilities
@@ -191,6 +261,23 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   `E210001` unknown command, `E210004` malformed data, `E210009` request size, `E220001` unreadable, `E220002`
   partially readable, `E220004` unwritable, `E125005` bad property value. (Derivation script kept outside the tree;
   `grep -n 'SVN_ERRDEF' svn_error_codes.h` shows each offset.)
+- **The merge, then the locks** [C: `tree.c` `svn_fs_fs__commit_txn` 2194 on, `merge_changes` 2284; `transaction.c`
+  `commit_body` 3797; read 2026-11-19 for A-592]: FSFS merges the head into the transaction first, and only a merged
+  transaction reaches `commit_body`, whose `verify_locks` checks the locks; so a work that conflicts is answered with
+  the conflict whatever locks stand in its way. The drive checks locks too: `fs-wrap.c` 151-152 begins a commit's
+  transaction with `SVN_FS_TXN_CHECK_LOCKS`, which `tree.c` honours at each editor call (1614, 2497, 2554, 2645).
+- **Subversion's path order** [C: `sorts.c` `svn_sort_compare_items_as_paths` 69-79, which is `path.c`
+  `svn_path_compare_paths` 418-453]: "Children of paths are greater than their parents, but less than greater siblings
+  of their parents": a `/` sorts before every other byte, so `/a/b` comes before `/a-b`, which byte order puts first.
+  `svn_fspath__skip_ancestor` (`dirent_uri.c` 2664, through `svn_relpath_skip_ancestor` 1530-1551) is what
+  `verify_locks` skips a checked subtree's paths by.
+- **Property lists compare by content** [C: `fs_fs.c` `svn_fs_fs__prop_rep_equal` 1608-1665]: the same representation
+  is equal, committed representations with different MD5s differ, and otherwise both lists are read and compared, so
+  an empty list and no list are equal.
+- **A transaction root's created revision** [C: `dag.c` `svn_fs_fs__dag_get_revision`]: "In the special case that
+  this is an unmodified transaction root, we need to actually get the revision of the noderev's predecessor (the
+  revision root); see Issue #2608"; every other node the transaction made answers no revision, so the drive's
+  out-of-date test passes it unless the client named a revision past the transaction's base.
 
 ## 7. Properties, locks, mergeinfo, hooks, authorization
 
@@ -273,6 +360,35 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   1.14.1 fixed (issue 4762). Log's revision access [B: `svn_repos.h` 4365-4377; C: `log.c` 114-221]: `none` when no
   changed path is readable, `partial` (`svn:date` and `svn:author` only, and the readable changed paths) when some are,
   `full` otherwise.
+- **Authorization, read whole for A-606 (2026-11-19, g229)**, at the same revision; sha256 prefixes: `authz_parse.c`
+  `65dfe8189bc612e4`, `authz.c` `77d8cab538643c77`, `authz_info.c` `5f9ff5bbaaf9e187`, `authz.h` `8042f6925f6712a6`
+  (C); `libsvn_subr/config_file.c` `0de5f15f23270f73`, `ctype.c` `8c00533a27dc55f5`, `string.c` `62b5ad96280ba127`
+  (C: the file's lines, whitespace, member lists); `tests/libsvn_repos/authz-test.c` `6eaefc582403bf7e`, `authz.rules`
+  `faed4da16fc20b00`, `authz.groups` `7436b89c876dd1e8`, `repos-test.c` `40e945d3228d791c`, `libsvn_repos/repos.c`
+  `d5b563ff1363880f` (the `conf/authz` `svnadmin create` writes), `tools/server-side/svnauthz.c` `f62113915e696068`;
+  APR 1.7.5 (tag object `ee3f7c40`) `strings/apr_fnmatch.c` `12788315aebe9455` and `test/testfnmatch.c`
+  `28b79467bb826dba` (C); the 1.10 and 1.14 release notes (`7c7a34f5bee69657`, `cb16ff08aa5519d6`) and the book's
+  path-based authorization page (`9b976e3a8e2792e6`), B. Trunk at `fd4e82b` (2026-11-07) has the same `lookup`, and
+  its parser differs in comments alone, so Subversion 1.15 behaves as 1.14.x here.
+  - The precedence [C: `authz.c` 904-1011, 1277-1418]: per (user, repository) the rules that apply are folded into a
+    tree of path segments; the deepest level of the path an applying rule matches decides, and among the rules
+    matching that level the one with the highest sequence number (defined last) wins (`combine_access`); a `**` node is
+    matched again at every level and at its own (`add_next_node`); a rule ending in `**` eclipses the earlier rules
+    beneath its prefix (`trim_tree`); a global and a repository rule for one path give way to the repository's when it
+    matches the user (`create_user_authz`, 932-958: issue 4762). A recursive question is the least access over the
+    subtrees of the level's nodes ("Potential because we don't verify that the respective paths actually exist").
+  - Where the code departs from its own documentation: (1) `lookup` strips `/` to the empty string and walks it as
+    one empty segment (1284-1319), so `[:glob:/*]` (`add_next_node(... ->any)`, 1354, for any segment, the empty one
+    too) decides the root although `authz.h` 210 says `*` "Matches any single non-empty path segment"; (2) for the
+    same reason a recursive question at the root weighs only rules an empty segment matches: with `[/] * = rw` and
+    `[/secret] * =`, a recursive read at `/` is granted, and a commit that copies `/` (a recursive read of its source,
+    `commit.c`) would pass over `/secret`; (3) a suffix match reverses the segment in place (1375) and nothing restores
+    it, so the next node of the same level meets it reversed (`[:glob:/*.secret]` beside `[:glob:/**/public]` leaves
+    `/public` unmatched and matches `/cilbup`); (4) `parse_rule_path` returns the root for any path whose first segment
+    is empty (`authz_parse.c` 505-512), so `[//secret]` is the root's rule, though the next lines say "A path with two
+    consecutive slashes is not canonical". Two more outcomes depend on hash order: group expansion
+    (`expand_group_callback`, 1062-1127) detects a cycle only through the group it expands first and otherwise
+    recurses until its stack runs out, and several refusals in one file are reported in hash order.
 
 ## 8. The reference servers' shape (what the comparison is against)
 

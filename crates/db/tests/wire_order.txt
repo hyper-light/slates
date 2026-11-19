@@ -48,6 +48,9 @@ LandingState 8 Refused
 LandingState 9 Aborted
 MemberOrigin 0 Root
 MemberOrigin 1 Branch
+NameChange 0 Bind
+NameChange 1 Retire
+NameChange 2 Default
 NamePolicy 0 Exact
 NamePolicy 1 Fold
 ObjectFormat 0 Sha1
@@ -149,12 +152,15 @@ Op 92 ReviewCommentOutdated
 Op 93 ReviewApproved
 Op 94 ReviewApprovalStaled
 Op 95 ReviewClosed
+Op 96 RepositoryAdvanced
 PlacementState 0 Local
 PlacementState 1 Placed
 Principal 0 Uid
 Principal 1 Sid
 Principal 2 Certificate
 Principal 3 Consumer
+RepositoryCheck 0 Head
+RepositoryCheck 1 Names
 Role 0 Plain
 Role 1 Work
 Role 2 Green
@@ -167,6 +173,9 @@ SealKeyOwner 5 PairReceived
 SealKeyOwner 6 PairRetired
 SizeClass 0 Bounded
 SizeClass 1 Dynamic
+StateChange 0 PhaseRootAdded
+StateChange 1 PhaseRootRemoved
+StateChange 2 MarkerAdded
 VcsTool 0 Git
 VcsTool 1 Mercurial
 VcsTool 2 Subversion
