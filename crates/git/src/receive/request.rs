@@ -1,10 +1,12 @@
-//! A push's update request, read as its bytes arrive (A-620 part 1; gitprotocol-pack "Reference Update Request and
-//! Packfile Transfer"; git's `read_head_info`, `queue_command` and `read_push_options`, v2.50.1).
+//! A push's update request, read as its bytes arrive (A-620 part 1; gitprotocol-pack "Reference
+//! Update Request and Packfile Transfer"; git's `read_head_info`, `queue_command` and
+//! `read_push_options`, v2.50.1).
 //!
-//! The grammar: `*shallow ( command-list | push-cert )`, the command list ending in a flush, then the push options and
-//! their flush when both sides chose `push-options`, then the pack. Each command is `old-id SP new-id SP refname`, the
-//! first followed by a NUL and the client's capabilities. A stock client ends no line with LF; git strips one where it
-//! is, and so does this reader.
+//! The grammar: `*shallow ( command-list | push-cert )`, the command list ending in a flush, then
+//! the push options and their flush when both sides chose `push-options`, then the pack. Each
+//! command is `old-id SP new-id SP refname`, the first followed by a NUL and the client's
+//! capabilities. A stock client ends no line with LF; git strips one where it is, and so does this
+//! reader.
 
 use super::{Advertised, Refusal, reserve};
 use crate::object_name::{ObjectFormat, ObjectId};
@@ -12,10 +14,12 @@ use crate::pktline::{self, Packet};
 use crate::refname;
 use crate::{Admission, to_u64};
 
-/// Format: what a shallow line begins with (`read_head_info`: `starts_with(reader->line, "shallow ")`).
+/// Format: what a shallow line begins with (`read_head_info`: `starts_with(reader->line, "shallow
+/// ")`).
 const SHALLOW: &[u8] = b"shallow ";
 
-/// Format: the line a push certificate begins with, its capabilities after a NUL (gitprotocol-pack: `push-cert`).
+/// Format: the line a push certificate begins with, its capabilities after a NUL (gitprotocol-pack:
+/// `push-cert`).
 const PUSH_CERT: &[u8] = b"push-cert";
 
 /// Format: the byte that ends a command and begins the client's capabilities.
@@ -27,13 +31,15 @@ const SPACE: u8 = b' ';
 /// Format: the byte a line may end with, which git strips (`PACKET_READ_CHOMP_NEWLINE`).
 const LF: u8 = b'\n';
 
-/// Format: what every ref name receive-pack updates begins with (`update`: "only refs/... are allowed").
+/// Format: what every ref name receive-pack updates begins with (`update`: "only refs/... are
+/// allowed").
 const REFS: &[u8] = b"refs/";
 
 /// Format: the byte between a ref name's components.
 const SLASH: u8 = b'/';
 
-/// Format: the capability asking for a report (gitprotocol-capabilities; `read_head_info`'s `parse_feature_request`).
+/// Format: the capability asking for a report (gitprotocol-capabilities; `read_head_info`'s
+/// `parse_feature_request`).
 const REPORT_STATUS: &[u8] = b"report-status";
 /// Format: the capability asking for the report with its option lines.
 const REPORT_STATUS_V2: &[u8] = b"report-status-v2";
@@ -55,7 +61,8 @@ const AGENT: &[u8] = b"agent";
 /// Format: the client's session id.
 const SESSION_ID: &[u8] = b"session-id";
 
-/// One command: a ref, the id the client saw it at, and the id it asks for; a zero id for a ref created or deleted.
+/// One command: a ref, the id the client saw it at, and the id it asks for; a zero id for a ref
+/// created or deleted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
   /// The id the client saw the ref at; zero to create it.
@@ -83,8 +90,8 @@ pub(crate) fn is_zero(id: &ObjectId) -> bool {
   id.as_bytes().iter().all(|byte| *byte == 0)
 }
 
-/// What the client asked for on its first command line: the capabilities that change the exchange, those the server
-/// advertised alone counted, and the values it gave.
+/// What the client asked for on its first command line: the capabilities that change the exchange,
+/// those the server advertised alone counted, and the values it gave.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Requested {
   /// `report-status`: a report after the pack.
@@ -121,8 +128,9 @@ pub struct Request {
 }
 
 impl Request {
-  /// Whether a pack follows the request: one does unless every command deletes (gitprotocol-pack: "The packfile MUST
-  /// NOT be sent if the only command used is 'delete'"), and none follows an empty request.
+  /// Whether a pack follows the request: one does unless every command deletes (gitprotocol-pack:
+  /// "The packfile MUST NOT be sent if the only command used is 'delete'"), and none follows an
+  /// empty request.
   pub fn wants_pack(&self) -> bool {
     self.commands.iter().any(|command| !command.is_delete())
   }
@@ -141,7 +149,8 @@ enum Stage {
 
 /// A push's update request, read as its bytes arrive.
 pub struct RequestReader<'a> {
-  /// What the server advertised: the repository's format, and which capabilities a client may turn on.
+  /// What the server advertised: the repository's format, and which capabilities a client may turn
+  /// on.
   advertised: &'a Advertised<'a>,
   /// What comes next.
   stage: Stage,
@@ -171,8 +180,9 @@ impl<'a> RequestReader<'a> {
     }
   }
 
-  /// Reads `bytes`, the next bytes of the push, as far as the request goes, charging what it keeps to `admission`: how
-  /// many it took. It takes none past the request's last flush, where the pack begins.
+  /// Reads `bytes`, the next bytes of the push, as far as the request goes, charging what it keeps
+  /// to `admission`: how many it took. It takes none past the request's last flush, where the pack
+  /// begins.
   pub fn read(&mut self, bytes: &[u8], admission: &mut Admission) -> Result<usize, Refusal> {
     let mut used = 0usize;
     while self.stage != Stage::Done {
@@ -198,8 +208,9 @@ impl<'a> RequestReader<'a> {
     Ok(self.request)
   }
 
-  /// Reads one packet from `rest`, or as much of one as has arrived: how many bytes it took. A packet whole in `rest` is
-  /// read in place; only one whose bytes have not all arrived is kept, and topped up by later calls.
+  /// Reads one packet from `rest`, or as much of one as has arrived: how many bytes it took. A
+  /// packet whole in `rest` is read in place; only one whose bytes have not all arrived is kept,
+  /// and topped up by later calls.
   fn step(&mut self, rest: &[u8], admission: &mut Admission) -> Result<usize, Refusal> {
     if self.partial.is_empty() {
       let at = self.at;
@@ -263,7 +274,8 @@ impl<'a> RequestReader<'a> {
     }
   }
 
-  /// One line of the command list: a shallow line, or a command, the first with the client's capabilities.
+  /// One line of the command list: a shallow line, or a command, the first with the client's
+  /// capabilities.
   fn line(&mut self, line: &[u8], at: u64, admission: &mut Admission) -> Result<(), Refusal> {
     if let Some(hex) = line.strip_prefix(SHALLOW) {
       if !self.request.commands.is_empty() {
@@ -296,8 +308,9 @@ impl<'a> RequestReader<'a> {
     push_charged(&mut self.request.commands, command, admission)
   }
 
-  /// The client's capabilities, from its first command line: those the server advertised turn on; an `object-format`
-  /// other than the repository's (SHA-1 when it names none) is refused, as git refuses it.
+  /// The client's capabilities, from its first command line: those the server advertised turn on;
+  /// an `object-format` other than the repository's (SHA-1 when it names none) is refused, as git
+  /// refuses it.
   fn capabilities(&mut self, list: &[u8], at: u64) -> Result<(), Refusal> {
     let mut format = None;
     for word in list
@@ -328,8 +341,9 @@ impl<'a> RequestReader<'a> {
     Ok(())
   }
 
-  /// A capability asked for by name alone: on when it is one git's receive-pack honours and, for `atomic` and
-  /// `push-options`, one the server advertised; any other is passed over, as git passes it over.
+  /// A capability asked for by name alone: on when it is one git's receive-pack honours and, for
+  /// `atomic` and `push-options`, one the server advertised; any other is passed over, as git
+  /// passes it over.
   fn flag(&mut self, name: &[u8]) {
     let requested = &mut self.request.requested;
     let advertised = self.advertised;
@@ -387,8 +401,8 @@ fn owned(bytes: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
   Ok(kept)
 }
 
-/// Pushes `value` onto `list`, growing it, when full, to twice its room (at least one): the room added charged to
-/// `admission` before it is made, so what the list holds is what was charged.
+/// Pushes `value` onto `list`, growing it, when full, to twice its room (at least one): the room
+/// added charged to `admission` before it is made, so what the list holds is what was charged.
 pub(super) fn push_charged<T>(
   list: &mut Vec<T>,
   value: T,
@@ -405,9 +419,9 @@ pub(super) fn push_charged<T>(
   Ok(())
 }
 
-/// Whether receive-pack updates a ref of this name (`update`): it begins `refs/`, passes git's `check_refname_format`
-/// (A-615's [`refname::is_valid`]), and names two components after `refs/` unless the command deletes it
-/// (`REFNAME_ALLOW_ONELEVEL` for a delete alone).
+/// Whether receive-pack updates a ref of this name (`update`): it begins `refs/`, passes git's
+/// `check_refname_format` (A-615's [`refname::is_valid`]), and names two components after `refs/`
+/// unless the command deletes it (`REFNAME_ALLOW_ONELEVEL` for a delete alone).
 pub(crate) fn refname_ok(name: &[u8], delete: bool) -> bool {
   let Some(rest) = name.strip_prefix(REFS) else {
     return false;

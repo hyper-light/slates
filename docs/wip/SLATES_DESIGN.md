@@ -12404,20 +12404,43 @@ engine: the verdict, rebase, position mapping, the register).
 > against what the stock git-lfs 3.8.1 client sent and accepted, recorded. Serving it (routes, the object store, lock
 > records, who may do what) is the server's part.
 >
+> **Status (2026-11-19, A-629 part 1: serving Git LFS, slates-git's half).** `crates/git` (`lfs::serve`,
+> `lfs::objects`) routes a request slates-http has read under `<repo>/info/lfs`: the batch API, the locks API and the
+> basic adapter's transfers this server hands out (`PUT` and `GET` of `objects/{oid}`, `POST objects/{oid}/verify`),
+> the repository's path decoded as git's smart HTTP routes decode one, media types and `Accept` held to RFC 9110 (the
+> most specific range decides; a zero weight refuses). It answers over three seams the server implements: who may do
+> what (`Access`, vcs_policy's check, A-597), the objects (`slates-vcs`, each named by its SHA-256 and checked on
+> arrival, its bytes the shared store's by BLAKE3), and the locks (`Locks`, the repository's lock log, A-642). An action
+> expires exactly when the credential that asked for it does, and carries no expiry when that credential never does; a
+> refusal of a request without credentials is `401` with `LFS-Authenticate`. Every answer is charged before it is made
+> and allocated at its measured length; a page of locks borrows the log's records and is cut by the client's limit, or
+> where the room would no longer hold the next lock and the cursor after it. Proven by replaying the stock git-lfs 3.8.1
+> client's 24 recorded exchanges through the routes and the server, and by a property test of the paging rule. Part 2
+> is the server's: the lock log in slates-db, guarded then applied; `Access` over vcs_policy and the owner rule; each
+> repository's LFS index beside the shared store; the call A-625's edge makes.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
 >
-> **Status (2026-11-19, A-620 part 1: piece 6's exchange built).** `crates/git` (`receive`) speaks receive-pack's
-> exchange as git 2.50.1 does. It writes the ref advertisement through A-604's v0 writer, receive-pack's capabilities
-> in git's order. It reads the update request as it arrives: shallow lines, the commands (the client's capabilities on
-> the first) and the push options. The pack goes through A-608's reader, a thin pack's bases taken from the repository
-> (`unpack::Outside`). The connectivity check walks the pushed objects alone: a tip reaching an object nothing holds is
-> `missing necessary objects`, and a client's shallow commit whose parent nothing holds is `shallow update not allowed`.
-> Each remaining command's ref name is held to A-615's rule, then the caller's verdict is asked (`Judge`), every ref or
-> none under `atomic`. The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
-> band-2 lines. Proven byte for byte against nine pushes stock git 2.50.1 made to stock `git receive-pack`. Part 2 makes
-> each ref's update a work the engine judges, every ref recorded as one register entry.
+> **Status (2026-11-19, A-620 part 1: piece 6's exchange, its checks and its session built).** `crates/git`
+> (`receive`) speaks receive-pack's exchange as git 2.50.1 does. It writes the ref advertisement through A-604's v0
+> writer, receive-pack's capabilities in git's order, leaving out the refs a deployment hides (`HiddenRefs`, which
+> A-597's policy answers in the server). It reads the update request as it arrives: shallow lines, the commands (the
+> client's capabilities on the first) and the push options. The pack goes through A-608's reader, a thin pack's bases
+> taken from the repository (`unpack::Outside`; A-638's `IndexedObjects` is that repository), and every object in it
+> through A-590's checks under a push's strictness (git's `--strict`) before any ref moves. The connectivity check walks
+> the pushed objects alone: a tip reaching an object nothing holds is `missing necessary objects`, and a client's
+> shallow commit whose parent nothing holds is `shallow update not allowed`. A hidden ref is then refused, and each
+> remaining command's ref name is held to A-615's rule. Then the caller's verdict (`Judge::judge`), which moves nothing,
+> and its append (`Judge::append`), which moves the ref: one entry on that ref's own log, only while the ref is at the
+> position the verdict read (A-642). Without `atomic` each ref moves on its own; under it, one append moves every ref or
+> none (`append_atomic`). The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
+> band-2 lines. `Session` runs it all over one connection, sans-io: bytes in as they arrive, bytes out to the caller's
+> sink, the answer written as the push's last byte arrives. Proven byte for byte against eleven pushes stock git 2.50.1
+> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2
+> implements `Judge`: each ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable
+> versions (A-645), appended per A-642.
 >
 > **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
 > answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
@@ -12459,6 +12482,14 @@ engine: the verdict, rebase, position mapping, the register).
 > 2.50.1 answered the golden vectors from, loaded into a real store from its own pack: the negotiation over the store
 > sends exactly the objects git sent for a clone and for a fetch with a have. The service over v2, and over v0 and v1,
 > is A-640's next part.
+>
+> **Status (2026-11-19, A-637: item 5's submodule link built in the merge engine).** A tree's `160000` entry is a
+> special node holding the commit's id (`SpecialKind::Gitlink` in `slates-merge`), encoded beside A-294's device kinds.
+> A push makes it (`Mknod`, no owner, time or permission bit, since git records none), moves it to another commit
+> (`Unlink` then `Mknod`) and removes it (`Unlink`). The engine takes a link moved to another commit as the same kind:
+> two pushes moving one link apart from one base conflict `CreateCreate`. A path changing to or from a link is a typed
+> kind change (GAPS §8f). A link's form in a volume and in a checkout is owed (git checks a submodule out as an empty
+> directory).
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12626,8 +12657,10 @@ create or update a reference named "refs/for/master", but may create or update a
 
 **Large files.** Git LFS's batch API [B: git-lfs `docs/api/batch.md`, `basic-transfers.md`, `locking.md`]: a
 `POST` to `<repo>.git/info/lfs/objects/batch` names an `operation` (upload or download) and objects by SHA-256 `oid` and
-`size`; the answer gives each object's actions (`href`, headers, `expires_in`); a basic transfer is a plain `PUT` or
-`GET` of the bytes; locks are per path. An LFS object is content in the volume store, deduplicated by BLAKE3 like every
+`size`; the answer gives each object's actions (`href`, headers, and the expiry of the credential that asked, since a
+transfer authenticates at the edge as the batch did: `expires_at` for a token that expires, none for one that does not,
+A-629); a basic transfer is a plain `PUT` or `GET` of the bytes; locks are per path, kept in the repository's lock log
+(A-642). An LFS object is content in the volume store, deduplicated by BLAKE3 like every
 other byte, with its SHA-256 name an index row and the bytes checked against it on upload. A version's tree holds the
 pointer files git holds [B: git-lfs `docs/spec.md`]. Partial clone with `blob:limit`, git's own answer to large files,
 is served as well. Mercurial's `lfs` extension speaks this same batch API, so one store serves both tools (§4.17.3).
@@ -42634,16 +42667,85 @@ Applied in the same change to:
       where git answered `unpack ok` and `ok refs/heads/main`.
   - On the tree merged with main (A-604's v0, A-615's refname, A-614's store), with the advertisement and the ref-name
     rule pointed at A-604's and A-615's: 287 of 287 under `--locked` (14.6 s), `cargo fmt --check` clean.
-- **Owed.** Part 2: each ref's update a work the engine judges (A-618), every ref recorded as one register entry
-  (A-603), with A-614's store as the `Repository` (a base's bytes assembled from the content plane). Then:
-  - the fsck checks of every new object (§4.17.2 item 4, A-590's `fsck`);
-  - the server loop that feeds the request reader and then the pack reader from one connection;
-  - review requests over `refs/for/` with report-status-v2's option lines (piece 10), hidden refs (`.have`),
-    and signed pushes (`push-cert`).
+- **Part 1, continued (2026-11-19): the pushed objects' fsck, hidden refs, the session, and each command's verdict
+  split from its append.** Asked by main once part 1 landed; A-642 and A-645 read as they landed.
+  - **fsck** (`receive::fsck`). Once the pack is whole, every commit, tag and tree in it goes through A-590's checks
+    under a push's strictness (`Strictness::Strict`: git's `index-pack --strict` and `unpack-objects --strict`, under
+    which a warning refuses), in pack order, before any ref moves. The first object refused ends the pack: every
+    command `unpacker error`, and on band 2 `error: object <id>: <finding>` and git's `fatal: fsck error in packed
+    object`. A blob passes until A-590 checks the `.gitmodules` and `.gitattributes` blobs a tree names.
+  - **The unpack status's words** follow git's `unpack_limit` (100, `transfer.unpackLimit`'s default): a refused pack
+    of fewer objects is `unpack-objects abnormal exit`, any other `index-pack abnormal exit`. Part 1 said index-pack
+    for every short pack, which git says only from 100 objects on.
+  - **Hidden refs** (`HiddenRefs`, a predicate A-597's `vcs_policy` answers in the server, as `transfer.hideRefs` and
+    `receive.hideRefs` hide). They are left out of the advertisement (`visible`), and a command naming one is refused
+    after the connectivity check, `deny updating a hidden ref` or `deny deleting a hidden ref`, in the order and words
+    of git's `reject_updates_to_hidden`. An object only hidden refs reach still counts as held: git's
+    `--exclude-hidden=receive` (2.39) keeps hidden refs from bounding its connectivity walk, for its cost alone.
+  - **The session** (`Session`): one push over one connection, sans-io. `advertise`, then `input` as the client's
+    bytes arrive and `end` when they stop, every answer written to the caller's `Out`; A-625's HTTP edge and A-594's
+    SSH channel drive it. It answers as the push's last byte arrives: a delete-only request as it ends, no pack
+    following it; any other once the pack's trailer is read; a pack cut short at the end of input, as git answers a
+    short pack. A request cut short, or one the protocol refuses, ends the session with nothing written, and bytes
+    after the push are not read.
+  - **Each command's verdict split from its append** (A-642, Ada). `Judge::judge` moves nothing and gives what its
+    append takes: part 2's work and the position its ref was read at. `Judge::append` moves one ref, one entry on its
+    own log, only while the ref is still at that position. Without `atomic` each command is judged and appended on its
+    own, in order, so one ref's refusal holds no other; under `atomic` every verdict comes first, then one
+    `append_atomic` moves every ref or none. git's words for a ref that moved: `failed to update ref`, and under
+    `atomic` `atomic transaction failed` for every command, its band-2 line once. The judging stays pure over
+    immutable versions, as A-645 asks.
+  - **Golden vectors.** The script captured two more pushes to the same server, eleven in all: `hidden`, a create of a
+    ref under `receive.hideRefs refs/hidden`, answered `deny updating a hidden ref`; and `fsck`, a commit with no
+    author email under `receive.fsckObjects`, answered `unpack unpack-objects abnormal exit` and `unpacker error`. The
+    nine earlier captures came out byte for byte the same. The fsck push's answer is git's on band 1 byte for byte,
+    and on band 2 line for line but for the prose git writes after a finding's id (A-590 names findings, not prose).
+  - **Tests** (`cargo test -p slates-git --lib`, 16 new and three of part 1's changed):
+    - every captured push answered as git answered, eleven of them;
+    - fsck: a commit with no email, a tag of an unknown type, a tree holding `.git` and a tree out of order each refused
+      with its finding and never judged; the `.git` tree kept by a default fsck and refused by a push's; the first
+      refused object in pack order named;
+    - hidden refs: left out of the captured server's advertisement, which with them shown is not git's; two creates,
+      an update, a delete and `refs/hidden` itself refused and never judged; connectivity's refusal first; an atomic
+      push naming one;
+    - the session: every captured push fed in pieces of 1, 3, 7 and 61 bytes and whole, answered as its last piece
+      arrives; every cut of every push answered as the push held whole; a refused request ending it; bytes after a push
+      not read; a request of no command;
+    - the appends, over a model of per-ref logs: without `atomic`, a ref moved between its verdict and its append
+      refused alone; an atomic push one append on all three refs; one whose ref moved appending to none; a verdict
+      declined under `atomic` appending nothing;
+    - the unpack status at 99 and at 100 objects.
+  - **Checks.** On the Mac Studio (kiln, debug, 2026-11-19), the tree merged with main (A-638's views, A-642, A-645):
+    - the first run (r866) stopped at A-638's test of `receive`, written to the old seam; it now accepts with `()`;
+    - r877: 349 of 349 under `--locked` (two of main's ignored; load 6.5, 14.4 s). Failing first: with fsck, hidden
+      refs, the limit's words, the appends and the session stubbed, 17 of the 31 `receive` tests failed: every new one
+      but the two that guard what mutations 2 and 6 break, and the three part-1 tests whose words changed;
+    - red ten ways by mutation: a default fsck (2 failed); hidden refs before connectivity (2); the hidden reasons
+      swapped (3); the limit's boundary at `<=` (1); an atomic push appended ref by ref (2); a declined atomic push
+      appending what was accepted (1); a delete-only push waiting for a pack (4); fsck's band-2 lines dropped (3); a
+      refused append's band-2 line on every command (1); a refused request not ending the session (1);
+    - `cargo fmt` rewrapped nine files (brought back by blob hash), then 349 of 349 again (load 11.4, 15.2 s), and
+      `cargo fmt --check` clean.
+  - Also in this change: the entry and delta generators draw plain tuples and selectors in place of the Arc-backed
+    `prop_oneof!` (R2), with its equal weights; `fed_in_chunks` (A-608's tests) refuses where it asserted; the receive
+    module's comments are wrapped at 100 columns; GAPS' §4.17 entry loses the conflict markers a merge on main left,
+    A-638's and A-624 part 2's paragraphs both kept.
+- **Owed.** Part 2, `Judge` over the engine: each command's ref the green its name maps to; its update a work through
+  A-618's `build` over A-638's `PushedObjects` (the index, then the push's quarantine), judged pure over immutable
+  versions (A-645), several judged together under `atomic` (A-635); appended per A-642 through a trait until g261's
+  per-green append lands. Then:
+  - review requests over `refs/for/` with report-status-v2's option lines (piece 10), and signed pushes (`push-cert`);
+  - the `.have` lines of objects a fork shares (git's alternates);
+  - the warnings git's strict check writes on band 2, and A-590's checks of the `.gitmodules` and `.gitattributes`
+    blobs.
 
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`receive/`, new, with its
 tests; `unpack.rs`'s `Outside`, `NoObjects` and `Reader::finish_with`, and its test; `lib.rs`'s module line);
-`crates/git/fixtures/push/` (new); `.gitattributes` (the push fixtures, byte for byte).
+`crates/git/fixtures/push/` (new); `.gitattributes` (the push fixtures, byte for byte). The continuation, to: §4.17.2's
+status; GAPS (the §4.17 entry, and its conflict markers); `crates/git` (`receive/`: `fsck.rs` and `session.rs` new,
+`mod.rs`, `report.rs`, and the other modules' comments; `receive/tests/`: `append.rs`, `checks.rs` and `session.rs` new;
+`unpack.rs`'s `format`, `objects` and `is_whole`; `tests/entry.rs`, `tests/delta.rs`, `tests/unpack.rs` and
+`tests/store/views.rs`); `crates/git/fixtures/push/` (two pushes, the script, `SHA256SUMS`).
 
 ### A-627 — `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token` read (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part, in part; A-609, A-602)
 Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), `research/vcs-servers-subversion.md` (§1's
@@ -43508,6 +43610,116 @@ Applied in the same change to:
   - a hard link names its target by path, so the head's removal of a file that links name is accepted and the links
     then name whatever is made there next;
   - the IPC node's unlink scans every attribute change and every hard link once per unlink.
+
+### A-629 part 1 — Serving Git LFS, slates-git's half: routes, answers and bounds over three seams, objects named by SHA-256 and checked on arrival, actions that expire with the credential that asked (2026-11-19, g293, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", "Access" and "Pieces (git)" piece 12's second part; after A-610, A-581, A-595 and A-597; with A-642)
+Applied in the same change to:
+- §4.17.2's "Large files" (the actions' expiry, the lock log) and its status; GAPS (the §4.17 entry);
+- `crates/git` (`lfs/serve.rs` and `lfs/objects.rs`, new, with `tests/lfs_serve.rs` and `tests/lfs_objects.rs`;
+  `lfs.rs`, the two modules' lines and `Oid`'s `AsRef<[u8]>`; `lfs/locks.rs`, `listed_len` and `cursor_len`;
+  `tests/lfs.rs`, each recorded request's `Content-Type` and `Accept`).
+- **The split.** A-629 serves LFS. Part 1 is slates-git alone: the routes and the answers, written against three seams
+  the server implements. Part 2 is the server's (slates-db and slates-server): the lock log, `Access` over vcs_policy,
+  each repository's LFS index, and the call A-625's edge makes. A-642 (Ada, the same day) keeps a repository's own
+  state in logs of its own, so the locks are the repository's lock log, guarded then applied, and never changes on
+  A-603's repository-wide entry; A-642 has the pushes keep their traits, and `Locks` is this one's.
+- **Routes** [B: git-lfs v3.8.1 `docs/api/server-discovery.md`, `batch.md`, `basic-transfers.md`, `locking.md`]. Under
+  the LFS server URL git-lfs derives, `<repo>/info/lfs`: `POST objects/batch`; `POST locks`, `GET locks`,
+  `POST locks/verify` and `POST locks/{id}/unlock` (A-610's route); and the basic transfers this server hands out as
+  actions, each href under the request's own LFS server URL: `PUT` and `GET` of `objects/{oid}`, and
+  `POST objects/{oid}/verify`. The path is decoded once: an escape that names a slash or a NUL, or a repository path
+  that is not UTF-8, is `400`; an empty, `.` or `..` segment is `404`; the last whole `/info/lfs` ends the repository's
+  path. A method an endpoint does not take is `405` with `Allow` (`400` to HTTP/1.0, which has no `405`). A malformed
+  escape never reaches a route: slates-http's reader refuses it as a bad request target (RFC 3986 §2.1), which the
+  first green run found.
+- **Media types** [B: RFC 9110 §12.5.1, §12.4.2, §5.6.1]. A JSON endpoint's body is `application/vnd.git-lfs+json`, a
+  `charset` taken as batch.md asks, else `415`. An answer's type must be acceptable: of the `Accept` ranges that cover
+  LFS's type, the most specific decides (the type, then `application/*`, then `*/*`), and a zero weight (`q=0`, `0.`,
+  `0.000`) is "not acceptable", so `406`. Empty list elements are no ranges, and no `Accept` takes anything. A
+  transfer's bytes are not JSON and are not held to it.
+- **Who may do what.** Each request asks `Access` for a `Need` on the ref it names, or on the repository's whole
+  namespace for a transfer, which names none: `Download`, `Upload`, `ListLocks` (locking.md: pull access), `Lock`,
+  `VerifyLocks`, `Unlock` (push access) and `UnlockOthers` (another user's lock, which also takes `force`). A refusal
+  of a request that sent no credentials is `401` with `LFS-Authenticate` when the edge gave a challenge (batch.md), so
+  git-lfs asks for credentials and retries; of one that did, `403`. Another user's lock without `force` is `403`.
+- **Objects** [B: git-lfs `docs/spec.md`]. An object's id is the SHA-256 of its bytes (aws-lc-rs). An upload is
+  admitted through `slates-vcs`'s quarantine with that naming (A-581): bytes that are not their oid are `422` and
+  nothing of them is kept, the store's content count and bytes unchanged; bytes that are go in as one row of the
+  repository's LFS index, keyed by the oid's 32 bytes and apart from its git objects' index, the content the shared
+  store's by BLAKE3. A store past its budget is `507`. A batch answers a download where the object is held at the size
+  asked, an upload and its verification where none is, nothing where it is held, and a per-object `404` or `422`
+  otherwise.
+- **Expiry** (main's ruling, 2026-11-19, replacing the learned expiry A-610 left owed). A transfer authenticates at the
+  edge as the batch did, so an action works exactly as long as the credential that asked for it: its `expires_at` is
+  that credential's expiry when the edge knows one (a bearer token's, handed in with the principal), and an action
+  asked with one that never expires (Basic) carries none. Nothing is chosen, signed or learned here.
+- **Bounds.** Every answer is charged to the request's admission before it is made, and allocated at its measured
+  length: a batch answer's hrefs and the slots that hold them, then its body; a lock or a conflict; a page. A page of
+  locks borrows the log's records, never copies them. It charges its frame, then each lock at its place in a list (the
+  comma before it, so at most a byte a list over what it writes) with the page's slot for it, while the client's limit
+  allows and the room holds the lock and the cursor naming the one after it, then the cursor that ends it. So that
+  cursor always fits, and a page that cannot hold one lock is `413`, never an empty page whose cursor names the lock it
+  could not hold, which would bring the client back to it for ever. A cursor that names no place in the log is `422`,
+  as is a query's `limit` that is no number.
+- **The locks' seam.** `take` (or the lock that holds the path: `409` with it), `find`, `listed_from` (the log's order
+  from the place a cursor names, inclusive; `None` for no place) and `release`; a full log is `507`. A lock's id names
+  its place in the log, so a cursor naming a lock released since still names a place; ids are RFC 3986 unreserved
+  characters, since git-lfs writes them into a path unescaped (A-610).
+- **Changed during the piece, and why.** The first page copied each record and wrote its frame and cursor uncharged;
+  it now borrows the records and charges every byte. The seam's visiting callback became an iterator, so a page can
+  see the lock after the one it weighs. The first `Accept` check took any covering range; it now follows RFC 9110's
+  precedence and zero weights and skips empty elements.
+- **Tests** (`tests/lfs_serve.rs`, 17; `tests/lfs_objects.rs`, 5): the stock git-lfs 3.8.1 client's 24 recorded
+  exchanges (A-610's fixture) replayed through the routes and the server, the transfers at this server's own hrefs:
+  every status, every object's answer, the locks and the conflict whole, every page beginning as recorded, every
+  downloaded byte. Then the route table and its refusals; `Accept`'s precedence and weights; `405`'s `Allow`; policy,
+  `401`'s challenge, the expiry, an upload checked against its oid, the unlock rules; pages by limit and by room;
+  `413`, `422` and `507` by kind; and a property test that follows the cursors against the paging rule, stated over
+  the locks' JSON. On the Mac Studio (M3 Ultra, debug, 2026-11-19): red at 05:55Z, the 22 new tests failing with nine
+  entry points stubbed on its clone (never committed) and 271 others passing; green at 05:58Z on cb761ddbf,
+  `cargo test -p slates-git --lib` 293 of 293, fmt clean. The first green had reused the red build: both clones shared
+  one target directory, and cargo names a workspace member by its path from the workspace root and judges it fresh by
+  its dep-info's absolute paths, which named the red copy's unchanged files. Red and green now build in target
+  directories of their own.
+- **Owed.** Part 2: the lock log in slates-db, guarded then applied; `Access` over vcs_policy and the owner rule; each
+  repository's LFS index; the call A-625's edge makes. Then a streaming put in `slates-vcs`, so an upload is admitted
+  window by window rather than whole; the stock client end to end against slates (main's run); Mercurial's `lfs`
+  (§4.17.3).
+
+### A-637 — A submodule's link is a special node holding its commit: encoded beside A-294's device kinds, made by a push, moved as the same kind (2026-11-19, g225, UI goal 93 (kiln 51cef9f7); §4.17.2 "Trees as a volume" item 5; §4.16's names with no content; §4.17.1 "A push is a work"; after A-294, A-618, A-638)
+
+- **What.** `SpecialKind::Gitlink { commit }` (`crates/merge/src/special.rs`): the commit of another repository a name
+  stands at, by the tool's id (git's 20 or 32 bytes). It is encoded as a FIFO's fields under kind byte 4, then the
+  id's length in one byte and its bytes. An empty id, or one past 32 bytes, is refused by kind; a short one as
+  truncated. No earlier encoding moved, and a test holds the FIFO's and a character device's bytes.
+- **The push.** A-618's `build` makes a submodule entry an `Mknod` of that node, with no owner, time or permission
+  bit, since git records none. A link moved to another commit is `Unlink` then `Mknod`, which the deriver composes
+  into one `Mknod`; a removed one is `Unlink`. A path changing to or from a link stays a typed `KindChanged` (GAPS
+  §8f), and `PushRefused::Submodule` is gone.
+- **Found on the way, fixed in the same change.**
+  - The build laid only file and attribute bytes in the post-state. The deriver places each `Mknod`'s node encoding
+    after them, and the engine reads it there, so any node a push made would have been refused as truncated. The build
+    now lays each node's encoding where the deriver placed it.
+  - The engine judged any difference of `SpecialKind` a type change, so a link moved to another commit was
+    `TypeChanged`. `SpecialKind::same_type` makes a link to any commit one type, since its commit is what it holds, as
+    a symbolic link's target is. Every other kind keeps its whole value, so A-294's renumbered device stays another
+    node. Two pushes moving one link apart from one base conflict `CreateCreate`; pushes that agree are accepted.
+- **Tests and runs.** Three encoding tests (`special/tests.rs`, new): the bytes laid out by hand at both id lengths,
+  every refusal, and the earlier kinds unchanged. In `push/tests.rs`:
+  - a link made, moved and removed, each held to the oracle;
+  - five paths changing kind, two of them to or from a link;
+  - two pushes moving one link from one base;
+  - the generated histories with links to two commits, the census requiring links made.
+
+  On the Mac Studio, 2026-11-19, the tests were red first: 5 of 96 failed against stubs. Next, 2 failed on the
+  engine's rule (`TypeChanged`). Then `cargo test -p slates-merge --lib` passed 97 of 97, and 104 of 104 merged with
+  main (A-643), with `slates-git --lib` 338 of 338 (2 ignored, main's); fmt was clean. Red four
+  ways by mutation: the whole-kind comparison (3 failed), no node bytes (4), an empty id taken (1), and a move without
+  its `Unlink` (3).
+- **Applied in the same change to:** `crates/merge/src/special.rs` (and `special/tests.rs`, new), `push.rs`,
+  `push/tests.rs`, `engine.rs` (`merge_special`), §4.17.2's status, GAPS §4.17.
+- **Owed.** A link's form in a volume and in a checkout: git checks a submodule out as an empty directory. The
+  server's paths from a volume's nodes to a green's (`merge_service`, `verbs`) never meet one, since a volume holds no
+  link yet.
 
 ### A-619 (part 2) — Mercurial's read serving, part 2: a `getbundle`'s answer, its bundle2 stream and changegroup over a store, held to three captured sessions of stock Mercurial 7.2 (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone" items 2 to 4, piece 4; §4.9; A-545, A-569, A-598, A-619 part 1)
 Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve::getbundle`, new: the

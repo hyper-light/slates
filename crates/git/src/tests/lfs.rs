@@ -64,6 +64,10 @@ pub(crate) struct Exchange {
   pub(crate) path: String,
   /// The query, without the `?`.
   pub(crate) query: String,
+  /// The request's `Content-Type`, when it sent one.
+  pub(crate) content_type: Option<String>,
+  /// The request's `Accept`, when it sent one.
+  pub(crate) accept: Option<String>,
   /// The request's body.
   pub(crate) request: String,
   /// The answer's status.
@@ -83,6 +87,8 @@ pub(crate) fn exchanges() -> Vec<Exchange> {
         method: entry["request"]["method"].as_str().unwrap().to_string(),
         path: entry["request"]["path"].as_str().unwrap().to_string(),
         query: entry["request"]["query"].as_str().unwrap().to_string(),
+        content_type: entry["request"]["content_type"].as_str().map(String::from),
+        accept: entry["request"]["accept"].as_str().map(String::from),
         request: text("request"),
         status: entry["response"]["status"].as_u64().unwrap(),
         response: text("response"),
