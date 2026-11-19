@@ -51,43 +51,103 @@ fn ranges_of(mergeinfo: &Mergeinfo, source: &str) -> Vec<MergeRange> {
 // ---------------------------------------------------------------------------------------------------------------------
 // Subversion's vectors: parsing and writing.
 
-/// A-605: `test_parse_single_line_mergeinfo` (`mergeinfo_vals`, `mergeinfo_paths`, `mergeinfo_ranges`): Subversion's 25 valid
-/// values each read to its one path and its ranges: unordered and overlapping ranges sorted and combined, colons in
-/// paths, relative and non-canonical paths made canonical.
+/// A-605: `test_parse_single_line_mergeinfo` (`mergeinfo_vals`, `mergeinfo_paths`, `mergeinfo_ranges`): Subversion's 25
+/// valid values each read to its one path and its ranges: unordered and overlapping ranges sorted and combined, colons
+/// in paths, relative and non-canonical paths made canonical.
 #[test]
 fn subversions_valid_values_read_to_its_paths_and_ranges() {
   let cases: [(&str, &str, &[(Revision, Revision, bool)]); 25] = [
     ("/trunk:1", "/trunk", &[(0, 1, true)]),
     ("/trunk/foo:1-6", "/trunk/foo", &[(0, 6, true)]),
-    ("/trunk: 5,7-9,10,11,13,14", "/trunk", &[(4, 5, true), (6, 11, true), (12, 14, true)]),
-    ("/trunk: 3-10,11*,13,14", "/trunk", &[(2, 10, true), (10, 11, false), (12, 14, true)]),
-    ("/branch: 1,2-18*,33*", "/branch", &[(0, 1, true), (1, 18, false), (32, 33, false)]),
-    ("patch-common::netasq-bpf.c:25381", "/patch-common::netasq-bpf.c", &[(25380, 25381, true)]),
-    ("patch-common_netasq-bpf.c::25381", "/patch-common_netasq-bpf.c:", &[(25380, 25381, true)]),
-    (":patch:common:netasq:bpf.c:25381", "/:patch:common:netasq:bpf.c", &[(25380, 25381, true)]),
+    (
+      "/trunk: 5,7-9,10,11,13,14",
+      "/trunk",
+      &[(4, 5, true), (6, 11, true), (12, 14, true)],
+    ),
+    (
+      "/trunk: 3-10,11*,13,14",
+      "/trunk",
+      &[(2, 10, true), (10, 11, false), (12, 14, true)],
+    ),
+    (
+      "/branch: 1,2-18*,33*",
+      "/branch",
+      &[(0, 1, true), (1, 18, false), (32, 33, false)],
+    ),
+    (
+      "patch-common::netasq-bpf.c:25381",
+      "/patch-common::netasq-bpf.c",
+      &[(25380, 25381, true)],
+    ),
+    (
+      "patch-common_netasq-bpf.c::25381",
+      "/patch-common_netasq-bpf.c:",
+      &[(25380, 25381, true)],
+    ),
+    (
+      ":patch:common:netasq:bpf.c:25381",
+      "/:patch:common:netasq:bpf.c",
+      &[(25380, 25381, true)],
+    ),
     (
       "/trunk:3-6,15,18,9,22",
       "/trunk",
-      &[(2, 6, true), (8, 9, true), (14, 15, true), (17, 18, true), (21, 22, true)],
+      &[
+        (2, 6, true),
+        (8, 9, true),
+        (14, 15, true),
+        (17, 18, true),
+        (21, 22, true),
+      ],
     ),
     ("/trunk:5,3", "/trunk", &[(2, 3, true), (4, 5, true)]),
     (
       "/trunk:3-6*,15*,18*,9,22*",
       "/trunk",
-      &[(2, 6, false), (8, 9, true), (14, 15, false), (17, 18, false), (21, 22, false)],
+      &[
+        (2, 6, false),
+        (8, 9, true),
+        (14, 15, false),
+        (17, 18, false),
+        (21, 22, false),
+      ],
     ),
     ("/trunk:5,3*", "/trunk", &[(2, 3, false), (4, 5, true)]),
-    ("/trunk:100,3-7,50,99,1-2", "/trunk", &[(0, 7, true), (49, 50, true), (98, 100, true)]),
-    ("/gunther_branch:5-10,7-12", "/gunther_branch", &[(4, 12, true)]),
-    ("/gunther_branch:5-10*,7-12*", "/gunther_branch", &[(4, 12, false)]),
+    (
+      "/trunk:100,3-7,50,99,1-2",
+      "/trunk",
+      &[(0, 7, true), (49, 50, true), (98, 100, true)],
+    ),
+    (
+      "/gunther_branch:5-10,7-12",
+      "/gunther_branch",
+      &[(4, 12, true)],
+    ),
+    (
+      "/gunther_branch:5-10*,7-12*",
+      "/gunther_branch",
+      &[(4, 12, false)],
+    ),
     (
       "/branches/branch1:43832-45742,49990-53669,43832-49987",
       "/branches/branch1",
       &[(43831, 49987, true), (49989, 53669, true)],
     ),
-    ("/gunther_branch:7-12,1,5-10", "/gunther_branch", &[(0, 1, true), (4, 12, true)]),
-    ("/gunther_branch:7-12*,1,5-10*", "/gunther_branch", &[(0, 1, true), (4, 12, false)]),
-    ("/b5:5-53,1-4,54-90*", "/b5", &[(0, 53, true), (53, 90, false)]),
+    (
+      "/gunther_branch:7-12,1,5-10",
+      "/gunther_branch",
+      &[(0, 1, true), (4, 12, true)],
+    ),
+    (
+      "/gunther_branch:7-12*,1,5-10*",
+      "/gunther_branch",
+      &[(0, 1, true), (4, 12, false)],
+    ),
+    (
+      "/b5:5-53,1-4,54-90*",
+      "/b5",
+      &[(0, 53, true), (53, 90, false)],
+    ),
     ("/c0:1-77,12-44", "/c0", &[(0, 77, true)]),
     ("/A/:7-8", "/A", &[(6, 8, true)]),
     ("/A///:7-8", "/A", &[(6, 8, true)]),
@@ -117,12 +177,14 @@ fn adjacent_revisions_of_one_kind_combine_into_one_range() {
 #[test]
 fn subversions_broken_values_are_refused_each_by_its_kind() {
   use MergeinfoRefusal as R;
-  let overlap = |first: (Revision, Revision, bool), second: (Revision, Revision, bool)| R::OverlappingInheritance {
-    at: 0,
-    overlap: RangeOverlap {
-      first: range(first.0, first.1, first.2),
-      second: range(second.0, second.1, second.2),
-    },
+  let overlap = |first: (Revision, Revision, bool), second: (Revision, Revision, bool)| {
+    R::OverlappingInheritance {
+      at: 0,
+      overlap: RangeOverlap {
+        first: range(first.0, first.1, first.2),
+        second: range(second.0, second.1, second.2),
+      },
+    }
   };
   let trailing = "/trunk: 5,7-9,10,11,13,14,";
   let cases: Vec<(&str, MergeinfoRefusal)> = vec![
@@ -145,20 +207,90 @@ fn subversions_broken_values_are_refused_each_by_its_kind() {
     ("/trunk:4*,4", overlap((3, 4, false), (3, 4, true))),
     ("/trunk:3-7*,4-23", overlap((2, 7, false), (3, 23, true))),
     ("/trunk:3-7,4-23*", overlap((2, 7, true), (3, 23, false))),
-    ("/trunk:22-20", R::ReversedRange { at: 7, first: 22, last: 20 }),
-    ("/trunk:22-20*", R::ReversedRange { at: 7, first: 22, last: 20 }),
-    ("/trunk:3,7-12,22-20,25", R::ReversedRange { at: 14, first: 22, last: 20 }),
-    ("/trunk:3,7,22-20*,25-30", R::ReversedRange { at: 11, first: 22, last: 20 }),
-    ("/trunk:22-22", R::SameStartAndEnd { at: 7, revision: 22 }),
-    ("/trunk:22-22*", R::SameStartAndEnd { at: 7, revision: 22 }),
-    ("/trunk:3,7-12,20-20,25", R::SameStartAndEnd { at: 14, revision: 20 }),
-    ("/trunk:3,7,20-20*,25-30", R::SameStartAndEnd { at: 11, revision: 20 }),
+    (
+      "/trunk:22-20",
+      R::ReversedRange {
+        at: 7,
+        first: 22,
+        last: 20,
+      },
+    ),
+    (
+      "/trunk:22-20*",
+      R::ReversedRange {
+        at: 7,
+        first: 22,
+        last: 20,
+      },
+    ),
+    (
+      "/trunk:3,7-12,22-20,25",
+      R::ReversedRange {
+        at: 14,
+        first: 22,
+        last: 20,
+      },
+    ),
+    (
+      "/trunk:3,7,22-20*,25-30",
+      R::ReversedRange {
+        at: 11,
+        first: 22,
+        last: 20,
+      },
+    ),
+    (
+      "/trunk:22-22",
+      R::SameStartAndEnd {
+        at: 7,
+        revision: 22,
+      },
+    ),
+    (
+      "/trunk:22-22*",
+      R::SameStartAndEnd {
+        at: 7,
+        revision: 22,
+      },
+    ),
+    (
+      "/trunk:3,7-12,20-20,25",
+      R::SameStartAndEnd {
+        at: 14,
+        revision: 20,
+      },
+    ),
+    (
+      "/trunk:3,7,20-20*,25-30",
+      R::SameStartAndEnd {
+        at: 11,
+        revision: 20,
+      },
+    ),
     ("/trunk:", R::NoRanges { at: 0 }),
     ("/trunk:2-9\n/branch:", R::NoRanges { at: 11 }),
     ("::", R::NoRanges { at: 0 }),
-    ("trunk:a-3", R::RevisionMissing { at: 6, negative: false }),
-    ("branch:3-four", R::RevisionMissing { at: 9, negative: false }),
-    ("trunk:yadayadayada", R::RevisionMissing { at: 6, negative: false }),
+    (
+      "trunk:a-3",
+      R::RevisionMissing {
+        at: 6,
+        negative: false,
+      },
+    ),
+    (
+      "branch:3-four",
+      R::RevisionMissing {
+        at: 9,
+        negative: false,
+      },
+    ),
+    (
+      "trunk:yadayadayada",
+      R::RevisionMissing {
+        at: 6,
+        negative: false,
+      },
+    ),
   ];
   assert_eq!(cases.len(), 26);
   for (value, refusal) in cases {
@@ -168,8 +300,8 @@ fn subversions_broken_values_are_refused_each_by_its_kind() {
   }
 }
 
-/// A-605: `test_rangelist_to_string` and `test_mergeinfo_to_string`: `mergeinfo1` written back in canonical form, its paths
-/// in order, and its relative keys written absolute.
+/// A-605: `test_rangelist_to_string` and `test_mergeinfo_to_string`: `mergeinfo1` written back in canonical form, its
+/// paths in order, and its relative keys written absolute.
 #[test]
 fn values_are_written_back_in_canonical_form() {
   let mergeinfo = parsed("/trunk: 3,5,7-9,10,11,13,14\n/fred:8-10");
@@ -182,8 +314,8 @@ fn values_are_written_back_in_canonical_form() {
   assert_eq!(relative.to_bytes(), b"/fred:8-10\n/trunk:3,5,7-11,13-14");
 }
 
-/// A-605: `svn_path_compare_paths` orders the written lines: a separator before any other byte, so `/a/b` precedes `/a-b`
-/// and `/a!`, which byte order would put first, and a path precedes its children.
+/// A-605: `svn_path_compare_paths` orders the written lines: a separator before any other byte, so `/a/b` precedes
+/// `/a-b` and `/a!`, which byte order would put first, and a path precedes its children.
 #[test]
 fn written_paths_follow_subversions_path_order() {
   let mergeinfo = parsed("/a-b:1\n/a!:2\n/a/b:3\n/a:4\n/ab:5\n/:6");
@@ -196,7 +328,8 @@ fn written_paths_follow_subversions_path_order() {
 // ---------------------------------------------------------------------------------------------------------------------
 // Subversion's vectors: the algebra.
 
-/// A-605: `test_diff_mergeinfo`: on `/trunk`, 7, 9, 11 and 33-34 deleted and 2, 5-6, 13-16 and 30 added, inheritance ignored.
+/// A-605: `test_diff_mergeinfo`: on `/trunk`, 7, 9, 11 and 33-34 deleted and 2, 5-6, 13-16 and 30 added, inheritance
+/// ignored.
 #[test]
 fn a_mergeinfo_difference_names_what_was_deleted_and_added() {
   let from = parsed("/trunk: 1,3-4,7,9,11-12,31-34");
@@ -219,12 +352,46 @@ fn a_mergeinfo_difference_names_what_was_deleted_and_added() {
 fn range_lists_intersect_as_subversion_intersects_them() {
   let first = list("1-6,12-16,30-32*,40-42");
   let second = list("1,3-4*,7,9,11-12,31-34*,38-44");
-  let considering = ranges(&[(0, 1, true), (11, 12, true), (30, 32, false), (39, 42, true)]);
-  let ignoring = ranges(&[(0, 1, true), (2, 4, true), (11, 12, true), (30, 32, false), (39, 42, true)]);
+  let considering = ranges(&[
+    (0, 1, true),
+    (11, 12, true),
+    (30, 32, false),
+    (39, 42, true),
+  ]);
+  let ignoring = ranges(&[
+    (0, 1, true),
+    (2, 4, true),
+    (11, 12, true),
+    (30, 32, false),
+    (39, 42, true),
+  ]);
   for (one, other) in [(&first, &second), (&second, &first)] {
-    assert_eq!(one.intersect(other, Compare::WithInheritance).ranges(), considering);
-    assert_eq!(one.intersect(other, Compare::WithoutInheritance).ranges(), ignoring);
+    assert_eq!(
+      one.intersect(other, Compare::WithInheritance).ranges(),
+      considering
+    );
+    assert_eq!(
+      one.intersect(other, Compare::WithoutInheritance).ranges(),
+      ignoring
+    );
   }
+}
+
+/// A-605: Subversion's walk with inheritance compared is not exact per revision, and this one must not be either: it
+/// passes `1-10` at `3-4*`, a range of the other kind that sorts after it, so `1-10` and `3-4*,5-6` share nothing and
+/// removing `3-4*,5-6` from `1-10` removes nothing, though `5-6` is inheritable in both (`rangelist_intersect_or_remove`,
+/// traced by hand; module documentation). Ignoring inheritance, the same lists share `3-6`.
+#[test]
+fn subversions_walk_passes_a_range_at_one_of_another_kind() {
+  let whole = list("1-10");
+  let mixed = list("3-4*,5-6");
+  assert!(whole.intersect(&mixed, Compare::WithInheritance).is_empty());
+  assert!(mixed.intersect(&whole, Compare::WithInheritance).is_empty());
+  assert_eq!(whole.remove(&mixed, Compare::WithInheritance), whole);
+  assert_eq!(
+    whole.intersect(&mixed, Compare::WithoutInheritance).to_bytes(),
+    b"3-6"
+  );
 }
 
 /// A-605: `test_mergeinfo_intersect`: only the source both hold survives, intersected with inheritance considered.
@@ -240,18 +407,38 @@ fn mergeinfo_intersects_by_source() {
   );
 }
 
-/// A-605: `test_merge_mergeinfo`: Subversion's twelve merges of two values, each source's ranges as its table gives them, and
-/// the changes merged in left as they were.
+/// A-605: `test_merge_mergeinfo`: Subversion's twelve merges of two values, each source's ranges as its table gives
+/// them, and the changes merged in left as they were.
 #[test]
 fn mergeinfo_merges_as_subversion_merges_it() {
   type Expected<'a> = &'a [(&'a str, &'a [(Revision, Revision, bool)])];
   let cases: [(&str, &str, Expected<'_>); 12] = [
     ("/trunk: 5-10", "/trunk: 6", &[("/trunk", &[(4, 10, true)])]),
-    ("/trunk: 5-10*", "/trunk: 6*", &[("/trunk", &[(4, 10, false)])]),
-    ("/trunk: 5-10", "/trunk: 6*", &[("/trunk", &[(4, 10, true)])]),
-    ("/trunk: 5-10*", "/trunk: 6", &[("/trunk", &[(4, 5, false), (5, 6, true), (6, 10, false)])]),
-    ("/trunk: 1,3,5-11,13", "/trunk: 2,4,12,14-22", &[("/trunk", &[(0, 22, true)])]),
-    ("/trunk: 1*,3*,5-11*,13*", "/trunk: 2*,4*,12*,14-22*", &[("/trunk", &[(0, 22, false)])]),
+    (
+      "/trunk: 5-10*",
+      "/trunk: 6*",
+      &[("/trunk", &[(4, 10, false)])],
+    ),
+    (
+      "/trunk: 5-10",
+      "/trunk: 6*",
+      &[("/trunk", &[(4, 10, true)])],
+    ),
+    (
+      "/trunk: 5-10*",
+      "/trunk: 6",
+      &[("/trunk", &[(4, 5, false), (5, 6, true), (6, 10, false)])],
+    ),
+    (
+      "/trunk: 1,3,5-11,13",
+      "/trunk: 2,4,12,14-22",
+      &[("/trunk", &[(0, 22, true)])],
+    ),
+    (
+      "/trunk: 1*,3*,5-11*,13*",
+      "/trunk: 2*,4*,12*,14-22*",
+      &[("/trunk", &[(0, 22, false)])],
+    ),
     (
       "/trunk: 1*,3*,5-11*,13*",
       "/trunk: 2,4,12,14-22",
@@ -289,12 +476,18 @@ fn mergeinfo_merges_as_subversion_merges_it() {
     (
       "/trunk::1: 3,5,7-9,10,11,13,14\n/fred:8-10",
       "/trunk::1: 1-4,6\n/fred:9-12",
-      &[("/trunk::1", &[(0, 11, true), (12, 14, true)]), ("/fred", &[(7, 12, true)])],
+      &[
+        ("/trunk::1", &[(0, 11, true), (12, 14, true)]),
+        ("/fred", &[(7, 12, true)]),
+      ],
     ),
     (
       "/trunk: 3*,5*,7-9*,10*,11*,13*,14*\n/fred:8-10*",
       "/trunk: 1-4*,6*\n/fred:9-12*",
-      &[("/trunk", &[(0, 11, false), (12, 14, false)]), ("/fred", &[(7, 12, false)])],
+      &[
+        ("/trunk", &[(0, 11, false), (12, 14, false)]),
+        ("/fred", &[(7, 12, false)]),
+      ],
     ),
     (
       "/trunk: 3,5*,7-9,10,11*,13,14\n/fred:8-10",
@@ -302,7 +495,13 @@ fn mergeinfo_merges_as_subversion_merges_it() {
       &[
         (
           "/trunk",
-          &[(0, 4, true), (4, 5, false), (5, 10, true), (10, 11, false), (12, 14, true)],
+          &[
+            (0, 4, true),
+            (4, 5, false),
+            (5, 10, true),
+            (10, 11, false),
+            (12, 14, true),
+          ],
         ),
         ("/fred", &[(7, 10, true), (10, 12, false)]),
       ],
@@ -324,7 +523,11 @@ fn mergeinfo_merges_as_subversion_merges_it() {
     let merged = parsed(first).merge(&changes);
     assert_eq!(merged.len(), expected.len(), "{first:?} + {second:?}");
     for (source, triples) in expected {
-      assert_eq!(ranges_of(&merged, source), ranges(triples), "{first:?} + {second:?}");
+      assert_eq!(
+        ranges_of(&merged, source),
+        ranges(triples),
+        "{first:?} + {second:?}"
+      );
     }
     assert_eq!(changes.to_bytes(), before);
   }
@@ -335,32 +538,101 @@ fn mergeinfo_merges_as_subversion_merges_it() {
 fn range_lists_remove_as_subversion_removes_them() {
   type Triples<'a> = &'a [(Revision, Revision, bool)];
   let cases: [(&str, &str, Triples<'_>, Triples<'_>); 15] = [
-    ("1-44", "5", &[(0, 4, true), (5, 44, true)], &[(0, 4, true), (5, 44, true)]),
-    ("1-44*", "5", &[(0, 44, false)], &[(0, 4, false), (5, 44, false)]),
-    ("1-44", "5*", &[(0, 44, true)], &[(0, 4, true), (5, 44, true)]),
-    ("1-44*", "5*", &[(0, 4, false), (5, 44, false)], &[(0, 4, false), (5, 44, false)]),
-    ("2-9,14-19", "12", &[(1, 9, true), (13, 19, true)], &[(1, 9, true), (13, 19, true)]),
-    ("2-9*,14-19*", "12", &[(1, 9, false), (13, 19, false)], &[(1, 9, false), (13, 19, false)]),
-    ("2-9,14-19", "12*", &[(1, 9, true), (13, 19, true)], &[(1, 9, true), (13, 19, true)]),
-    ("2-9*,14-19*", "12*", &[(1, 9, false), (13, 19, false)], &[(1, 9, false), (13, 19, false)]),
-    ("1,9-17", "12-20", &[(0, 1, true), (8, 11, true)], &[(0, 1, true), (8, 11, true)]),
-    ("1,9-17*", "12-20", &[(0, 1, true), (8, 17, false)], &[(0, 1, true), (8, 11, false)]),
-    ("1,9-17", "12-20*", &[(0, 1, true), (8, 17, true)], &[(0, 1, true), (8, 11, true)]),
-    ("1,9-17*", "12-20*", &[(0, 1, true), (8, 11, false)], &[(0, 1, true), (8, 11, false)]),
+    (
+      "1-44",
+      "5",
+      &[(0, 4, true), (5, 44, true)],
+      &[(0, 4, true), (5, 44, true)],
+    ),
+    (
+      "1-44*",
+      "5",
+      &[(0, 44, false)],
+      &[(0, 4, false), (5, 44, false)],
+    ),
+    (
+      "1-44",
+      "5*",
+      &[(0, 44, true)],
+      &[(0, 4, true), (5, 44, true)],
+    ),
+    (
+      "1-44*",
+      "5*",
+      &[(0, 4, false), (5, 44, false)],
+      &[(0, 4, false), (5, 44, false)],
+    ),
+    (
+      "2-9,14-19",
+      "12",
+      &[(1, 9, true), (13, 19, true)],
+      &[(1, 9, true), (13, 19, true)],
+    ),
+    (
+      "2-9*,14-19*",
+      "12",
+      &[(1, 9, false), (13, 19, false)],
+      &[(1, 9, false), (13, 19, false)],
+    ),
+    (
+      "2-9,14-19",
+      "12*",
+      &[(1, 9, true), (13, 19, true)],
+      &[(1, 9, true), (13, 19, true)],
+    ),
+    (
+      "2-9*,14-19*",
+      "12*",
+      &[(1, 9, false), (13, 19, false)],
+      &[(1, 9, false), (13, 19, false)],
+    ),
+    (
+      "1,9-17",
+      "12-20",
+      &[(0, 1, true), (8, 11, true)],
+      &[(0, 1, true), (8, 11, true)],
+    ),
+    (
+      "1,9-17*",
+      "12-20",
+      &[(0, 1, true), (8, 17, false)],
+      &[(0, 1, true), (8, 11, false)],
+    ),
+    (
+      "1,9-17",
+      "12-20*",
+      &[(0, 1, true), (8, 17, true)],
+      &[(0, 1, true), (8, 11, true)],
+    ),
+    (
+      "1,9-17*",
+      "12-20*",
+      &[(0, 1, true), (8, 11, false)],
+      &[(0, 1, true), (8, 11, false)],
+    ),
     ("", "", &[], &[]),
     ("", "5-8,10-100", &[], &[]),
-    ("5-8,10-100", "", &[(4, 8, true), (9, 100, true)], &[(4, 8, true), (9, 100, true)]),
+    (
+      "5-8,10-100",
+      "",
+      &[(4, 8, true), (9, 100, true)],
+      &[(4, 8, true), (9, 100, true)],
+    ),
   ];
   for (whiteboard, eraser, considering, ignoring) in cases {
     let (whiteboard, eraser) = (list(whiteboard), list(eraser));
     let (white_before, eraser_before) = (whiteboard.clone(), eraser.clone());
     assert_eq!(
-      whiteboard.remove(&eraser, Compare::WithInheritance).ranges(),
+      whiteboard
+        .remove(&eraser, Compare::WithInheritance)
+        .ranges(),
       ranges(considering),
       "{whiteboard:?} - {eraser:?}"
     );
     assert_eq!(
-      whiteboard.remove(&eraser, Compare::WithoutInheritance).ranges(),
+      whiteboard
+        .remove(&eraser, Compare::WithoutInheritance)
+        .ranges(),
       ranges(ignoring),
       "{whiteboard:?} - {eraser:?}"
     );
@@ -415,12 +687,20 @@ fn range_lists_merge_as_subversion_merges_them() {
     ("44-77", "5-77*", &[(4, 43, false), (43, 77, true)]),
     ("44-77*", "5-77*", &[(4, 77, false)]),
     ("12-24", "20-23", &[(11, 24, true)]),
-    ("12-24*", "20-23", &[(11, 19, false), (19, 23, true), (23, 24, false)]),
+    (
+      "12-24*",
+      "20-23",
+      &[(11, 19, false), (19, 23, true), (23, 24, false)],
+    ),
     ("12-24", "20-23*", &[(11, 24, true)]),
     ("12-24*", "20-23*", &[(11, 24, false)]),
     ("20-23", "12-24", &[(11, 24, true)]),
     ("20-23*", "12-24", &[(11, 24, true)]),
-    ("20-23", "12-24*", &[(11, 19, false), (19, 23, true), (23, 24, false)]),
+    (
+      "20-23",
+      "12-24*",
+      &[(11, 19, false), (19, 23, true), (23, 24, false)],
+    ),
     ("20-23*", "12-24*", &[(11, 24, false)]),
     ("50-73", "60-99", &[(49, 99, true)]),
     ("50-73*", "60-99", &[(49, 59, false), (59, 99, true)]),
@@ -435,7 +715,14 @@ fn range_lists_merge_as_subversion_merges_them() {
     (
       "1-5,7,12-13",
       "2-17*",
-      &[(0, 5, true), (5, 6, false), (6, 7, true), (7, 11, false), (11, 13, true), (13, 17, false)],
+      &[
+        (0, 5, true),
+        (5, 6, false),
+        (6, 7, true),
+        (7, 11, false),
+        (11, 13, true),
+        (13, 17, false),
+      ],
     ),
     ("1-5*,7*,12-13*", "2-17", &[(0, 1, false), (1, 17, true)]),
     ("2-17", "1-5,7,12-13", &[(0, 17, true)]),
@@ -443,18 +730,37 @@ fn range_lists_merge_as_subversion_merges_them() {
     (
       "2-17*",
       "1-5,7,12-13",
-      &[(0, 5, true), (5, 6, false), (6, 7, true), (7, 11, false), (11, 13, true), (13, 17, false)],
+      &[
+        (0, 5, true),
+        (5, 6, false),
+        (6, 7, true),
+        (7, 11, false),
+        (11, 13, true),
+        (13, 17, false),
+      ],
     ),
     ("2-17", "1-5*,7*,12-13*", &[(0, 1, false), (1, 17, true)]),
     (
       "3-4*,10-15,20",
       "5-60*",
-      &[(2, 9, false), (9, 15, true), (15, 19, false), (19, 20, true), (20, 60, false)],
+      &[
+        (2, 9, false),
+        (9, 15, true),
+        (15, 19, false),
+        (19, 20, true),
+        (20, 60, false),
+      ],
     ),
     (
       "5-60*",
       "3-4*,10-15,20",
-      &[(2, 9, false), (9, 15, true), (15, 19, false), (19, 20, true), (20, 60, false)],
+      &[
+        (2, 9, false),
+        (9, 15, true),
+        (15, 19, false),
+        (19, 20, true),
+        (20, 60, false),
+      ],
     ),
     ("3-4*,50-100*", "5-60*", &[(2, 100, false)]),
     ("5-60*", "3-4*,50-100*", &[(2, 100, false)]),
@@ -465,14 +771,27 @@ fn range_lists_merge_as_subversion_merges_them() {
     (
       "5,9,11-15,17,200-300,999",
       "7-50",
-      &[(4, 5, true), (6, 50, true), (199, 300, true), (998, 999, true)],
+      &[
+        (4, 5, true),
+        (6, 50, true),
+        (199, 300, true),
+        (998, 999, true),
+      ],
     ),
     ("1-44,45,46,47-50", "", &[(0, 50, true)]),
     ("1,2,3,4,5,6,7,8", "", &[(0, 8, true)]),
-    ("6-10,12-13,14,15,16-22", "", &[(5, 10, true), (11, 22, true)]),
+    (
+      "6-10,12-13,14,15,16-22",
+      "",
+      &[(5, 10, true), (11, 22, true)],
+    ),
     ("", "1-44,45,46,47-50", &[(0, 50, true)]),
     ("", "1,2,3,4,5,6,7,8", &[(0, 8, true)]),
-    ("", "6-10,12-13,14,15,16-22", &[(5, 10, true), (11, 22, true)]),
+    (
+      "",
+      "6-10,12-13,14,15,16-22",
+      &[(5, 10, true), (11, 22, true)],
+    ),
     ("", "", &[]),
   ];
   for (first, second, expected) in cases {
@@ -489,8 +808,22 @@ fn range_lists_merge_as_subversion_merges_them() {
 #[test]
 fn range_lists_differ_as_subversion_differs_them() {
   type Triples<'a> = &'a [(Revision, Revision, bool)];
-  let cases: [(&str, &str, Triples<'_>, Triples<'_>, Triples<'_>, Triples<'_>); 16] = [
-    ("1", "3", &[(2, 3, true)], &[(0, 1, true)], &[(2, 3, true)], &[(0, 1, true)]),
+  let cases: [(
+    &str,
+    &str,
+    Triples<'_>,
+    Triples<'_>,
+    Triples<'_>,
+    Triples<'_>,
+  ); 16] = [
+    (
+      "1",
+      "3",
+      &[(2, 3, true)],
+      &[(0, 1, true)],
+      &[(2, 3, true)],
+      &[(0, 1, true)],
+    ),
     ("1", "1,3", &[(2, 3, true)], &[], &[(2, 3, true)], &[]),
     ("1,3", "1", &[], &[(2, 3, true)], &[], &[(2, 3, true)]),
     ("1,3", "1,3", &[], &[], &[], &[]),
@@ -531,11 +864,27 @@ fn range_lists_differ_as_subversion_differs_them() {
   for (from, to, added, deleted, added_ignoring, deleted_ignoring) in cases {
     let (from, to) = (list(from), list(to));
     let considering = from.diff(&to, Compare::WithInheritance);
-    assert_eq!(considering.added.ranges(), ranges(added), "{from:?} -> {to:?}");
-    assert_eq!(considering.deleted.ranges(), ranges(deleted), "{from:?} -> {to:?}");
+    assert_eq!(
+      considering.added.ranges(),
+      ranges(added),
+      "{from:?} -> {to:?}"
+    );
+    assert_eq!(
+      considering.deleted.ranges(),
+      ranges(deleted),
+      "{from:?} -> {to:?}"
+    );
     let ignoring = from.diff(&to, Compare::WithoutInheritance);
-    assert_eq!(ignoring.added.ranges(), ranges(added_ignoring), "{from:?} -> {to:?}");
-    assert_eq!(ignoring.deleted.ranges(), ranges(deleted_ignoring), "{from:?} -> {to:?}");
+    assert_eq!(
+      ignoring.added.ranges(),
+      ranges(added_ignoring),
+      "{from:?} -> {to:?}"
+    );
+    assert_eq!(
+      ignoring.deleted.ranges(),
+      ranges(deleted_ignoring),
+      "{from:?} -> {to:?}"
+    );
   }
 }
 
@@ -545,7 +894,11 @@ fn range_lists_differ_as_subversion_differs_them() {
 #[test]
 fn the_merges_subversion_once_got_wrong_give_its_fixed_results() {
   let cases = [
-    ("19473-19612*,19615-19630*,19631-19634", "15014-20515*", "15014-19630*,19631-19634,19635-20515*"),
+    (
+      "19473-19612*,19615-19630*,19631-19634",
+      "15014-20515*",
+      "15014-19630*,19631-19634,19635-20515*",
+    ),
     ("8-10", "5-10*,11-24", "5-7*,8-24"),
     ("2*,4*,6*,8", "1-9*,11", "1-7*,8,9*,11"),
   ];
@@ -568,11 +921,18 @@ fn the_merges_subversion_once_got_wrong_give_its_fixed_results() {
   );
   let merged = reported.merge(&list("1035435-1050066*,1052459-1054617"));
   assert!(merged.is_canonical());
-  assert_eq!(covers(&merged, 1_060_000), merged_covers(&reported, &list("1035435-1050066*,1052459-1054617"), 1_060_000));
+  assert_eq!(
+    covers(&merged, 1_060_000),
+    merged_covers(
+      &reported,
+      &list("1035435-1050066*,1052459-1054617"),
+      1_060_000
+    )
+  );
 }
 
-/// A-605: `test_rangelist_loop`: every single range over revisions 0 to 62, of either kind, merged with Subversion's base list
-/// in both orders gives a canonical list; and, which Subversion's test leaves to do, the per-revision union.
+/// A-605: `test_rangelist_loop`: every single range over revisions 0 to 62, of either kind, merged with Subversion's
+/// base list in both orders gives a canonical list; and, which Subversion's test leaves to do, the per-revision union.
 #[test]
 fn every_single_range_merges_with_a_mixed_list_canonically() {
   let base = list("2,4,7-9,12-15,18-20,22*,25*,28-30*,33-35*,38-40,43-45*,48-50,52-54,56-59*");
@@ -592,13 +952,19 @@ fn every_single_range_merges_with_a_mixed_list_canonically() {
 // ---------------------------------------------------------------------------------------------------------------------
 // The parser beyond Subversion's tables.
 
-/// A-605: A revision is decimal digits alone, at most ten, at most 2^31 - 1, never 0, as `svn_revnum_parse` reads it: no
-/// sign and no space, so `5, 7` is refused where the line's first space is skipped.
+/// A-605: A revision is decimal digits alone, at most ten, at most 2^31 - 1, never 0, as `svn_revnum_parse` reads it:
+/// no sign and no space, so `5, 7` is refused where the line's first space is skipped.
 #[test]
 fn revisions_are_read_as_svn_revnum_parse_reads_them() {
   use MergeinfoRefusal as R;
-  assert_eq!(ranges_of(&parsed("/a:2147483647"), "/a"), ranges(&[(2_147_483_646, 2_147_483_647, true)]));
-  assert_eq!(ranges_of(&parsed("/a:0000000007"), "/a"), ranges(&[(6, 7, true)]));
+  assert_eq!(
+    ranges_of(&parsed("/a:2147483647"), "/a"),
+    ranges(&[(2_147_483_646, 2_147_483_647, true)])
+  );
+  assert_eq!(
+    ranges_of(&parsed("/a:0000000007"), "/a"),
+    ranges(&[(6, 7, true)])
+  );
   let refused = [
     ("/a:2147483648", R::RevisionTooLarge { at: 3 }),
     ("/a:3000000000", R::RevisionTooLarge { at: 3 }),
@@ -606,20 +972,54 @@ fn revisions_are_read_as_svn_revnum_parse_reads_them() {
     ("/a:00000000007", R::RevisionTooLong { at: 3 }),
     ("/a:0", R::RevisionZero { at: 3 }),
     ("/a:0-5", R::RevisionZero { at: 3 }),
-    ("/a:-5", R::RevisionMissing { at: 3, negative: true }),
-    ("/a:+5", R::RevisionMissing { at: 3, negative: false }),
-    ("/a:5, 7", R::RevisionMissing { at: 5, negative: false }),
-    ("/a:5- 7", R::RevisionMissing { at: 5, negative: false }),
-    ("/a:5-\n7", R::RevisionMissing { at: 5, negative: false }),
+    (
+      "/a:-5",
+      R::RevisionMissing {
+        at: 3,
+        negative: true,
+      },
+    ),
+    (
+      "/a:+5",
+      R::RevisionMissing {
+        at: 3,
+        negative: false,
+      },
+    ),
+    (
+      "/a:5, 7",
+      R::RevisionMissing {
+        at: 5,
+        negative: false,
+      },
+    ),
+    (
+      "/a:5- 7",
+      R::RevisionMissing {
+        at: 5,
+        negative: false,
+      },
+    ),
+    (
+      "/a:5-\n7",
+      R::RevisionMissing {
+        at: 5,
+        negative: false,
+      },
+    ),
     ("/a:1-2147483648", R::RevisionTooLarge { at: 5 }),
   ];
   for (value, refusal) in refused {
-    assert_eq!(Mergeinfo::parse(value.as_bytes()), Err(refusal), "{value:?}");
+    assert_eq!(
+      Mergeinfo::parse(value.as_bytes()),
+      Err(refusal),
+      "{value:?}"
+    );
   }
 }
 
-/// A-605: What may end a range: a comma, a `*`, the line's newline or the value's end; anything else is refused with the
-/// message for where it stands, after a revision or after a range.
+/// A-605: What may end a range: a comma, a `*`, the line's newline or the value's end; anything else is refused with
+/// the message for where it stands, after a revision or after a range.
 #[test]
 fn a_byte_where_a_range_must_end_is_refused_by_where_it_stands() {
   use MergeinfoRefusal as R;
@@ -635,34 +1035,47 @@ fn a_byte_where_a_range_must_end_is_refused_by_where_it_stands() {
     ("/a:1\r", invalid(4, b'\r', InvalidAfter::Revision)),
   ];
   for (value, refusal) in cases {
-    assert_eq!(Mergeinfo::parse(value.as_bytes()), Err(refusal), "{value:?}");
+    assert_eq!(
+      Mergeinfo::parse(value.as_bytes()),
+      Err(refusal),
+      "{value:?}"
+    );
   }
 }
 
-/// A-605: The grammar's edges as `parse_rangelist` and `parse_top` draw them: a comma before a newline is accepted, at the
-/// value's end refused; one trailing newline is accepted, an empty line refused; the C locale's spaces after a colon
-/// skipped; the empty value is empty mergeinfo; a path named twice has its ranges merged, inheritable winning where
-/// they overlap (issue #3547's `trunk` and `/trunk`).
+/// A-605: The grammar's edges as `parse_rangelist` and `parse_top` draw them: a comma before a newline is accepted, at
+/// the value's end refused; one trailing newline is accepted, an empty line refused; the C locale's spaces after a
+/// colon skipped; the empty value is empty mergeinfo; a path named twice has its ranges merged, inheritable winning
+/// where they overlap (issue #3547's `trunk` and `/trunk`).
 #[test]
 fn the_grammar_edges_fall_where_subversions_parser_draws_them() {
   use MergeinfoRefusal as R;
   assert_eq!(parsed("/a:1,\n/b:2").to_bytes(), b"/a:1\n/b:2");
-  assert_eq!(Mergeinfo::parse(b"/a:1,"), Err(R::RangeListUnterminated { at: 5 }));
+  assert_eq!(
+    Mergeinfo::parse(b"/a:1,"),
+    Err(R::RangeListUnterminated { at: 5 })
+  );
   assert_eq!(parsed("/a:1\n").to_bytes(), b"/a:1");
-  assert_eq!(Mergeinfo::parse(b"/a:1\n\n"), Err(R::PathNotTerminated { at: 5 }));
+  assert_eq!(
+    Mergeinfo::parse(b"/a:1\n\n"),
+    Err(R::PathNotTerminated { at: 5 })
+  );
   assert_eq!(Mergeinfo::parse(b"\n"), Err(R::PathNotTerminated { at: 0 }));
   assert_eq!(Mergeinfo::parse(b"/a: \n/b:1"), Err(R::NoRanges { at: 0 }));
   assert_eq!(parsed("/a:\t\x0b\x0c\r 5").to_bytes(), b"/a:5");
   assert_eq!(parsed(""), Mergeinfo::default());
   assert!(parsed("").is_empty());
-  assert_eq!(parsed("trunk:4033\n/trunk:4039-4995").to_bytes(), b"/trunk:4033,4039-4995");
+  assert_eq!(
+    parsed("trunk:4033\n/trunk:4039-4995").to_bytes(),
+    b"/trunk:4033,4039-4995"
+  );
   assert_eq!(parsed("/a:1-5\n/a:3*").to_bytes(), b"/a:1-5");
   assert_eq!(parsed("/a:3*\n/a:1-5*").to_bytes(), b"/a:1-5*");
   assert_eq!(parsed("/a/../b/./:1").to_bytes(), b"/a/../b:1");
 }
 
-/// A-605: The value is a C string: a parse reads to its first NUL, as `svn_mergeinfo_parse` reads a `const char *`; a commit's
-/// check refuses the NUL first (`verify_mergeinfo`, "unexpected string terminator").
+/// A-605: The value is a C string: a parse reads to its first NUL, as `svn_mergeinfo_parse` reads a `const char *`; a
+/// commit's check refuses the NUL first (`verify_mergeinfo`, "unexpected string terminator").
 #[test]
 fn a_nul_ends_a_read_and_is_refused_at_commit() {
   let value = b"/a:1\0/b:garbage";
@@ -671,7 +1084,10 @@ fn a_nul_ends_a_read_and_is_refused_at_commit() {
     Mergeinfo::verify(value),
     Err(MergeinfoRefusal::Terminator { at: 4 })
   );
-  assert_eq!(Mergeinfo::verify(b"/a:1-3*").unwrap().to_bytes(), b"/a:1-3*");
+  assert_eq!(
+    Mergeinfo::verify(b"/a:1-3*").unwrap().to_bytes(),
+    b"/a:1-3*"
+  );
   assert_eq!(
     Mergeinfo::verify(b"/a:0"),
     Err(MergeinfoRefusal::RevisionZero { at: 3 })
@@ -696,7 +1112,8 @@ fn covers(list: &RangeList, span: u64) -> Vec<u8> {
   let mut covers = vec![NONE; usize::try_from(span).unwrap()];
   for range in list.ranges() {
     for revision in range.start() + 1..=range.end() {
-      covers[usize::try_from(revision - 1).unwrap()] = if range.inheritable() { WHOLE } else { PARTIAL };
+      covers[usize::try_from(revision - 1).unwrap()] =
+        if range.inheritable() { WHOLE } else { PARTIAL };
     }
   }
   covers
@@ -752,6 +1169,28 @@ fn kinds_join_touching_pieces(list: &RangeList, sources: &[&[u8]]) -> bool {
   })
 }
 
+/// Inheritable covers where `keep` holds of the two lists' covers, none elsewhere.
+fn pointwise(first: &[u8], second: &[u8], keep: impl Fn(u8, u8) -> bool) -> Vec<u8> {
+  first
+    .iter()
+    .zip(second)
+    .map(|(&one, &other)| if keep(one, other) { WHOLE } else { NONE })
+    .collect()
+}
+
+/// Up to three sources, among them a root, a colon and two paths ordered differently by bytes and by path, each with
+/// covers.
+fn sources_strategy() -> impl Strategy<Value = BTreeMap<&'static str, Vec<u8>>> {
+  let source = prop_oneof![
+    Just("/trunk"),
+    Just("/a-b"),
+    Just("/a/b"),
+    Just("/"),
+    Just("/x:y")
+  ];
+  prop::collection::btree_map(source, cover_strategy(), 0..4)
+}
+
 /// The span of every model list.
 fn span() -> u64 {
   u64::try_from(MODEL_REVISIONS).unwrap()
@@ -776,9 +1215,9 @@ proptest! {
   #[test]
   fn inheritable_lists_intersect_and_remove_as_sets(first in whole_strategy(), second in whole_strategy()) {
     let (one, other) = (from_covers(&first), from_covers(&second));
-    let both: Vec<u8> = first.iter().zip(&second).map(|(&a, &b)| if a == WHOLE && b == WHOLE { WHOLE } else { NONE }).collect();
-    let less: Vec<u8> = first.iter().zip(&second).map(|(&a, &b)| if a == WHOLE && b == NONE { WHOLE } else { NONE }).collect();
-    let more: Vec<u8> = first.iter().zip(&second).map(|(&a, &b)| if b == WHOLE && a == NONE { WHOLE } else { NONE }).collect();
+    let both = pointwise(&first, &second, |one, other| one == WHOLE && other == WHOLE);
+    let less = pointwise(&first, &second, |one, other| one == WHOLE && other == NONE);
+    let more = pointwise(&first, &second, |one, other| other == WHOLE && one == NONE);
     for compare in [Compare::WithInheritance, Compare::WithoutInheritance] {
       prop_assert_eq!(one.intersect(&other, compare), from_covers(&both));
       prop_assert_eq!(one.remove(&other, compare), from_covers(&less));
@@ -788,9 +1227,10 @@ proptest! {
     }
   }
 
-  /// A-605: Without inheritance the walk is positional: an intersection holds the revisions both hold and a removal those the
-  /// eraser lacks, canonical, each range inheritable exactly when a revision of it is in either list (touching pieces
-  /// joined by `combine_with_lastrange`); and two lists are equal exactly when they hold the same revisions.
+  /// A-605: Without inheritance the walk is positional: an intersection holds the revisions both hold and a removal
+  /// those the eraser lacks, canonical, each range inheritable exactly when a revision of it is in either list
+  /// (touching pieces joined by `combine_with_lastrange`); and two lists are equal exactly when they hold the same
+  /// revisions.
   #[test]
   fn without_inheritance_lists_meet_by_revision(first in cover_strategy(), second in cover_strategy()) {
     let (one, other) = (from_covers(&first), from_covers(&second));
@@ -813,9 +1253,10 @@ proptest! {
     prop_assert_eq!(equal, held(&first) == held(&second));
   }
 
-  /// A-605: With inheritance compared, Subversion's walk is not exact per revision (it may pass a range at one of another kind,
-  /// module documentation), but it is bounded: an intersection holds only revisions both hold with one kind, of that
-  /// kind; a removal keeps every revision the eraser holds with another kind or not at all, and adds none.
+  /// A-605: With inheritance compared, Subversion's walk is not exact per revision (it may pass a range at one of
+  /// another kind, module documentation), but it is bounded: an intersection holds only revisions both hold with one
+  /// kind, of that kind; a removal keeps every revision the eraser holds with another kind or not at all, and adds
+  /// none.
   #[test]
   fn with_inheritance_lists_meet_within_the_per_revision_bounds(first in cover_strategy(), second in cover_strategy()) {
     let (one, other) = (from_covers(&first), from_covers(&second));
@@ -836,7 +1277,7 @@ proptest! {
   /// A-605: A canonical value written and read again is itself, and writing is stable.
   #[test]
   fn a_written_value_reads_back_as_itself(
-    sources in prop::collection::btree_map(prop_oneof![Just("/trunk"), Just("/a-b"), Just("/a/b"), Just("/"), Just("/x:y")], cover_strategy(), 0..4)
+    sources in sources_strategy()
   ) {
     let mut mergeinfo = Mergeinfo::default();
     for (source, cover) in &sources {
@@ -848,8 +1289,8 @@ proptest! {
     prop_assert_eq!(read, mergeinfo);
   }
 
-  /// A-605: Hostile values, from the grammar's alphabet and any byte: a read never panics, and what it accepts writes back to
-  /// a value that reads as itself; a commit's check accepts exactly what a read accepts of a value with no NUL.
+  /// A-605: Hostile values, from the grammar's alphabet and any byte: a read never panics, and what it accepts writes
+  /// back to a value that reads as itself; a commit's check accepts exactly what a read accepts of a value with no NUL.
   #[test]
   fn hostile_values_are_refused_or_read_canonically(
     value in prop::collection::vec(prop_oneof![
@@ -888,16 +1329,20 @@ proptest! {
   }
 }
 
-/// A-605: A value of a hundred thousand ranges, and one of a hundred thousand lines, read and written whole: the work is a
-/// pass over the bytes and the result holds what the value names.
+/// A-605: A value of a hundred thousand ranges, and one of a hundred thousand lines, read and written whole: the work
+/// is a pass over the bytes and the result holds what the value names.
 #[test]
 fn long_values_read_in_proportion_to_their_bytes() {
-  let many_ranges: Vec<String> = (1..=100_000_u64).map(|revision| (revision * 2).to_string()).collect();
+  let many_ranges: Vec<String> = (1..=100_000_u64)
+    .map(|revision| (revision * 2).to_string())
+    .collect();
   let value = format!("/a:{}", many_ranges.join(","));
   let mergeinfo = parsed(&value);
   assert_eq!(mergeinfo.get(&path("/a")).unwrap().ranges().len(), 100_000);
   assert_eq!(mergeinfo.to_bytes(), value.as_bytes());
-  let many_lines: Vec<String> = (1..=100_000_u64).map(|line| format!("/p{line}:{line}")).collect();
+  let many_lines: Vec<String> = (1..=100_000_u64)
+    .map(|line| format!("/p{line}:{line}"))
+    .collect();
   let mergeinfo = parsed(&many_lines.join("\n"));
   assert_eq!(mergeinfo.len(), 100_000);
 }
@@ -915,11 +1360,17 @@ fn a_range_is_forward_and_holds_the_revisions_after_its_start() {
   assert!(!five_to_seven.contains(4));
   assert!(five_to_seven.contains(5) && five_to_seven.contains(7));
   assert!(!five_to_seven.contains(8));
-  assert_eq!(RangeList::canonical(vec![range(4, 7, false), range(5, 9, true)]).unwrap_err(), RangeOverlap { first: range(4, 7, false), second: range(5, 9, true) });
+  assert_eq!(
+    RangeList::canonical(vec![range(4, 7, false), range(5, 9, true)]).unwrap_err(),
+    RangeOverlap {
+      first: range(4, 7, false),
+      second: range(5, 9, true)
+    }
+  );
 }
 
-/// A-605: `should_elide_mergeinfo`: no mergeinfo never elides; empty mergeinfo elides to none or empty; any other never to none
-/// or empty, and otherwise when equal with inheritance compared.
+/// A-605: `should_elide_mergeinfo`: no mergeinfo never elides; empty mergeinfo elides to none or empty; any other never
+/// to none or empty, and otherwise when equal with inheritance compared.
 #[test]
 fn mergeinfo_elides_by_subversions_rules() {
   let empty = Mergeinfo::default();
@@ -945,10 +1396,19 @@ fn inheritance_words_read_as_subversion_reads_them() {
     MergeinfoInheritance::Inherited,
     MergeinfoInheritance::NearestAncestor,
   ] {
-    assert_eq!(MergeinfoInheritance::from_word(mode.word().as_bytes()), mode);
+    assert_eq!(
+      MergeinfoInheritance::from_word(mode.word().as_bytes()),
+      mode
+    );
   }
-  assert_eq!(MergeinfoInheritance::from_word(b"Inherited"), MergeinfoInheritance::Explicit);
-  assert_eq!(MergeinfoInheritance::from_word(b""), MergeinfoInheritance::Explicit);
+  assert_eq!(
+    MergeinfoInheritance::from_word(b"Inherited"),
+    MergeinfoInheritance::Explicit
+  );
+  assert_eq!(
+    MergeinfoInheritance::from_word(b""),
+    MergeinfoInheritance::Explicit
+  );
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1008,13 +1468,21 @@ struct Naive {
 
 /// Whether `place` is `path` or beneath it.
 fn at_or_beneath(place: &str, path: &str) -> bool {
-  place == path || path == "/" || place.strip_prefix(path).is_some_and(|rest| rest.starts_with('/'))
+  place == path
+    || path == "/"
+    || place
+      .strip_prefix(path)
+      .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// `place` moved from beneath `from` to beneath `to`.
 fn moved(place: &str, from: &str, to: &str) -> String {
   let rest = &place[from.len()..];
-  if from == "/" { format!("{to}/{rest}") } else { format!("{to}{rest}") }
+  if from == "/" {
+    format!("{to}/{rest}")
+  } else {
+    format!("{to}{rest}")
+  }
 }
 
 /// The parent of a path other than the root.
@@ -1063,7 +1531,10 @@ impl Naive {
     identity[..8].copy_from_slice(&self.lists.to_le_bytes());
     let has_mergeinfo = value.is_some();
     self.values.insert(identity, value);
-    PropertyList::Held { identity, has_mergeinfo }
+    PropertyList::Held {
+      identity,
+      has_mergeinfo,
+    }
   }
 
   /// Commits one revision of rows that touch disjoint subtrees, to the naive trees and to the index; answers its
@@ -1101,9 +1572,16 @@ impl Naive {
     };
     match op {
       Op::AddDir(path, props) | Op::AddFile(path, props) => {
-        let kind = if matches!(op, Op::AddDir(..)) { NodeKind::Directory } else { NodeKind::File };
+        let kind = if matches!(op, Op::AddDir(..)) {
+          NodeKind::Directory
+        } else {
+          NodeKind::File
+        };
         let properties = props.as_ref().map(|props| self.list_for(props));
-        let node = NaiveNode { kind, properties: properties.unwrap_or(PropertyList::Empty) };
+        let node = NaiveNode {
+          kind,
+          properties: properties.unwrap_or(PropertyList::Empty),
+        };
         tree.insert(path.clone(), node);
         ChangedPath {
           properties,
@@ -1119,12 +1597,18 @@ impl Naive {
         if let Some(properties) = properties {
           copied.properties = properties;
         }
-        for (place, node) in source.iter().filter(|(place, _)| at_or_beneath(place, from) && *place != from) {
+        for (place, node) in source
+          .iter()
+          .filter(|(place, _)| at_or_beneath(place, from) && *place != from)
+        {
           tree.insert(moved(place, from, path), *node);
         }
         tree.insert(path.clone(), copied);
         ChangedPath {
-          copy_from: Some(CopySource { path: from.clone(), revision: *revision }),
+          copy_from: Some(CopySource {
+            path: from.clone(),
+            revision: *revision,
+          }),
           properties,
           mergeinfo_modified: properties.is_some() && (had || copied.properties.has_mergeinfo()),
           ..row(path, Action::Add, copied.kind)
@@ -1152,24 +1636,47 @@ impl Naive {
   /// The model's mergeinfo of `path` in `revision`, by the rule stated on whole trees: absent paths refused; the
   /// nearest node holding `svn:mergeinfo` from the path (or its parent) up, the path alone when explicit; an ancestor's
   /// inheritable part extended by the path beneath it; a value that does not parse is none.
-  fn mergeinfo(&self, path: &str, revision: Revision, inheritance: MergeinfoInheritance) -> Option<Option<Mergeinfo>> {
+  fn mergeinfo(
+    &self,
+    path: &str,
+    revision: Revision,
+    inheritance: MergeinfoInheritance,
+  ) -> Option<Option<Mergeinfo>> {
     let tree = self.tree(revision);
     tree.get(path)?;
     let mut chain = vec![(path.to_owned(), String::new())];
     let mut place = path.to_owned();
     while place != "/" {
       let parent = parent_of(&place).to_owned();
-      let relative = if parent == "/" { path[1..].to_owned() } else { path[parent.len() + 1..].to_owned() };
+      let relative = if parent == "/" {
+        path[1..].to_owned()
+      } else {
+        path[parent.len() + 1..].to_owned()
+      };
       chain.push((parent.clone(), relative));
       place = parent;
     }
     let skip = usize::from(inheritance == MergeinfoInheritance::NearestAncestor);
-    let take = if inheritance == MergeinfoInheritance::Explicit { 1 } else { chain.len() };
+    let take = if inheritance == MergeinfoInheritance::Explicit {
+      1
+    } else {
+      chain.len()
+    };
     for (place, relative) in chain.into_iter().skip(skip).take(take) {
-      if let PropertyList::Held { identity, has_mergeinfo: true } = tree[&place].properties {
+      if let PropertyList::Held {
+        identity,
+        has_mergeinfo: true,
+      } = tree[&place].properties
+      {
         let value = self.values[&identity].as_ref().unwrap();
         let read = Mergeinfo::parse(value).ok();
-        return Some(read.map(|mergeinfo| if relative.is_empty() { mergeinfo } else { mergeinfo.inheritable_part().with_suffix(&relative) }));
+        return Some(read.map(|mergeinfo| {
+          if relative.is_empty() {
+            mergeinfo
+          } else {
+            mergeinfo.inheritable_part().with_suffix(&relative)
+          }
+        }));
       }
     }
     Some(None)
@@ -1183,9 +1690,12 @@ impl Naive {
       .iter()
       .filter(|(place, _)| *place != path && at_or_beneath(place, path))
       .filter_map(|(place, node)| match node.properties {
-        PropertyList::Held { identity, has_mergeinfo: true } => {
-          Mergeinfo::parse(self.values[&identity].as_ref().unwrap()).ok().map(|mergeinfo| (place.clone(), mergeinfo))
-        }
+        PropertyList::Held {
+          identity,
+          has_mergeinfo: true,
+        } => Mergeinfo::parse(self.values[&identity].as_ref().unwrap())
+          .ok()
+          .map(|mergeinfo| (place.clone(), mergeinfo)),
         _ => None,
       })
       .collect();
@@ -1195,10 +1705,9 @@ impl Naive {
 
   /// Whether a node strictly beneath `directory` in `revision` holds `svn:mergeinfo`.
   fn holds_beneath(&self, directory: &str, revision: Revision) -> bool {
-    self
-      .tree(revision)
-      .iter()
-      .any(|(place, node)| place != directory && at_or_beneath(place, directory) && node.properties.has_mergeinfo())
+    self.tree(revision).iter().any(|(place, node)| {
+      place != directory && at_or_beneath(place, directory) && node.properties.has_mergeinfo()
+    })
   }
 }
 
@@ -1209,7 +1718,10 @@ fn path_order(left: &str, right: &str) -> Ordering {
 
 impl Contents for Naive {
   fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
-    self.listed.borrow_mut().push((directory.to_owned(), revision));
+    self
+      .listed
+      .borrow_mut()
+      .push((directory.to_owned(), revision));
     let tree = self.trees.get(usize::try_from(revision).ok()?)?;
     if tree.get(directory)?.kind != NodeKind::Directory {
       return None;
@@ -1242,51 +1754,88 @@ fn small_repository() -> Naive {
     Op::AddDir("/branches".into(), None),
     Op::AddDir("/quiet".into(), None),
   ]);
-  naive.commit(&[Op::AddDir("/trunk/a".into(), None), Op::AddFile("/quiet/f".into(), None)]);
-  naive.commit(&[Op::AddFile("/trunk/a/f".into(), None), Op::SetProps("/trunk".into(), Props::With(b"/src:1-5,7*".to_vec()))]);
+  naive.commit(&[
+    Op::AddDir("/trunk/a".into(), None),
+    Op::AddFile("/quiet/f".into(), None),
+  ]);
+  naive.commit(&[
+    Op::AddFile("/trunk/a/f".into(), None),
+    Op::SetProps("/trunk".into(), Props::With(b"/src:1-5,7*".to_vec())),
+  ]);
   naive.commit(&[Op::Copy("/branches/b".into(), "/trunk".into(), 3, None)]);
-  naive.commit(&[Op::SetProps("/trunk/a/f".into(), Props::With(b"garbage".to_vec()))]);
+  naive.commit(&[Op::SetProps(
+    "/trunk/a/f".into(),
+    Props::With(b"garbage".to_vec()),
+  )]);
   naive.commit(&[Op::AddDir("/branches/c".into(), None)]);
   naive.commit(&[Op::AddFile("/branches/c/g".into(), with("/x:9"))]);
   naive
 }
 
 /// The mergeinfo the query answers, panicking on a refusal.
-fn answered(naive: &Naive, path: &str, revision: Revision, inheritance: MergeinfoInheritance) -> Option<Vec<u8>> {
-  mergeinfo_at(&naive.index, naive, path, revision, inheritance).unwrap().map(|mergeinfo| mergeinfo.to_bytes())
+fn answered(
+  naive: &Naive,
+  path: &str,
+  revision: Revision,
+  inheritance: MergeinfoInheritance,
+) -> Option<Vec<u8>> {
+  mergeinfo_at(&naive.index, naive, path, revision, inheritance)
+    .unwrap()
+    .map(|mergeinfo| mergeinfo.to_bytes())
 }
 
-/// A-605: A path's own mergeinfo, an ancestor's as the path inherits it (its `*` ranges dropped, its sources extended), and a
-/// nearest ancestor's: each as FSFS answers, through a copied branch as through its source.
+/// A-605: A path's own mergeinfo, an ancestor's as the path inherits it (its `*` ranges dropped, its sources extended),
+/// and a nearest ancestor's: each as FSFS answers, through a copied branch as through its source.
 #[test]
 fn a_path_inherits_its_nearest_ancestors_mergeinfo_extended_without_its_partial_ranges() {
   use MergeinfoInheritance as I;
   let naive = small_repository();
-  assert_eq!(answered(&naive, "/trunk", 3, I::Explicit), Some(b"/src:1-5,7*".to_vec()));
+  assert_eq!(
+    answered(&naive, "/trunk", 3, I::Explicit),
+    Some(b"/src:1-5,7*".to_vec())
+  );
   assert_eq!(answered(&naive, "/trunk/a/f", 3, I::Explicit), None);
-  assert_eq!(answered(&naive, "/trunk/a/f", 3, I::Inherited), Some(b"/src/a/f:1-5".to_vec()));
+  assert_eq!(
+    answered(&naive, "/trunk/a/f", 3, I::Inherited),
+    Some(b"/src/a/f:1-5".to_vec())
+  );
   assert_eq!(answered(&naive, "/trunk", 3, I::NearestAncestor), None);
-  assert_eq!(answered(&naive, "/trunk/a", 3, I::NearestAncestor), Some(b"/src/a:1-5".to_vec()));
-  assert_eq!(answered(&naive, "/branches/b", 4, I::Explicit), Some(b"/src:1-5,7*".to_vec()));
-  assert_eq!(answered(&naive, "/branches/b/a/f", 4, I::Inherited), Some(b"/src/a/f:1-5".to_vec()));
+  assert_eq!(
+    answered(&naive, "/trunk/a", 3, I::NearestAncestor),
+    Some(b"/src/a:1-5".to_vec())
+  );
+  assert_eq!(
+    answered(&naive, "/branches/b", 4, I::Explicit),
+    Some(b"/src:1-5,7*".to_vec())
+  );
+  assert_eq!(
+    answered(&naive, "/branches/b/a/f", 4, I::Inherited),
+    Some(b"/src/a/f:1-5".to_vec())
+  );
   assert_eq!(answered(&naive, "/", 4, I::NearestAncestor), None);
   assert_eq!(answered(&naive, "/trunk/a", 2, I::Inherited), None);
 }
 
-/// A-605: Issue #3896: a node whose value does not parse answers no mergeinfo, and an inherited search stops at it rather than
-/// going on to `/trunk`'s; its nearest ancestor's is still found.
+/// A-605: Issue #3896: a node whose value does not parse answers no mergeinfo, and an inherited search stops at it
+/// rather than going on to `/trunk`'s; its nearest ancestor's is still found.
 #[test]
 fn a_value_that_does_not_parse_is_no_mergeinfo_and_ends_the_search() {
   use MergeinfoInheritance as I;
   let naive = small_repository();
   assert_eq!(answered(&naive, "/trunk/a/f", 5, I::Explicit), None);
   assert_eq!(answered(&naive, "/trunk/a/f", 5, I::Inherited), None);
-  assert_eq!(answered(&naive, "/trunk/a/f", 5, I::NearestAncestor), Some(b"/src/a/f:1-5".to_vec()));
-  assert_eq!(answered(&naive, "/branches/b/a/f", 5, I::Inherited), Some(b"/src/a/f:1-5".to_vec()));
+  assert_eq!(
+    answered(&naive, "/trunk/a/f", 5, I::NearestAncestor),
+    Some(b"/src/a/f:1-5".to_vec())
+  );
+  assert_eq!(
+    answered(&naive, "/branches/b/a/f", 5, I::Inherited),
+    Some(b"/src/a/f:1-5".to_vec())
+  );
 }
 
-/// A-605: The crawl finds the nodes beneath with mergeinfo, a value that does not parse skipped, in path order; it lists only
-/// directories with mergeinfo beneath them, so `/quiet` and `/trunk/a` before revision 5 are never listed.
+/// A-605: The crawl finds the nodes beneath with mergeinfo, a value that does not parse skipped, in path order; it
+/// lists only directories with mergeinfo beneath them, so `/quiet` and `/trunk/a` before revision 5 are never listed.
 #[test]
 fn descendants_are_found_by_the_counts_without_entering_quiet_directories() {
   let naive = small_repository();
@@ -1303,12 +1852,25 @@ fn descendants_are_found_by_the_counts_without_entering_quiet_directories() {
       ("/trunk".to_owned(), b"/src:1-5,7*".to_vec()),
     ]
   );
-  let listed: Vec<String> = naive.listed.borrow().iter().map(|(path, _)| path.clone()).collect();
-  assert_eq!(listed, vec!["/", "/branches", "/branches/c", "/trunk", "/trunk/a"]);
+  let listed: Vec<String> = naive
+    .listed
+    .borrow()
+    .iter()
+    .map(|(path, _)| path.clone())
+    .collect();
+  assert_eq!(
+    listed,
+    vec!["/", "/branches", "/branches/c", "/trunk", "/trunk/a"]
+  );
   naive.listed.borrow_mut().clear();
   let at_four: Vec<_> = descendants(&naive.index, &naive, "/", 4).unwrap().collect();
   assert_eq!(at_four.len(), 2);
-  let listed: Vec<String> = naive.listed.borrow().iter().map(|(path, _)| path.clone()).collect();
+  let listed: Vec<String> = naive
+    .listed
+    .borrow()
+    .iter()
+    .map(|(path, _)| path.clone())
+    .collect();
   assert_eq!(listed, vec!["/", "/branches"]);
 }
 
@@ -1316,8 +1878,19 @@ fn descendants_are_found_by_the_counts_without_entering_quiet_directories() {
 #[test]
 fn a_catalog_answers_each_path_then_its_descendants() {
   let naive = small_repository();
-  let answer = catalog(&naive.index, &naive, &["/branches", "/trunk/a"], 7, MergeinfoInheritance::Inherited, true).unwrap();
-  let answer: Vec<(String, Vec<u8>)> = answer.into_iter().map(|(path, mergeinfo)| (path, mergeinfo.to_bytes())).collect();
+  let answer = catalog(
+    &naive.index,
+    &naive,
+    &["/branches", "/trunk/a"],
+    7,
+    MergeinfoInheritance::Inherited,
+    true,
+  )
+  .unwrap();
+  let answer: Vec<(String, Vec<u8>)> = answer
+    .into_iter()
+    .map(|(path, mergeinfo)| (path, mergeinfo.to_bytes()))
+    .collect();
   assert_eq!(
     answer,
     vec![
@@ -1328,14 +1901,15 @@ fn a_catalog_answers_each_path_then_its_descendants() {
   );
 }
 
-/// A-605: The queries' refusals, each with its Subversion error: an absent path (`E160013`), a path out of canonical form
-/// (`E160005`), a revision past the youngest (`E160006`), a row claiming mergeinfo its list lacks (`E160004`), and a
-/// green that cannot list a directory the index says holds mergeinfo beneath (`E160004`).
+/// A-605: The queries' refusals, each with its Subversion error: an absent path (`E160013`), a path out of canonical
+/// form (`E160005`), a revision past the youngest (`E160006`), a row claiming mergeinfo its list lacks (`E160004`), and
+/// a green that cannot list a directory the index says holds mergeinfo beneath (`E160004`).
 #[test]
 fn the_queries_refuse_by_kind() {
   use MergeinfoInheritance as I;
   let naive = small_repository();
-  let refused = |path, revision| mergeinfo_at(&naive.index, &naive, path, revision, I::Inherited).unwrap_err();
+  let refused =
+    |path, revision| mergeinfo_at(&naive.index, &naive, path, revision, I::Inherited).unwrap_err();
   assert_eq!(refused("/nothing", 3).subversion_code(), 160_013);
   assert_eq!(refused("trunk", 3).subversion_code(), 160_005);
   assert_eq!(refused("/trunk", 99).subversion_code(), 160_006);
@@ -1353,10 +1927,22 @@ fn the_queries_refuse_by_kind() {
     }
   }
   let claims = mergeinfo_at(&naive.index, &Lost, "/trunk", 3, I::Explicit).unwrap_err();
-  assert_eq!(claims, QueryRefusal::ClaimsMergeinfo { path: "/trunk".into(), revision: 3 });
+  assert_eq!(
+    claims,
+    QueryRefusal::ClaimsMergeinfo {
+      path: "/trunk".into(),
+      revision: 3
+    }
+  );
   assert_eq!(claims.subversion_code(), 160_004);
   let lost = descendants(&naive.index, &Lost, "/", 3).unwrap_err();
-  assert_eq!(lost, QueryRefusal::ContentsDisagree { path: "/".into(), revision: 3 });
+  assert_eq!(
+    lost,
+    QueryRefusal::ContentsDisagree {
+      path: "/".into(),
+      revision: 3
+    }
+  );
   assert_eq!(lost.subversion_code(), 160_004);
 }
 
@@ -1403,8 +1989,22 @@ struct Wish {
 
 /// Any wish.
 fn wish() -> impl Strategy<Value = Wish> {
-  (any::<u8>(), any::<u16>(), any::<u16>(), any::<u16>(), any::<u8>(), any::<u8>())
-    .prop_map(|(op, place, source, from, name, props)| Wish { op, place, source, from, name, props })
+  (
+    any::<u8>(),
+    any::<u16>(),
+    any::<u16>(),
+    any::<u16>(),
+    any::<u8>(),
+    any::<u8>(),
+  )
+    .prop_map(|(op, place, source, from, name, props)| Wish {
+      op,
+      place,
+      source,
+      from,
+      name,
+      props,
+    })
 }
 
 /// The property list a wish sets: none (a quarter), empty, without mergeinfo, or one of the values.
@@ -1413,7 +2013,9 @@ fn wished_props(wish: &Wish) -> Option<Props> {
     0..=2 => None,
     3 => Some(Props::Empty),
     4 => Some(Props::Without),
-    pick => Some(Props::With(VALUES[usize::from(pick - 5) % VALUES.len()].to_vec())),
+    pick => Some(Props::With(
+      VALUES[usize::from(pick - 5) % VALUES.len()].to_vec(),
+    )),
   }
 }
 
@@ -1424,23 +2026,36 @@ fn pick<T: Clone>(choices: &[T], pick: u16) -> Option<T> {
 
 /// Whether `path` overlaps a path some row of this revision names.
 fn overlaps(path: &str, taken: &[String]) -> bool {
-  taken.iter().any(|other| at_or_beneath(path, other) || at_or_beneath(other, path))
+  taken
+    .iter()
+    .any(|other| at_or_beneath(path, other) || at_or_beneath(other, path))
 }
 
 /// The row a wish makes against the youngest tree, untouched by the other rows of its revision, or none.
 fn op_for(naive: &Naive, wish: &Wish, taken: &[String]) -> Option<Op> {
   let head = naive.head();
-  let free: Vec<&String> = head.keys().filter(|path| *path != "/" && !overlaps(path, taken)).collect();
+  let free: Vec<&String> = head
+    .keys()
+    .filter(|path| *path != "/" && !overlaps(path, taken))
+    .collect();
   match wish.op % 6 {
     0 | 1 | 2 => {
       let directories: Vec<&String> = head
         .iter()
-        .filter(|(path, node)| node.kind == NodeKind::Directory && path.matches('/').count() < DEPTH && !taken.iter().any(|other| at_or_beneath(path, other)))
+        .filter(|(path, node)| {
+          node.kind == NodeKind::Directory
+            && path.matches('/').count() < DEPTH
+            && !taken.iter().any(|other| at_or_beneath(path, other))
+        })
         .map(|(path, _)| path)
         .collect();
       let parent = pick(&directories, wish.place)?;
       let name = NAMES[usize::from(wish.name) % NAMES.len()];
-      let path = if parent == "/" { format!("/{name}") } else { format!("{parent}/{name}") };
+      let path = if parent == "/" {
+        format!("/{name}")
+      } else {
+        format!("{parent}/{name}")
+      };
       if head.contains_key(&path) || overlaps(&path, taken) {
         return None;
       }
@@ -1452,7 +2067,13 @@ fn op_for(naive: &Naive, wish: &Wish, taken: &[String]) -> Option<Op> {
           let tree = naive.tree(revision);
           let sources: Vec<String> = tree
             .keys()
-            .filter(|source| tree.keys().filter(|place| at_or_beneath(place, source)).count() <= COPY_CAP)
+            .filter(|source| {
+              tree
+                .keys()
+                .filter(|place| at_or_beneath(place, source))
+                .count()
+                <= COPY_CAP
+            })
             .cloned()
             .collect();
           let source = pick(&sources, wish.source)?;
@@ -1472,7 +2093,11 @@ fn op_for(naive: &Naive, wish: &Wish, taken: &[String]) -> Option<Op> {
 /// The path an op names.
 fn op_path(op: &Op) -> &str {
   match op {
-    Op::AddDir(path, _) | Op::AddFile(path, _) | Op::Copy(path, ..) | Op::Delete(path) | Op::SetProps(path, _) => path,
+    Op::AddDir(path, _)
+    | Op::AddFile(path, _)
+    | Op::Copy(path, ..)
+    | Op::Delete(path)
+    | Op::SetProps(path, _) => path,
   }
 }
 
@@ -1492,14 +2117,25 @@ struct Census {
 }
 
 /// The queries against the naive filesystem in one revision, every path and mode, and absent paths refused.
-fn same_queries(naive: &Naive, revision: Revision, census: &mut Census) -> Result<(), TestCaseError> {
+fn same_queries(
+  naive: &Naive,
+  revision: Revision,
+  census: &mut Census,
+) -> Result<(), TestCaseError> {
   use MergeinfoInheritance as I;
   for path in naive.tree(revision).keys() {
     for inheritance in [I::Explicit, I::Inherited, I::NearestAncestor] {
       let expected = naive.mergeinfo(path, revision, inheritance).unwrap();
       let actual = mergeinfo_at(&naive.index, naive, path, revision, inheritance)
         .map_err(|refusal| TestCaseError::fail(format!("{path}@{revision}: {refusal:?}")))?;
-      prop_assert_eq!(&actual, &expected, "{}@{} {:?}", path, revision, inheritance);
+      prop_assert_eq!(
+        &actual,
+        &expected,
+        "{}@{} {:?}",
+        path,
+        revision,
+        inheritance
+      );
       let holder_unparsed = naive.mergeinfo(path, revision, I::Inherited) == Some(None)
         && naive.tree(revision)[path].properties.has_mergeinfo();
       census.unparsed += usize::from(holder_unparsed && inheritance == I::Inherited);
@@ -1513,14 +2149,22 @@ fn same_queries(naive: &Naive, revision: Revision, census: &mut Census) -> Resul
     census.found_beneath += usize::from(!expected.is_empty());
     prop_assert_eq!(actual, expected, "beneath {}@{}", path, revision);
     for (listed, at) in naive.listed.borrow().iter() {
-      prop_assert!(naive.holds_beneath(listed, *at), "listed {} at {} with nothing beneath", listed, at);
+      prop_assert!(
+        naive.holds_beneath(listed, *at),
+        "listed {} at {} with nothing beneath",
+        listed,
+        at
+      );
       census.listings += 1;
     }
     let directory = naive.tree(revision)[path].kind == NodeKind::Directory;
     census.pruned += usize::from(directory && naive.listed.borrow().is_empty());
   }
   let absent = mergeinfo_at(&naive.index, naive, "/absent", revision, I::Inherited);
-  prop_assert_eq!(absent.map_err(|refusal| refusal.subversion_code()), Err(160_013));
+  prop_assert_eq!(
+    absent.map_err(|refusal| refusal.subversion_code()),
+    Err(160_013)
+  );
   Ok(())
 }
 

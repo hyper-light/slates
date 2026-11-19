@@ -1,13 +1,13 @@
-//! Mergeinfo (§4.17.4 item 8 and piece 9; A-605): the `svn:mergeinfo` property's value, read and written as
-//! Subversion reads and writes it, the range-list algebra Subversion computes merges with, inheritance and elision, and
-//! the queries a server answers over the Subversion index ([`crate::index`], A-553).
+//! Mergeinfo (§4.17.4 item 8 and piece 9; A-605): the `svn:mergeinfo` property's value, read and written as Subversion
+//! reads and writes it, the range-list algebra Subversion computes merges with, inheritance and elision, and the
+//! queries a server answers over the Subversion index ([`crate::index`], A-553).
 //!
 //! Merge tracking is the client's: `svn merge` asks the server for mergeinfo, logs, location segments and diffs, merges
 //! text in its working copy and commits the result as any commit (§4.17.4 item 8; §2 ban 11: the server never merges
 //! file contents). What the server owes is the value's grammar at commit, `get-mergeinfo`'s answers, and, for
-//! `svn mergeinfo --show-revs`, the very range lists the stock client computes. Everything here is read from Subversion's
-//! `1.14.x` branch at `d434dc14` (2026-11-01; `docs/wip/research/vcs-servers-subversion.md` §1 and §7), each rule naming
-//! the function it transcribes.
+//! `svn mergeinfo --show-revs`, the very range lists the stock client computes. Everything here is read from
+//! Subversion's `1.14.x` branch at `d434dc14` (2026-11-01; `docs/wip/research/vcs-servers-subversion.md` §1 and §7),
+//! each rule naming the function it transcribes.
 //!
 //! **The value** (`svn_mergeinfo.h` 45-110; `libsvn_subr/mergeinfo.c` `svn_mergeinfo_parse`): lines `PATH:RANGES`, a
 //! range `N` or `N-M`, either marked `*` when only its own path has it. Read as Subversion reads it:
@@ -24,9 +24,9 @@
 //!   refused (`svn_rangelist__canonicalize`).
 //!
 //! Every refusal is typed by the message Subversion gives it ([`MergeinfoRefusal`]) and answered `E200020`, the code
-//! `svn_mergeinfo_parse` puts on top of whatever refused the value. Written as `svn_mergeinfo_to_string` writes: paths in
-//! `svn_path_compare_paths` order (a separator before any other byte, so `/a/b` precedes `/a-b`), one line each, ranges
-//! `N` or `N-M` with `*`.
+//! `svn_mergeinfo_parse` puts on top of whatever refused the value. Written as `svn_mergeinfo_to_string` writes: paths
+//! in `svn_path_compare_paths` order (a separator before any other byte, so `/a/b` precedes `/a-b`), one line each,
+//! ranges `N` or `N-M` with `*`.
 //!
 //! **The algebra** is transcribed from `mergeinfo.c`, never restated: the union (`svn_rangelist_merge2`, 1.14's sweep,
 //! in which a revision takes the larger of its two kinds), and intersection, removal and difference
@@ -53,10 +53,10 @@
 //! principal may not read, as the repository layer does, and nothing beneath them is filtered (§4.17.4 item 10).
 //!
 //! Bounds: a parse allocates in proportion to the value, which the wire bounds before it arrives (§4.17.4 item 12, the
-//! cap on a property value); each range takes two bytes of it at least. The algebra's results hold at most the ranges of
-//! its operands plus one per range, since a removal splits a range at most once per range removed. A path's query walks
-//! its depth; the descendants are an iterator that holds one listing per directory on its way down, so the server pulls
-//! them a slice at a time under the shard's budget (§4.17.4 "Long reads").
+//! cap on a property value); each range takes two bytes of it at least. The algebra's results hold at most the ranges
+//! of its operands plus one per range, since a removal splits a range at most once per range removed. A path's query
+//! walks its depth; the descendants are an iterator that holds one listing per directory on its way down, so the server
+//! pulls them a slice at a time under the shard's budget (§4.17.4 "Long reads").
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -702,7 +702,8 @@ fn combine_with_last(new_range: MergeRange, ranges: &mut Vec<MergeRange>, compar
 }
 
 /// `combine_with_lastrange`'s overlapping case: the last range taken off, the older of the two cut where the newer
-/// begins unless it is inheritable, in which case the newer starts where it ends; answers whether the pieces kept order.
+/// begins unless it is inheritable, in which case the newer starts where it ends; answers whether the pieces kept
+/// order.
 fn split_overlap(last: MergeRange, new_range: MergeRange, ranges: &mut Vec<MergeRange>) -> bool {
   ranges.pop();
   let (mut older, mut newer) = if new_range.start < last.start {
@@ -717,7 +718,8 @@ fn split_overlap(last: MergeRange, new_range: MergeRange, ranges: &mut Vec<Merge
   }
   ranges.push(older);
   ranges.push(newer);
-  compare_ranges(&last, &older) == Ordering::Less && compare_ranges(&older, &newer) == Ordering::Less
+  compare_ranges(&last, &older) == Ordering::Less
+    && compare_ranges(&older, &newer) == Ordering::Less
 }
 
 /// `combine_with_lastrange`'s subset case: the last range taken off, the pieces the superset and the subset make pushed
@@ -745,11 +747,7 @@ fn subset_pieces(outer: MergeRange, inner: MergeRange) -> [Option<MergeRange>; 3
   let piece = |start, end, inheritable| MergeRange::new(start, end, inheritable);
   if outer.inheritable {
     [
-      piece(
-        outer.start.min(inner.start),
-        outer.end.max(inner.end),
-        true,
-      ),
+      piece(outer.start.min(inner.start), outer.end.max(inner.end), true),
       None,
       None,
     ]
@@ -925,8 +923,8 @@ impl IntersectOrRemove<'_> {
 pub struct SourcePath(Box<[u8]>);
 
 impl SourcePath {
-  /// The canonical form of `path`, read as a C string to its first NUL: empty and `.` names dropped, a leading separator
-  /// added (`svn_fspath__canonicalize`).
+  /// The canonical form of `path`, read as a C string to its first NUL: empty and `.` names dropped, a leading
+  /// separator added (`svn_fspath__canonicalize`).
   pub fn canonical(path: &[u8]) -> Self {
     let path = path
       .split(|&byte| byte == TERMINATOR)
@@ -1356,11 +1354,7 @@ impl<'value> Cursor<'value> {
 
   /// The byte at the place reached; a NUL at the end, as C reads its terminator.
   fn peek(&self) -> u8 {
-    self
-      .bytes
-      .get(self.position)
-      .copied()
-      .unwrap_or(TERMINATOR)
+    self.bytes.get(self.position).copied().unwrap_or(TERMINATOR)
   }
 
   /// One byte on.
@@ -1376,7 +1370,10 @@ impl<'value> Cursor<'value> {
   /// `parse_pathname`: the path before the line's last colon, canonical; the cursor left past that colon.
   fn pathname(&mut self) -> Result<SourcePath, MergeinfoRefusal> {
     let rest = self.rest();
-    let line = rest.split(|&byte| byte == LINE_END).next().unwrap_or_default();
+    let line = rest
+      .split(|&byte| byte == LINE_END)
+      .next()
+      .unwrap_or_default();
     let colon = line
       .iter()
       .rposition(|&byte| byte == PATH_END)
@@ -1633,14 +1630,12 @@ fn present<'index>(
   path: &str,
   revision: Revision,
 ) -> Result<Node<'index>, QueryRefusal> {
-  index
-    .node(path, revision)?
-    .ok_or_else(|| {
-      QueryRefusal::Index(IndexRefusal::NotFound {
-        path: path.to_owned(),
-        revision,
-      })
+  index.node(path, revision)?.ok_or_else(|| {
+    QueryRefusal::Index(IndexRefusal::NotFound {
+      path: path.to_owned(),
+      revision,
     })
+  })
 }
 
 /// A path's places from itself up to the root, each with the path relative to it: FSFS's parent-path chain, walked
@@ -1785,13 +1780,14 @@ impl<C: Contents + ?Sized> Descendants<'_, C> {
   /// Visits one node: its mergeinfo if it holds a value that parses, and its directory entered when nodes beneath it
   /// hold some.
   fn visit(&mut self, path: &str) -> Result<Option<Mergeinfo>, QueryRefusal> {
-    let node = self
-      .index
-      .node(path, self.revision)?
-      .ok_or_else(|| QueryRefusal::ContentsDisagree {
-        path: path.to_owned(),
-        revision: self.revision,
-      })?;
+    let node =
+      self
+        .index
+        .node(path, self.revision)?
+        .ok_or_else(|| QueryRefusal::ContentsDisagree {
+          path: path.to_owned(),
+          revision: self.revision,
+        })?;
     let mergeinfo = if node.has_mergeinfo() {
       // Issue #3896: a value that does not parse is skipped.
       Mergeinfo::parse(held_value(self.contents, &node, path, self.revision)?).ok()

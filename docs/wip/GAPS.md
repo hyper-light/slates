@@ -131,6 +131,13 @@
 > applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on the Mac
 > Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store, §4.17.1
 > shared piece 3), and a large revision applied in slices (with the server).
+> A-605 (2026-11-18, g262, UI goal 92): mergeinfo, piece 9: the `svn:mergeinfo` value read and written as Subversion
+> reads and writes it, every refusal typed by its message; the range-list algebra transcribed from `mergeinfo.c`,
+> Subversion's inexact walk with inheritance compared kept as it is; inheritance and elision; and `get-mergeinfo` over
+> the index, its descendants found by the counts; held to `mergeinfo-test.c`'s vectors, the per-revision model and a
+> naive filesystem on generated histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio
+> (see A-605). Owed from it: `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra
+> with piece 7's location segments and log; the property's UTF-8 and CR checks with piece 7's property validation.
 > Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
 > head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision

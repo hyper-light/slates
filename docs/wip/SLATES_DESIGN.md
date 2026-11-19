@@ -12668,6 +12668,19 @@ and export by landing).
 > FSFS's operations to whole trees, equals it on generated histories, and equals itself replayed in random drive
 > orders. Owed with the object store (§4.17.1 shared piece 3): the rows held as content tables with a mutable tail, and
 > the learned fold (item 12); with the server (piece 7): one large revision applied in slices under the shard's budget.
+>
+> **Status (2026-11-18, A-605).** Built: mergeinfo (`slates-svn`'s `mergeinfo`, piece 9, item 8): the `svn:mergeinfo`
+> value read as `svn_mergeinfo_parse` reads it (every refusal by Subversion's own message, answered `E200020`; at commit
+> a NUL inside the value refused first, as `verify_mergeinfo` does) and written as `svn_mergeinfo_to_string` writes it;
+> the range-list algebra transcribed from `mergeinfo.c` (union, intersection, removal, difference, equality, each with
+> `consider_inheritance`), since Subversion's walk is not exact per revision when inheritance is compared and the stock
+> client computes with it; inheritance and elision; and `get-mergeinfo`'s answers over the index (explicit, inherited,
+> nearest-ancestor; descendants found by the index's counts, a crawl the server pulls a slice at a time; a value that
+> does not parse answering none, issue #3896). Held to `mergeinfo-test.c`'s vectors, to the per-revision model wherever
+> Subversion's algebra is exact, and to a naive filesystem on generated histories. Owed: `svn mergeinfo --show-revs`'s
+> eligible and merged revisions, composed from this algebra with piece 7's location segments and log
+> (`libsvn_client/mergeinfo.c` `svn_client__mergeinfo_log`, `filter_log_entry_with_rangelist`); the property's UTF-8 and
+> CR checks at commit, which are piece 7's property validation (`svn_repos__validate_prop`).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -13066,7 +13079,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    `uuid`, `youngest`; the dump round trip is their gate.
 7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
    checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
-8. Locks. 9. Mergeinfo queries. 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
+8. Locks. 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's
+   segments and log). 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
