@@ -13121,9 +13121,12 @@ and export by landing).
 > Held to transcripts of stock `svnserve` 1.15.0 answering stock `svn` 1.15.0 and scripted clients
 > (`crates/svn/fixtures/reads`, recorded by its `make-fixtures.py` through a relay, each file's SHA-256 in
 > `SHA256SUMS`), property lists compared as sets: `svnserve` writes them in APR's per-table seeded hash order, three
-> recordings gave three orders, and slates writes them in name order. Owed: `get-file`, `get-dir`, `list`, `log` with
-> merged revisions, `get-locations`, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, then
-> `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
+> recordings gave three orders, and slates writes them in name order. Its second part's first slice (2026-11-19):
+> `get-dir` (the node's and the entry properties, the dirent fields asked for, the ancestors' properties) and
+> `get-locations` (`svn_repos_trace_node_locations` over the index: the closest copy by FSFS's youngest copy root, its
+> source, the same line at the same path), with `svn info` of a file and `svn proplist --show-inherited-props` replayed
+> whole. Owed: `get-file`, `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
+> `get-deleted-rev`, then `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -41874,11 +41877,20 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   hostile commands, never a panic. Red-checked six ways (a directory's size 0, `get-iprops` taking the youngest, an
   authentication request before an unknown command's refusal, a huge revision read as malformed, mergeinfo keys left
   absolute, dates before 1970 accepted): each failed its tests.
-- **Owed** (the next parts): `get-file`, `get-dir`, `list`, `log` with merged revisions, `get-locations`,
-  `get-location-segments`, `get-file-revs`, `get-deleted-rev`, each with its transcripts (two stock sessions recorded
-  here already ask for `get-locations` and `get-dir`); then `svn mergeinfo --show-revs`'s eligible and merged
-  revisions from the segments and the log; read access by A-606's rules, and the authentication request a denied
-  anonymous read makes when the session could authenticate.
+- **Part 2, its first slice** (2026-11-19): `get-dir` and `get-locations`, recorded in three more scripted sessions
+  (every dirent field, a field subset, inherited properties, a file refused "Can't get entries of non-directory"
+  160016, an absent path; a copy crossed, revisions after the peg kept while the line reaches back to the same path,
+  a tag, a deleted file refused for the revision after its deletion, an absent path and a bad peg refused after
+  `done`, a revision list holding a string ending the connection), and the two stock sessions recorded earlier
+  (`svn info` of a file at an older revision, `svn proplist --show-inherited-props`) replayed whole with the
+  session's base taken from the client's URL. Found by the recording: `get-dir` writes a directory's size 0 (`stat`
+  writes 2^64 - 1), the stored date as it is and time 0's date for an entry without one; both commands' entries come
+  in hash order, compared as sets. The session value gains the repository's UUID (`svn:entry:uuid`). Studio:
+  `cargo test -p slates-svn --lib reads` all passing, fixtures' sums checked.
+- **Owed** (the next slices): `get-file`, `list`, `log` with merged revisions, `get-location-segments`,
+  `get-file-revs`, `get-deleted-rev`, each with its transcripts; then `svn mergeinfo --show-revs`'s eligible and
+  merged revisions from the segments and the log; read access by A-606's rules, and the authentication request a
+  denied anonymous read makes when the session could authenticate.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
