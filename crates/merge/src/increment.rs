@@ -771,31 +771,31 @@ fn compose_xattrs(
 
 /// A `SetXattr` op: `path` is the file's index, `at` the name's index into the table, and the
 /// value is `len` bytes at post-state offset `src`.
-fn set_xattr_op(path: u16, name: u16, value_offset: u64, value_len: u64) -> Op {
+fn set_xattr_op(path: u64, name: u64, value_offset: u64, value_len: u64) -> Op {
   Op {
     kind: OpKind::SetXattr,
     flags: 0,
     path,
-    at: u64::from(name),
+    at: name,
     len: value_len,
     src: value_offset,
   }
 }
 
 /// A `RemoveXattr` op: `path` is the file's index, `at` the name's index into the table.
-fn remove_xattr_op(path: u16, name: u16) -> Op {
+fn remove_xattr_op(path: u64, name: u64) -> Op {
   Op {
     kind: OpKind::RemoveXattr,
     flags: 0,
     path,
-    at: u64::from(name),
+    at: name,
     len: 0,
     src: u64::MAX,
   }
 }
 
 /// A `SetMode` op: the new mode is carried in `len` (§4.16 `OpRecord`).
-fn set_mode_op(path: u16, mode: u32) -> Op {
+fn set_mode_op(path: u64, mode: u32) -> Op {
   Op {
     kind: OpKind::SetMode,
     flags: 0,
@@ -879,14 +879,14 @@ fn compose_symlinks(
 }
 
 /// A `Symlink` op: `path` is the link's index, `src` the target string's index into the table.
-fn symlink_op(link: u16, target: u16) -> Op {
+fn symlink_op(link: u64, target: u64) -> Op {
   Op {
     kind: OpKind::Symlink,
     flags: 0,
     path: link,
     at: 0,
     len: 0,
-    src: u64::from(target),
+    src: target,
   }
 }
 
@@ -967,19 +967,19 @@ fn compose_hardlinks(
 }
 
 /// A `Link` op: `path` is the link's index, `src` the target file's index into the table.
-fn link_op(link: u16, target: u16) -> Op {
+fn link_op(link: u64, target: u64) -> Op {
   Op {
     kind: OpKind::Link,
     flags: 0,
     path: link,
     at: 0,
     len: 0,
-    src: u64::from(target),
+    src: target,
   }
 }
 
 /// A namespace op with a path index and empty coordinates.
-fn namespace_op(kind: OpKind, path: u16) -> Op {
+fn namespace_op(kind: OpKind, path: u64) -> Op {
   Op {
     kind,
     flags: 0,
@@ -991,14 +991,14 @@ fn namespace_op(kind: OpKind, path: u16) -> Op {
 }
 
 /// A `Rename` op: `path` is the destination index, `src` the source path index into the table.
-fn rename_op(destination: u16, source: u16) -> Op {
+fn rename_op(destination: u64, source: u64) -> Op {
   Op {
     kind: OpKind::Rename,
     flags: 0,
     path: destination,
     at: 0,
     len: 0,
-    src: u64::from(source),
+    src: source,
   }
 }
 
@@ -1356,11 +1356,13 @@ fn emit_namespace(
   symlinks: Vec<SymlinkEmission>,
   hardlinks: Vec<LinkEmission>,
 ) {
-  let index_of = |name: &str| -> u16 {
+  // A name's index is its place among the sorted names; one not among them is `u64::MAX`, which names no path, never
+  // another's (A-621: a 16-bit index answered `u16::MAX`, the 65,536th name's, for both).
+  let index_of = |name: &str| -> u64 {
     names
       .binary_search_by(|candidate| candidate.as_str().cmp(name))
-      .map_or(u16::MAX, |position| {
-        u16::try_from(position).unwrap_or(u16::MAX)
+      .map_or(u64::MAX, |position| {
+        u64::try_from(position).unwrap_or(u64::MAX)
       })
   };
   for origin in removed {
@@ -1430,11 +1432,13 @@ fn seal(
   for name in &names {
     doc.paths.intern(name);
   }
-  let index_of = |name: &str| -> u16 {
+  // A name's index is its place among the sorted names; one not among them is `u64::MAX`, which names no path, never
+  // another's (A-621: a 16-bit index answered `u16::MAX`, the 65,536th name's, for both).
+  let index_of = |name: &str| -> u64 {
     names
       .binary_search_by(|candidate| candidate.as_str().cmp(name))
-      .map_or(u16::MAX, |position| {
-        u16::try_from(position).unwrap_or(u16::MAX)
+      .map_or(u64::MAX, |position| {
+        u64::try_from(position).unwrap_or(u64::MAX)
       })
   };
 
@@ -1493,7 +1497,7 @@ fn seal(
 fn push_content(
   doc: &mut OpsDoc,
   ops: Vec<Op>,
-  index: u16,
+  index: u64,
   (cursor, plan): (&mut u64, &mut PostStatePlan),
 ) {
   for mut op in ops {

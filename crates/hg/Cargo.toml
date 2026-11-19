@@ -18,6 +18,8 @@ zstd = { workspace = true }
 # The SHA-1 of a Mercurial node with collision detection, as 7.2's sha1dc computes it (A-588): the workspace's port of
 # sha1collisiondetection, which git's object names use (A-600; the workspace manifest says why this crate).
 sha1-checked = { workspace = true }
+# The shared object store's tables, which hold the repository's index (A-588 part 2, A-581).
+slates-vcs = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
