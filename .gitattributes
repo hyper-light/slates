@@ -54,3 +54,5 @@ crates/git/fixtures/*.idx -text
 crates/git/fixtures/deltas/*.delta -text
 # Subversion dumps stock `svnadmin` 1.15.0 wrote (A-593): carriage returns and NULs inside their texts, kept as written.
 crates/svn/fixtures/dump/*.dump -text
+# What stock git pushes sent and stock receive-pack answered, and the servers they met (A-620): byte for byte.
+crates/git/fixtures/push/** -text

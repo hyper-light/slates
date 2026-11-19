@@ -48,6 +48,8 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/mod_dav_svn/reports/dated-rev.c`, `deleted-rev.c` (A-609) | `c45708c8997cfbf5`, `639915799a79a818` | C |
 | `subversion/libsvn_subr/base64.c`, `time.c` (A-609) | `5e7c46c46c4ea17f`, `c58645b206f847e8` | C |
 | httpd 2.4.66 `modules/dav/main/mod_dav.h`, `mod_dav.c` (A-609) | `ad8361ef4e7e311c`, `2cab686b045e2237` | C |
+| `subversion/mod_dav_svn/reports/list.c`, `file-revs.c`, `mod_dav_svn/lock.c` (A-627) | `9c852cb6ba67f446`, `6efa4630426dabd0`, `c5bc4498df507c4f` | C |
+| httpd 2.4.66 `modules/dav/main/util_lock.c`, `props.c` (A-627) | `6b26b0425b33ea20`, `92a3201fa69632e6` | C |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
