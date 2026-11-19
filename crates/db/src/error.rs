@@ -99,6 +99,10 @@ pub enum DbError {
   NotGreen,
   /// A repository's or a branch's name is empty or holds a NUL byte (§4.17.1, A-515).
   InvalidName,
+  /// A review record's change out of its order (§4.17.1 shared piece 6, A-596): an outdated comment moved or outdated
+  /// again, a comment or approval changed at a version not after the one it stands on, an approval bound back to an
+  /// earlier version, or a new record that is already outdated or stale. Never entered in the log.
+  ReviewOutOfOrder,
 }
 
 impl fmt::Display for DbError {
@@ -143,6 +147,7 @@ impl fmt::Display for DbError {
       Self::Memory(e) => write!(f, "memory: {e}"),
       Self::NotGreen => f.write_str("not a green volume"),
       Self::InvalidName => f.write_str("an empty name, or one holding a NUL byte"),
+      Self::ReviewOutOfOrder => f.write_str("a review record changed out of its order"),
     }
   }
 }

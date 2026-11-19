@@ -9,8 +9,8 @@ use crate::catalog::{
   AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, BranchRecord, CompletionRecord,
   ConsumerRecord, GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState,
   LeaseRecord, LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
-  NfsOpenRecord, PlacementState, RepositoryId, RepositoryRecord, SizeClass, SnapshotId,
-  SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
+  NfsOpenRecord, PlacementState, Principal, RepositoryId, RepositoryRecord, ReviewApprovalRecord,
+  ReviewCommentRecord, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -649,6 +649,65 @@ pub enum Op {
     /// The kernel's id of its mount, as its mount table names it.
     mount: u64,
   },
+  /// A review comment was written on a request (§4.17.1 shared piece 6, A-596): anchored to a path, the whole lines a
+  /// byte range covers, and the version of the request's work it stands on. Appended.
+  ReviewCommented {
+    /// The comment.
+    record: ReviewCommentRecord,
+  },
+  /// A review comment moved with its request's work to a later version, its lines unchanged: now `len` bytes at `start`
+  /// of `version` (A-596). Appended.
+  ReviewCommentMoved {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// The comment's number.
+    id: u64,
+    /// Its lines' first byte at `version`.
+    start: u64,
+    /// The bytes they cover there.
+    len: u64,
+    /// The version it now stands on.
+    version: u64,
+  },
+  /// A change at `version` met a review comment's lines (A-596): it is outdated, where it last stood, never moved again.
+  /// Appended.
+  ReviewCommentOutdated {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// The comment's number.
+    id: u64,
+    /// The version whose change met its lines.
+    version: u64,
+  },
+  /// A request was approved at the version its approver saw; the approver's earlier approval, if any, is replaced
+  /// (A-596). Appended.
+  ReviewApproved {
+    /// The approval.
+    record: ReviewApprovalRecord,
+  },
+  /// A change at `version` met what the repository's policy says an approval covers: the approval is stale (A-596).
+  /// Appended.
+  ReviewApprovalStaled {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// Who approved.
+    approver: Principal,
+    /// The version whose change made it stale.
+    version: u64,
+  },
+  /// A request's review records left with it, its review merged or closed (A-596). Appended.
+  ReviewClosed {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+  },
 }
 
 impl Op {
@@ -681,6 +740,12 @@ impl Op {
       Op::AttachmentRemoved { .. } => "attachment_removed",
       Op::AttachmentBound { .. } => "attachment_bound",
       Op::AttachmentMountSeen { .. } => "attachment_mount_seen",
+      Op::ReviewCommented { .. } => "review_commented",
+      Op::ReviewCommentMoved { .. } => "review_comment_moved",
+      Op::ReviewCommentOutdated { .. } => "review_comment_outdated",
+      Op::ReviewApproved { .. } => "review_approved",
+      Op::ReviewApprovalStaled { .. } => "review_approval_staled",
+      Op::ReviewClosed { .. } => "review_closed",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",

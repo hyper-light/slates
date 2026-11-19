@@ -1415,3 +1415,47 @@ pub struct BranchRecord {
   /// The green.
   pub green: VolumeId,
 }
+
+/// A review comment on a request (§4.17.1 "Works over works", shared piece 6; A-596): anchored to a path, the whole lines
+/// a byte range covers, and the version of the request's work it stands on. It moves with the work by position mapping
+/// (`slates_merge::review`), and once a change meets its lines it is outdated: it stays where it last stood, never moved
+/// again.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ReviewCommentRecord {
+  /// The repository whose request it is on.
+  pub repository: RepositoryId,
+  /// The request: the work held for review.
+  pub request: VolumeId,
+  /// Its number among the request's comments.
+  pub id: u64,
+  /// Who wrote it.
+  pub author: Principal,
+  /// The path it is on, as the work names it.
+  pub path: String,
+  /// The first byte of its lines in the version it stands on.
+  pub start: u64,
+  /// The bytes its lines cover there, through the last one's newline.
+  pub len: u64,
+  /// The work's version it stands on: the one it was written on, or the one it was last moved to.
+  pub version: u64,
+  /// Whether a change met its lines.
+  pub outdated: bool,
+  /// What it says.
+  pub body: String,
+}
+
+/// An approval of a request (§4.17.1, shared piece 6; A-596): bound to the version of the request's work it saw, and
+/// stale once a later change meets what the repository's policy says an approval covers.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ReviewApprovalRecord {
+  /// The repository whose request it is on.
+  pub repository: RepositoryId,
+  /// The request: the work held for review.
+  pub request: VolumeId,
+  /// Who approved.
+  pub approver: Principal,
+  /// The work's version it saw.
+  pub version: u64,
+  /// Whether a later change made it stale.
+  pub stale: bool,
+}

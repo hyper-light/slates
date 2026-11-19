@@ -260,6 +260,10 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     // A repository's namespace binds greens only, under non-empty names without NUL bytes (§4.17.1, A-515).
     DbError::NotGreen => Refusal::NotGreen,
     DbError::InvalidName => Refusal::InvalidName,
+    // A review record changed out of its order (A-596): the review verbs that refine it are a later piece.
+    DbError::ReviewOutOfOrder => Refusal::BadRequest {
+      reason: "a review record changed out of its order".to_owned(),
+    },
   }
 }
 
