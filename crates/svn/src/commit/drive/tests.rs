@@ -1389,10 +1389,12 @@ fn accepted_work(replay: &Replay, base_path: &str, commands: &[u8]) -> Work {
 
 /// A-655 (§4.17.4 item 3.5; `transaction.c` `commit_body` 3784-3786). Do: over the repository after `edit`, accept a
 /// property change of `/trunk/project` and one of `/trunk/project/sub`, both judged at revision 3; commit the second
-/// through the step, then the first. Expect: the second is revision 4; the first refused "Transaction out of date"
-/// (`E160028`), the repository holding revision 4 alone, its property the second's.
+/// through the step, then the first as it was judged. Expect: the second is revision 4; the records refuse the first as
+/// FSFS's `commit_body` refuses a transaction whose base moved, "Transaction out of date" (`E160028`), holding revision
+/// 4 alone. The owner's step judges such a work again at the head by position before the records see it, as
+/// `svn_fs_fs__commit_txn` merges again (part 2b).
 #[test]
-fn a_work_whose_head_moved_before_its_step_is_refused_out_of_date() {
+fn a_revision_judged_at_a_moved_head_is_refused_by_the_records() {
   let mut replay = replayed_until("edit-large");
   let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let second = accepted_work(&replay, "/trunk/project/sub", DIRECTORY_PROPERTY);
@@ -1406,4 +1408,55 @@ fn a_work_whose_head_moved_before_its_step_is_refused_out_of_date() {
   assert_eq!(refusal, StepRefusal::OutOfDate { head: 3, youngest: 4 });
   let changed: Vec<String> = replay.repository.index().changes(4).unwrap().iter().map(|row| row.path.clone()).collect();
   assert_eq!((replay.repository.youngest(), changed), (4, vec!["/trunk/project/sub".to_owned()]));
+}
+
+/// What a hook read of the transaction: its name, its base, its revision properties and the paths of its rows.
+type HookRead = (String, Revision, Vec<(Vec<u8>, Vec<u8>)>, Vec<String>);
+
+/// What pre-commit reads of a drive of `commands` with `begun` as its revision properties, every hook passed, and the
+/// revision properties of the work accepted.
+fn read_at_pre_commit(
+  replay: &Replay,
+  begun: Vec<(Vec<u8>, Vec<u8>)>,
+  commands: &[u8],
+) -> (Option<HookRead>, Option<Vec<(Vec<u8>, Vec<u8>)>>) {
+  let mut drive = Drive::new(alice_setup("/trunk/project", begun));
+  let mut out = Vec::new();
+  let (mut read, mut accepted) = (None, None);
+  for (item, _) in items(commands) {
+    let records = &replay.repository;
+    let mut step = drive
+      .command(records.index(), records, records.locks(), &item, &mut out)
+      .unwrap();
+    if let Step::Hook(due) = step {
+      if let Due::PreCommit { .. } = due {
+        let pending = drive.pending();
+        let rows: Vec<String> = pending.rows.keys().cloned().collect();
+        let properties = pending.revision_properties.to_vec();
+        read = Some((pending.transaction.to_owned(), pending.base, properties, rows));
+      }
+      step = replay.resume(&mut drive, Ok(()), &mut out);
+    }
+    if let Step::Accepted(work) = step {
+      accepted = Some(work.revision_properties);
+    }
+  }
+  (read, accepted)
+}
+
+/// A-661 (`fs-wrap.c` `svn_repos_fs_commit_txn` 69-89: pre-commit reads the transaction, its ephemeral properties
+/// among its revision properties, and they are removed before the commit). Do: drive the property change of
+/// `/trunk/project`, begun with `svn:log` and `svn:txn-user-agent`, reading the transaction while pre-commit is due.
+/// Expect: pre-commit reads the transaction's name, its base 3, both properties and its one row; the accepted work
+/// keeps `svn:log` alone.
+#[test]
+fn pre_commit_reads_the_transaction_whose_work_drops_its_ephemeral_properties() {
+  let replay = replayed_until("edit-large");
+  let log = (b"svn:log".to_vec(), b"x".to_vec());
+  let agent = (b"svn:txn-user-agent".to_vec(), b"SVN/1.15.0".to_vec());
+  let begun = vec![log.clone(), agent.clone()];
+  let (read, accepted) = read_at_pre_commit(&replay, begun, DIRECTORY_PROPERTY);
+  let rows = vec!["/trunk/project".to_owned()];
+  let expected = ("3-1".to_owned(), 3, vec![log.clone(), agent], rows);
+  assert_eq!((read, accepted), (Some(expected), Some(vec![log])));
 }

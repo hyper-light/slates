@@ -8,7 +8,8 @@
 //! records it; [`Repository::apply`] commits what was checked, so the owner applies it after, and a recovery that
 //! checks and applies the logged revision again reaches the same records ([`Repository::commit`] is the two at once).
 //! Checked, in order: the revision's head is the youngest ("Transaction out of date" otherwise, as FSFS's
-//! `commit_body` answers a transaction whose base moved, `transaction.c` 3784-3786); its lock entries apply; every
+//! `commit_body` answers a transaction whose base moved, `transaction.c` 3784-3786; the owner's step judges a moved work
+//! again by position before it comes here, as `svn_fs_fs__commit_txn` merges again); its lock entries apply; every
 //! text and property list its rows name is held by the records or brought by the revision; its properties and new
 //! contents fit the room; the index takes its rows ([`Index::plan`]). A refused revision changes nothing.
 //!

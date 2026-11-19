@@ -51,8 +51,9 @@
 //!   (`svn_repos_fs_change_txn_props`, `fs-wrap.c` 344-357, in name order where `svnserve` takes APR's hash order),
 //!   then waits for start-commit ([`Step::Hook`], [`Due::StartCommit`]) before its root opens; `close-edit` waits for
 //!   pre-commit ([`Due::PreCommit`]) before the verdict, as `svn_repos_fs_commit_txn` runs it before FSFS's merge. The
-//!   caller runs the hook and hands its answer to [`Drive::resume`]: passed, the command goes on; refused, the hook's
-//!   errors are the command's failure, under the early-error rule.
+//!   caller runs the hook, which reads the transaction through [`Drive::pending`], and hands its answer to
+//!   [`Drive::resume`]: passed, the command goes on; refused, the hook's errors are the command's failure, under the
+//!   early-error rule.
 //! - **`close-edit`** runs the verdict once pre-commit passed (A-592's [`verdict`]: FSFS's merge at commit against the
 //!   head as it stands then, then the lock table's check with the commit's tokens, its releases decided). An accepted
 //!   work, which names the head its verdict judged against and keeps no ephemeral `svn:txn-` property (`fs-wrap.c`
@@ -730,6 +731,25 @@ pub enum Due {
   },
 }
 
+/// What a hook reads of the transaction its command waits on ([`Drive::pending`], A-661): what FSFS's read-only view of
+/// a transaction (`svnlook -t`'s, owed) is built over.
+#[derive(Clone, Copy, Debug)]
+pub struct Pending<'drive> {
+  /// The transaction's name.
+  pub transaction: &'drive str,
+  /// The revision it was begun on: the youngest at `open-root`.
+  pub base: Revision,
+  /// The revision properties it was begun with, the client's ephemeral `svn:txn-` ones among them, each name once in
+  /// name order.
+  pub revision_properties: &'drive [(Vec<u8>, Vec<u8>)],
+  /// Its changed-path rows so far, by path.
+  pub rows: &'drive BTreeMap<String, ChangedPath>,
+  /// The texts it made, by identity.
+  pub texts: &'drive BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The property lists it made, by identity, each sorted by name.
+  pub property_lists: &'drive BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
 /// An accepted work: what the caller commits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Work {
@@ -1295,6 +1315,19 @@ impl Drive {
       }),
     };
     self.answer(outcome, out)
+  }
+
+  /// The transaction as a hook reads it while its command waits ([`Step::Hook`]): its name, base, revision properties,
+  /// rows, texts and property lists so far.
+  pub fn pending(&self) -> Pending<'_> {
+    Pending {
+      transaction: &self.setup.transaction,
+      base: self.base,
+      revision_properties: &self.setup.revision_properties,
+      rows: &self.rows,
+      texts: &self.texts,
+      property_lists: &self.property_lists,
+    }
   }
 
   /// What a command's outcome makes of the drive, and its step.

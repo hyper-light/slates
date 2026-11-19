@@ -23,8 +23,10 @@
 //! `svn:date` and its absence among them, as `load-fs-vtable.c` `close_revision` keeps them.
 //!
 //! The step's refusals ([`StepRefusal`]) are typed and answered with Subversion's numbers; a refused revision changes
-//! nothing. Where its repository moved past the revision's head, the answer is FSFS's own: "Transaction out of date"
-//! (`transaction.c` `commit_body` 3784-3786).
+//! nothing. A revision whose head is no longer the youngest is refused as FSFS's `commit_body` refuses a transaction
+//! whose base moved, "Transaction out of date" (`transaction.c` 3784-3786); the owner's step first judges such a work
+//! again at the head by position, as `svn_fs_fs__commit_txn` merges again (`tree.c` 2295-2310; A-655 part 2b over
+//! A-658), so a client is refused only where the verdict finds a conflict.
 //!
 //! No I/O, no clock (the caller's instant), no randomness, no panic.
 
