@@ -18830,7 +18830,17 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   shard is owed, from memory of ext4's and XFS's fsync paths, which commit only to the directory's own last change, to
   verify; a mode Windows cannot hold (an execute bit) makes an entry whose set changes nothing there, and the next
   landing finds the file as the disk keeps it; a check and a set are two calls on one handle, so an outsider's change to
-  the same field between them is not seen; a `touch` alone and a base directory's mode change alone still land nothing;
+  the same field between them is not seen; a `touch` alone and a base directory's mode change alone, which landed
+  nothing, **fixed by A-501 the same day** (`docs/bugs/2026-11-18-a-touch-alone-and-a-base-directorys-mode-alone-never-landed.md`:
+  a file's time a field of its metadata entry, judged and set through its handle as its mode is; a base directory's
+  metadata entry, `ChmodDir`, judged against the witness its first metadata change takes, landed after every removal
+  and deepest first, synced by its batch's barrier through its own handle; its unit tests ran on the Mac Studio, the
+  oracle's and the crash oracle's reruns and the Windows `--test os` suite filed for main; still owed with it: a base
+  directory both moved and changed in mode lands its move alone, its rename entry winning the diverged walk; a directory
+  whose owner or time alone the volume changed keeps its witness past every landing, since it makes no entry; the
+  presented list (`PlannedAction::Chmod`) names no time, so a `touch` alone shows as a chmod that changes nothing
+  visible, though the grant binds the time; and a directory mode that takes its owner's search away lands last, but a
+  landing resumed after a crash past it cannot open what lies beneath it and refuses);
   a captured clone's replacement overwrote an outsider's mode change where an overlay's refuses it (T-1.14), **fixed by
   A-466 the same day** (`docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`: its
   metadata judged field by field beside its bytes, the outsider's mode kept under the agent's bytes, a mode both changed
@@ -18854,7 +18864,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   metadata entry opens it fails that entry alone, since `FlushFileBuffers` needs a handle that may write and NTFS refuses
   one to a read-only file, where a clear of the bit before the flush's open, or a measured rule, would land it; and a made
   directory's mode, given after `mkdirat` and synced with the directory's parent alone, has the same question, unasked
-  until now); and
+  until now, which A-501 asked and left open: a made directory is no metadata entry and joins no batch, its `mkdirat`
+  and `fchmod` running in the directories' class, so syncing it whole is one more handle and sync per made directory,
+  staged as a metadata entry is, to measure before it lands); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

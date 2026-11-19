@@ -85,7 +85,11 @@ fn script(vol: &mut Volume, host: &mut SimHost, store: &mut Store) -> slates_vfs
   vol.with_host(host).resolve(store, "/run.sh").unwrap().inode
 }
 
-fn request(grant: Option<crate::grant::GrantId>, source: Source, landing_id: u64) -> LandingRequest {
+fn request(
+  grant: Option<crate::grant::GrantId>,
+  source: Source,
+  landing_id: u64,
+) -> LandingRequest {
   LandingRequest {
     landing_id,
     consumer: b"consumer".to_vec().into_boxed_slice(),
@@ -256,7 +260,10 @@ fn a_touch_alone_lands_and_is_synced() {
   assert_eq!(outcomes(&report), vec![("/run.sh", Some(Outcome::Written))]);
   let after = host.fingerprint("/run.sh").unwrap();
   assert_eq!(after.mtime_ns, TOUCHED_NS);
-  assert_eq!(after.ino, before.ino, "the same file: its bytes never rewritten");
+  assert_eq!(
+    after.ino, before.ino,
+    "the same file: its bytes never rewritten"
+  );
   assert_eq!(after.mode & PERMISSIONS, SCRIPT_MODE & PERMISSIONS);
   assert!(!host.holds_unsynced_metadata("/run.sh"));
 }
@@ -325,7 +332,11 @@ fn a_directorys_mode_the_head_changed_past_a_landed_snapshot_lands_next() {
   let mode = |host: &SimHost| host.fingerprint("/lib").unwrap().mode & PERMISSIONS;
   assert_eq!(mode(&host), PRIVATE_DIR_MODE & PERMISSIONS);
   let diverged: Vec<String> = vol.diverged(&store).into_iter().map(|d| d.path).collect();
-  assert_eq!(diverged, vec!["/lib"], "the head's later mode, still to land");
+  assert_eq!(
+    diverged,
+    vec!["/lib"],
+    "the head's later mode, still to land"
+  );
   let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
   let report = landed.unwrap();
   assert_eq!(report.state, LandingState::Done, "{report:?}");

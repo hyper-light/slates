@@ -696,7 +696,8 @@ fn a_base_directorys_mode_change_is_witnessed_and_drifts_only_by_its_own_metadat
       kind: Divergence::Witnessed,
     }]
   );
-  let quiet = |status: slates_vfs::base::BaseStatus| status.drift.is_empty() && status.unverified.is_empty();
+  let quiet =
+    |status: slates_vfs::base::BaseStatus| status.drift.is_empty() && status.unverified.is_empty();
   assert!(quiet(vol.with_host(&mut host).status(&mut before).unwrap()));
   host.advance_ns(1_000_000_000);
   host.replace_file("/src/new.rs", b"an outsider's file");
@@ -727,7 +728,9 @@ fn a_base_directorys_mode_change_is_witnessed_and_drifts_only_by_its_own_metadat
     .rewitness(&mut after, None)
     .unwrap();
   assert_eq!(redone, vec!["/src".to_owned()]);
-  assert!(quiet(recovered.with_host(&mut host).status(&mut after).unwrap()));
+  assert!(quiet(
+    recovered.with_host(&mut host).status(&mut after).unwrap()
+  ));
   assert_eq!(
     recovered.stat(&after, src).unwrap().mode & 0o7777,
     VOLUME_MODE & 0o7777,

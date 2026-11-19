@@ -1079,7 +1079,15 @@ mod tests {
       mtime_ns: TOUCHED_NS,
       ..overlay([1; 32])
     };
-    let at = |mtime_ns: i64| file(Fingerprint { mtime_ns, ..fp(7, 3) }, None);
+    let at = |mtime_ns: i64| {
+      file(
+        Fingerprint {
+          mtime_ns,
+          ..fp(7, 3)
+        },
+        None,
+      )
+    };
     assert_eq!(witnessed.fingerprint.mtime_ns, WITNESSED_NS);
     let judged = |disk| verdict(&touch, Some(&witnessed), disk, Some(&touched));
     assert_eq!(judged(at(WITNESSED_NS)), Verdict::Apply);
@@ -1104,10 +1112,7 @@ mod tests {
       },
     };
     let directory = |mode: u32| DiskState::Dir {
-      fingerprint: Fingerprint {
-        mode,
-        ..dir_fp(7)
-      },
+      fingerprint: Fingerprint { mode, ..dir_fp(7) },
       holds_only_ours: false,
     };
     let rows = [

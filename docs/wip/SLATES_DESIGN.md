@@ -2105,7 +2105,12 @@ drift check `fstat`s.
   the whole file into pinned chunks, and for the large class keep the descriptor and pin only
   the written page-multiple ranges (the rest reads through `ExtentSrc::Base`); the inode's body
   becomes `Open` over the pinned extents. The class boundary is the measured large-file class of
-  D-6. Metadata-only changes copy up the witness and pin nothing.
+  D-6. Metadata-only changes copy up the witness and pin nothing. A base directory's first metadata change (its mode,
+  owner, times or Windows bits) takes a witness too (A-501): its fingerprint through its listing's handle, no bytes,
+  homed at its parent and its name as a file's is, so an image keeps it. Its drift is its own identity and metadata
+  alone — gone `Deleted`, another object `Replaced` or `TypeChanged`, another mode, owner or bits `Modified` — since its
+  times move with every entry made or removed in it, which the volume follows; `rewitness` takes the disk's directory
+  again. A directory the volume made, moved or recreated takes none (its entry lands it whole), nor the root.
 - Rename: within a volume, serialized on the owner (free); cycle check walks parent handles
   (O(depth)); POSIX semantics for existing targets; inode numbers preserved; the journal records
   the old and new paths. Renaming a base-backed directory records `origin` (overlayfs's
@@ -9976,13 +9981,23 @@ entry either old or new, never torn).
    disk still holds as the capture did, and with the disk's in every other, so an outsider's mode change is kept under
    the agent's bytes; a field held a third way is `ModifyModify`; and bytes the disk already holds are kept while the
    fields the file lacks are set alone. An overlay's replacement needs its witnessed file whole instead (step 6), so an
-   outsider's metadata change there refuses the landing.
+   outsider's metadata change there refuses the landing. A file whose bytes the volume kept and whose modification
+   time it changed (a `touch` alone) is a metadata entry too (A-501): its time is a field beside its mode and bits,
+   judged by the same rule against the time its witness found, and set through its handle first (`futimens`; Windows
+   `FILE_BASIC_INFO`'s `LastWriteTime`); a captured clone's entry judges no time, its capture having read another
+   folder. A base directory whose mode or Windows bits alone the volume changed is a metadata entry of its own
+   (`ChmodDir`, A-501), judged against its witness (§4.5) as a file's is, field by field, through the directory's own
+   handle: a missing directory is `ModifyDelete`, anything else at its name `TypeChanged`. Its time is no field: a
+   directory's moves with every entry made or removed in it. Windows keeps no POSIX mode for a directory, so there its
+   bits alone are set, its read-only among them.
 
    Any `Conflict` refuses the landing with `Conflict{entries}` and records `LandingValidated`
    with the verdicts; nothing is written. Resolution is the agent's or the human's (`read_base`,
    rewrite, `rewitness`), after which the landing is planned again and presents a new manifest.
 5. *Order.* Directories top-down (`mkdirat` batched), then creates, then replacements, then
-   directory renames, then file deletes, then directory removals bottom-up; each class runs in
+   directory renames, then file deletes, then directory removals bottom-up, then base directories' metadata entries
+   deepest first (A-501), so a mode that bars writing into a directory or searching it stands only once everything
+   beneath it has landed; each class runs in
    parallel and the next starts when the previous completes, so a tool reading the tree during
    the landing never sees a referenced entry missing.
 6. *Write one entry.* Linux: `openat(dirfd, ".", O_TMPFILE|O_WRONLY)`; `writev` from the arena
@@ -10044,8 +10059,11 @@ entry either old or new, never torn).
    writer's dirty data on the filesystem: beside one busy writer a `syncfs` took up to 3.7 s, A-130;
    macOS one `F_FULLFSYNC` after the barriers when the grant asked for media durability, otherwise the
    barriers only; Windows `FlushFileBuffers` on the directory handles). The directory syncs and the media
-   barrier still run on the shard: A-132's measured residual, the next piece (GAPS). A metadata entry (a mode or bits
-   change alone, A-458, A-466) is durable before it is reported, through its file's own handle in the same batch: its
+   barrier still run on the shard: A-132's measured residual, the next piece (GAPS). A metadata entry (a mode, bits or
+   time change alone, A-458, A-466, A-501; a base directory's, A-501) is durable before it is reported, through its
+   file's or directory's own handle in the same batch (a directory's descriptor is its own file's, which fsync(2) and
+   Apple's fsync(2) name; Windows opens it with `FILE_ADD_FILE`, a directory's `FILE_WRITE_DATA`, as the writer's
+   directory sync already flushes one): its
    fields are set in place, the handle stays open in the batch, and the barrier syncs the file whole — Linux `fsync`,
    which "also flushes the metadata information associated with the file" where `fdatasync` "does not flush modified
    metadata unless that metadata is needed in order to allow a subsequent data retrieval" (fsync(2)); macOS `fsync`,

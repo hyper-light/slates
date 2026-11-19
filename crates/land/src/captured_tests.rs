@@ -532,4 +532,3 @@ fn a_captured_clones_directory_mode_change_alone_lands() {
   assert_eq!(after.ino, before.ino);
   assert!(!host.holds_unsynced_metadata("/target/src"));
 }
-

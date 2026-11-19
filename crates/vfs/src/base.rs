@@ -2753,10 +2753,7 @@ impl Overlay<'_> {
     }
     let home = (parent, node.name.clone());
     let host_dir = self.listing_dir(no)?;
-    let fingerprint = self
-      .host
-      .fingerprint_dir(host_dir)
-      .map_err(host_refusal)?;
+    let fingerprint = self.host.fingerprint_dir(host_dir).map_err(host_refusal)?;
     let witness = Witness {
       fingerprint,
       identity: [0; 32],
@@ -3364,7 +3361,9 @@ impl Overlay<'_> {
       Some(fp) if (fp.dev, fp.ino) != (was.dev, was.ino) => {
         self.record_drift(store, no, DriftKind::Replaced);
       }
-      Some(fp) if (fp.mode, fp.uid, fp.gid, fp.windows) != (was.mode, was.uid, was.gid, was.windows) => {
+      Some(fp)
+        if (fp.mode, fp.uid, fp.gid, fp.windows) != (was.mode, was.uid, was.gid, was.windows) =>
+      {
         self.record_drift(store, no, DriftKind::Modified);
       }
       Some(_) => {}
@@ -3388,7 +3387,7 @@ impl Overlay<'_> {
       changed
     });
     if fresh {
-      let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+      let path = self.witnessed_path(store, no).unwrap_or_default();
       self
         .vol
         .record(&mut store.metadata, Op::Drift, path, Some(no), 0);
@@ -3534,9 +3533,17 @@ impl Overlay<'_> {
   /// An inode's path, or `inode N` where none names it, as `status` names it.
   fn path_or_inode(&self, store: &Store, no: InodeNo) -> String {
     self
+      .witnessed_path(store, no)
+      .unwrap_or_else(|| format!("inode {}", no.0))
+  }
+
+  /// The path of a witnessed entry in the head: a file's or a link's through its home, a base directory's through its own
+  /// name and parent chain (A-501), which no home names.
+  fn witnessed_path(&self, store: &Store, no: InodeNo) -> Option<String> {
+    self
       .vol
       .path_of_inode(store, no)
-      .unwrap_or_else(|| format!("inode {}", no.0))
+      .or_else(|| self.vol.path_of_dir(store, no))
   }
 
   /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.
@@ -3553,13 +3560,7 @@ impl Overlay<'_> {
       match self.check_drift(store, no) {
         // Drift found is recorded by the check itself and listed below.
         Ok(()) | Err(VfsError::BaseDrift) => {}
-        Err(refusal) => unverified.push((
-          self
-            .vol
-            .path_of_inode(store, no)
-            .unwrap_or_else(|| format!("inode {}", no.0)),
-          refusal,
-        )),
+        Err(refusal) => unverified.push((self.path_or_inode(store, no), refusal)),
       }
     }
     unverified.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3567,15 +3568,7 @@ impl Overlay<'_> {
     let mut drift: Vec<(String, DriftKind)> = plane
       .drift
       .iter()
-      .map(|(no, kind)| {
-        (
-          self
-            .vol
-            .path_of_inode(store, *no)
-            .unwrap_or_else(|| format!("inode {}", no.0)),
-          *kind,
-        )
-      })
+      .map(|(no, kind)| (self.path_or_inode(store, *no), *kind))
       .collect();
     drift.sort();
     Ok(BaseStatus {
@@ -3904,7 +3897,10 @@ impl Overlay<'_> {
         if store.dirs.get(x)?.inode == store.dirs.get(y)?.inode =>
       {
         let no = store.dirs.get(y)?.inode;
-        let (then, now) = (self.vol.inode_in(store, id, no)?, self.vol.inode(store, no)?);
+        let (then, now) = (
+          self.vol.inode_in(store, id, no)?,
+          self.vol.inode(store, no)?,
+        );
         if (then.attrs.mode, then.windows) == (now.attrs.mode, now.windows) {
           Since::Unchanged
         } else {
@@ -4304,7 +4300,7 @@ impl Overlay<'_> {
     if plane.drift.remove(&no).is_some() {
       plane.drift_writes = plane.drift_writes.saturating_add(1);
     }
-    Ok(self.vol.path_of_inode(store, no).unwrap_or_default())
+    Ok(self.vol.path_of_dir(store, no).unwrap_or_default())
   }
 
   /// `pin`: read the named subtrees (the whole base when none are named) into the store and

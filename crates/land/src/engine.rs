@@ -1444,10 +1444,8 @@ impl<H: LandFs> Landing<'_, H> {
   /// disk already holds (A-466), set in place and synced by its batch's barrier.
   fn stages_meta(&self, entry: &LandingEntry, report: &EntryReport) -> bool {
     matches!(report.verdict, Some(Verdict::Apply))
-      && (matches!(
-        entry.action,
-        Action::Chmod { .. } | Action::ChmodDir { .. }
-      ) || self.sets_meta_alone(entry))
+      && (matches!(entry.action, Action::Chmod { .. } | Action::ChmodDir { .. })
+        || self.sets_meta_alone(entry))
   }
 
   /// The barrier of the staged batch taken (§4.15 step 8, A-130, A-132): every staged file is to be durable before any
