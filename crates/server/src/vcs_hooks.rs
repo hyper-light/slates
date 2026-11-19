@@ -1876,7 +1876,10 @@ mod tests {
     for (options, [pre, update, post]) in negotiated.into_iter().zip(RECORDED_HOOKS) {
       let pre_receive = git_pre_receive(PendingView(1), std::slice::from_ref(&moved), options);
       assert_eq!(pre_receive.env, recorded_push_options(pre));
-      assert_eq!(git_update(PendingView(1), &moved).env, recorded_push_options(update));
+      assert_eq!(
+        git_update(PendingView(1), &moved).env,
+        recorded_push_options(update)
+      );
       let post_receive = git_post_receive(CommittedView(1), std::slice::from_ref(&moved), options);
       assert_eq!(post_receive.env, recorded_push_options(post));
     }

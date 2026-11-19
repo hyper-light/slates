@@ -33,3 +33,10 @@ outside tests), so no deployed push was affected.
   and post-receive for the three recorded pushes, held to the recorded `GIT_PUSH_OPTION_*`), and
   `gits_hooks_get_what_receive_pack_gives_them`'s count without options now `0`.
 - The sweep for the same difference in the other hooks' variables: see this piece's GAPS line.
+
+## Runs
+
+Windows x86_64, jupiter (kiln, debug, 2026-11-19, a fresh clone and target directory each; the Mac Studio offline):
+red with `vcs_hooks.rs` and `hook_driver.rs` as at 967e9e4bd (the tests alone), `cargo test --locked -p slates-server
+--lib -- vcs_hooks`: 31 passed, the two git tests above failed; green at 90fdf1708: 33 of 33, rustfmt's layout from
+that clone. `hook_driver`'s launch test is Unix-only (`#[cfg(unix)]`) and is filed for main's macOS and Linux runs.

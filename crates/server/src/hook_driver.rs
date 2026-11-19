@@ -738,7 +738,10 @@ mod tests {
         (ROLE.to_owned(), EnvValue::Bytes(role.as_bytes().to_vec())),
         ("HG_NODE".to_owned(), EnvValue::Bytes(b"aabb".to_vec())),
         ("HG_PENDING".to_owned(), EnvValue::ViewRoot),
-        ("GIT_PUSH_OPTION_COUNT".to_owned(), EnvValue::Bytes(b"0".to_vec())),
+        (
+          "GIT_PUSH_OPTION_COUNT".to_owned(),
+          EnvValue::Bytes(b"0".to_vec()),
+        ),
       ],
       clean_environment: false,
       stdin,

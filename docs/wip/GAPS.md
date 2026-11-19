@@ -420,7 +420,8 @@
 > as stock receive-pack 2.50.1 hands it (`cmd_receive_pack` always passes its option list, so `run_and_feed_hook` sets
 > the count; `githooks.adoc` says unset), where `vcs_hooks::push_option_env` had unset it; `EnvValue::Unset`, its one
 > producer, removed with the driver's `env_remove`. Held to A-665's recorded hooks (pre-receive, update, post-receive of
-> three pushes); `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`. The sweep of the other
+> three pushes; Windows x86_64, jupiter: red 2 of 2 new failing, green vcs_hooks 33 of 33; the Unix driver's test
+> filed); `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`. The sweep of the other
 > hooks' variables for a stock value slates leaves unset: git's push-certificate variables are set only with a
 > certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2;
 > Subversion's environment is its hooks-env section alone (A-623). Owed, Mercurial 7.2's: `_exthook` always sets
