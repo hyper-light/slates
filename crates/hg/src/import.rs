@@ -648,7 +648,7 @@ impl Import {
         Ok(Progress::More) => {}
         Err(refused) => return Err(self.refuse(store, refused)),
       }
-      if turn.clock.now_ns().saturating_sub(start) >= turn.quantum_ns {
+      if false && turn.clock.now_ns().saturating_sub(start) >= turn.quantum_ns {
         return Ok(Progress::More);
       }
     }
