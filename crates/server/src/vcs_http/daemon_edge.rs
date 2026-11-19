@@ -21,9 +21,9 @@
 //! (`verbs::owner_of_name`, as `CreateRepository` routes it): a name another shard holds moves the connection there
 //! (`Answer::Move`), so a repository is found, judged and served on its own shard, its partition read with no crossing.
 //!
-//! **What is served.** git's services as the server has them: upload-pack once each repository's store lives on its
-//! owner shard (A-662, whose map this site then lends a step at a time), receive-pack once its session lands (A-654);
-//! until then both answer `503`.
+//! **What is served.** git's services as the server has them, each from its own half: upload-pack once each
+//! repository's store is lent from its owner shard (A-662's map, a step at a time), `503` until then; receive-pack
+//! through the push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3).
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
 use slates_http_edge::credential::Credential;
@@ -31,7 +31,10 @@ use slates_rt::tcp::TcpListener;
 use slates_rt::{RtError, Runtime, ShardId, futures};
 use slates_vfs::clock::Clock;
 
-use super::git::{Authenticator, GitSite, Located, Proven, Repositories, Unproven, Unserved};
+use super::git::{
+  Authenticator, GitSite, Halves, Located, Proven, ReceiveServices, Repositories, ThisShard,
+  Unproven, Unserved,
+};
 use super::{Bounds, EdgeState, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
 
@@ -132,11 +135,12 @@ impl Repositories for ShardRepositories {
   }
 }
 
-/// git's site as the daemon serves it.
-pub(crate) type DaemonSite = GitSite<RecordedCredentials, ShardRepositories, Unserved>;
+/// git's site as the daemon serves it (the module doc, "What is served").
+pub(crate) type DaemonSite =
+  GitSite<RecordedCredentials, ShardRepositories, Halves<Unserved, ReceiveServices<ThisShard>>>;
 
-/// What makes the daemon's git site on any shard: its challenges name `realm`, and it charges each route's path to the
-/// request's `room`.
+/// What makes the daemon's git site on any shard: its challenges name `realm`, it charges each route's path to the
+/// request's `room`, and receive-pack admits each push that room.
 fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 'static {
   move || {
     GitSite::new(
@@ -144,7 +148,7 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       room,
       RecordedCredentials,
       ShardRepositories,
-      Unserved,
+      Halves::new(Unserved, ReceiveServices::new(ThisShard, room)),
     )
   }
 }
