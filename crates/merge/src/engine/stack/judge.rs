@@ -36,6 +36,9 @@ pub(super) struct Against<'a> {
   pub(super) at: u64,
   /// What a path no change names answers: nothing changed.
   pub(super) unchanged: Change,
+  /// The version the stack's bottom is based on, and the versions the stack's works landed as: a link another version
+  /// made after it is one the upper's base never held (A-670, [`Green::linked_by_another`]).
+  pub(super) since: (u64, &'a BTreeSet<u64>),
 }
 
 impl Against<'_> {
@@ -90,6 +93,7 @@ impl Green {
     let mut windows = Windows::default();
     self.upper_renames(r, against, &mut windows);
     self.upper_removals(r, against, &mut windows);
+    self.upper_unseen_links(r, against, &mut windows);
     self.upper_metadata(r, against, &mut windows);
     self.upper_links(r, against, &mut windows);
     upper_node_exclusive(work, against, &mut windows);
@@ -110,6 +114,47 @@ impl Green {
         windows.whole(path, MergeConflictClass::RenameRename);
       }
     }
+  }
+
+  /// A removal, or a replacement by a rename, of a file a link names that another version made after the stack's base
+  /// (A-670): the upper's base, its lower's post-state, never held that link, so the upper's writes to the file, if it
+  /// wrote, went with the node in its own volume while the link keeps the node at the head. Refused as the verdict
+  /// refuses one after a work's base (`Green::leaves_to_an_unseen_link`): delete against modify, or rename against
+  /// rename for a replaced destination; unless the upper hands the node on itself (A-669, `Green::handed_home`). A link
+  /// a work of the stack made is one the upper's base held. Links made after the version the upper is restated over
+  /// are the verdict's, which judges the restated upper as a work based on it.
+  fn upper_unseen_links(&self, r: &Resolved, against: &Against<'_>, windows: &mut Windows) {
+    let cleared = r.cleared();
+    let homes: BTreeSet<&str> = r
+      .content
+      .keys()
+      .filter_map(|heir| self.handed_home(r, heir, &cleared))
+      .collect();
+    let removed = r
+      .unlinks
+      .iter()
+      .map(|path| (path, MergeConflictClass::DeleteModify));
+    let replaced = r
+      .renames
+      .keys()
+      .filter(|dst| !cleared.contains(*dst))
+      .map(|path| (path, MergeConflictClass::RenameRename));
+    for (path, class) in removed.chain(replaced) {
+      let file = self.content_len_at(path, against.at).is_some();
+      if file && !homes.contains(path.as_str()) && self.linked_by_another(path, against) {
+        windows.whole(path, class);
+      }
+    }
+  }
+
+  /// Whether a link naming the file at `path` was last made or turned by a version after the stack's base that no work
+  /// of the stack landed as (`against.since`).
+  fn linked_by_another(&self, path: &str, against: &Against<'_>) -> bool {
+    let (base, landed) = against.since;
+    self.links_to.get(path).into_iter().flatten().any(|link| {
+      let changed = self.changed_last(self.hardlink_changed.get(link), link);
+      changed > base && !landed.contains(&changed)
+    })
   }
 
   /// Whether a symbolic link, a hard link or an IPC node stands at `path` at `version`.

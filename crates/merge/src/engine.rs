@@ -3460,25 +3460,10 @@ impl Green {
     windows: &mut Vec<ConflictWindow>,
   ) {
     let handed = self.decide_handed(inc, (r, cleared), effects, windows);
-    for (dst, from) in &r.renames {
-      let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
-      let source = (from.as_str(), cleared);
-      if let Err(window) =
-        self.merge_rename((dst, ops), (inc.base, &inc.post_state), source, effects)
-      {
-        windows.push(window);
-      }
-    }
-    for path in &r.creates {
-      let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
-      let bytes = apply(&[], content, &inc.post_state);
-      record(effects, windows, self.merge_create(path, bytes, content));
-    }
-    for path in &r.unlinks {
-      record(effects, windows, self.merge_unlink(path, inc.base));
-    }
+    let homes: BTreeSet<&str> = handed.values().map(String::as_str).collect();
+    self.decide_moves(inc, (r, cleared, &homes), effects, windows);
     for (path, ops) in &r.content {
-      if r.creates.contains(path) || r.renames.contains_key(path) || handed.contains(path) {
+      if r.creates.contains(path) || r.renames.contains_key(path) || handed.contains_key(path) {
         continue; // content of a created, renamed-into or handed file is handled with that effect
       }
       match self.merge_content(inc, path, ops) {
@@ -3490,16 +3475,17 @@ impl Green {
   }
 
   /// The writes a node takes to the link it passes to (A-669): each link the increment declares writes at whose node's
-  /// home it removes or replaces ([`Green::handed_home`]), judged and handed on ([`Green::merge_handed`]). The links,
-  /// whose writes the content loop leaves to this.
+  /// home it removes or replaces ([`Green::handed_home`]), judged and handed on ([`Green::merge_handed`]). Each such
+  /// link and its node's home: the content loop leaves the link's writes to this, and the home's removal hands its
+  /// node on with them.
   fn decide_handed(
     &self,
     inc: &Increment,
     (r, cleared): (&Resolved, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
-  ) -> BTreeSet<String> {
-    let mut handed = BTreeSet::new();
+  ) -> BTreeMap<String, String> {
+    let mut handed = BTreeMap::new();
     for (heir, ops) in &r.content {
       let Some(home) = self.handed_home(r, heir, cleared) else {
         continue;
@@ -3509,9 +3495,84 @@ impl Green {
         Ok(mut found) => effects.append(&mut found),
         Err(window) => windows.push(window),
       }
-      handed.insert(heir.clone());
+      handed.insert(heir.clone(), home.to_owned());
     }
     handed
+  }
+
+  /// The content dimension's namespace: renames, creates and unlinks. A removal, or a replacement by a rename, of a file
+  /// whose node a link the work's base never had now names is refused before it is merged, unless the increment hands
+  /// the node on itself (`homes`, [`Green::decide_handed`]): delete against modify, or rename against rename for a
+  /// replaced destination, as a change the work did not see is ([`Green::leaves_to_an_unseen_link`], A-670).
+  fn decide_moves(
+    &self,
+    inc: &Increment,
+    (r, cleared, homes): (&Resolved, &BTreeSet<String>, &BTreeSet<&str>),
+    effects: &mut Vec<Effect>,
+    windows: &mut Vec<ConflictWindow>,
+  ) {
+    for (dst, from) in &r.renames {
+      let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
+      let unseen =
+        !cleared.contains(dst) && self.leaves_to_an_unseen_link(dst, inc.base, (r, homes));
+      let merged = if unseen {
+        Err(Green::window(dst, MergeConflictClass::RenameRename))
+      } else {
+        let source = (from.as_str(), cleared);
+        self.merge_rename((dst, ops), (inc.base, &inc.post_state), source, effects)
+      };
+      if let Err(window) = merged {
+        windows.push(window);
+      }
+    }
+    for path in &r.creates {
+      let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
+      let bytes = apply(&[], content, &inc.post_state);
+      record(effects, windows, self.merge_create(path, bytes, content));
+    }
+    for path in &r.unlinks {
+      let merged = if self.leaves_to_an_unseen_link(path, inc.base, (r, homes)) {
+        Err(Green::window(path, MergeConflictClass::DeleteModify))
+      } else {
+        self.merge_unlink(path, inc.base)
+      };
+      record(effects, windows, merged);
+    }
+  }
+
+  /// Whether removing or replacing the file at `path` would leave its node to a link the work never saw, without writes
+  /// the work could not declare there (A-670): a link naming the file now was made or turned to it after `base`, the
+  /// increment hands no writes on from it (`homes`), and no link its base had to the file outlives it
+  /// ([`Green::links_unseen`]). The work's deriver declares a removed file's writes only at a base link that outlives
+  /// the work (A-669); otherwise they go with the node in the work's own volume, while the later link keeps the node
+  /// at the head, which the commit hands the head's bytes. The increment cannot say whether the work wrote, so every
+  /// such removal is refused, and the work rebased over the link hands its writes on itself.
+  fn leaves_to_an_unseen_link(
+    &self,
+    path: &str,
+    base: u64,
+    (r, homes): (&Resolved, &BTreeSet<&str>),
+  ) -> bool {
+    self.content.contains_key(path) && !homes.contains(path) && self.links_unseen(path, base, r)
+  }
+
+  /// Whether a link naming the file at `path` was made, or turned to it, after version `base`, while no link the base had
+  /// to it outlives the increment `r` (one `r` neither removes nor turns elsewhere): a work whose base link outlives it
+  /// declares its writes there, or is refused (A-669). Reads the links at `base` ([`Green::links_at`]) only when a link
+  /// was gained, since hard links are few and no index by target is kept.
+  fn links_unseen(&self, path: &str, base: u64, r: &Resolved) -> bool {
+    let gained = self
+      .links_to
+      .get(path)
+      .into_iter()
+      .flatten()
+      .any(|link| self.changed_last(self.hardlink_changed.get(link), link) > base);
+    let outlived = |link: &String| !r.unlinks.contains(link) && !r.hardlinks.contains_key(link);
+    gained
+      && !self
+        .links_at(base)
+        .iter()
+        .any(|(link, target)| target == path && outlived(link))
   }
 
   /// The home whose node passes with the work's writes to the head's link `path` (A-669): `path` is a hard link at the
