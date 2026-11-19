@@ -134,6 +134,23 @@ pub enum DavRefusal {
     /// The room given.
     room: usize,
   },
+  /// An editor call the drive's order does not allow where it came (a close with nothing open, a file's call on a
+  /// directory, a second root): a fault of the drive's producer, refused before a byte of the call is written.
+  DriveOrder {
+    /// The call.
+    call: &'static str,
+  },
+  /// An answer whose drive was aborted: its partial bytes are never sent, so the server answers the drive's refusal
+  /// whole, as `mod_dav` answers an error met before it has sent a byte (`dav_method_report`).
+  Aborted,
+  /// A value the server handed a writer that its answer cannot carry as `mod_dav_svn` writes it (a root path a URL
+  /// cannot hold as it is, a header value with a line break).
+  Unwritable {
+    /// What the value is.
+    what: &'static str,
+    /// The value.
+    value: String,
+  },
 }
 
 /// HTTP 400, Bad Request: every refusal of a body's content.
@@ -158,7 +175,10 @@ impl DavRefusal {
     match self {
       Self::Xml(refusal) if refusal.past_a_bound() => HTTP_CONTENT_TOO_LARGE,
       Self::UnknownReport { .. } => HTTP_NOT_IMPLEMENTED,
-      Self::OutputRoom { .. } => HTTP_INTERNAL_SERVER_ERROR,
+      Self::OutputRoom { .. }
+      | Self::DriveOrder { .. }
+      | Self::Aborted
+      | Self::Unwritable { .. } => HTTP_INTERNAL_SERVER_ERROR,
       _ => HTTP_BAD_REQUEST,
     }
   }
