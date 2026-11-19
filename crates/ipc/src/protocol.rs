@@ -1191,11 +1191,12 @@ pub enum RequestBody {
     /// The branch's name.
     name: String,
   },
-  /// Set repository `repository`'s policy whole (§4.17.1 "Policy"; A-622): its rules by name pattern and its hooks,
-  /// replacing what it held, made from `read`, the policy version its setter read (0 for a repository never given one).
-  /// Its owner's verb. Answered `Acknowledged`, the policy then at version `read + 1`; refused `PolicyChanged` with the
-  /// version now when the policy has moved since `read`, and `Database` naming the first rule or hook its repository
-  /// cannot hold. Appended.
+  /// Set repository `repository`'s policy whole (§4.17.1 "Policy"; A-622): its rules by name pattern, its hooks and the
+  /// keys trusted to sign its commits, replacing what it held, made from `read`, the policy version its setter read (0
+  /// for a repository never given one). Its owner's verb. Answered `Acknowledged`, the policy then at version `read +
+  /// 1`; refused `PolicyChanged` with the version now when the policy has moved since `read`, `Database` naming the
+  /// first rule or hook its repository cannot hold, and `BadRequest` for a signer that is no key slates verifies with
+  /// or signers for a repository that is not git's (A-644). Appended.
   SetRepositoryPolicy {
     /// The repository.
     repository: String,
@@ -1205,6 +1206,10 @@ pub enum RequestBody {
     rules: Vec<PolicyRule>,
     /// The hooks, in order: one point's hooks run in that order.
     hooks: Vec<HookConfig>,
+    /// The keys trusted to sign the repository's commits (A-644), each an SSH public key in wire form
+    /// (`ssh-ed25519` or `sk-ssh-ed25519@openssh.com`, A-321): a commit a rule requires signed verifies under one of
+    /// them. A git repository's alone. Appended.
+    signers: Vec<Vec<u8>>,
   },
 }
 
@@ -1224,7 +1229,7 @@ pub enum PolicyNames {
   Paths,
 }
 
-/// A right a policy rule decides (§4.17.1 "Policy"; A-622).
+/// A right a policy rule decides (§4.17.1 "Policy"; A-622, A-644's requirements).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyRight {
   /// Read the branch.
@@ -1235,6 +1240,12 @@ pub enum PolicyRight {
   Rewrite,
   /// Delete it.
   Delete,
+  /// Bring it a merge commit (A-644): a requirement, which a rule denying it imposes (a linear history) and a later
+  /// rule allowing it lifts for whom it names; where no rule speaks, nothing is required. git's alone. Appended.
+  MergeCommit,
+  /// Bring it a commit no trusted signer signed (A-644): a requirement as `MergeCommit` is (signed commits). git's
+  /// alone. Appended.
+  UnsignedCommit,
 }
 
 /// Whether a policy rule allows its right or denies it (A-622).

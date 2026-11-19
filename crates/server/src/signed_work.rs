@@ -10,7 +10,10 @@
 //! **The format.** OpenSSH's `PROTOCOL.sshsig` under the namespace [`NAMESPACE`] (`ssh-keygen -Y sign -n slates-work
 //! -f KEY FILE`), by an `ssh-ed25519` key (RFC 8709) or a FIDO `sk-ssh-ed25519@openssh.com` key, whose signature must
 //! carry the authenticator's user-presence flag, with the message hashed by `sha512` or `sha256`. A signature made for
-//! anything else (a git commit signs under `git`, a file under `file`) names another namespace and never verifies here.
+//! anything else (a git commit signs under `git`, a file under `file`) names another namespace and never verifies as
+//! signed work. The same verifier reads a git commit's SSH signature under git's own namespace ([`verify_in`],
+//! [`GIT_NAMESPACE`]), against the keys its repository's policy trusts, where a protected branch requires signed
+//! commits (A-644; §4.17.2 "Protected branches"; `crate::git_protect`).
 //!
 //! **What is signed: the statement.** Plain text, one field a line, so `ssh-keygen` signs it as a file and a person
 //! can read what they sign. The first line names the act and the grammar's version, so a merge's statement is never a
@@ -55,6 +58,9 @@ use slates_ipc::protocol::{SignatureFault, Signer, SignerKey, Verification};
 
 /// Format: the SSH signature namespace signed work is signed under (`ssh-keygen -Y sign -n slates-work`).
 pub const NAMESPACE: &str = "slates-work";
+/// Format: the SSH signature namespace git signs and verifies commits under (`ssh-keygen -Y sign -n git`;
+/// gpg-interface.c's `sign_buffer_ssh` and `verify_ssh_signed_buffer`, git v2.50.1; A-644).
+pub const GIT_NAMESPACE: &str = "git";
 /// Format: a merge statement's first line, naming the act and its grammar's version.
 const MERGE_HEADER: &str = "slates merge v1";
 /// Format: a landing statement's first line, naming the act and its grammar's version.
@@ -86,7 +92,8 @@ pub const FINGERPRINT_BYTES: usize = 32;
 pub enum SignatureRefusal {
   /// The armour, the base64 or the blob's grammar is wrong, or a length runs past its bytes.
   Malformed,
-  /// The signature was made under a namespace other than [`NAMESPACE`].
+  /// The signature was made under a namespace other than the one asked for: [`NAMESPACE`] for signed work,
+  /// [`GIT_NAMESPACE`] for a git commit.
   Namespace,
   /// The key type, the signature type or the message hash is not one slates accepts.
   Unsupported,
@@ -428,17 +435,33 @@ pub fn verify<'k>(
   statement: &[u8],
   trusted: &'k [TrustedKey],
 ) -> Result<&'k TrustedKey, SignatureRefusal> {
+  verify_in(NAMESPACE, signature, statement, trusted)
+}
+
+/// Verifies `signature` over `statement` as [`verify`] does, made under `namespace`: [`GIT_NAMESPACE`] for a git commit,
+/// whose statement is the commit without its signature headers (A-644).
+///
+/// # Errors
+/// The [`SignatureRefusal`] that applies.
+pub fn verify_in<'k>(
+  namespace: &str,
+  signature: &[u8],
+  statement: &[u8],
+  trusted: &'k [TrustedKey],
+) -> Result<&'k TrustedKey, SignatureRefusal> {
   let mut reader = Reader(signature);
   if reader.take(SSHSIG_MAGIC.len())? != SSHSIG_MAGIC || reader.u32()? != SSHSIG_VERSION {
     return Err(SignatureRefusal::Malformed);
   }
   let public_blob = reader.string()?;
-  let namespace = reader.string()?;
+  let signed_namespace = reader.string()?;
   let reserved = reader.string()?;
   let hash_name = reader.string()?;
   let signature_blob = reader.string()?;
   reader.end()?;
-  if namespace != NAMESPACE.as_bytes() {
+  let _ = namespace;
+  let namespace = NAMESPACE;
+  if signed_namespace != namespace.as_bytes() {
     return Err(SignatureRefusal::Namespace);
   }
   let key = SshKey::parse(public_blob)?;
@@ -452,7 +475,7 @@ pub fn verify<'k>(
     .find(|candidate| candidate.0 == public_blob)
     .ok_or(SignatureRefusal::UnregisteredKey)?;
   let mut signed = SSHSIG_MAGIC.to_vec();
-  put_string(&mut signed, NAMESPACE.as_bytes())?;
+  put_string(&mut signed, namespace.as_bytes())?;
   put_string(&mut signed, reserved)?;
   put_string(&mut signed, hash_name)?;
   put_string(&mut signed, digest::digest(algorithm, statement).as_ref())?;

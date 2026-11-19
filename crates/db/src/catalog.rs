@@ -1422,6 +1422,10 @@ pub struct RepositoryPolicy {
   pub rules: Vec<PolicyRule>,
   /// The hooks, in the order given: the hooks of one point run in that order.
   pub hooks: Vec<HookConfig>,
+  /// The keys trusted to sign the repository's commits (A-644), each an SSH public key in wire form, in the order set:
+  /// a commit a rule requires signed verifies under one of them (A-321's verifier, under git's namespace). Kept only as
+  /// the server's verb accepted them, and only for a git repository. Appended.
+  pub signers: Vec<Vec<u8>>,
 }
 
 /// What a policy rule's pattern names (§4.17.1; A-597): the names its repository's tool has, each in its tool's form.
@@ -1454,7 +1458,7 @@ impl PolicyNames {
   }
 }
 
-/// A right a policy rule decides (§4.17.1 "Policy").
+/// A right a policy rule decides (§4.17.1 "Policy"; A-644's requirements).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyRight {
   /// Read the branch.
@@ -1465,6 +1469,24 @@ pub enum PolicyRight {
   Rewrite,
   /// Delete it.
   Delete,
+  /// Bring it a merge commit, one of more than one parent, among the commits a change brings (A-644). A requirement: a
+  /// rule denying it keeps the name's history linear, a later one allowing it exempts whom it names, and where no rule
+  /// speaks nothing is required. git's alone. Appended.
+  MergeCommit,
+  /// Bring it a commit that no key of the policy's `signers` signed (A-644). A requirement as `MergeCommit` is: a rule
+  /// denying it requires signed commits. git's alone. Appended.
+  UnsignedCommit,
+}
+
+impl PolicyRight {
+  /// Whether a repository serving `tool` has this right: the requirements are git's alone, the one tool whose push
+  /// path judges them (§4.17.2 "Protected branches").
+  pub fn of(self, tool: VcsTool) -> bool {
+    match self {
+      Self::Read | Self::Submit | Self::Rewrite | Self::Delete => true,
+      Self::MergeCommit | Self::UnsignedCommit => tool == VcsTool::Git,
+    }
+  }
 }
 
 /// Whether a policy rule allows its right or denies it.

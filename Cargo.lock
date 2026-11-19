@@ -1911,6 +1911,7 @@ dependencies = [
  "slates-seal",
  "slates-test-seeds",
  "slates-transport",
+ "slates-vcs",
  "slates-vfs",
  "slates-wire",
  "windows-sys 0.60.2",

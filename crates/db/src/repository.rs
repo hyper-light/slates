@@ -1937,6 +1937,7 @@ mod tests {
       version,
       rules,
       hooks: Vec::new(),
+      signers: Vec::new(),
     }
   }
 

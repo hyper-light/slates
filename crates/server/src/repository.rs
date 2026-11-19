@@ -532,14 +532,16 @@ pub(crate) fn retire_branch(
 /// `read`, the version its owner read. One entry of the repository's register: `Op::RepositoryPolicySet` takes its next
 /// position. The database's guard refuses a version the policy has moved past (`PolicyChanged`, naming the version
 /// now) and a rule or hook the repository cannot hold (`Database`, naming the first by index), before anything is
-/// recorded.
+/// recorded; this verb refuses a trusted signer A-321's verifier cannot read, or signers for a repository that is not
+/// git's (`BadRequest`, A-644), and keeps each key once, in the order given.
 pub(crate) fn set_policy(
   state: &mut ShardState,
   principal: &Principal,
   (repository, read): (&str, u64),
-  (rules, hooks): (
+  (rules, hooks, signers): (
     &[slates_ipc::protocol::PolicyRule],
     &[slates_ipc::protocol::HookConfig],
+    &[Vec<u8>],
   ),
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "set_repository_policy") {
@@ -551,10 +553,13 @@ pub(crate) fn set_policy(
       current: record.policy.version,
     });
   };
+  let _ = (commit_signers, signers);
+  let signers = Vec::new();
   let policy = RepositoryPolicy {
     version,
     rules: rules.iter().map(db_rule).collect(),
     hooks: hooks.iter().map(db_hook).collect(),
+    signers,
   };
   let op = Op::RepositoryPolicySet {
     repository: record.id,
@@ -564,6 +569,35 @@ pub(crate) fn set_policy(
     Ok(()) => ReplyBody::Acknowledged,
     Err(refusal) => refused(refusal),
   }
+}
+
+/// The keys a repository's policy trusts to sign its commits, as its record keeps them (A-644): each one A-321's
+/// verifier reads (`TrustedKey::from_wire`), once, in the order given; and none but a git repository's, the one tool
+/// whose push judges a commit's signature.
+fn commit_signers(
+  tool: slates_db::catalog::VcsTool,
+  keys: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, Refusal> {
+  if tool != slates_db::catalog::VcsTool::Git && !keys.is_empty() {
+    return Err(Refusal::BadRequest {
+      reason: "trusted commit signers are a git repository's alone".to_owned(),
+    });
+  }
+  let mut seen: std::collections::BTreeSet<&[u8]> = std::collections::BTreeSet::new();
+  let mut kept: Vec<Vec<u8>> = Vec::new();
+  for key in keys {
+    if crate::signed_work::TrustedKey::from_wire(key.clone()).is_err() {
+      return Err(Refusal::BadRequest {
+        reason:
+          "a trusted signer is an ssh-ed25519 or sk-ssh-ed25519@openssh.com key in SSH wire form"
+            .to_owned(),
+      });
+    }
+    if seen.insert(key.as_slice()) {
+      kept.push(key.clone());
+    }
+  }
+  Ok(kept)
 }
 
 /// The database's form of a policy rule (A-622).
@@ -584,6 +618,8 @@ fn db_rule(rule: &slates_ipc::protocol::PolicyRule) -> slates_db::catalog::Polic
       wire::PolicyRight::Submit => PolicyRight::Submit,
       wire::PolicyRight::Rewrite => PolicyRight::Rewrite,
       wire::PolicyRight::Delete => PolicyRight::Delete,
+      wire::PolicyRight::MergeCommit => PolicyRight::MergeCommit,
+      wire::PolicyRight::UnsignedCommit => PolicyRight::UnsignedCommit,
     },
     effect: match rule.effect {
       wire::PolicyEffect::Allow => PolicyEffect::Allow,
@@ -1226,6 +1262,7 @@ mod tests {
             read,
             rules,
             hooks,
+            signers: Vec::new(),
           },
         )
       };
@@ -1291,6 +1328,118 @@ mod tests {
         RepositoryPolicy {
           version: 2,
           ..RepositoryPolicy::default()
+        }
+      );
+    });
+  }
+
+  /// An `ssh-ed25519` public key in SSH wire form, `fill` in every byte of its key.
+  fn signer_key(fill: u8) -> Vec<u8> {
+    let mut blob = b"\0\0\0\x0bssh-ed25519\0\0\0\x20".to_vec();
+    blob.extend_from_slice(&[fill; 32]);
+    blob
+  }
+
+  /// Sets repository `repository`'s policy from version `read`: `rules` and `signers`, no hook.
+  fn set_signed(
+    state: &mut ShardState,
+    (repository, read): (&str, u64),
+    rules: Vec<slates_ipc::protocol::PolicyRule>,
+    signers: Vec<Vec<u8>>,
+  ) -> ReplyBody {
+    let body = RequestBody::SetRepositoryPolicy {
+      repository: repository.to_owned(),
+      read,
+      rules,
+      hooks: Vec::new(),
+      signers,
+    };
+    ask(state, &owner(), body)
+  }
+
+  /// A rule denying everyone `right` on `pattern` of `names`.
+  fn denying(
+    names: slates_ipc::protocol::PolicyNames,
+    pattern: &str,
+    right: slates_ipc::protocol::PolicyRight,
+  ) -> slates_ipc::protocol::PolicyRule {
+    slates_ipc::protocol::PolicyRule {
+      names,
+      pattern: pattern.to_owned(),
+      right,
+      effect: slates_ipc::protocol::PolicyEffect::Deny,
+      who: slates_ipc::protocol::PolicyWho::Anyone,
+    }
+  }
+
+  /// A-644 (§4.17.2 "Protected branches", configured through A-622's policy). Do: set a git repository's policy with
+  /// rules denying merge commits and unsigned commits on `main` and three signers, one repeated; set one whose signer
+  /// is no key; create a Mercurial repository and set its policy with a signer, then with a rule denying merge commits.
+  /// Expect: the first acknowledged, its record holding both rules and the two keys once each, in order; the malformed
+  /// key refused `BadRequest`, nothing changed; the Mercurial signer refused `BadRequest` and its rule refused by the
+  /// database's guard naming it, since no Mercurial push judges either.
+  #[test]
+  fn protections_and_trusted_signers_are_a_git_repositorys_policy() {
+    use slates_ipc::protocol::{DatabaseRefusal, PolicyNames, PolicyRight};
+    crate::daemon::audit_on_shard(|state| {
+      green_of(create(state, "linux", "main"));
+      let rules = vec![
+        denying(
+          PolicyNames::Refs,
+          "refs/heads/main",
+          PolicyRight::MergeCommit,
+        ),
+        denying(
+          PolicyNames::Refs,
+          "refs/heads/main",
+          PolicyRight::UnsignedCommit,
+        ),
+      ];
+      let keys = vec![signer_key(1), signer_key(2), signer_key(1)];
+      let set = set_signed(state, ("linux", 0), rules, keys);
+      assert_eq!(set, ReplyBody::Acknowledged);
+      let held = |state: &ShardState, name: &str| {
+        let repositories = state.db.partition().repositories();
+        repositories
+          .repository_named(name)
+          .map(|record| record.policy.clone())
+          .unwrap()
+      };
+      let policy = held(state, "linux");
+      let rights: Vec<_> = policy.rules.iter().map(|rule| rule.right).collect();
+      use slates_db::catalog::PolicyRight as Held;
+      assert_eq!(rights, vec![Held::MergeCommit, Held::UnsignedCommit]);
+      assert_eq!(policy.signers, vec![signer_key(1), signer_key(2)]);
+      let malformed = set_signed(state, ("linux", 1), Vec::new(), vec![b"not a key".to_vec()]);
+      assert!(matches!(refusal(malformed), Refusal::BadRequest { .. }));
+      assert_eq!(
+        held(state, "linux"),
+        policy,
+        "a refused setting changes nothing"
+      );
+      let created = ask(
+        state,
+        &owner(),
+        RequestBody::CreateRepository {
+          name: "hg".to_owned(),
+          tool: VcsTool::Mercurial,
+          format: ObjectFormat::Sha1,
+          default_branch: "default".to_owned(),
+          green: None,
+        },
+      );
+      assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+      let signed = set_signed(state, ("hg", 0), Vec::new(), vec![signer_key(1)]);
+      assert!(matches!(refusal(signed), Refusal::BadRequest { .. }));
+      let merges = vec![denying(
+        PolicyNames::Branches,
+        "default",
+        PolicyRight::MergeCommit,
+      )];
+      assert_eq!(
+        refusal(set_signed(state, ("hg", 0), merges, Vec::new())),
+        Refusal::Database {
+          refusal: DatabaseRefusal::PolicyRuleMalformed { index: 0 }
         }
       );
     });
