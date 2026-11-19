@@ -625,6 +625,68 @@ fn the_repositorys_state_is_charged_to_the_merge_budget_and_given_back_with_it()
   advance(&mut partition, again).unwrap();
 }
 
+/// A-662 (§4.17.1 "Durability and residency": a push's objects held as a version holds its files' contents). Do: append
+/// two pushes, each a version of the root and its objects; then one whose objects pass the merge budget; rebuild the
+/// partition from its snapshot; destroy the repository and make another. Expect: the objects read back in the order
+/// the register received them; a push of one green and its objects is no atomic record, since the objects take no
+/// position; the one past the budget is refused `Capacity` with nothing kept; the rebuilt partition reads the same
+/// objects and charges them; the destroy gives their bytes back, so objects as large fit the next repository.
+#[test]
+fn a_pushs_objects_are_kept_in_order_charged_carried_by_a_snapshot_and_given_back_with_the_repository()
+ {
+  let budget = caps(256);
+  let (mut partition, repo, [a, ..]) = three_branches(budget);
+  for (at_version, byte) in [(1, 7u8), (2, 8)] {
+    let mut pushed = at(repo);
+    pushed.versions = vec![version(a, at_version, &[byte; 10])];
+    pushed.objects = vec![byte; 50];
+    advance(&mut partition, pushed).unwrap();
+  }
+  assert_eq!(partition.repositories().atomic_at(a, 1), None);
+  let kept: Vec<Vec<u8>> = partition
+    .repositories()
+    .objects(repo)
+    .map(<[u8]>::to_vec)
+    .collect();
+  assert_eq!(kept, vec![vec![7u8; 50], vec![8u8; 50]]);
+  assert_eq!(
+    partition.repositories().object_record(repo, 1),
+    Some(&[8u8; 50][..])
+  );
+  let before = partition.to_snapshot(0);
+  let full = Err(DbError::Capacity {
+    table: "green_chains",
+  });
+  let mut large = at(repo);
+  large.versions = vec![version(a, 3, &[9; 10])];
+  large.objects = vec![9; 150];
+  assert_eq!(advance(&mut partition, large.clone()), full);
+  assert_eq!(partition.to_snapshot(0), before);
+  let mut rebuilt = Partition::from_snapshot(&before, budget, 0).unwrap();
+  assert!(
+    rebuilt
+      .repositories()
+      .objects(repo)
+      .eq(partition.repositories().objects(repo))
+  );
+  assert_eq!(
+    advance(&mut rebuilt, large),
+    full,
+    "a rebuilt partition charges the objects it carries"
+  );
+  run(
+    &mut partition,
+    &Op::RepositoryDestroyed { repository: repo },
+  )
+  .unwrap();
+  assert_eq!(partition.repositories().objects(repo).count(), 0);
+  second_repository_with_root(&mut partition, green(6));
+  let mut again = at(repository_id(10));
+  again.objects = vec![9; 150];
+  again.state = vec![marker(&[1; 10])];
+  advance(&mut partition, again).unwrap();
+}
+
 /// A-642 (no global reference: each green and each state log at its own position). Do: append to one green alone, to
 /// two at once, and to a third alone after an entry was made against the first's position before the second moved;
 /// change names alone; record a member's version alone (`GreenAdvanced`); check a log after another log moved. Expect:

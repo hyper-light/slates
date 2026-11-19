@@ -126,6 +126,33 @@ fn rebuild_rule() {
   assert!(rebuild.due());
 }
 
+/// A-662 (a push's chain carried by its record, `Push::carried`). Do: commit a push whose pack
+/// carried chains two deep; then move another ref to its head with a push of no object, handed a
+/// chain three deep as a replay hands a record's; then a third ref with one handed a chain past
+/// git's limit. Expect: the learned depth two, then three, then git's limit: a push that brings
+/// no object teaches the store the chain its pack carried, as the live push's commit did.
+#[test]
+fn a_chain_carried_by_a_push_of_no_object_teaches_the_depth() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let objects = commit_over(format, &text(8, &[]), &[], 1);
+  let head = objects[0].id;
+  push_and_move(&mut repository, &mut store, objects, &[(1, Some(head))]).unwrap();
+  assert_eq!(repository.learned_depth(), 2);
+  let limit = crate::store::learn::DEPTH_LIMIT;
+  for (green, carried, learned) in [(2, 3, 3), (3, u64::MAX, limit)] {
+    let mut push = Push::new(format);
+    push.carried(carried);
+    repository.seal(&store, &mut push).unwrap();
+    let admitted = repository.admit(&store, &push, green, Some(head)).unwrap();
+    repository
+      .commit(&mut store, &mut push, &[admitted])
+      .unwrap();
+    assert_eq!(repository.learned_depth(), learned);
+  }
+}
+
 /// A commit over `big` (a text file) and `small`, and its objects.
 pub(super) fn commit_over(
   format: ObjectFormat,
