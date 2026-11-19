@@ -183,9 +183,9 @@ pub mod credentials;
 #[cfg_attr(not(test), allow(dead_code))]
 mod svn_hooks;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
-// each phase's wait learned, the bounds derived from the shard's budget, git's site, a connection moved to its
-// repository's shard, and the daemon's start. Upload-pack's store lender has no caller outside tests until each
-// repository's store lives on its owner shard (A-662).
+// each phase's wait learned, the bounds derived from the shard's budget, git's site, Mercurial's (A-650), a connection
+// moved to its repository's shard, and the daemon's start. Upload-pack's store lender has no caller outside tests until
+// each repository's store lives on its owner shard (A-662).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
 // §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each

@@ -2,7 +2,8 @@
 //! `decodevaluefromheaders`, `_httpresponsetype`, `genversion2`, `_callhttp`, and `httppeer.py`
 //! `makev1commandrequest`, `encodevalueinheaders` \[C\]).
 //!
-//! A command is the `cmd` field of the request's query. Its arguments are form fields (`urlencode`: `name=value`
+//! A command is the last `cmd` field of the request's query, as hgweb reads it (`req.qsparams[b'cmd']`, whose
+//! `multidict` answers a field's last value). Its arguments are form fields (`urlencode`: `name=value`
 //! joined by `&`, a space as `+`, other bytes `%XX`), read as 7.2's server reads them (`_args`): the query's fields,
 //! overridden name by name either by the first `X-HgArgs-Post` bytes of the body, when that header is sent and not
 //! zero (7.2's client sends it when the server advertises `httppostargs`), or else by the values of the headers
@@ -338,9 +339,15 @@ fn first<'b>(fields: &[(&'b [u8], &'b [u8])], name: &[u8]) -> Option<&'b [u8]> {
 type Pairs<'b> = Vec<(&'b [u8], &'b [u8])>;
 
 impl<'b> Fields<'b> {
-  /// The command: the query's first `cmd` field.
+  /// The command: the query's last `cmd` field, as hgweb's `multidict` answers a field's last value
+  /// (`req.qsparams[b'cmd']`; `hgweb/request.py`).
   pub fn command(&self) -> Option<&'b [u8]> {
-    first(&self.query, COMMAND)
+    self
+      .query
+      .iter()
+      .rev()
+      .find(|(known, _)| *known == COMMAND)
+      .map(|(_, value)| *value)
   }
 
   /// The value 7.2 reads for `name` (`knownargs[k][0]`): the arguments' first field of that name, else the query's.
@@ -621,6 +628,18 @@ mod tests {
     let expected: [(&[u8], &[u8]); 3] = [(b"a", b"3"), (b"b", b"2"), (b"c", b"5")];
     let arguments = read.arguments(Spec(b"*"), &mut room()).unwrap();
     assert_eq!(arguments.dictionary, expected);
+  }
+
+  /// A-650 part 1: do send a query naming `cmd` twice, and an argument twice. Expect the command the last `cmd`, as
+  /// hgweb's `multidict` reads it (7.2 serves the last), and the argument its first value, as `getargs` reads it.
+  #[test]
+  fn a_repeated_command_field_reads_its_last_value() {
+    let mut buffer = Vec::new();
+    let read = decode(b"cmd=heads&key=a&cmd=lookup&key=b", &[], b"", &mut buffer).unwrap();
+    assert_eq!(
+      (read.command(), read.value(b"key")),
+      (Some(&b"lookup"[..]), Some(&b"a"[..]))
+    );
   }
 
   /// AC-HG.9 (hostile input), A-569: do declare post arguments longer than the body, a post length that is not
