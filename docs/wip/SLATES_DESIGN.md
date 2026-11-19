@@ -44789,7 +44789,8 @@ fixtures `lock-steal.xml` and five request heads).
   Every source read is in the notes' §1 with its hash.
 - **Tests and the run.** 33 tests in `dav::drive` (12) and `dav::locking` (21). `cargo test --locked -p slates-svn
   --lib` on the Mac Studio, 2026-11-19: 351 of 351 on the branch (65078aed2), then 357 of 357 on the tree merged with
-  main (585458a4c); `cargo fmt -p slates-svn -- --check` clean. Red on a copy with six mutations (replay's `dir` named
+  main (585458a4c), and 390 of 390 merged again with A-616's drive over the index in (2b4ccaaef); `cargo fmt -p
+  slates-svn -- --check` clean each time. Red on a copy with six mutations (replay's `dir` named
   `directory`, no revision written 0, LOCK's blank line dropped, a held lock not 423, the floor under `Timeout` gone,
   a body's namespaces in tag order): 7 of 351 failed, each mutation's tests among them but the last's, whose test
   declared one new namespace on an element, where both orders agree. With two declared, the namespace mutation alone
