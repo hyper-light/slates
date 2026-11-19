@@ -43081,6 +43081,6 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
   eee90bd82): `cargo test --locked -p slates-svn --lib` 245 of 245 in 2.08 s; the prototype oracle's census: 136
   generated items read alike, 93 refused alike, 27 refused by the stricter rules alone. The module's line citations were
   checked against the sources at `d434dc14` before landing, and 23 of them corrected. On the tree merged with main
-  (8ef924a7b, 05:39 UTC): 295 of 295 in 8.53 s, the census 141, 98 and 17; `cargo fmt -p slates-svn -- --check` clean.
+  (0234aaa50, 05:42 UTC): 315 of 315 in 8.82 s, the census 153, 70 and 33; `cargo fmt -p slates-svn -- --check` clean.
   Clippy, `xtask check` and the doc gate are main's (the run-request queue).
 - **Owed.** Part 2b, the drive (§4.17.4's status).
