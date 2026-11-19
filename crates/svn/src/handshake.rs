@@ -501,7 +501,9 @@ impl Server {
       item_bytes,
       word_bytes: LONGEST_WORD,
       depth: CLIENT_DEPTH,
-      nodes: item_bytes.checked_div(SMALLEST_ITEM_BYTES).unwrap_or(0),
+      nodes: item_bytes
+        .checked_div(PARSED_ITEM_BYTES.max(SMALLEST_ITEM_BYTES))
+        .unwrap_or(0),
     };
     let capabilities = SERVER_CAPABILITIES.iter().map(|word| Value::Word(word)).collect();
     let greeting = Value::List(vec![
@@ -942,7 +944,6 @@ fn client_strings<'a>(
       Some(Value::String(client)) => Ok((Some(ra_client), Some(client))),
       Some(_) => Err(Refused::NotAnswer),
     },
-    (Some(Value::String(ra_client)), None) => Ok((Some(ra_client), None)),
     _ => Err(Refused::NotAnswer),
   }
 }
@@ -968,6 +969,9 @@ fn auth_response<'a>(value: &Value<'a>) -> Result<(&'a str, Option<&'a [u8]>), R
 /// 32 lowercase hexadecimal digits. A response holding a NUL byte is refused whole, as `cram.c` refuses every one: it
 /// reads the response as a C string, so the digest after the last space before the NUL holds the NUL or is too short.
 fn split_response(response: &[u8]) -> Option<(&[u8], [u8; DIGEST_BYTES])> {
+  if response.contains(&C_STRING_END) {
+    return None;
+  }
   let separator = response
     .iter()
     .rposition(|byte| *byte == RESPONSE_SEPARATOR)?;
