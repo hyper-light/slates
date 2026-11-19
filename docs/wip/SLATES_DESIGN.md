@@ -49368,7 +49368,8 @@ docs), `crates/merge/src/engine/copy_tests.rs` (the replica test's comparison be
   is `hg` (slates runs no hg of its own, so a hook's `$HG` is the first on its search path); `HG_TXNID` is `TXN:` and
   forty digits of a BLAKE3 key derived from the push's name (7.2's hashes its transaction's start: one value a push,
   which no hook can predict).
-- **Evidence** (macOS arm64, Mac Studio, kiln r175, 2026-11-19, debug, on 97cc365b3). Red first: `changegroup_env`
+- **Evidence** (macOS arm64, Mac Studio, kiln r184, 2026-11-19, debug, on the merged tree that lands, 3e2fb9569; r175
+  on 97cc365b3 before the merge alike). Red first: `changegroup_env`
   without the five variables, `cargo test --locked -p slates-server --lib
   vcs_hooks::tests::mercurials_hooks_get_the_environment_stock_7_2_hands_them` failed, 7 names against 7.2's recorded
   12. Green: `cargo test --locked -p slates-server --lib -- hg_push vcs_hooks --test-threads=4` 47 of 47, its build
