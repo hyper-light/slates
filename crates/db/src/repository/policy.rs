@@ -51,11 +51,16 @@ pub(super) fn bytes(policy: &RepositoryPolicy) -> usize {
     .iter()
     .map(|rule| rule.to_bytes().len())
     .fold(0, usize::saturating_add);
-  policy
+  let hooks = policy
     .hooks
     .iter()
     .map(|hook| hook.to_bytes().len())
-    .fold(rules, usize::saturating_add)
+    .fold(rules, usize::saturating_add);
+  policy
+    .signers
+    .iter()
+    .map(|key| key.to_bytes().len())
+    .fold(hooks, usize::saturating_add)
 }
 
 /// An item's index among its part of the policy, as a refusal names it.
@@ -67,6 +72,7 @@ fn index_of(index: usize) -> u32 {
 fn rule_holds(tool: VcsTool, rule: &PolicyRule) -> bool {
   let pattern = rule.pattern.as_str();
   rule.names.of(tool)
+    && rule.right.of(tool)
     && !pattern.is_empty()
     && !pattern.contains('\0')
     && (rule.names != PolicyNames::Paths

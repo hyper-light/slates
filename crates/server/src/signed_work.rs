@@ -459,8 +459,6 @@ pub fn verify_in<'k>(
   let hash_name = reader.string()?;
   let signature_blob = reader.string()?;
   reader.end()?;
-  let _ = namespace;
-  let namespace = NAMESPACE;
   if signed_namespace != namespace.as_bytes() {
     return Err(SignatureRefusal::Namespace);
   }
