@@ -803,6 +803,44 @@ fn an_update_the_principal_may_not_read_is_refused_where_authentication_cannot_h
   assert_eq!(connection.waiting(), Waiting::Command);
 }
 
+/// A check of `secret` beneath `/trunk`, which only alice may read (`make-fixtures.py` `AUTHZ`).
+const CHECK_SECRET: &[u8] = b"( check-path ( 6:secret ( ) ) ) ";
+
+/// An update of the session's path, `/trunk`, to r6 from a working copy that holds nothing, with
+/// its report.
+const UPDATE_TRUNK_FROM_NOTHING: &[u8] = b"( update ( ( 6 ) 0: true infinity false false ) ) \
+  ( set-path ( 0: 6 true ( ) infinity ) ) ( finish-report ( ) ) ";
+
+/// g297's step-6 finding (one principal's read rule from one source; A-606, `serve.c`
+/// `authz_check_access`): on the fixtures' repository, whose rules keep `/trunk/secret` from all
+/// but alice, an anonymous session whose caller's guards hide nothing; where users hold no keys,
+/// check `secret`, then ask to update it; where they do, update `/trunk` from nothing. Expect the
+/// check and the update both refused "Authorization failed" (170001), and the update of `/trunk`
+/// to send `secret` absent and never add it: the update, its drive and the read commands judge the
+/// one path by the one rule set the connection compiled for the principal.
+#[test]
+fn an_update_and_the_reads_judge_one_path_by_the_one_rule_set() {
+  let fixture = fixture();
+  let hides_nothing = FixtureGuards::default();
+  let keyless = Repository {
+    cram_md5: false,
+    ..fixtures_repository()
+  };
+  let mut connection = established_on(&keyless, ANONYMOUSLY);
+  let (checked, _) = send(&fixture, &hides_nothing, &mut connection, CHECK_SECRET);
+  let (updated, _) = send(&fixture, &hides_nothing, &mut connection, UPDATE_SECRET);
+  assert_eq!((checked, updated), (not_authorized(), not_authorized()));
+  let mut connection = established();
+  let edit = send_in_slices(
+    &fixture,
+    &hides_nothing,
+    &mut connection,
+    UPDATE_TRUNK_FROM_NOTHING,
+  );
+  assert!(edit.contains("( absent-dir ( 6:secret "), "{edit}");
+  assert!(!edit.contains("( add-dir ( 6:secret "), "{edit}");
+}
+
 /// Sends `command` on an established connection a byte of room and a step a call, until the
 /// connection awaits its next command, and returns what it wrote.
 fn send_in_slices(
