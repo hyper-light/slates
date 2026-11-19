@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 /// Shape: how long the anchor and its daemon get to come up (a quick profile plus two
 /// starts), and how long the daemon gets to leave after its anchor dies.
 const START_WAIT: Duration = Duration::from_secs(20);
-/// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's `UMNT` to show in
+/// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's unmount (A-511) to show in
 /// `status` — ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s; a client is asked about once silent for
 /// one budget, so a death shows within two).
 const WAIT_FOR: Duration = Duration::from_secs(10);
@@ -1531,9 +1531,9 @@ fn the_macos_mount_is_nosuid_and_nodev(path: &str) {
   }
 }
 
-/// Shape: how long a forged `UMNT` is watched for effect: three times the bound a fresh daemon's first confirmation
-/// waits (the liveness window before any unmount was measured; `crates/server/src/nfs.rs`, `unmount_bound_ns`, A-493),
-/// so a loaded box's delay cannot hide an ended attachment.
+/// Shape: how long a forged `UMNT` is watched for effect: three times the longest a `UMNT` ever led the daemon to wait
+/// (one liveness window, the first bound of the timed confirmation A-511 removed), so a regression that brings a
+/// `UMNT`'s effect back cannot hide behind a loaded box's delay.
 #[cfg(target_os = "macos")]
 const FORGED_UNMOUNT_WATCH: Duration = Duration::from_secs(3);
 
@@ -1586,9 +1586,9 @@ fn an_export_names_the_port_the_kernel_mount_uses(instance: &str, id: &str, path
   assert_eq!(code, 0, "detach: {err}");
 }
 
-/// §4.6 A-34: a `UMNT` proves nothing by itself, since any local process can send one. Do send the
-/// daemon a forged `UMNT /<name>` while the volume is mounted, as another user could; expect the mount's
-/// attachment to survive past the daemon's confirmation deadline, and the mount to keep serving.
+/// §4.6 A-34, A-511: a `UMNT` proves nothing by itself, since any local process can send one, so it ends nothing; only
+/// the kernel's own unmount event does. Do send the daemon a forged `UMNT /<name>` while the volume is mounted, as
+/// another user could; expect the mount's attachment to survive the whole watch, and the mount to keep serving.
 #[cfg(target_os = "macos")]
 fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &str) {
   use slates_bridge_nfs::client::{Credentials, exchange, umnt_call};
@@ -1598,13 +1598,9 @@ fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &st
     gid: 0,
     gids: Vec::new(),
   };
-  exchange(
-    port,
-    &umnt_call(1, &caller, &format!("/{name}")),
-    Duration::from_secs(5),
-  )
-  .expect("the daemon answers the forged UMNT");
-  // Watched past the daemon's confirmation deadline (one liveness budget), with room for a loaded box:
+  exchange(port, &umnt_call(1, &caller, &format!("/{name}")))
+    .expect("the daemon answers the forged UMNT");
+  // Watched past the longest a `UMNT` ever led the daemon to wait (one liveness budget), with room for a loaded box:
   // the attachment must hold the whole time.
   let watch_until = Instant::now() + FORGED_UNMOUNT_WATCH;
   while Instant::now() < watch_until {
@@ -1786,11 +1782,11 @@ fn unmount_and_check(instance: &str, id: &str, path: &str) {
     !is_mounted(path),
     "the kernel mount table no longer lists it"
   );
-  // The kernel's own `UMNT` ended the mount's attachment (AUD-01): the volume reports none, and no
-  // bound mount point remains.
+  // The kernel's unmount ended the mount's attachment (AUD-01), seen through the kernel's own event on macOS (A-511)
+  // and the FUSE device's close on Linux: the volume reports none, and no bound mount point remains.
   assert!(
     wait_for(|| attachments_of(instance, id) == "0"),
-    "the kernel's UMNT ended the mount's attachment: {}",
+    "the kernel's unmount ended the mount's attachment: {}",
     attachments_of(instance, id)
   );
   let (code, out, err) = run(instance, &["status", id]);
@@ -12460,7 +12456,7 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
     .publish(RegionKind::Profile, profile.to_json().unwrap().as_bytes())
     .unwrap();
   let args = ["--ignored", "--exact", "garbling_daemon", "--nocapture"].map(str::to_owned);
-  let policy = RestartPolicy::derive(config.failover_slo_ns);
+  let policy = RestartPolicy::derive(config.nfs_v4.lease_ns);
   let mut anchor = SupervisingTest(Supervisor::new(segment, &args, policy.get()).unwrap());
   anchor
     .0

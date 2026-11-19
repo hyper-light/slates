@@ -40,6 +40,106 @@ const TIMESTAMP_LEN: usize = 16;
 /// Format: a date's length, `YYYYMMDD`, the timestamp's first part and the scope's first field.
 const DATE_LEN: usize = 8;
 
+/// Format: seconds in a day, the timestamp's split of a Unix time into its day and its time of day.
+const SECONDS_PER_DAY: u64 = 86_400;
+/// Format: seconds in an hour and in a minute.
+const SECONDS_PER_HOUR: u64 = 3_600;
+/// Format: see [`SECONDS_PER_HOUR`].
+const SECONDS_PER_MINUTE: u64 = 60;
+/// Format: the days from 0000-03-01 to 1970-01-01 in the proleptic Gregorian calendar, which shifts the Unix epoch's
+/// day count into an era that begins on a March 1st (Howard Hinnant, "chrono-Compatible Low-Level Date Algorithms",
+/// `civil_from_days`).
+const EPOCH_SHIFT_DAYS: u64 = 719_468;
+/// Format: a common year's days.
+const DAYS_PER_YEAR: u64 = 365;
+/// Format: the Gregorian leap rule's periods: a leap day every fourth year, none in a century's last year, and one
+/// again every fourth century.
+const YEARS_PER_LEAP: u64 = 4;
+/// Format: see [`YEARS_PER_LEAP`].
+const YEARS_PER_CENTURY: u64 = 100;
+/// Format: see [`YEARS_PER_LEAP`]; an era, after which the calendar's days repeat.
+const YEARS_PER_ERA: u64 = 400;
+/// Derived: the days of four common years, the span after which the year formula takes a leap day off (1,460).
+const DAYS_PER_FOUR_COMMON_YEARS: u64 = DAYS_PER_YEAR * YEARS_PER_LEAP;
+/// Derived: the days of a century with no leap day in its last year: a hundred common years and 24 leap days (36,524).
+const DAYS_PER_CENTURY: u64 =
+  DAYS_PER_YEAR * YEARS_PER_CENTURY + YEARS_PER_CENTURY / YEARS_PER_LEAP - 1;
+/// Derived: the days of an era: four hundred common years, a leap day every fourth year, less the three centuries' last
+/// years that are no leap years (146,097).
+const DAYS_PER_ERA: u64 = DAYS_PER_YEAR * YEARS_PER_ERA + YEARS_PER_ERA / YEARS_PER_LEAP
+  - YEARS_PER_ERA / YEARS_PER_CENTURY
+  + 1;
+/// Format: the days of March through July, 31 + 30 + 31 + 30 + 31: counted from March, the months' lengths repeat in
+/// runs of five (August through December, then January and February cut short), so a day `doy` of the year from March
+/// lies in month `(5·doy + 2) / 153` (Hinnant's `civil_from_days`).
+const DAYS_PER_FIVE_MONTHS: u64 = 153;
+/// Format: see [`DAYS_PER_FIVE_MONTHS`].
+const FIVE_MONTHS: u64 = 5;
+/// Format: March's number, the first month of a year counted from March, which ends with February and its leap day.
+const MARCH: u64 = 3;
+/// Format: a year's months.
+const MONTHS_PER_YEAR: u64 = 12;
+
+/// `unix_seconds` as `x-amz-date`'s timestamp, `YYYYMMDD'T'HHMMSS'Z'` in UTC: the day by Hinnant's `civil_from_days`
+/// over the proleptic Gregorian calendar, with years counted from March so that a leap day ends its year.
+pub fn amz_timestamp(unix_seconds: u64) -> String {
+  let day = unix_seconds.checked_div(SECONDS_PER_DAY).unwrap_or(0);
+  let time = unix_seconds.checked_rem(SECONDS_PER_DAY).unwrap_or(0);
+  let shifted = day.saturating_add(EPOCH_SHIFT_DAYS);
+  let era = shifted.checked_div(DAYS_PER_ERA).unwrap_or(0);
+  let day_of_era = shifted.saturating_sub(era.saturating_mul(DAYS_PER_ERA));
+  let year_of_era = day_of_era
+    .saturating_sub(
+      day_of_era
+        .checked_div(DAYS_PER_FOUR_COMMON_YEARS)
+        .unwrap_or(0),
+    )
+    .saturating_add(day_of_era.checked_div(DAYS_PER_CENTURY).unwrap_or(0))
+    .saturating_sub(
+      day_of_era
+        .checked_div(DAYS_PER_ERA.saturating_sub(1))
+        .unwrap_or(0),
+    )
+    .checked_div(DAYS_PER_YEAR)
+    .unwrap_or(0);
+  let day_of_year = day_of_era.saturating_sub(
+    year_of_era
+      .saturating_mul(DAYS_PER_YEAR)
+      .saturating_add(year_of_era.checked_div(YEARS_PER_LEAP).unwrap_or(0))
+      .saturating_sub(year_of_era.checked_div(YEARS_PER_CENTURY).unwrap_or(0)),
+  );
+  let month_from_march = day_of_year
+    .saturating_mul(FIVE_MONTHS)
+    .saturating_add(2)
+    .checked_div(DAYS_PER_FIVE_MONTHS)
+    .unwrap_or(0);
+  let day_of_month = day_of_year
+    .saturating_sub(
+      month_from_march
+        .saturating_mul(DAYS_PER_FIVE_MONTHS)
+        .saturating_add(2)
+        .checked_div(FIVE_MONTHS)
+        .unwrap_or(0),
+    )
+    .saturating_add(1);
+  let counted = month_from_march.saturating_add(MARCH);
+  let month = if counted > MONTHS_PER_YEAR {
+    counted.saturating_sub(MONTHS_PER_YEAR)
+  } else {
+    counted
+  };
+  let year = year_of_era
+    .saturating_add(era.saturating_mul(YEARS_PER_ERA))
+    .saturating_add(u64::from(month < MARCH));
+  let hour = time.checked_div(SECONDS_PER_HOUR).unwrap_or(0);
+  let minute = time
+    .checked_rem(SECONDS_PER_HOUR)
+    .and_then(|rest| rest.checked_div(SECONDS_PER_MINUTE))
+    .unwrap_or(0);
+  let second = time.checked_rem(SECONDS_PER_MINUTE).unwrap_or(0);
+  format!("{year:04}{month:02}{day_of_month:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
 /// A credential to sign with, as Mantle hands it: an access key id, its secret, and, for a temporary credential, its
 /// session token. Its `Debug` shows the access key id alone.
 #[derive(Clone, PartialEq, Eq)]
@@ -217,8 +317,9 @@ fn canonical_headers(headers: &[(&str, &str)]) -> (String, String) {
 }
 
 /// The canonical query string: each name and value encoded, the pairs sorted by name and then value once encoded,
-/// joined by `&`; an empty string for no query.
-fn canonical_query(query: &[(&str, &str)]) -> String {
+/// joined by `&`; an empty string for no query. A request's target carries the same string, so what is sent is what was
+/// signed.
+pub fn canonical_query(query: &[(&str, &str)]) -> String {
   let mut pairs: Vec<(String, String)> = query
     .iter()
     .map(|(name, value)| (uri_encode(name, true), uri_encode(value, true)))
@@ -566,6 +667,21 @@ mod tests {
     let shown = format!("{credentials:?}");
     assert!(shown.contains(ACCESS_KEY_ID));
     assert!(!shown.contains(SECRET) && !shown.contains(token), "{shown}");
+  }
+
+  /// A-471: do format Unix times as `x-amz-date` timestamps: the epoch, the S3 page's example time, a leap day in a
+  /// century leap year and in an ordinary one, and the last second of year 9999. Expect each as the calendar has it.
+  #[test]
+  fn unix_times_format_as_the_calendar_has_them() {
+    for (seconds, timestamp) in [
+      (0, "19700101T000000Z"),
+      (1_369_353_600, "20130524T000000Z"),
+      (951_782_400, "20000229T000000Z"),
+      (1_709_164_800, "20240229T000000Z"),
+      (253_402_300_799, "99991231T235959Z"),
+    ] {
+      assert_eq!(amz_timestamp(seconds), timestamp, "{seconds}");
+    }
   }
 
   /// A-464: do sign at a timestamp not in `YYYYMMDD'T'HHMMSS'Z'` form and in a region a scope cannot carry. Expect each

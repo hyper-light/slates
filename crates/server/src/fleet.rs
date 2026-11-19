@@ -2533,7 +2533,15 @@ fn owed_catalog(
     state,
     config,
     (catalog, record.catalog_version),
-    crate::catalog::CatalogValue::of(record).to_record_bytes(),
+    crate::catalog::CatalogValue::of(
+      record,
+      state
+        .db
+        .partition()
+        .carried(record.id)
+        .map(|(carried, _)| carried),
+    )
+    .to_record_bytes(),
     local,
   );
   let committed = state.placed_heads.get(&catalog).is_some_and(|head| {
@@ -3404,13 +3412,17 @@ fn heal_for(
   let configuration = state.fleet.configuration();
   let quorum = configuration.quorum;
   let candidates = configuration.place(object).candidates;
+  let adopted = crate::takeover::adopted_here(state, object);
   let (heal, found) = heal_decision(
     local,
     region,
     &state.council.configuration().members,
     &candidates,
-    quorum,
+    (quorum, adopted),
   );
+  if adopted && heal == Some(Heal::Replace) && found.named_outside_candidates {
+    state.count(HEAL_ADOPTED_REPLACED, 1);
+  }
   for (seen, counter) in [
     (found.named_gone, HEAL_NAMED_GONE),
     (found.named_short, HEAL_NAMED_SHORT),
@@ -3439,10 +3451,14 @@ struct HealFindings {
 }
 
 /// The heal for a placement naming `region`, owned by `local`, under the council's `members` and the object's current
-/// `candidates` at `quorum` (§4.10 "the healer"; A-276). Pure, so the rule is tested at `f = 0` and on a fleet alike:
+/// `candidates` at `quorum`, `adopted` when a takeover round here adopted the volume and has not confirmed (§4.10 "the
+/// healer"; A-276, A-529). Pure, so the rule is tested at `f = 0` and on a fleet alike:
 /// - a **replace** when a remote holder it names is no longer a member, which no re-offer can reach, or when it names
 ///   fewer than `f + 1` holders (one recorded before the fleet's `f` grew): the content is placed on the current cohort
 ///   at the next sequence and the head republished there;
+/// - a **replace** too for an adopted volume whose placement names a member outside its candidates (A-529): its round
+///   confirms only once it serves the volume from its own placement (`takeover::adopted_served`), and a restore would
+///   leave that member named for good;
 /// - otherwise a **restore** of the holders it names that can be put to: the owner, which holds its own content, and the
 ///   named remote holders among the candidates, the only ones that admit a placement from this owner
 ///   (`content_authority`). A named member outside the candidates keeps the copy its head names and serves reads of it,
@@ -3457,7 +3473,7 @@ fn heal_decision(
   region: &[u64],
   members: &[HostId],
   candidates: &[HostId],
-  quorum: Quorum,
+  (quorum, adopted): (Quorum, bool),
 ) -> (Option<Heal>, HealFindings) {
   let mut named: Vec<HostId> = Vec::with_capacity(region.len());
   for host in region.iter().map(|host| HostId(*host)) {
@@ -3472,7 +3488,7 @@ fn heal_decision(
     named_short: copies < u64::from(quorum.f).saturating_add(1),
     named_outside_candidates: remote().any(|host| !candidates.contains(host)),
   };
-  if found.named_gone || found.named_short {
+  if found.named_gone || found.named_short || (adopted && found.named_outside_candidates) {
     return (Some(Heal::Replace), found);
   }
   // The holders the restore ends with: the owner when the placement names it, and the named remote holders it can put
@@ -3503,6 +3519,12 @@ const HEAL_NAMED_SHORT: &str = "fleet.heal.named_short";
 /// it, and only the named candidates are restored.
 /// Format: a refusal name in the daemon's status report.
 const HEAL_NAMED_OUTSIDE_CANDIDATES: &str = "fleet.heal.named_outside_candidates";
+
+/// The status count under which the healer records a replace of an adopted volume's placement that named a member
+/// outside the volume's candidates (A-529): a restore would have left that member named, and the takeover round that
+/// adopted the volume waits to confirm until it serves it from its own placement. Format: a refusal name in the daemon's
+/// status report.
+const HEAL_ADOPTED_REPLACED: &str = "fleet.heal.adopted_replaced";
 
 /// The status count under which the healer records a heal that ran its bound ([`heal_bound_ns`]) without finishing
 /// (every put refused, or a holder to restore unreachable): the job is dropped and the volume healed again on a later
@@ -12273,26 +12295,45 @@ mod tests {
   /// candidates, one naming a departed holder, one naming fewer than `f + 1` holders, one whose named holder is a member
   /// outside the candidates, and one naming a holder twice. Expect: no heal at `f = 0`, since the owner's copy is the
   /// whole placement; a restore of exactly the named candidates with the owner; a replace for the departed and for the
-  /// short, each found; no heal when no named candidate is left, the outsider found; and the repeat counted once.
+  /// short, each found; no heal when no named candidate is left, the outsider found, but a replace for the same
+  /// placement of an adopted volume (A-529); and the repeat counted once.
   /// Before (2026-11-17), a placement naming no remote holder was replaced, so at `f = 0` every healer step advanced the
   /// head's sequence by one, for good.
   #[test]
   fn the_heal_restores_named_candidates_and_replaces_only_a_departed_or_short_placement() {
     let (owner, b, c, d) = (HostId(1), HostId(2), HostId(3), HostId(4));
-    let lone = heal_decision(owner, &[owner.0], &[owner], &[owner], Quorum { f: 0 });
+    let lone = heal_decision(
+      owner,
+      &[owner.0],
+      &[owner],
+      &[owner],
+      (Quorum { f: 0 }, false),
+    );
     assert_eq!(
       lone,
       (None, HealFindings::default()),
       "f = 0: the owner's own copy is the whole placement; nothing to heal"
     );
     let fleet = [owner, b, c];
-    let restored = heal_decision(owner, &[owner.0, b.0], &fleet, &fleet, Quorum { f: 1 });
+    let restored = heal_decision(
+      owner,
+      &[owner.0, b.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       restored,
       (Some(Heal::Restore(vec![owner, b])), HealFindings::default()),
       "every named holder a member and a candidate: restore exactly them"
     );
-    let departed = heal_decision(owner, &[owner.0, d.0], &fleet, &fleet, Quorum { f: 1 });
+    let departed = heal_decision(
+      owner,
+      &[owner.0, d.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       departed,
       (
@@ -12305,7 +12346,7 @@ mod tests {
       ),
       "a named holder that left: replace"
     );
-    let short = heal_decision(owner, &[owner.0], &fleet, &fleet, Quorum { f: 1 });
+    let short = heal_decision(owner, &[owner.0], &fleet, &fleet, (Quorum { f: 1 }, false));
     assert_eq!(
       short,
       (
@@ -12317,7 +12358,13 @@ mod tests {
       ),
       "fewer than f + 1 named: replace"
     );
-    let moved = heal_decision(owner, &[owner.0, c.0], &fleet, &[owner, b], Quorum { f: 1 });
+    let moved = heal_decision(
+      owner,
+      &[owner.0, c.0],
+      &fleet,
+      &[owner, b],
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       moved,
       (
@@ -12329,7 +12376,31 @@ mod tests {
       ),
       "the named holder a member outside the candidates: left as its head names it, found"
     );
-    let repeated = heal_decision(owner, &[owner.0, b.0, b.0], &fleet, &fleet, Quorum { f: 2 });
+    let adopted = heal_decision(
+      owner,
+      &[owner.0, c.0],
+      &fleet,
+      &[owner, b],
+      (Quorum { f: 1 }, true),
+    );
+    assert_eq!(
+      adopted,
+      (
+        Some(Heal::Replace),
+        HealFindings {
+          named_outside_candidates: true,
+          ..HealFindings::default()
+        }
+      ),
+      "an adopted volume naming a member outside its candidates: replace, so its round can confirm (A-529)"
+    );
+    let repeated = heal_decision(
+      owner,
+      &[owner.0, b.0, b.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 2 }, false),
+    );
     assert_eq!(
       repeated,
       (

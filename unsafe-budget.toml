@@ -52,12 +52,8 @@
 #   with it, since a mapping is its bytes whoever made it (`region.rs` `lock_bytes_whole`/`lock_bytes_range`):
 #   the whole-map lock on fault and its macOS arm (2) and the range lock with `MADV_DONTDUMP` (2), less the two
 #   that took a memmap2 map and are now thin callers (−2): +2. 37 → 45.
-#   Sealed blocks (`sealed.rs`, 2026-11-18, A-273 step 3, D-7 "immutable chunk reads from any core"): a green's
-#   content read in place by its replicas on other shards instead of copied (A-64: content once). The reading helper
-#   (`read_in_place`, an unsafe fn by its contract: 1) and its one `slice::from_raw_parts` over a block's exposed
-#   address (1), its two callers, the writer's own read and a reader's read of a block in its live table (2), and the
-#   free of a block's boxed slice once every reader passed its release (`free_in_place`, `Box::from_raw`: 1): +5.
-#   63 → 68.
+#   Sealed blocks (`sealed.rs`, A-273 step 3, +5 on 2026-11-18: 63 → 68) went with the A-273 replicas, measured and
+#   rejected (2026-11-19, A-528): 68 → 63.
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -226,6 +222,9 @@
 #   has no safe wrapper for reading them: the `GetAdaptersAddresses` call (1), and the walk over what it writes, each
 #   read made only once the link or address is checked to lie wholly inside the call's buffer, aligned: an adapter
 #   entry (1), a DNS server entry (1), and a server's socket address with its address word read through the union (1).
+#   Raised 9 → 10 on 2026-11-19 (A-507, `mount.rs` `ask_unmount`, compiled for macOS and the BSDs): an unmount calls
+#   `unmount(2)` itself rather than running `umount` from the `PATH`, and neither rustix nor std wraps it there: the
+#   call on the mount point's C string (1).
 # slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
 #   mount (Unix, added later) will carry their own budgeted sites.
@@ -308,7 +307,7 @@ slates-machine = 86
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 68
+slates-mem = 63
 # 2026-11-04 (+2, A-205, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
 #   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
 #   `Inner::discard`). The call has no safe wrapper.
@@ -388,7 +387,13 @@ slates-mem = 68
 #   macOS): whether any thread of another process is runnable, from `proc_pidinfo(PROC_PIDTASKALLINFO)`'s
 #   `pti_numrunning`: the zeroed record and the call that fills it. Linux reads `/proc` and Windows reuses the snapshot
 #   above, so neither adds a site. A start held off its CPUs was killed as stuck without it.
-slates-rt = 102
+# 2026-11-18 (+4, A-475, `handle_wait.rs`, compiled only for Windows): a client's process handle awaited through the shard,
+#   which the completion port alone cannot hear: the wait registered with the thread pool (`RegisterWaitForSingleObject`,
+#   1), unregistered at the future's drop with every callback finished (`UnregisterWaitEx(INVALID_HANDLE_VALUE)`, 1), the
+#   handle asked with a zero timeout for the register-then-test and each wake's attribution (`WaitForSingleObject`, 1),
+#   and the callback's read of the context its registration boxed (1). The callback's post shares the kick's one
+#   `PostQueuedCompletionStatus` block (`iocp::post`, 0). None has a safe wrapper.
+slates-rt = 106
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
@@ -504,9 +509,11 @@ slates-ipc = 147
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 # 2026-11-02 (+1, A-198 Step 9.3): `anchor_hold_windows::adopted` takes unique ownership of an explicitly inherited
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
-slates-server = 8
+# 2026-11-18 (-3, A-475): the Windows liveness probe of a client's process (`peer.rs`'s open, zero-timeout wait and close)
+#   is gone with the poll it served; a client's process exit is awaited through the shard (`slates-rt`'s `handle_wait`).
+slates-server = 5
 slates-client = 0
-slates-api = 9
+slates-api = 10
 slates-cli = 2
 # 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
 #   its VMM's pidfd and on its signals together, so its signals arrive as bytes in a self-pipe: the handler's one
@@ -647,7 +654,11 @@ slates-bridge-virtiofs = 3
 # (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a
 # `statfs` of the path would touch the very mount the daemon serves. The Linux read of
 # `/proc/self/mountinfo` is safe rustix; the parser, verification and entry are pure.
-slates-bridge-oci = 1
+# Raised to 2 on 2026-11-18 (A-511, g232): the macOS unmount watch's one `kevent` call (`kevent_now` in
+# `mount_table.rs`), which registers the `EVFILT_FS` filter on `VQ_UNMOUNT` and reads its event. rustix's
+# `kevent` cannot name `EVFILT_FS` (its `EventFilter` has no such variant), so the call is libc's; the queue
+# itself is made through rustix, and the Linux watch (an epoll instance over `/proc/self/mountinfo`) is safe rustix.
+slates-bridge-oci = 2
 # slates-conformance (0): pure parsers and records; no FFI, no I/O.
 slates-conformance = 0
 # slates-test-seeds (0): a proptest persistence over compiled seed text; no FFI, no I/O.
@@ -668,3 +679,6 @@ slates-image = 0
 # 2026-10-29, when `cargo xtask unsafe` found the crate unbudgeted since A-187 added it (CI runs the structural and
 # literal checks, not the budget).
 slates-seal = 0
+# slates-svn (0): the Subversion server's pure pieces (A-500, §4.17.4): svndiff's integers, windows and sections read
+# and written by checked offsets and `get`, LZ4 through lz4_flex's safe codec; no casts, no maps, no FFI.
+slates-svn = 0

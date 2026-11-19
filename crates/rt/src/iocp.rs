@@ -236,9 +236,23 @@ impl Drop for RaisedForWait {
 /// any thread. A failed post means the port is being torn down with its shard, the documented outcome
 /// of a kick to an exiting shard (`Kick::kick`).
 pub fn post_kick(port: usize) {
+  let _posted = post(port, KICK_KEY, 0);
+}
+
+/// Posts `word` to `port` as a no-op's completion, which the shard's wait delivers as it delivers any word (A-475: a
+/// handle wait's callback, on a thread-pool thread, `crate::handle_wait`). Safe from any thread for a live port the
+/// caller has pinned ([`KickPort::with`]); whether the packet was posted.
+pub(crate) fn post_word(port: usize, word: u64) -> bool {
+  post(port, NOP_KEY, usize::try_from(word).unwrap_or(0))
+}
+
+/// Posts a packet with completion key `key` and the overlapped tag `tag` (a word the wait reads back as an address, never
+/// dereferenced) to `port`, a live port the caller has pinned; whether it was posted.
+fn post(port: usize, key: usize, tag: usize) -> bool {
   let handle: HANDLE = std::ptr::with_exposed_provenance_mut(port);
-  // SAFETY: the caller pinned the registration that owns this port, so the handle is open.
-  unsafe { PostQueuedCompletionStatus(handle, 0, KICK_KEY, std::ptr::null_mut()) };
+  // SAFETY: the caller pinned the registration that owns this port, so the handle is open; the overlapped pointer is a
+  // tag, never dereferenced.
+  unsafe { PostQueuedCompletionStatus(handle, 0, key, std::ptr::without_provenance_mut(tag)) != 0 }
 }
 
 impl Driver for IocpDriver {

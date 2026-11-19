@@ -6,11 +6,11 @@
 use slates_wire::Wire;
 
 use crate::catalog::{
-  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
-  GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
-  LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
-  PlacementState, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
-  VolumeState,
+  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, BranchRecord, CompletionRecord,
+  ConsumerRecord, GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState,
+  LeaseRecord, LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  NfsOpenRecord, PlacementState, RepositoryId, RepositoryRecord, SizeClass, SnapshotId,
+  SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -587,6 +587,60 @@ pub enum Op {
     /// The snapshot.
     snapshot: crate::catalog::SnapshotId,
   },
+  /// A captured clone's move carried its capture (A-503): what the volume's catalog ships from now on, and the snapshot
+  /// here holding the head the move hands over (its mark, should the move thaw). Raises the catalog register's sequence,
+  /// so the catalog ships it before the move is reported. Replaces any carried capture the volume held. Appended
+  /// (2026-11-18).
+  CaptureCarried {
+    /// The volume.
+    volume: VolumeId,
+    /// What the move carries.
+    carried: crate::catalog::CarriedRecord,
+    /// The snapshot holding the head it is relative to.
+    mark: Option<crate::catalog::SnapshotId>,
+  },
+  /// A volume a move brought here was materialized with the carried capture its adopted catalog holds (A-503), its mark
+  /// the snapshot it was materialized as when that is the head the capture was carried against, else none. The catalog
+  /// is the adopted one, unchanged, so its sequence stays. Appended (2026-11-18).
+  CaptureAdopted {
+    /// The volume.
+    volume: VolumeId,
+    /// What its adopted catalog carries.
+    carried: crate::catalog::CarriedRecord,
+    /// Its snapshot holding that head, when it holds one.
+    mark: Option<crate::catalog::SnapshotId>,
+  },
+  /// A repository was created, its namespace empty (§4.17.1, A-515). Appended.
+  RepositoryCreated {
+    /// The record.
+    record: RepositoryRecord,
+  },
+  /// A branch name of a repository was bound to a green of its partition (§4.17.1, A-515). Appended.
+  RepositoryBranchAdded {
+    /// The binding.
+    record: BranchRecord,
+  },
+  /// A branch name left its repository's namespace; its green is untouched, so binding the name to it again restores
+  /// the branch (§4.17.1 "Deleting a branch", A-515). Appended.
+  RepositoryBranchRetired {
+    /// The repository.
+    repository: RepositoryId,
+    /// The name.
+    name: String,
+  },
+  /// A repository's default branch was set, or cleared with `None` (§4.17.1, A-515). Appended.
+  RepositoryDefaultSet {
+    /// The repository.
+    repository: RepositoryId,
+    /// The branch name, bound or not yet (an unborn default).
+    branch: Option<String>,
+  },
+  /// A repository left, with every name of its namespace; its greens are untouched, each destroyed by its own verb
+  /// (§4.17.1, A-515). Appended.
+  RepositoryDestroyed {
+    /// The repository.
+    repository: RepositoryId,
+  },
 }
 
 impl Op {
@@ -674,6 +728,13 @@ impl Op {
       Op::AuditBatchAppended { .. } => "audit_batch_appended",
       Op::VolumeReleased { .. } => "volume_released",
       Op::BaseCaptured { .. } => "base_captured",
+      Op::CaptureCarried { .. } => "capture_carried",
+      Op::CaptureAdopted { .. } => "capture_adopted",
+      Op::RepositoryCreated { .. } => "repository_created",
+      Op::RepositoryBranchAdded { .. } => "repository_branch_added",
+      Op::RepositoryBranchRetired { .. } => "repository_branch_retired",
+      Op::RepositoryDefaultSet { .. } => "repository_default_set",
+      Op::RepositoryDestroyed { .. } => "repository_destroyed",
     }
   }
 }

@@ -1698,6 +1698,16 @@ impl<H: LandFs> Landing<'_, H> {
           window_ns: None,
         }
       }
+      // A refusal in Win32's numbering is no kind the landing tells apart, whatever its number (A-527): it ends the
+      // landing, as an errno other than a full disk does, reported by its own number.
+      Err(WriteFailure::Host(HostError::Win32(code))) => {
+        let errno = win32_number(code);
+        self.crashed = Some(errno);
+        Written {
+          outcome: Outcome::Failed { errno },
+          window_ns: None,
+        }
+      }
       // An entry below the target on a mount this daemon serves (A-227): refused before any open, that entry alone.
       Err(WriteFailure::Host(HostError::OwnMount(errno))) => Written {
         outcome: Outcome::Failed { errno },
@@ -2392,6 +2402,11 @@ impl<H: LandFs> Landing<'_, H> {
         return Ok(MetaSet::Done(Outcome::Conflict(ConflictClass::TypeChanged)));
       }
       Err(HostError::Unavailable(errno)) => return Ok(MetaSet::Done(Outcome::Failed { errno })),
+      Err(HostError::Win32(code)) => {
+        return Ok(MetaSet::Done(Outcome::Failed {
+          errno: win32_number(code),
+        }));
+      }
       Err(e) => return Err(e.into()),
     };
     let set = self.set_meta_through(file, change);
@@ -2525,7 +2540,9 @@ impl<H: LandFs> Landing<'_, H> {
     match self.host.rmdir(dir, name) {
       Ok(()) => Ok(Outcome::Written),
       Err(HostError::NotFound) => Ok(Outcome::Skipped(SkipReason::AlreadyThere)),
-      Err(HostError::Unavailable(_)) => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
+      Err(HostError::Unavailable(_) | HostError::Win32(_)) => {
+        Ok(Outcome::Conflict(ConflictClass::TargetInUse))
+      }
       Err(e) => Err(e.into()),
     }
   }
@@ -2604,7 +2621,9 @@ impl<H: LandFs> Landing<'_, H> {
       Ok(there) if there.dev == made.dev && there.ino == made.ino => {
         match self.host.rmdir(dir, fresh) {
           Ok(()) => {}
-          Err(HostError::Unavailable(_)) => self.keep(dir, split(path).0, fresh, path)?,
+          Err(HostError::Unavailable(_) | HostError::Win32(_)) => {
+            self.keep(dir, split(path).0, fresh, path)?;
+          }
           Err(e) => return Err(e.into()),
         }
       }
@@ -2911,10 +2930,11 @@ impl<H: LandFs> Landing<'_, H> {
   /// — the simulated crash, an `EIO`) aborts the landing so nothing is advanced; a full disk and the typed
   /// refusals (not found, not a directory, a stale handle) are recorded by the caller and the landing goes on.
   fn note_crash(&mut self, error: HostError) {
-    if let HostError::Unavailable(errno) = error
-      && !disk_full(errno)
-    {
-      self.crashed = Some(errno);
+    match error {
+      HostError::Unavailable(errno) if !disk_full(errno) => self.crashed = Some(errno),
+      // A Win32 code is no errno's full disk, whatever its number (A-527).
+      HostError::Win32(code) => self.crashed = Some(win32_number(code)),
+      _ => {}
     }
   }
 
@@ -3085,7 +3105,7 @@ impl<H: LandFs> Landing<'_, H> {
       HostKind::Dir => match self.host.rmdir(dir, aside) {
         Ok(()) => Ok(true),
         // Not empty: never this landing's.
-        Err(HostError::Unavailable(_)) => Ok(false),
+        Err(HostError::Unavailable(_) | HostError::Win32(_)) => Ok(false),
         Err(e) => Err(e),
       },
       _ => Ok(false),
@@ -3341,6 +3361,12 @@ fn disk_full(errno: i32) -> bool {
   errno == ERRNO_NOSPC || errno == ERRNO_DQUOT_LINUX || errno == ERRNO_DQUOT_MACOS
 }
 
+/// The number an entry's failure reports for a refusal in Win32's numbering (A-527): the code as its own number, which
+/// the report's one number field holds beside errnos (GAPS); never compared with an errno's.
+fn win32_number(code: u32) -> i32 {
+  i32::try_from(code).unwrap_or(i32::MAX)
+}
+
 fn elapsed_ns(since: Instant) -> u64 {
   u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
@@ -3590,13 +3616,14 @@ impl Beginning {
 
   /// [`Beginning::new`] for a clone of a captured base (§4.15 `capture_base`, A-291's landing): its manifest is the
   /// change of `request.source` since the capture `base` (a snapshot's tree in the same store, pinned while the clone
-  /// lives), every entry judged by content ([`crate::manifest::PlanWalk::against_capture`]), and its finish leaves the
-  /// volume as it was.
+  /// lives; or, for a clone a move brought here, what the move carried of the capture and the clone's mark, A-503),
+  /// every entry judged by content ([`crate::manifest::PlanWalk::against_capture`]), and its finish leaves the volume
+  /// as it was.
   pub fn against_capture(
     vol: &Volume,
     target: &LandingTarget,
     request: &LandingRequest,
-    base: slates_vfs::captured::FrozenTree,
+    base: impl Into<slates_vfs::captured::CaptureBase>,
   ) -> Result<Beginning, LandingRefusal> {
     let began = Instant::now();
     let walk = crate::manifest::PlanWalk::against_capture(vol, request.source, base)

@@ -28,7 +28,8 @@
 //! request, learned online, and whether a hold pays),
 //! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
 //! sockets ([`udp`] everywhere and `tcp` on Unix — the NFS mount server's, over one shared readiness
-//! future), and the OS drivers.
+//! future), `handle_wait` (Windows: a kernel object's signal, a client's process ending, waited on by the system thread
+//! pool and posted to the shard's port), and the OS drivers.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -73,6 +74,10 @@ pub mod waker;
 mod afd;
 #[cfg(target_os = "linux")]
 pub mod epoll;
+// A kernel object's signal awaited through the shard (A-475): a client's process handle, waited on by the system thread
+// pool and posted to the shard's completion port.
+#[cfg(target_os = "windows")]
+pub mod handle_wait;
 #[cfg(target_os = "windows")]
 pub mod iocp;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]

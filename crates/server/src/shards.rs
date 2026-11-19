@@ -42,8 +42,9 @@
 //! - its backend's tables for a snapshot of the VM, and their restore (Shards' D176 part 5; A-303). A SAVE, sent while
 //!   the device is paused and so between requests, is held while the guest's stores through its maps reach the volume,
 //!   then answered with the tables of the child module `tables`: a snapshot of the volume at the cut, taken for the
-//!   stream's own principal and made durable first, the inodes the guest holds with their references and opens, its
-//!   scope and its owner view. A RESTORE is taken only as a fresh stream's first frame, and only onto the volume saved,
+//!   stream's own principal and made durable first (published, and on a live-shipped volume held at its candidates as a
+//!   guest's `fsync` is, A-516), the inodes the guest holds with their references and opens, its scope and its owner
+//!   view. A RESTORE is taken only as a fresh stream's first frame, and only onto the volume saved,
 //!   unchanged since the cut, or a clone of the cut's snapshot, presenting the same directory: the stream's attachment
 //!   is then given what the saved one held, its owner view too. Anything else is refused in the form Shards reads, a
 //!   control answer with its reason, and changes nothing.
@@ -254,6 +255,9 @@ const OWNER_NAMED: &str = "shards.owner_named";
 const OWNER_REFUSED: &str = "shards.owner_refused";
 /// Counter: a SAVE answered with the stream's tables (A-303).
 const SAVED: &str = "shards.saved";
+/// Counter: a SAVE whose tables waited for its live-shipped volume's log to be durable where the save's publication put
+/// it (A-516), as a guest's `FSYNC` waits (A-200).
+const SAVE_HELD: &str = "shards.save_held";
 /// Format: the refusal-ledger name of a SAVE refused (A-303), with no snapshot left behind but one taken before a later
 /// step failed.
 const SAVE_REFUSED: &str = "shards.save_refused";
@@ -346,9 +350,10 @@ pub(crate) struct ShardsStream {
   /// What the owed reply waits for before it is sent: every FUSE mount of the volume told through the newest record its
   /// request made (AC-3.3, A-196). Shards' VMM asks one request at a time, so nothing else waits behind it.
   told: Option<crate::told::Owed>,
-  /// The owed reply is an `FSYNC` whose barrier published a live-shipped volume not yet durable there (A-200): it is
-  /// sent once the volume's log is durable at this position, and replaced by `EIO` (to request `unique`) if it is not
-  /// within the liveness budget, since a guest's `fsync` must not claim what no candidate holds.
+  /// The owed reply is an `FSYNC` whose barrier published a live-shipped volume not yet durable there (A-200), or a
+  /// SAVE's tables naming a snapshot whose publication did (A-516): it is sent once the volume's log is durable at this
+  /// position, and replaced (by `EIO`, or by the SAVE's refusal) if it is not within the liveness budget, since neither
+  /// may claim what no candidate holds.
   durable: Option<DurableOwed>,
   /// How the guest is shown the volume's owners (A-281): the identity until its root names the run's owner with
   /// Shards' owner word, then a swap of the root's owner then and the run's. Kept for the stream's life; a restart ends
@@ -456,12 +461,23 @@ impl ShardsStream {
   }
 }
 
-/// What an owed `FSYNC` reply waits for on a live-shipped volume (A-200): the log position its barrier published, and
-/// the request it answers.
+/// What an owed reply waits for on a live-shipped volume: the log position its publication put the volume at, and what
+/// the reply becomes if the log is not durable there within the bound (A-200, A-516).
 #[derive(Clone, Copy, Debug)]
 struct DurableOwed {
   target: u64,
-  unique: u64,
+  undurable: Undurable,
+}
+
+/// What a reply held for its volume's durability becomes when the log is not durable where it waits: the answer must not
+/// claim what no candidate holds.
+#[derive(Clone, Copy, Debug)]
+enum Undurable {
+  /// A guest's `FSYNC` (A-200): `EIO` to the request `unique`.
+  Errno { unique: u64 },
+  /// A SAVE (A-516): refused with its reason, so the VM's snapshot never names a slates snapshot that the owner's loss
+  /// would take with it.
+  Save,
 }
 
 impl std::fmt::Debug for ShardsStream {
@@ -1708,8 +1724,9 @@ fn durable_owed(stream: &mut ShardsStream) -> Option<u64> {
   stream.durable.map(|owed| owed.target)
 }
 
-/// Settles the owed `FSYNC` of stream `attachment` once its wait for durability is over: sent as it is when the log
-/// became durable at its position, replaced by `EIO` when it did not (counted).
+/// Settles the reply stream `attachment` held for its volume's durability once the wait is over: sent as it is when the
+/// log became durable at its position; when it did not, an `FSYNC`'s replaced by `EIO` and a SAVE's tables by its
+/// refusal (A-516). Each counted.
 fn settle_durable(s: &mut ShardState, attachment: u64, durable: bool) {
   let Some(stream) = s.shards_streams.get_mut(&attachment) else {
     return;
@@ -1717,10 +1734,21 @@ fn settle_durable(s: &mut ShardState, attachment: u64, durable: bool) {
   let Some(owed) = stream.durable.take() else {
     return;
   };
-  if !durable {
-    stream.owed = refuse(owed.unique, EIO, &mut stream.outbound);
-    stream.sent = 0;
-    s.count(LIVE_FSYNC_REFUSED, 1);
+  let counted = match (owed.undurable, durable) {
+    (Undurable::Errno { .. }, true) => None,
+    (Undurable::Errno { unique }, false) => {
+      stream.owed = refuse(unique, EIO, &mut stream.outbound);
+      stream.sent = 0;
+      Some(LIVE_FSYNC_REFUSED)
+    }
+    (Undurable::Save, true) => Some(SAVED),
+    (Undurable::Save, false) => {
+      owe(stream, &control_refusal(SAVE_UNDURABLE));
+      Some(SAVE_REFUSED)
+    }
+  };
+  if let Some(counter) = counted {
+    s.count(counter, 1);
   }
 }
 
@@ -1888,17 +1916,29 @@ fn held_save(stream: &ShardsStream, total: usize) -> bool {
 
 /// Answers a SAVE (A-303; Shards' D176 part 5) with the stream's tables, owed as its reply, or a refusal with its
 /// reason. The guest's stores through its maps reached the volume first, unless `stores_refused`: then the cut would
-/// lack them, and the SAVE is refused.
+/// lack them, and the SAVE is refused. On a live-shipped volume the tables wait until its log is durable where the
+/// save's publication put it, as a guest's `FSYNC` waits (A-516; [`settle_durable`]): the VM's snapshot names the
+/// slates snapshot, which must outlive the owner's loss as it outlives the daemon's restart.
 fn answer_save(s: &mut ShardState, stream: &mut ShardsStream, stores_refused: bool) {
   let saved = if stores_refused {
     Err(SAVE_STORES_REFUSED)
   } else {
     save(s, stream).and_then(|tables| control_answer(&tables).ok_or(SAVE_TOO_LONG))
   };
+  stream.durable = None;
   match saved {
     Ok(answer) => {
-      s.count(SAVED, 1);
       owe(stream, &answer);
+      match crate::live_ship::durable_target(s, stream.volume) {
+        Some(target) => {
+          stream.durable = Some(DurableOwed {
+            target,
+            undurable: Undurable::Save,
+          });
+          s.count(SAVE_HELD, 1);
+        }
+        None => s.count(SAVED, 1),
+      }
     }
     Err(reason) => {
       s.count(SAVE_REFUSED, 1);
@@ -2286,7 +2326,9 @@ fn serve_request(
   {
     stream.durable = Some(DurableOwed {
       target,
-      unique: answered.unique,
+      undurable: Undurable::Errno {
+        unique: answered.unique,
+      },
     });
     s.count(LIVE_FSYNC_HELD, 1);
     // A held `fsync` claims nothing until its log is durable: resent, it is served again, as FUSE's is.
@@ -2882,5 +2924,210 @@ impl Daemon {
       None,
     );
     registry::send_control(shard, Control::Spawn(Box::new(task))).map_err(ServerError::Runtime)
+  }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use std::io::{Read, Write};
+
+  use slates_bridge_fuse::shards_fs::CONTROL_FRAME;
+  use slates_ipc::protocol::{NamePolicy, RequestBody, SizeClass};
+
+  use super::*;
+
+  /// Shape: the most the test waits for an attach's answer or a SAVE's: well past the durability wait's bound (one
+  /// silent window of `live_ship::durable_wait_ns`, a few seconds, and its confirming looks), on a loaded machine.
+  const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+  /// Format: the size class of the test's volumes: a dynamic volume of a mebibyte.
+  const VOLUME_BYTES: u64 = 1 << 20;
+  /// Format: the first byte of a granted control answer (`control_answer`).
+  const GRANTED: u8 = 0;
+  /// Format: the first byte of a control answer Shards reads as a refusal (`control_refusal`).
+  const REFUSED: u8 = 1;
+  /// Format: the uid the test's volumes are owned by: any user's but root's.
+  const OWNER_UID: u32 = 1234;
+
+  /// What the shard counted of SAVEs: answered with tables, held for durability, refused.
+  #[derive(Debug, Default, PartialEq, Eq)]
+  struct Counts {
+    saved: u64,
+    held: u64,
+    refused: u64,
+  }
+
+  /// The principal the test's volumes are made and attached for: their owner, who may snapshot them.
+  fn owner() -> Principal {
+    Principal::Uid {
+      host: slates_db::register::HostId(0),
+      uid: OWNER_UID,
+    }
+  }
+
+  /// A volume named `name` made on `state`'s shard for [`owner`]; with `silent`, set live-shipped with its log shipped to
+  /// holders that never answer (`live_ship::ship_to_silent_holders`). Its id, or `None` where a verb refused.
+  fn volume_here(
+    state: &mut ShardState,
+    name: &str,
+    silent: bool,
+  ) -> Option<slates_ipc::protocol::VolumeId> {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::Create {
+        name: name.to_owned(),
+        size: SizeClass::Dynamic { max: VOLUME_BYTES },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let ReplyBody::Created { id } = created else {
+      return None;
+    };
+    if silent {
+      let shipped = crate::verbs::dispatch(
+        state,
+        1,
+        &owner(),
+        RequestBody::LiveShip {
+          volume: id,
+          live_shipped: true,
+        },
+      );
+      if !matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }) {
+        return None;
+      }
+      crate::live_ship::ship_to_silent_holders(state, VolumeId { bytes: id.bytes });
+    }
+    Some(id)
+  }
+
+  /// What the shard has counted of SAVEs so far.
+  fn counts(daemon: &Daemon) -> Counts {
+    crate::daemon::observe_first(daemon, |state| {
+      let counted = |name: &'static str| state.refusals.get(name).copied().unwrap_or(0);
+      Counts {
+        saved: counted(SAVED),
+        held: counted(SAVE_HELD),
+        refused: counted(SAVE_REFUSED),
+      }
+    })
+  }
+
+  /// Sends a SAVE as Shards' device sends one, on a stream attached to `volume` for [`owner`], and reads its answer: the
+  /// answer's first byte (granted or refused) and what follows it.
+  fn saved(
+    daemon: &Daemon,
+    volume: slates_ipc::protocol::VolumeId,
+  ) -> Result<(u8, Vec<u8>), String> {
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    daemon
+      .attach_shards_stream(
+        ShardsAsk {
+          principal: owner(),
+          volume,
+          subtree: None,
+          intent: Intent::Write,
+        },
+        Box::new(move |attached| {
+          let _ = sent.send(attached);
+        }),
+      )
+      .map_err(|error| format!("the owner shard was not reached: {error:?}"))?;
+    let attached = received
+      .recv_timeout(ANSWER_WAIT)
+      .map_err(|error| format!("the attach did not answer: {error:?}"))?
+      .map_err(|refusal| format!("the attach was refused: {refusal:?}"))?;
+    // The resync channel's end, where one was made, is kept while the stream serves: dropped, it would end the resync.
+    let _resync = attached.resync;
+    let mut device = std::os::unix::net::UnixStream::from(attached.stream);
+    device
+      .set_nonblocking(false)
+      .and_then(|()| device.set_read_timeout(Some(ANSWER_WAIT)))
+      .map_err(|error| format!("the device's end was not set up: {error}"))?;
+    let ask = [ASK_SAVE];
+    let length = CONTROL_FRAME
+      | u32::try_from(ask.len()).map_err(|_| "an ask's length fits its word".to_owned())?;
+    let mut frame = length.to_le_bytes().to_vec();
+    frame.extend_from_slice(&ask);
+    device
+      .write_all(&frame)
+      .map_err(|error| format!("the SAVE was not sent: {error}"))?;
+    let mut word = [0; LENGTH_BYTES];
+    device
+      .read_exact(&mut word)
+      .map_err(|error| format!("the SAVE was not answered: {error}"))?;
+    let word = u32::from_le_bytes(word);
+    if word & CONTROL_FRAME == 0 {
+      return Err(format!("the answer is not a control frame: {word:#x}"));
+    }
+    let length = usize::try_from(word & !CONTROL_FRAME)
+      .map_err(|_| "an answer's length fits the address space".to_owned())?;
+    let mut answer = vec![0; length];
+    device
+      .read_exact(&mut answer)
+      .map_err(|error| format!("the answer was cut short: {error}"))?;
+    let (&first, rest) = answer
+      .split_first()
+      .ok_or_else(|| "the answer has no first byte".to_owned())?;
+    Ok((first, rest.to_vec()))
+  }
+
+  /// A-516 (A-303's "Not here"; Shards' D176 part 5; §4.10, A-200). Do: on an audit daemon, make a volume shipped nowhere
+  /// and one shipped live to two holders at `f = 1` that never answer, attach a Shards stream to each, and send each a
+  /// SAVE as Shards' device does. Expect the first answered at once with its tables, counted saved; and the second held
+  /// for its snapshot's durability at the candidates (`shards.save_held`), then refused with the undurable reason once
+  /// the wait gives up, never its tables, counted refused and not saved. Before A-516 the second was answered with its
+  /// tables at once, naming a snapshot no candidate held, which the VM's snapshot would have gone on naming past the
+  /// owner's loss.
+  #[test]
+  fn a_save_names_its_snapshot_only_once_the_volume_is_durable_where_the_save_put_it() {
+    let daemon = crate::daemon::audit_daemon();
+    let volumes = crate::daemon::observe_first(&daemon, |state| {
+      (
+        volume_here(state, "saved-plain", false),
+        volume_here(state, "saved-live", true),
+      )
+    });
+    let (Some(plain), Some(live)) = volumes else {
+      daemon.stop();
+      panic!("the volumes were not made: {volumes:?}");
+    };
+    let plain_answer = saved(&daemon, plain);
+    let after_plain = counts(&daemon);
+    let live_answer = saved(&daemon, live);
+    let after_live = counts(&daemon);
+    daemon.stop();
+    let (granted, tables) = plain_answer.expect("the plain volume's SAVE was answered");
+    assert_eq!(
+      granted, GRANTED,
+      "a volume shipped nowhere is saved at once"
+    );
+    assert!(!tables.is_empty(), "its answer brings the tables");
+    assert_eq!(
+      after_plain,
+      Counts {
+        saved: 1,
+        held: 0,
+        refused: 0
+      },
+      "the plain volume's SAVE was saved, nothing held"
+    );
+    assert_eq!(
+      live_answer.expect("the live volume's SAVE was answered"),
+      (REFUSED, SAVE_UNDURABLE.as_bytes().to_vec()),
+      "a SAVE whose snapshot no candidate holds is refused, never answered with tables naming it"
+    );
+    assert_eq!(
+      after_live,
+      Counts {
+        saved: 1,
+        held: 1,
+        refused: 1
+      },
+      "the live volume's SAVE was held for its durability, then refused"
+    );
   }
 }

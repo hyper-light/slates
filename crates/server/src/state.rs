@@ -30,13 +30,13 @@ pub struct ClientSlot {
   pub principal: Principal,
   /// The client id.
   pub client_id: u32,
-  /// The client's process id (the liveness probe's input where no socket closes).
+  /// The client's process id (the hang-up watch's input where no control socket closes: macOS, Windows; A-475).
   pub pid: u32,
-  /// When the client last wrote a slot (any kind); a client silent past the liveness budget
-  /// is asked about.
-  pub last_seen_ns: u64,
   /// Dead ring admission is closed while its attachments are retired on all owner shards (§4.7).
   pub(crate) retiring: bool,
+  /// The watch awaiting this client's hang-up (A-475, `crate::reap::watch`): set at admission, cleared at its report,
+  /// and cancelled by a seat that ends first (`crate::reap::end_unproven`).
+  pub(crate) watch: Option<slates_rt::TaskId>,
   /// Set once the client has proven its id with its session key (`crate::session_key`), checked before its first
   /// request is served. A slot never proven is ended without retiring its id's attachments (`reap::end_unproven`):
   /// they belong to the id's owner, whom a stranger naming the id is not.
@@ -311,10 +311,10 @@ pub struct ShardState {
   /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
   /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
   pub(crate) refill_settled: Option<u64>,
-  /// The bytes one idle give-back step walks (A-226), the recovery memory's and the write log's alike: what the OS gave
-  /// back in one step quantum the last time, measured by each step for the next (`daemon::learn_give_back_rate`); zero
-  /// until the first, which takes a page.
-  pub(crate) give_back_slice_bytes: usize,
+  /// What one idle give-back step walks (A-226), the recovery memory's and the write log's alike: the bytes the shard
+  /// gave back in one step quantum of its own thread's CPU, measured by the steps for the next (A-491,
+  /// `daemon::GiveBackRate`); a page until the first rate is learned.
+  pub(crate) give_back_rate: crate::daemon::GiveBackRate,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
@@ -549,6 +549,10 @@ pub struct ShardState {
   /// the partition's attachment cap.
   #[cfg(target_os = "macos")]
   pub(crate) own_nfs_mounts: BTreeMap<u64, crate::own_nfs::OwnNfsMount>,
+  /// Whether this shard's watch of the kernel's unmounts runs (A-511, `crate::own_nfs::watch`): started once the shard
+  /// holds an own NFS mount, ended by the watch itself once it holds none.
+  #[cfg(target_os = "macos")]
+  pub(crate) unmount_watch: bool,
   /// The Windows WinFsp mounts this shard serves, by attachment (§4.6 "Windows"; `crate::winfsp`). Bounded by the
   /// partition's attachment cap: one entry per live WinFsp attachment at most.
   #[cfg(windows)]
@@ -680,6 +684,18 @@ pub struct ShardState {
   pub deferred: Vec<Deferred>,
   /// The shard's server task, woken when a client is added while it idles.
   pub server_task: Option<slates_rt::TaskId>,
+  /// The clients whose watches reported them gone and whose retirement is owed, each with its id (A-475): a seat joins
+  /// once, at its report, so the queue is bounded by the shard's seats (`clients_per_shard`). The reaper takes them a
+  /// batch at a time (`crate::reap::reaper`).
+  pub(crate) dead_clients: std::collections::VecDeque<(slates_mem::Handle<ClientSlot>, u32)>,
+  /// The shard's reaper task, woken when a client's watch reports it gone while the reaper idles (A-475).
+  pub(crate) reaper_task: Option<slates_rt::TaskId>,
+  /// The seats whose status capture has a deadline, by it (A-522, `crate::deadlines`): a seat once at most.
+  pub(crate) capture_deadlines: crate::deadlines::CaptureDeadlines,
+  /// The shard's deadline keeper, woken when a deadline is set earlier than the one it sleeps for (A-522).
+  pub(crate) deadline_task: Option<slates_rt::TaskId>,
+  /// The deadline the keeper sleeps until, `None` while none is set (`crate::deadlines::noted` reads it).
+  pub(crate) deadline_armed: Option<u64>,
   /// Listing pages in flight: by request word, the client slot, the shards still to answer, and
   /// their parts so far, each at most a page (a scatter-gather over owners, §4.8 "Lookup"; §4.4 `list`).
   pub(crate) scatters: BTreeMap<u64, (u32, usize, crate::verbs::ListParts)>,
@@ -735,9 +751,6 @@ pub struct ShardState {
   /// work retirement moves this to exactly what the engine holds. Balanced by construction; bounded
   /// by the greens.
   pub green_retention: BTreeMap<VolumeId, u64>,
-  /// The replicas of greens this shard owns or holds (A-457, A-273 step 5a; `crate::green_replicas`): as an owner, the
-  /// shards it fed and the engines it is retiring; as a replica's shard, the replicas it holds and what they charged.
-  pub(crate) green_replicas: crate::green_replicas::GreenReplicas,
   /// The read-ahead windows this shard's clients hold or are fetching (`crate::verbs::ReadAhead`): the bytes charged,
   /// never past `DaemonConfig::read_ahead_bytes`. Charged before a batch is fetched, credited as each window is
   /// replaced, dropped or its client goes.
@@ -789,10 +802,6 @@ pub struct ShardState {
   /// How long this shard's writers waited for their volume's FUSE mounts to be told, and the back-off after overdue
   /// waits: what the told bound is learned from (AC-3.3, A-431; `crate::told::bound_ns`). Two words and an estimator.
   pub(crate) told_times: crate::told::ToldTimes,
-  /// How long the kernel took, after sending each `UMNT` this shard confirmed, to take the mount out of its mount table,
-  /// and the back-off after confirmations that ran out: what the confirmation's bound is learned from (A-493;
-  /// `crate::nfs::unmount_bound_ns`), as the told bound is. Two words and an estimator.
-  pub(crate) unmount_times: crate::learned_wait::LearnedWait,
   /// What each NFS connection's client cache holds of the files it touched, by volume (A-192; `crate::nfs_writeback`).
   /// Bounded by the metadata ledger and the listener's connections.
   pub(crate) nfs_writeback: crate::nfs_writeback::WritebackStates,
@@ -942,6 +951,9 @@ pub struct ShardState {
   /// target and the head its move waits to see placed. Bounded by the shard's volumes; an entry leaves when its volume
   /// is released to the target, or thaws.
   pub(crate) moves_out: crate::moves::MovesOut,
+  /// Where each of those moves stands in carrying its captured clone's capture (A-503, `crate::moves::begin_carry`).
+  /// Bounded by the moves; an entry leaves once its carry is recorded, or with its move.
+  pub(crate) move_carries: crate::moves::MoveCarries,
   /// The adoptions of volumes the configuration moved to this node (A-291), driven on the control shard only: per
   /// volume, its round's epoch, the records its cohort reported and its seal. Bounded by the moved-object exceptions
   /// naming this node; an entry leaves once its move is adopted.

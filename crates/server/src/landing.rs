@@ -587,44 +587,74 @@ struct Prepared {
   signature: Option<Vec<u8>>,
 }
 
-/// The captured snapshot a clone of a captured base is landed against (§4.15 `capture_base`, A-291's landing, stage 1):
-/// that snapshot's tree, when `volume` is a scratch clone of a snapshot recorded captured (`Op::BaseCaptured`) whose
-/// volume this shard serves; `None` for any other volume, which lands as before. A clone and its origin share one store
-/// (D-5), so a captured clone's capture is on its own shard; a capture it names that is not served here (its origin
-/// left unrecovered) is refused, never landed as a scratch volume, which would plan every file as a create and carry
-/// no removal. A clone moved to another node keeps no lineage there and still lands as a scratch volume (stage 2, GAPS
-/// g267).
-fn capture_of(
+/// What a captured clone is landed against (§4.15 `capture_base`, A-291's landing): on the node that made it, its
+/// captured snapshot's tree, when `volume` is a scratch clone of a snapshot recorded captured (`Op::BaseCaptured`) whose
+/// volume this shard serves (stage 1); on a node a move brought it to, what the move carried of the capture and the
+/// snapshot here holding the head it handed over, its mark (stage 2, A-503); `None` for any other volume, which lands
+/// as before. A clone and its origin share one store (D-5), so a captured clone's capture is on its own shard; a capture
+/// it names that is not served here (its origin left unrecovered) is refused, never landed as a scratch volume, which
+/// would plan every file as a create and carry no removal; and so is a carried capture whose mark this node does not
+/// hold (a takeover that rebuilt a later head than the moved one, or the mark's snapshot destroyed), or whose carried
+/// paths do not parse. Also what a move from this node carries again ([`crate::moves`]).
+pub(crate) fn capture_of(
   state: &ShardState,
   volume: DbVolumeId,
-) -> Result<Option<slates_vfs::captured::FrozenTree>, Refusal> {
+) -> Result<Option<slates_vfs::captured::CaptureBase>, Refusal> {
   let partition = state.db.partition();
   let scratch = partition
     .volume(volume)
     .is_some_and(|record| matches!(record.base, slates_db::catalog::BaseRecord::Scratch));
-  let Some(edge) = partition.lineage(volume).filter(|_| scratch) else {
-    return Ok(None);
-  };
-  if !partition.is_captured(edge.origin_volume, edge.origin_snapshot) {
+  if !scratch {
     return Ok(None);
   }
-  let snapshot = crate::verbs::core_snapshot(SnapshotId {
-    value: edge.origin_snapshot.value,
-  });
-  let Some(origin) = state
-    .by_id
-    .get(&edge.origin_volume)
-    .and_then(|handle| state.volumes.get(*handle).ok())
-  else {
+  if let Some(edge) = partition.lineage(volume)
+    && partition.is_captured(edge.origin_volume, edge.origin_snapshot)
+  {
+    let snapshot = crate::verbs::core_snapshot(SnapshotId {
+      value: edge.origin_snapshot.value,
+    });
+    let Some(origin) = state
+      .by_id
+      .get(&edge.origin_volume)
+      .and_then(|handle| state.volumes.get(*handle).ok())
+    else {
+      return Err(Refusal::Unsupported {
+        feature: "landing a captured clone whose capture this node does not serve".to_owned(),
+      });
+    };
+    return origin
+      .volume
+      .frozen_tree(snapshot)
+      .map(|tree| Some(tree.into()))
+      .map_err(|error| refusal_of_vfs(&error));
+  }
+  let Some((carried, mark)) = partition.carried(volume) else {
+    return Ok(None);
+  };
+  let Some(mark) = mark else {
     return Err(Refusal::Unsupported {
-      feature: "landing a captured clone whose capture this node does not serve".to_owned(),
+      feature: "landing a moved captured clone whose moved head this node does not hold".to_owned(),
     });
   };
-  origin
+  let carried = slates_vfs::captured::CarriedCapture::parse(&carried.entries)
+    .map_err(|error| refusal_of_vfs(&error))?;
+  let Some(slot) = state
+    .by_id
+    .get(&volume)
+    .and_then(|handle| state.volumes.get(*handle).ok())
+  else {
+    return Err(Refusal::NotFound);
+  };
+  let mark = slot
     .volume
-    .frozen_tree(snapshot)
-    .map(Some)
-    .map_err(|error| refusal_of_vfs(&error))
+    .frozen_tree(crate::verbs::core_snapshot(SnapshotId {
+      value: mark.value,
+    }))
+    .map_err(|error| refusal_of_vfs(&error))?;
+  Ok(Some(slates_vfs::captured::CaptureBase::Carried {
+    mark,
+    carried,
+  }))
 }
 
 /// A landing's beginning: against its capture for a captured clone ([`capture_of`]), else from the volume's own
@@ -633,7 +663,7 @@ fn landing_beginning(
   vol: &slates_vfs::volume::Volume,
   target: &slates_land::engine::LandingTarget,
   request: &LandingRequest,
-  against: Option<slates_vfs::captured::FrozenTree>,
+  against: Option<slates_vfs::captured::CaptureBase>,
 ) -> Result<slates_land::engine::Beginning, slates_land::engine::LandingRefusal> {
   match against {
     Some(base) => slates_land::engine::Beginning::against_capture(vol, target, request, base),
@@ -1518,7 +1548,7 @@ impl BarrierThread {
         }
       },
     )
-    .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))?;
+    .map_err(|error| spawn_refusal(&error))?;
     Ok(Self {
       outcome,
       thread: Some(thread),
@@ -1556,12 +1586,31 @@ fn lost_barrier() -> HostError {
 
 /// What a barrier thread gone without its outcome reads as: Windows' own number for a failed I/O,
 /// `ERROR_IO_DEVICE`, since the Windows seam reports a refusal the engine does not tell apart in Win32's codes
-/// (`slates_land::os`, A-185).
+/// (`slates_land::os`, A-185), typed as one (A-527).
 #[cfg(windows)]
 fn lost_barrier() -> HostError {
   /// Format: `ERROR_IO_DEVICE` (winerror.h).
-  const ERROR_IO_DEVICE: i32 = 1117;
-  HostError::Unavailable(ERROR_IO_DEVICE)
+  const ERROR_IO_DEVICE: u32 = 1117;
+  HostError::Win32(ERROR_IO_DEVICE)
+}
+
+/// A barrier thread the landing could not be given, as the seam's refusal: the OS code its error names, an errno here
+/// (A-527).
+#[cfg(unix)]
+fn spawn_refusal(error: &std::io::Error) -> HostError {
+  HostError::Unavailable(error.raw_os_error().unwrap_or(0))
+}
+
+/// A barrier thread the landing could not be given, as the seam's refusal: the OS code its error names, a Win32 code
+/// here, typed as one (A-527).
+#[cfg(windows)]
+fn spawn_refusal(error: &std::io::Error) -> HostError {
+  HostError::Win32(
+    error
+      .raw_os_error()
+      .and_then(|code| u32::try_from(code).ok())
+      .unwrap_or(0),
+  )
 }
 
 impl Drop for BarrierThread {
@@ -3126,6 +3175,10 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::StaleHandle => HostAnswer::StaleHandle,
     // A-227: a path on a mount this daemon serves carries the platform's deadlock-avoided errno.
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => HostAnswer::Errno { errno },
+    // The reply's one number field holds a Win32 code as its own (A-527; typing it is the wire's own piece, GAPS).
+    HostError::Win32(code) => HostAnswer::Errno {
+      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    },
   }
 }
 
