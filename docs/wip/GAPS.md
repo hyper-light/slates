@@ -17,13 +17,19 @@
 > Mercurial's `Name <address>`), kept by principal key on the principal's partition, set whole as the version after
 > the one held (`Op::IdentitiesSet`, wire tag 98; a stale setting refused `PolicyChanged`, nothing changed) and carried
 > by the partition's snapshot (`slates-db --lib` 144 of 144 and `--test wire_order` on Windows x86_64, jupiter; the
-> macOS run owed). OWED: part 1's server half (after main's `slates-server` baseline on jupiter): the owner's setting on
-> the control channel (the launcher's proof, `Forbidden` on a consumer's channel, each identity held to its tool's
-> rules); a session's identities resolved once, at its first submit, from the principal's partition and kept with the
-> session (main's ruling: the owner never reads them per merge, and a change mid-session applies from the next
-> session); the submit carrying its message and the session's identities, refused at the green's owner
-> `MessageRequired` without a message and `IdentityRequired` without an identity in the repository's tool, before any
-> work is built; part 3, the made commit recorded with the version (the merge record
+> macOS run owed). Part 1's server half BUILT (`crates/server/src/identities/tests.rs`; A-664's entry has the runs, on
+> macOS arm64, the fleet's submits through sessions at f = 1 among them; Windows and Linux main's):
+> `SetIdentities` on the control channel (the launcher's proof, `Forbidden` on a consumer's channel, git's identity held
+> to `slates_git::derived::Identity`, a Mercurial user as Mercurial 7.2's `changelog.add` writes it: not empty, one
+> line, no byte it strips from either end), recorded on the principal's partition; a session's
+> identities read once, at its first submit, kept with the session and written into each submit over the client's
+> claim (main's ruling), the read waiting for room on the partition's channel and one never answered refusing the
+> submit `Overloaded`, unrecorded; every submit carrying its message (`Authorship`; `RequestBody::submit` the one
+> constructor, `with_message` the builder); the green's owner refusing `MessageRequired` and `IdentityRequired` beside
+> `EvidenceRequired`, before any work is built (the api's contract 51). OWED: the clients' surfaces
+> (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
+> message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); part 3, the made
+> commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
 > it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
 > `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
@@ -440,8 +446,14 @@
 > §4.13's keys, the repositories' lookup on their partitions); upload-pack (A-615, A-640) and receive-pack's commit
 > (A-620 part 2) behind `GitServices`; serving across shards at A-645's scale (a connection moved to its repository's
 > owner shard once its head names it, or a listener on each shard); a bearer credential's expiry handed with its
-> principal for LFS's actions (A-629 part 2); Mercurial's and Subversion's sites; the MCP edge onto this engine; the
-> live `git clone` over HTTPS (main's, once upload-pack serves).
+> principal for LFS's actions (A-629 part 2); Subversion's site (Mercurial's is built, A-650 part 1, below); the MCP
+> edge onto this engine; the live `git clone` over HTTPS (main's, once upload-pack serves).
+> **A-650 part 1 (2026-11-19, g303): a reply's fields named as its reply begins.** The engine renders a served reply's
+> head with its first bytes, from the decision's fields and then the service's (`Connection::reply_fields`, asked once
+> through `Exchange::reply_fields`, none by default), since a Mercurial answer's media type follows from its command's
+> outcome; a field a reply cannot carry fails the request `500` before any of it is sent. `slates-http-edge --lib` 32 of
+> 32 and `slates-server --lib vcs_http` 40 of 40, the late fields over a real loopback connection among them, on macOS
+> arm64 (Mac Studio, kiln r6 and r137, 2026-11-19); the other platforms owed.
 > **A-625 part 2, continued (2026-11-19, g299 under main's rulings):** no wait is unbounded: before a phase has learned,
 > RFC 6298's first RTO from the connection's own handshake round trip (`slates_rt::tcp::TcpStream::round_trip`, the
 > kernel's record on Linux, macOS and Windows), the edge's TLS work added, then the handshake's duration, floored by the
@@ -488,12 +500,20 @@
 > nothing; a version's head, root tree and any path read from rows and trees with no walk. An oracle holds the store to
 > a map model over generated histories in both formats; eleven mutations each turned tests red (`cargo test -p
 > slates-git --lib store::`, 14 of 14, Mac Studio; see A-614). Owed: part 2, the pack fragments and the base pack with
-> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters; the walks and a
-> commit sliced under the shard's budget; the versions' records as content. **Part 2 (A-614 part 2):** each version's
+> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters (superseded,
+> below); the walks and a commit sliced under the shard's budget; the versions' records as content. **Part 2 (A-614
+> part 2):** each version's
 > D(k) kept as two fragments (commits, trees and tags; blobs) of pack entries with their CRC32s, an edit a REF delta against
 > its path's previous object and similar objects OFS deltas, the window, zlib level, depth and rebuild point learned; the
 > base pack self-contained; packs read back through A-608's reader in the oracle; eleven mutations red. Owed of part 2:
-> the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs.
+> the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs. **Part 3 superseded
+> (2026-11-19, g083):** the commit rows keep no changed-path Bloom filters. They were for one walk, `log` and `blame`
+> of a path through slates' API narrowed from versions to commits; since A-645 those are A-666's derived types (part
+> 2's history reads one node a version it lists, part 3's blame the file's spans), the version their unit, so no walk
+> is left to skip. Checked: upload-pack walks no path's history (`sparse:oid` filters objects over trees); receive-pack
+> judges ref names and D(k)'s merges and signatures; a hook's git walks the hook view, which serves no commit-graph;
+> Subversion's path reads walk its own node history over revisions; Mercurial's server walks none. A commit-granular
+> history inside one stock push is the client's own, over its clone. A-614: parts 1 and 2 built, part 3 superseded.
 > **A-639 (2026-11-19, g083; piece 7's packs from fragments):** `slates-git` (`store::upload`) streams upload-pack's
 > pack from A-615's answer, taken through a trait (`Answered`): the runs from their fragments (filtered, the want always),
 > the walk's objects covered by whole kept parts (a clone so the base pack and the fragments after it; a filter that
@@ -680,7 +700,8 @@
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
 > objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
 > 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
-> (A-619), and the session over a byte channel (A-650 part 2); piece 5's first part, a push's bundle read, its race
+> (A-619), the session over a byte channel (A-650 part 2) and HTTP version 1 (A-650 part 1); piece 5's first part,
+> a push's bundle read, its race
 > checks and its reply (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079
 > for A-598 and A-619, g301 for A-641, g303 for A-650).**
 > Built on §4.17.1: a named branch's
@@ -818,25 +839,42 @@
 > whatever a path's depth, everything closed when the lend ends; proven on macOS arm64 (Mac Studio, 11 of 11) by two
 > stores imported through the simulated host equal to the same files read from memory, the guards each by a test; its
 > red run against a stub and each guard's mutation owed to main.
-> Owed, in order, after §4.17.1's seven
-> pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
-> the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
-> texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
-> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`) and the hooks at
-> `pretxnchangegroup` and `changegroup` (A-657 part 4); the landing's seam (`hg_push::Objects`) handed each
-> repository's index and content store from their home on its owner shard (A-662 built it: `vcs_store`'s Mercurial
-> arm, made with the record, charged and freed with it), each push's record and its replay at recovery (A-662 refuses
-> a Mercurial record `Owed` until then), and the served view over them (with A-650's site); part
-> 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed
-> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
-> the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2 `check:phases` (one
-> position for every phase) measured under concurrent pushes before it is kept;
-> (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
-> view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
-> largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
-> differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup
-> `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed
-> is claimed until main measures it.
+> **Built (A-650 part 1):** HTTP version 1 (`serve::http`): the last `cmd` as hgweb reads it (A-569's codec, which read
+> the first, corrected), the session's dispatch over the HTTP transport (its capabilities; 7.2's `bundle2required`
+> words), the answer in `0.1`, `hg-error`, or `0.2` in an engine the client reads (`0.1` in zlib otherwise), the caller
+> choosing the engine and level, each answer charged at its engine's bound; `getbundle` judging bundle capabilities
+> before what is missing, in 7.2's order (a bundle1 client was sent a bundle2 abort for a head the view lacked); the
+> daemon's site (`vcs_http::hg`): hgweb's route, git's credentials (A-625 part 3's record), a proven request moved to
+> its repository's shard, the policy in hgweb's order, `503` for hgweb's pages and for a repository whose store the
+> shard lacks (until the site is handed A-662's stores, after which that path goes), the media type named as the reply
+> begins. `slates-hg --lib` 306 of 306, the 13 captured exchanges among them, and `slates-server --lib vcs_http` 40 of
+> 40 on macOS arm64 (Mac Studio, kiln r137, 2026-11-19); the other platforms owed. Open, each its own piece with its
+> failing test first (main's to start): the zlib bound an answer is charged before it is compressed is stock zlib's
+> `compressBound`, which the linked zlib-rs's level 1 outgrows on bytes that do not compress (65,536 of the bytes its
+> fixed codes write in nine bits came to 73,721 against 65,569; Windows x86_64, jupiter, kiln r92, 2026-11-19), so a
+> compressor choosing zlib above level 0 could hold an answer up to about an eighth of its stream past its charge (the
+> site's first value takes zlib at level 0, stored, within it); and a query's fields past the request's room are `400`
+> where a path past it is `414`.
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651,
+> g294); A-662's stores handed to the HTTP site and that loop (their home on each owner shard is built); the learned
+> response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
+> ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
+> around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
+> step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes: the policy
+> (`vcs_policy::admit`) and the hooks at `pretxnchangegroup` and `changegroup` (A-657 part 4); the landing's seam
+> (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
+> it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
+> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the served view over them (with A-650's site);
+> part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
+> compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
+> bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
+> `check:phases` (one position for every phase) measured under concurrent pushes before it is kept; (6) the changesets
+> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream
+> clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
+> lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
+> against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
+> sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
+> main measures it.
 
 > **Fixed (g300, 2026-11-19, A-667; found by g304 against stock 7.2): Mercurial's branch heads were judged by a child on
 > the branch.** `serve::discovery::branch_head_revs` took a revision for its branch's head when no child of it was on
@@ -971,8 +1009,8 @@
 > thirteen ways; its seventh slice (g297), `get-file-revs` (its 13 scripted commands, `svn blame` and `svn blame -g`
 > replayed whole; Windows x86_64, jupiter, 444 of 444; macOS arm64, Mac Studio, its `reads::`, `serve::` and
 > `report::editor::` tests 58 of 58, a file property taken away and a mainline and a merged revision of one number
-> among them), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s writes as read until the
-> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0; its eighth slice
+> among them), not yet red-checked; svndiff 0 is held to stock `svnserve` 1.15.0's own writes since A-616 continued
+> (7) recorded the `get-file-revs-svndiff0` session; its eighth slice
 > (g297), read access by A-606's rules (the `locked` repository's four scripted and seven stock sessions replayed
 > whole, the connection judging each read by its principal's rules; macOS arm64, Mac Studio, 54 of 54), not yet
 > red-checked. Owed
@@ -1100,10 +1138,14 @@
 > A-652's generator.
 > A-616 continued (6) (2026-11-19, g234, a bug g297 found): a version-0 delta's chunks as `svnserve` writes them, a
 > window of new data alone `send_simple_insertion_window`'s two with the stream's header in the first (the writer had
-> sent the header alone), from `svndiff.c`; red four ways and green, the lib 467 of 467, on jupiter (Windows x86_64).
-> Owed: two hand-made sessions from a client announcing neither svndiff version, recorded against `svnserve` 1.15.0
-> (the Mac Studio), and their drives held to its chunks byte for byte; the macOS run. Swept: only the reporter's
-> editor writes `textdelta-chunk`s.
+> sent the header alone), from `svndiff.c`; red four ways and green, the lib 467 of 467, on jupiter (Windows x86_64);
+> its owed recording settled and its macOS run done by A-616 continued (7). Swept: only the reporter's editor writes
+> `textdelta-chunk`s.
+> A-616 continued (7) (2026-11-19, g234, the duplicate g297 found): one writer of an svndiff stream's writes, the
+> report editor's `DeltaWrites`, for its `textdelta-chunk`s and `get-file-revs`' delta strings; both callers held byte
+> for byte to stock `svnserve` 1.15.0's `get-file-revs-svndiff0` session (g297's recording, kiln r88), its 14 deltas
+> through each (macOS arm64, Mac Studio, 69 of 69); the report recorder's two svndiff 0 sessions, never recorded,
+> taken out. Owed: the Windows run and red-checks (main's).
 > A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
 > command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
 > land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.

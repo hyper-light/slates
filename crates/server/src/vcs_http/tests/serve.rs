@@ -6,7 +6,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use slates_http::head::Head;
 use slates_http::reply::Status;
-use slates_http_edge::connection::Phase;
+use slates_http_edge::connection::{Fields, Phase};
 use slates_http_edge::tls::ServingIdentity;
 use slates_rt::control::Control;
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
@@ -81,13 +81,24 @@ impl Site for Echoes {
   }
 }
 
-/// An exchange replying `echo:` and the body it took, in one run.
+/// Shape: a body [`Echo`] names [`ECHO_TYPE`] for as its reply begins, failing if its fields are asked again, as
+/// Mercurial's exchange fails once its answer is taken.
+const TYPED: &[u8] = b"typed";
+/// Shape: a body [`Echo`] fails for as its reply begins, `503`.
+const FAILS_AS_IT_BEGINS: &[u8] = b"fails";
+/// Shape: the media type [`Echo`] names for [`TYPED`].
+const ECHO_TYPE: &[u8] = b"text/x-echo";
+
+/// An exchange replying `echo:` and the body it took, in one run; naming its reply's fields, or failing as its reply
+/// begins, for the bodies [`TYPED`] and [`FAILS_AS_IT_BEGINS`].
 #[derive(Default)]
 struct Echo {
   /// The body taken.
   body: Vec<u8>,
   /// Whether it replied.
   replied: bool,
+  /// How many times its reply's fields were asked for.
+  asked: u32,
 }
 
 impl Exchange for Echo {
@@ -98,6 +109,16 @@ impl Exchange for Echo {
 
   async fn body_end(&mut self) -> Result<(), Failed> {
     Ok(())
+  }
+
+  async fn reply_fields(&mut self) -> Result<Fields, Failed> {
+    self.asked = self.asked.saturating_add(1);
+    match (self.body.as_slice(), self.asked) {
+      (TYPED, 1) => Ok(vec![(b"Content-Type".to_vec(), ECHO_TYPE.to_vec())]),
+      (TYPED, _) => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
+      (FAILS_AS_IT_BEGINS, _) => Err(Failed(Status::SERVICE_UNAVAILABLE)),
+      _ => Ok(Fields::new()),
+    }
   }
 
   async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
@@ -580,4 +601,47 @@ fn a_cleartext_edge_serves_on_loopback_alone() {
   ]
   .map(|ip| admits_cleartext(SocketAddrV4::new(ip, 0)));
   assert_eq!(admitted, [true, true, false, false]);
+}
+
+/// A-650 part 1 (the reply's fields named as it begins). Do: on one connection send a proven POST whose exchange names
+/// its media type as its reply begins and replies in two runs, failing if its fields are asked again, as Mercurial's
+/// exchange fails once its answer is taken; on a second, one whose exchange fails as its reply begins. Expect: the
+/// first reply's head carrying the media type after the decision's fields, its fields asked once, the reply whole; the
+/// second answered `503` in stages, nothing of a `200` sent, and the connection ended cleanly.
+#[test]
+fn a_service_names_its_reply_fields_once_and_a_failure_there_is_the_status() {
+  let ((typed, failed), _) = served(TWO_SEATS, None, |address| {
+    let mut stream = connect(address);
+    stream
+      .write_all(&post(TYPED, true))
+      .expect("the typed request");
+    let typed = read_until(&mut stream, LAST_CHUNK);
+    drop(stream);
+    let mut stream = connect(address);
+    stream
+      .write_all(&post(FAILS_AS_IT_BEGINS, true))
+      .expect("the request that fails");
+    (typed, read_to_end(&mut stream))
+  });
+  let data = [b"echo:", TYPED].concat();
+  let head = format!(
+    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+    String::from_utf8_lossy(ECHO_TYPE),
+    data.len()
+  );
+  let whole = [head.as_bytes(), &data, b"\r\n", LAST_CHUNK].concat();
+  let refused =
+    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  assert_eq!(
+    (
+      String::from_utf8_lossy(&typed),
+      String::from_utf8_lossy(&failed.0),
+      failed.1
+    ),
+    (
+      String::from_utf8_lossy(&whole),
+      String::from_utf8_lossy(refused.as_bytes()),
+      true
+    )
+  );
 }

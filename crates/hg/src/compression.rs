@@ -180,6 +180,24 @@ impl Engine {
     }
   }
 
+  /// The engine's name on the wire protocol, as 7.2's `wireprotosupport` names it: what a client lists after `comp=`,
+  /// what an `application/mercurial-0.2` answer's header names, and what `compression=` advertises.
+  pub const fn wire_name(self) -> &'static [u8] {
+    match self {
+      Self::Uncompressed => b"none",
+      Self::Zlib => b"zlib",
+      Self::Bzip2 => b"bzip2",
+      Self::Zstd => b"zstd",
+    }
+  }
+
+  /// The engine a wire name names, matched exactly, or `None` for one this crate does not write.
+  pub fn for_wire_name(name: &[u8]) -> Option<Self> {
+    ENGINES
+      .into_iter()
+      .find(|engine| engine.wire_name() == name)
+  }
+
   /// The engine a bundle type names, matched exactly as 7.2 matches it (`supportedbundletypes`, case and all), or
   /// `None` for one this crate does not read.
   pub fn for_bundle_type(name: &[u8]) -> Option<Self> {
@@ -277,7 +295,7 @@ pub enum Refusal {
 }
 
 /// Why a stream or a bundle was not compressed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeRefusal {
   /// A level outside the engine's [`Engine::levels`].
   Level {
@@ -313,6 +331,43 @@ pub enum EncodeRefusal {
     /// Their length.
     len: u64,
   },
+}
+
+/// Format: the shifts of zlib's `compressBound`, `len + (len >> 12) + (len >> 14) + (len >> 25) + 13` (zlib's
+/// `compress.c`), the most a zlib stream of `len` bytes takes at any level.
+const ZLIB_BOUND_SHIFTS: [u32; 3] = [12, 14, 25];
+
+/// Format: the constant of zlib's `compressBound`: its header, its Adler-32 and its last block's framing.
+const ZLIB_BOUND_EXTRA: u64 = 13;
+
+/// Format: bzip2's bound, an output "1% larger than the uncompressed data, plus six hundred extra bytes" (the bzip2
+/// manual's `BZ2_bzBuffToBuffCompress`): the divisor of that one percent.
+const BZIP2_BOUND_DIVISOR: u64 = 100;
+
+/// Format: bzip2's bound's six hundred extra bytes (as [`BZIP2_BOUND_DIVISOR`]).
+const BZIP2_BOUND_EXTRA: u64 = 600;
+
+/// The most bytes [`compress`] writes for `length` plain bytes with `engine`, by each library's own documented bound:
+/// zlib's `compressBound`, bzip2's one percent and six hundred bytes, libzstd's `ZSTD_compressBound`, and the length
+/// itself uncompressed. A caller charges it to its admission before it compresses, so the compressed bytes are never
+/// held past the room.
+pub fn bound(engine: Engine, length: u64) -> u64 {
+  match engine {
+    Engine::Uncompressed => length,
+    Engine::Zlib => ZLIB_BOUND_SHIFTS
+      .iter()
+      .fold(length, |total, shift| {
+        total.saturating_add(length.checked_shr(*shift).unwrap_or(0))
+      })
+      .saturating_add(ZLIB_BOUND_EXTRA),
+    Engine::Bzip2 => length
+      .saturating_add(length.div_ceil(BZIP2_BOUND_DIVISOR))
+      .saturating_add(BZIP2_BOUND_EXTRA),
+    Engine::Zstd => usize::try_from(length)
+      .ok()
+      .map(zstd_safe::compress_bound)
+      .map_or(u64::MAX, to_u64),
+  }
 }
 
 /// Inflates `stream`, one whole stream of `engine`, onto the end of `out`. The memory the stream's header sizes for
