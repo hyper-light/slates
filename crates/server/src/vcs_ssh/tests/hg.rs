@@ -7,9 +7,9 @@
 //! the site refusing a repository argument as 7.2's dispatch refuses it before anything is opened.
 
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use slates_db::catalog::{
@@ -283,8 +283,9 @@ impl Store for Probed {
 struct Lends {
   /// The store, kept for the test's life.
   probed: &'static Probed,
-  /// Whether the store went away; it never does when none.
-  gone: Option<&'static Cell<bool>>,
+  /// Whether the store went away; it never does when none. A word every shard may read, since the edge's harness makes
+  /// a site on each shard from one maker (A-651 part 4).
+  gone: Option<&'static AtomicBool>,
 }
 
 impl Lends {
@@ -301,7 +302,7 @@ impl HgStores for Lends {
   type Store = Probed;
 
   fn holds(&self, id: RepositoryId) -> bool {
-    id == HG && !self.gone.is_some_and(Cell::get)
+    id == HG && !self.gone.is_some_and(|gone| gone.load(Ordering::Acquire))
   }
 
   fn lend<R>(&mut self, id: RepositoryId, step: impl FnOnce(&Probed) -> R) -> Option<R> {
@@ -562,7 +563,7 @@ fn a_client_asking_for_hidden_changesets_is_warned_as_7_2_warns_and_served_the_v
 /// not-served words with `abort`'s status, `heads` never consumed.
 #[test]
 fn a_store_that_goes_away_ends_the_session_as_not_served() {
-  let gone: &'static Cell<bool> = Box::leak(Box::new(Cell::new(false)));
+  let gone: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
   let lends = Lends {
     gone: Some(gone),
     ..Lends::probed()
@@ -572,7 +573,7 @@ fn a_store_that_goes_away_ends_the_session_as_not_served() {
   command.input(HELLO).expect("within the window");
   channel.drive(&mut command);
   let hello = std::mem::take(&mut channel.stdout);
-  gone.set(true);
+  gone.store(true, Ordering::Release);
   command.input(HEADS).expect("within the window");
   channel.drive(&mut command);
   let ended = Channel {
