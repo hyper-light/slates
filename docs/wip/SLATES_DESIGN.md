@@ -12871,7 +12871,9 @@ engine: the verdict, rebase, position mapping, the register).
 > clone takes its small blobs from the parts of blobs as they were kept. After the greens whose heads are wanted, each
 > object still wanted is offered the parts of the version its row says brought it, so a partial clone's later fetch of
 > blobs by their ids, which wants no head, is answered from the fragments too. upload-pack's service writes the stream
-> through one pack source, A-640 part 3's `upload::Fragments`.
+> through one pack source, A-640 part 3's `upload::Fragments`. Through it, stock git's clone of small.git and A-582's
+> five fetches are answered from the store's parts, every version encoded and a base pack made, each object once; and
+> `Streamed::counters` tells which of the store's paths wrote a pack (A-653 continued (1)).
 >
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
@@ -48275,6 +48277,68 @@ Applied in the same change to:
   the key lookup; the stores (A-662) behind upload-pack and Mercurial's session, and receive-pack's and Subversion's
   entry points (A-654, A-656), each a `Command` behind `Services`, the not-served answer going with the last of them;
   the live OpenSSH 10.2 `git clone` over SSH (main's run, filed); the four red-checks above (main's).
+
+### A-653, continued (1) — The real clone's requests answered through `upload::Fragments` from the store's parts; `Streamed::counters` (2026-11-19, g083 for UI goal 93; §4.17.2 "A fetch", piece 7; A-640 part 3)
+
+Applied in the same change to: §4.17.2's A-653 status block, GAPS (the A-653 entry), `crates/git`
+(`upload::Streamed::counters`; `upload::tests::fragments`: four tests and `streamed_from`; `upload::tests::clone`: its
+`fetch` request, branches, small.git and refs shared with those tests).
+
+- **What A-653 owed.** Its parts were tested through the store's stream alone, while upload-pack writes that stream
+  through A-640 part 3's `upload::Fragments`. Stock git's own requests now go through the source, with the store's
+  parts kept as the owner keeps them: every version encoded and `main`'s base pack made.
+- **`Streamed::counters`** answers the stream's own counters (A-639's `UploadCounters`), so a test through the source
+  sees which of the store's paths wrote its pack: parts copied whole, parts read entry by entry, objects encoded
+  afresh.
+- **Tests**, the one that reads the counters failing first against a stub answering no work:
+  `a_stock_clones_fetch_is_answered_from_the_stores_parts` (the `fetch` a stock `git clone` of small.git sent, 32
+  wants of 31 commits with `thin-pack`, `ofs-delta`, `no-progress` and `done`, before any version is encoded and once
+  every one is: the packfile section alone, its pack exactly small.git's 32 objects, each once);
+  `every_fetch_stock_git_answered_is_answered_from_the_stores_parts` (A-582's five exchanges, `fetch-clone`,
+  `fetch-haves`, `fetch-shallow`, `fetch-ref-in-want` and `fetch-progress`: every packet but the pack's data the one
+  stock git 2.50.1 sent, progress aside, and a pack of exactly the objects git's held, each once, a thin one completed
+  from the repository's objects); `a_pack_through_the_source_is_read_from_the_kept_parts` (every object of A-582's
+  repository through the source: parts copied whole and parts read entry by entry, none encoded afresh, each object
+  once); `a_plan_past_its_admission_is_refused` (a plan begun with no room admitted is refused past its admission).
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1), `cargo test --locked -p slates-git --lib --
+  upload::`: with the stub, 58 passed, 1 failed, 1 ignored, the one failure
+  `a_pack_through_the_source_is_read_from_the_kept_parts` with every counter 0; over the tree landed, 59 passed, 0
+  failed, 1 ignored, 439 filtered out, the four tests among the passes; `cargo fmt -p slates-git -- --check` clean.
+  No integration target reaches upload-pack's pack source (the server's upload-pack tests lend a stub one).
+- **Owed.** The live clone over the HTTP edge (A-625 part 3: the server's git store per repository and its lender);
+  the red-checks and the other platforms' runs (main's); a delta search for an object past a window; the fragments'
+  encoding sliced.
+
+### A-660 — The deadlines tests hold their failover delay through the daemon's seam, and their look counts the descheduling their shard measured (2026-11-19, g229, main's bug for the server's gates; A-574, A-536, A-525)
+Applied in the same change to: `crates/server/src/deadlines.rs`'s tests;
+`docs/bugs/2026-11-19-the-deadlines-tests-wrote-the-failover-delay-the-beat-overwrites.md`, new.
+
+- **The bug.** `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` failed
+  on every machine (`deadlines.rs:830`), and every server agent's green run carried it (A-648's entry among others).
+  Since A-574 the control shard's beat publishes `injected_failover_ns.unwrap_or(estimate)` into `failover_ns` at
+  every beat. The test wrote `failover_ns` itself and captured two delays later, so the capture was held the estimate,
+  past the half window it looks for. The CLI attachment's test wrote it the same way and passed only because it reads
+  its delay in the same observe.
+- **The fix.** Both tests inject their delay with `Daemon::inject_failover`, which every beat then publishes; nothing
+  else in the module writes `failover_ns`. The seven other test sites that write it (`fleet.rs`'s fan test among
+  them) each read it within one `audit_on_shard` closure, where no beat runs between, so none needs it.
+- **Under load.** Asked to check the write lease's test under load: one whole-suite run of eleven with the fix missed
+  the bare half window in it and in the CLI attachment's test (load average 14.7). With the look allowed ten seconds,
+  every release in the whole suite came 101 to 166 ms after its 100 ms term. `look_until` now widens its half window
+  by the descheduling the shard measured (`slates_rt::futures::scheduler_overrun_ns`), which is next to nothing on a
+  quiet host, and a miss reports how long it looked and what the shard measured. The miss was not reproduced in twelve
+  suites run two at a time since, with or without the widening: the widening is a measured noise floor, not a proven
+  cure.
+- **Tests** macOS arm64, Mac Studio, 2026-11-19 (kiln r66), on a8c2fc09b, main 2e4433040 with this change merged, the
+  code this commit lands: `cargo fmt -p slates-server -- --check` clean; `cargo test --locked -p slates-server --lib
+  deadlines:: -- --test-threads=4` 10 of 10, the status capture's test among them (main's file failed it 10 of 10
+  alone; the bug record holds the red); and, each by name with `--test-threads=4`, the 19 integration tests that inject
+  the failover delay through the same seam, 19 of 19: `slates-server`'s `attachment_term` (its four),
+  `landing_fairness`'s `a_landing_longer_than_its_lease_term_renews_it_and_lands_everything`, twelve of `fleet`'s (the
+  forward's paths floor, the durability refusal at the failover delay, both live-shipped held-reply bounds, the
+  forward's location budget, and the seven takeovers on `lone_fleet_node`), and `slates-client`'s `reap` and `client`
+  term tests. The same counts on 3ed9ad19f (main b1926d201, kiln r53), before A-657 part 3 and A-626 part 3 changed
+  what `slates-server` builds from. The Linux and Windows runs are owed.
 
 ### A-625 part 3 — the credential record both edges authenticate through, and the daemon starting the HTTP edge with each proven connection moved to its repository's shard (2026-11-19, g299 under main's rulings, UI goal 93 (kiln 51cef9f7); §4.13 "Principals"; §4.17.2 "Transports" item 1 and "Access"; after A-625 part 3's first slice, A-633)
 Applied in the same change to: §4.13 (a status); §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/db`
