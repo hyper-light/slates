@@ -12303,6 +12303,26 @@ engine: the verdict, rebase, position mapping, the register).
 > their transient sets charged; the versions' records kept as content. A green's maps made from a commit that is no
 > version's head (A-534's owed item) is receive-pack's create, piece 6.
 >
+> **Status (2026-11-19, A-614 part 2: piece 5's pack fragments and base pack).** `crates/git` (`store`) encodes each
+> version's D(k), once and off the answer's path, as two fragments kept as content: commits, trees and tags, then blobs.
+> Each entry is written as `pack-objects` writes one through A-582's writers, deflated by zlib through flate2 over
+> zlib-rs (A-607), with the CRC32 of the whole entry kept. An object may be a delta against an earlier entry of its
+> fragment, named by offset, or against the object its path held in the previous version, named by id: that object,
+> found by walking the two root trees together into the subtrees that differ, is tried first. The delta search is git's
+> shape (`diff-delta.c`), with the source indexed in blocks a copy instruction long, matches extended greedily, and copies
+> at most 64 KiB. Every tunable is learned from the deployment's own objects (`store::learn`). The window is one rank past
+> the deepest whose measured savings paid for its measured time at the owner's exchange (§4.11's value of a byte over
+> its value of CPU); it starts at the nearest candidate and grows a rank a fragment while further ranks pay. The zlib
+> level per kind is the level whose saved bytes most outweigh its time, every level sampled on one object of each kind a
+> fragment. The depth is the deepest chain the deployment's own clients' packs carried, at most git's 4095. The base
+> pack's rebuild point is rent or buy: clones' measured time on the fragments after it, against the last rebuild's
+> measured time, the first clone building the first. The base pack is every object the head reaches, self-contained
+> (offset deltas only); a clone is the base pack and the fragments after it, and a pack is assembled through A-591's
+> writer (header, entries, trailer). Owed: the fetch's choice of fragments within fast-forward runs (piece 7); a REF
+> chain's depth across fragments, bounded today by the versions a pack spans and reset by each rebuild; the encoding and
+> rebuild sliced under the shard's budget; one base pack shared by greens that reach alike (each green keeps its own
+> today).
+>
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
 > (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
@@ -12610,8 +12630,9 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
    trailer; hostile input. (The deflate implementation, chosen by measurement: zlib-rs through flate2's API, A-607.)
 4. The tree, commit and tag parsers with the fsck checks.
 5. The git object store on §4.17.1's: index rows with commit rows, D(k) per version, pack fragments, the base pack
-   (part 1 built, A-614: naming, rows, commit rows, D(k) and reached sets, a version read as a tree; part 2 the
-   fragments and the base pack; part 3 the commit rows' changed-path Bloom filters).
+   (part 1 built, A-614: naming, rows, commit rows, D(k) and reached sets, a version read as a tree; part 2 built:
+   the fragments and the base pack, their window, depth, zlib level and rebuild point learned; part 3 the commit rows'
+   changed-path Bloom filters).
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
    report-status-v2, atomic; a create's green made from its commit's tree, its maps (A-534) built from a commit that is no
    version's head.
@@ -42654,6 +42675,56 @@ Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`sto
 - **Owed of A-630.** The import (each revlog the fncache names read through `revlog` and appended to `index`, links by
   changelog number, through §4.15's read seam; golden: every changeset's node and every file's bytes equal to the
   fixtures' `debugdata`), then version 2's file index (`store_utils/file_index.py`).
+
+### A-614 part 2 — Pack fragments per D(k) and the base pack, the delta window, depth and zlib level and the rebuild point learned from the deployment's own objects (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 4, piece 5; §4.11's cost model; A-582, A-591, A-607, A-608)
+
+Applied in the same change to: §4.17.2 (a status block; piece 5's line), GAPS (the §4.17 entry), `crates/git` (`store`:
+`learn`, `deltas`, `fragment`, the repository's fragment and base-pack records and methods; `Incoming::depth`).
+
+- **Fragments.** `Repository::encode_fragments` encodes a version's D(k), after its commit, as two fragments kept as
+  content (commits, trees and tags; then blobs, so a fetch that wants no blobs is a concatenation too). Each entry is
+  written through `entry::write`, deflated through flate2, and its CRC32 kept (`Placed`). A fragment is written as if it
+  began right after a pack's header, and an offset delta keeps only the distance back to its base, so its bytes are valid
+  wherever a pack places them. `pack` and `clone_pack` assemble packs through `pack::Writer`.
+- **Bases.** The object a path held in the previous version, found by walking the two root trees together into the
+  subtrees that differ, is tried first, as a REF delta; then the earlier entries of the same kind, nearest first, as OFS
+  deltas. The smallest delta shorter than the object wins. A REF delta's base lies outside its fragment, so it begins a
+  chain, as a client completing a thin pack stores the base whole.
+- **The delta search** (`deltas::delta_of`): git's shape, `diff-delta.c`. The source is indexed in blocks a copy
+  instruction long (eight bytes: a shorter match saves nothing as a copy), the target is scanned with a rolling hash,
+  matches are extended greedily, and copies are at most git's 64 KiB.
+- **Learned, never fixed** (`learn`): the window, the zlib level per kind, the depth, and the rebuild point. git fixes
+  the first two by constants it calls "magic values" (window 10, depth 50; `technical/pack-heuristics`).
+  - The window is one rank past the deepest whose measured savings paid for its time at the owner's exchange. It starts
+    at the nearest candidate; every candidate would make an import's first fragment cost a delta search for every pair.
+  - The level is the one whose saved bytes most outweigh its time, every level sampled on one object of each kind each
+    fragment.
+  - The depth is the deepest chain the deployment's clients' packs carried (their `pack.depth`), at most git's 4095;
+    zero before any push carried a delta.
+  - The rebuild point is rent or buy over clones' measured time and the last rebuild's.
+- **The base pack** is every object the head reaches, self-contained (OFS only); `clone_pack` is it and the fragments
+  after it.
+- **Tests** (`cargo test --locked -p slates-git --lib store::`, 21 of 21 and 2 ignored, the whole crate 278 of 278, and
+  `-p slates-vcs --lib` 30 of 30, the Mac Studio, 2026-11-19, at 6dbde92ad; `cargo fmt --check` clean):
+  - The oracle now encodes every committed version and reads each ref's whole pack back through A-608's reader against
+    its D(k)s, in both formats.
+  - `a_delta_turns_its_source_into_its_target_and_none_saves_nothing` and `every_delta_applies_back_to_its_target`
+    (generated).
+  - `the_learned_rules_follow_what_was_measured`.
+  - `a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_version`.
+  - `similar_files_in_one_version_are_offset_deltas_within_the_learned_depth`.
+  - `a_fragments_entries_keep_their_offsets_and_crcs`.
+  - `a_clone_is_its_base_pack_and_the_fragments_after_it`.
+  - Main's two runs, ignored: `a_sample_pack_for_verify_pack` and `double_hashing_costs`.
+- **Red-checks** (the Studio, each mutation once on a copy, the tree clean after): no delta ever found (3 red), the named
+  base never tried (1), a chain past the learned depth (1, after the test was made to need it), an offset delta's base a
+  byte off (3), a CRC32 a byte short (1), the window never growing (1), the worst level chosen (1), a rebuild due without
+  rent (2), named bases backwards (1, after the edit's own entry was pinned), a base pack of the last D(k) alone (1), a
+  pack's count one off (5).
+- **Owed.** The fetch's choice of fragments within fast-forward runs (piece 7). A REF chain's depth across fragments,
+  bounded today by the versions a pack spans and reset by each rebuild. The encoding and the rebuild sliced under the
+  shard's budget. One base pack shared by greens that reach alike. Main's runs are filed: `git verify-pack` over the
+  sample pack, the double hashing, clippy, `xtask` and the docs.
 
 ### A-622 part 3 — The hook driver: a hook run as an owned process of its own group, held to A-597's runner (2026-11-19, g255, UI goal 93; §4.17.1 "Policy" and shared piece 7's rest; after A-622 part 2)
 Applied in the same change to:

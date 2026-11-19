@@ -380,49 +380,55 @@ fn oracle_run(graph: &TestGraph, want: u32, common: &[u32]) -> Option<Run<u32>> 
   best
 }
 
-/// What the oracle expects `asks` to be answered.
-fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
+/// The wants the store holds, each once, in order; refused at the first it does not hold.
+fn oracle_wants(graph: &TestGraph, ids: &[ObjectId]) -> Result<Vec<u32>, Refusal> {
   let mut wants = Vec::new();
-  for id in &asks.wants {
+  for id in ids {
     let node = graph.node(id).ok_or(Refusal::NotOurs { id: *id })?;
     if !wants.contains(&node) {
       wants.push(node);
     }
   }
-  if wants.is_empty() && !asks.wait_for_done {
-    return Ok(Expected {
-      answer: Answer::Nothing,
-      one_round: 0,
-      walk_wants: 0,
-    });
-  }
-  let common = held(graph, &asks.haves);
+  Ok(wants)
+}
+
+/// The client's shallow commits the store holds, each once; refused at one that is no commit.
+fn oracle_client(graph: &TestGraph, ids: &[ObjectId]) -> Result<Vec<u32>, Refusal> {
   let mut client = Vec::new();
-  for id in &asks.shallow {
-    if let Some(node) = graph.node(id) {
-      if graph.objects[at(node)].kind != Kind::Commit {
-        return Err(Refusal::ShallowNotCommit { id: *id });
-      }
-      if !client.contains(&node) {
-        client.push(node);
-      }
+  for (id, node) in ids
+    .iter()
+    .filter_map(|id| graph.node(id).map(|node| (id, node)))
+  {
+    if graph.objects[at(node)].kind != Kind::Commit {
+      return Err(Refusal::ShallowNotCommit { id: *id });
+    }
+    if !client.contains(&node) {
+      client.push(node);
     }
   }
-  if let Some(filter) = &asks.filter {
-    super::filter::check_served(filter).map_err(Refusal::Filter)?;
-  }
+  Ok(client)
+}
+
+/// The oracle's runs, and the wants they answer: none unless the request leaves the one-round path open.
+fn oracle_runs(
+  graph: &TestGraph,
+  asks: &Asks,
+  wants: &[u32],
+  common: &[u32],
+  client: &[u32],
+) -> (Vec<Run<u32>>, Vec<u32>) {
   let open = client.is_empty()
     && asks.deepen.is_none()
     && asks.filter.as_ref().is_none_or(Filter::is_per_object);
   let mut runs = Vec::new();
-  let mut one_round = Vec::new();
+  let mut answered = Vec::new();
   if open {
     for want in wants
       .iter()
       .filter(|want| graph.objects[at(**want)].kind == Kind::Commit)
     {
-      if let Some(run) = oracle_run(graph, *want, &common) {
-        one_round.push(*want);
+      if let Some(run) = oracle_run(graph, *want, common) {
+        answered.push(*want);
         if run.after < run.through {
           runs.push(run);
         }
@@ -431,38 +437,62 @@ fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
   }
   runs.sort();
   runs.dedup();
+  (runs, answered)
+}
+
+/// Whether the oracle finds the server ready: no `wait-for-done`, a common have, and every walked want, peeled, a
+/// commit that reaches a common commit or one of its parents.
+fn oracle_ready(graph: &TestGraph, asks: &Asks, walk_wants: &[u32], common: &[u32]) -> bool {
+  let they_have: BTreeSet<u32> = common
+    .iter()
+    .filter(|node| graph.objects[at(**node)].kind == Kind::Commit)
+    .flat_map(|node| std::iter::once(*node).chain(graph.objects[at(*node)].parents.iter().copied()))
+    .collect();
+  let all_reach = walk_wants.iter().all(|want| {
+    peeled_commit(graph, *want).is_none_or(|commit| {
+      !graph
+        .reach_commits([commit], &BTreeSet::new())
+        .is_disjoint(&they_have)
+    })
+  });
+  !asks.wait_for_done && !common.is_empty() && all_reach
+}
+
+/// What the oracle expects `asks` to be answered.
+fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
+  let wants = oracle_wants(graph, &asks.wants)?;
+  if wants.is_empty() && !asks.wait_for_done {
+    return Ok(Expected {
+      answer: Answer::Nothing,
+      one_round: 0,
+      walk_wants: 0,
+    });
+  }
+  let common = held(graph, &asks.haves);
+  let client = oracle_client(graph, &asks.shallow)?;
+  if let Some(filter) = &asks.filter {
+    super::filter::check_served(filter).map_err(Refusal::Filter)?;
+  }
+  let (runs, one_round) = oracle_runs(graph, asks, &wants, &common, &client);
   let walk_wants: Vec<u32> = wants
     .iter()
     .copied()
     .filter(|want| !one_round.contains(want))
     .collect();
+  let answered = u64::try_from(one_round.len()).unwrap();
   let acknowledgments = if asks.done {
     None
   } else {
-    let they_have: BTreeSet<u32> = common
-      .iter()
-      .filter(|node| graph.objects[at(**node)].kind == Kind::Commit)
-      .flat_map(|node| {
-        std::iter::once(*node).chain(graph.objects[at(*node)].parents.iter().copied())
-      })
-      .collect();
-    let all_reach = walk_wants
-      .iter()
-      .all(|want| match peeled_commit(graph, *want) {
-        None => true,
-        Some(commit) => !graph
-          .reach_commits([commit], &BTreeSet::new())
-          .is_disjoint(&they_have),
-      });
-    let ready = !asks.wait_for_done && !common.is_empty() && all_reach;
+    let ready = oracle_ready(graph, asks, &walk_wants, &common);
     let acknowledgments = Acknowledgments {
       common: common.iter().map(|node| graph.id(*node)).collect(),
       ready,
     };
     if !ready {
+      let answer = Answer::Acknowledgments(acknowledgments);
       return Ok(Expected {
-        answer: Answer::Acknowledgments(acknowledgments),
-        one_round: u64::try_from(one_round.len()).unwrap(),
+        answer,
+        one_round: answered,
         walk_wants: walk_wants.len(),
       });
     }
@@ -470,14 +500,15 @@ fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
   };
   let cut = oracle_cut(graph, asks, &wants, &client)?;
   let objects = oracle_objects(graph, asks, &walk_wants, &one_round, &common, &cut, &runs);
+  let pack = Pack {
+    acknowledgments,
+    shallow_info: cut.info.clone(),
+    runs,
+    objects,
+  };
   Ok(Expected {
-    answer: Answer::Pack(Pack {
-      acknowledgments,
-      shallow_info: cut.info.clone(),
-      runs,
-      objects,
-    }),
-    one_round: u64::try_from(one_round.len()).unwrap(),
+    answer: Answer::Pack(pack),
+    one_round: answered,
     walk_wants: walk_wants.len(),
   })
 }
@@ -519,94 +550,124 @@ fn oracle_cut(
   wants: &[u32],
   client: &[u32],
 ) -> Result<OracleCut, Refusal> {
-  let mut cut = OracleCut {
+  let cut = OracleCut {
     grafts: client.iter().copied().collect(),
     ..OracleCut::default()
   };
   let Some(deepen) = &asks.deepen else {
-    cut.info = (!client.is_empty()).then(ShallowInfo::default);
-    return Ok(cut);
+    return Ok(OracleCut {
+      info: (!client.is_empty()).then(ShallowInfo::default),
+      ..cut
+    });
   };
-  let (shallow, whole): (BTreeSet<u32>, BTreeSet<u32>) = match deepen {
+  let (shallow, whole) = match deepen {
     OwnedDeepen::Depth(0, _) => return Err(Refusal::ZeroDepth),
     OwnedDeepen::Depth(depth, _) if *depth == INFINITE_DEPTH => {
       (BTreeSet::new(), client.iter().copied().collect())
     }
-    OwnedDeepen::Depth(depth, relative) => {
-      let (roots, limit): (Vec<u32>, u32) = if *relative {
-        let tips: Vec<u32> = graph
-          .tips
-          .iter()
-          .filter_map(|tip| peeled_commit(graph, *tip))
-          .collect();
-        let reached = graph.reach_commits(tips, &BTreeSet::new());
-        (
-          client
-            .iter()
-            .copied()
-            .filter(|node| reached.contains(node))
-            .collect(),
-          depth + 1,
-        )
-      } else {
-        (
-          wants
-            .iter()
-            .filter_map(|want| peeled_commit(graph, *want))
-            .collect(),
-          *depth,
-        )
-      };
-      let depth = depths(graph, &roots);
-      (
-        depth
-          .iter()
-          .filter(|(_, at)| **at == limit)
-          .map(|(node, _)| *node)
-          .collect(),
-        depth
-          .iter()
-          .filter(|(_, at)| **at < limit)
-          .map(|(node, _)| *node)
-          .collect(),
-      )
-    }
-    OwnedDeepen::Cut(since, not) => {
-      let starts: Vec<u32> = wants
-        .iter()
-        .filter_map(|want| peeled_commit(graph, *want))
-        .collect();
-      let reached = graph.reach_commits(starts, &BTreeSet::new());
-      let mut excluded_starts: Vec<u32> = Vec::new();
-      for id in not {
-        let node = graph.node(id).ok_or(Refusal::DeepenNotHeld { id: *id })?;
-        excluded_starts.extend(peeled_commit(graph, node));
-      }
-      excluded_starts.extend(
-        reached
-          .iter()
-          .copied()
-          .filter(|node| since.is_some_and(|time| graph.objects[at(*node)].date < time)),
-      );
-      let excluded = graph.reach_commits(excluded_starts, &BTreeSet::new());
-      let selected: BTreeSet<u32> = reached.difference(&excluded).copied().collect();
-      if selected.is_empty() {
-        return Err(Refusal::NothingSelected);
-      }
-      let shallow: BTreeSet<u32> = selected
+    OwnedDeepen::Depth(depth, relative) => oracle_by_depth(graph, wants, client, *depth, *relative),
+    OwnedDeepen::Cut(since, not) => oracle_by_rev_list(graph, wants, *since, not)?,
+  };
+  Ok(oracle_finish(graph, client, cut, shallow, &whole))
+}
+
+/// `deepen` or `deepen-relative`: the commits at the depth limit, and those above it.
+fn oracle_by_depth(
+  graph: &TestGraph,
+  wants: &[u32],
+  client: &[u32],
+  depth: u32,
+  relative: bool,
+) -> (BTreeSet<u32>, BTreeSet<u32>) {
+  let (roots, limit): (Vec<u32>, u32) = if relative {
+    let tips: Vec<u32> = graph
+      .tips
+      .iter()
+      .filter_map(|tip| peeled_commit(graph, *tip))
+      .collect();
+    let reached = graph.reach_commits(tips, &BTreeSet::new());
+    (
+      client
         .iter()
         .copied()
-        .filter(|node| {
-          graph.objects[at(*node)]
-            .parents
-            .iter()
-            .any(|parent| !selected.contains(parent))
-        })
-        .collect();
-      let whole = selected.difference(&shallow).copied().collect();
-      (shallow, whole)
-    }
+        .filter(|node| reached.contains(node))
+        .collect(),
+      depth + 1,
+    )
+  } else {
+    (
+      wants
+        .iter()
+        .filter_map(|want| peeled_commit(graph, *want))
+        .collect(),
+      depth,
+    )
   };
+  let depth = depths(graph, &roots);
+  (
+    depth
+      .iter()
+      .filter(|(_, at)| **at == limit)
+      .map(|(node, _)| *node)
+      .collect(),
+    depth
+      .iter()
+      .filter(|(_, at)| **at < limit)
+      .map(|(node, _)| *node)
+      .collect(),
+  )
+}
+
+/// `deepen-since` and `deepen-not`: the selected commits with a parent not selected, and the rest selected.
+fn oracle_by_rev_list(
+  graph: &TestGraph,
+  wants: &[u32],
+  since: Option<u64>,
+  not: &[ObjectId],
+) -> Result<(BTreeSet<u32>, BTreeSet<u32>), Refusal> {
+  let starts: Vec<u32> = wants
+    .iter()
+    .filter_map(|want| peeled_commit(graph, *want))
+    .collect();
+  let reached = graph.reach_commits(starts, &BTreeSet::new());
+  let mut excluded_starts: Vec<u32> = Vec::new();
+  for id in not {
+    let node = graph.node(id).ok_or(Refusal::DeepenNotHeld { id: *id })?;
+    excluded_starts.extend(peeled_commit(graph, node));
+  }
+  excluded_starts.extend(
+    reached
+      .iter()
+      .copied()
+      .filter(|node| since.is_some_and(|time| graph.objects[at(*node)].date < time)),
+  );
+  let excluded = graph.reach_commits(excluded_starts, &BTreeSet::new());
+  let selected: BTreeSet<u32> = reached.difference(&excluded).copied().collect();
+  if selected.is_empty() {
+    return Err(Refusal::NothingSelected);
+  }
+  let shallow: BTreeSet<u32> = selected
+    .iter()
+    .copied()
+    .filter(|node| {
+      graph.objects[at(*node)]
+        .parents
+        .iter()
+        .any(|parent| !selected.contains(parent))
+    })
+    .collect();
+  let whole = selected.difference(&shallow).copied().collect();
+  Ok((shallow, whole))
+}
+
+/// The cut's sections, grafts and the wants and haves a commit made whole adds.
+fn oracle_finish(
+  graph: &TestGraph,
+  client: &[u32],
+  mut cut: OracleCut,
+  shallow: BTreeSet<u32>,
+  whole: &BTreeSet<u32>,
+) -> OracleCut {
   let made_whole: Vec<u32> = client
     .iter()
     .copied()
@@ -629,7 +690,7 @@ fn oracle_cut(
     .flat_map(|node| graph.objects[at(*node)].parents.clone())
     .collect();
   cut.haves = made_whole;
-  Ok(cut)
+  cut
 }
 
 /// Whether `filter` sends an object of `kind` and `size` met at `depth`.
@@ -637,17 +698,15 @@ fn admitted(filter: Option<&Filter>, kind: Kind, size: u64, depth: u64) -> bool 
   filter.is_none_or(|filter| filter.admits(kind, size, depth))
 }
 
-/// The oracle's objects, from the module's rules over full reachability.
-fn oracle_objects(
+/// The commits the oracle sends: those the walked wants (and the parents of commits made whole) reach, grafts kept,
+/// that the common haves (and the commits made whole, and the wants a run answers) do not.
+fn oracle_sent(
   graph: &TestGraph,
-  asks: &Asks,
   walk_wants: &[u32],
   one_round: &[u32],
   common: &[u32],
   cut: &OracleCut,
-  runs: &[Run<u32>],
-) -> Vec<u32> {
-  let filter = asks.filter.as_ref();
+) -> BTreeSet<u32> {
   let wanted: Vec<u32> = walk_wants
     .iter()
     .chain(&cut.wants)
@@ -660,11 +719,21 @@ fn oracle_objects(
     .filter_map(|node| peeled_commit(graph, *node))
     .collect();
   let had = graph.reach_commits(had, &cut.grafts);
-  let sent: BTreeSet<u32> = graph
+  graph
     .reach_commits(wanted, &cut.grafts)
     .difference(&had)
     .copied()
-    .collect();
+    .collect()
+}
+
+/// What the oracle leaves out: everything in the trees of the sent commits' unsent parents, and in the haves that are
+/// no commits.
+fn oracle_left_out(
+  graph: &TestGraph,
+  common: &[u32],
+  cut: &OracleCut,
+  sent: &BTreeSet<u32>,
+) -> BTreeSet<u32> {
   let mut left_out = BTreeSet::new();
   for commit in sent.iter().filter(|commit| !cut.grafts.contains(commit)) {
     for parent in graph.objects[at(*commit)]
@@ -680,42 +749,48 @@ fn oracle_objects(
       left_out.extend(graph.reach([have]));
     }
   }
-  let mut chosen = BTreeSet::new();
-  let mut least: BTreeMap<u32, u64> = BTreeMap::new();
-  let mut queue: VecDeque<(u32, u64)> = VecDeque::new();
-  for commit in &sent {
-    if admitted(filter, Kind::Commit, 0, 0) {
-      chosen.insert(*commit);
-    }
-    queue.push_back((graph.objects[at(*commit)].tree, 0));
-  }
-  for want in walk_wants {
-    let mut current = *want;
-    loop {
-      let object = &graph.objects[at(current)];
-      match object.kind {
-        Kind::Tag => {
-          chosen.insert(current);
-          match object.target {
-            Some(next) => current = next,
-            None => break,
-          }
-        }
-        Kind::Tree => {
-          chosen.insert(current);
-          for entry in &object.entries {
-            queue.push_back((*entry, 0));
-          }
-          break;
-        }
-        Kind::Blob => {
-          chosen.insert(current);
-          break;
-        }
-        Kind::Commit => break,
+  left_out
+}
+
+/// A walked want: its chain of tags and, when it ends at a tree or blob, that object, chosen; a wanted tree's entries
+/// queued at depth 0.
+fn oracle_want(
+  graph: &TestGraph,
+  want: u32,
+  chosen: &mut BTreeSet<u32>,
+  roots: &mut Vec<(u32, u64)>,
+) {
+  let mut current = want;
+  loop {
+    let object = &graph.objects[at(current)];
+    match object.kind {
+      Kind::Tag => {
+        chosen.insert(current);
+        let Some(next) = object.target else { return };
+        current = next;
       }
+      Kind::Tree => {
+        chosen.insert(current);
+        roots.extend(object.entries.iter().map(|entry| (*entry, 0)));
+        return;
+      }
+      Kind::Blob => {
+        chosen.insert(current);
+        return;
+      }
+      Kind::Commit => return,
     }
   }
+}
+
+/// Each tree and blob below `roots` (each with its depth) that nothing left out holds, at the least depth it is met at.
+fn oracle_least_depths(
+  graph: &TestGraph,
+  roots: Vec<(u32, u64)>,
+  left_out: &BTreeSet<u32>,
+) -> BTreeMap<u32, u64> {
+  let mut least: BTreeMap<u32, u64> = BTreeMap::new();
+  let mut queue: VecDeque<(u32, u64)> = roots.into_iter().collect();
   while let Some((node, depth)) = queue.pop_front() {
     if left_out.contains(&node) || least.get(&node).is_some_and(|before| *before <= depth) {
       continue;
@@ -723,48 +798,85 @@ fn oracle_objects(
     least.insert(node, depth);
     let object = &graph.objects[at(node)];
     if object.kind == Kind::Tree {
-      for entry in &object.entries {
-        queue.push_back((*entry, depth + 1));
+      queue.extend(object.entries.iter().map(|entry| (*entry, depth + 1)));
+    }
+  }
+  least
+}
+
+/// The objects the runs carry that the filter admits.
+fn oracle_carried(graph: &TestGraph, filter: Option<&Filter>, runs: &[Run<u32>]) -> BTreeSet<u32> {
+  let mut carried = BTreeSet::new();
+  for run in runs {
+    for version in run.after + 1..=run.through {
+      for node in graph.brought_set(run.green, version) {
+        let object = &graph.objects[at(node)];
+        if admitted(filter, object.kind, object.size, 0) {
+          carried.insert(node);
+        }
       }
     }
   }
-  for (node, depth) in &least {
-    let object = &graph.objects[at(*node)];
-    if admitted(filter, object.kind, object.size, *depth) {
-      chosen.insert(*node);
+  carried
+}
+
+/// `include-tag`: each annotated tag whose chain ends at an object chosen or carried, chosen with its chain.
+fn oracle_tags(graph: &TestGraph, carried: &BTreeSet<u32>, chosen: &mut BTreeSet<u32>) {
+  for tag in &graph.tags {
+    let mut chain = vec![*tag];
+    let mut current = *tag;
+    let mut end = None;
+    while graph.objects[at(current)].kind == Kind::Tag {
+      let Some(next) = graph.objects[at(current)].target else {
+        break;
+      };
+      if graph.objects[at(next)].kind == Kind::Tag {
+        chain.push(next);
+      } else {
+        end = Some(next);
+      }
+      current = next;
+    }
+    if end.is_some_and(|end| chosen.contains(&end) || carried.contains(&end)) {
+      chosen.extend(chain);
+    }
+  }
+}
+
+/// The oracle's objects, from the module's rules over full reachability.
+fn oracle_objects(
+  graph: &TestGraph,
+  asks: &Asks,
+  walk_wants: &[u32],
+  one_round: &[u32],
+  common: &[u32],
+  cut: &OracleCut,
+  runs: &[Run<u32>],
+) -> Vec<u32> {
+  let filter = asks.filter.as_ref();
+  let sent = oracle_sent(graph, walk_wants, one_round, common, cut);
+  let left_out = oracle_left_out(graph, common, cut, &sent);
+  let mut chosen: BTreeSet<u32> = sent
+    .iter()
+    .copied()
+    .filter(|_| admitted(filter, Kind::Commit, 0, 0))
+    .collect();
+  let mut roots: Vec<(u32, u64)> = sent
+    .iter()
+    .map(|commit| (graph.objects[at(*commit)].tree, 0))
+    .collect();
+  for want in walk_wants {
+    oracle_want(graph, *want, &mut chosen, &mut roots);
+  }
+  for (node, depth) in oracle_least_depths(graph, roots, &left_out) {
+    let object = &graph.objects[at(node)];
+    if admitted(filter, object.kind, object.size, depth) {
+      chosen.insert(node);
     }
   }
   if asks.include_tag {
-    let mut carried = BTreeSet::new();
-    for run in runs {
-      for version in run.after + 1..=run.through {
-        for node in graph.brought_set(run.green, version) {
-          let object = &graph.objects[at(node)];
-          if admitted(filter, object.kind, object.size, 0) {
-            carried.insert(node);
-          }
-        }
-      }
-    }
-    for tag in &graph.tags {
-      let mut chain = vec![*tag];
-      let mut current = *tag;
-      let mut end = None;
-      while graph.objects[at(current)].kind == Kind::Tag {
-        let Some(next) = graph.objects[at(current)].target else {
-          break;
-        };
-        if graph.objects[at(next)].kind == Kind::Tag {
-          chain.push(next);
-        } else {
-          end = Some(next);
-        }
-        current = next;
-      }
-      if end.is_some_and(|end| chosen.contains(&end) || carried.contains(&end)) {
-        chosen.extend(chain);
-      }
-    }
+    let carried = oracle_carried(graph, filter, runs);
+    oracle_tags(graph, &carried, &mut chosen);
   }
   chosen.into_iter().collect()
 }
@@ -873,6 +985,20 @@ fn first_parents(graph: &TestGraph, head: u32) -> Vec<u32> {
 /// and a shallow line naming no commit each come in some cases, not most.
 fn build(plan: &Plan) -> (TestGraph, Asks) {
   let mut graph = TestGraph::default();
+  let (blobs, trees, commits) = build_history(&mut graph, plan);
+  build_tags(&mut graph, plan, &[&commits, &trees, &blobs]);
+  let greens = build_greens(&mut graph, plan, &commits);
+  let mut asks = build_asks(&graph, plan, &greens, &commits);
+  asks.deepen = build_deepen(&graph, plan, &commits);
+  asks.filter = build_filter(plan);
+  if plan.mode % 3 == 0 {
+    one_round_friendly(&graph, plan, &greens.current, &greens.chains, &mut asks);
+  }
+  (graph, asks)
+}
+
+/// A plan's blobs, trees and commits.
+fn build_history(graph: &mut TestGraph, plan: &Plan) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
   let blobs: Vec<u32> = plan
     .blobs
     .iter()
@@ -888,30 +1014,31 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
   }
   let mut commits: Vec<u32> = Vec::new();
   for (index, (parents, tree, date, skew)) in plan.commits.iter().enumerate() {
-    let mut chosen: Vec<u32> = if commits.is_empty() {
-      vec![]
-    } else {
-      parents
-        .iter()
-        .map(|choice| pick(&commits, *choice))
-        .collect()
-    };
+    let mut chosen: Vec<u32> = parents
+      .iter()
+      .filter(|_| !commits.is_empty())
+      .map(|choice| pick(&commits, *choice))
+      .collect();
     chosen.sort();
     chosen.dedup();
-    let date = u64::try_from(index).unwrap() * 10
-      + if *skew {
-        u64::from(*date)
-      } else {
-        u64::from(*date % 10)
-      };
+    let offset = if *skew {
+      u64::from(*date)
+    } else {
+      u64::from(*date % 10)
+    };
+    let date = u64::try_from(index).unwrap() * 10 + offset;
     commits.push(graph.new_commit(&chosen, pick(&trees, *tree), date));
   }
-  let mut tags = Vec::new();
+  (blobs, trees, commits)
+}
+
+/// A plan's annotated tags, each naming a commit, tree, blob or earlier tag, all under `refs/tags/`.
+fn build_tags(graph: &mut TestGraph, plan: &Plan, pools: &[&[u32]]) {
+  let mut tags: Vec<u32> = Vec::new();
   for choice in &plan.tags {
-    let pool: Vec<u32> = commits
+    let pool: Vec<u32> = pools
       .iter()
-      .chain(&trees)
-      .chain(&blobs)
+      .flat_map(|pool| pool.iter())
       .chain(&tags)
       .copied()
       .collect();
@@ -919,12 +1046,26 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
     tags.push(tag);
   }
   graph.tags = tags.clone();
-  let mut current = Vec::new();
-  let mut versions = Vec::new();
-  let mut chains: Vec<Vec<u32>> = Vec::new();
+  graph.tips.extend(tags);
+}
+
+/// A plan's greens: each one's current head, every version's head, and each one's chain of heads.
+struct Greens {
+  current: Vec<u32>,
+  versions: Vec<u32>,
+  chains: Vec<Vec<u32>>,
+}
+
+/// A plan's greens, each along its head's first-parent ancestry, a rewrite put among them in some.
+fn build_greens(graph: &mut TestGraph, plan: &Plan, commits: &[u32]) -> Greens {
+  let mut greens = Greens {
+    current: Vec::new(),
+    versions: Vec::new(),
+    chains: Vec::new(),
+  };
   for (head, picks, rewrite) in &plan.greens {
-    let head = pick(&commits, *head);
-    let chain = first_parents(&graph, head);
+    let head = pick(commits, *head);
+    let chain = first_parents(graph, head);
     let mut positions: Vec<usize> = picks
       .iter()
       .map(|choice| usize::from(*choice) % chain.len())
@@ -935,87 +1076,120 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
     let mut heads: Vec<u32> = positions.iter().map(|index| chain[*index]).collect();
     if rewrite % 4 == 0 && heads.len() >= 2 {
       let place = usize::from(*rewrite / 4) % (heads.len() - 1);
-      heads.insert(place + 1, pick(&commits, rewrite.wrapping_add(7)));
+      heads.insert(place + 1, pick(commits, rewrite.wrapping_add(7)));
     }
-    versions.extend(heads.iter().copied());
-    chains.push(heads.clone());
-    current.push(head);
+    greens.versions.extend(heads.iter().copied());
+    greens.chains.push(heads.clone());
+    greens.current.push(head);
     graph.new_green(&heads);
     graph.tips.push(head);
   }
-  graph.tips.extend(tags.iter().copied());
+  greens
+}
+
+/// A plan's request: its wants, haves, shallow lines and flags.
+fn build_asks(graph: &TestGraph, plan: &Plan, greens: &Greens, commits: &[u32]) -> Asks {
   let everything: Vec<u32> = (0..u32::try_from(graph.objects.len()).unwrap()).collect();
-  let mut asks = Asks::default();
-  for (index, choice) in plan.wants.iter().enumerate() {
-    let pool = if index % 2 == 0 {
-      &current
-    } else {
-      &everything
-    };
-    asks.wants.push(graph.id(pick(pool, *choice)));
+  let mut wants: Vec<ObjectId> = plan
+    .wants
+    .iter()
+    .enumerate()
+    .map(|(index, choice)| {
+      graph.id(pick(
+        if index % 2 == 0 {
+          &greens.current
+        } else {
+          &everything
+        },
+        *choice,
+      ))
+    })
+    .collect();
+  if plan.flags & 0x41 == 0x41 && !wants.is_empty() {
+    wants.push(object_id(9999));
   }
-  if plan.flags & 0x41 == 0x41 && !asks.wants.is_empty() {
-    asks.wants.push(object_id(9999));
-  }
-  for (index, choice) in plan.haves.iter().enumerate() {
-    let pool = if index % 3 == 2 {
-      &everything
-    } else {
-      &versions
-    };
-    asks.haves.push(graph.id(pick(pool, *choice)));
-  }
+  let mut haves: Vec<ObjectId> = plan
+    .haves
+    .iter()
+    .enumerate()
+    .map(|(index, choice)| {
+      graph.id(pick(
+        if index % 3 == 2 {
+          &everything
+        } else {
+          &greens.versions
+        },
+        *choice,
+      ))
+    })
+    .collect();
   if plan.flags & 2 != 0 {
-    asks.haves.push(object_id(8888));
+    haves.push(object_id(8888));
   }
-  if plan.flags & 4 != 0 {
-    for choice in &plan.shallow {
-      let pool = if plan.flags & 0x80 != 0 {
-        &everything
-      } else {
-        &commits
-      };
-      asks.shallow.push(graph.id(pick(pool, *choice)));
-    }
+  let pool = if plan.flags & 0x80 != 0 {
+    &everything[..]
+  } else {
+    commits
+  };
+  let shallow: Vec<ObjectId> = plan
+    .shallow
+    .iter()
+    .filter(|_| plan.flags & 4 != 0)
+    .map(|choice| graph.id(pick(pool, *choice)))
+    .collect();
+  Asks {
+    wants,
+    haves,
+    done: plan.flags & 8 != 0,
+    wait_for_done: plan.flags & 16 != 0,
+    shallow,
+    deepen: None,
+    filter: None,
+    include_tag: plan.flags & 32 != 0,
   }
-  asks.done = plan.flags & 8 != 0;
-  asks.wait_for_done = plan.flags & 16 != 0;
-  asks.include_tag = plan.flags & 32 != 0;
-  asks.deepen = match plan.deepen % 8 {
+}
+
+/// A plan's deepening, if any: by depth (zero among them), relative (to infinity among them), by time, or by a rev.
+fn build_deepen(graph: &TestGraph, plan: &Plan, commits: &[u32]) -> Option<OwnedDeepen> {
+  match plan.deepen % 8 {
     0..=3 => None,
     4 => Some(OwnedDeepen::Depth(u32::from(plan.depth % 4), false)),
-    5 => Some(OwnedDeepen::Depth(
-      if plan.depth % 5 == 0 {
+    5 => {
+      let depth = if plan.depth % 5 == 0 {
         INFINITE_DEPTH
       } else {
         u32::from(plan.depth % 4) + 1
-      },
-      true,
-    )),
+      };
+      Some(OwnedDeepen::Depth(depth, true))
+    }
     6 => Some(OwnedDeepen::Cut(Some(u64::from(plan.since)), vec![])),
-    _ => Some(OwnedDeepen::Cut(
-      (plan.since % 2 == 0).then_some(u64::from(plan.since)),
-      vec![graph.id(pick(&commits, plan.depth))],
-    )),
-  };
-  asks.filter = match plan.filter % 9 {
+    _ => {
+      let since = (plan.since % 2 == 0).then_some(u64::from(plan.since));
+      Some(OwnedDeepen::Cut(
+        since,
+        vec![graph.id(pick(commits, plan.depth))],
+      ))
+    }
+  }
+}
+
+/// A plan's filter, if any: each kind, and a combination of a limit and a depth.
+fn build_filter(plan: &Plan) -> Option<Filter> {
+  let value = u64::from(plan.filter_value);
+  match plan.filter % 9 {
     0..=2 => None,
     3 => Some(Filter::BlobNone),
-    4 => Some(Filter::BlobLimit(u64::from(plan.filter_value))),
-    5 => Some(Filter::TreeDepth(u64::from(plan.filter_value % 4))),
+    4 => Some(Filter::BlobLimit(value)),
+    5 => Some(Filter::TreeDepth(value % 4)),
     6 => Some(Filter::ObjectType(
       [Kind::Commit, Kind::Tree, Kind::Blob, Kind::Tag][usize::from(plan.filter_value % 4)],
     )),
     7 => Some(Filter::Combine(vec![
-      Filter::BlobLimit(u64::from(plan.filter_value)),
-      Filter::TreeDepth(u64::from(plan.filter_value % 3) + 1),
+      Filter::BlobLimit(value),
+      Filter::TreeDepth(value % 3 + 1),
     ])),
     _ => Some(Filter::SparseOid(b"main:.sparse".to_vec())),
-  };
-  if plan.mode % 3 == 0 {
-    one_round_friendly(&graph, plan, &current, &chains, &mut asks);
   }
-  (graph, asks)
 }
 
 /// A third of the plans: what closes the one-round path cleared (shallow lines, a deepening, a filter by depth or
