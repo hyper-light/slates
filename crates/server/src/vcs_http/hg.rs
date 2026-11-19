@@ -40,6 +40,8 @@
 //! **Differs from hgweb, on purpose.** A principal whose credentials hold and whom the policy refuses is `403` (RFC
 //! 9110 §15.5.4: the credentials are "insufficient to grant access"), where hgweb answers `401` without a challenge.
 
+use std::borrow::Cow;
+
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_hg::compression::Engine;
 use slates_hg::obsmarkers::Marker;
@@ -47,7 +49,7 @@ use slates_hg::phases::Phase;
 use slates_hg::serve::getbundle::{Logged, Store};
 use slates_hg::serve::http::{self as hg_http, Compression, Compressor, Media, Permission};
 use slates_hg::serve::{Repository, Rev};
-use slates_hg::{Admission, Node, http as hg_wire};
+use slates_hg::{Admission, Node, PastAdmission, http as hg_wire};
 use slates_http::head::{Head, Target};
 use slates_http::percent::{self, Plus};
 use slates_http::reply::Status;
@@ -155,19 +157,28 @@ impl Repository for NoStore {
 }
 
 impl Store for NoStore {
-  fn changeset_text(&self, _rev: Rev) -> Option<&[u8]> {
+  fn changeset_text(
+    &self,
+    _rev: Rev,
+    _room: &mut Admission,
+  ) -> Result<Option<Cow<'_, [u8]>>, PastAdmission> {
     match *self {}
   }
 
-  fn manifest(&self, _node: &Node) -> Option<Logged<'_>> {
+  fn manifest(
+    &self,
+    _node: &Node,
+    _room: &mut Admission,
+  ) -> Result<Option<Logged<'_>>, PastAdmission> {
     match *self {}
   }
 
-  fn file(&self, _path: &[u8], _node: &Node) -> Option<Logged<'_>> {
-    match *self {}
-  }
-
-  fn file_node(&self, _manifest: &Node, _path: &[u8]) -> Option<Node> {
+  fn file(
+    &self,
+    _path: &[u8],
+    _node: &Node,
+    _room: &mut Admission,
+  ) -> Result<Option<Logged<'_>>, PastAdmission> {
     match *self {}
   }
 
