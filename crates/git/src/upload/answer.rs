@@ -8,11 +8,13 @@
 //! room bounds what a step writes and one packet bounds what it asks of the pack's source. A packet is filled to the
 //! most data its band carries, the format's own limit (`sideband::MAX_BAND_DATA` for side-band-64k, 995 bytes for
 //! side-band's 1000-byte packets), so a pack goes out in the fewest packets whatever room the caller gives. A source
-//! that refuses mid-pack, or writes nothing while saying more is coming, ends the response with git's band-3 words for
-//! a pack that could not be finished: nothing follows a band-3 packet, and the client stops with them. Without
-//! side-band there is no band to say it on, so the pack stops short, as git's does, and the client finds it cut.
+//! whose call worked and wrote nothing yet (A-639's stream counting the pack before its header) ends the step there,
+//! and the next step asks it again, so a step is bounded by one call of the source's. A source that refuses mid-pack
+//! ends the response with git's band-3 words for a pack that could not be finished: nothing follows a band-3 packet,
+//! and the client stops with them. Without side-band there is no band to say it on, so the pack stops short, as git's
+//! does, and the client finds it cut.
 
-use super::{ABORT, PackRefused, PackSource, Refusal, Refused, Served};
+use super::{ABORT, PackSource, Refusal, Refused, Served};
 use crate::negotiation::Counters;
 use crate::out::Out;
 use crate::pktline::{self, Packet};
@@ -204,32 +206,36 @@ impl<K> Answer<K> {
       if streaming.closed {
         return Written::End;
       }
-      if let Err(refusal) = streaming.frame_next(served, packs) {
-        self.refusal = Some(refusal);
+      match streaming.frame_next(served, packs) {
+        Ok(true) => {}
+        Ok(false) => return Written::More,
+        Err(refusal) => self.refusal = Some(refusal),
       }
     }
   }
 }
 
 impl<K> Streaming<K> {
-  /// Frames the pack's next packet: its next data, and the flush after its last; or, when the source refuses or stalls,
-  /// the band-3 words that end the response. Refused with why the pack ended early.
+  /// Frames the pack's next packet: its next data, and the flush after its last; or, when the source refuses, the
+  /// band-3 words that end the response: whether anything was framed. A source that worked and wrote nothing yet
+  /// frames nothing, and the step ends there, so a step is bounded by one call of the source's; the next step asks
+  /// again. Refused with why the pack ended early.
   fn frame_next<P: PackSource<Pack = K>>(
     &mut self,
     served: &Served<'_>,
     packs: &mut P,
-  ) -> Result<(), Refusal> {
+  ) -> Result<bool, Refusal> {
     self.framed.clear();
     self.framed_written = 0;
     self.data.clear();
     let room = self.framing.data();
     match packs.write(served, &mut self.source, &mut self.data, room) {
-      Ok(true) if self.data.is_empty() => self.end_early(Refusal::Pack(PackRefused::Stalled)),
+      Ok(true) if self.data.is_empty() => Ok(false),
       Ok(more) => match self.frame_data(more) {
-        Ok(()) => Ok(()),
-        Err(refusal) => self.end_early(refusal),
+        Ok(()) => Ok(true),
+        Err(refusal) => self.end_early(refusal).map(|()| true),
       },
-      Err(refused) => self.end_early(Refusal::Pack(refused)),
+      Err(refused) => self.end_early(Refusal::Pack(refused)).map(|()| true),
     }
   }
 
