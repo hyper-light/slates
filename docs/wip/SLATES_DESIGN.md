@@ -37808,4 +37808,6 @@ entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `cr
   step a copy.
 - **Not here.** The rows as content tables with a mutable tail and the learned fold (§4.17.4 item 12) are the object
   store's (§4.17.1 shared piece 3); one large revision applied in slices under the shard's budget is the server's
-  (piece 7); the commit rule over these rows is piece 5.
+  (piece 7); the commit rule over these rows is piece 5. Opening a row's path looks each of its directories up beneath
+  the ones above it, so a row costs lookups in the square of its depth; a large import may want the revision's opened
+  directories kept between its rows. Nothing here is measured yet (main's, with the server's load).
