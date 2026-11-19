@@ -40508,7 +40508,8 @@ Applied in the same change to:
     where it lies after, read with no index, with an index placing every object, and fed in chunks of any size.
 - **Checks.** On the Mac Studio (kiln, debug, 2026-11-19). Failing first: the 20 new tests against a stub that refused
   everything (r562, load 8.0) all failed, and the crate's other 76 passed. Then 96 of 96 under `--locked` (r581, load
-  8.4 to 9.2, 15.3 s), and `cargo fmt --check` was clean. Red four ways:
+  8.4 to 9.2, 15.3 s), and `cargo fmt --check` was clean; on the tree merged with main (ed9b240f4, main's `objects` and
+  `v2` beside it), 162 of 162 under `--locked` (15.0 s, load 7.6 to 9.0), `cargo fmt --check` clean. Red four ways:
   - the past-the-size guard removed: a stream one byte long was cut to its size and read as a blob `six b`, where
     `LongerThanSize` was due, and the unended stream then fed a byte more read as `Inflate`;
   - the trailer's comparison removed: a changed trailer read whole, where `Pack(Checksum)` was due;

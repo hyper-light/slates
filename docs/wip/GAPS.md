@@ -158,7 +158,7 @@
 > is bounded by the admission. It holds an index's names to the objects read, which A-591 left to it. Golden vectors:
 > the `ofs`, `ref` and `sha256` packs stock git 2.50.1 wrote, every object as `verify-pack -v` lists it, read whole, a
 > byte at a time and through git's own index. `cargo test -p slates-git --lib`: 96 of 96 on the Mac Studio, the 20 new
-> failing first against a stub, red four ways. Owed: a thin pack's bases from the repository and an object too large to
+> failing first against a stub, red four ways; 162 of 162 on the tree merged with main. Owed: a thin pack's bases from the repository and an object too large to
 > hold, streamed into content (pieces 5 and 6); a duplicate object refused where the repository's index is built (git's
 > strict "appears twice", piece 5). Clippy, `xtask` and the lint matrix over the change are main's (run requests).
 
