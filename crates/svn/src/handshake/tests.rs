@@ -625,7 +625,7 @@ fn an_established_handshake_hands_on_its_session() {
     server.receive(rest, &mut written),
     Ok(Progress::Established { .. })
   ));
-  let expected = Session {
+  let expected = crate::handshake::Session {
     principal: Principal::Anonymous,
     capabilities: ClientCapabilities {
       svndiff1: true,

@@ -713,13 +713,13 @@ fn a_link_at_depth_exclude_is_refused_and_a_deleted_target_keeps_its_depth() {
     b"6 false ( ) exclude ) ) ( finish-report ( ) ) ",
   ]
   .concat();
-  let replay = replay(&trunk_context(&session, 1 << 16), update_head(), &report, &[]);
-  assert_eq!(replay.ending, Ending::Failed(ReportFailure::ExcludeLink));
+  let excluded = replay(&trunk_context(&session, 1 << 16), update_head(), &report, &[]);
+  assert_eq!(excluded.ending, Ending::Failed(ReportFailure::ExcludeLink));
   let mut request = update_head();
   request.target = "a.txt".to_owned();
   let report = b"( set-path ( 0: 6 false ( ) files ) ) ( delete-path ( 0: ) ) ( finish-report ( ) ) ";
-  let replay = replay(&trunk_context(&session, 1 << 16), request, report, &[]);
-  let Ending::Finished(finished) = replay.ending else { panic!("{:?}", replay.ending) };
+  let deleted = replay(&trunk_context(&session, 1 << 16), request, report, &[]);
+  let Ending::Finished(finished) = deleted.ending else { panic!("{:?}", deleted.ending) };
   assert_eq!(finished.target_info, path("a.txt", None, Depth::Files, false));
   assert_eq!(finished.source_revision, 6);
 }
