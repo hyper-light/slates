@@ -180,7 +180,9 @@ enum Stage {
   Hashed,
 }
 
-/// A seal being made (module docs): the pass, then [`Sealing::finish_with`].
+/// A seal being made (module docs): the pass, a turn at a time
+/// ([`HookView::seal_step`](super::HookView::seal_step)), then the index
+/// ([`HookView::seal`](super::HookView::seal)).
 pub struct Sealing {
   pack: ObjectId,
   stage: Stage,
