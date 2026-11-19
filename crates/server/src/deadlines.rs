@@ -85,6 +85,11 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   if state.landing.audit_look_at.is_some_and(|at| at <= now) {
     crate::landing::look_at_owed_audit(state, now);
   }
+  // A look at departures some shard did not answer is asked for again at its retry (A-222, A-554): the reaper takes it.
+  if state.departures_retry_at.is_some_and(|at| at <= now) {
+    state.departures_retry_at = None;
+    crate::remote_attach::look_for_departures(state);
+  }
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
     state.destroy_retry_at = None;
@@ -110,6 +115,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.destroy_retry_at,
     state.landing.grants.next_due_ns(),
     state.landing.audit_look_at,
+    state.departures_retry_at,
   ]
   .into_iter()
   .flatten()
@@ -155,6 +161,10 @@ const DEADLINE_STUCK: &str = "deadline.stuck";
 /// to lapse before the deadline the keeper sleeps for wakes it, so it re-arms (A-536, A-554). The keeper's own pass
 /// notes the leases it renews, after it armed for them, so they wake nothing.
 pub(crate) fn after_borrow(state: &mut ShardState) {
+  // The fleet's members changed: the control shard's reaper looks for hosts that left (A-222, A-554).
+  if state.fleet.take_members_changed() {
+    crate::remote_attach::look_for_departures(state);
+  }
   let partition = state.db.partition_mut();
   let earliest = [
     partition.take_noted_lease(),
@@ -410,6 +420,105 @@ mod tests {
     daemon.stop();
     let ended = ended.expect("the grant ended and was audited within half a liveness window");
     println!("a grant with a {SOON_NS} ns term ended {ended:?} after it was issued");
+  }
+
+  /// Shape: the certificate anchors and member ids of the two peers the departure test's control shard learns: one that
+  /// stays a member and one that leaves.
+  const STAYING_ANCHOR: u64 = 0x51_0001;
+  /// Shape: see [`STAYING_ANCHOR`].
+  const STAYING_MEMBER: u64 = 0x51_0002;
+  /// Shape: see [`STAYING_ANCHOR`].
+  const LEAVING_ANCHOR: u64 = 0x1e_0001;
+  /// Shape: see [`STAYING_ANCHOR`].
+  const LEAVING_MEMBER: u64 = 0x1e_0002;
+  /// Shape: how long the departure test waits for the control shard to count the leaving peer among the members: a
+  /// window and a half, past the reap loop's first look a window into the start.
+  const COUNTED_WITHIN_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2 * 3;
+
+  /// A-554 (departed hosts off the tick; A-222). Do: on a one-shard daemon, learn two peers (each anchor's member id,
+  /// as the control shard learns them on contact), configure both members beside the node, and record an attachment of
+  /// one of the leaving peer's clients on a volume here; wait until the control shard counts the leaving peer's anchor
+  /// among the members'; then install a configuration without it, as the council's commit of its retirement does, and
+  /// look until the attachment is gone. Expect: ended within half a window of the install, by a look the change itself
+  /// asked for. The reap loop's tick looked once a window, and its look was what counted the peer, so the install that
+  /// followed it waited a whole window for the next.
+  #[test]
+  fn a_departed_hosts_attachment_ends_when_the_fleet_lets_it_go_without_a_tick() {
+    use slates_db::HostId;
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let attachment = crate::daemon::observe_first(&daemon, |state| {
+      for (anchor, member) in [
+        (STAYING_ANCHOR, STAYING_MEMBER),
+        (LEAVING_ANCHOR, LEAVING_MEMBER),
+      ] {
+        state.learned_members.insert(
+          HostId(anchor),
+          crate::state::LearnedMember {
+            boot_nonce: 1,
+            host: HostId(member),
+            previous: None,
+          },
+        );
+      }
+      let local = state.fleet.host();
+      let configuration = state.fleet.configuration().clone();
+      state.fleet.install_configuration(
+        configuration,
+        &[local, HostId(STAYING_MEMBER), HostId(LEAVING_MEMBER)],
+      );
+      let volume = crate::verbs::to_db_volume(created(state, "departing"));
+      let record = state.db.partition().volume(volume).unwrap().clone();
+      let id = crate::verbs::next_attachment_id(state);
+      let now = state.clock.monotonic_ns();
+      let added = slates_db::Op::AttachmentAdded {
+        record: slates_db::catalog::AttachmentRecord {
+          id,
+          volume: record.id,
+          consumer: slates_db::catalog::Consumer::Remote {
+            host: LEAVING_ANCHOR,
+            client: 1,
+          },
+          snapshot: None,
+          form: slates_db::catalog::AttachForm::Root,
+          principal: record.owner.clone(),
+          rights: crate::verbs::rights_of(&record, &record.owner),
+          token: [0; 16],
+          mount: None,
+        },
+      };
+      state.db.mutate(&mut state.segment, &added, now).unwrap();
+      id
+    });
+    // The control shard's count of the members' anchors is what a departure is judged against (A-222); the test waits
+    // for it to name the leaving peer before the peer leaves.
+    let begun = Instant::now();
+    while !crate::daemon::observe_first(&daemon, |state| {
+      state.configured_members.contains(&LEAVING_ANCHOR)
+    }) {
+      assert!(
+        begun.elapsed() < Duration::from_nanos(COUNTED_WITHIN_NS),
+        "the control shard counted the leaving peer among the members"
+      );
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
+    }
+    let retired = Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      let local = state.fleet.host();
+      let configuration = state.fleet.configuration().clone();
+      state
+        .fleet
+        .install_configuration(configuration, &[local, HostId(STAYING_MEMBER)]);
+    });
+    let ended = look_until(&daemon, retired, move |state| {
+      state.db.partition().attachment(attachment).is_none()
+    });
+    daemon.stop();
+    let ended = ended.expect("the departed peer's attachment ended within half a liveness window");
+    println!(
+      "a departed peer's attachment ended {ended:?} after the configuration without it was installed"
+    );
   }
 
   /// A volume named `name` that [`principal`] creates on `state`'s shard, through the verb: its id.

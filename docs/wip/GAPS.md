@@ -4035,13 +4035,15 @@
 > on, never spun on (job 3's red check found that spin). Still on the tick: grants, the owed audit (piece 4), departed
 > hosts' attachments (A-222), held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the
 > idle seal and the huge-page re-arm.
-> **Since A-554 (piece 4)** grants past their term and the owed audit are off the tick: the grants table indexes its
-> issued grants by the end of their term and the keeper sleeps to the next due (an issue or a restore notes it, each
-> state borrow hands the note to the keeper); what a shard owes the audit is looked at a retry window after the record
-> that armed the look, sent again if its front has not moved, and looked at again only while anything is owed; a
-> deadline whose job was refused is retried the named retry window on (`deadlines::retry_window_ns`, A-455's shard
-> window). Still on the tick: departed hosts' attachments (A-222), held copies, the pressure hold, NFS purges, base
-> hints with their delegation recalls, the idle seal and the huge-page re-arm.
+> **Since A-554 (piece 4)** grants past their term, the owed audit and departed hosts are off the tick: the grants
+> table indexes its issued grants by the end of their term and the keeper sleeps to the next due (an issue or a restore
+> notes it, each state borrow hands the note to the keeper); what a shard owes the audit is looked at a retry window
+> after the record that armed the look, sent again if its front has not moved, and looked at again only while anything
+> is owed; a departed host's attachments are ended by the control shard's reaper when the fleet's members or a member's
+> anchor change (A-222), a look some shard did not answer asked for again a retry window on; a deadline whose job was
+> refused is retried the named retry window on (`deadlines::retry_window_ns`, A-455's shard window). Still on the tick:
+> held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the idle seal and the huge-page
+> re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.

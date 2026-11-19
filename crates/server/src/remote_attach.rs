@@ -296,12 +296,36 @@ pub(crate) fn end_hosts(state: &mut ShardState, anchors: &[u64]) -> Result<u64, 
   end_all(state, &ended)
 }
 
-/// The reap loop's look at departures (A-222), run on the control shard each liveness budget: the departed anchors,
-/// then their attachments ended on every shard, each through a call judged in that shard's own time
-/// (`xshard::call_in_shard_time`, A-65, A-408), whose budget is the window every such wait takes: one liveness window
-/// on the wall, then more while the shard runs or waits for a CPU, so a starved shard's end is heard and a wedged
-/// one's given up (A-449, R3's class B, item B-f: the departure itself was decided by the fleet's membership, its own
-/// estimators, A-363). Owed again at the next look unless every shard answered.
+/// Asks the control shard's reaper for a look at departures (A-222, A-554): the fleet's members or a member's anchor
+/// changed (an install that changed the members, `FleetNode::take_members_changed`; an anchor learned or restarted; a
+/// peer's plane started), so a host may have left, and the look counts the members' anchors anew. Nothing off the
+/// control shard, which alone keeps the learned identities and looks. Until A-554 the reap loop's tick looked once a
+/// liveness window, whether anything had changed or not.
+pub(crate) fn look_for_departures(state: &mut ShardState) {
+  if !crate::verbs::is_control_shard(state) {
+    return;
+  }
+  state.departures_owed = true;
+  if let Some(reaper) = state.reaper_task {
+    slates_rt::registry::wake(reaper.0);
+  }
+}
+
+/// Owes the departed anchors' ends to a look a retry window on (A-554): a shard did not answer this one. Kept by the
+/// deadline keeper, which asks the reaper for the look then ([`look_for_departures`]).
+fn retry_departures(state: &mut ShardState) {
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  let at = now.saturating_add(crate::deadlines::retry_window_ns());
+  state.departures_retry_at = Some(state.departures_retry_at.map_or(at, |due| due.min(at)));
+  crate::deadlines::noted(state, at);
+}
+
+/// The reaper's look at departures (A-222), run on the control shard when one is asked for ([`look_for_departures`]):
+/// the departed anchors, then their attachments ended on every shard, each through a call judged in that shard's own
+/// time (`xshard::call_in_shard_time`, A-65, A-408), whose budget is the window every such wait takes: one liveness
+/// window on the wall, then more while the shard runs or waits for a CPU, so a starved shard's end is heard and a
+/// wedged one's given up (A-449, R3's class B, item B-f: the departure itself was decided by the fleet's membership,
+/// its own estimators, A-363). Owed again a retry window on unless every shard answered ([`retry_departures`]).
 pub(crate) async fn sweep_departed() {
   let Some((control, shards, gone)) = crate::state::with_state(|state| {
     let control = state.shards.first().copied()?;
@@ -332,6 +356,8 @@ pub(crate) async fn sweep_departed() {
   }
   if settled {
     let _ = crate::state::with_state(settle_departed);
+  } else {
+    let _ = crate::state::with_state(retry_departures);
   }
 }
 

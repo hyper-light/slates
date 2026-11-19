@@ -4923,20 +4923,24 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
-> **Status (2026-11-19, A-554: grants and the owed audit leave the tick; the retry window named).** A grant past its
-> term ends at the first instant past it, kept by the shard's deadline keeper: the grants table keeps its issued grants
-> in an index by the end of their term (`slates_land::grant::Grants`, one entry an issued grant, taken out at its
-> consumption, revocation or end), so the keeper sleeps to the next grant due and its sweep reads the due alone, where
-> the tick walked every grant once a window. An issue or a restore notes the earliest it entered, and each state borrow
-> hands that to the keeper. A deadline its job could not end (a grant whose expiry record the catalog refused, a refused
-> destroy record) is tried again the retry window on (`deadlines::retry_window_ns`, counted `deadline.stuck`): the
-> shard's window of A-455, the liveness window `W` (the recovery budget by rent or buy, A-359) raised to the scheduler
-> overrun the shard measured, never past the observation budget. What a shard owes the audit (A-265) is looked at by the
-> keeper a retry window after the record that armed the look was owed (`landing::arm_owed_audit_look`, armed in
-> `write_audit` and at the shard's start for a recovered outbox): a front where the look was armed is sent again
-> (`landing.audit_resent`), and the look is armed again a window on while anything is owed, never while nothing is. Off
-> the tick so far: dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and
-> destroys (A-536), grants and the owed audit (A-554); departed hosts are next.
+> **Status (2026-11-19, A-554: grants, the owed audit and departed hosts leave the tick; the retry window named).** A
+> grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants table keeps its
+> issued grants in an index by the end of their term (`slates_land::grant::Grants`, one entry an issued grant, taken out
+> at its consumption, revocation or end), so the keeper sleeps to the next grant due and its sweep reads the due alone,
+> where the tick walked every grant once a window. An issue or a restore notes the earliest it entered, and each state
+> borrow hands that to the keeper. A deadline its job could not end (a grant whose expiry record the catalog refused, a
+> refused destroy record) is tried again the retry window on (`deadlines::retry_window_ns`, counted `deadline.stuck`):
+> the shard's window of A-455, the liveness window `W` (the recovery budget by rent or buy, A-359) raised to the
+> scheduler overrun the shard measured, never past the observation budget. What a shard owes the audit (A-265) is looked
+> at by the keeper a retry window after the record that armed the look was owed (`landing::arm_owed_audit_look`, armed
+> in `write_audit` and at the shard's start for a recovered outbox): a front where the look was armed is sent again
+> (`landing.audit_resent`), and the look is armed again a window on while anything is owed, never while nothing is. A
+> host the fleet let go has its clients' attachments ended (A-222) by the control shard's reaper, which looks when the
+> look's inputs change: an install that changed the fleet's members (`FleetNode::take_members_changed`, read as each
+> state borrow closes), an anchor learned or restarted, a peer's plane started (`remote_attach::look_for_departures`); a
+> look some shard did not answer is asked for again a retry window on, by the keeper. Off the tick so far: dead clients
+> (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536), grants, the owed
+> audit and departed hosts (A-554); held copies are next.
 
 > **Status (2026-11-19, A-536: leases, CLI attachments and destroys leave the tick).** The shard's deadline keeper
 > (`crate::deadlines`) also sleeps to the lease wheel's next deadline, releasing or renewing a lapsed write lease at its
@@ -36584,7 +36588,23 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   Test: `crates/server/src/landing.rs` `an_unacknowledged_audit_batch_is_sent_again_a_window_after_its_send` (a
   two-shard daemon past the tick's first look, the second shard's acknowledgements withheld: the batch sent again no
   sooner than a window after its send and within half a window more). Failed first on main's code (cf17cae, the Mac
-  Studio): not sent again within a window and a half.
+  Studio): not sent again within a window and a half. Green on c718509 (the Mac Studio, 2026-11-19 17:41 local, load
+  12.8, debug): `slates-server --lib landing:: deadlines::` 21 of 21; the batch sent again 1.0012 s after its send.
+- **Departed hosts (job 3).** A host the fleet let go has its clients' attachments ended on every shard (A-222) by the
+  control shard's reaper (`crate::reap::reaper`: a departed host's clients are dead clients no watch here sees), no
+  longer by the tick. The look runs when one of its inputs changes, each of which asks for it
+  (`remote_attach::look_for_departures`, a flag the reaper takes and a wake): an install that changed the fleet's
+  members (`FleetNode::take_members_changed` in slates-cluster, noted by the install and read as each state borrow
+  closes, so all nine install paths are covered and a repeated install of the same members asks for nothing), a
+  member's anchor learned on contact or changed by a restart (`fleet.rs`, the two learn paths), and a peer's plane
+  started (its seed id mapped to its anchor). A look some shard did not answer leaves its anchors owed, as before, and
+  is asked for again a retry window on, kept by the keeper (`ShardState::departures_retry_at`). No task is added: the
+  reaper idles while nothing is owed. Tests: `crates/cluster/src/fleet.rs` `an_install_notes_a_change_of_members_once`;
+  `crates/server/src/deadlines.rs` `a_departed_hosts_attachment_ends_when_the_fleet_lets_it_go_without_a_tick` (a
+  one-shard daemon, two learned peers configured members, a remote attachment of the leaving peer's client; once the
+  control shard counts the peer, a configuration without it is installed: the attachment ended within half a window).
+  The server test failed first on c718509 (the Mac Studio): the tick counted the peer, then the attachment was not
+  ended within half a window of the install.
 
 Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/land/src/grant.rs`,
-`crates/server/src/{deadlines,landing,verbs,daemon}.rs`.
+`crates/cluster/src/fleet.rs`, `crates/server/src/{deadlines,landing,verbs,daemon,reap,remote_attach,fleet,state}.rs`.

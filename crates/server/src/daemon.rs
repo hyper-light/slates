@@ -4487,6 +4487,8 @@ async fn init_shard(
     image: crate::image::ImageState::default(),
     configured_members: Vec::new(),
     departed_owed: Vec::new(),
+    departures_owed: false,
+    departures_retry_at: None,
     direct_map: crate::direct_map::DirectMapState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
@@ -4838,14 +4840,15 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: departed hosts' attachments, held copies,
-/// the pressure hold, NFS purges, base hints and the idle seal. Dead clients are no longer its: since A-475 each
-/// client's watch reports its hang-up and the shard's reaper retires it then (`crate::reap`); nor, since A-522, A-536
-/// and A-554, are abandoned staging buffers, status captures, lapsed write leases, lapsed CLI attachments, grants past
-/// their term and the owed audit's resend, which the shard's keeper takes at their own deadlines (`crate::deadlines`),
-/// nor destroys, which the serve loop steps once woken and the keeper retries at a refused record's deadline. The jobs
-/// left here leave a piece at a time for the events or deadlines that own them, and then the loop and its tick go (the
-/// reaper series, GAPS). Derived: the cadence is the budget.
+/// The shard's tick for the cold work it still owns, at the liveness cadence: held copies, the pressure hold, NFS
+/// purges, base hints and the idle seal; since A-554 departed hosts' attachments are ended by the reaper when the
+/// fleet's members change (`crate::remote_attach::look_for_departures`). Dead clients are no longer its: since A-475
+/// each client's watch reports its hang-up and the shard's reaper retires it then (`crate::reap`); nor, since A-522,
+/// A-536 and A-554, are abandoned staging buffers, status captures, lapsed write leases, lapsed CLI attachments, grants
+/// past their term and the owed audit's resend, which the shard's keeper takes at their own deadlines
+/// (`crate::deadlines`), nor destroys, which the serve loop steps once woken and the keeper retries at a refused
+/// record's deadline. The jobs left here leave a piece at a time for the events or deadlines that own them, and then
+/// the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4855,8 +4858,6 @@ async fn reap_loop() {
   .get();
   loop {
     pace(cadence).await;
-    // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
-    crate::remote_attach::sweep_departed().await;
     // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
     #[cfg(target_os = "linux")]
     let _reclaimed = crate::held_copy::reclaim_unclaimed().await;

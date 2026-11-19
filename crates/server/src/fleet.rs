@@ -556,6 +556,7 @@ pub(crate) fn learn_member(
     }
     LearnedOutcome::Current => {
       state.authenticated_members.insert(announced);
+      let learned = !state.learned_members.contains_key(&anchor);
       state
         .learned_members
         .entry(anchor)
@@ -564,6 +565,10 @@ pub(crate) fn learn_member(
           host: announced,
           previous: None,
         });
+      // A member's anchor learned: the departures the control shard judges are counted by anchor (A-222, A-554).
+      if learned {
+        crate::remote_attach::look_for_departures(state);
+      }
     }
     LearnedOutcome::Restarted { old } => {
       state.authenticated_members.remove(&old);
@@ -576,6 +581,8 @@ pub(crate) fn learn_member(
           previous: Some(old),
         },
       );
+      // The anchor's member id changed: the departures the control shard judges are counted by anchor (A-222, A-554).
+      crate::remote_attach::look_for_departures(state);
       // A discovery exchange pending on this anchor's link addresses the old incarnation: woken now, it
       // ends invalidated and releases its endpoint, so the link re-dials the new one this period.
       wake_link_waiter(state, anchor);
@@ -1242,7 +1249,12 @@ impl PeerDriver {
       stale: false,
       seed_retired: false,
     };
-    let _ = state::with_state_counted(|s| s.plane.peers.insert(peer.anchor, plane_peer));
+    let _ = state::with_state_counted(|s| {
+      s.plane.peers.insert(peer.anchor, plane_peer);
+      // A member's seed id now maps to its anchor: the departures the control shard judges are counted by anchor
+      // (A-222, A-554).
+      crate::remote_attach::look_for_departures(s);
+    });
     let record = PeerDial {
       anchor: peer.anchor,
       host: peer.host,
