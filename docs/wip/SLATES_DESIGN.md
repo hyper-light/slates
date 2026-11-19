@@ -11924,6 +11924,18 @@ engine: the verdict, rebase, position mapping, the register).
 > detection (RustCrypto's `sha1-checked`, detection on and safe hash off as `git_SHA1DCInit`), which refuses git's own
 > t0013 SHAttered vector by type and names its plain SHA-1 as git's refusal does; and SHA-256 through aws-lc-rs. Proven
 > against every object type and the empty blob as stock git 2.50.1 named them in a SHA-1 and a SHA-256 repository.
+>
+> **Status (2026-11-19, A-594: piece 9's transport built).** `crates/ssh` (`slates-ssh`) is the SSH server's transport
+> (RFC 4253) as a sans-io core that git's, Mercurial's and Subversion's SSH routes can share: the caller moves bytes and
+> the time in and reads events out. It sends its banner lines and identification, reads the client's line within RFC
+> 4253 §4.2's 255 bytes, negotiates by the client's first choice, runs `curve25519-sha256` with an `ssh-ed25519` host
+> key, and seals packets under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` through aws-lc-rs. Strict
+> key exchange, OpenSSH's answer to the Terrapin attack, is offered under both its names and enforced whenever the
+> client offers it. A key is replaced when either direction reaches half the bound its cipher's analysis gives (RFC 4344
+> §3), or when the key time passes; the key time is learned (the table below), and the server's estimator that feeds it
+> is owed with the listener. Held to the chacha20-poly1305 draft's worked packet, NIST's SSH key-derivation vectors,
+> RFC 7748's X25519 exchange and RFC 8032's Ed25519 tests, and to whole connections with a client written from the RFCs
+> alone. User authentication and the session channel are piece 9's next parts.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12123,6 +12135,7 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Reaping a stalled client | silence past the tail of the gaps seen for that phase of the exchange, with the estimate's own error added (A-363's form) | the shard's connection budget | the round trip measured at connect |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
 | Index table merges | merge two immutable tables when the measured cost of probing one more table, times the measured lookup rate, exceeds the measured merge cost spread over the tables' expected life | one merge in flight per repository | merge when the first lookup's measured probe cost exceeds its measured share of a merge |
+| SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
 
 git fixes the first two by constants: "Defaults to 10" for the window and "Defaults to 50" for the depth [B: config
 `pack.window`, `pack.depth`]; its own notes call them "magic values" [B: technical `pack-heuristics`].
@@ -39288,3 +39301,80 @@ Applied in the same change to:
   - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
   - with the size not charged, a header naming 100 bytes read under an admission of 99.
 - **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.
+
+### A-594 — SSH's transport, the SSH server's first part: RFC 4253 as a sans-io core, strict key exchange, `curve25519-sha256` with `ssh-ed25519`, and keys retired by their ciphers' bounds and a learned time (2026-11-19, g294, UI goal 92; §4.17.2 "Transports" item 2 and "Pieces (git)" piece 9; D-28)
+Applied in the same change to:
+- §4.17.2's status and its tunables table (the SSH key time); GAPS (the §4.17 entry); `research/vcs-servers.md` §5.5
+  (new: the sources read for it, pinned by hash) and §5.4 (the drafts' owed reading discharged);
+- `crates/ssh` (new, `slates-ssh`: `lib.rs`, `wire`, `ident`, `packet`, `kexinit`, `kex`, `hostkey`, `keylife`,
+  `refusal`, `transport`, `entropy`; the tests in `src/tests`, with the test client in `src/tests/client.rs`);
+- the workspace lock (the new crate alone: its only dependency is aws-lc-rs, and proptest and `slates-test-seeds` for
+  its tests).
+- **Why a crate of its own.** git, Mercurial and Subversion each reach slates over SSH, so the transport carries no
+  tool's knowledge; the channel piece decides what an `exec` request names. §4.17.3 and §4.17.4 still describe the
+  host's `sshd` starting a slates CLI verb; this transport lets those routes be slates-served too, which is their
+  owners' call and not changed here.
+- **Sans-io.** `ServerTransport` takes the client's bytes and the time and gives events, output bytes and a timer. Its
+  random bytes (a KEXINIT's cookie, each packet's padding, each exchange's ephemeral key) come through an `Entropy`
+  seam whose one real implementation is AWS-LC's system generator, so a test runs a whole connection from known bytes.
+- **The identification** (RFC 4253 §4.2). Banner lines first, each checked never to begin "SSH-"; then
+  `SSH-2.0-slates_<version>`. The client's line is read within 255 bytes and refused on its 255th if that does not end
+  it. Following OpenSSH's own reader (`kex.c` at `fa4b2a82`): a line before the identification is refused, a bare LF
+  ends a line (which §4.2 allows), a NUL or a CR not followed by LF is refused, and any printable byte follows the
+  protocol version, since clients in use put a minus sign in their software version. Versions 2.0 and 1.99 are taken.
+- **Packets** (RFC 4253 §6; RFC 5647 §7; the chacha20-poly1305 draft §6, §7). From its first four bytes a packet's
+  length is refused if too short for a payload, not aligned to its cipher's block (8 in the clear and for ChaCha20, the
+  part after the length for the AEADs; 16 for AES), or past the caller's cap, which RFC 4253 §6.1's 35000 bytes floors;
+  so a hostile length costs nothing. The tag is checked before decryption, and the padding after (four bytes at least,
+  a payload left). Sending uses the least padding that aligns, drawn at random, and no packet larger than 35000 bytes.
+  AES-GCM's nonce is the IV's fixed field and its 64-bit invocation counter, counted up per packet and wrapping as RFC
+  5647's integer does; no key sees 2^64 packets, so no nonce repeats.
+- **Negotiation** (RFC 4253 §7.1). Per list, the client's first name the server runs. The MAC lists are skipped, as
+  both AEAD drafts say; the server's own MAC lists name `none` alone, since §7.1 requires one name and the server runs
+  no MAC apart from its ciphers. A marker (`kex-strict-*`, `ext-info-c`) is matched against the methods the server
+  runs, never its advertised list, so no marker is ever chosen, even one a client lists first. A guessed packet is
+  ignored when the guess was wrong, judged by the two lists' first names as OpenSSH judges it.
+- **Strict key exchange** (`draft-ietf-sshm-strict-kex-03` §3). The server offers both names; it is on when the client
+  offers either client name. Then the client's KEXINIT must be its first packet, only KEXINIT, NEWKEYS and the exchange
+  methods' messages (30 to 49) are taken until the first exchange ends, `SSH_MSG_KEX_ECDH_INIT` is taken once, and
+  each direction's sequence number restarts at zero after its NEWKEYS. A sequence number that would wrap before the
+  first exchange ends is refused with or without it. Without it the server carries numbers on, as RFC 4253 does: with
+  neither side sending `SSH_MSG_EXT_INFO`, the only message a Terrapin deletion could take is the first one after the
+  keys, whose loss stalls the connection rather than changing it.
+- **The exchange** (RFC 8731 §3, §3.1; RFC 5656 §4; RFC 4253 §7.2). Public keys of any length but 32 are refused, and
+  an all-zero secret is refused by an OR over its bytes, behind AWS-LC's own refusal of small-order points. K is the
+  secret read big-endian as an `mpint`; the hash covers `V_C`, `V_S`, both KEXINIT payloads, `K_S`, `Q_C`, `Q_S` and K;
+  the first hash is the session id; the keys are `HASH(K || H || letter || session_id)` extended as §7.2 says, wiped
+  from memory on drop (a best-effort overwrite through `core::hint::black_box`; no dependency taken for it).
+- **Keys' lives** (RFC 4344 §3; RFC 4253 §9). By use, derived from the cipher: 2^32 packets (RFC 4344 §3.1, and
+  ChaCha20's nonce space), and for AES 2^(L/4) = 2^32 blocks (§3.2, L = 128); ChaCha20 has no block bound. The server
+  starts a new exchange at half of each, the point RFC 4344 §3.1 prefers for packets ("rekey after receiving more than
+  2**31 packets"), and ends the connection only if a key reaches its whole limit, as when a client ignores the server's
+  KEXINIT and keeps sending. An operator's cap can only lower the limits. By time, learned: the tail of the lifetimes
+  this deployment's authenticated connections lived, within RFC 4253 §9's hour and the hour until one is measured
+  (`keylife::key_time_limit_ns`), never shorter than the connection's last exchange took, so a re-exchange can never
+  fill a connection. The server starts exchanges only after the service is accepted, so a service reply never falls
+  inside one.
+- **Back-pressure.** One packet is buffered in and one event waits; reading stops while an event waits or while a
+  packet cap of output is unwritten, so a client that floods and does not read grows nothing.
+- **Owed, in order.** User authentication by public key (RFC 4252), with RFC 8308's `SSH_MSG_EXT_INFO` and its
+  `server-sig-algs` when RSA keys are offered (RFC 8332 and RFC 5656 remain owed reading); the session channel with
+  git's `exec` and `env` (RFC 4254); the listener on the runtime, with the estimator of connection lifetimes that feeds
+  the key time and the host key's keeping; main's live interop with stock `ssh` clients. A post-quantum exchange:
+  OpenSSH 10's clients prefer `mlkem768x25519-sha256`, and (from memory, to be verified) OpenSSH 10.1 warns on every
+  connection whose exchange is not post-quantum; aws-lc-rs carries ML-KEM-768, so the hybrid is a follow-on piece with
+  its own design amendment.
+- **Tests** (`cargo test --locked -p slates-ssh --lib`, Mac Studio d1323898, 68 of 68 at 33a9588). Red first at
+  c5a312d: 23 compile errors, each a module of the transport not yet built. Golden: the chacha20-poly1305 draft's
+  Appendix A packet sealed and opened byte for byte; NIST CAVS 14.1's SSH KDF vectors (SHA-1, whose 192-bit keys need
+  §7.2's extension, and SHA-256 in both groups); RFC 7748 §6.1's exchange as the server's half; RFC 8032 §7.1 tests 1
+  to 3 as host key and signature blobs; an AES-GCM oracle sealing by hand under RFC 5647 §7.1's nonce across the
+  counter's wrap. Hostile: identification lines at and past 255 bytes, lengths too short, unaligned, past the cap and
+  `u32::MAX`, bad padding, forged tags under both ciphers, small-order and wrong-length keys, every out-of-place message,
+  a refused service, an unshared cipher, and any bytes (proptest), each refused by its kind with its disconnect reason
+  checked by the client. Whole connections with the test client under both ciphers, strict and not, each direction its
+  own cipher, a right and a wrong guess, a client's rekey (session id kept), the server's rekeys by time and by use, a
+  client that never rekeys running out its key, both kinds of back-pressure, and the same seeds giving byte-identical
+  connections. Red four ways on the Studio: with the strict receive reset removed 12 of 26 transport tests failed; with
+  the KEXINIT-first check removed, its test failed; with the GCM counter frozen, 8 failed; with the all-zero check
+  removed, the small-order test still passed, since AWS-LC refuses those keys first (kept as RFC 8731's own check).

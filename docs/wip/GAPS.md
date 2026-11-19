@@ -53,6 +53,17 @@
 > object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
 > `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
 > entry's header and the delta instructions (others' parts).
+> **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
+> sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
+> under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
+> by the client's first choice with strict key exchange enforced; `curve25519-sha256` with an `ssh-ed25519` host key;
+> keys replaced at half their ciphers' RFC 4344 bounds or when the learned key time passes; every refusal typed and
+> sent as its disconnect reason. Held to the chacha20-poly1305 draft's worked packet, NIST's SSH KDF vectors, RFC 7748,
+> RFC 8032 and whole connections with a client written from the RFCs (`cargo test -p slates-ssh --lib`, 68 of 68; red
+> four ways). Owed, in order: user authentication by public key (RFC 4252, with EXT_INFO's `server-sig-algs`); the
+> session channel with git's `exec` and `env` (RFC 4254); the listener on the runtime, with the connection-lifetime
+> estimator that feeds the key time and the host key's keeping; main's live interop with stock `ssh` clients, and its
+> clippy and `xtask` over the crate; a post-quantum exchange (`mlkem768x25519-sha256`) after its own amendment.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's
