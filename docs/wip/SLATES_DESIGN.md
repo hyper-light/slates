@@ -37110,7 +37110,7 @@ and:
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
   - A clone is admitted with no entry allowance.
   - A resize leaves the entry allowance at the size the volume was made with.
-  - Recovery counts a whiteout as a live entry (found by reading).
+  - Recovery counts a whiteout as a live entry (found by reading; fixed since by A-572).
 
 ### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
 Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
@@ -37840,6 +37840,27 @@ publication" and "an outsider's change beneath a base during a takeover's gap"),
 
 Applied in the same change to: §4.15's status (A-503's paragraph), GAPS (g267; the bug's entry), the bug record,
 `crates/server` (`verbs.rs`, `fleet.rs`, `live_ship.rs`: `owe_first_whole`, a test's live log).
+
+### A-572 — A volume's entry count and allowance hold the namespace rule at a restart, a clone's admission and a resize (2026-11-19, goal 85, g234; A-549's sweep; §4.2's namespace dimension, §4.5 whiteouts, §4.8 recovery)
+Applied in the same changes to: A-549's entry and its bug record (the siblings marked fixed); GAPS, §8c; the bug record
+`docs/bugs/2026-11-19-a-restart-counted-whiteouts-as-live-entries.md`; and, part by part, the files named below. One
+commit a part, in order of harm.
+
+- **Part 1, a restart counted whiteouts as live entries.**
+  - **What was there.** The live count never holds a whiteout. `dir_remove` takes one off as it turns a base name into
+    a whiteout, and `DirNode::live_len` skips them. But `rebuild_entries` places each image entry that names no child
+    as `Child::Whiteout` through `dir_insert`, and `dir_place` counted every placement. So every restart counted an
+    overlay's whiteouts in its head and in a clone head's own directories, and floored its entry allowance at that
+    count.
+  - **The rule.** A placement counts as a live entry, and is admitted against the allowance, only when it names a
+    child (`Volume::dir_place`, `dir_insert`). The live path never places a whiteout (it turns a name into one in place),
+    so only a recovery's count changes. The rule sits at the one counting site, not in recovery alone, so no later
+    placement of a whiteout can count one.
+  - **Tests.** `a_restart_counts_no_whiteout_as_a_live_entry` (`crates/vfs/src/base.rs`). It builds an overlay with
+    three whiteouts and a file and a directory of its own. Its count before a restart, after it, and the recount of its
+    image (the names its directories carry that name a child) must all be equal.
+  - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (3 counted live, 6 after the
+    restart); green with the rule; `cargo test --locked -p slates-vfs --lib` 85 passed, 1 ignored.
 
 ### A-521 — A volume exported to one client is a verb of the library, so a host that reaches slates only through it serves a pod's volume over its node's export (2026-11-19, g294, UI goal 88's kiln Kubernetes engine, kiln goal 28e73c34's part 01a1f124; §4.6 "Kubernetes publication without privilege", A-115, §4.12; `CONTRACT` = 50)
 Applied in the same change to: §4.6 (the Kubernetes publication's status: the export through the library), §4.12's
