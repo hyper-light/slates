@@ -43718,6 +43718,12 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
     crate's. Red first (kiln r149): the three serve tests failed, answered "Authorization failed" where `svnserve`
     asks. The fold's tests were written beside it and not run red: the ASCII fold they replace leaves `Ärger.txt` as it
     is, which the oracle's first name refuses.
+- **The fixtures' sums** (2026-11-19, g297): `crates/svn/src/fixture_sums.rs` holds every file under
+  `crates/svn/fixtures` to its directory's `SHA256SUMS` (a stale sum, a sum whose file is gone, a file no sum names
+  but its recorder's inputs, and a fixture directory no recorder's inputs are named for each fail), where only the
+  names a sum lists were tested before. Red first on main (macOS arm64, Mac Studio, kiln r13): one problem in seven
+  directories, `reads/sessions.txt`, whose sum predated bdc73e368's appended `get-file-revs-svndiff0` line; its sum
+  made again.
 - **Owed**: the 58 code points Unicode 18 assigned that utf8proc 2.12.0 folds and the fold here keeps, until
   `unicode-normalization`'s tables are Unicode 18's (the oracle test prints them); red-checks of the seventh slice, the
   eighth and step 7 (the `get-file-revs-svndiff0` recording landed with A-616 continued (7)).
