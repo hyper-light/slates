@@ -41013,7 +41013,7 @@ Applied in the same change to:
 - §4.17.2's status and its "Transports" item 1; GAPS (the §4.17 entry);
 - `crates/http` (`slates-http`, new: `head`, `body`, `gzip`, `percent`, `reply`, `admission`, `grammar`, their tests);
 - `crates/git` (`http.rs` and its tests; `tests/http_golden.rs`; `fixtures/http` with `make-http-fixtures.sh` and
-  `cgi-host.py`; `Cargo.toml`: `slates-http`, and flate2 for the golden test alone);
+  `cgi-host.py`; `Cargo.toml`: `slates-http`; the golden test gzips with flate2, a dependency since A-608);
 - the workspace manifest (`slates-http`) and lock (A-607's flate2 resolved: zlib-rs alone).
 - **Why a crate.** Mercurial's HTTP (A-569) already takes a request whose head and body are read, and Subversion's
   WebDAV will; a module of `slates-git` would make both depend on git's crate and its hashes. `slates-http` holds no
