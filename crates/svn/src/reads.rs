@@ -60,7 +60,7 @@
 //!
 //! No I/O, no clock, no randomness, no panic.
 
-use crate::authz::{Access, PrincipalRules, RepositoryPath};
+use crate::authz::{PrincipalRules, may_read};
 use crate::handshake::ClientCapabilities;
 use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
@@ -1262,14 +1262,10 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     }
   }
 
-  /// Whether the session may read `path` (`authz_check_access` for `svn_authz_read`): every path without rules; with
-  /// them, when they give read or write access there. A path that is no repository path (one holding a NUL byte, which
-  /// no C string does) is not readable, as `lookup_access` denies a lookup that fails.
+  /// Whether the session may read `path`: the session's one read rule ([`crate::authz::may_read`]), which an update's
+  /// target and its drive ask too.
   fn readable(&self, path: &str) -> bool {
-    let Some(rules) = self.authz else {
-      return true;
-    };
-    RepositoryPath::new(path.as_bytes()).is_ok_and(|path| rules.access(path) >= Access::Read)
+    may_read(self.authz, path)
   }
 
   /// `must_have_access` for reading `path` (`serve.c`): the trivial authentication request when the session may read
