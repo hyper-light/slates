@@ -266,6 +266,10 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     // (a version not after the record's, an approval bound back, an outdated comment moved). No verb records review
     // operations yet; the review verbs (owed) type their refusals on the wire, as A-299 did the database's.
     DbError::Review(_) => volume(VolumeRefusal::Invalid),
+    // A change of a repository's Git LFS lock log its guard refuses (A-629 part 2): a place the log
+    // has moved past, a path held or malformed, a release of no lock. The LFS server answers each
+    // in its own words (a held path is a `409` naming the lock), so a generic verb never meets one.
+    DbError::LfsLock(_) => volume(VolumeRefusal::Invalid),
     // An entry of a repository's register refused at its position (A-603): made against another state of the register,
     // a check that no longer holds there, or a state change made against another state. Each server answers its
     // tool's words for a repository that moved under the push.

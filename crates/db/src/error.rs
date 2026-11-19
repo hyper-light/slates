@@ -129,6 +129,9 @@ pub enum DbError {
   /// A review record's change the review rules refuse (§4.17.1 shared piece 6, A-596), by the rule
   /// (`crate::review`). Never entered in the log.
   Review(ReviewRefusal),
+  /// A change of a repository's Git LFS lock log its guard refuses (§4.17.2 "Large files", A-629
+  /// part 2), by the rule (`crate::lfs_locks`). Never entered in the log.
+  LfsLock(LfsLockRefusal),
   /// A repository policy's setting named a version its policy has moved past, or a repository created already holding a
   /// policy, which only its own setting gives (A-622). Read the policy again and set it from there. Never entered in the
   /// log.
@@ -167,6 +170,41 @@ pub enum ReviewRefusal {
   Ended,
   /// A comment's lines span no bytes: an empty range, or one whose end is past the largest byte position.
   Empty,
+}
+
+/// Why a repository's Git LFS lock log refuses a change (§4.17.2 "Large files", A-629 part 2;
+/// `crate::lfs_locks`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LfsLockRefusal {
+  /// The lock log stands at another place than the one the taker read (A-642: appended only at the
+  /// place read): read it again and take the lock from there.
+  Moved {
+    /// The place the log stands at.
+    next: u64,
+  },
+  /// The path is locked already, by the lock at `place`.
+  Held {
+    /// The holding lock's place.
+    place: u64,
+  },
+  /// No lock stands at the place a release names.
+  NotHeld,
+  /// The path is empty or holds a NUL byte.
+  Path,
+  /// The lock log has no place after its last: every place a lock could take is taken.
+  Exhausted,
+}
+
+impl fmt::Display for LfsLockRefusal {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Moved { next } => write!(f, "the lock log stands at {next}, not at the place read"),
+      Self::Held { place } => write!(f, "the path is locked by the lock at {place}"),
+      Self::NotHeld => f.write_str("no lock stands at that place"),
+      Self::Path => f.write_str("the path is empty or holds a NUL byte"),
+      Self::Exhausted => f.write_str("the lock log has no place after its last"),
+    }
+  }
 }
 
 impl fmt::Display for ReviewRefusal {
@@ -229,6 +267,7 @@ impl fmt::Display for DbError {
         "{members} live members of its lineage were made from this green"
       ),
       Self::Review(rule) => write!(f, "review: {rule}"),
+      Self::LfsLock(rule) => write!(f, "lfs lock: {rule}"),
       Self::OutOfOrder { named, expected } => write!(
         f,
         "a register entry naming {named} where the register holds {expected} next"

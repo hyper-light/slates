@@ -1666,6 +1666,35 @@ pub struct ReviewApprovalRecord {
   pub stale_at: Option<u64>,
 }
 
+/// A Git LFS lock (§4.17.2 "Large files"; A-629 part 2): a path of a repository held by its owner,
+/// at its place in the repository's lock log (`crate::lfs_locks`). A-642 keeps a repository's own
+/// state in logs of its own, so a lock is never an entry of the repository's register. Its place is
+/// its id, never reused.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LfsLockRecord {
+  /// The repository whose path it locks.
+  pub repository: RepositoryId,
+  /// Its place in the repository's lock log: the place the log stood at when its taker read it.
+  pub place: u64,
+  /// The path it locks, as the client names it: not empty, no NUL byte.
+  pub path: String,
+  /// Who took it: the principal who alone releases it without force.
+  pub owner: Principal,
+  /// When it was taken, in whole seconds since the Unix epoch (UTC).
+  pub locked_at: i64,
+}
+
+/// A repository's lock log (A-629 part 2, A-642): the place its next lock takes. Made with the
+/// repository's first lock and kept until the repository leaves, so a released lock's place is
+/// never taken again.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LfsLockLogRecord {
+  /// The repository.
+  pub repository: RepositoryId,
+  /// The place the next lock takes.
+  pub next: u64,
+}
+
 /// A check an entry of a repository's register makes (§4.17.1 shared piece 2, A-603): read at the entry's register
 /// position, before any of the entry's own changes and in the step that commits it, so it holds at exactly the position
 /// the entry takes. A check that does not hold refuses the whole entry.

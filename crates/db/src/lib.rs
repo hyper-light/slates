@@ -39,6 +39,7 @@ pub mod art;
 pub mod catalog;
 pub mod error;
 pub mod ledger;
+pub mod lfs_locks;
 pub mod live;
 pub mod mirror;
 pub mod op;

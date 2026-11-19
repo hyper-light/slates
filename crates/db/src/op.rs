@@ -732,6 +732,21 @@ pub enum Op {
     /// The policy, its version the next.
     policy: crate::catalog::RepositoryPolicy,
   },
+  /// A Git LFS lock was taken (§4.17.2 "Large files"; A-629 part 2): its record at the next place
+  /// of its repository's lock log, the place its taker read. The lock log is a log of its own
+  /// (A-642), appended only while it stands at the place read. Appended.
+  LfsLockTaken {
+    /// The lock.
+    lock: crate::catalog::LfsLockRecord,
+  },
+  /// A Git LFS lock was released (A-629 part 2): the lock at `place` of `repository`'s lock log, by
+  /// its owner or by force, which the server judged. Appended.
+  LfsLockReleased {
+    /// The repository.
+    repository: RepositoryId,
+    /// The lock's place in its lock log.
+    place: u64,
+  },
 }
 
 impl Op {
@@ -773,6 +788,8 @@ impl Op {
       Op::ReviewClosed { .. } => "review_closed",
       Op::RepositoryAdvanced { .. } => "repository_advanced",
       Op::RepositoryPolicySet { .. } => "repository_policy_set",
+      Op::LfsLockTaken { .. } => "lfs_lock_taken",
+      Op::LfsLockReleased { .. } => "lfs_lock_released",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",

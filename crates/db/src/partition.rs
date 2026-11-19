@@ -186,6 +186,11 @@ pub struct PartitionSnapshot {
   /// Every repository's register: its next position and its own state (§4.17.1 shared piece 2, A-603; appended), by
   /// repository order.
   pub repository_registers: Vec<crate::catalog::RegisterRecord>,
+  /// Every repository's Git LFS lock log: the place its next lock takes (§4.17.2 "Large files",
+  /// A-629 part 2; appended), by repository order.
+  pub lfs_lock_logs: Vec<crate::catalog::LfsLockLogRecord>,
+  /// The standing Git LFS locks (A-629 part 2; appended), by repository and place.
+  pub lfs_locks: Vec<crate::catalog::LfsLockRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -341,6 +346,10 @@ pub struct Partition {
   /// The review records of those repositories (§4.17.1 shared piece 6, A-596): their bytes counted in
   /// `green_chain_bytes` against the merge byte budget; they leave with their review's close and their repository.
   reviews: crate::review::Reviews,
+  /// Those repositories' Git LFS lock logs (§4.17.2 "Large files", A-629 part 2; A-642): their
+  /// bytes counted in `green_chain_bytes` against the merge byte budget; they leave with their
+  /// repository.
+  lfs_locks: crate::lfs_locks::LfsLocks,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -473,6 +482,7 @@ impl Partition {
       carried: BTreeMap::new(),
       repositories: crate::repository::Repositories::new(),
       reviews: crate::review::Reviews::new(),
+      lfs_locks: crate::lfs_locks::LfsLocks::new(),
       tombstones: BTreeMap::new(),
     }
   }
@@ -485,6 +495,11 @@ impl Partition {
   /// The review records of this partition's repositories (§4.17.1 shared piece 6, A-596).
   pub fn reviews(&self) -> &crate::review::Reviews {
     &self.reviews
+  }
+
+  /// The Git LFS lock logs of this partition's repositories (§4.17.2 "Large files", A-629 part 2).
+  pub fn lfs_locks(&self) -> &crate::lfs_locks::LfsLocks {
+    &self.lfs_locks
   }
 
   /// What the catalog holds under `id`, as a repository's namespace asks it (§4.17.1: a namespace binds greens).
@@ -1542,6 +1557,15 @@ impl Partition {
         let bytes = self.repositories.policy_bytes(*repository, policy);
         self.merge_bytes_fit(bytes.released, bytes.added)
       }
+      // A Git LFS lock log keeps its rules (A-629 part 2): `crate::lfs_locks`; a lock's bytes fit
+      // the merge byte budget.
+      Op::LfsLockTaken { .. } | Op::LfsLockReleased { .. } => {
+        self
+          .lfs_locks
+          .check(op, |id| self.repositories.repository(id).is_some())?;
+        let (released, added) = self.lfs_locks.charge(op);
+        self.merge_bytes_fit(released, added)
+      }
       // A review record keeps §4.17.1's rules (A-596): `crate::review`; its bytes fit the merge byte budget.
       Op::ReviewCommented { .. }
       | Op::ReviewCommentMoved { .. }
@@ -2040,8 +2064,21 @@ impl Partition {
       // register's state does (A-603).
       Op::RepositoryDestroyed { repository } => {
         self.apply_repository(op)?;
-        let released = self.reviews.repository_removed(*repository);
+        let released = self
+          .reviews
+          .repository_removed(*repository)
+          .saturating_add(self.lfs_locks.repository_removed(*repository));
         self.green_chain_bytes = self.green_chain_bytes.saturating_sub(released);
+        Ok(())
+      }
+      // A Git LFS lock taken or released (A-629 part 2), its bytes moving the merge budget.
+      Op::LfsLockTaken { .. } | Op::LfsLockReleased { .. } => {
+        let (released, added) = self.lfs_locks.charge(op);
+        self.lfs_locks.apply(op)?;
+        self.green_chain_bytes = self
+          .green_chain_bytes
+          .saturating_sub(released)
+          .saturating_add(added);
         Ok(())
       }
       Op::ReviewCommented { .. }
@@ -2733,6 +2770,8 @@ impl Partition {
       review_comments: self.reviews.comment_records().cloned().collect(),
       review_approvals: self.reviews.approval_records().cloned().collect(),
       repository_registers: self.repositories.registers().collect(),
+      lfs_lock_logs: self.lfs_locks.log_records().collect(),
+      lfs_locks: self.lfs_locks.lock_records().cloned().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2994,6 +3033,13 @@ impl Partition {
       |id| p.repositories.repository(id).is_some(),
     )?;
     p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.reviews.bytes());
+    // The Git LFS lock logs, charged to the merge byte budget as when they were recorded (A-629
+    // part 2).
+    p.lfs_locks =
+      crate::lfs_locks::LfsLocks::restore(&snapshot.lfs_lock_logs, &snapshot.lfs_locks, |id| {
+        p.repositories.repository(id).is_some()
+      })?;
+    p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.lfs_locks.bytes());
     Ok(p)
   }
 
