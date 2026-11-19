@@ -22,7 +22,7 @@
 
 use super::json::{self, Cursor, Integer, JsonStr, NumberRefusal, Shape};
 use super::{ErrorBody, RefProblem, Timestamp, read_ref};
-use crate::out::Out;
+use crate::out::{Measure, Out};
 use crate::{Admission, to_u64};
 
 /// Format: the largest limit git-lfs sends, Go's `int64` maximum (`locking/api.go`: `Limit int`, 64 bits on every
@@ -541,16 +541,35 @@ fn put_lock(lock: &Lock<'_>, out: &mut impl Out) {
   out.put(b"}");
 }
 
+/// Format: what separates two locks in an array (RFC 8259 §5).
+const SEPARATOR: &[u8] = b",";
+
 /// Writes locks as an array.
 fn put_locks(locks: &[Lock<'_>], out: &mut impl Out) {
   out.put(b"[");
   for (place, lock) in locks.iter().enumerate() {
     if place > 0 {
-      out.put(b",");
+      out.put(SEPARATOR);
     }
     put_lock(lock, out);
   }
   out.put(b"]");
+}
+
+/// The bytes a lock takes in an answer's array with the separator before it: what a page of locks
+/// charges for it, so a page is charged a byte over for each array's first lock (A-629).
+pub fn listed_len(lock: &Lock<'_>) -> u64 {
+  let mut measure = Measure::default();
+  measure.put(SEPARATOR);
+  put_lock(lock, &mut measure);
+  measure.0
+}
+
+/// The bytes the cursor `cursor` takes in a page's answer (A-629).
+pub fn cursor_len(cursor: &str) -> u64 {
+  let mut measure = Measure::default();
+  put_next_cursor(Some(cursor), &mut measure);
+  measure.0
 }
 
 /// Writes the answer to a lock created (201) or released (200): `{"lock": ...}`.
