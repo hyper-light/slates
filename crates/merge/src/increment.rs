@@ -652,11 +652,15 @@ fn resolve_rename_target(
   Ok(None)
 }
 
-/// The directories present at seal: the base directories, with the journal's mkdir/rmdir applied.
-/// (Validity — no mkdir over an existing directory, no rmdir of an absent one — is checked by
-/// [`compose_directories`], which runs first.)
+/// The directories present at seal: the base directories, with the journal's mkdir/rmdir applied,
+/// and the root. (Validity — no mkdir over an existing directory, no rmdir of an absent one — is
+/// checked by [`compose_directories`], which runs first.)
 fn present_directories(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeSet<String> {
   let mut present: std::collections::BTreeSet<String> = base.dirs.iter().cloned().collect();
+  // The root, the empty path (the server keys a volume's `/` so), is always present: nothing makes or removes it, and
+  // its mode and attributes compose as any directory's (A-618: a push's head is an attribute of the root, §4.17.1 "A
+  // push is a work" item 3; and an agent's `chmod` or `setxattr` of a mount's root declares the same).
+  present.insert(String::new());
   for op in journal {
     match op {
       VolumeOp::Mkdir { path } => {

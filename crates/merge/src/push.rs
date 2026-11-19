@@ -282,12 +282,41 @@ pub fn build<O: PushObjects>(
   objects: &O,
   room: u64,
 ) -> Result<Built, PushRefused> {
-  // Red: the walk is not built yet (A-618, failing tests first).
-  let _ = (objects, room);
-  Err(PushRefused::UnknownBase {
-    base: push.base_version,
-    head: green.head(),
-  })
+  if push.base_version > green.head() {
+    return Err(PushRefused::UnknownBase {
+      base: push.base_version,
+      head: green.head(),
+    });
+  }
+  let mut walk = Walk {
+    objects,
+    journal: Vec::new(),
+    contents: BTreeMap::new(),
+    reads: Reads::default(),
+    held: 0,
+    room,
+    stack: Vec::new(),
+  };
+  if push.base_tree == Some(push.tree) {
+    walk.reads.skipped = 1;
+  } else {
+    walk.queue(Step::Compare {
+      path: ROOT.to_owned(),
+      base: push.base_tree,
+      pushed: Some(push.tree),
+    })?;
+  }
+  while let Some(step) = walk.stack.pop() {
+    walk.step(step)?;
+  }
+  if let Some(head) = push.head {
+    walk.emit(VolumeOp::SetXattr {
+      path: ROOT.to_owned(),
+      name: HEAD_ATTRIBUTE.to_owned(),
+      value: head.to_vec(),
+    })?;
+  }
+  walk.seal(push, green)
 }
 
 /// The identity of a push's work: the push's name and base, then the document and the post-state, under a context of

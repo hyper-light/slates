@@ -2616,7 +2616,9 @@ impl Green {
     mode: u32,
     established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if !self.content.contains_key(path)
+    // The root, the empty path, is always present (A-618, the deriver's `present_directories`).
+    if !path.is_empty()
+      && !self.content.contains_key(path)
       && !self.dirs.contains_key(path)
       && !self.specials.contains_key(path)
       && !established
@@ -2694,7 +2696,9 @@ impl Green {
     value: &[u8],
     established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if !self.content.contains_key(path)
+    // The root, the empty path, is always present (A-618, the deriver's `present_directories`).
+    if !path.is_empty()
+      && !self.content.contains_key(path)
       && !self.dirs.contains_key(path)
       && !self.specials.contains_key(path)
       && !established
