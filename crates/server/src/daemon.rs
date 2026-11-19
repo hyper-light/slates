@@ -1186,9 +1186,10 @@ impl Daemon {
     // The version-control servers' HTTP edge, when the operator asked for one (§4.17.2 "Transports" item 1, A-625 part 3):
     // its listener on the control shard beside the NFS transport, every shard keeping its seats.
     let vcs_http_port = crate::vcs_http::start(&runtime, control, &shards, &config)?;
-    // And its SSH edge (§4.17.2 "Transports" item 2, A-684): its listener and connections on the control shard, its host
-    // key the fleet node's own, else the one the anchor keeps in the segment, else this lone daemon's own.
-    let vcs_ssh = crate::vcs_ssh::start(&runtime, control, &config, &segment)?;
+    // And its SSH edge (§4.17.2 "Transports" item 2, A-684): its listener on the control shard, every shard seating the
+    // connections that move to it; its host key the fleet node's own, else the one the anchor keeps in the segment, else
+    // this lone daemon's own.
+    let vcs_ssh = crate::vcs_ssh::start(&runtime, control, &shards, &config, &segment)?;
     Ok(Daemon {
       runtime: Some(runtime),
       segment,

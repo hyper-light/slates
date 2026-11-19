@@ -97,6 +97,91 @@ pub struct Httpv2 {
   pub mergeinfo: Option<bool>,
   /// `SVN-Allow-Bulk-Updates`.
   pub bulk_updates: BulkUpdates,
+  /// The capabilities the `DAV` lines list: what the site serves (A-681), every one for `mod_dav_svn`'s own list
+  /// ([`Capability::ALL`]).
+  pub served: Vec<Capability>,
+}
+
+/// A capability `mod_dav_svn` names on a `DAV` line (`svn_dav.h`'s `SVN_DAV_NS_DAV_SVN_*`): a report, a form of an
+/// answer or of a commit that a client uses once it is listed, so a site lists only those it serves (A-681).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capability {
+  /// `depth`: depth in an update-report.
+  Depth,
+  /// `log-revprops`: a log-report's revision properties named.
+  LogRevprops,
+  /// `atomic-revprops`: a revision property changed against its old value.
+  AtomicRevprops,
+  /// `partial-replay`: a replay of a subtree.
+  PartialReplay,
+  /// `inherited-props`: the `inherited-props-report`.
+  InheritedProps,
+  /// `inline-props`: properties inline in an update-report.
+  InlineProps,
+  /// `reverse-file-revs`: a `file-revs-report` newest first.
+  ReverseFileRevs,
+  /// `list`: the `list-report`.
+  List,
+  /// `mergeinfo`: the `mergeinfo-report`.
+  Mergeinfo,
+  /// `replay-rev-resource`: a replay against a revision's resource.
+  ReplayRevResource,
+  /// `ephemeral-txnprops`: a commit's transaction properties.
+  EphemeralTxnprops,
+  /// `svndiff1`: svndiff 1 in a commit's bodies.
+  Svndiff1,
+  /// `svndiff2`: svndiff 2 in a commit's bodies.
+  Svndiff2,
+  /// `put-result-checksum`: a PUT's answer carries its result's checksum.
+  PutResultChecksum,
+}
+
+impl Capability {
+  /// Every capability `mod_dav_svn` 1.14 lists, in its order.
+  /// Format: `version.c` `get_vsn_options` and `get_option`.
+  pub const ALL: [Capability; 14] = [
+    Capability::Depth,
+    Capability::LogRevprops,
+    Capability::AtomicRevprops,
+    Capability::PartialReplay,
+    Capability::InheritedProps,
+    Capability::InlineProps,
+    Capability::ReverseFileRevs,
+    Capability::List,
+    Capability::Mergeinfo,
+    Capability::ReplayRevResource,
+    Capability::EphemeralTxnprops,
+    Capability::Svndiff1,
+    Capability::Svndiff2,
+    Capability::PutResultChecksum,
+  ];
+
+  /// Its URI on a `DAV` line.
+  /// Format: `svn_dav.h`, `SVN_DAV_NS_DAV_SVN_*`.
+  pub fn uri(self) -> &'static str {
+    match self {
+      Capability::Depth => "http://subversion.tigris.org/xmlns/dav/svn/depth",
+      Capability::LogRevprops => "http://subversion.tigris.org/xmlns/dav/svn/log-revprops",
+      Capability::AtomicRevprops => "http://subversion.tigris.org/xmlns/dav/svn/atomic-revprops",
+      Capability::PartialReplay => "http://subversion.tigris.org/xmlns/dav/svn/partial-replay",
+      Capability::InheritedProps => "http://subversion.tigris.org/xmlns/dav/svn/inherited-props",
+      Capability::InlineProps => "http://subversion.tigris.org/xmlns/dav/svn/inline-props",
+      Capability::ReverseFileRevs => "http://subversion.tigris.org/xmlns/dav/svn/reverse-file-revs",
+      Capability::List => "http://subversion.tigris.org/xmlns/dav/svn/list",
+      Capability::Mergeinfo => "http://subversion.tigris.org/xmlns/dav/svn/mergeinfo",
+      Capability::ReplayRevResource => {
+        "http://subversion.tigris.org/xmlns/dav/svn/replay-rev-resource"
+      }
+      Capability::EphemeralTxnprops => {
+        "http://subversion.tigris.org/xmlns/dav/svn/ephemeral-txnprops"
+      }
+      Capability::Svndiff1 => "http://subversion.tigris.org/xmlns/dav/svn/svndiff1",
+      Capability::Svndiff2 => "http://subversion.tigris.org/xmlns/dav/svn/svndiff2",
+      Capability::PutResultChecksum => {
+        "http://subversion.tigris.org/xmlns/dav/svn/put-result-checksum"
+      }
+    }
+  }
 }
 
 /// `SVNAllowBulkUpdates`, as `SVN-Allow-Bulk-Updates` names it.
@@ -110,43 +195,51 @@ pub enum BulkUpdates {
   Prefer,
 }
 
-/// The capability names `mod_dav_svn` lists on `DAV` lines (`get_vsn_options`), in its order.
-/// Format: `version.c` `get_vsn_options`, `svn_dav.h`'s `SVN_DAV_NS_DAV_SVN_*`.
-const VSN_OPTIONS: [&str; 11] = [
+/// The DeltaV classes `mod_dav_svn` lists on `DAV` lines before its capabilities (`get_vsn_options`).
+/// Format: `version.c` `get_vsn_options`.
+const VSN_CLASSES: [&str; 2] = [
   "version-control,checkout,working-resource",
   "merge,baseline,activity,version-controlled-collection",
-  "http://subversion.tigris.org/xmlns/dav/svn/depth",
-  "http://subversion.tigris.org/xmlns/dav/svn/log-revprops",
-  "http://subversion.tigris.org/xmlns/dav/svn/atomic-revprops",
-  "http://subversion.tigris.org/xmlns/dav/svn/partial-replay",
-  "http://subversion.tigris.org/xmlns/dav/svn/inherited-props",
-  "http://subversion.tigris.org/xmlns/dav/svn/inline-props",
-  "http://subversion.tigris.org/xmlns/dav/svn/reverse-file-revs",
-  "http://subversion.tigris.org/xmlns/dav/svn/list",
-  "http://subversion.tigris.org/xmlns/dav/svn/mergeinfo",
+];
+
+/// The capabilities `get_vsn_options` lists, in its order: those before the HTTPv2 headers.
+/// Format: `version.c` `get_vsn_options`.
+const VSN_CAPABILITIES: [Capability; 9] = [
+  Capability::Depth,
+  Capability::LogRevprops,
+  Capability::AtomicRevprops,
+  Capability::PartialReplay,
+  Capability::InheritedProps,
+  Capability::InlineProps,
+  Capability::ReverseFileRevs,
+  Capability::List,
+  Capability::Mergeinfo,
 ];
 
 /// The commit capabilities `get_option` adds once the activity collection is asked for, in its order.
 /// Format: `version.c` `get_option` `capabilities[]`.
-const COMMIT_CAPABILITIES: [&str; 4] = [
-  "http://subversion.tigris.org/xmlns/dav/svn/ephemeral-txnprops",
-  "http://subversion.tigris.org/xmlns/dav/svn/svndiff1",
-  "http://subversion.tigris.org/xmlns/dav/svn/svndiff2",
-  "http://subversion.tigris.org/xmlns/dav/svn/put-result-checksum",
+const COMMIT_CAPABILITIES: [Capability; 4] = [
+  Capability::EphemeralTxnprops,
+  Capability::Svndiff1,
+  Capability::Svndiff2,
+  Capability::PutResultChecksum,
 ];
 
 /// The OPTIONS answer's headers, in the order `mod_dav` and `mod_dav_svn` set them: `DAV` lines (the class `1,2`, the
 /// version options), then, when the body asked for the activity collection, the HTTPv2 headers and the commit
-/// capabilities.
+/// capabilities; a capability only where `facts` lists it served.
 pub fn options_headers(
   facts: &Httpv2,
   activity_collection_set: bool,
 ) -> Vec<(&'static str, String)> {
+  let served = |capability: &&Capability| facts.served.contains(capability);
   let mut headers: Vec<(&'static str, String)> = vec![("DAV", String::from("1,2"))];
+  headers.extend(VSN_CLASSES.iter().map(|class| ("DAV", (*class).to_owned())));
   headers.extend(
-    VSN_OPTIONS
+    VSN_CAPABILITIES
       .iter()
-      .map(|option| ("DAV", (*option).to_owned())),
+      .filter(served)
+      .map(|capability| ("DAV", capability.uri().to_owned())),
   );
   if !activity_collection_set {
     return headers;
@@ -163,10 +256,12 @@ pub fn options_headers(
       String::from(if has { "yes" } else { "no" }),
     )
   }));
-  headers.push((
-    "DAV",
-    String::from("http://subversion.tigris.org/xmlns/dav/svn/replay-rev-resource"),
-  ));
+  headers.extend(
+    [Capability::ReplayRevResource]
+      .iter()
+      .filter(served)
+      .map(|capability| ("DAV", capability.uri().to_owned())),
+  );
   let stub = |name: &str| format!("{}/{}/{name}", facts.root, facts.special);
   headers.push(("SVN-Repository-Root", facts.root.clone()));
   headers.push(("SVN-Me-Resource", stub("me")));
@@ -187,7 +282,8 @@ pub fn options_headers(
   headers.extend(
     COMMIT_CAPABILITIES
       .iter()
-      .map(|capability| ("DAV", (*capability).to_owned())),
+      .filter(served)
+      .map(|capability| ("DAV", capability.uri().to_owned())),
   );
   headers
 }

@@ -151,7 +151,10 @@ mod deadlines;
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;
 mod reap;
+// The repository verbs (§4.17.1; A-575). What a client's create names by default is public (A-685, `slates repository
+// create`): each tool's object formats and the namespace name a new repository's root is bound to.
 mod repository;
+pub use repository::{RootRefused, object_formats, root_binding};
 // git's `dowild` transcribed line for line, the oracle `vcs_policy`'s tests hold its glob rules to (A-597): the file
 // that `slates_vcs::wildmatch`'s own tests read as their `reference`, compiled into this crate's tests too, so both
 // crates' tests hold one transcription and no product build links it (A-671). The matcher is `slates_vcs::wildmatch`.
@@ -188,6 +191,14 @@ pub mod credentials;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod svn_hooks;
+// git's hooks as the server runs them (A-665 part 2): the read-only bare repository a hook runs
+// in, opened on the owner shard over the repository's store, sealed there in slices and handed to
+// the hook driver with receive-pack's variables; Unix alone with the driver. No caller outside
+// tests until git's push driver (`git_push`, A-654) runs its hooks in a view presented at a path
+// (part 3).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_hooks;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
 // each phase's wait learned, the bounds derived from the shard's budget, git's site, Mercurial's (A-650), a connection
 // moved to its repository's shard, and the daemon's start, whose git site serves receive-pack through the push driver

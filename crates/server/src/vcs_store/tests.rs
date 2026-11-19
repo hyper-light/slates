@@ -75,7 +75,7 @@ fn tree(files: &[(Vec<u8>, ObjectId)]) -> (ObjectId, Vec<u8>) {
 }
 
 /// An id's lowercase hex, as a commit names its tree and parents.
-fn hex(id: ObjectId) -> String {
+pub(crate) fn hex(id: ObjectId) -> String {
   id.as_bytes()
     .iter()
     .map(|byte| format!("{byte:02x}"))
@@ -99,7 +99,7 @@ fn commit(tree: ObjectId, parents: &[ObjectId], date: u64) -> (ObjectId, Vec<u8>
 }
 
 /// One object a push brings: its type, id and content.
-type Brought = (Kind, ObjectId, Vec<u8>);
+pub(crate) type Brought = (Kind, ObjectId, Vec<u8>);
 
 /// `brought` as a source hands it in, claimed by its id, at `depth`.
 fn incoming(brought: &Brought, depth: u64) -> Incoming<'_> {
@@ -112,7 +112,7 @@ fn incoming(brought: &Brought, depth: u64) -> Incoming<'_> {
 }
 
 /// A commit of a tree of `files` over `parents` at `date`: its blobs, its tree and itself, in that order, and its id.
-fn commit_of(
+pub(crate) fn commit_of(
   files: &[(Vec<u8>, Vec<u8>)],
   parents: &[ObjectId],
   date: u64,
@@ -975,7 +975,8 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
 // ---------------------------------------------------------------------------------------------------------------------
 // The owner shard.
 
-fn owner() -> Principal {
+/// The principal every test repository is created by, and so its owner.
+pub(crate) fn owner() -> Principal {
   Principal::Uid {
     host: slates_db::HostId(0),
     uid: 1234,
@@ -983,7 +984,11 @@ fn owner() -> Principal {
 }
 
 /// Creates repository `name` of `tool` on the shard: its id and its root green.
-fn repository(state: &mut ShardState, name: &str, tool: VcsTool) -> (RepositoryId, DbVolumeId) {
+pub(crate) fn repository(
+  state: &mut ShardState,
+  name: &str,
+  tool: VcsTool,
+) -> (RepositoryId, DbVolumeId) {
   let reply = dispatch(
     state,
     1,
@@ -1111,13 +1116,17 @@ fn begun_at(
 }
 
 /// A push begun on the shard with `objects` admitted whole.
-fn begun(state: &mut ShardState, repository: RepositoryId, objects: &[Brought]) -> GitPush {
+pub(crate) fn begun(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  objects: &[Brought],
+) -> GitPush {
   begun_at(state, repository, objects, 0)
 }
 
 /// A-618's work for `push` on `green`, from `base` (a version and its tree) to `head`'s tree, read through A-638's view
 /// with the room the shard lends the read.
-fn work_of(
+pub(crate) fn work_of(
   state: &mut ShardState,
   (push, green): (&GitPush, DbVolumeId),
   (version, base): (u64, Option<ObjectId>),
@@ -1147,7 +1156,7 @@ fn work_of(
 }
 
 /// `changes` appended with `sealed`'s objects and `moves` through A-635's append.
-fn appended(
+pub(crate) fn appended(
   state: &mut ShardState,
   repository: RepositoryId,
   changes: Vec<BranchChange>,
@@ -1164,7 +1173,7 @@ fn appended(
 
 /// One push through the shard: `objects` admitted, the work from `base` to the commit's tree, the push sealed with its
 /// move and appended. The version it made.
-fn push_through(
+pub(crate) fn push_through(
   state: &mut ShardState,
   (repository, green): (RepositoryId, DbVolumeId),
   objects: &[Brought],
@@ -1186,7 +1195,7 @@ fn push_through(
 }
 
 /// The root tree a commit's content names.
-fn tree_of(objects: &[Brought]) -> ObjectId {
+pub(crate) fn tree_of(objects: &[Brought]) -> ObjectId {
   objects
     .iter()
     .find(|(kind, ..)| *kind == Kind::Tree)
@@ -1502,5 +1511,59 @@ fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
     let last = records(state, repository).pop().expect("a record");
     let read = Record::decode(&last, FORMAT).expect("a record");
     assert_eq!(read.moves, vec![(key, 1, Some(head))]);
+  });
+}
+
+/// The files of the map the store holds for `green`, a green of `repository`, when it is of `version` (A-664 part 3).
+fn kept_files(
+  state: &ShardState,
+  repository: RepositoryId,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<BTreeMap<Vec<u8>, slates_vcs::derived::paths::Entry>> {
+  let (content, git) = state.vcs_stores.git_ref(repository)?;
+  let paths = git.paths.as_ref()?;
+  let head = git
+    .heads
+    .get(&green_key(green))
+    .filter(|head| head.version == version)?;
+  paths.files(content, head.root).ok()
+}
+
+/// A-664 part 3 (its first piece: a push's version keeps its map of paths to git's files, as a submit's does). Do: push
+/// a commit of two files to a git repository's root green through A-635's append. Expect: the green's new version keeps
+/// a map holding both, each a regular file whose content is its blob's bytes as an object, built whole (the green's
+/// first version) and none refused.
+#[test]
+fn t_a664_p3_a_pushs_version_keeps_its_map_of_gits_files() {
+  crate::daemon::audit_on_shard(|state| {
+    let (repository, green) = repository(state, "pushed", VcsTool::Git);
+    let (a, a_bytes) = blob(b"alpha\n");
+    let (b, b_bytes) = blob(b"beta\n");
+    let (tree_id, tree_bytes) = tree(&[(b"a".to_vec(), a), (b"b".to_vec(), b)]);
+    let (head, commit_bytes) = commit(tree_id, &[], FIRST_DATE);
+    let objects: Vec<Brought> = vec![
+      (Kind::Blob, a, a_bytes.clone()),
+      (Kind::Blob, b, b_bytes.clone()),
+      (Kind::Tree, tree_id, tree_bytes),
+      (Kind::Commit, head, commit_bytes),
+    ];
+    let version = push_through(state, (repository, green), &objects, (None, head, tree_id));
+    let files = kept_files(state, repository, green, version).expect("the version's map");
+    let content = state.vcs_stores.content().expect("the content store");
+    let file = |bytes: &[u8]| slates_vcs::derived::paths::Entry {
+      class: slates_git::derived::FileClass::File.class(),
+      content: content.object_id(bytes),
+    };
+    let expected = BTreeMap::from([
+      (b"a".to_vec(), file(&a_bytes)),
+      (b"b".to_vec(), file(&b_bytes)),
+    ]);
+    assert_eq!(files, expected);
+    let counted = |name: &str| state.refusals.get(name).copied();
+    assert_eq!(
+      (counted(super::paths::BUILT), counted(super::paths::REFUSED)),
+      (Some(1), None)
+    );
   });
 }

@@ -1,11 +1,14 @@
 //! The daemon's SSH edge (A-684; §4.17.2 "Transports" item 2; A-651's owed start): started beside the HTTP edge, its
-//! listener and its connections on the control shard, its host key the fleet node's own or the one its anchor keeps.
+//! listener on the control shard and an edge state on every shard, its host key the fleet node's own or the one its
+//! anchor keeps.
 //!
-//! **The start** ([`start`]). With an address in `DaemonConfig::vcs_ssh`, the control shard keeps the edge's state, its
-//! seats and channel window derived from the shard's budget as the HTTP edge's are (`Bounds::of_shard`), and serves the
-//! listener ([`serve`]): the one a supervising anchor holds and handed over (`slates_anchor::ENV_VCS_SSH`), adopted
-//! where the configuration says, else one bound here (`crate::daemon::edge_listener`). The port and the host key's
-//! fingerprint are the daemon's to report (`crate::daemon::VcsSshEdge`): its log names both before it says it serves.
+//! **The start** ([`start`]). With an address in `DaemonConfig::vcs_ssh`, every shard keeps an edge state, its seats and
+//! channel window derived from the shard's budget as the HTTP edge's are (`Bounds::of_shard`): the control shard's with
+//! the host key, every other's without one (`EdgeState::arrivals`), seating the connections that move there to their
+//! repository's owner (A-651 part 4). The control shard serves the listener ([`serve`]): the one a supervising anchor
+//! holds and handed over (`slates_anchor::ENV_VCS_SSH`), adopted where the configuration says, else one bound here
+//! (`crate::daemon::edge_listener`). The port and the host key's fingerprint are the daemon's to report
+//! (`crate::daemon::VcsSshEdge`): its log names both before it says it serves.
 //!
 //! **The host key** ([`host_seed`]; main's ruling, 2026-11-19). A fleet node's edge presents the node's own key, from
 //! the identity its plan hands in, as the HTTP edge's TLS presents the node's certificate: so its key is the node's
@@ -17,10 +20,10 @@
 //! anchor outlives, makes its own from the system's generator for its own life, as it binds its own listener.
 //!
 //! **What it serves** (`super::site::ToolSite`). Keys proved by the credential record a person enrolls (A-651 part 3,
-//! `super::site::RecordKeys`); repositories found on the partition of the listener's shard (`ShardRepositories::find`;
-//! one another shard holds is owed its move, as the HTTP edge moves a connection); and the services as the server has
-//! them: none yet, each `exec` refused as not served (`super::site::NotYet`) until the stores' lender (A-682) and
-//! receive-pack's call (A-683) are wired in.
+//! `super::site::RecordKeys`); repositories located on the partitions their names route to, the connection moved to
+//! the owner's shard (`ShardRepositories`, A-651 part 4); and the services as the server has them: none yet, each
+//! `exec` refused as not served (`super::site::NotYet`) until the stores' lender (A-682) and receive-pack's call (A-683)
+//! are wired in.
 //!
 //! Each reason the edge cannot start (no host key, an address that does not bind, a listener held elsewhere) leaves the
 //! daemon serving everything else, logged, as the HTTP edge's does.
@@ -32,25 +35,26 @@ use slates_ssh::entropy::{Entropy, SystemEntropy};
 use slates_ssh::hostkey::{ED25519_SEED_LEN, HostKey};
 
 use super::site::{NotYet, RecordKeys, ToolSite};
-use super::{EdgeState, HostSeed, serve};
+use super::{EdgeState, HostSeed, keep_here, serve};
 use crate::config::{DaemonConfig, VcsSshConfig};
 use crate::daemon::VcsSshEdge;
 use crate::vcs_http::ShardRepositories;
 
 /// Counter: an edge whose listener's task the control shard's arena refused.
 const NOT_STARTED: &str = "vcs_ssh.not_started";
-/// Counter: an edge whose state the control shard could not keep.
+/// Counter: a shard that could not keep its edge state, so a connection that moves there is lost.
 const NOT_KEPT: &str = "vcs_ssh.not_kept";
 
 /// The SSH site as the daemon serves it (the module doc, "What it serves").
 pub(crate) type DaemonSite = ToolSite<RecordKeys, ShardRepositories, NotYet>;
 
-/// Starts the SSH edge `config` names, if it names one (the module doc): the `control` shard keeps its state and serves
-/// its listener, its host key read from `segment` where the anchor published one. The edge's port and host key's
-/// fingerprint; none when no edge is asked for or it did not start, which is logged.
+/// Starts the SSH edge `config` names, if it names one (the module doc): every shard of `shards` keeps its edge state and
+/// the `control` shard serves the listener, its host key read from `segment` where the anchor published one. The edge's
+/// port and host key's fingerprint; none when no edge is asked for or it did not start, which is logged.
 pub(crate) fn start(
   runtime: &Runtime,
   control: ShardId,
+  shards: &[ShardId],
   config: &DaemonConfig,
   segment: &AnchorSegment,
 ) -> Result<Option<VcsSshEdge>, RtError> {
@@ -89,12 +93,18 @@ pub(crate) fn start(
     Ok(address) => address.port(),
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),
   };
+  for shard in shards.iter().copied().filter(|shard| *shard != control) {
+    runtime.spawn_on(shard, async move {
+      if keep_here(EdgeState::arrivals(bounds)).is_err() {
+        crate::fleet::count_refusal(NOT_KEPT);
+      }
+    })?;
+  }
   runtime.spawn_on(control, async move {
-    let kept =
-      slates_rt::registry::with_current(|context| context.keep(EdgeState::new(bounds, seed.0)));
+    let kept = keep_here(EdgeState::new(bounds, seed.0));
     // The seed's copy here is wiped as it drops: the edge's state holds its own, wiped with it.
     drop(seed);
-    let Some(Ok(state)) = kept else {
+    let Ok(state) = kept else {
       crate::fleet::count_refusal(NOT_KEPT);
       return;
     };

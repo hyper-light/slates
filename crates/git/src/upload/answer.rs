@@ -16,6 +16,12 @@
 //! wrote before refusing, as git sends what `pack-objects` wrote before it failed: nothing follows a band-3 packet, and
 //! the client stops with them. Without side-band there is no band to say it on, so the pack stops short, as git's
 //! does, and the client finds it cut.
+//!
+//! A pack git's `pack-objects` would die of as it begins (A-640 part 4: a `sparse:oid` filter's blob not resolved or
+//! not read) is answered as git's server answers it: what came before the pack, then the dying process's lines as git
+//! formats them (`vfreportf`: cut to 4096 bytes, a control byte but a tab and a newline shown as `?`) and relays them
+//! (a band-2 packet each read of at most 128 bytes, a line read alone), then git's band-3 words, and no flush; with no
+//! band, what came before the pack alone.
 
 use super::{ABORT, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::Counters;
@@ -27,6 +33,29 @@ use crate::{Admission, to_u64};
 
 /// Format: what an error line begins with outside a multiplexed response (`packet_writer_error`).
 const ERR: &[u8] = b"ERR ";
+
+/// Format: what git's `die` writes before a dying process's words (`usage.c` `die_message_builtin`), which git's server
+/// relays on band 2 when `pack-objects` dies (A-640 part 4).
+const FATAL: &[u8] = b"fatal: ";
+
+/// Format: what git's `warning` writes before its words (`usage.c` `warn_builtin`).
+const WARNING: &[u8] = b"warning: ";
+
+/// Format: the most bytes one of git's reported lines takes, its newline last (`usage.c` `vfreportf`'s `msg[4096]`).
+const REPORTED: usize = 4096;
+
+/// Format: the most bytes git's server relays of `pack-objects`' error stream in one band-2 packet, a read's worth
+/// (`upload-pack.c` `create_pack_file`'s `progress[128]`).
+const RELAYED: usize = 128;
+
+/// Format: what git's report shows in place of a control byte other than a tab and a newline (`vfreportf`).
+const SHOWN: u8 = b'?';
+
+/// Format: the control bytes git's report keeps: a tab and a newline (`vfreportf`).
+const KEPT_CONTROLS: &[u8] = b"\t\n";
+
+/// Format: what ends each of git's reported lines (`vfreportf`).
+const NEWLINE: &[u8] = b"\n";
 
 /// Format: the flush packet, four zero digits [gitprotocol-common: "0000 (flush-pkt)"].
 const FLUSH: &[u8] = b"0000";
@@ -67,6 +96,11 @@ impl Framing {
       Framing::V2(_) | Framing::Raw => MAX_BAND_DATA,
       Framing::Band { data } => data,
     }
+  }
+
+  /// Whether the answer has bands to say more than the pack on: every framing but v0's bare pack.
+  pub(super) fn is_banded(self) -> bool {
+    !matches!(self, Framing::Raw)
   }
 }
 
@@ -142,6 +176,46 @@ impl<K> Answer<K> {
       refusal: Some(refused.refusal),
       ..Answer::whole(head)
     }
+  }
+
+  /// The answer git's server gives when `pack-objects` dies as it begins (A-640 part 4: a `sparse:oid` filter's blob
+  /// that is not resolved or not read): `head`, everything written before the pack; then, where the answer has a band
+  /// to say them on (`banded`), the lines the dying process writes (`Refusal::warning`'s, then `refusal`'s words as
+  /// its `fatal:` line) as git's server relays them, a band-2 packet a read of at most `RELAYED` bytes, each line read
+  /// alone, then git's band-3 words, and no flush, as none follows git's. With no band, `head` alone: git's server
+  /// writes those lines to its own error stream, and the client finds the pack missing. The packets are charged to
+  /// `admission` first.
+  pub(super) fn died(
+    mut head: Vec<u8>,
+    refusal: Refusal,
+    banded: bool,
+    admission: &mut Admission,
+  ) -> Result<Answer<K>, Refusal> {
+    if banded {
+      let lines: Vec<Vec<u8>> = refusal
+        .warning()
+        .map(|words| reported(WARNING, &words))
+        .into_iter()
+        .chain([reported(FATAL, &refusal.words())])
+        .collect();
+      let relayed = lines
+        .iter()
+        .flat_map(|line| line.chunks(RELAYED))
+        .map(|read| sideband::written_len(to_u64(read.len())))
+        .fold(
+          sideband::written_len(to_u64(ABORT.len())),
+          u64::saturating_add,
+        );
+      admission.charge(relayed).map_err(Refusal::PastAdmission)?;
+      for read in lines.iter().flat_map(|line| line.chunks(RELAYED)) {
+        sideband::write(Band::Progress, read, &mut head);
+      }
+      sideband::write(Band::Error, ABORT, &mut head);
+    }
+    Ok(Answer {
+      refusal: Some(refusal),
+      ..Answer::whole(head)
+    })
   }
 
   /// An answer of `head`, then the pack `source` writes, framed as `framing` frames it; under v2 its grammar is where
@@ -321,12 +395,41 @@ impl<K> Streaming<K> {
   /// Puts git's band-3 words for a pack that could not be finished after what is framed, or, with no band to say them
   /// on, nothing, so the pack stops short: the response ends there, refused with `refusal`.
   fn abort(&mut self, refusal: Refusal) -> Result<(), Refusal> {
-    if !matches!(self.framing, Framing::Raw) {
+    if self.framing.is_banded() {
       sideband::write(Band::Error, ABORT, &mut self.framed);
     }
     self.closed = true;
     Err(refusal)
   }
+}
+
+/// The line git's `vfreportf` writes for `words` after `prefix`: the words cut to what its buffer holds, each control
+/// byte but a tab and a newline shown as `?`, and a newline last.
+fn reported(prefix: &[u8], words: &[u8]) -> Vec<u8> {
+  let most = REPORTED
+    .saturating_sub(prefix.len())
+    .saturating_sub(NEWLINE.len());
+  let kept = words.get(..most).unwrap_or(words);
+  let mut line = Vec::with_capacity(
+    prefix
+      .len()
+      .saturating_add(kept.len())
+      .saturating_add(NEWLINE.len()),
+  );
+  line.extend_from_slice(prefix);
+  line.extend(
+    kept
+      .iter()
+      .map(|byte| if shown_as_is(*byte) { *byte } else { SHOWN }),
+  );
+  line.extend_from_slice(NEWLINE);
+  line
+}
+
+/// Whether git's report shows `byte` as it is: any byte but a control byte (git's `iscntrl`: below a space, and DEL),
+/// a tab and a newline excepted.
+fn shown_as_is(byte: u8) -> bool {
+  !byte.is_ascii_control() || KEPT_CONTROLS.contains(&byte)
 }
 
 /// Puts the bytes of `bytes` from `from` on into `out`, at most `room` of them: how many it put.
