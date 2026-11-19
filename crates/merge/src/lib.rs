@@ -52,7 +52,7 @@ pub mod verdict;
 pub use derive::{ContentOp, compose_content, compose_content_sized};
 pub use engine::{
   ComputeRefused, Computed, ConflictWindow, Green, HeadMoved, Increment, Judged, Judgment, Outcome,
-  ReanchorRefused, Reanchored,
+  PositionRefused, ReanchorRefused, Reanchored,
 };
 pub use increment::{Base, DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};
