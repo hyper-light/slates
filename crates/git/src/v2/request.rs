@@ -22,7 +22,7 @@
 //! A server reads a request as it arrives: [`whole_len`] says when the bytes so far hold a whole one, since the first
 //! flush always ends a request. Nothing caps a request's size but its bytes and the caller's admission.
 
-use super::line::{self, Ending, Line, Packets, Part};
+use super::line::{self, Line, Packets, Part};
 use super::{Capability, Refusal, advertisement, fetch, ls_refs};
 use crate::object_name::ObjectFormat;
 use crate::out::{Measure, Out};

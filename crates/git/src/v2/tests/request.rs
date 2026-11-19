@@ -491,15 +491,13 @@ fn each_argument_value_is_read_within_gits_range_and_refused_past_it() {
       Packet::Flush,
     ]);
     decode(&stream, &mut room()).map(|request| match request {
-      Request::Command(request) => fetch_arguments(&request).first().copied(),
-      Request::End => None,
+      Request::Command(request) => format!("{:?}", fetch_arguments(&request).first()),
+      Request::End => String::new(),
     })
   };
-  assert_eq!(one(b"deepen 1"), Ok(Some(F::Deepen(1))));
-  assert_eq!(
-    one(b"deepen 2147483647"),
-    Ok(Some(F::Deepen(2_147_483_647)))
-  );
+  let read = |argument: F<'_>| Ok(format!("{:?}", Some(argument)));
+  assert_eq!(one(b"deepen 1"), read(F::Deepen(1)));
+  assert_eq!(one(b"deepen 2147483647"), read(F::Deepen(2_147_483_647)));
   for refused in [
     &b"deepen 0"[..],
     b"deepen -1",
@@ -515,10 +513,10 @@ fn each_argument_value_is_read_within_gits_range_and_refused_past_it() {
   ] {
     assert_eq!(one(refused), Err(Refusal::Number { at: 22 }), "{refused:?}");
   }
-  assert_eq!(one(b"deepen-since 0"), Ok(Some(F::DeepenSince(0))));
+  assert_eq!(one(b"deepen-since 0"), read(F::DeepenSince(0)));
   assert_eq!(
     one(b"deepen-since 18446744073709551614"),
-    Ok(Some(F::DeepenSince(u64::MAX - 1)))
+    read(F::DeepenSince(u64::MAX - 1))
   );
   for empty in [&b"filter "[..], b"deepen-not ", b"packfile-uris "] {
     assert_eq!(one(empty), Err(Refusal::EmptyValue { at: 22 }), "{empty:?}");
