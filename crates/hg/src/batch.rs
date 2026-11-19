@@ -1,5 +1,5 @@
 //! `batch`, several commands in one request (A-569; `wireprotov1server.py` `batch`, `wireprototypes.py`
-//! `escapebatcharg` and `unescapebatcharg`, `wireprotov1peer.py` `encodebatchcmds` [C]).
+//! `escapebatcharg` and `unescapebatcharg`, `wireprotov1peer.py` `encodebatchcmds` \[C\]).
 //!
 //! The `cmds` argument lists the calls: `;` between calls, a space between a call's command and its arguments, `,`
 //! between arguments, `=` between an argument's name and its value. Names and values escape the four separators, `:`

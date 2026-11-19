@@ -8,14 +8,15 @@
 //! the deltas inside them ([`delta`]), and the part payloads a push and a pull carry ([`phases`], [`bookmarks`],
 //! [`heads`], [`obsmarkers`], [`pushkey`]; A-545), and the wire protocol's version 1 framings both transports use
 //! ([`ssh`], [`http`], their arguments [`wire`], the [`capabilities`] and [`batch`]; A-569), and the objects a
-//! repository holds with their nodes ([`changeset`], [`manifest`], [`filerev`], [`node`]; A-588), byte for byte as
-//! Mercurial 7.2 writes them, and nothing more: it keeps no index (piece 3's next part), handles no part (piece 5),
-//! and serves no command (piece 4). A bundle compressed with `GZ`, `BZ` or `ZS` is made plain by [`compression`]
-//! (A-598): its zlib, bzip2 or zstd stream inflated within the caller's admission, a compression bomb refused by kind;
-//! and a plain bundle is compressed as 7.2 compresses one.
+//! repository holds with their nodes ([`changeset`], [`manifest`], [`filerev`], [`node`]; A-588), and the revlogs an
+//! existing store keeps them in ([`revlog`]; A-611: their zlib and zstd chunks inflated through A-607's engines), byte
+//! for byte as Mercurial 7.2 writes them, and nothing more: it keeps no index (piece 3's next part), handles no part
+//! (piece 5), and serves no command (piece 4). A bundle compressed with `GZ`, `BZ` or `ZS` is made plain by
+//! [`compression`] (A-598): its zlib, bzip2 or zstd stream inflated within the caller's admission, a compression bomb
+//! refused by kind; and a plain bundle is compressed as 7.2 compresses one.
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
-//! `internals.bundle2`, `internals.bundles` and `internals.changegroups` [B], and its code [C], which is what clients
+//! `internals.bundle2`, `internals.bundles` and `internals.changegroups` \[B\], and its code \[C\], which is what clients
 //! run and is followed where the two disagree: `bundle2.py` (every size a signed 32-bit integer; a part type of
 //! `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter; the interrupt), `changegroup.py` (the delta headers
 //! of versions `01` to `05`; a chunk length of 1 to 4 refused as a negative one is; the tree-manifest list every
@@ -86,6 +87,7 @@ pub mod phases;
 pub mod pushkey;
 mod quote;
 mod read;
+pub mod revlog;
 pub mod ssh;
 pub mod wire;
 
@@ -129,3 +131,7 @@ mod wire_tests;
 #[cfg(test)]
 #[path = "tests/objects.rs"]
 mod object_tests;
+
+#[cfg(test)]
+#[path = "tests/revlogs.rs"]
+mod revlog_tests;

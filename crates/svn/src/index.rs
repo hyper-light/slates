@@ -87,7 +87,7 @@ const ROOT: &str = "/";
 const SEPARATOR: char = '/';
 
 /// The name that means the directory itself, which no stored path holds.
-/// Format: `svn_fs__path_valid` refuses "'.' or '..' element[s]" (`libsvn_fs/fs-loader.c`).
+/// Format: `svn_fs__path_valid` refuses "'.' or '..' element\[s\]" (`libsvn_fs/fs-loader.c`).
 const CURRENT_DIRECTORY: &str = ".";
 
 /// The name that means the parent directory, which no stored path holds.
@@ -102,7 +102,7 @@ const FORBIDDEN_IN_NAMES: [char; 2] = ['\n', '\0'];
 /// The bytes besides ASCII letters and digits a transaction's name may hold.
 /// Format: "Transaction names are guaranteed to contain only letters (upper- and lower-case), digits, `-', and `.'"
 /// (`svn_fs.h`; research notes §5).
-const TRANSACTION_NAME_PUNCTUATION: [u8; 2] = [b'-', b'.'];
+const TRANSACTION_NAME_PUNCTUATION: [u8; 2] = *b"-.";
 
 /// The node identity of the root directory, the same in every revision.
 /// Format: FSFS's root node id `0` (`structure`, "Node-revision IDs"; `svn_fs_fs__id_part_is_root`).

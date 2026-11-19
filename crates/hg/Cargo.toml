@@ -10,7 +10,8 @@ description = "Mercurial's exchange formats and objects (§4.17.3, A-514, A-545,
 
 [dependencies]
 # The engines of compressed bundles (A-598; D-17): zlib through the workspace's flate2, whose backend the workspace
-# chose by measurement (A-607); bzip2 on its pure-Rust libbz2-rs-sys; zstd the workspace's (libzstd 1.5.7).
+# chose by measurement (A-607); bzip2 on its pure-Rust libbz2-rs-sys; zstd the workspace's (libzstd 1.5.7). zlib and
+# zstd also inflate a revlog's chunks (A-611).
 bzip2 = { workspace = true }
 flate2 = { workspace = true }
 zstd = { workspace = true }

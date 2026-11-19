@@ -275,6 +275,14 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     }),
     DbError::CheckFailed { index } => database(DatabaseRefusal::CheckFailed { index: *index }),
     DbError::StateChanged { index } => database(DatabaseRefusal::StateChanged { index: *index }),
+    // A repository's policy set from a version it has moved past, or one its repository cannot hold (A-622).
+    DbError::PolicyChanged { current } => Refusal::PolicyChanged { current: *current },
+    DbError::PolicyRuleMalformed { index } => {
+      database(DatabaseRefusal::PolicyRuleMalformed { index: *index })
+    }
+    DbError::PolicyHookMalformed { index } => {
+      database(DatabaseRefusal::PolicyHookMalformed { index: *index })
+    }
   }
 }
 

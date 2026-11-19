@@ -2,8 +2,8 @@
 //! each entry inflated to exactly the size its header names, each delta resolved against its base through the applier,
 //! every object named, and the trailer checked.
 //!
-//! **Sources** (read 2026-11-19, git v2.50.1). The document [B]: `gitformat-pack.adoc`, a pack's header, entries and
-//! trailer (lines 35-68) and its deltas (95-175). The code [C], which git's receive-pack runs on every push and which
+//! **Sources** (read 2026-11-19, git v2.50.1). The document \[B\]: `gitformat-pack.adoc`, a pack's header, entries and
+//! trailer (lines 35-68) and its deltas (95-175). The code \[C\], which git's receive-pack runs on every push and which
 //! is followed where the document leaves room: `builtin/index-pack.c`,
 //! - `parse_pack_header`, the header;
 //! - `unpack_entry_data` (476-518), each entry inflated into a buffer of exactly its size, refused unless the stream

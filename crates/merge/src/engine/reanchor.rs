@@ -94,9 +94,16 @@ impl Green {
     if from < floor {
       return Err(ReanchorRefused::Folded { floor });
     }
-    let Some(history) = self.content_history.get(path) else {
-      // A path with no history has held the head's bytes since version 0 (the one history rule, A-534): nothing
-      // changed it, so the lines stand where they stood.
+    // A path holding what a copy gave it reads, from the copy's version on, as a path with no history (A-586): its own
+    // history, if any, ends before the copy.
+    let history = self.content_history.get(path).filter(|history| {
+      self
+        .covered_since(path, super::last_version(Some(*history)))
+        .is_none_or(|since| from < since)
+    });
+    let Some(history) = history else {
+      // A path with no history has held the head's bytes since version 0 (the one history rule, A-534), or since its
+      // copy (A-586): nothing changed it, so the lines stand where they stood.
       let lines = self
         .content
         .get(path)

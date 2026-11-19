@@ -129,6 +129,26 @@ pub enum DbError {
   /// A review record's change the review rules refuse (§4.17.1 shared piece 6, A-596), by the rule
   /// (`crate::review`). Never entered in the log.
   Review(ReviewRefusal),
+  /// A repository policy's setting named a version its policy has moved past, or a repository created already holding a
+  /// policy, which only its own setting gives (A-622). Read the policy again and set it from there. Never entered in the
+  /// log.
+  PolicyChanged {
+    /// The policy's version now.
+    current: u64,
+  },
+  /// A repository policy's rule the log must never record (A-622): its pattern names what the repository's tool does
+  /// not have, is empty, holds a NUL, or is a Subversion path not from the root. Never entered in the log.
+  PolicyRuleMalformed {
+    /// The rule's index among the policy's rules.
+    index: u32,
+  },
+  /// A repository policy's hook the log must never record (A-622): at another tool's point, named other than its point
+  /// allows or named twice there, or running a program that is not an absolute path or holds a NUL. Never entered in
+  /// the log.
+  PolicyHookMalformed {
+    /// The hook's index among the policy's hooks.
+    index: u32,
+  },
 }
 
 /// The rule a review record's change broke (§4.17.1 "Works over works", shared piece 6; A-596; `crate::review`).
@@ -223,6 +243,16 @@ impl fmt::Display for DbError {
         f,
         "a register entry's state change {index} was made against another state"
       ),
+      Self::PolicyChanged { current } => write!(
+        f,
+        "a repository policy set from a version it has moved past (version {current} now)"
+      ),
+      Self::PolicyRuleMalformed { index } => {
+        write!(f, "a repository policy's rule {index} is malformed")
+      }
+      Self::PolicyHookMalformed { index } => {
+        write!(f, "a repository policy's hook {index} is malformed")
+      }
     }
   }
 }

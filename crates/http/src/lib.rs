@@ -36,8 +36,8 @@
 //! half-close, then the client's bytes drained) to the edge that writes sockets. Moving the MCP edge onto this crate is
 //! owed (GAPS, the §4.17 entry).
 //!
-//! **Sources** (read 2026-11-19): RFC 9110 and RFC 9112 [B]; RFC 1952 (gzip) and RFC 3986 (URIs) [B]; git's
-//! `http-backend.c` and `remote-curl.c` [C], the server and the client this crate is first proven against (`slates-git`'s
+//! **Sources** (read 2026-11-19): RFC 9110 and RFC 9112 \[B\]; RFC 1952 (gzip) and RFC 3986 (URIs) \[B\]; git's
+//! `http-backend.c` and `remote-curl.c` \[C\], the server and the client this crate is first proven against (`slates-git`'s
 //! golden vectors, stock git's own HTTP traffic).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt;

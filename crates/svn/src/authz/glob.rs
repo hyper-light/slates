@@ -41,7 +41,7 @@ const BRACKET_CLOSE: u8 = b']';
 
 /// The bytes that negate a bracket expression right after its `[`.
 /// Format: `negate = ((**pattern == '!') || (**pattern == '^'))` (`apr_fnmatch.c` 68).
-const NEGATIONS: [u8; 2] = [b'!', b'^'];
+const NEGATIONS: [u8; 2] = *b"!^";
 
 /// The byte between a range's ends in a bracket expression.
 /// Format: `((*pattern)[1] == '-')` (`apr_fnmatch.c` 98).
@@ -90,7 +90,7 @@ pub(super) enum Segment {
 ///
 /// # Errors
 /// [`AuthzRefusal::RulePathEmptySegment`] for two slashes in a row or a trailing slash (the module documentation of
-/// `authz`, item 4: two slashes at the start too), [`AuthzRefusal::RulePathDot`] and [`AuthzRefusal::RulePathDotDot`].
+/// `authz`, item 3: two slashes at the start too), [`AuthzRefusal::RulePathDot`] and [`AuthzRefusal::RulePathDotDot`].
 pub(super) fn rule_path(path: &[u8], glob: bool) -> Result<Vec<Segment>, AuthzRefusal> {
   let after_root = path.get(1..).unwrap_or_default();
   let mut segments = Vec::new();
@@ -409,6 +409,7 @@ fn bracket_member(pattern: &[u8], p: usize, member: u8, byte: u8) -> Option<(usi
   let dash = at(p.saturating_add(1)) == Some(RANGE);
   let after_dash = at(p.saturating_add(2));
   if dash && after_dash != Some(BRACKET_CLOSE) {
+    // Format: a range's end escaped by a backslash takes three bytes past the start, a plain one two.
     let skip = if after_dash == Some(BACKSLASH) { 3 } else { 2 };
     let end_at = p.saturating_add(skip);
     let last = at(end_at)?;

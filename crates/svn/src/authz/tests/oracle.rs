@@ -513,12 +513,19 @@ fn accumulate(pairs: &[(&str, Access)], asked: &str) -> (Rights, bool) {
   )
 }
 
-/// What each section (and the root's default) gives the anonymous user, every authenticated user, and through its
+/// What one section (or the root's default) gives the anonymous user, every authenticated user, and through its
 /// inverted entries, as `add_access_entry` accumulates them.
-fn token_access(
-  model: &Model,
-) -> Vec<(&'static str, Option<Access>, Option<Access>, Option<Access>)> {
-  let mut sections: Vec<(&'static str, Option<Access>, Option<Access>, Option<Access>)> = model
+#[derive(Clone, Copy, Debug)]
+struct TokenRow {
+  repository: &'static str,
+  anonymous: Option<Access>,
+  authenticated: Option<Access>,
+  inverted: Option<Access>,
+}
+
+/// Every section's [`TokenRow`], and the root's default when the set has no global root.
+fn token_access(model: &Model) -> Vec<TokenRow> {
+  let mut sections: Vec<TokenRow> = model
     .sections
     .iter()
     .map(|section| {
@@ -546,25 +553,28 @@ fn token_access(
         entry.inverted && matches!(entry.who, Who::User(_) | Who::Group(_) | Who::Alias(_))
       });
       let global_root = section.repository.is_empty() && section.segments().is_empty();
-      if global_root {
-        (
-          section.repository,
-          Some(anonymous.unwrap_or(Access::None)),
-          Some(authenticated.unwrap_or(Access::None)),
-          inverted,
-        )
-      } else {
-        (section.repository, anonymous, authenticated, inverted)
+      let forced = |access: Option<Access>| {
+        if global_root {
+          Some(access.unwrap_or(Access::None))
+        } else {
+          access
+        }
+      };
+      TokenRow {
+        repository: section.repository,
+        anonymous: forced(anonymous),
+        authenticated: forced(authenticated),
+        inverted,
       }
     })
     .collect();
   if !model.has_global_root() {
-    sections.push((
-      "",
-      Some(Access::None),
-      Some(Access::None),
-      Some(Access::None),
-    ));
+    sections.push(TokenRow {
+      repository: "",
+      anonymous: Some(Access::None),
+      authenticated: Some(Access::None),
+      inverted: Some(Access::None),
+    });
   }
   sections
 }
@@ -572,16 +582,14 @@ fn token_access(
 /// `svn_authz__get_global_rights` transcribed over the generated set.
 fn oracle_global(model: &Model, repository: &str, principal: Option<&str>) -> GlobalRights {
   let tokens = token_access(model);
-  let column = |pick: fn(
-    &(&'static str, Option<Access>, Option<Access>, Option<Access>),
-  ) -> Option<Access>| {
+  let column = |pick: fn(&TokenRow) -> Option<Access>| {
     tokens
       .iter()
-      .filter_map(|row| pick(row).map(|access| (row.0, access)))
+      .filter_map(|row| pick(row).map(|access| (row.repository, access)))
       .collect::<Vec<_>>()
   };
   let (rights, explicit) = match principal {
-    None => accumulate(&column(|row| row.1), repository),
+    None => accumulate(&column(|row| row.anonymous), repository),
     Some(user) => {
       let own = if model.known(user) {
         let mut pairs: Vec<(&str, Access)> = (0..model.sections.len())
@@ -595,12 +603,12 @@ fn oracle_global(model: &Model, repository: &str, principal: Option<&str>) -> Gl
           pairs.push(("", Access::None));
         }
         Some(accumulate(&pairs, repository))
-      } else if tokens.iter().any(|row| row.3.is_some()) {
-        Some(accumulate(&column(|row| row.3), repository))
+      } else if tokens.iter().any(|row| row.inverted.is_some()) {
+        Some(accumulate(&column(|row| row.inverted), repository))
       } else {
         None
       };
-      let (everyone, everyone_explicit) = accumulate(&column(|row| row.2), repository);
+      let (everyone, everyone_explicit) = accumulate(&column(|row| row.authenticated), repository);
       match own {
         Some((own, own_explicit)) => (
           Rights {
@@ -705,38 +713,55 @@ fn agrees(model: &Model) -> Result<(), TestCaseError> {
   Ok(())
 }
 
-/// A generated piece of a rule path.
+/// The pieces a rule path is made of.
+const PIECES: [Piece; 10] = [
+  Piece::Name("a"),
+  Piece::Name("b"),
+  Piece::Name("ab"),
+  Piece::One,
+  Piece::Many,
+  Piece::Prefix,
+  Piece::Suffix,
+  Piece::Pattern("?"),
+  Piece::Pattern("a?"),
+  Piece::Pattern("*a*"),
+];
+
+/// The repositories a section may name.
+const SECTION_REPOSITORIES: [&str; 3] = ["", "R1", "R2"];
+
+/// The separators an option may be written with.
+const SEPARATORS: [&str; 4] = [" = ", "=", ": ", " : "];
+
+/// A generated piece of a rule path, chosen by index: a plain strategy, nothing `Arc`-backed (R2).
 fn piece() -> impl Strategy<Value = Piece> {
-  prop_oneof![
-    Just(Piece::Name("a")),
-    Just(Piece::Name("b")),
-    Just(Piece::Name("ab")),
-    Just(Piece::One),
-    Just(Piece::Many),
-    Just(Piece::Prefix),
-    Just(Piece::Suffix),
-    Just(Piece::Pattern("?")),
-    Just(Piece::Pattern("a?")),
-    Just(Piece::Pattern("*a*")),
-  ]
+  (0..PIECES.len()).prop_map(|at| PIECES[at])
 }
 
 /// A generated access.
 fn access() -> impl Strategy<Value = Access> {
-  prop_oneof![Just(Access::None), Just(Access::Read), Just(Access::Write)]
+  (0u8..3).prop_map(|at| match at {
+    0 => Access::None,
+    1 => Access::Read,
+    _ => Access::Write,
+  })
+}
+
+/// Whom a generated entry names, from a plain tuple.
+fn who() -> impl Strategy<Value = Who> {
+  (0u8..6, 0..USERS.len(), 0..3usize, 0..2usize).prop_map(|(kind, user, group, alias)| match kind {
+    0 => Who::User(user),
+    1 => Who::Group(group),
+    2 => Who::Alias(alias),
+    3 => Who::Everyone,
+    4 => Who::Anonymous,
+    _ => Who::Authenticated,
+  })
 }
 
 /// A generated entry (`~*` never: it is refused).
 fn entry() -> impl Strategy<Value = Entry> {
-  let who = prop_oneof![
-    (0..USERS.len()).prop_map(Who::User),
-    (0..3usize).prop_map(Who::Group),
-    (0..2usize).prop_map(Who::Alias),
-    Just(Who::Everyone),
-    Just(Who::Anonymous),
-    Just(Who::Authenticated),
-  ];
-  (any::<bool>(), who, access()).prop_map(|(inverted, who, access)| Entry {
+  (any::<bool>(), who(), access()).prop_map(|(inverted, who, access)| Entry {
     inverted: inverted && !matches!(who, Who::Everyone),
     who,
     access,
@@ -746,32 +771,32 @@ fn entry() -> impl Strategy<Value = Entry> {
 /// A generated section.
 fn section() -> impl Strategy<Value = Section> {
   (
-    prop_oneof![Just(""), Just("R1"), Just("R2")],
+    0..SECTION_REPOSITORIES.len(),
     any::<bool>(),
     vec(piece(), 0..=3),
     vec(entry(), 0..=4),
   )
     .prop_map(|(repository, glob, pieces, entries)| Section {
-      repository,
+      repository: SECTION_REPOSITORIES[repository],
       glob,
       pieces,
       entries,
     })
 }
 
-/// A generated member.
+/// A generated member, from a plain tuple.
 fn member() -> impl Strategy<Value = Member> {
-  prop_oneof![
-    (0..USERS.len()).prop_map(Member::User),
-    (0..2usize).prop_map(Member::Alias),
-    (0..3usize).prop_map(Member::Group),
-  ]
+  (0u8..3, 0..USERS.len(), 0..2usize, 0..3usize).prop_map(|(kind, user, alias, group)| match kind {
+    0 => Member::User(user),
+    1 => Member::Alias(alias),
+    _ => Member::Group(group),
+  })
 }
 
 /// A generated style.
 fn style() -> impl Strategy<Value = Style> {
   (
-    prop_oneof![Just(" = "), Just("="), Just(": "), Just(" : ")],
+    0..SEPARATORS.len(),
     any::<bool>(),
     any::<bool>(),
     any::<bool>(),
@@ -779,7 +804,7 @@ fn style() -> impl Strategy<Value = Style> {
   )
     .prop_map(
       |(separator, crlf, byte_order_mark, continuation, comments)| Style {
-        separator,
+        separator: SEPARATORS[separator],
         crlf,
         byte_order_mark,
         continuation,
