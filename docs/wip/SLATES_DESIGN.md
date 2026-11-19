@@ -44378,6 +44378,13 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
 - **v0's ref names** (main's ask, after A-615's finding): an advertised ref is `HEAD`, `receive-pack`'s `.have`, or a
   name `refname::is_valid` takes, read and written. It was any word. The word check stays first, so a bad byte is
   still placed exactly.
+- **The pack from A-639's stream** (`upload/fragments.rs`, after A-639 landed). `Fragments` is the service's pack
+  source over `store::Upload`. The plan is copied as A-639's `Answered`: runs, single objects, the filter for the
+  runs, `thin-pack` and `ofs-delta`, each list charged first. Each call takes one turn of the stream on the owner's
+  clock, exchange and quantum, and hands out at most the answer's room of what it wrote. A turn may write nothing yet,
+  as the stream counts the pack before its header. The answer then ends its step and asks again at the next, so a step
+  does at most one turn's work, and the earlier "stalled" refusal is gone: a source's contract is to bring the pack
+  nearer its end each call, which A-639's turns do, each doing at least one unit of a finite stream.
 - **Stateless only.** Over SSH a v0 client speaks in rounds on one stream and the server keeps what each round taught
   it; that is owed. git's client speaks v2 over SSH since 2.26, and v2 is stateless by design.
 - **Tests** (`src/upload/tests/v0.rs`, 8; the v0 repository rebuilt from the pack git sent its clone):
@@ -44392,6 +44399,10 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
   - refusals: a capability not advertised, SHA-256, a have before the flush, bytes after `done`, no flush;
   - every cut and every bit flip of git's `detailed-done` request.
   In A-604's tests, a test of the ref-name rule; its generator now draws valid names.
+  With A-639 (`src/upload/tests/fragments.rs`): git's five v2 fetches answered from A-639's packs, read back through
+  A-608's reader, every packet but the pack's data git's and the objects git's; and turns of one tick in steps of one
+  byte, the answer the same and steps that wrote nothing met. A source that pauses every other call answers whole
+  (`refused.rs`). JOIN-CHECKS-PENDING (the Studio was offline when the join was written).
 - **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 424 of 424 (2 of main's ignored),
   `cargo fmt --check` clean with rustfmt's layout taken from the Studio. Failing first, the first run failed 3:
   - A-604's property test, drawing ref names as words;
