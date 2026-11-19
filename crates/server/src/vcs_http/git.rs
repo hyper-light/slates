@@ -6,12 +6,13 @@
 //! **The order**, each refusal with its status and the three cache fields `http-backend` sends on every answer:
 //! 1. The route. A path, method, service or content type `http-backend` refuses is refused as it refuses it, whoever
 //!    asks: its syntax names no repository, so a client learns its mistake without credentials.
-//! 2. The credentials. None, another scheme, Basic in cleartext, or a credential that proves no principal (none held
-//!    under its hash, past its expiry, a revoked consumer's, an SSH key's) is `401` with the challenges the connection
-//!    accepts (RFC 9110 §11.6.1: "A server generating a 401 (Unauthorized) response MUST send a WWW-Authenticate header
-//!    field containing at least one challenge"; Basic over TLS alone, RFC 7617 §4); a repeated or malformed
-//!    `Authorization` is `400`; a credential record that did not answer is `503`. Nothing about a repository is answered
-//!    to a client that has proved no one. The proof is the credential record's (`crate::credentials`, A-625 part 3).
+//! 2. The credentials. None, another scheme, or a credential that proves no principal (none held under its hash, past
+//!    its expiry, a revoked consumer's, an SSH key's) is `401` with the edge's challenges, Basic's first and then
+//!    Bearer's, on every connection (RFC 9110 §11.6.1: "A server generating a 401 (Unauthorized) response MUST send a
+//!    WWW-Authenticate header field containing at least one challenge"; A-686: Basic is taken on the loopback cleartext
+//!    edge as over TLS, `slates_http_edge::credential`'s module doc); a repeated or malformed `Authorization` is `400`;
+//!    a credential record that did not answer is `503`. Nothing about a repository is answered to a client that has
+//!    proved no one. The proof is the credential record's (`crate::credentials`, A-625 part 3).
 //! 3. The repository. A name another shard's partition holds moves the connection there whole, its head undecided, and
 //!    the head is decided again where the repository lives ([`Answer::Move`]; main's ruling, 2026-11-19, as the NFS
 //!    export moves a mount's connection, §4.6), so its every step lends the store on its own shard. There, none of that
@@ -111,8 +112,6 @@ pub(crate) trait Repositories {
 pub(crate) enum Refused {
   /// No credentials, or a scheme other than Basic and Bearer: `401`.
   NoCredentials,
-  /// Basic on a cleartext connection (RFC 7617 §4): `401`, its challenges offering Bearer alone.
-  CleartextBasic,
   /// An `Authorization` field repeated or broken: `400`.
   MalformedCredentials,
   /// A credential that proved no one: `401`, or `503` when its record did not answer.
@@ -134,7 +133,6 @@ impl Refused {
   pub(crate) fn status(self) -> Status {
     match self {
       Refused::NoCredentials
-      | Refused::CleartextBasic
       | Refused::Unproven(
         Unproven::Unknown | Unproven::Expired | Unproven::Revoked | Unproven::NotAToken,
       ) => Status::UNAUTHORIZED,
@@ -150,7 +148,6 @@ impl Refused {
   pub(crate) fn counter(self) -> &'static str {
     match self {
       Refused::NoCredentials => "vcs_http.git.no_credentials",
-      Refused::CleartextBasic => "vcs_http.git.cleartext_basic",
       Refused::MalformedCredentials => "vcs_http.git.malformed_credentials",
       Refused::Unproven(Unproven::Unknown) => "vcs_http.git.unknown_credential",
       Refused::Unproven(Unproven::Expired) => "vcs_http.git.expired_credential",
@@ -414,13 +411,9 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
     }
   }
 
-  /// The answer to `head`, on a connection that is TLS when `secure`, in the module doc's order: refused by kind, moved to
-  /// the shard its repository lives on, or served.
-  pub(crate) async fn answer(
-    &mut self,
-    head: &Head<'_>,
-    secure: bool,
-  ) -> Decided<GitExchange<S::Exchange>> {
+  /// The answer to `head`, on any connection, in the module doc's order: refused by kind, moved to the shard its
+  /// repository lives on, or served.
+  pub(crate) async fn answer(&mut self, head: &Head<'_>) -> Decided<GitExchange<S::Exchange>> {
     let route = match http::route(head, &mut Admission::new(self.room)) {
       Ok(route) => route,
       Err(refused) => {
@@ -428,9 +421,9 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
         return refused_with(status, owned(&fields), false);
       }
     };
-    let proven = match self.proof(head, secure).await {
+    let proven = match self.proof(head).await {
       Ok(proven) => proven,
-      Err(refused) => return self.refuse(refused, secure, false),
+      Err(refused) => return self.refuse(refused, false),
     };
     let asked = Asked::of(route);
     if let Located::Elsewhere(shard) = self.repositories.locate(&asked.repository) {
@@ -444,22 +437,21 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
       .find(&asked.repository)
       .filter(|repository| repository.tool == VcsTool::Git)
     else {
-      return self.refuse(Refused::NoRepository, secure, true);
+      return self.refuse(Refused::NoRepository, true);
     };
     match vcs_policy::reaches(&repository, &proven.principal, rights(asked.service)) {
-      Ok(true) => self.start(&asked, &repository, &proven.principal, secure),
-      Ok(false) => self.refuse(Refused::Forbidden, secure, true),
+      Ok(true) => self.start(&asked, &repository, &proven.principal),
+      Ok(false) => self.refuse(Refused::Forbidden, true),
       // A policy its tool cannot read is a damaged record (A-622's guard keeps such rules out): never judged without it.
-      Err(_) => self.refuse(Refused::Unreadable, secure, true),
+      Err(_) => self.refuse(Refused::Unreadable, true),
     }
   }
 
   /// What `head`'s credentials prove, or why they prove no one.
-  async fn proof(&self, head: &Head<'_>, secure: bool) -> Result<Proven, Refused> {
-    let credential = match credential::credential(head, secure) {
+  async fn proof(&self, head: &Head<'_>) -> Result<Proven, Refused> {
+    let credential = match credential::credential(head) {
       Ok(Some(credential)) => credential,
       Ok(None) | Err(CredentialRefused::UnknownScheme) => return Err(Refused::NoCredentials),
-      Err(CredentialRefused::BasicInCleartext) => return Err(Refused::CleartextBasic),
       Err(CredentialRefused::Repeated | CredentialRefused::Malformed) => {
         return Err(Refused::MalformedCredentials);
       }
@@ -471,25 +463,20 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
       .map_err(Refused::Unproven)
   }
 
-  /// `refused`'s answer, counted under its kind: `401` with the challenges a connection that is TLS when `secure`
-  /// accepts, any other status with the cache fields. `proven` when the credentials proved a principal.
-  fn refuse(
-    &self,
-    refused: Refused,
-    secure: bool,
-    proven: bool,
-  ) -> Decided<GitExchange<S::Exchange>> {
+  /// `refused`'s answer, counted under its kind: `401` with the challenges, any other status with the cache fields.
+  /// `proven` when the credentials proved a principal.
+  fn refuse(&self, refused: Refused, proven: bool) -> Decided<GitExchange<S::Exchange>> {
     crate::fleet::count_refusal(refused.counter());
     let status = refused.status();
     if status == Status::UNAUTHORIZED {
-      return self.unauthorized(secure);
+      return self.unauthorized();
     }
     refused_with(status, cache_fields(), proven)
   }
 
-  /// `401` with the challenges a connection that is TLS when `secure` accepts, then the cache fields.
-  fn unauthorized(&self, secure: bool) -> Decided<GitExchange<S::Exchange>> {
-    let Ok(challenges) = credential::challenges(&self.realm, secure) else {
+  /// `401` with the challenges, Basic's first and then Bearer's, then the cache fields.
+  fn unauthorized(&self) -> Decided<GitExchange<S::Exchange>> {
+    let Ok(challenges) = credential::challenges(&self.realm) else {
       // A realm a challenge cannot carry is the operator's misconfiguration, never the client's.
       return refused_with(Status::INTERNAL_SERVER_ERROR, cache_fields(), false);
     };
@@ -508,7 +495,6 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
     asked: &Asked,
     repository: &RepositoryRecord,
     principal: &Principal,
-    secure: bool,
   ) -> Decided<GitExchange<S::Exchange>> {
     let start = Start {
       repository,
@@ -519,12 +505,12 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
     };
     let service = match self.services.start(&start) {
       Ok(service) => service,
-      Err(refused) => return self.refuse(refused.kind(), secure, true),
+      Err(refused) => return self.refuse(refused.kind(), true),
     };
     let mut prelude = Vec::new();
     let reply = if asked.advertise {
       if http::advertisement_prelude(asked.service, asked.version, &mut prelude).is_err() {
-        return self.refuse(Refused::Unwritable, secure, true);
+        return self.refuse(Refused::Unwritable, true);
       }
       Reply::Advertisement(asked.service)
     } else {
@@ -544,8 +530,9 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
 impl<A: Authenticator, R: Repositories, S: GitServices> Site for GitSite<A, R, S> {
   type Exchange = GitExchange<S::Exchange>;
 
-  async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
-    self.answer(head, secure).await
+  /// The site's answer, whatever the connection: no step of it reads whether the connection is TLS (A-686).
+  async fn decide(&mut self, head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
+    self.answer(head).await
   }
 }
 

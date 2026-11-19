@@ -1,19 +1,26 @@
 //! A request's credentials and the challenges a 401 carries (RFC 9110 §11.6; §4.17.2 "Access": "HTTP: Basic with a
-//! token as the password, or a bearer token, over TLS").
+//! token as the password, or a bearer token", over TLS or on a loopback edge in cleartext).
 //!
 //! **Read** ([`credential`]): the one `Authorization` line a request carries, or none. `Basic` (RFC 7617 §2) is a user
 //! id and a password joined by the first colon, in base64 (RFC 4648 §4) read strictly: whole quanta, padding at the end
 //! alone, no bits past the last byte, so one text names one credential. `Bearer` (RFC 6750 §2.1) is a `b64token`. The
-//! scheme is compared without regard to case (RFC 9110 §11.1). Basic is refused on a connection that is not TLS (RFC
-//! 7617 §4: "the Basic authentication scheme is not a secure method of user authentication"), Bearer accepted there only
-//! because a cleartext listener is a loopback one.
+//! scheme is compared without regard to case (RFC 9110 §11.1). Both are read on every connection: the server serves an
+//! edge in cleartext on a loopback listener alone (`slates-server`'s `vcs_http::serve`), so neither Basic's password
+//! nor a bearer token crosses a network in the clear (RFC 7617 §4: "the Basic authentication scheme is not a secure
+//! method of user authentication"; RFC 6750 §5.3), and on loopback the two carry the same token (main's ruling,
+//! 2026-11-19, A-686: stock Mercurial and Subversion send Basic and no Bearer, so a lone anchor's edge, which is
+//! cleartext, took no credential of theirs).
 //!
 //! **What they prove** is the site's to decide: its authenticator maps a credential to a principal of §4.13 and its
 //! policy decides what that principal may do (§4.17.1). This module reads the bytes and offers the challenges
-//! ([`challenges`]): Basic with its charset (RFC 7617 §2.1) over TLS alone, and Bearer (RFC 6750 §3), each naming the
-//! realm, as "A server generating a 401 (Unauthorized) response MUST send a WWW-Authenticate header field containing at
-//! least one challenge" (RFC 9110 §11.6.1). A secret is compared in time independent of where it differs
-//! ([`same_secret`]).
+//! ([`challenges`]): Basic with its charset (RFC 7617 §2.1) first, then Bearer (RFC 6750 §3), each naming the realm, as
+//! "A server generating a 401 (Unauthorized) response MUST send a WWW-Authenticate header field containing at least one
+//! challenge" (RFC 9110 §11.6.1). Basic leads because a client may read the first challenge alone: stock Mercurial
+//! 7.2's opener hands a 401 to urllib's digest handler before its Basic one (`handler_order` 490 against 500), and that
+//! handler reads the first `WWW-Authenticate` field alone and raises on any scheme but Digest and Basic (Python
+//! 3.12.16's `urllib/request.py` lines 1112-1129, through hg's `url.py` line 418), so a Bearer first ended stock hg in
+//! its crash report; urllib's Basic handler reads every field (`get_all`, line 998), so it takes Basic in either place.
+//! A secret is compared in time independent of where it differs ([`same_secret`]).
 
 use slates_http::head::Head;
 use slates_http::reply::Status;
@@ -55,10 +62,8 @@ pub enum CredentialRefused {
   Repeated,
   /// A Basic or Bearer credential that breaks its scheme's syntax (RFC 6750 §3.1 `invalid_request`): `400`.
   Malformed,
-  /// A scheme other than Basic and Bearer: `401` with the challenges this connection accepts.
+  /// A scheme other than Basic and Bearer: `401` with the challenges.
   UnknownScheme,
-  /// Basic on a connection that is not TLS: `401` with the challenges it accepts, which offer no Basic.
-  BasicInCleartext,
 }
 
 impl CredentialRefused {
@@ -66,9 +71,7 @@ impl CredentialRefused {
   pub fn status(self) -> Status {
     match self {
       CredentialRefused::Repeated | CredentialRefused::Malformed => Status::BAD_REQUEST,
-      CredentialRefused::UnknownScheme | CredentialRefused::BasicInCleartext => {
-        Status::UNAUTHORIZED
-      }
+      CredentialRefused::UnknownScheme => Status::UNAUTHORIZED,
     }
   }
 }
@@ -110,9 +113,9 @@ const ESCAPE: u8 = b'\\';
 /// Format: as [`ESCAPE`].
 const QUOTE: u8 = b'"';
 
-/// Reads the credentials `head` carries: none, or its one `Authorization` line's. `secure` says whether the connection
-/// is TLS, which Basic requires.
-pub fn credential(head: &Head<'_>, secure: bool) -> Result<Option<Credential>, CredentialRefused> {
+/// Reads the credentials `head` carries: none, or its one `Authorization` line's, Basic or Bearer, whatever the
+/// connection (the module doc).
+pub fn credential(head: &Head<'_>) -> Result<Option<Credential>, CredentialRefused> {
   let Some(value) = head
     .field(AUTHORIZATION)
     .map_err(|_| CredentialRefused::Repeated)?
@@ -121,9 +124,6 @@ pub fn credential(head: &Head<'_>, secure: bool) -> Result<Option<Credential>, C
   };
   let (scheme, rest) = split_scheme(value);
   if scheme.eq_ignore_ascii_case(BASIC) {
-    if !secure {
-      return Err(CredentialRefused::BasicInCleartext);
-    }
     basic(rest).map(Some)
   } else if scheme.eq_ignore_ascii_case(BEARER) {
     bearer(rest).map(Some)
@@ -228,21 +228,16 @@ fn sextet(character: u8) -> Option<u32> {
     .and_then(|place| u32::try_from(place).ok())
 }
 
-/// The `WWW-Authenticate` values a 401 on this connection carries: Basic with its charset over TLS alone, and Bearer,
-/// each naming `realm` as a quoted string.
-pub fn challenges(realm: &str, secure: bool) -> Result<Vec<Vec<u8>>, BadRealm> {
+/// The `WWW-Authenticate` values a 401 carries, on every connection: Basic with its charset first, then Bearer, each
+/// naming `realm` as a quoted string (the module doc says why Basic leads).
+pub fn challenges(realm: &str) -> Result<Vec<Vec<u8>>, BadRealm> {
   let quoted = quoted(realm.as_bytes())?;
-  let mut values = Vec::new();
-  if secure {
-    let mut basic = b"Basic realm=".to_vec();
-    basic.extend_from_slice(&quoted);
-    basic.extend_from_slice(b", charset=\"UTF-8\"");
-    values.push(basic);
-  }
+  let mut basic = b"Basic realm=".to_vec();
+  basic.extend_from_slice(&quoted);
+  basic.extend_from_slice(b", charset=\"UTF-8\"");
   let mut bearer = b"Bearer realm=".to_vec();
   bearer.extend_from_slice(&quoted);
-  values.push(bearer);
-  Ok(values)
+  Ok(vec![basic, bearer])
 }
 
 /// `text` as a quoted string, its quotes and backslashes escaped; refused when it holds a control byte other than HTAB.

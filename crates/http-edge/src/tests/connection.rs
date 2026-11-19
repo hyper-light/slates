@@ -587,7 +587,7 @@ fn drive_tls(
       }
       Next::Decide => {
         let head = connection.head().unwrap();
-        seen_credential = credential(&head, connection.secure()).unwrap();
+        seen_credential = credential(&head).unwrap();
         let decision = serve(&head);
         connection.decide(decision);
       }

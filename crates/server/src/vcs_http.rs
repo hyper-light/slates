@@ -256,7 +256,10 @@ pub(crate) struct Decided<E> {
 pub(crate) trait Site {
   /// The exchange a served request runs.
   type Exchange: Exchange;
-  /// Decides `head`, on a connection that is TLS when `secure`.
+  /// Decides `head`, on a connection that is TLS when `secure`: the scheme its client reached the edge by, which a site
+  /// writing absolute URLs needs (LFS's call takes it for its hrefs, A-629 part 2b-ii). No credential depends on it:
+  /// Basic and Bearer are taken alike over TLS and on the loopback cleartext edge, the only cleartext one [`serve`]
+  /// serves (A-686).
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange>;
 }
 

@@ -22,7 +22,7 @@ use super::{
   Authenticator, GitServices, GitSite, Located, Proven, Refused, Repositories, ServiceRefused,
   Start, StoreLender, Unproven, Unserved, UploadServices,
 };
-use crate::vcs_http::{Answer, Decided, Exchange, Failed};
+use crate::vcs_http::{Answer, Decided, Exchange, Failed, Site};
 
 /// Shape: room enough for every head these tests send.
 const ROOM: u64 = 1 << 20;
@@ -44,9 +44,11 @@ const RECEIVE_ADVERTISEMENT: &str = "/r.git/info/refs?service=git-receive-pack";
 const OWNER_BEARER: &str = "Authorization: Bearer owner-token";
 /// Shape: as [`OWNER_BEARER`].
 const OWNER_BASIC: &str = "Authorization: Basic Z2l0Om93bmVyLXRva2Vu";
+/// Shape: Basic's credentials for a token that proves no one (`git:nobody`).
+const NOBODY_BASIC: &str = "Authorization: Basic Z2l0Om5vYm9keQ==";
 /// Shape: the stranger's, as a bearer token.
 const STRANGER_BEARER: &str = "Authorization: Bearer stranger-token";
-/// Shape: the challenges a `401` carries over TLS, then over cleartext.
+/// Shape: the challenges a `401` carries, in this order, on every connection.
 const BASIC_CHALLENGE: &str = "Basic realm=\"slates\", charset=\"UTF-8\"";
 /// Shape: as [`BASIC_CHALLENGE`].
 const BEARER_CHALLENGE: &str = "Bearer realm=\"slates\"";
@@ -285,60 +287,75 @@ fn replies<E: Exchange>(exchange: &mut E) -> Vec<Vec<u8>> {
   }
 }
 
-/// A-625 part 2 (RFC 9110 §11.6.1; RFC 7617 §4). Do: ask for upload-pack's advertisement with no credentials, over TLS
-/// and over a cleartext loopback connection. Expect: `401`, unproven, with Basic's and Bearer's challenges over TLS and
-/// Bearer's alone in cleartext, each naming the realm, then `http-backend`'s cache fields.
+/// A-686 (main's ruling, 2026-11-19: Basic's challenge first on every connection, TLS included; RFC 9110 §11.6.1). Do:
+/// ask for upload-pack's advertisement with no credentials, on a TLS connection and on a loopback cleartext one.
+/// Expect: `401`, unproven, on both, with Basic's challenge first and Bearer's second, each naming the realm, then
+/// `http-backend`'s cache fields: a client that reads the first challenge alone, as stock Mercurial's urllib does,
+/// reads Basic whatever the connection.
 #[test]
-fn a_request_without_credentials_is_401_with_the_challenges_its_connection_accepts() {
+fn a_request_without_credentials_is_401_with_basics_challenge_first_on_either_connection() {
   let mut site = site(Vec::new(), Unserved);
   let asked = request("GET", UPLOAD_ADVERTISEMENT, &[]);
   let www = "WWW-Authenticate";
-  assert_eq!(
-    refusal(&ready(site.answer(&head(&asked), true))),
-    (
-      Status::UNAUTHORIZED,
-      with_cache(&[(www, BASIC_CHALLENGE), (www, BEARER_CHALLENGE)]),
-      false
-    )
-  );
-  assert_eq!(
-    refusal(&ready(site.answer(&head(&asked), false))),
-    (
-      Status::UNAUTHORIZED,
-      with_cache(&[(www, BEARER_CHALLENGE)]),
-      false
-    )
-  );
+  for secure in [true, false] {
+    assert_eq!(
+      refusal(&ready(site.decide(&head(&asked), secure))),
+      (
+        Status::UNAUTHORIZED,
+        with_cache(&[(www, BASIC_CHALLENGE), (www, BEARER_CHALLENGE)]),
+        false
+      ),
+      "secure: {secure}"
+    );
+  }
 }
 
-/// A-625 part 2 (RFC 7617 §4, RFC 9110 §11.4 and §5.3). Do: send Basic credentials over cleartext, a bearer token that
-/// proves no one, another scheme, and two `Authorization` lines. Expect: the first three `401` with the connection's
-/// challenges, unproven; the repeated line `400` with the cache fields alone.
+/// A-686 (main's ruling, 2026-11-19: Basic with the token as the password is taken on the loopback cleartext edge as
+/// over TLS). Do: ask for upload-pack's advertisement with the owner's token as Basic's password, on a TLS connection
+/// and on a loopback cleartext one, while the services are unserved. Expect: both proven, the owner past the policy's
+/// gate, and `503` with the cache fields alone, as the owner's bearer token is answered.
+#[test]
+fn basic_proves_its_principal_on_a_loopback_cleartext_connection_as_over_tls() {
+  let mut site = site(Vec::new(), Unserved);
+  let asked = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BASIC]);
+  for secure in [true, false] {
+    assert_eq!(
+      refusal(&ready(site.decide(&head(&asked), secure))),
+      (Status::SERVICE_UNAVAILABLE, with_cache(&[]), true),
+      "secure: {secure}"
+    );
+  }
+}
+
+/// A-625 part 2 (RFC 9110 §11.4 and §5.3) and A-686. Do: send Basic credentials whose token proves no one on a loopback
+/// cleartext connection, a bearer token that proves no one, another scheme, and two `Authorization` lines. Expect: the
+/// first three `401` with the challenges, Basic's first and Bearer's second, unproven; the repeated line `400` with the
+/// cache fields alone.
 #[test]
 fn credentials_that_prove_no_principal_are_401_and_a_repeated_line_400() {
   let mut site = site(Vec::new(), Unserved);
   let www = "WWW-Authenticate";
   let unproven = [
-    (OWNER_BASIC, false),
+    (NOBODY_BASIC, false),
     ("Authorization: Bearer someone-else", true),
     ("Authorization: Digest username=\"git\"", true),
   ];
   for (credential, secure) in unproven {
     let asked = request("GET", UPLOAD_ADVERTISEMENT, &[credential]);
-    let (status, fields, proven) = refusal(&ready(site.answer(&head(&asked), secure)));
-    let bearer = (
-      www.as_bytes().to_vec(),
-      BEARER_CHALLENGE.as_bytes().to_vec(),
-    );
+    let (status, fields, proven) = refusal(&ready(site.decide(&head(&asked), secure)));
     assert_eq!(
-      (status, fields.contains(&bearer), proven),
-      (Status::UNAUTHORIZED, true, false),
+      (status, fields, proven),
+      (
+        Status::UNAUTHORIZED,
+        with_cache(&[(www, BASIC_CHALLENGE), (www, BEARER_CHALLENGE)]),
+        false
+      ),
       "{credential}"
     );
   }
   let repeated = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER, OWNER_BEARER]);
   assert_eq!(
-    refusal(&ready(site.answer(&head(&repeated), true))),
+    refusal(&ready(site.answer(&head(&repeated)))),
     (Status::BAD_REQUEST, with_cache(&[]), false)
   );
 }
@@ -371,7 +388,7 @@ fn a_proven_principal_meets_404_then_403_then_503() {
   for (target, credential, expected) in cases {
     let asked = request("GET", target, &[credential]);
     assert_eq!(
-      refusal(&ready(site.answer(&head(&asked), true))),
+      refusal(&ready(site.answer(&head(&asked)))),
       (expected, with_cache(&[]), true),
       "{target} with {credential}"
     );
@@ -399,8 +416,8 @@ fn a_rule_that_lets_a_principal_read_admits_it_to_upload_pack_alone() {
   let receive = request("GET", RECEIVE_ADVERTISEMENT, &[STRANGER_BEARER]);
   assert_eq!(
     (
-      refusal(&ready(site.answer(&head(&upload), true))).0,
-      refusal(&ready(site.answer(&head(&receive), true))).0
+      refusal(&ready(site.answer(&head(&upload)))).0,
+      refusal(&ready(site.answer(&head(&receive)))).0
     ),
     (Status::SERVICE_UNAVAILABLE, Status::FORBIDDEN)
   );
@@ -419,8 +436,7 @@ fn a_served_advertisement_is_its_prelude_then_its_service() {
     .collect();
   let owner = principal(OWNER);
   let v0 = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
-  let (served_fields, head_only, mut exchange, proven) =
-    served(ready(site.answer(&head(&v0), true)));
+  let (served_fields, head_only, mut exchange, proven) = served(ready(site.answer(&head(&v0))));
   assert_eq!((&served_fields, head_only, proven), (&fields, false, true));
   assert_eq!(
     replies(&mut exchange),
@@ -434,7 +450,7 @@ fn a_served_advertisement_is_its_prelude_then_its_service() {
     UPLOAD_ADVERTISEMENT,
     &[OWNER_BEARER, "Git-Protocol: version=2"],
   );
-  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&v2), true)));
+  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&v2))));
   assert_eq!(
     replies(&mut exchange),
     [started_as(
@@ -445,7 +461,7 @@ fn a_served_advertisement_is_its_prelude_then_its_service() {
     )]
   );
   let only_head = request("HEAD", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
-  assert!(served(ready(site.answer(&head(&only_head), true))).1);
+  assert!(served(ready(site.answer(&head(&only_head)))).1);
 }
 
 /// A-625 part 2 (gitprotocol-http's service requests). Do: as the owner, POST a receive-pack request of its content type
@@ -463,7 +479,7 @@ fn a_service_request_streams_its_body_to_the_service_and_its_reply_back() {
       "Content-Length: 3",
     ],
   );
-  let (fields, head_only, mut exchange, proven) = served(ready(site.answer(&head(&asked), true)));
+  let (fields, head_only, mut exchange, proven) = served(ready(site.answer(&head(&asked))));
   let result: Fields = reply_fields(Reply::Result(Service::ReceivePack))
     .iter()
     .map(|(name, value)| (name.to_vec(), value.to_vec()))
@@ -482,12 +498,12 @@ fn a_route_refused_by_its_syntax_is_http_backends_whoever_asks() {
   let mut site = site(Vec::new(), Unserved);
   let dumb = request("GET", "/r.git/objects/info/packs", &[]);
   assert_eq!(
-    refusal(&ready(site.answer(&head(&dumb), true))),
+    refusal(&ready(site.answer(&head(&dumb)))),
     (Status::FORBIDDEN, with_cache(&[]), false)
   );
   let put = request("PUT", "/r.git/git-upload-pack", &[]);
   assert_eq!(
-    refusal(&ready(site.answer(&head(&put), true))),
+    refusal(&ready(site.answer(&head(&put)))),
     (
       Status::METHOD_NOT_ALLOWED,
       with_cache(&[("Allow", "POST")]),
@@ -603,7 +619,7 @@ fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
     UPLOAD_ADVERTISEMENT,
     &[OWNER_BEARER, "Git-Protocol: version=2"],
   );
-  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&advertise), true)));
+  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&advertise))));
   ready(exchange.body_end()).unwrap();
   let advertisement = replies(&mut exchange).concat();
   assert!(
@@ -627,7 +643,7 @@ fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
       &length,
     ],
   );
-  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&post), true)));
+  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&post))));
   ready(exchange.body(ls_refs)).unwrap();
   ready(exchange.body_end()).unwrap();
   assert_eq!(replies(&mut exchange).concat(), b"0000");
@@ -649,7 +665,7 @@ fn a_request_upload_pack_refuses_is_answered_in_gits_words() {
       "Content-Length: 4",
     ],
   );
-  let (_, _, mut exchange, proven) = served(ready(site.answer(&head(&post), true)));
+  let (_, _, mut exchange, proven) = served(ready(site.answer(&head(&post))));
   ready(exchange.body(garbage)).unwrap();
   ready(exchange.body_end()).unwrap();
   let answer = replies(&mut exchange).concat();
@@ -672,7 +688,7 @@ fn receive_pack_and_an_unheld_store_are_503() {
   let mut site = site(Vec::new(), UploadServices::new(lender, ROOM));
   let receive = request("GET", RECEIVE_ADVERTISEMENT, &[OWNER_BEARER]);
   assert_eq!(
-    refusal(&ready(site.answer(&head(&receive), true))).0,
+    refusal(&ready(site.answer(&head(&receive)))).0,
     Status::SERVICE_UNAVAILABLE
   );
   assert!(!lender.holds(RepositoryId { bytes: [1; 16] }));
@@ -687,7 +703,7 @@ fn receive_pack_and_an_unheld_store_are_503() {
 fn a_proven_request_for_another_shards_repository_moves_and_an_unproven_one_is_refused_here() {
   let mut site = site(Vec::new(), Unserved);
   let asked = request("GET", ELSEWHERE, &[OWNER_BEARER]);
-  let decided = ready(site.answer(&head(&asked), true));
+  let decided = ready(site.answer(&head(&asked)));
   assert!(
     matches!(decided.answer, Answer::Move { shard } if shard == ELSEWHERE_SHARD),
     "a proven request moves"
@@ -695,7 +711,7 @@ fn a_proven_request_for_another_shards_repository_moves_and_an_unproven_one_is_r
   assert!(decided.proven);
   for fields in [&[][..], &["Authorization: Bearer nobody"][..]] {
     let asked = request("GET", ELSEWHERE, fields);
-    let (status, _, proven) = refusal(&ready(site.answer(&head(&asked), true)));
+    let (status, _, proven) = refusal(&ready(site.answer(&head(&asked))));
     assert_eq!(
       (status, proven),
       (Status::UNAUTHORIZED, false),
@@ -704,61 +720,44 @@ fn a_proven_request_for_another_shards_repository_moves_and_an_unproven_one_is_r
   }
 }
 
-/// A-625 part 3 (each refusal typed). Do: decide what each of these proves: no `Authorization`, an unknown scheme, Basic
-/// in cleartext, a repeated line, an unknown token, an expired one, a revoked consumer's, one whose record did not
-/// answer, the owner's. Expect each typed by why (`NoCredentials`, `NoCredentials`, `CleartextBasic`,
-/// `MalformedCredentials`, then the record's `Unknown`, `Expired`, `Revoked`, `Unanswered`) and answered with its
-/// status: `401` with the challenges, `400`, and `503` for the record that did not answer; the owner proven.
+/// A-625 part 3 (each refusal typed). Do: decide what each of these proves: no `Authorization`, an unknown scheme, a
+/// repeated line, an unknown token, an expired one, a revoked consumer's, one whose record did not answer, the owner's.
+/// Expect each typed by why (`NoCredentials`, `NoCredentials`, `MalformedCredentials`, then the record's `Unknown`,
+/// `Expired`, `Revoked`, `Unanswered`) and answered with its status: `401` with the challenges, `400`, and `503` for
+/// the record that did not answer; the owner proven.
 #[test]
 fn a_credential_that_proves_no_one_is_typed_by_why() {
   let mut site = site(Vec::new(), Unserved);
-  let cases: [(&[&str], bool, Refused); 8] = [
-    (&[], true, Refused::NoCredentials),
-    (
-      &["Authorization: Negotiate abc"],
-      true,
-      Refused::NoCredentials,
-    ),
-    (&[OWNER_BASIC], false, Refused::CleartextBasic),
-    (
-      &[OWNER_BEARER, OWNER_BEARER],
-      true,
-      Refused::MalformedCredentials,
-    ),
+  let cases: [(&[&str], Refused); 7] = [
+    (&[], Refused::NoCredentials),
+    (&["Authorization: Negotiate abc"], Refused::NoCredentials),
+    (&[OWNER_BEARER, OWNER_BEARER], Refused::MalformedCredentials),
     (
       &["Authorization: Bearer nobody"],
-      true,
       Refused::Unproven(Unproven::Unknown),
     ),
     (
       &["Authorization: Bearer expired-token"],
-      true,
       Refused::Unproven(Unproven::Expired),
     ),
     (
       &["Authorization: Bearer revoked-token"],
-      true,
       Refused::Unproven(Unproven::Revoked),
     ),
     (
       &["Authorization: Bearer silent-token"],
-      true,
       Refused::Unproven(Unproven::Unanswered),
     ),
   ];
-  for (fields, secure, why) in cases {
+  for (fields, why) in cases {
     let asked = request("GET", UPLOAD_ADVERTISEMENT, fields);
-    assert_eq!(
-      ready(site.proof(&head(&asked), secure)),
-      Err(why),
-      "{fields:?}"
-    );
-    let (status, _, proven) = refusal(&ready(site.answer(&head(&asked), secure)));
+    assert_eq!(ready(site.proof(&head(&asked))), Err(why), "{fields:?}");
+    let (status, _, proven) = refusal(&ready(site.answer(&head(&asked))));
     assert_eq!((status, proven), (why.status(), false), "{fields:?}");
   }
   let asked = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
   assert_eq!(
-    ready(site.proof(&head(&asked), true)),
+    ready(site.proof(&head(&asked))),
     Ok(Proven {
       principal: principal(OWNER),
       bearer_expires_ns: None,
