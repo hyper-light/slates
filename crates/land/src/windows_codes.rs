@@ -23,12 +23,12 @@ const HANDLE_DISK_FULL: u32 = 39;
 const DISK_FULL: u32 = 112;
 
 /// The seam's refusal for the Win32 error code `code`: a name that exists or a full disk as the errno of that kind,
-/// which the engine tells apart; any other code as itself.
+/// which the engine tells apart; any other code as the Win32 code it is, which no reader takes for an errno.
 pub(crate) fn refusal_of(code: u32) -> HostError {
   match code {
     FILE_EXISTS | ALREADY_EXISTS => HostError::Unavailable(ERRNO_EXIST),
     HANDLE_DISK_FULL | DISK_FULL => HostError::Unavailable(ERRNO_NOSPC),
-    other => HostError::Unavailable(i32::try_from(other).unwrap_or(i32::MAX)),
+    other => HostError::Win32(other),
   }
 }
 
