@@ -68,7 +68,10 @@ fn assert_checked_as_the_last_piece_arrives(scenario: &Scenario, piece: usize, w
   assert_eq!(objects, Some(pushed), "{label}");
   let mut policy = git_policy(&repository);
   let answered = session.answer(&mut policy, &mut written, &mut unbounded());
-  assert!(matches!(answered, Ok(Some(_))) && session.is_done(), "{label}");
+  assert!(
+    matches!(answered, Ok(Some(_))) && session.is_done(),
+    "{label}"
+  );
   assert_eq!(written, whole, "{label}");
 }
 
@@ -193,7 +196,10 @@ fn a_request_of_no_command_is_received_with_nothing_written() {
   let create = scenario("create");
   let repository = Repo::from_pack(create.before_pack);
   let mut session = Session::new(&ADVERTISED, &HIDDEN);
-  assert_eq!(session.input(b"0000", &repository, &mut unbounded()), Ok(true));
+  assert_eq!(
+    session.input(b"0000", &repository, &mut unbounded()),
+    Ok(true)
+  );
   let mut written = Vec::new();
   let mut policy = git_policy(&repository);
   let answered = session.answer(&mut policy, &mut written, &mut unbounded());
@@ -204,20 +210,28 @@ fn a_request_of_no_command_is_received_with_nothing_written() {
 }
 
 /// A-620 (the push waits checked, holding nothing of the caller's). Do: feed a session the hidden
-/// push whole, against its server's objects, then drop that repository and judge before
-/// answering, from a second copy. Expect: the checked push holding the pack's objects and the
-/// hidden ref's refusal; answered from the copy as the push held whole is.
+/// push whole against its server's objects, end its input (an HTTP body's end comes before its
+/// answer), then drop that repository and answer judged from a second copy. Expect: the end keeping
+/// the push checked, holding the pack's objects and the hidden ref's refusal; answered from the
+/// copy as the push held whole is.
 #[test]
 fn a_checked_push_waits_for_its_verdicts_holding_nothing_of_the_callers() {
   let hidden = scenario("hidden");
   let first = Repo::from_pack(hidden.before_pack);
   let mut session = Session::new(&ADVERTISED, &HIDDEN);
-  assert_eq!(session.input(hidden.request, &first, &mut unbounded()), Ok(true));
+  assert_eq!(
+    session.input(hidden.request, &first, &mut unbounded()),
+    Ok(true)
+  );
+  assert_eq!(session.end(&first, &mut unbounded()), Ok(false));
   drop(first);
   let checked = session.checked().unwrap();
   assert!(!checked.objects().is_empty());
   let denied = checked.early.first().cloned().flatten();
-  assert!(matches!(denied, Some(crate::receive::Outcome::Ng(_))), "{denied:?}");
+  assert!(
+    matches!(denied, Some(crate::receive::Outcome::Ng(_))),
+    "{denied:?}"
+  );
   let second = Repo::from_pack(hidden.before_pack);
   let mut written = Vec::new();
   let mut policy = git_policy(&second);
