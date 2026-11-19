@@ -12076,6 +12076,25 @@ engine: the verdict, rebase, position mapping, the register).
 > `git fsck --strict` printed. slates parts from git once, on purpose: a tag whose malformed tagger is followed by an
 > extra header, which git reports and then accepts, is refused. Owed: the `.gitmodules` and `.gitattributes` blob
 > checks over the ids a tree's check hands on; the push's use of these checks is piece 6's.
+>
+> **Status (2026-11-19, A-582's second part: protocol v2's messages built).** `crates/git` (`v2`) reads and writes the
+> capability advertisement, the command request, `ls-refs`'s arguments and answer, and `fetch`'s seventeen arguments and
+> its response's five sections, as pure functions over bytes; every advertisement, request and answer stock git 2.50.1
+> wrote or read decodes and encodes back to its exact bytes. One machine holds the response's section order, stepped by
+> the reader and the writer alike, so neither takes a section out of order. `object-info` and `bundle-uri` are refused
+> as unknown commands until their part, so a server advertises neither before it.
+>
+> **Status (2026-11-19, A-594: piece 9's transport built).** `crates/ssh` (`slates-ssh`) is the SSH server's transport
+> (RFC 4253) as a sans-io core that git's, Mercurial's and Subversion's SSH routes can share: the caller moves bytes and
+> the time in and reads events out. It sends its banner lines and identification, reads the client's line within RFC
+> 4253 §4.2's 255 bytes, negotiates by the client's first choice, runs `curve25519-sha256` with an `ssh-ed25519` host
+> key, and seals packets under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` through aws-lc-rs. Strict
+> key exchange, OpenSSH's answer to the Terrapin attack, is offered under both its names and enforced whenever the
+> client offers it. A key is replaced when either direction reaches half the bound its cipher's analysis gives (RFC 4344
+> §3), or when the key time passes; the key time is learned (the table below), and the server's estimator that feeds it
+> is owed with the listener. Held to the chacha20-poly1305 draft's worked packet, NIST's SSH key-derivation vectors,
+> RFC 7748's X25519 exchange and RFC 8032's Ed25519 tests, and to whole connections with a client written from the RFCs
+> alone. User authentication and the session channel are piece 9's next parts.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12124,9 +12143,11 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
   the document's own examples (piece 1).
 - Side band: during a pack, channel 1 carries the pack, 2 progress and 3 a fatal error [B: gitprotocol-v2 "packfile
   section"]; `ERR <text>` is the pack protocol's error line [B: gitprotocol-pack].
-- v2 capabilities advertised: `agent`, `ls-refs=symrefs peel ref-prefix unborn`, `fetch=shallow filter ref-in-want
-  sideband-all packfile-uris wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and
-  `object-info`. A v0 or v1 fetch (the old ref advertisement and its negotiation) is a later piece.
+- v2 capabilities advertised: `agent`, `ls-refs=unborn`, `fetch=shallow filter ref-in-want sideband-all packfile-uris
+  wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and `object-info`. `ls-refs` lists
+  only `unborn`, as git does (`ls-refs.c` `ls_refs_advertise`): `symrefs`, `peel` and `ref-prefix` are the command's
+  base arguments, which need no feature [B: gitprotocol-v2 "ls-refs"]. A v0 or v1 fetch (the old ref advertisement and
+  its negotiation) is a later piece.
 - receive-pack capabilities: `report-status`, `report-status-v2`, `delete-refs`, `ofs-delta`, `atomic`,
   `push-options`, `side-band-64k`, `quiet`, `object-format` and `agent`.
 
@@ -12275,6 +12296,7 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Reaping a stalled client | silence past the tail of the gaps seen for that phase of the exchange, with the estimate's own error added (A-363's form) | the shard's connection budget | the round trip measured at connect |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
 | Index table merges | merge two immutable tables when the measured cost of probing one more table, times the measured lookup rate, exceeds the measured merge cost spread over the tables' expected life | one merge in flight per repository | merge when the first lookup's measured probe cost exceeds its measured share of a merge |
+| SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
 
 git fixes the first two by constants: "Defaults to 10" for the window and "Defaults to 50" for the depth [B: config
 `pack.window`, `pack.depth`]; its own notes call them "magic values" [B: technical `pack-heuristics`].
@@ -12868,6 +12890,30 @@ and export by landing).
 > eligible and merged revisions, composed from this algebra with piece 7's location segments and log
 > (`libsvn_client/mergeinfo.c` `svn_client__mergeinfo_log`, `filter_log_entry_with_rangelist`); the property's UTF-8 and
 > CR checks at commit, which are piece 7's property validation (`svn_repos__validate_prop`).
+>
+> **Status (2026-11-19, A-592).** Built: the commit rule (`slates-svn`'s `commit`, piece 5, items 3.2 to 3.4): the
+> drive's out-of-date test (`check_out_of_date`, `commit.c`'s); and the verdict at `close-edit` (`verdict`): FSFS's
+> `merge()` stated on the index, over the work's transaction as the index's own builder makes it on its base
+> (`Index::trial`), reading only the rows of the head's revisions since the base and the nodes they reach; then, once
+> it finds no conflict, the lock table's check (A-602's `LockTable::verdict`, handed in by the merge task), whose
+> refusal is the verdict's and whose entries are its accepted answer. Every refusal typed and named by its Subversion
+> error. Its oracle transcribes `merge()`, `compare_dir_structure`, `verify_locks`, `verify_lock` and
+> `svn_path_compare_paths` over the naive FSFS of the index's tests and equals the verdict, with the lock table's real
+> check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. Owed with the server
+> (piece 7): the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each
+> command arrives, over a transaction built a command at a time.
+>
+> **Status (2026-11-19, A-599).** Built: ra_svn's greeting and authentication (`slates-svn`'s `handshake`, piece 7's
+> first part), a state machine that does no I/O, from the greeting to `repos-info`: the client's answer read as
+> `svnserve` reads it, the mechanisms `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` listed, taken and failed as `svnserve`
+> lists, takes and fails them, and `CRAM-MD5`'s HMAC-MD5 through RustCrypto's `hmac` and `md-5` (the vendored aws-lc-rs
+> has MD5 but HMAC over the SHA family alone), the keyed contexts held, never the secret. Its oracle is stock
+> Subversion 1.15.0's own sessions, `svn` against `svnserve`, every byte each way logged by a relay
+> (`crates/svn/fixtures/handshake/`): each is answered byte for byte as `svnserve` answered it, the greeting's
+> `svndiff1` aside, whole and cut anywhere, and each hostile one refused where `svnserve` refused it. The principal is
+> the one the successful attempt proved; three hostile inputs no stock client sends are refused where `svnserve` reads
+> them through a C string or to 64 levels (item 10's text below). Owed with the rest of piece 7: the URL's canonical
+> form, the repository it names and the root URL `repos-info` carries, as `find_repos` derives them.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12980,7 +13026,10 @@ for Subversion.)
       both made the same change ("If any of the three entries is of type file, declare a conflict");
    2. for a name both sides changed: a double delete, a delete against a change, a replacement on either side ("even an
       identical replacement") and an addition on both ("two additions are not auto-mergeable") are conflicts, and a
-      directory changed on both sides otherwise is judged entry by entry, by these rules, beneath it;
+      directory changed on both sides otherwise is judged entry by entry, by these rules, beneath it, when both sides
+      kept its node and copy identities; a directory of a branch that no revision changed since the copy takes the
+      branch's copy identity when first changed inside it (a lazy copy, `get_copy_inheritance`), so two works that
+      change different files beneath it conflict there, as they do in FSFS (A-592);
    3. a directory on the path from the root to any node the work changed whose property list changed in (B, head] is a
       conflict (FSFS refuses the source's property change of a directory both sides changed beneath);
    4. a directory whose property list the work changed is a conflict when its names, or their node or copy identities,
@@ -13154,7 +13203,11 @@ standard error is the client's message (`E165001`); post-commit's becomes `commi
 `CRAM-MD5` and, through the tunnel, `EXTERNAL`; over `https://` a TLS client certificate or Basic credentials inside
 TLS; over `svn+ssh://` the SSH login. `CRAM-MD5` needs the server to hold the shared secret or its keyed-MD5
 "contexts", which "must both be protected" alike (RFC 2195 §2 and §4), so slates holds the contexts, never the
-cleartext, as §4.15's S3 credentials are held: in RAM on the owner and the anchor, never on disk. `svn://` carries no
+cleartext, as §4.15's S3 credentials are held: in RAM on the owner and the anchor, never on disk. The exchange is
+`svnserve`'s (`serve.c` `construct_server_baton`, `auth`; `cram.c`; built, A-599), stricter on three inputs no stock
+client sends: a CRAM-MD5 response holding a NUL is malformed, as `cram.c` finds every such response; an `EXTERNAL`
+token is compared whole, where `strcmp` stops at a NUL; and a list deeper than the handshake's prototypes is refused at
+its third level, where `svnserve` reads 64. `svn://` carries no
 encryption, so it is served on loopback alone unless the repository's policy names another interface; `svn+ssh://` and
 `https://` are the encrypted routes. Path rules are Subversion's authorization file (notes §7: per-repository and global
 sections, globs from 1.10, users, `@groups`, `&aliases`, `$anonymous`, `$authenticated`, `*`, `~`; 1.14.1's combining of
@@ -13282,11 +13335,13 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
-   must give the same accept or conflict, and the same conflicting path.
+   must give the same accept or conflict, and the same conflicting path (built, A-592, with the drive's out-of-date
+   test, the lock table's check after the merge, and `verify_locks` in the oracle).
 6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format), `setrevprop`, `setlog`, `info`,
    `uuid`, `youngest`; the dump round trip is their gate.
-7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
-   checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
+7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
+   the plain reads; the reporter (update, switch, status, diff, checkout); commit; log, locations, segments, file
+   revisions, deleted revision, replay; revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
    oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
    log). 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
@@ -39286,6 +39341,86 @@ Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crat
 their tests and `tests/pack_fixtures.rs`; `lib.rs`'s module lines); `crates/git/fixtures` (`make-delta-fixtures.sh` and
 `deltas/`, new); `.gitattributes` (the deltas, binary).
 
+**Part 2 (2026-11-19, g296, UI goal 92; landed after part 3): protocol v2's messages** (`crates/git/src/v2`; §4.17.2
+"The wire" and "A fetch"). Pure functions over bytes, as part 1: every list a decode builds is counted in a first walk
+and charged exactly to the caller's `Admission` before a second walk builds it; every encode is checked whole, into a
+`Measure`, before it writes, so a refused encode writes nothing; every refusal is a typed `v2::Refusal` naming the byte
+where the packet at fault begins. Sources, read 2026-11-19 at the revision the golden vectors' git shipped:
+`gitprotocol-v2.adoc` at v2.50.1 (SHA-256 `2e739965…`; master `e1ec09b2`, which `research/vcs-servers.md` cites, differs
+only in `object-info` and `promisor-remote`) and `gitprotocol-common.adoc` [B]; git v2.50.1's `serve.c`, `ls-refs.c`,
+`upload-pack.c`, `fetch-pack.c`, `connect.c`, `pkt-line.c`, `sideband.c` and `refs.c` [C].
+
+- **The advertisement** (`v2::advertisement`): `version 2`, one capability a line, a flush. A key is held to the
+  grammar's `key`; a value is any bytes but NUL and LF, the rule the document gives server options, since its `value`
+  grammar names fewer bytes than its own `agent` and `session-id` sections allow. Lookups answer as git's client does
+  (`server_supports_v2`, `server_supports_feature`), and the object format is SHA-1 when none is named.
+- **The request** (`v2::request`): one `command=` line and the client's capabilities in the order sent, since
+  `serve.c` reads the command after them too and git's own `bundle-uri` client sends it so; a delimiter where there is
+  one, since `serve.c` reads a flush right after the head as a command with no arguments; the arguments; the flush. A
+  flush alone ends the client's requests. A client's capabilities are `serve.c`'s that are not commands (`agent`,
+  `server-option`, `object-format`, `session-id`, `promisor-remote`); `object-format` must name a format, and the last
+  one names the arguments' format, as `serve.c` keeps the last. The commands are `ls-refs` and `fetch`. `whole_len` says
+  when the bytes that have arrived hold a whole request (the first flush always ends one), so nothing caps a request but
+  its bytes and the admission.
+- **ls-refs** (`v2::ls_refs`): `peel`, `symrefs`, `unborn` and `ref-prefix <prefix>`, any prefix, the empty one too,
+  which git reads as matching every ref. Its answer is one ref a line: an id or `unborn`, a name, then at most one
+  `symref-target:` and one `peeled:` in either order, as git's client reads them; written whole, or a ref at a time
+  (`write_ref`) for a server streaming one. `ls-refs.c` stops honouring prefixes past 65536; that is a server's choice,
+  since the document lets a server show refs no prefix matches, and is left to the server's piece.
+- **fetch** (`v2::fetch`): its seventeen arguments; a depth positive and within git's `int` (whose largest is
+  `INFINITE_DEPTH`, what `--unshallow` sends); a time any but `timestamp_t`'s largest, revision.c's "no limit";
+  `filter` and `packfile-uris` once each, as git dies on a second; `deepen` never beside `deepen-since` or `deepen-not`,
+  which the document says "Cannot be used with" it. The response is read and written as events through one machine
+  (`Response`): acknowledgments (`NAK` or `ACK`s, never both, then `ready`, after which a delimiter and the pack follow,
+  and without which a flush ends the response), shallow-info, wanted-refs, packfile-uris and the packfile, each section
+  later than the one before; bands where the response carries them, in the packfile always and everywhere under
+  `sideband-all`; progress anywhere it may come; a band-3 error ending the stream.
+- **Lossless.** A line's trailing LF is optional, and stock git writes both forms in one exchange: its client writes
+  `command=fetch`, its capabilities and its flags without one and `want`, `have` and `done` with one; its server writes
+  `shallow <id>` without one. So each line records how it ended. Where git's reader is laxer than the grammar, slates is
+  strict, so a decode loses nothing and every message it accepts is written back byte for byte, the pkt-line length
+  digits aside, which part 1 reads in either case. Ids are lower-case hexadecimal only (gitprotocol-common's `HEXDIG`):
+  git's `get_oid_hex` also reads upper case and ignores what follows an id, which no client writes (git, JGit, libgit2
+  and go-git all write lower case). Numbers are canonical decimal, where git's `strtol` with base 0 also reads octal and
+  `0x`. A text line holds no NUL, where git's C readers would end its string, and no LF but its last byte. A ref name is
+  `HEAD` or under `refs/` and passes `check_refname_format`, whose rules add two to the document's list: no empty
+  component and no component ending `.lock`.
+- **The order, settled by git.** git 2.50.1's `upload_pack_v2` wrote wanted-refs before shallow-info, against the
+  document's grammar and its own client: `fetch-pack.c` reads shallow-info first, so a shallow fetch by `want-ref` died
+  "expected 'packfile', received 'shallow-info'". git fixed it in `191740edaa4a` ("upload-pack: swap wanted-ref/
+  shallow-info responses", 2026-09-16, merged 2026-10-04, with a test in t5703). slates reads and writes the document's
+  order, and its writer cannot write another.
+- **Keepalives.** git's `create_pack_file` keeps a waiting client alive with `0005\1`, an empty band-1 packet, where the
+  document says `0005\2`. Before the packfile section git's own client reads an empty band-1 packet as an empty line
+  where a section's name must stand, and dies; this decoder refuses it there too (`UnknownSection`). A slates server
+  keeps a client alive on band 2, which every client reads as progress wherever it comes.
+- **Tests** (`cargo test -p slates-git --lib`: 37 new, 59 in all). Every advertisement, request and answer stock git
+  2.50.1 wrote or read is decoded by its message's decoder and encoded back to its bytes. git's own client's forms are
+  read and written back: no LF on the head and the flags, capabilities before the command, no delimiter, SHA-256. Every
+  kind of refusal is checked at its byte. Every cut of every stream is `Truncated` inside a packet or `Unfinished`
+  between packets, never a message. Every bit flip of every stream is refused by kind at a place inside it, or read back
+  to exactly its bytes; a tally asserts the flips reach twelve kinds of refusal. Lines filling a packet are read whole,
+  and one byte longer is refused with nothing written. Admissions are refused one item short with nothing charged, and
+  spent exactly. A writer refuses git 2.50.1's order with nothing written. Two property tests: any `fetch` request
+  written decodes back to itself, and any stream of the grammar's words and arbitrary bytes, decoded as every message,
+  is refused by kind or read back exactly.
+- **Checks** (Mac Studio M3 Ultra, debug, kiln r526 and r535, 2026-11-19, load 4 to 13): 59 of 59, `cargo fmt --check`
+  clean; merged with part 3 and A-591, 113 of 113. Failing first: with the eight message functions and the response
+  machine's `read` and `write` stubbed to refuse, in the Studio's clone and never the tree, all 32 message tests failed.
+  Red four ways, one guard at a time, in the Studio's clone:
+  - sections taken in any order between delimiters failed the order test;
+  - upper-case ids accepted failed four tests (the id, request and answer refusals, and the bit flips);
+  - every line written with an LF failed eight, among them the golden round trips, through git's `shallow` line;
+  - the response's events left uncharged failed its admission test.
+- **Next** (GAPS): `object-info` and `bundle-uri`, refused as unknown commands until then, so a server advertises
+  neither; a request checked against the server's own advertisement, as `serve.c` checks the command and capabilities
+  and `upload-pack.c`'s `allow_*` check `filter`, `want-ref`, `sideband-all` and `packfile-uris`; the `ERR` line and a
+  band-3 error carrying a server's refusals. A-582's own next part is the pack stream (§4.17.2 piece 3), others' part.
+
+Part 2 applied in the same change to: §4.17.2 (its status; "The wire": `ls-refs=unborn`, as git advertises it, since
+`symrefs`, `peel` and `ref-prefix` are the command's base arguments, which need no feature [B: gitprotocol-v2 "ls-refs";
+C: `ls-refs.c` `ls_refs_advertise`]), GAPS (the §4.17 entry), `crates/git` (`src/v2`, new; its `mod` line in `lib.rs`).
+
 ### A-589 — The fleet's own test of a captured clone moved twice: whole on each new owner, never stale on an old one, landed on the last against its capture (2026-11-19, g230, UI goal 90; §4.10 "Ownership follows the writer", §4.15 `capture_base` and "Plan"; the test A-503 filed for main)
 Applied in the same change to: GAPS (g267's captured-clone status: the test written, its run owed),
 `crates/server/tests/fleet.rs` (the test and its helpers beside A-583's; `assert_the_agents_changes_landed_alone` now
@@ -40114,6 +40249,218 @@ Applied in the same change to:
 - **Owed.** The `.gitmodules` and `.gitattributes` blob checks (`fsck_blob`: `gitmodulesUrl`, `gitmodulesPath` and the
   rest), over the ids a tree's check hands on; the push path's use of these checks (piece 6); per-id severities from
   configuration (`fsck.<id>`), if policy ever needs them.
+
+### A-592 — The Subversion commit rule as a pure function: the drive's out-of-date test, and FSFS's merge at commit stated on the index, then the lock table's check, held to FSFS's own code transcribed (2026-11-19, g268 for UI goal 92; §4.17.4 items 3.2 to 3.4 and piece 5; A-553, A-602)
+Applied in the same change to: §4.17.4 (a status block; item 3.3 rule 2's lazy copy; piece 5 marked built), GAPS (the
+§4.17.4 entry, and the order A-602's lock check answers in), `docs/wip/research/vcs-servers-subversion.md` (five more
+sources and four notes of §6), `crates/svn/src/commit.rs` and `crates/svn/src/commit/tests.rs` (new),
+`crates/svn/src/index.rs` (`Index::trial`, `Trial`, `TrialNode`, `Builder::new_on`; a copy's source read in any
+committed revision), `crates/svn/src/index/tests.rs` (the naive filesystem's transaction on any base, `begin_on`, and
+its tree, `into_tree`; the oracle's types open to the crate), and `crates/svn/src/lib.rs`.
+- **What was there.** Item 3.3 stated FSFS's commit rule in five rules and piece 5 asked for it as a pure function with
+  a transcription of `merge()` as its oracle; nothing computed it. The lock table and its check at the verdict were
+  A-602's, landed the same day.
+- **The decision.** Subversion's rule as its code applies it (1.14.x at `d434dc14`), in its order. (1) During the
+  drive, `commit.c` `check_out_of_date` (179-198): a client's revision older than the node's created revision in the
+  transaction is out of date (`E160028`), one past the transaction's base is no such revision (`E160006`);
+  `check_out_of_date` takes the created revision as `svn_fs_node_created_rev` reads the transaction's root (none for a
+  node the transaction made; the base for an untouched root, `dag.c`'s issue #2608). (2) At `close-edit`, `tree.c`
+  `merge(target = the transaction, source = the head, ancestor = the base)` (1790-2146) from the root: the base cases;
+  the head's property change of a directory both sides changed; the work's against `compare_dir_structure`
+  (1724-1765: count, names, node and copy identities); the base's entries in name order (deleted on either side; a
+  file among the three sides, a node kind conflict when the kinds differ; no direct modification; else down into it);
+  then the head's additions. Stated on the index, it visits only the names the rows of (B, head] reach, since a row
+  makes a new node-revision of every directory above it and every other entry is the base's node-revision on both
+  sides. The work's identities come from the index's own builder begun on B (`Index::trial`), so a lazy copy is FSFS's:
+  two works changing different files beneath a directory a branch never changed since its copy conflict at that
+  directory, as in FSFS. Property lists compare by content, as `svn_fs_fs__prop_rep_equal` (`fs_fs.c` 1608-1665) does.
+  (3) Then, as `commit_body` runs `verify_locks` after the merge (`transaction.c` 3797), the lock check: the verdict
+  hands the work's changes to the check the merge task passes, A-602's `LockTable::verdict` over each change's path
+  and action for the commit's principal and presented tokens; its refusal is the verdict's (`E160034`, `E160037`,
+  `E160039`) and its entries (the locks the accepted commit releases) the verdict's accepted answer. The verdict is
+  generic in that answer, so a test can pass a check that answers nothing.
+- **Refusals,** typed (`CommitRefusal`), each with its Subversion error: out of date `E160028` (a file's, a
+  directory's or no node's words); a revision past the transaction's base `E160006`; a conflict `E160024`, naming the
+  check that found it (`ConflictKind`: properties changed, structure changed, deleted twice, deleted against a change,
+  kind changed, file changed, no direct modification, added twice); the lock check's refusal; and a work its base
+  cannot hold, the index's own refusal.
+- **Tests** (`crates/svn/src/commit/tests.rs`). One case a rule, each citing the line it holds the rule to: the worked
+  example's commits beside a later change; a file both changed, even alike; a directory's properties changed by the
+  head, the root's too; a property change against an added entry but not an entry changed in place; a double delete
+  and a delete against a change both ways; a node kind conflict; a replaced directory, even replaced alike; the lazy
+  copy beneath a branch, and the same changes on trunk committing; an addition on both sides, even alike; the first
+  conflict in `merge()`'s order (a base entry before an addition named earlier; a directory whole before `/trunk/d-x`,
+  which byte order puts first); the lock table's check refusing by each of its three errors, and accepting with the
+  presented locks released; a conflicting work never asking the check; the out-of-date test against the index's
+  created revision (Carol and Eve); a work its base cannot hold. The oracle: the index tests' generated histories, a
+  work on a base mostly near the head and after the root's last property change (some of the next revision's own
+  changes made again, then its own), up to six locks mostly on files the work's changes reach, the committer's or
+  another's, their tokens presented or not, the commit anonymous in a quarter of the cases; answered by the verdict
+  with the lock table's real check, and by `merge()`, `compare_dir_structure`, `verify_locks`, `verify_lock`,
+  `svn_fs_fs__allow_locked_operation`, `svn_path_compare_paths` and `svn_fspath__skip_ancestor` transcribed over the
+  naive filesystem's whole trees; equal on every case, with a census that must show every conflict kind, each lock
+  refusal, a lock met beneath every changed path and a changed path skipped. The case count, 4,096, is derived from
+  the census's rarest rule.
+- **Evidence** (the Mac Studio d1323898, kiln, debug builds of fresh clones). Failing first (04:01 UTC, load 3.2):
+  with `verdict` accepting whatever the index can build and `check_out_of_date` passing every command, `cargo test
+  --locked -p slates-svn --lib` failed 13 of the then 16 commit tests, the three passing being the commits beside a
+  later change, the index's refusals and a path-order case, since removed with the module's own lock reader (below,
+  "Rejected"). The first green run (03:57
+  UTC) overflowed the oracle's stack: its naive entries of `/` listed `/` itself under the empty name, so the
+  transcribed `merge()` went down into the root forever (fixed in the oracle; the rule's walk drops empty names). The
+  next (04:01 UTC) was equal on all 256 cases but met no double delete, a change of the root's properties answering 112
+  of them first, so the generator draws bases near the head and after that change, repeats changes, and places locks
+  where checks meet them. With the lock check asked before the merge (04:18 UTC, load 10.1), 2 failed: the
+  conflicting work asked the check once, and the oracle met a work that deletes `/a` and replaces `/b` by a copy, answered
+  at a lock beneath `/b` where FSFS answers its conflict. Green (04:18 UTC): 89 of 89 in 1.03 s, 15 of them the commit
+  rule's; the census over 4,096 cases: 1,733 commits (1,576 on the head); conflicts: properties changed 742, structure
+  changed 391, deleted twice 74, deleted against a change 200, kind changed 99, file changed 49, no direct modification
+  171, added twice 268; lock refusals `E160034` 120, `E160037` 85, `E160039` 164, 77 at a lock beneath every changed
+  path; 402 changed paths skipped. `cargo fmt` clean. Clippy, `xtask check` and the cross-target lint are main's (the
+  run-request queue).
+- **Found, owed to A-602.** `LockTable::verdict` verifies the locks a commit meets in the byte order of their paths;
+  FSFS checks the changed paths in `svn_path_compare_paths` order. A commit refused by locks at both `/t/a/b` and
+  `/t/a-b` is answered at `/t/a-b` where `svnserve` answers `/t/a/b`. The generated histories name paths of one-letter
+  names, where the two orders agree, so the oracle cannot see it; GAPS records it.
+- **Rejected.** Computing the work's identities in the commit module: a second copy of `get_copy_inheritance` and
+  `make_path_mutable` beside the index's, free to drift; the index's builder begun on the base is the one place they
+  live. Comparing whole trees, as the oracle does: a commit would cost its repository's size. A lock reader of the
+  commit module's own (built first, before A-602 landed: each changed path read in Subversion's order through a
+  per-path predicate): a second check beside the lock table's, which also holds expiry and release.
+- **Not here.** The drive (piece 7): asking the out-of-date test, and the lock check FSFS also makes at each editor
+  call (`fs-wrap.c` 151-152 begins a commit's transaction with `SVN_FS_TXN_CHECK_LOCKS`; `tree.c` checks at 1614, 2497,
+  2554 and 2645), as each command arrives, over a transaction built a command at a time; the drive's other checks. The
+  merged version's identities and mergeinfo counts (FSFS's `update_ancestry` and mergeinfo increment) are the index's
+  at the version's append (A-553), not the verdict's.
+
+### A-599 — ra_svn's greeting and authentication: a handshake that does no I/O, held to stock Subversion's own sessions (2026-11-19, g234, UI goal 92; §4.17.4 "5. The wire" and "10. Who may do what", piece 7's first part; after A-531)
+Applied in the same change to:
+- §4.17.4's status, item 10 and piece 7; GAPS (the §4.17.4 entry); the research notes (`vcs-servers-subversion.md` §1
+  and §2);
+- `crates/svn` (`handshake.rs` and `handshake/tests.rs`, new; `fixtures/handshake` with `make-fixtures.py` and
+  `SHA256SUMS`; `lib.rs`; `Cargo.toml`);
+- the workspace manifest and lock (`hmac` 0.12.1, `md-5` 0.10.6, and `subtle` under `digest` for `hmac`'s `mac`
+  feature; nothing else re-resolved, though cargo's own resolution also moved five packages to `windows-sys` 0.61.2).
+- **The exchange**, as `svnserve` makes it (`serve.c` at `d434dc14`: `construct_server_baton`, `send_mechs`, `auth`,
+  `internal_auth_request`, `find_repos`; `cram.c`). The greeting is `svnserve`'s without `svndiff1`. The client's answer
+  is read as `vparse_tuple` reads `nlc?c(?c)`: items past the prototype ignored, a `ra-client` with its client list or
+  not at all, then the version, the capabilities' kinds and `edit-pipeline` judged in that order; each refusal ends the
+  connection with nothing written. The caller names the repository or refuses the URL in `svnserve`'s words
+  (`SVN_ERR_BAD_URL`, `SVN_ERR_BAD_FILENAME`, `SVN_ERR_RA_SVN_REPOS_NOT_FOUND`); a repository that allows no one is
+  refused before any request. The mechanisms are listed, taken and failed in `send_mechs`' and `auth`'s order and words;
+  a failed attempt lets the client answer again; success writes `( success ( ) )` and `repos-info` at once. The
+  principal is the one the successful attempt proved, and nothing a failed attempt named is kept. CRAM-MD5's challenge
+  is `<nonce.time@host>` from parts the caller gives (the host a C string), its response split at the last space and
+  verified in constant time; a caller that can make no challenge fails the attempt as `cram.c` does.
+- **The dependency.** The vendored aws-lc-rs has MD5 (`digest::MD5_FOR_LEGACY_USE_ONLY`, a local change for S3) but no
+  HMAC over it: `hmac::Algorithm`'s field is private and its constants are the SHA family's (`vendor/aws-lc-rs/src/
+  hmac.rs` 124 and 143-155). Main approved RustCrypto's `hmac` and `md-5` for this mechanism alone; the keyed contexts
+  are what is held (RFC 2195 §4), never the secret.
+- **Evidence.** `make-fixtures.py` ran stock Subversion 1.15.0 (r1937767, Homebrew, the Mac Studio, 2026-11-19), `svn`
+  against `svnserve -d` through a relay on 127.0.0.1:3690 and against `svnserve -t` through a tunnel, each direction
+  logged before it was forwarded, `SHA256SUMS` checked on the Studio and again here: anonymous; CRAM-MD5 with secrets
+  of 11, 64 and 70 bytes; a wrong password; both mechanisms listed; `EXTERNAL`; no repository; no access; and
+  hand-made clients for each answer `svnserve` refuses, unlisted mechanisms, and an `EXTERNAL` token naming another
+  user. 1.15.0's `cram.c`, `internal_auth.c` and protocol document equal `d434dc14`'s byte for byte, and its `serve.c`
+  differs by a Windows include and a comment. The stock client is built with Cyrus SASL: its `ANONYMOUS` token is
+  base64 of `anonymous@` and its host's name with a line feed, and after a failure it sends `( CRAM-MD5 ( ) )` before
+  learning it has no further credentials (`cyrus_auth.c` 498-505, 553-555 at 1.15.0); a client without SASL sends an
+  empty token (`internal_auth.c`).
+- **Stricter than `svnserve`**, on hostile input alone: a CRAM-MD5 response holding a NUL is malformed (`cram.c` refuses
+  every one, reading a C string); an `EXTERNAL` token is compared whole (`strcmp` stops at a NUL), and an absent one is
+  an empty one; a list deeper than the handshake's prototypes is refused at its third level.
+- **Bounds.** The caller's item bytes; the longest word, 24 (`MAX_WORD_LENGTH`, 1.14 and 1.15 alike); depth 2; and the
+  item count the bytes over what one parsed item costs (`size_of::<Value>()`, 24 bytes on aarch64-apple-darwin), so a
+  message's parsed values take no more memory than its bytes may.
+- **Tests.** `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: 78 of 78 on the branch, then 139
+  of 139 on the tree merged with main at 575188f7f (A-602's locks and A-605's mergeinfo among them; `cargo fmt --check`
+  clean), the handshake's 28 after two long tests were split to stay within the lint wall's cognitive complexity of 10.
+  Every session replayed whole, in two pieces at every cut and cut short at every byte; RFC 2195's worked example;
+  RFC 2202's seven HMAC-MD5 vectors; `cram.c`'s digest and its reading of a response transcribed as oracles under
+  proptest; `vparse_tuple`'s tables; every bound exactly enough for every stock session; calls out of turn. Red first, on
+  the earlier draft given the API the tests drive: 17 of 25 passed, the 8 failures naming its three decisions (a
+  `ra-client` taken without its list; a NUL-holding response split; the item count the bytes over two, which let a
+  message's values cost twelve times its bytes).
+- **Owed** (GAPS): the URL's canonical form, the repository it names and the root URL `repos-info` carries, as
+  `find_repos` derives them; a learned limit on failed attempts (`svnserve` has none); the keyed contexts held across a
+  restart without the secret (§4.13).
+
+### A-594 — SSH's transport, the SSH server's first part: RFC 4253 as a sans-io core, strict key exchange, `curve25519-sha256` with `ssh-ed25519`, and keys retired by their ciphers' bounds and a learned time (2026-11-19, g294, UI goal 92; §4.17.2 "Transports" item 2 and "Pieces (git)" piece 9; D-28)
+Applied in the same change to:
+- §4.17.2's status and its tunables table (the SSH key time); GAPS (the §4.17 entry); `research/vcs-servers.md` §5.5
+  (new: the sources read for it, pinned by hash) and §5.4 (the drafts' owed reading discharged);
+- `crates/ssh` (new, `slates-ssh`: `lib.rs`, `wire`, `ident`, `packet`, `kexinit`, `kex`, `hostkey`, `keylife`,
+  `refusal`, `transport`, `entropy`; the tests in `src/tests`, with the test client in `src/tests/client.rs`);
+- the workspace lock (the new crate alone: its only dependency is aws-lc-rs, and proptest and `slates-test-seeds` for
+  its tests).
+- **Why a crate of its own.** git, Mercurial and Subversion each reach slates over SSH, so the transport carries no
+  tool's knowledge; the channel piece decides what an `exec` request names. §4.17.3 and §4.17.4 still describe the
+  host's `sshd` starting a slates CLI verb; this transport lets those routes be slates-served too, which is their
+  owners' call and not changed here.
+- **Sans-io.** `ServerTransport` takes the client's bytes and the time and gives events, output bytes and a timer. Its
+  random bytes (a KEXINIT's cookie, each packet's padding, each exchange's ephemeral key) come through an `Entropy`
+  seam whose one real implementation is AWS-LC's system generator, so a test runs a whole connection from known bytes.
+- **The identification** (RFC 4253 §4.2). Banner lines first, each checked never to begin "SSH-"; then
+  `SSH-2.0-slates_<version>`. The client's line is read within 255 bytes and refused on its 255th if that does not end
+  it. Following OpenSSH's own reader (`kex.c` at `fa4b2a82`): a line before the identification is refused, a bare LF
+  ends a line (which §4.2 allows), a NUL or a CR not followed by LF is refused, and any printable byte follows the
+  protocol version, since clients in use put a minus sign in their software version. Versions 2.0 and 1.99 are taken.
+- **Packets** (RFC 4253 §6; RFC 5647 §7; the chacha20-poly1305 draft §6, §7). From its first four bytes a packet's
+  length is refused if too short for a payload, not aligned to its cipher's block (8 in the clear and for ChaCha20, the
+  part after the length for the AEADs; 16 for AES), or past the caller's cap, which RFC 4253 §6.1's 35000 bytes floors;
+  so a hostile length costs nothing. The tag is checked before decryption, and the padding after (four bytes at least,
+  a payload left). Sending uses the least padding that aligns, drawn at random, and no packet larger than 35000 bytes.
+  AES-GCM's nonce is the IV's fixed field and its 64-bit invocation counter, counted up per packet and wrapping as RFC
+  5647's integer does; no key sees 2^64 packets, so no nonce repeats.
+- **Negotiation** (RFC 4253 §7.1). Per list, the client's first name the server runs. The MAC lists are skipped, as
+  both AEAD drafts say; the server's own MAC lists name `none` alone, since §7.1 requires one name and the server runs
+  no MAC apart from its ciphers. A marker (`kex-strict-*`, `ext-info-c`) is matched against the methods the server
+  runs, never its advertised list, so no marker is ever chosen, even one a client lists first. A guessed packet is
+  ignored when the guess was wrong, judged by the two lists' first names as OpenSSH judges it.
+- **Strict key exchange** (`draft-ietf-sshm-strict-kex-03` §3). The server offers both names; it is on when the client
+  offers either client name. Then the client's KEXINIT must be its first packet, only KEXINIT, NEWKEYS and the exchange
+  methods' messages (30 to 49) are taken until the first exchange ends, `SSH_MSG_KEX_ECDH_INIT` is taken once, and
+  each direction's sequence number restarts at zero after its NEWKEYS. A sequence number that would wrap before the
+  first exchange ends is refused with or without it. Without it the server carries numbers on, as RFC 4253 does: with
+  neither side sending `SSH_MSG_EXT_INFO`, the only message a Terrapin deletion could take is the first one after the
+  keys, whose loss stalls the connection rather than changing it.
+- **The exchange** (RFC 8731 §3, §3.1; RFC 5656 §4; RFC 4253 §7.2). Public keys of any length but 32 are refused, and
+  an all-zero secret is refused by an OR over its bytes, behind AWS-LC's own refusal of small-order points. K is the
+  secret read big-endian as an `mpint`; the hash covers `V_C`, `V_S`, both KEXINIT payloads, `K_S`, `Q_C`, `Q_S` and K;
+  the first hash is the session id; the keys are `HASH(K || H || letter || session_id)` extended as §7.2 says, wiped
+  from memory on drop (a best-effort overwrite through `core::hint::black_box`; no dependency taken for it).
+- **Keys' lives** (RFC 4344 §3; RFC 4253 §9). By use, derived from the cipher: 2^32 packets (RFC 4344 §3.1, and
+  ChaCha20's nonce space), and for AES 2^(L/4) = 2^32 blocks (§3.2, L = 128); ChaCha20 has no block bound. The server
+  starts a new exchange at half of each, the point RFC 4344 §3.1 prefers for packets ("rekey after receiving more than
+  2**31 packets"), and ends the connection only if a key reaches its whole limit, as when a client ignores the server's
+  KEXINIT and keeps sending. An operator's cap can only lower the limits. By time, learned: the tail of the lifetimes
+  this deployment's authenticated connections lived, within RFC 4253 §9's hour and the hour until one is measured
+  (`keylife::key_time_limit_ns`), never shorter than the connection's last exchange took, so a re-exchange can never
+  fill a connection. The server starts exchanges only after the service is accepted, so a service reply never falls
+  inside one.
+- **Back-pressure.** One packet is buffered in and one event waits; reading stops while an event waits or while a
+  packet cap of output is unwritten, so a client that floods and does not read grows nothing.
+- **Owed, in order.** User authentication by public key (RFC 4252), with RFC 8308's `SSH_MSG_EXT_INFO` and its
+  `server-sig-algs` when RSA keys are offered (RFC 8332 and RFC 5656 remain owed reading); the session channel with
+  git's `exec` and `env` (RFC 4254); the listener on the runtime, with the estimator of connection lifetimes that feeds
+  the key time and the host key's keeping; main's live interop with stock `ssh` clients. A post-quantum exchange:
+  OpenSSH 10's clients prefer `mlkem768x25519-sha256`, and (from memory, to be verified) OpenSSH 10.1 warns on every
+  connection whose exchange is not post-quantum; aws-lc-rs carries ML-KEM-768, so the hybrid is a follow-on piece with
+  its own design amendment.
+- **Tests** (`cargo test --locked -p slates-ssh --lib`, Mac Studio d1323898, 68 of 68 at 33a9588). Red first at
+  c5a312d: 23 compile errors, each a module of the transport not yet built. Golden: the chacha20-poly1305 draft's
+  Appendix A packet sealed and opened byte for byte; NIST CAVS 14.1's SSH KDF vectors (SHA-1, whose 192-bit keys need
+  §7.2's extension, and SHA-256 in both groups); RFC 7748 §6.1's exchange as the server's half; RFC 8032 §7.1 tests 1
+  to 3 as host key and signature blobs; an AES-GCM oracle sealing by hand under RFC 5647 §7.1's nonce across the
+  counter's wrap. Hostile: identification lines at and past 255 bytes, lengths too short, unaligned, past the cap and
+  `u32::MAX`, bad padding, forged tags under both ciphers, small-order and wrong-length keys, every out-of-place message,
+  a refused service, an unshared cipher, and any bytes (proptest), each refused by its kind with its disconnect reason
+  checked by the client. Whole connections with the test client under both ciphers, strict and not, each direction its
+  own cipher, a right and a wrong guess, a client's rekey (session id kept), the server's rekeys by time and by use, a
+  client that never rekeys running out its key, both kinds of back-pressure, and the same seeds giving byte-identical
+  connections. Red four ways on the Studio: with the strict receive reset removed 12 of 26 transport tests failed; with
+  the KEXINIT-first check removed, its test failed; with the GCM counter frozen, 8 failed; with the all-zero check
+  removed, the small-order test still passed, since AWS-LC refuses those keys first (kept as RFC 8731's own check).
 
 ### A-603 — A repository's register: one entry commits several greens' versions, members, names and the repository's own state as one step, its checks read at its position (2026-11-19, g261 for UI goal 92; §4.17.1 items 2 and 3 and shared piece 2; §4.17.3 decisions 3, 4 and 6; §4.16 "Commit"; D-28; after A-515, A-575)
 Applied in the same change to: §4.16 ("Commit"), §4.17.1 (a status block, items 2 and 3, the pieces list's item 2),
