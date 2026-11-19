@@ -13095,6 +13095,25 @@ engine: the verdict, rebase, position mapping, the register).
 > Owed: part 2, the view presented to the hook driver on the owner shard (after A-662); main's run of stock git over
 > the view.
 >
+> **Status (2026-11-19, A-665 part 2: the view handed to the hook driver on the owner shard, built).** `crates/server`
+> (`git_hooks`) opens part 1's view over the repository's store in the shard's `vcs_stores` (A-662), the push where
+> receive-pack keeps it at each point: in git's quarantine for `pre-receive`, among the packs for `update`, nowhere for
+> `post-receive` or a push of deletes alone. The caller names each ref by its full name, its green and the version of
+> the green the push read, and the store's own versions of the green translate it; a version no push made is refused
+> (`NotInStore`), the store holding what pushes brought alone. The view's tables are charged to the shard's budget
+> while it lives, its packs sealed in the shard's slices, each seal lent the room `HookView::seal_len` names, and its
+> close gives every hold and charge back. `run` hands the hook the repository's policy configures at the point the
+> view's variables beside its point's own, `GIT_DIR=.` and for `pre-receive` the quarantine's three as stock git 2.50.1
+> sets them, in the view's root, and refuses a view the point would not see. Proven by running the test binary as each
+> point's hook in its view, written into a scratch directory by the tests' own presenter: each hook sees what
+> receive-pack's hooks see, and stock `git` there reads the pushed commit and its history (macOS arm64, Mac Studio,
+> kiln r111 over main 0577ab0bd: `git_hooks`, `vcs_hooks`, `hook_driver`, `vcs_store::` and `git_push` 70 of 70,
+> `hook_view` 16 passed and 1 ignored; red first against stubs, kiln r204). Owed: part 3, the
+> view presented at a path (a read-only attachment the mount edges serve a read at a time; on Linux in the launcher's
+> namespace, §4.6); its seals kept as derived data across views; the calls of git's push driver (`git_push`, A-654
+> part 2, which answers every command `hook not run` while a git hook is configured until they land); git's words for
+> each outcome.
+>
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
 > capabilities and this server's agent. Each request is answered whole and statelessly: the shallow-update first,
@@ -13158,6 +13177,18 @@ engine: the verdict, rebase, position mapping, the register).
 > entries their names (`Graph::named_entries`, A-614's store reading them from the tree's bytes). Refused: a
 > `sparse:oid` without its patterns, which the service does not read yet (the next slice), and one within a
 > `combine:`, where git's answer turns on its order of walk.
+
+> **Status (2026-11-19, A-640 part 4, third slice: the service reads the blob).** `crates/git` (`upload::sparse`)
+> resolves a `sparse:oid=<blob-ish>` as git resolves one in a repository with no work tree: an object's full name, or a
+> ref by git's patterns (`HEAD` and `@` the default branch), alone or before `:<path>`, the path walked below the
+> revision's tree as git's `find_tree_entry` walks it (`objects::Tree::find`). A relative path is refused as git
+> refuses it there; a form this server does not resolve (`~`, `^`, `^{...}`, `@{...}`, an abbreviated name, the name
+> `git describe` writes, `:/<text>`) is refused by kind. The blob is read within the request's admission and its
+> patterns handed to the negotiation, so `sparse:oid` alone is served under protocol v2 and v0. A blob git's
+> `pack-objects` dies of is answered as git's server answers it (`Answer::died`): what precedes the pack, then git's
+> `fatal:` line on band 2 in packets of at most 128 bytes, its band-3 words and no flush; under v0 with no band, the
+> acknowledgments alone. Held byte for byte to stock git 2.50.1's nine recorded `sparse:oid` exchanges. Still refused:
+> `sparse:oid` within `combine:`.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -13356,8 +13387,10 @@ quarantine shows them to a hook. Building that view (packs and refs generated fr
 part 1, the view itself, is built (A-665: `HEAD`, `config` and `packed-refs` as git writes them; packs each whole by
 itself from the base packs and fragments, the objects no kept part holds and the push's held whole; the push in
 `objects/tmp_objdir-incoming-<six>` for `pre-receive` with receive-pack's environment, among the repository's packs for
-`update`; a pack's trailer, Adler-32s and index its seal, the rest of every file read a window at a time); part 2
-presents it to the hook driver on the owner shard.
+`update`; a pack's trailer, Adler-32s and index its seal, the rest of every file read a window at a time); part 2,
+handing it to the hook driver on the owner shard, is built (A-665 part 2: opened over the repository's store, sealed in
+the shard's slices, run with `GIT_DIR=.` and the quarantine's variables); part 3 presents it at a path, a read-only
+attachment the mount edges serve.
 
 **Operations on the server.** Merging a review request is §4.17.1's merge: on accept the server makes the merge commit
 (parents: the target's head and the request's head; tree: the accepted version's; author and committer the person who
@@ -13462,8 +13495,9 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
    `include-tag`; `object-info`.
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
 9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
-10. Hooks over a read-only bare-repository view (part 1, the view, built: A-665; part 2, presenting it to the hook
-    driver on the owner shard, after A-662); push options; push to review with report-status-v2.
+10. Hooks over a read-only bare-repository view (part 1, the view, built: A-665; part 2, handing it to the hook driver
+    on the owner shard, built: A-665 part 2; part 3, presenting it at a path, owed); push options; push to review with
+    report-status-v2.
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
@@ -51160,6 +51194,195 @@ lent with the request's room and `file_node` gone, the changegroup lending each 
   panics on arbitrary bytes.
 - **Owed.** The view handed to the daemon's HTTP site over A-662's stores, and the site's pushes through `hg_push`
   (A-680 part 2); the other platforms' runs (main's).
+
+### A-665 part 2 — The hook's view on the owner shard: opened over the repository's store, sealed in the shard's slices, and handed to the hook driver with receive-pack's variables (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-597, A-622, A-662, A-665)
+Applied in the same change to:
+- §4.17.2 (a status block, "Hooks, in git's terms", piece 10's line) and GAPS (the §4.17 entry: A-665's owed list, the
+  hooks' variable sweep, and this part's paragraph);
+- `crates/server`: `git_hooks` and its tests (new); `lib.rs` (the module, Unix alone with the hook driver);
+  `vcs_store.rs` (`VcsStores::content_mut`, `within_budget` made crate-visible, and the docs of A-654 part 2's
+  `SealedPush::quarantine`, which the view reads a push through) and its tests' push helpers made crate-visible for
+  the hooks' tests;
+- `crates/git`: `HookView::seal_len`, its module's docs, and a test in `src/tests/store/hook_view.rs`.
+
+- **What.** `git_hooks::GitHookView::open(state, repository, (refs, head), pushed)` opens part 1's view over the
+  repository's git store in the shard's `vcs_stores` (A-662), with a sealed push where receive-pack keeps it:
+  `ShownPush::Quarantined` for `pre-receive`, `ShownPush::Migrated` for `update` (receive-pack moves the objects in
+  between, `tmp_objdir_migrate` in `execute_commands`), none for `post-receive` and for a push of deletes alone, for
+  which receive-pack unpacks nothing and so makes no quarantine. `seal_turn` seals its packs a turn at a time;
+  `node`, `list` and `read` are what a presentation serves; `presented_at(root)` answers the view as a hook sees it at
+  `root`; `close` gives everything back. `git_hooks::run(site, input, bound, client_gone)` runs the hook the
+  repository's policy configures at the input's point in that view.
+- **Refs by green and version.** The store keeps no ref names (A-640: "the caller names each ref's green"), so the
+  caller, receive-pack, names each ref it advertised by its full name, its green and the version of the green it read
+  (`ReadRef`). The view shows the store's version of that green whose green version that is, the newest such
+  (`GitStore::versions`, as `version_of` reads newest first). A ref at a version no push made is refused
+  (`NotInStore`, naming its place), since the store holds what pushes brought and nothing else (A-662; a version a
+  server-side merge makes is A-664 part 3's).
+- **The budget (§4.2).** Opening runs inside `vcs_store::within_budget`: the content store is lent what the shard could
+  admit now, the view's own tables (part 1 charges them to an `Admission` of that room) are charged to the content
+  store with `ContentStore::charge`, and the settle carries them as retention for as long as the view lives, as the
+  store's own structures are carried. A hold changes no byte count (`ContentStore::hold`). Each seal is made inside
+  `within_budget` too, lent the room `HookView::seal_len` names: the index's bytes, held as content, and four bytes for
+  the Adler-32 of each object the pack holds whole, which is what the seal keeps (`seal::keep`). The lent figure grows
+  the arena before the step, so the settle's retention charge after it is met. `close` gives the seals, the holds and
+  the tables' charge back through the shard's one content store (`VcsStores::content_mut`), whether or not the
+  repository's entry is still there, and settles; a refusal there is counted (`git_hooks.view_release_refused`).
+- **Sliced.** A seal hashes every byte of its pack, so it runs a turn at a time: each turn the pass runs for the shard's
+  live step quantum (`DaemonConfig::step_quantum_ns`, §4.3), at least one unit of work (part 1's `Quantum` over the
+  runtime's clock), and the caller's task yields between turns. A seal refused (`Changed`: a base pack made again under
+  the view) closes the view, which is opened again.
+- **The hook's variables.** `presented_at(root)` takes part 1's `HookView::environment(root)`: `GIT_DIR=.` at every
+  point, which receive-pack exports to every hook once it has entered the repository (`setup.c` `set_git_dir_1`), and
+  for a quarantine `GIT_OBJECT_DIRECTORY` and `GIT_QUARANTINE_PATH` the quarantine and `GIT_ALTERNATE_OBJECT_DIRECTORIES`
+  the repository's objects, each an absolute path through `./objects` as `tmp_objdir_env` hands them (part 1's
+  fixtures). `run` adds them after the point's own (the push options, A-597), as `run_and_feed_hook` adds
+  `tmp_objdir_env` after the options; no name is in both.
+- **Which view a point sees.** `pre-receive` sees the push quarantined or no push; `update` the push migrated or none;
+  `post-receive` none. A view handed otherwise, or an input at another tool's point, is refused before any process
+  starts (`ViewForAnotherPoint`, `NotGits`), so a hook can never be handed a quarantine receive-pack would not hand it.
+  A point with no hook configured lets the push through and teaches nothing (A-597).
+- **Not done here: the view at a path.** The driver starts a hook in a directory (`hook_driver::Launch::view_root`), so
+  the view must be presented at a path the hook and its `git` read. A mount of the daemon's serves a volume; a view is
+  no volume, and its reads need the shard's content store, which a volume slot's base host cannot hold beside it, so
+  serving it lazily means lending the content store to the view at each edge's request (the base seam's lens), a piece
+  of its own (part 3), with the launcher's namespace on Linux (§4.6). Copying the view into a volume would hold every
+  pack's bytes twice per hook, which A-645's scale rules out. Until part 3 the tests present the view themselves, by
+  writing it into a scratch directory in the build output.
+- **Tests** (`crates/server/src/git_hooks/tests.rs`; `crates/git/src/tests/store/hook_view.rs`).
+  - `a_git_hook_runs_in_its_view_at_each_of_receive_packs_points`: on the owner shard, `main` pushed once, then a second
+    commit's push sealed; its `pre-receive` view (sealed a unit of work a turn) and `update` view opened, sealed,
+    written into scratch directories and closed; the push appended; its `post-receive` view the same; then the test
+    binary run as each point's hook in its view. Each view held and charged more once open, charged more once sealed,
+    and the shard's holds and charge back to what they were at its close; the sliced seal taking more turns than packs.
+    Each hook accepted, its working directory its view's root, `GIT_DIR=.`, `HEAD` naming `main`, `packed-refs` naming
+    `main`'s head as the push read it (the pushed head after the append); `pre-receive` handed the quarantine as stock
+    receive-pack hands it, the push's pack alone in it; `update` and `post-receive` none, the push's pack among the
+    repository's for `update`; stock `git`, where it runs, finding the pushed commit and the two commits it reaches
+    (`cat-file -t`, `rev-parse refs/heads/main`, `rev-list --count`), skipping loudly where no `git` runs.
+  - `a_view_the_store_cannot_show_is_refused_by_kind_and_holds_nothing`: `NotInStore` at the first ref and at the
+    second, `ForeignPush`, `NoStore` for a Mercurial repository, the shard's holds and charge unchanged after each.
+  - `a_view_is_handed_only_to_a_point_that_sees_it_so`: a quarantine to `update` and `post-receive`, a migrated push to
+    `pre-receive` and `post-receive`, refused naming both; a Subversion point refused as not git's; an unconfigured
+    point let through with nothing to learn.
+  - slates-git `a_seal_keeps_its_index_and_a_sum_for_each_object_held_whole`: each pack's `seal_len` is its index's
+    length as the view lists it and the charge its seal added, some pack's charge not zero; an unknown name has none.
+- **Runs** (macOS arm64, Mac Studio d1323898, kiln, debug, 2026-11-19; `CARGO_BUILD_JOBS=2`, a
+  clone of the pushed branch, its own target directory).
+  - The first build (r186) compiled slates-git (`cargo test --locked -p slates-git --lib -- hook_view`: 16 passed, 1
+    ignored, main's stock-git run) but not the server's tests, on two mistakes of the tests' own: the runtime's
+    `within` answers `Result<Option<_>>`, and a local named `repository` shadowed the helper. Fixed, r200: `cargo test
+    --locked -p slates-server --lib -- git_hooks vcs_store:: --test-threads=4` 17 of 17.
+  - Red (r204), the implementation stubbed on the clone, never committed: the hook handed none of the view's
+    variables, every ref's version taken as found, every point seeing every view, `seal_len` without its sums. The
+    three new server tests failed, each at its own assertion, and slates-git's `seal_len` test failed (15 others
+    passed); the clone was restored, `git status` clean, and rustfmt's layout taken from it.
+  - Green on the trees that land: r12 and r30 over main bb535bd4d, then r39 over main 4dca63df7, the code this commit
+    lands byte for byte (the policy's literal now takes `..RepositoryPolicy::default()`, A-644 having appended
+    `signers` meanwhile). r39, 21:06Z: slates-git `--lib -- hook_view` 16 passed, 1 ignored; slates-server `--lib --
+    git_hooks vcs_store::` 22 of 22, A-675's import tests among them, both crates compiled afresh, no warning from
+    these files; the end-to-end test again with `--nocapture`, printing no skip, so stock git 2.50.1 (Apple Git-155)
+    read every view; `cargo fmt -p slates-git -p slates-server -- --check` clean. r12's build had warned that
+    `GitHookView::node` was never used; the tests' presenter now holds each path's node to its listing.
+  - On the merged trees, main having landed A-626 part 4 (3612d1ef9: slates-server's listing, verbs, work_home and
+    work_log) and A-654 part 2 (0577ab0bd: git's push driver, whose `SealedPush::quarantine` the view now reads a push
+    through, in place of this part's own accessor of the same field), each run with `--nocapture` and printing no
+    skip, no warning from a slates crate, both crates' fmt checks clean: r82 over 3612d1ef9, `cargo test --locked -p
+    slates-server --lib -- git_hooks vcs_hooks hook_driver vcs_store::` 67 of 67 (`git_hooks` 4, `vcs_hooks` 34,
+    `hook_driver` 11, `vcs_store` 18) and `-p slates-git --lib hook_view` 16 passed and 1 ignored; r111 over
+    0577ab0bd (068d00c19), the same with `git_push` added: 70 of 70, and 16 passed and 1 ignored; and again over
+    main's newer commits on the tree as it landed, the landing merge's message says.
+  - No integration test reaches `git_hooks`: it is the crate's own until git's push driver calls it (`git_push`,
+    A-654 part 2).
+- **Found, not changed (reported to main).** A git hook inherits the daemon's environment (A-597: git's and Mercurial's
+  hooks inherit the server's), so a repository variable the daemon was started with (`GIT_OBJECT_DIRECTORY`,
+  `GIT_COMMON_DIR`, git's `local_repo_env` list) would reach `update` and `post-receive`, which the view sets none of,
+  and point their `git` away from the view. Stock git's own transports clear that list for receive-pack (`connect.c`,
+  from memory, to verify); whether the hook driver clears it for git's points is main's to decide.
+- **Owed.** Part 3, the view presented at a path (above); its seals kept as derived data across views, since a pack's
+  name hashes what it is made from and a seal serves every view showing its pack; the calls of git's push driver
+  (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until they
+  land), which open, seal, present, run and close the views at each point; git's words for each outcome (`pre-receive
+  hook declined`, `hook declined`); main's runs (the other platforms, clippy, `xtask`, the doc gates).
+
+### A-640 part 4, third slice — The service reads the blob: a `<blob-ish>` resolved as git resolves one with no work tree, and a dying `pack-objects` answered as git's server answers it (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-640 part 4 first and second slices, A-653 continued (4))
+Applied in the same change to:
+- §4.17.2's statuses (a status after the second slice's);
+- GAPS (the A-640 entries);
+- `crates/git/src/upload/sparse.rs` (new: the resolution and the read), `upload/mod.rs` (`Refusal::SparseBlob`,
+  `SparseForm`, `SparseRelative`, `SparseData` and `SparseTooLarge`, their words and git's warning; the module doc),
+  `upload/answer.rs` (`Answer::died`: git's report and its relay), `upload/fetch.rs` and `upload/v0.rs` (the blob
+  read, its patterns handed on, a death answered), `upload/refs.rs` (`dwim`, `peeled_node`), `objects/tree.rs`
+  (`Tree::find`), `store/graph.rs` (`StoreGraph::blob_bytes` and `tree_entry`), `store/repository.rs`
+  (`tree_entry`), `negotiation/sparse.rs` (an empty `Patterns` by default), `negotiation/filter.rs` (the
+  `sparse:oid` variant's doc);
+- the fixtures: the recorders `fixtures/make-fixtures.sh` and `fixtures/v0/make-v0-fixtures.sh`, and the nine
+  exchanges they recorded (`fixtures/fetch-sparse-*`, `fixtures/v0/sparse-*`, `fixtures/v0/SHA256SUMS`);
+- the tests: `upload/tests/sparse.rs` (new), `upload/tests/fetch.rs`, `upload/tests/refused.rs`,
+  `upload/tests/v0.rs`, `tests/objects/tree.rs`, `tests/fixtures.rs`, `tests/v0.rs`.
+
+- **What git does** [C: git v2.50.1, `list-objects-filter.c` `filter_sparse_oid__init`; `object-name.c`
+  `get_oid_with_context_1`, `get_oid_1`, `get_oid_basic`, `get_describe_name` and `resolve_relative_path`;
+  `tree-walk.c` `get_tree_entry` and `find_tree_entry`; `object-file.c` `read_object_with_reference`; `dir.c`
+  `add_patterns_from_blob_to_list`; `upload-pack.c` `create_pack_file` and `upload_pack_v2`; `usage.c` `vfreportf`].
+  `pack-objects` resolves the `<blob-ish>` as it begins, and dies when it names nothing ("unable to access sparse
+  blob in '%s'"), when its path is relative in a repository with no work tree ("relative path syntax can't be used
+  outside working tree"), or when it names no blob, or one past git's 100 MiB limit after a warning ("unable to
+  parse sparse filter data in %s"). By then upload-pack has written what precedes the pack: under v2 the sections
+  and the packfile section's header, which under `sideband-all` with `packfile-uris` waits for the pack's start and
+  so is never written; under v0 the acknowledgments. It relays `pack-objects`' error stream on band 2, a packet for
+  each read of at most 128 bytes, then its band-3 words, and ends with no flush; with no band it writes those lines
+  to its own error stream, and the client finds the pack missing. `die` writes `fatal: ` and the words as one line,
+  cut to 4,096 bytes with its newline, each control byte but a tab and a newline shown as `?`.
+- **The resolution** (`upload::sparse`), in `get_oid_with_context_1`'s order: the whole name as a revision; then an
+  index path, which names nothing, a served repository having no index; then a revision and the path after its first
+  `:` outside a `@{...}` or `^{...}`. A revision is an object's full name in the repository's format, either case,
+  held or not, or the ref the first of git's patterns finds (`refs::dwim`; `repo_dwim_ref` takes the first), `@`
+  read as `HEAD`. The path is walked below the revision's tree (peeled through tags and a commit, as
+  `read_object_with_reference` peels) an entry at a time by `Tree::find`, which searches the entries in the order
+  written and stops where git's loop stops, so a tree out of order is searched as git searches it; a submodule's
+  commit is an entry like any other, a trailing `/` names the directory and an empty path the tree itself. Refused
+  by kind (`Refusal::SparseForm`, answered with git's words for a name that names nothing and what this server
+  resolves): a parent or an ancestor, a peel or a reflog, an abbreviated name, `git describe`'s, and a search of
+  commit messages.
+- **The read.** The blob's length is charged to the request's admission before its bytes are read
+  (`StoreGraph::blob_bytes`), then its patterns (`Patterns::read`, the first slice); a blob past git's limit by its
+  length alone is refused unread.
+- **The answer** (`Answer::died`): what precedes the pack, then the warning's line (for a blob past git's limit)
+  and the `fatal:` line as `vfreportf` writes them, relayed in band-2 packets of at most 128 bytes, each line read
+  alone, then git's band-3 words and no flush, all charged to the admission first; with no band, what precedes the
+  pack alone.
+- **When the blob is read.** Under v0 once the pack is due, as git's `pack-objects` reads it, so a round with no
+  pack never meets it. Under v2 in every round its filter rides in, since the negotiation walks by its patterns in
+  the round that sends the pack; a blob that names nothing still dies only with the pack, so a round answered with
+  acknowledgments alone is answered as git answers it, but a blob past the request's admission is refused in any
+  round (not git's; the fetch fails either way). git warns on band 2 of a ref name two of its patterns find; this
+  server takes the first, as git does, without the warning.
+- **Tests.** Against stock git's recordings (the two scripts on the Mac Studio, kiln r114: git 2.50.1, Apple Git-155, as
+  every other fixture, each older one reproduced byte for byte but `fetch-progress`'s timed text): the served clone
+  under `main:dir/file` (a blob whose one pattern matches no path: every commit and tree, no blob) among the v2
+  exchanges, section for section with git's objects, and `sparse-v0` among v0's; five v2 deaths byte for byte (a path
+  not there, a path naming a tree, 140 `a`s with a tab, a control byte and DEL after them, whose line git relays in two
+  packets, and a path not there under `sideband-all`, alone and with `packfile-uris`); v0's death on side-band-64k and
+  on no band byte for byte. Resolution (`upload/tests/sparse.rs`): every form this server resolves names the same blob
+  and serves the same clone; names of no blob, names of nothing, relative paths and the forms not resolved are each
+  refused by their kind (a name of no blob naming its object, the others the name as sent); a blob past git's limit is
+  warned of, then refused; a 5,000-byte name's line is cut to git's 4,096 bytes in 32 full packets. A round that sends
+  no pack is answered as with no filter, its blob naming nothing (v2 and v0). `Tree::find` against git's loop traced by
+  hand over stock git's `ok-tree` in both formats, and over a tree written out of order.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r250, over main b94ae6e90 with this
+  slice (`agents/g296-a640-p4c` at cf032854e): `cargo test --locked -p slates-git --lib -- negotiation::
+  objects::tests::tree upload:: store::repository::graph::tests:: every_golden_vector` 112 passed, 1 ignored (main's
+  `upload_packs_for_git_index_pack`); `cargo test --locked -p slates-server --lib -- vcs_http::git::tests::
+  vcs_http::daemon_edge::tests:: vcs_ssh::git::tests:: vcs_ssh::site::tests:: --test-threads=4` 27 of 27, the git edges
+  that call `upload::serve`; `cargo fmt -p slates-git -- --check` clean. Failing first (the Studio, over main 0577ab0bd
+  with this slice, `agents/g296-a640-p4c-red` at 6f3b98227): with `sparse::read`, `Tree::find` and `Answer::died`
+  stubbed, 16 of 105 failed (the eight in `upload/tests/sparse.rs`, the two tree walks, the v2 and v0 deaths, the
+  v2 and v0 exchanges holding the served sparse clone, the v2 round without a pack and the refused filter's), the rest
+  passing. No integration target reaches the service's fetch: the CLI's two version-control tests stop at the edge's
+  `401`. The Linux and Windows runs are owed.
+- **Owed.** `sparse:oid` within `combine:` (refused, the second slice); the revision forms refused by kind; git's
+  band-2 warning of an ambiguous ref name.
 
 ### A-682 — The daemon's StoreLender over A-662's map: upload-pack served from each repository's store on its owner shard, its refs lent by the asker's read right (2026-11-19, g309 for UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Transports" items 1 and 2, §4.17.1 "Policy"; A-625 part 3's second slice; after A-614, A-640 part 2, A-651 part 2, A-653 and A-662)
 Applied in the same change to:

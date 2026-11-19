@@ -91,3 +91,37 @@ cp "$WORK/ref-$(cat "$WORK/ref.name").pack" "$OUT/ref.pack"; cp "$WORK/ref-$(cat
 # From inside OUT, so the listing names the pack by its own name, not by this run's directory.
 (cd "$OUT" && git verify-pack -v ofs.idx > ofs.verify.txt && git verify-pack -v ref.idx > ref.verify.txt)
 for object in $(cat "$WORK/objects"); do printf '%s %s %s\n' "$object" "$(git cat-file -t "$object")" "$(git cat-file -s "$object")"; done > "$OUT/objects.txt"
+# A sparse filter (A-640 part 4; `git clone --filter=sparse:oid=...`), with filters allowed for these alone:
+# `main:dir/file` names a blob whose one pattern, `deep`, matches no path, so the pack holds every commit and tree and
+# no blob; `main:missing` names nothing and `main:dir` a tree, for git's two refusals ("unable to access sparse blob",
+# "unable to parse sparse filter data").
+git config uploadpack.allowFilter true
+for name in main:dir/file main:missing main:dir; do
+  file="$OUT/fetch-sparse-$(printf '%s' "$name" | tr ':/' '--')"
+  { pkt $'command=fetch\n'; pkt $'object-format=sha1\n'; printf 0001
+    pkt $'thin-pack\n'; pkt $'ofs-delta\n'; pkt $'no-progress\n'; pkt "want $HEAD_OID"$'\n'
+    pkt "filter sparse:oid=$name"$'\n'; pkt $'done\n'; printf 0000; } > "$file.request.bin"
+  v2 < "$file.request.bin" > "$file.response.bin" 2> /dev/null || true
+done
+# A name whose refusal is longer than the 128 bytes git's server relays a read of `pack-objects`' errors in, holding a
+# tab, which `die` keeps, and a control byte and DEL, which it shows as `?`.
+LONG="main:$(printf 'a%.0s' $(seq 1 140))"$'\t\x01\x7fz'
+{ pkt $'command=fetch\n'; pkt $'object-format=sha1\n'; printf 0001
+  pkt $'thin-pack\n'; pkt $'ofs-delta\n'; pkt $'no-progress\n'; pkt "want $HEAD_OID"$'\n'
+  pkt "filter sparse:oid=$LONG"$'\n'; pkt $'done\n'; printf 0000; } > "$OUT/fetch-sparse-long.request.bin"
+v2 < "$OUT/fetch-sparse-long.request.bin" > "$OUT/fetch-sparse-long.response.bin" 2> /dev/null || true
+# The refusal under `sideband-all`, alone and with `packfile-uris`: git writes the packfile section's header before
+# `pack-objects` begins when the request names no URI protocol, and otherwise only once its pack begins, which a refusal
+# never does.
+git config uploadpack.allowSidebandAll true
+{ pkt $'command=fetch\n'; pkt $'object-format=sha1\n'; printf 0001
+  pkt $'ofs-delta\n'; pkt $'no-progress\n'; pkt $'sideband-all\n'; pkt "want $HEAD_OID"$'\n'
+  pkt $'filter sparse:oid=main:missing\n'; pkt $'done\n'; printf 0000; } > "$OUT/fetch-sparse-sideband-all.request.bin"
+v2 < "$OUT/fetch-sparse-sideband-all.request.bin" > "$OUT/fetch-sparse-sideband-all.response.bin" 2> /dev/null || true
+git config uploadpack.blobPackfileUri "$BLOB $URIPACK https://example.invalid/$URIPACK.pack"
+{ pkt $'command=fetch\n'; pkt $'object-format=sha1\n'; printf 0001
+  pkt $'ofs-delta\n'; pkt $'no-progress\n'; pkt $'sideband-all\n'; pkt "want $HEAD_OID"$'\n'; pkt $'packfile-uris https\n'
+  pkt $'filter sparse:oid=main:missing\n'; pkt $'done\n'; printf 0000; } > "$OUT/fetch-sparse-uris.request.bin"
+v2 < "$OUT/fetch-sparse-uris.request.bin" > "$OUT/fetch-sparse-uris.response.bin" 2> /dev/null || true
+git config --unset uploadpack.blobPackfileUri; git config --unset uploadpack.allowSidebandAll
+git config --unset uploadpack.allowFilter

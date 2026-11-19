@@ -30,6 +30,7 @@ use super::{Chain, Place, Repository, StoreRefused};
 use crate::negotiation::{CommitRow, Graph};
 use crate::object_name::{Kind, ObjectId};
 use crate::store::rows::ObjectRow;
+use crate::{Admission, PastAdmission};
 
 /// Format: what every tag ref's name begins with.
 const TAGS: &[u8] = b"refs/tags/";
@@ -167,6 +168,58 @@ impl<'r> StoreGraph<'r> {
       Err(refused) => {
         self.failed(GraphFault::Store(refused));
         Vec::new()
+      }
+    }
+  }
+
+  /// The bytes of the blob `id` names, its length charged to `admission` before they are read (A-640 part 4: the blob a
+  /// `sparse:oid` filter reads its patterns from): `None` when the store holds no blob of that name, or cannot read it
+  /// (kept as a fault).
+  pub(crate) fn blob_bytes(
+    &self,
+    id: &ObjectId,
+    admission: &mut Admission,
+  ) -> Result<Option<Vec<u8>>, PastAdmission> {
+    let Some((row, content)) = self.repository.indexed(self.store, id) else {
+      return Ok(None);
+    };
+    if row.kind != Kind::Blob {
+      return Ok(None);
+    }
+    admission.charge(row.len)?;
+    let place = Place::Indexed { row, content };
+    match Repository::bytes_of(self.store, id, &place) {
+      Ok(bytes) => Ok(Some(bytes)),
+      Err(refused) => {
+        self.failed(GraphFault::Store(refused));
+        Ok(None)
+      }
+    }
+  }
+
+  /// What git's tree walk finds for `path` in the tree at `position` (A-640 part 4: a `sparse:oid` filter's
+  /// `<rev>:<path>`, walked as `find_tree_entry` walks it), a submodule's commit an entry like any other: the entry's
+  /// object and the path left below it. `None` when the walk finds nothing or the object at `position` is no tree; a
+  /// tree the store cannot read is kept as a fault.
+  pub(crate) fn tree_entry<'p>(
+    &self,
+    position: u64,
+    path: &'p [u8],
+  ) -> Option<(ObjectId, &'p [u8])> {
+    let (id, _) = self.row(position)?;
+    let Some((row, content)) = self.repository.indexed(self.store, &id) else {
+      self.failed(GraphFault::NoRow { position });
+      return None;
+    };
+    if row.kind != Kind::Tree {
+      return None;
+    }
+    let place = Place::Indexed { row, content };
+    match self.repository.tree_entry(self.store, &id, &place, path) {
+      Ok(found) => found,
+      Err(refused) => {
+        self.failed(GraphFault::Store(refused));
+        None
       }
     }
   }

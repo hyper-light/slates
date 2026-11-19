@@ -237,3 +237,54 @@ proptest! {
     prop_assert!(!report.findings().contains(&FsckId::TreeNotSorted), "{:?}", picks);
   }
 }
+
+/// Format: paths looked up in stock git's `ok-tree` (`lib-x`, `lib.rs`, the subtree `lib`, `link`, `run`, the
+/// submodule `sub`, in git's order), each with what git's `find_tree_entry` finds, traced by hand through its loop: the
+/// entry's name and the path left below it.
+const FOUND: [(&[u8], Option<(&[u8], &[u8])>); 12] = [
+  (b"lib-x", Some((b"lib-x", b""))),
+  (b"lib.rs", Some((b"lib.rs", b""))),
+  (b"lib", Some((b"lib", b""))),
+  (b"lib/", Some((b"lib", b""))),
+  (b"lib/x/y", Some((b"lib", b"x/y"))),
+  (b"lib//x", Some((b"lib", b"/x"))),
+  (b"sub", Some((b"sub", b""))),
+  (b"sub/x", None),
+  (b"run/x", None),
+  (b"li", None),
+  (b"lib-y", None),
+  (b"zzz", None),
+];
+
+/// A-640 part 4 (`tree-walk.c` `find_tree_entry`, git v2.50.1; `fixtures/fsck` `ok-tree`, written by `git mktree`). Do:
+/// look up each path of `FOUND` in the tree stock git wrote with every mode it writes, in both formats. Expect: what
+/// git's loop finds: a name found with nothing left; the subtree with what follows its `/` (nothing after a trailing
+/// `/`, the rest's own leading `/` after `//`); the submodule like any entry, but no path through it or through a file;
+/// and nothing for a name that is not there, an entry after it in order ending the search (`lib-y` at `link`).
+#[test]
+fn a_path_is_found_as_gits_tree_walk_finds_it() {
+  for format in FORMATS {
+    let golden = golden(format, "ok-tree");
+    let tree = Tree::parse(golden.bytes, format, &mut ample()).unwrap();
+    let found: Vec<Option<(&[u8], &[u8])>> = FOUND
+      .iter()
+      .map(|(path, _)| tree.find(path).map(|(entry, below)| (entry.name, below)))
+      .collect();
+    let expected: Vec<Option<(&[u8], &[u8])>> = FOUND.iter().map(|(_, found)| *found).collect();
+    assert_eq!(found, expected, "{format:?}");
+  }
+}
+
+/// A-640 part 4 (`find_tree_entry` ends its search at the first entry after the path's start, which a sorted tree's
+/// order makes right): do write a tree out of order, `b` before `a`, and look up each. Expect: the tree read all the
+/// same, `b` found and `a` not, as git's walk finds them.
+#[test]
+fn a_tree_out_of_order_is_searched_as_git_searches_it() {
+  let id = [0_u8; 20];
+  let mut bytes = Vec::new();
+  Entry::new(Mode::File, b"b", &id).write(&mut bytes);
+  Entry::new(Mode::File, b"a", &id).write(&mut bytes);
+  let tree = Tree::parse(&bytes, ObjectFormat::Sha1, &mut ample()).unwrap();
+  let found = |path: &[u8]| tree.find(path).map(|(entry, _)| entry.name.to_vec());
+  assert_eq!((found(b"a"), found(b"b")), (None, Some(b"b".to_vec())));
+}

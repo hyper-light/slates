@@ -1,0 +1,9 @@
+0012command=fetch
+0017object-format=sha1
+0001000eofs-delta
+0010no-progress
+0011sideband-all
+0032want d0f175d3390380c935e9b56e0cebb715995d838d
+0023filter sparse:oid=main:missing
+0009done
+0000
