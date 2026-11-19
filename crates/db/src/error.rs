@@ -105,10 +105,40 @@ pub enum DbError {
     /// The live members made from it.
     members: u64,
   },
-  /// A review record's change out of its order (§4.17.1 shared piece 6, A-596): an outdated comment moved or outdated
-  /// again, a comment or approval changed at a version not after the one it stands on, an approval bound back to an
-  /// earlier version, or a new record that is already outdated or stale. Never entered in the log.
-  ReviewOutOfOrder,
+  /// A review record's change the review rules refuse (§4.17.1 shared piece 6, A-596), by the rule
+  /// (`crate::review`). Never entered in the log.
+  Review(ReviewRefusal),
+}
+
+/// The rule a review record's change broke (§4.17.1 "Works over works", shared piece 6; A-596; `crate::review`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRefusal {
+  /// The comment is outdated: it never moves, and is never outdated again.
+  Outdated,
+  /// The approval is stale already.
+  Stale,
+  /// The change names a version not after the one the record stands on: a record moves forward only.
+  NotAfter,
+  /// The approval names a version before its approver's standing one, or before the change that made it stale: an
+  /// approval binds to the version its approver saw, never back.
+  Behind,
+  /// A new record that is already outdated or stale.
+  Ended,
+  /// A comment's lines span no bytes: an empty range, or one whose end is past the largest byte position.
+  Empty,
+}
+
+impl fmt::Display for ReviewRefusal {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Outdated => "the comment is outdated",
+      Self::Stale => "the approval is stale",
+      Self::NotAfter => "the version is not after the record's",
+      Self::Behind => "the approval is behind its approver's standing one",
+      Self::Ended => "a new record already outdated or stale",
+      Self::Empty => "the comment's lines span no bytes",
+    })
+  }
 }
 
 impl fmt::Display for DbError {
@@ -157,7 +187,7 @@ impl fmt::Display for DbError {
         f,
         "{members} live members of its lineage were made from this green"
       ),
-      Self::ReviewOutOfOrder => f.write_str("a review record changed out of its order"),
+      Self::Review(rule) => write!(f, "review: {rule}"),
     }
   }
 }

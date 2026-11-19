@@ -1,42 +1,58 @@
-//! Review comments moved with the code (§4.17.1 "Works over works": "A comment's range moves with the code: §4.16's
-//! position mapping shifts it through every delta in between, so a comment stays on its line across rebases. A range
-//! that an edit replaced is marked outdated; it is never moved by a guess"; shared piece 6, A-596).
+//! Review comments moved with the code (§4.17.1 "Works over works", shared piece 6; D-28; A-596): the pure rule that
+//! moves a comment's lines through one later version's change, and the line arithmetic a server anchors one by.
 //!
-//! A comment is anchored to a path, a run of whole lines and the version it was written on. Its lines are held as the
-//! byte range they cover in that version's text, from the first line's first byte through the last line's newline (or
-//! the file's end, for a last line with none), so the engine's position mapping ([`crate::map::map_range`]) moves it
-//! exactly as it moves an increment's ranges: through each later version's delta on the path, in order, a change that
-//! touches the range hands it over (here: the comment is outdated), and a change before it shifts it.
+//! **A comment's anchor.** A comment is anchored to a path, a run of whole lines and the version it was written on
+//! (§4.17.1: "comments anchored to the work, one of its versions, a path and a byte range"). Its lines are held as the
+//! byte range they cover in that version's text, from the first line's first byte through the last line's newline, or
+//! the text's end for a last line with none ([`line_range`]), so the engine's position mapping ([`crate::map`]) moves
+//! it exactly as it moves an increment's ranges (§4.16 "Position mapping"), and a reader is answered its lines again
+//! from the version it stands on ([`lines_of`]).
 //!
-//! Bytes are not lines, and the mapping alone would move a comment onto text that is no longer its lines: an insert at
-//! the range's first byte (the edge rule, [`crate::range::Range::overlaps`]) may add whole lines before it or text
-//! before its first line on the same line; a change to the newline before it joins its first line to the one above;
-//! an append at the end of a last line with no newline lengthens that line. So after each delta the moved range must
-//! still cover whole lines of that version's text, which the caller reads from the version's content
-//! ([`reanchor`]'s `whole_lines`); otherwise the comment is outdated. Unchanged bytes covering whole lines are exactly
-//! the same lines. A comment once outdated stays outdated: a later version that brings the same text back does not move
-//! it there, since that would be a guess. Removing or replacing the file (an unlink, a rename of it or onto it, a
-//! re-creation) outdates it too: following a rename is owed with the engine's path remapping.
+//! **One step** ([`move_through`]): through one later version's canonical delta on the path, a change that meets the
+//! range outdates the comment, a change before it shifts it and a change after it leaves it. Bytes are not lines, so
+//! three facts are judged besides, each read from the delta or from the version's text, never guessed:
+//! - the delta must account for the file's change of length. Every delta the engine records for an edit does (an
+//!   accepted op set fits its base: an extend starts at the base's end and a hole is zeros in the post-state,
+//!   `fits_base` in `crate::engine`), and one that does not edited nothing of the old bytes: the file was replaced
+//!   (a rename onto the path records the new file as one insert at its start). The comment is outdated
+//!   ([`OutdatedBy::FileReplaced`]);
+//! - the edge rule lets an insert at the range's first byte shift it and one at its end leave it
+//!   ([`crate::range::Range::overlaps`]), and a change to the newline just before the range does not meet it. So the
+//!   moved range must still cover whole lines of the new text ([`covers_whole_lines`]); when it does not, text was
+//!   joined to its first or last line (an insert before the first line's first byte, the newline before it deleted or
+//!   overwritten, an append to a last line with no newline), and the comment is outdated
+//!   ([`OutdatedBy::LinesJoined`]). Unchanged bytes that cover whole lines are exactly the same lines: the newlines
+//!   inside them are unchanged, and nothing else stands on their first or last line;
+//! - a change that meets the range itself changed the lines ([`OutdatedBy::LinesChanged`]).
 //!
-//! The oracle is the test module's: a model that re-anchors by diffing each version's whole text against the next's,
-//! line by line, over generated histories of whole-line, in-line and line-joining edits; the two must agree at every
-//! version.
+//! A file removed (an unlink, a rename away, a re-creation) outdates the comment too, judged by the walk that feeds
+//! these steps. Following a renamed file is owed with the engine's path remapping: the verdict answers a work's edit to
+//! a renamed-away file `DeleteModify` today, and a comment is no braver than the verdict. A comment once outdated stays
+//! outdated where it last stood: a later version that brings the same text back does not move it there, since that
+//! would be a guess.
+//!
+//! The walk through a green's versions, and the oracle that holds it to a diff of whole texts over generated histories,
+//! are [`crate::engine::Green::reanchor`]'s.
 
-use crate::map::{Mapped, map_range};
-use crate::ops_doc::{Op, OpKind};
+use crate::map::{Mapped, effect_of, map_range};
+use crate::ops_doc::Op;
 use crate::range::Range;
 
-/// Where a comment stands at a later version.
+/// Why a comment was outdated at a step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Anchored {
-  /// Its lines are unchanged, now covering this byte range of the version's text.
-  Moved(Range),
-  /// A change met its lines (or removed or replaced its file); it is never moved again.
-  Outdated,
+pub enum OutdatedBy {
+  /// Its file was removed, or replaced by bytes that are not an edit of the old ones (a rename onto it, a file made
+  /// again after a removal).
+  FileReplaced,
+  /// A change met its lines' bytes: an edit inside them, over them or of a newline among them.
+  LinesChanged,
+  /// Its bytes are unchanged but are no longer whole lines: text was joined to its first or last line.
+  LinesJoined,
 }
 
-/// The byte range lines `first` through `last` (counting from zero) cover in `text`, through the last one's newline (or
-/// the text's end, for a last line with none); `None` when `first` is after `last` or either is past the text's lines.
+/// The byte range lines `first` through `last` (counting from zero) cover in `text`, through the last one's newline,
+/// or the text's end for a last line with none; `None` when `first` is after `last` or either is past the text's
+/// lines. A text's lines are its runs ending in a newline, and the run after its last newline when that is not empty.
 pub fn line_range(text: &[u8], first: usize, last: usize) -> Option<Range> {
   if first > last {
     return None;
@@ -49,7 +65,9 @@ pub fn line_range(text: &[u8], first: usize, last: usize) -> Option<Range> {
       .get(at..)?
       .iter()
       .position(|byte| *byte == b'\n')
-      .map_or(text.len(), |newline| at.saturating_add(newline).saturating_add(1));
+      .map_or(text.len(), |newline| {
+        at.saturating_add(newline).saturating_add(1)
+      });
     if line == first {
       start = Some(at);
     }
@@ -64,373 +82,217 @@ pub fn line_range(text: &[u8], first: usize, last: usize) -> Option<Range> {
   None
 }
 
-/// Whether `range` covers whole lines of `text`: it is not empty, lies within the text, starts at the text's start or
-/// just after a newline, and ends just after a newline or at the text's end.
-pub fn whole_lines(text: &[u8], range: Range) -> bool {
-  let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end())) else {
+/// Whether `range` covers whole lines of a text `len` bytes long, judged from the byte just before it (`None` at the
+/// text's start, or where there is none) and its own last byte: it is not empty, lies within the text, starts the text
+/// or follows a newline, and ends the text or with a newline. Two bytes and a length decide it, so a caller reads no
+/// more of a version's text than those.
+pub fn covers_whole_lines(range: Range, len: u64, before: Option<u8>, last: Option<u8>) -> bool {
+  let Some(end) = range.start.checked_add(range.len) else {
     return false;
   };
-  if range.len == 0 || end > text.len() {
-    return false;
-  }
-  let starts_a_line = start == 0
-    || start
-      .checked_sub(1)
-      .and_then(|before| text.get(before))
-      .is_some_and(|byte| *byte == b'\n');
-  let ends_a_line = end == text.len()
-    || end
-      .checked_sub(1)
-      .and_then(|last| text.get(last))
-      .is_some_and(|byte| *byte == b'\n');
-  starts_a_line && ends_a_line
+  let starts_a_line = range.start == 0 || before == Some(b'\n');
+  let ends_a_line = end == len || last == Some(b'\n');
+  range.len > 0 && end <= len && starts_a_line && ends_a_line
 }
 
-/// The lines (first and last, counting from zero) a whole-lines `range` covers in `text`; `None` when it covers no
-/// whole lines there ([`whole_lines`]).
+/// The byte at `at` of `text`, if it has one.
+fn byte_at(text: &[u8], at: u64) -> Option<u8> {
+  text.get(usize::try_from(at).ok()?).copied()
+}
+
+/// Whether `range` covers whole lines of `text` ([`covers_whole_lines`] over the whole text).
+pub fn whole_lines(text: &[u8], range: Range) -> bool {
+  let len = u64::try_from(text.len()).unwrap_or(u64::MAX);
+  let before = range
+    .start
+    .checked_sub(1)
+    .and_then(|at| byte_at(text, at));
+  let last = range
+    .start
+    .checked_add(range.len)
+    .and_then(|end| end.checked_sub(1))
+    .and_then(|at| byte_at(text, at));
+  covers_whole_lines(range, len, before, last)
+}
+
+/// The lines, first and last counting from zero, that a whole-lines `range` covers in `text`; `None` when it covers no
+/// whole lines there ([`whole_lines`]). What a reader of a comment is answered, from the version it stands on.
 pub fn lines_of(text: &[u8], range: Range) -> Option<(usize, usize)> {
   if !whole_lines(text, range) {
     return None;
   }
   let start = usize::try_from(range.start).ok()?;
   let end = usize::try_from(range.end()).ok()?;
-  let first = text.get(..start)?.iter().filter(|byte| **byte == b'\n').count();
-  let newlines = text
-    .get(start..end)?
-    .iter()
-    .filter(|byte| **byte == b'\n')
-    .count();
+  let newlines = |bytes: &[u8]| bytes.iter().filter(|byte| **byte == b'\n').count();
+  let first = newlines(text.get(..start)?);
+  let inside = newlines(text.get(start..end)?);
   let ends_with_newline = text
     .get(end.checked_sub(1)?)
     .is_some_and(|byte| *byte == b'\n');
   let last = first
-    .saturating_add(newlines)
+    .saturating_add(inside)
     .saturating_sub(usize::from(ends_with_newline));
   Some((first, last))
 }
 
-/// Whether `op` removes or replaces the file a comment is on, or names it as a rename's other end: such a change takes
-/// the comment's lines with it, whatever its bytes.
-fn replaces_the_file(op: &Op) -> bool {
-  matches!(
-    op.kind,
-    OpKind::Unlink
-      | OpKind::Rename
-      | OpKind::Create
-      | OpKind::Mkdir
-      | OpKind::Rmdir
-      | OpKind::Link
-      | OpKind::Symlink
-      | OpKind::Mknod
-  )
+/// The change of length `ops` make to a file: the bytes each adds less the bytes each removes ([`effect_of`]).
+fn net_change(ops: &[Op]) -> i128 {
+  ops
+    .iter()
+    .filter_map(effect_of)
+    .fold(0i128, |net, (_, removed, added)| {
+      net
+        .saturating_add(i128::from(added))
+        .saturating_sub(i128::from(removed))
+    })
 }
 
-/// Moves a comment's `range` (whole lines of the text it was written on) forward through `deltas`, oldest first: each
-/// later version's canonical ops that touch the comment's path or name it as a rename's other end, sorted by offset
-/// and non-overlapping, as the engine maps an increment through them. `whole_lines(i, range)` says whether `range`
-/// covers whole lines of the text after delta `i`, read from that version's content ([`whole_lines`] over it). The
-/// comment is outdated at the first delta that removes or replaces its file, touches its range, or leaves it not on
-/// whole lines; otherwise it moves to where the last delta left it.
-pub fn reanchor(
+/// Moves a comment's `range` (whole lines of its file's text before the step) through one later version's canonical
+/// ops on its path: sorted by offset and non-overlapping, in the coordinates of the version before, as the engine maps
+/// an increment's ranges through them. `lengths` is the file's length before the step and after it; `whole_lines` says
+/// whether a range covers whole lines of the text after it ([`covers_whole_lines`] over that version's bytes). The
+/// range in the text after the step, or why the comment is outdated there.
+pub fn move_through(
   range: Range,
-  deltas: &[&[Op]],
-  whole_lines: impl Fn(usize, Range) -> bool,
-) -> Anchored {
-  let mut current = range;
-  for (index, ops) in deltas.iter().enumerate() {
-    if ops.iter().any(replaces_the_file) {
-      return Anchored::Outdated;
-    }
-    match map_range(&[*ops], current) {
-      Mapped::Overlaps => return Anchored::Outdated,
-      Mapped::Shifted(next) => {
-        if !whole_lines(index, next) {
-          return Anchored::Outdated;
-        }
-        current = next;
-      }
-    }
+  ops: &[Op],
+  (before, after): (u64, u64),
+  whole_lines: impl FnOnce(Range) -> bool,
+) -> Result<Range, OutdatedBy> {
+  if i128::from(before).saturating_add(net_change(ops)) != i128::from(after) {
+    return Err(OutdatedBy::FileReplaced);
   }
-  Anchored::Moved(current)
+  match map_range(&[ops], range) {
+    Mapped::Overlaps => Err(OutdatedBy::LinesChanged),
+    Mapped::Shifted(moved) if whole_lines(moved) => Ok(moved),
+    Mapped::Shifted(_) => Err(OutdatedBy::LinesJoined),
+  }
 }
 
 #[cfg(test)]
-// proptest's strategy types carry `Arc` (D-8's harness exception).
-#[allow(clippy::disallowed_types)]
 mod tests {
-  use proptest::prelude::*;
-
   use super::*;
+  use crate::ops_doc::OpKind;
 
   /// An op of `kind` at `at` of `len` bytes on path 0, adding no content of its own.
-  fn op(kind: OpKind, at: usize, len: usize) -> Op {
+  fn op(kind: OpKind, at: u64, len: u64) -> Op {
     Op {
       kind,
       flags: 0,
       path: 0,
-      at: u64::try_from(at).unwrap(),
-      len: u64::try_from(len).unwrap(),
+      at,
+      len,
       src: u64::MAX,
     }
   }
 
-  /// One generated edit of a history, its positions taken modulo what the text holds.
-  #[derive(Clone, Debug)]
-  enum Edit {
-    /// Fresh whole lines inserted before line `at` (or at the end).
-    InsertLines { at: usize, count: usize },
-    /// Lines `at` onward, `count` of them, deleted.
-    DeleteLines { at: usize, count: usize },
-    /// Lines `at` onward, `count` of them, replaced by as many fresh ones.
-    ReplaceLines { at: usize, count: usize },
-    /// Fresh text inserted in line `at`, `into` bytes into it (zero: at its very start, before its first byte).
-    InsertInLine { at: usize, into: usize },
-    /// The newline ending line `at` deleted, joining the next line to it.
-    JoinNext { at: usize },
-    /// Fresh text appended at the end of the text, with no newline.
-    AppendTail,
+  /// `text` with its `removed` bytes at `at` replaced by `inserted`: the text after a step, which its whole-lines
+  /// judgement reads.
+  fn moved_text(text: &[u8], at: usize, removed: usize, inserted: &[u8]) -> Vec<u8> {
+    let mut out = text[..at].to_vec();
+    out.extend_from_slice(inserted);
+    out.extend_from_slice(&text[at + removed..]);
+    out
   }
 
-  /// A history's text as lines, each unique (a serial no earlier text held), the last one perhaps with no newline.
-  #[derive(Clone, Debug)]
-  struct Text {
-    lines: Vec<Vec<u8>>,
-    serial: u64,
-  }
-
-  impl Text {
-    /// A text of `count` fresh lines, each ending in a newline.
-    fn new(count: usize) -> Text {
-      let mut text = Text {
-        lines: Vec::new(),
-        serial: 0,
-      };
-      for _ in 0..count {
-        let line = text.fresh(true);
-        text.lines.push(line);
-      }
-      text
-    }
-
-    /// Fresh unique bytes, with a newline when `newline`.
-    fn fresh(&mut self, newline: bool) -> Vec<u8> {
-      self.serial += 1;
-      let mut bytes = format!("<{}>", self.serial).into_bytes();
-      if newline {
-        bytes.push(b'\n');
-      }
-      bytes
-    }
-
-    /// The whole text.
-    fn bytes(&self) -> Vec<u8> {
-      self.lines.concat()
-    }
-
-    /// The byte offset line `at` starts at (the text's length past the last line).
-    fn offset(&self, at: usize) -> usize {
-      self.lines.iter().take(at).map(Vec::len).sum()
-    }
-
-    /// Whether the last line has no newline.
-    fn open_tail(&self) -> bool {
-      self.lines.last().is_some_and(|last| last.last() != Some(&b'\n'))
-    }
-
-    /// Applies `edit` and returns the canonical delta it is on the path (sorted, non-overlapping, in the text's
-    /// coordinates before it), or `None`, changing nothing, when the text cannot take it.
-    fn apply(&mut self, edit: &Edit) -> Option<Vec<Op>> {
-      let lines = self.lines.len();
-      match *edit {
-        Edit::InsertLines { at, count } => {
-          let at = at % (lines + 1);
-          // After a last line with no newline the first inserted line would join it.
-          if at == lines && self.open_tail() {
-            return None;
-          }
-          let made: Vec<Vec<u8>> = (0..count.max(1)).map(|_| self.fresh(true)).collect();
-          let len = made.iter().map(Vec::len).sum();
-          let offset = self.offset(at);
-          self.lines.splice(at..at, made);
-          Some(vec![op(OpKind::Insert, offset, len)])
-        }
-        Edit::DeleteLines { at, count } => {
-          if lines == 0 {
-            return None;
-          }
-          let at = at % lines;
-          // Whole lines end in a newline but the last, so deleting whole lines never joins two.
-          let count = count.max(1).min(lines - at);
-          let offset = self.offset(at);
-          let len = self.offset(at + count) - offset;
-          self.lines.drain(at..at + count);
-          Some(vec![op(OpKind::Delete, offset, len)])
-        }
-        Edit::ReplaceLines { at, count } => {
-          if lines == 0 {
-            return None;
-          }
-          let at = at % lines;
-          let count = count.max(1).min(lines - at);
-          let offset = self.offset(at);
-          let old = self.offset(at + count) - offset;
-          let open = self.lines[at + count - 1].last() != Some(&b'\n');
-          let mut made: Vec<Vec<u8>> = (0..count).map(|_| self.fresh(true)).collect();
-          if open && let Some(last) = made.last_mut() {
-            last.pop();
-          }
-          let new: usize = made.iter().map(Vec::len).sum();
-          self.lines.splice(at..at + count, made);
-          // A replacement's canonical form: the shorter length overwritten in place, the rest inserted or deleted just
-          // after it (an insert at an overwrite's end edge does not overlap it).
-          let common = old.min(new);
-          let mut ops = vec![op(OpKind::Overwrite, offset, common)];
-          if new > old {
-            ops.push(op(OpKind::Insert, offset + common, new - old));
-          } else if old > new {
-            ops.push(op(OpKind::Delete, offset + common, old - new));
-          }
-          Some(ops)
-        }
-        Edit::InsertInLine { at, into } => {
-          if lines == 0 {
-            return None;
-          }
-          let at = at % lines;
-          let body = self.lines[at].len() - usize::from(self.lines[at].last() == Some(&b'\n'));
-          let into = into % (body + 1);
-          let made = self.fresh(false);
-          let offset = self.offset(at) + into;
-          let len = made.len();
-          self.lines[at].splice(into..into, made);
-          Some(vec![op(OpKind::Insert, offset, len)])
-        }
-        Edit::JoinNext { at } => {
-          if lines < 2 {
-            return None;
-          }
-          let at = at % (lines - 1);
-          let offset = self.offset(at + 1) - 1;
-          self.lines[at].pop();
-          let next = self.lines.remove(at + 1);
-          self.lines[at].extend(next);
-          Some(vec![op(OpKind::Delete, offset, 1)])
-        }
-        Edit::AppendTail => {
-          let made = self.fresh(false);
-          let offset = self.offset(lines);
-          let len = made.len();
-          match self.lines.last_mut() {
-            Some(last) if last.last() != Some(&b'\n') => last.extend(made),
-            _ => self.lines.push(made),
-          }
-          Some(vec![op(OpKind::Extend, offset, len)])
-        }
-      }
-    }
-  }
-
-  /// The oracle: where a comment on lines `first..=last` of `before` stands in `after`, by diffing the two whole texts
-  /// line by line. Every line is unique, so the diff is unambiguous: a line is unchanged exactly when `after` holds a
-  /// line of the same bytes. The comment moves when each of its lines is unchanged and they stand together, in order, in
-  /// `after`; otherwise it is outdated.
-  fn model_step(before: &Text, after: &Text, first: usize, last: usize) -> Option<(usize, usize)> {
-    let position = |line: &Vec<u8>| after.lines.iter().position(|other| other == line);
-    let start = position(before.lines.get(first)?)?;
-    for (offset, line) in before.lines.get(first..=last)?.iter().enumerate() {
-      if position(line)? != start + offset {
-        return None;
-      }
-    }
-    Some((start, start + (last - first)))
-  }
-
-  /// A generated history: a first text's line count, a comment's first line and extent on it, and the edits after it.
-  fn history() -> impl Strategy<Value = (usize, usize, usize, Vec<Edit>)> {
-    let edit = prop_oneof![
-      (0..12usize, 1..3usize).prop_map(|(at, count)| Edit::InsertLines { at, count }),
-      (0..12usize, 1..3usize).prop_map(|(at, count)| Edit::DeleteLines { at, count }),
-      (0..12usize, 1..3usize).prop_map(|(at, count)| Edit::ReplaceLines { at, count }),
-      (0..12usize, 0..8usize).prop_map(|(at, into)| Edit::InsertInLine { at, into }),
-      (0..12usize).prop_map(|at| Edit::JoinNext { at }),
-      Just(Edit::AppendTail),
-    ];
-    (
-      1..10usize,
-      0..10usize,
-      0..4usize,
-      prop::collection::vec(edit, 0..12),
-    )
-  }
-
-  proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
-
-    /// A-596's oracle (§4.17.1 "Works over works"). Do: generate a text of unique lines, a comment on a run of its
-    /// lines, and a history of edits (whole lines inserted, deleted or replaced, text inserted inside a line or at its
-    /// very start, a line joined to the next, text appended to the end), one canonical delta a version; move the comment
-    /// through the deltas by position mapping, and re-anchor it by diffing each version's whole text against the next.
-    /// Expect the two to agree at every version: the same lines while it moves, outdated at the same version, and
-    /// outdated for good after.
-    #[test]
-    fn a_comment_moved_by_position_mapping_is_where_diffing_whole_texts_puts_it(
-      (lines, first, extra, edits) in history()
-    ) {
-      let mut text = Text::new(lines);
-      let first = first % lines;
-      let last = (first + extra).min(lines - 1);
-      let range = line_range(&text.bytes(), first, last).unwrap();
-      let mut texts = vec![text.clone()];
-      let mut deltas: Vec<Vec<Op>> = Vec::new();
-      for edit in &edits {
-        if let Some(ops) = text.apply(edit) {
-          deltas.push(ops);
-          texts.push(text.clone());
-        }
-      }
-      let mut model = Some((first, last));
-      for upto in 0..=deltas.len() {
-        if upto > 0 {
-          model = model.and_then(|(a, b)| model_step(&texts[upto - 1], &texts[upto], a, b));
-        }
-        let held: Vec<&[Op]> = deltas[..upto].iter().map(Vec::as_slice).collect();
-        let mapped = reanchor(range, &held, |index, moved| {
-          whole_lines(&texts[index + 1].bytes(), moved)
-        });
-        let mapped_lines = match mapped {
-          Anchored::Moved(moved) => lines_of(&texts[upto].bytes(), moved),
-          Anchored::Outdated => None,
-        };
-        prop_assert_eq!(mapped_lines, model, "at version {}: {:?}", upto, texts[upto]);
-      }
-    }
-  }
-
-  /// A-596. Do: anchor a comment on lines 1 and 2 of three, then (each alone) insert a whole line before them, insert
-  /// text before line 1's first byte on line 1, and unlink the file. Expect the comment moved one line down, outdated
-  /// (its first line now holds other text), and outdated (its file gone).
+  /// A-596. Do: name lines of a text with a final newline, of one without, and of one with an empty line, then read
+  /// each range's lines back. Expect each run of lines covered from its first byte through its last newline (or the
+  /// text's end), the same lines read back, and lines past the text, a reversed run, a range starting inside a line,
+  /// one ending inside a line, an empty one and one past the text's end each refused.
   #[test]
-  fn a_comment_moves_on_whole_lines_and_is_outdated_by_a_change_to_its_lines_or_file() {
+  fn a_run_of_lines_is_the_bytes_from_its_first_byte_through_its_last_newline() {
+    let text = b"zero\none\ntwo\n";
+    assert_eq!(line_range(text, 0, 0), Some(Range::new(0, 5)));
+    assert_eq!(line_range(text, 1, 2), Some(Range::new(5, 8)));
+    assert_eq!(line_range(text, 2, 3), None);
+    assert_eq!(line_range(text, 2, 1), None);
+    assert_eq!(lines_of(text, Range::new(5, 8)), Some((1, 2)));
+    let open = b"zero\none";
+    assert_eq!(line_range(open, 1, 1), Some(Range::new(5, 3)));
+    assert_eq!(lines_of(open, Range::new(5, 3)), Some((1, 1)));
+    assert_eq!(lines_of(open, Range::new(0, 8)), Some((0, 1)));
+    let blank = b"a\n\nb\n";
+    assert_eq!(line_range(blank, 1, 1), Some(Range::new(2, 1)));
+    assert_eq!(lines_of(blank, Range::new(2, 3)), Some((1, 2)));
+    for (range, why) in [
+      (Range::new(1, 4), "starts inside a line"),
+      (Range::new(0, 3), "ends inside a line"),
+      (Range::new(5, 0), "is empty"),
+      (Range::new(5, 9), "runs past the text"),
+      (Range::new(u64::MAX, 2), "has no end"),
+    ] {
+      assert!(!whole_lines(text, range), "a range that {why}");
+      assert_eq!(lines_of(text, range), None, "a range that {why}");
+    }
+  }
+
+  /// A-596. Do: move a comment on lines 1 and 2 of three through one step each: whole lines inserted above them, an
+  /// insert at their first byte that ends in a newline, one that does not, the newline before them deleted, an edit
+  /// inside them, lines appended after them, and the file replaced by an insert at its start that does not account for
+  /// its length. Expect: moved down by the inserted lines, moved by the insert that ends a line, outdated as joined by
+  /// the other insert and by the deleted newline, outdated as changed by the edit inside, unmoved by the lines after,
+  /// and outdated as replaced by the insert that is no edit of the old bytes.
+  #[test]
+  fn one_step_moves_whole_lines_and_outdates_lines_a_change_met_joined_or_replaced() {
     let text = b"zero\none\ntwo\n".to_vec();
     let range = line_range(&text, 1, 2).unwrap();
-    assert_eq!(range, Range::new(5, 8));
-    let after = b"new\nzero\none\ntwo\n".to_vec();
-    let inserted = [op(OpKind::Insert, 5, 4)];
+    let step = |ops: &[Op], after: &[u8]| {
+      move_through(
+        range,
+        ops,
+        (text.len() as u64, after.len() as u64),
+        |moved| whole_lines(after, moved),
+      )
+    };
+    let above = moved_text(&text, 0, 0, b"new\n");
+    assert_eq!(step(&[op(OpKind::Insert, 0, 4)], &above), Ok(Range::new(9, 8)));
+    assert_eq!(lines_of(&above, Range::new(9, 8)), Some((2, 3)));
+    let ending_a_line = moved_text(&text, 5, 0, b"new\n");
     assert_eq!(
-      reanchor(range, &[&inserted], |_, moved| whole_lines(&after, moved)),
-      Anchored::Moved(Range::new(9, 8))
+      step(&[op(OpKind::Insert, 5, 4)], &ending_a_line),
+      Ok(Range::new(9, 8))
     );
-    assert_eq!(lines_of(&after, Range::new(9, 8)), Some((2, 3)));
-    let prefixed = b"zero\nxxone\ntwo\n".to_vec();
-    let prefix = [op(OpKind::Insert, 5, 2)];
+    let prefixed = moved_text(&text, 5, 0, b"xx");
     assert_eq!(
-      reanchor(range, &[&prefix], |_, moved| whole_lines(&prefixed, moved)),
-      Anchored::Outdated
+      step(&[op(OpKind::Insert, 5, 2)], &prefixed),
+      Err(OutdatedBy::LinesJoined)
     );
-    let unlinked = [op(OpKind::Unlink, 0, 0)];
+    let joined = moved_text(&text, 4, 1, b"");
     assert_eq!(
-      reanchor(range, &[&unlinked], |_, _| true),
-      Anchored::Outdated
+      step(&[op(OpKind::Delete, 4, 1)], &joined),
+      Err(OutdatedBy::LinesJoined)
     );
+    let inside = moved_text(&text, 6, 0, b"x");
+    assert_eq!(
+      step(&[op(OpKind::Insert, 6, 1)], &inside),
+      Err(OutdatedBy::LinesChanged)
+    );
+    let after = moved_text(&text, 13, 0, b"three\n");
+    assert_eq!(step(&[op(OpKind::Extend, 13, 6)], &after), Ok(range));
+    let replaced = b"another file\n".to_vec();
+    assert_eq!(
+      step(&[op(OpKind::Insert, 0, 13)], &replaced),
+      Err(OutdatedBy::FileReplaced)
+    );
+  }
+
+  /// A-596. Do: a comment on a last line with no newline, then text appended to that line, and then a newline appended
+  /// alone. Expect both outdated as joined: the line holds other text after the comment's bytes either way.
+  #[test]
+  fn an_append_to_an_open_last_line_outdates_a_comment_on_it() {
+    let text = b"zero\none".to_vec();
+    let range = line_range(&text, 1, 1).unwrap();
+    for added in [&b"more"[..], &b"\n"[..]] {
+      let after = moved_text(&text, 8, 0, added);
+      assert_eq!(
+        move_through(
+          range,
+          &[op(OpKind::Extend, 8, added.len() as u64)],
+          (8, after.len() as u64),
+          |moved| whole_lines(&after, moved),
+        ),
+        Err(OutdatedBy::LinesJoined),
+        "{added:?}"
+      );
+    }
   }
 }

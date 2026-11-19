@@ -1447,45 +1447,48 @@ pub struct BranchRecord {
 }
 
 /// A review comment on a request (§4.17.1 "Works over works", shared piece 6; A-596): anchored to a path, the whole lines
-/// a byte range covers, and the version of the request's work it stands on. It moves with the work by position mapping
-/// (`slates_merge::review`), and once a change meets its lines it is outdated: it stays where it last stood, never moved
-/// again.
+/// a byte range covers, and the version of the request it stands on (the version of the green whose versions are the
+/// request's updates). It moves forward with the request by the engine's position mapping
+/// (`slates_merge::engine::Green::reanchor`), its lines unchanged; once a change meets them it is outdated where it last
+/// stood, never moved again (`crate::review`).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct ReviewCommentRecord {
   /// The repository whose request it is on.
   pub repository: RepositoryId,
-  /// The request: the work held for review.
+  /// The request: the volume whose versions are the request's updates.
   pub request: VolumeId,
-  /// Its number among the request's comments.
+  /// Its number among the request's comments, from one.
   pub id: u64,
   /// Who wrote it.
   pub author: Principal,
-  /// The path it is on, as the work names it.
+  /// The path it is on, as the request names it.
   pub path: String,
   /// The first byte of its lines in the version it stands on.
   pub start: u64,
-  /// The bytes its lines cover there, through the last one's newline.
+  /// The bytes its lines cover there, through the last one's newline (or the text's end).
   pub len: u64,
-  /// The work's version it stands on: the one it was written on, or the one it was last moved to.
+  /// The version it stands on: the one it was written on, or the one it was last moved to.
   pub version: u64,
-  /// Whether a change met its lines.
-  pub outdated: bool,
+  /// The version whose change outdated it, once one has: it stands where it last stood (`start` and `len` at
+  /// `version`) and never moves again.
+  pub outdated_at: Option<u64>,
   /// What it says.
   pub body: String,
 }
 
-/// An approval of a request (§4.17.1, shared piece 6; A-596): bound to the version of the request's work it saw, and
-/// stale once a later change meets what the repository's policy says an approval covers.
+/// An approval of a request (§4.17.1, shared piece 6; A-596): bound to the version of the request its approver saw, and
+/// stale once a later change meets what the repository's policy says an approval covers (`crate::review`). A standing
+/// approval is the evidence a policy counts.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct ReviewApprovalRecord {
   /// The repository whose request it is on.
   pub repository: RepositoryId,
-  /// The request: the work held for review.
+  /// The request: the volume whose versions are the request's updates.
   pub request: VolumeId,
   /// Who approved.
   pub approver: Principal,
-  /// The work's version it saw.
+  /// The version of the request it saw.
   pub version: u64,
-  /// Whether a later change made it stale.
-  pub stale: bool,
+  /// The version whose change made it stale, once one has.
+  pub stale_at: Option<u64>,
 }
