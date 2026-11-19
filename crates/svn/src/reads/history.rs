@@ -81,7 +81,11 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
   }
 
   /// `history_prev`: one step back from a location.
-  fn history_step(&self, history: &History, cross_copies: bool) -> Result<Option<History>, Failure> {
+  fn history_step(
+    &self,
+    history: &History,
+    cross_copies: bool,
+  ) -> Result<Option<History>, Failure> {
     let (path, revision, reported) = match &history.hint {
       Some(_) if !cross_copies => return Ok(None),
       Some((path, revision)) => (path.as_str(), *revision, false),
@@ -142,7 +146,10 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     let Some((source, source_revision)) = copy_root.copy_from() else {
       return Ok(None);
     };
-    Ok(Some((copied_in, (join(source, remainder), source_revision))))
+    Ok(Some((
+      copied_in,
+      (join(source, remainder), source_revision),
+    )))
   }
 }
 

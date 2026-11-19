@@ -130,7 +130,11 @@ impl LogRequest {
       .collect::<Option<Vec<String>>>()?;
     let (limit, merged, revprops) = match params.len() {
       COMPAT_ITEMS => (0, false, Revprops::Named(compat_revprops())),
-      LIMIT_ITEMS => (revnum_count(params.get(5))?, false, Revprops::Named(compat_revprops())),
+      LIMIT_ITEMS => (
+        revnum_count(params.get(5))?,
+        false,
+        Revprops::Named(compat_revprops()),
+      ),
       count if count >= WHOLE_ITEMS => Self::whole_tail(params)?,
       _ => return None,
     };
@@ -358,7 +362,8 @@ impl LogStream {
     let descending = start >= end;
     let (oldest, youngest) = (start.min(end), start.max(end));
     let paths = &self.request.paths;
-    let root_alone = paths.is_empty() || (paths.len() == 1 && paths.first().is_some_and(|path| path == ROOT));
+    let root_alone =
+      paths.is_empty() || (paths.len() == 1 && paths.first().is_some_and(|path| path == ROOT));
     if root_alone && !self.request.merged {
       let count = youngest.saturating_sub(oldest).saturating_add(1);
       let remaining = match self.request.limit {
@@ -414,7 +419,11 @@ impl LogStream {
 
   /// One revision of `do_logs`' loop: every history checked at the current revision, the revision sent (newest first)
   /// or gathered (oldest first) when one holds it, then the next revision any history holds.
-  fn walk<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>, mut walk: Walk) -> Result<(), Stop> {
+  fn walk<R: Repository + ?Sized>(
+    &mut self,
+    reads: &mut Reads<'_, R>,
+    mut walk: Walk,
+  ) -> Result<(), Stop> {
     let mut changed = false;
     let mut any_left = false;
     for info in &mut walk.histories {
@@ -509,7 +518,12 @@ impl LogStream {
     let copy = change
       .copy_from
       .iter()
-      .flat_map(|source| [Value::String(source.path.as_bytes()), Value::Number(source.revision)])
+      .flat_map(|source| {
+        [
+          Value::String(source.path.as_bytes()),
+          Value::Number(source.revision),
+        ]
+      })
       .collect();
     let flags = Value::List(vec![
       Value::String(kind_word(change.kind).as_bytes()),
@@ -539,7 +553,10 @@ impl LogStream {
       Revprops::Named(names) if names.is_empty() => return None,
       Revprops::Named(names) => Some(names),
     };
-    let all = reads.repository.revision_properties(revision).unwrap_or_default();
+    let all = reads
+      .repository
+      .revision_properties(revision)
+      .unwrap_or_default();
     let Some(names) = wanted else {
       return Some(all);
     };
@@ -578,7 +595,11 @@ impl LogStream {
         .find(|(held, _)| *held == name)
         .map(|(_, value)| *value)
     };
-    let (author, date, message) = (find(AUTHOR_PROPERTY), find(DATE_PROPERTY), find(LOG_PROPERTY));
+    let (author, date, message) = (
+      find(AUTHOR_PROPERTY),
+      find(DATE_PROPERTY),
+      find(LOG_PROPERTY),
+    );
     let standard = author.is_some()
       && date.is_some()
       && message.is_some()
@@ -598,12 +619,11 @@ impl LogStream {
     }
     reads.out.extend_from_slice(LIST_CLOSE);
     self.receiver.started = false;
-    let optional = |value: Option<&[u8]>| Value::List(value.map(Value::String).into_iter().collect());
     for item in [
       Value::Number(revision),
-      optional(author),
-      optional(date),
-      optional(message),
+      optional_string(author),
+      optional_string(date),
+      optional_string(message),
       Value::Word(super::bool_word(has_children)),
       Value::Word(super::bool_word(false)),
       Value::Number(u64::try_from(rest.len()).unwrap_or(u64::MAX)),
@@ -684,7 +704,12 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
   /// `get_history`: the path's next history location, from the history kept open or from one opened again at the last
   /// location (one step past it, two after the first time); done when the history ends or passes the range's oldest
   /// revision.
-  fn next_history(&self, info: &mut PathInfo, strict: bool, start: Revision) -> Result<(), Failure> {
+  fn next_history(
+    &self,
+    info: &mut PathInfo,
+    strict: bool,
+    start: Revision,
+  ) -> Result<(), Failure> {
     let next = if info.kept {
       match &info.history {
         Some(history) => self.history_prev(history, !strict)?,
@@ -715,6 +740,11 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     }
     Ok(())
   }
+}
+
+/// A string in a list of its own, or an empty list (`write_tuple_string_opt_list`).
+fn optional_string(value: Option<&[u8]>) -> Value<'_> {
+  Value::List(value.map(Value::String).into_iter().collect())
 }
 
 /// `next_history_rev`: the youngest revision a history not yet done is at; `None` when every one is done.

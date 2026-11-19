@@ -220,11 +220,9 @@ impl Fixture {
     let had = tree.get(&path).is_some_and(|node| node.1.has_mergeinfo());
     // FSFS records no property change for a node added with an empty property block (recorded: `/trunk A` with
     // `( dir false false )` in the `log` session), so such a row carries no property list.
-    let properties = field("props")
-      .map(|list| self.list(list))
-      .filter(|list| {
-        !(matches!(action, Action::Add | Action::Replace) && *list == PropertyList::Empty)
-      });
+    let properties = field("props").map(|list| self.list(list)).filter(|list| {
+      !(matches!(action, Action::Add | Action::Replace) && *list == PropertyList::Empty)
+    });
     let text = field("text").map(|text| {
       let bytes = unhex(text);
       let (md5, sha1) = (unhex(field("md5").unwrap()), unhex(field("sha1").unwrap()));
@@ -1099,7 +1097,9 @@ fn a_log_streams_a_revision_a_step_and_refuses_merged_revisions_until_built() {
   assert!(narrow_slices > 12 && wide_slices == 1, "{narrow_slices}");
   let command = b"( log ( ( 5:trunk ) ( 11 ) ( 0 ) false false 0 true revprops ( ) ) ) ";
   let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
-  assert!(out.ends_with(b"done ( failure ( ( 200007 36:Trying to use an unsupported feature 0: 0 ) ) ) "));
+  assert!(
+    out.ends_with(b"done ( failure ( ( 200007 36:Trying to use an unsupported feature 0: 0 ) ) ) ")
+  );
 }
 
 /// A-613 part 2 (`log`): `fill_log_entry` hands over every revision property when the names asked are as many as the
