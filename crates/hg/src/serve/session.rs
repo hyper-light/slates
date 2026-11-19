@@ -390,8 +390,8 @@ fn advertised(
   let mut quoted = Vec::new();
   capabilities::encode_bundle2_value(&blob, &mut quoted);
   let (names, header_line): (&[&[u8]], u64) = match transport {
-    Transport::Ssh => (&SERVED, 0),
-    Transport::Http { header_line } => (&SERVED_HTTP, header_line),
+    Transport::Ssh => (SERVED.as_slice(), 0),
+    Transport::Http { header_line } => (SERVED_HTTP.as_slice(), header_line),
   };
   let header_line = Decimal::unsigned(header_line);
   let value = |name: &[u8]| -> Option<&[u8]> {
@@ -403,7 +403,7 @@ fn advertised(
       _ => None,
     }
   };
-  let line: Vec<(&[u8], Option<&[u8]>)> = names.iter().map(|name| (*name, value(name))).collect();
+  let line: Vec<(&[u8], Option<&[u8]>)> = names.iter().map(|name| (*name, value(*name))).collect();
   let len = line.iter().fold(0_usize, |total, (name, value)| {
     total
       .saturating_add(name.len())
