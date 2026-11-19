@@ -52,6 +52,70 @@ pub(crate) fn bytes_acked_in(info: &[u8; TCP_INFO_THROUGH_BYTES_ACKED]) -> Optio
   ))
 }
 
+// ============================================================================== a connection's round trip, as its kernel measured it
+
+/// Format: where Linux's `struct tcp_info` keeps `tcpi_rtt`, the smoothed round trip in microseconds, a `__u32` in the
+/// kernel's byte order: after eight one-byte fields and fifteen `__u32`s (`include/uapi/linux/tcp.h`, unchanged from
+/// 2.6 through mainline, read 2026-11-19).
+const TCP_INFO_RTT_AT: usize = 68;
+
+/// Format: the bytes of Linux's `struct tcp_info` read for `tcpi_rtt`, through its end ([`TCP_INFO_RTT_AT`] and its four
+/// bytes).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const TCP_INFO_THROUGH_RTT: usize = 72;
+
+/// Format: where macOS's `struct tcp_connection_info` keeps `tcpi_srtt`, the smoothed round trip in milliseconds, a
+/// `u_int32_t` in the kernel's byte order: after four one-byte fields and ten `u_int32_t`s (xnu `bsd/netinet/tcp.h`).
+const TCP_CONNECTION_INFO_SRTT_AT: usize = 44;
+
+/// Format: the bytes of macOS's `struct tcp_connection_info` read for `tcpi_srtt`, through its end
+/// ([`TCP_CONNECTION_INFO_SRTT_AT`] and its four bytes).
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+pub(crate) const TCP_CONNECTION_INFO_THROUGH_SRTT: usize = 48;
+
+/// Format: the clock Linux measures `tcpi_rtt` with, and Windows `RttUs`: microseconds, in nanoseconds.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) const MICROSECOND_NS: u64 = 1_000;
+
+/// Format: the clock macOS measures `tcpi_srtt` with: milliseconds (xnu's `TCP_RETRANSHZ`, 1000 a second), in
+/// nanoseconds.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+const MILLISECOND_NS: u64 = 1_000_000;
+
+/// The `u32` at `at` in `record`, in the kernel's byte order.
+fn word_at(record: &[u8], at: usize) -> Option<u32> {
+  let end = at.checked_add(size_of::<u32>())?;
+  let word = record.get(at..end)?;
+  Some(u32::from_ne_bytes(
+    <[u8; size_of::<u32>()]>::try_from(word).ok()?,
+  ))
+}
+
+/// The round trip in the first [`TCP_INFO_THROUGH_RTT`] bytes of a Linux `struct tcp_info`: `tcpi_rtt`, microseconds.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn linux_round_trip_in(
+  info: &[u8; TCP_INFO_THROUGH_RTT],
+) -> Option<crate::tcp::RoundTrip> {
+  let micros = word_at(info, TCP_INFO_RTT_AT)?;
+  Some(crate::tcp::RoundTrip {
+    ns: u64::from(micros).saturating_mul(MICROSECOND_NS),
+    resolution_ns: MICROSECOND_NS,
+  })
+}
+
+/// The round trip in the first [`TCP_CONNECTION_INFO_THROUGH_SRTT`] bytes of a macOS `struct tcp_connection_info`:
+/// `tcpi_srtt`, milliseconds.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+pub(crate) fn macos_round_trip_in(
+  info: &[u8; TCP_CONNECTION_INFO_THROUGH_SRTT],
+) -> Option<crate::tcp::RoundTrip> {
+  let millis = word_at(info, TCP_CONNECTION_INFO_SRTT_AT)?;
+  Some(crate::tcp::RoundTrip {
+    ns: u64::from(millis).saturating_mul(MILLISECOND_NS),
+    resolution_ns: MILLISECOND_NS,
+  })
+}
+
 /// The bytes a stream's writers have handed its kernel since the connection was made, from the kernel's two counters
 /// (A-550): the bytes acknowledged (`acked`; none where the kernel keeps no such count) and the bytes queued and not yet
 /// acknowledged (`queued`). Their sum is the count only when both describe one instant, and they are read apart, so the
@@ -227,6 +291,40 @@ mod handed_tests {
       past,
       Err(RtError::DriverRefused { code: None, .. })
     ));
+  }
+}
+
+#[cfg(test)]
+mod round_trip_tests {
+  use super::{
+    TCP_CONNECTION_INFO_THROUGH_SRTT, TCP_INFO_THROUGH_RTT, linux_round_trip_in,
+    macos_round_trip_in,
+  };
+  use crate::tcp::RoundTrip;
+
+  /// A-625 part 2, golden vectors: Linux keeps `tcpi_rtt` (microseconds) in bytes 68..72 of `struct tcp_info`, macOS
+  /// `tcpi_srtt` (milliseconds) in bytes 44..48 of `struct tcp_connection_info`. Do: fill each record with 0xFF and put a
+  /// round trip in native order where its kernel keeps it. Expect it read in nanoseconds with its clock's resolution; a
+  /// read one word early or late would take 0xFF bytes into it.
+  #[test]
+  fn each_kernels_round_trip_is_read_where_it_keeps_it() {
+    let mut linux = [0xFFu8; TCP_INFO_THROUGH_RTT];
+    linux[68..72].copy_from_slice(&1_234u32.to_ne_bytes());
+    let mut macos = [0xFFu8; TCP_CONNECTION_INFO_THROUGH_SRTT];
+    macos[44..48].copy_from_slice(&7u32.to_ne_bytes());
+    assert_eq!(
+      (linux_round_trip_in(&linux), macos_round_trip_in(&macos)),
+      (
+        Some(RoundTrip {
+          ns: 1_234_000,
+          resolution_ns: 1_000
+        }),
+        Some(RoundTrip {
+          ns: 7_000_000,
+          resolution_ns: 1_000_000
+        })
+      )
+    );
   }
 }
 
@@ -704,6 +802,30 @@ mod imp {
     get_option(&socket.fd, libc::IPPROTO_TCP, TCP_STATE_OPTION, &mut state)
       .map_err(|e| refused("getsockopt(TCP state)", e))?;
     Ok(state == [TCP_ESTABLISHED])
+  }
+
+  /// The connection's round trip as its kernel measured it (`crate::tcp::RoundTrip`), from the record
+  /// [`established`] reads: Linux `TCP_INFO`'s `tcpi_rtt`.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    let mut info = [0u8; super::TCP_INFO_THROUGH_RTT];
+    get_option(&socket.fd, libc::IPPROTO_TCP, libc::TCP_INFO, &mut info)
+      .map_err(|e| refused("getsockopt(TCP_INFO)", e))?;
+    super::linux_round_trip_in(&info).ok_or_else(|| invalid("getsockopt(TCP_INFO)"))
+  }
+
+  /// See the Linux arm: macOS `TCP_CONNECTION_INFO`'s `tcpi_srtt`.
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    let mut info = [0u8; super::TCP_CONNECTION_INFO_THROUGH_SRTT];
+    get_option(
+      &socket.fd,
+      libc::IPPROTO_TCP,
+      libc::TCP_CONNECTION_INFO,
+      &mut info,
+    )
+    .map_err(|e| refused("getsockopt(TCP_CONNECTION_INFO)", e))?;
+    super::macos_round_trip_in(&info).ok_or_else(|| invalid("getsockopt(TCP_CONNECTION_INFO)"))
   }
 
   /// The bytes this stream's writers have handed the kernel since the connection was made (A-550): `tcpi_bytes_acked`
@@ -1507,9 +1629,22 @@ mod imp {
     Ok(())
   }
 
-  /// Whether the connection is still established, from Windows' own record of it (`SIO_TCP_INFO`, version 0, Windows
-  /// 10 1703 and later): its state is `TCPSTATE_ESTABLISHED`.
+  /// Whether the connection is still established, from Windows' own record of it ([`tcp_info`]): its state is
+  /// `TCPSTATE_ESTABLISHED`.
   pub(crate) fn established(socket: &Socket) -> Result<bool, RtError> {
+    Ok(tcp_info(socket)?.State == TCPSTATE_ESTABLISHED)
+  }
+
+  /// The connection's round trip as Windows measured it ([`tcp_info`]'s `RttUs`, microseconds).
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    Ok(crate::tcp::RoundTrip {
+      ns: u64::from(tcp_info(socket)?.RttUs).saturating_mul(super::MICROSECOND_NS),
+      resolution_ns: super::MICROSECOND_NS,
+    })
+  }
+
+  /// Windows' own record of the connection (`SIO_TCP_INFO`, version 0, Windows 10 1703 and later).
+  fn tcp_info(socket: &Socket) -> Result<TCP_INFO_v0, RtError> {
     let version: u32 = 0;
     let mut info = TCP_INFO_v0::default();
     let mut returned = 0u32;
@@ -1531,7 +1666,7 @@ mod imp {
     if rc == SOCKET_ERROR {
       return Err(last("WSAIoctl(SIO_TCP_INFO)"));
     }
-    Ok(info.State == TCPSTATE_ESTABLISHED)
+    Ok(info)
   }
 
   /// Ends both directions of the connection, whoever else holds a copy of the socket.
@@ -1631,7 +1766,7 @@ pub(crate) use imp::{OwnedDatagram, OwnedStream, Socket};
 pub(crate) use imp::{
   accept, adopt_listener, adopt_stream, broken_pipe, bytes_handed, connect, connected, discard,
   established, into_owned, invalid, listen, make_sends_whole, peek, read, reserve_buffers,
-  set_nodelay, shutdown, shutdown_write, stream_socket, want_bytes, would_block, write,
+  round_trip, set_nodelay, shutdown, shutdown_write, stream_socket, want_bytes, would_block, write,
   write_vectored,
 };
 pub(crate) use imp::{

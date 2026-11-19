@@ -12450,14 +12450,19 @@ engine: the verdict, rebase, position mapping, the register).
 > so it gives its slot back as it ends, and is cancelled and joined when the listener ends, so none outlives it. The
 > bounds come from the shard's budget: as many connections at once as the shard seats clients (`clients_per_shard`,
 > AC-2.6), each request the bytes of one client region, so together they hold at most the client share of the shard's
-> reserve. At the bound the listener stops accepting until a connection ends, and the kernel's backlog is the same
-> bound: over HTTPS a refusal could be answered only after a handshake, which costs the task and buffers the bound
-> limits. Each phase's wait on a client is learned with `LearnedWait` (RFC 6298, Karn's rule, the back-off). The
+> reserve. Each phase's wait on a client is learned with `LearnedWait` (RFC 6298, Karn's rule, the back-off). The
 > handshake, idleness, a head and the drain are waited for whole, so a client trickling bytes is held to the phase's
 > learned length; a body's and a reply's silences are waited for one at a time, since their length is the push's or the
-> clone's size. A phase has no bound until one of its waits has completed, and only a connection whose credentials
-> proved a principal teaches the bounds: its waits before the proof are folded in at the proof, each phase's longest,
-> and a stranger's cut backs nothing off. git's site routes as `http-backend` routes (A-595), then answers `401` with the
+> clone's size. Before a phase has learned, a wait's bound is RFC 6298's first RTO from the connection's own
+> measurement: the TCP handshake's round trip as the kernel measured it at accept (`TcpStream::round_trip`), the edge's
+> own TLS work added while a handshake runs, then the handshake's whole duration, floored by the clock's measured
+> granularity. A wait past its bound marks its connection overdue and goes on, since a git client may be silent for long
+> mid-request; a late wait is still a sample. The listener takes the next connection whenever it comes and, with every
+> seat taken, reaps the most overdue connection for it; a reap teaches nothing and backs the phase off (main's rulings,
+> 2026-11-19, the rule g294 found for SSH). So a silent client never holds a seat a new connection needs and none is cut
+> while seats are free; no connection is answered `503` at the bound, since over HTTPS only a handshake could carry it.
+> Only a connection whose credentials proved a principal teaches the bounds: its waits before the proof are folded in
+> at the proof, each phase's longest, and a stranger's reap backs nothing off. git's site routes as `http-backend` routes (A-595), then answers `401` with the
 > challenges the connection accepts, `404` for no git repository of that name, `403` when the repository's policy lets
 > the principal reach it for none of the service's rights (`vcs_policy::reaches`, A-597, A-622), and `503` while the
 > service's server half has not landed, which today is both (upload-pack, A-615; receive-pack's commit, A-620 part 2).
@@ -12877,7 +12882,7 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Cache shares (fragments, kept compressed objects, commit rows, index tables) | shares of the shard's memory budget (§4.2) that equalize each cache's marginal misses saved per byte, from miss-ratio curves sampled online | the shard's budget | equal shares until the first curves exist (no literal: an equal split of a measured budget) |
 | Push bytes in flight and pushes per shard | the shard's memory budget over the measured inflate and hash rate | the shard's budget, typed refusal | the first push's own size |
 | Keepalive during a held push (git's own: "The default is 5 seconds" [B: config `receive.keepAlive`]) | silence shorter than the shortest silent gap after which this deployment's connections were seen to drop, learned from the drops | the client's own deadline when it sent one | the connection's measured round trip |
-| Reaping a stalled client (A-625 part 2) | per phase of the exchange: the handshake, idleness, a head and the drain waited for whole, a body's and a reply's silences one at a time; RFC 6298's estimator over the phase's completed waits (`LearnedWait`: the tail plus the liveness window, Karn's rule, the back-off), fed only by connections whose credentials proved a principal | the shard's connection seats: a stalled client holds one seat | none: until a phase's first completed wait, its waits end only when the client leaves, as a hook's first run is bounded by its client alone (§4.17.1) |
+| Reaping a stalled client (A-625 part 2) | per phase of the exchange: the handshake, idleness, a head and the drain waited for whole, a body's and a reply's silences one at a time; RFC 6298's estimator over the phase's completed waits, late ones included (`LearnedWait`: the tail plus the liveness window, Karn's rule, the back-off), fed only by connections whose credentials proved a principal; a wait past its bound marks its connection overdue, and the most overdue is reaped only when every seat is taken and a new connection needs one, a reap backing the phase off | the shard's connection seats | RFC 6298 §2.2's first RTO from the connection's own measurement, `R + max(G, 2R)`: the TCP handshake's round trip as the kernel measured it at accept, the edge's own TLS work added while a handshake runs, then the TLS handshake's whole duration; `G` the timer's tick, the scheduler's lateness or the kernel clock's resolution |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
 | Index table merges (§4.17.1's rule, A-581: the git store's index is `slates-vcs`'s, A-614) | for each `j`, merge the newest `j` runs only this index holds once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, the largest due `j`); a table is one window of the content plane and the tail seals once its rows no longer fit one | the store's budget, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
 | SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
@@ -14155,9 +14160,12 @@ copy and commits the result as any commit. The server never merges file contents
 
 *9. Hooks* (§4.17.1's hook rule; A-623). The server's nine hook points as stock `svnserve` 1.15 runs them, and nothing
 of Subversion's client side: slates offers the server alone, and a hook that reads its transaction runs the stock
-`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). Each hook runs through §4.17.1's
-driver over a read-only attachment of the work or the revision, and gets `hooks.c`'s arguments, standard input and
-environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
+`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). REPOS names a read-only
+FSFS-layout view of the repository, derived from the index (A-645's derived data), so that stock `svnlook` reads the
+transaction and the revisions there, as git's hooks get a read-only bare repository (git piece 10; main's decision,
+2026-11-19; owed after A-647's derived-data mechanism). Each hook runs through §4.17.1's driver, configured in the
+repository's policy at one of the nine points the record names (A-648), and gets `hooks.c`'s arguments, standard input
+and environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
 - start-commit: the repository's directory (REPOS, its configured directory), the user, the client's capabilities
   joined by `:`, the transaction.
 - pre-commit: REPOS and the transaction. On standard input, when the commit presented lock tokens, `LOCK-TOKENS:`, a
@@ -14174,8 +14182,11 @@ environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates
 
 Every argument is a C string that ends at its first NUL. A hook's environment is its own hooks-env section, else the
 default section, else nothing, and never the server's; a section named twice is one, and a section with no variables is
-none. Its directory is `/` and a hook with no input of its own reads the null device, as under `svnserve -d`; standard
-input is a pipe, never Subversion's temporary file (R1).
+none. The sections are the repository policy's (A-648), set by its owner with the rules and the hooks: in place of the
+file `svnserve.conf`'s `hooks-env` names, which a repository with no disk has not. Its directory is `/` and a hook with
+no input of its own reads the null device, as under `svnserve -d`; standard input is a pipe, never Subversion's
+temporary file (R1). pre-lock's standard output, read up to its first NUL, is the token the lock is made with, judged as
+a client's token is; empty, the server makes the token.
 
 What the client is told is `svnserve`'s own words, byte for byte (`check_hook_result`, `fs-wrap.c`, `serve.c`). A
 refusing pre-hook is `E165001` "Commit blocked by pre-commit hook (exit code 2)" (start-commit and pre-commit "Commit",
@@ -14247,6 +14258,22 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > trailing newline, recorded); a dangling link told apart (`svnserve`'s "Failed to run '…' hook; broken symlink",
 > recorded); no core dumps (`apr_exit_why_e` 6); the server's calls at commit, lock, unlock and revision-property
 > change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ.
+>
+> **Status (2026-11-19, A-648: the record's points, the hooks-env and the driver's gaps).** The repository record names
+> Subversion's nine points (`slates_db`'s and the protocol's `HookPointName`, tags 8 to 13 appended, both wire orders
+> published) and holds a Subversion repository's hooks-env in its policy (`RepositoryPolicy::hooks_env` and
+> `SetRepositoryPolicy`'s, appended): the guard refuses a section no hook's environment can carry (unnamed, a NUL, a
+> variable named by nothing or holding `=` or a NUL, a value holding a NUL) and any section in a git or Mercurial
+> repository (`PolicyHooksEnvMalformed`, `DatabaseRefusal` 11, by index), and charges its sections' bytes as it charges
+> rules and hooks. The driver runs a Subversion hook in `/` (`HookPoint::directory`), hands pre-lock's standard output
+> back (`Ended::standard_output`: a second pipe, read as the words are, to the run's cap) as the lock's token
+> (`svn_lock_token`: up to the first NUL, the server's own when empty, none past the cap), and a Subversion hook's
+> environment is the record's (`SvnHooksEnv::of`; the record's point is the runner's by `HookPoint::of`). On the Mac
+> Studio: `slates-db` and `slates-ipc` lib whole, both wire orders, and `slates-server` lib 597 of 598, the one failure
+> (a `deadlines` test) failing alike on main; red eleven ways.
+> Owed: the read-only FSFS-layout view at REPOS (after A-647); the server's calls at commit, lock, unlock and
+> revision-property change, a lock whose token the hook wrote past the cap refused in Subversion's words among them;
+> a dangling link told apart; no core dumps; the Windows driver.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -45650,6 +45677,99 @@ stream in their place; `pack::put_header`), `crates/vcs` (`ContentStore::window_
   past a window. The fragments' encoding and the base pack's rebuild sliced. Wiring the stream into upload-pack's
   `fetch` response is A-640. Main's runs are filed: `git index-pack --strict` and `git verify-pack -v` over the
   stream's packs, a thin one with `--fix-thin`; clippy, `xtask` and the docs.
+
+### A-625 part 2, continued — no wait unbounded, and an overdue connection reaped only when a new one needs its seat (2026-11-19, g299 under main's rulings, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1 and its tunables; after A-625 part 2)
+Applied in the same change to: §4.17.2's A-625 part 2 status and its "Reaping a stalled client" row; GAPS (the §4.17
+entry); `crates/rt` (`tcp::RoundTrip`, `TcpStream::round_trip`; `netsys`'s readers of each kernel's record);
+`crates/server` (`vcs_http`, `vcs_http::waits`, their tests).
+- **Main's two rulings** (2026-11-19). First: a silent client must never hold a seat unbounded, so before a phase has
+  learned, its waits are bounded by the connection's own first measurement under RFC 6298 §2.2 (`SRTT = R`,
+  `RTTVAR = R/2`, so `R + max(G, 2R)`), floored by the clock's measured granularity. Then, the rule g294 found for SSH:
+  a git client can be silent for long mid-request (compressing a large push, a credential helper prompting), so a wait
+  past its bound only marks its connection overdue, and the edge reaps overdue connections, most overdue first, only
+  while every seat is taken; a reap teaches nothing and backs off. Main confirmed the other decision of part 2: at the
+  bound no `503`, since over HTTPS only a handshake could carry it.
+- **`R`, from the connection itself.** The kernel times the TCP handshake (its SYN-ACK to the client's ACK) before accept
+  returns, so `TcpStream::round_trip` reads it from the kernel's own record: Linux `tcpi_rtt` (microseconds, byte 68 of
+  `struct tcp_info`), macOS `tcpi_srtt` (milliseconds, byte 44 of `struct tcp_connection_info`; xnu's `TCP_RETRANSHZ`),
+  Windows `RttUs` (`SIO_TCP_INFO`). The record's clock resolution is part of `G` (RFC 6298 §2.3), so a macOS loopback
+  round trip read as zero milliseconds still yields a millisecond. While a TLS handshake runs, the edge's own work on it
+  (the time its session took over each flight) is added to `R`: the client's share is the same work (a key exchange, a
+  signature checked), and a loopback round trip of microseconds would otherwise mark every first handshake overdue at
+  once. Once the handshake ends, its whole duration from acceptance is `R`.
+- **Overdue, not cut.** A wait races its I/O against its deadline without ever dropping the I/O: a `write_all` past its
+  deadline keeps its place in the reply. The seat carries the mark (the deadline that passed, the phase, the back-offs
+  it was armed under, whether the connection proved a principal); a wait that ends clears it, and a late wait is still
+  a completed one, so a slow client teaches the bound. The listener accepts the next connection whenever it comes; with
+  every seat taken it cancels the task of the most overdue (the earliest deadline passed), whose seat comes back as the
+  cancellation drops its guard, and with none overdue it waits until a seat comes back or a connection becomes overdue.
+  So it holds at most one accepted connection beyond the seats.
+- **The back-off, once per bound.** A reap backs its phase off only for a proven connection whose wait was armed under
+  the bound now in force (RFC 6298 §5.5 doubles the timer that expired): connections reaped together back it off once.
+  Every cut once doubled the shared bound, so a burst of them could arm a deadline years away. Before a phase has
+  samples, a reap doubles that phase's first RTO.
+- **Seen on the way (hypothesis, for main):** with the first RTO stubbed unbounded, the red run's HTTPS test failed with
+  an empty reply while the cleartext tests, whose reads never had to wait, passed: a timer armed near `u64::MAX` reaches
+  `kevent` as a park timeout of centuries, which macOS may refuse, stalling the shard's I/O. Unconfirmed by logs; no
+  deadline the edge arms now comes near it.
+- **Tests** (`cargo test --locked`, Mac Studio, debug, 2026-11-19, kiln): red first at 2d2749b1a (the first RTO and the
+  round-trip readers: 2 of 2 rt tests and 3 server tests failing on stubs) and at 41698f336 (the reaping: 8 of 8 failing:
+  marks ignored, nothing reaped, reaps neither counted nor backing off); green at 2559aa2fd: `slates-rt --lib round_trip`
+  2 of 2, `slates-server --lib vcs_` 69 of 69, `cargo fmt --check` clean. Over real loopback sockets: a silent client kept
+  while another seat is free (marked overdue); one reaped when a new connection needs its seat, which is then answered;
+  the most overdue of two reaped first; a proven client past its learned idle bound kept until its seat is needed, then
+  reaped, idleness learning from both clients; HTTPS's first handshake served under the first RTO with the edge's work
+  added. Pure: the first RTO's three cases, the TLS handshake's work then duration, a reap's back-off and its doubling
+  of a first RTO, a stranger's reap backing nothing off, reaps together backing off once.
+- **Owed.** As part 2, plus the Linux and Windows round-trip readers compiled and run (main's lint matrix).
+
+### A-648 — Subversion's hook points in the record and the driver's gaps: the six other points, a repository's hooks-env, hooks run in /, pre-lock's output as the token (2026-11-19, g229, UI goal 93; §4.17.4 item 9; after A-623 and A-622)
+Applied in the same change to:
+- §4.17.4 item 9 (REPOS a read-only FSFS-layout view, main's decision; the hooks-env the policy's; pre-lock's output
+  the token) and a status;
+- GAPS (the §4.17 entry);
+- `crates/db` (`catalog.rs`: `HookPointName`'s six appended points, `HooksEnvSection` and `HooksEnvVariable`, new, and
+  `RepositoryPolicy::hooks_env`, appended; `error.rs`: `PolicyHooksEnvMalformed`; `repository/policy.rs`: the guard and
+  the charge; `repository.rs`'s tests; `tests/wire_order.txt`, the six tags published);
+- `crates/ipc` (`protocol.rs`: the same points, types and field, `SetRepositoryPolicy::hooks_env` appended,
+  `DatabaseRefusal::PolicyHooksEnvMalformed`, tag 11 (after A-642's `Moved`, 10); `tests/wire_order.txt`);
+- `crates/server` (`repository.rs`: the verb's hooks-env and points; `verbs.rs`; `error.rs`; `vcs_policy.rs`'s test
+  record; `vcs_hooks.rs`: `HookPoint::directory` and `HookPoint::of`, `SvnHooksEnv::of`, `svn_lock_token`;
+  `hook_driver.rs`: the directory, pre-lock's output, `Ended`).
+
+- **The record.** `HookPointName` names Subversion's nine points, the six A-623 added appended as tags 8 to 13 in the
+  database's enum and the protocol's, each published by its wire order's file. A Subversion repository's policy holds
+  its hooks-env, set with its rules and hooks by `SetRepositoryPolicy`: sections, each named for a hook or `default`,
+  of variables, each a name and bytes, in place of the file `svnserve.conf`'s `hooks-env` names, which a repository
+  with no disk has not. A section is held as the file's would be read (A-623's `SvnHooksEnv`: one named twice is one,
+  one with no variables is none), and its bytes are charged to the partition's merge budget as rules and hooks are.
+- **The guard.** It refuses, by section index, a section in a git or Mercurial repository (their hooks inherit the
+  server's environment), one named by nothing or holding a NUL, and one with a variable no hook's environment can carry:
+  a name empty or holding `=` or a NUL, a value holding a NUL. Typed on the wire as `PolicyHooksEnvMalformed`.
+- **The driver.** A Subversion hook runs in `/`, as `svnserve -d` runs it (`HookPoint::directory`; git's and
+  Mercurial's still run in their view's root). pre-lock's standard output is a second pipe, read as the words are, to
+  the run's cap, and handed back with the outcome (`Ended::standard_output`); `svn_lock_token` reads it as `svnserve`
+  does, a C string up to its first NUL, the server's own token when that is empty, and none when the cap cut it before
+  any NUL. A Subversion hook's environment is built from the record (`SvnHooksEnv::of`), and a record's point is the
+  runner's by `HookPoint::of`.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19, a fresh clone of 135d358c0; `cargo fmt` clean over the
+  three crates): `cargo test --locked -p slates-db --lib` 140 of 140; `-p slates-ipc --lib` 74 of 74, two ignored;
+  `-p slates-db --test wire_order` and `-p slates-ipc --test wire_order` 2 of 2 each, the appended tags published by
+  hand and held by them; `-p slates-server --lib` 597 of 598. The failure,
+  `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` (`deadlines.rs`
+  830, the capture never let go within its window), is not this change's: it fails 5 of 5 alone here and 3 of 3 on a
+  clean clone of main at 3239c88. Red eleven ways, each guard broken in a copy failing the tests that hold it and
+  nothing else: the hooks-env unchecked, `=` allowed in a name, a section held by any tool (each the guard's test and
+  the verb's), the sections uncharged (the charge's test), pre-lock taken for git's (the nine points' test and the
+  snapshot's), two appended tags swapped (`wire_order`), a Subversion hook run in its view's root, pre-lock's output
+  sent to the null device, its token read past a NUL, the record's sections dropped, and pre-lock's point read as
+  post-lock's (each its own test); the files put back, 49 of 49 again. On the tree merged with main (de9dc5cbf, A-642's
+  `Moved` taking `DatabaseRefusal` 10 first): db lib 142 of 142, ipc lib 74 of 74, both wire orders 2 of 2, server lib
+  621 of 622, the same `deadlines` test failing.
+- **Owed.** The read-only FSFS-layout view at REPOS for stock `svnlook` (A-645's derived data, after A-647, queued by
+  main); the server's calls at commit, lock, unlock and revision-property change, refusing in Subversion's words a lock
+  whose token the hook wrote past the cap; a dangling link told apart; no core dumps; the Windows driver. Main's:
+  clippy, `xtask` and the lint matrix over the change.
 
 ### A-647 part 1 — Derived data, one mechanism: types derived from their parents' values, kept immutable under (type, version), eager or lazy, filled a unit a step; a version's map of paths to contents its first type (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.1 "Objects" item 2 and "Reads")
 
