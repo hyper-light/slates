@@ -59,3 +59,10 @@ hostile-report-early-edit-response: (written by this script)
 hostile-report-client-refuses-the-edit: (written by this script)
 hostile-update-copy-sources: (written by this script)
 hostile-checkout-copy-sources: (written by this script)
+read-auth-cat: cat --username alice --password secret svn://127.0.0.1/repo/trunk/secret/s.txt
+  exit 0
+read-auth-ls: ls --username alice --password secret svn://127.0.0.1/repo/trunk/secret
+  exit 0
+read-auth-cat-bob: cat --username bob --password bob's secret svn://127.0.0.1/repo/trunk/secret/s.txt
+  exit 1
+  stderr: svn: E170001: Authorization failed

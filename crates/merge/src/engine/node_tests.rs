@@ -11,8 +11,10 @@ use super::replaced_node_tests::{
   FILE, HARDLINK, Kind, NAME, SPECIAL, TARGET, Work, accept, classes_on, green, kinds_at,
   removal_of,
 };
-use super::{Green, Outcome, Rebased};
+use super::{ConflictWindow, Green, Increment, Outcome, Rebased};
+use crate::increment::{DeriveError, VolumeOp, compose_volume_planned};
 use crate::ops_doc::OpKind;
+use crate::special::SpecialNode;
 use crate::verdict::MergeConflictClass;
 
 /// Shape: a second hard link to `TARGET` the tests make.
@@ -417,6 +419,224 @@ fn a_rebase_restates_the_node_a_removed_home_hands_to_its_link() -> Result<(), S
         "restated {restated:?}, a journal operation at the link {names_the_link}, accepted \
          {accepted:?}"
       ));
+    }
+  }
+  Ok(())
+}
+
+/// What a green holds at a path of a node's own metadata: its mode and `NAME`'s value.
+type Metadata = (Option<u32>, Option<Vec<u8>>);
+
+/// What `green` holds at `path` of a node's own metadata.
+fn metadata_at(green: &Green, path: &str) -> Metadata {
+  (
+    green.mode(path),
+    green.xattr(path, NAME).map(<[u8]>::to_vec),
+  )
+}
+
+/// A work rebased at the head of a green `made` makes; the rebased work's next submit as the
+/// server makes it (its restated journal composed again over its new base, the post-state empty,
+/// since these works add no bytes) accepted by a second such green; and a third that accepts the
+/// work itself: what the second and the third hold at `heir`.
+fn resubmitted_beside_submitted(
+  made: fn() -> Result<Green, String>,
+  work: fn() -> Work,
+  heir: &str,
+) -> Result<(Metadata, Metadata), String> {
+  let rebasing = made()?;
+  let increment = work().at(rebasing.head(), 4);
+  let Rebased::Rebased {
+    version, journal, ..
+  } = rebasing.rebase(&increment)
+  else {
+    return Err("the work did not rebase cleanly".to_owned());
+  };
+  let (doc, _) = compose_volume_planned(&rebasing.base_for(version, &journal), &journal)
+    .map_err(|refused| format!("the restated journal does not compose: {refused:?}"))?;
+  let next = Increment {
+    id: [5; 32],
+    base: version,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+  };
+  let mut resubmitting = made()?;
+  if !matches!(resubmitting.submit(&next), Outcome::Accepted { .. }) {
+    return Err("the rebased work's next submit was not accepted".to_owned());
+  }
+  let mut submitting = made()?;
+  if !matches!(submitting.submit(&increment), Outcome::Accepted { .. }) {
+    return Err("the work itself was not accepted".to_owned());
+  }
+  Ok((
+    metadata_at(&resubmitting, heir),
+    metadata_at(&submitting, heir),
+  ))
+}
+
+/// A work that removes `TARGET`.
+fn removed_target() -> Work {
+  removal_of(TARGET, Kind::File)
+}
+
+/// A work that renames `FILE` over `TARGET`.
+fn replaced_target() -> Work {
+  Work::default().naming(OpKind::Rename, TARGET, FILE)
+}
+
+/// A green whose FIFO `SPECIAL` the hard link `SECOND` names.
+fn linked_fifo() -> Result<Green, String> {
+  let mut green = green();
+  accept(
+    &mut green,
+    Work::default().naming(OpKind::Link, SECOND, SPECIAL),
+    1,
+  )?;
+  Ok(green)
+}
+
+/// A work that removes the FIFO `SPECIAL`.
+fn removed_fifo() -> Work {
+  removal_of(SPECIAL, Kind::Special)
+}
+
+/// A work that renames `FILE` over the FIFO `SPECIAL`.
+fn replaced_fifo() -> Work {
+  Work::default().naming(OpKind::Rename, SPECIAL, FILE)
+}
+
+/// A-677's sibling (A-646's hand-over: the least surviving link takes its node's mode). Do: rebase
+/// at the head a work that removes `TARGET` (mode 0o600), which `HARDLINK` and `SECOND` name, and
+/// one that renames `FILE` over it; submit the rebased work's next submit beside a twin that
+/// submits the work itself. Expect `HARDLINK` to hold the node's mode after both. A rebased work's
+/// view shows no mode (its files' bytes and sizes, its declared directories and symlinks), so its
+/// next submit, composed from its restated journal, is where the mode it holds lands.
+#[test]
+fn a_rebased_works_next_submit_leaves_its_link_the_nodes_mode() -> Result<(), String> {
+  let works: [fn() -> Work; 2] = [removed_target, replaced_target];
+  for work in works {
+    let (resubmitted, submitted) = resubmitted_beside_submitted(linked, work, HARDLINK)?;
+    if resubmitted.0 != submitted.0 || submitted.0 != Some(0o600) {
+      return Err(format!(
+        "the next submit left {resubmitted:?}, the work {submitted:?}"
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// A-677's sibling (A-646's hand-over: the least surviving link takes its node's attributes). Do:
+/// as for the mode, with `TARGET`'s `NAME` set to `w`. Expect `HARDLINK` to hold `NAME` set to `w`
+/// after both: a rebased work's view shows no attribute, so its next submit is where they land.
+#[test]
+fn a_rebased_works_next_submit_leaves_its_link_the_nodes_attributes() -> Result<(), String> {
+  let works: [fn() -> Work; 2] = [removed_target, replaced_target];
+  for work in works {
+    let (resubmitted, submitted) = resubmitted_beside_submitted(linked, work, HARDLINK)?;
+    if resubmitted.1 != submitted.1 || submitted.1.as_deref() != Some(&b"w"[..]) {
+      return Err(format!(
+        "the next submit left {resubmitted:?}, the work {submitted:?}"
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// The classes of `windows` at `SPECIAL`.
+fn classes_at_the_fifo(windows: &[ConflictWindow]) -> Vec<MergeConflictClass> {
+  windows
+    .iter()
+    .filter(|window| window.path == SPECIAL)
+    .map(|window| window.class)
+    .collect()
+}
+
+/// What the server answers of a work at the linked FIFO `SPECIAL`: its verdict's conflict classes
+/// there, the deriver's refusal of its journal, or what `SECOND` holds once it is accepted.
+#[derive(Debug, PartialEq)]
+enum AtTheFifo {
+  Conflict(Vec<MergeConflictClass>),
+  Refused(DeriveError),
+  Holds(Option<SpecialNode>),
+}
+
+/// `journal` composed over a `linked_fifo` green at its head, as the server seals a work's journal
+/// (the post-state empty, since these journals add no bytes), and submitted to it as increment `id`.
+fn submitted_at_the_fifo(journal: &[VolumeOp], id: u8) -> Result<AtTheFifo, String> {
+  let mut green = linked_fifo()?;
+  let head = green.head();
+  let (doc, _) = match compose_volume_planned(&green.base_for(head, journal), journal) {
+    Ok(planned) => planned,
+    Err(refused) => return Ok(AtTheFifo::Refused(refused)),
+  };
+  let increment = Increment {
+    id: [id; 32],
+    base: head,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+  };
+  Ok(match green.submit(&increment) {
+    Outcome::Conflict { windows } => AtTheFifo::Conflict(classes_at_the_fifo(&windows)),
+    _ => AtTheFifo::Holds(green.special(SECOND)),
+  })
+}
+
+/// What the server answers of `work` at a linked FIFO once it is rebased at the head: the rebase's
+/// conflict, or its restated journal sealed and submitted, as its next submit.
+fn rebased_at_the_fifo(work: fn() -> Work) -> Result<AtTheFifo, String> {
+  let rebasing = linked_fifo()?;
+  match rebasing.rebase(&work().at(rebasing.head(), 4)) {
+    Rebased::Conflict { windows } => Ok(AtTheFifo::Conflict(classes_at_the_fifo(&windows))),
+    Rebased::Rebased { journal, .. } => submitted_at_the_fifo(&journal, 5),
+    other => Err(format!("the rebase answered {other:?}")),
+  }
+}
+
+/// A work, its own declared journal as its volume records it, and what the server answers of it
+/// at the linked FIFO rebased and as its own submit.
+type Pinned = (fn() -> Work, Vec<VolumeOp>, AtTheFifo, AtTheFifo);
+
+/// A-677's sibling (A-646's hand-over of an IPC node; GAPS, the inode-aware namespace journal
+/// owed). Do: rebase at the head a work that removes the FIFO `SPECIAL`, which `SECOND` names, and
+/// one that renames `FILE` over it, and seal and submit each rebased work's restated journal, as its
+/// next submit; beside each, seal and submit the work's own declared journal, as the server makes
+/// its submit. Expect each refused by the deriver, rebased or not: the removal `Unsupported` both
+/// ways (a name's unlink while a link names its IPC node), the rename `PathKindConflict` as the work
+/// declared it and `Unsupported` as the rebase restates it, the replaced FIFO's removal written out.
+/// No work in the server seals, submits or rebases either, so no rebased work holds a FIFO handed to
+/// a link; when the inode-aware journal composes them this fails, and the heir FIFO is to be held to
+/// the submit's, as the mode and attributes are.
+#[test]
+fn a_linked_fifos_removal_or_replacement_is_refused_rebased_or_not() -> Result<(), String> {
+  let unsupported = || AtTheFifo::Refused(DeriveError::Unsupported(SPECIAL.to_owned()));
+  let cases: [Pinned; 2] = [
+    (
+      removed_fifo,
+      vec![VolumeOp::Unlink {
+        path: SPECIAL.to_owned(),
+      }],
+      unsupported(),
+      unsupported(),
+    ),
+    (
+      replaced_fifo,
+      vec![VolumeOp::Rename {
+        from: FILE.to_owned(),
+        to: SPECIAL.to_owned(),
+      }],
+      unsupported(),
+      AtTheFifo::Refused(DeriveError::PathKindConflict(SPECIAL.to_owned())),
+    ),
+  ];
+  for (work, declared, rebased_answer, own_answer) in cases {
+    let found = (
+      rebased_at_the_fifo(work)?,
+      submitted_at_the_fifo(&declared, 6)?,
+    );
+    if found != (rebased_answer, own_answer) {
+      return Err(format!("rebased, then its own submit: {found:?}"));
     }
   }
   Ok(())

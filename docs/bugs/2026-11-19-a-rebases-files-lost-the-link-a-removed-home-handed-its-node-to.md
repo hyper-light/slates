@@ -79,8 +79,11 @@ target directory, `CARGO_BUILD_JOBS=2`):
 
 ## Siblings (the sweep, by reading)
 
-- The hand-over also moves the node's mode and attributes to the heir, and an IPC node (`Effect::Special`). A rebase's
-  answer holds files alone, so what a rebased work shows of a heir's mode, attributes or IPC node is the server's work
-  view's, not checked here.
+- The hand-over also moves the node's mode and attributes to the heir, and an IPC node (`Effect::Special`), which a
+  rebase's answer, holding files alone, does not hold. Checked after A-677 landed (A-677's design entry, "The heir's
+  mode, attributes and IPC node, checked"): a work's view on the server holds no mode, attribute or IPC node, so a
+  rebased work holds them in its restated journal alone; its next submit leaves the link the node's mode and
+  attributes as the work's own submit does; and no work in the server removes a FIFO a link names or renames a file
+  over one, since the deriver refuses both, rebased or not (the inode-aware namespace journal owed), which a test pins.
 - Not siblings: the chain entry's copy fixes (`CopyFix::files`, A-626) record a copy's tree, and the stack's
   restatements are operations, from which a commit derives its own node moves.
