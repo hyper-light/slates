@@ -12842,7 +12842,9 @@ engine: the verdict, rebase, position mapping, the register).
 > clone takes its small blobs from the parts of blobs as they were kept. After the greens whose heads are wanted, each
 > object still wanted is offered the parts of the version its row says brought it, so a partial clone's later fetch of
 > blobs by their ids, which wants no head, is answered from the fragments too. upload-pack's service writes the stream
-> through one pack source, A-640 part 3's `upload::Fragments`.
+> through one pack source, A-640 part 3's `upload::Fragments`. Through it, stock git's clone of small.git and A-582's
+> five fetches are answered from the store's parts, every version encoded and a base pack made, each object once; and
+> `Streamed::counters` tells which of the store's paths wrote a pack (A-653 continued (1)).
 >
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
@@ -48246,3 +48248,34 @@ Applied in the same change to:
   the key lookup; the stores (A-662) behind upload-pack and Mercurial's session, and receive-pack's and Subversion's
   entry points (A-654, A-656), each a `Command` behind `Services`, the not-served answer going with the last of them;
   the live OpenSSH 10.2 `git clone` over SSH (main's run, filed); the four red-checks above (main's).
+
+### A-653, continued (1) — The real clone's requests answered through `upload::Fragments` from the store's parts; `Streamed::counters` (2026-11-19, g083 for UI goal 93; §4.17.2 "A fetch", piece 7; A-640 part 3)
+
+Applied in the same change to: §4.17.2's A-653 status block, GAPS (the A-653 entry), `crates/git`
+(`upload::Streamed::counters`; `upload::tests::fragments`: four tests and `streamed_from`; `upload::tests::clone`: its
+`fetch` request, branches, small.git and refs shared with those tests).
+
+- **What A-653 owed.** Its parts were tested through the store's stream alone, while upload-pack writes that stream
+  through A-640 part 3's `upload::Fragments`. Stock git's own requests now go through the source, with the store's
+  parts kept as the owner keeps them: every version encoded and `main`'s base pack made.
+- **`Streamed::counters`** answers the stream's own counters (A-639's `UploadCounters`), so a test through the source
+  sees which of the store's paths wrote its pack: parts copied whole, parts read entry by entry, objects encoded
+  afresh.
+- **Tests**, the one that reads the counters failing first against a stub answering no work:
+  `a_stock_clones_fetch_is_answered_from_the_stores_parts` (the `fetch` a stock `git clone` of small.git sent, 32
+  wants of 31 commits with `thin-pack`, `ofs-delta`, `no-progress` and `done`, before any version is encoded and once
+  every one is: the packfile section alone, its pack exactly small.git's 32 objects, each once);
+  `every_fetch_stock_git_answered_is_answered_from_the_stores_parts` (A-582's five exchanges, `fetch-clone`,
+  `fetch-haves`, `fetch-shallow`, `fetch-ref-in-want` and `fetch-progress`: every packet but the pack's data the one
+  stock git 2.50.1 sent, progress aside, and a pack of exactly the objects git's held, each once, a thin one completed
+  from the repository's objects); `a_pack_through_the_source_is_read_from_the_kept_parts` (every object of A-582's
+  repository through the source: parts copied whole and parts read entry by entry, none encoded afresh, each object
+  once); `a_plan_past_its_admission_is_refused` (a plan begun with no room admitted is refused past its admission).
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1), `cargo test --locked -p slates-git --lib --
+  upload::`: with the stub, 58 passed, 1 failed, 1 ignored, the one failure
+  `a_pack_through_the_source_is_read_from_the_kept_parts` with every counter 0; over the tree landed, 59 passed, 0
+  failed, 1 ignored, 439 filtered out, the four tests among the passes; `cargo fmt -p slates-git -- --check` clean.
+  No integration target reaches upload-pack's pack source (the server's upload-pack tests lend a stub one).
+- **Owed.** The live clone over the HTTP edge (A-625 part 3: the server's git store per repository and its lender);
+  the red-checks and the other platforms' runs (main's); a delta search for an object past a window; the fragments'
+  encoding sliced.
