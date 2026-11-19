@@ -27,7 +27,9 @@
 //! Git LFS's locks API ([`ShardLfs`], A-629 part 2c), answered on the repository's owner shard over its locks log
 //! (`crate::lfs::answer`), which is durable as the partition's log is; the batch API and the transfers answer `503` at
 //! their head until the owner shard keeps LFS objects durably (A-581), so no upload is acknowledged that a restart
-//! would forget.
+//! would forget. Mercurial's commands, a request whose query names one ([`ToolSites`]), from each repository's served
+//! view over its store on the shard the connection moved to, lent for each step (`ServedViews`, A-680 part 2); its
+//! pushes (`unbundle`) are not served yet.
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
 use slates_git::lfs::serve::{Answer as LfsAnswer, Endpoint};
@@ -41,9 +43,11 @@ use super::git::{
   Authenticator, GitSite, Halves, LfsService, Located, Proven, ReceiveServices, Repositories,
   ThisShard, Unproven, Unserved,
 };
-use super::{Bounds, EdgeState, admits_cleartext, keep_here, serve};
+use super::hg::HgSite;
+use super::{Bounds, EdgeState, ToolSites, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
 use crate::lfs::{LfsCall, NoObjects};
+use crate::vcs_store::hg_view::ServedViews;
 
 /// Counter: an edge whose listener's task the control shard's arena refused.
 const NOT_STARTED: &str = "vcs_http.not_started";
@@ -141,22 +145,36 @@ impl LfsService for ShardLfs {
 /// git's services as the daemon serves them (the module doc, "What is served").
 pub(crate) type DaemonServices = Halves<Unserved, ReceiveServices<ThisShard>>;
 
-/// git's site as the daemon serves it (the module doc, "What is served").
-pub(crate) type DaemonSite =
+/// git's site as the daemon serves it, Git LFS's among its routes (the module doc, "What is served").
+pub(crate) type DaemonGitSite =
   GitSite<RecordedCredentials, ShardRepositories, DaemonServices, ShardLfs>;
 
-/// What makes the daemon's git site on any shard: its challenges name `realm`, it charges each route's path to the
-/// request's `room`, and receive-pack admits each push that room.
+/// Mercurial's site as the daemon serves it (the module doc, "What is served").
+pub(crate) type DaemonHgSite = HgSite<RecordedCredentials, ShardRepositories, ServedViews>;
+
+/// The daemon's sites on its edge: each request to its tool's (the module doc, "What is served").
+pub(crate) type DaemonSite = ToolSites<DaemonGitSite, DaemonHgSite>;
+
+/// What makes the daemon's sites on any shard: their challenges name `realm`, each request's route and exchange are
+/// charged to the request's `room`, and receive-pack admits each push that room.
 fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 'static {
   move || {
-    GitSite::new(
+    let git = GitSite::new(
       realm.clone(),
       room,
       RecordedCredentials,
       ShardRepositories,
       Halves::new(Unserved, ReceiveServices::new(ThisShard, room)),
     )
-    .with_lfs(ShardLfs)
+    .with_lfs(ShardLfs);
+    let hg = HgSite::new(
+      realm.clone(),
+      room,
+      RecordedCredentials,
+      ShardRepositories,
+      ServedViews,
+    );
+    ToolSites::new(git, hg, room)
   }
 }
 

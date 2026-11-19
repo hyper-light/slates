@@ -13533,8 +13533,7 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
 }
 
 /// Shape: a Git LFS locks listing of `r.git` with no credentials, as git-lfs asks it (A-629 part 2c).
-const LFS_LOCKS_REQUEST: &str =
-  "GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n";
+const LFS_LOCKS_REQUEST: &str = "GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n";
 
 /// Whether `head`, in lower case, is a `401` whose `field` offers Bearer's challenge and no Basic one anywhere.
 fn bearer_alone(head: &str, field: &str) -> bool {
@@ -13876,8 +13875,8 @@ fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
 /// challenge alone and refuses any scheme but Digest and Basic: Basic's challenge first on every connection is A-686
 /// (g258).
 #[test]
-#[ignore = "waits on A-680 (g303: the hg site's stores and lender) and A-686 (g258: Basic's challenge first; \
-            stock hg 7.2 crashes on a first Bearer challenge)"]
+#[ignore = "waits on A-686 (g258: Basic's challenge first; stock hg 7.2 crashes on a first Bearer challenge); \
+            the hg site and its lender are on the daemon's edge (A-680 part 2a)"]
 fn stock_hg_without_credentials_is_refused_in_its_own_words() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13916,8 +13915,8 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 /// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
 /// [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
 #[test]
-#[ignore = "waits on A-685 (g305: slates repository create <name> --tool hg), A-680 (g303: the hg site's stores and \
-            lender) and A-686 (g258: Basic with the token as password on the loopback edge, Basic's challenge first)"]
+#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push) and A-686 (g258: Basic \
+            with the token as password on the loopback edge, Basic's challenge first)"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
     eprintln!(
