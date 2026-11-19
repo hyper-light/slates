@@ -671,8 +671,10 @@
 > alone on main from its seed (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
 > deltifier, `text_delta.c` and `xdelta.c`, ported); the wiring (a `CreateRepository` repository's records on its
 > shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
-> shard's budget); main's: clippy and `xtask` over the module. Found by it, for A-553's owner: the index refuses a
-> replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion comes first. Designed
+> shard's budget); main's: clippy and `xtask` over the module. Found by it and fixed by A-652 (2026-11-19, g264): the
+> index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
+> comes first; it takes it now as the copy FSFS makes, the index's and the verdict's oracles holding such replacements
+> (`cargo test -p slates-svn --lib --locked` 367 of 367 on the Mac Studio, red first 5 of 367). Designed
 > from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the head,
 > FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision

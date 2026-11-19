@@ -44664,7 +44664,8 @@ Applied in the same change to:
 - **Found, not this change's to fix.** The index refuses a replacement by a copy of the node-revision it replaces
   (`CopyOntoItself`), which FSFS records when the deletion comes first (`tree.c` `copy_helper` makes a copy onto the very
   node a no-op only while the destination still holds it); a dump holding one is refused here with the index's refusal.
-  Reported to main for A-553's owner; the generated histories keep a copy off the node it would replace.
+  Reported to main for A-553's owner; the generated histories keep a copy off the node it would replace. Fixed by A-652
+  (the index takes it as the copy FSFS makes; the generated histories hold such replacements since).
 - **Owed of A-628.** The export in format 3 (`text_delta.c`'s windowing and `xdelta.c` ported, so `deltas.dump` and
   `part2.dump` are written again byte for byte); the wiring: a repository `CreateRepository` made holding these records
   on its shard, its texts in the shared object store, the import and export on the control channel, a revision a
@@ -44717,3 +44718,27 @@ sources); `crates/svn` (`report/drive.rs`'s `Drive`, `Guards`, `DriveFailure` an
 - **Owed** (GAPS): the deltas of changed texts against their base, `xdelta.c` ported; the handler that writes the
   drive, reads the client's early answer and its answers to `close-edit` and `abort-edit`, and answers the command;
   one copy-root walk for `reads` and the drive.
+
+### A-652 — The index takes a replacement by a copy of the node it replaces; the export in format 3 with Subversion's deltifier; the import and export as repository verbs (2026-11-19, g264, UI goal 93; §4.17.4 items 2 and 3.5, piece 6; A-553, A-628)
+Applied in the same change to (its first part, the index):
+- `crates/svn` (`index.rs`: `copy_source` takes the very node-revision a replacement replaces, `IndexRefusal::CopyOntoItself`
+  goes, the module documentation says why; `index/tests.rs`: a unit test, the refusal case taken out, the oracle's
+  generator no longer skipping such replacements, a census counter of them; `migration/tests`: a rule test and the
+  generated histories no longer keeping a copy off the node it would replace), the A-628 entry (its finding marked
+  fixed) and GAPS (the §4.17.4 entry).
+- **What was there.** A-553's index refused a replacement whose copy source was the node-revision it replaced
+  (`CopyOntoItself`, `E160004`), reading FSFS's `copy_helper` (`tree.c` 2602), which makes a copy onto the very node
+  standing at its destination a no-op. A-628's import met the gap: `svnadmin load` replays a `replace` record as
+  `svn_fs_delete` then `svn_fs_copy`, and a client's drive as `delete-entry` then `add-file` with history, so the
+  destination holds no node when `copy_helper` runs, and FSFS records a replacement by a copy.
+- **The decision.** A replacement is its deletion and then its addition, so its copy source may be the node-revision it
+  replaces, and the row is a copy like any other (`svn_fs_fs__dag_copy`: the source's line, a fresh copy identity,
+  its own copy root, the replaced node-revision its predecessor and one more predecessor). `copy_helper`'s no-op is a
+  copy onto a node still standing, which records nothing, so no record holds one; the refusal goes, with its variant.
+- **Tests** (Mac Studio, 2026-11-19, kiln, debug, `cargo test -p slates-svn --lib --locked`). Red first (12b582e68,
+  676e0c1ee, own target directory): 5 failed of 367, every one refused `CopyOntoItself`: the unit test, the index's
+  naive-filesystem oracle and A-592's verdict oracle (both draw the index's generated histories, which now hold such
+  replacements), and A-628's rule and generated tests. Green (6423b148d): 367 of 367, rustfmt's layout taken from that
+  run. The unit test replaces `/trunk/README` by a copy of itself, then `/trunk`: each its line kept, a fresh copy
+  identity, its own copy root, the replaced node-revision its predecessor, its count one more, created in its revision,
+  related to what it replaced, the nodes beneath the directory the same node-revisions again.
