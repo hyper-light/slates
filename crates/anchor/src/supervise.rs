@@ -702,6 +702,12 @@ impl Supervisor {
       }
       env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
+    // And the held version-control edge's listener, the same way: the daemon adopts it rather than binding (A-625 part
+    // 3), so the edge's port never drops while a daemon restarts.
+    #[cfg(unix)]
+    if let Some(fd) = &self.vcs_http_listener {
+      env.push((ENV_VCS_HTTP.to_owned(), fd.as_raw_fd().to_string()));
+    }
     // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
     // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the
     // dead daemon left. The table's object is kept until the spawn holds its own copy.

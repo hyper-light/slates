@@ -12701,9 +12701,17 @@ engine: the verdict, rebase, position mapping, the register).
 > files, so the daemon reads none (R1), and the transport's key stays private to it. A daemon that is no fleet node has
 > no identity to present, so its edge serves cleartext, on a loopback address alone; any other address is refused where
 > the flag is read (`slates_api::role::vcs_http_address`, by both roles and the `slates` command), as usage before
-> anything starts, rather than by a daemon that would start without its edge. Owed: the anchor holding the edge's
-> listener across a daemon's restart, as it holds the export's; the option on a library starter's anchor
-> (`slates_api::start`).
+> anything starts, rather than by a daemon that would start without its edge.
+>
+> **Status (2026-11-19, A-625 part 3 continued (2): the anchor holds the edge's port, built).** On Unix the anchor binds
+> the edge's listener once, at the address `--vcs-http` names, with the backlog the edge derives
+> (`slates_server::daemon::bind_vcs_http_listener`), and hands it to every daemon it starts
+> (`slates_anchor::ENV_VCS_HTTP`), as it holds the NFS listener and a fleet node's serve sockets; the daemon adopts it
+> only where its own configuration would have bound (the same address, the same port unless port 0), and serves it. A
+> restart never drops the edge's port: a client that connects while a daemon is down waits in the listener's queue and
+> is answered by the next daemon. An address the anchor cannot bind ends its start by name, as a fleet node's serve
+> sockets do. A library starter asks for the edge too (`StartSpec::vcs_http`), and its anchor holds it the same way.
+> Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
@@ -49644,3 +49652,27 @@ Fixed line), `research/mercurial-server.md` (§25's bullet on the bound: the mac
   arbitrary bytes (generated), none past `bound`.
 - **Owed.** The other platforms' runs (main's). The proptest's failing seed from the red run is not kept: its block has
   no seed file, and the table holds the same case.
+
+### A-625 part 3, continued (2) — the anchor holds the version-control edge's listener, so a daemon's restart never drops its port (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1; §4.6 "One TCP loopback listener held by the anchor"'s rule, applied to the edge)
+Applied in the same change to: §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/anchor` (`ENV_VCS_HTTP`,
+`Supervisor::hold_vcs_http_listener` and its handover at each start); `crates/server` (`daemon::held_listener`, the one
+`OwnedFd::from_raw_fd` site the NFS listener already used, now shared; `daemon::bind_vcs_http_listener`;
+`vcs_http::daemon_edge`'s `bind`, `listener_for`, `listens_at`); `crates/api` (the anchor role's
+`hold_vcs_http_listener`; `StartSpec::vcs_http`; `CONTRACT` 53); `unsafe-budget.toml`'s comment on that site (the count
+unchanged); `docs/cli.md`; `docs/library.md`.
+- **What.** Until now each daemon bound the edge's address itself, so its port was free from a daemon's death until its
+  successor bound it again: a client was refused meanwhile, and a port 0 changed with every restart. The anchor now
+  binds it once, as it binds the NFS listener and a fleet node's serve sockets, and hands the descriptor to every daemon
+  it starts; the kernel queues a client that connects while no daemon runs, and the next daemon answers it.
+- **Decisions.** (1) The daemon adopts a handed listener only where its own configuration would have bound: the same
+  address, the same port unless the configuration asks for port 0 (the anchor's one pick for every daemon); a listener
+  elsewhere is refused, never served, since the edge would answer where the operator did not ask. (2) The anchor binds
+  with the edge's own backlog, derived from the same configuration the daemon derives (`bind_vcs_http_listener`), so
+  the queue is the edge's whoever bound it. (3) An address the anchor cannot bind ends its start by name, as a fleet
+  node's serve sockets do: the operator asked for the edge there, and a daemon would fail the same bind; one that cannot
+  be made inheritable is not held, and each daemon binds its own, as for the NFS listener. (4) No second `unsafe` site:
+  the NFS listener's adoption became `held_listener(variable)`, which both use. (5) A library starter's anchor takes the
+  same option (`StartSpec::vcs_http`), its role and command carrying it, as main asked if it was the same piece.
+- **Tests.** EVIDENCE
+- **Owed.** Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2), the edge's as the NFS
+  listener's.

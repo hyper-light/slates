@@ -117,18 +117,18 @@ impl StartSpec {
       quick: self.quick,
       shards: self.shards,
       fleet: self.fleet.clone(),
-      vcs_http: None,
+      vcs_http: self.vcs_http,
     })
   }
 
-  /// The anchor's command: `PROGRAM PREFIX... --instance NAME anchor [--quick] [--shards N] [--fleet PATH --node
-  /// NAME]`. Its standard input is closed, or, with a launcher's secret, a pipe holding the secret's record and then its
-  /// end ([`crate::launcher`]), so the anchor's read always ends; a host that wraps the command (`systemd-run --scope`)
-  /// keeps the command's standard input, which an exec passes unchanged. Standard output and error are the host's to
-  /// direct: the roles write their log lines to standard error. On Unix the anchor leads a process group of its own, so
-  /// a signal meant for the host's group (a terminal's interrupt) does not stop the instance; a host stops it through
-  /// [`Anchor::stop`], or by sending the anchor `SIGTERM` itself. Refused [`StartFault::Launcher`] when the pipe cannot
-  /// be made.
+  /// The anchor's command: `PROGRAM PREFIX... --instance NAME anchor [--quick] [--shards N] [--fleet PATH --node NAME]
+  /// [--vcs-http ADDRESS]`. Its standard input is closed, or, with a launcher's secret, a pipe holding the secret's
+  /// record and then its end ([`crate::launcher`]), so the anchor's read always ends; a host that wraps the command
+  /// (`systemd-run --scope`) keeps the command's standard input, which an exec passes unchanged. Standard output and
+  /// error are the host's to direct: the roles write their log lines to standard error. On Unix the anchor leads a
+  /// process group of its own, so a signal meant for the host's group (a terminal's interrupt) does not stop the
+  /// instance; a host stops it through [`Anchor::stop`], or by sending the anchor `SIGTERM` itself. Refused
+  /// [`StartFault::Launcher`] when the pipe cannot be made.
   pub fn anchor_command(&self) -> Result<Command, Error> {
     self.anchor_command_under(&[])
   }
