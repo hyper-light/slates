@@ -413,7 +413,7 @@ fn serve(role: &str, drive: &str) -> ! {
   let (send, receive) = sync_channel(REQUEST_BOUND);
   let mut mount = MountThread::start(
     drive,
-    true,
+    (true, NameSearch::CaseSensitive),
     send,
     Waker::noop().clone(),
     slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
@@ -1162,7 +1162,7 @@ fn purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_ti
   let (send, receive) = sync_channel(REQUEST_BOUND);
   let mut mount = MountThread::start(
     &drive,
-    false,
+    (false, NameSearch::CaseSensitive),
     send,
     Waker::noop().clone(),
     slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,

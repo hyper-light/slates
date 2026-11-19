@@ -2339,6 +2339,19 @@ fail the call), so this is the protocol's limit, not a slates defect (A-269). Un
 an open for writing and answered each change `NotPermitted`
 (`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
 
+**A folding volume's drive is case-insensitive to Windows (A-543, A-551; from WinFsp v2.1's source).** A WinFsp drive
+declares `CaseSensitiveSearch` for an exact volume only. Over a folding volume WinFsp's driver keys its open files by
+name compared without case, as the system's upcase table compares them, so every spelling of a file is one file node:
+one share access (an open that shares nothing under one spelling refuses another, `ERROR_SHARING_VIOLATION`, as on
+NTFS) and one cache. Each open answers its node's name as its normalized name (`FSP_FSCTL_OPEN_FILE_INFO`): each
+prefix as Windows already holds it, else as the volume stores it (A-543's `stored_path`) where the driver takes that for
+the asked spelling, else as asked (`crates/bridge-winfsp/src/normalized.rs`). The open's ledger record and its open
+names keep that name byte for byte, since the driver renames a node and the nodes beneath it by it and a notification
+must name it (`winfsp.h` 1285-1299). `GetFinalPathNameByHandleW` shows the made spelling. Three cases stay out of reach
+and are in GAPS: names the volume folds alike and Windows' table does not (normalization, the Kelvin sign) remain a node
+per spelling; a path past 1,024 units is upper-cased by the driver itself; and names the table folds alike and the
+volume keeps apart (`ς` and `σ`) share one node.
+
 **Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
 mount a component makes into a pod, and both need a privilege R10 forbids:
 
@@ -36527,3 +36540,48 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-551 — A folding volume's WinFsp drive compares names without case, and each open answers its node's name (2026-11-19, goal 85, g258; §4.4 name policy, §4.6 "Windows"; B2's Windows half after A-543; T-4.6)
+Applied in the same change to: §4.6 ("A folding volume's drive is case-insensitive to Windows"), GAPS (the
+folding-drive entry: part 2 built, the Windows build owed, three cases out of reach), the bug record
+`docs/bugs/2026-11-18-a-winfsp-drive-declared-a-folding-volume-case-sensitive.md`, `crates/bridge-winfsp/src/`
+(`normalized.rs` new; `notify.rs`, `held.rs`, `inflight.rs`, `ffi.rs`, `host.rs`, `dispatcher.rs`, `lib.rs`),
+`crates/bridge-winfsp/tests/support/host.rs`, `crates/server/src/winfsp.rs`, `crates/cli/tests/winfsp_semantics.rs`,
+`unsafe-budget.toml` (bridge-winfsp 156 to 159).
+- **What was there.** Every WinFsp drive declared `CaseSensitiveSearch`, so on a folding volume each spelling of a file
+  was a file node of its own in WinFsp's driver: an open that shares nothing under one spelling did not refuse another,
+  where NTFS answers `ERROR_SHARING_VIOLATION`, and Windows kept a cache per spelling over one file. A-543 gave the
+  portable half, the path an open names as the volume stores it.
+- **What the driver does (WinFsp v2.1, read 2026-11-19).** Without `CaseSensitiveSearch` it keys open files by name
+  compared without case, unit by unit through the system's upcase table (`src/sys/util.c` 1543-1552), and an open of a
+  name equal so to an open node's joins that node (`src/sys/device.c` 743-760, `src/sys/file.c` 662-666). A new node
+  takes the normalized name the open answers, which must equal the asked name so, or the open is refused
+  `STATUS_OBJECT_NAME_INVALID`; with none it takes the asked name upper-cased (`src/sys/create.c` 1035-1069). The DLL
+  passes a normalized name of at most 1,024 units (`src/dll/fsop.c` 466). A rename moves a node and every node beneath
+  it, found by the same comparison, to the new name with each one's own rest (`src/sys/file.c` 1573-1640); the new name
+  is the target directory's node name and the last component as typed (`src/sys/fileinfo.c` 1814-1862). A notification
+  must name a node by its normalized name (`inc/winfsp/winfsp.h` 1285-1299).
+- **The rule.** A drive declares `CaseSensitiveSearch` for an exact volume only; the held record keeps the posture, so a
+  successor serves a drive as it was mounted (a record from before A-551 reads as case-sensitive, as its drive was).
+  On a folding drive each open answers its node's name: each prefix as Windows already holds it, through a name open at
+  it or beneath it; past that, each component as the volume stores it where the driver takes that for the asked one,
+  else as asked; past 1,024 units, the driver's own upper-cased name, unanswered. The ledger record and the open names
+  keep that name byte for byte, the match the driver renames by and the name a notification needs. A rule that took the
+  stored path alone would have left records behind the driver's: after another path respelled a held directory, a
+  sibling's open would name the new spelling while the driver joined the old node, and a rename would move the node and
+  not the record.
+- **Rejected.** Recording each open as WinFsp upper-cases it, which keeps every record equal to the driver's by
+  construction: `GetFinalPathNameByHandleW` would then show upper case to Rust's `canonicalize`, Python's `realpath`
+  and git, which ask it for a file's path (A-369), and a notification of an entry under a held directory would carry
+  the upper-cased directory to watchers. Answering every open with its stored path, as A-543's record planned: refused by the driver
+  for any spelling that differs by more than case, and out of step with a node Windows already holds.
+- **Also fixed.** WinFsp v2.1's DLL counts an open's normalized name twice when it places the open's security descriptor
+  after it (`src/dll/fsop.c` 468, then 413), and leaves the alignment between them unwritten, so a Create's size reached
+  bytes of the receive packet's earlier response. `finish_response` clears both spans, keeping A-215's rule that no
+  byte of an earlier response is sent.
+- **Cost.** On a folding drive, one look-up a component per open (the stored path), and one indexed look-up a component
+  of the open names until Windows holds none (`OpenNames::spelled_at`), keyed by the upcased units; nothing on an exact
+  drive.
+- **Out of reach (GAPS).** Spellings the volume folds alike and the table does not (normalization, the Kelvin sign) are a
+  node each; a path past 1,024 units is upper-cased by the driver, so a rename above it that the records spell otherwise
+  leaves its record; names the table folds alike and the volume keeps apart (`ς`, `σ`) share one node.

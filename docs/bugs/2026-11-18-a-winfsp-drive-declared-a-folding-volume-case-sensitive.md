@@ -34,13 +34,37 @@ Part 1 (A-543, this change):
   asked), implemented by `VolumeBridge` (after its look-up, so an overlay's base entry is in the directory) and
   `ScopedBridge` (admitted as its look-up is); `stored_path`, a path named component by component as stored.
 
-Part 2 (owed, Windows-only, main's to write and compile): `CaseSensitiveSearch` for an exact volume only; each open and
-create of a folding volume answered with its `stored_path` as WinFsp's normalized name (`FSP_FSCTL_OPEN_FILE_INFO`'s
-`NormalizedName` when it fits `NormalizedNameSize`), the ledger and the open names recording that path; and the drive
-test: an exclusive open of `A.TXT`, then `a.txt` refused `ERROR_SHARING_VIOLATION`, and the final path the stored one.
+Part 2 (A-551, 2026-11-19, g258; the Windows half compiled and run by main):
+- `crates/bridge-winfsp/src/host.rs`: `Mounted::new` declares `CaseSensitiveSearch` only for an exact volume, and a held
+  drive keeps the posture its record names; `system_upcase` (ntdll's `RtlUpcaseUnicodeChar`, the table the driver
+  compares by); `record_open_reply` names each open by `crate::normalized::node_name` over its `stored_path` and records
+  that name in the ledger and `OpenNames`; `Reply::Opened` carries it, and `finish_open` copies it into
+  `FSP_FSCTL_OPEN_FILE_INFO`'s `NormalizedName` when it fits (`put_normalized_name`).
+- `crates/bridge-winfsp/src/normalized.rs` (new, pure): the rule. Each prefix as Windows already holds it, else the
+  stored spelling where the driver takes it for the asked one, else as asked; past 1,024 units the driver's own
+  upper-cased name; a path that lost an unpaired surrogate unanswered.
+- `crates/bridge-winfsp/src/notify.rs`: `OpenNames::searching` keeps the open names by the units the driver compares
+  them by, so an open finds the spelling Windows holds a prefix of its path by (`spelled_at`).
+- `crates/bridge-winfsp/src/held.rs`: the record's flag byte keeps the drive's case posture (bit 1).
+- `crates/bridge-winfsp/src/inflight.rs`: `finish_response` clears what a successful Create's size counts besides its
+  name and descriptor (WinFsp v2.1's DLL counts the name twice when it places the descriptor, `fsop.c` 468 then 413).
+- `crates/bridge-winfsp/src/ffi.rs`: `OpenFileInfo`, `FSP_FSCTL_OPEN_FILE_INFO`'s layout, checked when it compiles.
+- `crates/server/src/winfsp.rs`: `name_search` gives the mount its volume's policy; the shard's `OpenNames` searches as
+  the drive declared (`Ready::search`).
+- `crates/cli/tests/winfsp_semantics.rs`: the drive tests.
 
 ## Tests
 
 `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (`crates/bridge-core/src/lib.rs`, every
 host): red with the open named as asked, green with the walk, on the Mac Studio (d1323898, debug). Command:
 `cargo test -p slates-bridge-core --lib stored_path_tests`.
+
+Part 2, every host: `normalized::tests` (each spelling of a file names one node by its made spelling; a case-sensitive
+drive answers nothing; a stored spelling answered only where the driver takes it; the spelling Windows already holds a
+path or a prefix by; past 1,024 units the driver's upper-cased name; a lost surrogate unanswered; final sigma takes the
+open node's name), `notify::tests::the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames`,
+`inflight::tests::a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response` and
+`held::tests::the_mount_record_keeps_how_its_drive_compares_names`. Command:
+`cargo test -p slates-bridge-winfsp --lib -- normalized:: notify:: inflight:: held::`. Windows (main's): the drive
+tests `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` and
+`an_exact_drive_keeps_two_spellings_two_files` in `crates/cli/tests/winfsp_semantics.rs`.

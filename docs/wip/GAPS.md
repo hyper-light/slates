@@ -1418,7 +1418,7 @@
 >   - the same race on WinFsp's own driver, with an outside writer in place of the link.
 
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
-> A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
+> A-300; built 2026-11-19 in two parts, A-543 and A-551; the Windows half compiled and run by main, owed).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
 > every volume (`crates/bridge-winfsp/src/host.rs`, the mount's `params.flags`), while a volume made with `--fold`
 > (`NamePolicy::Fold`) folds names in its own look-ups. WinFsp's driver keys its open files by name and compares
 > case-sensitively when that bit is set (`src/sys/device.c` 676 and 750, `src/sys/create.c` 316-318). So a file opened
@@ -1436,12 +1436,32 @@
 >   file answers the spelling it was made with, on an exact one the path as asked. Held by
 >   `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (bridge-core's unit tests, every
 >   host), red with the open named as asked on the Mac Studio.
-> - **Owed, part 2 (Windows-only, main's to write and compile, run-requests.md):** the drive declares
->   `CaseSensitiveSearch` only for an exact volume (`Mounted::new`'s `params.flags`, given the volume's name policy by
->   `crates/server/src/winfsp.rs`); an open or create on a folding volume answers its `stored_path` as WinFsp's
->   normalized name (`FSP_FSCTL_OPEN_FILE_INFO`'s `NormalizedName`, copied when it fits `NormalizedNameSize`, else
->   none), and the open's ledger and `OpenNames` record that path, the name the driver's file node takes; then the drive
->   test above.
+> - **Built, part 2 of 2 (2026-11-19, A-551, goal 85, g258): the drive's half.** The drive declares
+>   `CaseSensitiveSearch` for an exact volume only (`Mounted::new`, given the volume's policy by
+>   `crates/server/src/winfsp.rs` `name_search`); the held record keeps the posture, so a successor serves a drive as it
+>   was mounted, and a record made before A-551 reads as case-sensitive, as every drive then was. Each open and create on
+>   a folding drive answers its node's name as WinFsp's normalized name (`FSP_FSCTL_OPEN_FILE_INFO`, `finish_open`):
+>   each prefix as Windows already holds it, else the stored spelling where the driver takes it for the asked one (the
+>   system's upcase table, ntdll's `RtlUpcaseUnicodeChar`), else as asked (`crates/bridge-winfsp/src/normalized.rs`);
+>   the open's ledger record and `OpenNames` keep that name byte for byte, as the driver renames and notifications need
+>   it (`winfsp.h` 1285-1299). The receive worker clears what WinFsp's DLL counts past a Create's name and descriptor:
+>   v2.1 counts the name twice when it places the descriptor (`fsop.c` 468 then 413), which would have sent the
+>   packet's earlier bytes. Pure rules held by unit tests on every host (`normalized::tests`, `notify::tests`'s
+>   `the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames`, `inflight::tests`'s
+>   `a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response`, `held::tests`'s
+>   `the_mount_record_keeps_how_its_drive_compares_names`).
+> - **Owed (main, filed in run-requests.md):** the Windows build of A-551 (`host.rs`, the server's `winfsp.rs`) and the
+>   drive tests `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` (red before: `a.txt` opened beside
+>   an unshared `A.TXT`, final path `a.txt`) and `an_exact_drive_keeps_two_spellings_two_files`
+>   (`crates/cli/tests/winfsp_semantics.rs`), with the rest of the WinFsp suites.
+> - **Out of reach, stated (A-551):** names the volume folds alike and Windows' upcase table does not (a decomposed `é`
+>   against a precomposed one, the Kelvin sign against `K`) stay a file node per spelling, since the driver refuses a
+>   normalized name that differs by more than its table's case; a path past 1,024 units is upper-cased by the driver
+>   (the DLL drops a longer normalized name), so a rename of a directory above it that the records spell otherwise
+>   leaves that record behind; and names the table folds alike and the volume keeps apart (final sigma `ς` against `σ`)
+>   are two files to the volume and one node to the driver, so the second's open while the first is open shares the
+>   first's node and cache. The last would need the volume to refuse such a name beside its twin on a drive's volume,
+>   or the drive to refuse the second open; neither is built.
 
 > **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
 > owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.

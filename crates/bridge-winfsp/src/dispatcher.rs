@@ -473,7 +473,8 @@ impl inflight::settle::Edges for Dll<'_> {
 /// One DLL operation on the worker's reused packets. The request is copied whole into the working packet, and the
 /// callbacks read nothing past its own size. Only the response's fixed part is cleared, as the header the callback
 /// fills: a callback writes whatever it returns past that part and sets the size over it, and
-/// [`inflight::finish_response`] clears the padding up to the aligned length, so no byte of an earlier response is sent.
+/// [`inflight::finish_response`] clears the padding up to the aligned length, and what a successful Create's size
+/// counts besides its normalized name and open descriptor (A-551), so no byte of an earlier response is sent.
 /// `response` is the worker's own [`Packet`], lent through the protocol; any other buffer is refused.
 fn operation(
   file_system: *mut FileSystem,
