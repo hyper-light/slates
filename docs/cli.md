@@ -31,7 +31,7 @@ entitlement. These limitations are open correctness/integration work, not option
 ## Running a daemon
 
 ```
-slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME]
+slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME] [--vcs-http ADDRESS]
 ```
 
 The anchor measures the machine profile (seconds; `--quick` for tests), creates the shared
@@ -45,6 +45,14 @@ an anonymous shared segment alone does not establish locked residency or no swap
 `--shards N` overrides the derived shard count (tests). One process runs at most 1,024 shards (the
 runtime's registry of shards); a larger count is refused as a usage error before anything starts, since
 the daemon could never register its shards and the anchor would restart it for good.
+
+`--vcs-http ADDRESS` serves git over HTTP at ADDRESS, an IPv4 address and port (port 0 lets the system
+pick one); the daemon logs where it serves (`slates daemon: the version-control HTTP edge serves HTTPS on
+IP:PORT`). A fleet node's edge serves HTTPS with the node's own certificate and key, the ones its fleet
+manifest names. A daemon that is no fleet node has no certificate, so it serves plain HTTP, on a loopback
+address alone: any other address is refused as a usage error before anything starts. Clients sign in with
+a token from `slates credential token`, as a bearer token or, over HTTPS, as Basic's password. The anchor
+passes the flag to the daemon it supervises.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 
