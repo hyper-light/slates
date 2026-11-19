@@ -148,6 +148,18 @@
 > session channel with git's `exec` and `env` (RFC 4254); the listener on the runtime, with the connection-lifetime
 > estimator that feeds the key time and the host key's keeping; main's live interop with stock `ssh` clients, and its
 > clippy and `xtask` over the crate; a post-quantum exchange (`mlkem768x25519-sha256`) after its own amendment.
+> **A-614 (2026-11-19, g083; piece 5's part 1):** `slates-git` keeps a repository's objects on `slates-vcs` (`store`):
+> objects in through one trait, `Entries`, which A-608's reader fits; each named once by git's rule, the store's
+> parameter, a claimed id checked against it, and a collision attack refused in git's words; held by the push until its
+> verdict. Committed, an object gets a position and its rows (a commit's with its tree and parents by position, its
+> date and its generation number); each version keeps D(k) and the green its reached set as runs of positions, computed
+> at admission by walks that stop at what the green reached (a reached tree skipped whole), a fast-forward growing the
+> set and a create or rewrite making it again from the nearest green head below, so a ref made at another's head walks
+> nothing; a version's head, root tree and any path read from rows and trees with no walk. An oracle holds the store to
+> a map model over generated histories in both formats; eleven mutations each turned tests red (`cargo test -p
+> slates-git --lib store::`, 14 of 14, Mac Studio; see A-614). Owed: part 2, the pack fragments and the base pack with
+> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters; the walks and a
+> commit sliced under the shard's budget; the versions' records as content.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) (2026-11-19; UI goals 91 and
