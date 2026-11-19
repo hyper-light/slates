@@ -13,7 +13,15 @@ use slates_http::reply::Status;
 use slates_http_edge::connection::Fields;
 use slates_http_edge::credential::Credential;
 
-use super::{Authenticator, GitServices, GitSite, Repositories, ServiceRefused, Start, Unserved};
+use slates_git::object_name::ObjectFormat as GitFormat;
+use slates_git::store::Repository as GitStore;
+use slates_git::upload::{PackPlan, PackRefused, PackSource, Served as UploadServed};
+use slates_vcs::ContentStore;
+
+use super::{
+  Authenticator, GitServices, GitSite, Repositories, ServiceRefused, Start, StoreLender, Unserved,
+  UploadServices,
+};
 use crate::vcs_http::{Answer, Decided, Exchange, Failed};
 
 /// Shape: room enough for every head these tests send.
@@ -225,15 +233,18 @@ fn ready<F: Future>(future: F) -> F::Output {
   }
 }
 
-/// Every run an exchange replies, in order, until its reply ends.
+/// Every run an exchange replies, in order, until its reply ends: a step's bytes are kept whether or not more follow.
 fn replies<E: Exchange>(exchange: &mut E) -> Vec<Vec<u8>> {
   let mut runs = Vec::new();
   loop {
     let mut run = Vec::new();
-    if !ready(exchange.reply(&mut run)).unwrap() {
+    let more = ready(exchange.reply(&mut run)).unwrap();
+    if !run.is_empty() {
+      runs.push(run);
+    }
+    if !more {
       return runs;
     }
-    runs.push(run);
   }
 }
 
@@ -445,4 +456,179 @@ fn a_route_refused_by_its_syntax_is_http_backends_whoever_asks() {
       false
     )
   );
+}
+
+/// Shape: the content store's budget and window an upload test's empty repository is kept in.
+const STORE_BUDGET: u64 = 1 << 20;
+/// Shape: as [`STORE_BUDGET`]: a window of many identities.
+const STORE_WINDOW: usize = 1 << 16;
+/// Shape: the branch the test repository's `HEAD` names, unborn.
+const UNBORN_HEAD: &[u8] = b"refs/heads/main";
+
+/// An empty SHA-1 repository's store, kept for the test's life.
+struct EmptyRepository {
+  /// Its index, versions and greens: none yet.
+  repository: GitStore,
+  /// Its content: none yet.
+  store: ContentStore,
+}
+
+/// A pack source no exchange of these tests begins: an empty repository has nothing to pack.
+#[derive(Clone, Copy, Debug)]
+struct NoPacks;
+
+impl PackSource for NoPacks {
+  type Pack = ();
+
+  fn begin(
+    &mut self,
+    _served: &UploadServed<'_>,
+    _plan: &PackPlan<'_>,
+    _admission: &mut slates_git::Admission,
+  ) -> Result<(), PackRefused> {
+    Err(PackRefused::Stalled)
+  }
+
+  fn write(
+    &mut self,
+    _served: &UploadServed<'_>,
+    _pack: &mut (),
+    _out: &mut Vec<u8>,
+    _room: usize,
+  ) -> Result<bool, PackRefused> {
+    Err(PackRefused::Stalled)
+  }
+}
+
+/// Lends the git repository `r.git`'s store, an empty one, and no other.
+#[derive(Clone, Copy)]
+struct Lends {
+  /// The store, kept for the test's life.
+  held: &'static EmptyRepository,
+  /// The pack source.
+  packs: NoPacks,
+}
+
+impl Lends {
+  /// A lender of a fresh empty repository's store.
+  fn empty() -> Lends {
+    let held = Box::leak(Box::new(EmptyRepository {
+      repository: GitStore::new(GitFormat::Sha1),
+      store: ContentStore::new(STORE_BUDGET, STORE_WINDOW).unwrap(),
+    }));
+    Lends {
+      held,
+      packs: NoPacks,
+    }
+  }
+}
+
+impl StoreLender for Lends {
+  type Packs = NoPacks;
+
+  fn holds(&self, id: RepositoryId) -> bool {
+    id == (RepositoryId { bytes: [0; 16] })
+  }
+
+  fn lend<R>(
+    &mut self,
+    id: RepositoryId,
+    step: impl FnOnce(&UploadServed<'_>, &mut NoPacks) -> R,
+  ) -> Option<R> {
+    let held = self.held;
+    let served = UploadServed {
+      repository: &held.repository,
+      store: &held.store,
+      refs: &[],
+      head: UNBORN_HEAD,
+    };
+    self.holds(id).then(|| step(&served, &mut self.packs))
+  }
+}
+
+/// A-625 part 3 (A-640 part 2's upload-pack behind the edge). Do: as the owner, with upload-pack served from an empty
+/// repository's store, ask for the advertisement at protocol v2, then POST an `ls-refs` request. Expect: the
+/// advertisement is v2's capabilities, its `version 2` line first and `ls-refs=unborn` among them, with no `# service=`
+/// line; the `ls-refs` answer is the flush alone, since the repository holds no ref.
+#[test]
+fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
+  let mut site = site(Vec::new(), UploadServices::new(Lends::empty(), ROOM));
+  let advertise = request(
+    "GET",
+    UPLOAD_ADVERTISEMENT,
+    &[OWNER_BEARER, "Git-Protocol: version=2"],
+  );
+  let (_, _, mut exchange, _) = served(site.answer(&head(&advertise), true));
+  ready(exchange.body_end()).unwrap();
+  let advertisement = replies(&mut exchange).concat();
+  assert!(
+    advertisement.starts_with(b"000eversion 2\n"),
+    "{advertisement:?}"
+  );
+  assert!(
+    advertisement
+      .windows(b"ls-refs=unborn".len())
+      .any(|window| window == b"ls-refs=unborn")
+  );
+  let ls_refs: &[u8] = b"0014command=ls-refs\n0000";
+  let length = format!("Content-Length: {}", ls_refs.len());
+  let post = request(
+    "POST",
+    "/r.git/git-upload-pack",
+    &[
+      OWNER_BEARER,
+      "Git-Protocol: version=2",
+      "Content-Type: application/x-git-upload-pack-request",
+      &length,
+    ],
+  );
+  let (_, _, mut exchange, _) = served(site.answer(&head(&post), true));
+  ready(exchange.body(ls_refs)).unwrap();
+  ready(exchange.body_end()).unwrap();
+  assert_eq!(replies(&mut exchange).concat(), b"0000");
+}
+
+/// A-625 part 3 (A-640 part 2: a refused request is still answered). Do: POST upload-pack a body that is no pkt-line.
+/// Expect: served `200`, the answer git's `ERR` line, as `git upload-pack --stateless-rpc` answers it.
+#[test]
+fn a_request_upload_pack_refuses_is_answered_in_gits_words() {
+  let mut site = site(Vec::new(), UploadServices::new(Lends::empty(), ROOM));
+  let garbage: &[u8] = b"zzzz";
+  let post = request(
+    "POST",
+    "/r.git/git-upload-pack",
+    &[
+      OWNER_BEARER,
+      "Git-Protocol: version=2",
+      "Content-Type: application/x-git-upload-pack-request",
+      "Content-Length: 4",
+    ],
+  );
+  let (_, _, mut exchange, proven) = served(site.answer(&head(&post), true));
+  ready(exchange.body(garbage)).unwrap();
+  ready(exchange.body_end()).unwrap();
+  let answer = replies(&mut exchange).concat();
+  assert!(proven);
+  assert!(
+    answer
+      .windows(b"ERR ".len())
+      .any(|window| window == b"ERR "),
+    "{:?}",
+    String::from_utf8_lossy(&answer)
+  );
+}
+
+/// A-625 part 3 (A-654 owed). Do: as the owner, with upload-pack served, ask for receive-pack's advertisement, and
+/// upload-pack's of a repository whose store is not held. Expect: `503` for each: receive-pack's entry point has not
+/// landed, and no store is lent for that repository.
+#[test]
+fn receive_pack_and_an_unheld_store_are_503() {
+  let lender = Lends::empty();
+  let mut site = site(Vec::new(), UploadServices::new(lender, ROOM));
+  let receive = request("GET", RECEIVE_ADVERTISEMENT, &[OWNER_BEARER]);
+  assert_eq!(
+    refusal(&site.answer(&head(&receive), true)).0,
+    Status::SERVICE_UNAVAILABLE
+  );
+  assert!(!lender.holds(RepositoryId { bytes: [1; 16] }));
 }
