@@ -40,10 +40,20 @@ fn text(key: Vec<u8>) -> String {
 }
 
 /// One dimension's map: its root, and the arena its nodes live in (module docs, "Arenas are lent").
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Dim<V> {
   root: Ptrie<V>,
   nodes: Nodes<V>,
+}
+
+// By hand: a derived `Default` would ask it of the values, which an empty map holds none of.
+impl<V> Default for Dim<V> {
+  fn default() -> Self {
+    Dim {
+      root: Ptrie::default(),
+      nodes: Nodes::default(),
+    }
+  }
 }
 
 impl<V: Clone> Dim<V> {

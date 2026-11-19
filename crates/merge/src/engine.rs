@@ -3149,9 +3149,9 @@ impl Green {
             .push((version, Some(value)));
         }
         Effect::RemoveXattr(path, name) => {
-          let held = self.xattrs.remove(&path, &name).map(Some);
+          let before = self.xattrs.remove(&path, &name).map(Some);
           let key = (path, name);
-          seed(&mut self.xattr_history, &key, held);
+          seed(&mut self.xattr_history, &key, before);
           self.xattr_changed.insert(key.clone(), version);
           self
             .xattr_history
