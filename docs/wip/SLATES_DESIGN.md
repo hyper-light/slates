@@ -36527,3 +36527,25 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-558 — A digest that finds another file at a clean entry's name leaves the inode on its file, as A-151 has it (2026-11-18, g230, UI goal 85, from g225's inventory; §4.15 "verified current", §4.5, A-151)
+Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-a-digest-pointed-an-open-base-inode-at-the-file-an-outsider-put-at-its-name.md`
+(new), and `crates/vfs/src/base.rs` (`verify_current`, `leave_name`, `Current`, `digest_begin`/`digest_begin_at`,
+`reopen_verified`, `DigestStats::replaced`, and its first unit test module).
+- **What was there.** `verify_current` opens a clean file's path afresh and compares its identity with the descriptor
+  the inode holds, the one check that sees a replacement racing the directory listing's validation. On a mismatch it
+  pointed the inode at the new file in place: it swapped in the new descriptor and adopted the new fingerprint. A handle
+  opened on the old file then read the outsider's bytes, and the name kept the old number. A-151 had made every relist
+  detach such an inode instead; this path was left as it was, with no test reaching it.
+- **The rule.** The inode leaves its name as a relist has it (`leave_name`): its descriptor is kept while a handle holds
+  it open (the opener reads the file it opened, POSIX), its directory's listing is reread, and the name leaves the node,
+  so the next lookup serves the disk's file as a new inode. `verify_current` answers `Current::Replaced`, counted
+  `DigestStats::replaced`, and so does an inode the validated listing itself took from its name, which was `NotFound`.
+  A digest by path looks the name up once more and digests the new entry; a second replacement is the disk changing it
+  now, refused `DigestUnverified`, as is a replacement between a digest's slices.
+- **Test.** `a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one` (`base.rs`' unit tests):
+  a base file opened as a mount's `OPEN` does, then its path digested with an outsider's replacement landing at each
+  seam call of the digest in turn, a scene each, until one lands after the digest. Each landing must leave the handle
+  reading the file it opened, the digest naming the outsider's file or refused `DigestUnverified`, the name a new inode,
+  and at least one landing must reach `verify_current`'s identity check (`replaced` moved).
+

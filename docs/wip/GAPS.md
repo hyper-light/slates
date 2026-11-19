@@ -18202,9 +18202,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - Sent to the owner for review and merge.
   - **Owed:** the owner's review of the five-patch series; Shards' Linux CI legs on it.
 - **Open, found by step 4 (2026-10-24), reported:**
-  - `verify_current` (§4.15's digest) re-points an untouched inode to another file found at its name, where A-151
-    detaches the inode and gives the name a new one; no test reaches this path (`digest_begin` has none). Its backings
-    are marked stale there, in case it runs.
+  - **Fixed 2026-11-18 (A-558):** `verify_current` (§4.15's digest) re-pointed an untouched inode to another file found
+    at its name, where A-151 detaches the inode and gives the name a new one. It now leaves the name as a relist does
+    (the descriptor kept while a handle holds the inode open, the listing reread, the name a new entry), counted
+    `DigestStats::replaced`; a digest by path looks once more and digests the new entry, and one between its slices is
+    refused `DigestUnverified`. An inode the validated listing already took from its name answers the same, where it
+    was `NotFound`. Test: `a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one`
+    (`crates/vfs/src/base.rs`: the outsider's replacement landed at each seam call of a digest in turn).
   - `rewitness` recorded every witness `racy: false`, so a same-tick edit after it was caught only by a later
     fingerprint change (correctness on a coarse-granularity filesystem). **Fixed 2026-10-24**, failing test first: a
     re-witness asks the host's clock as a copy-up does (A-162).
