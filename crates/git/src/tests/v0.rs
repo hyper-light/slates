@@ -1143,6 +1143,47 @@ fn advertisement_lines_that_break_the_grammar_are_refused_by_kind() {
   );
 }
 
+/// A-640 (A-615's finding: this module read a ref's name as a word): do decode advertisements naming a ref git's
+/// `check_refname_format` refuses (`..`, a name outside `refs/`, `.lock` at the end, `@{`), and write each. Expect:
+/// each refused at its name, read or written; `HEAD` and `receive-pack`'s `.have` taken.
+#[test]
+fn an_advertised_ref_name_is_held_to_gits_ref_name_rule() {
+  let (tip, two) = (recorded("refs/heads/main"), commit("two"));
+  let first = format!("{tip} HEAD\0multi_ack\n");
+  for name in ["refs/heads/a..b", "main", "refs/heads/x.lock", "refs/heads/a@{1}"] {
+    let second = format!("{tip} {name}\n");
+    let lines: [&[u8]; 2] = [first.as_bytes(), second.as_bytes()];
+    refused_advertisement(
+      &lines,
+      Refusal::Line {
+        at: packet_at(&lines, 1),
+        refusal: LineRefusal::Name { at: 41 },
+      },
+    );
+    let written = Advertisement {
+      version: Version::V0,
+      capabilities: Capabilities::listed(&[]),
+      refs: vec![AdvertisedRef {
+        id: tip,
+        name: name.as_bytes(),
+        peeled: None,
+      }],
+      shallows: Vec::new(),
+    }
+    .write(&mut Vec::new());
+    assert_eq!(
+      written,
+      Err(WriteRefusal::Line(LineRefusal::Name { at: 41 })),
+      "{name}"
+    );
+  }
+  let alternate = format!("{two} .have\n");
+  let bytes = stream(&[first.as_bytes(), alternate.as_bytes()]);
+  let (advertisement, _) = decoded(&bytes);
+  let names: Vec<&[u8]> = advertisement.refs.iter().map(|reference| reference.name).collect();
+  assert_eq!(names, [b"HEAD".as_slice(), b".have"]);
+}
+
 /// A-604, refused by kind: do decode advertisements whose order breaks the grammar one way each. Expect: each refused as
 /// unexpected where its packet begins: a peeled line after no ref or after another ref, a ref after the shallow lines,
 /// `capabilities^{}` with a name not null, a ref after it, it again on a later line, a peeled first line.

@@ -79,6 +79,7 @@ use crate::object_name::{
 };
 use crate::out::{Measure, Out};
 use crate::pktline::{self, HEADER_LEN, MAX_DATA, Packet};
+use crate::refname;
 use crate::{Admission, PastAdmission, to_u64};
 
 /// Format: the byte git's writers end most lines with, and which its readers take off a line's end when it is there
@@ -108,6 +109,10 @@ const PEELED: &[u8] = b"^{}";
 /// Format: the name on the line an advertisement with no refs sends, with the null object name [gitprotocol-pack
 /// "no-refs"].
 const NO_REFS: &[u8] = b"capabilities^{}";
+
+/// Format: the name `receive-pack` gives an object it offers from an alternate, which is no ref (`receive-pack.c`
+/// `show_one_alternate_ref`; `connect.c` `process_ref` reads it apart).
+const ALTERNATE: &[u8] = b".have";
 
 /// Format: the word a version line begins with (`protocol.c`'s `determine_protocol_version_client`).
 const VERSION: &[u8] = b"version";
@@ -1189,14 +1194,20 @@ fn check_ref(reference: &AdvertisedRef<'_>, format: ObjectFormat) -> Result<(), 
   if let Some(peeled) = reference.peeled {
     same_format(peeled, format)?;
   }
-  let name_at = format.hex_len().saturating_add(1);
-  check_name(reference.name, name_at).map_err(WriteRefusal::Line)?;
-  if reference.name.ends_with(PEELED) {
+  if !is_ref_name(reference.name) {
     return Err(WriteRefusal::Line(LineRefusal::Name {
-      at: to_u64(name_at),
+      at: to_u64(format.hex_len().saturating_add(1)),
     }));
   }
   Ok(())
+}
+
+/// Whether an advertised ref may be named `name` (A-640, after A-615's finding that this module read names as words):
+/// `HEAD`, `receive-pack`'s `.have`, or a name under `refs/` that git's `check_refname_format` takes
+/// (`crate::refname`), as git's client holds every advertised ref to it (`connect.c` `check_ref`). A peeled line's
+/// name is its ref's, with `^{}` after it, so it is held to its ref.
+fn is_ref_name(name: &[u8]) -> bool {
+  name == ALTERNATE || refname::is_valid(name)
 }
 
 /// Writes a ref's peeled line, `<id> <name>^{}`, when it has one.
@@ -1400,6 +1411,9 @@ impl<'a> RefWalk<'a> {
         Ok(())
       }
       Some(_) => Err(Refusal::Unexpected { at: to_u64(at) }),
+      None if !is_ref_name(name) => Err(refused_line(at)(LineRefusal::Name {
+        at: to_u64(self.format.hex_len().saturating_add(1)),
+      })),
       None => {
         self.peelable = Some(name);
         self.refs = self.refs.saturating_add(1);

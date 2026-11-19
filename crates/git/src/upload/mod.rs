@@ -18,7 +18,9 @@
 //! request is held to the advertisement first, as `serve.c` holds it, so a command or a capability not advertised
 //! (`bundle-uri` until the repository offers a bundle list, `promisor-remote`) and an object format other than the
 //! repository's are refused; then `ls-refs`, `fetch` or `object-info` answers it. A flush alone ends a session, and is
-//! answered with nothing ([`Answer::ends_session`]).
+//! answered with nothing ([`Answer::ends_session`]). Protocol v0 and v1 (A-640 part 3) are answered as git answers them
+//! over smart HTTP: the ref advertisement, and each request whole and statelessly, its acknowledgments as
+//! `get_common_commits` writes them and its pack on the band the client chose (the `v0` module).
 //!
 //! **One position of the store.** Everything but the pack is decided and encoded while [`serve`] runs, in one turn over
 //! the repository: `ls-refs` reads the refs at one position (§4.17.2 "A fetch" item 1), and `fetch` maps its arguments
@@ -43,9 +45,10 @@
 //! framed through, each charged before it is made. A step writes at most the room its caller gives it and asks the
 //! pack's source for at most one packet's data at a time, so a step's work is bounded by its room and one packet.
 //!
-//! **Owed** (GAPS): protocol v0 and v1 (A-640 part 3), answered with an `ERR` until then; `sparse:oid` (part 4);
-//! `packfile-uris` answered from the store's URI packs and `bundle-uri` from its bundle list, whose choice A-624 built
-//! and which the store keeps neither of yet; progress on band 2; hidden refs, which §4.17.2's "Access" makes policy.
+//! **Owed** (GAPS): a stateful protocol v0 session, an SSH client's (git speaks v2 over SSH since 2.26); `sparse:oid`
+//! (part 4); `packfile-uris` answered from the store's URI packs and `bundle-uri` from its bundle list, whose choice
+//! A-624 built and which the store keeps neither of yet; progress on band 2; hidden refs, which §4.17.2's "Access"
+//! makes policy.
 
 use slates_vcs::ContentStore;
 
@@ -62,8 +65,12 @@ mod advertise;
 mod answer;
 mod fetch;
 mod refs;
+mod v0;
 
 pub use answer::{Answer, Written};
+
+/// Format: the name this server gives itself in `agent`, under every protocol version, its crate's version after it.
+const AGENT: &str = concat!("slates/", env!("CARGO_PKG_VERSION"));
 
 /// Format: git's band-3 words for a pack that could not be finished (`upload-pack.c` `create_pack_file`'s
 /// `abort_msg`).
@@ -154,10 +161,23 @@ pub trait PackSource {
 /// ([`Refusal::words`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-  /// A protocol version this server does not answer yet: v0 and v1, A-640 part 3.
-  Version(Version),
   /// The request is not one protocol v2 reads (A-582's refusal), or an answer could not be written.
   Wire(v2::Refusal),
+  /// A protocol v0 or v1 request the pack protocol does not read: bytes that are no pkt-lines, a line out of its
+  /// place, a request that ends before its wants' flush, or bytes after its end.
+  Request {
+    /// Where the packet at fault begins, or where the bytes ended.
+    at: u64,
+  },
+  /// A protocol v0 or v1 line that is no client line (A-604's refusal).
+  Line {
+    /// Where its packet begins.
+    at: u64,
+    /// Why.
+    refusal: crate::v0::LineRefusal,
+  },
+  /// A protocol v0 or v1 answer's line the protocol cannot carry (A-604's refusal).
+  Write(crate::v0::WriteRefusal),
   /// A command the server does not advertise (`parse_command`: "invalid command").
   Command(Command),
   /// A capability the server does not advertise (`receive_client_capability`: "unknown capability").
@@ -211,8 +231,11 @@ impl Refusal {
   /// What the client is told, in git's words where it has them.
   pub fn words(&self) -> Vec<u8> {
     match self {
-      Refusal::Version(_) => said(&[b"upload-pack: protocol v0 and v1 are not served yet"]),
       Refusal::Wire(_) => said(&[b"upload-pack: the request is not one protocol v2 reads"]),
+      Refusal::Request { .. } | Refusal::Line { .. } => {
+        said(&[b"upload-pack: the request is not one the pack protocol reads"])
+      }
+      Refusal::Write(_) => said(&[b"upload-pack: an answer's line could not be written"]),
       Refusal::Command(command) => said(&[b"invalid command '", command.name(), b"'"]),
       Refusal::Capability => said(&[b"upload-pack: unknown capability"]),
       Refusal::ObjectFormat { server, client } => said(&[
@@ -305,7 +328,12 @@ pub fn serve<P: PackSource>(
       .map(Answer::whole)
       .map_err(Refused::plain),
     (Version::V2, Asked::Request(bytes)) => request(served, bytes, packs, admission),
-    (Version::V0 | Version::V1, _) => Err(Refused::plain(Refusal::Version(version))),
+    (Version::V0 | Version::V1, Asked::Advertise) => v0::advertisement(served, version, admission)
+      .map(Answer::whole)
+      .map_err(Refused::plain),
+    (Version::V0 | Version::V1, Asked::Request(bytes)) => {
+      v0::answer(served, bytes, packs, admission).map_err(Refused::plain)
+    }
   };
   made.unwrap_or_else(Answer::refused)
 }

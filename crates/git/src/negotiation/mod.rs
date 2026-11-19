@@ -337,6 +337,50 @@ pub fn negotiate<S: Graph>(
   })
 }
 
+/// Whether a server whose client holds `common` is ready to send the pack (A-640 part 3: protocol v0's
+/// `ok_to_give_up`, which `get_common_commits` asks again as each have arrives): there is a common object, and each
+/// want, peeled through its tags, reaches a common commit or one of its parents, as `ready` above is decided.
+pub fn ready<S: Graph>(
+  graph: &S,
+  wants: &[ObjectId],
+  common: &[ObjectId],
+  admission: &mut Admission,
+) -> Result<bool, Refusal> {
+  let wants = ready::wants(graph, wants, admission)?;
+  let common = ready::common(graph, common, admission)?;
+  ready::is_ready(
+    graph,
+    &wants,
+    &[],
+    &common,
+    admission,
+    &mut Counters::default(),
+  )
+}
+
+/// The shallow-update `request`'s deepening makes, the shallow-info section's lines (A-640 part 3: protocol v0 sends
+/// them before any acknowledgment, `receive_needs`, so ahead of the pack's walk): `None` when it asks for no deepening.
+pub fn shallow_update<S: Graph>(
+  graph: &S,
+  request: &Request<'_>,
+  admission: &mut Admission,
+) -> Result<Option<ShallowInfo>, Refusal> {
+  if request.deepen.is_none() {
+    return Ok(None);
+  }
+  let wants = ready::wants(graph, request.wants, admission)?;
+  let client = shallow::client(graph, request.shallow, admission)?;
+  let cut = shallow::cut(
+    graph,
+    request,
+    &wants,
+    &client,
+    admission,
+    &mut Counters::default(),
+  )?;
+  Ok(cut.info)
+}
+
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;

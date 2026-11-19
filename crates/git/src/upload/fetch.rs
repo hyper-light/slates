@@ -17,7 +17,7 @@
 //! shallow or deepens (its `shallow` and `unshallow` lines without an LF, as git writes them), `wanted-refs` where
 //! refs were wanted by name, then the packfile section's header; the pack follows as the answer is stepped.
 
-use super::answer::Answer;
+use super::answer::{Answer, Framing};
 use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
 use crate::Admission;
 use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, Pack, ShallowInfo};
@@ -278,7 +278,7 @@ fn written<P: PackSource>(
       let (bytes, (response, at)) = charged(admission, |out| {
         before_pack(&pack, &asked.wanted, format, multiplexed, out)
       })?;
-      Answer::streaming(bytes, response, at, source, admission)
+      Answer::streaming(bytes, Framing::V2(response), at, source, admission)
         .map(|answer| answer.counted(outcome.counters))
     }
   }

@@ -199,23 +199,6 @@ fn an_answer_past_its_admission_is_refused() {
   assert_eq!(answer.refusal(), None);
 }
 
-/// A-640 part 2 (versions): do ask for the advertisement and a request at v0 and v1. Expect: an `ERR` line until part 3
-/// serves them.
-#[test]
-fn protocol_v0_and_v1_are_refused_until_part_three() {
-  let fixture = served::served();
-  for version in [Version::V0, Version::V1] {
-    for asked in [Asked::Advertise, Asked::Request(FETCH_CLONE_REQUEST)] {
-      let (bytes, answer) = answer_of(&fixture, &REFS, MAIN_REF, version, asked);
-      assert_eq!(answer.refusal(), Some(&Refusal::Version(version)));
-      assert_eq!(
-        bytes,
-        pkt(b"ERR upload-pack: protocol v0 and v1 are not served yet")
-      );
-    }
-  }
-}
-
 /// A-640 part 2 (a flush alone; the served refs' order): do send a flush alone, then serve refs out of order. Expect:
 /// nothing answered and the session's end; then a refusal naming the first ref out of place.
 #[test]
