@@ -40400,22 +40400,23 @@ Applied in the same change to:
   and that fetch runs with `--no-tags`, so the vector holds `deepen-relative`, `deepen 1` and a shallow-update with
   `unshallow`. Two further runs wrote the same 39 files. gitprotocol-pack's own examples are vectors too, each long
   line as its length counts it.
-- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 40 of 40, 18 new,
-  fmt clean). Every advertisement decodes to the refs `refs.txt` recorded and writes back; every line of every exchange
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 167 of 167 over main
+  with this change, 25 new; `cargo fmt -p slates-git -- --check` clean; each test and helper read against the lint
+  wall's cognitive-complexity threshold of 10 by count, every `assert_eq!` counting one). Every advertisement decodes to the refs `refs.txt` recorded and writes back; every line of every exchange
   reads and writes back; each depth request is answered by its shallow-update; the document's examples read and write
   as printed; unknown capabilities are kept; lines read with or without LF and in either case; refusal tables for
   client lines, server lines, advertisements and shallow-updates; writers refuse and write nothing; every cut of a
   message waits and every cut of a line reads as its bytes say; every bit flip is refused by kind or reads as its
   bytes say; the admission is charged exactly; generated lines, advertisements and shallow-updates round-trip.
-  - Red first: the tests against the module with every entry point refusing, 17 of 18 failed (the checksum test alone
+  - Red first: the tests against the module with every entry point refusing, 24 of 25 failed (the checksum test alone
     passes).
   - Red nine ways by mutation, each on a copy and caught by the test that names its rule: a peeled line taken after
     any ref; the request's `shallow` written with LF; bytes after an object name ignored; `deepen-since` taking `-1`;
     capability names of either case; `ERR` inside a message read as a ref; the advertisement's lists not charged; the
     advertisement written without its checking pass (a refused write left its first lines in the output); a `shallow`
-    after an `unshallow` taken. A comment-only control passed 18 of 18.
+    after an `unshallow` taken. A comment-only control passed 25 of 25.
   - A trap, recorded: red and green checkouts of one workspace built in one `CARGO_TARGET_DIR` gave green the red
-    binary, because cargo's fingerprint for the path package named the red checkout's files; green reported red's 17
-    failures until `cargo clean -p slates-git`. One target directory per arm.
+    binary, because cargo's fingerprint for the path package named the red checkout's files; green reported red's
+    failures until `cargo clean -p slates-git`. One target directory per arm, as the later red runs used.
 - **Owed of piece 14:** serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and
   neither, `no-done`, the stateless rounds over HTTP), then `packfile-uris` and `bundle-uri`.

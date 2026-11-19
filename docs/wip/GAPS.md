@@ -144,9 +144,9 @@
 > `deepen-not` and `filter`, the server's `NAK` and `ACK` plain, `continue`, `common` and `ready`, the shallow-update,
 > and `ERR` from either side. A capability git does not define is kept by name; a malformed id or line is refused by
 > kind and place. Golden vectors are fifteen exchanges and six advertisements stock git wrote under protocol.version 0
-> and 1 (`fixtures/v0`, `make-v0-fixtures.sh`, SHA-256 checked). `cargo test -p slates-git --lib`: 40 of 40 (18
-> new), red first against a codec that refused everything (17 of 18 failed) and nine ways by mutation. Owed of piece
-> 14: serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and neither, `no-done`,
+> and 1 (`fixtures/v0`, `make-v0-fixtures.sh`, SHA-256 checked). `cargo test -p slates-git --lib` over main with it:
+> 167 of 167 (25 new), red first against a codec that refused everything (24 of 25 failed) and nine ways by mutation.
+> Owed of piece 14: serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and neither, `no-done`,
 > the stateless HTTP rounds), then `packfile-uris` and `bundle-uri`.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
