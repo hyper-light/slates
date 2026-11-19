@@ -7960,9 +7960,9 @@ mod tests {
       ) else {
         return None;
       };
-      let origin_handle = *state
-        .by_id
-        .get(&slates_db::catalog::VolumeId { bytes: origin.bytes })?;
+      let origin_handle = *state.by_id.get(&slates_db::catalog::VolumeId {
+        bytes: origin.bytes,
+      })?;
       write_file(state, origin_handle, "a", b"inherited a")?;
       write_file(state, origin_handle, "b", b"inherited b")?;
       let ReplyBody::Snapshotted { id: snapshot, .. } = crate::verbs::dispatch(
@@ -7996,7 +7996,10 @@ mod tests {
         .to_standalone_image(&state.store, None)
         .ok()?;
       let (a, b) = (file_no(state, handle, "a")?, file_no(state, handle, "b")?);
-      let mut runs = BTreeMap::from([((a, 0), b"inherited a".to_vec()), ((b, 0), b"inherited b".to_vec())]);
+      let mut runs = BTreeMap::from([
+        ((a, 0), b"inherited a".to_vec()),
+        ((b, 0), b"inherited b".to_vec()),
+      ]);
       write_file(state, handle, "b", b"rewritten b")?;
       write_file(state, handle, "c", b"made c")?;
       let slot = state.volumes.get(handle).ok()?;
@@ -8013,9 +8016,16 @@ mod tests {
       ))
     });
     let (a_was_shared, same_tree, standing_alone, runs, a) = checked.expect("the scene was made");
-    assert!(a_was_shared, "the full record named the untouched `a` by number");
+    assert!(
+      a_was_shared,
+      "the full record named the untouched `a` by number"
+    );
     assert!(same_tree, "the rebuilt image is the clone's whole tree now");
     assert!(standing_alone, "and stands alone");
-    assert_eq!(runs, vec![(a, 0)], "`a`'s content kept, `b`'s left to the record");
+    assert_eq!(
+      runs,
+      vec![(a, 0)],
+      "`a`'s content kept, `b`'s left to the record"
+    );
   }
 }
