@@ -60,16 +60,14 @@ fn room() -> Admission {
   Admission::new(u64::MAX)
 }
 
-/// A node's forty hexadecimal digits.
+/// A node's forty lower-case hexadecimal digits, as 7.2's `hex` writes them.
 fn hex(node: &Node) -> String {
-  let mut out = Vec::new();
-  node::write_hex(node, &mut out);
-  String::from_utf8(out).unwrap()
+  crate::verbs::hex_of(node)
 }
 
-/// A node from its forty hexadecimal digits.
+/// A node from its forty hexadecimal digits, as 7.2's `bin` reads them.
 fn parsed(hex: &str) -> Node {
-  node::from_hex(hex.as_bytes()).unwrap()
+  slates_hg::pushkey::hex_node(hex.as_bytes()).unwrap().unwrap()
 }
 
 /// A served view a test builds from a fixture's listings: `{rev} {node} {p1} {p2} {phase} {branch}` a line, and
