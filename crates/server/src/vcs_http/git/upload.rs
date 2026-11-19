@@ -62,7 +62,7 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
   type Exchange = Upload<L>;
 
   fn start(&mut self, start: &Start<'_>) -> Result<Upload<L>, ServiceRefused> {
-    if start.service != Service::UploadPack || !self.lender.holds(start.repository.id) {
+    if start.service == Service::UploadPack || !self.lender.holds(start.repository.id) {
       return Err(ServiceRefused::Unavailable);
     }
     Ok(Upload {
