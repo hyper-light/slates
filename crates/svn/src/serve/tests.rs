@@ -940,12 +940,23 @@ fn a_denied_read_authenticates_first_and_is_judged_by_the_new_principals_rules()
   let fixture = fixture();
   let anonymous = FixtureGuards::anonymous();
   let mut connection = established();
-  let (out, _) = send(&fixture, &anonymous, &mut connection, b"( check-path ( 3:dir ( ) ) ) ");
+  let (out, _) = send(
+    &fixture,
+    &anonymous,
+    &mut connection,
+    b"( check-path ( 3:dir ( ) ) ) ",
+  );
   assert_eq!(out, A_DIRECTORY);
   let (out, turn) = send(&fixture, &anonymous, &mut connection, CHECK_SECRET);
-  assert_eq!((out, turn.map(|turn| turn.starts_with("Took"))), (cram_md5_request(), Ok(true)));
+  assert_eq!(
+    (out, turn.map(|turn| turn.starts_with("Took"))),
+    (cram_md5_request(), Ok(true))
+  );
   let (out, verdict) = cram_md5(&mut connection, b"alice", ALICE_SECRET);
-  assert_eq!(verdict, Verdict::Established(Principal::User(b"alice".to_vec())));
+  assert_eq!(
+    verdict,
+    Verdict::Established(Principal::User(b"alice".to_vec()))
+  );
   assert!(out.ends_with("> ) ) ( success ( ) ) "), "{out}");
   let alice = FixtureGuards::default();
   let (out, turn) = send(&fixture, &alice, &mut connection, b"");
@@ -965,10 +976,18 @@ fn a_read_still_refused_after_the_authentication_is_refused_with_no_trivial_requ
   let fixture = fixture();
   let anonymous = FixtureGuards::anonymous();
   let mut connection = established();
-  let (out, _) = send(&fixture, &anonymous, &mut connection, b"( stat ( 6:secret ( ) ) ) ");
+  let (out, _) = send(
+    &fixture,
+    &anonymous,
+    &mut connection,
+    b"( stat ( 6:secret ( ) ) ) ",
+  );
   assert_eq!(out, cram_md5_request());
   let (_, verdict) = cram_md5(&mut connection, b"bob", b"bob's secret");
-  assert_eq!(verdict, Verdict::Established(Principal::User(b"bob".to_vec())));
+  assert_eq!(
+    verdict,
+    Verdict::Established(Principal::User(b"bob".to_vec()))
+  );
   let (out, turn) = send(&fixture, &anonymous, &mut connection, b"");
   let wrote = Ok(format!("{:?}", Turn::Wrote));
   assert_eq!((out, turn), (not_authorized(), wrote));
@@ -988,7 +1007,12 @@ fn a_tunnels_anonymous_read_authenticates_as_the_tunnels_user() {
     ..alices_tunnel()
   };
   let mut connection = established_on(&tunnel, ANONYMOUSLY);
-  let (out, _) = send(&fixture, &FixtureGuards::anonymous(), &mut connection, CHECK_SECRET);
+  let (out, _) = send(
+    &fixture,
+    &FixtureGuards::anonymous(),
+    &mut connection,
+    CHECK_SECRET,
+  );
   assert_eq!(out, external_request());
   let none = None::<&Sources<'_, Green, FixtureGuards>>;
   let mut out = Vec::new();

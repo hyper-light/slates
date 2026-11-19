@@ -27,13 +27,13 @@
 //! the caller gives, so a slice's output and work are bounded by the room. What it keeps is one level of names per
 //! directory on the path from the listed one, as `svn_repos_list` keeps them.
 
+use super::fold::fold;
 use super::stream::{Progress, Stream};
 use super::{
   AUTHOR_PROPERTY, DATE_PROPERTY, DIRECTORY_SIZE, DIRENT_FIELDS, DONE, Failure, Outcome, Reads,
   Repository, SEPARATOR, SVN_ERR_FS_NOT_FOUND, bool_word, c_string_of, child_path, format_time,
   kind_word, parse_time, path_and_revision,
 };
-use super::fold::fold;
 use crate::authz::fnmatch;
 use crate::index::{Node, NodeKind, Revision};
 use crate::ra_svn::{ItemError, Value, write};

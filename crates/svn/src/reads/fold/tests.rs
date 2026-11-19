@@ -71,7 +71,10 @@ fn every_value_and_name_folds_as_utf8proc_folds_it() {
   println!(
     "fold oracle: {compared} values compared, {} names; skipped as Unicode 18's: {:04X?}",
     names.len(),
-    skipped.iter().map(|character| u32::from(*character)).collect::<Vec<_>>()
+    skipped
+      .iter()
+      .map(|character| u32::from(*character))
+      .collect::<Vec<_>>()
   );
   assert_eq!((names.len(), listed.len() > skipped.len()), (28, true));
 }

@@ -1750,12 +1750,18 @@ fn listed_paths(out: &[u8]) -> Vec<String> {
 #[test]
 fn a_listing_matches_names_beyond_ascii_folded_as_utf8proc_folds_them() {
   let mut fixture = Fixture::new();
-  fixture.commit(&["row 12 /trunk/Ärger.txt file add", "row 12 /trunk/Straße file add"]);
+  fixture.commit(&[
+    "row 12 /trunk/Ärger.txt file add",
+    "row 12 /trunk/Straße file add",
+  ]);
   let folded = "( list ( 5:trunk ( 12 ) immediates ( kind ) ( 6:arger* 7:strasse ) ) ) ";
   let (_, out, _) = streamed(&fixture, &fixture.green, folded.as_bytes(), usize::MAX);
   assert_eq!(
     listed_paths(&out),
-    [String::from("/trunk/Straße"), String::from("/trunk/Ärger.txt")]
+    [
+      String::from("/trunk/Straße"),
+      String::from("/trunk/Ärger.txt")
+    ]
   );
   let unfolded = "( list ( 5:trunk ( 12 ) immediates ( kind ) ( 7:Ärger* ) ) ) ";
   let (_, out, _) = streamed(&fixture, &fixture.green, unfolded.as_bytes(), usize::MAX);
@@ -1830,7 +1836,11 @@ fn a_read_run_again_after_its_authentication_has_no_trivial_request() {
     (Outcome::Answered, String::from("( success ( dir ) ) "))
   );
   assert_eq!(
-    answered_with(&rules, Authentication::Done, b"( check-path ( 8:branches ( ) ) ) "),
+    answered_with(
+      &rules,
+      Authentication::Done,
+      b"( check-path ( 8:branches ( ) ) ) "
+    ),
     (Outcome::Answered, String::from(refusal))
   );
   assert_eq!(
