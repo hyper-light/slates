@@ -12929,6 +12929,17 @@ signature verification).
 > every file revision the client lacks; hostile requests. Owed of piece 4: `slates hg serve --stdio`'s loop (a bundle2
 > request's abort answered as an `error:abort` part), HTTP version 1, held deltas in place of full texts, and the
 > index's kept heads in place of the walks.
+>
+> **Status (2026-11-19, A-619 part 3: the session of `slates hg serve --stdio`).** `serve::session::serve` serves the
+> SSH version 1 request at the front of the buffered input as 7.2's `_runsshserver` does: `hello` and `capabilities` of
+> what is served (`batch`, `branchmap`, `bundle2`, `getbundle`, `known`, `protocaps`), `protocaps`, `batch` of the
+> string-answering calls, discovery and `listkeys`, and `getbundle`'s stream, its refusal of a bundle2 request answered
+> as an `ERROR:ABORT` part; an empty answer for a name 7.2 lacks; the commands 7.2 serves and this server does not read
+> and refused out of band; an empty line ending the session. Proven by `cargo test --locked -p slates-hg --lib` on the
+> Mac Studio, 219 of 219, red first (5 of 5 failed against a stub): the three captured sessions served whole (every
+> string answer byte for byte as 7.2 framed it, `getbundle` by meaning, `hello` a subset of 7.2's capabilities), hostile
+> requests, and arbitrary input. Owed of piece 4: the process around the session (stdin and stdout through the runtime),
+> HTTP version 1 over `slates-http` and the shared edge, held deltas, the index's kept heads.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13325,8 +13336,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    encodings, the hashed long names) and its fncache. Owed: the import into the index, and version 2's file index.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
-   with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; owed: the stdio loop,
-   HTTP.
+   with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
+   3); owed: the process around it, HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
@@ -43777,3 +43788,27 @@ twenty lines), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (§19).
 - **Owed.** `slates hg serve --stdio`'s loop over the SSH version 1 codec (`hello`, `between`, `protocaps`, `batch` and
   the commands built, a bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas,
   `obsolete`'s `listkeys` dump, and the index's kept heads in place of the walks.
+
+### A-619 (part 3) — Mercurial's read serving, part 3: the SSH version 1 session of `slates hg serve --stdio`, held to three captured sessions of stock Mercurial 7.2 served whole (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone", piece 4; A-569, A-619 parts 1 and 2)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve::session`, new: `serve`,
+`Step`, `Refused`; `serve::Refusal` is `Copy`; its tests beside `getbundle`'s, whose store they share), GAPS (the
+§4.17.3 entry), `research/mercurial-server.md` (§20).
+- **What it does.** One step serves the request at the front of the buffered input: the command line, its arguments by
+  7.2's spec, then a string answer, `getbundle`'s raw stream, or an out-of-band error; `More` where the buffer holds
+  only part of a request. The commands served are those part 1 and part 2 answer, with `hello`, `capabilities`,
+  `protocaps` and `batch`; 7.2's others are read and refused out of band, so the session stays in step.
+- **Decided.** A request that cannot be read ends the session after an error answer, where 7.2 fails mid-stream; a
+  command's own refusal is answered out of band and the session goes on, where 7.2's exceptions end the process; a
+  bundle2 request's `getbundle` refusal is 7.2's `ERROR:ABORT` part with 7.2's words where 7.2 aborts alike. The
+  advertised capabilities are what is served; a 7.2 client asks the same `getbundle` of them (`_pullbundle2` reads
+  `phases`, `bookmarks`, `listkeys`, `obsmarkers`).
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 219 of 219 (load 9.1), 5 of
+  them this part's; red first against a step that ends at once, 5 of 5 failed; fmt clean. Golden: each captured session
+  served whole and ended by an empty line, `between`, `protocaps`, `batch` and `listkeys` byte for byte with their
+  framing, `getbundle` by meaning, `hello` each capability one 7.2 advertised. Hostile: an unknown name, `lookup`, a
+  batch calling `getbundle`, a batch call without its space, `known` of a non-hex node, a bundle1 `getbundle`, a client
+  with only version 01 (its `ERROR:ABORT` part), partial requests, an argument past the admission, a line too long;
+  arbitrary input (a session ends cleanly only on an empty line, by a refusal only with the rest taken).
+- **Owed.** The process around the session (the CLI's stdin and stdout through the runtime, sliced within the shard's
+  budget), HTTP version 1 over `slates-http` (A-595) and the shared edge (A-625), held deltas, `obsolete`'s `listkeys`
+  dump, and the index's kept heads.

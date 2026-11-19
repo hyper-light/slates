@@ -621,3 +621,21 @@ server's directory are the ones its reviewed expected-failure list starts from.
   (`getfnode(computemissing=False)`); none was, so no session carried one.
 - **An abort on a bundle2 request is answered as a bundle2 stream** holding one `error:abort` part (the message
   mandatory, the hint advisory), not as an SSH error: owed to the stdio loop.
+
+## 20. Found while building piece 4's read serving, part 3: the SSH version 1 session (A-619, 2026-11-19; 7.2's code [C] in the wheel `uv` installs on the Mac Studio, `mercurial==7.2`; the three captured sessions, `fixtures/serve`)
+
+- **`_runsshserver`** reads a command line; an empty one ends the session; a name its table lacks
+  (`commandavailable`) is answered with an empty string and no argument read; any other has its arguments read by its
+  spec (`getargs`: `*` a count then that many `key length` lines) and answers bytes (`<length>\n<value>`), a stream
+  (raw), a push result (two strings) or an out-of-band error (`\n` on stdout, the message and `\n-\n` on stderr).
+- **The table** (21 commands): `batch` (`cmds *`), `between` (`pairs`), `branches` (`nodes`), `branchmap`,
+  `capabilities`, `changegroup` (`roots`), `changegroupsubset` (`bases heads`), `clonebundles`, `clonebundles_manifest`
+  (`*`), `debugwireargs` (`one two *`), `get_cached_bundle_inline` (`path`), `getbundle` (`*`), `heads`, `hello`,
+  `known` (`nodes *`), `listkeys` (`namespace`), `lookup` (`key`), `protocaps` (`caps`), `pushkey` (`namespace key old
+  new`, push), `stream_out`, `unbundle` (`heads`, push).
+- **`hello`** is `capabilities: ` and `capabilities`' answer, the sorted list, then a newline; `protocaps` answers `OK`.
+  Measured: 7.2's hello on the captured server, 537 bytes, `batch branchmap bundle2=… changegroupsubset getbundle known
+  lookup protocaps pushkey streamreqs=… unbundle=HG10GZ,HG10BZ,HG10UN unbundlehash`.
+- **`batch`** splits `cmds` at `;`, each call at its first space, its arguments at `,` and `=`, unescapes them, runs the
+  command (any in the table, its permission checked; a stream answer asserts) and joins the escaped answers with `;`.
+  Measured: `heads ;known nodes=` answered `124` bytes, the three heads, `;`, and an empty `known`.

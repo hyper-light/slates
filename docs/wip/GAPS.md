@@ -461,11 +461,15 @@
 > in `sortedmarkers`' order, a part the client cannot read refused by kind; proven by `cargo test --locked -p slates-hg
 > --lib`, 208 of 208 on the Mac Studio (2026-11-19, debug, load 8.4), red first against stubs (9 of 9 failed), against
 > three captured sessions of stock 7.2 (a clone, a pull, an incoming) by meaning, a model of 7.2's packer on generated
-> histories, and hostile requests. Owed, in order, after §4.17.1's seven pieces: (3, rest) the import into the index,
+> histories, and hostile requests. **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH version 1
+> request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
+> `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
+> stub), the three captured sessions served whole. Owed, in order, after §4.17.1's seven pieces: (3, rest) the import
+> into the index,
 > version 2's file index, and censored, ellipsis and externally stored revisions; (4, rest) read serving: `obsolete`'s
-> `listkeys` dump, `slates hg serve --stdio`'s loop (a bundle2 request's abort answered as an `error:abort` part), HTTP
-> version 1, held deltas in place of full texts, the `0.2` answers compressed by A-598's engines at the learned level,
-> and the index's kept heads in place of the walks over the whole view; (5) pushes, a compressed bundle inflated in
+> `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
+> texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
+> the walks over the whole view; (5) pushes, a compressed bundle inflated in
 > slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission);
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
