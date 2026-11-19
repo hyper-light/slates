@@ -11346,6 +11346,26 @@ node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 ite
 change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
 Subversion client's commit needs.
 
+> **Status (2026-11-19, A-612: a work never changes bytes it did not see).** Two rules the verdict now keeps, each a
+> defect A-596's oracle found:
+> - *A file removed after the work's base is deleted, whatever stands at its path now.* The green records the last
+>   version that removed the file at each path (`Green::file_removed`): an unlink, a rename away, or a rename onto it,
+>   which removes the file it replaces. Replay rebuilds it, and it is never folded. A work based before it that edits the
+>   path is delete against modify (`DeleteModify`), and one that renames it is rename against rename (`RenameRename`),
+>   though a file was made there again, renamed onto it, or moved onto it beneath a directory's rename. Before, the
+>   verdict mapped the work's ops through the replacement's one-insert delta and spliced them at the new file's end, and
+>   a rename moved the replacement.
+> - *A truncate removes the bytes it saw.* In a net op set it is a removal of base bytes, `[at, at + len)`, reaching the
+>   base's end: a hunk over base bytes, as the interval algebra composes it (`slates_vfs::algebra`), judged by its span
+>   with the edge rule. Mapped to a head that grew past that span after its base (an append at the end), it is the delete
+>   of its span (`at_head`), in a submit, a rebase and a rename's edits, so the append is kept and the version's delta
+>   states exactly what left. Before, the splice cut to the head's end and removed the append, a lost update.
+>
+> The sweep's other cases already held, judged by the spans in both directions: an overwrite ending at the cut, an
+> insert at the cut and an append past it kept beside a truncate; an overwrite inside the cut span or a shorter
+> truncate a conflict; the same truncate identical. Tests: `crates/merge/src/engine/unseen_bytes_tests.rs`; A-596's
+> oracle generates both cases again (`engine/reanchor/tests.rs`).
+
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
 into the increment's post-state chunks (`Extent{src: Chunk{chunk, off}}`, sub-chunk offsets
@@ -11849,9 +11869,9 @@ is one more version, and the chain itself is never rewritten.
 > approvals a policy predicate names (A-597's matcher plugs in), and the standing ones are the evidence a policy counts.
 > The records are the repository's partition's (`crates/db/src/review.rs`): six operations, guarded then applied, carried
 > by the snapshot, charged to the merge byte budget, each refusal typed (`ReviewRefusal`). The oracle holds the walk to a
-> diff of the whole texts over generated histories, and found two verdict defects, filed in GAPS with parked tests: a
-> work based before its file was replaced is spliced into the replacement, and a truncate based before an append drops
-> the appended bytes. Owed: the server's verbs (write, move each comment as its request gets a version, approve, stale,
+> diff of the whole texts over generated histories, and found two verdict defects, both fixed by A-612 (§4.16 "The
+> verdict"): a work based before its file was replaced was spliced into the replacement, and a truncate based before an
+> append dropped the appended bytes. Owed: the server's verbs (write, move each comment as its request gets a version, approve, stale,
 > close), their wire refusals typed, and a comment's version held as a live reader of its green's fold floor.
 - A review request (git's pull request; §4.17.3 and §4.17.4 say what one is for their tools) is a work held
   unsubmitted, with a review record: comments anchored to the work, one of its versions, a path and a byte range;
@@ -40273,3 +40293,52 @@ its tree, `into_tree`; the oracle's types open to the crate), and `crates/svn/sr
   2554 and 2645), as each command arrives, over a transaction built a command at a time; the drive's other checks. The
   merged version's identities and mergeinfo counts (FSFS's `update_ancestry` and mergeinfo increment) are the index's
   at the version's append (A-553), not the verdict's.
+
+### A-612 — the verdict refuses a work based before its file was replaced, and a truncate removes only the bytes it saw (2026-11-19, g267, UI goal 93; §4.16 "The verdict" and "Splice"; D-27; A-596's findings)
+Applied in the same change to:
+- §4.16's status (after "The verdict, two pure passes"); §4.17.1's A-596 status; GAPS (both findings, fixed; A-596's
+  paragraph of the §4.17 entry);
+- `crates/merge/src/engine.rs`: `Green::file_removed`, `file_removed_since`, `len_of`, `at_head`, and the checks in
+  `merge_content`, `merge_rename` and `edits_after_rename`;
+- `crates/merge/src/engine/unseen_bytes_tests.rs`, new; `crates/merge/src/engine/reanchor/tests.rs`, where the oracle's
+  guards are gone and the parked tests move to the new module;
+- the two bug records in `docs/bugs/`, rewritten as fixed with their root causes and edits.
+- **The rule for a replaced file**, by §4.16's "delete against modify in either direction". A file the green removed
+  after a work's base is gone for that work, whatever stands at its path now. The engine records the last version that
+  removed the file at each path:
+  - an unlink or a rename away (each `RemoveContent`);
+  - a rename onto a path that held a file (a `SetContent` from `ContentSource::Copied` while the path held content).
+
+  `merge_content` answers a later-based edit `DeleteModify`, and `merge_rename` a later-based rename of it
+  `RenameRename`. Replay rebuilds the record, since `apply_recorded` makes the same effects. It is never folded, so a
+  base below the fold floor meets it too. A green restored from a checkpoint, or made as a branch, starts with it
+  empty, since its bases are never before its first version. Its bound: one entry a path the green ever removed a file
+  at, as `last_changed` holds one a path it ever changed.
+- **The rule for a truncate**, by the interval algebra (`slates_vfs::algebra`, whose hunks are over base bytes). A
+  truncate in a net op set removes the base bytes it covers, `[at, at + len)`. An append at the base's end is a
+  zero-length insert at that span's end, disjoint by the edge rule, so the two commute and both are kept: last-writer-
+  wins is one of D-27's lost designs. `at_head` turns a mapped truncate whose span no longer reaches the head's end
+  into the delete of that span, the head's canonical form for such a removal, in `merge_content` and
+  `edits_after_rename`. `apply`, the version's delta, the chain entry's `Spliced` ops, the history's spliced value and a
+  rebase's restated journal (`content_volume_ops`) then all remove exactly the span.
+- **Not changed.** A version a holder recomputes is judged by its own build. A holder of an older build than its owner
+  would answer such a version otherwise and refuse it, fatal and loud, as for any verdict change, so a fleet's holders
+  move to a new verdict together. Chain entries recorded before the change replay their recorded effects unchanged.
+- **Tests** (debug, Mac Studio, 2026-11-19, kiln r613, load 7.8 to 8.7):
+  - green: `cargo test -p slates-merge --lib`, 43 of 43; `cargo fmt -p slates-merge -- --check` clean;
+  - red with the fix reversed: the six new tests and A-596's oracle (its generators on again) failed. A work based
+    before its file was made again was accepted as version 3, for its edit and for a rename of it; each truncate case
+    left `<1>\n`.
+- **The sweep** of the siblings:
+  - a file replaced beneath a directory's rename: refused, a case of the test;
+  - a truncate against an overwrite, an insert or a truncate at its cut, in both directions: judged by the spans, and
+    unchanged by this fix (the sweep test);
+  - a rebase, and a rename's edits: fixed as above.
+
+  Seen by reading only, not changed, and reported:
+  - a mode or attribute change to a file replaced after the work's base is judged by that dimension's own last change;
+  - a rename whose source is a symlink or a hard link replaced after the base moves the new one;
+  - `intervening` read a version's delta once for each history entry at that version, removal and set alike, now
+    unreachable from both callers;
+  - an append at the old end of a file a whole-file rewrite replaced is accepted at the new end, by the edge rule (a
+    question for the design, not a defect of the code).

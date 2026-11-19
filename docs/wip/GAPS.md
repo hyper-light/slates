@@ -92,7 +92,7 @@
 > refusals (today `VolumeRefusal::Invalid`, which no verb emits yet); a comment's version held as a live reader of its
 > green's fold floor; following a renamed file with the engine's path remapping; the integration suites, clippy and
 > `xtask` over the change (main's; `crates/db/tests/wire_order.rs` against `Op` 90 to 95, published by hand). Two
-> verdict findings, below, are open.
+> verdict findings, below, were fixed by A-612 (2026-11-19).
 > **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
 > BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
 > no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held
@@ -1855,33 +1855,38 @@
 > work to the same answer and head as the same work submitted, after a generated work merged ahead of it: 400 cases,
 > red-checked on each fix. `docs/bugs/2026-11-09-a-rebased-work-was-restated-into-other-bytes.md`.
 >
-> **A work based before its file was replaced is spliced into the replacement: found open (2026-11-19, A-596's oracle,
-> g267; §4.16 "Position mapping", "The verdict").** A work edits a file at its base; after that base the green unlinks
-> the file and makes it again, or renames another file onto it. The verdict finds the path's content present
-> (`merge_content`) and maps the work's ops through the path's deltas since the base. The replacement's delta is one
-> insert of the whole new file at offset 0 (`insert_whole`, from `merge_create` and `merge_rename`), so every op shifts
-> past the new bytes and is spliced at the new file's end: the edit of a file the work no longer has lands in one it
-> never saw, and the work is accepted. `fits_base` judged the ops against the file at the base only. Expected: a
-> conflict on the path (`DeleteModify`, as a work editing a path the green removed is answered). Red test, parked:
-> `a_work_based_before_its_file_was_replaced_conflicts` (`crates/merge/src/engine/reanchor/tests.rs`; Mac Studio,
-> kiln r504 and r529: accepted as version 3, the re-made file `<9>\nx`). Owed: the verdict refuses a work whose
-> path's content history records a removal or a replacement after its base, and the replacement's delta states the old
-> bytes' removal, so the position mapping of works and of review comments meets it. A-596's oracle bases no work before
-> its file's last replacement until then; a comment's step already refuses such a delta (`FileReplaced`). Bug record:
-> `docs/bugs/2026-11-19-a-work-based-before-its-file-was-replaced-is-spliced-into-the-replacement.md`.
+> **A work based before its file was replaced was spliced into the replacement: fixed (2026-11-19, A-612, g267; found
+> by A-596's oracle; §4.16 "The verdict": "delete against modify in either direction").** A work edited a file at its
+> base; after that base the green unlinked the file and made it again, renamed another file onto it, or replaced it
+> beneath a directory's rename. The verdict found the path's content present (`merge_content`), mapped the work's ops
+> through the replacement's one-insert delta (`insert_whole`) and spliced them at the new file's end: accepted. A rename
+> of the file, so based, moved the replacement (`merge_rename` checked only that the source named something). Now the
+> green records the last version that removed the file at each path (`Green::file_removed`: an unlink, a rename away,
+> a rename onto it; rebuilt by replay, never folded), and a work based before it is refused `DeleteModify`, a rename of
+> it `RenameRename`, whatever stands at the path now. Tests (`crates/merge/src/engine/unseen_bytes_tests.rs`): the
+> three replacements, each refused, the same edit at the head accepted; the rename of each refused. Red on the Mac
+> Studio with the fix reversed (kiln r613: made again, accepted as version 3, for the edit and for the rename), green
+> with it (`cargo test -p slates-merge --lib`, 43 of 43). A-596's oracle bases works before replacements again. Bug
+> record: `docs/bugs/2026-11-19-a-work-based-before-its-file-was-replaced-is-spliced-into-the-replacement.md`.
+> Siblings seen, not changed (reading only): a mode or attribute change to a file replaced after the work's base is
+> judged by that dimension's own last change, so it may land on the replacement; a rename whose source is a symlink or
+> a hard link replaced after the base moves the new one (`file_removed` records files).
 
-> **A truncate based before an append removes the appended bytes: found open (2026-11-19, A-596's oracle, g267; §4.16
-> "The verdict", "Splice").** A work removes a file's tail to its end, which the deriver composes as a truncate; after
-> its base another work appends at that end. The truncate's span ends where the append begins, so they meet only at its
-> edge and the verdict accepts, and the splice truncates to the end of the head's file (`apply`, `OpKind::Truncate`),
-> removing the append the work never saw. The version's delta still states the bytes the work saw, so a position mapping
-> through it misplaces what follows. Red test, parked: `a_truncate_based_before_an_append_keeps_the_appended_bytes`
-> (`crates/merge/src/engine/reanchor/tests.rs`; Mac Studio, kiln r529: accepted as version 2, the file `<1>\n`, the
-> appended `<3>\n` gone). Found by A-596's oracle in r504: a comment on an untouched first line was refused at that
-> version (`FileReplaced`, the delta states four bytes where eight left) while a diff kept the line. Owed: the truncate
-> removes only the bytes it saw at their mapped place, or conflicts with a change at its end; and its delta states what
-> left. A-596's oracle bases no truncating work behind the head until then. Bug record:
-> `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
+> **A truncate based before an append removed the appended bytes: fixed (2026-11-19, A-612, g267; found by A-596's
+> oracle; §4.16 "The verdict", "Splice"; `slates_vfs::algebra`).** A work removed a file's tail to its end, composed as a
+> truncate; after its base another work appended at that end. The two meet only at the truncate's edge, so the verdict
+> accepted, and the splice cut to the end of the head's file (`apply`, `OpKind::Truncate`), removing the append the
+> work never saw: a lost update; the version's delta stated four bytes where eight left. A rebase restated it as a
+> truncate to the new length, and a rename's edits (A-547) cut the same way. Now a truncate mapped to a head that grew
+> past its span is the delete of that span (`at_head`, the interval algebra's hunk over base bytes, disjoint from an
+> append at its end by the edge rule), in `merge_content` and `edits_after_rename`, so both changes are kept and the
+> delta, the chain entry, the history and a rebase's journal state exactly what left. Tests
+> (`crates/merge/src/engine/unseen_bytes_tests.rs`): the submit (comments followed through its delta, exact), the
+> rebase (a delete in the journal), the rename's edits, and the sweep of truncates against changes at their cut in both
+> directions (an overwrite ending at the cut, an insert at the cut and an append kept; an overwrite inside the span and
+> a shorter truncate conflicts; the same truncate identical). Red on the Mac Studio with the fix reversed (kiln r613:
+> the file `<1>\n` each time), green with it (43 of 43). A-596's oracle bases truncating works behind the head again.
+> Bug record: `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
 
 > **An edit after a rename was accepted and lost: fixed (2026-11-19, A-547, g225; found by perf, 2026-11-09, §4.16
 > "Composition at seal").** The verdict now maps the destination's ops through what changed the source since the work's
