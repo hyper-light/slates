@@ -656,10 +656,24 @@ fn large_count(entries: &[Entry], small_max: u64) -> usize {
 
 /// The bytes [`write`] writes for `entries` in `format`'s hash.
 pub fn written_len(format: ObjectFormat, entries: &[Entry]) -> u64 {
-  let large = large_count(entries, u64::from(SMALL_MAX));
-  fixed_len(entries.len(), format.raw_len())
+  len_of(
+    format,
+    entries.len(),
+    large_count(entries, u64::from(SMALL_MAX)),
+  )
+}
+
+/// The bytes [`write`] writes for `count` entries, `large` of them past 2^31 - 1, in `format`'s
+/// hash: an index sized before it is written (A-665's view answers a listing with it).
+pub fn len_of(format: ObjectFormat, count: usize, large: usize) -> u64 {
+  fixed_len(count, format.raw_len())
     .and_then(|fixed| fixed.checked_add(large.checked_mul(LARGE_ENTRY)?))
     .map_or(u64::MAX, to_u64)
+}
+
+/// Whether [`write`] puts an entry beginning `offset` bytes into its pack in the 8-byte table.
+pub fn is_large(offset: u64) -> bool {
+  offset > u64::from(SMALL_MAX)
 }
 
 /// Writes an index of `entries` for the pack whose trailer is `pack_checksum`, in that trailer's hash, as git 2.50.1
