@@ -8625,6 +8625,13 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   so the catalog's bit and every id with the second bit clear are as they were. They are placed and taken over as the
 >   repository is, so its state moves as one. Three class bits in place of one: a partition mints at most 2^45 − 1 ids
 >   (`MAX_OBJECT_COUNTER`).
+> - **Every dispatch by the class (2026-11-19, A-636 part 2b).** The server reads a register's class from its id at each
+>   place it once asked only whether the id was a catalog: a takeover's adoption (a state log is counted adopted and
+>   never queued as a volume or a green, whatever its value's bytes), a give-up by name (a state log, like a catalog,
+>   has no verbs of its own and is settled unrecorded), a mirror's promotion page (only an object's own register pages
+>   as a head) and the record plane's shipments (a state log's parts are counted under their own names, their
+>   acknowledgements kept per log, never as a head's placement). A holder keeps a state log's records whole, a ledger
+>   never compacted to its newest.
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -11998,10 +12005,15 @@ decides the details.
 > what it applied or one that splits a record; a takeover runs a log at a time, as a live round does (A-636 part 2a):
 > each log's holders answer on the wire with that log's promise alone, which only that log's round counts, and the
 > repository is adopted only once every log's round has read its quorum, a refusal leaving the logs read before it
-> fenced; it keeps a record only where every log's read holds it whole, dropping it and what follows it otherwise. Owed:
-> the live plane's rest (A-636 part 2b, the partition's records shipped to each log's holders; 2c, the server's takeover
-> by this rule, every log of a repository, its greens' included, following one successor); and the repository policy's
-> check before the verdict (A-622's next part).
+> fenced; it keeps a record only where every log's read holds it whole, dropping it and what follows it otherwise. Each
+> state log's records ship to its holders a log at a time (A-636 part 2b): the partition hands its owner one record of
+> each state log an operation moved once the operation is durable, carrying that log's changes, the operation's
+> identity and every span it moved, its greens' included (`StateLogRecord`); the record plane ships each as its log's
+> register at the position it leaves the log at, in order, committed at `f + 1`, and a holder keeps it only where it
+> continues its copy of the log, so every holder's copy is a prefix and a successor can rebuild the repository's state
+> from it and keep or drop each operation whole. Owed: the repository's greens placed on its holders at their joins
+> (A-636 part 2b-2), then the server's takeover by this rule, every log of a repository, its greens' included,
+> following one successor (2c); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12523,7 +12535,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    holders applying records at their joins, replicas refusing split cuts, takeovers keeping each record whole), and its
    live plane's first piece (A-636 part 2a: the state logs a register class of the repository, placed and taken over as
    it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
-   every log or none); owed: the rest of the live plane (A-636 parts 2b and 2c).
+   every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
+   operation's identity and spans (A-636 part 2b); owed: the greens placed on their repository's holders at their joins
+   (A-636 part 2b-2) and the server's takeover by the rule (2c).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -52015,6 +52029,122 @@ Applied in the same change to:
 - **Owed.** The objects a hidden ref alone reaches hidden by slates-git; the daemon starting the SSH edge (A-684); the
   live stock `git clone` and fetch over the daemon's edge (the next piece, g309's); the exchange moved by the live
   signals; Linux and Windows runs, clippy, the doc and lint gates (main's).
+
+### A-636 part 2b — The partition's records shipped a log at a time: each state log's record of each operation, naming the operation whole, held by its holders as a prefix of the log; every server dispatch by the register's class (2026-11-19, g261, UI goal 93; §4.17.1 shared piece 2, the fleet half's live plane; §4.8 "records are sent to all candidates; committed at f + 1" and "Promotion and takeover"; after A-636 part 2a)
+
+- **Why.** A-636 part 2a made a repository's four state logs registers of its own class, placed and taken over as the
+  repository is, but nothing wrote them: a repository's names, phase roots, markers and locks lived on its owner's
+  partition alone, so a takeover had nothing to adopt them from. And the server told a register's class only by
+  asking whether its id was a catalog's, so a state log's register, once shipped, would have been adopted, given up,
+  paged and counted as its repository's head. This is part 2's second piece (g306's split, main's ruling of
+  2026-11-19): the class dispatch first, then each state log's records shipped to its holders a log at a time.
+- **The records** (`crates/db/src/catalog.rs`: `StateLogRecord`, `LoggedChange`, a new wire enum published at tags 0
+  to 3). One operation that moves a repository's state logs makes one record of each log it moved: that log's changes
+  in the order the operation made them (a green joined, a name bound or retired, the default moved, a member gone with
+  its destroy, a phase root, a marker, a lock), the position it found the log at and the one it left it at, one change
+  a position, and the operation's identity and every span it moved, its greens' included. The identity is BLAKE3 over
+  the spans' encoding and then the operation's own log encoding, so every record of one operation names it alike, and
+  two operations that moved the same positions alike (one dropped by a takeover, another made after it) are told apart
+  by what they did. A takeover can therefore keep an operation where every log it moved holds it and drop it otherwise,
+  part 1's rule (part 2c applies it).
+  - Made where the change is applied (`crates/db/src/repository.rs`: each change takes its log's position in
+    `log_names` and the state changes' apply, recording itself as it does; a change that changed nothing took no
+    position and is in no record), stamped once the operation is applied (`Partition::apply`: `clear_made`, the
+    operation, `seal_made`), and handed on by the database only once the operation is durable
+    (`Db::take_state_log_records`): a lone mutation's after its append, a transaction's at its commit, none of a
+    transaction rolled back. A replay applies the same operations and makes the same records, but hands none on.
+  - Why made by the partition and not read back by the server from the operations it sent: the server records a
+    repository's changes through two paths (the repository verbs, a push's entry), and a member green's destroy moves
+    the names log from every path that removes a volume; one rule where the positions move keeps every position in a
+    record, and a missed position would leave a log no holder can continue.
+- **The owner's parts** (`crates/server/src/state_log.rs`). The owner takes the partition's records into parts of
+  their logs' registers, each at the position it leaves its log at, and the record plane ships them with the heads
+  each period (`fleet::unplaced_heads` → `owed_state_log_parts`, `ship_head`): to the candidates missing each, in
+  position order, committed at `f + 1` through the owner's acceptor. A candidate's acknowledgements are kept per log as
+  its highest position, and a part goes once every candidate holds it; a laptop (`f = 0`) keeps none. A log is its own
+  register, so a push that moved the names and the locks never waits on one log's holders for the other's.
+- **A holder's copy, a prefix** (`state_log::check_held`, from `fleet::check_held_record`). A holder keeps a part only
+  where its value is a record of that register's log at that position, naming its own span among its operation's,
+  with one change a position, and continuing its copy: its predecessor held there, or the log's start. Refused
+  otherwise, by kind (`malformed`, `misnamed`, `misplaced`, `discontinuous`), as a malformed record: no
+  acknowledgement, and the owner ships the part again in order. It is a ledger (`catalog::is_single_value` false for
+  its class byte, 5), never compacted to its newest, and judged against no content.
+- **Every dispatch by the class.** A takeover's adoption reads the register's class before any value is decoded
+  (`takeover::record_adoption`: a catalog rebuilds its volume, a state log is counted `fleet.takeover.state_log_adopted`
+  and nothing more until part 2c, the object's own register by its value's class); a give-up by name settles a state
+  log unrecorded, as it does a catalog, since neither has verbs of its own (`given_up_shard`); a mirror's promotion page
+  names only an object's own register as a head (`mirror::page_entries`); and the record plane counts a state log's
+  shipments under its own names (`fleet.ship.state_log.*`, `ShipCounters`) and keeps its acknowledgements per log,
+  never as a head's placement (`record_acks_in`).
+- **Bounded.** The parts held are bounded by the partition's merge budget (`state_log::bound`): a part is a copy of
+  state changes that budget charged when they were made, so more owed than the budget is more than a second copy of
+  everything the partition may hold, which only holders gone silent for long leave unacknowledged. A repository's next
+  change of its state logs (a verb, or a push that makes or deletes a branch or moves names or state) is refused
+  `Overloaded` naming the shard while the parts are at the bound (`state_log::admit`, counted
+  `repository.state_log.parts_full`); a push of greens alone moves no state log and waits on none. The records the
+  database holds between two takes are bounded by what one take admits plus a member's destroy each, which the
+  partition's volume capacity bounds.
+- **The cost.** An operation that moves a state log encodes itself once more and hashes that and its spans: linear in
+  its size, as its log append already is; an operation of greens alone makes no record and pays nothing.
+- **Next (A-636 part 2b-2, main's ruling of 2026-11-19).** A record that spans a green's log and a state log needs one
+  set of holders and one successor for 2c to adopt it whole, and the greens' logs are still placed by their own ids.
+  So a repository's greens are placed on the repository's holders when they join it (bind or branch): a home change at
+  the join, D-14's home-change case, so no write path touches the configuration group. The trade, recorded here as
+  main ruled: for greens bound to a repository, A-642 part 1's copyset spreading (each green's log on a copyset of its
+  own, so pushes to different greens land on different holders) gives way; the alternative, a commit across holder
+  sets per record, is coordination on a write path (CLAUDE.md §2 item 10) and is not built. A green not bound to a
+  repository keeps its own placement.
+- **Tests** (macOS arm64, Mac Studio, kiln, debug, `CARGO_BUILD_JOBS=2`).
+  - The oracle: the repository model test (`every_history_of_entries_equals_the_rules_and_every_crash_recovers_it`, A-603's
+    and A-635's generated histories with crashes) now builds a holder's copy of the state logs from the records the
+    database hands on, and holds it equal to the model's state logs after every step: each record continuing its log
+    where the copy stands, one change a position, its own span among its operation's, every record of one operation
+    naming it alike, no identity met twice (`crates/db/src/repository/entry/tests/replica.rs`). Its census counts the
+    records, the operations of several logs and the members that left. Beside it, the exact records of a scripted
+    history (`each_operation_records_what_it_moved_of_each_state_log_named_alike`) and a transaction's records handed
+    on only at its commit, none of one rolled back (`a_transactions_state_log_records_go_on_only_once_it_is_durable`).
+    In the server: the owner's parts owed to the repository's candidates in order and let go as they are held, at
+    `f = 1` (`fleet::state_log_tests`); a holder's prefix and its refusals; the counters by class; the adoption, the
+    give-up and the mirror's page by class; the rule and the bookkeeping alone (`state_log::tests`).
+  - Red first. Kiln r307 (at ac87e1064, over main b94ae6e90), slates-server with each new behaviour stubbed back (every
+    dispatch site to `is_catalog`, a state log's counters to a head's, the holder's check out and its class byte compacted
+    as a single value, the owner taking no record): `cargo test --locked -p slates-server --lib -- state_log
+    takeover::tests::a_state_logs_register takeover::tests::a_given_up_state_log mirror::tests fleet::state_log_tests
+    --test-threads=4` 6 of 8 failed, each on its rule (the names log queued to be materialized as a volume; a given-up
+    state log recorded on its repository's shard; the page naming the names log as a head beside its repository's
+    catalog; its parts counted as heads; a part past a gap acknowledged and the log compacted to its newest; the owner
+    owing nothing), the two that passed being the module's rule and bookkeeping, which the stubs left in place. Kiln
+    r343 (at 01eb043b8), slates-db with the partition handing on no record: `cargo test --locked -p slates-db --lib --
+    repository::entry::tests::each_operation_records repository::entry::tests::a_transactions_state_log
+    repository::entry::tests::every_history_of_entries` 3 of 3 failed (no record of the first entry, none of the
+    committed transaction, and the copy empty where the model held the root joined and `n0` bound, the names log at 2).
+  - Green. Kiln r343 (at 01eb043b8): `cargo test --locked -p slates-db --lib -- repository:: register ledger catalog`
+    138 of 138; `cargo test --locked -p slates-server --lib -- state_log takeover:: mirror:: fleet:: repository::
+    --test-threads=4` 79 of 79. Kiln r307: `cargo test --locked -p slates-db --test wire_order` 2 of 2 and 1 ignored
+    (`LoggedChange`'s four tags published by hand and held); `--test model -- every_recovery_equals_the_live_partition`
+    2 of 2 (every operation's apply now stamps its records); `cargo fmt -p slates-db -p slates-server -- --check` clean
+    both times.
+  - As it lands. Kiln r367 (at 96a5aa13b, this change merged with main 2f73eb075, whose repository verbs, push path and
+    Subversion commit share files with it): `cargo test --locked -p slates-db --lib -- repository:: register ledger
+    catalog` 138 of 138, the repository model test's census over its 128 histories 1,083 state-log records taken by the
+    copy, 603 operations of several logs, 17 members left with their destroys (beside A-635's 191 entries of several
+    greens, 409 moving state with versions and 122 alone, 318 recoveries from a snapshot and 37 from the log alone);
+    `--test wire_order` 2 of 2 and 1 ignored; `--test model -- every_recovery_equals_the_live_partition` 2 of 2;
+    `cargo test --locked -p slates-server --lib -- state_log takeover:: mirror:: fleet:: repository:: --test-threads=4`
+    85 of 85; `cargo fmt -p slates-db -p slates-server -- --check` clean.
+- **Owed.** A push's answer waiting for its records to commit at `f + 1` (the barrier the merge plane keeps for a
+  submit, `MergeShardState::awaiting`); a candidate that joins a log's placement past parts every earlier candidate held,
+  which needs the log's state installed before its next part (a state-log checkpoint, which also lets holders and the
+  owner's acceptor drop the records below it, as A-404 does for a green's chain); a neighbourhood change's settle
+  waiting for the state logs' parts on the new cohort (`records_placed_on_current_neighbourhood` reads heads and greens
+  only); the parts rebuilt after the owner restarts (the partition's replay hands none on); parts batched a shipment; a
+  destroyed repository's four state-log registers forgotten by its holders and its owner; the repository record and
+  its policy replicated (their own register); the greens placed on their repository's holders (2b-2); the successor
+  adopting a repository's logs and each operation whole (2c). Main's gates: clippy, xtask, the doc build, other
+  platforms, the db and server suites whole.
+- **Applied in the same change to:** §4.8's catalog-class status (every dispatch by the class); §4.17.1's status and
+  shared piece 2; GAPS (A-642's headline, the §4.17 entry); `crates/db/tests/wire_order.txt` (`LoggedChange`); this
+  entry.
 
 ### A-658 part 3a — A computed verdict's wire form: what a holder sends the owner, read back against the increment it judged (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); A-645 "Merges computed anywhere, committed by position"; §4.16 "Commit" and "Apply on holders"; after A-658 parts 1 and 2)
 

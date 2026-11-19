@@ -11,7 +11,7 @@
 
 use slates_cluster::{CommitBudget, broadcast};
 use slates_db::catalog::{PlacementState, VolumeId as DbVolumeId};
-use slates_db::register::{HostId, ObjectId, Quorum, Record};
+use slates_db::register::{HostId, ObjectId, Quorum, Record, RegisterClass};
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 use slates_wire::Wire;
@@ -571,12 +571,30 @@ pub(crate) fn serve_promise(
   let after = <[u8; 16]>::try_from(request.after.as_slice())
     .ok()
     .map(ObjectId);
-  let budget = crate::takeover::page_budget();
+  let (entries, next) = page_entries(state, lost, after, crate::takeover::page_budget());
+  PromisePage {
+    holder: local.0,
+    root_version,
+    entries,
+    next,
+  }
+  .to_bytes()
+}
+
+/// One promise page's entries from the cursor `after` on, within `budget` bytes, and the cursor after them when the page
+/// stopped short: each of `lost`'s volumes' newest head this member mirrors, with its catalog beside it. Only an
+/// object's own register pages as a head, read from its id's class (A-636 part 2b): a catalog rides beside its volume's
+/// head, and a repository's state log is no volume's head, whatever its bytes.
+fn page_entries(
+  state: &ShardState,
+  lost: slates_db::register::RegionId,
+  after: Option<ObjectId>,
+  budget: usize,
+) -> (Vec<Vec<u8>>, Vec<u8>) {
   let mut entries = Vec::new();
   let mut used = 0usize;
-  let mut next = Vec::new();
   for (object, head) in state.mirror_records.iter() {
-    if object.is_catalog() || after.is_some_and(|after| *object <= after) {
+    if object.class() != RegisterClass::Own || after.is_some_and(|after| *object <= after) {
       continue;
     }
     if shipped_from(state, *object) != lost {
@@ -588,20 +606,14 @@ pub(crate) fn serve_promise(
     let (head, catalog) = (head.encode(), catalog.encode());
     let size = head.len().saturating_add(catalog.len());
     if used > 0 && used.saturating_add(size) > budget {
-      next = after_of(&entries);
-      break;
+      let next = after_of(&entries);
+      return (entries, next);
     }
     used = used.saturating_add(size);
     entries.push(head);
     entries.push(catalog);
   }
-  PromisePage {
-    holder: local.0,
-    root_version,
-    entries,
-    next,
-  }
-  .to_bytes()
+  (entries, Vec::new())
 }
 
 /// The cursor after a page's last head record.
@@ -931,3 +943,51 @@ fn seed_assigned(state: &mut ShardState, local: HostId) -> Vec<ObjectId> {
 
 /// The status count of promoted objects this node began adopting. Format: a counter name in the status report.
 const PROMOTION_SEEDED: &str = "fleet.mirror.promotion_seeded";
+
+#[cfg(test)]
+mod tests {
+  use slates_db::catalog::StateLog;
+  use slates_db::register::{FIRST_EPOCH, HostId, ObjectId, Record, RegionId, RegisterClass};
+
+  /// A record of `object` from its creator, its value `value`.
+  fn mirrored(object: ObjectId, value: &[u8]) -> Record {
+    Record {
+      owner: object.creator(),
+      object,
+      sequence: 1,
+      epoch: FIRST_EPOCH,
+      generation: 1,
+      value: value.to_vec(),
+    }
+  }
+
+  /// A-636 part 2b (A-636 part 2a's dispatch sites). Do: on a mirror member holding a lost region's repository's own
+  /// record, its catalog and its names log's record, answer a promotion's page. Expect: one head and its catalog, the
+  /// repository's own: a state log is no volume's head, so it is never paged as one beside its repository's catalog.
+  /// Before, every register but a catalog paged as a head, so a promotion adopted the names log as a volume.
+  #[test]
+  fn a_promotions_page_names_only_an_objects_own_register_as_its_head() {
+    crate::daemon::audit_on_shard(|state| {
+      let repository = ObjectId::new(HostId(7), 3);
+      let names = repository.in_class(RegisterClass::State(StateLog::Names));
+      for (object, value) in [
+        (repository, &b"the head"[..]),
+        (repository.catalog(), &b"the catalog"[..]),
+        (names, &b"the names log's part"[..]),
+      ] {
+        assert_eq!(
+          state.mirror_records.accept(mirrored(object, value)),
+          Ok(true)
+        );
+      }
+      let (entries, next) = super::page_entries(state, RegionId(0), None, usize::MAX);
+      let paged: Vec<ObjectId> = entries
+        .iter()
+        .filter_map(|entry| Record::decode(entry).ok())
+        .map(|record| record.object)
+        .collect();
+      assert_eq!(paged, vec![repository, repository.catalog()]);
+      assert!(next.is_empty(), "one page holds it all");
+    });
+  }
+}
