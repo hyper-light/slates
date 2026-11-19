@@ -21,6 +21,8 @@ slates-http = { workspace = true }
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
+# The golden test gzips stock git's inflated fetch request again (A-595; the fixtures hold no compressed bytes, A-607).
+flate2 = { workspace = true }
 
 [lints]
 workspace = true

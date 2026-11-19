@@ -568,3 +568,7 @@ pub fn advertisement_prelude(
 #[cfg(test)]
 #[path = "tests/http.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/http_golden.rs"]
+mod golden;

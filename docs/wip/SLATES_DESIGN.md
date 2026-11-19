@@ -11946,6 +11946,19 @@ engine: the verdict, rebase, position mapping, the register).
 > each CRC32 over its bytes), and writes an index byte for byte as git 2.50.1 does. Every checksum runs through
 > `object_name` (A-600); the CRC32 is zlib's, through `crc32fast`, the crate flate2 computes it with. Proven against the
 > packs, indexes and `verify-pack -v` listings stock git 2.50.1 wrote, one of them with its 8-byte table in use.
+>
+> **Status (2026-11-19, A-595: piece 8's first part built, the request codec and git's routes).** HTTP/1.1's request
+> codec is a crate of its own, `crates/http` (`slates-http`), so §4.17.3's and §4.17.4's HTTP read requests with it
+> without depending on git's crate. A head is read as its bytes arrive, each byte scanned once, every line held to RFC
+> 9112 §3's 8000 octets, its bytes and field index charged to the request's admission, and every framing two readers
+> could disagree on refused by kind. A body's framing (`Content-Length` or chunked) is removed as it streams, its data
+> handed back as slices of the input, so a push's pack passes in constant memory; a gzip body is inflated through
+> flate2's streaming decoder over A-607's zlib-rs, every inflated byte charged, so a bomb stops at the room. `crates/git`
+> (`http`) routes as `git http-backend` routes, with its statuses and its three cache fields, takes `Git-Protocol`'s
+> greatest version as `protocol.c` does, and writes the `# service=` line and flush for v0 and v1 alone. Proven against
+> stock git 2.50.1's own HTTP traffic with `http-backend` (its heads and inflated bodies, SHA-256 checked) and hostile
+> input at every cut. Owed: the edge that reads sockets (TLS, authentication, `100 Continue`, the services' bodies
+> streamed through, the staged close).
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -11965,9 +11978,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    respond with the `403 Forbidden` HTTP status code"); a request without credentials is `401` with its challenge (HTTP
    semantics, RFC 9110). TLS is rustls over aws-lc-rs, already in the workspace. Every request is a future on a shard
    (R6): no process starts per request, where `git-http-backend` is "A simple CGI program" [B: git-http-backend] whose
-   fetch runs `upload-pack` and `pack-objects` as further processes. The MCP edge's HTTP/1.1 server
-   (`crates/mcp/src/http.rs`) is the starting point; the git edge adds TLS, chunked and gzip bodies, and streaming
-   responses.
+   fetch runs `upload-pack` and `pack-objects` as further processes. Requests are read by `slates-http` (A-595), a
+   sans-I/O HTTP/1.1 codec the Mercurial and Subversion servers share; the MCP edge's server (`crates/mcp/src/http.rs`),
+   bound to its one endpoint and refusing every transfer coding, lent its line bound and its staged close, and moving it
+   onto the codec is owed. The git edge adds TLS, authentication and streaming responses.
 2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
    one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
    [B: RFC 8709], with the RSA and ECDSA key forms users already hold as owed reading; ciphers `aes256-gcm@openssh.com`
@@ -39596,3 +39610,61 @@ Applied in the same change to:
   index's ids checked against its pack's objects. `Idx::decode` and `Idx::check_pack` run whole, hashing and CRC-ing
   every byte in one call, so a caller on a shard gives them what its slice admits; a sliced form comes with the import
   of a repository on disk (piece 15), which also remakes a version 1 index from its pack.
+
+### A-595 — HTTP/1.1's request codec as a crate the version-control servers share, and git's smart HTTP routes over it (2026-11-19, g076b, UI goal 92; §4.17.2 "Transports" item 1 and "Pieces (git)" piece 8's first part)
+Applied in the same change to:
+- §4.17.2's status and its "Transports" item 1; GAPS (the §4.17 entry);
+- `crates/http` (`slates-http`, new: `head`, `body`, `gzip`, `percent`, `reply`, `admission`, `grammar`, their tests);
+- `crates/git` (`http.rs` and its tests; `tests/http_golden.rs`; `fixtures/http` with `make-http-fixtures.sh` and
+  `cgi-host.py`; `Cargo.toml`: `slates-http`, and flate2 for the golden test alone);
+- the workspace manifest (`slates-http`) and lock (A-607's flate2 resolved: zlib-rs alone).
+- **Why a crate.** Mercurial's HTTP (A-569) already takes a request whose head and body are read, and Subversion's
+  WebDAV will; a module of `slates-git` would make both depend on git's crate and its hashes. `slates-http` holds no
+  tool's rule: it reads a request and frames a reply, and each tool routes.
+- **The head** (RFC 9112 §2 to §6). `HeadReader` scans each byte once across reads, keeping three offsets, and skips
+  empty lines before the request line. A line past 8000 octets (RFC 9112 §3's recommended minimum, the MCP edge's
+  bound) is refused, 414 for the request line and 431 after, whole or still open; a head that fills the admission's
+  room unended is refused the same way. A whole head is charged its bytes and its field index before the index is
+  built, and borrows the caller's bytes. The origin, absolute (`http` or `https`, no userinfo, its authority over
+  `Host`) and asterisk (`OPTIONS`) forms are read; a bare CR or LF, a fold, whitespace before a colon, a control byte
+  in a value, a target byte no URI holds, a second `Host` or none in HTTP/1.1 are refused 400 by kind. The framing is
+  RFC 9112 §6.3's with every case two readers could disagree on refused: `Content-Length` with `Transfer-Encoding`, a
+  transfer coding in HTTP/1.0, chunked not last or twice (400), another transfer coding (501), `Content-Length` values
+  that disagree or are not digits (400) or pass 64 bits (413). gzip once is the one content coding read (415 with
+  `Accept-Encoding: gzip` otherwise); `Expect: 100-continue` is honoured in HTTP/1.1 and ignored in HTTP/1.0, another
+  expectation 417. The refusals are judged in one order whatever the fields' order: the grammar, `Host`, the length,
+  the framing, the coding, the expectation.
+- **The body** (RFC 9112 §7.1). `BodyReader` keeps only the state of the line it is in; a step returns a run of data as
+  a slice of its input, or takes all its input and asks for more, or ends exactly at the body's last byte. Chunk sizes
+  are hexadecimal within 64 bits; extensions are skipped but hold no control byte; trailers are read to the field
+  grammar, dropped, and charged to the admission as a head is; every line is held to the same 8000 octets.
+- **gzip** (RFC 1952). `Gunzip` writes into flate2's `write::MultiGzDecoder` (A-607's zlib-rs; no backend named): every
+  inflated byte is charged as it is made, a write past the room is refused with the sink never grown past it, every
+  member's CRC-32 and length are checked, and the decoder is never written after its end (flate2 may panic there).
+- **git's routes**, as `http-backend.c` answers: `info/refs?service=` for `GET` and `HEAD`; `POST` to a service of its
+  request type (415) with a body (411); the dumb protocol's paths and `info/refs` with no service 403 (git with
+  `http.getanyfile` off), an unknown service 403, `git-upload-archive` 403; 405 naming `GET, HEAD` or `POST`, or 400 to
+  HTTP/1.0 (`bad_request`); 404 for a repository path with an empty, `.` or `..` segment (`daemon_avoid_alias`); paths
+  routed decoded and queries read as forms, the last `service` winning (`get_parameter`), an escaped slash or NUL 400.
+  `Git-Protocol`'s greatest `version=` is the version (`determine_protocol_version_server`; the codec before this
+  change took the last, which git does not). Replies carry `http-backend`'s `Expires`, `Pragma` and `Cache-Control`
+  in its order, then the content type; the `# service=` pkt-line and flush precede a v0 or v1 advertisement only.
+- **Golden vectors.** `make-http-fixtures.sh` (the MacBook, git 2.50.1 Apple Git-155, Python 3.9.6, 2026-11-19) serves
+  two repositories through `cgi-host.py`, a loopback CGI host running `git http-backend`, and records twelve exchanges:
+  `ls-remote` at v0 and v1, a v2 clone whose fetch is gzipped (git gzips a request past 1024 bytes), a push, and a v2
+  clone with a 64 KiB post buffer whose `ls-refs` and fetch go chunked after git's probe of a lone flush. As main ruled
+  with A-607 the fixtures hold inflated bytes alone: heads, plain pkt-line bodies, the gzip body inflated by Python and
+  gzipped again by the test, the chunked fetch's framing with the SHA-256 of its data, `http-backend`'s CGI heads and
+  its advertisements; no pack. git 2.50.1 refuses a post buffer of LARGE_PACKET_MAX or less over a stateless
+  connection (`BUG: ... rpc->buf should be larger than LARGE_PACKET_MAX`), hence 64 KiB.
+- **Not reused: the MCP edge's parser** (`crates/mcp/src/http.rs`). It reads MCP's fields alone, takes `POST` alone,
+  requires `Content-Length`, refuses every transfer coding, and lives in a crate on the runtime and the client. Its
+  line bound and its citations were taken; moving it onto `slates-http` is owed.
+- **Tests** (Mac Studio M3 Ultra, debug, 2026-11-19): red first, kiln r513 (load 6.5): 49 of 51 `slates-http` tests
+  and 11 of 11 git route tests failed on stubs; green `cargo test -p slates-http --lib` 51 of 51 and
+  `cargo test -p slates-git --lib` 87 of 87 at 7ece429be (load 7.6), then GREEN_GOLDEN with the golden vectors;
+  `cargo fmt` clean.
+- **Owed.** The edge that reads sockets (piece 8's next part): listeners on a shard, TLS, authentication (401 with its
+  challenge, 403), `100 Continue`, each service's body streamed into upload-pack and receive-pack and the replies out
+  in chunks, the staged close of RFC 9112 §9.6; the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's
+  DAV reading their requests through it.

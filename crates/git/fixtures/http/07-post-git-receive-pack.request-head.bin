@@ -1,0 +1,8 @@
+POST /small.git/git-receive-pack HTTP/1.1
+Host: 127.0.0.1:53711
+User-Agent: git/2.50.1
+Accept-Encoding: deflate, gzip
+Content-Type: application/x-git-receive-pack-request
+Accept: application/x-git-receive-pack-result
+Content-Length: 360
+
