@@ -28,9 +28,16 @@
 //!   new text's MD5 and SHA-1 taken as it is written; `close-file`'s checksum, when sent, must equal the MD5 of the
 //!   file's text then (`E200014` otherwise, as `svn_checksum_mismatch_err` writes it).
 //! - **Properties**: a change sets or deletes one property of the node's list; the new list is named by the green
-//!   ([`Green::name_properties`]) and declared as one replacement of the node's list. Which names and values Subversion
-//!   refuses (`svn_repos__validate_prop`) is owed, with the authorization checks (`check_authz`, A-606) and an added
-//!   path's validation (`svn_repos__validate_new_path`): A-617's next part.
+//!   ([`Green::name_properties`]) and declared as one replacement of the node's list. First `svn_repos_fs_change_node_prop`'s
+//!   checks (`fs-wrap.c` 297-338; A-655): `svn:mergeinfo` must hold no NUL and parse (A-605's parser; the parser's own
+//!   words beneath `verify_mergeinfo`'s are owed with A-605's messages), a property `svn:wc:` or `svn:entry:` is never
+//!   stored, and an `svn:` value must be UTF-8 without a carriage return, `svn:date` a date as `svn_time_from_cstring`
+//!   reads one; a deletion is never refused.
+//! - **Who may** (`commit.c` `check_authz`; A-655): each call asks A-606's rules, compiled for the principal
+//!   ([`Setup::rules`]), what `svnserve`'s commit editor asks: a deletion a write at and beneath a directory and a write
+//!   on its parent, an addition a write on the path and its parent and, for a copy, a read of the source, beneath it for
+//!   a directory; `open-file` a read; a file's first change and a directory's a write. An added path holding a control
+//!   character is refused first (`svn_repos__validate_new_path`).
 //! - **The transaction**: each change is declared as it is checked, on the revision's changed-path rows, one per path,
 //!   folded as FSFS folds them (a deletion then an addition is a replacement; a deletion drops the rows beneath it; an
 //!   addition then a deletion leaves nothing). Every check reads the transaction as those rows leave it over the index
@@ -67,8 +74,9 @@ use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, IndexRefusal, NodeKind, PropertyList,
   Revision, RevisionRecord, Text,
 };
-use crate::authz::PrincipalRules;
+use crate::authz::{Access, PrincipalRules, RepositoryPath};
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockRefusal, LockTable};
+use crate::mergeinfo::{Mergeinfo, MergeinfoRefusal};
 use crate::ra_svn::{ItemError, Value, write};
 use crate::svndiff::{self, Decoded, Decoder, InstructionFault, SvndiffError};
 
@@ -171,6 +179,101 @@ const SVN_ERR_RA_SVN_UNKNOWN_CMD: u32 = 210_001;
 /// `SVN_ERR_RA_SVN_REQUEST_SIZE`: a work past its room.
 /// Format: the ra_svn category's start plus 9 (`svn_error_codes.h` 1601-1602).
 const SVN_ERR_RA_SVN_REQUEST_SIZE: u32 = 210_009;
+
+/// `SVN_ERR_BAD_DATE`: an `svn:date` that is no date.
+/// Format: the bad-argument category's start plus 3 (`svn_error_codes.h`).
+const SVN_ERR_BAD_DATE: u32 = 125_003;
+
+/// `SVN_ERR_BAD_PROPERTY_VALUE`: an `svn:` property's value refused.
+/// Format: the bad-argument category's start plus 5 (`svn_error_codes.h`).
+const SVN_ERR_BAD_PROPERTY_VALUE: u32 = 125_005;
+
+/// `SVN_ERR_BAD_PROPERTY_VALUE_EOL`: an `svn:` property's value holding a carriage return.
+/// Format: the bad-argument category's start plus 17 (`svn_error_codes.h`).
+const SVN_ERR_BAD_PROPERTY_VALUE_EOL: u32 = 125_017;
+
+/// `SVN_ERR_MERGEINFO_PARSE_ERROR`: `svn:mergeinfo` refused at commit.
+/// Format: the miscellaneous category's start plus 20 (`svn_error_codes.h`).
+const SVN_ERR_MERGEINFO_PARSE_ERROR: u32 = 200_020;
+
+/// `SVN_ERR_AUTHZ_UNREADABLE`: a read the rules deny.
+/// Format: the authorization category's start, 120,000 + 20 × 5,000 = 220,000, plus 1 (`svn_error_codes.h`).
+const SVN_ERR_AUTHZ_UNREADABLE: u32 = 220_001;
+
+/// `SVN_ERR_AUTHZ_UNWRITABLE`: a write the rules deny.
+/// Format: the authorization category's start plus 4 (`svn_error_codes.h`).
+const SVN_ERR_AUTHZ_UNWRITABLE: u32 = 220_004;
+
+/// The prefix of Subversion's own properties.
+/// Format: `svn_props.h` `SVN_PROP_PREFIX`.
+const SVN_PREFIX: &[u8] = b"svn:";
+
+/// The prefix of the working copy's properties, which the repository never stores.
+/// Format: `svn_props.h` `SVN_PROP_WC_PREFIX`; `properties.c` `svn_property_kind2`.
+const WC_PREFIX: &[u8] = b"svn:wc:";
+
+/// The prefix of the entry properties, which the repository makes and never stores as sent.
+/// Format: `svn_props.h` `SVN_PROP_ENTRY_PREFIX`; `properties.c` `svn_property_kind2`.
+const ENTRY_PREFIX: &[u8] = b"svn:entry:";
+
+/// The property whose value must be a date.
+/// Format: `svn_props.h` `SVN_PROP_REVISION_DATE`; `fs-wrap.c` 250.
+const REVISION_DATE: &[u8] = b"svn:date";
+
+/// The carriage return an `svn:` property may not hold.
+/// Format: `fs-wrap.c` 237, `strchr(value->data, '\r')`.
+const CARRIAGE_RETURN: u8 = b'\r';
+
+/// The byte that ends a C string.
+/// Format: C's terminator, where `strchr`, `strlen` and `svn_time_from_cstring` stop.
+const NUL: u8 = 0;
+
+/// The separator after each number of a date, in order.
+/// Format: `time.c` `TIMESTAMP_FORMAT`, `"%04d-%02d-%02dT%02d:%02d:%02d.%06dZ"`, as `svn_time_from_cstring` reads it.
+const DATE_SEPARATORS: [u8; 7] = *b"--T::.Z";
+
+/// How many numbers a date has: one before each separator.
+const DATE_FIELDS: usize = DATE_SEPARATORS.len();
+
+/// The base `svn__strtoul` reads in.
+/// Format: decimal digits (`string.c` `svn__strtoul`).
+const DECIMAL: u64 = 10;
+
+/// The year `struct tm`'s years count from.
+/// Format: `time.c`, `tm_year -= 1900`.
+const TM_YEAR_BASE: i64 = 1900;
+
+/// The days from the 1st of March to the 1st of each month, January first, as APR counts a year from March.
+/// Format: APR 1.7.5 `time/unix/time.c` `apr_time_exp_get`'s `dayoffset`.
+const DAY_OFFSET: [i64; 12] = [306, 337, 0, 31, 61, 92, 122, 153, 184, 214, 245, 275];
+
+/// The days of a common year.
+/// Format: the Gregorian calendar, as `apr_time_exp_get` counts.
+const DAYS_PER_YEAR: i64 = 365;
+
+/// The years between leap years.
+/// Format: the Gregorian calendar, `year / 4` in `apr_time_exp_get`.
+const LEAP_EVERY: i64 = 4;
+
+/// The years of a century, whose first is no leap year unless the fourth.
+/// Format: the Gregorian calendar, `year / 100` in `apr_time_exp_get`.
+const CENTURY: i64 = 100;
+
+/// The offset that counts 2000's leap day from 1900 in `(year / 100 + 3) / 4`.
+/// Format: `apr_time_exp_get`.
+const CENTURY_LEAP_OFFSET: i64 = 3;
+
+/// The days from the 1st of March 1900 to the 1st of January 1970.
+/// Format: `apr_time_exp_get`, "1 jan 1970 is 25508 days since 1 mar 1900".
+const EPOCH_DAYS: i64 = 25_508;
+
+/// The hours of a day.
+/// Format: `apr_time_exp_get`.
+const HOURS_PER_DAY: i64 = 24;
+
+/// The minutes of an hour and the seconds of a minute.
+/// Format: `apr_time_exp_get`.
+const SIXTY: i64 = 60;
 
 /// `SVN_ERR_FS_CONFLICT`'s message, as FSFS's merge writes it.
 /// Format: `tree.c` `conflict_err`.
@@ -304,6 +407,47 @@ pub enum DriveRefusal {
   },
   /// The digest library failed, which no input causes.
   DigestFailed,
+  /// An added path holding a control character (`path.c` `svn_path_check_valid`).
+  ControlCharacter {
+    /// The first control character.
+    byte: u8,
+    /// The path as the client sent it.
+    path: Vec<u8>,
+  },
+  /// A property Subversion keeps for itself, `svn:wc:` or `svn:entry:`, set through the repository (`fs-wrap.c` 213).
+  NotRegular {
+    /// Its name.
+    name: String,
+  },
+  /// An `svn:` property's value that is not UTF-8 (`fs-wrap.c` 227).
+  NotUtf8 {
+    /// Its name.
+    name: String,
+  },
+  /// An `svn:` property's value holding a carriage return (`fs-wrap.c` 237), two errors on the wire.
+  NonLf {
+    /// Its name.
+    name: String,
+  },
+  /// An `svn:date` that is no date (`fs-wrap.c` 250-259), two errors on the wire.
+  BadDate,
+  /// `svn:mergeinfo` holding a NUL (`fs-wrap.c` `verify_mergeinfo` 311).
+  MergeinfoTerminator {
+    /// The node's path.
+    path: String,
+  },
+  /// `svn:mergeinfo` that does not parse (`fs-wrap.c` `verify_mergeinfo` 317-322); the parser's own words, beneath
+  /// these, are owed with A-605's messages.
+  MergeinfoInvalid {
+    /// The node's path.
+    path: String,
+    /// Why A-605's parser refused it.
+    refusal: MergeinfoRefusal,
+  },
+  /// A write the authorization rules deny (`commit.c` `check_authz`).
+  Unwritable,
+  /// A read the authorization rules deny (`commit.c` `check_authz`).
+  Unreadable,
 }
 
 impl DriveRefusal {
@@ -325,6 +469,12 @@ impl DriveRefusal {
       Self::PathSyntax { .. } => SVN_ERR_FS_PATH_SYNTAX,
       Self::Room { .. } => SVN_ERR_RA_SVN_REQUEST_SIZE,
       Self::DigestFailed => SVN_ERR_BASE,
+      Self::ControlCharacter { .. } => SVN_ERR_FS_PATH_SYNTAX,
+      Self::NotRegular { .. } => SVN_ERR_REPOS_BAD_ARGS,
+      Self::NotUtf8 { .. } | Self::NonLf { .. } | Self::BadDate => SVN_ERR_BAD_PROPERTY_VALUE,
+      Self::MergeinfoTerminator { .. } | Self::MergeinfoInvalid { .. } => SVN_ERR_MERGEINFO_PARSE_ERROR,
+      Self::Unwritable => SVN_ERR_AUTHZ_UNWRITABLE,
+      Self::Unreadable => SVN_ERR_AUTHZ_UNREADABLE,
     }
   }
 }
@@ -468,6 +618,8 @@ struct File {
   path: String,
   /// Its text delta, while one is open.
   delta: Option<Delta>,
+  /// Whether its write was checked (`checked_write`): from the start for one the drive added.
+  checked: bool,
 }
 
 /// What a token names.
@@ -950,6 +1102,26 @@ impl Drive {
       DriveRefusal::Delta(refusal) => delta_message(*refusal),
       DriveRefusal::NoTransaction => "No valid transaction supplied to close_edit".to_owned(),
       DriveRefusal::UnknownCommand { name } => format!("Unknown editor command '{name}'"),
+      DriveRefusal::ControlCharacter { byte, path } => format!(
+        "Invalid control character '0x{byte:02x}' in path '{}'",
+        escaped(path)
+      ),
+      DriveRefusal::NotRegular { name } => format!(
+        "Storage of non-regular property '{name}' is disallowed through the repository interface, and could \
+         indicate a bug in your client"
+      ),
+      DriveRefusal::NotUtf8 { name } => {
+        format!("Cannot accept '{name}' property because it is not encoded in UTF-8")
+      }
+      DriveRefusal::NonLf { .. } => "Invalid property value".to_owned(),
+      DriveRefusal::BadDate => "Wrong or unexpected property value".to_owned(),
+      DriveRefusal::MergeinfoTerminator { path } => format!(
+        "Commit rejected because mergeinfo on '{path}' contains unexpected string terminator"
+      ),
+      DriveRefusal::MergeinfoInvalid { path, .. } => {
+        format!("Commit rejected because mergeinfo on '{path}' is syntactically invalid")
+      }
+      DriveRefusal::Unwritable | DriveRefusal::Unreadable => "Access denied".to_owned(),
       DriveRefusal::Room { .. } => {
         "The client request size exceeds the configured limit".to_owned()
       }
@@ -990,9 +1162,28 @@ impl Drive {
     }
   }
 
+  /// The errors `svnserve` writes for `refusal`, outermost first: one, or a chain where Subversion wraps an error in
+  /// another (`marshal.c` `svn_ra_svn__write_cmd_failure` writes each).
+  pub fn errors(&self, refusal: &DriveRefusal) -> Vec<(u32, String)> {
+    match refusal {
+      DriveRefusal::NonLf { name } => vec![
+        (SVN_ERR_BAD_PROPERTY_VALUE, self.message(refusal)),
+        (
+          SVN_ERR_BAD_PROPERTY_VALUE_EOL,
+          format!("Cannot accept non-LF line endings in '{name}' property"),
+        ),
+      ],
+      DriveRefusal::BadDate => vec![
+        (SVN_ERR_BAD_PROPERTY_VALUE, self.message(refusal)),
+        (SVN_ERR_BAD_DATE, "Bogus date".to_owned()),
+      ],
+      other => vec![(other.subversion_code(), self.message(other))],
+    }
+  }
+
   /// Writes a refusal's failure and turns to dropping (`editorp.c` 1149-1174).
   fn refuse(&mut self, refusal: &DriveRefusal, out: &mut Vec<u8>) -> Result<Step, ItemError> {
-    write_failure_words(refusal.subversion_code(), &self.message(refusal), out)?;
+    write_failure_errors(&self.errors(refusal), out)?;
     self.phase = Phase::Dropping;
     Ok(Step::Refused)
   }
@@ -1087,6 +1278,7 @@ impl Drive {
       EditCommand::TextdeltaEnd { file } => self.textdelta_end(world.green, file),
       EditCommand::ChangeFileProp { file, name, value } => {
         let path = self.file(file)?.path.clone();
+        self.check_written(file, &path)?;
         self.change_property(world, &path, name, value)
       }
       EditCommand::CloseFile {
@@ -1133,9 +1325,13 @@ impl Drive {
     revision: Option<u64>,
     directory: &[u8],
   ) -> Result<Outcome, Stop> {
-    self.directory(directory)?;
+    let parent = self.directory(directory)?.path.clone();
     let full = self.full_path(path)?;
-    let Some(node) = self.view(world.index, &full)? else {
+    let node = self.view(world.index, &full)?;
+    let recursive = node.is_some_and(|node| node.kind == NodeKind::Directory);
+    self.check_authz(&full, true, recursive)?;
+    self.check_authz(&parent, true, false)?;
+    let Some(node) = node else {
       return Err(
         CommitRefusal::OutOfDate {
           path: full,
@@ -1158,20 +1354,26 @@ impl Drive {
     world: &World<'_, G>,
     added: Added<'_>,
   ) -> Result<Outcome, Stop> {
-    let copied = self.directory(added.parent)?.copied;
+    let parent = self.directory(added.parent)?;
+    let (copied, parent) = (parent.copied, parent.path.clone());
     if added.kind == NodeKind::File {
       self.tokens.insert(
         added.child.to_vec(),
         Baton::File(File {
           path: String::new(),
           delta: None,
+          checked: false,
         }),
       );
     }
+    validate_new_path(added.path)?;
     let full = self.full_path(added.path)?;
+    let directory = added.kind == NodeKind::Directory;
+    self.check_authz(&full, true, directory && added.copied_from.is_some())?;
+    self.check_authz(&parent, true, false)?;
     let present = self.view(world.index, &full)?;
     let copy_from = match added.copied_from {
-      Some(source) => Some(self.copy_source(world, &full, present.as_ref(), copied, source)?),
+      Some(source) => Some(self.copy_source(world, &full, present.as_ref(), copied, (source, added.kind))?),
       None => {
         if present.is_some() {
           return Err(DriveRefusal::AlreadyExists { path: full }.into());
@@ -1191,6 +1393,7 @@ impl Drive {
       NodeKind::File => Baton::File(File {
         path: full,
         delta: None,
+        checked: true,
       }),
     };
     self.tokens.insert(added.child.to_vec(), baton);
@@ -1205,7 +1408,7 @@ impl Drive {
     full: &str,
     present: Option<&View>,
     copied: bool,
-    source: CopiedFrom<'_>,
+    (source, kind): (CopiedFrom<'_>, NodeKind),
   ) -> Result<CopySource, Stop> {
     if let Some(node) = present
       && !copied
@@ -1227,6 +1430,7 @@ impl Drive {
         .into(),
       );
     }
+    self.check_authz(&path, false, kind == NodeKind::Directory)?;
     if world.index.node(&path, source.revision)?.is_none() {
       return Err(
         DriveRefusal::SourceNotFound {
@@ -1307,6 +1511,7 @@ impl Drive {
   ) -> Result<Outcome, Stop> {
     let directory = self.directory(token)?.clone();
     if !directory.checked {
+      self.check_authz(&directory.path, true, false)?;
       if let Some(base) = directory.base {
         let node = self.view(world.index, &directory.path)?;
         let node = node.ok_or_else(|| DriveRefusal::NotFound {
@@ -1349,9 +1554,11 @@ impl Drive {
       Baton::File(File {
         path: String::new(),
         delta: None,
+        checked: false,
       }),
     );
     let full = self.full_path(path)?;
+    self.check_authz(&full, false, false)?;
     let Some(node) = self.view(world.index, &full)? else {
       return Err(DriveRefusal::NotFound { path: full }.into());
     };
@@ -1363,6 +1570,7 @@ impl Drive {
       Baton::File(File {
         path: full,
         delta: None,
+        checked: false,
       }),
     );
     Ok(Outcome::Taken)
@@ -1380,6 +1588,7 @@ impl Drive {
       File { delta: Some(_), .. } => return Err(Stop::Close),
       File { path, .. } => path.clone(),
     };
+    self.check_written(token, &path)?;
     let expected = base_checksum.map(parsed_md5).transpose()?.flatten();
     let Some(node) = self.view(world.index, &path)? else {
       return Err(DriveRefusal::NotFound { path }.into());
@@ -1546,6 +1755,7 @@ impl Drive {
     name: &[u8],
     value: Option<&[u8]>,
   ) -> Result<Outcome, Stop> {
+    validate_property(path, name, value)?;
     let node = self
       .view(world.index, path)?
       .ok_or_else(|| DriveRefusal::NotFound {
@@ -1683,6 +1893,38 @@ impl Drive {
         mergeinfo_modified: false,
       });
     set(row);
+  }
+
+  /// `check_authz` (`commit.c` 243-262) by A-606's rules: read, or write, at `path`, and beneath it when `recursive`.
+  fn check_authz(&self, path: &str, write: bool, recursive: bool) -> Result<(), DriveRefusal> {
+    let Some(rules) = self.setup.rules.as_ref() else {
+      return Ok(());
+    };
+    let at = RepositoryPath::new(path.as_bytes()).map_err(|_| DriveRefusal::PathSyntax {
+      path: path.to_owned(),
+    })?;
+    let granted = if recursive {
+      rules.access_beneath(at)
+    } else {
+      rules.access(at)
+    };
+    match (write, granted) {
+      (true, Access::Write) | (false, Access::Read | Access::Write) => Ok(()),
+      (true, _) => Err(DriveRefusal::Unwritable),
+      (false, _) => Err(DriveRefusal::Unreadable),
+    }
+  }
+
+  /// A file's first change: its write checked once (`checked_write`, `commit.c` 573-579 and 659-665).
+  fn check_written(&mut self, token: &[u8], path: &str) -> Result<(), DriveRefusal> {
+    if matches!(self.tokens.get(token), Some(Baton::File(File { checked: true, .. }))) {
+      return Ok(());
+    }
+    self.check_authz(path, true, false)?;
+    if let Some(Baton::File(file)) = self.tokens.get_mut(token) {
+      file.checked = true;
+    }
+    Ok(())
   }
 
   /// A path's locks met as FSFS meets them at a call (`svn_fs_fs__allow_locked_operation`): at or beneath it when
@@ -1880,7 +2122,153 @@ fn read_windows(delta: &mut Delta, source: &[u8]) -> Result<(), DriveRefusal> {
   Ok(())
 }
 
-/// Writes a failure with its code and words.
+/// `svn_repos__validate_new_path` (`repos.c` 2097; `path.c` `svn_path_check_valid`): an added path holds no control
+/// character.
+fn validate_new_path(path: &[u8]) -> Result<(), DriveRefusal> {
+  match path.iter().find(|byte| byte.is_ascii_control()) {
+    Some(&byte) => Err(DriveRefusal::ControlCharacter {
+      byte,
+      path: path.to_vec(),
+    }),
+    None => Ok(()),
+  }
+}
+
+/// A path as `svn_path_illegal_path_escape` writes it in a message: each control character as `\` and three octal
+/// digits (`path.c`).
+fn escaped(path: &[u8]) -> String {
+  let mut out = Vec::with_capacity(path.len());
+  for &byte in path {
+    if byte.is_ascii_control() {
+      out.extend_from_slice(format!("\\{byte:03o}").as_bytes());
+    } else {
+      out.push(byte);
+    }
+  }
+  String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `svn_repos_fs_change_node_prop`'s checks before FSFS's (`fs-wrap.c` 327-338): `svn:mergeinfo` verified, then
+/// `svn_repos__validate_prop` (202-263). A deletion is never refused.
+fn validate_property(path: &str, name: &[u8], value: Option<&[u8]>) -> Result<(), DriveRefusal> {
+  let Some(value) = value else {
+    return Ok(());
+  };
+  if name == MERGEINFO {
+    verify_mergeinfo(path, value)?;
+  }
+  let named = || String::from_utf8_lossy(name).into_owned();
+  if name.starts_with(WC_PREFIX) || name.starts_with(ENTRY_PREFIX) {
+    return Err(DriveRefusal::NotRegular { name: named() });
+  }
+  if !name.starts_with(SVN_PREFIX) {
+    return Ok(());
+  }
+  if std::str::from_utf8(value).is_err() {
+    return Err(DriveRefusal::NotUtf8 { name: named() });
+  }
+  let c_string = value.split(|byte| *byte == NUL).next().unwrap_or_default();
+  if c_string.contains(&CARRIAGE_RETURN) {
+    return Err(DriveRefusal::NonLf { name: named() });
+  }
+  if name == REVISION_DATE && !is_date(c_string) {
+    return Err(DriveRefusal::BadDate);
+  }
+  Ok(())
+}
+
+/// `verify_mergeinfo` (`fs-wrap.c` 297-324): no NUL, then A-605's parser.
+fn verify_mergeinfo(path: &str, value: &[u8]) -> Result<(), DriveRefusal> {
+  if value.contains(&NUL) {
+    return Err(DriveRefusal::MergeinfoTerminator {
+      path: path.to_owned(),
+    });
+  }
+  Mergeinfo::parse(value)
+    .map(|_| ())
+    .map_err(|refusal| DriveRefusal::MergeinfoInvalid {
+      path: path.to_owned(),
+      refusal,
+    })
+}
+
+/// Whether `text` reads as a date the way `svn_time_from_cstring` reads one (`time.c`): `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`,
+/// each number `svn__strtoul`'s digits, then APR's check (`apr_time_exp_gmt_get`): a month from 1 to 12, and a time
+/// not before 1970. The format `svn` stopped writing in 2002 is refused (module documentation).
+fn is_date(text: &[u8]) -> bool {
+  let mut fields = [0_i64; DATE_FIELDS];
+  let mut rest = text;
+  for (field, separator) in fields.iter_mut().zip(DATE_SEPARATORS) {
+    let (value, after) = strtoul(rest);
+    let Some((&next, after)) = after.split_first() else {
+      return false;
+    };
+    if next != separator {
+      return false;
+    }
+    *field = value;
+    rest = after;
+  }
+  let [year, month, day, hour, minute, second, _] = fields;
+  epoch_seconds([year, month, day], [hour, minute, second]).is_some_and(|seconds| seconds >= 0)
+}
+
+/// `svn__strtoul`'s leading decimal digits, wrapping as C's unsigned long does, then cast to `apr_int32_t` as `time.c`
+/// casts them.
+fn strtoul(text: &[u8]) -> (i64, &[u8]) {
+  let digits = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
+  let (number, rest) = text.split_at_checked(digits).unwrap_or((text, &[]));
+  let value = number.iter().fold(0_u64, |value, digit| {
+    value
+      .wrapping_mul(DECIMAL)
+      .wrapping_add(u64::from(digit.wrapping_sub(b'0')))
+  });
+  let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
+  (i64::from(i32::from_ne_bytes(low.to_ne_bytes())), rest)
+}
+
+/// The seconds since 1970 `apr_time_exp_get` computes for a date, or `None` for a month outside the year.
+fn epoch_seconds([year, month, day]: [i64; 3], [hour, minute, second]: [i64; 3]) -> Option<i64> {
+  let month = month.checked_sub(1)?;
+  let offset = *DAY_OFFSET.get(usize::try_from(month).ok()?)?;
+  let mut year = year.checked_sub(TM_YEAR_BASE)?;
+  if month < 2 {
+    year = year.checked_sub(1)?;
+  }
+  let centuries = year.checked_div(CENTURY)?;
+  let days = year
+    .checked_mul(DAYS_PER_YEAR)?
+    .checked_add(year.checked_div(LEAP_EVERY)?)?
+    .checked_sub(centuries)?
+    .checked_add(centuries.checked_add(CENTURY_LEAP_OFFSET)?.checked_div(LEAP_EVERY)?)?
+    .checked_add(offset)?
+    .checked_add(day)?
+    .checked_sub(1)?
+    .checked_sub(EPOCH_DAYS)?;
+  days
+    .checked_mul(HOURS_PER_DAY)?
+    .checked_add(hour)?
+    .checked_mul(SIXTY)?
+    .checked_add(minute)?
+    .checked_mul(SIXTY)?
+    .checked_add(second)
+}
+
+/// Writes a failure with every error of its chain, outermost first, each with a release build's empty file and zero
+/// line.
+fn write_failure_errors(errors: &[(u32, String)], out: &mut Vec<u8>) -> Result<(), ItemError> {
+  let items = errors.iter().map(|(code, message)| {
+    Value::List(vec![
+      Value::Number(u64::from(*code)),
+      Value::String(message.as_bytes()),
+      Value::String(b""),
+      Value::Number(0),
+    ])
+  });
+  write(&Value::List(vec![Value::Word(FAILURE), Value::List(items.collect())]), out)
+}
+
+/// Writes a failure of one error.
 fn write_failure_words(code: u32, message: &str, out: &mut Vec<u8>) -> Result<(), ItemError> {
   let error = Value::List(vec![
     Value::Number(u64::from(code)),
