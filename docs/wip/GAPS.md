@@ -277,6 +277,14 @@
 > 111; as it landed over main 71a43cd97, `--lib vcs_ssh` 19 of 19, macOS arm64, Mac Studio). Owed: the daemon
 > starting the edge, the credentials record, the stores and entry points, four of five red-checks (main's runs under
 > §8), and main's live OpenSSH `git clone` over SSH.
+> **A-651 part 2 (2026-11-19, g294; git's upload-pack behind the SSH edge):** `vcs_ssh::git` drives A-640's entry
+> point over an SSH session, the store lent a step at a time by the HTTP edge's `StoreLender`: each request measured
+> whole, a flush ending the session 0, a refused request and the end of input inside a request ending it with git's
+> `die` status 128 (an end before a request's first packet is whole ends it 0, as git's reader does); a v0 or v1 session
+> refused with an `ERR` line naming v2, since slates-git answers v0 statelessly alone while a v0 client over SSH
+> negotiates in rounds (`--lib vcs_ssh`: red 23 of 25 at 8dfd557f, green 25 of 25 at caa2fc0f, macOS arm64, Mac
+> Studio). Owed: the `StoreLender` over A-662's map (A-662's), without which no store is lent and the edge's services
+> stay `NotYet`; the stateful v0 session over SSH; main's live `git clone` over SSH.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence

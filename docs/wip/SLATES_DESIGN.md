@@ -12535,6 +12535,15 @@ engine: the verdict, rebase, position mapping, the register).
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
+> **Status (2026-11-19, A-651 part 2: git's upload-pack behind the SSH edge).** `crates/server`'s `vcs_ssh::git` runs
+> A-640's one entry point over an SSH session's standard input and output, the store lent a step at a time by the HTTP
+> edge's `StoreLender` (A-625 part 3): the advertisement first, each request measured whole by `whole_len`, consumed and
+> answered a pkt-line's room a step, a flush alone ending the session 0 and a refused request ending it with git's `die`
+> status, 128. The end of the client's input ends the session 0 before a request's first packet is whole and dies 128
+> after it, as git's reader does. A session at protocol v0 or v1 is refused with an `ERR` line naming v2, since
+> slates-git answers those protocols statelessly and a v0 client over SSH negotiates in rounds. `ToolServices` starts it
+> only over a store the lender holds, and none does until the lender over A-662's map lands, so it runs in tests alone.
+>
 > **Status (2026-11-19, A-651: piece 9's edge built).** `crates/server`'s `vcs_ssh` serves SSH on the runtime's TCP,
 > the HTTP edge's counterpart: one connection a task under seats derived from the shard's clients, each driving
 > `slates-ssh`'s session. A key proves a principal only through the site's lookup, today `NoKeyRecord`, which refuses
@@ -48582,3 +48591,52 @@ the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the se
   crates. No integration test reaches the adapter: nothing calls it outside its own tests until the daemon's import
   (owed). Main's (§8): the red run against a stub (`len` and `read` finding no file; all 11 must fail) and a mutation
   of each guard.
+
+### A-651 part 2 — git's upload-pack behind the SSH edge: A-640's entry point over an SSH session, the store lent a step at a time, git's server's exit status at each end, and protocols v0 and v1 refused over SSH (2026-11-19, g294, UI goal 93; §4.17.2 "A fetch", "Transports" item 2 and "Pieces (git)" piece 9; after A-651 part 1, A-640 parts 2 and 3, A-625 part 3 and A-662)
+Applied in the same change to:
+- §4.17.2's status; GAPS (the §4.17 entry, after A-651's line); `research/vcs-servers.md` §5.10 (git's reader at the
+  end of its input, pinned by hash);
+- `crates/server` (new: `vcs_ssh::git`, `UploadCommand`, and its tests; `vcs_ssh::site` gains `ToolServices`, which
+  starts it, and says what each service waits for).
+- **The session** (`UploadCommand`). Over SSH upload-pack speaks first: the advertisement is written as the command
+  starts. Each request is then measured whole by `slates_git::v2::request::whole_len` as the client's bytes arrive
+  (A-640 part 2: "or what `request::whole_len` measured of an SSH session's input"), consumed (its bytes given back to
+  the channel's window), served within the edge's room, and answered one whole pkt-line's room a step
+  (`pktline::MAX_LEN`), the edge stepping again only once that step's bytes have gone to the channel. A flush alone ends
+  the session 0. A request upload-pack refuses is answered in git's words (`ERR`, or band 3 under `sideband-all`) and
+  ends the session with `die`'s status, 128, as git's own server dies on one (`serve.c`: "unknown capability") [C].
+- **The end of the client's input** (g294's finding, reading git at `e1ec09b2`) [C]. git's server is gentle on it
+  only until a request's first packet is whole: `serve.c`'s `process_request` peeks that packet under
+  `PACKET_READ_GENTLE_ON_EOF` and returns quietly on the end (lines 286, 295, 302), then clears the flag (304), and
+  `pkt-line.c`'s `get_packet_data` dies "the remote end hung up unexpectedly" at a later short read (339, 371). So the
+  edge ends the session 0 when the input ends before a first packet is whole, and with 128 in those words after it.
+  git judges each line as it reads it, so a request ending after a line git refuses dies in that refusal's words
+  instead, such as "no command requested" (`serve.c` 350); the status is the same.
+- **Protocols v0 and v1** (found merging main, where A-640 part 3 had made slates-git answer them). slates-git answers
+  them statelessly, a whole request at a time as smart HTTP sends one (`upload/v0.rs`: "Stateless only"), while a v0
+  client over SSH negotiates in rounds on one stream, sending its wants once and its haves round by round, so a
+  stateless answer to its second round would have lost its wants. The edge therefore refuses a session at v0 or v1 at
+  its start, before any advertisement: one `ERR` packet, "upload-pack serves protocol v2 alone over SSH: ask for it
+  with git -c protocol.version=2", which git's client shows as a remote error, then `die`'s 128. git's client asks for
+  v2 over SSH by default (slates-git's `upload` module doc: since git 2.26), through `GIT_PROTOCOL`, the session
+  channel's one `env`. The stateful v0 session is owed (slates-git's GAPS line).
+- **The services** (`ToolServices`). upload-pack starts only over a store the lender holds. receive-pack (A-654),
+  Mercurial's `serve --stdio` (a lender of its store) and Subversion's tunnel (A-656) stay not served. A-662 holds each
+  repository's store on its owner shard, but the `StoreLender` over that map is on A-662's owed list, so no lender
+  holds a store yet, and the edge's production services remain `NotYet`.
+- **Tests** (`cargo test --locked -p slates-server --lib vcs_ssh`, macOS arm64, Mac Studio d1323898, debug,
+  2026-11-19). The six of `vcs_ssh::git::tests` step the command as the edge does, over an empty SHA-1 repository's
+  store lent by a test lender: a v2 session advertised, answered and ended at a flush; a refused request answered in
+  git's words with 128; a v0 and a v1 session each refused with one `ERR` packet naming v2; the end of input before a
+  whole first packet ending the session 0, and inside a request dying 128 in git's words; upload-pack started only
+  over a held store.
+  - Red over main 77e5ffb46 at 8dfd557f (part 2 through its failing test 335dba43): 23 of 25. The end of input inside
+    a request ended the session 0 where git dies 128, and a v0 session was given slates-git's v0 advertisement where
+    the edge must refuse it.
+  - Green at caa2fc0f (the fix b22dd97c, and the v0 and v1 refusal): 25 of 25, no warning; `cargo fmt -p
+    slates-server -- --check` clean. Part 2's first red and green (8cf81d67, 15cc6b6a) were never built alone; their
+    code is in both runs.
+  - The test pack source refuses past admission, as the HTTP edge's tests' does since A-640 part 3 removed the stall.
+- **Owed.** The `StoreLender` over A-662's map, which makes upload-pack reachable; the daemon starting the SSH edge; the
+  stateful protocol v0 session over SSH (slates-git's); receive-pack (A-654), a lender of Mercurial's store, and
+  Subversion's tunnel (A-656); main's live OpenSSH `git clone` over SSH once a lender holds a store.

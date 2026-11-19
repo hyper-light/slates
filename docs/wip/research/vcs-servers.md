@@ -420,6 +420,7 @@ made at a commit pushed first to a branch nothing protects; it is not followed.
 |---|---|---|
 | OpenSSH `sshconnect2.c`, `sshconnect.c`, `channels.h` | openssh-portable `master` at `fa4b2a82be7df9768272cfabc2d78e4a12c2b3c0` | 1caf45cb23fd452e, b5b0ec1052da2c26, ffbc133ac4c1a4c1 |
 | git `usage.c`, `builtin/upload-pack.c` | git `master` at `e1ec09b23c8e0deb21a0b95ac5996422277395d4` | 114f74835706dd86, ff09e4385553b959 |
+| git `serve.c`, `pkt-line.c` (A-651 part 2) | git `master` at `e1ec09b23c8e0deb21a0b95ac5996422277395d4` | 834f019139daadf5, 708420106f01ee9d |
 | Mercurial `mercurial/dispatch.py`, `mercurial/scmutil.py`, `mercurial/localrepo.py` | 7.2's PyPI source distribution, SHA-256 `a250227e…` (as §5.7) | 7f057268680b0b53, cea9db559e8c7dee, 4fa160a96510dad8 |
 | Subversion `subversion/svnserve/svnserve.c` | `1.14.x` at `d434dc14866e0c48602dba59a15443255d0b8c1e` | 43155c2bd557492f |
 
@@ -433,6 +434,11 @@ What it rests on (quoted):
 - **git's refusals** [C: git]: `die_builtin` reports with the prefix "fatal: " (`usage.c` 74) and `exit(128)` (87);
   upload-pack's `die("'%s' does not appear to be a git repository", dir)` when it cannot enter the repository
   (`builtin/upload-pack.c` 62).
+- **git's reader at the end of its input** [C: git] (A-651 part 2): `process_request` initializes its reader with
+  `PACKET_READ_GENTLE_ON_EOF` (`serve.c` 286, 295) and returns quietly when the peek of a request's first packet meets
+  the end (302), then clears the flag (304); a later short read reaches `get_packet_data`'s `die(_("the remote end
+  hung up unexpectedly"))` (`pkt-line.c` 339, 371), so exit 128. A request with no command dies "no command
+  requested" (`serve.c` 350).
 - **Mercurial's** [C: Mercurial 7.2]: `RepoError(_(b'repository %s not found') % path)` (`localrepo.py` 574),
   printed "abort: %s" by `callcatch`, whose coarse exit code is -1 (`scmutil.py` 198, 231-234, 311), and
   `sys.exit(status & 255)` (`dispatch.py` 106): 255.
@@ -441,7 +447,9 @@ What it rests on (quoted):
 
 What follows for slates (A-651): the SSH edge reaps a stalled connection only when a new one needs its seat, since the
 waits above belong to people and to a push's compression; and a command the edge cannot run is refused as its tool's
-own program refuses, in its words and with its status, after the `exec` itself is accepted.
+own program refuses, in its words and with its status, after the `exec` itself is accepted; and upload-pack's
+session ends 0 when its client's input ends before a request's first packet is whole, and dies 128 after it (A-651
+part 2).
 
 ## 6. Policy by name pattern and the hooks' protocol (§4.17.1 shared piece 7, A-597)
 
