@@ -368,10 +368,10 @@ fn send(
   (String::from_utf8_lossy(&out).into_owned(), turn)
 }
 
-/// A-656 (`serve.c` `reparent`): reparent an established session to `/tags`, then check `''` there;
-/// reparent it outside the repository; send a `reparent` whose URL is no string; expect a trivial
-/// auth request and a success, `/tags` a directory, then a trivial auth request and 170000 "'…' is
-/// not the same repository as '…'", then the connection's end.
+/// A-656 (`serve.c` `reparent`): reparent an established session from `/trunk` to `/tags`, then
+/// check `a.txt` there; reparent it outside the repository; send a `reparent` whose URL is no
+/// string; expect a trivial auth request and a success, no `a.txt` beneath `/tags`, then a trivial
+/// auth request and 170000 "'…' is not the same repository as '…'", then the connection's end.
 #[test]
 fn reparent_moves_the_session_within_its_repository() {
   let fixture = fixture();
@@ -380,8 +380,8 @@ fn reparent_moves_the_session_within_its_repository() {
   let (out, turn) = send(&fixture, &guards, &mut connection, b"( reparent ( 25:svn://127.0.0.1/repo/tags ) ) ");
   assert_eq!(out, "( success ( ( ) 0: ) ) ( success ( ) ) ");
   assert!(turn.unwrap().starts_with("Took"));
-  let (out, _) = send(&fixture, &guards, &mut connection, b"( check-path ( 0: ( 1 ) ) ) ");
-  assert!(out.ends_with("( success ( dir ) ) "), "{out}");
+  let (out, _) = send(&fixture, &guards, &mut connection, b"( check-path ( 5:a.txt ( 6 ) ) ) ");
+  assert!(out.ends_with("( success ( none ) ) "), "{out}");
   let (out, _) = send(&fixture, &guards, &mut connection, b"( reparent ( 23:svn://example.org/other ) ) ");
   let message = "'svn://example.org/other' is not the same repository as 'svn://127.0.0.1/repo'";
   let failure = format!("( failure ( ( 170000 {}:{message} 0: 0 ) ) ) ", message.len());
