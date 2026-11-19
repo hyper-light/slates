@@ -39,6 +39,7 @@ use slates_db::catalog::{
 use slates_db::op::Op;
 use slates_ipc::protocol::Refusal;
 use slates_merge::engine::{ConflictWindow, Increment, Judged, Judgment};
+use slates_vfs::clock::Clock;
 
 use crate::error::refusal_of_db;
 use crate::state::ShardState;
@@ -815,7 +816,7 @@ fn recorded_entry(
 /// with what the log holds (`verbs::reconcile_unpublished_effects`). Each op was judged whole beforehand
 /// (`Partition::check_creating`), so none is refused here; one that is, is counted.
 fn record_all(state: &mut ShardState, ops: &[Op]) -> Result<(), PushRefused> {
-  let now = slates_vfs::clock::Clock::monotonic_ns(&state.clock);
+  let now = state.clock.monotonic_ns();
   let own = !state.db.in_transaction();
   if own {
     state.db.begin();
