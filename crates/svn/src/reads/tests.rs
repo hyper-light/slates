@@ -1160,7 +1160,7 @@ fn a_log_streams_a_revision_a_step() {
   let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
   assert_eq!(narrow, wide);
   assert!(narrow_slices > 12 && wide_slices == 1, "{narrow_slices}");
-  let command = b"( log ( ( 9:tags/t1 5:trunk ) ( 11 ) ( 0 ) true false 0 true all-revprops ( ) ) ) ";
+  let command = b"( log ( ( 7:tags/t1 5:trunk ) ( 11 ) ( 0 ) true false 0 true all-revprops ( ) ) ) ";
   let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
   let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
   assert_eq!(narrow, wide);
