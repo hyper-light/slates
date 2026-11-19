@@ -46363,8 +46363,8 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
     the store (`OverBudget`), typed, with nothing changed, and answered `BudgetExceeded` with the room the budget had.
     No figure is a constant (R3).
   - **Durability.** A git push's one entry (A-635's append) holds its record (`vcs_store::record`): the deepest delta
-    chain its pack carried (the store's learned depth reads it), its moves by each green's key in the store and the
-    commit its new head names, and every object its quarantine sealed that the repository lacked, in admission order,
+    chain its pack carried (the store's learned depth reads it), its moves by each green's key in the store, the version
+    the entry leaves the green at and the commit its new head names, and every object its quarantine sealed that the repository lacked, in admission order,
     by content identity (`ContentStore::object_id`) with its bytes. Objects the repository holds already are passed over
     at admission, since the store reads an indexed object from its index before any push, so the record holds each
     object's bytes once. `RepositoryEntry::objects` carries it opaquely; the partition's register keeps each entry's
@@ -46374,9 +46374,11 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
   - **Guard then apply.** The store commits between the register's guard (`Partition::check_creating`, which charged
     the record) and the entry's apply, inside the append (`repository::push::push_sealed`), so a push a rule, a verdict
     or the guard refuses never reaches the store; a store that refuses (its budget) refuses the entry with nothing
-    applied. The caller keeps the sealed push across appends: a push without `atomic` appends each ref on its own, a
-    refused ref leaves the push whole for the next (`SealedPush::reseal`), and the first commit takes every object, so
-    later records hold their moves alone. After the store committed, a
+    applied. The caller keeps the sealed push across appends: a push without `atomic` appends each ref on its own, each
+    append admitting its own moves (`SealedPush::admit`), a refused ref leaves the push whole for the next, and the
+    first commit takes every object, so later records hold their moves alone. A move names a green of the repository
+    or, for a new branch, the branch's name (`vcs_store::Target`), resolved inside the append once `make` has made the
+    branch's green, so its key exists only once the green does. After the store committed, a
     verdict's commit or the record not made durable leaves the store ahead of the log, so the store is made again from
     the log (`vcs_store::rebuild`), the recovery's own replay. A recovery (`verbs::rebuild_recovered`, after the
     members) makes every store again and replays each record, in log order, a record a unit of the recovery's slices,
@@ -46384,8 +46386,11 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
     the record the admission makes compared with the one the log holds (a recomputation that differs is refused, as
     §4.16 refuses one), the seal, the moves, the commit and the derived values kept. A store not made again is given
     back and named unrecovered with why.
-  - **Keys.** A-614's store names a green by a `u64`: the half of its volume id holding its partition and counter, which
-    `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green as before.
+  - **Keys and versions.** A-614's store names a green by a `u64`: the half of its volume id holding its partition and
+    counter, which `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green
+    as before. The store's versions of a green are its own (a version a push made), so the entry keeps, for each, the
+    green's version, which a later push's old value is read back to (`GitStore::version_of`, newest first) and a
+    recovery replays from the records.
   - **Not recorded, derived.** Positions, rows, D(k), reached sets, derived values and pack fragments. A fragment's
     encoding follows measured times (A-614 part 2's learned window and level), so a recovery leaves fragments to the
     same off-path step that encodes a live version's (A-654), and the oracle compares everything else.

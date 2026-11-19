@@ -287,21 +287,29 @@ pub(crate) fn push(
   push_holding(state, (principal, repository), changes, parts, None)
 }
 
+/// One move of a git push's store (A-662): the green it names, a new branch's by its name, and its new head, none to
+/// delete it.
+pub(crate) type StoreMove = (crate::vcs_store::Target, Option<slates_git::object_name::ObjectId>);
+
 /// [`push`] of a git push whose objects `sealed` holds (A-662): the entry holds their record, and the repository's store
-/// commits them, with the moves `sealed` admitted, between the register's guard and the entry's apply. Appended, the
-/// store holds the objects; refused, `sealed` is as it was, for the push's next ref or to be given back.
+/// commits them with `moves` between the register's guard and the entry's apply, each move resolved once the new
+/// branches are made: its green's key, and the version the entry leaves the green at. Appended, the store holds the
+/// objects; refused, `sealed` is as it was, for the push's next ref or to be given back.
 pub(crate) fn push_sealed(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   changes: Vec<BranchChange>,
   parts: EntryParts,
-  sealed: &mut crate::vcs_store::SealedPush,
+  (sealed, moves): (&mut crate::vcs_store::SealedPush, &[StoreMove]),
 ) -> Result<Appended, AppendRefused> {
   if sealed.repository() != repository {
     return Err(AppendRefused::Repository(Refusal::NotFound));
   }
-  push_holding(state, (principal, repository), changes, parts, Some(sealed))
+  push_holding(state, (principal, repository), changes, parts, Some((sealed, moves)))
 }
+
+/// A sealed push and the moves its append commits.
+type Sealed<'p> = (&'p mut crate::vcs_store::SealedPush, &'p [StoreMove]);
 
 /// [`push`] and [`push_sealed`]'s one path, with the sealed push if any.
 fn push_holding(
@@ -309,7 +317,7 @@ fn push_holding(
   (principal, repository): (&Principal, RepositoryId),
   changes: Vec<BranchChange>,
   parts: EntryParts,
-  sealed: Option<&mut crate::vcs_store::SealedPush>,
+  sealed: Option<Sealed<'_>>,
 ) -> Result<Appended, AppendRefused> {
   let record = state
     .db
@@ -522,7 +530,7 @@ fn push_planned(
   record: &RepositoryRecord,
   (steps, parts): (Vec<Step>, EntryParts),
   held: &mut Held,
-  mut sealed: Option<&mut crate::vcs_store::SealedPush>,
+  mut sealed: Option<Sealed<'_>>,
 ) -> Result<Appended, AppendRefused> {
   make(state, &steps, held).map_err(AppendRefused::Changes)?;
   secure(state, &steps, held).map_err(AppendRefused::Changes)?;
@@ -535,7 +543,11 @@ fn push_planned(
     })
     .collect();
   let mut entry = entry(record.id, (&steps, &verdicts), parts);
-  if let Some(sealed) = sealed.as_deref() {
+  if let Some((sealed, moves)) = sealed.as_mut() {
+    let resolved = resolve(state, (&steps, &entry), moves)?;
+    if let Err(refused) = sealed.admit(&mut state.vcs_stores, resolved) {
+      return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)));
+    }
     entry.objects = sealed.record();
   }
   let changes_anything = !(entry.joined.is_empty()
@@ -549,8 +561,8 @@ fn push_planned(
     return Ok(answer(&steps, &verdicts));
   }
   // The store commits the push's objects between the guard and the apply (A-662), so a refusal here applies nothing.
-  let store_committed = match sealed.as_deref_mut() {
-    Some(sealed) => {
+  let store_committed = match sealed {
+    Some((sealed, _)) => {
       if let Err(refused) = crate::vcs_store::commit(state, sealed) {
         return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)));
       }
@@ -564,6 +576,40 @@ fn push_planned(
     crate::vcs_store::rebuild(state, record.id);
   }
   applied
+}
+
+/// Each of a git push's store moves resolved (A-662): a green of the repository keyed by its id, a new branch's by the
+/// green its step made, each with the version the entry leaves its green at (its entry's version, a new green's 0
+/// when no work moves it, a deleted branch's head). A move naming no green of the push is refused `NotFound`.
+fn resolve(
+  state: &ShardState,
+  (steps, entry): (&[Step], &RepositoryEntry),
+  moves: &[StoreMove],
+) -> Result<Vec<crate::vcs_store::record::RecordedMove>, AppendRefused> {
+  let version_of = |green: DbVolumeId, otherwise: u64| {
+    entry
+      .versions
+      .iter()
+      .rev()
+      .find(|version| version.green == green)
+      .map_or(otherwise, |version| version.version)
+  };
+  moves
+    .iter()
+    .map(|(target, head)| {
+      let (green, otherwise) = match target {
+        crate::vcs_store::Target::Green(green) => (*green, state.db.partition().green_head(*green)),
+        crate::vcs_store::Target::Created(name) => steps
+          .iter()
+          .find_map(|step| match step {
+            Step::Create { name: made, record, .. } if made == name => Some((record.id, 0)),
+            _ => None,
+          })
+          .ok_or(AppendRefused::Entry(Refusal::NotFound))?,
+      };
+      Ok((crate::vcs_store::green_key(green), version_of(green, otherwise), *head))
+    })
+    .collect()
 }
 
 /// The push once judged and its store committed: the verdicts committed, then the new greens' records and the entry

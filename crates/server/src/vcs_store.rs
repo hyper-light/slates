@@ -122,6 +122,9 @@ pub(crate) struct GitStore {
   pub(crate) derivations: Derivations,
   /// The reach sets' type, eager: each version's value kept as it commits, from the admission's own walks.
   pub(crate) reach: ReachSets,
+  /// For each green's key, the green's version at each of the store's versions of it, in order: what a push's old
+  /// value is read back to (`version_of`), as each record names it.
+  versions: BTreeMap<u64, Vec<u64>>,
 }
 
 impl GitStore {
@@ -131,8 +134,40 @@ impl GitStore {
       repository: Repository::new(format),
       derivations: Derivations::new(),
       reach: ReachSets::declare(Mode::Eager),
+      versions: BTreeMap::new(),
     }
   }
+
+  /// The green's version, and the tree, of the newest of the store's versions of the green keyed `key` whose head is
+  /// `head`: a push's base (§4.17.1 item 1). It reads the green's versions newest first, each one row.
+  pub(crate) fn version_of(
+    &self,
+    content: &ContentStore,
+    key: u64,
+    head: &ObjectId,
+  ) -> Option<(u64, ObjectId)> {
+    let versions = self.versions.get(&key)?;
+    versions.iter().enumerate().rev().find_map(|(at, version)| {
+      (self.repository.head(content, key, at).as_ref() == Some(head))
+        .then(|| self.repository.tree(content, key, at).map(|tree| (*version, tree)))
+        .flatten()
+    })
+  }
+
+  /// The green's versions at each of the store's versions of the green keyed `key`.
+  pub(crate) fn versions(&self, key: u64) -> &[u64] {
+    self.versions.get(&key).map_or(&[], Vec::as_slice)
+  }
+}
+
+/// Which green a push's move names: one the repository holds, or the one its append makes for a new branch, named by its
+/// branch's name until the append makes it (`repository::push::push_sealed` resolves it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+  /// A green of the repository.
+  Green(DbVolumeId),
+  /// The green the append makes for the branch of this name.
+  Created(String),
 }
 
 /// A Mercurial repository's store: A-588's index and the values derived from it.
@@ -385,19 +420,19 @@ pub(crate) struct GitPush {
   record: RecordWriter,
 }
 
-/// A git push sealed and its moves admitted: what A-635's append commits beside its entry (`repository::push::
-/// push_sealed`, [`commit`]). Its caller keeps it across appends: a push without `atomic` appends each ref on its own
-/// ([`SealedPush::reseal`] admits the next ref's move), and a refused append leaves it whole for the next. The first
-/// commit gives the store every object the push brought, so later records hold its moves alone.
+/// A git push sealed: what A-635's append commits beside its entry, with the moves that append admits
+/// (`repository::push::push_sealed`, [`SealedPush::admit`], [`commit`]). Its caller keeps it across appends: a push
+/// without `atomic` appends each ref on its own, and a refused append leaves it whole for the next. The first commit
+/// gives the store every object the push brought, so later records hold their moves alone.
 #[derive(Debug)]
 pub(crate) struct SealedPush {
   /// The repository.
   repository: RepositoryId,
   /// The objects, in quarantine until a commit takes them.
   push: Push,
-  /// The moves admitted, in the order the store commits them.
+  /// The moves the current append admitted, in the order the store commits them.
   moves: Vec<Move>,
-  /// The same moves as the record names them.
+  /// The same moves as the record names them: key, the green's version, head.
   keyed: Vec<RecordedMove>,
   /// The record's objects, until a commit takes them.
   objects: RecordWriter,
@@ -414,23 +449,16 @@ impl SealedPush {
     self.objects.clone().finish(self.push.deepest(), &self.keyed)
   }
 
-  /// Admits `moves` in place of the ones admitted before, against the store as it is now: the next ref of a push
-  /// without `atomic`, after an earlier ref's commit or refusal. Refused, the push keeps what it holds.
-  pub(crate) fn reseal(
+  /// Admits `moves` (each a green's key, its version once the entry moves it, and its new head) in place of any
+  /// admitted before, against the store as it is now: what one append commits. Refused, the push keeps what it holds.
+  pub(crate) fn admit(
     &mut self,
-    state: &mut ShardState,
-    moves: &[(DbVolumeId, Option<ObjectId>)],
+    stores: &mut VcsStores,
+    moves: Vec<RecordedMove>,
   ) -> Result<(), GitRefused> {
-    let keyed: Vec<RecordedMove> = moves
-      .iter()
-      .map(|(green, head)| (green_key(*green), *head))
-      .collect();
-    let (content, store) = state
-      .vcs_stores
-      .git(self.repository)
-      .ok_or(GitRefused::NoStore)?;
-    self.moves = admit_moves(content, store, &self.push, &keyed)?;
-    self.keyed = keyed;
+    let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
+    self.moves = admit_moves(content, store, &self.push, &moves)?;
+    self.keyed = moves;
     Ok(())
   }
 
@@ -473,27 +501,22 @@ impl GitPush {
     })
   }
 
-  /// Seals the push and admits each ref's move, in order: each a green of the repository and the commit its new head
-  /// names, none to delete it. Refused, the push is abandoned and its holds given back.
-  pub(crate) fn seal(
-    mut self,
-    state: &mut ShardState,
-    moves: &[(DbVolumeId, Option<ObjectId>)],
-  ) -> Result<SealedPush, GitRefused> {
-    let keyed: Vec<RecordedMove> = moves
-      .iter()
-      .map(|(green, head)| (green_key(*green), *head))
-      .collect();
-    let admitted = match state.vcs_stores.git(self.repository) {
-      Some((content, store)) => seal_moves(content, store, &mut self.push, &keyed),
+  /// Seals the push: every commit's generation number, its parents read from the push or the repository (A-614). Each
+  /// append then admits its own moves ([`SealedPush::admit`]). Refused, the push is abandoned and its holds given back.
+  pub(crate) fn seal(mut self, state: &mut ShardState) -> Result<SealedPush, GitRefused> {
+    let sealed = match state.vcs_stores.git(self.repository) {
+      Some((content, store)) => store
+        .repository
+        .seal(content, &mut self.push)
+        .map_err(GitRefused::Store),
       None => Err(GitRefused::NoStore),
     };
-    match admitted {
-      Ok(admitted) => Ok(SealedPush {
+    match sealed {
+      Ok(()) => Ok(SealedPush {
         repository: self.repository,
         push: self.push,
-        moves: admitted,
-        keyed,
+        moves: Vec::new(),
+        keyed: Vec::new(),
         objects: self.record,
       }),
       Err(refused) => {
@@ -585,7 +608,7 @@ fn admit_moves(
 ) -> Result<Vec<Move>, GitRefused> {
   moves
     .iter()
-    .map(|(green, head)| {
+    .map(|(green, _, head)| {
       store
         .repository
         .admit(content, push, *green, *head)
@@ -602,7 +625,7 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   let repository = sealed.repository;
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
-    commit_moves(content, store, &mut sealed.push, &sealed.moves)
+    commit_moves(content, store, &mut sealed.push, (&sealed.moves, &sealed.keyed))
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
@@ -616,12 +639,15 @@ fn commit_moves(
   content: &mut ContentStore,
   store: &mut GitStore,
   push: &mut Push,
-  moves: &[Move],
+  (moves, keyed): (&[Move], &[RecordedMove]),
 ) -> Result<u64, GitRefused> {
   store
     .repository
     .commit(content, push, moves)
     .map_err(GitRefused::Store)?;
+  for (key, version, _) in keyed {
+    store.versions.entry(*key).or_default().push(*version);
+  }
   let mut unkept = 0u64;
   for movement in moves {
     let green = movement.green();
@@ -695,7 +721,7 @@ fn replay_push(
     return Err(ReplayRefused::Diverged);
   }
   let moves = seal_moves(content, store, push, &record.moves).map_err(ReplayRefused::Git)?;
-  commit_moves(content, store, push, &moves).map_err(ReplayRefused::Git)
+  commit_moves(content, store, push, (&moves, &record.moves)).map_err(ReplayRefused::Git)
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.

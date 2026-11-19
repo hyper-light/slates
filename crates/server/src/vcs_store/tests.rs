@@ -16,10 +16,10 @@ use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
 use super::record::{Record, RecordRefused, RecordWriter, RecordedMove, RecordedObject};
 use super::{
-  GitPush, GitRefused, GitStore, ReplayRefused, RepositoryStore, admit_object, commit_moves, green_key,
-  replay_git, replay_into, seal_moves,
+  GitPush, GitRefused, GitStore, ReplayRefused, RepositoryStore, Target, admit_object, commit_moves,
+  green_key, replay_git, replay_into, seal_moves,
 };
-use crate::repository::push::{BranchAppended, BranchChange, EntryParts};
+use crate::repository::push::{BranchAppended, BranchChange, EntryParts, StoreMove};
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
@@ -127,7 +127,7 @@ fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   let identity = ContentId([0x11; 32]);
   let mut writer = RecordWriter::default();
   writer.object(Kind::Blob, identity, b"hi");
-  let moves: Vec<RecordedMove> = vec![(7, None), (9, Some(head))];
+  let moves: Vec<RecordedMove> = vec![(7, 4, None), (9, 5, Some(head))];
   let bytes = writer.finish(3, &moves);
   let mut expected = Vec::new();
   expected.extend_from_slice(b"SGPR");
@@ -135,8 +135,10 @@ fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   expected.extend_from_slice(&3u64.to_le_bytes());
   expected.extend_from_slice(&2u64.to_le_bytes());
   expected.extend_from_slice(&7u64.to_le_bytes());
+  expected.extend_from_slice(&4u64.to_le_bytes());
   expected.push(0);
   expected.extend_from_slice(&9u64.to_le_bytes());
+  expected.extend_from_slice(&5u64.to_le_bytes());
   expected.push(1);
   expected.extend_from_slice(&[0xab; 20]);
   expected.extend_from_slice(&1u64.to_le_bytes());
@@ -170,7 +172,7 @@ fn t_a662_hostile_records_are_refused_by_kind() {
   let head = ObjectId::from_bytes(FORMAT, &[0xcd; 20]).expect("an id");
   let mut writer = RecordWriter::default();
   writer.object(Kind::Commit, ContentId([2; 32]), b"commit");
-  let bytes = writer.finish(0, &[(1, Some(head))]);
+  let bytes = writer.finish(0, &[(1, 1, Some(head))]);
   for cut in 0..bytes.len() {
     let read = Record::decode(bytes.get(..cut).expect("a prefix"), FORMAT);
     assert!(read.is_err(), "a record cut at {cut} was read");
@@ -195,8 +197,8 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
     Record::decode(&version, FORMAT),
     Err(RecordRefused::Version { version: 2 })
   );
-  // Format: the objects' count follows the header (24 bytes), the move's key and marker (9) and its head (20).
-  let objects_at = 24 + 9 + 20;
+  // Format: the objects' count follows the header (24 bytes), the move's key, version and marker (17) and its head (20).
+  let objects_at = 24 + 17 + 20;
   let objects_huge = with(objects_at..objects_at + 8, &u64::MAX.to_le_bytes());
   assert_eq!(Record::decode(&objects_huge, FORMAT), Err(RecordRefused::Count));
 }
@@ -204,13 +206,15 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
 /// The markers, the format, the type and the end of `bytes` made hostile, each refused by its kind.
 fn assert_hostile_marks(bytes: &[u8]) {
   let mut marker = bytes.to_vec();
-  if let Some(byte) = marker.get_mut(32) {
+  // Format: the move's marker follows the header (24 bytes), its key and its version (16).
+  if let Some(byte) = marker.get_mut(24 + 16) {
     *byte = 2;
   }
   assert_eq!(Record::decode(&marker, FORMAT), Err(RecordRefused::Marker));
   assert!(Record::decode(bytes, ObjectFormat::Sha256).is_err());
   let mut delta = bytes.to_vec();
-  if let Some(byte) = delta.get_mut(24 + 9 + 20 + 8) {
+  // Format: the object's type follows the move (24 + 17 + 20) and the objects' count (8).
+  if let Some(byte) = delta.get_mut(24 + 17 + 20 + 8) {
     *byte = 6;
   }
   assert_eq!(Record::decode(&delta, FORMAT), Err(RecordRefused::Malformed));
@@ -229,6 +233,8 @@ struct Live {
   records: Vec<Vec<u8>>,
   /// Each ref's head, by its key.
   heads: BTreeMap<u64, ObjectId>,
+  /// Each ref's green's version, by its key: what its moves name.
+  greens: BTreeMap<u64, u64>,
   /// Every blob a push brought, to send one again.
   blobs: Vec<Brought>,
 }
@@ -240,6 +246,7 @@ impl Live {
       store: GitStore::new(FORMAT),
       records: Vec::new(),
       heads: BTreeMap::new(),
+      greens: BTreeMap::new(),
       blobs: Vec::new(),
     }
   }
@@ -255,7 +262,8 @@ impl Live {
     pushed?;
     given.map_err(|refused| GitRefused::Object(PushRefused::Content(refused)))?;
     self.records.push(record.finish(deepest, moves));
-    for (key, head) in moves {
+    for (key, version, head) in moves {
+      self.greens.insert(*key, *version);
       match head {
         Some(id) => self.heads.insert(*key, *id),
         None => self.heads.remove(key),
@@ -278,7 +286,7 @@ impl Live {
       admit_object(&mut self.content, &self.store, (&mut *push, &mut *record), incoming(brought, depth))?;
     }
     let admitted = seal_moves(&self.content, &self.store, push, moves)?;
-    commit_moves(&mut self.content, &mut self.store, push, &admitted).map(drop)
+    commit_moves(&mut self.content, &mut self.store, push, (&admitted, moves)).map(drop)
   }
 
   /// The store made again from the records alone, as a recovery makes it.
@@ -293,6 +301,7 @@ impl Live {
       store,
       records: self.records.clone(),
       heads: self.heads.clone(),
+      greens: self.greens.clone(),
       blobs: self.blobs.clone(),
     })
   }
@@ -301,13 +310,16 @@ impl Live {
 /// What a test compares of a version: D(k), its head, its root tree and its derived value.
 type VersionFacts = (Option<Positions>, Option<ObjectId>, Option<ObjectId>, Option<ContentId>);
 
+/// What a test compares of a ref: each version's facts, its reached set, and its green's version at each.
+type RefFacts = (Vec<VersionFacts>, Option<Positions>, Vec<u64>);
+
 /// Everything a store holds that a reader can ask (the module docs' "the store after a recovery equals the store
 /// before"): every position's id and row, every ref's versions and reached set, every derived value, and every content
 /// the content store holds with its holders.
 #[derive(Debug, PartialEq, Eq)]
 struct Facts {
   rows: Vec<(ObjectId, Option<ObjectRow>)>,
-  refs: Vec<(Vec<VersionFacts>, Option<Positions>)>,
+  refs: Vec<RefFacts>,
   contents: Vec<(ContentId, u64)>,
   used: u64,
 }
@@ -339,7 +351,11 @@ fn facts(content: &ContentStore, store: &GitStore, greens: &[u64]) -> Facts {
           )
         })
         .collect();
-      (versions, store.repository.reached(*green).cloned())
+      (
+        versions,
+        store.repository.reached(*green).cloned(),
+        store.versions(*green).to_vec(),
+      )
     })
     .collect();
   let mut contents: Vec<(ContentId, u64)> = content
@@ -408,34 +424,42 @@ fn planned(live: &Live, step: &Step, date: u64, census: &mut Census) -> (Vec<Bro
     .collect();
   let mine = live.heads.get(&target).copied();
   let theirs = live.heads.get(&other).copied();
+  let next = |key: u64| live.greens.get(&key).copied().unwrap_or(0) + 1;
+  let kept = |key: u64| live.greens.get(&key).copied().unwrap_or(0);
   let (mut objects, moves) = match (act % 6, mine, theirs) {
     (3, _, Some(theirs)) => {
       census.moved_to_another += 1;
-      (Vec::new(), vec![(target, Some(theirs))])
+      (Vec::new(), vec![(target, next(target), Some(theirs))])
     }
     (4, Some(_), _) => {
       census.deletes += 1;
-      (Vec::new(), vec![(target, None)])
+      (Vec::new(), vec![(target, kept(target), None)])
     }
     (2, _, Some(theirs)) => {
       census.branched += 1;
       let (objects, id) = commit_of(&files, &[theirs], date);
-      (objects, vec![(target, Some(id))])
+      (objects, vec![(target, next(target), Some(id))])
     }
     (1, Some(mine), _) => {
       census.atomic += 1;
       let (objects, id) = commit_of(&files, &[mine], date);
-      (objects, vec![(target, Some(id)), (other, Some(id))])
+      (
+        objects,
+        vec![
+          (target, next(target), Some(id)),
+          (other, next(other), Some(id)),
+        ],
+      )
     }
     (_, Some(mine), _) => {
       census.fast_forwards += 1;
       let (objects, id) = commit_of(&files, &[mine], date);
-      (objects, vec![(target, Some(id))])
+      (objects, vec![(target, next(target), Some(id))])
     }
     _ => {
       census.roots += 1;
       let (objects, id) = commit_of(&files, &[], date);
-      (objects, vec![(target, Some(id))])
+      (objects, vec![(target, next(target), Some(id))])
     }
   };
   if *resend && let Some(held) = live.blobs.first() {
@@ -552,7 +576,7 @@ fn t_a662_a_fixed_history_makes_every_kind_of_push_and_recovers() {
 fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   let mut live = Live::new();
   let (objects, head) = commit_of(&[(b"a".to_vec(), b"bytes".to_vec())], &[], FIRST_DATE);
-  live.push(&objects, &[(0, Some(head))], 0).expect("pushed");
+  live.push(&objects, &[(0, 1, Some(head))], 0).expect("pushed");
   let before = live.facts();
   let record = live.records.first().expect("a record").clone();
   let mut changed = record.clone();
@@ -571,7 +595,7 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   ));
   assert_eq!(store.facts(), before);
   let nobody = ObjectId::from_bytes(FORMAT, &[0x5a; 20]).expect("an id");
-  let missing = RecordWriter::default().finish(0, &[(1, Some(nobody))]);
+  let missing = RecordWriter::default().finish(0, &[(1, 1, Some(nobody))]);
   assert!(matches!(
     replay_git(&mut store.content, &mut store.store, &missing),
     Err(ReplayRefused::Git(GitRefused::Store(_)))
@@ -700,14 +724,13 @@ fn work_of(
     .expect("the work")
 }
 
-/// `work` on `green` appended with `sealed`'s objects through A-635's append.
+/// `changes` appended with `sealed`'s objects and `moves` through A-635's append.
 fn appended(
   state: &mut ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  work: slates_merge::engine::Increment,
-  sealed: &mut super::SealedPush,
+  repository: RepositoryId,
+  changes: Vec<BranchChange>,
+  sealed: (&mut super::SealedPush, &[StoreMove]),
 ) -> Result<crate::repository::push::Appended, crate::repository::push::AppendRefused> {
-  let changes = vec![BranchChange::Update { green, work }];
   crate::repository::push::push_sealed(state, (&owner(), repository), changes, EntryParts::default(), sealed)
 }
 
@@ -722,8 +745,10 @@ fn push_through(
   let push = begun(state, repository, objects);
   let version = state.greens.get(&green).expect("the green's engine").head();
   let built = work_of(state, (&push, green), (version, base), (head, tree_id));
-  let mut sealed = push.seal(state, &[(green, Some(head))]).expect("sealed");
-  let made = appended(state, (repository, green), built, &mut sealed).expect("appended");
+  let mut sealed = push.seal(state).expect("sealed");
+  let changes = vec![BranchChange::Update { green, work: built }];
+  let moves = [(Target::Green(green), Some(head))];
+  let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
   // Committed, the push holds nothing: giving it back gives back nothing.
   sealed.abandon(state);
   match made.changes.first() {
@@ -733,8 +758,8 @@ fn push_through(
 }
 
 /// A-662 (a push without `atomic`: each ref its own append, the push kept whole by its caller). Do: push a first commit;
-/// then admit a second push's objects, seal its move and append it with a work made against the stale version 0, which
-/// the verdict refuses; reseal the same move and append the work made against version 1. Expect: the stale append
+/// then admit a second push's objects, seal it and append it with a work made against the stale version 0, which the
+/// verdict refuses; append it again with the work made against version 1. Expect: the stale append
 /// refused with nothing applied, the store unmoved and the push still holding its objects; the second append accepted
 /// as version 2, its record holding every object the push brought, and the store's ref at the new head.
 #[test]
@@ -751,13 +776,15 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
     let push = begun(state, repository, &second);
     let stale = work_of(state, (&push, root), (0, None), (two, second_tree));
     let fresh = work_of(state, (&push, root), (1, Some(first_tree)), (two, second_tree));
-    let mut sealed = push.seal(state, &[(root, Some(two))]).expect("sealed");
+    let mut sealed = push.seal(state).expect("sealed");
+    let moves = [(Target::Green(root), Some(two))];
     let held = state.vcs_stores.content().map(ContentStore::used);
-    assert!(appended(state, (repository, root), stale, &mut sealed).is_err());
+    let changes = vec![BranchChange::Update { green: root, work: stale }];
+    assert!(appended(state, repository, changes, (&mut sealed, &moves)).is_err());
     assert_eq!(state.vcs_stores.content().map(ContentStore::used), held);
     assert_eq!(state.db.partition().repositories().objects(repository).count(), 1);
-    sealed.reseal(state, &[(root, Some(two))]).expect("resealed");
-    let made = appended(state, (repository, root), fresh, &mut sealed).expect("appended");
+    let changes = vec![BranchChange::Update { green: root, work: fresh }];
+    let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
     assert!(matches!(made.changes.first(), Some(BranchAppended::Moved { version: 2, .. })));
     sealed.abandon(state);
     let records: Vec<Vec<u8>> = state
@@ -823,6 +850,10 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
     );
     assert_recorded_and_charged(state, repository, root, (first.len(), second.len()));
     let greens = [green_key(root)];
+    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
+    assert_eq!(store.version_of(content, greens[0], &one), Some((1, first_tree)));
+    assert_eq!(store.version_of(content, greens[0], &two), Some((2, second_tree)));
+    assert_eq!(store.versions(greens[0]), &[1, 2]);
     let live = {
       let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
       facts(content, store, &greens)
@@ -868,4 +899,50 @@ fn assert_recorded_and_charged(
   let used = state.vcs_stores.content().map_or(0, ContentStore::used);
   assert!(used > 0);
   assert_eq!(state.vcs_stores.charged(), used);
+}
+
+/// A-662 (a new branch's move keyed by the green its append makes). Do: push a first commit to the default branch; then
+/// create `topic` at a commit on it through the append, made at the default branch's version 1, its store move naming
+/// the branch by name. Expect: the branch made as a new green at its version 1; its store keyed by that green, at
+/// version 1 with the new head; the record naming that key.
+#[test]
+fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
+  crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "made", VcsTool::Git);
+    let files = [(b"README".to_vec(), b"one\n".to_vec())];
+    let (first, one) = commit_of(&files, &[], FIRST_DATE);
+    let first_tree = tree_of(&first);
+    push_through(state, (repository, root), &first, (None, one, first_tree));
+    let files = [(b"README".to_vec(), b"topic\n".to_vec())];
+    let (topic, head) = commit_of(&files, &[one], FIRST_DATE + 1);
+    let push = begun(state, repository, &topic);
+    let work = work_of(state, (&push, root), (1, Some(first_tree)), (head, tree_of(&topic)));
+    let mut sealed = push.seal(state).expect("sealed");
+    let changes = vec![BranchChange::Create {
+      name: "topic".to_owned(),
+      from: root,
+      version: 1,
+      work: Some(work),
+    }];
+    let moves = [(Target::Created("topic".to_owned()), Some(head))];
+    let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
+    sealed.abandon(state);
+    let Some(BranchAppended::Created { green, version: 1 }) = made.changes.first().cloned() else {
+      panic!("not created: {made:?}");
+    };
+    let key = green_key(green);
+    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
+    assert_eq!(store.versions(key), &[1]);
+    assert_eq!(store.repository.head(content, key, 0), Some(head));
+    let last = state
+      .db
+      .partition()
+      .repositories()
+      .objects(repository)
+      .last()
+      .map(<[u8]>::to_vec)
+      .expect("a record");
+    let read = Record::decode(&last, FORMAT).expect("a record");
+    assert_eq!(read.moves, vec![(key, 1, Some(head))]);
+  });
 }
