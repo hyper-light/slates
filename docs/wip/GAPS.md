@@ -361,11 +361,12 @@
 > each remaining command's ref name (A-615's rule), then the caller's verdict (`Judge::judge`, moving nothing) and its
 > append (`Judge::append`: one entry on that ref's own log at the position read, A-642; `append_atomic`, every ref or
 > none under `atomic`, stricter than git's code by the capability's own words), and report-status and
-> report-status-v2 with option lines, multiplexed after git's band-2 lines. `Session` runs it over one connection,
-> sans-io. Golden vectors: eleven pushes stock git 2.50.1 made to stock `git receive-pack`
+> report-status-v2 with option lines, multiplexed after git's band-2 lines. `check` and `decide` are its two halves, and
+> `Session` runs them over one connection, sans-io, the push waiting checked between them while the caller admits its
+> objects to the store's quarantine. Golden vectors: eleven pushes stock git 2.50.1 made to stock `git receive-pack`
 > (`fixtures/push/make-push-fixtures.sh`), answered byte for byte, the fsck push's band 2 but for git's prose. `cargo
 > test -p slates-git --lib` on the Mac Studio: part 1's 194 of 194, 287 merged; the continuation's 349 of 349 merged
-> with main, 17 failing first against stubs, red ten ways by mutation. Owed: part 2, `Judge` over the engine (each
+> with main, 17 failing first against stubs, red ten ways by mutation; the split, 377 of 377, red four ways. Owed: part 2, `Judge` over the engine (each
 > ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable versions, A-645; several
 > together under `atomic`, A-635; appended per A-642 through a trait until g261's append lands); then review requests
 > over `refs/for/`, signed pushes, `.have` lines, the warnings git's strict check writes on band 2, and A-590's blob
@@ -417,10 +418,11 @@
 > (piece 7); `object-info`'s `type`, which git's master adds, when a release ships it.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
-> (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588), its revlog reader (A-611), its index's tables (A-588 part 2) and a store's names (A-630 part 1); piece
-> 4's read-serving logic, part 1 (A-619); piece 5's first part, a push's bundle read, its race checks and its reply
-> (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g079 for A-598 and A-619, g301 for A-641).**
+> (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
+> objects and nodes (A-588), its revlog reader (A-611), its index's tables (A-588 part 2), a store's names (A-630 part
+> 1) and an existing store's import with its file index (A-630 parts 2 and 3); piece 4's read-serving logic, part 1
+> (A-619); piece 5's first part, a push's bundle read, its race checks and its reply (A-641 part 1) (2026-11-19; UI
+> goals 91 to 93; owners g291, g300 for A-630 parts 2 and 3, g079 for A-598 and A-619, g301 for A-641).**
 > Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -499,20 +501,35 @@
 > (`crates/hg/fixtures/push/make-push-fixtures.sh`: three races made by sending a recorded session again after another
 > client moved a head, a bookmark or a phase; a new head refused by 7.2's own `reject_new_heads`; an unknown part and
 > parameter), every reply byte for byte, and a naive oracle of the four checks over generated histories; red six ways.
-> **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH version 1 request a step as 7.2's
-> `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery, `listkeys`, `getbundle` with its
-> `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a stub), the three captured sessions
-> served whole. Owed, in order, after §4.17.1's seven pieces: (3, rest) the import into the index, version 2's file
-> index, and censored, ellipsis and externally stored revisions; (4, rest) read serving: `obsolete`'s `listkeys` dump,
-> the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full texts, the `0.2`
-> answers compressed by A-598's engines at the learned level, and the index's kept heads in place of the walks over the
-> whole view; (5, rest) pushes: the changegroup verified and its changesets classified into works (lines, bookmarks),
-> each through A-618's builder over the flat manifests' paths; the landing, each moved green appended at the position
-> the push read and the greens the checks read compared there (A-642), phases and bookmarks in the same landing, through
-> a trait until g261's rebuilt entry and A-635's verdict over several works land; the policy (`vcs_policy::admit`) and
-> the hooks at their points; the pushkey namespaces' compare and swap; a compressed bundle inflated in slices within the
-> shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission), and the bundle read
-> in slices too (part 1 holds it whole);
+> **Built (A-630 parts 2 and 3):** an existing store imported into a new index through a read-only seam
+> (`import::RepositoryFiles`, one whole file under `.hg` a call by its path's names): every requirement 7.2 knows read,
+> beside the point or refused by kind, the store's shape as 7.2's `makestore` chooses it (the plain encoding among
+> them), the fncache's revlogs or version 1 of the file index (`file_index`), each revlog by its own header (version 1,
+> or behind a docket), appended in 7.2's order, each log whole or refused, each text held to its node; 7.2's cheap
+> `verify` checks across the logs; censored, ellipsis, externally stored and unknown flags refused by kind; a refused
+> import releasing its index and every hold. Proven by `cargo test --locked -p slates-hg --lib`, 224 of 224 on the Mac
+> Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against one
+> history stock 7.2 stored five ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's
+> `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
+> import, with later pieces: the phase roots, bookmarks and markers beside the logs (pieces 5 and 7; until then an
+> import holds every changeset, secret ones too, and must not be served); the import sliced under the shard's step
+> budget and resumed after a host's pending read, rather than run again; revlogs read by ranges rather than whole; a
+> text rebuilt from the one before it where its chain passes through it (7.2's revision cache), rather than from its
+> chain's base; a manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from §4.15's
+> host seam to `RepositoryFiles` (one name at a time; a store name that is not UTF-8, which only the plain encoding
+> leaves, refused by kind there). **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH version 1
+> request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
+> `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
+> stub), the three captured sessions served whole. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving:
+> `obsolete`'s `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in
+> place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads
+> in place of the walks over the whole view; (5, rest) pushes: the changegroup verified and its changesets classified
+> into works (lines, bookmarks), each through A-618's builder over the flat manifests' paths; the landing, each moved
+> green appended at the position the push read and the greens the checks read compared there (A-642), phases and
+> bookmarks in the same landing, through a trait until g261's rebuilt entry and A-635's verdict over several works land;
+> the policy (`vcs_policy::admit`) and the hooks at their points; the pushkey namespaces' compare and swap; a compressed
+> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
+> the admission), and the bundle read in slices too (part 1 holds it whole);
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the

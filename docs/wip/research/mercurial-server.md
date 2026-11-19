@@ -671,7 +671,57 @@ server's directory are the ones its reviewed expected-failure list starts from.
   255 for a refused push, so each replay found the server unmoved and was accepted (`reply:changegroup` 1). The
   stand-in now records only a named capture, and only a recorded push may be refused.
 
-## 21. Found while building piece 4's read serving, part 3: the SSH version 1 session (A-619, 2026-11-19; 7.2's code [C] in the wheel `uv` installs on the Mac Studio, `mercurial==7.2`; the three captured sessions, `fixtures/serve`)
+## 21. Found while building piece 3's import of an existing store and its file index (A-630 parts 2 and 3, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/import`)
+
+- **Which requirements 7.2 knows.** `repo/requirements.py`'s `BASE_SUPPORTED` (23), the `exp-compression-<engine>`
+  names of every engine with a revlog header (`zlib`, `zstd`, and `none`, whose chunks keep a NUL) with
+  `revlog-compression-zstd` (`gather_supported_requirements`), and the shipped extensions' `narrowhg-experimental`,
+  `lfs` and `largefiles`: 30 in all. A requirement it does not know refuses the repository ("repository requires
+  features unknown to this Mercurial"); an empty one, or one not beginning with a letter or a digit, is a corrupt file
+  (`ensurerequirementsrecognized`). `scmutil.readrequires` cuts the file with `splitlines`.
+- **Where a store's requirements are.** With `share-safe` in `.hg/requires` (7.2's default), the store's own are in
+  `store/requires`, which must be there (`readrequires(storevfs, False)`); without it every requirement is in
+  `.hg/requires` and there is no `store/requires`. Measured: the dotencode, hybrid, version 2 and file index
+  repositories' `.hg/requires` hold `share-safe` alone; a repository made with `format.use-share-safe=False` holds all
+  seven of its store's in `.hg/requires` and no `store/requires`, its store byte for byte the share-safe one's.
+- **A file index store is named by dotencode's encoding.** `localrepo.makestore` gives a `fileindex-v1` store
+  `Encoding.DOTENCODE` unless the plain encoding is required, though `dotencode` itself is refused beside
+  `fileindex-v1` (as `fncache` and `treemanifest` are). Measured: the version 1 file index store's data revlogs carry
+  exactly the dotencode store's names (`data/~2eleading.i`, `data/~20space.i`), and the version 2 store's dockets the
+  same with `-<id>.idx`, `.dat` and `.sda` beside them, a long one hashed with its extension kept
+  (`dh/upper_zzz….txt-18857273.idx<sha1>.idx`).
+- **The plain encoding** (`exp-very-fragile-and-unsafe-plain-store-encoding`, 7.2's `_plain_encode`) only gives each
+  directory under `data/` a trailing `_`; with `dotencode` it is refused. Its doctests are this crate's unit vectors; no
+  store of it was made, since on the Studio's case-insensitive volume the fixtures' history (`FOO` removed, then
+  `foo`) would fold two file logs into one file, which is the hazard its name gives.
+- **An absent revlog reads empty.** `revlog._get_data` answers an absent file with `b''`, so a store without a
+  changelog or manifest log is an empty repository (`hg init` writes neither), and a split revlog without its data file
+  reads until a chunk is needed. `verify` then calls a file log a changeset names but that is empty or missing an error
+  ("empty or missing"), a changeset whose manifest the manifest log lacks one too, and a listed log no manifest names
+  an orphan, a warning.
+- **The file index on disk** (`helptext/internals/file-index.txt`, `store_utils/file_index_util.py`): a 60-byte fixed
+  docket (`>12s3I8s8s8s3I`: the marker, three used sizes, three ids, the root's pointer, the unused bytes, flags 7.2
+  zeroes), then a garbage list (`>II` and `>HIIH` entries, a buffer of old files' paths). The list, meta and tree files
+  are `fileindex-list.<id>`, `-meta.` and `-tree.`, opened unencoded at the store's root; an id of eight `0`s names no
+  file. The paths are the meta records from token 1 (`items`); the tree serves `get_token`. 7.2 checks the root only
+  (token 0, an empty label, children when the tree file is not empty) and slices short garbage lists, children and
+  paths without a word. Measured (`hg debug::file-index --docket`): 22 paths, a list of 555 bytes, a meta of 184 (23
+  records with the root's), a tree of 198 with its root at 27 and 27 bytes no node reaches (a tree is appended to,
+  never rewritten in place, until it is vacuumed), no garbage entries.
+- **Deterministic dockets.** `utils/docket.py` makes every new id from the file `HGTEST_UUIDFILE` names when that is
+  set (7.2's own test suite's hook), and `devel.fileindex.garbage-timestamp` fixes a garbage entry's time, so the
+  fixtures' version 2 and file index stores are the same on every run; their ids come from one chain of seeds (the file
+  index store's list file and the version 2 store's changelog index are both `150e1cfc`).
+- **Revision flags.** 7.2 refuses a revision whose flags hold a bit outside `REVISION_FLAGS_KNOWN`, bits 6 to 15
+  (`flagutil.processflagsraw`: "incompatible revision flag"); of the known ones, censored, ellipsis and externally
+  stored change what the text is (`REVIDX_RAWTEXT_CHANGING_FLAGS` and the ellipsis processor), and the rest are
+  information (`hasmeta`, the copies' sidedata, the delta's quality). A file log with `hasmeta` keeps its texts as
+  without it (`filelog.add` sets the flag whenever it writes a block), so a text's block is split from its bytes the
+  same way.
+- **A first run of the import tests, red then green.** Against the stubs, 21 of the 224 lib tests failed, each by its
+  assertion; with the import, 224 of 224 at the first build.
+
+## 22. Found while building piece 4's read serving, part 3: the SSH version 1 session (A-619, 2026-11-19; 7.2's code [C] in the wheel `uv` installs on the Mac Studio, `mercurial==7.2`; the three captured sessions, `fixtures/serve`)
 
 - **`_runsshserver`** reads a command line; an empty one ends the session; a name its table lacks
   (`commandavailable`) is answered with an empty string and no argument read; any other has its arguments read by its
