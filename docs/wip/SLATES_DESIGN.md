@@ -10955,7 +10955,10 @@ same ops document on every platform (its identity is the test). Paths under the 
 excluded subtrees are left out; the filter id is part of the increment identity. The composition
 needs every record since the base: when the journal's retention has dropped any of them, the
 derivation is refused `JournalIncomplete` (naming the sequence it needed and the oldest the journal
-holds), never composed from what is left (`Volume::records_since`; 2026-11-05).
+holds), never composed from what is left (`Volume::records_since`; 2026-11-05). A rename's destination the work edited
+after the rename carries those edits on the move: the verdict maps them through the source's deltas onto the bytes the
+rename moves, an edit meeting one of them an overlap conflict, and the chain entry records them with the copy, so
+replay and a rebase restate them after the `Rename` (A-547).
 
 **Position mapping.** Through the canonical deltas in (base, head], one direction, per path: an
 intervening size-changing operation at position p with delta d shifts the increment's ranges
@@ -36047,3 +36050,26 @@ test).
   profiles for the engines slates has run since it was written (rootless podman, G-mount step 3, and podman's command
   line); and Windows, which binds nothing (G-mount step 4) until a route into Docker Desktop's VM is measured (kiln's
   W9: WSL 2's 9P server over a WinFsp drive, else the network export).
+
+### A-547 — An edit after a rename is merged with the renamed bytes, and the chain entry's copy carries it (2026-11-19, goal 85 via g225; §4.16 "Composition at seal", "Position mapping"; A-202)
+
+- **What was there.** A work that renames `a` over `b` and then writes `b` declares a `Rename` and content ops on `b`
+  in the coordinates of `a`'s bytes at its base. The verdict copied `a`'s head bytes to `b` and skipped `b`'s ops, as
+  "handled with that effect", which never used them: the submit was accepted and the edit lost (GAPS, found by perf
+  2026-11-09). The chain entry's `Copied { dst, from }` had no ops to replay, and replay maps all of an entry's effects
+  before committing any, so a second `Spliced` effect could not carry them.
+- **The rule.** The verdict maps the destination's ops through what changed the source since the work's base
+  (`Green::edits_after_rename`, the same position mapping a path's own edits take) and splices them into the bytes the
+  rename moves; an edit that meets an intervening change to the source is an overlap conflict on the destination. The
+  effect carries them (`ContentSource::Copied(from, ops)`), the chain entry records them (`Applied::Copied`'s `ops`,
+  tag `COPIED_SPLICED`; a rename alone still encodes as `COPIED`, so existing entries read as before), replay splices
+  them into the copy, and a rebase restates them after the `Rename` (`rebased_from`).
+- **Test.** `an_edit_after_a_rename_over_a_file_is_merged_with_the_renamed_bytes` (`crates/merge/src/engine.rs`: the
+  submit keeps `b` = `0123456789XY` with `a` gone, and the version's entry, encoded, decoded and replayed, does too).
+  The server's parked `an_edit_after_a_rename_over_a_file_is_merged_with_it` (`crates/server/tests/green_post_state.rs`)
+  is no longer ignored; it and the merge suites are filed for main.
+- **Owed.** The rebase oracle's generator (`journal_of` in `green_post_state.rs`) still leaves this case out.
+
+Applied in the same change to: §4.16 "Composition at seal", GAPS (the 2026-11-09 entry, fixed), the bug record
+`docs/bugs/2026-11-19-an-edit-after-a-rename-was-accepted-and-lost.md`, `crates/merge/src/{engine,chain_entry}.rs`,
+`crates/server/tests/green_post_state.rs`.

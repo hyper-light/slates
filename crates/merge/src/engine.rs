@@ -906,8 +906,10 @@ enum ContentSource {
   Mapped,
   /// These declared ops over nothing, from the increment's post-state.
   Created(Vec<Op>),
-  /// The bytes another file holds at this version.
-  Copied(String),
+  /// The bytes another file holds at this version, with these ops, in those bytes' coordinates, spliced into them from
+  /// the increment's post-state (A-547: a rename's destination the work edited after the rename; none for a rename
+  /// alone).
+  Copied(String, Vec<Op>),
 }
 
 impl Effect {
@@ -923,9 +925,10 @@ impl Effect {
       Effect::SetContent(path, _, _, ContentSource::Created(declared)) => {
         Applied::Created(path.clone(), declared.clone())
       }
-      Effect::SetContent(path, _, _, ContentSource::Copied(from)) => Applied::Copied {
+      Effect::SetContent(path, _, _, ContentSource::Copied(from, ops)) => Applied::Copied {
         dst: path.clone(),
         from: from.clone(),
+        ops: ops.clone(),
       },
       Effect::RemoveContent(path) => Applied::RemoveContent(path.clone()),
       Effect::MakeDir(path) => Applied::MakeDir(path.clone()),
@@ -2166,11 +2169,15 @@ impl Green {
   }
 
   /// Merges a file rename to `dst` from `from` (source content captured at merge time), collecting
-  /// the destination set and the source removal.
+  /// the destination set and the source removal. `ops` are the work's edits to `dst` after the rename, in the
+  /// coordinates of the source's bytes at the work's base, adding from `post_state`: they are mapped through what changed
+  /// the source since the base and spliced into the bytes it moves (A-547), so an edit after a rename is kept; one that
+  /// meets an intervening change to the source is an overlap conflict, never dropped. Until A-547 the destination took
+  /// the source's bytes alone, and the submit was accepted with the edit lost.
   fn merge_rename(
     &self,
-    dst: &str,
-    base: u64,
+    (dst, ops): (&str, &[Op]),
+    (base, post_state): (u64, &[u8]),
     from: &str,
     effects: &mut Vec<Effect>,
   ) -> Result<(), ConflictWindow> {
@@ -2198,12 +2205,14 @@ impl Green {
     // Move whatever the source names, capturing its current value so an intervening change to the
     // source follows the move, and removing the source name.
     if let Some(source) = self.content.get(from) {
-      let ops = vec![insert_whole(source.len() as u64)];
+      let edits = self.edits_after_rename((dst, ops), base, from)?;
+      let bytes = apply(source, &edits, post_state);
+      let whole = vec![insert_whole(bytes.len() as u64)];
       effects.push(Effect::SetContent(
         dst.to_owned(),
-        source.clone(),
-        ops,
-        ContentSource::Copied(from.to_owned()),
+        bytes,
+        whole,
+        ContentSource::Copied(from.to_owned(), edits),
       ));
       effects.push(Effect::RemoveContent(from.to_owned()));
     } else if let Some(target) = self.symlinks.get(from) {
@@ -2214,6 +2223,40 @@ impl Green {
       effects.push(Effect::RemoveHardlink(from.to_owned()));
     }
     Ok(())
+  }
+
+  /// The work's edits to a rename's destination `dst` (`ops`, in the coordinates of the source `from`'s bytes at `base`),
+  /// moved to where they stand in the source's bytes now, past every change made to it since `base` (A-547); an edit that
+  /// meets one of those changes is an overlap conflict on `dst`.
+  fn edits_after_rename(
+    &self,
+    (dst, ops): (&str, &[Op]),
+    base: u64,
+    from: &str,
+  ) -> Result<Vec<Op>, ConflictWindow> {
+    let unchanged = self.last_changed.get(from).copied().unwrap_or(0) <= base;
+    let intervening = if unchanged {
+      Vec::new()
+    } else {
+      self.intervening(from, base)
+    };
+    ops
+      .iter()
+      .map(
+        |op| match crate::map::map_range(&intervening, touched_range(op)) {
+          crate::map::Mapped::Shifted(shifted) => {
+            let mut moved = *op;
+            moved.at = shifted.start;
+            Ok(moved)
+          }
+          crate::map::Mapped::Overlaps => Err(ConflictWindow {
+            path: dst.to_owned(),
+            range: touched_range(op),
+            class: MergeConflictClass::Overlap,
+          }),
+        },
+      )
+      .collect()
   }
 
   /// Merges a create at `path` with `bytes`.
@@ -2675,7 +2718,9 @@ impl Green {
     windows: &mut Vec<ConflictWindow>,
   ) {
     for (dst, from) in &r.renames {
-      if let Err(window) = self.merge_rename(dst, inc.base, from, effects) {
+      let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
+      if let Err(window) = self.merge_rename((dst, ops), (inc.base, &inc.post_state), from, effects)
+      {
         windows.push(window);
       }
     }
@@ -3210,10 +3255,16 @@ impl Green {
           ContentSource::Created(declared.clone()),
         )
       }
-      Applied::Copied { dst, from } => {
-        let bytes = self.content.get(from).cloned().unwrap_or_default();
-        let ops = vec![insert_whole(bytes.len() as u64)];
-        Effect::SetContent(dst.clone(), bytes, ops, ContentSource::Copied(from.clone()))
+      Applied::Copied { dst, from, ops } => {
+        let source = self.content.get(from).map(Vec::as_slice).unwrap_or(&[]);
+        let bytes = apply(source, ops, post_state);
+        let whole = vec![insert_whole(bytes.len() as u64)];
+        Effect::SetContent(
+          dst.clone(),
+          bytes,
+          whole,
+          ContentSource::Copied(from.clone(), ops.clone()),
+        )
       }
       Applied::RemoveContent(path) => Effect::RemoveContent(path.clone()),
       Applied::MakeDir(path) => Effect::MakeDir(path.clone()),
@@ -3651,11 +3702,17 @@ impl Green {
         // A rename is restated as the rename it is, in head coordinates, as the composer states one (one `Rename`,
         // replacing whatever the head holds there): its whole-file insert stands for bytes supplied by the move, and
         // replayed over a head that holds the destination it would add them to that file's own.
-        Effect::SetContent(path, bytes, _, ContentSource::Copied(from)) => {
+        Effect::SetContent(path, bytes, _, ContentSource::Copied(from, edits)) => {
           journal.push(VolumeOp::Rename {
             from: from.clone(),
             to: path.clone(),
           });
+          // The edits the work made after the rename follow it, over the bytes it moved (A-547).
+          let moved_len = self
+            .content
+            .get(&from)
+            .map_or(0, |moved| moved.len() as u64);
+          journal.extend(content_volume_ops(&path, &edits, moved_len));
           moved_from.insert(from);
           changed.insert(path, Some(bytes));
         }

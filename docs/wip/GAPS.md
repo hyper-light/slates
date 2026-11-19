@@ -1507,8 +1507,14 @@
 > work to the same answer and head as the same work submitted, after a generated work merged ahead of it: 400 cases,
 > red-checked on each fix. `docs/bugs/2026-11-09-a-rebased-work-was-restated-into-other-bytes.md`.
 >
-> **Open and owed (found by perf, 2026-11-09, §4.16 "Composition at seal"): an edit after a rename is accepted and
-> lost.** A work renames `a` over `b`, writes at the end of `b`, and submits. It is accepted, and `b` holds `a`'s head
+> **An edit after a rename was accepted and lost: fixed (2026-11-19, A-547, g225; found by perf, 2026-11-09, §4.16
+> "Composition at seal").** The verdict now maps the destination's ops through what changed the source since the work's
+> base and splices them into the bytes the rename moves (`Green::edits_after_rename`; an edit meeting such a change is
+> an overlap conflict, never dropped); the chain entry's `Copied` carries them (tag `COPIED_SPLICED`, a rename alone
+> encoding as before), replay applies them, and the rebase restates them after the `Rename`
+> (`an_edit_after_a_rename_over_a_file_is_merged_with_the_renamed_bytes`, `crates/merge/src/engine.rs`; the parked
+> server test is no longer ignored). Owed: the rebase oracle's generator still stays out of this case. What was there:
+> A work renames `a` over `b`, writes at the end of `b`, and submits. It is accepted, and `b` holds `a`'s head
 > bytes alone. This is on main with no rebase involved. The verdict skips a renamed-into path's content ops
 > (`decide_content`) and copies the source's head bytes (`merge_rename`). The chain entry's `Applied::Copied { dst, from }`
 > has no ops to replay, and replay maps an entry's effects before committing any, so a second `Spliced` effect cannot
