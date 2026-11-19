@@ -48796,3 +48796,46 @@ credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`
   `crates/merge/src/engine/compute_tests.rs` (new), `crates/merge/tests/rebase.rs` (a binding no longer mutable),
   `crates/merge/tests/engine.rs` (`symlink_merges`' last base), `crates/server/src/verbs.rs` (`map_rebase`:
   `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry; GAPS' A-645 entry.
+
+### A-654 part 1 — receive-pack's session owns its parts, and its verdicts are read only beside the appends (2026-11-19, g258, UI goal 93; §4.17.1 "A push is a work" items 1 to 5; §4.17.2 "A push" items 6 and 7; A-620, A-642, A-645, A-662)
+
+- **What was there.** A-620's `Session` borrowed its advertisement and its hidden refs for its life, and `Works` held
+  the greens shared and the appends exclusive at once; a create's work was built over an empty green. Neither fits
+  the server: a connection's task keeps its session between the bytes its edge hands it, and on the owner shard the
+  greens, the appends and the push's object view are one `ShardState`, which A-662's `push_sealed` changes.
+- **The decision.** (1) A create is made at the version of the green its new value's first parent heads, where one
+  can still be branched from, else at the default branch's head, its work the whole difference against that
+  version's tree; over an empty green only while the default branch is unborn (main's ruling of 2026-11-19).
+  (2) A green is lent to the judge for one call, by closure (`Greens::read`, `Greens::base_of_create`), as the server
+  lends one member of a lineage at a time (A-575). (3) `Session` keeps a copy of its advertisement (`Advertised` is
+  `Copy`) and owns its hidden refs, so a caller keeps it across its own steps; `HiddenRefs for &T` keeps callers that
+  hold the predicate themselves. (4) `Verdicts` judges a command and appends nothing; `Works` pairs it with an
+  `Appends`; a server whose greens and appends are one state judges through `Verdicts` between its own appends and
+  answers in git's words through `append_declined` and `atomic_declined`. (5) `Unappended::Refused { at, why }`: an
+  append's own refusal (the shard's budget, the register's capacity, an approval the branch requires) under git's
+  `failed to update ref`, slates' reason on band 2.
+- **Tests** (`crates/git/src/receive/tests/`): a create made at its first parent's version and an orphan create
+  stating the whole difference from the default head (`works.rs`); a session made from parts that go out of scope at
+  once, kept in a caller's struct and fed the create push in pieces, answering byte for byte as a borrowing one
+  (`session.rs`); an entry the append refused for its own reason answered in git's words with slates' on band 2,
+  alone and atomic (`works.rs`).
+- **Evidence.** macOS arm64, Mac Studio (kiln, debug, 2026-11-19), on the merged tree 6f2d690eb: `cargo test --locked
+  -p slates-git --lib receive::` 42 of 42, the five A-654 tests among them; `--lib protected_fixtures` 5 of 5 and
+  `--lib store::views` 7 of 7 (the other users of the reader and the judge); `cargo fmt --all -- --check` clean; no
+  warning in `receive`. The first run (r131) failed the annotated tag's test alone, written for A-620's create over an
+  empty green: under (1) a tag of a root commit is made at the default head and its work is the head alone, so the
+  test now submits it to a green holding that version. slates-git has no integration target, and nothing outside it
+  calls the session or the judge until part 2. Main's: clippy, `xtask check`, the doc gates and the other platforms.
+- **Owed (part 2): the server's driver** (`crates/server/src/git_push.rs`, one entry point for the HTTP edge, g299,
+  and the SSH edge, g294): `start` writes the advertisement of the branches whose greens hold a git head, a ref the
+  pusher may not read under A-622's policy hidden; `input` and `end` feed the session over A-638's `IndexedObjects`
+  lent the shard's room (A-662's `lent_to_read`); `answer` admits the checked objects to A-662's `GitPush` and seals
+  it, asks A-622's `admit` (Submit, Rewrite for a move A-614's admission finds no fast-forward, Delete), refuses
+  typed while a git hook is configured and its view is owed (A-665 part 2), and decides through a server judge:
+  `Verdicts` over the shard's greens, whose `version_of` answers only a green's current head until A-664's
+  server-made commits allow a push based on an older version, then `push_sealed` for each entry, or once for all
+  under `atomic`; the report written to the caller's bytes.
+- **Applied in the same change to:** `crates/git/src/receive/works.rs` (`Verdicts`, `Works`, `Greens`,
+  `Entry::Create::from`, `Unappended::Refused`, `append_declined`, `atomic_declined`, module docs),
+  `receive/session.rs`, `receive/request.rs` (`RequestReader` keeps a copy), `receive/mod.rs` (`HiddenRefs for &T`),
+  and their tests; GAPS (the §4.17 entry).

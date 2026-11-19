@@ -239,3 +239,44 @@ fn a_checked_push_waits_for_its_verdicts_holding_nothing_of_the_callers() {
   assert_eq!(answered, Ok(Some(received(&hidden, &second))));
   assert_eq!(written, answer_to(&received(&hidden, &second)));
 }
+
+/// A connection's state as an edge's task keeps it between the bytes it is handed: the session
+/// alone, owning its parts.
+struct Kept {
+  /// The session.
+  session: Session<'static, super::HideRefs>,
+}
+
+/// A-654 (a session owns its advertisement and its hidden refs, so a caller keeps it across its own
+/// steps). Do: make a session from an advertisement and a predicate that go out of scope at once,
+/// keep it in a struct of the caller's, and feed it the create push in pieces of seven bytes
+/// through that struct; then answer it. Expect: checked as its last piece arrives, and its answer and every
+/// byte it wrote those of a session borrowing its parts.
+#[test]
+fn a_session_owning_its_parts_is_kept_by_its_caller_across_calls() {
+  let scenario = scenario("create");
+  let repository = Repo::from_pack(scenario.before_pack);
+  let borrowed = fed_in_pieces(scenario.request, 7, &repository);
+  let mut kept = {
+    let advertised = ADVERTISED;
+    let hidden = HIDDEN;
+    Kept {
+      session: Session::new(&advertised, hidden),
+    }
+  };
+  let mut checked = Ok(false);
+  for chunk in scenario.request.chunks(7) {
+    checked = kept.session.input(chunk, &repository, &mut unbounded());
+    if !matches!(checked, Ok(false)) {
+      break;
+    }
+  }
+  assert_eq!(checked, Ok(true));
+  let mut written = Vec::new();
+  let mut policy = git_policy(&repository);
+  let answered = kept
+    .session
+    .answer(&mut policy, &mut written, &mut unbounded());
+  assert_eq!(answered, borrowed.result);
+  assert_eq!(written, borrowed.written);
+}
