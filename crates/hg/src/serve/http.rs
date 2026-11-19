@@ -43,6 +43,44 @@ const LINE_END: u8 = b'\n';
 /// (`genversion2`).
 const V2_LENGTH_BYTE: u64 = 1;
 
+/// Format: the commands 7.2's table marks `push` (`wireprotov1server`'s `permission=b'push'`); every other command it
+/// holds is `pull`.
+const PUSH_COMMANDS: [&[u8]; 2] = [b"pushkey", b"unbundle"];
+
+/// What a command asks of its caller's principal, as 7.2's table states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Permission {
+  /// A read: every command but the two that push.
+  Pull,
+  /// A push: `pushkey` and `unbundle`.
+  Push,
+}
+
+/// The permission `command` needs, `None` for a name 7.2's table lacks: a request naming such a command, or none, is
+/// no wire request, and 7.2 hands it to hgweb.
+pub fn permission(command: &[u8]) -> Option<Permission> {
+  spec_of(command).map(|_| {
+    if PUSH_COMMANDS.contains(&command) {
+      Permission::Push
+    } else {
+      Permission::Pull
+    }
+  })
+}
+
+/// The command a request's query names, decoded: its last `cmd` field, as hgweb reads it; `None` where it names none.
+/// The query's decoded fields are charged to `admission`, and freed.
+pub fn command(query: &[u8], admission: &mut Admission) -> Result<Option<Vec<u8>>, http::Refusal> {
+  let mut buffer = Vec::new();
+  let request = Request {
+    query,
+    headers: &[],
+    body: &[],
+  };
+  let fields = http::fields(&request, admission, &mut buffer)?;
+  Ok(fields.command().map(<[u8]>::to_vec))
+}
+
 /// A stream answer's media type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Media {

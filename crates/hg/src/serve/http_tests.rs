@@ -10,7 +10,7 @@ use super::super::getbundle::tests::{
   Served, check_bundle2_subset, check_streams, cloned, session_stores,
 };
 use super::super::session::Refused;
-use super::{Answered, Compression, Compressor, Media, answer};
+use super::{Answered, Compression, Compressor, Media, Permission, answer, command, permission};
 use crate::compression::{self, EncodeRefusal, Engine};
 use crate::http::{self, MEDIA_TYPE_ERROR, MEDIA_TYPE_V1, MEDIA_TYPE_V2, Request};
 use crate::{Admission, PastAdmission, capabilities};
@@ -528,4 +528,28 @@ proptest! {
       prop_assert!(Engine::for_wire_name(engine).is_some());
     }
   }
+}
+
+/// A-650 part 1: do ask what `unbundle`, `pushkey`, `heads` and a name 7.2's table lacks need, and which command a query
+/// naming `cmd` twice, escaped, names. Expect a push for the first two, a pull for `heads`, none for the last (no wire
+/// request), and the last `cmd`, decoded.
+#[test]
+fn the_permission_a_command_needs_is_mercurials() {
+  let needs: Vec<Option<Permission>> = [&b"unbundle"[..], b"pushkey", b"heads", b"frobnicate"]
+    .iter()
+    .map(|name| permission(name))
+    .collect();
+  let named = command(b"cmd=heads&cmd=list%6Beys", &mut Admission::new(ROOM));
+  assert_eq!(
+    (needs, named),
+    (
+      vec![
+        Some(Permission::Push),
+        Some(Permission::Push),
+        Some(Permission::Pull),
+        None
+      ],
+      Ok(Some(b"listkeys".to_vec()))
+    )
+  );
 }

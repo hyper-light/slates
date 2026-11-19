@@ -57,6 +57,8 @@ slates-http = { path = "crates/http", version = "0.1.0" }
 slates-http-edge = { path = "crates/http-edge", version = "0.1.0" }
 # git's wire, objects, store and smart HTTP routes (§4.17.2), which the daemon's git site serves (A-625 part 2).
 slates-git = { path = "crates/git", version = "0.1.0" }
+# Mercurial's formats, wire and read serving (§4.17.3), which the daemon's Mercurial site serves (A-650).
+slates-hg = { path = "crates/hg", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
 # version-specific, each with a comment saying why (Appendix B.1).
