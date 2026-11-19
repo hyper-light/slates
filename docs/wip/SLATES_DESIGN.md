@@ -11924,6 +11924,13 @@ engine: the verdict, rebase, position mapping, the register).
 > detection (RustCrypto's `sha1-checked`, detection on and safe hash off as `git_SHA1DCInit`), which refuses git's own
 > t0013 SHAttered vector by type and names its plain SHA-1 as git's refusal does; and SHA-256 through aws-lc-rs. Proven
 > against every object type and the empty blob as stock git 2.50.1 named them in a SHA-1 and a SHA-256 repository.
+>
+> **Status (2026-11-19, A-582's second part: protocol v2's messages built).** `crates/git` (`v2`) reads and writes the
+> capability advertisement, the command request, `ls-refs`'s arguments and answer, and `fetch`'s seventeen arguments and
+> its response's five sections, as pure functions over bytes; every advertisement, request and answer stock git 2.50.1
+> wrote or read decodes and encodes back to its exact bytes. One machine holds the response's section order, stepped by
+> the reader and the writer alike, so neither takes a section out of order. `object-info` and `bundle-uri` are refused
+> as unknown commands until their part, so a server advertises neither before it.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -11972,9 +11979,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
   the document's own examples (piece 1).
 - Side band: during a pack, channel 1 carries the pack, 2 progress and 3 a fatal error [B: gitprotocol-v2 "packfile
   section"]; `ERR <text>` is the pack protocol's error line [B: gitprotocol-pack].
-- v2 capabilities advertised: `agent`, `ls-refs=symrefs peel ref-prefix unborn`, `fetch=shallow filter ref-in-want
+- v2 capabilities advertised: `agent`, `ls-refs=unborn`, `fetch=shallow filter ref-in-want
   sideband-all packfile-uris wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and
-  `object-info`. A v0 or v1 fetch (the old ref advertisement and its negotiation) is a later piece.
+  `object-info`. `ls-refs` lists only `unborn`, as git does (`ls-refs.c` `ls_refs_advertise`): `symrefs`, `peel` and
+  `ref-prefix` are the command's base arguments, which need no feature [B: gitprotocol-v2 "ls-refs"]. A v0 or v1 fetch (the old ref advertisement and its negotiation) is a later piece.
 - receive-pack capabilities: `report-status`, `report-status-v2`, `delete-refs`, `ofs-delta`, `atomic`,
   `push-options`, `side-band-64k`, `quiet`, `object-format` and `agent`.
 

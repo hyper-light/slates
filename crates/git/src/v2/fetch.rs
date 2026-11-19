@@ -214,7 +214,7 @@ impl<'a> Argument<'a> {
   }
 
   /// The line's text in parts: the word, a space where there is a value, and the value.
-  pub(crate) fn parts(&self) -> [Part<'_>; 3] {
+  pub(super) fn parts(&self) -> [Part<'_>; 3] {
     let none = Part::Bytes(b"");
     let space = Part::Bytes(&[SP]);
     match self {
