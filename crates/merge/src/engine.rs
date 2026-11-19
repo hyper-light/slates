@@ -4046,6 +4046,9 @@ fn special_payload(
 mod branch;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
+mod reanchor;
+pub use reanchor::{ReanchorRefused, Reanchored};
+
 #[cfg(test)]
 mod node_exclusive_tests;
 
