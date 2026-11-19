@@ -563,7 +563,16 @@ fn a_record_proves_its_principal_for_its_own_key_while_live() {
       key_holder(&record(key(), later), &blob, NOW_NS),
       key_holder(&record(key(), Some(NOW_NS)), &blob, NOW_NS),
       key_holder(&record(key(), None), &other, NOW_NS),
-      key_holder(&record(CredentialKind::HttpToken, None), &blob, NOW_NS),
+      key_holder(
+        &record(
+          CredentialKind::HttpToken {
+            cram_md5_contexts: [0; 32],
+          },
+          None,
+        ),
+        &blob,
+        NOW_NS,
+      ),
     ],
     [
       Ok(principal(OWNER)),
@@ -601,6 +610,7 @@ fn the_production_lookup_proves_a_key_by_the_credential_record_from_any_shard() 
   };
   let token = CredentialMaterial::HttpToken {
     id: crate::credentials::ssh_key_id(&blob(2)),
+    cram_md5_contexts: [0; 32],
   };
   let replies = [
     enrolled(

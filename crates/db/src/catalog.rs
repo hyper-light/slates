@@ -234,9 +234,17 @@ pub enum CredentialKind {
     /// The public key blob (RFC 4253 §6.6).
     blob: Vec<u8>,
   },
-  /// An HTTP token, Basic's password or a bearer token (RFC 7617, RFC 6750): held as its SHA-256 alone, the record's
-  /// id, so the token itself is never kept.
-  HttpToken,
+  /// A token: Basic's password or a bearer token over HTTP (RFC 7617, RFC 6750), and CRAM-MD5's secret over `svn://`
+  /// (RFC 2195; A-692). Held as its SHA-256, the record's id, and its CRAM-MD5 keyed contexts, so the token itself is
+  /// never kept.
+  HttpToken {
+    /// HMAC-MD5's keyed contexts of the token (RFC 2104 §4, RFC 2195 §4; A-692), made when it was enrolled: MD5's
+    /// state after the token's outer pad block, then after its inner pad block, each four words low-order byte first
+    /// (Dovecot's CRAM-MD5 scheme's layout, `slates_svn::handshake::CramContexts`). They answer `svn://`'s CRAM-MD5
+    /// as the token does and do not give the token back: an HTTP request, which presents the token, cannot be made
+    /// from them.
+    cram_md5_contexts: [u8; 32],
+  },
 }
 
 /// A version-control credential a human enrolled for a principal (§4.13: through the CLI's control verbs, never MCP or

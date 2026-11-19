@@ -646,14 +646,14 @@ fn http_leg(session: &str) -> Leg {
 /// §4.17.4 item 14 over `svn://` (item 5's svn://: the daemon's svn:// listener running A-656's connection). Do: start
 /// an anchor with its svn:// listener on loopback (`--vcs-svn 127.0.0.1:0`); make the repository and a token (`slates
 /// credential token`); run the round trip as stock `svn` 1.15 at `svn://127.0.0.1:PORT/project`, with the token's id
-/// and the token as the user and password `svn` answers CRAM-MD5 with. Expect: every step as against `svnserve`
-/// ([`stock_svn_sessions_hold_against_stock_svnserve`]). Skips loudly without stock Subversion 1.15. Ignored until it
-/// can pass: the listener (A-689, g234) answers every URL "No repository found" until its next slice looks the
-/// repository up, lends its sources and calls A-655 part 2b's commit step; `slates repository create` is A-685 (g305);
-/// and CRAM-MD5's secrets (A-599's owed (3)) have no piece yet, so the user and password given here are this test's
-/// assumption: CRAM-MD5 finds its secret by the user's name, and a token's id names one token.
+/// and the token as the user and password `svn` answers CRAM-MD5 with, as A-692 proves a token's principal (the token's
+/// record keeps its CRAM-MD5 keyed contexts; `slates_server::credentials::cram_md5_key`). Expect: every step as
+/// against `svnserve` ([`stock_svn_sessions_hold_against_stock_svnserve`]). Skips loudly without stock Subversion
+/// 1.15. Ignored until it can pass: the listener (A-689, g234) answers every URL "No repository found" until its next
+/// slice looks the repository up, lends its sources, asks `cram_md5_key` for a client's key and calls A-655 part 2b's
+/// commit step; `slates repository create` is A-685 (g305).
 #[test]
-#[ignore = "waits on A-689 and its lookup (g234), A-685 (g305) and svn:// CRAM-MD5 secrets (no piece yet)"]
+#[ignore = "waits on A-689 and its lookup (g234) and A-685 (g305)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   if !stock_svn() {
     eprintln!("skipping stock svn over svn://: no stock Subversion 1.15 here (svn on the PATH)");
