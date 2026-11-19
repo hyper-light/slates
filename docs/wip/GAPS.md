@@ -1173,7 +1173,21 @@
 >   `EBUSY` is `MountFault::Busy`, and the table still listing the mount after a call that said done is
 >   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`).
 >   Owed: the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
-> - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 44; A-507's two owed
+> - **a host mount bound into a container, built 2026-11-18 (A-520, `CONTRACT` = 44; kiln's container engine, kiln goal
+>   01a1f124):** the OCI form (§4.6 A-9) was the wire's and the command line's alone (`slates attach --oci-source`), so
+>   a host that drives slates through the library alone (kiln) could not bind a volume into a container.
+>   `Instance::bind_into_container(volume, source, destination, intent)` and the seam's verb answer a `ContainerBind`
+>   (the binding's attachment and the `OciBinding` entry the runtime performs), refused typed as the daemon refuses the
+>   form; the source is spelled by its folder's real path, never by looking into the mount; the simulator binds the
+>   mounts it recorded in the daemon's order of checks and ends a bind with its mount. Unit tests: `container::tests`
+>   (a binding taken only from an answer that established one; the source's spelling) and `sim::tests` (the entry and
+>   its lifetime, every refusal with none holding room; Windows' refusal, on Windows' own build). By use, with a kernel
+>   mount: `a_mounted_volume_binds_into_a_container_through_the_library` (`crates/api/tests/api.rs`,
+>   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. Owed (A-520's next pieces): the
+>   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
+>   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
+>   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+> - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
 >   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
 >   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
 >   `EBUSY` is on macOS. Every `Busy` carries `MountHolders`, read on that refusal alone from the kernel's own tables
@@ -4109,8 +4123,11 @@
 >   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
 >   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
 >   C-b: the reply deadline's other users,
->   each a wait that cannot see the departure yet: a delivery's read (Linux: the socket's readability), the macOS
->   route's claim steps and the CLI's MCP edge, which borrows the reply deadline for its own. The synchronous send's
+>   each a wait that cannot see the departure yet: the macOS route's claim steps and the CLI's MCP edge, which borrows
+>   the reply deadline for its own. A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
+>   descriptor until its reply deadline and gave up `DeadlineExceeded` there; it now waits on the control socket itself,
+>   readable or hung up, with no clock (`ClientEnd::wait_delivery`), and ends `ChannelLost` once the daemon is gone with
+>   nothing delivered (`a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock`, Linux, main's to run). The synchronous send's
 >   wait for a slot on a full ring since A-523 (2026-11-18, g251b): it spun for a whole reply deadline (a second),
 >   asked the daemon's liveness at each one and paced its tries at a tenth of it; it now spins for the client's wake
 >   estimate, then parks, each pause twice the last and never past the next look, the looks on A-443's doubling

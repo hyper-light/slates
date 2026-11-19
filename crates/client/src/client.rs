@@ -2237,16 +2237,17 @@ impl Client {
 
   /// Receives the descriptor the daemon sent over the control socket for the reply just read (§4.6: a content map,
   /// A-135; a stream end, A-161), the one `ours` recognises by what the reply named. The daemon sends it before the
-  /// ring reply, so it is already waiting; the loop only covers a kernel that makes the socket readable a scheduling
-  /// tick after the ring slot, bounded by the client's existing reply deadline (no new timeout). A delivery for an
-  /// earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never answers a later
-  /// call.
+  /// ring reply, and answers a typed refusal where the send failed, so it is waiting, or the socket turns readable a
+  /// scheduling tick after the ring slot: the loop waits on the socket itself, readable or hung up, with no clock
+  /// (`ClientEnd::wait_delivery`, A-523), and ends `ChannelLost` once the daemon is gone with nothing delivered. Until
+  /// A-523 it yielded until the client's reply deadline (a fixed second) and gave up `DeadlineExceeded` there. A
+  /// delivery for an earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never
+  /// answers a later call.
   #[cfg(unix)]
   fn recv_delivery(
     &self,
     ours: impl Fn(&ControlDelivery) -> bool,
   ) -> Result<ControlDelivery, ClientError> {
-    let start = Instant::now();
     loop {
       if let Some(delivery) = self.end.recv_delivery().map_err(ClientError::Ipc)? {
         if ours(&delivery) {
@@ -2254,10 +2255,10 @@ impl Client {
         }
         continue;
       }
-      if elapsed_ns(start) > self.deadlines.reply_ns {
-        return Err(ClientError::Ipc(IpcError::DeadlineExceeded));
+      if self.end.daemon_gone() {
+        return Err(ClientError::ChannelLost);
       }
-      std::thread::yield_now();
+      self.end.wait_delivery().map_err(ClientError::Ipc)?;
     }
   }
 

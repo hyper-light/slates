@@ -4438,6 +4438,13 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > **Reconciled 2026-11-06 (VFS plan Step 15).** The Linux bind over the daemon's FUSE mount and the container lane run
 > on a real kernel in CI (6ba06780, f7c88d2f; 9edd0681), and a live guest is AC-9.7's evidence on the vhost-user route
 > (5ad111d3). Still owed: a live guest of the in-process route.
+>
+> **The form through the library (A-520, 2026-11-18).** A host that drives slates through its library alone (§4.12)
+> binds a volume's mount into a container with `Instance::bind_into_container` and the seam's verb of that name, which
+> ask this form and answer the binding's attachment and the runtime's entry (`ContainerBind`, `CONTRACT` = 44); the
+> simulator judges the mounts it recorded as this form judges the kernel's table. kiln's container engine binds each
+> agent's workspace mount so (kiln's `docs/agentic.md` W9). Still the command line's alone, owed to the library next:
+> the engine's profile (`slates oci-runtime`) and the check just before the runtime binds (`slates oci-check`).
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -9101,8 +9108,14 @@ it builds against the contract and adds to it rather than around it.
 > `MountFault::Busy`; a call that said done while the table still lists the mount is `MountFault::StillMounted`; a
 > table that could not be read is `MountFault::MountTable`. Linux keeps `fusermount3 -u`, the setuid helper its FUSE
 > mount is made through (`umount2(2)` needs `CAP_SYS_ADMIN`), under the same table judgment.
+> **`CONTRACT` = 44 (A-520):** a host mount bound into a container is a verb of the contract:
+> `Instance::bind_into_container(volume, source, destination, intent)` and the seam's verb answer a `ContainerBind`, the
+> binding's attachment and the entry the host's OCI runtime performs (`OciBinding` and its `HostMountEvidence`, now
+> re-exported), refused typed as the daemon refuses §4.6 A-9's form. Until then the form was the wire's and the command
+> line's alone, and kiln, which reaches slates only through this library, could not bind an agent's volume into its
+> container.
 
-> **`CONTRACT` = 44 (A-537):** a busy unmount names its holders and is typed on Linux too. `MountFault::Busy` carries
+> **`CONTRACT` = 45 (A-537):** a busy unmount names its holders and is typed on Linux too. `MountFault::Busy` carries
 > `MountHolders`, the processes the kernel's own tables show holding the mount, read on that refusal alone without
 > touching it (Linux: each process's descriptors, working and root directories under `/proc`, `statx`ed with
 > `AT_STATX_DONT_SYNC` and compared by device), with `HoldersUnread` saying why none were read (macOS: every libproc
@@ -35715,6 +35728,15 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   debug, 2026-11-18, load 16 to 19): `slates-client --lib` green with
   `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`; red with the old spin through a
   reply deadline put back: "spun at 3000 ns, past the wake estimate".
+- **A delivery's read** (Linux; `Client::recv_delivery`, `ClientEnd::wait_delivery`, `Liveness::wait_delivery`). After a
+  reply that names a descriptor the client yielded until the descriptor was there or its reply deadline passed, and
+  gave up `DeadlineExceeded` there. The daemon sends the descriptor before that reply and answers a typed refusal where
+  the send failed (`MapUnavailable`, a stream's hand-off refused), so the descriptor is waiting or comes a scheduling
+  tick later: the wait is now one `poll` of the control socket for readability or its peer's close, with no timeout,
+  and a daemon gone with nothing delivered ends it `ChannelLost`. macOS has no control socket and is refused
+  `Unsupported` (its descriptors come by the socket route). Checks (Mac Studio, debug, 2026-11-18, load 18 to 20):
+  `slates-ipc --lib` 64 of 64 (1 ignored) and `slates-client --lib` 8 of 8 on macOS; the Linux test
+  `a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock` is main's to run.
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
@@ -35951,7 +35973,6 @@ layout 6; layout 5 still read, uncertified), `crates/server/src/content_retentio
   `takeover::`, retention, the healer and the holder tests 33 of 33; red once on a mutated copy that let an uncertified
   takeover's content go: the uncertified A-335 test failed at its first install.
 - **Owed.** An owner's settle certifies content the same way, and A-508's holders then drop content too.
-
 ### A-533 — A work left unbuilt at recovery answers `Unpublished`, never recorded, and is asked for again as clients are let in, by messages, never a timer (2026-11-19, goal 85 via g225; A-513's remainder; §4.16 "Recovery"; A-207, A-247)
 
 - **What was there.** At recovery a work whose green lives on another partition is replayed through the green's owner
@@ -35982,11 +36003,63 @@ layout 6; layout 5 still read, uncertified), `crates/server/src/content_retentio
 Applied in the same change to: §4.16 (A-513's status: its owed item done), GAPS (A-513's remainder closed), A-513's bug
 record, `crates/server/src/{work_home,verbs,daemon}.rs`.
 
-### A-537 — A busy unmount names its holders from the kernel's own tables, and Linux's is typed by the mount table (2026-11-18, g230, UI goal 85; A-507's two owed items; §4.6; `CONTRACT` = 44)
-Applied in the same change to: §4.6's contract log (`CONTRACT` = 44), GAPS (the library's mount entry), `docs/library.md`,
+### A-520 — A host mount bound into a container is a verb of the library, so a host that reaches slates only through it binds a volume into a container (2026-11-18, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9, §4.12; `CONTRACT` = 44)
+Applied in the same change to: §4.6 (A-9's OCI record: the form through the library), §4.12's contract log (`CONTRACT`
+= 44), GAPS (the library's entry), `docs/library.md` (the seam's verbs, the serving list, what is owed),
+`crates/api/src/container.rs` (new: `ContainerBind`, `Instance::bind_into_container`, the source's spelling, and their
+tests), `crates/api/src/seam.rs` (the verb on `Volumes`), `crates/api/src/sim.rs` (the simulator's bind, a mount's and a
+bind's records, a bind ending with its mount, and the tests), `crates/api/src/lib.rs` (`CONTRACT` = 44; `OciBinding`
+and `HostMountEvidence` re-exported) and `crates/api/tests/api.rs` (the conformance suite's stranger, and a kernel-mount
+test).
+- **Why.** kiln reaches slates through this library alone (A-278), and its container engine (kiln's `docs/agentic.md`
+  W9) runs each agent's container on the agent's workspace volume, bound from the host's mount and never copied. §4.6
+  A-9's OCI form was the wire's (`AttachRequest::Oci`) and the command line's (`slates attach --oci-source`) alone.
+- **The verb.** `Instance::bind_into_container(volume, source, destination, intent)` asks the form and answers a
+  `ContainerBind`: the binding's attachment (ended by `detach`, and with its source mount) and the `OciBinding` entry the
+  host hands its runtime as it is. An answer that established no binding is a protocol fault, never a binding made up.
+  Its refusals are the daemon's, typed as the contract already typed them: `NotFound`, `Unsupported::Attachment`
+  (Windows' `HostPlatform`; a host without its mount bridge `HostMountRequired`), `Invalid::ChosenPath` (`NotAbsolute`,
+  `DestinationNotAbsolute`, `NotAMountPoint`, `ForeignFilesystem`, `DescendantMount`, and on macOS `NotThisVolume`), and
+  `Denied::Rights` (no mount of the volume's by this caller at the path, or a read-only one bound for writing).
+- **The source's spelling.** The daemon compares the source with the kernel's table, which names a mount by its real
+  path, so the library spells the source by its folder's real path with its own name kept: never the mount point
+  resolved whole, which looks into the mount (a request to the very daemon asked; on a `hard` NFS mount, one that waits
+  on its server). A source with no folder to resolve goes as given and the daemon judges it. The command line still
+  resolves its `--oci-source` whole (`crates/cli/src/verbs.rs`), looking into the mount: reported, not changed.
+- **The simulator.** It binds only the mounts it recorded, judged in the daemon's order (absolute source, absolute
+  destination, a mount at the path, the newest there, none beneath it, the volume's and writable for a writable bind),
+  answers Slates' own entry (`slates_bridge_oci::binding`), claims none of a kernel table's evidence beyond whether the
+  mount was made shared, and ends a bind with its mount. Another volume's mount it refuses `Denied::Rights`, as Linux's
+  daemon does at its records; macOS's daemon refuses it earlier, `NotThisVolume`, by the NFS source that names the
+  volume, so the conformance suite holds the two to the stranger alone (`NotFound` on every platform, the volume found
+  before the form is judged).
+- **Tests.** `crates/api/src/container.rs`: `a_bind_answers_the_binding_the_daemon_established_and_nothing_else`,
+  `a_source_is_spelled_by_its_folders_real_path_and_its_own_name` (macOS: `/var` spelled `/private/var`);
+  `crates/api/src/sim.rs`: `a_mounts_bind_answers_the_runtimes_entry_and_ends_with_its_mount`,
+  `a_bind_the_daemon_would_refuse_is_refused_typed_and_holds_nothing` (a simulator with room for exactly what the cases
+  keep, so a refusal that held an attachment would refuse the last bind) and, on Windows' own build,
+  `a_bind_on_windows_is_refused_as_the_daemon_refuses_it`. Filed for main: the conformance suite's stranger, and
+  `a_mounted_volume_binds_into_a_container_through_the_library` (`crates/api/tests/api.rs`, a kernel mount,
+  `SLATES_TEST_MOUNT=1`, macOS and Linux).
+- **Evidence (the Mac Studio, kiln, 2026-11-18, debug, load 20 to 21).** Red first, on a scratch copy whose verb
+  answered as the library did (no binding taken, the simulator offering none, the source sent as given; scratch branch
+  `agents/g293-a520-red`, never merged): `cargo test --locked -p slates-api --lib -- container:: sim::tests
+  contract_history` failed the four new tests (run r201: the bind refused `HostMountRequired`, `/var/…` left unspelled,
+  the binding not taken) and passed the contract's history. Green with this change's code, file for file (scratch
+  a728e2afa, run r208): the same command 5 of 5, and the crate's whole `cargo test --locked -p slates-api --lib` 76
+  passed, 4 ignored. Main's A-535 took contract 43 meanwhile, so this change is 44, its history's line and constant
+  renumbered, nothing else. `cargo fmt -p slates-api` laid the code out.
+- **Owed** (A-520's next pieces, kiln goal 01a1f124): the engine's profile (`slates oci-runtime`) and the check just
+  before a runtime binds (`slates oci-check`) as library calls, so a host binds through the library alone; the judge's
+  profiles for the engines slates has run since it was written (rootless podman, G-mount step 3, and podman's command
+  line); and Windows, which binds nothing (G-mount step 4) until a route into Docker Desktop's VM is measured (kiln's
+  W9: WSL 2's 9P server over a WinFsp drive, else the network export).
+
+### A-537 — A busy unmount names its holders from the kernel's own tables, and Linux's is typed by the mount table (2026-11-18, g230, UI goal 85; A-507's two owed items; §4.6; `CONTRACT` = 45)
+Applied in the same change to: §4.6's contract log (`CONTRACT` = 45), GAPS (the library's mount entry), `docs/library.md`,
 `crates/bridge-oci/src/mount_holders.rs` (new) and `mount_table.rs` (`MAJOR_SHIFT` shared), `crates/api/src/mount.rs`
 (`judged`, `still_listed`, `named`, `holders_from`), `crates/api/src/error.rs` (`MountFault::Busy::holders`,
-`MountHolders`, `HoldersUnread`), and `crates/api/src/lib.rs` (`CONTRACT` = 44, the re-exports).
+`MountHolders`, `HoldersUnread`), and `crates/api/src/lib.rs` (`CONTRACT` = 45, the re-exports).
 - **What was owed.** A-507 typed macOS's busy unmount by `unmount(2)`'s `EBUSY`, but Linux's `fusermount3 -u` reports no
   error number: a refused `umount2(2)` prints "failed to unmount %s: %s" and the helper exits 1, as it does for a mount
   not the caller's (libfuse `util/fusermount.c`: `unmount_fuse_locked`, `may_unmount`, `err_out`). So a busy Linux mount
