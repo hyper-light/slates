@@ -7158,6 +7158,12 @@ failure.
 > attachment (`a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb`;
 > `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Open (GAPS): a live-shipped verb whose
 > effects committed before its held-reply bound refused it, and a deferred task that ends on `Overloaded`.
+>
+> A-563 (2026-11-19): a deferred reply too. A reply that comes back through `deliver` is written by `retry_deferred`,
+> which recorded every new one. So a read scatter's `Overloaded`, for a part not sent or not served (A-557), was the
+> request's completion. It now leaves a `not_started` reply unrecorded as well
+> (`a_resend_of_a_read_scatter_refused_overloaded_runs_it_again`;
+> `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`).
 
 > **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
 > its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
@@ -36947,6 +36953,31 @@ until part 2), `crates/bridge-core/tests/invalidation.rs`.
   reader stays open. The retention oracle (`retention_keeps_what_a_live_reader_needs_as_the_model_does`) generates
   both, its model stating each rule, and checks directly that while no growth was refused no record a reader held
   while open has not read has left.
+
+### A-563 — A deferred reply that says its request was not started is never recorded as its completion (2026-11-19, goal 85 via g225; §4.9 RIFL, "Status (2026-11-17, an `Overloaded` verb is never its own completion)"; A-557's sibling, A-533)
+
+- **What was there.** `Overloaded` means not started, so a resend under the id runs the request, and a verb's own such
+  answer is left unrecorded (`recorded_unless_deferred`). A reply that comes back through `deliver` is written by
+  `retry_deferred`, which recorded every new one. A read scatter's `Overloaded`, for a part not sent (2026-11-05) or not
+  served (A-557), came that way, so it was the request's completion: every resend under the id was answered from the
+  record, and the scatter never ran again.
+- **The rule.** `retry_deferred` judges a new deferred reply as a verb's answer is judged: a `not_started` reply
+  (`Overloaded`, `Unpublished`) goes through `unrecorded_not_started`, counted and never recorded, and anything else is
+  recorded as before. A reply already recorded, or deferred again by a full ring, is unchanged.
+- **Test.** `a_resend_of_a_read_scatter_refused_overloaded_runs_it_again` (`crates/server/src/verbs.rs`): a two-shard
+  daemon with its control shard fenced; a client seated on the other shard lists and asks for its grants, each served as
+  its ring hands it over, then sends each again under its own id. Red before the fix: the listing's resend was answered
+  from its record (0.74 s, Mac Studio). Green: both resends go out again, both are answered `Overloaded { shard: 0 }`,
+  and four parts are counted unserved.
+- **Reported, not changed.** `consensus_on_control` answers `Overloaded` after its operation ran: either a shard's
+  publication call or the control call itself was given up. Its resend now runs the operation again. A bootstrap is
+  idempotent (`bootstrap_authorized`) and publishes again; `Recover`'s second run is judged by its own stale checks,
+  not read here.
+
+Applied in the same change to: §4.9 (the 2026-11-17 status), GAPS (the 2026-11-17 entry's sibling, closed),
+`crates/server/src/verbs.rs` (`retry_deferred`, `not_started`'s doc, the test and its shared answer reader), the bug
+records `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md` and
+`docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`.
 
 ### A-539 — A host's refusal code carries its numbering end to end, and the landing reads kinds, never numbers (2026-11-19, g085, UI goal 88; §4.15 step 6, §4.9, §4.12; A-527's owed half; A-185, A-227, A-237, A-519)
 Applied in the same change to: §4.15 step 6 (the rule), §4.9 (status: wire major 3), §4.12's contract log (`CONTRACT`

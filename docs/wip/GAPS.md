@@ -3273,10 +3273,15 @@
 >     - A deferred verb's task records its final reply, and some tasks end on `Overloaded`: a granted landing whose
 >       target lease went unanswered (`landing::acquire_target_lease`, answered through `finish_unrun`), so its
 >       resend meets it for good.
->     - A listing's or the grants' `Overloaded` for a part not sent or not served is delivered as not yet recorded,
+>     - ~~A listing's or the grants' `Overloaded` for a part not sent or not served is delivered as not yet recorded,
 >       and `retry_deferred` records it, so its resend meets it for good (found by A-557, 2026-11-19, g225;
 >       `settle_refused`'s `paged` and the refusal branch of `gather` and `gather_grants`; the status scatter and
->       `xshard::AnswerUnstarted` deliver theirs unrecorded).
+>       `xshard::AnswerUnstarted` deliver theirs unrecorded).~~ Fixed 2026-11-19 by A-563 (g225): `retry_deferred`
+>       leaves a `not_started` reply unrecorded, as `recorded_unless_deferred` does, so the resend runs the scatter
+>       again (`a_resend_of_a_read_scatter_refused_overloaded_runs_it_again`;
+>       `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`). Open beside it:
+>       `consensus_on_control` answers `Overloaded` after its operation ran, and its resend now runs it again (a
+>       bootstrap is idempotent; `Recover`'s second run is not yet read).
 >
 > - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
 >   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply
