@@ -10,11 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 use slates_vcs::ContentStore;
 
+use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::tree::Mode;
 use crate::store::{Found, Repository};
+use crate::unpack::{NoIndex, read_whole};
 
-use super::{Made, blob, commit, ids, push_and_move, sealed, store, tree};
+use super::{EXCHANGE, Made, Ticks, blob, commit, ids, push_and_move, sealed, store, tree};
 
 /// Shape: the paths the generated histories edit: two at the top, two in `d`, one in `d/e`, one in `f`.
 const PATHS: [&[u8]; 6] = [b"a", b"b", b"d/x", b"d/y", b"d/e/z", b"f/w"];
@@ -53,19 +55,31 @@ enum Op {
 }
 
 fn op() -> impl Strategy<Value = Op> {
-  let green = 0..GREENS;
-  let base = prop_oneof![
-    3 => Just(Base::Head),
-    1 => any::<usize>().prop_map(Base::Commit),
-    1 => Just(Base::Root),
-  ];
   let edit = (0..PATHS.len(), proptest::option::of(0..CONTENTS.len()));
-  prop_oneof![
-    6 => (green.clone(), base, proptest::collection::vec(edit, 0..4), proptest::bool::weighted(0.15))
-      .prop_map(|(green, base, edits, refuse)| Op::Commit { green, base, edits, refuse }),
-    2 => (green.clone(), green.clone()).prop_map(|(green, other)| Op::At { green, other }),
-    1 => green.prop_map(|green| Op::Delete { green }),
-  ]
+  (
+    (0u8..9, 0..GREENS, 0..GREENS, 0u8..5, any::<usize>()),
+    (
+      proptest::collection::vec(edit, 0..4),
+      proptest::bool::weighted(0.15),
+    ),
+  )
+    .prop_map(|((selector, green, other, base, at), (edits, refuse))| {
+      let base = match base {
+        0..3 => Base::Head,
+        3 => Base::Commit(at),
+        _ => Base::Root,
+      };
+      match selector {
+        0..6 => Op::Commit {
+          green,
+          base,
+          edits,
+          refuse,
+        },
+        6..8 => Op::At { green, other },
+        _ => Op::Delete { green },
+      }
+    })
 }
 
 /// The model (module docs).
@@ -220,6 +234,7 @@ impl Model {
 struct Real {
   store: ContentStore,
   repository: Repository,
+  clock: Ticks,
 }
 
 fn commit_op(
@@ -298,6 +313,47 @@ fn apply(real: &mut Real, model: &mut Model, op: &Op) {
     Op::At { green, other } => at_op(real, model, *green, *other),
     Op::Delete { green } => delete_op(real, model, *green),
   }
+  let green = match op {
+    Op::Commit { green, .. } | Op::At { green, .. } | Op::Delete { green } => *green,
+  };
+  if let Some(version) = real.repository.versions(green).checked_sub(1) {
+    let encoded = real.repository.encode_fragments(
+      &mut real.store,
+      (green, version),
+      &mut real.clock,
+      EXCHANGE,
+    );
+    assert_eq!(encoded, Ok(()));
+  }
+}
+
+/// Every green's versions read back through A-608's reader from one pack of all their fragments:
+/// the objects of their D(k)s, each with the bytes the model made. A pack that spans a rewrite may
+/// hold an object twice (a version brought it again); the reader takes both.
+fn check_packs(real: &Real, model: &Model) {
+  for (green, heads) in &model.heads {
+    let last = heads.len() - 1;
+    let pack = real
+      .repository
+      .pack(&real.store, *green, (0, last))
+      .unwrap();
+    let unpacked =
+      read_whole(&pack, model.format, &NoIndex, &mut Admission::new(u64::MAX)).unwrap();
+    let read: BTreeMap<ObjectId, Vec<u8>> = unpacked
+      .objects
+      .into_iter()
+      .map(|object| (object.id, object.content))
+      .collect();
+    let expected: BTreeSet<ObjectId> = (0..heads.len())
+      .flat_map(|version| model.brought(*green, version))
+      .collect();
+    assert_eq!(read.keys().copied().collect::<BTreeSet<_>>(), expected);
+    assert!(
+      read
+        .iter()
+        .all(|(id, content)| model.objects[id].content == *content)
+    );
+  }
 }
 
 /// A ref's versions read as the model's: each head and D(k), and the reached set its head's closure.
@@ -375,6 +431,7 @@ fn check(real: &Real, model: &Model) {
     check_paths(real, model, green);
   }
   check_rows(real, model);
+  check_packs(real, model);
 }
 
 proptest! {
@@ -388,13 +445,13 @@ proptest! {
   #[test]
   fn the_git_store_reads_as_its_map_model_over_every_history(sha256 in any::<bool>(), ops in proptest::collection::vec(op(), 1..24)) {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
-    let mut real = Real { store: store(), repository: Repository::new(format) };
+    let mut real = Real { store: store(), repository: Repository::new(format), clock: Ticks(0) };
     let mut model = Model::new(format);
     for op in &ops {
       apply(&mut real, &mut model, op);
       check(&real, &model);
     }
-    let Real { mut store, repository } = real;
+    let Real { mut store, repository, .. } = real;
     repository.release(&mut store).unwrap();
     prop_assert!(store.is_empty());
   }

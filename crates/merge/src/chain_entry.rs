@@ -25,6 +25,8 @@
 //! **The encoding** follows the origin's and the checkpoint's: magic and version, little-endian, every count checked
 //! against the bytes that remain before anything is allocated, any malformation refused typed ([`DocDecodeError`]).
 
+use std::collections::BTreeMap;
+
 use crate::engine::Increment;
 use crate::ops_doc::{DocDecodeError, Op, OpKind, Reader};
 use crate::origin::{put_bytes, put_count, reader_bytes, take_str};
@@ -108,8 +110,9 @@ pub enum Applied {
   /// Remove an xattr: path, name.
   RemoveXattr(String, String),
   /// Copy `from`'s tree to `dst` by reference (A-586): what the head holds of it, which the verdict found unchanged
-  /// since `version`, the source's version the increment declared. Encoded as its two paths; `version` is read back
-  /// from the increment's own `Copy` operation, so the entry costs no more than its bound's two strings.
+  /// since `version`, the source's version the increment declared, replacing what `dst` holds when `replace` (A-626).
+  /// Encoded as its two paths; `version` and `replace` are read back from the increment's own `Copy` operation, so the
+  /// entry costs no more than its bound's two strings.
   CopyTree {
     /// The destination.
     dst: String,
@@ -117,6 +120,8 @@ pub enum Applied {
     from: String,
     /// The version of the source the increment copies.
     version: u64,
+    /// Whether the copy replaces what the destination holds ([`crate::ops_doc::REPLACE`]).
+    replace: bool,
   },
 }
 
@@ -250,8 +255,9 @@ pub fn encode(
   out.extend_from_slice(&VERSION.to_le_bytes());
   put_bytes(&mut out, increment_bytes);
   put_count(&mut out, applied.len());
+  let declared = Declared::of(increment);
   for effect in applied {
-    put_applied(&mut out, increment, effect);
+    put_applied(&mut out, &declared, effect);
   }
   match completion {
     Some(key) => {
@@ -330,8 +336,9 @@ pub fn decode(entry: &[u8]) -> Result<ChainEntry, DocDecodeError> {
     return Err(DocDecodeError::Truncated);
   }
   let mut applied = Vec::with_capacity(count);
+  let declared = Declared::of(&increment);
   for _ in 0..count {
-    applied.push(take_applied(&mut reader, &increment)?);
+    applied.push(take_applied(&mut reader, &declared)?);
   }
   let completion = match reader.u8()? {
     PRESENT => {
@@ -448,27 +455,70 @@ fn put_tagged_paths(out: &mut Vec<u8>, tag: u8, paths: &[&str]) {
   }
 }
 
-/// The content ops `increment` declares for `path`, in order.
-fn declared_ops(increment: &Increment, path: &str) -> Vec<Op> {
-  increment
-    .doc
-    .ops
-    .iter()
-    .filter(|op| {
-      crate::engine::is_content(op.kind) && increment.doc.paths.path(op.path) == Some(path)
-    })
-    .copied()
-    .collect()
+/// What an increment declares, indexed for its entry's effects (A-632): each path's content ops in
+/// order, and each copy's source version and whether it replaces, by its destination and source
+/// (A-586, A-626). Built in one pass
+/// over the increment's ops, once per entry encoded or decoded; finding them by scanning every op
+/// for each splice and each copy cost O(effects × ops), quadratic for a version that splices many
+/// files.
+struct Declared<'a> {
+  /// Each path's content ops, in the increment's order.
+  ops: BTreeMap<&'a str, Vec<Op>>,
+  /// Each copy's source version and whether it replaces, by destination, then source; the first a
+  /// pair declares.
+  copies: BTreeMap<&'a str, BTreeMap<&'a str, (u64, bool)>>,
 }
 
-fn put_applied(out: &mut Vec<u8>, increment: &Increment, applied: &Applied) {
+impl<'a> Declared<'a> {
+  /// The index of what `increment` declares: every op visited once.
+  fn of(increment: &'a Increment) -> Declared<'a> {
+    let mut declared = Declared {
+      ops: BTreeMap::new(),
+      copies: BTreeMap::new(),
+    };
+    let paths = &increment.doc.paths;
+    for op in &increment.doc.ops {
+      #[cfg(test)]
+      tests::count_visit();
+      let Some(path) = paths.path(op.path) else {
+        continue;
+      };
+      if crate::engine::is_content(op.kind) {
+        declared.ops.entry(path).or_default().push(*op);
+      } else if op.kind == OpKind::Copy
+        && let Some(from) = paths.path(op.src)
+      {
+        declared
+          .copies
+          .entry(path)
+          .or_default()
+          .entry(from)
+          .or_insert((op.at, op.replaces()));
+      }
+    }
+    declared
+  }
+
+  /// The content ops the increment declares for `path`, in order.
+  fn ops_for(&self, path: &str) -> &[Op] {
+    self.ops.get(path).map_or(&[][..], Vec::as_slice)
+  }
+
+  /// The source version of the copy the increment declares from `from` to `dst`, and whether it
+  /// replaces; `None` when it declares none, which no entry the engine recorded holds.
+  fn copy(&self, dst: &str, from: &str) -> Option<(u64, bool)> {
+    self.copies.get(dst)?.get(from).copied()
+  }
+}
+
+fn put_applied(out: &mut Vec<u8>, declared: &Declared<'_>, applied: &Applied) {
   match applied {
     Applied::Special(path, node) => {
       put_tagged_paths(out, tag::SPECIAL, &[path]);
       put_bytes(out, &node.encode());
     }
     Applied::RemoveSpecial(path) => put_tagged_paths(out, tag::REMOVE_SPECIAL, &[path]),
-    Applied::Spliced(path, ops) if *ops == declared_ops(increment, path) => {
+    Applied::Spliced(path, ops) if ops.as_slice() == declared.ops_for(path) => {
       put_tagged_paths(out, tag::SPLICED_AS_DECLARED, &[path]);
     }
     Applied::Spliced(path, ops) => {
@@ -506,7 +556,10 @@ fn put_applied(out: &mut Vec<u8>, increment: &Increment, applied: &Applied) {
   }
 }
 
-fn take_applied(reader: &mut Reader<'_>, increment: &Increment) -> Result<Applied, DocDecodeError> {
+fn take_applied(
+  reader: &mut Reader<'_>,
+  declared: &Declared<'_>,
+) -> Result<Applied, DocDecodeError> {
   Ok(match reader.u8()? {
     tag::SPECIAL => {
       let path = take_str(reader)?;
@@ -519,7 +572,7 @@ fn take_applied(reader: &mut Reader<'_>, increment: &Increment) -> Result<Applie
     }
     tag::SPLICED_AS_DECLARED => {
       let path = take_str(reader)?;
-      let ops = declared_ops(increment, &path);
+      let ops = declared.ops_for(&path).to_vec();
       Applied::Spliced(path, ops)
     }
     tag::CREATED => {
@@ -573,30 +626,88 @@ fn take_applied(reader: &mut Reader<'_>, increment: &Increment) -> Result<Applie
     tag::COPY_TREE => {
       let dst = take_str(reader)?;
       let from = take_str(reader)?;
-      let version = declared_copy(increment, &dst, &from).ok_or(DocDecodeError::BadKind)?;
-      Applied::CopyTree { dst, from, version }
+      let (version, replace) = declared.copy(&dst, &from).ok_or(DocDecodeError::BadKind)?;
+      Applied::CopyTree {
+        dst,
+        from,
+        version,
+        replace,
+      }
     }
     _ => return Err(DocDecodeError::BadKind),
   })
 }
 
-/// The source version of the `Copy` operation `increment` declares from `from` to `dst` (A-586); `None` when it declares
-/// none, which no entry the engine recorded holds.
-fn declared_copy(increment: &Increment, dst: &str, from: &str) -> Option<u64> {
-  // Each index is 64 bits (A-621): narrowed to 16, a copy past the 65,535th path was never found.
-  let path = |index: u64| increment.doc.paths.path(index);
-  increment
-    .doc
-    .ops
-    .iter()
-    .find(|op| op.kind == OpKind::Copy && path(op.path) == Some(dst) && path(op.src) == Some(from))
-    .map(|op| op.at)
-}
-
 #[cfg(test)]
 mod tests {
+  use std::cell::Cell;
+
   use super::*;
   use crate::ops_doc::OpsDoc;
+
+  thread_local! {
+    /// The increment's ops an entry's index visited on this thread ([`Declared::of`]).
+    static VISITS: Cell<u64> = const { Cell::new(0) };
+  }
+
+  /// Counts one op visited by [`Declared::of`] (test builds).
+  pub(super) fn count_visit() {
+    VISITS.with(|count| count.set(count.get().saturating_add(1)));
+  }
+
+  /// The ops visited on this thread since the last read, the count reset.
+  fn visits() -> u64 {
+    VISITS.with(|count| count.replace(0))
+  }
+
+  /// Shape: the files a version splices, each as its increment declared it.
+  const FILES: usize = 1_000;
+
+  /// A-632 (failing first: each splice's declared ops were found by scanning every op of the
+  /// increment). Do: record a version splicing each of a thousand files as its increment declared
+  /// it (so each splice is recorded by its path alone and its ops found again from the increment),
+  /// counting the increment's ops the entry's encode and its decode visit. Expect each to visit
+  /// every op once, a thousand, never once a splice (a million), and the entry to decode to what
+  /// was recorded.
+  #[test]
+  fn an_entry_finds_each_splices_declared_ops_in_one_pass() {
+    let names: Vec<String> = (0..FILES).map(|n| format!("src/{n:04}.c")).collect();
+    let mut doc = OpsDoc::new();
+    for name in &names {
+      let path = doc.paths.intern(name);
+      doc.ops.push(Op {
+        kind: OpKind::Overwrite,
+        flags: 0,
+        path,
+        at: 0,
+        len: 1,
+        src: 0,
+      });
+    }
+    doc.canonicalize();
+    let increment = Increment {
+      id: [3; 32],
+      base: 0,
+      doc,
+      post_state: b"x".to_vec(),
+      evidence: Vec::new(),
+    };
+    let applied: Vec<Applied> = increment
+      .doc
+      .ops
+      .iter()
+      .zip(&names)
+      .map(|(op, name)| Applied::Spliced(name.clone(), vec![*op]))
+      .collect();
+    let increment_bytes = increment.encode();
+    visits();
+    let bytes = encode(&increment_bytes, &increment, &applied, None, None, None);
+    let encoded = visits();
+    let entry = decode(&bytes).unwrap();
+    let decoded = visits();
+    assert_eq!(entry.applied, applied);
+    assert_eq!((encoded, decoded), (FILES as u64, FILES as u64));
+  }
 
   /// A-621 (the chain entry's version 5). Do: record a version whose increment names 65,537 paths, its splice on the
   /// last path an op the verdict mapped (so the entry writes the op whole, its path index with it) and its splice on
