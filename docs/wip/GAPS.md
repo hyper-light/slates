@@ -1221,9 +1221,11 @@
 > every step and every settling delivery (the Mac Studio, kiln r176: 7,198 and 6,329 reads judged at `f = 1` and
 > `f = 2`, 3,721 and 3,035 of them past a holder without a durable write, none broken). Its first run found the model's
 > successor naming fresh members as holders without `following`, which the daemon's does not; the model now takes the
-> superseded shipper's committed holders. **Owed:** the real-process runs of `crates/cli/tests/live_chaos.rs`
-> (main's); and main's answer to whether a live-shipped volume can be taken over with no holders recorded, where the
-> daemon's successor falls back to the configuration's candidates (`live_ship`).
+> superseded shipper's committed holders. The daemon's question it raised is answered by reading (A-601, continued
+> (1)): a live-shipped volume can be taken over with no holders recorded, but then no log ever shipped, no holder is
+> counted, the volume is served from its placed seal, and the successor's configuration-chosen holders belong to a
+> log that begins new; a successor of an adopted log keeps the recorded holders (`live_ship`'s module doc). **Owed:**
+> the real-process runs of `crates/cli/tests/live_chaos.rs` (main's).
 
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
