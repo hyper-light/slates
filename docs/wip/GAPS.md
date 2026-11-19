@@ -2652,9 +2652,17 @@
 >   here); both red with the destroy path and `find_record`'s check taken out (diag-slabs-41, run 42506866717). On both
 >   Windows runners (run 42506866249) the WinFsp suite 16 of 17, its one failure A-254's second-daemon test (owned by
 >   conformance). Record: `docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.
-> - **Open, found here:** on Linux a kept FUSE mount of such a volume is let go but never unmounted (the stale-mount
->   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
->   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
+> - **Fixed 2026-11-18 (A-509, goal 85, g079): on Linux a kept FUSE mount of such a volume was let go but never
+>   unmounted, so it answered `ENOTCONN` until someone unmounted it by hand.** Recovery left the volume out of its
+>   reconciliation, so the device the anchor held was let go with the mount still in the kernel's table. Now the kept
+>   mount is served on and every request answered `EIO` (`fuse.unrecovered_refused`), until its user releases it
+>   (A-102) or the volume is destroyed; the anchor keeps its device, so a later restart that rebuilds the volume serves
+>   it again. A mount whose device was not held is left and its record ended, as any dead mount's. Held by
+>   `a_kept_mount_of_a_volume_recovery_could_not_rebuild_answers_each_request_eio` (the server's unit tests, Linux).
+>   Record: `docs/bugs/2026-11-18-a-kept-fuse-mount-of-a-volume-recovery-could-not-rebuild-answered-enotconn-until-
+>   unmounted-by-hand.md`. **Owed (main's):** the flow on a real Linux mount (a volume left unrecovered across a
+>   restart, `ls` through its kept mount answering `EIO`, the mount served again once a restart rebuilds it).
+> - **Open, found here:** the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
 
 > **Ubuntu 26.04 confines `fusermount3`, so a Linux `slates mount` reaches only some directories (found 2026-11-09,
 > slabs; a product limit, recorded for users in `docs/cli.md`).** Main's live-guest lane failed at its first `slates mount`
@@ -3946,8 +3954,18 @@
 >   runs on the target and whose answer a stopped shard loses after it: a direct map's send to its client, closed by
 >   A-505 (2026-11-19, g225: the client's shard records each map it sent until its reply arrives, a second ask is
 >   answered from the record, and a hand-off whose answers were all lost keeps its copy as handed;
->   `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`); open: the Shards route's take
->   of an offer, and recovery's `rebuild_remote_works` (its docs accept a non-answering shard's works left unbuilt).
+>   `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`); recovery's
+>   `rebuild_remote_works`, closed by A-513 (2026-11-18, g230: judged under §4.16 first, the acceptance did not hold. A
+>   work left unbuilt by a lost answer, not by a log that would not replay, is unserved for the daemon's life, every
+>   change it acknowledged out of reach against A-207 and A-247's "unserved until it has", and its floor holds its
+>   green's checkpoint at its base; and the pass took the shard's whole list, so one lost answer cost every such work
+>   of the shard. Now the list is read, never taken (`verbs::unbuilt_works`), each ask is made once more after a lost
+>   answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
+>   nothing (`verbs::install_replayed_work`), where it once made the work afresh and charged it twice;
+>   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). **Still owed
+>   (A-513):** a work whose asks go unanswered twice keeps its record and stays unbuilt until the daemon's next start;
+>   a retry after admission, and its verbs answering `Unpublished` (A-247's word) rather than `NotFound` meanwhile, are
+>   not built. Open: the Shards route's take of an offer.
 >   **Class C, the rendezvous's
 >   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and

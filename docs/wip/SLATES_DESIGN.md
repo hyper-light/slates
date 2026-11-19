@@ -2520,6 +2520,14 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > unmounts it, so no write by path reaches the disk beneath. The restart after a crash likewise ends a dead mount's
 > record and leaves the mount for its user (`leave_stale`, counted `fuse.dead_mount_left`); that path runs only on
 > kernels before Linux 6.9, since later ones keep the mount through the anchor's held device (A-61).
+>
+> **Status (2026-11-18, A-509: a kept mount of a volume recovery could not rebuild).** Such a mount is served again
+> like any kept mount, and its every request is answered `EIO` without reaching any volume (`fuse::refuse_unrecovered`,
+> counted `fuse.unrecovered_refused`; a `FORGET` by nothing). It stays its user's to release (A-102) and ends when the
+> kernel disconnects; the anchor keeps its device, so a later restart whose recovery rebuilds the volume serves it as
+> any kept mount. A mount of such a volume whose device was not held is left and its record ended, as any dead mount's.
+> Before, recovery passed the volume's attachments by: the held device was let go with the mount still in the kernel's
+> table, which answered `ENOTCONN` until someone unmounted it by hand.
 
 > **Status (2026-10-01, AUD-29-77 in part: kept copies charged; protection named).** A guest device's copy
 > buffers are charged to its attachment for as long as it keeps them: growth is charged and reserved exactly,
@@ -10956,6 +10964,16 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
 > by the owner's answer (`crates/server/src/work_home.rs`). Each work's base is held by a durable floor on the green's
 > partition. Across nodes (a work on the creating client's node) is not built.
+
+> **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
+> recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
+> target's own time. Every ask may lose its answer after it ran, and the pass took the work's shard's list of such
+> works, so one lost answer left all of them unbuilt for the daemon's life: unserved, every change they acknowledged out
+> of reach (against A-207 and the recovery rule above, "unserved until it has"), and each floor holding its green's
+> checkpoint at its base. The list is now read, never taken (`verbs::unbuilt_works`), each ask is made once more after
+> a lost answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
+> nothing (`verbs::install_replayed_work`). Owed: a work whose asks go unanswered twice stays unbuilt until the next
+> start; its verbs then answer `NotFound` rather than `Unpublished`.
 
 **Submission.** `submit(work_volume, evidence?)`: seal the work volume (drain open extents,
 compose the net op set, chunk; in a fleet, place the snapshot to its candidate holders now, at
@@ -34591,3 +34609,63 @@ Applied in the same change to: §4.6's contract log (`CONTRACT` = 42), GAPS (the
 `StillMounted`, `MountTable`; `Unmount` and `NotMounted` restated), `crates/api/src/lib.rs` (`CONTRACT` = 42),
 `crates/api/Cargo.toml` and `Cargo.lock` (`slates-bridge-oci` on Unix), `crates/api/tests/api.rs`, and
 `crates/cli/src/verbs.rs` (a doc line).
+
+### A-509 — A kept FUSE mount of a volume recovery could not rebuild is served on, refusing every request `EIO`, until its user releases it (2026-11-18, goal 85, g079; §4.6 "Linux", §4.8 `NotRecovered`; A-61, A-102, A-304)
+Applied in the same change to: §4.6 "Linux" (a status under AUD-29-64's), GAPS (the not-recovered entry's open line),
+`crates/server/src/verbs.rs` (`keep_unrecovered_mounts`), `crates/server/src/fuse.rs` (`refuse_unrecovered`, the turn's
+not-recovered branch, `fuse.unrecovered_refused`, the failing test), `crates/bridge-fuse/src/channel.rs`
+(`refuse_unserved`), and the bug record
+`docs/bugs/2026-11-18-a-kept-fuse-mount-of-a-volume-recovery-could-not-rebuild-answered-enotconn-until-unmounted-by-hand.md`.
+- **What was there.** Recovery reconciles a rebuilt volume's attachments: a FUSE mount whose device the anchor held is
+  kept and served again (A-61), any other is left in place for its user and its record ended (A-102). A volume recovery
+  could not rebuild was left out of that reconciliation, so its held device was let go at the end of recovery with
+  the mount still in the kernel's table: every call answered `ENOTCONN`, nothing named why, and a later restart that
+  rebuilt the volume came back to no mount. Only an unmount by hand ended it.
+- **The decision.** Ending the mount cleanly so the kernel reports it gone is an unmount, which A-102 refuses: a mount
+  removed under a process exposes the directory beneath it, and a write by path then reaches the disk. A not-recovered
+  volume answers every verb `NotRecovered` with its cause (§4.8); at a FUSE mount the only word is an errno, and
+  `EIO` is the one a program reads as a store it cannot reach. So the kept mount is served on, every request answered
+  `EIO` without reaching any volume, a `FORGET` by nothing (its lookups taken off what the kernel holds), and the
+  takeover round a restored mount owes (A-158) is owed no more, since nothing of the volume is served. The mount ends
+  when the kernel disconnects (its user's unmount) or when the volume is destroyed (A-102's end). The anchor keeps the
+  device meanwhile, so a later restart whose recovery rebuilds the volume adopts the mount as any kept mount. A mount
+  whose device was not held is left in place and its record ended, as any dead mount's (`leave_stale`).
+- **Rejected.** Letting the device go with an unmount (A-102's hazard); serving `ENOTCONN` by hand (the same dead
+  mount, with no way back when the volume recovers); a per-cause errno (`ENOENT` for a missing base, `ENOMEM` for
+  resources): each would tell a program something about one file the volume as a whole refuses, while the cause is in
+  `volume list` (`not_recovered=<kind>`).
+- **Not changed.** Pages the kernel cached before the restart are still read without a request, as from any ended
+  mount (the revoked round's drop, AUD-29-84, is a consumer's revocation's).
+- **Tests.** `a_kept_mount_of_a_volume_recovery_could_not_rebuild_answers_each_request_eio` (`crates/server/src/fuse.rs`,
+  the server's unit tests on Linux: a mount over a socket pair standing in for `/dev/fuse`, of a volume the shard records
+  unrecovered; a `FORGET` and a `LOOKUP`): red without the turn's not-recovered branch on adacachy (both turns ended the
+  mount, no reply); green with it.
+
+### A-513 — A work replayed through its green's owner at recovery is found again after a lost answer, and installed once (2026-11-18, g230, goal 85; A-488's and A-505's sibling; §4.16 "Recovery", A-207, A-247)
+Applied in the same change to: §4.16 (a status after A-247's), GAPS (class A's lost-answer siblings),
+`docs/bugs/2026-11-18-a-remote-works-rebuild-lost-every-work-of-a-shard-to-one-lost-answer.md` (new), and
+`crates/server/src/daemon.rs` (`rebuild_remote_works`, `rebuild_remote_work`, `ask_once_more`),
+`crates/server/src/verbs.rs` (`unbuilt_works`, `install_replayed_work`) and `crates/server/src/work_home.rs`
+(`Unbuilt`).
+- **The question first: may such a work stay unbuilt?** The pass's docs accepted that a shard that does not answer
+  leaves its works unbuilt, their verbs answering `NotFound` as a work whose log would not replay. Under §4.16 that
+  does not hold. A work's log is kept, so nothing is lost from storage, but the work is unserved for the daemon's life:
+  every change it acknowledged before the restart is out of the client's reach, which A-207 exists to prevent ("every
+  change it acknowledged before the restart is there after it"), and A-247's recovery rule makes the work unserved only
+  "until it has" been replayed. Its floor stays too (`reconcile_work_floors` keeps a floor whose work could not be
+  rebuilt), so its green's checkpoint never folds past its base. A log that does not replay is a different case: that
+  is the work's own state, refused and counted (`merge.work_rebuild_refused`). A lost answer is not.
+- **What was there.** `rebuild_remote_works` took each shard's list (`std::mem::take` of `work_home.unbuilt`), so a
+  listing whose answer was lost after it ran left every such work of that shard unbuilt; a lost answer to the log read
+  or the owner's replay skipped the work; and an install asked again made the work afresh and charged its budget twice.
+- **The rule.** The list is read and never taken; each ask is made once more when its answer was lost, behind the
+  first on the target's channel, as A-505 asks a map's send; the install ends the work's record on its shard, so a
+  second install changes nothing. The log read and the owner's replay are reads, so asking again is safe. A work whose
+  asks go unanswered twice keeps its record, counted in the recovery's log line, and is replayed at the next start.
+- **Test.** `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`
+  (`verbs`' unit tests: a recorded work listed twice, the first answer lost; its outcome installed twice, the first
+  answer lost, the work marked between). Expect the second listing to name the work, the first install to make and
+  charge it, the second to charge nothing and keep the marked work, and nothing owed after. Green on the Mac Studio
+  (kiln r114, debug, 0.74 s); red with both functions back as they were (the listing taken, the install unguarded):
+  the second listing empty, the second install charging the work's 96 bytes again and dropping the marked work.
+

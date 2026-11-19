@@ -48,7 +48,7 @@ use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, LostWrites, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
   ChangeSignal, Dispatched, FuseChannel, Sent, ServeState, Step, Turn, Wake, dispatch_ready,
-  reclaim_dispatched, redeliver_after_refusal, send_reply, serve_step,
+  reclaim_dispatched, redeliver_after_refusal, refuse_unserved, send_reply, serve_step,
 };
 use slates_bridge_fuse::mount::{
   Awaiting, Mount, MountError, PendingExit, Progress, begin_mount, begin_unmount,
@@ -846,12 +846,51 @@ fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
   turned
 }
 
+/// Format: `EIO`, the errno a kept mount of a volume recovery could not rebuild answers every request with (A-509): the
+/// volume is the shard's, listed with its cause (`volume list`, `not_recovered=<kind>`), and nothing of it can be read
+/// or written, which is what `EIO` tells a program of a store it cannot reach.
+const NOT_RECOVERED_ERRNO: i32 = EIO;
+/// Format: requests a kept mount of a volume recovery could not rebuild answered [`NOT_RECOVERED_ERRNO`] (A-509): the
+/// non-vacuity counter of that mount's service.
+const UNRECOVERED_REFUSED: &str = "fuse.unrecovered_refused";
+
+/// One turn of a mount whose volume recovery could not rebuild (§4.8 `NotRecovered`, A-509): a request turn answers the
+/// waiting request [`NOT_RECOVERED_ERRNO`] without reaching any volume (`slates_bridge_fuse::channel::refuse_unserved`);
+/// a change turn has nothing to tell, since no change of the volume is served. The mount stays its user's to release
+/// (A-102) and ends when the kernel disconnects; its device stays held by the anchor, so a later restart whose recovery
+/// rebuilds the volume serves it again. Before, its turn found no volume and ended it as a destroyed volume's: its device
+/// dropped, the kernel answered every call `ENOTCONN` until someone unmounted it by hand, and the volume came back to no
+/// mount.
+fn refuse_unrecovered(s: &mut ShardState, mount: &mut FuseMount, kind: TurnKind) -> Turned {
+  if matches!(kind, TurnKind::Change) {
+    mount.change.drain();
+    return Turned::Idle;
+  }
+  match refuse_unserved(&mut mount.channel, &mut mount.serve, NOT_RECOVERED_ERRNO) {
+    Ok(Turn::Idle) => Turned::Idle,
+    Ok(Turn::Ended) => Turned::Ended,
+    Ok(_) => {
+      s.count(UNRECOVERED_REFUSED, 1);
+      Turned::Served
+    }
+    Err(_) => {
+      // Ended without an unmount: the mount answers `ENOTCONN` until its user unmounts it (see `turn`).
+      s.count(SERVE_FAILED, 1);
+      Turned::Ended
+    }
+  }
+}
+
 /// One turn of `mount`, lent by [`turn`] and out of the shard's map while it runs.
 fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: TurnKind) -> Turned {
   // The volume is gone (destroyed): the mount ends without an unmount. Its device dropped and the anchor's copy
   // released (`ended`), the kernel answers every later call `ENOTCONN` until the mount's user unmounts it, so no write
-  // by path falls through to the disk beneath (conditions 3 and 4).
+  // by path falls through to the disk beneath (conditions 3 and 4). A volume recovery could not rebuild is no gone one:
+  // its mount is served on, refusing every request (A-509, [`refuse_unrecovered`]).
   let Some(&handle) = s.by_id.get(&mount.volume) else {
+    if s.unrecovered.contains_key(&mount.volume) {
+      return refuse_unrecovered(s, mount, kind);
+    }
     return Turned::Ended;
   };
   let told_before = mount.serve.told_through();
@@ -1674,5 +1713,132 @@ async fn reap(mut pending: PendingExit) {
       let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
       return;
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
+
+  /// Shape: the attachment id the test's mount is held under.
+  const ATTACHMENT: u64 = 7;
+  /// Shape: the node the test's `FORGET` gives back.
+  const FORGOTTEN_NODE: u64 = 9;
+  /// Format: the kernel's root node (`FUSE_ROOT_ID`).
+  const ROOT_NODE: u64 = 1;
+
+  /// The bytes of a FUSE request (`struct fuse_in_header`, `include/uapi/linux/fuse.h`, then `body`): its length, its
+  /// opcode, `unique` and `nodeid`, and no caller's ids.
+  fn request(opcode: Opcode, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(IN_HEADER_LEN + body.len()).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(&opcode.to_wire().to_le_bytes());
+    bytes.extend_from_slice(&unique.to_le_bytes());
+    bytes.extend_from_slice(&nodeid.to_le_bytes());
+    // uid, gid and pid, then the extension length and its padding.
+    bytes.extend_from_slice(&[0u8; 16]);
+    bytes.extend_from_slice(body);
+    bytes
+  }
+
+  /// A-509 (§4.6 "Linux", §4.8 `NotRecovered`, A-102): a kept mount of a volume recovery could not rebuild is served
+  /// on, each request answered `EIO`, until its user releases it. Do: on an audit shard, hold a FUSE mount over a socket
+  /// pair standing in for `/dev/fuse`, of a volume the shard records unrecovered (no slot, as recovery leaves one);
+  /// send a `FORGET` and then a `LOOKUP`, and take the mount's request turns. Expect both turns served, the `FORGET`
+  /// answered by nothing and the `LOOKUP` by `EIO` under its own `unique`, and both counted `fuse.unrecovered_refused`.
+  /// Before, the turn found no volume and ended the mount as a destroyed volume's: its device dropped, the kernel
+  /// answered every call `ENOTCONN` until someone unmounted it by hand.
+  #[test]
+  fn a_kept_mount_of_a_volume_recovery_could_not_rebuild_answers_each_request_eio() {
+    let (turns, counted, replies) = crate::daemon::audit_on_shard(|s| {
+      let volume = VolumeId { bytes: [0x51; 16] };
+      s.unrecovered
+        .insert(volume, slates_ipc::protocol::RecoveryCause::NoImage);
+      let (device, peer) = rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::SEQPACKET,
+        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+        None,
+      )
+      .unwrap();
+      let registry = s
+        .attachments
+        .attach(
+          volume,
+          View::Current,
+          Principal::Uid {
+            host: slates_db::HostId(0),
+            uid: 0,
+          },
+          Rights {
+            read: true,
+            write: true,
+          },
+        )
+        .unwrap();
+      let mut serve = ServeState::new();
+      let change = change_signal(&mut serve).unwrap();
+      s.fuse_mounts.insert(
+        ATTACHMENT,
+        FuseMount {
+          channel: FuseChannel::nonblocking(device).unwrap(),
+          serve,
+          handles: new_handle_store(),
+          registry,
+          volume,
+          mount_point: "/kept/by/the/anchor".to_owned(),
+          scope: None,
+          session_held: true,
+          lost: LostWrites::new(std::collections::BTreeSet::new(), false),
+          change,
+          seen: 0,
+          held: std::collections::VecDeque::new(),
+          _own: OwnMountRecord(0),
+        },
+      );
+      rustix::io::write(
+        &peer,
+        &request(Opcode::Forget, 1, FORGOTTEN_NODE, &1u64.to_le_bytes()),
+      )
+      .unwrap();
+      rustix::io::write(&peer, &request(Opcode::Lookup, 2, ROOT_NODE, b"f\0")).unwrap();
+      let turns: Vec<&'static str> = (0..2)
+        .map(|_| match turn(s, ATTACHMENT, TurnKind::Request) {
+          Turned::Idle => "idle",
+          Turned::Served => "served",
+          Turned::Fenced => "fenced",
+          Turned::Ended => "ended",
+        })
+        .collect();
+      let mut replies = Vec::new();
+      let mut buffer = [0u8; 2 * OUT_HEADER_LEN];
+      while let Ok(n) = rustix::io::read(&peer, &mut buffer) {
+        replies.push(buffer[..n].to_vec());
+      }
+      s.fuse_mounts.remove(&ATTACHMENT);
+      let counted = s.refusals.get(UNRECOVERED_REFUSED).copied().unwrap_or(0);
+      (turns, counted, replies)
+    });
+    assert_eq!(
+      turns,
+      vec!["served", "served"],
+      "the mount serves on, refusing"
+    );
+    assert_eq!(
+      replies.len(),
+      1,
+      "the FORGET is answered by nothing and the LOOKUP once: {replies:?}"
+    );
+    let reply = &replies[0];
+    let error = i32::from_le_bytes(reply[4..8].try_into().unwrap());
+    let unique = u64::from_le_bytes(reply[8..16].try_into().unwrap());
+    assert_eq!(
+      (error, unique),
+      (-NOT_RECOVERED_ERRNO, 2),
+      "the LOOKUP is answered EIO"
+    );
+    assert_eq!(counted, 2, "both requests counted refused");
   }
 }
