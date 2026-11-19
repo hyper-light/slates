@@ -51,15 +51,6 @@ const SVNDIFF1: &[u8] = b"svndiff1 ";
 /// The sessions the golden replay must meet: every recorded one.
 const REPLAYED: usize = 40;
 
-/// The entry `svnserve` hides from the anonymous principal in a listing (`make-fixtures.py`'s
-/// `AUTHZ`), which A-613's `get-dir` lists: the read commands apply no authorization yet (A-606,
-/// owed in `reads`).
-const HIDDEN: &[u8] = b"secret";
-
-/// The answers the replay meets where slates lists [`HIDDEN`] and `svnserve` does not: one, the
-/// listing of `/trunk` in `update-depth-files`.
-const HIDDEN_LISTINGS: usize = 1;
-
 /// The repository `svnserve` named for every recorded session's URL: anonymous reads, users with
 /// keys, mergeinfo announced, its UUID its realm (`make-fixtures.py`).
 fn fixtures_repository() -> Repository<'static> {
@@ -248,30 +239,15 @@ fn drive_span(items: &[&[u8]]) -> (usize, usize) {
   (start, start + drive.len())
 }
 
-/// A tree without the directory entry named [`HIDDEN`].
-fn without_hidden(tree: Tree) -> Tree {
-  match tree {
-    Tree::List(items) => Tree::List(
-      items
-        .into_iter()
-        .filter(|item| !matches!(item, Tree::List(record) if record.first() == Some(&Tree::Bytes(HIDDEN.to_vec())) && matches!(record.get(1), Some(Tree::Word(_)))))
-        .map(without_hidden)
-        .collect(),
-    ),
-    other => other,
-  }
-}
-
-/// Asserts that items match one for one as trees, ours allowed to list [`HIDDEN`] where theirs
-/// does not; the answers that did so are counted into `hidden`.
-fn assert_items(name: &str, ours: &[&[u8]], theirs: &[&[u8]], hidden: &mut usize) {
+/// Asserts that items match one for one as trees.
+fn assert_items(name: &str, ours: &[&[u8]], theirs: &[&[u8]]) {
   assert_eq!(ours.len(), theirs.len(), "{name}: the items");
   for (index, (ours, theirs)) in ours.iter().zip(theirs).enumerate() {
-    let (ours, theirs) = (tree(&value_of(ours)), tree(&value_of(theirs)));
-    if ours != theirs {
-      assert_eq!(without_hidden(ours), theirs, "{name}: item {index}");
-      *hidden += 1;
-    }
+    assert_eq!(
+      tree(&value_of(ours)),
+      tree(&value_of(theirs)),
+      "{name}: item {index}"
+    );
   }
 }
 
@@ -283,7 +259,6 @@ fn assert_as_svnserve(
   ours: &[&[u8]],
   server: &[u8],
   texts: &BTreeMap<[u8; 16], Vec<u8>>,
-  hidden: &mut usize,
 ) {
   let theirs = items(server);
   let greeting: Vec<u8> = {
@@ -298,10 +273,10 @@ fn assert_as_svnserve(
   let (our_start, our_end) = drive_span(ours);
   let (their_start, their_end) = drive_span(&theirs);
   if our_start == ours.len() {
-    assert_items(name, &ours[1..], &theirs[1..ours.len()], hidden);
+    assert_items(name, &ours[1..], &theirs[1..ours.len()]);
     return;
   }
-  assert_items(name, &ours[1..our_start], &theirs[1..their_start], hidden);
+  assert_items(name, &ours[1..our_start], &theirs[1..their_start]);
   let our_drive = read_drive(&ours[our_start..our_end]).calls;
   let their_drive = read_drive(&theirs[their_start..their_end]).calls;
   assert_eq!(
@@ -310,25 +285,21 @@ fn assert_as_svnserve(
     "{name}: the drive"
   );
   let after = ours.len() - our_end;
-  assert_items(
-    name,
-    &ours[our_end..],
-    &theirs[their_end..their_end + after],
-    hidden,
-  );
+  assert_items(name, &ours[our_end..], &theirs[their_end..their_end + after]);
 }
 
 /// A-656 (`serve.c`'s command loop against stock `svnserve` 1.15.0): replay every recorded session
 /// from its first byte through a connection over the fixtures' repository, the client's items
 /// handed over as a stock client sends them; expect `svnserve`'s greeting less `svndiff1`, every
 /// item as a tree, the drive call for call, up to a command not served yet, answered "Unknown
-/// editor command"; and every recorded session met, the listing that shows an entry `svnserve`
-/// hides the one place they differ.
+/// editor command"; and every recorded session met, every item equal: the reads judge the anonymous
+/// principal's paths by the fixtures' rules (A-613's eighth slice), so `update-depth-files`'
+/// listing of `/trunk` leaves `secret` out as `svnserve`'s does.
 #[test]
 fn every_recorded_session_is_answered_as_svnserve_answered_it() {
   let fixture = fixture();
   let texts = texts_by_md5(&fixture.green);
-  let (mut replayed, mut hidden) = (0, 0);
+  let mut replayed = 0;
   for recorded in SESSIONS.iter().copied() {
     let (out, ending) = replay(&fixture, recorded, PLENTY);
     replayed += 1;
@@ -355,11 +326,9 @@ fn every_recorded_session_is_answered_as_svnserve_answered_it() {
       &ours[..compared],
       recorded.server,
       &texts,
-      &mut hidden,
     );
   }
   assert_eq!(replayed, REPLAYED);
-  assert_eq!(hidden, HIDDEN_LISTINGS);
 }
 
 /// A-656 (bounded turns): replay the recorded checkout and an update with one byte and one step a
@@ -833,6 +802,61 @@ fn an_update_the_principal_may_not_read_is_refused_where_authentication_cannot_h
     (not_authorized(), Ok(format!("{:?}", Turn::Wrote)))
   );
   assert_eq!(connection.waiting(), Waiting::Command);
+}
+
+/// Sends `command` on an established connection a byte of room and a step a call, until the
+/// connection awaits its next command, and returns what it wrote.
+fn send_in_slices(
+  fixture: &Fixture,
+  guards: &FixtureGuards,
+  connection: &mut Connection,
+  command: &[u8],
+) -> String {
+  let sources = fixture.sources(guards);
+  let mut out = Vec::new();
+  let mut rest = command;
+  loop {
+    match connection.receive(Some(&sources), rest, &mut out, SMALLEST) {
+      Ok(Turn::Took { consumed }) => rest = &rest[consumed..],
+      Ok(Turn::Wrote) => {}
+      Ok(Turn::NeedMore { .. }) => return String::from_utf8_lossy(&out).into_owned(),
+      other => panic!("{other:?}"),
+    }
+  }
+}
+
+/// A-613's eighth slice with A-606 (`must_have_access` and `authz_check_access` through the
+/// connection, by each principal's own rules): on a repository that holds no keys, check `secret`,
+/// which the fixtures' rules keep from everyone but alice, then `dir`, anonymously, and ask for
+/// r1's log, which added `secret`, a byte of room a call; then the same through alice's tunnel;
+/// expect "Authorization failed" (170001) with nothing before it, `dir`'s trivial auth request and
+/// its kind, and a whole log naming no `secret`; for alice, `secret` a directory and her log
+/// naming it.
+#[test]
+fn the_reads_judge_each_principals_paths_by_its_own_rules() {
+  let fixture = fixture();
+  let anonymous = FixtureGuards::anonymous();
+  let check_secret = b"( check-path ( 6:secret ( ) ) ) ";
+  let log_r1 = b"( log ( ( 0: ) ( 1 ) ( 1 ) true false 0 false ) ) ";
+  let a_directory = "( success ( ( ) 0: ) ) ( success ( dir ) ) ";
+  let keyless = Repository {
+    cram_md5: false,
+    ..fixtures_repository()
+  };
+  let mut connection = established_on(&keyless, ANONYMOUSLY);
+  let (out, _) = send(&fixture, &anonymous, &mut connection, check_secret);
+  assert_eq!(out, not_authorized());
+  let check_dir = b"( check-path ( 3:dir ( ) ) ) ";
+  let (out, _) = send(&fixture, &anonymous, &mut connection, check_dir);
+  assert_eq!(out, a_directory);
+  let log = send_in_slices(&fixture, &anonymous, &mut connection, log_r1);
+  assert!(log.ends_with("done ( success ( ) ) ") && !log.contains("secret"), "{log}");
+  let alices = FixtureGuards::default();
+  let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
+  let (out, _) = send(&fixture, &alices, &mut connection, check_secret);
+  assert_eq!(out, a_directory);
+  let log = send_in_slices(&fixture, &alices, &mut connection, log_r1);
+  assert!(log.contains("13:/trunk/secret A"), "{log}");
 }
 
 /// A-656 with A-655 (`serve.c` `commit` 1471-1580): commit, through a tunnel as alice, a drive

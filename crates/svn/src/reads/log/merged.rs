@@ -87,7 +87,9 @@ impl From<Failure> for Unread {
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
   /// `get_paths_history_as_mergeinfo`: each path's location segments from the range's youngest revision down to its
-  /// oldest, as mergeinfo: each segment's path the source of the revisions after its start through its end.
+  /// oldest, as mergeinfo: each segment's path the source of the revisions after its start through its end. As
+  /// `svn_repos_node_location_segments` walks them with the session's rules: a path it may not read refused
+  /// (`check_readability`), a segment it may not read ending that path's walk.
   pub(super) fn history_as_mergeinfo(
     &self,
     paths: &[String],
@@ -96,6 +98,9 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
   ) -> Result<Mergeinfo, Failure> {
     let mut history = Mergeinfo::default();
     for path in paths {
+      if !self.readable(path) {
+        return Err(Failure::unreadable_path());
+      }
       let mut segments = Vec::new();
       let mut next = Some((path.clone(), youngest));
       while let Some((place, revision)) = next.take().filter(|(_, revision)| *revision >= oldest) {

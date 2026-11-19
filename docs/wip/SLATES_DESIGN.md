@@ -14026,8 +14026,14 @@ and export by landing).
 > revisions found by `find_merged_revisions`' rounds and interleaved; a start after the end walked newest first), each
 > revision's property changes and its text's delta from the previous text in Subversion's own windows (A-652's
 > deltifier), a string for each write `svndiff.c` makes, a revision a step; the scripted session's 13 commands and the
-> stock `svn blame` and `svn blame -g` replayed whole. Owed: the svndiff 0 session's recording; the fold of a name
-> beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules (A-606).
+> stock `svn blame` and `svn blame -g` replayed whole. Its eighth slice (2026-11-19, g297): read access by A-606's
+> rules, the session carrying its principal's compiled rules: `must_have_access`' refusal (170001) for the six commands
+> that check their path, and every walk passing over or stopping at what the session may not read as `libsvn_repos`
+> does (hidden entries, ancestors and mergeinfo paths left out, revision properties censored, locations, segments,
+> histories and file revisions ended, 220001 where a command needs a hidden path whole); its sessions owed a recording
+> against a second repository served under an authorization file, and a run. Owed: the svndiff 0 session's recording;
+> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); a denied read in a session that could
+> authenticate, which `svnserve` asks to, mid-command, before it refuses.
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -43315,9 +43321,32 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   and failed both replays until fixed. Owed: the session to record, `get-file-revs-svndiff0`, whose client announces
   neither `svndiff1` nor `accepts-svndiff2`, to hold svndiff 0 to `svnserve` byte for byte (stock `svnserve` 1.15.0, as
   the recorder runs it); red-checks.
+- **Part 2, its eighth slice** (2026-11-19, g297): read access by A-606's rules (`serve.c` `must_have_access`,
+  `lookup_access`, `authz_check_access`; `libsvn_repos`' `authz_read_func` at every site the read commands reach). The
+  session carries its principal's rules (`Session::authz`, A-606's `PrincipalRules` compiled for the repository's name
+  and the user; `None` without an authorization file, every path readable). `get-file`, `get-dir`, `check-path`, `stat`,
+  `get-iprops` and `list` check their path first: readable, the trivial authentication request; not, "Authorization
+  failed" (170001, the error's own message) with nothing before it. Then, as `libsvn_repos` does: `get-dir` and `list`
+  pass hidden entries by (`list` does not descend into one); inherited properties pass hidden ancestors by;
+  `get-mergeinfo` drops hidden requested paths, never the paths its answer names; `rev-proplist` and `rev-prop` show as
+  much as `svn_repos_check_revision_access` finds the revision readable (all, `svn:author` and `svn:date`, or none; a
+  revision that changed nothing whole); `get-locations` and `get-location-segments` refuse a hidden peg path after the
+  revision checks, 220001 "Unreadable path encountered; access denied", and end at a hidden copy source; `log` refuses a
+  hidden path (`get_path_histories`, before its history opens, nested walks included) and a hidden root on the shortcut,
+  220001 "Item is not readable", ends a path's history at a hidden location, refuses `-g` with a hidden path as segments
+  do, and gives each revision `detect_changed`'s censoring (hidden changed paths and copy sources left out, then the
+  same three levels); `get-file-revs` ends at a hidden location, and where that leaves the mainline empty `svnserve`'s
+  assertion aborts its process (it sets no malfunction handler, `error.c`'s default aborts), so the connection ends
+  after the authentication request (`Progress::Close`). `get-latest-rev`, `get-dated-rev` and `get-deleted-rev` check
+  nothing. Recording: a second repository, `locked`, a hot copy of the first under rules hiding the root, `/branches`
+  and `/trunk/dir` save `/trunk/dir/b.txt`, with no password database; four scripted sessions (`locked-reads` 29
+  commands, `locked-log` 8, `locked-file-revs` 4, `locked-file-revs-abort`) and seven stock ones. One case the history
+  does not reach, a readable path copied from a hidden one, is a test over a committed revision. Tests: owed the
+  recording and a run on the Mac Studio, offline since 2026-11-19.
 - **Owed** (the next slices): `list`'s fold of a name beyond ASCII (utf8proc's NFD with case folding and marks stripped,
-  composed again, which needs Unicode's case-folding and general-category tables); read access by A-606's rules, and the
-  authentication request a denied anonymous read makes when the session could authenticate.
+  composed again, which needs Unicode's case-folding and general-category tables); the authentication request a denied
+  read makes mid-command when the session is anonymous and could authenticate (a password database, SASL or a tunnel's
+  user), with the connection that runs the exchange.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
