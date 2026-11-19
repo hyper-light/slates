@@ -12785,8 +12785,9 @@ engine: the verdict, rebase, position mapping, the register).
 > the deployment plan hands them over (`FleetPlan::edge_identity`) from the DER the command read from the manifest's
 > files, so the daemon reads none (R1), and the transport's key stays private to it. A daemon that is no fleet node has
 > no identity to present, so its edge serves cleartext, on a loopback address alone; any other address is refused where
-> the flag is read (`slates_api::role::vcs_http_address`, by both roles and the `slates` command), as usage before
-> anything starts, rather than by a daemon that would start without its edge.
+> the flag is read (`slates_api::role::vcs_address`, by both roles and the `slates` command; named `vcs_http_address`
+> until A-689 made it the one reader of `--vcs-http` and `--vcs-svn`), as usage before anything starts, rather than by
+> a daemon that would start without its edge.
 >
 > **Status (2026-11-19, A-625 part 3 continued (2): the anchor holds the edge's port, built).** On Unix the anchor binds
 > the edge's listener once, at the address `--vcs-http` names, with the backlog the edge derives
@@ -12797,6 +12798,23 @@ engine: the verdict, rebase, position mapping, the register).
 > is answered by the next daemon. An address the anchor cannot bind ends its start by name, as a fleet node's serve
 > sockets do. A library starter asks for the edge too (`StartSpec::vcs_http`), and its anchor holds it the same way.
 > Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
+>
+> **Status (2026-11-19, A-682: upload-pack served from each repository's store on its owner shard).** The daemon's
+> git site serves upload-pack from the store A-662 keeps on the repository's owner shard, lent by
+> `vcs_store::upload::ShardStores`, the `StoreLender` over the shard's map. The step that answers a request (the
+> advertisement, `ls-refs`, a `fetch`) is lent A-614's store, the content store, the refs the asker may read and the
+> branch `HEAD` names, read from the partition's register as the step runs; every later step of the answer is lent the
+> objects alone, since the pack's source names what it sends by position. Each register name is a git ref by git's
+> push's rule (A-654's `git_push::ref_of`: a short name `N` is `refs/heads/N`, a name under `refs/` is itself, and a
+> name beginning `refs/heads/` or one git's `check_refname_format` refuses is no ref), so both services see one ref a
+> name and no listing meets a name protocol v2 cannot carry; a ref the repository's policy hides from the asker is
+> hidden as from a pusher (A-654's `PolicyHidden`: A-622's `Read`, git's `transfer.hideRefs` precedence, a ref no rule
+> speaks to its owner's alone), and `HEAD` reads as unborn to a reader that may not read its branch. The
+> pack is A-639's stream through A-653's `Fragments`, its turns on the shard's clock within the step quantum the shard
+> keeps now, at the owner's exchange (a saved byte worth the time to copy it, §4.11 at neutral). The SSH site's services
+> take the same lender (`ToolServices<ShardStores>`), for the SSH edge once the daemon starts one. Owed: the objects a
+> hidden ref alone reaches, fetchable by id until slates-git hides them; the daemon starting the SSH edge (A-684); the
+> live stock `git clone` over the daemon's edge (the next piece) and the other platforms (main's).
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
@@ -13947,6 +13965,37 @@ signature verification).
 > generated histories to 7.2's filter stated literally, and pins, reveals, a dropped root, an unreadable marker and
 > every room up to the least to their answers. Owed: the view handed to the daemon's sites over A-662's stores (A-680
 > part 2).
+>
+> **Status (2026-11-19, A-680 part 2a: Mercurial's site on the daemon's edge, over each repository's served view).** The
+> daemon's HTTP edge hands each request to its tool's site (`vcs_http::ToolSites`): Mercurial's for a request whose
+> query names a command, as hgweb tells a wire request from its pages (`wireprotoserver.handlewsgirequest`), git's for
+> every other, so a repository of the other tool is answered as one that does not exist. Mercurial's site reads each
+> repository through `vcs_store::hg_view::ServedViews`, the lender both edges reach a Mercurial store through: on the
+> shard the request moved to, afresh for each step, the repository's served view (A-680 part 1) over its index and the
+> shard's content store in A-662's map, with its register's phase roots and bookmarks (each `bookmark:` name's green's
+> head) as they stand then, made within the request's room. Every repository publishes until its record carries 7.2's
+> `phases.publish` (decision 3). A store the map does not hold, one an import is filling, and a view that cannot be made
+> (counted) are `503`. The register is the record: an imported repository's phase roots and bookmarks are served once
+> its import records them there (A-687). Proven on macOS arm64 (Mac Studio, kiln r357, 2026-11-19; the other platforms
+> owed): `slates-server --lib` filtered to `vcs_http::`, `vcs_store::hg_view` and the namespace's names, 51 of 51, fmt
+> clean: a two-shard daemon's edge, over TLS with a bearer token, answers `capabilities` and `heads` of a Mercurial
+> repository on the other shard whose store took `fixtures/state`'s `states` by an import, `heads` equal to its
+> history's heads read from the index, while a git repository asked as Mercurial asks is `404` and git's own request
+> still git's; the lender lends nothing while an import fills a store, for a git repository or an unknown one, or past
+> the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and the stock `hg` interop run over
+> the edge once a repository can be made from the CLI (A-685) and the edge offers hg's client Basic first (A-686).
+>
+> **Status (2026-11-19, A-690: divergent bookmarks left out where bookmarks are served).**
+> `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part both read, leaves out
+> a divergent name, one with an `@` before its end, as 7.2's `listbinbookmarks` leaves it out (`bookmarks.py` 475-484:
+> `hasnode(v) and not isdivergent(k)`); the rule is `crate::bookmarks::divergent`, which the push's refusal of a
+> divergent name now shares. Before, every bookmark naming a held changeset was listed, and A-619's oracle stated the
+> same over names that never held an `@`. Reproduced by use first (Mac Studio, stock 7.2 from PyPI, 2026-11-19):
+> `fixtures/state`'s `divergent`, where `feature` moved apart in a clone and the clone was pulled back so 7.2 kept the
+> clone's as `feature@1`, answers `@` and `feature` to `hg debugpushkey` over `hg serve`, and a clone over it holds
+> those two, where slates' view of it answered `feature@1` too. Proven on macOS arm64 (Mac Studio, kiln r340 red and
+> r356 green, 2026-11-19; the other platforms owed): `slates-hg --lib serve:: push:: bookmarks::` 93 passed and 0
+> failed, fmt clean (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14364,8 +14413,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
    index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
-   owed: the process around the stdio session, the learned response compression (the first value until then), and
-   A-662's stores handed to the site with the view over them (A-680 part 2).
+   owed: the process around the stdio session, the learned response compression (the first value until then), and the
+   site's pushes (`unbundle` through `hg_push`, A-680 part 2b). Built (A-680 part 2a, `vcs_http::ToolSites`,
+   `vcs_store::hg_view`): the site on the daemon's edge, each repository's served view lent from its store on its owner
+   shard.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -14791,6 +14842,31 @@ and export by landing).
 > authentication for `lock-many` (the reporter's `lock-a` session), byte for byte; red seven ways. Owed: the lock
 > verbs; the read commands' authentication for one command with their authorization (A-606); the daemon's commit
 > once A-655 part 2b lands.
+>
+> **Status (2026-11-19, A-689: the svn:// listener, A-656 part 2's first slice).** Built: `slates anchor|daemon
+> --vcs-svn ADDRESS` (read by the roles' one version-control address reader, `slates_api::role::vcs_address`, beside
+> `--vcs-http`: loopback alone for a daemon that is no fleet node, since ra_svn has no TLS) starts the daemon's
+> svn:// listener on the control shard (`crates/server/src/vcs_svn.rs`), its port logged before the daemon's serving
+> line. On Unix the anchor binds the listener once, at that address (`slates_server::daemon::bind_vcs_svn_listener`),
+> and hands it to every daemon it starts (`slates_anchor::ENV_VCS_SVN`), as it holds the HTTP edge's: the daemon adopts
+> it only where its configuration would have bound (`crate::daemon::held_or_bound_listener`, now the HTTP edge's too),
+> so a restart never drops the port and a client that connects meanwhile is answered by the next daemon; a library
+> starter asks for it with `StartSpec::vcs_svn`. Each accepted connection is a seated child task running A-656's
+> connection over its socket: `svnserve`'s greeting byte for byte but for `svndiff1` ("5. The wire"), the client's
+> answer judged by A-599's handshake, and its URL answered "No repository found" (210005), as `svnserve` answers under
+> a root holding no repository, then the connection's end. Its seats and its overdue rule are the HTTP edge's: as many
+> connections as the shard seats clients, a wait past the connection's first RTO (its own handshake round trip)
+> marking it overdue, and the most overdue reaped only when a seat is needed. Proven against stock `svnserve` 1.15.0's
+> recorded `no-repository` session, the URL naming the listener's port: in-process
+> (`vcs_svn::tests::a_connection_is_greeted_as_svnserve_greets_and_its_url_refused_in_svnserves_words`), through a
+> real anchor (`an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener`), and across a `kill -9` of the daemon, a
+> connection made while it was down answered by its successor on the same port
+> (`a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again`); red first, the flag unknown. Owed: the
+> repositories' lookup (the rest of `find_repos`: the scheme, the URL's canonical form, a path that climbs with `..`;
+> a name located on its partition's shard, the connection moved there as the HTTP edge moves one), the repository's
+> sources lent with every call, CRAM-MD5 keys over §4.13's principals, each phase's wait learned (one mechanism for the
+> HTTP, SSH and svn:// edges), and the SSH tunnel's entry point. Windows keeps no listener across a restart
+> (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -51729,6 +51805,215 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   push's step); `crates/server/src/repository.rs` (`retire_member`, the module's docs); `crates/merge/src/engine.rs`
   (the five readers), `engine/node_tests.rs` and `engine/copy_tests.rs`; §4.17.1's and §4.17.2's statuses and piece
   13; GAPS (A-664's entry).
+
+### A-680 part 2a — Mercurial's site on the daemon's edge: a request whose query names a command handed to it, each repository's served view lent from its store on its owner shard with its register's state (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Access" and piece 4; §4.17.2 "Transports" item 1; A-650 part 1, A-662, A-680 part 1, A-625 part 3)
+Applied in the same change to: §4.17.3 (a status block, piece 4's line), `crates/server` (`vcs_http`: `ToolSites`,
+`ToolExchange`, `Decided::map`, `hg` made crate-visible; `vcs_http::hg`: `HgStores` lending a view made within the
+request's room, `wire_request`, `NoStores` removed; `vcs_http::daemon_edge`: `DaemonSite` both sites; `vcs_store`:
+`mercurial_ref`, `hg_view` new with its tests; `repository::hg_push`: `bookmark_of`; the edge's and the site's tests),
+`crates/cli` (the stock-hg tests' ignore reasons: the refusal waits on A-686 alone, the round trip on A-680 part 2b and
+A-686), GAPS (the §4.17.3 entry).
+- **Why.** The daemon's edge served git's site alone, so stock hg met `404` from a running daemon (g083's interop tests,
+  `crates/cli/tests/cli.rs`), and Mercurial's site, tested alone, answered every repository `503` (`NoStores`) since
+  nothing lent it a store.
+- **Which site.** A request whose query names a command (`cmd`) is Mercurial's, as hgweb tells a wire request from its
+  pages (7.2's `wireprotoserver.handlewsgirequest`: "if b'cmd' not in req.qsparams: return False"); every other is
+  git's, whose requests never name one, so git's answers are unchanged. A repository of the other tool is answered `404`
+  by the site asked. hgweb's pages (piece 12) name no command, so they reach git's site and are `404` there.
+- **The lender** (`ServedViews`). Each step's view is made afresh on the shard the site moved the connection to (A-625
+  part 3), so nothing of the shard is held across a wait: the repository's index and the shard's content store from
+  A-662's map, its register's phase roots and bookmarks copied and charged to the request's room, then A-680 part 1's
+  view over them, charged to the same room; the step gets what is left of it. `HgStores::lend` takes that room and its
+  view type is generic over the borrow (`type Store<'s>`), since the view borrows the shard's state for the step alone.
+  A store an import is filling is not lent, so no client is served half a history; a view that cannot be made is counted
+  (`vcs_store.hg_view.unmade`); each is `503`.
+- **Decided.** Every repository publishes, Mercurial's default (decision 3), until its record carries `phases.publish`.
+  A bookmark is a name `bookmark_of` reads back exactly (`bookmark_name`'s inverse) whose green names a head; a phase
+  root of a phase or node Mercurial does not have is not read; neither is ever written by a push.
+- **Tests** (macOS arm64, Mac Studio, kiln r357, 2026-11-19). `cargo test --locked -p slates-server --lib -- vcs_http::
+  vcs_store::hg_view repository::hg_push::tests::names --test-threads=4` 51 of 51; `cargo fmt --check -p slates-server`
+  clean. `a_mercurial_repositorys_store_is_served_over_the_daemons_edge`: a two-shard daemon, a Mercurial repository on
+  the other shard's partition holding `fixtures/state`'s `states` by an import, and a git repository; over TLS with the
+  owner's bearer token, `capabilities` `200` naming `getbundle` and `httpheader`, `heads` `200` equal to the heads read
+  from the index (no row names them as a parent, newest first), the git repository asked as Mercurial asks `404`, and
+  git's own request answered by git's site. `t_a680_a_view_is_lent_from_the_store_or_not_at_all`: nothing while the
+  import fills the store, the imported history's five changesets once it ends, nothing for a git repository or an
+  unknown id (uncounted), and nothing past the room (counted). `bookmark_of` reads every name `bookmark_name` writes
+  back, and no second spelling, line's name or name without its end. No integration target reaches the site yet: the
+  stock-hg CLI tests wait on A-685 and A-686 too.
+- **Owed.** The site's pushes (`unbundle` through `hg_push`: the push capabilities, the exchange driving prepare,
+  admission, hooks and the landing, the reply framed as 7.2's `streamreslegacy`; A-680 part 2b); the stock `hg` round
+  trip over the edge (g083's tests, once A-685 and A-686 land); the other platforms' runs (main's).
+
+### A-690 — Divergent bookmarks left out where bookmarks are served, as 7.2's `listbinbookmarks` leaves them out (2026-11-19, g083 for UI goal 93 (kiln 51cef9f7); found by g303 reading `serve/pull.rs`; §4.17.3 "Pull and clone" items 1 and 3; A-619, A-680 part 1)
+Applied in the same change to: §4.17.3 (its status), `crates/hg` (`bookmarks::divergent`, `push::classify`,
+`serve::pull::bookmark_entries`, `serve::Repository::bookmarks`' doc, `serve::tests`' generator and oracle,
+`serve/indexed_tests.rs`, `tests/fixtures.rs`), `crates/hg/fixtures/state` (both scripts by repository name;
+`divergent`), GAPS (a fixed entry), `docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`.
+- **What was wrong.** `bookmark_entries` listed every bookmark naming a changeset the served view holds; 7.2 lists those
+  whose name is not divergent (`bookmarks.py` 471-472, `isdivergent`: an `@` in the name and not as its last byte;
+  475-484, `listbinbookmarks`), for `listkeys bookmarks` (`pushkey.py` 27-32, through `listbookmarks`, 487-491) and
+  the `bookmarks` part (`exchange.py` 2638-2649). A-619's oracle stated the implementation's rule over generated names
+  that never held an `@`, so it certified it.
+- **The decision.** One rule, 7.2's, in `crate::bookmarks::divergent`: the pull's listing leaves a divergent name out
+  and the push's classification refuses one (`push/classify.rs`, unchanged in behaviour, now sharing it). `@` alone and
+  any name ending with `@` stay listed.
+- **Reproduced by use first** (Mac Studio, macOS arm64, stock Mercurial 7.2 from PyPI through uv, 2026-11-19).
+  `make-state-fixtures.sh . divergent` makes the repository as a divergent bookmark is made (a root bookmarked
+  `feature`, a changeset on it in a clone and another here, the clone pulled back: "divergent bookmark feature stored
+  as feature@1"; `@` on the root), and `make-served-fixtures.sh . divergent` records 7.2's served answers. The
+  repository rebuilt from those files: `hg bookmarks` lists `@`, `feature` and `feature@1`; under `hg serve`,
+  `hg debugpushkey http://127.0.0.1:54846/ bookmarks` answers `@` and `feature`, and a clone over it holds `@` and
+  `feature`. Before the fix slates' view of the same repository answered `feature@1` too (r340, below).
+- **Tests (macOS arm64, Mac Studio, rustc 1.98.1).** Red: kiln r340 over ab23dd3e0 (the fixture and the golden alone):
+  `cargo test --locked -p slates-hg --lib serve::` 52 passed and 1 failed, the golden, at `listkeys bookmarks`
+  (`feature@1` answered). Green: kiln r356 over 15342a05f: `cargo test --locked -p slates-hg --lib -- serve:: push::
+  bookmarks::` 93 passed and 0 failed; `cargo fmt -p slates-hg -- --check` clean. Again over the landing merged with
+  main 0462bd922 (8afa1583c; A-664 part 3 adds to slates-merge, which slates-hg links): 93 passed and 0 failed,
+  slates-merge and slates-hg compiled afresh, fmt clean. The golden holds `divergent`'s three changesets, none left
+  out, `heads` (two), `branchmap` (`default`'s two heads), `listkeys` of `bookmarks` and `phases`, and the `bookmarks`
+  part's entries to stock 7.2's, the view holding all three bookmarks. The serve oracle now generates names with an
+  `@` inside them and at their end, and states `isdivergent` as 7.2's source states it.
+- **Siblings.** A-691 (next): `listkeys phases` answers the served view's draft roots, where 7.2 answers its stored
+  draft roots read from the unfiltered changelog (`phases.py` 1049-1058), so a hidden draft root is left out here.
+- **Owed.** The other platforms' runs, and the oracle's red-check with the filter taken out (main's).
+
+### A-689 — The svn:// listener: `slates anchor|daemon --vcs-svn ADDRESS`, held by the anchor across daemon restarts (2026-11-19, g234, UI goal 93; §4.17.4 piece 7, A-656 part 2's first slice; after A-625 part 3 continued (2))
+Applied in the same change to: §4.17.4's status; §4.17.2's status (A-625 part 3 continued's reader, renamed); GAPS
+(the A-656 entry); `crates/api/src/role/mod.rs` (`ProcessOptions::vcs_svn`, `vcs_address` replacing
+`vcs_http_address` as the one reader of both flags, `Role::args`), `role/daemon.rs` (`DaemonConfig::vcs_svn`, the port
+line), `role/anchor.rs` (`hold_vcs_svn_listener`), `start.rs` (`StartSpec::vcs_svn` and its test), `lib.rs`
+(`CONTRACT` 54); `crates/anchor/src/supervise.rs` (`ENV_VCS_SVN`, `Supervisor::hold_vcs_svn_listener`) and `lib.rs`;
+`crates/cli/src/args.rs` (the roles' grammar and usage); `crates/server/src/vcs_svn.rs` and `vcs_svn/tests.rs` (new),
+`config.rs` (`DaemonConfig::vcs_svn`), `daemon.rs` (`Daemon::vcs_svn_port`, `bind_vcs_svn_listener`, and
+`held_or_bound_listener` with `listens_at`, moved from `vcs_http::daemon_edge`'s `listener_for` and `listens_at` so
+both servers adopt an anchor's listener one way), `vcs_http/daemon_edge.rs` and its test, `vcs_http.rs` (`awaited`
+visible to the crate); `crates/cli/tests/cli.rs` (`edge_port_before_serving` takes the line naming the port);
+`docs/cli.md`; the README's command table.
+
+- **Why.** The daemon had no svn:// listener: A-656 part 1 built the connection with no I/O, and nothing served it, so
+  a stock `svn` could not connect at all.
+- **The listener.** `--vcs-svn ADDRESS` is read as `--vcs-http` is, by one reader (`vcs_address`): an IPv4 address and
+  port, port 0 the system's pick, which the daemon logs (`slates daemon: the svn:// listener serves on IP:PORT`) before
+  it says it serves; an address off loopback is refused as usage for a daemon that is no fleet node, since ra_svn is
+  cleartext (CRAM-MD5 sends no password, every other byte crosses as written), and the daemon's start checks it again.
+  The listener runs on the control shard; each connection is a child task (spawned, detached, cancelled and joined with
+  the listener). Its bounds are the HTTP edge's (`Bounds::of_shard`: a seat for each client the shard seats, an item at
+  most a client region's bytes) and one read is `svnserve`'s own read buffer, `SVN_RA_SVN__READBUF_SIZE` (four 4,096-byte
+  pages, `libsvn_ra_svn/ra_svn.h` 65-67). A wait on a client past RFC 6298's first RTO of the connection's own handshake
+  round trip marks the connection overdue and goes on; with every seat taken the most overdue is reaped for a new one,
+  and none is cut while seats are free (the HTTP edge's rule, main's ruling of 2026-11-19).
+- **The anchor holds its port.** As A-625 part 3 continued (2) holds the HTTP edge's: on Unix the anchor binds the
+  listener once at the operator's address, with the backlog the daemon derives (`bind_vcs_svn_listener`), and every
+  daemon it starts inherits it (`ENV_VCS_SVN`) and adopts it where it listens at the configured address (the same
+  port unless port 0), else refuses it and starts no listener, logged; with no anchor the daemon binds its own. A
+  restart never drops the port: a connection made while the daemon is down waits in the listener's queue for its
+  successor. An address the anchor cannot bind ends its start by name. Windows keeps no listener across a restart
+  (`docs/wip/platforms.md`, gap 2).
+- **What a connection does.** A-656's `Connection`: the greeting (`svnserve`'s without `svndiff1`, "5. The wire"),
+  the client's answer judged by A-599's handshake, and the URL answered "No repository found in '…'" (210005),
+  `svnserve`'s answer under a root that holds no repository (`serve.c` `find_repos`), then its end. Until the lookup's
+  piece, the repository type the handshake's calls name is an uninhabited one (`Unresolved`), so no sources can be
+  handed to a connection.
+- **Tests.** Red first (macOS arm64, Mac Studio, 2026-11-19 21:55Z, at 825715a27 over main 2410011da): the CLI
+  test `an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener` failed, the anchor ending before any daemon served,
+  `--vcs-svn` unknown. The first build of the listener failed the same test by the test's own expectation: it read
+  `svnserve`'s 207-byte greeting whole where the daemon writes 198, `svndiff1` aside as "5. The wire" decides, and
+  waited out its timeout; the tests now take `svndiff1` out of the recording, as `slates_svn::handshake`'s tests do.
+  Green (macOS arm64, Mac Studio, 2026-11-19 22:45-22:51Z, kiln r310, at 39478a4a8 over main b94ae6e90):
+  `cargo test --locked -p slates-server --lib -- vcs_svn:: vcs_http::daemon_edge:: deploy::` 19 of 19 (the listener
+  in-process, the HTTP edge's adoption through the shared function, the deploy plan's configuration);
+  `-p slates-api --lib -- role:: start::tests contract_history` 39 passed, 4 ignored (child roles);
+  `-p slates-cli --bin slates -- the_grammar` 12 of 12; `-p slates-cli --test cli -- vcs_svn svn_listeners vcs_http`
+  4 of 4 (the svn start and restart tests, and the HTTP edge's two over the shared port reader);
+  `-p slates-anchor --test anchor -- held_vcs_http` 1 of 1; `cargo fmt -p slates-anchor -p slates-api -p
+  slates-server -p slates-cli -- --check` clean. The same commands again over main 693bc8feb, whose A-681, A-651 part
+  3 and A-655 part 2b had changed slates-server and slates-svn, and whose hg interop tests' helpers the start test now
+  shares (kiln r344, 22:55-23:03Z): 19 of 19, 39 and 4 ignored, 12 of 12, 4 of 4 (main's ignored hg test aside), 1 of
+  1, fmt clean.
+- **Owed.** The repositories' lookup (the rest of `find_repos`, a name located on its partition's shard, the
+  connection moved there), the repository's sources with every call, CRAM-MD5 keys over §4.13's principals, learned
+  waits (one mechanism for the three edges), the SSH tunnel's entry point; the Windows and Linux runs (main's).
+
+### A-682 — The daemon's StoreLender over A-662's map: upload-pack served from each repository's store on its owner shard, its refs lent by the asker's read right (2026-11-19, g309 for UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Transports" items 1 and 2, §4.17.1 "Policy"; A-625 part 3's second slice; after A-614, A-640 part 2, A-651 part 2, A-653 and A-662)
+Applied in the same change to:
+- §4.17.2's statuses (A-682's, after A-625 part 3's);
+- GAPS (the §4.17 entry: A-682's line; the owed lists of A-662, A-651 part 2 and A-625 part 3);
+- `crates/server`: `vcs_store/upload.rs` and its tests `vcs_store/upload/tests.rs` (new); `vcs_store.rs` (the module)
+  and `vcs_store/tests.rs` (its push helpers shared with the new tests); `vcs_http/git/upload.rs` (`StoreLender::lend`
+  takes the asker, `lend_objects` new), `vcs_http/git.rs` (`Unserved` moved into the site's tests, the one place it is
+  used), `vcs_http/daemon_edge.rs` (the daemon's site: upload-pack's half of A-654 part 3's `Halves`) and
+  `vcs_http.rs`; `vcs_ssh/git.rs` and `vcs_ssh/site.rs` (the session's asker); `git_push.rs` (A-654's `ref_of` and `PolicyHidden` visible to the crate, so both services name and
+  hide refs by one rule); `lib.rs` (the modules' notes); the tests of the git site, the SSH command and the daemon's
+  edge.
+
+- **What.** The daemon's git site (`vcs_http::daemon_edge::DaemonSite`) serves upload-pack through
+  `UploadServices<ShardStores>`, upload-pack's half of A-654 part 3's `Halves` (receive-pack's is
+  `ReceiveServices<ThisShard>`). `ShardStores` holds nothing: each step borrows the shard's state for its own length
+  (`state::with_state_counted`) and lends A-614's store and the content store from A-662's map (`VcsStores::git_ref`),
+  the content store lent the room the shard's budget admits for the step's reads and set back after it
+  (`vcs_store::lent_to_read`). A store the map does not hold here (another shard's, one a recovery could not make
+  again, another tool's) is not lent, and the edge answers `503` as for a service not served. Before this change no
+  lender existed outside tests, so the daemon's site answered every upload-pack `503`.
+- **The asker's refs at the request's step alone.** upload-pack reads refs only while it answers a request: `ls-refs`
+  lists them, a `fetch` looks its `want-ref`s and `deepen-not`s up among them and checks their order, and v0's
+  advertisement lists them. Every later step only writes the answer: `Answer::write` hands the store to the pack's
+  source with the request's admission (A-653 continued (4)), and A-653's `Fragments::write` reads `served.repository`
+  and `served.store` alone, naming objects by position. So the seam has two calls: `lend`, for a request's step, takes the asker and reads the register and the
+  policy as it runs; `lend_objects`, for an answer's later steps, reads no ref, so each costs its room and one packet
+  whatever the repository's refs (A-640 part 2's bound) rather than a walk of the register a packet.
+- **Each register name one git ref, by git's push's rule.** §4.17.1 makes each git ref a green bound to a name, and
+  A-654 states which: a short name `N` is the ref `refs/heads/N`, a name under `refs/` is itself, and a name beginning
+  `refs/heads/` is no ref, since its ref is another name's, so names and refs map one to one (`git_push::ref_of`).
+  The lender names refs by that same function, so receive-pack and upload-pack never disagree about a ref; a first
+  draft that mapped names itself would have listed `refs/heads/main` twice for a register holding `main` and
+  `refs/heads/main`, and upload-pack's order check would then have refused every listing (`upload::refs::check_order`).
+  The register takes any name but an empty one or one holding a NUL (A-515), while protocol v2's lines refuse a name
+  git's `check_refname_format` refuses (`slates_git::v2::ls_refs`); `ref_of` answers no ref for one, so a branch named
+  `my topic` is left out rather than refusing its repository's every listing, and a repository whose default branch
+  is no ref is not lent, since slates-git's answers always name `HEAD`'s branch.
+- **Refs by the asker's read right.** The edge admits a principal to a repository when some rule lets it read some
+  name (`vcs_policy::reaches`, A-625 part 2), "each name then judged by the rule that decides it". This is that
+  judgement for reads, and A-654 already makes it for a pusher (`git_push::PolicyHidden`: A-622's `Read` judged by
+  `vcs_policy::admit_right` as a push's own right is, git's precedence, the last rule that covers the ref deciding, a
+  ref no rule speaks to its owner's alone, A-575), so the lender asks the same value, compiled once a request. A ref
+  the asker may not read is neither listed nor found by name (`want-ref` and `deepen-not` answer git's "unknown ref"),
+  and `HEAD`, looked up among the refs lent, reads as unborn to an asker that may not read its branch. The objects such
+  a ref alone reaches stay fetchable by id: slates-git's negotiation answers a want of any object the store holds
+  (`negotiation::Refusal::NotOurs` names one it lacks), so hiding them is slates-git's, owed there.
+- **The pack.** `ShardPacks` is A-653's `Fragments`, each turn on the shard's clock (`slates_rt::futures::now_ns`,
+  §4.3) within the step quantum the shard keeps now (`DaemonConfig::step_quantum_ns`, its live wake estimate), at the
+  owner's exchange: `Exchange { ns: 1e9, bytes: memcpy_bytes_per_second }`. Derived: a saved byte is worth the time
+  this machine takes to copy it, the neutral worth the archive's codec policy prices a byte at (`DaemonConfig::codec`,
+  memcpy at the largest probed size, §4.11), until the live memory-pressure and load signals move both.
+- **The SSH site.** `UploadCommand` takes the session's principal, and `ToolServices<ShardStores>` is what the SSH
+  edge's site runs once the daemon starts that edge (A-651's owed); its test drives it on a daemon's shard.
+- **Tests** (`crates/server`). The daemon's edge over TLS, red first: the owner's advertisement at protocol v0 and v2
+  answered `200` from the store on the repository's shard after the move, and an `ls-refs` asking for `HEAD` with
+  `symrefs` and `unborn` answered `unborn HEAD symref-target:refs/heads/main`, the record's default branch; nothing
+  counted unavailable. With A-654 part 3's receive-pack on the same edge, stock git 2.50.1's `create` push (its golden
+  vector) posted, then `ls-refs` listing `HEAD` at the pushed commit naming `refs/heads/main`, and a `fetch` of it whose
+  pack holds exactly the objects the push's own pack held. The lender on a real one-shard daemon whose repository took
+  its objects through A-635's append
+  (`vcs_store::upload::tests`): `ls-refs` listing `HEAD` and `refs/heads/main` at the pushed commit, and a `fetch` of
+  it whose pack, read whole as index-pack reads one, holds exactly the commit, its tree and its blob; a reader one rule
+  lets read `main` alone seeing `HEAD` and `main` while the owner sees `topic` too, the reader's `want-ref` of `topic`
+  refused `UnknownRef`; branches named `my topic` and `refs/heads/main` (beside `main`) left out of a whole listing
+  that names `refs/heads/main` once; a Mercurial store, a git repository whose
+  default branch is `my main` and an unknown id not lent to a request (the second's objects still lent to an answer's
+  later steps); and an SSH session started by the SSH site's services over `ShardStores` from a task on the shard,
+  advertised, answering `ls-refs` and the `fetch` with the same pack, and ended 0 by a flush.
+- **Evidence.** macOS arm64, Mac Studio, 2026-11-19. Red first (kiln r95, at 6236f3335, the daemon's edge before the
+  lender): `cargo test --locked -p slates-server --lib vcs_http::daemon_edge` 0 of 2, the owner's answers
+  `[503, 503, 401, 401, 403]` where `[200, 200, 401, 401, 403]` was expected and the v2 advertisement `503`. Green over
+  main 17f4f7d6f (kiln r279, this tree): `cargo test --locked -p slates-server --lib -- vcs_http:: vcs_ssh:: vcs_store::
+  --test-threads=4` 95 of 95 (the five `t_a682_` lender tests, the three daemon-edge tests above, the HTTP and SSH
+  sites' upload-pack tests over the split lender); `cargo test --locked -p slates-cli --test cli vcs_http` 2 of 2 (an
+  anchor's `--vcs-http` edge answering `401`, and its port held across a daemon restart); `cargo fmt -p slates-server --
+  --check` clean.
+- **Owed.** The objects a hidden ref alone reaches hidden by slates-git; the daemon starting the SSH edge (A-684); the
+  live stock `git clone` and fetch over the daemon's edge (the next piece, g309's); the exchange moved by the live
+  signals; Linux and Windows runs, clippy, the doc and lint gates (main's).
 
 ### A-647 part 4 — A version's reach sets kept as trees of nodes over fixed blocks of positions, so its value adds what it brought, never its reached set again (format 3) (2026-11-19, g294 from g302's draft, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 3)
 

@@ -82,11 +82,13 @@ use slates_vfs::volume::Store;
 use crate::state::ShardState;
 
 pub(crate) mod hg_import;
+pub(crate) mod hg_view;
 pub(crate) mod paths;
 pub(crate) mod record;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod upload;
 
 use record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove, WriteRefused};
 
@@ -372,6 +374,15 @@ impl VcsStores {
   ) -> Option<(&mut ContentStore, &mut HgStore)> {
     let content = self.content.as_mut()?;
     match self.entries.get_mut(&id)? {
+      RepositoryStore::Mercurial(store) => Some((content, store)),
+      _ => None,
+    }
+  }
+
+  /// Repository `id`'s Mercurial store with the content store, read (A-680 part 2: the served view lends from it).
+  pub(crate) fn mercurial_ref(&self, id: RepositoryId) -> Option<(&ContentStore, &HgStore)> {
+    let content = self.content.as_ref()?;
+    match self.entries.get(&id)? {
       RepositoryStore::Mercurial(store) => Some((content, store)),
       _ => None,
     }

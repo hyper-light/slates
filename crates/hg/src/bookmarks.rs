@@ -8,6 +8,11 @@
 //! itself is the only cap. A bookmark's name is returned as sent; whether it is a name Mercurial allows is its
 //! handler's to judge (piece 5). An encode is checked whole before a byte is written, and its exact length is known
 //! before it is made ([`encoded_len`]).
+//!
+//! **Divergent names** (`isdivergent`). A name with an `@` before its end is one a pull made for a remote's bookmark
+//! that moved apart from the local one (`_diverge`: `feature@default`, `feature@1`). 7.2 refuses one from a push and
+//! leaves one out wherever it lists bookmarks to a peer (`listbinbookmarks`, which `listkeys` and the `bookmarks` part
+//! read), and so does this crate, both through `divergent` (A-690).
 
 use crate::out::{Measure, Out};
 use crate::read::{Cursor, to_u64};
@@ -19,6 +24,15 @@ pub const ENTRY_HEADER_LEN: usize = 22;
 
 /// Format: the node that stands for "no bookmark": every bit set (`nodeconstants.wdirid`).
 pub const MISSING: Node = [u8::MAX; NODE_LEN];
+
+/// Format: the byte that makes a bookmark's name divergent where it stands before the name's end (`isdivergent`).
+const DIVERGENT: u8 = b'@';
+
+/// Whether a bookmark's name is divergent (7.2's `bookmarks.isdivergent`: an `@` in it, and not as its last byte), so
+/// a push naming it is refused and no peer is shown it (the module doc).
+pub(crate) fn divergent(name: &[u8]) -> bool {
+  name.contains(&DIVERGENT) && name.last() != Some(&DIVERGENT)
+}
 
 /// One entry: a bookmark's name and its node, or `None` where the node says "no bookmark".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
