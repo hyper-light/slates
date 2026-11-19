@@ -14,12 +14,12 @@
 //!    (`crate::vcs_policy::reaches`, A-597). upload-pack asks to read; receive-pack to submit, rewrite or delete;
 //!    Mercurial's `serve --stdio`, which pulls and pushes in one session, any of the four, each command then judged by
 //!    the session. A damaged policy is refused, never judged without it.
-//! 3. The service ([`Services`]): one the server cannot start yet is refused as not served ([`Unserved`]), as the HTTP
-//!    edge answers `503`: today all four. git's upload-pack (`slates_git::upload::serve`, A-640 part 2) and Mercurial's
-//!    `serve --stdio` (`slates_hg::serve::stdio::Stdio`, A-650 part 2) have landed, and wait for their repository's
-//!    store, which A-662's map on the owner shard will hold; receive-pack (A-654) and Subversion's tunnel (A-656) wait
-//!    for their entry points. Each becomes a [`Command`] behind [`Services`] as it can run, and the not-served answer
-//!    goes with the last of them.
+//! 3. The service ([`Services`]): one the server cannot start is refused as not served ([`Unserved`]), as the HTTP edge
+//!    answers `503`. git's upload-pack runs (`super::git`, A-651 part 2) when the store lender holds the repository's
+//!    store (A-625 part 3's [`StoreLender`]), which no lender does until A-662's map holds stores on their owner shards.
+//!    Mercurial's `serve --stdio` (`slates_hg::serve::stdio::Stdio`, A-650 part 2) waits for the same stores;
+//!    receive-pack (A-654) and Subversion's tunnel (A-656) wait for their entry points. Each becomes a [`Command`]
+//!    behind [`Services`] as it can run, and the not-served answer goes with the last of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
@@ -29,7 +29,9 @@ use slates_db::catalog::{Principal, RepositoryRecord, VcsTool};
 use slates_ssh::command::Command as Asked;
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 
+use super::git::UploadCommand;
 use crate::vcs_http::git::Repositories;
+use crate::vcs_http::git::upload::StoreLender;
 use crate::vcs_policy::{self, Right};
 
 /// Format: the refusal count of a key refused because no record of principals' keys exists yet ([`NoKeyRecord`]).
@@ -186,6 +188,34 @@ pub(crate) trait Services {
 /// The services as the server has them today: none has its server half, so each is [`Unserved`] (the module doc).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NotYet;
+
+/// The services the server runs today (A-651 part 2): git's upload-pack from the stores `lender` lends, each request
+/// admitted `room` bytes (`super::git`); receive-pack, Mercurial's `serve --stdio` and Subversion's tunnel not yet, as
+/// their stores (A-662) and entry points (A-654, A-656) have not landed. A repository whose store the lender does not hold
+/// is not served.
+#[derive(Clone, Debug)]
+pub(crate) struct ToolServices<L> {
+  /// Where the stores are lent.
+  lender: L,
+  /// The bytes each request may hold: the edge's room.
+  room: u64,
+}
+
+impl<L> ToolServices<L> {
+  /// The services over `lender`'s stores, each request admitted `room` bytes.
+  pub(crate) fn new(lender: L, room: u64) -> Self {
+    Self { lender, room }
+  }
+}
+
+impl<L: StoreLender + Clone> Services for ToolServices<L> {
+  type Command = UploadCommand<L>;
+
+  fn start(&mut self, start: &Start<'_>) -> Result<UploadCommand<L>, Unserved> {
+    let _ = start;
+    Err(Unserved)
+  }
+}
 
 /// The command an unserved service never starts: no value has this type.
 pub(crate) enum NoCommand {}
