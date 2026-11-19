@@ -45,7 +45,6 @@ use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::hkdf;
@@ -637,47 +636,40 @@ pub struct Claimed {
 
 /// Claims the `kind` offer `id` from the daemon of `instance` with the offer's `secret` (the client's side of the
 /// exchange in the module doc): its descriptor, and a stream's resync end beside it, once the daemon's confirmation
-/// opens. Each socket read and write waits `within` at a time, and when that runs out asks `alive` whether the daemon
-/// still lives: while it does, the step goes on waiting, as a client waits for a deferred reply (A-186), since a live
-/// daemon always answers its route; once it does not, the claim is refused `DeadlineExceeded`. The daemon's refusals
-/// arrive typed (`RouteRefused`); a confirmation that does not open is refused `Confirmation`, one carrying other
-/// descriptors than its kind and the offer's name `Malformed`, and one carrying a socket the kernel flushed in flight
-/// `Flushed`, every descriptor it carried closed.
+/// opens. Each socket read and write waits while the route's connection lives, by no clock (A-523), as the daemon's
+/// side waits while the client's does (A-492): a live daemon always answers its route, however slow, and a daemon that
+/// goes closes its end with its process, or with its route's task when it stops inside its process, which the next
+/// read meets at once (`Malformed`, the connection closed before the answer was whole). Until A-523 each step waited
+/// the caller's reply deadline at a time, a fixed second, and asked the daemon's liveness when it ran out. The daemon's
+/// refusals arrive typed (`RouteRefused`); a confirmation that does not open is refused `Confirmation`, one carrying
+/// other descriptors than its kind and the offer's name `Malformed`, and one carrying a socket the kernel flushed in
+/// flight `Flushed`, every descriptor it carried closed.
 pub fn claim(
   instance: &str,
   (kind, id): (OfferKind, u64),
   secret: &[u8; SECRET_BYTES],
-  within: Duration,
-  alive: &mut dyn FnMut() -> bool,
 ) -> Result<Claimed, IpcError> {
   let address = SocketAddrUnix::new(path(instance)?).map_err(|e| refused("socket address", e))?;
   let socket = stream_socket()?;
-  for which in [
-    rustix::net::sockopt::Timeout::Recv,
-    rustix::net::sockopt::Timeout::Send,
-  ] {
-    rustix::net::sockopt::set_socket_timeout(&socket, which, Some(within))
-      .map_err(|e| refused("setsockopt(SO_*TIMEO)", e))?;
-  }
   rustix::net::connect(&socket, &address).map_err(|e| refused("connect route", e))?;
   let hello = Hello {
     kind,
     id,
     client_nonce: random()?,
   };
-  write_all(socket.as_fd(), &hello.encode(), alive)?;
+  write_all(socket.as_fd(), &hello.encode())?;
   let mut answer = [0u8; 1];
-  read_exact(socket.as_fd(), &mut answer, alive)?;
+  read_exact(socket.as_fd(), &mut answer)?;
   if answer != [KIND_CHALLENGE] {
     return Err(IpcError::RouteRefused {
       refusal: refusal_of(answer.first().copied().unwrap_or(KIND_MALFORMED)),
     });
   }
   let mut daemon_nonce = [0u8; NONCE_BYTES];
-  read_exact(socket.as_fd(), &mut daemon_nonce, alive)?;
+  read_exact(socket.as_fd(), &mut daemon_nonce)?;
   let exchange = Exchange::new(secret, (kind, id), &hello.client_nonce, &daemon_nonce)?;
-  write_all(socket.as_fd(), &exchange.proof()?, alive)?;
-  let (confirmation, claimed) = receive_confirmation(socket.as_fd(), kind, alive)?;
+  write_all(socket.as_fd(), &exchange.proof()?)?;
+  let (confirmation, claimed) = receive_confirmation(socket.as_fd(), kind)?;
   if !exchange.confirmation_holds(&confirmation) {
     return Err(IpcError::RouteRefused {
       refusal: RouteRefusal::Confirmation,
@@ -697,22 +689,11 @@ pub fn claim(
   Ok(claimed)
 }
 
-/// Whether a step whose wait ran out may wait again: while `alive` says the daemon lives; otherwise the claim is
-/// refused `DeadlineExceeded`.
-fn wait_again(alive: &mut dyn FnMut() -> bool) -> Result<(), IpcError> {
-  if alive() {
-    Ok(())
-  } else {
-    Err(IpcError::DeadlineExceeded)
-  }
-}
-
 /// The daemon's answer to a proof for a `kind` offer: its confirmation and the descriptors it carried, or its refusal.
-/// Its wait runs out and is renewed as [`claim`] says.
+/// It waits as [`claim`] says.
 fn receive_confirmation(
   socket: BorrowedFd<'_>,
   kind: OfferKind,
-  alive: &mut dyn FnMut() -> bool,
 ) -> Result<([u8; SEALED_BYTES], Claimed), IpcError> {
   let mut message = [0u8; 1 + SEALED_BYTES];
   let mut space =
@@ -727,7 +708,6 @@ fn receive_confirmation(
     ) {
       Ok(received) => break received,
       Err(rustix::io::Errno::INTR) => {}
-      Err(rustix::io::Errno::AGAIN) => wait_again(alive)?,
       Err(e) => return Err(refused("recvmsg confirmation", e)),
     }
   };
@@ -794,12 +774,8 @@ fn claimed_of(confirmed: u8, kind: OfferKind, descriptors: Vec<OwnedFd>) -> Opti
   }
 }
 
-/// Writes all of `bytes` on a blocking socket whose writes time out, each wait renewed as [`claim`] says.
-fn write_all(
-  socket: BorrowedFd<'_>,
-  mut bytes: &[u8],
-  alive: &mut dyn FnMut() -> bool,
-) -> Result<(), IpcError> {
+/// Writes all of `bytes` on a blocking socket, waiting as [`claim`] says.
+fn write_all(socket: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), IpcError> {
   while !bytes.is_empty() {
     match rustix::net::send(socket, bytes, SendFlags::empty()) {
       Ok(0) => {
@@ -809,20 +785,15 @@ fn write_all(
       }
       Ok(sent) => bytes = bytes.get(sent..).unwrap_or(&[]),
       Err(rustix::io::Errno::INTR) => {}
-      Err(rustix::io::Errno::AGAIN) => wait_again(alive)?,
       Err(e) => return Err(refused("send route", e)),
     }
   }
   Ok(())
 }
 
-/// Fills `buffer` from a blocking socket whose reads time out, each wait renewed as [`claim`] says; the daemon's
-/// closing before it is full is `Malformed`.
-fn read_exact(
-  socket: BorrowedFd<'_>,
-  buffer: &mut [u8],
-  alive: &mut dyn FnMut() -> bool,
-) -> Result<(), IpcError> {
+/// Fills `buffer` from a blocking socket, waiting as [`claim`] says; the daemon's closing before it is full is
+/// `Malformed`.
+fn read_exact(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<(), IpcError> {
   let mut filled = 0usize;
   while filled < buffer.len() {
     let Some(room) = buffer.get_mut(filled..) else {
@@ -836,7 +807,6 @@ fn read_exact(
       }
       Ok((read, _)) => filled = filled.saturating_add(read),
       Err(rustix::io::Errno::INTR) => {}
-      Err(rustix::io::Errno::AGAIN) => wait_again(alive)?,
       Err(e) => return Err(refused("recv route", e)),
     }
   }
@@ -965,6 +935,90 @@ mod tests {
     }
   }
 
+  /// Shape: how long each claim step waited before A-523 asked the daemon's liveness: the client's reply deadline, a
+  /// second (`slates_client::Deadlines::reply_ns`).
+  const OLD_STEP_BOUND_NS: u64 = 1_000_000_000;
+  /// Shape: how long the late stand-in daemon holds its challenge: half again the old step bound.
+  const LATE_ANSWER_NS: u64 = OLD_STEP_BOUND_NS + OLD_STEP_BOUND_NS / 2;
+
+  /// The stand-in daemon's side of one claim on `listener` under `secret`: the hello taken, the challenge held `hold`,
+  /// the proof checked, `offered` confirmed, and the client's close awaited.
+  fn serve_one_claim(
+    listener: &Listener,
+    secret: &[u8; SECRET_BYTES],
+    offered: BorrowedFd<'_>,
+    hold: std::time::Duration,
+  ) {
+    let connection = loop {
+      if let Some(connection) = listener.accept().unwrap() {
+        break connection;
+      }
+      std::thread::yield_now();
+    };
+    rustix::io::ioctl_fionbio(&connection, false).unwrap();
+    let mut hello = [0u8; HELLO_BYTES];
+    read_exact(connection.as_fd(), &mut hello).unwrap();
+    let hello = Hello::decode(&hello).unwrap();
+    #[allow(clippy::disallowed_methods)]
+    // the stand-in daemon holds its challenge on purpose: the claim's wait across the hold is what is tested.
+    std::thread::sleep(hold);
+    let daemon_nonce = [5u8; NONCE_BYTES];
+    write_all(connection.as_fd(), &[KIND_CHALLENGE]).unwrap();
+    write_all(connection.as_fd(), &daemon_nonce).unwrap();
+    let exchange = Exchange::new(
+      secret,
+      (hello.kind, hello.id),
+      &hello.client_nonce,
+      &daemon_nonce,
+    )
+    .unwrap();
+    let mut proof = [0u8; SEALED_BYTES];
+    read_exact(connection.as_fd(), &mut proof).unwrap();
+    assert!(exchange.proof_holds(&proof), "the client's proof holds");
+    send_confirmation(
+      connection.as_fd(),
+      &exchange.confirmation().unwrap(),
+      offered,
+      None,
+    )
+    .unwrap();
+    let mut closed = [0u8; 1];
+    let _ = rustix::net::recv(&connection, &mut closed, RecvFlags::empty());
+  }
+
+  /// A-523 (R3's class C). Do: claim a map's offer from a stand-in daemon that takes the hello, holds its challenge half
+  /// again the old step bound, then confirms with a descriptor. Expect: the claim served after the hold, the descriptor
+  /// the very one offered. Each step waits while the route's connection lives, by no clock; before A-523 each waited the
+  /// caller's reply deadline and then asked the daemon's liveness.
+  #[test]
+  fn a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound() {
+    let instance = format!("route-late-{}", std::process::id());
+    let listener = Listener::bind(&instance).unwrap();
+    let secret = [3u8; SECRET_BYTES];
+    let (offered_peer, offered) = crate::stream::pair().unwrap();
+    let daemon = std::thread::spawn(move || {
+      serve_one_claim(
+        &listener,
+        &secret,
+        offered.as_fd(),
+        std::time::Duration::from_nanos(LATE_ANSWER_NS),
+      );
+    });
+    let asked = std::time::Instant::now();
+    let claimed = claim(&instance, (OfferKind::Map, 9), &secret).unwrap();
+    let took = asked.elapsed();
+    daemon.join().unwrap();
+    assert!(
+      took >= std::time::Duration::from_nanos(LATE_ANSWER_NS),
+      "the claim was served after {took:?}, before the hold"
+    );
+    assert!(
+      claimed.resync.is_none(),
+      "a map's claim carries no resync end"
+    );
+    assert!(reads_through(&offered_peer, &claimed.descriptor, b"late"));
+  }
+
   /// A-339. Do: send a stream's confirmation with its resync end beside its end, and one with its end alone; read each
   /// as a stream's claim and as a map's. Expect a stream's claim of the first to take the end and then the resync end,
   /// each the very socket sent (bytes written on its peer read back through it) and close-on-exec; a map's claim of it
@@ -973,7 +1027,6 @@ mod tests {
   #[test]
   fn a_streams_confirmation_carries_its_resync_end_beside_its_end_and_a_maps_never_does() {
     let confirmation = [7u8; SEALED_BYTES];
-    let mut alive = || true;
     // Kept open past every receipt: a socket whose every copy rides a message is flushed by macOS's collector (A-161).
     let (stream_peer, stream_end) = crate::stream::pair().unwrap();
     let (resync_peer, resync_end) = crate::stream::pair().unwrap();
@@ -989,7 +1042,7 @@ mod tests {
         Some(resync_end.as_fd()),
       )
       .unwrap();
-      match (kind, receive_confirmation(client.as_fd(), kind, &mut alive)) {
+      match (kind, receive_confirmation(client.as_fd(), kind)) {
         (OfferKind::Stream, Ok((confirmed, claimed))) => {
           assert_eq!(confirmed, confirmation);
           assert_both_ends_claimed(claimed, &stream_peer, &resync_peer);
@@ -1001,7 +1054,7 @@ mod tests {
     for kind in [OfferKind::Stream, OfferKind::Map] {
       let (daemon, client) = crate::stream::pair().unwrap();
       send_confirmation(daemon.as_fd(), &confirmation, stream_end.as_fd(), None).unwrap();
-      let (_, claimed) = receive_confirmation(client.as_fd(), kind, &mut alive).unwrap();
+      let (_, claimed) = receive_confirmation(client.as_fd(), kind).unwrap();
       assert!(claimed.resync.is_none(), "one descriptor, no resync end");
       assert!(reads_through(&stream_peer, &claimed.descriptor, b"alone"));
     }
