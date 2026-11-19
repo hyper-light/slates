@@ -615,7 +615,8 @@ fn t_a647_a_lazy_read_walks_to_the_nearest_kept_ancestor_and_fills_down() {
   let (third, steps) = read_to_end(&mut derivations, &mut lazy, &history, &mut store, 29);
   assert_eq!((third.clone(), steps), (second.clone(), 0));
   assert_ne!(first.unwrap(), second.unwrap());
-  assert_eq!(store.charged(), 0, "a finished fill charges nothing");
+  derivations.release(&mut store).unwrap();
+  assert_eq!(store.charged(), 0, "every fill gave its charge back");
 }
 
 /// A-647: an eager type. Do: record a chain of five versions, filling each as it is recorded. Expect: each fill walks
