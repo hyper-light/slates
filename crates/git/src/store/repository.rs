@@ -18,6 +18,7 @@ use super::naming::{GitNaming, kind_of};
 use super::positions::Positions;
 use super::push::Push;
 use super::rows::{self, CommitRow, ObjectRow};
+use reach::Sets;
 
 /// The store read as upload-pack's commit graph (A-640), a child of this module so it reads the rows and chains kept
 /// here.
@@ -187,12 +188,14 @@ pub struct Found {
   pub id: ObjectId,
 }
 
-/// One version of a ref: its head's position (`None` for a deleted ref), D(k), what it brought, and how its reached set
-/// followed.
+/// One version of a ref: its head's position (`None` for a deleted ref), its value of the reach sets, and how its
+/// reached set followed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Version {
   head: Option<u64>,
-  brought: Positions,
+  /// Its value of [`super::ReachSets`] (A-647 part 3), held once by the record: the set its head reaches and D(k), what
+  /// it brought, which the store reads from it and keeps nowhere else.
+  value: ContentId,
   /// Its D(k) encoded, once the owner asked (A-614 part 2).
   fragments: Option<Fragments>,
   /// How its reached set followed, kept so its derivation (A-647 part 2, [`reach`]) reads only its parents' values.
@@ -250,11 +253,10 @@ struct BasePack {
   parts: Fragments,
 }
 
-/// A ref's chain of versions and the set its current head reaches.
+/// A ref's chain of versions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Chain {
   versions: Vec<Version>,
-  reached: Positions,
   base: Option<BasePack>,
   rebuild: Rebuild,
 }
@@ -264,15 +266,15 @@ impl Chain {
     self.versions.last().and_then(|version| version.head)
   }
 
-  /// What the chain charges the budget: its records and its sets' runs.
+  /// The index of its newest version.
+  fn newest(&self) -> Option<usize> {
+    self.versions.len().checked_sub(1)
+  }
+
+  /// What the chain charges the budget: its records and its kept parts' runs. Its versions' sets are their values'
+  /// bytes, which the content store charges as it keeps them (A-647 part 3).
   fn footprint(&self) -> u64 {
-    let runs = self
-      .versions
-      .iter()
-      .fold(self.reached.runs(), |runs, version| {
-        runs.saturating_add(version.brought.runs())
-      });
-    let runs = self.kept().fold(runs, |runs, kept| {
+    let runs = self.kept().fold(0_usize, |runs, kept| {
       runs
         .saturating_add(kept.positions.runs())
         .saturating_add(kept.references.runs())
@@ -852,9 +854,11 @@ impl Repository {
     let (base, from) = match self.base(store, push, to)? {
       Some(green) => {
         self.count(|counters| counters.bases_found = counters.bases_found.saturating_add(1));
-        let chain = self.chains.get(&green);
-        let set = chain.map(|chain| chain.reached.clone()).unwrap_or_default();
-        let version = chain.and_then(|chain| chain.versions.len().checked_sub(1));
+        let version = self.chains.get(&green).and_then(Chain::newest);
+        let set = match version {
+          Some(version) => self.sets(store, green, version)?.reached,
+          None => Positions::new(),
+        };
         (set, version.map(|version| (green, version)))
       }
       None => (Positions::new(), None),
@@ -889,7 +893,10 @@ impl Repository {
       });
     };
     match (from, chain) {
-      (Some(from), Some(chain)) => self.admit_onto(store, push, (green, from, &chain.reached), to),
+      (Some(from), Some(_)) => {
+        let reached = self.current_reached(store, green)?.unwrap_or_default();
+        self.admit_onto(store, push, (green, from, &reached), to)
+      }
       _ => self.admit_create(store, push, green, to),
     }
   }
@@ -946,9 +953,10 @@ impl Repository {
   }
 
   /// Commits `push` and `moves` once the verdict accepts them: a position and rows for each object new to the
-  /// repository, and a version for each move with what it brought, its reached set and the head map moved. The rows and
-  /// the versions' bytes are admitted first: refused, nothing changed, and the push still holds its objects. Committed,
-  /// the push holds nothing. The versions made, one for each move, in order.
+  /// repository, and a version for each move with its value of the reach sets (what it brought and its reached set,
+  /// A-647 part 3) and the head map moved. The values, the rows and the versions' bytes are admitted first: refused,
+  /// nothing changed, and the push still holds its objects. Committed, the push holds nothing. The versions made, one
+  /// for each move, in order.
   pub fn commit(
     &mut self,
     store: &mut ContentStore,
@@ -962,12 +970,18 @@ impl Repository {
     let (positions, next) = self.positions_for(&fresh)?;
     let brought_by = self.brought_by(moves, first);
     let owned = self.rows_for(store, push, &fresh, &positions, &brought_by)?;
-    let (chains, heads) = self.plan(store, moves, &positions)?;
+    let (planned, heads) = self.plan(store, moves, &positions)?;
+    let values = put_values(store, &planned)?;
+    let chains = self.chains_with(planned, &values);
     let total = footprint(&self.chains, &chains, &heads);
     let more = total.saturating_sub(self.charged);
-    store.charge(more)?;
+    if let Err(refused) = store.charge(more) {
+      give_back(store, &values)?;
+      return Err(refused.into());
+    }
     if let Err(refused) = self.insert(store, &owned) {
       store.discharge(more)?;
+      give_back(store, &values)?;
       return Err(refused);
     }
     store.discharge(self.charged.saturating_sub(total))?;
@@ -1167,24 +1181,22 @@ impl Repository {
     Ok(())
   }
 
-  /// The chains the moves make and the head map after them, planned on copies.
+  /// The versions the moves make, their sets computed and their values not yet put, and the head map after them.
   fn plan(
     &self,
     store: &ContentStore,
     moves: &[Move],
     positions: &BTreeMap<ObjectId, u64>,
-  ) -> Result<(BTreeMap<u64, Chain>, BTreeMap<u64, BTreeSet<u64>>), StoreRefused> {
-    let mut chains: BTreeMap<u64, Chain> = BTreeMap::new();
+  ) -> Result<(Vec<Planned>, BTreeMap<u64, BTreeSet<u64>>), StoreRefused> {
+    let mut planned = Vec::with_capacity(moves.len());
     let mut heads = self.heads.clone();
     for movement in moves {
-      let mut chain = self
-        .chains
-        .get(&movement.green)
-        .cloned()
-        .unwrap_or_default();
       let brought = self.members_positions(store, &movement.brought, positions)?;
-      chain.reached = match &movement.reach {
-        Reach::Grown => chain.reached.union(&brought),
+      let reached = match &movement.reach {
+        Reach::Grown => self
+          .current_reached(store, movement.green)?
+          .unwrap_or_default()
+          .union(&brought),
         Reach::Remade { base, beyond, .. } => {
           base.union(&self.members_positions(store, beyond, positions)?)
         }
@@ -1195,15 +1207,30 @@ impl Repository {
         .map(|to| self.position_of(store, positions, &to))
         .transpose()?;
       move_head(&mut heads, movement.green, movement.from, head);
-      chain.versions.push(Version {
+      planned.push(Planned {
+        green: movement.green,
         head,
-        brought,
-        fragments: None,
         followed: followed(&movement.reach),
+        sets: Sets { reached, brought },
       });
-      chains.insert(movement.green, chain);
     }
-    Ok((chains, heads))
+    Ok((planned, heads))
+  }
+
+  /// The chains the planned versions make, on copies: each version with its value, `values`' in order.
+  fn chains_with(&self, planned: Vec<Planned>, values: &[ContentId]) -> BTreeMap<u64, Chain> {
+    let mut chains: BTreeMap<u64, Chain> = BTreeMap::new();
+    for (planned, value) in planned.into_iter().zip(values) {
+      let mut chain = self.chains.get(&planned.green).cloned().unwrap_or_default();
+      chain.versions.push(Version {
+        head: planned.head,
+        value: *value,
+        fragments: None,
+        followed: planned.followed,
+      });
+      chains.insert(planned.green, chain);
+    }
+    chains
   }
 
   /// A walk's members as positions, the new ones by the positions given them now.
@@ -1229,33 +1256,46 @@ impl Repository {
       .map_or(0, |chain| chain.versions.len())
   }
 
-  /// D(k): what `green`'s version `version` brought, as positions.
+  /// D(k): what `green`'s version `version` brought, as positions, read from the version's value (A-647 part 3).
   pub fn brought(
     &self,
-    _store: &ContentStore,
+    store: &ContentStore,
     green: u64,
     version: usize,
   ) -> Result<Positions, StoreRefused> {
-    Ok(self.version_record(green, version)?.brought.clone())
+    Ok(self.sets(store, green, version)?.brought)
   }
 
-  /// The set `green`'s version `version`'s head reaches.
+  /// The set `green`'s version `version`'s head reaches, read from the version's value (A-647 part 3): any version's,
+  /// not only the newest.
   pub fn reached(
     &self,
-    _store: &ContentStore,
+    store: &ContentStore,
     green: u64,
     version: usize,
   ) -> Result<Positions, StoreRefused> {
-    let chain = self.chains.get(&green);
-    match chain {
-      Some(chain) if version.checked_add(1) == Some(chain.versions.len()) => {
-        Ok(chain.reached.clone())
-      }
-      _ => Err(StoreRefused::NoVersion {
-        green,
-        version: to_u64(version),
-      }),
-    }
+    Ok(self.sets(store, green, version)?.reached)
+  }
+
+  /// `green`'s version `version`'s two sets, read from its value.
+  fn sets(&self, store: &ContentStore, green: u64, version: usize) -> Result<Sets, StoreRefused> {
+    let record = self.version_record(green, version)?;
+    Sets::read(store, &record.value).ok_or(StoreRefused::SetsUnreadable {
+      green,
+      version: to_u64(version),
+    })
+  }
+
+  /// The set `green`'s newest version's head reaches, read from its value; `None` for a green with no version.
+  fn current_reached(
+    &self,
+    store: &ContentStore,
+    green: u64,
+  ) -> Result<Option<Positions>, StoreRefused> {
+    let Some(newest) = self.chains.get(&green).and_then(Chain::newest) else {
+      return Ok(None);
+    };
+    Ok(Some(self.sets(store, green, newest)?.reached))
   }
 
   /// The head of `green`'s version `version`; `None` for a deleted ref.
@@ -1330,8 +1370,8 @@ impl Repository {
     )))
   }
 
-  /// Gives back everything the repository holds: its rows' holds, their tables, and its versions' charge. It goes on
-  /// past a refusal and answers the first.
+  /// Gives back everything the repository holds: its rows' holds, their tables, its versions' values and their charge.
+  /// It goes on past a refusal and answers the first.
   pub fn release(self, store: &mut ContentStore) -> Result<(), StoreRefused> {
     let mut first = self.index.release(store).map_err(StoreRefused::from);
     for kept in self.chains.values().flat_map(Chain::kept) {
@@ -1342,8 +1382,53 @@ impl Repository {
           .map_err(StoreRefused::from),
       );
     }
+    let values: Vec<ContentId> = self
+      .chains
+      .values()
+      .flat_map(|chain| chain.versions.iter().map(|version| version.value))
+      .collect();
+    first = first.and(give_back(store, &values));
     first.and(store.discharge(self.charged).map_err(StoreRefused::from))
   }
+}
+
+/// A move's version as its commit plans it: its green, its head's position, how its reached set followed, and its sets,
+/// which become its value once the commit puts them.
+struct Planned {
+  green: u64,
+  head: Option<u64>,
+  followed: Followed,
+  sets: Sets,
+}
+
+/// Puts each planned version's sets as its value (A-647 part 3), held once for its record, in order; refused, every
+/// value put is given back.
+fn put_values(
+  store: &mut ContentStore,
+  planned: &[Planned],
+) -> Result<Vec<ContentId>, StoreRefused> {
+  let mut values = Vec::with_capacity(planned.len());
+  for version in planned {
+    match version.sets.put(store) {
+      Ok(value) => values.push(value),
+      Err(refused) => {
+        give_back(store, &values)?;
+        return Err(refused.into());
+      }
+    }
+  }
+  Ok(values)
+}
+
+/// Gives back one hold of each of `values`; past a refusal the rest still, and the first refusal is the answer.
+fn give_back(store: &mut ContentStore, values: &[ContentId]) -> Result<(), StoreRefused> {
+  let mut first = Ok(());
+  for value in values {
+    if let Err(refused) = store.release(value) {
+      first = first.and(Err(StoreRefused::from(refused)));
+    }
+  }
+  first
 }
 
 /// What a version records of its move's [`Reach`].
@@ -1660,7 +1745,7 @@ impl Repository {
     if record.fragments.is_some() {
       return Ok(());
     }
-    let brought = record.brought.clone();
+    let brought = self.sets(store, green, version)?.brought;
     let named = self.named_bases(store, green, version)?;
     let (others, blobs) = self.to_encode(store, &brought, &named)?;
     let mut learning = Learning {
@@ -1722,7 +1807,7 @@ impl Repository {
       .len()
       .checked_sub(1)
       .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
-    let reached = chain.reached.clone();
+    let reached = self.sets(store, green, version)?.reached;
     let start = clock.now_ns();
     let (objects, blobs) = self.to_encode(store, &reached, &BTreeMap::new())?;
     let mut learning = Learning {
