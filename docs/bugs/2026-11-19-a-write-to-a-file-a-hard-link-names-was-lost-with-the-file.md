@@ -73,6 +73,8 @@ owed. Main's slates-merge was the same from 4b12a582e to 0e755c9b1.
   typed, no conflicts; the write handed on twice at a removal and once at a rename. Again at 5f6cc2d3a, the census
   showing the case rather than requiring it: 152 of 152; 141 agreed, 115 refused, no conflicts, the write handed on
   five times at a removal and at no rename. `cargo fmt -p slates-merge -- --check`: clean on both.
+- Merged with main at f6ec36df2 (A-659's stacks), at 85b5b7eee: 169 of 169, main's 164 and A-669's 5; the census 153
+  agreed, 103 refused, no conflicts, the write handed on four times at a removal and once at a rename; fmt clean.
 
 ## Siblings (the sweep, by reading)
 

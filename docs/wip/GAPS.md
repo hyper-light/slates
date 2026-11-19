@@ -2704,7 +2704,8 @@
 > (`cargo test --locked -p slates-merge --lib restate_tests` at 59ee404f5, 6 of 11, A-663's five passing); the first
 > green run's oracle found a link resolved through the links standing at the seal (`ln h l; rm h`), fixed in the same
 > change; green 152 of 152 over main at 0e755c9b1 (`cargo test --locked -p slates-merge --lib` at 72177dcd7, and at
-> 5f6cc2d3a with the census showing the case rather than requiring it), fmt clean. Bug record:
+> 5f6cc2d3a with the census showing the case rather than requiring it), fmt clean; merged with main at f6ec36df2
+> (A-659's stacks), 169 of 169 at 85b5b7eee, fmt clean. Bug record:
 > `docs/bugs/2026-11-19-a-write-to-a-file-a-hard-link-names-was-lost-with-the-file.md`.
 
 > **A write to a file a later version linked is lost when the work removes the file: found open (2026-11-19, A-669's
