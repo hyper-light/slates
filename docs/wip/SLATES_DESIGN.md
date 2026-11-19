@@ -2164,8 +2164,11 @@ drift check `fstat`s.
   redirect and drift records are journaled the same way; retention is bounded by a memory budget
   derived from the volume's measured mutation rate and the longest subscriber lag (A-157). The
   journal keeps what a live reader still owes. It starts at a one-page floor and grows from the
-  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader
-  silent past its transport's liveness pins nothing, and a refused growth is counted.
+  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader's
+  owner names its patience by what the reader's reads wait on (A-548): the NFS write-back tracker,
+  consumed at the change itself on the volume's own shard, holds its records while it is open; a
+  reader whose rounds wait on a mount's kernel is presumed gone past its transport's liveness, and
+  pins nothing then. A refused growth is counted.
 
 **Failure matrix.** Hash collision on equivalence (two names fold equal): Refused (`EEXIST`),
 which is APFS behaviour. Cut-over conversion mid-operation: Masked (conversion is a copy of a
@@ -3048,7 +3051,8 @@ therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every loc
 the rest of the page as it fetched it. Apple's client does so for a page dirtied through a shared map while another path
 changed the file, and no recall makes it flush first. So the server keeps, per connection, A-140's byte states for each
 file the connection's READs and WRITEs touched. A READ makes bytes fresh, the connection's own changes refresh them,
-and every other change, fed by a per-volume keeper reading the journal (A-157), makes fetched bytes stale. A WRITE
+and every other change, fed by a per-volume keeper reading the journal (A-157; its reader held while the tracker is
+open, A-548), makes fetched bytes stale. A WRITE
 whose stale bytes differ from the file's bytes now is refused whole, `NFS3ERR_IO`, never merged (banned item 11). A
 write over bytes never fetched, or over stale bytes equal to the file's, is applied. The states go with their
 connection, on the shards its calls were served on, however it ends (`crates/server/src/nfs_writeback.rs`). Apple's
@@ -8274,7 +8278,9 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > capture serves the agents started over an unchanged folder, and a base goes with its last clone. A moved captured
 > clone lands on its new owner against its capture (A-503): its move carries the captured state of every path it
 > changed in its catalog, and the new owner keeps the moved head as its mark (§4.15's status); the mark is no snapshot
-> that holds a later move back.
+> that holds a later move back. Since A-544 every head of its own carries that record, so a workspace taken over after
+> its runner's loss lands against its capture on the successor too; one whose runner died before its first snapshot
+> was placed reaches the successor as an empty tree, and its landing is refused by kind.
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -9974,7 +9980,15 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > are where the source parts from the mark and every carried path, and what the capture held at a path is the carried
 > state, else the mark's, which is the stage-1 judgement exactly. A move from the new owner carries again from its mark
 > and its record. A carried record whose mark this node does not hold (a takeover that rebuilt a later head) is refused
-> typed, never landed as a scratch volume.
+> typed, never landed as a scratch volume. **Since A-544 (2026-11-18) every head carries, not a move's alone:** a
+> captured clone is born with its record (naming no head yet), each head of its own it seals is walked and recorded in
+> its catalog (`crate::carry`), and its head register ships only once the record for it is in, so a takeover after the
+> owner's loss adopts the newest placed head with its record and marks it as a move's new owner does, and its landing
+> is judged against the capture. A head whose carry could not be walked ships without its record (the head's content
+> is never held back), and a successor that adopts it, or the creation head, refuses the landing by kind; a move waits
+> until the head it hands over carries its record, so a refused carry holds the move back until it is refused
+> `Unplaced`, as before. A clone never sealed before its owner's loss reaches its successor as an empty tree, the
+> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost).
 
 **An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
 of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
@@ -36299,7 +36313,7 @@ the bug record `docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origi
   at the first clone, `left: 9, right: 5`. Green with the change, the same machine: `cargo test --locked -p slates-vfs
   --lib` 79 passed, 1 ignored.
 - **The sweep for siblings** (every counter a clone, a restore or an adoption takes from the live origin rather than
-  the frozen state), reported and not changed, with their effects in the bug record:
+  the frozen state), reported and not changed, with their effects in the bug record (both fixed since by A-549):
   - the server's clone admission reads the clone's inherited inodes from the origin's head count
     (`verbs::admit_clone`'s `inherited`: a bounded clone's version reservation and its allowance's floor, a dynamic
     clone's version hold), where it should read the snapshot's, now recorded;
@@ -36772,6 +36786,152 @@ Applied in the same change to: §4.9 (its status), GAPS (the 2026-11-05 entry's 
 `crates/server/src/{verbs,state}.rs`, `crates/ipc/src/protocol.rs` (the doc of `Refusal::Overloaded`; the wire is
 unchanged), the bug records `docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md` and
 `docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`.
+
+### A-544 — A captured clone taken over after its owner's loss lands against its capture: every head it places carries its capture's record (2026-11-18, g267, UI goal 89; §4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover"; A-291, A-424, A-503)
+
+- **What was there.** A-503 carried a captured clone's capture only with a move: the old owner walked it against the
+  head it handed over and recorded it in the catalog. A takeover after the owner's loss adopts the newest placed head
+  and its catalog, which carried nothing for it (no move had walked it), so the successor landed the clone as a volume
+  with no capture: every file a create, no removal, every change a conflict.
+- **The rule.** Every head of a captured clone is placed with its capture's record, so whatever head a successor adopts
+  comes with what it needs, and the move needs no walk of its own. A clone of a captured base is born with a record
+  naming no head (`carry::creation_record`, all-zero identity; `verbs::publish_clone_as`, in the clone's own atom). On
+  its owner, the seal walk steps each captured clone's carry (`carry::step`): when its head is a snapshot of its own
+  that its record is not for, a task of its shard walks the capture (its own here, or its mark and record on a node a
+  move or a takeover brought it to) against that snapshot a slice a turn (`CarryWalk`), and once the head's seal names
+  its archive identity records it (`Op::CaptureCarried`, its mark that snapshot, raising the catalog's sequence). The
+  head register waits for the record of its head (`carry::holds_head_back`, in `fleet::unplaced_heads`), and a head ships
+  only once its catalog's current version is placed, so a successor adopts the record with the head and marks the
+  snapshot it materializes (`verbs::finish_making`, A-503) when the identities agree. A move hands over a head placed
+  this way and waits until that head carries its record (`carry::carries_its_head`, first in
+  `moves::ready_to_hand_over`): a carry still walking or refused holds it back until it is refused `Unplaced`, as
+  A-503's own walk did, so a move never turns a clone that lands against its capture into one its new owner refuses.
+  A-503's move-time walk is gone, its `fleet.move.capture_uncarried` now `fleet.carry.refused`.
+- **A head of its own.** A clone's record starts as a copy of its origin's (`publish_clone_as`), so until its first
+  snapshot its head names its origin's snapshot, which its own tree cannot walk (a clone's volume core starts with no
+  snapshot). It carries nothing until then, and that head waits for no record (`carry::own_head`). As first written, a
+  carry was begun for it and refused, counted with a log line, for every captured clone made: on a kiln fleet runner,
+  every workspace.
+- **Bounded.** A shard's carries are bounded by the volumes it serves: an entry leaves once its record is in, when its
+  volume is no captured clone or has no head of its own, and at the end of each home seal walk when the shard no longer
+  serves its volume (`carry::forget_gone`; the walk visits only served volumes, so an entry refused or waiting for its
+  seal outlived a volume released, relinquished or destroyed). A carry's task ends with its entry.
+- **What is lost when the capture was never replicated.** The capture reaches the fleet only through the clone's own
+  sealed heads and their records; its origin (the captured base) is a volume of the node that made the clone, and the
+  clone's catalog names no lineage. Two cases:
+  - *The clone was sealed, but not the record for the head its successor adopts:* its carry could not be walked (the
+    capture or the head's tree unreadable, counted `fleet.carry.refused`; the head ships anyway, since placement is
+    never held back for a landing), the catalog carrying a newer head's record was placed and its owner died in the
+    round before that head was (the catalog ships first), or a live-shipped clone was rebuilt from its log past its
+    seal. The successor holds every byte of the head it adopted and lacks only what the capture held where the clone
+    changed it, so it holds no mark, and its landing is refused by kind (`Unsupported`, "a moved captured clone whose
+    moved head this node does not hold"), never landed as a volume with no capture. The agent's work stays in the
+    volume; what is lost is its landing against the capture.
+  - *The clone was never sealed before its owner's loss* (no snapshot of its own, or its first head not yet placed): its
+    successor holds its catalog and the record it was born with, and serves the creation head, an empty tree. What is
+    lost is the whole tree, the capture's bytes with every change since (the origin's own head, where it was sealed and
+    placed, is served by the origin's successor as a plain volume, which nothing links the clone to). Its landing is
+    refused by kind, so the empty tree is never landed as the clone.
+- **Tests.** `a544_a_clone_of_a_captured_base_is_born_with_its_capture_record` and
+  `a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind` (`crates/server/src/verbs.rs`: the
+  marked successor moves the clone on; the markless one refuses its landing and its carry, counted, and holds a move);
+  `a544_a_captured_clones_head_waits_for_its_capture_record_and_carries_it` (the head and a move held back before its
+  record and free after it; the record for the head, its mark the head, naming the rewritten file as captured and the
+  made one as absent), `a544_a_fresh_captured_clone_carries_nothing_until_its_first_snapshot` and
+  `a544_the_carry_of_a_clone_the_shard_no_longer_serves_is_forgotten_at_the_walks_end` (`crates/server/src/carry.rs`).
+  Red first on the Mac Studio (2026-11-18, `cargo test --locked -p slates-server --lib -- a544`): with the five rules
+  taken out and their calls kept (no creation record, no head held back, any sealed head taken as the clone's own, a
+  move never waiting, nothing forgotten), 0 of 5 passed, each failing at its own assertion; with them, 5 of 5, and 50
+  of 50 over the lib's `a544`, `carry::`, `moves::`, `catalog::`, `landing::` and `fleet::` tests; `slates-db`'s
+  carried-capture tests 3 of 3.
+- **Owed.** The fleet's own test of a takeover (three daemons: a captured clone's owner killed after a sealed head, its
+  successor landing it against its capture), filed for main. A live-shipped clone's record for the head its log rebuilt.
+  A captured clone sealed at its making (its content shares its origin's chunks, so its placement puts little), or its
+  catalog naming its capture, so a clone whose owner dies before its first snapshot is not lost whole. Seen, not
+  changed: until a clone's first snapshot its inherited head also refuses the home seal every period (`fleet.seal`
+  counted, `fleet::start_seal`), reported to main.
+
+Applied in the same change to: §4.15's status (A-503's paragraph), §4.10's status (the consumer's paragraph), GAPS
+(g267), `crates/db` (`catalog.rs`: `CarriedRecord::NO_HEAD`), `crates/server` (`carry.rs`, new; `moves.rs`: the
+move-time carry gone, the move waiting for its head's record; `fleet.rs`, `verbs.rs`, `state.rs`, `daemon.rs`,
+`lib.rs`).
+
+### A-549 — A clone is admitted by its snapshot's inodes and counts its snapshot's entries, whatever its origin did since (2026-11-19, goal 85, g234; A-541's sweep; §4.2's inode and namespace dimensions, §4.4 snapshots and clones, D-5)
+Applied in the same change to: A-541's entry and its bug record (both of its siblings marked fixed); GAPS, §8c (the fix
+and the siblings left open); the bug record `docs/bugs/2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`;
+and:
+- `crates/vfs`: `snapshot.rs` (`Snapshot::live_entries`); `volume.rs` (`Volume::snapshot` records the head's entry
+  count, `clone_inner` starts the clone from it, `Volume::snapshot_inodes`, `clone_of`'s notes; two lib tests in
+  `clone_count_tests`); `recover.rs` (`rebuild_snapshot_tree` returns its tree's entries, `named_entries`,
+  `rebuild_snapshot` records them).
+- `crates/server`: `verbs.rs` (`admit_clone` reads the clone's inherited inodes from its snapshot; the lib test module
+  `clone_admission_tests`, new).
+
+- **What was there.** The server admitted a clone by its origin's inode count at the moment of the clone (`admit_clone`'s
+  `inherited`): a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold. Since
+  A-541 the clone counts its snapshot's inodes, so where the origin had removed files the allowance fell below the
+  clone's count, was refused, and left the clone with no inode cap, and a dynamic clone held fewer slots than it holds
+  inodes. A clone's entry count was its origin's head count at the clone, as its inode count had been.
+- **The rule.** A snapshot carries the counts a clone of it is admitted and counted by, as §4.2 has complete snapshot
+  roots carry their referenced counts for O(1) clone admission: its live inodes (A-541) and its live entries, each the
+  head's when the snapshot is taken. The owner admits a clone by the snapshot's inodes: a bounded clone reserves its fair
+  share but never fewer than them, and that is its allowance; a dynamic clone holds a slot for each. A clone's entry
+  count starts from the snapshot's. A recovered snapshot's entries are its tree's, by the rule the live count keeps (a
+  whiteout is no entry): the named entries of its own directories' images and the live entries of the head's
+  directories it shares (A-395), so the image's layout does not change. A stale snapshot is refused at admission, before
+  any slot is taken, with the refusal the clone would give.
+- **Tests.** In `crates/vfs/src/volume.rs`, `clone_count_tests`: the entry count of the origin, the clone and a clone of
+  the clone's snapshot against a walk of each namespace after every step, then an entry allowance of one past the tree
+  admitting exactly one file; and across a restart, the rebuilt clone and a clone of the recovered snapshot, whose tree
+  shares an untouched directory with its origin's head (the test first checks the image shares it, so the count's shared
+  arm is exercised). In `crates/server/src/verbs.rs`, `clone_admission_tests`: a bounded clone of an origin floored 8
+  past its fair share and left under it is admitted with its snapshot's inodes as its allowance, none refused; a dynamic
+  clone holds a slot for each inode its snapshot holds.
+- **Evidence.** All on the Mac Studio, 2026-11-19.
+  - Red first, with the tests alone on main `a613562eb`. The bounded clone's allowance was `u64::MAX` against its
+    snapshot's 36: the share, 28, was refused below 36. The dynamic clone held 2 slots for 13 inodes. The live entries
+    test counted 13 where the tree holds 9, and the restart test 14 where it holds 10.
+  - Green with the change: `cargo test --locked -p slates-vfs --lib` passed 81 with 1 ignored, and `cargo test --locked
+    -p slates-server --lib clone` passed 3 of 3.
+  - Each arm of the recovered count, removed on a copy, failed the restart test at the later clone: without the shared
+    directories it counted 7 of 9; recording zero, 0 of 9.
+- **Found by the sweep, left open** (GAPS, with the bug record):
+  - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, the next piece).
+    This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
+  - A clone is admitted with no entry allowance.
+  - A resize leaves the entry allowance at the size the volume was made with.
+  - Recovery counts a whiteout as a live entry (found by reading).
+
+### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
+Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
+`crates/vfs/src/{journal,volume}.rs` (`Patience`), `crates/vfs/tests/journal_cost.rs`,
+`crates/server/src/nfs_writeback.rs`, `crates/server/src/{fuse,winfsp}.rs` (the typed patience; their rule unchanged
+until part 2), `crates/bridge-core/tests/invalidation.rs`.
+- **What was there.** Every journal reader was opened with one patience, the daemon's liveness window `W` (a second on
+  the wall): a record a reader had not read for `W` was dropped at the next append past the budget, and the reader
+  overran when it came back (A-157). A-359 listed three class C waits left in C-c once A-492 and A-493 landed: the FUSE
+  and WinFsp readers' patience, the NFS write-back tracker's, and `verbs::await_materialization`.
+- **Part 1, the NFS write-back tracker** (`nfs_writeback::tracking`). The tracker's reader is consumed by its keeper, a
+  task on the volume's own shard woken by the change that journals the record, so only that shard's own turns stand
+  between a record and its consumer. A record waiting `W` on the wall therefore meant a shard kept off its CPU, never a
+  tracker gone, and dropping it was the costliest answer: the keeper's consume found its cursor behind the journal and
+  lost every connection's states, so each write-back of those connections was refused (`NFS3ERR_IO`) until the
+  connection ended. Now the reader holds its records while the tracker is open (`Patience::WhileOpen`); it closes with
+  the tracker when the tracker's last connection ends. Its records stay bounded by the shard's metadata ledger, whose
+  refusal drops the oldest, counted (`growth_refused`). A tracker whose keeper could not be spawned (a counted tripwire,
+  `nfs.writeback_keeper_refused`) is consumed at its connections' calls and holds its records until then, within the
+  same ledger.
+- **Tests (part 1).** `a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window` (`nfs_writeback.rs`:
+  a connection's fetch tracked, another path's change, the shard held a window and a tenth at a fifth of its CPU, the
+  journal filled past its budget, then the connection's write-back of a byte it fetched judged). On the Mac Studio
+  (debug, 2026-11-19, load 13 to 32): `slates-server --lib nfs_writeback` 2 of 2 and `slates-vfs --lib journal` 11 of 11;
+  red with the one-window patience put back: the write-back judged `Unknown`, the connection's states lost, where
+  `Apply` was expected.
+- **The journal's rule.** `Patience` names what a reader's reads wait on: `WhileOpen` for a reader consumed at the
+  change on the volume's own shard, `Bounded(ns)` for one whose rounds wait on another party, which may stall while the
+  reader stays open. The retention oracle (`retention_keeps_what_a_live_reader_needs_as_the_model_does`) generates
+  both, its model stating each rule, and checks directly that while no growth was refused no record a reader held
+  while open has not read has left.
 
 ### A-563 — A deferred reply that says its request was not started is never recorded as its completion (2026-11-19, goal 85 via g225; §4.9 RIFL, "Status (2026-11-17, an `Overloaded` verb is never its own completion)"; A-557's sibling, A-533)
 

@@ -1098,8 +1098,12 @@
 >   touch since is a `ModifyModify` conflict (a refusal, never a loss) until the clone keeps what it landed as its base
 >   (a mark snapshot plus the per-path bases of what a filter left out); (2) stage 2 is built (A-503): a move carries
 >   the captured state of every path its clone changed in the volume's catalog, and the new owner keeps the moved head as
->   its mark, so a moved clone lands against its capture; owed of it, the fleet's own three-daemon test (filed for main)
->   and a captured clone taken over after its owner's loss, which carries nothing and still lands as a scratch volume;
+>   its mark, so a moved clone lands against its capture; and since A-544 every head a captured clone places carries its
+>   record, so a takeover after its owner's loss lands it against its capture too (refused by kind where the adopted
+>   head has no record, and a move waits for its head's record); owed of it, the fleet's own three-daemon tests of a
+>   move and a takeover (filed for main), a live-shipped clone's record for a head its log rebuilt, and a clone whose
+>   owner dies before its first snapshot is placed, which its successor serves as an empty tree (sealed at its making,
+>   or its catalog naming its capture, A-544);
 >   (3) a kind
 >   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
 >   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a
@@ -4255,7 +4259,14 @@
 >   `an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart`,
 >   `a_held_mount_keeps_its_id_in_its_attachments_record`, and in `slates-db`
 >   `an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot`); an attachment never seen mounted keeps the
->   rule before, since the table's silence about its point proves nothing. Class B (the
+>   rule before, since the table's silence about its point proves nothing. C-c's rest since A-548 (2026-11-19, g232),
+>   part 1: the NFS write-back tracker's journal reader was presumed gone once a record had waited a liveness window on
+>   the wall, so a shard kept off its CPU that long lost the record to the next append past the budget and every tracked
+>   connection's states with it, each of their write-backs refused until the connection ended; the tracker's keeper
+>   consumes each change on the volume's own shard, so its reader now holds its records while the tracker is open
+>   (`slates_vfs::journal::Patience::WhileOpen`), within the shard's metadata ledger
+>   (`a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window`). Owed in C-c: the FUSE and WinFsp
+>   readers' patience (part 2) and `verbs::await_materialization` (part 3). Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -8027,12 +8038,33 @@ its origin's count at the moment of the clone, not its snapshot's, so every file
 counted against the clone's inode allowance and every file it removed did not, until a restart recounted the clone's
 tree (`docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`). A snapshot now keeps its count,
 and a clone starts from it; a recovered snapshot's is its image's entries. AC-1.7's two counters were compared after
-every step, but no step cloned a snapshot its origin had changed since. **Open, found by the sweep:** the server's
-clone admission still reads the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s `inherited`:
-a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it should read
-the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension, `entry_allowance`) starts
-from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart recounts it (the bug record
-names the effects of each).
+every step, but no step cloned a snapshot its origin had changed since. **Found by the sweep, fixed since by A-549
+(below):** the server's clone admission read the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s
+`inherited`: a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it
+should read the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension,
+`entry_allowance`) started from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart
+recounted it (the bug record names the effects of each).
+
+**Fixed 2026-11-19 (A-549, goal 85, g234): a clone's admission and its entry count read its origin's head.** A
+snapshot now records its live entries beside its inodes (a recovered one's from its image: its own directories' named
+entries and the live entries of the head's directories it shares), a clone starts from them, and the server admits a
+clone by its snapshot's inodes (`Volume::snapshot_inodes`): a bounded clone's reservation and its allowance's floor, a
+dynamic clone's version hold. Measured before: a bounded clone of an origin floored 8 past its share of 28 ran with no
+inode cap (its allowance of 28 refused below its 36), a dynamic clone held 2 slots for 13 inodes, and a clone counted 13
+entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`).
+**Open, found by the sweep:**
+- A restart refused any clone holding a snapshot while it still shared a file with its origin, `RecoveryIncomplete`
+  from `Volume::clone_from_image` (A-561, the next piece): the clone's snapshot marks such a file shared with the head,
+  and recovery looks a head-shared entry up only among the images of the head's own inodes, which a clone's
+  origin-shared files are not. No test recovered a clone with a snapshot of its own; A-549's restart test recovers one
+  without.
+- A clone is admitted with no entry allowance (`admit_clone` sets the inode allowance alone, where a create and a
+  restart set both), so its namespace dimension is unbounded until a restart.
+- A resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume was made
+  with (`verbs::resize`).
+- Recovery counts a whiteout as a live entry (`rebuild_entries` re-inserts one through `dir_insert`, which counts it;
+  the live count and `DirNode::live_len` never do), so a restarted overlay's entry count and its allowance's floor at
+  the restart are raised by its whiteouts. Found by reading, not tested.
 
 ## 8d. Phase 2 record (2026-09-05)
 

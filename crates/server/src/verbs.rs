@@ -10047,20 +10047,26 @@ pub(crate) fn admit_clone(
   };
   // Take the clone's version slots *before* cloning (§4.2: reserve all credits or none before publishing), so a refusal
   // allocates nothing and does not leave the origin's `clone_refs` bumped. A clone shares its origin's versions until
-  // it diverges. A bounded clone reserves its whole allowance — a create's fair share, but never below the count it
-  // inherits from the origin (equal to the origin's live count at clone time) — as the sacred claim that backs full
-  // divergence of the inherited inodes. A dynamic clone holds slots for the inodes it inherits only, from the
-  // unpromised capacity, and grows its hold as it makes more (A-342). If the slab cannot back them, the clone is refused.
-  let inherited = match state.volumes.get(handle) {
-    Ok(slot) => slot.volume.inode_usage().0,
-    Err(_) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        Refusal::NotFound,
-      )));
+  // it diverges. A bounded clone reserves its whole allowance — a create's fair share, but never below the inodes it
+  // inherits — as the sacred claim that backs full divergence of the inherited inodes. A dynamic clone holds slots for
+  // the inodes it inherits only, from the unpromised capacity, and grows its hold as it makes more (A-342). If the slab
+  // cannot back them, the clone is refused. The inodes it inherits are its snapshot's tree's, the count the clone starts
+  // from (A-541), never the origin's head's now, which has made and removed files since (A-549); a stale snapshot is
+  // refused here, before any slot is taken, as the clone would refuse it.
+  let inherited = state
+    .volumes
+    .get(handle)
+    .map_err(|_| Refusal::NotFound)
+    .and_then(|slot| {
+      slot
+        .volume
+        .snapshot_inodes(core_snapshot(snapshot))
+        .map_err(|error| refusal_of_vfs(&error))
+    });
+  let inherited = match inherited {
+    Ok(inodes) => inodes,
+    Err(refusal) => {
+      return Err(Box::new(give_back(state, reservation, None, None, refusal)));
     }
   };
   let clone_allowance = inode_allowance(state, size).max(inherited);
@@ -10260,25 +10266,32 @@ pub(crate) fn publish_clone_as(
   new_record.access = Vec::new();
   new_record.lease = None;
   new_record.created_ns = now;
-  // A clone of a captured base holds its whole tree and reads no base directory (A-291).
-  if state
+  // A clone of a captured base holds its whole tree and reads no base directory (A-291), and is born with its capture's
+  // record, naming no head yet (A-544): a successor that adopts a head no record is for refuses its landing by kind.
+  let captured = state
     .db
     .partition()
-    .is_captured(record.id, to_db_snapshot(snapshot))
-  {
+    .is_captured(record.id, to_db_snapshot(snapshot));
+  if captured {
     new_record.base = BaseRecord::Scratch;
   }
+  let born_with = captured.then(|| Op::CaptureCarried {
+    volume: id,
+    carried: crate::carry::creation_record(),
+    mark: None,
+  });
   let ops = [
-    Op::VolumeCreated { record: new_record },
-    Op::LineageAdded {
+    Some(Op::VolumeCreated { record: new_record }),
+    Some(Op::LineageAdded {
       edge: LineageEdge {
         child: id,
         origin_volume: record.id,
         origin_snapshot: to_db_snapshot(snapshot),
       },
-    },
+    }),
+    born_with,
   ];
-  for op in &ops {
+  for op in ops.iter().flatten() {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       discard_clone(state, origin, snapshot, admitted);
       return Err(refusal_of_db(&e));
@@ -20841,6 +20854,182 @@ mod tests {
     });
   }
 
+  /// A-544. Do: capture a volume's snapshot as a base and clone it, after cloning it once before the capture. Expect the
+  /// clone of the captured base born with its capture's record, naming no head (so a successor that adopts a head no
+  /// record is for refuses its landing by kind), shipped in its catalog; and the clone of the snapshot no capture named
+  /// born with none.
+  #[test]
+  fn a544_a_clone_of_a_captured_base_is_born_with_its_capture_record() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::Created { id: origin } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "a544-origin".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the origin was created")
+      };
+      let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Snapshot { volume: origin },
+      ) else {
+        panic!("the origin was snapshotted")
+      };
+      let clone = |state: &mut crate::state::ShardState, name: &str| {
+        let reply = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Clone {
+            volume: origin,
+            snapshot,
+            name: name.to_owned(),
+          },
+        );
+        let super::ReplyBody::Cloned { id } = reply else {
+          panic!("the clone was made: {reply:?}")
+        };
+        super::to_db_volume(id)
+      };
+      let plain = clone(state, "a544-plain");
+      let captured_op = super::Op::BaseCaptured {
+        volume: super::to_db_volume(origin),
+        snapshot: super::to_db_snapshot(snapshot),
+      };
+      state
+        .db
+        .mutate(&mut state.segment, &captured_op, 0)
+        .unwrap();
+      let captured = clone(state, "a544-captured");
+      let born = crate::carry::creation_record();
+      assert_eq!(state.db.partition().carried(captured), Some((&born, None)));
+      let record = state.db.partition().volume(captured).cloned().unwrap();
+      let carried = state
+        .db
+        .partition()
+        .carried(captured)
+        .map(|(carried, _)| carried);
+      assert_eq!(
+        crate::catalog::CatalogValue::of(&record, carried).carried,
+        Some(born),
+        "the catalog ships the record"
+      );
+      assert_eq!(state.db.partition().carried(plain), None);
+    });
+  }
+
+  /// [`take_over_at`] with the adopted head naming `manifest`, as a sealed head names its archive's identity.
+  fn take_over_named(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    manifest: [u8; 32],
+  ) -> Result<(), Box<super::ReplyBody>> {
+    let head = crate::head::HeadValue {
+      manifest: Some(manifest),
+      content_holders: Vec::new(),
+      sealing: None,
+    };
+    let taken = super::TakenOver {
+      head: &head,
+      catalog,
+      catalog_sequence: 0,
+      sequence: 1,
+      takeover: slates_db::catalog::TakeoverRecord {
+        epoch: 1,
+        head_sequence: 1,
+        from_live_log: false,
+        past_tolerance: None,
+      },
+    };
+    super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// A-544. Do: take over a captured clone whose owner died, its catalog carrying the record for the head the takeover
+  /// adopts; and another whose catalog carries only the record it was born with (no head of it was ever placed with its
+  /// record), and step its carry as the seal walk does. Expect: the first judged against its capture on the successor,
+  /// the carried paths as its owner recorded them, and free to move on with them; the second refused by kind, never
+  /// landed as a volume with no capture, its carry refused (no mark to carry from, counted) and a move of it waiting
+  /// until it is refused `Unplaced`, as A-503's move of a capture it could not carry waited.
+  #[test]
+  fn a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind() {
+    crate::daemon::audit_on_shard(|state| {
+      let chunk = slates_archive::Archive::raw_chunk(b"CAPT".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: chunk.identity,
+          chunk_offset: 0,
+        }],
+        vec![chunk],
+      );
+      let head = [0x3c; 32];
+      let carried = slates_vfs::captured::CarriedCapture {
+        entries: vec![slates_vfs::captured::CarriedPath {
+          path: "/gone.rs".to_owned(),
+          state: slates_vfs::captured::CapturedState::Absent,
+        }],
+      };
+      let record = slates_db::catalog::CarriedRecord {
+        head,
+        entries: slates_wire::Wire::to_bytes(&carried),
+      };
+      let id = slates_db::catalog::VolumeId { bytes: [0x91; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        carried: Some(record),
+        ..takeover_catalog("a544-carried", 1 << 20)
+      };
+      take_over_named(state, id, &catalog, &archive, head).unwrap();
+      match crate::landing::capture_of(state, id) {
+        Ok(Some(slates_vfs::captured::CaptureBase::Carried { carried: got, .. })) => {
+          assert_eq!(got, carried)
+        }
+        other => panic!("the successor holds no capture to land against: {other:?}"),
+      }
+      assert!(
+        crate::carry::carries_its_head(state, id),
+        "a successor that marked its adopted head moves the clone on with its record"
+      );
+      let born = slates_db::catalog::VolumeId { bytes: [0x92; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        carried: Some(crate::carry::creation_record()),
+        ..takeover_catalog("a544-born", 1 << 20)
+      };
+      take_over_named(state, born, &catalog, &archive, head).unwrap();
+      assert!(
+        matches!(
+          crate::landing::capture_of(state, born),
+          Err(Refusal::Unsupported { .. })
+        ),
+        "a captured clone with no record for its head is refused by kind, never landed as a volume with no capture"
+      );
+      crate::carry::step(state, born);
+      assert_eq!(
+        state.refusals.get(crate::carry::CARRY_REFUSED),
+        Some(&1),
+        "a successor with no mark cannot carry the capture for its head, and counts it"
+      );
+      assert!(
+        !crate::carry::carries_its_head(state, born),
+        "a move of a clone whose head carries no record waits to be refused"
+      );
+    });
+  }
+
   /// An archive of one file `f` laid out by `extents` over `chunks`, its recorded size their tiled length.
   fn takeover_archive(
     extents: Vec<slates_archive::Extent>,
@@ -22885,4 +23074,199 @@ fn nfs_quantile(state: &ShardState, times: NfsTimes, ppm: u64) -> Option<u64> {
     NfsTimes::Forwarded => &state.nfs_service.forwarded,
   };
   (histogram.count() > 0).then(|| histogram.quantile(ppm))
+}
+
+/// A-549: a clone's admission sizes its version slots and its allowance by the inodes its snapshot's tree holds, not by
+/// what its origin holds at the clone (A-541's sibling).
+#[cfg(test)]
+mod clone_admission_tests {
+  use super::{
+    NamePolicy, ReplyBody, RequestBody, ShardState, SizeClass, VOLUME_ALLOWANCE_REFUSED, dispatch,
+    inode_allowance, to_db_volume,
+  };
+
+  /// Format: the uid of the volumes' owner, who may snapshot and clone them.
+  const OWNER_UID: u32 = 1234;
+  /// Shape: a bounded origin's quota: small, so its fair share of inodes is a few hundred at most.
+  const BOUNDED_BYTES: u64 = 1 << 16;
+  /// Shape: a dynamic origin's maximum.
+  const DYNAMIC_BYTES: u64 = 1 << 20;
+  /// Shape: the inodes past its fair share the bounded origin holds at its snapshot.
+  const PAST_FAIR: u64 = 8;
+  /// Shape: the files the dynamic origin holds at its snapshot.
+  const DYNAMIC_FILES: u64 = 12;
+  /// Format: a file's mode.
+  const FILE_MODE: u32 = 0o644;
+
+  fn owner() -> slates_db::catalog::Principal {
+    slates_db::catalog::Principal::Uid {
+      host: slates_db::register::HostId(0),
+      uid: OWNER_UID,
+    }
+  }
+
+  /// Makes a volume named `name` of `size` for [`owner`]; its id.
+  fn made(state: &mut ShardState, name: &str, size: SizeClass) -> slates_ipc::protocol::VolumeId {
+    let reply = dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::Create {
+        name: name.to_owned(),
+        size,
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let ReplyBody::Created { id } = reply else {
+      panic!("the volume {name} was made: {reply:?}")
+    };
+    id
+  }
+
+  /// Runs `change` on `volume`'s core with the shard's store.
+  fn on_core<T>(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    change: impl FnOnce(&mut slates_vfs::Volume, &mut slates_vfs::volume::Store) -> T,
+  ) -> T {
+    let handle = *state.by_id.get(&to_db_volume(volume)).unwrap();
+    let ShardState { store, volumes, .. } = &mut *state;
+    let slot = volumes.get_mut(handle).unwrap();
+    change(&mut slot.volume, store)
+  }
+
+  /// Makes `count` empty files named `prefix-n` in `volume`'s root.
+  fn make_files(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    prefix: &str,
+    count: u64,
+  ) {
+    on_core(state, volume, |core, store| {
+      let root = core.root_inode(store).unwrap();
+      for n in 0..count {
+        core
+          .create_file_no(store, root, &format!("{prefix}-{n}"), FILE_MODE)
+          .unwrap();
+      }
+    });
+  }
+
+  /// Removes the files `prefix-0` to `prefix-(count - 1)` from `volume`'s root.
+  fn remove_files(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    prefix: &str,
+    count: u64,
+  ) {
+    on_core(state, volume, |core, store| {
+      let root = core.root_inode(store).unwrap();
+      for n in 0..count {
+        core
+          .unlink_no(store, root, &format!("{prefix}-{n}"))
+          .unwrap();
+      }
+    });
+  }
+
+  /// Snapshots `volume`, then clones the snapshot as `name`: the snapshot's live-inode count (its origin's at the
+  /// snapshot) and the clone's id.
+  fn snapshot_then_clone(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    removed: (&str, u64),
+    name: &str,
+  ) -> (u64, slates_ipc::protocol::VolumeId) {
+    let at_snapshot = on_core(state, volume, |core, _| core.inode_usage().0);
+    let reply = dispatch(state, 1, &owner(), RequestBody::Snapshot { volume });
+    let ReplyBody::Snapshotted { id: snapshot, .. } = reply else {
+      panic!("the origin was snapshotted: {reply:?}")
+    };
+    remove_files(state, volume, removed.0, removed.1);
+    let reply = dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::Clone {
+        volume,
+        snapshot,
+        name: name.to_owned(),
+      },
+    );
+    let ReplyBody::Cloned { id } = reply else {
+      panic!("the clone {name} was made: {reply:?}")
+    };
+    (at_snapshot, id)
+  }
+
+  /// A-549. Do: make a bounded origin whose inode allowance is above its fair share (as a restart floors a volume's at
+  /// the inodes it recovered on a machine whose share is smaller, or an admission floors a clone's at the inodes it
+  /// inherited), fill it past that share, snapshot it, remove files until it holds fewer than the share, and clone the
+  /// snapshot. Expect the clone's allowance to be what its tree holds (more than the share), at least its count, and no
+  /// allowance refused. Before A-549 the admission sized it by the origin's count at the clone, under the share, so the
+  /// allowance was the share, below the clone's count: refused, counted, and the clone ran with no inode cap.
+  #[test]
+  fn a_bounded_clone_is_admitted_by_the_inodes_its_snapshot_holds() {
+    let (fair, at_snapshot, (count, allowance), refused) = crate::daemon::audit_on_shard(|state| {
+      let size = SizeClass::Bounded {
+        limit: BOUNDED_BYTES,
+      };
+      let fair = inode_allowance(state, size);
+      assert!(
+        fair >= 2,
+        "a share of at least two inodes leaves a file to remove: {fair}"
+      );
+      let origin = made(state, "floored", size);
+      on_core(state, origin, |core, _| {
+        core.set_inode_allowance(fair + PAST_FAIR).unwrap();
+      });
+      // The root and the files: the share and `PAST_FAIR` inodes past it, all the raised allowance admits.
+      make_files(state, origin, "f", fair + PAST_FAIR - 1);
+      // One file more than the inodes past the share: the origin then holds one fewer than its share.
+      let (at_snapshot, clone) =
+        snapshot_then_clone(state, origin, ("f", PAST_FAIR + 1), "floored-clone");
+      let usage = on_core(state, clone, |core, _| core.inode_usage());
+      let refused = state
+        .refusals
+        .get(VOLUME_ALLOWANCE_REFUSED)
+        .copied()
+        .unwrap_or(0);
+      (fair, at_snapshot, usage, refused)
+    });
+    assert_eq!(
+      at_snapshot,
+      fair + PAST_FAIR,
+      "the origin held its share and more at its snapshot"
+    );
+    assert_eq!(count, at_snapshot, "the clone counts its snapshot's inodes");
+    assert_eq!(
+      allowance, at_snapshot,
+      "the clone's allowance is what its snapshot holds, above the share"
+    );
+    assert_eq!(refused, 0, "no allowance was refused");
+  }
+
+  /// A-549. Do: make a dynamic origin, fill it, snapshot it, remove most of its files, and clone the snapshot. Expect the
+  /// clone's version hold to be the inodes it holds, its snapshot's. Before A-549 the admission held slots for the
+  /// origin's count at the clone, fewer than the clone holds.
+  #[test]
+  fn a_dynamic_clone_holds_a_version_slot_for_each_inode_its_snapshot_holds() {
+    let (at_snapshot, count, hold) = crate::daemon::audit_on_shard(|state| {
+      let origin = made(state, "dynamic", SizeClass::Dynamic { max: DYNAMIC_BYTES });
+      make_files(state, origin, "f", DYNAMIC_FILES);
+      let (at_snapshot, clone) =
+        snapshot_then_clone(state, origin, ("f", DYNAMIC_FILES - 1), "dynamic-clone");
+      let (count, hold) = on_core(state, clone, |core, _| {
+        (core.inode_usage().0, core.version_hold())
+      });
+      (at_snapshot, count, hold)
+    });
+    assert_eq!(count, at_snapshot, "the clone counts its snapshot's inodes");
+    assert_eq!(
+      hold, count,
+      "the clone holds a version slot for each inode it holds"
+    );
+  }
 }
