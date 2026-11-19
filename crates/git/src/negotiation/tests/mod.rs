@@ -53,7 +53,7 @@ impl TestGraph {
     u32::try_from(self.objects.len() - 1).unwrap()
   }
 
-  fn blob(&mut self, size: u64) -> u32 {
+  fn new_blob(&mut self, size: u64) -> u32 {
     self.add(Object {
       kind: Kind::Blob,
       parents: vec![],
@@ -66,7 +66,7 @@ impl TestGraph {
     })
   }
 
-  fn tree(&mut self, entries: &[u32]) -> u32 {
+  fn new_tree(&mut self, entries: &[u32]) -> u32 {
     let entries = entries.to_vec();
     self.add(Object {
       kind: Kind::Tree,
@@ -80,7 +80,7 @@ impl TestGraph {
     })
   }
 
-  fn commit(&mut self, parents: &[u32], tree: u32, date: u64) -> u32 {
+  fn new_commit(&mut self, parents: &[u32], tree: u32, date: u64) -> u32 {
     let generation = parents
       .iter()
       .map(|parent| self.objects[at(*parent)].generation)
@@ -100,7 +100,7 @@ impl TestGraph {
     })
   }
 
-  fn tag(&mut self, target: u32) -> u32 {
+  fn new_tag(&mut self, target: u32) -> u32 {
     let target = Some(target);
     self.add(Object {
       kind: Kind::Tag,
@@ -115,7 +115,7 @@ impl TestGraph {
   }
 
   /// A green whose versions are `heads`, in order.
-  fn green(&mut self, heads: &[u32]) -> u32 {
+  fn new_green(&mut self, heads: &[u32]) -> u32 {
     self.greens.push(Chain {
       heads: heads.to_vec(),
     });
@@ -851,7 +851,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
   let blobs: Vec<u32> = plan
     .blobs
     .iter()
-    .map(|size| graph.blob(u64::from(*size)))
+    .map(|size| graph.new_blob(u64::from(*size)))
     .collect();
   let mut trees: Vec<u32> = Vec::new();
   for entries in &plan.trees {
@@ -859,7 +859,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
     let mut chosen: Vec<u32> = entries.iter().map(|choice| pick(&pool, *choice)).collect();
     chosen.sort();
     chosen.dedup();
-    trees.push(graph.tree(&chosen));
+    trees.push(graph.new_tree(&chosen));
   }
   let mut commits: Vec<u32> = Vec::new();
   for (index, (parents, tree, date, skew)) in plan.commits.iter().enumerate() {
@@ -879,7 +879,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
       } else {
         u64::from(*date % 10)
       };
-    commits.push(graph.commit(&chosen, pick(&trees, *tree), date));
+    commits.push(graph.new_commit(&chosen, pick(&trees, *tree), date));
   }
   let mut tags = Vec::new();
   for choice in &plan.tags {
@@ -890,7 +890,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
       .chain(&tags)
       .copied()
       .collect();
-    let tag = graph.tag(pick(&pool, *choice));
+    let tag = graph.new_tag(pick(&pool, *choice));
     tags.push(tag);
   }
   graph.tags = tags.clone();
@@ -898,7 +898,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
   for chain in &plan.greens {
     let heads: Vec<u32> = chain.iter().map(|choice| pick(&commits, *choice)).collect();
     heads_all.extend(heads.iter().copied());
-    graph.green(&heads);
+    graph.new_green(&heads);
     graph.tips.push(*heads.last().unwrap());
   }
   graph.tips.extend(tags.iter().copied());
@@ -1054,12 +1054,12 @@ fn straight(count: u64) -> (TestGraph, Vec<u32>) {
   let mut graph = TestGraph::default();
   let mut commits = Vec::new();
   for index in 0..count {
-    let blob = graph.blob(index);
-    let tree = graph.tree(&[blob]);
+    let blob = graph.new_blob(index);
+    let tree = graph.new_tree(&[blob]);
     let parents: Vec<u32> = commits.last().copied().into_iter().collect();
-    commits.push(graph.commit(&parents, tree, index * 10));
+    commits.push(graph.new_commit(&parents, tree, index * 10));
   }
-  graph.green(&commits);
+  graph.new_green(&commits);
   graph.tips.push(*commits.last().unwrap());
   (graph, commits)
 }
@@ -1106,10 +1106,10 @@ fn a_client_versions_behind_is_answered_in_one_round_without_a_walk() {
 #[test]
 fn a_rewrite_between_takes_the_walk() {
   let (mut graph, commits) = straight(4);
-  let blob = graph.blob(99);
-  let tree = graph.tree(&[blob]);
-  let side = graph.commit(&[commits[0]], tree, 100);
-  let top = graph.commit(&[side], tree, 110);
+  let blob = graph.new_blob(99);
+  let tree = graph.new_tree(&[blob]);
+  let side = graph.new_commit(&[commits[0]], tree, 100);
+  let top = graph.new_commit(&[side], tree, 110);
   graph.greens[0].heads.extend([side, top]);
   let asks = Asks {
     wants: vec![graph.id(top)],
