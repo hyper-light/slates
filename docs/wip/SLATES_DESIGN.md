@@ -11490,7 +11490,10 @@ against what that copy brings there.
 > at the base link still naming its node (the deriver's `heirs_of_writes`), which the verdict makes the node's home with
 > them (`Green::merge_handed`), its mode and attributes too, and which a rebase restates as the work made them; a write
 > whose node only a link the work made still names is refused, typed, owed (`crates/merge/src/engine/
-> restate_tests.rs`).
+> restate_tests.rs`). Since A-670 a work never hands a node to a link it never saw: removing a file, or renaming
+> another over it, is refused when a link naming it was made after the work's base and none of the base's links to it
+> outlives the work (delete against modify, rename against rename), unless the work hands the node on itself; a
+> stack's upper alike for a link another version made under the stack.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -47274,3 +47277,45 @@ Applied in the same change to:
   file, since a link made to a file records no change of the file (GAPS, open); a removed file's own mode or attribute
   change is refused (`SetModeMissing`, `XattrMissing`), not lost; a file renamed away keeps its writes, which travel with
   it; the commit's other hand-overs carry no writes of the version.
+
+### A-670 — a work never hands a node to a link it never saw, and the restatement census is met by fixed histories (2026-11-19, g307, UI goal 93 (kiln 51cef9f7); §4.16 "The verdict" and A-646's decision; §4.17.1 "Works over works"; found by A-669's sweep and by main)
+Applied in the same change to:
+- §4.16: A-646's decision's status; GAPS (two entries fixed);
+- `crates/merge/src/engine.rs`: `Green::decide_moves` (the renames, creates and unlinks out of `decide_content`),
+  `leaves_to_an_unseen_link` and `links_unseen`; `decide_handed` answers each heir's home;
+- `crates/merge/src/engine/stack.rs` and `stack/judge.rs`: `Against::since`, `upper_unseen_links`,
+  `linked_by_another`; `stack/handed_tests.rs`, new;
+- `crates/merge/src/engine/restate_tests.rs`: the heads that link a file late, five cases, `fixed_histories`;
+  `crates/merge/src/engine/replaced_node_tests.rs`: the whole-state model's rule;
+- `docs/bugs/2026-11-19-a-write-to-a-file-a-later-version-linked-was-lost-with-the-file.md`.
+- **The defect.** A work based before a version that linked `a` to `g` wrote to `g` and removed it, or renamed another
+  file over it. Its deriver saw no link, so the writes went with the node in the work's own volume (A-669 declares them
+  only at a link the base had). The verdict accepted the removal, since a link made to a file records no change of the
+  file, and the commit handed the node to `a` with the head's bytes: a lost update. The same in a stack: an upper's base
+  is its lower's post-state, which never holds a link another work made while the stack was in flight.
+- **The rule.** Removing a file, or renaming another over it, is refused when a link naming the file was made after the
+  work's base and no link the base had to it outlives the work: delete against modify, or rename against rename. A work
+  that hands the node on itself (A-669) is exempt, its other links following the heir. The increment cannot say whether
+  its work wrote, so a removal without a write is refused alike; rebased over the link, the work removes the file
+  again, the link keeping the node, or hands its writes on. A stack's upper is refused alike for a link that a version
+  no work of the stack landed as made after the stack's base.
+- **A-659's question.** A stack's upper that hands a write on to a link lands with its node: the restatement carries
+  the writes at the link to the verdict, and a change another work made to the home meets the upper's removal of it
+  (delete against modify), so the writes are never placed over bytes the head no longer holds. Answered by test;
+  nothing to fix.
+- **The census.** A-663's oracle checked its census on generated works alone, with a random seed each run; `to_made`
+  ran 12, 4 and 6 over A-669's runs. One fixed history a counted case now runs first (`fixed_histories`), each checked
+  by the four readings as a generated work is, so every count is met on every run and none can fall to zero by luck.
+- **Tests.** Four verdict cases red first: a write and a removal, a write and a rename over, a removal without a write,
+  and a write whose base link the work removed itself; a base link outliving the work keeps the removal accepted. In
+  stacks: an upper handing a write on lands with its node; it meets a change to the home and conflicts; an upper
+  removing a file another work linked under the stack is refused, red first; one removing a file its lower linked
+  lands. A-663's oracle's heads may link `FILE` or `TARGET` late, and A-643's whole-state model states the rule (its
+  first green run had shrunk to a link made and a removal based before it, which the engine refused and the model
+  accepted).
+- **Evidence** (Windows x86_64, jupiter, kiln, 2026-11-19, debug; the macOS run owed). Red over main's engine at
+  cac45de71 (`cargo test --locked -p slates-merge --lib -- restate_tests handed_tests`): 6 failing, the four cases, the
+  stack case and the oracle's fixed history, 14 passing. Green over main at 6e42e7a2c (`cargo test --locked -p
+  slates-merge --lib`): 177 of 178 at ac6a83b09, A-643's model failing as said; 178 of 178 at e8c10097e; the census
+  33 refused and 13 kept at a late link, 130 agreed, 102 refused by the deriver, 34 conflicts; `cargo fmt -p
+  slates-merge -- --check` clean.

@@ -2720,13 +2720,31 @@
 > (A-659's stacks), 169 of 169 at 85b5b7eee, fmt clean. Bug record:
 > `docs/bugs/2026-11-19-a-write-to-a-file-a-hard-link-names-was-lost-with-the-file.md`.
 
-> **A write to a file a later version linked is lost when the work removes the file: found open (2026-11-19, A-669's
-> sweep, g307, by reading; §4.16 "The verdict"; A-646's decision; `Green::merge_unlink`).** A work based before a
-> version that links `a` to `g` writes to `g` and removes it. Its deriver saw no link, so the writes went with the
-> node; the verdict accepts the removal, since a link made to a file records no change of the file (`record_changes`
-> names the link's path), and the commit hands `g`'s node to `a` with the head's bytes. POSIX keeps the work's writes
-> at `a`. Owed: a failing test first; then the removal of a file whose node gained a link after the work's base judged
-> delete against modify, so the rebase brings the link and the work's next submit hands the writes on itself (A-669).
+> **A write to a file a later version linked was lost when the work removed the file: fixed (2026-11-19, A-670, g307;
+> found by A-669's sweep, by reading; §4.16 "The verdict"; A-646's decision; `Green::leaves_to_an_unseen_link`).** A
+> work based before a version that links `a` to `g` writes to `g` and removes it, or renames another file over it. Its
+> deriver saw no link, so the writes went with the node in its own volume; the verdict accepted the removal, since a
+> link made to a file records no change of the file, and the commit handed `g`'s node to `a` with the head's bytes.
+> The same in a stack (A-659): an upper's base, its lower's post-state, never holds a link another work made while the
+> stack was in flight, and the restated upper is judged as based on a version after that link.
+>
+> Fixed: the verdict refuses removing a file, or renaming another over it, when a link naming it now was made after
+> the work's base and no link the base had to it outlives the work, unless the increment hands the node on itself
+> (A-669): delete against modify, or rename against rename. The increment cannot say whether the work wrote, so a
+> removal without a write is refused alike; the rebased work removes the file again, the link keeping the node. A
+> stack's upper is refused alike for a link another version made under the stack (`upper_unseen_links`). A-643's
+> whole-state model states the rule; A-663's oracle heads may link a file late. Tests: four verdict cases and a stack
+> case, red first; a base link outliving the work keeps the removal accepted; A-659's stacks carry an upper's write
+> handed on to a link (the question A-669 left, answered by test, nothing to fix). Evidence (Windows x86_64, jupiter,
+> 2026-11-19; the macOS run owed): red over main's engine at cac45de71, 6 failing (the four cases, the stack case and
+> the oracle's fixed history), 14 passing; green 178 of 178 over main at 6e42e7a2c (e8c10097e), fmt clean. Bug record:
+> `docs/bugs/2026-11-19-a-write-to-a-file-a-later-version-linked-was-lost-with-the-file.md`.
+>
+> **The restatement oracle's census could be met by luck: fixed (2026-11-19, A-670, g307; main's finding on A-669's
+> runs).** Its counts rested on the generated works alone, with a random seed each run: `to_made` ran 12, 4 and 6 over
+> three runs, so a run meeting a case zero times would fail, and a case could be met by no history at all. One fixed
+> history a counted case now runs before the generated works (`fixed_histories`), so every count is met on every run,
+> and the generated works add to them.
 
 > **A rebased work's other restatements a volume refuses: found open (2026-11-19, A-663's sweep, g307, by reading;
 > §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).**
