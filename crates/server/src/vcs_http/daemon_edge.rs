@@ -235,8 +235,8 @@ fn not_started(why: &str) -> Option<u16> {
 }
 
 /// The edge's bounds on each shard of `config`: its seats and request room from the shard's budget, its waits floored by
-/// the timer's tick ([`Bounds::of_shard`]).
-fn bounds_of(config: &DaemonConfig) -> Bounds {
+/// the timer's tick ([`Bounds::of_shard`]); the SSH edge's too (A-684), whose connections are clients of the shard alike.
+pub(crate) fn bounds_of(config: &DaemonConfig) -> Bounds {
   Bounds::of_shard(
     config.clients_per_shard,
     config.region.total_bytes(),
