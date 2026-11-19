@@ -12742,9 +12742,17 @@ engine: the verdict, rebase, position mapping, the register).
 > files, so the daemon reads none (R1), and the transport's key stays private to it. A daemon that is no fleet node has
 > no identity to present, so its edge serves cleartext, on a loopback address alone; any other address is refused where
 > the flag is read (`slates_api::role::vcs_http_address`, by both roles and the `slates` command), as usage before
-> anything starts, rather than by a daemon that would start without its edge. Owed: the anchor holding the edge's
-> listener across a daemon's restart, as it holds the export's; the option on a library starter's anchor
-> (`slates_api::start`).
+> anything starts, rather than by a daemon that would start without its edge.
+>
+> **Status (2026-11-19, A-625 part 3 continued (2): the anchor holds the edge's port, built).** On Unix the anchor binds
+> the edge's listener once, at the address `--vcs-http` names, with the backlog the edge derives
+> (`slates_server::daemon::bind_vcs_http_listener`), and hands it to every daemon it starts
+> (`slates_anchor::ENV_VCS_HTTP`), as it holds the NFS listener and a fleet node's serve sockets; the daemon adopts it
+> only where its own configuration would have bound (the same address, the same port unless port 0), and serves it. A
+> restart never drops the edge's port: a client that connects while a daemon is down waits in the listener's queue and
+> is answered by the next daemon. An address the anchor cannot bind ends its start by name, as a fleet node's serve
+> sockets do. A library starter asks for the edge too (`StartSpec::vcs_http`), and its anchor holds it the same way.
+> Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
@@ -13097,6 +13105,18 @@ engine: the verdict, rebase, position mapping, the register).
 > default branch's empty green while that branch is unborn. Six pushes stock git 2.50.1 made are answered with git's
 > bytes. Owed: the edges' calls, the hooks' runs, older bases (A-664), the policy's principals other than the owner at
 > A-635's append, push options, review requests, the new versions' fragments off the answer's path.
+>
+> **Status (2026-11-19, A-654 part 3: receive-pack on git's HTTP site).** `crates/server` (`vcs_http::git::receive`)
+> serves `git-receive-pack` through the push driver: the advertisement on `GET info/refs` (the site's `# service=`
+> prelude for every version but 2, and `version 1` first to a client asking version 1, as git's own), and a `POST` read
+> into the driver a run at a time as it arrives and answered once its body has ended, the report given back a pkt-line's
+> room a run; each step lent the state of the shard the site moved the connection to (`ThisShard`, over `with_state`).
+> The site serves each service from its own half (`Halves`: in the daemon, upload-pack's `Unserved` until its stores are
+> lent, receive-pack's `ReceiveServices`). A step that fails before any reply is answered with a status (`400`, `413`,
+> `404`, `500`, `503`); a command's own refusal is the report's, `200`. Proven end to end: stock git 2.50.1's `create`
+> push posted over loopback TLS to a two-shard daemon is answered with git's very report and `main` advertised at its
+> commit after, and a delete under a policy denying it refused `deletion prohibited`. Owed: the SSH channel's call
+> (g294); the live `git push` over HTTPS with stock git's binary (main's run).
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -50625,6 +50645,88 @@ at start).
   `crates/merge/src/engine/copy_tests.rs` (copies judged again); with the merge of A-669 and A-670, `position.rs`'s
   footprints naming links and `Since`'s files whose links changed, and `engine.rs`'s `decide_handed` and
   `decide_moves` as units and `Resolved::declares_more_than_writes`; §4.16 "Commit"; A-645's entry; GAPS' A-645 entry.
+
+### A-625 part 3, continued (2) — the anchor holds the version-control edge's listener, so a daemon's restart never drops its port (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 1; §4.6 "One TCP loopback listener held by the anchor"'s rule, applied to the edge)
+Applied in the same change to: §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/anchor` (`ENV_VCS_HTTP`,
+`Supervisor::hold_vcs_http_listener` and its handover at each start); `crates/server` (`daemon::held_listener`, the one
+`OwnedFd::from_raw_fd` site the NFS listener already used, now shared; `daemon::bind_vcs_http_listener`;
+`vcs_http::daemon_edge`'s `bind`, `listener_for`, `listens_at`); `crates/api` (the anchor role's
+`hold_vcs_http_listener`; `StartSpec::vcs_http`; `CONTRACT` 53); `unsafe-budget.toml`'s comment on that site (the count
+unchanged); `docs/cli.md`; `docs/library.md`.
+- **What.** Until now each daemon bound the edge's address itself, so its port was free from a daemon's death until its
+  successor bound it again: a client was refused meanwhile, and a port 0 changed with every restart. The anchor now
+  binds it once, as it binds the NFS listener and a fleet node's serve sockets, and hands the descriptor to every daemon
+  it starts; the kernel queues a client that connects while no daemon runs, and the next daemon answers it.
+- **Decisions.** (1) The daemon adopts a handed listener only where its own configuration would have bound: the same
+  address, the same port unless the configuration asks for port 0 (the anchor's one pick for every daemon); a listener
+  elsewhere is refused, never served, since the edge would answer where the operator did not ask. (2) The anchor binds
+  with the edge's own backlog, derived from the same configuration the daemon derives (`bind_vcs_http_listener`), so
+  the queue is the edge's whoever bound it. (3) An address the anchor cannot bind ends its start by name, as a fleet
+  node's serve sockets do: the operator asked for the edge there, and a daemon would fail the same bind; one that cannot
+  be made inheritable is not held, and each daemon binds its own, as for the NFS listener. (4) No second `unsafe` site:
+  the NFS listener's adoption became `held_listener(variable)`, which both use. (5) A library starter's anchor takes the
+  same option (`StartSpec::vcs_http`), its role and command carrying it, as main asked if it was the same piece.
+- **Tests.** macOS arm64 (Mac Studio, `cargo test --locked`, fmt clean for `slates-anchor`, `slates-api`, `slates-cli`
+  and `slates-server`). Red first (kiln r9, 2026-11-19 20:54-20:59Z, over stubs that handed nothing over, adopted
+  nowhere and ignored the starter's address): the anchor's child found no descriptor (exit 2; the NFS listener's twin
+  passing), the starter's role carried `None`, the adoption check refused its own address, and the restart test failed
+  "the edge's port was dropped while its daemon restarted: Connection refused (os error 61)", its successor serving on
+  another port; their 21 neighbours passing. Green on the tree as it lands over main 4dca63df7 (21:08-21:12Z):
+  `-p slates-anchor --test anchor the_supervised_child_inherits` 2 of 2; `-p slates-api --lib start::tests` 1 of 1,
+  `role::tests` 4 of 4, `contract_history` 1 of 1; `-p slates-server --lib vcs_http::daemon_edge` 2 of 2 and
+  `deploy::tests` 14 of 14; `-p slates-cli --test cli vcs_http` 2 of 2
+  (`a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again`: a request made while the killed daemon's
+  successor started was answered `401` by it, at the port the successor named again).
+- **Owed.** Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2), the edge's as the NFS
+  listener's.
+
+### A-654 part 3 — receive-pack on git's HTTP site (2026-11-19, g258, UI goal 93; §4.17.2 "A push", "Transports" item 1 and "Access"; A-625 parts 2 and 3, A-654 part 2)
+
+- **What was there.** A-654 part 2's driver (`git_push::ReceivePack`) had no caller outside tests, and git's HTTP site
+  answered `git-receive-pack` `503`: the daemon's services were `Unserved`, both of them.
+- **The decision.** (1) `vcs_http::git::receive::ReceiveServices` starts the driver for receive-pack's advertisement and
+  requests; its exchange (`Receive`) hands the request's body to `ReceivePack::input` a run at a time, ends and answers
+  the push in one step once the body has ended, and gives back what the driver wrote (the advertisement, or the report)
+  a pkt-line's room (`pktline::MAX_LEN`) a reply run, as upload-pack's answer is. (2) The shard's state is lent for each
+  step (`ShardLender`; the daemon's `ThisShard` borrows `with_state` on the shard the site moved the connection to,
+  A-625 part 3), so a push holds nothing of its shard across the edge's waits. (3) The site serves each service from its
+  own half (`Halves<U, R>`, `HalfExchange`), so upload-pack's lender (A-682, g309) and receive-pack's driver are built
+  and replaced apart; the daemon's site is `Halves<Unserved, ReceiveServices<ThisShard>>` until upload-pack's half
+  lands. (4) Versions as git 2.50.1's own (read in its sources): `receive-pack.c`'s `cmd_receive_pack` ignores a request
+  for version 2 and writes `version 1` before its advertisement to a client asking version 1; `http-backend.c`'s
+  `get_info_refs` writes the `# service=` prelude for every version but 2; stock git's client asks version 0 for a push
+  (`remote-curl.c`'s `discover_refs`). (5) A failure before any reply is a status: a request git's protocol does not
+  allow `400`, one past the push's room `413`, memory refused or no store held `503`, the repository gone `404`, an
+  unreadable policy or an unwritable advertisement `500`; at the start, each the site's typed refusal
+  (`ServiceRefused::{NoRepository, Unreadable, Unwritable}`, and the site's new `Refused::Unwritable`, counted
+  `vcs_http.git.unwritable`, which the site's own prelude failure now gives too). A command's own refusal is the
+  report's, `200`, as `http-backend`'s is. (6) A request that asks nothing (a flush alone: the probe stock git posts
+  before a large push, `remote-curl.c`'s `probe_rpc`) is answered `200` with no report, as git's receive-pack writes
+  none for it. (7) Each push is admitted the edge's request room, one client region's bytes (`Bounds::of_shard`).
+- **Tests.** `vcs_http::daemon_edge::tests::a_stock_git_push_over_the_daemons_edge_lands_through_the_push_driver`: a
+  two-shard daemon with its edge on loopback TLS, a git repository on the second shard's partition and its owner's token
+  enrolled; over rustls, each on a new connection: receive-pack's advertisement (`200`, the prelude and then no ref
+  under this server's capabilities), the bytes stock git 2.50.1 posted to create `main` (`200`, the very report `git
+  receive-pack` wrote), the advertisement after (`main` at the pushed commit), a delete of `main` under a policy denying
+  it (`200`, `ng refs/heads/main deletion prohibited`), and `main` still advertised. Its HTTP client helpers are g309's
+  from A-682's branch, verbatim, so the two pieces merge to one copy.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Windows x86_64 and Linux runs owed). Red first, the push
+  test over today's site (kiln r138 at d81b05529): `cargo test --locked -p slates-server --lib -- vcs_http:: git_push::
+  repository::push:: --test-threads=4` 47 passed and the new test failed at its first assertion, receive-pack's
+  advertisement answered `(503, [])`. Green at 1a5273730: 48 of 48, `cargo fmt --all -- --check` clean, no warning. Over
+  main 225d7eead as it lands (f1e4d78e6, with A-625 part 3 continued (2)'s listener test): the same filters 49 of 49
+  (`vcs_http` 42, the daemon edge's 3 among them; `git_push` 3; `repository::push` 4), fmt clean, no warning. No
+  integration target pushes through the edge: the daemon-edge test is this piece's end-to-end test, over real TLS to a
+  running daemon.
+- **Owed.** The SSH channel's call (g294). The live `git push` over HTTPS with stock git's binary (main's run).
+  upload-pack's half in the daemon (A-682, g309). The rest of A-654 part 2's owed items: the hooks over A-665 part 2's
+  view, a push based on an older version (A-664), principals other than the owner at A-635's append, push options,
+  review requests, the new versions' fragments off the answer's path, a tag of a tag.
+- **Applied in the same change to:** `crates/server/src/vcs_http/git/receive.rs` (new); `vcs_http/git.rs` (`Halves`,
+  `HalfExchange`, `ServiceRefused`'s kinds, `Refused::Unwritable`, the module doc's step 5, `Unserved`'s doc);
+  `vcs_http/daemon_edge.rs` (`DaemonSite`, the module doc); `vcs_http/git/upload.rs` and `vcs_http.rs` (their docs);
+  `vcs_http/tests/daemon_edge.rs` (the push test, with g309's helpers); `vcs_http/tests/git.rs` (a test's doc);
+  `git_push.rs` (its docs); `lib.rs` (the modules' notes); §4.17.2's status; GAPS (the A-654 entry).
 
 ### A-665 part 2 — The hook's view on the owner shard: opened over the repository's store, sealed in the shard's slices, and handed to the hook driver with receive-pack's variables (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-597, A-622, A-662, A-665)
 Applied in the same change to:
