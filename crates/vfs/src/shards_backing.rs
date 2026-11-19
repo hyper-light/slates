@@ -477,6 +477,9 @@ pub struct ShardsBackings {
   /// The host declined a placement since the last re-arm in a way likely to hold, so ranges are served unplaced
   /// without asking again ([`ShardsBackings::place`]).
   placement_declined: bool,
+  /// A decline remembered since the daemon last asked ([`ShardsBackings::take_declined`], A-570): what tells the
+  /// shard's deadline keeper to arm the re-arm a window on.
+  declined_noted: bool,
   /// Collapses asked of the kernel, monotone: the non-vacuity counter that the memo above spares it.
   placements_asked: u64,
 }
@@ -514,6 +517,7 @@ impl ShardsBackings {
       peers: 0,
       peer_bytes: 0,
       placement_declined: false,
+      declined_noted: false,
       placements_asked: 0,
     }
   }
@@ -741,14 +745,29 @@ impl ShardsBackings {
       self.placements_asked = self.placements_asked.saturating_add(1);
     }
     if placement == (Placement::Declined { transient: false }) {
-      self.placement_declined = true;
+      self.remember_decline();
     }
     Ok(placement)
   }
 
-  /// Forgets that the host declined a placement, so the next range asks the kernel again: the daemon calls it on its
-  /// reap tick, the cadence the arena's zones re-arm at (`DaxZones::rearm_refusals`), so a host that frees memory
-  /// places ranges again within one tick.
+  /// Remembers a decline likely to hold, as a placement the host declined that way does ([`ShardsBackings::place`]):
+  /// ranges are served unplaced until the re-arm, and the daemon is told ([`ShardsBackings::take_declined`]).
+  pub fn remember_decline(&mut self) {
+    if !self.placement_declined {
+      self.placement_declined = true;
+      self.declined_noted = true;
+    }
+  }
+
+  /// Whether a decline was remembered since the last call, taken (A-570): the shard's deadline keeper arms the re-arm a
+  /// window after it.
+  pub fn take_declined(&mut self) -> bool {
+    std::mem::take(&mut self.declined_noted)
+  }
+
+  /// Forgets that the host declined a placement, so the next range asks the kernel again: the daemon calls it at the
+  /// deadline its keeper armed a retry window after the decline (A-570; the reap loop's tick until then), so a host
+  /// that frees memory places ranges again a window after it declined, and nothing wakes while no decline is held.
   pub fn rearm_placement(&mut self) {
     self.placement_declined = false;
   }

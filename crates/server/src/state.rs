@@ -1163,6 +1163,9 @@ pub struct ShardState {
   pub(crate) nfs_purge_at: Option<u64>,
   /// Whether the reaper owes a purge round (A-570): set by the keeper at `nfs_purge_at`, taken by the reaper.
   pub(crate) nfs_purge_owed: bool,
+  /// When the deadline keeper re-arms the backed route's huge-page placement (A-570): a retry window after the host
+  /// declined one in a way likely to hold (`ShardsBackings::take_declined`); `None` while no decline is held.
+  pub(crate) placement_rearm_at: Option<u64>,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder

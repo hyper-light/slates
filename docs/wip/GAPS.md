@@ -4193,8 +4193,8 @@
 > memory notifications); a kernel that offers none has the watch refused by kind, logged and counted, with nothing
 > polled in its place. The Linux and Windows arms were written by g255 on macOS and are filed for main's build. NFSv4
 > purges owed go out at their own deadline: at once at a start that owes them, a retry window after any access that
-> leaves the table owing. Still on the tick: base hints with their delegation recalls, the idle seal and the huge-page
-> re-arm.
+> leaves the table owing. A lasting huge-page decline is re-armed by the keeper a retry window after it. Still on the
+> tick: base hints with their delegation recalls, and the idle seal.
 > Still on `W` itself, each owed its own change (class D): the reap loop's tick (`reap_loop`, leaving a job at a time
 > in the event-driven reaper series), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
