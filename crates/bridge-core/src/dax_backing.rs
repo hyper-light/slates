@@ -1778,7 +1778,8 @@ mod tests {
     };
     let mut object =
       DaxObject::create(most_views(&store.shards_backings), DaxLayout::Identity).unwrap();
-    object.store(0, &[BYTE; SLICE as usize]).unwrap();
+    let slice = usize::try_from(SLICE).unwrap();
+    object.store(0, &vec![BYTE; slice]).unwrap();
     let handle = store
       .shards_backings
       .adopt_vmm(
@@ -1799,7 +1800,7 @@ mod tests {
       "the session takes the backing back"
     );
     assert!(
-      object_bytes(&mut store, &session, node, (0, WRITTEN))[..SLICE as usize]
+      object_bytes(&mut store, &session, node, (0, WRITTEN))[..slice]
         .iter()
         .all(|byte| *byte == BYTE),
       "the object holds the dead daemon's fill"

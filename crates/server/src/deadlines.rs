@@ -13,7 +13,6 @@
 use std::collections::BTreeSet;
 
 use slates_mem::Handle;
-use slates_rt::TaskId;
 use slates_vfs::clock::Clock;
 
 use crate::state::{self, ClientSlot, ShardState};

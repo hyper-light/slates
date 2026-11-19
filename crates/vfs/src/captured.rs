@@ -1331,7 +1331,11 @@ mod tests {
   }
 
   /// The paths a search of `source` against `base` names as candidates.
-  fn candidates(store: &Store, base: &CaptureBase, source: FrozenTree) -> BTreeSet<String> {
+  fn searched_candidates(
+    store: &Store,
+    base: &CaptureBase,
+    source: FrozenTree,
+  ) -> BTreeSet<String> {
     let mut search = base.search(source);
     loop {
       if let Some(found) = search.unit(store).unwrap() {
@@ -1354,7 +1358,7 @@ mod tests {
       .filter(|path| was.get(*path) != now.get(*path))
       .cloned()
       .collect();
-    let moved_candidates = candidates(store, carried_base, moved_tree);
+    let moved_candidates = searched_candidates(store, carried_base, moved_tree);
     for path in &parted {
       assert!(
         moved_candidates.contains(path),
@@ -1368,7 +1372,7 @@ mod tests {
     let clone_whole = whole(store, clone_tree);
     assert_eq!(
       parted,
-      candidates(store, capture, clone_tree)
+      searched_candidates(store, capture, clone_tree)
         .into_iter()
         .filter(|path| was.get(path) != clone_whole.get(path))
         .collect::<BTreeSet<String>>(),
