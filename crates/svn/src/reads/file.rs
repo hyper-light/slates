@@ -110,8 +110,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     let Some(request) = FileRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    if !self.must_read(&request.path)? {
-      return Ok(Outcome::Answered);
+    if let Some(outcome) = self.must_read(&request.path)? {
+      return Ok(outcome);
     }
     let answer = match self.file_answer(&request) {
       Ok(answer) => answer,

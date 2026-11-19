@@ -16,16 +16,20 @@
 //! derivation reads only recorded history. A version's parents in this history (the `Graph` the repository is) are
 //! version `k - 1` when it had a head, then the version its set was remade from.
 //!
-//! **Kept with no second walk.** The store's admission computes each version's value already: [`Repository::reach_value`]
-//! encodes a ref's newest version's sets as the type's value, which the owner keeps under (type, version) as it commits
-//! (`Derivations::keep`), and a tier that lacks a value derives it with a fill, the same value by identity. The store's
-//! outputs are unchanged: its versions, D(k) and reached sets are what they were, and the type reads them back. A
+//! **Kept with no second walk, and the store's one copy** (A-647 part 3). The store's commit puts each version's sets,
+//! as its admission walked them, as the version's value, held by the version's record; the store serves every
+//! version's D(k) and reached set from it ([`Repository::brought`], [`Repository::reached`]) and keeps the sets nowhere
+//! else. [`Repository::reach_value`] hands the owner a ref's newest value, which it keeps under (type, version) as it
+//! commits (`Derivations::keep`), and a tier that lacks a value derives it with a fill, the same value by identity. A
 //! derivation's walks are the admission's own and counted as any walk is ([`super::StoreCounters`]).
 //!
-//! **A value's bytes**: a derived node naming no content, whose payload is the reached set's runs, then D(k)'s, each a
-//! count (eight bytes, little-endian) and that many runs, each a start and an end (eight bytes each, little-endian).
-//! A set keeps its runs one way (ascending, a gap between each two), so the same sets are the same bytes, and bytes in
-//! any other form are refused.
+//! **A value's bytes** (format 2): a derived node naming one object, the sets' bytes, with the object's length as its
+//! payload (eight bytes, little-endian), so a value is as long as its sets need. Format 1 (part 2) kept the bytes in
+//! the node itself, and a node is at most one window of the store, so a set of more runs than a window holds was no
+//! value.
+//! The sets' bytes are the reached set's runs, then D(k)'s, each a count (eight bytes, little-endian) and that many
+//! runs, each a start and an end (eight bytes each, little-endian). A set keeps its runs one way (ascending, a gap
+//! between each two), so the same sets are the same bytes, and bytes in any other form are refused.
 
 use std::mem::size_of;
 
@@ -36,8 +40,8 @@ use super::{Followed, Repository, StoreRefused, Version};
 use crate::object_name::ObjectId;
 use crate::store::{Positions, Push};
 
-/// Format: the type's name and its format's version.
-const TYPE_NAME: &[u8] = b"slates-git reach sets 1";
+/// Format: the type's name and its format's version (module docs: 2, the sets' bytes an object its node names).
+const TYPE_NAME: &[u8] = b"slates-git reach sets 2";
 
 /// Format: the bytes of a count of runs, and of a run's start and of its end, little-endian.
 const WORD_BYTES: usize = size_of::<u64>();
@@ -88,7 +92,7 @@ pub struct Sets {
 }
 
 impl Sets {
-  /// The value's payload (module docs).
+  /// The sets' bytes, the object a value names (module docs).
   fn encode(&self) -> Vec<u8> {
     let runs = self
       .reached
@@ -108,17 +112,42 @@ impl Sets {
     payload
   }
 
-  /// The sets a payload holds; `None` for bytes in any other form.
-  fn decode(payload: &[u8]) -> Option<Sets> {
-    let (reached, rest) = decode_set(payload)?;
+  /// The sets `bytes` hold; `None` for bytes in any other form.
+  fn decode(bytes: &[u8]) -> Option<Sets> {
+    let (reached, rest) = decode_set(bytes)?;
     let (brought, rest) = decode_set(rest)?;
     rest.is_empty().then_some(Sets { reached, brought })
   }
 
-  /// The sets the value `root` holds, read from `store`; `None` when it is no value of the type.
+  /// The sets the value `root` holds, read from `store`: the one object its node names, as long as the node says;
+  /// `None` when it is no value of the type.
   pub fn read(store: &ContentStore, root: &ContentId) -> Option<Sets> {
-    let node = store.derived(root).filter(|node| node.is_empty())?;
-    Sets::decode(node.payload())
+    let node = store.derived(root)?;
+    let mut names = node.names();
+    let (Some(object), None) = (names.next(), names.next()) else {
+      return None;
+    };
+    let len = <[u8; WORD_BYTES]>::try_from(node.payload()).ok()?;
+    let bytes = store.object_bytes(&object, u64::from_le_bytes(len))?;
+    Sets::decode(&bytes)
+  }
+
+  /// Puts the sets as the type's value (module docs): their bytes as an object of any length, and the node naming it,
+  /// held once by the caller. Refused, nothing is kept.
+  pub(super) fn put(&self, store: &mut ContentStore) -> Result<ContentId, ContentRefused> {
+    let bytes = self.encode();
+    let len = u64::try_from(bytes.len()).map_err(|_| ContentRefused::CountExhausted)?;
+    let object = store.put_object(&bytes)?;
+    let node = store.put_derived(&[object], &len.to_le_bytes());
+    let released = store.release(&object);
+    match (node, released) {
+      (Ok(node), Ok(_)) => Ok(node.identity),
+      (Ok(node), Err(refused)) => {
+        store.release(&node.identity)?;
+        Err(refused)
+      }
+      (Err(refused), _) => Err(refused),
+    }
   }
 }
 
@@ -211,10 +240,7 @@ impl DerivedType for ReachSets {
       values.push(Sets::read(store, root).ok_or(ReachRefused::Malformed { node: *root })?);
     }
     let sets = repository.follow(store, (green, version), (record, before), &values)?;
-    let stored = store
-      .put_derived(&[], &sets.encode())
-      .map_err(ReachRefused::Content)?;
-    Ok(stored.identity)
+    sets.put(store).map_err(ReachRefused::Content)
   }
 }
 
@@ -304,9 +330,9 @@ impl Repository {
     Ok(members.indexed)
   }
 
-  /// `green`'s newest version and its value of [`ReachSets`], encoded from the sets the store computed at its admission,
-  /// held once by the caller: what the owner keeps under (type, version) as it commits, with no second walk (module
-  /// docs).
+  /// `green`'s newest version and its value of [`ReachSets`]: the very value the store serves the version's sets from,
+  /// put as it committed with the sets its admission computed, held once more by the caller: what the owner keeps under
+  /// (type, version) as it commits, with no second walk (module docs).
   pub fn reach_value(
     &self,
     store: &mut ContentStore,
@@ -320,12 +346,8 @@ impl Repository {
       .versions
       .last()
       .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
-    let sets = Sets {
-      reached: chain.reached.clone(),
-      brought: newest.brought.clone(),
-    };
-    let stored = store.put_derived(&[], &sets.encode())?;
+    store.hold(&newest.value)?;
     let version = u64::try_from(chain.versions.len().saturating_sub(1)).unwrap_or(u64::MAX);
-    Ok((version, stored.identity))
+    Ok((version, newest.value))
   }
 }

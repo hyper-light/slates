@@ -286,6 +286,7 @@ fn record(id: RepositoryId) -> RepositoryRecord {
       rules: Vec::new(),
       hooks: Vec::new(),
       hooks_env: Vec::new(),
+      signers: Vec::new(),
     },
   }
 }

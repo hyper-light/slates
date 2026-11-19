@@ -19,13 +19,15 @@
 
 use super::*;
 use crate::index::{Action, Index};
+use crate::lock::{Lock, LockEntry, LockToken};
 use crate::report::drive::green::texts_by_md5;
-use crate::report::drive::green::{FixtureGuards, Green, guards_of, normalize, repository};
+use crate::report::drive::green::{AUTHZ, Green, NOW, locks_of, normalize, repository};
 use crate::report::recorded::{
   ROOT_URL, Recorded, SESSIONS, UUID, command, drive_items, finished_report, items, read_drive,
   value_of,
 };
 use std::collections::BTreeMap;
+use std::ffi::CString;
 
 mod commit;
 
@@ -65,10 +67,6 @@ fn fixtures_repository() -> Repository<'static> {
   }
 }
 
-/// The fixtures' authorization file (`make-fixtures.py` `AUTHZ`): everyone reads, alice writes,
-/// and `/trunk/secret` is alice's alone.
-const AUTHZ: &[u8] = b"[/]\n* = r\nalice = rw\n[/trunk/secret]\n* =\nalice = rw\n";
-
 /// alice's secret in the fixtures' password database (`make-fixtures.py` `PASSWD`).
 const ALICE_SECRET: &[u8] = b"secret";
 
@@ -96,15 +94,20 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
-  /// What every call of a session established on the fixtures' repository hands over, the guards
-  /// `guards` (`make-fixtures.py` `SVNSERVE_CONF`: anonymous users read, authenticated ones write,
-  /// under [`AUTHZ`]).
-  fn sources<'f>(&'f self, guards: &'f FixtureGuards) -> Sources<'f, Green, FixtureGuards> {
+  /// What every call of a session established on the fixtures' repository hands over
+  /// (`make-fixtures.py` `SVNSERVE_CONF`: anonymous users read, authenticated ones write, under
+  /// [`AUTHZ`]), its lock table the fixture's.
+  fn sources(&self) -> Sources<'_, Green> {
+    self.sources_with(&self.locks)
+  }
+
+  /// [`Fixture::sources`] with `locks` for the repository's lock table, judged at [`NOW`].
+  fn sources_with<'f>(&'f self, locks: &'f LockTable) -> Sources<'f, Green> {
     Sources {
       index: &self.index,
       repository: &self.green,
-      guards,
-      locks: &self.locks,
+      locks,
+      now: NOW,
       policy: Policy {
         anonymous: authz::Access::Read,
         authenticated: authz::Access::Write,
@@ -130,14 +133,15 @@ enum Ending {
 /// over when the connection asks for more (with the item that answered a drive early when the
 /// session's client sent it so).
 fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, Ending) {
-  let guards = session_guards(recorded);
-  let sources = fixture.sources(&guards);
+  let locks = session_locks(recorded);
+  let sources = fixture.sources_with(&locks);
   let client = items(recorded.client);
   let mut out = Vec::new();
   let mut connection = Connection::new(LIMITS, &mut out).unwrap();
   let mut next = client.iter();
   let mut held: Vec<u8> = Vec::new();
   let mut established = false;
+  let mut challenges = 0;
   loop {
     let given = established.then_some(&sources);
     let before = items(&out).len();
@@ -161,10 +165,60 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
         held.drain(..consumed);
         established = true;
       }
+      Ok(Turn::ChallengeNeeded { consumed }) => {
+        held.drain(..consumed);
+        let (nonce, time_micros, host) = recorded_challenge(recorded, challenges);
+        challenges += 1;
+        connection
+          .challenge(nonce, time_micros, &host, &mut out)
+          .unwrap();
+      }
+      Ok(Turn::KeyNeeded { user, consumed }) => {
+        let key = CramKey::from_secret(recorded_secret(user)).unwrap();
+        held.drain(..consumed);
+        connection.key(Some(&key), &mut out).unwrap();
+      }
       Ok(Turn::Unserved { .. }) => return (out, Ending::Unserved(before)),
       Ok(other) => panic!("{}: {other:?}", recorded.name),
       Err(refused) => return (out, Ending::Refused(refused)),
     }
+  }
+}
+
+/// The parts of the `n`-th CRAM-MD5 challenge `svnserve` sent in `recorded`, `<nonce.time@host>`
+/// (`cram.c` `make_nonce`), so the connection sends the very challenge its client answered.
+fn recorded_challenge(recorded: Recorded, n: usize) -> (u64, i64, CString) {
+  let challenge = items(recorded.server)
+    .iter()
+    .filter_map(|item| match value_of(item) {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::Word("step"), Value::List(challenge)] => match challenge.as_slice() {
+          [Value::String(text)] => Some(text.to_vec()),
+          _ => None,
+        },
+        _ => None,
+      },
+      _ => None,
+    })
+    .nth(n)
+    .unwrap();
+  let text = std::str::from_utf8(&challenge).unwrap();
+  let inner = text.strip_prefix('<').unwrap().strip_suffix('>').unwrap();
+  let (nonce, rest) = inner.split_once('.').unwrap();
+  let (time_micros, host) = rest.split_once('@').unwrap();
+  (
+    nonce.parse().unwrap(),
+    time_micros.parse().unwrap(),
+    CString::new(host).unwrap(),
+  )
+}
+
+/// The secret the recorder's password file gives `user` (`make-fixtures.py` `PASSWD`).
+fn recorded_secret(user: &[u8]) -> &'static [u8] {
+  match user {
+    b"alice" => ALICE_SECRET,
+    b"bob" => b"bob's secret",
+    other => panic!("no key for {}", String::from_utf8_lossy(other)),
   }
 }
 
@@ -183,16 +237,16 @@ fn deliver<'i>(
   }
 }
 
-/// The guards a session ran under: the anonymous principal's, and the lock its report names where
-/// it held one.
-fn session_guards(recorded: Recorded) -> FixtureGuards {
+/// The lock table a session ran under: empty, and holding the lock its report names where it held
+/// one.
+fn session_locks(recorded: Recorded) -> LockTable {
   let reports = items(recorded.client)
     .iter()
     .any(|item| command(item).is_some_and(|(name, _)| RequestKind::of(&name).is_some()));
   if reports && recorded.name == "update-with-lock.1" {
-    guards_of(recorded.name, &finished_report(recorded))
+    locks_of(recorded.name, &finished_report(recorded))
   } else {
-    FixtureGuards::anonymous()
+    LockTable::new()
   }
 }
 
@@ -378,7 +432,7 @@ fn established_on(repository: &Repository<'_>, auth: &str) -> Connection {
   let opening = opening("svn://127.0.0.1/repo/trunk", auth);
   let mut rest = opening.as_slice();
   while connection.session().is_none() {
-    let none = None::<&Sources<'_, Green, FixtureGuards>>;
+    let none = None::<&Sources<'_, Green>>;
     match connection.receive(none, rest, &mut out, PLENTY).unwrap() {
       Turn::Opened { consumed, .. } => {
         rest = &rest[consumed..];
@@ -394,11 +448,10 @@ fn established_on(repository: &Repository<'_>, auth: &str) -> Connection {
 /// Sends `command` on an established connection and returns what it wrote and how it ended.
 fn send(
   fixture: &Fixture,
-  guards: &FixtureGuards,
   connection: &mut Connection,
   command: &[u8],
 ) -> (String, Result<String, Refused>) {
-  let sources = fixture.sources(guards);
+  let sources = fixture.sources();
   let mut out = Vec::new();
   let turn = connection.receive(Some(&sources), command, &mut out, PLENTY);
   let turn = turn.map(|turn| format!("{turn:?}"));
@@ -412,11 +465,9 @@ fn send(
 #[test]
 fn reparent_moves_the_session_within_its_repository() {
   let fixture = fixture();
-  let guards = FixtureGuards::anonymous();
   let mut connection = established();
   let (out, turn) = send(
     &fixture,
-    &guards,
     &mut connection,
     b"( reparent ( 25:svn://127.0.0.1/repo/tags ) ) ",
   );
@@ -424,14 +475,12 @@ fn reparent_moves_the_session_within_its_repository() {
   assert!(turn.unwrap().starts_with("Took"));
   let (out, _) = send(
     &fixture,
-    &guards,
     &mut connection,
     b"( check-path ( 5:a.txt ( 6 ) ) ) ",
   );
   assert!(out.ends_with("( success ( none ) ) "), "{out}");
   let (out, _) = send(
     &fixture,
-    &guards,
     &mut connection,
     b"( reparent ( 23:svn://example.org/other ) ) ",
   );
@@ -441,7 +490,7 @@ fn reparent_moves_the_session_within_its_repository() {
     message.len()
   );
   assert_eq!(out, format!("( success ( ( ) 0: ) ) {failure}"));
-  let (out, turn) = send(&fixture, &guards, &mut connection, b"( reparent ( 5 ) ) ");
+  let (out, turn) = send(&fixture, &mut connection, b"( reparent ( 5 ) ) ");
   assert_eq!((out.as_str(), turn), ("", Err(Refused::Malformed)));
 }
 
@@ -452,10 +501,9 @@ fn reparent_moves_the_session_within_its_repository() {
 #[test]
 fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
   let fixture = fixture();
-  let guards = FixtureGuards::anonymous();
   let mut connection = established();
   let item = b"( replay ( 6 0 true ) ) ";
-  let (out, turn) = send(&fixture, &guards, &mut connection, item);
+  let (out, turn) = send(&fixture, &mut connection, item);
   let message = "Unknown editor command 'replay'";
   assert_eq!(
     out,
@@ -469,14 +517,9 @@ fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
     consumed: item.len(),
   };
   assert_eq!(turn, Ok(format!("{unserved:?}")));
-  let (out, _) = send(
-    &fixture,
-    &guards,
-    &mut connection,
-    b"( get-latest-rev ( ) ) ",
-  );
+  let (out, _) = send(&fixture, &mut connection, b"( get-latest-rev ( ) ) ");
   assert!(out.ends_with("( success ( 6 ) ) "), "{out}");
-  let (out, turn) = send(&fixture, &guards, &mut connection, b"5 ");
+  let (out, turn) = send(&fixture, &mut connection, b"5 ");
   assert_eq!((out.as_str(), turn), ("", Err(Refused::Malformed)));
 }
 
@@ -486,7 +529,7 @@ fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
 fn a_call_without_sources_or_after_the_end_is_the_callers_error() {
   let mut connection = established();
   let mut out = Vec::new();
-  let none = None::<&Sources<'_, Green, FixtureGuards>>;
+  let none = None::<&Sources<'_, Green>>;
   let refused = connection.receive(none, b"( get-latest-rev ( ) ) ", &mut out, PLENTY);
   assert_eq!(refused, Err(Refused::NoSources));
   assert_eq!(
@@ -507,8 +550,7 @@ fn a_connection_names_what_it_waits_for() {
     .copied()
     .find(|session| session.name == "checkout-r1.1")
     .unwrap();
-  let guards = FixtureGuards::anonymous();
-  let sources = fixture.sources(&guards);
+  let sources = fixture.sources();
   let client = items(recorded.client);
   let mut out = Vec::new();
   let mut connection = Connection::new(LIMITS, &mut out).unwrap();
@@ -565,7 +607,7 @@ fn a_tunnels_user_is_taken_and_a_closed_repository_ends_the_connection() {
   let mut out = Vec::new();
   let mut connection = Connection::new(LIMITS, &mut out).unwrap();
   let answer = b"( 2 ( edit-pipeline ) 26:svn://127.0.0.1/repo/trunk ) ";
-  let none = None::<&Sources<'_, Green, FixtureGuards>>;
+  let none = None::<&Sources<'_, Green>>;
   let opened = connection.receive(none, answer, &mut out, PLENTY).unwrap();
   assert!(matches!(opened, Turn::Opened { .. }));
   assert_eq!(connection.open(&tunnel, &mut out), Ok(Access::Asked));
@@ -659,7 +701,7 @@ fn start() -> CommitStart {
 /// Answers the authentication the connection asked for with CRAM-MD5 as `user`, whose key the
 /// caller holds, made from `secret`: what the connection wrote, and its verdict.
 fn cram_md5(connection: &mut Connection, user: &[u8], secret: &[u8]) -> (String, Verdict) {
-  let none = None::<&Sources<'_, Green, FixtureGuards>>;
+  let none = None::<&Sources<'_, Green>>;
   let mut out = Vec::new();
   let choice = b"( CRAM-MD5 ( ) ) ";
   let chose = connection.receive(none, choice, &mut out, PLENTY);
@@ -693,12 +735,8 @@ fn cram_md5(connection: &mut Connection, user: &[u8], secret: &[u8]) -> (String,
 /// Drives [`ADD_NEWDIR`] and `close-edit` through `connection`, each command taken without a word,
 /// start-commit answered at `open-root` and pre-commit at `close-edit`, both passing; returns the
 /// work accepted once pre-commit passed, for which nothing is written.
-fn drive_newdir(
-  fixture: &Fixture,
-  guards: &FixtureGuards,
-  connection: &mut Connection,
-) -> Box<Work> {
-  let sources = fixture.sources(guards);
+fn drive_newdir(fixture: &Fixture, connection: &mut Connection) -> Box<Work> {
+  let sources = fixture.sources();
   for (at, command) in ADD_NEWDIR.into_iter().enumerate() {
     let mut out = Vec::new();
     let turn = connection.receive(Some(&sources), command.as_bytes(), &mut out, PLENTY);
@@ -742,16 +780,15 @@ fn drive_newdir(
 
 /// A-656 (`serve.c` `update`'s `must_have_access` on the session's path joined to the target,
 /// 807-850): ask anonymously to update `secret` beneath `/trunk`, which only alice may read, where
-/// users hold keys; authenticate as alice by CRAM-MD5; call again with her guards; expect the
-/// request listing `CRAM-MD5` alone in the repository's realm, the challenge, `( success ( ) )`
+/// users hold keys; authenticate as alice by CRAM-MD5; call again; expect the request listing
+/// `CRAM-MD5` alone in the repository's realm, the challenge, `( success ( ) )`
 /// alone, then the report awaited with nothing written, no trivial auth request after a real one,
 /// and the session alice's.
 #[test]
 fn an_update_of_a_target_the_principal_may_not_read_authenticates_first() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
   let mut connection = established();
-  let (out, turn) = send(&fixture, &anonymous, &mut connection, UPDATE_SECRET);
+  let (out, turn) = send(&fixture, &mut connection, UPDATE_SECRET);
   assert_eq!(out, cram_md5_request());
   assert!(turn.unwrap().starts_with("Took"));
   assert_eq!(connection.waiting(), Waiting::Handshake);
@@ -760,7 +797,7 @@ fn an_update_of_a_target_the_principal_may_not_read_authenticates_first() {
   assert_eq!(verdict, Verdict::Established(alice.clone()));
   assert!(out.ends_with("> ) ) ( success ( ) ) "), "{out}");
   assert_eq!(connection.waiting(), Waiting::Writing);
-  let (out, turn) = send(&fixture, &FixtureGuards::default(), &mut connection, b"");
+  let (out, turn) = send(&fixture, &mut connection, b"");
   assert_eq!((out.as_str(), turn), ("", Ok(format!("{:?}", Turn::Wrote))));
   assert_eq!(connection.waiting(), Waiting::Report);
   let principal = connection.session().map(|session| &session.principal);
@@ -769,33 +806,32 @@ fn an_update_of_a_target_the_principal_may_not_read_authenticates_first() {
 
 /// A-656 (`must_have_access` 826-844 where authentication cannot help, and a readable target):
 /// ask anonymously to update `secret` on a repository that holds no keys, then `dir`; then, where
-/// keys are held, authenticate as bob, whom the rules keep out of `secret`, and call again with his
-/// guards; expect "Authorization failed" (170001) with no request before it and the next command
+/// keys are held, authenticate as bob, whom the rules keep out of `secret`, and call again; expect
+/// "Authorization failed" (170001) with no request before it and the next command
 /// awaited, then `dir`'s trivial auth request and its report awaited; then the request, bob's
 /// success, and "Authorization failed" with no trivial auth request before it.
 #[test]
 fn an_update_the_principal_may_not_read_is_refused_where_authentication_cannot_help() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
   let keyless = Repository {
     cram_md5: false,
     ..fixtures_repository()
   };
   let mut connection = established_on(&keyless, ANONYMOUSLY);
-  let (out, _) = send(&fixture, &anonymous, &mut connection, UPDATE_SECRET);
+  let (out, _) = send(&fixture, &mut connection, UPDATE_SECRET);
   assert_eq!(out, not_authorized());
   assert_eq!(connection.waiting(), Waiting::Command);
   let update_dir = b"( update ( ( 6 ) 3:dir true infinity false false ) ) ";
-  let (out, _) = send(&fixture, &anonymous, &mut connection, update_dir);
+  let (out, _) = send(&fixture, &mut connection, update_dir);
   assert_eq!(out, "( success ( ( ) 0: ) ) ");
   assert_eq!(connection.waiting(), Waiting::Report);
   let mut connection = established();
-  let (out, _) = send(&fixture, &anonymous, &mut connection, UPDATE_SECRET);
+  let (out, _) = send(&fixture, &mut connection, UPDATE_SECRET);
   assert_eq!(out, cram_md5_request());
   let (_, verdict) = cram_md5(&mut connection, b"bob", b"bob's secret");
   let bob = Principal::User(b"bob".to_vec());
   assert_eq!(verdict, Verdict::Established(bob));
-  let (out, turn) = send(&fixture, &anonymous, &mut connection, b"");
+  let (out, turn) = send(&fixture, &mut connection, b"");
   assert_eq!(
     (out, turn),
     (not_authorized(), Ok(format!("{:?}", Turn::Wrote)))
@@ -803,15 +839,91 @@ fn an_update_the_principal_may_not_read_is_refused_where_authentication_cannot_h
   assert_eq!(connection.waiting(), Waiting::Command);
 }
 
+/// A check of `secret` beneath `/trunk`, which only alice may read (`make-fixtures.py` `AUTHZ`).
+const CHECK_SECRET: &[u8] = b"( check-path ( 6:secret ( ) ) ) ";
+
+/// An update of the session's path, `/trunk`, to r6 from a working copy that holds nothing, with
+/// its report.
+const UPDATE_TRUNK_FROM_NOTHING: &[u8] = b"( update ( ( 6 ) 0: true infinity false false ) ) \
+  ( set-path ( 0: 6 true ( ) infinity ) ) ( finish-report ( ) ) ";
+
+/// A-656 continued (2), g297's step-6 finding (one principal's read rule from one source; A-606,
+/// `serve.c` `authz_check_access`): on the fixtures' repository, whose rules keep `/trunk/secret`
+/// from all but alice, an anonymous session (before this change the update asked the caller's
+/// guards, and guards that hid nothing let it read what the rules hide); where users hold no keys,
+/// check `secret`, then ask to update it; where they do, update
+/// `/trunk` from nothing. Expect the check and the update both refused "Authorization failed"
+/// (170001), and the update of `/trunk` to send `secret` absent and never add it: the update, its
+/// drive and the read commands judge the one path by the one rule set the connection compiled for
+/// the principal.
+#[test]
+fn an_update_and_the_reads_judge_one_path_by_the_one_rule_set() {
+  let fixture = fixture();
+  let keyless = Repository {
+    cram_md5: false,
+    ..fixtures_repository()
+  };
+  let mut connection = established_on(&keyless, ANONYMOUSLY);
+  let (checked, _) = send(&fixture, &mut connection, CHECK_SECRET);
+  let (updated, _) = send(&fixture, &mut connection, UPDATE_SECRET);
+  assert_eq!((checked, updated), (not_authorized(), not_authorized()));
+  let mut connection = established();
+  let edit = send_in_slices(&fixture, &mut connection, UPDATE_TRUNK_FROM_NOTHING);
+  assert!(edit.contains("( absent-dir ( 6:secret "), "{edit}");
+  assert!(!edit.contains("( add-dir ( 6:secret "), "{edit}");
+}
+
+/// The token of the lock the lock tests hold on `/trunk/a.txt`: `opaquelocktoken:` and a UUID, as
+/// `svn_fs_fs__generate_lock_token` writes one.
+const A_TXT_TOKEN: &str = "opaquelocktoken:5b2b37fb-8a42-4f4a-9c0d-6a3e1f2d0c11";
+
+/// An update of the session's path, `/trunk`, at r6 from a working copy at r6 whose `a.txt` holds
+/// [`A_TXT_TOKEN`], with its report.
+const UPDATE_TRUNK_HOLDING_A_TXTS_LOCK: &[u8] =
+  b"( update ( ( 6 ) 0: true infinity false false ) ) \
+  ( set-path ( 0: 6 false ( ) infinity ) ) \
+  ( set-path ( 5:a.txt 6 false \
+  ( 52:opaquelocktoken:5b2b37fb-8a42-4f4a-9c0d-6a3e1f2d0c11 ) infinity ) ) \
+  ( finish-report ( ) ) ";
+
+/// alice's lock on `/trunk/a.txt`, [`A_TXT_TOKEN`], made at the epoch and never expiring.
+fn a_txts_lock() -> LockEntry {
+  LockEntry::Set(Lock {
+    path: String::from("/trunk/a.txt"),
+    token: LockToken::supplied(A_TXT_TOKEN).unwrap(),
+    owner: String::from("alice"),
+    comment: None,
+    is_dav_comment: false,
+    created: AprTime(0),
+    expires: None,
+  })
+}
+
+/// A-656 continued (3), one source for locks (`reporter.c` `update_entry` and `delta_files`, which
+/// ask `svn_fs_get_lock`; A-602's lock table is the record of truth): update `/trunk` from a
+/// working copy at r6 whose `a.txt` holds a lock token, once with the repository's lock table
+/// holding that lock on `a.txt` and once with the table holding none (before this change the update
+/// asked the caller's guards, which held no lock, and took the token away both times); expect
+/// `a.txt` left alone where the table holds the lock, and its lock token taken away
+/// (`svn:entry:lock-token` with no value) where the table holds none: the update reads the table a
+/// commit's and the lock verbs' checks read.
+#[test]
+fn an_update_keeps_a_lock_the_lock_table_holds_and_takes_away_one_it_does_not() {
+  let mut held = fixture();
+  held.locks.apply(&a_txts_lock()).unwrap();
+  let mut connection = established();
+  let kept = send_in_slices(&held, &mut connection, UPDATE_TRUNK_HOLDING_A_TXTS_LOCK);
+  assert!(!kept.contains("svn:entry:lock-token"), "{kept}");
+  let none = fixture();
+  let mut connection = established();
+  let taken = send_in_slices(&none, &mut connection, UPDATE_TRUNK_HOLDING_A_TXTS_LOCK);
+  assert!(taken.contains("20:svn:entry:lock-token ( )"), "{taken}");
+}
+
 /// Sends `command` on an established connection a byte of room and a step a call, until the
 /// connection awaits its next command, and returns what it wrote.
-fn send_in_slices(
-  fixture: &Fixture,
-  guards: &FixtureGuards,
-  connection: &mut Connection,
-  command: &[u8],
-) -> String {
-  let sources = fixture.sources(guards);
+fn send_in_slices(fixture: &Fixture, connection: &mut Connection, command: &[u8]) -> String {
+  let sources = fixture.sources();
   let mut out = Vec::new();
   let mut rest = command;
   loop {
@@ -834,7 +946,6 @@ fn send_in_slices(
 #[test]
 fn the_reads_judge_each_principals_paths_by_its_own_rules() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
   let check_secret = b"( check-path ( 6:secret ( ) ) ) ";
   let log_r1 = b"( log ( ( 0: ) ( 1 ) ( 1 ) true false 0 false all-revprops ( ) ) ) ";
   let a_directory = "( success ( ( ) 0: ) ) ( success ( dir ) ) ";
@@ -843,22 +954,149 @@ fn the_reads_judge_each_principals_paths_by_its_own_rules() {
     ..fixtures_repository()
   };
   let mut connection = established_on(&keyless, ANONYMOUSLY);
-  let (out, _) = send(&fixture, &anonymous, &mut connection, check_secret);
+  let (out, _) = send(&fixture, &mut connection, check_secret);
   assert_eq!(out, not_authorized());
   let check_dir = b"( check-path ( 3:dir ( ) ) ) ";
-  let (out, _) = send(&fixture, &anonymous, &mut connection, check_dir);
+  let (out, _) = send(&fixture, &mut connection, check_dir);
   assert_eq!(out, a_directory);
-  let log = send_in_slices(&fixture, &anonymous, &mut connection, log_r1);
+  let log = send_in_slices(&fixture, &mut connection, log_r1);
   assert!(
     log.ends_with("done ( success ( ) ) ") && !log.contains("secret"),
     "{log}"
   );
-  let alices = FixtureGuards::default();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
-  let (out, _) = send(&fixture, &alices, &mut connection, check_secret);
+  let (out, _) = send(&fixture, &mut connection, check_secret);
   assert_eq!(out, a_directory);
-  let log = send_in_slices(&fixture, &alices, &mut connection, log_r1);
+  let log = send_in_slices(&fixture, &mut connection, log_r1);
   assert!(log.contains("13:/trunk/secret A"), "{log}");
+}
+
+/// A directory's kind answered after the trivial auth request.
+const A_DIRECTORY: &str = "( success ( ( ) 0: ) ) ( success ( dir ) ) ";
+
+/// The request for an authentication for one command through a tunnel: `EXTERNAL` alone, in the
+/// repository's realm, its UUID.
+fn external_request() -> String {
+  let realm = std::str::from_utf8(UUID).unwrap();
+  format!("( success ( ( EXTERNAL ) {}:{realm} ) ) ", realm.len())
+}
+
+/// A-613 part 2, step 7 (`serve.c` `must_have_access` 809-850 for a read: the request made with a
+/// username needed, then the lookup made again): anonymously, where users hold keys, check `dir`,
+/// then `secret`; authenticate as alice by CRAM-MD5; call again; check `secret` once more; expect
+/// `dir` a directory after the trivial auth request, then the request listing `CRAM-MD5` alone with
+/// nothing before it, the challenge and `( success ( )` alone, then `secret` a directory with no
+/// trivial auth request before it (alice's rules compiled once the principal changed, the
+/// anonymous principal's having been compiled for `dir`), then, alice's still, a directory after
+/// the trivial request.
+#[test]
+fn a_denied_read_authenticates_first_and_is_judged_by_the_new_principals_rules() {
+  let fixture = fixture();
+  let mut connection = established();
+  let (out, _) = send(&fixture, &mut connection, b"( check-path ( 3:dir ( ) ) ) ");
+  assert_eq!(out, A_DIRECTORY);
+  let (out, turn) = send(&fixture, &mut connection, CHECK_SECRET);
+  assert_eq!(
+    (out, turn.map(|turn| turn.starts_with("Took"))),
+    (cram_md5_request(), Ok(true))
+  );
+  let (out, verdict) = cram_md5(&mut connection, b"alice", ALICE_SECRET);
+  assert_eq!(
+    verdict,
+    Verdict::Established(Principal::User(b"alice".to_vec()))
+  );
+  assert!(out.ends_with("> ) ) ( success ( ) ) "), "{out}");
+  let (out, turn) = send(&fixture, &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out.as_str(), turn), ("( success ( dir ) ) ", wrote));
+  assert_eq!(connection.waiting(), Waiting::Command);
+  let (out, _) = send(&fixture, &mut connection, CHECK_SECRET);
+  assert_eq!(out, A_DIRECTORY);
+}
+
+/// A-613 part 2, step 7 (`must_have_access`' second lookup, 841-846): anonymously, where users hold
+/// keys, stat `secret`; authenticate as bob, whom the rules keep out of it too; call again; expect
+/// the request listing `CRAM-MD5` alone, bob's success, then "Authorization failed" (170001) with
+/// no trivial auth request before it, and the next command awaited.
+#[test]
+fn a_read_still_refused_after_the_authentication_is_refused_with_no_trivial_request() {
+  let fixture = fixture();
+  let mut connection = established();
+  let (out, _) = send(&fixture, &mut connection, b"( stat ( 6:secret ( ) ) ) ");
+  assert_eq!(out, cram_md5_request());
+  let (_, verdict) = cram_md5(&mut connection, b"bob", b"bob's secret");
+  assert_eq!(
+    verdict,
+    Verdict::Established(Principal::User(b"bob".to_vec()))
+  );
+  let (out, turn) = send(&fixture, &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out, turn), (not_authorized(), wrote));
+  assert_eq!(connection.waiting(), Waiting::Command);
+}
+
+/// A-613 part 2, step 7 (`must_have_access` through a tunnel: `send_mechs` lists `EXTERNAL` for the
+/// tunnel's user, never `ANONYMOUS` where a username is needed): through alice's tunnel, where
+/// anonymous users read too, established anonymously, check `secret`; answer `EXTERNAL`; call
+/// again; expect the request listing `EXTERNAL` alone, the session alice's with `( success ( ) )`
+/// alone, then `secret` a directory with no trivial auth request before it.
+#[test]
+fn a_tunnels_anonymous_read_authenticates_as_the_tunnels_user() {
+  let fixture = fixture();
+  let tunnel = Repository {
+    anonymous: true,
+    ..alices_tunnel()
+  };
+  let mut connection = established_on(&tunnel, ANONYMOUSLY);
+  let (out, _) = send(&fixture, &mut connection, CHECK_SECRET);
+  assert_eq!(out, external_request());
+  let none = None::<&Sources<'_, Green>>;
+  let mut out = Vec::new();
+  let external = connection.receive(none, EXTERNALLY.as_bytes(), &mut out, PLENTY);
+  let alice = Principal::User(b"alice".to_vec());
+  assert!(matches!(external, Ok(Turn::Established { principal, .. }) if principal == alice));
+  assert_eq!(String::from_utf8_lossy(&out), "( success ( ) ) ");
+  let (out, turn) = send(&fixture, &mut connection, b"");
+  let wrote = Ok(format!("{:?}", Turn::Wrote));
+  assert_eq!((out.as_str(), turn), ("( success ( dir ) ) ", wrote));
+}
+
+/// The recorded reads that authenticate in the middle of their command (`make-fixtures.py`
+/// `read-auth-*`): stock `svn cat` and `svn ls` of `/trunk/secret` as alice, and `svn cat` as bob.
+const READ_AUTH: [Recorded; 3] = [
+  Recorded {
+    name: "read-auth-cat.1",
+    client: include_bytes!("../../fixtures/report/read-auth-cat.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-cat.1.server.bin"),
+  },
+  Recorded {
+    name: "read-auth-ls.1",
+    client: include_bytes!("../../fixtures/report/read-auth-ls.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-ls.1.server.bin"),
+  },
+  Recorded {
+    name: "read-auth-cat-bob.1",
+    client: include_bytes!("../../fixtures/report/read-auth-cat-bob.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-cat-bob.1.server.bin"),
+  },
+];
+
+/// A-613 part 2, step 7, against stock `svnserve` 1.15.0 (`make-fixtures.py` `read-auth-*`): replay
+/// stock `svn cat` and `svn ls` of `/trunk/secret` as alice and `svn cat` of it as bob, each
+/// anonymous after the handshake and asked to authenticate in the middle of its read, through a
+/// connection over the fixtures' repository, with the challenge `svnserve` sent and each user's key
+/// from the recorder's password file; expect every item as `svnserve` wrote it: the request
+/// listing `CRAM-MD5` alone, the challenge and `( success ( ) )`, then alice's answer with no
+/// trivial auth request before it, and bob refused "Authorization failed" (170001).
+#[test]
+fn reads_that_authenticate_in_the_middle_of_their_command_are_answered_as_svnserve_answered_them() {
+  let fixture = fixture();
+  let texts = texts_by_md5(&fixture.green);
+  for recorded in READ_AUTH {
+    let (out, ending) = replay(&fixture, recorded, PLENTY);
+    assert_eq!(ending, Ending::Waiting, "{}", recorded.name);
+    assert_as_svnserve(recorded.name, &items(&out), recorded.server, &texts);
+  }
 }
 
 /// A-656 with A-655 (`serve.c` `commit` 1471-1580): commit, through a tunnel as alice, a drive
@@ -871,9 +1109,8 @@ fn the_reads_judge_each_principals_paths_by_its_own_rules() {
 #[test]
 fn a_commit_is_driven_and_answered_with_the_revision_the_owner_made() {
   let fixture = fixture();
-  let alice = FixtureGuards::default();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
-  let (out, turn) = send(&fixture, &alice, &mut connection, COMMIT_NEWDIR);
+  let (out, turn) = send(&fixture, &mut connection, COMMIT_NEWDIR);
   let asked = Turn::CommitAsked {
     consumed: COMMIT_NEWDIR.len(),
   };
@@ -881,11 +1118,11 @@ fn a_commit_is_driven_and_answered_with_the_revision_the_owner_made() {
   assert_eq!(connection.waiting(), Waiting::Writing);
   let mut out = Vec::new();
   connection
-    .commit(start(), &fixture.sources(&alice), &mut out)
+    .commit(start(), &fixture.sources(), &mut out)
     .unwrap();
   let begun = "( success ( ( ) 0: ) ) ( success ( ) ) ";
   assert_eq!(String::from_utf8_lossy(&out), begun);
-  let work = drive_newdir(&fixture, &alice, &mut connection);
+  let work = drive_newdir(&fixture, &mut connection);
   let rows: Vec<(&str, Action)> = work
     .record
     .changes
@@ -912,8 +1149,8 @@ fn a_commit_is_driven_and_answered_with_the_revision_the_owner_made() {
 }
 
 /// A-656 with A-655 (`must_have_access` 826-836 for `commit`, then `editorp.c` 1149-1208): commit
-/// anonymously where users hold keys; authenticate as alice by CRAM-MD5; call again with her
-/// guards; drive `newdir`; refuse the accepted work as the owner refuses every one until A-655
+/// anonymously where users hold keys; authenticate as alice by CRAM-MD5; call again; drive
+/// `newdir`; refuse the accepted work as the owner refuses every one until A-655
 /// part 2; send a stray editor command, a number, then `abort-edit`; ask for the youngest
 /// revision; expect the request listing `CRAM-MD5` alone, the success alone, then the commit's
 /// success with no trivial auth request before it, the work accepted, then 200007 "This server
@@ -922,13 +1159,12 @@ fn a_commit_is_driven_and_answered_with_the_revision_the_owner_made() {
 #[test]
 fn an_anonymous_commit_authenticates_for_write_and_an_unmade_work_is_refused() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
   let mut connection = established();
-  let (_, turn) = send(&fixture, &anonymous, &mut connection, COMMIT_NEWDIR);
+  let (_, turn) = send(&fixture, &mut connection, COMMIT_NEWDIR);
   assert!(turn.unwrap().starts_with("CommitAsked"));
   let mut out = Vec::new();
   connection
-    .commit(start(), &fixture.sources(&anonymous), &mut out)
+    .commit(start(), &fixture.sources(), &mut out)
     .unwrap();
   assert_eq!(String::from_utf8_lossy(&out), cram_md5_request());
   assert_eq!(connection.waiting(), Waiting::Handshake);
@@ -936,12 +1172,11 @@ fn an_anonymous_commit_authenticates_for_write_and_an_unmade_work_is_refused() {
   let alice_principal = Principal::User(b"alice".to_vec());
   assert_eq!(verdict, Verdict::Established(alice_principal.clone()));
   assert!(out.ends_with("> ) ) ( success ( ) ) "), "{out}");
-  let alice = FixtureGuards::default();
-  let (out, turn) = send(&fixture, &alice, &mut connection, b"");
+  let (out, turn) = send(&fixture, &mut connection, b"");
   let wrote = Ok(format!("{:?}", Turn::Wrote));
   assert_eq!((out.as_str(), turn), ("( success ( ) ) ", wrote));
   assert_eq!(connection.waiting(), Waiting::Edit);
-  drive_newdir(&fixture, &alice, &mut connection);
+  drive_newdir(&fixture, &mut connection);
   let mut out = Vec::new();
   connection
     .not_committed(&Uncommitted::NotServed, &mut out)
@@ -953,22 +1188,17 @@ fn an_anonymous_commit_authenticates_for_write_and_an_unmade_work_is_refused() {
   assert_eq!(String::from_utf8_lossy(&out), failure);
   assert_eq!(connection.waiting(), Waiting::Edit);
   for stray in ["( close-dir ( 2:d0 ) ) ", "5 "] {
-    let (out, turn) = send(&fixture, &alice, &mut connection, stray.as_bytes());
+    let (out, turn) = send(&fixture, &mut connection, stray.as_bytes());
     let took = Turn::Took {
       consumed: stray.len(),
     };
     assert_eq!((out.as_str(), turn), ("", Ok(format!("{took:?}"))));
     assert_eq!(connection.waiting(), Waiting::Edit);
   }
-  let (out, _) = send(&fixture, &alice, &mut connection, b"( abort-edit ( ) ) ");
+  let (out, _) = send(&fixture, &mut connection, b"( abort-edit ( ) ) ");
   assert_eq!(out, "");
   assert_eq!(connection.waiting(), Waiting::Command);
-  let (out, _) = send(
-    &fixture,
-    &alice,
-    &mut connection,
-    b"( get-latest-rev ( ) ) ",
-  );
+  let (out, _) = send(&fixture, &mut connection, b"( get-latest-rev ( ) ) ");
   assert!(out.ends_with("( success ( 6 ) ) "), "{out}");
   let principal = connection.session().map(|session| &session.principal);
   assert_eq!(principal, Some(&alice_principal));
@@ -982,58 +1212,47 @@ fn an_anonymous_commit_authenticates_for_write_and_an_unmade_work_is_refused() {
 #[test]
 fn a_refused_commits_commands_are_dropped_until_the_clients_success_too() {
   let fixture = fixture();
-  let alice = FixtureGuards::default();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
-  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
-    .1
-    .unwrap();
+  send(&fixture, &mut connection, COMMIT_NEWDIR).1.unwrap();
   connection
-    .commit(start(), &fixture.sources(&alice), &mut Vec::new())
+    .commit(start(), &fixture.sources(), &mut Vec::new())
     .unwrap();
-  drive_newdir(&fixture, &alice, &mut connection);
+  drive_newdir(&fixture, &mut connection);
   connection
     .not_committed(&Uncommitted::NotServed, &mut Vec::new())
     .unwrap();
   let stray = "( close-dir ( 2:d0 ) ) ";
-  let (out, turn) = send(&fixture, &alice, &mut connection, stray.as_bytes());
+  let (out, turn) = send(&fixture, &mut connection, stray.as_bytes());
   let took = Turn::Took {
     consumed: stray.len(),
   };
   assert_eq!((out.as_str(), turn), ("", Ok(format!("{took:?}"))));
   assert_eq!(connection.waiting(), Waiting::Edit);
-  let (out, _) = send(&fixture, &alice, &mut connection, b"( success ( ) ) ");
+  let (out, _) = send(&fixture, &mut connection, b"( success ( ) ) ");
   assert_eq!(out, "");
   assert_eq!(connection.waiting(), Waiting::Command);
-  let (out, _) = send(
-    &fixture,
-    &alice,
-    &mut connection,
-    b"( get-latest-rev ( ) ) ",
-  );
+  let (out, _) = send(&fixture, &mut connection, b"( get-latest-rev ( ) ) ");
   assert!(out.ends_with("( success ( 6 ) ) "), "{out}");
 }
 
 /// A-656 with A-655 (`must_have_access` 840-844 for `commit`): commit anonymously where users hold
-/// keys; authenticate as bob, whom the rules let read alone; call again with his guards; expect the
-/// request, bob's success, then "Authorization failed" with no trivial auth request before it, and
+/// keys; authenticate as bob, whom the rules let read alone; call again; expect the request, bob's
+/// success, then "Authorization failed" with no trivial auth request before it, and
 /// the next command awaited.
 #[test]
 fn a_commit_by_a_user_the_rules_keep_from_writing_is_refused_after_the_authentication() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
   let mut connection = established();
-  send(&fixture, &anonymous, &mut connection, COMMIT_NEWDIR)
-    .1
-    .unwrap();
+  send(&fixture, &mut connection, COMMIT_NEWDIR).1.unwrap();
   let mut out = Vec::new();
   connection
-    .commit(start(), &fixture.sources(&anonymous), &mut out)
+    .commit(start(), &fixture.sources(), &mut out)
     .unwrap();
   assert_eq!(String::from_utf8_lossy(&out), cram_md5_request());
   let (_, verdict) = cram_md5(&mut connection, b"bob", b"bob's secret");
   let bob = Principal::User(b"bob".to_vec());
   assert_eq!(verdict, Verdict::Established(bob));
-  let (out, turn) = send(&fixture, &anonymous, &mut connection, b"");
+  let (out, turn) = send(&fixture, &mut connection, b"");
   assert_eq!(
     (out, turn),
     (not_authorized(), Ok(format!("{:?}", Turn::Wrote)))
@@ -1048,15 +1267,12 @@ fn a_commit_by_a_user_the_rules_keep_from_writing_is_refused_after_the_authentic
 #[test]
 fn a_work_the_owners_step_refuses_is_answered_in_its_words() {
   let fixture = fixture();
-  let alice = FixtureGuards::default();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
-  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
-    .1
-    .unwrap();
+  send(&fixture, &mut connection, COMMIT_NEWDIR).1.unwrap();
   connection
-    .commit(start(), &fixture.sources(&alice), &mut Vec::new())
+    .commit(start(), &fixture.sources(), &mut Vec::new())
     .unwrap();
-  let work = drive_newdir(&fixture, &alice, &mut connection);
+  let work = drive_newdir(&fixture, &mut connection);
   let moved = StepRefusal::OutOfDate {
     head: work.head,
     youngest: work.head + 1,
@@ -1083,12 +1299,9 @@ fn a_work_the_owners_step_refuses_is_answered_in_its_words() {
 #[test]
 fn a_start_commit_hooks_failure_is_open_roots_and_the_drive_is_dropped() {
   let fixture = fixture();
-  let alice = FixtureGuards::default();
-  let sources = fixture.sources(&alice);
+  let sources = fixture.sources();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
-  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
-    .1
-    .unwrap();
+  send(&fixture, &mut connection, COMMIT_NEWDIR).1.unwrap();
   connection
     .commit(start(), &sources, &mut Vec::new())
     .unwrap();
@@ -1128,13 +1341,13 @@ fn a_start_commit_hooks_failure_is_open_roots_and_the_drive_is_dropped() {
   assert_eq!(String::from_utf8_lossy(&out), failure);
   assert!(connection.pending().is_none());
   for dropped in [ADD_NEWDIR[1], "5 "] {
-    let (out, turn) = send(&fixture, &alice, &mut connection, dropped.as_bytes());
+    let (out, turn) = send(&fixture, &mut connection, dropped.as_bytes());
     let took = Turn::Took {
       consumed: dropped.len(),
     };
     assert_eq!((out.as_str(), turn), ("", Ok(format!("{took:?}"))));
   }
-  let (out, _) = send(&fixture, &alice, &mut connection, b"( abort-edit ( ) ) ");
+  let (out, _) = send(&fixture, &mut connection, b"( abort-edit ( ) ) ");
   assert_eq!(out, "");
   assert_eq!(connection.waiting(), Waiting::Command);
 }
@@ -1146,12 +1359,9 @@ fn a_start_commit_hooks_failure_is_open_roots_and_the_drive_is_dropped() {
 #[test]
 fn a_pre_commit_hooks_failure_is_close_edits_and_no_work_is_accepted() {
   let fixture = fixture();
-  let alice = FixtureGuards::default();
-  let sources = fixture.sources(&alice);
+  let sources = fixture.sources();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
-  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
-    .1
-    .unwrap();
+  send(&fixture, &mut connection, COMMIT_NEWDIR).1.unwrap();
   connection
     .commit(start(), &sources, &mut Vec::new())
     .unwrap();
@@ -1182,7 +1392,7 @@ fn a_pre_commit_hooks_failure_is_close_edits_and_no_work_is_accepted() {
   let failure = format!("( failure ( ( 165001 {}:{words} 0: 0 ) ) ) ", words.len());
   assert_eq!(String::from_utf8_lossy(&out), failure);
   assert_eq!(connection.waiting(), Waiting::Edit);
-  let (out, _) = send(&fixture, &alice, &mut connection, b"( abort-edit ( ) ) ");
+  let (out, _) = send(&fixture, &mut connection, b"( abort-edit ( ) ) ");
   assert_eq!(out, "");
   assert_eq!(connection.waiting(), Waiting::Command);
 }
@@ -1193,16 +1403,13 @@ fn a_pre_commit_hooks_failure_is_close_edits_and_no_work_is_accepted() {
 #[test]
 fn a_call_while_a_hook_is_due_or_an_answer_with_none_due_is_the_callers_error() {
   let fixture = fixture();
-  let alice = FixtureGuards::default();
-  let sources = fixture.sources(&alice);
+  let sources = fixture.sources();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
   let mut out = Vec::new();
   let early = connection.answer_hook(Ok(()), &sources, &mut out);
   assert_eq!(early, Err(Refused::OutOfTurn));
   assert_eq!(connection.waiting(), Waiting::Command);
-  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
-    .1
-    .unwrap();
+  send(&fixture, &mut connection, COMMIT_NEWDIR).1.unwrap();
   connection.commit(start(), &sources, &mut out).unwrap();
   out.clear();
   let open_root = ADD_NEWDIR[0].as_bytes();
@@ -1241,8 +1448,7 @@ fn a_call_while_a_hook_is_due_or_an_answer_with_none_due_is_the_callers_error() 
 #[test]
 fn a_commit_call_out_of_turn_is_the_callers_error_and_changes_nothing() {
   let fixture = fixture();
-  let alice = FixtureGuards::default();
-  let sources = fixture.sources(&alice);
+  let sources = fixture.sources();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
   let mut out = Vec::new();
   let refused = connection.commit(start(), &sources, &mut out);

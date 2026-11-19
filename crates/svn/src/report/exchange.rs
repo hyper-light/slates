@@ -39,7 +39,7 @@
 #[cfg(test)]
 mod tests;
 
-use super::drive::{Call, Drive, DriveFailure, Guards, Next, Sources};
+use super::drive::{Call, Drive, DriveFailure, Next, Sources};
 use super::editor::{EditorRefused, EditorWriter};
 use super::tuple::{self, Field};
 use super::{
@@ -288,9 +288,9 @@ impl Exchange {
   /// [`Refused`] for client bytes that end the connection (an item past its bounds, a malformed
   /// report command, a report past its room), for a drive's call the writer refuses, and
   /// [`Refused::OutOfTurn`] after the command is answered.
-  pub fn receive<R: Repository + ?Sized, G: Guards + ?Sized>(
+  pub fn receive<R: Repository + ?Sized>(
     &mut self,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     input: &[u8],
     out: &mut Vec<u8>,
     budget: Budget,
@@ -334,11 +334,11 @@ impl Exchange {
 
   /// The drive's calls written until the room or the steps are spent, an early answer met, or the
   /// edit closed or aborted.
-  fn drive<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn drive<R: Repository + ?Sized>(
     &mut self,
     mut drive: Box<Drive>,
     mut writer: EditorWriter,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     input: &[u8],
     out: &mut Vec<u8>,
     budget: Budget,
@@ -346,7 +346,7 @@ impl Exchange {
     let start = out.len();
     let steps = budget.steps.max(1);
     loop {
-      let next = drive.next(sources.index, sources.repository, sources.guards, steps);
+      let next = drive.next(sources, steps);
       let call = match next {
         Next::Call(call) => call,
         Next::Paused => {
