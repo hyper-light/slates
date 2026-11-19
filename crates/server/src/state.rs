@@ -874,6 +874,10 @@ pub struct ShardState {
   /// `await_placed`) consults this — a head with a stored quorum placement is region-placed; without one it
   /// is the local append (`f = 0`, or not yet replicated). Empty on a laptop (no fleet loop runs).
   pub placed_heads: BTreeMap<ObjectId, crate::head::PlacedHead>,
+  /// The state logs' records of the repositories this shard owns that some candidate still lacks (A-636 part 2b): each
+  /// a part of its log's register, shipped by the record plane in position order and let go once every candidate holds
+  /// it. Bounded by the partition's merge budget (`crate::state_log::bound`); empty on a laptop.
+  pub(crate) state_logs: crate::state_log::StateLogs,
   /// The fleet peers this node has established a live probe session with (§4.8): a peer is inserted the
   /// moment its probe session's handshake completes, so this is the set of peers the direct mesh has
   /// actually formed to — distinct from the membership's optimistically **seeded** alive set, which holds
