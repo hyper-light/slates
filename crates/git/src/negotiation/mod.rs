@@ -47,6 +47,7 @@ mod one_round;
 mod paint;
 mod ready;
 mod shallow;
+pub mod sparse;
 
 use crate::object_name::{Kind, ObjectId};
 use crate::{Admission, PastAdmission};

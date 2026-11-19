@@ -12960,6 +12960,14 @@ engine: the verdict, rebase, position mapping, the register).
 > thin pack in a shallow exchange (`--objects-edge-aggressive`), now kept and held by the oracle. A stateful v0
 > session, an SSH client's, is owed.
 
+> **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
+> (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
+> limit, the byte-order mark, comments, carriage returns, NULs, trailing spaces) and asks each path what git's
+> `path_matches_pattern_list` answers outside cone mode: matched, not matched or undecided, by the last pattern that
+> matches, a segment pattern anywhere and a slashed one from the root, globbed by `slates_vcs::wildmatch` (A-671). The
+> filter is still refused as not served: the walk by path with git's tree frames, the graph's named entries and the
+> blob's name resolved are its next slices.
+
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
 commands are `ls-refs`, `fetch`, `object-info` and `bundle-uri` [B: gitprotocol-v2]; it defines no push, so a push
@@ -49212,6 +49220,54 @@ the bundle capabilities first; `fixtures/serve-http` and its script, kept as cap
   `hg clone` and `hg pull` over HTTPS against the daemon (main's run); and two pieces of their own, each with its
   failing test first: zlib's bound as the linked zlib-rs states it (`compress_bound`), and a query's fields past the
   request's room `414`, as a path's are.
+
+### A-640 part 4, first slice — A sparse filter's pattern list, read and asked as git's `dir.c` reads and asks it (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-615 part 2, A-671)
+Applied in the same change to:
+- §4.17.2's statuses (a status after A-640 part 3's);
+- GAPS (the A-640 entries);
+- `crates/git/src/negotiation/sparse.rs` (new) and its tests, `negotiation/tests/sparse.rs`; `negotiation/mod.rs` (the
+  module); `negotiation/filter.rs` (the module doc's `sparse:oid` line);
+- `crates/vcs/src/wildmatch.rs` (`Glob::kept_bytes` and its test).
+
+- **What git does** [C: `list-objects-filter.c` `filter_sparse_oid__init` and `filter_sparse`, `dir.c`, git v2.50.1,
+  read at the tag]. The filter resolves its `<blob-ish>` (`get_oid_with_context` with `GET_OID_BLOB`), reads the
+  blob's patterns with the root as their base (`add_patterns_from_blob_to_list(oid, "", 0)`), and dies on either
+  failure ("unable to access sparse blob in '%s'", "unable to parse sparse filter data in %s"). Walking each sent
+  commit's tree, it asks every tree's and blob's full path, a tree as a directory and a blob as a file,
+  `path_matches_pattern_list`; an undecided path takes the verdict of the tree it is in, below the root a base that is
+  not matched (`default_match = 0`, `NOT_MATCHED`, though that line's comment says "default to include"). Every tree is
+  sent; a blob is sent when matched, and is otherwise left out for now and asked again wherever else it is met.
+- **The list** (`negotiation::sparse::Patterns`): read and asked as its module doc states, each rule from the function
+  it names. Two of git's choices are tests by name: a slashed pattern's rest is globbed as a pattern of its own after
+  its literal bytes (`ab**/c` matches `abx/y/c`), and an empty pattern, from a line of spaces or of a carriage return
+  alone, matches the root tree, whose name is empty.
+- **The glob.** `slates_vcs::wildmatch` (A-671), which has `WM_PATHNAME`: git globs a segment pattern without it, which
+  changes a verdict only at a `/`, and neither a segment nor such a pattern holds one. The property below holds every
+  generated list to a transcription that calls the glob where git calls `fnmatch_icase_mem`.
+- **Bounds.** The list's slots are counted and charged before it is made; each pattern's bytes and compiled glob as it
+  is made, before the list keeps it (`Glob::kept_bytes`, new: the room a glob's tokens keep, none holding heap of its
+  own).
+- **Tests** (`negotiation/tests/sparse.rs`, 10): seven hand-traced cases (git's non-cone sparse-checkout example, `/*`
+  then `!/*/`; segments by name, ending and glob; slashed paths from the root; a rest globbed alone; trees alone; the
+  blob's reading rules; an empty list); git's 100 MiB limit at its edge, a missing last newline counted; the admission;
+  and a property over generated blobs and paths against `dir.c`'s reader and matcher transcribed in their own shape
+  (`add_patterns_from_buffer`, `trim_trailing_spaces`, `parse_path_pattern` at each ask,
+  `last_matching_pattern_from_list`, `match_basename`, `match_pathname`). slates-vcs:
+  `a_pattern_keeps_room_for_each_of_its_tokens`.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r144, over main 5c0967fb2 with this
+  slice (`agents/g296-a640-p4` at e2b66d21a): `cargo test --locked -p slates-git --lib negotiation::sparse` 10 of 10;
+  `cargo test --locked -p slates-vcs --lib wildmatch` 4 of 4; `cargo fmt -p slates-git -- --check` and
+  `cargo fmt -p slates-vcs -- --check` clean. Failing first (kiln r133, over main acc2ac16f with this slice, in the
+  clone): with `Patterns::read`, `Patterns::decide` and `Glob::kept_bytes` stubbed, 9 of the 10 failed (the empty
+  list's test passes against an empty list by construction) and the slates-vcs test failed; restored, 10 of 10 and 4
+  of 4. No integration target reaches the module: slates-git has none, and nothing outside it calls the module yet.
+  The Linux and Windows runs are owed.
+- **Next slices.** The walk by path (`negotiation/objects.rs`): the graph's tree entries with their names (`Graph`),
+  git's frames kept per tree (`default_match`, `child_prov_omit`), every tree sent and a blob when some path matches
+  it, a tree whose blobs all went marked done, each frame charged; the request's filter served with its patterns, and
+  the one-round runs refused for it as now (`Filter::is_per_object`). The service (`upload`): `<blob-ish>` resolved, a
+  full id or `<rev>:<path>` through the refs' rules and other forms refused by kind, its blob read within the request's
+  admission, git's two refusals' words, and a stock git `sparse:oid` exchange recorded as a golden.
 
 ### A-626 part 3, continued (1) — A checkpoint carries its copies' section and the identity's sum beside a copy's record alone: version 5, the anchor's layout 13 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); a regression A-626 part 3 made, found by g258's run of slates-server's lib and bisected by main to 637a65d69; §4.16 "Deltas older than the derived retention fold into checkpoint deltas", W3's doubling rule)
 Applied in the same change to: §4.16 and §4.17.4 (A-626 part 3's status blocks), GAPS (the §4.17.4 entry),
