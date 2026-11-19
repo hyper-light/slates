@@ -342,7 +342,7 @@ fn blame_at(
       class: BLAME_CLASS,
       content,
     })) => Ok((Some(content), reads)),
-    Some(At::File(_)) => Err(BlameRefused::Malformed { node: tree }),
+    Some(At::File(_)) => Ok((None, reads)),
   }
 }
 
@@ -882,7 +882,10 @@ impl<S> Work<'_, '_, S> {
     self.charge(line_bytes().saturating_mul(number_of(read)?))?;
     self.counters.lines_read = self.counters.lines_read.saturating_add(number_of(read)?);
     let mut lines = vec![None; file.len()];
-    for (old, (_id, attribution)) in others.iter().zip(through) {
+    for (old, (id, attribution)) in others.iter().zip(through) {
+      if attribution.len() != old.len() {
+        return Err(BlameRefused::Malformed { node: *id });
+      }
       self.charge(diff_bytes(old.len(), file.len()))?;
       for (from, to) in matched(old, file).ok_or(BlameRefused::Exhausted)? {
         if let (Some(slot), Some(line)) = (lines.get_mut(to), attribution.get(from))
