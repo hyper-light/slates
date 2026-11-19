@@ -4586,7 +4586,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   attribute change is published before its reply;
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
-  write the share it was given. It is taken from the guest's root on the stream's root alone, and refused otherwise
+  write the share it was given. It is read in the SETXATTR form the stream's INIT kept, the extended one where the
+  guest's kernel kept `FUSE_SETXATTR_EXT`, as the dispatch reads every other SETXATTR (A-587). It is taken from the
+  guest's root on the stream's root alone, and refused otherwise
   as Shards' own server refuses it: `EPERM` from any other caller, `EINVAL` on any other node or for a value that is
   no `UID:GID`. From then on the guest is shown the owner the volume keeps for the stream's root as the run's owner,
   and the run's owner as the root's, uid and gid each. The ids the guest names (a creator's, a chown's) are kept the
@@ -38855,3 +38857,38 @@ drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); 
 
 Applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (new), `Cargo.lock`,
 `.gitattributes` (the binary fixtures), `unsafe-budget.toml` (`slates-git = 0`).
+
+### A-587 — A Shards stream reads Shards' owner word in the SETXATTR form its guest's INIT kept, so a run of an unprivileged user writes its share again (2026-11-19, UI goal 89 (kiln 28e73c34, g262), part "kiln's macOS microVM drive green again"; §4.6 the Shards form; A-281, A-378)
+Applied in the same change to:
+- §4.6 the Shards form (the owner word's bullet); GAPS (A-281's entry);
+  `docs/bugs/2026-11-19-a-shards-guests-owner-word-was-read-in-the-short-setxattr-form.md` (new).
+- `crates/bridge-fuse/src/shards_fs.rs`: `owner_word(request, extended)` reads `fuse_setxattr_in` by the stream's form
+  (`SETXATTR_IN_BYTES` or `COMPAT_SETXATTR_IN_BYTES`); the unit tests
+  `an_owner_word_in_the_extended_form_is_taken_where_the_stream_kept_that_form` and
+  `an_owner_word_in_the_short_form_is_taken_where_the_stream_kept_no_extension`; `tests/shards_fs.rs` reads its short
+  form through `owner_word_short`.
+- `crates/server/src/shards.rs`: the serve loop passes `stream.setxattr_ext`; the unit test
+  `an_owner_word_after_an_init_that_kept_the_extended_form_shows_the_root_as_the_runs`.
+
+- **What was there.** A-378 made a guest's route negotiate `FUSE_SETXATTR_EXT` and told every bridge the form, but a
+  Shards stream takes Shards' owner word (A-281) before its bridge sees the request, and `owner_word` read an 8-byte
+  head. Shards' init sets the word after its kernel's INIT kept the extended form, so the word's name was read from the
+  setter's flags and the pad, all zero: it never matched and went to the dispatch as an ordinary attribute. The owner
+  view stayed the identity, and the guest's kernel, which judges every access itself (A-314: `FUSE_POSIX_ACL` turns
+  `default_permissions` on), judged the run's writes by the host's owner. kiln's macOS microVM drive (main's run r134,
+  2026-11-19, at kiln 815a790c, which vendors A-378 since kiln 688cb98ce) failed there: its stand-in's create in its
+  served project was refused `EACCES` (`WRITE_FAIL [Errno 13]`).
+- **The rule.** The owner word is read in the form the stream's INIT kept, as the dispatch reads every other SETXATTR
+  (`bridge.rs` `serve_setxattr`): the extended form where the kernel kept `FUSE_SETXATTR_EXT`, the short one before an
+  INIT or where none was kept.
+- **The sweep.** No other intercept of the stream reads a negotiated form: `replayed` (A-316) reads the in-header's
+  unique; `dax::hold_for_ingest` and `release_forgotten` the in-header and the FORGET and BATCH_FORGET bodies; the
+  INIT's kept flags come through `init::kept_flags`, which reads `flags2` under `FUSE_INIT_EXT`. slates' own virtio-fs
+  device tells its bridge the form before every chain (A-378) and intercepts no SETXATTR. No transport negotiates a
+  request extension (`FUSE_SECURITY_CTX`, `FUSE_CREATE_SUPP_GROUP`), so SETXATTR's head is the only one a connection
+  settles.
+- **Tests.** The word in the extended form, with and without `FUSE_SETXATTR_ACL_KILL_SGID`, named where the form read is
+  the extended one and not taken where it is the short one, and its refusals in that form (`EPERM`, `EINVAL`, `EIO`); the
+  word in the short form named where no extension was kept, with its refusals; and by use, a daemon's stream that answers
+  an INIT offering `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT`, takes the word in the extended form after it
+  (`shards.owner_named`), and shows its root owned by the run (1000:1001) where the volume keeps it as its owner's.

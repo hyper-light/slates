@@ -953,6 +953,14 @@
 > INIT; a stream reads the form after a restore and after its daemon's death; each of fourteen guards removed alone
 > fails its test. Owed: a real guest's run (a non-member's `setfacl` on a set-group-ID file, over a Shards stream and
 > over slates' own virtio-fs device).
+> **Fixed since (A-587, 2026-11-19):** A-378 left the owner word behind. A Shards stream takes the word before its
+> bridge sees the request, and read it in the short form, so after a guest's INIT kept the extended one the word's
+> name was read from the setter's flags and the pad, never matched, and the run was shown its share as the host's:
+> kiln's macOS microVM drive (r134, kiln 815a790c, slates' A-378 vendored since kiln 688cb98ce) had its stand-in's
+> create in its served project refused `EACCES`. The word is read in the form the stream's INIT kept. Tests: the word
+> in each form (`crates/bridge-fuse/src/shards_fs.rs`), and a daemon's stream taking it after an INIT that kept the
+> extended form, its root then shown as the run's (`crates/server/src/shards.rs`). Swept: no other intercept of the
+> stream reads a negotiated form. Owed: kiln's re-vendor and its macOS microVM drive (main's run).
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto

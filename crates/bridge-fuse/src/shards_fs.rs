@@ -24,7 +24,7 @@ use std::io;
 
 use slates_bridge_core::{Bridge, OpContext};
 
-use crate::abi::{OUT_HEADER_LEN, Opcode};
+use crate::abi::{COMPAT_SETXATTR_IN_BYTES, OUT_HEADER_LEN, Opcode, SETXATTR_IN_BYTES};
 use crate::bridge::{EINVAL, EIO, EPERM, FUSE_ROOT_ID, dispatch, reply_error, takes_reply};
 use crate::init::{MAX_WRITE, max_pages};
 use crate::reply::ReplyHeader;
@@ -222,17 +222,24 @@ impl OwnerWord {
 }
 
 /// The owner word `request` carries, if it is a `SETXATTR` of [`OWNER_WORD`]: `None` for every other request, which the
-/// dispatch answers. `fuse_setxattr_in` is the value's size and the flags, then the name and its NUL, then the value;
-/// the flags (`XATTR_CREATE`, `XATTR_REPLACE`) are ignored, as Shards' server ignores them, since the word names no
-/// attribute a file keeps. The value may end in NULs, which are dropped.
-pub fn owner_word(request: &[u8]) -> Option<OwnerWord> {
-  /// Format: `fuse_setxattr_in` — size, flags — before the name.
-  const HEAD: usize = 2 * size_of::<u32>();
+/// dispatch answers. `fuse_setxattr_in` is the value's size and the flags, then, where the stream's `INIT` kept
+/// `FUSE_SETXATTR_EXT` (`extended`, A-378), the setter's flags and a pad, then the name and its NUL, then the value: read
+/// in the form the stream's guest sends, as the dispatch reads every other `SETXATTR` (A-587; read in the short form
+/// alone, a guest whose kernel kept the extended one never had its word taken, so its run was shown its share owned by
+/// the host and refused its writes `EACCES`). The flags (`XATTR_CREATE`, `XATTR_REPLACE`) and the setter's flags are
+/// ignored, as Shards' server ignores them, since the word names no attribute a file keeps. The value may end in NULs,
+/// which are dropped.
+pub fn owner_word(request: &[u8], extended: bool) -> Option<OwnerWord> {
+  let head = if extended {
+    SETXATTR_IN_BYTES
+  } else {
+    COMPAT_SETXATTR_IN_BYTES
+  };
   let parsed = Request::parse(request).ok()?;
   if parsed.opcode != Some(Opcode::SetXattr) {
     return None;
   }
-  let rest = parsed.body.get(HEAD..)?;
+  let rest = parsed.body.get(head..)?;
   let end = rest.iter().position(|b| *b == 0)?;
   if rest.get(..end)? != OWNER_WORD {
     return None;
@@ -511,6 +518,100 @@ pub fn descriptor_refusal(errno: i32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A `SETXATTR` of `name` set to `value` under `unique` on node `nodeid` from the caller `(uid, gid)`, as a guest's
+  /// kernel sends it: the in-header (`len`, `opcode`, `unique`, `nodeid`, then `uid` at 24 and `gid` at 28), then
+  /// `fuse_setxattr_in` in its extended form where `setter` is given (the setter's flags, then a pad), else in its short
+  /// form, then the name and its NUL, then the value.
+  fn setxattr(
+    (unique, nodeid): (u64, u64),
+    (uid, gid): (u32, u32),
+    setter: Option<u32>,
+    name: &[u8],
+    value: &[u8],
+  ) -> Vec<u8> {
+    let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+    body.extend_from_slice(&0u32.to_le_bytes());
+    if let Some(setter) = setter {
+      body.extend_from_slice(&setter.to_le_bytes());
+      body.extend_from_slice(&0u32.to_le_bytes());
+    }
+    body.extend_from_slice(name);
+    body.push(0);
+    body.extend_from_slice(value);
+    let mut request = vec![0u8; crate::abi::IN_HEADER_LEN];
+    let total = u32::try_from(request.len() + body.len()).unwrap();
+    request[0..4].copy_from_slice(&total.to_le_bytes());
+    request[4..8].copy_from_slice(&(Opcode::SetXattr as u32).to_le_bytes());
+    request[8..16].copy_from_slice(&unique.to_le_bytes());
+    request[16..24].copy_from_slice(&nodeid.to_le_bytes());
+    request[24..28].copy_from_slice(&uid.to_le_bytes());
+    request[28..32].copy_from_slice(&gid.to_le_bytes());
+    request.extend_from_slice(&body);
+    request
+  }
+
+  /// A-587 (A-281's owner word under A-378's extended `SETXATTR`). Do: read Shards' owner word `1000:1001`, sent by the
+  /// guest's root on the share's root in the form a guest whose kernel kept `FUSE_SETXATTR_EXT` sends (the 16-byte
+  /// `fuse_setxattr_in`), with no setter's flags and with `FUSE_SETXATTR_ACL_KILL_SGID`, as a stream that kept that
+  /// form reads it; the same request as a stream that kept the short form would read it; and the word in the extended
+  /// form from another caller, on another node, and cut short of its value. Expect the run's owner named whatever the
+  /// setter's flags; nothing taken where the short form is read, the name then beginning at the setter's flags; and
+  /// `EPERM`, `EINVAL` and `EIO` for the three. Before A-587 every stream read the short form, so a guest that kept the
+  /// extended one never named its run's owner (kiln's macOS microVM drive, r134: its run's create refused `EACCES`).
+  #[test]
+  fn an_owner_word_in_the_extended_form_is_taken_where_the_stream_kept_that_form() {
+    let run = Some(OwnerWord::Named {
+      unique: 7,
+      uid: 1000,
+      gid: 1001,
+    });
+    let root = (7, FUSE_ROOT_ID);
+    for setter in [0, crate::abi::SETXATTR_ACL_KILL_SGID] {
+      let word = setxattr(root, (0, 0), Some(setter), OWNER_WORD, b"1000:1001");
+      assert_eq!(owner_word(&word, true), run, "setter's flags {setter:#x}");
+      assert_eq!(
+        owner_word(&word, false),
+        None,
+        "read in the short form, its name begins at the setter's flags (setter's flags {setter:#x})"
+      );
+    }
+    let refused = |errno| Some(OwnerWord::Refused { unique: 7, errno });
+    let from_a_user = setxattr(root, (1000, 1001), Some(0), OWNER_WORD, b"1000:1001");
+    assert_eq!(owner_word(&from_a_user, true), refused(EPERM), "only the guest's root");
+    let elsewhere = setxattr((7, 5), (0, 0), Some(0), OWNER_WORD, b"1000:1001");
+    assert_eq!(owner_word(&elsewhere, true), refused(EINVAL), "only the share's root");
+    let mut short = setxattr(root, (0, 0), Some(0), OWNER_WORD, b"1000:1001");
+    let size_at = crate::abi::IN_HEADER_LEN;
+    short[size_at..size_at + 4].copy_from_slice(&64u32.to_le_bytes());
+    assert_eq!(owner_word(&short, true), refused(EIO), "a value cut short of its size");
+  }
+
+  /// A-587. Do: read Shards' owner word `1000:1001` in the short form (`FUSE_COMPAT_SETXATTR_IN_SIZE`: the value's size
+  /// and the flags) as a stream that kept no `FUSE_SETXATTR_EXT` reads it: from the guest's root on the share's root,
+  /// from another caller, and on another node; and a `SETXATTR` of another name in that form. Expect the run's owner
+  /// named, `EPERM`, `EINVAL`, and nothing taken from the other name, which the dispatch answers: the short form read as
+  /// it was before A-587.
+  #[test]
+  fn an_owner_word_in_the_short_form_is_taken_where_the_stream_kept_no_extension() {
+    let root = (7, FUSE_ROOT_ID);
+    let word = setxattr(root, (0, 0), None, OWNER_WORD, b"1000:1001");
+    assert_eq!(
+      owner_word(&word, false),
+      Some(OwnerWord::Named {
+        unique: 7,
+        uid: 1000,
+        gid: 1001,
+      })
+    );
+    let refused = |errno| Some(OwnerWord::Refused { unique: 7, errno });
+    let from_a_user = setxattr(root, (1000, 1001), None, OWNER_WORD, b"1000:1001");
+    assert_eq!(owner_word(&from_a_user, false), refused(EPERM), "only the guest's root");
+    let elsewhere = setxattr((7, 5), (0, 0), None, OWNER_WORD, b"1000:1001");
+    assert_eq!(owner_word(&elsewhere, false), refused(EINVAL), "only the share's root");
+    let other = setxattr(root, (0, 0), None, b"user.shards.owner", b"1000:1001");
+    assert_eq!(owner_word(&other, false), None, "another name is the dispatch's");
+  }
 
   /// T-shards-windows-5.3. Do: parse a Windows DESCRIPTOR ask of each length around the claimed one, and one whose
   /// range is empty. Expect the claimed body parsed field by field and every other refused; and the handle answer to
