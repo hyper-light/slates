@@ -101,8 +101,9 @@
 > objects, t0060's spellings of the special files, spellings of `.git`, tag names), each reported as `git fsck` and
 > `git fsck --strict` reported it (`fixtures/fsck`, `make-fsck-fixtures.sh`, two runs byte for byte the same). One
 > divergence on purpose: a malformed tagger before an extra header, which git accepts, is refused.
-> `cargo test --locked -p slates-git --lib`: 51 of 51, red four ways. Owed: the `.gitmodules` and `.gitattributes`
-> blob checks over the ids a tree's check hands on; the push's use of the checks (piece 6).
+> `cargo test --locked -p slates-git --lib`: 51 of 51, and 105 of 105 merged with A-582 part 3 and A-591; red five
+> ways. Owed: the `.gitmodules` and `.gitattributes` blob checks over the ids a tree's check hands on; the push's use
+> of the checks (piece 6).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) (2026-11-19; UI goals 91 and

@@ -39908,7 +39908,8 @@ Applied in the same change to:
   and 37 tag names on either side of refs.c's. For each, the manifest keeps what `git fsck`, `git fsck --strict` and
   `git hash-object` said; `SHA256SUMS` keeps each file's SHA-256. The 158 objects an earlier run of the script made
   came out of this one byte for byte.
-- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio, 51 of 51, 29 of them this piece's, 16.65 s): every
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio: 51 of 51, 29 of them this piece's, in 16.65 s; on
+  the tree merged with main's A-582 part 3 and A-591, 105 of 105 in 15.56 s): every
   fixture against its SHA-256 and its id; every object read and written back byte for byte, or refused for git's reason
   where git cannot read it; every object judged as `git fsck` and `git fsck --strict` judged it, and as
   `git hash-object` did, but for the one divergence; trees, commits and tags by use (modes, order, the handed-on ids,
@@ -39923,7 +39924,9 @@ Applied in the same change to:
   - with a backslash's part up to the next backslash checked instead of the rest of the name, the golden judgments
     failed (the corpus's `x\.gitmodules\x` and `x\gitmod~1\x`, which git says are not `.gitmodules`);
   - with duplicates sought only between neighbours, the golden judgments, the corpus's names and the sorted-trees
-    proptest failed.
+    proptest failed;
+  - with an entry's mode judged before the next entry is decoded, the golden judgments failed: `bad-tree-mode-unjudged`
+    read `error:badTree,warning:badFilemode`, where git printed `error:badTree` alone.
 - **Owed.** The `.gitmodules` and `.gitattributes` blob checks (`fsck_blob`: `gitmodulesUrl`, `gitmodulesPath` and the
   rest), over the ids a tree's check hands on; the push path's use of these checks (piece 6); per-id severities from
   configuration (`fsck.<id>`), if policy ever needs them.
