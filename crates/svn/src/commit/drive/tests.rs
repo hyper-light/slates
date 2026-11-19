@@ -766,7 +766,62 @@ fn a_lock_in_the_way_refuses_the_call_that_meets_it() {
     let step = drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out);
     last = kind_of(&step.unwrap());
   }
-  let failure = items(&out).into_iter().find_map(|(item, _)| failure_of(&item));
-  let words = "User 'alice' does not own lock on path '/trunk/project/a.txt' (currently locked by 'bob')";
-  assert_eq!((failure, last), (Some((160_039, words.to_owned())), Last::Dropped));
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| failure_of(&item));
+  let words =
+    "User 'alice' does not own lock on path '/trunk/project/a.txt' (currently locked by 'bob')";
+  assert_eq!(
+    (failure, last),
+    (Some((160_039, words.to_owned())), Last::Dropped)
+  );
+}
+
+/// The rows of an accepted drive: each changed path with its action.
+fn accepted_rows(step: &Step) -> Vec<(String, Action)> {
+  let Step::Accepted(work) = step else {
+    return Vec::new();
+  };
+  let rows = work.record.changes.iter();
+  rows.map(|row| (row.path.clone(), row.action)).collect()
+}
+
+/// A-617 (module documentation: the transaction; `tree.c` `open_path` through a copy). Do: after `edit`, copy
+/// `/trunk/project/sub` to `sub2`, open `sub2/b.txt` at revision 3 with the source's MD5 as its base, empty it, close
+/// it with the empty text's MD5 and close the edit. Expect: no refusal: the file beneath the copy is the source's (its
+/// created revision 2, its MD5), and the verdict accepts the copy and the file's change.
+#[test]
+fn a_path_beneath_a_copy_reads_the_copys_source() {
+  let replay = replayed_until("edit-large");
+  let source = replay.index.node("/trunk/project/sub/b.txt", 3).unwrap().unwrap();
+  let base = displayed(&source.text().unwrap().md5);
+  let empty = displayed(&md5_of(b"").unwrap());
+  let commands = format!(
+    "( open-root ( ( 3 ) 2:d0 ) ) \
+     ( add-dir ( 4:sub2 2:d0 2:d1 ( 44:{REPOSITORY}/trunk/project/sub 3 ) ) ) \
+     ( open-file ( 10:sub2/b.txt 2:d1 2:c2 ( 3 ) ) ) ( apply-textdelta ( 2:c2 ( 32:{base} ) ) ) \
+     ( textdelta-chunk ( 2:c2 4:SVN\0 ) ) ( textdelta-end ( 2:c2 ) ) \
+     ( close-file ( 2:c2 ( 32:{empty} ) ) ) ( close-dir ( 2:d1 ) ) ( close-dir ( 2:d0 ) ) \
+     ( close-edit ( ) ) "
+  );
+  let mut drive = Drive::new(Setup {
+    base_path: "/trunk/project".to_owned(),
+    repository_url: REPOSITORY.to_owned(),
+    filesystem: "fixture".to_owned(),
+    transaction: "3-1".to_owned(),
+    locks: CommitLocks::default(),
+    now: AprTime(0),
+    room: ROOM,
+  });
+  let mut out = Vec::new();
+  let mut rows = Vec::new();
+  for (item, _) in items(commands.as_bytes()) {
+    let step = drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out);
+    rows = accepted_rows(&step.unwrap());
+  }
+  let expected = vec![
+    ("/trunk/project/sub2".to_owned(), Action::Add),
+    ("/trunk/project/sub2/b.txt".to_owned(), Action::Modify),
+  ];
+  assert_eq!((String::from_utf8_lossy(&out).into_owned(), rows), (String::new(), expected));
 }
