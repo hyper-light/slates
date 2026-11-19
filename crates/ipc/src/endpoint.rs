@@ -133,6 +133,9 @@ pub struct ClientEnd {
   /// Parks the waits for room on a full command ring took ([`Self::send_when_room`], A-571): a non-vacuity count, zero
   /// for a wait that found room inside its spin.
   room_parks: u64,
+  /// Looks at the daemon's life the waits for room made ([`Self::send_when_room`], A-571): on the doubling of the time
+  /// waited, whatever a park's early return adds to the parks.
+  room_looks: u64,
   /// The current departure wait's look schedule (macOS, Windows; A-456; reset as each wait begins).
   #[cfg(any(target_os = "macos", windows))]
   looks: Looks,
@@ -184,6 +187,7 @@ impl ClientEnd {
       unsettled: [None; REPLY_STAMP_SLOTS],
       liveness_looks: 0,
       room_parks: 0,
+      room_looks: 0,
       #[cfg(any(target_os = "macos", windows))]
       looks: Looks::default(),
       #[cfg(target_os = "linux")]
@@ -618,8 +622,13 @@ impl ClientEnd {
   fn wait_for_room(&mut self, wait: &mut RoomWait, elapsed_ns: u64) -> bool {
     match wait.next(elapsed_ns, self.wake_estimate_ns()) {
       RoomStep::Spin => std::hint::spin_loop(),
-      RoomStep::Look if self.daemon_gone() => return true,
-      RoomStep::Look => wait.looked(elapsed_ns),
+      RoomStep::Look => {
+        self.room_looks = self.room_looks.saturating_add(1);
+        if self.daemon_gone() {
+          return true;
+        }
+        wait.looked(elapsed_ns);
+      }
       RoomStep::Park(pause_ns) => {
         self.room_parks = self.room_parks.saturating_add(1);
         std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
@@ -631,6 +640,11 @@ impl ClientEnd {
   /// Parks the waits for room on this end took ([`Self::send_when_room`]): a non-vacuity count.
   pub fn room_parks(&self) -> u64 {
     self.room_parks
+  }
+
+  /// Looks at the daemon's life the waits for room on this end made ([`Self::send_when_room`]).
+  pub fn room_looks(&self) -> u64 {
+    self.room_looks
   }
 
   /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps onto (nothing is dropped: a
@@ -1861,9 +1875,10 @@ mod departure {
 
   /// A-571 (A-523's rule, now every client end's). Do: fill a live daemon's command ring; on its own thread the daemon
   /// takes one request a fifth of a second later; meanwhile send one more, waiting for room. Expect: the request written
-  /// once the daemon took a slot, never before; the wait parked at least once and logarithmically often, at most twice
-  /// the doubling's count (the logarithm of the wait over the wake estimate, plus two), where a spinning wait parks
-  /// never. Before A-571 each raw client of the daemon's tests spun its core on a full ring for up to five seconds.
+  /// once the daemon took a slot, never before; the wait parked, where a spinning wait parks never; and its looks at the
+  /// daemon's life on the doubling, no more than the logarithm of the wait over its first look (twice the wake
+  /// estimate) plus two. Before A-571 each raw client of the daemon's tests spun its core on a full ring for up to five
+  /// seconds.
   #[test]
   fn a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees() {
     let _gate = crate::descriptor_test_gate();
@@ -1892,11 +1907,12 @@ mod departure {
     let written = Instant::now();
     let (taken, freeing) = drainer.join().unwrap().unwrap();
     drop(life);
-    let parks = rings.client.room_parks();
+    let (parks, looks) = (rings.client.room_parks(), rings.client.room_looks());
     let wake = rings.client.wake_estimate_ns().max(1);
     let took = written.duration_since(asked);
     println!(
-      "a full ring a daemon drained after {DRAINS_AFTER_NS} ns: {roomed:?} after {took:?}, {parks} parks, wake {wake} ns"
+      "a full ring a daemon drained after {DRAINS_AFTER_NS} ns: {roomed:?} after {took:?}, {parks} parks, {looks} \
+       looks, wake {wake} ns"
     );
     assert_eq!(roomed, Roomed::Sent);
     assert_eq!(taken, 1, "the daemon took the oldest request");
@@ -1904,13 +1920,14 @@ mod departure {
       written >= freeing,
       "written only once the daemon began to take a slot"
     );
-    // The doubling parks once between looks; a park the OS ends early takes one more in its interval (the Mac Studio's
-    // first green run parked 12 times across 377.7 ms, the doubling's own count at that length).
+    assert!(parks >= 1, "{parks} parks across {took:?}: the wait spun");
+    // The looks come on the doubling of the time waited, so a park the OS ends early adds a park but never a look (the
+    // Mac Studio parked 12 and 18 times across 377.7 and 309.2 ms at load 12 to 38).
     let took_ns = u64::try_from(took.as_nanos()).unwrap();
-    let bound = 2 * (u64::from((took_ns / wake).max(1).ilog2()) + 2);
+    let bound = u64::from((took_ns / (2 * wake)).max(1).ilog2()) + 2;
     assert!(
-      (1..=bound).contains(&parks),
-      "{parks} parks across {took:?} from a {wake} ns wake"
+      (1..=bound).contains(&looks),
+      "{looks} looks across {took:?} from a {wake} ns wake"
     );
   }
 
@@ -1934,8 +1951,10 @@ mod departure {
       .send_when_room(|end| end.send(&Slot::inline(filled + 1, b"room")?))
       .unwrap();
     let took = asked.elapsed();
-    println!("a full ring whose daemon is gone: {roomed:?} after {took:?}");
+    let looks = rings.client.room_looks();
+    println!("a full ring whose daemon is gone: {roomed:?} after {took:?}, {looks} looks");
     assert_eq!(roomed, Roomed::DaemonGone, "after {took:?}");
+    assert_eq!(looks, 1, "seen gone at the first look");
     assert!(
       took < Duration::from_nanos(OLD_CREDIT_WAIT_NS / 10),
       "seen gone after {took:?}, not near the old five seconds"
