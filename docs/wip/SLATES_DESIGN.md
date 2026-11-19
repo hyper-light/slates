@@ -11616,6 +11616,14 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > accepts it, the restated journal replayed, and the green that accepts that journal composed again) with a census
 > of every case (`docs/bugs/2026-11-19-a-rebased-work-restated-its-links-after-moving-their-nodes.md`).
 
+> **Status (2026-11-19, A-677: a rebase's files hold the node a removed home hands to its link).** A version that
+> removes or replaces a file's home while hard links still name its node hands the node to the least surviving link
+> (A-646, `Green::node_moves`), which takes it as the version leaves it (A-669's rule). A rebase's journal stays the
+> work's own operations, since a volume's link names the node already; its changes now hold that link with the node's
+> bytes, as the submit leaves it (`Green::heirs_of`). Before, they held the home's removal alone, so a rebased work's
+> files lost the link the submit kept, and the rebase oracle failed on some seeds
+> (`docs/bugs/2026-11-19-a-rebases-files-lost-the-link-a-removed-home-handed-its-node-to.md`).
+
 **Rebase off the owner (A-273): measured and rejected (A-528).** A work's rebase and its base reads at a named
 version are the green's owner's: a work's shard asks them of the owner's shard (A-247, A-388), which answers them on
 its one thread beside the verdicts. A-273 tried keeping a replica of the green on each shard that holds its works (the
@@ -49375,3 +49383,49 @@ Applied in the same change to:
 - **Owed.** The `StoreLender` over A-662's map, which makes upload-pack reachable; the daemon starting the SSH edge; the
   stateful protocol v0 session over SSH (slates-git's); receive-pack (A-654), a lender of Mercurial's store, and
   Subversion's tunnel (A-656); main's live OpenSSH `git clone` over SSH once a lender holds a store.
+
+### A-677 — A rebase's files hold the node a removed home hands to its link (bug, 2026-11-19, g305, UI goal 93 (kiln 51cef9f7); §4.16 "Rebase, the only corrective path" and A-669's rule; found by A-658 part 1's runs)
+Applied in the same change to:
+- §4.16 "Rebase, the only corrective path" (a status note);
+- `crates/merge/src/engine.rs`: `Green::heirs_of` (new) and `Green::rebased_from`; the docs of `Rebased::Rebased`'s
+  `changed` and of `Green::node_moves`;
+- `crates/merge/src/engine/node_tests.rs` (one case); `crates/merge/tests/rebase.rs` (the oracle's check a function,
+  the two shrunk cases a named test, the property seeded); `crates/merge/tests/rebase.proptest-regressions` (new);
+- `docs/bugs/2026-11-19-a-rebases-files-lost-the-link-a-removed-home-handed-its-node-to.md`.
+- **The defect.** With a file `a` whose node a hard link `b` names, a work removing `a` was answered by its rebase with
+  the changes `{a: None}` and the journal `[Unlink a]`, while the submit leaves `b` holding the node: the commit's node
+  moves (`Green::node_moves`, A-646) hand the node to the least surviving link, and the rebase built its changes from
+  the work's own effects alone. A rename over `a` lost its heir the same way. The rebase oracle (A-202) failed on some
+  seeds (kiln r55 and r113, macOS arm64, Mac Studio), and a probe of r55's case answered the same on main's own tree
+  (787f5948b, r89) as on A-658's branch.
+- **The fix.** The rebase takes the files the commit's node moves leave at heirs (`Green::heirs_of`: each heir with the
+  node's bytes), computed after the mapped files are made, as the commit computes them, and puts them into its changes
+  after the work's own, as the commit applies its moves after the version's effects. Its journal is unchanged: the
+  hand-over is the commit's, never the work's operation, and a volume's link names the node already. The server keeps
+  the changes as the work's files and composes the next submit from the journal, so the next increment is unchanged,
+  and the rebased work's files hold the link the submit keeps (their charge counting the link's bytes, as A-669's
+  hand-over with writes already did).
+- **Tests**, red first, on macOS arm64, the Mac Studio (kiln r156, 2026-11-19, debug, fresh clones of the pushed
+  branches, each with its own target directory, `CARGO_BUILD_JOBS=2`):
+  - `a_rebase_restates_the_node_a_removed_home_hands_to_its_link` (`crates/merge/src/engine/node_tests.rs`): a removal
+    of `TARGET`, which `HARDLINK` and `SECOND` name, and a rename of `FILE` over it, each rebased at the head beside a
+    twin that submits it; the rebase's files must be the twin's, `HARDLINK` holding `TARGET`'s old bytes, and no
+    journal operation may name `HARDLINK`.
+  - `a_removed_homes_link_holds_its_node_in_the_rebases_files` (`crates/merge/tests/rebase.rs`): the oracle's check on
+    its two shrunk cases; and the property seeded with both seeds, which it replays before its novel cases.
+  - Red at 05593caea (the tests alone, over main 545181b30): `cargo test --locked -p slates-merge --lib node_tests` 24
+    passed and the new case failing (the removal's rebased files `{f}` against the twin's `{f, h}`); `cargo test
+    --locked -p slates-merge --test rebase` 1 passed and 2 failing, the named cases (`{}` against `{"b": []}`) and the
+    property at its first replayed seed (0 successes).
+  - Green at 79ec79e77: `cargo fmt -p slates-merge -- --check` clean; `cargo test --locked -p slates-merge --lib` 192
+    of 192; `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1; and the
+    server's integration tests that drive a rebase over the wire, by name (`daemon`'s lifecycle test, two of
+    `merge_load`, two of `verdict_pages`, five of `works_off_owner`, three of `green_post_state`), 13 of 13.
+  - The landing run, over main 1ef718820 (878a2eb43, kiln r172), alike: fmt clean; slates-merge lib 193 of 193 (main's
+    A-676 added one); `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1;
+    the server's 13 of 13.
+- **Siblings** (the sweep, by reading): the hand-over also moves the node's mode and attributes to the heir, and an IPC
+  node (`Effect::Special`); a rebase's answer holds files alone, so what a rebased work shows of a heir's mode,
+  attributes or IPC node is the server's work view's, not checked here. The chain entry's copy fixes
+  (`CopyFix::files`, A-626) and the stack's restatements (operations, from which a commit derives its own node moves)
+  are not siblings.
