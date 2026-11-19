@@ -11434,6 +11434,24 @@ against what that copy brings there.
 > link, a hard link or an IPC node is refused `TypeChanged` with no concurrent change, though POSIX replaces it; and a
 > hard link names its target by path, so the target's removal leaves the link naming whatever is made there next.
 
+> **Status (2026-11-19, A-646 part 1: a rename replaces an unchanged link or IPC node, and an IPC node's removal is two
+> lookups).**
+> - *A rename's destination is replaced as POSIX `rename` replaces it.* Any node but a directory the work's base held
+>   unchanged is removed by its own effect, pushed before the source's set: a symbolic link, a hard link, an IPC node,
+>   and (A-643) a file a link is renamed over. A directory, and a link or IPC node changed after the base, are still a
+>   type change; a file changed after it is still rename against rename; an IPC node a hard link names is delete
+>   against modify, as its unlink is. Before, any node but a file at the destination was refused `TypeChanged`, though
+>   nothing had changed after the base.
+> - *Two names of one file renamed one over the other change nothing*, as POSIX `rename` does: a file over its own hard
+>   link, or one link over another link to the same file (A-643 settled a link over the file it names).
+> - *An IPC node's removal reads its last change in any dimension (`changed_after`) and the links naming it
+>   (`links_to`)*, two lookups, where it had scanned every attribute change and every hard link of the green.
+>
+> Tests: `crates/merge/src/engine/replaced_node_tests.rs` and `scan_tests.rs` (a counter of the entries the verdict
+> examines: 2 for one removal in a green of a thousand hard links and attribute changes, 2,000 before). The whole-state
+> oracle renames a file or a link over a file or a link. Owed, as A-646 part 2: a hard link names its target's node,
+> never a path.
+
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
 into the increment's post-state chunks (`Extent{src: Chunk{chunk, off}}`, sub-chunk offsets
@@ -12318,6 +12336,16 @@ engine: the verdict, rebase, position mapping, the register).
 > close end the channel in order. The listener on the runtime, the host key's keeping and the commands' serving are
 > owed.
 >
+> **Status (2026-11-19, A-634: the post-quantum key exchange built).** The transport runs `mlkem768x25519-sha256`, the
+> ML-KEM-768 and X25519 hybrid OpenSSH made its default in 10.0, and offers it first; a client that does not list it
+> gets `curve25519-sha256`, since the client's first choice decides. The server checks `C_INIT`'s length, encapsulates
+> to the client's ML-KEM key through aws-lc-rs (AWS-LC runs FIPS 203 §7.2's modulus check inside the encapsulation),
+> keeps RFC 8731's checks on the X25519 half, and enters `K = SHA-256(K_PQ || K_CL)` into the hash and the key
+> derivation as a string. OpenSSH 10.1 and later warn on every connection whose exchange is not post-quantum, and each
+> of them lists the hybrid first, so none warns here. Held to whole handshakes and rekeys against the test client,
+> which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
+> mutations of the secret's encoding and order, the reply's order and the length check, each caught.
+>
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
 > inflated through flate2 over zlib-rs (A-607) into room for exactly the size its header names, then the trailer, which
@@ -12553,7 +12581,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    bound to its one endpoint and refusing every transfer coding, lent its line bound and its staged close, and moving it
    onto the codec is owed. The git edge adds TLS, authentication and streaming responses.
 2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
-   one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
+   one session channel [B: RFC 4254]. Key exchange `mlkem768x25519-sha256` first, ML-KEM-768 with X25519
+   [B: `draft-ietf-sshm-mlkem-hybrid-kex-10`; FIPS 203], OpenSSH's default since 10.0, whose clients since 10.1 warn on
+   every connection without a post-quantum exchange [B: OpenSSH 10.0 and 10.1 release notes] (A-634), then
+   `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
    [B: RFC 8709], and user keys in RSA under `rsa-sha2-512` and `rsa-sha2-256` [B: RFC 8332] (A-633), with the ECDSA
    and FIDO key forms users also hold as owed reading; ciphers `aes256-gcm@openssh.com`
    and `chacha20-poly1305@openssh.com`, the forms OpenSSH clients speak ("Because of problems with the design of the
@@ -13017,6 +13048,17 @@ signature verification).
 > bookmarks and markers beside the logs (pieces 5 and 7; until then an import is not served), the import sliced under
 > the shard's budget and resumed after a pending read, revlogs read by ranges, a rebuild that starts from the text
 > before it, and the server's adapter from the base's host seam.
+>
+> **Status (2026-11-19, A-619 part 3: the session of `slates hg serve --stdio`).** `serve::session::serve` serves the
+> SSH version 1 request at the front of the buffered input as 7.2's `_runsshserver` does: `hello` and `capabilities` of
+> what is served (`batch`, `branchmap`, `bundle2`, `getbundle`, `known`, `protocaps`), `protocaps`, `batch` of the
+> string-answering calls, discovery and `listkeys`, and `getbundle`'s stream, its refusal of a bundle2 request answered
+> as an `ERROR:ABORT` part; an empty answer for a name 7.2 lacks; the commands 7.2 serves and this server does not read
+> and refused out of band; an empty line ending the session. Proven by `cargo test --locked -p slates-hg --lib` on the
+> Mac Studio, 219 of 219, red first (5 of 5 failed against a stub): the three captured sessions served whole (every
+> string answer byte for byte as 7.2 framed it, `getbundle` by meaning, `hello` a subset of 7.2's capabilities), hostile
+> requests, and arbitrary input. Owed of piece 4: the process around the session (stdin and stdout through the runtime),
+> HTTP version 1 over `slates-http` and the shared edge, held deltas, the index's kept heads.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13416,8 +13458,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    7), the import sliced and by ranges, and the server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
-   with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; owed: the stdio loop,
-   HTTP.
+   with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
+   3); owed: the process around it, HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts; owed: the
@@ -43650,7 +43692,8 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
 Applied in the same change to:
 - §4.17.2's status and its SSH item (RSA user keys under RFC 8332; Mercurial's and Subversion's commands); §4.17.3's
   transports and §4.17.4's svn+ssh (slates' own SSH server reads their commands); GAPS (the §4.17 entry);
-  `research/vcs-servers.md` §5.6 (new: the sources, pinned by hash);
+  `research/vcs-servers.md` §5.7 (new: the sources, pinned by hash; first numbered §5.6, beside A-624's, and renumbered
+  by A-634);
 - `crates/ssh` (new: `userauth`, `channel`, `command`, `session`; `transport` sends EXT_INFO and gives each upper-layer
   message its sequence number; `refusal` gains reason 14; their tests; `fixtures/userauth` with `make-fixtures.sh`).
 - **Authentication** (RFC 4252). `none` is answered with a failure naming `publickey` and is never counted. A query is
@@ -44395,6 +44438,137 @@ requirements reader, now strict, and its plain encoding; `fixtures/import/` and 
   holds twice, fncache entries; every refusal leaving the store as it found it; any byte of either store changed or cut
   (256 generated cases) never a panic and never a hold left. Unit: 7.2's `_plain_encode` doctests, the store's shape
   for each layout, every kind of refused requirement, the file index's docket, files and paths.
+
+### A-646 part 1 — a rename replaces an unchanged link or IPC node at its destination, and an IPC node's removal is two lookups (2026-11-19, g267, UI goal 93; §4.16 "The verdict"; A-643's first and third siblings)
+Applied in the same change to:
+- §4.16's verdict status; GAPS (A-643's siblings: the first and third fixed, the second owed as part 2);
+- `crates/merge/src/engine.rs`: `merge_rename` (`replaced_by_rename`, `same_file`), `merge_unlink`'s IPC branch,
+  `named_by_links`, and a counter of the entries examined in test builds;
+- `crates/merge/src/engine/replaced_node_tests.rs` and `crates/merge/src/engine/scan_tests.rs`: the failing-first
+  tests, and the whole-state oracle widened to renames over links;
+- `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
+- **The defects.**
+  - A rename over a symbolic link, a hard link or an IPC node was refused `TypeChanged`, even with nothing changed
+    after the work's base. POSIX `rename` replaces any destination but a directory, and does nothing for two names of
+    one file, so `mv file link`, `mv link link`, `mv file fifo` and a file renamed over its own link could never land.
+  - An IPC node's unlink scanned every attribute change and every hard link of the green: O(changes) per removal.
+- **The rule, from §4.16 and POSIX `rename`.** A type change is a conflict for a concurrent change, not for an
+  operation the work saw and made. The destination is replaced when it is the node the base held:
+  - A directory is still refused, since a non-directory never replaces one.
+  - A link or IPC node changed after the base is a type change.
+  - A file changed after it is rename against rename.
+  - An IPC node a hard link names is delete against modify until links name nodes (part 2).
+  - Otherwise the node is removed by its own effect before the source's set, so the history's last entry at the version
+    is the new node.
+
+  Two names of one file are one name.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 7 to 9), green on kiln r960 and, merged with main, r972:
+  `cargo test -p slates-merge --lib`, 104 of 104 and 116 of 116; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests:
+  - the file and the symlink, each renamed over a symlink, a hard link and a FIFO, accepted and replacing it;
+  - the guard: a link changed after the base, and a directory, still `TypeChanged`;
+  - a file over its own link, and a link over another link to the same file, accepted with nothing changed;
+  - the whole-state oracle renaming the file or a link over a file or a link, with a census count of a link replaced;
+  - the counter: one IPC node's removal examines two entries in a green of a thousand hard links and attribute
+    changes.
+
+  Red on r960, with the old rename rule and the old scans restored (the scans counting): 4 of the 7 tests the run
+  selected failed, and the guards passed either way. The file over the symlink, and the file over its own link, were
+  each `TypeChanged`; the oracle shrank to the hard link renamed over the symlink; the removal examined 2,000 entries.
+
+### A-619 (part 3) — Mercurial's read serving, part 3: the SSH version 1 session of `slates hg serve --stdio`, held to three captured sessions of stock Mercurial 7.2 served whole (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone", piece 4; A-569, A-619 parts 1 and 2)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve::session`, new: `serve`,
+`Step`, `Refused`; `serve::Refusal` is `Copy`; its tests beside `getbundle`'s, whose store they share), GAPS (the
+§4.17.3 entry), `research/mercurial-server.md` (§22).
+- **What it does.** One step serves the request at the front of the buffered input: the command line, its arguments by
+  7.2's spec, then a string answer, `getbundle`'s raw stream, or an out-of-band error; `More` where the buffer holds
+  only part of a request. The commands served are those part 1 and part 2 answer, with `hello`, `capabilities`,
+  `protocaps` and `batch`; 7.2's others are read and refused out of band, so the session stays in step.
+- **Decided.** A request that cannot be read ends the session after an error answer, where 7.2 fails mid-stream; a
+  command's own refusal is answered out of band and the session goes on, where 7.2's exceptions end the process; a
+  bundle2 request's `getbundle` refusal is 7.2's `ERROR:ABORT` part with 7.2's words where 7.2 aborts alike. The
+  advertised capabilities are what is served; a 7.2 client asks the same `getbundle` of them (`_pullbundle2` reads
+  `phases`, `bookmarks`, `listkeys`, `obsmarkers`).
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 219 of 219 (load 9.1), 5 of
+  them this part's; red first against a step that ends at once, 5 of 5 failed; fmt clean. Golden: each captured session
+  served whole and ended by an empty line, `between`, `protocaps`, `batch` and `listkeys` byte for byte with their
+  framing, `getbundle` by meaning, `hello` each capability one 7.2 advertised. Hostile: an unknown name, `lookup`, a
+  batch calling `getbundle`, a batch call without its space, `known` of a non-hex node, a bundle1 `getbundle`, a client
+  with only version 01 (its `ERROR:ABORT` part), partial requests, an argument past the admission, a line too long;
+  arbitrary input (a session ends cleanly only on an empty line, by a refusal only with the rest taken).
+- **Owed.** The process around the session (the CLI's stdin and stdout through the runtime, sliced within the shard's
+  budget), HTTP version 1 over `slates-http` (A-595) and the shared edge (A-625), held deltas, `obsolete`'s `listkeys`
+  dump, and the index's kept heads.
+
+### A-634 — The SSH server's post-quantum key exchange: `mlkem768x25519-sha256`, ML-KEM-768 with X25519 through aws-lc-rs, offered first, and OpenSSH's warning checked against its release notes (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2; after A-594 and A-633)
+Applied in the same change to:
+- §4.17.2's status and its SSH item (the key exchange); GAPS (the §4.17 entry); `research/vcs-servers.md` §5.8 (new:
+  the draft, FIPS 203's checks where AWS-LC runs them, OpenSSH's release notes and its post-quantum page, pinned by
+  hash), with A-633's sources renumbered §5.7 and moved into §5, where a merge had left them after §6 under A-624's
+  number;
+- `crates/ssh`: `kex` (the hybrid's half; one X25519 step both methods share, the all-zero check in it alone);
+  `kexinit` (the method list, `KexMethod::Mlkem768X25519Sha256`); `transport` (each method's half; `Algorithms::kex`);
+  `entropy` (the one draw that does not pass through it); the tests (the hybrid's half, hostile values, negotiation,
+  whole handshakes; the test client decapsulates for itself and lists OpenSSH 10's default methods; the tests'
+  narrowing casts are checked conversions now).
+- **The claim, checked.** The brief said OpenSSH 10 "may warn on every non-post-quantum exchange". The release notes
+  say so of 10.1, not 10.0. OpenSSH 10.0 (released 2025-04-09) made the hybrid its default: "the hybrid post-quantum
+  algorithm mlkem768x25519-sha256 is now used by default for key agreement" [B: release-10.0]. OpenSSH 10.1
+  (2025-10-06), among its potentially incompatible changes, has `ssh(1)` "add a warning when the connection negotiates
+  a non-post quantum key agreement algorithm", "due to the risk of "store now, decrypt later" attacks", controlled by
+  "a new WarnWeakCrypto ssh_config option, defaulting to on" [B: release-10.1]. OpenSSH 10.2 (2025-10-10) changes
+  nothing here. The warning is the client's, on every such connection: "** WARNING: connection is not using a
+  post-quantum key exchange algorithm." It stays silent when the server offers `mlkem768x25519-sha256` or
+  `sntrup761x25519-sha512` [B: openssh.com/pq.html]. So `git` and `hg` over OpenSSH 10.1 or later would have warned
+  on every connection to slates before this change. Now none does, since every such client lists the hybrid first
+  (`KEX_CLIENT_KEX` in `myproposal.h` at `fa4b2a82`) [C].
+- **Not offered: `sntrup761x25519-sha512`**, OpenSSH's post-quantum default from 9.0 to 9.8. AWS-LC has no Streamlined
+  NTRU Prime, and every client that warns offers the hybrid; a 9.0 to 9.8 client gets `curve25519-sha256` here and does
+  not warn.
+- **The exchange** (the draft §2.1 to §2.5). Messages 30 and 31 carry longer values: `C_INIT` is the client's
+  ML-KEM-768 encapsulation key (1184 bytes) and then its X25519 key, and `S_REPLY` is the ciphertext (1088 bytes) and
+  then the server's X25519 key. The server checks that `C_INIT` is exactly 1216 bytes ("MUST check that the length of
+  the C_INIT is the sum of the expected length of each public key"), runs the X25519 half with RFC 8731's checks,
+  encapsulates through aws-lc-rs, and computes `K = SHA-256(K_PQ || K_CL)` over the two secrets as fixed-length byte
+  strings. "K is encoded as a string" in the hash and the key derivation, not as an `mpint` (§2.5). Every refusal ends
+  the connection with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, as §2.1 requires. OpenSSH's server does the same
+  (`kex_kem_mlkem768x25519_enc` in `kexmlkem768x25519.c` at `fa4b2a82`) [C].
+- **FIPS 203 §7.2's checks.** The length check is the server's own. The modulus check is part of ML-KEM's encapsulation
+  as FIPS 203 defines its input checking, and AWS-LC runs it there: `mlk_kem_enc_derand` calls `mlk_kem_check_pk`,
+  "Implements @[FIPS203, Section 7.2, Modulus check]" (`vendor/aws-lc-sys/aws-lc/crypto/fipsmodule/ml_kem/mlkem/kem.c`
+  line 331, aws-lc-sys 0.45.0). The crate does not check it again, since a second check would be a second path doing
+  the same thing; a hostile test holds AWS-LC to it instead: a coefficient at q or at 4095 is refused, one at q - 1
+  served.
+- **Negotiation.** The method is the client's first that the server runs (RFC 4253 §7.1): the hybrid for a client
+  listing it first, `curve25519-sha256` for one that prefers it or lacks the hybrid. A guess is judged by the first
+  names as before, so a client listing the hybrid first now guesses right. `Established` and `Rekeyed` name the method
+  (`Algorithms::kex`), so a deployment can count the connections that ran it.
+- **Randomness.** The encapsulation's 32 random bytes come from AWS-LC's generator inside AWS-LC, the source
+  `SystemEntropy` reads. aws-lc-rs encapsulates from no given bytes, and AWS-LC's encapsulation that does
+  (`EVP_PKEY_encapsulate_deterministic`) is experimental and unwrapped. Production's source is unchanged, but a hybrid
+  transcript is not reproducible from the test seeds, so the determinism test holds the classical exchange (`entropy`'s
+  module doc says this). Measured: 64 encapsulations to one key gave 64 different ciphertexts, as the draft's §6 asks
+  ("MUST NOT reuse randomness in the generation of ML-KEM ciphertexts").
+- **Tests** (`cargo test --locked -p slates-ssh --lib`, Mac Studio d1323898). 110 of 110 at a064d221.
+  - Red first at bdb2fb7d: 100 passed and the 10 new and changed tests failed, with the server offering the classical
+    exchange alone and the hybrid's half a stub that refused.
+  - Green at 07650154 on its first build, 110 of 110.
+  - The hybrid's half against a client decapsulating with its own key, with RFC 7748's X25519 values on both sides,
+    over 64 runs that must include a hash with its top bit set, where an `mpint` and a `string` differ.
+  - Hostile `C_INIT`s refused by kind beside served controls: a byte short or long, a classical key, a coefficient at
+    q or 4095, the all-zero point.
+  - Negotiation by the client's choice; the KEXINIT's lists; guesses right and wrong, counted by the exchange messages
+    the client sent.
+  - Whole connections against the test client: handshakes under both ciphers with and without strict key exchange,
+    client and server rekeys, and every session and authentication test, all running the hybrid; a classical client
+    and one preferring `curve25519-sha256`, each through a handshake and a rekey.
+  - Red four ways on the Studio:
+    - `K` written as an `mpint`: 23 of 110 failed, the unit test only by chance, so it now requires a top-bit run and
+      failed each of 3 runs;
+    - the two secrets swapped: 35 failed;
+    - the length check removed: both hostile tests failed;
+    - the reply's two parts swapped: 35 failed.
+- **Owed.** Main's live interop with OpenSSH 10.2 (`ssh -v` naming `mlkem768x25519-sha256`, and no warning), and a
+  golden transcript with known keys, which needs a client with a fixed ML-KEM key, since the draft gives no vector.
 
 ### A-628 — The repository's import and export: a dump made into a repository's history as FSFS's load makes it, and a history written as `svnadmin dump` writes it (2026-11-19, g264, UI goal 93; §4.17.4 "Pieces that follow" piece 6's rest, rescoped by Ada; A-553, A-575, A-593)
 Applied in the same change to:
