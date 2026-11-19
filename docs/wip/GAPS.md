@@ -191,7 +191,8 @@
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588) (2026-11-19; UI goals 91 and 92; owners g291, and g079 for A-598).** Built on §4.17.1: a named branch's
+> built (A-588); piece 4's read-serving logic, part 1 (A-619) (2026-11-19; UI goals 91 to 93; owners g291, and g079 for
+> A-598 and A-619).** Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
 > and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
@@ -235,10 +236,20 @@
 > first against stubbed engines (14 of its 16 tests failed), against the five compressed bundles stock `hg` 7.2 wrote
 > (`crates/hg/fixtures/compressed/make-compressed-fixtures.sh`, `SHA256SUMS`), each made plain to exactly the bundle
 > 7.2 wrote uncompressed, and 7.2's server's zstd answer to a `getbundle`; every cut, a bit flipped at every place,
-> unknown engines and bytes after a stream refused by kind. Owed, in order, after §4.17.1's seven pieces: (3, rest) the
+> unknown engines and bytes after a stream refused by kind. **Built (A-619 part 1):** read serving's logic over a
+> `Repository` trait (the served view's graph and names): `heads`, `known`, `between`, `branches`, `branchmap`,
+> `listkeys` (namespaces, bookmarks, phases) and a `getbundle`'s choice with its phase heads and bookmarks, node lists
+> and walks charged to the admission, a graph naming a parent after its child refused; proven by `cargo test --locked
+> -p slates-hg --lib`, 182 of 182 on the Mac Studio (2026-11-19, debug, load 6.5), red first against stubs (7 of 7
+> failed), against a naive oracle on generated histories, 7.2's set discovery driven to the shared set (its rounds
+> counted), and a probe of stock `hg serve --stdio` 7.2 (`crates/hg/fixtures/serve/make-serve-fixtures.sh`): eight
+> answers byte for byte. Owed, in order, after §4.17.1's seven pieces: (3, rest) the
 > index's tables, then import of a repository directory, its zlib and zstd revlog chunks inflated by A-607's engines
-> (flate2 over zlib-rs, and zstd), its tests holding inflated bytes; (4) read serving, the `0.2` answers compressed by
-> A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the shard's step
+> (flate2 over zlib-rs, and zstd), its tests holding inflated bytes; (4, rest) read serving: the changegroup and the
+> bundle2 a `getbundle` answers (A-619 part 2), `obsolete`'s `listkeys` dump and the `obsmarkers` part, `slates hg
+> serve --stdio`'s loop, HTTP version 1, the `0.2` answers compressed by A-598's engines at the learned level, and the
+> index's kept heads in place of the walks over the whole view; (5) pushes, a compressed bundle inflated in slices
+> within the shard's step
 > budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
 > changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
 > (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
