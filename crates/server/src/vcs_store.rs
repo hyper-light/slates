@@ -66,8 +66,9 @@ use crate::state::ShardState;
 
 pub(crate) mod hg_import;
 pub(crate) mod record;
+// Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove, WriteRefused};
 
@@ -266,6 +267,13 @@ impl VcsStores {
     self.content.as_ref()
   }
 
+  /// The content store, lent for one step that gives back what something beside a repository's
+  /// store holds in it: a hook's view, whose holds outlive no repository entry
+  /// (`crate::git_hooks`, A-665 part 2).
+  pub(crate) fn content_mut(&mut self) -> Option<&mut ContentStore> {
+    self.content.as_mut()
+  }
+
   /// What the stores hold of the shard's budget.
   pub(crate) fn charged(&self) -> u64 {
     self.charged
@@ -440,8 +448,10 @@ pub(crate) fn settle(state: &mut ShardState) {
   }
 }
 
-/// Runs `step` over the stores with the room [`lend`] gives for `bytes`, then settles.
-fn within_budget<T>(
+/// Runs `step` over the stores with the room [`lend`] gives for `bytes`, then settles: a push's
+/// steps here, and a hook's view opened and sealed over the store (`crate::git_hooks`, A-665
+/// part 2).
+pub(crate) fn within_budget<T>(
   state: &mut ShardState,
   bytes: u64,
   step: impl FnOnce(&mut VcsStores) -> T,
@@ -503,6 +513,13 @@ impl SealedPush {
   /// The repository it is a push to.
   pub(crate) fn repository(&self) -> RepositoryId {
     self.repository
+  }
+
+  /// Its objects, in quarantine until a commit takes them: what a hook's view shows of the push
+  /// (`crate::git_hooks`, A-665 part 2), in git's quarantine for `pre-receive` and among the
+  /// repository's packs for `update`.
+  pub(crate) fn push(&self) -> &Push {
+    &self.push
   }
 
   /// The record the entry holds (`RepositoryEntry::objects`): the moves now admitted and the objects not yet committed,

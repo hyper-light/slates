@@ -13000,6 +13000,22 @@ engine: the verdict, rebase, position mapping, the register).
 > Owed: part 2, the view presented to the hook driver on the owner shard (after A-662); main's run of stock git over
 > the view.
 >
+> **Status (2026-11-19, A-665 part 2: the view handed to the hook driver on the owner shard, built).** `crates/server`
+> (`git_hooks`) opens part 1's view over the repository's store in the shard's `vcs_stores` (A-662), the push where
+> receive-pack keeps it at each point: in git's quarantine for `pre-receive`, among the packs for `update`, nowhere for
+> `post-receive` or a push of deletes alone. The caller names each ref by its full name, its green and the version of
+> the green the push read, and the store's own versions of the green translate it; a version no push made is refused
+> (`NotInStore`), the store holding what pushes brought alone. The view's tables are charged to the shard's budget
+> while it lives, its packs sealed in the shard's slices, each seal lent the room `HookView::seal_len` names, and its
+> close gives every hold and charge back. `run` hands the hook the repository's policy configures at the point the
+> view's variables beside its point's own, `GIT_DIR=.` and for `pre-receive` the quarantine's three as stock git 2.50.1
+> sets them, in the view's root, and refuses a view the point would not see. Proven by running the test binary as each
+> point's hook in its view, written into a scratch directory by the tests' own presenter: each hook sees what
+> receive-pack's hooks see, and stock `git` there reads the pushed commit and its history (@@RUNS@@). Owed: part 3, the
+> view presented at a path (a read-only attachment the mount edges serve a read at a time; on Linux in the launcher's
+> namespace, §4.6); its seals kept as derived data across views; receive-pack's calls (A-654); git's words for each
+> outcome.
+>
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
 > capabilities and this server's agent. Each request is answered whole and statelessly: the shallow-update first,
@@ -13214,8 +13230,10 @@ quarantine shows them to a hook. Building that view (packs and refs generated fr
 part 1, the view itself, is built (A-665: `HEAD`, `config` and `packed-refs` as git writes them; packs each whole by
 itself from the base packs and fragments, the objects no kept part holds and the push's held whole; the push in
 `objects/tmp_objdir-incoming-<six>` for `pre-receive` with receive-pack's environment, among the repository's packs for
-`update`; a pack's trailer, Adler-32s and index its seal, the rest of every file read a window at a time); part 2
-presents it to the hook driver on the owner shard.
+`update`; a pack's trailer, Adler-32s and index its seal, the rest of every file read a window at a time); part 2,
+handing it to the hook driver on the owner shard, is built (A-665 part 2: opened over the repository's store, sealed in
+the shard's slices, run with `GIT_DIR=.` and the quarantine's variables); part 3 presents it at a path, a read-only
+attachment the mount edges serve.
 
 **Operations on the server.** Merging a review request is §4.17.1's merge: on accept the server makes the merge commit
 (parents: the target's head and the request's head; tree: the accepted version's; author and committer the person who
@@ -13320,8 +13338,9 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
    `include-tag`; `object-info`.
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
 9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
-10. Hooks over a read-only bare-repository view (part 1, the view, built: A-665; part 2, presenting it to the hook
-    driver on the owner shard, after A-662); push options; push to review with report-status-v2.
+10. Hooks over a read-only bare-repository view (part 1, the view, built: A-665; part 2, handing it to the hook driver
+    on the owner shard, built: A-665 part 2; part 3, presenting it at a path, owed); push options; push to review with
+    report-status-v2.
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
@@ -49754,3 +49773,85 @@ Applied in the same change to: §4.17.2 (a status block), GAPS (the A-653 entry)
   reaches the search.
 - **Owed.** Part 2, as main ruled it (above); the fragment encoder's per-object unit, once `Encoder::put` steps its
   trials through a search; the red-checks and the other platforms' runs (main's).
+
+### A-665 part 2 — The hook's view on the owner shard: opened over the repository's store, sealed in the shard's slices, and handed to the hook driver with receive-pack's variables (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-597, A-622, A-662, A-665)
+Applied in the same change to:
+- §4.17.2 (a status block, "Hooks, in git's terms", piece 10's line) and GAPS (the §4.17 entry: A-665's owed list, the
+  hooks' variable sweep, and this part's paragraph);
+- `crates/server`: `git_hooks` and its tests (new); `lib.rs` (the module, Unix alone with the hook driver);
+  `vcs_store.rs` (`SealedPush::push`, `VcsStores::content_mut`, `within_budget` made crate-visible) and its tests'
+  push helpers made crate-visible for the hooks' tests;
+- `crates/git`: `HookView::seal_len`, its module's docs, and a test in `src/tests/store/hook_view.rs`.
+
+- **What.** `git_hooks::GitHookView::open(state, repository, (refs, head), pushed)` opens part 1's view over the
+  repository's git store in the shard's `vcs_stores` (A-662), with a sealed push where receive-pack keeps it:
+  `ShownPush::Quarantined` for `pre-receive`, `ShownPush::Migrated` for `update` (receive-pack moves the objects in
+  between, `tmp_objdir_migrate` in `execute_commands`), none for `post-receive` and for a push of deletes alone, for
+  which receive-pack unpacks nothing and so makes no quarantine. `seal_turn` seals its packs a turn at a time;
+  `node`, `list` and `read` are what a presentation serves; `presented_at(root)` answers the view as a hook sees it at
+  `root`; `close` gives everything back. `git_hooks::run(site, input, bound, client_gone)` runs the hook the
+  repository's policy configures at the input's point in that view.
+- **Refs by green and version.** The store keeps no ref names (A-640: "the caller names each ref's green"), so the
+  caller, receive-pack, names each ref it advertised by its full name, its green and the version of the green it read
+  (`ReadRef`). The view shows the store's version of that green whose green version that is, the newest such
+  (`GitStore::versions`, as `version_of` reads newest first). A ref at a version no push made is refused
+  (`NotInStore`, naming its place), since the store holds what pushes brought and nothing else (A-662; a version a
+  server-side merge makes is A-664 part 3's).
+- **The budget (§4.2).** Opening runs inside `vcs_store::within_budget`: the content store is lent what the shard could
+  admit now, the view's own tables (part 1 charges them to an `Admission` of that room) are charged to the content
+  store with `ContentStore::charge`, and the settle carries them as retention for as long as the view lives, as the
+  store's own structures are carried. A hold changes no byte count (`ContentStore::hold`). Each seal is made inside
+  `within_budget` too, lent the room `HookView::seal_len` names: the index's bytes, held as content, and four bytes for
+  the Adler-32 of each object the pack holds whole, which is what the seal keeps (`seal::keep`). The lent figure grows
+  the arena before the step, so the settle's retention charge after it is met. `close` gives the seals, the holds and
+  the tables' charge back through the shard's one content store (`VcsStores::content_mut`), whether or not the
+  repository's entry is still there, and settles; a refusal there is counted (`git_hooks.view_release_refused`).
+- **Sliced.** A seal hashes every byte of its pack, so it runs a turn at a time: each turn the pass runs for the shard's
+  live step quantum (`DaemonConfig::step_quantum_ns`, §4.3), at least one unit of work (part 1's `Quantum` over the
+  runtime's clock), and the caller's task yields between turns. A seal refused (`Changed`: a base pack made again under
+  the view) closes the view, which is opened again.
+- **The hook's variables.** `presented_at(root)` takes part 1's `HookView::environment(root)`: `GIT_DIR=.` at every
+  point, which receive-pack exports to every hook once it has entered the repository (`setup.c` `set_git_dir_1`), and
+  for a quarantine `GIT_OBJECT_DIRECTORY` and `GIT_QUARANTINE_PATH` the quarantine and `GIT_ALTERNATE_OBJECT_DIRECTORIES`
+  the repository's objects, each an absolute path through `./objects` as `tmp_objdir_env` hands them (part 1's
+  fixtures). `run` adds them after the point's own (the push options, A-597), as `run_and_feed_hook` adds
+  `tmp_objdir_env` after the options; no name is in both.
+- **Which view a point sees.** `pre-receive` sees the push quarantined or no push; `update` the push migrated or none;
+  `post-receive` none. A view handed otherwise, or an input at another tool's point, is refused before any process
+  starts (`ViewForAnotherPoint`, `NotGits`), so a hook can never be handed a quarantine receive-pack would not hand it.
+  A point with no hook configured lets the push through and teaches nothing (A-597).
+- **Not done here: the view at a path.** The driver starts a hook in a directory (`hook_driver::Launch::view_root`), so
+  the view must be presented at a path the hook and its `git` read. A mount of the daemon's serves a volume; a view is
+  no volume, and its reads need the shard's content store, which a volume slot's base host cannot hold beside it, so
+  serving it lazily means lending the content store to the view at each edge's request (the base seam's lens), a piece
+  of its own (part 3), with the launcher's namespace on Linux (§4.6). Copying the view into a volume would hold every
+  pack's bytes twice per hook, which A-645's scale rules out. Until part 3 the tests present the view themselves, by
+  writing it into a scratch directory in the build output.
+- **Tests** (`crates/server/src/git_hooks/tests.rs`; `crates/git/src/tests/store/hook_view.rs`).
+  - `a_git_hook_runs_in_its_view_at_each_of_receive_packs_points`: on the owner shard, `main` pushed once, then a second
+    commit's push sealed; its `pre-receive` view (sealed a unit of work a turn) and `update` view opened, sealed,
+    written into scratch directories and closed; the push appended; its `post-receive` view the same; then the test
+    binary run as each point's hook in its view. Each view held and charged more once open, charged more once sealed,
+    and the shard's holds and charge back to what they were at its close; the sliced seal taking more turns than packs.
+    Each hook accepted, its working directory its view's root, `GIT_DIR=.`, `HEAD` naming `main`, `packed-refs` naming
+    `main`'s head as the push read it (the pushed head after the append); `pre-receive` handed the quarantine as stock
+    receive-pack hands it, the push's pack alone in it; `update` and `post-receive` none, the push's pack among the
+    repository's for `update`; stock `git`, where it runs, finding the pushed commit and the two commits it reaches
+    (`cat-file -t`, `rev-parse refs/heads/main`, `rev-list --count`), skipping loudly where no `git` runs.
+  - `a_view_the_store_cannot_show_is_refused_by_kind_and_holds_nothing`: `NotInStore` at the first ref and at the
+    second, `ForeignPush`, `NoStore` for a Mercurial repository, the shard's holds and charge unchanged after each.
+  - `a_view_is_handed_only_to_a_point_that_sees_it_so`: a quarantine to `update` and `post-receive`, a migrated push to
+    `pre-receive` and `post-receive`, refused naming both; a Subversion point refused as not git's; an unconfigured
+    point let through with nothing to learn.
+  - slates-git `a_seal_keeps_its_index_and_a_sum_for_each_object_held_whole`: each pack's `seal_len` is its index's
+    length as the view lists it and the charge its seal added, some pack's charge not zero; an unknown name has none.
+- **Runs.** @@RUNS-ENTRY@@
+- **Found, not changed (reported to main).** A git hook inherits the daemon's environment (A-597: git's and Mercurial's
+  hooks inherit the server's), so a repository variable the daemon was started with (`GIT_OBJECT_DIRECTORY`,
+  `GIT_COMMON_DIR`, git's `local_repo_env` list) would reach `update` and `post-receive`, which the view sets none of,
+  and point their `git` away from the view. Stock git's own transports clear that list for receive-pack (`connect.c`,
+  from memory, to verify); whether the hook driver clears it for git's points is main's to decide.
+- **Owed.** Part 3, the view presented at a path (above); its seals kept as derived data across views, since a pack's
+  name hashes what it is made from and a seal serves every view showing its pack; receive-pack's calls (A-654), which
+  open, seal, present, run and close the views at each point; git's words for each outcome (`pre-receive hook
+  declined`, `hook declined`); main's runs (the other platforms, clippy, `xtask`, the doc gates).
