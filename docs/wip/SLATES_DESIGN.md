@@ -14219,9 +14219,10 @@ and export by landing).
 > does (hidden entries, ancestors and mergeinfo paths left out, revision properties censored, locations, segments,
 > histories and file revisions ended, 220001 where a command needs a hidden path whole), and the connection judging
 > each read by its principal's rules; held to a second repository served under an authorization file, its four scripted
-> and seven stock sessions replayed whole (macOS arm64, Mac Studio, 54 of 54). Owed: the svndiff 0 session's recording;
-> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); a denied read in a session that could
-> authenticate, which `svnserve` asks to, mid-command, before it refuses.
+> and seven stock sessions replayed whole (macOS arm64, Mac Studio, 54 of 54); svndiff 0 held to `svnserve`'s own writes
+> since A-616 continued (7) recorded its session. Owed: the fold of a name beyond ASCII (utf8proc's case folding and
+> mark stripping); a denied read in a session that could authenticate, which `svnserve` asks to, mid-command, before it
+> refuses.
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -14314,12 +14315,13 @@ and export by landing).
 > `dav::Drive` consumes the same calls. `EditorWriter` writes each as `editorp.c` and `marshal.c` do: tokens `d` and
 > `c` from one counter, absent entries only to a client that announced `absent-entries`, svndiff 2 to a client that
 > accepts it and 0 to any other, each window as `svndiff.c`'s three chunks (corrected 2026-11-19, A-616 continued (6):
-> a version-0 window of new data alone is `send_simple_insertion_window`'s two, the stream's header in the first),
-> and a call out of the editor's order refused with nothing written. Held to every drive in the recordings (28: 22
-> stock, six hand-made), each read back and written again: the same calls and windows, and every item byte for byte but
-> a chunk `svnserve` stored LZ4-compressed. Owed of part 2: the drive over the index and the green, with
-> `svn_repos_deleted_rev` and `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the
-> client's early answer and its answers to `close-edit` and `abort-edit`.
+> a version-0 window of new data alone is `send_simple_insertion_window`'s two, the stream's header in the first; one
+> writer of those writes, `DeltaWrites`, for the editor and `get-file-revs` alike, held to `svnserve`'s recorded svndiff
+> 0 writes since A-616 continued (7)), and a call out of the editor's order refused with nothing written. Held to every
+> drive in the recordings (28: 22 stock, six hand-made), each read back and written again: the same calls and windows,
+> and every item byte for byte but a chunk `svnserve` stored LZ4-compressed. Owed of part 2: the drive over the index
+> and the green, with `svn_repos_deleted_rev` and `svn_fs_closest_copy`; the deltas of changed texts; and the handler
+> that reads the client's early answer and its answers to `close-edit` and `abort-edit`.
 >
 > **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
 > `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
@@ -49092,6 +49094,42 @@ Applied in the same change to: §4.17.2 (item 2, "Operations on the server", pie
   rows.
 - **Owed.** Nothing of A-614: parts 1 and 2 built, part 3 superseded. The server's verbs over A-666's types stay
   A-666's.
+
+### A-616, continued (7) — One writer of an svndiff stream's writes, held to `svnserve`'s recorded svndiff 0 (2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (A-613's reads and part 2's first slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/report/editor.rs` (`DeltaWrites`, `Writes`) and its tests; `crates/svn/src/reads/file_revs.rs`;
+`crates/svn/src/reads/tests.rs`; `crates/svn/fixtures/reads` (`get-file-revs-svndiff0`'s two transcripts,
+`SHA256SUMS`, `sessions.txt`); `crates/svn/fixtures/report/make-fixtures.py`;
+`docs/bugs/2026-11-19-a-version-0-delta-sent-its-header-as-a-chunk-of-its-own.md`.
+
+- **Found** by g297: the layout of an svndiff stream's writes (`svndiff.c`'s `window_handler` and
+  `send_simple_insertion_window`, A-616 continued (6)) was written twice, in the report editor's
+  `EditorWriter::window` and in `get-file-revs`' delta writer (A-613's seventh slice), each with its own header flag
+  and its own join of the header, the integers and the instruction; the two shared only the rule that picks an
+  insertion and the split of an encoded window.
+- **One writer.** `report::editor::DeltaWrites` writes a stream a window at a time: it encodes the window into the
+  caller's buffer and answers its writes as slices of it (`Writes`, at most four; a part `svndiff.c` leaves unwritten,
+  being empty, is no write), the header leading a version-0 insertion's first write or written alone first, and at the
+  stream's end the header alone when no window came. The editor sends each write as a `textdelta-chunk` and moves its
+  delta past a window only once every chunk is written; `get-file-revs` sends each as a string. `simple_insertion` and
+  `window_sections` are the writer's own again, and `window_sections` refuses as the codec does (`SvndiffError`).
+  Neither caller's bytes change: both wrote these writes already.
+- **Recorded.** g297's recording of `get-file-revs-svndiff0` against stock `svnserve` 1.15.0 (the Mac Studio, kiln
+  r88, 2026-11-19; the recorder's own session, its client's greeting without `svndiff1` and `accepts-svndiff2`): five
+  `get-file-revs` commands, 17 revisions, 14 deltas, all svndiff 0, 4 opening with a window of new data alone, 9 with
+  the header alone and an empty text's header alone. Its two transcripts are added with their sums, checked against
+  the recording's, and its line in `sessions.txt`; the run's other transcripts stay as main holds them. This settles
+  the recording A-616 continued (6) left owed: the two report sessions added to the report recorder for it, never
+  recorded, are taken out, since `svnserve`'s own svndiff 0 writes now hold the one writer through both callers.
+- **Tests.** `both_callers_of_the_one_delta_writer_send_svnserves_svndiff_0_writes` (`reads/tests.rs`): the session
+  replayed through `get-file-revs`, every delta string `svnserve`'s byte for byte; then each of its 14 deltas, its
+  windows decoded from `svnserve`'s strings, written through the report editor for the same client, its
+  `textdelta-chunk`s `svnserve`'s strings byte for byte; the shapes counted, so neither half can pass empty. The sums
+  test names the session. Run (macOS arm64, Mac Studio, 2026-11-19, over main at `545181b30`): `cargo test --locked -p
+  slates-svn --lib -- report::editor:: report::exchange:: reads:: serve::` 69 of 69, `cargo fmt -p slates-svn --
+  --check` clean; the crate has no integration target. The first build refused the shape count's closure returning its
+  argument's borrow, a lifetime a closure cannot name; it is a function now.
+- **Owed.** The Windows run and red-checks (main's).
 
 ### A-650 (part 1) — Mercurial over HTTP: HTTP version 1 answered as stock Mercurial 7.2 frames it, from the daemon's site on the shared edge, the answer's media type named as its reply begins (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Access" and piece 4; §4.17.2 "Transports" item 1; A-569, A-619, A-625, A-597, A-622; the stores it reads are A-662's)
 Applied in the same change to: §4.17.3 (its status, and piece 4's line), §4.17.2 (a status for the edge's change),

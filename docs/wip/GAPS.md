@@ -1001,8 +1001,8 @@
 > thirteen ways; its seventh slice (g297), `get-file-revs` (its 13 scripted commands, `svn blame` and `svn blame -g`
 > replayed whole; Windows x86_64, jupiter, 444 of 444; macOS arm64, Mac Studio, its `reads::`, `serve::` and
 > `report::editor::` tests 58 of 58, a file property taken away and a mainline and a merged revision of one number
-> among them), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s writes as read until the
-> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0; its eighth slice
+> among them), not yet red-checked; svndiff 0 is held to stock `svnserve` 1.15.0's own writes since A-616 continued
+> (7) recorded the `get-file-revs-svndiff0` session; its eighth slice
 > (g297), read access by A-606's rules (the `locked` repository's four scripted and seven stock sessions replayed
 > whole, the connection judging each read by its principal's rules; macOS arm64, Mac Studio, 54 of 54), not yet
 > red-checked. Owed
@@ -1130,10 +1130,14 @@
 > A-652's generator.
 > A-616 continued (6) (2026-11-19, g234, a bug g297 found): a version-0 delta's chunks as `svnserve` writes them, a
 > window of new data alone `send_simple_insertion_window`'s two with the stream's header in the first (the writer had
-> sent the header alone), from `svndiff.c`; red four ways and green, the lib 467 of 467, on jupiter (Windows x86_64).
-> Owed: two hand-made sessions from a client announcing neither svndiff version, recorded against `svnserve` 1.15.0
-> (the Mac Studio), and their drives held to its chunks byte for byte; the macOS run. Swept: only the reporter's
-> editor writes `textdelta-chunk`s.
+> sent the header alone), from `svndiff.c`; red four ways and green, the lib 467 of 467, on jupiter (Windows x86_64);
+> its owed recording settled and its macOS run done by A-616 continued (7). Swept: only the reporter's editor writes
+> `textdelta-chunk`s.
+> A-616 continued (7) (2026-11-19, g234, the duplicate g297 found): one writer of an svndiff stream's writes, the
+> report editor's `DeltaWrites`, for its `textdelta-chunk`s and `get-file-revs`' delta strings; both callers held byte
+> for byte to stock `svnserve` 1.15.0's `get-file-revs-svndiff0` session (g297's recording, kiln r88), its 14 deltas
+> through each (macOS arm64, Mac Studio, 69 of 69); the report recorder's two svndiff 0 sessions, never recorded,
+> taken out. Owed: the Windows run and red-checks (main's).
 > A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
 > command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
 > land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.

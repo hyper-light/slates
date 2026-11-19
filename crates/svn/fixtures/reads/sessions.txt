@@ -47,3 +47,4 @@ locked-reads: scripted, 29 commands
 locked-log: scripted, 8 commands
 locked-file-revs: scripted, 4 commands
 locked-file-revs-abort: scripted, 2 commands
+get-file-revs-svndiff0: scripted, 5 commands
