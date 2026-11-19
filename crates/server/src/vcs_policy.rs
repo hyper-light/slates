@@ -751,17 +751,24 @@ impl Compiled {
         };
         HgPattern::parse(namespace, &rule.pattern).ok()
       })?)),
-      VcsTool::Subversion => Self::Subversion(SvnPolicy::new(compiled_rules(rules, |rule| {
-        match rule.names {
-          slates_db::catalog::PolicyNames::Paths => PathPattern::parse(&rule.pattern).ok(),
-          _ => None,
-        }
-      })?)),
+      VcsTool::Subversion => {
+        Self::Subversion(SvnPolicy::new(compiled_rules(rules, |rule| {
+          match rule.names {
+            slates_db::catalog::PolicyNames::Paths => PathPattern::parse(&rule.pattern).ok(),
+            _ => None,
+          }
+        })?))
+      }
     })
   }
 
   /// The verdict on `principal`'s `right` on `name`, or none for a name of another tool.
-  pub(crate) fn verdict(&self, name: Name<'_>, principal: &Principal, right: Right) -> Option<Verdict> {
+  pub(crate) fn verdict(
+    &self,
+    name: Name<'_>,
+    principal: &Principal,
+    right: Right,
+  ) -> Option<Verdict> {
     match (self, name) {
       (Self::Git(policy), Name::Ref(name)) => Some(policy.verdict(name, principal, right)),
       (Self::Mercurial(policy), Name::Hg(namespace, name)) => {
@@ -1523,7 +1530,10 @@ mod tests {
   fn record_rule(
     names: slates_db::catalog::PolicyNames,
     pattern: &str,
-    (right, effect): (slates_db::catalog::PolicyRight, slates_db::catalog::PolicyEffect),
+    (right, effect): (
+      slates_db::catalog::PolicyRight,
+      slates_db::catalog::PolicyEffect,
+    ),
     who: slates_db::catalog::PolicyWho,
   ) -> slates_db::catalog::PolicyRule {
     slates_db::catalog::PolicyRule {
@@ -1608,7 +1618,10 @@ mod tests {
     );
     let (owner, stranger) = (principal(OWNER), principal(STRANGER));
     let main = "refs/heads/main";
-    assert_eq!(super::admit(&git, &owner, &[git_change(main, Right::Submit)]), Ok(()));
+    assert_eq!(
+      super::admit(&git, &owner, &[git_change(main, Right::Submit)]),
+      Ok(())
+    );
     assert_eq!(
       super::admit(&git, &owner, &[git_change(main, Right::Rewrite)]),
       Err(super::PushRefusal::Denied { index: 0, rule: 1 })
@@ -1626,7 +1639,10 @@ mod tests {
       super::admit(
         &git,
         &owner,
-        &[git_change(feature, Right::Submit), git_change(main, Right::Rewrite)]
+        &[
+          git_change(feature, Right::Submit),
+          git_change(main, Right::Rewrite)
+        ]
       ),
       Err(super::PushRefusal::Denied { index: 1, rule: 1 })
     );
