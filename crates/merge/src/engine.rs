@@ -4656,6 +4656,9 @@ mod replaced_node_tests;
 mod scan_tests;
 
 #[cfg(test)]
+mod node_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
 
