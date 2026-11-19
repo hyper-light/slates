@@ -13,6 +13,7 @@
 //! **Stricter than 7.2, on purpose.** A node in upper-case digits (7.2 reads either case, and writes lower), the tree
 //! flag `t` (tree manifests are not served, §4.17.3) and any other flag are refused.
 
+use core::cmp::Ordering;
 use core::slice::Split;
 
 use crate::Node;
@@ -145,6 +146,36 @@ pub fn decode(text: &[u8]) -> Result<Entries<'_>, Refusal> {
   Ok(Entries { lines: lines(text) })
 }
 
+/// The entry of `path` in a manifest's text that [`decode`] has checked, found by halving the text (A-680): its lines
+/// are sorted by path, so the line holding the middle byte of what is left says which half holds `path`, as 7.2's pure
+/// reader halves its lines (`manifest.py` `_lazymanifest.bsearch` \[C\], over an index of line starts it builds first;
+/// here a line's start is found from the byte, so nothing is built). `None` where the manifest names no such path. Over
+/// a text [`decode`] refuses, the answer is unspecified, and never a panic.
+pub fn find<'a>(text: &'a [u8], path: &[u8]) -> Option<Entry<'a>> {
+  let (mut low, mut high) = (0_usize, text.len());
+  while low < high {
+    let half = high.saturating_sub(low).checked_div(2).unwrap_or_default();
+    let middle = low.saturating_add(half);
+    let start = text
+      .get(..middle)?
+      .iter()
+      .rposition(is_newline)
+      .map_or(0, |newline| newline.saturating_add(1));
+    let end = text
+      .get(start..)?
+      .iter()
+      .position(is_newline)
+      .map_or(text.len(), |newline| start.saturating_add(newline));
+    let entry = parse(text.get(start..end)?)?;
+    match entry.path.cmp(path) {
+      Ordering::Equal => return Some(entry),
+      Ordering::Less => low = end.saturating_add(1),
+      Ordering::Greater => high = start,
+    }
+  }
+  None
+}
+
 /// One line's entry, or `None` for a line that is not one.
 fn parse(line: &[u8]) -> Option<Entry<'_>> {
   let nul = line.iter().position(|byte| *byte == NUL)?;
@@ -221,10 +252,42 @@ fn write(entries: &[Entry<'_>], out: &mut impl Out) {
 
 #[cfg(test)]
 mod tests {
-  use super::{EncodeRefusal, Entry, Flag, Refusal, decode, encode, encoded_len};
+  use super::{EncodeRefusal, Entry, Flag, Refusal, decode, encode, encoded_len, find};
   use proptest::prelude::*;
 
   const NODE_HEX: &[u8] = b"b6d7ec209a65c0afe68d5b7b14b68848981fd7fa";
+
+  /// The text of a manifest of `paths`, each with a node of its own index and every third executable.
+  fn manifest_of(paths: &[&'static [u8]]) -> (Vec<u8>, Vec<Entry<'static>>) {
+    let flags = [Flag::Regular, Flag::Link, Flag::Executable];
+    let entries: Vec<Entry<'static>> = paths
+      .iter()
+      .enumerate()
+      .map(|(index, path)| Entry {
+        path,
+        node: [u8::try_from(index).unwrap(); 20],
+        flag: flags[index % flags.len()],
+      })
+      .collect();
+    let mut text = Vec::new();
+    encode(&entries, &mut text).unwrap();
+    (text, entries)
+  }
+
+  /// A-680: do find every path of a manifest whose paths are each other's prefixes and neighbours (`a`, `a/b`, `ab`),
+  /// then paths it does not name: before its first, between two, after its last, a prefix of one, and empty. Expect
+  /// each named path's own entry, its node and flag, and nothing for the rest; an empty manifest names nothing.
+  #[test]
+  fn a_path_is_found_by_halving_and_an_absent_one_is_not() {
+    let (text, entries) = manifest_of(&[b"a", b"a/b", b"ab", b"b", b"dir/x", b"z"]);
+    for entry in &entries {
+      assert_eq!(find(&text, entry.path), Some(*entry), "{:?}", entry.path);
+    }
+    for absent in [&b""[..], b"0", b"a/", b"a/a", b"aa", b"c", b"dir", b"zz"] {
+      assert_eq!(find(&text, absent), None, "{absent:?}");
+    }
+    assert_eq!(find(b"", b"a"), None);
+  }
 
   /// A-588: do read a manifest of a regular file, a link and an executable, and write it back. Expect each entry with
   /// its node and flag, and the same bytes at the length `encoded_len` gave.
@@ -359,6 +422,43 @@ mod tests {
         let mut out = Vec::new();
         encode(&read, &mut out).unwrap();
         prop_assert_eq!(out, text);
+      }
+    }
+
+    /// A-680 (oracle): do look up generated paths, and every path, in manifests of generated paths, nodes and flags.
+    /// Expect what a walk of every line finds: the entry of a path the manifest names, nothing for one it does not.
+    #[test]
+    fn halving_finds_what_a_walk_of_every_line_finds(
+      generated in proptest::collection::btree_map(
+        "[a-c/._-]{1,4}",
+        (any::<[u8; 20]>(), 0_u8..3),
+        0..24,
+      ),
+      probes in proptest::collection::vec("[a-c/._-]{0,5}", 0..8),
+    ) {
+      let flags = [Flag::Regular, Flag::Executable, Flag::Link];
+      let entries: Vec<Entry<'_>> = generated.iter().map(|(path, (node, flag))| Entry {
+        path: path.as_bytes(),
+        node: *node,
+        flag: flags[usize::from(*flag)],
+      }).collect();
+      let mut text = Vec::new();
+      encode(&entries, &mut text).unwrap();
+      let walked = |path: &[u8]| decode(&text).unwrap().find(|entry| entry.path == path);
+      for path in generated.keys().map(String::as_str).chain(probes.iter().map(String::as_str)) {
+        prop_assert_eq!(find(&text, path.as_bytes()), walked(path.as_bytes()), "{:?}", path);
+      }
+    }
+
+    /// AC-HG.9, A-680: do look up a path in arbitrary bytes. Expect nothing, or an entry of exactly that path; never a
+    /// panic, never a loop.
+    #[test]
+    fn halving_arbitrary_bytes_finds_only_the_path_asked(
+      bytes in proptest::collection::vec(any::<u8>(), 0..96),
+      path in proptest::collection::vec(any::<u8>(), 0..6),
+    ) {
+      if let Some(entry) = find(&bytes, &path) {
+        prop_assert_eq!(entry.path, &path[..]);
       }
     }
 
