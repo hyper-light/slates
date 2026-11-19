@@ -776,7 +776,7 @@ struct Plan {
   trees: Vec<Vec<u8>>,
   commits: Vec<(Vec<u8>, u8, u8, bool)>,
   tags: Vec<u8>,
-  greens: Vec<Vec<u8>>,
+  greens: Vec<(u8, Vec<u8>, u8)>,
   wants: Vec<u8>,
   haves: Vec<u8>,
   shallow: Vec<u8>,
@@ -804,12 +804,19 @@ fn any_plan() -> impl Strategy<Value = Plan> {
         1..14,
       ),
       proptest::collection::vec(any::<u8>(), 0..4),
-      proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..6), 0..3),
+      proptest::collection::vec(
+        (
+          any::<u8>(),
+          proptest::collection::vec(any::<u8>(), 0..6),
+          any::<u8>(),
+        ),
+        1..4,
+      ),
     ),
     (
       proptest::collection::vec(any::<u8>(), 0..4),
       proptest::collection::vec(any::<u8>(), 0..5),
-      proptest::collection::vec(any::<u8>(), 0..3),
+      proptest::collection::vec(any::<u8>(), 1..3),
       any::<u8>(),
       any::<u8>(),
       any::<u8>(),
@@ -846,8 +853,21 @@ fn pick(options: &[u32], choice: u8) -> u32 {
   options[usize::from(choice) % options.len()]
 }
 
+/// The first-parent ancestry of `head`, oldest first, ending at `head`.
+fn first_parents(graph: &TestGraph, head: u32) -> Vec<u32> {
+  let mut chain = vec![head];
+  while let Some(parent) = graph.objects[at(*chain.last().unwrap())].parents.first() {
+    chain.push(*parent);
+  }
+  chain.reverse();
+  chain
+}
+
 /// The history and request a plan makes. Commits go oldest first, so a parent is always an earlier commit; dates rise
-/// but for the skewed ones; a green's heads are commits; the haves lean to version heads, so the one-round path is met.
+/// but for the skewed ones. A green's versions run along its head's first-parent ancestry, so they fast-forward, but
+/// for a commit from elsewhere put among them now and then, a rewrite. Wants lean to the greens' heads and haves to their
+/// versions' heads, so the one-round path is met as often as the walk; a want the store does not hold, a shallow client
+/// and a shallow line naming no commit each come in some cases, not most.
 fn build(plan: &Plan) -> (TestGraph, Asks) {
   let mut graph = TestGraph::default();
   let blobs: Vec<u32> = plan
@@ -896,58 +916,70 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
     tags.push(tag);
   }
   graph.tags = tags.clone();
-  let mut heads_all = Vec::new();
-  for chain in &plan.greens {
-    let heads: Vec<u32> = chain.iter().map(|choice| pick(&commits, *choice)).collect();
-    heads_all.extend(heads.iter().copied());
+  let mut current = Vec::new();
+  let mut versions = Vec::new();
+  for (head, picks, rewrite) in &plan.greens {
+    let head = pick(&commits, *head);
+    let chain = first_parents(&graph, head);
+    let mut positions: Vec<usize> = picks
+      .iter()
+      .map(|choice| usize::from(*choice) % chain.len())
+      .collect();
+    positions.push(chain.len() - 1);
+    positions.sort();
+    positions.dedup();
+    let mut heads: Vec<u32> = positions.iter().map(|index| chain[*index]).collect();
+    if rewrite % 4 == 0 && heads.len() >= 2 {
+      let place = usize::from(*rewrite / 4) % (heads.len() - 1);
+      heads.insert(place + 1, pick(&commits, rewrite.wrapping_add(7)));
+    }
+    versions.extend(heads.iter().copied());
+    current.push(head);
     graph.new_green(&heads);
-    graph.tips.push(*heads.last().unwrap());
+    graph.tips.push(head);
   }
   graph.tips.extend(tags.iter().copied());
   let everything: Vec<u32> = (0..u32::try_from(graph.objects.len()).unwrap()).collect();
-  let preferred: Vec<u32> = if heads_all.is_empty() {
-    commits.clone()
-  } else {
-    heads_all.clone()
-  };
   let mut asks = Asks::default();
   for (index, choice) in plan.wants.iter().enumerate() {
     let pool = if index % 2 == 0 {
-      &preferred
+      &current
     } else {
       &everything
     };
     asks.wants.push(graph.id(pick(pool, *choice)));
   }
-  if plan.flags & 1 != 0 && !asks.wants.is_empty() {
+  if plan.flags & 0x41 == 0x41 && !asks.wants.is_empty() {
     asks.wants.push(object_id(9999));
   }
   for (index, choice) in plan.haves.iter().enumerate() {
     let pool = if index % 3 == 2 {
       &everything
     } else {
-      &preferred
+      &versions
     };
     asks.haves.push(graph.id(pick(pool, *choice)));
   }
   if plan.flags & 2 != 0 {
     asks.haves.push(object_id(8888));
   }
-  for choice in &plan.shallow {
-    let pool = if plan.flags & 4 != 0 {
-      &everything
-    } else {
-      &commits
-    };
-    asks.shallow.push(graph.id(pick(pool, *choice)));
+  if plan.flags & 4 != 0 {
+    for choice in &plan.shallow {
+      let pool = if plan.flags & 0x80 != 0 {
+        &everything
+      } else {
+        &commits
+      };
+      asks.shallow.push(graph.id(pick(pool, *choice)));
+    }
   }
   asks.done = plan.flags & 8 != 0;
   asks.wait_for_done = plan.flags & 16 != 0;
   asks.include_tag = plan.flags & 32 != 0;
-  asks.deepen = match plan.deepen % 6 {
-    0 | 1 => None,
-    2 => Some(OwnedDeepen::Depth(u32::from(plan.depth % 4), false)),
-    3 => Some(OwnedDeepen::Depth(
+  asks.deepen = match plan.deepen % 8 {
+    0..=3 => None,
+    4 => Some(OwnedDeepen::Depth(u32::from(plan.depth % 4), false)),
+    5 => Some(OwnedDeepen::Depth(
       if plan.depth % 5 == 0 {
         INFINITE_DEPTH
       } else {
@@ -955,7 +987,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
       },
       true,
     )),
-    4 => Some(OwnedDeepen::Cut(Some(u64::from(plan.since)), vec![])),
+    6 => Some(OwnedDeepen::Cut(Some(u64::from(plan.since)), vec![])),
     _ => Some(OwnedDeepen::Cut(
       (plan.since % 2 == 0).then_some(u64::from(plan.since)),
       vec![graph.id(pick(&commits, plan.depth))],
