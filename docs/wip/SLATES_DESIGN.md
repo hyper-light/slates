@@ -46423,7 +46423,30 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
     version }` (the computing copy had accepted the increment at a version this green's record does not hold, so it was
     no copy of this green).
   - **Counter.** `Green::judged_again`: the units judged again because the green moved.
-- **Tests** (`crates/merge/src/engine/compute_tests.rs`, `copy_tests.rs`). EVIDENCE PENDING.
+- **Tests** (`crates/merge/src/engine/compute_tests.rs`, `copy_tests.rs`). Run on Windows x86_64, jupiter (kiln,
+  2026-11-19, debug, a fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`): the Mac
+  Studio was offline, so the macOS run is owed to main's lanes.
+  - The oracle: generated concurrent histories on three greens, one judging every work serially at its head as a
+    submit does, an owner taking by position the verdicts a copy computed, and the copy, rebuilt from the owner's chain
+    entries alone and lagging behind it. A work is computed at one head and held; other works land or commit meanwhile;
+    held verdicts commit in any order; works are sent again. Every verdict taken by position equals the serial one (the
+    head and what the chain records, the windows, a version accepted before), and both greens read the same after every
+    event. Census of one run of 256 histories: 393 commits at their position and 892 after the green moved, 320 of
+    those judging units again and 572 none; 569 accepts, 556 conflicts, 160 works sent again; 262 answered another kind
+    than computed.
+  - The counter: a work based at version 0 that edits a hot file (changed at each of versions 1 to 50) and 100 cold
+    files, computed at version 50 and taken at version 51, after one more change to the hot file. One unit of 102 is
+    judged again, through one delta; the serial verdict at 51 maps the hot file through all 51. Both accept, recording
+    the same.
+  - Beside them: a copy computed before the green moved is judged again (its fix brings the source as it stood at its
+    version); and the owner's three typed refusals, each leaving the green as it was.
+  - Red first at 5bd844b4d, with `at_head` a stub that took every unit as computed: the oracle (shrunk to a work taken
+    accepted where the serial verdict answered delete against modify), the counter (0 and 0 for 1 and 1) and the copies'
+    test (no fix) failed; the 8 others passed.
+  - Green on the tree merged with part 1 and main (2d1430f49): `cargo test --locked -p slates-merge --lib` 152 of 152
+    in 32 s; with rustfmt's layout and the census lines (58c8ab018), 152 of 152 in 35 s and `cargo fmt -p slates-merge
+    -- --check` clean. Part 1's oracle in the same run: 2,493 accepts, 319 works sent again, 1,338 conflicts, 2,997
+    works behind the head and 1,731 rebases of them.
 - **Owed.** The fleet's route: a green's holders rebuild every version already (§4.16 "Apply on holders"), so a holder
   computes and the owner takes by position; then the server's submit and push taking verdicts computed elsewhere. A
   rename's edits placed as a content edit's are (a rename unit judged again maps its edits from the work's base, at the
