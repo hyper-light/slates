@@ -502,6 +502,29 @@ pub enum Reply {
   Result(Service),
 }
 
+/// A reply's field as data: its name and its value, as `slates-http`'s reply writer takes them.
+pub type Field = (&'static [u8], &'static [u8]);
+
+/// The cache fields `http-backend` sends on every answer, in its order (`hdr_nocache`): what a site's own refusals
+/// (`401`, `403`, `404`, `503`) carry as well, since git's server answers every request with them.
+pub fn no_cache_fields() -> [Field; 3] {
+  [(b"", b""), (b"", b""), (b"", b"")]
+}
+
+/// The fields of a smart reply, as data, in `http-backend`'s order: its three cache fields, then the reply's content
+/// type. An edge that renders the reply's head itself (A-625) writes exactly what [`reply_head`] writes from them.
+pub fn reply_fields(reply: Reply) -> [Field; 4] {
+  let _ = reply;
+  [(b"", b""), (b"", b""), (b"", b""), (b"", b"")]
+}
+
+/// The status and fields of the reply to a refused route to a request of version `http`, as data: `Allow` with the
+/// route's methods first on a `405`, then `http-backend`'s cache fields. What [`refusal_reply`] writes, for an edge that
+/// renders the reply itself (A-625).
+pub fn refusal_parts(refused: RouteRefused, http: HttpVersion) -> (Status, Vec<Field>) {
+  (refused.status(http), Vec::new())
+}
+
 /// Writes a smart reply's head: `200`, the reply's content type, `http-backend`'s cache fields, and a chunked body to
 /// an HTTP/1.1 request (`Connection: close` too unless `keep_alive`), or one framed by the close to HTTP/1.0.
 pub fn reply_head(

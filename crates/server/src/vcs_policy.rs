@@ -860,6 +860,20 @@ pub(crate) fn admit(
   Ok(())
 }
 
+/// Whether `principal` may reach `record`'s repository for any of `rights` at all (A-625 part 2): its owner always, who
+/// holds every right a policy leaves unruled (A-575); another principal when some rule of the policy allows it one of
+/// them on some name. The gate an edge asks before it starts a service (§4.17.2 "Access": a repository the principal may
+/// not reach is `403`); each name is then judged by the rule that decides it, the service's own check ([`admit`] for a
+/// push). `Unreadable` for a policy its tool's matcher cannot read, never judged without the rule.
+pub(crate) fn reaches(
+  record: &RepositoryRecord,
+  principal: &Principal,
+  rights: &[Right],
+) -> Result<bool, PushRefusal> {
+  let _ = (record, principal, rights);
+  Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
   use proptest::prelude::*;
@@ -1561,6 +1575,8 @@ mod tests {
   const OWNER: u32 = 1;
   /// Shape: a principal other than the owner.
   const STRANGER: u32 = 2;
+  /// Shape: a principal no rule names.
+  const UNNAMED: u32 = 3;
 
   /// A repository record of `tool` owned by `OWNER`, its policy `rules` at version 1.
   fn record(
@@ -1753,6 +1769,59 @@ mod tests {
         &principal(OWNER),
         &[git_change("refs/heads/main", Right::Submit)]
       ),
+      Err(super::PushRefusal::Unreadable { rule: 0 })
+    );
+  }
+
+  /// A-625 part 2 (the edge's gate). Do: with rules letting one stranger read `refs/heads/feature/*` and denying everyone
+  /// the rewrite of `refs/heads/main`, ask whether the owner, that stranger and a principal no rule names may reach the
+  /// git repository to read and to push; then ask of a damaged record. Expect: the owner reaches it for every right; the
+  /// stranger to read alone (a rule allows it that), not to push (no rule allows it a push's right, and a deny admits no
+  /// one); the unnamed principal for neither; the damaged record refused `Unreadable`, never judged without its rule.
+  #[test]
+  fn an_edge_admits_a_principal_some_rule_lets_reach_the_repository() {
+    use slates_db::catalog::{PolicyEffect, PolicyNames, PolicyRight, PolicyWho, VcsTool};
+    let git = record(
+      VcsTool::Git,
+      vec![
+        record_rule(
+          PolicyNames::Refs,
+          "refs/heads/feature/*",
+          (PolicyRight::Read, PolicyEffect::Allow),
+          record_only(&[STRANGER]),
+        ),
+        record_rule(
+          PolicyNames::Refs,
+          "refs/heads/main",
+          (PolicyRight::Rewrite, PolicyEffect::Deny),
+          PolicyWho::Anyone,
+        ),
+      ],
+    );
+    let (read, push) = (
+      &[Right::Read][..],
+      &[Right::Submit, Right::Rewrite, Right::Delete][..],
+    );
+    let reach = |uid: u32| {
+      (
+        super::reaches(&git, &principal(uid), read),
+        super::reaches(&git, &principal(uid), push),
+      )
+    };
+    assert_eq!(reach(OWNER), (Ok(true), Ok(true)));
+    assert_eq!(reach(STRANGER), (Ok(true), Ok(false)));
+    assert_eq!(reach(UNNAMED), (Ok(false), Ok(false)));
+    let damaged = record(
+      VcsTool::Git,
+      vec![record_rule(
+        PolicyNames::Branches,
+        "main",
+        (PolicyRight::Read, PolicyEffect::Allow),
+        PolicyWho::Anyone,
+      )],
+    );
+    assert_eq!(
+      super::reaches(&damaged, &principal(OWNER), read),
       Err(super::PushRefusal::Unreadable { rule: 0 })
     );
   }
