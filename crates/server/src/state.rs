@@ -1453,6 +1453,8 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
       return Err(StateAccess::Fenced);
     }
     let result = f(state);
+    // A deadline the borrow set before the one the shard's keeper sleeps for wakes it, whichever path set it (A-536).
+    crate::deadlines::after_borrow(state);
     crate::retention::retain(state).map_err(StateAccess::Retention)?;
     Ok(result)
   })

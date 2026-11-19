@@ -11299,8 +11299,8 @@ fn guest_over_the_ring(
 /// Takes (or renews) the volume's write lease for `principal` (D-16): the holder renews at its
 /// epoch, an expired lease passes to the next epoch, and the term is the node's live failover delay (A-363, A-414).
 /// Another principal's lease is refused `LeaseHeld` while it is unexpired, and past its term too while its holder still
-/// holds a live write attachment of the volume ([`lease_kept_until`]): the reaper renews such a lease at its lapse
-/// ([`expire_leases`]), and a take between the lapse and that pass must not hand it to a second writer.
+/// holds a live write attachment of the volume ([`lease_kept_until`]): the shard's deadline keeper renews such a lease at
+/// its lapse ([`expire_leases`], A-536), and a take between the lapse and that pass must not hand it to a second writer.
 fn take_write_lease(
   state: &mut ShardState,
   record: &VolumeRecord,

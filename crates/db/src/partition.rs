@@ -258,6 +258,10 @@ pub struct Partition {
   leases_by_holder: Art<VolumeId>,
   lease_expiry: Wheel,
   lease_timers: BTreeMap<VolumeId, slates_rt::timer::TimerId>,
+  /// The earliest lease expiry entered in the wheel since the shard's deadline keeper last asked
+  /// ([`Partition::take_noted_lease`]): what tells the keeper a lease was set to lapse before the deadline it sleeps for
+  /// (A-536), whichever path recorded it (a take, a renewal, a replay).
+  lease_noted: Option<u64>,
   attachments: Slab<AttachmentRecord>,
   attachment_index: Art<Handle<AttachmentRecord>>,
   completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
@@ -402,6 +406,7 @@ impl Partition {
       leases_by_holder: Art::new(),
       lease_expiry: Wheel::new(caps.tick_ns, caps.timers, now_ns),
       lease_timers: BTreeMap::new(),
+      lease_noted: None,
       attachments: Slab::new(caps.segment_slots, caps.attachments),
       attachment_index: Art::new(),
       completions: BTreeMap::new(),
@@ -2392,7 +2397,24 @@ impl Partition {
         table: "lease timers",
       })?;
     self.lease_timers.insert(volume, timer);
+    // Noted as the wheel will report it, its tick at or after the expiry (`next_lease_expiry`), so the keeper's own arming
+    // for it reads as no earlier deadline.
+    let tick = self.lease_expiry.tick_ns().max(1);
+    let due = lease.expires_ns.div_ceil(tick).saturating_mul(tick);
+    self.lease_noted = Some(self.lease_noted.map_or(due, |noted| noted.min(due)));
     Ok(())
+  }
+
+  /// The earliest lease expiry entered since the last call, taken: the shard's keeper wakes for it when it sleeps for a
+  /// later deadline (A-536).
+  pub fn take_noted_lease(&mut self) -> Option<u64> {
+    self.lease_noted.take()
+  }
+
+  /// When the next lease lapses on the wheel, the deadline the shard's keeper sleeps until for leases (A-536): the
+  /// wheel's tick at or after the earliest expiry, so a pass at that moment finds the lease due.
+  pub fn next_lease_expiry(&mut self) -> Option<u64> {
+    self.lease_expiry.next_deadline_ns()
   }
 
   /// The volumes whose leases expired by `now_ns` (the caller records `LeaseReleased` for
