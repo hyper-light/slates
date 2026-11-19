@@ -11570,6 +11570,20 @@ The agent reads green's bytes for each window (a read of the named version), rew
 bytes, and calls `rebase` again. A rebased increment has a new identity; deduplication never
 blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 
+> **Status (2026-11-19, A-663: a rebased work restates each hard link where the node it names still stands).** The
+> restated journal is the work's own operations over the head, and a volume with real inodes replays it in order, as
+> does the deriver composing the work's next submit. A hard link names the node at its target when it is made
+> (A-646), so each link is restated just before the first restated operation that moves its node away from the name
+> it names it by or removes it there (a rename from it or over it, a removal), after the operation that made its
+> node; every other operation keeps the verdict's order. A link made where the head holds another link is restated
+> after that link's removal, since a volume refuses a held name. Before, every link was restated after the renames
+> and removals: `ln g l; mv f g` replayed put `l` on `f`'s file, a link to a node the work renamed or removed named an
+> emptied name, and a link made again over the head's was refused when the rebased work composed its next submit
+> (`LinkOverExisting`). Tests: `crates/merge/src/engine/restate_tests.rs`, each case red first, and an oracle over
+> generated works holding four readings equal (the work's own order over the head with real inodes, the green that
+> accepts it, the restated journal replayed, and the green that accepts that journal composed again) with a census
+> of every case (`docs/bugs/2026-11-19-a-rebased-work-restated-its-links-after-moving-their-nodes.md`).
+
 **Rebase off the owner (A-273): measured and rejected (A-528).** A work's rebase and its base reads at a named
 version are the green's owner's: a work's shard asks them of the owner's shard (A-247, A-388), which answers them on
 its one thread beside the verdicts. A-273 tried keeping a replica of the green on each shard that holds its works (the

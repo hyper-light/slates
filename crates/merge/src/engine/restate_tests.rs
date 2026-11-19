@@ -464,13 +464,26 @@ fn own_order(head: &Inodes, steps: &[Step]) -> Result<Seen, String> {
   Ok(volume.seen())
 }
 
-/// Holds what `reading` saw to what the work's own order gives.
-fn agree(reading: &str, seen: &Seen, own: &Seen) -> Result<(), String> {
-  if seen == own {
+/// One reading of a rebased work: what it is, and what a reader saw there or why nothing could be read.
+type Found<'a> = (&'a str, Result<Seen, String>);
+
+/// Holds every reading to what the work's own order gives, naming each that differs or could not be read, so a red
+/// run shows every reading a defect reaches.
+fn agree(own: &Seen, readings: [Found<'_>; 3]) -> Result<(), String> {
+  let differing: Vec<String> = readings
+    .into_iter()
+    .filter_map(|(reading, seen)| match seen {
+      Ok(seen) if seen == *own => None,
+      Ok(seen) => Some(format!("{reading} reads {seen:?}")),
+      Err(error) => Some(format!("{reading}: {error}")),
+    })
+    .collect();
+  if differing.is_empty() {
     return Ok(());
   }
   Err(format!(
-    "{reading} reads {seen:?}, the work's own order {own:?}"
+    "{}; the work's own order reads {own:?}",
+    differing.join("; ")
   ))
 }
 
@@ -506,16 +519,25 @@ fn restate(steps: &[Step]) -> Result<Restated, String> {
       },
       Outcome::Accepted { .. },
     ) => {
-      agree("the green that accepts the work", &seen_in(&green), &own)?;
       let restated = Restatement {
         version,
         changed,
         journal,
       };
-      let replayed = replay(&head, &restated)?.seen();
-      agree("the restated journal replayed", &replayed, &own)?;
-      let again = resubmitted(&head, &restated)?;
-      agree("the green that accepts it composed again", &again, &own)?;
+      agree(
+        &own,
+        [
+          ("the green that accepts the work", Ok(seen_in(&green))),
+          (
+            "the restated journal replayed",
+            replay(&head, &restated).map(|volume| volume.seen()),
+          ),
+          (
+            "the green that accepts it composed again",
+            resubmitted(&head, &restated),
+          ),
+        ],
+      )?;
       Ok(Restated::Agreed(own))
     }
     (Rebased::Conflict { .. }, Outcome::Conflict { .. }) => Ok(Restated::Conflict),
