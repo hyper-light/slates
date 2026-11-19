@@ -584,7 +584,6 @@ impl ContentStore {
     names: &[ContentId],
     payload: &[u8],
   ) -> Result<Stored, ContentRefused> {
-    return Err(ContentRefused::NotHeld);
     let bytes = encode_derived(names, payload).ok_or(ContentRefused::CountExhausted)?;
     self.within_window(bytes.len())?;
     let identity = ContentId::named(Form::Derived, &bytes);

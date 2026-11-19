@@ -228,7 +228,6 @@ impl<S> PathMap<S> {
     store: &mut ContentStore,
     files: &BTreeMap<Vec<u8>, Entry>,
   ) -> Result<ContentId, PathsRefused> {
-    return Err(PathsRefused::NoChange);
     let mut work = Work::new(store, self.window);
     let made = work.build(files);
     self.settle(work, made)
@@ -242,7 +241,6 @@ impl<S> PathMap<S> {
     parent: Option<ContentId>,
     change: &Change,
   ) -> Result<ContentId, PathsRefused> {
-    return Err(PathsRefused::NoChange);
     let mut work = Work::new(store, self.window);
     let made = work.apply(parent, change);
     self.settle(work, made)

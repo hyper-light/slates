@@ -471,9 +471,6 @@ impl<V: Copy + Ord + Debug> Fill<V> {
     T: DerivedType,
     T::Source: Graph<Version = V>,
   {
-    return Err(DerivedRefused::Corrupt {
-      version: self.target,
-    });
     if let Some(root) = self.done {
       return Ok(Progress::Done(root));
     }
