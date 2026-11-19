@@ -2211,26 +2211,41 @@
 > clippy. Bug record:
 > `docs/bugs/2026-11-19-a-metadata-change-or-a-links-rename-based-before-its-node-was-replaced-landed-on-the-new-one.md`.
 
-> **Four siblings of A-631's verdicts, probed and open (2026-11-19, A-631's sweep, g267; §4.16 "The verdict": "delete
-> against modify in either direction"; D-27).** Probed on the Mac Studio with a scratch test, never committed, against
-> `crates/merge` at A-631 merged with main (kiln r810):
-> 1. A symbolic link or a hard link renamed over an unchanged regular file is accepted, even by a work based at the
->    head (`Accepted { version: 1 }`), and the green then holds both the file (4 bytes) and the link at one path.
->    `merge_rename` emits the link at the destination and the source's removal, but no removal of the file it replaces.
->    Two nodes at one path is a broken green, not only a verdict question.
-> 2. A directory's removal takes no base (`merge_rmdir`), so one based before the directory was removed and made again
->    removes the new one (`Accepted { version: 3 }`).
-> 3. A file's unlink or a directory's removal based before the head changed the node's mode, and a file's unlink based
->    before the head set an attribute, are each accepted. `merge_unlink` reads a mode or an attribute change only for an
->    IPC node, and `merge_rmdir` reads neither. A-631 refuses the other direction, a metadata change based before a
->    removal.
-> 4. A hard link made to a target removed and made again after the work's base is accepted and names the new file
->    (13 bytes); `merge_hardlink` judges only the link's own path.
+> **Four siblings of A-631's verdicts: fixed (2026-11-19, A-643, g267; found by A-631's sweep; §4.16 "The verdict":
+> "delete against modify in either direction"; D-27; POSIX `rename`).** Each probed on r810, then a failing test:
+> 1. A symbolic link or a hard link renamed over an unchanged regular file now replaces it: the file is removed and its
+>    removal recorded, unless the increment removes it itself, and the link stands alone at the path. Before, the green
+>    held both at one path. A hard link renamed over the file it names now changes nothing, as POSIX `rename` does;
+>    the replacement alone would have removed the file's bytes and left the link naming itself (red on r880).
+> 2. A directory's removal is judged against its base (`changed_after`), so one made again since is not removed.
+> 3. An unlink of a file and a directory's removal are judged against a change to the node in any dimension, so a mode
+>    or attribute change after the base is delete against modify, never lost with the node.
+> 4. A hard link to a file removed after the base is `DeleteModify` on the link, unless the work makes the target
+>    itself.
 >
-> A fifth, probed before the merge, was closed by A-618 meanwhile: a removed node's mode and attributes outlived it and
-> passed to the next node made at its path; on r810 neither is answered after a removal or a remake. Owed: a failing
-> test of each of the four, then the design's rule: for 1, the replaced file removed and recorded as a file's rename
-> over a file is; for 2 and 3, `DeleteModify`; for 4, `DeleteModify` on the target.
+> Tests (`crates/merge/src/engine/replaced_node_tests.rs`): each case, the same-file rename, a rotation, and a
+> generated oracle of the whole state (a model of what stands at every path at every version, compared after every
+> event, with a census of nine answers). Red with A-643's engine change reversed (r880: 6 of 7 failed; the rotation
+> passes either way), and with the same-file rule alone reversed (both its tests failed). Green on the Mac Studio
+> (r880: `slates-merge --lib` 99 of 99, fmt clean). Owed to main: the merge crate's integration suites and clippy.
+> Bug record: `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
+
+> **Three siblings of A-643's verdicts, open (2026-11-19, A-643's sweep, g267; §4.16 "The verdict"; POSIX
+> `rename`).**
+> 1. A rename over a symbolic link, a hard link or an IPC node is refused `TypeChanged` even with no concurrent change:
+>    `merge_rename` reads `occupied_by_nonfile` before any base. POSIX `rename` replaces any non-directory destination,
+>    and does nothing for two links to one file, so `mv file link`, `mv link link`, and a hard link renamed over
+>    another link to its own file can never land. These are false conflicts, not broken states. Found by reading.
+> 2. A hard link names its target by path. The head's removal of a file that hard links name is accepted (only an IPC
+>    node's removal reads the links naming it), and the links then name a path with nothing, or the file made there
+>    next. POSIX keeps a removed file's bytes under its remaining names. A-643's oracle generates this and follows the
+>    engine: its remake of `TARGET` is accepted while `HARDLINK` names it. A question of the model, for its owner.
+> 3. `merge_unlink`'s IPC-node branch scans every attribute change and every hard link for each unlink
+>    (`xattr_changed.iter().any`, `hardlinks.values().any`): O(changes) per op on the verdict's path. `changed_after`
+>    and `links_to` answer both by lookup. Found by reading.
+>
+> Owed: a failing test of each, then the rule: for 1, the destination replaced as A-643 replaces a file, and two links
+> to one file a no-op; for 2, the model's decision; for 3, the lookups, with a counter test.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found
 > by A-621's reading; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` and `take_applied` found a
