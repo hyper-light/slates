@@ -34,10 +34,12 @@ slates-land = { workspace = true }
 slates-merge = { workspace = true }
 slates-bridge-core = { workspace = true }
 # The version-control servers' HTTP edge (§4.17.2 "Transports" item 1, A-625 part 2; `crate::vcs_http`): HTTP/1.1's
-# request codec (A-595), the edge's engine over it (A-625 part 1), and git's routes and replies (A-595).
+# request codec (A-595), the edge's engine over it (A-625 part 1), git's routes and replies (A-595), and Mercurial's
+# HTTP version 1 answers (A-650).
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
+slates-hg = { workspace = true }
 blake3 = { workspace = true }
 rustls = { workspace = true }
 
