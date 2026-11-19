@@ -2689,6 +2689,10 @@ impl Volume {
         previous: snap.previous.map(to_snapshot_id),
         next: snap.next.map(to_snapshot_id),
         referenced_bytes: snap.referenced_bytes,
+        // Its tree's entries, each imaged once in full or shared (`capture_snapshot_tree`), as the head's are counted
+        // (A-541): what a clone of it made after the restart starts counting from.
+        live_inodes: u64::try_from(snap.inodes.len().saturating_add(snap.shared.len()))
+          .unwrap_or(u64::MAX),
         seq: snap.seq,
         identity: None,
         orphans,
