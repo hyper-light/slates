@@ -198,9 +198,7 @@ impl HostError {
       | Self::NotDirectory
       | Self::NotFile
       | Self::StaleHandle
-      | Self::Pending(_) => {
-        None
-      }
+      | Self::Pending(_) => None,
     }
   }
 }
