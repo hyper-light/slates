@@ -1059,8 +1059,9 @@
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
 > - **Kiln's runners as members: the network each needs (written 2026-11-18, `docs/deploy.md` "What a node's firewall
 >   must let through").** Each runner's node takes inbound UDP at its manifest's base port (probes) and the next
->   (records) from the other runners; TCP at the base port only for the network export, which kiln does not use (its
->   agents mount their volumes on their own runner). As the supervisor reported on 2026-11-18, adacachy's `ufw` drops
+>   (records) from the other runners; TCP at the base port only for the network export, which kiln's Kubernetes
+>   engine uses for a pod's volume from its home runner (its W10, designed 2026-11-19; A-521 the library's verb), while
+>   a runner's own agents mount their volumes on that runner. As the supervisor reported on 2026-11-18, adacachy's `ufw` drops
 >   inbound UDP but kiln's own ports and adacachy2's passes LAN UDP 17202 and 17212 alone, so neither passes a slates
 >   block yet: each needs `ufw allow proto udp from <the LAN> to any port <base>:<base+1>` once, an operator's (root)
 >   step slates never takes (R10). The Macs' firewalls were not checked.
@@ -1235,6 +1236,20 @@
 >   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
 >   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
 >   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+> - **a volume exported to one client, built 2026-11-19 (A-521, `CONTRACT` = 50; kiln's Kubernetes engine, kiln goal
+>   28e73c34's part 01a1f124, its `docs/agentic.md` W10):** §4.6's export was the command line's (`slates export`) and
+>   the raw client's alone, so a host that drives slates through the library alone (kiln) could not serve a pod's volume
+>   over its node's export. `Instance::export(volume, uid, &ExportOptions)` and the seam's verb attach the volume bound
+>   to the client's Unix identity (A-115), read-only or beneath a directory as asked, and answer an `Exported`: the
+>   export's attachment, whose detach ends the capability, and the path the capability authorizes, which the client's
+>   mount names; its `Debug` never shows the token; an answer without a capability is a protocol fault. The simulator
+>   answers a path of its own per export and ends it at its detach or with its volume. Unit tests: `export::tests` (the
+>   path, its redaction, the protocol fault) and `sim::tests` (one capability per client, ended at its detach and with
+>   its volume; the stranger and a full table refused typed). By use over a real daemon: the conformance suite's
+>   stranger and `expect_an_export_is_one_clients_and_ends_at_its_detach` (`crates/api/tests/api.rs`), filed for main.
+>   Owed: a report of the network export's address (today the deployer's own plan: the probe plane's address, over
+>   TCP); and `slates export` over this verb, since it prints the loopback port beside the path, which a
+>   PersistentVolume must not name;
 > - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
 >   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
 >   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
@@ -8194,9 +8209,9 @@ entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-ent
   restart set both), so its namespace dimension is unbounded until a restart.
 - Open: a resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume
   was made with (`verbs::resize`).
-- Open: recovery counts a whiteout as a live entry (`rebuild_entries` re-inserts one through `dir_insert`, which counts
-  it; the live count and `DirNode::live_len` never do), so a restarted overlay's entry count and its allowance's floor
-  at the restart are raised by its whiteouts. Found by reading, not tested.
+- Fixed since by A-572 (below), found by reading: recovery counted a whiteout as a live entry (`rebuild_entries`
+  re-inserted one through `dir_insert`, which counted it; the live count and `DirNode::live_len` never do), so a
+  restarted overlay's entry count and its allowance's floor at the restart were raised by its whiteouts.
 
 **Fixed 2026-11-19 (A-561, goal 85, g234): a restart refused a clone holding its own snapshot.** Every clone that had
 taken a snapshot while it still shared a file with its origin was left unrecovered at a restart (`ImageRefused`), and
@@ -8207,6 +8222,16 @@ head's rebuilt table, as an origin-shared one through the origin's; the image is
 the fix rebuild too. Measured before, on the Mac Studio: 32 of a matrix's 48 cases refused, every one whose clone held a
 snapshot of its own (`docs/bugs/2026-11-19-a-restart-refused-a-clone-holding-its-own-snapshot.md`). **Owed (main's):**
 the recovery oracle and the server's recovery suite over a clone with a snapshot of its own, which no suite restarted.
+
+**A-572 (goal 85, g234): the namespace dimension's three siblings from A-549's sweep, one commit each, worst first**
+(`docs/bugs/2026-11-19-a-restart-counted-whiteouts-as-live-entries.md`).
+- Fixed 2026-11-19: a restart counted every whiteout in a rebuilt directory as a live entry, so an overlay counted one
+  entry too many per whiteout after each restart, and the restart floored its entry allowance at that count. A
+  placement now counts, and is admitted, only when it names a child (`Volume::dir_place`, `dir_insert`), as
+  `dir_remove` and `DirNode::live_len` already kept it. Measured before on the Mac Studio: an overlay with three
+  whiteouts counted 3 entries live and 6 after a restart.
+- Open, next in this piece: a clone is admitted with no entry allowance; a resize leaves the entry allowance at the size
+  the volume was made with.
 
 ## 8d. Phase 2 record (2026-09-05)
 
