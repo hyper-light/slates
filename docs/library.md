@@ -159,13 +159,14 @@ where you must decide; a moved contract then fails your build at the place to up
 
 A host whose rules reach other products only through a trait with a simulator (Hex's) holds
 `slates_api::Volumes`: provision, snapshot, destroy a snapshot, destroy, list, serve to a Shards VMM,
-mount, unmount, bind a mount into a container, and detach, each with the `Instance` verb's own
-signature. `Instance` implements it, and so does `SimVolumes::new(most)`, an in-memory stand-in for
+mount, unmount, bind a mount into a container, export to one client, and detach, each with the
+`Instance` verb's own signature. `Instance` implements it, and so does `SimVolumes::new(most)`, an in-memory stand-in for
 tests with no daemon: it answers the same outcomes and typed errors (names unique, clones pinning
 snapshots, works only over greens), holds at most `most` volumes and `most` attachments, serves no
 bytes (a stream it hands out is a real end nothing answers until detached), mounts nothing (a mount is
 a record) and binds only the mounts it recorded, judged as the daemon judges the kernel's table (a
-bind is a record too, ending with its mount). The conformance suite in `crates/api/tests/api.rs`
+bind is a record too, ending with its mount; so is an export, a path of its own for each client,
+ending at its detach or with its volume). The conformance suite in `crates/api/tests/api.rs`
 (`the_seam_conforms`) runs over both.
 
 ## What is built (2026-11-18)
@@ -220,6 +221,15 @@ bind is a record too, ending with its mount). The conformance suite in `crates/a
   working or root directories are on the mount, read from `/proc` without touching it, and how many could not be read;
   on macOS none are read (`HoldersUnread::NoReader`), since every libproc answer stats the file, which a `hard` NFS
   mount whose daemon has gone waits on without bound.
+  `export(volume, uid, &ExportOptions)` (A-521) exports a volume to one client on another machine, a pod
+  above all: an attachment bound to the client's Unix identity `uid` (A-115: that uid is served, and
+  every other caller, root included, is shown attributes and nothing else) and the path its capability
+  authorizes (`Exported`: `attachment` and `path`, `/<name>@<attachment>.<token>`), which the client's
+  mount names, a PersistentVolume's `nfs.path` that kubelet mounts over the node's RPC-with-TLS export
+  (`mountOptions: [nfsvers=4.2, xprtsec=mtls, port=<the node's export port>, nosuid, nodev]`; the port
+  is the node's probe plane's, as its fleet manifest plans it). `ExportOptions` asks for it read-only or
+  beneath a directory. Give each client its own export; `detach(attachment)` ends the capability, and
+  its path reaches nothing after. The path is a secret: `Exported`'s `Debug` leaves the token out.
 - Landing: `land(&request, signature)` under the caller's mode; `plan_landing(&request)` presents
   without writing, for a reviewer, and states what a signer signs; `approval_entries(&approval)` lists what an approval writes, path
   by path (each file's BLAKE3 and length, a rename's origin, a symlink's target, the conflict found at
@@ -340,3 +350,5 @@ the goal's clauses:
    observation.
 3. Rootless podman's profile (held since A-520's third piece) by use through the library: its live
    check, which confirms the container's other ids are refused and every hard link's name is served.
+4. The network export's address in a report (A-521): a host reads it from its node's plan today (the
+   probe plane's address, over TCP), and `slates export` prints the loopback port beside the path.

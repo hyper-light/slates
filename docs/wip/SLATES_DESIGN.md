@@ -2407,6 +2407,15 @@ Build order: the server side of RFC 9289 on the NFS edge, with its oracle; the n
 the token root; the KIND workload pod with an `nfs` PersistentVolume and `tlshd` in the node image, on the CI
 Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 
+> **Status (2026-11-19, A-521): the export is a verb of the library.** `Instance::export(volume, uid, &ExportOptions)`
+> and the seam's `export` attach the volume bound to the client's Unix identity (A-115), read-only or beneath a
+> directory as asked, and answer an `Exported`: the export's attachment, whose detach ends its capability, and the path
+> that capability authorizes, `/<name>@<attachment>.<token>`, which the client's mount names (a PersistentVolume's
+> `nfs.path`). One export per client, never one path shared. Until then the export was the command line's `slates
+> export` and the raw client's alone, so a host that drives slates through the library alone (kiln's Kubernetes engine,
+> its `docs/agentic.md` W10) could not serve a pod's volume. The network export's own address is the node's plan (the
+> probe plane's address, over TCP), which its deployer wrote; no report names it yet (owed, GAPS).
+
 > **Status (2026-09-30, A-48).** The base plane's witnesses, their disk homes, and the fingerprints behind
 > whiteouts and redirects are versioned by epoch like the tree and the inode table: a snapshot, and a
 > clone made from one, reads them as the snapshot froze them. A write overwrites a version no live
@@ -2864,16 +2873,23 @@ kernel, and its successor's journal starts empty. The successor knows where such
   write in the write log (A-63);
 - a kernel holds state older than a change only for an inode it looked up before the change, and the change's
   publication recorded that reference (A-61);
-- a logged write is in no publication, so the write-log replay notes the inodes it wrote.
+- a logged write is in no publication, so the write-log replay notes the inodes it wrote;
+- but a lookup made after the last publication is in no image, and such a kernel can hold what the successor never had
+  or holds otherwise: bytes a mutation showed before the publication the death lost, and the pages of a base file an
+  outsider wrote while no daemon ran (A-573). The successor cannot tell which inodes those are.
 
 So a restored mount's rounds open with a takeover round. First comes `FUSE_NOTIFY_INC_EPOCH`, to a kernel that offered
 FUSE 7.44 or later: every cached name is looked up again at its next use, which reaches the names no inode set can.
-Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode its owner's restored references and
-the replay name. A directory's invalidation also drops its cached listing, which kernels before Linux 7.2 keep past an
-epoch bump. The set is as large as what the kernel had looked up, so the round is sent in slices of half the shard's
-live step quantum, walked in inode order from where the last slice ended. The mount turns at once while a slice is owed
-and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44 cannot drop a
-renamed-away name this way, which is counted (`fuse.epoch_unsupported`).
+Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode of the head, each costing the kernel
+nothing for an inode it never cached; a mount of a pinned view, whose version takes no head change, is sent its owner's
+restored references and the replay's inodes. A directory's invalidation also drops its cached listing, which kernels
+before Linux 7.2 keep past an epoch bump. The set is as large as the volume, so the round is sent in slices of half the
+shard's live step quantum, walked in the inode table's order from where the last slice ended. The mount turns at once
+while a slice is owed and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44
+cannot drop a renamed-away name this way, which is counted (`fuse.epoch_unsupported`). A number the dead daemon issued
+after its last publication is in no image and no head: the successor refuses it, never serving it, but a descriptor
+opened before the death keeps its cached pages until a publication records the counter such numbers were issued below
+(GAPS).
 
 **Every round a mount builds on its serving thread is sliced** (A-562). The journal gather walks a backlog of records,
 the overrun round every node and name the kernel holds, and the takeover round its inode set; each grows with what
@@ -9267,6 +9283,11 @@ it builds against the contract and adds to it rather than around it.
 > code; the wire's `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
 > `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone. An `OsCode` is
 > put in the OS's words only in its own numbering.
+> **`CONTRACT` = 50 (A-521):** a volume exported to one client is a verb of the contract: `Instance::export(volume,
+> uid, &ExportOptions)` and the seam's `export` answer an `Exported`, the export's attachment (its detach ends the
+> capability) and the path the capability authorizes, bound to the client's uid (A-115), its `Debug` showing the path
+> without its token. Until then §4.6's export was the command line's and the raw client's alone, and kiln, which
+> reaches slates only through this library, could not serve a pod's volume over its node's export.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -10067,7 +10088,10 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > is never held back), and a successor that adopts it, or the creation head, refuses the landing by kind; a move waits
 > until the head it hands over carries its record, so a refused carry holds the move back until it is refused
 > `Unplaced`, as before. A clone never sealed before its owner's loss reaches its successor as an empty tree, the
-> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost).
+> capture's bytes included, and its landing is refused by kind (A-544's entry says what is lost). **A live-shipped one
+> moves with its mark too (A-565):** its new owner rebuilds it from its live log, which the move made durable at
+> exactly the head it hands over, so the rebuild is that head and is marked as a seal's is; a takeover after an
+> owner's loss still marks nothing it rebuilt from a log, which may have run past the seal its head names.
 
 **An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
 of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
@@ -12464,6 +12488,14 @@ and export by landing).
 > node-exclusive path changed in any dimension after the base, a move's source among them (item 3, rules 1 and 2).
 > Owed, its second half: `Copy`, sharing the source by reference through the persistent radix tree of A-534
 > (`crates/merge/src/ptrie.rs`, its `subtree` and `graft`), with the copied keys' history beginning at the copy.
+>
+> **Status (2026-11-19, A-553).** Built: the Subversion index (`slates-svn`'s `index`, piece 4, item 2): node rows with
+> FSFS's node, copy and copy-root identities, predecessors and counts, texts, property lists and mergeinfo counts;
+> history and shape lists per path; revision rows; all computed from each revision's changed-path rows by FSFS's own
+> operations, every inconsistent record refused, typed, with nothing changed. Its oracle, a naive filesystem applying
+> FSFS's operations to whole trees, equals it on generated histories, and equals itself replayed in random drive
+> orders. Owed with the object store (§4.17.1 shared piece 3): the rows held as content tables with a mutable tail, and
+> the learned fold (item 12); with the server (piece 7): one large revision applied in slices under the shard's budget.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12512,18 +12544,34 @@ immutable sorted tables that are content plus a mutable tail, and every row is a
 their commit records (item 3), so replicas (A-273) and holders (§4.16 "Apply on holders") compute it and never receive
 it.
 - *Revisions:* per revision, its changed-path rows sorted by path, and its transaction's name.
-- *Nodes:* per path and created revision: kind; text identity (BLAKE3, the green's content) with the MD5 and SHA-1
-  clients check; size; property-list identity; predecessor and its count; copy source and copy root; the node's identity
-  (where it was born) and its copy identity, assigned by FSFS's rules (notes §5: a creation takes its parent's copy
-  identity, a copy gets a fresh one, a change made through a copied parent is a lazy copy with a fresh one), so the
-  three answers of `svn_fs_node_relation` (unchanged, common ancestor, unrelated) come out as FSFS's; and whether the
-  node has `svn:mergeinfo`, with the count of such nodes beneath a directory (FSFS's `minfo-here` and `minfo-cnt`).
+- *Nodes:* per node-revision, by its created path and revision: kind; text identity (BLAKE3, the green's content) with
+  the MD5 and SHA-1 clients check; size; property-list identity; predecessor and its count; copy source and copy root;
+  the node's identity (where it was born) and its copy identity, assigned by FSFS's rules (notes §5; `structure`,
+  "Copy-IDs and copy roots"; `tree.c` `get_copy_inheritance`): a creation takes its parent's copy identity and copy
+  root, a copy gets a fresh copy identity and is its own copy root, a change through the node's own created path keeps
+  its copy identity, a change of a never-copied node through a copied directory (a lazy copy) takes that directory's,
+  and a change of a copied node through another path (a soft copy) takes a fresh one; so the three answers of
+  `svn_fs_node_relation` (unchanged, common ancestor, unrelated) come out as FSFS's; and whether the node has
+  `svn:mergeinfo`, with the count of such nodes at and beneath a directory (FSFS's `minfo-here` and `minfo-cnt`).
 - *History:* per path, the revisions at which a node-revision was created there, deletions included. FSFS makes a new
-  node-revision of every directory above a changed node (notes §5, "bubble-up"), so a directory's list holds every
+  node-revision of every directory above a changed node (notes §5, "bubble-up"), and of the root in every revision,
+  even one that changes nothing (`transaction.c` `create_new_txn_noderev_from_rev`), so a directory's list holds every
   revision that changed anything beneath it. The created revision of a path at revision R, which the out-of-date test,
   `stat` and `svn:entry:committed-rev` all read, is one search in that list: its last entry at or before R, a deletion
-  meaning absent. §4.16's `last_changed` is a file's own last change; a directory's last change in Subversion's sense
-  is its subtree's, which this list keeps.
+  meaning absent, unless a directory above the path was added, copied to, replaced or deleted after that entry (each
+  path keeps a list of those changes too). Then the latest such change decides: a deletion, or an addition without
+  history, leaves nothing at the path, and a copy sends the question to the same place beneath the copy's source, in the
+  source's revision. So a path beneath a branch answers its trunk node-revision until it changes on the branch, as FSFS
+  shares it. §4.16's `last_changed` is a file's own last change; a directory's last change in Subversion's sense is its
+  subtree's, which this list keeps.
+- *How a revision's rows are applied:* in path order, parents first, against revision N - 1, each as FSFS applies the
+  editor call it records (the path's directories opened and made mutable from the root down, then the entry made,
+  copied, deleted or changed). That is what FSFS's commit leaves for every commit it accepts: `merge()` refuses a
+  directory both sides changed unless both kept its node and copy identities ("not a direct modification"), and points
+  its predecessor at the newer revision's (`svn_fs_fs__dag_update_ancestry`). FSFS makes nodes mutable in its drive's
+  order, and a stock client sends file texts last; the oracle replays every generated revision in random drive orders
+  and finds every identity, copy root and predecessor equal to path order's, the decisions where order could matter
+  among them (A-553).
 
 *3. A commit is a work, and its verdict is FSFS's commit rule.* (§4.17.1 "A push is a work" items 1, 2 and 5, made exact
 for Subversion.)
@@ -12837,7 +12885,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (owed, on A-534's
    persistent radix tree: `graft` of the source's `subtree` at the destination; with §4.17.1's pieces 1 and 4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
-   revisions, histories, relations and mergeinfo counts.
+   revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
+   object store's, §4.17.1 shared piece 3).
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
    must give the same accept or conflict, and the same conflicting path.
 6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format), `setrevprop`, `setlog`, `info`,
@@ -36885,7 +36934,6 @@ Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-
   red once with the old in-place adoption restored (kiln r29): landing at call 4, the open handle read the outsider's
   file and the name kept its number (`replaced` 1, so the path was reached).
 
-
 ### A-520, third piece — Rootless podman holds its tested profile on its own Linux host, so a host runs containers under it (2026-11-19, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9; AUD-29-67; `CONTRACT` = 48)
 Applied in the same change to: §4.6 (A-9's OCI record: the profiles held), §4.12's contract log (`CONTRACT` = 48), GAPS
 (the library's entry), `docs/library.md` (the profiles that hold evidence; what is owed), `docs/wip/oci-handoff.md`
@@ -37101,7 +37149,7 @@ and:
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
   - A clone is admitted with no entry allowance.
   - A resize leaves the entry allowance at the size the volume was made with.
-  - Recovery counts a whiteout as a live entry (found by reading).
+  - Recovery counts a whiteout as a live entry (found by reading; fixed since by A-572).
 
 ### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
 Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
@@ -37741,6 +37789,227 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
   `host.rs` and the server's `winfsp.rs`, and the drive tests
   `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` and
   `an_exact_drive_keeps_two_spellings_two_files` (`crates/cli/tests/winfsp_semantics.rs`).
+
+### A-573 — A takeover names every inode of the head to a mount of the head: what a kernel looked up after the last publication never outlives a death (2026-11-19, g232; UI goal 85, B10; §4.6 "A mount taken over by a restarted daemon"; A-61, A-63, A-151, A-158)
+Applied in the same change to: §4.6 (the takeover paragraph), GAPS (A-158's siblings "an effect served before its
+publication" and "an outsider's change beneath a base during a takeover's gap"), the bug record
+`docs/bugs/2026-11-19-a-takeover-left-cached-what-a-kernel-looked-up-after-the-last-publication.md`,
+`crates/vfs/src/{trie,volume,base}.rs`, `crates/bridge-core/src/{volume_bridge,lib}.rs`.
+- **What was there.** A-158's takeover round invalidated the root and every inode the mount's owner's restored
+  references and the write-log replay named, on the premise that a kernel holds state older than a change only for an
+  inode it looked up before the change, which the change's publication recorded (A-61). A lookup made after the last
+  publication is in no image, and two kinds of kernel state fell outside the premise: bytes a mutation showed before
+  the publication the death lost (a dirty read), and the pages of a base file an outsider wrote in place while no daemon
+  ran, whose names and attributes revalidate but whose pages a FUSE mount, which asks no `FUSE_AUTO_INVAL_DATA`, keeps.
+  Both stayed cached for as long as the kernel kept them.
+- **The rule, by kind.** The successor cannot tell which inodes a kernel looked up after the last publication, so a
+  mount of the head is sent every inode of the head (`Volume::visit_head_inodes`), each `FUSE_NOTIFY_INVAL_INODE`
+  costing the kernel nothing for an inode it never cached; every reference a current view takes and every inode the
+  replay writes is one of them. A mount of a pinned view keeps A-158's set: its version takes no head change, so no
+  mutation the death lost ever showed through it. A number the dead daemon issued after its last publication (another
+  path's unpublished create a listing showed, a base directory first loaded after the publication) is in no image and
+  no head: the successor refuses it (`NotFound`) and never serves it.
+- **The walk.** The inode table is a radix trie over the number's counter; `trie::visit_after` walks it in that order
+  from past any number, entering only the nodes on that number's path and the subtrees past it, so the round's slices
+  each cost what they send. The table's order is the counter's, which keeps a clone's own and its origin's inodes in one
+  order, where the numbers' full values would interleave two prefixes.
+- **Tests.** `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover` (a: a file published,
+  looked up and written after the publication, the daemon dead; the successor holds the published bytes, no restored
+  reference names the file, and the head's walk does) and
+  `a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit` (b: a base file
+  loaded and published, looked up after, written in place by an outsider while no daemon ran; the successor reads the
+  edit, and the head's walk names the file), both in `crates/vfs/src/base.rs`;
+  `a_walk_after_any_number_gives_the_inodes_past_it_in_order_and_slices_join_whole` (`trie.rs`). On the Mac Studio
+  (debug, 2026-11-19, load 2 to 11): `slates-vfs --lib` the two 2 of 2 and `trie::` 6 of 6, `slates-bridge-core --lib`
+  40 of 40; red with the old rule put back (the mount's restored references and the replay): both failed at the walk's
+  assertion, their premises holding under both rules.
+- **Owed.** The numbers issued after the last publication: a descriptor opened before the death keeps their cached
+  pages, since no walk can name them until each publication records the volume's live counter beside its reserved
+  ceiling (the image and the delta, both encodings, the publication oracle), when the round can name exactly the numbers
+  between the two. The FUSE takeover tests that run the round (`crates/bridge-fuse/tests/takeover_round.rs`, the CLI's
+  kill-in-window tests) are Linux's, main's to run.
+
+### A-565 — A live-shipped captured clone's move gives its new owner the mark; what a clone never sealed loses, plainly; a clone seals nothing until its first snapshot (2026-11-19, g267, UI goal 89; §4.15 `capture_base`, §4.10 "Live shipping", §4.8 "Promotion and takeover"; A-200, A-291, A-503, A-544)
+
+- **What was there.** A move's new owner materializes a live-shipped volume from its live log, as a takeover's
+  successor does (`fleet::make_in_turns`), and A-503's adoption marked only a head materialized from a placed seal
+  (`verbs::finish_making`: never `from_live_log`), since a log rebuilt after an owner's loss may have run past the seal
+  its head names. So a live-shipped captured clone, moved, held no mark on its new owner, and its landing there was
+  refused by kind.
+- **The rule.** A move's rebuild from the log is the head the move hands over: its old owner froze the volume (no write,
+  no snapshot), took the head of its live tree (`verbs::head_for_move`) and reported the move only once the log was
+  durable at its head (`moves::ready_to_report`), so the log's tree is that head. The new owner learns that the
+  materialization is a move's from its adoption, which the control shard keeps until the move is reported adopted
+  (`ShardState::move_adoptions`; `fleet::MakeTaken::moved`, `verbs::TakenOver::moved`), and marks the materialized
+  snapshot when the head's identity is the carried one, as from a seal. A takeover after an owner's loss still marks
+  nothing it rebuilt from a log. Identities cannot decide that instead: the rebuild lays its archive out by the image's
+  extents (`live_ship::archive_of`), the seal by its chunker, so one tree has two identities.
+- **What a clone never sealed loses (settled for main).** A-544 states that a captured clone never sealed before its
+  owner's loss reaches its successor as an empty tree. Whether that loses an acknowledged write depends on the promise
+  the volume was made with:
+  - *Not live-shipped* (every kiln fleet workspace: kiln never turns live shipping on). A write is acknowledged once it
+    is published on its owner (D-18); across an owner's loss the design keeps only the newest placed seal, and the
+    volume's status reports the rest as its loss window: with no seal placed, its whole age (`verbs::at_risk_ns`). The
+    empty tree is inside the window the client was told of, so nothing acknowledged beyond the promise is lost.
+  - *Live-shipped* (a clone of a live origin inherits the flag). A write is acknowledged only once it is durable on `f`
+    candidates (A-200): a clone's first write publishes its whole image, inherited tree included, at its log's first
+    position and answers once that position is durable, so no write is lost. **The `Clone` verb itself is not held:** its
+    reply waits on the origin's log (`verbs::replicated_waits` takes the verb's own volume), which the clone did not
+    change, so the clone is answered while nothing of it is held anywhere else, and the status reports its window as zero.
+    At `f = 1` an owner lost before the clone's first write is durable leaves a successor with no log of it and no seal,
+    serving it empty: an acknowledged clone lost, a durability bug against the live-durability promise (goal 84). Filed as
+    its own bug, `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, with its failing test
+    parked (`a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`, `#[ignore]` until the fix).
+- **A clone seals nothing until its first snapshot (A-544's sibling, fixed here).** The home seal walk takes a head that
+  is none of the volume's own snapshots as nothing to seal (`fleet::sealable_head`): a fresh clone's head is its
+  origin's (`verbs::publish_clone_as` copies the origin's record), and recovery may reset a lost head to none
+  (`verbs::reconcile_lost`). Before, `start_seal` was refused for it and counted `fleet.seal` every period, for every
+  clone made, until its first snapshot.
+- **Tests.** `a565_a_moved_live_clone_rebuilt_from_its_log_is_marked_and_a_taken_over_one_is_not` and the parked
+  `a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable` (`crates/server/src/verbs.rs`);
+  `a_clone_has_nothing_to_seal_until_its_first_snapshot` (`crates/server/src/fleet.rs`). Red first on the Mac Studio
+  (2026-11-19, `cargo test --locked -p slates-server --lib`): with the move flag ignored and the old `sealable_head`,
+  both failed (the walk named the origin's head, `SnapshotId { value: 0 }` at sequence 1, where nothing was due; the
+  moved clone held no mark); with the change, 72 of 72 over the lib's `a565`, the seal test, `a544`, `carry::`,
+  `moves::`, `catalog::`, `landing::`, `fleet::` and `live_ship::` tests; the parked bug test fails as filed (`None`
+  where the clone's position 0 is due).
+- **Owed.** A takeover's rebuild of a live-shipped captured clone after its owner's loss marks nothing: a mark there
+  needs the log position its head was sealed at, so the rebuild can stop there for the mark and go on. The fleet's own
+  test of a moved live clone landing on its new owner (filed for main). The bug's fix (filed).
+
+Applied in the same change to: §4.15's status (A-503's paragraph), GAPS (g267; the bug's entry), the bug record,
+`crates/server` (`verbs.rs`, `fleet.rs`, `live_ship.rs`: `owe_first_whole`, a test's live log).
+
+### A-572 — A volume's entry count and allowance hold the namespace rule at a restart, a clone's admission and a resize (2026-11-19, goal 85, g234; A-549's sweep; §4.2's namespace dimension, §4.5 whiteouts, §4.8 recovery)
+Applied in the same changes to: A-549's entry and its bug record (the siblings marked fixed); GAPS, §8c; the bug record
+`docs/bugs/2026-11-19-a-restart-counted-whiteouts-as-live-entries.md`; and, part by part, the files named below. One
+commit a part, in order of harm.
+
+- **Part 1, a restart counted whiteouts as live entries.**
+  - **What was there.** The live count never holds a whiteout. `dir_remove` takes one off as it turns a base name into
+    a whiteout, and `DirNode::live_len` skips them. But `rebuild_entries` places each image entry that names no child
+    as `Child::Whiteout` through `dir_insert`, and `dir_place` counted every placement. So every restart counted an
+    overlay's whiteouts in its head and in a clone head's own directories, and floored its entry allowance at that
+    count.
+  - **The rule.** A placement counts as a live entry, and is admitted against the allowance, only when it names a
+    child (`Volume::dir_place`, `dir_insert`). The live path never places a whiteout (it turns a name into one in place),
+    so only a recovery's count changes. The rule sits at the one counting site, not in recovery alone, so no later
+    placement of a whiteout can count one.
+  - **Tests.** `a_restart_counts_no_whiteout_as_a_live_entry` (`crates/vfs/src/base.rs`). It builds an overlay with
+    three whiteouts and a file and a directory of its own. Its count before a restart, after it, and the recount of its
+    image (the names its directories carry that name a child) must all be equal.
+  - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (3 counted live, 6 after the
+    restart); green with the rule; `cargo test --locked -p slates-vfs --lib` 85 passed, 1 ignored.
+
+### A-521 — A volume exported to one client is a verb of the library, so a host that reaches slates only through it serves a pod's volume over its node's export (2026-11-19, g294, UI goal 88's kiln Kubernetes engine, kiln goal 28e73c34's part 01a1f124; §4.6 "Kubernetes publication without privilege", A-115, §4.12; `CONTRACT` = 50)
+Applied in the same change to: §4.6 (the Kubernetes publication's status: the export through the library), §4.12's
+contract log (`CONTRACT` = 50), GAPS (the library's entry; the runners-as-members entry, whose network export kiln's
+Kubernetes engine uses), `docs/library.md` (the seam's verbs, the serving list, what is owed), `crates/api/src/export.rs`
+(new: `ExportOptions`, `Exported` and its `Debug`, `Instance::export`, and their test), `crates/api/src/seam.rs` (the
+verb on `Volumes`), `crates/api/src/sim.rs` (the simulator's export, its record and token, and the tests),
+`crates/api/src/lib.rs` (`CONTRACT` = 50, the module and its re-exports) and `crates/api/tests/api.rs` (the conformance
+suite's stranger, and an export's lifetime over both).
+- **Why.** kiln reaches slates through this library alone (A-278), and its Kubernetes engine (kiln's `docs/agentic.md`
+  W10) runs each agent's pod on the agent's volume, which kubelet mounts as an `nfs` PersistentVolume from the network
+  export of the runner that holds it (§4.6 "Kubernetes publication without privilege"): one capability per pod, bound
+  to one Unix identity (A-115), ended at the pod's end. The export was the command line's `slates export` and the raw
+  client's `attach_bound_mount` alone.
+- **The verb.** `Instance::export(volume, uid, &ExportOptions { read_only, subtree })` reads the volume's name from its
+  raw status (a base the status could not read now does not stop it), attaches the bound host mount
+  (`AttachRequest::BoundHostMount`), and answers an `Exported`: the export's attachment and the path its capability
+  authorizes (`mount::export_path`). The uid is required: an export is to one client, and A-115's binding is what keeps
+  what one uid's kernel cached (a link's target) from every other user of the client's machine. Its refusals are the
+  daemon's, typed as the contract already types them (`NotFound` for the volume; a subtree that names nothing or no
+  directory; a volume another node owns; the caller's rights). An answer without a capability is a protocol fault
+  (`ProtocolFault::UnexpectedReply`), since the daemon mints one for every bound host mount (`capability_token`), and
+  never a path made up. `Exported`'s `Debug` shows the path without its token, a bearer secret on the network
+  export's path.
+- **Where it is served.** Nowhere new: the daemon's NFS listeners serve every capability it issued, the loopback one
+  and, on a fleet node with an operator authority (Unix), the network export over RPC-with-TLS on the probe plane's
+  address (`crates/server/src/deploy.rs`). That address is the deployer's own plan (kiln's listed base port; Slates' KIND
+  proof's `base_port`); no report names it, and the command line's `slates export` prints the loopback port beside the
+  path, which a PersistentVolume must not name: both owed (GAPS).
+- **The simulator.** An export is a record: an attachment of its own per client and the path the daemon would answer,
+  its token the attachment's id (unique to the export, and no secret, since nothing serves it). It takes the uid, the
+  intent and a subtree as given, since it holds no files to judge a subtree by (as for a stream's), and the export ends
+  at its detach or with its volume, never with a mount.
+- **Tests.** `crates/api/src/export.rs`: `an_export_is_the_path_its_capability_authorizes_and_never_shows_its_token`;
+  `crates/api/src/sim.rs`: `an_export_is_one_clients_capability_and_ends_at_its_detach` and
+  `an_export_the_daemon_would_refuse_is_refused_typed_and_holds_nothing`, written first (bda17c0: the library had no
+  export to ask). By use over a real daemon, filed for main: the conformance suite's stranger and
+  `expect_an_export_is_one_clients_and_ends_at_its_detach` (`crates/api/tests/api.rs`).
+- **Owed.** The daemon naming its network export's address in a report, so a host reads it rather than derives it from
+  its plan; the command line's `slates export` over this verb, printing the network export's port where the node has
+  one; kiln's side of W10 (its pods' PersistentVolumes, claims and reaper).
+
+### A-553 — The Subversion index: every node-revision with the identities FSFS gives it, computed from each revision's changed-path rows and held to a naive filesystem (2026-11-19, g292 for UI goal 91; §4.17.4 item 2 and piece 4; A-500, A-531, A-542)
+Applied in the same change to: §4.17.4 (a status block; item 2's copy-identity rules made FSFS's, every revision's
+root, what a path beneath a copy answers, how a revision's rows are applied; piece 4 marked built), GAPS (the §4.17.4
+entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `crates/svn/src/lib.rs`; and
+`crates/merge/src/engine/node_exclusive_tests.rs` (`is_multiple_of`, main's clippy finding on A-542's test).
+- **What was there.** Item 2 named the index's rows and gave FSFS's copy-identity rules loosely: "a change made through
+  a copied parent is a lazy copy with a fresh one". FSFS's lazy copy takes the copied directory's copy identity; only a
+  soft copy, a copied node changed through another path, takes a fresh one (`structure`, "Copy-IDs and copy roots").
+  Its created-revision search did not say what a path beneath a copy answers, and nothing computed any of it.
+- **The decision.** The rows are FSFS's own operations, read in its code (1.14.x at `d434dc14`), applied to each
+  revision's changed-path rows: every revision a new root, even an empty one (`transaction.c`
+  `create_new_txn_noderev_from_rev`); each row as the editor call it records, its directories opened from the root
+  with each one's copy inheritance decided against its parent as it stands (`tree.c` `open_path`,
+  `get_copy_inheritance`), then cloned from the root down (`make_path_mutable`, `dag.c` `svn_fs_fs__dag_clone_child`:
+  the predecessor and its count, the copy root moving to the parent's unless the node is its copy root's node), then
+  the entry made (`make_entry`), copied (`svn_fs_fs__dag_copy`), deleted or changed. Rows go in path order against
+  revision N - 1: `merge()` refuses a directory both sides changed unless both kept its node and copy identities, and
+  points its predecessor at the newer revision's (`svn_fs_fs__dag_update_ancestry`), so for every commit FSFS accepts
+  the identities made against N - 1 are FSFS's. Reading: a path's own last history entry decides unless a directory
+  above it was added, copied to, replaced or deleted after it (a shape list per path), the latest such change deciding
+  and a copy sending the question to the same place beneath its source. A copy costs one row, as in FSFS.
+- **Refusals,** typed with the Subversion error each answers, a refused record changing nothing: a path out of canonical
+  form (`E160005`); a revision past the youngest, or a copy source not before its copy (`E160006`); a path absent, its
+  own or a directory's, a question's or a copy source's (`E160013`); an unknown node-revision (`E160014`); an addition
+  where a node stands (`E160020`); a directory that is a file (`E160016`); a text on a directory (`E160017`); the root
+  added, deleted or replaced (`E160021`); and as `E160004`, every record no FSFS commit writes: a kind that differs from
+  its node or copy source, a copy onto its own node-revision (FSFS records nothing for it), two rows for one path, a
+  row whose fields contradict each other (`svn:mergeinfo` gained or lost without the mergeinfo flag among them), a
+  transaction name outside `svn_fs.h`'s letters, digits, `-` and `.`. The room is the caller's: the most entries (node
+  rows and deletions) the index may hold, which bound every other table linearly (`E160000` past it).
+- **Tests** (`crates/svn/src/index/tests.rs`). Nineteen cases, each citing the FSFS line it holds the index to: revision
+  0; every revision's root; bubble-up; a path beneath a copy until it changes there; each of `structure`'s copy-identity
+  rules (creation, copy, lazy copy, soft copy with its copy root kept); mergeinfo counts through a set, a copy, a
+  deletion, a replacement and a removal; history lists with deletions and a replacement; a deleted directory and a copy
+  over it; a copy into its own subtree, which FSFS allows; and every refusal, each with its code and the index
+  unchanged. The oracle: generated histories (additions, copies of any earlier revision's paths into any place, their
+  own subtrees among them, deletions, replacements, text and property changes, `svn:mergeinfo` set and dropped, empty
+  revisions) replayed into the index and into a naive filesystem that keeps every revision's whole tree and applies
+  FSFS's operations to it literally; at every path of every revision the same presence, created path and revision,
+  predecessor and count, copy source and copy root, text, properties and mergeinfo count (the naive one counted by
+  walking the tree), with node-revisions, node identities and copy identities paired one to one; the same history at
+  every path; the same relation for every pair in a sample of places. The naive filesystem replaying each revision in
+  random drive orders, and in its generation order, must equal its own replay in path order. A census, printed every
+  run, must show each rule met, the drive orders that differ from path order and the decisions where order could
+  matter (a child compared against a parent the same transaction already cloned with another copy identity) among them.
+- **Evidence** (the Mac Studio, kiln, 2026-11-19, debug builds of fresh clones of the branch). Failing first (02:03
+  UTC, load 29): with `append` refusing every record, `cargo test --locked -p slates-svn --lib index::` failed 19 of 20,
+  the one pass revision 0's, which needs no record. Green (02:31 UTC, load 23, the branch merged with main): the
+  crate's whole `--lib` suite 53 of 53 in 0.24 s, 20 of them the index's, and `cargo test --locked -p slates-merge --lib
+  node_exclusive` 8 of 8 with `is_multiple_of`. The oracle's census over its generated histories (proptest's default
+  count): 1,223 clones that kept their copy identity, 48 lazy copies and 70 soft copies; 786 copies, 607 of them into
+  their source's own subtree; 514 deletions and 259 replacements; 221 empty revisions; 422 answers reached beneath a
+  copy; 1,882 directories counting mergeinfo beneath them; 32,362 unrelated, 5,242 unchanged and 21,620
+  common-ancestor relations; 495 revisions replayed in a drive order other than path order, and 12 inheritance
+  decisions where that order could have mattered, every identity equal. Each of three rules broken in a copy of the
+  index failed its own case and the oracle, 18 of 20 passing: a soft copy keeping its copy identity, a copy adding no
+  mergeinfo to the directories above it, a copy not counting its source as a predecessor. Clippy, `xtask check` and
+  the cross-target lint are main's (the run-request queue).
+- **Rejected.** Keeping each revision's whole tree, as the naive filesystem does: a revision would cost the tree's size;
+  it is the oracle only. Applying a revision against its transaction's own base: the record would have to carry it,
+  and for every commit FSFS accepts it gives the identities N - 1 gives. Giving each path beneath a copy its own rows:
+  a copy would cost its subtree's size, where FSFS's costs one node-revision; the shape list answers beneath it in one
+  step a copy.
+- **Not here.** The rows as content tables with a mutable tail and the learned fold (§4.17.4 item 12) are the object
+  store's (§4.17.1 shared piece 3); one large revision applied in slices under the shard's budget is the server's
+  (piece 7); the commit rule over these rows is piece 5. Opening a row's path looks each of its directories up beneath
+  the ones above it, so a row costs lookups in the square of its depth; a large import may want the revision's opened
+  directories kept between its rows. Nothing here is measured yet (main's, with the server's load).
 
 ### A-562 — Every round a mount builds on its serving thread is sliced under one turn budget: the journal gather by record, A-141's overrun round by node then name, with A-158's takeover round (2026-11-18, g230, UI goal 85's B9; §4.6 "Cache posture", CLAUDE.md bounded work; amends A-141, A-158)
 Applied in the same change to: GAPS (the whole rounds' entry closed; the two walks still whole recorded), §4.6,

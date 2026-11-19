@@ -1875,7 +1875,13 @@ impl Bridge for VolumeBridge<'_> {
     after: Option<u64>,
     visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
   ) -> bool {
-    self.volume.visit_takeover_inodes(cx.owner, after, visit)
+    // A mount of the head may hold, from a lookup no image recorded, what the dead daemon showed and this daemon never
+    // had: every inode of the head is named (A-573). A pinned view's version takes no head change: its references and
+    // the replay (A-158).
+    match cx.view {
+      View::Current => self.volume.visit_head_inodes(self.store, after, visit),
+      View::Version(_) => self.volume.visit_takeover_inodes(cx.owner, after, visit),
+    }
   }
 
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {

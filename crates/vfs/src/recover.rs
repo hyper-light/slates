@@ -2861,8 +2861,8 @@ impl Volume {
     }
     // The tree's entries (§4.2's namespace dimension, A-549), by the rule the live count keeps: each name its own
     // directories' images carry that names a child, and each live entry of a directory it shares with the head, whose
-    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which takes a whiteout as an entry and
-    // which the caller sets the head's count back over.
+    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which the caller sets the head's count
+    // back over.
     let mut entries = snap
       .inodes
       .iter()
