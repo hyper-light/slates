@@ -48,12 +48,14 @@ mod positions;
 mod push;
 mod repository;
 pub mod rows;
+pub mod views;
 
 pub use deltas::delta_of;
 pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
+pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
 pub use repository::{Found, Move, Repository, StoreCounters, StoreRefused};
 
 #[cfg(test)]

@@ -586,7 +586,43 @@ server's directory are the ones its reviewed expected-failure list starts from.
   `dagops::heads`, the same); harmless, since `getbundle` takes them as common. The test driver holds the found set to
   the shared set by its ancestor closure.
 
-## 19. Found while building piece 5's first part, a push's bundle, race checks and reply (A-641 part 1, 2026-11-19; 7.2's code [C] in the wheel uv installs on the Mac Studio, CPython 3.12; captures of stock `hg` 7.2 over SSH, `fixtures/push`)
+## 19. Found while building piece 4's read serving, part 2: a `getbundle`'s answer (A-619, 2026-11-19; 7.2's code [C] in the wheel `uv` installs on the Mac Studio, `mercurial==7.2`; three sessions of a stock 7.2 client against stock `hg serve --stdio` 7.2 on the Mac Studio, `fixtures/serve`)
+
+- **Over SSH version 1 the answer is a raw bundle2 stream**, uncompressed (no stream parameter), its parts numbered
+  from 0, written after the batch's string answer; the client's next command's answer follows its end. Measured: the
+  clone's `CHANGEGROUP` (version `03` mandatory, `nbchanges` 10 advisory, 4,422 bytes), `BOOKMARKS` (53),
+  `LISTKEYS` (namespace `bookmarks`, 92), `OBSMARKERS` (92: one format 1 marker) and `PHASE-HEADS` (96); the pull's
+  five alike (`nbchanges` 1, phase heads 120); the incoming's `CHANGEGROUP` alone (it asks `cg` and nothing else),
+  then a separate `listkeys phases`.
+- **`_prunemanifests` sends every manifest outside an ellipsis clone** ("better to prevent calling of store.rev and
+  store.linkrev on a lot of nodes as compared to sending some extra data"); only file revisions are left out, where
+  their file log's link is common (`generatefiles`). A manifest's link is the first missing changeset naming it
+  (`lookupcl`'s `manifests.setdefault`). Measured: the clone's ten changesets carried nine manifests, the
+  `--close-branch` commit having reused its parent's.
+- **File revisions are found by reading each sent manifest's delta** (`lookupmflinknode`:
+  `read_delta_parents(shallow=True, exact=False)`, the stored delta's lines where it is stored against a parent, the
+  whole manifest otherwise), kept at the paths a missing changeset lists (`changedfiles`), each linked to the earliest
+  missing changeset whose manifest yields it. A merge that takes one side's file unchanged lists no file: the captured
+  merge's list is empty.
+- **The order:** the changelog in storage order (`nodesorder=b'storage'`), the manifests and each file group by their
+  log's revision (`emitrevisions`' default), the file groups by path. 7.2's deltas are against the previous revision
+  or a parent; a full text against the null base is what `mdiff.trivialdiffheader` makes, and every reader takes it.
+- **bundle2 is asked for by any bundle capability starting `HG2`** (`bundle2requested`); the bundle2 capabilities of
+  every `bundle2=` item are merged (`b2caps.update`); with none at all no changegroup part is made; a client that lists
+  no changegroup version is sent version 01 (3.1 and 3.2 sent the capability empty); the version is chosen, and
+  refused ("no common changegroup version"), before `_computeoutgoing`, so even when nothing is missing.
+- **`listkeys` is a `csv` argument** (`v.split(b',')`): an empty value is one empty namespace, an empty `LISTKEYS`
+  part; a boolean is false for `0` and for an empty value.
+- **The markers sent** are `relevantmarkers(revs=::heads)` over the unfiltered changelog (an unknown head passed over),
+  sorted by `sortedmarkers`, the whole marker tuple (predecessor, successors, flags, metadata, date, parents with
+  `None` as `()`), in the newest format both read (`commonversion`). Measured: the amend's one marker, its metadata
+  `ef1`, `operation` `amend`, `user` `test`.
+- **`HGTAGSFNODES`** is advisory and sent only for heads whose `.hgtags` file node the server's cache already holds
+  (`getfnode(computemissing=False)`); none was, so no session carried one.
+- **An abort on a bundle2 request is answered as a bundle2 stream** holding one `error:abort` part (the message
+  mandatory, the hint advisory), not as an SSH error: owed to the stdio loop.
+
+## 20. Found while building piece 5's first part, a push's bundle, race checks and reply (A-641 part 1, 2026-11-19; 7.2's code [C] in the wheel uv installs on the Mac Studio, CPython 3.12; captures of stock `hg` 7.2 over SSH, `fixtures/push`)
 
 - **Files read**, with their SHA-256 there: `bundle2_part_handlers.py` (`7aabb77e10cd6160…`), `bundle2.py`
   (`90ddd2bf3fbdb781…`), `exchange.py` (`ecf56e2d9f26d017…`), `wireprotov1server.py` (`b47340cf38d24c13…`); and from the

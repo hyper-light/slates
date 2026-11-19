@@ -14,16 +14,16 @@
 //! request's head is therefore kept as its lines came ([`Head`]), with exactly one `command=` line among them. The
 //! capabilities a client may send are the ones `serve.c` receives: `agent`, `server-option`, `object-format`,
 //! `session-id` and `promisor-remote`; a command's name there, or any other key, is refused ("unknown capability"), as
-//! is `object-format` without a value or naming a format git does not know. The commands are `ls-refs` and `fetch`;
-//! any other is refused ("invalid command"): `object-info` and `bundle-uri` are a later part, and a server must not
-//! advertise them before it reads them. The arguments' ids are in the format the last `object-format` names, SHA-1
-//! when none does, as `serve.c` keeps the last.
+//! is `object-format` without a value or naming a format git does not know. The commands are `ls-refs`, `fetch`,
+//! `object-info` and `bundle-uri` (A-624); any other is refused ("invalid command"). `bundle-uri` takes no argument
+//! (`bundle_uri_command` dies on one), so a line after its delimiter is refused. The arguments' ids are in the format
+//! the last `object-format` names, SHA-1 when none does, as `serve.c` keeps the last.
 //!
 //! A server reads a request as it arrives: [`whole_len`] says when the bytes so far hold a whole one, since the first
 //! flush always ends a request. Nothing caps a request's size but its bytes and the caller's admission.
 
 use super::line::{self, Line, Packets, Part};
-use super::{Capability, Refusal, advertisement, fetch, ls_refs};
+use super::{Capability, Refusal, advertisement, fetch, ls_refs, object_info};
 use crate::object_name::ObjectFormat;
 use crate::out::{Measure, Out};
 use crate::pktline::{self, Packet};
@@ -45,8 +45,14 @@ const CLIENT_CAPABILITIES: [&[u8]; 5] = [
   b"promisor-remote",
 ];
 
-/// Format: each command this crate reads, and its name [gitprotocol-v2 "ls-refs", "fetch"].
-const COMMANDS: [(Command, &[u8]); 2] = [(Command::LsRefs, b"ls-refs"), (Command::Fetch, b"fetch")];
+/// Format: each command this crate reads, and its name [gitprotocol-v2 "ls-refs", "fetch", "object-info",
+/// "bundle-uri"].
+const COMMANDS: [(Command, &[u8]); 4] = [
+  (Command::LsRefs, b"ls-refs"),
+  (Command::Fetch, b"fetch"),
+  (Command::ObjectInfo, b"object-info"),
+  (Command::BundleUri, b"bundle-uri"),
+];
 
 /// A request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +90,10 @@ pub enum Command {
   LsRefs,
   /// `fetch`: negotiate, and send a pack.
   Fetch,
+  /// `object-info`: answer objects' sizes ([`object_info`]).
+  ObjectInfo,
+  /// `bundle-uri`: answer the bundles a client may seed from ([`super::bundle_uri`]).
+  BundleUri,
 }
 
 impl Command {
@@ -111,6 +121,10 @@ pub enum Arguments<'a> {
   LsRefs(Vec<Line<ls_refs::Argument<'a>>>),
   /// `fetch` and its arguments.
   Fetch(Vec<Line<fetch::Argument<'a>>>),
+  /// `object-info` and its arguments.
+  ObjectInfo(Vec<Line<object_info::Argument>>),
+  /// `bundle-uri`, which takes none.
+  BundleUri,
 }
 
 impl Arguments<'_> {
@@ -119,6 +133,8 @@ impl Arguments<'_> {
     match self {
       Arguments::LsRefs(_) => Command::LsRefs,
       Arguments::Fetch(_) => Command::Fetch,
+      Arguments::ObjectInfo(_) => Command::ObjectInfo,
+      Arguments::BundleUri => Command::BundleUri,
     }
   }
 
@@ -127,6 +143,8 @@ impl Arguments<'_> {
     match self {
       Arguments::LsRefs(arguments) => arguments.len(),
       Arguments::Fetch(arguments) => arguments.len(),
+      Arguments::ObjectInfo(arguments) => arguments.len(),
+      Arguments::BundleUri => 0,
     }
   }
 
@@ -206,6 +224,8 @@ trait Sink<'a> {
   fn ls_refs(&mut self, line: Line<ls_refs::Argument<'a>>);
   /// A `fetch` argument.
   fn fetch(&mut self, line: Line<fetch::Argument<'a>>);
+  /// An `object-info` argument.
+  fn object_info(&mut self, line: Line<object_info::Argument>);
 }
 
 /// A sink that counts what it is handed.
@@ -229,6 +249,10 @@ impl<'a> Sink<'a> for Count {
   fn fetch(&mut self, _: Line<fetch::Argument<'a>>) {
     self.arguments = self.arguments.saturating_add(1);
   }
+
+  fn object_info(&mut self, _: Line<object_info::Argument>) {
+    self.arguments = self.arguments.saturating_add(1);
+  }
 }
 
 /// A sink that keeps what it is handed.
@@ -239,6 +263,8 @@ struct Build<'a> {
   ls_refs: Vec<Line<ls_refs::Argument<'a>>>,
   /// The `fetch` arguments.
   fetch: Vec<Line<fetch::Argument<'a>>>,
+  /// The `object-info` arguments.
+  object_info: Vec<Line<object_info::Argument>>,
 }
 
 impl<'a> Sink<'a> for Build<'a> {
@@ -252,6 +278,10 @@ impl<'a> Sink<'a> for Build<'a> {
 
   fn fetch(&mut self, line: Line<fetch::Argument<'a>>) {
     self.fetch.push(line);
+  }
+
+  fn object_info(&mut self, line: Line<object_info::Argument>) {
+    self.object_info.push(line);
   }
 }
 
@@ -352,6 +382,11 @@ fn read_arguments<'a>(
         rules.admit(&value, at)?;
         sink.fetch(Line { value, ending });
       }
+      Command::ObjectInfo => sink.object_info(Line {
+        value: object_info::Argument::parse(text, format, at)?,
+        ending,
+      }),
+      Command::BundleUri => return Err(Refusal::UnknownArgument { at }),
     }
   }
   Ok(())
@@ -383,7 +418,8 @@ pub fn decode<'a>(bytes: &'a [u8], admission: &mut Admission) -> Result<Request<
   let argument = match shape {
     Shape::Command(Command::LsRefs, _) => core::mem::size_of::<Line<ls_refs::Argument<'a>>>(),
     Shape::Command(Command::Fetch, _) => core::mem::size_of::<Line<fetch::Argument<'a>>>(),
-    Shape::End => 0,
+    Shape::Command(Command::ObjectInfo, _) => core::mem::size_of::<Line<object_info::Argument>>(),
+    Shape::Command(Command::BundleUri, _) | Shape::End => 0,
   };
   let head = core::mem::size_of::<Line<Head<'a>>>().saturating_mul(count.head);
   admission
@@ -391,15 +427,17 @@ pub fn decode<'a>(bytes: &'a [u8], admission: &mut Admission) -> Result<Request<
       head.saturating_add(argument.saturating_mul(count.arguments)),
     ))
     .map_err(Refusal::PastAdmission)?;
-  let (ls_refs, fetch) = match shape {
-    Shape::Command(Command::LsRefs, _) => (count.arguments, 0),
-    Shape::Command(Command::Fetch, _) => (0, count.arguments),
-    Shape::End => (0, 0),
+  let (ls_refs, fetch, object_info) = match shape {
+    Shape::Command(Command::LsRefs, _) => (count.arguments, 0, 0),
+    Shape::Command(Command::Fetch, _) => (0, count.arguments, 0),
+    Shape::Command(Command::ObjectInfo, _) => (0, 0, count.arguments),
+    Shape::Command(Command::BundleUri, _) | Shape::End => (0, 0, 0),
   };
   let mut build = Build {
     head: Vec::with_capacity(count.head),
     ls_refs: Vec::with_capacity(ls_refs),
     fetch: Vec::with_capacity(fetch),
+    object_info: Vec::with_capacity(object_info),
   };
   walk(bytes, &mut build)?;
   Ok(match shape {
@@ -410,6 +448,8 @@ pub fn decode<'a>(bytes: &'a [u8], admission: &mut Admission) -> Result<Request<
       arguments: match command {
         Command::LsRefs => Arguments::LsRefs(build.ls_refs),
         Command::Fetch => Arguments::Fetch(build.fetch),
+        Command::ObjectInfo => Arguments::ObjectInfo(build.object_info),
+        Command::BundleUri => Arguments::BundleUri,
       },
     }),
   })
@@ -519,6 +559,15 @@ fn write_arguments(
         at = at.saturating_add(line::put_line(None, &parts, at, out)?);
       }
     }
+    Arguments::ObjectInfo(arguments) => {
+      for line in arguments {
+        line.value.check(format, at)?;
+        let [word, space, value] = line.value.parts();
+        let parts = [word, space, value, Part::Bytes(line.ending.bytes())];
+        at = at.saturating_add(line::put_line(None, &parts, at, out)?);
+      }
+    }
+    Arguments::BundleUri => {}
   }
   line::put_special(Packet::Flush, out);
   Ok(())

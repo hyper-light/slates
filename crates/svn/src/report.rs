@@ -48,6 +48,10 @@
 //! canonical already; and the authentication `svnserve` asks for when an anonymous `update` may not
 //! read but a user could. No I/O, no clock, no randomness, no panic.
 
+pub mod drive;
+pub mod editor;
+#[cfg(test)]
+mod recorded;
 mod tuple;
 
 use crate::handshake::{self, Session};

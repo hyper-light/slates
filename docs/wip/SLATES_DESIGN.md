@@ -11238,6 +11238,16 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   by a wrong checkpoint stays fenced.
 >   (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.)
 
+> **Status (2026-11-19, A-632: a chain entry finds what its increment declared in one pass).** A splice recorded by its
+> path alone has its ops found again in the increment: on encode, to see that they are the declared ones, and on decode,
+> to restore them. Each effect used to scan every op of the increment for its path (`declared_ops`), and each copy for
+> its source version (`declared_copy`, A-586), O(effects × ops): about 5 × 10⁹ visits for a version splicing 50,000
+> files of a 100,000-op increment, on the owner's commit and on every holder's replay. An entry now indexes its
+> increment's ops once (`Declared`: each path's content ops in order, each copy's source version by destination, then
+> source), so encode and decode visit each op once and look each effect up in an ordered map. The entry's bytes are
+> unchanged. Test: a thousand splices visit a thousand ops on encode and a thousand on decode, where the scan visited a
+> million each way (kiln r786); `docs/bugs/2026-11-19-a-chain-entry-scanned-its-increment-for-every-splice.md`.
+
 > **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
 > - Now, after each accept, the owner checkpoints the chain at the floor. The floor is the oldest version a live work
@@ -11358,7 +11368,10 @@ it). Fast path: if `last_changed[path] <= base` for every path in the increment,
 node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 item 3, A-542) is judged whole instead: any
 change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
 Subversion client's commit needs. A `Copy` (A-586) is always judged so, as an addition: its destination's tree must be
-absent at the head and unchanged after the base, and its source's tree unchanged after the version it copies.
+absent at the head and unchanged after the base, and its source's tree unchanged after the version it copies. One that
+replaces (A-626, `REPLACE`) is judged as its destination tree's removal with that addition: the tree unchanged after the
+base and holding no hard link nor any link's target. A copy into another copy's tree in the same increment is judged
+against what that copy brings there.
 
 > **Status (2026-11-19, A-612: a work never changes bytes it did not see).** Two rules the verdict now keeps, each a
 > defect A-596's oracle found:
@@ -11379,6 +11392,47 @@ absent at the head and unchanged after the base, and its source's tree unchanged
 > insert at the cut and an append past it kept beside a truncate; an overwrite inside the cut span or a shorter
 > truncate a conflict; the same truncate identical. Tests: `crates/merge/src/engine/unseen_bytes_tests.rs`; A-596's
 > oracle generates both cases again (`engine/reanchor/tests.rs`).
+
+> **Status (2026-11-19, A-631: a work never changes a node removed after its base).** A-612's record of removals
+> (`Green::file_removed`) covers a node of every type now: a regular file, a symbolic link, a hard link's name, an IPC
+> node and a directory, each removed by its own effect or renamed away (a regular file also when renamed onto). Two
+> more verdicts read it as the content verdict does:
+> - *A metadata change.* A work's `SetMode`, `SetXattr` or `RemoveXattr` based before its path's node was removed is
+>   delete against modify (`DeleteModify`), whatever was made at the path since, unless the work makes the path itself.
+>   Before, each was judged by its own dimension's last change alone (`mode_changed`, `xattr_changed`), which a removal
+>   does not touch, and it landed on the new node.
+> - *A link's rename.* A rename whose source is a symbolic link or a hard link removed after the work's base is rename
+>   against rename (`RenameRename`), as a regular file's is (A-612). Before, it moved the new link.
+>
+> Tests: `crates/merge/src/engine/replaced_node_tests.rs`, each case red first, and a generated oracle: histories over a
+> file, a symbolic link, a hard link and a directory, each removed and made again while works based behind the head
+> change a mode, an attribute or a name, every answer held to the rule and a census requiring each case to run. Probed
+> and owed (GAPS): a link renamed over a regular file keeps the file beside it; a directory's removal takes no base; an
+> unlink or a directory's removal ignores a metadata change after its base; and a hard link to a target made again
+> links the new file.
+
+> **Status (2026-11-19, A-643: the green stays whole, and no work removes or links a node changed after its base).**
+> A-631's four siblings, each now refused or replaced by the rule:
+> - *A link renamed over a file replaces it.* A symbolic link or a hard link renamed over an unchanged regular file
+>   removes the file, its removal recorded (`file_removed`, so a later work based before it is answered as A-612
+>   says), and stands alone at the path, as a file renamed over a file does and as POSIX `rename` replaces its
+>   destination. A file the increment removes itself, by an unlink or a rename away, is removed once, by that. A hard
+>   link renamed over the file it names changes nothing, as POSIX `rename` does for two links to one file. Before, the
+>   file stayed beside the link at one path.
+> - *A removal is judged against its base in every dimension.* An unlink of a file, and a directory's removal, based
+>   before a change to the node in any dimension (its bytes, a remake, its mode or an attribute) is delete against
+>   modify (`DeleteModify`), read off the change index (`changed_after`). Before, an unlink judged a file's bytes alone
+>   and lost a mode or attribute change with it, and a directory's removal took no base and removed a directory made
+>   again since.
+> - *A hard link to a file removed after the work's base* is delete against modify on the link, unless the work makes
+>   the target itself. Before, it named the file made in its place, or nothing.
+>
+> Metadata stays keyed by path (A-618): a link that replaces a file keeps the path's mode and attributes unless the
+> work changes them, as a file renamed over a file does. Tests: `crates/merge/src/engine/replaced_node_tests.rs`, each
+> case red first, and a generated oracle whose model holds what stands at every path at every version; after every
+> event each path must hold the one node the model says, never two. Probed and owed (GAPS): a rename over a symbolic
+> link, a hard link or an IPC node is refused `TypeChanged` with no concurrent change, though POSIX replaces it; and a
+> hard link names its target by path, so the target's removal leaves the link naming whatever is made there next.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -11505,6 +11559,12 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > recorded once at its destination (`crates/merge/src/engine/copy.rs`; the "Copies" bullet below). Owed: a checkpoint
 > of a green holding a copy, a rebase that restates one, a copy from a version its source changed after, and a copy
 > onto a path its own increment removes (the A-586 entry).
+>
+> **Status (2026-11-19, A-626 part 1).** Built in the engine: a copy that replaces what its destination holds
+> (Subversion's replace with history) and copies nested in one increment, a move inside a copied tree among them (the
+> "Copies" bullet below); with them, three defects of A-586's branch made before a copy, which A-626's oracle found.
+> Owed (the A-626 entry): a copy from a version its source changed after, a checkpoint of a green holding a copy, and a
+> rebase that restates one.
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -11534,7 +11594,14 @@ which of its pending paths green has moved under (awareness, never load-bearing)
   conflict. The set hash adds one entry a copy (its destination, source and source version), which stands for every
   entry the copy brought: the sum is the state's entries plus each copy's entry less the entries of the tree it copied,
   O(1) a copy and recomputed alike by every holder that applies the same versions. A branch made before a copy cuts the
-  copy's tree from its maps (`Ptrie::cut`, a graft's inverse) and takes the copy's entry out of its identity.
+  copy's tree from its maps (`Ptrie::cut`, a graft's inverse) and takes the copy's entry out of its identity; every key
+  the change index names after it is read through the copies above it and set back wherever it differs from what the
+  branch then holds (A-626). A copy may replace what its destination holds (A-626, `REPLACE`, Subversion's replace with
+  history): the tree is taken away key by key at the copy's version, each removal recorded as removals are, before the
+  source is grafted there, and a key's own removal at a copy's version reads as before the copy, so a key the replace
+  took away and the copy gave back reads as the copy's. Copies nest in one increment: every source is held before any
+  lands (FSFS copies from a revision), they land in their destinations' order, and one inside another's tree is judged
+  against what that one brings there.
 - **A lineage.** Greens made from one another's versions share their maps' arenas through a `Lineage`, which owns the
   arenas and lends them to one green for the length of one call, so every node has one owner and nothing is shared by
   pointer (R2). `branch(from, v)` forks `from`'s eight roots (one count each), sets back in the new green every key whose
@@ -12136,6 +12203,13 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    commit's tree, without walking it (built at another green's version: A-534's persistent maps and `Lineage::branch`
    in the engine, §4.16, and A-575's verbs over one lineage a repository on its partition, recovered from the log and
    the snapshot; at a commit that is no version's head, owed with piece 3's trees).
+2. (A-642, Ada 2026-11-19, supersedes the repository-wide position below: the unit of work is a changeset appended
+   to a write-ahead log; commits are server-side, lock-free and incremental; no global references. Each green
+   keeps its own log and its changesets append there; a repository has no position every change passes through.
+   An atomic push across greens is one entry on each green it moves, appended only while each green is still at
+   the position the push read, refused otherwise; the checks on greens it does not move compare their positions
+   the same way. The repository's own state, Mercurial's phase roots and markers and the LFS locks, is kept in
+   logs of its own.)
 2. A register entry that commits several greens' versions together (the atomic push), with its recovery and its
    recomputation on holders. The entry also carries the repository's own state beside its greens' versions and
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
@@ -12232,6 +12306,17 @@ engine: the verdict, rebase, position mapping, the register).
 > is owed with the listener. Held to the chacha20-poly1305 draft's worked packet, NIST's SSH key-derivation vectors,
 > RFC 7748's X25519 exchange and RFC 8032's Ed25519 tests, and to whole connections with a client written from the RFCs
 > alone. User authentication and the session channel are piece 9's next parts.
+>
+> **Status (2026-11-19, A-633: piece 9's authentication and session channel built).** `slates-ssh`'s `Session` serves
+> a connection whole. Authentication is by public key: the `none` probe, a query answered `PK_OK` only for a key a
+> principal holds (through `KeyHolders`, the server's lookup over §4.13's principals), and a signature over the session
+> id checked through aws-lc-rs, for `ssh-ed25519` and for RSA keys under `rsa-sha2-512` and `rsa-sha2-256` (RFC 8332),
+> with partial success while a principal's policy wants more keys, the banner, a failure limit, and RFC 8308's
+> `server-sig-algs` sent after the first NEWKEYS. One session channel takes `env GIT_PROTOCOL` and one `exec` parsed as
+> git's two programs in git's quoting, `hg -R <repo> serve --stdio` in Mercurial's, or `svnserve -t`. Everything else
+> is refused by kind, the windows come from the caller's budget and the transport's cap, and `exit-status`, EOF and
+> close end the channel in order. The listener on the runtime, the host key's keeping and the commands' serving are
+> owed.
 >
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
@@ -12335,20 +12420,43 @@ engine: the verdict, rebase, position mapping, the register).
 > against what the stock git-lfs 3.8.1 client sent and accepted, recorded. Serving it (routes, the object store, lock
 > records, who may do what) is the server's part.
 >
+> **Status (2026-11-19, A-629 part 1: serving Git LFS, slates-git's half).** `crates/git` (`lfs::serve`,
+> `lfs::objects`) routes a request slates-http has read under `<repo>/info/lfs`: the batch API, the locks API and the
+> basic adapter's transfers this server hands out (`PUT` and `GET` of `objects/{oid}`, `POST objects/{oid}/verify`),
+> the repository's path decoded as git's smart HTTP routes decode one, media types and `Accept` held to RFC 9110 (the
+> most specific range decides; a zero weight refuses). It answers over three seams the server implements: who may do
+> what (`Access`, vcs_policy's check, A-597), the objects (`slates-vcs`, each named by its SHA-256 and checked on
+> arrival, its bytes the shared store's by BLAKE3), and the locks (`Locks`, the repository's lock log, A-642). An action
+> expires exactly when the credential that asked for it does, and carries no expiry when that credential never does; a
+> refusal of a request without credentials is `401` with `LFS-Authenticate`. Every answer is charged before it is made
+> and allocated at its measured length; a page of locks borrows the log's records and is cut by the client's limit, or
+> where the room would no longer hold the next lock and the cursor after it. Proven by replaying the stock git-lfs 3.8.1
+> client's 24 recorded exchanges through the routes and the server, and by a property test of the paging rule. Part 2
+> is the server's: the lock log in slates-db, guarded then applied; `Access` over vcs_policy and the owner rule; each
+> repository's LFS index beside the shared store; the call A-625's edge makes.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
 >
-> **Status (2026-11-19, A-620 part 1: piece 6's exchange built).** `crates/git` (`receive`) speaks receive-pack's
-> exchange as git 2.50.1 does. It writes the ref advertisement through A-604's v0 writer, receive-pack's capabilities
-> in git's order. It reads the update request as it arrives: shallow lines, the commands (the client's capabilities on
-> the first) and the push options. The pack goes through A-608's reader, a thin pack's bases taken from the repository
-> (`unpack::Outside`). The connectivity check walks the pushed objects alone: a tip reaching an object nothing holds is
-> `missing necessary objects`, and a client's shallow commit whose parent nothing holds is `shallow update not allowed`.
-> Each remaining command's ref name is held to A-615's rule, then the caller's verdict is asked (`Judge`), every ref or
-> none under `atomic`. The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
-> band-2 lines. Proven byte for byte against nine pushes stock git 2.50.1 made to stock `git receive-pack`. Part 2 makes
-> each ref's update a work the engine judges, every ref recorded as one register entry.
+> **Status (2026-11-19, A-620 part 1: piece 6's exchange, its checks and its session built).** `crates/git`
+> (`receive`) speaks receive-pack's exchange as git 2.50.1 does. It writes the ref advertisement through A-604's v0
+> writer, receive-pack's capabilities in git's order, leaving out the refs a deployment hides (`HiddenRefs`, which
+> A-597's policy answers in the server). It reads the update request as it arrives: shallow lines, the commands (the
+> client's capabilities on the first) and the push options. The pack goes through A-608's reader, a thin pack's bases
+> taken from the repository (`unpack::Outside`; A-638's `IndexedObjects` is that repository), and every object in it
+> through A-590's checks under a push's strictness (git's `--strict`) before any ref moves. The connectivity check walks
+> the pushed objects alone: a tip reaching an object nothing holds is `missing necessary objects`, and a client's
+> shallow commit whose parent nothing holds is `shallow update not allowed`. A hidden ref is then refused, and each
+> remaining command's ref name is held to A-615's rule. Then the caller's verdict (`Judge::judge`), which moves nothing,
+> and its append (`Judge::append`), which moves the ref: one entry on that ref's own log, only while the ref is at the
+> position the verdict read (A-642). Without `atomic` each ref moves on its own; under it, one append moves every ref or
+> none (`append_atomic`). The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
+> band-2 lines. `Session` runs it all over one connection, sans-io: bytes in as they arrive, bytes out to the caller's
+> sink, the answer written as the push's last byte arrives. Proven byte for byte against eleven pushes stock git 2.50.1
+> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2
+> implements `Judge`: each ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable
+> versions (A-645), appended per A-642.
 >
 > **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
 > answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
@@ -12360,6 +12468,44 @@ engine: the verdict, rebase, position mapping, the register).
 > `tree:<depth>`, `object:type` and `combine:` (`sparse:oid` read and refused, owed); and `include-tag`. Proven against
 > an oracle computing each answer from full reachability over generated histories. Building the pack from the runs and
 > the objects is piece 7's next part.
+>
+> **Status (2026-11-19, A-624 part 2: `object-info`, `bundle-uri` and the `packfile-uris` choice built).** `v2` reads
+> and answers `object-info` as git 2.50.1 does (the `size` line only when asked, an object the server lacks with its
+> space alone, ids alone without `size`, no LF), from `ObjectSizes`, which A-614's store answers by its rows; reads
+> `bundle-uri`'s answer as git's client reads it and writes a repository's `BundleList` as git's server writes the same
+> configuration; and chooses what a fetch sends by URI: the longest suffix of its units that eligible packs tile, in the
+> fewest packs, a pack eligible under a listed protocol and `sideband-all`, and self-contained without `thin-pack`.
+> Proven against stock git 2.50.1's own answers, a stock clone through `bundle-uri`, and its four `packfile-uris`
+> decisions. Owed: the store's bundle list and URI packs, and the fetch path that asks for them.
+>
+> **Status (2026-11-19, A-638: the store as the push path reads it).** `crates/git` (`store::views`) lets receive-pack
+> and A-618's work read the store. `IndexedObjects` is receive-pack's `Repository`: a thin pack's bases and the
+> connectivity check's stops come from the index alone, never from a push's quarantine, and `holds` reads an object's
+> row and no bytes. An object of one window is lent as the store keeps it; a longer base is assembled once, kept for
+> the view's life and lent again, each charged to the view's room before it is assembled, and a base refused for the
+> room is named (`refused`). `PushedObjects` is A-618's `PushObjects`: the index first, then the push's quarantine, a
+> tree's modes read as git's tree walk reads them (`canon_mode`: stock git 2.50.1 reads `100600` and `100664` as
+> `100644`, `100700` and `100775` as `100755`, and a typeless `644` as `160000`). Proven by receive-pack resolving a
+> thin pack of two deltas on a base the store holds across windows, and by two pushes becoming works through the store
+> (versions 1 and 2, the unchanged directory never read).
+>
+> **Status (2026-11-19, A-640 part 1: the store read as the negotiation's graph).** `crates/git` (`store::graph`) reads
+> A-614's store as A-615's `Graph`. A node is an object's position. Its name, kind, size and commit row come from its
+> rows, a tree's entries and a tag's object from its bytes, and a green's versions from its chain (numbered from 0, D(k)
+> the positions version k brought). A version's fast-forward is the store's own verdict at admission, found again by the
+> store's rule. The store keeps no ref names, so the caller names each ref's green. A read the store cannot make is kept
+> as the graph's first fault, and an answer made while one was kept is refused. Proven on the repository stock git
+> 2.50.1 answered the golden vectors from, loaded into a real store from its own pack: the negotiation over the store
+> sends exactly the objects git sent for a clone and for a fetch with a have. The service over v2, and over v0 and v1,
+> is A-640's next part.
+>
+> **Status (2026-11-19, A-637: item 5's submodule link built in the merge engine).** A tree's `160000` entry is a
+> special node holding the commit's id (`SpecialKind::Gitlink` in `slates-merge`), encoded beside A-294's device kinds.
+> A push makes it (`Mknod`, no owner, time or permission bit, since git records none), moves it to another commit
+> (`Unlink` then `Mknod`) and removes it (`Unlink`). The engine takes a link moved to another commit as the same kind:
+> two pushes moving one link apart from one base conflict `CreateCreate`. A path changing to or from a link is a typed
+> kind change (GAPS §8f). A link's form in a volume and in a checkout is owed (git checks a submodule out as an empty
+> directory).
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12385,11 +12531,13 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    onto the codec is owed. The git edge adds TLS, authentication and streaming responses.
 2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
    one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
-   [B: RFC 8709], with the RSA and ECDSA key forms users already hold as owed reading; ciphers `aes256-gcm@openssh.com`
+   [B: RFC 8709], and user keys in RSA under `rsa-sha2-512` and `rsa-sha2-256` [B: RFC 8332] (A-633), with the ECDSA
+   and FIDO key forms users also hold as owed reading; ciphers `aes256-gcm@openssh.com`
    and `chacha20-poly1305@openssh.com`, the forms OpenSSH clients speak ("Because of problems with the design of the
    algorithm negotiation in this RFC, OpenSSH (and other SSH implementations) use different rules" [B: OpenSSH
    `PROTOCOL` §1.6, §1.7]). The channel accepts one `exec` request whose command is exactly `git-upload-pack '<path>'`
-   or `git-receive-pack '<path>'`; the server parses it and never runs a command ("Normal precautions MUST be taken to
+   or `git-receive-pack '<path>'`, or, for §4.17.3 and §4.17.4, `hg -R <path> serve --stdio` and `svnserve -t`, each
+   read in its own client's quoting (A-633); the server parses it and never runs a command ("Normal precautions MUST be taken to
    prevent the execution of unauthorized commands" [B: RFC 4254 §6.5]). It accepts the `env` request for
    `GIT_PROTOCOL` alone ("It is recommended that implementations either maintain a list of allowable variable names"
    [B: RFC 4254 §6.4]), which is how a client asks for v2 over SSH ("the GIT_PROTOCOL environment variable must be set
@@ -12410,7 +12558,8 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
 - Side band: during a pack, channel 1 carries the pack, 2 progress and 3 a fatal error [B: gitprotocol-v2 "packfile
   section"]; `ERR <text>` is the pack protocol's error line [B: gitprotocol-pack].
 - v2 capabilities advertised: `agent`, `ls-refs=unborn`, `fetch=shallow filter ref-in-want sideband-all packfile-uris
-  wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and `object-info`. `ls-refs` lists
+  wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and `object-info`, and `bundle-uri`
+  where the repository offers a bundle list (A-624). `ls-refs` lists
   only `unborn`, as git does (`ls-refs.c` `ls_refs_advertise`): `symrefs`, `peel` and `ref-prefix` are the command's
   base arguments, which need no feature [B: gitprotocol-v2 "ls-refs"]. A v0 or v1 fetch (the old ref advertisement and
   its negotiation) is piece 14; its codecs are built (A-604), and serving one is owed.
@@ -12517,13 +12666,17 @@ create or update a reference named "refs/for/master", but may create or update a
      `tree:<depth>`, `sparse:oid` and `combine:` choose objects by their index rows (size, depth, path).
    - `include-tag`, `ofs-delta`, `no-progress` and `sideband-all` behave as the protocol defines. With `packfile-uris`
      or `bundle-uri` the server may name the base pack and runs of fragments as static, content-addressed URIs that any
-     cache can hold.
-4. `object-info` answers type and size from the index rows.
+     cache can hold. git's client indexes the inline pack before it downloads any URI's (`fetch-pack.c`), so the inline
+     pack carries a prefix of the fetch's units, and the URI packs tile the rest, in order (A-624).
+4. `object-info` answers size from the index rows, git 2.50.1's one attribute; `type`, which git's master adds, when a
+   release ships it.
 
 **Large files.** Git LFS's batch API [B: git-lfs `docs/api/batch.md`, `basic-transfers.md`, `locking.md`]: a
 `POST` to `<repo>.git/info/lfs/objects/batch` names an `operation` (upload or download) and objects by SHA-256 `oid` and
-`size`; the answer gives each object's actions (`href`, headers, `expires_in`); a basic transfer is a plain `PUT` or
-`GET` of the bytes; locks are per path. An LFS object is content in the volume store, deduplicated by BLAKE3 like every
+`size`; the answer gives each object's actions (`href`, headers, and the expiry of the credential that asked, since a
+transfer authenticates at the edge as the batch did: `expires_at` for a token that expires, none for one that does not,
+A-629); a basic transfer is a plain `PUT` or `GET` of the bytes; locks are per path, kept in the repository's lock log
+(A-642). An LFS object is content in the volume store, deduplicated by BLAKE3 like every
 other byte, with its SHA-256 name an index row and the bytes checked against it on upload. A version's tree holds the
 pointer files git holds [B: git-lfs `docs/spec.md`]. Partial clone with `blob:limit`, git's own answer to large files,
 is served as well. Mercurial's `lfs` extension speaks this same batch API, so one store serves both tools (§4.17.3).
@@ -12777,6 +12930,22 @@ signature verification).
 > through §4.15's read seam; its golden vectors, every revision's `debugdata`, are in the same fixtures) and version
 > 2's file index.
 >
+> **Status (2026-11-19, A-619 part 2: a `getbundle`'s answer).** `serve::getbundle` writes the bundle2 stream 7.2's
+> `getbundlechunks` writes, over a `Store` (the served view with its changeset texts, its manifest and file logs and its
+> markers): `CHANGEGROUP` in the highest version among `02` and `03` the client reads, carrying the missing changesets,
+> every manifest they name (7.2 prunes none outside an ellipsis clone) and the file revisions at the paths they list
+> whose file log's link the client lacks, each as its full text against the null base; `BOOKMARKS`, a `LISTKEYS` part
+> for each namespace asked, `OBSMARKERS` (the relevant markers in 7.2's order, in the newest format both read) and
+> `PHASE-HEADS`. A part the client cannot read is refused by kind, as 7.2 aborts, and a bundle1 is not served. Proven by
+> `cargo test --locked -p slates-hg --lib` on the Mac Studio, 208 of 208, red first (9 of 9 failed against stubs): three
+> sessions of a stock 7.2 client against stock `hg serve --stdio` 7.2 (`crates/hg/fixtures/serve`: a clone, a pull, an
+> incoming), each `getbundle` answered as 7.2 meant it (the same parts and parameters, every payload but the changegroup
+> byte for byte, the changegroup revision by revision, every node the hash of its parents and text); a model of 7.2's
+> packer (each manifest's delta read against a parent, or whole) on generated histories, equal on every manifest and
+> every file revision the client lacks; hostile requests. Owed of piece 4: `slates hg serve --stdio`'s loop (a bundle2
+> request's abort answered as an `error:abort` part), HTTP version 1, held deltas in place of full texts, and the
+> index's kept heads in place of the walks.
+>
 > **Status (2026-11-19, A-641 part 1: piece 5's first part, a push's bundle read, its race checks and its reply).**
 > `slates-hg`'s `push` reads what a client's `unbundle` asks as 7.2's part handlers read it (`push::read`): each part
 > routed by its type in lower case to the handler a push has (`replycaps`, the four checks, `changegroup`,
@@ -12924,7 +13093,9 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
   server as a key's forced command (as Mercurial's own `contrib/hg-ssh` restricts a key to `hg -R <repo> serve
-  --stdio`) or by the client's `--remotecmd`; HTTP version 1 on the daemon's own HTTP edge, under TLS. HTTP version 2
+  --stdio`) or by the client's `--remotecmd`; or by slates' own SSH server (§4.17.2, A-633), which reads that exact
+  command in Mercurial's quoting and serves it in the daemon with no process; HTTP version 1 on the daemon's own HTTP
+  edge, under TLS. HTTP version 2
   (`/api/*`, the `hgrpc` frames) is not served: Mercurial documents it as experimental, and 7.2's server has no handler
   for it (no `X-HgUpgrade` path in `wireprotoserver.py` [C]).
 - **Commands.** Every command of 7.2's table, with its argument spec and its permission, `pull` or `push` [C:
@@ -13196,8 +13367,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    Mercurial's naming as its `Naming`. Built (A-630 part 1, `crates/hg`: `store`): a store's names (both of 7.2's
    encodings, the hashed long names) and its fncache. Owed: the import into the index, and version 2's file index.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
-   (A-619 part 1, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets and its
-   phase heads and bookmarks; owed: the changegroup and bundle2 assembly, the stdio loop, HTTP.
+   (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
+   with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; owed: the stdio loop,
+   HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts; owed: the
@@ -13265,10 +13437,11 @@ and export by landing).
 > client computes with it; inheritance and elision; and `get-mergeinfo`'s answers over the index (explicit, inherited,
 > nearest-ancestor; descendants found by the index's counts, a crawl the server pulls a slice at a time; a value that
 > does not parse answering none, issue #3896). Held to `mergeinfo-test.c`'s vectors, to the per-revision model wherever
-> Subversion's algebra is exact, and to a naive filesystem on generated histories. Owed: `svn mergeinfo --show-revs`'s
-> eligible and merged revisions, composed from this algebra with piece 7's location segments and log
-> (`libsvn_client/mergeinfo.c` `svn_client__mergeinfo_log`, `filter_log_entry_with_rangelist`); the property's UTF-8 and
-> CR checks at commit, which are piece 7's property validation (`svn_repos__validate_prop`).
+> Subversion's algebra is exact, and to a naive filesystem on generated histories. `svn mergeinfo --show-revs`'s
+> eligible and merged revisions are the stock client's own work (`libsvn_client/mergeinfo.c`
+> `svn_client__mergeinfo_log`) over the server's `get-mergeinfo`, `log` and location segments, so slates owes only those
+> answers (Ada's scope, 2026-11-18: slates offers the server portion). Owed: the property's UTF-8 and CR checks at
+> commit, which are piece 7's property validation (`svn_repos__validate_prop`).
 >
 > **Status (2026-11-19, A-592).** Built: the commit rule (`slates-svn`'s `commit`, piece 5, items 3.2 to 3.4): the
 > drive's out-of-date test (`check_out_of_date`, `commit.c`'s); and the verdict at `close-edit` (`verdict`): FSFS's
@@ -13313,6 +13486,12 @@ and export by landing).
 > one, a copy from a version its source changed after, and Subversion's replace with history (a copy onto a path its
 > own increment removes), each in the A-586 entry.
 >
+> **Status (2026-11-19, A-626 part 1).** Built: the engine's replace with history (`REPLACE`, a flag on `Copy`: the
+> destination's tree taken away key by key at the copy's version, judged as a removal against the base) and copies
+> nested in one increment, a second copy into a new branch and a move inside one (a copy and a removal) among them, so
+> a stock client's commit holding either is no longer refused. Owed (the A-626 entry): a copy from a version its source
+> changed after, a checkpoint of a green holding a copy, and a rebase restating one.
+>
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
 > writes it; texts passed in pieces with their MD5 and SHA-1 checked through aws-lc-rs, deltas window by window through
@@ -13334,8 +13513,15 @@ and export by landing).
 > `get-dir` (the node's and the entry properties, the dirent fields asked for, the ancestors' properties) and
 > `get-locations` (`svn_repos_trace_node_locations` over the index: the closest copy by FSFS's youngest copy root, its
 > source, the same line at the same path), with `svn info` of a file and `svn proplist --show-inherited-props` replayed
-> whole. Owed: `get-file`, `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
-> `get-deleted-rev`, then `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
+> whole. Its second slice (2026-11-19, g297): `get-file` (the checksum from the node row, the properties and inherited
+> properties, then the text in `svnserve`'s 4,096-byte strings, the empty string and a second response), the text read
+> from the green a piece at a time and written a slice at a time in the room the caller gives (a `Stream` the server
+> resumes), so no file is held whole; the stock `svn cat` sessions replayed whole. Its third slice (2026-11-19, g297):
+> `list`, `svn_repos_list`'s walk streamed a slice at a time (each slice bounded by the bytes it writes and the entries
+> it visits), its patterns matched by APR's `apr_fnmatch` after Subversion's fold, exact over ASCII names; `svn ls -v
+> -R` replayed whole. Owed: `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`;
+> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules
+> (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -13347,6 +13533,34 @@ and export by landing).
 > of mixed revisions, holding a lock, over a switched and a not-present path, switches, `status -u`, a diff, and
 > thirteen hand-made reports. Owed, part 2: the editor drive that answers a finished report over the index (A-553),
 > its texts as svndiff, its entry properties, absent entries, copy sources and its early-error abort.
+>
+> **Status (2026-11-19, A-617, part 2a).** Built: the commit's request and its editor commands, read as `svnserve` reads
+> them (`slates-svn`'s `commit::edit`, piece 7's commit, its first part). `commit`'s parameters are read as `serve.c`
+> reads them, `"clb?l"` or a client before 1.2's one item, and its lock tokens after the authentication request as
+> `add_lock_tokens` reads them; each editor command by its handler's prototype in `editorp.c`, as `marshal.c`'s
+> `vparse_tuple` reads one: items past the prototype ignored, an optional rest absent, another kind than the prototype's
+> malformed. The refusals carry `svnserve`'s numbers: malformed data (`E210004`) ends the connection, an unknown command
+> (`E210001`) is a command failure; a NUL inside a C string and a revision past `svn_revnum_t`, which `svnserve` reads
+> through C, are refused. Each command writes itself back as a stock client writes it. Held to seventeen commits
+> recorded on the Mac Studio, four of them refused by `svnserve`: stock `svn` 1.15.0 against stock `svnserve` 1.15.0
+> through a relay (`crates/svn/fixtures/commit`, its `make-fixtures.py`, each file's SHA-256 in `SHA256SUMS`), every
+> command read and written back byte for byte, every text delta decoded whole and applied to its file's text; and to
+> `vparse_tuple` transcribed over generated items for every prototype. Owed (part 2b): the drive, each command checked
+> as it arrives (the tokens, the paths, the out-of-date test, the lock check) and declared on a trial built a command at
+> a time, the texts through the svndiff codec with their MD5 checked, `close-edit`'s verdict, and the answers `svnserve`
+> writes: after a failure, the commands read and dropped until `abort-edit` (`editorp.c` 1149-1208).
+>
+> **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
+> (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
+> makes, in `reporter.c`'s order, each with the editor's own arguments and the raw facts of the node it names; A-627's
+> `dav::Drive` consumes the same calls. `EditorWriter` writes each as `editorp.c` and `marshal.c` do: tokens `d` and
+> `c` from one counter, absent entries only to a client that announced `absent-entries`, svndiff 2 to a client that
+> accepts it and 0 to any other, each window as `svndiff.c`'s three chunks, and a call out of the editor's order
+> refused with nothing written. Held to every drive in the recordings (28: 22 stock, six hand-made), each read back
+> and written again: the same calls and windows, and every item byte for byte but a chunk `svnserve` stored
+> LZ4-compressed. Owed of part 2: the drive over the index and the green, with `svn_repos_deleted_rev` and
+> `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the client's early answer and its
+> answers to `close-edit` and `abort-edit`.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -13549,7 +13763,9 @@ for Subversion.)
   on a send that never blocks the task, and the rest of the drive is read and dropped until `abort-edit`.
 - **svn+ssh.** sshd starts `svnserve -t` as the logged-in user; slates installs that command as one of its own (a CLI
   verb under the name `svnserve`), which speaks ra_svn on its standard input and output and relays to the daemon
-  through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism).
+  through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism). Over
+  slates' own SSH server (§4.17.2, A-633) the same `svnserve -t` is read from the `exec` request and served in the
+  daemon, the principal the one the client's key proved.
 - **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
   COPY and DELETE against it with `X-SVN-Version-Name` for the out-of-date test; MERGE; LOCK and UNLOCK. DeltaV's
@@ -13623,16 +13839,44 @@ copy and commits the result as any commit. The server never merges file contents
   review; approving it submits the work under item 3 and makes the revision, and the author's next `svn update` meets
   its own edits as the incoming change. A held commit built on another is a work over a work (§4.17.1).
 
-*9. Hooks* (§4.17.1's hook rule). start-commit (the repository's path, the user, the client's capabilities joined by
-`:`, the transaction), pre-commit (path, transaction; on standard input `LOCK-TOKENS:` and a `path|token` line per
-presented token), post-commit (path, revision, transaction), pre- and post-revprop-change (path, revision, author,
-property, action `A`, `M` or `D`; the new value, or the old one, on standard input) and the four lock hooks, each with
-`hooks.c`'s arguments (notes §7). A hook's standard input is a pipe, never Subversion's temporary file (R1). A stock
-hook reads the transaction with `svnlook -t TXN REPOS`, so slates installs its own `svnlook` (the subcommands hooks use:
-`author`, `cat`, `changed`, `date`, `diff`, `dirs-changed`, `filesize`, `history`, `info`, `lock`, `log`, `propget`,
-`proplist`, `tree`, `uuid`, `youngest`) first on the hook's `PATH`, answering from the work or the revision through the
-client channel and never from a disk, and REPOS is the repository's configured directory. A refusing pre-hook's
-standard error is the client's message (`E165001`); post-commit's becomes `commit-info`'s `post-commit-err`.
+*9. Hooks* (§4.17.1's hook rule; A-623). The server's nine hook points as stock `svnserve` 1.15 runs them, and nothing
+of Subversion's client side: slates offers the server alone, and a hook that reads its transaction runs the stock
+`svnlook -t TXN REPOS` itself; slates ships no `svnlook` (Ada's scope, 2026-11-19). Each hook runs through §4.17.1's
+driver over a read-only attachment of the work or the revision, and gets `hooks.c`'s arguments, standard input and
+environment exactly (notes §7; recorded from stock `svnserve` 1.15.0 in `crates/svn/fixtures/hooks`):
+- start-commit: the repository's directory (REPOS, its configured directory), the user, the client's capabilities
+  joined by `:`, the transaction.
+- pre-commit: REPOS and the transaction. On standard input, when the commit presented lock tokens, `LOCK-TOKENS:`, a
+  `path|token` line a token and a blank line; the path is the client's own, relative to its commit's base (`b.txt` for
+  `/trunk/with space/b.txt`), escaped as `svn_path_uri_autoescape` escapes (ten bytes: `%20` for a space, `%7C` for
+  `|`; `%` and every byte past ASCII kept). Otherwise nothing.
+- post-commit: REPOS, the revision, the transaction.
+- pre- and post-revprop-change: REPOS, the revision, the author, the property, the action `A`, `M` or `D`; the new
+  value, or the old one, on standard input.
+- pre-lock: REPOS, the path, the user, the comment, `1` for a stolen lock; its standard output, when it writes one, is
+  the lock's token. pre-unlock: REPOS, the path, the user, the token, `1` for a broken lock. post-lock and post-unlock:
+  REPOS and the user, the paths on standard input a line each. A commit that releases its locks runs pre-unlock for each
+  with its token, not broken, then post-unlock.
+
+Every argument is a C string that ends at its first NUL. A hook's environment is its own hooks-env section, else the
+default section, else nothing, and never the server's; a section named twice is one, and a section with no variables is
+none. Its directory is `/` and a hook with no input of its own reads the null device, as under `svnserve -d`; standard
+input is a pipe, never Subversion's temporary file (R1).
+
+What the client is told is `svnserve`'s own words, byte for byte (`check_hook_result`, `fs-wrap.c`, `serve.c`). A
+refusing pre-hook is `E165001` "Commit blocked by pre-commit hook (exit code 2)" (start-commit and pre-commit "Commit",
+pre-revprop-change "Revprop change", pre-lock "Lock", pre-unlock "Unlock"), then " with output:" and its standard error
+up to its first NUL when that is UTF-8, `[Error output could not be translated from the native locale to UTF-8.]` when
+it is not, or " with no output.". A hook a signal ended, or one slates killed past its learned bound, is "'pre-commit'
+hook failed (did not exit cleanly: apr_exit_why_e was 2, exitcode was 9). " and the same tail: `svnserve` has no
+deadline, so its words have no place for the bound. A program that cannot be executed is told as exit code 255 with no
+output, since `svnserve` learns of a failed `exec` only from its child's exit; one with no room to start is `E165002`
+"Failed to start '<program>' hook" over "Can't start process". Start-commit's refusal answers `open-root`, pre-commit's
+`close-edit`, and pre-lock's and pre-unlock's their own path among `lock-many`'s or `unlock-many`'s. A failed
+post-revprop-change is the command's `E165001`, the change standing; post-lock's and post-unlock's are `E165008`
+"Locking succeeded, but post-lock hook failed" and `E165009` "Unlock succeeded, but post-unlock hook failed" over
+`E165001`, after the `done`; post-commit's is `commit-info`'s `post-commit-err`, the commit standing. The unlock hooks a
+commit's release runs are logged and never told, as `svnserve` drops them.
 
 *10. Who may do what.* The transport proves the principal (§4.13): over `svn://` the SASL mechanisms `ANONYMOUS`,
 `CRAM-MD5` and, through the tunnel, `EXTERNAL`; over `https://` a TLS client certificate or Basic credentials inside
@@ -13669,6 +13913,26 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > Owed: the server's questions (piece 7: every path sent, every path a commit changes); the file read from the
 > repository (`authz-db` as a `^/` URL) and compiled per file identity; `svnserve`'s `force-username-case`; and
 > `mod_authz_svn`'s questions with HTTP (piece 13).
+>
+> **Status (2026-11-19, A-623: the hook points, item 9).** Built in `crates/server`'s `vcs_hooks`, pure and not yet
+> called: Subversion's nine points, each hook's input (`svn_start_commit` to `svn_post_unlock`, `SvnHooksEnv`), and what
+> the client is told of each outcome (`svn_told`, `svn_told_unconfigured`). Held to stock `svnserve` 1.15.0's own runs
+> on the Mac Studio, recorded by `crates/svn/fixtures/hooks/make-fixtures.py`: 33 cases, 64 hook runs and every byte
+> `svnserve` sent, SHA-256 checked. Every recorded input is rebuilt byte for byte, and every refusal's words are found
+> in the bytes `svnserve` sent. `cargo test -p slates-server --lib -- vcs_hooks hook_driver`: 37 of 37 on the tree
+> merged with A-622 part 3; red eleven ways, each guard broken in a copy failing the tests that hold it. slates ships no
+> `svnlook`; the rebuilt one was stopped by Ada's scope, and its recordings stay on the unmerged branch
+> `agents/g229-a623-svnlook`.
+> Owed: the record's six new points (`HookPointName` names pre-commit, pre-revprop-change and post-commit alone; the
+> others need wire tags, A-622); a hooks-env the owner can set (until then every hook runs with an empty environment,
+> as `svnserve` with no hooks-env file); from A-622 part 3's driver, which now starts a hook whose input asks for a
+> clean environment with none of the server's (this change): a Subversion hook's directory (`svnserve -d` runs hooks in
+> `/`, the driver in its view's root) and what REPOS names, which a stock `svnlook -t TXN REPOS` must be able to read;
+> pre-lock's standard output, which the driver sends to the null device, read as the token, and a bad one refused as
+> `svn_fs_lock_many` refuses it (`E160037`, "Lock token '…' is not ASCII or is a control character at byte 31" for a
+> trailing newline, recorded); a dangling link told apart (`svnserve`'s "Failed to run '…' hook; broken symlink",
+> recorded); no core dumps (`apr_exit_why_e` 6); the server's calls at commit, lock, unlock and revision-property
+> change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -13746,7 +14010,9 @@ refused, naming the hook. A lock in the way: refused as item 3.4 says. A holder 
 another `E160039`, a bad token `E160037`, already locked `E160035`, no such lock `E160040`, out of date for a lock
 `E160042`, an expired lock `E160041`, no principal `E160034`, a directory to lock `E160017`, a path to lock the head
 lacks `E160013`, a lock comment XML cannot carry `E130004`, a negative expiry `E200004`; a revision property's old value
-differs `E160049`; hook refused `E165001`; revision properties not enabled `E165006`; post-commit failed `E165007`; not
+differs `E160049`; hook refused `E165001`; a hook that could not start `E165002`; revision properties not enabled
+`E165006`; post-lock or post-unlock failed `E165008`, `E165009` (a failed post-commit is `commit-info`'s
+`post-commit-err`, never a failure: item 9); not
 authorized `E170001`; unreadable `E220001`, unwritable `E220004`; checksum `E200014`; property value `E125005`;
 mergeinfo `E200020`; malformed `E210004`; unknown command `E210001`; request too large `E210009`; svndiff `E185000` to
 `E185005`; LZ4 `E200046`. §4.17.1's typed refusals map onto these.
@@ -13784,8 +14050,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    cut anywhere).
 3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (its maps built,
    A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation built,
-   A-586: one record a copy, read by the latest copy above a key, one identity entry a copy; owed from it: the
-   checkpoint, the rebase, a copy from a changed source's older version, and the replace with history).
+   A-586: one record a copy, read by the latest copy above a key, one identity entry a copy; the replace with history
+   and copies nested in one increment built, A-626 part 1; owed: the checkpoint, the rebase, and a copy from a changed
+   source's older version).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
@@ -13799,8 +14066,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    part 1, its editor drive owed); commit; log, locations, segments, file revisions, deleted revision, replay;
    revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
-   oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
-   log). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
+   oracle). 9. Mergeinfo queries (built, A-605; `svn mergeinfo --show-revs` is the client's work over piece 7's
+   `get-mergeinfo`, `log` and segments). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
     (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH, LOCK's request and the update-report drive are
@@ -41688,9 +41955,10 @@ unknown).
     destination.
   - a copy from a version its source changed after: the source's changes since set back at the destination, as a
     branch sets back, and recorded in the chain entry so replay reads no folded history.
-  - Subversion's replace with history: a copy onto a path its own increment removes, which needs the removed tree held
-    by reference.
-  - moves, links and second copies into a copied tree in one increment.
+  - Subversion's replace with history: a copy onto a path its own increment removes. Built as A-626 part 1, key by key
+    rather than by reference (the A-626 entry weighs both).
+  - moves, links and second copies into a copied tree in one increment. Moves and second copies built as A-626 part 1;
+    links stay refused (Subversion has none).
   - the server's consumers of the change index (attachments' invalidation) treating a copy's destination as its tree.
   - the appearance records live as long as the green: a key they cover reads by them whatever the fold. Their bytes are
     charged with the change index's, and the chain bounds them while no checkpoint folds it.
@@ -42197,10 +42465,55 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   writes 2^64 - 1), the stored date as it is and time 0's date for an entry without one; both commands' entries come
   in hash order, compared as sets. The session value gains the repository's UUID (`svn:entry:uuid`). Studio:
   `cargo test -p slates-svn --lib reads` all passing, fixtures' sums checked.
-- **Owed** (the next slices): `get-file`, `list`, `log` with merged revisions, `get-location-segments`,
-  `get-file-revs`, `get-deleted-rev`, each with its transcripts; then `svn mergeinfo --show-revs`'s eligible and
-  merged revisions from the segments and the log; read access by A-606's rules, and the authentication request a
-  denied anonymous read makes when the session could authenticate.
+- **Part 2, its second slice** (2026-11-19, g297): `get-file` (`reads/file.rs`) and the first streamed answer
+  (`reads/stream.rs`). The fixtures were recorded again with revisions 8 to 11 (a 10,000-byte text and its change, an
+  empty text, a name in capitals, a path added again after its deletion, a file replaced by a copy, a revision without
+  an author, mergeinfo taken from a tag) and the sessions of every command still owed, scripted and stock (`svn cat`,
+  `ls`, `log`, `log -g`, `blame`, `blame -g`, `mergeinfo --show-revs`): 85 files, SHA-256 checked on the Studio and
+  here. Fifteen old transcripts changed: where the new revisions reach them (the youngest is now 11, the tag's
+  mergeinfo gone at 11) and where `svnserve`'s seeded hash order fell differently (revision 3's properties,
+  `get-locations`' entries), both already compared as the tests compare them. `get-file`: the parameters `c(?r)bb?B`;
+  the revision opened, then the checksum, the node row's MD5 (the MD5 of no bytes for a file without a text, as
+  `svn_fs_file_checksum` forces one), a directory refused "Attempted to get checksum of a *non*-file node" (160017,
+  `svn_fs_fs__dag_file_checksum`); the property list written even when not wanted, the inherited list only when asked
+  and empty when no ancestor has properties; the text as strings of 4,096 bytes (`get_file`'s buffer; recorded 4,096,
+  4,096 and 1,818 for a 10,010-byte text), the empty string and `( success ( ) )`, or the empty string and a refusal
+  when the green lost a text the index names. The `Repository` seam gains `text` (the bytes of a text from an offset,
+  a piece at a time), and `Outcome` gains `Streaming`: a command whose answer grows with the repository writes its head
+  and hands back a `Stream`, which the caller resumes with the room it gives each slice; each slice writes at least one
+  item and stops past the room, so a slice holds the caller's room and one string. Tests (the Mac Studio,
+  `cargo test -p slates-svn --lib`, 2026-11-19): 287 of 287, `cargo fmt --check` clean; the `get-file` session (18
+  commands) and its hostile one, and `svn cat` of a small and a large file, replayed whole; a text sliced in a room of
+  one byte and of all, the same bytes; a text the green lost; a file without a text; the parameters. Red-checked six
+  ways (strings of 4,000 bytes, a directory not refused, the empty MD5 wrong, no empty string at the end, inherited
+  properties inverted, `get-file` handed elsewhere): each failed named tests.
+- **Scope** (Ada, 2026-11-18, through main): slates offers the server's portion; `svn mergeinfo --show-revs`'s eligible
+  and merged revisions are the stock client's work over `get-mergeinfo`, `log` and the location segments, so no
+  server piece computes them.
+- **Part 2, its third slice** (2026-11-19, g297): `list` (`reads/list.rs`). The parameters `c(?r)w?l?l` (the
+  fields, each a word, any word but the six ignored; the patterns, each a string read to its NUL); the authentication
+  request; a revision past the youngest refused before `done`; then `svn_repos_list`'s walk, its `done` and its answer:
+  a depth below `empty` refused "Invalid depth 'N' in svn_repos_list" (165002; `exclude` -1, `unknown` and every word
+  `svn_depth_from_word` does not know -2), an absent path "Path 'P' not found" (160013), a file listed alone, an empty
+  pattern list answered at once, the path's own dirent when its name matches, then its entries depth-first, each
+  directory's in byte order, directories left out at `files`, a file matching no pattern left out, a directory
+  matching none walked unreported. A dirent is `( path kind ( size ) ( has-props ) ( created-rev ) ( date ) ( author ) )`
+  with absolute paths, each list empty when its field is not asked and the kind `unknown`, or `( path kind )` when
+  only the kind is asked; filled, every field is read whichever are asked, so a date that does not parse refuses the
+  listing after the dirents before it. Names match after Subversion's fold (`svn_utf__fuzzy_glob_match`: utf8proc's
+  decomposition, case folding and mark stripping, composed again; over ASCII the letters lowered), through A-606's
+  `apr_fnmatch` port, now re-exported to the crate. The walk is a `Stream`: it keeps one level of sorted names per
+  directory on its path, and a slice ends when the bytes it wrote and the entries it visited reach the caller's room.
+  Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 323 of 323, `cargo fmt --check` clean; the `list` session (16 commands), its hostile one and `svn ls -v -R` replayed whole;
+  slicing; a date that does not parse; the parameters; a pattern read to its NUL. Red-checked eight ways (entries in
+  reverse, names not folded, the kind `none` when not asked, `exclude` walked, dates never read, directories kept at
+  `files`, recursion at every depth: each failed named tests; the eighth, an empty pattern list walked, answers the
+  same bytes and failed once the test of its one slice was added).
+- **Owed** (the next slices): `log` with merged revisions, `get-location-segments`, `get-file-revs`,
+  `get-deleted-rev`, each replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
+  (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
+  general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
+  when the session could authenticate.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
@@ -42481,16 +42794,85 @@ Applied in the same change to:
       where git answered `unpack ok` and `ok refs/heads/main`.
   - On the tree merged with main (A-604's v0, A-615's refname, A-614's store), with the advertisement and the ref-name
     rule pointed at A-604's and A-615's: 287 of 287 under `--locked` (14.6 s), `cargo fmt --check` clean.
-- **Owed.** Part 2: each ref's update a work the engine judges (A-618), every ref recorded as one register entry
-  (A-603), with A-614's store as the `Repository` (a base's bytes assembled from the content plane). Then:
-  - the fsck checks of every new object (§4.17.2 item 4, A-590's `fsck`);
-  - the server loop that feeds the request reader and then the pack reader from one connection;
-  - review requests over `refs/for/` with report-status-v2's option lines (piece 10), hidden refs (`.have`),
-    and signed pushes (`push-cert`).
+- **Part 1, continued (2026-11-19): the pushed objects' fsck, hidden refs, the session, and each command's verdict
+  split from its append.** Asked by main once part 1 landed; A-642 and A-645 read as they landed.
+  - **fsck** (`receive::fsck`). Once the pack is whole, every commit, tag and tree in it goes through A-590's checks
+    under a push's strictness (`Strictness::Strict`: git's `index-pack --strict` and `unpack-objects --strict`, under
+    which a warning refuses), in pack order, before any ref moves. The first object refused ends the pack: every
+    command `unpacker error`, and on band 2 `error: object <id>: <finding>` and git's `fatal: fsck error in packed
+    object`. A blob passes until A-590 checks the `.gitmodules` and `.gitattributes` blobs a tree names.
+  - **The unpack status's words** follow git's `unpack_limit` (100, `transfer.unpackLimit`'s default): a refused pack
+    of fewer objects is `unpack-objects abnormal exit`, any other `index-pack abnormal exit`. Part 1 said index-pack
+    for every short pack, which git says only from 100 objects on.
+  - **Hidden refs** (`HiddenRefs`, a predicate A-597's `vcs_policy` answers in the server, as `transfer.hideRefs` and
+    `receive.hideRefs` hide). They are left out of the advertisement (`visible`), and a command naming one is refused
+    after the connectivity check, `deny updating a hidden ref` or `deny deleting a hidden ref`, in the order and words
+    of git's `reject_updates_to_hidden`. An object only hidden refs reach still counts as held: git's
+    `--exclude-hidden=receive` (2.39) keeps hidden refs from bounding its connectivity walk, for its cost alone.
+  - **The session** (`Session`): one push over one connection, sans-io. `advertise`, then `input` as the client's
+    bytes arrive and `end` when they stop, every answer written to the caller's `Out`; A-625's HTTP edge and A-594's
+    SSH channel drive it. It answers as the push's last byte arrives: a delete-only request as it ends, no pack
+    following it; any other once the pack's trailer is read; a pack cut short at the end of input, as git answers a
+    short pack. A request cut short, or one the protocol refuses, ends the session with nothing written, and bytes
+    after the push are not read.
+  - **Each command's verdict split from its append** (A-642, Ada). `Judge::judge` moves nothing and gives what its
+    append takes: part 2's work and the position its ref was read at. `Judge::append` moves one ref, one entry on its
+    own log, only while the ref is still at that position. Without `atomic` each command is judged and appended on its
+    own, in order, so one ref's refusal holds no other; under `atomic` every verdict comes first, then one
+    `append_atomic` moves every ref or none. git's words for a ref that moved: `failed to update ref`, and under
+    `atomic` `atomic transaction failed` for every command, its band-2 line once. The judging stays pure over
+    immutable versions, as A-645 asks.
+  - **Golden vectors.** The script captured two more pushes to the same server, eleven in all: `hidden`, a create of a
+    ref under `receive.hideRefs refs/hidden`, answered `deny updating a hidden ref`; and `fsck`, a commit with no
+    author email under `receive.fsckObjects`, answered `unpack unpack-objects abnormal exit` and `unpacker error`. The
+    nine earlier captures came out byte for byte the same. The fsck push's answer is git's on band 1 byte for byte,
+    and on band 2 line for line but for the prose git writes after a finding's id (A-590 names findings, not prose).
+  - **Tests** (`cargo test -p slates-git --lib`, 16 new and three of part 1's changed):
+    - every captured push answered as git answered, eleven of them;
+    - fsck: a commit with no email, a tag of an unknown type, a tree holding `.git` and a tree out of order each refused
+      with its finding and never judged; the `.git` tree kept by a default fsck and refused by a push's; the first
+      refused object in pack order named;
+    - hidden refs: left out of the captured server's advertisement, which with them shown is not git's; two creates,
+      an update, a delete and `refs/hidden` itself refused and never judged; connectivity's refusal first; an atomic
+      push naming one;
+    - the session: every captured push fed in pieces of 1, 3, 7 and 61 bytes and whole, answered as its last piece
+      arrives; every cut of every push answered as the push held whole; a refused request ending it; bytes after a push
+      not read; a request of no command;
+    - the appends, over a model of per-ref logs: without `atomic`, a ref moved between its verdict and its append
+      refused alone; an atomic push one append on all three refs; one whose ref moved appending to none; a verdict
+      declined under `atomic` appending nothing;
+    - the unpack status at 99 and at 100 objects.
+  - **Checks.** On the Mac Studio (kiln, debug, 2026-11-19), the tree merged with main (A-638's views, A-642, A-645):
+    - the first run (r866) stopped at A-638's test of `receive`, written to the old seam; it now accepts with `()`;
+    - r877: 349 of 349 under `--locked` (two of main's ignored; load 6.5, 14.4 s). Failing first: with fsck, hidden
+      refs, the limit's words, the appends and the session stubbed, 17 of the 31 `receive` tests failed: every new one
+      but the two that guard what mutations 2 and 6 break, and the three part-1 tests whose words changed;
+    - red ten ways by mutation: a default fsck (2 failed); hidden refs before connectivity (2); the hidden reasons
+      swapped (3); the limit's boundary at `<=` (1); an atomic push appended ref by ref (2); a declined atomic push
+      appending what was accepted (1); a delete-only push waiting for a pack (4); fsck's band-2 lines dropped (3); a
+      refused append's band-2 line on every command (1); a refused request not ending the session (1);
+    - `cargo fmt` rewrapped nine files (brought back by blob hash), then 349 of 349 again (load 11.4, 15.2 s), and
+      `cargo fmt --check` clean.
+  - Also in this change: the entry and delta generators draw plain tuples and selectors in place of the Arc-backed
+    `prop_oneof!` (R2), with its equal weights; `fed_in_chunks` (A-608's tests) refuses where it asserted; the receive
+    module's comments are wrapped at 100 columns; GAPS' §4.17 entry loses the conflict markers a merge on main left,
+    A-638's and A-624 part 2's paragraphs both kept.
+- **Owed.** Part 2, `Judge` over the engine: each command's ref the green its name maps to; its update a work through
+  A-618's `build` over A-638's `PushedObjects` (the index, then the push's quarantine), judged pure over immutable
+  versions (A-645), several judged together under `atomic` (A-635); appended per A-642 through a trait until g261's
+  per-green append lands. Then:
+  - review requests over `refs/for/` with report-status-v2's option lines (piece 10), and signed pushes (`push-cert`);
+  - the `.have` lines of objects a fork shares (git's alternates);
+  - the warnings git's strict check writes on band 2, and A-590's checks of the `.gitmodules` and `.gitattributes`
+    blobs.
 
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`receive/`, new, with its
 tests; `unpack.rs`'s `Outside`, `NoObjects` and `Reader::finish_with`, and its test; `lib.rs`'s module line);
-`crates/git/fixtures/push/` (new); `.gitattributes` (the push fixtures, byte for byte).
+`crates/git/fixtures/push/` (new); `.gitattributes` (the push fixtures, byte for byte). The continuation, to: §4.17.2's
+status; GAPS (the §4.17 entry, and its conflict markers); `crates/git` (`receive/`: `fsck.rs` and `session.rs` new,
+`mod.rs`, `report.rs`, and the other modules' comments; `receive/tests/`: `append.rs`, `checks.rs` and `session.rs` new;
+`unpack.rs`'s `format`, `objects` and `is_whole`; `tests/entry.rs`, `tests/delta.rs`, `tests/unpack.rs` and
+`tests/store/views.rs`); `crates/git/fixtures/push/` (two pushes, the script, `SHA256SUMS`).
 
 ### A-627 — `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token` read (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part, in part; A-609, A-602)
 Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), `research/vcs-servers-subversion.md` (§1's
@@ -42859,6 +43241,851 @@ Applied in the same change to:
 - **Owed** (GAPS): part 2, the editor drive answering a finished report; URLs read as `svn_uri_canonicalize` reads
   them; and the authentication `svnserve` asks for mid-session when an anonymous `update` may not read.
 
+### A-631 — a work never changes a node removed after its base: a metadata change and a link's rename (2026-11-19, g267, UI goal 93; §4.16 "The verdict"; A-612's siblings)
+Applied in the same change to:
+- §4.16's verdict and its status; GAPS (A-612's siblings, fixed; the siblings probed here, filed open);
+- `crates/merge/src/engine.rs`: `file_removed` recorded for every type's removal; the mode, attribute-set and
+  attribute-removal verdicts read it; `file_removed_since`'s doc put back above it;
+- `crates/merge/src/engine/replaced_node_tests.rs`, new: the failing-first tests and the generated oracle;
+- `docs/bugs/2026-11-19-a-metadata-change-or-a-links-rename-based-before-its-node-was-replaced-landed-on-the-new-one.md`.
+- **The defect.** A-612 refused a work's content edit or rename of a regular file removed after its base, by a record of
+  the last version that removed the file at each path. Two siblings were left:
+  - A mode change, or an attribute set or removed, based before its node was removed and made again, was judged only
+    by its own dimension's last change, which a removal does not touch. It was accepted and changed the new node.
+  - A rename of a symbolic link or a hard link removed and made again was not refused, since the record held regular
+    files alone. It moved the new link.
+- **The rule, from §4.16 and D-27.** A node removed after a work's base is gone for that work, whatever was made at its
+  path since: a change to it is delete against modify in either direction, and a rename of it is rename against rename.
+  `commit` now records the removal of a symbolic link, a hard link's name, an IPC node and a directory, as it did a
+  regular file's. The mode, attribute-set and attribute-removal verdicts refuse `DeleteModify` when the path's node was
+  removed after the base, unless the work makes the path itself (`established`). The rename verdict already read the
+  record, so a replaced link's rename is `RenameRename`.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 6 to 9), green on kiln r786 and, merged with main, r810:
+  - `cargo test -p slates-merge --lib`, the whole suite, 79 of 79 (r786) and 92 of 92 (r810);
+  - `cargo fmt -p slates-merge -- --check`, clean on both.
+
+  The failing-first tests:
+  - each metadata change based before its file was made again is `DeleteModify`, the head unmoved and the metadata
+    kept, and the same change based at the head is accepted;
+  - a rename of a symlink, and of a hard link, made again after its base is `RenameRename` on the destination;
+  - the oracle: generated histories over a file, a symbolic link, a hard link and a directory, each removed and made
+    again while works based behind the head change a mode, an attribute or a name. Every answer is held to the rule,
+    and a census requires each case to run (a metadata change refused, a link's rename refused, a file's rename
+    refused, an accept).
+
+  Red on r786, with the records and checks reversed: all three failed. The mode change was `Accepted { version: 3 }`
+  and changed the new file's metadata; the symlink's rename was `Accepted { version: 3 }` and moved the new link; the
+  oracle shrank to a symlink made again, then an attribute removal on it based before that, accepted.
+- **Siblings probed, not changed** (GAPS; a scratch test on the Studio, never committed, re-run merged with main on
+  r810):
+  - a symbolic link or a hard link renamed over an unchanged regular file is accepted, even at the head, and the green
+    then holds both the file and the link at one path;
+  - a directory's removal takes no base, so one based before the directory was made again removes the new one;
+  - a file's unlink or a directory's removal based before a mode or attribute change at the head is accepted;
+  - a hard link made to a target removed and made again after its base links the new file.
+
+  A fifth, a removed node's mode and attributes outliving it and passing to the next node made at its path, was found
+  before the merge and closed by A-618 meanwhile; r810 answers neither after a removal or a remake.
+
+### A-632 — a chain entry finds what its increment declared in one pass (2026-11-19, g267, UI goal 93; §4.16 "Commit"; found by A-621's reading)
+Applied in the same change to:
+- §4.16's chain entry status; GAPS (the entry filed by A-621, fixed);
+- `crates/merge/src/chain_entry.rs`: `Declared`, built once per entry encoded or decoded, replaces `declared_ops` and
+  `declared_copy`;
+- `docs/bugs/2026-11-19-a-chain-entry-scanned-its-increment-for-every-splice.md`.
+- **The defect.** An entry records a splice whose ops are the ones its increment declared by its path alone, and finds
+  those ops again in the increment: on encode to compare, on decode to restore. Each effect scanned every op of the
+  increment for its path, and each copy for its source version (A-586), O(effects × ops). That is about 5 × 10⁹ visits
+  for a version splicing 50,000 files of a 100,000-op increment, on the owner's commit and on every holder's replay.
+- **The index.** One pass over the increment's ops builds each path's content ops in order and each copy's source
+  version by destination, then source, the first one a pair declares. Encode and decode build it once, so each op is
+  visited once and each effect is an ordered-map lookup. The entry's bytes are unchanged; it stays version 5.
+- **Tests** (debug, Mac Studio, 2026-11-19), green on kiln r786: `cargo test -p slates-merge --lib`, 79 of 79, and 92 of
+  92 merged with main (r810). The
+  failing-first test counts the increment's ops visited (a counter in test builds): an entry splicing 1,000 files as
+  declared visits 1,000 on encode and 1,000 on decode, and decodes to what was recorded. Red on r786, with the index
+  rebuilt for every effect: 1,000,000 each way.
+
+### A-624 part 2 — v2's `object-info` and `bundle-uri`, read and answered over store traits, and the server's `packfile-uris` choice (2026-11-19, g230, UI goal 93; §4.17.2 "Pieces (git)" piece 14's rest, "The wire", "A fetch" items 3 and 4; after A-582 part 2, A-614 part 1 and A-624 part 1)
+Applied in the same change to:
+- §4.17.2's status, "The wire" (`bundle-uri` advertised where a repository offers a list), "A fetch" item 3 (the
+  inline pack a prefix of the units, the URI packs tiling the rest) and item 4 (`object-info` answers size, git 2.50.1's
+  one attribute); GAPS (the §4.17 entry); `research/vcs-servers.md` §5.6, and §5.4's owed reading discharged;
+- `crates/git/src/v2` (`object_info.rs`, `bundle_uri.rs` and `packfile_uris.rs`, new; `request.rs` reads both
+  commands; `mod.rs`); their tests, and the shared golden tests (`tests/mod.rs`: two message kinds, nineteen new golden
+  streams through every cut, every bit flip and random streams); `crates/git/fixtures/v2-rest` with
+  `make-v2-rest-fixtures.sh`, and `tests/v2_rest_fixtures.rs`.
+- **`object-info`, as git 2.50.1 answers** (`protocol-caps.c`). The arguments are `size` and `oid <id>`. A request
+  naming no object gets the flush alone; otherwise `size` where it was asked for, then each object's line in the order
+  named, its id and size, an object the server lacks as its id and a space, ids alone without `size`, every line
+  without an LF where the grammar puts one. A request git answers with an `ERR` line and goes on (an argument it does not
+  know, an id it cannot read) is refused here by kind before any answer, as `fetch`'s and `ls-refs`'s are. git echoes
+  each id as its client wrote it; this writes `oid_to_hex`'s lower case, A-624's rule, the same bytes for every client
+  git ships. The answer asks a repository one thing (`ObjectSizes`); A-614's store answers it by its rows (`Stored`,
+  an object with no row unknown, so a push's objects stay hidden until its verdict, as git's quarantine hides them).
+  git's master adds a `type` attribute; it is owed when a release ships it.
+- **`bundle-uri`** (`bundle-uri.c`, `connect.c`). The request takes no argument and one is refused, as git's server
+  dies on it. The answer's lines are read as git's client reads them: split at the first `=`; a line with no `=`, an
+  empty key or value, a key outside `bundle.`, a version other than 1 (canonical decimal), a mode other than `all` and
+  `any` is refused by kind; keys and heuristics git does not know are kept by name. A bundle's second `uri`, which git's
+  client also refuses, is a rule of the list, not of a line; `answer` cannot write one. `answer` writes a repository's
+  `BundleList` as git's server writes the same configuration: `bundle.version=1`, `bundle.mode`, `bundle.heuristic`
+  where there is one, then each bundle's `uri` and `creationtoken`, keys in git's configuration case, no LF; a
+  repository offering no list gets the flush alone. An id that is empty or holds `=`, or an empty URI, is refused, since
+  git's client could not read it back.
+- **The `packfile-uris` choice.** §4.17.2 let the server name the base pack and runs of fragments by URI; this states
+  which. git's client indexes the inline pack first and only then downloads each URI's pack, in the order listed, each
+  indexed with the inline pack's arguments (`fetch-pack.c`), so a delta's base is completed from the repository
+  (`--fix-thin`, under `thin-pack` only) but never from a URI pack still to come. So the inline pack carries a prefix of
+  the fetch's units (the base pack where it is a clone, then each version's fragment), and the URI packs tile the rest
+  exactly, in order; without `thin-pack` only a self-contained pack may go by URI. A pack goes to a client only as git's
+  server allows: its URI begins with a protocol the request lists, then `:` (`pack-objects.c`), and only under
+  `sideband-all` (`upload-pack.c` clears the list without it). Of the tilings, the longest suffix in the fewest packs,
+  found from the run's end back over the offered packs by their first unit, in time and room in proportion to the packs
+  offered whatever the run's length, charged to the caller's admission first. So a base pack offered alone is never
+  sent by URI to a clone that needs the fragments after it: they would have to come inline, after it.
+- **Golden vectors.** `make-v2-rest-fixtures.sh` (git 2.50.1, Apple Git-155, on the MacBook, 2026-11-19; run twice, 30
+  files byte for byte alike, no local path in any byte, the bundle's URI relative). git ships no `object-info` client,
+  so its requests are written by the script and answered by `upload-pack --stateless-rpc`: sizes of a blob, a tree, a
+  commit, a larger blob and an object the server lacks; ids alone; no id; an upper-case id; and the same in a SHA-256
+  repository. A stock clone with `transfer.bundleURI` on, its whole session teed: the client asked for the list,
+  downloaded the bundle by its relative URI, filed it as `refs/bundles/heads/base`, and fetched with the bundle's commit
+  as a `have`. A stateless `bundle-uri` exchange. Fetches from a server naming the larger blob's pack by URI
+  (`uploadpack.blobPackfileUri`), taken as `https`, as `http` only, without `sideband-all`, and as `ftp,https`. Every
+  object of the SHA-1 repository as loose bytes, for the store test.
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 292 of 292, and 326 over
+  main as it landed, 2 of main's ignored; fmt clean). The merge met A-614 part 2's new `Incoming::depth`: the store
+  test hands its loose objects in whole, depth zero.
+  Each answer is the one stock git wrote from the same objects, from a plain list and from A-614's store itself (every
+  object pushed, a branch moved, the answer read from the rows); an upper-case id is read and answered in lower case,
+  where git echoed it; the bundle list is answered with every byte git wrote, and the stock clone's session reads and
+  writes back message by message; git's four `packfile-uris` decisions are made here and the section's lines are the
+  ones git wrote; the choice equals a brute-force oracle over generated runs, offers and requests; refusal tables for
+  each grammar; nothing written on a refusal; admissions charged exactly.
+  - Red first: the tests against modules whose every entry point refuses, 21 failed (the 18 new and three shared golden
+    tests that carry the new streams); the checksum test passes alone.
+  - Red ten ways by mutation, each on a copy and caught by the test that names its rule: the `size` line written with no
+    object named; an unknown object written without its space; the store's size read off by one; a size read with no
+    `size` line before it; a bundle list of version 2 read; the creation token's key in the documentation's case
+    (`creationToken`, where git's configuration writes `creationtoken`); URIs offered without `sideband-all`; a
+    protocol taken as a bare prefix (`http` for `https`); a thin pack offered without `thin-pack`; the shortest tiled
+    suffix chosen instead of the longest. A control passed 59 of 59.
+- **Owed:** the store's own bundle list and URI packs (each a run of A-614 part 2's fragments, with its hash and URI),
+  and the fetch path that asks for them (piece 7); `object-info`'s `type` when a git release ships it.
+
+### A-642 — changesets in write-ahead logs, lock-free incremental commits, no global references (2026-11-19, Ada; main; UI goal 93 (kiln 51cef9f7); §4.17.1 shared piece 2; supersedes A-603's repository-wide position)
+
+- **What Ada asked.** "Write-ahead log & lock-free commits. The fundamental unit of work is a "changeset" stored as an
+  entry in a write-ahead log. ... server-side, lock-free incremental commits and avoids global references to keep merge
+  throughput high."
+- **What already holds.** A push becomes a work, an ops document: a changeset. It is judged against its base and
+  appended as a log entry that recovery replays (the db's guard-then-apply log). A commit carries its changeset's
+  operations, never a tree snapshot. A repository lives on one owner shard with one writer, so no commit takes a
+  lock (R2, D-7).
+- **What changes.** A-603 made every change of a repository take the next position in one repository-wide register.
+  That position is a global reference: a push to one branch waits behind a push to another, and in a fleet every
+  change replicates through one ordered record. Instead:
+  - each green keeps its own log; its changesets append there, ordered by that green's own positions;
+  - a repository has no position every change passes through;
+  - an atomic push across greens is one entry on each green it moves. It appends only while each green is still at the
+    position the push read, and is refused otherwise, typed, naming the green that moved;
+  - checks on greens a push does not move (Mercurial's `check:heads`) compare those greens' positions the same way;
+  - the repository's own state (Mercurial's phase roots and obsolescence markers, LFS locks) is kept in logs of its
+    own, never a counter every push must pass.
+- **Why, under the worst case (Ada, 2026-11-19: "Assume worst case").** On one node the two shapes cost the same:
+  the owner shard runs a repository's operations one at a time and neither takes a lock. In a replicated fleet a single
+  ordered register makes every later change wait for an earlier one to commit at f + 1. In the worst case a large
+  push, a kernel-size first push of hundreds of MB, then stalls every other branch's pushes until it has replicated.
+  With a log per green only that green's later pushes wait.
+- **Robustness, by design.** The single register's strengths are kept by these rules:
+  - An atomic push across greens is one record naming each green and the position it expects, committed whole or not
+    at all, with each green's log pointing at it. A holder applies it only once every named green has reached its
+    predecessor: a join that only atomic pushes pay.
+  - On the owner, a read of every green's head in one turn is consistent by construction, since the shard is the
+    single writer. A replica's read carries a vector of per-green positions and refuses a cut an atomic record would
+    split.
+  - Recovery replays each green's log in its own order and applies an atomic record at its join. A takeover adopts
+    each log, and an atomic record whole or not at all, held to the register's invariants (NoLoss, Agreement,
+    StaleNeverCommits) by a model test that crashes and recovers at random points.
+  - Subversion is unaffected: a Subversion repository is one green (§4.17.4), so it keeps one ordered log.
+- **Lock-free, server-side merging (Ada, 2026-11-19: slates works primarily like EdenFS and Sapling, offering git,
+  Mercurial and Subversion compatibility; the reference design's principle is server-side lock-free incremental
+  commits with no global references).** A work submitted to a green that moved past its base is judged and rebased by
+  the verdict on the owner shard (accept, identical or conflict). It is never refused for its older base, so a hot
+  green gives no client a compare-and-swap retry loop. Stock clients bound this where their own semantics do: git
+  refuses a push to a moved branch as a non-fast-forward, so a git push is rebased server-side only where the
+  branch's policy turns pushrebase on; Mercurial's pushrebase takes it as is.
+- **Owed.** A-603's entry rebuilt to this shape, and its fleet half on each green's log (g261, with A-635 and A-636).
+  The pushes coding against it (receive-pack A-620, Mercurial's unbundle A-641, LFS locks A-629) keep their traits.
+- **Applied in the same change to:** §4.17.1 shared piece 2's text; GAPS' §4.17 entry.
+
+### A-617 part 2a — The commit's request and its editor commands read as `svnserve` reads them, held to stock `svn` 1.15.0's own commits recorded through a relay (2026-11-19, g268 for UI goal 93; §4.17.4 "5. The wire", piece 7)
+Applied in the same change to: §4.17.4's status (A-617, part 2a), GAPS (the §4.17.4 entry), the research notes
+(`vcs-servers-subversion.md`: §1's `editorp.c` row; §14, new), `crates/svn/src/commit.rs` (`pub mod edit`, its doc
+sentence, one line rewrapped), `crates/svn/src/commit/edit.rs` and `crates/svn/src/commit/edit/tests.rs` (new),
+`crates/svn/fixtures/commit/` (new: the recording script, 52 streams of 26 connections, `sessions.txt`, the tools'
+versions, `SHA256SUMS`), `crates/svn/src/commit/tests.rs` (main's two clippy findings: A-592's oracle `merge`, which
+returns a `Result`, answers a node that is not a directory with a typed stop where it asserted, and the generator's
+anonymous share reads `is_multiple_of`; the case checker's revision lookup returns its miss rather than unwrapping it).
+- **What was there.** Nothing read `commit` or the editor commands after it: the item codec (A-531) parses items, and
+  the handshake (A-599) and the read commands (A-613) answer their own. A-592's out-of-date test and verdict waited for
+  a drive.
+- **The decision.** One typed value per command, `EditCommand`: a variant for each name `editorp.c`'s table dispatches
+  and for `failure`, its fields borrowed from the parsed item. `EditCommand::read` reads one as `vparse_tuple` reads its
+  handler's prototype; `to_value` writes it back as `marshal.c`'s `svn_ra_svn__write_cmd_*` write it.
+  `CommitRequest::read` reads `commit`'s parameters as `serve.c` does, and `lock_tokens` reads the tokens as
+  `add_lock_tokens` does, later and as a command failure. The refusals are typed: `EditRefusal::Malformed` with its
+  `Malformation` (`E210004`, the connection ends), `EditRefusal::UnknownCommand` (`E210001`, a command failure) and
+  `LockTokensRefusal` (`E210004`, a command failure). Two are stricter than `svnserve`, each for an input no stock
+  client sends: a NUL inside a C string (`svnserve` reads `a\0b` as `a`) and a revision past `svn_revnum_t` (`svnserve`
+  casts it to a negative number, which reads as no revision). Which command may come when, and every check of the commit
+  editor, are the drive's (part 2b).
+- **The recordings.** On the Mac Studio, stock `svn`, `svnserve` and `svnadmin` 1.15.0 (r1937767): `make-fixtures.py`
+  makes a repository and its working copies in a directory of its own, runs 34 steps as two users, and its `--tunnel`
+  role relays each `svn+fixture://` connection to `svnserve -t`, logging every byte each way. 25 sessions reached the
+  server over 26 connections, 17 of them commits. Four commits were refused as stock refuses them: `E160028` twice (a
+  file out of date, and a property change on a stale root), `E160039` (another user's lock) and `E160024` (a conflict,
+  made by holding the client's stream at `close-edit` while another commit landed). `sessions.txt` keeps each step's
+  command, user and exit, and the refusals' messages; `SHA256SUMS` each file's digest.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the pushed branch, its own target
+  directory). Failing first (05:17 UTC): with the readers stubbed, 9 of the new tests failed. Green (05:18 UTC,
+  eee90bd82): `cargo test --locked -p slates-svn --lib` 245 of 245 in 2.08 s; the prototype oracle's census: 136
+  generated items read alike, 93 refused alike, 27 refused by the stricter rules alone. The module's line citations were
+  checked against the sources at `d434dc14` before landing, and 23 of them corrected. On the tree merged with main
+  (0234aaa50, 05:42 UTC): 315 of 315 in 8.82 s, the census 153, 70 and 33; `cargo fmt -p slates-svn -- --check` clean.
+  Clippy, `xtask check` and the doc gate are main's (the run-request queue).
+- **Owed.** Part 2b, the drive (§4.17.4's status).
+
+### A-638 — The store as the push path reads it: receive-pack's thin-pack bases and connectivity from the index alone, and a push's trees above the index for its work (2026-11-19, g225, UI goal 93 (kiln 51cef9f7); §4.17.2 "A push" items 3 and 4, "Pieces (git)" pieces 5 and 6; §4.17.1 "A push is a work"; after A-614, A-618, A-620)
+
+- **What.** Two views of one repository's objects in the shared content store (`crates/git/src/store/views.rs`).
+  `IndexedObjects` implements receive-pack's `Repository` (A-620): the pack reader's thin-pack bases and the
+  connectivity check's stopping points, read from the index alone. A push's quarantined objects have passed no check,
+  so they are never a base and never end a walk. `holds` reads a row and no bytes. `PushedObjects` implements A-618's
+  `PushObjects`: the index first, then the push's quarantine, the store's own order.
+- **Lending without a copy, and a bounded keep.** slates-vcs keeps an object of at most one window as that window, so
+  both views lend such an object as the store keeps it. Both traits lend borrowed bytes; receive-pack's lends `&[u8]` for
+  the view's borrow. So a longer base is assembled once into a slot that never moves (segments of slots, each twice the
+  last, all safe `OnceCell`s), kept for the view's life and lent again to every delta naming it. Each is charged to the
+  view's room before it is assembled; a base past the room is answered as not held and named (`refused`), so the
+  caller can tell it from a base the repository lacks. A `Cow` return on `unpack::Outside` and `receive::Repository`
+  would let a view lend an assembled base without keeping it. Those traits are A-608's and A-620's, so this keeps
+  their signatures.
+- **Modes as git reads them.** `Entry::canonical_mode` (`objects/tree.rs`) is git's `canon_mode`, which
+  `decode_tree_entry` applies to every mode it reads (tree-walk.c, read-cache-ll.h). A regular file is executable when
+  its owner's execute bit is set; any mode but a regular file, a symbolic link or a directory is a submodule's link.
+  Stock git 2.50.1 on the Mac Studio, 2026-11-19 (`git ls-tree`, and `git ls-files -s` after `git read-tree`), read
+  `100600` and `100664` as `100644`, `100700` and `100775` as `100755`, and a typeless `644` as `160000`. The test holds
+  the views to exactly that.
+- **Typed refusals.** A-618's `Unavailable` gains `Malformed` (a tree the tree walk cannot read, a type number with no
+  name) and `PastRoom` (a listing past the store's room). The store's `Repository::indexed` is `pub(crate)`, the one
+  line this needed in A-614's module.
+- **Tests and runs.** Seven tests (`crates/git/src/tests/store/views.rs`):
+  - a base lent from the index alone, as kept, with `holds` lending nothing;
+  - a long base assembled once and lent again;
+  - the room refused and named;
+  - receive-pack resolving a thin pack of two reference deltas on a base the store holds across windows, through
+    `receive`;
+  - the stock-git mode table;
+  - every refusal by kind;
+  - two pushes becoming works through the store with A-618's `build`: versions 1 and 2, the green holding the client's
+    bytes and modes, and reads of 3 trees and 4 blobs, then 4 trees, 1 blob and 1 directory skipped.
+
+  On the Mac Studio, 2026-11-19: the tests were red first, 7 of 7 failing against stubs, and red five ways by mutation:
+  `holds` reading bytes (2 failed), no reuse (2), only the standard modes (1), no lending without a copy (4), the room
+  uncharged (1). Merged with main (A-614 part 2, A-615, A-624), `cargo test -p slates-git --lib` passed 333 of 333 with
+  main's 2 ignored, `cargo test -p slates-merge --lib` 92 of 92, and fmt was clean.
+- **Applied in the same change to:** `crates/git/src/store/views.rs` (new), `store/mod.rs` (its `mod` line),
+  `store/repository.rs` (`indexed`), `objects/tree.rs` (`canonical_mode`), `crates/merge/src/push.rs` (`Unavailable`),
+  `crates/git/Cargo.toml` and `Cargo.lock` (slates-merge), §4.17.2's status, GAPS §4.17.
+- **Owed.** receive-pack's part 2 submitting each ref's work through these views (A-620's part 2). The submodule link's
+  special-node kind (A-637). Charging the transient tables A-618's walk holds, beside the store's room.
+
+### A-645 — the version-control servers at agentic Meta scale, held to Anthropic's Scion (2026-11-19, Ada; main; UI goal 93 (kiln 51cef9f7); §4.17.1; with A-642)
+
+- **Source.** Anthropic, "Redesigning source control" (anthropic.com/research/redesigning-source-control, read
+  2026-11-19) describes Scion. Its numbers: about 30,000 merges a day by September 2026, growing about 10x in five
+  months; a main-branch history of almost 100 GB and a compressed working copy over 25 GB; about 25 million CI
+  checkouts a day. Ada: slates works "not just on local laptop but at agentic Meta scale. Absolute extremes."
+- **Targets.** slates is designed and tested at no less than ten times those numbers: a history of 1 TB, a working copy of
+  250 GB, 300,000 merges a day with peaks at many times the mean, and 250 million checkouts a day. The laptop is the
+  degenerate case of the same code (R8).
+- **What slates already shares with Scion.**
+  - A change is an entry in a write-ahead log, created and merged on the server (works, the verdict), with nothing
+    pushed by a native client.
+  - Content is addressed by its identity and immutable, so any tier may cache it.
+  - A checkout is a volume made in microseconds that materializes only what is read (R9).
+  - Branches have no global lock (A-642).
+- **What this amendment adds, each one a piece owed under goal 93.**
+  - **Derived data, one mechanism.** Every structure that is not a change is derived data: git's trees, commits and pack
+    fragments, Mercurial's manifests and changelog entries, Subversion's node revisions, blame, path history, merge
+    bases and skip lists, copy detection, file search. Each type for a version is computed from its parents' values,
+    eagerly or lazily, and stored immutable by identity, so any server or tier computes, caches and serves it without
+    coordination. The tool stores built so far (A-553, A-588, A-614) become types under it, not sources of truth.
+  - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
+    its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
+    at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
+    increment since that position, so the hottest green's throughput is its owner's append rate, not its verdict rate.
+  - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
+    Native workflows keep few long-lived greens.
+  - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
+    client.
+  - **Fetches name immutable objects.** A native client asks only for what it wants, never states what it has, and each
+    request is resumable and cacheable at every tier. The tiers are strict, so a failed tier never floods the one
+    above it (with goal 91's federation).
+- **Applied in the same change to:** this entry; GAPS' §4.17 entry.
+
+### A-633 — The SSH server's user authentication and session channel: publickey with Ed25519 and RSA SHA-2 through a principals lookup, one session taking `env GIT_PROTOCOL` and one `exec` of git's, Mercurial's or Subversion's command, flow control from the caller's budget (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2 and "Pieces (git)" piece 9; §4.13; §4.17.3, §4.17.4; after A-594)
+Applied in the same change to:
+- §4.17.2's status and its SSH item (RSA user keys under RFC 8332; Mercurial's and Subversion's commands); §4.17.3's
+  transports and §4.17.4's svn+ssh (slates' own SSH server reads their commands); GAPS (the §4.17 entry);
+  `research/vcs-servers.md` §5.6 (new: the sources, pinned by hash);
+- `crates/ssh` (new: `userauth`, `channel`, `command`, `session`; `transport` sends EXT_INFO and gives each upper-layer
+  message its sequence number; `refusal` gains reason 14; their tests; `fixtures/userauth` with `make-fixtures.sh`).
+- **Authentication** (RFC 4252). `none` is answered with a failure naming `publickey` and is never counted. A query is
+  answered `SSH_MSG_USERAUTH_PK_OK` only for a key a principal holds. A signature over the session id and the request
+  (§7) is checked through aws-lc-rs, and only for a held key, so a client can make the server verify nothing it would
+  not accept. Keys: `ssh-ed25519`, and RSA under `rsa-sha2-512` and `rsa-sha2-256` over the `ssh-rsa` blob (RFC 8332
+  §3), within the 2048 to 8192 bits aws-lc-rs's verifiers take; a signature must name its request's algorithm (§3.2),
+  and one shorter than its modulus is padded with leading zeros, which §3 allows. `ssh-rsa` with SHA-1 is refused, as
+  OpenSSH 8.8 refused it by default. ECDSA and FIDO keys remain owed. The algorithms are announced in RFC 8308's
+  `server-sig-algs`, which the transport sends as the packet after its first NEWKEYS to a client that listed
+  `ext-info-c` (§2.4).
+- **Principals.** A key proves a principal only through `KeyHolders`, the server's lookup over §4.13's principals; the
+  crate keeps no keys. A principal whose policy wants several keys gets partial successes (§5.1) until that many
+  distinct keys of its have signed; a change of user name drops what was proven (§5).
+- **The failure limit** is the caller's. RFC 4252 §4 recommends 20 (`RECOMMENDED_FAILURE_LIMIT`), and past the limit the
+  server disconnects with reason 14, no more authentication methods. It is not learned here: a tail of the failures
+  that successful clients needed would never see the clients it cut off, so a learned limit needs a floor that lets a
+  client offer each key it holds. That is owed with the listener.
+- **The channel** (RFC 4254). One session at a time, on the design's "one session channel". `env` is taken for
+  `GIT_PROTOCOL` alone (§6.4), and one `exec` (§6.5) parsed by `command::parse` and raised to the caller, never run:
+  - git's `git-upload-pack '<path>'` and `git-receive-pack '<path>'`, the path read as git's own `sq_dequote` reads it
+    (`quote.c`, `connect.c` at `e1ec09b2`);
+  - Mercurial's `hg -R <path> serve --stdio`, with `--hidden`, the path bare or single-quoted as 7.2's `_serverquote`
+    writes it and the five words `contrib/hg-ssh` accepts; a shell metacharacter, a double quote or a stray backslash
+    is refused;
+  - Subversion's `svnserve -t`, the tunnel agent's fixed arguments (`libsvn_ra_svn/client.c` at `d434dc14`).
+  Every other request is answered `SSH_MSG_CHANNEL_FAILURE` when a reply is wanted, and every global request
+  `SSH_MSG_REQUEST_FAILURE`. Opens are refused as administratively prohibited for RFC 4254's own forwarding types, as
+  an unknown type (as §5.1 requires) for the rest, and as a resource shortage for a second session.
+- **Flow control, no fixed size.** The window offered is the caller's budget; the packet offered is the transport's
+  cap less the framing (`channel::max_data`), as §5.2 requires ("MUST NOT advertise a maximum packet size that would
+  result in transport packets larger than its transport layer is willing to receive"). A client sending past either
+  is refused. The window is given back once a packet's worth has been consumed, or sooner when what is left could not
+  carry a packet, so a small window never deadlocks. Sends stay within the client's window and packet and RFC 4253's
+  35000 bytes; `Writable` says when a held send may go again.
+- **Ending.** `exit-status`, then EOF, then close, in that order (§6.10). A client's close is answered with the server's
+  own unless it was already sent (§5.3).
+- **Sending order.** Every reply and every byte of data goes through one queue, bounded by the packet cap. It is flushed
+  as far as the transport takes it, so nothing is sent inside the server's own key exchange (RFC 4253 §7.1), and
+  reading stops while the queue is full.
+- **Tests** (`cargo test --locked -p slates-ssh --lib`, Mac Studio d1323898). 105 of 105 at c088a300, with
+  `cargo fmt -p slates-ssh -- --check` clean.
+  - Red first at 3663c5af: 11 compile errors, each a missing layer.
+  - Two runs to green: a test helper sent its service request inside the first exchange, which strict mode rightly
+    refused; then a closed transport hid the client's disconnect event (fixed in `Session::receive`).
+  - Golden: an RSA 3072 key OpenSSH 10.2p1 made, read from its own blob, signing under both SHA-2 algorithms, with
+    OpenSSH's fingerprint; RFC 8032's keys as Ed25519 user keys; git's and Mercurial's quoting written from their
+    source, with proptests over any path.
+  - Whole sessions with the test client: EXT_INFO, a fetch from the probe to exit-status, EOF and close; every refusal
+    by kind; both windows; replies and data held through the server's own rekey and received under its new keys;
+    unknown numbers answered `SSH_MSG_UNIMPLEMENTED`.
+  - Red five ways on the Studio:
+    - the Ed25519 check skipped, its forgery test failed;
+    - the client's window not charged, the window test failed;
+    - sends allowed inside the server's rekey, the rekey test failed;
+    - partial success ignored, both partial tests failed;
+    - any escaped byte taken in a git path, the git refusal test failed.
+- **Owed.** The listener on slates-rt with the reaper and the connection-lifetime estimator (A-594's key time); the
+  host key's keeping; the key store over §4.13's principals; serving each command (§4.17.2-§4.17.4's pieces); ECDSA and
+  FIDO user keys; main's live interop with stock `ssh`, `git`, `hg` and `svn` clients.
+
+### A-640 — The upload-pack service end to end, part 1: A-614's store read as A-615's commit graph (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Pieces (git)" piece 7; after A-614 and A-615)
+
+**Part 1: the store as the negotiation's graph** (`crates/git/src/store/graph.rs`, `StoreGraph`). A-615's negotiation
+reads a repository through a trait (`Graph`); A-614's store now answers it, so a fetch is negotiated over the objects,
+versions and D(k) the store keeps, and neither module names the other's internals.
+
+- **Nodes.** A node is an object's position, the store's own handle, and a green is the store's green. An object's name
+  is its position's row; its kind, size and commit row (generation number, committer date, root tree, parents by
+  position) are its object row. A tree's entries and a tag's object are read from the object's bytes by A-590's parsers
+  through the store's own reads, a submodule's commit left out as the store's walks leave it out.
+- **Versions.** A green's versions are the store's chain: version `v` is the chain's `v`-th, numbered from 0, and D(v)
+  is the positions it brought. The greens a commit heads, each at its current version, come from the store's head map.
+  A version fast-forwarded the one before when the store judged its move so at admission (`Move::is_fast_forward`).
+  Versions keep no verdict, so the graph finds it again by the store's rule: both heads are commits, and the later is
+  the earlier or reaches it, searched back through parents no lower than the earlier head's generation number. A tag
+  moved onto itself is no fast-forward, as the store judged it, though its D(k) is empty. The first draft called any
+  two equal heads one; the test against the store's verdicts fails on that draft.
+- **Refs.** The store holds greens, not names, so the caller (the server, which keeps the repository's record) names
+  each ref's green (`NamedRef`). Every ref's head is a tip, and the refs under `refs/tags/` whose head is an annotated
+  tag are the tags `include-tag` reads.
+- **Faults.** The trait's reads cannot fail, and a store whose index and content agree never fails them. Where one does
+  (a position with no row, an object whose bytes git's parser refuses, a name the store does not hold), the read
+  answers nothing and the graph keeps the first fault (`StoreGraph::fault`, `GraphFault`). The service refuses an
+  answer made while one was kept, so a broken store never yields a wrong pack.
+- **Where.** The file is a child module of the store's `repository.rs` (`#[path = "graph.rs"]`), so it reads the
+  chains, the head map and the object reads that module keeps private. The store's other files (g083's) gain one line
+  each: the module's in `repository.rs` and its re-export in `mod.rs`.
+- **Tests** (`src/tests/store_graph.rs`; the fixture repository in `src/tests/served.rs`). The repository stock git
+  2.50.1 answered A-582's golden vectors from (`fixtures/make-fixtures.sh`) is loaded into a real store from its own
+  pack (`fixtures/ofs.pack`, all twelve objects), `main`'s history committed as three versions. Every node reads back
+  to its name, kind and size; each tree's entries are what git's tree parser reads; the tag names `second`; the
+  commits' generations are 1, 2 and 3 with their parents. Refs, versions and D(k) read as the store kept them, a rewind
+  of `side` included. The graph's fast-forward for each version is the store's verdict at admission, over six moves:
+  onward, onto the same commit, a tag onto itself, back, a tag to a commit, and onward again. A position the store
+  never gave reads as the null name and is kept as the first fault. And the negotiation over the store answers git's
+  own fetches with git's own objects. For `fetch-haves` (want `third`, have `first`) it answers an `ACK` for `first`,
+  `ready`, and one round over `main`'s versions 1 and 2 with nothing walked, carrying exactly the objects of git's thin
+  pack (read with its bases from the repository, as `index-pack --fix-thin` reads one). For `fetch-clone` the walk
+  sends exactly the objects of git's clone pack.
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 309 of 309 on the branch, then 338
+  of 338 merged with main (2 of main's ignored); `cargo fmt --check` clean. The golden test's first run failed reading
+  git's `fetch-haves` pack, which is thin (the request asked `thin-pack`), until its bases were taken from the
+  repository. Red in the Studio's clone, one guard at a time: the first draft's fast-forward failed the test against
+  the store's verdicts; a fast-forward always answered failed 2 tests; and, on the branch before the merge, the head
+  map never found failed 2, the golden fetch among them, and a tree's entries read empty failed 3.
+- **Next** (A-640's parts): the service over v2, with one entry point: `fetch`'s arguments mapped onto the negotiation
+  (`want-ref` and `deepen-not` through the refs), the answer's sections in order over side-band, and the pack from
+  A-639's fragments through a trait until it lands; `ls-refs` from the refs; the same service over v0 and v1
+  (`multi_ack_detailed`, `side-band-64k`) on A-604's codecs, with v0's ref names held to A-615's rule; then
+  `sparse:oid`.
+
+Part 1 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`store/graph.rs`,
+new; `store/repository.rs`, the child module's line; `store/mod.rs`, its re-export; `tests/store_graph.rs` and
+`tests/served.rs`, new; `lib.rs`, the test module's line).
+
+### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and
+`report/editor.rs` with its tests, new; `report/recorded.rs`, the recorded sessions in one table both test modules
+read, taken out of `report/tests.rs`).
+
+- **The calls** (`report::drive::Call`): `svn_delta_editor_t`'s, with the editor's own arguments, in `reporter.c`'s
+  order (`drive`, `delta_dirs`, `update_entry`, `delta_proplists`, `delta_files`), so the nodes open are a stack and a
+  property change applies to the innermost. An open or an add carries `Facts` (the node's repository path, its created
+  revision, a file's SHA-1), from which `update.c` derives its hrefs; a delta is `ApplyTextDelta`, each `Window`,
+  `TextDeltaEnd`, so no file's delta is held whole, and its svndiff version is the consumer's. Agreed with g298
+  (A-627) through main as the calls `dav::Drive` takes.
+- **The writer** (`report::editor::EditorWriter`; `editorp.c` and `marshal.c`'s `svn_ra_svn__write_cmd_*` at
+  `d434dc14`, 1.15.0 alike): tokens `d` and `c` and one counter from 0 (`make_token`); `absent-dir` and `absent-file`
+  only to a client that announced `absent-entries`; svndiff 2, each section LZ4 when shorter, to a client that accepts
+  it, 0 to any other, never 1 (`svn_ra_svn__svndiff_version`, A-500); the stream's header as one chunk at its first
+  window or its end, and each window as `svndiff.c`'s `window_handler` writes it, its integers, its instructions and
+  its new data, each a chunk when not empty. A call out of the editor's order is refused, typed, with nothing written
+  and the writer as it was; `abort-edit` may follow a written `close-edit`, as `ra_svn_close_edit` writes one when the
+  client refuses the edit.
+- **One difference, in bytes alone:** a compressed section is `lz4_flex`'s block where `svnserve`'s is liblz4's, so it
+  may differ while it decodes to the same window; every section stored uncompressed is `svnserve`'s byte for byte.
+- **Tests.** Every drive of the 38 recorded sessions (28 hold one) read back into calls, its deltas decoded, and
+  written again: the same calls and windows, and every item byte for byte but the chunks of a delta `svnserve`
+  compressed; svndiff 0 to a client without `accepts-svndiff2`; absent entries to one without `absent-entries` left
+  out; eighteen calls out of the editor's order refused with nothing written; the bound on nodes open; svndiff
+  integers and window encodings at and past their limits. `cargo test --locked -p slates-svn --lib` on the Mac Studio,
+  2026-11-19: red first with the writer writing nothing (5 of the 7 failed, the two helper tests passed), then 313 of
+  313; `cargo fmt -p slates-svn -- --check` clean after rustfmt's layout.
+- **Owed** (GAPS): the drive over the index (A-553) and the green, with `svn_repos_deleted_rev` and
+  `svn_fs_closest_copy`; the deltas of changed texts; the handler that answers the client's early answer and its
+  answers to `close-edit` and `abort-edit`.
+
+### A-643 — the green stays whole, and no work removes or links a node changed after its base (2026-11-19, g267, UI goal 93; §4.16 "The verdict"; A-631's siblings)
+Applied in the same change to:
+- §4.16's verdict status; GAPS (A-631's four siblings, fixed; the siblings found here, filed open);
+- `crates/merge/src/engine.rs`: `merge_rename` (a link over a file replaces it; a hard link over the file it names
+  changes nothing), `merge_rmdir` (judged against its base), `merge_unlink` (a file judged in every dimension),
+  `merge_hardlink` (its target judged against its removal), and `decide` (the increment's own removals gathered once);
+- `crates/merge/src/engine/replaced_node_tests.rs`: the failing-first tests and a generated oracle of the whole state;
+- `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
+- **The defects**, A-631's siblings, probed on r810:
+  - a symbolic link or a hard link renamed over an unchanged regular file was accepted, and the green held both at one
+    path;
+  - a directory's removal took no base, and removed a directory made again since;
+  - an unlink of a file or a directory's removal ignored a mode or attribute change made after its base, which was
+    lost with the node;
+  - a hard link made to a file removed after its base named the file made in its place, or nothing.
+
+  A fifth was found while fixing the first: with a link renamed over a file replacing it, a hard link renamed over the
+  file it names removed the file's bytes and left the link naming itself.
+- **The rule, from §4.16, D-27 and POSIX `rename`.**
+  - A rename replaces an unchanged file at its destination, whatever the source names. The link's set takes the path,
+    and the file's removal is an effect of its own, recorded as A-612's removals are. The paths the increment removes
+    itself are not removed twice.
+  - Two names of one file renamed one over the other is a rename onto itself: nothing changes.
+  - A removal deletes the node the work saw. Changed after the base in any dimension (`changed_after`, one lookup in
+    the change index, which keeps every path's last change through folding), the node is another's change, and its
+    removal is delete against modify.
+  - A link names the file the work saw. Removed after the base, that file is gone for the work: delete against modify
+    on the link, unless the work makes the target itself.
+- **Metadata stays keyed by path** (A-618): a link that replaces a file keeps the path's mode and attributes unless the
+  work changes them, as a file renamed over a file does.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 4 to 7), green on kiln r880 and, merged with main, r899: `cargo test
+  -p slates-merge --lib`, 99 of 99 on both; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests: each sibling's case, the same-file
+  rename, and a rotation (a file renamed away and a link over its path in one work, the file removed once). The oracle
+  generates histories over two files, a symlink, a hard link and a directory. At the head, nodes are removed and made
+  again and their mode or attributes changed; works behind the head remove a node, link a file, or rename a link over
+  either file. A model of what stands at every path at every version is compared with the green after every event,
+  every answer is held to the rule, and a census of nine answers requires each to run.
+
+  Red on r880 with all of A-643's engine change reversed: 6 of 7 failed, the rotation passing either way. The link over
+  the file left `[File, Symlink]` at `f`; the directory made again was removed (`Accepted { version: 3 }`); the hard
+  link to a file made again was made; the file whose mode and attribute changed was removed with both; and the oracle
+  shrank to one rename of the symlink over `f`. With only the same-file rule reversed, `g` became a link to itself
+  with its bytes gone, and the oracle shrank to that rename.
+- **Siblings found, not changed** (GAPS):
+  - a rename over a symbolic link, a hard link or an IPC node is refused `TypeChanged` with no concurrent change, though
+    POSIX replaces it;
+  - a hard link names its target by path, so the head's removal of a file that links name is accepted and the links
+    then name whatever is made there next;
+  - the IPC node's unlink scans every attribute change and every hard link once per unlink.
+
+### A-629 part 1 — Serving Git LFS, slates-git's half: routes, answers and bounds over three seams, objects named by SHA-256 and checked on arrival, actions that expire with the credential that asked (2026-11-19, g293, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", "Access" and "Pieces (git)" piece 12's second part; after A-610, A-581, A-595 and A-597; with A-642)
+Applied in the same change to:
+- §4.17.2's "Large files" (the actions' expiry, the lock log) and its status; GAPS (the §4.17 entry);
+- `crates/git` (`lfs/serve.rs` and `lfs/objects.rs`, new, with `tests/lfs_serve.rs` and `tests/lfs_objects.rs`;
+  `lfs.rs`, the two modules' lines and `Oid`'s `AsRef<[u8]>`; `lfs/locks.rs`, `listed_len` and `cursor_len`;
+  `tests/lfs.rs`, each recorded request's `Content-Type` and `Accept`).
+- **The split.** A-629 serves LFS. Part 1 is slates-git alone: the routes and the answers, written against three seams
+  the server implements. Part 2 is the server's (slates-db and slates-server): the lock log, `Access` over vcs_policy,
+  each repository's LFS index, and the call A-625's edge makes. A-642 (Ada, the same day) keeps a repository's own
+  state in logs of its own, so the locks are the repository's lock log, guarded then applied, and never changes on
+  A-603's repository-wide entry; A-642 has the pushes keep their traits, and `Locks` is this one's.
+- **Routes** [B: git-lfs v3.8.1 `docs/api/server-discovery.md`, `batch.md`, `basic-transfers.md`, `locking.md`]. Under
+  the LFS server URL git-lfs derives, `<repo>/info/lfs`: `POST objects/batch`; `POST locks`, `GET locks`,
+  `POST locks/verify` and `POST locks/{id}/unlock` (A-610's route); and the basic transfers this server hands out as
+  actions, each href under the request's own LFS server URL: `PUT` and `GET` of `objects/{oid}`, and
+  `POST objects/{oid}/verify`. The path is decoded once: an escape that names a slash or a NUL, or a repository path
+  that is not UTF-8, is `400`; an empty, `.` or `..` segment is `404`; the last whole `/info/lfs` ends the repository's
+  path. A method an endpoint does not take is `405` with `Allow` (`400` to HTTP/1.0, which has no `405`). A malformed
+  escape never reaches a route: slates-http's reader refuses it as a bad request target (RFC 3986 §2.1), which the
+  first green run found.
+- **Media types** [B: RFC 9110 §12.5.1, §12.4.2, §5.6.1]. A JSON endpoint's body is `application/vnd.git-lfs+json`, a
+  `charset` taken as batch.md asks, else `415`. An answer's type must be acceptable: of the `Accept` ranges that cover
+  LFS's type, the most specific decides (the type, then `application/*`, then `*/*`), and a zero weight (`q=0`, `0.`,
+  `0.000`) is "not acceptable", so `406`. Empty list elements are no ranges, and no `Accept` takes anything. A
+  transfer's bytes are not JSON and are not held to it.
+- **Who may do what.** Each request asks `Access` for a `Need` on the ref it names, or on the repository's whole
+  namespace for a transfer, which names none: `Download`, `Upload`, `ListLocks` (locking.md: pull access), `Lock`,
+  `VerifyLocks`, `Unlock` (push access) and `UnlockOthers` (another user's lock, which also takes `force`). A refusal
+  of a request that sent no credentials is `401` with `LFS-Authenticate` when the edge gave a challenge (batch.md), so
+  git-lfs asks for credentials and retries; of one that did, `403`. Another user's lock without `force` is `403`.
+- **Objects** [B: git-lfs `docs/spec.md`]. An object's id is the SHA-256 of its bytes (aws-lc-rs). An upload is
+  admitted through `slates-vcs`'s quarantine with that naming (A-581): bytes that are not their oid are `422` and
+  nothing of them is kept, the store's content count and bytes unchanged; bytes that are go in as one row of the
+  repository's LFS index, keyed by the oid's 32 bytes and apart from its git objects' index, the content the shared
+  store's by BLAKE3. A store past its budget is `507`. A batch answers a download where the object is held at the size
+  asked, an upload and its verification where none is, nothing where it is held, and a per-object `404` or `422`
+  otherwise.
+- **Expiry** (main's ruling, 2026-11-19, replacing the learned expiry A-610 left owed). A transfer authenticates at the
+  edge as the batch did, so an action works exactly as long as the credential that asked for it: its `expires_at` is
+  that credential's expiry when the edge knows one (a bearer token's, handed in with the principal), and an action
+  asked with one that never expires (Basic) carries none. Nothing is chosen, signed or learned here.
+- **Bounds.** Every answer is charged to the request's admission before it is made, and allocated at its measured
+  length: a batch answer's hrefs and the slots that hold them, then its body; a lock or a conflict; a page. A page of
+  locks borrows the log's records, never copies them. It charges its frame, then each lock at its place in a list (the
+  comma before it, so at most a byte a list over what it writes) with the page's slot for it, while the client's limit
+  allows and the room holds the lock and the cursor naming the one after it, then the cursor that ends it. So that
+  cursor always fits, and a page that cannot hold one lock is `413`, never an empty page whose cursor names the lock it
+  could not hold, which would bring the client back to it for ever. A cursor that names no place in the log is `422`,
+  as is a query's `limit` that is no number.
+- **The locks' seam.** `take` (or the lock that holds the path: `409` with it), `find`, `listed_from` (the log's order
+  from the place a cursor names, inclusive; `None` for no place) and `release`; a full log is `507`. A lock's id names
+  its place in the log, so a cursor naming a lock released since still names a place; ids are RFC 3986 unreserved
+  characters, since git-lfs writes them into a path unescaped (A-610).
+- **Changed during the piece, and why.** The first page copied each record and wrote its frame and cursor uncharged;
+  it now borrows the records and charges every byte. The seam's visiting callback became an iterator, so a page can
+  see the lock after the one it weighs. The first `Accept` check took any covering range; it now follows RFC 9110's
+  precedence and zero weights and skips empty elements.
+- **Tests** (`tests/lfs_serve.rs`, 17; `tests/lfs_objects.rs`, 5): the stock git-lfs 3.8.1 client's 24 recorded
+  exchanges (A-610's fixture) replayed through the routes and the server, the transfers at this server's own hrefs:
+  every status, every object's answer, the locks and the conflict whole, every page beginning as recorded, every
+  downloaded byte. Then the route table and its refusals; `Accept`'s precedence and weights; `405`'s `Allow`; policy,
+  `401`'s challenge, the expiry, an upload checked against its oid, the unlock rules; pages by limit and by room;
+  `413`, `422` and `507` by kind; and a property test that follows the cursors against the paging rule, stated over
+  the locks' JSON. On the Mac Studio (M3 Ultra, debug, 2026-11-19): red at 05:55Z, the 22 new tests failing with nine
+  entry points stubbed on its clone (never committed) and 271 others passing; green at 05:58Z on cb761ddbf,
+  `cargo test -p slates-git --lib` 293 of 293, fmt clean. The first green had reused the red build: both clones shared
+  one target directory, and cargo names a workspace member by its path from the workspace root and judges it fresh by
+  its dep-info's absolute paths, which named the red copy's unchanged files. Red and green now build in target
+  directories of their own.
+- **Owed.** Part 2: the lock log in slates-db, guarded then applied; `Access` over vcs_policy and the owner rule; each
+  repository's LFS index; the call A-625's edge makes. Then a streaming put in `slates-vcs`, so an upload is admitted
+  window by window rather than whole; the stock client end to end against slates (main's run); Mercurial's `lfs`
+  (§4.17.3).
+
+### A-637 — A submodule's link is a special node holding its commit: encoded beside A-294's device kinds, made by a push, moved as the same kind (2026-11-19, g225, UI goal 93 (kiln 51cef9f7); §4.17.2 "Trees as a volume" item 5; §4.16's names with no content; §4.17.1 "A push is a work"; after A-294, A-618, A-638)
+
+- **What.** `SpecialKind::Gitlink { commit }` (`crates/merge/src/special.rs`): the commit of another repository a name
+  stands at, by the tool's id (git's 20 or 32 bytes). It is encoded as a FIFO's fields under kind byte 4, then the
+  id's length in one byte and its bytes. An empty id, or one past 32 bytes, is refused by kind; a short one as
+  truncated. No earlier encoding moved, and a test holds the FIFO's and a character device's bytes.
+- **The push.** A-618's `build` makes a submodule entry an `Mknod` of that node, with no owner, time or permission
+  bit, since git records none. A link moved to another commit is `Unlink` then `Mknod`, which the deriver composes
+  into one `Mknod`; a removed one is `Unlink`. A path changing to or from a link stays a typed `KindChanged` (GAPS
+  §8f), and `PushRefused::Submodule` is gone.
+- **Found on the way, fixed in the same change.**
+  - The build laid only file and attribute bytes in the post-state. The deriver places each `Mknod`'s node encoding
+    after them, and the engine reads it there, so any node a push made would have been refused as truncated. The build
+    now lays each node's encoding where the deriver placed it.
+  - The engine judged any difference of `SpecialKind` a type change, so a link moved to another commit was
+    `TypeChanged`. `SpecialKind::same_type` makes a link to any commit one type, since its commit is what it holds, as
+    a symbolic link's target is. Every other kind keeps its whole value, so A-294's renumbered device stays another
+    node. Two pushes moving one link apart from one base conflict `CreateCreate`; pushes that agree are accepted.
+- **Tests and runs.** Three encoding tests (`special/tests.rs`, new): the bytes laid out by hand at both id lengths,
+  every refusal, and the earlier kinds unchanged. In `push/tests.rs`:
+  - a link made, moved and removed, each held to the oracle;
+  - five paths changing kind, two of them to or from a link;
+  - two pushes moving one link from one base;
+  - the generated histories with links to two commits, the census requiring links made.
+
+  On the Mac Studio, 2026-11-19, the tests were red first: 5 of 96 failed against stubs. Next, 2 failed on the
+  engine's rule (`TypeChanged`). Then `cargo test -p slates-merge --lib` passed 97 of 97, and 104 of 104 merged with
+  main (A-643), with `slates-git --lib` 338 of 338 (2 ignored, main's); fmt was clean. Red four
+  ways by mutation: the whole-kind comparison (3 failed), no node bytes (4), an empty id taken (1), and a move without
+  its `Unlink` (3).
+- **Applied in the same change to:** `crates/merge/src/special.rs` (and `special/tests.rs`, new), `push.rs`,
+  `push/tests.rs`, `engine.rs` (`merge_special`), §4.17.2's status, GAPS §4.17.
+- **Owed.** A link's form in a volume and in a checkout: git checks a submodule out as an empty directory. The
+  server's paths from a volume's nodes to a green's (`merge_service`, `verbs`) never meet one, since a volume holds no
+  link yet.
+
+### A-619 (part 2) — Mercurial's read serving, part 2: a `getbundle`'s answer, its bundle2 stream and changegroup over a store, held to three captured sessions of stock Mercurial 7.2 (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone" items 2 to 4, piece 4; §4.9; A-545, A-569, A-598, A-619 part 1)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve::getbundle`, new: the
+`Store` trait, `Logged`, `Asked`, `getbundle`, `changegroup`; `serve::Refusal` gains `NoBundle2`, `NoCommonExchange` and
+`Store`; `fixtures/serve/` gains the three sessions with their states and bookmarks and `incoming.txt`, `SHA256SUMS` now
+twenty lines), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (§19).
+- **What it does.** `getbundle(store, asked, admission, out)` writes the bundle2 stream of 7.2's `getbundlechunks` for a
+  request's arguments as the wire carried them, over a `Store`: the served view (A-619 part 1's `Repository`) with its
+  changeset texts, manifest and file revisions (each with its log position, parents, link, flags and text), the node a
+  manifest names at a path, and the markers. Parts in 7.2's order, each where asked: `CHANGEGROUP` (the highest of `02`
+  and `03` the client lists, `version` mandatory, `nbchanges` advisory), `BOOKMARKS`, a `LISTKEYS` part per namespace
+  (`csv`: an empty item is a namespace), `OBSMARKERS` and `PHASE-HEADS`; every part's bytes and the stream's length
+  charged to the request's admission first.
+- **The changegroup.** The missing changesets oldest first; every manifest they name, linked to the first that names it,
+  none left out (7.2's `_prunemanifests` keeps every one outside an ellipsis clone); then, by path, for each path a
+  missing changeset lists, the file revisions the missing changesets' manifests name there, each linked to the first,
+  those whose file log's link the client holds left out (`generatefiles`); each group in its log's order. Every revision
+  is its full text against the null base, which every reader takes; held and computed deltas are the learned delta
+  choice's, owed.
+- **Decided: the paths listed, not the manifests' deltas.** 7.2 finds file revisions by reading each sent manifest's
+  delta against a parent (`read_delta_parents(exact=False)`, the whole manifest where its revlog stored it otherwise),
+  which depends on its revlog's delta choices. Taking the node each missing changeset's manifest names at each path it
+  lists yields the same revisions with the same links, except that 7.2 now and then resends a revision the client holds,
+  when its file log links it to a changeset neither held nor sent and a whole-stored manifest yields it; the model's
+  hand-built case reaches it. The client keeps one copy either way.
+- **From the sources.** 7.2's `exchange.py` (`getbundlechunks`, `bundle2requested`, `_getbundlechangegrouppart`,
+  `_getbundlebookmarkpart`, `_getbundlelistkeysparts`, `_getbundleobsmarkerpart`, `_getbundlephasespart`,
+  `_getbundletagsfnodes`), `changegroup.py` (`cgpacker`: `lookupcl`, `generatemanifests`, `_prunemanifests`,
+  `lookupmflinknode`, `generatefiles`, `deltagroup`), `manifest.py` (`read_delta_parents`), `obsolete.py`
+  (`relevantmarkers`, `commonversion`), `obsutil.py` (`sortedmarkers`), `bundle2.py` (`buildobsmarkerspart`) and
+  `wireprotov1server.py` (`getbundle`'s argument types, its abort answer), read from the wheel `uv` installs on the Mac
+  Studio (`mercurial==7.2`).
+- **Stricter than 7.2, or apart from it, on purpose.** A bundle1 (no bundle capability starting `HG2`) and version 01 (a
+  client listing no served version) are refused, not served. An unknown head is refused before any part (7.2 fails
+  inside the first part that reads it, and its markers part passes it over). `HGTAGSFNODES`, advisory, is never sent
+  (7.2 sends only what its tag cache holds). Markers sort by 7.2's whole tuple; a format 0 marker by its metadata as
+  held (7.2 lifts its date and parents out first; it writes format 1).
+- **Golden vectors.** `crates/hg/fixtures/serve`: the script's three sessions, a stock 7.2 client (PyPI through `uvx`,
+  CPython 3.12) cloning, pulling after a public commit under the `main` bookmark, and asking `incoming` after a draft
+  commit, through an ssh stand-in that records both directions, each with the served view and bookmarks dumped before
+  it, on the Mac Studio, 2026-11-19; brought here by a kiln program as `tar | base64` and every file checked against the
+  Studio's `SHA256SUMS`, 20 of 20.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 208 of 208 (load 8.4), 9 of
+  them this part's; red first against stubs of `getbundle` and `changegroup`, 9 of 9 failed (199 passed); `cargo fmt -p
+  slates-hg -- --check` clean. Golden: each session's `getbundle` asked again of a store rebuilt from what 7.2 had sent
+  up to it, the same parts with the same ids and parameters, every payload but the changegroup byte for byte, the
+  changegroup revision by revision (node, parents, link, flags, full text), every node the hash of its parents and text;
+  the incoming's `listkeys phases` byte for byte. Model (proptest): generated histories filled with files (branches
+  making one revision alike, merges taking a side's revision unlisted, empty changesets reusing their parent's manifest,
+  each manifest's delta stored against a parent or whole), packed by this module and by 7.2's packer stated literally,
+  equal on every manifest and every file revision the client lacks; its non-vacuity a hand-built history where 7.2
+  resends a held revision. Hostile: a bundle1, version 01 alone or unlisted, bookmarks, phases and markers a client
+  cannot read, a store that lost a changeset's text, a manifest or a file revision, every admission short of the answer,
+  and arbitrary arguments: each refused by kind, none panicking.
+- **Owed.** `slates hg serve --stdio`'s loop over the SSH version 1 codec (`hello`, `between`, `protocaps`, `batch` and
+  the commands built, a bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas,
+  `obsolete`'s `listkeys` dump, and the index's kept heads in place of the walks.
+
+### A-626 part 1 — `Copy` replaces what its destination holds and nests in one increment: Subversion's replace with history, a second copy into a new branch and a move inside one, never refused (2026-11-19, g295 for UI goal 93; §4.16 "The state's maps" and "The verdict", §4.17.4 items 3 and 3.5 and piece 3; A-586, A-618, A-621, A-631, A-632)
+Applied in the same change to: §4.16 (a status block, the verdict's sentence on `Copy`, the "Copies" bullet), §4.17.4
+(a status block, piece 3), the A-586 entry (its owed list), GAPS (the §4.17.4 entry), `crates/merge/src/ops_doc.rs`
+(`REPLACE`, `Op::replaces`), `crates/merge/src/engine.rs` (each copy's `CopySpec` in the resolved increment,
+`Effect::CopyTree`'s flag, the commit as `apply_effect` over a `Staged` set with `remove_file_now` and A-618's
+`drop_metadata`, the readers' `last_entry`, `head_identity_from_scratch` split, the replace's reservations),
+`crates/merge/src/engine/copy.rs` (nesting, the replace's verdict and removal, every source held before any copy lands,
+the readers' ties, the reservations), `crates/merge/src/engine/branch.rs` (the reverts), `crates/merge/src/dims.rs` and
+`dims/copy.rs` (`hold_tree` and `graft_tree`, `Xattrs::iter_tree`), `crates/merge/src/chain_entry.rs`
+(`Applied::CopyTree`'s flag, read from A-632's index), `crates/merge/src/engine/reanchor.rs`, and the tests
+(`engine/copy_tests.rs`).
+- **What was there.** A-586's `Copy` refused a destination that held anything (`CreateCreate`) and any second copy,
+  move or link into a copied tree in the same increment (`TypeChanged`). A stock client sends both, and FSFS commits
+  both: a replace with history is a changed path `R` with a copy source (`svn rm` and `svn cp` of one path in one
+  commit: re-tagging a release, restoring a file from an older revision), and a branch made and edited in one commit
+  carries copies beneath it (`svn cp ^/trunk ^/branches/b` with `svn mv` or `svn cp` inside it, which the editor drives
+  as `add-file` with a copy source and `delete-entry`).
+- **The flag.** `REPLACE`, the low bit of a `Copy`'s flags (`0x01`; no other kind sets it, so a document that never
+  sets it means what it meant): the destination's tree is taken away first, then the source's tree is copied there.
+  The removal is the flag's; the document's other operations on paths in the destination's tree land after the copy,
+  on what it brought. The chain entry records nothing more: replay reads the flag back from the increment's own
+  operation through A-632's one-pass index, as it reads the source's version.
+- **The verdict.** A replace is judged as the removal of its destination's tree, as an unlink is judged, and as A-586's
+  addition: refused when the tree changed after the base (`DeleteModify`, a delete against a change) or holds a hard
+  link or another link's target (`TypeChanged`: Subversion has neither, and the reverse map of links would carry them
+  through the removal). A copy whose destination lies in another copy's tree of the same increment (the innermost one
+  holding it) is judged against what that copy brings there, its source's tree at the same place, which the outer
+  copy's verdict holds unchanged since its version: a tree there takes it only as a replace (`CreateCreate`
+  otherwise). Subversion's move inside a copied tree is such a copy and a removal of the moved name, which A-586's
+  same-increment rule already judges against the copied tree. A rename or a hard link with an end in a copied tree stays
+  refused, typed: Subversion has neither.
+- **The commit.** Every source is held first, before any copy of the version changes a map, since FSFS copies from a
+  revision root and never from the transaction (`libsvn_fs_fs/tree.c` `copy_helper` refuses a mutable source: "Copy
+  from mutable tree not currently supported"). The copies then land in their destinations' order, an outer one before
+  those inside its tree: for a replace its destination's tree is taken away key by key, then the held source is
+  grafted. The removal walks each map beneath the destination once and records each key as its own removal records it:
+  a file as an unlink (its value seeded where its history does not hold it, and `file_removed` for A-612's rule), an
+  IPC node with its metadata, a directory, a symbolic link, then every mode and attribute left, through A-618's
+  `drop_metadata`; each path joins the version's change index.
+- **The readers.** A key's own last entry at a copy's version that records a removal reads as before the copy
+  (`covered_since`), so a key the replace took away and the copy gave back reads as the copy's from that version, and by
+  its own history before it. Of the copies one version made above a key, the nearest is the latest (`copy_above`).
+- **The identity (A-202).** Unchanged: the state's entries plus, for each copy, its entry less its tree's. A replace's
+  removals move the sum as removals do. A key an outer copy brought and an inner replace of the same version took away
+  gives back the outer copy's entry for it, read from the copies above it (`copied_entries`).
+- **Cost, and the shape weighed.** A replace costs O(the replaced tree): one walk of each map beneath the destination
+  and one removal a key. That is what removing the tree key by key costs, and what Subversion's delete of the same tree
+  costs a slates increment, which has no tree removal. A file whose value its history does not hold (unchanged since
+  version 0, or since the copy that gave it) is recorded whole (W2's `Value::whole` copies its bytes), as any removal
+  records it. Both are secured before the verdict: `history_reservation` adds each replaced file's latest bytes and
+  each IPC node, and `changes_reservation` each path taken away, named at its destination, twice (at the version and
+  as its last change), a replace inside another copy's tree counted where that copy's source holds it; a test holds
+  each at least what the commit grew by. The other shape, the replaced tree held by reference in the copy's record,
+  costs O(the paths) and copies no byte, but needs a second reader rule (a key with no history of its own, read before
+  the replace, from the held tree, recursively through the copies before it), an identity term for each held tree, its
+  retention counted without a walk, a branch that grafts it back and a checkpoint that lists it. It is owed if a
+  measured re-tag's removal outweighs its copy (GAPS).
+- **Three defects of A-586's branch, found by this oracle** (`Lineage::branch` at a version before a copy).
+  1. A key of the cut tree that held, at the branch's version, the value the head holds was left cut: a replace that
+     gives a tree back unchanged meets it, and so did a copy bringing a removed key's bytes back.
+  2. A key's value at the version was read from its own history alone for IPC nodes, directories, modes, links and
+     attributes, so a key an older copy (at or before the version) gave its value read as before that copy whenever its
+     path was visited for another change.
+  3. A copy's entry was given back only for keys changed after the version, so a key whose history ended before the
+     copy over it (a copy's own destination, removed and then copied over) had its head entry exchanged out with
+     nothing standing for it.
+
+  Now every key the change index names is read through the copies above it, set back wherever its value differs from
+  what the branch holds once its cuts are made, and given back each copy's entry when it has a history of its own. The
+  algebra: the branch's sum is the head's less each later copy's entry, plus each later copy's tree entries, less each
+  key's head entry, plus its entry at the version; a key the change index does not name holds at both ends what the
+  copies over it stand for, so only the named keys move it.
+- **Main's clippy findings, with it.** `head_identity_from_scratch` split (`add_state_entries`); branch.rs's array of
+  last changes, whose type and length clippy flagged, went with the third defect's fix (a slice of `HasHistory`).
+- **Tests** (`crates/merge/src/engine/copy_tests.rs`).
+  - A replace takes its destination's tree away and copies the source there; the version before reads byte for byte;
+    the change index names what it took; it replays from its encoded chain entry.
+  - A key a replace took away and gave back, changed later, and a directory it took away, made again later, read at
+    every version.
+  - Copies nest in one increment: a second copy where the outer leaves nothing, a replace where it brings a tree, and a
+    move inside it; replayed.
+  - A replace's reservations cover what its commit adds and exceed a plain copy's.
+  - Branches before and after a replace and nested copies; before a copy that brings a removed key back unchanged;
+    through the copy that gave a key its value.
+  - Every refusal, the green unchanged; among them a second copy onto a filled place, and replaces of a tree changed
+    after the base, of one holding a hard link and of a link's target.
+  - The oracle, rewritten: a model that states every version's tree by the design's rules (a reference green cannot,
+    since plain operations state no replace), over generated histories of puts, takes, directories, single copies
+    (replacing or not, from the head or an older version), nested pairs and moves. The green decides every step as the
+    model does and reads as it at every version (bases, bytes, the paths the change index names since); its identity
+    equals its recount and its change index's bytes theirs; no map refuses a copy; a copy that replaces nothing walks
+    no map; its chain replays; a branch at every version reads as the model and hashes as the replay, and making it
+    walks no map. Its steps are chosen by a weighted selector over plain tuples (`prop_oneof!`'s strategy is
+    shared-ownership backed, R2).
+- **Evidence** (the Mac Studio M3 Ultra, kiln, debug, fresh clones of the branch; r868 at 05:51 UTC, load 8.9; r893
+  from 05:59 to 06:03 UTC, load 5.0 to 6.2; 2026-11-19).
+  - `cargo test --locked -p slates-merge --lib`: 99 of 99 at `eddac8c74` (24.48 s), `cargo fmt --check` clean. The
+    census over 128 histories: 85 copies accepted, 362 refused, 8 from the root, 33 from an older version, 25 into
+    their own source's tree, 71 refused for a source changed since, 33 keys changed beneath a copy, 31 replaces over a
+    tree that held something, 31 nested pairs (7 with an inner replace), 20 moves.
+  - Red first: the new tests over main's implementation (the engine files of `0020d61`, the tests and `REPLACE` kept):
+    7 failed, every A-626 test, and A-586's 10 passed; the same over the branch's first base (`6ce9e687d`, r851).
+  - The first green run, before merging main (`fcffd15c4`, r851): 61 of 63, both failures the tests' own (the branch
+    test's expected identity at version 1 was version 2's; the oracle counted the walk of a branch's base read, which
+    walks by design). After merging main (`682479e9f`, r868): 95 of 97, the branch defects above.
+  - Red seven ways at `eddac8c74` (r893), each on a copy of the tree with one guard taken out, the whole `--lib` suite
+    run: the readers' tie rule, 2 failed; the nested verdict, 2; the replace's refusal of a tree changed after the
+    base, 1; the replaced tree's modes and attributes, 4; the replace's reservation, 1; every source held before any
+    copy lands, 1 (the oracle); branch.rs before its fix, 4.
+  - Merged with main again (A-637's submodule links and A-643's verdict siblings in slates-merge, both clean): 111 of
+    111 at `2d453fca3` (06:08 UTC, load 10.0, 24.48 s), `cargo fmt --check` clean; that run's census: 80 accepted, 397
+    refused, 4 from the root, 30 from an older version, 14 into their own source's tree, 63 refused for a changed
+    source, 34 keys changed beneath a copy, 31 replaces, 34 nested pairs (4 with an inner replace), 29 moves.
+  - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
+- **Owed** (A-626's later parts):
+  - a copy from a version its source changed after (part 2): the source's changes since set back at the destination,
+    recorded in the chain entry so replay reads no folded history, reserved before the verdict, with room in the
+    server's entry bound (`crates/server/src/verbs.rs`, computed from the increment alone);
+  - a checkpoint of a green holding a copy (part 3): its copies and the identity's sum carried;
+  - a rebase restating a copy (part 4): the deriver's `VolumeOp::Copy`.
+
+### A-623 — Subversion's hook points as stock svnserve runs them: each hook's input and what the client is told, byte for byte (2026-11-19, g229, UI goal 93; §4.17.4 item 9 and piece 11; after A-597 and A-622)
+Applied in the same change to:
+- §4.17.4 item 9 (rewritten), its refusals list (`E165002`, `E165008`, `E165009`; post-commit's failure no failure)
+  and a status;
+- GAPS (the §4.17 entry); the Subversion research notes §7 (the recorded facts);
+- `crates/server` (`vcs_hooks.rs`: start-commit, post-revprop-change and the four lock hooks added to the points;
+  `SvnHooksEnv`; every argument a C string and a lock token's path escaped; `svn_told` and `svn_told_unconfigured`;
+  `Outcome::TimedOut` keeps the status its process was reaped with; `hook_driver.rs`, A-622 part 3's driver, which
+  landed while this piece ran: a hook whose input asks for a clean environment starts with none of the server's, and
+  its test helper's input names the new field);
+- `crates/svn/fixtures/hooks` (new: `make-fixtures.py` and the 325 files it wrote).
+
+- **Scope.** Ada's correction (2026-11-19, relayed by main): slates offers the server portion only, and stock clients
+  and tools stay stock. The piece first rebuilt `svnlook`'s commands; that stopped, and its recordings stay on the
+  unmerged branch `agents/g229-a623-svnlook`. Item 9's "slates installs its own `svnlook`" is gone: a hook that reads
+  its transaction runs the stock `svnlook` itself. The piece is now the server's nine hook points: their arguments,
+  standard input and environment as `svnserve` passes them, run through A-597's runner and A-622's driver over a
+  read-only attachment, and each hook's refusal returned to the client as `svnserve` returns it.
+- **The evidence.** `make-fixtures.py` runs stock `svnserve` 1.15.0 on the Mac Studio in `/` with the null device as
+  its input, as a daemon starts its hooks, with nine generated hooks that record their arguments, standard input,
+  environment and directory, and a relay that logs each connection. 33 cases: commits by two users, locks taken,
+  stolen, broken, taken from a working copy with a token the pre-lock hook chose and given back with their tokens, a
+  commit that releases its lock and one that keeps two, three revision-property changes; then each pre-hook refusing
+  with output and without, killed by a signal, writing bytes UTF-8 refuses or a NUL; pre-revprop-change missing; each
+  post-hook failing; a hook not executable, a broken link, and a pre-lock token with a newline. Before any Rust ran,
+  each refusal's predicted bytes were looked for in what `svnserve` sent: 17 of 17 found.
+- **Found by the recording.** (1) A `LOCK-TOKENS:` line names the client's own path, relative to its commit's base
+  (`b.txt` for `/trunk/with space/b.txt`), escaped by `svn_path_uri_autoescape`, whose table escapes ten bytes and none
+  past ASCII; `LockToken` took a pre-escaped path, and now the builder escapes. (2) With no token presented,
+  pre-commit reads the null device: A-597's builder wrote `LOCK-TOKENS:` and a blank line, and its test asserted it.
+  (3) A hooks-env section with no variables is no section, so its hook takes the default one; a section named twice
+  is one. (4) `svn_io_start_cmd3` leaves APR's error check off, so a program `exec` refuses is told as exit code 255
+  with no output, never "Failed to start", which only a failed `fork` gives. (5) `svnserve` releases a commit's locks
+  through pre-unlock and post-unlock and drops their failures. (6) post-lock's and post-unlock's failures come wrapped
+  in `E165008` and `E165009` after the `done`; post-commit's is `commit-info`'s `post-commit-err`.
+- **Decided.** A hook slates kills past its learned bound is told as `svnserve` tells of a hook a signal ended, from
+  the status it was reaped with (`Outcome::TimedOut` now keeps it): `svnserve` has no deadline, so its words have no
+  place for the bound. The server speaks UTF-8, so a hook's standard error is told as it is when it is UTF-8 and as
+  `check_hook_result`'s notice otherwise, as `svnserve` does under a UTF-8 locale; a character the runner's cap cut in
+  two is left out, so a cut does not turn the whole into the notice. Every argument ends at its first NUL, as
+  `svnserve`'s C strings do, so none holds a NUL no `execve` could pass. The driver applied a hook's variables over
+  the server's environment; a Subversion hook's input asks for a clean one (`HookInput::clean_environment`), and the
+  driver now clears it first, shown by a re-invoked test binary that writes its environment's names.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19): `cargo test --locked -p slates-server --lib vcs_hooks` 28 of
+  28 and `cargo fmt -p slates-server -- --check` clean, on a fresh clone of the branch. Red ten ways, each on a copy of
+  the module in the Studio's clone, each failing the tests that guard it and nothing else: an argument kept past its NUL
+  (1 test), nothing escaped (2), an empty section kept (2), sections not merged (6), a cut character kept (1),
+  `apr_exit_why_e` 1 for a signal (2), exit 1 for a failed `exec` (2), post-lock's failure unwrapped (1), standard error
+  read past its NUL (2), and A-597's `LOCK-TOKENS:` with no token (2: the token test and the recorded commits); the file
+  put back, 28 of 28 again. On the tree merged with A-622 part 3 (06aa369e6): `-- vcs_hooks hook_driver` 37 of 37, fmt
+  clean; red once more, the driver's clearing taken out: its new test fails and nothing else (8 of 9).
+- **Owed.** The record's six new points (`HookPointName` names three; the rest need wire tags, A-622); a hooks-env the
+  owner can set, until which every hook runs with an empty environment, as `svnserve` with no hooks-env file; from
+  A-622 part 3's driver: the directory `/` and what REPOS names, which a stock `svnlook -t TXN REPOS` must be able to
+  read; pre-lock's standard output, sent to the null device now, read as the token, and a bad one refused as
+  `svn_fs_lock_many` refuses it (recorded: `E160037` for a trailing newline); a dangling link told apart as
+  `svnserve`'s "broken symlink" (recorded); no core dumps; the server's calls at commit, lock, unlock and
+  revision-property change; Windows' `svnserve`, whose words for a program `CreateProcess` refuses differ. Main's:
+  clippy, `xtask` and the lint matrix over the two modules.
+
 ### A-641 part 1 — a push's bundle read as 7.2's handlers read it, its race checks judged in 7.2's words and order, and its reply written as 7.2's server writes it (2026-11-19, g301, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" steps 1, 4 and 7 and piece 5; A-514, A-545, A-569, A-619; the landing follows A-642)
 
 - **What.** `crates/hg/src/push` (`slates-hg`): `read` takes a plain bundle2 (A-598 makes a compressed one plain) and
@@ -42869,7 +44096,7 @@ Applied in the same change to:
   sent `replycaps`) or `refused` (the salvaged `output`, then one error part), with `heads_changed` (the `return` of
   `reply:changegroup`) and `multiple_heads` (the words of 7.2's `reject_new_heads`).
 - **Read from 7.2's code** (the wheel uv installs, CPython 3.12, the Mac Studio, 2026-11-19; SHA-256 of each file in
-  `research/mercurial-server.md` §19): `bundle2.py` `_gethandler` (a mandatory part no handler takes, or one whose
+  `research/mercurial-server.md` §20): `bundle2.py` `_gethandler` (a mandatory part no handler takes, or one whose
   mandatory parameter its handler does not name, is `BundleUnknownFeatureError`, its type lower-cased and the unknown
   names sorted; an advisory one is passed over); `bundle2_part_handlers.py` (each handler's parameters, the race checks'
   words, `reply:changegroup` advisory and `reply:pushkey`/`reply:obsmarkers` mandatory with advisory parameters);
@@ -42908,4 +44135,4 @@ Applied in the same change to:
   pushkey namespaces' compare and swap; `vcs_policy::admit` and the hook driver at their points (slates-server); the
   bundle read in slices within the shard's step budget.
 - **Applied in the same change to:** §4.17.3's status (this part) and piece 5's line; GAPS' §4.17.3 entry (built and
-  owed); `research/mercurial-server.md` §19; `crates/hg/src/lib.rs` (the `push` module line).
+  owed); `research/mercurial-server.md` §20; `crates/hg/src/lib.rs` (the `push` module line).

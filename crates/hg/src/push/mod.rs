@@ -5,7 +5,7 @@
 //! (A-642), and the policy and the hooks at their points are the piece's next parts.
 //!
 //! **Sources** (read 2026-11-19 in the wheel of Mercurial 7.2 that uv installs, CPython 3.12, on the Mac Studio; each
-//! file's SHA-256 in `docs/wip/research/mercurial-server.md` §19) \[C\]: `bundle2.py` (`_gethandler`, `_processpart`,
+//! file's SHA-256 in `docs/wip/research/mercurial-server.md` §20) \[C\]: `bundle2.py` (`_gethandler`, `_processpart`,
 //! `processbundle`), `bundle2_part_handlers.py` (each handler, the parameters it names and the race checks' words),
 //! `wireprotov1server.py` (`unbundle`: the reply to each refusal), `exchange.py` (`check_heads`, `unbundle`) and
 //! `changegroup.py` (`apply`: the change in heads a reply counts).
