@@ -406,6 +406,19 @@
 > refused. Tests on the Mac Studio: merge 94/94, db 138/138 (model test with crashes: Agreement, StaleNeverCommits,
 > NoLoss), ipc 74, server 577 with main's known failure; red sixteen ways. Owed: the fleet half (A-636), the policy's
 > check (A-622's next part), stacks of works on one green (piece 5).
+> **Fixed (A-694, 2026-11-19, g300; found by A-687's import landing): an append's new branches were minted one volume
+> id.** `verbs::fresh_volume_id` minted from the database's next sequence, which moves only when a record commits, so
+> every `Create` of one entry got one id and the second was refused `ContentUnavailable` (`Lineage::branch` met it
+> already): a git push under `atomic` creating two refs, a Mercurial push making two lines or bookmarks, an import of
+> two bookmarks. Now the partition keeps a volume counter, one past the highest counter of every volume created,
+> advanced by each `VolumeCreated` in `apply` and carried by the snapshot; `Db::volume_counter_at` mints
+> `max(next_seq, counter) + offset`, and the append's plan mints each `Create` at its own offset, so no id repeats and a
+> recovery mints what the live partition would (the bug record
+> `docs/bugs/2026-11-19-an-appends-new-branches-were-minted-one-volume-id.md`). Proven on macOS arm64 (Mac Studio, kiln
+> r398, over main b288b412e): red first, the two server tests failing with every new branch minted at offset 0; then the
+> db model test's minting histories with crashes and its recovery histories 3 of 3, the server's 55 of 55 filtered to the
+> append, the Mercurial push, the repository verbs, git's push and the stores, `green_checkpoint` 6 of 6, fmt clean; the
+> other platforms owed.
 > **A-636 part 1 (2026-11-19, g261; the fleet half's protocol):** `crates/db/src/ledger/logs.rs`, the fenced ledger over
 > a repository's logs. Each log is a register of its own, placed by its own object id and committing at `f + 1` of its
 > own holders, so a push to one green waits on that green's holders alone. A record is committed once every log it
@@ -629,9 +642,25 @@
 > vcs_ssh:: vcs_store::` 95 of 95, among them stock git's `create` push posted to the daemon's edge and its objects
 > fetched back whole over the same edge, `slates-cli --test cli vcs_http` 2 of 2, fmt clean. Owed: the objects a
 > hidden ref alone reaches stay fetchable by id (slates-git's negotiation answers a want of any object the store holds;
-> its hidden refs are owed there); the daemon starting the SSH edge (A-684); the live stock `git clone` over the
-> daemon's edge (the interop piece after this one) and other platforms' runs (main's); the exchange moved by the live
-> memory-pressure and load signals, as the codec policy's.
+> its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
+> exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
+> the daemon's edge is built since (stock git's interop tests, next).
+> **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
+> (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
+> first commit pushed to an empty repository, cloned, an edit pushed from the clone and fetched back into the first
+> copy) run as a control against stock git's own server (a bare repository over `file://`), so every step expects
+> what git's own server answers; git with no credential refused in its own words (`could not read Username for
+> 'http://127.0.0.1:PORT': terminal prompts disabled`, exit 128); and the round trip over the HTTP edge, the token a
+> bearer credential (`http.extraHeader`), which passes: stock git 2.50.1 clones a repository `slates repository
+> create` made, pushes to it and fetches from it over the daemon's edge. Ignored naming their waits: the round trip
+> with the token as Basic's password in the URL (A-686, g258: the cleartext edge's `401` offers Bearer alone, so git
+> answers `Authentication failed`), and over the SSH edge (A-684, g299: `--vcs-ssh`; A-683, g302: git-receive-pack on
+> the SSH edge). A credential is minted with the anchor's issuer surface, so on Linux, where that surface is a
+> descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln r426 over main
+> 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2 ignored; with
+> `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication failed for
+> 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the control and
+> the refusal run there, the HTTP leg skips), main's.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -788,6 +817,20 @@
 > main's `deadlines` test failing as on main. Owed: the edge's answer whose status follows the body; the durable
 > object store on the owner shard (A-581); locks by others than the owner once the push's policy check lands;
 > principals' names for people (§4.13).
+> **A-629 part 2c (2026-11-19, g230; Git LFS on the shared HTTP edge):** git's HTTP site routes `<repo>/info/lfs`
+> through `slates_git::lfs::serve::route` and the edge's authentication (a route's refusal whoever asks; `401` with
+> `LFS-Authenticate`; the owner shard, `404`, `403`; `503` at the head for an endpoint the service does not serve), and
+> a served LFS request decides its status after its body (`StatusMode::AfterBody`, `Connection::reply_status`, one
+> mechanism with A-681's Subversion site, whose route decides after its body too; a `1xx`, `204`, `205` or `304`, or a
+> status other than `200` on a streamed route, fails it `500`), its actions expiring with the bearer token that asked. The daemon serves the locks API over the locks log (`ShardLfs`); the batch API and the transfers answer
+> `503` at their head until A-581, so no upload is acknowledged that a restart would forget. Closes A-625 part 3's
+> "LFS's routes on the site" and part 2b-ii's "the edge's answer whose status follows the body". macOS arm64 (Mac
+> Studio, kiln r109): `slates-http-edge --lib connection::` 18 of 18, the new test failing first with the status never
+> taken; `slates-git --lib lfs::` 73 of 73; `slates-server --lib vcs_http:: lfs:: credentials::` 55 of 55; the CLI's
+> edge test 1 of 1.
+> Owed: A-581's durable LFS objects on the owner shard, and the batch API and the transfers served over them; locks by
+> others than the owner (A-635's policy check); principals' names for people (§4.13); the stock git-lfs client end to
+> end against the daemon (main's).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still

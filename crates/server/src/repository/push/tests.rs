@@ -796,3 +796,53 @@ fn assert_the_write_policy_gates_the_push(
     );
   }
 }
+
+/// The green each change of an append made, in its changes' order.
+fn made_greens(pushed: &Appended) -> Vec<DbVolumeId> {
+  pushed
+    .changes
+    .iter()
+    .filter_map(|change| match change {
+      BranchAppended::Created { green, .. } => Some(*green),
+      _ => None,
+    })
+    .collect()
+}
+
+/// A-694 (bug: every new branch of one append was minted the same id). Do: in a repository whose `main` is at version
+/// 1, append three new branches made from `main` at version 1 in one entry; then make a fourth through the branch verb,
+/// recorded after the entry. Expect the entry accepted, each branch its own green at version 0 holding `main`'s file and
+/// bound to its name, the four greens' ids all different, and each new id's counter past the one before it. Before,
+/// the second branch's id was the first's, and the entry was refused `ContentUnavailable` naming it.
+#[test]
+fn t_a694_an_append_makes_each_new_branch_its_own_green() {
+  crate::daemon::audit_on_shard(|state| {
+    let (repo, [main, _], _, _) = two_branches(state);
+    let changes = vec![
+      create("left", main, 1),
+      create("middle", main, 1),
+      create("right", main, 1),
+    ];
+    let pushed = push(state, &owner(), repo, changes, EntryParts::default());
+    let pushed = pushed.expect("three new branches in one entry");
+    let made = made_greens(&pushed);
+    assert_eq!(made.len(), 3, "{pushed:?}");
+    let repositories = state.db.partition().repositories();
+    for (name, green) in ["left", "middle", "right"].into_iter().zip(&made) {
+      assert_eq!(repositories.branch(repo, name), Some(*green), "{name}");
+    }
+    for green in &made {
+      assert_eq!(file(state, *green, "f").as_deref(), Some(&b"one"[..]));
+    }
+    let fourth = branch(state, "tree", ("fourth", "main"));
+    let counters: Vec<u64> = made
+      .iter()
+      .chain([&fourth])
+      .map(|green| green.counter())
+      .collect();
+    assert!(
+      counters.windows(2).all(|pair| pair[0] < pair[1]),
+      "{counters:?}"
+    );
+  });
+}

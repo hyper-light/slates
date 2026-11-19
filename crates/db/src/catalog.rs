@@ -1453,7 +1453,26 @@ impl VolumeId {
   pub fn partition(&self) -> u16 {
     id_partition(&self.bytes)
   }
+
+  /// The counter the id was minted at (bytes 10-15, big-endian): the partition's minting counter when the volume was
+  /// made (A-694; `Db::volume_counter_at`).
+  pub fn counter(&self) -> u64 {
+    let mut counter = [0u8; size_of::<u64>()];
+    if let (Some(low), Some(minted)) = (
+      counter.get_mut(ID_COUNTER_PAD..),
+      self.bytes.get(ID_COUNTER_BYTES),
+    ) {
+      low.copy_from_slice(minted);
+    }
+    u64::from_be_bytes(counter)
+  }
 }
+
+/// Format: where a volume id's counter lies: its last six bytes, after the host's eight and the partition's two.
+const ID_COUNTER_BYTES: std::ops::Range<usize> = 10..16;
+
+/// Format: the bytes of a `u64` the counter's six leave above them: two.
+const ID_COUNTER_PAD: usize = size_of::<u64>() - (ID_COUNTER_BYTES.end - ID_COUNTER_BYTES.start);
 
 /// A repository (§4.17.1 "The repository and its greens"; A-515): a name a tool's clients reach, its tool and object
 /// format, its default branch, and its owner. Its namespace, each branch name bound to the green whose versions are the

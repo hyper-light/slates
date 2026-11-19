@@ -365,6 +365,20 @@ impl Db {
     self.next_seq
   }
 
+  /// The counter the `offset`-th volume id minted now takes (A-694): the next sequence or, past it, one past the highest
+  /// counter of any volume created here (`Partition::volume_counter`), plus `offset`. A verb that creates several volumes
+  /// before any is recorded (an append's new branches) mints them at offsets 0, 1, ...; each creation's apply moves the
+  /// partition's counter past its own, so no later mint repeats one, and a recovery, which applies the same records,
+  /// mints what the live database would. `None` past the counters an id may hold
+  /// (`crate::register::MAX_OBJECT_COUNTER`).
+  pub fn volume_counter_at(&self, offset: u64) -> Option<u64> {
+    self
+      .next_seq
+      .max(self.partition.volume_counter())
+      .checked_add(offset)
+      .filter(|counter| *counter <= crate::register::MAX_OBJECT_COUNTER)
+  }
+
   /// Pins a fixed cadence: the snapshots after it come every `policy.bytes_between_snapshots` of log, whatever the
   /// measured work (a model test that drives snapshots at a chosen rate; a bench that wants none).
   pub fn set_policy(&mut self, policy: SnapshotPolicy) {
