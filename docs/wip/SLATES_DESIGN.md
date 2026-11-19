@@ -11769,6 +11769,27 @@ is one more version, and the chain itself is never rewritten.
   windows.
 
 **Works over works: review requests and their trees.**
+
+> **Status (2026-11-19, A-596; shared piece 6).** Review records are built in the engine and the metadata database; the
+> server's review verbs are owed. A request's versions are the versions of the volume its records name, the green its
+> updates are held as. A comment is anchored to a path, the whole lines a byte range covers
+> (`slates_merge::review::line_range`) and one such version. `Green::reanchor` (`crates/merge/src/engine/reanchor.rs`)
+> follows it to a later version through each change the green recorded to its path, by one pure step
+> (`slates_merge::review::move_through`, the position mapping of §4.16): a change that meets its bytes outdates it
+> (`LinesChanged`); one before it shifts it; the moved range must still cover whole lines of the new text, which two of
+> its bytes decide, or text was joined to its first or last line (`LinesJoined`); and a removal of its file, or a delta
+> that does not account for the file's change of length (a rename onto the file records the new bytes as one insert),
+> outdates it as `FileReplaced`. It never moves an outdated comment again, and costs the path's own changes since the
+> comment's version, never a whole file or the tree; a version below the fold floor is refused, typed. Following a
+> renamed file waits for the engine's path remapping (the verdict answers a work's edit of a renamed-away file
+> `DeleteModify`). An approval binds to the version its approver saw; `Reviews::staled_by` makes stale the standing
+> approvals a policy predicate names (A-597's matcher plugs in), and the standing ones are the evidence a policy counts.
+> The records are the repository's partition's (`crates/db/src/review.rs`): six operations, guarded then applied, carried
+> by the snapshot, charged to the merge byte budget, each refusal typed (`ReviewRefusal`). The oracle holds the walk to a
+> diff of the whole texts over generated histories, and found two verdict defects, filed in GAPS with parked tests: a
+> work based before its file was replaced is spliced into the replacement, and a truncate based before an append drops
+> the appended bytes. Owed: the server's verbs (write, move each comment as its request gets a version, approve, stale,
+> close), their wire refusals typed, and a comment's version held as a live reader of its green's fold floor.
 - A review request (git's pull request; §4.17.3 and §4.17.4 say what one is for their tools) is a work held
   unsubmitted, with a review record: comments anchored to the work, one of its versions, a path and a byte range;
   approvals; and the evidence the policy requires (status checks, signatures).
@@ -11900,7 +11921,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
    client-fidelity test (an accepted push's paths hold exactly the client's bytes).
 5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
-6. Review records: comments anchored and moved by position mapping; approvals as evidence.
+6. Review records: comments anchored and moved by position mapping; approvals as evidence (built in the engine and the
+   metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
    commit, under learned deadlines.
 
@@ -39288,3 +39310,79 @@ Applied in the same change to:
   - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
   - with the size not charged, a header naming 100 bytes read under an admission of 99.
 - **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.
+
+### A-596 — review records: comments followed by position mapping, approvals bound to the version they saw (2026-11-19, g267, UI goal 92; §4.17.1 "Works over works" and shared piece 6; §4.16 "Position mapping")
+Applied in the same change to:
+- §4.17.1's "Works over works" status and its pieces list (item 6); GAPS (the §4.17 entry, and two verdict findings,
+  open);
+- `crates/merge` (`review.rs` and `engine/reanchor.rs` with its tests, new; `map.rs`: `effect_of` visible to the crate;
+  `engine.rs` and `lib.rs` declare them);
+- `crates/db` (`review.rs`, new; `catalog.rs`: `ReviewCommentRecord`, `ReviewApprovalRecord`; `op.rs`: six operations
+  appended, published by hand in `tests/wire_order.txt` as `Op` 90 to 95; `error.rs`: `DbError::Review` and
+  `ReviewRefusal`; `partition.rs`: the records' guard, apply and budget, the snapshot's `review_comments` and
+  `review_approvals` appended, and their restore; `lib.rs`);
+- `crates/server` (`error.rs`: a review refusal answers `VolumeRefusal::Invalid` until the review verbs type theirs on
+  the wire, as A-299 did the database's).
+- **A comment's anchor.** A path, a run of whole lines held as the byte range they cover, from the first line's first
+  byte through the last line's newline (or the text's end), and a version of the request: the version of the green the
+  records name. `line_range` turns a client's lines into the range, and `lines_of` turns the range back into lines at
+  the version it stands on.
+- **One step** (`move_through`). Through one later version's canonical delta on the path:
+  - a change that meets the range outdates it, `LinesChanged`;
+  - a change before it shifts it; the moved range must still cover whole lines of the new text, judged from the byte
+    before it, its last byte and the text's length (`covers_whole_lines`), or text was joined to its first or last
+    line, `LinesJoined`. The edge rule lets an insert at the range's first byte shift it and one at its end leave it,
+    and a change to the newline just before it does not meet it, so bytes alone would move a comment onto a line that
+    now holds other text too;
+  - a delta that does not account for the file's change of length is no edit of the old bytes, `FileReplaced`. Every
+    delta the verdict records for an edit accounts for it, since an accepted op set fits its base (`fits_base`); a
+    rename onto the file records the new bytes as one insert at its start, which does not.
+- **The walk** (`Green::reanchor`). From the comment's version to a later one, through the path's content history
+  after it: a removal is `FileReplaced`; each change's delta on the path is that version's ops; each judgement reads two
+  bytes from the history value the walk holds. So it costs the path's own changes in between, never a whole file, another
+  path or the tree. Refused, typed: past the head, backward, below the fold floor or the checkpoint the green was
+  restored at (the texts are gone), and a range that is not whole lines at the comment's version.
+- **Approvals.** One an approver, bound to the version it saw. The approver's approval at an earlier version, or at one
+  before the change that made the standing one stale, is refused (`Behind`), so an approval never binds back.
+  `Reviews::staled_by` returns the operations that make stale the standing approvals, bound to an earlier version, that
+  the policy predicate names; a stale one is not made stale again (`Stale`). `Reviews::standing` is the evidence a policy
+  counts.
+- **The records.** On the repository's partition, guarded then applied (`crates/db/src/partition.rs`'s pattern):
+  `ReviewCommented`, `ReviewCommentMoved`, `ReviewCommentOutdated`, `ReviewApproved`, `ReviewApprovalStaled` and
+  `ReviewClosed`. A comment moves only forward and an outdated one never again; a new record is neither outdated nor
+  stale; comment numbers count from one (`next_comment`). Their bytes are charged to the merge byte budget and refused at
+  it as the merge plane's `Capacity`. They leave with their review's close and with their repository, and a snapshot
+  carries them, its restore refusing a record of a repository it does not carry.
+- **Tests** (debug, Mac Studio, 2026-11-19, kiln r504 and r529; load 9.7 to 12.4):
+  - `cargo test -p slates-merge --lib -- review:: engine::reanchor`: 7 of 7, 2 ignored (the findings);
+  - `cargo test -p slates-db --lib -- review:: repository:: partition:: replay::`: 11 of 11;
+  - `cargo test -p slates-server --lib -- error::`: 3 of 3;
+  - `cargo fmt -p slates-merge -p slates-db -p slates-server -- --check`: clean.
+
+  The oracle (`a_comment_follows_its_lines_as_a_diff_of_whole_texts_does_over_every_history`) runs generated histories
+  over a two-file green. Works are based at the head or behind it and make every line edit (whole lines inserted,
+  deleted or replaced; text inserted in a line or before its first byte; a line split, or joined to the next by a
+  deleted or overwritten newline; text appended), or unlink, re-create, rename onto or rename away the commented file.
+  Comments are written at versions the green reconstructs, and folds come at generated floors. Every comment is
+  followed to every later version and equals a diff of the whole texts the green held at each commit, line by line:
+  the same lines, the same version and reason when outdated, refused below the floor. A census asserts every answer was
+  met. The partition's model test holds every answer and the whole record state to the rules over generated histories,
+  and goes on from a partition rebuilt from its snapshot after every step. Red (r504), with each rule taken out at once
+  (the whole-lines judgement, the length check, the overlap's answer, the fold's refusal, the removal, the outdated and
+  behind rules, the restore's byte count, the repository's release): every one of the 7 merge and 4 db tests failed.
+- **Findings** (the oracle's; filed in GAPS, each a parked test red on r529):
+  - a work based before its file was replaced is spliced into the replacement: its ops shift past the replacement's
+    one-insert delta and land at the new file's end (`a_work_based_before_its_file_was_replaced_conflicts`: accepted,
+    the re-made file `<9>\nx`);
+  - a truncate based before an append removes the appended bytes: it meets the append only at its edge, and the splice
+    truncates to the head's end (`a_truncate_based_before_an_append_keeps_the_appended_bytes`: accepted, the file
+    `<1>\n`, the append gone).
+
+  The oracle bases neither case until the verdict is fixed, and a comment's step refuses to follow the truncate's
+  delta, which states four bytes where eight left.
+- **Owed.**
+  - The server's review verbs: write, move each comment as its request gets a version, approve, stale by A-597's
+    matcher, and close the review with its request. Their wire refusals typed, with the contract's next number.
+  - A comment's version held as a live reader of its green's fold floor.
+  - Following a renamed file, with the engine's path remapping.
+  - The two findings' fix in the verdict.
