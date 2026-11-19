@@ -16,7 +16,11 @@
 # - delete: `side` deleted, with no pack;
 # - options: a fast-forward of `main` with two push options;
 # - non-ff: a rewritten `main` forced, which the server refuses as non-fast-forward;
-# - atomic: `--atomic` of a new branch and the rewritten `main` forced, both refused.
+# - atomic: `--atomic` of a new branch and the rewritten `main` forced, both refused;
+# - hidden: with `receive.hideRefs refs/hidden` and a ref under it, a push to another ref under it, refused as a hidden
+#   ref's update, the hidden ref left out of the advertisement;
+# - fsck: with `receive.fsckObjects` too, a commit with no author email (`git hash-object --literally`), refused by
+#   index-pack's strict check.
 # Deterministic: no configuration but this script's, a fixed identity, fixed dates, one thread of delta search; then
 # SHA256SUMS lists every file made.
 # Usage: make-push-fixtures.sh OUTDIR
@@ -78,4 +82,12 @@ git checkout -q -b good main~1
 printf 'good\n' > good; git add good; commit -m 'good'
 git checkout -q main
 push atomic --atomic --force "$SERVER" good main
+git -C "$SERVER" config receive.hideRefs refs/hidden
+git -C "$SERVER" update-ref refs/hidden/x "$(git -C "$SERVER" rev-parse main)"
+push hidden "$SERVER" main:refs/hidden/y
+git -C "$SERVER" config receive.fsckObjects true
+bad=$(printf 'tree %s\nauthor A %s +0000\ncommitter A <a@example.com> %s +0000\n\nno author email\n' \
+  "$(git rev-parse 'main^{tree}')" "$at" "$at" | git hash-object -t commit -w --literally --stdin)
+git update-ref refs/heads/bad "$bad"
+push fsck "$SERVER" bad
 cd "$OUT" && shasum -a 256 git-version.txt ./*.bin ./*.refs ./*.pack | sed 's| \./| |' > SHA256SUMS
