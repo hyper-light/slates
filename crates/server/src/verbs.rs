@@ -21845,6 +21845,61 @@ mod tests {
     }
   }
 
+  /// A-533 (A-513's remainder; §4.16 "Recovery": a work "is unserved (`Unpublished`) until it has" been replayed through
+  /// its green's owner; A-207, A-247): a recovered work whose rebuild asks went unanswered twice keeps its record and
+  /// stays unbuilt, and the protocol's `Unpublished` is never answered from memory. Do: on a shard, record such a work;
+  /// send a read of it; end its record as its replay's install does; send the same request again under its id. Expect:
+  /// `Unpublished` first; the resend runs the verb and answers what it answers now (`NotFound`: the stand-in work has no
+  /// volume record), not the first answer again. Before, the work's verbs answered `NotFound` while its record stood, as
+  /// if the work were gone, and that answer was the request's completion.
+  #[test]
+  fn an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt() {
+    let (first, resent) = crate::daemon::audit_on_shard(|state| {
+      let unbuilt = crate::work_home::Unbuilt {
+        work: super::DbVolumeId { bytes: [0x53; 16] },
+        green: super::DbVolumeId { bytes: [0x54; 16] },
+        created_at: 1,
+      };
+      state.work_home.unbuilt.push(unbuilt.clone());
+      let id = slates_wire::request::RequestId {
+        client: 1,
+        sequence: 1,
+      };
+      let principal = Principal::Uid {
+        host: HostId(0),
+        uid: 0,
+      };
+      let request = super::RequestBody::ReadRange {
+        volume: super::to_wire_volume(unbuilt.work),
+        path: "/f".to_owned(),
+        at: slates_ipc::protocol::ReadAt::Head,
+        offset: 0,
+        max: 1,
+      };
+      let first = super::run_forwarded(state, 1, id, 1, &principal, request.clone(), None);
+      // The record ends as the replay's install ends it (A-513): here a log that did not replay.
+      super::install_replayed_work(state, &unbuilt, None);
+      let resent = super::run_forwarded(state, 1, id, 1, &principal, request, None);
+      (first, resent)
+    });
+    assert!(
+      matches!(
+        first,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Unpublished { .. }
+        })
+      ),
+      "a work recorded unbuilt is unserved, Unpublished, not gone: {first:?}"
+    );
+    assert_eq!(
+      resent,
+      Some(ReplyBody::Refused {
+        refusal: Refusal::NotFound
+      }),
+      "the resend under the same id ran the verb, not the recorded first answer"
+    );
+  }
+
   /// §4.9 (RIFL), the protocol's `Overloaded` ("the request was not started and may be retried" under its id), GAPS
   /// "The many-client load test from 10,000 to 100,000 clients"
   /// (`docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`): a verb answered `Overloaded` ran
