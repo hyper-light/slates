@@ -343,8 +343,12 @@ impl<S: PathSources> DerivedType for PathHistory<S> {
   }
 }
 
-/// [`PathHistory`]'s inputs: `version`'s parents, then each version its sources name that is not among them, in order.
-fn inputs_of<S: PathSources>(source: &S, version: S::Version) -> Option<Vec<S::Version>> {
+/// [`PathHistory`]'s inputs, and blame's ([`super::blame`]): `version`'s parents, then each version its sources name that
+/// is not among them, in order.
+pub(super) fn inputs_of<S: PathSources>(
+  source: &S,
+  version: S::Version,
+) -> Option<Vec<S::Version>> {
   let mut inputs = source.parents(version)?;
   let named: BTreeSet<S::Version> = source
     .sources(version)?
