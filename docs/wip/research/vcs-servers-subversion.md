@@ -68,6 +68,8 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/libsvn_ra_svn/internal_auth.c` | `61f373448a9c878c` (A-599) | C |
 | `subversion/libsvn_ra_svn/client.c` | `3c3b9263dd7223a9` (A-599) | C |
 | `subversion/libsvn_ra_svn/editorp.c` (read 2026-11-19 for A-617; 1.15.0's is the same bytes) | `610cffcd14b17ecf` | C |
+| `subversion/include/private/svn_fs_util.h` (read 2026-11-19 for A-617) | `b1f1221b87609113` | C |
+| `subversion/libsvn_subr/checksum.c` (read 2026-11-19 for A-617) | `907299438410f21b` | C |
 | `subversion/mod_dav_svn/repos.c` | `940bc5282be7b763` | C |
 | `subversion/libsvn_repos/hooks.c` | `96392d3013a7f6bb` | C |
 | `subversion/libsvn_repos/log.c` | `d5f97de3e455314b` | C |
@@ -828,3 +830,23 @@ the first 16 hex digits of each file's sha256:
   makes; the golden vectors' stock round trip (`svnadmin load` then `dump` of each, recorded on the parked branch
   `agents/g264-a628-svnadmin`, `fixtures/svnadmin/redumps.txt`) gives `full.dump` byte for byte, the bar the export is
   held to.
+- **The drive's checks** [C: `commit.c` 413-882; `tree.c`; `svn_fs_util.h` 82-107; `checksum.c` 688-694; `lock.c`
+  605-630]: `open-root` past the youngest is "No such revision %ld (HEAD is %ld)" (428-431), the transaction begun on
+  the youngest; `delete-entry` checks the path in the transaction, then (absent) "'%s' is out of date", then the
+  out-of-date test when it names a revision (487-509); an add with a copy refuses a present target unless its directory
+  was copied, then a source outside the repository ("Source url '%s' is from different repository"), then the source's
+  revision and path (323-366); an add without one is FSFS's "File already exists: filesystem '%s', transaction '%s',
+  path '%s'"; `open-dir` of an absent path is "Path '%s' not present", the relpath as the client named it (550-554);
+  `open-file` reads the created revision, "File not found: transaction '%s', path '%s'" for an absent one, then the
+  out-of-date test (627-634); a directory's out-of-date test runs at its first property change only (710-727);
+  `close-file` compares the text's MD5, "Checksum mismatch for resulting fulltext\n(%s)" in
+  `svn_checksum_mismatch_err`'s layout (679-694); `close-edit` without `open-root` is `E165002` (811-813).
+- **Locks at each call** [C: `tree.c`, with `SVN_FS_TXN_CHECK_LOCKS`]: `fs_delete_node`, `fs_make_dir` and `copy_helper`
+  check every lock at or beneath the path, `fs_make_file` and `fs_apply_textdelta` the path's own, `fs_change_node_prop`
+  at or beneath a directory and a file's own; a commit against another's lock is refused at the first such call
+  (`verify_lock`'s order: no user, then the owner, then the token), the same words the verdict would give at
+  `close-edit`.
+- **Words without a message** [C: `marshal.c` `svn_ra_svn__write_cmd_failure`]: an error created without a message is
+  written with its code's own (`svn_err_best_message`): `svn_checksum_parse_hex`'s refusal is "Invalid character in hex
+  checksum" and an undecodable LZ4 block "LZ4 decompression failed" (`svn_error_codes.h` 221, 1498). A checksum is read
+  as its first 32 hexadecimal digits, the rest ignored, and the all-zero digest is no checksum at all.

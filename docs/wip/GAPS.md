@@ -595,9 +595,9 @@
 > `commit`: the drive's out-of-date test, and the verdict (FSFS's `merge()` stated on the index, over the work's
 > transaction as the index's own builder makes it on its base, then the lock table's check); its oracle FSFS's `merge()`
 > and `verify_locks` transcribed over the index tests' naive filesystem, equal to the verdict with the lock table's real
-> check on 4,096 generated histories a run; `cargo test -p slates-svn --lib` on the Mac Studio (see A-592). Owed from
-> it: the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each command
-> arrives, over a transaction built a command at a time (piece 7). Found by it and fixed by A-617 (2026-11-19, g268):
+> check on 4,096 generated histories a run; `cargo test -p slates-svn --lib` on the Mac Studio (see A-592). Built since
+> (A-617 part 2b): the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as
+> each command arrives. Found by it and fixed by A-617 (2026-11-19, g268):
 > `LockTable::verdict` verified the locks a commit meets in the byte order of their paths, where FSFS checks the changed
 > paths in `svn_path_compare_paths` order and returns at the first that fails (`transaction.c` 3537-3539, 3578), so a
 > commit refused by locks at both `/t/a/b` and `/t/a-b` was answered at `/t/a-b` where `svnserve` answers `/t/a/b`; it
@@ -607,9 +607,15 @@
 > (`E210001`) refused as it refuses them; held to seventeen commits of stock `svn` 1.15.0 against stock `svnserve`
 > 1.15.0 recorded through a relay (`crates/svn/fixtures/commit`, SHA-256 checked), each command read and written back
 > byte for byte and each text delta applied, and to `vparse_tuple` transcribed over generated items; `cargo test
-> --locked -p slates-svn --lib` on the Mac Studio, red first (see A-617 part 2a). Owed from it (part 2b): the drive,
-> each command checked as it arrives and declared on a trial built a command at a time, `close-edit`'s verdict and the
-> answers `svnserve` writes. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock`
+> --locked -p slates-svn --lib` on the Mac Studio, red first (see A-617 part 2a). A-617 part 2b (2026-11-19, g268, UI
+> goal 93): the drive (`commit::drive`), each command checked as it arrives in `svnserve`'s order and words, FSFS's lock
+> check at each call, text deltas applied a window at a time with their MD5 checked, `close-edit`'s verdict and the
+> early-error rule, its rows read over the index at its base with nothing borrowed between commands; held to the
+> seventeen recorded commits replayed in their order, every answer byte for byte (revisions 1 to 13, the out-of-date,
+> lock and conflict refusals among them), and to hostile drives, each guard red-checked; `cargo test --locked -p
+> slates-svn --lib` on the Mac Studio (see A-617 part 2b). Owed from it: `svn_repos__validate_prop`'s checks,
+> authorization (A-606), `svn_repos__validate_new_path`, authenticating for write, the owner's commit step and the
+> connection task. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock`
 > (with
 > breaking), and the verdict's lock check (with release or keep), each returning the register entries it decided,
 > applied unconditionally; its oracle FSFS's lock rules transcribed, equal on generated histories; `cargo test -p
