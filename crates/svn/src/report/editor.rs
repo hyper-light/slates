@@ -677,15 +677,16 @@ fn hex_digit(nibble: u8) -> u8 {
 
 /// Whether `svndiff.c` writes `window` through `send_simple_insertion_window` (`window_handler`
 /// 259-261: version 0, no source copy and one instruction, which is then the new data making the
-/// whole target, 101-104).
-fn simple_insertion(version: Version, window: &Window) -> bool {
+/// whole target, 101-104). `get-file-revs` writes its deltas' windows by it too (`crate::reads`,
+/// A-613).
+pub(crate) fn simple_insertion(version: Version, window: &Window) -> bool {
   version == Version::Zero && matches!(window.instructions.as_slice(), [Instruction::New { .. }])
 }
 
 /// An encoded window split as `window_handler` writes it: its integers, its instruction section and
 /// its new-data section. Refused when the encoding does not hold its own lengths, which the encoder
-/// never writes.
-fn window_sections(encoded: &[u8]) -> Result<[&[u8]; 3], EditorRefused> {
+/// never writes. `get-file-revs` writes its deltas' windows with it too (`crate::reads`, A-613).
+pub(crate) fn window_sections(encoded: &[u8]) -> Result<[&[u8]; 3], EditorRefused> {
   let malformed = EditorRefused::Window(SvndiffError::CorruptWindowHeader);
   let mut at = 0usize;
   let mut integers = [0u64; WINDOW_HEADER_INTEGERS];
