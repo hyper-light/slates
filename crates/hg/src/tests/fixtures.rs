@@ -878,7 +878,8 @@ pub(crate) mod import {
 /// stock 7.2 in two repositories (`states`, bookmarks in `.hg/bookmarks`; `states-store`, bookmarks in the store), each
 /// store whole with its requirements, `.hg/bookmarks` where it is kept there, and 7.2's own listings of every changeset's
 /// phase, every bookmark and every marker, as `fixtures/state/make-state-fixtures.sh` wrote them (its header names the
-/// run), compiled in by name.
+/// run); and what 7.2's `served` filter serves of each (A-680 part 1), as `make-served-fixtures.sh` wrote it; compiled in
+/// by name.
 pub(crate) mod state {
   /// Lists each file's name with its bytes.
   macro_rules! stored {
@@ -896,12 +897,23 @@ pub(crate) mod state {
     "states-markers.txt",
     "states-phases.txt",
     "states-requires.txt",
+    "states-served-bookmarks.txt",
+    "states-served-branchmap.txt",
+    "states-served-heads.txt",
+    "states-served-phases.txt",
+    "states-served.txt",
     "states-store-bookmarks.txt",
     "states-store-files.txt",
     "states-store-hg-requires.txt",
     "states-store-markers.txt",
     "states-store-phases.txt",
     "states-store-requires.txt",
+    "states-store-served-bookmarks.txt",
+    "states-store-served-branchmap.txt",
+    "states-store-served-heads.txt",
+    "states-store-served-phases.txt",
+    "states-store-served.txt",
+    "states-store-unserved.txt",
     "states-store/00changelog.d",
     "states-store/00changelog.i",
     "states-store/00manifest.i",
@@ -914,6 +926,7 @@ pub(crate) mod state {
     "states-store/obsstore",
     "states-store/phaseroots",
     "states-store/requires",
+    "states-unserved.txt",
     "states/00changelog.d",
     "states/00changelog.i",
     "states/00manifest.i",
