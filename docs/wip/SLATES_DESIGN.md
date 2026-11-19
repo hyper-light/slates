@@ -36687,9 +36687,15 @@ platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.
   wanted. At this change's tests-first commit (92362f024): `slates-land --lib -- whatever_the_kind` 2 of 2 failed on
   their first refusal, `Exists(Errno(17))` (the metadata entry's landing `Aborted` with `Crashed`; the removal
   `Failed` where `Conflict(TargetInUse)` was wanted), and `slates-wire --lib -- header` read a major-2 header through to
-  its unknown class. The golden vectors (`crates/ipc/src/os_code_vectors.txt`) agree, 8 of 8, byte for byte with an
-  encoder written apart from the crate's, from the codec's rules (a `u32` discriminant by declaration index, a `u32`
-  length prefix, little-endian fields) and the wire order's indices.
+  its unknown class. Green with the change (run r76, 01:47 to 01:51 UTC, load 14.2 to 18.8): `slates-land --lib` 47
+  passed (1 ignored, the manifest vectors' writer), `slates-vfs --lib -- host:: base` 13, `slates-base --lib --
+  own_mounts s3::host` 12, `slates-ipc --lib -- os_code_vectors protocol` 7 (2 ignored), `slates-wire --lib -- header`
+  4, `slates-anchor --lib -- layout` 2, `slates-api --lib -- error:: contract_history` 12, `slates-server --lib --
+  landing:: error:: longest` 16, `slates-mcp` and `slates-bridge-core` built; the wire order's writer
+  (`publish_appended_variants`) left `crates/ipc/tests/wire_order.txt` as committed; `cargo fmt --check` clean. The
+  golden vectors (`crates/ipc/src/os_code_vectors.txt`) agree, 8 of 8, byte for byte with an encoder written apart from
+  the crate's, from the codec's rules (a `u32` discriminant by declaration index, a `u32` length prefix, little-endian
+  fields) and the wire order's indices.
 - **Owed** (GAPS): `TargetRefusal::MountRefused` carries a WinFsp mount's Win32 code in its `errno` field on Windows; an
   `OsCode` says an errno but not whose, and a fleet mixing Linux and macOS would put a forwarded errno in the reader's
   words; the client's own OS faults name a bare number in its own numbering. Filed for main: the Windows land and base
