@@ -899,7 +899,12 @@
 > Its sixth slice, in part (g297): `log` without merged revisions (a log asking for them refused until built),
 > red-checked ten ways; reads asks A-616's one walk of copy roots; the sixth slice whole, `log`'s merged revisions
 > (nested walks of each merge's runs; `svn log -g` and `svn mergeinfo --show-revs` replayed whole), red-checked
-> thirteen ways. Owed from it: `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> thirteen ways; its seventh slice (g297), `get-file-revs` (its 13 scripted commands, `svn blame` and `svn blame -g`
+> replayed whole; Windows x86_64, jupiter, 444 of 444; macOS arm64, Mac Studio, its `reads::`, `serve::` and
+> `report::editor::` tests 58 of 58, a file property taken away and a mainline and a merged revision of one number
+> among them), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s writes as read until the
+> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0. Owed
+> from it: `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
@@ -2664,7 +2669,10 @@
 > passing), fmt clean; the one failure, A-626's copy oracle census meeting no nested copy whose inner copy replaced a
 > tree (0 of 30 nested pairs), is not A-668's, since that oracle bases every work at the head and so never reaches the
 > walk A-668 changed, and it passed alone again (r131, 3 of 37); its owner's, filed. Bug record:
-> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
+> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`. That census failure is fixed
+> (2026-11-19, A-672, g307): one fixed history, run first, meets every case the copy oracle's census counts, whatever
+> the seed, and the generated histories add to the counts (macOS arm64, Mac Studio, kiln r4: `cargo test --locked -p
+> slates-merge --lib copy` 34 passed, the fixed history meeting all eleven cases; the other platforms' runs owed).
 
 > **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
 > A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name
