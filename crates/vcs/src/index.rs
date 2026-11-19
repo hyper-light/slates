@@ -191,9 +191,9 @@ fn give_back(store: &mut ContentStore, contents: &[ContentId]) -> Result<(), Ind
 }
 
 /// Gives back the holds `rows` take of their contents, going on past a refusal and answering the first.
-fn release_rows(
+fn release_rows<'a>(
   store: &mut ContentStore,
-  rows: impl Iterator<Item = RowRef<'_>>,
+  rows: impl Iterator<Item = RowRef<'a>>,
 ) -> Result<(), IndexRefused> {
   let mut first = Ok(());
   for row in rows {
@@ -205,9 +205,9 @@ fn release_rows(
 }
 
 /// Takes the holds `rows` take of their contents.
-fn hold_rows(
+fn hold_rows<'a>(
   store: &mut ContentStore,
-  rows: impl Iterator<Item = RowRef<'_>>,
+  rows: impl Iterator<Item = RowRef<'a>>,
 ) -> Result<(), IndexRefused> {
   for row in rows {
     for content in row.contents() {
