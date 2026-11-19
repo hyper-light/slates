@@ -32,6 +32,10 @@ use crate::{Admission, to_u64};
 /// Format: what a request's command line begins with [gitprotocol-v2: `command = PKT-LINE("command=" key LF)`].
 const COMMAND: &[u8] = b"command=";
 
+/// Format: the parts a head line is written in: a key or `command=`, `=` or nothing, a value or the command's name,
+/// and its ending.
+const HEAD_LINE_PARTS: usize = 4;
+
 /// Format: the capabilities a client may send, `serve.c`'s `capabilities[]` that are not commands.
 const CLIENT_CAPABILITIES: [&[u8]; 5] = [
   b"agent",
@@ -457,7 +461,7 @@ fn write_head(
   let mut format = ObjectFormat::Sha1;
   let mut commands = 0usize;
   for line in &request.head {
-    let parts: [&[u8]; 4] = match line.value {
+    let parts: [&[u8]; HEAD_LINE_PARTS] = match line.value {
       Head::Command => {
         commands = commands.saturating_add(1);
         if commands > 1 {

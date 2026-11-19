@@ -429,7 +429,7 @@ fn a_refused_write_writes_nothing() {
   let too_long = vec![0u8; MAX_BAND_DATA + 1];
   let sha256 = ObjectId::from_hex(ObjectFormat::Sha256, "d".repeat(64).as_bytes()).unwrap();
   let packfile = header(Section::Packfile);
-  let cases: Vec<(Vec<Event<'_>>, Refusal)> = vec![
+  let cases = [
     (
       vec![packfile, Event::Pack(&too_long), Event::Flush],
       Refusal::TooLong {

@@ -202,12 +202,12 @@ impl<'a> Argument<'a> {
       Argument::Want(id) | Argument::Have(id) | Argument::Shallow(id) => {
         line::check_format(id, format, at)
       }
-      Argument::WantRef(name) => ref_name(name, at).map(drop),
-      Argument::Deepen(depth) => self::depth(u64::from(*depth), at).map(drop),
-      Argument::DeepenSince(time) => since(*time, at).map(drop),
+      Argument::WantRef(name) => ref_name(name, at).map(|_| ()),
+      Argument::Deepen(depth) => self::depth(u64::from(*depth), at).map(|_| ()),
+      Argument::DeepenSince(time) => since(*time, at).map(|_| ()),
       Argument::DeepenNot(value) | Argument::Filter(value) | Argument::PackfileUris(value) => {
         line::check_text(value, at)?;
-        named(value, at).map(drop)
+        named(value, at).map(|_| ())
       }
       _ => Ok(()),
     }
@@ -604,7 +604,7 @@ impl Response {
       }
       Event::WantedRef(line) => {
         line::check_format(&line.value.id, self.format, at)?;
-        ref_name(line.value.name, at).map(drop)
+        ref_name(line.value.name, at).map(|_| ())
       }
       Event::PackfileUri(line) => {
         line::check_format(&line.value.hash, self.format, at)?;
@@ -799,12 +799,12 @@ fn shallow(
 }
 
 /// The wanted-refs line `text` writes.
-fn wanted_ref<'a>(
-  text: &'a [u8],
+fn wanted_ref(
+  text: &[u8],
   ending: Ending,
   format: ObjectFormat,
   at: u64,
-) -> Result<Event<'a>, Refusal> {
+) -> Result<Event<'_>, Refusal> {
   let (hex, name) = split_word(text).ok_or(Refusal::Line { at })?;
   let id = line::object_id(format, hex, at)?;
   let name = ref_name(name, at)?;
@@ -815,12 +815,12 @@ fn wanted_ref<'a>(
 }
 
 /// The packfile-uris line `text` writes.
-fn packfile_uri<'a>(
-  text: &'a [u8],
+fn packfile_uri(
+  text: &[u8],
   ending: Ending,
   format: ObjectFormat,
   at: u64,
-) -> Result<Event<'a>, Refusal> {
+) -> Result<Event<'_>, Refusal> {
   let (hex, uri) = split_word(text).ok_or(Refusal::Line { at })?;
   let hash = line::object_id(format, hex, at)?;
   check_uri(uri, at)?;

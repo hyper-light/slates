@@ -232,7 +232,7 @@ impl<'a> Ref<'a> {
 }
 
 /// The attribute `word` writes.
-fn attribute<'a>(word: &'a [u8], format: ObjectFormat, at: u64) -> Result<Attribute<'a>, Refusal> {
+fn attribute(word: &[u8], format: ObjectFormat, at: u64) -> Result<Attribute<'_>, Refusal> {
   if let Some(name) = word.strip_prefix(SYMREF_TARGET) {
     let target = Attribute::SymrefTarget(name);
     check_attribute(target, format, at)?;

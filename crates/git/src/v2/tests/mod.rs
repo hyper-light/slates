@@ -467,8 +467,16 @@ proptest! {
       .filter(|(argument, _)| match argument {
         fetch::Argument::Filter(_) => !core::mem::replace(&mut filter, true),
         fetch::Argument::PackfileUris(_) => !core::mem::replace(&mut uris, true),
-        fetch::Argument::Deepen(_) => !cut && { depth = true; true },
-        fetch::Argument::DeepenSince(_) | fetch::Argument::DeepenNot(_) => !depth && { cut = true; true },
+        fetch::Argument::Deepen(_) if cut => false,
+        fetch::Argument::Deepen(_) => {
+          depth = true;
+          true
+        }
+        fetch::Argument::DeepenSince(_) | fetch::Argument::DeepenNot(_) if depth => false,
+        fetch::Argument::DeepenSince(_) | fetch::Argument::DeepenNot(_) => {
+          cut = true;
+          true
+        }
         _ => true,
       })
       .map(|(value, ending)| super::Line { value, ending: if ending { super::Ending::Lf } else { super::Ending::NoLf } })
@@ -512,7 +520,7 @@ proptest! {
         Ok(written) => prop_assert_eq!(&written, &stream),
         Err(refusal) => {
           let at = place(&refusal);
-          prop_assert!(at.is_some_and(|at| at <= to_u64(stream.len())), "{:?}", refusal);
+          prop_assert!(at.is_some_and(|at| at <= to_u64(stream.len())), "{refusal:?}");
         }
       }
     }

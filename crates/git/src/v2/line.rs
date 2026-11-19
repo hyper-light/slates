@@ -10,7 +10,7 @@ use crate::sideband::Band;
 use crate::to_u64;
 
 /// Format: the byte a text line ends with [gitprotocol-common: "A non-binary line SHOULD BE terminated by an LF"].
-pub(super) const LF: u8 = b'\n';
+const LF: u8 = b'\n';
 
 /// Format: the byte between a line's words [gitprotocol-v2: `SP`].
 pub(super) const SP: u8 = b' ';
@@ -196,11 +196,11 @@ fn decimal_digits(value: u64) -> ([u8; MAX_DECIMAL_DIGITS], usize) {
   let mut digits = [b'0'; MAX_DECIMAL_DIGITS];
   let mut rest = value;
   let mut len = 0usize;
-  for slot in digits.iter_mut().rev() {
+  for (written, slot) in digits.iter_mut().rev().enumerate() {
     let digit = u8::try_from(rest.checked_rem(DECIMAL).unwrap_or(0)).unwrap_or(0);
     *slot = b'0'.saturating_add(digit);
     rest = rest.checked_div(DECIMAL).unwrap_or(0);
-    len = len.saturating_add(1);
+    len = written.saturating_add(1);
     if rest == 0 {
       break;
     }

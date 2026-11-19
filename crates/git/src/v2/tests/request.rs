@@ -282,7 +282,7 @@ fn a_request_out_of_its_grammar_is_refused_by_kind() {
   let upper = format!("want {}\n", MAIN.to_uppercase());
   let trailing = format!("want {MAIN} side\n");
   let short = format!("want {}\n", &MAIN[..39]);
-  let cases: Vec<(Vec<u8>, Refusal)> = vec![
+  let cases = [
     (
       wire(&[Packet::Data(b"command=push\n"), Packet::Flush]),
       Refusal::UnknownCommand { at: 0 },
@@ -533,7 +533,7 @@ fn rules_between_arguments_are_kept() {
     let mut packets = vec![Packet::Data(b"command=fetch\n"), Packet::Delim];
     packets.extend(lines.iter().map(|line| Packet::Data(line)));
     packets.push(Packet::Flush);
-    decode(&wire(&packets), &mut room()).map(drop)
+    decode(&wire(&packets), &mut room()).map(|_| ())
   };
   assert_eq!(
     arguments(&[b"filter blob:none\n", b"filter tree:0\n"]),
