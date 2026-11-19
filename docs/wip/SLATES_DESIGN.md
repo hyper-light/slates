@@ -12267,6 +12267,11 @@ is one more version, and the chain itself is never rewritten.
 > goes back to its caller, which teaches the hook's times on the shard. Owed: the Windows driver (a job object, the
 > handle-list spawn of `slates_ipc::win_spawn`), the launcher's namespace on Linux (§4.6), and the push pieces' calls.
 
+> **Status (2026-11-19, A-671: the matcher's home).** git's `wildmatch` is `slates_vcs::wildmatch`
+> (`crates/vcs/src/wildmatch.rs`), moved whole from `crates/server`, behaviour unchanged: slates-vcs is the crate every
+> version-control server's crate builds on, so the policy and git's own crate (its sparse filter, A-640 part 4) hold one
+> matcher. Its oracle, git's `dowild` transcribed, is a file both crates' tests compile and no product build links.
+
 > **Status (2026-11-19, A-647 part 1: derived data, one mechanism, A-645).** What a read computes for a version is a
 > type of derived data (`crates/vcs/src/derived.rs`): a pure function of the version's change and its parents' values
 > of the same type, kept as content under the type's name and the version's in an index whose rows never change, so
@@ -47851,3 +47856,29 @@ with the fixed history first), GAPS (A-668's entry, where the census's failure w
   histories meeting the rare case in 3 of 34 nested pairs; `cargo fmt -p slates-merge -- --check` clean. The change is
   in the lib's test module alone, which no integration target compiles; its red is the luck recorded above (r81, r84),
   and a red of the new guard (a fixed history that stops meeting a case) is a mutation run, main's.
+
+### A-671 — git's `wildmatch` moved to slates-vcs, the crate every version-control server's crate builds on (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.1 "Policy" and shared piece 3; A-597, A-640 part 4)
+Applied in the same change to:
+- §4.17.1's policy statuses (a status after A-622 part 3's: where the matcher lives);
+- GAPS (the §4.17 entry);
+- `crates/vcs` (`wildmatch.rs`, moved from `crates/server`; `wildmatch/reference.rs`, its oracle as a file of its own;
+  `lib.rs`; `Cargo.toml`'s description);
+- `crates/server` (`lib.rs`: the module gone, its oracle compiled for the tests; `vcs_policy.rs`: the imports and the
+  docs' links; `Cargo.toml`: slates-vcs moved from the dev-dependencies to the dependencies).
+
+- **Why it moved.** git's `sparse:oid` filter (A-640 part 4) reads its patterns with git's glob, in slates-git, which
+  builds on slates-vcs and not on slates-server (slates-server builds on slates-git), so the matcher could not be
+  reached from there, and a second matcher would be two to hold to git. slates-vcs is the crate both build on.
+- **What moved, and what did not change.** The module whole, as a rename: its code, its docs, git's 190 vectors and
+  the generated comparison with the transcription of `dowild`. Only its visibility changed (`Glob`, `Glob::new`,
+  `Glob::matches` and `is_glob_special` are public; the rest stays private) and the doc's account of where it lives.
+  No behaviour changed.
+- **The oracle, one file in two crates' tests.** The transcription of `dowild` judges the matcher's own generated
+  cases, and it is `vcs_policy`'s oracle of git's ref patterns and Subversion's segments. It is now a file of its own
+  (`wildmatch/reference.rs`): slates-vcs declares it under `#[cfg(test)]`, and slates-server's `lib.rs` compiles the
+  same file under `#[cfg(test)]` with `#[path]`, as other crates' tests compile the server's test support
+  (`crates/api/tests/api.rs`). Rejected: a cargo feature that slates-server's tests turn on, the route first planned.
+  A feature's code compiles as product code, where the lint wall denies the transcription's indexing
+  (`clippy::indexing_slicing`; clippy.toml's `allow-indexing-slicing-in-tests` covers `#[cfg(test)]` code alone), and
+  passing it would mean rewriting git's lines. Also rejected: a copy (two oracles to keep equal), and `vcs_policy`'s
+  oracle reading the product matcher (an oracle that is the code it checks).

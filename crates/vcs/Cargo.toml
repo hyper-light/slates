@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 readme.workspace = true
-description = "The version-control servers' one object store (§4.17.1 shared piece 3, A-581): every object's raw bytes as content by BLAKE3 identity, one copy across git, Mercurial and Subversion; each repository's index as immutable sorted tables that are content, plus a mutable tail, shared by forks; every object checked against its tool's id on arrival and held by its push until the verdict commits."
+description = "The version-control servers' one object store (§4.17.1 shared piece 3, A-581): every object's raw bytes as content by BLAKE3 identity, one copy across git, Mercurial and Subversion; each repository's index as immutable sorted tables that are content, plus a mutable tail, shared by forks; every object checked against its tool's id on arrival and held by its push until the verdict commits; and git's wildmatch glob, the one pattern matcher the servers' crates share (A-671)."
 
 [dependencies]
 blake3 = { workspace = true }

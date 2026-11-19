@@ -349,6 +349,12 @@
 > ra_svn and DAV. Linux x86_64 (adacachy): server lib 630 passed beside main's 624, the glue's five tests new and
 > nothing failing that main's tree passed; each of four choices broken in a copy failed only its own tests; the macOS
 > run owed. Owed: DAV's LOCK and UNLOCK wired (A-661's next part, after g298's serving); the hook times' table.
+> **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
+> whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
+> slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
+> transcribed, is a file of its own that slates-vcs's tests and slates-server's policy tests both compile, under
+> `#[cfg(test)]` in each, so no product build links it. A cargo feature was rejected: its code builds as product code,
+> where the lint wall refuses the transcription's indexing.
 > **A-648 (2026-11-19, g229; §4.17.4 item 9, the gaps A-623 found):** the record names Subversion's nine points
 > (`HookPointName` 8 to 13 in `slates_db` and the protocol, both wire orders) and holds a Subversion repository's
 > hooks-env in its policy (refused by section, `DatabaseRefusal` 11, when no hook's environment can carry it or the
