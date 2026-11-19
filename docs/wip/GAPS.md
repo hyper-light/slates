@@ -1,13 +1,17 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **§4.17 version-control servers: the shared mapping and the git server are designed, nothing is built (2026-11-18,
-> A-497, D-28; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> **§4.17 version-control servers: the shared mapping and the git server are designed, and the repository record is
+> built (2026-11-18, A-497, D-28, A-515; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
 > §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
 > of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
 > object store and its index; works from a client's push, with the head operation and the client-fidelity test; works
 > over works and bases given as trees; review records; policy and hooks), then each tool's pieces (§4.17.2's fifteen for
 > git, starting with the pkt-line codec). No speed is claimed until main measures it by §4.17.1's and §4.17.2's method.
+> **A-515 (2026-11-18):** shared piece 1's first half is built: the repository record and its namespace in the metadata
+> database (`crates/db/src/repository.rs`), with its rules model-tested. Owed from piece 1: a green made at another
+> green's version without a walk (maps shared by identity in the engine); the verbs that create repositories and their
+> greens; the record's replication in a fleet (with piece 2).
 
 > **§4.17.3 the Mercurial server: designed, nothing is built (2026-11-18, A-499; UI goal 91; owner g291).** Built on
 > §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move toward public, and a
@@ -1253,7 +1257,12 @@
 > --local` on the drive links all 7 object files, as NTFS does; with WinFsp's own driver the clone dies `failed to
 > create link` and the test skips loudly. The decision now comes with the patch in hand: WinFsp's contributor agreement
 > (upstream; it assigns joint copyright to WinFsp's author) or an EV code-signing certificate and a Microsoft Partner
-> Center account (a slates-signed driver). **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> Center account (a slates-signed driver). **A-498 (2026-11-18, g258):** the harness stated the three lines on any WinFsp
+> drive, so it failed exactly a patched drive, whose clones link as NTFS's do. It now asks the drive: one file of the
+> mount's workload root is given a second name before the workloads run, and the lines are stated only where that is
+> refused (`HardLinks`, `mount_links`). On the patched driver git's history and Mercurial are held to every count NTFS
+> prints; on WinFsp as released the record notes the refusal and states the lines as before. Owed (main's): that run on
+> the test-signing VM, where Mercurial's hard-linked clone and store must come out identical. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
 > and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
 > drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
 > environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
