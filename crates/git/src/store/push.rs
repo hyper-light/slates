@@ -36,6 +36,9 @@ pub struct Incoming<'a> {
   pub claimed: Option<ObjectId>,
   /// Its content: the bytes git hashes after the header.
   pub content: &'a [u8],
+  /// The depth of the delta chain its source's pack stored it at, zero whole: what the
+  /// deployment's own clients chose, which the fragments' depth learns from (A-614 part 2).
+  pub depth: u64,
 }
 
 /// Why a push's admission was refused. The push keeps what it held before, for its caller to abandon.
@@ -85,6 +88,8 @@ pub struct Push {
   quarantine: Quarantine,
   commits: BTreeMap<ObjectId, Arrived>,
   sealed: bool,
+  /// The deepest delta chain the push's source carried.
+  deepest: u64,
 }
 
 impl Push {
@@ -95,6 +100,7 @@ impl Push {
       quarantine: Quarantine::new(),
       commits: BTreeMap::new(),
       sealed: false,
+      deepest: 0,
     }
   }
 
@@ -132,6 +138,7 @@ impl Push {
       self.read_commit(id, incoming.content, room)?;
     }
     self.sealed = false;
+    self.deepest = self.deepest.max(incoming.depth);
     Ok((id, admitted))
   }
 
@@ -192,6 +199,11 @@ impl Push {
   /// Whether no object is held.
   pub fn is_empty(&self) -> bool {
     self.quarantine.is_empty()
+  }
+
+  /// The deepest delta chain the push's source carried.
+  pub fn deepest(&self) -> u64 {
+    self.deepest
   }
 
   /// Whether the push is sealed: every commit's generation number is known.

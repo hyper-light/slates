@@ -258,7 +258,11 @@
 > a map model over generated histories in both formats; eleven mutations each turned tests red (`cargo test -p
 > slates-git --lib store::`, 14 of 14, Mac Studio; see A-614). Owed: part 2, the pack fragments and the base pack with
 > their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters; the walks and a
-> commit sliced under the shard's budget; the versions' records as content.
+> commit sliced under the shard's budget; the versions' records as content. **Part 2 (A-614 part 2):** each version's
+> D(k) kept as two fragments (commits, trees and tags; blobs) of pack entries with their CRC32s, an edit a REF delta against
+> its path's previous object and similar objects OFS deltas, the window, zlib level, depth and rebuild point learned; the
+> base pack self-contained; packs read back through A-608's reader in the oracle; eleven mutations red. Owed of part 2:
+> the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
