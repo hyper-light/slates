@@ -13462,19 +13462,19 @@ fn assert_refused_at_the_slo(first: &Result<ReplyBody, IpcError>, slo_ns: u64) {
 }
 
 /// A-354 (§4.10 "Live shipping"; CLAUDE.md §2 items 8 and 9): a reply held for a live volume's durability waits through
-/// a silence but is answered at the latest at the failover SLO from its hold, the total bound of the rule every
+/// a silence but is answered at the latest at the failover delay from its hold, the total bound of the rule every
 /// transport judges a held reply by (`slates_bridge_core::durable_bound`), refused `DurabilityPending` as the request's
 /// recorded outcome; the verb sent again under a new id runs again and is answered once the log is durable. Do: three
 /// nodes at `f = 1`; both survivors refuse every register record from a (`Daemon::inject_record_refusal`), so a new
 /// live volume's head and catalog never place and nothing written to it can be durable; on a, a live-shipped volume
 /// shared with the fleet; one write, its reply awaited for at most the placement wait; the same request again; then
 /// lift the refusals and send the write under a new id. Expect the write refused `DurabilityPending` after it was held
-/// the failover SLO and within a liveness budget past it, counted `fleet.live.held_gave_up`; the same request answered
+/// the failover delay and within a liveness budget past it, counted `fleet.live.held_gave_up`; the same request answered
 /// that same refusal (its completion, §4.9); and the write under a new id answered `FsDone`. Before, a held reply ended
 /// only durable, fenced or destroyed, so its client waited as long as its daemon lived (A-353's hang: a write through a
 /// successor whose catalog was refused for good waited 21 minutes).
 #[test]
-fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again() {
+fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   // a's failover delay held at its estimate now (A-363), so the hold's bound cannot move under the assertion; held from
@@ -28421,12 +28421,12 @@ fn a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget() {
   );
 }
 
-/// A-317, the ceiling on the same budget: a location round can wait for peers that do not answer, so the operator's
-/// failover delay ends the location on the wall whatever its other bound says. Do: the same read with the node's failover
-/// delay held at one nanosecond (injected, A-363). Expect: refused at its first look at the ceiling, with no look past the first, counted as
-/// ended by the SLO.
+/// A-317, the ceiling on the same budget: a location round can wait for peers that do not answer, so the failover delay
+/// ends the location on the wall whatever its other bound says. Do: the same read with the node's failover delay held at
+/// one nanosecond (injected, A-363). Expect: refused at its first look at the ceiling, with no look past the first,
+/// counted as ended by the delay.
 #[test]
-fn the_failover_slo_ends_a_forwards_location_budget() {
+fn the_failover_delay_ends_a_forwards_location_budget() {
   let _serial = serialize_fleet_tests();
   let (reply, polls, (spent, slo_ended)) = read_with_no_owner_to_find(Some(1));
   assert!(

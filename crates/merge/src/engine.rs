@@ -34,12 +34,24 @@
 //! and holders recompute the verdict before serving — those are the engine's remaining pieces
 //! (owed). The per-path content history kept for base reconstruction is a full byte copy per change;
 //! the design's chain shares it copy-on-write, the measured optimization (owed).
+//!
+//! **The state is persistent maps (A-534).** Each dimension's current values are a persistent radix tree
+//! ([`crate::dims`]), so a green made at another green's version ([`Lineage::branch`]) shares every node of the other's
+//! state and costs what changed since that version, never the tree (§4.17.1 item 4).
+//!
+//! **One history rule (A-534).** A key with no history has held its current value since version 0. A key's first
+//! recorded change first records, at version 0, the value it held, when it held one; a key that appears records only
+//! its appearance. So a green seeded from its origin records no history for the origin's keys (until 2026-11-19 every
+//! origin key had a version-0 entry, which held a second copy of every origin file's bytes), a green made at another's
+//! version starts with none, and every reader of a key's value at a version answers from the history when the key has
+//! one and from the current value when it has none.
 
 use crate::special::SpecialNode;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::dims::{Dim, Files, Xattrs};
 use crate::ops_doc::{Op, OpKind, OpsDoc};
 use crate::range::Range;
 use crate::verdict::MergeConflictClass;
@@ -309,10 +321,10 @@ fn xattr_entry(path: &str, name: &str, value: &[u8]) -> crate::identity::Entry {
 const SPECIAL_NODE_BYTES: usize = size_of::<SpecialNode>();
 
 /// A green being seeded from its origin a share at a time (§4.16 "the origin version from a snapshot"; §4.3 "Bounded
-/// work everywhere"): the origin's entries are moved into the engine — each one's identity added, its value and its
-/// version-0 history set — until a share's bytes are in, so a kernel-sized origin (97,229 files) seeds over many of a
-/// shard's steps instead of one poll. The order entries go in does not reach the result: the identity is a set hash
-/// and every table is keyed. [`Green::with_origin`] is the load run to its end.
+/// work everywhere"): the origin's entries are moved into the engine — each one's identity added and its value set,
+/// with no history, as the module's one history rule has it (A-534) — until a share's bytes are in, so a kernel-sized
+/// origin (97,229 files) seeds over many of a shard's steps instead of one poll. The order entries go in does not reach
+/// the result: the identity is a set hash and every table is keyed. [`Green::with_origin`] is the load run to its end.
 #[derive(Debug)]
 pub struct OriginLoad {
   green: Green,
@@ -353,34 +365,26 @@ impl OriginLoad {
     if let Some((path, bytes)) = origin.files.pop() {
       let moved = path.len().saturating_add(bytes.len());
       green.identity.add(&file_entry(&path, &bytes));
-      green.content.insert(path.clone(), bytes.clone());
-      green.last_changed.insert(path.clone(), 0);
-      let value = crate::history::Value::whole(&mut green.chunks, &bytes);
-      green.push_content(path, 0, Some(value));
+      green.content.insert(&path, bytes);
       return Some(moved);
     }
     if let Some((path, node)) = origin.specials.pop() {
       let moved = path.len();
       green.identity.add(&special_entry(&path, &node));
-      green.specials.insert(path.clone(), node);
-      green.special_changed.insert(path.clone(), 0);
-      green.special_history.insert(path, vec![(0, Some(node))]);
+      green.specials.insert(&path, node);
       return Some(moved);
     }
     if let Some(path) = origin.dirs.pop() {
       let moved = path.len();
-      if green.dirs.insert(path.clone()) {
+      if green.dirs.insert(&path, ()).is_none() {
         green.identity.add(&dir_entry(&path));
       }
-      green.dir_history.insert(path, vec![(0, true)]);
       return Some(moved);
     }
     if let Some((path, mode)) = origin.modes.pop() {
       let moved = path.len();
       green.identity.add(&mode_entry(&path, mode));
-      green.modes.insert(path.clone(), mode);
-      green.mode_changed.insert(path.clone(), 0);
-      green.mode_history.insert(path, vec![(0, Some(mode))]);
+      green.modes.insert(&path, mode);
       return Some(moved);
     }
     if let Some((path, target)) = origin.symlinks.pop() {
@@ -388,9 +392,7 @@ impl OriginLoad {
       green
         .identity
         .add(&link_entry(IDENTITY_TAG_SYMLINK, &path, &target));
-      green.symlinks.insert(path.clone(), target.clone());
-      green.symlink_changed.insert(path.clone(), 0);
-      green.symlink_history.insert(path, vec![(0, Some(target))]);
+      green.symlinks.insert(&path, target);
       return Some(moved);
     }
     if let Some((path, target)) = origin.hardlinks.pop() {
@@ -398,10 +400,8 @@ impl OriginLoad {
       green
         .identity
         .add(&link_entry(IDENTITY_TAG_HARDLINK, &path, &target));
-      green.hardlinks.insert(path.clone(), target.clone());
       relink(&mut green.links_to, &path, None, Some(&target));
-      green.hardlink_changed.insert(path.clone(), 0);
-      green.hardlink_history.insert(path, vec![(0, Some(target))]);
+      green.hardlinks.insert(&path, target);
       return Some(moved);
     }
     if let Some((path, name, value)) = origin.xattrs.pop() {
@@ -410,10 +410,7 @@ impl OriginLoad {
         .saturating_add(name.len())
         .saturating_add(value.len());
       green.identity.add(&xattr_entry(&path, &name, &value));
-      let key = (path, name);
-      green.xattrs.insert(key.clone(), value.clone());
-      green.xattr_changed.insert(key.clone(), 0);
-      green.xattr_history.insert(key, vec![(0, Some(value))]);
+      green.xattrs.insert(&path, &name, value);
       return Some(moved);
     }
     None
@@ -424,7 +421,9 @@ impl OriginLoad {
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
 /// base version can be reconstructed for a lagging work. The content dimension's history is copy-on-write
 /// (`crate::history`, W2): each version of a file is pieces of shared immutable chunks, so a version costs the bytes it
-/// added, not the file; the namespace dimensions' histories hold presence or the value.
+/// added, not the file; the namespace dimensions' histories hold presence or the value. The current values are
+/// persistent maps ([`crate::dims`]) and a key with no history has held its current value since version 0 (the module
+/// docs, A-534).
 #[derive(Debug, Default)]
 pub struct Green {
   /// The set hash of every entry at `identity_version` (`crate::identity`, A-202): brought to the head only when
@@ -435,7 +434,8 @@ pub struct Green {
   /// The keys whose entries any commit after `identity_version` changed: bounded by the keys the green's histories
   /// hold, each once however often it changed.
   identity_dirty: BTreeSet<IdentityKey>,
-  content: BTreeMap<String, Vec<u8>>,
+  /// The current files (persistent, [`crate::dims`]).
+  content: Files,
   content_history: ContentHistory,
   /// The chunks the content history's values share (`crate::history`).
   chunks: crate::history::Chunks,
@@ -443,14 +443,14 @@ pub struct Green {
   history_lists: usize,
   /// The bytes of every path's latest content value and its piece list (the current files, as the history holds
   /// them), a running total: what [`Green::history_bytes`] leaves out, as the current values were always left out.
-  specials: BTreeMap<String, SpecialNode>,
+  specials: Dim<SpecialNode>,
   special_history: ValueHistory<SpecialNode>,
   special_changed: BTreeMap<String, u64>,
-  dirs: BTreeSet<String>,
-  modes: BTreeMap<String, u32>,
-  symlinks: BTreeMap<String, String>,
-  hardlinks: BTreeMap<String, String>,
-  xattrs: BTreeMap<(String, String), Vec<u8>>,
+  dirs: Dim<()>,
+  modes: Dim<u32>,
+  symlinks: Dim<String>,
+  hardlinks: Dim<String>,
+  xattrs: Xattrs,
   dir_history: DirHistory,
   mode_history: ValueHistory<u32>,
   symlink_history: ValueHistory<String>,
@@ -517,7 +517,7 @@ pub struct Green {
   /// Each path's last change below the fold floor, whose entry the change index keeps there ([`Green::fold_history_before`]).
   below_floor_last: BTreeMap<String, u64>,
   /// The hard links naming each target, the reverse of `hardlinks`: the links a special's change changes.
-  links_to: BTreeMap<String, BTreeSet<String>>,
+  links_to: Dim<BTreeSet<String>>,
   /// The bytes `changes` and `latest_change` hold, a running total counted in [`Green::history_bytes`], so the index
   /// folds under the same budget as the histories it indexes.
   changes_bytes: usize,
@@ -651,26 +651,74 @@ fn history_touches<T>(history: &[(u64, T)], from: u64, to: u64) -> bool {
 }
 
 /// Moves hard link `alias` from naming `old` to naming `new` in the reverse map of the links naming each target.
-fn relink(
-  links_to: &mut BTreeMap<String, BTreeSet<String>>,
-  alias: &str,
-  old: Option<&str>,
-  new: Option<&str>,
-) {
+fn relink(links_to: &mut Dim<BTreeSet<String>>, alias: &str, old: Option<&str>, new: Option<&str>) {
   if let Some(old) = old
-    && let Some(aliases) = links_to.get_mut(old)
+    && let Some(aliases) = links_to.get(old)
   {
+    let mut aliases = aliases.clone();
     aliases.remove(alias);
     if aliases.is_empty() {
       links_to.remove(old);
+    } else {
+      links_to.insert(old, aliases);
     }
   }
   if let Some(new) = new {
-    links_to
-      .entry(new.to_owned())
-      .or_default()
-      .insert(alias.to_owned());
+    let mut aliases = links_to.get(new).cloned().unwrap_or_default();
+    aliases.insert(alias.to_owned());
+    links_to.insert(new, aliases);
   }
+}
+
+/// A key's value at `version` by the module's one history rule (A-534): from its history when it has one, else its
+/// current value, which it has held since version 0.
+fn value_at<T: Clone>(
+  history: Option<&Vec<(u64, Option<T>)>>,
+  current: Option<&T>,
+  version: u64,
+) -> Option<T> {
+  match history {
+    Some(history) => history_at(history, version),
+    None => current.cloned(),
+  }
+}
+
+/// Before `key`'s first recorded change, records the entry it held since version 0 (`held`, `None` when it held
+/// nothing), as the module's one history rule has it (A-534): a key that held a value keeps it reconstructible at every
+/// version before the change, and a key that appears records only its appearance.
+fn seed<K: Ord + Clone, T>(history: &mut BTreeMap<K, Vec<(u64, T)>>, key: &K, held: Option<T>) {
+  if let Some(held) = held
+    && !history.contains_key(key)
+  {
+    history.insert(key.clone(), vec![(0, held)]);
+  }
+}
+
+/// A value history's entry for a key's current value, for [`seed`]: `None` when the key holds none.
+fn held<T: Clone>(current: Option<&T>) -> Option<Option<T>> {
+  current.map(|value| Some(value.clone()))
+}
+
+/// The keys of two sorted, distinct key sequences together, sorted and each once: a green's current keys and its
+/// history's, which by the module's one history rule are every key it held at any version (A-534).
+fn union_keys<K: Ord>(
+  current: impl Iterator<Item = K>,
+  recorded: impl Iterator<Item = K>,
+) -> impl Iterator<Item = K> {
+  let mut current = current.peekable();
+  let mut recorded = recorded.peekable();
+  std::iter::from_fn(move || match (current.peek(), recorded.peek()) {
+    (Some(left), Some(right)) => match left.cmp(right) {
+      std::cmp::Ordering::Less => current.next(),
+      std::cmp::Ordering::Greater => recorded.next(),
+      std::cmp::Ordering::Equal => {
+        recorded.next();
+        current.next()
+      }
+    },
+    (Some(_), None) => current.next(),
+    (None, _) => recorded.next(),
+  })
 }
 
 /// Format: what the change index holds for each path a restore indexes: its entry in its version, its last change
@@ -1011,9 +1059,10 @@ impl Green {
 
   /// A green whose version 0 is `origin` — the state captured from a complete immutable base
   /// (§4.16 "the origin version from a snapshot"; the A-9 requirement that a chain starts "from
-  /// scratch or a complete immutable base"). Every dimension is seeded at version 0 with a history
-  /// entry there, so a work based on version 0 composes against the origin, an untouched path takes
-  /// the fast path (last changed at 0 ≤ base 0), and `base_at(0)` reconstructs it. The head stays
+  /// scratch or a complete immutable base"). Every dimension's current values are the origin's, with
+  /// no history: by the module's one history rule each has held its value since version 0 (A-534), so
+  /// a work based on version 0 composes against the origin, an untouched path takes the fast path
+  /// (never changed, so last changed at 0 ≤ base 0), and `base_at(0)` reconstructs it. The head stays
   /// 0: the origin is not a delta. Deterministic: the same origin seeds the same state, which is what
   /// lets a holder recompute version 0 from the placed origin bytes.
   /// Takes the origin by value and moves its entries in, so seeding costs no copy of the origin (it cloned the whole
@@ -1126,7 +1175,7 @@ impl Green {
     }
     if let Some(bytes) = &changed.value {
       self.identity.add(&file_entry(&changed.key, bytes));
-      self.content.insert(changed.key.clone(), bytes.clone());
+      self.content.insert(&changed.key, bytes.clone());
     }
     self.last_changed.insert(changed.key.clone(), changed.at);
     self.clear_content_history(&changed.key);
@@ -1138,12 +1187,12 @@ impl Green {
   }
 
   fn restore_dir(&mut self, changed: &crate::checkpoint::Changed<String, ()>) {
-    if self.dirs.remove(&changed.key) {
+    if self.dirs.remove(&changed.key).is_some() {
       self.identity.remove(&dir_entry(&changed.key));
     }
     if changed.value.is_some() {
       self.identity.add(&dir_entry(&changed.key));
-      self.dirs.insert(changed.key.clone());
+      self.dirs.insert(&changed.key, ());
     }
     self.dir_history.insert(
       changed.key.clone(),
@@ -1157,7 +1206,7 @@ impl Green {
     }
     if let Some(mode) = changed.value {
       self.identity.add(&mode_entry(&changed.key, mode));
-      self.modes.insert(changed.key.clone(), mode);
+      self.modes.insert(&changed.key, mode);
     }
     self.mode_changed.insert(changed.key.clone(), changed.at);
     self
@@ -1185,7 +1234,7 @@ impl Green {
     }
     if let Some(target) = &changed.value {
       self.identity.add(&link_entry(tag, &changed.key, target));
-      map.insert(changed.key.clone(), target.clone());
+      map.insert(&changed.key, target.clone());
     }
     if tag != IDENTITY_TAG_SYMLINK {
       relink(
@@ -1208,7 +1257,7 @@ impl Green {
     }
     if let Some(node) = changed.value {
       self.identity.add(&special_entry(&changed.key, &node));
-      self.specials.insert(changed.key.clone(), node);
+      self.specials.insert(&changed.key, node);
     }
     self.special_changed.insert(changed.key.clone(), changed.at);
     self
@@ -1218,12 +1267,12 @@ impl Green {
 
   fn restore_xattr(&mut self, changed: &crate::checkpoint::Changed<(String, String), Vec<u8>>) {
     let (path, name) = &changed.key;
-    if let Some(old) = self.xattrs.remove(&changed.key) {
+    if let Some(old) = self.xattrs.remove(path, name) {
       self.identity.remove(&xattr_entry(path, name, &old));
     }
     if let Some(value) = &changed.value {
       self.identity.add(&xattr_entry(path, name, value));
-      self.xattrs.insert(changed.key.clone(), value.clone());
+      self.xattrs.insert(path, name, value.clone());
     }
     self.xattr_changed.insert(changed.key.clone(), changed.at);
     self.xattr_history.insert(
@@ -1285,8 +1334,6 @@ impl Green {
     Option<crate::identity::Entry>,
     Option<crate::identity::Entry>,
   ) {
-    let target_at =
-      |history: Option<&Vec<(u64, Option<String>)>>| history.and_then(|h| history_at(h, since));
     match key {
       IdentityKey::File(path) => (
         self
@@ -1296,9 +1343,7 @@ impl Green {
       ),
       IdentityKey::Special(path) => (
         self
-          .special_history
-          .get(path)
-          .and_then(|h| history_at(h, since))
+          .special_at(path, since)
           .map(|node| special_entry(path, &node)),
         self
           .specials
@@ -1306,23 +1351,16 @@ impl Green {
           .map(|node| special_entry(path, node)),
       ),
       IdentityKey::Dir(path) => (
-        self
-          .dir_history
-          .get(path)
-          .is_some_and(|h| present_at(h, since))
-          .then(|| dir_entry(path)),
-        self.dirs.contains(path).then(|| dir_entry(path)),
+        self.dir_at(path, since).then(|| dir_entry(path)),
+        self.dirs.contains_key(path).then(|| dir_entry(path)),
       ),
       IdentityKey::Mode(path) => (
-        self
-          .mode_history
-          .get(path)
-          .and_then(|h| history_at(h, since))
-          .map(|mode| mode_entry(path, mode)),
+        self.mode_at(path, since).map(|mode| mode_entry(path, mode)),
         self.modes.get(path).map(|mode| mode_entry(path, *mode)),
       ),
       IdentityKey::Symlink(path) => (
-        target_at(self.symlink_history.get(path))
+        self
+          .symlink_at(path, since)
           .map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, &target)),
         self
           .symlinks
@@ -1330,54 +1368,105 @@ impl Green {
           .map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, target)),
       ),
       IdentityKey::Hardlink(path) => (
-        target_at(self.hardlink_history.get(path))
+        self
+          .hardlink_at(path, since)
           .map(|target| link_entry(IDENTITY_TAG_HARDLINK, path, &target)),
         self
           .hardlinks
           .get(path)
           .map(|target| link_entry(IDENTITY_TAG_HARDLINK, path, target)),
       ),
-      IdentityKey::Xattr(path, name) => {
-        let key = (path.clone(), name.clone());
-        (
-          self
-            .xattr_history
-            .get(&key)
-            .and_then(|h| history_at(h, since))
-            .map(|value| xattr_entry(path, name, &value)),
-          self
-            .xattrs
-            .get(&key)
-            .map(|value| xattr_entry(path, name, value)),
-        )
-      }
+      IdentityKey::Xattr(path, name) => (
+        self
+          .xattr_at(path, name, since)
+          .map(|value| xattr_entry(path, name, &value)),
+        self
+          .xattrs
+          .get(path, name)
+          .map(|value| xattr_entry(path, name, value)),
+      ),
     }
+  }
+
+  /// A path's IPC node at `version`, by the module's one history rule (A-534).
+  fn special_at(&self, path: &str, version: u64) -> Option<SpecialNode> {
+    value_at(
+      self.special_history.get(path),
+      self.specials.get(path),
+      version,
+    )
+  }
+
+  /// Whether a directory stood at `path` at `version`, by the module's one history rule (A-534).
+  fn dir_at(&self, path: &str, version: u64) -> bool {
+    match self.dir_history.get(path) {
+      Some(history) => present_at(history, version),
+      None => self.dirs.contains_key(path),
+    }
+  }
+
+  /// A path's mode at `version`, by the module's one history rule (A-534).
+  fn mode_at(&self, path: &str, version: u64) -> Option<u32> {
+    value_at(self.mode_history.get(path), self.modes.get(path), version)
+  }
+
+  /// A symbolic link's target at `version`, by the module's one history rule (A-534).
+  fn symlink_at(&self, path: &str, version: u64) -> Option<String> {
+    value_at(
+      self.symlink_history.get(path),
+      self.symlinks.get(path),
+      version,
+    )
+  }
+
+  /// A hard link's target at `version`, by the module's one history rule (A-534).
+  fn hardlink_at(&self, path: &str, version: u64) -> Option<String> {
+    value_at(
+      self.hardlink_history.get(path),
+      self.hardlinks.get(path),
+      version,
+    )
+  }
+
+  /// An attribute's value at `version`, by the module's one history rule (A-534).
+  fn xattr_at(&self, path: &str, name: &str, version: u64) -> Option<Vec<u8>> {
+    value_at(
+      self.xattr_history.get(&(path.to_owned(), name.to_owned())),
+      self.xattrs.get(path, name),
+      version,
+    )
+  }
+
+  /// Whether `path` is or ever was an IPC node: a special now, or one whose node has a history (A-534: by the one
+  /// history rule a special unchanged since version 0 has none, so the history alone no longer says it).
+  fn was_special(&self, path: &str) -> bool {
+    self.specials.contains_key(path) || self.special_history.contains_key(path)
   }
 
   /// [`Green::head_identity`] recounted from scratch over every current entry: the oracle the running set hash is
   /// held equal to (`crates/merge/tests/identity.rs`), O(everything the green holds).
   pub fn head_identity_from_scratch(&self) -> [u8; 32] {
     let mut set = crate::identity::SetHash::default();
-    for (path, node) in &self.specials {
-      set.add(&special_entry(path, node));
+    for (path, node) in self.specials.iter() {
+      set.add(&special_entry(&path, node));
     }
-    for (path, bytes) in &self.content {
-      set.add(&file_entry(path, bytes));
+    for (path, bytes) in self.content.iter() {
+      set.add(&file_entry(&path, bytes));
     }
-    for path in &self.dirs {
-      set.add(&dir_entry(path));
+    for path in self.dirs.keys() {
+      set.add(&dir_entry(&path));
     }
-    for (path, mode) in &self.modes {
-      set.add(&mode_entry(path, *mode));
+    for (path, mode) in self.modes.iter() {
+      set.add(&mode_entry(&path, *mode));
     }
-    for (path, target) in &self.symlinks {
-      set.add(&link_entry(IDENTITY_TAG_SYMLINK, path, target));
+    for (path, target) in self.symlinks.iter() {
+      set.add(&link_entry(IDENTITY_TAG_SYMLINK, &path, target));
     }
-    for (path, target) in &self.hardlinks {
-      set.add(&link_entry(IDENTITY_TAG_HARDLINK, path, target));
+    for (path, target) in self.hardlinks.iter() {
+      set.add(&link_entry(IDENTITY_TAG_HARDLINK, &path, target));
     }
-    for ((path, name), value) in &self.xattrs {
-      set.add(&xattr_entry(path, name, value));
+    for ((path, name), value) in self.xattrs.iter() {
+      set.add(&xattr_entry(&path, &name, value));
     }
     set.identity()
   }
@@ -1419,14 +1508,17 @@ impl Green {
         .filter(|(_, history)| history_touches(history, from, to))
         .map(|((path, _), _)| path.clone()),
     );
-    for (alias, history) in &self.hardlink_history {
-      let targets = [history_at(history, from), history_at(history, to)];
+    // Every link at either end: by the one history rule a link unchanged since version 0 has no history (A-534).
+    let aliases: Vec<String> =
+      union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned()).collect();
+    for alias in aliases {
+      let targets = [self.hardlink_at(&alias, from), self.hardlink_at(&alias, to)];
       if targets
         .iter()
         .flatten()
-        .any(|target| self.special_history.contains_key(target) && changed.contains(target))
+        .any(|target| self.was_special(target) && changed.contains(target))
       {
-        changed.insert(alias.clone());
+        changed.insert(alias);
       }
     }
     changed.into_iter().collect()
@@ -1442,33 +1534,33 @@ impl Green {
       specials: self
         .specials
         .iter()
-        .map(|(path, node)| (path.clone(), *node))
+        .map(|(path, node)| (path, *node))
         .collect(),
       files: self
         .content
         .iter()
-        .map(|(path, bytes)| (path.clone(), bytes.len() as u64))
+        .map(|(path, bytes)| (path, bytes.len() as u64))
         .collect(),
-      dirs: self.dirs.iter().cloned().collect(),
+      dirs: self.dirs.keys().collect(),
       modes: self
         .modes
         .iter()
-        .map(|(path, mode)| (path.clone(), *mode))
+        .map(|(path, mode)| (path, *mode))
         .collect(),
       symlinks: self
         .symlinks
         .iter()
-        .map(|(path, target)| (path.clone(), target.clone()))
+        .map(|(path, target)| (path, target.clone()))
         .collect(),
       xattrs: self
         .xattrs
         .iter()
-        .map(|((path, name), value)| (path.clone(), name.clone(), value.clone()))
+        .map(|((path, name), value)| (path, name, value.clone()))
         .collect(),
       hardlinks: self
         .hardlinks
         .iter()
-        .map(|(path, target)| (path.clone(), target.clone()))
+        .map(|(path, target)| (path, target.clone()))
         .collect(),
     }
   }
@@ -1490,21 +1582,19 @@ impl Green {
 
   /// A file's current bytes, or `None` when it is absent.
   pub fn content(&self, path: &str) -> Option<&[u8]> {
-    self.content.get(path).map(Vec::as_slice)
+    self.content.get(path)
   }
 
   /// Every file the green currently holds, with its bytes — so a new work volume can be seeded with
-  /// the base content it inherits and edits splice against it.
-  pub fn files(&self) -> impl Iterator<Item = (&str, &[u8])> {
-    self
-      .content
-      .iter()
-      .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+  /// the base content it inherits and edits splice against it. Each path is assembled by the walk (a persistent map's
+  /// keys are its edges, [`crate::dims`]), so it is owned.
+  pub fn files(&self) -> impl Iterator<Item = (String, &[u8])> {
+    self.content.iter()
   }
 
   /// Whether a directory exists at the path.
   pub fn is_dir(&self, path: &str) -> bool {
-    self.dirs.contains(path)
+    self.dirs.contains_key(path)
   }
 
   /// IPC aliases share the primary inode's metadata; no independent value is stored at an alias.
@@ -1535,7 +1625,7 @@ impl Green {
   pub fn xattr(&self, path: &str, name: &str) -> Option<&[u8]> {
     self
       .xattrs
-      .get(&(self.metadata_path(path).to_owned(), name.to_owned()))
+      .get(self.metadata_path(path), name)
       .map(Vec::as_slice)
   }
 
@@ -1611,53 +1701,44 @@ impl Green {
     // Each dimension is reconstructed from its own `(version, value)` history: the last entry at or
     // before `version` is that dimension's state then. Files come from the content history (a path
     // absent or removed by then yields no entry); directories from a presence history; modes,
-    // symlinks, hard links and xattrs from a value history (a removal is a `None` entry).
-    let files = self
-      .content_history
-      .keys()
+    // symlinks, hard links and xattrs from a value history (a removal is a `None` entry). A key with
+    // no history has held its current value since version 0, so each dimension's keys are its current
+    // keys and its history's together (the one history rule, A-534).
+    let files = union_keys(self.content.keys(), self.content_history.keys().cloned())
+      .filter_map(|path| {
+        let len = self.content_len_at(&path, version)?;
+        Some((path, len as u64))
+      })
+      .collect();
+    let dirs = union_keys(self.dirs.keys(), self.dir_history.keys().cloned())
+      .filter(|path| self.dir_at(path, version))
+      .collect();
+    let modes = union_keys(self.modes.keys(), self.mode_history.keys().cloned())
+      .filter_map(|path| self.mode_at(&path, version).map(|mode| (path, mode)))
+      .collect();
+    let symlinks = union_keys(self.symlinks.keys(), self.symlink_history.keys().cloned())
+      .filter_map(|path| self.symlink_at(&path, version).map(|target| (path, target)))
+      .collect();
+    let hardlinks = union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned())
       .filter_map(|path| {
         self
-          .content_len_at(path, version)
-          .map(|len| (path.clone(), len as u64))
+          .hardlink_at(&path, version)
+          .map(|target| (path, target))
       })
       .collect();
-    let dirs = self
-      .dir_history
-      .iter()
-      .filter(|(_, history)| present_at(history, version))
-      .map(|(path, _)| path.clone())
-      .collect();
-    let modes = self
-      .mode_history
-      .iter()
-      .filter_map(|(path, history)| history_at(history, version).map(|mode| (path.clone(), mode)))
-      .collect();
-    let symlinks = self
-      .symlink_history
-      .iter()
-      .filter_map(|(path, history)| {
-        history_at(history, version).map(|target| (path.clone(), target))
-      })
-      .collect();
-    let hardlinks = self
-      .hardlink_history
-      .iter()
-      .filter_map(|(path, history)| {
-        history_at(history, version).map(|target| (path.clone(), target))
-      })
-      .collect();
-    let xattrs = self
-      .xattr_history
-      .iter()
-      .filter_map(|((path, name), history)| {
-        history_at(history, version).map(|value| (path.clone(), name.clone(), value))
-      })
-      .collect();
+    let xattrs = union_keys(
+      self.xattrs.iter().map(|(key, _)| key),
+      self.xattr_history.keys().cloned(),
+    )
+    .filter_map(|(path, name)| {
+      self
+        .xattr_at(&path, &name, version)
+        .map(|value| (path, name, value))
+    })
+    .collect();
     crate::increment::Base {
-      specials: self
-        .special_history
-        .iter()
-        .filter_map(|(path, history)| history_at(history, version).map(|node| (path.clone(), node)))
+      specials: union_keys(self.specials.keys(), self.special_history.keys().cloned())
+        .filter_map(|path| self.special_at(&path, version).map(|node| (path, node)))
         .collect(),
       files,
       dirs,
@@ -1694,22 +1775,31 @@ impl Green {
     // A link named by the journal, or one aimed at a path it names (an unlink of a primary path is refused while
     // aliases survive). Hard links are few, and no index by target exists yet.
     let named_link = |link: &str, target: &str| named.contains(link) || named.contains(target);
-    if at_head {
-      for (link, target) in &self.hardlinks {
-        if named_link(link, target) {
-          base.hardlinks.push((link.clone(), target.clone()));
-        }
-      }
-    } else {
-      for (link, history) in &self.hardlink_history {
-        if let Some(target) = history_at(history, version)
-          && named_link(link, &target)
-        {
-          base.hardlinks.push((link.clone(), target));
-        }
-      }
-    }
+    base.hardlinks = self
+      .links_at(version)
+      .into_iter()
+      .filter(|(link, target)| named_link(link, target))
+      .collect();
     base
+  }
+
+  /// Every hard link at `version` and its target: the head's, or each link's value then by the module's one history
+  /// rule (A-534). Hard links are few, and no index by target exists yet.
+  fn links_at(&self, version: u64) -> Vec<(String, String)> {
+    if version >= self.head() {
+      return self
+        .hardlinks
+        .iter()
+        .map(|(link, target)| (link, target.clone()))
+        .collect();
+    }
+    union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned())
+      .filter_map(|link| {
+        self
+          .hardlink_at(&link, version)
+          .map(|target| (link, target))
+      })
+      .collect()
   }
 
   /// The entries one path contributes to a restricted base at `version` ([`Green::base_for`]): every dimension's entry
@@ -1718,24 +1808,16 @@ impl Green {
   /// (A-247).
   pub fn path_base(&self, version: u64, path: &str) -> crate::increment::Base {
     let mut base = crate::increment::Base::of_files(Vec::new());
-    let at_head = version >= self.head();
-    if at_head {
+    if version >= self.head() {
       self.head_entries(path, &mut base);
-      for (link, target) in &self.hardlinks {
-        if link == path || target == path {
-          base.hardlinks.push((link.clone(), target.clone()));
-        }
-      }
     } else {
       self.entries_at(path, version, &mut base);
-      for (link, history) in &self.hardlink_history {
-        if let Some(target) = history_at(history, version)
-          && (link == path || target == path)
-        {
-          base.hardlinks.push((link.clone(), target));
-        }
-      }
     }
+    base.hardlinks = self
+      .links_at(version)
+      .into_iter()
+      .filter(|(link, target)| link == path || target == path)
+      .collect();
     base
   }
 
@@ -1747,7 +1829,7 @@ impl Green {
     if let Some(node) = self.specials.get(path) {
       base.specials.push((path.to_owned(), *node));
     }
-    if self.dirs.contains(path) {
+    if self.dirs.contains_key(path) {
       base.dirs.push(path.to_owned());
     }
     if let Some(mode) = self.modes.get(path) {
@@ -1756,58 +1838,40 @@ impl Green {
     if let Some(target) = self.symlinks.get(path) {
       base.symlinks.push((path.to_owned(), target.clone()));
     }
-    let from = (path.to_owned(), String::new());
-    for ((attr_path, name), value) in self.xattrs.range(from..) {
-      if attr_path != path {
-        break;
-      }
-      base
-        .xattrs
-        .push((attr_path.clone(), name.clone(), value.clone()));
+    for (name, value) in self.xattrs.of(path) {
+      base.xattrs.push((path.to_owned(), name, value.clone()));
     }
   }
 
-  /// Every dimension's entry at `path` at the earlier `version` but hard links, from the histories, added to `base`
-  /// ([`Green::base_for`]).
+  /// Every dimension's entry at `path` at the earlier `version` but hard links, from the histories by the module's one
+  /// history rule (A-534), added to `base` ([`Green::base_for`]).
   fn entries_at(&self, path: &str, version: u64, base: &mut crate::increment::Base) {
     if let Some(len) = self.content_len_at(path, version) {
       base.files.push((path.to_owned(), len as u64));
     }
-    if let Some(node) = self
-      .special_history
-      .get(path)
-      .and_then(|history| history_at(history, version))
-    {
+    if let Some(node) = self.special_at(path, version) {
       base.specials.push((path.to_owned(), node));
     }
-    if self
-      .dir_history
-      .get(path)
-      .is_some_and(|history| present_at(history, version))
-    {
+    if self.dir_at(path, version) {
       base.dirs.push(path.to_owned());
     }
-    if let Some(mode) = self
-      .mode_history
-      .get(path)
-      .and_then(|history| history_at(history, version))
-    {
+    if let Some(mode) = self.mode_at(path, version) {
       base.modes.push((path.to_owned(), mode));
     }
-    if let Some(target) = self
-      .symlink_history
-      .get(path)
-      .and_then(|history| history_at(history, version))
-    {
+    if let Some(target) = self.symlink_at(path, version) {
       base.symlinks.push((path.to_owned(), target));
     }
     let from = (path.to_owned(), String::new());
-    for ((attr_path, name), history) in self.xattr_history.range(from..) {
-      if attr_path != path {
-        break;
-      }
-      if let Some(value) = history_at(history, version) {
-        base.xattrs.push((attr_path.clone(), name.clone(), value));
+    let recorded = self
+      .xattr_history
+      .range(from..)
+      .take_while(|((attr_path, _), _)| attr_path == path)
+      .map(|((_, name), _)| name.clone());
+    let names: Vec<String> =
+      union_keys(self.xattrs.of(path).map(|(name, _)| name), recorded).collect();
+    for name in names {
+      if let Some(value) = self.xattr_at(path, &name, version) {
+        base.xattrs.push((path.to_owned(), name, value));
       }
     }
   }
@@ -1822,20 +1886,18 @@ impl Green {
   /// Every file at `version` with its bytes in path order: the head's files, or each path's value at an earlier
   /// version. What a work based at `version` lists (its untouched files are the green's there). Borrowed where a
   /// file is unchanged since `version`, copied out of the history where it changed after ([`Green::content_ref_at`]).
-  pub fn files_at(&self, version: u64) -> Vec<(&str, Cow<'_, [u8]>)> {
+  /// The paths are owned, as [`Green::files`]'s are.
+  pub fn files_at(&self, version: u64) -> Vec<(String, Cow<'_, [u8]>)> {
     if version >= self.head() {
       return self
         .files()
         .map(|(path, bytes)| (path, Cow::Borrowed(bytes)))
         .collect();
     }
-    self
-      .content_history
-      .keys()
+    union_keys(self.content.keys(), self.content_history.keys().cloned())
       .filter_map(|path| {
-        self
-          .content_ref_at(path, version)
-          .map(|bytes| (path.as_str(), bytes))
+        let bytes = self.content_ref_at(&path, version)?;
+        Some((path, bytes))
       })
       .collect()
   }
@@ -1843,17 +1905,17 @@ impl Green {
   /// A file's bytes at `version` ([`Green::content_at`] without the copy where it can): borrowed from the head when
   /// the file is unchanged since `version` (its value then is the current one), copied out of the history's chunks
   /// when it changed after (W2: the history holds what each version changed, not a whole copy of the file to lend).
+  /// A file with no history has held its current bytes since version 0 (the one history rule, A-534).
   pub fn content_ref_at(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
-    let history = self.content_history.get(path)?;
+    let Some(history) = self.content_history.get(path) else {
+      return self.content.get(path).map(Cow::Borrowed);
+    };
     let index = history
       .iter()
       .rposition(|(recorded, _)| *recorded <= version)?;
     let value = history.get(index)?.1.as_ref()?;
     if index.saturating_add(1) == history.len() {
-      return self
-        .content
-        .get(path)
-        .map(|bytes| Cow::Borrowed(bytes.as_slice()));
+      return self.content.get(path).map(Cow::Borrowed);
     }
     Some(Cow::Owned(value.materialize(&self.chunks)))
   }
@@ -1867,53 +1929,62 @@ impl Green {
     version: u64,
     (offset, want): (u64, u64),
   ) -> Option<(Vec<u8>, u64)> {
-    let history = self.content_history.get(path)?;
+    let page_of = |bytes: &[u8]| {
+      let total = bytes.len();
+      let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
+      let end = usize::try_from(offset.saturating_add(want))
+        .unwrap_or(usize::MAX)
+        .min(total);
+      (
+        bytes.get(start..end).unwrap_or_default().to_vec(),
+        u64::try_from(total).unwrap_or(u64::MAX),
+      )
+    };
+    let Some(history) = self.content_history.get(path) else {
+      // Unchanged since version 0 (the one history rule, A-534): the head's bytes.
+      return self.content.get(path).map(page_of);
+    };
     let index = history
       .iter()
       .rposition(|(recorded, _)| *recorded <= version)?;
     let value = history.get(index)?.1.as_ref()?;
+    if index.saturating_add(1) == history.len() {
+      return self.content.get(path).map(page_of);
+    }
     let total = value.len();
     let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
     let end = usize::try_from(offset.saturating_add(want))
       .unwrap_or(usize::MAX)
       .min(total);
-    let page = if index.saturating_add(1) == history.len() {
-      self
-        .content
-        .get(path)
-        .and_then(|bytes| bytes.get(start..end))
-        .unwrap_or_default()
-        .to_vec()
-    } else {
-      value.read(&self.chunks, start, end)
-    };
-    Some((page, u64::try_from(total).unwrap_or(u64::MAX)))
+    Some((
+      value.read(&self.chunks, start, end),
+      u64::try_from(total).unwrap_or(u64::MAX),
+    ))
   }
 
   /// Every file at `version` with its length, in path order: [`Green::files_at`] without the bytes.
-  pub fn file_lens_at(&self, version: u64) -> Vec<(&str, usize)> {
+  pub fn file_lens_at(&self, version: u64) -> Vec<(String, usize)> {
     if version >= self.head() {
       return self
         .files()
         .map(|(path, bytes)| (path, bytes.len()))
         .collect();
     }
-    self
-      .content_history
-      .keys()
+    union_keys(self.content.keys(), self.content_history.keys().cloned())
       .filter_map(|path| {
-        self
-          .content_len_at(path, version)
-          .map(|len| (path.as_str(), len))
+        let len = self.content_len_at(&path, version)?;
+        Some((path, len))
       })
       .collect()
   }
 
-  /// A file's length at `version`, or `None` when it was absent then: read off the history, never copied.
+  /// A file's length at `version`, or `None` when it was absent then: read off the history, never copied, or the
+  /// head's when the file has no history (the one history rule, A-534).
   pub fn content_len_at(&self, path: &str, version: u64) -> Option<usize> {
-    self
-      .content_history
-      .get(path)?
+    let Some(history) = self.content_history.get(path) else {
+      return self.content.get(path).map(<[u8]>::len);
+    };
+    history
       .iter()
       .rev()
       .find(|(recorded, _)| *recorded <= version)
@@ -1958,6 +2029,23 @@ impl Green {
       .push((version, value));
   }
 
+  /// Before `path`'s first recorded content change, records at version 0 the bytes it held since then, whole (the
+  /// module's one history rule, A-534), so the change's value shares its runs as every later one does. A path with a
+  /// history, or with no bytes, records nothing.
+  fn seed_content(&mut self, path: &str) {
+    if self.content_history.contains_key(path) {
+      return;
+    }
+    let Green {
+      content, chunks, ..
+    } = self;
+    let Some(bytes) = content.get(path) else {
+      return;
+    };
+    let value = crate::history::Value::whole(chunks, bytes);
+    self.push_content(path.to_owned(), 0, Some(value));
+  }
+
   /// The value `bytes` that `ops` make of `path`'s latest content (`crate::history::Value::spliced`), or `bytes`
   /// whole for a path with none.
   fn content_value(&mut self, path: &str, ops: &[Op], bytes: &[u8]) -> crate::history::Value {
@@ -1983,10 +2071,14 @@ impl Green {
   /// not the file. Until 2026-11-09 it materialized the base, applied the ops to a copy and compared the copy with the
   /// head, three passes over the file per verdict: the largest self time under the owner's `decide` (`memcmp`,
   /// `memmove`) at 3,000 clients over `kernel/`. A path absent at `base` is empty there, as before. The head's value is
-  /// the history's last, which every writer of the content pushes with it (`commit`, `restore_file`, the origin).
+  /// the history's last, which every writer of the content pushes with it (`commit`, `restore_file`). A path with no
+  /// history has held the head's bytes since version 0 (the one history rule, A-534), so its value at `base` is the
+  /// head's.
   fn lands_on_head(&self, path: &str, base: u64, ops_and_post: (&[Op], &[u8])) -> bool {
     let Some(history) = self.content_history.get(path) else {
-      return false;
+      let head = self.content.get(path).unwrap_or_default();
+      let (ops, post_state) = ops_and_post;
+      return apply(head, ops, post_state) == head;
     };
     let empty = crate::history::Value::default();
     let at_base = history
@@ -2171,19 +2263,20 @@ impl Green {
     r
   }
 
-  /// Whether any file, directory, symlink or hard link under `prefix` survives `cleared`.
+  /// Whether any file, directory, symlink or hard link under `prefix` survives `cleared`: each map's keys under the
+  /// prefix, one descent each (A-534; a scan of every key of every map before).
   fn has_live_child(&self, prefix: &str, cleared: &BTreeSet<String>) -> bool {
-    let live = |path: &String| path.starts_with(prefix) && !cleared.contains(path);
-    self.content.keys().any(live)
-      || self.dirs.iter().any(live)
-      || self.symlinks.keys().any(live)
-      || self.hardlinks.keys().any(live)
-      || self.specials.keys().any(live)
+    let live = |path: &String| !cleared.contains(path);
+    self.content.prefix(prefix).any(|(path, _)| live(&path))
+      || self.dirs.prefix(prefix).any(|(path, _)| live(&path))
+      || self.symlinks.prefix(prefix).any(|(path, _)| live(&path))
+      || self.hardlinks.prefix(prefix).any(|(path, _)| live(&path))
+      || self.specials.prefix(prefix).any(|(path, _)| live(&path))
   }
 
   /// Whether an intervening change occupied `path` with any non-file kind.
   fn occupied_by_nonfile(&self, path: &str) -> bool {
-    self.dirs.contains(path)
+    self.dirs.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
       || self.specials.contains_key(path)
@@ -2291,7 +2384,7 @@ impl Green {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     match self.content.get(path) {
-      Some(current) if current.as_slice() == bytes.as_slice() => Ok(None),
+      Some(current) if current == bytes.as_slice() => Ok(None),
       Some(_) => Err(Green::window(path, MergeConflictClass::CreateCreate)),
       None => {
         let ops = vec![insert_whole(bytes.len() as u64)];
@@ -2429,11 +2522,7 @@ impl Green {
         crate::map::Mapped::Overlaps => span.start,
       };
       let agent_bytes = span_bytes(&inc.post_state, op.src, op.len);
-      let current = self
-        .content
-        .get(path)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+      let current = self.content.get(path).unwrap_or_default();
       let start = usize::try_from(head_start).unwrap_or(usize::MAX);
       let end = start.saturating_add(agent_bytes.len());
       let identical = current.get(start..end) == Some(agent_bytes);
@@ -2454,8 +2543,7 @@ impl Green {
     if mapped.is_empty() {
       return Ok(None);
     }
-    let empty = Vec::new();
-    let current = self.content.get(path).unwrap_or(&empty);
+    let current = self.content.get(path).unwrap_or_default();
     let next = apply(current, &mapped, &inc.post_state);
     Ok(Some(Effect::SetContent(
       path.to_owned(),
@@ -2474,7 +2562,7 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
-    if self.dirs.contains(path) {
+    if self.dirs.contains_key(path) {
       return Ok(None);
     }
     Ok(Some(Effect::MakeDir(path.to_owned())))
@@ -2493,7 +2581,7 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
-    if !self.dirs.contains(path) {
+    if !self.dirs.contains_key(path) {
       return Ok(None);
     }
     let prefix = format!("{path}/");
@@ -2510,17 +2598,13 @@ impl Green {
     let current = self.specials.get(path).map(|node| node.kind);
     if current.is_none()
       && !self.content.contains_key(path)
-      && !self.dirs.contains(path)
+      && !self.dirs.contains_key(path)
       && !self.symlinks.contains_key(path)
       && !self.hardlinks.contains_key(path)
     {
       return false;
     }
-    let previous = self
-      .special_history
-      .get(path)
-      .and_then(|history| history_at(history, base))
-      .map(|node| node.kind);
+    let previous = self.special_at(path, base).map(|node| node.kind);
     previous != current
   }
 
@@ -2533,7 +2617,7 @@ impl Green {
     established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
     if !self.content.contains_key(path)
-      && !self.dirs.contains(path)
+      && !self.dirs.contains_key(path)
       && !self.specials.contains_key(path)
       && !established
     {
@@ -2561,7 +2645,7 @@ impl Green {
     // A file, directory or hard link already at this path is a different kind — a type conflict. An
     // existing symlink is not: that is the retarget case decided just below.
     if self.content.contains_key(path)
-      || self.dirs.contains(path)
+      || self.dirs.contains_key(path)
       || self.hardlinks.contains_key(path)
       || self.specials.contains_key(path)
     {
@@ -2586,7 +2670,7 @@ impl Green {
     // A file, directory or symlink already at this path is a different kind — a type conflict. An
     // existing hard link is not: that is the retarget case decided just below.
     if self.content.contains_key(path)
-      || self.dirs.contains(path)
+      || self.dirs.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.specials.contains_key(path)
     {
@@ -2611,7 +2695,7 @@ impl Green {
     established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
     if !self.content.contains_key(path)
-      && !self.dirs.contains(path)
+      && !self.dirs.contains_key(path)
       && !self.specials.contains_key(path)
       && !established
     {
@@ -2622,7 +2706,7 @@ impl Green {
     }
     let key = (path.to_owned(), name.to_owned());
     if self.xattr_changed.get(&key).copied().unwrap_or(0) > base {
-      if self.xattrs.get(&key).map(Vec::as_slice) == Some(value) {
+      if self.xattrs.get(path, name).map(Vec::as_slice) == Some(value) {
         return Ok(None);
       }
       return Err(Green::window(path, MergeConflictClass::MetaMeta));
@@ -2645,7 +2729,7 @@ impl Green {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     let key = (path.to_owned(), name.to_owned());
-    if !self.xattrs.contains_key(&key) {
+    if !self.xattrs.contains_key(path, name) {
       return Ok(None);
     }
     if self.xattr_changed.get(&key).copied().unwrap_or(0) > base {
@@ -2663,7 +2747,7 @@ impl Green {
     node: SpecialNode,
   ) -> Result<Option<Effect>, ConflictWindow> {
     if self.content.contains_key(path)
-      || self.dirs.contains(path)
+      || self.dirs.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
     {
@@ -2853,7 +2937,12 @@ impl Green {
 
   /// Keep the superseded IPC value for pinned readers before setting the new value.
   fn commit_special(&mut self, path: String, node: SpecialNode, version: u64) {
-    if self.specials.insert(path.clone(), node).is_some() {
+    seed(
+      &mut self.special_history,
+      &path,
+      held(self.specials.get(&path)),
+    );
+    if self.specials.insert(&path, node).is_some() {
       self.special_history_bytes = self
         .special_history_bytes
         .saturating_add(SPECIAL_NODE_BYTES);
@@ -2869,12 +2958,18 @@ impl Green {
   /// Remove the live inode and its metadata while retaining their historical values.
   fn remove_special(&mut self, path: String, version: u64) {
     // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
+    seed(
+      &mut self.special_history,
+      &path,
+      held(self.specials.get(&path)),
+    );
     if self.specials.remove(&path).is_some() {
       self.special_history_bytes = self
         .special_history_bytes
         .saturating_add(SPECIAL_NODE_BYTES);
     }
     self.special_changed.insert(path.clone(), version);
+    seed(&mut self.mode_history, &path, held(self.modes.get(&path)));
     if self.modes.remove(&path).is_some() {
       self.identity_dirty.insert(IdentityKey::Mode(path.clone()));
       self.mode_changed.insert(path.clone(), version);
@@ -2884,14 +2979,15 @@ impl Green {
         .or_default()
         .push((version, None));
     }
-    let attributes: Vec<_> = self
+    let attributes: Vec<(String, Vec<u8>)> = self
       .xattrs
-      .keys()
-      .filter(|(name, _)| name == &path)
-      .cloned()
+      .of(&path)
+      .map(|(name, value)| (name, value.clone()))
       .collect();
-    for key in attributes {
-      self.xattrs.remove(&key);
+    for (name, value) in attributes {
+      self.xattrs.remove(&path, &name);
+      let key = (path.clone(), name);
+      seed(&mut self.xattr_history, &key, Some(Some(value)));
       self
         .identity_dirty
         .insert(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
@@ -2925,8 +3021,12 @@ impl Green {
         Effect::RemoveSpecial(path) => self.remove_special(path, version),
         Effect::SetContent(path, bytes, ops, _) => set_content.push((path, bytes, ops)),
         Effect::RemoveContent(path) => removed_content.push(path),
+        // Each key's history first records what it held since version 0 when it has none yet (`seed`, the one
+        // history rule, A-534), then its change.
         Effect::MakeDir(path) => {
-          self.dirs.insert(path.clone());
+          let stood = self.dirs.contains_key(&path).then_some(true);
+          seed(&mut self.dir_history, &path, stood);
+          self.dirs.insert(&path, ());
           self
             .dir_history
             .entry(path)
@@ -2934,6 +3034,8 @@ impl Green {
             .push((version, true));
         }
         Effect::RemoveDir(path) => {
+          let stood = self.dirs.contains_key(&path).then_some(true);
+          seed(&mut self.dir_history, &path, stood);
           self.dirs.remove(&path);
           self
             .dir_history
@@ -2942,7 +3044,8 @@ impl Green {
             .push((version, false));
         }
         Effect::Mode(path, mode) => {
-          self.modes.insert(path.clone(), mode);
+          seed(&mut self.mode_history, &path, held(self.modes.get(&path)));
+          self.modes.insert(&path, mode);
           self.mode_changed.insert(path.clone(), version);
           self
             .mode_history
@@ -2951,7 +3054,12 @@ impl Green {
             .push((version, Some(mode)));
         }
         Effect::Symlink(path, target) => {
-          self.symlinks.insert(path.clone(), target.clone());
+          seed(
+            &mut self.symlink_history,
+            &path,
+            held(self.symlinks.get(&path)),
+          );
+          self.symlinks.insert(&path, target.clone());
           self.symlink_changed.insert(path.clone(), version);
           self
             .symlink_history
@@ -2960,6 +3068,11 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveSymlink(path) => {
+          seed(
+            &mut self.symlink_history,
+            &path,
+            held(self.symlinks.get(&path)),
+          );
           self.symlinks.remove(&path);
           self.symlink_changed.insert(path.clone(), version);
           self
@@ -2969,7 +3082,12 @@ impl Green {
             .push((version, None));
         }
         Effect::Hardlink(path, target) => {
-          let old = self.hardlinks.insert(path.clone(), target.clone());
+          seed(
+            &mut self.hardlink_history,
+            &path,
+            held(self.hardlinks.get(&path)),
+          );
+          let old = self.hardlinks.insert(&path, target.clone());
           relink(&mut self.links_to, &path, old.as_deref(), Some(&target));
           self.hardlink_changed.insert(path.clone(), version);
           self
@@ -2979,6 +3097,11 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveHardlink(path) => {
+          seed(
+            &mut self.hardlink_history,
+            &path,
+            held(self.hardlinks.get(&path)),
+          );
           let old = self.hardlinks.remove(&path);
           relink(&mut self.links_to, &path, old.as_deref(), None);
           self.hardlink_changed.insert(path.clone(), version);
@@ -2989,8 +3112,10 @@ impl Green {
             .push((version, None));
         }
         Effect::SetXattr(path, name, value) => {
+          let before = held(self.xattrs.get(&path, &name));
+          self.xattrs.insert(&path, &name, value.clone());
           let key = (path, name);
-          self.xattrs.insert(key.clone(), value.clone());
+          seed(&mut self.xattr_history, &key, before);
           self.xattr_changed.insert(key.clone(), version);
           self
             .xattr_history
@@ -2999,8 +3124,9 @@ impl Green {
             .push((version, Some(value)));
         }
         Effect::RemoveXattr(path, name) => {
+          let before = self.xattrs.remove(&path, &name).map(Some);
           let key = (path, name);
-          self.xattrs.remove(&key);
+          seed(&mut self.xattr_history, &key, before);
           self.xattr_changed.insert(key.clone(), version);
           self
             .xattr_history
@@ -3013,6 +3139,7 @@ impl Green {
     for path in removed_content {
       // A removed file's last value stays in the history for reconstruction: no longer a current value, so retained
       // and charged (`history_bytes`).
+      self.seed_content(&path);
       self.content.remove(&path);
       self.last_changed.insert(path.clone(), version);
       self.push_content(path, version, None);
@@ -3021,8 +3148,9 @@ impl Green {
       // The value this one supersedes stays in the history, sharing every run the new one kept (W2): what the
       // history gains is the bytes the new value added, its piece list, and whatever the old one held that the new
       // one does not, the retention charged to the running totals.
+      self.seed_content(&path);
       let value = self.content_value(&path, &ops, &bytes);
-      self.content.insert(path.clone(), bytes);
+      self.content.insert(&path, bytes);
       self.last_changed.insert(path.clone(), version);
       self.push_content(path.clone(), version, Some(value));
       delta.insert(path, ops);
@@ -3037,7 +3165,7 @@ impl Green {
   fn record_changes(&mut self, version: u64, mut changed: BTreeSet<String>) {
     let links: Vec<String> = changed
       .iter()
-      .filter(|path| self.special_history.contains_key(*path))
+      .filter(|path| self.was_special(path))
       .filter_map(|path| self.links_to.get(path))
       .flatten()
       .cloned()
@@ -3097,11 +3225,11 @@ impl Green {
   /// link naming a special is changed when the special last changed, if later. The cost of the restore's own keys.
   fn index_restored_changes(&mut self) {
     let mut last = self.last_changes_after_origin();
-    for (alias, target) in &self.hardlinks {
-      if self.special_history.contains_key(target)
+    for (alias, target) in self.hardlinks.iter() {
+      if self.was_special(target)
         && let Some(special) = last.get(target).copied()
       {
-        note_last(&mut last, alias, Some(special));
+        note_last(&mut last, &alias, Some(special));
       }
     }
     let mut by_version: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
@@ -3286,8 +3414,7 @@ impl Green {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
       Applied::RemoveSpecial(path) => Effect::RemoveSpecial(path.clone()),
       Applied::Spliced(path, ops) => {
-        let empty = Vec::new();
-        let current = self.content.get(path).unwrap_or(&empty);
+        let current = self.content.get(path).unwrap_or_default();
         Effect::SetContent(
           path.clone(),
           apply(current, ops, post_state),
@@ -3306,7 +3433,7 @@ impl Green {
         )
       }
       Applied::Copied { dst, from, ops } => {
-        let source = self.content.get(from).map(Vec::as_slice).unwrap_or(&[]);
+        let source = self.content.get(from).unwrap_or_default();
         let bytes = apply(source, ops, post_state);
         let whole = vec![insert_whole(bytes.len() as u64)];
         Effect::SetContent(
@@ -3418,7 +3545,7 @@ impl Green {
     }
     let links = paths
       .iter()
-      .filter(|path| self.special_history.contains_key(**path))
+      .filter(|path| self.was_special(path))
       .filter_map(|path| self.links_to.get(*path))
       .flatten()
       .map(String::as_str);
@@ -3488,7 +3615,7 @@ impl Green {
   /// less what the current value (bytes and list) grew by: the overwritten and the deleted or truncated bytes, and the
   /// old value's list (the bytes an insert or extension adds are current). Stored whole, the old value and its list.
   fn edit_reservation(&self, path: &str, ops: &[&Op]) -> usize {
-    let old = self.content.get(path).map_or(0, Vec::len);
+    let old = self.content.get(path).map_or(0, <[u8]>::len);
     let old_len = u64::try_from(old).unwrap_or(u64::MAX);
     let (overwritten, removed, inserted) =
       ops
@@ -3532,13 +3659,19 @@ impl Green {
   }
 
   /// What `path`'s latest content value counts among the current values: its bytes and its list (none for no value).
+  /// A path with no history has none yet; its first change records its bytes whole (`seed_content`, A-534), and that
+  /// is what it counts.
   fn latest_bytes(&self, path: &str) -> usize {
-    self
-      .content_history
-      .get(path)
-      .and_then(|history| history.last())
-      .and_then(|(_, value)| value.as_ref())
-      .map_or(0, current_bytes)
+    match self.content_history.get(path) {
+      Some(history) => history
+        .last()
+        .and_then(|(_, value)| value.as_ref())
+        .map_or(0, current_bytes),
+      None => self
+        .content
+        .get(path)
+        .map_or(0, |bytes| crate::history::Value::whole_cost(bytes.len())),
+    }
   }
 
   /// What the green charges as retention (AUD-16): the content and IPC histories' bytes and the
@@ -3558,7 +3691,7 @@ impl Green {
       content: self
         .content
         .values()
-        .map(Vec::len)
+        .map(<[u8]>::len)
         .sum::<usize>()
         .saturating_add(self.specials.len().saturating_mul(SPECIAL_NODE_BYTES)),
       history: self.history_bytes(),
@@ -3796,7 +3929,7 @@ impl Green {
     }
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
     // removal of a file the head does not hold, are no change.
-    changed.retain(|path, after| after.as_deref() != self.content.get(path).map(Vec::as_slice));
+    changed.retain(|path, after| after.as_deref() != self.content.get(path));
     Rebased::Rebased {
       version: to,
       changed,
@@ -3909,6 +4042,9 @@ fn special_payload(
   let end = start.checked_add(len).ok_or(DocDecodeError::Truncated)?;
   SpecialNode::decode(post.get(start..end).ok_or(DocDecodeError::Truncated)?)
 }
+
+mod branch;
+pub use branch::{Lineage, LineageGreen, LineageRefused};
 
 #[cfg(test)]
 mod node_exclusive_tests;
