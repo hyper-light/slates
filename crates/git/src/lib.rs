@@ -43,6 +43,7 @@
 mod admission;
 pub mod delta;
 pub mod entry;
+pub mod lfs;
 pub mod object_name;
 pub mod out;
 pub mod pack;

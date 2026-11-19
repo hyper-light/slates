@@ -4,11 +4,14 @@
 # PUTs, two verify callbacks), locks taken (two, then a conflict), listed (whole, by path, for verification; each list
 # of two paged by a cursor), released (by path, then by id with --force), a pointer whose object was never uploaded,
 # and a clone (batch downloads, two GETs, and a per-object 404). Every request and answer goes to `exchange.jsonl` in
-# OUTDIR, one JSON object a line, with the git and git-lfs versions beside it.
-# Deterministic but for the responder's port inside the URLs it hands out: no configuration but this script's (system
-# and global configuration cleared, HOME a scratch folder), a fixed identity, every date 2005-04-07T22:13:13Z, fixed
-# file contents. Usage: make-lfs-exchange.sh OUTDIR. Needs git, git-lfs (Homebrew's `git-lfs` on the Mac Studio) and
-# python3; writes only under OUTDIR and a scratch folder it removes.
+# OUTDIR, one JSON object a line, with the git and git-lfs versions and the client's words for the lock conflict beside
+# it. Deterministic but for two things: the responder's port inside the URLs it hands out, and the order of the
+# concurrent PUTs and verify callbacks of one push. No configuration but this script's (system and global configuration
+# cleared, HOME a scratch folder), a fixed identity, every date 2005-04-07T22:13:13Z, fixed file contents. Usage:
+# make-lfs-exchange.sh OUTDIR. Needs git, git-lfs (Homebrew's `git-lfs` on the Mac Studio) and python3; writes only
+# under OUTDIR and a scratch folder it removes. Run 2026-11-19 04:27Z on the Mac Studio with git-lfs 3.8.1 (Homebrew,
+# darwin arm64, go 1.27.3) and git 2.50.1: 24 exchanges; the clone's checkout failed on ghost.bin as intended, the
+# client having read the per-object error ("[404] Object does not exist").
 #
 # Sources: git-lfs v3.8.1 (tag 36e29152, commit a662a6dbf, 2026-10-22): docs/api/batch.md, basic-transfers.md,
 # locking.md; the client's request structs in tq/api.go and locking/api.go.
@@ -62,6 +65,7 @@ git add ghost.bin
 git commit -q -m ghost
 git push -q origin main 2>&1 | sed 's/^/push ghost: /'
 cd "$WORK"
-if git clone -q "$WORK/remote.git" clone > "$OUT/clone.txt" 2>&1; then echo "clone: smudged every file"; else echo "clone: exit $? (ghost.bin's object is missing, as intended)"; fi
+if git clone -q "$WORK/remote.git" clone > "$WORK/clone.txt" 2>&1; then echo "clone: smudged every file"; else echo "clone: exit $? (ghost.bin's object is missing, as intended)"; fi
+grep -o '\[404\] Object does not exist' "$WORK/clone.txt" | head -1 | sed 's/^/clone: the client read /' || true
 kill "$RESPONDER"; wait "$RESPONDER" 2>/dev/null || true; RESPONDER=""
 cp "$WORK/exchange.jsonl" "$OUT/exchange.jsonl"

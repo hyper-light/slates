@@ -1642,6 +1642,7 @@ dependencies = [
  "aws-lc-rs",
  "crc32fast",
  "proptest",
+ "serde_json",
  "sha1-checked",
  "slates-test-seeds",
 ]
