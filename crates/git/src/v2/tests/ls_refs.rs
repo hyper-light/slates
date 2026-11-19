@@ -114,6 +114,24 @@ fn an_unborn_head_and_attributes_in_either_order_are_written_back_as_they_came()
   );
 }
 
+/// A-624 (a reader takes an id in either case, as git's `get_oid_hex` does): do decode an answer line naming `main` in
+/// upper case, then encode the answer. Expect: the ref read with `main`'s id, written back in lower case.
+#[test]
+fn an_upper_case_id_in_an_answer_is_read_and_written_back_in_lower_case() {
+  let answer = |id: String| {
+    let text = format!("{id} refs/heads/main\n");
+    wire(&[Packet::Data(text.as_bytes()), Packet::Flush])
+  };
+  let upper = answer(MAIN.to_uppercase());
+  let refs = decode_answer(&upper, ObjectFormat::Sha1, &mut room()).unwrap();
+  let mut out = Vec::new();
+  encode_answer(&refs, ObjectFormat::Sha1, &mut out).unwrap();
+  assert_eq!(
+    (refs[0].value.target, out),
+    (Target::Id(sha1(MAIN)), answer(MAIN.to_owned()))
+  );
+}
+
 /// A-582 part 2: do decode answer lines out of the grammar, one fault each. Expect: each refused by its kind at the
 /// line: an attribute twice, an attribute git does not write, a line with no name, a name or target that is no ref
 /// name, an id in upper case, a delimiter, the bytes ending early or going on.
