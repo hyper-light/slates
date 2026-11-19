@@ -1639,6 +1639,7 @@ dependencies = [
  "slates-machine",
  "slates-rt",
  "slates-server",
+ "slates-transport",
 ]
 
 [[package]]
