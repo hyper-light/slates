@@ -978,13 +978,9 @@ mod tests {
       offered(s, (OfferKind::Stream, FIRST_ID), CLIENT, retired_end);
       offered(s, (OfferKind::Stream, SECOND_ID), OTHER_CLIENT, kept_end);
       let task = futures::spawn(async move {
-        let retired = crate::reap::remove_on_owners(
-          origin,
-          &[origin],
-          batch,
-          CLIENT,
-          |_| crate::daemon::LIVENESS_BUDGET_NS,
-        )
+        let retired = crate::reap::remove_on_owners(origin, &[origin], batch, CLIENT, |_| {
+          crate::daemon::LIVENESS_BUDGET_NS
+        })
         .await;
         let left = state::with_state(|s| {
           (
