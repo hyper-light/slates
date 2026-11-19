@@ -150,8 +150,8 @@ enum Stage {
 /// A push's update request, read as its bytes arrive.
 pub struct RequestReader<'a> {
   /// What the server advertised: the repository's format, and which capabilities a client may turn
-  /// on.
-  advertised: &'a Advertised<'a>,
+  /// on. A copy, so the reader borrows nothing of its caller but the advertisement's own bytes.
+  advertised: Advertised<'a>,
   /// What comes next.
   stage: Stage,
   /// The bytes read so far.
@@ -164,9 +164,9 @@ pub struct RequestReader<'a> {
 
 impl<'a> RequestReader<'a> {
   /// A reader of a request made to a server that advertised `advertised`.
-  pub fn new(advertised: &'a Advertised<'a>) -> Self {
+  pub fn new(advertised: &Advertised<'a>) -> Self {
     Self {
-      advertised,
+      advertised: *advertised,
       stage: Stage::Commands,
       at: 0,
       partial: Vec::new(),

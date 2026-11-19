@@ -25,7 +25,8 @@
 //! entries let go are never ones the next object would try, and a fragment encoded so is the one
 //! encoded with every earlier entry at hand. upload-pack's stream (`upload`) encodes the objects no
 //! fragment covers with it, a turn's object at a time, naming an earlier entry by its id where the
-//! client did not say `ofs-delta`.
+//! client did not say `ofs-delta`. A version's fragments and a base pack are encoded with it an
+//! object a unit too, under the owner's quantum (`encoding`, A-653 continued (2)).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -277,26 +278,9 @@ impl Encoder {
 /// A fragment's bytes and entries.
 pub(crate) type Encoded = (Vec<u8>, Vec<Placed>);
 
-/// Encodes `objects`, in the caller's order, as one fragment (module docs).
-pub(crate) fn encode(
-  objects: Vec<ToEncode>,
-  learning: &mut Learning<'_>,
-) -> Result<Encoded, FragmentRefused> {
-  let mut encoder = Encoder::new(true);
-  let mut bytes = Vec::new();
-  let mut placed: Vec<Placed> = Vec::with_capacity(objects.len());
-  for object in objects {
-    let at = PACK_HEADER_LEN.saturating_add(to_u64(bytes.len()));
-    let (entry, record) = encoder.put(object, at, learning)?;
-    bytes.extend_from_slice(&entry);
-    placed.push(in_fragment(record));
-  }
-  Ok((bytes, placed))
-}
-
 /// A record's offsets moved from its pack's count to its fragment's: its own, and an offset
 /// delta's base.
-fn in_fragment(mut record: Placed) -> Placed {
+pub(crate) fn in_fragment(mut record: Placed) -> Placed {
   record.offset = record.offset.saturating_sub(PACK_HEADER_LEN);
   if record.stored == Stored::Offset {
     record.base = record.base.map(|base| base.saturating_sub(PACK_HEADER_LEN));

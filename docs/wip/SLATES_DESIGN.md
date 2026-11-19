@@ -9537,6 +9537,12 @@ server, not inferred from command names.
 > instance's issuer. The write policy is owed; until it lands, grants are made as before, by the issuer's keyed hash.
 > Record: A-285, GAPS (2026-11-18).
 
+> **Status (2026-11-19, A-625 part 3: version-control credentials).** A human enrolls a principal's credentials for the
+> version-control servers' HTTP and SSH edges through the CLI's control verbs (`slates credential key|token|revoke`),
+> proven under the issuer secret as an enrollment is; a consumer's channel is refused `Forbidden`, and MCP and the SDKs
+> carry no proof. The one record keeps an SSH key by its fingerprint and an HTTP token by its hash alone, each with the
+> principal it proves and its expiry (§4.17.2's A-625 part 3 status).
+
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
 carried through §4.4's operation refusal taxonomy. A-9 adds these requirements without claiming
@@ -11486,7 +11492,8 @@ against what that copy brings there.
 > - Renaming the home moves the node, and its links name it at the new path.
 > - A later file at a path the node left is another node, which no link names.
 > - A link a work makes names a node: the one at the target at the work's base (a link's home while that link stood
->   unchanged since, a file while it was not removed since), or the one the work makes.
+>   unchanged since, a file or IPC node that stood there at the base and was not removed since), or the one the work
+>   makes. A node made at the target after the base is none the work saw (A-676).
 >
 > The engine holds a node at its home and keeps every link's target there. The moves are derived in the commit from the
 > head and the version's own effects (`Green::node_moves`), never recorded: a replay derives the same, and a rebase
@@ -11502,7 +11509,10 @@ against what that copy brings there.
 > restate_tests.rs`). Since A-670 a work never hands a node to a link it never saw: removing a file, or renaming
 > another over it, is refused when a link naming it was made after the work's base and none of the base's links to it
 > outlives the work (delete against modify, rename against rename), unless the work hands the node on itself; a
-> stack's upper alike for a link another version made under the stack.
+> stack's upper alike for a link another version made under the stack. Since A-676 a link to a file or IPC node made
+> at its target after the work's base, where none stood then, is refused delete against modify
+> (`Green::node_stood_at`): the verdict had judged such a target only by a removal since, so a forged link named a node
+> its work never saw.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -11526,7 +11536,11 @@ and answering every later reply that names the version. A green keeps its own lo
 append to it, and a push of several greens' versions is one entry appended to each green it moves only while each is
 at the position the push read, kept as one atomic record those positions point to (§4.17.1 shared piece 2; A-603,
 rebuilt by A-635 per A-642). A push is judged whole before anything is applied: `Green::judge` holds each work's verdict
-and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once.
+and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once. Since
+A-658 the verdict is `Green::compute`, a pure function of the versions a work is judged over and of the work: the owner
+judging is the owner computing at its own head, and any copy that holds those versions (a holder's replica, rebuilt from
+the chain's entries) computes the same `Computed`, which names the head it was computed against (part 2, the owner's
+commit of a result computed elsewhere by position, is owed).
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -12621,6 +12635,29 @@ engine: the verdict, rebase, position mapping, the register).
 > daemon starting an edge (address, identity, an authenticator over §4.13's keys, the lookup across partitions),
 > receive-pack's session (A-654), then the live `git clone`.
 >
+> **Status (2026-11-19, A-625 part 3: the credential record, and the daemon's edge).** One record of version-control
+> credentials in the metadata database serves both edges (§4.13; main's ruling): `slates-db`'s `credentials` table holds
+> an SSH user key by its blob under OpenSSH's fingerprint (the blob's SHA-256) and its key type, and an HTTP token by its
+> SHA-256 alone, each proving one §4.13 principal until its wall-clock expiry, on the partition its id routes to, each
+> record's bytes charged to the partition's table budget (`Capacity` at it). A human enrolls and revokes them through
+> the CLI's control verbs (`slates credential key LINE`, `slates credential token`, `slates credential revoke ID`),
+> proven under the issuer secret; a consumer's channel is refused `Forbidden` whatever it carries, and MCP and the SDKs
+> hold no proof. The issuer mints a token and sends the daemon its hash alone, so no token crosses a channel. A key is
+> enrolled only when SSH's user authentication would take it (A-633's parser). Both edges look a presented credential
+> up through `credentials::find`, one bounded call on the owner shard. The daemon starts the HTTP edge from
+> `DaemonConfig::vcs_http` (an address, and the node's identity the command hands in as DER, the one its RPC-with-TLS
+> export presents) beside the NFS transport, its listener on the control shard and every shard keeping its own seats.
+> git's site proves a token (Basic's password over TLS, or Bearer) by the record: held as a token, live, and a
+> consumer's not revoked; a bearer token's expiry goes with its principal, for LFS's actions. A proven request whose
+> repository another shard's partition holds moves its connection there whole (socket, engine with the head undecided,
+> waits), as the NFS export moves a mount's connection; there it is seated as a new connection is (at most as many
+> arrivals waiting as the shard has seats, closed and counted past that), decided again, and served with its partition
+> read locally. Every refusal is typed and counted by kind. Owed: upload-pack served once each repository's store lives
+> on its owner shard (A-662; `503` until then), receive-pack's session (A-654), LFS's routes on the site under main's
+> ruling (a route says whether its status is fixed at the head or decided after its body), the operator's flag for the
+> edge's address and the fleet identity's hand-in in the daemon role, a consumer's revocation in the SSH edge's key
+> holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live `git clone` (main's).
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -12869,6 +12906,12 @@ engine: the verdict, rebase, position mapping, the register).
 > through one pack source, A-640 part 3's `upload::Fragments`. Through it, stock git's clone of small.git and A-582's
 > five fetches are answered from the store's parts, every version encoded and a base pack made, each object once; and
 > `Streamed::counters` tells which of the store's paths wrote a pack (A-653 continued (1)).
+>
+> **Status (2026-11-19, A-653 continued (2): the fragments' encoding sliced).** A version's two fragments and a green's
+> base pack are encoded a unit at a time under the owner's quantum (`store::Encoding`, turned as upload-pack's stream
+> is): one pair of trees walked for the bases a reference delta may name, a window's worth of rows read into the
+> encoding's order, or one object encoded, a unit; both parts kept last. Between turns it holds no borrow, and over any
+> turns it writes the bytes one pass writes. Owed: one object, a pair of trees and a part's put each still one unit.
 >
 > **Status (2026-11-19, A-665: piece 10's part 1, the read-only bare repository a hook runs in, built).**
 > `crates/git` (`store::hook_view`) answers, from A-614's store, the refs a push read and the push itself, the tree a
@@ -44534,6 +44577,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
     increment since that position, so the hottest green's throughput is its owner's append rate, not its verdict rate.
+    (Part 1 built, A-658: `Green::compute` and `Green::rebase` read the green and change nothing, a `Computed` holds
+    nothing of the green that computed it and names the head it was computed against, and a copy lacking the versions
+    refuses typed. Owed: part 2, the owner's commit by position, judging again only the increment since; then the
+    fleet's route, a holder computing and the owner appending.)
   - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
     Native workflows keep few long-lived greens.
   - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
@@ -48640,6 +48687,254 @@ the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the se
   crates. No integration test reaches the adapter: nothing calls it outside its own tests until the daemon's import
   (owed). Main's (§8): the red run against a stub (`len` and `read` finding no file; all 11 must fail) and a mutation
   of each guard.
+
+### A-625 part 3 — the credential record both edges authenticate through, and the daemon starting the HTTP edge with each proven connection moved to its repository's shard (2026-11-19, g299 under main's rulings, UI goal 93 (kiln 51cef9f7); §4.13 "Principals"; §4.17.2 "Transports" item 1 and "Access"; after A-625 part 3's first slice, A-633)
+Applied in the same change to: §4.13 (a status); §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/db`
+(`credentials`, new; `catalog::CredentialRecord`, `CredentialKind`; `Op::CredentialEnrolled`, `CredentialRevoked`,
+appended; the partition's table and its snapshot field; `tests/wire_order`); `crates/ipc` (`CredentialMaterial`,
+`RequestBody::EnrollCredential`, `RevokeCredential`, `ReplyBody::CredentialEnrolled`, `CredentialRevoked`, appended;
+`tests/wire_order`); `crates/server` (`credentials`, new; `vcs_http::daemon_edge`, new; `vcs_http`'s move, per-shard
+seats and arrivals; git's site; `config::VcsHttpConfig`, `EdgeIdentity`; `daemon`'s start and `vcs_http_port`;
+`verbs`' routing and dispatch; its manifest depends on `slates-ssh`); `crates/client`, `crates/api` (`Issuer`'s
+credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`slates-ssh`'s entry) and lock.
+- **Main's rulings** (2026-11-19). The connection moves to its repository's owner shard once its head names it, as the
+  NFS export moves a mount's connection. Credentials are enrolled, never minted per start: a human enrolls them through
+  the CLI's control channel (§4.13), kept in the metadata database, tokens as their hash with an expiry and SSH keys by
+  fingerprint, one record both edges read (g294 kept none, so this is the one). HTTP takes Basic with the token as the
+  password, never in cleartext, or Bearer, and the authenticator hands a bearer token's expiry with its principal. The
+  edge's certificate and key come from where the RPC-with-TLS export's do, handed in by the operator.
+- **The record** (`slates_db::credentials`). Keyed by the SHA-256 of what a client presents, so a lookup is one map read
+  on the partition the id routes to (its first eight bytes over the partitions; D-14, no global index). Guard then
+  apply: an id held is `AlreadyExists`, a revocation of one not held `NotFound`; each record's bytes (the record, a
+  key's blob and type, a SID's text) are charged to the partition's table byte budget, the one the merge chains and the
+  review records draw from, refused `Capacity` naming the credentials table. Expiry is never decided in `apply`.
+- **Who enrolls** (`slates_server::credentials`). The verbs carry the launcher's proof, a keyed BLAKE3 under the issuer
+  secret over their own domain tags and exactly what they enroll or revoke; a consumer's channel is refused `Forbidden`
+  first (A-285). The issuer mints a token (32 bytes of the system's generator, `slates_` and hex) and sends its hash, so
+  no token crosses a channel. A key is taken only when A-633's parser takes it, so a human learns at enrollment, not at
+  a refused login, that a key cannot serve.
+- **The edge's start** (`vcs_http::daemon_edge::start`). Every shard keeps its own edge state (seats and room from its
+  own budget); the control shard binds and serves. A failed identity, a failed bind and cleartext off loopback leave
+  the daemon serving everything else, logged.
+- **The move** (`vcs_http`). A proven request whose repository another shard's partition holds answers `Move`: the
+  connection's socket handle, its engine with the head undecided, and its waits go as one spawn on that shard's control
+  channel, its seat here given back first. There it takes a seat as a new connection does (a free one, the most overdue
+  connection's, or a wait); at most as many arrivals wait as the shard has seats, and one past that is closed and
+  counted, as a refused NFS move closes its connection. Holding the old seat while waiting for the new one was rejected:
+  two shards each full of connections waiting to move to the other would deadlock. Authentication comes before the
+  move, so a client that proved no one never moves a connection.
+- **Tests.** macOS arm64 (Mac Studio, kiln r46, 2026-11-19, the tree merged over main 71a43cd97; `cargo test --locked`;
+  fmt clean on the six crates): `-p slates-db --lib credentials` 5 of 5 (a credential found by its id until revoked and
+  kept by a snapshot; its expiry; a held id's enrollment and an unheld id's revocation refused; the table byte budget;
+  the rules' model over every generated history); `-p slates-server --lib credentials` 9 of 9 (the id OpenSSH and FIPS
+  180-4 name; a key line read as `ssh-keygen` writes it; a credential found from any shard; a human enrolling and
+  revoking while an agent cannot; a token held as its hash and a key the edge cannot take refused; and four site and
+  LFS tests the filter meets) and `--lib vcs_http` 32 of 32 (among them the move to the repository's shard, a
+  credential that proves no one typed by why, and the daemon's edge moving a proven request and refusing the rest by
+  kind); `-p slates-http-edge --lib` 31 of 31; `-p slates-cli --bin slates credential` 1 of 1 (the grammar);
+  `--test wire_order` 2 of 2 in `slates-db` and in `slates-ipc` (the appended tags as published); `-p slates-ipc --lib
+  protocol` 5 of 5. The first build (r17) refused four type errors (the `Clock` trait unimported where the verbs read
+  the clock; two spawn-refusal arms giving the counter's `u64` as a statement's value), fixed in the same change.
+- **Owed.** As the status says.
+
+### A-658 part 1 — The verdict and the rebase computed anywhere: pure functions of the versions a work is judged over (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); A-645 "Merges computed anywhere, committed by position"; §4.16 "The verdict", "Commit" and "Rebase"; after A-635 and A-642)
+
+- **What was there.** A-635 split the owner's verdict into `Green::judge`, which held a verdict at the head, and
+  `Green::commit_judged`, which committed it as the version after that head or refused `HeadMoved`. Both took the green
+  mutably: the verdict added to a statistics counter in place (`fast_path_hits`) and kept a conflict in the owner's
+  rejected-result cache, and `Green::rebase` saved and restored the counter. Only the green's owner could judge, so a
+  hot green's merges were bounded by its owner's verdict rate.
+- **The decision.** The verdict is a pure function of the versions a work is judged over (its base, the head and the
+  deltas between them, none of which changes once committed) and of the work.
+  - `Green::compute(&self, inc) -> Result<Computed, ComputeRefused>` reads the green and changes nothing. The fast-path
+    counter is a `Cell`, as `deltas_visited` already was, so only the cost counters move.
+  - A `Computed` holds nothing of the green that computed it: the increment's identity and base, the head it was
+    computed against (the position the owner checks before it appends, A-635's rule), and the verdict: accepted before
+    as a version, accepted with its effects and what the chain records of them, or the conflict windows. Since main's
+    71f05f93d (a verdict makes no file until it accepts) a mapped file is held as the ops that make it, never its bytes:
+    the owner's hold takes the increment's post-state into the `Judged` (`Green::held`), and the commit makes the file
+    over the head it was judged at (`Green::make_mapped`).
+  - Any copy that holds the versions computes the same result: the owner, or a holder's replica rebuilt from the
+    chain's entries alone (`Green::apply_recorded`).
+  - Refused, typed, and neither refusal a verdict, so the caller computes on a green that holds the versions:
+    `ComputeRefused::BaseUnavailable` (the base is below the version the copy was restored at, its deltas folded away)
+    and `ComputeRefused::BaseAhead` (the base is past the copy's head, a version it has not reached).
+  - The owner's `judge` is the owner computing at its own head, its rejected-result cache around the computation, so
+    `submit`, the server's submit and A-635's push run one verdict, unchanged.
+  - `Green::rebase(&self)` is pure too, and answers `Rebased::BaseAhead` for a base past the head.
+- **A sibling found and fixed.** A work based past the owner's head was judged as if it were based at the head (each
+  op mapped through no delta) and could commit, and its rebase came back based at the head, a version older than its
+  own base. Both are refused now: the owner answers the base unknown (`Outcome::BaseUnavailable` and
+  `Judgment::BaseUnavailable`, the service's `UnknownBase`), and the rebase `Rebased::BaseAhead` (`UnknownBase` at the
+  server's `map_rebase`). The server never sent such a work, since a work's base is a version its green made, so no
+  answer on the wire changes. One test did: `symlink_merges` (`crates/merge/tests/engine.rs`) based its last work at
+  version 4 over a head of 3, meaning the version that holds the file (its third increment conflicted and made no
+  version), and passed only because the past-head base was judged at the head; it now names 3 and asserts the version
+  the file was accepted at.
+- **Tests** (`crates/merge/src/engine/compute_tests.rs`). Red and the first green ran on Windows x86_64, jupiter (kiln,
+  2026-11-19, debug, a fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`) while the Mac
+  Studio was offline; the landing runs are macOS arm64, the Mac Studio (kiln r89 and r113, 2026-11-19, debug, the same
+  discipline with `CARGO_BUILD_JOBS=2`), over the tree merged with main 1b480bd70 (b77c7802d) and then with af520142f
+  (3b5fc4874), which changed the server's push beside the verdict.
+  - The oracle: generated histories of works (files written whole, overwritten, inserted into, removed and renamed;
+    modes, attributes and the root's head set; a directory made or removed; a hard link made), based at the head or up
+    to three versions behind, some sent again. Before every verdict a copy rebuilt from the owner's chain entries alone
+    computes the owner's judgment (the head, what the chain records, the windows, a version accepted before) and the
+    owner's rebase; computing leaves the copy as it was; after every commit both read the same state. Its census
+    requires accepts, works sent again, conflicts, works behind the head and rebases of them.
+  - Beside it: computing applies nothing and keeps no conflict, the same result twice; the owner keeps in its cache the
+    conflict it answers; a copy behind the work's base refuses `BaseAhead`, and its rebase answers so; a green restored
+    past the base refuses `BaseUnavailable`; the owner answers a base past its head unknown, and its rebase `BaseAhead`.
+  - Red first at 508eabb64, with `Green::compute` a stub that refused everything and the old judge and rebase:
+    `cargo test --locked -p slates-merge --lib compute_tests` failed 6 of 6, each for its own reason.
+  - Green on the tree merged with main (0ef8e9741): `cargo test --locked -p slates-merge --lib` 147 of 147 in 78 s
+    (main's Windows baseline at 018d32ba2: 141 of 141); rustfmt's layout applied from jupiter's `cargo fmt`. The whole
+    server lib on Windows at 0af63658a (`cargo test --locked -p slates-server --lib -- --test-threads=4`; at 32 threads
+    the daemon's watchdog ended the binary) ended 595 passed, 14 failed, 3 ignored: five among main's Windows failures
+    at 6e42e7a2c, nine handed to main (none of the fourteen reaches the verdict or the rebase by the code; not
+    measured).
+  - The landing runs, each alike: `cargo fmt -p slates-merge -p slates-server -- --check` clean; `cargo test --locked -p
+    slates-merge --lib` 191 of 191; the merge crate's integration targets whose works reach the verdict
+    (`--no-fail-fast --test rebase --test engine --test checkpoint --test special --test base_for --test chain_replay
+    --test changed_since_cost --test identity --test origin --test splice --test shuttle_green`) 104 passed and 1
+    ignored (`shuttle_green` holds no test without `--cfg shuttle`; at r113 the rebase oracle failed once, main's
+    failure below); the server's lib tests that reach the verdict
+    (`repository::push::`, `repository::hg_push::`, `merge_origin::`, `merge_service::`) 42 of 42 at four threads; and
+    the server's integration tests that drive a rebase over the wire, by name (`daemon`'s lifecycle test, two of
+    `merge_load`, two of `verdict_pages`, five of `works_off_owner`, three of `green_post_state`), 13 of 13. No server
+    lib test reaches `map_rebase`; those integration tests do.
+  - The macOS runs (kiln r23, r55 and r113) found `symlink_merges` (above) and two failures that are main's, each
+    measured on main's own tree in its own target directory: `hard_link_merges` (fixed on main by 8d7209388), and the
+    rebase oracle's (`crates/merge/tests/rebase.rs`) generated cases in which a work removes the home of a file a hard
+    link names (r55: the link made at version 1, the work at the head; r113: both in the origin, the work at version
+    0): the rebase restates the removal alone (`changed` holds `a` removed, the journal one `Unlink`) where the submit
+    leaves the link holding the node (`b`, empty), on main at 787f5948b as here (r55's case run on both trees, r89);
+    handed to main.
+- **Owed.** Part 2, the owner's commit by position (`Green::judge_computed`): the owner's caches and floor, the
+  position check, and when the green moved, judging again only what the change index names in the versions since the
+  position, held equal to the serial verdict by an oracle over generated concurrent histories. Then the fleet's route:
+  a green's holders already rebuild its versions (§4.16 "Apply on holders"), so a holder computes and the owner
+  appends; replicas kept on the shards for the purpose were measured and rejected (A-528).
+- **Applied in the same change to:** `crates/merge/src/engine.rs` (`Computed`, `ComputeRefused`, `Green::compute`,
+  `Green::judge` on it, `Rebased::BaseAhead`, the counter a `Cell`, the module docs), `crates/merge/src/lib.rs`,
+  `crates/merge/src/engine/compute_tests.rs` (new), `crates/merge/tests/rebase.rs` (a binding no longer mutable),
+  `crates/merge/tests/engine.rs` (`symlink_merges`' last base), `crates/server/src/verbs.rs` (`map_rebase`:
+  `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry; GAPS' A-645 entry.
+
+### A-653, continued (2) — A version's fragments and a base pack encoded a unit at a time under the owner's quantum (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 4; CLAUDE.md §3 "Bounded work everywhere"; A-614 part 2, A-639)
+
+Applied in the same change to: §4.17.2 (a status block), GAPS (the A-653 entry), `crates/git` (`store::encoding`,
+new: `Encoding`, `EncodingCounters`; `store::repository`: `encode_fragments` and `rebuild_base` one-call drivers over
+it, the walk, the reading of every object first and the batch order moved into it, its accessors; `store::fragment`:
+the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` shared; the store's module docs;
+`tests::store::encoding`, new).
+
+- **What was unbounded.** `encode_fragments` and `rebuild_base` each encoded in one call: every object's bytes read
+  first, sorted, then every delta trial and deflate, then both parts kept. A version brings any number of objects and
+  a base pack holds every object its head reaches, so one call's work had no bound but the repository's size, where
+  CLAUDE.md §3 chunks every loop over user-scaled data under the shard's budget.
+- **The encoding in turns.** `Encoding::fragments` or `Encoding::base`, then `advance` a turn at a time: units until
+  the owner's quantum (§4.3) is spent, at least one, as `Upload::advance` does. A unit is one pair of trees walked for
+  the bases a reference delta may name; a window's worth of handles of rows read into the order (by type, the largest
+  first, then by id: a row gives the type and the length, so no object's bytes are read before it is encoded); one
+  object encoded through the part's encoder; or, last, both parts kept and recorded. Between turns the encoding holds
+  no borrow: objects by id and position, the order as two sets, the walk's pending pairs and bases, the part's bytes so
+  far and the encoder's recent entries. Each unit learns into the repository's own window and levels. A version whose
+  fragments were kept meanwhile keeps those; a base pack is made from the head version and reach the making began
+  with; a refusal is every later turn's. `encode_fragments` and `rebuild_base` drive an encoding to its end in one
+  turn, the one-call form for tests and tools: there is no second encoder.
+- **Tests**, failing first against `Encoding`'s first state, today's encoding whole in its first unit:
+  `a_versions_fragments_are_encoded_an_object_a_unit_as_one_pass_encodes_them` (green 1 at two versions of 300 files,
+  the second changing 150 at their paths: its fragments encoded a turn at a time with a quantum of nothing, each turn
+  one unit, none encoding more than one object, walking more than one pair of trees or reading more than a window's
+  worth of rows, the rows read over more than one unit, and both fragments those of a twin encoded in one pass, byte
+  for byte) and `a_base_pack_is_made_an_object_a_unit_as_one_pass_makes_it` (the same for the base pack of every
+  object the head reaches). The store's other tests (A-614 part 2's fragments and base packs read back through A-608's
+  reader, A-639's and A-653's oracles over them) now run through the encoding.
+- **Runs.** On macOS arm64 (the Mac Studio, 2026-11-19, rustc 1.98.1), `cargo test --locked -p slates-git --lib --
+  store:: upload::`: with the first state, 120 passed, 2 failed (the two tests above, each at its first turn's
+  one-object check), 4 ignored; with the encoding, 122 passed, 0 failed, 4 ignored; over the tree landed, merged with
+  main's A-662 and A-671 (slates-git's store and slates-vcs), 123 passed, 0 failed, 4 ignored, 375 filtered out;
+  `cargo fmt -p slates-git -- --check` clean. No integration target reaches the store's encoding.
+- **Owed.** Within an encoding, one object's unit is bounded by that object and the learned window rather than by a
+  window of bytes (with A-639's owed delta search past a window), a pair of trees is read whole, and the last unit puts
+  each part whole into the content store, which has no put by pieces; the owner driving encodings by turns once it
+  holds a git repository (A-625 part 3); a turn's span measured on the owner (main's); the red-checks and the other
+  platforms' runs (main's).
+
+### A-654 part 1 — receive-pack's session owns its parts, and its verdicts are read only beside the appends (2026-11-19, g258, UI goal 93; §4.17.1 "A push is a work" items 1 to 5; §4.17.2 "A push" items 6 and 7; A-620, A-642, A-645, A-662)
+
+- **What was there.** A-620's `Session` borrowed its advertisement and its hidden refs for its life, and `Works` held
+  the greens shared and the appends exclusive at once; a create's work was built over an empty green. Neither fits
+  the server: a connection's task keeps its session between the bytes its edge hands it, and on the owner shard the
+  greens, the appends and the push's object view are one `ShardState`, which A-662's `push_sealed` changes.
+- **The decision.** (1) A create is made at the version of the green its new value's first parent heads, where one
+  can still be branched from, else at the default branch's head, its work the whole difference against that
+  version's tree; over an empty green only while the default branch is unborn (main's ruling of 2026-11-19).
+  (2) A green is lent to the judge for one call, by closure (`Greens::read`, `Greens::base_of_create`), as the server
+  lends one member of a lineage at a time (A-575). (3) `Session` keeps a copy of its advertisement (`Advertised` is
+  `Copy`) and owns its hidden refs, so a caller keeps it across its own steps; `HiddenRefs for &T` keeps callers that
+  hold the predicate themselves. (4) `Verdicts` judges a command and appends nothing; `Works` pairs it with an
+  `Appends`; a server whose greens and appends are one state judges through `Verdicts` between its own appends and
+  answers in git's words through `append_declined` and `atomic_declined`. (5) `Unappended::Refused { at, why }`: an
+  append's own refusal (the shard's budget, the register's capacity, an approval the branch requires) under git's
+  `failed to update ref`, slates' reason on band 2.
+- **Tests** (`crates/git/src/receive/tests/`): a create made at its first parent's version and an orphan create
+  stating the whole difference from the default head (`works.rs`); a session made from parts that go out of scope at
+  once, kept in a caller's struct and fed the create push in pieces, answering byte for byte as a borrowing one
+  (`session.rs`); an entry the append refused for its own reason answered in git's words with slates' on band 2,
+  alone and atomic (`works.rs`).
+- **Evidence.** macOS arm64, Mac Studio (kiln, debug, 2026-11-19), on the merged tree 6f2d690eb: `cargo test --locked
+  -p slates-git --lib receive::` 42 of 42, the five A-654 tests among them; `--lib protected_fixtures` 5 of 5 and
+  `--lib store::views` 7 of 7 (the other users of the reader and the judge); `cargo fmt --all -- --check` clean; no
+  warning in `receive`. The first run (r131) failed the annotated tag's test alone, written for A-620's create over an
+  empty green: under (1) a tag of a root commit is made at the default head and its work is the head alone, so the
+  test now submits it to a green holding that version. slates-git has no integration target, and nothing outside it
+  calls the session or the judge until part 2. Main's: clippy, `xtask check`, the doc gates and the other platforms.
+- **Owed (part 2): the server's driver** (`crates/server/src/git_push.rs`, one entry point for the HTTP edge, g299,
+  and the SSH edge, g294): `start` writes the advertisement of the branches whose greens hold a git head, a ref the
+  pusher may not read under A-622's policy hidden; `input` and `end` feed the session over A-638's `IndexedObjects`
+  lent the shard's room (A-662's `lent_to_read`); `answer` admits the checked objects to A-662's `GitPush` and seals
+  it, asks A-622's `admit` (Submit, Rewrite for a move A-614's admission finds no fast-forward, Delete), refuses
+  typed while a git hook is configured and its view is owed (A-665 part 2), and decides through a server judge:
+  `Verdicts` over the shard's greens, whose `version_of` answers only a green's current head until A-664's
+  server-made commits allow a push based on an older version, then `push_sealed` for each entry, or once for all
+  under `atomic`; the report written to the caller's bytes.
+- **Applied in the same change to:** `crates/git/src/receive/works.rs` (`Verdicts`, `Works`, `Greens`,
+  `Entry::Create::from`, `Unappended::Refused`, `append_declined`, `atomic_declined`, module docs),
+  `receive/session.rs`, `receive/request.rs` (`RequestReader` keeps a copy), `receive/mod.rs` (`HiddenRefs for &T`),
+  and their tests; GAPS (the §4.17 entry).
+
+### A-676 — A link to a node made at its target after the work's base is refused (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.16 "The verdict", A-646's decision; found by g307's reading)
+
+- **What was wrong.** A hard link a work makes names the node at its target at the work's base (A-646). For a file or
+  IPC node standing at the target now, `Green::node_home` asked only whether one was removed there after the base
+  (`file_removed_since`), so a node made there after the base, where nothing stood at it, answered as the link's node:
+  the link was accepted naming a node its work never saw, though `node_home`'s own doc and A-646's rule make it delete
+  against modify. No deriver makes such a link (`link(2)` answers `ENOENT` at the base, and a target the work makes is
+  its own, `made`), so only a forged or hand-built increment reached it. g307 found it by reading, fixing
+  `hard_link_merges` (8d7209388).
+- **The change.** `Green::node_stood_at(path, base)`: whether a file or an IPC node stood at the path at the base, read
+  off the histories by the one history rule and the copies (`content_len_at`, `special_at`), never by copying the file;
+  `node_home` refuses a node at the target that stood nowhere at the base, as it refuses one removed since. Exact at and
+  above the fold floor, as `special_kind_changed`'s read of the base is; the service folds only below the oldest base a
+  live reader names. A copy replacing the target after the base needs nothing new: `remove_file_now` records it in
+  `file_removed`.
+- **Tests** (macOS arm64, Mac Studio, kiln, debug, 2026-11-19). `a_link_to_a_node_made_after_its_base_conflicts`
+  (`crates/merge/src/engine/node_tests.rs`): a file, and a FIFO (`Work::fifo`), made at `made` after version 0, each
+  linked by a work based at 0; each must be refused `DeleteModify` with no link made, and the test names every kind it
+  misjudges. Red (20:05 UTC) with `engine.rs` put back to its state before the fix (main effb30ac2) in a scratch clone:
+  `cargo test --locked -p slates-merge --lib -- engine::node_tests::a_link_to_a_node_made_after_its_base_conflicts`
+  failed, both links accepted (`a file: Accepted { version: 2 }; a FIFO: Accepted { version: 2 }`). Green over main
+  effb30ac2: `cargo test --locked -p slates-merge --lib -- engine::node_tests engine::replaced_node_tests
+  engine::restate_tests engine::stack` 62 of 62. Over main 545181b30 (A-658 part 1, the verdict computed anywhere;
+  20:11 UTC): the same with `engine::compute_tests` 68 of 68; `cargo test --locked -p slates-merge --test engine --
+  hardlink hard_link` 6 of 6; `cargo fmt -p slates-merge -- --check` clean. Main's commits since, to 5c0967fb2, touch
+  nothing slates-merge builds from. Main's (§8): the other platforms, clippy and the whole suites.
+- **Applied in the same change to:** §4.16 A-646's decision (the link rule's bullet, and its status); GAPS (A-676's
+  entry after A-643's siblings); `crates/merge/src/engine.rs` (`node_home`, `node_stood_at`),
+  `crates/merge/src/engine/node_tests.rs`, `crates/merge/src/engine/replaced_node_tests.rs` (`Work::fifo`, `fifo_node`);
+  `docs/bugs/2026-11-19-a-link-to-a-node-made-after-its-base-was-accepted.md` (new).
 
 ### A-675 — The daemon imports a Mercurial repository's directory into the repository's store, a turn at a time on its owner shard (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.3; A-649 parts 3b and 4; A-662)
 Applied in the same change to: §4.17.3 (its status, piece 3), `crates/server` (`vcs_store::hg_import` and its tests,

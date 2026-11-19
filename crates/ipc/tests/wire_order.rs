@@ -26,14 +26,14 @@ mod order;
 
 use slates_ipc::protocol::{
   ArchiveFault, AttachRequest, AttachTransport, AuditKind, BaseReport, CauseRecord, ConflictClass,
-  Conformance, DatabaseRefusal, DeleteWhileOpen, DriftKind, EditBytes, EntryKind, Established,
-  GrantScope, GrantState, HookPointName, HostAnswer, HostPathReason, Intent, IpcNodeKind,
-  KernelCache, LandingDegradation, LandingStage, MoveRefusal, NamePolicy, ObjectFormat,
-  OwnMountUse, PlannedAction, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicySubject,
-  PolicyWho, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal, ReplyBody, RequestBody,
-  Residency, Scope, SignatureFault, SignerKey, SizeClass, SnapshotBoundary, TargetPathConstraint,
-  TargetRefusal, UnsupportedReason, VcsTool, Verification, VolumeRefusal, WatcherState, WorkOp,
-  WriteAct, WriteMode,
+  Conformance, CredentialMaterial, DatabaseRefusal, DeleteWhileOpen, DriftKind, EditBytes,
+  EntryKind, Established, GrantScope, GrantState, HookPointName, HostAnswer, HostPathReason,
+  Intent, IpcNodeKind, KernelCache, LandingDegradation, LandingStage, MoveRefusal, NamePolicy,
+  ObjectFormat, OwnMountUse, PlannedAction, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight,
+  PolicySubject, PolicyWho, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal, ReplyBody,
+  RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass, SnapshotBoundary,
+  TargetPathConstraint, TargetRefusal, UnsupportedReason, VcsTool, Verification, VolumeRefusal,
+  WatcherState, WorkOp, WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 
@@ -52,6 +52,7 @@ fn schemas() -> Vec<&'static str> {
     <ConflictClass as Wire>::SCHEMA,
     <DatabaseRefusal as Wire>::SCHEMA,
     <Conformance as Wire>::SCHEMA,
+    <CredentialMaterial as Wire>::SCHEMA,
     <DeleteWhileOpen as Wire>::SCHEMA,
     <DriftKind as Wire>::SCHEMA,
     <EditBytes as Wire>::SCHEMA,
