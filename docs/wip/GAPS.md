@@ -447,6 +447,20 @@
 > red ten ways by mutation. Owed: the store's own bundle
 > list and URI packs (each a run of A-614 part 2's fragments, its hash and URI) and the fetch path that asks for them
 > (piece 7); `object-info`'s `type`, which git's master adds, when a release ships it.
+>
+> **A-644 part 1 (2026-11-19, g230; piece 11, protected branches: the store's answers and git's words):** `slates-git`
+> (`store::protect`) answers, against each ref's own green alone (A-642), how a move changes it (create, fast-forward,
+> rewrite, delete; the fast-forward decided with no walk where generation numbers decide it, counted) and which commits
+> it brings (D(k)'s; a create's whole history): the first merge commit, and the first commit no trusted key signed, its
+> signature split from its payload as commit.c splits them and told by its armour, SSH through a `CommitSigners`
+> verifier, OpenPGP and X.509 refused typed. `receive::protected` answers in git's words (`non-fast-forward`, `deletion
+> prohibited`, and `hook declined` after a hook's words in git's 128-byte pieces). A-590's payload left in a header
+> named `gpgsig…` that git leaves out; fixed here, red first. Golden vectors (`fixtures/protected`): twelve pushes stock
+> git 2.50.1 made to a stock server protecting `main`, and the signatures and payloads git's verifier read. Owed (part
+> 2): the policy's requirement rules and its trust list of commit signers (A-622's record), `admit`'s typed refusals
+> mapped to these words, and A-321's verifier under git's namespace; then receive-pack's part 2 asking them (A-620).
+> The walks are not yet sliced under the shard's budget (the store's owed item): a create of a protected name walks,
+> and verifies, its whole history at once.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its
@@ -715,8 +729,10 @@
 > alone on main from its seed (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
 > deltifier, `text_delta.c` and `xdelta.c`, ported); the wiring (a `CreateRepository` repository's records on its
 > shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
-> shard's budget); main's: clippy and `xtask` over the module. Found by it, for A-553's owner: the index refuses a
-> replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion comes first. Designed
+> shard's budget); main's: clippy and `xtask` over the module. Found by it and fixed by A-652 (2026-11-19, g264): the
+> index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
+> comes first; it takes it now as the copy FSFS makes, the index's and the verdict's oracles holding such replacements
+> (`cargo test -p slates-svn --lib --locked` 367 of 367 on the Mac Studio, red first 5 of 367). Designed
 > from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the head,
 > FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision

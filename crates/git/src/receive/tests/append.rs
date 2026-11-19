@@ -58,6 +58,7 @@ impl Judge for Logs {
     if self.declining.contains(&command.name) {
       return Err(Declined {
         reason: b"hook declined".to_vec(),
+        hook: Vec::new(),
         message: None,
       });
     }
@@ -69,6 +70,7 @@ impl Judge for Logs {
     if self.position(&command.name) != read {
       return Err(Declined {
         reason: FAILED_TO_UPDATE.to_vec(),
+        hook: Vec::new(),
         message: Some(moved_line(&command.name)),
       });
     }
@@ -90,6 +92,7 @@ impl Judge for Logs {
     if let Some((command, _)) = moved {
       return Err(Declined {
         reason: ATOMIC_TRANSACTION_FAILED.to_vec(),
+        hook: Vec::new(),
         message: Some(moved_line(&command.name)),
       });
     }
@@ -136,6 +139,7 @@ fn three_creates(atomic: bool, logs: &mut Logs) -> Vec<Outcome> {
 fn refused(reason: &[u8], line: Option<Vec<u8>>) -> Outcome {
   Outcome::Ng(Declined {
     reason: reason.to_vec(),
+    hook: Vec::new(),
     message: line,
   })
 }
