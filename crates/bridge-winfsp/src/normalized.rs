@@ -155,7 +155,8 @@ pub fn node_name(names: &OpenNames, asked: &str, stored: Option<&str>) -> NodeNa
 
 /// `name` as the driver names a node it is given no normalized name for: each unit upcased (`create.c` 1041-1043,
 /// `RtlUpcaseUnicodeString`). A table that mapped a surrogate unit would leave units no string holds; Windows' maps
-/// none (from memory, to be checked against a live drive), and the asked name is kept if one ever did.
+/// none (Microsoft's recommended exFAT table, `slates_vfs::upcase`, which the Windows host's
+/// `the_volumes_upcase_table_is_the_systems` holds to the system's), and the asked name is kept if one ever did.
 fn upcased(name: &str, upcase: fn(u16) -> u16) -> String {
   let units: Vec<u16> = name.encode_utf16().map(upcase).collect();
   String::from_utf16(&units).unwrap_or_else(|_| name.to_owned())
@@ -227,23 +228,12 @@ impl Spelling<'_> {
 mod tests {
   use super::*;
 
-  /// A model of Windows' upcase table for the tests: ASCII's `a` to `z`; `é` to `É`, which the table maps as Unicode
-  /// does; final sigma `ς` and `σ` both to `Σ`, which the table maps alike where Unicode lowercasing keeps them apart
-  /// (the table as ntfs-3g transcribes it, `uc_run_table` `{0x03C2, 0x03C3, -31}`, from memory); and everything else to
-  /// itself, the Kelvin sign and a combining acute among it.
-  fn model_upcase(unit: u16) -> u16 {
-    match unit {
-      0x61..=0x7A => unit - 0x20,
-      0xE9 => 0xC9,
-      0x3C2 | 0x3C3 => 0x3A3,
-      _ => unit,
-    }
-  }
-
   /// A folding volume's drive holding the names `held` open, each by its own handle and inode.
   fn folding(held: &[&str]) -> OpenNames {
+    // Windows' upcase table as the volume core keeps it (A-576), which the Windows host's `system_upcase` is checked
+    // against: `é` to `É`, final and medial sigma to `Σ`, the Kelvin sign and a combining acute as they are.
     let mut names = OpenNames::searching(NameSearch::CaseInsensitive {
-      upcase: model_upcase,
+      upcase: slates_vfs::upcase::upcase,
     });
     for (handle, path) in (1u64..).zip(held) {
       names.opened(handle, handle, path);
