@@ -107,8 +107,7 @@ impl Bounds {
 
 /// Whether a cleartext edge may serve on `address`: on loopback alone (the module doc).
 fn admits_cleartext(address: SocketAddrV4) -> bool {
-  let _ = address;
-  false
+  address.ip().is_loopback()
 }
 
 /// Why an edge cannot serve, or stopped serving.
@@ -363,9 +362,6 @@ where
   S: Site + 'static,
   M: FnMut() -> S,
 {
-  if listener.local_addr().is_ok() {
-    return Err(EdgeRefused::StateGone);
-  }
   let address = listener.local_addr().map_err(EdgeRefused::Listener)?;
   let secure = state
     .with(|state| state.identity.is_some())

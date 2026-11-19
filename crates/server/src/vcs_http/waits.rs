@@ -116,18 +116,27 @@ impl PhaseWaits {
   /// then the tail of its completed waits plus a liveness window, doubled for each wait cut since the last completed one
   /// (`LearnedWait::bound_ns`). None for `Closed`.
   pub(crate) fn bound_ns(&self, phase: Phase) -> Option<u64> {
-    let _ = (phase, NO_CEILING_NS, self.learned.get(phase).map(|learned| learned.waits.bound_ns(0)));
-    None
+    self
+      .learned
+      .get(phase)
+      .filter(|learned| learned.samples > 0)
+      .map(|learned| learned.waits.bound_ns(NO_CEILING_NS))
   }
 
   /// A wait in `phase` that completed after `waited_ns`: a sample, and the end of any back-off.
   pub(crate) fn completed(&mut self, phase: Phase, waited_ns: u64) {
-    let _ = (phase, waited_ns);
+    if let Some(learned) = self.learned.get_mut(phase) {
+      learned.waits.completed(waited_ns);
+      learned.samples = learned.samples.saturating_add(1);
+    }
   }
 
   /// A wait in `phase` cut at its bound: no sample (Karn's rule: its true length is unknown), and the bound backed off.
   pub(crate) fn ran_out(&mut self, phase: Phase) {
-    let _ = (phase, self.learned.get_mut(phase).map(|learned| learned.waits.ran_out()));
+    if let Some(learned) = self.learned.get_mut(phase) {
+      learned.waits.ran_out();
+      learned.cuts = learned.cuts.saturating_add(1);
+    }
   }
 
   /// How many of `phase`'s waits completed: its samples, the non-vacuity counter of its learned bound.

@@ -870,8 +870,15 @@ pub(crate) fn reaches(
   principal: &Principal,
   rights: &[Right],
 ) -> Result<bool, PushRefusal> {
-  let _ = (record, principal, rights);
-  Ok(false)
+  let _readable = Compiled::of(record)?;
+  if *principal == record.owner {
+    return Ok(true);
+  }
+  Ok(record.policy.rules.iter().any(|rule| {
+    matches!(rule.effect, slates_db::catalog::PolicyEffect::Allow)
+      && rights.contains(&right_of(rule.right))
+      && who_of(&rule.who).names(principal)
+  }))
 }
 
 #[cfg(test)]

@@ -234,9 +234,6 @@ impl<A: Authenticator, R: Repositories, S: GitServices> GitSite<A, R, S> {
     head: &Head<'_>,
     secure: bool,
   ) -> Decided<GitExchange<S::Exchange>> {
-    if !head.method.is_empty() {
-      return refused_with(Status::INTERNAL_SERVER_ERROR, Fields::new(), secure && false);
-    }
     let route = match http::route(head, &mut Admission::new(self.room)) {
       Ok(route) => route,
       Err(refused) => {
