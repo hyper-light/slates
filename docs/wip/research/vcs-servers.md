@@ -210,12 +210,59 @@ C: deployed code). Every quotation below was read directly on 2026-11-18 from th
 
 ### 5.4 Owed reading (git)
 
-- RFC 8332 and RFC 5656 (RSA with SHA-2 and ECDSA keys for SSH), and the Internet-Drafts OpenSSH names for its AES-GCM
-  and ChaCha20-Poly1305 rules, before the SSH server's piece.
+- RFC 8332 and RFC 5656's key forms (RSA with SHA-2 and ECDSA keys for SSH), before the SSH server's authentication
+  part. The Internet-Drafts OpenSSH names for its AES-GCM and ChaCha20-Poly1305 rules, owed here before the transport,
+  were read for A-594 (§5.5).
 - git's `gitformat-bundle` and `technical/bundle-uri.adoc` before piece 14; `technical/partial-clone.adoc` and
   `shallow.adoc` (downloaded, read only for their definitions so far) before piece 7.
 - GitLab Workhorse's own documentation, to confirm it is the HTTP front that drives Gitaly for git clients (§4.17.2
   names it from memory).
+
+### 5.5 The SSH transport (A-594, read 2026-11-19)
+
+| Source | Revision read | sha256 (first 16 hex) |
+|---|---|---|
+| RFC 4250, 4251, 4253, 4344, 5647, 5656, 7748, 8032, 8308, 8709, 8731 | the RFC Editor's text | eb3a9d7c3e1fae53, 23a5052796d29edc, b471173305154f6c, be7136101f416191, a0ee7571f0fa4a2b, 0cc84636afaf4860, 279ca0ecc5e92e29, ed63657ff3893012, c7d36121bcd0f242, ea4aa3a8feec6bd5, 26dcf1e8481d83e0 |
+| `draft-ietf-sshm-strict-kex-03`, `draft-ietf-sshm-chacha20-poly1305-04`, `draft-miller-sshm-aes-gcm-01` | the IETF archive's text (each the newest revision the datatracker named that day) | cda5d60229f73469, a8aa91696db885d2, 3ea287492f70cbec |
+| OpenSSH `PROTOCOL`, `kex.c`, `packet.c` | openssh-portable `master` at `fa4b2a82be7df9768272cfabc2d78e4a12c2b3c0` | 91b7534f158c66ae, 5b8e7fb70d685e7b, 81ddae0fafc0c2a2 |
+| NIST CAVS 14.1 SSH KDF vectors | AWS-LC `crypto/evp_extra/sshkdf_tests.txt` at `02561621ffa4cf17c0c4f70bc11a82df36b42ae9`, the vendored aws-lc-sys's commit (`vendor/UPSTREAM.md`) | a492dbca6c2637f0 |
+
+What the transport rests on (quoted):
+- **OpenSSH's extensions are now drafts** [B: `PROTOCOL` §1.6, §1.7, §1.9]: AES-GCM "as described in"
+  `draft-miller-sshm-aes-gcm`, ChaCha20-Poly1305 in `draft-ietf-sshm-chacha20-poly1305`, and the Terrapin hardening,
+  "collectively referred to as "strict KEX"", in `draft-miller-sshm-strict-kex` (now `draft-ietf-sshm-strict-kex`).
+- **Strict key exchange** [B: strict-kex draft §3.1-§3.3]: "a client indicates support ... by including the standard
+  "kex-strict-c" identifier and/or the pre-standard "kex-strict-c-v00@openssh.com" identifier"; servers "SHOULD offer
+  both"; the markers "are valid only in the initial SSH_MSG_KEXINIT"; "implementations MUST terminate the connection if
+  they receive a non-KEX message during the initial key exchange"; "MUST verify that the SSH_MSG_KEXINIT was the first
+  message received from the peer"; "MUST ensure that the sequence number does not wrap ... prior to the completion of
+  the initial KEX"; a server "MUST only accept" `SSH_MSG_KEX_ECDH_INIT` once; "the sequence number used when sending
+  packets MUST be reset to zero immediately after any SSH_MSG_NEWKEYS packet is sent".
+- **ChaCha20-Poly1305** [B: the chacha draft §6-§8, Appendix A]: the second half of the 64-byte key encrypts the length
+  alone, the first half the rest and keys Poly1305; the nonce is the sequence number; "the MAC MUST be checked before
+  decryption"; "ChaCha20 must never reuse a {key, nonce}"; Appendix A works one packet through to its wire bytes, the
+  golden vector the crate holds.
+- **AES-GCM** [B: the AES-GCM draft §2; RFC 5647 §7.1-§7.3]: "AEAD modes ... MUST be listed in the
+  "encryption_algorithms" field ... only", and "MAC negotiation MUST be skipped"; the IV is "a 4-octet fixed field and an
+  8-octet invocation counter field", "incremented after each invocation"; the length is "additional authenticated
+  data, not ... plaintext".
+- **Rekeying** [B: RFC 4344 §3.1, §3.2; RFC 4253 §9]: "SHOULD rekey at least once every 2**32 outgoing packets", with
+  "rekey after receiving more than 2**31 packets" the preferred receiving point; for a block cipher of L ≥ 128 bits,
+  "SHOULD NOT encrypt more than 2**(L/4) blocks"; and RFC 4253's "after each gigabyte of transmitted data or after
+  each hour of connection time", with "should not be performed too often".
+- **The exchange** [B: RFC 8731 §3, §3.1; RFC 5656 §4]: "MUST check whether the computed Diffie-Hellman shared secret
+  is the all-zero value", "MUST also abort if the length of the received public keys are not the expected lengths"; X
+  read "as an unsigned fixed-length integer encoded in network byte order", then an `mpint`; the hash's eight fields.
+- **OpenSSH's own reader** [C: `kex.c` `kex_exchange_identification`; `packet.c`]: a server refuses lines before the
+  client's identification ("Do not accept lines before the SSH ident from a client"), a NUL or a CR not followed by LF
+  is invalid, a bare LF ends a line, and `sscanf("SSH-%d.%d-%[^\n]\n")` takes any software version; packets under an
+  AEAD must have `packlen` of at least 5 and a multiple of the block size after the length; `MAX_PACKETS (1U<<31)` in
+  either direction forces a rekey, as do `1 << (block_size*2)` blocks for 16-byte blocks.
+
+What follows for slates (A-594): every bound on a key comes from its cipher's analysis, never from a chosen size; the
+time bound is learned (§4.17.2's tunables table); the transport takes both markers, enforces strict key exchange when
+offered, and keeps its sequence-number rules exactly as the draft states, since ChaCha20-Poly1305's nonce is that
+number.
 
 ## 6. Policy by name pattern and the hooks' protocol (§4.17.1 shared piece 7, A-597)
 
