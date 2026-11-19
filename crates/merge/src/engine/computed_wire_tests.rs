@@ -171,13 +171,19 @@ fn every_cut_or_flipped_wire_form_is_refused() {
   let form = two_units_form();
   let green = Green::new();
   for len in 0..form.len() {
-    assert!(green.computed_from(&bare(), &form[..len]).is_err(), "cut at {len}");
+    assert!(
+      green.computed_from(&bare(), &form[..len]).is_err(),
+      "cut at {len}"
+    );
   }
   for at in 0..form.len() {
     for bit in 0..8 {
       let mut flipped = form.clone();
       flipped[at] ^= 1 << bit;
-      assert!(green.computed_from(&bare(), &flipped).is_err(), "byte {at} bit {bit}");
+      assert!(
+        green.computed_from(&bare(), &flipped).is_err(),
+        "byte {at} bit {bit}"
+      );
     }
   }
 }
