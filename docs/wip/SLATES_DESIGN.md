@@ -36112,6 +36112,35 @@ holds through `own_nfs::hold`), and the record literals in
 - **Owed.** Main's runs: the db integration tests (`model`, `wire_order`), and the live macOS mount suite across a
   restart with a mount unmounted while no daemon ran.
 
+### A-546 — An owner's settle certifies its content, and a holder its neighbourhood left lets the content go (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Neighbourhood changes"; §4.10 "the healer"; the content release signal for live owners; A-508, A-538)
+Applied in the same change to: GAPS (A-529's entry), `crates/db/src/register.rs`
+(`RegionalConfiguration::settle_certified`, `settle_certifies_content`), `crates/cluster/src/raft_wire.rs` (regional
+layout 7; layouts 6 and 5 still read, their settles uncertified), `crates/server/src/fleet.rs`
+(`content_placed_on_current_neighbourhood` in the settle report, `unsettled_replace` in the healer,
+`fleet.heal.unsettled_replaced`) and `crates/server/src/takeover.rs` (`let_go_settled_away`'s certified case,
+`fleet.settle.released_content`).
+- **What was there.** A-508 let a live owner's copy go from a holder outside all of the owner's neighbourhoods. The
+  copy was kept whole while its content was held, since the owner's head might still name this holder.
+- **The rule.** An owner reports its neighbourhood placed only once every volume it owns is served from within it, as
+  well as its records: each head snapshot's placement names only the owner and hosts of its current neighbourhood.
+  While the change is in flight, the healer replaces a placement naming a host outside that neighbourhood, where it
+  would otherwise restore it. So a settle certifies that no head the owner serves names a holder outside its
+  neighbourhoods. A-508's holder then lets go the content its own records name (A-538's
+  `content_retention::release_certified`), and keeps a placement ahead of them.
+- **Mixed fleets.** The configuration lists the members whose settle certifies their content: every member this build
+  forms, admits or settles, a retired member's mark going with it. Regional layout 7 adds that list after the settled
+  neighbourhoods. A configuration of layout 6 or 5 is read with every settle uncertified, and its holders keep the
+  content.
+- **The cost.** A neighbourhood change now re-places the content of every owned volume whose placement names a host it
+  dropped, before the owner settles. Main measures it: bytes per change, and the time to settle.
+- **Tests.** `a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go` (red before: kept whole).
+  `a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go` now runs on an uncertified settle; red
+  with an uncertified settle's content let go. `an_unsettled_owners_placement_outside_its_current_neighbourhood_is_replaced`,
+  `a_settle_this_build_records_certifies_its_content`, and the layout test (layouts 6 and 5 read uncertified). Kiln on
+  the Mac Studio, 2026-11-19, debug: `slates-db` `register::` 87 of 87, `slates-cluster` `raft_wire::` 22 of 22,
+  `slates-server` takeover, retention, healer and holder tests 35 of 35. Red once on a mutated copy that let an
+  uncertified settle's content go: the uncertified test lost the head at its first install (`(false, false)`).
+
 ### A-541 — A clone counts its snapshot's inodes, whatever its origin made or removed since (2026-11-19, goal 85; found by A-532; §4.2's inode dimension, §4.4 snapshots and clones, D-5)
 Applied in the same change to: A-532's entry (its finding marked fixed); GAPS, §8c (the fix and the siblings left open);
 the bug record `docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`; and:
