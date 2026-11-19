@@ -29,6 +29,11 @@ pub(super) mod graph;
 #[path = "protect.rs"]
 pub(super) mod protect;
 
+/// A-614's D(k) and reached sets as a type of derived data (A-647 part 2), a child of this module so its derivation
+/// walks the store as the admission does.
+#[path = "reach.rs"]
+pub(super) mod reach;
+
 /// Shape: what one version's record costs the budget beside its set's runs. Derived from the type.
 const VERSION_BYTES: usize = size_of::<Version>();
 
@@ -175,13 +180,30 @@ pub struct Found {
   pub id: ObjectId,
 }
 
-/// One version of a ref: its head's position (`None` for a deleted ref) and D(k), what it brought.
+/// One version of a ref: its head's position (`None` for a deleted ref), D(k), what it brought, and how its reached set
+/// followed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Version {
   head: Option<u64>,
   brought: Positions,
   /// Its D(k) encoded, once the owner asked (A-614 part 2).
   fragments: Option<Fragments>,
+  /// How its reached set followed, kept so its derivation (A-647 part 2, [`reach`]) reads only its parents' values.
+  followed: Followed,
+}
+
+/// How a version's reached set followed (A-647 part 2): the move's [`Reach`], with the version a remade set was taken
+/// from named, since which green's head a rewrite or a create descends from is found among the greens' heads at its
+/// admission, and a derivation reads only recorded history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Followed {
+  /// A fast-forward: the green's previous set grown by what the version brought.
+  Grown,
+  /// A create or a rewrite: made again from the set of `base` (a green and its version when the move was admitted), or
+  /// from nothing.
+  Remade { base: Option<(u64, usize)> },
+  /// A delete: nothing reached.
+  Emptied,
 }
 
 /// Shape: what one fragment entry's record costs the budget. Derived from the type.
@@ -291,8 +313,13 @@ struct Members {
 enum Reach {
   /// A fast-forward: the set grows by what the version brought.
   Grown,
-  /// A create or a rewrite: the set made again, a base set and what a walk found beyond it.
-  Remade { base: Positions, beyond: Members },
+  /// A create or a rewrite: the set made again, a base set (the reached set of `from`, a green and its version, when one
+  /// was found) and what a walk found beyond it.
+  Remade {
+    base: Positions,
+    beyond: Members,
+    from: Option<(u64, usize)>,
+  },
   /// A delete: nothing reached.
   Emptied,
 }
@@ -801,27 +828,27 @@ impl Repository {
     self.heads.get(&row.position)?.iter().next().copied()
   }
 
-  /// The reached set made again for a head `to` (module docs): a base green's set, and what a walk finds beyond it.
+  /// The reached set made again for a head `to` (module docs): a base green's set, and what a walk finds beyond it; and
+  /// the green and version the base set is, when one was found.
   fn remade(
     &self,
     store: &ContentStore,
     push: &Push,
     to: ObjectId,
-  ) -> Result<(Positions, Members), StoreRefused> {
-    let base = match self.base(store, push, to)? {
+  ) -> Result<(Positions, Members, Option<(u64, usize)>), StoreRefused> {
+    let (base, from) = match self.base(store, push, to)? {
       Some(green) => {
         self.count(|counters| counters.bases_found = counters.bases_found.saturating_add(1));
-        self
-          .chains
-          .get(&green)
-          .map(|chain| chain.reached.clone())
-          .unwrap_or_default()
+        let chain = self.chains.get(&green);
+        let set = chain.map(|chain| chain.reached.clone()).unwrap_or_default();
+        let version = chain.and_then(|chain| chain.versions.len().checked_sub(1));
+        (set, version.map(|version| (green, version)))
       }
-      None => Positions::new(),
+      None => (Positions::new(), None),
     };
     let beyond = self.walk(store, push, to, &base)?;
     self.count(|counters| counters.remade = counters.remade.saturating_add(1));
-    Ok((base, beyond))
+    Ok((base, beyond, from))
   }
 
   /// Admits `green`'s move to `to` (`None` deletes the ref) before its verdict: what its version brings and how its
@@ -870,8 +897,8 @@ impl Repository {
       self.count(|counters| counters.fast_forwards = counters.fast_forwards.saturating_add(1));
       Reach::Grown
     } else {
-      let (base, beyond) = self.remade(store, push, to)?;
-      Reach::Remade { base, beyond }
+      let (base, beyond, from) = self.remade(store, push, to)?;
+      Reach::Remade { base, beyond, from }
     };
     Ok(Move {
       green,
@@ -891,7 +918,7 @@ impl Repository {
     green: u64,
     to: ObjectId,
   ) -> Result<Move, StoreRefused> {
-    let (base, beyond) = self.remade(store, push, to)?;
+    let (base, beyond, from) = self.remade(store, push, to)?;
     let brought = Members {
       indexed: base.union(&beyond.indexed),
       new: beyond.new.clone(),
@@ -901,7 +928,7 @@ impl Repository {
       from: None,
       to: Some(to),
       brought,
-      reach: Reach::Remade { base, beyond },
+      reach: Reach::Remade { base, beyond, from },
     })
   }
 
@@ -1145,7 +1172,7 @@ impl Repository {
       let brought = self.members_positions(store, &movement.brought, positions)?;
       chain.reached = match &movement.reach {
         Reach::Grown => chain.reached.union(&brought),
-        Reach::Remade { base, beyond } => {
+        Reach::Remade { base, beyond, .. } => {
           base.union(&self.members_positions(store, beyond, positions)?)
         }
         Reach::Emptied => Positions::new(),
@@ -1159,6 +1186,7 @@ impl Repository {
         head,
         brought,
         fragments: None,
+        followed: followed(&movement.reach),
       });
       chains.insert(movement.green, chain);
     }
@@ -1283,6 +1311,15 @@ impl Repository {
       );
     }
     first.and(store.discharge(self.charged).map_err(StoreRefused::from))
+  }
+}
+
+/// What a version records of its move's [`Reach`].
+fn followed(reach: &Reach) -> Followed {
+  match reach {
+    Reach::Grown => Followed::Grown,
+    Reach::Remade { from, .. } => Followed::Remade { base: *from },
+    Reach::Emptied => Followed::Emptied,
   }
 }
 
@@ -1768,6 +1805,17 @@ impl Repository {
       &base.parts.objects
     };
     Some((base.version, part))
+  }
+
+  /// The position the next object new to the repository gets: every position below it is given
+  /// (A-665: the hook's view shows every object the repository holds).
+  pub(super) fn next_position(&self) -> u64 {
+    self.next_position
+  }
+
+  /// Every green with a chain, in order (A-665: the hook's view weighs each one's base pack).
+  pub(super) fn greens(&self) -> impl Iterator<Item = u64> + '_ {
+    self.chains.keys().copied()
   }
 
   /// The position of `green`'s version `version`'s head; `None` for a deleted ref.

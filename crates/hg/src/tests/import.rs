@@ -12,11 +12,13 @@ use slates_vcs::{ContentId, ContentStore};
 use crate::fixtures::{
   import as import_fixtures, state as state_fixtures, store as store_fixtures,
 };
-use crate::import::{FileRefused, ImportRefused, Imported, RepositoryFiles, import};
+use crate::import::{
+  Clock, FileRefused, Import, ImportRefused, Imported, Progress, RepositoryFiles, Turn, import,
+};
 use crate::index::{Log, NONE, RevisionRow};
 use crate::lines::lines;
 use crate::obsmarkers;
-use crate::phases::{Phase, PhaseHead};
+use crate::phases::Phase;
 use crate::revlog;
 use crate::store::RequiresRefused;
 use crate::{Admission, NULL_NODE, changeset, filerev, node};
@@ -48,28 +50,49 @@ struct Pending;
 struct Repository {
   files: BTreeMap<Vec<u8>, Vec<u8>>,
   asked: Vec<Vec<u8>>,
+  reads: Vec<Range>,
   pending: Option<Vec<u8>>,
 }
+
+/// A range read: the file's path, the offset and the length asked.
+type Range = (Vec<u8>, u64, u64);
 
 impl RepositoryFiles for Repository {
   type Refused = Pending;
 
-  fn read(
-    &mut self,
-    path: &[&[u8]],
-    room: &mut Admission,
-  ) -> Result<Option<Vec<u8>>, FileRefused<Pending>> {
+  fn len(&mut self, path: &[&[u8]]) -> Result<Option<u64>, FileRefused<Pending>> {
     let joined = path.join(&b'/');
     self.asked.push(joined.clone());
     if self.pending.as_ref() == Some(&joined) {
       return Err(FileRefused::Host(Pending));
     }
+    let len = |bytes: &Vec<u8>| u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    Ok(self.files.get(&joined).map(len))
+  }
+
+  fn read(
+    &mut self,
+    path: &[&[u8]],
+    offset: u64,
+    len: u64,
+    room: &mut Admission,
+  ) -> Result<Option<Vec<u8>>, FileRefused<Pending>> {
+    let joined = path.join(&b'/');
+    self.reads.push((joined.clone(), offset, len));
     let Some(bytes) = self.files.get(&joined) else {
       return Ok(None);
     };
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    room.charge(len).map_err(FileRefused::PastAdmission)?;
-    Ok(Some(bytes.clone()))
+    let at = |value: u64| {
+      usize::try_from(value)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len())
+    };
+    let range = bytes
+      .get(at(offset)..at(offset.saturating_add(len)))
+      .unwrap_or_default();
+    let charged = u64::try_from(range.len()).unwrap_or(u64::MAX);
+    room.charge(charged).map_err(FileRefused::PastAdmission)?;
+    Ok(Some(range.to_vec()))
   }
 }
 
@@ -299,6 +322,47 @@ fn refused(repository: &mut Repository) -> ImportRefused<Pending> {
 /// A path as a refusal names it.
 fn named(path: &str) -> Box<[u8]> {
   Box::from(path.as_bytes())
+}
+
+/// The reads of the file at `path`, each its length.
+fn read_lengths(repository: &Repository, path: &[u8]) -> Vec<u64> {
+  let of_path = |(read, _, _): &&Range| read.as_slice() == path;
+  repository
+    .reads
+    .iter()
+    .filter(of_path)
+    .map(|(_, _, len)| *len)
+    .collect()
+}
+
+/// A-649 part 3 (non-vacuity): do import the dotencode store, whose changelog keeps a data file, and the version 2 store,
+/// whose revlogs are behind dockets. Expect each such file read in more than one range and no range as long as the file,
+/// an inline revlog read whole, and texts rebuilt from the text before them.
+#[test]
+fn revlogs_are_read_by_ranges_never_whole() {
+  let mut dot = repository("dot");
+  assert!(imported(&mut dot).rebuilt_from_cache > 0);
+  let mut v2 = repository("v2");
+  imported(&mut v2);
+  let ranged = [
+    (&dot, b"store/00changelog.i".as_slice()),
+    (&dot, b"store/00changelog.d"),
+    (&v2, b"store/00changelog-150e1cfc.idx"),
+    (&v2, b"store/00changelog-b870a51b.dat"),
+  ];
+  for (repository, path) in ranged {
+    let whole = u64::try_from(repository.files[path].len()).unwrap();
+    let lengths = read_lengths(repository, path);
+    let pieces = lengths.len() > 1 && lengths.iter().all(|len| *len < whole);
+    assert!(
+      pieces,
+      "{}: {lengths:?} of {whole}",
+      String::from_utf8_lossy(path)
+    );
+  }
+  let inline = read_lengths(&dot, b"store/data/plain.txt.i");
+  let whole = u64::try_from(dot.files[b"store/data/plain.txt.i".as_slice()].len()).unwrap();
+  assert!(inline.contains(&whole), "{inline:?}");
 }
 
 /// AC-HG.9, A-630 parts 2 and 3: do import stores whose fncache, file index and version 1 file index each name a file
@@ -807,6 +871,100 @@ fn an_obsstore_is_read_whole_or_refused() {
   ));
   assert!(matches!(refusal, ImportRefused::Markers(_)), "{refusal:?}");
   assert_eq!(imported(&mut states_with("store/obsstore", &[])).markers, 0);
+}
+
+/// A clock that moves a nanosecond each time it is read, so a turn of a one-nanosecond quantum does one unit.
+struct Ticking(u64);
+
+impl Clock for Ticking {
+  fn now_ns(&mut self) -> u64 {
+    self.0 += 1;
+    self.0
+  }
+}
+
+/// `repository` imported a unit a turn: the import, and how many turns it took.
+fn sliced(repository: &mut Repository, store: &mut ContentStore) -> (Imported, u64) {
+  let mut clock = Ticking(0);
+  let mut import = Import::start(repository, room()).unwrap();
+  loop {
+    let turn = Turn {
+      clock: &mut clock,
+      quantum_ns: 1,
+    };
+    if import.advance(repository, store, turn).unwrap() == Progress::Done {
+      let turns = import.turns();
+      assert_eq!(turns, import.units());
+      return (import.into_imported().unwrap(), turns);
+    }
+  }
+}
+
+/// A-649 part 3 (slices): do import the dotencode store and the version 2 store a unit a turn, under a clock that ends
+/// every turn after its first unit, and again in one call. Expect each turn to do one unit, more turns than the store
+/// has revisions, and the two indexes equal row for row.
+#[test]
+fn an_import_a_unit_a_turn_equals_the_whole_import() {
+  for name in ["dot", "v2", "states"] {
+    let mut store = store();
+    let (mut piecewise, turns) = sliced(&mut repository(name), &mut store);
+    let revisions =
+      u64::from(piecewise.changesets) + u64::from(piecewise.manifests) + piecewise.file_revisions;
+    assert!(
+      turns > revisions,
+      "{name}: {turns} turns for {revisions} revisions"
+    );
+    let mut whole_store = self::store();
+    let mut whole = import(&mut repository(name), &mut whole_store, room()).unwrap();
+    assert_eq!(
+      rows(&mut piecewise, &store),
+      rows(&mut whole, &whole_store),
+      "{name}"
+    );
+  }
+}
+
+/// A-649 part 3: do import the dotencode store a unit a turn, then abandon it after half its turns; and import it with
+/// its host refusing a file log's index midway. Expect the abandoned import to give back everything, and the refused
+/// one to end with nothing held, a further turn refused as ended.
+#[test]
+fn an_import_ended_midway_holds_nothing() {
+  let mut clock = Ticking(0);
+  let mut repository = repository("dot");
+  let mut store = store();
+  let mut import = Import::start(&mut repository, room()).unwrap();
+  for _ in 0..20 {
+    let turn = Turn {
+      clock: &mut clock,
+      quantum_ns: 1,
+    };
+    assert_eq!(
+      import.advance(&mut repository, &mut store, turn),
+      Ok(Progress::More)
+    );
+  }
+  assert!(store.used() > 0);
+  import.abandon(&mut store).unwrap();
+  assert_eq!((store.len(), store.used()), (0, 0));
+  repository.pending = Some(b"store/data/plain.txt.i".to_vec());
+  let mut import = Import::start(&mut repository, room()).unwrap();
+  let turn = Turn {
+    clock: &mut clock,
+    quantum_ns: u64::MAX,
+  };
+  assert_eq!(
+    import.advance(&mut repository, &mut store, turn),
+    Err(ImportRefused::Host(Pending))
+  );
+  assert_eq!((store.len(), store.used()), (0, 0));
+  let turn = Turn {
+    clock: &mut clock,
+    quantum_ns: 1,
+  };
+  assert_eq!(
+    import.advance(&mut repository, &mut store, turn),
+    Err(ImportRefused::Ended)
+  );
 }
 
 proptest! {

@@ -26,6 +26,12 @@
 //! current head, found back through the commit rows by generation, walking only what lies beyond it: a branch made at
 //! another's head costs no walk.
 //!
+//! **D(k) as derived data** (A-647 part 2, [`ReachSets`]). A version's two sets are a type of `slates-vcs`'s derived
+//! data: a pure function of the version's record and its parents' values (version `k - 1`'s, and that of the version a
+//! remade set came from, which each version records), so any tier derives them with the admission's own walks over the
+//! committed index, and the owner keeps the admission's sets under (type, version) with no second walk
+//! ([`Repository::reach_value`]). The sets above are unchanged; the type reads them back, identity for identity.
+//!
 //! **A version read as a tree.** A version's head and its root tree are read from its commit row, and a path is
 //! resolved one tree a component down ([`Repository::entry`]): no walk of history and none of the tree. Making a
 //! green's maps (A-534) from a commit that is no version's head is receive-pack's create (piece 6).
@@ -50,12 +56,18 @@
 //! of work up to the owner's quantum and holds nothing borrowed between turns; every answered pack holds exactly the
 //! answer's objects, each once. upload-pack's service writes it through A-640's pack source over it.
 //!
+//! **A hook's repository (A-665, [`hook_view`]).** A git hook runs in a read-only bare repository
+//! made from what the store keeps: `HEAD`, `config` and `packed-refs` from the refs a push read,
+//! and packs from the base packs and fragments, each whole by itself, with the push's objects in
+//! git's quarantine; every file's bytes made when a read reaches them.
+//!
 //! **Owed (A-614's part 3, and later pieces):** the changed-path Bloom filters of the commit rows (part 3); the walks,
 //! a commit and a fragment's encoding sliced under the shard's budget, and their transient sets charged; a delta search
 //! for an object past a window; the versions' records kept as content, replicated as the index's tables are.
 
 mod deltas;
 mod fragment;
+pub mod hook_view;
 pub mod learn;
 mod naming;
 mod positions;
@@ -72,6 +84,7 @@ pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
 pub use repository::protect::{Change, CommitSigners, Unsigned};
+pub use repository::reach::{ReachRefused, ReachSets, Sets};
 pub use repository::{Found, Move, Repository, StoreCounters, StoreRefused};
 pub use upload::{Answered, Progress, Turn, Upload, UploadCounters, Versions};
 
