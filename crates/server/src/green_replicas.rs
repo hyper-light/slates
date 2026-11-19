@@ -1760,7 +1760,10 @@ mod tests {
       submit_one(state, work, 1);
       (green, work, head_of(state, green))
     });
-    assert!(both_hold(&daemon, green, first), "both replicas hold version 1");
+    assert!(
+      both_hold(&daemon, green, first),
+      "both replicas hold version 1"
+    );
     let before = crate::daemon::observe_first(&daemon, sent_and_acknowledged);
     let (sent_before_replies, head) = crate::daemon::observe_first(&daemon, move |state| {
       let mut sent_before_replies = Vec::new();
@@ -1777,7 +1780,10 @@ mod tests {
       [0, 0, 0],
       "no message of the feed sent before any of the turn's replies"
     );
-    assert!(both_hold(&daemon, green, head), "both replicas at the owner's head");
+    assert!(
+      both_hold(&daemon, green, head),
+      "both replicas at the owner's head"
+    );
     let after = crate::daemon::observe_first(&daemon, sent_and_acknowledged);
     assert_eq!(
       [

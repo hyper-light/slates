@@ -32536,3 +32536,15 @@ carries a turn's messages; `apply` and `replay` take them in order and acknowled
   flushes at once, counted (`merge.replica.flush_unarmed`): the feed then goes before the turn's later replies rather
   than wait for a change that may never come. The queue is bounded by one turn's changes; an engine given up or
   installed again before its flush is sent nothing, and the daemon's stop drops the queue.
+- **Test.** `a_turns_changes_go_to_each_replica_in_one_message_after_the_turns_replies`
+  (`crates/server/src/green_replicas.rs`, the lib's unit tests): a three-shard daemon, a green on the first shard held
+  at its head by the replicas on the other two; three versions submitted in one turn of the owner, each reply read
+  before the next submit. It expects no message of the feed sent before any of the turn's replies, and after the turn
+  both replicas at the owner's head, one message sent to each replica's shard and one acknowledgement home from each.
+  On the Mac Studio (debug, r84, 2026-11-18): failing first on the code before the fix (the counters added):
+  `[2, 2, 2]` messages sent before the three replies, one to each replica for each version; red with the fix but each
+  applied message acknowledged: `[2, 6]` sends and acknowledgements for `[2, 2]`; green with the fix, and
+  `cargo test --locked -p slates-server --lib green_replicas` 8 of 8; rustfmt's layout taken. Clippy, `xtask`, the
+  doc builds and the suites are main's (CLAUDE.md §8).
+- **Owed.** The supervisor's A/B again, the same arms (without the replicas 95bbed246; with them this landing): if it
+  is still not green, the replicas come out, recorded measured-and-rejected.
