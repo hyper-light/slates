@@ -23,7 +23,7 @@ const VERSION_PREFIX: &[u8] = b"SVN-fs-dump-format-version: ";
 /// The bytes Subversion counts as whitespace, any of which begins a line `load.c` passes over between records.
 /// Format: `svn_ctype_isspace` (`svn_ctype.h` 84; `ctype.c` 58-62 and 81): tab, line feed, vertical tab, form feed,
 /// carriage return and space.
-const WHITESPACE: [u8; 6] = [b'\t', b'\n', 0x0b, 0x0c, b'\r', b' '];
+const WHITESPACE: [u8; 6] = *b"\t\n\x0b\x0c\r ";
 
 /// The prefix of a property entry's line naming a property to set.
 /// Format: `hash.c` 289 writes `K <length>\n`; `load.c` 213 reads it.

@@ -182,8 +182,10 @@ pub(super) fn parse_hex<const N: usize>(hex: &[u8]) -> Option<[u8; N]> {
   if hex.len() != N.checked_mul(HEX_DIGITS_PER_BYTE)? {
     return None;
   }
-  for (byte, pair) in digest.iter_mut().zip(hex.chunks_exact(HEX_DIGITS_PER_BYTE)) {
-    let [high, low] = <[u8; HEX_DIGITS_PER_BYTE]>::try_from(pair).ok()?;
+  for (byte, &[high, low]) in digest
+    .iter_mut()
+    .zip(hex.as_chunks::<HEX_DIGITS_PER_BYTE>().0)
+  {
     *byte = hex_value(high)?
       .checked_mul(HEX_BASE)?
       .checked_add(hex_value(low)?)?;
