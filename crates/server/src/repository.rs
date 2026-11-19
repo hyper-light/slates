@@ -6,8 +6,9 @@
 //! green of the partition that joins as it stands, bound to the default branch. `CreateBranch` makes a member at a
 //! version of a branch (its head when none) through `Lineage::branch` and binds the new name to it. `BindBranch` binds a
 //! name to a member no name binds, which restores a retired branch; `RetireBranch` lets a name go and keeps its green
-//! (item 5). Destroying a member is the green's own destroy verb: it retires the member from its lineage at once and
-//! queues what only it held, which [`run_releases`] gives back a node a unit under the shard's slice.
+//! (item 5). Destroying a member is the green's own destroy verb: it retires the member from its lineage at once, gives
+//! back its map of paths to git's files (A-664 part 3, `crate::vcs_store::paths`), and queues what only it held, which
+//! [`run_releases`] gives back a node a unit under the shard's slice.
 //!
 //! **Rights.** A repository's owner holds every right on it (§4.13) until §4.17.1's policy (shared piece 7) says
 //! otherwise, so the branch verbs are its owner's, refused `Forbidden` to another principal; a green that becomes a root
@@ -852,12 +853,18 @@ fn db_hooks_env_section(
   }
 }
 
-/// Retires member `id` from its lineage at its destroy (module docs): its engine is gone at once, and what only it held
-/// is queued for [`run_releases`], which starts when none runs. False when `id` is no member.
+/// Retires member `id` from its lineage at its destroy (module docs): its engine is gone at once, and so is its map of
+/// paths to git's files (A-664 part 3, `vcs_store::paths::forget`), and what only it held in the lineage is queued for
+/// [`run_releases`], which starts when none runs. False when `id` is no member.
 pub(crate) fn retire_member(state: &mut ShardState, id: DbVolumeId) -> bool {
+  // Read before the retire, which ends the membership the lineage answers by.
+  let lineage = state.greens.lineage_of(&id);
   match state.greens.retire_queued(&id) {
     None => false,
     Some(Ok(start)) => {
+      if let Some(repository) = lineage {
+        crate::vcs_store::paths::forget(state, repository, id);
+      }
       if start {
         let spawned =
           slates_rt::futures::spawn(run_releases()).and_then(slates_rt::futures::detach);
