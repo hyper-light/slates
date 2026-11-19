@@ -62,7 +62,9 @@ fn problems_of(name: &str, inputs: &[&str]) -> Vec<String> {
     match std::fs::read(directory.join(file)) {
       Ok(bytes) if sha256_hex(&bytes) == sum => {}
       Ok(_) => problems.push(format!("{name}/{file}: its bytes are not its sum's")),
-      Err(error) => problems.push(format!("{name}/{file}: named by a sum, not readable: {error}")),
+      Err(error) => problems.push(format!(
+        "{name}/{file}: named by a sum, not readable: {error}"
+      )),
     }
   }
   for file in files_beneath(&directory, &directory) {
