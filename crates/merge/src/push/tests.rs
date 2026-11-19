@@ -17,6 +17,7 @@ use super::{
 use crate::engine::{Green, Increment, Outcome};
 use crate::increment::{DeriveError, VolumeOp, compose_volume_planned};
 use crate::ops_doc::OpKind;
+use crate::special::{SpecialKind, SpecialNode};
 use crate::verdict::MergeConflictClass;
 
 /// An object of the store.
@@ -108,6 +109,8 @@ enum Node {
   File(Vec<u8>, bool),
   /// A symbolic link and its target.
   Link(String),
+  /// A submodule's link and the commit it stands at (A-637).
+  Submodule(ObjectKey),
 }
 
 /// A branch's tree as its paths: files and links by path, each directory implied by the paths beneath it, as git's
@@ -162,6 +165,7 @@ fn put_dir(store: &mut Store, dir: &Dir) -> ObjectKey {
       DirEntry::Leaf(Node::File(bytes, false)) => (EntryKind::File, store.put_blob(bytes)),
       DirEntry::Leaf(Node::File(bytes, true)) => (EntryKind::Executable, store.put_blob(bytes)),
       DirEntry::Leaf(Node::Link(target)) => (EntryKind::Symlink, store.put_blob(target.as_bytes())),
+      DirEntry::Leaf(Node::Submodule(commit)) => (EntryKind::Submodule, *commit),
     };
     entries.push(TreeEntry {
       name: name.as_bytes().to_vec(),
@@ -253,6 +257,7 @@ fn oracle(store: &Store, green: &Green, push: &Push<'_>) -> Expected {
     });
   }
   let mut contents: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+  let mut encoded: BTreeMap<String, Vec<u8>> = BTreeMap::new();
   let mut reads = Reads::default();
   for (path, (kind, id)) in &given {
     let was = based.get(path);
@@ -305,7 +310,19 @@ fn oracle(store: &Store, green: &Green, push: &Push<'_>) -> Expected {
           });
         }
       }
-      EntryKind::Submodule => panic!("the generator makes no submodule"),
+      EntryKind::Submodule if !same => {
+        if was.is_some() {
+          journal.push(VolumeOp::Unlink { path: path.clone() });
+        }
+        let node = gitlink(*id);
+        encoded.insert(path.clone(), node.encode());
+        journal.push(VolumeOp::Mknod {
+          path: path.clone(),
+          node,
+          mode: 0,
+        });
+      }
+      EntryKind::Submodule => {}
     }
   }
   if let Some(head) = push.head {
@@ -354,6 +371,7 @@ fn oracle(store: &Store, green: &Green, push: &Push<'_>) -> Expected {
         &contents[path][from..from + usize::try_from(op.len).unwrap()]
       }
       OpKind::SetXattr => push.head.unwrap(),
+      OpKind::Mknod => encoded[path].as_slice(),
       _ => continue,
     };
     let at = usize::try_from(op.src).unwrap();
@@ -376,7 +394,8 @@ fn oracle(store: &Store, green: &Green, push: &Push<'_>) -> Expected {
 }
 
 /// The client-fidelity test (§4.17.1 item 4): `green` holds exactly `files`, each file's bytes and executable bit, each
-/// link's target, the directories they imply and nothing else, and its root's head is `head`.
+/// link's target, each submodule link's commit, the directories they imply and nothing else, and its root's head is
+/// `head`.
 fn holds_exactly(green: &Green, files: &Files, head: &[u8]) {
   let mut wanted_dirs = BTreeSet::new();
   for (path, node) in files {
@@ -400,6 +419,11 @@ fn holds_exactly(green: &Green, files: &Files, head: &[u8]) {
         Some(target.as_str()),
         "{path}'s target"
       ),
+      Node::Submodule(commit) => assert_eq!(
+        green.special(path),
+        Some(gitlink(*commit)),
+        "{path}'s commit"
+      ),
     }
   }
   let held_files: BTreeSet<String> = green.files().map(|(path, _)| path).collect();
@@ -417,9 +441,33 @@ fn holds_exactly(green: &Green, files: &Files, head: &[u8]) {
     .map(|(path, _)| path)
     .collect();
   assert_eq!(held_links, wanted_links, "the links and nothing else");
+  let held_gitlinks: BTreeSet<&String> = base.specials.iter().map(|(path, _)| path).collect();
+  let wanted_gitlinks: BTreeSet<&String> = files
+    .iter()
+    .filter(|(_, node)| matches!(node, Node::Submodule(_)))
+    .map(|(path, _)| path)
+    .collect();
+  assert_eq!(
+    held_gitlinks, wanted_gitlinks,
+    "the submodule links and nothing else"
+  );
   let held_dirs: BTreeSet<String> = base.dirs.iter().cloned().collect();
   assert_eq!(held_dirs, wanted_dirs, "the directories and nothing else");
   assert_eq!(green.xattr(ROOT, HEAD_ATTRIBUTE), Some(head), "the head");
+}
+
+/// The special node a submodule's link to `commit` is (A-637): the commit, and no owner or time, since git records
+/// none.
+fn gitlink(commit: ObjectKey) -> SpecialNode {
+  SpecialNode {
+    kind: SpecialKind::Gitlink { commit },
+    uid: 0,
+    gid: 0,
+    atime: 0,
+    mtime: 0,
+    ctime: 0,
+    btime: 0,
+  }
 }
 
 /// A head for the `n`th push of a history, twenty bytes as git's SHA-1 commit ids.
@@ -953,58 +1001,70 @@ fn names_and_targets_slates_cannot_hold_are_refused_by_kind() {
   }
 }
 
-/// A-618 (§4.17.2 item 5: a submodule's special node kind is owed; GAPS §8f: the deriver's composition of a path that
-/// changes kind is owed). Do: push a tree with a submodule link; then, over a landed tree, a file becoming a directory,
-/// a directory becoming a link, and a link becoming a file. Expect: `Submodule`, then `KindChanged` naming each path;
-/// the green unchanged.
+/// A-637 (§4.17.2 "Trees as a volume" item 5). Do: push a tree with a submodule's link beside a file; then move the
+/// link to another commit; then remove it. Expect: each the oracle's work, accepted; the green holding the link as a
+/// special node of its commit (an `Mknod`), then of the other commit, then nothing at the path or its directory.
 #[test]
-fn a_submodule_and_a_path_changing_kind_are_refused_until_their_compositions_exist() {
+fn a_submodule_link_lands_as_a_special_node_holding_its_commit() {
   let mut store = Store::default();
-  let commit = key(b"commit", b"another repository's");
-  let tree = tree_with(
-    &mut store,
-    vec![entry(b"sub", EntryKind::Submodule, commit)],
-  );
-  assert_eq!(
-    refusal(&store, tree),
-    PushRefused::Submodule {
-      path: "sub".to_owned()
-    }
-  );
   let mut green = Green::new();
-  let base_files = files_of(&[
+  let first = key(b"commit", b"another repository's first");
+  let second = key(b"commit", b"another repository's second");
+  let linked = |commit| files_of(&[("f", file(b"f\n")), ("vendor/lib", Node::Submodule(commit))]);
+  let (built, outcome, tree) = land(&mut store, &mut green, None, &linked(first), &head(1));
+  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  let made = kinds(&built.increment)
+    .into_iter()
+    .any(|(path, kind, _, _)| path == "vendor/lib" && kind == OpKind::Mknod);
+  assert!(made, "{:?}", kinds(&built.increment));
+  holds_exactly(&green, &linked(first), &head(1));
+  assert_eq!(green.special("vendor/lib"), Some(gitlink(first)));
+  let (_, outcome, tree) = land(
+    &mut store,
+    &mut green,
+    Some(tree),
+    &linked(second),
+    &head(2),
+  );
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  holds_exactly(&green, &linked(second), &head(2));
+  let unlinked = files_of(&[("f", file(b"f\n"))]);
+  let (_, outcome, _) = land(&mut store, &mut green, Some(tree), &unlinked, &head(3));
+  assert_eq!(outcome, Outcome::Accepted { version: 3 });
+  holds_exactly(&green, &unlinked, &head(3));
+  assert_eq!(green.special("vendor/lib"), None);
+}
+
+/// A-618 and A-637 (GAPS §8f: the deriver's composition of a path that changes kind is owed). Do: over a landed tree,
+/// push a file becoming a directory, a directory becoming a link, a link becoming a file, a file becoming a submodule's
+/// link, and a submodule's link becoming a directory. Expect: `KindChanged` naming each path; the green unchanged.
+#[test]
+fn a_path_changing_kind_is_refused_until_its_composition_exists() {
+  let mut store = Store::default();
+  let mut green = Green::new();
+  let commit = key(b"commit", b"another repository's");
+  let base: [(&str, Node); 4] = [
     ("f", file(b"f\n")),
     ("d/x", file(b"x\n")),
     ("l", Node::Link("f".to_owned())),
-  ]);
-  let (_, _, base_tree) = land(&mut store, &mut green, None, &base_files, &head(1));
-  let changes: [(&str, Files); 3] = [
-    (
-      "f",
-      files_of(&[
-        ("f/inner", file(b"f\n")),
-        ("d/x", file(b"x\n")),
-        ("l", Node::Link("f".to_owned())),
-      ]),
-    ),
-    (
-      "d",
-      files_of(&[
-        ("f", file(b"f\n")),
-        ("d", Node::Link("f".to_owned())),
-        ("l", Node::Link("f".to_owned())),
-      ]),
-    ),
-    (
-      "l",
-      files_of(&[
-        ("f", file(b"f\n")),
-        ("d/x", file(b"x\n")),
-        ("l", file(b"now a file\n")),
-      ]),
-    ),
+    ("s", Node::Submodule(commit)),
   ];
-  for (path, files) in changes {
+  let base_files = files_of(&base);
+  let (_, _, base_tree) = land(&mut store, &mut green, None, &base_files, &head(1));
+  let changes: [(&str, &str, Node); 5] = [
+    ("f", "f/inner", file(b"f\n")),
+    ("d", "d", Node::Link("f".to_owned())),
+    ("l", "l", file(b"now a file\n")),
+    ("f", "f", Node::Submodule(commit)),
+    ("s", "s/inner", file(b"s\n")),
+  ];
+  for (path, changed, node) in changes {
+    let mut files: Files = base
+      .iter()
+      .filter(|(at, _)| at.split('/').next() != Some(path))
+      .map(|(at, kept)| ((*at).to_owned(), kept.clone()))
+      .collect();
+    files.insert(changed.to_owned(), node);
     let tree = put(&mut store, &files);
     assert_eq!(
       build(
@@ -1015,7 +1075,8 @@ fn a_submodule_and_a_path_changing_kind_are_refused_until_their_compositions_exi
       ),
       Err(PushRefused::KindChanged {
         path: path.to_owned()
-      })
+      }),
+      "{path}"
     );
   }
   holds_exactly(&green, &base_files, &head(1));
@@ -1134,8 +1195,8 @@ const CONTENTS: [&[u8]; 4] = [b"one\n", b"two\n", b"", b"a longer line of bytes\
 /// Format: the targets a generated link holds.
 const TARGETS: [&str; 2] = ["f", "../c/f"];
 
-/// What one slot becomes at a step: removed (0), a file of [`CONTENTS`] (1 to 4, with its executable bit), or a link to
-/// a target of [`TARGETS`] (5 and 6).
+/// What one slot becomes at a step: removed (0), a file of [`CONTENTS`] (1 to 4, with its executable bit), a link to a
+/// target of [`TARGETS`] (5 and 6), or a submodule's link to one of two commits (7 and 8).
 fn apply(files: &Files, step: &[Option<(u8, bool)>]) -> Files {
   let mut next = files.clone();
   for (slot, change) in SLOTS.iter().zip(step) {
@@ -1153,11 +1214,14 @@ fn apply(files: &Files, step: &[Option<(u8, bool)>]) -> Files {
           Node::File(CONTENTS[usize::from(*choice) - 1].to_vec(), *executable),
         );
       }
-      _ => {
+      5..=6 => {
         next.insert(
           path,
           Node::Link(TARGETS[usize::from(*choice) - 5].to_owned()),
         );
+      }
+      _ => {
+        next.insert(path, Node::Submodule(key(b"commit", &[*choice])));
       }
     }
   }
@@ -1181,6 +1245,8 @@ struct Census {
   links: Cell<u64>,
   /// Files replaced whole: a `Delete` of the base's bytes.
   replaced: Cell<u64>,
+  /// Submodule links made or moved to another commit.
+  gitlinks: Cell<u64>,
 }
 
 impl Census {
@@ -1195,6 +1261,7 @@ impl Census {
         OpKind::SetMode => add(&self.modes, 1),
         OpKind::Symlink => add(&self.links, 1),
         OpKind::Delete => add(&self.replaced, 1),
+        OpKind::Mknod => add(&self.gitlinks, 1),
         _ => {}
       }
     }
@@ -1241,11 +1308,12 @@ fn history(steps: &[Vec<Option<(u8, bool)>>], census: &Census) {
 
 /// A-618 (§4.17.1 items 2 to 4; the oracle and the client-fidelity test). Do: run 256 generated histories of up to
 /// seven pushes, each changing, adding or removing any of twelve paths, deep and shallow, as files of four contents
-/// (one empty) with or without the executable bit, or as links of two targets; each pushed over the last landed tree.
+/// (one empty) with or without the executable bit, as links of two targets, or as submodule links to two commits; each
+/// pushed over the last landed tree.
 /// Expect: each build the oracle's work byte for byte, with exactly the reads a walk by identity makes; a path changing
 /// kind refused naming one of the paths that do, the green unchanged; every other push accepted, leaving the green
 /// holding exactly what was pushed and its head; and the histories, counted, reaching every case: subtrees skipped,
-/// kind changes refused, directories removed, modes set, links made, files replaced whole.
+/// kind changes refused, directories removed, modes set, links made, files replaced whole, submodule links made.
 #[test]
 fn every_push_is_the_oracles_work_and_leaves_the_client_where_it_is() {
   let census = Census::default();
@@ -1253,7 +1321,7 @@ fn every_push_is_the_oracles_work_and_leaves_the_client_where_it_is() {
     proptest::test_runner::Config::default(),
   ));
   let histories = proptest::collection::vec(
-    proptest::collection::vec(proptest::option::of((0u8..7, any::<bool>())), SLOTS.len()),
+    proptest::collection::vec(proptest::option::of((0u8..9, any::<bool>())), SLOTS.len()),
     1..8,
   );
   runner
@@ -1270,6 +1338,7 @@ fn every_push_is_the_oracles_work_and_leaves_the_client_where_it_is() {
     ("modes", census.modes.get()),
     ("links", census.links.get()),
     ("replaced", census.replaced.get()),
+    ("submodule links", census.gitlinks.get()),
   ];
   for (case, count) in met {
     assert!(count > 0, "the histories never met {case}: {met:?}");

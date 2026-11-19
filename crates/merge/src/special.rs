@@ -1,4 +1,5 @@
-//! Names with no content in §4.16: FIFO and socket names (A-26) and device nodes (A-294). Each carries an explicit
+//! Names with no content in §4.16: FIFO and socket names (A-26), device nodes (A-294) and submodule links (A-637).
+//! Each carries an explicit
 //! kind and captured ownership/timestamps, never stream bytes or a kernel endpoint; a device node carries its major
 //! and minor numbers too, metadata nothing in the merge opens. The fixed little-endian encoding is shared by origins,
 //! checkpoints and declared creations; replay reads no clock or host state. Modes use the engine's existing
@@ -9,8 +10,15 @@
 //! every FIFO and socket encoding, and every identity over one, is what it was before device nodes were kept, and no
 //! origin, checkpoint or chain format version moved: a reader of those formats meets a device kind only in bytes
 //! that hold one.
+//!
+//! A submodule's link (A-637; §4.17.2 "Trees as a volume" item 5: git's mode `160000`) is a name another repository's
+//! commit stands at, which the merge keeps as metadata as it keeps a device's number: its encoding is a FIFO or socket
+//! name's under a kind tag of its own, then the commit id's length in one byte and its bytes, as the tool names it (one
+//! to [`LONGEST_ID`] bytes: git's 20 or 32). No earlier encoding moved, and a reader meets the kind only in bytes that
+//! hold one.
 
 use crate::ops_doc::{DocDecodeError, Reader};
+use crate::push::{LONGEST_ID, ObjectKey};
 
 /// The kinds of name with no content: the two IPC kinds A-26 authorized, and the device nodes A-294 keeps as
 /// metadata, each with its number.
@@ -33,6 +41,11 @@ pub enum SpecialKind {
     major: u32,
     /// The minor number.
     minor: u32,
+  },
+  /// A submodule's link (A-637): the commit of another repository the name stands at, by that tool's id.
+  Gitlink {
+    /// The commit's id.
+    commit: ObjectKey,
   },
 }
 
@@ -68,6 +81,8 @@ const KIND_SOCKET: u8 = 1;
 const KIND_BLOCK_DEVICE: u8 = 2;
 /// Format: the kind byte of a character device node (A-294).
 const KIND_CHAR_DEVICE: u8 = 3;
+/// Format: the kind byte of a submodule's link (A-637).
+const KIND_GITLINK: u8 = 4;
 
 impl SpecialNode {
   /// The length of [`SpecialNode::encode`]'s bytes: [`DEVICE_ENCODED_BYTES`] for a device node, [`ENCODED_BYTES`]
@@ -76,6 +91,7 @@ impl SpecialNode {
     match self.kind {
       SpecialKind::Fifo | SpecialKind::Socket => ENCODED_BYTES,
       SpecialKind::BlockDevice { .. } | SpecialKind::CharDevice { .. } => DEVICE_ENCODED_BYTES,
+      SpecialKind::Gitlink { .. } => ENCODED_BYTES,
     }
   }
 
@@ -87,6 +103,7 @@ impl SpecialNode {
       SpecialKind::Socket => (KIND_SOCKET, None),
       SpecialKind::BlockDevice { major, minor } => (KIND_BLOCK_DEVICE, Some((major, minor))),
       SpecialKind::CharDevice { major, minor } => (KIND_CHAR_DEVICE, Some((major, minor))),
+      SpecialKind::Gitlink { .. } => (KIND_GITLINK, None),
     };
     bytes.push(kind);
     bytes.extend_from_slice(&self.uid.to_le_bytes());
@@ -249,3 +266,6 @@ impl Composition {
     doc.canonicalize();
   }
 }
+
+#[cfg(test)]
+mod tests;

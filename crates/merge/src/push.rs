@@ -33,9 +33,9 @@
 //!
 //! **What is refused, typed ([`PushRefused`]).** A base version the green does not hold; an object the push names that
 //! the store cannot give as the kind the walk needs; a name slates cannot hold in a path (not UTF-8, empty, `.`, `..`,
-//! or holding `/` or NUL), or one name twice in a tree; a symbolic link whose target slates cannot hold; a link to
-//! another repository's commit (a git submodule), whose special node kind is owed (§4.17.2 "Trees as a volume" item 5);
-//! a path that changes between a file, a directory and a symbolic link, whose composition the deriver owes (GAPS §8f);
+//! or holding `/` or NUL), or one name twice in a tree; a symbolic link whose target slates cannot hold; a path that
+//! changes between a file, a directory, a symbolic link and a submodule's link, whose composition the deriver owes
+//! (GAPS §8f);
 //! a work past the caller's room, which bounds a push of any size (an ops document names as many paths as its work
 //! declares, A-621); and a base the green disagrees with, which the deriver refuses.
 //!
@@ -235,11 +235,6 @@ pub enum PushRefused {
   },
   /// A symbolic link whose target slates cannot hold: not UTF-8, or holding NUL.
   TargetNotHeld {
-    /// The link's path.
-    path: String,
-  },
-  /// A link to another repository's commit (a git submodule), whose node kind is owed (§4.17.2 item 5).
-  Submodule {
     /// The link's path.
     path: String,
   },
@@ -469,9 +464,6 @@ impl<O: PushObjects> Walk<'_, O> {
     now: Option<(EntryKind, ObjectKey)>,
   ) -> Result<(), PushRefused> {
     match (was, now) {
-      (Some((EntryKind::Submodule, _)), _) | (_, Some((EntryKind::Submodule, _))) => {
-        Err(PushRefused::Submodule { path })
-      }
       (Some(was), Some(now)) => self.changed(path, was, now),
       (Some((kind, id)), None) => self.removed(path, kind, id),
       (None, Some((kind, id))) => self.added(path, kind, id),
@@ -537,7 +529,7 @@ impl<O: PushObjects> Walk<'_, O> {
       EntryKind::File | EntryKind::Executable | EntryKind::Symlink => {
         self.emit(VolumeOp::Unlink { path })
       }
-      EntryKind::Submodule => Err(PushRefused::Submodule { path }),
+      EntryKind::Submodule => Err(PushRefused::KindChanged { path }),
     }
   }
 
@@ -567,7 +559,7 @@ impl<O: PushObjects> Walk<'_, O> {
         let target = self.target(&path, id)?;
         self.emit(VolumeOp::Symlink { path, target })
       }
-      EntryKind::Submodule => Err(PushRefused::Submodule { path }),
+      EntryKind::Submodule => Err(PushRefused::KindChanged { path }),
     }
   }
 
