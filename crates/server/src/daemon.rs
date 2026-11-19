@@ -468,17 +468,39 @@ pub(crate) const NFS_BACKLOG: i32 = 16;
 /// anchor's descriptor is the only path that keeps the port stable across restarts.
 #[cfg(unix)]
 fn nfs_listener() -> Result<TcpListener, RtError> {
-  if let Some(raw) = std::env::var(ENV_NFS_LISTENER)
+  held_listener(ENV_NFS_LISTENER)
+    .unwrap_or_else(|| TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG))
+}
+
+/// The listener a supervising anchor holds and handed over under the environment variable `variable` (the NFS
+/// listener's, §4.6, or the version-control edge's, A-625 part 3), adopted so its port survives a daemon restart; none
+/// when no anchor handed one over (a standalone start, or tests).
+#[cfg(unix)]
+pub(crate) fn held_listener(variable: &str) -> Option<Result<TcpListener, RtError>> {
+  let raw = std::env::var(variable)
     .ok()
-    .and_then(|value| value.parse::<RawFd>().ok())
-  {
-    // SAFETY: the anchor bound this listening socket and handed its descriptor to us across the spawn,
-    // inherited at this number; ownership is ours now (the anchor keeps its own copy), so wrapping it
-    // in an `OwnedFd` gives it a single owner that closes it on drop.
-    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-    return TcpListener::from_owned(owned);
-  }
-  TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG)
+    .and_then(|value| value.parse::<RawFd>().ok())?;
+  // SAFETY: the anchor bound this listening socket and handed its descriptor to us across the spawn,
+  // inherited at this number; ownership is ours now (the anchor keeps its own copy), so wrapping it
+  // in an `OwnedFd` gives it a single owner that closes it on drop.
+  let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+  Some(TcpListener::from_owned(owned))
+}
+
+/// See the Unix arm: no anchor holds a listener for its daemons on Windows (`docs/wip/platforms.md`, gap 2).
+#[cfg(windows)]
+pub(crate) fn held_listener(_variable: &str) -> Option<Result<TcpListener, RtError>> {
+  None
+}
+
+/// Binds the version-control servers' shared HTTP edge's listener at `address` as the daemon binds its own, its backlog
+/// the edge's seats on a shard of `config` (A-625 part 3): what a supervising anchor binds once and holds across its
+/// daemons' restarts ([`slates_anchor::ENV_VCS_HTTP`]), so the edge's port never drops while a daemon restarts.
+pub fn bind_vcs_http_listener(
+  config: &DaemonConfig,
+  address: SocketAddrV4,
+) -> Result<TcpListener, RtError> {
+  crate::vcs_http::bind(config, address)
 }
 
 /// The NFS loopback listener to serve on Windows: a fresh ephemeral bind, since no anchor holds one there across a

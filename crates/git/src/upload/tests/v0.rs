@@ -218,15 +218,12 @@ fn answered(
 ) -> (Vec<u8>, Answer<super::WholePack>) {
   let served = serving(fixture, &REFS, b"refs/heads/main");
   let mut source = WholeObjects::new(&fixture.objects);
-  let mut answer = serve(
-    &served,
-    version,
-    asked,
-    &mut source,
-    &mut Admission::new(u64::MAX),
-  );
+  let mut admission = Admission::new(u64::MAX);
+  let mut answer = serve(&served, version, asked, &mut source, &mut admission);
   let mut bytes = Vec::new();
-  while answer.write(&served, &mut source, &mut bytes, usize::MAX) == Written::More {}
+  while answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX) == Written::More
+  {
+  }
   (bytes, answer)
 }
 
@@ -367,15 +364,17 @@ fn side_band_packets_hold_a_thousand_bytes_and_no_side_band_sends_the_pack_bare(
   let served = serving(&fixture, &REFS, b"refs/heads/main");
   let mut source = Counting { len: 3000 };
   let request = clone_request("side-band ofs-delta");
+  let mut admission = Admission::new(u64::MAX);
   let mut answer = serve(
     &served,
     Version::V0,
     Asked::Request(&request),
     &mut source,
-    &mut Admission::new(u64::MAX),
+    &mut admission,
   );
   let mut long = Vec::new();
-  while answer.write(&served, &mut source, &mut long, usize::MAX) == Written::More {}
+  while answer.write(&served, &mut source, &mut admission, &mut long, usize::MAX) == Written::More {
+  }
   let data: Vec<usize> = packets_from(&long, 0)
     .iter()
     .filter(|packet| packet.get(4) == Some(&1))
