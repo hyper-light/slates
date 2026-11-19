@@ -46134,3 +46134,39 @@ new; git's site's tests; the manifest's dev-dependency on `slates-vcs`) and the 
   `ls-refs` answered with the flush alone, a body that is no pkt-line answered `ERR`, receive-pack and an unheld store
   `503`.
 - **Owed.** As the status says.
+
+### A-663 — a rebased work restates each hard link where the node it names still stands (2026-11-19, g307, UI goal 93 (kiln 51cef9f7); §4.16 "Rebase, the only corrective path"; A-646's decision; found by A-646's sweep, g267)
+Applied in the same change to:
+- §4.16's rebase status; GAPS (the entry closed; two entries of siblings filed open);
+- `crates/merge/src/engine.rs`: `in_replay_order`, `link_places`, `removed_links`, `Effect::unhomes` and
+  `Effect::frees`; `Green::rebased_from` restating the effects in that order, and a link made where the head holds
+  another after that link's removal;
+- `crates/merge/src/engine/restate_tests.rs`, new;
+- `docs/bugs/2026-11-19-a-rebased-work-restated-its-links-after-moving-their-nodes.md`.
+- **The defect.** A clean rebase restated the verdict's effects in the verdict's order, renames, creates and removals
+  first and hard links last. The restated journal is the work's: a volume with real inodes replays it in order, and the
+  work's next submit composes it again. A link names the node at its target when it is made (A-646), so a link restated
+  after a rename or removal of its node met the name afterwards: `ln g l; mv f g` put `l` on `f`'s file, and the
+  journal composed again did too; a link to a node the work renamed (`mv f m; ln m l`, `ln f l; mv f m`) or removed
+  (`ln f l; rm f`) named an emptied name. Found with them: a link made where the head holds another (`rm h; ln f h`)
+  was restated with no removal of the head's, so the rebased work's next submit was refused `LinkOverExisting`.
+- **The rule.** The restatement is the work's own operations in an order a volume replays to the state the green
+  reads. Each link goes just before the first operation that moves its node away from the name it names it by or
+  removes it there (a rename from it or over it, a removal), and never before an operation that frees the link's own
+  name. Every other operation keeps the verdict's order, which makes a node before a link to it. A link made where the
+  head holds another follows that link's removal. The commit's node moves (`Green::node_moves`) stay the commit's: the
+  restated journal names no node by its home after the commit, only where it stands as the journal reaches it.
+- **Tests.** Each case is held to four readings of what a reader sees (each name's bytes and every name of its node),
+  which must agree: the work's own operations in their own order over the head in a model with real inodes, the green
+  that accepts the work, the restated journal replayed over the head in that model, and the green that accepts the
+  restated journal composed again (the server's next submit). Five cases, red first: the three of the GAPS entry, the
+  second in both orders, and the link made again over the head's. The oracle generates works over the same readings,
+  kept to what the deriver composes as a volume replays it, with a census requiring each case: a link before a rename
+  over its name, before and after its node's rename, before its node's removal, made again where the base's stood, and
+  to a file the work made.
+- **Evidence.** Pending the Mac Studio, offline since about 09:20 UTC.
+- **Siblings found, not changed** (GAPS): the deriver composes a name's node replaced by a new file (unlinked and made
+  again, or a new file renamed over it) as an edit of that node in place, so a link naming it reads the new bytes, and
+  a rename onto a name the work linked as both a link and a file there; the restatement makes a symbolic link over the
+  head's with no removal of it (`SymlinkOverExisting` on the next submit), and directories after the files made in
+  them.
