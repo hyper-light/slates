@@ -2,10 +2,10 @@
 //! state in (`fixtures/state`), each imported from its store and viewed at its imported phase roots and bookmarks, held
 //! to what stock 7.2's `served` filter serves of them (`fixtures/state/make-served-fixtures.sh`): the changesets, why
 //! each other one is left out, and the answers `heads`, `branchmap` and `listkeys` give; and so `divergent`, a
-//! divergent bookmark as stock 7.2 makes one (A-690). A clone over the view, every
-//! text lent once and hashing to its node; texts longer than a window copied within the room. The model: 7.2's filter
-//! stated literally (whole ancestor sets for the phases, `_revealancestors` with its stack) on generated histories with
-//! phase roots of every phase, markers, prunes and bookmarks. And the refusals.
+//! divergent bookmark as stock 7.2 makes one (A-690), and `amended-root`, a draft root hidden by its amend (A-691). A
+//! clone over the view, every text lent once and hashing to its node; texts longer than a window copied within the
+//! room. The model: 7.2's filter stated literally (whole ancestor sets for the phases, `_revealancestors` with its
+//! stack) on generated histories with phase roots of every phase, markers, prunes and bookmarks. And the refusals.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -268,6 +268,29 @@ fn a_divergent_bookmark_is_served_as_7_2_serves_it() {
     listed("divergent-served-bookmarks.txt")
   );
   assert_eq!(view.census(), Census::default());
+}
+
+/// A-691 (golden): do serve `amended-root`, which stock 7.2 made with a draft root amended under evolution (the old
+/// changeset hidden by the marker, and both kept among the draft roots 7.2 stores) and another draft made secret
+/// afterwards, imported from its store and viewed at its imported phase roots. Expect what stock 7.2's `served` filter
+/// serves of it (`make-served-fixtures.sh`): the public root and the amended draft, the old draft left out as hidden
+/// and the secret one as secret, and `heads`, `branchmap` and `listkeys` of `bookmarks` and `phases` byte for byte,
+/// `phases` listing the hidden draft root beside the amended one, since 7.2's `listphases` reads the stored draft
+/// roots from the unfiltered changelog (`phases.py` 1049-1058).
+#[test]
+fn a_hidden_draft_root_is_listed_as_7_2_lists_it() {
+  let name = "amended-root";
+  let (imported, store) = imported(name);
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  check_served(name, &view, &imported, &store);
+  check_left_out(name, &view, &imported, &store);
+  check_answers(name, &view);
+  let census = Census {
+    hidden: 1,
+    secret: 1,
+    ..Census::default()
+  };
+  assert_eq!(view.census(), census);
 }
 
 /// The full texts of a group of a decoded changegroup, each held to its node.
