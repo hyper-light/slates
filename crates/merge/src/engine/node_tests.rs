@@ -217,6 +217,7 @@ fn a_link_to_a_node_made_after_its_base_conflicts() -> Result<(), String> {
     ("a file", Work::default().create(MADE, b"<made>\n")),
     ("a FIFO", Work::default().fifo(MADE)),
   ];
+  let mut misjudged = Vec::new();
   for (kind, work) in made {
     let mut green = green();
     accept(&mut green, work, 1)?;
@@ -224,10 +225,14 @@ fn a_link_to_a_node_made_after_its_base_conflicts() -> Result<(), String> {
     let answer = green.submit(&link.at(0, 2));
     let refused = classes_on(&answer, "third") == Some(vec![MergeConflictClass::DeleteModify]);
     if !refused || green.hardlink("third").is_some() {
-      return Err(format!("{kind}: {answer:?}"));
+      misjudged.push(format!("{kind}: {answer:?}"));
     }
   }
-  Ok(())
+  if misjudged.is_empty() {
+    Ok(())
+  } else {
+    Err(misjudged.join("; "))
+  }
 }
 
 /// Submits `work` at the head of `live` and replays its chain entry onto `replica`.
