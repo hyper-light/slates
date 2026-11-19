@@ -4585,6 +4585,9 @@ async fn init_shard(
     server_task: None,
     dead_clients: std::collections::VecDeque::new(),
     reaper_task: None,
+    capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
+    deadline_task: None,
+    deadline_armed: None,
     scatters: std::collections::BTreeMap::new(),
     grant_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
@@ -4817,6 +4820,9 @@ async fn init_shard(
   // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
   let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reaper);
+  // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
+  let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(keeper);
   Ok(slices.finish())
 }
 
@@ -4867,8 +4873,10 @@ async fn rebuild_and_report(
 /// The shard's tick for the deadlines and the cold work it still owns, at the liveness cadence: expired leases, lapsed
 /// CLI attachments, destroys and grants, the audit owed, departed hosts' attachments, the pressure hold, base hints and
 /// the idle seal. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's
-/// reaper retires it then (`crate::reap`). The jobs left here leave a piece at a time for the events or deadlines that
-/// own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the budget.
+/// reaper retires it then (`crate::reap`); nor, since A-522, are abandoned staging buffers and status captures, which
+/// the shard's keeper releases at their own deadlines (`crate::deadlines`). The jobs left here leave a piece at a time
+/// for the events or deadlines that own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the
+/// cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4879,14 +4887,6 @@ async fn reap_loop() {
   loop {
     pace(cadence).await;
     state::with_state(|s| {
-      // Abandoned staging buffers and expired status pages, a lease after their last use (`crate::staging`,
-      // `crate::status_pages`): deadlines this tick keeps until the deadline wheel takes them (A-475 moved them here
-      // from the dead-client sweep).
-      let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
-      s.staging.expire(now, &mut s.store.metadata);
-      for (_, client) in s.clients.iter_mut_all() {
-        client.status_pages.expire(now, &mut s.store.metadata);
-      }
       let _ = verbs::expire_leases(s);
       // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
       let _ = verbs::expire_lapsed_attachments(s);
@@ -6238,6 +6238,7 @@ async fn control_loop(
         let completion = a.completion_dup();
         let control = a.control;
         let pid = a.pid;
+        let started = a.started;
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut end = slates_ipc::DaemonEnd::new(a.region);
         #[cfg(unix)]
@@ -6250,7 +6251,7 @@ async fn control_loop(
               // Its hang-up is watched from its seat on (A-475). A client whose hang-up cannot be watched is not seated,
               // since nothing would reclaim it: its control closes with this task, which its client reads as the daemon
               // gone, and the admission gives its id back.
-              let hangup = match crate::hangup::Hangup::of_client(control.as_ref(), pid) {
+              let hangup = match crate::hangup::Hangup::of_client(control.as_ref(), pid, started) {
                 Ok(hangup) => hangup,
                 Err(refusal) => {
                   s.count(crate::reap::UNWATCHABLE, 1);
