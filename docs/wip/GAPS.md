@@ -593,12 +593,12 @@
 > main 770ae8826): `slates-http-edge --lib credential` 10 of 10, `slates-server --lib vcs_http::` 46 of 46 (stock hg
 > 7.2 against the edge serving the hg site: `abort: HTTP Error 503`, the site reached), `slates-cli --test cli
 > vcs_http` 2 of 2, fmt clean; over main 693bc8feb (kiln r361, Subversion's site deciding alike) 10, 51 and 2 of each.
-> Over main b288b412e, with Mercurial's site on the daemon's edge (A-680 part 2a): stock hg 7.2's `hg identify` by
-> Basic on a daemon's loopback cleartext edge served from the repository's store, and g083's clone with no credentials
-> against a real anchor un-ignored, refused in hg's own words. RUNS_PENDING
-> Owed: the daemon serving the hg site beside git's (its site is git's alone, so stock hg against a running anchor
-> meets git's `404`; A-680 part 2 and the sites' composition), then g083's stock-hg anchor tests un-ignored; stock
-> svn over the loopback edge (A-681); the Windows and Linux runs (main's).
+> Over main b288b412e, with Mercurial's site on the daemon's edge (A-680 part 2a): stock hg 7.2's `hg
+> debugcapabilities` by Basic on a daemon's loopback cleartext edge answered from the repository's store, and g083's
+> clone with no credentials against a real anchor un-ignored, refused in hg's own words. RUNS_PENDING
+> Owed: g083's stock-hg round trip over the anchor's edge, once the hg site takes pushes (A-680 part 2b); stock `hg
+> identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
+> found here, main's); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the

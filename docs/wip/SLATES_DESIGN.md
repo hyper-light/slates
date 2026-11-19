@@ -13219,9 +13219,9 @@ engine: the verdict, rebase, position mapping, the register).
 > taken, so a token crosses no network either way), and every `401` offers Basic's challenge first and Bearer's after
 > it, on both kinds of connection (`challenges`). Stock Mercurial 7.2 reads the first challenge alone and crashed on a
 > Bearer first; stock git and Subversion send Basic alone, so a lone anchor's edge, which is cleartext, took none of
-> their credentials. Proven with stock hg 7.2 against a daemon's loopback cleartext edge (`hg identify` by Basic,
-> served from the repository's store) and against a real anchor (a clone with no credentials refused in hg's own
-> words), and over a daemon's loopback cleartext edge, where the owner's token as Basic's password is answered with
+> their credentials. Proven with stock hg 7.2 against a daemon's loopback cleartext edge (`hg debugcapabilities` by
+> Basic, answered from the repository's store) and against a real anchor (a clone with no credentials refused in hg's
+> own words), and over a daemon's loopback cleartext edge, where the owner's token as Basic's password is answered with
 > receive-pack's advertisement.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
@@ -51844,11 +51844,12 @@ A-686), GAPS (the §4.17.3 entry).
   `basic_proves_its_principal_on_a_daemons_loopback_cleartext_edge` (the owner's token as Basic's password over plain
   TCP, moved to the repository's shard and answered with receive-pack's advertisement through the push driver). Stock hg
   7.2 against a daemon (A-680 part 2a put Mercurial's site on its edge):
-  `stock_hg_identifies_a_repository_on_a_daemons_loopback_edge_by_basic` (a two-shard daemon whose edge serves loopback
-  cleartext, a Mercurial repository made from `fixtures/state`'s `states` and the owner's token enrolled; `hg identify`
-  with the token as Basic's password in the URL exits 0 naming the repository's tip; it skips loudly without stock hg
-  7.2, `SLATES_TEST_HG`); until main put that site on the daemon's edge, the same stock hg ran against the edge serving
-  Mercurial's site with no store (the red run's
+  `stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic` (a two-shard daemon whose edge serves
+  loopback cleartext, a Mercurial repository made from `fixtures/state`'s `states` and the owner's token enrolled; `hg
+  debugcapabilities` with the token as Basic's password in the URL exits 0, `getbundle` among the capabilities it lists
+  (`hg identify` gets as far, then stops: the site advertises no `lookup`, a finding of its own for main); it skips
+  loudly without stock hg 7.2, `SLATES_TEST_HG`); until main put that site on the daemon's edge, the same stock hg ran
+  against the edge serving Mercurial's site with no store (the red run's
   `vcs_http::tests::stock_hg_meets_basic_first_on_a_loopback_edge_and_reaches_the_hg_site`, `503` once past the `401`),
   replaced by this one. `slates-cli`: `an_anchors_vcs_http_flag_starts_its_daemons_edge` (a real anchor's cleartext edge
   answers Basic's challenge, then Bearer's) and g083's `stock_hg_without_credentials_is_refused_in_its_own_words`,
