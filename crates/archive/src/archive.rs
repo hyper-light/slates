@@ -621,10 +621,7 @@ impl Decoding {
   /// archive once every piece is done, and `None` after (the archive is given once). A stream fed short of its length
   /// is refused `Truncated`, as one that ends before its frame; a stream that does not decode is refused typed, as
   /// [`Archive::decode`] refuses it.
-  pub fn step(
-    &mut self,
-    mut spent: impl FnMut() -> bool,
-  ) -> Result<Option<Archive>, ArchiveError> {
+  pub fn step(&mut self, mut spent: impl FnMut() -> bool) -> Result<Option<Archive>, ArchiveError> {
     loop {
       if matches!(self.check, Check::Given) {
         return Ok(None);
@@ -840,7 +837,11 @@ impl Decoding {
   /// Record `index` next, or the manifest once every record the header counts is framed.
   fn body_frame(&mut self, index: u64) -> Frame {
     if index < self.header.map_or(0, |header| header.chunk_count) {
-      return self.in_body(Frame::Record { index }, RECORD_HEADER_BYTES, Section::Records);
+      return self.in_body(
+        Frame::Record { index },
+        RECORD_HEADER_BYTES,
+        Section::Records,
+      );
     }
     self.manifest_at = Some(self.fed);
     self.in_body(Frame::ManifestLength, size_of::<u64>(), Section::Manifest)
@@ -1306,7 +1307,8 @@ mod tests {
     }
   }
 
-  /// Noisy bytes no codec shrinks, from a xorshift seeded by `seed`.
+  /// Noisy bytes no codec shrinks, from a xorshift seeded by `seed` (an odd seed: an even one starts as the odd one
+  /// after it).
   fn noise(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed | 1;
     (0..len)
@@ -1367,7 +1369,7 @@ mod tests {
   #[test]
   fn a_stream_many_times_its_bound_is_fed_within_it() {
     let slice = 64;
-    let files: Vec<Vec<u8>> = (0..8).map(|seed| noise(seed, 3_000)).collect();
+    let files: Vec<Vec<u8>> = (0..8).map(|number| noise(2 * number + 1, 3_000)).collect();
     let archive = archive_of(&files);
     let bytes = archive.encode();
     let bound = Decoding::bound(slice);

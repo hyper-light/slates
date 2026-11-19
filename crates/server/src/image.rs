@@ -1916,7 +1916,11 @@ impl ImportJob {
   /// `Decoding::bound(slice_bytes)` (counted past it). `Some` once the decoder holds the file's admitted length, or
   /// all it held: a file cut short meanwhile reads short, and the decoder refuses it as cut off. A header this daemon
   /// does not read is refused at its first slice, typed.
-  fn feed_step(&mut self, state: &mut ShardState, slice_bytes: usize) -> Result<Option<()>, Refusal> {
+  fn feed_step(
+    &mut self,
+    state: &mut ShardState,
+    slice_bytes: usize,
+  ) -> Result<Option<()>, Refusal> {
     let (archive, file) = (self.archive, self.file);
     let ImportJob {
       decoding,
@@ -2402,6 +2406,7 @@ mod tests {
   use slates_db::catalog::{Principal, VolumeId as DbVolumeId};
   use slates_ipc::protocol::{ARCHIVE_FILE, NamePolicy, ReplyBody, RequestBody, SizeClass};
   use slates_vfs::Volume;
+  use slates_vfs::dir::Child;
   use slates_vfs::ids::InodeNo;
   use slates_vfs::inode::Attrs;
   use slates_wire::request::RequestId;
@@ -2424,7 +2429,8 @@ mod tests {
     }
   }
 
-  /// Noisy bytes no codec shrinks, from a xorshift seeded by `seed`.
+  /// Noisy bytes no codec shrinks, from a xorshift seeded by `seed` (an odd seed: an even one starts as the odd one
+  /// after it).
   fn noise(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed | 1;
     (0..len)
@@ -2631,10 +2637,11 @@ mod tests {
       Vec::new(),
     )];
     for path in paths {
-      let no = volume.resolve(&state.store, path).unwrap().inode;
+      let located = volume.resolve(&state.store, path).unwrap();
+      let no = located.inode;
       let attrs = volume.stat(&state.store, no).unwrap();
       let mut bytes = Vec::new();
-      if attrs.mode & 0o170_000 == 0o100_000 {
+      if matches!(located.child, Child::File(_)) {
         bytes.resize(usize::try_from(attrs.size).unwrap(), 0);
         let read = volume.read(&state.store, no, 0, &mut bytes).unwrap();
         bytes.truncate(read);
@@ -2694,7 +2701,14 @@ mod tests {
     crate::daemon::audit_on_shard(|state| {
       let mut chunks = Vec::new();
       let entries = (0..8u64)
-        .map(|seed| file(&format!("file-{seed}"), seed + 2, &noise(seed, 3_000), &mut chunks))
+        .map(|number| {
+          file(
+            &format!("file-{number}"),
+            number + 2,
+            &noise(2 * number + 1, 3_000),
+            &mut chunks,
+          )
+        })
         .collect();
       let archive = archive(entries, chunks);
       let bytes = archive.encode();
@@ -2714,8 +2728,12 @@ mod tests {
         "the reading held {} of the file at once, past its bound of {bound}",
         import.stage_high_water
       );
-      let laid = view(state, &import.admitted.as_ref().unwrap().volume, &["file-7"]);
-      assert_eq!(laid[1].2, noise(7, 3_000));
+      let laid = view(
+        state,
+        &import.admitted.as_ref().unwrap().volume,
+        &["file-7"],
+      );
+      assert_eq!(laid[1].2, noise(15, 3_000));
       import.release(state);
     });
   }
