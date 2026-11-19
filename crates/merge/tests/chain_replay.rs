@@ -257,6 +257,7 @@ fn kind_of(applied: &chain_entry::Applied) -> &'static str {
     A::Spliced(..) => "spliced",
     A::Created(..) => "created",
     A::Copied { .. } => "copied",
+    A::CopyTree { .. } => "copy-tree",
     A::RemoveContent(..) => "remove-content",
     A::MakeDir(..) => "mkdir",
     A::RemoveDir(..) => "rmdir",
