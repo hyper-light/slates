@@ -7,7 +7,8 @@
 # For each repository R:
 #   R-served.txt            every changeset the filter serves, in revision order: `{node} {phase}`
 #   R-served-heads.txt      the served heads as `heads` answers them, in 7.2's order
-#   R-served-branchmap.txt  each branch and its heads as `branchmap` answers them, by branch: `{branch} {node} ...`
+#   R-served-branchmap.txt  each branch and its heads, closed ones too, as `branchmap` answers them (7.2's
+#                           `wireprotov1server.branchmap`), by branch: `{branch} {node} ...`
 #   R-served-bookmarks.txt  `listkeys bookmarks` as a peer is answered, sorted: `{name} {node}`
 #   R-served-phases.txt     `listkeys phases` as a peer is answered, sorted: `{key} {value}`
 #   R-unserved.txt          every changeset the filter leaves out, in revision order, and why: `{node} hidden` for one
@@ -44,8 +45,10 @@ def text(value):
 
 write('served', ['%s %s' % (text(served[r].hex()), text(served[r].phasestr())) for r in served])
 write('served-heads', [text(hex(h)) for h in served.heads()])
-write('served-branchmap', ['%s %s' % (text(branch), ' '.join(text(hex(n)) for n in heads))
-                           for branch, heads in sorted(served.branchmap().iteritems())])
+branchmap = served.branchmap()
+write('served-branchmap', ['%s %s' % (text(branch), ' '.join(text(hex(n)) for n in
+                                                            branchmap.branchheads(branch, closed=True)))
+                           for branch in sorted(branchmap)])
 write('served-bookmarks', sorted('%s %s' % (text(k), text(v))
                                  for k, v in pushkey.list(served, b'bookmarks').items()))
 write('served-phases', sorted('%s %s' % (text(k), text(v))
