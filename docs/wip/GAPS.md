@@ -2097,6 +2097,47 @@
 > the file `<1>\n` each time), green with it (43 of 43). A-596's oracle bases truncating works behind the head again.
 > Bug record: `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
 
+> **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
+> A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name
+> past the 65,535th, so the 65,536th and every later name of one work aliased one path; the deriver's index lookup,
+> the verdict's reading of a rename's source and an attribute's name, and the server's laying-in of an attribute's
+> value (which skipped it) narrowed the same way, and interning scanned every name, O(n²). Now an index is 64 bits in
+> memory and on the wire: the ops document's version 2, with u64 path and op counts and 34-byte op records, and the
+> chain entry's version 5. Interning looks a name up in an ordered map, and decode refuses a table naming a path twice
+> (`DuplicatePath`); versions 1 and 4 are refused `BadVersion`. A work names as many paths as its caller's admission
+> allows: a kernel tree's first push (about 97,000 files) is one work, and g225's interim refusal of a work past
+> 65,535 names (A-618, `TooManyNames`) can go. Tests (`crates/merge/src/ops_doc/tests.rs`, moved there from
+> `tests/ops_doc.rs`; `chain_entry`'s): 65,537 distinct names each their own through canonicalization, encode and
+> decode; the comparison counter (doubling the names less than triples the comparisons, where a scan quadruples them);
+> the determinism gate at that size (built twice, names declared in opposite orders, same bytes); the golden vectors
+> re-derived for version 2 (`11ede55e…d370763b`) by an independent encoder and BLAKE3 that reproduce version 1's; the
+> chain entry keeping an op's index past 16 bits. Green on the Mac Studio (kiln r692: `slates-merge --lib` 60 of 60,
+> `slates-server --lib` green and merge-origin tests 31 of 31, fmt clean). Red with the old scan and 16-bit index
+> restored inside the new types (r705: all four failed; doubling the names took 2,149,245,934 comparisons against
+> 537,633,163). Owed to main: the merge crate's integration tests updated by reading (`tests/increment.rs`,
+> `tests/special.rs`, `tests/chain_replay.rs`) and the server's suites. Bug record:
+> `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`.
+
+> **A metadata change to a file replaced after a work's base, and a rename of a replaced symlink or hard link: found
+> open (2026-11-19, A-612's sweep, reading only; §4.16 "The verdict": "delete against modify in either direction",
+> "rename against rename").** A-612 refuses a work's content edit or rename of a file replaced after its base
+> (`Green::file_removed`), but two siblings were seen by reading and not changed. (1) A work's `SetMode`,
+> `SetXattr` or `RemoveXattr` on a path whose file was replaced after its base is judged only by that dimension's own
+> last change (`mode_changed`, `xattr_changed`), so it may land on the file that took the old one's place. (2) A rename
+> whose source is a symlink or a hard link that was removed and made again (or renamed onto) after the work's base
+> moves the new one, since `file_removed` records regular files. Owed: a failing test of each, then the same rule:
+> refused `DeleteModify` (metadata) and `RenameRename` (a link's rename) when the path's node was replaced after the
+> base, recorded for every kind a path can name.
+
+> **A chain entry's encoding scans every op of the increment for each splice: found open (2026-11-19, A-621's reading,
+> g267; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` records a splice "as declared" when its ops
+> are the increment's for that path, which `declared_ops` finds by filtering every op of the increment by its path's
+> name; `take_applied` does the same on decode. A version that splices many existing files pays O(splices × ops):
+> about 50,000 splices of a 100,000-op increment is 5 × 10⁹ path lookups and string compares, on the owner's commit
+> path and every holder's replay. A first push is untouched: its files are created (`Created`, ops recorded whole).
+> Owed: group the increment's content ops by path once per entry (one pass), a failing cost test first (a counter of
+> ops visited, against the splices times the ops).
+
 > **An edit after a rename was accepted and lost: fixed (2026-11-19, A-547, g225; found by perf, 2026-11-09, §4.16
 > "Composition at seal").** The verdict now maps the destination's ops through what changed the source since the work's
 > base and splices them into the bytes the rename moves (`Green::edits_after_rename`; an edit meeting such a change is

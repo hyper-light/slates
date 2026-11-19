@@ -53,7 +53,7 @@ impl Work {
   }
 
   fn name(&mut self, text: &str) -> u64 {
-    u64::from(self.doc.paths.intern(text))
+    self.doc.paths.intern(text)
   }
 
   fn stash(&mut self, bytes: &[u8]) -> u64 {
