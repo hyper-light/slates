@@ -202,11 +202,12 @@ mod vcs_http;
 mod vcs_ssh;
 // The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
 // tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
-// from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654).
+// from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654), and
+// its Mercurial import (A-675) none until the verb that asks for one (its piece).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_store;
-// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). No caller
-// outside tests until the daemon imports a repository's directory (its piece).
+// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). Its caller is
+// the store map's import (`vcs_store::hg_import`, A-675), which has none outside tests until its verb.
 #[cfg_attr(not(test), allow(dead_code))]
 mod hg_base;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
