@@ -9,8 +9,9 @@
 //! "Position mapping"), so after each work of a stack lands the green must hold what that replica holds, and a work must
 //! land exactly where the replica's lands. A bottom the green refuses is one some work in between meets, so the replica
 //! of the bottom refuses one of those. Where every work in between lands in the replica, that is all the oracle needs,
-//! and it requires it. Where one does not, the replica is no reference, and the stack goes unchecked from that level
-//! up (counted): the verdict depends on order there. Two works inserting at two points land one after the other, and a
+//! and it requires it. Where one does not, each must still land alone over the stack's works below (a refusal alone
+//! is a pair the verdict judges in one order only, A-668's kind); then the replica is no reference, and the stack goes
+//! unchecked from that level up (counted): the verdict depends on order there. Two works inserting at two points land one after the other, and a
 //! stack's work deleting the bytes between them lands after both; in the replica the delete lands first, the two
 //! points become one, and the second insert meets the first. Neither answer is wrong for its order, and the green's
 //! order is the one it was given. Every byte a generated work adds is fresh, so no two works ever make the same
@@ -391,6 +392,11 @@ impl History {
     let (replica, between, landed) = stack.replay(replica, level)?;
     match outcome {
       Landed::Accepted { .. } if !between => {
+        prop_assert!(
+          stack.each_alone(self, level)?,
+          "the green landed level {} where a work between is refused alone over the levels below it",
+          level
+        );
         census.collapsed += 1;
         Ok(false)
       }
@@ -426,6 +432,11 @@ impl History {
         Ok(false)
       }
       Landed::Conflict { .. } if !between => {
+        prop_assert!(
+          stack.each_alone(self, level)?,
+          "the green landed below level {} where a work between is refused alone over those levels",
+          level
+        );
         census.collapsed += 1;
         Ok(false)
       }
@@ -475,6 +486,24 @@ struct Stack<'a> {
 }
 
 impl Stack<'_> {
+  /// Whether each work between lands alone over the stack's works below `level` (the bottom, for the bottom) in a
+  /// replica of the green before the stack. Where the replica refused one of them with the others there, a refusal alone
+  /// means it meets a work of the stack that the green landed, which is no order the verdict depends on but a pair it
+  /// judges in one order only; a landing alone means the works between met one another (module docs).
+  fn each_alone(&self, history: &History, level: usize) -> Result<bool, TestCaseError> {
+    for work in self.between {
+      let mut green = history.replica(self.prefix)?;
+      for below in self.works.get(..level.max(1)).unwrap_or_default() {
+        let outcome = green.submit(below);
+        prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+      }
+      if !matches!(green.submit(work), Outcome::Accepted { .. }) {
+        return Ok(false);
+      }
+    }
+    Ok(true)
+  }
+
   /// The replica of the work at `level` (module docs): the green, whether every work between landed there, and whether
   /// the work at `level` did. For the bottom: the bottom, then the works between. For an upper: the works below it, the
   /// works between, then it.

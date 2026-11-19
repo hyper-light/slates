@@ -11367,6 +11367,15 @@ checkpoint is the green's state at its reachable floor, and a base below it is r
 names one.) A holder's replica folds where its owner's engine had folded when it made the merge record the holder
 holds (the record names the floor), so no replica keeps more history than its owner (A-385).
 
+> **Status (2026-11-19, A-668: two inserts at one point meet in both orders).** A delta's operations are walked in
+> order and the walk stops at the first one lying past the range: one starting after the range's end, or at its end
+> for a range that is not a point. A point (an insert's empty range) is not passed by an operation starting at it, which
+> lies after it without shifting it, so the walk goes on and meets an insert at the point that canonical order puts
+> behind an overwrite or a truncate there (`crate::map::lies_past`). Until A-668 it stopped at that overwrite or
+> truncate, and a work's insert landed after one that overwrote or truncated and inserted at its point was accepted
+> ahead of both, while the other order conflicted: two inserts at one point, which D-27 makes a conflict in both orders
+> (`docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`).
+
 **The verdict, two pure passes.** Inputs: the mapped increment, the effect ranges of the
 intervening deltas, and the referenced immutable content. Pass one: a sweep line over the
 increment's ranges and the intervening effect ranges per path, O((n+m) log(n+m)); disjoint
@@ -46955,3 +46964,33 @@ Applied in the same change to:
 - **Applied in the same change to:** §4.17.1's "Works over works" status and shared piece 5's text; GAPS' §4.17 entry;
   `crates/merge/src/engine/stack.rs` and `stack/{moved,levels,judge,tree}.rs` with `stack/{tests,oracle,tree_tests}.rs`
   (new); `crates/merge/src/engine.rs` (the module's two lines).
+
+### A-668 — Two inserts at one point conflict in both orders: the walk through a delta goes on past an operation starting at a point (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.16 "Position mapping" and "The verdict"; D-27; found by A-659)
+
+- **What was wrong.** Two works insert at one point, each based before the other, and one also overwrites the bytes
+  from that point or truncates from it. Canonical order puts the overwrite or the truncate before the insert at one
+  offset (`OpsDoc::canonicalize`), and the walk through a delta (`crate::map::map_through_one`) stopped at the first
+  operation starting at or after a range's end. A point's end is its start, so the walk stopped at the overwrite or the
+  truncate and never met the insert behind it: the work landed second was accepted ahead of both, while in the other
+  order the two inserts met and conflicted. A-659 found it: its restatement takes the verdict's walk for both sides of
+  every pair of operations, and here the two sides disagreed.
+- **The decision** (main's, from D-27): a conflict in both orders. Accepting one insert ahead of the other chooses an
+  order, which is an inferred merge.
+- **The change.** `crate::map::lies_past(at, range)`: an operation lies past a range when it starts after the range's
+  end, or at its end for a range that is not a point. `map_through_one` stops only there, so a point walks on past an
+  overwrite or a truncate starting at it, which lie after it without shifting it, and meets an insert behind them. A
+  non-empty range is walked as before. Every reader of the walk takes it: the verdict's content, a rename's edits
+  (A-547), a rebase, pass two's point, a review comment's lines (never a point, so unchanged), and A-659's restatement,
+  whose moved walk counts an operation starting at a point as after it (`Meets::Beside`).
+- **Tests.** `crates/merge/src/map/tests.rs`: the point meets an insert behind an overwrite and behind a truncate at
+  it, and one in front of an overwrite; an overwrite alone, or one with an insert past it, leaves the point where it
+  was; at the verdict, an insert against an overwrite-then-insert and against a truncate-then-insert at one point, each
+  landed first in turn, conflict in all four. A-659's stack oracle generates the shape (an overwrite or a truncate, then
+  an insert, at one offset), which it had avoided, and now requires a work between that a replica refuses to land alone
+  over the stack's works below it, so a pair judged in one order only fails the oracle rather than passing as an order
+  the verdict depends on.
+- **Evidence.** EVIDENCE-PENDING (Windows x86_64, jupiter; the macOS run owed).
+- **Applied in the same change to:** §4.16 "Position mapping" (the status); GAPS (A-668's entry beside A-612's, and
+  A-659's paragraph); `crates/merge/src/map.rs`, `map/tests.rs` (new), `engine/stack/moved.rs`,
+  `engine/stack/oracle.rs`; `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md` (new).
+

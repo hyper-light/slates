@@ -138,10 +138,8 @@
 > over its lower and restated as it lands; the lower's base held as a live reader of the fold floor while an upper over
 > it is unlanded); the whole-file identity check for an upper's length-changing operation that meets a change (refused
 > today); a copy in a stack; a stack whose bottom is a tree; clippy, `xtask` and the lint matrix over the change
-> (main's, run requests). **Finding, registered as A-668 (landing next):** the verdict's walk stops at the first delta
-> operation starting at or after a range's end, so a work's insert at an offset where the delta overwrites or truncates
-> and inserts too is accepted before both, while the two works in the other order conflict as two inserts at one
-> point; D-27 makes them a conflict in both orders.
+> (main's, run requests). The verdict's walk that met two inserts at one point in one order only, which A-659 found,
+> is fixed by A-668 (below, with A-612's).
 > **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
 > BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
 > no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held
@@ -2557,6 +2555,19 @@
 > a shorter truncate conflicts; the same truncate identical). Red on the Mac Studio with the fix reversed (kiln r613:
 > the file `<1>\n` each time), green with it (43 of 43). A-596's oracle bases truncating works behind the head again.
 > Bug record: `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
+
+> **Two inserts at one point conflicted in one order only: fixed (2026-11-19, A-668, g306; found by A-659's
+> restatement; §4.16 "Position mapping", "The verdict"; D-27).** Two works insert at one point, each based before the
+> other, one of them also overwriting the bytes from that point or truncating from it. Landed first, that one made the
+> plain insert accepted ahead of both its changes; landed second, the two conflicted as inserts at one point. The walk
+> through a delta (`crate::map::map_through_one`) stopped at the first operation starting at or after a range's end,
+> and a point's end is its start, so canonical order (overwrite and truncate before insert at one offset) hid the
+> insert behind it. D-27 decides it: a conflict in both orders, since accepting one ahead of the other chooses an order.
+> Now the walk stops at an operation starting after the range's end, or at its end for a range that is not a point
+> (`crate::map::lies_past`), and A-659's restatement walks the same way. Tests: `crates/merge/src/map/tests.rs` (the
+> point meets an insert behind an overwrite and behind a truncate at it; both orders conflict at the verdict); A-659's
+> stack oracle generates the shape, and a work between that a replica refuses must still land alone over the stack's
+> works below. EVIDENCE-PENDING. Bug record: `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
 
 > **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
 > A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name
