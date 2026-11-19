@@ -650,27 +650,56 @@ fn a_history_list_holds_every_creation_and_deletion_at_its_path() {
 fn a_replacement_by_a_copy_of_the_node_it_replaces_is_a_copy() {
   let mut index = trunk();
   let file = at(&index, "/trunk/README", 1);
-  let (file_id, file_line, file_copy, file_count) =
-    (file.id(), file.node_id(), file.copy_id(), file.predecessor_count());
+  let (file_id, file_line, file_copy, file_count) = (
+    file.id(),
+    file.node_id(),
+    file.copy_id(),
+    file.predecessor_count(),
+  );
   let second = commit(
     &mut index,
-    vec![replaced_by_copy("/trunk/README", NodeKind::File, "/trunk/README", 1)],
+    vec![replaced_by_copy(
+      "/trunk/README",
+      NodeKind::File,
+      "/trunk/README",
+      1,
+    )],
   );
-  assert_a_copy_of(&index, "/trunk/README", second, (file_id, file_line, file_copy, file_count));
+  assert_a_copy_of(
+    &index,
+    "/trunk/README",
+    second,
+    (file_id, file_line, file_copy, file_count),
+  );
   assert_eq!(
-    index.relation(("/trunk/README", second), ("/trunk/README", 1)).unwrap(),
+    index
+      .relation(("/trunk/README", second), ("/trunk/README", 1))
+      .unwrap(),
     NodeRelation::CommonAncestor
   );
   let directory = at(&index, "/trunk", second);
-  let replaced = (directory.id(), directory.node_id(), directory.copy_id(), directory.predecessor_count());
+  let replaced = (
+    directory.id(),
+    directory.node_id(),
+    directory.copy_id(),
+    directory.predecessor_count(),
+  );
   let a_c = at(&index, "/trunk/lib/a.c", second).id();
   let third = commit(
     &mut index,
-    vec![replaced_by_copy("/trunk", NodeKind::Directory, "/trunk", second)],
+    vec![replaced_by_copy(
+      "/trunk",
+      NodeKind::Directory,
+      "/trunk",
+      second,
+    )],
   );
   assert_a_copy_of(&index, "/trunk", third, replaced);
   assert_eq!(at(&index, "/trunk/lib/a.c", third).id(), a_c);
-  assert_eq!(revisions(index.history("/trunk/README").unwrap()), [1, second]);
+  assert_eq!(
+    revisions(index.history("/trunk/README").unwrap()),
+    [1, second]
+  );
 }
 
 /// The node at `path` in `revision` is a copy made in that revision of the node-revision `replaced` names (its id, node

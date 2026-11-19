@@ -274,7 +274,10 @@ fn a_replacement_by_a_copy_of_the_node_it_replaces_imports_and_round_trips() {
   let changes = youngest_changes(&repository);
   assert_eq!(actions(&changes), vec![("/f", Action::Replace)]);
   assert_eq!(
-    changes[0].copy_from.as_ref().map(|source| (source.path.as_str(), source.revision)),
+    changes[0]
+      .copy_from
+      .as_ref()
+      .map(|source| (source.path.as_str(), source.revision)),
     Some(("/f", 1))
   );
   same_history_through_its_export(&repository);
