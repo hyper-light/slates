@@ -53,7 +53,7 @@ use crate::vcs_policy::{self, Right};
 mod receive;
 mod upload;
 
-pub(crate) use receive::{ReceiveServices, ThisShard};
+pub(crate) use receive::{ReceiveServices, ShardLender, ThisShard};
 pub(crate) use upload::{StoreLender, UploadServices};
 
 /// What a request's credential proved (§4.13; A-625 part 3): its principal, and the expiry an LFS action carries.

@@ -72,11 +72,12 @@
 //! recording nothing; `atomic` all or none, at the verdict and at the append, and a push without it a ref at a time. A
 //! protected name's linear history and signed commits are A-644 part 2's own tests (`git_protect/tests.rs`).
 //!
-//! **Called by** the HTTP site's receive-pack (`vcs_http::git`'s `receive`, A-654 part 3). **Owed** (GAPS' §4.17
-//! entry): the SSH channel's call (g294); the hooks run over A-665 part 2's view; a push based on an older version (A-664); a principal the policy allows who is
-//! not the repository's owner, whom A-635's append refuses `Forbidden` until its owner check gives way to the policy;
-//! push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (item
-//! 8); a tag of a tag.
+//! **Called by** the HTTP site's receive-pack (`vcs_http::git`'s `receive`, A-654 part 3) and the SSH site's
+//! (`vcs_ssh`'s `receive`, A-683), each lending the owner shard's state a step at a time through one seam
+//! (`vcs_http::git`'s `ShardLender`). **Owed** (GAPS' §4.17 entry): the hooks run over A-665 part 2's view; a push
+//! based on an older version (A-664); a principal the policy allows who is not the repository's owner, whom A-635's
+//! append refuses `Forbidden` until its owner check gives way to the policy; push options; review requests
+//! (`refs/for/`); the new versions' pack fragments encoded off the answer's path (item 8); a tag of a tag.
 
 use core::convert::Infallible;
 
@@ -110,7 +111,7 @@ use crate::vcs_store::{GitPush, GitRefused, GitStore, SealedPush, Target, green_
 use crate::verbs::to_wire_volume;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Format: the agent receive-pack advertises (`agent=`), the name upload-pack gives this server too (A-640).
 const AGENT: &[u8] = slates_git::upload::AGENT.as_bytes();

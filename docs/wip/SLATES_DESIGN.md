@@ -13110,8 +13110,9 @@ engine: the verdict, rebase, position mapping, the register).
 > all in one under `atomic`), and writes git's report. A ref's base is its green's head alone, held at the append by
 > compare and swap, until A-664's server-made commits; a create is made at its first parent's version, or from the
 > default branch's empty green while that branch is unborn. Six pushes stock git 2.50.1 made are answered with git's
-> bytes. Owed: the edges' calls, the hooks' runs, older bases (A-664), the policy's principals other than the owner at
-> A-635's append, push options, review requests, the new versions' fragments off the answer's path.
+> bytes. Owed: the hooks' runs, older bases (A-664), the policy's principals other than the owner at A-635's append,
+> push options, review requests, the new versions' fragments off the answer's path. Both edges call it: the HTTP
+> site (A-654 part 3) and the SSH site (A-683).
 >
 > **Status (2026-11-19, A-654 part 3: receive-pack on git's HTTP site).** `crates/server` (`vcs_http::git::receive`)
 > serves `git-receive-pack` through the push driver: the advertisement on `GET info/refs` (the site's `# service=`
@@ -13122,8 +13123,21 @@ engine: the verdict, rebase, position mapping, the register).
 > lent, receive-pack's `ReceiveServices`). A step that fails before any reply is answered with a status (`400`, `413`,
 > `404`, `500`, `503`); a command's own refusal is the report's, `200`. Proven end to end: stock git 2.50.1's `create`
 > push posted over loopback TLS to a two-shard daemon is answered with git's very report and `main` advertised at its
-> commit after, and a delete under a policy denying it refused `deletion prohibited`. Owed: the SSH channel's call
-> (g294); the live `git push` over HTTPS with stock git's binary (main's run).
+> commit after, and a delete under a policy denying it refused `deletion prohibited`. Owed: the live `git push` over
+> HTTPS with stock git's binary (main's run). The SSH site's call is A-683's (below).
+>
+> **Status (2026-11-19, A-683: git's receive-pack on the SSH edge).** `crates/server` (`vcs_ssh::receive`) runs the
+> push driver for the SSH site's `git-receive-pack '<repo>'`: `ToolServices` starts it for a repository the site found
+> on the connection's shard, with no store lender (the driver reads the store the shard holds, A-662), and each step is
+> lent the shard's state afresh through the HTTP site's seam (`ShardLender`; in the daemon `ThisShard`, over
+> `with_state`), so a push holds nothing of its shard across the edge's awaits. The advertisement is written as the
+> command starts, after `version 1` for a v1 client, a v2 client answered at v0 as git's receive-pack answers one; the
+> client's bytes go to the driver as they arrive; the checked push is answered with git's report and exit 0, a flush
+> alone, a push of nothing, with nothing; a refusal ends the session in git's `die` words with 128, a shard not lent in
+> the site's not-served words. Stock git 2.50.1's `create` push, sent over a real SSH session to the production site on
+> an audit daemon's shard, is answered with git's bytes, and `main` holds its tree. Owed: moving a connection to its
+> repository's owner shard, as the HTTP edge moves one (with the daemon's start of the SSH edge, A-684), and a live
+> `git push` over SSH with stock git's binary (main's run).
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -51143,3 +51157,69 @@ lent with the request's room and `file_node` gone, the changegroup lending each 
   panics on arbitrary bytes.
 - **Owed.** The view handed to the daemon's HTTP site over A-662's stores, and the site's pushes through `hg_push`
   (A-680 part 2); the other platforms' runs (main's).
+
+### A-683 — git's receive-pack on the SSH edge (2026-11-19, g302, UI goal 93; §4.17.2 "A push" items 1 to 7 and "Transports" item 2; A-651, A-654 parts 2 and 3, A-662)
+
+- **What was there.** A-654 part 2's driver (`git_push::ReceivePack`: `start`, `input`, `end`, `answer`, each one step
+  on the owner shard) had one caller, the HTTP site (A-654 part 3: `vcs_http::git`'s `receive`, each step lent the
+  shard's state through its `ShardLender`, `ThisShard` in the daemon). The SSH site's services (`ToolServices`, A-651
+  part 2) ran upload-pack alone and answered `git-receive-pack` `fatal: git-receive-pack is not served yet` with 128.
+- **The decision.** (1) A sans-io `Command` over the driver, `vcs_ssh::receive::ReceiveCommand`, which the services
+  start for `git-receive-pack` with no store lender: the driver reads the repository's store on its owner shard (A-662),
+  so receive-pack is served wherever the site finds the repository, while upload-pack still waits for a store lender
+  (A-682). The services' command is `ToolCommand`, upload or receive, each boxed, so a connection holds a pointer
+  whichever runs (clippy's `large_enum_variant` is denied, and the two commands' sizes are their own). (2) The shard is
+  lent a step at a time through the HTTP site's own seam: the command is generic over `ShardLender` (now re-exported by
+  `vcs_http::git`), and `ToolServices` carries one beside its store lender, `ThisShard` (over `with_state`) in the daemon
+  as on the HTTP site, so both edges reach a push's shard one way. A push holds nothing of the shard across the edge's
+  awaits, the driver stays outside each lend, and a state not lent (no state on the thread, the shard fenced, its state
+  lent already) is refused in the site's not-served words, where the HTTP site answers `503`. A first draft (7f2c9c791)
+  borrowed the state through `with_state_counted` directly; the seam replaced it before landing, so one rule holds for
+  both edges and a test lends the state it holds. (3) The session as git v2.50.1's `cmd_receive_pack` runs it over SSH
+  (`builtin/receive-pack.c` lines 2558-2649, the copy §5.9 of `research/vcs-servers.md` pins, sha256
+  `6e3cec699acf968d…`): the advertisement first, after `version 1` for a v1 client (line 2571), a v2 client answered at
+  v0 ("push support for protocol v2 has not been implemented yet, so ignore the request to use v2 and fallback to using
+  v0"); exit 0 whatever each command's outcome (the report says a refusal; line 2649 returns 0), and a flush alone
+  answered with nothing (no command read, so no report). (4) Each step hands the driver every byte held, a channel's
+  window at most, and the window is given back; a command that finds input already held when it has advertised steps
+  again at once, since a client may send its request before it reads the advertisement and would otherwise wait on a
+  command that waits on it. (5) Refusals end the session in git's `die` words with 128: a repository gone since the site
+  found it as git's own after `enter_repo` (line 2547); a store not held, and a shard not lent, as the site's
+  not-served; a policy git's matcher cannot read as the site's; an exchange in git's own words where git dies with fixed
+  ones (`pkt-line.c` at v2.50.1, sha256 `a8a3cf58e3026ddd…`, lines 158, 371, 433, 450 and 458; `receive-pack.c` lines
+  2052, 2111, 2143 and 2164), without the bytes git quotes after some, which the driver has read and the command no
+  longer holds, and in slates' words where git has none (a push past its room, refused memory). A refusal sends nothing
+  of the command's own output: the edge drops the command with what it had not sent, so a v1 client refused at the start
+  reads no `version 1` line, as git dies before writing one.
+- **Tests** (`crates/server/src/vcs_ssh/tests/receive.rs`, a child of the edge's serve tests over their SSH client): on
+  an audit daemon's shard, an empty git repository and the SSH edge served with the production site (`ToolSite` over
+  `ShardRepositories` and `ToolServices` with `ThisShard`); the owner's key runs `git-receive-pack '/pushed'` and sends
+  stock git 2.50.1's `create` push (`make-push-fixtures.sh`) 97 bytes at a time before reading the advertisement:
+  standard output the driver's advertisement and then the very report `git receive-pack` wrote, nothing on standard
+  error, exit 0, EOF and close in order, the connection ended, and `main` holding the fixture's first text; then three
+  sessions asking v0, v1 and v2, each sending a flush alone: each exits 0 after the advertisement, `version 1` before it
+  for v1 alone, nothing after it, nothing landed. Two refusals before a push starts, driving the command's first step: a
+  lender that lends no state (`fatal: git-receive-pack is not served yet`, 128), and on an audit daemon's shard, its
+  state lent, a repository its partition does not hold (`fatal: 'gone' does not appear to be a git repository`, 128).
+  The services' own test now starts receive-pack over a held and an unheld store alike.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Linux and Windows runs owed to main). Red first
+  (954ed792e on agents/g302-ssh-receive-red, over main 2410011da, kiln r163): `cargo test --locked -p slates-server
+  --lib -- vcs_ssh git_push --test-threads=4` 28 passed and the 2 new failed, each session answered
+  `fatal: git-receive-pack is not served yet` with 128 where the advertisement was expected; fmt clean. The first draft
+  (7f2c9c791, r187): 30 of 30. The seam over main b94ae6e90 (a00f47d7c on agents/g302-ssh-receive-land, kiln r286):
+  `cargo test --locked -p slates-server --lib -- vcs_ssh git_push vcs_http --test-threads=4` 74 of 74, the four A-683
+  tests, the services' test, the driver's three and the HTTP site's daemon push among them; `cargo fmt -p slates-server
+  -- --check` clean. The landed tree, merged over main 770ae8826, whose A-651 part 3 changed the SSH site and its
+  tests' harness (0041eb501, tree 16f4e16ff, kiln r313): the same filters 77 of 77, fmt clean. No integration target
+  reaches either edge's receive-pack: the daemon does not start the SSH edge yet (A-684), and the HTTP site's push test
+  is a lib test.
+- **Owed.** Moving a connection to the shard its repository's name routes to, as the HTTP edge moves one (with the
+  daemon's start of the SSH edge, A-684); main's live stock `git push` over SSH; every item A-654 part 2 owes (the
+  hooks, older bases, the policy's principals other than the owner at the append, push options, review requests).
+- **Applied in the same change to:** `crates/server/src/vcs_ssh/receive.rs` (new), `vcs_ssh/site.rs`
+  (`ToolServices` with its shard lender, `ToolCommand`, the module docs' step 3), `vcs_ssh.rs` (the module and its owed
+  list), `vcs_ssh/tests/receive.rs` (new), `vcs_ssh/tests/serve.rs` (its child), `vcs_ssh/tests/git.rs` (the services'
+  test), `vcs_http/git.rs` (`ShardLender` re-exported), `vcs_http/git/receive.rs` (the trait's doc names its SSH
+  caller), `git_push.rs` (its tests crate-visible; its callers), `git_push/tests.rs` (the fixtures crate-visible),
+  `vcs_http.rs` (`daemon_edge` crate-visible), `lib.rs` (the modules' notes); §4.17.2's status (A-654 part 2's and
+  part 3's owed calls, A-683's status); GAPS (A-654's entry, the A-683 entry).

@@ -18,6 +18,10 @@ use super::waits::PHASES;
 use super::{Bounds, Counts, EdgeState, serve};
 use crate::daemon::LIVENESS_BUDGET_NS;
 
+/// A-683: git's receive-pack over this edge, through these tests' client (`receive.rs`).
+#[path = "receive.rs"]
+mod receive;
+
 /// Shape: one seat: the edge of a shard that seats one client.
 const ONE_SEAT: usize = 1;
 /// Shape: two seats: a connection, and the one that needs the other's seat.
