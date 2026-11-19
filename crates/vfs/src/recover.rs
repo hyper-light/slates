@@ -2772,12 +2772,17 @@ impl Volume {
           .ok_or(VfsError::RecoveryIncomplete)?;
         Ok((source_root, kind_image(store.inodes.get(handle)?.kind)))
       }
+      // The head's table, rebuilt first, holds every number the head holds. For a clone that includes the records it
+      // still shares with its origin, which its image carries by number alone (`origin_shared`, A-64), so they have no
+      // image among the head's own; a snapshot of the clone that holds one shares it with the head all the same. So the
+      // entry resolves through the table, as an origin's does, and its kind is the inode's (A-561).
       SharedSource::Head => {
-        let image = refs
-          .head_images
-          .get(&entry.number)
+        let handle = trie::get(&store.tries, refs.head_inode_root, InodeNo(entry.number))
           .ok_or(VfsError::RecoveryIncomplete)?;
-        Ok((refs.head_inode_root, image.kind))
+        Ok((
+          refs.head_inode_root,
+          kind_image(store.inodes.get(handle)?.kind),
+        ))
       }
       SharedSource::Snapshot { at } => {
         let image = refs
@@ -2856,8 +2861,8 @@ impl Volume {
     }
     // The tree's entries (§4.2's namespace dimension, A-549), by the rule the live count keeps: each name its own
     // directories' images carry that names a child, and each live entry of a directory it shares with the head, whose
-    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which takes a whiteout as an entry and
-    // which the caller sets the head's count back over.
+    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which the caller sets the head's count
+    // back over.
     let mut entries = snap
       .inodes
       .iter()

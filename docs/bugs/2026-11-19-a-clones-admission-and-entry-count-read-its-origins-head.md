@@ -77,7 +77,8 @@ Evidence, all on the Mac Studio on 2026-11-19:
 
 ## Siblings (the sweep: what else takes a clone's or a volume's counts from the wrong state)
 
-- **Open, found by this change's restart test (A-561):** a restart refused any clone holding a snapshot while it still
+- **Fixed since by A-561 (2026-11-19, `2026-11-19-a-restart-refused-a-clone-holding-its-own-snapshot.md`), found by
+  this change's restart test:** a restart refused any clone holding a snapshot while it still
   shared a file with its origin (`Volume::clone_from_image` answered `RecoveryIncomplete`). The clone's snapshot marks
   such a file shared with the head (`capture_snapshot_tree`). Recovery resolves a head-shared entry only through the
   images of the head's own inodes (`shared_source`), and the file is not among them: the clone's image lists it with
@@ -87,7 +88,8 @@ Evidence, all on the Mac Studio on 2026-11-19:
   admission (`admit_dimensions`) and a restart set both. The clone's namespace dimension is unbounded until a restart.
 - **Open:** a resize moves the inode allowance with the new policy (`resize`) but leaves the entry allowance at the size
   the volume was made with.
-- **Open, found by reading, not tested:** recovery counts a whiteout as a live entry. `rebuild_entries` re-inserts an
+- **Fixed since by A-572 (2026-11-19, `2026-11-19-a-restart-counted-whiteouts-as-live-entries.md`), found by
+  reading:** recovery counts a whiteout as a live entry. `rebuild_entries` re-inserts an
   image entry that names no child as `Child::Whiteout` through `dir_insert`, which counts it. The live count and
   `live_len` never count one. A restarted overlay with whiteouts therefore counts each whiteout in its head's count and
   in a clone head's own directories, and its entry allowance's floor at the restart is raised by as many.

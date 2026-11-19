@@ -414,9 +414,14 @@ fn home_redirect(
 /// Route bootstrap to the sole shard that drives consensus. The bounded call owns its reply
 /// registration through cancellation; an unavailable shard cannot produce a successful bootstrap. Each call (the
 /// operation on the control shard, then its publication on every other) is waited for in its target's own time
-/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is refused `Overloaded` after a
-/// window with no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the
-/// wall second while the bootstrap went on).
+/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is given up after a window with
+/// no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the wall second
+/// while the bootstrap went on). `Overloaded` answers only an operation that has not run: one whose task this shard
+/// could not spawn, or whose control shard refused it or was given up before it ran. A control shard wedged past the
+/// window may still run the operation when its poll ends; each of the three (`serve_consensus_control`) meets a second
+/// run as the first's outcome (a bootstrap already authorized, a recovery's receipt for its digest, a plan is a read),
+/// so the resend the refusal invites takes effect once. Once the operation ran, its answer says so
+/// ([`published_or_pending`], A-566).
 fn consensus_on_control(
   state: &ShardState,
   client_index: u32,
@@ -447,25 +452,7 @@ fn consensus_on_control(
         reply @ (ReplyBody::Acknowledged | ReplyBody::RecoveryStarted { .. }),
         publication,
         shards,
-      )) => {
-        let mut reply = reply;
-        for shard in shards.into_iter().filter(|shard| *shard != control) {
-          let publication = publication.clone();
-          if crate::xshard::call_in_shard_time(
-            origin,
-            shard,
-            move |state| publication.apply(state),
-            crate::daemon::LIVENESS_BUDGET_NS,
-          )
-          .await
-          .is_none()
-          {
-            reply = refused(Refusal::Overloaded { shard });
-            break;
-          }
-        }
-        reply
-      }
+      )) => published_or_pending(origin, control, reply, (publication, shards)).await,
       Some((reply, _, _)) => reply,
       None => refused(Refusal::Overloaded { shard: control }),
     };
@@ -477,6 +464,38 @@ fn consensus_on_control(
   // Freshly admitted on the current shard; no await can retire its slot before detach.
   let _ = slates_rt::futures::detach(task);
   Served::Forwarded
+}
+
+/// The answer of a consensus operation that ran on the control shard, `reply`, once its `publication` has gone to every
+/// other shard of `shards` (§4.8): `reply` when each applied it, each waited for in its own time
+/// (`xshard::call_in_shard_time`). When one did not, `DurabilityPending`, with how long it waited since the operation's
+/// answer: the operation ran and stands on the control shard but is not yet where its answer waits for it, and that is
+/// the request's recorded outcome, so a resend under its id meets it and the operation runs again only under a new id,
+/// whose run publishes again. Until A-566 this was `Overloaded`, which says the operation did not start: left
+/// unrecorded since A-563, its resend ran the operation a second time.
+async fn published_or_pending(
+  origin: u16,
+  control: u16,
+  reply: ReplyBody,
+  (publication, shards): (crate::consensus::Publication, Vec<u16>),
+) -> ReplyBody {
+  let answered_ns = slates_machine::clock::monotonic_ns();
+  for shard in shards.into_iter().filter(|shard| *shard != control) {
+    let publication = publication.clone();
+    if crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| publication.apply(state),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .is_none()
+    {
+      let held_ns = slates_machine::clock::monotonic_ns().saturating_sub(answered_ns);
+      return refused(Refusal::DurabilityPending { held_ns });
+    }
+  }
+  reply
 }
 
 /// Routes an operator's `PromoteRegion` to the **control shard**, where the root group is driven (§4.8, D-14 —
@@ -1878,24 +1897,27 @@ fn route_after(
   None
 }
 
-/// Holds a verb on a volume this node owns but has not materialized while its materialization is pending, polled at
-/// the heartbeat, for at most one liveness budget. The client waits for such a verb while its daemon lives
-/// (`defers_reply`), and the refusal that follows meets the materialized volume on the client's retry. Answered at
-/// once before 2026-10-07: a client that retried without a pause was refused 2.8 million times in 400 s while the
-/// successor restored a volume. Ends early once the materialization is no longer pending, done or dropped.
+/// Holds a verb on a volume this node owns but has not materialized until that materialization ends: made, given up
+/// (past the failover SLO's worth of attempts without progress, `fleet::materialize_pending`) or its volume tombstoned,
+/// each of which removes its pending entry and wakes the verbs waiting on it
+/// (`state::PendingMaterializations::remove`, A-548). The client waits for such a verb while its daemon lives
+/// (`defers_reply`), and the refusal that follows meets the materialized volume on the client's retry. No timer: until
+/// A-548 the wait looked at the map each heartbeat and gave up at one liveness window, so a materialization slower
+/// than that sent its client a refusal, and a retry, every second for nothing. Answered at once before 2026-10-07: a
+/// client that retried without a pause was refused 2.8 million times in 400 s while the successor restored a volume.
+/// Ends at once for a volume no longer pending, and at the shard's stop (its state out of reach).
 async fn await_materialization(object: ObjectId) {
-  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
-  while crate::state::with_state(|state| state.pending_materializations.contains_key(&object))
-    .unwrap_or(false)
-    && slates_rt::futures::now_ns() < deadline
-  {
-    if slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
-      .await
-      .is_err()
-    {
-      return;
+  std::future::poll_fn(|cx| {
+    match crate::state::with_state_counted(|state| {
+      state
+        .pending_materializations
+        .wait_for_end(object, cx.waker())
+    }) {
+      Some(false) => std::task::Poll::Pending,
+      Some(true) | None => std::task::Poll::Ready(()),
     }
-  }
+  })
+  .await;
 }
 
 /// The status count of a request for a work no member owns, sent to its green's owner by the work's catalog record this
@@ -9690,7 +9712,7 @@ pub(crate) fn owner_sizes(
     engine
       .file_lens_at(version)
       .into_iter()
-      .map(|(path, len)| (path.to_owned(), u64::try_from(len).unwrap_or(u64::MAX)))
+      .map(|(path, len)| (path, u64::try_from(len).unwrap_or(u64::MAX)))
       .collect(),
   );
   fetched
@@ -12125,13 +12147,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
   any || releasing
 }
 
-/// Derived: a destroy whose completion record was refused is tried again the shard's window after `now` (A-455's
-/// window over the scheduler overrun this shard measured): no sooner than a pass of the refusing condition could
-/// change, and kept by the deadline keeper, never a tick (A-536).
+/// Derived: a destroy whose completion record was refused is tried again the retry window after `now`
+/// (`deadlines::retry_window_ns`, A-455's window over the scheduler overrun this shard measured): no sooner than a pass
+/// of the refusing condition could change, and kept by the deadline keeper, never a tick (A-536).
 fn retry_destroy_at_window(state: &mut ShardState, now: u64) {
-  let at = now.saturating_add(crate::watchdog::watch_window_ns(
-    slates_rt::futures::scheduler_overrun_ns(),
-  ));
+  let at = now.saturating_add(crate::deadlines::retry_window_ns());
   state.destroy_retry_at = Some(state.destroy_retry_at.map_or(at, |due| due.min(at)));
   crate::deadlines::noted(state, at);
 }
@@ -13230,6 +13250,10 @@ pub(crate) struct TakenOver<'a> {
   /// The takeover itself, kept in the volume's record (AC-8.3, A-325): the epoch the head was placed under, `sequence`,
   /// and whether the volume is rebuilt from its live log.
   pub takeover: slates_db::catalog::TakeoverRecord,
+  /// Whether this node adopts the volume by a planned move (A-291): its old owner froze it and made its live log durable
+  /// at the head it handed over, so a tree rebuilt from that log is exactly that head (A-565). `false` for a takeover
+  /// after an owner's loss, whose log may have run past its newest seal.
+  pub moved: bool,
 }
 
 /// Counter: a stale copy this node relinquished to a takeover that named it again (A-362, [`relinquish_superseded`]).
@@ -13571,7 +13595,7 @@ pub(crate) fn finish_making(
   region: Vec<u64>,
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
-  let from_live_log = taken.takeover.from_live_log;
+  let (from_live_log, moved) = (taken.takeover.from_live_log, taken.moved);
   let Some(making) = state.making_volumes.remove(&id) else {
     return Err(Box::new(refused(Refusal::NotFound)));
   };
@@ -13688,13 +13712,14 @@ pub(crate) fn finish_making(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  // What a move carried of the volume's capture comes with its catalog (A-503): the snapshot just sealed is its mark
-  // when it holds the head the capture was carried against (a move's adoption, or a takeover before the new owner wrote,
-  // since the archive's identity is the tree's). A takeover that rebuilt a later head holds none, nor one rebuilt from a
-  // live log, whose tree may have run past the seal it names, so its landings are refused rather than judged from a
-  // tree that is not the moved one.
+  // What a captured clone's head carried of its capture comes with its catalog (A-503, A-544): the snapshot just sealed is
+  // its mark when it holds the head the record was carried against (a move's adoption, or a takeover before the new owner
+  // wrote, since the archive's identity is the tree's). A takeover that rebuilt a later head holds none, nor one rebuilt
+  // from a live log after an owner's loss, whose tree may have run past the seal it names, so its landings are refused
+  // rather than judged from a tree that is not the head. A move's rebuild from the log is the head (A-565): its old owner
+  // froze the volume and made the log durable at the head it handed over before the move was reported.
   if let Some(carried) = catalog.carried.clone() {
-    let moved_head = head.manifest == Some(carried.head) && !from_live_log;
+    let moved_head = head.manifest == Some(carried.head) && (!from_live_log || moved);
     let mark = moved_head.then_some(to_db_snapshot(snapshot));
     let op = Op::CaptureAdopted {
       volume: id,
@@ -20607,6 +20632,7 @@ mod tests {
       catalog_sequence: 0,
       sequence: takeover.head_sequence,
       takeover,
+      moved: false,
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
   }
@@ -20930,6 +20956,18 @@ mod tests {
     archive: &slates_archive::Archive,
     manifest: [u8; 32],
   ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_named_as(state, id, (catalog, archive), manifest, (false, false))
+  }
+
+  /// [`take_over_named`] made as `(from_live_log, moved)` says: from a live log or a placed seal, by a planned move's
+  /// adoption or a takeover after an owner's loss.
+  fn take_over_named_as(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    (catalog, archive): (&crate::catalog::CatalogValue, &slates_archive::Archive),
+    manifest: [u8; 32],
+    (from_live_log, moved): (bool, bool),
+  ) -> Result<(), Box<super::ReplyBody>> {
     let head = crate::head::HeadValue {
       manifest: Some(manifest),
       content_holders: Vec::new(),
@@ -20943,11 +20981,148 @@ mod tests {
       takeover: slates_db::catalog::TakeoverRecord {
         epoch: 1,
         head_sequence: 1,
-        from_live_log: false,
+        from_live_log,
         past_tolerance: None,
       },
+      moved,
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// A-565. Do: materialize a live-shipped captured clone from its live log, its catalog carrying the record for the head
+  /// it adopts: once as a planned move's adoption, once as a takeover after its owner's loss. Expect: the moved one judged
+  /// against its capture (the snapshot it materialized is its mark, the carried paths as its old owner recorded them),
+  /// and the taken-over one refused by kind, never landed as a volume with no capture. A move's old owner froze the
+  /// volume and made its log durable at the head it handed over, so the rebuilt tree is that head; a takeover's log may
+  /// have run past its newest seal. Before A-565 both were refused: every tree rebuilt from a live log held no mark.
+  #[test]
+  fn a565_a_moved_live_clone_rebuilt_from_its_log_is_marked_and_a_taken_over_one_is_not() {
+    crate::daemon::audit_on_shard(|state| {
+      let chunk = slates_archive::Archive::raw_chunk(b"LIVE".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: chunk.identity,
+          chunk_offset: 0,
+        }],
+        vec![chunk],
+      );
+      let head = [0x5e; 32];
+      let carried = slates_vfs::captured::CarriedCapture {
+        entries: vec![slates_vfs::captured::CarriedPath {
+          path: "/made.rs".to_owned(),
+          state: slates_vfs::captured::CapturedState::Absent,
+        }],
+      };
+      let live_clone = |name: &str| crate::catalog::CatalogValue {
+        carried: Some(slates_db::catalog::CarriedRecord {
+          head,
+          entries: slates_wire::Wire::to_bytes(&carried),
+        }),
+        live_shipped: true,
+        ..takeover_catalog(name, 1 << 20)
+      };
+      let moved = slates_db::catalog::VolumeId { bytes: [0xa5; 16] };
+      let catalog = live_clone("a565-moved");
+      take_over_named_as(state, moved, (&catalog, &archive), head, (true, true)).unwrap();
+      match crate::landing::capture_of(state, moved) {
+        Ok(Some(slates_vfs::captured::CaptureBase::Carried { carried: got, .. })) => {
+          assert_eq!(got, carried, "the moved clone lands against its capture")
+        }
+        other => panic!("the move's new owner holds no mark for the head it rebuilt: {other:?}"),
+      }
+      let taken = slates_db::catalog::VolumeId { bytes: [0xa6; 16] };
+      let catalog = live_clone("a565-taken");
+      take_over_named_as(state, taken, (&catalog, &archive), head, (true, false)).unwrap();
+      assert!(
+        matches!(
+          crate::landing::capture_of(state, taken),
+          Err(Refusal::Unsupported { .. })
+        ),
+        "a takeover's rebuild from a live log that may have run past its seal is refused by kind"
+      );
+    });
+  }
+
+  /// The open bug `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, filed with A-565, red
+  /// until fixed. Do: on a shard, make a volume, ship it live, snapshot it and clone the snapshot (the clone is
+  /// live-shipped as its origin is), give the clone's log the state it holds before any of it reaches a holder (`f = 1`,
+  /// its first whole entry owed), and ask what the Clone's reply waits for. Expect the clone's first whole entry, position
+  /// 0: a verb on a live volume answers once what it published is durable on `f` candidates (A-200). Today the reply
+  /// waits on the verb's own volume, the origin, whose log the Clone did not change, so a Clone answers while nothing of
+  /// the clone is held anywhere else; its owner lost then, the successor finds no log and no seal of it and serves it
+  /// empty.
+  #[test]
+  #[ignore = "open bug docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md: red until fixed"]
+  fn a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable() {
+    let (waits, clone) = crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::Created { id: origin } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "live-origin".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the origin was created")
+      };
+      let shipped = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::LiveShip {
+          volume: origin,
+          live_shipped: true,
+        },
+      );
+      let super::ReplyBody::LiveShippingSet { live_shipped: true } = shipped else {
+        panic!("the origin ships live: {shipped:?}")
+      };
+      let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Snapshot { volume: origin },
+      ) else {
+        panic!("the origin was snapshotted")
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Clone {
+          volume: origin,
+          snapshot,
+          name: "live-clone".to_owned(),
+        },
+      );
+      let super::ReplyBody::Cloned { id: clone } = reply else {
+        panic!("the clone was made: {reply:?}")
+      };
+      let clone = super::to_db_volume(clone);
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        slates_db::register::HostId(local.0.wrapping_add(1)),
+        slates_db::register::HostId(local.0.wrapping_add(2)),
+      ];
+      crate::live_ship::owe_first_whole(state, clone, &holders);
+      let (live, _) = super::replicated_waits(state, Some(super::to_db_volume(origin)), 1, &reply);
+      (live, clone)
+    });
+    assert_eq!(
+      waits,
+      Some((clone, 0)),
+      "the Clone's reply waits for the clone's first whole entry"
+    );
   }
 
   /// A-544. Do: take over a captured clone whose owner died, its catalog carrying the record for the head the takeover
@@ -22600,6 +22775,129 @@ mod tests {
     );
   }
 
+  /// Fences the shard of `partition` as a failed consensus publication fences the control shard
+  /// (`Daemon::inject_consensus_failure`): every later borrow of its state is refused. The borrow that sets the fence is
+  /// refused at its own retention check, which names the fence it set.
+  fn fence_shard(daemon: &crate::daemon::Daemon, partition: usize) {
+    let fenced = daemon
+      .observation(
+        daemon.shards().get(partition).copied(),
+        crate::daemon::OBSERVE_BUDGET_NS,
+        |state| {
+          state.consensus_failure = Some(slates_anchor::AnchorError::Layout {
+            reason: "test support: a shard fenced as a failed consensus publication fences one",
+          });
+        },
+      )
+      .unwrap()
+      .wait();
+    assert!(
+      matches!(
+        fenced,
+        Err(crate::observe::ObserveError::State(
+          crate::state::StateAccess::Retention(_)
+        ))
+      ),
+      "the shard was fenced: {fenced:?}"
+    );
+  }
+
+  /// The root group's identity on the control shard now.
+  fn root_group(daemon: &crate::daemon::Daemon) -> Option<[u8; 32]> {
+    crate::daemon::observe_first(daemon, |state| {
+      state.root_group.as_ref().map(|group| group.id)
+    })
+  }
+
+  /// The answer to one request of the seated client: the one it was given at once, or else the next on its ring.
+  fn answer_of(end: &mut slates_ipc::ClientEnd, at_once: Option<ReplyBody>) -> Option<ReplyBody> {
+    at_once.or_else(|| answers_by_sequence(end, 1).into_values().next())
+  }
+
+  /// What the Recover test saw ([`recovered_past_a_fenced_shard`]).
+  struct Recovered {
+    /// The Recover's answer.
+    first: Option<ReplyBody>,
+    /// Its resend's answer, under the same id.
+    resent: Option<ReplyBody>,
+    /// The root group's identity before the Recover, after its answer, and after its resend's.
+    groups: [Option<[u8; 32]>; 3],
+  }
+
+  /// On a three-shard daemon whose third shard is fenced, a client seated on the second recovers the root group as its
+  /// first voter from a reviewed plan, then sends the same Recover again under its id, as a client resends a request
+  /// whose answer said it was not started.
+  fn recovered_past_a_fenced_shard() -> Recovered {
+    let daemon = crate::daemon::audit_daemon_of(3);
+    let (digest, proof) = crate::daemon::observe_first(&daemon, |state| {
+      let reviewed = crate::consensus_recovery::plan(state, true, None).unwrap();
+      let proof = crate::consensus_recovery::recovery_proof(&state.issuer_secret, &reviewed.digest);
+      (reviewed.digest, proof)
+    });
+    let before = root_group(&daemon);
+    fence_shard(&daemon, 2);
+    let recover = (
+      1,
+      super::RequestBody::Recover {
+        root: true,
+        target: None,
+        plan: digest,
+        proof,
+      },
+    );
+    let sent = recover.clone();
+    let (seat, region, at_once) = crate::daemon::observe_at(&daemon, 1, move |state| {
+      let (seat, region) = seat_asking(state);
+      let at_once = served_as_from_the_ring(state, seat, &sent);
+      (seat, region, at_once)
+    });
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let first = answer_of(&mut end, at_once);
+    let after_first = root_group(&daemon);
+    let at_once = crate::daemon::observe_at(&daemon, 1, move |state| {
+      served_as_from_the_ring(state, seat, &recover)
+    });
+    let resent = answer_of(&mut end, at_once);
+    let after_resend = root_group(&daemon);
+    daemon.stop();
+    Recovered {
+      first,
+      resent,
+      groups: [before, after_first, after_resend],
+    }
+  }
+
+  /// A-566 (§4.8 explicit quorum-loss recovery; §4.9: `Overloaded` says a request was not started, so a resend under its
+  /// id runs it). Do: on a three-shard daemon whose third shard is fenced, so the control shard's publication of a
+  /// consensus operation to it is refused, recover the root group from a client seated on the second shard; then send
+  /// the same Recover again under its id. Expect: the answer says the recovery ran (`DurabilityPending`), the resend
+  /// meets that answer, and the root group was replaced once. Before, the answer was `Overloaded` naming the fenced
+  /// shard though the recovery had run, so since A-563 its resend ran the operation again.
+  #[test]
+  fn a_recover_answered_after_it_ran_says_so_and_its_resend_takes_effect_once() {
+    let seen = recovered_past_a_fenced_shard();
+    assert!(
+      matches!(
+        seen.first,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::DurabilityPending { .. }
+        })
+      ),
+      "the Recover ran, and its answer says so: {:?}",
+      seen.first
+    );
+    assert_eq!(
+      seen.resent, seen.first,
+      "the resend under its id meets the Recover's answer"
+    );
+    let [before, after_first, after_resend] = seen.groups;
+    assert_ne!(before, after_first, "the Recover replaced the root group");
+    assert_eq!(
+      after_first, after_resend,
+      "once: the resend replaced it no further"
+    );
+  }
+
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
   /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves
   /// locally — the fast path, taken before any map lookup.
@@ -23259,6 +23557,71 @@ mod clone_admission_tests {
     assert_eq!(
       hold, count,
       "the clone holds a version slot for each inode it holds"
+    );
+  }
+}
+
+#[cfg(test)]
+mod materialization_wait_tests {
+  use super::await_materialization;
+  use crate::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
+  use slates_db::register::ObjectId;
+
+  /// Shape: the volume whose materialization the held verb waits for; any id works, nothing reads its catalog.
+  const PENDING: ObjectId = ObjectId([7; 16]);
+  /// Shape: how long the test thread waits before it looks: past the bound the wait had until A-548 (one liveness
+  /// window) by half a window.
+  const PAST_THE_OLD_BOUND_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 2;
+
+  /// A-548 (R3's class C; §4.8 "Promotion and takeover"): a verb held for its volume's materialization waits for the
+  /// materialization's end, however long it takes, and is let go at that end. Do: on an audit daemon's shard, mark a
+  /// volume pending materialization and spawn a task that waits as such a verb does; wait past the old bound (one
+  /// liveness window) and half a window more; then end the materialization (its pending entry removed, as a made, a
+  /// given-up or a tombstoned volume's is). Expect: the task still waiting past the old bound, and done once the
+  /// materialization ended. Before, the wait looked at the heartbeat and gave up at one window, so its verb was refused
+  /// while the materialization still ran, and its client sent round to retry.
+  #[test]
+  // The test thread waits past the old bound; no runtime wheel serves this thread (D-9 allows a test).
+  #[allow(clippy::disallowed_methods)]
+  fn a_verb_held_for_a_materialization_waits_for_its_end_past_any_fixed_bound() {
+    let daemon = crate::daemon::audit_daemon();
+    let (done, done_seen) = std::sync::mpsc::channel();
+    crate::daemon::observe_first(&daemon, move |state| {
+      state.pending_materializations.insert(
+        PENDING,
+        crate::state::PendingVolume::adopted(
+          crate::head::HeadValue {
+            manifest: None,
+            content_holders: Vec::new(),
+            sealing: None,
+          },
+          None,
+          Vec::new(),
+        ),
+      );
+      let held = slates_rt::futures::spawn(async move {
+        await_materialization(PENDING).await;
+        let _ = done.send(());
+      })
+      .unwrap();
+      slates_rt::futures::detach(held).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_nanos(PAST_THE_OLD_BOUND_NS));
+    let waited_past_the_old_bound = done_seen.try_recv().is_err();
+    crate::daemon::observe_first(&daemon, |state| {
+      state.pending_materializations.remove(&PENDING);
+    });
+    let let_go_at_the_end = done_seen
+      .recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .is_ok();
+    daemon.stop();
+    assert!(
+      waited_past_the_old_bound,
+      "the held verb was let go while its materialization was still pending"
+    );
+    assert!(
+      let_go_at_the_end,
+      "the held verb is let go once its materialization ends"
     );
   }
 }

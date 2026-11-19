@@ -130,6 +130,24 @@ pub(crate) struct FileInfo {
   pub(crate) ea_size: u32,
 }
 
+/// `FSP_FSCTL_OPEN_FILE_INFO` (`inc/winfsp/fsctl.h` 293-298) — what the `FileInfo` WinFsp's DLL hands Create and Open
+/// opens (`winfsp.h` 1495-1541, `FspFileSystemGetOpenFileInfo`): the file's information, then the buffer the open's
+/// normalized name may be copied into, `NormalizedName`, pointing into the response, and its size in bytes,
+/// `NormalizedNameSize`, which the open sets to the bytes it copied, with no terminator (A-551). The header asserts no
+/// size; on the 64-bit targets slates ships it is 72 + 8 + 2 bytes, padded to 88.
+#[repr(C)]
+pub(crate) struct OpenFileInfo {
+  pub(crate) file_info: FileInfo,
+  pub(crate) normalized_name: Pwstr,
+  pub(crate) normalized_name_size: u16,
+}
+
+// Format: the layout above, checked when the crate compiles: the name's buffer right after the 72-byte FileInfo, its
+// size after that pointer, and the whole padded to eight bytes.
+const _: () = assert!(std::mem::offset_of!(OpenFileInfo, normalized_name) == 72);
+const _: () = assert!(std::mem::offset_of!(OpenFileInfo, normalized_name_size) == 80);
+const _: () = assert!(size_of::<OpenFileInfo>() == 88);
+
 /// `FSP_FSCTL_DIR_INFO`'s fixed head (104 bytes; the variable `FileNameBuf` follows). The host fills
 /// one per directory entry and hands it to `FspFileSystemAddDirInfo` ([`Api::add_dir_info`]), which copies it plus the name.
 #[repr(C)]

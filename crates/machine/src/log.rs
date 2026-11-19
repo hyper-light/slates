@@ -63,6 +63,11 @@ pub fn log(line: fmt::Arguments<'_>) {
   }
 }
 
+/// [`write_line`] of an owned line: the sink a [`LogWriter`] writes with.
+fn write_owned(line: String) {
+  write_line(line);
+}
+
 /// Writes `line` and a newline to standard error as one locked write, counting a refusal.
 fn write_line(line: impl fmt::Display) {
   let mut stderr = std::io::stderr().lock();
@@ -83,13 +88,14 @@ std::thread_local! {
   static ROUTE: RefCell<Option<LogRoute>> = const { RefCell::new(None) };
 }
 
-/// The queue's bytes in flight and its bound, shared by a writer and the threads routed to it. One per writer, leaked for
-/// the process's life: two words.
+/// The queue's bytes in flight and its bound, shared by a writer and the threads routed to it, and the lines the writer
+/// has written, which its stop reads as its progress (A-552). One per writer, leaked for the process's life: three words.
 #[derive(Debug)]
 #[repr(align(128))]
 struct Queued {
   bytes: AtomicUsize,
   capacity: usize,
+  written: AtomicU64,
 }
 
 /// A thread's way to a [`LogWriter`]: the sending side of its queue. Made by [`LogWriter::route`] and installed on the
@@ -141,6 +147,8 @@ impl LogRoute {
 pub struct LogWriter {
   /// The route its owner clones for each thread; dropped at the stop, so the thread ends when the routed threads have.
   route: Option<LogRoute>,
+  /// The queue the route sends into, kept past the route's drop for the stop to read the writer's progress.
+  queued: &'static Queued,
   handle: Option<std::thread::JoinHandle<()>>,
   /// Told when the thread has written its last line.
   ended: Receiver<()>,
@@ -152,26 +160,36 @@ impl LogWriter {
     LogWriter::start_with(QUEUE_BYTES)
   }
 
-  /// Starts the writer's thread with its queue bounded at `capacity` bytes.
+  /// Starts the writer's thread with its queue bounded at `capacity` bytes, writing to standard error.
   fn start_with(capacity: usize) -> std::io::Result<LogWriter> {
+    LogWriter::start_with_sink(capacity, write_owned)
+  }
+
+  /// Starts the writer's thread with its queue bounded at `capacity` bytes, each line written by `sink`: standard error's
+  /// writer, or a test's.
+  fn start_with_sink(capacity: usize, sink: fn(String)) -> std::io::Result<LogWriter> {
     let (lines, queue) = channel::<String>();
     let (ended_sender, ended) = channel::<()>();
     let queued: &'static Queued = Box::leak(Box::new(Queued {
       bytes: AtomicUsize::new(0),
       capacity,
+      written: AtomicU64::new(0),
     }));
     let handle = std::thread::Builder::new()
       .name("slates-log".to_owned())
       .spawn(move || {
         for line in queue {
           queued.bytes.fetch_sub(line.len(), Ordering::AcqRel);
-          write_line(line);
+          sink(line);
+          // After the write: a writer held inside one shows no progress.
+          queued.written.fetch_add(1, Ordering::Release);
         }
         // An owner that stopped waiting (a stop past its wait) is told nothing more.
         let _told = ended_sender.send(());
       })?;
     Ok(LogWriter {
       route: Some(LogRoute { lines, queued }),
+      queued,
       handle: Some(handle),
       ended,
     })
@@ -185,17 +203,30 @@ impl LogWriter {
     })
   }
 
-  /// Stops the writer: lets its route go and waits `within` for the thread to write what is queued and end, then joins
-  /// it. Whether it ended: a thread still holding a route (a stuck shard's, which nothing joins), or a standard error
-  /// that takes nothing, keeps it past the wait, and it is left to the process's end rather than waited for without end.
-  pub fn stop(&mut self, within: std::time::Duration) -> bool {
+  /// Stops the writer: lets its route go, waits for the thread to write what is queued and end, and joins it. It waits
+  /// while the writer goes on writing lines, its owner's liveness window `window` at a time, and gives it up at the first
+  /// look a window after the last that finds no line written since (A-552): a standard error that takes lines slowly is
+  /// waited for until it has them all, while one that takes nothing, or a thread still holding a route (a stuck
+  /// shard's, which nothing joins) with nothing left to send, keeps the writer still, and it is left to the process's end
+  /// rather than waited for without end. Whether it ended. Until A-552 the stop waited one window in all, so it gave up a
+  /// slow, live writer with lines unwritten.
+  pub fn stop(&mut self, window: std::time::Duration) -> bool {
     drop(self.route.take());
     let Some(handle) = self.handle.take() else {
       return true;
     };
-    match self.ended.recv_timeout(within) {
-      Ok(()) | Err(RecvTimeoutError::Disconnected) => handle.join().is_ok(),
-      Err(RecvTimeoutError::Timeout) => false,
+    let mut written = self.queued.written.load(Ordering::Acquire);
+    loop {
+      match self.ended.recv_timeout(window) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => return handle.join().is_ok(),
+        Err(RecvTimeoutError::Timeout) => {
+          let now = self.queued.written.load(Ordering::Acquire);
+          if now == written {
+            return false;
+          }
+          written = now;
+        }
+      }
     }
   }
 }
@@ -322,5 +353,66 @@ mod tests {
       writer.stop(ROUTED_WAIT),
       "the writer wrote what it queued and ended"
     );
+  }
+
+  /// Shape: the window the stop test's writers are stopped with. A std timed wait under a launchd job's timer policy
+  /// (kiln's agents, CI's macOS runner) comes back about eight times late, at most about 150 ms late (measured
+  /// 2026-10-26), so the window is long enough for a slow line taken that late to land inside it.
+  const STOP_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+  /// Shape: how long the stop test's slow sink takes a line: a sixth of the window, so even taken late it takes one well
+  /// inside each window.
+  const SLOW_LINE: std::time::Duration = std::time::Duration::from_millis(100);
+  /// Shape: the lines the stop test queues: the slow sink takes at least two windows over them.
+  const SLOW_LINES: usize = 12;
+
+  /// A standard error that takes a line every [`SLOW_LINE`]: slow, never stuck.
+  fn slow_sink(line: String) {
+    // The point of the fixture: a reader that takes each line late.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(SLOW_LINE);
+    drop(line);
+  }
+
+  /// A-552 (R3's class D: the daemon's log writer's drain wait). Do: route a thread to a writer whose standard error takes
+  /// a line every sixth of a window, queue more lines than it takes in two windows, let the thread end, and stop the
+  /// writer with a window; then stop a second writer while a route to it is still held, as a stuck shard's thread holds
+  /// its own, with nothing queued. Expect the first stop to wait while the writer goes on taking lines and find it ended,
+  /// every line written; the second to give its writer up once a window passes with no line taken. Before, a stop waited
+  /// one window in all, so it gave a slow, live writer up with lines unwritten.
+  #[test]
+  fn a_stop_waits_while_its_writer_takes_lines_and_gives_up_a_still_one() {
+    let _gate = counter_gate();
+    let mut writer = LogWriter::start_with_sink(TEST_QUEUE_BYTES * SLOW_LINES, slow_sink).unwrap();
+    let route = writer.route().unwrap();
+    std::thread::spawn(move || {
+      route.install();
+      for count in 0..SLOW_LINES {
+        crate::log_line!("a line for a slow standard error, {count}");
+      }
+    })
+    .join()
+    .unwrap();
+    let began = std::time::Instant::now();
+    let ended = writer.stop(STOP_WINDOW);
+    let took = began.elapsed();
+    assert!(
+      ended,
+      "a writer that went on taking lines was waited for: gave up after {took:?}"
+    );
+    assert!(
+      took > STOP_WINDOW,
+      "its lines took longer than a window to take: {took:?}"
+    );
+    let mut still = LogWriter::start_with_sink(TEST_QUEUE_BYTES, slow_sink).unwrap();
+    let held = still.route().unwrap();
+    let began = std::time::Instant::now();
+    let ended = still.stop(STOP_WINDOW);
+    let took = began.elapsed();
+    drop(held);
+    assert!(
+      !ended,
+      "a writer a held route keeps, with nothing to take, is given up"
+    );
+    assert!(took >= STOP_WINDOW, "after a still window: {took:?}");
   }
 }

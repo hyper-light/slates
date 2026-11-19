@@ -147,25 +147,31 @@ pub enum SegmentSource {
   },
 }
 
-/// Derived: the CPU a [`Daemon::starve_control_shard`] hold runs each beat over `span_ns`: one beat times half a liveness
-/// window over the span, at most the whole beat, so the hold's whole CPU is at most half a window and the watchdog never
-/// finds it spinning, while each beat's share shows CPU progress, so it is never wedged either (A-228's rule).
-pub fn starved_share_ns(span_ns: u64) -> u64 {
+/// Derived: the CPU a [`Daemon::starve_control_shard`] hold runs each beat over `span_ns` on a shard the watchdog judges
+/// by `window_ns` (its own window, A-455: the liveness window raised to the scheduler overrun the shard measured,
+/// [`crate::watchdog::shard_window_ns`]): one beat times half that window over the span, at most the whole beat. So the
+/// hold's whole CPU is at most half the shard's window and the watchdog, judging the shard spinning only after a whole
+/// window of CPU held to the build (never less than the window), never finds it spinning, while each beat's share shows
+/// CPU progress at every look, so it is never judged still either (A-228's rule). Until A-552 the share was half the
+/// liveness window whatever window the watchdog judged the shard by.
+pub fn starved_share_ns(span_ns: u64, window_ns: u64) -> u64 {
   HEARTBEAT_NS
-    .saturating_mul(LIVENESS_BUDGET_NS / 2)
+    .saturating_mul(window_ns / 2)
     .checked_div(span_ns)
     .unwrap_or(HEARTBEAT_NS)
     .min(HEARTBEAT_NS)
 }
 
 /// Test support: runs the calling thread for `span_ns` as a starved thread runs, a little CPU at a time (A-232): each
-/// beat it spins for its share ([`starved_share_ns`]) and sleeps the rest, so the shard it runs on steps nothing else
+/// beat it spins for its share ([`starved_share_ns`]) of the window its shard is judged by, read as the hold begins
+/// ([`crate::watchdog::own_window_ns`]; a shard folds its overrun in only when it waits, and a hold inside one poll
+/// waits for nothing, so the window stands for the span), and sleeps the rest, so the shard it runs on steps nothing else
 /// for the span while the watchdog sees it move every look, alive and never stuck. Returns the span it measured,
 /// nanoseconds. [`Daemon::starve_control_shard`] runs it on the control shard; a test that keeps another shard silent
 /// past a window runs it in that shard's observation, where a sleep would be a wedge that ends a daemon no anchor
 /// supervises (`tests/fleet.rs`, `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
 pub fn starve_this_thread(span_ns: u64) -> u64 {
-  let share_ns = starved_share_ns(span_ns);
+  let share_ns = starved_share_ns(span_ns, crate::watchdog::own_window_ns());
   let begin = slates_rt::futures::now_ns();
   let end = begin.saturating_add(span_ns);
   let mut beat_began = begin;
@@ -928,9 +934,15 @@ impl Daemon {
     #[cfg(windows)]
     configure_windows_hold_owner(windows_channel.is_some(), &shards)?;
     let handed_connections = handed.connections;
-    // This daemon's learning gate (A-227): its shards' crossing checks wait on its own shards' learning alone.
+    // This daemon's learning gate (A-227): its shards' crossing checks wait on its own shards' learning alone, while it
+    // goes on (A-552): a check gives the learning its own shard's window (the one its watchdog judges it by, A-455) to
+    // end one more shard's, and parks a beat between looks, so its watchdog sees it move at every look of its own.
     #[cfg(unix)]
-    let gate = slates_base::own_mounts::Gate::new(LIVENESS_BUDGET_NS);
+    let gate = slates_base::own_mounts::Gate::new(
+      shards.len(),
+      crate::watchdog::own_window_ns,
+      HEARTBEAT_NS,
+    );
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();
@@ -2437,8 +2449,8 @@ impl Daemon {
   /// then resume), its own probes, its record plane and its consensus loops.
   ///
   /// It runs as a starved thread runs, a little CPU at a time (A-232): each beat it spins for its share and sleeps the
-  /// rest, its share being what keeps its whole CPU over the span to half a liveness window
-  /// ([`starved_share_ns`]). Until A-232 it spun the whole span, and the watchdog's own rule (A-228) calls a window of
+  /// rest, its share being what keeps its whole CPU over the span to half the window the watchdog judges the control
+  /// shard by ([`starved_share_ns`], A-552). Until A-232 it spun the whole span, and the watchdog's own rule (A-228) calls a window of
   /// CPU without a step a spinning, stuck shard, not a starved one: an anchor would kill that daemon, and since A-232 a
   /// lone one ends itself. So a span past a window was a stuck daemon, not the live, starved one this models. Admission is retried while the
   /// control channel is full ([`Self::observation`]); the typed refusal when there is no control shard or
@@ -3812,6 +3824,15 @@ impl Daemon {
   /// daemon's error stream, which its anchor keeps (every worker is still joined and every slot given back,
   /// AUD-29-12); with `panic = "abort"` a release build never reaches here after a worker's panic.
   fn stop_parts(&mut self) {
+    // The window the log writer's drain is judged by (A-552): the widest this daemon's shards are judged by now (A-455),
+    // read while they still run. A host that keeps the shards off their CPUs that long keeps the writer's thread off its
+    // own as long, so a narrower window would give up a writer that is only starved.
+    let log_window_ns = self
+      .shards
+      .iter()
+      .map(|shard| crate::watchdog::shard_window_ns(shard.0))
+      .max()
+      .unwrap_or_else(|| crate::watchdog::watch_window_ns(0));
     // The FUSE mounts end with each shard's serve loop (`EndMounts`), on the shard's own thread as the
     // shutdown cancels it — never as a question queued behind the shard's work, which would answer every
     // question already waiting there instead of terminating it (§4.6; AUD-29-64).
@@ -3832,11 +3853,12 @@ impl Daemon {
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
     }
-    // After the shards, whose ended threads let their routes go, so the writer has every line they queued. A shard that
-    // never ended still holds its route, and a standard error that takes nothing holds the writer: it is waited for a
-    // window, then left to the process's end, never waited for without end.
+    // After the shards, whose ended threads let their routes go, so the writer has every line they queued. It is waited
+    // for while it writes lines (A-552). A shard that never ended still holds its route, and a standard error that takes
+    // nothing holds the writer still: it is given up a window after its last line, then left to the process's end,
+    // never waited for without end.
     if let Some(mut log_writer) = self.log_writer.take() {
-      log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
+      log_writer.stop(std::time::Duration::from_nanos(log_window_ns));
     }
   }
 }
@@ -4482,6 +4504,10 @@ async fn init_shard(
     image: crate::image::ImageState::default(),
     configured_members: Vec::new(),
     departed_owed: Vec::new(),
+    departures_owed: false,
+    departures_retry_at: None,
+    #[cfg(target_os = "linux")]
+    held_copies_owed: false,
     direct_map: crate::direct_map::DirectMapState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
@@ -4697,7 +4723,7 @@ async fn init_shard(
     put_outcomes: crate::fleet::PutOutcomes::default(),
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
-    pending_materializations: std::collections::BTreeMap::new(),
+    pending_materializations: crate::state::PendingMaterializations::default(),
     making_taken_over: std::collections::BTreeMap::new(),
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
@@ -4721,6 +4747,10 @@ async fn init_shard(
   state.landing.next_landing = verbs::next_landing_counter(state.db.partition());
   // The runtime grants, rebuilt from the durable ones in their recorded states (AUD-29-06).
   crate::landing::restore_grants(&mut state);
+  // What the partition owed the audit when its predecessor stopped (a batch a crash cut off) is looked at a retry
+  // window into the start, by the deadline keeper (A-265, A-554).
+  let started_ns = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  crate::landing::arm_owed_audit_look(&mut state, started_ns);
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
   }
@@ -4829,14 +4859,16 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: grants, the audit owed,
-/// departed hosts' attachments, held copies, the pressure hold, NFS purges, base hints and the idle seal. Dead clients are
-/// no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper retires it then
-/// (`crate::reap`); nor, since A-522 and A-536, are abandoned staging buffers, status captures, lapsed write leases and
-/// lapsed CLI attachments, which the shard's keeper releases at their own deadlines (`crate::deadlines`), nor destroys,
-/// which the serve loop steps once woken and the keeper retries at a refused record's deadline. The jobs left
-/// here leave a piece at a time for the events or deadlines that own them, and then the loop and its tick go (the reaper
-/// series, GAPS). Derived: the cadence is the budget.
+/// The shard's tick for the cold work it still owns, at the liveness cadence: the pressure hold, NFS purges, base hints
+/// and the idle seal; since A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
+/// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
+/// claim's deadline (Linux, `crate::held_copy::reclaim_owed`). Dead clients are no longer its: since A-475
+/// each client's watch reports its hang-up and the shard's reaper retires it then (`crate::reap`); nor, since A-522,
+/// A-536 and A-554, are abandoned staging buffers, status captures, lapsed write leases, lapsed CLI attachments, grants
+/// past their term and the owed audit's resend, which the shard's keeper takes at their own deadlines
+/// (`crate::deadlines`), nor destroys, which the serve loop steps once woken and the keeper retries at a refused
+/// record's deadline. The jobs left here leave a piece at a time for the events or deadlines that own them, and then
+/// the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4846,18 +4878,6 @@ async fn reap_loop() {
   .get();
   loop {
     pace(cadence).await;
-    state::with_state(|s| {
-      // A grant past its term leaves the tables (A-266); its history is the audit log.
-      crate::landing::end_expired_grants(s);
-      // What this shard owes the audit and was not acknowledged a tick ago is sent again (A-265): a batch lost to a
-      // crash, a restart or an unanswered wait reaches the control partition, which appends nothing twice.
-      crate::landing::resend_stuck_audit(s);
-    });
-    // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
-    crate::remote_attach::sweep_departed().await;
-    // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
-    #[cfg(target_os = "linux")]
-    let _reclaimed = crate::held_copy::reclaim_unclaimed().await;
     refresh_pressure_hold().await;
 
     crate::nfs::purge_owed_here().await;
@@ -6596,6 +6616,48 @@ mod late_beat_tests {
       "under the ceiling's half"
     );
     assert!(beat_is_late(5 * window, runaway), "at the ceiling's half");
+  }
+}
+
+#[cfg(test)]
+mod starved_share_tests {
+  use super::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, starved_share_ns};
+  use crate::watchdog::watch_window_ns;
+
+  /// Shape: a hold's span: ten liveness windows, a whole number of beats, past every window judged here.
+  const SPAN_NS: u64 = 10 * LIVENESS_BUDGET_NS;
+
+  /// A hold's whole CPU over `span_ns` on a shard judged by `window_ns`, as `starve_this_thread` spends it: its share
+  /// each beat, over the span's beats.
+  fn whole_cpu_ns(span_ns: u64, window_ns: u64) -> u64 {
+    span_ns.div_ceil(HEARTBEAT_NS) * starved_share_ns(span_ns, window_ns)
+  }
+
+  /// A-552 (R3's class D, `starved_share_ns`; A-232, A-455). Do: take a starved hold's share over ten liveness windows on
+  /// a quiet shard and on one whose host held it off its CPU two and a half windows, each judged by the window the
+  /// watchdog gives its measured overrun; then over a span shorter than a beat. Expect the hold's whole CPU to be half
+  /// the shard's own window in both, so the watchdog judging the shard by that window finds it neither spinning nor
+  /// still, and no beat's share past a beat. Before, the hold's whole CPU was half the liveness window whatever window
+  /// the watchdog judged its shard by.
+  #[test]
+  fn a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by() {
+    let quiet = watch_window_ns(0);
+    assert_eq!(
+      whole_cpu_ns(SPAN_NS, quiet),
+      quiet / 2,
+      "a quiet shard's hold"
+    );
+    let held = watch_window_ns(5 * LIVENESS_BUDGET_NS / 2);
+    assert_eq!(
+      whole_cpu_ns(SPAN_NS, held),
+      held / 2,
+      "a held shard's hold spins half the window the watchdog judges it by"
+    );
+    assert_eq!(
+      starved_share_ns(HEARTBEAT_NS / 2, held),
+      HEARTBEAT_NS,
+      "a span under a beat spins a beat at most"
+    );
   }
 }
 
