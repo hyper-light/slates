@@ -11238,6 +11238,16 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   by a wrong checkpoint stays fenced.
 >   (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.)
 
+> **Status (2026-11-19, A-632: a chain entry finds what its increment declared in one pass).** A splice recorded by its
+> path alone has its ops found again in the increment: on encode, to see that they are the declared ones, and on decode,
+> to restore them. Each effect used to scan every op of the increment for its path (`declared_ops`), and each copy for
+> its source version (`declared_copy`, A-586), O(effects × ops): about 5 × 10⁹ visits for a version splicing 50,000
+> files of a 100,000-op increment, on the owner's commit and on every holder's replay. An entry now indexes its
+> increment's ops once (`Declared`: each path's content ops in order, each copy's source version by destination, then
+> source), so encode and decode visit each op once and look each effect up in an ordered map. The entry's bytes are
+> unchanged. Test: a thousand splices visit a thousand ops on encode and a thousand on decode, where the scan visited a
+> million each way (kiln r786); `docs/bugs/2026-11-19-a-chain-entry-scanned-its-increment-for-every-splice.md`.
+
 > **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
 > - Now, after each accept, the owner checkpoints the chain at the floor. The floor is the oldest version a live work
@@ -11379,6 +11389,24 @@ absent at the head and unchanged after the base, and its source's tree unchanged
 > insert at the cut and an append past it kept beside a truncate; an overwrite inside the cut span or a shorter
 > truncate a conflict; the same truncate identical. Tests: `crates/merge/src/engine/unseen_bytes_tests.rs`; A-596's
 > oracle generates both cases again (`engine/reanchor/tests.rs`).
+
+> **Status (2026-11-19, A-631: a work never changes a node removed after its base).** A-612's record of removals
+> (`Green::file_removed`) covers a node of every type now: a regular file, a symbolic link, a hard link's name, an IPC
+> node and a directory, each removed by its own effect or renamed away (a regular file also when renamed onto). Two
+> more verdicts read it as the content verdict does:
+> - *A metadata change.* A work's `SetMode`, `SetXattr` or `RemoveXattr` based before its path's node was removed is
+>   delete against modify (`DeleteModify`), whatever was made at the path since, unless the work makes the path itself.
+>   Before, each was judged by its own dimension's last change alone (`mode_changed`, `xattr_changed`), which a removal
+>   does not touch, and it landed on the new node.
+> - *A link's rename.* A rename whose source is a symbolic link or a hard link removed after the work's base is rename
+>   against rename (`RenameRename`), as a regular file's is (A-612). Before, it moved the new link.
+>
+> Tests: `crates/merge/src/engine/replaced_node_tests.rs`, each case red first, and a generated oracle: histories over a
+> file, a symbolic link, a hard link and a directory, each removed and made again while works based behind the head
+> change a mode, an attribute or a name, every answer held to the rule and a census requiring each case to run. Probed
+> and owed (GAPS): a link renamed over a regular file keeps the file beside it; a directory's removal takes no base; an
+> unlink or a directory's removal ignores a metadata change after its base; and a hard link to a target made again
+> links the new file.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -42841,6 +42869,71 @@ Applied in the same change to:
   `unwrap`, `assert` or `panic` in a function returning `Option` or `Result`.
 - **Owed** (GAPS): part 2, the editor drive answering a finished report; URLs read as `svn_uri_canonicalize` reads
   them; and the authentication `svnserve` asks for mid-session when an anonymous `update` may not read.
+
+### A-631 — a work never changes a node removed after its base: a metadata change and a link's rename (2026-11-19, g267, UI goal 93; §4.16 "The verdict"; A-612's siblings)
+Applied in the same change to:
+- §4.16's verdict and its status; GAPS (A-612's siblings, fixed; the siblings probed here, filed open);
+- `crates/merge/src/engine.rs`: `file_removed` recorded for every type's removal; the mode, attribute-set and
+  attribute-removal verdicts read it; `file_removed_since`'s doc put back above it;
+- `crates/merge/src/engine/replaced_node_tests.rs`, new: the failing-first tests and the generated oracle;
+- `docs/bugs/2026-11-19-a-metadata-change-or-a-links-rename-based-before-its-node-was-replaced-landed-on-the-new-one.md`.
+- **The defect.** A-612 refused a work's content edit or rename of a regular file removed after its base, by a record of
+  the last version that removed the file at each path. Two siblings were left:
+  - A mode change, or an attribute set or removed, based before its node was removed and made again, was judged only
+    by its own dimension's last change, which a removal does not touch. It was accepted and changed the new node.
+  - A rename of a symbolic link or a hard link removed and made again was not refused, since the record held regular
+    files alone. It moved the new link.
+- **The rule, from §4.16 and D-27.** A node removed after a work's base is gone for that work, whatever was made at its
+  path since: a change to it is delete against modify in either direction, and a rename of it is rename against rename.
+  `commit` now records the removal of a symbolic link, a hard link's name, an IPC node and a directory, as it did a
+  regular file's. The mode, attribute-set and attribute-removal verdicts refuse `DeleteModify` when the path's node was
+  removed after the base, unless the work makes the path itself (`established`). The rename verdict already read the
+  record, so a replaced link's rename is `RenameRename`.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 6 to 9), green on kiln r786 and, merged with main, r810:
+  - `cargo test -p slates-merge --lib`, the whole suite, 79 of 79 (r786) and 92 of 92 (r810);
+  - `cargo fmt -p slates-merge -- --check`, clean on both.
+
+  The failing-first tests:
+  - each metadata change based before its file was made again is `DeleteModify`, the head unmoved and the metadata
+    kept, and the same change based at the head is accepted;
+  - a rename of a symlink, and of a hard link, made again after its base is `RenameRename` on the destination;
+  - the oracle: generated histories over a file, a symbolic link, a hard link and a directory, each removed and made
+    again while works based behind the head change a mode, an attribute or a name. Every answer is held to the rule,
+    and a census requires each case to run (a metadata change refused, a link's rename refused, a file's rename
+    refused, an accept).
+
+  Red on r786, with the records and checks reversed: all three failed. The mode change was `Accepted { version: 3 }`
+  and changed the new file's metadata; the symlink's rename was `Accepted { version: 3 }` and moved the new link; the
+  oracle shrank to a symlink made again, then an attribute removal on it based before that, accepted.
+- **Siblings probed, not changed** (GAPS; a scratch test on the Studio, never committed, re-run merged with main on
+  r810):
+  - a symbolic link or a hard link renamed over an unchanged regular file is accepted, even at the head, and the green
+    then holds both the file and the link at one path;
+  - a directory's removal takes no base, so one based before the directory was made again removes the new one;
+  - a file's unlink or a directory's removal based before a mode or attribute change at the head is accepted;
+  - a hard link made to a target removed and made again after its base links the new file.
+
+  A fifth, a removed node's mode and attributes outliving it and passing to the next node made at its path, was found
+  before the merge and closed by A-618 meanwhile; r810 answers neither after a removal or a remake.
+
+### A-632 — a chain entry finds what its increment declared in one pass (2026-11-19, g267, UI goal 93; §4.16 "Commit"; found by A-621's reading)
+Applied in the same change to:
+- §4.16's chain entry status; GAPS (the entry filed by A-621, fixed);
+- `crates/merge/src/chain_entry.rs`: `Declared`, built once per entry encoded or decoded, replaces `declared_ops` and
+  `declared_copy`;
+- `docs/bugs/2026-11-19-a-chain-entry-scanned-its-increment-for-every-splice.md`.
+- **The defect.** An entry records a splice whose ops are the ones its increment declared by its path alone, and finds
+  those ops again in the increment: on encode to compare, on decode to restore. Each effect scanned every op of the
+  increment for its path, and each copy for its source version (A-586), O(effects × ops). That is about 5 × 10⁹ visits
+  for a version splicing 50,000 files of a 100,000-op increment, on the owner's commit and on every holder's replay.
+- **The index.** One pass over the increment's ops builds each path's content ops in order and each copy's source
+  version by destination, then source, the first one a pair declares. Encode and decode build it once, so each op is
+  visited once and each effect is an ordered-map lookup. The entry's bytes are unchanged; it stays version 5.
+- **Tests** (debug, Mac Studio, 2026-11-19), green on kiln r786: `cargo test -p slates-merge --lib`, 79 of 79, and 92 of
+  92 merged with main (r810). The
+  failing-first test counts the increment's ops visited (a counter in test builds): an entry splicing 1,000 files as
+  declared visits 1,000 on encode and 1,000 on decode, and decodes to what was recorded. Red on r786, with the index
+  rebuilt for every effect: 1,000,000 each way.
 
 ### A-624 part 2 — v2's `object-info` and `bundle-uri`, read and answered over store traits, and the server's `packfile-uris` choice (2026-11-19, g230, UI goal 93; §4.17.2 "Pieces (git)" piece 14's rest, "The wire", "A fetch" items 3 and 4; after A-582 part 2, A-614 part 1 and A-624 part 1)
 Applied in the same change to:
