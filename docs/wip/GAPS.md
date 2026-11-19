@@ -45,6 +45,14 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-600 (2026-11-19, g230; piece 2's object names):** `slates-git` names objects. It reads and writes the object
+> header within git's 32 bytes, its size charged to the caller's admission first, and refuses `ofs-delta` and
+> `ref-delta` by kind. It maps `object-format` both ways. It hashes in either format: SHA-1 through RustCrypto's
+> `sha1-checked`, configured as git configures sha1dc (detection on, safe hash off), so git's own t0013 SHAttered vector
+> and its twin are refused, typed, naming their plain SHA-1; and SHA-256 through aws-lc-rs. Golden vectors are every
+> object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
+> `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
+> entry's header and the delta instructions (others' parts).
 > **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
 > BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget;
 > tables of sorted rows that are content, each row naming the contents it holds, opened from any bytes with every fault
@@ -1007,6 +1015,14 @@
 > INIT; a stream reads the form after a restore and after its daemon's death; each of fourteen guards removed alone
 > fails its test. Owed: a real guest's run (a non-member's `setfacl` on a set-group-ID file, over a Shards stream and
 > over slates' own virtio-fs device).
+> **Fixed since (A-587, 2026-11-19):** A-378 left the owner word behind. A Shards stream takes the word before its
+> bridge sees the request, and read it in the short form, so after a guest's INIT kept the extended one the word's
+> name was read from the setter's flags and the pad, never matched, and the run was shown its share as the host's:
+> kiln's macOS microVM drive (r134, kiln 815a790c, slates' A-378 vendored since kiln 688cb98ce) had its stand-in's
+> create in its served project refused `EACCES`. The word is read in the form the stream's INIT kept. Tests: the word
+> in each form (`crates/bridge-fuse/src/shards_fs.rs`), and a daemon's stream taking it after an INIT that kept the
+> extended form, its root then shown as the run's (`crates/server/src/shards.rs`). Swept: no other intercept of the
+> stream reads a negotiated form. Owed: kiln's re-vendor and its macOS microVM drive (main's run).
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto

@@ -1658,8 +1658,9 @@ fn answer_frame(
         consume(stream, total);
         return flush_unless_refill_owed(s, stream);
       }
-      // Shards' owner word is the stream's to take, never a file's attribute (A-281).
-      if let Some(word) = owner_word(&request) {
+      // Shards' owner word is the stream's to take, never a file's attribute (A-281), read in the form the guest's
+      // `INIT` kept, as the dispatch reads every other `SETXATTR` (A-378, A-587).
+      if let Some(word) = owner_word(&request, stream.setxattr_ext) {
         let served = take_owner_word(s, stream, word);
         consume(stream, total);
         if !served {
@@ -3215,6 +3216,157 @@ mod tests {
         refused: 1
       },
       "the live volume's SAVE was held for its durability, then refused"
+    );
+  }
+
+  /// Format: FUSE's root node, the share's root (`FUSE_ROOT_ID`).
+  const ROOT_NODE: u64 = 1;
+  /// Format: the minor version the test's `INIT` names, a Linux 6.9 or later guest's kernel's (7.41).
+  const GUEST_MINOR: u32 = 41;
+  /// Format: the read-ahead the test's `INIT` offers, as a guest's kernel offers it.
+  const READAHEAD: u32 = 128 << 10;
+  /// Format: `fuse_getattr_in`: the getattr flags, a pad and a file handle, none set.
+  const GETATTR_IN_BYTES: usize = 16;
+  /// Format: where `fuse_attr_out`'s `attr` begins in a reply's body, past `attr_valid`, its nanoseconds and a pad;
+  /// and where `fuse_attr`'s `uid` and `gid` lie in it, past the inode, size, blocks, three times, their three
+  /// nanoseconds, the mode and the link count.
+  const ATTR_AT: usize = 16;
+  const ATTR_UID_AT: usize = 68;
+  const ATTR_GID_AT: usize = 72;
+
+  /// A FUSE request of `opcode` under `unique` on the share's root from the guest's root, carrying `body`: the in-header
+  /// (`len`, `opcode`, `unique`, `nodeid`, then the caller's ids, root's), then `body`.
+  fn on_the_root(opcode: Opcode, unique: u64, body: &[u8]) -> Vec<u8> {
+    let mut request = vec![0u8; slates_bridge_fuse::abi::IN_HEADER_LEN];
+    let total = u32::try_from(request.len() + body.len()).expect("a test request fits its word");
+    request[0..4].copy_from_slice(&total.to_le_bytes());
+    request[4..8].copy_from_slice(&(opcode as u32).to_le_bytes());
+    request[8..16].copy_from_slice(&unique.to_le_bytes());
+    request[16..24].copy_from_slice(&ROOT_NODE.to_le_bytes());
+    request.extend_from_slice(body);
+    request
+  }
+
+  /// Attaches a Shards stream to `volume` for [`owner`] and sends each of `requests` on it as Shards' device does, each
+  /// FUSE request in a frame of its own, reading its reply before the next: the replies, each its out-header and body.
+  fn exchanged(
+    daemon: &Daemon,
+    volume: slates_ipc::protocol::VolumeId,
+    requests: &[Vec<u8>],
+  ) -> Result<Vec<Vec<u8>>, String> {
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    daemon
+      .attach_shards_stream(
+        ShardsAsk {
+          principal: owner(),
+          volume,
+          subtree: None,
+          intent: Intent::Write,
+        },
+        Box::new(move |attached| {
+          let _ = sent.send(attached);
+        }),
+      )
+      .map_err(|error| format!("the owner shard was not reached: {error:?}"))?;
+    let attached = received
+      .recv_timeout(ANSWER_WAIT)
+      .map_err(|error| format!("the attach did not answer: {error:?}"))?
+      .map_err(|refusal| format!("the attach was refused: {refusal:?}"))?;
+    // The resync channel's end, where one was made, is kept while the stream serves: dropped, it would end the resync.
+    let _resync = attached.resync;
+    let mut device = std::os::unix::net::UnixStream::from(attached.stream);
+    device
+      .set_nonblocking(false)
+      .and_then(|()| device.set_read_timeout(Some(ANSWER_WAIT)))
+      .map_err(|error| format!("the device's end was not set up: {error}"))?;
+    let mut replies = Vec::with_capacity(requests.len());
+    for request in requests {
+      let length =
+        u32::try_from(request.len()).map_err(|_| "a request's length fits its word".to_owned())?;
+      let mut frame = length.to_le_bytes().to_vec();
+      frame.extend_from_slice(request);
+      device
+        .write_all(&frame)
+        .map_err(|error| format!("a request was not sent: {error}"))?;
+      let mut word = [0; LENGTH_BYTES];
+      device
+        .read_exact(&mut word)
+        .map_err(|error| format!("a request was not answered: {error}"))?;
+      let length = usize::try_from(u32::from_le_bytes(word))
+        .map_err(|_| "a reply's length fits the address space".to_owned())?;
+      let mut reply = vec![0; length];
+      device
+        .read_exact(&mut reply)
+        .map_err(|error| format!("a reply was cut short: {error}"))?;
+      replies.push(reply);
+    }
+    Ok(replies)
+  }
+
+  /// A-587 (A-281's owner word under A-378's extended `SETXATTR`; kiln's macOS microVM drive, r134). Do: attach a
+  /// Shards stream to a volume the test's owner keeps and send on it, as a Linux guest does: the `INIT` its kernel
+  /// sends, offering `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT`; then Shards' owner word `1000:1001` from the guest's root
+  /// on the share's root, in the extended form that `INIT` kept; then a `GETATTR` of the root. Expect each answered,
+  /// the word taken (`shards.owner_named`), and the root shown owned by the run, 1000:1001, where the volume keeps it as
+  /// the owner's: what lets a run of an unprivileged user write its share under its kernel's own check (A-314). Before
+  /// A-587 the stream read the word in the short form, took none, and showed the root as the owner's, so the guest's
+  /// kernel refused the run's create `EACCES`.
+  #[test]
+  fn an_owner_word_after_an_init_that_kept_the_extended_form_shows_the_root_as_the_runs() {
+    use slates_bridge_fuse::abi::{OUT_HEADER_LEN, flags};
+    let daemon = crate::daemon::audit_daemon();
+    let volume = crate::daemon::observe_first(&daemon, |state| volume_here(state, "owned", false));
+    let Some(volume) = volume else {
+      daemon.stop();
+      panic!("the volume was not made");
+    };
+    let offered = u32::try_from(flags::POSIX_ACL | flags::SETXATTR_EXT)
+      .expect("both lie in the first flags word");
+    let mut init = Vec::new();
+    for word in [
+      slates_bridge_fuse::FUSE_KERNEL_VERSION,
+      GUEST_MINOR,
+      READAHEAD,
+      offered,
+    ] {
+      init.extend_from_slice(&word.to_le_bytes());
+    }
+    let value = b"1000:1001";
+    // `fuse_setxattr_in` in its extended form: the value's size, then the flags, the setter's flags and a pad, none set.
+    let mut word = u32::try_from(value.len())
+      .expect("a short value")
+      .to_le_bytes()
+      .to_vec();
+    word.extend_from_slice(&[0u8; 3 * size_of::<u32>()]);
+    word.extend_from_slice(slates_bridge_fuse::shards_fs::OWNER_WORD);
+    word.push(0);
+    word.extend_from_slice(value);
+    let requests = [
+      on_the_root(Opcode::Init, 1, &init),
+      on_the_root(Opcode::SetXattr, 2, &word),
+      on_the_root(Opcode::GetAttr, 3, &[0u8; GETATTR_IN_BYTES]),
+    ];
+    let replies = exchanged(&daemon, volume, &requests);
+    let named = crate::daemon::observe_first(&daemon, |state| {
+      state.refusals.get(OWNER_NAMED).copied().unwrap_or(0)
+    });
+    daemon.stop();
+    let replies = replies.expect("the stream answered each request");
+    for (what, reply) in ["the INIT", "the owner word", "the GETATTR"]
+      .iter()
+      .zip(&replies)
+    {
+      let error = i32::from_le_bytes(reply[4..8].try_into().expect("an out-header"));
+      assert_eq!(error, 0, "{what} is answered");
+    }
+    assert_eq!(named, 1, "the owner word was taken");
+    let attr = OUT_HEADER_LEN + ATTR_AT;
+    let field =
+      |at: usize| u32::from_le_bytes(replies[2][at..at + 4].try_into().expect("an attribute"));
+    assert_eq!(
+      (field(attr + ATTR_UID_AT), field(attr + ATTR_GID_AT)),
+      (1000, 1001),
+      "the root shown owned by the run"
     );
   }
 

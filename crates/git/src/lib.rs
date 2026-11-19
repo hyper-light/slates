@@ -6,8 +6,9 @@
 //! (`0001`) and response end (`0002`). A pack travels inside the `packfile` section multiplexed by side-band-64k
 //! ([`sideband`]): each data packet's first byte names its band, 1 the pack, 2 progress, 3 a fatal error. Under
 //! protocol v2's `sideband-all` every data packet of a response is multiplexed so. This crate reads and writes both,
-//! byte for byte as stock git 2.50 writes them, and nothing more yet: protocol v2's messages, deltas, pack indexes and
-//! packs are A-582's next parts (GAPS, the §4.17 entry).
+//! byte for byte as stock git 2.50 writes them. It also names objects ([`object_name`], A-600): the object header, and an
+//! object's name in either `object-format`, SHA-1 with git's collision detection or SHA-256. Protocol v2's messages,
+//! deltas, pack indexes and packs are A-582's next parts (GAPS, the §4.17 entry).
 //!
 //! **Sources** (read 2026-11-19). git's `Documentation/gitprotocol-common.txt` ("pkt-line Format"),
 //! `gitprotocol-v2.txt` ("Packet-Line Framing", "packfile section", `sideband-all`) and `gitprotocol-capabilities.txt`
@@ -40,6 +41,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod admission;
+pub mod object_name;
 pub mod out;
 pub mod pktline;
 pub mod sideband;
