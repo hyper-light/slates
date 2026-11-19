@@ -333,6 +333,21 @@
 > Owed: the daemon starting the edge, the stores, main's live OpenSSH `git clone` with an enrolled key; the site finds
 > a repository on its own shard's partition alone, where the HTTP edge locates one held elsewhere and moves the
 > connection there (main's finding, its own piece).
+> **A-688 (2026-11-19, g229; svn+ssh over slates' own SSH server, §4.17.4 piece 12):** `vcs_ssh::svn` serves the SSH
+> site's `svnserve -t` (`SvnServices` beside the other services): A-656's ra_svn connection over the channel, the
+> client's URL found as `find_repos` finds it (E125001, E125002, E210005), A-597's policy asked (E170001), the tunnel's
+> user the principal the key proved (its index key in hexadecimal), never the SSH login; sources lent a step at a time
+> (`SvnStores`); a commit begun, its hooks passed where none is configured, its work refused 200007; the tunnel ending
+> as `svnserve -t` 1.15.0 ends, held to stock recordings (the `mkdir` commit; scripted sessions recorded on the Mac
+> Studio, 2026-11-19) and end to end over the SSH edge (macOS arm64, Mac Studio, kiln r311: `--lib vcs_ssh::` red 26 of
+> 35, green 35 of 35; slates-svn `handshake:: serve::` 60 of 60; fmt clean; as it landed over main 693bc8feb, r377: 38
+> of 38 and 60 of 60). Owed: the lender of a Subversion store over A-662's map (the records A-655 part 2b keeps there, a
+> directory's entries from the green, the repository's `svnserve.conf` facts; the DAV site's own `SvnStores`, A-681,
+> waits for the same lender), without which the daemon's site cannot start the tunnel; the accepted work handed to A-655
+> part 2b's owner step (`repository::svn_commit::commit`); the daemon's edge (A-684); a configured hook run, not
+> refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve`
+> exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a
+> daemon.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -1350,7 +1365,8 @@
 > own for `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s
 > `get-dir`, compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at
 > once, where `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH
-> tunnel's entry point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's
+> tunnel's entry point (built since, A-688; one learned-wait mechanism for the three edges, after A-625's and A-651's
+> land); the daemon's
 > commit through A-655 part 2b's step (`repository::svn_commit::commit`, built); the lock verbs; the read commands'
 > authentication for one command with their
 > authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`

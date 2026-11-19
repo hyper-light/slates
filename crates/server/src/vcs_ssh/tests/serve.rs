@@ -14,6 +14,7 @@ use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 
 use super::site::{Command, Dispatched, Next, Refused, SshSite, Stepped};
 use super::ssh_client::{Client, ClientOptions, put_string, read_string};
+use super::svn::tests as svn_tests;
 use super::waits::PHASES;
 use super::{Bounds, Counts, EdgeState, serve};
 use crate::daemon::LIVENESS_BUDGET_NS;
@@ -486,6 +487,13 @@ fn send_data(peer: &mut Peer, data: &[u8]) {
   peer.send(&message);
 }
 
+/// Ends the client's input on the session (RFC 4254 §5.3: `SSH_MSG_CHANNEL_EOF`).
+fn send_eof(peer: &mut Peer) {
+  let mut message = vec![96];
+  message.extend_from_slice(&peer.channel.to_be_bytes());
+  peer.send(&message);
+}
+
 /// What a session gave its client.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Transcript {
@@ -734,4 +742,39 @@ fn a_key_looked_up_where_its_record_lives_proves_its_principal() {
   let (transcript, seen) = served_by(ONE_SEAT, || LooksUp, |address| session(address, 0, 0));
   assert_eq!(transcript, Some(pushed()));
   assert_eq!(seen.counts.commands_run, 1);
+}
+
+/// A-688 (§4.17.4 "svn+ssh": over slates' own SSH server `svnserve -t` is read from the `exec` request and served in
+/// the daemon, the principal the one the client's key proved). Do: authenticate with the held key, run `svnserve -t`
+/// through the site with Subversion's tunnel over an empty repository the key's principal owns, send a scripted stock
+/// client's session (its answer to the greeting naming the repository, `EXTERNAL`, `get-latest-rev`) and EOF, and read
+/// to the end. Expect: what stock `svnserve -t` 1.15.0 wrote on that session (`super::svn::tests`' recording), its
+/// greeting less `svndiff1`, as standard output; nothing on standard error; exit-status 0, EOF and close, in order; one
+/// command run.
+#[test]
+fn an_svnserve_tunnel_serves_a_stock_session_over_the_channel() {
+  let site = || svn_tests::tunnel_site(Keys, HOLDER);
+  let (transcript, seen) = served_by(ONE_SEAT, site, |address| {
+    let mut peer = Peer::connect(address)?;
+    (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+    (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+    exec(&mut peer, b"svnserve -t").then_some(())?;
+    send_data(&mut peer, &svn_tests::latest_client());
+    send_eof(&mut peer);
+    Some(transcript(&mut peer))
+  });
+  assert_eq!(
+    transcript,
+    Some(Transcript {
+      out: svn_tests::latest_answer(),
+      err: Vec::new(),
+      status: Some(0),
+      order: vec![94, 98, 96, 97],
+      ended: true,
+    })
+  );
+  assert_eq!(
+    (seen.counts.commands_run, seen.counts.commands_refused),
+    (1, 0)
+  );
 }
