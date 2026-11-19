@@ -26,13 +26,25 @@
 > claim (main's ruling), the read waiting for room on the partition's channel and one never answered refusing the
 > submit `Overloaded`, unrecorded; every submit carrying its message (`Authorship`; `RequestBody::submit` the one
 > constructor, `with_message` the builder); the green's owner refusing `MessageRequired` and `IdentityRequired` beside
-> `EvidenceRequired`, before any work is built (the api's contract 51). OWED: the clients' surfaces
+> `EvidenceRequired`, before any work is built (the api's contract 51). Part 3's first piece BUILT
+> (`crates/server/src/vcs_store/paths.rs` and its tests; A-664 part 3's entry has the runs, on macOS arm64): each member
+> green of a git repository keeps the map of paths to git's files of its head (A-647's path map of `FileClass` entries
+> over the shard's content store, one a green, its root held once by the store), made as each version commits on the
+> owner (a submit's after its record is appended, a push's after its entry is applied): derived from the one before over
+> the change index and the hard links naming each changed file (`Green::links_naming`; the index names a change to a
+> regular file at the file alone), built whole where no map of the version before is kept or a copy names a tree by its
+> destination alone (`Green::copied_after`, A-586); given back as the green leaves its lineage
+> (`repository::retire_member`), made again from the head by a recovery and a rebuild, freed with the repository; the
+> live store held equal to one made again after a branch's destroy. OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); part 3, the made
 > commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
-> it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
-> `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
+> it and the branch's head names it, derived from the maps part 3's first piece keeps; the maps' whole builds and a whole
+> map's release sliced a unit at a time (each is one step, as A-662's replay of a record is); a branch's first map
+> derived from its source's where the source's head is the version it was made at; the holders' maps (A-636's fleet
+> half); a copy made through a work driven through the maps' whole build by a test, once a client verb makes one (A-626
+> part 4); a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
 > `.gitmodules` link, a name past 4096 bytes); a `.gitmodules` blob's own checks; blob ids read by content from the git
 > store's rows, so a rename or a revert hashes nothing; a derivation's transient listings charged to the store; then
 > Mercurial's changesets the server makes (§4.17.3 decision 7, piece 6) and Subversion's revisions (§4.17.4's revision
