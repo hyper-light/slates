@@ -34834,6 +34834,8 @@ its works: measured and rejected"); `unsafe-budget.toml` (`slates-mem` 68 → 63
   may keep for its replicas (`held_limit`) were near zero and its first release evicted the slowest replica, which then
   left and was made again inside the owner's next submit (A-465's remake), cloning the engine's every index on the
   owner's one thread.
-- **Tests.** The removed code's tests went with it. The libraries' own tests pass without it on the Mac Studio (below).
+- **Tests.** The removed code's tests went with it. On the Mac Studio (debug, r175, 2026-11-19), with it gone:
+  `cargo test --locked -p slates-server --lib` 456 passed, 3 ignored; `-p slates-merge --lib` 3 of 3; `-p slates-mem
+  --lib budget` 13 of 13 (the library compiles without `sealed`); rustfmt changes nothing of this change's.
 - **Owed.** Main's next A/B is the owner-shard path against itself; goal 87's next piece is what keeps its p99 above
   1 ms in the contended rounds (0.23 to 32.9 ms across r100's), which main profiles.
