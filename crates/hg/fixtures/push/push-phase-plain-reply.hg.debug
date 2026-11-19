@@ -1,0 +1,2 @@
+Stream params: {}
+reply:changegroup -- {in-reply-to: 3, return: 1} (mandatory: False)

@@ -1,0 +1,148 @@
+== commit-by-jrandom
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m First commit. mkdir trunk mkdir trunk/with space put WORK/sources/a.txt trunk/a.txt put WORK/sources/b.txt trunk/with space/b.txt put WORK/sources/cafe.txt trunk/café.txt
+exit 0
+== commit-by-jconstant
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jconstant -p -U svn://127.0.0.1:58678/r -m Second commit. put WORK/sources/a2.txt trunk/a.txt
+exit 0
+== lock
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password lock -m First line of the comment.
+Second line. svn://127.0.0.1:58678/r/trunk/a.txt
+exit 0
+== lock-stolen
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jconstant --password lock --force -m Stolen. svn://127.0.0.1:58678/r/trunk/a.txt
+exit 0
+== lock-broken
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password unlock --force svn://127.0.0.1:58678/r/trunk/a.txt
+exit 0
+== checkout
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password checkout svn://127.0.0.1:58678/r/trunk WORK/wc
+exit 0
+== lock-token-from-the-hook
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password lock WORK/wc/with space/b.txt
+exit 0
+== commit-releasing-its-lock
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password commit -m Third commit. WORK/wc
+exit 0
+== update
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password update WORK/wc
+exit 0
+== lock-two-paths
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password lock WORK/wc/café.txt
+exit 0
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password lock WORK/wc/a.txt
+exit 0
+== commit-keeping-its-locks
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password commit --no-unlock -m Fourth commit. WORK/wc
+exit 0
+== unlock-with-tokens
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password unlock WORK/wc/café.txt
+exit 0
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password unlock WORK/wc/a.txt
+exit 0
+== revprop-modified
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password propset --revprop -r 1 svn:log Edited log message. svn://127.0.0.1:58678/r
+exit 0
+== revprop-added
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password propset --revprop -r 1 slates:note added later svn://127.0.0.1:58678/r
+exit 0
+== revprop-deleted
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password propdel --revprop -r 1 slates:note svn://127.0.0.1:58678/r
+exit 0
+== start-commit-refuses
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Refused. put WORK/sources/new.txt trunk/x1.txt
+exit 1
+svnmucc: E165001: Commit blocked by start-commit hook (exit code 1) with output:
+start-commit refuses this commit
+
+== pre-commit-refuses
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Refused. put WORK/sources/new.txt trunk/x2.txt
+exit 1
+svnmucc: E165001: Commit blocked by pre-commit hook (exit code 2) with output:
+Refused: café
+second line
+
+== pre-commit-refuses-silently
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Refused. put WORK/sources/new.txt trunk/x3.txt
+exit 1
+svnmucc: E165001: Commit blocked by pre-commit hook (exit code 1) with no output.
+== pre-commit-killed
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Refused. put WORK/sources/new.txt trunk/x4.txt
+exit 1
+svnmucc: E165001: 'pre-commit' hook failed (did not exit cleanly: apr_exit_why_e was 2, exitcode was 9).   with output:
+dying
+
+== pre-commit-invalid-utf8
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Refused. put WORK/sources/new.txt trunk/x5.txt
+exit 1
+svnmucc: E165001: Commit blocked by pre-commit hook (exit code 1) with output:
+[Error output could not be translated from the native locale to UTF-8.]
+== pre-commit-nul
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Refused. put WORK/sources/new.txt trunk/x6.txt
+exit 1
+svnmucc: E165001: Commit blocked by pre-commit hook (exit code 1) with output:
+before
+== pre-revprop-change-refuses
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password propset --revprop -r 1 svn:log Refused. svn://127.0.0.1:58678/r
+exit 1
+svn: E165001: Revprop change blocked by pre-revprop-change hook (exit code 1) with output:
+no revision property changes
+
+== pre-revprop-change-missing
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password propset --revprop -r 1 svn:log Refused. svn://127.0.0.1:58678/r
+exit 1
+svn: E165006: Repository has not been enabled to accept revision propchanges;
+ask the administrator to create a pre-revprop-change hook
+== post-revprop-change-fails
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password propset --revprop -r 1 svn:log Edited again. svn://127.0.0.1:58678/r
+exit 1
+svn: E165001: post-revprop-change hook failed (exit code 1) with output:
+post-revprop-change failed
+
+== pre-lock-refuses
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password lock svn://127.0.0.1:58678/r/trunk/a.txt
+exit 1
+svn: warning: W165001: Lock blocked by pre-lock hook (exit code 1) with output:
+no locks on this path
+
+svn: E200009: One or more locks could not be obtained
+== post-lock-fails
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password lock svn://127.0.0.1:58678/r/trunk/a.txt
+exit 1
+svn: E165008: Locking succeeded, but post-lock hook failed
+svn: E165001: post-lock hook failed (exit code 1) with output:
+post-lock failed
+
+== pre-unlock-refuses
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password unlock --force svn://127.0.0.1:58678/r/trunk/a.txt
+exit 1
+svn: warning: W165001: Unlock blocked by pre-unlock hook (exit code 1) with output:
+no unlocking
+
+svn: E200009: One or more locks could not be released
+== post-unlock-fails
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password unlock --force svn://127.0.0.1:58678/r/trunk/a.txt
+exit 1
+svn: E165009: Unlock succeeded, but post-unlock hook failed
+svn: E165001: post-unlock hook failed (exit code 1) with output:
+post-unlock failed
+
+== post-commit-fails
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Fifth commit. put WORK/sources/new.txt trunk/post-commit-fails.txt
+exit 0
+== start-commit-not-executable
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Refused. put WORK/sources/new.txt trunk/x7.txt
+exit 1
+svnmucc: E165001: Commit blocked by start-commit hook (exit code 255) with no output.
+== pre-commit-broken-symlink
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Refused. put WORK/sources/new.txt trunk/x8.txt
+exit 1
+svnmucc: E165001: Failed to run 'WORK/root/r/hooks/pre-commit' hook; broken symlink
+== post-commit-not-executable
+$ svnmucc --config-dir WORK/config --non-interactive --no-auth-cache -u jrandom -p -U svn://127.0.0.1:58678/r -m Sixth commit. put WORK/sources/new.txt trunk/post-commit-not-executable.txt
+exit 0
+== pre-lock-token-with-a-newline
+$ svn --config-dir WORK/config --non-interactive --no-auth-cache --username jrandom --password lock svn://127.0.0.1:58678/r/trunk/a.txt
+exit 1
+svn: warning: W160037: Lock token 'opaquelocktoken:fixture-newline
+' is not ASCII or is a control character at byte 31
+svn: E200009: One or more locks could not be obtained

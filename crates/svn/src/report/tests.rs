@@ -9,36 +9,9 @@
 //! Subversion's canonical paths and URL decoding, the first refusal kept, the bounds, calls out of
 //! turn, and every cut of every report.
 
+use super::recorded::{ROOT_URL, Recorded, command, items, recorded, session, value_of};
 use super::*;
-use crate::handshake::{ClientCapabilities, Principal, Session};
-
-/// One recorded connection: what the client sent and what `svnserve` sent.
-#[derive(Clone, Copy)]
-struct Recorded {
-  /// The session's name and connection, its files' stem.
-  name: &'static str,
-  /// The client's bytes.
-  client: &'static [u8],
-  /// The server's bytes.
-  server: &'static [u8],
-}
-
-/// The recorded connection `$name`, its two files included at build time.
-macro_rules! recorded {
-  ($name:literal) => {
-    Recorded {
-      name: $name,
-      client: include_bytes!(concat!("../../fixtures/report/", $name, ".client.bin")),
-      server: include_bytes!(concat!("../../fixtures/report/", $name, ".server.bin")),
-    }
-  };
-}
-
-/// The repository's URL every session reached it at.
-const ROOT_URL: &[u8] = b"svn://127.0.0.1/repo";
-
-/// The repository's identity (`make-fixtures.py` `UUID`).
-const UUID: &[u8] = b"00000000-0000-4000-8000-0000000a0616";
+use crate::handshake::Session;
 
 /// The youngest revision of `history.txt`'s repository.
 const YOUNGEST: Revision = 6;
@@ -52,66 +25,6 @@ const TARGET_REV: &[u8] = b"( target-rev ";
 
 /// A trivial auth request, `serve.c`'s `trivial_auth_request`.
 const TRIVIAL_AUTH: &[u8] = b"( success ( ( ) 0: ) ) ";
-
-/// An anonymous session of a stock 1.15 client on the fixtures' repository.
-fn session() -> Session {
-  Session {
-    principal: Principal::Anonymous,
-    capabilities: ClientCapabilities {
-      svndiff1: true,
-      accepts_svndiff2: true,
-      absent_entries: true,
-      depth: true,
-      mergeinfo: true,
-      log_revprops: true,
-    },
-    uuid: UUID.to_vec(),
-    root_url: ROOT_URL.to_vec(),
-  }
-}
-
-/// Bounds that admit any item of `bytes`.
-fn admitting(bytes: &[u8]) -> Bounds {
-  Bounds {
-    item_bytes: bytes.len() + 1,
-    word_bytes: bytes.len(),
-    depth: bytes.len(),
-    nodes: bytes.len(),
-  }
-}
-
-/// `bytes` split into its items, each with its whitespace.
-fn items(bytes: &[u8]) -> Vec<&[u8]> {
-  let mut items = Vec::new();
-  let mut rest = bytes;
-  while !rest.is_empty() {
-    let Parsed::Item { consumed, .. } = Parser::new(admitting(rest)).parse(rest).unwrap() else {
-      panic!("the bytes end inside an item");
-    };
-    items.push(&rest[..consumed]);
-    rest = &rest[consumed..];
-  }
-  items
-}
-
-/// The value of one whole item.
-fn value_of(item: &[u8]) -> Value<'_> {
-  match Parser::new(admitting(item)).parse(item).unwrap() {
-    Parsed::Item { value, .. } => value,
-    Parsed::NeedMore { .. } => panic!("not a whole item"),
-  }
-}
-
-/// A command item's word and parameters, or none for an item that is no command.
-fn command(item: &[u8]) -> Option<(String, Vec<Value<'_>>)> {
-  match value_of(item) {
-    Value::List(parts) => match parts.as_slice() {
-      [Value::Word(name), Value::List(params)] => Some(((*name).to_owned(), params.clone())),
-      _ => None,
-    },
-    _ => None,
-  }
-}
 
 /// The repository path a URL names, for the tests' own bookkeeping of the session's path.
 fn path_of(url: &[u8]) -> String {
@@ -360,15 +273,15 @@ fn assert_finished(recorded: Recorded, expected: Report) {
 #[test]
 fn a_stock_checkouts_report_is_kept_as_svnserve_keeps_it() {
   assert_finished(
-    recorded!("checkout-r1.1"),
+    recorded("checkout-r1.1"),
     trunk_update(1, 1, path("", Some(1), Depth::Infinity, true)),
   );
   let mut empty = trunk_update(6, 6, path("", Some(6), Depth::Empty, true));
   empty.requested_depth = Depth::Empty;
-  assert_finished(recorded!("checkout-depth-empty.1"), empty);
+  assert_finished(recorded("checkout-depth-empty.1"), empty);
   let mut immediates = trunk_update(6, 6, path("", Some(6), Depth::Immediates, true));
   immediates.requested_depth = Depth::Immediates;
-  assert_finished(recorded!("checkout-depth-immediates.1"), immediates);
+  assert_finished(recorded("checkout-depth-immediates.1"), immediates);
 }
 
 /// A-616 (stock updates: to the head over r1, to depth infinity, at depth files, of mixed
@@ -379,16 +292,16 @@ fn a_stock_checkouts_report_is_kept_as_svnserve_keeps_it() {
 fn a_stock_updates_report_is_kept_as_svnserve_keeps_it() {
   let mut to_head = trunk_update(6, 1, path("", Some(1), Depth::Infinity, false));
   to_head.paths = vec![secret()];
-  assert_finished(recorded!("update-to-head.1"), to_head);
+  assert_finished(recorded("update-to-head.1"), to_head);
   let mut deeper = trunk_update(6, 6, path("", Some(6), Depth::Empty, false));
   deeper.requested_depth = Depth::Infinity;
-  assert_finished(recorded!("update-set-depth-infinity.1"), deeper);
+  assert_finished(recorded("update-set-depth-infinity.1"), deeper);
   let mut files = trunk_update(6, 6, path("", Some(6), Depth::Files, false));
   files.paths = vec![secret()];
-  assert_finished(recorded!("update-depth-files.1"), files);
+  assert_finished(recorded("update-depth-files.1"), files);
   let mut mixed = trunk_update(6, 6, path("", Some(6), Depth::Infinity, false));
   mixed.paths = vec![secret(), path("a.txt", Some(2), Depth::Infinity, false)];
-  assert_finished(recorded!("update-mixed-revisions.1"), mixed);
+  assert_finished(recorded("update-mixed-revisions.1"), mixed);
 }
 
 /// A-616 (stock updates of a target beneath the anchor: one file to r2, a subtree to a revision
@@ -399,12 +312,12 @@ fn a_stock_update_of_a_target_joins_its_report_to_the_target() {
   let mut file = trunk_update(2, 6, path("a.txt", Some(6), Depth::Infinity, false));
   file.operand = "a.txt".to_owned();
   file.target_path = "/trunk/a.txt".to_owned();
-  assert_finished(recorded!("update-file-to-r2.1"), file);
+  assert_finished(recorded("update-file-to-r2.1"), file);
   let mut subtree = trunk_update(1, 6, path("sub", Some(6), Depth::Infinity, false));
   subtree.anchor = "/trunk/dir".to_owned();
   subtree.operand = "sub".to_owned();
   subtree.target_path = "/trunk/dir/sub".to_owned();
-  assert_finished(recorded!("update-subtree-to-r1.1"), subtree);
+  assert_finished(recorded("update-subtree-to-r1.1"), subtree);
 }
 
 /// A-616 (stock reports of a not-present path, a lock and a switched subtree: `delete-path`,
@@ -414,8 +327,8 @@ fn a_stock_update_of_a_target_joins_its_report_to_the_target() {
 fn a_stock_reports_deletions_locks_and_links_are_kept() {
   let mut not_present = trunk_update(6, 6, path("", Some(6), Depth::Infinity, false));
   not_present.paths = vec![path("dir/sub", None, Depth::Infinity, false), secret()];
-  assert_finished(recorded!("update-with-not-present.1"), not_present);
-  let (_, replay, _) = replay_recorded(recorded!("update-with-lock.1"));
+  assert_finished(recorded("update-with-not-present.1"), not_present);
+  let (_, replay, _) = replay_recorded(recorded("update-with-lock.1"));
   let Ending::Finished(report) = replay.ending else {
     panic!("{:?}", replay.ending)
   };
@@ -430,12 +343,12 @@ fn a_stock_reports_deletions_locks_and_links_are_kept() {
   let mut held = path("a.txt", Some(6), Depth::Infinity, false);
   held.lock_token = Some(token);
   locked.paths = vec![secret(), held];
-  assert_finished(recorded!("update-with-lock.1"), locked);
+  assert_finished(recorded("update-with-lock.1"), locked);
   let mut linked = trunk_update(6, 6, path("", Some(6), Depth::Infinity, false));
   let mut switched = path("dir", Some(6), Depth::Infinity, false);
   switched.link_path = Some("/branches/b1/dir".to_owned());
   linked.paths = vec![switched, secret()];
-  assert_finished(recorded!("update-with-link.1"), linked);
+  assert_finished(recorded("update-with-link.1"), linked);
 }
 
 /// A-616 (stock `switch` of the whole and of a subtree, `status -u` and a URL `diff`: `serve.c`
@@ -448,25 +361,25 @@ fn a_stock_switch_status_and_diff_report_where_their_commands_say() {
   switch.target_path = "/branches/b1".to_owned();
   switch.is_switch = true;
   switch.paths = vec![secret()];
-  assert_finished(recorded!("switch-to-branch.1"), switch);
+  assert_finished(recorded("switch-to-branch.1"), switch);
   let mut subtree = trunk_update(6, 6, path("dir", Some(6), Depth::Infinity, false));
   subtree.kind = RequestKind::Switch;
   subtree.operand = "dir".to_owned();
   subtree.target_path = "/branches/b1/dir".to_owned();
   subtree.is_switch = true;
-  assert_finished(recorded!("switch-subtree.1"), subtree);
+  assert_finished(recorded("switch-subtree.1"), subtree);
   let mut status = trunk_update(6, 2, path("", Some(2), Depth::Infinity, false));
   status.kind = RequestKind::Status;
   status.text_deltas = false;
   status.paths = vec![secret()];
-  assert_finished(recorded!("status-u.1"), status);
+  assert_finished(recorded("status-u.1"), status);
   let mut diff = trunk_update(6, 1, path("trunk", Some(1), Depth::Infinity, false));
   diff.kind = RequestKind::Diff;
   diff.anchor = "/".to_owned();
   diff.operand = "trunk".to_owned();
   diff.is_switch = true;
   diff.ignore_ancestry = true;
-  assert_finished(recorded!("diff-r1-r6.1"), diff);
+  assert_finished(recorded("diff-r1-r6.1"), diff);
 }
 
 /// The server's items after the handshake, joined.
@@ -497,17 +410,17 @@ fn replay_hostile(recorded: Recorded) -> Replay {
 fn a_report_svnserve_refuses_at_its_end_is_refused_in_its_words() {
   let cases = [
     (
-      recorded!("hostile-report-first-not-root.1"),
+      recorded("hostile-report-first-not-root.1"),
       ReportFailure::InvalidTopLevel,
       165_004,
     ),
     (
-      recorded!("hostile-report-bad-depth.1"),
+      recorded("hostile-report-bad-depth.1"),
       ReportFailure::UnsupportedDepth,
       165_002,
     ),
     (
-      recorded!("hostile-report-delete-root.1"),
+      recorded("hostile-report-delete-root.1"),
       ReportFailure::TwoTopLevelReports,
       165_004,
     ),
@@ -528,7 +441,7 @@ fn a_report_svnserve_refuses_at_its_end_is_refused_in_its_words() {
     );
     assert_eq!(failure.subversion_code(), code);
   }
-  let elsewhere = recorded!("hostile-report-link-elsewhere.1");
+  let elsewhere = recorded("hostile-report-link-elsewhere.1");
   let replay = replay_hostile(elsewhere);
   let failure = ReportFailure::NotSameRepository {
     url: "svn://example.org/other/dir".to_owned(),
@@ -545,11 +458,11 @@ fn a_report_svnserve_refuses_at_its_end_is_refused_in_its_words() {
 /// aside.
 #[test]
 fn an_abandoned_report_and_an_excluded_request_are_answered_as_svnserve_answers_them() {
-  let aborted = recorded!("hostile-report-abort.1");
+  let aborted = recorded("hostile-report-abort.1");
   let replay = replay_hostile(aborted);
   assert_eq!(replay.ending, Ending::Aborted);
   assert_eq!(replay.written, after_handshake(aborted.server));
-  let excluded = recorded!("hostile-update-depth-exclude.1");
+  let excluded = recorded("hostile-update-depth-exclude.1");
   let replay = replay_hostile(excluded);
   assert_eq!(
     replay.ending,
@@ -567,10 +480,10 @@ fn an_abandoned_report_and_an_excluded_request_are_answered_as_svnserve_answers_
 #[test]
 fn a_report_that_reaches_the_drive_is_answered_as_svnserve_answered_it_before() {
   for recorded in [
-    recorded!("hostile-report-unknown-command.1"),
-    recorded!("hostile-report-missing-path.1"),
-    recorded!("hostile-update-target-absent.1"),
-    recorded!("hostile-report-client-refuses-the-edit.1"),
+    recorded("hostile-report-unknown-command.1"),
+    recorded("hostile-report-missing-path.1"),
+    recorded("hostile-update-target-absent.1"),
+    recorded("hostile-report-client-refuses-the-edit.1"),
   ] {
     let replay = replay_hostile(recorded);
     assert!(
@@ -586,8 +499,8 @@ fn a_report_that_reaches_the_drive_is_answered_as_svnserve_answered_it_before() 
     );
   }
   for recorded in [
-    recorded!("hostile-report-revision-past-head.1"),
-    recorded!("hostile-report-early-edit-response.1"),
+    recorded("hostile-report-revision-past-head.1"),
+    recorded("hostile-report-early-edit-response.1"),
   ] {
     let replay = replay_hostile(recorded);
     assert!(
@@ -609,7 +522,7 @@ fn a_report_that_reaches_the_drive_is_answered_as_svnserve_answered_it_before() 
 /// expect the connection refused, "Malformed network data", 210004.
 #[test]
 fn a_malformed_report_command_ends_the_connection() {
-  let replay = replay_hostile(recorded!("hostile-report-malformed-set-path.1"));
+  let replay = replay_hostile(recorded("hostile-report-malformed-set-path.1"));
   assert_eq!(replay.ending, Ending::Ended(Refused::Malformed));
   assert_eq!(Refused::Malformed.subversion_code(), Some(210_004));
 }
@@ -1010,11 +923,11 @@ fn a_call_after_the_report_is_out_of_turn() {
 #[test]
 fn every_recorded_report_cut_anywhere_is_read_as_the_whole() {
   for recorded in [
-    recorded!("update-to-head.1"),
-    recorded!("update-with-lock.1"),
-    recorded!("update-with-link.1"),
-    recorded!("hostile-report-unknown-command.1"),
-    recorded!("hostile-report-link-elsewhere.1"),
+    recorded("update-to-head.1"),
+    recorded("update-with-lock.1"),
+    recorded("update-with-link.1"),
+    recorded("hostile-report-unknown-command.1"),
+    recorded("hostile-report-link-elsewhere.1"),
   ] {
     let (session_path, index, request) = report_command(recorded);
     let session = session();

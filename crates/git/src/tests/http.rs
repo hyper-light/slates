@@ -4,8 +4,8 @@ use slates_http::head::{
 };
 
 use super::{
-  Allowed, Reply, Route, RouteRefused, Service, Version, advertisement_prelude, refusal_reply,
-  reply_head, route, version,
+  Allowed, Reply, Route, RouteRefused, Service, Version, advertisement_prelude, no_cache_fields,
+  refusal_parts, refusal_reply, reply_fields, reply_head, route, version,
 };
 use crate::to_u64;
 
@@ -652,4 +652,80 @@ fn a_refusal_reply_is_written_as_http_backend_answers() {
       "{refusal:?} {http:?}"
     );
   }
+}
+
+/// Every reply kind a smart route answers with: each service's advertisement and result.
+const REPLIES: [Reply; 4] = [
+  Reply::Advertisement(Service::UploadPack),
+  Reply::Advertisement(Service::ReceivePack),
+  Reply::Result(Service::UploadPack),
+  Reply::Result(Service::ReceivePack),
+];
+
+/// Every kind of refused route, one of each.
+const REFUSALS: [RouteRefused; 11] = [
+  RouteRefused::NotFound,
+  RouteRefused::MethodNotAllowed(Allowed::GetHead),
+  RouteRefused::MethodNotAllowed(Allowed::Post),
+  RouteRefused::DumbProtocol,
+  RouteRefused::UnsupportedService,
+  RouteRefused::ServiceNotServed,
+  RouteRefused::UnsupportedMediaType,
+  RouteRefused::LengthRequired,
+  RouteRefused::BadPath,
+  RouteRefused::Head(HeadRefused::BadRequest(Malformed::RepeatedField)),
+  RouteRefused::PastRoom,
+];
+
+/// A-625 part 2: do render each smart reply's fields as data the way the HTTP edge renders a decided reply
+/// (`slates-http`'s `reply::head`, chunked to HTTP/1.1, framed by the close to HTTP/1.0, kept or closed). Expect, byte
+/// for byte, the head [`reply_head`] writes, which the golden vectors hold to `http-backend`'s.
+#[test]
+fn a_smart_replys_fields_as_data_render_its_head() {
+  use slates_http::reply::{self, Body, Status};
+  for kind in REPLIES {
+    for (http, body) in [
+      (HttpVersion::Http11, Body::Chunked),
+      (HttpVersion::Http10, Body::UntilClose),
+    ] {
+      for keep_alive in [true, false] {
+        let mut written = Vec::new();
+        reply_head(kind, http, keep_alive, &mut written).unwrap();
+        let mut rendered = Vec::new();
+        reply::head(
+          Status::OK,
+          &reply_fields(kind),
+          body,
+          !keep_alive,
+          &mut rendered,
+        )
+        .unwrap();
+        assert_eq!(rendered, written, "{kind:?} {http:?} kept {keep_alive}");
+      }
+    }
+  }
+}
+
+/// A-625 part 2: do render each refused route's status and fields as data the way the HTTP edge renders a refusal that
+/// ends its connection, over each version. Expect, byte for byte, the reply [`refusal_reply`] writes: `Allow` on a `405`
+/// alone and first, then `http-backend`'s cache fields, which [`no_cache_fields`] gives a site's own refusals.
+#[test]
+fn a_refused_routes_parts_as_data_render_its_reply() {
+  use slates_http::reply::{self, Body};
+  let mut cache_only = Vec::new();
+  for refused in REFUSALS {
+    for http in [HttpVersion::Http11, HttpVersion::Http10] {
+      let mut written = Vec::new();
+      refusal_reply(refused, http, &mut written).unwrap();
+      let (status, fields) = refusal_parts(refused, http);
+      assert_eq!(status, refused.status(http), "{refused:?} {http:?}");
+      let mut rendered = Vec::new();
+      reply::head(status, &fields, Body::Length(0), true, &mut rendered).unwrap();
+      assert_eq!(rendered, written, "{refused:?} {http:?}");
+      if refused == RouteRefused::NotFound {
+        cache_only = fields;
+      }
+    }
+  }
+  assert_eq!(cache_only, no_cache_fields().to_vec());
 }
