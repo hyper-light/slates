@@ -44,6 +44,9 @@ pub mod partition;
 pub mod reconfig;
 pub mod record;
 pub mod register;
+// Goal 81's chaos part, its network half: the fenced register under a network nemesis, its invariants as history checks.
+#[cfg(test)]
+mod register_nemesis;
 pub mod replay;
 pub mod repository;
 pub mod takeover;

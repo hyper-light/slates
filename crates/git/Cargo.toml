@@ -1,0 +1,18 @@
+[package]
+name = "slates-git"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "git's wire formats (§4.17.2, A-582): pkt-lines and side-band-64k, decoded and encoded as pure functions over bytes, every length checked against the input and the caller's admission."
+
+[dependencies]
+
+[dev-dependencies]
+slates-test-seeds = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

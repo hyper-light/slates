@@ -3599,3 +3599,35 @@ mod channel {
     });
   }
 }
+
+#[cfg(test)]
+mod upcase_table {
+  //! The volume core's copy of Windows' upcase table against the system's own (A-576): a volume that folds names by
+  //! `NameEquivalence::Upcase` folds them as WinFsp's driver does only while the two agree at every unit.
+
+  use super::system_upcase;
+
+  /// A-576. Do: upcase each of the 65,536 UTF-16 units through the volume core's table (`slates_vfs::upcase`, Microsoft's
+  /// recommended exFAT up-case table) and through ntdll's `RtlUpcaseUnicodeChar`, the table WinFsp's driver compares by.
+  /// Expect: the same unit at every one, and the first differences named if not, so a drive and its volume take the
+  /// same names for one. Windows only, as the table it reads is.
+  #[test]
+  fn the_volumes_upcase_table_is_the_systems() {
+    let differences: Vec<(u16, u16, u16)> = (0..=u16::MAX)
+      .filter_map(|unit| {
+        let (volume, system) = (slates_vfs::upcase::upcase(unit), system_upcase(unit));
+        (volume != system).then_some((unit, volume, system))
+      })
+      .collect();
+    let first: Vec<String> = differences
+      .iter()
+      .take(32)
+      .map(|(unit, volume, system)| format!("{unit:04X}: volume {volume:04X}, system {system:04X}"))
+      .collect();
+    assert!(
+      differences.is_empty(),
+      "{} units differ; the first: {first:?}",
+      differences.len()
+    );
+  }
+}

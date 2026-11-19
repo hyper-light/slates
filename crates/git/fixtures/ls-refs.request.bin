@@ -1,0 +1,8 @@
+0014command=ls-refs
+0017object-format=sha1
+00010009peel
+000csymrefs
+000bunborn
+0014ref-prefix HEAD
+0015ref-prefix refs/
+0000

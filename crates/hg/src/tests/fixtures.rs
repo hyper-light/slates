@@ -189,3 +189,131 @@ pub(crate) mod payloads {
   pub(crate) const PUSH_STRICT_LISTKEYS_PHASES: &[u8] =
     include_bytes!("../../fixtures/payloads/push-strict-listkeys-phases.bin");
 }
+
+/// The wire protocol's golden vectors (A-569): what stock 7.2's clients sent and its servers answered over SSH and
+/// HTTP, each file as `fixtures/wire/make-wire-fixtures.sh` wrote it (its header names the exact command), compiled
+/// in by name.
+pub(crate) mod wire {
+  /// Lists each capture's name with its bytes.
+  macro_rules! captures {
+    ($($name:literal),* $(,)?) => {
+      /// Every capture, by its file name.
+      const FILES: &[(&str, &[u8])] = &[$(($name, include_bytes!(concat!("../../fixtures/wire/", $name)))),*];
+    };
+  }
+
+  captures![
+    "http-clone.01.request",
+    "http-clone.01.response-body",
+    "http-clone.01.response-head",
+    "http-clone.02.request",
+    "http-clone.02.response-body",
+    "http-clone.02.response-head",
+    "http-clone.03.request",
+    "http-clone.03.response-body",
+    "http-clone.03.response-head",
+    "http-none.01.request",
+    "http-none.01.response-body",
+    "http-none.01.response-head",
+    "http-none.02.request",
+    "http-none.02.response-body",
+    "http-none.02.response-head",
+    "http-none.03.request",
+    "http-none.03.response-body",
+    "http-none.03.response-head",
+    "http-oob.01.request",
+    "http-oob.01.response-body",
+    "http-oob.01.response-head",
+    "http-oob.02.request",
+    "http-oob.02.response-body",
+    "http-oob.02.response-head",
+    "http-oob.03.request",
+    "http-oob.03.response-body",
+    "http-oob.03.response-head",
+    "http-oob.04.request",
+    "http-oob.04.response-body",
+    "http-oob.04.response-head",
+    "http-oob.client-stderr",
+    "http-postargs.01.request",
+    "http-postargs.01.response-body",
+    "http-postargs.01.response-head",
+    "http-postargs.02.request",
+    "http-postargs.02.response-body",
+    "http-postargs.02.response-head",
+    "http-postargs.03.request",
+    "http-postargs.03.response-body",
+    "http-postargs.03.response-head",
+    "http-postargs.answer",
+    "http-push.01.request",
+    "http-push.01.response-body",
+    "http-push.01.response-head",
+    "http-push.02.request",
+    "http-push.02.response-body",
+    "http-push.02.response-head",
+    "http-push.03.request",
+    "http-push.03.response-body",
+    "http-push.03.response-head",
+    "http-push.04.request",
+    "http-push.04.response-body",
+    "http-push.04.response-head",
+    "http-push.05.request",
+    "http-push.05.response-body",
+    "http-push.05.response-head",
+    "http-push.06.request",
+    "http-push.06.response-body",
+    "http-push.06.response-head",
+    "http-push.07.request",
+    "http-push.07.response-body",
+    "http-push.07.response-head",
+    "http-push.08.request",
+    "http-push.08.response-body",
+    "http-push.08.response-head",
+    "http-query.01.request",
+    "http-query.01.response-body",
+    "http-query.01.response-head",
+    "http-query.02.request",
+    "http-query.02.response-body",
+    "http-query.02.response-head",
+    "http-query.03.request",
+    "http-query.03.response-body",
+    "http-query.03.response-head",
+    "http-query.answer",
+    "http-wireargs.01.request",
+    "http-wireargs.01.response-body",
+    "http-wireargs.01.response-head",
+    "http-wireargs.02.request",
+    "http-wireargs.02.response-body",
+    "http-wireargs.02.response-head",
+    "http-wireargs.03.request",
+    "http-wireargs.03.response-body",
+    "http-wireargs.03.response-head",
+    "http-wireargs.answer",
+    "server-log.txt",
+    "ssh-clone.client",
+    "ssh-clone.server",
+    "ssh-clone.stderr",
+    "ssh-oob.client",
+    "ssh-oob.client-stderr",
+    "ssh-oob.server",
+    "ssh-oob.stderr",
+    "ssh-pull.client",
+    "ssh-pull.server",
+    "ssh-pull.stderr",
+    "ssh-push.client",
+    "ssh-push.server",
+    "ssh-push.stderr",
+    "ssh-wireargs.answer",
+    "ssh-wireargs.client",
+    "ssh-wireargs.server",
+    "ssh-wireargs.stderr",
+  ];
+
+  /// The capture named `name`.
+  pub(crate) fn file(name: &str) -> &'static [u8] {
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
+      .unwrap_or_else(|| panic!("no capture {name}"))
+  }
+}

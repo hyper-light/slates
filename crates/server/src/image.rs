@@ -2004,12 +2004,13 @@ impl ImportJob {
   }
 
   /// Admits the new volume, as a create admits one (every credit reserved, or none), under its archive's name policy:
-  /// one this daemon does not hold is refused `Unsupported`.
+  /// one this daemon does not hold is refused `Unsupported`. Windows' upcase folding (A-576) is such a policy until the
+  /// protocol and the catalog name it (A-576's part 2): the volume core folds by it, and no record of a volume can say so.
   fn admit(&mut self, state: &mut ShardState, name_policy_id: u32) -> Result<(), Refusal> {
     self.names = match slates_vfs::export::name_equivalence_of_id(name_policy_id) {
       Some(NameEquivalence::Exact) => NamePolicy::Exact,
       Some(NameEquivalence::Fold) => NamePolicy::Fold,
-      None => {
+      Some(NameEquivalence::Upcase) | None => {
         return Err(Refusal::ArchiveRefused {
           fault: ArchiveFault::Unsupported,
         });

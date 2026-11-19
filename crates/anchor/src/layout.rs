@@ -151,6 +151,14 @@ pub const SUP_LOOKED: usize = 216;
 /// operator) can wait for the anchor's own verdict first. Zero in a block an older anchor wrote.
 /// Format: the byte offset inside the supervision block, the word after the looked word.
 pub const SUP_RECOVERED: usize = 224;
+/// The anchor's **lapse bound** word (A-574): the age, in nanoseconds, past which the anchor takes its daemon's beat for
+/// lapsed and kills it (A-467: the liveness window plus the anchor's own measured lateness p99, within the watchdog's
+/// ceiling), written by the anchor's observation loop whenever it moves. The daemon reads it as the anchor's part of its
+/// failover detection (`slates_cluster::failover::supervision`): a stuck daemon is found by its own watchdog, which then
+/// withholds the beat, and is killed once that beat is this old. Zero in a block no anchor wrote: a daemon run alone,
+/// which its own watchdog ends, or one under an older anchor.
+/// Format: the byte offset inside the supervision block, the word after the recovered word.
+pub const SUP_LAPSE_BOUND: usize = 232;
 /// The node's **client session secret** published word: `1` once a daemon has published the secret after it, `0` before
 /// (a fresh segment, or one an older anchor wrote). The secret is made by the first daemon under this anchor and adopted
 /// by every daemon after it, so a client's session key (`slates_server::session_key`), which only it and the daemon

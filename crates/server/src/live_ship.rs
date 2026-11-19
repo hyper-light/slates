@@ -1834,8 +1834,9 @@ const LIVE_YIELD_REFUSED: &str = "fleet.live.yield_refused";
 /// it and tells every write waiting on it so; a fence learned now is kept before anyone is told, as a holder keeps a
 /// fence it raised, so a restart does not forget it (A-344; a refused publication leaves the mark for the next); and
 /// its mounts of the volume learn of it at once (A-346): a FUSE mount ends as a revoked one does
-/// (`crate::fuse::superseded`), and an NFS mount answers `NFS3ERR_STALE` at its next request (`crate::nfs`'s gate reads
-/// [`superseded`]). Nothing for a volume this shard ships no log of.
+/// (`crate::fuse::superseded`), a Shards stream too (`crate::shards::superseded`, A-584), and an NFS mount answers
+/// `NFS3ERR_STALE` at its next request (`crate::nfs`'s gate reads [`superseded`]). Nothing for a volume this shard ships
+/// no log of.
 fn learn_superseded(state: &mut ShardState, volume: [u8; 16], current: HostEpoch) {
   let Some(live) = state.live.shipping.get_mut(&volume) else {
     return;
@@ -1849,16 +1850,17 @@ fn learn_superseded(state: &mut ShardState, volume: [u8; 16], current: HostEpoch
     }
     #[cfg(target_os = "linux")]
     crate::fuse::superseded(state, slates_db::catalog::VolumeId { bytes: volume });
+    crate::shards::superseded(state, slates_db::catalog::VolumeId { bytes: volume });
   }
   refuse_awaiting(state, volume, current);
   wake_parked(state, volume);
 }
 
 /// Test support (`Daemon::inject_superseded`, never reachable from the wire): this owner is superseded on `id` at
-/// `epoch`, `learned` now, as a holder's answer with a later fence finds it ([`learn_superseded`], its mounts told), or
-/// else as a restart over a kept fence finds it (A-344: the fence kept, no mount told, each mount's own turn finds it).
-/// A volume this shard ships no log of is marked by a kept fence either way. So a mount's answer to a takeover is driven
-/// without a fleet, each path alone.
+/// `epoch`, `learned` now, as a holder's answer with a later fence finds it ([`learn_superseded`], its mounts and
+/// streams told), or else as a restart over a kept fence finds it (A-344: the fence kept, none told, each mount's and
+/// stream's own turn finds it). A volume this shard ships no log of is marked by a kept fence either way. So a mount's
+/// or a stream's answer to a takeover is driven without a fleet, each path alone.
 pub(crate) fn inject_superseded(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
@@ -1885,6 +1887,9 @@ pub(crate) fn inject_superseded(
   #[cfg(target_os = "linux")]
   if learned {
     crate::fuse::superseded(state, id);
+  }
+  if learned {
+    crate::shards::superseded(state, id);
   }
 }
 

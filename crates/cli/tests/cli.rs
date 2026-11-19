@@ -3790,6 +3790,9 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.accept.replaced",
     "fleet.fan.sent",
     "fleet.fan.unchanged",
+    // The beat's fan of the failover delay to a shard whose last received delay it no longer was (A-574,
+    // `fleet::FAILOVER_FAN_SENT`), the configuration fan's former part; its refusals still fail here.
+    "fleet.failover_fan.sent",
     // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
     // discovery pages sent, the learner's configuration fetches and those its backoff skipped, and the
     // announcement pass's lent sessions and sends.

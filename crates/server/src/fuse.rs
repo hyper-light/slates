@@ -47,8 +47,9 @@ use slates_base::own_mounts::Unrecorded;
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, LostWrites, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
-  ChangeSignal, Dispatched, FuseChannel, Sent, ServeState, Step, Turn, Wake, dispatch_ready,
-  reclaim_dispatched, redeliver_after_refusal, refuse_unserved, send_reply, serve_step,
+  ChangeSignal, Dispatched, FuseChannel, Sent, ServeState, Step, Turn, Wake, dispatch_kept,
+  dispatch_ready, reclaim_dispatched, redeliver_after_refusal, refuse_unserved, send_reply,
+  serve_step,
 };
 use slates_bridge_fuse::mount::{
   Awaiting, Mount, MountError, PendingExit, Progress, begin_mount, begin_unmount,
@@ -98,6 +99,9 @@ const ADOPTED: &str = "fuse.adopted";
 /// Format: see [`MOUNT_REFUSED`] — requests the kernel resent after a takeover's `FUSE_NOTIFY_RESEND` (A-61): ones
 /// a dead daemon read and never answered, served here; the resend's non-vacuity counter.
 const RESENT: &str = "fuse.resent";
+/// Format: the counter of requests kept off the device while their base fetched what they read (A-555), each a wait:
+/// the non-vacuity count of that path.
+const KEPT: &str = "fuse.base_kept";
 /// Format: entry invalidations the kernel **refused** with `ENOENT`, counted only for names this mount handed the
 /// kernel: a name it never got cannot be in its cache, and since A-137 no lookup miss is cached either. Zero is the
 /// healthy reading. Movement means the kernel dropped a name it was handed on its own (a dentry evicted, which the
@@ -156,12 +160,13 @@ const REVOKED_UNWOKEN: &str = "fuse.revoked_unwoken";
 /// Format: mounts ended because this node lost their volume to a takeover (A-346): each fenced as a revoked mount is, its
 /// kernel's cache dropped, then ended.
 const SUPERSEDED_ENDED: &str = "fuse.superseded_ended";
-/// Shape: the share of the shard's step quantum one slice of a takeover round may take, in permille: half, as a landing
-/// slice and a destroy slice take, so a mount taken over with a large kernel cache leaves the rest of each step to the
-/// shard's other clients (§4.3).
-const TAKEOVER_SLICE_PERMILLE: u64 = 500;
-/// Format: parts per thousand.
-const PERMILLE: u64 = 1_000;
+/// Format: rounds whose first slice ran out of its turn with items still owed (A-562): a journal gather over a backlog,
+/// or an overrun round over a large kernel cache, sent over several turns. The signal that a mount's rounds outgrow the
+/// shard's step; movement is expected after a burst of writes elsewhere or an overrun.
+const ROUNDS_OUTGROWN: &str = "fuse.rounds_outgrown";
+/// Format: slices that resumed a round where an earlier slice stopped (A-562): the non-vacuity counter of the sliced
+/// rounds, which moves whenever [`ROUNDS_OUTGROWN`] does.
+const SLICES_RESUMED: &str = "fuse.slices_resumed";
 
 /// A mounted volume being served: its device, the serve loop's state, the open-handle map that persists
 /// across requests, the registry attachment its requests are admitted under, and where it is mounted.
@@ -192,9 +197,21 @@ pub(crate) struct FuseMount {
   /// What this mount's journal reader's rounds have shown of its kernel's pace (A-548): the reader's patience is
   /// learned from them after every turn (`crate::reader_patience`).
   patience: crate::learned_wait::LearnedWait,
+  /// Requests kept while their base fetched what they read, their wait since ended (A-555, [`keep`]): dispatched again,
+  /// oldest first, before the device is read. Bounded by the shard's base waits, one each took before it came here.
+  kept: std::collections::VecDeque<Kept>,
+  /// The mount's task's waker while it waits for work, woken when a kept request comes back ([`settle_kept`]).
+  kept_waker: Option<std::task::Waker>,
   /// This mount's place in the daemon's own mounts (A-227): recorded while it is served, forgotten when it is dropped.
   /// Held for its drop alone.
   _own: OwnMountRecord,
+}
+
+/// A request kept off the device while its base fetched what it reads (A-555): the request as the kernel sent it, and
+/// the deadline of its whole wait (the failover delay from its first, the most a reply is held).
+struct Kept {
+  request: Vec<u8>,
+  until_ns: u64,
 }
 
 /// A FUSE mount's id in the process's set of its own mounts (`slates_base::own_mounts`, A-227), so no daemon thread
@@ -621,6 +638,8 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
       seen: 0,
       held: std::collections::VecDeque::new(),
       patience: crate::learned_wait::LearnedWait::default(),
+      kept: std::collections::VecDeque::new(),
+      kept_waker: None,
       _own: own,
     },
   );
@@ -706,11 +725,12 @@ fn volume_changed(s: &mut ShardState, attachment: u64, waker: &std::task::Waker)
     .is_ok_and(|slot| slot.volume.wait_for_change(seen, waker))
 }
 
-/// Whether mount `attachment`, taken over from a daemon that died, has yet to send its takeover round (A-158).
-fn owes_takeover_round(s: &ShardState, attachment: u64) -> bool {
+/// Whether mount `attachment` has a slice of a round to send now (A-158, A-562): the takeover round of a mount taken
+/// over from a daemon that died, or the rest of a journal gather or an overrun round a turn's slice cut.
+fn owes_round_now(s: &ShardState, attachment: u64) -> bool {
   s.fuse_mounts
     .get(&attachment)
-    .is_some_and(|mount| mount.serve.owes_takeover_round())
+    .is_some_and(|mount| mount.serve.owes_round_now())
 }
 
 /// Whether every FUSE mount of `volume` has been told through journal record `seq` (AC-3.3; `crate::told`): asked on the
@@ -757,6 +777,10 @@ async fn wait_for_work(
   std::future::poll_fn(|cx| {
     // Held `fsync` replies whose volume became durable (or never will) are answered first; the rest park on it.
     let _ = state::with_state(|s| settle_held(s, attachment, Some(cx.waker())));
+    // A kept request whose wait ended goes before the device (A-555, [`keep`]).
+    if state::with_state(|s| kept_ready(s, attachment, cx.waker())).unwrap_or(false) {
+      return std::task::Poll::Ready(Ok(Woke::Request));
+    }
     if give_up.as_mut().poll(cx).is_ready() {
       return std::task::Poll::Ready(Ok(Woke::Held));
     }
@@ -769,9 +793,10 @@ async fn wait_for_work(
     if state::with_state(|s| volume_changed(s, attachment, cx.waker())).unwrap_or(false) {
       return std::task::Poll::Ready(Ok(Woke::Change));
     }
-    // A mount taken over from a dead daemon turns at once until its takeover round is out (A-158): a kernel serving
-    // from its stale cache sends no request, and nothing may change again for a long time.
-    if state::with_state(|s| owes_takeover_round(s, attachment)).unwrap_or(false) {
+    // A mount with a round owed turns at once until it is out (A-158, A-562): its takeover round, or the rest of a round
+    // its last turn's slice cut. A kernel serving from its stale cache sends no request, and nothing may change again for
+    // a long time.
+    if state::with_state(|s| owes_round_now(s, attachment)).unwrap_or(false) {
       return std::task::Poll::Ready(Ok(Woke::Change));
     }
     std::task::Poll::Pending
@@ -809,7 +834,13 @@ async fn serve(attachment: u64) {
           let _ = state::with_state_counted(|s| ended(s, attachment));
           return;
         }
-        Some(Turned::Idle | Turned::Served) => {}
+        Some(Turned::Idle | Turned::Served) => {
+          // A round its slice cut that sent nothing has no return to wake the task, and the wait answers at once while
+          // it is owed (A-562): the shard's other tasks run between its slices.
+          if state::with_state(|s| owes_round_now(s, attachment)).unwrap_or(false) {
+            let _ = futures::yield_now().await;
+          }
+        }
       }
       continue;
     }
@@ -941,14 +972,14 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     .unwrap_or(0)
     .max(1)
     .saturating_mul(chunk);
-  // A takeover round runs a slice per turn too (A-158), timed against the shard's live quantum.
-  mount.serve.slices_within(
-    s.config
-      .step_quantum_ns()
-      .saturating_mul(TAKEOVER_SLICE_PERMILLE)
-      / PERMILLE,
-  );
-  let dispatched = {
+  // A mount's rounds run a slice per turn too (A-158, A-562): its takeover round, its journal gather and its overrun
+  // round, timed together against the shard's live quantum as every clock-bounded slice is.
+  mount.serve.slices_within(s.config.copy_slice_ns());
+  // A request kept while its base fetched what it reads (A-555), its wait ended, goes before the device's: the kernel
+  // has waited for it longest. Not while an allocation runs, whose slices go first.
+  let kept = next_kept(mount, kind);
+  let kept_until = kept.as_ref().map(|kept| kept.until_ns);
+  let (dispatched, met) = {
     let ShardState {
       store,
       volumes,
@@ -958,42 +989,63 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     let Ok(slot) = volumes.get_mut(handle) else {
       return Turned::Ended;
     };
-    let mut bridge = VolumeBridge::attached(
-      mount.volume,
-      &mut slot.volume,
-      store,
-      &mut mount.handles,
-      slot.host.as_mut().map(|host| host as &mut dyn HostFs),
-    )
-    .with_lost_writes(&mut mount.lost);
-    let mut scoped = None;
-    let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, mount.scope);
-    match kind {
-      TurnKind::Request => dispatch_ready(
-        &mut mount.channel,
-        served,
-        attachments,
-        mount.registry,
-        &mut mount.serve,
-        slice_bytes,
-      ),
-      TurnKind::Change => {
-        mount.change.drain();
-        serve_step(
+    // The slot's base host is lent through a lens that notes the fetch a request met pending (A-555): such a request is
+    // kept, not answered, until that fetch lands ([`keep`]).
+    let mut lens = slot
+      .host
+      .as_mut()
+      .map(|host| crate::base_wait::Lens::over(host));
+    let dispatched = {
+      let mut bridge = VolumeBridge::attached(
+        mount.volume,
+        &mut slot.volume,
+        store,
+        &mut mount.handles,
+        lens.as_mut().map(|lens| lens as &mut dyn HostFs),
+      )
+      .with_lost_writes(&mut mount.lost);
+      let mut scoped = None;
+      let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, mount.scope);
+      match (kind, kept) {
+        (TurnKind::Request, Some(kept)) => dispatch_kept(
           &mut mount.channel,
           served,
           attachments,
           mount.registry,
           &mut mount.serve,
-          Wake::Change,
-        )
-        .map(|step| match step {
-          Step::Ended => Turn::Ended,
-          // A change wake reads no request, so it only delivers or ends; the other steps are a request's.
-          Step::Change(_) | Step::Request { .. } | Step::Dropped => Turn::Idle,
-        })
+          slice_bytes,
+          kept.request,
+        ),
+        (TurnKind::Request, None) => dispatch_ready(
+          &mut mount.channel,
+          served,
+          attachments,
+          mount.registry,
+          &mut mount.serve,
+          slice_bytes,
+        ),
+        (TurnKind::Change, _) => {
+          mount.change.drain();
+          serve_step(
+            &mut mount.channel,
+            served,
+            attachments,
+            mount.registry,
+            &mut mount.serve,
+            Wake::Change,
+          )
+          .map(|step| match step {
+            Step::Ended => Turn::Ended,
+            // A change wake reads no request, so it only delivers or ends; the other steps are a request's.
+            Step::Change(_) | Step::Request { .. } | Step::Dropped => Turn::Idle,
+          })
+        }
       }
-    }
+    };
+    (
+      dispatched,
+      lens.as_ref().and_then(crate::base_wait::Lens::met),
+    )
   };
   hand_over_session(s, attachment, mount);
   // Whether this turn delivered the owed round: a change turn always does; a request turn only when it dispatched a
@@ -1019,7 +1071,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
         let count = s.refusals.entry(RESENT).or_insert(0);
         *count = count.saturating_add(1);
       }
-      reply(s, attachment, mount, &dispatched)
+      answer(s, attachment, mount, &dispatched, (met, kept_until))
     }
     Err(_) => {
       // Ended without an unmount: the mount answers `ENOTCONN` until its user unmounts it (see `turn`).
@@ -1043,6 +1095,9 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   s.count(WRITEBACKS_UNKNOWN, unknown);
   let overruns = mount.serve.take_journal_overruns();
   s.count(JOURNAL_OVERRUNS, overruns);
+  let (outgrown, resumed) = mount.serve.take_sliced_counts();
+  s.count(ROUNDS_OUTGROWN, outgrown);
+  s.count(SLICES_RESUMED, resumed);
   // What the journal reader's rounds found this turn teaches its patience (A-548).
   crate::reader_patience::learn(s, mount.volume, mount.registry.key(), &mut mount.patience);
   let lost_for_room = mount.serve.take_states_lost_for_room();
@@ -1069,6 +1124,93 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     crate::told::wake(s, mount.volume);
   }
   turned
+}
+
+/// The kept request a request turn dispatches before reading the device (A-555): the oldest whose wait ended, unless an
+/// allocation runs, whose slices go first; none for a change turn.
+fn next_kept(mount: &mut FuseMount, kind: TurnKind) -> Option<Kept> {
+  match kind {
+    TurnKind::Request if !mount.serve.allocation_running() => mount.kept.pop_front(),
+    TurnKind::Request | TurnKind::Change => None,
+  }
+}
+
+/// Answers a dispatched request ([`reply`]), or keeps it ([`keep`]) when it was answered the retry because a base host
+/// call of it met `met`, a fetch under way (A-555); `kept_until` is the deadline a request brought back from its wait
+/// carries.
+fn answer(
+  s: &mut ShardState,
+  attachment: u64,
+  mount: &mut FuseMount,
+  dispatched: &Dispatched,
+  (met, kept_until): (Option<slates_vfs::host::FetchId>, Option<u64>),
+) -> Turned {
+  match met.filter(|_| dispatched.error == slates_bridge_fuse::bridge::EAGAIN) {
+    Some(fetch) => {
+      let key = (mount.volume, fetch);
+      keep(s, attachment, mount, dispatched, (key, kept_until))
+    }
+    None => reply(s, attachment, mount, dispatched),
+  }
+}
+
+/// Keeps `dispatched`, a request answered the retry because a base host call of it met a fetch under way (A-555),
+/// rather than send that answer: a task of this shard waits for the fetch `key` names (`crate::base_wait::wait`) until
+/// `until_ns`, set at the request's first wait to the failover delay (the most a reply is held), then hands the request
+/// back to the mount, which dispatches it again before reading the device ([`settle_kept`]); the kernel's other requests
+/// are served meanwhile, since FUSE answers each by its own `unique`. A request whose wait has passed its deadline, that
+/// the shard's waits have no room for, or whose task cannot be spawned is answered the retry now, as dispatched.
+fn keep(
+  s: &mut ShardState,
+  attachment: u64,
+  mount: &mut FuseMount,
+  dispatched: &Dispatched,
+  (key, until_ns): (crate::base_wait::Key, Option<u64>),
+) -> Turned {
+  let now = futures::now_ns();
+  let until_ns = until_ns.unwrap_or_else(|| now.saturating_add(s.failover_ns));
+  if now >= until_ns || crate::base_wait::full(s) {
+    return reply(s, attachment, mount, dispatched);
+  }
+  let request = dispatched.request().to_vec();
+  let waiting = async move {
+    let _ = crate::base_wait::wait(key, until_ns).await;
+    let _ = state::with_state_counted(|s| settle_kept(s, attachment, Kept { request, until_ns }));
+  };
+  match futures::spawn(waiting).and_then(futures::detach) {
+    Ok(()) => {
+      s.count(KEPT, 1);
+      Turned::Served
+    }
+    Err(_) => reply(s, attachment, mount, dispatched),
+  }
+}
+
+/// Hands kept request `kept` back to mount `attachment` once its wait ended (A-555): queued to be dispatched again before
+/// the device is read, and the mount's task woken. Its fetch landed, so it is answered from what landed; or its wait
+/// passed its deadline or found the shard's waits full, so it is answered the retry if its base is still fetching. A
+/// mount that ended meanwhile takes nothing: its kernel has no one to answer.
+fn settle_kept(s: &mut ShardState, attachment: u64, kept: Kept) {
+  let Some(mount) = s.fuse_mounts.get_mut(&attachment) else {
+    return;
+  };
+  mount.kept.push_back(kept);
+  if let Some(waker) = mount.kept_waker.take() {
+    waker.wake();
+  }
+}
+
+/// Whether mount `attachment` holds a kept request ready to be dispatched again (A-555); when it holds none, `waker`
+/// is woken once one comes back ([`settle_kept`]).
+fn kept_ready(s: &mut ShardState, attachment: u64, waker: &std::task::Waker) -> bool {
+  let Some(mount) = s.fuse_mounts.get_mut(&attachment) else {
+    return false;
+  };
+  if !mount.kept.is_empty() {
+    return true;
+  }
+  mount.kept_waker = Some(waker.clone());
+  false
 }
 
 /// Runs a dispatched request's barrier when it needs one, then writes its reply or `EIO`.
@@ -1446,6 +1588,8 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
       seen: 0,
       held: std::collections::VecDeque::new(),
       patience: crate::learned_wait::LearnedWait::default(),
+      kept: std::collections::VecDeque::new(),
+      kept_waker: None,
       _own: own,
     },
   );
@@ -1823,6 +1967,8 @@ mod tests {
           seen: 0,
           held: std::collections::VecDeque::new(),
           patience: crate::learned_wait::LearnedWait::default(),
+          kept: std::collections::VecDeque::new(),
+          kept_waker: None,
           _own: OwnMountRecord(0),
         },
       );
@@ -1868,5 +2014,113 @@ mod tests {
       "the LOOKUP is answered EIO"
     );
     assert_eq!(counted, 2, "both requests counted refused");
+  }
+
+  /// The `unique` of each reply waiting on `peer`, in the order the mount wrote them.
+  fn replied_uniques(peer: &std::os::fd::OwnedFd) -> Vec<u64> {
+    let mut uniques = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while let Ok(n) = rustix::io::read(peer, &mut buffer) {
+      if n < OUT_HEADER_LEN {
+        break;
+      }
+      uniques.push(u64::from_le_bytes(buffer[8..16].try_into().unwrap()));
+    }
+    uniques
+  }
+
+  /// A-555 (a request kept while its base fetched is dispatched again before the device is read). Do: on an audit
+  /// shard, make a volume and hold a FUSE mount of it over a socket pair standing in for `/dev/fuse`; keep a `LOOKUP`
+  /// as a request whose wait ended, send another `LOOKUP` on the device, and take two request turns. Expect both turns
+  /// served, the kept request answered first under its own `unique`, then the device's.
+  #[test]
+  fn a_kept_request_is_dispatched_again_before_the_device_is_read() {
+    let (turns, uniques) = crate::daemon::audit_on_shard(|s| {
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      };
+      let made = crate::verbs::dispatch(
+        s,
+        0,
+        &principal,
+        slates_ipc::protocol::RequestBody::Create {
+          name: "kept".to_owned(),
+          size: slates_ipc::protocol::SizeClass::Bounded { limit: 4 << 20 },
+          names: slates_ipc::protocol::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let volume = *s
+        .by_id
+        .keys()
+        .next()
+        .unwrap_or_else(|| panic!("the create answered {made:?}"));
+      let (device, peer) = rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::SEQPACKET,
+        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+        None,
+      )
+      .unwrap();
+      let registry = s
+        .attachments
+        .attach(
+          volume,
+          View::Current,
+          principal,
+          Rights {
+            read: true,
+            write: true,
+          },
+        )
+        .unwrap();
+      let mut serve = ServeState::new();
+      let change = change_signal(&mut serve).unwrap();
+      let kept = Kept {
+        request: request(Opcode::Lookup, 41, ROOT_NODE, b"kept\0"),
+        until_ns: u64::MAX,
+      };
+      s.fuse_mounts.insert(
+        ATTACHMENT,
+        FuseMount {
+          channel: FuseChannel::nonblocking(device).unwrap(),
+          serve,
+          handles: new_handle_store(),
+          registry,
+          volume,
+          mount_point: "/kept/for/its/base".to_owned(),
+          scope: None,
+          session_held: true,
+          lost: LostWrites::new(std::collections::BTreeSet::new(), false),
+          change,
+          seen: 0,
+          held: std::collections::VecDeque::new(),
+          patience: crate::learned_wait::LearnedWait::default(),
+          kept: std::collections::VecDeque::from([kept]),
+          kept_waker: None,
+          _own: OwnMountRecord(0),
+        },
+      );
+      rustix::io::write(&peer, &request(Opcode::Lookup, 42, ROOT_NODE, b"device\0")).unwrap();
+      let turns: Vec<&'static str> = (0..2)
+        .map(|_| match turn(s, ATTACHMENT, TurnKind::Request) {
+          Turned::Idle => "idle",
+          Turned::Served => "served",
+          Turned::Fenced => "fenced",
+          Turned::Ended => "ended",
+        })
+        .collect();
+      let uniques = replied_uniques(&peer);
+      s.fuse_mounts.remove(&ATTACHMENT);
+      (turns, uniques)
+    });
+    assert_eq!(turns, vec!["served", "served"]);
+    assert_eq!(
+      uniques,
+      vec![41, 42],
+      "the kept request is answered first, then the device's"
+    );
   }
 }

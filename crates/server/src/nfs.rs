@@ -364,48 +364,61 @@ fn with_export<R>(
     attachments,
     nfs_v4_files,
     snapshot_views,
+    nfs_pending_base,
     ..
   } = s;
   let mut handles = new_handle_store();
-  // A snapshot mount serves its attachment's read-only view; every other mount, the volume's head.
-  let mut bridge = match snapshot_views.get_mut(&capability.0) {
-    Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
-    None => {
-      let slot = volumes.get_mut(handle).ok()?;
-      VolumeBridge::attached(
-        volume,
-        &mut slot.volume,
-        store,
-        &mut handles,
-        slot.host.as_mut().map(|host| host as &mut dyn HostFs),
-      )
+  // The slot's base host is lent through a lens that notes the fetch a host call of this request met pending (A-555):
+  // the bridge answers the refusal on the wire, and the call then parks on that fetch (`serve_local_held`).
+  let mut lens = None;
+  let served = {
+    // A snapshot mount serves its attachment's read-only view; every other mount, the volume's head.
+    let mut bridge = match snapshot_views.get_mut(&capability.0) {
+      Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
+      None => {
+        let slot = volumes.get_mut(handle).ok()?;
+        lens = slot
+          .host
+          .as_mut()
+          .map(|host| crate::base_wait::Lens::over(host));
+        VolumeBridge::attached(
+          volume,
+          &mut slot.volume,
+          store,
+          &mut handles,
+          lens.as_mut().map(|lens| lens as &mut dyn HostFs),
+        )
+      }
+    };
+    attachments.begin(admitted).ok()?;
+    let mut scoped;
+    let served: &mut dyn slates_bridge_core::Bridge = match scope {
+      Some(scope) => {
+        scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
+        &mut scoped
+      }
+      None => &mut bridge,
+    };
+    let mut export = Export::over(served, volume, subject, attachments, admitted);
+    export.set_groups(groups);
+    if stranger {
+      export.set_stranger();
     }
-  };
-  attachments.begin(admitted).ok()?;
-  let mut scoped;
-  let served: &mut dyn slates_bridge_core::Bridge = match scope {
-    Some(scope) => {
-      scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
-      &mut scoped
+    export.set_dialect(dialect);
+    // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
+    // learn whether unstable writes were lost; each is published before its reply (A-358), so none are.
+    export.set_write_verifier(write_verifier);
+    export.set_capability(capability);
+    if let Some(files) = nfs_v4_files.as_mut() {
+      export.lend_file_state(files);
     }
-    None => &mut bridge,
+    let served = f(&mut export);
+    drop(export);
+    attachments.end(admitted);
+    served
   };
-  let mut export = Export::over(served, volume, subject, attachments, admitted);
-  export.set_groups(groups);
-  if stranger {
-    export.set_stranger();
-  }
-  export.set_dialect(dialect);
-  // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
-  // learn whether unstable writes were lost; each is published before its reply (A-358), so none are.
-  export.set_write_verifier(write_verifier);
-  export.set_capability(capability);
-  if let Some(files) = nfs_v4_files.as_mut() {
-    export.lend_file_state(files);
-  }
-  let served = f(&mut export);
-  drop(export);
-  attachments.end(admitted);
+  let met = lens.as_ref().and_then(crate::base_wait::Lens::met);
+  *nfs_pending_base = met.map(|fetch| (volume, fetch)).or(*nfs_pending_base);
   Some(served)
 }
 
@@ -1040,6 +1053,7 @@ fn serve_local(
   let _ = state::with_state_counted(|s| {
     s.store.recall_gate.act_as(requester.client);
     s.nfs_call = call;
+    s.nfs_pending_base = None;
   });
   // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
@@ -1260,7 +1274,8 @@ async fn serve_remote(
     origin,
     owner,
     move || async move {
-      let (served, owed) = serve_local(requester, xid, program, procedure, &args, port);
+      let ((served, owed), _) =
+        serve_local_fetched(requester, xid, program, procedure, &args, port).await;
       let served = stable_once_durable(procedure, served).await;
       if let Some(owed) = owed {
         let _ = crate::told::wait(owed).await;
@@ -1542,6 +1557,61 @@ async fn serve_v3(
   served
 }
 
+/// Serves one call locally ([`serve_local`]) on the volume's owner shard, waiting while what it reads is fetched from an
+/// S3 base (§4.15 "An S3 base", A-555): a call answered `NFS3ERR_JUKEBOX` after a host call of it met a pending fetch
+/// changed nothing, so it waits for that fetch (`crate::base_wait`) and is served again from its start once it lands,
+/// within the failover delay from its first wait, the most a reply is held. A call that cannot wait (the shard's waits
+/// at their bound, the delay passed) is answered the retry it was given. With the answer goes the recall gate's
+/// refusals as they stood just before the run that answered, which a delegation's hold judges by (A-79).
+async fn serve_local_fetched(
+  requester: Requester,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  port: u16,
+) -> (
+  ((AcceptStatus, Vec<u8>), Option<crate::told::Owed>),
+  Option<u64>,
+) {
+  let mut until = None;
+  loop {
+    let seen = state::with_state(|s| s.store.recall_gate.refusals());
+    let answered = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let Some(key) = met_pending_base(&answered.0) else {
+      return (answered, seen);
+    };
+    if !waited_for_base(key, &mut until).await {
+      return (answered, seen);
+    }
+  }
+}
+
+/// The fetch a call just served waits for (A-555): the one a host call of it met pending
+/// (`ShardState::nfs_pending_base`, taken here so it never outlives its call), when the call was answered the retry a
+/// pending base's refusal is on this wire (`NFS3ERR_JUKEBOX`). `None` for every other call.
+fn met_pending_base(served: &(AcceptStatus, Vec<u8>)) -> Option<crate::base_wait::Key> {
+  let met = state::with_state(|s| s.nfs_pending_base.take()).flatten()?;
+  (served.0 == AcceptStatus::Success && leading_status(&served.1) == Some(Nfsstat3::Jukebox as u32))
+    .then_some(met)
+}
+
+/// Waits for the fetch `key` names to land, until the call's deadline: `until`, the failover delay from its first wait,
+/// set then. Whether the call runs again.
+async fn waited_for_base(key: crate::base_wait::Key, until: &mut Option<u64>) -> bool {
+  let deadline = match *until {
+    Some(deadline) => deadline,
+    None => {
+      let failover =
+        state::with_state(|s| s.failover_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+      let deadline = futures::now_ns().saturating_add(failover);
+      *until = Some(deadline);
+      deadline
+    }
+  };
+  crate::base_wait::wait(key, deadline).await == crate::base_wait::Waited::Landed
+}
+
 /// Counter: NFSv3 calls the recall gate refused that were held for the delegation's return rather than answered
 /// `NFS3ERR_JUKEBOX` (A-79), one per wait.
 const V3_HELD: &str = "nfs.v3.held_for_recall";
@@ -1566,8 +1636,8 @@ async fn serve_local_held(
   let holdable = program == NFS_PROGRAM && matches!(requester.dialect, Dialect::Nfs3 { .. });
   let mut deadline: Option<u64> = None;
   loop {
-    let seen = state::with_state(|s| s.store.recall_gate.refusals());
-    let (served, owed) = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let ((served, owed), seen) =
+      serve_local_fetched(requester.clone(), xid, program, procedure, args, port).await;
     let served = stable_once_durable(procedure, served).await;
     // A change the call recorded is told to every FUSE mount of its volume before the reply (AC-3.3). A call the
     // recall gate refused changed nothing, so it owes nothing and is not held here.
@@ -2588,16 +2658,20 @@ pub(crate) fn next_connection_id() -> u64 {
   })
 }
 
-/// What ends a connection the anchor holds: its id, if held. Ending one shuts it down (so the client sees it close
-/// though the anchor still holds a copy) and releases the anchor's copy.
+/// What ends a connection the anchor holds: its id, if held, and its ledger slot, if its sends are recorded (A-550).
+/// Ending one shuts it down (so the client sees it close though the anchor still holds a copy) and releases the
+/// anchor's copy.
 #[derive(Clone, Copy, Debug)]
 struct Ending {
   held: Option<u64>,
+  slot: Option<usize>,
 }
 
 impl Ending {
-  /// Releases the anchor's copy and the hold's place under the bound; without a hold, nothing.
+  /// Frees the ledger slot, then releases the anchor's copy and the hold's place under the bound; without a hold,
+  /// nothing more. A death between the two leaves a held connection no ledger records, which a successor ends.
   fn release(self) {
+    crate::held_send::free(self.slot);
     let Some(connection) = self.held else {
       return;
     };
@@ -2611,12 +2685,50 @@ impl Ending {
   }
 }
 
+/// The status refusal count of accepted connections a kept ledger could not hold because the kernel did not count their
+/// bytes handed from zero (A-550): each is served unheld, as every Linux connection was before.
+const COUNT_REFUSED: &str = "nfs.held_send.count_refused";
+
+/// How an accepted connection is held across a restart (A-113, A-550).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holding {
+  /// Not held: no anchor, or a connection whose stream a successor could not tell stands on a record's boundary.
+  Unheld,
+  /// Held, every send of a record all or nothing (macOS, the BSDs).
+  Whole,
+  /// Held, every send recorded in this daemon's ledger, judged against the kernel's count at a successor's adoption
+  /// (Linux).
+  Ledgered,
+}
+
+/// How `stream`, just accepted and written nothing, is held: under an anchor, with whole sends where the kernel makes
+/// them, else under the ledger where this daemon keeps one and the kernel counts the bytes handed, which must read zero
+/// here as an accepted connection's does (no SYN counted, `slates_rt::tcp::TcpStream::bytes_handed`); a count that
+/// reads otherwise or not at all holds nothing and is counted ([`COUNT_REFUSED`]).
+fn holding(stream: &TcpStream, whole: slates_rt::tcp::WholeSends) -> Holding {
+  if !crate::anchor_hold::anchored() {
+    return Holding::Unheld;
+  }
+  if whole == slates_rt::tcp::WholeSends::Guaranteed {
+    return Holding::Whole;
+  }
+  if !crate::held_send::kept() {
+    return Holding::Unheld;
+  }
+  if stream.bytes_handed() == Ok(Some(0)) {
+    return Holding::Ledgered;
+  }
+  crate::fleet::count_refusal(COUNT_REFUSED);
+  Holding::Unheld
+}
+
 /// Admits an accepted connection (A-113): sizes its kernel buffers to [`CONNECTION_BUFFER_BYTES`] (a request must sit
 /// whole in the receive queue to be peeked), makes its sends of up to [`RECORD_WIRE_BYTES`] whole where the kernel
-/// offers that, and — under a supervising anchor that can hold it — hands the anchor a duplicate before its first
-/// request is read. A connection whose buffers or low-water mark the kernel refuses, or that the hold bound or the
-/// channel refuses, is shut down and counted ([`HOLD_REFUSED`]); the client reconnects. Where the kernel cannot make a
-/// send whole (Linux), a connection is served unheld: holding it would let a successor resume mid-record (GAPS, A-113).
+/// offers that, and — under a supervising anchor that can hold it ([`holding`]) — hands the anchor a duplicate before
+/// its first request is read. Where the kernel cannot make a send whole (Linux), the connection is held only under this
+/// daemon's ledger: its slot is claimed before the anchor holds it, so a held connection always has a record (A-550).
+/// A connection whose buffers or low-water mark the kernel refuses, or that the hold bound, the ledger's slots or the
+/// channel refuses, is shut down and counted ([`HOLD_REFUSED`]); the client reconnects.
 fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
   let refuse = |stream: &TcpStream| {
     crate::fleet::count_refusal(HOLD_REFUSED);
@@ -2633,7 +2745,10 @@ fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
       return None;
     }
   };
-  let held = if whole == slates_rt::tcp::WholeSends::Guaranteed && crate::anchor_hold::anchored() {
+  let holding = holding(&stream, whole);
+  let (held, slot) = if holding == Holding::Unheld {
+    (None, None)
+  } else {
     let admitted = HELD_CONNECTIONS
       .fetch_update(
         std::sync::atomic::Ordering::Relaxed,
@@ -2646,34 +2761,54 @@ fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
       return None;
     }
     let connection = next_connection_id();
+    let slot = if holding == Holding::Ledgered {
+      let Some(slot) = crate::held_send::claim(connection) else {
+        HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        refuse(&stream);
+        return None;
+      };
+      Some(slot)
+    } else {
+      None
+    };
     if !matches!(
       crate::anchor_hold::hold_connection(connection, &stream),
       Some(Ok(()))
     ) {
+      crate::held_send::free(slot);
       HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
       refuse(&stream);
       return None;
     }
-    Some(connection)
-  } else {
-    None
+    (Some(connection), slot)
   };
-  Some(Connection::new(stream, port, held))
+  let mut connection = Connection::new(stream, port, held);
+  connection.slot = slot;
+  Some(connection)
 }
 
 /// Serves again the connections a dead daemon left (A-113), each handed back by the anchor
 /// ([`crate::anchor_hold::adopt`]): the socket and its buffers and low-water marks are as the dead daemon left them;
-/// every request it had not answered is still queued, since a request is consumed only after its reply's send. A
-/// connection that cannot be adopted is released, so the anchor closes the last copy and the client reconnects.
+/// every request it had not answered is still queued, since a request is consumed only after its reply's send. Where a
+/// send may have stopped mid-record (Linux), each is first judged by the newest ledger the anchor handed back
+/// (`inherited`) and the kernel's count of the bytes handed, and served on only on a record's boundary
+/// ([`crate::held_send::Handover`], A-550); this daemon's own ledger, shaped for `bound` connections and the machine's
+/// `cache_line`, is held before any adopted connection sends. A connection that cannot be adopted is shut down and
+/// released, so the anchor closes the last copy and the client reconnects.
 pub(crate) fn adopt_held(
   handed: Vec<crate::anchor_hold::HandedConnection>,
+  inherited: crate::held_send::Inherited,
   port: u16,
   bound: usize,
+  cache_line: usize,
 ) {
+  let handover = crate::held_send::Handover::start(inherited, bound, cache_line);
+  let mut adopted = Vec::new();
   for crate::anchor_hold::HandedConnection { connection, socket } in handed {
     LAST_CONNECTION_ID.with(|last| last.set(last.get().max(connection)));
     let ending = Ending {
       held: Some(connection),
+      slot: None,
     };
     let previously = HELD_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(stream) = TcpStream::from_owned(socket) else {
@@ -2688,10 +2823,22 @@ pub(crate) fn adopt_held(
       ending.release();
       continue;
     }
+    let crate::held_send::Verdict::Serve(slot) = handover.judge(connection, &stream) else {
+      // Its stream cannot be shown to stand on a record's boundary (A-550, counted by its reason): it ends.
+      let _ = stream.shutdown();
+      ending.release();
+      continue;
+    };
     note(NFS_CONNECTIONS_ADOPTED);
-    let mut adopted = Connection::new(stream, port, Some(connection));
-    adopted.inherited = true;
-    spawn_connection(adopted);
+    let mut adoption = Connection::new(stream, port, Some(connection));
+    adoption.slot = slot;
+    adoption.inherited = true;
+    adopted.push(adoption);
+  }
+  // The fresh ledger is held and the inherited ones let go before any adopted connection sends (A-550).
+  handover.finish();
+  for adoption in adopted {
+    spawn_connection(adoption);
   }
 }
 
@@ -2733,6 +2880,9 @@ struct Connection {
   carry: Option<(SessionId, DepartedSession)>,
   /// The connection's id while the anchor holds it.
   held: Option<u64>,
+  /// Its slot in this daemon's send ledger, where a held connection's sends may stop mid-record (Linux, A-550): every
+  /// send on it is recorded there before and after ([`send_ledgered`]).
+  slot: Option<usize>,
   /// Handed to this daemon by its anchor at its start (A-231; `Requester::inherited`).
   inherited: bool,
   /// The receive low-water mark last set, so it is set only when it changes (0: not known on this shard).
@@ -2754,6 +2904,7 @@ impl Connection {
       home: registry::current_shard().unwrap_or(0),
       carry: None,
       held,
+      slot: None,
       inherited: false,
       #[cfg(unix)]
       wanted: 0,
@@ -2764,7 +2915,10 @@ impl Connection {
 
   /// What ends this connection, kept apart from it for the paths that lose the socket.
   fn ending(&self) -> Ending {
-    Ending { held: self.held }
+    Ending {
+      held: self.held,
+      slot: self.slot,
+    }
   }
 
   /// Ends the connection while this daemon lives: shuts it down, so the client sees it close although the anchor's copy
@@ -3244,7 +3398,7 @@ async fn send_run(
   consumed: &mut usize,
 ) -> bool {
   if !run.is_empty() {
-    match connection.stream.send_records_vectored(run).await {
+    match send_ledgered(connection, run).await {
       Ok(slates_rt::tcp::Sent::Whole) => {}
       Ok(slates_rt::tcp::Sent::Completed) => note(NFS_SEND_COMPLETED),
       Err(_) => return false,
@@ -3261,14 +3415,34 @@ async fn send_callbacks(connection: &Connection, records: &[Vec<u8>]) -> bool {
   let mut run: Vec<u8> = Vec::new();
   for record in records {
     if !run.is_empty() && run.len().saturating_add(record.len()) > RECORD_WIRE_BYTES {
-      if connection.stream.send_records(&run).await.is_err() {
+      if send_ledgered(connection, &[&run]).await.is_err() {
         return false;
       }
       run.clear();
     }
     run.extend_from_slice(record);
   }
-  run.is_empty() || connection.stream.send_records(&run).await.is_ok()
+  run.is_empty() || send_ledgered(connection, &[&run]).await.is_ok()
+}
+
+/// Sends `records` on `connection` as one run of whole records, its ledger slot told the run's length before and that
+/// the run is in the kernel after (A-550). It is the only writer of a connection's stream, so a held connection's
+/// ledger always says where its stream stands: a byte sent past it would leave the record behind the stream. A send
+/// that fails ends the connection with its record naming the run, which a successor judges by the kernel's count.
+async fn send_ledgered(
+  connection: &Connection,
+  records: &[&[u8]],
+) -> Result<slates_rt::tcp::Sent, slates_rt::RtError> {
+  let len = records
+    .iter()
+    .map(|record| record.len())
+    .fold(0usize, usize::saturating_add);
+  crate::held_send::begin(connection.slot, len);
+  let sent = connection.stream.send_records_vectored(records).await;
+  if sent.is_ok() {
+    crate::held_send::commit(connection.slot);
+  }
+  sent
 }
 
 /// A connection's registration in its shard's back-channel table, ended when the serve loop ends (any path, a
@@ -3427,6 +3601,7 @@ fn migrate(owner: u16, connection: Connection) {
     home,
     carry,
     held,
+    slot,
     inherited,
     #[cfg(windows)]
     inbox,
@@ -3457,6 +3632,8 @@ fn migrate(owner: u16, connection: Connection) {
         home,
         carry: None,
         held,
+        // Its ledger slot goes with it: the owner's shard records its sends from here (A-550).
+        slot,
         inherited,
         #[cfg(unix)]
         wanted: 0,
