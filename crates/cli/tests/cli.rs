@@ -13709,6 +13709,11 @@ const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves o
 /// enrolled proves the principal over SSH, and the token, Basic's password, over HTTP.
 const HG_USER: &str = "slates";
 
+/// Format: why a test that mints a credential skips where the anchor names no issuer surface through the environment
+/// ([`PRINTS_ISSUER_SURFACE`]): the issuer's verbs (`credential token|key`) prove the human's authority with it.
+const NO_ISSUER_SURFACE: &str = "this platform publishes no issuer surface through the environment, so a separate \
+  process cannot mint a credential (on Linux it is a descriptor only the anchor's children hold)";
+
 /// Stock Mercurial 7.2's command, or `None` when this host runs none, which the caller skips loudly: the words
 /// [`STOCK_HG`] names, answering `--version` with 7.2's line.
 fn stock_hg() -> Option<Vec<String>> {
@@ -13771,8 +13776,33 @@ fn hg_nodes(hg: &[String], dir: &str) -> Vec<String> {
 }
 
 /// Starts an anchor whose daemon is asked for `edges` (`--vcs-http`, `--vcs-ssh`) and waits until it serves: the
-/// anchor, and the daemon's lines before it served, which name the edges' ports.
+/// anchor, and the lines read until its daemon served, which name the edges' ports.
 fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<String>) {
+  let (anchor, lines, _) = anchor_with_edges_as(instance, edges, false);
+  (anchor, lines)
+}
+
+/// [`anchor_with_edges`] for a test that mints a credential, which the issuer's verbs do (`credential token|key`):
+/// read on until the anchor has named its issuer surface too, where this platform names one
+/// ([`PRINTS_ISSUER_SURFACE`]), and its daemon then answering verbs steadily with its consensus group bootstrapped, as
+/// [`start_anchor_with_vcs_http`] waits (A-685's test): the anchor, the lines read, and the surface's exports, none
+/// where this platform names none.
+fn anchor_with_edges_and_issuer(
+  instance: &str,
+  edges: &[&str],
+) -> (AnchorProcess, Vec<String>, Option<Vec<(String, String)>>) {
+  anchor_with_edges_as(instance, edges, true)
+}
+
+/// Starts an anchor whose daemon is asked for `edges` and reads its lines, echoing each, until the daemon serves and,
+/// when `issuer` is asked on a platform that names one, the anchor has named its issuer surface, the two processes'
+/// lines taken in whichever order they arrive ([`await_serving`]'s rule); with `issuer`, then waits for the daemon as
+/// [`start_anchor_with_issuer_surface`] does. The anchor, the lines read and the surface's exports when asked.
+fn anchor_with_edges_as(
+  instance: &str,
+  edges: &[&str],
+  issuer: bool,
+) -> (AnchorProcess, Vec<String>, Option<Vec<(String, String)>>) {
   use std::io::{BufRead, Write};
   let mut child = slates()
     .args([
@@ -13791,8 +13821,9 @@ fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<Stri
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
   let mut anchor = AnchorProcess { child, drain: None };
   let serving_line = format!("{SERVING_LINE}{instance} serving on ");
-  let mut lines = Vec::new();
-  loop {
+  let wants_issuer = issuer && PRINTS_ISSUER_SURFACE;
+  let (mut lines, mut exports, mut served) = (Vec::new(), None, false);
+  while !served || (wants_issuer && exports.is_none()) {
     let mut line = String::new();
     let read = stderr.read_line(&mut line).unwrap();
     assert!(
@@ -13804,13 +13835,15 @@ fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<Stri
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served: {line}"
     );
-    if line.starts_with(&serving_line) {
-      break;
-    }
+    served |= line.starts_with(&serving_line);
+    exports = exports.or_else(|| issuer_exports(&line));
     lines.push(line);
   }
   anchor.drain = Some(echo_the_rest(stderr));
-  (anchor, lines)
+  if issuer {
+    await_stable_daemon(instance, true);
+  }
+  (anchor, lines, exports.filter(|_| wants_issuer))
 }
 
 /// The port named on the line of `lines` that begins with `prefix`: the digits right after it, so what the line names
@@ -13907,10 +13940,12 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 
 /// A-650 part 1 and A-686 (§4.17.3 "Access": Basic with a token as the password, over TLS or the loopback edge, main's
 /// ruling of 2026-11-19). Do: start an anchor with its HTTP edge on loopback (`--vcs-http 127.0.0.1:0`); make a
-/// Mercurial repository through the CLI ([`create_hg_repository`]) and a token (`credential token`); with the token as
-/// Basic's password (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and
-/// pull it back ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips
-/// loudly without stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass: as of main 34d10acb5 the CLI has no
+/// Mercurial repository through the CLI ([`create_hg_repository`]) and a token (`credential token`, the issuer's verb,
+/// run with the anchor's issuer surface: [`anchor_with_edges_and_issuer`]); with the token as Basic's password
+/// (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and pull it back
+/// ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]), and where the platform names no issuer surface ([`NO_ISSUER_SURFACE`]). Ignored until
+/// it can pass: as of main 34d10acb5 the CLI has no
 /// `repository create` (A-685, g305; `unknown flag --tool`, kiln r174), the daemon's edge serves git's site alone and
 /// the hg site holds no store (A-680, g303: the hg site's stores and lender, its pushes' `unbundle` with them), and the
 /// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
@@ -13926,11 +13961,16 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
     return;
   };
   let instance = format!("cli-hg-http-{}", std::process::id());
-  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let (_anchor, lines, issuer) =
+    anchor_with_edges_and_issuer(&instance, &["--vcs-http", "127.0.0.1:0"]);
   let port =
     port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
+  let Some(issuer) = issuer else {
+    eprintln!("SKIP stock hg over the HTTP edge: {NO_ISSUER_SURFACE}");
+    return;
+  };
   create_hg_repository(&instance, "r");
-  let (code, out, err) = run(&instance, &["credential", "token"]);
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "token"]);
   assert_eq!(code, 0, "credential token: {out}{err}");
   let token = out
     .lines()
@@ -13955,9 +13995,11 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 
 /// A-650 and A-679 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo> serve
 /// --stdio` in Mercurial's quoting). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make a
-/// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`); run
-/// [`hg_round_trip`] over `ssh://` with OpenSSH holding that key alone. Expect each step done and both copies holding
-/// the same two changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`. Ignored until it can
+/// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`, the issuer's
+/// verb, run with the anchor's issuer surface: [`anchor_with_edges_and_issuer`]); run [`hg_round_trip`] over `ssh://`
+/// with OpenSSH holding that key alone. Expect each step done and both copies holding the same two changesets. Skips
+/// loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`, and where the platform names no issuer surface
+/// ([`NO_ISSUER_SURFACE`]). Ignored until it can
 /// pass: no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag --vcs-ssh`, kiln r174 over
 /// main 34d10acb5), and the edge's Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`, over
 /// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece, as the
@@ -13997,10 +14039,15 @@ fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   assert!(made.status.success(), "ssh-keygen: {made:?}");
   let public = std::fs::read_to_string(format!("{key}.pub")).unwrap();
   let instance = format!("cli-hg-ssh-{}", std::process::id());
-  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (_anchor, lines, issuer) =
+    anchor_with_edges_and_issuer(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
   let port = port_on(&lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+  let Some(issuer) = issuer else {
+    eprintln!("SKIP stock hg over the SSH edge: {NO_ISSUER_SURFACE}");
+    return;
+  };
   create_hg_repository(&instance, "r");
-  let (code, out, err) = run(&instance, &["credential", "key", public.trim()]);
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "key", public.trim()]);
   assert_eq!(code, 0, "credential key: {out}{err}");
   let ssh = format!(
     "ui.ssh=ssh -i {key} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no \
