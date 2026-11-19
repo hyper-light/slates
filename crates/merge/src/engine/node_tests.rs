@@ -15,6 +15,8 @@ use crate::verdict::MergeConflictClass;
 
 /// Shape: a second hard link to `TARGET` the tests make.
 const SECOND: &str = "second";
+/// Shape: where a node is made after the base of the work that links to it.
+const MADE: &str = "made";
 
 /// A green whose `TARGET` (mode 0o600, `NAME` set to `w`) is named by `HARDLINK` and `SECOND`.
 fn linked() -> Result<Green, String> {
@@ -199,6 +201,31 @@ fn a_link_based_before_its_target_moved_conflicts() -> Result<(), String> {
   let refused = classes_on(&answer, "third") == Some(vec![MergeConflictClass::DeleteModify]);
   if !refused || green.hardlink("third").is_some() {
     return Err(format!("{answer:?}"));
+  }
+  Ok(())
+}
+
+/// A-676 (found by reading, g307). Do: make a file at `MADE` after version 0, then submit a work
+/// based at 0 that links `third` to the node at `MADE`; and the same with a FIFO made there.
+/// Expect `DeleteModify` on `third` and no link, each time: nothing stood at `MADE` at the work's
+/// base, so the link names no node the work saw (A-646), as only a forged increment can, since
+/// `link(2)` answers `ENOENT` there. Before, `Green::node_home` judged only a removal since the
+/// base and accepted both links, naming nodes made after it.
+#[test]
+fn a_link_to_a_node_made_after_its_base_conflicts() -> Result<(), String> {
+  let made = [
+    ("a file", Work::default().create(MADE, b"<made>\n")),
+    ("a FIFO", Work::default().fifo(MADE)),
+  ];
+  for (kind, work) in made {
+    let mut green = green();
+    accept(&mut green, work, 1)?;
+    let link = Work::default().naming(OpKind::Link, "third", MADE);
+    let answer = green.submit(&link.at(0, 2));
+    let refused = classes_on(&answer, "third") == Some(vec![MergeConflictClass::DeleteModify]);
+    if !refused || green.hardlink("third").is_some() {
+      return Err(format!("{kind}: {answer:?}"));
+    }
   }
   Ok(())
 }
