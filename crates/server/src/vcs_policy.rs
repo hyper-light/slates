@@ -778,6 +778,35 @@ impl Compiled {
       _ => None,
     }
   }
+
+  /// [`admit`]'s judging over a policy compiled once, for a caller that asks it many times (git's receive-pack hides
+  /// each ref a pusher may not read, and judges each command, A-654): each change in `asked`, in order, judged for
+  /// `principal` in a repository `owner` owns; the first refused is the refusal. A change no rule speaks to is the
+  /// owner's alone.
+  pub(crate) fn admits(
+    &self,
+    owner: &Principal,
+    principal: &Principal,
+    asked: &[Asked<'_>],
+  ) -> Result<(), PushRefusal> {
+    for (index, change) in asked.iter().enumerate() {
+      let index = index_of(index);
+      match self.verdict(change.name, principal, change.right) {
+        None => return Err(PushRefusal::OtherTool { index }),
+        Some(Verdict::Allowed { .. }) => {}
+        Some(Verdict::Unruled) if principal == owner => {}
+        Some(Verdict::Unruled) => return Err(PushRefusal::NotPermitted { index }),
+        Some(Verdict::NotListed) => return Err(PushRefusal::NotListed { index }),
+        Some(Verdict::Denied { rule }) => {
+          return Err(PushRefusal::Denied {
+            index,
+            rule: index_of(rule),
+          });
+        }
+      }
+    }
+    Ok(())
+  }
 }
 
 /// `rules` compiled by `pattern`, which reads a rule's pattern in its tool's form or answers none; `Unreadable` naming
@@ -840,24 +869,7 @@ pub(crate) fn admit(
   principal: &Principal,
   asked: &[Asked<'_>],
 ) -> Result<(), PushRefusal> {
-  let compiled = Compiled::of(record)?;
-  for (index, change) in asked.iter().enumerate() {
-    let index = index_of(index);
-    match compiled.verdict(change.name, principal, change.right) {
-      None => return Err(PushRefusal::OtherTool { index }),
-      Some(Verdict::Allowed { .. }) => {}
-      Some(Verdict::Unruled) if *principal == record.owner => {}
-      Some(Verdict::Unruled) => return Err(PushRefusal::NotPermitted { index }),
-      Some(Verdict::NotListed) => return Err(PushRefusal::NotListed { index }),
-      Some(Verdict::Denied { rule }) => {
-        return Err(PushRefusal::Denied {
-          index,
-          rule: index_of(rule),
-        });
-      }
-    }
-  }
-  Ok(())
+  Compiled::of(record)?.admits(&record.owner, principal, asked)
 }
 
 /// Whether `principal` may reach `record`'s repository for any of `rights` at all (A-625 part 2): its owner always, who
