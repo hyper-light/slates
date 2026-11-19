@@ -4103,11 +4103,11 @@
 > and tested on Linux by main, the agent's host being macOS); a deadline whose job was refused is retried the named
 > retry window on (`deadlines::retry_window_ns`, A-455's shard window). Still on the tick: the pressure hold, NFS
 > purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
-> **Since A-570 (piece 5)** the pressure hold is sampled at the host's own memory-pressure reports (macOS's dispatch
-> source, Linux's pressure-stall trigger, Windows' memory notifications), again a retry window on while a hold is held,
-> and on a host that reports nothing at the heartbeat's measured stall. The Linux and Windows arms were written by g255
-> on macOS and are filed for main's build. Still on the tick: NFS purges, base hints with their delegation recalls, the
-> idle seal and the huge-page re-arm.
+> **Since A-570 (piece 5)** the pressure hold is sampled at its start and at the kernel's own memory-pressure reports
+> (macOS's dispatch source, Linux's pressure-stall trigger with its silence past a window as the stall's end, Windows'
+> memory notifications); a kernel that offers none has the watch refused by kind, logged and counted, with nothing
+> polled in its place. The Linux and Windows arms were written by g255 on macOS and are filed for main's build. Still on
+> the tick: NFS purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.

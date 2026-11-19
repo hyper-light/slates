@@ -1055,14 +1055,15 @@ Same code, zero modes.
 
 > **Status (2026-11-19, A-570: the pressure hold is sampled at the host's own reports).** The control shard's sampler
 > (`crate::pressure`) samples the host's available memory and the daemon's resident memory at its start, which fixes
-> the baseline, and again at each report of a change in the host's memory pressure, never at a tick
+> the baseline, and again at each report the kernel makes of a change in its memory pressure, never at a tick
 > (`slates_machine::memory_pressure`): macOS's dispatch memory-pressure source at every level, Linux's pressure-stall
-> trigger for any stall in the shortest window an unprivileged process may ask for (two seconds, psi.rst), and
-> Windows' low- and high-memory resource notifications. While a hold is held it samples again a retry window after
-> each sample, so the hold is let go as memory comes back (Linux's trigger reports stalls, never their end); with no
-> hold it never wakes. A host that reports nothing (a Linux kernel without PSI, or before unprivileged triggers) has its
-> own measured stall (A-336's reading) taken at the control shard's heartbeat, and a stall that began or ended asks for
-> a sample. Until A-570 the reap loop's tick sampled once a liveness window on every daemon.
+> trigger for any stall in the shortest window an unprivileged process may ask for (two seconds, psi.rst), and Windows'
+> low- and high-memory resource notifications. A stall's end is a report too: macOS reports a return to normal,
+> Windows its high-memory notification, and Linux's trigger, which reports stalls alone, by its silence past its own
+> window and one update interval (the kernel reports once a window while stalls go on). Between reports the hold stands
+> as last sampled. A kernel that offers no report (no PSI, or before unprivileged triggers) has the watch refused by
+> kind at the start, logged and counted (`pressure.watch_refused`, `pressure.watch_unsupported`), and nothing polls in
+> its place. Until A-570 the reap loop's tick sampled once a liveness window on every daemon.
 
 > **Correction (2026-09-20).** An explicit shard count is applied before deriving any
 > per-shard capacity or anchor geometry. The previous post-derivation override stranded
@@ -4944,10 +4945,10 @@ root-relative path as an explicit alternative; it does not report that the reque
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
 > **Status (2026-11-19, A-570: the pressure hold leaves the tick).** The pressure hold's sampler (`crate::pressure`, a
-> task of the control shard's) samples at the host's own memory-pressure reports, and again a retry window on while a
-> hold is held (§4.2's A-570 status). Off the tick so far: dead clients (A-475), staging buffers and status captures
-> (A-522), leases, CLI attachments and destroys (A-536), grants, the owed audit, departed hosts and held copies
-> (A-554), the pressure hold (A-570); NFS purges are next.
+> task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
+> them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
+> dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536),
+> grants, the owed audit, departed hosts and held copies (A-554), the pressure hold (A-570); NFS purges are next.
 
 > **Status (2026-11-19, A-554: grants, the owed audit, departed hosts and held copies leave the tick; the retry window
 > named).** A grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants
@@ -37329,12 +37330,20 @@ Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' 
   - Windows: the low- and high-memory resource notifications (`CreateMemoryResourceNotification`), each signalled
     while its condition holds [B: Microsoft Learn]: the sampler awaits the one that names the next change through
     `slates_rt::handle_wait`, so neither is awaited while signalled and nothing spins.
-  - Where the host reports nothing (a Linux kernel without PSI, or one before unprivileged triggers in 6.5), the host's
-    own measured stall (A-336's reading) is taken at the control shard's heartbeat, a wake the daemon keeps for its
-    liveness, and a stall that began or ended since the last beat asks for a sample (`pressure::stall_beat`).
-- **When it samples.** At its start, which fixes the baseline; at each report; and, while a hold is held, again a retry
-  window after each sample (`deadlines::retry_window_ns`), since Linux's trigger reports stalls and never their end and
-  memory may come back between reports: the hold is let go by sampling. With no hold it waits for a report alone.
+- **A stall's end is a report.** macOS's source reports a return to normal and Windows' high-memory notification the
+  recovery. Linux's trigger reports stalls alone, "rate-limited to one per tracking window", its update interval a
+  tenth of the window (`UPDATES_PER_WINDOW` in `kernel/sched/psi.c`): so after a report, a window and an update interval
+  with no report is the stall's end in the kernel's own terms, and the sampler samples then
+  (`Events::stall_ended_after_ns`). The hold is let go by that sample as memory comes back. Between reports the hold
+  stands as last sampled, so it follows the kernel's account of its pressure, not our reading of the bytes between.
+- **A kernel that offers no report** (a Linux without PSI, or one before unprivileged triggers in 6.5; another
+  platform) has its watch refused by kind at the start: logged, and counted in the shard's status
+  (`pressure.watch_refused`, `pressure.watch_unsupported`); nothing polls in its place, and the hold stands as the
+  start's sample left it. A first draft of this piece took the host's measured stall (A-336's reading) at the control
+  shard's heartbeat on such a host, and sampled again a retry window on while a hold was held: both were a second path
+  (§2, item 7), a poll in the event's place, and were withdrawn before landing at main's review.
+- **When it samples.** At its start, which fixes the baseline; at each report, a stall's end included. With no report it
+  never wakes.
 - **A test's reading is a report.** `Daemon::inject_available_memory` and `inject_resident_memory` ask the sampler, as a
   kernel report would; the first such reading replaces the source the baseline was taken from, so the baseline is
   taken again from it (the recovery suite's two pressure tests inject after the start and wait for that baseline).
@@ -37342,8 +37351,7 @@ Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' 
   unsafe budget 86 → 97 (libdispatch's source on macOS, the notifications on Windows; the file names each site).
 - **Tests.** `crates/server/src/pressure.rs`: `a_reported_fall_in_available_memory_is_held_back_without_a_tick` (a
   one-shard daemon's readings pinned, the baseline fixed, then available falls by an eighth of the capacity: held back
-  within half a window) and `the_heartbeat_asks_for_a_sample_where_a_stall_begins_or_ends` (the heartbeat's verdict
-  over a level and over a cumulative total); `crates/machine/src/memory_pressure.rs`:
+  within half a window); `crates/machine/src/memory_pressure.rs`:
   `the_hosts_memory_pressure_reports_open_where_the_platform_offers_them`.
 - **Filed for main's build.** The Linux and Windows arms (`memory_pressure.rs`'s two platform modules and
   `pressure::report_or_asked`'s Windows arm) were written on macOS and never compiled by g255.

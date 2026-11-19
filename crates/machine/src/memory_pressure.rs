@@ -17,18 +17,23 @@
 //!   kernel signals with `POLLPRI`, "rate-limited to one per tracking window" [B: kernel
 //!   `Documentation/accounting/psi.rst`, "Monitoring for pressure thresholds": "unprivileged users can also create
 //!   monitors, with the only limitation that the window size must be a multiple of 2s"]. Any stall is the rule A-336's
-//!   reading already takes (`crate::memory_stall`: a stall is the total risen). The shard's runtime awaits readability
-//!   alone, so the trigger sits in an epoll set of its own, which is readable while the trigger has fired (epoll(7):
-//!   an epoll descriptor "is readable if one or more events are available"); the caller awaits that set readable and
-//!   empties it ([`Events::acknowledge`]). A kernel built without PSI, or one before unprivileged triggers (Linux 6.5),
-//!   refuses: [`Refused::Host`].
+//!   reading already takes (`crate::memory_stall`: a stall is the total risen). The trigger reports stalls and never
+//!   their end, so the end is its silence: while stalls go on it reports once a window, its update interval a tenth of
+//!   the window (`UPDATES_PER_WINDOW` in the kernel's `kernel/sched/psi.c`), so a window and an update interval with no
+//!   report is the stall's end ([`Events::stall_ended_after_ns`]). The shard's runtime awaits readability alone, so the
+//!   trigger sits in an epoll set of its own, which is readable while the trigger has fired (epoll(7): an epoll
+//!   descriptor "is readable if one or more events are available"); the caller awaits that set readable and empties it
+//!   ([`Events::acknowledge`]). A kernel built without PSI, or one before unprivileged triggers (Linux 6.5), refuses:
+//!   [`Refused::Host`].
 //! - **Windows**: the low- and high-memory resource notifications (`CreateMemoryResourceNotification`), each "signaled"
 //!   while its condition holds [B: Microsoft Learn, "CreateMemoryResourceNotification function (memoryapi.h)"]: the
 //!   caller awaits whichever names the next change ([`Events::awaited`]: the high one while memory is low, the low one
 //!   otherwise) and says when it fired ([`Events::crossed`]). Neither stays awaited while it is signaled, so nothing
 //!   spins.
-//! - **Elsewhere**, and under Miri: no reports ([`Refused::Unsupported`]); the caller takes the host's own measured
-//!   stall at a wake it already has (A-336's reading).
+//! - **Elsewhere**, and under Miri: no reports ([`Refused::Unsupported`]).
+//!
+//! A host whose kernel offers none, or refuses one, has its watch refused by kind at the start: the caller says so in
+//! its log and counts it, and nothing else is polled in its place (§2's ban on a second path).
 
 use std::fmt;
 
@@ -184,6 +189,11 @@ mod platform {
       self.read.as_fd()
     }
 
+    /// None: the source reports a return to normal itself.
+    pub fn stall_ended_after_ns(&self) -> Option<u64> {
+      None
+    }
+
     /// Takes every waiting report, so the descriptor is readable again only at the next.
     pub fn acknowledge(&self) {
       let mut taken = [0u8; READ_AT_ONCE];
@@ -228,6 +238,12 @@ mod platform {
   const UNPRIVILEGED_WINDOW_US: u64 = 2_000_000;
   /// Format: the reports one look takes: the set holds one descriptor.
   const AT_ONCE: usize = 1;
+  /// Format: the kernel's trigger updates per tracking window (`UPDATES_PER_WINDOW` in `kernel/sched/psi.c`; psi.rst:
+  /// windows of 500 ms to 10 s give update intervals of 50 ms to 1 s): a report can come up to an update interval past
+  /// the window.
+  const UPDATES_PER_WINDOW: u64 = 10;
+  /// Format: nanoseconds per microsecond, the trigger's unit.
+  const NS_PER_US: u64 = 1_000;
 
   /// The host's memory-pressure reports (Linux): the trigger's descriptor and the epoll set it sits in alone.
   #[derive(Debug)]
@@ -265,6 +281,13 @@ mod platform {
     /// The descriptor the caller awaits readable: the trigger has fired.
     pub fn descriptor(&self) -> BorrowedFd<'_> {
       self.set.as_fd()
+    }
+
+    /// How long after a report the silence of the trigger is the stall's end: a tracking window and one update
+    /// interval, since while stalls go on the kernel reports once a window.
+    pub fn stall_ended_after_ns(&self) -> Option<u64> {
+      let window = UNPRIVILEGED_WINDOW_US.saturating_mul(NS_PER_US);
+      Some(window.saturating_add(window / UPDATES_PER_WINDOW))
     }
 
     /// Takes the trigger's report, so the set is readable again only at the next.
@@ -342,6 +365,11 @@ mod platform {
       }
     }
 
+    /// None: the high-memory notification reports the recovery itself.
+    pub fn stall_ended_after_ns(&self) -> Option<u64> {
+      None
+    }
+
     /// The awaited notification signaled: memory is on its other side now.
     pub fn crossed(&mut self) {
       self.low_now = !self.low_now;
@@ -391,6 +419,11 @@ mod platform {
     pub fn open() -> Result<Events, Refused> {
       Err(Refused::Unsupported)
     }
+
+    /// None: no report comes here.
+    pub fn stall_ended_after_ns(&self) -> Option<u64> {
+      None
+    }
   }
 }
 
@@ -411,7 +444,7 @@ mod tests {
       "Linux opens a trigger or names the host's refusal: {opened:?}"
     );
     #[cfg(any(not(any(target_os = "linux", target_os = "macos", windows)), miri))]
-    assert_eq!(opened.err(), Some(super::Refused::Unsupported));
+    assert_eq!(opened.as_ref().err(), Some(&super::Refused::Unsupported));
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     if let Ok(events) = &opened {
       events.acknowledge();

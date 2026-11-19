@@ -4672,7 +4672,6 @@ async fn init_shard(
     pressure_sent: vec![(0, 0); config_shards.len()],
     pressure_task: None,
     pressure_asked: false,
-    pressure_reported: false,
     stop_watch: None,
     nfs_purges_refused: false,
     answers_given: crate::lease::AnswersGiven::default(),
@@ -5433,8 +5432,7 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 /// §5.5), run by the control shard's sampler at its start and at each report of the host's memory pressure
 /// (`crate::pressure`, A-570; the reap loop's tick ran it once a liveness window until then) — the design's
 /// "cheap-refresh", one sampler a daemon (before 2026-10-09 every shard sampled and sent its own reading to every
-/// shard, N² cross-shard messages a second on a daemon at rest, each waking a parked shard). The hold it withheld, or
-/// `None` where nothing was sampled (off the control shard, or no memory sampler on this host).
+/// shard, N² cross-shard messages a second on a daemon at rest, each waking a parked shard).
 ///
 /// The hold is the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that
 /// is committed content, charged already), and never more than the daemon's unfilled room exceeds the host's free
@@ -5453,8 +5451,10 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 /// (`memory_available_now` is `None` on an unsupported platform) leaves the hold at zero — the budget then admits
 /// exactly as before, no worse than not sampling. The read is one cheap syscall or `/proc` line per cadence, not per
 /// request; the shards are asked for their free room only while the pool cannot cover the hold.
-pub(crate) async fn refresh_pressure_hold() -> Option<u64> {
-  let (origin, shards, hold) = sample_pressure_hold()?;
+pub(crate) async fn refresh_pressure_hold() {
+  let Some((origin, shards, hold)) = sample_pressure_hold() else {
+    return;
+  };
   let pooled = state::with_state(|s| {
     let geometry = crate::content_pool::PoolGeometry::of(&s.config);
     crate::content_pool::hold_toward(&s.segment, &geometry, hold)
@@ -5465,7 +5465,7 @@ pub(crate) async fn refresh_pressure_hold() -> Option<u64> {
       state::with_state_counted(|s| s.count(PRESSURE_POOL_REFUSED, 1));
       0
     }
-    None => return None,
+    None => return,
   };
   let residual = hold.saturating_sub(pooled);
   let (holds, debt) = if residual == 0 {
@@ -5479,7 +5479,6 @@ pub(crate) async fn refresh_pressure_hold() -> Option<u64> {
     (holds, residual.saturating_sub(placed))
   };
   send_pressure_holds(origin, &shards, &holds, debt);
-  Some(hold)
 }
 
 /// The control shard's sample of the pressure hold (§4.2): this shard, the daemon's shards and the daemon-wide hold,
@@ -6488,9 +6487,6 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
   let _control_life = control_life;
   let mut clock = HostClock::new();
   let mut last: Option<(u64, slates_rt::shard::Counters)> = None;
-  // The host's measured memory stall at the last beat and its verdict, read only while the host reports no
-  // memory-pressure changes (A-570, `crate::pressure::stall_beat`).
-  let mut stall: (Option<slates_machine::memory_stall::StallReading>, bool) = (None, false);
   loop {
     let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
     let counters = registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
@@ -6509,7 +6505,6 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
         // Bounded by one: a reason already sent and not yet taken is the same news.
         let _full_or_gone = watch.wake.try_send(());
       }
-      stall = crate::pressure::stall_beat(s, stall.0, stall.1);
     });
     pace(HEARTBEAT_NS).await;
   }

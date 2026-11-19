@@ -1,19 +1,19 @@
 //! The pressure hold's sampler, woken by the host's own reports (§4.2 "the pressure hold", admission.md §5.5; A-570).
 //! The control shard samples the host's available memory and the daemon's own resident memory and withholds the hold
 //! from admission (`crate::daemon::refresh_pressure_hold`): once at its start, which fixes the baseline, and again each
-//! time the host reports a change in its memory pressure (`slates_machine::memory_pressure`: macOS's dispatch source,
-//! Linux's pressure-stall trigger, Windows' memory resource notifications). Until A-570 the reap loop's tick sampled
-//! once a liveness window on every daemon, whether the host's pressure had changed or not.
+//! time the kernel reports a change in its memory pressure (`slates_machine::memory_pressure`: macOS's dispatch source,
+//! Linux's pressure-stall trigger, Windows' memory resource notifications). Between reports the hold stands as last
+//! sampled. Until A-570 the reap loop's tick sampled once a liveness window on every daemon, whether the host's
+//! pressure had changed or not.
 //!
-//! **A hold is let go by sampling again.** A report says the host's pressure changed; Linux's trigger reports stalls
-//! and never their end, and memory can come back between two reports elsewhere too. So while a hold is held, the
-//! sampler samples again a retry window after each sample (`crate::deadlines::retry_window_ns`), until the hold is
-//! nothing; with no hold it waits for a report alone, and never wakes.
+//! **A stall's end is a report too.** macOS reports a return to normal and Windows its high-memory notification;
+//! Linux's trigger reports stalls alone, so after one the sampler samples again once the trigger has been silent past
+//! its own window (`Events::stall_ended_after_ns`), when the kernel has said in its own terms that the stall is over.
 //!
-//! **Where the host reports nothing** (a Linux kernel without PSI, or one that refuses an unprivileged trigger), the
-//! host's own measured stall (A-336's reading, `slates_machine::memory_stall`) is taken at the control shard's
-//! heartbeat, a wake the daemon keeps for its liveness anyway, and a stall that began or ended since the last beat asks
-//! the sampler to sample ([`stall_beat`]). No threshold is chosen here, and no wake is added for it.
+//! **A kernel that offers no report** (a Linux without PSI, or one before unprivileged triggers; another platform) has
+//! its watch refused by kind at the start: logged, and counted in the shard's status (`pressure.watch_unsupported`,
+//! `pressure.watch_refused`). The hold then stands as the start's sample left it, nothing in its place polls (§2: no
+//! second path), and the sampler waits for the asking alone.
 //!
 //! **A test's reading is a report.** `Daemon::inject_available_memory` and `inject_resident_memory` put a reading in
 //! the host's place and ask the sampler, as the kernel's report would ([`ask`]); the first such reading replaces the
@@ -22,18 +22,23 @@
 use std::task::Poll;
 
 use slates_machine::memory_pressure::{Events, Refused};
-use slates_machine::memory_stall::{self, StallReading};
 use slates_rt::RtError;
 
 use crate::state::{self, ShardState};
 
-/// Counter: the sampler's wait for the host's next report refused by the runtime; it falls back to the host's measured
-/// stall at the heartbeat, as on a host that reports nothing.
+/// Counter: the host's memory-pressure watch refused at the start because the platform offers no report to this build
+/// (`slates_machine::memory_pressure::Refused::Unsupported`): the hold stands as the start's sample left it.
+const WATCH_UNSUPPORTED: &str = "pressure.watch_unsupported";
+/// Counter: the host's memory-pressure watch refused at the start by the host (`Refused::Host`: a kernel without PSI,
+/// or one before unprivileged triggers): the hold stands as the start's sample left it.
+const WATCH_REFUSED: &str = "pressure.watch_refused";
+/// Counter: the sampler's wait for the host's next report refused by the runtime: the watch ends there, as a refused
+/// one does, and the hold stands as last sampled.
 const REPORT_WAIT_REFUSED: &str = "pressure.report_wait_refused";
 
 /// The sampler (A-570): one task a shard, made at its start; off the control shard it ends at once. It samples, then
-/// waits for the host's next report, a test's reading, the heartbeat's measured stall, or, while a hold is held, the
-/// retry window, and samples again.
+/// waits for the host's next report (on Linux, after a report, for the trigger's silence past its window too) or a
+/// test's reading, and samples again.
 pub(crate) async fn sampler() {
   let Some(control) = state::with_state(|state| {
     if !crate::verbs::is_control_shard(state) {
@@ -50,37 +55,43 @@ pub(crate) async fn sampler() {
   let mut reports = Events::open();
   if let Err(refused) = &reports {
     slates_machine::log_line!(
-      "slates-server: the host reports no memory-pressure changes to this process ({refused}); the pressure hold \
-       follows its measured stall at the heartbeat"
+      "slates-server: the host's memory-pressure watch is refused ({refused}); the pressure hold stands as its start \
+       sample left it"
     );
+    let kind = match refused {
+      Refused::Unsupported => WATCH_UNSUPPORTED,
+      Refused::Host { .. } => WATCH_REFUSED,
+    };
+    if state::with_state(|state| state.count(kind, 1)).is_none() {
+      return;
+    }
   }
-  let reported = reports.is_ok();
-  if state::with_state(|state| state.pressure_reported = reported).is_none() {
-    return;
-  }
+  // Whether the last wake was the kernel's report: on Linux the trigger's silence after one is the stall's end.
+  let mut reported = false;
   loop {
-    let held = crate::daemon::refresh_pressure_hold().await.unwrap_or(0) > 0;
-    let woke = if held {
-      slates_rt::futures::within(crate::deadlines::retry_window_ns(), next_wake(&mut reports))
+    crate::daemon::refresh_pressure_hold().await;
+    let silence = reports
+      .as_ref()
+      .ok()
+      .filter(|_| reported)
+      .and_then(Events::stall_ended_after_ns);
+    let woke = match silence {
+      // The trigger's silence past its window: the stall is over, a report of its own.
+      Some(ns) => slates_rt::futures::within(ns, next_wake(&mut reports))
         .await
-        .map(|woke| woke.unwrap_or(Ok(())))
-    } else {
-      Ok(next_wake(&mut reports).await)
+        .map(|woke| woke.unwrap_or(Ok(false))),
+      None => Ok(next_wake(&mut reports).await),
     };
     match woke {
-      Ok(Ok(())) => {}
+      Ok(Ok(report)) => reported = report,
       Ok(Err(refusal)) | Err(refusal) => {
         slates_machine::log_line!(
           "slates-server: the wait for the host's memory-pressure report was refused ({refusal}); the pressure hold \
-           follows its measured stall at the heartbeat"
+           stands as last sampled"
         );
         reports = Err(Refused::Unsupported);
-        if state::with_state(|state| {
-          state.pressure_reported = false;
-          state.count(REPORT_WAIT_REFUSED, 1);
-        })
-        .is_none()
-        {
+        reported = false;
+        if state::with_state(|state| state.count(REPORT_WAIT_REFUSED, 1)).is_none() {
           return;
         }
       }
@@ -88,8 +99,8 @@ pub(crate) async fn sampler() {
   }
 }
 
-/// Asks the sampler to sample now (A-570): a reading a test put in the host's place, or a stall the heartbeat measured.
-/// Nothing off the control shard, whose sampler alone samples.
+/// Asks the sampler to sample now (A-570): a reading a test put in the host's place, which stands for the kernel's
+/// report. Nothing off the control shard, whose sampler alone samples.
 pub(crate) fn ask(state: &mut ShardState) {
   state.pressure_asked = true;
   if let Some(task) = state.pressure_task {
@@ -102,9 +113,9 @@ fn asked() -> bool {
   state::with_state(|state| std::mem::take(&mut state.pressure_asked)) == Some(true)
 }
 
-/// Waits until the host reports a change in its memory pressure, or the sampler is asked ([`ask`]); a host that reports
-/// nothing leaves the asking alone. A refused wait is the runtime's typed refusal.
-async fn next_wake(reports: &mut Result<Events, Refused>) -> Result<(), RtError> {
+/// Waits until the host reports a change in its memory pressure, or the sampler is asked ([`ask`]): whether it was the
+/// host's report. A refused watch leaves the asking alone. A refused wait is the runtime's typed refusal.
+async fn next_wake(reports: &mut Result<Events, Refused>) -> Result<bool, RtError> {
   match reports {
     Ok(events) => report_or_asked(events).await,
     Err(_) => {
@@ -116,7 +127,7 @@ async fn next_wake(reports: &mut Result<Events, Refused>) -> Result<(), RtError>
         }
       })
       .await;
-      Ok(())
+      Ok(false)
     }
   }
 }
@@ -126,7 +137,7 @@ async fn next_wake(reports: &mut Result<Events, Refused>) -> Result<(), RtError>
 /// readable again only at the next. The asking is looked at before the descriptor at each poll, so a wake from it is
 /// never taken for a report (A-149).
 #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
-async fn report_or_asked(events: &mut Events) -> Result<(), RtError> {
+async fn report_or_asked(events: &mut Events) -> Result<bool, RtError> {
   use std::future::Future;
   use std::os::fd::AsRawFd;
   let raw = events.descriptor().as_raw_fd();
@@ -140,17 +151,18 @@ async fn report_or_asked(events: &mut Events) -> Result<(), RtError> {
     })
     .await
   };
-  if reported? {
+  let reported = reported?;
+  if reported {
     events.acknowledge();
   }
-  Ok(())
+  Ok(reported)
 }
 
 /// The host's next report or the sampler's asking, whichever comes first (Windows: the memory resource notification
 /// that names the next change, awaited signalled through the system thread pool, `slates_rt::handle_wait`); a report
 /// moves the awaited notification to the other side.
 #[cfg(all(windows, not(miri)))]
-async fn report_or_asked(events: &mut Events) -> Result<(), RtError> {
+async fn report_or_asked(events: &mut Events) -> Result<bool, RtError> {
   use std::future::Future;
   let reported = {
     let mut report = std::pin::pin!(slates_rt::handle_wait::signalled(events.awaited()));
@@ -162,16 +174,17 @@ async fn report_or_asked(events: &mut Events) -> Result<(), RtError> {
     })
     .await
   };
-  if reported? {
+  let reported = reported?;
+  if reported {
     events.crossed();
   }
-  Ok(())
+  Ok(reported)
 }
 
 /// Where no report can come (another platform, Miri): the asking alone. `Events::open` refuses there, so this is never
 /// reached with a source.
 #[cfg(any(not(any(target_os = "linux", target_os = "macos", windows)), miri))]
-async fn report_or_asked(_events: &mut Events) -> Result<(), RtError> {
+async fn report_or_asked(_events: &mut Events) -> Result<bool, RtError> {
   std::future::poll_fn(|_| {
     if asked() {
       Poll::Ready(())
@@ -180,39 +193,7 @@ async fn report_or_asked(_events: &mut Events) -> Result<(), RtError> {
     }
   })
   .await;
-  Ok(())
-}
-
-/// The heartbeat's look at the host's measured memory stall (A-570, A-336's reading), on the control shard while the
-/// host reports no changes: a stall that began or ended since the last beat (`stalled`, the verdict the last beat left)
-/// asks the sampler to sample ([`stall_changed`]). Returns this beat's reading and verdict, the next beat's `before`
-/// and `stalled`; a host that reports its changes is not read at all.
-pub(crate) fn stall_beat(
-  state: &mut ShardState,
-  before: Option<StallReading>,
-  stalled: bool,
-) -> (Option<StallReading>, bool) {
-  if state.pressure_reported || state.pressure_task.is_none() {
-    return (before, stalled);
-  }
-  let now = memory_stall::read();
-  let (changed, stalled_now) = stall_changed(before, now, stalled);
-  if changed {
-    ask(state);
-  }
-  (now, stalled_now)
-}
-
-/// Whether a stall began or ended between the readings `before` and `now`, given the verdict `stalled` the last look
-/// left, and the verdict now: the host's own rule (`slates_machine::memory_stall::stalled_between`), so a level pressed
-/// now, or a cumulative total risen since `before`, is a stall.
-fn stall_changed(
-  before: Option<StallReading>,
-  now: Option<StallReading>,
-  stalled: bool,
-) -> (bool, bool) {
-  let stalled_now = memory_stall::stalled_between(before, now);
-  (stalled_now != stalled, stalled_now)
+  Ok(false)
 }
 
 #[cfg(test)]
@@ -282,37 +263,5 @@ mod tests {
       panic!("the fall was held back within half a liveness window: {withheld:?} for {fall}")
     });
     println!("a fall of {fall} bytes in available memory held back {held:?} after it");
-  }
-
-  /// A-570. Do: walk the heartbeat's verdict over a level (macOS, Windows) clear, pressed, pressed, clear, and over a
-  /// cumulative total (Linux) unchanged, risen, risen, unchanged, then over no reading. Expect: the sampler asked where
-  /// a stall begins and where it ends, never while it holds or while nothing stalls, and nothing asked without a
-  /// reading.
-  #[test]
-  fn the_heartbeat_asks_for_a_sample_where_a_stall_begins_or_ends() {
-    use slates_machine::memory_stall::StallReading;
-    let walk = |readings: &[Option<StallReading>]| {
-      let mut before = None;
-      let mut stalled = false;
-      let mut asked = Vec::new();
-      for now in readings {
-        let (changed, stalled_now) = super::stall_changed(before, *now, stalled);
-        asked.push(changed);
-        before = *now;
-        stalled = stalled_now;
-      }
-      asked
-    };
-    let level = |pressed| Some(StallReading::Level { pressed });
-    assert_eq!(
-      walk(&[level(false), level(true), level(true), level(false)]),
-      [false, true, false, true]
-    );
-    let total = |stalled_us| Some(StallReading::Cumulative { stalled_us });
-    assert_eq!(
-      walk(&[total(10), total(10), total(15), total(20), total(20)]),
-      [false, false, true, false, true]
-    );
-    assert_eq!(walk(&[None, None]), [false, false]);
   }
 }

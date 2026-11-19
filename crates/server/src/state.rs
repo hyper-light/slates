@@ -1149,12 +1149,9 @@ pub struct ShardState {
   /// The pressure sampler's task on the control shard (A-570, `crate::pressure::sampler`), woken when it is asked to
   /// sample (`crate::pressure::ask`); `None` elsewhere and before it starts.
   pub(crate) pressure_task: Option<slates_rt::TaskId>,
-  /// Whether the sampler was asked to sample since it last looked (A-570): a reading a test put in the host's place, or
-  /// a stall the heartbeat measured on a host that reports nothing.
+  /// Whether the sampler was asked to sample since it last looked (A-570): a reading a test put in the host's place,
+  /// which stands for the kernel's report.
   pub(crate) pressure_asked: bool,
-  /// Whether the host reports its memory-pressure changes to the sampler (A-570, `slates_machine::memory_pressure`);
-  /// while it does not, the heartbeat takes the host's measured stall instead (`crate::pressure::stall_beat`).
-  pub(crate) pressure_reported: bool,
   /// The process thread's wait for a reason to stop (`Daemon::wait_for_stop`), asked at each heartbeat on the control
   /// shard; `None` until a process installs it (and on every other shard).
   pub(crate) stop_watch: Option<crate::daemon::StopWatch>,
