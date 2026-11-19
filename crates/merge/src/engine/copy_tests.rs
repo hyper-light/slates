@@ -1344,6 +1344,25 @@ impl Census {
     self.into_themselves += usize::from(in_tree(&copy.dst, &copy.src));
     self.replaced += usize::from(copy.replace && held);
   }
+
+  /// Whether every case was met at least once.
+  fn met(&self) -> bool {
+    [
+      self.accepted,
+      self.refused,
+      self.from_root,
+      self.from_before,
+      self.into_themselves,
+      self.from_changed,
+      self.changed_beneath,
+      self.replaced,
+      self.nested,
+      self.nested_replaced,
+      self.moved,
+    ]
+    .iter()
+    .all(|&count| count > 0)
+  }
 }
 
 /// A copy one step declares: its destination, its source, the source's version, and whether it replaces (A-626).
@@ -1954,6 +1973,60 @@ fn run(steps: &[Step], census: &mut Census) -> Result<(), TestCaseError> {
   oracle.replay_and_branch()
 }
 
+/// One history meeting every case the census counts, so each count is met on every run whatever the generator's seed,
+/// the generated histories adding to them (A-672, after A-670's rule for the restatement oracle). On the generated
+/// histories alone, an inner copy replacing what its outer copy brought was met in about one nested pair in thirty, by
+/// none of 30 in one run and 3 of 37 in the next (jupiter, 2026-11-19), so a run could fail by the seed's luck. The
+/// steps, by path (puts index [`PATHS`] through [`named_path`], copies through [`any_path`]): `a/x` put twice; `a`
+/// copied to `c` as the version before the head held it, its tree changed since; `c/x` put beneath that copy; the root
+/// copied into its own tree at `d`; `a` copied over `c`, replacing it, then again without replacing, refused; `a`
+/// copied to `b` with `a/x` moved to `b/m` inside it; and `a` copied to `ab` with `b` copied to `ab/x`, replacing the
+/// file the outer copy brought there.
+fn fixed_history() -> Vec<Step> {
+  vec![
+    Step::Put { path: 1, byte: 1 },
+    Step::Put { path: 1, byte: 2 },
+    Step::Copy {
+      from: 1,
+      to: 8,
+      back: 1,
+      replace: false,
+    },
+    Step::Put { path: 8, byte: 3 },
+    Step::Copy {
+      from: 0,
+      to: 10,
+      back: 0,
+      replace: false,
+    },
+    Step::Copy {
+      from: 1,
+      to: 8,
+      back: 0,
+      replace: true,
+    },
+    Step::Copy {
+      from: 1,
+      to: 8,
+      back: 0,
+      replace: false,
+    },
+    Step::Move {
+      from: 1,
+      to: 5,
+      file: 0,
+      at: 3,
+    },
+    Step::Nested {
+      from: 1,
+      to: 7,
+      inner: 5,
+      at: 0,
+      replace: (false, true),
+    },
+  ]
+}
+
 /// A-586 and A-626 (the oracle). Do: generated histories of files and their attributes put and taken, directories made
 /// with modes, single copies of any path (the root among them) at the head or a version or two before it, its tree
 /// changed since or not (A-626 part 2), to any path (into the source's own tree among them), replacing what the destination holds or not, two copies nested in one
@@ -1962,10 +2035,20 @@ fn run(steps: &[Step], census: &mut Census) -> Result<(), TestCaseError> {
 /// every version (each base, each file's bytes, the paths the change index names since), its identity equals its
 /// recount and its change index's bytes theirs, no map refused a copy its verdict passed, and a copy that replaces
 /// nothing walked no map; at the end its chain, replayed from its entries, reads and hashes as it does, and a branch at
-/// every version reads as the model and hashes as the replay, walking no map. The census shows each kind of copy met.
+/// every version reads as the model and hashes as the replay, walking no map. A fixed history, run first, meets every
+/// kind of copy the census counts whatever the seed (A-672); the generated histories add to the counts.
 #[test]
 fn every_copy_reads_as_its_model_over_every_history() {
-  let census = RefCell::new(Census::default());
+  let mut fixed = Census::default();
+  if let Err(failure) = run(&fixed_history(), &mut fixed) {
+    panic!("the fixed history: {failure}");
+  }
+  assert!(
+    fixed.met(),
+    "the fixed history no longer meets every case: {fixed:?}"
+  );
+  eprintln!("copy oracle census, the fixed history: {fixed:?}");
+  let census = RefCell::new(fixed);
   let config = Config {
     cases: slates_test_seeds::cases(128),
     ..Config::default()
@@ -1977,24 +2060,6 @@ fn every_copy_reads_as_its_model_over_every_history() {
   if let Err(failure) = result {
     panic!("{failure}");
   }
-  let census = census.into_inner();
-  // The figures the evidence quotes (`-- --nocapture`).
-  eprintln!("copy oracle census: {census:?}");
-  let met = [
-    census.accepted,
-    census.refused,
-    census.from_root,
-    census.from_before,
-    census.into_themselves,
-    census.from_changed,
-    census.changed_beneath,
-    census.replaced,
-    census.nested,
-    census.nested_replaced,
-    census.moved,
-  ];
-  assert!(
-    met.iter().all(|&count| count > 0),
-    "a case never met: {census:?}"
-  );
+  // The figures the evidence quotes (`-- --nocapture`): the fixed history's counts and the generated histories'.
+  eprintln!("copy oracle census: {:?}", census.into_inner());
 }
