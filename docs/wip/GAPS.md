@@ -733,7 +733,15 @@
 > A-606) and authenticating for write (`must_have_access`, the lock tokens' writes), through one entry point for the
 > svn:// connection task (`commit::drive::commit`, A-656); `cargo test --locked -p slates-svn --lib` on the Mac Studio,
 > red first (see A-655 part 1). Owed from it: part 2, the owner's commit step through A-635's `RepositoryLogs::append`,
-> which a dump's import drives too (A-652 part 3). A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with
+> which a dump's import drives too (A-652 part 3). A-655 part 2a (2026-11-19, g268, UI goal 93): one `Revision` a
+> client's accepted work (dated at the owner's instant, its `svn:txn-` properties dropped) or an imported dump revision
+> is made into, committed by one step over a repository's records (`Repository::check`, then `apply`; `Index::plan` and
+> `commit_planned`; the lock entries all or none), which A-628's import now takes too; the drive waits for start-commit
+> at `open-root`, its revision properties checked first, and for pre-commit before the verdict (A-661's `Step::Hook`,
+> `Due`, `Drive::resume`); `cargo test --locked -p slates-svn --lib` on Windows x86_64 (jupiter; the macOS run owed),
+> red first (see A-655 part 2a). Owed from it: part 2b, the server's step over A-662's map (the green's version and the
+> Subversion record in one durable entry through A-635's append, a `Moved` append judged again by position, recovery),
+> then A-652 part 3. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with
 > stealing) and `unlock`
 > (with
 > breaking), and the verdict's lock check (with release or keep), each returning the register entries it decided,
