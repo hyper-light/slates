@@ -12267,6 +12267,11 @@ is one more version, and the chain itself is never rewritten.
 > goes back to its caller, which teaches the hook's times on the shard. Owed: the Windows driver (a job object, the
 > handle-list spawn of `slates_ipc::win_spawn`), the launcher's namespace on Linux (§4.6), and the push pieces' calls.
 
+> **Status (2026-11-19, A-671: the matcher's home).** git's `wildmatch` is `slates_vcs::wildmatch`
+> (`crates/vcs/src/wildmatch.rs`), moved whole from `crates/server`, behaviour unchanged: slates-vcs is the crate every
+> version-control server's crate builds on, so the policy and git's own crate (its sparse filter, A-640 part 4) hold one
+> matcher. Its oracle, git's `dowild` transcribed, is a file both crates' tests compile and no product build links.
+
 > **Status (2026-11-19, A-647 part 1: derived data, one mechanism, A-645).** What a read computes for a version is a
 > type of derived data (`crates/vcs/src/derived.rs`): a pure function of the version's change and its parents' values
 > of the same type, kept as content under the type's name and the version's in an index whose rows never change, so
@@ -47795,3 +47800,40 @@ tests, new; `lib.rs`).
   merged tree. The macOS run is owed.
 - **Owed.** DAV's LOCK and UNLOCK wired through the glue (A-661's next part, once g298's DAV serving lands); the hook
   times' table that keeps each hook's learned bound (A-622's list).
+
+### A-671 — git's `wildmatch` moved to slates-vcs, the crate every version-control server's crate builds on (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.1 "Policy" and shared piece 3; A-597, A-640 part 4)
+Applied in the same change to:
+- §4.17.1's policy statuses (a status after A-622 part 3's: where the matcher lives);
+- GAPS (the §4.17 entry);
+- `crates/vcs` (`wildmatch.rs`, moved from `crates/server`; `wildmatch/reference.rs`, its oracle as a file of its own;
+  `lib.rs`; `Cargo.toml`'s description);
+- `crates/server` (`lib.rs`: the module gone, its oracle compiled for the tests; `vcs_policy.rs`: the imports and the
+  docs' links; `Cargo.toml`: slates-vcs moved from the dev-dependencies to the dependencies).
+
+- **Why it moved.** git's `sparse:oid` filter (A-640 part 4) reads its patterns with git's glob, in slates-git, which
+  builds on slates-vcs and not on slates-server (slates-server builds on slates-git), so the matcher could not be
+  reached from there, and a second matcher would be two to hold to git. slates-vcs is the crate both build on.
+- **What moved, and what did not change.** The module whole, as a rename: its code, its docs, git's 190 vectors and
+  the generated comparison with the transcription of `dowild`. Only its visibility changed (`Glob`, `Glob::new`,
+  `Glob::matches` and `is_glob_special` are public; the rest stays private) and the doc's account of where it lives.
+  No behaviour changed.
+- **The oracle, one file in two crates' tests.** The transcription of `dowild` judges the matcher's own generated
+  cases, and it is `vcs_policy`'s oracle of git's ref patterns and Subversion's segments. It is now a file of its own
+  (`wildmatch/reference.rs`): slates-vcs declares it under `#[cfg(test)]`, and slates-server's `lib.rs` compiles the
+  same file under `#[cfg(test)]` with `#[path]`, as other crates' tests compile the server's test support
+  (`crates/api/tests/api.rs`). Rejected: a cargo feature that slates-server's tests turn on, the route first planned.
+  A feature's code compiles as product code, where the lint wall denies the transcription's indexing
+  (`clippy::indexing_slicing`; clippy.toml's `allow-indexing-slicing-in-tests` covers `#[cfg(test)]` code alone), and
+  passing it would mean rewriting git's lines. Also rejected: a copy (two oracles to keep equal), and `vcs_policy`'s
+  oracle reading the product matcher (an oracle that is the code it checks).
+- **Tests** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r61, over main a6306963e with this change
+  (`agents/g296-wildmatch-check` at d9528b6f2):
+  `cargo test --locked -p slates-server --lib -- vcs_policy:: vcs_http::git::tests:: lfs::tests:: --test-threads=4`
+  29 of 29: `vcs_policy`'s 15 (its oracle reading the transcription through the included file) and its two callers'
+  tests, the HTTP edge's git site 10 (its gate is `reaches`) and LFS 4 (its access is `admit`);
+  `cargo test --locked -p slates-vcs --lib wildmatch` 3 of 3, the module's own (git's 190 vectors, a long starry
+  pattern answered without recursion, the generated comparison with the transcription);
+  `cargo fmt -p slates-server -- --check` and `cargo fmt -p slates-vcs -- --check` clean. Earlier, on Windows x86_64
+  (jupiter, kiln r144, over 0cd28dead): `cargo test --locked -p slates-vcs --lib` 68 of 68. No integration target
+  reaches the matcher or the policy: `vcs_http` and `lfs` have no caller outside tests yet, and no target under
+  `crates/*/tests` names either. The server's runs on Linux and Windows are owed.
