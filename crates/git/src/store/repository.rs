@@ -86,6 +86,13 @@ pub enum StoreRefused {
     /// The version asked for.
     version: u64,
   },
+  /// A version's sets, its value of the reach sets (A-647, [`super::ReachSets`]), do not read as the type's.
+  SetsUnreadable {
+    /// The green.
+    green: u64,
+    /// The version.
+    version: u64,
+  },
   /// A pack asked for a version whose fragments are not encoded yet.
   NotEncoded {
     /// The version.
@@ -1223,13 +1230,32 @@ impl Repository {
   }
 
   /// D(k): what `green`'s version `version` brought, as positions.
-  pub fn brought(&self, green: u64, version: usize) -> Option<&Positions> {
-    Some(&self.chains.get(&green)?.versions.get(version)?.brought)
+  pub fn brought(
+    &self,
+    _store: &ContentStore,
+    green: u64,
+    version: usize,
+  ) -> Result<Positions, StoreRefused> {
+    Ok(self.version_record(green, version)?.brought.clone())
   }
 
-  /// The set `green`'s current head reaches.
-  pub fn reached(&self, green: u64) -> Option<&Positions> {
-    Some(&self.chains.get(&green)?.reached)
+  /// The set `green`'s version `version`'s head reaches.
+  pub fn reached(
+    &self,
+    _store: &ContentStore,
+    green: u64,
+    version: usize,
+  ) -> Result<Positions, StoreRefused> {
+    let chain = self.chains.get(&green);
+    match chain {
+      Some(chain) if version.checked_add(1) == Some(chain.versions.len()) => {
+        Ok(chain.reached.clone())
+      }
+      _ => Err(StoreRefused::NoVersion {
+        green,
+        version: to_u64(version),
+      }),
+    }
   }
 
   /// The head of `green`'s version `version`; `None` for a deleted ref.
