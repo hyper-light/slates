@@ -798,7 +798,10 @@ fn merge_source_additions(trees: Trees<'_>, path: &str) -> Merged {
       continue;
     }
     if t_entries.contains_key(name) {
-      return Err(Stopped::Conflict(joined_path(path, name), ConflictKind::AddedTwice));
+      return Err(Stopped::Conflict(
+        joined_path(path, name),
+        ConflictKind::AddedTwice,
+      ));
     }
   }
   Ok(())

@@ -19,23 +19,74 @@ type Session = (&'static str, &'static [u8]);
 /// The recorded sessions that commit, or try to: every client stream of `sessions.txt` whose session runs `commit`,
 /// `import`, `mkdir` or a copy between URLs.
 const SESSIONS: [Session; 17] = [
-  ("mkdir", include_bytes!("../../../fixtures/commit/mkdir.1.client.bin")),
-  ("import", include_bytes!("../../../fixtures/commit/import.1.client.bin")),
-  ("edit", include_bytes!("../../../fixtures/commit/edit.1.client.bin")),
-  ("edit-large", include_bytes!("../../../fixtures/commit/edit-large.1.client.bin")),
-  ("propset", include_bytes!("../../../fixtures/commit/propset.1.client.bin")),
-  ("propdel", include_bytes!("../../../fixtures/commit/propdel.1.client.bin")),
-  ("root-prop-stale", include_bytes!("../../../fixtures/commit/root-prop-stale.1.client.bin")),
-  ("root-prop", include_bytes!("../../../fixtures/commit/root-prop.1.client.bin")),
-  ("add-delete", include_bytes!("../../../fixtures/commit/add-delete.1.client.bin")),
-  ("replace", include_bytes!("../../../fixtures/commit/replace.1.client.bin")),
-  ("copy-url", include_bytes!("../../../fixtures/commit/copy-url.1.client.bin")),
-  ("copy-modify", include_bytes!("../../../fixtures/commit/copy-modify.1.client.bin")),
-  ("out-of-date", include_bytes!("../../../fixtures/commit/out-of-date.1.client.bin")),
-  ("locked-by-other", include_bytes!("../../../fixtures/commit/locked-by-other.1.client.bin")),
-  ("commit-with-lock", include_bytes!("../../../fixtures/commit/commit-with-lock.1.client.bin")),
-  ("conflict", include_bytes!("../../../fixtures/commit/conflict.1.client.bin")),
-  ("race-commit", include_bytes!("../../../fixtures/commit/race-commit.1.client.bin")),
+  (
+    "mkdir",
+    include_bytes!("../../../fixtures/commit/mkdir.1.client.bin"),
+  ),
+  (
+    "import",
+    include_bytes!("../../../fixtures/commit/import.1.client.bin"),
+  ),
+  (
+    "edit",
+    include_bytes!("../../../fixtures/commit/edit.1.client.bin"),
+  ),
+  (
+    "edit-large",
+    include_bytes!("../../../fixtures/commit/edit-large.1.client.bin"),
+  ),
+  (
+    "propset",
+    include_bytes!("../../../fixtures/commit/propset.1.client.bin"),
+  ),
+  (
+    "propdel",
+    include_bytes!("../../../fixtures/commit/propdel.1.client.bin"),
+  ),
+  (
+    "root-prop-stale",
+    include_bytes!("../../../fixtures/commit/root-prop-stale.1.client.bin"),
+  ),
+  (
+    "root-prop",
+    include_bytes!("../../../fixtures/commit/root-prop.1.client.bin"),
+  ),
+  (
+    "add-delete",
+    include_bytes!("../../../fixtures/commit/add-delete.1.client.bin"),
+  ),
+  (
+    "replace",
+    include_bytes!("../../../fixtures/commit/replace.1.client.bin"),
+  ),
+  (
+    "copy-url",
+    include_bytes!("../../../fixtures/commit/copy-url.1.client.bin"),
+  ),
+  (
+    "copy-modify",
+    include_bytes!("../../../fixtures/commit/copy-modify.1.client.bin"),
+  ),
+  (
+    "out-of-date",
+    include_bytes!("../../../fixtures/commit/out-of-date.1.client.bin"),
+  ),
+  (
+    "locked-by-other",
+    include_bytes!("../../../fixtures/commit/locked-by-other.1.client.bin"),
+  ),
+  (
+    "commit-with-lock",
+    include_bytes!("../../../fixtures/commit/commit-with-lock.1.client.bin"),
+  ),
+  (
+    "conflict",
+    include_bytes!("../../../fixtures/commit/conflict.1.client.bin"),
+  ),
+  (
+    "race-commit",
+    include_bytes!("../../../fixtures/commit/race-commit.1.client.bin"),
+  ),
 ];
 
 /// The longest word a stock 1.15 parser reads (`marshal.c` `MAX_WORD_LENGTH`), which bounds the recorded streams' words.
@@ -64,7 +115,9 @@ fn items(stream: &[u8]) -> Vec<Read<'_>> {
         read.push((value, &rest[..consumed]));
         rest = &rest[consumed..];
       }
-      Parsed::NeedMore { needed } => panic!("a recorded stream ends inside an item ({needed} bytes needed)"),
+      Parsed::NeedMore { needed } => {
+        panic!("a recorded stream ends inside an item ({needed} bytes needed)")
+      }
     }
   }
   read
@@ -77,12 +130,20 @@ fn written(value: &Value<'_>) -> Vec<u8> {
   out
 }
 
+/// Whether `value` is the client's `commit` command.
+fn is_commit(value: &Value<'_>) -> bool {
+  let Value::List(parts) = value else {
+    return false;
+  };
+  parts.first() == Some(&Value::Word("commit"))
+}
+
 /// The commit request and the editor commands that follow it in `stream`, each with the bytes it took.
 fn drive(stream: &[u8]) -> (Read<'_>, Vec<Read<'_>>) {
   let all = items(stream);
   let at = all
     .iter()
-    .position(|(value, _)| matches!(value, Value::List(parts) if parts.first() == Some(&Value::Word("commit"))))
+    .position(|(value, _)| is_commit(value))
     .expect("a commit session holds a commit command");
   let mut rest = all.into_iter().skip(at);
   let request = rest.next().unwrap();
@@ -118,13 +179,19 @@ fn names(commands: &[EditCommand<'_>]) -> Vec<&'static str> {
 fn round_trips(name: &str, stream: &[u8], census: &mut BTreeMap<&'static str, usize>) {
   let ((request, request_bytes), drive) = drive(stream);
   let read = CommitRequest::read(params(&request)).unwrap();
-  assert_eq!(written(&read.to_value()), request_bytes, "{name}: the request");
+  assert_eq!(
+    written(&read.to_value()),
+    request_bytes,
+    "{name}: the request"
+  );
   for (value, bytes) in &drive {
     let command = EditCommand::read(value).unwrap();
     assert_eq!(written(&command.to_value()), *bytes, "{name}: {command:?}");
     *census.entry(command.name()).or_default() += 1;
   }
-  let last = drive.last().map(|(value, _)| EditCommand::read(value).unwrap());
+  let last = drive
+    .last()
+    .map(|(value, _)| EditCommand::read(value).unwrap());
   assert_eq!(last, Some(EditCommand::CloseEdit), "{name}: the drive ends");
 }
 
@@ -157,7 +224,11 @@ fn every_stock_commit_reads_and_writes_back_byte_for_byte() {
     .into_iter()
     .filter(|name| !census.contains_key(name))
     .collect();
-  assert_eq!(missing, Vec::<&str>::new(), "commands never met: {census:?}");
+  assert_eq!(
+    missing,
+    Vec::<&str>::new(),
+    "commands never met: {census:?}"
+  );
 }
 
 /// The text deltas of a drive, by the file token they are for, with the path the file was opened or added at.
@@ -203,7 +274,11 @@ fn applied(stream: &[u8], path: &[u8], base: &[u8]) -> Vec<u8> {
     .find(|(at, _)| *at == path)
     .expect("the session sends a delta for the path");
   let (version, windows) = svndiff::decode_all(delta).unwrap();
-  assert_eq!(version, svndiff::Version::Two, "a stock client sends svndiff 2 to a server that accepts it");
+  assert_eq!(
+    version,
+    svndiff::Version::Two,
+    "a stock client sends svndiff 2 to a server that accepts it"
+  );
   svndiff::apply_all(base, &windows).unwrap()
 }
 
@@ -221,14 +296,23 @@ fn the_text_deltas_of_stock_commits_are_whole_svndiff_streams() {
     }
   }
   let session = |name: &str| SESSIONS.iter().find(|(at, _)| *at == name).unwrap().1;
-  assert_eq!(applied(session("import"), b"project/a.txt", b""), b"alpha\nbeta\ngamma\n");
+  assert_eq!(
+    applied(session("import"), b"project/a.txt", b""),
+    b"alpha\nbeta\ngamma\n"
+  );
   let binary: Vec<u8> = (0..=u8::MAX).collect::<Vec<u8>>().repeat(4);
-  assert_eq!(applied(session("import"), b"project/binary.bin", b""), binary);
+  assert_eq!(
+    applied(session("import"), b"project/binary.bin", b""),
+    binary
+  );
   assert_eq!(
     applied(session("edit"), b"a.txt", b"alpha\nbeta\ngamma\n"),
     b"alpha\nBETA\ngamma\ndelta\n"
   );
-  assert_eq!(applied(session("replace"), b"c.txt", b""), b"the replacement\n");
+  assert_eq!(
+    applied(session("replace"), b"c.txt", b""),
+    b"the replacement\n"
+  );
   let (base, edited) = large_files();
   assert_eq!(applied(session("edit-large"), b"large.txt", &base), edited);
 }
@@ -336,13 +420,27 @@ fn the_requests_carry_their_locks_and_revision_properties() {
   let ((held_value, _), _) = drive(session("commit-with-lock"));
   let held = CommitRequest::read(params(&held_value)).unwrap();
   let tokens = held.lock_tokens().unwrap();
-  assert_eq!(tokens.iter().map(|(path, _)| *path).collect::<Vec<_>>(), [b"a.txt"]);
-  assert!(tokens.iter().all(|(_, token)| token.starts_with(b"opaquelocktoken:")));
+  assert_eq!(
+    tokens.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+    [b"a.txt"]
+  );
+  assert!(
+    tokens
+      .iter()
+      .all(|(_, token)| token.starts_with(b"opaquelocktoken:"))
+  );
   assert!(!held.keep_locks());
   let ((branch_value, _), _) = drive(session("copy-url"));
   let branch = CommitRequest::read(params(&branch_value)).unwrap();
-  assert_eq!((branch.lock_tokens(), branch.keep_locks()), (Ok(Vec::new()), true));
-  let expected: [&[u8]; 3] = [b"svn:log", b"svn:txn-client-compat-version", b"svn:txn-user-agent"];
+  assert_eq!(
+    (branch.lock_tokens(), branch.keep_locks()),
+    (Ok(Vec::new()), true)
+  );
+  let expected: [&[u8]; 3] = [
+    b"svn:log",
+    b"svn:txn-client-compat-version",
+    b"svn:txn-user-agent",
+  ];
   for request in [&held, &branch] {
     assert_eq!(property_names(request), expected);
   }
@@ -365,21 +463,49 @@ fn malformed<T>() -> Result<T, EditRefusal> {
 #[test]
 fn a_command_out_of_its_prototype_is_malformed_and_items_past_it_are_ignored() {
   let string = |bytes: &'static [u8]| Value::String(bytes);
-  let short = item("open-file", vec![string(b"a"), string(b"d0"), string(b"c1")]);
+  let short = item(
+    "open-file",
+    vec![string(b"a"), string(b"d0"), string(b"c1")],
+  );
   assert_eq!(EditCommand::read(&short), malformed());
-  let word = item("open-file", vec![Value::Word("a"), string(b"d0"), string(b"c1"), Value::List(vec![])]);
+  let word = item(
+    "open-file",
+    vec![
+      Value::Word("a"),
+      string(b"d0"),
+      string(b"c1"),
+      Value::List(vec![]),
+    ],
+  );
   assert_eq!(EditCommand::read(&word), malformed());
-  let number = item("open-file", vec![string(b"a"), string(b"d0"), string(b"c1"), Value::Number(2)]);
+  let number = item(
+    "open-file",
+    vec![string(b"a"), string(b"d0"), string(b"c1"), Value::Number(2)],
+  );
   assert_eq!(EditCommand::read(&number), malformed());
   let path_alone = item(
     "add-file",
-    vec![string(b"a"), string(b"d0"), string(b"c1"), Value::List(vec![string(b"/x")])],
+    vec![
+      string(b"a"),
+      string(b"d0"),
+      string(b"c1"),
+      Value::List(vec![string(b"/x")]),
+    ],
   );
   let refused = EditCommand::read(&path_alone).unwrap_err();
-  assert_eq!((refused.subversion_code(), refused.ends_connection()), (210_004, true));
+  assert_eq!(
+    (refused.subversion_code(), refused.ends_connection()),
+    (210_004, true)
+  );
   let extra = item(
     "open-file",
-    vec![string(b"a"), string(b"d0"), string(b"c1"), Value::List(vec![]), Value::Word("extra")],
+    vec![
+      string(b"a"),
+      string(b"d0"),
+      string(b"c1"),
+      Value::List(vec![]),
+      Value::Word("extra"),
+    ],
   );
   assert_eq!(
     EditCommand::read(&extra),
@@ -404,7 +530,10 @@ fn an_unknown_command_is_a_command_failure_and_a_non_command_ends_the_connection
       name: "rename-file".to_owned(),
     }
   );
-  assert_eq!((unknown.subversion_code(), unknown.ends_connection()), (210_001, false));
+  assert_eq!(
+    (unknown.subversion_code(), unknown.ends_connection()),
+    (210_001, false)
+  );
   assert_eq!(EditCommand::read(&Value::Word("open-root")), malformed());
   let string_params = Value::List(vec![Value::Word("close-edit"), Value::String(b"x")]);
   assert_eq!(EditCommand::read(&string_params), malformed());
@@ -418,7 +547,11 @@ fn an_unknown_command_is_a_command_failure_and_a_non_command_ends_the_connection
 fn a_nul_in_a_c_string_and_a_revision_past_svn_revnum_t_are_refused() {
   let nul = item(
     "delete-entry",
-    vec![Value::String(b"a\0b"), Value::List(vec![]), Value::String(b"d0")],
+    vec![
+      Value::String(b"a\0b"),
+      Value::List(vec![]),
+      Value::String(b"d0"),
+    ],
   );
   assert_eq!(
     EditCommand::read(&nul),
@@ -442,7 +575,10 @@ fn a_nul_in_a_c_string_and_a_revision_past_svn_revnum_t_are_refused() {
   );
   assert!(EditCommand::read(&at(largest)).is_ok());
   let token = item("close-dir", vec![Value::String(b"d\0")]);
-  assert_eq!(EditCommand::read(&token), Ok(EditCommand::CloseDir { directory: b"d\0" }));
+  assert_eq!(
+    EditCommand::read(&token),
+    Ok(EditCommand::CloseDir { directory: b"d\0" })
+  );
 }
 
 /// A-617 (`serve.c` `commit` 1497-1510 and `add_lock_tokens` 1395-1430). Do: read a request of one item, one of
@@ -464,7 +600,12 @@ fn a_commit_request_is_read_as_svnserve_reads_it() {
   assert_eq!(CommitRequest::read(&not_boolean), malformed());
   let missing = [log.clone(), Value::List(vec![])];
   assert_eq!(CommitRequest::read(&missing), malformed());
-  let bad_properties = [log, Value::List(vec![]), Value::Word("true"), Value::List(vec![Value::String(b"x")])];
+  let bad_properties = [
+    log,
+    Value::List(vec![]),
+    Value::Word("true"),
+    Value::List(vec![Value::String(b"x")]),
+  ];
   assert_eq!(CommitRequest::read(&bad_properties), malformed());
   check_lock_tokens();
 }
@@ -474,13 +615,29 @@ fn check_lock_tokens() {
   let pair = |items: Vec<Value<'static>>| Value::List(items);
   let cases = [
     (Value::String(b"x"), LockTokensRefusal::NotListOfLists),
-    (pair(vec![Value::Number(1), Value::String(b"t")]), LockTokensRefusal::PathNotString),
-    (pair(vec![Value::String(b"a"), Value::Word("t")]), LockTokensRefusal::TokenNotString),
-    (pair(vec![Value::String(b"a")]), LockTokensRefusal::ShortPair),
-    (pair(vec![Value::String(b"a\0"), Value::String(b"t")]), LockTokensRefusal::NulInString),
+    (
+      pair(vec![Value::Number(1), Value::String(b"t")]),
+      LockTokensRefusal::PathNotString,
+    ),
+    (
+      pair(vec![Value::String(b"a"), Value::Word("t")]),
+      LockTokensRefusal::TokenNotString,
+    ),
+    (
+      pair(vec![Value::String(b"a")]),
+      LockTokensRefusal::ShortPair,
+    ),
+    (
+      pair(vec![Value::String(b"a\0"), Value::String(b"t")]),
+      LockTokensRefusal::NulInString,
+    ),
   ];
   for (token, refusal) in cases {
-    let params = [Value::String(b"log"), Value::List(vec![token]), Value::Word("false")];
+    let params = [
+      Value::String(b"log"),
+      Value::List(vec![token]),
+      Value::Word("false"),
+    ];
     let read = CommitRequest::read(&params).unwrap();
     assert_eq!(read.lock_tokens(), Err(refusal));
     assert_eq!(refusal.subversion_code(), 210_004);
@@ -623,7 +780,8 @@ fn got_of<'a>(command: &EditCommand<'a>) -> Vec<Got<'a>> {
   let c = |bytes| Got::Bytes(b'c', bytes);
   let s = |bytes| Got::Bytes(b's', bytes);
   let r = |revision: Option<u64>| revision.map_or(Got::Absent, |number| Got::Number(b'r', number));
-  let o = |bytes: Option<&'a [u8]>, letter| bytes.map_or(Got::Absent, |bytes| Got::Bytes(letter, bytes));
+  let o =
+    |bytes: Option<&'a [u8]>, letter| bytes.map_or(Got::Absent, |bytes| Got::Bytes(letter, bytes));
   let copy = |copied: Option<CopiedFrom<'a>>| match copied {
     Some(source) => vec![c(source.path), Got::Number(b'r', source.revision)],
     None => vec![Got::Absent, Got::Absent],
@@ -670,8 +828,9 @@ fn got_of<'a>(command: &EditCommand<'a>) -> Vec<Got<'a>> {
       name,
       value,
     } => vec![s(token), c(name), o(value, b's')],
-    EditCommand::CloseDir { directory: token }
-    | EditCommand::TextdeltaEnd { file: token } => vec![s(token)],
+    EditCommand::CloseDir { directory: token } | EditCommand::TextdeltaEnd { file: token } => {
+      vec![s(token)]
+    }
     EditCommand::AbsentDir { path, parent } | EditCommand::AbsentFile { path, parent } => {
       vec![c(path), s(parent)]
     }
@@ -684,9 +843,10 @@ fn got_of<'a>(command: &EditCommand<'a>) -> Vec<Got<'a>> {
       text_checksum: checksum,
     } => vec![s(file), o(checksum, b'c')],
     EditCommand::TextdeltaChunk { file, chunk } => vec![s(file), s(chunk)],
-    EditCommand::CloseEdit | EditCommand::AbortEdit | EditCommand::FinishReplay | EditCommand::Failure => {
-      Vec::new()
-    }
+    EditCommand::CloseEdit
+    | EditCommand::AbortEdit
+    | EditCommand::FinishReplay
+    | EditCommand::Failure => Vec::new(),
   }
 }
 
@@ -715,7 +875,13 @@ impl Owned {
 const WORDS: [&str; 4] = ["true", "false", "maybe", "open-root"];
 
 /// The numbers a generated item may be: small, at and past `svn_revnum_t`'s end, and the largest.
-const NUMBERS: [u64; 5] = [0, 7, 9_223_372_036_854_775_807, 9_223_372_036_854_775_808, u64::MAX];
+const NUMBERS: [u64; 5] = [
+  0,
+  7,
+  9_223_372_036_854_775_807,
+  9_223_372_036_854_775_808,
+  u64::MAX,
+];
 
 /// The strings a generated item may be: plain, empty, and holding a NUL byte.
 const STRINGS: [&[u8]; 4] = [b"a.txt", b"", b"d\0", b"svn+fixture://fixture/repo/trunk"];
@@ -763,11 +929,18 @@ fn params_for(format: &[u8], picks: &mut std::slice::Iter<'_, u8>) -> Vec<Owned>
       b')' => break,
       b'(' => {
         let inner_start = at;
-        let depth = format[inner_start..].iter().position(|&l| l == b')').unwrap_or(0);
+        let depth = format[inner_start..]
+          .iter()
+          .position(|&l| l == b')')
+          .unwrap_or(0);
         let inner = &format[inner_start..inner_start + depth];
         at = inner_start + depth + 1;
         let empty = pick(picks).is_multiple_of(3);
-        items.push(Owned::List(if empty { Vec::new() } else { params_for(inner, picks) }));
+        items.push(Owned::List(if empty {
+          Vec::new()
+        } else {
+          params_for(inner, picks)
+        }));
       }
       _ => match pick(picks) % 8 {
         0 => return items,
@@ -818,9 +991,10 @@ fn check_case(name: &str, picks: &[u8], census: &mut Census) -> Result<(), Strin
   let typed = EditCommand::read(&item(name, params.clone()));
   match (transcribed, typed) {
     (Err(()), Err(EditRefusal::Malformed(_))) => census.refused += 1,
-    (Ok(()), Err(EditRefusal::Malformed(Malformation::NulInString | Malformation::RevisionPastRange)))
-      if stricter(&got) =>
-    {
+    (
+      Ok(()),
+      Err(EditRefusal::Malformed(Malformation::NulInString | Malformation::RevisionPastRange)),
+    ) if stricter(&got) => {
       census.stricter += 1;
     }
     (Ok(()), Ok(command)) if !stricter(&got) && got_of(&command) == got => census.read += 1,
@@ -847,7 +1021,10 @@ fn every_prototype_reads_as_vparse_tuple_reads_it() {
   let census = RefCell::new(Census::default());
   let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config::default()));
   let result = runner.run(
-    &(0..PROTOTYPES.len(), prop::collection::vec(any::<u8>(), 0..48)),
+    &(
+      0..PROTOTYPES.len(),
+      prop::collection::vec(any::<u8>(), 0..48),
+    ),
     |(index, picks)| {
       let name = PROTOTYPES[index].0;
       check_case(name, &picks, &mut census.borrow_mut()).map_err(TestCaseError::fail)

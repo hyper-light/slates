@@ -483,16 +483,21 @@ impl<'a> EditCommand<'a> {
   fn parts(&self) -> (&'static str, Vec<Value<'a>>) {
     match *self {
       Self::TargetRev { revision } => ("target-rev", vec![Value::Number(revision)]),
-      Self::OpenRoot { revision, root } => {
-        ("open-root", vec![optional_number(revision), Value::String(root)])
-      }
+      Self::OpenRoot { revision, root } => (
+        "open-root",
+        vec![optional_number(revision), Value::String(root)],
+      ),
       Self::DeleteEntry {
         path,
         revision,
         directory,
       } => (
         "delete-entry",
-        vec![Value::String(path), optional_number(revision), Value::String(directory)],
+        vec![
+          Value::String(path),
+          optional_number(revision),
+          Value::String(directory),
+        ],
       ),
       Self::AddDir {
         path,
@@ -512,7 +517,10 @@ impl<'a> EditCommand<'a> {
         value,
       } => ("change-dir-prop", changed(directory, name, value)),
       Self::CloseDir { directory } => ("close-dir", vec![Value::String(directory)]),
-      Self::AbsentDir { path, parent } => ("absent-dir", vec![Value::String(path), Value::String(parent)]),
+      Self::AbsentDir { path, parent } => (
+        "absent-dir",
+        vec![Value::String(path), Value::String(parent)],
+      ),
       Self::AddFile {
         path,
         directory,
@@ -528,17 +536,29 @@ impl<'a> EditCommand<'a> {
       Self::ApplyTextdelta {
         file,
         base_checksum,
-      } => ("apply-textdelta", vec![Value::String(file), optional_string(base_checksum)]),
-      Self::TextdeltaChunk { file, chunk } => {
-        ("textdelta-chunk", vec![Value::String(file), Value::String(chunk)])
-      }
+      } => (
+        "apply-textdelta",
+        vec![Value::String(file), optional_string(base_checksum)],
+      ),
+      Self::TextdeltaChunk { file, chunk } => (
+        "textdelta-chunk",
+        vec![Value::String(file), Value::String(chunk)],
+      ),
       Self::TextdeltaEnd { file } => ("textdelta-end", vec![Value::String(file)]),
-      Self::ChangeFileProp { file, name, value } => ("change-file-prop", changed(file, name, value)),
+      Self::ChangeFileProp { file, name, value } => {
+        ("change-file-prop", changed(file, name, value))
+      }
       Self::CloseFile {
         file,
         text_checksum,
-      } => ("close-file", vec![Value::String(file), optional_string(text_checksum)]),
-      Self::AbsentFile { path, parent } => ("absent-file", vec![Value::String(path), Value::String(parent)]),
+      } => (
+        "close-file",
+        vec![Value::String(file), optional_string(text_checksum)],
+      ),
+      Self::AbsentFile { path, parent } => (
+        "absent-file",
+        vec![Value::String(path), Value::String(parent)],
+      ),
       Self::CloseEdit => ("close-edit", Vec::new()),
       Self::AbortEdit => ("abort-edit", Vec::new()),
       Self::FinishReplay => ("finish-replay", Vec::new()),
@@ -619,7 +639,9 @@ fn open_file<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefus
 }
 
 /// A token, a name and a value or none: `change-dir-prop`'s and `change-file-prop`'s `"sc(?s)"`.
-fn property<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<(Token<'a>, &'a [u8], Option<&'a [u8]>), EditRefusal> {
+fn property<'a>(
+  tuple: &mut Tuple<'_, 'a>,
+) -> Result<(Token<'a>, &'a [u8], Option<&'a [u8]>), EditRefusal> {
   let token = tuple.string()?;
   let name = tuple.cstring()?;
   Ok((token, name, optional_value(tuple)?))
@@ -703,7 +725,12 @@ fn added<'a>(
 }
 
 /// `write_cmd_open_node`'s items.
-fn opened<'a>(path: &'a [u8], parent: Token<'a>, child: Token<'a>, revision: Option<u64>) -> Vec<Value<'a>> {
+fn opened<'a>(
+  path: &'a [u8],
+  parent: Token<'a>,
+  child: Token<'a>,
+  revision: Option<u64>,
+) -> Vec<Value<'a>> {
   vec![
     Value::String(path),
     Value::String(parent),
@@ -714,7 +741,11 @@ fn opened<'a>(path: &'a [u8], parent: Token<'a>, child: Token<'a>, revision: Opt
 
 /// `write_cmd_change_node_prop`'s items.
 fn changed<'a>(token: Token<'a>, name: &'a [u8], value: Option<&'a [u8]>) -> Vec<Value<'a>> {
-  vec![Value::String(token), Value::String(name), optional_string(value)]
+  vec![
+    Value::String(token),
+    Value::String(name),
+    optional_string(value),
+  ]
 }
 
 impl<'v, 'a> CommitRequest<'v, 'a> {
