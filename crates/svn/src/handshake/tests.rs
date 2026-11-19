@@ -1773,7 +1773,11 @@ fn an_authentication_for_one_command_offers_no_anonymous_and_ends_at_its_success
   let item_bytes = roomy(&alices_response());
   let mut server =
     Server::for_command(anonymous_session(), &mechanisms, item_bytes, &mut written).unwrap();
-  let request = cat(&[b"( success ( ( CRAM-MD5 ) ", &string_item(UUID_BOTH), b") ) "]);
+  let request = cat(&[
+    b"( success ( ( CRAM-MD5 ) ",
+    &string_item(UUID_BOTH),
+    b") ) ",
+  ]);
   assert_bytes(&written, &request, "the request");
   written.clear();
   let anonymous = b"( ANONYMOUS ( 0: ) ) ";
@@ -1890,7 +1894,11 @@ fn an_authentication_for_one_command_writes_what_svnserve_wrote_for_lock_many() 
     asking.key(Some(&key), &mut written),
     Ok(Verdict::Established(alice.clone()))
   );
-  assert_bytes(&written, &cat(&[server[5], server[6]]), "the challenge and the success");
+  assert_bytes(
+    &written,
+    &cat(&[server[5], server[6]]),
+    "the challenge and the success",
+  );
   assert_eq!(
     asking.session().map(|session| &session.principal),
     Some(&alice)
@@ -1910,9 +1918,18 @@ fn a_tunnels_authentication_for_one_command_takes_its_user() {
     cram_md5: false,
   };
   let external = b"( EXTERNAL ( 0: ) ) ";
-  let mut server =
-    Server::for_command(anonymous_session(), &mechanisms, roomy(external), &mut written).unwrap();
-  let request = cat(&[b"( success ( ( EXTERNAL ) ", &string_item(UUID_BOTH), b") ) "]);
+  let mut server = Server::for_command(
+    anonymous_session(),
+    &mechanisms,
+    roomy(external),
+    &mut written,
+  )
+  .unwrap();
+  let request = cat(&[
+    b"( success ( ( EXTERNAL ) ",
+    &string_item(UUID_BOTH),
+    b") ) ",
+  ]);
   assert_bytes(&written, &request, "the request");
   written.clear();
   assert_eq!(
