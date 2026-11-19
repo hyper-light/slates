@@ -108,14 +108,15 @@ fn different_work_has_a_different_identity() {
   assert_ne!(a.identity(), b.identity());
 }
 
-/// Every op kind round-trips through its wire value.
+/// Every op kind round-trips through its wire value, `Copy` (16, appended by A-586) the last.
 #[test]
 fn op_kinds_round_trip() {
-  for value in 0u8..=15 {
+  for value in 0u8..=16 {
     let kind = OpKind::from_wire(value).unwrap();
     assert_eq!(kind.to_wire(), value);
   }
-  assert!(OpKind::from_wire(16).is_none());
+  assert_eq!(OpKind::from_wire(16), Some(OpKind::Copy));
+  assert!(OpKind::from_wire(17).is_none());
 }
 
 /// Interning is stable and deduplicated during building; canonicalize then sorts the table so

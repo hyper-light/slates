@@ -12,7 +12,8 @@
 //! **What it holds.** The increment's own encoding, byte for byte, since a merge record's inputs are those bytes
 //! (`merge_service::inputs_of`) and a holder and a successor judge them afresh (§4.16 "Apply on holders"). Then each
 //! [`Applied`] effect: content by reference to the increment's post-state (the mapped ops of a splice, the declared ops
-//! of a create, the source path of a rename), so no file's bytes are recorded twice; every other dimension by value.
+//! of a create, the source path of a rename), a copied tree by its two paths (A-586), so no file's bytes are recorded
+//! twice; every other dimension by value.
 //! Then the completion key of the submit that made the version, where one did, with the work it was submitted from when
 //! its client was on another node (A-255: its merge record carries both, so a green's successor answers the submit's
 //! resend after a takeover and keeps the work's route only while it holds such a completion, A-288; and a restarted owner
@@ -106,6 +107,17 @@ pub enum Applied {
   SetXattr(String, String, Vec<u8>),
   /// Remove an xattr: path, name.
   RemoveXattr(String, String),
+  /// Copy `from`'s tree to `dst` by reference (A-586): what the head holds of it, which the verdict found unchanged
+  /// since `version`, the source's version the increment declared. Encoded as its two paths; `version` is read back
+  /// from the increment's own `Copy` operation, so the entry costs no more than its bound's two strings.
+  CopyTree {
+    /// The destination.
+    dst: String,
+    /// The source.
+    from: String,
+    /// The version of the source the increment copies.
+    version: u64,
+  },
 }
 
 /// A decoded chain entry.
@@ -191,6 +203,8 @@ mod tag {
   /// Format: the tag of a file taking another's bytes with edits spliced into them (A-547): a rename's destination the
   /// work edited after the rename. A rename alone keeps [`COPIED`].
   pub(super) const COPIED_SPLICED: u8 = 17;
+  /// Format: the tag of a tree copied by reference (A-586), its source's version the increment's `Copy` operation's.
+  pub(super) const COPY_TREE: u8 = 18;
 }
 
 /// The largest an entry for `increment` can encode to, whatever its verdict resolves it to: what the service charges
@@ -488,6 +502,7 @@ fn put_applied(out: &mut Vec<u8>, increment: &Increment, applied: &Applied) {
       put_bytes(out, value);
     }
     Applied::RemoveXattr(path, name) => put_tagged_paths(out, tag::REMOVE_XATTR, &[path, name]),
+    Applied::CopyTree { dst, from, .. } => put_tagged_paths(out, tag::COPY_TREE, &[dst, from]),
   }
 }
 
@@ -555,8 +570,27 @@ fn take_applied(reader: &mut Reader<'_>, increment: &Increment) -> Result<Applie
       let path = take_str(reader)?;
       Applied::RemoveXattr(path, take_str(reader)?)
     }
+    tag::COPY_TREE => {
+      let dst = take_str(reader)?;
+      let from = take_str(reader)?;
+      let version = declared_copy(increment, &dst, &from).ok_or(DocDecodeError::BadKind)?;
+      Applied::CopyTree { dst, from, version }
+    }
     _ => return Err(DocDecodeError::BadKind),
   })
+}
+
+/// The source version of the `Copy` operation `increment` declares from `from` to `dst` (A-586); `None` when it declares
+/// none, which no entry the engine recorded holds.
+fn declared_copy(increment: &Increment, dst: &str, from: &str) -> Option<u64> {
+  // Each index is 64 bits (A-621): narrowed to 16, a copy past the 65,535th path was never found.
+  let path = |index: u64| increment.doc.paths.path(index);
+  increment
+    .doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::Copy && path(op.path) == Some(dst) && path(op.src) == Some(from))
+    .map(|op| op.at)
 }
 
 #[cfg(test)]

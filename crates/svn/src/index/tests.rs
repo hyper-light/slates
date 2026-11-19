@@ -1597,7 +1597,7 @@ impl Txn<'_> {
   /// A copy of a path of an earlier revision, of at most `COPY_CAP` paths, at a free place or over `replacing`.
   fn copy_of(&self, wish: &Wish, path: String, action: Action) -> Option<ChangedPath> {
     let revision = u64::from(wish.from) % self.revision;
-    let tree = &self.fs.trees[usize::try_from(revision).unwrap()];
+    let tree = self.fs.trees.get(usize::try_from(revision).ok()?)?;
     let sources: Vec<&String> = tree.keys().collect();
     let source = pick(&sources, wish.source)?.clone();
     if tree
@@ -1831,7 +1831,7 @@ impl Pairings {
 
 /// The naive answer at `path` in `revision`, if present.
 fn naive_answer(fs: &NaiveFs, path: &str, revision: Revision) -> Option<Answer> {
-  let label = *fs.trees[usize::try_from(revision).unwrap()].get(path)?;
+  let label = *fs.trees.get(usize::try_from(revision).ok()?)?.get(path)?;
   let node = &fs.nodes[label];
   Some(Answer {
     label,
@@ -1852,11 +1852,14 @@ fn naive_answer(fs: &NaiveFs, path: &str, revision: Revision) -> Option<Answer> 
   })
 }
 
-/// The index's answer at `path` in `revision`, if present.
-fn index_answer(index: &Index, path: &str, revision: Revision) -> Option<Answer> {
-  let node = index.node(path, revision).unwrap()?;
+/// The index's answer at `path` in `revision`, if present; a refusal of the question is the oracle's failure.
+fn index_answer(index: &Index, path: &str, revision: Revision) -> Result<Option<Answer>, String> {
+  let asked = index.node(path, revision);
+  let Some(node) = asked.map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))? else {
+    return Ok(None);
+  };
   let id = |id: NodeRevisionId| id.0;
-  Some(Answer {
+  Ok(Some(Answer {
     label: id(node.id()),
     node_id: (node.node_id().revision, node.node_id().number),
     copy_id: (node.copy_id().revision, node.copy_id().number),
@@ -1874,7 +1877,7 @@ fn index_answer(index: &Index, path: &str, revision: Revision) -> Option<Answer>
       properties: node.properties(),
       mergeinfo: node.mergeinfo_count(),
     },
-  })
+  }))
 }
 
 /// Every path any revision of `fs` held.
@@ -1888,10 +1891,13 @@ fn every_path(fs: &NaiveFs) -> BTreeSet<String> {
 /// Holds two naive replays of one history equal at every path of every revision.
 fn same_naive(left: &NaiveFs, right: &NaiveFs) -> Result<(), String> {
   let mut pairings = Pairings::new();
-  for (revision, tree) in left.trees.iter().enumerate() {
-    let revision = u64::try_from(revision).unwrap();
+  for (position, tree) in left.trees.iter().enumerate() {
+    let revision = u64::try_from(position).map_err(|error| error.to_string())?;
     let paths: Vec<&String> = tree.keys().collect();
-    let other: Vec<&String> = right.trees[usize::try_from(revision).unwrap()]
+    let other: Vec<&String> = right
+      .trees
+      .get(position)
+      .ok_or_else(|| format!("revision {revision}: absent from the other replay"))?
       .keys()
       .collect();
     if paths != other {
@@ -1900,8 +1906,9 @@ fn same_naive(left: &NaiveFs, right: &NaiveFs) -> Result<(), String> {
       ));
     }
     for path in paths {
-      let first = naive_answer(left, path, revision).unwrap();
-      let second = naive_answer(right, path, revision).unwrap();
+      let absent = || format!("{path}@{revision}: listed and absent");
+      let first = naive_answer(left, path, revision).ok_or_else(absent)?;
+      let second = naive_answer(right, path, revision).ok_or_else(absent)?;
       pairings.same(&first, &second, &format!("{path}@{revision}"))?;
     }
   }
@@ -1935,7 +1942,7 @@ fn same_as_index(index: &Index, fs: &NaiveFs, census: &mut Census) -> Result<(),
     for path in &paths {
       let place = format!("{path}@{revision}");
       match (
-        index_answer(index, path, revision),
+        index_answer(index, path, revision)?,
         naive_answer(fs, path, revision),
       ) {
         (None, None) => {}
@@ -1966,7 +1973,7 @@ fn same_history(
 ) -> Result<(), String> {
   let ours: Vec<(Revision, bool, usize)> = index
     .history(path)
-    .unwrap()
+    .map_err(|refusal| format!("{path}: {refusal:?}"))?
     .iter()
     .map(|entry| match entry.event {
       HistoryEvent::Created(node) => (entry.revision, true, node.0),

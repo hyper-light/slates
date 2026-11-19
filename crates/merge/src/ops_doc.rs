@@ -56,6 +56,10 @@ pub enum OpKind {
   RemoveXattr = 14,
   /// Format: a FIFO/socket node whose fixed metadata is at `src` for `len` bytes.
   Mknod = 15,
+  /// Format: a path's tree copied by reference (A-586, Subversion's copy, §4.17.4 item 3): `path` is the destination,
+  /// `src` the source's index in the path table (as a rename's), `at` the version of the source copied (Subversion's
+  /// copy-from revision), `len` unused. Judged node-exclusively whatever its flags: it adds its destination.
+  Copy = 16,
 }
 
 impl OpKind {
@@ -88,6 +92,7 @@ const ALL_KINDS: &[OpKind] = &[
   OpKind::SetXattr,
   OpKind::RemoveXattr,
   OpKind::Mknod,
+  OpKind::Copy,
 ];
 
 /// One declared operation (§4.16 `OpRecord`), naming a path (by index into the document's path
@@ -243,7 +248,10 @@ impl OpsDoc {
   pub fn canonicalize(&mut self) {
     let remap = self.paths.sort_and_remap();
     for op in &mut self.ops {
-      if matches!(op.kind, OpKind::Rename | OpKind::Link | OpKind::Symlink) {
+      if matches!(
+        op.kind,
+        OpKind::Rename | OpKind::Link | OpKind::Symlink | OpKind::Copy
+      ) {
         op.src = usize::try_from(op.src)
           .ok()
           .and_then(|index| remap.get(index))
