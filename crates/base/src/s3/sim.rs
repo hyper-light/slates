@@ -231,18 +231,29 @@ impl SimS3 {
 
   /// One delimited listing page of `prefix`, after the item `token` names.
   fn page(&mut self, prefix: &str, token: Option<&str>) -> Result<ListPage, S3Error> {
-    let after = match token {
-      None => None,
-      Some(token) => match self.tokens.get(token) {
-        Some((listed, after)) if listed == prefix => Some(after.clone()),
-        _ => {
-          return Err(S3Error::Unexpected {
-            status: http::BAD_REQUEST,
-            code: Some("InvalidArgument".to_owned()),
-          });
-        }
-      },
+    let after = self.resumed_after(prefix, token)?;
+    let items = self.items_under(prefix);
+    Ok(self.fill_page(prefix, &items, after))
+  }
+
+  /// Where a listing of `prefix` resumes: after the item `token` names, from its start with no token. A token this
+  /// store did not give for `prefix` is refused `400 InvalidArgument`, as S3 refuses one.
+  fn resumed_after(&self, prefix: &str, token: Option<&str>) -> Result<Option<String>, S3Error> {
+    let Some(token) = token else {
+      return Ok(None);
     };
+    match self.tokens.get(token) {
+      Some((listed, after)) if listed == prefix => Ok(Some(after.clone())),
+      _ => Err(S3Error::Unexpected {
+        status: http::BAD_REQUEST,
+        code: Some("InvalidArgument".to_owned()),
+      }),
+    }
+  }
+
+  /// The items directly under `prefix`, by name in UTF-8 binary order: each key with a current object, and each common
+  /// prefix that has one beneath it.
+  fn items_under(&self, prefix: &str) -> BTreeMap<String, Item> {
     let mut items: BTreeMap<String, Item> = BTreeMap::new();
     let under = self
       .objects
@@ -268,6 +279,17 @@ impl SimS3 {
         }
       }
     }
+    items
+  }
+
+  /// The page of `items` after `after`, at most the store's keys a page, a common prefix counted as one key, with a
+  /// continuation token issued for `prefix` when more follow.
+  fn fill_page(
+    &mut self,
+    prefix: &str,
+    items: &BTreeMap<String, Item>,
+    after: Option<String>,
+  ) -> ListPage {
     let start = match &after {
       Some(after) => Bound::Excluded(after.as_str()),
       None => Bound::Unbounded,
@@ -294,7 +316,7 @@ impl SimS3 {
       page.truncated = true;
       page.next_token = Some(token);
     }
-    Ok(page)
+    page
   }
 
   /// Whether a key under `common` has a current object, so its common prefix lists.

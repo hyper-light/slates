@@ -149,46 +149,59 @@ pub fn civil_of(unix_seconds: u64) -> Civil {
 /// The Unix seconds of `civil`, or none for a date the calendar has not (a month past 12, a day past its month's last,
 /// an hour, minute or second past its field) or one before 1970 (Hinnant's `days_from_civil`).
 pub fn unix_of(civil: Civil) -> Option<u64> {
-  let in_year = (1..=MONTHS_PER_YEAR).contains(&civil.month)
-    && civil.day >= 1
-    && civil.day <= days_in_month(civil.year, civil.month)
-    && civil.hour < HOURS_PER_DAY
-    && civil.minute < SECONDS_PER_MINUTE
-    && civil.second < SECONDS_PER_MINUTE;
-  if !in_year || civil.year < YEARS.0 {
+  if !on_the_calendar(civil) {
     return None;
   }
-  let year = civil.year.checked_sub(u64::from(civil.month < MARCH))?;
-  let era = year.checked_div(YEARS_PER_ERA)?;
-  let year_of_era = year.checked_sub(era.checked_mul(YEARS_PER_ERA)?)?;
-  let month_from_march = if civil.month >= MARCH {
-    civil.month.checked_sub(MARCH)?
-  } else {
-    civil
-      .month
-      .checked_add(MONTHS_PER_YEAR)?
-      .checked_sub(MARCH)?
-  };
-  let day_of_year = DAYS_PER_FIVE_MONTHS
-    .checked_mul(month_from_march)?
-    .checked_add(2)?
-    .checked_div(FIVE_MONTHS)?
-    .checked_add(civil.day)?
-    .checked_sub(1)?;
-  let day_of_era = year_of_era
-    .checked_mul(DAYS_PER_YEAR)?
-    .checked_add(year_of_era.checked_div(YEARS_PER_LEAP)?)?
-    .checked_sub(year_of_era.checked_div(YEARS_PER_CENTURY)?)?
-    .checked_add(day_of_year)?;
-  let days = era
-    .checked_mul(DAYS_PER_ERA)?
-    .checked_add(day_of_era)?
-    .checked_sub(EPOCH_SHIFT_DAYS)?;
-  days
+  days_of(civil.year, civil.month, civil.day)?
     .checked_mul(SECONDS_PER_DAY)?
     .checked_add(civil.hour.checked_mul(SECONDS_PER_HOUR)?)?
     .checked_add(civil.minute.checked_mul(SECONDS_PER_MINUTE)?)?
     .checked_add(civil.second)
+}
+
+/// Whether `civil` names a time the calendar has, from 1970: a month of the year, a day of that month, and an hour,
+/// minute and second within their fields.
+fn on_the_calendar(civil: Civil) -> bool {
+  (1..=MONTHS_PER_YEAR).contains(&civil.month)
+    && civil.day >= 1
+    && civil.day <= days_in_month(civil.year, civil.month)
+    && civil.hour < HOURS_PER_DAY
+    && civil.minute < SECONDS_PER_MINUTE
+    && civil.second < SECONDS_PER_MINUTE
+    && civil.year >= YEARS.0
+}
+
+/// The days from the Unix epoch to `month`'s `day` of `year`, or none before the epoch (Hinnant's `days_from_civil`,
+/// its year counted from March so that a leap day ends its year).
+fn days_of(year: u64, month: u64, day: u64) -> Option<u64> {
+  let year = year.checked_sub(u64::from(month < MARCH))?;
+  let era = year.checked_div(YEARS_PER_ERA)?;
+  let year_of_era = year.checked_sub(era.checked_mul(YEARS_PER_ERA)?)?;
+  let day_of_era = year_of_era
+    .checked_mul(DAYS_PER_YEAR)?
+    .checked_add(year_of_era.checked_div(YEARS_PER_LEAP)?)?
+    .checked_sub(year_of_era.checked_div(YEARS_PER_CENTURY)?)?
+    .checked_add(day_of_year_from_march(month, day)?)?;
+  era
+    .checked_mul(DAYS_PER_ERA)?
+    .checked_add(day_of_era)?
+    .checked_sub(EPOCH_SHIFT_DAYS)
+}
+
+/// `month`'s `day` as the day of a year counted from March 1st, its first day 0 (Hinnant's `days_from_civil`: the
+/// months from March repeat their lengths in runs of five, [`DAYS_PER_FIVE_MONTHS`]).
+fn day_of_year_from_march(month: u64, day: u64) -> Option<u64> {
+  let month_from_march = if month >= MARCH {
+    month.checked_sub(MARCH)?
+  } else {
+    month.checked_add(MONTHS_PER_YEAR)?.checked_sub(MARCH)?
+  };
+  DAYS_PER_FIVE_MONTHS
+    .checked_mul(month_from_march)?
+    .checked_add(2)?
+    .checked_div(FIVE_MONTHS)?
+    .checked_add(day)?
+    .checked_sub(1)
 }
 
 /// The days of `month` in `year`: February's 28, or 29 in a leap year; 30 for April, June, September and November; 31
@@ -251,26 +264,13 @@ pub fn iso8601_of(ns: i64) -> String {
 /// has not, a year before 1970 or past 9999, a fraction past nanoseconds, or a time past what a signed count of
 /// nanoseconds holds (2262-04-11T23:47:16.854775807Z).
 pub fn ns_of_iso8601(text: &str) -> Option<i64> {
-  let rest = text.strip_suffix('Z')?;
-  let (date, time) = rest.split_once('T')?;
-  let mut date_fields = date.split('-');
-  let year = digits(date_fields.next()?, YEAR_DIGITS)?;
-  let month = digits(date_fields.next()?, FIELD_DIGITS)?;
-  let day = digits(date_fields.next()?, FIELD_DIGITS)?;
-  if date_fields.next().is_some() || year > YEARS.1 {
-    return None;
-  }
+  let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+  let (year, month, day) = date_of(date)?;
   let (clock, fraction) = match time.split_once('.') {
     Some((clock, fraction)) => (clock, Some(fraction)),
     None => (time, None),
   };
-  let mut clock_fields = clock.split(':');
-  let hour = digits(clock_fields.next()?, FIELD_DIGITS)?;
-  let minute = digits(clock_fields.next()?, FIELD_DIGITS)?;
-  let second = digits(clock_fields.next()?, FIELD_DIGITS)?;
-  if clock_fields.next().is_some() {
-    return None;
-  }
+  let (hour, minute, second) = clock_of(clock)?;
   let seconds = unix_of(Civil {
     year,
     month,
@@ -284,6 +284,26 @@ pub fn ns_of_iso8601(text: &str) -> Option<i64> {
     Some(fraction) => nanos_of_fraction(fraction)?,
   };
   i64::try_from(seconds.checked_mul(NANOS_PER_SECOND)?.checked_add(nanos)?).ok()
+}
+
+/// The year, month and day of an ISO 8601 extended date (`YYYY-MM-DD`), each exactly its digits and the year at most
+/// 9999; none for any other text.
+fn date_of(date: &str) -> Option<(u64, u64, u64)> {
+  let mut fields = date.split('-');
+  let year = digits(fields.next()?, YEAR_DIGITS)?;
+  let month = digits(fields.next()?, FIELD_DIGITS)?;
+  let day = digits(fields.next()?, FIELD_DIGITS)?;
+  (fields.next().is_none() && year <= YEARS.1).then_some((year, month, day))
+}
+
+/// The hour, minute and second of an ISO 8601 extended time of day (`HH:MM:SS`), each exactly two digits; none for any
+/// other text.
+fn clock_of(clock: &str) -> Option<(u64, u64, u64)> {
+  let mut fields = clock.split(':');
+  let hour = digits(fields.next()?, FIELD_DIGITS)?;
+  let minute = digits(fields.next()?, FIELD_DIGITS)?;
+  let second = digits(fields.next()?, FIELD_DIGITS)?;
+  fields.next().is_none().then_some((hour, minute, second))
 }
 
 /// A field of exactly `width` decimal digits.
