@@ -13575,7 +13575,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    log). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
-    (A-609); the editor drives and the write methods' bodies are its second.
+    (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH and LOCK's request are built (A-627), and the
+    update-report and replay editor drives and LOCK's answer are owed.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -41875,3 +41876,34 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   here already ask for `get-locations` and `get-dir`); then `svn mergeinfo --show-revs`'s eligible and merged
   revisions from the segments and the log; read access by A-606's rules, and the authentication request a denied
   anonymous read makes when the session could authenticate.
+
+### A-627 — `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token` read (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part, in part; A-609, A-602)
+Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), `research/vcs-servers-subversion.md` (§1's
+sources), and `crates/svn` (`dav/listing.rs`, `dav/locking.rs`, their tests, four fixtures; `dav.rs`).
+
+- **Built.**
+  - `dav::listing` reads `list-report` (`reports/list.c`: path, revision, depth, patterns, and the entry fields its
+    `S:prop` names select) and `file-revs-report` (`file-revs.c`: path, range, merged revisions).
+  - It answers both byte for byte. A list entry carries its attributes in `list.c`'s order and the author as an
+    element. A file revision carries its revision properties and property changes as `send_prop` writes them (base64
+    with line breaks where XML cannot carry a value), and its text as an svndiff delta through the crate's encoder, in
+    base64 with no line breaks (`dav_svn__make_base64_output_stream` passes `svn_base64_encode2` `FALSE`).
+  - `dav::locking` reads a PROPPATCH (`D:set` and `D:remove` in order, `V:absent` a removal, `V:encoding="base64"`
+    marked) and LOCK's `D:lockinfo` (an exclusive write lock, its owner text the comment).
+  - It also reads `Timeout` as `dav_get_timeout` does (`Second-N` after the owner's clock, `Infinite` or none for no
+    expiry; the first readable value counts) and `Lock-Token`'s bracketed token, into what the A-602 table takes.
+- **Golden vectors.** Four bodies stock svn 1.15.0 sent to the recorded responder on the Mac Studio (2026-11-19):
+  `svn ls -v`'s list-report, `svn blame`'s file-revs-report, `svn propset --revprop`'s PROPPATCH, and
+  `svn lock -m`'s LOCK. UNLOCK sends no body; its token rides `Lock-Token`.
+- **Tests and the run.** Eleven tests: each captured body decoded, every cut refused, both answers byte for byte (the
+  delta's base64 checked against the svndiff format by hand), the PROPPATCH extension, and the two headers.
+  `cargo test --locked -p slates-svn --lib` passed 283 of 283 on the Mac Studio (debug, 2026-11-19), and fmt was clean.
+  Red once, on a copy that wrote the delta with svn's line breaks: the file-revs test failed.
+- **Owed.** The rest of piece 13's second part:
+  - the update-report answer, the editor drive in `update.c`'s format strings (target revision, open and add of
+    directories and files with their checked-in hrefs, deletes, absents, set and remove props, txdelta in flat base64,
+    the md5 prop), over the index;
+  - the replay drive (`replay.c`);
+  - LOCK's answer (`util_lock.c`'s `activelock`, with `mod_dav_svn`'s `X-SVN-Creation-Date` and `X-SVN-Lock-Owner`
+    headers);
+  - the mapping of LOCK and UNLOCK onto the A-602 guards in the server.
