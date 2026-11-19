@@ -536,3 +536,52 @@ server's directory are the ones its reviewed expected-failure list starts from.
   single-threaded.
 - **libbz2-rs-sys's fast decoder** allocates `tt`, one `u32` per byte of the block size its header digit names (3.6 MB
   at `BZh9`), when it reads that digit, beside a zeroed state; the fast mode is the one Python's `BZ2Decompressor` runs.
+
+## 17. Found while building piece 3's revlog reader (A-611, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/revlogs`)
+
+- **The changelog keeps a data file from its first revision.** In the zstd and zlib repositories every changelog had a
+  `00changelog.d` beside its index while the manifests and files stayed inline under 7.2's 128 KiB `_maxinline`
+  (`revlog.py`), so a store holds both shapes from its start. `_maxinline` is a module constant with no configuration;
+  the fixtures lower it with a two-line extension to split every revlog, as the store's own rule would at that size.
+- **Version 2 in 7.2.** `experimental.revlogv2=enable-unstable-format-and-corrupt-my-data` makes an `exp-revlogv2.2`
+  store with `fileindex-v1` and without `fncache` or `dotencode` (`repo/creation.py`); each revlog's `.i` is an 83-byte
+  docket (the header `0x0000DEAD`, three 8-byte ids, the sizes, `(` as the default header) naming `<radix>-<id>.idx`
+  (96-byte entries), `.dat` and `.sda`. The PyPI build aborts on such a store ("accessing `fileindex` repository
+  without associated fast implementation") unless `storage.fileindex.slow-path=allow` (`repo/vfs_options.py`).
+  `format.exp-use-changelog-v2` gives the changelog 96-byte entries of its own with no base and no link, every
+  revision a full text.
+- **A version 2 chunk's mode** (`revlogutils/deltas.py` `delta_compression`): plain for an empty chunk, a raw one
+  beginning with NUL, or a `u` chunk with its `u` dropped; default when it begins with the docket's default header,
+  which stays in place (a zstd frame's magic begins with `(`); else its own header. The grown file's twelve revisions
+  in the version 2 store were nine default and three plain.
+- **Sparse-revlog's intermediate snapshots need large texts.** With `format.maxchainlen=3` and 300-byte texts 7.2 wrote
+  only full snapshots; with a file of about 6 KB of SHA-256 lines growing a line a changeset it wrote four intermediate
+  snapshots (`hg debugdeltachain`: `snap`), a delta against an earlier snapshot no longer than half the text and than
+  that snapshot (`_is_good_delta_info_snapshot_constraints`).
+- **A compressed chunk cut short is refused by its engine's own reader:** flate2 1.1.11's `zio::read` answers
+  `UnexpectedEof`, "incomplete deflate stream", once its input ends with the stream unfinished (`src/zio.rs`), and
+  zstd's reader refused a frame cut short (the test `a_compressed_chunk_must_end_exactly`); bytes after a stream are
+  found by the count of the bytes it took.
+
+## 18. Found while building piece 4's read-serving logic, part 1 (A-619, 2026-11-19; 7.2's code [C] from its PyPI source distribution, SHA-256 `a250227e…`; a probe of stock `hg serve --stdio` 7.2 on the Mac Studio, `fixtures/serve`)
+
+- **`heads`** is `reversed(cl.headrevs())`: the served view's DAG heads newest first, a closed branch head among them;
+  an empty repository answers the null node. Measured: the probe's three heads, a closed head included, newest first.
+- **`known`** answers `1` for the null node (its revision, `nullrev`, is neither missing nor filtered). Measured:
+  `11011` for a held tip, the root, an unknown node, a held closed head and the null node.
+- **`between`** walks first parents from each pair's top, keeping the nodes met at distances 1, 2, 4, 8 and on, until
+  the bottom (compared, never looked up) or the root; every SSH session's handshake asks it for the null pair, answered
+  by an empty line.
+- **`branchmap`** lists, per branch, `branchheads(branch, closed=True)`: heads in revision order, closed ones kept;
+  the branches come in the branch cache's order, which is by name once the cache has been written (`_write` sorts
+  them). Measured: `default`, `old%20feature/x`, `stable`, the name quoted with `/` safe.
+- **`listkeys phases`** (`listphases`) reads the unfiltered changelog's draft roots, so a hidden draft root would be
+  listed (none was here); `publishing` is listed only by a publishing repository. Measured: three draft roots, each
+  `1`, no `publishing` on a `phases.publish = False` server.
+- **The server's view follows its own configuration.** A server process started without the evolution options does
+  not hide an obsoleted changeset ("obsolete feature not enabled but 1 markers found!"), so the probe's first run
+  answered from a view the dump made with them did not show; the options now live in the served repository's hgrc.
+- **Set discovery's common heads keep stale bases.** `partialdiscovery.commonheads` is `headrevs(bases)`, which removes
+  only the bases' direct parents, so an earlier common base can stay beside the true common head (the Rust version,
+  `dagops::heads`, the same); harmless, since `getbundle` takes them as common. The test driver holds the found set to
+  the shared set by its ancestor closure.

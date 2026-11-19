@@ -11,7 +11,8 @@
 //!
 //! **Rights.** A repository's owner holds every right on it (§4.13) until §4.17.1's policy (shared piece 7) says
 //! otherwise, so the branch verbs are its owner's, refused `Forbidden` to another principal; a green that becomes a root
-//! is one its creator administers.
+//! is one its creator administers. The policy itself is its owner's to set (`SetRepositoryPolicy`, A-622): whole, from
+//! the version its owner read, held in the repository's record.
 //!
 //! **Bounds and refusals.** Every refusal is typed: a repository or branch that does not exist `NotFound`; a name taken,
 //! a green bound or a member twice `AlreadyExists`; an empty name or one holding a NUL `InvalidName`, and so is a
@@ -35,7 +36,7 @@
 
 use slates_db::catalog::{
   BaseRecord, GreenVersion, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy,
-  PolicyRecord, Principal, RepositoryEntry, RepositoryId, RepositoryRecord, Role,
+  PolicyRecord, Principal, RepositoryEntry, RepositoryId, RepositoryPolicy, RepositoryRecord, Role,
   SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::op::Op;
@@ -329,6 +330,7 @@ fn record_repository(
         format: db_format(format),
         default_branch: Some(default_branch.to_owned()),
         owner: principal.clone(),
+        policy: RepositoryPolicy::default(),
       },
     },
   )?;
@@ -553,6 +555,113 @@ pub(crate) fn retire_branch(
   match entry.and_then(|entry| self::record(state, &Op::RepositoryAdvanced { entry })) {
     Ok(()) => ReplyBody::Acknowledged,
     Err(refusal) => refused(refusal),
+  }
+}
+
+/// Sets repository `repository`'s policy whole (§4.17.1 "Policy", A-622): its owner's verb, made from policy version
+/// `read`, the version its owner read. One entry of the repository's register: `Op::RepositoryPolicySet` takes its next
+/// position. The database's guard refuses a version the policy has moved past (`PolicyChanged`, naming the version
+/// now) and a rule or hook the repository cannot hold (`Database`, naming the first by index), before anything is
+/// recorded.
+pub(crate) fn set_policy(
+  state: &mut ShardState,
+  principal: &Principal,
+  (repository, read): (&str, u64),
+  (rules, hooks): (
+    &[slates_ipc::protocol::PolicyRule],
+    &[slates_ipc::protocol::HookConfig],
+  ),
+) -> ReplyBody {
+  let record = match owned_repository(state, principal, repository, "set_repository_policy") {
+    Ok(record) => record,
+    Err(reply) => return reply,
+  };
+  let Some(version) = read.checked_add(1) else {
+    return refused(Refusal::PolicyChanged {
+      current: record.policy.version,
+    });
+  };
+  let policy = RepositoryPolicy {
+    version,
+    rules: rules.iter().map(db_rule).collect(),
+    hooks: hooks.iter().map(db_hook).collect(),
+  };
+  let op = Op::RepositoryPolicySet {
+    repository: record.id,
+    policy,
+  };
+  match self::record(state, &op) {
+    Ok(()) => ReplyBody::Acknowledged,
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// The database's form of a policy rule (A-622).
+fn db_rule(rule: &slates_ipc::protocol::PolicyRule) -> slates_db::catalog::PolicyRule {
+  use slates_db::catalog::{PolicyEffect, PolicyNames, PolicyRight};
+  use slates_ipc::protocol as wire;
+  slates_db::catalog::PolicyRule {
+    names: match rule.names {
+      wire::PolicyNames::Refs => PolicyNames::Refs,
+      wire::PolicyNames::Branches => PolicyNames::Branches,
+      wire::PolicyNames::Bookmarks => PolicyNames::Bookmarks,
+      wire::PolicyNames::Topics => PolicyNames::Topics,
+      wire::PolicyNames::Paths => PolicyNames::Paths,
+    },
+    pattern: rule.pattern.clone(),
+    right: match rule.right {
+      wire::PolicyRight::Read => PolicyRight::Read,
+      wire::PolicyRight::Submit => PolicyRight::Submit,
+      wire::PolicyRight::Rewrite => PolicyRight::Rewrite,
+      wire::PolicyRight::Delete => PolicyRight::Delete,
+    },
+    effect: match rule.effect {
+      wire::PolicyEffect::Allow => PolicyEffect::Allow,
+      wire::PolicyEffect::Deny => PolicyEffect::Deny,
+    },
+    who: db_who(&rule.who),
+  }
+}
+
+/// The database's form of the principals a rule speaks to, each principal as the catalog names it (A-622).
+fn db_who(who: &slates_ipc::protocol::PolicyWho) -> slates_db::catalog::PolicyWho {
+  use slates_db::catalog::{PolicyEntry, PolicyWho};
+  use slates_ipc::protocol as wire;
+  match who {
+    wire::PolicyWho::Anyone => PolicyWho::Anyone,
+    wire::PolicyWho::AnyOf { entries } => PolicyWho::AnyOf {
+      entries: entries
+        .iter()
+        .map(|entry| match entry {
+          wire::PolicyEntry::Is { principal } => PolicyEntry::Is {
+            principal: crate::verbs::to_db_principal(principal),
+          },
+          wire::PolicyEntry::IsNot { principal } => PolicyEntry::IsNot {
+            principal: crate::verbs::to_db_principal(principal),
+          },
+        })
+        .collect(),
+    },
+  }
+}
+
+/// The database's form of a configured hook (A-622).
+fn db_hook(hook: &slates_ipc::protocol::HookConfig) -> slates_db::catalog::HookConfig {
+  use slates_db::catalog::HookPointName as Point;
+  use slates_ipc::protocol::HookPointName as Given;
+  slates_db::catalog::HookConfig {
+    point: match hook.point {
+      Given::GitPreReceive => Point::GitPreReceive,
+      Given::GitUpdate => Point::GitUpdate,
+      Given::GitPostReceive => Point::GitPostReceive,
+      Given::HgPretxnchangegroup => Point::HgPretxnchangegroup,
+      Given::HgChangegroup => Point::HgChangegroup,
+      Given::SvnPreCommit => Point::SvnPreCommit,
+      Given::SvnPreRevpropChange => Point::SvnPreRevpropChange,
+      Given::SvnPostCommit => Point::SvnPostCommit,
+    },
+    name: hook.name.clone(),
+    program: hook.program.clone(),
   }
 }
 
@@ -1074,6 +1183,124 @@ mod tests {
           "{green:?} not fenced"
         );
       }
+    });
+  }
+
+  /// A-622 (§4.17.1 "Policy"). Do: create a git repository; set its policy from version 0 with a rule denying every
+  /// principal but its owner the submit of `main`, and a pre-receive hook; set it from 0 again; set it as another
+  /// principal; set one holding a branch rule, which a git repository has not, and one running a relative program; then
+  /// set an empty one from 1.
+  /// Expect: the first acknowledged, and the record holds it at version 1 with the rule's principal as the catalog names
+  /// it; the stale setting refused `PolicyChanged` naming 1; the stranger `Forbidden`; the malformed ones `Database`
+  /// naming the rule or the hook by index, nothing changed; the last acknowledged, the policy empty at version 2.
+  #[test]
+  fn a_repositorys_policy_is_its_owners_to_set_whole_from_the_version_read() {
+    use slates_db::catalog::RepositoryPolicy;
+    use slates_ipc::protocol::{
+      DatabaseRefusal, HookConfig, HookPointName, PolicyEffect, PolicyEntry, PolicyNames,
+      PolicyRight, PolicyRule, PolicyWho,
+    };
+    crate::daemon::audit_on_shard(|state| {
+      green_of(create(state, "linux", "main"));
+      let rule = |names: PolicyNames, pattern: &str| PolicyRule {
+        names,
+        pattern: pattern.to_owned(),
+        right: PolicyRight::Submit,
+        effect: PolicyEffect::Deny,
+        who: PolicyWho::AnyOf {
+          entries: vec![PolicyEntry::IsNot {
+            principal: slates_ipc::protocol::Principal::Uid { host: 0, uid: 1234 },
+          }],
+        },
+      };
+      let program = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+      let hook = |program: &str| HookConfig {
+        point: HookPointName::GitPreReceive,
+        name: "pre-receive".to_owned(),
+        program: program.to_owned(),
+      };
+      let set = |state: &mut ShardState,
+                 principal: &Principal,
+                 read: u64,
+                 (rules, hooks): (Vec<PolicyRule>, Vec<HookConfig>)| {
+        ask(
+          state,
+          principal,
+          RequestBody::SetRepositoryPolicy {
+            repository: "linux".to_owned(),
+            read,
+            rules,
+            hooks,
+          },
+        )
+      };
+      let held = |state: &ShardState| {
+        state
+          .db
+          .partition()
+          .repositories()
+          .repository_named("linux")
+          .map(|record| record.policy.clone())
+          .unwrap()
+      };
+      let main = vec![rule(PolicyNames::Refs, "refs/heads/main")];
+      assert_eq!(
+        set(state, &owner(), 0, (main, vec![hook(&program)])),
+        ReplyBody::Acknowledged
+      );
+      let first = held(state);
+      assert_eq!(first.version, 1);
+      assert_eq!(first.hooks.len(), 1);
+      assert_eq!(
+        first.rules.first().map(|rule| rule.who.clone()),
+        Some(slates_db::catalog::PolicyWho::AnyOf {
+          entries: vec![slates_db::catalog::PolicyEntry::IsNot { principal: owner() }],
+        })
+      );
+      assert_eq!(
+        refusal(set(state, &owner(), 0, (Vec::new(), Vec::new()))),
+        Refusal::PolicyChanged { current: 1 }
+      );
+      assert!(matches!(
+        refusal(set(state, &stranger(), 1, (Vec::new(), Vec::new()))),
+        Refusal::Forbidden { .. }
+      ));
+      let branch_rule = vec![
+        rule(PolicyNames::Refs, "refs/tags/*"),
+        rule(PolicyNames::Branches, "main"),
+      ];
+      assert_eq!(
+        refusal(set(state, &owner(), 1, (branch_rule, Vec::new()))),
+        Refusal::Database {
+          refusal: DatabaseRefusal::PolicyRuleMalformed { index: 1 }
+        }
+      );
+      assert_eq!(
+        refusal(set(
+          state,
+          &owner(),
+          1,
+          (Vec::new(), vec![hook("hooks/pre-receive")])
+        )),
+        Refusal::Database {
+          refusal: DatabaseRefusal::PolicyHookMalformed { index: 0 }
+        }
+      );
+      assert_eq!(held(state), first, "a refused setting changes nothing");
+      assert_eq!(
+        set(state, &owner(), 1, (Vec::new(), Vec::new())),
+        ReplyBody::Acknowledged
+      );
+      assert_eq!(
+        held(state),
+        RepositoryPolicy {
+          version: 2,
+          ..RepositoryPolicy::default()
+        }
+      );
     });
   }
 }

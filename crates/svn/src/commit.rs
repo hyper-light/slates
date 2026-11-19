@@ -27,7 +27,7 @@
 //!      replacement"); otherwise the merge goes down into it.
 //!    - Then the head's additions, in name order (2096): one the work added too is a conflict (2112).
 //!
-//!    The first conflict in that order is the one answered, at its path: `E160024` "Conflict at '<path>'", which the
+//!    The first conflict in that order is the one answered, at its path: `E160024` `"Conflict at '<path>'"`, which the
 //!    client reports as out of date. The work's identities are FSFS's, made on B by the index's own builder
 //!    ([`Index::trial`]), so a directory a work first changes inside a branch takes the branch's copy identity there
 //!    (`get_copy_inheritance`), and two works that change different files beneath one directory of a branch that no

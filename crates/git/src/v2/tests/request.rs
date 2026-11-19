@@ -270,6 +270,31 @@ fn a_flush_alone_is_the_end_of_requests() {
   );
 }
 
+/// A-624 (a server reads an id as git's server does, `get_oid_hex` taking either case; gitprotocol-pack: "both MUST
+/// treat obj-id as case-insensitive"): do decode a `fetch` request whose `want` names `main` in upper case, then encode
+/// it. Expect: the want read as `main`'s id, written back in lower case as git writes an id, the rest byte for byte.
+#[test]
+fn an_upper_case_want_is_read_and_written_back_in_lower_case() {
+  let request = |want: &str| {
+    wire(&[
+      Packet::Data(b"command=fetch\n"),
+      Packet::Delim,
+      Packet::Data(want.as_bytes()),
+      Packet::Data(b"done\n"),
+      Packet::Flush,
+    ])
+  };
+  let upper = request(&format!("want {}\n", MAIN.to_uppercase()));
+  let read = command(&upper);
+  assert_eq!(
+    (fetch_arguments(&read), encoded(&Request::Command(read))),
+    (
+      vec![F::Want(sha1(MAIN)), F::Done],
+      request(&format!("want {MAIN}\n"))
+    )
+  );
+}
+
 /// A-582 part 2 (`serve.c`, `ls-refs.c`, `upload-pack.c`): do decode requests out of the grammar, one fault each.
 /// Expect: each refused by its kind at the line at fault: commands git does not run, a second command, none,
 /// capabilities a client does not send, a bad `object-format`, arguments the command does not take, a malformed id,
@@ -279,7 +304,6 @@ fn a_request_out_of_its_grammar_is_refused_by_kind() {
   let fetch = Packet::Data(b"command=fetch\n");
   let ls = Packet::Data(b"command=ls-refs\n");
   let want = format!("want {MAIN}\n");
-  let upper = format!("want {}\n", MAIN.to_uppercase());
   let trailing = format!("want {MAIN} side\n");
   let short = format!("want {}\n", &MAIN[..39]);
   let cases = [
@@ -376,18 +400,6 @@ fn a_request_out_of_its_grammar_is_refused_by_kind() {
         Packet::Flush,
       ]),
       Refusal::UnknownArgument { at: 22 },
-    ),
-    (
-      wire(&[
-        fetch,
-        Packet::Delim,
-        Packet::Data(upper.as_bytes()),
-        Packet::Flush,
-      ]),
-      Refusal::ObjectId {
-        at: 22,
-        refusal: HexRefusal::NotHex { at: 0 },
-      },
     ),
     (
       wire(&[

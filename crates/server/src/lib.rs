@@ -154,8 +154,9 @@ mod repository;
 // segments (A-597). No caller outside tests until the version-control servers' policy reads it (their pieces).
 #[cfg_attr(not(test), allow(dead_code))]
 mod wildmatch;
-// §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597). No caller outside tests until the
-// repository record holds a policy and the servers' push paths ask it (their pieces).
+// §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597), and the push's check point over the
+// policy the repository's record holds (`admit`, A-622). No caller outside tests until the servers' push paths ask it
+// (their pieces: git's receive-pack, Subversion's commit editor, Mercurial's unbundle).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_policy;
 // §4.17.1's hooks: the points, their inputs, each hook's learned deadline and the runner (A-597). No caller outside

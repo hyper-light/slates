@@ -18,7 +18,7 @@
 //! absolute, and it resolves to nothing. A Windows-absolute link keeps the Win32 path its NT substitute names
 //! (`\??\C:\x` is kept as `C:\x`, `\??\UNC\srv\share\x` as `\\srv\share\x`), which Linux and macOS read unchanged
 //! and do not resolve. An absolute substitute in any other NT form (`\??\Volume{…}\`, `\Device\…`) has no Win32 path
-//! and is refused ([`Refusal::Foreign`]).
+//! and is refused (`Refusal::Foreign`).
 //!
 //! **The lossy case.** A POSIX name may hold `\`, which Windows takes for a separator. A Linux target `a\b` (one name)
 //! reads on Windows as two components, and one that starts with a drive letter and `:\` (`C:\x`) or with `\\` reads as

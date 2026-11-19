@@ -27,8 +27,8 @@
 //!   [`Refused::Host`].
 //! - **Windows**: the low- and high-memory resource notifications (`CreateMemoryResourceNotification`), each "signaled"
 //!   while its condition holds [B: Microsoft Learn, "CreateMemoryResourceNotification function (memoryapi.h)"]: the
-//!   caller awaits whichever names the next change ([`Events::awaited`]: the high one while memory is low, the low one
-//!   otherwise) and says when it fired ([`Events::crossed`]). Neither stays awaited while it is signaled, so nothing
+//!   caller awaits whichever names the next change (`Events::awaited`: the high one while memory is low, the low one
+//!   otherwise) and says when it fired (`Events::crossed`). Neither stays awaited while it is signaled, so nothing
 //!   spins.
 //! - **Elsewhere**, and under Miri: no reports ([`Refused::Unsupported`]).
 //!

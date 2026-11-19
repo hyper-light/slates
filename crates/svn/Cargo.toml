@@ -9,6 +9,9 @@ readme.workspace = true
 description = "The Subversion server's pure pieces (§4.17.4, A-500): svndiff versions 0 and 2, decoded with every refusal Subversion's own decoder makes, encoded as Subversion encodes, and applied by the reference applier."
 
 [dependencies]
+# The dump format's text checksums (A-593): MD5 and SHA-1 through the workspace's one cryptographic library, whose
+# vendored copy exposes MD5 (`vendor/UPSTREAM.md`).
+aws-lc-rs = { workspace = true }
 # svndiff version 2 stores each window section as an LZ4 block (`libsvn_subr/compress_lz4.c`); the workspace's LZ4
 # codec, built with its safe encoder and decoder only.
 lz4_flex = { workspace = true }

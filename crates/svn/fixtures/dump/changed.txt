@@ -1,0 +1,62 @@
+r1
+A   branches/
+A   tags/
+A   trunk/
+A   trunk/a.txt
+A   trunk/a: b c.txt
+A   trunk/bin.dat
+A   trunk/dir/
+A   trunk/dir/deep.txt
+A   trunk/empty
+A   trunk/link
+A   trunk/run.sh
+r2
+_U  /
+_U  trunk/
+UU  trunk/a.txt
+_U  trunk/bin.dat
+r3
+A + branches/b1/
+    (from trunk/:r2)
+A + trunk/a-copy.txt
+    (from trunk/a.txt:r2)
+A + trunk/empty-copy
+    (from trunk/empty:r2)
+r4
+D   trunk/dir/
+D   trunk/link
+r5
+D   branches/b1/dir/
+A   branches/b1/dir/
+D   trunk/run.sh
+A   trunk/run.sh
+r6
+D   branches/b1/
+A + branches/b1/
+    (from trunk/:r5)
+D   branches/b1/bin.dat
+A + branches/b1/bin.dat
+    (from trunk/a.txt:r5)
+D   trunk/a: b c.txt
+A + trunk/a: b c.txt
+    (from trunk/a.txt:r5)
+D   trunk/bin.dat
+A + trunk/bin.dat
+    (from trunk/a.txt:r5)
+r7
+A   trunk/big.txt
+r8
+U   trunk/big.txt
+r9
+A + tags/v1/
+    (from trunk/:r8)
+r10
+U   branches/b1/a.txt
+r11
+_U  trunk/
+U   trunk/a.txt
+r12
+A + trunk/a-from-r1.txt
+    (from trunk/a.txt:r1)
+r13
+_U  /

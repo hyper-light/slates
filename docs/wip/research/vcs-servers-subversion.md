@@ -48,6 +48,8 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/mod_dav_svn/reports/dated-rev.c`, `deleted-rev.c` (A-609) | `c45708c8997cfbf5`, `639915799a79a818` | C |
 | `subversion/libsvn_subr/base64.c`, `time.c` (A-609) | `5e7c46c46c4ea17f`, `c58645b206f847e8` | C |
 | httpd 2.4.66 `modules/dav/main/mod_dav.h`, `mod_dav.c` (A-609) | `ad8361ef4e7e311c`, `2cab686b045e2237` | C |
+| `subversion/mod_dav_svn/reports/list.c`, `file-revs.c`, `mod_dav_svn/lock.c` (A-627) | `9c852cb6ba67f446`, `6efa4630426dabd0`, `c5bc4498df507c4f` | C |
+| httpd 2.4.66 `modules/dav/main/util_lock.c`, `props.c` (A-627) | `6b26b0425b33ea20`, `92a3201fa69632e6` | C |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
@@ -379,14 +381,12 @@ the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `
     subtrees of the level's nodes ("Potential because we don't verify that the respective paths actually exist").
   - Where the code departs from its own documentation: (1) `lookup` strips `/` to the empty string and walks it as
     one empty segment (1284-1319), so `[:glob:/*]` (`add_next_node(... ->any)`, 1354, for any segment, the empty one
-    too) decides the root although `authz.h` 210 says `*` "Matches any single non-empty path segment"; (2) for the
-    same reason a recursive question at the root weighs only rules an empty segment matches: with `[/] * = rw` and
-    `[/secret] * =`, a recursive read at `/` is granted, and a commit that copies `/` (a recursive read of its source,
-    `commit.c`) would pass over `/secret`; (3) a suffix match reverses the segment in place (1375) and nothing restores
-    it, so the next node of the same level meets it reversed (`[:glob:/*.secret]` beside `[:glob:/**/public]` leaves
-    `/public` unmatched and matches `/cilbup`); (4) `parse_rule_path` returns the root for any path whose first segment
-    is empty (`authz_parse.c` 505-512), so `[//secret]` is the root's rule, though the next lines say "A path with two
-    consecutive slashes is not canonical". Two more outcomes depend on hash order: group expansion
+    too) decides the root although `authz.h` 210 says `*` "Matches any single non-empty path segment"; (2) a suffix
+    match reverses the segment in place (1375) and nothing restores it, so the next node of the same level meets it
+    reversed (`[:glob:/*.secret]` beside `[:glob:/**/public]` leaves `/public` unmatched and matches `/cilbup`);
+    (3) `parse_rule_path` returns the root for any path whose first segment is empty (`authz_parse.c` 505-512), so
+    `[//secret]` is the root's rule, though the next lines say "A path with two consecutive slashes is not
+    canonical". Two more outcomes depend on hash order: group expansion
     (`expand_group_callback`, 1062-1127) detects a cycle only through the group it expands first and otherwise
     recurses until its stack runs out, and several refusals in one file are reported in hash order.
 
@@ -472,3 +472,125 @@ and `tree.c`, `fs-wrap.c`, `log.c`, `serve.c` and the protocol at §1's hashes.
 - **Elision** [C: `libsvn_client/mergeinfo.c` `should_elide_mergeinfo`, `svn_client__elide_mergeinfo`]: no mergeinfo
   never elides; empty elides to none or empty; any other never to none or empty, else when `svn_mergeinfo__equals` with
   inheritance considered.
+
+## 12. The dump format (A-593; §4.17.4 piece 6, its first part)
+
+Read 2026-11-19 at the same revision (`1.14.x` at `d434dc14`), from the same mirror; the first 16 hex digits of each
+file's sha256:
+
+| File | sha256 (prefix) | Tier |
+|---|---|---|
+| `notes/dump-load-format.txt` | `abd310d84f04dd6d` | B |
+| `subversion/include/svn_repos.h` | `8421f33e065fd927` | B |
+| `subversion/include/svn_types.h` | `6167309dad233964` | B |
+| `subversion/libsvn_repos/dump.c` | `10e31e13700f3a74` | C |
+| `subversion/libsvn_repos/dump_editor.c` (svnrdump's writer) | `21e5a7bb82fecc6a` | C |
+| `subversion/libsvn_repos/load.c` | `7a04eb3858a0cfda` | C |
+| `subversion/libsvn_repos/load-fs-vtable.c` | `e802f38a22f4c8ad` | C |
+| `subversion/libsvn_subr/hash.c` | `5973d515ba697c50` | C |
+| `subversion/libsvn_subr/checksum.c` | `907299438410f21b` | C |
+| `subversion/libsvn_subr/sorts.c` | `4fe2371630f6f71a` | C |
+| `subversion/libsvn_subr/ctype.c` | `8c00533a27dc55f5` | C |
+| `subversion/svnrdump/dump_editor.c` | `96c82adcc9d5b6c8` | C |
+
+The golden vectors (`crates/svn/fixtures/dump`) were written by Homebrew's Subversion 1.15.0 (r1937767) on the Mac
+Studio, so its tag `1.15.0` was compared too: its `dump.c` and `hash.c` are byte for byte the files above; `load.c`
+differs in one comment's spelling (`8d488ab2e38e6068`); `load-fs-vtable.c` in the hash function of its revision map,
+`svn_hash__make` (`8b70fca46f6534fb`); `notes/dump-load-format.txt` (`8ecf80f7a448bd0d`, its version 1.3) adds that
+revisions are always dumped in increasing order and describes `svn:author`, `svn:date` and `svn:log`.
+
+- **The grammar** [B: notes 29-198]: a stream is a version line, then records; a record is header lines, "a key,
+  followed by a colon, followed by text data to end of line", an empty line, and optionally a body; "unrecognized
+  headers are ignored". A UUID record follows the version line in format 2 and later; revision records carry the
+  revision's properties; node records follow their revision; "Dump decoders should be prepared for the optional lines
+  after Node-action to be in any order". A property section is `K`/`V` entries, each "a header line giving the length
+  of the key or value content in bytes" then the content and a line feed, ended by `PROPS-END\n`, "its length is
+  included in the Prop-content-length". Format 3 adds `Text-delta`, `Prop-delta`, `Text-delta-base-md5` and
+  `-sha1`, and `D` entries "to describe property deletion" (notes 195-197, 466-523).
+- **The writer's bytes** [C: `dump.c`]: the version record `SVN_REPOS_DUMPFILE_MAGIC_HEADER ": %d\n\n"` (516-524); the
+  UUID record (527-537); a revision record's headers, `Revision-number` first and `Content-length` last (411-454; only
+  three are ever pushed, so the order is fixed), an empty line, the properties, and `"\n"` (540-598), every revision
+  with a property section, empty or not (`write_revision_record` passes `include_revprops` as
+  `props_section_always`, 1968-1997). A node's headers are pushed in a fixed order (`dump_node`, 1119-1545: path,
+  kind, action, copy source, the copy source's checksums, `Prop-delta`, `Text-delta`, the delta base's checksums, the
+  text's), and `svn_repos__dump_node_record` (601-645) appends `Prop-content-length`, `Text-content-length` and
+  `Content-length`. A record with content ends with `"\n\n"` (1542); one with none with `"\n"` after its empty line
+  (1366-1376); and a replacement by a copy is a deletion record that ends with its empty line alone, then an addition
+  with the copy source ("### Unusually, we end this 'delete' node record with only a single blank line", 1234-1274,
+  `dump_node_delete` 1087-1104). A deletion has no `Node-kind` (`close_directory` passes `svn_node_unknown`).
+  svnrdump's writer does the same (`dump_editor.c` 285-306, 741-743).
+- **Property sections** [C: `hash.c` 256-335]: entries sorted by `svn_sort_compare_items_lexically` (266, 302), which is
+  `memcmp` then length (`sorts.c` 83-96): Rust's byte-slice order. `K %d\n%s\nV %d\n`, the value, `\n` (288-296); in a
+  delta, entries equal to the base's are left out and every name the new list lacks is a `D %d\n%s\n` after all `K`s
+  (298-316); then `PROPS-END\n` (319). A name is printed with `%s`, so a name holding a NUL could not be written whole.
+- **Deltas** [C: `dump.c` 345; `dump_editor.c` 889-891]: both stock writers encode svndiff version 0
+  (`svn_txdelta_to_svndiff3(..., 0, ...)`), against the copy source for a copy, the previous revision's text for a
+  change, and the empty text for an addition, which then has no base checksums (1456-1510). The windows are
+  Subversion's own deltifier's, so a format-3 dump is byte for byte `svnadmin`'s only given its windows.
+- **The reader** [C: `load.c`, `load-fs-vtable.c`]:
+  - the first line within 80 bytes, `SVN-fs-dump-format-version` and a colon, the number by `svn_cstring_atoi`, refused
+    past 3 (`parse_format_version`, 361-427); a version record later in the stream is read as a record (676-683), which
+    is how two dumps written one after the other load as one;
+  - between records, an empty line or one whose first byte `svn_ctype_isspace` calls whitespace is passed over (635),
+    tab, line feed, vertical tab, form feed, carriage return and space (`ctype.c` 58-62, 81);
+  - a header line is cut at its first colon and its value taken two bytes on, the second byte unchecked (112); no
+    colon, or a colon at the line's end, is "a malformed header" (103, 116); the stream's end ends a header block as
+    an empty line would (92); a header given twice keeps the last (`svn_hash_sets`);
+  - the record's kind is the first of `Revision-number`, `Node-path`, `UUID`, the version header it holds, and none is
+    "Unrecognized record type in stream" (642-689);
+  - lengths are read by `svn__atoui64`, which is `apr_atoi64` (`svn_types.h` 442), revisions by `SVN_STR_TO_REV`, which
+    is `atol` (398): both stop at the first byte that is not a digit;
+  - a property section is read until its stated length is used or `PROPS-END` comes, whichever is first (195-289): a
+    section whose entries fill its length exactly needs no `PROPS-END`, and a `PROPS-END` before the length is used
+    leaves the rest to be read as text; `K`, `V` and `D` lengths by `svn_cstring_strtoui64`, refused as
+    `SVN_ERR_INCORRECT_PARAMS` (213-266); a `D` in a revision's section is malformed (271);
+  - the content block's bytes past its sections are passed over, a `Content-length` below them refused ("Sum of subblock
+    sizes larger than total block content length", 785-811);
+  - an unknown `Node-kind` leaves the kind unknown (`load-fs-vtable.c` 385, 400-406), and an addition of unknown kind
+    without history adds nothing (`maybe_add_with_history`); an unknown or missing `Node-action` is "Unrecognized
+    node-action on node" (`load-fs-vtable.c` 688-694); a node in revision 0 is refused (676-679 there); checksums are
+    read by `svn_checksum_parse_hex`, two hex digits of either case a byte, what follows them ignored, an all-zero
+    digest read as none (`checksum.c` 371-441), the MD5s alone (`load-fs-vtable.c` 437-452; the SHA-1 headers "are not
+    currently used by the loader", notes 519-522).
+- **What follows for slates** (A-593): the codec reads what `load.c` reads and writes what `dump.c` writes, byte for
+  byte, and is stricter where `load.c` would read on and load a different history: digits only in every number; an
+  unknown kind, action or delta flag refused; a header given twice refused; a NUL in a header or a property name
+  refused; a property section that does not end exactly at its `PROPS-END` refused; a header block the stream's end
+  cuts refused (a cut dump must never read as a shorter valid one but at a record's end); a version other than 2 or 3
+  refused (format 1 is the archaic form notes 525-541 keep "for historical completeness only"); version-1 svndiff
+  (zlib) refused, which no stock writer puts in a dump. A deletion followed by an addition of its path is read as the
+  one replacement FSFS records, so the codec's records are the changed-path rows of §4.17.4 item 2.
+
+## 13. The read commands (A-613, §4.17.4 "4. Reads", piece 7's second part)
+
+Read 2026-11-19 by g262 at §1's revision: `svnserve/serve.c` (sha256 `acb1cac75ea86ba7`, as §1), `libsvn_subr/time.c`
+(`c58645b206f847e8`), `libsvn_repos/rev_hunt.c` (`5acc827a362d11f4`), the protocol (§1's), and stock 1.15.0's own bytes
+(`crates/svn/fixtures/reads`, recorded through a relay by its `make-fixtures.py`).
+- **The order of a command's writes** [C: `serve.c` `trivial_auth_request`, `must_have_access`, each handler]: a
+  command's parameters are parsed first (`svn_ra_svn__parse_tuple`; a refusal there is not a command error, so the
+  connection ends with nothing written: recorded, `hostile-malformed`), then the trivial authentication request,
+  `( success ( ( ) 0: ) )`, then the command's work, so a refusal of its revision or path follows the request
+  (recorded). An unknown command is refused by the dispatcher with no request: "Unknown editor command" 210001
+  (recorded).
+- **Refusals' bytes** (recorded): `( failure ( ( code message 0: 0 ) ) )`, a release build's empty file and zero line;
+  "Bogus date" (125003) for a date `svn_time_from_cstring` refuses; "No such revision N" and "Invalid revision number
+  'N'" (160006); "File not found: revision N, path 'P'" (160013, `get-mergeinfo`); "'P' path not found" (160013,
+  `get-iprops`); `get-iprops` with no revision opens revision -1 and is refused.
+- **Property lists' order**: `svnserve` writes a hash table's order; three recordings of one repository gave revision
+  3's four properties three orders, every other byte the same, so the order is APR's per-table seed (`apr_hash_make`
+  since APR 1.5), not `svn_hash__make`'s fixed function (`hash.c` `hashfunc_compatible`).
+- **Dates** [C: `time.c` `svn_time_from_cstring`, `svn_time_to_cstring`; `rev_hunt.c` `get_time`,
+  `svn_repos_dated_revision`]: fields read by `svn__strtoul` (digits alone), each cast to 32 bits, then APR's
+  `apr_time_exp_gmt_get`, which refuses a month outside 0-11 or a time before 1970 and checks no other field; the
+  pre-1.0 format is tried after (`sscanf`), which slates refuses as a bogus date. The dated search is a binary search
+  whose edges are its own: a date before every revision's is revision 0, after them the youngest.
+- **`get-dir` and `get-locations`** [C: `serve.c` `get_dir`, `parse_dirent_fields`, `get_locations`;
+  `rev_hunt.c` `svn_repos_trace_node_locations`, `svn_repos__prev_location`, `check_ancestry_of_peg_path`; recorded]:
+  `get-dir`'s properties are the node's with `svn:entry:committed-rev`, `committed-date` (the stored string),
+  `last-author` and `uuid`; its dirent fields default to `none`, 0, `false`, 0, time 0's date and no author when not
+  asked; a directory's size is 0 here; a file is refused "Can't get entries of non-directory" (160016).
+  `get-locations` writes its entries, then `done`, then the answer or the refusal; its trace follows the closest copy
+  (the youngest copy root on the path's chain, a child's over its parent's of one revision, refused when the node at
+  the copy's revision is another line or was made fresh there) back to its source, keeps a revision after the peg
+  while the line reaches back to the same path (refused when the path is absent in it), and ends where the path holds
+  another line or none.

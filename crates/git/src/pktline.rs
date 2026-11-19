@@ -1,5 +1,5 @@
 //! pkt-lines (A-582; git's `gitprotocol-common.txt` "pkt-line Format" and `gitprotocol-v2.txt` "Packet-Line Framing"
-//! [B]; `pkt-line.c` [C]): every message of git's wire is a run of packets, each four hexadecimal digits giving its
+//! \[B\]; `pkt-line.c` \[C\]): every message of git's wire is a run of packets, each four hexadecimal digits giving its
 //! whole length, the four digits included, then that many bytes less four of data. A length of zero is the flush
 //! packet, which ends a message; protocol v2 adds one, the delimiter between a message's sections, and two, the response
 //! end a stateless server sends after a response. No other length shorter than the four digits exists, and no packet is
@@ -7,7 +7,7 @@
 //!
 //! [`read`] reads one packet from the bytes a stream has delivered so far, saying when they do not yet hold all of it,
 //! so a server reads a request as it arrives; [`decode`] decodes a whole stream at once under an [`Admission`];
-//! [`write`] encodes one packet as git writes it, its length in lower-case digits.
+//! [`write`](fn@write) encodes one packet as git writes it, its length in lower-case digits.
 
 use crate::out::Out;
 use crate::{Admission, PastAdmission, to_u64};

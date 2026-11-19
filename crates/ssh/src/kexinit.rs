@@ -25,7 +25,7 @@
 //! **A guess.** A client may send its first exchange packet before seeing the server's KEXINIT. The guess "is considered
 //! wrong if ... the kex algorithm and/or the host key algorithm is guessed wrong (server and client have different
 //! preferred algorithm)" [B: RFC 4253 §7], judged as OpenSSH judges it, by the first names of the two lists
-//! (`proposals_match` in `kex.c` at `fa4b2a82`) [C]; a wrong guess's packet is ignored.
+//! (`proposals_match` in `kex.c` at `fa4b2a82`) \[C\]; a wrong guess's packet is ignored.
 
 use crate::hostkey::ED25519;
 use crate::packet::Cipher;

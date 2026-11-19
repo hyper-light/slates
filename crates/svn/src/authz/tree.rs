@@ -353,7 +353,7 @@ fn matching_prefixes<'n>(node: &'n Node, name: &'n [u8]) -> impl Iterator<Item =
 }
 
 /// The suffix children of `node` whose suffix `name` ends with: one lookup per length of `name`, none when there are
-/// no suffixes. The segment is never reversed in place (module documentation of `authz`, item 3).
+/// no suffixes. The segment is never reversed in place (module documentation of `authz`, item 2).
 fn matching_suffixes<'n>(node: &'n Node, name: &'n [u8]) -> impl Iterator<Item = usize> + 'n {
   let starts = if node.suffixes.is_empty() {
     0
@@ -641,10 +641,10 @@ fn global_rights_with(
 }
 
 /// The rules' repositories and the access each gives, where `pick` finds one.
-fn picked<'m>(
-  model: &'m Model,
+fn picked(
+  model: &Model,
   pick: impl Fn(&Acl) -> Option<Access>,
-) -> impl Iterator<Item = (&'m [u8], Access)> {
+) -> impl Iterator<Item = (&[u8], Access)> {
   model
     .acls()
     .iter()

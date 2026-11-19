@@ -1,0 +1,2 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 26:svn://127.0.0.1:36913/repo 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( ANONYMOUS ( 45:YW5vbnltb3VzQEFkYXMtTWFjLVN0dWRpby5sb2NhbA==
+ ) ) ( check-path ( 0: ( ) ) ) ( check-path ( 11:trunk/a.txt ( ) ) ) ( check-path ( 9:trunk/dir ( 1 ) ) ) ( check-path ( 13:trunk/missing ( ) ) ) ( check-path ( 15:trunk/dir/b.txt ( 5 ) ) ) ( check-path ( 15:trunk/dir/b.txt ( 6 ) ) ) ( check-path ( 14:/trunk//dir/./ ( ) ) ) ( check-path ( 5:trunk ( 99 ) ) ) 

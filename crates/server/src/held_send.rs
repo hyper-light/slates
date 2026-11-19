@@ -427,6 +427,7 @@ impl LedgerRecord {
   pub(crate) fn decode(bytes: &[u8]) -> Option<LedgerRecord> {
     let whole = <&[u8; LEDGER_RECORD_BYTES]>::try_from(bytes).ok()?;
     let (words, _) = whole.as_chunks::<{ size_of::<u64>() }>();
+    // Shape: a ledger record's four words, its tag, generation, slot count and stride.
     let [tag, generation, slots, stride] = <[[u8; size_of::<u64>()]; 4]>::try_from(words)
       .ok()?
       .map(u64::from_le_bytes);
