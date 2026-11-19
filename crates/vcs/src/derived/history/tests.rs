@@ -1011,10 +1011,12 @@ fn ask(
   assert!(generations, "{asked}");
   let names = number(key(path).split(|byte| *byte == b'/').count());
   let cut = limit < full;
+  let listed = number(answer.len());
+  assert_eq!(cost.listed, listed, "{asked}");
   let bound = if cut {
-    2 + cost.listed * (1 + MAX_PARENTS)
+    2 + listed * (1 + MAX_PARENTS)
   } else {
-    1 + cost.listed
+    1 + listed
   };
   assert!(
     cost.lookups <= names && cost.reads <= bound,

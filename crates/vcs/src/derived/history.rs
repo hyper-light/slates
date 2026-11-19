@@ -73,7 +73,7 @@ use std::mem::size_of;
 use crate::content::{ContentId, ContentRefused, ContentStore, IDENTITY_BYTES};
 
 use super::paths::{At, Change, Entry, PathChanges, PathCounters, PathMap, PathsRefused, at};
-use super::{DerivedType, Graph, Mode};
+use super::{DerivedType, Mode};
 
 #[cfg(test)]
 mod tests;
@@ -243,7 +243,7 @@ pub enum Made {
 /// A version a path's history lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Logged {
-  /// The bytes that name the version in its history ([`Graph::name`]).
+  /// The bytes that name the version in its history ([`super::Graph::name`]).
   pub version: Vec<u8>,
   /// Its generation.
   pub generation: u64,
