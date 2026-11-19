@@ -41,7 +41,9 @@
 //!
 //! **The pack** is A-615's choice for the wants and every have, since `create_pack_file` takes them all. It is framed
 //! on side-band-64k, on side-band (1000-byte packets, `DEFAULT_PACKET_MAX`) or on neither, as the client chose, with a
-//! flush after it on either band.
+//! flush after it on either band. A `sparse:oid` filter's blob is read once the pack is due, as git's `pack-objects`
+//! reads it (A-640 part 4); one it dies of is answered as git answers it: after the acknowledgments, its words on band
+//! 2 and git's band-3 words on either band, and nothing with neither.
 //!
 //! **Stateless only.** Over SSH a v0 client speaks in rounds on one stream, and the server keeps what each round taught
 //! it; that is owed (GAPS). git's client speaks protocol v2 over SSH since 2.26, and v2 is stateless by design.
@@ -49,7 +51,7 @@
 use std::collections::BTreeSet;
 
 use super::answer::{Answer, Framing};
-use super::{AGENT, PackPlan, PackSource, Refusal, Served, charged, refs};
+use super::{AGENT, PackPlan, PackSource, Refusal, Served, charged, refs, sparse};
 use crate::http::Version;
 use crate::negotiation::{self, Deepen, Filter, Graph, ShallowInfo};
 use crate::object_name::{ObjectFormat, ObjectId};
@@ -579,10 +581,34 @@ fn answered<P: PackSource>(
   if !due {
     return Ok(Answer::whole(head));
   }
-  let outcome = negotiation::negotiate(graph, request, admission).map_err(Refusal::Negotiation)?;
+  with_pack(graph, served, request, head, chosen, packs, admission)
+}
+
+/// The answer once its pack is due: `head`, then the pack, or, when the request's `sparse:oid` filter's blob was not
+/// resolved or read, git's answer to a `pack-objects` that dies as it begins (A-640 part 4). The blob is read here, as
+/// git's `pack-objects` reads it once the pack is due.
+fn with_pack<P: PackSource>(
+  graph: &StoreGraph<'_>,
+  served: &Served<'_>,
+  request: &negotiation::Request<'_>,
+  head: Vec<u8>,
+  chosen: Chosen,
+  packs: &mut P,
+  admission: &mut Admission,
+) -> Result<Answer<P::Pack>, Refusal> {
+  let sparse = sparse::read(graph, served, request.filter, admission)?;
+  let request = negotiation::Request {
+    sparse: sparse.patterns.as_ref(),
+    ..*request
+  };
+  let outcome = negotiation::negotiate(graph, &request, admission).map_err(Refusal::Negotiation)?;
   let negotiation::Answer::Pack(pack) = outcome.answer else {
     return Ok(Answer::whole(head).counted(outcome.counters));
   };
+  if let Some(refusal) = sparse.dies {
+    return Answer::died(head, refusal, chosen.framing.is_banded(), admission)
+      .map(|answer| answer.counted(outcome.counters));
+  }
   let plan = PackPlan {
     runs: &pack.runs,
     objects: &pack.objects,

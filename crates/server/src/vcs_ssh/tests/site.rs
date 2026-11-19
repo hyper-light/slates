@@ -31,6 +31,8 @@ const SHARDS: u16 = 2;
 const CALLS: u64 = 6;
 /// Shape: an agent's consumer id that no enrollment holds.
 const UNENROLLED_CONSUMER: u64 = 77;
+/// Shape: the runtime shard the locating test's repositories elsewhere live on.
+const AWAY_SHARD: u16 = 1;
 
 /// The principal with uid `uid` on host 0.
 fn principal(uid: u32) -> Principal {
@@ -404,6 +406,54 @@ fn a_dispatched_service_starts_with_its_repository_and_protocol() {
       ),
       (super::Service::Subversion, None, owner, None),
     ]
+  );
+}
+
+/// Locates the repositories `away.git` and `hg/away` on [`AWAY_SHARD`], every other name here; finds none, since these
+/// tests only locate.
+struct Away;
+
+impl Repositories for Away {
+  fn locate(&self, name: &str) -> Located {
+    if matches!(name, "away.git" | "hg/away") {
+      Located::Elsewhere(AWAY_SHARD)
+    } else {
+      Located::Here
+    }
+  }
+
+  fn find(&self, _name: &str) -> Option<RepositoryRecord> {
+    None
+  }
+}
+
+/// A-651 part 4 (main's ruling for the HTTP edge, A-625 part 3: a connection moves to its repository's owner shard;
+/// D-14, a name routes to its partition). Do: locate git's two services and Mercurial's on repositories another shard
+/// holds, git's path with its leading slash and without; git's on a repository here; and Subversion's tunnel, which
+/// names none. Expect: the first three on that shard, each by its name without the slash, and the last two here.
+#[test]
+fn an_exec_is_located_on_the_shard_its_repository_lives_on() {
+  let site = ToolSite::new(NoKeys, Away, NotYet);
+  let commands = [
+    Asked::GitUploadPack {
+      path: b"/away.git".to_vec(),
+    },
+    Asked::GitReceivePack {
+      path: b"away.git".to_vec(),
+    },
+    Asked::Mercurial {
+      repository: b"hg/away".to_vec(),
+      hidden: false,
+    },
+    Asked::GitUploadPack {
+      path: b"/r.git".to_vec(),
+    },
+    Asked::Subversion,
+  ];
+  let away = Located::Elsewhere(AWAY_SHARD);
+  assert_eq!(
+    commands.map(|command| site.locate(&command)),
+    [away, away, away, Located::Here, Located::Here]
   );
 }
 

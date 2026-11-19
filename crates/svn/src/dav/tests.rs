@@ -823,6 +823,7 @@ fn an_options_answer_gives_the_httpv2_headers_only_when_asked() {
     uuid: Some("6b4a5e2c".to_owned()),
     mergeinfo: Some(true),
     bulk_updates: BulkUpdates::Prefer,
+    served: Capability::ALL.to_vec(),
   };
   let asked = response::options_headers(&facts, true);
   let unasked = response::options_headers(&facts, false);
