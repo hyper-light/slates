@@ -12966,6 +12966,55 @@ signature verification).
 > every file revision the client lacks; hostile requests. Owed of piece 4: `slates hg serve --stdio`'s loop (a bundle2
 > request's abort answered as an `error:abort` part), HTTP version 1, held deltas in place of full texts, and the
 > index's kept heads in place of the walks.
+>
+> **Status (2026-11-19, A-641 part 1: piece 5's first part, a push's bundle read, its race checks and its reply).**
+> `slates-hg`'s `push` reads what a client's `unbundle` asks as 7.2's part handlers read it (`push::read`): each part
+> routed by its type in lower case to the handler a push has (`replycaps`, the four checks, `changegroup`,
+> `phase-heads`, `bookmarks`, `pushkey`, `obsmarkers`, `pushvars`, `output`), a mandatory part or a mandatory parameter
+> no handler names refused as 7.2's `error:unsupportedcontent` names it (the type in lower case, the unknown parameters
+> sorted), an advisory one passed over, and every payload decoded by piece 1's codecs and kept in stream order. A
+> changegroup is taken once, in versions `01` to `03`, and a `targetphase` of secret, archived or internal is refused
+> (decision 3). It judges the race checks against the served view the push read (`push::check`), in 7.2's order and
+> words: `check:heads` (the heads, sorted, exactly; the null node alone for an empty repository), `check:updated-heads`
+> (each a branch's head, closed ones too), `check:bookmarks` (its three messages) and `check:phases` (phase by phase in
+> `allphases` order, as 7.2's decoded mapping hands them over), and `unbundle`'s `heads` argument as `check_heads`
+> reads it (`force`, the heads in `heads`' order, or `hashed` and their SHA-1). Where the push lands, each green and log
+> a check read is compared again at the position it was read at (A-642), so the checks hold at the push's own step
+> (the landing is part 2's). It writes the reply as 7.2's server does (`push::reply`): `reply:changegroup` with the
+> change in heads `changegroup.apply` counts, `reply:pushkey`, `reply:obsmarkers` and captured `output` for an
+> accepted push, and for a refused one the salvaged `output` then `error:abort`, `error:pushraced`, `error:pushkey` or
+> `error:unsupportedcontent`; and the words of 7.2's `reject_new_heads` for a refused new head, the branch written as
+> CPython writes a bytes repr. Proven against eleven pushes stock 7.2 made over SSH (`crates/hg/fixtures/push`, the
+> command in `make-push-fixtures.sh`, checked by `SHA256SUMS`): a bookmark moved, a draft published, a plain push, three
+> races made deterministic by sending one client's recorded session again after another client moved its head, its
+> bookmark or its phase, a new head refused by 7.2's own hook, and an unknown part and parameter. Each request reads as
+> 7.2's listing shows it, each race is found in exactly the words 7.2 answered, and each reply is written byte for byte
+> as 7.2 wrote it; a naive oracle of the four checks agrees over generated histories. Owed (part 2 on): the changegroup
+> verified and classified into works through A-618's builder, the landing on each green's log through a trait (A-642,
+> A-635), phases and bookmarks in the same landing, the policy and the hooks at their points, and the bundle read in
+> slices.
+>
+> **Status (2026-11-19, A-630 parts 2 and 3: an existing store imported as the base, its file index read; piece 3
+> whole).** `slates-hg`'s `import` takes a repository's store into a new `index` through a read-only seam
+> (`RepositoryFiles`: one whole file under `.hg` a call, by its path's names, which the server answers from §4.15's
+> base plane). The requirements first, `requires` and under `share-safe` the store's own, every one 7.2 knows read,
+> beside the point of the logs, or refused by kind (tree manifests, narrow, lfs, largefiles, a shared store, copies in
+> sidedata; an unknown or corrupt line; 7.2's incompatible pairs; a store that lists no file log), and the store's
+> shape chosen as 7.2's `makestore` chooses it, the plain encoding among them (`store`). Then the listing: the
+> fncache's revlogs, or version 1 of the file index (`file_index`: its docket, the used bytes of its list, meta and
+> tree files, its root held to 7.2's checks, its paths). Then each revlog by its own header (version 1 inline or split,
+> or a docket naming its index and data files), appended in 7.2's order (the changelog, the manifest log, each file log
+> in its path's order), each log one group, whole or refused, each text held to its node before it is kept. Checked
+> across the logs as 7.2's `verify` checks them: links, each changeset's manifest, each path a changeset names listed
+> and not empty, every revision keeping its revlog's number. Censored, ellipsis and externally stored revisions, and
+> flags 7.2 does not know, are refused by kind; a refused import releases its index and gives back every hold. Proven
+> against one history stock 7.2 stored five ways (A-630 part 1's two stores, the first under a pre-share-safe
+> `.hg/requires`, and `crates/hg/fixtures/import`'s revlog version 2 store with the changelog's version 2 and its
+> version 1 file index store, made by `make-import-fixtures.sh`): every text 7.2's `debugdata`, every node 7.2's, the
+> five indexes equal row for row, and nothing read but the files each holds, each once. Owed: the phase roots,
+> bookmarks and markers beside the logs (pieces 5 and 7; until then an import is not served), the import sliced under
+> the shard's budget and resumed after a pending read, revlogs read by ranges, a rebuild that starts from the text
+> before it, and the server's adapter from the base's host seam.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13359,13 +13408,18 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
    holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
    Mercurial's naming as its `Naming`. Built (A-630 part 1, `crates/hg`: `store`): a store's names (both of 7.2's
-   encodings, the hashed long names) and its fncache. Owed: the import into the index, and version 2's file index.
+   encodings, the hashed long names) and its fncache. Built (A-630 parts 2 and 3, `crates/hg`: `import`,
+   `file_index`, `store`'s requirements and plain encoding): an existing store imported into the index through a
+   read-only seam, its file index read. Owed with later pieces: the phase roots, bookmarks and markers (pieces 5 and
+   7), the import sliced and by ranges, and the server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; owed: the stdio loop,
    HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
-   register entry and the reply.
+   register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
+   the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts; owed: the
+   works, the landing on each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -44176,6 +44230,139 @@ Applied in the same change to:
   as the NFS export moves a mount's connection, or each shard listens); the authenticator handing a bearer credential's
   expiry with its principal, which LFS's actions carry (A-629 part 2); Mercurial's (§4.17.3) and Subversion's (§4.17.4)
   sites; the MCP edge onto this engine; the live `git clone` over HTTPS (main's run, once upload-pack serves).
+
+### A-641 part 1 — a push's bundle read as 7.2's handlers read it, its race checks judged in 7.2's words and order, and its reply written as 7.2's server writes it (2026-11-19, g301, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" steps 1, 4 and 7 and piece 5; A-514, A-545, A-569, A-619; the landing follows A-642)
+
+- **What.** `crates/hg/src/push` (`slates-hg`): `read` takes a plain bundle2 (A-598 makes a compressed one plain) and
+  returns what the push asks, part by part in stream order; `check::judge` judges its `check:heads`,
+  `check:updated-heads`, `check:bookmarks` and `check:phases` against the served view the push read (A-619's
+  `serve::Repository`), and `check::heads_argument` with `judge_heads_argument` the `unbundle` command's own `heads`
+  argument; `reply::Reply` writes the answer: `accepted` (the reply parts of the parts handled, only when the client
+  sent `replycaps`) or `refused` (the salvaged `output`, then one error part), with `heads_changed` (the `return` of
+  `reply:changegroup`) and `multiple_heads` (the words of 7.2's `reject_new_heads`).
+- **Read from 7.2's code** (the wheel uv installs, CPython 3.12, the Mac Studio, 2026-11-19; SHA-256 of each file in
+  `research/mercurial-server.md` §20): `bundle2.py` `_gethandler` (a mandatory part no handler takes, or one whose
+  mandatory parameter its handler does not name, is `BundleUnknownFeatureError`, its type lower-cased and the unknown
+  names sorted; an advisory one is passed over); `bundle2_part_handlers.py` (each handler's parameters, the race checks'
+  words, `reply:changegroup` advisory and `reply:pushkey`/`reply:obsmarkers` mandatory with advisory parameters);
+  `wireprotov1server.py` `unbundle` (a refused bundle2 push answers a new stream: the salvaged `output` parts, then one
+  of `error:pushkey`, `error:unsupportedcontent`, `error:abort` or `error:pushraced`, each mandatory); `exchange.py`
+  `check_heads` (`force`, the list in `heads`' order, or `hashed` and the SHA-1 of the sorted heads; "repository changed
+  while preparing changes" or "uploading changes"); `changegroup.py` `apply` (the change in heads less the added heads
+  that close a branch, plus one, minus one when negative: never 0); `branchmap.all_nodes_are_heads` (the null node
+  alone is a head only of an empty repository); `phases.binarydecode` (a mapping in `allphases` order, so
+  `check:phases` is judged public first, whatever the payload's order).
+- **Decided, each stricter than 7.2 on purpose** (module docs): the parts 7.2 handles only in a pull or a reply have no
+  handler in a push; one changegroup a push, versions `01` to `03` (§4.17.3 "The wire surface"); a `targetphase` other
+  than public or draft refused (decision 3); a damaged payload or a number parameter that is none refused by kind
+  where 7.2 fails with an exception; a mandatory interrupting part refused; a node `check:phases` names that the view
+  lacks is a race in the plain words (7.2 fails on its lookup); a reply parameter longer than the 255 bytes a bundle2
+  parameter holds is cut there (7.2's writer fails on it).
+- **Golden vectors.** `crates/hg/fixtures/push/make-push-fixtures.sh` (stock hg 7.2 from PyPI through uv, SSH v1
+  through a recording stand-in, run on the Mac Studio 2026-11-19 from this branch; 66 files, `SHA256SUMS` checked after
+  the copy): a bookmark moved, a draft published, a plain push, three races (a recorded session sent again after another
+  client moved the head it checks, the bookmark it checks onto another branch, or published the draft it checks), a new
+  head refused by `hgext.hooklib.reject_new_heads`, and an unknown mandatory part and parameter sent by hand. The first
+  run found the script's own fault: the other clients' pushes went through the stand-in without a capture name, died
+  there, and their 255 was taken for a refusal, so no race happened and each replay was accepted; the script now lets
+  only a recorded push be refused. CPython 3.12's bytes repr, which `%r` writes a branch with, measured for ten hostile
+  names through `uvx --python 3.12 --from mercurial==7.2 python -I` (the test's table).
+- **Evidence** (Mac Studio, kiln, debug): `cargo test --locked -p slates-hg --lib` 217 of 217 at 709928d1e (load
+  5.3), `cargo fmt` clean after the Studio's formatting patch. Red six ways, each in a disposable copy and each turning
+  only its guarding tests red: an unknown mandatory parameter ignored (3 tests), `check:updated-heads` always holding
+  (3), `short` of ten digits (3), `reply:changegroup` mandatory (1), the repr always in single quotes (1), and
+  `check:phases` judged in the payload's order (1, the oracle alone).
+- **Owed** (part 2 on): the changegroup verified (every delta's base held or earlier, every node hashed, every link and
+  every file node a new manifest names present) and classified into works, one per line or bookmark a push moves,
+  through A-618's `slates_merge::push::build` over the flat manifests' paths; the landing through a trait of its own,
+  each moved green appended at the position the push read and every green and log the checks read compared there
+  (A-642; A-635's verdict over several works, g261's rebuilt entry); phases and bookmarks moved in that landing, the
+  pushkey namespaces' compare and swap; `vcs_policy::admit` and the hook driver at their points (slates-server); the
+  bundle read in slices within the shard's step budget.
+- **Applied in the same change to:** §4.17.3's status (this part) and piece 5's line; GAPS' §4.17.3 entry (built and
+  owed); `research/mercurial-server.md` §20; `crates/hg/src/lib.rs` (the `push` module line).
+
+### A-630 parts 2 and 3 — An existing Mercurial store imported as the repository's base, read-only and in 7.2's order, its file index read as 7.2 reads it (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3, the import; §4.15; A-588, A-611, A-630 part 1)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`import` and `file_index`, new; `store`'s
+requirements reader, now strict, and its plain encoding; `fixtures/import/` and its `make-import-fixtures.sh`), GAPS
+(the §4.17.3 entry), `research/mercurial-server.md` §21.
+- **What it does.** `import::import` reads a repository's `.hg` through `RepositoryFiles`, a read-only seam that hands
+  over one whole file a call by its path's names (the server answers it from §4.15's base plane, whose host seam opens
+  a name at a time and has no verb that writes), and returns a new `HgIndex` holding every log of the store, its texts
+  kept in the content store. The requirements first: `requires`, and under `share-safe` the store's own
+  `store/requires`, which must then be there; `store::Layout::read` knows all 30 requirements 7.2 knows (its
+  `BASE_SUPPORTED`, the three `exp-compression-` engines with a revlog header and `revlog-compression-zstd`, and the
+  shipped extensions' three), each read (the listing, the encoding, `share-safe`), beside the point of the logs (what
+  each revlog's own header says, caches, the working directory's, and the phases and bookmarks this import does not
+  take yet), or refused by kind (`treemanifest`, `narrowhg-experimental`, `lfs`, `largefiles`, `shared`, `relshared`,
+  `exp-copies-sidedata-changeset`); a line 7.2 calls corrupt, a requirement it does not know, its incompatible pairs and
+  a store that lists no file log are refused too. `Layout::shape` chooses the store's listing and encoding as 7.2's
+  `localrepo.makestore` does: an fncache store named by dotencode's encoding, the plain one (`store::plain_encode`,
+  7.2's `_plain_encode`) or the hybrid one; a file index store by dotencode's, though it never requires `dotencode`, or
+  the plain one. Then the listing: the fncache's revlog files grouped by revlog as 7.2's `_gather_revlog` groups them
+  (any other file passed over, as 7.2 passes it over; a revlog outside `data/` refused), or the file index's paths
+  (`file_index`: the docket, the used bytes of its list, meta and tree files, its root held to 7.2's two checks, each
+  path from its meta record). Then each revlog, opened by its index file's header as 7.2's `_loadindex` opens one
+  (version 1, inline or with its data file, or a docket naming its index and data files), and appended in 7.2's order,
+  the changelog, the manifest log, then each file log in its path's order, each log one group of
+  `HgIndex::append_changesets` or `append_revisions`, whole or refused, each text rebuilt and held to its node by the
+  reader before it is kept, a file revision's block apart from its bytes.
+- **Decisions.**
+  - *One new index, released whole on a refusal.* The import never writes into an index that holds anything else, and
+    a refusal at any step releases the index and gives back every hold the import's puts took, so a refused import
+    leaves the content store exactly as it was (its contents and its charges, both held to zero by the tests at the
+    least room and the least budget that import, less one byte).
+  - *As 7.2 opens a store, not as its listing promises.* An absent changelog or manifest log is empty, as 7.2's
+    `_get_data` reads an absent file (a store has neither before its first commit); an absent version 1 data file or
+    docket-named file is empty, the reader refusing every chunk it needed; a listed file log whose index file is absent
+    is refused (`Missing`), where 7.2 would read it empty and its `verify` call it missing.
+  - *7.2's `verify`, where it is cheap.* Each manifest and file revision's link must name a changeset; each changeset's
+    manifest must be the null node or one the manifest log holds; each path a changeset names must be listed and its
+    log not empty (otherwise a damaged fncache or file index would drop that file's history unseen); every revision
+    must keep its revlog's number, since the index passes over a node it holds and would number the rest otherwise.
+    A manifest's file nodes are not checked against the file logs: that is a whole verify's work, owed with one.
+  - *Stricter than 7.2.* Censored, ellipsis and externally stored revisions are refused by kind (`Censored`,
+    `Ellipsis`, `ExternallyStored`) before their texts are read, their pieces being later ones (10, 11); flags 7.2
+    does not know are refused as it refuses them. A file index's garbage list cut short, a used size past its file, a
+    root's children cut short, a meta file of partial records and a path past its list file, empty or holding NUL, a
+    line feed or a carriage return are refused where 7.2 slices on; every name handed to the host must be plain, so a
+    docket id that spells `..` is refused before the host is asked.
+  - *Bounds from the caller and the store.* `room` is the most the import holds at once (the requirements and the
+    listing for the walk, one revlog's files and group, one text's rebuild, each charged to a copy of the room its
+    enclosing scope left); the texts and rows are the content store's budget's; the shared index's tail is sealed when
+    due after each group, as its rule says. No number of the import's own.
+- **From the sources.** 7.2's code, read from Homebrew's 7.2 (`/opt/homebrew/Cellar/mercurial/7.2`): `localrepo.py`
+  (`makelocalrepository`'s requirements and `share-safe`, `makestore`, the incompatible pairs), `repo/requirements.py`
+  (`BASE_SUPPORTED`, `gather_supported_requirements`), `repo/creation.py`, `requirements.py`, `scmutil.readrequires`,
+  `store.py` (`_plain_encode`, `fncachestore`, `FileIndexStore`, `_gather_revlog`, `_split_revlog_ext`,
+  `REVLOG_FILES_EXT`), `store_utils/file_index.py` and `file_index_util.py` with `helptext/internals/file-index.txt`,
+  `utils/docket.py` (`UNSET_UID`, `HGTEST_UUIDFILE`), `revlog.py` (`_get_data`, `_loadindex`),
+  `revlogutils/docket.py` (the index, data and sidedata files' names), `revlogutils/flagutil.py` (`processflagsraw`)
+  with `interfaces/repository.py` (the revision flags), `revlogutils/constants.py`, `filelog.py` (`hasmeta`) and
+  `verify.py` (`_verifyfiles`).
+- **Golden vectors.** `crates/hg/fixtures/import`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 05:41:16 to
+  05:41:37 UTC (load 2.5 to 6.2), by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the
+  branch at 028ba0c81, exactly: `bash crates/hg/fixtures/import/make-import-fixtures.sh "$D/out"
+  crates/hg/fixtures/store`. The history of `fixtures/store` made again in five repositories, docket ids and garbage
+  timestamps fixed by 7.2's own test hooks: the dotencode, hybrid and pre-share-safe stores byte for byte A-630 part
+  1's (`cmp`, file by file), each `.hg/requires` kept; a revlog version 2 store with the changelog's version 2 and a
+  version 1 store, both listed by the file index, each whole with its file list, requirements, and 7.2's
+  `debug::file-index` listing and docket, every revision's `debugdata` byte for byte `fixtures/store`'s. 144 files and
+  their `SHA256SUMS`, each checked equal after the copy.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red first: branch `agents/g300-hg-import-red` (01f892747, not for
+  main: `import`, `file_index::read_docket` and `paths`, `store::plain_encode` and `Layout::read` returning at once),
+  `cargo test --locked -p slates-hg --lib` 203 passed and 21 failed, every new test but the property test failing by
+  its assertion, and part 1's golden (its requirements stubbed). Green: 224 of 224 at cb5455896, the first build;
+  rustfmt's layout taken from that run; 249 of 249 with rustfmt clean on the tree merged with main (A-619 part 2's and
+  A-641 part 1's modules among its newest) at a2eec04d9, load 11.6 to 13.0. Golden: the five stores import to five indexes equal row for row, every
+  changeset's, manifest's and file revision's text 7.2's `debugdata` and every node computed from its parents and text
+  7.2's, and the host asked only for files each repository holds, each once. Hostile: a listed log gone (fncache, file
+  index, version 1 file index store), logs that disagree (no manifest log, a path the fncache lacks, an empty named
+  log), cut indexes (split, inline, version 2), the four flags, refused requirements (asked nothing past them), the
+  least room and the least budget less a byte, a host's own refusal handed back, a docket id climbing out, a node a log
+  holds twice, fncache entries; every refusal leaving the store as it found it; any byte of either store changed or cut
+  (256 generated cases) never a panic and never a hold left. Unit: 7.2's `_plain_encode` doctests, the store's shape
+  for each layout, every kind of refused requirement, the file index's docket, files and paths.
 
 ### A-628 — The repository's import and export: a dump made into a repository's history as FSFS's load makes it, and a history written as `svnadmin dump` writes it (2026-11-19, g264, UI goal 93; §4.17.4 "Pieces that follow" piece 6's rest, rescoped by Ada; A-553, A-575, A-593)
 Applied in the same change to:

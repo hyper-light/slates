@@ -1,0 +1,2 @@
+Stream params: {}
+error:abort -- {message: Changes on branch 'default' resulted in multiple heads} (mandatory: True)
