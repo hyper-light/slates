@@ -2926,7 +2926,7 @@ fn replicated_waits(
 /// The owner's side of a forwarded verb: its own completion window first (a retry of a
 /// verb this partition already ran answers from the record), then the verb and its record
 /// in one step. `None` when the verb deferred its reply to a fleet commit (AUD-11).
-fn run_forwarded(
+pub(crate) fn run_forwarded(
   state: &mut ShardState,
   origin: u64,
   id: RequestId,

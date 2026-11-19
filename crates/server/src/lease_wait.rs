@@ -363,36 +363,117 @@ pub(crate) fn parked_reply() -> ReplyBody {
 
 #[cfg(test)]
 mod tests {
+  use std::time::Duration;
+
   use slates_db::catalog::Principal;
   use slates_db::register::HostId;
   use slates_ipc::protocol::{NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, VolumeId};
-  use slates_wire::request::{RequestId, Seen};
+  use slates_wire::request::RequestId;
 
-  use super::{EXPIRED, SERVED, join, parked, resolve};
+  use super::{EXPIRED, SERVED, parked, resolve};
   use crate::state::ShardState;
 
+  /// Format: the anchor of the node every test request is forwarded from: another node's.
+  const ORIGIN: u64 = 1;
   /// Format: the client every test request is asked by.
   const CLIENT: u32 = 7;
-  /// Format: the sequence of the one request each test asks.
+  /// Format: the sequence of the one request each test asks, and retries under the same id.
   const SEQUENCE: u32 = 1;
+  /// Shape: the pause between the deadline test's looks: a tenth of the fleet's heartbeat, short beside the lease bound
+  /// (nine heartbeats), so a read resolved before its deadline by more than a pause is seen early.
+  const LOOK_PAUSE_NS: u64 = crate::daemon::HEARTBEAT_NS / 10;
+  /// Shape: how long past its deadline the deadline test looks for the refusal: half a liveness window, widened by the
+  /// shard's measured descheduling, as `deadlines`' tests look for a release (A-660).
+  const REFUSED_WITHIN_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2;
 
-  /// What a test saw of the one read it asked, as the module's contract names it.
+  /// What a request through the owner's side of a forwarded verb was answered, by kind.
   #[derive(Debug, PartialEq, Eq)]
-  struct ReadSeen {
-    /// The read parked when it met the refusing lease: one waiter, nothing recorded.
-    parked_at_first: bool,
-    /// The reply recorded as the read's completion, by kind: `Some(true)` when it is the expected one.
-    recorded_as_expected: Option<bool>,
-    /// The module's count of verbs served after a wait ([`super::SERVED`]).
-    served: u64,
-    /// The module's count of verbs refused at their deadline ([`super::EXPIRED`]).
-    expired: u64,
-    /// The verbs parked once it resolved.
-    parked_after: usize,
-    /// Whether a retry of the request, once it resolved, still found it parked to join.
-    joined_after: bool,
+  enum Answered {
+    /// Nothing yet: the request parked, or a retry joined the parked request.
+    Waiting,
+    /// The volume's status.
+    Status,
+    /// Refused `LeaseUnconfirmed` under the shard's configuration version, as the module refuses at a deadline.
+    LeaseUnconfirmed,
+    /// Anything else, as its debug text, so a failure shows it.
+    Other(String),
   }
 
+  /// When the deadline test saw its parked read resolved, against the read's deadline: the lease bound from its parking.
+  #[derive(Debug, PartialEq, Eq)]
+  enum Resolved {
+    /// At its deadline or after it, within the bound the test looks for.
+    AtItsDeadline,
+    /// Seen resolved this many nanoseconds before its deadline.
+    Early { before_deadline_ns: u64 },
+    /// Still parked when the test stopped looking: how far past its deadline, and the shard's measured descheduling.
+    NotWithin {
+      past_deadline_ns: u64,
+      overrun_ns: u64,
+    },
+  }
+
+  /// What the confirmation test saw.
+  #[derive(Debug, PartialEq, Eq)]
+  struct Confirmed {
+    /// The ask's answer.
+    asked: Answered,
+    /// The verbs parked while the lease refused.
+    parked_while_refused: usize,
+    /// The verbs parked once the lease held and the shard resolved twice.
+    parked_once_resolved: usize,
+    /// A retry under the same id once the read resolved, the lease refusing again.
+    retried: Answered,
+    /// The verbs parked after that retry.
+    parked_after_retry: usize,
+    /// The shard's `lease.wait.served` count.
+    served: u64,
+    /// The shard's `lease.wait.expired` count.
+    expired: u64,
+  }
+
+  /// What the wait-and-join test saw.
+  #[derive(Debug, PartialEq, Eq)]
+  struct Joined {
+    /// The ask's answer.
+    asked: Answered,
+    /// A retry under the same id after a resolve within the read's deadline, the lease still refusing.
+    retried_while_parked: Answered,
+    /// The verbs parked after that retry.
+    parked_with_the_retry: usize,
+    /// A second retry once the lease held and the shard resolved.
+    retried_once_confirmed: Answered,
+    /// The verbs parked after it.
+    parked_after: usize,
+    /// The shard's `lease.wait.served` count.
+    served: u64,
+    /// The shard's `lease.wait.expired` count.
+    expired: u64,
+  }
+
+  /// What the deadline test saw.
+  #[derive(Debug, PartialEq, Eq)]
+  struct Lapsed {
+    /// The ask's answer.
+    asked: Answered,
+    /// The verbs parked right after it.
+    parked_at_first: usize,
+    /// When the read was seen resolved.
+    resolved: Resolved,
+    /// The periods the daemon's fleet coordinator ran: none on a laptop daemon, so no fan of lease evidence could
+    /// resolve the read and the module's own deadline timer did (the non-vacuity count).
+    coordinator_periods: u64,
+    /// A retry under the same id once the lease held again.
+    retried: Answered,
+    /// The verbs parked after it.
+    parked_after: usize,
+    /// The shard's `lease.wait.served` count.
+    served: u64,
+    /// The shard's `lease.wait.expired` count.
+    expired: u64,
+  }
+
+  /// The principal every test volume is made and read as.
   fn principal() -> Principal {
     Principal::Uid {
       host: HostId(0),
@@ -420,182 +501,250 @@ mod tests {
     }
   }
 
-  /// Makes `state`'s owner lease refuse, as a newer version of the owner's own authority announced to it does: the one
-  /// verdict an audit shard, whose lone owner's lease holds on no confirmation, can refuse with. The module asks only
-  /// whether the verdict holds (`verbs::lease_verdict`), never why.
-  fn lease_refuses(state: &mut ShardState) {
-    state.lease = crate::lease::OwnerLease {
-      superseded: Some(state.fleet.configuration().version.saturating_add(1)),
-      ..crate::lease::OwnerLease::default()
-    };
+  /// Supersedes `state`'s owner lease as a holder's answer under the next configuration version does
+  /// (`OwnerLease::supersede`): the shard's latest-state reads refuse until it installs that version. Returns it.
+  fn superseded(state: &mut ShardState) -> u64 {
+    let next = state.fleet.configuration().version.saturating_add(1);
+    state.lease.supersede(next);
+    next
   }
 
-  /// Lets `state`'s owner lease hold again, as a confirmation that reaches the shard does.
-  fn lease_confirms(state: &mut ShardState) {
-    state.lease = crate::lease::OwnerLease::default();
+  /// Lets `state`'s owner lease hold again as installing the `superseding` version does (`OwnerLease::installed`).
+  fn installed(state: &mut ShardState, superseding: u64) {
+    state
+      .lease
+      .installed(superseding, slates_machine::clock::monotonic_ns());
   }
 
-  /// Asks `volume`'s status, a latest-state read, as request [`SEQUENCE`] of [`CLIENT`], run as `verbs::run_recorded`
-  /// runs a request up to its commit: under its completion key, in one durable step, with no reply route (as a verb
-  /// forwarded from another node, whose exchange reads the completion record). Whether it parked, with nothing
-  /// recorded.
-  fn ask_status(state: &mut ShardState, volume: VolumeId) -> bool {
+  /// Asks `volume`'s status, a latest-state read, as request [`SEQUENCE`] of [`CLIENT`] forwarded from [`ORIGIN`],
+  /// through the owner's side of a forwarded verb (`verbs::run_forwarded`): the completion record first, a parked
+  /// request's retry joined to it, else the verb run under its completion key.
+  fn status_asked(state: &mut ShardState, volume: VolumeId) -> Answered {
     let id = RequestId {
       client: CLIENT,
       sequence: SEQUENCE,
     };
-    state.db.begin();
-    state.current_request = Some((state.origin_anchor.0, id));
-    let reply = crate::verbs::dispatch(state, CLIENT, &principal(), RequestBody::Status { volume });
-    state.current_request = None;
-    let deferred = std::mem::take(&mut state.acceptance_deferred);
-    let committed = state.db.commit(&mut state.segment).is_ok();
-    deferred
-      && committed
-      && reply == super::parked_reply()
-      && parked(state) == 1
-      && recorded(state).is_none()
+    let reply = crate::verbs::run_forwarded(
+      state,
+      ORIGIN,
+      id,
+      CLIENT,
+      &principal(),
+      RequestBody::Status { volume },
+      None,
+    );
+    answered(state, reply)
   }
 
-  /// The reply recorded as the request's completion, `None` while none is.
-  fn recorded(state: &ShardState) -> Option<ReplyBody> {
-    match state
-      .db
-      .partition()
-      .completion(state.origin_anchor.0, CLIENT, SEQUENCE)
-    {
-      Seen::Completed(bytes) => ReplyBody::from_bytes(&bytes).ok(),
-      _ => None,
+  /// `reply` by kind, a `LeaseUnconfirmed` judged against `state`'s configuration version.
+  fn answered(state: &ShardState, reply: Option<ReplyBody>) -> Answered {
+    let version = state.fleet.configuration().version;
+    match reply {
+      None => Answered::Waiting,
+      Some(ReplyBody::Status { .. }) => Answered::Status,
+      Some(ReplyBody::Refused {
+        refusal: Refusal::LeaseUnconfirmed {
+          version: refused_under,
+        },
+      }) if refused_under == version => Answered::LeaseUnconfirmed,
+      Some(other) => Answered::Other(format!("{other:?}")),
     }
   }
 
+  /// The count `name` on `state`'s shard.
   fn counted(state: &ShardState, name: &str) -> u64 {
     state.refusals.get(name).copied().unwrap_or(0)
   }
 
-  /// What `state` shows of the request once it resolved, `expected` judging its recorded reply.
-  fn seen_after(
-    state: &mut ShardState,
-    parked_at_first: bool,
-    expected: impl Fn(&ReplyBody) -> bool,
-  ) -> ReadSeen {
-    let id = RequestId {
-      client: CLIENT,
-      sequence: SEQUENCE,
-    };
-    let origin = state.origin_anchor.0;
-    ReadSeen {
-      parked_at_first,
-      recorded_as_expected: recorded(state).map(|reply| expected(&reply)),
-      served: counted(state, SERVED),
-      expired: counted(state, EXPIRED),
-      parked_after: parked(state),
-      joined_after: join(state, origin, id),
-    }
-  }
-
-  /// §4.8 "Leases and reads" (AUD-08), `lease_wait`'s first rule. Do: make a volume, let the owner lease refuse, and
-  /// ask the volume's status as a recorded request; then let the lease confirm and resolve twice. Expect: the read
-  /// parked with nothing recorded, then ran once its lease confirmed: its completion is the volume's status, counted
-  /// served once and expired never; nothing is left parked, and a retry finds no request to join (it reads the
-  /// completion). The second resolve changes nothing.
+  /// §4.8 "Leases and reads" (AUD-08): a parked read runs the moment its lease confirms, and only once. Do: on an audit
+  /// shard make a volume, supersede the owner lease, and ask the volume's status as a forwarded request; install the
+  /// superseding version and resolve the shard's parked reads twice, as a fan of lease evidence installs it and resolves
+  /// them (`fleet::fan_configs_to_shards`); supersede the lease again and retry the request under its id. Expect: the
+  /// ask parked, unanswered, one verb parked; once resolved nothing is parked, counted served once and expired never;
+  /// and the retry answered the status recorded as its completion though the lease refuses again, parking nothing: the
+  /// read neither ran nor parked a second time.
   #[test]
   fn a_parked_read_runs_once_its_lease_confirms_and_only_once() {
     let seen = crate::daemon::audit_on_shard(|state| {
       let volume = volume_made(state, "confirmed")?;
-      lease_refuses(state);
-      let parked_at_first = ask_status(state, volume);
-      lease_confirms(state);
+      let superseding = superseded(state);
+      let asked = status_asked(state, volume);
+      let parked_while_refused = parked(state);
+      installed(state, superseding);
       resolve(state);
       resolve(state);
-      Some(seen_after(state, parked_at_first, |reply| {
-        matches!(reply, ReplyBody::Status { .. })
-      }))
+      let parked_once_resolved = parked(state);
+      superseded(state);
+      let retried = status_asked(state, volume);
+      Some(Confirmed {
+        asked,
+        parked_while_refused,
+        parked_once_resolved,
+        retried,
+        parked_after_retry: parked(state),
+        served: counted(state, SERVED),
+        expired: counted(state, EXPIRED),
+      })
     });
     assert_eq!(
       seen,
-      Some(ReadSeen {
-        parked_at_first: true,
-        recorded_as_expected: Some(true),
+      Some(Confirmed {
+        asked: Answered::Waiting,
+        parked_while_refused: 1,
+        parked_once_resolved: 0,
+        retried: Answered::Status,
+        parked_after_retry: 0,
         served: 1,
         expired: 0,
-        parked_after: 0,
-        joined_after: false,
       })
     );
   }
 
-  /// §4.8 "Leases and reads" (AUD-08), `lease_wait`'s second rule. Do: as above, but leave the lease refusing and put
-  /// the waiter's deadline (the lease bound from its parking, which a unit test does not sleep through) behind the
-  /// clock; resolve twice. Expect: the read refused `LeaseUnconfirmed` under the configuration's version and recorded
-  /// so as its completion, counted expired once and served never; nothing is left parked, and a retry joins nothing.
+  /// §4.8 "Leases and reads" (AUD-08): a parked read whose lease never confirms is refused `LeaseUnconfirmed` at its
+  /// deadline, once. Do: on a laptop audit daemon make a volume, supersede the owner lease and ask the volume's status as
+  /// a forwarded request; leave the lease refusing and look at the shard until the read resolves; then install the
+  /// superseding version and retry the request under its id. Expect: the ask parked; the read stayed parked at every
+  /// look before the lease bound from its parking had passed and was resolved after it, within half a liveness window
+  /// past it widened by the shard's measured descheduling; the fleet coordinator ran no period (a laptop spawns none, so
+  /// no fan of lease evidence resolved the read: the module's own deadline timer did); the retry answered the
+  /// `LeaseUnconfirmed` recorded as its completion under the configuration's version though the lease now holds;
+  /// nothing parked, counted expired once and served never.
   #[test]
   fn a_parked_read_whose_lease_never_confirms_is_refused_lease_unconfirmed_at_its_deadline() {
-    let seen = crate::daemon::audit_on_shard(|state| {
-      let volume = volume_made(state, "lapsed")?;
-      lease_refuses(state);
-      let parked_at_first = ask_status(state, volume);
-      let version = state.fleet.configuration().version;
-      for waiter in &mut state.lease_waiters.waiting {
-        waiter.deadline_ns = 0;
-      }
-      resolve(state);
-      resolve(state);
-      Some(seen_after(state, parked_at_first, |reply| {
-        matches!(
-          reply,
-          ReplyBody::Refused {
-            refusal: Refusal::LeaseUnconfirmed { version: refused_under },
-          } if *refused_under == version
-        )
-      }))
-    });
+    let daemon = crate::daemon::audit_daemon();
+    let seen = lapsed(&daemon);
+    daemon.stop();
     assert_eq!(
       seen,
-      Some(ReadSeen {
-        parked_at_first: true,
-        recorded_as_expected: Some(true),
+      Some(Lapsed {
+        asked: Answered::Waiting,
+        parked_at_first: 1,
+        resolved: Resolved::AtItsDeadline,
+        coordinator_periods: 0,
+        retried: Answered::LeaseUnconfirmed,
+        parked_after: 0,
         served: 0,
         expired: 1,
-        parked_after: 0,
-        joined_after: false,
       })
     );
   }
 
-  /// §4.8 "Leases and reads" (AUD-08), `lease_wait`'s wait: before its deadline a lease still refusing keeps the read
-  /// parked, and a retry joins it rather than parking twice. Do: park the read, resolve with the lease still refusing,
-  /// retry the request; then let the lease confirm and resolve. Expect: after the first resolve one waiter and nothing
-  /// recorded; the retry joined, and still one waiter; then one completion, the volume's status, counted served once.
+  /// Parks a status read on `daemon`'s shard with its owner lease superseded, looks until the read resolves, then
+  /// retries it with the lease holding again: what the deadline test saw, or `None` when the volume could not be made.
+  fn lapsed(daemon: &crate::daemon::Daemon) -> Option<Lapsed> {
+    let (volume, superseding, parked_at_ns, asked, parked_at_first) =
+      crate::daemon::observe_first(daemon, |state| {
+        let volume = volume_made(state, "lapsed")?;
+        let superseding = superseded(state);
+        let parked_at_ns = slates_machine::clock::monotonic_ns();
+        let asked = status_asked(state, volume);
+        Some((volume, superseding, parked_at_ns, asked, parked(state)))
+      })?;
+    let resolved = resolution(daemon, parked_at_ns);
+    let coordinator_periods = daemon.fleet_progress();
+    let (retried, parked_after, served, expired) =
+      crate::daemon::observe_first(daemon, move |state| {
+        installed(state, superseding);
+        let retried = status_asked(state, volume);
+        (
+          retried,
+          parked(state),
+          counted(state, SERVED),
+          counted(state, EXPIRED),
+        )
+      });
+    Some(Lapsed {
+      asked,
+      parked_at_first,
+      resolved,
+      coordinator_periods,
+      retried,
+      parked_after,
+      served,
+      expired,
+    })
+  }
+
+  /// Looks at `daemon`'s shard every [`LOOK_PAUSE_NS`] until its parked read is resolved: whether that was at or after
+  /// its deadline (the lease bound from `parked_at_ns`), before it, or not within [`REFUSED_WITHIN_NS`] past it widened
+  /// by the shard's measured descheduling (`slates_rt::futures::scheduler_overrun_ns`): a host that keeps the shard off
+  /// its CPUs delays the deadline timer's wake by as much, which says nothing of the deadline it armed.
+  fn resolution(daemon: &crate::daemon::Daemon, parked_at_ns: u64) -> Resolved {
+    let deadline_ns = parked_at_ns.saturating_add(crate::lease::lease_bound_ns());
+    loop {
+      let (resolved, now_ns, overrun_ns) = crate::daemon::observe_first(daemon, |state| {
+        (
+          parked(state) == 0,
+          slates_machine::clock::monotonic_ns(),
+          slates_rt::futures::scheduler_overrun_ns(),
+        )
+      });
+      if resolved {
+        return resolved_at(now_ns, deadline_ns);
+      }
+      let past_deadline_ns = now_ns.saturating_sub(deadline_ns);
+      if past_deadline_ns > REFUSED_WITHIN_NS.saturating_add(overrun_ns) {
+        return Resolved::NotWithin {
+          past_deadline_ns,
+          overrun_ns,
+        };
+      }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
+    }
+  }
+
+  /// A read first seen resolved at `now_ns`, judged against its `deadline_ns`.
+  fn resolved_at(now_ns: u64, deadline_ns: u64) -> Resolved {
+    if now_ns < deadline_ns {
+      Resolved::Early {
+        before_deadline_ns: deadline_ns.saturating_sub(now_ns),
+      }
+    } else {
+      Resolved::AtItsDeadline
+    }
+  }
+
+  /// §4.8 "Leases and reads" (AUD-08): a read stays parked within its deadline, and a retry joins it. Do: on an audit
+  /// shard make a volume, supersede the owner lease and ask the volume's status as a forwarded request; resolve the
+  /// shard's parked reads while the lease still refuses and the read's deadline (the lease bound from its parking) is
+  /// far off; retry the request under its id; then install the superseding version, resolve, and retry again. Expect:
+  /// the ask and its first retry unanswered with one verb parked, so the retry joined the parked read rather than
+  /// parking twice, and nothing was recorded; the second retry answered the status recorded as its completion, nothing
+  /// parked, counted served once and expired never.
   #[test]
   fn a_read_still_within_its_deadline_stays_parked_and_its_retry_joins_it() {
     let seen = crate::daemon::audit_on_shard(|state| {
       let volume = volume_made(state, "waiting")?;
-      lease_refuses(state);
-      let asked = ask_status(state, volume);
+      let superseding = superseded(state);
+      let asked = status_asked(state, volume);
       resolve(state);
-      let id = RequestId {
-        client: CLIENT,
-        sequence: SEQUENCE,
-      };
-      let origin = state.origin_anchor.0;
-      let joined = join(state, origin, id);
-      let kept = parked(state) == 1 && recorded(state).is_none();
-      lease_confirms(state);
+      let retried_while_parked = status_asked(state, volume);
+      let parked_with_the_retry = parked(state);
+      installed(state, superseding);
       resolve(state);
-      Some(seen_after(state, asked && joined && kept, |reply| {
-        matches!(reply, ReplyBody::Status { .. })
-      }))
+      let retried_once_confirmed = status_asked(state, volume);
+      Some(Joined {
+        asked,
+        retried_while_parked,
+        parked_with_the_retry,
+        retried_once_confirmed,
+        parked_after: parked(state),
+        served: counted(state, SERVED),
+        expired: counted(state, EXPIRED),
+      })
     });
     assert_eq!(
       seen,
-      Some(ReadSeen {
-        parked_at_first: true,
-        recorded_as_expected: Some(true),
+      Some(Joined {
+        asked: Answered::Waiting,
+        retried_while_parked: Answered::Waiting,
+        parked_with_the_retry: 1,
+        retried_once_confirmed: Answered::Status,
+        parked_after: 0,
         served: 1,
         expired: 0,
-        parked_after: 0,
-        joined_after: false,
       })
     );
   }

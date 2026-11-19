@@ -28668,7 +28668,7 @@ fn assert_isolated_owner_lease(
       at_one: Ok(b"hello".to_vec()),
       at_head: Ok(b"hello world!".to_vec()),
     },
-    "before isolation the owner served the green's latest state on this connection"
+    "before isolation the owner served the green's latest state"
   );
   assert!(
     refuses_lease(&after.head) && refuses_lease(&after.at_head),
