@@ -64,7 +64,7 @@ pub(crate) mod record;
 #[cfg(test)]
 mod tests;
 
-use record::{Record, RecordRefused, RecordWriter, RecordedMove};
+use record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove, WriteRefused};
 
 /// Counter: a repository whose store could not be made (a window too short for two identities, or a git repository
 /// recorded in no git format): zero on every machine. Format: a counter name in the status report.
@@ -125,6 +125,9 @@ pub(crate) struct GitStore {
   /// For each green's key, the green's version at each of the store's versions of it, in order: what a push's old
   /// value is read back to (`version_of`), as each record names it.
   versions: BTreeMap<u64, Vec<u64>>,
+  /// What `versions` holds of the content store's budget (`ContentStore::charge`), charged before a commit keeps a
+  /// version and given back with the store ([`versions_cost`]).
+  charged: u64,
 }
 
 impl GitStore {
@@ -135,6 +138,7 @@ impl GitStore {
       derivations: Derivations::new(),
       reach: ReachSets::declare(Mode::Eager),
       versions: BTreeMap::new(),
+      charged: 0,
     }
   }
 
@@ -210,6 +214,22 @@ pub(crate) enum GitRefused {
   Object(PushRefused<Infallible>),
   /// The store refused: an object neither the push nor the repository holds, a green moved, or the budget.
   Store(StoreRefused),
+  /// The allocator refused a record's room, or its length is past what an address can hold.
+  Allocation,
+}
+
+/// A record not written, in a push's terms: an object whose bytes the content store does not hold whole is one the
+/// store cannot read, as its own refusal names it.
+fn unwritten(refused: WriteRefused) -> GitRefused {
+  match refused {
+    WriteRefused::Unreadable { id } => GitRefused::Store(StoreRefused::Unreadable { id }),
+    WriteRefused::Allocation => GitRefused::Allocation,
+  }
+}
+
+/// A content store's refusal, in a push's terms.
+fn content_refused(refused: ContentRefused) -> GitRefused {
+  GitRefused::Store(StoreRefused::Content(refused))
 }
 
 impl VcsStores {
@@ -342,8 +362,9 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
   };
   match entry {
     RepositoryStore::Git(store) => {
+      let versions = content.discharge(store.charged).is_ok();
       let values = store.derivations.release(content).is_ok();
-      store.repository.release(content).is_ok() && values
+      store.repository.release(content).is_ok() && values && versions
     }
     RepositoryStore::Mercurial(store) => {
       let values = store.derivations.release(content).is_ok();
@@ -357,7 +378,7 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
 /// every byte the shard's budget could admit now given to the content store as room beside what it holds.
 fn lend(store: &mut Store, stores: &mut VcsStores, bytes: u64) {
   store.make_room(bytes);
-  let room = store.budget.admittable();
+  let room = store.admittable();
   let budget = stores.charged.saturating_add(room);
   if let Some(content) = stores.content.as_mut() {
     content.set_budget(budget);
@@ -444,9 +465,11 @@ impl SealedPush {
     self.repository
   }
 
-  /// The record the entry holds (`RepositoryEntry::objects`): the objects not yet committed and the moves now admitted.
-  pub(crate) fn record(&self) -> Vec<u8> {
-    self.objects.clone().finish(self.push.deepest(), &self.keyed)
+  /// The record the entry holds (`RepositoryEntry::objects`): the moves now admitted and the objects not yet committed,
+  /// written now, as the append commits ([`record_of`]).
+  pub(crate) fn record(&self, stores: &VcsStores) -> Result<Vec<u8>, GitRefused> {
+    let (content, store) = stores.git_ref(self.repository).ok_or(GitRefused::NoStore)?;
+    record_of(content, store, (&self.objects, self.push.deepest()), &self.keyed)
   }
 
   /// Admits `moves` (each a green's key, its version once the entry moves it, and its new head) in place of any
@@ -561,8 +584,8 @@ fn abandon_push(state: &mut ShardState, push: Push) {
 
 /// Admits one object into `push`: named by git's rule and checked against the id its source claims (A-614). An object
 /// the repository holds already is passed over, since the store reads an indexed object from its index before any
-/// push (A-638's order) and a commit gives positions only to objects the repository lacks; any other is written to the
-/// record with the content identity it is held under. So a replay of the record admits exactly what this admitted.
+/// push (A-638's order) and a commit gives positions only to objects the repository lacks; any other is noted for the
+/// record by the root the push's quarantine holds it under. So a replay of the record admits exactly what this admitted.
 fn admit_object(
   content: &mut ContentStore,
   store: &GitStore,
@@ -579,10 +602,31 @@ fn admit_object(
     .admit::<_, Infallible>(content, &naming, incoming)
     .map_err(GitRefused::Object)?;
   if admitted == Admitted::New && store.repository.object(content, &id).is_none() {
-    let identity = content.object_id(incoming.content);
-    record.object(incoming.kind, identity, incoming.content);
+    let (_, identity, len) = push
+      .object(&id)
+      .ok_or(GitRefused::Store(StoreRefused::Unreadable { id }))?;
+    record.object(Noted {
+      kind: incoming.kind,
+      id,
+      identity,
+      len,
+    });
   }
   Ok(())
+}
+
+/// The record a commit of `moves` writes (`record::RecordWriter::finish`): the objects `writer` noted, read back from
+/// `content`, after `deepest` and `moves`.
+pub(crate) fn record_of(
+  content: &ContentStore,
+  store: &GitStore,
+  (writer, deepest): (&RecordWriter, u64),
+  moves: &[RecordedMove],
+) -> Result<Vec<u8>, GitRefused> {
+  let _ = store;
+  writer
+    .finish(content, |_| true, (deepest, moves))
+    .map_err(unwritten)
 }
 
 /// Seals `push` and admits each of `moves` against the store, in order (A-614's `seal` and `admit`).
@@ -632,22 +676,57 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   Ok(())
 }
 
-/// A-614's commit of `push` with `moves`, then each moved green's newest value of the reach sets kept as the store's
-/// admission computed it, with no second walk (A-647 part 2), the caller's own hold of it given back once the row holds
-/// it. The values not kept: each is derived again when read.
+/// A-614's commit of `push` with `moves`, each green's version kept with its key, charged first ([`versions_cost`]), then
+/// each moved green's newest value of the reach sets kept ([`keep_values`]). Refused, the charge is given back and
+/// nothing of the store changed. The values not kept: each is derived again when read.
 fn commit_moves(
   content: &mut ContentStore,
   store: &mut GitStore,
   push: &mut Push,
   (moves, keyed): (&[Move], &[RecordedMove]),
 ) -> Result<u64, GitRefused> {
-  store
-    .repository
-    .commit(content, push, moves)
-    .map_err(GitRefused::Store)?;
+  let cost = versions_cost(&store.versions, keyed);
+  content.charge(cost).map_err(content_refused)?;
+  if let Err(refused) = store.repository.commit(content, push, moves) {
+    content.discharge(cost).map_err(content_refused)?;
+    return Err(GitRefused::Store(refused));
+  }
+  store.charged = store.charged.saturating_add(cost);
   for (key, version, _) in keyed {
     store.versions.entry(*key).or_default().push(*version);
   }
+  Ok(keep_values(content, store, moves))
+}
+
+/// Derived: the bytes a kept version takes in its green's list, one word.
+const VERSION_BYTES: usize = size_of::<u64>();
+
+/// Derived: the bytes a green's first kept version adds besides its word: its key's word and its list's header.
+const KEY_BYTES: usize = size_of::<u64>() + size_of::<Vec<u64>>();
+
+/// What keeping `keyed`'s versions adds to a store's `versions`, by the types it holds, as A-614's store charges its
+/// chains by their entries: a version's word each, and a key's word and a list's header for a green it holds no version
+/// of yet (`GitStore::charged`).
+fn versions_cost(versions: &BTreeMap<u64, Vec<u64>>, keyed: &[RecordedMove]) -> u64 {
+  let mut cost = 0usize;
+  for (at, (key, ..)) in keyed.iter().enumerate() {
+    cost = cost.saturating_add(VERSION_BYTES);
+    let earlier = keyed
+      .get(..at)
+      .unwrap_or_default()
+      .iter()
+      .any(|(other, ..)| other == key);
+    if !versions.contains_key(key) && !earlier {
+      cost = cost.saturating_add(KEY_BYTES);
+    }
+  }
+  u64::try_from(cost).unwrap_or(u64::MAX)
+}
+
+/// Each moved green's newest value of the reach sets kept as the store's admission computed it, with no second walk
+/// (A-647 part 2), the caller's own hold of it given back once the row holds it. The values not kept: each is derived
+/// again when read.
+fn keep_values(content: &mut ContentStore, store: &mut GitStore, moves: &[Move]) -> u64 {
   let mut unkept = 0u64;
   for movement in moves {
     let green = movement.green();
@@ -667,16 +746,18 @@ fn commit_moves(
       unkept = unkept.saturating_add(1);
     }
   }
-  Ok(unkept)
+  unkept
 }
 
-/// The wire's refusal for a store that refused a commit: the shard's budget, by the room it had; anything else is a
-/// store not available, which [`COMMIT_REFUSED`] counts, since a store kept beside its greens has no other reason to
-/// refuse a commit their verdicts passed.
+/// The wire's refusal for a store that refused a commit: the shard's budget, by the room it had (a record's room the
+/// allocator refused, by what the shard could admit now, as `staging` answers one); anything else is a store not
+/// available, which [`COMMIT_REFUSED`] counts, since a store kept beside its greens has no other reason to refuse a
+/// commit their verdicts passed.
 pub(crate) fn refusal_of(state: &mut ShardState, refused: &GitRefused) -> Refusal {
   let budget = match refused {
     GitRefused::Store(StoreRefused::Content(ContentRefused::OverBudget { room, .. }))
     | GitRefused::Object(PushRefused::Content(ContentRefused::OverBudget { room, .. })) => Some(*room),
+    GitRefused::Allocation => Some(state.store.admittable()),
     _ => None,
   };
   match budget {
@@ -717,7 +798,9 @@ fn replay_push(
 ) -> Result<u64, ReplayRefused> {
   let mut remade = RecordWriter::default();
   replay_objects(content, store, (&mut *push, &mut remade), record)?;
-  if remade.finish(push.deepest(), &record.moves) != bytes {
+  let remade = record_of(content, store, (&remade, push.deepest()), &record.moves)
+    .map_err(ReplayRefused::Git)?;
+  if remade != bytes {
     return Err(ReplayRefused::Diverged);
   }
   let moves = seal_moves(content, store, push, &record.moves).map_err(ReplayRefused::Git)?;

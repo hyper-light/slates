@@ -548,7 +548,12 @@ fn push_planned(
     if let Err(refused) = sealed.admit(&mut state.vcs_stores, resolved) {
       return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)));
     }
-    entry.objects = sealed.record();
+    match sealed.record(&state.vcs_stores) {
+      Ok(objects) => entry.objects = objects,
+      Err(refused) => {
+        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)));
+      }
+    }
   }
   let changes_anything = !(entry.joined.is_empty()
     && entry.versions.is_empty()

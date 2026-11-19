@@ -8,18 +8,20 @@ use proptest::prelude::*;
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
 use slates_git::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use slates_git::objects::tree::{Entry, Mode, compare, write_entries};
-use slates_git::store::{Incoming, Positions, Push, PushRefused, StoreRefused};
 use slates_git::store::rows::ObjectRow;
+use slates_git::store::{Incoming, Positions, Push, PushRefused, StoreRefused};
 use slates_ipc::protocol::{ObjectFormat as WireFormat, Refusal, ReplyBody, RequestBody, VcsTool};
 use slates_merge::push as work;
 use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
-use super::record::{Record, RecordRefused, RecordWriter, RecordedMove, RecordedObject};
+use super::record::{
+  Noted, Record, RecordRefused, RecordWriter, RecordedMove, RecordedObject, WriteRefused,
+};
 use super::{
   GitPush, GitRefused, GitStore, ReplayRefused, RepositoryStore, Target, admit_object, commit_moves,
-  green_key, replay_git, replay_into, seal_moves,
+  green_key, record_of, replay_git, replay_into, seal_moves,
 };
-use crate::repository::push::{BranchAppended, BranchChange, EntryParts, StoreMove};
+use crate::repository::push::{Appended, BranchAppended, BranchChange, EntryParts, StoreMove};
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
@@ -35,6 +37,9 @@ const GREENS: u64 = 3;
 
 /// Shape: the room a wiring test's work is built within, far past its trees.
 const ROOM: u64 = 1 << 20;
+
+/// Shape: the deepest delta chain a wiring test's pack carried: past zero, so its records carry a chain to replay.
+const DEEP: u64 = 2;
 
 /// Format: the format every test repository is in.
 const FORMAT: ObjectFormat = ObjectFormat::Sha1;
@@ -119,16 +124,36 @@ fn commit_of(files: &[(Vec<u8>, Vec<u8>)], parents: &[ObjectId], date: u64) -> (
 // ---------------------------------------------------------------------------------------------------------------------
 // The record.
 
-/// A-662 (the record's format, pinned). Do: write a record of one delete and one move, and one object, then read it
-/// back. Expect: the bytes the module's encoding states, byte for byte, and the same moves and object read back.
+/// A content store holding `bytes` as an object: the store, and the object as a writer notes it.
+fn holding(kind: Kind, bytes: &[u8]) -> (ContentStore, Noted) {
+  let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
+  let identity = content.put_object(bytes).expect("held");
+  let id = name_of(FORMAT, kind, bytes).expect("named");
+  let len = u64::try_from(bytes.len()).expect("a length");
+  (
+    content,
+    Noted {
+      kind,
+      id,
+      identity,
+      len,
+    },
+  )
+}
+
+/// A-662 (the record's format, pinned). Do: write a record of one delete, one move and one object held by a content
+/// store, then read it back. Expect: the bytes the module's encoding states, byte for byte, the object's bytes read back
+/// from its root; and the same moves and object read back.
 #[test]
 fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   let head = ObjectId::from_bytes(FORMAT, &[0xab; 20]).expect("an id");
-  let identity = ContentId([0x11; 32]);
+  let (content, noted) = holding(Kind::Blob, b"hi");
   let mut writer = RecordWriter::default();
-  writer.object(Kind::Blob, identity, b"hi");
+  writer.object(noted);
   let moves: Vec<RecordedMove> = vec![(7, 4, None), (9, 5, Some(head))];
-  let bytes = writer.finish(3, &moves);
+  let bytes = writer
+    .finish(&content, |_| true, (3, &moves))
+    .expect("written");
   let mut expected = Vec::new();
   expected.extend_from_slice(b"SGPR");
   expected.extend_from_slice(&1u32.to_le_bytes());
@@ -143,23 +168,62 @@ fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   expected.extend_from_slice(&[0xab; 20]);
   expected.extend_from_slice(&1u64.to_le_bytes());
   expected.push(3);
-  expected.extend_from_slice(&[0x11; 32]);
+  expected.extend_from_slice(&noted.identity.0);
   expected.extend_from_slice(&2u64.to_le_bytes());
   expected.extend_from_slice(b"hi");
   assert_eq!(bytes, expected);
-  let read = Record::decode(&bytes, FORMAT).expect("read back");
   let object = RecordedObject {
     kind: Kind::Blob,
-    identity,
+    identity: noted.identity,
     content: b"hi",
   };
+  let read = Record {
+    deepest: 3,
+    moves,
+    objects: vec![object],
+  };
+  assert_eq!(Record::decode(&bytes, FORMAT), Ok(read));
+}
+
+/// A-662 (the record written when an append commits, its bytes read back). Do: note three objects, the third longer
+/// than three windows; write the record with the second one held by the repository by then; then write one naming an
+/// object the content store does not hold. Expect: the record holds the first and the third in the order noted, the
+/// long one's bytes whole from its windows, and not the second; the object not held refused `Unreadable`, never
+/// written short.
+#[test]
+fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_bytes_not_held() {
+  let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
+  let long: Vec<u8> = (0..=u8::MAX).cycle().take(WINDOW * 3 + 5).collect();
+  let mut writer = RecordWriter::default();
+  for bytes in [&b"one"[..], b"two", &long] {
+    let identity = content.put_object(bytes).expect("held");
+    let (id, _) = blob(bytes);
+    let len = u64::try_from(bytes.len()).expect("a length");
+    writer.object(Noted {
+      kind: Kind::Blob,
+      id,
+      identity,
+      len,
+    });
+  }
+  let (held, _) = blob(b"two");
+  let bytes = writer
+    .finish(&content, |id| *id != held, (0, &[]))
+    .expect("written");
+  let read = Record::decode(&bytes, FORMAT).expect("read back");
+  let contents: Vec<&[u8]> = read.objects.iter().map(|object| object.content).collect();
+  assert_eq!(contents, vec![&b"one"[..], &long[..]]);
+  let (ghost, _) = blob(b"never held");
+  let mut unheld = RecordWriter::default();
+  unheld.object(Noted {
+    kind: Kind::Blob,
+    id: ghost,
+    identity: ContentId([9; 32]),
+    len: 10,
+  });
   assert_eq!(
-    read,
-    Record {
-      deepest: 3,
-      moves,
-      objects: vec![object],
-    }
+    unheld.finish(&content, |_| true, (0, &[])),
+    Err(WriteRefused::Unreadable { id: ghost })
   );
 }
 
@@ -170,9 +234,12 @@ fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
 #[test]
 fn t_a662_hostile_records_are_refused_by_kind() {
   let head = ObjectId::from_bytes(FORMAT, &[0xcd; 20]).expect("an id");
+  let (content, noted) = holding(Kind::Commit, b"commit");
   let mut writer = RecordWriter::default();
-  writer.object(Kind::Commit, ContentId([2; 32]), b"commit");
-  let bytes = writer.finish(0, &[(1, 1, Some(head))]);
+  writer.object(noted);
+  let bytes = writer
+    .finish(&content, |_| true, (0, &[(1, 1, Some(head))]))
+    .expect("written");
   for cut in 0..bytes.len() {
     let read = Record::decode(bytes.get(..cut).expect("a prefix"), FORMAT);
     assert!(read.is_err(), "a record cut at {cut} was read");
@@ -226,6 +293,9 @@ fn assert_hostile_marks(bytes: &[u8]) {
 // ---------------------------------------------------------------------------------------------------------------------
 // The store, live and replayed.
 
+/// One ref's planned move: its key and its new head, none to delete it.
+type Planned = (u64, Option<ObjectId>);
+
 /// A store as a shard holds it, with the records its pushes made, in order, and what the test knows of it.
 struct Live {
   content: ContentStore,
@@ -236,6 +306,17 @@ struct Live {
   /// Each ref's green's version, by its key: what its moves name.
   greens: BTreeMap<u64, u64>,
   /// Every blob a push brought, to send one again.
+  blobs: Vec<Brought>,
+}
+
+/// A push admitted and not yet committed, as a sealed push waits for its appends: its quarantine and its record's
+/// writer, the moves it plans, whether it commits them a ref at a time from the one push (a push without `atomic`, each
+/// ref its own append), and its blobs.
+struct Pending {
+  push: Push,
+  writer: RecordWriter,
+  moves: Vec<Planned>,
+  split: bool,
   blobs: Vec<Brought>,
 }
 
@@ -251,17 +332,79 @@ impl Live {
     }
   }
 
-  /// The live path a push takes (`super::GitPush`, `super::commit`): its objects admitted in order, the push sealed,
-  /// its moves admitted, its record made, and its commit. The record.
-  fn push(&mut self, objects: &[Brought], moves: &[RecordedMove], depth: u64) -> Result<(), GitRefused> {
+  /// Admits `objects` at `depth` as the live path does (`super::GitPush::admit_all`), for `moves` to commit later.
+  fn begin(
+    &mut self,
+    objects: &[Brought],
+    depth: u64,
+    (moves, split): (Vec<Planned>, bool),
+  ) -> Result<Pending, GitRefused> {
     let mut push = Push::new(FORMAT);
-    let mut record = RecordWriter::default();
-    let pushed = self.push_held(&mut push, &mut record, (objects, moves), depth);
-    let deepest = push.deepest();
-    let given = push.abandon(&mut self.content);
-    pushed?;
-    given.map_err(|refused| GitRefused::Object(PushRefused::Content(refused)))?;
-    self.records.push(record.finish(deepest, moves));
+    let mut writer = RecordWriter::default();
+    for brought in objects {
+      let arriving = incoming(brought, depth);
+      admit_object(&mut self.content, &self.store, (&mut push, &mut writer), arriving)?;
+    }
+    let blobs = objects
+      .iter()
+      .filter(|(kind, ..)| *kind == Kind::Blob)
+      .cloned()
+      .collect();
+    Ok(Pending {
+      push,
+      writer,
+      moves,
+      split,
+      blobs,
+    })
+  }
+
+  /// Commits `pending` as the live path appends it (`super::SealedPush`, `super::commit`): its moves at once, or a ref
+  /// at a time from the one push, each commit's record written as it commits and each move's version read off the refs
+  /// then.
+  fn commit(&mut self, mut pending: Pending) -> Result<(), GitRefused> {
+    let parts: Vec<Vec<Planned>> = if pending.split {
+      pending.moves.iter().map(|movement| vec![*movement]).collect()
+    } else {
+      vec![pending.moves.clone()]
+    };
+    for part in &parts {
+      let moves = self.versioned(part);
+      self.commit_part(&mut pending, &moves)?;
+      self.moved(&moves);
+    }
+    pending
+      .push
+      .abandon(&mut self.content)
+      .map_err(|refused| GitRefused::Object(PushRefused::Content(refused)))?;
+    self.blobs.extend(pending.blobs);
+    Ok(())
+  }
+
+  /// One append's commit of `moves`: admitted against the store as it is now, its record written, committed.
+  fn commit_part(&mut self, pending: &mut Pending, moves: &[RecordedMove]) -> Result<(), GitRefused> {
+    let admitted = seal_moves(&self.content, &self.store, &mut pending.push, moves)?;
+    let deepest = pending.push.deepest();
+    let record = record_of(&self.content, &self.store, (&pending.writer, deepest), moves)?;
+    commit_moves(&mut self.content, &mut self.store, &mut pending.push, (&admitted, moves))?;
+    pending.writer = RecordWriter::default();
+    self.records.push(record);
+    Ok(())
+  }
+
+  /// `moves` with each ref's green's version once moved: the next for a new head, its own for a delete.
+  fn versioned(&self, moves: &[Planned]) -> Vec<RecordedMove> {
+    moves
+      .iter()
+      .map(|(key, head)| {
+        let now = self.greens.get(key).copied().unwrap_or(0);
+        (*key, if head.is_some() { now + 1 } else { now }, *head)
+      })
+      .collect()
+  }
+
+  /// The refs and their greens' versions once `moves` committed.
+  fn moved(&mut self, moves: &[RecordedMove]) {
     for (key, version, head) in moves {
       self.greens.insert(*key, *version);
       match head {
@@ -269,24 +412,12 @@ impl Live {
         None => self.heads.remove(key),
       };
     }
-    for brought in objects.iter().filter(|(kind, ..)| *kind == Kind::Blob) {
-      self.blobs.push(brought.clone());
-    }
-    Ok(())
   }
 
-  fn push_held(
-    &mut self,
-    push: &mut Push,
-    record: &mut RecordWriter,
-    (objects, moves): (&[Brought], &[RecordedMove]),
-    depth: u64,
-  ) -> Result<(), GitRefused> {
-    for brought in objects {
-      admit_object(&mut self.content, &self.store, (&mut *push, &mut *record), incoming(brought, depth))?;
-    }
-    let admitted = seal_moves(&self.content, &self.store, push, moves)?;
-    commit_moves(&mut self.content, &mut self.store, push, (&admitted, moves)).map(drop)
+  /// A push admitted and committed at once.
+  fn push(&mut self, objects: &[Brought], moves: Vec<Planned>, depth: u64) -> Result<(), GitRefused> {
+    let pending = self.begin(objects, depth, (moves, false))?;
+    self.commit(pending)
   }
 
   /// The store made again from the records alone, as a recovery makes it.
@@ -334,29 +465,7 @@ fn facts(content: &ContentStore, store: &GitStore, greens: &[u64]) -> Facts {
   }
   let refs = greens
     .iter()
-    .map(|green| {
-      let versions = (0..store.repository.versions(*green))
-        .map(|at| {
-          let version = u64::try_from(at).expect("a version");
-          let value = store
-            .derivations
-            .value(content, &store.reach, &store.repository, (*green, version))
-            .ok()
-            .flatten();
-          (
-            store.repository.brought(*green, at).cloned(),
-            store.repository.head(content, *green, at),
-            store.repository.tree(content, *green, at),
-            value,
-          )
-        })
-        .collect();
-      (
-        versions,
-        store.repository.reached(*green).cloned(),
-        store.versions(*green).to_vec(),
-      )
-    })
+    .map(|green| ref_facts(content, store, *green))
     .collect();
   let mut contents: Vec<(ContentId, u64)> = content
     .identities()
@@ -371,6 +480,31 @@ fn facts(content: &ContentStore, store: &GitStore, greens: &[u64]) -> Facts {
   }
 }
 
+/// [`RefFacts`] of the ref keyed `green`.
+fn ref_facts(content: &ContentStore, store: &GitStore, green: u64) -> RefFacts {
+  let versions = (0..store.repository.versions(green))
+    .map(|at| {
+      let version = u64::try_from(at).expect("a version");
+      let value = store
+        .derivations
+        .value(content, &store.reach, &store.repository, (green, version))
+        .ok()
+        .flatten();
+      (
+        store.repository.brought(green, at).cloned(),
+        store.repository.head(content, green, at),
+        store.repository.tree(content, green, at),
+        value,
+      )
+    })
+    .collect();
+  (
+    versions,
+    store.repository.reached(green).cloned(),
+    store.versions(green).to_vec(),
+  )
+}
+
 impl Live {
   fn facts(&self) -> Facts {
     let greens: Vec<u64> = (0..GREENS).collect();
@@ -379,10 +513,10 @@ impl Live {
 }
 
 /// One generated push (the oracle's docs): which ref it moves, what it does (`act`), the ref it reads, the files of its
-/// new tree, whether it sends a blob the repository holds again, and one byte more ([`Extra`]).
-type Step = (u8, u8, u8, Vec<(u8, Vec<u8>)>, bool, u8);
+/// new tree, whether it sends a blob again, one byte more ([`Extra`]) and its order ([`Order`]).
+type Step = (u8, u8, u8, Vec<(u8, Vec<u8>)>, bool, u8, u8);
 
-/// A step's last byte read as three choices: its objects reversed (bit 0), the delta depth its pack carried (bits 1 and
+/// A step's sixth byte read as three choices: its objects reversed (bit 0), the delta depth its pack carried (bits 1 and
 /// 2), and the store recovered after it (the bits above, one value in three).
 struct Extra {
   reversed: bool,
@@ -400,6 +534,22 @@ impl Extra {
   }
 }
 
+/// A step's last byte read as its order: a push moving two refs committed a ref at a time from its one push (bit 0, a
+/// push without `atomic`), and its commit held back until the next step's push has committed (bit 1, a hook's wait).
+struct Order {
+  split: bool,
+  defer: bool,
+}
+
+impl Order {
+  fn of(byte: u8) -> Order {
+    Order {
+      split: byte & 1 == 1,
+      defer: byte & 2 == 2,
+    }
+  }
+}
+
 /// What a generated history did, for the census.
 #[derive(Debug, Default)]
 struct Census {
@@ -410,11 +560,21 @@ struct Census {
   deletes: u64,
   atomic: u64,
   resent: u64,
+  split: u64,
+  deferred: u64,
+  shared: u64,
   recoveries: u64,
 }
 
-/// The push one step makes against `live` at `date`: its objects and its moves; counted in `census`.
-fn planned(live: &Live, step: &Step, date: u64, census: &mut Census) -> (Vec<Brought>, Vec<RecordedMove>) {
+/// The push one step makes against `live` at `date`: its objects and its moves; counted in `census`. A step that sends a
+/// blob again sends one the push `held` back holds and the repository lacks when there is one, so this push commits it
+/// first; else one the repository holds.
+fn planned(
+  live: &Live,
+  (step, held): (&Step, Option<&Pending>),
+  date: u64,
+  census: &mut Census,
+) -> (Vec<Brought>, Vec<Planned>) {
   let (target, act, other, files, resend, ..) = step;
   let target = u64::from(*target) % GREENS;
   let other = (target + 1 + u64::from(*other) % (GREENS - 1)) % GREENS;
@@ -424,83 +584,164 @@ fn planned(live: &Live, step: &Step, date: u64, census: &mut Census) -> (Vec<Bro
     .collect();
   let mine = live.heads.get(&target).copied();
   let theirs = live.heads.get(&other).copied();
-  let next = |key: u64| live.greens.get(&key).copied().unwrap_or(0) + 1;
-  let kept = |key: u64| live.greens.get(&key).copied().unwrap_or(0);
   let (mut objects, moves) = match (act % 6, mine, theirs) {
     (3, _, Some(theirs)) => {
       census.moved_to_another += 1;
-      (Vec::new(), vec![(target, next(target), Some(theirs))])
+      (Vec::new(), vec![(target, Some(theirs))])
     }
     (4, Some(_), _) => {
       census.deletes += 1;
-      (Vec::new(), vec![(target, kept(target), None)])
+      (Vec::new(), vec![(target, None)])
     }
     (2, _, Some(theirs)) => {
       census.branched += 1;
       let (objects, id) = commit_of(&files, &[theirs], date);
-      (objects, vec![(target, next(target), Some(id))])
+      (objects, vec![(target, Some(id))])
     }
     (1, Some(mine), _) => {
       census.atomic += 1;
       let (objects, id) = commit_of(&files, &[mine], date);
-      (
-        objects,
-        vec![
-          (target, next(target), Some(id)),
-          (other, next(other), Some(id)),
-        ],
-      )
+      (objects, vec![(target, Some(id)), (other, Some(id))])
     }
     (_, Some(mine), _) => {
       census.fast_forwards += 1;
       let (objects, id) = commit_of(&files, &[mine], date);
-      (objects, vec![(target, next(target), Some(id))])
+      (objects, vec![(target, Some(id))])
     }
     _ => {
       census.roots += 1;
       let (objects, id) = commit_of(&files, &[], date);
-      (objects, vec![(target, next(target), Some(id))])
+      (objects, vec![(target, Some(id))])
     }
   };
-  if *resend && let Some(held) = live.blobs.first() {
-    census.resent += 1;
-    objects.insert(0, held.clone());
+  if *resend && let Some(again) = sent_again(live, held, census) {
+    objects.insert(0, again);
   }
   (objects, moves)
 }
 
-/// Runs `steps` against a reference store that is never recovered and a live one recovered after the steps that ask,
-/// comparing them whole after every recovery and at the end, and their records after every push.
-fn run_history(steps: &[Step]) -> Result<Census, TestCaseError> {
-  let mut census = Census::default();
-  let mut reference = Live::new();
-  let mut live = Live::new();
-  for (index, step) in steps.iter().enumerate() {
-    let date = FIRST_DATE + u64::try_from(index).unwrap_or(0);
-    let (objects, moves) = planned(&reference, step, date, &mut census);
-    let extra = Extra::of(step.5);
-    let order: Vec<Brought> = if extra.reversed {
-      objects.iter().rev().cloned().collect()
+/// The blob a step sends again: one the push `held` back holds and the repository lacks (counted shared), else the
+/// first blob the repository holds (counted resent); none when neither has one.
+fn sent_again(live: &Live, held: Option<&Pending>, census: &mut Census) -> Option<Brought> {
+  let lacked = held.and_then(|pending| {
+    pending
+      .blobs
+      .iter()
+      .find(|(_, id, _)| live.store.repository.object(&live.content, id).is_none())
+  });
+  if let Some(blob) = lacked {
+    census.shared += 1;
+    return Some(blob.clone());
+  }
+  let blob = live.blobs.first()?;
+  census.resent += 1;
+  Some(blob.clone())
+}
+
+/// A failure of the oracle's own step, named.
+fn fail(why: impl std::fmt::Debug) -> TestCaseError {
+  TestCaseError::fail(format!("{why:?}"))
+}
+
+/// A generated history's two stores, taking the same pushes in the same order: a reference never recovered and a live
+/// one recovered after the steps that ask; the push a step held back, in both; and the census.
+struct History {
+  reference: Live,
+  live: Live,
+  held: Option<(Pending, Pending)>,
+  census: Census,
+}
+
+impl History {
+  /// Runs `steps`, comparing both stores' records after every step, and both whole after every recovery and at the end.
+  fn run(steps: &[Step]) -> Result<Census, TestCaseError> {
+    let mut history = History {
+      reference: Live::new(),
+      live: Live::new(),
+      held: None,
+      census: Census::default(),
+    };
+    for (index, step) in steps.iter().enumerate() {
+      history.step(step, FIRST_DATE + u64::try_from(index).unwrap_or(0))?;
+    }
+    history.end()
+  }
+
+  /// One step: its push planned against the reference and admitted to both stores, then committed now, or held back
+  /// until the next step's push has committed; then the live store recovered when the step asks.
+  fn step(&mut self, step: &Step, date: u64) -> Result<(), TestCaseError> {
+    let (extra, order) = (Extra::of(step.5), Order::of(step.6));
+    let begun = self.begin(step, date, &extra, &order)?;
+    if order.defer && self.held.is_none() {
+      self.census.deferred += 1;
+      self.held = Some(begun);
+      return Ok(());
+    }
+    self.commit(begun)?;
+    if let Some(held) = self.held.take() {
+      self.commit(held)?;
+    }
+    prop_assert_eq!(&self.live.records, &self.reference.records, "both stores record alike");
+    if extra.recover {
+      self.recover()?;
+    }
+    Ok(())
+  }
+
+  /// A step's push admitted to both stores.
+  fn begin(
+    &mut self,
+    step: &Step,
+    date: u64,
+    extra: &Extra,
+    order: &Order,
+  ) -> Result<(Pending, Pending), TestCaseError> {
+    let held = self.held.as_ref().map(|(held, _)| held);
+    let (objects, moves) = planned(&self.reference, (step, held), date, &mut self.census);
+    let objects: Vec<Brought> = if extra.reversed {
+      objects.into_iter().rev().collect()
     } else {
       objects
     };
-    prop_assert_eq!(reference.push(&order, &moves, extra.depth), Ok(()));
-    prop_assert_eq!(live.push(&order, &moves, extra.depth), Ok(()));
-    prop_assert_eq!(&live.records, &reference.records, "the recovered store records alike");
-    if extra.recover {
-      census.recoveries += 1;
-      live = live
-        .recovered()
-        .map_err(|why| TestCaseError::fail(format!("not recovered: {why:?}")))?;
-      prop_assert_eq!(live.facts(), reference.facts());
-    }
+    let split = order.split && moves.len() > 1;
+    self.census.split += u64::from(split);
+    let theirs = self
+      .reference
+      .begin(&objects, extra.depth, (moves.clone(), split))
+      .map_err(fail)?;
+    let ours = self
+      .live
+      .begin(&objects, extra.depth, (moves, split))
+      .map_err(fail)?;
+    Ok((theirs, ours))
   }
-  let recovered = live
-    .recovered()
-    .map_err(|why| TestCaseError::fail(format!("not recovered: {why:?}")))?;
-  prop_assert_eq!(recovered.facts(), reference.facts());
-  prop_assert_eq!(live.facts(), reference.facts());
-  Ok(census)
+
+  /// A push committed to both stores.
+  fn commit(&mut self, (theirs, ours): (Pending, Pending)) -> Result<(), TestCaseError> {
+    self.reference.commit(theirs).map_err(fail)?;
+    self.live.commit(ours).map_err(fail)
+  }
+
+  /// The live store made again from its records alone, equal whole to the reference.
+  fn recover(&mut self) -> Result<(), TestCaseError> {
+    self.census.recoveries += 1;
+    self.live = self.live.recovered().map_err(fail)?;
+    prop_assert_eq!(self.live.facts(), self.reference.facts());
+    Ok(())
+  }
+
+  /// The push still held back committed; both stores' records alike, and the live store, and one made again from its
+  /// records, equal whole to the reference.
+  fn end(mut self) -> Result<Census, TestCaseError> {
+    if let Some(held) = self.held.take() {
+      self.commit(held)?;
+    }
+    prop_assert_eq!(&self.live.records, &self.reference.records, "both stores record alike");
+    let recovered = self.live.recovered().map_err(fail)?;
+    prop_assert_eq!(recovered.facts(), self.reference.facts());
+    prop_assert_eq!(self.live.facts(), self.reference.facts());
+    Ok(self.census)
+  }
 }
 
 /// A generated step.
@@ -511,6 +752,7 @@ fn step() -> impl Strategy<Value = Step> {
     any::<u8>(),
     proptest::collection::vec((any::<u8>(), proptest::collection::vec(any::<u8>(), 0..200)), 1..4),
     any::<bool>(),
+    any::<u8>(),
     any::<u8>(),
   )
 }
@@ -525,58 +767,72 @@ proptest! {
   /// A-662 (§4.17.1 "Durability and residency": the store after a recovery equals the store before; guard then apply,
   /// as `crates/db/tests/model.rs` drops and recovers the database at random points). Do: run generated histories of
   /// pushes against three refs (commits on a head, roots, commits on another ref's head, a ref moved to another's head,
-  /// deletes, one commit moving two refs at once, blobs the repository holds sent again, objects in pack order and
-  /// reversed, packs of several depths), against a store never recovered and one made again from its records alone after
-  /// the steps that ask. Expect: every push accepted on both; both make the same records; after every recovery and at
-  /// the end the two stores are equal whole: every position's id and row, every ref's D(k), heads, trees, derived values
-  /// and reached set, and every content held with its holders.
+  /// deletes, one commit moving two refs at once or a ref at a time from one push, blobs the repository holds sent
+  /// again, pushes held back while the next commits, sharing a blob with it, objects in pack order and reversed, packs
+  /// of several depths), against a store never recovered and one made again from its records alone after the steps that
+  /// ask. Expect: every push accepted on both; both make the same records; after every recovery and at the end the two
+  /// stores are equal whole: every position's id and row, every ref's D(k), heads, trees, derived values, reached set
+  /// and its greens' versions, and every content held with its holders.
   #[test]
   fn t_a662_the_store_after_a_recovery_equals_the_store_before(
     steps in proptest::collection::vec(step(), 1..24),
   ) {
-    run_history(&steps)?;
+    History::run(&steps)?;
   }
 }
 
-/// A-662 (the oracle's non-vacuity census, over one fixed history). Do: run a history that makes every kind of push
-/// and recovers three times. Expect: the stores equal as the oracle checks, and every kind of push counted, so a dead
+/// A-662 (the oracle's non-vacuity census, over one fixed history). Do: run a history that makes every kind of push,
+/// commits a push moving two refs a ref at a time from a pack two deep, holds a push back while the next commits a blob
+/// it holds, and recovers three times. Expect: the stores equal as the oracle checks, and every kind counted, so a dead
 /// branch of the generator can never pass the oracle unseen.
 #[test]
 fn t_a662_a_fixed_history_makes_every_kind_of_push_and_recovers() {
   let files = |byte: u8| vec![(byte, vec![byte; 150]), (byte.wrapping_add(1), vec![byte; 7])];
-  // Each last byte (`Extra`): 9 reversed and recovered, 2 at depth 1, 8 recovered, 5 reversed at depth 2, 14 recovered
-  // at depth 3, 1 reversed.
+  // Each sixth byte (`Extra`): 9 reversed and recovered, 2 at depth 1, 8 recovered, 5 reversed at depth 2, 14
+  // recovered at depth 3, 1 reversed. Each last byte (`Order`): 1 a ref at a time, 2 held back.
   let steps: Vec<Step> = vec![
-    (0, 0, 0, files(1), false, 0),
-    (0, 0, 0, files(2), true, 9),
-    (1, 2, 1, files(3), false, 2),
-    (2, 3, 0, files(4), true, 8),
-    (0, 1, 0, files(5), false, 5),
-    (1, 4, 0, files(6), true, 14),
-    (1, 0, 0, files(7), false, 0),
-    (2, 2, 1, files(8), true, 1),
+    (0, 0, 0, files(1), false, 0, 0),
+    (0, 0, 0, files(2), true, 9, 0),
+    (1, 2, 1, files(3), false, 2, 0),
+    (2, 3, 0, files(4), true, 8, 0),
+    (0, 1, 0, files(5), false, 5, 1),
+    (1, 4, 0, files(6), true, 14, 0),
+    (1, 0, 0, files(7), false, 0, 2),
+    (2, 2, 1, files(8), true, 1, 0),
   ];
-  let census = run_history(&steps).expect("the history holds");
-  assert!(census.fast_forwards > 0, "{census:?}");
-  assert!(census.roots > 0, "{census:?}");
-  assert!(census.branched > 0, "{census:?}");
-  assert!(census.moved_to_another > 0, "{census:?}");
-  assert!(census.deletes > 0, "{census:?}");
-  assert!(census.atomic > 0, "{census:?}");
-  assert!(census.resent > 0, "{census:?}");
+  let census = History::run(&steps).expect("the history holds");
+  let kinds = [
+    ("fast-forwards", census.fast_forwards),
+    ("roots", census.roots),
+    ("branched", census.branched),
+    ("moved to another", census.moved_to_another),
+    ("deletes", census.deletes),
+    ("atomic", census.atomic),
+    ("resent", census.resent),
+    ("a ref at a time", census.split),
+    ("held back", census.deferred),
+    ("shared", census.shared),
+  ];
+  let never: Vec<&str> = kinds
+    .iter()
+    .filter(|(_, count)| *count == 0)
+    .map(|(kind, _)| *kind)
+    .collect();
+  assert!(never.is_empty(), "never made: {never:?} in {census:?}");
   assert_eq!(census.recoveries, 3, "{census:?}");
-  assert!(census.roots > 0 && census.fast_forwards > 0, "{census:?}");
 }
 
 /// A-662 (guard then apply: a replay refuses what is not what its record names, and leaves nothing). Do: replay a
-/// record whose object's bytes were changed, one whose first object the store holds already (a record the live
-/// admission would not have made), and one whose head names a commit nobody sent. Expect: refused `Identity`,
-/// `Diverged` and the store's `Missing` in turn, and each refused replay leaves the store as it was.
+/// record whose object's bytes were changed, one whose objects the store holds already (a record the live admission
+/// would not have made), and one whose head names a commit nobody sent. Expect: refused `Identity`, `Diverged` and the
+/// store's `Missing` in turn, and each refused replay leaves the store as it was.
 #[test]
 fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   let mut live = Live::new();
   let (objects, head) = commit_of(&[(b"a".to_vec(), b"bytes".to_vec())], &[], FIRST_DATE);
-  live.push(&objects, &[(0, 1, Some(head))], 0).expect("pushed");
+  live
+    .push(&objects, vec![(0, Some(head))], 0)
+    .expect("pushed");
   let before = live.facts();
   let record = live.records.first().expect("a record").clone();
   let mut changed = record.clone();
@@ -595,7 +851,9 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   ));
   assert_eq!(store.facts(), before);
   let nobody = ObjectId::from_bytes(FORMAT, &[0x5a; 20]).expect("an id");
-  let missing = RecordWriter::default().finish(0, &[(1, 1, Some(nobody))]);
+  let missing = RecordWriter::default()
+    .finish(&store.content, |_| true, (0, &[(1, 1, Some(nobody))]))
+    .expect("written");
   assert!(matches!(
     replay_git(&mut store.content, &mut store.store, &missing),
     Err(ReplayRefused::Git(GitRefused::Store(_)))
@@ -673,8 +931,9 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
   });
 }
 
-/// A-662 (the wire's words for a store's refusal). Do: map a store's budget refusal and a moved green. Expect:
-/// `BudgetExceeded` with the room the budget had, then `ContentUnavailable`, counted.
+/// A-662 (the wire's words for a store's refusal). Do: map a store's budget refusal, a record whose room the allocator
+/// refused, and a moved green. Expect: `BudgetExceeded` with the room the budget had, then with what the shard could
+/// admit now, then `ContentUnavailable`, counted.
 #[test]
 fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
   crate::daemon::audit_on_shard(|state| {
@@ -686,18 +945,36 @@ fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
       super::refusal_of(state, &budget),
       Refusal::BudgetExceeded { available: 3 }
     );
+    let available = state.store.admittable();
+    assert_eq!(
+      super::refusal_of(state, &GitRefused::Allocation),
+      Refusal::BudgetExceeded { available }
+    );
     let moved = GitRefused::Store(StoreRefused::Moved { green: 1 });
     assert_eq!(super::refusal_of(state, &moved), Refusal::ContentUnavailable);
     assert_eq!(state.refusals.get(super::COMMIT_REFUSED).copied(), Some(1));
   });
 }
 
-/// A push begun on the shard with `objects` admitted.
-fn begun(state: &mut ShardState, repository: RepositoryId, objects: &[Brought]) -> GitPush {
+/// A push begun on the shard with `objects` admitted at `depth`.
+fn begun_at(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  objects: &[Brought],
+  depth: u64,
+) -> GitPush {
   let mut push = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
-  let arriving: Vec<Incoming<'_>> = objects.iter().map(|brought| incoming(brought, 0)).collect();
+  let arriving: Vec<Incoming<'_>> = objects
+    .iter()
+    .map(|brought| incoming(brought, depth))
+    .collect();
   push.admit_all(state, &arriving).expect("admitted");
   push
+}
+
+/// A push begun on the shard with `objects` admitted whole.
+fn begun(state: &mut ShardState, repository: RepositoryId, objects: &[Brought]) -> GitPush {
+  begun_at(state, repository, objects, 0)
 }
 
 /// A-618's work for `push` on `green`, from `base` (a version and its tree) to `head`'s tree, read through A-638's view.
@@ -730,7 +1007,7 @@ fn appended(
   repository: RepositoryId,
   changes: Vec<BranchChange>,
   sealed: (&mut super::SealedPush, &[StoreMove]),
-) -> Result<crate::repository::push::Appended, crate::repository::push::AppendRefused> {
+) -> Result<Appended, crate::repository::push::AppendRefused> {
   crate::repository::push::push_sealed(state, (&owner(), repository), changes, EntryParts::default(), sealed)
 }
 
@@ -755,6 +1032,126 @@ fn push_through(
     Some(BranchAppended::Moved { version, .. }) => *version,
     other => panic!("not moved: {other:?}"),
   }
+}
+
+/// The root tree a commit's content names.
+fn tree_of(objects: &[Brought]) -> ObjectId {
+  objects
+    .iter()
+    .find(|(kind, ..)| *kind == Kind::Tree)
+    .map(|(_, id, _)| *id)
+    .expect("a tree")
+}
+
+/// Branch `topic` made at `version` of `from`, with no work of its own.
+fn topic_at(from: DbVolumeId, version: u64) -> Vec<BranchChange> {
+  vec![BranchChange::Create {
+    name: "topic".to_owned(),
+    from,
+    version,
+    work: None,
+  }]
+}
+
+/// `topic`'s store move to `head`, named by its branch until its append makes its green.
+fn topic_move(head: ObjectId) -> [StoreMove; 1] {
+  [(Target::Created("topic".to_owned()), Some(head))]
+}
+
+/// The green an append made for its new branch.
+fn created_green(made: &Appended) -> DbVolumeId {
+  match made.changes.first() {
+    Some(BranchAppended::Created { green, .. }) => *green,
+    other => panic!("not created: {other:?}"),
+  }
+}
+
+/// `repository`'s records, in the order its register received them.
+fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u8>> {
+  state
+    .db
+    .partition()
+    .repositories()
+    .objects(repository)
+    .map(<[u8]>::to_vec)
+    .collect()
+}
+
+/// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one
+/// whole over the refs keyed `greens`, every record replayed and none refused.
+fn assert_made_again_whole(state: &mut ShardState, repository: RepositoryId, greens: &[u64]) {
+  let live = {
+    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
+    facts(content, store, greens)
+  };
+  let count = u64::try_from(records(state, repository).len()).expect("a count");
+  let replayed = state.refusals.get(super::REPLAYED).copied().unwrap_or(0);
+  super::rebuild(state, repository);
+  assert_eq!(state.vcs_stores.unrecovered(repository), None);
+  let made = {
+    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store made again");
+    facts(content, store, greens)
+  };
+  assert_eq!(made, live);
+  assert_eq!(state.refusals.get(super::REPLAYED).copied(), Some(replayed + count));
+}
+
+/// A-662 (a push without `atomic`, a ref at a time from one sealed push, as `repository::push` appends each). Do: admit
+/// a commit's objects from a pack whose chains were two deep and seal the push; append its move of the default branch;
+/// then, from the same push, append `topic` made at that commit; make the store again from the log. Expect: the second
+/// record holds the push's deepest chain and its move alone, the first append having committed every object; the store
+/// made again equal whole, both records replayed and none refused.
+#[test]
+fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
+  crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "split", VcsTool::Git);
+    let files = [(b"README".to_vec(), b"one\n".to_vec())];
+    let (objects, one) = commit_of(&files, &[], FIRST_DATE);
+    let push = begun_at(state, repository, &objects, DEEP);
+    let work = work_of(state, (&push, root), (0, None), (one, tree_of(&objects)));
+    let mut sealed = push.seal(state).expect("sealed");
+    let main = vec![BranchChange::Update { green: root, work }];
+    let moves = [(Target::Green(root), Some(one))];
+    appended(state, repository, main, (&mut sealed, &moves)).expect("the default branch");
+    let made = appended(state, repository, topic_at(root, 1), (&mut sealed, &topic_move(one)))
+      .expect("topic");
+    sealed.abandon(state);
+    let last = records(state, repository).pop().expect("a record");
+    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.objects.len()));
+    assert_eq!(read, Ok((DEEP, 0)));
+    let greens = [green_key(root), green_key(created_green(&made))];
+    assert_made_again_whole(state, repository, &greens);
+  });
+}
+
+/// A-662 (two pushes in flight at once, as a hook's wait allows: one commits what the other holds). Do: admit one
+/// commit's objects into two pushes and seal both; append the first, moving the default branch; then the second,
+/// making `topic` at that commit; make the store again from the log. Expect: the second record holds no object, the
+/// first's commit having given every one its position; the store made again equal whole, both records replayed.
+#[test]
+fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
+  crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "twice", VcsTool::Git);
+    let files = [(b"README".to_vec(), b"one\n".to_vec())];
+    let (objects, one) = commit_of(&files, &[], FIRST_DATE);
+    let first = begun(state, repository, &objects);
+    let second = begun(state, repository, &objects);
+    let work = work_of(state, (&first, root), (0, None), (one, tree_of(&objects)));
+    let mut first = first.seal(state).expect("sealed");
+    let mut second = second.seal(state).expect("sealed");
+    let main = vec![BranchChange::Update { green: root, work }];
+    let moves = [(Target::Green(root), Some(one))];
+    appended(state, repository, main, (&mut first, &moves)).expect("the first");
+    first.abandon(state);
+    let made = appended(state, repository, topic_at(root, 1), (&mut second, &topic_move(one)))
+      .expect("the second");
+    second.abandon(state);
+    let last = records(state, repository).pop().expect("a record");
+    let read = Record::decode(&last, FORMAT).map(|record| record.objects.len());
+    assert_eq!(read, Ok(0));
+    let greens = [green_key(root), green_key(created_green(&made))];
+    assert_made_again_whole(state, repository, &greens);
+  });
 }
 
 /// A-662 (a push without `atomic`: each ref its own append, the push kept whole by its caller). Do: push a first commit;
@@ -782,35 +1179,19 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
     let changes = vec![BranchChange::Update { green: root, work: stale }];
     assert!(appended(state, repository, changes, (&mut sealed, &moves)).is_err());
     assert_eq!(state.vcs_stores.content().map(ContentStore::used), held);
-    assert_eq!(state.db.partition().repositories().objects(repository).count(), 1);
+    assert_eq!(records(state, repository).len(), 1);
     let changes = vec![BranchChange::Update { green: root, work: fresh }];
     let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
     assert!(matches!(made.changes.first(), Some(BranchAppended::Moved { version: 2, .. })));
     sealed.abandon(state);
-    let records: Vec<Vec<u8>> = state
-      .db
-      .partition()
-      .repositories()
-      .objects(repository)
-      .map(<[u8]>::to_vec)
-      .collect();
-    let last = records.last().expect("a record");
-    let read = Record::decode(last, FORMAT).expect("a record");
+    let last = records(state, repository).pop().expect("a record");
+    let read = Record::decode(&last, FORMAT).expect("a record");
     assert_eq!(read.objects.len(), second.len());
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     let key = green_key(root);
     let newest = store.repository.versions(key).checked_sub(1).expect("a version");
     assert_eq!(store.repository.head(content, key, newest), Some(two));
   });
-}
-
-/// The root tree a commit's content names.
-fn tree_of(objects: &[Brought]) -> ObjectId {
-  objects
-    .iter()
-    .find(|(kind, ..)| *kind == Kind::Tree)
-    .map(|(_, id, _)| *id)
-    .expect("a tree")
 }
 
 /// A-662 (§4.17.1 "Durability and residency" over the owner shard; A-635's append). Do: create a git repository; admit
@@ -849,23 +1230,12 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
       2
     );
     assert_recorded_and_charged(state, repository, root, (first.len(), second.len()));
-    let greens = [green_key(root)];
+    let key = green_key(root);
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
-    assert_eq!(store.version_of(content, greens[0], &one), Some((1, first_tree)));
-    assert_eq!(store.version_of(content, greens[0], &two), Some((2, second_tree)));
-    assert_eq!(store.versions(greens[0]), &[1, 2]);
-    let live = {
-      let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
-      facts(content, store, &greens)
-    };
-    let replayed = state.refusals.get(super::REPLAYED).copied().unwrap_or(0);
-    super::rebuild(state, repository);
-    let made = {
-      let (content, store) = state.vcs_stores.git_ref(repository).expect("the store made again");
-      facts(content, store, &greens)
-    };
-    assert_eq!(made, live);
-    assert_eq!(state.refusals.get(super::REPLAYED).copied(), Some(replayed + 2));
+    assert_eq!(store.version_of(content, key, &one), Some((1, first_tree)));
+    assert_eq!(store.version_of(content, key, &two), Some((2, second_tree)));
+    assert_eq!(store.versions(key), &[1, 2]);
+    assert_made_again_whole(state, repository, &[key]);
     super::free(state, repository);
     assert_eq!(state.vcs_stores.charged(), 0);
     assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
@@ -880,13 +1250,7 @@ fn assert_recorded_and_charged(
   root: DbVolumeId,
   (first, second): (usize, usize),
 ) {
-  let records: Vec<Vec<u8>> = state
-    .db
-    .partition()
-    .repositories()
-    .objects(repository)
-    .map(<[u8]>::to_vec)
-    .collect();
+  let records = records(state, repository);
   let read: Vec<Record<'_>> = records
     .iter()
     .map(|bytes| Record::decode(bytes, FORMAT).expect("a record"))
@@ -924,8 +1288,8 @@ fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
       version: 1,
       work: Some(work),
     }];
-    let moves = [(Target::Created("topic".to_owned()), Some(head))];
-    let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
+    let made = appended(state, repository, changes, (&mut sealed, &topic_move(head)))
+      .expect("appended");
     sealed.abandon(state);
     let Some(BranchAppended::Created { green, version: 1 }) = made.changes.first().cloned() else {
       panic!("not created: {made:?}");
@@ -934,14 +1298,7 @@ fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     assert_eq!(store.versions(key), &[1]);
     assert_eq!(store.repository.head(content, key, 0), Some(head));
-    let last = state
-      .db
-      .partition()
-      .repositories()
-      .objects(repository)
-      .last()
-      .map(<[u8]>::to_vec)
-      .expect("a record");
+    let last = records(state, repository).pop().expect("a record");
     let read = Record::decode(&last, FORMAT).expect("a record");
     assert_eq!(read.moves, vec![(key, 1, Some(head))]);
   });

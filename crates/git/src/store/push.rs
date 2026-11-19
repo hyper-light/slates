@@ -211,8 +211,9 @@ impl Push {
     self.sealed
   }
 
-  /// The kind, root content and length of the object held under `id`.
-  pub(crate) fn object(&self, id: &ObjectId) -> Option<(u8, slates_vcs::ContentId, u64)> {
+  /// The kind, root content and length of the object held under `id`: what a push's record names an object by, its
+  /// bytes read back from its root when the record is written (A-662, `slates-server`'s `vcs_store::record`).
+  pub fn object(&self, id: &ObjectId) -> Option<(u8, slates_vcs::ContentId, u64)> {
     self.quarantine.object(id.as_bytes())
   }
 
