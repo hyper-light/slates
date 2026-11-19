@@ -2515,6 +2515,14 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > unmounts it, so no write by path reaches the disk beneath. The restart after a crash likewise ends a dead mount's
 > record and leaves the mount for its user (`leave_stale`, counted `fuse.dead_mount_left`); that path runs only on
 > kernels before Linux 6.9, since later ones keep the mount through the anchor's held device (A-61).
+>
+> **Status (2026-11-18, A-509: a kept mount of a volume recovery could not rebuild).** Such a mount is served again
+> like any kept mount, and its every request is answered `EIO` without reaching any volume (`fuse::refuse_unrecovered`,
+> counted `fuse.unrecovered_refused`; a `FORGET` by nothing). It stays its user's to release (A-102) and ends when the
+> kernel disconnects; the anchor keeps its device, so a later restart whose recovery rebuilds the volume serves it as
+> any kept mount. A mount of such a volume whose device was not held is left and its record ended, as any dead mount's.
+> Before, recovery passed the volume's attachments by: the held device was let go with the mount still in the kernel's
+> table, which answered `ENOTCONN` until someone unmounted it by hand.
 
 > **Status (2026-10-01, AUD-29-77 in part: kept copies charged; protection named).** A guest device's copy
 > buffers are charged to its attachment for as long as it keeps them: growth is charged and reserved exactly,
@@ -33125,3 +33133,34 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 Applied in the same change to: §4.8 "Lookup" (the owner location status) and learners, A-489's owed item, GAPS (the
 location test's entry), `crates/server/src/{owner_location,fleet,verbs}.rs`, and the bug record
 `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
+
+### A-509 — A kept FUSE mount of a volume recovery could not rebuild is served on, refusing every request `EIO`, until its user releases it (2026-11-18, goal 85, g079; §4.6 "Linux", §4.8 `NotRecovered`; A-61, A-102, A-304)
+Applied in the same change to: §4.6 "Linux" (a status under AUD-29-64's), GAPS (the not-recovered entry's open line),
+`crates/server/src/verbs.rs` (`keep_unrecovered_mounts`), `crates/server/src/fuse.rs` (`refuse_unrecovered`, the turn's
+not-recovered branch, `fuse.unrecovered_refused`, the failing test), `crates/bridge-fuse/src/channel.rs`
+(`refuse_unserved`), and the bug record
+`docs/bugs/2026-11-18-a-kept-fuse-mount-of-a-volume-recovery-could-not-rebuild-answered-enotconn-until-unmounted-by-hand.md`.
+- **What was there.** Recovery reconciles a rebuilt volume's attachments: a FUSE mount whose device the anchor held is
+  kept and served again (A-61), any other is left in place for its user and its record ended (A-102). A volume recovery
+  could not rebuild was left out of that reconciliation, so its held device was let go at the end of recovery with
+  the mount still in the kernel's table: every call answered `ENOTCONN`, nothing named why, and a later restart that
+  rebuilt the volume came back to no mount. Only an unmount by hand ended it.
+- **The decision.** Ending the mount cleanly so the kernel reports it gone is an unmount, which A-102 refuses: a mount
+  removed under a process exposes the directory beneath it, and a write by path then reaches the disk. A not-recovered
+  volume answers every verb `NotRecovered` with its cause (§4.8); at a FUSE mount the only word is an errno, and
+  `EIO` is the one a program reads as a store it cannot reach. So the kept mount is served on, every request answered
+  `EIO` without reaching any volume, a `FORGET` by nothing (its lookups taken off what the kernel holds), and the
+  takeover round a restored mount owes (A-158) is owed no more, since nothing of the volume is served. The mount ends
+  when the kernel disconnects (its user's unmount) or when the volume is destroyed (A-102's end). The anchor keeps the
+  device meanwhile, so a later restart whose recovery rebuilds the volume adopts the mount as any kept mount. A mount
+  whose device was not held is left in place and its record ended, as any dead mount's (`leave_stale`).
+- **Rejected.** Letting the device go with an unmount (A-102's hazard); serving `ENOTCONN` by hand (the same dead
+  mount, with no way back when the volume recovers); a per-cause errno (`ENOENT` for a missing base, `ENOMEM` for
+  resources): each would tell a program something about one file the volume as a whole refuses, while the cause is in
+  `volume list` (`not_recovered=<kind>`).
+- **Not changed.** Pages the kernel cached before the restart are still read without a request, as from any ended
+  mount (the revoked round's drop, AUD-29-84, is a consumer's revocation's).
+- **Tests.** `a_kept_mount_of_a_volume_recovery_could_not_rebuild_answers_each_request_eio` (`crates/server/src/fuse.rs`,
+  the server's unit tests on Linux: a mount over a socket pair standing in for `/dev/fuse`, of a volume the shard records
+  unrecovered; a `FORGET` and a `LOOKUP`): red without the turn's not-recovered branch on adacachy (both turns ended the
+  mount, no reply); green with it.

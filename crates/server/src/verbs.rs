@@ -15751,10 +15751,63 @@ async fn rebuild_records(
       rebuilt.orphans_reclaimed = rebuilt
         .orphans_reclaimed
         .saturating_add(settle_references(state, record));
+    } else {
+      rebuilt.attachments_dropped = rebuilt
+        .attachments_dropped
+        .saturating_add(keep_unrecovered_mounts(state, record));
     }
     slices.unit_done().await;
   }
   max_prefix
+}
+
+/// The FUSE mounts of a volume recovery could not rebuild (§4.8 `NotRecovered`; A-102; A-509): one whose device the
+/// anchor held, on a kernel that can resend what the dead daemon read, is kept and served again, every request refused
+/// `EIO` (`fuse::refuse_unrecovered`), so its user is told why and releases it, and a later restart whose recovery
+/// rebuilds the volume serves it as any kept mount; any other died with the process and is left in place as any dead
+/// mount is (`fuse::leave_stale`), its record ended. The volume's other attachments stay, as its record does. Returns
+/// the records ended. Before, recovery passed such a volume's attachments by: a held device was let go with its mount
+/// still in the kernel's table, which answered `ENOTCONN` until someone unmounted it by hand.
+fn keep_unrecovered_mounts(state: &mut ShardState, record: &VolumeRecord) -> usize {
+  let now = state.clock.monotonic_ns();
+  let mounts: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments_of(record.id)
+    .iter()
+    .filter(|a| a.form.fuse_mount_point().is_some())
+    .map(|a| (**a).clone())
+    .collect();
+  let mut ended: usize = 0;
+  for attachment in mounts {
+    #[cfg(target_os = "linux")]
+    if let Some(at) = state
+      .inherited_fuse
+      .iter()
+      .position(|held| held.attachment == attachment.id && held.adoptable())
+    {
+      let held = state.inherited_fuse.swap_remove(at);
+      state.adopt_fuse.push((attachment, held));
+      continue;
+    }
+    if let Some(point) = attachment.form.fuse_mount_point() {
+      state
+        .stale_fuse_mounts
+        .push((attachment.id, point.to_owned()));
+    }
+    if state
+      .db
+      .mutate(
+        &mut state.segment,
+        &Op::AttachmentRemoved { id: attachment.id },
+        now,
+      )
+      .is_ok()
+    {
+      ended = ended.saturating_add(1);
+    }
+  }
+  ended
 }
 
 /// Rebuilds one recorded volume by its role; false when a plain volume could not be (refused and logged, never

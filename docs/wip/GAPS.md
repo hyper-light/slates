@@ -2584,9 +2584,17 @@
 >   here); both red with the destroy path and `find_record`'s check taken out (diag-slabs-41, run 42506866717). On both
 >   Windows runners (run 42506866249) the WinFsp suite 16 of 17, its one failure A-254's second-daemon test (owned by
 >   conformance). Record: `docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.
-> - **Open, found here:** on Linux a kept FUSE mount of such a volume is let go but never unmounted (the stale-mount
->   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
->   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
+> - **Fixed 2026-11-18 (A-509, goal 85, g079): on Linux a kept FUSE mount of such a volume was let go but never
+>   unmounted, so it answered `ENOTCONN` until someone unmounted it by hand.** Recovery left the volume out of its
+>   reconciliation, so the device the anchor held was let go with the mount still in the kernel's table. Now the kept
+>   mount is served on and every request answered `EIO` (`fuse.unrecovered_refused`), until its user releases it
+>   (A-102) or the volume is destroyed; the anchor keeps its device, so a later restart that rebuilds the volume serves
+>   it again. A mount whose device was not held is left and its record ended, as any dead mount's. Held by
+>   `a_kept_mount_of_a_volume_recovery_could_not_rebuild_answers_each_request_eio` (the server's unit tests, Linux).
+>   Record: `docs/bugs/2026-11-18-a-kept-fuse-mount-of-a-volume-recovery-could-not-rebuild-answered-enotconn-until-
+>   unmounted-by-hand.md`. **Owed (main's):** the flow on a real Linux mount (a volume left unrecovered across a
+>   restart, `ls` through its kept mount answering `EIO`, the mount served again once a restart rebuilds it).
+> - **Open, found here:** the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
 
 > **Ubuntu 26.04 confines `fusermount3`, so a Linux `slates mount` reaches only some directories (found 2026-11-09,
 > slabs; a product limit, recorded for users in `docs/cli.md`).** Main's live-guest lane failed at its first `slates mount`
