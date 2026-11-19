@@ -87,8 +87,8 @@ Evidence, all on the Mac Studio on 2026-11-19:
 - **Fixed since by A-572 (2026-11-19), part 2:** a clone is admitted with no entry allowance. `admit_clone` sets the
   inode allowance only, where a create's admission (`admit_dimensions`) and a restart set both. The clone's namespace
   dimension is unbounded until a restart.
-- **Open:** a resize moves the inode allowance with the new policy (`resize`) but leaves the entry allowance at the size
-  the volume was made with.
+- **Fixed since by A-572 (2026-11-19), part 3:** a resize moves the inode allowance with the new policy (`resize`) but
+  leaves the entry allowance at the size the volume was made with.
 - **Fixed since by A-572 (2026-11-19, `2026-11-19-a-restart-counted-whiteouts-as-live-entries.md`), found by
   reading:** recovery counts a whiteout as a live entry. `rebuild_entries` re-inserts an
   image entry that names no child as `Child::Whiteout` through `dir_insert`, which counts it. The live count and

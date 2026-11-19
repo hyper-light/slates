@@ -12560,8 +12560,12 @@ and export by landing).
 > **Status (2026-11-19, A-542, its first half).** Built: node-exclusive operations in the merge engine
 > (`slates-merge`): `NODE_EXCLUSIVE`, the high bit of an operation's flags, and the verdict's pass that refuses a
 > node-exclusive path changed in any dimension after the base, a move's source among them (item 3, rules 1 and 2).
-> Owed, its second half: `Copy`, sharing the source by reference through the persistent radix tree of A-534
-> (`crates/merge/src/ptrie.rs`, its `subtree` and `graft`), with the copied keys' history beginning at the copy.
+> Its second half, `Copy`, part 1 (2026-11-19): Copy's maps. Every map of a green's state copies a path's tree by
+> reference (`crates/merge/src/dims/copy.rs`: the source's keys beneath it held as one subtree of A-534's radix tree
+> and grafted beneath the destination, its own key set to the source's value), O(the two paths' lengths) whatever the
+> tree holds, a copied file one more holder of its block, no walk (the arena's visited count does not move).
+> Owed, part 2: the engine's `Copy` operation, recorded by one entry for the destination's prefix in the histories, the
+> change index and `last_changed`, never a walk (the A-542 entry's plan).
 >
 > **Status (2026-11-19, A-553).** Built: the Subversion index (`slates-svn`'s `index`, piece 4, item 2): node rows with
 > FSFS's node, copy and copy-root identities, predecessors and counts, texts, property lists and mergeinfo counts;
@@ -12956,8 +12960,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 2. The ra_svn item codec (built, A-531): the resumable parser and the writer, with the protocol's examples as golden
    vectors and hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream
    cut anywhere).
-3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (owed, on A-534's
-   persistent radix tree: `graft` of the source's `subtree` at the destination; with §4.17.1's pieces 1 and 4).
+3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (its maps built,
+   A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation owed, with
+   §4.17.1's pieces 1 and 4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
@@ -36733,6 +36738,39 @@ A-500 status block's last sentence restored to it, which A-531's edit had moved)
   key to the destination and `graft` the source's `subtree` under it in each current-value map, O(path length) per
   map, and begin each copied key's history at the copy's version with its source recorded. Building a second
   persistent structure here was ruled out, and g261 built its tree so a prefix is one shared node.
+- **Copy, part 1: its maps (2026-11-19, g292; A-534 on main since f8ba01f61).** Applied to `crates/merge/src/dims.rs`
+  (the module's "A tree is copied by reference"; `escaped`, the attribute key's path bytes) and
+  `crates/merge/src/dims/copy.rs` with its tests (new). `Dim::copy_tree(from, to)` checks the destination by descents
+  alone (its own key, and a count taken and given back on the prefix beneath it), holds the source's keys beneath it as
+  one subtree, grafts them beneath the destination and sets the destination's own key to the source's value; `Files`
+  makes each copied file one more holder of its block; `Xattrs` copies a path's own attributes and its descendants'
+  as two prefixes, both held before either graft. Cost: two descents, two counts, the nodes of the destination's path
+  and the subtree's top node: O(the two paths' lengths), whatever the tree holds (a radix node's children start with
+  distinct bytes, so the top node's copy is bounded by the byte alphabet); no walk. Refused, nothing changed, onto a
+  present destination or one with a key beneath it (Subversion's copy needs its destination absent), and from or onto
+  the root, whose tree no one prefix names. The subtree is held before the graft, so a copy into its own subtree
+  (which FSFS allows, `tree.c` `copy_helper`) copies the source as it was. Tests: the cost against a tree of 1 and of
+  4,096 files (the arena's visited count unmoved, no block made, at most twice the destination path's nodes and two
+  more gained); the refusals; a copy beneath itself; and an oracle (generated puts, removals and copies, from and onto
+  any path and the root, forked at a generated step, on the file, mode and attribute maps, each equal after every step
+  to a reference that copies key by key, the originals unchanged by the fork's copies, every node and block freed at
+  the end; its census requires copies that grafted, copies into their own source, both refusals and forks). Evidence
+  (the Mac Studio, kiln, 2026-11-19 02:49 UTC, load 27, debug): red with both copies returning nothing, the four new
+  tests failed and the two older `dims` tests passed; green, `cargo test --locked -p slates-merge --lib dims::` 6 of
+  6 and the crate's whole `--lib` 26 of 26. Until part 2 calls them, the copies are reached only from tests, which the
+  module states as a dead-code expectation that fails once part 2 calls them.
+- **Copy, part 2, owed: the engine's operation.** `OpKind::Copy`, appended as wire value 16, its source in `src` as a
+  rename's is; applied by `copy_tree` in every map; judged node-exclusively (a destination present, or changed since the
+  base, conflicts). The one history rule (A-534) reads a key with no history as present since version 0, which a
+  grafted key is not, so the copy is recorded as one entry for the destination's prefix: an appearance record (the
+  prefix, the version, the source and its version), one change-index entry and one `last_changed` entry for the prefix;
+  a key's reader takes the latest appearance above it after its own last entry as its first value, and a key's first
+  change after an appearance records, at the appearance's version, the value it held. Found while reading the engine,
+  for part 2 to settle: the identity's set hash (A-202) folds each changed key's entry, and a graft brings a whole
+  subtree's entries under new names, so either the identity's next read pays the subtree once, or entries are hashed
+  relative to their nearest copy so a graft moves a subtree's sum in one step; a copied hard link's reverse map
+  (`links_to`) gains the copy's links, one per link, so a source holding hard links is either refused (Subversion has
+  none) or paid per link; and the root's copy (Subversion's copy of `/`) is not one prefix in the attribute map.
 - **Tests** (`node_exclusive_tests.rs`, a module of the engine). Seven cases, each running one work plain and
   node-exclusive against the same change since its base (§4.16 accepts the plain one, the flag refuses it): an
   identical overwrite, a disjoint one, a property change against a text change, an identical addition, a move whose
@@ -37222,7 +37260,7 @@ and:
   - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, fixed since).
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
   - A clone is admitted with no entry allowance (fixed since by A-572).
-  - A resize leaves the entry allowance at the size the volume was made with.
+  - A resize leaves the entry allowance at the size the volume was made with (fixed since by A-572).
   - Recovery counts a whiteout as a live entry (found by reading; fixed since by A-572).
 
 ### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
@@ -37988,6 +38026,20 @@ commit a part, in order of harm.
     none refused.
   - **Evidence.** On the Mac Studio, 2026-11-19: red first with the rule's lines taken out (`u64::MAX` against 4,104),
     green with them; `cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored (main's open-bug test).
+- **Part 3, a resize left the entry allowance at the size the volume was made with.**
+  - **What was there.** `resize` re-derived the inode allowance from the new policy, floored at the live count, but
+    never the entry allowance, which only a create and a restart set. A volume grown from 64 KiB to 1 MiB kept the
+    smaller share; one shrunk kept the larger.
+  - **The rule.** A resize moves the entry allowance with the new policy as it moves the inode allowance: the new
+    policy's share, never below the entries the volume holds. It reserves nothing, so it is set once the core has
+    accepted the new limit.
+  - **Tests.** `a_resize_moves_the_entry_allowance_with_the_policy_never_below_the_entries_held`
+    (`crates/server/src/verbs.rs`, the new `resize_admission_tests`). Resized up, a volume holding names past the smallest
+    policy's share gets the larger share. Resized down, it gets the smallest share floored at its entries, which a walk
+    of its namespace counts. None is refused.
+  - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (4,096 against 65,536 after the
+    resize up); green with the rule; `cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored, and
+    `resize_admission_tests` 1 of 1.
 
 ### A-521 — A volume exported to one client is a verb of the library, so a host that reaches slates only through it serves a pod's volume over its node's export (2026-11-19, g294, UI goal 88's kiln Kubernetes engine, kiln goal 28e73c34's part 01a1f124; §4.6 "Kubernetes publication without privilege", A-115, §4.12; `CONTRACT` = 50)
 Applied in the same change to: §4.6 (the Kubernetes publication's status: the export through the library), §4.12's

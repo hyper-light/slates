@@ -85,3 +85,44 @@ its snapshot's, so there was a count to floor an allowance at, but nothing set o
 
 Evidence: red first with the fix's lines taken out (`u64::MAX` against 4,104), green with them; `cargo test --locked -p
 slates-server --lib clone` 11 passed, 1 ignored (main's open-bug test of a live clone), on the Mac Studio, 2026-11-19.
+
+## 3. A resize left the entry allowance at the size the volume was made with
+
+### Description
+
+A resize moved a volume's inode allowance with its new policy but left its entry allowance at the share of the policy
+the volume was made with. A volume grown from 64 KiB to 1 MiB kept an entry allowance of 4,096 where its new policy's
+share is 65,536, so, by `dir_insert`'s admission, its 4,097th name was refused `NoSpace` far inside the quota it was
+resized to (read from the code, not run). A volume shrunk kept the larger allowance of its first size. Measured on the
+Mac Studio (2026-11-19), with the test alone on main: after the resize up, the allowance was 4,096 where 65,536 was
+owed.
+
+### Root cause
+
+`resize` (`crates/server/src/verbs.rs`) re-derives the inode allowance from the new policy (`inode_allowance`, floored at
+the live count) and sets it. It never re-derived the entry allowance, which only a create (`admit_dimensions`) and a
+restart set.
+
+### Impact
+
+- A grown volume refused names (`NoSpace`) at its old share; a shrunk one kept the larger share until a restart re-derived
+  it.
+- A restart re-derives it from the policy the catalog acknowledged, so the allowance also changed across a restart.
+
+### Exact edits
+
+- `crates/server/src/verbs.rs`, `resize`: after the inode allowance, the entry allowance. It is the new policy's share
+  (`entry_allowance(size)`), never below the entries the volume holds, as a create derives it and a restart floors it.
+  It reserves nothing, so it is set once the core has accepted the new limit. A refusal is counted as
+  `volume.allowance_refused` (there is none, since the floor is the count).
+- The lib test module `resize_admission_tests` is new, using `clone_admission_tests`' helpers, which are now visible to
+  it. Its test `a_resize_moves_the_entry_allowance_with_the_policy_never_below_the_entries_held` sets up a bounded
+  volume holding a file and names linked to it past the smallest policy's share:
+  - Resized up, its allowance must be the larger policy's share.
+  - Resized down, it must be the smallest policy's share floored at the entries it holds, which equals a walk of its
+    namespace.
+  - No allowance may be refused.
+
+Evidence: red first with the test alone on main (4,096 against 65,536 after the resize up), green with the change;
+`cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored, and `resize_admission_tests` 1 of 1, on the Mac
+Studio, 2026-11-19.

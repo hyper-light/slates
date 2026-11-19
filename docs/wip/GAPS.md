@@ -99,8 +99,12 @@
 > authorization file, and a learned estimator for every tunable. Built: `slates-svn`'s svndiff codec (versions 0 and
 > 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
 > `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
-> A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. Owed, in order: `Copy` in the
-> engine (on A-534's persistent radix tree); the commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. A-542's second half, part 1
+> (2026-11-19): Copy's maps, every map of a green's state copying a path's tree by reference on A-534's radix tree,
+> O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
+> Mac Studio, see A-542). Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and
+> `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the
+> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
 > mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.
@@ -8248,8 +8252,8 @@ entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-ent
   one without.
 - Fixed since by A-572 (below): a clone was admitted with no entry allowance (`admit_clone` set the inode allowance
   alone, where a create and a restart set both), so its namespace dimension was unbounded until a restart.
-- Open: a resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume
-  was made with (`verbs::resize`).
+- Fixed since by A-572 (below): a resize moved the inode allowance with the new policy but left the entry allowance at
+  the size the volume was made with (`verbs::resize`).
 - Fixed since by A-572 (below), found by reading: recovery counted a whiteout as a live entry (`rebuild_entries`
   re-inserted one through `dir_insert`, which counted it; the live count and `DirNode::live_len` never do), so a
   restarted overlay's entry count and its allowance's floor at the restart were raised by its whiteouts.
@@ -8275,7 +8279,9 @@ the recovery oracle and the server's recovery suite over a clone with a snapshot
   create and a restart set both), so its namespace dimension was unbounded until a restart. It now gets a create's
   share, never below the entries it holds, its snapshot's (A-549). Measured before on the Mac Studio: a clone of a
   snapshot holding 4,104 names (a 64 KiB origin's share of 4,096 and 8 past it) carried `u64::MAX`.
-- Open, next in this piece: a resize leaves the entry allowance at the size the volume was made with.
+- Fixed 2026-11-19: a resize left the entry allowance at the share of the size the volume was made with. It now moves
+  with the new policy as the inode allowance does, never below the entries held (`verbs::resize`). Measured before on
+  the Mac Studio: a volume grown from 64 KiB to 1 MiB kept 4,096 where 65,536 was owed.
 
 ## 8d. Phase 2 record (2026-09-05)
 

@@ -11917,6 +11917,11 @@ fn resize(
   // settle the byte reservation the same way.
   // Never refused: `new_allowance` is at least the live count, the setter's one refusal. Counted all the same.
   let allowed = slot.volume.set_inode_allowance(new_allowance);
+  // The entry allowance moves with the policy as the inode allowance does (§4.2), never below the entries the volume
+  // holds, as a create's admission derives it and a restart floors it. It reserves nothing. Before A-572 a resize left
+  // it at the share of the size the volume was made with.
+  let entries = entry_allowance(size).max(slot.volume.entry_usage().0);
+  let entries_allowed = slot.volume.set_entry_allowance(entries);
   slot.version_credit = settle_resized_credit(
     &mut state.store.versions,
     &slot.volume,
@@ -11935,6 +11940,7 @@ fn resize(
     }
   }
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, entries_allowed);
   let now = state.clock.monotonic_ns();
   if let Err(e) = state.db.mutate(
     &mut state.segment,
@@ -23544,7 +23550,7 @@ mod clone_admission_tests {
   /// Format: a file's mode.
   const FILE_MODE: u32 = 0o644;
 
-  fn owner() -> slates_db::catalog::Principal {
+  pub(super) fn owner() -> slates_db::catalog::Principal {
     slates_db::catalog::Principal::Uid {
       host: slates_db::register::HostId(0),
       uid: OWNER_UID,
@@ -23552,7 +23558,11 @@ mod clone_admission_tests {
   }
 
   /// Makes a volume named `name` of `size` for [`owner`]; its id.
-  fn made(state: &mut ShardState, name: &str, size: SizeClass) -> slates_ipc::protocol::VolumeId {
+  pub(super) fn made(
+    state: &mut ShardState,
+    name: &str,
+    size: SizeClass,
+  ) -> slates_ipc::protocol::VolumeId {
     let reply = dispatch(
       state,
       1,
@@ -23572,7 +23582,7 @@ mod clone_admission_tests {
   }
 
   /// Runs `change` on `volume`'s core with the shard's store.
-  fn on_core<T>(
+  pub(super) fn on_core<T>(
     state: &mut ShardState,
     volume: slates_ipc::protocol::VolumeId,
     change: impl FnOnce(&mut slates_vfs::Volume, &mut slates_vfs::volume::Store) -> T,
@@ -23880,5 +23890,96 @@ mod materialization_wait_tests {
       let_go_at_the_end,
       "the held verb is let go once its materialization ends"
     );
+  }
+}
+
+/// A-572: a resize moves a volume's entry allowance with its new policy, as it moves its inode allowance, never below the
+/// entries the volume holds.
+#[cfg(test)]
+mod resize_admission_tests {
+  use super::clone_admission_tests::{entries_of, link_names, made, on_core, owner};
+  use super::{
+    ReplyBody, RequestBody, ShardState, SizeClass, VOLUME_ALLOWANCE_REFUSED, dispatch,
+    entry_allowance,
+  };
+
+  /// Shape: the policies the volume is made with, resized up to and resized down to: their entry shares grow with their
+  /// quotas, and the smallest's is below the names the volume holds.
+  const MADE_BYTES: u64 = 1 << 16;
+  const LARGER_BYTES: u64 = 1 << 20;
+  const SMALLER_BYTES: u64 = 1 << 12;
+  /// Shape: the names past the smallest policy's share the volume holds.
+  const PAST_SMALLER: u64 = 8;
+  /// Format: a file's mode.
+  const FILE_MODE: u32 = 0o644;
+
+  /// Resizes `volume` to `size`, which must be accepted.
+  fn resized(state: &mut ShardState, volume: slates_ipc::protocol::VolumeId, size: SizeClass) {
+    let reply = dispatch(state, 1, &owner(), RequestBody::Resize { volume, size });
+    assert!(
+      matches!(reply, ReplyBody::Resized),
+      "the resize to {size:?} was accepted: {reply:?}"
+    );
+  }
+
+  /// A-572 (A-549's sweep). Do: make a bounded volume holding a file and names linked to it past the share of the
+  /// smallest policy below, resize it up to a larger policy, then down to the smallest. Expect its entry allowance to be
+  /// the larger policy's share after the resize up, and after the resize down the smallest's share floored at the
+  /// entries the volume holds, which a walk of its namespace counts; no allowance refused. Before A-572 a resize left the
+  /// entry allowance at the share of the policy the volume was made with.
+  #[test]
+  fn a_resize_moves_the_entry_allowance_with_the_policy_never_below_the_entries_held() {
+    let (up, down, refused) = crate::daemon::audit_on_shard(|state| {
+      let volume = made(state, "resized", SizeClass::Bounded { limit: MADE_BYTES });
+      let file = on_core(state, volume, |core, store| {
+        let root = core.root_inode(store).unwrap();
+        core.create_file_no(store, root, "f", FILE_MODE).unwrap()
+      });
+      let smaller = SizeClass::Bounded {
+        limit: SMALLER_BYTES,
+      };
+      link_names(
+        state,
+        volume,
+        file,
+        ("l", entry_allowance(smaller) + PAST_SMALLER),
+      );
+      let larger = SizeClass::Bounded {
+        limit: LARGER_BYTES,
+      };
+      resized(state, volume, larger);
+      let up = (entry_allowance(larger), entries_of(state, volume));
+      resized(state, volume, smaller);
+      let down = (entry_allowance(smaller), entries_of(state, volume));
+      let refused = state
+        .refusals
+        .get(VOLUME_ALLOWANCE_REFUSED)
+        .copied()
+        .unwrap_or(0);
+      (up, down, refused)
+    });
+    let (share, (walked, count, allowance)) = up;
+    assert_eq!(
+      count, walked,
+      "the count is the entries the namespace holds"
+    );
+    assert_eq!(
+      allowance, share,
+      "a resize up moves the entry allowance to the larger policy's share"
+    );
+    let (share, (walked, count, allowance)) = down;
+    assert_eq!(
+      count, walked,
+      "the count is still the entries the namespace holds"
+    );
+    assert!(
+      walked > share,
+      "the volume holds more names than the smaller policy's share: {walked} against {share}"
+    );
+    assert_eq!(
+      allowance, walked,
+      "a resize down floors the entry allowance at the entries the volume holds"
+    );
+    assert_eq!(refused, 0, "no allowance was refused");
   }
 }
