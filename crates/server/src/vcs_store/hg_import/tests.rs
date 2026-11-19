@@ -487,3 +487,29 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
     assert_eq!(count(state, LANDING_REFUSED), 1);
   });
 }
+
+/// Diagnostic (not for main): the landing's append refusal, printed.
+#[test]
+fn diag_a687_landing_refusal() {
+  crate::daemon::audit_on_shard(|state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    assert!(to_its_end(state, id).1.is_ok());
+    let (mut imported, room) = match state.vcs_stores.imports.remove(&id) {
+      Some(super::Importing {
+        stage: super::Stage::Done { imported, room },
+        ..
+      }) => (imported, room),
+      _ => panic!("not done"),
+    };
+    let entry = super::landing_entry(state, id, (&*imported, room));
+    let (owner, changes, parts, record) = entry.expect("entry");
+    let shown: Vec<String> = changes.iter().map(|change| match change {
+      crate::repository::push::BranchChange::Create { name, from, version, work } => format!("create {name} from {from:?} at {version} work {:?}", work.as_ref().map(|work| (work.base, work.post_state.len()))),
+      other => format!("{other:?}"),
+    }).collect();
+    let mut index = Some(core::mem::take(&mut imported.index));
+    let appended = crate::repository::push::push_imported(state, (&owner, id), changes, parts, (&mut index, record));
+    panic!("DIAG changes {shown:?} appended {appended:?}");
+  });
+}
