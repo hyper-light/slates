@@ -780,4 +780,4 @@ impl<'m> MarkerIndex<'m> {
 
 #[cfg(test)]
 #[path = "getbundle_tests.rs"]
-mod tests;
+pub(crate) mod tests;
