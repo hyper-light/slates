@@ -577,18 +577,22 @@ pub fn write_commit_info(
   post_commit_error: Option<&str>,
   out: &mut Vec<u8>,
 ) -> Result<(), ItemError> {
-  let optional = |text: Option<&str>| Value::List(text.map(|text| Value::String(text.as_bytes())).into_iter().collect());
   write(&Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]), out)?;
   write(&trivial_auth(), out)?;
   write(
     &Value::List(vec![
       Value::Number(revision),
-      optional(Some(date)),
-      optional(author),
-      optional(post_commit_error),
+      optional_string(Some(date)),
+      optional_string(author),
+      optional_string(post_commit_error),
     ]),
     out,
   )
+}
+
+/// An optional C string as `"(?c)"` writes it: a list of it, or an empty list.
+fn optional_string(text: Option<&str>) -> Value<'_> {
+  Value::List(text.map(|text| Value::String(text.as_bytes())).into_iter().collect())
 }
 
 /// `trivial_auth_request`: `( success ( ( ) 0: ) )`.
