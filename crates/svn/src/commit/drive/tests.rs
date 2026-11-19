@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use aws_lc_rs::digest::{SHA256, digest};
 
 use super::*;
-use crate::authz::{Authz, Bounds, Principal};
+use crate::authz;
 use crate::lock::{HeadView, LockRequest, LockTarget};
 use crate::ra_svn::{Bounds, Parsed, Parser};
 
@@ -1005,9 +1005,9 @@ fn errors_of(item: &Value<'_>) -> Option<Vec<(u64, String)>> {
 }
 
 /// Alice's rules under [`RULES`].
-fn alice_rules() -> crate::authz::PrincipalRules {
-  let authz = Authz::parse(RULES, None, Bounds::of(RULES, None)).unwrap();
-  authz.rules(b"repo", Principal::named(Some(b"alice")))
+fn alice_rules() -> authz::PrincipalRules {
+  let rules = authz::Authz::parse(RULES, None, authz::Bounds::of(RULES, None)).unwrap();
+  rules.rules(b"repo", authz::Principal::named(Some(b"alice")))
 }
 
 /// Runs one case over `replay` and checks it.
