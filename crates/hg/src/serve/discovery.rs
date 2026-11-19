@@ -24,7 +24,7 @@ const PAIR: u8 = b'-';
 const NEWLINE: u8 = b'\n';
 
 /// Format: `known`'s answer for a node the served view holds, and for one it does not.
-const KNOWN: [u8; 2] = [b'0', b'1'];
+const KNOWN: [u8; 2] = *b"01";
 
 /// Appends `heads`'s answer (`wireprotov1server.heads`): the served view's heads, newest first, as hexadecimal nodes
 /// joined by spaces, then a newline; an empty repository answers the null node, as 7.2's does.

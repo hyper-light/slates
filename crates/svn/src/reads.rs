@@ -31,13 +31,18 @@
 //!
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
-//! (`svn_repos_fs_get_mergeinfo2`) and `get-iprops` (`svn_repos_fs_get_inherited_props`). Owed with this piece:
-//! `get-file`, `get-dir`, `list`, `log` with merged revisions, `get-locations`, `get-location-segments`,
-//! `get-file-revs`, `get-deleted-rev`, `svn mergeinfo --show-revs`, and read access by the authorization rules (A-606):
-//! today every path is readable, as in an `anon-access = read` repository with no rules.
+//! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
+//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments` and `get-deleted-rev` (each its own
+//! module, `file`, `list`, `segments` and `deleted`). Owed with this piece: `log` with merged revisions,
+//! `get-file-revs`, and read access by the authorization rules (A-606): today every path is readable, as in an
+//! `anon-access = read` repository with no rules.
+//! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
+//! never a server command.)
 //!
 //! Bounds: an answer holds what its command names, bounded by the index and the green (a property list, a revision's
-//! properties, a request's paths and their mergeinfo); the streaming commands that follow write a slice at a time.
+//! properties, a request's paths and their mergeinfo). A command whose answer grows with the repository writes its
+//! head and hands back a [`Stream`] that writes the rest a slice at a time, in the room the caller gives each slice
+//! (module `stream`): a file's text is never held whole, nor a listing.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -164,18 +169,16 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 22] = [
+const ELSEWHERE: [&str; 18] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
   "commit",
-  "get-file",
   "update",
   "switch",
   "status",
   "diff",
   "log",
-  "get-location-segments",
   "get-file-revs",
   "lock",
   "lock-many",
@@ -185,8 +188,6 @@ const ELSEWHERE: [&str; 22] = [
   "get-locks",
   "replay",
   "replay-range",
-  "get-deleted-rev",
-  "list",
 ];
 
 /// The separators of `svn_time_from_cstring`'s format, each after its field: year, month, day, hour, minute, second,
@@ -312,13 +313,21 @@ pub trait Repository: Contents {
 
   /// The property list held as `identity`, every property, in any order; `None` when the green does not hold it.
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>>;
+
+  /// The bytes of the text held as `identity` from `offset`: a run of at least one byte, as long as the green holds it
+  /// in one piece (§4.17.4 item 11: a read streams from chunks, nothing is assembled whole), or none at the text's end;
+  /// `None` when the green does not hold the text.
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]>;
 }
 
 /// What the handler made of a command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
   /// Answered: its answer, or its refusal, is appended to the output.
   Answered,
+  /// Answered in part: the answer's head is appended to the output, and its rest follows a slice at a time from the
+  /// [`Stream`] ([`Stream::resume`]).
+  Streaming(Stream),
   /// Malformed: not a command, or parameters `svn_ra_svn__parse_tuple` refuses (`SVN_ERR_RA_SVN_MALFORMED_DATA`), which
   /// `svnserve` answers by ending the connection without a word. Nothing is appended; the caller ends the connection.
   Close,
@@ -362,6 +371,10 @@ pub fn answer<R: Repository + ?Sized>(
     "get-iprops" => reads.inherited(params),
     "get-dir" => reads.directory(params),
     "get-locations" => reads.locations(params),
+    "get-file" => reads.file(params),
+    "list" => reads.list(params),
+    "get-location-segments" => reads.location_segments(params),
+    "get-deleted-rev" => reads.deleted_revision(params),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -409,6 +422,17 @@ impl Failure {
   /// A filesystem the index and the green disagree about.
   fn corrupt() -> Self {
     Self::new(SVN_ERR_FS_CORRUPT, String::from("Filesystem is corrupt"))
+  }
+
+  /// `( failure ( ( code message 0: 0 ) ) )`, a release build's empty file and zero line.
+  fn value(&self) -> Value<'_> {
+    let error = Value::List(vec![
+      Value::Number(u64::from(self.code)),
+      Value::String(self.message.as_bytes()),
+      Value::String(b""),
+      Value::Number(0),
+    ]);
+    Value::List(vec![Value::Word(FAILURE), Value::List(vec![error])])
   }
 
   /// The refusal of an index refusal the read commands meet.
@@ -737,6 +761,21 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     Ok(found)
   }
 
+  /// The ancestors of `path` holding properties, root first, each by its own path without the leading separator.
+  fn owned_ancestors(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<OwnedAncestors<'reads>, Failure> {
+    let found = self.ancestors_properties(path, revision)?;
+    Ok(
+      found
+        .into_iter()
+        .map(|(ancestor, properties)| (ancestor.to_owned(), properties))
+        .collect(),
+    )
+  }
+
   /// `get-dir ( path [ rev ] want-props want-contents ? ( field ... ) ? want-iprops )`: the directory's properties
   /// with its entry properties, its entries as dirents carrying the fields asked for, and its ancestors' properties
   /// when asked (`serve.c` `get_dir`).
@@ -755,17 +794,7 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
           answer.entries.iter().map(DirectoryEntry::value).collect(),
         ));
         if let Some(ancestors) = &answer.ancestors {
-          items.push(Value::List(
-            ancestors
-              .iter()
-              .map(|(path, properties)| {
-                Value::List(vec![
-                  Value::String(path.as_bytes()),
-                  proplist(properties.clone()),
-                ])
-              })
-              .collect(),
-          ));
+          items.push(inherited_value(ancestors));
         }
         self.success(items)
       }
@@ -785,13 +814,7 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       Vec::new()
     };
     let ancestors = if request.inherited {
-      let found = self.ancestors_properties(&request.path, revision)?;
-      Some(
-        found
-          .into_iter()
-          .map(|(path, properties)| (path.to_owned(), properties))
-          .collect(),
-      )
+      Some(self.owned_ancestors(&request.path, revision)?)
     } else {
       None
     };
@@ -999,19 +1022,9 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     revision: i64,
   ) -> Result<Option<(i64, String, i64)>, Failure> {
     let revision = self.existing(revision)?;
-    let node = self
-      .node(path, revision)?
-      .ok_or_else(|| Failure::not_found(path, revision))?;
-    let Some((copied_in, copy_path)) = self.youngest_copy_root(path, revision)? else {
+    let Some((copied_in, copy_path)) = self.closest_copy(path, revision)? else {
       return Ok(None);
     };
-    let Some(copied) = self.node(path, copied_in)? else {
-      return Ok(None);
-    };
-    let fresh = copied.created_revision() == copied_in && copied.predecessor().is_none();
-    if copied.node_id() != node.node_id() || fresh {
-      return Ok(None);
-    }
     let Some((source, source_revision)) = self
       .node(&copy_path, copied_in)?
       .and_then(|root| root.copy_from())
@@ -1034,6 +1047,30 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       previous,
       i64::try_from(source_revision).unwrap_or(i64::MAX),
     )))
+  }
+
+  /// `svn_fs_closest_copy` (`tree.c` `fs_closest_copy`): the revision and path of the copy that made the node at `path`
+  /// in `revision` what it is: the youngest copy root on the path, unless the node there in that revision is another
+  /// line, or was made fresh in it beneath the copy; `None` without one. Refused when the path is absent.
+  fn closest_copy(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<Option<(Revision, String)>, Failure> {
+    let node = self
+      .node(path, revision)?
+      .ok_or_else(|| Failure::not_found(path, revision))?;
+    let Some((copied_in, copy_path)) = self.youngest_copy_root(path, revision)? else {
+      return Ok(None);
+    };
+    let Some(copied) = self.node(path, copied_in)? else {
+      return Ok(None);
+    };
+    let fresh = copied.created_revision() == copied_in && copied.predecessor().is_none();
+    if copied.node_id() != node.node_id() || fresh {
+      return Ok(None);
+    }
+    Ok(Some((copied_in, copy_path)))
   }
 
   /// FSFS's `find_youngest_copyroot`: the youngest copy root of the path's node and its directories in `revision`, a
@@ -1142,16 +1179,7 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
 
   /// `( failure ( ( code message 0: 0 ) ) )`, a release build's empty file and zero line.
   fn failure(&mut self, failure: &Failure) -> Result<Outcome, ItemError> {
-    let error = Value::List(vec![
-      Value::Number(u64::from(failure.code)),
-      Value::String(failure.message.as_bytes()),
-      Value::String(b""),
-      Value::Number(0),
-    ]);
-    write(
-      &Value::List(vec![Value::Word(FAILURE), Value::List(vec![error])]),
-      self.out,
-    )?;
+    write(&failure.value(), self.out)?;
     Ok(Outcome::Answered)
   }
 }
@@ -1169,6 +1197,25 @@ enum Search {
 
 /// The ancestors of a path holding properties, each by its path without the leading separator, with its properties.
 type Ancestors<'path, 'reads> = Vec<(&'path str, Vec<(&'reads [u8], &'reads [u8])>)>;
+
+/// [`Ancestors`] with each path owned.
+type OwnedAncestors<'reads> = Vec<(String, Vec<(&'reads [u8], &'reads [u8])>)>;
+
+/// An inherited property list as `get-dir`, `get-file` and `get-iprops` write it: `( ( path ( props ) ) ... )`, the
+/// root's first.
+fn inherited_value<'value>(ancestors: &'value OwnedAncestors<'_>) -> Value<'value> {
+  Value::List(
+    ancestors
+      .iter()
+      .map(|(path, properties)| {
+        Value::List(vec![
+          Value::String(path.as_bytes()),
+          proplist(properties.clone()),
+        ])
+      })
+      .collect(),
+  )
+}
 
 /// The dirent fields a `get-dir` asks for (`SVN_DIRENT_*`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1267,7 +1314,7 @@ struct DirectoryAnswer<'repository> {
   /// Its entries; none when not wanted.
   entries: Vec<DirectoryEntry<'repository>>,
   /// Its ancestors' properties, when wanted.
-  ancestors: Option<Vec<(String, Vec<(&'repository [u8], &'repository [u8])>)>>,
+  ancestors: Option<OwnedAncestors<'repository>>,
 }
 
 /// One entry of `get-dir`'s answer.
@@ -1674,6 +1721,14 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     .wrapping_add(i64::from(month <= FEBRUARY));
   (year, month, day)
 }
+
+mod deleted;
+mod file;
+mod list;
+mod segments;
+mod stream;
+
+pub use stream::{Progress, Stream};
 
 #[cfg(test)]
 mod tests;

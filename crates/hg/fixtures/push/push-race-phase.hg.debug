@@ -1,0 +1,12 @@
+Stream params: {}
+replycaps -- {} (mandatory: True)
+check:phases -- {} (mandatory: True)
+check:updated-heads -- {} (mandatory: True)
+changegroup -- {version: 03} (mandatory: True)
+    format: id, p1, p2, cset, delta base, len(delta)
+
+    changelog
+    2201f6048a2c877c1a0d336fb92d0bd8122d4597 048741fabe422ed31728cd666c1e36b6c3f0a96d 0000000000000000000000000000000000000000 2201f6048a2c877c1a0d336fb92d0bd8122d4597 0000000000000000000000000000000000000000 72
+
+    manifest
+    7fbfa70e548d279aa8bb58e4112034ef3e71284a 8b52510d425d34840bed5093ef47f00ec2e545d6 0000000000000000000000000000000000000000 2201f6048a2c877c1a0d336fb92d0bd8122d4597 8b52510d425d34840bed5093ef47f00ec2e545d6 55

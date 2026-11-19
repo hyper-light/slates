@@ -538,16 +538,25 @@ enum Step {
   Insert(Vec<u8>),
 }
 
-/// A source of 1 to 699 bytes and up to ten steps over it: copies inside it, inserts of 1 to 299 bytes.
+/// A source of 1 to 699 bytes and up to ten steps over it: copies inside it, inserts of 1 to 299
+/// bytes, each step as likely to be either. Drawn as plain tuples and a selector, so the strategy
+/// needs no `Arc`-backed `prop_oneof!` (R2; `crates/vcs/src/tests.rs` `step` is the pattern).
 fn source_and_steps() -> impl Strategy<Value = (Vec<u8>, Vec<Step>)> {
   proptest::collection::vec(any::<u8>(), 1..700).prop_flat_map(|source| {
     let len = u64::try_from(source.len()).unwrap();
-    let copy = (0..len)
-      .prop_flat_map(move |offset| (Just(offset), 1..=len - offset))
-      .prop_map(|(offset, len)| Step::Copy { offset, len });
-    let insert = proptest::collection::vec(any::<u8>(), 1..300).prop_map(Step::Insert);
-    let steps = proptest::collection::vec(prop_oneof![copy, insert], 0..10);
-    (Just(source), steps)
+    let step = (any::<bool>(), 0..len)
+      .prop_flat_map(move |(copies, offset)| {
+        let bytes = proptest::collection::vec(any::<u8>(), 1..300);
+        (Just(copies), Just(offset), 1..=len - offset, bytes)
+      })
+      .prop_map(|(copies, offset, span, bytes)| {
+        if copies {
+          Step::Copy { offset, len: span }
+        } else {
+          Step::Insert(bytes)
+        }
+      });
+    (Just(source), proptest::collection::vec(step, 0..10))
   })
 }
 

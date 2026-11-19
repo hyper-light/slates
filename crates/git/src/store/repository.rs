@@ -20,6 +20,11 @@ use super::positions::Positions;
 use super::push::Push;
 use super::rows::{self, CommitRow, ObjectRow};
 
+/// The store read as upload-pack's commit graph (A-640), a child of this module so it reads the rows and chains kept
+/// here.
+#[path = "graph.rs"]
+pub(super) mod graph;
+
 /// Shape: what one version's record costs the budget beside its set's runs. Derived from the type.
 const VERSION_BYTES: usize = size_of::<Version>();
 
@@ -368,7 +373,11 @@ impl Repository {
   }
 
   /// The row of the object `id` names, and its root content.
-  fn indexed(&self, store: &ContentStore, id: &ObjectId) -> Option<(ObjectRow, ContentId)> {
+  pub(crate) fn indexed(
+    &self,
+    store: &ContentStore,
+    id: &ObjectId,
+  ) -> Option<(ObjectRow, ContentId)> {
     let found = self.index.get(store, &rows::object_key(id))?;
     let content = found.contents().next()?;
     Some((rows::decode(found.payload())?, content))

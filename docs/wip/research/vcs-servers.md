@@ -371,3 +371,32 @@ Read 2026-11-19 (UTC) by g255. Each file was downloaded and hashed; the lines ci
   hosting server's; a policy rule is one statement, so authz's union of lines within a section stays the authorization
   file's (A-606); and every hook's deadline is learned from its own runs, with no deadline before its first finished
   run but its client's connection.
+
+### 5.6 The SSH server's authentication and channel (A-633, read 2026-11-19)
+
+| Source | Revision read | sha256 (first 16 hex) |
+|---|---|---|
+| RFC 4252, 4254, 8332 | the RFC Editor's text | a36b882cf77b1073, bfc727e9350067ea, b194d8da7a5b07cf |
+| git `quote.c`, `connect.c` | git `master` at `e1ec09b23c8e0deb21a0b95ac5996422277395d4` | 9a53645731a1b83f, 02363f9f84e69ca0 |
+| Mercurial `mercurial/sshpeer.py`, `mercurial/utils/procutil.py`, `contrib/hg-ssh` | 7.2's PyPI source distribution, SHA-256 `a250227e…` (as §4.17.3's notes) | d84a797aff1ce219, c5412a454a414111, 323bfa2b2375e0a0 |
+| Subversion `subversion/libsvn_ra_svn/client.c` | `1.14.x` at `d434dc14866e0c48602dba59a15443255d0b8c1e` | 3c3b9263dd7223a9 |
+
+What it rests on (quoted):
+- **The probe and the query** [B: RFC 4252 §4, §5.2, §7]: "The main purpose of sending this request is to get the
+  list of supported methods from the server"; a query "MUST respond ... with either SSH_MSG_USERAUTH_FAILURE or ...
+  SSH_MSG_USERAUTH_PK_OK"; the signed data's eight fields; "partial success MUST be TRUE if the authentication request
+  to which this is a response was successful"; "SHOULD limit the number of failed authentication attempts ... (the
+  RECOMMENDED limit is 20 attempts)".
+- **RSA with SHA-2** [B: RFC 8332 §3, §3.2]: the `ssh-rsa` key format is kept; "the client MUST encode the same algorithm
+  name in the signature"; "A verifier MAY accept shorter encodings of S with one or more leading zeros omitted".
+- **Extensions** [B: RFC 8308 §2.4, §3.1]: the server may send `SSH_MSG_EXT_INFO` "As the next packet following the
+  server's first SSH_MSG_NEWKEYS"; "a server MUST enumerate all public key algorithms it might accept during user
+  authentication".
+- **Channels** [B: RFC 4254 §5.1-§5.3, §6.4, §6.5, §6.10]: the open and its failure reasons; "MUST NOT advertise a
+  maximum packet size that would result in transport packets larger than its transport layer is willing to receive";
+  the window "MUST NOT be increased above 2^32 - 1 bytes"; "Only one of these requests can succeed per channel"; "The
+  channel needs to be closed with SSH_MSG_CHANNEL_CLOSE after this message".
+- **The clients' commands** [C]: git builds `prog SP sq_quote(path)` and `sq_dequote` reads a quoted run then only
+  `\'` or `\!` between reopened quotes; Mercurial 7.2 sends `%s -R %s serve --stdio%s` with `_serverquote` (bare for
+  `[a-zA-Z0-9@%_+=:,./-]`, else `'...'` with `'\''`), and `contrib/hg-ssh` takes exactly `['hg', '-R', path, 'serve',
+  '--stdio']`; Subversion's tunnel agent appends `svnserve -t` after the host.
