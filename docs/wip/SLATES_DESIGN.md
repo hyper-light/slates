@@ -11656,6 +11656,15 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > the tree stood then (the head's graft fixed by what the change index names since, the fix recorded whole in the chain
 > entry, its room derived before the verdict and added to the entry's bound by the service). Owed: a checkpoint of a
 > green holding a copy, and a rebase that restates one (the A-626 part 2 entry).
+>
+> **Status (2026-11-19, A-626 part 3).** Built in the engine: a checkpoint of a green holding a copy (`crate::checkpoint`
+> version 4, `crates/merge/src/engine/copy_checkpoint.rs`): every copy record made at or before the checkpoint's version,
+> each copied tree's keys holding then what the copy above them gave them (set by a restore with no history, so each
+> reads by its record again), and the identity's running sum, moved to the version as a branch moves it, which the
+> restore takes (what it holds beyond the restored state's entries is kept for the recount). The anchor's layout is 12:
+> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Owed: a rebase that
+> restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since its version, where the
+> checkpoint lists it key by key (the A-626 part 3 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -12513,6 +12522,19 @@ engine: the verdict, rebase, position mapping, the register).
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
+> **Status (2026-11-19, A-651: piece 9's edge built).** `crates/server`'s `vcs_ssh` serves SSH on the runtime's TCP,
+> the HTTP edge's counterpart: one connection a task under seats derived from the shard's clients, each driving
+> `slates-ssh`'s session. A key proves a principal only through the site's lookup, today `NoKeyRecord`, which refuses
+> every key until the one record of principals' credentials lands (main's ruling under §4.13; no key file, no default
+> key). Each `exec` is dispatched by its tool and refused in the tool's own words and exit status where it cannot run: a
+> missing repository, the repository's policy, and, for now, all four services as not served (git's upload-pack and
+> Mercurial's `serve --stdio` have landed and wait for their stores, A-662; receive-pack's and Subversion's entry
+> points, A-654 and A-656). Waits keep the HTTP edge's rule: RFC 6298's first RTO of the connection's own round trip
+> before a phase learns; a wait past its bound only marks its seat overdue, and the most overdue is reaped only for a new
+> connection with every seat taken, since an SSH connection waits on people (a key's passphrase after `PK_OK`, a host
+> key's confirmation) and on a push's compression. The key time is fed by authenticated connections' lifetimes. The
+> daemon starting the edge, the stores, the key record and the live OpenSSH `git clone` are owed.
+>
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
 > inflated through flate2 over zlib-rs (A-607) into room for exactly the size its header names, then the trailer, which
@@ -13089,9 +13111,10 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Push bytes in flight and pushes per shard | the shard's memory budget over the measured inflate and hash rate | the shard's budget, typed refusal | the first push's own size |
 | Keepalive during a held push (git's own: "The default is 5 seconds" [B: config `receive.keepAlive`]) | silence shorter than the shortest silent gap after which this deployment's connections were seen to drop, learned from the drops | the client's own deadline when it sent one | the connection's measured round trip |
 | Reaping a stalled client (A-625 part 2) | per phase of the exchange: the handshake, idleness, a head and the drain waited for whole, a body's and a reply's silences one at a time; RFC 6298's estimator over the phase's completed waits, late ones included (`LearnedWait`: the tail plus the liveness window, Karn's rule, the back-off), fed only by connections whose credentials proved a principal; a wait past its bound marks its connection overdue, and the most overdue is reaped only when every seat is taken and a new connection needs one, a reap backing the phase off | the shard's connection seats | RFC 6298 §2.2's first RTO from the connection's own measurement, `R + max(G, 2R)`: the TCP handshake's round trip as the kernel measured it at accept, the edge's own TLS work added while a handshake runs, then the TLS handshake's whole duration; `G` the timer's tick, the scheduler's lateness or the kernel clock's resolution |
+| Reaping a stalled SSH client (A-651) | the HTTP edge's rule over SSH's phases: the handshake (to the client's NEWKEYS), authentication, setup and closing waited for whole, the command's silences one at a time (a silence keeps its start across the session's rekey timer); RFC 6298's estimator over completed waits, late ones included, fed only by connections whose key proved a principal; a wait past its bound marks its connection overdue, and the most overdue is reaped only when every seat is taken and a new connection needs one | the shard's connection seats | RFC 6298 §2.2's first RTO from the connection's own measurement: the TCP handshake's round trip at accept, the edge's own SSH handshake work added while it runs, then the SSH handshake's whole duration |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
 | Index table merges (§4.17.1's rule, A-581: the git store's index is `slates-vcs`'s, A-614) | for each `j`, merge the newest `j` runs only this index holds once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, the largest due `j`); a table is one window of the content plane and the tail seals once its rows no longer fit one | the store's budget, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
-| SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
+| SSH key time (when a key is replaced by time; A-594, fed by A-651's edge) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
 
 git fixes the first two by constants: "Defaults to 10" for the window and "Defaults to 50" for the depth [B: config
 `pack.window`, `pack.depth`]; its own notes call them "magic values" [B: technical `pack-heuristics`].
@@ -14019,6 +14042,10 @@ and export by landing).
 > **Status (2026-11-19, A-626 part 2).** Built: a copy from a version its source changed after (`svn cp ^/trunk@N` with
 > the trunk changed since, as FSFS takes it), brought as the tree stood then, recorded whole in its chain entry with the
 > room it needs derived before the verdict. Owed: a checkpoint of a green holding a copy, and a rebase restating one.
+>
+> **Status (2026-11-19, A-626 part 3).** Built: a green holding copies is checkpointed (format version 4, the anchor's
+> layout 12), so a repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a
+> rebase restating a copy (part 4).
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -46025,8 +46052,8 @@ Applied in the same change to: §4.16 (a status block, the verdict's sentence on
     slates-server's `--lib` 614 passed, 3 ignored, and the same one of main's failed (3 of 3 with main `dc46c9f`'s
     `verbs.rs`).
   - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
-- **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: its copies and the identity's sum
-  carried); a rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
+- **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: built as A-626 part 3, its entry); a
+  rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
 
 ### A-644 part 1 — A protected branch's answers from the store, in git's words: how a move changes its ref, decided by generation numbers with no walk where they decide it, and the first merge commit and the first unsigned commit a move brings (2026-11-19, g230, UI goal 93; §4.17.2 "Protected branches, in git's terms", "A push" step 6 and "Pieces (git)" piece 11; after A-590, A-614, A-620 and A-642)
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `research/vcs-servers.md` §5.9; `crates/git`
@@ -48040,6 +48067,206 @@ the store's module docs; three tests in `tests::store::upload`; and A-665's test
   crate-visible); `crates/hg/src/push/{classify,classify_tests,held,commit,commit_tests}.rs` (new);
   `crates/server/src/repository.rs`, `crates/server/src/repository/hg_push.rs` and `hg_push/tests.rs` (new);
   `crates/server/Cargo.toml`, `Cargo.toml` and `Cargo.lock` (slates-server on slates-hg and slates-vcs).
+
+### A-626 part 3 — A checkpoint of a green holding a copy: version 4 carries the copies' records, their trees' keys and the identity's sum, and the anchor's layout is 12 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); §4.16 "The state's maps", "Commit" and A-238's checkpoint; §4.17.4 item 3 and piece 3; A-586, A-626 parts 1 and 2, A-202, A-238)
+Applied in the same change to: §4.16 (a status block under "The state's maps"), §4.17.4 (a status block), the A-626 part 2
+entry (its owed list), GAPS (the §4.17.4 entry; A-621's and A-646 part 2b's entries; "Formats the segment keeps changed
+without a layout bump", new, open), `crates/merge/src/checkpoint.rs` (version 4: `CopyRecord`, `Tables`, `Sum`,
+`SUM_BYTES`, the fields `copies`, `copied` and `sum`; a key or a record written twice refused `DuplicatePath`) and its
+tests (`src/checkpoint/tests.rs`, new), `crates/merge/src/engine/copy_checkpoint.rs` (new: `copied_at`,
+`leave_out_copied`, `copy_records_at`, `sum_at`, `restore_copied`, `take_sum`, the `place_*` setters),
+`crates/merge/src/engine.rs` (`checkpoint` without `copied_by`, `with_checkpoint` restoring the copies and the sum, the
+`restore_*` setters over `place_*`, `copies_before` and the recount), `crates/merge/src/engine/branch.rs`
+(`identity_moved_to`), `crates/merge/src/engine/copy.rs` (`every_key` for the engine; `brought_entry`, the record's
+kept fix, `record_bytes`, `release_kept_fixes`), the bug record
+`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`, `crates/merge/src/identity.rs`
+(`SUM_BYTES`, `add_sum`, `less`, `is_empty`, `to_bytes`, `from_bytes`), `crates/anchor/src/layout.rs`
+(`LAYOUT_VERSION` 12), and the tests (`engine/copy_tests.rs`: the checkpoint and restore test replacing the refusal's,
+the copy oracle restoring every history at every version; `tests/checkpoint.rs`, main's, updated by reading;
+`crates/anchor/tests/anchor.rs`: a segment of layout 11 refused at start).
+- **What was there.** `Green::checkpoint` answered `None` at or after any copy (`copied_by`), so the service kept such a
+  green's chain whole, counting `merge.checkpoint.unavailable`: a Subversion repository green that ever copied (every
+  branch and tag is a copy) never folded its chain. Two facts stood in the way. A copied tree's keys hold what the copy
+  gave them with no history of their own, read by the copy's record, so a checkpoint listing the keys whose histories
+  changed after the origin left the copied trees out; and the identity's set hash holds one entry a copy, standing for
+  its tree's entries at the source's version (A-586), which a green restored from the origin and the listed keys cannot
+  recount, since the histories that hold the source at that version are folded into the checkpoint.
+- **The format, version 4.** After the changed keys' tables: the copy records made at or before the checkpoint's
+  version (destination, version, source, source version), by destination then version; the copied tables, one a
+  dimension, each copied tree's keys that hold at the version what the copy above them gave them (no change of their own
+  after that copy and at or before the version), read there as every reader reads them, with the copy's version (a key
+  absent then is listed only where something stood at it at or before the version, which a restore must take away);
+  then the identity's running sum, LtHash16's 1,024 lanes little-endian, 2,048 bytes; then the head check. A key of a
+  copied tree that its own change set after the copy is a changed key, as any key is, and the changed tables leave the
+  copied keys out. A version 3 checkpoint is refused `BadVersion`, and a key or a record written twice `DuplicatePath`.
+- **The sum at a version below the head.** The running sum is brought to the head on a copy of it (the green is not
+  changed), then moved to the version by the keys changed since, as a branch at that version moves it
+  (`identity_moved_to`, the branch's own reverts): what a branch costs, the keys changed since the version.
+- **The restore.** The changed keys as before; the copied keys set with no history, so each reads by its record again;
+  the records kept, each charged with the change index as its commit charged it; then the carried sum taken as the
+  green's identity. What the sum holds beyond the restored state's own entries (the copies' entries less their trees')
+  is kept (`copies_before`), and the recount adds it for the copies made at or before the restore, whose trees it can no
+  longer read, so the identity still equals its recount.
+- **The anchor's layout, 12** (main's ruling): the segment keeps every checkpoint, so its format's change bumps the
+  layout, and a segment of an earlier layout is refused once, typed, at adoption, before anything is served. No reader
+  of version 3 exists, and no green is fenced mid-service for one. A-621 and A-646 part 2b changed formats the segment
+  keeps without a bump; this one covers them from now on (GAPS, filed with the guard owed: a structural test tying every
+  persisted format's version to the layout). A segment whose header says 11 is refused at start, typed
+  (`a_segment_from_before_version_4_checkpoints_is_refused_at_start`, as A-539's layout 10 test is), so a test holds
+  the bump: by reading, with the layout left at 11 the attach would succeed (that red is main's to run).
+- **Cost.** A checkpoint lists each copied tree key by key, files with their bytes, where the green holds the tree by
+  reference: the price of a checkpoint a restore reads alone. Owed, if a measurement shows it worth its rules: a restore
+  that grafts a tree whose source is unchanged since its version by reference.
+- **Tests** (`crates/merge/src/checkpoint/tests.rs`, `crates/merge/src/engine/copy_tests.rs`,
+  `crates/anchor/tests/anchor.rs`).
+  - Golden vectors: a checkpoint touching every table, a copy's record and copied keys, 2,497 bytes laid out field by
+    field, identity `13b881c8102bee2341e78a0d61ba6ffc1b5e90b31a082162f724c50c29251df3`. Both derived outside the crate:
+    the layout field by field, the identity by a BLAKE3 written in Python from the BLAKE3 paper with no library, which
+    reproduces the empty input's hash, the official test vectors at 1, 1023, 1024, 1025, 2048, 2049 and 3072 bytes, and
+    A-646's ops-document vector (218 bytes, `553a422f…6c0d92`).
+  - The determinism gate over the copies and the copied tables declared in reverse; hostile input: every prefix, a
+    version 3 header, a copied key and a copy's record each written twice, a byte appended.
+  - A green holding a copy, checkpointed at the copy's version and after an edit beneath it, restored and given the
+    versions after: it reads and hashes as the green, its identity its recount.
+  - The copy oracle: every generated history's green checkpointed at every version, the checkpoint encoded and decoded,
+    restored and given every later chain entry, hashing as the replay at every version it reaches, reading as the model
+    at every version from the checkpoint on, its identity its recount; a census of checkpoints carrying copies and of
+    ones listing copied keys, both met by A-672's fixed history whatever the seed (13 cases in all).
+  - A segment of layout 11, the layout before this part, written into a header and attached: refused at start, typed.
+- **Found by the oracle: what a copy brought is read from its graft, never below the floor.** The oracle's first run
+  restored greens at 2 and at 3 and replayed a copy made at 4 from version 1 (seed `cc ef9d3557…`, now a reviewed
+  seed). Their recounts read the source's history at 1, which a restored green does not hold. By reading, so did the
+  running identity for a key the copy brought that changes in its fold window or its own increment, and so did a sum
+  moved below the copy. A replica replaying such a copy hashed otherwise than its owner
+  (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`). It is no artefact of
+  the oracle: the owner folds only as far as its retention budget needs, below the reachable floor it checkpoints at,
+  so a copy above its own fold floor may name a version below its last checkpoint, and recovery replays it.
+  - *Recording the entries a copy brought*: rejected. `svn copy ^/trunk ^/branches/x` is Subversion's most common
+    commit, and at A-645's scale it copies a 250 GB tree. A record holding every entry turns A-542's O(path length)
+    copy into O(the tree), in the format and in the checkpoint.
+  - *A floor rule* (a checkpoint waiting at the oldest source version a copy still needs): it does not meet the case.
+    The copies it fails on are made after the checkpoint, so no rule at the checkpoint holds them. And a copy at or
+    before the checkpoint needs nothing below it once restored: its keys read their current values from its record on,
+    the identity is past it, and the carried sum stands for what it brought.
+  - *No read below the floor* (taken). A copy grafts its source held at the version before it, with its fix (part 2).
+    Nothing reads what a copy brought unless the copy stands above the floor: the identity is brought past a copy before
+    the floor passes it, and a branch or a checkpoint is made at the floor or above. The version before such a copy
+    never lies below the floor or a restored green's checkpoint. The destination's own maps would answer a key the copy
+    gave and nothing changed since (its current value), and one changed later (its history at the copy's version). But
+    they cannot answer a key the copy's own version changed, or an inner copy of that version replaced, since that
+    value stood at no version: only the graft holds it. So every reader reads the graft (`Green::brought_entry`): the
+    source at the version before the copy, through the copy's fix. The fix, which the chain entry already carries whole,
+    is kept with the record while the copy stands above the fold floor and let go when the floor reaches it
+    (`Green::release_kept_fixes`). It is charged with the change index and secured before the verdict as the entry's
+    room is. A copy whose source was unchanged since its version keeps none: the common copy, from the head, stays
+    O(path length). The checkpoint's format is unchanged: a record carries no fix and no copied entry.
+  - Tests: a replica given a copy and then a change to a key it brought, its identity read once after both; one given
+    a copy whose own increment edits beneath it; each must hash as its owner and its identity equal its recount, and
+    the first replica's checkpoint below the copy must carry its owner's sum.
+- **Evidence** (debug, 2026-11-19, each run a fresh clone of the pushed branch: Windows x86_64 on jupiter with
+  `CARGO_BUILD_JOBS=4`, then the merged tree on macOS arm64, the Mac Studio, with `CARGO_BUILD_JOBS=2`; the Linux run
+  owed):
+  - Part 3 before the fix (7d08dd16a, over main 4644dcec3): `cargo test -p slates-merge --lib` 180 of 181, the copy
+    oracle failing at a restored green's recount (seed `cc ef9d3557…`); `cargo test -p slates-anchor --lib` 31 of 31,
+    main's baseline; `cargo fmt -p slates-merge -- --check` and `cargo fmt -p slates-anchor -- --check` clean.
+  - Red, the fix's tests over part 3 as it stood (d2a2b0afc, kiln r84): `cargo test -p slates-merge --lib copy_tests`,
+    22 passed and 3 failed, each at an identity: the two replica tests (`copy_tests.rs` 1270, "the replica's identity
+    at 5", and 1301) and the copy oracle on the seed, shrunk to a put, a directory, a put and a copy replacing its
+    destination from two versions back.
+  - Green (617ad96e0, r84): `cargo test -p slates-merge --lib` 182 of 183, every identity and model check passing and
+    the census meeting no nested replace (A-672's, landed before this part); the oracle run again alone, 1 of 1, its
+    census 77 accepted, 380 refused, 12 from the root, 36 from before the head, 26 into themselves, 19 from a changed
+    source, 17 changes beneath a copy, 35 replaced, 30 nested, 3 nested replacing, 26 moves, 265 checkpoints carrying
+    copies, 264 listing copied keys; `cargo test -p slates-anchor --lib` 31 of 31; both crates' fmt checks clean.
+  - The merged tree, over main 5c0a522f1 with A-672 landed (be0348459, the Mac Studio, kiln r40, load 15 on 32 cores),
+    each run focused on what this part changed. `cargo test --locked -p slates-merge --lib -- copy checkpoint
+    engine::branch engine::node_tests engine::reanchor engine::stack::tests`, every lib test reaching the checkpoint,
+    the restore, the recount, the fold or `identity_moved_to`: 73 passed, none failed, 112 filtered out. The copy
+    oracle's fixed history met all 13 census cases (6 checkpoints carrying copies, 5 listing copied keys), and the
+    whole run counted 97 accepted, 395 refused, 23 from the root, 55 from before the head, 34 into themselves, 19 from a
+    changed source, 45 changes beneath a copy, 36 replaced, 40 nested, 7 nested replacing, 28 moves, 337 checkpoints
+    carrying copies and 335 listing copied keys. `cargo test --locked -p slates-merge --test checkpoint checkpoint` 4 of
+    4 and `--test chain_replay checkpoint` 3 of 3; `cargo test --locked -p slates-anchor --lib layout` 2 of 2 and
+    `--test anchor a_segment_` 5 of 5, the layout 11 refusal among them; both crates' fmt checks clean.
+
+### A-651 — The SSH edge in the daemon: the listener on the runtime's TCP, each connection a task driving slates-ssh's session, waits per phase on main's rulings with overdue connections reaped only for a new one, keys proved through the site's lookup, and each `exec` dispatched by its tool (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2 and "Pieces (git)" piece 9; §4.17.3; §4.17.4's svn+ssh, piece 12; §4.13; after A-594, A-633, A-634 and A-625 part 2)
+Applied in the same change to:
+- §4.17.2's status and its tunables table (a row for reaping a stalled SSH client; the SSH key time fed by the edge);
+  GAPS (the §4.17 entry); `research/vcs-servers.md` §5.10 (new: OpenSSH's client, git's, Mercurial's and svnserve's
+  failures, pinned by hash);
+- `crates/server` (new: `vcs_ssh` with `site` and `waits`, and their tests; `lib.rs` declares it; `vcs_http`'s `git`
+  and `waits` modules and `Bounds::granularity_ns` made crate-visible so both edges share one `Repositories` and one
+  first RTO); `crates/ssh` (`ServerTransport::is_established`, and its test); the manifests and the lock (slates-server
+  depends on slates-ssh).
+- **The listener** is the HTTP edge's: a task on its shard owning its connections as detached child tasks, cancelled
+  and joined when it ends; seats from the shard's clients (`Bounds::of_shard`), the kernel's backlog the same bound.
+  Each connection's session is made from the edge's host key seed (zeroed on drop), the packet cap every peer accepts
+  (RFC 4253 §6.1's 35000 bytes, which OpenSSH's 32 KiB session packets fit), the channel window of one client region,
+  RFC 4252's recommended failure limit, and the key time learned from authenticated connections' lifetimes.
+- **Waits, on main's rulings** (as A-625 part 2's for HTTP). SSH's phases: the handshake to the client's NEWKEYS
+  (`ServerTransport::is_established`, a round trip after the session id is known, since a client's host-key
+  confirmation lies between), authentication to the proof, setup to the `exec`, the command's silences, and closing to
+  the channel's close. Before a phase learns, a wait is bounded by RFC 6298's first RTO of the connection's own
+  measurement: the kernel's TCP round trip at accept with the edge's own handshake work added (time inside the session's
+  `receive` while the handshake runs), then the SSH handshake's whole duration. A wait past its bound marks its seat
+  overdue and goes on; the listener, holding a new connection with every seat taken, reaps the most overdue (its task
+  cancelled); a reap teaches nothing and backs a proven connection's phase off once per bound. A running silence keeps
+  its start across the session's own rekey timer, which interrupts the read but not the client's silence.
+- **Why not cut at the bound** (g294's finding, main's ruling). An SSH connection waits on people inside it: OpenSSH's
+  `input_userauth_pk_ok` calls `sign_and_send_pubkey`, whose `identity_sign` loads a key not yet loaded through
+  `load_identity_file`, which prompts "Enter passphrase for key" (`sshconnect2.c` at `fa4b2a82`, lines 745, 1242,
+  1543) [C]; `check_host_key` asks "Are you sure you want to continue connecting" before the client's NEWKEYS
+  (`sshconnect.c`) [C]; and a push's client compresses its pack before sending it. A cut at a bound learned from the
+  clients that finished would cut every agent-less passphrase on every connection, and a cut before the proof backs
+  nothing off, so it would never be learned.
+- **Keys** (main's ruling under §4.13). A key proves a principal only through the site's lookup (`slates-ssh`'s
+  `KeyHolders`). The credentials are enrolled by a person through slates' own CLI on the control channel and kept in one
+  record both edges' authenticators read, which g299 builds; until it lands the production lookup, `NoKeyRecord`,
+  refuses every key and counts it. There is no key file and no default key.
+- **Dispatch** (`site::ToolSite`), in the HTTP site's order, each refusal written on standard error as the tool's own
+  program refuses, then its exit status: the repository named by the path without one leading slash, of the command's
+  tool (git: `fatal: '<path>' does not appear to be a git repository`, `die`'s 128, `builtin/upload-pack.c` and
+  `usage.c` at `e1ec09b2`; Mercurial: `abort: repository <path> not found`, 255, `localrepo.py`, `scmutil.py`'s
+  `callcatch` and `dispatch.py`'s `sys.exit(status & 255)` in 7.2); the repository's policy (`vcs_policy::reaches`:
+  upload-pack asks to read, receive-pack to submit, rewrite or delete, Mercurial's session any of the four; a policy its
+  tool cannot read is refused, the owner included); then the service. All four are refused as not served for now:
+  git's upload-pack (`slates_git::upload::serve`, A-640 part 2) and Mercurial's `serve --stdio`
+  (`slates_hg::serve::stdio::Stdio`, A-650 part 2) have landed and wait for their repository's store, which A-662's map
+  on the owner shard will hold (main: no store home of the edge's own, and no not-served path once it lands);
+  receive-pack (A-654) and Subversion's tunnel (A-656) wait for their entry points. svnserve's refusals begin
+  `svnserve: ` and exit `EXIT_FAILURE` (`svnserve.c` at `d434dc14`); its repository is the tunnel session's to find,
+  from the greeting's URL.
+- **Commands** are stepped sans-io as the tools' entry points are (`site::Command`): the client's input held by the
+  command until a step consumes it, the window given back for what was consumed (a command that claims more than it was
+  given ends the connection), standard error sent before standard output, one step and one input run a turn, and
+  `exit-status`, EOF and close in order when the command exits. A refused `exec` is accepted and answered with its words
+  and status, as a stock server's program refuses after its shell started it.
+- **Tests** (`cargo test --locked -p slates-server --lib vcs_`, `cargo test --locked -p slates-ssh --lib`, Mac Studio
+  d1323898, debug).
+  - Red first: 510a759c (slates-ssh 110 of 111, the new establishment test failing; slates-server's tests stopped at a
+    fixture missing `hooks_env`, fixed in 8bcb6a6c), then 8bcb6a6c (slates-server 74 of 92, the 18 new SSH tests failing
+    but the key lookup's, which a stub cannot miss), with the connection task dropping its socket, dispatch refusing
+    wordlessly, a wait's deadline now, waits learning nothing, reaps backing nothing off, and the transport never
+    established.
+  - Green at 0df9950f on its first build: slates-ssh 111 of 111, slates-server 92 of 92 (the HTTP edge's, the policy's
+    and the hooks' tests among them); 55468644 (the dispatch test reads who a service starts for), 92 of 92.
+  - As it landed (macOS arm64, Mac Studio, debug): `cargo test --locked -p slates-server --lib vcs_ssh` 19 of 19 on the
+    merged tree over main 71a43cd97 (c6c8e52a); slates-ssh's lib 111 of 111 over main cd84e3811 (b07e0143), whose
+    later commits touch nothing slates-ssh builds from; `cargo fmt -p slates-server -p slates-ssh -- --check` clean. No
+    integration target reaches the edge (`vcs_ssh` has no caller outside its tests until the daemon starts an edge,
+    and slates-ssh has no `tests/`), so the whole connections over loopback below are its end-to-end tests.
+  - Whole connections over loopback with slates-ssh's client written from the RFCs (included by path, so one file stays
+    the oracle): a held key's command run to its exit in order; a refused `exec` on standard error with its status; an
+    unheld key refused, teaching nothing; a passphrase pause after `PK_OK` and a slow push's silence marked overdue but
+    not cut with a seat free, and each reaped when a new connection needs the only seat (the push's phase backed off
+    once, the unproven passphrase's not at all).
+  - Red-checked on the Studio: reaping removed, both reap tests failed (17 of 19 passed). Four more (a wait cut at its
+    bound, unproven reaps backing off, the window given back on receipt, the policy skipped) were cut short when the
+    Studio ran out of memory; under §8 they are main's runs (main's ruling, 2026-11-19), filed in its run requests.
+- **Owed.** The daemon starting the edge (its address, the host key's keeping); the credentials record (g299) behind
+  the key lookup; the stores (A-662) behind upload-pack and Mercurial's session, and receive-pack's and Subversion's
+  entry points (A-654, A-656), each a `Command` behind `Services`, the not-served answer going with the last of them;
+  the live OpenSSH 10.2 `git clone` over SSH (main's run, filed); the four red-checks above (main's).
 
 ### A-644 part 2 — Protected branches through A-622's policy: two requirement rights and the trusted commit signers, judged at the check point after the change's own right, the commits' SSH signatures verified by A-321's code under git's namespace, and every refusal in git's words (2026-11-19, g230, UI goal 93; §4.17.1 "Policy", §4.17.2 "Protected branches, in git's terms" and "Pieces (git)" piece 11; after A-321, A-622 and A-644 part 1)
 Applied in the same change to: §4.17.1's status (the policy's requirements and signers) and §4.17.2's (the server's
