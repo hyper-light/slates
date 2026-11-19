@@ -36548,5 +36548,7 @@ Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-
   seam call of the digest in turn, a scene each, until one lands after the digest. Each landing must leave the handle
   reading the file it opened, the digest naming the outsider's file (or the opened one where the replacement landed
   after the digest's last check) or refused `DigestUnverified`, never torn bytes, the name a new inode, and at least one
-  landing must reach `verify_current`'s identity check (`replaced` moved).
+  landing must reach `verify_current`'s identity check (`replaced` moved). Green on the Mac Studio (kiln r33, debug);
+  red once with the old in-place adoption restored (kiln r29): landing at call 4, the open handle read the outsider's
+  file and the name kept its number (`replaced` 1, so the path was reached).
 
