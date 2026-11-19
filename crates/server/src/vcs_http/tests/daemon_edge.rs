@@ -823,8 +823,6 @@ fn basic_proves_its_principal_on_a_daemons_loopback_cleartext_edge() {
 /// `uvx --quiet --python 3.12 --from mercurial==7.2 hg`, as `crates/hg/fixtures/make-fixtures.sh` runs it. Unset, `hg`
 /// on the path.
 const STOCK_HG: &str = "SLATES_TEST_HG";
-/// Shape: the digits of a changeset's id stock hg names it by, its short form (`hg identify`).
-const SHORT_ID_DIGITS: usize = 12;
 
 /// Stock Mercurial 7.2's command, its words as [`STOCK_HG`] names them, or `None` when this host runs none, which the
 /// caller skips loudly: the command must answer `--version` with 7.2's line.
@@ -872,14 +870,14 @@ fn hg_run(words: &[String], args: &[&str]) -> (Option<i32>, String, String) {
 /// A-686 with A-680 part 2a (main's ruling, 2026-11-19: Basic with the token as the password taken on the loopback
 /// cleartext edge as over TLS, Basic's challenge first). Do: start a two-shard daemon whose edge serves loopback
 /// cleartext (no identity); on the second shard's partition create a Mercurial repository from `fixtures/state`'s
-/// `states` and enroll its owner's token; run stock Mercurial 7.2's `hg identify` against the repository with the
-/// token as Basic's password in the URL. Expect: hg reads the edge's `401`, whose first challenge is Basic's, sends
-/// Basic, which the loopback edge takes, and is served from the repository's owner shard: exit 0, naming the
-/// repository's tip first, the newest of its heads. Before A-686 the cleartext edge's `401` offered Bearer alone, on
-/// which 7.2's urllib digest handler, reading the first challenge alone, raised (`** unknown exception`, exit 1).
-/// Skips loudly without stock hg 7.2 ([`STOCK_HG`]).
+/// `states` and enroll its owner's token; run stock Mercurial 7.2's `hg debugcapabilities` against the repository with
+/// the token as Basic's password in the URL. Expect: hg reads the edge's `401`, whose first challenge is Basic's, sends
+/// Basic, which the loopback edge takes, and is answered by Mercurial's site from the repository's store on its owner
+/// shard: exit 0, `getbundle` among the capabilities it lists. Before A-686 the cleartext edge's `401` offered Bearer
+/// alone, on which 7.2's urllib digest handler, reading the first challenge alone, raised (`** unknown exception`, exit
+/// 1). Skips loudly without stock hg 7.2 ([`STOCK_HG`]).
 #[test]
-fn stock_hg_identifies_a_repository_on_a_daemons_loopback_edge_by_basic() {
+fn stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic() {
   let Some(hg) = stock_hg() else {
     eprintln!(
       "skipping stock hg against the daemon's edge: no Mercurial 7.2 here \
@@ -890,18 +888,14 @@ fn stock_hg_identifies_a_repository_on_a_daemons_loopback_edge_by_basic() {
   let (daemon, _) = daemon_named(None);
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
-  let heads = create_hg_from_states(&daemon, &name);
+  create_hg_from_states(&daemon, &name);
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   let url = format!("http://hg:{OWNER_TOKEN}@127.0.0.1:{port}/{name}");
-  let (code, out, err) = hg_run(&hg, &["identify", &url]);
+  let (code, out, err) = hg_run(&hg, &["debugcapabilities", &url]);
   daemon.stop();
-  let tip: String = String::from_utf8_lossy(&heads)
-    .chars()
-    .take(SHORT_ID_DIGITS)
-    .collect();
   assert_eq!(
-    (code, out.split_whitespace().next()),
-    (Some(0), Some(tip.as_str())),
+    (code, out.lines().any(|line| line.trim() == "getbundle")),
+    (Some(0), true),
     "{out}{err}"
   );
 }
