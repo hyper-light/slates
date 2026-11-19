@@ -1486,6 +1486,29 @@ mod literals {
       || after.starts_with(']')
       || before.ends_with("u8")
   }
+
+  #[cfg(test)]
+  mod tests {
+    use super::{is_trivial, numeric_literals};
+
+    /// Do: read typed zeros and ones written with a separator before the suffix. Expect each judged as the value it is:
+    /// `0_usize` is 0, never the literal `0_`.
+    #[test]
+    fn a_separator_before_a_type_suffix_is_no_digit() {
+      for literal in numeric_literals("let (a, b, c) = (0_usize, 1_u64, 0_u32); (1_u64..)") {
+        assert!(is_trivial(&literal), "{literal}");
+      }
+      assert!(!numeric_literals("let n = 7_usize;").iter().all(|literal| is_trivial(literal)));
+    }
+
+    /// Do: read tuple fields by position, then a range and a float beside them. Expect the fields' indexes not read as
+    /// literals, and the range's end and the float still read.
+    #[test]
+    fn a_tuple_fields_index_is_a_position_not_a_literal() {
+      assert!(numeric_literals("top.3 = true; pair.0.1; f().4; v[i].5").is_empty());
+      assert_eq!(numeric_literals("let r = 0..7; let x = 3.5;"), vec!["0", "7", "3.5"]);
+    }
+  }
 }
 
 #[cfg(test)]
@@ -1527,24 +1550,6 @@ mod string_state_tests {
     assert!(!lines[0].contains('5'), "{lines:?}");
     assert!(!lines[1].contains('6'), "{lines:?}");
     assert!(lines[1].contains("let w = 9;"), "{lines:?}");
-  }
-
-  /// Do: read typed zeros and ones written with a separator before the suffix. Expect each judged as the value it is:
-  /// `0_usize` is 0, never the literal `0_`.
-  #[test]
-  fn a_separator_before_a_type_suffix_is_no_digit() {
-    for literal in numeric_literals("let (a, b, c) = (0_usize, 1_u64, 0_u32); (1_u64..)") {
-      assert!(is_trivial(&literal), "{literal}");
-    }
-    assert!(!numeric_literals("let n = 7_usize;").iter().all(|literal| is_trivial(literal)));
-  }
-
-  /// Do: read tuple fields by position, then a range and a float beside them. Expect the fields' indexes not read as
-  /// literals, and the range's end and the float still read.
-  #[test]
-  fn a_tuple_fields_index_is_a_position_not_a_literal() {
-    assert!(numeric_literals("top.3 = true; pair.0.1; f().4; v[i].5").is_empty());
-    assert_eq!(numeric_literals("let r = 0..7; let x = 3.5;"), vec!["0", "7", "3.5"]);
   }
 
   /// Do: strip one line on its own, as the structural check does. Expect a comment and a whole string gone.
