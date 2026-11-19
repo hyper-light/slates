@@ -44396,11 +44396,20 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
   still placed exactly.
 - **The pack from A-639's stream** (`upload/fragments.rs`, after A-639 landed). `Fragments` is the service's pack
   source over `store::Upload`. The plan is copied as A-639's `Answered`: runs, single objects, the filter for the
-  runs, `thin-pack` and `ofs-delta`, each list charged first. Each call takes one turn of the stream on the owner's
-  clock, exchange and quantum, and hands out at most the answer's room of what it wrote. A turn may write nothing yet,
-  as the stream counts the pack before its header. The answer then ends its step and asks again at the next, so a step
-  does at most one turn's work, and the earlier "stalled" refusal is gone: a source's contract is to bring the pack
-  nearer its end each call, which A-639's turns do, each doing at least one unit of a finite stream.
+  runs, `thin-pack` and `ofs-delta`, each list charged first. A call hands out what the last turn wrote, at most the
+  room it is asked for, and takes one turn of the stream on the owner's clock, exchange and quantum only once all of it
+  is handed out. A turn may write nothing yet, as the stream counts the pack before its header.
+- **One call a step, packets framed full** (`upload/answer.rs`). The answer calls its source at most once a step,
+  asking for what the packet it is filling still has room for, and frames the packet once it is full or the pack has
+  ended; data that leaves it short waits in it for the next step's call. So a step does at most one turn of the
+  stream's work (§4.3's step budget), the packets are the same full ones whatever the caller's room and however the
+  turns divide the work, and a call that wrote nothing only ends its step. The earlier "stalled" refusal is gone: a
+  source's contract is to bring the pack nearer its end each call, which A-639's turns do, each doing at least one unit
+  of a finite stream. A source that refuses mid-pack still has the data it wrote before refusing sent first, the
+  packet being filled framed short, then git's band-3 words, as part 2 holds it and as git sends what `pack-objects`
+  wrote before it failed. The framed buffer now holds a whole packet and after it the longer of the flush and git's
+  71-byte band-3 packet (65,591 bytes, charged with the packet's data); it held the packet alone, so a pack whose last
+  data filled its packet grew the buffer past its charge.
 - **Stateless only.** Over SSH a v0 client speaks in rounds on one stream and the server keeps what each round taught
   it; that is owed. git's client speaks v2 over SSH since 2.26, and v2 is stateless by design.
 - **Tests** (`src/upload/tests/v0.rs`, 8; the v0 repository rebuilt from the pack git sent its clone):
@@ -44440,7 +44449,8 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
 
 Part 3 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload/v0.rs`,
 new, with `upload/tests/v0.rs`; `upload/mod.rs`, v0 and v1 dispatched and their refusals; `upload/answer.rs`, the
-pack's framing; `upload/advertise.rs`, `upload/refs.rs` and `upload/fetch.rs`, what v0 shares; `negotiation/mod.rs`,
+pack's framing, one source call a step and packets framed full; `upload/fragments.rs`, new, with
+`upload/tests/fragments.rs`, the pack from A-639's stream; `upload/advertise.rs`, `upload/refs.rs` and `upload/fetch.rs`, what v0 shares; `negotiation/mod.rs`,
 `ready`, `shallow_update` and `Request::thin`; `negotiation/objects.rs` and its oracle, the aggressive rule; `v0.rs`,
 the ref-name rule, with its tests; `tests/store_graph.rs`; `upload/tests/refused.rs` and `upload/tests/steps.rs`).
 

@@ -12,11 +12,12 @@
 //! ended; data a call wrote that leaves it short waits in it for the next step's call. So a pack goes out in the fewest
 //! packets, the same packets whatever room the caller gives and however the source divides its work, and a call that
 //! worked and wrote nothing yet (A-639's stream counting the pack before its header) only ends its step. A source that
-//! refuses mid-pack ends the response with git's band-3 words for a pack that could not be finished: nothing follows a
-//! band-3 packet, and the client stops with them. Without side-band there is no band to say it on, so the pack stops
-//! short, as git's does, and the client finds it cut.
+//! refuses mid-pack ends the response with git's band-3 words for a pack that could not be finished, after the data it
+//! wrote before refusing, as git sends what `pack-objects` wrote before it failed: nothing follows a band-3 packet, and
+//! the client stops with them. Without side-band there is no band to say it on, so the pack stops short, as git's
+//! does, and the client finds it cut.
 
-use super::{ABORT, PackSource, Refusal, Refused, Served};
+use super::{ABORT, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::Counters;
 use crate::out::Out;
 use crate::pktline::{self, Packet};
@@ -30,9 +31,19 @@ const ERR: &[u8] = b"ERR ";
 /// Format: the flush packet, four zero digits [gitprotocol-common: "0000 (flush-pkt)"].
 const FLUSH: &[u8] = b"0000";
 
-/// Format: the most one framing holds: a packet at the format's longest, and the flush after it when the pack's last
-/// data fills it.
-const FRAMED_MOST: usize = pktline::MAX_LEN.saturating_add(FLUSH.len());
+/// Format: the length of the band-3 packet of git's words for a pack that could not be finished: the words, after the
+/// packet's length and band byte (a band packet's most less the most data it carries).
+const ABORT_PACKET: usize =
+  ABORT.len().saturating_add(pktline::MAX_LEN.saturating_sub(MAX_BAND_DATA));
+
+/// Format: the most one framing holds: a packet at the format's longest, then the flush after the pack's last data or,
+/// after the data a source wrote before it refused, git's band-3 words, whichever is longer.
+const FRAMED_MOST: usize = pktline::MAX_LEN.saturating_add(longer(FLUSH.len(), ABORT_PACKET));
+
+/// The longer of two lengths, for the bounds above.
+const fn longer(first: usize, second: usize) -> usize {
+  if first > second { first } else { second }
+}
 
 /// How an answer frames its pack's data.
 #[derive(Clone, Copy, Debug)]
@@ -250,7 +261,7 @@ impl<K> Streaming<K> {
       Ok(more) => self
         .frame_data(more)
         .or_else(|refusal| self.end_early(refusal)),
-      Err(refused) => self.end_early(Refusal::Pack(refused)),
+      Err(refused) => self.end_refused(refused),
     }
   }
 
@@ -285,11 +296,27 @@ impl<K> Streaming<K> {
     Ok(())
   }
 
+  /// Ends the pack early because its source refused: the data it wrote before refusing goes out first, in its packet,
+  /// as git sends what `pack-objects` wrote before it failed, then git's band-3 words. Refused with the source's
+  /// refusal, or with why that data could not be framed.
+  fn end_refused(&mut self, refused: PackRefused) -> Result<(), Refusal> {
+    match self.frame_data(true) {
+      Ok(()) => self.abort(Refusal::Pack(refused)),
+      Err(refusal) => self.end_early(refusal),
+    }
+  }
+
   /// Ends the response with git's band-3 words for a pack that could not be finished, in place of anything framed and
-  /// not written, or, with no band to say it on, ends it there: refused with `refusal`.
+  /// not written: refused with `refusal`.
   fn end_early(&mut self, refusal: Refusal) -> Result<(), Refusal> {
     self.framed.clear();
     self.framed_written = 0;
+    self.abort(refusal)
+  }
+
+  /// Puts git's band-3 words for a pack that could not be finished after what is framed, or, with no band to say them
+  /// on, nothing, so the pack stops short: the response ends there, refused with `refusal`.
+  fn abort(&mut self, refusal: Refusal) -> Result<(), Refusal> {
     if !matches!(self.framing, Framing::Raw) {
       sideband::write(Band::Error, ABORT, &mut self.framed);
     }
