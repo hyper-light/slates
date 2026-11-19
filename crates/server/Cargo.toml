@@ -38,6 +38,9 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
+# Mercurial's pushes landed on the repository's logs (A-657, `crate::repository::hg_push`): slates-hg reads, verifies
+# and places a push; its index and content store are slates-vcs's.
+slates-hg = { workspace = true }
 # The shared content store git's object store rides on (§4.17.1 shared piece 3): a protected branch's questions read
 # A-614's store through it (`crate::git_protect`, A-644).
 slates-vcs = { workspace = true }
