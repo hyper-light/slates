@@ -3,7 +3,7 @@
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
-> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** OWED: derived data as one mechanism (the tool stores as types under it); merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
+> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). OWED: part 2, A-614's D(k) rows as a type (A-647); A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
 >
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** OWED: A-603's repository-wide register position replaced by each green's own log; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own (g261, with A-635/A-636).
 >
@@ -588,8 +588,7 @@
 > Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against one
 > history stock 7.2 stored five ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
-> import, with later pieces: the phase roots, bookmarks and markers beside the logs (pieces 5 and 7; until then an
-> import holds every changeset, secret ones too, and must not be served); the import sliced under the shard's step
+> import, with later pieces: the import sliced under the shard's step
 > budget and resumed after a host's pending read, rather than run again; revlogs read by ranges rather than whole; a
 > text rebuilt from the one before it where its chain passes through it (7.2's revision cache), rather than from its
 > chain's base; a manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from §4.15's
@@ -604,13 +603,18 @@
 > audits them (transcribed: the first audit, written from the design's summary, took `a/.hg/b`, which 7.2 refuses), and
 > a line's move made A-618's work over its flat manifests laid out as directories named by their content; held to stock
 > 7.2's bundles (each branch head landed holding exactly what `hg cat` recorded) and hand-made changegroups breaking
-> each rule; red nine ways. **Built (A-650 part 2):** the session over a byte channel (`serve::stdio`), the entry point
-> the daemon's SSH edge (A-651) calls with the session channel's bytes: one answer held at a time, standard error before
-> standard output, the consumed bytes given back to the window, a request needing more than the window refused out of
-> band; proven by 259 of 259 on the Mac Studio (red 5 of 5 with the step held waiting), the three captured sessions
-> handed in at every cut down to a byte. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH
-> edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump, the process around `slates hg serve
-> --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
+> each rule; red nine ways. **Built (A-649 part 2):** the phase roots, bookmarks and markers imported as 7.2 reads them
+> (`phaseroots` strict as `_readroots`, bookmarks lenient as `bmstore`, the obsstore checked whole); the phase roots and
+> bookmarks returned typed for the register, the repository's mutable state (an import is not served before the
+> register's entry holds them); the markers kept as the index's `M` rows in the obsstore's order; red first (5 failed),
+> 261 of 261, against a history 7.2 kept with drafts, an amend, a secret changeset, bookmarks and markers
+> (`crates/hg/fixtures/state`). **Built (A-650 part 2):** the session over a byte channel (`serve::stdio`), the entry
+> point the daemon's SSH edge (A-651) calls with the session channel's bytes: one answer held at a time, standard error
+> before standard output, the consumed bytes given back to the window, a request needing more than the window refused
+> out of band; proven by 259 of 259 on the Mac Studio (red 5 of 5 with the step held waiting), the three captured
+> sessions handed in at every cut down to a byte. Owed, in order, after §4.17.1's seven pieces: (4, rest) read
+> serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump, the process around
+> `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
 > the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
 > (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
@@ -2510,22 +2514,37 @@
 > merge crate's integration suites and clippy.
 > Bug record: `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
 
+> **A rebased work restates its links after its own renames and removals: found open (2026-11-19, A-646's sweep, g267,
+> by reading; §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).** A clean rebase restates the verdict's
+> effects as the work's journal in the verdict's order: content first (renames, creates, unlinks), then the metadata
+> dimensions, hard links among them. A volume has real inodes, so a link restated after a rename or removal of the node
+> it names meets the path afterwards. Three cases go wrong:
+> - `ln g l; mv f g` would put `l` on `f`'s file, not `g`'s old one;
+> - a link to a node the work renames would be restated after the node left its path (A-646's made node resolved to
+>   the rename's source);
+> - a link to a node the work also removes would meet an empty path.
+>
+> The verdict and the commit are right; only the restatement's order is wrong. Owed: a failing test of each, then
+> restating a work's links after its creates and before its renames and removals, and a rebased journal replayed into a
+> volume compared with the green.
+
 > **Three siblings of A-643's verdicts: the first and third fixed by A-646 part 1, the second owed (2026-11-19, A-643's
 > sweep, g267; §4.16 "The verdict"; POSIX `rename`).**
 > 1. Fixed (A-646 part 1): a rename over a symbolic link, a hard link or an IPC node with no concurrent change replaces
 >    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
 >    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
 >    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
-> 2. The engine's half fixed (A-646 part 2a; §4.16's decision): a hard link names its node, never a path. A removed or
->    replaced home hands the node to its least surviving link, with its content or IPC node, mode and attributes. A
->    renamed home's links follow it, and a later file at the path is another node. A link a work makes names the node
->    at its target at the work's base, or the work's own. Red on kiln r1019 (9 failed: links left naming an empty path,
->    a new file, or a link); green on r1019, 124 of 124, and merged with main on r1032, 126 of 126. Owed, part 2b: the ops document says so, a node table a link
->    names, under a new format version with golden vectors re-derived (A-621's way). Bug record:
->    `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+> 2. Fixed (A-646 parts 2a and 2b; §4.16's decision): a hard link names its node, never a path. In the engine (2a), a
+>    removed or replaced home hands the node to its least surviving link, with its content or IPC node, mode and
+>    attributes; a renamed home's links follow it; a later file at the path is another node (red on kiln r1019; green
+>    124 of 124, merged 126 of 126 on r1032). In the ops document (2b), version 3 holds a node table a link names, the
+>    node at its target at the work's base or the one the work makes, its golden vectors re-derived independently
+>    (218 bytes, `553a422f…6c0d92`) and the determinism gate holding with nodes (red on r1104, 12 failed; green 134
+>    of 134; merged with main on r1111, 141 of 141). Bug record: `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
->    (`links_to`), two lookups where it scanned every attribute change and every hard link. A counter test shows 2
->    entries examined where the scan examined 2,000 (r960).
+>    (`links_to`), two lookups where it scanned every attribute change and every hard link; a counter test shows 2
+>    entries examined where the scan examined 2,000 (r960). Since part 2a it is one lookup, its last change: the links
+>    naming the node keep it rather than refuse its removal.
 > Bug record (1, 3): `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found

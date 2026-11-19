@@ -1,0 +1,11 @@
+00changelog.d
+00changelog.i
+00manifest.i
+data/a.i
+data/b.i
+data/c.i
+data/d.i
+fncache
+obsstore
+phaseroots
+requires
