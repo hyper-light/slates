@@ -1,8 +1,9 @@
 //! The FUSE transport's coherence state beyond the delivery rounds (§4.6 "Cache posture"): the journal records its
 //! own requests took, the files open for writing, the byte states of the dirty-page write-back rule, and the names the
-//! kernel holds. The rounds themselves (`Coherence`, `Delivered`) are every transport's and live in
-//! `slates_bridge_core::delivery`. The rules are pure, cfg-free and unit-tested on every host; the Linux transport
-//! (`crate::channel`) runs them against a real mount.
+//! kernel holds, with the round that invalidates them all when the mount falls behind the journal ([`OverrunRound`]).
+//! The rounds themselves (`Coherence`, `Delivered`) are every transport's and live in `slates_bridge_core::delivery`.
+//! The rules are pure, cfg-free and unit-tested on every host; the Linux transport (`crate::channel`) runs them against
+//! a real mount.
 
 /// The spans of journal sequences the transport's own requests took (§4.6, the
 /// dirty-page write-back rule; `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`).
@@ -837,17 +838,18 @@ impl KernelHolds {
       .map(|(&node, _)| node)
   }
 
-  /// What an `Everything` invalidates ([`KernelHolds::everything`]), taking the names away as it goes: once the round
-  /// is written the kernel has dropped or expired each, and a later use is a new lookup that names it again. The nodes
-  /// stay, since an invalidation takes no lookup away. Taken when the round is built, not when it returns: a lookup
-  /// answered meanwhile then adds its name back, so a name the kernel holds is never missing.
-  pub fn invalidate_everything(&mut self) -> (Vec<u64>, Vec<(u64, String)>) {
-    let held = self.everything();
-    self.names.clear();
-    for set in self.named.values_mut() {
-      set.clear();
-    }
-    held
+  /// The first name the kernel holds after `after` in `(parent, name)` order, or the first of all for `None`: what an
+  /// overrun round walks a slice at a time ([`OverrunRound`]).
+  fn name_after(&self, after: Option<&(u64, String)>) -> Option<(u64, String)> {
+    let from = match after {
+      Some(after) => std::ops::Bound::Excluded(after),
+      None => std::ops::Bound::Unbounded,
+    };
+    self
+      .names
+      .range::<(u64, String), _>((from, std::ops::Bound::Unbounded))
+      .next()
+      .map(|(key, _)| key.clone())
   }
 
   /// Notes that `name` in `parent` names `node`, taking the name from whatever node it named before.
@@ -860,6 +862,203 @@ impl KernelHolds {
       set.remove(&key);
     }
     self.named.entry(node).or_default().insert(key);
+  }
+}
+
+/// The round a mount owes once it falls behind the journal's retention and is told
+/// [`slates_bridge_core::Invalidation::Everything`] (A-141): an attribute-and-data invalidation of the root (the
+/// kernel's node 1) and of every node the kernel references, and an entry invalidation of every name it holds
+/// ([`KernelHolds`]), marked to expire, which a kernel that took `FUSE_EXPIRE_ONLY` does so a busy directory is
+/// revalidated rather than torn down. Each name is taken away as it is told, since the kernel has then dropped or
+/// expired it and a later use is a new lookup that names it again
+/// (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`).
+///
+/// **Slices** (A-562). The round is as large as what the kernel holds, tens of thousands of nodes and names for a tree a
+/// build walked, and each message is built on the serving thread, which CLAUDE.md's bounded-work rule and A-158's
+/// takeover round bound to the owner's budget. So a slice tells what its budget allows and at least one item, walked in
+/// one order — the root, the nodes by id, then the names by `(parent, name)` — from where the last slice stopped
+/// ([`OverrunRound::slice`]). A round whose first slice stops short is counted, and so is every slice that resumes one.
+///
+/// **Nothing lost.** The kernel's holdings may change between slices. An item it gives back needs nothing: its next use
+/// is a lookup, answered fresh. One handed out after the overrun was answered from the volume as it then stood, so it is
+/// fresh too, wherever it falls in the walk; one ahead of the walk is told anyway, which costs a lookup. An item the
+/// kernel held at the overrun and still holds is still in the set, so the walk either has told it since or reaches it.
+/// A name is taken away when it is told, not when the round returns, so a lookup answered meanwhile adds it back.
+///
+/// **Overrun again.** A mount that falls behind again while a lap is under way owes a whole lap after it: the lap under
+/// way finishes, and another begins at the root. So every item is told within two laps of any overrun, and a mount that
+/// keeps falling behind still has every item told once a lap.
+#[derive(Debug, Default)]
+pub struct OverrunRound {
+  /// Where the lap under way stands; `None` while no lap is owed.
+  lap: Option<Lap>,
+  /// Whether another whole lap is owed once this one ends: the mount fell behind again while it was under way.
+  again: bool,
+  /// How far the kernel had been told of the journal before the earliest overrun still owed, until the round is told
+  /// whole ([`OverrunRound::told_before`]).
+  told_before: Option<u64>,
+  /// Rounds whose first slice stopped short since this was last read: each outgrew its turn. Read and cleared by the
+  /// owner.
+  outgrown: u64,
+  /// Slices that resumed a lap where an earlier one stopped since this was last read: the sliced path's non-vacuity
+  /// count. Read and cleared by the owner.
+  resumed: u64,
+}
+
+/// Where an overrun lap stands: the last item it told ([`OverrunRound`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Lap {
+  /// Nothing yet: the root comes first.
+  Start,
+  /// The root and the nodes through `through` told (`None`: the root alone).
+  Nodes {
+    /// The last node told.
+    through: Option<u64>,
+  },
+  /// Every node told, and the names through `through` (`None`: none yet).
+  Names {
+    /// The last name told.
+    through: Option<(u64, String)>,
+  },
+}
+
+/// What an overrun lap tells next, found before it is taken ([`OverrunRound::slice`]).
+enum Next {
+  /// The root, the kernel's node 1 whatever the volume numbers its root.
+  Root,
+  /// A node the kernel references.
+  Node(u64),
+  /// A name the kernel holds, as `(parent, name)`.
+  Name(u64, String),
+}
+
+impl OverrunRound {
+  /// The mount fell behind the journal's retention: a round is owed, from the root, or another whole lap after the one
+  /// under way. `told_before` is how far its kernel had been told of the journal before this overrun's gather, which
+  /// [`OverrunRound::told_before`] answers until the round is told whole.
+  pub fn begin(&mut self, told_before: u64) {
+    if self.lap.is_some() {
+      self.again = true;
+    } else {
+      self.lap = Some(Lap::Start);
+    }
+    self.told_before = Some(
+      self
+        .told_before
+        .map_or(told_before, |told| told.min(told_before)),
+    );
+  }
+
+  /// Whether a slice of the round is owed: its owner turns at once while one is and no round is out.
+  pub fn owed(&self) -> bool {
+    self.lap.is_some()
+  }
+
+  /// How far the kernel had been told of the journal before the earliest overrun still owed: what a writer outside FUSE
+  /// waits past (AC-3.3), since the records before the overrun reach this kernel only through the round. Kept from the
+  /// overrun until the round's last slice is told ([`OverrunRound::settle`]).
+  pub fn told_before(&self) -> Option<u64> {
+    self.told_before
+  }
+
+  /// The slices sent are all told: once no lap is owed, the round's bound on [`OverrunRound::told_before`] is lifted.
+  /// Its owner calls this when a round it sent is back, and when a turn sends none.
+  pub fn settle(&mut self) {
+    if self.lap.is_none() {
+      self.told_before = None;
+    }
+  }
+
+  /// The rounds that outgrew their turn and the slices that resumed one since this was last asked, and zero afterwards,
+  /// as `(outgrown, resumed)`.
+  pub fn take_counts(&mut self) -> (u64, u64) {
+    (
+      std::mem::take(&mut self.outgrown),
+      std::mem::take(&mut self.resumed),
+    )
+  }
+
+  /// One slice of the round: hands `told` each item's invalidation, in the round's order from where the last slice
+  /// stopped, taking each name away from `holds` as it is told. `more` is asked before each item after the first; at
+  /// [`std::ops::ControlFlow::Break`] the slice stops and the rest stays owed. A lap that ends ends the slice; another
+  /// owed after it begins at the next slice.
+  pub fn slice(
+    &mut self,
+    holds: &mut KernelHolds,
+    more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
+    told: &mut dyn FnMut(slates_bridge_core::Invalidation),
+  ) {
+    let Some(mut lap) = self.lap.take() else {
+      return;
+    };
+    let resumed = lap != Lap::Start;
+    if resumed {
+      self.resumed = self.resumed.saturating_add(1);
+    }
+    let mut took = false;
+    loop {
+      let next = match &lap {
+        Lap::Start => Some(Next::Root),
+        Lap::Nodes { through } => holds
+          .nodes_after(*through)
+          .find(|&node| node != crate::bridge::FUSE_ROOT_ID)
+          .map(Next::Node),
+        Lap::Names { through } => holds
+          .name_after(through.as_ref())
+          .map(|(parent, name)| Next::Name(parent, name)),
+      };
+      let Some(next) = next else {
+        if matches!(lap, Lap::Nodes { .. }) {
+          lap = Lap::Names { through: None };
+          continue;
+        }
+        // The lap is told whole: another begins at the next slice if one is owed.
+        if std::mem::take(&mut self.again) {
+          self.lap = Some(Lap::Start);
+        }
+        return;
+      };
+      if took && more().is_break() {
+        if !resumed {
+          self.outgrown = self.outgrown.saturating_add(1);
+        }
+        self.lap = Some(lap);
+        return;
+      }
+      took = true;
+      lap = match next {
+        Next::Root => {
+          told(node_invalidation(crate::bridge::FUSE_ROOT_ID));
+          Lap::Nodes { through: None }
+        }
+        Next::Node(node) => {
+          told(node_invalidation(node));
+          Lap::Nodes {
+            through: Some(node),
+          }
+        }
+        Next::Name(parent, name) => {
+          holds.unnamed(parent, &name);
+          told(slates_bridge_core::Invalidation::Entry {
+            parent,
+            name: name.clone(),
+            expire: true,
+          });
+          Lap::Names {
+            through: Some((parent, name)),
+          }
+        }
+      };
+    }
+  }
+}
+
+/// An attribute-and-data invalidation of node `node`: all of its cached bytes, its attributes and, for a directory, its
+/// listing.
+fn node_invalidation(node: u64) -> slates_bridge_core::Invalidation {
+  slates_bridge_core::Invalidation::Inode {
+    ino: node,
+    data: slates_bridge_core::CachedBytes::ALL,
   }
 }
 
@@ -1423,7 +1622,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::super::KernelHolds;
+    use super::super::{KernelHolds, OverrunRound};
 
     /// One generated event of the FUSE lookup protocol, over a few directories, names and nodes (node 0 is a negative
     /// entry): an entry reply received, lookups given back, the mount's own unlink, or its own rename or exchange.
@@ -1536,6 +1735,244 @@ mod tests {
       assert_eq!(holds.everything(), (vec![9], Vec::new()));
       holds.forgot(9, 1);
       assert_eq!(holds.everything(), (Vec::new(), Vec::new()));
+    }
+
+    /// What an overrun slice told, as the walk names it: a node (the root is node 1) or a name.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Told {
+      Node(u64),
+      Name(u64, String),
+    }
+
+    fn told_of(invalidation: slates_bridge_core::Invalidation) -> Told {
+      match invalidation {
+        slates_bridge_core::Invalidation::Inode { ino, .. } => Told::Node(ino),
+        slates_bridge_core::Invalidation::Entry { parent, name, .. } => Told::Name(parent, name),
+        slates_bridge_core::Invalidation::Everything => panic!("a slice never tells an Everything"),
+      }
+    }
+
+    /// One slice of `round` whose budget allows `items` items: what it told, in order.
+    fn slice_of(round: &mut OverrunRound, holds: &mut KernelHolds, items: usize) -> Vec<Told> {
+      let mut left = items.saturating_sub(1);
+      let mut more = || {
+        if left == 0 {
+          std::ops::ControlFlow::Break(())
+        } else {
+          left -= 1;
+          std::ops::ControlFlow::Continue(())
+        }
+      };
+      let mut told = Vec::new();
+      round.slice(holds, &mut more, &mut |invalidation| {
+        told.push(told_of(invalidation))
+      });
+      told
+    }
+
+    fn name_told(parent: u64, name: &str) -> Told {
+      Told::Name(parent, name.to_owned())
+    }
+
+    /// A-562 (B9; GAPS "Two rounds are built whole in one turn"). Do: a kernel holding six nodes, each under one name in
+    /// directory 1 and one in directory 2, falls behind the journal; run its overrun round in slices of three items. After
+    /// the first slice the kernel forgets a node ahead of the walk and is handed a new node and name ahead of it; after
+    /// the third it is handed a name behind the walk, and the mount's own unlink takes a name ahead of it. Expect six
+    /// slices of at most three items: the root, the nodes in order, then the names in order; every node and name the
+    /// kernel held at the overrun and still holds told exactly once, and the new ones ahead told too; nothing forgotten,
+    /// unlinked or handed out behind the walk told; each told name taken away; one round outgrown and five slices
+    /// resumed; and the told bound kept until the round is settled after its last slice.
+    #[test]
+    fn an_overrun_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing()
+    {
+      let mut holds = KernelHolds::default();
+      for node in 10..16u64 {
+        holds.handed_out(1, Some(&format!("a{node}")), node);
+        holds.handed_out(2, Some(&format!("b{node}")), node);
+      }
+      let mut round = OverrunRound::default();
+      round.begin(7);
+      assert!(round.owed());
+
+      let mut slices = vec![slice_of(&mut round, &mut holds, 3)];
+      holds.forgot(14, 2);
+      holds.handed_out(1, Some("a00"), 16);
+      slices.push(slice_of(&mut round, &mut holds, 3));
+      slices.push(slice_of(&mut round, &mut holds, 3));
+      holds.handed_out(1, Some("a01"), 10);
+      holds.unnamed(2, "b12");
+      while round.owed() {
+        assert_eq!(
+          round.told_before(),
+          Some(7),
+          "the kernel stands before the overrun until the round is told"
+        );
+        assert!(slices.len() < 20, "the round ends: {slices:?}");
+        slices.push(slice_of(&mut round, &mut holds, 3));
+      }
+
+      let expected = vec![
+        vec![Told::Node(1), Told::Node(10), Told::Node(11)],
+        vec![Told::Node(12), Told::Node(13), Told::Node(15)],
+        vec![Told::Node(16), name_told(1, "a00"), name_told(1, "a10")],
+        vec![
+          name_told(1, "a11"),
+          name_told(1, "a12"),
+          name_told(1, "a13"),
+        ],
+        vec![
+          name_told(1, "a15"),
+          name_told(2, "b10"),
+          name_told(2, "b11"),
+        ],
+        vec![name_told(2, "b13"), name_told(2, "b15")],
+      ];
+      assert_eq!(slices, expected);
+      assert_eq!(
+        holds.everything(),
+        (vec![10, 11, 12, 13, 15, 16], vec![(1, "a01".to_owned())]),
+        "every told name is taken away; the one handed out behind the walk stays"
+      );
+      assert_eq!(
+        round.take_counts(),
+        (1, 5),
+        "one round outgrew its turn; five slices resumed it"
+      );
+      assert_eq!(
+        round.told_before(),
+        Some(7),
+        "kept until the last slice is told"
+      );
+      round.settle();
+      assert_eq!(round.told_before(), None);
+      assert_eq!(
+        slice_of(&mut round, &mut holds, 3),
+        Vec::<Told>::new(),
+        "nothing more is owed"
+      );
+    }
+
+    /// A-562. Do: a kernel holding four nodes and their names falls behind; one slice of two items runs; it falls behind
+    /// again, and the lap under way runs out in slices of two. Expect the told bound to be the earlier overrun's, the lap
+    /// under way to finish, then a whole second lap from the root that tells again what the first had told before the
+    /// second overrun, and the counts to say two rounds outgrew their turn.
+    #[test]
+    fn falling_behind_again_mid_lap_owes_a_whole_lap_after_it() {
+      let mut holds = KernelHolds::default();
+      for node in 10..14u64 {
+        holds.handed_out(1, Some(&format!("a{node}")), node);
+      }
+      let mut round = OverrunRound::default();
+      round.begin(30);
+      let first = slice_of(&mut round, &mut holds, 2);
+      assert_eq!(first, vec![Told::Node(1), Told::Node(10)]);
+      round.begin(40);
+      assert_eq!(
+        round.told_before(),
+        Some(30),
+        "the earlier overrun bounds the kernel"
+      );
+      let mut laps = vec![first];
+      while round.owed() {
+        assert!(laps.len() < 20, "the round ends: {laps:?}");
+        laps.push(slice_of(&mut round, &mut holds, 2));
+      }
+      let told: Vec<Told> = laps.into_iter().flatten().collect();
+      let lap = |names: &[&str]| {
+        let mut lap = vec![
+          Told::Node(1),
+          Told::Node(10),
+          Told::Node(11),
+          Told::Node(12),
+          Told::Node(13),
+        ];
+        lap.extend(names.iter().map(|name| name_told(1, name)));
+        lap
+      };
+      let mut expected = lap(&["a10", "a11", "a12", "a13"]);
+      expected.extend(lap(&[]));
+      assert_eq!(
+        told, expected,
+        "the lap under way finishes, then a whole lap tells every node again; its names were taken by the first"
+      );
+      assert_eq!(round.take_counts().0, 2, "each lap outgrew its turn");
+    }
+
+    /// One step of a generated overrun history: an event of the lookup protocol, a slice of the round whose budget allows
+    /// a few items, or the mount falling behind the journal again.
+    #[derive(Clone, Debug)]
+    enum Step {
+      Event(Event),
+      Slice(usize),
+      Overrun,
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+      prop_oneof![
+        4 => event().prop_map(Step::Event),
+        3 => (1..4usize).prop_map(Step::Slice),
+        1 => Just(Step::Overrun),
+      ]
+    }
+
+    proptest! {
+      #![proptest_config(slates_test_seeds::unseeded(ProptestConfig {
+        cases: slates_test_seeds::cases(2000),
+        .. ProptestConfig::default()
+      }))]
+
+      /// A-562, the overrun round's rule against the lookup protocol's reference model: after any history of lookups,
+      /// forgets, unlinks, renames, overruns and slices of any budget, and the round then sliced to its end, every node
+      /// and name the kernel held at an overrun was told after it, or left the kernel after it (given back, unlinked,
+      /// renamed away); and no slice told more items than its budget allowed.
+      #[test]
+      fn every_item_held_at_an_overrun_is_told_after_it_or_given_back(steps in prop::collection::vec(step(), 0..60)) {
+        let mut holds = KernelHolds::default();
+        let mut model = Model::default();
+        let mut round = OverrunRound::default();
+        let mut owed: std::collections::BTreeSet<Told> = std::collections::BTreeSet::new();
+        let drain = std::iter::repeat_n(Step::Slice(1), 200);
+        for step in steps.iter().cloned().chain(drain) {
+          match step {
+            Step::Event(event) => {
+              model.apply(&event);
+              match &event {
+                Event::HandOut(parent, byte, node) => holds.handed_out(*parent, Some(&name(*byte)), *node),
+                Event::Forget(node, count) => holds.forgot(*node, *count),
+                Event::Unname(parent, byte) => holds.unnamed(*parent, &name(*byte)),
+                Event::Rename((from_parent, from_name), (to_parent, to_name), exchange) => holds.renamed(
+                  (*from_parent, &name(*from_name)),
+                  (*to_parent, &name(*to_name)),
+                  *exchange,
+                ),
+              }
+              owed.retain(|item| match item {
+                Told::Node(1) => true,
+                Told::Node(node) => model.lookups.contains_key(node),
+                Told::Name(parent, name) => model.names.contains_key(&(*parent, name.clone())),
+              });
+            }
+            Step::Overrun => {
+              round.begin(0);
+              owed.insert(Told::Node(1));
+              owed.extend(model.lookups.keys().map(|node| Told::Node(*node)));
+              owed.extend(model.names.keys().map(|(parent, name)| Told::Name(*parent, name.clone())));
+            }
+            Step::Slice(items) => {
+              let told = slice_of(&mut round, &mut holds, items);
+              prop_assert!(told.len() <= items, "a slice of {} told {:?}", items, told);
+              for item in told {
+                if let Told::Name(parent, name) = &item {
+                  model.names.remove(&(*parent, name.clone()));
+                }
+                owed.remove(&item);
+              }
+            }
+          }
+        }
+        prop_assert!(!round.owed(), "the round ends once nothing more happens");
+        prop_assert!(owed.is_empty(), "never told after its overrun: {:?}", owed);
+      }
     }
   }
 }

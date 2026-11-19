@@ -156,12 +156,13 @@ const REVOKED_UNWOKEN: &str = "fuse.revoked_unwoken";
 /// Format: mounts ended because this node lost their volume to a takeover (A-346): each fenced as a revoked mount is, its
 /// kernel's cache dropped, then ended.
 const SUPERSEDED_ENDED: &str = "fuse.superseded_ended";
-/// Shape: the share of the shard's step quantum one slice of a takeover round may take, in permille: half, as a landing
-/// slice and a destroy slice take, so a mount taken over with a large kernel cache leaves the rest of each step to the
-/// shard's other clients (§4.3).
-const TAKEOVER_SLICE_PERMILLE: u64 = 500;
-/// Format: parts per thousand.
-const PERMILLE: u64 = 1_000;
+/// Format: rounds whose first slice ran out of its turn with items still owed (A-562): a journal gather over a backlog,
+/// or an overrun round over a large kernel cache, sent over several turns. The signal that a mount's rounds outgrow the
+/// shard's step; movement is expected after a burst of writes elsewhere or an overrun.
+const ROUNDS_OUTGROWN: &str = "fuse.rounds_outgrown";
+/// Format: slices that resumed a round where an earlier slice stopped (A-562): the non-vacuity counter of the sliced
+/// rounds, which moves whenever [`ROUNDS_OUTGROWN`] does.
+const SLICES_RESUMED: &str = "fuse.slices_resumed";
 
 /// A mounted volume being served: its device, the serve loop's state, the open-handle map that persists
 /// across requests, the registry attachment its requests are admitted under, and where it is mounted.
@@ -702,11 +703,12 @@ fn volume_changed(s: &mut ShardState, attachment: u64, waker: &std::task::Waker)
     .is_ok_and(|slot| slot.volume.wait_for_change(seen, waker))
 }
 
-/// Whether mount `attachment`, taken over from a daemon that died, has yet to send its takeover round (A-158).
-fn owes_takeover_round(s: &ShardState, attachment: u64) -> bool {
+/// Whether mount `attachment` has a slice of a round to send now (A-158, A-562): the takeover round of a mount taken
+/// over from a daemon that died, or the rest of a journal gather or an overrun round a turn's slice cut.
+fn owes_round_now(s: &ShardState, attachment: u64) -> bool {
   s.fuse_mounts
     .get(&attachment)
-    .is_some_and(|mount| mount.serve.owes_takeover_round())
+    .is_some_and(|mount| mount.serve.owes_round_now())
 }
 
 /// Whether every FUSE mount of `volume` has been told through journal record `seq` (AC-3.3; `crate::told`): asked on the
@@ -765,9 +767,10 @@ async fn wait_for_work(
     if state::with_state(|s| volume_changed(s, attachment, cx.waker())).unwrap_or(false) {
       return std::task::Poll::Ready(Ok(Woke::Change));
     }
-    // A mount taken over from a dead daemon turns at once until its takeover round is out (A-158): a kernel serving
-    // from its stale cache sends no request, and nothing may change again for a long time.
-    if state::with_state(|s| owes_takeover_round(s, attachment)).unwrap_or(false) {
+    // A mount with a round owed turns at once until it is out (A-158, A-562): its takeover round, or the rest of a round
+    // its last turn's slice cut. A kernel serving from its stale cache sends no request, and nothing may change again for
+    // a long time.
+    if state::with_state(|s| owes_round_now(s, attachment)).unwrap_or(false) {
       return std::task::Poll::Ready(Ok(Woke::Change));
     }
     std::task::Poll::Pending
@@ -937,13 +940,9 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     .unwrap_or(0)
     .max(1)
     .saturating_mul(chunk);
-  // A takeover round runs a slice per turn too (A-158), timed against the shard's live quantum.
-  mount.serve.slices_within(
-    s.config
-      .step_quantum_ns()
-      .saturating_mul(TAKEOVER_SLICE_PERMILLE)
-      / PERMILLE,
-  );
+  // A mount's rounds run a slice per turn too (A-158, A-562): its takeover round, its journal gather and its overrun
+  // round, timed together against the shard's live quantum as every clock-bounded slice is.
+  mount.serve.slices_within(s.config.copy_slice_ns());
   let dispatched = {
     let ShardState {
       store,
@@ -1039,6 +1038,9 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   s.count(WRITEBACKS_UNKNOWN, unknown);
   let overruns = mount.serve.take_journal_overruns();
   s.count(JOURNAL_OVERRUNS, overruns);
+  let (outgrown, resumed) = mount.serve.take_sliced_counts();
+  s.count(ROUNDS_OUTGROWN, outgrown);
+  s.count(SLICES_RESUMED, resumed);
   let lost_for_room = mount.serve.take_states_lost_for_room();
   s.count(STATES_LOST_FOR_ROOM, lost_for_room);
   let (bumped, unsupported, invalidated) = mount.serve.take_takeover_counts();

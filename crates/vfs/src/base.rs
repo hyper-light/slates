@@ -4717,7 +4717,7 @@ mod tests {
   ) -> Result<Vec<u8>, VfsError> {
     let mut o = vol.with_host(host);
     let size = o.stat(store, no)?.size;
-    let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+    let mut buf = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
     let n = o.read(store, no, 0, &mut buf)?;
     buf.truncate(n);
     Ok(buf)

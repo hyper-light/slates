@@ -17863,9 +17863,19 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   `FUSE_NOTIFY_INC_EPOCH`, and no inode set reaches a name. Counted: `fuse.epoch_unsupported`. The same holds for a
   mount whose session a daemon before A-158 recorded, until it is mounted again. Linux 6.9–6.15 resend requests but
   cannot bump the epoch.
-- **Two rounds are built whole in one turn (open, from A-158).** A-141's `everything_told` and the journal gather each
-  build a round over everything they name on the serving thread, against the bounded-work rule the takeover round now
-  follows. Not measured.
+- **Two rounds are built whole in one turn (closed 2026-11-18 by A-562; open from A-158).** A-141's `everything_told`
+  and the journal gather each built a round over everything they named on the serving thread, against the bounded-work
+  rule the takeover round follows. Now one budget a turn, half the shard's live step quantum, bounds the takeover round,
+  the gather (by record) and the overrun round (`OverrunRound`, by node, then name) together, each resuming where its
+  last slice stopped; counted `fuse.rounds_outgrown` and `fuse.slices_resumed` (WinFsp's gather too, `winfsp.*`).
+  Red first: `a_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing` (bridge-core) and
+  `an_overrun_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing` (bridge-fuse).
+- **Two walks of a backlog still run whole in one turn (open, from A-562).** The gather's base-plane half lists the
+  loaded entries of every hinted directory in the slice whose journal half reaches the head, all loaded directories
+  after a watcher overflow. Slicing it needs a resume point a hint sequence shares between directories, and one within a
+  directory's hash order. And the byte states take every record through the head at a round's first slice
+  (`feed_states`), tens of nanoseconds a record against the gather's microseconds, so a write-back's pending records
+  stay few; slicing it would leave a write-back to judge the rest of the backlog. Not measured.
 - **A CLI attachment dies about a second after its `attach` exits (open, found 2026-10-23; fixed 2026-11-06 by A-230,
   bug-sweep).** A CLI attachment now holds a term, the failover SLO as the write lease's, renewed by each verb that names
   it. It ends at the lapse with its lease, and a later use is refused `AttachmentExpired`. Red first:

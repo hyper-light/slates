@@ -2857,6 +2857,21 @@ live step quantum, walked in inode order from where the last slice ended. The mo
 and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44 cannot drop a
 renamed-away name this way, which is counted (`fuse.epoch_unsupported`).
 
+**Every round a mount builds on its serving thread is sliced** (A-562). The journal gather walks a backlog of records,
+the overrun round every node and name the kernel holds, and the takeover round its inode set; each grows with what
+others did, so none may take a whole turn. One budget bounds a turn's rounds together: half the shard's live step
+quantum, the share every clock-bounded slice takes. Each round takes at least one item a turn, in a fixed order from
+where its last slice stopped: the gather by record, the cursor moving through the records it took; the overrun round
+by the root, the nodes by id, then the names, each name taken away as it is told. The mount turns at once while any
+round is owed and none is out. Nothing is lost: the cursor never passes a record not gathered, and an item the kernel
+held at an overrun stays in the set until the walk tells it, unless the kernel gives it back. A mount that falls behind
+again mid-lap owes a whole lap after it. Until the overrun round is told whole, a writer outside FUSE waits on that
+mount as on one told nothing past where it fell behind (AC-3.3). The byte states still take every record through the
+head at each round, so a write-back's pending records stay few, and a record is fed once. A round whose first slice
+runs out of its turn is counted (`fuse.rounds_outgrown`, `winfsp.rounds_outgrown`), and every slice that resumes one
+(`fuse.slices_resumed`, `winfsp.slices_resumed`). A round's backlog is measured at each slice in a segment's records at
+most, from per-segment running charges, where the measurement once walked the whole backlog.
+
 §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,

@@ -136,7 +136,8 @@ holds the file open, so the premise holds: 8 of 8 suite runs after.
 - **Kernels before FUSE 7.44** keep a name renamed or removed away after a takeover; counted as
   `fuse.epoch_unsupported`. So does a mount whose session a daemon before A-158 recorded, until it is mounted again.
 - **Unsliced rounds.** A-141's `everything_told` and the journal gather each build a whole round in one turn, against
-  the bounded-work rule this change follows for the takeover round.
+  the bounded-work rule this change follows for the takeover round. Closed 2026-11-18 by A-562: one turn budget slices
+  all three.
 - **A CLI attachment dies about a second after its `attach` process exits** (above): a dead client's attachments are
   removed by design, so `docs/cli.md`'s `attach` then `write`/`detach` from later processes races the reaper.
 - **A create's entry invalidation.** Since A-137 no lookup miss is cached, so the entry invalidation that follows

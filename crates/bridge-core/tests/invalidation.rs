@@ -155,7 +155,11 @@ impl Overlay {
     let cursor = self.cursor;
     let (owed, next, result) = self.bridge(|b, cx| {
       let mut owed = Vec::new();
-      let next = b.invalidations(cx, cursor, &mut owed).unwrap();
+      let next = b
+        .invalidations(cx, cursor, &mut owed, &mut || {
+          std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
       let result = f(b, cx);
       (owed, next, result)
     });
@@ -220,7 +224,9 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   };
   let mut owed = Vec::new();
   let cursor = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert!(
     owed.is_empty(),
@@ -232,7 +238,9 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   vol.write(&mut store, f_no, 0, b"hello").unwrap();
   vol.truncate(&mut store, f_no, 2).unwrap();
   let cursor = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     owed,
@@ -248,7 +256,9 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   vol.rename(&mut store, root_h, "f", root_h, "g").unwrap();
   vol.create_file(&mut store, root_h, "h", 0o644).unwrap();
   let cursor = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     owed,
@@ -266,7 +276,9 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   // A chmod through the SDK is attributes only: the pages stay.
   vol.chmod(&mut store, f_no, 0o600).unwrap();
   let _ = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(owed, vec![inode(f, CachedBytes::Kept)]);
 }
@@ -345,7 +357,9 @@ fn a_content_change_owes_its_kernel_the_bytes_it_touched_not_the_whole_file() {
       &mut handles,
       None,
     )
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
     let expected: Vec<Invalidation> = expected
       .into_iter()
@@ -393,7 +407,9 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
   vol.write(&mut store, a, 0, b"new").unwrap();
   let mut owed = Vec::new();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     owed,
@@ -406,7 +422,9 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
     vol.write(&mut store, b, 0, &[round]).unwrap();
   }
   let next = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     owed,
@@ -418,7 +436,9 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
 
   owed.clear();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, next, &mut owed)
+    .invalidations(&cx, next, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert!(owed.is_empty(), "caught up: {owed:?}");
 }
@@ -452,7 +472,9 @@ fn each_current_round_records_what_waited_for_it_and_a_pinned_round_records_noth
 
   let mut owed = Vec::new();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   let measure = vol.op_log().measure();
   assert_eq!(measure.rounds, 1, "one current round, one measurement");
@@ -483,7 +505,9 @@ fn each_current_round_records_what_waited_for_it_and_a_pinned_round_records_noth
   attachments.set_coherence(pinned_id, slates_bridge_core::CacheCoherence::Invalidated);
   let pinned = attachments.context(pinned_id).unwrap();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&pinned, cursor, &mut owed)
+    .invalidations(&pinned, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     vol.op_log().measure().rounds,
@@ -541,10 +565,14 @@ fn a_current_round_moves_its_readers_point_and_a_pinned_round_moves_none() {
   assert!(cursor.journal_seq > opened_at, "the changes were journaled");
   let mut owed = Vec::new();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&current, cursor, &mut owed)
+    .invalidations(&current, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&pinned, cursor, &mut owed)
+    .invalidations(&pinned, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     vol.op_log().slowest_reader(),
@@ -608,7 +636,9 @@ fn round(
     &mut handles,
     None,
   )
-  .invalidations(cx, cursor, &mut owed)
+  .invalidations(cx, cursor, &mut owed, &mut || {
+    std::ops::ControlFlow::Continue(())
+  })
   .unwrap();
   owed
 }
@@ -816,7 +846,10 @@ fn a_scoped_view_filters_an_out_of_scope_base_plane_hint() {
   let cursor = base.cursor;
   let unscoped = base.bridge(|b, cx| {
     let mut owed = Vec::new();
-    b.invalidations(cx, cursor, &mut owed).unwrap();
+    b.invalidations(cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
+    .unwrap();
     owed
   });
   assert!(
@@ -830,7 +863,11 @@ fn a_scoped_view_filters_an_out_of_scope_base_plane_hint() {
   let owed = f.bridge(|b, cx| {
     let mut scoped = ScopedBridge::new(b, scope_ino);
     let mut owed = Vec::new();
-    scoped.invalidations(cx, cursor, &mut owed).unwrap();
+    scoped
+      .invalidations(cx, cursor, &mut owed, &mut || {
+        std::ops::ControlFlow::Continue(())
+      })
+      .unwrap();
     owed
   });
   assert!(
