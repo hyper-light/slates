@@ -262,6 +262,10 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::InvalidName => Refusal::InvalidName,
     // A green live members of its lineage were made from is pinned by them, as a snapshot by its clones (A-575).
     DbError::BranchedFrom { .. } => volume(VolumeRefusal::Pinned),
+    // A review record's change its rules refuse (§4.17.1 shared piece 6, A-596): an argument the change does not take
+    // (a version not after the record's, an approval bound back, an outdated comment moved). No verb records review
+    // operations yet; the review verbs (owed) type their refusals on the wire, as A-299 did the database's.
+    DbError::Review(_) => volume(VolumeRefusal::Invalid),
   }
 }
 
@@ -373,6 +377,29 @@ mod tests {
           refusal: VolumeRefusal::Memory
         },
         "{memory:?}"
+      );
+    }
+  }
+
+  /// A-596 (§4.17.1 shared piece 6). Do: map each rule a review record's change can break. Expect each typed as the
+  /// volume core's `Invalid`, an argument the change does not take, never words.
+  #[test]
+  fn every_review_refusal_is_typed() {
+    use slates_db::error::ReviewRefusal;
+    for rule in [
+      ReviewRefusal::Outdated,
+      ReviewRefusal::Stale,
+      ReviewRefusal::NotAfter,
+      ReviewRefusal::Behind,
+      ReviewRefusal::Ended,
+      ReviewRefusal::Empty,
+    ] {
+      assert_eq!(
+        refusal_of_db(&DbError::Review(rule)),
+        Refusal::Volume {
+          refusal: VolumeRefusal::Invalid
+        },
+        "{rule:?}"
       );
     }
   }

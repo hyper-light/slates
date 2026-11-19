@@ -241,6 +241,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1631,6 +1640,7 @@ name = "slates-git"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "crc32fast",
  "proptest",
  "sha1-checked",
  "slates-test-seeds",
@@ -1648,6 +1658,7 @@ name = "slates-hg"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "sha1-checked",
  "slates-test-seeds",
 ]
 
@@ -1863,6 +1874,15 @@ dependencies = [
  "rustls",
  "slates-machine",
  "slates-rt",
+ "slates-test-seeds",
+]
+
+[[package]]
+name = "slates-vcs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proptest",
  "slates-test-seeds",
 ]
 

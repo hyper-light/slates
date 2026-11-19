@@ -178,6 +178,11 @@ pub struct PartitionSnapshot {
   /// Every lineage's members (§4.17.1 item 4, A-575; appended), lineage by lineage in id order, each in the order it
   /// joined.
   pub repository_members: Vec<crate::catalog::MemberRecord>,
+  /// The review comments of this partition's repositories (§4.17.1 shared piece 6, A-596; appended), by repository,
+  /// request and number.
+  pub review_comments: Vec<crate::catalog::ReviewCommentRecord>,
+  /// Their approvals (A-596; appended), by repository, request and approver.
+  pub review_approvals: Vec<crate::catalog::ReviewApprovalRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -330,6 +335,9 @@ pub struct Partition {
   /// The repositories and their namespaces (§4.17.1, A-515): repositories bounded by `caps.volumes`, bindings by the
   /// greens each binds.
   repositories: crate::repository::Repositories,
+  /// The review records of those repositories (§4.17.1 shared piece 6, A-596): their bytes counted in
+  /// `green_chain_bytes` against the merge byte budget; they leave with their review's close and their repository.
+  reviews: crate::review::Reviews,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -461,6 +469,7 @@ impl Partition {
       captured_bases: std::collections::BTreeSet::new(),
       carried: BTreeMap::new(),
       repositories: crate::repository::Repositories::new(),
+      reviews: crate::review::Reviews::new(),
       tombstones: BTreeMap::new(),
     }
   }
@@ -468,6 +477,11 @@ impl Partition {
   /// The repositories this partition holds and their namespaces (§4.17.1, A-515).
   pub fn repositories(&self) -> &crate::repository::Repositories {
     &self.repositories
+  }
+
+  /// The review records of this partition's repositories (§4.17.1 shared piece 6, A-596).
+  pub fn reviews(&self) -> &crate::review::Reviews {
+    &self.reviews
   }
 
   /// What the catalog holds under `id`, as a repository's namespace asks it (§4.17.1: a namespace binds greens).
@@ -1498,6 +1512,19 @@ impl Partition {
       | Op::RepositoryGreenJoined { .. } => self
         .repositories
         .check(op, self.caps.volumes, |id| self.held(id)),
+      // A review record keeps §4.17.1's rules (A-596): `crate::review`; its bytes fit the merge byte budget.
+      Op::ReviewCommented { .. }
+      | Op::ReviewCommentMoved { .. }
+      | Op::ReviewCommentOutdated { .. }
+      | Op::ReviewApproved { .. }
+      | Op::ReviewApprovalStaled { .. }
+      | Op::ReviewClosed { .. } => {
+        self
+          .reviews
+          .check(op, |id| self.repositories.repository(id).is_some())?;
+        let (released, added) = self.reviews.charge(op);
+        self.merge_bytes_fit(released, added)
+      }
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1976,8 +2003,28 @@ impl Partition {
       | Op::RepositoryBranchAdded { .. }
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
-      | Op::RepositoryDestroyed { .. }
       | Op::RepositoryGreenJoined { .. } => self.repositories.apply(op),
+      // A destroyed repository's review records leave with it, their bytes back to the merge budget (A-596).
+      Op::RepositoryDestroyed { repository } => {
+        self.repositories.apply(op)?;
+        let released = self.reviews.repository_removed(*repository);
+        self.green_chain_bytes = self.green_chain_bytes.saturating_sub(released);
+        Ok(())
+      }
+      Op::ReviewCommented { .. }
+      | Op::ReviewCommentMoved { .. }
+      | Op::ReviewCommentOutdated { .. }
+      | Op::ReviewApproved { .. }
+      | Op::ReviewApprovalStaled { .. }
+      | Op::ReviewClosed { .. } => {
+        let (released, added) = self.reviews.charge(op);
+        self.reviews.apply(op)?;
+        self.green_chain_bytes = self
+          .green_chain_bytes
+          .saturating_sub(released)
+          .saturating_add(added);
+        Ok(())
+      }
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -2626,6 +2673,8 @@ impl Partition {
       repositories: self.repositories.repositories().cloned().collect(),
       repository_branches: self.repositories.bindings().collect(),
       repository_members: self.repositories.memberships().collect(),
+      review_comments: self.reviews.comment_records().cloned().collect(),
+      review_approvals: self.reviews.approval_records().cloned().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2875,6 +2924,13 @@ impl Partition {
       &snapshot.repository_branches,
       &snapshot.repository_members,
     )?;
+    // The review records, charged to the merge byte budget as when they were recorded (A-596).
+    p.reviews = crate::review::Reviews::restore(
+      &snapshot.review_comments,
+      &snapshot.review_approvals,
+      |id| p.repositories.repository(id).is_some(),
+    )?;
+    p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.reviews.bytes());
     Ok(p)
   }
 

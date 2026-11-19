@@ -1,0 +1,17 @@
+tree bd75f28ba73f4c6b7d6dddf980ffb74939fd974b
+parent e897a536510e96d16e260188439b09e85626ddce
+parent e8e18325b043aaa4c241f21dd83423f23406323c
+author A U Thor <author@example.com> 1112911993 +0000
+committer C O Mitter <committer@example.com> 1112911993 +0000
+mergetag object e897a536510e96d16e260188439b09e85626ddce
+ type commit
+ tag v1
+ tagger C O Mitter <committer@example.com> 1112911993 +0000
+ 
+ version one
+ -----BEGIN PGP SIGNATURE-----
+ 
+ bm90IGEgc2lnbmF0dXJl
+ -----END PGP SIGNATURE-----
+
+merge tag v1
