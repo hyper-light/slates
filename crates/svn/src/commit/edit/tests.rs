@@ -209,9 +209,9 @@ fn applied(stream: &[u8], path: &[u8], base: &[u8]) -> Vec<u8> {
 
 /// A-617 (§4.17.4 item 3.2, "A text change"; `editorp.c` 762-827: a file's `textdelta-chunk`s are one svndiff stream).
 /// Do: gather each recorded file's chunks between `apply-textdelta` and `textdelta-end`, decode every stream whole,
-/// and apply four of them to the texts the recording script made. Expect: every stream decodes; the import's `a.txt`,
-/// the edit's `a.txt`, the replacement's `c.txt` and the large file's edit across three windows come out as the script
-/// wrote them.
+/// and apply five of them to the texts the recording script made. Expect: every stream decodes; the import's `a.txt`
+/// and binary file (its session rooted at the trunk, so `project/...`), the edit's `a.txt`, the replacement's `c.txt`
+/// and the large file's edit across three windows come out as the script wrote them.
 #[test]
 fn the_text_deltas_of_stock_commits_are_whole_svndiff_streams() {
   for (name, stream) in SESSIONS {
@@ -221,7 +221,9 @@ fn the_text_deltas_of_stock_commits_are_whole_svndiff_streams() {
     }
   }
   let session = |name: &str| SESSIONS.iter().find(|(at, _)| *at == name).unwrap().1;
-  assert_eq!(applied(session("import"), b"a.txt", b""), b"alpha\nbeta\ngamma\n");
+  assert_eq!(applied(session("import"), b"project/a.txt", b""), b"alpha\nbeta\ngamma\n");
+  let binary: Vec<u8> = (0..=u8::MAX).collect::<Vec<u8>>().repeat(4);
+  assert_eq!(applied(session("import"), b"project/binary.bin", b""), binary);
   assert_eq!(
     applied(session("edit"), b"a.txt", b"alpha\nbeta\ngamma\n"),
     b"alpha\nBETA\ngamma\ndelta\n"
