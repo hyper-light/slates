@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use slates_api::{
   ArchiveFault, AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind,
-  Error, Exhausted, Existing, Filter, Instance, Intent, Invalid, IssuerFault, KindMismatch,
+  Error, Exhausted, Existing, ExportOptions, Filter, Instance, Intent, Invalid, IssuerFault, KindMismatch,
   LandOutcome, LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval,
   MergeOutcome, MergeRecord, Missing, MountOptions, MoveTarget, PathFault, PolicyReason,
   PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source,
@@ -2940,6 +2940,10 @@ fn a_mounted_volume_binds_into_a_container_through_the_library() {
 
 /// A volume id no instance issued (A-310's conformance cases).
 const NOWHERE: VolumeId = VolumeId { bytes: [0xAB; 16] };
+/// Shape: the Unix identity one client's export is bound to (A-115, A-521).
+const CLIENT_UID: u32 = 1000;
+/// Shape: another client's identity.
+const OTHER_UID: u32 = 1001;
 /// Shape: the simulator's bound in the conformance suite: room for every volume and attachment the suite makes.
 const SIM_MOST: usize = 16;
 
@@ -3023,6 +3027,7 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   expect_strangers_refused_typed(seam, snapshot);
   expect_a_work_over_a_green_alone(seam, origin);
   expect_a_served_streams_peer_reads_its_end_at_the_detach(seam, origin);
+  expect_an_export_is_one_clients_and_ends_at_its_detach(seam, origin);
   assert!(
     matches!(
       seam.destroy_snapshot(origin, snapshot),
@@ -3046,8 +3051,8 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   );
 }
 
-/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy, serve and bind into a
-/// container a volume no one made; detach an attachment no one made; provision an overlay of a relative folder. Expect
+/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy, serve, bind into a
+/// container and export a volume no one made; detach an attachment no one made; provision an overlay of a relative folder. Expect
 /// each refused typed:
 /// `NotFound` naming the volume, the snapshot or the attachment, and the folder `NotAbsolute`.
 fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId) {
@@ -3076,6 +3081,11 @@ fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId
   // platform, so the stranger is `NotFound` whatever the host offers to bind.
   assert_eq!(
     seam.bind_into_container(NOWHERE, "/seam/nowhere", "/work", Intent::Read),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  // An export of a volume no one made (A-521): the volume is read before anything is attached.
+  assert_eq!(
+    seam.export(NOWHERE, CLIENT_UID, &ExportOptions::default()),
     Err(Error::NotFound(Missing::Volume(NOWHERE)))
   );
   assert_eq!(
@@ -3137,6 +3147,45 @@ fn expect_a_served_streams_peer_reads_its_end_at_the_detach<V: Volumes>(
     reads_its_end(&peer),
     "a detached stream's peer reads its end"
   );
+}
+
+/// The exports of `the_seam_conforms` (§4.6 "Kubernetes publication without privilege", A-115, A-521). Do: export
+/// `origin` to two clients, the second read-only; detach the first export, and detach it again; detach the second.
+/// Expect an attachment and a path of its own for each client, each path naming the volume and its attachment, and the
+/// first export ended at its detach (`NotFound` the second time).
+fn expect_an_export_is_one_clients_and_ends_at_its_detach<V: Volumes>(
+  seam: &mut V,
+  origin: VolumeId,
+) {
+  let first = seam
+    .export(origin, CLIENT_UID, &ExportOptions::default())
+    .unwrap();
+  let read_only = ExportOptions {
+    read_only: true,
+    subtree: None,
+  };
+  let second = seam.export(origin, OTHER_UID, &read_only).unwrap();
+  assert_ne!(
+    first.attachment, second.attachment,
+    "each client its own attachment"
+  );
+  assert_ne!(first.path, second.path, "each client its own capability");
+  for exported in [&first, &second] {
+    assert!(
+      exported
+        .path
+        .starts_with(&format!("/seam-origin@{:x}.", exported.attachment)),
+      "an export's path names its volume and its attachment: {exported:?}"
+    );
+  }
+  seam.detach(first.attachment).unwrap();
+  assert_eq!(
+    seam.detach(first.attachment),
+    Err(Error::NotFound(Missing::Attachment {
+      attachment: first.attachment
+    }))
+  );
+  seam.detach(second.attachment).unwrap();
 }
 
 /// A-310: the conformance suite over a real instance, in this process.

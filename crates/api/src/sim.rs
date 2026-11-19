@@ -17,9 +17,13 @@
 //! must be the volume's and writable for a writable bind), answers Slates' own runtime entry
 //! (`slates_bridge_oci::binding`), claims none of the table's evidence (no table vouched for it), and ends the bind
 //! with its mount. Where the daemon refuses another volume's mount by the table's source (macOS's NFS export names the
-//! volume) before its records, the simulator answers the records' refusal, as Linux's daemon does. A green's version is
-//! its first (no merge is simulated), and every volume's bytes are none. A host test that needs a guest's bytes runs a
-//! real instance.
+//! volume) before its records, the simulator answers the records' refusal, as Linux's daemon does. An export is a record
+//! too (A-521): [`SimVolumes::export`] makes an attachment of its own for each client and answers the path the daemon
+//! would (`/<name>@<attachment>.<token>`, [`crate::export`]), its token the attachment's id, so each export's path is
+//! its own and none is a secret (nothing serves it); it takes the client's uid, the intent and a subtree as given, since
+//! it holds no files to judge a subtree by (as a stream's), and the export ends at its detach or with its volume, never
+//! with a mount. A green's version is its first (no merge is simulated), and every volume's bytes are none. A host test
+//! that needs a guest's bytes runs a real instance.
 //!
 //! **Bounds.** Each table (volumes, attachments) holds at most what its constructor was given, the caller's own bound,
 //! and refuses past it [`Exhausted::Table`]; ids come from one counter, refused the same way at its last value.
@@ -37,6 +41,7 @@ use crate::container::ContainerBind;
 use crate::error::{
   Busy, Denied, Error, Exhausted, Existing, Invalid, KindMismatch, Missing, Note,
 };
+use crate::export::{ExportOptions, Exported};
 use crate::mount::{MountOptions, Mounted, Unmounted};
 use crate::outcome::Work;
 use crate::seam::Volumes;
@@ -107,6 +112,8 @@ enum Held {
     /// The source mount's attachment.
     mount: u64,
   },
+  /// An export's record (A-521): one client's capability, which ends at its detach or with its volume.
+  Export,
 }
 
 /// One simulated attachment.
@@ -305,7 +312,7 @@ impl SimVolumes {
             read_only: made_read_only,
             shared,
           } => Some((*id, attachment.volume, path, *made_read_only, *shared)),
-          Held::Stream { .. } | Held::Bind { .. } => None,
+          Held::Stream { .. } | Held::Bind { .. } | Held::Export => None,
         })
     };
     let (mount, mounted, path, mount_read_only, shared) = mounts()
@@ -406,6 +413,16 @@ fn binding_of(
 #[cfg(windows)]
 fn binding_of(_paths: (&str, &str), _read_only: bool, _shared: bool) -> Result<OciBinding, Error> {
   Err(not_offered())
+}
+
+/// A simulated export's token: its attachment's id in its first eight bytes, so each export's path is its own; no
+/// secret, since nothing serves it.
+fn token_of(attachment: u64) -> [u8; 16] {
+  let mut token = [0u8; 16];
+  for (slot, byte) in token.iter_mut().zip(attachment.to_le_bytes()) {
+    *slot = byte;
+  }
+  token
 }
 
 /// The refusal of a full table named `name`.
@@ -645,6 +662,19 @@ impl Volumes for SimVolumes {
     })
   }
 
+  fn export(
+    &mut self,
+    volume: VolumeId,
+    _uid: u32,
+    _options: &ExportOptions,
+  ) -> Result<Exported, Error> {
+    let Some(name) = self.volumes.get(&volume).map(|held| held.name.clone()) else {
+      return Err(Error::NotFound(Missing::Volume(volume)));
+    };
+    let attachment = self.attach(volume, Held::Export)?;
+    crate::export::exported(&name, attachment, Some(token_of(attachment)))
+  }
+
   fn detach(&mut self, attachment: u64) -> Result<(), Error> {
     if !self.attachments.contains_key(&attachment) {
       return Err(Error::NotFound(Missing::Attachment { attachment }));
@@ -855,7 +885,6 @@ mod tests {
   /// `NotFound`), and the second with its volume.
   #[test]
   fn an_export_is_one_clients_capability_and_ends_at_its_detach() {
-    use crate::export::ExportOptions;
     let mut sim = SimVolumes::new(MOST);
     let work = volume(&mut sim, "work");
     let first = sim
@@ -901,7 +930,6 @@ mod tests {
   /// `Exhausted::Table`.
   #[test]
   fn an_export_the_daemon_would_refuse_is_refused_typed_and_holds_nothing() {
-    use crate::export::ExportOptions;
     let mut sim = SimVolumes::new(1);
     let nowhere = VolumeId { bytes: [0xAB; 16] };
     assert_eq!(
