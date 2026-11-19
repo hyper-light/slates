@@ -10234,7 +10234,13 @@ entry either old or new, never torn).
    buffered information for a specified file" through a handle that may write (its documentation). No source says a
    directory's sync covers another inode's mode: fsync(2) names the file it flushes; ext4's documentation says a
    power loss loses "as much as the latest 5 seconds of metadata changes" (`commit=`); XFS's says its transactions
-   are asynchronous until a log force (A-472).
+   are asynchronous until a log force (A-472). NTFS opens a read-only file to no handle that may write: "If
+   Open.File.FileType is DataFile and (File.FileAttributes.FILE_ATTRIBUTE_READONLY && (DesiredAccess.FILE_WRITE_DATA ||
+   DesiredAccess.FILE_APPEND_DATA)), then return STATUS_ACCESS_DENIED" (MS-FSA 2.1.5.1.2.1). So a read-only file's
+   metadata entry opens it to write its attributes alone, write-through, by the rule Microsoft's File Caching states:
+   "File system metadata is always cached. Therefore, to store any metadata changes to disk, the file must either be
+   flushed or be opened with FILE_FLAG_WRITE_THROUGH". Each set through it is stored as it returns, and the batch's
+   barrier leaves the file out (A-519); those sets wait on the device on the shard, beside the directory syncs (GAPS).
    The outcome record states which durability the landing achieved, and the reply carries it with
    every Degraded cell met (A-45): a directory it could not open or sync (`Unsynced`), a media barrier
    asked for that failed (`MediaUnsynced`, as against `BarriersOnly` when not asked for), an entry of
@@ -23425,7 +23431,11 @@ Applied in the same change to:
     HKDF-SHA256 from the secret salted with both nonces, the client's proof and the daemon's confirmation each the
     attachment sealed with AES-256-GCM (the transcript as additional data, each key sealing one message at nonce
     zero). The owner shard checks the proof and retires the offer, so the secret never leaves it; the end goes by
-    `SCM_RIGHTS` with the confirmation, which the client opens before it trusts the end.
+    `SCM_RIGHTS` with the confirmation, which the client opens before it trusts the end. Since A-512 the owner first
+    claims the offer for the exchange and answers copies of the ends, keeping them until the exchange settles the
+    claim (`shards_route::settle`): retired once the client has its ends, claimable again when the hand-over failed. An
+    answer lost on its way back then loses nothing: the exchange asks once more and is answered the same claim, and no
+    other exchange can take the offer meanwhile.
   - Bounds: a shard's exchanges at its client seats (`Busy` past them), each waiting on its client while the client's
     connection lives (A-492; one liveness budget until then), the socket being the user's alone; every
     refusal is one byte naming its kind and every ending is counted (`shards.route_*`, `shards.route_claimed` the
@@ -34668,6 +34678,76 @@ Applied in the same change to: §4.16 (a status after A-247's), GAPS (class A's 
   charge it, the second to charge nothing and keep the marked work, and nothing owed after. Green on the Mac Studio
   (kiln r114, debug, 0.74 s); red with both functions back as they were (the listing taken, the install unguarded):
   the second listing empty, the second install charging the work's 96 bytes again and dropping the marked work.
+
+### A-519 — A read-only file's metadata entry lands on Windows: opened to write its attributes alone, write-through, each set stored as it returns (2026-11-19, g085, UI goal 88; §4.15 step 8; A-458, A-472)
+Applied in the same change to: §4.15 step 8 (the read-only file's rule and its sources), GAPS (A-472's owed read-only
+file: built, with what it leaves), `crates/land` (`src/windows_bits.rs`: `MetaOpen`, `meta_open`, `read_only`, the
+access rights and create options at Windows' values, and the tests; `src/os_windows.rs`: `open_to_chmod`'s second open,
+the writer's write-through files kept across a lend, `begin_barrier` leaving them out, `CHMOD_ACCESS` a directory's;
+`tests/os.rs`: the Windows test).
+- **What was there.** A file's metadata entry opened the file with `FILE_WRITE_DATA` beside its attributes, which its
+  batch's `FlushFileBuffers` needs; NTFS refuses that right to a read-only file, so the entry failed alone (A-472's
+  owed item).
+- **The sources (read 2026-11-19).**
+  - Microsoft's File Caching (learn.microsoft.com, updated 2025-03-12): "File system metadata is always cached.
+    Therefore, to store any metadata changes to disk, the file must either be flushed or be opened with
+    FILE_FLAG_WRITE_THROUGH."
+  - FlushFileBuffers (learn.microsoft.com): "The file handle must have the GENERIC_WRITE access right"; flushing every
+    file of a volume asks administrative privileges (R10 rules that out).
+  - MS-FSA 2.1.5.1.2.1, Algorithm to Check Access to an Existing File: "If Open.File.FileType is DataFile and
+    (File.FileAttributes.FILE_ATTRIBUTE_READONLY && (DesiredAccess.FILE_WRITE_DATA || DesiredAccess.FILE_APPEND_DATA)),
+    then return STATUS_ACCESS_DENIED", and with `MAXIMUM_ALLOWED` it clears the same rights; `FILE_WRITE_ATTRIBUTES`
+    is never among them.
+  - NtCreateFile (learn.microsoft.com): `FILE_WRITE_THROUGH` (0x2), "System services, file-system drivers, and drivers
+    that write data to the file must actually transfer the data to the file before any requested write operation is
+    considered complete"; `FILE_WRITE_ATTRIBUTES`, "Write the attributes of the file".
+  - So a read-only file can be neither flushed by a handle the landing may hold nor written: the documented way left is
+    the write-through open, and a set of `FILE_BASIC_INFO` needs only `FILE_WRITE_ATTRIBUTES`.
+- **The rule.** The writer opens a metadata entry's file to write its attributes and data first (the flushable open,
+  A-472). Refused, it opens the file again with `FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE` and
+  `FILE_WRITE_THROUGH`; a file that reads `READONLY` through it is kept so, and any other refusal stands. Each set
+  through it (time, bits, mode, as A-501 orders them) is stored as it returns, and the batch's barrier leaves it out.
+  The write-through files are the writer's own state, kept across a lend. A directory needs none of this: MS-FSA
+  refuses those rights to a data file alone.
+- **What it leaves.** The write-through sets wait on the device on the shard, up to three a file, beside the directory
+  syncs A-132 left there. One write-through set of the fields the entry changes, run by the barrier off the shard, would
+  end that; it is owed, to measure (GAPS).
+- **Tests.** Failing first on the Mac Studio (2026-11-19, kiln, load 14.2 to 20.6, debug): `cargo test --locked -p
+  slates-land --lib windows_bits` 1 of 6 failed, the new
+  `a_read_only_files_metadata_is_opened_write_through_to_its_attributes_alone` (the read-only open asked
+  `FILE_WRITE_DATA`). With the change (load 17.0 to 18.5): `slates-land --lib` 42 passed, the writer ignored; `cargo
+  fmt` laid the lines out. Windows only, filed for main: `the_metadata_opens_values_are_windows_own` (the values
+  against windows-sys) and `tests/os.rs`'s `a_read_only_files_metadata_entry_lands` (a file `attrib +R` made
+  read-only, marked hidden through an overlay, lands `HIDDEN` and still `READONLY`, its entry written), with the xwin
+  check and clippy.
+
+### A-512 — The socket route's take claims its offer for its exchange and keeps the ends until the exchange settles, so a lost answer loses nothing and nothing is handed twice (2026-11-19, goal 85 via g225; A-488's sibling; §4.6 the socket route; A-161, A-173, A-440, A-492)
+
+- **What was there.** On macOS an exchange asks the offer's owner shard to check the claim and hand over the ends
+  (`shards_route::take`), waiting in that shard's own time (A-440). The take retired the offer and moved its ends into
+  the answer. An owner shard that stopped for a window had its take forgotten by the exchange and ran it once it
+  resumed: the offer was retired, the answer with the ends was dropped, and dropping it closed them. A stream's other
+  side then read its end and ended the attachment; a map's copy never reached its client; a claim made again found no
+  offer.
+- **The rule.** The take claims the offer for the exchange, by the exchange's daemon nonce (`Offer::claimed_by`), and
+  answers copies of the ends; the ends stay with the offer. An ask of the same exchange is answered the same claim and
+  copies of the same ends, and every other exchange finds no offer. The exchange asks once more when its first answer
+  is lost; the second ask runs behind the first on the owner shard's channel. Once the exchange ends it settles its
+  claim there, after any take it asked (`settle`, in the owner shard's own time): `Handed` once the client has its ends,
+  which retires the offer and closes the ends kept there; `NotHanded` otherwise, which leaves the offer claimable
+  again; where the exchange holds no claim (refused, or the offer withdrawn) the settle changes nothing. The settle runs
+  behind every ask of its exchange, so no ask can claim again after it.
+- **Why this and not another.** A claim is the owner shard's effect, so its record is kept there, as A-488's seal and
+  A-505's send are, and in the offer itself, which the offer's existing bounds already count (`shards::pending_ends`
+  counts a claimed offer's ends as held, as they are). The ends are copied rather than moved because an answer between
+  shards can be lost, and an end moved into it would be closed with it.
+- **Tests.** `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice` (the first
+  take's answer dropped, the same claim asked again, another exchange's claim after) and
+  `a_claim_settled_not_handed_frees_its_offer_and_one_handed_retires_it` (`crates/server/src/shards_route.rs`). The A-440
+  and A-492 tests now read the claim where they read the retirement.
+
+Applied in the same change to: §4.6 (the socket route's claim), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, A-488's
+siblings), A-488's bug record (its Shards-route sibling closed), `crates/server/src/shards_route.rs`.
 
 ### A-518 — The lineage model states the holder rules of A-341, A-484 and A-508 and the property they keep: no let-go removes the last copy a committed record names (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; the goal's "Lineage gets its own model")
 Applied in the same change to: `docs/wip/models/Lineage.tla`, the new `docs/wip/models/MC_Lineage.tla`,

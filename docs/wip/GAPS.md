@@ -3967,7 +3967,10 @@
 >   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). **Still owed
 >   (A-513):** a work whose asks go unanswered twice keeps its record and stays unbuilt until the daemon's next start;
 >   a retry after admission, and its verbs answering `Unpublished` (A-247's word) rather than `NotFound` meanwhile, are
->   not built. Open: the Shards route's take of an offer.
+>   not built. The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
+>   its exchange and answers copies of its ends, kept on the owner shard until the exchange settles the claim, retired
+>   once handed or claimable again;
+>   `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice`).
 >   **Class C, the rendezvous's
 >   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
@@ -19085,7 +19088,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   as its documentation states; no source says a directory's sync covers another inode's metadata; its unit tests ran on
   the Mac Studio, the crash oracle's rerun filed for main; still owed with it: on Windows a file read-only when its
   metadata entry opens it fails that entry alone, since `FlushFileBuffers` needs a handle that may write and NTFS refuses
-  one to a read-only file, where a clear of the bit before the flush's open, or a measured rule, would land it; and a made
+  one to a read-only file, **built by A-519 the same day** (the read-only file opened to write its attributes alone,
+  write-through, by the rule Microsoft's File Caching states, "to store any metadata changes to disk, the file must
+  either be flushed or be opened with FILE_FLAG_WRITE_THROUGH"; MS-FSA 2.1.5.1.2.1 refuses a read-only data file
+  `FILE_WRITE_DATA` and `FILE_APPEND_DATA` alone; each set stored as it returns, the barrier leaving the file out; its
+  pure open tested on the Mac Studio, its Windows `--test os` test filed for main; still owed with it: those sets wait on
+  the device on the shard, up to three a file (its time, its bits, its mode), beside the directory syncs A-132 left
+  there, where one write-through set of the fields the entry changes, run by the barrier off the shard, would end it,
+  to measure); and a made
   directory's mode, given after `mkdirat` and synced with the directory's parent alone, has the same question, unasked
   until now, which A-501 asked and left open: a made directory is no metadata entry and joins no batch, its `mkdirat`
   and `fchmod` running in the directories' class, so syncing it whole is one more handle and sync per made directory,
