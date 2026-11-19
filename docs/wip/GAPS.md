@@ -137,6 +137,10 @@
 > `sideband-all`, `packfile-uris`); the server's refusals as `ERR` lines and band-3 errors; a duplicate `want-ref` (a
 > protocol error) caught where the server maps names to refs; the server keeping clients alive on band 2, never with
 > git's empty band-1 packet before the packfile; clippy and the cross-target lint over `src/v2` (main's run request).
+> **A-615 part 1 (2026-11-19, g296; one ref-name rule):** slates-git's two copies of git's `check_refname_format`
+> (A-590's tag-name check, A-582 part 2's protocol names) are one module, `refname`, which both callers ask; A-590's
+> golden fsck fixtures and A-582's cases both run against it, with a property test against refs.c's check transcribed
+> (144 of 144 on the Mac Studio, red twice). Owed in A-615: part 2, §4.17.2 piece 7's negotiation for upload-pack v2.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation

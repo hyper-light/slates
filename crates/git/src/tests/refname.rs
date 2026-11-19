@@ -161,25 +161,26 @@ fn a_tag_name_is_checked_as_git_checks_refs_tags_and_the_name() {
   }
 }
 
-/// A byte that reaches every disposition of `refname_disposition`, and plain ones.
-fn any_name_byte() -> impl Strategy<Value = u8> {
+/// A piece of a name: one that reaches each rule of `check_refname_format` (`.lock`, `..`, `@{`, a leading dot, every
+/// disposition of `refname_disposition`), plain bytes, or any byte.
+fn any_name_piece() -> impl Strategy<Value = Vec<u8>> {
   prop_oneof![
-    Just(b'a'),
-    Just(b'l'),
-    Just(b'o'),
-    Just(b'c'),
-    Just(b'k'),
-    Just(b'.'),
-    Just(b'/'),
-    Just(b'@'),
-    Just(b'{'),
-    Just(b'*'),
-    Just(b' '),
-    Just(b'~'),
-    Just(0u8),
-    Just(0x7fu8),
-    Just(0xc3u8),
-    any::<u8>(),
+    Just(b"a".to_vec()),
+    Just(b"main".to_vec()),
+    Just(b".lock".to_vec()),
+    Just(b"..".to_vec()),
+    Just(b"@{".to_vec()),
+    Just(b".".to_vec()),
+    Just(b"/".to_vec()),
+    Just(b"@".to_vec()),
+    Just(b"{".to_vec()),
+    Just(b"*".to_vec()),
+    Just(b" ".to_vec()),
+    Just(b"~".to_vec()),
+    Just(vec![0u8]),
+    Just(vec![0x7fu8]),
+    Just(vec![0xc3u8, 0xa9]),
+    any::<u8>().prop_map(|byte| vec![byte]),
   ]
 }
 
@@ -191,9 +192,10 @@ proptest! {
   /// `HEAD` or begins `refs/` and git passes it; a tag name exactly when git passes `refs/tags/` and the name.
   #[test]
   fn both_questions_answer_as_gits_own_check_answers(
-    tail in proptest::collection::vec(any_name_byte(), 0..14),
+    pieces in proptest::collection::vec(any_name_piece(), 0..8),
     prefix in 0usize..4,
   ) {
+    let tail = pieces.concat();
     let prefix: &[u8] = [&b""[..], b"refs/", b"refs/heads/", b"HEAD"][prefix];
     let name = [prefix, &tail[..]].concat();
     let expected = name == b"HEAD" || (name.starts_with(b"refs/") && git_check_refname_format(&name));
