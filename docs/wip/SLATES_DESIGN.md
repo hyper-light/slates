@@ -11931,6 +11931,17 @@ decides the details.
 > long-lived branch costs its source is that history, bounded by the source's retention budget. Owed: a branch's base
 > recorded as a delta against its source's checkpoint, which ends both.
 >
+> **Status (2026-11-19, A-685: a repository made from the command line).** `slates repository create NAME --tool
+> git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]` sends `CreateRepository` through the client
+> (`Client::create_repository`, `RepositorySpec`) and prints the repository's name and its root green's id; a name any
+> repository holds is refused `AlreadyExists` (exit 1). What a creator names by default is decided beside the verb
+> (`crates/server/src/repository.rs`: `object_formats`, `root_binding`), so every surface creates alike: git's SHA-1
+> (or SHA-256), its root bound to `main` or the branch named, held to git's ref rules under `refs/heads/`; Mercurial's
+> SHA-1, its root the first line of `default` or of the branch named (`branch:<B>:0`, the name its push reads);
+> Subversion's revision numbers, its one green bound to `root`, no branch taken. A format or a branch the tool cannot
+> have is a usage error before the daemon is asked. Owed: the other repository verbs' words (`CreateBranch`,
+> `BindBranch`, `RetireBranch`, `SetRepositoryPolicy`, `ImportRepository`) on the command line, and the SDKs' and MCP's.
+>
 > **Status (2026-11-19, A-603: shared piece 2 built on the owner).** A repository's register is built in the metadata
 > database (`crates/db/src/repository.rs`, the entry's guard in `crates/db/src/repository/entry.rs`;
 > `Op::RepositoryAdvanced`). One entry commits, as one durable step, any of: several of the repository's greens'
@@ -12141,6 +12152,15 @@ is one more version, and the chain itself is never rewritten.
 > its first submit and carried by every submit with its message (`Authorship`); a repository's green refuses a submit
 > without either, `MessageRequired` or `IdentityRequired`, before any work is built (A-664 part 1). Owed: the commit
 > recorded with the version and admitted (part 3), Mercurial's and Subversion's.
+>
+> **Status (2026-11-19, A-664 part 3, first piece: the green's state as the path map).** Each member green of a git
+> repository keeps the map of paths to git's files of its head (`crates/server/src/vcs_store/paths.rs`), the map item
+> 3's derived trees read: made as each version commits on the owner, a submit's and a push's alike; derived from the one
+> before over the change index and the hard links naming each changed file; built whole where no map of the version
+> before is kept or a copy names a tree by its destination alone; given back as the green leaves its lineage; made again
+> from the head by a recovery, so the store after a recovery equals the store before (A-662). Owed: the commit derived
+> from these maps, recorded with the version and admitted to the git store (part 3's commit), Mercurial's and
+> Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -12863,6 +12883,12 @@ engine: the verdict, rebase, position mapping, the register).
 > principal's identities and the submit's message (part 1), and the made commit recorded with the version and admitted
 > to the git store (part 3, over A-662).
 >
+> **Status (2026-11-19, A-664 part 3, first piece: the path map `Trees` reads).** Built: each git green's head kept by
+> its repository's store as A-647's path map of `FileClass` entries over the shard's content store
+> (`vcs_store::paths`, §4.17.1's status), a file's content its bytes as an object, so a version's tree is derived from
+> the change between two kept maps. Part 1 is built too (A-664 part 1). Owed: the trees and the commit made from these
+> maps, admitted with the green's head moved and recorded with the version.
+>
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
 > (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
@@ -13511,8 +13537,9 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
-    A-664: part 2 built, a version's trees and commit as derived types; part 1, the principal's identities and
-    `MessageRequired` and `IdentityRequired` at submit, and part 3, the made commit recorded and admitted, owed.)
+    A-664: part 2 built, a version's trees and commit as derived types; part 1 built, the principal's identities and
+    `MessageRequired` and `IdentityRequired` at submit; part 3's first piece built, each green's map of paths to git's
+    files kept at its head (`vcs_store::paths`); the made commit recorded and admitted, owed.)
 14. A v0 and v1 fetch for older clients; `packfile-uris` and `bundle-uri`.
 15. Import of a bare repository on disk as a base (its loose objects, packs and indexes, read-only, §4.15); export by
     landing.
@@ -13932,6 +13959,37 @@ signature verification).
 > generated histories to 7.2's filter stated literally, and pins, reveals, a dropped root, an unreadable marker and
 > every room up to the least to their answers. Owed: the view handed to the daemon's sites over A-662's stores (A-680
 > part 2).
+>
+> **Status (2026-11-19, A-680 part 2a: Mercurial's site on the daemon's edge, over each repository's served view).** The
+> daemon's HTTP edge hands each request to its tool's site (`vcs_http::ToolSites`): Mercurial's for a request whose
+> query names a command, as hgweb tells a wire request from its pages (`wireprotoserver.handlewsgirequest`), git's for
+> every other, so a repository of the other tool is answered as one that does not exist. Mercurial's site reads each
+> repository through `vcs_store::hg_view::ServedViews`, the lender both edges reach a Mercurial store through: on the
+> shard the request moved to, afresh for each step, the repository's served view (A-680 part 1) over its index and the
+> shard's content store in A-662's map, with its register's phase roots and bookmarks (each `bookmark:` name's green's
+> head) as they stand then, made within the request's room. Every repository publishes until its record carries 7.2's
+> `phases.publish` (decision 3). A store the map does not hold, one an import is filling, and a view that cannot be made
+> (counted) are `503`. The register is the record: an imported repository's phase roots and bookmarks are served once
+> its import records them there (A-687). Proven on macOS arm64 (Mac Studio, kiln r357, 2026-11-19; the other platforms
+> owed): `slates-server --lib` filtered to `vcs_http::`, `vcs_store::hg_view` and the namespace's names, 51 of 51, fmt
+> clean: a two-shard daemon's edge, over TLS with a bearer token, answers `capabilities` and `heads` of a Mercurial
+> repository on the other shard whose store took `fixtures/state`'s `states` by an import, `heads` equal to its
+> history's heads read from the index, while a git repository asked as Mercurial asks is `404` and git's own request
+> still git's; the lender lends nothing while an import fills a store, for a git repository or an unknown one, or past
+> the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and the stock `hg` interop run over
+> the edge once a repository can be made from the CLI (A-685) and the edge offers hg's client Basic first (A-686).
+>
+> **Status (2026-11-19, A-690: divergent bookmarks left out where bookmarks are served).**
+> `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part both read, leaves out
+> a divergent name, one with an `@` before its end, as 7.2's `listbinbookmarks` leaves it out (`bookmarks.py` 475-484:
+> `hasnode(v) and not isdivergent(k)`); the rule is `crate::bookmarks::divergent`, which the push's refusal of a
+> divergent name now shares. Before, every bookmark naming a held changeset was listed, and A-619's oracle stated the
+> same over names that never held an `@`. Reproduced by use first (Mac Studio, stock 7.2 from PyPI, 2026-11-19):
+> `fixtures/state`'s `divergent`, where `feature` moved apart in a clone and the clone was pulled back so 7.2 kept the
+> clone's as `feature@1`, answers `@` and `feature` to `hg debugpushkey` over `hg serve`, and a clone over it holds
+> those two, where slates' view of it answered `feature@1` too. Proven on macOS arm64 (Mac Studio, kiln r340 red and
+> r356 green, 2026-11-19; the other platforms owed): `slates-hg --lib serve:: push:: bookmarks::` 93 passed and 0
+> failed, fmt clean (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14349,8 +14407,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
    index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
-   owed: the process around the stdio session, the learned response compression (the first value until then), and
-   A-662's stores handed to the site with the view over them (A-680 part 2).
+   owed: the process around the stdio session, the learned response compression (the first value until then), and the
+   site's pushes (`unbundle` through `hg_push`, A-680 part 2b). Built (A-680 part 2a, `vcs_http::ToolSites`,
+   `vcs_store::hg_view`): the site on the daemon's edge, each repository's served view lent from its store on its owner
+   shard.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -51555,6 +51615,237 @@ Applied in the same change to:
   shard of the repository its greeting names (A-688); a test of an arrival that waits for a full shard's seat and of
   one refused past the bound; main's live OpenSSH `git clone` over SSH and the other platforms' runs.
 
+### A-685 — A repository made from the command line: `slates repository create`, each tool's defaults decided beside the verb (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); §4.17.1 "The repository and its greens" item 1; §4.12; A-575's `CreateRepository`, the interop tests' first verb)
+
+Applied in the same change to: §4.17.1 (a status block), GAPS (the §4.17 entry), `docs/cli.md`, `crates/server`
+(`repository`: `object_formats`, `root_binding`, `RootRefused`, re-exported from the crate's root; `git_push`: `HEADS`
+and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_repository`; `VcsTool` and
+`ObjectFormat` re-exported), `crates/cli` (`args`: the verb, its four flags, its usage lines and two grammar tests;
+`verbs`: its answer; `tests/cli.rs`: the anchored test, the edge's request helper shared).
+- **What was there.** `CreateRepository` (A-575) was sent only by the server's own tests and the Subversion migration's
+  tests: no client or CLI verb made a repository, so no stock git, Mercurial or Subversion client could be pointed at
+  one, and every interop test was blocked on it.
+- **The verb.** `slates repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root
+  GREEN] [--json]` sends `CreateRepository` through the client (`Client::create_repository` with a `RepositorySpec`,
+  `CreateRepository`'s fields), routed to the partition the name hashes to as every repository verb is, and prints
+  `repository: NAME` and `id: ROOT`, the root green's id (the reply's `GreenCreated`), or `{"repository","id"}` under
+  `--json`. A refusal is the client's, exit 1 as every verb's: a name any repository holds, whatever its tool,
+  `AlreadyExists`; an empty name or one holding a NUL `InvalidName`; a root that cannot join `NotGreen`, `Forbidden` or
+  `NotFound`.
+- **Each tool's defaults, decided beside the verb.** A client names what the server's namespace reads, so the defaults
+  live in the server crate (`repository::object_formats`, `repository::root_binding`) and the command asks them; an SDK
+  or MCP surface creating a repository asks the same. Formats (item 1): git SHA-1, the format git takes when none is
+  named (A-600), or SHA-256; Mercurial SHA-1 alone; Subversion revision numbers alone; the first is each tool's default.
+  The root's binding: git's branch `N` is the name `N`, the ref `refs/heads/N` (`git_push`'s namespace), `main` when
+  none is named (the branch the server's push tests and its stock-git captures bind; a stock clone of the empty
+  repository takes it from the unborn `HEAD` the site advertises), held to git's ref rules (`git_push::ref_of`), and a
+  name beginning `refs/` refused since the namespace reads it as a ref of its own, never a branch; Mercurial's branch
+  `B` is its first line `branch:<B>:0`, `default`'s when none is named, the green `hg_push`'s module docs say the verb
+  makes and a new repository's first push takes (a root bound to the bare name would leave a first push "no line to
+  make a branch from"); Subversion's one green is bound to `root`, its branches being directories in it (§4.17.4), and
+  a branch named for it is refused. A format or a branch the tool cannot have is refused as usage (exit 2), naming the
+  flag, before the daemon is asked.
+- **Not taken.** A wire `default_branch` the server fills when empty: a second meaning for one field, a mode switch.
+  The defaults kept in the CLI: Mercurial's line names are the server's encoding, and a second copy would drift.
+- **Tests.** The grammar (`crates/cli/src/args.rs`): `the_grammar_parses_the_repository_verb` (each tool's defaults,
+  every flag as given, Mercurial's branch by its first line) and `the_grammar_refuses_a_repository_its_tool_cannot_have`
+  (no tool, a tool slates serves none of, a format each tool cannot name, `refs/heads/main` and `a..b` for git, a
+  branch for Subversion, a root that is no id, the verb's own form). A real anchor (`crates/cli/tests/cli.rs`,
+  `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge`): an anchor with `--vcs-http 127.0.0.1:0`; the
+  create answers the name and a 32-digit root id; the name again, for Mercurial, refused `AlreadyExists` (exit 1); a
+  Mercurial, a Subversion and a SHA-256 git repository (`--json`) each created with its defaults; a token enrolled with
+  `slates credential token` and sent as a bearer token finds the repository by its name (receive-pack's advertisement,
+  `200`) where a name no repository has answers `404`. Where no issuer surface is published (Linux) the token's leg
+  skips loudly.
+- **Runs.** macOS arm64, Mac Studio (kiln r294, 2026-11-19 22:35-22:45Z, debug, rustc 1.98.1, `CARGO_BUILD_JOBS=2`, a
+  fresh clone of the branch at dbe8ba1ef, load 7.7). Red first, on the same tree with the verb's dispatch taken out of
+  the grammar, so `repository` is unknown to it: `cargo test --locked -p slates-cli --bin slates the_grammar` 11
+  passed, 2 failed (the two above, each at its first parse); `--test cli a_repository_the_cli_creates` 1 failed, its
+  first create answered exit 2 (usage). Green: `--bin slates the_grammar` 13 of 13; `--test cli vcs_http` 3 of 3 in
+  5.2 s (this test and the two A-625 edge tests, whose request helper it now shares). `cargo fmt -p slates-cli -p
+  slates-client -p slates-server -- --check` asked for layout alone; rustfmt's own patch from that clone is applied.
+  Main's: clippy, `xtask check`, the doc gates, the Linux and Windows runs.
+- **Owed.** The other repository verbs on the command line (`CreateBranch`, `BindBranch`, `RetireBranch`,
+  `SetRepositoryPolicy`, `ImportRepository`); the SDKs' and MCP's words for them; the server's own refusal of a format
+  its tool does not name (today it records the repository, and a git one in revision numbers gets no store,
+  `vcs_store.unmade` counted; the command refuses it before asking); the Linux and Windows runs (main's).
+
+### A-664 part 3, first piece — Each git green's map of paths to git's files, kept at its head as each version commits: derived from the one before over the change index and the links it leaves out, built whole where no map of the version before is kept or a copy names a tree alone, given back as the green leaves its lineage, made again by a recovery (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.17.1 "A version" and "A push is a work" item 3; §4.17.2 "The repository in git's terms" item 5 and piece 13; A-647's owed map; A-662; A-586; after A-664 part 2)
+
+- **What it keeps** (`crates/server/src/vcs_store/paths.rs`). For each member green of a git repository, the map of
+  paths to git's files of its head: A-647's path map (`slates_vcs::derived::paths::PathMap`) whose entries are
+  `slates_git::derived::FileClass`'s, a file's content its bytes as an object in the shard's content store (A-662). A
+  regular file is `100644`, or `100755` when its owner may execute it (git keeps a regular file's owner execute bit
+  alone \[C: git `read-cache.c` `ce_mode_from_stat` and `cache.h` `create_ce_mode`, v2.50.1\]); a symbolic link
+  `120000`, its content its target; a submodule's link `160000`, its content the commit's id (A-637); a hard link a
+  file with its file's bytes and class; a named pipe, a socket or a device nothing git holds, so no file of the map.
+  One map a green (`GitStore::heads`, by the green's key, the version it is of beside its root), its root held once by
+  the store and replaced as each version commits; what two greens' heads share is held once (path copying, A-647).
+- **The head's alone, and why.** A green's next map is derived from its head's and nothing else reads an earlier one;
+  and A-662's rule is that a store made again from the log equals the live one whole, every content with its holders,
+  while an earlier version's map cannot be made again from a log a checkpoint folds. The piece's first cut kept every
+  version's map under its version (`Derivations`), which no recovery could make again; the head's is made again from
+  the green itself.
+- **When, and from what.** As each version commits on the owner: a submit's in `verbs::judge_submission` once
+  `record_accepted` has appended its record, a push's in `repository::push::push_sealed` once its register entry is
+  applied (each green the entry moved). The change is read from the green, never from a client: the paths
+  `Green::changed_between` names (the change index, A-264), and the hard links naming each (`Green::links_naming`,
+  new): the index names a change to a regular file at the file alone (a special node's links are named with it), while
+  each link reads the file's bytes and mode, so without them an overwrite of a linked file left the link's entry at the
+  old bytes (the fixed history's sixth version, red first). Each named path is set to its file at the head, or removed
+  where the map before holds a file and the head none. A directory needs nothing of its own: the map keeps a directory
+  while a file stands beneath it (A-647), and the index names each file a version makes, moves or removes, so a step
+  costs the change's paths and their directories in the map, never the green's tree.
+- **Whole, where it must be.** The map is built from the whole head where the store keeps no map of the green's version
+  before (a green's first version, a branch's first, the first after a refused step), or where a copy was made at or
+  above a named path in the span (`Green::copied_after`, new, over the engine's `replaced_after`): the index names a
+  copy at its destination alone, standing for the tree it brought (A-586). The first cut built whole wherever a named
+  path was a directory at the head, so a version that made a directory, or set a directory's mode, hashed every file
+  of the green again; a directory's files are named one by one, and only a copy's are not. No client verb makes a copy
+  yet (A-626 part 4), so `copied_after` is held by the engine's test alone and its use here is owed a test through a
+  work.
+- **Its life.** Given back as the green leaves its lineage (`vcs_store::paths::forget`, from
+  `repository::retire_member`, which reads the green's repository from its lineage before the retire ends it: a
+  destroy, a fence, a refused push's branch made in memory), since a store made again holds no map for a green that is
+  no member: the first cut kept a destroyed branch's map until its repository went. Made again from the head by a
+  recovery (`vcs_store::recover`, a green a unit, after the repository's records replay) and by `vcs_store::rebuild`;
+  freed with the repository (`vcs_store::release`).
+- **Budget and refusals.** A step's contents and nodes are lent the room the shard's budget could admit now and trued
+  up after, as A-662 charges a push. A refused step (that room, a path the map refuses, the content store's own) keeps
+  nothing new and holds nothing new, and is counted (`vcs_paths.refused`); the version's record is durable already, and
+  the green's next map is built whole. Counters: `vcs_paths.derived` (the incremental path's non-vacuity count),
+  `vcs_paths.built`, `vcs_paths.remade`, `vcs_paths.refused`.
+- **The engine's readers** (`slates-merge`, `Green`): `symlinks`, `hardlinks` and `specials`, which with `files` read
+  every name of the head that is no directory; `links_naming`; `copied_after`.
+- **Tests.** `crates/server/src/vcs_store/paths/tests.rs`, each map held, identity for identity, to the map its model
+  builds from scratch in another store with the shard's window (A-647: one map, one root, on every store): an
+  eleven-version fixed history on a git repository's root green (files made in a directory, one overwritten, one made
+  executable, a symbolic link and a hard link, a named pipe and an attribute, the hard link's file overwritten, a file
+  renamed, the symbolic link removed, an executable file moved to a new directory and the old one removed, a splice,
+  the execute bit taken away), one built and ten derived, none refused; a plain green keeps no map; a store made again
+  holds each green's map again, the next version derived from it; a branch's first version built whole, its second
+  derived; a destroyed branch takes its map with it, the store then equal to one made again from the log, every
+  content with its holders and the bytes it uses. `crates/server/src/vcs_store/tests.rs`: a push's version through
+  A-635's append keeps its map, built whole. `crates/merge/src/engine/node_tests.rs`: the links naming a file follow
+  it through a rename, and the index names a change to the file alone; `copy_tests.rs`: `copied_after` holds for a
+  copy's destination and a path beneath it after the version before the copy, never after the copy's own, never for its
+  source or a path beside it.
+- **Found, and left to its own piece** (reported to main). The green keeps a mode at its path (A-618), and a rename
+  carries a file's bytes and not its mode: `chmod +x d/a` in one version and `mv d/a x/a` in a later one land `x/a`
+  with no mode, the moved file's mode dropped with its old path, so the tree git reads holds it `100644`, where POSIX
+  `rename` and `git mv` keep it `0755` (the piece's first run, at bad1af546: the move read class 0 where the model said
+  1). The map reads the green as it is; the fixed history states the moved file's mode in the work that moves it.
+- **Runs** (macOS arm64, the Mac Studio, 2026-11-19, rustc 1.98.1, debug, `CARGO_BUILD_JOBS=2`). Red first (kiln r124,
+  dfe4617a8 with `paths.rs` and `repository.rs` put back as they stood before this change's fixes, at d752f0d1b, the
+  first cut merged with main 3612d1ef9): `cargo test --locked -p slates-server --lib vcs_store::paths::` 3 passed and 2
+  failed, the fixed history at version 6 (the link `h` still its file's old bytes, `keep` the new) and the destroyed
+  branch's map still kept (`(true, true)` against `(true, false)`). Before it, the first cut's own runs (at bad1af546):
+  with `advance` doing nothing, 4 of its 5 tests failed and the plain green's passed; with it, the fixed history failed
+  at the move (the finding above). Green (kiln r147, dfe4617a8 over main 3612d1ef9, slates-server compiled afresh):
+  `cargo test --locked -p slates-server --lib -- vcs_store:: repository:: verbs::tests vcs_http::tests::git identities`
+  120 passed, 2 ignored (measurements, not gates), none failed, among them the six tests above, A-662's and every
+  repository test (main's failure at 3329211e0, `each_verb_moves_the_names_log_and_each_members_version_its_own_log`,
+  passes on main now); that filter named none of the git edge's tests, so `-- vcs_http::git::tests` ran apart, 12 of 12;
+  `cargo test --locked -p slates-merge --lib -- engine::node_tests::
+  engine::copy_tests::a_copy_is_named_for_every_path_of_its_tree_after_the_version_before_it` 18 of 18; the integration
+  tests through the submit's step, filtered as A-664 part 1's were: `-p slates-client --test edit_and_submit` 2 of 2,
+  `-p slates-server --test daemon` 7 of 7, `--test works_off_owner` 5 of 5 and `--test fleet` 14 of 14 (178.4 s); `cargo
+  fmt -p slates-server -p slates-merge -- --check` clean. The same set on the tree as it lands, the server's filter
+  widened to the git edges whose pushes reach the map's step through `push_sealed` (A-654 part 3): the piece squashed
+  over main b94ae6e90 (kiln r242, 22:21-22:31Z), then merged with main 9f349d66b (kiln r289, 22:39-22:49Z), where
+  `rebuild` replays through main's `make_from_log` (A-655 part 2b) and makes the maps again after it: `cargo test
+  --locked -p slates-server --lib -- vcs_store:: repository:: verbs::tests vcs_http:: identities git_push::
+  --test-threads=4` 169 and then 175 passed, 2 ignored, none failed, the piece's six among them; slates-merge's 18 of
+  18; edit_and_submit 2 of 2, daemon 7 of 7, works_off_owner 5 of 5 and fleet 14 of 14 (181.8 s, 193.2 s); fmt clean.
+  Main's commits after 9f349d66b change this piece's files by visibility and one accessor alone (A-665 part 2's hooks).
+  No integration target makes a git repository, so none of them keeps a map; the unit tests above do. The Windows x86_64
+  and Linux runs, clippy, xtask and the doc gate are main's.
+- **Owed.** Part 3's commit: the trees and the commit derived from these maps' changes (A-664 part 2's types),
+  admitted to the git store with the green's head moved and recorded with the version; a submit refused before its
+  verdict when its post-state is one git cannot hold; a whole build and a whole map's release sliced a unit at a time
+  (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
+  source's head is the version it was made at; the holders' maps (A-636's fleet half); a copy made through a work
+  driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
+  by the same rule.
+- **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
+  `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
+  `vcs_store/tests.rs`; `crates/server/src/verbs.rs` (the submit's step); `crates/server/src/repository/push.rs` (the
+  push's step); `crates/server/src/repository.rs` (`retire_member`, the module's docs); `crates/merge/src/engine.rs`
+  (the five readers), `engine/node_tests.rs` and `engine/copy_tests.rs`; §4.17.1's and §4.17.2's statuses and piece
+  13; GAPS (A-664's entry).
+
+### A-680 part 2a — Mercurial's site on the daemon's edge: a request whose query names a command handed to it, each repository's served view lent from its store on its owner shard with its register's state (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Access" and piece 4; §4.17.2 "Transports" item 1; A-650 part 1, A-662, A-680 part 1, A-625 part 3)
+Applied in the same change to: §4.17.3 (a status block, piece 4's line), `crates/server` (`vcs_http`: `ToolSites`,
+`ToolExchange`, `Decided::map`, `hg` made crate-visible; `vcs_http::hg`: `HgStores` lending a view made within the
+request's room, `wire_request`, `NoStores` removed; `vcs_http::daemon_edge`: `DaemonSite` both sites; `vcs_store`:
+`mercurial_ref`, `hg_view` new with its tests; `repository::hg_push`: `bookmark_of`; the edge's and the site's tests),
+`crates/cli` (the stock-hg tests' ignore reasons: the refusal waits on A-686 alone, the round trip on A-680 part 2b and
+A-686), GAPS (the §4.17.3 entry).
+- **Why.** The daemon's edge served git's site alone, so stock hg met `404` from a running daemon (g083's interop tests,
+  `crates/cli/tests/cli.rs`), and Mercurial's site, tested alone, answered every repository `503` (`NoStores`) since
+  nothing lent it a store.
+- **Which site.** A request whose query names a command (`cmd`) is Mercurial's, as hgweb tells a wire request from its
+  pages (7.2's `wireprotoserver.handlewsgirequest`: "if b'cmd' not in req.qsparams: return False"); every other is
+  git's, whose requests never name one, so git's answers are unchanged. A repository of the other tool is answered `404`
+  by the site asked. hgweb's pages (piece 12) name no command, so they reach git's site and are `404` there.
+- **The lender** (`ServedViews`). Each step's view is made afresh on the shard the site moved the connection to (A-625
+  part 3), so nothing of the shard is held across a wait: the repository's index and the shard's content store from
+  A-662's map, its register's phase roots and bookmarks copied and charged to the request's room, then A-680 part 1's
+  view over them, charged to the same room; the step gets what is left of it. `HgStores::lend` takes that room and its
+  view type is generic over the borrow (`type Store<'s>`), since the view borrows the shard's state for the step alone.
+  A store an import is filling is not lent, so no client is served half a history; a view that cannot be made is counted
+  (`vcs_store.hg_view.unmade`); each is `503`.
+- **Decided.** Every repository publishes, Mercurial's default (decision 3), until its record carries `phases.publish`.
+  A bookmark is a name `bookmark_of` reads back exactly (`bookmark_name`'s inverse) whose green names a head; a phase
+  root of a phase or node Mercurial does not have is not read; neither is ever written by a push.
+- **Tests** (macOS arm64, Mac Studio, kiln r357, 2026-11-19). `cargo test --locked -p slates-server --lib -- vcs_http::
+  vcs_store::hg_view repository::hg_push::tests::names --test-threads=4` 51 of 51; `cargo fmt --check -p slates-server`
+  clean. `a_mercurial_repositorys_store_is_served_over_the_daemons_edge`: a two-shard daemon, a Mercurial repository on
+  the other shard's partition holding `fixtures/state`'s `states` by an import, and a git repository; over TLS with the
+  owner's bearer token, `capabilities` `200` naming `getbundle` and `httpheader`, `heads` `200` equal to the heads read
+  from the index (no row names them as a parent, newest first), the git repository asked as Mercurial asks `404`, and
+  git's own request answered by git's site. `t_a680_a_view_is_lent_from_the_store_or_not_at_all`: nothing while the
+  import fills the store, the imported history's five changesets once it ends, nothing for a git repository or an
+  unknown id (uncounted), and nothing past the room (counted). `bookmark_of` reads every name `bookmark_name` writes
+  back, and no second spelling, line's name or name without its end. No integration target reaches the site yet: the
+  stock-hg CLI tests wait on A-685 and A-686 too.
+- **Owed.** The site's pushes (`unbundle` through `hg_push`: the push capabilities, the exchange driving prepare,
+  admission, hooks and the landing, the reply framed as 7.2's `streamreslegacy`; A-680 part 2b); the stock `hg` round
+  trip over the edge (g083's tests, once A-685 and A-686 land); the other platforms' runs (main's).
+
+### A-690 — Divergent bookmarks left out where bookmarks are served, as 7.2's `listbinbookmarks` leaves them out (2026-11-19, g083 for UI goal 93 (kiln 51cef9f7); found by g303 reading `serve/pull.rs`; §4.17.3 "Pull and clone" items 1 and 3; A-619, A-680 part 1)
+Applied in the same change to: §4.17.3 (its status), `crates/hg` (`bookmarks::divergent`, `push::classify`,
+`serve::pull::bookmark_entries`, `serve::Repository::bookmarks`' doc, `serve::tests`' generator and oracle,
+`serve/indexed_tests.rs`, `tests/fixtures.rs`), `crates/hg/fixtures/state` (both scripts by repository name;
+`divergent`), GAPS (a fixed entry), `docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`.
+- **What was wrong.** `bookmark_entries` listed every bookmark naming a changeset the served view holds; 7.2 lists those
+  whose name is not divergent (`bookmarks.py` 471-472, `isdivergent`: an `@` in the name and not as its last byte;
+  475-484, `listbinbookmarks`), for `listkeys bookmarks` (`pushkey.py` 27-32, through `listbookmarks`, 487-491) and
+  the `bookmarks` part (`exchange.py` 2638-2649). A-619's oracle stated the implementation's rule over generated names
+  that never held an `@`, so it certified it.
+- **The decision.** One rule, 7.2's, in `crate::bookmarks::divergent`: the pull's listing leaves a divergent name out
+  and the push's classification refuses one (`push/classify.rs`, unchanged in behaviour, now sharing it). `@` alone and
+  any name ending with `@` stay listed.
+- **Reproduced by use first** (Mac Studio, macOS arm64, stock Mercurial 7.2 from PyPI through uv, 2026-11-19).
+  `make-state-fixtures.sh . divergent` makes the repository as a divergent bookmark is made (a root bookmarked
+  `feature`, a changeset on it in a clone and another here, the clone pulled back: "divergent bookmark feature stored
+  as feature@1"; `@` on the root), and `make-served-fixtures.sh . divergent` records 7.2's served answers. The
+  repository rebuilt from those files: `hg bookmarks` lists `@`, `feature` and `feature@1`; under `hg serve`,
+  `hg debugpushkey http://127.0.0.1:54846/ bookmarks` answers `@` and `feature`, and a clone over it holds `@` and
+  `feature`. Before the fix slates' view of the same repository answered `feature@1` too (r340, below).
+- **Tests (macOS arm64, Mac Studio, rustc 1.98.1).** Red: kiln r340 over ab23dd3e0 (the fixture and the golden alone):
+  `cargo test --locked -p slates-hg --lib serve::` 52 passed and 1 failed, the golden, at `listkeys bookmarks`
+  (`feature@1` answered). Green: kiln r356 over 15342a05f: `cargo test --locked -p slates-hg --lib -- serve:: push::
+  bookmarks::` 93 passed and 0 failed; `cargo fmt -p slates-hg -- --check` clean. Again over the landing merged with
+  main 0462bd922 (8afa1583c; A-664 part 3 adds to slates-merge, which slates-hg links): 93 passed and 0 failed,
+  slates-merge and slates-hg compiled afresh, fmt clean. The golden holds `divergent`'s three changesets, none left
+  out, `heads` (two), `branchmap` (`default`'s two heads), `listkeys` of `bookmarks` and `phases`, and the `bookmarks`
+  part's entries to stock 7.2's, the view holding all three bookmarks. The serve oracle now generates names with an
+  `@` inside them and at their end, and states `isdivergent` as 7.2's source states it.
+- **Siblings.** A-691 (next): `listkeys phases` answers the served view's draft roots, where 7.2 answers its stored
+  draft roots read from the unfiltered changelog (`phases.py` 1049-1058), so a hidden draft root is left out here.
+- **Owed.** The other platforms' runs, and the oracle's red-check with the filter taken out (main's).
+
 ### A-683 — git's receive-pack on the SSH edge (2026-11-19, g302, UI goal 93; §4.17.2 "A push" items 1 to 7 and "Transports" item 2; A-651, A-654 parts 2 and 3, A-662)
 
 - **What was there.** A-654 part 2's driver (`git_push::ReceivePack`: `start`, `input`, `end`, `answer`, each one step
@@ -51608,9 +51899,10 @@ Applied in the same change to:
   tests, the services' test, the driver's three and the HTTP site's daemon push among them; `cargo fmt -p slates-server
   -- --check` clean. Then merged as main moved, the same filters over each merge's very tree (a side branch's commit
   on agents/g302-ssh-receive-land), fmt clean each time: over 770ae8826, whose A-651 part 3 changed the SSH site and
-  its tests' harness (0041eb501, kiln r313), 77 of 77; over 693bc8feb (288566d81, r354), 82 of 82; and the landed
-  tree, over 2f73eb075, whose A-651 part 4 moves a connection to its repository's owner shard (002fe9d0a, tree
-  05655bfc9, r375), 84 of 84. No integration target reaches either edge's receive-pack: the daemon does not start the
+  its tests' harness (0041eb501, kiln r313), 77 of 77; over 693bc8feb (288566d81, r354), 82 of 82; over 2f73eb075,
+  whose A-651 part 4 moves a connection to its repository's owner shard (002fe9d0a, r375), 84 of 84; and the landed
+  tree, over f1fbd2c44, whose A-664 part 3 advances a green's map of paths at each push's append (1c4cfa019, tree
+  62336376b, r403), 85 of 85. No integration target reaches either edge's receive-pack: the daemon does not start the
   SSH edge yet (A-684), and the HTTP site's push test is a lib test.
 - **Owed.** A push over a connection A-651 part 4 moved to its repository's owner shard (it landed beside this piece,
   and its own tests move connections running other commands): a two-shard daemon, as the HTTP site's push test runs;

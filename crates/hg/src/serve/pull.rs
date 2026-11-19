@@ -14,14 +14,15 @@
 //! (`heads(only(draft, public) and public())`), so a client learns where public ends; each phase's nodes sorted.
 //!
 //! **Bookmarks and `listkeys`.** The `bookmarks` part carries every bookmark naming a changeset the served view holds,
-//! by name (`listbinbookmarks`). `listkeys` answers `namespaces` with 7.2's four, `bookmarks` with each such bookmark's
-//! hexadecimal node, and `phases` with the served view's draft roots (each `1`, draft's number) and `publishing`
-//! `True` on a publishing repository (`listphases`), sorted by key; any other namespace answers nothing. `obsolete`'s
-//! markers, which 7.2 lists in base85 chunks, come with the markers' exchange.
+//! by name, but a divergent one (an `@` before its name's end), as 7.2 lists them to a peer (`listbinbookmarks`:
+//! `hasnode(v) and not isdivergent(k)`; A-690). `listkeys` answers `namespaces` with 7.2's four, `bookmarks` with each
+//! such bookmark's hexadecimal node, and `phases` with the served view's draft roots (each `1`, draft's number) and
+//! `publishing` `True` on a publishing repository (`listphases`), sorted by key; any other namespace answers nothing.
+//! `obsolete`'s markers, which 7.2 lists in base85 chunks, come with the markers' exchange.
 
 use super::discovery::head_revs;
 use super::{Refusal, Repository, Rev, node_list, node_of, parents_of};
-use crate::bookmarks::Bookmark;
+use crate::bookmarks::{Bookmark, divergent};
 use crate::phases::{Phase, PhaseHead};
 use crate::read::to_u64;
 use crate::{Admission, NODE_LEN, Node, pushkey};
@@ -152,8 +153,8 @@ fn draft_roots(repo: &impl Repository, admission: &mut Admission) -> Result<Vec<
   Ok(roots)
 }
 
-/// Every bookmark naming a changeset the served view holds, sorted by name (`listbinbookmarks`), as the `bookmarks`
-/// part carries them.
+/// Every bookmark naming a changeset the served view holds, but a divergent one, sorted by name (`listbinbookmarks`:
+/// `hasnode(v) and not isdivergent(k)`), as the `bookmarks` part carries them and `listkeys` lists them.
 pub fn bookmark_entries<'r>(
   repo: &'r impl Repository,
   admission: &mut Admission,
@@ -161,7 +162,7 @@ pub fn bookmark_entries<'r>(
   let held = || {
     repo
       .bookmarks()
-      .filter(|(_, node)| repo.rev(node).is_some())
+      .filter(|(name, node)| !divergent(name) && repo.rev(node).is_some())
   };
   admission.charge_items::<Bookmark<'_>>(held().count())?;
   let mut marks: Vec<Bookmark<'r>> = held()
