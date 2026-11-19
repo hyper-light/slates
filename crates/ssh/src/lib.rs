@@ -10,7 +10,8 @@
 //!   opening under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`, sequence numbers;
 //! - algorithm negotiation ([`kexinit`]): the client's first choice the server also has, per list, with the markers of
 //!   strict key exchange (the Terrapin countermeasure) and of RFC 8308's extension negotiation never chosen as methods;
-//! - `curve25519-sha256` (RFC 8731) with `ssh-ed25519` host keys (RFC 8709) ([`kex`], [`hostkey`]): the exchange hash,
+//! - `mlkem768x25519-sha256` (A-634; `draft-ietf-sshm-mlkem-hybrid-kex-10`, ML-KEM-768 with X25519, preferred) and
+//!   `curve25519-sha256` (RFC 8731), with `ssh-ed25519` host keys (RFC 8709) ([`kex`], [`hostkey`]): the exchange hash,
 //!   the key derivation of RFC 4253 §7.2 and `SSH_MSG_NEWKEYS`;
 //! - rekeying ([`keylife`]): by each cipher's own bounds (RFC 4344 §3) and by a key time the deployment learns.
 //!

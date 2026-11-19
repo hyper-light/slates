@@ -6,10 +6,11 @@
 //! name-list that is also on the server's name-list" [B: RFC 4253 §7.1], and a list with none ends the connection, which
 //! [`negotiate`] refuses by the list's kind.
 //!
-//! **What the server offers.** Key exchange `curve25519-sha256` (RFC 8731); host key `ssh-ed25519` (RFC 8709); ciphers
-//! `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`, both AEADs, so MAC negotiation is skipped: "When an AEAD
-//! mode is selected ..., MAC negotiation MUST be skipped and the contents of the "mac_algorithms" field ignored" [B: the
-//! AES-GCM draft §2; the chacha draft §5 says the same]. Its own MAC lists still name one algorithm, since RFC 4253 §7.1
+//! **What the server offers.** Key exchange `mlkem768x25519-sha256` first, the post-quantum hybrid that OpenSSH 10.0
+//! made its default and whose absence OpenSSH 10.1 warns of (A-634; research notes §5.7), then `curve25519-sha256`
+//! (RFC 8731); host key `ssh-ed25519` (RFC 8709); ciphers `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`,
+//! both AEADs, so MAC negotiation is skipped: "When an AEAD mode is selected ..., MAC negotiation MUST be skipped and the
+//! contents of the "mac_algorithms" field ignored" [B: the AES-GCM draft §2; the chacha draft §5 says the same]. Its own MAC lists still name one algorithm, since RFC 4253 §7.1
 //! says "Each name-list MUST contain at least one algorithm name", and that name is `none`: the server runs no MAC apart
 //! from its ciphers, so `none` is the honest entry, and it is never in use. Compression is `none` alone, and the language
 //! lists are empty, as §7.1 says they "SHOULD" be.
@@ -39,7 +40,11 @@ pub const KEXINIT: u8 = 20;
 /// Format: the bytes of a KEXINIT's cookie (RFC 4253 §7.1, `byte[16] cookie`).
 pub const COOKIE_LEN: usize = 16;
 
-/// The key exchange method the server runs (RFC 8731 §3).
+/// The post-quantum hybrid key exchange the server prefers (`draft-ietf-sshm-mlkem-hybrid-kex-10` §2.3.3), OpenSSH 10's
+/// default (A-634).
+pub const MLKEM768X25519_SHA256: &str = "mlkem768x25519-sha256";
+
+/// The classical key exchange the server also runs (RFC 8731 §3).
 pub const CURVE25519_SHA256: &str = "curve25519-sha256";
 
 /// The server's markers of strict key exchange: the pre-standard name, then the standard one (strict-kex draft §3.1).
@@ -54,7 +59,7 @@ pub const EXT_INFO_CLIENT: &str = "ext-info-c";
 /// The algorithm named "none" (RFC 4253 §6.2, §6.4).
 pub const NONE: &str = "none";
 
-/// The key exchange methods the server runs, in its order of preference.
+/// The key exchange methods the server runs, in its order of preference: the post-quantum hybrid first.
 const KEX_METHODS: [&str; 1] = [CURVE25519_SHA256];
 
 /// The host key algorithms the server has keys for.
@@ -217,8 +222,23 @@ pub fn server_kexinit(cookie: &[u8; COOKIE_LEN], initial: bool) -> Result<Vec<u8
 /// The key exchange method agreed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KexMethod {
+  /// `mlkem768x25519-sha256`, ML-KEM-768 with X25519 (A-634).
+  Mlkem768X25519Sha256,
   /// `curve25519-sha256`.
   Curve25519Sha256,
+}
+
+impl KexMethod {
+  /// The method a KEXINIT name stands for, among those the server runs.
+  fn from_name(name: &[u8]) -> Option<Self> {
+    if name == MLKEM768X25519_SHA256.as_bytes() {
+      Some(KexMethod::Mlkem768X25519Sha256)
+    } else if name == CURVE25519_SHA256.as_bytes() {
+      Some(KexMethod::Curve25519Sha256)
+    } else {
+      None
+    }
+  }
 }
 
 /// What a client's KEXINIT and the server's agreed.
@@ -242,7 +262,8 @@ pub struct Negotiated {
 
 /// Negotiates the client's KEXINIT against what the server runs; `initial` says whether this is the first exchange.
 pub fn negotiate(client: &KexInit<'_>, initial: bool) -> Result<Negotiated, KexInitRefusal> {
-  shared(client, List::Kex, &KEX_METHODS)?;
+  let kex = KexMethod::from_name(shared(client, List::Kex, &KEX_METHODS)?)
+    .ok_or(KexInitRefusal::NoCommonAlgorithm(List::Kex))?;
   shared(client, List::HostKey, &HOST_KEYS)?;
   let client_to_server = cipher(client, List::CipherClientToServer)?;
   let server_to_client = cipher(client, List::CipherServerToClient)?;
@@ -250,7 +271,7 @@ pub fn negotiate(client: &KexInit<'_>, initial: bool) -> Result<Negotiated, KexI
   shared(client, List::CompressionServerToClient, &COMPRESSION)?;
   let kex_list = client.list(List::Kex);
   Ok(Negotiated {
-    kex: KexMethod::Curve25519Sha256,
+    kex,
     host_key: ED25519,
     client_to_server,
     server_to_client,
