@@ -1,22 +1,26 @@
 //! Every object checked against its tool's id as it arrives, and held by the push that brought it until the verdict
 //! commits (§4.17.1 "Objects" items 4 and 5; "Refusals (shared)", `ObjectIdMismatch { id }`; "Failure matrix").
 //!
-//! **Checked on arrival.** The server hashes each object as its tool does ([`Naming`]: git hashes
-//! `<type> <length>\0<content>`, Mercurial the sorted parents and the text, and a Subversion text is checked by the
-//! checksums its client sent) and compares the name with the id the client claimed. An object whose bytes do not hash
-//! to it is refused, [`ArrivalRefused::IdMismatch`], before it is stored or indexed; the caller refuses its push and
-//! abandons the push's quarantine, so nothing of the push is indexed. The same id brought twice with other bytes is a
-//! collision of the tool's hash, refused by kind too.
+//! **Checked on arrival.** The server hashes each object as its tool does ([`Naming`], a parameter: git's SHA-1 with
+//! collision detection or SHA-256 of `<type> <length>\0<content>`, `slates_git::object_name::name_of`; Mercurial's
+//! SHA-1 of the sorted parents and the text; a Subversion text by the checksums its client sent) and compares the name
+//! with the id the client claimed. An object whose bytes do not hash to it is refused, [`AdmitRefused::IdMismatch`],
+//! before a byte of it is stored; one the tool will not name at all is refused with the tool's own reason,
+//! [`AdmitRefused::NotNamed`] (git's SHA-1 refuses an input its collision detection finds to be part of a known attack,
+//! "SHA-1 appears to be part of a collision attack", and names its plain SHA-1, which the server's answer carries). The
+//! caller refuses the push and abandons its quarantine, so nothing of the push is indexed. The same id brought twice
+//! with other bytes is a collision of the tool's hash, refused by kind too.
 //!
 //! **Held by the push, not the repository.** An admitted object's bytes are content held by the push's
-//! [`Quarantine`], as git's `receive-pack` keeps a push's objects in a quarantine directory that is "removed entirely"
-//! when the push fails [B: git-receive-pack, "QUARANTINE ENVIRONMENT"]. The verdict's accept commits the quarantine
-//! into the repository's index as one step ([`Quarantine::commit`], which checks every row before it applies any); a
-//! refused, disconnected or abandoned push gives back every hold ([`Quarantine::abandon`]), and a content no other
-//! holder names is freed with it.
+//! [`Quarantine`] ([`ContentStore::put_object`]: windows, and lists naming them past one window), as git's
+//! `receive-pack` keeps a push's objects in a quarantine directory that is "removed entirely" when the push fails [B:
+//! git-receive-pack, "QUARANTINE ENVIRONMENT"]. The verdict's accept commits the quarantine into the repository's index
+//! as one step ([`Quarantine::commit`], which checks every row before it applies any); a refused, disconnected or
+//! abandoned push gives back every hold ([`Quarantine::abandon`]), and a content no other holder names is freed with
+//! it.
 //!
 //! **The object row** (§4.17.1 "Objects" item 3: "an index from the tool's id to the object's kind, length and content
-//! identity"): the key is the id, the row names the content, and the payload is the kind and the length
+//! identity"): the key is the id, the row names the object's root content, and the payload is the kind and the length
 //! ([`object_payload`]), so a tool answers a size (git's `object-info`) without reading the bytes. A tool's own rows
 //! (git's commit rows, Mercurial's revlog rows, Subversion's node rows) are its section's, kept by the same tables.
 
@@ -30,11 +34,17 @@ use crate::table::RowRef;
 /// Format: an object row's payload: the kind, one byte, then the length, a little-endian `u64`.
 pub const OBJECT_PAYLOAD_BYTES: usize = size_of::<u8>() + size_of::<u64>();
 
-/// A tool's rule for naming an object (module docs).
+/// A tool's rule for naming an object (module docs): the parameter every arrival is checked by, never one hash.
 pub trait Naming {
+  /// The tool's id, as the bytes a client claims it by.
+  type Id: AsRef<[u8]>;
+  /// Why the tool refuses to name bytes at all: git's `CollisionAttack`; a tool whose hash never refuses names
+  /// `core::convert::Infallible`.
+  type Refused;
+
   /// The id the tool gives the object of `kind` whose raw bytes are `bytes`, with what else the tool hashes into it,
   /// `context` (Mercurial's parents and metadata block; nothing for git).
-  fn name(&self, kind: u8, context: &[u8], bytes: &[u8]) -> Vec<u8>;
+  fn name(&self, kind: u8, context: &[u8], bytes: &[u8]) -> Result<Self::Id, Self::Refused>;
 }
 
 /// An object as its push brings it.
@@ -50,23 +60,38 @@ pub struct Arriving<'a> {
   pub bytes: &'a [u8],
 }
 
-/// Why an arrival or a commit was refused.
+/// Why an arriving object was refused; nothing of it was stored. `R` is the tool's own reason ([`Naming::Refused`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ArrivalRefused {
-  /// The object's bytes do not hash to the id the client claimed (§4.17.1's `ObjectIdMismatch`); nothing was stored.
+pub enum AdmitRefused<R> {
+  /// The object's bytes do not hash to the id the client claimed (§4.17.1's `ObjectIdMismatch`).
   IdMismatch {
     /// The id claimed.
     id: Box<[u8]>,
   },
-  /// The push brought the id once more with other bytes or another kind; nothing was stored.
+  /// The tool refused to name the bytes at all, for its own `reason` (git: a known collision attack).
+  NotNamed {
+    /// The id claimed.
+    id: Box<[u8]>,
+    /// The tool's reason.
+    reason: R,
+  },
+  /// The push brought the id once more with other bytes or another kind.
   Collision {
     /// The id.
     id: Box<[u8]>,
   },
-  /// The store refused the bytes (the budget); nothing was stored.
+  /// The store refused the bytes (the budget).
   Content(ContentRefused),
-  /// The index refused the commit (a row it holds of one of the ids differs); nothing was committed.
+}
+
+/// Why a quarantine's commit was refused; nothing was committed and the quarantine still holds every object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitRefused {
+  /// The index refused (a row it holds of one of the ids differs, or the budget).
   Index(IndexRefused),
+  /// Giving back the quarantine's holds after the commit met a content the store does not hold: the store and the
+  /// quarantine disagree. The rows are committed.
+  Content(ContentRefused),
 }
 
 /// What an admission did.
@@ -87,7 +112,7 @@ pub fn object_payload(kind: u8, len: u64) -> [u8; OBJECT_PAYLOAD_BYTES] {
   payload
 }
 
-/// An object row read back: its kind, its length and its content, or `None` when the row is not one.
+/// An object row read back: its kind, its length and its root content, or `None` when the row is not one.
 pub fn object_row(row: &RowRef<'_>) -> Option<(u8, u64, ContentId)> {
   let payload = <[u8; OBJECT_PAYLOAD_BYTES]>::try_from(row.payload()).ok()?;
   let (kind, length) = payload.split_first()?;
@@ -100,7 +125,7 @@ pub fn object_row(row: &RowRef<'_>) -> Option<(u8, u64, ContentId)> {
   Some((*kind, len, content))
 }
 
-/// An object a push brought: its kind, its content and its length.
+/// An object a push brought: its kind, its root content and its length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Staged {
   kind: u8,
@@ -121,23 +146,31 @@ impl Quarantine {
   }
 
   /// Checks an arriving object against its id by `naming`, then holds its bytes as content.
-  pub fn admit(
+  pub fn admit<N: Naming>(
     &mut self,
     store: &mut ContentStore,
-    naming: &impl Naming,
+    naming: &N,
     arriving: Arriving<'_>,
-  ) -> Result<Admitted, ArrivalRefused> {
-    if naming.name(arriving.kind, arriving.context, arriving.bytes) != arriving.id {
-      return Err(ArrivalRefused::IdMismatch {
+  ) -> Result<Admitted, AdmitRefused<N::Refused>> {
+    let named = naming
+      .name(arriving.kind, arriving.context, arriving.bytes)
+      .map_err(|reason| AdmitRefused::NotNamed {
+        id: Box::from(arriving.id),
+        reason,
+      })?;
+    if named.as_ref() != arriving.id {
+      return Err(AdmitRefused::IdMismatch {
         id: Box::from(arriving.id),
       });
     }
     if let Some(staged) = self.staged.get(arriving.id) {
-      return Quarantine::again(staged, arriving);
+      return Quarantine::again(store, staged, arriving);
     }
     let len = u64::try_from(arriving.bytes.len())
-      .map_err(|_| ArrivalRefused::Content(ContentRefused::CountExhausted))?;
-    let content = store.put(arriving.bytes).map_err(ArrivalRefused::Content)?;
+      .map_err(|_| AdmitRefused::Content(ContentRefused::CountExhausted))?;
+    let content = store
+      .put_object(arriving.bytes)
+      .map_err(AdmitRefused::Content)?;
     self.staged.insert(
       Box::from(arriving.id),
       Staged {
@@ -150,11 +183,15 @@ impl Quarantine {
   }
 
   /// An id the push brought before: the same object, or a collision.
-  fn again(staged: &Staged, arriving: Arriving<'_>) -> Result<Admitted, ArrivalRefused> {
-    if staged.kind == arriving.kind && staged.content == ContentId::of(arriving.bytes) {
+  fn again<R>(
+    store: &ContentStore,
+    staged: &Staged,
+    arriving: Arriving<'_>,
+  ) -> Result<Admitted, AdmitRefused<R>> {
+    if staged.kind == arriving.kind && staged.content == store.object_id(arriving.bytes) {
       return Ok(Admitted::Again);
     }
-    Err(ArrivalRefused::Collision {
+    Err(AdmitRefused::Collision {
       id: Box::from(arriving.id),
     })
   }
@@ -169,7 +206,7 @@ impl Quarantine {
     self.staged.is_empty()
   }
 
-  /// The kind, content and length of the object held under `id`.
+  /// The kind, root content and length of the object held under `id`.
   pub fn object(&self, id: &[u8]) -> Option<(u8, ContentId, u64)> {
     self
       .staged
@@ -177,13 +214,13 @@ impl Quarantine {
       .map(|staged| (staged.kind, staged.content, staged.len))
   }
 
-  /// Commits every object into `index` as one step, then gives back the quarantine's holds, leaving it empty. Refused,
-  /// it commits nothing and keeps every object, for the caller to abandon.
+  /// Commits every object into `index` as one step, then gives back the quarantine's holds, leaving it empty. Refused
+  /// by the index, it commits nothing and keeps every object, for the caller to abandon.
   pub fn commit(
     &mut self,
     index: &mut Index,
     store: &mut ContentStore,
-  ) -> Result<Batch, ArrivalRefused> {
+  ) -> Result<Batch, CommitRefused> {
     let named: Vec<([ContentId; 1], [u8; OBJECT_PAYLOAD_BYTES])> = self
       .staged
       .values()
@@ -201,19 +238,19 @@ impl Quarantine {
       .collect();
     let batch = index
       .insert_all(store, &rows)
-      .map_err(ArrivalRefused::Index)?;
-    self.abandon(store)?;
+      .map_err(CommitRefused::Index)?;
+    self.abandon(store).map_err(CommitRefused::Content)?;
     Ok(batch)
   }
 
   /// Gives back every hold the quarantine took, leaving it empty; a content no one else names is freed. It goes on
   /// past a refusal and answers the first.
-  pub fn abandon(&mut self, store: &mut ContentStore) -> Result<(), ArrivalRefused> {
+  pub fn abandon(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     let staged = std::mem::take(&mut self.staged);
     let mut first = Ok(());
     for object in staged.values() {
       first = first.and(store.release(&object.content).map(drop));
     }
-    first.map_err(ArrivalRefused::Content)
+    first
   }
 }

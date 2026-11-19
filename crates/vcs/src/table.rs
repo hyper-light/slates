@@ -17,8 +17,9 @@
 //! ```
 //!
 //! Keys strictly increase, so a lookup is a binary search over the offsets and no row is read whole to find another.
-//! Offsets are 64 bits so no table's size is bounded by the encoding's integers; a narrower offset for small tables is
-//! a measured improvement left for later.
+//! A table is at most one window of the content plane ([`crate::content`]): the index cuts its rows into tables by
+//! [`row_bytes`] and [`TABLE_FRAME_BYTES`], and the store refuses a longer one. Offsets are 64 bits, as wide as any
+//! length the encoding names; a narrower offset for a window's table is a measured improvement left for later.
 //!
 //! **Hostile input (§4.9).** [`TableView::open`] admits bytes from anywhere: it checks the frame (the magic, the row
 //! count against the bytes there are, the offsets' region, the entries' length), then every entry (its key length
@@ -45,6 +46,19 @@ const KEY_LENGTH_BYTES: usize = size_of::<u32>();
 
 /// Format: the bytes of a body's count of contents.
 const COUNT_BYTES: usize = size_of::<u8>();
+
+/// Format: the bytes a table takes beyond its rows' ([`row_bytes`]): the header, and the offset that ends the last
+/// entry.
+pub const TABLE_FRAME_BYTES: usize = HEADER_BYTES + WORD_BYTES;
+
+/// The bytes a row of `key` and `body` takes in a table: its offset, its key's length, its key and its body; `None` past
+/// the integers. A table of rows is [`TABLE_FRAME_BYTES`] plus each row's.
+pub fn row_bytes(key: &[u8], body: &[u8]) -> Option<usize> {
+  WORD_BYTES
+    .checked_add(KEY_LENGTH_BYTES)?
+    .checked_add(key.len())?
+    .checked_add(body.len())
+}
 
 /// Why bytes are not a table, or why a row cannot be written into one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,6 +341,18 @@ impl TableBuilder {
     self.rows
   }
 
+  /// The bytes the table would take finished now: [`TABLE_FRAME_BYTES`] and each row's [`row_bytes`].
+  pub fn len(&self) -> usize {
+    TABLE_FRAME_BYTES
+      .saturating_add(self.offsets.len())
+      .saturating_add(self.entries.len())
+  }
+
+  /// Whether no row is written yet.
+  pub fn is_empty(&self) -> bool {
+    self.rows == 0
+  }
+
   /// The table's bytes.
   pub fn finish(self) -> Result<Vec<u8>, TableRefused> {
     let end = u64::try_from(self.entries.len()).map_err(|_| TableRefused::TooLarge)?;
@@ -381,11 +407,10 @@ mod tests {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
   }
 
-  /// A-581, §4.9. Do: open a table, then every way of breaking its frame: too short for a header, a foreign magic, a
-  /// row count of `u64::MAX`, a row count one past its offsets, a first offset not zero, a last offset short of and past
-  /// the entries, and a byte after them. Expect: each refused by its kind, and the whole table read back row by row.
+  /// A-581. Do: open a table of three rows and read it. Expect: three rows, a row's payload and contents read in place,
+  /// and an absent key not found.
   #[test]
-  fn a_tables_frame_is_checked_before_a_row_is_read() {
+  fn a_table_reads_its_rows_in_place() {
     let bytes = three_rows();
     let view = TableView::open(&bytes).unwrap();
     assert_eq!(view.rows(), 3);
@@ -396,6 +421,21 @@ mod tests {
       vec![ContentId::of(b"y"), ContentId::of(b"z")]
     );
     assert_eq!(view.get(b"b"), None);
+  }
+
+  /// `bytes` with the word at `at` set to `value`, opened.
+  fn opened_with_word(bytes: &[u8], at: usize, value: u64) -> Result<(), TableRefused> {
+    let mut changed = bytes.to_vec();
+    set_word(&mut changed, at, value);
+    TableView::open(&changed).map(drop)
+  }
+
+  /// A-581, §4.9. Do: break a table's frame every way: too short for a header, a foreign magic, a row count of
+  /// `u64::MAX`, a row count one past its offsets, a first offset not zero, a last offset short of and past the entries,
+  /// and a byte after them. Expect: each refused by its kind before a row is read.
+  #[test]
+  fn a_tables_frame_is_checked_before_a_row_is_read() {
+    let bytes = three_rows();
     assert_eq!(
       TableView::open(&bytes[..10]).unwrap_err(),
       TableRefused::Truncated
@@ -406,29 +446,22 @@ mod tests {
       TableView::open(&foreign).unwrap_err(),
       TableRefused::ForeignMagic
     );
-    let mut huge = bytes.clone();
-    set_word(&mut huge, 8, u64::MAX);
-    assert_eq!(TableView::open(&huge).unwrap_err(), TableRefused::Truncated);
-    let mut one_more = bytes.clone();
-    set_word(&mut one_more, 8, 4);
-    assert!(TableView::open(&one_more).is_err());
-    let mut first = bytes.clone();
-    set_word(&mut first, HEADER_BYTES, 1);
+    assert_eq!(opened_with_word(&bytes, 8, u64::MAX), Err(TableRefused::Truncated));
+    assert!(opened_with_word(&bytes, 8, 4).is_err());
     assert_eq!(
-      TableView::open(&first).unwrap_err(),
-      TableRefused::Malformed { row: 0 }
+      opened_with_word(&bytes, HEADER_BYTES, 1),
+      Err(TableRefused::Malformed { row: 0 })
     );
     let last_at = HEADER_BYTES + 3 * WORD_BYTES;
     let entries = u64::try_from(bytes.len() - last_at - WORD_BYTES).unwrap();
-    let mut short = bytes.clone();
-    set_word(&mut short, last_at, entries - 1);
     assert_eq!(
-      TableView::open(&short).unwrap_err(),
-      TableRefused::TrailingBytes
+      opened_with_word(&bytes, last_at, entries - 1),
+      Err(TableRefused::TrailingBytes)
     );
-    let mut long = bytes.clone();
-    set_word(&mut long, last_at, entries + 1);
-    assert_eq!(TableView::open(&long).unwrap_err(), TableRefused::Truncated);
+    assert_eq!(
+      opened_with_word(&bytes, last_at, entries + 1),
+      Err(TableRefused::Truncated)
+    );
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert_eq!(
@@ -437,18 +470,15 @@ mod tests {
     );
   }
 
-  /// A-581, §4.9. Do: break one entry at a time: offsets that go backwards, a key length past its entry, a body's
-  /// count past its end, two rows out of order, two rows with one key; and push rows out of order into a builder.
-  /// Expect: each refused naming its row; the builder refuses the row and keeps the rows before it.
+  /// A-581, §4.9. Do: break one entry at a time: offsets that go backwards, a key length past its entry, a body's count
+  /// past its end, two rows out of order, two rows with one key. Expect: each refused naming its row.
   #[test]
   fn a_tables_entries_and_their_order_are_checked() {
     let bytes = three_rows();
     let second = HEADER_BYTES + WORD_BYTES;
-    let mut backwards = bytes.clone();
-    set_word(&mut backwards, second, 1_000);
     assert!(matches!(
-      TableView::open(&backwards).unwrap_err(),
-      TableRefused::Malformed { .. }
+      opened_with_word(&bytes, second, 1_000),
+      Err(TableRefused::Malformed { .. })
     ));
     let entries_at = HEADER_BYTES + 4 * WORD_BYTES;
     let mut key_past = bytes.clone();
@@ -477,6 +507,13 @@ mod tests {
       TableView::open(&repeated).unwrap_err(),
       TableRefused::Unsorted { row: 2 }
     );
+  }
+
+  /// A-581. Do: push rows out of order, a repeated key and a body that is none into a builder, and encode a body naming
+  /// more contents than its count can say. Expect: each refused naming its row, the rows before it kept; the body refused
+  /// by kind.
+  #[test]
+  fn a_builder_refuses_a_row_out_of_order_or_malformed() {
     let mut builder = TableBuilder::new();
     builder.push(b"m", &body(&[], b"")).unwrap();
     assert_eq!(
@@ -491,7 +528,7 @@ mod tests {
       builder.push(b"z", &[3]),
       Err(TableRefused::Malformed { row: 1 })
     );
-    assert_eq!(builder.rows(), 1);
+    assert_eq!((builder.rows(), builder.is_empty()), (1, false));
     assert_eq!(
       encode_body(&vec![ContentId::of(b""); 256], b""),
       Err(TableRefused::TooManyContents)
@@ -515,7 +552,8 @@ mod tests {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
 
     /// A-581. Do: write generated rows as a table and open it. Expect: every row read back in order, every key found
-    /// by its search and every absent key not, as the ordered map they came from.
+    /// by its search and every absent key not, as the ordered map they came from; its length the frame's and each row's
+    /// (`row_bytes`), the measure the index cuts tables by.
     #[test]
     fn a_table_reads_back_as_the_ordered_map_it_was_written_from(rows in rows(), probes in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..6), 0..20)) {
       let bytes = table(&rows);
@@ -523,6 +561,8 @@ mod tests {
       let read: BTreeMap<Vec<u8>, Vec<u8>> = view.iter().map(|row| (row.key().to_vec(), row.body().to_vec())).collect();
       prop_assert_eq!(&read, &rows);
       prop_assert_eq!(view.rows(), rows.len());
+      let counted = rows.iter().map(|(key, body)| row_bytes(key, body).unwrap()).sum::<usize>();
+      prop_assert_eq!(bytes.len(), TABLE_FRAME_BYTES + counted);
       for probe in probes.iter().chain(rows.keys()) {
         prop_assert_eq!(view.get(probe).map(|row| row.body().to_vec()), rows.get(probe).cloned());
       }
