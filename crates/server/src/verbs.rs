@@ -22743,6 +22743,103 @@ mod tests {
     );
   }
 
+  /// Shape: the peer a forwarded verb comes from in the fenced-owner test, a host of the fleet other than this daemon's.
+  const PEER: HostId = HostId(77);
+
+  /// The answer to `body` forwarded from another node ([`PEER`]), served on the daemon's control shard as its fleet
+  /// transport serves one (`serve_forward`), waited for within the observation budget.
+  fn served_as_forwarded(
+    daemon: &crate::daemon::Daemon,
+    body: super::RequestBody,
+  ) -> Option<ReplyBody> {
+    let (sent, received) = std::sync::mpsc::channel();
+    let forwarded = super::encode_body(&super::ForwardedRequest {
+      principal: scatter_asker(),
+      body,
+      request: slates_wire::request::RequestId {
+        client: ASKING,
+        sequence: 1,
+      }
+      .word(),
+      ack_up_to: None,
+      ack_owed: Vec::new(),
+    });
+    let spawned = crate::daemon::observe_first(daemon, move |state| {
+      let control = state.shard;
+      slates_rt::futures::spawn(async move {
+        let reply = super::serve_forward(control, PEER, &forwarded).await;
+        let _unheard = sent.send(reply);
+      })
+      .and_then(slates_rt::futures::detach)
+      .is_ok()
+    });
+    assert!(spawned, "the forward's task was spawned on the control shard");
+    let bytes = received
+      .recv_timeout(std::time::Duration::from_nanos(
+        crate::daemon::OBSERVE_BUDGET_NS,
+      ))
+      .ok()?;
+    super::decode_body::<ReplyBody>(&bytes).ok()
+  }
+
+  /// What the fenced-owner test was answered for a volume whose owner shard is fenced: asked by a client on another
+  /// shard of the same node, and forwarded from another node.
+  struct AskedOfAFencedOwner {
+    /// The answer to the client seated on the control shard.
+    same_node: Option<ReplyBody>,
+    /// The answer to the verb forwarded from [`PEER`].
+    another_node: Option<ReplyBody>,
+  }
+
+  /// On a two-shard daemon, makes a volume the second shard owns, fences that shard, then asks for the volume's status
+  /// from a client seated on the control shard and as a verb forwarded from another node.
+  fn asked_of_a_fenced_owner() -> AskedOfAFencedOwner {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let volume = crate::daemon::observe_at(&daemon, 1, |state| {
+      let name = owned_name(state, "fenced-owner");
+      plain_volume(state, &scatter_asker(), &name)
+    });
+    fence_shard(&daemon, 1);
+    let status = (1, super::RequestBody::Status { volume });
+    let (region, at_once) = crate::daemon::observe_first(&daemon, move |state| {
+      let (seat, region) = seat_asking(state);
+      (region, served_as_from_the_ring(state, seat, &status))
+    });
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let same_node = answer_of(&mut end, at_once);
+    let another_node = served_as_forwarded(&daemon, super::RequestBody::Status { volume });
+    daemon.stop();
+    AskedOfAFencedOwner {
+      same_node,
+      another_node,
+    }
+  }
+
+  /// A-564 (§4.8 "Lookup": the answer comes from the current owner and is authoritative). Do: on a two-shard daemon,
+  /// make a volume the second shard owns and fence that shard as a failed consensus publication does; ask for the
+  /// volume's status from a client on the control shard, and as a verb forwarded from another node. Expect: both are
+  /// refused `ConsensusRecoveryUnavailable`, the refusal a failed publication answers, and neither `NotFound`. Before,
+  /// both forwards took the fenced owner's refused borrow for no volume and answered `NotFound`, so a volume that
+  /// exists read as absent.
+  #[test]
+  fn a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found() {
+    let seen = asked_of_a_fenced_owner();
+    for (asked, answer) in [
+      ("on the same node", &seen.same_node),
+      ("from another node", &seen.another_node),
+    ] {
+      assert!(
+        matches!(
+          answer,
+          Some(ReplyBody::Refused {
+            refusal: Refusal::ConsensusRecoveryUnavailable
+          })
+        ),
+        "a volume whose owner is fenced, asked {asked}: {answer:?}"
+      );
+    }
+  }
+
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
   /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves
   /// locally — the fast path, taken before any map lookup.
