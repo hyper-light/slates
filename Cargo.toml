@@ -119,6 +119,13 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-
 # t0013 SHAttered vector (`crates/git/src/tests/object_name.rs`, `crates/hg/src/node.rs`). No default features: neither
 # `std` nor the OID tables are used.
 sha1-checked = { version = "0.10.0", default-features = false }
+# zlib's CRC32 (the IEEE polynomial, reflected), which git's pack index keeps of each packed object and `git
+# verify-pack` checks (§4.17.2, A-591): the crate flate2 itself computes zlib's CRC32 with, and flate2 is the
+# workspace's deflate API (A-607), so it costs no code beyond what flate2 brings (approved by main, 2026-11-19, on that
+# reason). slates' own CRC is CRC32C (`slates_wire::crc32c`), another polynomial. Default features: `std` lets it pick
+# ARMv8's CRC instructions or x86-64's carry-less multiply at run time, with a table for the rest, and slates-git keeps
+# no `unsafe` of its own.
+crc32fast = "1"
 # The shared crates from ../hyper-raft, vendored at the revision in vendor/hyper-raft/SNAPSHOT (A-67).
 hyper-datagram = { path = "vendor/hyper-raft/hyper-datagram" }
 hyper-swim = { path = "vendor/hyper-raft/hyper-swim" }
@@ -132,6 +139,12 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
 zstd = "0.13"
+# The deflate engine for git packs, smart HTTP's gzip bodies and Mercurial's GZ streams and revlog chunks (A-607,
+# §4.17.2 piece 3 "chosen by measurement"): flate2's API over zlib-rs, pure Rust. Measured against miniz_oxide on the
+# Mac Studio M3 Ultra, 2026-11-19, over slates' own 4,742 files at e85c17f9f: at git's level 6, deflate 135.0 against
+# 79.4 MB/s and inflate 956.4 against 497.5 MB/s, best of 5 interleaved, output 0.255 against 0.257 of the input
+# (docs/wip/BENCHMARKS.md, "The deflate engine"). Crates name it `flate2.workspace = true`; no crate picks a backend.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 # The derive macro's parser and emitter (the standard trio); build-time only.
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

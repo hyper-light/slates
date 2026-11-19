@@ -48,3 +48,5 @@ crates/hg/fixtures/objects/** -text
 crates/git/fixtures/*.bin -text
 crates/git/fixtures/*.pack -text
 crates/git/fixtures/*.idx -text
+# The deltas those packs carry, inflated once by make-delta-fixtures.sh (A-582 part 3).
+crates/git/fixtures/deltas/*.delta -text

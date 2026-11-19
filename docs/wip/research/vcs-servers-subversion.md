@@ -28,6 +28,12 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | `subversion/tests/cmdline/README` | `b4dc08b968167424` | B |
 | `subversion/libsvn_repos/commit.c` | `1727532bffd25017` | C |
 | `subversion/libsvn_fs_fs/tree.c` | `5f4e47d132ef9e02` | C |
+| `subversion/libsvn_fs_fs/lock.c` (read 2026-11-19 for A-602) | `45d641aea0fe524c` | C |
+| `subversion/libsvn_fs_fs/transaction.c` (read 2026-11-19 for A-602) | `8d99770ee4faa1e5` | C |
+| `subversion/libsvn_fs/fs-loader.c` (read 2026-11-19 for A-602) | `afde9ced13069c16` | C |
+| `subversion/libsvn_subr/xml.c` (read 2026-11-19 for A-602) | `aeffb5c3effa073f` | C |
+| `subversion/libsvn_subr/ctype.c` (read 2026-11-19 for A-602) | `8c00533a27dc55f5` | C |
+| `subversion/include/svn_ctype.h` (read 2026-11-19 for A-602) | `2928f028e729a7b1` | B |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
@@ -197,6 +203,54 @@ Also read: `svn_repos.h`, `svn_delta.h`, `svn_props.h`, `svn_types.h`, `libsvn_r
   any of its parent directories"; a lock is "an immutable data object" with "a unique identifier, the path being locked,
   the username that owns the lock, and a creation timestamp", a comment optional; release on commit by default; breaking
   and stealing; `svn:needs-lock` tells clients a file must be locked first.
+- **Locks, the code** (read 2026-11-19 for A-602, §4.17.4 item 7).
+  - **Locking.** [C: `fs-wrap.c` 580-614; `fs-loader.c` `svn_fs_lock_many` 1816-1904; `lock.c` `check_lock` 713-829,
+    `lock_body` 838-945]
+    - A request needs a username: "Cannot lock path, no authenticated username available."
+    - The comment must be XML-safe: "Lock comment contains illegal characters", `E130004`.
+    - The expiration must not be negative: "Negative expiration date passed to svn_fs_lock", `E200004`.
+    - A supplied token must start `opaquelocktoken:` ("has bad scheme") and hold no byte that is past ASCII or a
+      control character ("is not ASCII or is a control character"), `E160037`.
+    - Each path is then checked in path order:
+      - a directory is `SVN_FS__ERR_NOT_FILE`;
+      - a path HEAD lacks is refused, "we deliberately choose not to allow such madness": `E160042` when a current
+        revision was given, `E160013` otherwise;
+      - a current revision past the youngest is `E160006`;
+      - one older than the node's created revision is "Lock failed: newer version of '%s' exists", `E160042`;
+      - an existing lock without stealing is `SVN_FS__ERR_PATH_ALREADY_LOCKED`, whoever asks.
+    - The second loop gives each path that passed its token (supplied, or `svn_fs_fs__generate_lock_token`:
+      "opaquelocktoken:" and `svn_uuid_generate`), the username as owner, and `apr_time_now()` as creation.
+    - "### TODO: actually do this check": a supplied token is never checked against other paths' tokens.
+  - **Expiry.** [C: `lock.c` `lock_expired` 455-458, `get_lock` 467-505, `get_lock_helper` 508-535, `walk_locks`
+    541-600]
+    - `lock_expired` is "lock->expiration_date && (apr_time_now() > lock->expiration_date)", so 0 is none.
+    - `get_lock` removes an expired lock "Only ... if we have the write lock" and answers `E160041`.
+    - `get_lock_helper` treats no lock and an expired lock alike as none: "this function doesn't tell the caller *why*
+      the lock is unavailable".
+    - `walk_locks` skips an expired lock, and removes it under the write lock.
+  - **Unlocking.** [C: `lock.c` `check_unlock` 949-968, `svn_fs_fs__unlock` 1200-1275; `fs-loader.c` `svn_fs_unlock`]
+    - "We need to have a username attached to the fs" holds even to break, `E160034`.
+    - No lock is `E160040`.
+    - Unless breaking, a token other than the lock's is `E160040`, and another owner `E160039`.
+    - A token not sent is compared as "" ("if (!token) token = "";").
+  - **At the commit.** [C: `transaction.c` `verify_locks` 3527-3593; `lock.c` `verify_lock` 606-631,
+    `svn_fs_fs__allow_locked_operation` 645-672]
+    - Changed paths are sorted "depth-first-ily". A modification checks the path's own lock. Every other change checks
+      every lock at or beneath it: "For paths being added or removed, we need to hold the locks for that path and any
+      children of that path".
+    - Each lock is verified in order: no username (`E160034`), then another owner (`E160039`), then a token missing
+      from the access context's tokens (`E160037`). Those tokens are keyed by token, not by path.
+  - **Release.** [C: `serve.c` `commit` 1471-1580, `unlock_paths` 1429-1468, `lock` 2952-2990]
+    - "if (! keep_locks && lock_tokens && lock_tokens->nelts) unlock_paths" unlocks every presented path with its
+      token, never breaking, after the commit.
+    - Its errors are ignored: "The lock may have become defunct after the commit, so ignore such errors".
+    - ra_svn's `lock` asks "No expiration time" (0).
+  - **Control characters.** [C: `xml.c` `svn_xml_is_xml_safe` 105-127; `ctype.c`]
+    - Valid UTF-8, with no control byte but tab, line feed, carriage return and delete.
+    - `svn_ctype_iscntrl` is 0 to 31 and 127.
+  - **Error numbers.** [B: `svn_error_codes.h`] The filesystem category plus its offset: `E160034` no user, `E160035`
+    already locked, `E160037` bad token, `E160039` owner mismatch, `E160040` no such lock, `E160041` expired, `E160042`
+    out of date. Also `E130004`, XML category plus 4, and `E200004`, miscellaneous category plus 4.
 - **Mergeinfo** [B: `svn_mergeinfo.h` 45-90]: the value grammar (`revisionrange`, `revisioneelement` with an optional
   `*` for non-inheritable, `rangelist`, `revisionline`, `top`); a path without its own mergeinfo "inherits mergeinfo
   from its nearest parent that has SVN_PROP_MERGEINFO set", except non-inheritable ranges; elision. Merging itself is
