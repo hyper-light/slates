@@ -2878,9 +2878,11 @@ before Linux 7.2 keep past an epoch bump. The set is as large as the volume, so 
 shard's live step quantum, walked in the inode table's order from where the last slice ended. The mount turns at once
 while a slice is owed and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44
 cannot drop a renamed-away name this way, which is counted (`fuse.epoch_unsupported`). A number the dead daemon issued
-after its last publication is in no image and no head: the successor refuses it, never serving it, but a descriptor
-opened before the death keeps its cached pages until a publication records the counter such numbers were issued below
-(GAPS).
+after its last publication (another path's create a listing showed, a base directory first loaded then) is in no image
+and no head: the successor refuses it, never serving it, and the round names it too in its place. Every publication
+records the volume's live counter beside its reserved ceiling (A-150), and the numbers between the two are exactly those
+the dead daemon could have handed out since without another publication (A-578), so a descriptor opened before the
+death drops their pages as well.
 
 §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
@@ -37774,7 +37776,8 @@ publication" and "an outsider's change beneath a base during a takeover's gap"),
   pages, since no walk can name them until each publication records the volume's live counter beside its reserved
   ceiling (the image and the delta, both encodings, the publication oracle), when the round can name exactly the numbers
   between the two. The FUSE takeover tests that run the round (`crates/bridge-fuse/tests/takeover_round.rs`, the CLI's
-  kill-in-window tests) are Linux's, main's to run.
+  kill-in-window tests) are Linux's, main's to run. The numbers closed by A-578 (2026-11-19): every publication records
+  the live counter, and the round names the numbers between it and the ceiling.
 
 ### A-565 — A live-shipped captured clone's move gives its new owner the mark; what a clone never sealed loses, plainly; a clone seals nothing until its first snapshot (2026-11-19, g267, UI goal 89; §4.15 `capture_base`, §4.10 "Live shipping", §4.8 "Promotion and takeover"; A-200, A-291, A-503, A-544)
 
@@ -37826,3 +37829,39 @@ publication" and "an outsider's change beneath a base during a takeover's gap"),
 
 Applied in the same change to: §4.15's status (A-503's paragraph), GAPS (g267; the bug's entry), the bug record,
 `crates/server` (`verbs.rs`, `fleet.rs`, `live_ship.rs`: `owe_first_whole`, a test's live log).
+
+### A-578 — Every publication records the live inode counter beside the reserved ceiling, and a takeover names the numbers between them (2026-11-19, g232; UI goal 85, A-573's owed item; §4.6 "A mount taken over by a restarted daemon", §4.8 publications; A-150, A-573; image version 33)
+Applied in the same change to: §4.6 (the takeover paragraph), A-573 (its owed item closed), GAPS (A-573's two still-open
+notes), `crates/vfs/src/recover.rs` (`IMAGE_VERSION` 33, `VolumeImage::live_counter`, `to_image`, `encode_image_into`,
+the rebuild), `crates/vfs/src/delta.rs` (`VolumeDelta::live_counter`, `delta`, `encode_delta`, `VolumeImage::apply`),
+`crates/vfs/src/volume.rs` (`unrecorded_counters`, `visit_head_inodes`), `crates/vfs/src/base.rs` (tests),
+`crates/vfs/tests/model.rs` (the publication oracle).
+- **What was there.** A publication recorded only the reserved ceiling (A-150): the counter plus the store's reserve,
+  where a successor starts. A number the dead daemon issued after its last publication, below that ceiling, is in no
+  image: another path's create a listing showed, or a base directory's entries first loaded after it. A-573's round
+  named every inode the successor holds, and could not name these, so a descriptor a kernel opened on one before the
+  death kept its cached pages; the successor refused the number (`NotFound`) and never served it.
+- **The rule.** Each publication records the volume's live counter beside its reserved ceiling: the image
+  (`VolumeImage::live_counter`) and every delta (`VolumeDelta::live_counter`), in both encodings, the struct builders
+  and the streamed encoders the daemon writes. Recovery folds the deltas into the image and rebuilds the volume with the
+  counters from the live one up to the ceiling (`Volume::unrecorded_counters`): numbers no image holds and this daemon
+  never issues, since its own counter starts at the ceiling. The takeover walk of the head
+  (`Volume::visit_head_inodes`) names them in their place in counter order: the restored inodes below them, then each
+  of them under the volume's prefix, then what this daemon issued since. An image whose live counter passes its ceiling
+  is refused (`RecoveryIncomplete`). The live counter stays out of the roots a clean volume is judged by: a base
+  directory's load issues numbers and changes nothing published, and the last publication's two counters already bound
+  what was issued since. The gap is at most a reserve of numbers per takeover (A-150's 262,144 on the box), each a
+  `FUSE_NOTIFY_INVAL_INODE` the kernel answers at once for a number it never cached, sent in the round's slices.
+- **Format.** Image version 33: the image and every delta carry the new counter, so a reader of version 32 refuses it,
+  and this reader refuses 32. No shim reads the old form.
+- **Tests.** `a_number_issued_after_the_last_publication_is_refused_and_named_by_the_takeover` (red first: a file made
+  and a base directory first loaded after the publication; the successor refuses both numbers and its walk names both),
+  `the_takeover_walk_in_slices_joins_whole_across_the_unrecorded_counters` (the walk across the restored inodes, the
+  unrecorded counters and the successor's own, whole and in slices of 1 to 5),
+  `an_image_whose_live_counter_passes_its_ceiling_is_refused` (hostile), all in `crates/vfs/src/base.rs` under a
+  nonzero reserve. The publication oracle (`check_publication`, `crates/vfs/tests/model.rs`) now checks each folded
+  publication's two counters against the volume's own and that they differ, under the model's nonzero reserve (A-150's
+  gotcha: with none they coincide, and an encoder writing one for the other passes unseen); main's to run. On the Mac
+  Studio (debug, 2026-11-19, load 19 to 23): `slates-vfs --lib` 90 of 90 (1 ignored), `slates-bridge-core --lib` 40 of
+  40; red with the unrecorded counters dropped at the rebuild: the first test failed at its naming, its refusal holding;
+  red with the ceiling's check removed: the hostile image rebuilt.
