@@ -243,7 +243,8 @@ fn hash_encode(path: &[u8], dotencode: bool) -> Result<Vec<u8>, CollisionAttack>
   node::write_hex(&node::sha1(path)?, &mut digest);
   let mut parts = segments(&lower_encode(path.get(PREFIX_LEN..).unwrap_or_default()));
   aux_encode(&mut parts, dotencode);
-  let (basename, directories) = parts.split_last().unwrap_or((&Vec::new(), &[]));
+  let none = Vec::new();
+  let (basename, directories) = parts.split_last().unwrap_or((&none, &[]));
   let mut dirs: Vec<u8> = Vec::new();
   for directory in directories {
     let mut prefix = directory.get(..DIR_PREFIX).unwrap_or(directory).to_vec();
