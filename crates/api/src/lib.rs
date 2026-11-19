@@ -95,8 +95,8 @@ pub use container_engine::{EngineFault, EngineProfile};
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HoldersUnread, HostFault, Invalid,
   IssuerFault, KindMismatch, Missing, MountFault, MountHolders, MountMissing, MoveTarget, Note,
-  PathFault, ProtocolFault, RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported,
-  Unusable,
+  OsCode, PathFault, ProtocolFault, RetryCause, Stale, StartFault, Unmovable, Unreported,
+  Unsupported, Unusable,
 };
 pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
@@ -277,9 +277,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`container_engine::IdentityRule::ContainerRootAsMountingUser`] (the container's root is the user who mounted the
 /// volume); [`container_engine::Engine::Podman`] and [`container_engine::Endpoint::Local`] are appended, a remote
 /// podman is refused `RemoteEngine` and one run as root `ProfileUntested` (2026-11-19).
+/// 49: a host's refusal code carries its numbering (A-539): [`HostFault::Base`] names an [`OsCode`], an errno or a
+/// Win32 error code (none where the host named none), where it held a bare number; the wire's
+/// `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
+/// `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone (2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 48;
+pub const CONTRACT: u32 = 49;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

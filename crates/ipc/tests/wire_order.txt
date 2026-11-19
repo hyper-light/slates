@@ -83,6 +83,7 @@ HostAnswer 1 NotDirectory
 HostAnswer 2 NotFile
 HostAnswer 3 StaleHandle
 HostAnswer 4 Errno
+HostAnswer 5 Win32
 HostPathReason 0 NotAbsolute
 HostPathReason 1 DestinationNotAbsolute
 HostPathReason 2 NotAMountPoint
@@ -108,6 +109,7 @@ LandingDegradation 4 MediaUnsynced
 LandingDegradation 5 Leftover
 LandingDegradation 6 Unswept
 LandingDegradation 7 Kept
+LandingDegradation 8 CrashedWin32
 LandingStage 0 Planning
 LandingStage 1 AwaitingGrant
 LandingStage 2 Validating
@@ -233,6 +235,7 @@ Refusal 71 DurabilityPending
 Refusal 72 VerdictReplaced
 Refusal 73 MoveRefused
 Refusal 74 ArchiveRefused
+Refusal 75 BaseUnavailableWin32
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -430,6 +433,7 @@ TargetRefusal 14 DetachPending
 TargetRefusal 15 MountManagerNotAllowed
 TargetRefusal 16 DriveLetterTaken
 TargetRefusal 17 TooLong
+TargetRefusal 18 HostWin32
 UnsupportedReason 0 HostPlatform
 UnsupportedReason 1 ListenerNotBound
 UnsupportedReason 2 MountNeedsPrivilege

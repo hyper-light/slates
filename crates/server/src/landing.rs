@@ -73,13 +73,19 @@ pub struct LandingState {
   /// crash used to lose it. Never set from the wire.
   pub crossing_withheld: bool,
   /// Test support: while set, this shard records no acknowledgement of its appended audit records (A-265;
-  /// `Daemon::withhold_audit_acknowledgement`), as if each were lost, so its outbox keeps them and the reap tick sends
-  /// them again. Never set from the wire.
+  /// `Daemon::withhold_audit_acknowledgement`), as if each were lost, so its outbox keeps them and the deadline
+  /// keeper's look sends them again. Never set from the wire.
   pub acknowledgement_withheld: bool,
-  /// The crossing sequence at the front of this partition's outbox when the reap tick last looked (A-265): a front that
-  /// has not moved over a whole tick is sent again ([`resend_stuck_audit`]), so a batch lost to a crash, a restart or an
-  /// unanswered call reaches the control partition. `None` until the first look, which sends whatever is owed.
+  /// The crossing sequence at the front of this partition's outbox when its look was armed or last taken (A-265,
+  /// A-554): a front that has not moved by the look, a retry window on, is sent again ([`look_at_owed_audit`]), so a
+  /// batch lost to a crash, a restart or an unanswered call reaches the control partition. `None` while no look is
+  /// armed.
   pub outbox_front_seen: Option<u64>,
+  /// When the shard's deadline keeper looks next at what this partition owes the audit (A-554): a retry window after
+  /// the record that armed it was owed, then a window after each look while any is owed ([`arm_owed_audit_look`]);
+  /// `None` while nothing is owed. Until A-554 the reap loop's tick looked once a window whether anything was owed or
+  /// not.
+  pub audit_look_at: Option<u64>,
   /// The next landing id.
   pub next_landing: u64,
   /// A landing awaiting a grant: its id, the manifest it planned, the volume and the target,
@@ -201,6 +207,7 @@ impl Default for LandingState {
       crossing_withheld: false,
       acknowledgement_withheld: false,
       outbox_front_seen: None,
+      audit_look_at: None,
       next_landing: 1,
       awaiting: std::collections::BTreeMap::new(),
       in_flight: std::collections::BTreeMap::new(),
@@ -1548,7 +1555,7 @@ impl BarrierThread {
         }
       },
     )
-    .map_err(|error| spawn_refusal(&error))?;
+    .map_err(|error| HostError::Unavailable(slates_vfs::host::OsCode::of_io(&error)))?;
     Ok(Self {
       outcome,
       thread: Some(thread),
@@ -1581,7 +1588,9 @@ impl BarrierThread {
 /// aborts): the platform's own number for a failed I/O, `EIO` on Unix.
 #[cfg(unix)]
 fn lost_barrier() -> HostError {
-  HostError::Unavailable(rustix::io::Errno::IO.raw_os_error())
+  HostError::Unavailable(slates_vfs::host::OsCode::Errno(
+    rustix::io::Errno::IO.raw_os_error(),
+  ))
 }
 
 /// What a barrier thread gone without its outcome reads as: Windows' own number for a failed I/O,
@@ -1591,26 +1600,7 @@ fn lost_barrier() -> HostError {
 fn lost_barrier() -> HostError {
   /// Format: `ERROR_IO_DEVICE` (winerror.h).
   const ERROR_IO_DEVICE: u32 = 1117;
-  HostError::Win32(ERROR_IO_DEVICE)
-}
-
-/// A barrier thread the landing could not be given, as the seam's refusal: the OS code its error names, an errno here
-/// (A-527).
-#[cfg(unix)]
-fn spawn_refusal(error: &std::io::Error) -> HostError {
-  HostError::Unavailable(error.raw_os_error().unwrap_or(0))
-}
-
-/// A barrier thread the landing could not be given, as the seam's refusal: the OS code its error names, a Win32 code
-/// here, typed as one (A-527).
-#[cfg(windows)]
-fn spawn_refusal(error: &std::io::Error) -> HostError {
-  HostError::Win32(
-    error
-      .raw_os_error()
-      .and_then(|code| u32::try_from(code).ok())
-      .unwrap_or(0),
-  )
+  HostError::Unavailable(slates_vfs::host::OsCode::Win32(ERROR_IO_DEVICE))
 }
 
 impl Drop for BarrierThread {
@@ -2992,21 +2982,26 @@ fn end_grants_recorded_ended(state: &mut ShardState, ops: &[Op]) {
   }
 }
 
-/// The grants past their term end (A-266), once a reap tick: each is recorded `Expired`, which takes it out of the
+/// The grants past their term end (A-266), by the shard's deadline keeper at the first instant past the earliest term
+/// (A-554, `crate::deadlines`; the reap loop's tick until then): each is recorded `Expired`, which takes it out of the
 /// durable table, with its `grant_expired` audit record in the same atom ([`record_expiry`]), and then leaves the
-/// runtime one. A grant that cannot be recorded stays, and the next tick tries again; one in use by a running landing is
-/// unaffected, since the run holds its own copy of the grant it checked. On a shard other than the control shard each
-/// committed expiry's audit record is owed in its own atom (the partition's outbox), and what is owed goes to the control
-/// partition as one batch once the sweep is done.
+/// runtime one. A grant that cannot be recorded stays due, and the keeper tries again a retry window on; one in use by
+/// a running landing is unaffected, since the run holds its own copy of the grant it checked. On a shard other than the
+/// control shard each committed expiry's audit record is owed in its own atom (the partition's outbox), and what is
+/// owed goes to the control partition as one batch once the sweep has ended any.
 pub fn end_expired_grants(state: &mut ShardState) {
   let now = state.clock.monotonic_ns();
+  let mut ended = false;
   for id in state.landing.grants.expired_at(now) {
     if record_expiry(state, id.0, now) {
       state.landing.grants.end(id);
       state.count(GRANTS_EXPIRED, 1);
+      ended = true;
     }
   }
-  send_owed_audit(state);
+  if ended {
+    send_owed_audit(state);
+  }
 }
 
 /// Records grant `id`'s expiry and its audit record as one atom (A-266; AC-2.10, every grant's history in the audit):
@@ -3056,7 +3051,7 @@ fn record_expiry(state: &mut ShardState, id: u64, now: u64) -> bool {
   }
 }
 
-/// Counter: grants ended at their term by the reap tick's sweep (A-266).
+/// Counter: grants ended at their term by the deadline keeper's sweep (A-266, A-554).
 pub const GRANTS_EXPIRED: &str = "landing.grants_expired";
 
 /// The ops that close a finished landing's records: its grant's transition, and the volume's new base when
@@ -3143,7 +3138,13 @@ fn degradation_of(degradation: &Degradation) -> LandingDegradation {
       widest_window_ns: *widest_window_ns,
     },
     Degradation::BarriersOnly => LandingDegradation::BarriersOnly,
-    Degradation::Crashed { errno } => LandingDegradation::Crashed { errno: *errno },
+    // The code in the variant of its numbering (A-539).
+    Degradation::Crashed {
+      code: slates_vfs::host::OsCode::Errno(errno),
+    } => LandingDegradation::Crashed { errno: *errno },
+    Degradation::Crashed {
+      code: slates_vfs::host::OsCode::Win32(code),
+    } => LandingDegradation::CrashedWin32 { code: *code },
     Degradation::Unsynced { dir, error } => LandingDegradation::Unsynced {
       dir: dir.to_string(),
       answer: answer_of(*error),
@@ -3173,11 +3174,15 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::NotDirectory => HostAnswer::NotDirectory,
     HostError::NotFile => HostAnswer::NotFile,
     HostError::StaleHandle => HostAnswer::StaleHandle,
-    // A-227: a path on a mount this daemon serves carries the platform's deadlock-avoided errno.
-    HostError::Unavailable(errno) | HostError::OwnMount(errno) => HostAnswer::Errno { errno },
-    // The reply's one number field holds a Win32 code as its own (A-527; typing it is the wire's own piece, GAPS).
-    HostError::Win32(code) => HostAnswer::Errno {
-      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    // The code in the variant of its numbering (A-539); a path on a mount this daemon serves carries the platform's
+    // deadlock-avoided code (A-227).
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code)
+    | HostError::OwnMount(code) => match code {
+      slates_vfs::host::OsCode::Win32(code) => HostAnswer::Win32 { code },
+      slates_vfs::host::OsCode::Errno(errno) => HostAnswer::Errno { errno },
     },
     // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
     // a refusal no errno names.
@@ -3867,7 +3872,9 @@ pub(crate) const AUDIT_PARTITION: u16 = 0;
 /// Writes `records` to the audit (A-265): applied in the current atom when this shard is the control shard, else owed
 /// to it in the same atom (`Op::AuditOwed`, the partition's outbox), so a record is durable with the effect it records
 /// and a crash before its batch arrives loses nothing (AC-2.10). The atom's caller sends what is owed once the atom
-/// commits ([`send_owed_audit`], [`append_owed_audit`]); a refused atom's owed records roll back with it.
+/// commits ([`send_owed_audit`], [`append_owed_audit`]), and a record owed arms the look that sends it again unless it
+/// is acknowledged a retry window on ([`arm_owed_audit_look`], A-554); a refused atom's owed records roll back with it,
+/// and the look then finds nothing owed.
 fn write_audit(
   state: &mut ShardState,
   records: Vec<DbAuditRecord>,
@@ -3882,7 +3889,33 @@ fn write_audit(
     };
     state.db.mutate(&mut state.segment, &op, now)?;
   }
+  if owed {
+    arm_owed_audit_look(state, now);
+  }
   Ok(())
+}
+
+/// Arms the deadline keeper's look at what this partition owes the audit (A-554): a retry window from `now`
+/// (`deadlines::retry_window_ns`), the outbox's front noted for the look to compare, unless a look is armed already or
+/// nothing is owed. A record owed when the shard starts (a batch a crash or a restart cut off) is looked at a window
+/// into the start, as the reap loop's first tick did.
+pub(crate) fn arm_owed_audit_look(state: &mut ShardState, now: u64) {
+  if state.landing.audit_look_at.is_some() {
+    return;
+  }
+  let Some(front) = state
+    .db
+    .partition()
+    .audit_outbox()
+    .next()
+    .map(|record| record.seq)
+  else {
+    return;
+  };
+  let at = now.saturating_add(crate::deadlines::retry_window_ns());
+  state.landing.outbox_front_seen = Some(front);
+  state.landing.audit_look_at = Some(at);
+  crate::deadlines::noted(state, at);
 }
 
 /// What this shard's partition owes the control partition (A-265): the partition, the crossing sequence of its oldest
@@ -3956,8 +3989,8 @@ fn record_delivered(state: &mut ShardState, through: u64) {
 
 /// Sends what this shard's partition owes the audit to the control shard (A-265), and the control shard's
 /// acknowledgement back, without waiting: after a sync verb's transaction (`verbs::run_recorded`), which cannot wait, and
-/// from the reap tick ([`resend_stuck_audit`]). Nothing when nothing is owed. A batch that cannot be sent, or is refused,
-/// is counted ([`AUDIT_UNAPPENDED`]) and stays owed, durable, for the next send.
+/// from the deadline keeper's look ([`look_at_owed_audit`]). Nothing when nothing is owed. A batch that cannot be sent,
+/// or is refused, is counted ([`AUDIT_UNAPPENDED`]) and stays owed, durable, for the next send.
 pub(crate) fn send_owed_audit(state: &mut ShardState) {
   let Some(batch) = owed_batch(state) else {
     return;
@@ -3984,28 +4017,30 @@ pub(crate) fn send_owed_audit(state: &mut ShardState) {
   );
 }
 
-/// Sends what this shard's partition owes the audit again when the reap tick finds the outbox's front where the last
-/// tick left it (A-265): its batch was lost (a crash or a restart between the owning atom's commit and the batch, an
-/// unanswered wait, a refused append) or is slow; the control partition appends nothing twice. The first tick after a
-/// start sends whatever the recovered outbox holds.
-pub(crate) fn resend_stuck_audit(state: &mut ShardState) {
-  let front = state
+/// The deadline keeper's look at what this partition owes the audit, at its armed deadline (A-265, A-554): an outbox
+/// whose front is where the look was armed or last taken, a retry window ago, is sent again, since its batch was lost
+/// (a crash or a restart between the owning atom's commit and the batch, an unanswered wait, a refused append) or is
+/// slow, and the control partition appends nothing twice. While anything is owed the look is armed again a window on;
+/// once nothing is, it is not, so a shard that owes nothing is never woken for the audit. Until A-554 the reap loop's
+/// tick looked once a window, so a record owed just after a look was sent again nearly two windows on, and the first
+/// tick after a start sent again what had been sent a moment before.
+pub(crate) fn look_at_owed_audit(state: &mut ShardState, now: u64) {
+  state.landing.audit_look_at = None;
+  let seen = state.landing.outbox_front_seen.take();
+  let Some(front) = state
     .db
     .partition()
     .audit_outbox()
     .next()
-    .map(|record| record.seq);
-  let seen = state
-    .landing
-    .outbox_front_seen
-    .replace(front.unwrap_or(u64::MAX));
-  if front.is_some()
-    && seen.is_none_or(|seen| Some(seen) == front)
-    && !state.landing.crossing_withheld
-  {
+    .map(|record| record.seq)
+  else {
+    return;
+  };
+  if seen == Some(front) && !state.landing.crossing_withheld {
     state.count(AUDIT_RESENT, 1);
     send_owed_audit(state);
   }
+  arm_owed_audit_look(state, now);
 }
 
 /// Sends what this shard's partition owes the audit to the control shard and waits for it (A-265): a presentation's or a
@@ -4051,8 +4086,8 @@ async fn append_owed_audit(shard: u16, budget_ns: u64) -> bool {
 /// (A-265): the records stay owed, and the next batch carries them; the control partition appends none twice.
 pub(crate) const AUDIT_UNACKNOWLEDGED: &str = "landing.audit_unacknowledged";
 
-/// Format: the landing-plane counter of the reap tick's sends of owed audit records whose batch had not been
-/// acknowledged a tick later (A-265): a lost batch, a restart, or a slow control shard.
+/// Format: the landing-plane counter of the deadline keeper's sends of owed audit records whose batch had not been
+/// acknowledged a retry window after it was sent (A-265, A-554): a lost batch, a restart, or a slow control shard.
 pub const AUDIT_RESENT: &str = "landing.audit_resent";
 
 /// Format: the landing-plane counter of an audit batch that did not reach the control partition (A-265): refused at
@@ -4688,6 +4723,75 @@ mod landed_reply_tests {
   use slates_ipc::protocol::{
     HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, ReplyBody, framed_len,
   };
+  use slates_ipc::protocol::{Refusal, TargetRefusal};
+  use slates_vfs::host::{HostError, OsCode};
+
+  /// A-539 (the numbering's kind carried end to end). Do: pass one number as a host's Win32 error code and as an errno
+  /// to the reply's answer, a target's refusal, a crashed landing's cell and a base directory's refusal. Expect the Win32
+  /// code in the wire's Win32 variants and the errno in its errno variants, the named kinds by their codes: a reader
+  /// never takes one numbering for the other.
+  #[test]
+  fn a_win32_code_reaches_the_wire_as_one_and_an_errno_as_an_errno() {
+    /// Shape: one number in both numberings, `ERROR_ACCESS_DENIED` and `EIO`.
+    const BOTH: u32 = 5;
+    /// Shape: see `BOTH`.
+    const BOTH_ERRNO: i32 = 5;
+    let win32 = OsCode::Win32(BOTH);
+    let errno = OsCode::Errno(BOTH_ERRNO);
+    assert_eq!(
+      super::answer_of(HostError::Unavailable(win32)),
+      HostAnswer::Win32 { code: BOTH }
+    );
+    assert_eq!(
+      super::answer_of(HostError::NoSpace(errno)),
+      HostAnswer::Errno { errno: BOTH_ERRNO }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::Exists(win32)),
+      TargetRefusal::HostWin32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::Unavailable(errno)),
+      TargetRefusal::Host { errno: BOTH_ERRNO }
+    );
+    // A path on this daemon's own mount carries the platform's deadlock-avoided code in its own numbering (A-227):
+    // Windows' `ERROR_POSSIBLE_DEADLOCK` rode in an errno's place before A-539.
+    assert_eq!(
+      super::answer_of(HostError::OwnMount(win32)),
+      HostAnswer::Win32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::OwnMount(win32)),
+      TargetRefusal::HostWin32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::OwnMount(errno)),
+      TargetRefusal::Host { errno: BOTH_ERRNO }
+    );
+    assert_eq!(
+      super::degradation_of(&slates_land::engine::Degradation::Crashed { code: win32 }),
+      LandingDegradation::CrashedWin32 { code: BOTH }
+    );
+    assert_eq!(
+      super::degradation_of(&slates_land::engine::Degradation::Crashed { code: errno }),
+      LandingDegradation::Crashed { errno: BOTH_ERRNO }
+    );
+    let base = |code| crate::error::base_unavailable("/base".to_owned(), code);
+    assert_eq!(
+      base(Some(win32)),
+      Refusal::BaseUnavailableWin32 {
+        path: "/base".to_owned(),
+        code: BOTH
+      }
+    );
+    assert_eq!(
+      base(None),
+      Refusal::BaseUnavailable {
+        path: "/base".to_owned(),
+        errno: 0
+      }
+    );
+  }
 
   /// Shape: the degraded cells the test's landing met: one a directory, several replies' worth at these paths.
   const CELLS: usize = 400;
@@ -4784,5 +4888,87 @@ mod landed_reply_tests {
       "the longest named fits"
     );
     assert!(framed_len(&presentation(&fitting)) <= chunk);
+  }
+}
+
+#[cfg(test)]
+mod owed_audit_tests {
+  use std::time::{Duration, Instant};
+
+  use slates_db::catalog::{AuditKind as DbAuditKind, AuditRecord as DbAuditRecord, Principal};
+  use slates_vfs::clock::Clock;
+
+  use crate::daemon::LIVENESS_BUDGET_NS;
+
+  /// Shape: how long the test lets its daemon run before the record is owed: past the reap loop's first look, a window
+  /// after its start, by a tenth of a window, and short of its second.
+  const PAST_THE_FIRST_LOOK_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 10;
+  /// Shape: how long past a window after the send the test waits for the batch to be sent again: half a window.
+  const RESENT_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
+  /// Shape: the pause between the test's looks at the shard's count, short beside half a window.
+  const LOOK_PAUSE_NS: u64 = 1_000_000;
+  /// Shape: the partition the record is owed from: the second shard's, so the control partition is another shard's.
+  const OWING: usize = 1;
+
+  /// A-554 (the owed audit off the tick; A-265's resend). Do: on a two-shard daemon past the reap loop's first look,
+  /// with the second shard's acknowledgements withheld so its batch stays owed as if each were lost, owe the control
+  /// partition one audit record there and send it as a verb's transaction does; watch the shard's resends. Expect: the
+  /// batch sent again no sooner than a window after its send, when its acknowledgement could still be on its way, and
+  /// within half a window more, by the shard's deadline keeper. The reap loop's tick looked once a window and sent
+  /// again a front it had seen at its look before, so a record owed just after a look was sent again nearly two windows
+  /// on.
+  #[test]
+  fn an_unacknowledged_audit_batch_is_sent_again_a_window_after_its_send() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    // The harness waits out the reap loop's first look; the daemon under test runs on.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
+    let sent = Instant::now();
+    crate::daemon::observe_at(&daemon, OWING, |state| {
+      state.landing.acknowledgement_withheld = true;
+      let now = state.clock.monotonic_ns();
+      let record = DbAuditRecord {
+        seq: 0,
+        at_ns: now,
+        kind: DbAuditKind::LandingPlanned,
+        principal: Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        grant: None,
+        landing: Some(1),
+        manifest: None,
+        outcome: None,
+        signature: None,
+      };
+      super::write_audit(state, vec![record], now).unwrap();
+      super::send_owed_audit(state);
+    });
+    let resent = loop {
+      let count = crate::daemon::observe_at(&daemon, OWING, |state| {
+        state
+          .refusals
+          .get(super::AUDIT_RESENT)
+          .copied()
+          .unwrap_or(0)
+      });
+      if count > 0 {
+        break Some(sent.elapsed());
+      }
+      if sent.elapsed() > Duration::from_nanos(LIVENESS_BUDGET_NS + RESENT_WITHIN_NS) {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
+    };
+    daemon.stop();
+    let resent =
+      resent.expect("the batch was sent again within half a window past a window after its send");
+    println!("an unacknowledged batch was sent again {resent:?} after its send");
+    assert!(
+      resent >= Duration::from_nanos(LIVENESS_BUDGET_NS),
+      "not sent again before its acknowledgement could come: {resent:?}"
+    );
   }
 }

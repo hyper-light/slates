@@ -2904,7 +2904,8 @@ const OVERLOADED_UNRECORDED: &str = "verb.overloaded_unrecorded";
 /// unserved until it is rebuilt, A-533). Such a reply is never a completion (§4.9 RIFL): recorded, it was what every
 /// resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000 clients";
 /// `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Until A-533 an `Unpublished` a verb
-/// answered was recorded, so a resend met it for good where the protocol promises the verb runs again.
+/// answered was recorded, so a resend met it for good where the protocol promises the verb runs again. Judged where a
+/// verb answers ([`recorded_unless_deferred`]) and where a deferred reply is written ([`retry_deferred`], A-563).
 fn not_started(reply: &ReplyBody) -> bool {
   matches!(
     reply,
@@ -4453,7 +4454,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::Archived => "archived",
     Refusal::InvalidName => "invalid_name",
     Refusal::PolicyMismatch => "policy_mismatch",
-    Refusal::BaseUnavailable { .. } => "base_unavailable",
+    Refusal::BaseUnavailable { .. } | Refusal::BaseUnavailableWin32 { .. } => "base_unavailable",
     Refusal::DuplicateRequest => "duplicate_request",
     Refusal::BarrierIncomplete { .. } => "barrier_incomplete",
     Refusal::Unsupported { .. } => "unsupported",
@@ -6850,19 +6851,8 @@ fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal 
       path: path.to_owned(),
       used_as: slates_ipc::protocol::OwnMountUse::Base,
     },
-    slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: code,
-    },
-    // A Win32 code as its own number (A-527; typing it is the wire's own piece, GAPS).
-    slates_vfs::host::HostError::Win32(code) => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: i32::try_from(code).unwrap_or(i32::MAX),
-    },
-    _ => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: 0,
-    },
+    // The code in the variant of its numbering (A-539).
+    other => crate::error::base_unavailable(path.to_owned(), other.code()),
   }
 }
 
@@ -12135,13 +12125,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
   any || releasing
 }
 
-/// Derived: a destroy whose completion record was refused is tried again the shard's window after `now` (A-455's
-/// window over the scheduler overrun this shard measured): no sooner than a pass of the refusing condition could
-/// change, and kept by the deadline keeper, never a tick (A-536).
+/// Derived: a destroy whose completion record was refused is tried again the retry window after `now`
+/// (`deadlines::retry_window_ns`, A-455's window over the scheduler overrun this shard measured): no sooner than a pass
+/// of the refusing condition could change, and kept by the deadline keeper, never a tick (A-536).
 fn retry_destroy_at_window(state: &mut ShardState, now: u64) {
-  let at = now.saturating_add(crate::watchdog::watch_window_ns(
-    slates_rt::futures::scheduler_overrun_ns(),
-  ));
+  let at = now.saturating_add(crate::deadlines::retry_window_ns());
   state.destroy_retry_at = Some(state.destroy_retry_at.map_or(at, |due| due.min(at)));
   crate::deadlines::noted(state, at);
 }
@@ -14300,10 +14288,10 @@ fn refused_before_dispatch(
   match body {
     RequestBody::Create {
       base: Some(path), ..
-    } if path.len() > longest_recordable_base() => Some(Refusal::BaseUnavailable {
-      path: path.clone(),
-      errno: PATH_TOO_LONG_ERRNO,
-    }),
+    } if path.len() > longest_recordable_base() => Some(crate::error::base_unavailable(
+      path.clone(),
+      Some(PATH_TOO_LONG),
+    )),
     _ => None,
   }
 }
@@ -14320,13 +14308,16 @@ const PLATFORM_PATH_BYTES: usize = 4_095;
 #[cfg(windows)]
 const PLATFORM_PATH_BYTES: usize = 32_767 * 3;
 
-/// Format: the errno a base path past [`longest_recordable_base`] is refused with: `ENAMETOOLONG`, the host's own answer
-/// to a path past its maximum (the MSVC runtime's value on Windows, `<errno.h>`).
+/// Format: the code a base path past [`longest_recordable_base`] is refused with, the host's own answer to a path past
+/// its maximum, typed by its numbering (A-539): `ENAMETOOLONG`, an errno.
 #[cfg(unix)]
-const PATH_TOO_LONG_ERRNO: i32 = rustix::io::Errno::NAMETOOLONG.raw_os_error();
-/// Format: see the Unix arm.
+const PATH_TOO_LONG: slates_vfs::host::OsCode =
+  slates_vfs::host::OsCode::Errno(rustix::io::Errno::NAMETOOLONG.raw_os_error());
+/// Format: see the Unix arm; Windows' own answer, `ERROR_FILENAME_EXCED_RANGE`, a Win32 error code. Before A-539 it was
+/// the MSVC runtime's `ENAMETOOLONG` (38, `<errno.h>`), a number no Windows call answers, in an errno's place.
 #[cfg(windows)]
-const PATH_TOO_LONG_ERRNO: i32 = 38;
+const PATH_TOO_LONG: slates_vfs::host::OsCode =
+  slates_vfs::host::OsCode::Win32(windows_sys::Win32::Foundation::ERROR_FILENAME_EXCED_RANGE);
 
 /// Format: the longest reason a recovery cause records ([`RecoveryCause`]'s `reason`), in bytes. A reason is the
 /// daemon's own text, never a caller's: a fixed phrase and a typed error's display (a host refusal and its errno, a
@@ -15201,7 +15192,10 @@ fn expire_leases_at(state: &mut ShardState, now: u64) -> usize {
 
 /// Deferred replies first: a reply back from another shard (recorded as a completion here,
 /// the client's shard) or one whose completion ring was full and may have room now. A reply written is a client's loop
-/// I/O, which `serve_round` stamps for the closed loop (`ShardState::loop_io`, A-326).
+/// I/O, which `serve_round` stamps for the closed loop (`ShardState::loop_io`, A-326). A reply that says its request was
+/// not started ([`not_started`]) is never recorded here, as a verb's own is not ([`recorded_unless_deferred`]), so a
+/// resend under its id runs it (A-563). Until A-563 a read scatter's `Overloaded`, a part not sent or not served, came
+/// this way and was recorded, so every resend under the id met it for good.
 fn retry_deferred(state: &mut ShardState) -> bool {
   let mut any = false;
   let deferred = std::mem::take(&mut state.deferred);
@@ -15227,6 +15221,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
         .partition()
         .completion(origin, id.client, id.sequence)
       {
+        Seen::New if not_started(&reply) => unrecorded_not_started(state, reply),
         Seen::New => record_completion(state, origin, id, reply),
         _ => reply,
       }
@@ -18353,7 +18348,7 @@ fn replay_one(
           .with_host(host)
           .write(&mut state.store, inode, record.offset, &record.bytes)
       }
-      None => Err(slates_vfs::VfsError::BaseUnavailable(0)),
+      None => Err(slates_vfs::VfsError::BaseUnavailable(None)),
     }
   } else {
     slot
@@ -22402,8 +22397,22 @@ mod tests {
     });
     assert!(all_sent, "each scatter sent its part to the fenced shard");
     let mut end = slates_ipc::ClientEnd::new(region);
+    let answers = answers_by_sequence(&mut end, 3);
+    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
+      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
+    });
+    daemon.stop();
+    (fenced, answers, unserved)
+  }
+
+  /// The next `count` answers the seated client's ring holds, by request sequence, each waited for within the
+  /// observation budget; fewer when one does not come.
+  fn answers_by_sequence(
+    end: &mut slates_ipc::ClientEnd,
+    count: usize,
+  ) -> std::collections::BTreeMap<u32, ReplyBody> {
     let mut answers = std::collections::BTreeMap::new();
-    while answers.len() < 3 {
+    while answers.len() < count {
       match end.wait(Some(crate::daemon::OBSERVE_BUDGET_NS)) {
         Ok(reply) => {
           let body: ReplyBody =
@@ -22419,11 +22428,7 @@ mod tests {
         }
       }
     }
-    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
-      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
-    });
-    daemon.stop();
-    (fenced, answers, unserved)
+    answers
   }
 
   /// A-557 (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`'s sibling; §4.8 "Lookup": an
@@ -22453,6 +22458,143 @@ mod tests {
       unserved,
       Some(3),
       "each scatter's part came home unserved, counted where it was asked"
+    );
+  }
+
+  /// The two read scatters the resend test sends, by request sequence: a listing (1) and the caller's grants (2).
+  fn read_scatters() -> [(u32, super::RequestBody); 2] {
+    [
+      (1, super::RequestBody::List { after: None }),
+      (2, super::RequestBody::Grants { after: None }),
+    ]
+  }
+
+  /// Serves `body` from the client seated at `seat` under `sequence`, as the shard serves a request its ring hands over
+  /// (`serve`): its answer when it was answered at once, `None` when it went out to be answered later (a scatter).
+  fn served_as_from_the_ring(
+    state: &mut crate::state::ShardState,
+    seat: u32,
+    (sequence, body): &(u32, super::RequestBody),
+  ) -> Option<ReplyBody> {
+    use slates_vfs::clock::Clock as _;
+    let generation = state.clients.generation_at(seat).unwrap();
+    let handle = slates_mem::Handle::from_raw(seat, generation);
+    let word = slates_wire::request::RequestId {
+      client: ASKING,
+      sequence: *sequence,
+    }
+    .word();
+    let slot = slates_ipc::protocol::pack(
+      state.clients.get_mut(handle).unwrap().end.region_mut(),
+      slates_ipc::protocol::Direction::Request,
+      u64::from(*sequence),
+      word,
+      body,
+    )
+    .unwrap();
+    let request = super::Request {
+      request: slot.request,
+      kind: slot.kind,
+      payload: slot.payload,
+    };
+    let now = state.clock.monotonic_ns();
+    match super::serve(state, handle, &request, now) {
+      super::Served::Reply(reply) => Some(reply),
+      super::Served::Forwarded => None,
+    }
+  }
+
+  /// What the resend test saw ([`resent_past_a_fenced_shard`]), each by request sequence.
+  struct Resent {
+    /// The fenced control shard.
+    fenced: Option<u16>,
+    /// Each scatter's first answer.
+    first: std::collections::BTreeMap<u32, ReplyBody>,
+    /// A resend answered at once, as from the request's completion record, with that answer.
+    at_once: std::collections::BTreeMap<u32, ReplyBody>,
+    /// A resend's answer that came back later, its scatter run again.
+    again: std::collections::BTreeMap<u32, ReplyBody>,
+    /// The asking shard's count of parts that came home unserved.
+    unserved: Option<u64>,
+  }
+
+  /// On a two-shard daemon whose control shard is fenced, a client seated on the other shard sends each read scatter
+  /// ([`read_scatters`]), reads both answers, then sends each again under its own id, as a client resends a request
+  /// refused `Overloaded` (`slates_client::Client::begin_again`).
+  fn resent_past_a_fenced_shard() -> Resent {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    daemon.inject_consensus_failure().unwrap();
+    let (fenced, seat, region, sent_at_once) = crate::daemon::observe_at(&daemon, 1, |state| {
+      let (seat, region) = seat_asking(state);
+      let sent_at_once = read_scatters()
+        .iter()
+        .filter_map(|asked| served_as_from_the_ring(state, seat, asked))
+        .count();
+      (state.shards.first().copied(), seat, region, sent_at_once)
+    });
+    assert_eq!(sent_at_once, 0, "each scatter went out to the fenced shard");
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let first = answers_by_sequence(&mut end, read_scatters().len());
+    let at_once: std::collections::BTreeMap<u32, ReplyBody> =
+      crate::daemon::observe_at(&daemon, 1, move |state| {
+        read_scatters()
+          .iter()
+          .filter_map(|asked| {
+            served_as_from_the_ring(state, seat, asked).map(|reply| (asked.0, reply))
+          })
+          .collect()
+      });
+    let owed = read_scatters().len().saturating_sub(at_once.len());
+    let again = answers_by_sequence(&mut end, owed);
+    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
+      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
+    });
+    daemon.stop();
+    Resent {
+      fenced,
+      first,
+      at_once,
+      again,
+      unserved,
+    }
+  }
+
+  /// A-563 (A-557's sibling; §4.9 "Status (2026-11-17, an `Overloaded` verb is never its own completion)": `Overloaded`
+  /// says the request was not started, so a resend under its id runs it). Do: on a two-shard daemon whose control shard
+  /// is fenced, list the volumes and ask for the grants from a client seated on the other shard, each served as its
+  /// ring hands it over; once both are answered, send each again under its own id. Expect: each answered `Overloaded`
+  /// naming the fenced shard both times, and each resend run again (its part sent and counted unserved a second time),
+  /// never answered from a record. Before, the deferred reply's path recorded the refusal as the request's completion,
+  /// so every resend under the id met it for good.
+  #[test]
+  fn a_resend_of_a_read_scatter_refused_overloaded_runs_it_again() {
+    let seen = resent_past_a_fenced_shard();
+    let fenced = seen.fenced.expect("the daemon has a control shard");
+    let refused_for_the_fence = |answer: Option<&ReplyBody>| {
+      matches!(
+        answer,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Overloaded { shard }
+        }) if *shard == fenced
+      )
+    };
+    for (verb, sequence) in [("list", 1u32), ("grants", 2)] {
+      let (first, at_once, again) = (
+        seen.first.get(&sequence),
+        seen.at_once.get(&sequence),
+        seen.again.get(&sequence),
+      );
+      assert!(
+        refused_for_the_fence(first),
+        "{verb}'s first answer: {first:?}"
+      );
+      assert_eq!(at_once, None, "{verb}'s resend was answered from a record");
+      assert!(refused_for_the_fence(again), "{verb}'s resend: {again:?}");
+    }
+    assert_eq!(
+      seen.unserved,
+      Some(4),
+      "each send and each resend ran its scatter"
     );
   }
 

@@ -4934,6 +4934,28 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-19, A-554: grants, the owed audit, departed hosts and held copies leave the tick; the retry window
+> named).** A grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants
+> table keeps its issued grants in an index by the end of their term (`slates_land::grant::Grants`, one entry an issued
+> grant, taken out at its consumption, revocation or end), so the keeper sleeps to the next grant due and its sweep
+> reads the due alone, where the tick walked every grant once a window. An issue or a restore notes the earliest it
+> entered, and each state borrow hands that to the keeper. A deadline its job could not end (a grant whose expiry record
+> the catalog refused, a refused destroy record) is tried again the retry window on (`deadlines::retry_window_ns`,
+> counted `deadline.stuck`): the shard's window of A-455, the liveness window `W` (the recovery budget by rent or buy,
+> A-359) raised to the scheduler overrun the shard measured, never past the observation budget. What a shard owes the
+> audit (A-265) is looked at by the keeper a retry window after the record that armed the look was owed
+> (`landing::arm_owed_audit_look`, armed in `write_audit` and at the shard's start for a recovered outbox): a front
+> where the look was armed is sent again (`landing.audit_resent`), and the look is armed again a window on while
+> anything is owed, never while nothing is. A host the fleet let go has its clients' attachments ended (A-222) by the
+> control shard's reaper, which looks when the look's inputs change: an install that changed the fleet's members
+> (`FleetNode::take_members_changed`, read as each state borrow closes), an anchor learned or restarted, a peer's plane
+> started (`remote_attach::look_for_departures`); a look some shard did not answer is asked for again a retry window on,
+> by the keeper. A writable copy taken back after a takeover that no holder claimed (Linux, A-197) is reclaimed at its
+> claim's deadline: the keeper sleeps to it (`held_copy::next_claim_deadline`) and hands the reclaim to the reaper,
+> which writes the copies back. Off the tick so far: dead clients (A-475), staging buffers and status captures (A-522),
+> leases, CLI attachments and destroys (A-536), grants, the owed audit, departed hosts and held copies (A-554); the
+> pressure hold is next.
+
 > **Status (2026-11-19, A-536: leases, CLI attachments and destroys leave the tick).** The shard's deadline keeper
 > (`crate::deadlines`) also sleeps to the lease wheel's next deadline, releasing or renewing a lapsed write lease at its
 > term, and to the next CLI attachment's lapse, which the partition now keeps in an index of terms (derived from the
@@ -5042,7 +5064,8 @@ root-relative path as an explicit alternative; it does not report that the reque
 
 **Data model.**
 ```rust
-#[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
+#[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, request: u64, payload: [u8; 40],
+                                   stamp: u32 /* the producer's clock, low 32 bits, as it wrote the slot (A-559) */ }
 struct Ring { slots: [Slot; N], head: CachePadded<AtomicU64>, tail: CachePadded<AtomicU64> }
 struct ClientRegion { magic, version /* 3 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
                      spin_ns: u32, spin_shift: u32,
@@ -5141,7 +5164,11 @@ well-known name.
 **Protocol.** Requests and replies are fixed-layout 64-byte slots; request ids are `(client_id,
 sequence)`; the daemon keeps a completion record per client until acknowledged (RIFL), so a retry
 after a lost reply returns the original result; deadlines are remaining budgets; cancellation is
-a slot kind.
+a slot kind. Each slot carries its producer's stamp (A-559): the low 32 bits of the host's monotonic clock as the slot
+was written, the lowest bit set so zero reads as unstamped, which whoever takes it widens back to the full reading
+(`slates_ipc::slot::landed_ns`, from any reading within 2³² ns, about 4.3 s, after it). So a client knows when its
+request landed in the command ring and when its reply landed in its own, not only when it took it, and a caller's
+latency splits into the daemon's part and its own (`slates_machine::attribution`).
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
 loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
@@ -7056,6 +7083,11 @@ window is the process-restart window (zero, thanks to the anchor). Same code, ze
 
 ### 4.9 Wire protocol (D-15)
 
+> **Status (2026-11-19, A-539: wire major 3).** A host's refusal code is typed by its numbering (§4.15 step 6): an errno
+> field carries an errno alone, and a Win32 error code rides in a variant appended beside it. A major-2 Windows peer put
+> Win32 codes in errno fields, which no append-only change can say of them, so the major is 3 and a major-2 peer is
+> refused before its body is read (`crates/wire/src/header.rs`, as A-237 took major 2).
+
 > **Status (2026-11-07, A-241: a client proves its id).** A client's id names its seat: its retained completion records,
 > its attachments, every verb after. The rendezvous carries only the id a client wants, which a stranger can name, and
 > a request carries its id in its slot word. So now:
@@ -7155,6 +7187,12 @@ failure.
 > attachment (`a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb`;
 > `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Open (GAPS): a live-shipped verb whose
 > effects committed before its held-reply bound refused it, and a deferred task that ends on `Overloaded`.
+>
+> A-563 (2026-11-19): a deferred reply too. A reply that comes back through `deliver` is written by `retry_deferred`,
+> which recorded every new one. So a read scatter's `Overloaded`, for a part not sent or not served (A-557), was the
+> request's completion. It now leaves a `not_started` reply unrecorded as well
+> (`a_resend_of_a_read_scatter_refused_overloaded_runs_it_again`;
+> `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`).
 
 > **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
 > its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
@@ -9189,6 +9227,11 @@ it builds against the contract and adds to it rather than around it.
 > `IdentityRule::ContainerRootAsMountingUser` (appended) and every hard link's name served at once; `Engine::Podman`
 > and `Endpoint::Local` are appended. A remote podman is refused `RemoteEngine`, one run as root `ProfileUntested`, a
 > labelling one `SelinuxLabelsUntested`, and every other rootless profile still `UserNamespaceUntested`.
+> **`CONTRACT` = 49 (A-539):** a host's refusal code carries its numbering. `HostFault::Base` names an `OsCode`, an
+> errno or a Win32 error code (none where the host named none), where it held a bare number that on Windows was a Win32
+> code; the wire's `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
+> `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone. An `OsCode` is
+> put in the OS's words only in its own numbering.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -10358,12 +10401,23 @@ entry either old or new, never torn).
    exchange's temporary and a clear's fresh directory take the aside name, so the displaced entry
    lands there. An exchange back removes only the temporary by its descriptor's inode, or the fresh
    directory by the identity it had at its hidden name; anything else there is kept. The seam offers
-   no rename that replaces its destination. A refusal the seam gives a number is typed by the numbering it is in
-   (A-527): an errno (`HostError::Unavailable`) or a Win32 error code (`HostError::Win32`). The engine tells refusals
-   apart by an errno's number (a name that exists, a full disk, a verb the filesystem lacks), so the Windows writer gives
-   a Win32 code of such a kind that kind's errno and keeps every other one as the Win32 code it is: a Win32 code whose
-   number is one of those errnos (`ERROR_NOT_SAME_DEVICE` 17, `EEXIST`'s) never reads as it, and ends the landing as any
-   refusal the engine does not tell apart does.
+   no rename that replaces its destination. The seam names the kinds the engine tells apart (A-539): a name that exists
+   (`HostError::Exists`), no room (`NoSpace`), a verb the filesystem lacks (`Unsupported`); each writer reads its own
+   platform's numbers into them (Linux's `EDQUOT` 122 and macOS's 69, a Linux exchange's `EINVAL` and macOS's
+   `ENOTSUP`, Windows' `ERROR_ALREADY_EXISTS`), so the engine compares no number. Where it tells none of them apart it
+   reads every kind alike, as it read every errno before: a metadata entry's open refused by any kind fails that entry
+   alone, and a refused `rmdir` is the target in use (a removal), a kept directory (an exchange back) or not this
+   landing's (an aside). Every refusal carries its code typed by its numbering (`OsCode`: an errno or a Win32 error code,
+   A-527) to the end: the landing report's failed entry (none for a fetch under way) and crash, the volume's
+   `BaseUnavailable`, a path on this daemon's own mount (`EDEADLK`, Windows' `ERROR_POSSIBLE_DEADLOCK`), a base path past
+   the longest recorded (`ENAMETOOLONG`, Windows' `ERROR_FILENAME_EXCED_RANGE`), and the wire, where each errno variant
+   carries an errno alone and a Win32 variant appended beside it carries a Win32 code (`HostAnswer::Win32`,
+   `LandingDegradation::CrashedWin32`, `TargetRefusal::HostWin32`, `Refusal::BaseUnavailableWin32`), pinned by golden
+   vectors (`crates/ipc/src/os_code_vectors.rs`); the library contract's `HostFault::Base` names an `OsCode` (contract
+   49). An errno field so changed what it may hold, which no append-only change can say of what an older peer or record
+   holds, so the change takes a new wire major (3: a major-2 peer is refused, never decoded; D-15, as A-237's took 2)
+   and a new anchor layout (11: a segment whose completion records keep replies a layout-10 daemon wrote is refused,
+   never misread); a ring body's schema hash moves with its appended variants on its own (§4.9 "Framing").
 7. *Batches inside the landing (A-130).* A file is staged — written, given its mode and mtime, and
    written out — and waits, open at its hidden name, for its batch's barrier; then the batch's files
    are placed. A batch holds at most one copy window of pages (`chunk_bytes`), each file counted as at
@@ -11891,6 +11945,19 @@ signature verification).
 > golden vectors stock Mercurial 7.2 made (`crates/hg/fixtures`, the command in `make-fixtures.sh`): each bundle decodes
 > as 7.2's own `debugbundle` lists it, every text rebuilds from its deltas, each encodes back to its bytes. Still owed
 > from piece 1: the parts' own payloads (phase-heads, bookmarks, the check parts, markers, pushkey values).
+>
+> **Status (2026-11-19, A-545: piece 1's part payloads built).** `slates-hg` also decodes and encodes what a push and a
+> pull carry inside their parts: `phase-heads` and `check:phases` (24-byte entries, each phase 7.2 defines), `bookmarks`
+> and `check:bookmarks` (a node, a 16-bit name length and the name; every bit set for "no bookmark"), `check:heads` and
+> `check:updated-heads` (whole nodes), obsolescence markers in formats 0 and 1 (an `obsmarkers` payload and an obsstore
+> alike), and pushkey: a `pushkey` part's request, the `reply:pushkey` part 7.2's server writes, and the listkeys
+> encoding, a namespace's values read as nodes. Nothing is allocated in decoding; every encoder gives its exact length
+> before it writes, so its caller charges its admission first, and writes nothing on a refusal. Proven against golden
+> vectors stock 7.2 made (`crates/hg/fixtures/payloads`, the command in `make-payload-fixtures.sh`): three pushes over
+> SSH captured on the wire, the server's replies and its answers to the `listkeys phases` after each, and two
+> obsstores; each payload decodes as 7.2's listings and logs say and encodes back to its bytes. The crate root now
+> carries the no-panic attribute (`arithmetic_side_effects` denied outside tests). Still owed from piece 1: compressed
+> streams, once the D-17 engines are wired.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12254,8 +12321,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
    interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
    parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
-   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, `crates/hg`): the framings,
-   bundle1 and the deltas; owed: the parts' payloads, from phase-heads to pushkey values.
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, A-545, `crates/hg`): the
+   framings, bundle1, the deltas and the parts' payloads; owed: compressed streams (`GZ`, `BZ`, `ZS`, D-17).
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
    string and the bundle2 capability blob, and `batch` escaping.
@@ -36953,3 +37020,296 @@ until part 2), `crates/bridge-core/tests/invalidation.rs`. Part 2: §4.5, §4.6 
   `slates-vfs --lib journal` 12 of 12, `slates-server --lib reader_patience` 2 of 2 and `learned_wait` 2 of 2; red with
   the fold made a no-op (the patience kept at the one-window prior): all six rounds overran, where only the first
   should. The mounts' wiring (`fuse.rs` on Linux, `winfsp.rs` on Windows) is not compiled on macOS: main's lanes.
+
+### A-563 — A deferred reply that says its request was not started is never recorded as its completion (2026-11-19, goal 85 via g225; §4.9 RIFL, "Status (2026-11-17, an `Overloaded` verb is never its own completion)"; A-557's sibling, A-533)
+
+- **What was there.** `Overloaded` means not started, so a resend under the id runs the request, and a verb's own such
+  answer is left unrecorded (`recorded_unless_deferred`). A reply that comes back through `deliver` is written by
+  `retry_deferred`, which recorded every new one. A read scatter's `Overloaded`, for a part not sent (2026-11-05) or not
+  served (A-557), came that way, so it was the request's completion: every resend under the id was answered from the
+  record, and the scatter never ran again.
+- **The rule.** `retry_deferred` judges a new deferred reply as a verb's answer is judged: a `not_started` reply
+  (`Overloaded`, `Unpublished`) goes through `unrecorded_not_started`, counted and never recorded, and anything else is
+  recorded as before. A reply already recorded, or deferred again by a full ring, is unchanged.
+- **Test.** `a_resend_of_a_read_scatter_refused_overloaded_runs_it_again` (`crates/server/src/verbs.rs`): a two-shard
+  daemon with its control shard fenced; a client seated on the other shard lists and asks for its grants, each served as
+  its ring hands it over, then sends each again under its own id. Red before the fix: the listing's resend was answered
+  from its record (0.74 s, Mac Studio). Green: both resends go out again, both are answered `Overloaded { shard: 0 }`,
+  and four parts are counted unserved.
+- **Reported, not changed.** `consensus_on_control` answers `Overloaded` after its operation ran: either a shard's
+  publication call or the control call itself was given up. Its resend now runs the operation again. A bootstrap is
+  idempotent (`bootstrap_authorized`) and publishes again; `Recover`'s second run is judged by its own stale checks,
+  not read here.
+
+Applied in the same change to: §4.9 (the 2026-11-17 status), GAPS (the 2026-11-17 entry's sibling, closed),
+`crates/server/src/verbs.rs` (`retry_deferred`, `not_started`'s doc, the test and its shared answer reader), the bug
+records `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md` and
+`docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`.
+
+### A-539 — A host's refusal code carries its numbering end to end, and the landing reads kinds, never numbers (2026-11-19, g085, UI goal 88; §4.15 step 6, §4.9, §4.12; A-527's owed half; A-185, A-227, A-237, A-519)
+Applied in the same change to: §4.15 step 6 (the rule), §4.9 (status: wire major 3), §4.12's contract log (`CONTRACT`
+= 49), GAPS (A-185's owed numbering: built, with what it leaves), `docs/library.md` (the host faults' row),
+`crates/vfs` (`src/host/mod.rs`: `OsCode`, the named kinds `HostError::Exists`, `NoSpace`, `Unsupported`,
+`Unavailable(OsCode)`, `OwnMount(OsCode)`, `HostError::code`; `src/host/sim.rs`: the simulated host gives the kinds and
+can refuse `rmdir` and a metadata open; `src/error.rs`: `VfsError::BaseUnavailable(Option<OsCode>)`; `src/base.rs` and
+`src/base_recovery.rs`: a recovered directory's code typed, the gone directory's per platform; `src/volume.rs`;
+`tests/base.rs`), `crates/base` (`src/unix.rs`, `src/windows.rs`, `src/own_mounts.rs`: the deadlock avoided typed per
+platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.rs`: the Unix writer's rule;
+`src/os_windows.rs` and `src/windows_codes.rs`: the Windows writer's; `src/engine.rs`: `Outcome::Failed` and
+`Degradation::Crashed` by `OsCode`, `named_code`; `src/test_store.rs`, `src/chmod_tests.rs`, `src/captured_tests.rs`,
+`tests/durability.rs`), `crates/server` (`src/error.rs`: `target_of_host`, `base_unavailable`; `src/landing.rs`:
+`answer_of`, `degradation_of`; `src/verbs.rs`: the over-long base's code per platform; `src/daemon.rs`), `crates/ipc`
+(`src/protocol.rs`: the four appended variants; `tests/wire_order.txt`; `src/os_code_vectors.rs` and its `.txt`, new),
+`crates/wire` (`src/header.rs`: `MAJOR` = 3), `crates/anchor` (`src/layout.rs`: `LAYOUT_VERSION` = 11;
+`tests/anchor.rs`), `crates/api` (`src/error.rs`: `OsCode`, `HostFault::Base { code }`; `src/lib.rs`: `CONTRACT` =
+49), `crates/mcp` and `crates/sdk-node` (a Win32 code as `win32` beside `errno`), and the bridges (`bridge-core`,
+`bridge-fuse`: the volume's refusal as its errno, where it is one).
+- **What was there.** A-527 typed the land seam's own refusal (`HostError::Win32` beside `Unavailable(errno)`), and
+  past the seam one number field still held either numbering: the landing report's `Failed { errno }` and crash, the
+  volume's `BaseUnavailable`, and the wire's `TargetRefusal::Host`, `HostAnswer::Errno`, `LandingDegradation::Crashed`
+  and `Refusal::BaseUnavailable`, which on Windows carried Win32 codes (5 is `EIO` as an errno and
+  `ERROR_ACCESS_DENIED` as a Win32 code). The engine told refusals apart by an errno's number, with Linux's and macOS's
+  side by side (`EDQUOT` 122 and 69, `ENOTSUP` 95 and 45), and the Windows writer gave a Win32 code of such a kind
+  the errno of that kind. Two more fields carried a Windows number where an errno goes: a path on the daemon's own
+  mount (`ERROR_POSSIBLE_DEADLOCK`, 1131) and a base path past the longest recorded (the MSVC runtime's `ENAMETOOLONG`,
+  38, which no Windows call answers).
+- **The rule.** The seam names the kinds the landing tells apart (`Exists`, `NoSpace`, `Unsupported`), each writer
+  reading its own platform's numbers into them, so the engine compares no number. Where it tells none of them apart it
+  reads every kind alike, as it read every errno before: a metadata entry's open refused by any kind fails that entry
+  alone (A-519, A-527), and a refused `rmdir` is the target in use, a kept directory or not this landing's (A-291,
+  AUD-29-04). Every code is typed by its numbering (`OsCode`) to the end: the report, the volume, the daemon's own-mount
+  and over-long refusals, and the wire, where an errno variant carries an errno alone and a Win32 variant appended
+  beside it a Win32 code. The library names an `OsCode` in `HostFault::Base` and puts it in the OS's words only in its
+  own numbering.
+- **Layouts.** An errno field changed what it may hold, which no appended variant can say of what an older peer sent or
+  an older segment keeps. So the wire's major is 3 (a major-2 peer is refused before its body is read, D-15, as A-237
+  took 2), and the anchor's layout is 11 (a completion record keeps its reply's bytes, read back with no schema word, so
+  a layout-10 segment is refused at start, never misread). A ring body's schema hash covers every variant of every enum
+  in it (`slates-wire-derive`), so the ring needed nothing more: a body of the older form is refused "schema mismatch".
+  No shim reads the old form anywhere.
+- **Tests, red first** (the Mac Studio, kiln, 2026-11-19, debug, run r59, 01:40 to 01:44 UTC, load 11.9 to 25.4).
+  At the first piece's tests-first commit (033ecb3d0): `slates-land --lib -- windows_codes os::tests` 2 of 2 failed
+  (`ERROR_FILE_EXISTS` read `Unavailable(17)` where `Exists(Win32(80))` was wanted; `refusal(EEXIST)` `Unavailable(17)`
+  where `Exists(Errno(17))`), `slates-ipc --lib -- os_code_vectors` failed its vectors (none published, 12 written),
+  and `slates-server --lib -- a_win32_code_reaches_the_wire` read `Errno { errno: 5 }` where `Win32 { code: 5 }` was
+  wanted. At this change's tests-first commit (92362f024): `slates-land --lib -- whatever_the_kind` 2 of 2 failed on
+  their first refusal, `Exists(Errno(17))` (the metadata entry's landing `Aborted` with `Crashed`; the removal
+  `Failed` where `Conflict(TargetInUse)` was wanted), and `slates-wire --lib -- header` read a major-2 header through to
+  its unknown class. Green with the change (run r76, 01:47 to 01:51 UTC, load 14.2 to 18.8): `slates-land --lib` 47
+  passed (1 ignored, the manifest vectors' writer), `slates-vfs --lib -- host:: base` 13, `slates-base --lib --
+  own_mounts s3::host` 12, `slates-ipc --lib -- os_code_vectors protocol` 7 (2 ignored), `slates-wire --lib -- header`
+  4, `slates-anchor --lib -- layout` 2, `slates-api --lib -- error:: contract_history` 12, `slates-server --lib --
+  landing:: error:: longest` 16, `slates-mcp` and `slates-bridge-core` built; the wire order's writer
+  (`publish_appended_variants`) left `crates/ipc/tests/wire_order.txt` as committed; `cargo fmt --check` clean. The
+  golden vectors (`crates/ipc/src/os_code_vectors.txt`) agree, 8 of 8, byte for byte with an encoder written apart from
+  the crate's, from the codec's rules (a `u32` discriminant by declaration index, a `u32` length prefix, little-endian
+  fields) and the wire order's indices.
+- **Owed** (GAPS): `TargetRefusal::MountRefused` carries a WinFsp mount's Win32 code in its `errno` field on Windows; an
+  `OsCode` says an errno but not whose, and a fleet mixing Linux and macOS would put a forwarded errno in the reader's
+  words; the client's own OS faults name a bare number in its own numbering. Filed for main: the Windows land and base
+  suites and the xwin check (the Windows writer's rule, the deadlock and over-long codes), the anchor's cross-process
+  test `a_segment_from_before_typed_host_codes_is_refused_at_start`, the land integration suites over
+  `Outcome::Failed { code: Option<OsCode> }`, and clippy.
+
+### A-559 — Every slot carries its producer's stamp, so a harness splits each latency into the daemon's part and its own, measures its own noise, and charges the server only for the server's part (2026-11-19, goal 87 via g083; §4.7 "Data model", "Protocol"; A-297, A-416, A-528)
+
+Applied in the same change to: §4.7 ("Data model", the slot; "Protocol", the stamp); GAPS (the 1,000-client bound's
+entry); `crates/ipc/src/slot.rs` (`Slot::stamp`, `stamp_now`, `landed_ns`, the format), `crates/ipc/src/endpoint.rs`
+(each push stamped, `Reply::stamp`, `ClientEnd::request_stamp`), `crates/ipc/src/protocol.rs` (a bulk slot keeps its
+stamp through `owned`), `crates/client/src/client.rs` (`Client::poll_reply_stamped`, `request_stamp`; the pending
+replies keep their stamps), `crates/machine/src/attribution.rs` (new: `Exchange`, `harness_part`, `Verdict`, `judge`),
+`crates/machine/src/bench.rs` (`longest_gap_ns`), and `crates/client/examples/load_bench.rs` (the split, the `noise`
+row, the bound's verdict).
+
+- **What was measured.** Main's reading of r100's harness lines (the Mac Studio, 2026-11-19, 1,000 clients, without
+  the replicas): the rounds with a bad p99 were the rounds where `load_bench` itself stalled. Accepted submits' p99 was
+  29.2 ms beside a longest sweep of 33.8 ms and a longest window of 44.0 ms in which a reply's arrival could not be
+  placed (a 20 ms think, round 1), 22.9 ms beside 37.5 and 37.6 ms (round 3), and 2.7 and 0.42 ms beside 11.0 and
+  3.8 ms and 7.6 and 5.1 ms. The harness stamped a reply when its sweep took it, so its own stalls were in every
+  latency, and the bound charged them to the server.
+- **The stamp.** The slot's last four bytes were padding. Each producer now writes there the low 32 bits of the host's
+  monotonic clock (`slates_machine::clock::monotonic_ns`, the clock the daemon stamps its spans in) as it writes the
+  slot, with the lowest bit set, so a slot no producer stamped reads zero (`slates_ipc::slot::stamp_now`). The client
+  stamps its requests and the daemon its replies alike, one rule at the one push each end makes. Whoever takes a slot
+  widens the stamp back to the clock's full reading from any reading taken within 2³² ns (about 4.3 s) after it, to
+  within the nanosecond the set bit may add (`landed_ns`). A producer of the layout before writes zero there, which
+  reads as no stamp, so a client and a daemon of the two layouts still talk.
+- **The split.** An answered attempt's harness part is the time from its sending to its request's landing and from its
+  reply's landing to its taking (`slates_machine::attribution::harness_part`); its server part is the rest. With a stamp
+  missing or the instants out of order there is no harness part, and the whole latency is the server's. The bench sums
+  each client's attempts' harness parts and its held sends, so an operation, a cycle and a round each have theirs over
+  their own span; its rows `latency_server`, `latency_harness`, `operation_server` and `operation_harness` replace the
+  `floor` rows, which held only a lower bound on what the daemon took.
+- **The noise floor.** Before each level the bench runs as many threads as the level has workers, each watching the
+  clock for 100 ms with nothing between its reads (`slates_machine::bench::longest_gap_ns`, the probe `destroy_rows`
+  in `crates/vfs/examples/vfs_bench.rs` uses), and reports the longest gap any saw (the `noise` row, and in the
+  `harness` and `bound` rows).
+- **The verdict.** A judged kind is charged only for its server part (`slates_machine::attribution::judge`): its server
+  part's p99 at or over the bound misses it; its latency's p99 over the bound with its server part's under it is
+  harness-bound; both under, it is met. A level is `met\tyes` when every judged kind is met at the stated rate with no
+  failure, `met\tharness` when none missed and some kind was harness-bound (counted in `harness_bound`), never charged to
+  the server, and `met\tno` otherwise.
+- **Tests.** Failing first on the Mac Studio (debug, r52, 2026-11-19): `slates-machine`'s three attribution tests
+  against stub functions (`None` for every harness part, `Met` for every verdict) failed, the stalled-sweep reply read
+  as no harness part where 29.005 ms was, and a server part past the bound read as met. Green with the rule (r80):
+  `cargo test --locked -p slates-machine --lib attribution` 3 of 3 and `bench::` 4 of 4 (the noise probe's own test),
+  `-p slates-ipc --lib` 69 passed and 1 ignored (the slot's four stamp tests among them: widened back within a wrap,
+  zero and a pre-clock landing none, carried through a write and a read, a stamp taken now between the readings around
+  it), `-p slates-client --lib` 8 of 8, and `-p slates-server --lib` 485 passed and 3 ignored, every daemon in them
+  replying through stamped slots; rustfmt's layout taken. The bench is an example, compiled and run by main: its new
+  unit test is `a_level_past_the_bound_only_by_the_harnesss_part_is_harness_bound`.
+- **Owed (main's).** The example and the suites built and run, the lint matrix, and the A/B again on a quiet machine
+  reading the split rows.
+
+### A-545 — Mercurial's part payloads decoded and encoded and held to what stock Mercurial 7.2 sent and wrote: phases, bookmarks, the check parts, obsolescence markers in both formats, pushkey (2026-11-19, g291 for UI goal 91; §4.17.3 piece 1; §4.9; A-514, A-16)
+Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (`phases`, `bookmarks`, `heads`,
+`obsmarkers` and `pushkey`, new; the crate root's no-panic attribute; `bundle2`'s parameter sizes read as pairs; four
+tests split, a test type named, the fixtures' node parser; `fixtures/payloads/` and its `make-payload-fixtures.sh`),
+`.gitattributes` (every bundle under `crates/hg/fixtures` binary), GAPS (the §4.17.3 entry),
+`research/mercurial-server.md` (§13).
+- **What it does.** Reads and writes the payloads inside a push's and a pull's parts, byte for byte as 7.2 writes them:
+  `phase-heads` and `check:phases` (entries `>i20s`: public 0, draft 1, secret 2, archived 32, internal 96; any other
+  phase refused by kind, where 7.2 fails with a `KeyError`), `bookmarks` and `check:bookmarks` (`>20sH` and the name;
+  every bit set means "no bookmark"; an encode refuses a node equal to that marker and a name past 16 bits),
+  `check:heads` and `check:updated-heads` (whole nodes), markers in format 0 (`>BIB20s`, `key:value` metadata joined
+  by NUL) and format 1 (`>IdhHBBB`, nodes of 20 bytes or, flagged, 32, sized metadata), and pushkey: a `pushkey`
+  part's four mandatory parameters in 7.2's order, the `reply:pushkey` part 7.2's server writes (a mandatory type,
+  advisory `in-reply-to` and `return`, the numbers' text written into a fixed buffer the part borrows), the listkeys
+  encoding (`key\tvalue` lines, read as Python's `splitlines()` cuts them, each holding exactly one tab), and a
+  namespace's values as nodes. Handling the parts (whether a check holds, what a bookmark move does) is piece 5's;
+  converting markers between the formats, and the `obsolete` pushkey namespace, are piece 7's.
+- **From the sources (7.2's code [C], read 2026-11-19 in the wheel `uvx` installs; `research/mercurial-server.md` §4
+  and §13).** `phases.binarydecode` and `bookmarks.binarydecode` refuse a short last entry; `_fm0decodemeta`
+  (`obsolete.py:291`) splits each entry at its first `:`; 7.2 reads format 1 with the C reader when it is built
+  (`obsolete.py:459`) and the pure one otherwise, and the two disagree, measured on stock 7.2: a size past a marker's
+  fields is skipped by the C reader and fails the pure one, a parent count of 0 is no parent data to the C reader and
+  recorded-and-none to the pure one, a count of 4 is no parent data to the C reader and fails the pure one. A push
+  carries `phase-heads` only for heads it publishes (`_pushb2phaseheads`, `exchange.py:1046`), so a getbundle is where
+  each phase's heads travel; the client asks `listkeys phases` after every push (`_pushsyncphase`, `exchange.py:1346`);
+  the reply's parameters are advisory (`bundle2_part_handlers.py:438`); the phases namespace lists its draft roots
+  beside `publishing`.
+- **Stricter than 7.2, on purpose.** A format 1 marker whose size is not exactly its fields, so both of 7.2's readers
+  would read it alike; a parent count past 3; a format 0 marker flagged SHA-256 (7.2 reads 20-byte nodes under it, and
+  its writer refuses one); a format 0 metadata entry with no `:`, refused on decode and on encode; a listkeys line
+  without exactly one tab. A parent count of 0, which 7.2 writes, is kept as written and read as the pure reader reads
+  it.
+- **Caps, none a literal.** Decoding allocates nothing: a payload is checked whole, then read in place, so the payload
+  is the cap. Every encoder has its `encoded_len` (`listkeys_encoded_len` for listkeys), the exact length through the
+  same writer, so a caller charges its admission before it allocates; a refused encode writes nothing.
+- **Golden vectors.** `crates/hg/fixtures/payloads`, made on the Mac Studio (macOS 26.4, arm64) on 2026-11-19 by stock
+  Mercurial 7.2 from PyPI through `uvx` (CPython 3.12.16) with, from a clone of the branch, exactly:
+  `OUT=$(mktemp -d ~/.cache/g291-payload.XXXXXX) && crates/hg/fixtures/payloads/make-payload-fixtures.sh "$OUT"`.
+  Three pushes over SSH version 1 to a non-publishing server, captured by an ssh stand-in: the modern one (bookmarks,
+  the check parts, changegroup `03`, markers), the legacy one (`devel.legacy.exchange=bookmarks,phases`: pushkey
+  parts) and one to a `concurrent-push-mode = strict` server (`check:heads`); the server's replies and its answers to
+  the `listkeys phases` after each; two obsstores of the same three markers (an amend, a prune recording its parent, a
+  split with its own date and user) in formats 0 and 1; 7.2's `debugbundle --all` and `debugobsolete` of each. The
+  first run cut each reply at the end of the server's output, so the next response trailed the stream, which 7.2's
+  reader stops before and this codec refuses (3 of 78 tests failed on it); the second, cutting where the stream ends,
+  made every other file byte for byte alike, and the 24 files' SHA-256 matched after the copy.
+- **Main's gate findings in the crate folded in (adacachy and jupiter, 2026-11-19).** The crate root's
+  `#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]`, beside the print macros denied; every operation
+  outside tests was already checked or a division by a nonzero constant. `chunks_exact` with a constant size gone from
+  the crate (`as_chunks`). The two tests at cognitive complexity 11 split (bundle2's malformed streams; changegroups
+  `03` and `04`), and the new tests kept under 10 by the same count. The generated part's type named; the fixtures'
+  node parser without string slicing. Clippy and xtask are main's to rerun.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug, load 18.7).** `cargo test --locked -p slates-hg --lib`: 80 of 80 in
+  1.0 s; `cargo fmt -p slates-hg -- --check` clean. Golden: the getbundle's `phase-heads` as 7.2 lists each phase's
+  heads, and its marker; the modern push's check parts, bookmark and marker; the legacy push's pushkey requests, each
+  part rebuilt equal to the one sent, and its check parts; the strict push's `check:heads`; the server's
+  `reply:pushkey` parts rebuilt equal to 7.2's, and its `reply:changegroup`; the `listkeys phases` answers; both
+  obsstores against `debugobsolete`; every payload and every captured stream encoded back to its bytes at the length
+  its `encoded_len` gave. Hostile: payloads cut inside an entry, unknown phases (`u32::MAX` among them), names longer
+  than their length says, markers misread by either 7.2 reader, every cut of both obsstores, every bit of the format 1
+  obsstore flipped, listkeys lines with no tab or two, arbitrary bytes (property tests), and a reply at the widest
+  numbers. Not red-checked (one unit-test run, CLAUDE.md §8): each hostile test asserts its refusal's kind and place.
+- **Owed.** Compressed streams (D-17); the markers' conversion between the formats and the `obsolete` namespace's
+  base85 `dump` keys, with the exchange (piece 7); the parts' handlers (piece 5).
+
+### A-554 — Grants, the owed audit, departed hosts and held copies leave the reap loop's tick, each at its own deadline or event (2026-11-19, goal 86, g255; the event-driven reaper's piece 4; §4.7; A-265, A-266, A-222, A-197, A-475, A-522, A-536)
+
+- **What was there.** The reap loop's tick, once a liveness window on every shard, ended the grants past their term
+  (`landing::end_expired_grants`, a walk of every grant the shard holds), then sent again what the shard owed the audit
+  and had not been acknowledged since the tick before (`landing::resend_stuck_audit`); then, on the control shard, it
+  looked for departed hosts (A-222), and it reclaimed unclaimed held copies (Linux, A-197), sampled the pressure hold,
+  purged NFS state, drained base hints and delegation recalls, sealed idle content and re-armed huge-page placement.
+- **Grants (job 1).** The grants table (`slates_land::grant::Grants`) keeps its issued grants in an index by the end of
+  their term (`by_term`, one entry an issued grant: entered at an issue or a restore, taken out when the grant is
+  consumed, revoked, ended or dropped by `retain`), so `expired_at` reads the due alone, in the order their terms ended,
+  and `next_due_ns` is the first instant one is past its term: its end and a nanosecond, since a grant is usable through
+  its term's last nanosecond (`Grants::check`). The shard's deadline keeper (`crate::deadlines`, A-522) sleeps to it
+  and runs `end_expired_grants` in its pass when it is due. An issue or a restore notes the earliest due it entered
+  (`Grants::take_noted`) and each state borrow hands that to the keeper (`deadlines::after_borrow`), as the partition's
+  lease and term notes are. `end_expired_grants` now sends the owed audit only when it recorded an expiry: every tick
+  sent whatever was owed through it, which hid the resend's own cadence.
+- **The retry window, named.** A deadline still past after the keeper's pass (a job that could not end it: a grant whose
+  expiry record the catalog refused) and a refused destroy record are tried again the retry window on
+  (`deadlines::retry_window_ns`, counted `deadline.stuck`): the shard's window (A-455, `watchdog::watch_window_ns`), the
+  liveness window `W` raised to the scheduler overrun the shard measured, never past the observation budget. A-536 took
+  that window at both sites and named it only as "a window".
+- **Tests.** `crates/land/src/grant.rs`: `the_index_of_terms_answers_as_a_walk_of_the_table` (one history over every
+  change the table takes, each step's answers compared with a walk of the table at instants around every term's end,
+  and the noted instant with the earliest entered since the last ask). `crates/server/src/deadlines.rs`:
+  `a_grant_past_its_term_ends_at_its_term_without_a_tick` (a grant issued under the policy with a term of a tenth of a
+  window, ended, out of both tables and audited within half a window). The server test failed first on main's code
+  (cf17cae, the Mac Studio, 2026-11-19): not ended within half a window. Green on 3a83ace (the Mac Studio, 2026-11-19
+  17:35 local, load 17, debug): `slates-land --lib grant::` 5 of 5, `slates-server --lib deadlines::` 8 of 8; the grant
+  with a 100 ms term ended 102.4 ms after its issue.
+- **The owed audit (job 2).** What a non-control shard owes the audit (A-265's outbox) is looked at by the keeper a
+  retry window after the record that armed the look was owed: `write_audit` arms it when it owes a record
+  (`landing::arm_owed_audit_look`: the outbox's front noted, the look at `now` and a retry window, unless one is
+  armed), and so does the shard's start for an outbox a crash cut off. At the look (`landing::look_at_owed_audit`) a
+  front still where it was noted is sent again (`landing.audit_resent`): the batch was lost or is slow, and the control
+  partition appends nothing twice. While anything is owed the look is armed again a window on; once nothing is, nothing
+  is armed, so a shard that owes nothing is never woken for the audit. The tick looked once a window on every shard
+  whether anything was owed or not, sent again a front it had seen at its look before, so a record owed just after a
+  look waited nearly two windows, and its first look after a start sent again what had been sent a moment before.
+  Test: `crates/server/src/landing.rs` `an_unacknowledged_audit_batch_is_sent_again_a_window_after_its_send` (a
+  two-shard daemon past the tick's first look, the second shard's acknowledgements withheld: the batch sent again no
+  sooner than a window after its send and within half a window more). Failed first on main's code (cf17cae, the Mac
+  Studio): not sent again within a window and a half. Green on c718509 (the Mac Studio, 2026-11-19 17:41 local, load
+  12.8, debug): `slates-server --lib landing:: deadlines::` 21 of 21; the batch sent again 1.0012 s after its send.
+- **Departed hosts (job 3).** A host the fleet let go has its clients' attachments ended on every shard (A-222) by the
+  control shard's reaper (`crate::reap::reaper`: a departed host's clients are dead clients no watch here sees), no
+  longer by the tick. The look runs when one of its inputs changes, each of which asks for it
+  (`remote_attach::look_for_departures`, a flag the reaper takes and a wake): an install that changed the fleet's
+  members (`FleetNode::take_members_changed` in slates-cluster, noted by the install and read as each state borrow
+  closes, so all nine install paths are covered and a repeated install of the same members asks for nothing), a
+  member's anchor learned on contact or changed by a restart (`fleet.rs`, the two learn paths), and a peer's plane
+  started (its seed id mapped to its anchor). A look some shard did not answer leaves its anchors owed, as before, and
+  is asked for again a retry window on, kept by the keeper (`ShardState::departures_retry_at`). No task is added: the
+  reaper idles while nothing is owed. Tests: `crates/cluster/src/fleet.rs` `an_install_notes_a_change_of_members_once`;
+  `crates/server/src/deadlines.rs` `a_departed_hosts_attachment_ends_when_the_fleet_lets_it_go_without_a_tick` (a
+  one-shard daemon, two learned peers configured members, a remote attachment of the leaving peer's client; once the
+  control shard counts the peer, a configuration without it is installed: the attachment ended within half a window).
+  The server test failed first on c718509 (the Mac Studio): the tick counted the peer, then the attachment was not
+  ended within half a window of the install. Green on 80c9aa2 (the Mac Studio, 2026-11-19 17:47 local, load 14.2,
+  debug): `slates-cluster --lib fleet::` 10 of 10, `slates-server --lib` 15 of 15 (`deadlines::`, `reap::`,
+  `remote_attach::` and the three tests of the learn paths); the attachment ended 107 µs after the install.
+- **Held copies (job 4, Linux).** A writable copy a successor took back from its anchor and no holder claimed within
+  the reconnect budget (A-197) is reclaimed at its claim's deadline, no longer at the tick: the keeper sleeps to the
+  earliest claim due (`held_copy::next_claim_deadline`, a walk of the maps not yet claimed, which the anchor's held-copy
+  bound bounds; paired with a `None` where no copy is taken back, `deadlines::claim_due`) and at it hands the reclaim to
+  the reaper (`held_copy::owe_reclaim_if_due`, `ShardState::held_copies_owed`), since the reclaim writes copies back a
+  slice a turn; the reaper runs it (`held_copy::reclaim_owed`). The code is Linux's alone, as the copies are, so this
+  agent could neither build nor run it on its macOS host (§8): the test, `crates/server/src/held_copy.rs`
+  `an_unclaimed_map_is_reclaimed_at_its_claims_deadline_without_a_tick` (a map entered unclaimed with its claim due a
+  tenth of a window ahead: reclaimed within half a window and counted once), is filed for main's Linux build, red on
+  80c9aa2 with the test alone and green on this change. On macOS the change builds its `None` arm: green on 570664b
+  (the Mac Studio, 2026-11-19 17:52 local, load 22.9, debug), `slates-server --lib` 25 of 25 (`deadlines::`, `reap::`,
+  `remote_attach::`, `landing::`).
+- **The merged tree.** c2abf6e (the Mac Studio, 2026-11-19 17:54 local, load 18.8, debug): `cargo fmt --check` clean
+  for the three crates; `slates-land --lib grant::` 5 of 5, `slates-cluster --lib fleet::` 10 of 10, `slates-server
+  --lib` 30 of 30 (`deadlines::`, `reap::`, `remote_attach::`, `landing::`, the learn paths' three, the relinquish).
+- **Left for piece 5, in order.** The pressure hold: its event is a watermark crossing (A-470's plan), which the hosts
+  name for themselves and slates already reads polled (`slates_machine::memory_stall`: Linux PSI's memory `some`, macOS
+  `kern.memorystatus_vm_pressure_level`, Windows' low-memory notification); awaiting them is per-platform work (a PSI
+  trigger's `POLLPRI` through the shard's readiness wait on Linux, the notification handle through
+  `slates_rt::handle_wait` on Windows, XNU's memory-status level on macOS), and the hold today follows the shortfall
+  below the boot baseline rather than the host's level, so which signal moves it is the piece's first decision. Then
+  NFS purges, base hints with their delegation drain, the idle seal and the huge-page re-arm; then the reap loop and its
+  tick are deleted, which §4.7's status will say.
+
+Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/land/src/grant.rs`,
+`crates/cluster/src/fleet.rs`,
+`crates/server/src/{deadlines,landing,verbs,daemon,reap,remote_attach,fleet,state,held_copy}.rs`.

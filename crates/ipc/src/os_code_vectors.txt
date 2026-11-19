@@ -1,0 +1,12 @@
+# The wire form of a host's refusal code (A-539): an errno in the errno variants, a Win32 error code in the Win32
+# variants, for numbers both numberings name. A line is `<value> <hex>`, the value as the test builds it. Republish
+# deliberately after a layout change:
+#   cargo test -p slates-ipc --lib -- --ignored publish_the_os_code_vectors
+HostAnswer::Errno{errno:17} 0400000011000000
+HostAnswer::Win32{code:17} 0500000011000000
+LandingDegradation::Crashed{errno:5} 0200000005000000
+LandingDegradation::CrashedWin32{code:5} 0800000005000000
+TargetRefusal::Host{errno:5} 0700000005000000
+TargetRefusal::HostWin32{code:5} 1200000005000000
+Refusal::BaseUnavailable{path:/base,errno:2} 0c000000050000002f6261736502000000
+Refusal::BaseUnavailableWin32{path:/base,code:2} 4b000000050000002f6261736502000000
