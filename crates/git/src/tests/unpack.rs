@@ -30,7 +30,8 @@ fn unbounded() -> Admission {
   Admission::new(u64::MAX)
 }
 
-/// `bytes` fed to a reader `chunk` bytes at a time, every byte taken, then finished.
+/// `bytes` fed to a reader `chunk` bytes at a time, then finished: refused as bytes after the
+/// pack where a piece was not taken whole.
 fn fed_in_chunks<L: Locate + ?Sized>(
   bytes: &[u8],
   format: ObjectFormat,
@@ -39,8 +40,13 @@ fn fed_in_chunks<L: Locate + ?Sized>(
 ) -> Result<Unpacked, Refusal> {
   let mut admission = unbounded();
   let mut reader = Reader::new(format, index);
+  let mut fed = 0u64;
   for piece in bytes.chunks(chunk) {
-    assert_eq!(reader.read(piece, &mut admission)?, piece.len());
+    let took = reader.read(piece, &mut admission)?;
+    fed = fed.saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+    if took < piece.len() {
+      return Err(Refusal::TrailingBytes { at: fed });
+    }
   }
   reader.finish(&mut admission)
 }

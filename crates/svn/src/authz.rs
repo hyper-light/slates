@@ -68,6 +68,8 @@ mod tree;
 mod tests;
 
 pub use tree::PrincipalRules;
+// APR's `apr_fnmatch` as Subversion calls it, for `list`'s patterns (`crate::reads`, A-613 part 2).
+pub(crate) use glob::fnmatch;
 
 /// `SVN_ERR_MALFORMED_FILE`, which `svn_config__parse_stream` answers for a line it cannot read.
 /// Format: the miscellaneous category's start, 120,000 + 16 × 5,000 = 200,000, plus 2 (`svn_error_codes.h` 1289-1290).
