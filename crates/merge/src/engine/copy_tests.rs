@@ -1570,8 +1570,8 @@ impl Oracle {
     );
     for (path, bytes) in &state.files {
       prop_assert_eq!(
-        self.green.content_at(path, version).as_ref(),
-        Some(bytes),
+        self.green.content_at(path, version),
+        Some(bytes.clone()),
         "{} at {}",
         path,
         version
