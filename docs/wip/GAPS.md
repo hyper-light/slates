@@ -1188,9 +1188,14 @@
 >   second piece, `CONTRACT` = 47):** the engine's profile and the pre-bind check are library calls the command line
 >   makes (`container_engine::engine_profile` under `slates oci-runtime`, `container::check_source` under
 >   `slates oci-check`), each held by unit tests on every host (the questions' order over an injected query; the check's
->   judgment over an injected table and identity, and the host's own table). Owed: the judge's profiles for the engines
->   measured since it was written (rootless podman, G-mount step 3, and podman's command line); and Windows, which
->   has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+>   judgment over an injected table and identity, and the host's own table). **Built 2026-11-19 (A-520's third
+>   piece, `CONTRACT` = 48):** rootless podman's profile on its own Linux host, the one rootless run slates has by use
+>   (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`): the handshake asks podman its own
+>   statement (`podman info`), and the judge holds it with `IdentityRule::ContainerRootAsMountingUser`; podman run as
+>   root, remote or labelling stays refused typed. Owed: that profile's live check by use (filed 2026-11-19: `slates
+>   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
+>   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
+>   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
 > - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
 >   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
 >   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
