@@ -12502,6 +12502,19 @@ engine: the verdict, rebase, position mapping, the register).
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
+> **Status (2026-11-19, A-651: piece 9's edge built).** `crates/server`'s `vcs_ssh` serves SSH on the runtime's TCP,
+> the HTTP edge's counterpart: one connection a task under seats derived from the shard's clients, each driving
+> `slates-ssh`'s session. A key proves a principal only through the site's lookup, today `NoKeyRecord`, which refuses
+> every key until the one record of principals' credentials lands (main's ruling under §4.13; no key file, no default
+> key). Each `exec` is dispatched by its tool and refused in the tool's own words and exit status where it cannot run: a
+> missing repository, the repository's policy, and, for now, all four services as not served (git's upload-pack and
+> Mercurial's `serve --stdio` have landed and wait for their stores, A-662; receive-pack's and Subversion's entry
+> points, A-654 and A-656). Waits keep the HTTP edge's rule: RFC 6298's first RTO of the connection's own round trip
+> before a phase learns; a wait past its bound only marks its seat overdue, and the most overdue is reaped only for a new
+> connection with every seat taken, since an SSH connection waits on people (a key's passphrase after `PK_OK`, a host
+> key's confirmation) and on a push's compression. The key time is fed by authenticated connections' lifetimes. The
+> daemon starting the edge, the stores, the key record and the live OpenSSH `git clone` are owed.
+>
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
 > inflated through flate2 over zlib-rs (A-607) into room for exactly the size its header names, then the trailer, which
@@ -13059,9 +13072,10 @@ algorithm, so its answer equals `git blame`'s; it is a read of history, decides 
 | Push bytes in flight and pushes per shard | the shard's memory budget over the measured inflate and hash rate | the shard's budget, typed refusal | the first push's own size |
 | Keepalive during a held push (git's own: "The default is 5 seconds" [B: config `receive.keepAlive`]) | silence shorter than the shortest silent gap after which this deployment's connections were seen to drop, learned from the drops | the client's own deadline when it sent one | the connection's measured round trip |
 | Reaping a stalled client (A-625 part 2) | per phase of the exchange: the handshake, idleness, a head and the drain waited for whole, a body's and a reply's silences one at a time; RFC 6298's estimator over the phase's completed waits, late ones included (`LearnedWait`: the tail plus the liveness window, Karn's rule, the back-off), fed only by connections whose credentials proved a principal; a wait past its bound marks its connection overdue, and the most overdue is reaped only when every seat is taken and a new connection needs one, a reap backing the phase off | the shard's connection seats | RFC 6298 §2.2's first RTO from the connection's own measurement, `R + max(G, 2R)`: the TCP handshake's round trip as the kernel measured it at accept, the edge's own TLS work added while a handshake runs, then the TLS handshake's whole duration; `G` the timer's tick, the scheduler's lateness or the kernel clock's resolution |
+| Reaping a stalled SSH client (A-651) | the HTTP edge's rule over SSH's phases: the handshake (to the client's NEWKEYS), authentication, setup and closing waited for whole, the command's silences one at a time (a silence keeps its start across the session's rekey timer); RFC 6298's estimator over completed waits, late ones included, fed only by connections whose key proved a principal; a wait past its bound marks its connection overdue, and the most overdue is reaped only when every seat is taken and a new connection needs one | the shard's connection seats | RFC 6298 §2.2's first RTO from the connection's own measurement: the TCP handshake's round trip at accept, the edge's own SSH handshake work added while it runs, then the SSH handshake's whole duration |
 | Hook deadline | per hook, the tail of its own runs (§4.17.1) | the push's connection: a hook ends when its client leaves | the first run ends only with its client's connection |
 | Index table merges (§4.17.1's rule, A-581: the git store's index is `slates-vcs`'s, A-614) | for each `j`, merge the newest `j` runs only this index holds once the time lookups spent on the visits that merge saves reaches its predicted time (rent or buy, the largest due `j`); a table is one window of the content plane and the tail seals once its rows no longer fit one | the store's budget, which every table, the tail and the fences are charged against | before any merge, what building the tail cost a row |
-| SSH key time (when a key is replaced by time; A-594) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
+| SSH key time (when a key is replaced by time; A-594, fed by A-651's edge) | the tail of the lifetimes this deployment's authenticated SSH connections lived (A-363's form, RFC 6298's estimator), so a long connection's key serves no longer than an ordinary connection's only key; never shorter than the connection's last key exchange took | RFC 4253 §9's hour ("after each hour of connection time") | the hour, until a lifetime is measured |
 
 git fixes the first two by constants: "Defaults to 10" for the window and "Defaults to 50" for the depth [B: config
 `pack.window`, `pack.depth`]; its own notes call them "magic values" [B: technical `pack-heuristics`].
@@ -47827,3 +47841,77 @@ Applied in the same change to: §4.17.4's status (part 2's first slice); GAPS (t
 - **Swept**: only the reporter's editor writes `textdelta-chunk`s. The dump's, the HTTP listing's and drive's and the
   migration's svndiff writers write one continuous stream, where write boundaries never show; the commit's drive
   reads a client's chunks whatever their boundaries.
+
+### A-651 — The SSH edge in the daemon: the listener on the runtime's TCP, each connection a task driving slates-ssh's session, waits per phase on main's rulings with overdue connections reaped only for a new one, keys proved through the site's lookup, and each `exec` dispatched by its tool (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2 and "Pieces (git)" piece 9; §4.17.3; §4.17.4's svn+ssh, piece 12; §4.13; after A-594, A-633, A-634 and A-625 part 2)
+Applied in the same change to:
+- §4.17.2's status and its tunables table (a row for reaping a stalled SSH client; the SSH key time fed by the edge);
+  GAPS (the §4.17 entry); `research/vcs-servers.md` §5.10 (new: OpenSSH's client, git's, Mercurial's and svnserve's
+  failures, pinned by hash);
+- `crates/server` (new: `vcs_ssh` with `site` and `waits`, and their tests; `lib.rs` declares it; `vcs_http`'s `git`
+  and `waits` modules and `Bounds::granularity_ns` made crate-visible so both edges share one `Repositories` and one
+  first RTO); `crates/ssh` (`ServerTransport::is_established`, and its test); the manifests and the lock (slates-server
+  depends on slates-ssh).
+- **The listener** is the HTTP edge's: a task on its shard owning its connections as detached child tasks, cancelled
+  and joined when it ends; seats from the shard's clients (`Bounds::of_shard`), the kernel's backlog the same bound.
+  Each connection's session is made from the edge's host key seed (zeroed on drop), the packet cap every peer accepts
+  (RFC 4253 §6.1's 35000 bytes, which OpenSSH's 32 KiB session packets fit), the channel window of one client region,
+  RFC 4252's recommended failure limit, and the key time learned from authenticated connections' lifetimes.
+- **Waits, on main's rulings** (as A-625 part 2's for HTTP). SSH's phases: the handshake to the client's NEWKEYS
+  (`ServerTransport::is_established`, a round trip after the session id is known, since a client's host-key
+  confirmation lies between), authentication to the proof, setup to the `exec`, the command's silences, and closing to
+  the channel's close. Before a phase learns, a wait is bounded by RFC 6298's first RTO of the connection's own
+  measurement: the kernel's TCP round trip at accept with the edge's own handshake work added (time inside the session's
+  `receive` while the handshake runs), then the SSH handshake's whole duration. A wait past its bound marks its seat
+  overdue and goes on; the listener, holding a new connection with every seat taken, reaps the most overdue (its task
+  cancelled); a reap teaches nothing and backs a proven connection's phase off once per bound. A running silence keeps
+  its start across the session's own rekey timer, which interrupts the read but not the client's silence.
+- **Why not cut at the bound** (g294's finding, main's ruling). An SSH connection waits on people inside it: OpenSSH's
+  `input_userauth_pk_ok` calls `sign_and_send_pubkey`, whose `identity_sign` loads a key not yet loaded through
+  `load_identity_file`, which prompts "Enter passphrase for key" (`sshconnect2.c` at `fa4b2a82`, lines 745, 1242,
+  1543) [C]; `check_host_key` asks "Are you sure you want to continue connecting" before the client's NEWKEYS
+  (`sshconnect.c`) [C]; and a push's client compresses its pack before sending it. A cut at a bound learned from the
+  clients that finished would cut every agent-less passphrase on every connection, and a cut before the proof backs
+  nothing off, so it would never be learned.
+- **Keys** (main's ruling under §4.13). A key proves a principal only through the site's lookup (`slates-ssh`'s
+  `KeyHolders`). The credentials are enrolled by a person through slates' own CLI on the control channel and kept in one
+  record both edges' authenticators read, which g299 builds; until it lands the production lookup, `NoKeyRecord`,
+  refuses every key and counts it. There is no key file and no default key.
+- **Dispatch** (`site::ToolSite`), in the HTTP site's order, each refusal written on standard error as the tool's own
+  program refuses, then its exit status: the repository named by the path without one leading slash, of the command's
+  tool (git: `fatal: '<path>' does not appear to be a git repository`, `die`'s 128, `builtin/upload-pack.c` and
+  `usage.c` at `e1ec09b2`; Mercurial: `abort: repository <path> not found`, 255, `localrepo.py`, `scmutil.py`'s
+  `callcatch` and `dispatch.py`'s `sys.exit(status & 255)` in 7.2); the repository's policy (`vcs_policy::reaches`:
+  upload-pack asks to read, receive-pack to submit, rewrite or delete, Mercurial's session any of the four; a policy its
+  tool cannot read is refused, the owner included); then the service. All four are refused as not served for now:
+  git's upload-pack (`slates_git::upload::serve`, A-640 part 2) and Mercurial's `serve --stdio`
+  (`slates_hg::serve::stdio::Stdio`, A-650 part 2) have landed and wait for their repository's store, which A-662's map
+  on the owner shard will hold (main: no store home of the edge's own, and no not-served path once it lands);
+  receive-pack (A-654) and Subversion's tunnel (A-656) wait for their entry points. svnserve's refusals begin
+  `svnserve: ` and exit `EXIT_FAILURE` (`svnserve.c` at `d434dc14`); its repository is the tunnel session's to find,
+  from the greeting's URL.
+- **Commands** are stepped sans-io as the tools' entry points are (`site::Command`): the client's input held by the
+  command until a step consumes it, the window given back for what was consumed (a command that claims more than it was
+  given ends the connection), standard error sent before standard output, one step and one input run a turn, and
+  `exit-status`, EOF and close in order when the command exits. A refused `exec` is accepted and answered with its words
+  and status, as a stock server's program refuses after its shell started it.
+- **Tests** (`cargo test --locked -p slates-server --lib vcs_`, `cargo test --locked -p slates-ssh --lib`, Mac Studio
+  d1323898, debug).
+  - Red first: 510a759c (slates-ssh 110 of 111, the new establishment test failing; slates-server's tests stopped at a
+    fixture missing `hooks_env`, fixed in 8bcb6a6c), then 8bcb6a6c (slates-server 74 of 92, the 18 new SSH tests failing
+    but the key lookup's, which a stub cannot miss), with the connection task dropping its socket, dispatch refusing
+    wordlessly, a wait's deadline now, waits learning nothing, reaps backing nothing off, and the transport never
+    established.
+  - Green at 0df9950f on its first build: slates-ssh 111 of 111, slates-server 92 of 92 (the HTTP edge's, the policy's
+    and the hooks' tests among them); 55468644 (the dispatch test reads who a service starts for), 92 of 92.
+  - Whole connections over loopback with slates-ssh's client written from the RFCs (included by path, so one file stays
+    the oracle): a held key's command run to its exit in order; a refused `exec` on standard error with its status; an
+    unheld key refused, teaching nothing; a passphrase pause after `PK_OK` and a slow push's silence marked overdue but
+    not cut with a seat free, and each reaped when a new connection needs the only seat (the push's phase backed off
+    once, the unproven passphrase's not at all).
+  - Red-checked on the Studio: reaping removed, both reap tests failed. Four more (a wait cut at its bound, unproven
+    reaps backing off, the window given back on receipt, the policy skipped) were cut short when the Studio ran out of
+    memory and are owed with its return.
+- **Owed.** The daemon starting the edge (its address, the host key's keeping); the credentials record (g299) behind
+  the key lookup; the stores (A-662) behind upload-pack and Mercurial's session, and receive-pack's and Subversion's
+  entry points (A-654, A-656), each a `Command` behind `Services`, the not-served answer going with the last of them;
+  the live OpenSSH 10.2 `git clone` over SSH (main's run, filed); the four red-checks above.
