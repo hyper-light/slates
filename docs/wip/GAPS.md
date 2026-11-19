@@ -909,9 +909,17 @@
 > `cargo test --locked -p slates-server --lib vcs_http::hg` 6 passed and 1 failed, the room test reading `400` for the
 > query where `414` was expected and its other three statuses as expected; then `slates-server --lib vcs_http::hg` 7 of
 > 7, `slates-hg --lib http` 22 of 22 and fmt clean on macOS arm64 (Mac Studio, kiln r212); the other platforms owed.
-> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
-> g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site (g303, running) and that loop
-> (their home on each owner shard is built); the learned
+> **Built (A-679, 2026-11-19, g304): `serve --stdio` behind the daemon's SSH edge.** `vcs_ssh::hg` runs A-650 part 2's
+> `serve::stdio` over an SSH session, started by `ToolServices` (beside upload-pack, `ToolCommand`) over the store the
+> HTTP site's lender holds (`HgStores`); the site refuses a repository argument starting `--` before any lookup in 7.2's
+> recorded words (research §26); `--hidden` answered with 7.2's warning to an unauthorized user, then the view; a
+> store gone mid-session ends in the not-served words; input arriving after the session ended given back to the window.
+> Red first (`cargo test --locked -p slates-server --lib -- vcs_ssh`: 25 passed, the 7 new failed against stubs), then
+> `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean, on macOS arm64 (Mac Studio, kiln r128): the probe stock
+> `hg serve --stdio` 7.2 answered, after 7.2's handshake, byte for byte at every cut and over the real edge with a
+> scripted SSH client. The other platforms, and main's live `hg clone` over SSH once A-680 lends the stores, owed.
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: A-662's stores handed to the lender the HTTP
+> site and the SSH edge read (A-680, g303, running; their home on each owner shard is built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's

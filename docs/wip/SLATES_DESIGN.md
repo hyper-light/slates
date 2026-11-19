@@ -12608,6 +12608,11 @@ engine: the verdict, rebase, position mapping, the register).
 > slates-git answers those protocols statelessly and a v0 client over SSH negotiates in rounds. `ToolServices` starts it
 > only over a store the lender holds, and none does until the lender over A-662's map lands, so it runs in tests alone.
 >
+> **Status (2026-11-19, A-679: Mercurial's `serve --stdio` behind the SSH edge).** `vcs_ssh::hg` runs A-650 part 2's
+> `serve::stdio` for `hg -R <path> serve --stdio`, which `ToolServices` starts beside upload-pack over the store the
+> HTTP site's Mercurial lender holds (`ToolCommand` is either); the site refuses a repository argument starting `--`
+> in 7.2's words before anything is looked up. §4.17.3's status says what it answers and how it is proven.
+>
 > **Status (2026-11-19, A-651: piece 9's edge built).** `crates/server`'s `vcs_ssh` serves SSH on the runtime's TCP,
 > the HTTP edge's counterpart: one connection a task under seats derived from the shard's clients, each driving
 > `slates-ssh`'s session. A key proves a principal only through the site's lookup, today `NoKeyRecord`, which refuses
@@ -13769,6 +13774,25 @@ signature verification).
 > proven request moved to its repository's shard; the edge's late fields. Owed of piece 4: the estimator (the
 > connection's delivery rate, and this repository's compression speed and ratio), the answers sliced within the shard's
 > budget, the process around `slates hg serve --stdio`, held deltas, the index's kept heads.
+>
+> **Status (2026-11-19, A-679: `serve --stdio` behind the daemon's SSH edge).** `crates/server`'s `vcs_ssh::hg` runs
+> A-650 part 2's `serve::stdio` over an SSH session's standard input and output (A-651's edge, "Transports" above:
+> served in the daemon with no process): `ToolServices` starts it for `hg -R <path> serve --stdio` over the store the
+> lender the HTTP site reads holds (`HgStores`), beside git's upload-pack, so both edges reach a Mercurial store one
+> way. Each request is admitted the edge's room and the input held is the channel's window over it; bytes that come
+> after the session ended are given back to the window, so it is never left short. The site refuses a repository
+> argument starting `--` before anything is looked up, as 7.2's dispatch refuses it (`abort: potentially unsafe serve
+> --stdio invocation:` and the arguments as `stringutil.pprint` lists them, 255); one starting with a single `-` is
+> looked up, as in 7.2. A client asking for hidden changesets is warned as 7.2 warns a user its
+> `experimental.server.allow-hidden-access` does not name, the principal named, and then served the view, since no right
+> grants hidden access; a store gone mid-session ends it in the site's not-served words. Proven on macOS arm64 (Mac
+> Studio, kiln r128, 2026-11-19): red first with the site starting no Mercurial session, checking no argument and the
+> command answering nothing (`cargo test --locked -p slates-server --lib -- vcs_ssh`: 25 passed, the 7 new failed at
+> their assertions), then green, `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean: the probe stock `hg serve
+> --stdio` 7.2 answered (`crates/hg/fixtures/serve`), after 7.2's handshake, answered byte for byte at every cut down to
+> a byte and over the real edge with a scripted SSH client, exit-status 0, EOF and close in order; 7.2's refusals as
+> recorded from stock 7.2 (research §26). Until A-680 hands the lender A-662's stores no repository has one, so the edge
+> serves `hg` in tests alone, and the daemon starting the SSH edge is A-651's.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14181,8 +14205,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
-   (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site); owed: the process around the stdio
-   session, the learned response compression (the first value until then), and A-662's stores handed to the site.
+   (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site). Built (A-679, `crates/server`
+   `vcs_ssh::hg`): that session behind the daemon's SSH edge, over the stores the HTTP site's lender holds. Owed: the
+   process around the stdio session, the learned response compression (the first value until then), and A-662's
+   stores handed to the lender both edges read (A-680).
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -50357,3 +50383,50 @@ at start).
   (`admit_right` visible to the crate), `repository.rs` (`branch_version` visible to the crate),
   `crates/git/src/upload/mod.rs` (`AGENT` public); §4.17.2's status; GAPS (the A-654 entry, and A-644 part 2's owed
   line).
+
+### A-679 — Mercurial's `serve --stdio` behind the daemon's SSH edge: slates-hg's `serve::stdio` over the store the HTTP site's lender holds, its refusals in 7.2's words (2026-11-19, g304 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Transports" and piece 4; §4.17.2 "Transports" item 2; after A-650 part 2, A-651 and A-662)
+Applied in the same change to: `crates/server` (`vcs_ssh/hg.rs`, new; `vcs_ssh/site.rs`: `ToolServices<L, H>`,
+`ToolCommand`, `not_served`, the refusal of a repository argument starting `--`, the module doc's steps 1 and 3;
+`vcs_ssh.rs`: `channel_window`, the owed list; `vcs_http.rs`: `hg` visible to the crate; `vcs_ssh/tests/hg.rs`, new;
+`vcs_ssh/tests/serve.rs`: `served_by`, written as A-651 part 3 writes it; `vcs_ssh/tests/git.rs`: `NoStores` as the
+Mercurial lender), §4.17.2's status, §4.17.3's status and piece 4, GAPS (the §4.17.3 entry: a Built line and the owed
+list), `research/mercurial-server.md` (§26).
+- **What was there.** A-650 part 2 built the session over a byte channel (`serve::stdio`), the entry point the SSH edge
+  was to call. A-651 built the edge and its site, whose services started git's upload-pack alone (part 2) and answered
+  `hg -R <path> serve --stdio` as not served. A-650 part 1's HTTP site reads Mercurial's stores through a lender
+  (`HgStores`), which holds none until A-662's stores are handed to it (A-680).
+- **Decided.** (1) The command (`vcs_ssh::hg::HgCommand`) drives `Stdio` a step at a time over the store the HTTP
+  site's lender holds, lent afresh for each step, so both edges reach a Mercurial store one way and A-680's lender
+  fills both, as git's two edges share `StoreLender`; `ToolServices` holds both tools' lenders and `ToolCommand` is the
+  command either tool's session runs. (2) Each request is admitted the edge's room and the input held is bounded by the
+  channel's window over that room (`channel_window`, the function the edge's session takes its window from), so the
+  session's refusal of input past its window (slates' words, `abort`'s status) is met only where a caller's room and
+  window disagree; input arriving after the session ended, which `Stdio` drops as an exited process does, is given back
+  to the window at the next step. (3) The site refuses a repository argument starting `--` before the repository is
+  looked up, as 7.2's dispatch refuses it, the arguments listed as `stringutil.pprint` lists them (research §26); one
+  starting with a single `-` is looked up, as in 7.2. (4) `--hidden` is answered as 7.2 answers a user its
+  `experimental.server.allow-hidden-access` does not name: its warning on standard error naming the principal's record
+  (as A-657 part 4's `acl` words name it, until §4.13's Mercurial identity), then the served view; no right grants
+  hidden access (§4.17.3 "Access": an administrator's mode). (5) A store that goes away mid-session ends the session
+  in the site's not-served words with `abort`'s status, the words a store not held at the start gets
+  (`site::not_served`).
+- **Tests** (`crates/server/src/vcs_ssh/tests/hg.rs`, a child of the edge's tests). The probe stock `hg serve --stdio`
+  7.2 answered (`crates/hg/fixtures/serve`), sent after 7.2's handshake (`hello`, the null `between`) through the
+  command a byte, seven bytes, a kilobyte and the whole at a time: the session's capabilities framed as SSH version 1
+  frames an answer, then 7.2's empty line and 7.2's eight answers byte for byte, every byte consumed, exit 0. The hidden
+  warning alone first, then the same answers. A store gone after `hello`. The window's bookkeeping: 25 bytes past a
+  24-byte window refused naming both numbers, a request past the room answered out of band, and 6 bytes arriving after
+  the end given back. `ToolServices` starting the session over a held store alone. The site's refusals against the
+  recorded cases (`--`, `--x` with and without `--hidden`, a quote, a tab, line ends, a backslash, DEL, a control byte,
+  a double quote, bytes past ASCII; `-x` not found). And over the real edge with the tests' scripted SSH client and the
+  production site: the probe session's standard output as above, then exit-status 0, EOF and close in order; with
+  `--hidden`, the warning on standard error before the answers; a repository nobody has refused in 7.2's words, 255.
+- **Evidence** (macOS arm64, Mac Studio, kiln r128, 2026-11-19, over main 2410011da). Red first, with the site
+  starting no Mercurial session, checking no argument and the command answering nothing (30dc4ca18):
+  `cargo test --locked -p slates-server --lib -- vcs_ssh --test-threads=4` 25 passed and the 7 new failed, each at its
+  assertion. Green (9e7e1b054): `cargo test --locked -p slates-server --lib -- vcs_ssh vcs_http::hg --test-threads=4`
+  39 of 39 (the seven new among vcs_ssh's 32), no warning; `cargo fmt -p slates-server -- --check` clean. No
+  integration target reaches the SSH edge: the daemon does not start it yet.
+- **Owed.** A-680's lender over A-662's stores, without which no Mercurial store is lent and the edge serves `hg` in
+  tests alone; the daemon starting the SSH edge (A-651); main's live `hg clone` and `hg pull` over SSH; each answer made
+  within the shard's step budget (a `getbundle` is one step, as over HTTP); the other platforms' runs.
