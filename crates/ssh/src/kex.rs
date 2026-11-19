@@ -181,8 +181,36 @@ pub fn mlkem768x25519_server(
   private: &[u8; X25519_LEN],
   client_init: &[u8],
 ) -> Result<ServerHalf, KexRefusal> {
-  let _ = (private, client_init);
-  Err(KexRefusal::EncapsulationFailed)
+  let length = KexRefusal::PublicKeyLength {
+    length: to_u64(client_init.len()),
+  };
+  if client_init.len() != MLKEM768_ENCAPSULATION_KEY_LEN.saturating_add(X25519_LEN) {
+    return Err(length);
+  }
+  let (encapsulation_key, client_public) = client_init
+    .split_at_checked(MLKEM768_ENCAPSULATION_KEY_LEN)
+    .ok_or(length)?;
+  let (public, classical) = x25519(private, client_public)?;
+  let key = EncapsulationKey::new(&ML_KEM_768, encapsulation_key)
+    .map_err(|_| KexRefusal::EncapsulationKeyRejected)?;
+  let (ciphertext, post_quantum) = key
+    .encapsulate()
+    .map_err(|_| KexRefusal::EncapsulationFailed)?;
+  let mut both = Secret(Vec::with_capacity(
+    post_quantum.as_ref().len().saturating_add(X25519_LEN),
+  ));
+  both.0.extend_from_slice(post_quantum.as_ref());
+  both.0.extend_from_slice(classical.bytes());
+  let hashed = Secret(digest::digest(&SHA256, both.bytes()).as_ref().to_vec());
+  let mut shared_secret = Secret(Vec::with_capacity(HASH_LEN.saturating_add(UINT32_LEN)));
+  put_string(&mut shared_secret.0, hashed.bytes()).map_err(KexRefusal::Encoding)?;
+  let mut reply = Vec::with_capacity(MLKEM768_CIPHERTEXT_LEN.saturating_add(X25519_LEN));
+  reply.extend_from_slice(ciphertext.as_ref());
+  reply.extend_from_slice(&public);
+  Ok(ServerHalf {
+    public: reply,
+    shared_secret,
+  })
 }
 
 /// `X` as RFC 8731 §3.1's `mpint` K.

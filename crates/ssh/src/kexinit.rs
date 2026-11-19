@@ -60,7 +60,7 @@ pub const EXT_INFO_CLIENT: &str = "ext-info-c";
 pub const NONE: &str = "none";
 
 /// The key exchange methods the server runs, in its order of preference: the post-quantum hybrid first.
-const KEX_METHODS: [&str; 1] = [CURVE25519_SHA256];
+const KEX_METHODS: [&str; 2] = [MLKEM768X25519_SHA256, CURVE25519_SHA256];
 
 /// The host key algorithms the server has keys for.
 const HOST_KEYS: [&str; 1] = [ED25519];
