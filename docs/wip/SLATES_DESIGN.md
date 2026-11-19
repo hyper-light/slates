@@ -14011,10 +14011,10 @@ signature verification).
 > looked up, as in 7.2. A client asking for hidden changesets is warned as 7.2 warns a user its
 > `experimental.server.allow-hidden-access` does not name, the principal named, and then served the view, since no right
 > grants hidden access; a store gone mid-session ends it in the site's not-served words. Proven on macOS arm64 (Mac
-> Studio, kiln r128 and, over main f7684fc20 as it lands, r422, 2026-11-19): red first with the site starting no
+> Studio, kiln r128 and, over main 5206419be as it lands, r438, 2026-11-19): red first with the site starting no
 > Mercurial session, checking no argument and the command answering nothing (`cargo test --locked -p slates-server --lib
 > -- vcs_ssh`: 25 passed, the 7 new failed at their assertions), then green, `-- vcs_ssh vcs_http::hg` 39 of 39 (44 of
-> 44 over main f7684fc20, A-651 parts 3 and 4's tests among them), no warning, fmt clean: the probe stock `hg serve
+> 44 over main 5206419be, A-651 parts 3 and 4's tests among them), no warning, fmt clean: the probe stock `hg serve
 > --stdio` 7.2 answered (`crates/hg/fixtures/serve`), after 7.2's handshake, answered byte for byte at every cut down
 > to a byte and over the real edge with a scripted SSH client, exit-status 0, EOF and close in order; 7.2's refusals
 > as recorded from stock 7.2 (research §27). In the daemon the lender is `ServedViews` (A-680 part 2a, above); the
@@ -52103,9 +52103,11 @@ owed list with the SSH edge's pushes, and the interop tests' line on what the SS
   23:20-23:23Z, load 11), the command lending through A-680 part 2a's `HgStores::lend` within the request's
   admission and the git test's Mercurial lender `ServedViews`: the same filters 44 of 44 (748 filtered out), no
   warning, fmt clean for slates-server and slates-cli, and the SSH round trip 1 ignored, its reason naming A-684 and
-  the pushes over the stdio session. Over main f7684fc20 as it lands (6fe628d60, kiln r422, 23:30-23:32Z, load 21),
-  with A-690's bookmarks served as 7.2 serves them and slates-hg and slates-server compiled afresh: the same filters
-  44 of 44 (750 filtered out), no warning, fmt clean for slates-server and slates-cli. No integration test reaches the SSH edge while the daemon does not start it: that round trip with stock hg
+  the pushes over the stdio session. Over main f7684fc20 (6fe628d60, kiln r422), with A-690's bookmarks served as
+  7.2 serves them: the same 44 of 44. Over main 5206419be as it lands (e1dcee5b7, kiln r438, 23:37-23:39Z, load 11),
+  A-682's git lender taking the reader and its SSH session test started over both daemon lenders: the same filters
+  and `vcs_store::upload`, 49 of 49 (752 filtered out), A-682's SSH session through `ShardStores` beside
+  `ServedViews` among them, no warning, fmt clean for slates-server and slates-cli. No integration test reaches the SSH edge while the daemon does not start it: that round trip with stock hg
   7.2 over SSH is its test once those three land.
 - **Owed.** The daemon starting the SSH edge with the HTTP site's lender, `ServedViews` (A-684's `--vcs-ssh <addr>`),
   without which the edge serves `hg` in tests alone; pushes over the session (`unbundle` in the stdio session, through
