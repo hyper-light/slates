@@ -3,20 +3,27 @@
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
-> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). Part 2 BUILT (A-647): A-614's D(k) and reached sets are a type (`slates-git`'s `store::ReachSets`), each version recording the version its set was remade from; over A-614's generated histories every derived value is the store's own sets and the value it kept, and each derivation walks what its admission walked (`slates-git --lib` 446 of 446). OWED: the git store serving D(k) from its values; A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
+> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). Part 2 BUILT (A-647): A-614's D(k) and reached sets are a type (`slates-git`'s `store::ReachSets`), each version recording the version its set was remade from; over A-614's generated histories every derived value is the store's own sets and the value it kept, and each derivation walks what its admission walked (`slates-git --lib` 446 of 446). Queries by API, part 1 BUILT (A-666, g302, 2026-11-19): `slates-vcs`'s `derived::ancestry`, a type whose value holds Mononoke's commit-graph fields (generation, first-parent and skip-tree skew jumps by Myers' rule, run bottom, skip-tree parent: a dominator), and is-ancestor, the merge bases (git's `--all` set) and bisect's midpoint answered from the values, logarithmic along runs and linear only in the merges a question opens; held to a naive walk over generated histories, to Myers' bound and to the immediate dominator (`research/ancestry-queries.md`). OWED: the git store serving D(k) from its values; A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position; queries by API's later parts (path history and blame) and the server's verbs over A-666's type (each repository's values on its owner shard, A-662), with corrected commit dates where a history has them and questions cut into the shard's slices; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
 >
 > **A-664 (2026-11-19, g308; §4.17.1 "A push is a work" items 3 and 4; §4.17.2 piece 13; §4.17.3 decision 7 and piece
-> 6): the commits the server makes.** Part 2 BUILT: `slates-git`'s `derived` module makes a version's git objects as
+> 6): the commits the server makes.** Part 2 BUILT (main 78a670256): `slates-git`'s `derived` module makes a version's git objects as
 > two types of A-647's derived data: its trees (`Trees`, derived from the change the path map reads: each file's mode
 > from its class, git's order, only the change's directories made again, a directory past one node through lists) and
 > its commit (`Commits`: a pushed version's client commit, or the server's of the version's tree, its parents' commits,
 > the principal's identity at the merge record's time in UTC and the submit's message, as `git commit-tree -m` writes
 > it); every object made passes git's strict fsck. Golden vectors from stock git 2.50.1 (`fixtures/made`), an oracle
 > over generated histories against the trees built from each version's whole path map, and a determinism gate (A-664's
-> entry has the runs). OWED: part 1, each principal's record holding its tool identities (git's name and email,
-> Mercurial's `Name <address>`), set by its owner on the control channel, and a submit to a repository's green
-> carrying a message, refused `MessageRequired` without one and `IdentityRequired` for a principal with no identity in
-> the repository's tool, before any work is built; part 3, the made commit recorded with the version (the merge record
+> entry has the runs). Part 1's record BUILT: `slates-db`'s `IdentityRecord`, one a principal (git's name and email,
+> Mercurial's `Name <address>`), kept by principal key on the principal's partition, set whole as the version after
+> the one held (`Op::IdentitiesSet`, wire tag 98; a stale setting refused `PolicyChanged`, nothing changed) and carried
+> by the partition's snapshot (`slates-db --lib` 144 of 144 and `--test wire_order` on Windows x86_64, jupiter; the
+> macOS run owed). OWED: part 1's server half (after main's `slates-server` baseline on jupiter): the owner's setting on
+> the control channel (the launcher's proof, `Forbidden` on a consumer's channel, each identity held to its tool's
+> rules); a session's identities resolved once, at its first submit, from the principal's partition and kept with the
+> session (main's ruling: the owner never reads them per merge, and a change mid-session applies from the next
+> session); the submit carrying its message and the session's identities, refused at the green's owner
+> `MessageRequired` without a message and `IdentityRequired` without an identity in the repository's tool, before any
+> work is built; part 3, the made commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
 > it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
 > `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
@@ -118,6 +125,30 @@
 > green's fold floor; following a renamed file with the engine's path remapping; the integration suites, clippy and
 > `xtask` over the change (main's; `crates/db/tests/wire_order.rs` against `Op` 90 to 95, published by hand). Two
 > verdict findings, below, were fixed by A-612 (2026-11-19).
+> **A-659 (2026-11-19, g306; shared piece 5, works over works and bases given as trees):** built in the engine
+> (`crates/merge/src/engine/stack.rs` and its modules). An upper, a work composed against another work's post-state,
+> is restated over the version its lower landed as (`Green::restate`): the green's changes between the lower's base and
+> its landing are read for the paths the upper names and moved over the lower's operations by the walk the verdict
+> mapped the lower with, the lower's landed operations held to the delta the green recorded; the upper is mapped
+> through them and judged against them in every dimension as the verdict judges a work against the changes after its
+> base. `Green::land_stack` lands a stack of any depth in order, each work all or none, a refused work leaving those
+> above it unjudged, a stack landed again answered each version. A work over a tree is judged by whole-value
+> differences between the tree and the head (`Green::restate_over_tree`). Tests: 11 worked cases, 3 tree cases, the
+> stack's oracle against a replica in which its works landed first and the works between after them, and the tree's
+> against a whole-file model. Windows x86_64 on jupiter (the Mac Studio offline; the macOS run owed): red at 43317a523,
+> 16 of the 17 failing against the stubs; green at 0ae0875d5, `slates-merge --lib` 158 of 158 (main's 141 and these
+> 17), fmt clean; censuses: stacks through depths one to four 774, 479, 273 and 128 times, uppers moved 108 and
+> unmoved 772, uppers refused 129 and bottoms 188, works between 1,335; files over a tree applied 175, refused 150.
+> Where a work in between does not land in the replica (the verdict depends on order: two inserts at two points and a
+> stack's delete of the bytes between them), the oracle leaves the stack unchecked from there, counted. Owed: the
+> server's verbs (an upper held
+> over its lower and restated as it lands; the lower's base held as a live reader of the fold floor while an upper over
+> it is unlanded); the whole-file identity check for an upper's length-changing operation that meets a change (refused
+> today); a copy in a stack; a stack whose bottom is a tree; clippy, `xtask` and the lint matrix over the change
+> (main's, run requests). **Finding, registered as A-668 (landing next):** the verdict's walk stops at the first delta
+> operation starting at or after a range's end, so a work's insert at an offset where the delta overwrites or truncates
+> and inserts too is accepted before both, while the two works in the other order conflict as two inserts at one
+> point; D-27 makes them a conflict in both orders.
 > **A-581 (2026-11-19, g083):** shared piece 3's core is built as a pure crate, `crates/vcs` (`slates-vcs`): content by
 > BLAKE3 identity, one copy across tools, pushes and repositories, held by count within the owner's derived budget, and
 > no content longer than the content plane's window (D-6's chunk, which the owner derives): an object past it is held
@@ -402,6 +433,20 @@
 > 2's "the fetch's fragment choice" and A-615's "the pack from the runs' fragments and the chosen objects". Owed: a part
 > only partly wanted read entry by entry; a delta search for an object past a window; the fragments' encoding sliced;
 > the stream wired into `fetch` (A-640); main's run, `git index-pack --strict` over the stream's packs.
+> **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
+> (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
+> `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
+> fragments with the bases their reference deltas name held whole, as `index-pack --fix-thin` completes a thin pack;
+> the rest and the push whole, as zlib stored blocks so every offset follows from lengths), chosen as few as cover every
+> object; the push in git's quarantine for `pre-receive` with receive-pack's environment, among the packs for
+> `update`. A pack's trailer, Adler-32s and index are its seal, derived in slices and kept by the caller; every other
+> byte is read a window at a time. Held to stock git's fixtures (`fixtures/view`) and to an oracle reading every object
+> of the store and the push back through the view's packs, counted (Windows x86_64, jupiter: red 13 of 15, then the
+> two vacuous ones made to read and red 2 of 2; green 15 of 15, the crate 462 of 462 with 4 ignored; macOS owed). Found: stock receive-pack sets
+> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unsets it (reported to main). Owed: part 2, the view presented to the hook
+> driver on the owner shard (after A-662), seals kept as derived data; a seal made at encoding; `packed-refs` by ranges
+> from the register; the cover as derived data and fragments merged into fewer packs; main's run of stock git over a
+> mounted view.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
@@ -2587,19 +2632,71 @@
 > merge crate's integration suites and clippy.
 > Bug record: `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
 
-> **A rebased work restates its links after its own renames and removals: found open (2026-11-19, A-646's sweep, g267,
-> by reading; §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).** A clean rebase restates the verdict's
-> effects as the work's journal in the verdict's order: content first (renames, creates, unlinks), then the metadata
-> dimensions, hard links among them. A volume has real inodes, so a link restated after a rename or removal of the node
-> it names meets the path afterwards. Three cases go wrong:
-> - `ln g l; mv f g` would put `l` on `f`'s file, not `g`'s old one;
-> - a link to a node the work renames would be restated after the node left its path (A-646's made node resolved to
->   the rename's source);
-> - a link to a node the work also removes would meet an empty path.
+> **A rebased work restates its links after its own renames and removals: fixed (2026-11-19, A-663, g307; found by
+> A-646's sweep, g267, by reading; §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).** A clean rebase
+> restated the verdict's effects as the work's journal in the verdict's order: content first (renames, creates,
+> unlinks), then the metadata dimensions, hard links among them. A volume has real inodes, so a link restated after a
+> rename or removal of the node it names met the path afterwards:
+> - `ln g l; mv f g` put `l` on `f`'s file, not `g`'s old one, and the journal composed again did too;
+> - a link to a node the work renames was restated after the node left its path (A-646's made node resolved to the
+>   rename's source), in either order (`mv f m; ln m l`, `ln f l; mv f m`);
+> - a link to a node the work also removes met an empty path.
 >
-> The verdict and the commit are right; only the restatement's order is wrong. Owed: a failing test of each, then
-> restating a work's links after its creates and before its renames and removals, and a rebased journal replayed into a
-> volume compared with the green.
+> Found with them: a link made where the head holds another (`rm h; ln f h`) was restated with no removal of the
+> head's, so the rebased work's next submit was refused `LinkOverExisting`.
+>
+> Fixed: the effects are restated in the order a volume replays them (`in_replay_order`): each link just before the
+> first effect that moves its node away from the name it names it by or removes it there, after the effect that made
+> its node, and a link made over the head's after that link's removal. Tests: `crates/merge/src/engine/restate_tests.rs`,
+> each case red first, and an oracle over generated works holding four readings equal (the work's own order over the
+> head with real inodes, the green that accepts it, the restated journal replayed, and the green that accepts that
+> journal composed again), with a census of every case. Evidence (Windows x86_64, jupiter, 2026-11-19, the Mac Studio
+> offline; the macOS run owed): red over main's engine 6 of 6 failing (`cargo test --locked -p slates-merge --lib
+> restate_tests` at 91d14b44d); green over main at 78a670256, `cargo test --locked -p slates-merge --lib` 147 of 147
+> (main's 141 and the 6 new), the oracle's census over 256 works 153 agreed, 102 refused typed, 1 conflict, with every
+> case met (a rename over the link's name 5, rename then link 30, link then rename 32, removal 13, made again 26, to a
+> made file 8); `cargo fmt -p slates-merge -- --check` clean.
+> Bug record: `docs/bugs/2026-11-19-a-rebased-work-restated-its-links-after-moving-their-nodes.md`.
+
+> **A name's node replaced by a new file is composed as an edit of that node in place: found open (2026-11-19, A-663's
+> oracle, g307, by reading; §4.16 "Composition at seal"; A-646's decision; `crate::increment`).** `rm x; touch x`
+> (unlinked then made again) and `touch n; mv n x` (a new file renamed over `x`, the write-and-rename pattern) both
+> compose to a delete of `x`'s base bytes and the new bytes, with no create (`apply_create`'s in-place replacement,
+> `apply_rename`'s re-rooting). A hard link naming `x`'s node, the base's or one the work made before, then reads the new
+> bytes: the green keeps the link on `x`, whose content changed. POSIX gives the link the old file and `x` a new one
+> (A-646: "a later file at a path the node left is another node"). A rename onto a name the work made a hard link at is
+> refused instead, typed (`PathKindConflict` from `check_no_file_directory_collision`), a file and a link at one name
+> being among the deriver's compositions owed. A-663's oracle generates neither. Owed: the replacement composed as the
+> node model says (a new node at the name, the link's node handed on as `Green::node_moves` hands one), a failing test
+> first, and the oracle's works widened to it.
+
+> **A write to a file a hard link also names is lost when the work then removes the file or renames another over it:
+> found open (2026-11-19, A-663's oracle on its first run, Windows x86_64 (jupiter), g307; §4.16 "Composition at
+> seal"; A-646's decision; `crate::increment`, `Green::hand_over`).** With the base holding `g` and a hard link `h` to
+> it, a work that appends to `g` and then removes it composes to `Unlink g` alone: the deriver drops a removed file's
+> content operations (`apply_unlink` clears them), and the green hands `g`'s node to `h` with the head's bytes
+> (`Green::hand_over` copies the home's content as the head holds it). POSIX keeps the write: `h` is the node's last
+> name and reads it, as the work's own volume does. The oracle's minimal case, `[(31, 13, 0), (22, 88, 0)]`, read `h`
+> as `<g>\n` in the green that accepted the work, in its restated journal replayed and in that journal composed again,
+> against `<g>\n<+0>\n` in the work's own order. By reading, a rename over the file (`mv f g` after the write) loses the
+> write the same way (`apply_rename` drops the replaced file's operations), and so does the case where the link is one
+> the work made to a base file; a link the work made to a file it made is refused instead (`Unsupported`,
+> `made_target_moved`). The submit is accepted without the write, so this is a lost update, not a refusal. A-663's
+> oracle generates none of them (its works never remove or replace the file of a node they wrote to while another name
+> names it). Owed: a failing test first; then the write carried to the link that inherits the node (or, until it is, a
+> typed refusal in place of the silent loss); and the oracle's works widened to it.
+
+> **A rebased work's other restatements a volume refuses: found open (2026-11-19, A-663's sweep, g307, by reading;
+> §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).**
+> 1. *A symbolic link made where the head holds another* (`rm s; ln -s t2 s`) is restated as the `Symlink` alone, as the
+>    hard link was before A-663: a volume refuses the held name, and the deriver refuses the rebased work's next submit
+>    (`SymlinkOverExisting`).
+> 2. *Directories are restated after the files made in them*: `mkdir d; touch d/x` restates as `touch d/x; mkdir d`
+>    (the verdict gathers content before directories), which a volume with real directories refuses; the deriver, whose
+>    names are flat, composes it alike.
+>
+> Owed: a failing test of each, then the symbolic link's removal restated first, and directories made before what they
+> hold and removed after it.
 
 > **Three siblings of A-643's verdicts: the first and third fixed by A-646 part 1, the second owed (2026-11-19, A-643's
 > sweep, g267; §4.16 "The verdict"; POSIX `rename`).**
