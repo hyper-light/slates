@@ -38,9 +38,11 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
-# A repository's `.hg` read through the base plane's host seam for Mercurial's import (§4.17.3 piece 3, A-649 part 4;
-# `crate::hg_base`).
+# Mercurial's pushes landed on the repository's logs (A-657, `crate::repository::hg_push`): slates-hg reads, verifies
+# and places a push; its index and content store are slates-vcs's. A repository's `.hg` is read through the base
+# plane's host seam for Mercurial's import (§4.17.3 piece 3, A-649 part 4; `crate::hg_base`).
 slates-hg = { workspace = true }
+slates-vcs = { workspace = true }
 blake3 = { workspace = true }
 rustls = { workspace = true }
 
