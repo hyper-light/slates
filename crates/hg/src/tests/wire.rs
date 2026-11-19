@@ -244,7 +244,8 @@ fn an_ssh_pull_batches_discovery_then_takes_a_stream() {
   let cmds = sent[3].arguments.get(spec(b"batch"), b"cmds").unwrap();
   let mut buffer = Vec::new();
   let calls = batch::calls(cmds, &mut room(), &mut buffer).unwrap();
-  let pairs: Vec<Vec<batch::Argument<'_>>> = calls.iter().map(|call| call.arguments.clone()).collect();
+  let pairs: Vec<Vec<batch::Argument<'_>>> =
+    calls.iter().map(|call| call.arguments.clone()).collect();
   let encoded: Vec<(&[u8], &[batch::Argument<'_>])> = calls
     .iter()
     .zip(&pairs)
