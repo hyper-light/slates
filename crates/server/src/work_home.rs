@@ -594,6 +594,9 @@ pub(crate) fn gate(
   principal: &Principal,
   body: RequestBody,
 ) -> Gate {
+  if let Some(refusal) = unbuilt_refusal(state, &body) {
+    return Gate::Answer(crate::verbs::refused(refusal));
+  }
   if let RequestBody::CreateWork { green, name } = &body {
     return match create_need(state, crate::verbs::to_db_volume(*green), name) {
       Ok(None) => Gate::Run(body),
@@ -620,6 +623,31 @@ pub(crate) fn gate(
     return Gate::Run(body);
   }
   park(state, client_id, principal, body, Some(work), need)
+}
+
+/// Format: the refusal-ledger name of a verb of a work recorded unbuilt, answered `Unpublished` (A-533): the
+/// non-vacuity count of [`unbuilt_refusal`].
+const UNBUILT_UNPUBLISHED: &str = "merge.work_unbuilt_unpublished";
+
+/// A verb of a work this shard recovered and has not yet rebuilt through its green's owner (its record in `unbuilt`,
+/// A-247, A-513), answered `Unpublished`: the protocol's "not completed, retry under the same id", never recorded as
+/// the request's completion (`verbs::not_started`), so the resend runs the verb once the work is rebuilt (§4.16
+/// "Recovery": the work "is unserved (`Unpublished`) until it has"). Until A-533 it ran, and answered `NotFound`, as if
+/// the work were gone. Every verb naming the work is answered so, whatever shard holds its green.
+fn unbuilt_refusal(state: &mut ShardState, body: &RequestBody) -> Option<Refusal> {
+  let volume = crate::verbs::to_db_volume(body.volume()?);
+  if !state
+    .work_home
+    .unbuilt
+    .iter()
+    .any(|unbuilt| unbuilt.work == volume)
+  {
+    return None;
+  }
+  state.count(UNBUILT_UNPUBLISHED, 1);
+  Some(Refusal::Unpublished {
+    reason: "the work is rebuilt from its log once its green's owner answers".to_owned(),
+  })
 }
 
 /// A submit's reset must fit the work's log before anything is asked of the owner, as before the verdict when the two

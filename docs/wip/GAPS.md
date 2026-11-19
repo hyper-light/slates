@@ -4057,10 +4057,12 @@
 >   of the shard. Now the list is read, never taken (`verbs::unbuilt_works`), each ask is made once more after a lost
 >   answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
 >   nothing (`verbs::install_replayed_work`), where it once made the work afresh and charged it twice;
->   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). **Still owed
->   (A-513):** a work whose asks go unanswered twice keeps its record and stays unbuilt until the daemon's next start;
->   a retry after admission, and its verbs answering `Unpublished` (A-247's word) rather than `NotFound` meanwhile, are
->   not built. The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
+>   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). Its remainder closed
+>   by A-533 (2026-11-19, g225): a work whose asks go unanswered twice keeps its record and answers `Unpublished`, left
+>   unrecorded so its resend runs the verb again (`verbs::not_started`), and its shard asks its green's owner again as
+>   clients are let in, by messages each shard runs when it next runs, never a timer (`verbs::ask_owners_to_replay`;
+>   `an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt`,
+>   `an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it`). The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
 >   its exchange and answers copies of its ends, kept on the owner shard until the exchange settles the claim, retired
 >   once handed or claimable again;
 >   `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice`).
@@ -4108,8 +4110,11 @@
 >   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
 >   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
 >   C-b: the reply deadline's other users,
->   each a wait that cannot see the departure yet: a delivery's read (Linux: the socket's readability), the macOS
->   route's claim steps and the CLI's MCP edge, which borrows the reply deadline for its own. The synchronous send's
+>   each a wait that cannot see the departure yet: the macOS route's claim steps and the CLI's MCP edge, which borrows
+>   the reply deadline for its own. A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
+>   descriptor until its reply deadline and gave up `DeadlineExceeded` there; it now waits on the control socket itself,
+>   readable or hung up, with no clock (`ClientEnd::wait_delivery`), and ends `ChannelLost` once the daemon is gone with
+>   nothing delivered (`a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock`, Linux, main's to run). The synchronous send's
 >   wait for a slot on a full ring since A-523 (2026-11-18, g251b): it spun for a whole reply deadline (a second),
 >   asked the daemon's liveness at each one and paced its tries at a tenth of it; it now spins for the client's wake
 >   estimate, then parks, each pause twice the last and never past the next look, the looks on A-443's doubling

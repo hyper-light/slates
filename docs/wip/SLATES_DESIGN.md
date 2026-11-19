@@ -11024,8 +11024,10 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > of reach (against A-207 and the recovery rule above, "unserved until it has"), and each floor holding its green's
 > checkpoint at its base. The list is now read, never taken (`verbs::unbuilt_works`), each ask is made once more after
 > a lost answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
-> nothing (`verbs::install_replayed_work`). Owed: a work whose asks go unanswered twice stays unbuilt until the next
-> start; its verbs then answer `NotFound` rather than `Unpublished`.
+> nothing (`verbs::install_replayed_work`). *Done by A-533 (2026-11-19):* a work whose asks go unanswered twice keeps
+> its record and answers `Unpublished`, never recorded as the request's completion, and its shard asks its green's
+> owner again as clients are let in, by messages each shard runs when it next runs: no timer, and no wait holds the
+> admission.
 
 **Submission.** `submit(work_volume, evidence?)`: seal the work volume (drain open extents,
 compose the net op set, chunk; in a fleet, place the snapshot to its candidate holders now, at
@@ -35719,6 +35721,15 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   debug, 2026-11-18, load 16 to 19): `slates-client --lib` green with
   `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`; red with the old spin through a
   reply deadline put back: "spun at 3000 ns, past the wake estimate".
+- **A delivery's read** (Linux; `Client::recv_delivery`, `ClientEnd::wait_delivery`, `Liveness::wait_delivery`). After a
+  reply that names a descriptor the client yielded until the descriptor was there or its reply deadline passed, and
+  gave up `DeadlineExceeded` there. The daemon sends the descriptor before that reply and answers a typed refusal where
+  the send failed (`MapUnavailable`, a stream's hand-off refused), so the descriptor is waiting or comes a scheduling
+  tick later: the wait is now one `poll` of the control socket for readability or its peer's close, with no timeout,
+  and a daemon gone with nothing delivered ends it `ChannelLost`. macOS has no control socket and is refused
+  `Unsupported` (its descriptors come by the socket route). Checks (Mac Studio, debug, 2026-11-18, load 18 to 20):
+  `slates-ipc --lib` 64 of 64 (1 ignored) and `slates-client --lib` 8 of 8 on macOS; the Linux test
+  `a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock` is main's to run.
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
@@ -35955,6 +35966,36 @@ layout 6; layout 5 still read, uncertified), `crates/server/src/content_retentio
   `takeover::`, retention, the healer and the holder tests 33 of 33; red once on a mutated copy that let an uncertified
   takeover's content go: the uncertified A-335 test failed at its first install.
 - **Owed.** An owner's settle certifies content the same way, and A-508's holders then drop content too.
+### A-533 — A work left unbuilt at recovery answers `Unpublished`, never recorded, and is asked for again as clients are let in, by messages, never a timer (2026-11-19, goal 85 via g225; A-513's remainder; §4.16 "Recovery"; A-207, A-247)
+
+- **What was there.** At recovery a work whose green lives on another partition is replayed through the green's owner
+  (A-247), each ask made once more after a lost answer (A-513). A work whose asks both went unanswered kept its record
+  and stayed unbuilt until the daemon's next start, and its verbs ran and answered `NotFound`, as if it were gone,
+  against §4.16's rule that such a work "is unserved (`Unpublished`) until it has" been replayed. And an `Unpublished`
+  a verb answered was recorded as the request's completion, though the protocol defines it as never answered from
+  memory: a resend under the same id met it for good.
+- **The rule.** A verb naming a work recorded unbuilt answers `Unpublished` (`work_home::unbuilt_refusal`, counted
+  `merge.work_unbuilt_unpublished`). `Unpublished` is now a reply of a verb not started (`verbs::not_started`, beside
+  `Overloaded`), so it is never recorded and a resend under its id runs the verb. As clients are let in, every shard is
+  told to ask its recorded works' green owners again (`daemon::ask_again_for_unbuilt_works`,
+  `verbs::ask_owners_to_replay`, counted `merge.work_rebuild_asked_again`): a message the owner runs when it next runs,
+  at once or once it comes back from a stop, replays the work and sends the outcome back by a message of its own, which
+  installs it once (`install_replayed_work`, A-513). Each message waits for room on its target's channel while that
+  shard lives (`xshard::run_on_waiting`), so one is lost only with its shard, counted.
+- **Why this and not another.** Events, not a clock: the shards that did not answer run these messages when they run
+  again, which is exactly when a replay can succeed, so the retry needs no timer and holds no admission, and a work's
+  verbs meanwhile tell its client to come back rather than that the work is gone.
+- **What it changes beside.** Every `Unpublished` a verb answers inside its transaction is now left unrecorded, as the
+  protocol always said; the `Overloaded` count (`verb.overloaded_unrecorded`) counts `Overloaded` alone.
+- **Tests.** `an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt` (on a shard: a
+  recorded unbuilt work's read answered `Unpublished`; its record ended; the resend under the same id runs and answers
+  `NotFound`) and `an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it` (a two-shard daemon:
+  the green on one shard, the work recorded unbuilt on the other, the work installed by the owner's message)
+  (`crates/server/src/verbs.rs`).
+
+Applied in the same change to: §4.16 (A-513's status: its owed item done), GAPS (A-513's remainder closed), A-513's bug
+record, `crates/server/src/{work_home,verbs,daemon}.rs`.
+
 ### A-520 — A host mount bound into a container is a verb of the library, so a host that reaches slates only through it binds a volume into a container (2026-11-18, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9, §4.12; `CONTRACT` = 44)
 Applied in the same change to: §4.6 (A-9's OCI record: the form through the library), §4.12's contract log (`CONTRACT`
 = 44), GAPS (the library's entry), `docs/library.md` (the seam's verbs, the serving list, what is owed),

@@ -5771,7 +5771,7 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
   let owed = rebuild_remote_works(origin, shards).await;
   if owed > 0 {
     slates_machine::log_line!(
-      "slates-server: {owed} work(s) left unbuilt at recovery: their shards did not answer twice; their records are kept"
+      "slates-server: {owed} work(s) left unbuilt at recovery: their shards did not answer twice; their records are kept, answering Unpublished, and asked for again as clients are let in"
     );
   }
   drop_pending_creations(origin, shards).await;
@@ -5789,8 +5789,8 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
 /// (`verbs::unbuilt_works`), and the install ends the work's record there (`verbs::install_replayed_work`), so a
 /// second ask behind a first that ran finds what the first left. Taken, one lost answer left every work of that shard
 /// unbuilt for the daemon's life: unserved, every change it acknowledged out of reach, and its floor holding its green's
-/// checkpoint at its base. A work whose asks went unanswered twice keeps its record and stays unbuilt until the daemon's
-/// next start replays it from its log (a retry after admission is owed, GAPS). Returns how many works were left so.
+/// checkpoint at its base. A work whose asks went unanswered twice keeps its record, answers `Unpublished`, and is asked
+/// for again as clients are let in ([`ask_again_for_unbuilt_works`], A-533). Returns how many works were left so.
 async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) -> usize {
   let mut owed = 0usize;
   for shard in shards.iter().copied() {
@@ -5844,6 +5844,26 @@ async fn rebuild_remote_work(
   })
   .await
   .is_some()
+}
+
+/// Format: the refusal-ledger name of a shard the retry of unbuilt works could not reach ([`ask_again_for_unbuilt_works`]):
+/// the shard gone, or the carrier refusing the message.
+const UNBUILT_ASK_REFUSED: &str = "merge.work_unbuilt_ask_refused";
+
+/// As clients are let in (A-533): tells every shard to ask its works still recorded unbuilt of their greens' owners
+/// again (`verbs::ask_owners_to_replay`), by a message each runs when it next runs. A work whose rebuild asks went
+/// unanswered twice at recovery is so rebuilt when its shard and its green's owner run again, each run the event, and
+/// answers `Unpublished` meanwhile; nothing waits, so the admission is not held, and no timer runs. A shard with no such
+/// work does nothing.
+fn ask_again_for_unbuilt_works(origin: u16, shards: &[ShardId]) {
+  for shard in shards.iter().copied() {
+    crate::xshard::run_on_waiting(
+      origin,
+      shard.0,
+      crate::verbs::ask_owners_to_replay,
+      UNBUILT_ASK_REFUSED,
+    );
+  }
 }
 
 /// Asks `shard` to run `work` in its own time, and once more when no answer came back (A-513, as A-505 asks a map's
@@ -6146,6 +6166,7 @@ async fn control_loop(
   // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
   // green's owner, and only then is every floor compared with the work it holds for (A-247).
   recover_works_across_partitions(control, &shards).await;
+  ask_again_for_unbuilt_works(control, &shards);
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the
@@ -6739,7 +6760,7 @@ mod limits {
 #[cfg(test)]
 pub(crate) use tests::{
   audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
-  audit_on_shard_configured, hold_busy, observe_first, test_profile,
+  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -6985,6 +7006,17 @@ mod tests {
   ) -> T {
     daemon
       .observe(daemon.shards.first().copied(), history)
+      .expect("the observation completed")
+  }
+
+  /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
+  pub(crate) fn observe_at<T: Send + 'static>(
+    daemon: &super::Daemon,
+    partition: usize,
+    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  ) -> T {
+    daemon
+      .observe(daemon.shards.get(partition).copied(), history)
       .expect("the observation completed")
   }
 
