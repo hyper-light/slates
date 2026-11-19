@@ -74,3 +74,7 @@ mod fixtures;
 #[cfg(test)]
 #[path = "tests/pack_fixtures.rs"]
 mod pack_fixtures;
+
+#[cfg(test)]
+#[path = "tests/v2_rest_fixtures.rs"]
+mod v2_rest_fixtures;
