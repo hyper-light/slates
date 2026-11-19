@@ -61,8 +61,11 @@ An address the anchor cannot bind ends its start with an error naming it.
 lets the system pick one; `svnserve`'s is 3690); the daemon logs where it serves (`slates daemon: the svn://
 listener serves on IP:PORT`). `svn://` has no encryption, so a daemon that is no fleet node serves it on a
 loopback address alone: any other address is refused as a usage error before anything starts. The anchor
-passes the flag to the daemon it supervises. For now every connection is greeted as `svnserve` greets one and
-its URL is answered "No repository found": serving the daemon's Subversion repositories is the next step.
+binds the address once and hands its listener to every daemon it supervises (on Linux and macOS), so a
+daemon's restart never drops the port: a client that connects meanwhile is answered by the next daemon. An
+address the anchor cannot bind ends its start with an error naming it. For now every connection is greeted
+as `svnserve` greets one and its URL is answered "No repository found": serving the daemon's Subversion
+repositories is the next step.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 

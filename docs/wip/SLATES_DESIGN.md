@@ -12741,8 +12741,9 @@ engine: the verdict, rebase, position mapping, the register).
 > the deployment plan hands them over (`FleetPlan::edge_identity`) from the DER the command read from the manifest's
 > files, so the daemon reads none (R1), and the transport's key stays private to it. A daemon that is no fleet node has
 > no identity to present, so its edge serves cleartext, on a loopback address alone; any other address is refused where
-> the flag is read (`slates_api::role::vcs_http_address`, by both roles and the `slates` command), as usage before
-> anything starts, rather than by a daemon that would start without its edge.
+> the flag is read (`slates_api::role::vcs_address`, by both roles and the `slates` command; named `vcs_http_address`
+> until A-689 made it the one reader of `--vcs-http` and `--vcs-svn`), as usage before anything starts, rather than by
+> a daemon that would start without its edge.
 >
 > **Status (2026-11-19, A-625 part 3 continued (2): the anchor holds the edge's port, built).** On Unix the anchor binds
 > the edge's listener once, at the address `--vcs-http` names, with the backlog the edge derives

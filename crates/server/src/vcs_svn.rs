@@ -28,13 +28,14 @@
 //! ([`first_rto_ns`]), as the HTTP edge bounds a phase that has not learned yet. Learning each phase's wait, one
 //! mechanism for the HTTP, SSH and svn:// edges, is owed (GAPS, A-656).
 //!
-//! **What is served.** The greeting, `svnserve`'s byte for byte, then the client's answer: its version, capabilities
-//! and client strings judged by A-599's handshake, and its URL answered as `svnserve`'s `find_repos` answers a URL
-//! under a root that holds no repository, "No repository found in '…'" (`SVN_ERR_RA_SVN_REPOS_NOT_FOUND`, 210005),
-//! after which the connection ends, as `svnserve`'s does. No repository is looked up yet. The next piece ports the rest
-//! of `find_repos` (the scheme's check, the URL's canonical form, a path that climbs with `..`), locates a repository's
-//! name on its partition's shard, moves the connection there as the HTTP edge moves one, and lends the repository's
-//! sources there with every call (GAPS, A-656).
+//! **What is served.** The greeting, `svnserve`'s byte for byte but for `svndiff1`, which slates does not announce, so
+//! no client sends it zlib (§4.17.4 "5. The wire"; A-599's handshake); then the client's answer: its version,
+//! capabilities and client strings judged by A-599's handshake, and its URL answered as `svnserve`'s `find_repos`
+//! answers a URL under a root that holds no repository, "No repository found in '…'" (`SVN_ERR_RA_SVN_REPOS_NOT_FOUND`,
+//! 210005), after which the connection ends, as `svnserve`'s does. No repository is looked up yet. The next piece ports
+//! the rest of `find_repos` (the scheme's check, the URL's canonical form, a path that climbs with `..`), locates a
+//! repository's name on its partition's shard, moves the connection there as the HTTP edge moves one, and lends the
+//! repository's sources there with every call (GAPS, A-656).
 
 use std::cell::RefCell;
 use std::task::{Poll, Waker};
@@ -353,9 +354,7 @@ pub(crate) fn start(
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),
   };
   runtime.spawn_on(control, async move {
-    slates_machine::log_line!("G234-DEBUG svn listener task runs, {} seats", bounds.connections);
     let Ok(state) = keep(ListenerState::new(bounds.connections)) else {
-      slates_machine::log_line!("G234-DEBUG svn listener state not kept");
       crate::fleet::count_refusal(NOT_STARTED);
       return;
     };
@@ -411,11 +410,8 @@ async fn serve(
   limits: Limits,
 ) -> Result<(), ListenerRefused> {
   loop {
-    slates_machine::log_line!("G234-DEBUG svn listener accepting");
     let stream = listener.accept().await.map_err(ListenerRefused::Listener)?;
-    slates_machine::log_line!("G234-DEBUG svn listener accepted");
     let Ok(round_trip) = stream.round_trip() else {
-      slates_machine::log_line!("G234-DEBUG svn no round trip");
       crate::fleet::count_refusal(NO_ROUND_TRIP);
       continue;
     };
@@ -423,13 +419,9 @@ async fn serve(
       round_trip.ns,
       bounds.granularity_ns().max(round_trip.resolution_ns),
     );
-    slates_machine::log_line!("G234-DEBUG svn bound {bound_ns} ns; seating");
     let slot = seat_for(state).await?;
-    slates_machine::log_line!("G234-DEBUG svn seated at {slot}");
     let seat = Seat::take(state, slot).ok_or(ListenerRefused::StateGone)?;
-    let spawned = spawn_child(converse(stream, seat, limits, bound_ns));
-    slates_machine::log_line!("G234-DEBUG svn spawned: {}", spawned.is_ok());
-    match spawned {
+    match spawn_child(converse(stream, seat, limits, bound_ns)) {
       Ok(task) => {
         let _ = state.with(|state| state.set_task(slot, task));
         if detach(task).is_err() {
@@ -484,15 +476,11 @@ enum Next {
 /// [`Connection`] until it ends; each wait on the client marked overdue past `bound_ns` from the greeting, and waited
 /// on.
 async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) {
-  slates_machine::log_line!("G234-DEBUG svn converse starts");
   let mut out = Vec::new();
   let Ok(mut connection) = Connection::new(limits, &mut out) else {
-    slates_machine::log_line!("G234-DEBUG svn connection refused its limits");
     return;
   };
-  let written = stream.write_all(&out).await;
-  slates_machine::log_line!("G234-DEBUG svn greeting of {} bytes written: {:?}", out.len(), written);
-  if written.is_err() {
+  if stream.write_all(&out).await.is_err() {
     return;
   }
   let deadline_ns = now_ns().saturating_add(bound_ns);
@@ -500,7 +488,6 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
   loop {
     out.clear();
     let next = answer(&mut connection, &input, &mut out, limits);
-    slates_machine::log_line!("G234-DEBUG svn next {next:?} with {} in, {} out", input.len(), out.len());
     if !out.is_empty() && stream.write_all(&out).await.is_err() {
       return;
     }

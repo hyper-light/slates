@@ -13679,6 +13679,10 @@ const SVN_NO_REPOSITORY: &[u8] =
 const SVN_RECORDED_URL: &str = "svn://127.0.0.1/missing";
 /// Format: where the recorded server's refusal starts, after its greeting.
 const SVN_REFUSAL_START: &[u8] = b"( failure ";
+/// Format: the capability `svnserve`'s greeting announces and slates' does not, its word and the space after it: a
+/// sender uses zlib only with a peer that announced `svndiff1` (`marshal.c`), so slates never receives zlib (§4.17.4
+/// "5. The wire"; `slates_svn::handshake`).
+const SVN_SVNDIFF1: &str = "svndiff1 ";
 
 /// The URL a client of the svn:// listener at loopback `port` names for the repository `missing`, as
 /// [`SVN_RECORDED_URL`] did.
@@ -13714,15 +13718,15 @@ fn svn_replaced(recorded: &[u8], item: &str, replacement: &str) -> Vec<u8> {
   bytes
 }
 
-/// What the svn:// listener at loopback `port` must send, as `svnserve` sent it: the greeting, then the refusal of the
-/// recorded client's URL naming that port.
+/// What the svn:// listener at loopback `port` must send, as `svnserve` sent it: the greeting, its `svndiff1` taken out
+/// ([`SVN_SVNDIFF1`]), then the refusal of the recorded client's URL naming that port.
 fn svnserves_answers(port: u16) -> (Vec<u8>, Vec<u8>) {
   let refusal = SVNSERVE_NO_REPOSITORY
     .windows(SVN_REFUSAL_START.len())
     .position(|window| window == SVN_REFUSAL_START)
     .expect("the recorded server refused");
   (
-    SVNSERVE_NO_REPOSITORY[..refusal].to_vec(),
+    svn_replaced(&SVNSERVE_NO_REPOSITORY[..refusal], SVN_SVNDIFF1, ""),
     svn_replaced(
       &SVNSERVE_NO_REPOSITORY[refusal..],
       &svn_string(&svn_no_repository(SVN_RECORDED_URL)),
@@ -13768,13 +13772,14 @@ fn svn_exchange(port: u16, patience: Duration) -> std::io::Result<(Vec<u8>, Vec<
 }
 
 /// Asserts that `exchanged`, what [`svn_exchange`] read from the listener at `port`, is what `svnserve` sent: its
-/// greeting byte for byte, then its refusal of the URL, "No repository found" (210005), and the connection's end.
+/// greeting byte for byte but for `svndiff1`, then its refusal of the URL, "No repository found" (210005), and the
+/// connection's end.
 fn assert_svnserves_answers(exchanged: &(Vec<u8>, Vec<u8>), port: u16) {
   let (greeting, refusal) = svnserves_answers(port);
   assert_eq!(
     String::from_utf8_lossy(&exchanged.0),
     String::from_utf8_lossy(&greeting),
-    "the listener greets as svnserve does"
+    "the listener greets as svnserve does, svndiff1 aside"
   );
   assert_eq!(
     String::from_utf8_lossy(&exchanged.1),
@@ -13787,9 +13792,10 @@ fn assert_svnserves_answers(exchanged: &(Vec<u8>, Vec<u8>), port: u16) {
 /// the system picks (`--vcs-svn 127.0.0.1:0`); read the port the daemon names; connect, read the greeting, answer it as
 /// stock `svn` 1.15.0 answered `svnserve`, naming the repository `missing` at that port
 /// (`crates/svn/fixtures/handshake/no-repository.client.bin`), and read until the connection ends. Expect: the daemon
-/// names the listener's port before it says it serves; the greeting is `svnserve`'s byte for byte; the answer is
-/// refused as `svnserve` refuses a URL no repository holds, "No repository found" (210005), and the connection ends:
-/// the flag went from the anchor to its daemon, which runs A-656's connection on each connection it accepts.
+/// names the listener's port before it says it serves; the greeting is `svnserve`'s byte for byte but for `svndiff1`
+/// (§4.17.4 "5. The wire"); the answer is refused as `svnserve` refuses a URL no repository holds, "No repository
+/// found" (210005), and the connection ends: the flag went from the anchor to its daemon, which runs A-656's
+/// connection on each connection it accepts.
 #[test]
 fn an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener() {
   let instance = format!("cli-vcs-svn-{}", std::process::id());

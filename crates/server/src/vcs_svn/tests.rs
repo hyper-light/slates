@@ -17,13 +17,19 @@ const SHARDS: u16 = 2;
 const PATIENCE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 /// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`RECORDED_URL`] under a root holding no
 /// repository: its greeting, then its refusal (recorded on the Mac Studio, 2026-11-19).
-const SERVER_BYTES: &[u8] = include_bytes!("../../../svn/fixtures/handshake/no-repository.server.bin");
+const SERVER_BYTES: &[u8] =
+  include_bytes!("../../../svn/fixtures/handshake/no-repository.server.bin");
 /// Format: what that client wrote: its answer to the greeting, naming [`RECORDED_URL`].
-const CLIENT_BYTES: &[u8] = include_bytes!("../../../svn/fixtures/handshake/no-repository.client.bin");
+const CLIENT_BYTES: &[u8] =
+  include_bytes!("../../../svn/fixtures/handshake/no-repository.client.bin");
 /// Format: the URL the recorded client named, at `svnserve`'s default port; a client of the listener names its port.
 const RECORDED_URL: &str = "svn://127.0.0.1/missing";
 /// Format: where the recorded server's refusal starts, after its greeting.
 const REFUSAL_START: &[u8] = b"( failure ";
+/// Format: the capability `svnserve`'s greeting announces and slates' does not, its word and the space after it: a
+/// sender uses zlib only with a peer that announced `svndiff1` (`marshal.c`), so slates never receives zlib (§4.17.4
+/// "5. The wire"; `slates_svn::handshake`).
+const SVNDIFF1: &str = "svndiff1 ";
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for the svn:// listener at `address`.
 fn daemon(address: SocketAddrV4) -> Daemon {
@@ -86,14 +92,15 @@ fn answer_naming(port: u16) -> Vec<u8> {
   )
 }
 
-/// The recorded greeting, and the recorded refusal naming the listener at `port`.
+/// The recorded greeting, its `svndiff1` taken out ([`SVNDIFF1`]), and the recorded refusal naming the listener at
+/// `port`.
 fn svnserves_answers(port: u16) -> (Vec<u8>, Vec<u8>) {
   let refusal = SERVER_BYTES
     .windows(REFUSAL_START.len())
     .position(|window| window == REFUSAL_START)
     .expect("the recorded server refused");
   (
-    SERVER_BYTES[..refusal].to_vec(),
+    replaced(&SERVER_BYTES[..refusal], SVNDIFF1, ""),
     replaced(
       &SERVER_BYTES[refusal..],
       &string_item(&no_repository(RECORDED_URL)),
@@ -102,8 +109,8 @@ fn svnserves_answers(port: u16) -> (Vec<u8>, Vec<u8>) {
   )
 }
 
-/// What a client connected to `port` reads before the connection has sent `wanted` bytes, ends, or is silent past the
-/// patience: as many bytes as came.
+/// What `stream` reads before the listener has sent `wanted` bytes, ends the connection, or is silent past the
+/// stream's patience: as many bytes as came.
 fn read_up_to(stream: &mut ClientStream, wanted: usize) -> Vec<u8> {
   let mut read = Vec::new();
   let mut chunk = [0u8; 4096];
@@ -119,8 +126,9 @@ fn read_up_to(stream: &mut ClientStream, wanted: usize) -> Vec<u8> {
 /// A-689 (§4.17.4 piece 7). Do: start a daemon asked for the svn:// listener on loopback at a port the system picks;
 /// connect to the port it reports, read its first bytes, answer them as stock `svn` 1.15.0 answered `svnserve`, naming
 /// the repository `missing` at the listener's port, and read until the connection ends. Expect: the greeting is
-/// `svnserve`'s byte for byte, and the answer is refused as `svnserve` refused it, "No repository found in" the URL the
-/// client named (210005), after which the listener closes the connection, as `svnserve` does.
+/// `svnserve`'s byte for byte but for `svndiff1` (§4.17.4 "5. The wire"), and the answer is refused as `svnserve`
+/// refused it, "No repository found in" the URL the client named (210005), after which the listener closes the
+/// connection, as `svnserve` does.
 #[test]
 fn a_connection_is_greeted_as_svnserve_greets_and_its_url_refused_in_svnserves_words() {
   let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
@@ -134,7 +142,7 @@ fn a_connection_is_greeted_as_svnserve_greets_and_its_url_refused_in_svnserves_w
   assert_eq!(
     String::from_utf8_lossy(&greeted),
     String::from_utf8_lossy(&greeting),
-    "the listener greets as svnserve does"
+    "the listener greets as svnserve does, svndiff1 aside"
   );
   stream
     .write_all(&answer_naming(port))
