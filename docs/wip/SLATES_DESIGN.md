@@ -13763,9 +13763,11 @@ and export by landing).
 > loop a turn a step (the closest copy or the node's origin, each segment cropped to the range, the gap to the copy's
 > source), `serve.c`'s range refusals after `done`. Its fifth slice (2026-11-19, g297): `get-deleted-rev`,
 > `svn_repos_deleted_rev`'s checks and binary search over node relation and closest copy, a path not deleted answered
-> with the refusal a newer client reads as none. Owed: `log` with merged revisions, `get-file-revs`; the fold of a
-> name beyond ASCII (utf8proc's case folding and mark stripping); read access by the
-> authorization rules (A-606).
+> with the refusal a newer client reads as none. Its sixth slice, in part (2026-11-19, g297): `log` without merged
+> revisions, `svn_repos_get_logs5` and `do_logs` over FSFS's node history on the index, a stream a revision a step,
+> merged revisions refused until built; and the crate's one walk of copy roots (A-616's) asked by every read command.
+> Owed: `log`'s merged revisions, `get-file-revs`; the fold of a name beyond ASCII (utf8proc's case folding and mark
+> stripping); read access by the authorization rules (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -42843,15 +42845,45 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   160006), the two revisions taken older first, each refused past the youngest when opened. A path absent in the older
   revision, or present in both as one line no copy younger than the older made, was not deleted; otherwise
   `svn_repos_deleted_rev`'s binary search, which compares the node with the older revision's as it began and the
-  closest copy (`svn_fs_closest_copy`, now its own function beside `svn_repos__prev_location`) with the start as it
-  moves, as the C code does. Not deleted is `SVN_ERR_ENTRY_MISSING_REVISION` (150003) in `serve.c`'s words, the two
-  revisions as given. The search halves its range each turn, so it is bounded at 65 turns, past which a contradictory
-  index is refused as corrupt. Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 332 of 332; the
+  closest copy (`svn_fs_closest_copy`) with the start as it moves, as the C code does. Not deleted is
+  `SVN_ERR_ENTRY_MISSING_REVISION` (150003) in `serve.c`'s words, the two revisions as given. The search halves its
+  range each turn, so it is bounded at 65 turns. (Since the sixth slice the search and the closest copy are the
+  crate's one walk of copy roots, A-616's `report::drive::history`, which answers none past the bound.) Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 332 of 332; the
   session (15 commands: a deletion found from two pegs and from a reversed range, a replacement found, a path re-added
   as a new line, a copy older than the start, the root, an absent path, revisions past the youngest and negative)
   replayed whole; the parameters. Red-checked five ways (no swap, copies ignored at the end or in the search, the
   message's revisions swapped, the revision before the found one): each failed the session's replay.
-- **Owed** (the next slices): `log` with merged revisions and `get-file-revs`, each replayed against the transcripts
+- **Part 2, its sixth slice, in part** (2026-11-19, g297): `log` without merged revisions (`reads/log.rs`) over
+  FSFS's node history on the index (`reads/history.rs`: `svn_fs_node_history2`, `svn_fs_history_prev2` as `tree.c`'s
+  `history_prev` steps them, the root's special case, at most two steps a reported location). The parameters as
+  `vparse_tuple` reads `l(?r)(?r)bb?n?Bwl` (five items a client before 1.5's, six with a limit, nine or more whole;
+  seven or eight malformed), a limit past `INT_MAX` none; after the authentication request the range settled and
+  checked ("No such revision N" after `done`); no paths or the root alone, every revision of the range
+  (`svn_repos_get_logs5`'s shortcut); otherwise `do_logs`: each path's history from the range's youngest revision (an
+  absent path refused), a revision sent when any history holds it, newest first or gathered and sent oldest first,
+  until the limit; the first 32 histories kept open and the rest opened again at each step as `get_history` does
+  (`MAX_OPEN_HISTORIES`). Entries as `fill_log_entry` and `revision_receiver` make them: changed paths when asked, never
+  revision 0's, in the revision's stored (byte) order, `( path action ( copy ) ( kind text-mod prop-mod ) )`; revision
+  properties every one, or those named, or every one when the names match the revision's own one for one (a name asked
+  twice brings another, a test); `svn:author`, `svn:date` and `svn:log` in their places and the rest counted and listed.
+  The log is a `Stream`, a stack of frames, one revision a step. Until merged revisions are built a log asking for them
+  is refused after `done` with `SVN_ERR_UNSUPPORTED_FEATURE` (200007), never answered without them. Also in this
+  slice: reads asks the crate's one walk of copy roots (A-616's `report::drive::history`, main's decision): its
+  `closest_copy` behind a wrapper that refuses an absent path as `open_path` does, its `youngest_copy_root` (opened to
+  the crate) for the node history, and its `deleted_revision` for `get-deleted-rev`; reads' own walk removed. And the
+  hostile property test's bound: g264 found on main (a5dffc913, seed `cc 8c15aaa6...`, now in
+  `reads/tests.proptest-regressions`, the suite seeded) a `list` whose depth is the word `true`, which svnserve answers
+  in three items (the request, `done`, "Invalid depth '-2'"; recorded), where the test asked four of every stream; the
+  handler was right, the test's check is now a named function holding a stream to a request first and a response last,
+  and the input is pinned by a named test, red under the old bound. The test fixture records no property change for a
+  node added with an empty property block, as FSFS records none (recorded: `/trunk A ( dir false false )`). Tests (the
+  Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19, merged with main): 370 of 370, rustfmt clean; the `log`
+  session (16 commands), its three hostile ones and `svn log -v` replayed whole. Red-checked ten ways: the old bound,
+  changed paths reversed, `strict-node` ignored, no shortcut for no paths, the limit ignored, gathered revisions sent
+  newest first, the names' shortcut dropped, a reopened history stepping once: each failed named tests; the standard
+  trio's shortcut and the root's special case answer the same bytes without them, so the first was removed and the
+  second kept for its cost.
+- **Owed** (the next slices): `log`'s merged revisions and `get-file-revs`, each replayed against the transcripts
   already recorded; `list`'s fold of a name beyond ASCII
   (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
   general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
