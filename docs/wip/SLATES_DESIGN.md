@@ -45831,8 +45831,8 @@ three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/s
   record before it there is committed. The repository's committed state is the greatest cut at or below each log's
   committed length that holds every record it touches whole (`LogsCohort::committed_cut`, the oracle;
   `LogsOwner::committed_cut`, what the owner learned from its acknowledgements).
-  - A holder applies that cut at its joins (`LogsOwner::announce`): a record once every log of it the holder holds has
-    reached it, on the owner's word for a log it does not hold.
+  - A holder applies the owner's cut once it holds the owner's whole log (`LogsOwner::announce`). The cut holds every
+    record whole, so every log of a record the holder holds reaches the record in that one step: its join.
   - A replica answers a read at a vector of positions (`LogsCohort::read`). It refuses one past what it applied
     (`NotApplied`), one naming a log it holds no copy of (`NotHeld`), and one that holds part of a record and not the
     rest (`Split`). The split rule is A-635's, now `catalog::spans_split_by`, the function the owner's

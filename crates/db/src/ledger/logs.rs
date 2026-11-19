@@ -13,11 +13,11 @@
 //! log it moves holds it on `f + 1` holders and every record before it in those logs is committed too. The
 //! repository's committed state is therefore a cut, one position a log: the greatest at or below each log's committed
 //! length that holds every record it touches whole ([`LogsCohort::committed_cut`], the oracle;
-//! [`LogsOwner::committed_cut`], what the owner learned from its acknowledgements). A holder applies that cut at its
-//! joins ([`LogsOwner::announce`]): it applies a record only once every log of it the holder holds has reached the
-//! record's positions, and takes the owner's word for the logs it does not hold. A replica answers a read at a vector of
-//! positions, one a log ([`LogsCohort::read`]); it refuses a vector past what it applied, and one that holds part of a
-//! record and not the rest (A-642: a replica's read refuses a cut an atomic record would split).
+//! [`LogsOwner::committed_cut`], what the owner learned from its acknowledgements). A holder applies the owner's cut once
+//! it holds the owner's whole log ([`LogsOwner::announce`]); the cut holds every record whole, so every log of a record
+//! the holder holds reaches the record in that one step, its join. A replica answers a read at a vector of positions,
+//! one a log ([`LogsCohort::read`]); it refuses a vector past what it applied, and one that holds part of a record and
+//! not the rest (A-642: a replica's read refuses a cut an atomic record would split).
 //!
 //! **Takeover.** The successor fences and reads `f + 1` holders of every log, each as [`Owner::take_over`] reads one
 //! register, or of none: every log's round is asked first ([`Cohort::can_take_over`]), so a takeover that cannot fence
@@ -196,7 +196,7 @@ impl LogsCohort {
       .map(|(name, log)| (*name, as_position(log.committed_prefix().len())))
       .collect();
     let identity_at = |name: &LogName, position: usize| self.logs.get(name)?.committed_at(position);
-    whole_cut(limits, &Cut::new(), &identity_at, &self.records)
+    whole_cut(limits, &identity_at, &self.records)
   }
 
   /// The identities [`LogsCohort::committed_cut`] holds, a log at a time.
@@ -277,31 +277,14 @@ impl LogsCohort {
       .unwrap_or(0)
   }
 
-  /// `host`, which holds the owner's log of every log in `held`, applies the owner's committed `cut` at its joins: the
-  /// greatest cut at or below `cut` and what it holds that holds every record it touches whole, a log it does not hold
-  /// judged at `cut`. What it applied before stays applied: committed positions never change.
+  /// `host`, which acknowledged the owner's whole log of every log in `held`, applies the owner's committed `cut` over
+  /// them. The cut holds every record whole, so every log of a record the host holds reaches the record in this one
+  /// step: its join. What it applied before stays applied, since committed positions never change.
   fn apply(&mut self, host: HostId, held: &BTreeSet<LogName>, cut: &Cut) {
-    let limits = held
-      .iter()
-      .map(|name| {
-        let length = self
-          .logs
-          .get(name)
-          .and_then(|log| log.held(host))
-          .map_or(0, <[_]>::len);
-        let committed = cut.get(name).copied().unwrap_or(0);
-        (*name, committed.min(as_position(length)))
-      })
-      .collect();
-    let identity_at = |name: &LogName, position: usize| {
-      let held = self.logs.get(name)?.held(host)?;
-      held.get(position).map(|record| record.identity)
-    };
-    let reached = whole_cut(limits, cut, &identity_at, &self.records);
     let applied = self.applied.entry(host).or_default();
-    for (name, position) in reached {
-      let at = applied.entry(name).or_insert(0);
-      *at = (*at).max(position);
+    for name in held {
+      let at = applied.entry(*name).or_insert(0);
+      *at = (*at).max(cut.get(name).copied().unwrap_or(0));
     }
   }
 }
@@ -353,7 +336,7 @@ impl LogsOwner {
       .collect();
     let identity_at =
       |name: &LogName, position: usize| self.owners.get(name)?.log().get(position).copied();
-    whole_cut(limits, &Cut::new(), &identity_at, &cohort.records)
+    whole_cut(limits, &identity_at, &cohort.records)
   }
 
   /// Appends `record` to every log it moves, each span's positions proposed in order to that log's holders (A-636), or
@@ -524,16 +507,14 @@ fn held_whole(spans: &[LogSpan], identity: [u8; 32], owners: &BTreeMap<LogName, 
 }
 
 /// The greatest cut at or below `limits` that holds every record it touches whole (A-642, A-636): a log's position is
-/// lowered to the first position of a record that some log of it does not hold within the cut, until none is. A log
-/// `limits` does not name is judged at `beyond`'s position alone: a holder's word from its owner for a log it does not
-/// hold. `identity_at` reads a log's identity at a position.
+/// lowered to the first position of a record that some log of it does not hold within the cut, until none is.
+/// `identity_at` reads a log's identity at a position.
 fn whole_cut(
   mut limits: Cut,
-  beyond: &Cut,
   identity_at: &dyn Fn(&LogName, usize) -> Option<[u8; 32]>,
   records: &BTreeMap<[u8; 32], Vec<LogSpan>>,
 ) -> Cut {
-  while let Some((log, position)) = first_partial(&limits, beyond, identity_at, records) {
+  while let Some((log, position)) = first_partial(&limits, identity_at, records) {
     limits.insert(log, position);
   }
   limits
@@ -543,13 +524,12 @@ fn whole_cut(
 /// identity or body is unknown: where [`whole_cut`] lowers that log next.
 fn first_partial(
   limits: &Cut,
-  beyond: &Cut,
   identity_at: &dyn Fn(&LogName, usize) -> Option<[u8; 32]>,
   records: &BTreeMap<[u8; 32], Vec<LogSpan>>,
 ) -> Option<(LogName, u64)> {
   limits.iter().find_map(|(log, limit)| {
     (0..as_index(*limit))
-      .find_map(|index| lowered_to(log, index, limits, beyond, identity_at, records))
+      .find_map(|index| lowered_to(log, index, limits, identity_at, records))
       .map(|position| (*log, position))
   })
 }
@@ -560,7 +540,6 @@ fn lowered_to(
   log: &LogName,
   index: usize,
   limits: &Cut,
-  beyond: &Cut,
   identity_at: &dyn Fn(&LogName, usize) -> Option<[u8; 32]>,
   records: &BTreeMap<[u8; 32], Vec<LogSpan>>,
 ) -> Option<u64> {
@@ -573,7 +552,7 @@ fn lowered_to(
   };
   if spans
     .iter()
-    .all(|span| span_within(span, identity, limits, beyond, identity_at))
+    .all(|span| span_within(span, identity, limits, identity_at))
   {
     return None;
   }
@@ -581,23 +560,19 @@ fn lowered_to(
   Some(from.unwrap_or(position).min(position))
 }
 
-/// Whether a cut holds `span` of the record `identity`: its log's limit past the span and every position of it carrying
-/// the record, or, for a log the cut does not name, `beyond` past the span.
+/// Whether a cut holds `span` of the record `identity`: its log's limit past the span, and every position of it carrying
+/// the record.
 fn span_within(
   span: &LogSpan,
   identity: [u8; 32],
   limits: &Cut,
-  beyond: &Cut,
   identity_at: &dyn Fn(&LogName, usize) -> Option<[u8; 32]>,
 ) -> bool {
-  match limits.get(&span.log) {
-    Some(limit) => {
-      *limit >= span.to
-        && (span.from..span.to)
-          .all(|position| identity_at(&span.log, as_index(position)) == Some(identity))
-    }
-    None => beyond.get(&span.log).is_some_and(|at| *at >= span.to),
-  }
+  limits.get(&span.log).is_some_and(|limit| {
+    *limit >= span.to
+      && (span.from..span.to)
+        .all(|position| identity_at(&span.log, as_index(position)) == Some(identity))
+  })
 }
 
 /// A log length as a position.
