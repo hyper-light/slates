@@ -447,9 +447,11 @@ fn an_orphan_create_states_the_whole_difference_from_the_default_head() {
   );
 }
 
-/// A-620 part 2 (§4.17.1 item 6: a tag is a green). Do: create `refs/tags/v1` at an annotated tag
-/// of the served head. Expect: one create appended; its work, submitted to a new green, holding the
-/// tagged commit's tree and naming the tag as its head.
+/// A-620 part 2, A-654 (§4.17.1 item 6: a tag is a green, made at a base like any create). Do:
+/// create `refs/tags/v1` at an annotated tag of the served head, a root commit. Expect: one create
+/// appended, made at the served branch's version 1 (the default head, the commit having no
+/// parent); its work, submitted to a green holding that version, holding the tagged commit's tree
+/// and naming the tag as its head.
 #[test]
 fn an_annotated_tag_is_a_green_of_its_commits_tree() {
   let mut served = Served::new();
@@ -468,13 +470,18 @@ fn an_annotated_tag_is_a_green_of_its_commits_tree() {
   let mut logs = Logs::served();
   let received = pushed(&mut served, &bytes, &mut logs);
   assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
-  let mut green = Green::new();
-  let verdict = green.submit(only_increment(&logs).unwrap());
+  let made_at = matches!(
+    logs.appended.as_slice(),
+    [Entry::Create { name, from: Some((GREEN, 1)), .. }] if name == b"refs/tags/v1"
+  );
+  assert!(made_at, "{:?}", logs.appended);
+  let increment = only_increment(&logs).unwrap().clone();
+  let verdict = served.green.submit(&increment);
   assert!(
-    matches!(verdict, Verdict::Accepted { version: 1 }),
+    matches!(verdict, Verdict::Accepted { version: 2 }),
     "{verdict:?}"
   );
-  assert_holds(&green, b"one\n", tag_id);
+  assert_holds(&served.green, b"one\n", tag_id);
 }
 
 /// A-620 part 2 (§4.17.1's namespace item 5: deleting a branch retires its green). Do: delete the
@@ -563,8 +570,8 @@ fn a_work_a_store_cannot_build_is_refused_in_slates_words_naming_its_path() {
 }
 
 /// A-654 (an entry the append refused for a reason of its own: git's words for a ref not updated,
-/// slates' on band 2). Do: decline one ref's entry the append refused for the shard's budget, and an
-/// atomic push whose second entry it refused so. Expect: `failed to update ref` for the one and
+/// slates' on band 2). Do: decline one ref's entry the append refused for the shard's budget, and
+/// an atomic push whose second entry it refused so. Expect: `failed to update ref` for the one and
 /// `atomic transaction failed` for the push, each band-2 line naming the refused ref and why.
 #[test]
 fn an_entry_the_append_refused_for_its_own_reason_is_answered_in_git_words_with_slates_why() {
