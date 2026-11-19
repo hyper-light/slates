@@ -187,9 +187,14 @@ struct Version {
 /// Shape: what one fragment entry's record costs the budget. Derived from the type.
 const PLACED_BYTES: usize = size_of::<Placed>();
 
+/// Shape: what one entry's place in its part's position order costs the budget (A-653). Derived from the type.
+const ORDER_BYTES: usize = size_of::<u32>();
+
 /// One fragment, or a part of a base pack, kept: its bytes as content, its length, its entries; and
 /// read from them once (A-639), the positions of its objects, the positions its reference deltas'
-/// bases have, and how many of its entries are offset deltas.
+/// bases have, and how many of its entries are offset deltas; and its entries' indexes in their
+/// objects' position order (A-653), so a stream finds the entries of the objects it wants by
+/// halving, whatever the part's size.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Kept {
   pub(super) content: ContentId,
@@ -198,6 +203,7 @@ pub(super) struct Kept {
   pub(super) positions: Positions,
   pub(super) references: Positions,
   pub(super) offsets: u64,
+  pub(super) order: Vec<u32>,
 }
 
 /// A version's two fragments, or a base pack's two parts: commits, trees and tags, then blobs.
@@ -243,7 +249,10 @@ impl Chain {
         .saturating_add(kept.references.runs())
     });
     let records = bytes(self.versions.len(), VERSION_BYTES).saturating_add(bytes(runs, RUN_BYTES));
-    records.saturating_add(bytes(self.placed(), PLACED_BYTES))
+    records.saturating_add(bytes(
+      self.placed(),
+      PLACED_BYTES.saturating_add(ORDER_BYTES),
+    ))
   }
 
   /// Every kept fragment's and the base pack's entries.
@@ -1340,6 +1349,7 @@ fn keep(
   store: &mut ContentStore,
   (bytes, placed): fragment::Encoded,
 ) -> Result<Kept, StoreRefused> {
+  let order = position_order(&placed)?;
   let content = store.put_object(&bytes)?;
   let positions = Positions::of(placed.iter().map(|entry| entry.position).collect());
   let references = Positions::of(
@@ -1360,7 +1370,23 @@ fn keep(
     positions,
     references,
     offsets: to_u64(offsets),
+    order,
   })
+}
+
+/// The indexes of `placed` in their objects' position order; refused for a part of more entries
+/// than a pack's header counts.
+fn position_order(placed: &[Placed]) -> Result<Vec<u32>, StoreRefused> {
+  let mut order = (0..placed.len())
+    .map(|index| u32::try_from(index).map_err(|_| StoreRefused::PackTooLarge))
+    .collect::<Result<Vec<u32>, StoreRefused>>()?;
+  order.sort_by_key(|index| {
+    usize::try_from(*index)
+      .ok()
+      .and_then(|index| placed.get(index))
+      .map_or(u64::MAX, |entry| entry.position)
+  });
+  Ok(order)
 }
 
 /// A version's two fragments, or a base pack's two parts, kept as content; refused, neither is
