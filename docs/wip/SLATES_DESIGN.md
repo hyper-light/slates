@@ -35565,4 +35565,8 @@ Applied in the same change to: §4.6's contract log (`CONTRACT` = 43), GAPS (the
   `only_an_all_digit_proc_entry_is_a_process` (every host), `the_caller_is_named_holding_the_mount_its_root_is_on`
   (Linux, by use: this process's root is on `/`), `macos_reads_no_holder_and_says_why` (macOS). The kernel-mount run
   (`a_busy_mount_is_let_go_of_the_oss_way` with `SLATES_TEST_MOUNT=1`) is filed for main.
+- **Evidence (2026-11-18, debug).** The Mac Studio (kiln r216): `cargo test -p slates-bridge-oci --lib mount_holders`
+  4 of 4, `cargo test -p slates-api --lib -- mount:: contract_history` 14 of 14; red once with the Linux rule removed
+  (the helper's refusal stood as `Unmount { status: Some(1) }` where `Busy` was expected). adacachy, Linux 7.2 x86_64,
+  in a capped user unit (kiln r219): the reader's 4 of 4, its `/proc` read naming the test process on `/`.
 
