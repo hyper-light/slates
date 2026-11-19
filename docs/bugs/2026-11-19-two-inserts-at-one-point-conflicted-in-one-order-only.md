@@ -57,3 +57,10 @@ Windows x86_64 on jupiter (kiln, debug, 2026-11-19; the macOS run owed): red (r1
 their state before the fix in a scratch clone, 3 of 4 failing (the map test: the point `Shifted` to 4 where it must
 meet the insert; the verdict's both orders; and the stack oracle, which met the pair by itself); green (r1448)
 `cargo test -p slates-merge --lib` 166 of 166, `cargo fmt -p slates-merge -- --check` clean.
+
+The merged tree, A-668 at 92038d5aa over main e3234e618 (r81, 17:12 to 17:32 UTC, same box): `cargo test --locked -p
+slates-merge --lib` ran 180 tests (main's 178 and the 2 above) and passed 179, both of the above among them;
+`cargo fmt -p slates-merge -- --check` clean. The failure was A-626's copy oracle, whose census met no nested copy
+whose inner copy replaced a tree (0 of 30 nested pairs) while every history agreed with its model. That oracle bases
+every work at the head, so its verdicts map through no delta and never reach the walk this change touched; the same
+test alone passed again (r131, meeting 3 of 37). The census zero is the oracle's own chance (reported to main).

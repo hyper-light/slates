@@ -47625,6 +47625,19 @@ base text) and its tests.
   --check` clean. The stack oracle's census: stacks through depths one to four 664, 405, 230 and 97 times; uppers moved
   38, unmoved 694; uppers refused 147, bottoms 300; works between 1,266; collapsed 0. The tree oracle's: applied 178,
   refused 142.
+- **The merged tree** (Windows x86_64, jupiter, kiln, debug, 2026-11-19; the macOS run owed). At 92038d5aa, A-668 over
+  main e3234e618 (A-669's and A-670's nodes handed on to links; a verdict that makes no file until it accepts):
+  `cargo test --locked -p slates-merge --lib -- --show-output` (r81, 17:12 to 17:32 UTC) ran 180 tests, main's 178 and
+  A-668's 2, and passed 179 in 35.58 s, A-668's two among them; `cargo fmt -p slates-merge -- --check` clean. The one
+  failure was A-626's copy oracle (`engine::copy_tests::every_copy_reads_as_its_model_over_every_history`): every
+  history agreed with its model, but its census, which requires every kind of copy met, met no nested pair whose inner
+  copy replaced a tree (0 of 30 nested pairs). A-668 cannot move it: that oracle bases every work at the head, so its
+  verdicts map through no delta and never reach the walk A-668 changed, and a seed decides the same there with or
+  without A-668. The kind is rare since A-626 part 2 (2 of 31 and 2 of 46 nested pairs in its recorded runs), so by a
+  Poisson estimate one run in three to five meets none (filed for its owner). Run alone again (r131, 18:09 UTC) it
+  passed, meeting 3 of 37. The stack oracle's census: stacks through depths one to four 646, 393, 236 and 103 times;
+  uppers moved 42, unmoved 690; uppers refused 128, bottoms 263; works between 1,073; collapsed 0. The tree oracle's:
+  applied 173, refused 133. Main's commits to f607f424c touch nothing slates-merge builds from.
 - **Applied in the same change to:** §4.16 "Position mapping" (the status); GAPS (A-668's entry beside A-612's, and
   A-659's paragraph); `crates/merge/src/map.rs`, `map/tests.rs` (new), `engine/stack/moved.rs`,
   `engine/stack/oracle.rs`; `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md` (new).

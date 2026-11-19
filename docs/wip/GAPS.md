@@ -2637,7 +2637,11 @@
 > stack oracle generates the shape, and a work between that a replica refuses must still land alone over the stack's
 > works below. Windows x86_64 on jupiter (the macOS run owed): red with the fix out, 3 of 4 failing (the map test, the
 > verdict's both orders, and the stack oracle, which met the pair by itself); green `slates-merge --lib` 166 of 166, fmt
-> clean. Bug record: `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
+> clean. The merged tree (A-668 at 92038d5aa over main e3234e618, r81): 179 of 180 (main's 178 and A-668's 2, both
+> passing), fmt clean; the one failure, A-626's copy oracle census meeting no nested copy whose inner copy replaced a
+> tree (0 of 30 nested pairs), is not A-668's, since that oracle bases every work at the head and so never reaches the
+> walk A-668 changed, and it passed alone again (r131, 3 of 37); its owner's, filed. Bug record:
+> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
 
 > **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
 > A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name
