@@ -692,10 +692,11 @@ fn driver_event(event: Event) -> DriverEvent {
 
 #[napi]
 impl Client {
-  /// Connects to the named daemon `instance` as a new client (§4.7 rendezvous). `replyNs` is how long
-  /// a reply is awaited before the daemon's liveness is questioned, and `reconnectNs` how long a
-  /// reconnect is tried after it is found gone — both nanoseconds, derived by the caller from the
-  /// machine's budgets.
+  /// Connects to the named daemon `instance` as a new client (§4.7 rendezvous). `replyNs` is how often
+  /// a wait that cannot see the daemon's departure asks its liveness, and `reconnectNs` how long a
+  /// request refused for now during a fleet takeover is asked again; a reconnect itself waits while the
+  /// instance's anchor lives and fails at once with none (A-468). Both nanoseconds, derived by the
+  /// caller from the machine's budgets.
   #[napi(factory)]
   pub fn connect(instance: String, reply_ns: i64, reconnect_ns: i64) -> Result<Client> {
     let deadlines = Deadlines {

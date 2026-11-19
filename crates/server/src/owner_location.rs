@@ -3,7 +3,10 @@
 //! A read-only exchange asks the admitted home-region peers, bounded by the existing session
 //! table and the record plane's measured round budget over the slowest path it asks (A-437). It never executes a
 //! client verb or grants authority. One cached route per client avoids repeating discovery for ordinary use, without a
-//! global catalog. Evidence: the five-node history in tests/fleet.rs and the dated remote-lookup bug report.
+//! global catalog. A query is bound to its asker's root view; one bound to a newer view than a peer holds is refused and
+//! sends that peer's root learner to fetch from the asker (A-489), and a refusal names the root its peer holds, so an
+//! asker behind it fetches from that peer and asks again under the root it then holds (A-504). Evidence: the five-node
+//! history in tests/fleet.rs and the dated remote-lookup bug reports.
 
 use slates_cluster::membership::Liveness;
 use slates_cluster::{CommitBudget, broadcast};
@@ -36,6 +39,16 @@ struct Reply {
   /// route a resend of its submit takes, a hint that grants nothing. `None` from every other peer and for every other
   /// object. Fixed-size, so decoding stays bounded.
   work_of: Option<[u8; 16]>,
+}
+
+/// A peer's refusal of a location query (A-504): the root configuration version the peer holds, so an asker under an
+/// older root view learns that it is behind and from whom to fetch the newer root ([`learn_from_refusal`]). Sent where a
+/// refusal was an empty reply that named nothing. Its encoding is never a [`Reply`]'s (a fixed 8 bytes against a reply's
+/// 42 or more, each decoded exactly), and an asker of an earlier build reads it as malformed, which it folds as no
+/// claim, as it did the empty reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+struct Refused {
+  root_version: u64,
 }
 
 /// A routing hint owned by one live client slot. A hint permits a single forward, never an
@@ -91,6 +104,17 @@ impl Query {
 
   pub(crate) fn route(self, owner: HostId) -> CachedRoute {
     CachedRoute { query: self, owner }
+  }
+
+  /// This query bound to the root view this node holds now (A-504): each look of a lookup asks under it
+  /// (`verbs::locate_within_horizon`), so a newer root this node fetched since the lookup began, after a peer's refusal
+  /// named it ([`learn_from_refusal`]), is the view its peers answer under. Before, every look asked under the root the
+  /// lookup began with, and an asker that had caught up was still refused for the old view.
+  pub(crate) fn under_held_root(self, state: &ShardState) -> Self {
+    Self {
+      root_version: state.root.configuration().version,
+      ..self
+    }
   }
 
   /// Reuse this client's most recent route, else the owner this node's own routing names (A-338), else the id's live
@@ -178,23 +202,35 @@ fn eligible(state: &ShardState, host: HostId, region: RegionId) -> bool {
 /// takeover does not advertise itself until adoption finishes. Peers without this object report no owner;
 /// they never infer one from live membership. The session has already authenticated enrollment. Returns the reply
 /// and, when this node does not claim the object, why ([`declined`]), for the caller to count.
+///
+/// A query bound to a root view other than this node's is refused, since a reply binds the view it was asked under.
+/// One bound to a newer view than this node holds also says that `peer`, the asker, holds that view and this node is
+/// behind ([`note_newer_root`]): its root learner fetches from `peer` at its next period, and the asker's next look is
+/// answered (A-489). A root learner fetched only when its regions or the voters it knew looked wrong
+/// (`fleet::root_diverges`), and a seat change moves the root's version with neither (A-406), so a learner left behind at
+/// formation refused every round a foreign voter asked, until the lookup's budget ran out (`OwnerUnreachable`).
 pub(crate) fn serve(
-  state: &ShardState,
+  state: &mut ShardState,
+  peer: HostId,
   bytes: &[u8],
 ) -> Result<(Vec<u8>, Option<&'static str>), LocationError> {
   let query = Query::from_bytes(bytes).map_err(|_| LocationError::Malformed)?;
+  if !state.consensus_ready {
+    return Err(LocationError::NotReady);
+  }
+  let held_root = state.root.configuration().version;
+  if held_root != query.root_version {
+    if query.root_version > held_root {
+      note_newer_root(state, query.root_version, peer);
+    }
+    return Err(LocationError::RootViewDiffers);
+  }
   let local = state.fleet.host();
   let root = state.root.configuration();
   let creator_region = state
     .node_regions
     .get(&ObjectId(query.object).creator())
     .copied();
-  if !state.consensus_ready {
-    return Err(LocationError::NotReady);
-  }
-  if root.version != query.root_version {
-    return Err(LocationError::RootViewDiffers);
-  }
   if state.node_regions.get(&local) != Some(&RegionId(query.region))
     || creator_region
       .is_none_or(|region| root.home_of(ObjectId(query.object), region) != RegionId(query.region))
@@ -218,6 +254,71 @@ pub(crate) fn serve(
     .to_bytes(),
     declined,
   ))
+}
+
+/// What this node answers a peer's location query on [`STREAM`] (§4.8 Lookup): the reply ([`serve`]), with why it did
+/// not claim the object counted; or, refused, a refusal naming the root version this node holds ([`Refused`], A-504),
+/// with the refusal's reason counted. Before A-504 a refusal was an empty reply, from which an asker behind this node's
+/// root learned nothing.
+pub(crate) fn answer(state: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8> {
+  match serve(state, peer, request) {
+    Ok((reply, declined)) => {
+      if let Some(declined) = declined {
+        state.count(declined, 1);
+      }
+      reply
+    }
+    Err(error) => {
+      state.count(error.counter(), 1);
+      Refused {
+        root_version: state.root.configuration().version,
+      }
+      .to_bytes()
+    }
+  }
+}
+
+/// Counter: a location query bound to a newer root view than this node holds, which says this node is behind (A-489).
+/// Format: a counter name in the daemon's status report.
+const ROOT_BEHIND: &str = "fleet.owner_location.root_behind";
+
+/// Counter: a peer's refusal of this node's location query named a newer root than this node holds, which says this
+/// asker is behind (A-504).
+/// Format: a counter name in the daemon's status report.
+const ASKER_BEHIND: &str = "fleet.owner_location.asker_behind";
+
+/// Counter: a peer refused this node's location query, by an empty reply (a peer of an earlier build) or one naming its
+/// root ([`Refused`]); the peer counted the reason.
+/// Format: a counter name in the daemon's status report.
+const REFUSED_BY_PEER: &str = "fleet.owner_location.refused_by_peer";
+
+/// Records that `peer` holds root configuration `version`, newer than the one this node holds ([`serve`], A-489): the
+/// newest version so shown and the peer that showed it, which the root learner's next period fetches from
+/// (`fleet::root_learner_fetch`), counted.
+fn note_newer_root(state: &mut ShardState, version: u64, peer: HostId) {
+  state.count(ROOT_BEHIND, 1);
+  record_newer_root(state, version, peer);
+}
+
+/// Reads a peer's refusal of this node's location query (A-504): when the root it names is newer than the one this node
+/// holds, this asker is behind, so its root learner's next period fetches from `peer`, which holds that root
+/// (`fleet::root_learner_fetch`), counted. Whether it was behind. Before, a refusal named nothing, and a behind asker's
+/// rounds were refused for its lookup's whole budget (A-489's converse).
+fn learn_from_refusal(state: &mut ShardState, peer: HostId, refused: Refused) -> bool {
+  if refused.root_version <= state.root.configuration().version {
+    return false;
+  }
+  state.count(ASKER_BEHIND, 1);
+  record_newer_root(state, refused.root_version, peer);
+  true
+}
+
+/// Keeps `version`, held by `peer`, as the newest root this node has been shown past its own, with the peer that showed
+/// it (`ShardState::root_newer_seen`).
+fn record_newer_root(state: &mut ShardState, version: u64, peer: HostId) {
+  if state.root_newer_seen.is_none_or(|(seen, _)| version > seen) {
+    state.root_newer_seen = Some((version, peer));
+  }
 }
 
 /// The green `object`'s catalog record names, if `object` is a work whose catalog record this node holds (A-255).
@@ -520,8 +621,9 @@ fn sessions_out(peers: &std::collections::BTreeSet<HostId>) -> std::collections:
   .unwrap_or_default()
 }
 
-/// Folds the replies that arrived into the round's answer, counting what each did — an empty reply is the
-/// peer's refusal, which it counted itself by reason — and strikes each replying peer from `unanswered`.
+/// Folds the replies that arrived into the round's answer, counting what each did — a refusal is the peer's, which it
+/// counted itself by reason, and one naming a newer root than this node holds sends this node's root learner to fetch
+/// from that peer ([`learn_from_refusal`], A-504) — and strikes each replying peer from `unanswered`.
 fn fold_replies(
   answers: &mut Answers,
   query: Query,
@@ -536,7 +638,10 @@ fn fold_replies(
   for (peer, reply, endpoint) in replies {
     unanswered.remove(&peer);
     let counter = if reply.bytes.is_empty() {
-      "fleet.owner_location.refused_by_peer"
+      REFUSED_BY_PEER
+    } else if let Ok(refused) = Refused::from_bytes(&reply.bytes) {
+      let _ = state::with_state_counted(|state| learn_from_refusal(state, peer, refused));
+      REFUSED_BY_PEER
     } else {
       match answers.fold(query, peer, &reply.bytes) {
         Ok(folded) => folded.counter(),
@@ -791,6 +896,198 @@ mod tests {
     assert!(
       slow.max_deadline_ns() > slow_tail,
       "a lent session is waited for past the slowest path's tail"
+    );
+  }
+
+  /// The peer a root learner's period fetches from beside the voters it knows, if any (`fleet::root_learner_fetch`).
+  fn shown_by(fetch: crate::fleet::RootLearnerFetch) -> Option<HostId> {
+    match fetch {
+      crate::fleet::RootLearnerFetch::Due { shown_by } => shown_by,
+      crate::fleet::RootLearnerFetch::Idle => None,
+    }
+  }
+
+  /// A-489 (§4.8 Lookup; D-14 root learners): a location query bound to a newer root view than this node holds is
+  /// refused, since a reply binds the view it was asked under, and it tells this node that it is behind and that the
+  /// asker holds the newer root: the root learner's next period fetches from the asker. Main's runs of the fleet test
+  /// `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns` (the quiet Mac Studio, main 3022c6894 and
+  /// 2a5bf7264) failed 2 of 3 with `OwnerUnreachable`: the successor, a root learner, counted `root_view_differs` once
+  /// for each of the foreign voter's 58 and 68 rounds until the lookup's budget ran out, since nothing it compared told
+  /// it that a seat change (A-406) had moved the root on. Do: on a shard whose root has moved past one version (a region
+  /// admitted), run the learner's period, then serve location queries bound to the older version (from Q), to its own
+  /// (from Q), to the next (from P), to the one after (from R) and to the next again (from P), and run the period twice.
+  /// Expect: the older and both newer views refused `RootViewDiffers` and its own view served; three newer views
+  /// counted; no fetch from a shown peer before the queries, a fetch from R (which showed the newest) at the first period
+  /// after them, and none from a shown peer at the second.
+  #[test]
+  fn a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker() {
+    use slates_cluster::root_group::RootCommand;
+    let (refusals, periods, behind, (p, q, r)) = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let object = ObjectId::new(local, 1);
+      state.node_regions.insert(local, RegionId(0));
+      let older = state.root.configuration().version;
+      assert!(state.root.propose(RootCommand::AdmitRegion(RegionId(2))));
+      let held = state.root.configuration().version;
+      assert!(held > older, "the root moved past one version");
+      let (p, q, r) = (
+        HostId(local.0 ^ 1),
+        HostId(local.0 ^ 2),
+        HostId(local.0 ^ 3),
+      );
+      let bound = |root_version| {
+        Query {
+          object: object.0,
+          region: 0,
+          root_version,
+        }
+        .to_bytes()
+      };
+      let now = slates_rt::futures::now_ns();
+      let before = crate::fleet::root_learner_fetch(state, now);
+      let refusals = [
+        serve(state, q, &bound(older)).err(),
+        serve(state, q, &bound(held)).err(),
+        serve(state, p, &bound(held.saturating_add(1))).err(),
+        serve(state, r, &bound(held.saturating_add(2))).err(),
+        serve(state, p, &bound(held.saturating_add(1))).err(),
+      ];
+      let first = crate::fleet::root_learner_fetch(state, now);
+      let second = crate::fleet::root_learner_fetch(state, now);
+      let behind = state.refusals.get(ROOT_BEHIND).copied();
+      (refusals, [before, first, second], behind, (p, q, r))
+    });
+    let view = Some(LocationError::RootViewDiffers);
+    assert_eq!(
+      refusals,
+      [view, None, view, view, view],
+      "the older and the newer views refused, its own served (from {q:?}, {p:?} and {r:?})"
+    );
+    assert_eq!(
+      periods.map(shown_by),
+      [None, Some(r), None],
+      "fetched from {r:?}, which showed the newest root, at the first period after the queries alone: {periods:?}"
+    );
+    assert_eq!(behind, Some(3), "each newer view counted");
+  }
+
+  /// A-504 (§4.8 Lookup; D-14 root learners): a behind asker's round is answered after one fetch. A peer's refusal names
+  /// the root the peer holds, so an asker under an older root learns that it is behind and its root learner's next period
+  /// fetches from that peer; once the asker holds that root, its next look, asked under the root it holds, is answered.
+  /// Before, a refusal was an empty reply that named nothing, and every look asked under the root the lookup began with,
+  /// so a behind asker was refused for its lookup's whole budget (A-489's converse). Do: two nodes, the peer's root a
+  /// version past the asker's (a region admitted) and the peer owning the object; the asker asks under its root, reads
+  /// the peer's answer and runs its learner's period; then the asker reaches the peer's root (the fetch, as the same
+  /// region admitted) and asks again under the root it holds. Expect: the first answer a refusal naming the peer's root,
+  /// the asker counted behind and its learner fetching from the peer; the second answer the peer's claim.
+  #[test]
+  fn a_behind_askers_round_is_answered_after_one_fetch() {
+    use slates_cluster::root_group::RootCommand;
+    let peer = crate::daemon::audit_daemon();
+    let asker = crate::daemon::audit_daemon();
+    let (peer_host, peer_root) = crate::daemon::observe_first(&peer, |state| {
+      assert!(state.root.propose(RootCommand::AdmitRegion(RegionId(2))));
+      (state.fleet.host(), state.root.configuration().version)
+    });
+    let (asker_host, asked) = crate::daemon::observe_first(&asker, |state| {
+      let local = state.fleet.host();
+      (local, Query::new(state, ObjectId::new(local, 1), 0))
+    });
+    let first = crate::daemon::observe_first(&peer, move |state| {
+      let local = state.fleet.host();
+      state.node_regions.insert(local, RegionId(0));
+      state.node_regions.insert(asker_host, RegionId(0));
+      state
+        .fleet
+        .track_object_owner(ObjectId::new(asker_host, 1), local);
+      answer(state, asker_host, &asked.to_bytes())
+    });
+    let (read, behind, fetch, counted) = crate::daemon::observe_first(&asker, move |state| {
+      let read = Refused::from_bytes(&first).ok();
+      let behind = read.is_some_and(|refused| learn_from_refusal(state, peer_host, refused));
+      let fetch = crate::fleet::root_learner_fetch(state, slates_rt::futures::now_ns());
+      (
+        read,
+        behind,
+        fetch,
+        state.refusals.get(ASKER_BEHIND).copied(),
+      )
+    });
+    let (caught_up, again) = crate::daemon::observe_first(&asker, move |state| {
+      assert!(state.root.propose(RootCommand::AdmitRegion(RegionId(2))));
+      (
+        state.root.configuration().version,
+        asked.under_held_root(state),
+      )
+    });
+    let second = crate::daemon::observe_first(&peer, move |state| {
+      answer(state, asker_host, &again.to_bytes())
+    });
+    peer.stop();
+    asker.stop();
+    assert!(
+      asked.root_version < peer_root,
+      "the asker began a root behind the peer: {} < {peer_root}",
+      asked.root_version
+    );
+    assert_eq!(
+      read,
+      Some(Refused {
+        root_version: peer_root
+      }),
+      "the peer's refusal names the root it holds"
+    );
+    assert!(behind, "the asker read itself behind");
+    assert_eq!(counted, Some(1), "counted once");
+    assert_eq!(
+      fetch,
+      crate::fleet::RootLearnerFetch::Due {
+        shown_by: Some(peer_host)
+      },
+      "the asker's root learner fetches from the peer at its next period"
+    );
+    assert_eq!(caught_up, peer_root, "one fetch reached the peer's root");
+    assert_eq!(again.root_version, peer_root, "the next look asks under it");
+    let mut answers = Answers::default();
+    assert_eq!(
+      answers.fold(again, peer_host, &second),
+      Ok(Folded::Claim),
+      "the peer answers the look under the root they share"
+    );
+    assert_eq!(answers.finish(), Ok(peer_host), "the round finds the owner");
+  }
+
+  /// A-504, the refusal's bytes (§4.9's bounded decoding; hostile input): a refusal is exactly the root version it names,
+  /// and a reply is never read as a refusal nor a refusal as a reply. Do: encode a refusal and decode it; cut it short at
+  /// every length and give it a byte more; decode a reply as a refusal and the refusal as a reply. Expect: the refusal
+  /// back whole; every cut and the longer one refused; neither read as the other.
+  #[test]
+  fn a_refusal_names_the_peers_root_and_no_reply_reads_as_one() {
+    let refused = Refused {
+      root_version: u64::MAX,
+    };
+    let bytes = refused.to_bytes();
+    assert_eq!(Refused::from_bytes(&bytes).ok(), Some(refused));
+    for length in 0..bytes.len() {
+      assert!(
+        Refused::from_bytes(&bytes[..length]).is_err(),
+        "cut at {length}"
+      );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(Refused::from_bytes(&longer).is_err(), "a byte more");
+    for serves in [false, true] {
+      assert!(
+        Refused::from_bytes(&reply(4, serves)).is_err(),
+        "a reply is no refusal"
+      );
+    }
+    let mut answers = Answers::default();
+    assert_eq!(
+      answers.fold(query(), HostId(1), &bytes),
+      Err(LocationError::Malformed),
+      "a refusal is no reply"
     );
   }
 }

@@ -102,6 +102,11 @@ pub struct ClientEnd {
   /// reply's wake that landed after its reply was taken and found this park — so the client parked
   /// again. Every park ends in a reply, one of these, the deadline, a look, or the daemon's departure.
   unanswered_wakes: u64,
+  /// Parks a departure wait's look ended (macOS, Windows; A-456, A-506): the park's timeout was the next look at the
+  /// daemon's life, which came before any wake, and the look found the daemon alive, so the client parked again. Neither
+  /// a reply's wake nor an unanswered one, and its wait teaches the estimate nothing; zero on Linux, whose park waits on
+  /// the departure itself.
+  parks_ended_by_looks: u64,
   /// The client's online wake estimate, its spin window: seeded with the window the daemon published
   /// and fed the wake of each park a reply ended asleep, from the daemon's reply stamp to the client running
   /// again ([`Self::wait`], [`wait_may_teach`]).
@@ -179,6 +184,7 @@ impl ClientEnd {
       parks: 0,
       replies: 0,
       unanswered_wakes: 0,
+      parks_ended_by_looks: 0,
       #[cfg(unix)]
       completion: None,
       #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -512,6 +518,13 @@ impl ClientEnd {
     self.unanswered_wakes
   }
 
+  /// Parks a departure wait's look ended, the daemon found alive and the client parked again (macOS, Windows; A-506; see
+  /// the field). With the replies and [`Self::unanswered_wakes`] they account for every park a wait made that neither a
+  /// deadline nor the daemon's departure ended.
+  pub fn parks_ended_by_looks(&self) -> u64 {
+    self.parks_ended_by_looks
+  }
+
   /// The ring index the next request takes (its bulk chunk is chosen by it).
   pub fn next_request_index(&self) -> u64 {
     self.next_request
@@ -680,7 +693,7 @@ impl ClientEnd {
       returned_ns,
       waker_confirms: parked.waker_confirms,
     });
-    self.after_park(ends, slot, parked, woke)
+    self.after_park(ends, slot, parked, woke, look_timeout_ns.is_some())
   }
 
   /// Arms a park (§4.7; `crate::park`): the flag first, then the wake word's value, both before the caller's re-check
@@ -714,13 +727,15 @@ impl ClientEnd {
 
   /// What a park's end means: a wake teaches its wait (`woke`, when [`wait_may_teach`] let it) and the reply is looked
   /// for; a departure ends the wait, a reply written before it taken first; a deadline's park that timed out ends its
-  /// wait `DeadlineExceeded`; anything else waits on (`None`).
+  /// wait `DeadlineExceeded`; a departure park that waited until its next look (`timed_for_a_look`) and timed out was
+  /// ended by that look, counted as such and teaching nothing (A-506); anything else waits on (`None`).
   fn after_park(
     &mut self,
     ends: Ends,
     slot: usize,
     parked: Parked,
     woke: Option<Unsettled>,
+    timed_for_a_look: bool,
   ) -> Result<Option<Waited>, IpcError> {
     if parked.woken
       && let Some(reply) = self.after_wake(slot, woke)?
@@ -736,6 +751,10 @@ impl ClientEnd {
     }
     match ends {
       Ends::At(Some(_)) => self.after_deadline().map(Some),
+      Ends::Departure if timed_for_a_look => {
+        self.parks_ended_by_looks = self.parks_ended_by_looks.saturating_add(1);
+        Ok(None)
+      }
       Ends::At(None) | Ends::Departure => Ok(None),
     }
   }
@@ -1605,25 +1624,11 @@ mod departure {
     let mut rings = rings("slates-endpoint-late-reply", liveness).unwrap();
     let open_daemon = rings.daemon_end();
     rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
-    let replier = std::thread::spawn(move || {
-      let mut daemon = open_daemon().unwrap();
-      let request = loop {
-        if let Some(request) = daemon.try_take().unwrap() {
-          break request;
-        }
-        std::thread::yield_now();
-      };
-      #[allow(clippy::disallowed_methods)]
-      // the daemon holds its answer on purpose: the hold is what is tested.
-      std::thread::sleep(Duration::from_nanos(LATE_NS));
-      daemon
-        .reply(&Slot::inline(request.request, b"late").unwrap())
-        .unwrap();
-    });
+    let replier = reply_late(open_daemon);
     let asked = Instant::now();
     let waited = rings.client.wait_while_daemon_lives().unwrap();
     let took = asked.elapsed();
-    replier.join().unwrap();
+    replier.join().unwrap().unwrap();
     drop(life);
     let looks = rings.client.liveness_looks();
     println!("a reply held {LATE_NS} ns: {waited:?} after {took:?}, {looks} looks");
@@ -1648,6 +1653,82 @@ mod departure {
     } else {
       assert_eq!(looks, 0, "the park waited on the departure, never looked");
     }
+  }
+
+  /// On its own thread, a daemon end opened by `open_daemon` takes the first request and answers it `LATE_NS` after.
+  fn reply_late(
+    open_daemon: impl FnOnce() -> Result<DaemonEnd, IpcError> + Send + 'static,
+  ) -> std::thread::JoinHandle<Result<(), IpcError>> {
+    std::thread::spawn(move || {
+      let mut daemon = open_daemon()?;
+      let request = loop {
+        if let Some(request) = daemon.try_take()? {
+          break request;
+        }
+        std::thread::yield_now();
+      };
+      #[allow(clippy::disallowed_methods)]
+      // the daemon holds its answer on purpose: the hold is what is tested.
+      std::thread::sleep(Duration::from_nanos(LATE_NS));
+      daemon.reply(&Slot::inline(request.request, b"late")?)
+    })
+  }
+
+  /// A-506 (A-456's accounting). Do: wait on a live daemon for the reply it sends half again the old reply deadline after
+  /// the request, and read how each park ended. Expect: every park counted, ended by the reply, by a wake that brought
+  /// none, or at its look at the daemon's life; on macOS and Windows at least one park a look ended (its timeout came,
+  /// the look found the daemon alive, and the client parked again), as many as the looks made or one more (the reply
+  /// taken as the last such park returned needs no look); on Linux none, its park waiting on the departure itself. And a
+  /// park a look ended teaches the wake estimate nothing: the estimate gains at most one sample for each park a look did
+  /// not end. Before A-506 such a park was counted as no kind, and the client suite's accounting failed on macOS
+  /// (`the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed`: 32 parks, 17 replies, 0 unanswered).
+  #[test]
+  fn a_park_a_liveness_look_ends_is_counted_as_its_own_kind_and_teaches_the_estimate_nothing() {
+    let _gate = crate::descriptor_test_gate();
+    let instance = unique_name("slates-endpoint-look-park-daemon");
+    #[cfg(any(target_os = "macos", windows))]
+    let _rendezvous = published(&instance).unwrap();
+    let (life, liveness) = daemon_life(&instance).unwrap();
+    let mut rings = rings("slates-endpoint-look-park", liveness).unwrap();
+    let open_daemon = rings.daemon_end();
+    rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let samples_before = rings.client.wake_samples();
+    let replier = reply_late(open_daemon);
+    let waited = rings.client.wait_while_daemon_lives().unwrap();
+    replier.join().unwrap().unwrap();
+    drop(life);
+    let (parks, replies) = rings.client.park_ratio();
+    let unanswered = rings.client.unanswered_wakes();
+    let at_looks = rings.client.parks_ended_by_looks();
+    let looks = rings.client.liveness_looks();
+    let taught = rings.client.wake_samples() - samples_before;
+    println!(
+      "a reply held {LATE_NS} ns: {parks} parks, {replies} replies, {unanswered} unanswered, {at_looks} ended by \
+       looks, {looks} looks, {taught} taught the estimate"
+    );
+    assert!(
+      matches!(waited, Waited::Reply(_)),
+      "the wait ended {waited:?} with its daemon alive"
+    );
+    assert!(
+      parks <= replies + unanswered + at_looks,
+      "every park is counted: {parks} parks, {replies} replies, {unanswered} unanswered, {at_looks} ended by looks"
+    );
+    if cfg!(any(target_os = "macos", windows)) {
+      assert!(
+        at_looks >= 1 && (looks..=looks + 1).contains(&at_looks),
+        "{at_looks} parks ended by looks, {looks} looks"
+      );
+    } else {
+      assert_eq!(
+        at_looks, 0,
+        "the park waited on the departure, never looked"
+      );
+    }
+    assert!(
+      taught <= parks - at_looks,
+      "{taught} samples taught from {parks} parks, {at_looks} of them ended by looks"
+    );
   }
 
   /// A-456. Do: wait on a daemon that never answers, and end its process a quarter of the old reply deadline into the

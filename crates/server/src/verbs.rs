@@ -2003,7 +2003,9 @@ async fn locate_within_budget(query: crate::owner_location::Query) -> Option<Hos
 
 /// [`locate_within_budget`]'s loop: a look every poll interval (the direct route, a round, and the direct route again,
 /// with what the shard read while the round waited), until an owner is found, a look begun after the membership
-/// horizon has found none, or the failover SLO has passed.
+/// horizon has found none, or the failover SLO has passed. Each round asks under the root this node holds at its look
+/// (`owner_location::Query::under_held_root`, A-504), so a newer root a peer's refusal sent its learner to fetch is the
+/// view the next round asks under; before, every round asked under the root the lookup began with.
 async fn locate_within_horizon(query: crate::owner_location::Query) -> Option<HostId> {
   let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   let began = slates_rt::futures::now_ns();
@@ -2016,7 +2018,10 @@ async fn locate_within_horizon(query: crate::owner_location::Query) -> Option<Ho
     if let Some(owner) = known() {
       return Some(owner);
     }
-    if let Ok(owner) = crate::owner_location::locate(query).await {
+    // Asked under the root this node holds now: one a peer's refusal sent its root learner to fetch since the lookup
+    // began is the view its peers answer under (A-504).
+    let asked = crate::state::with_state(|state| query.under_held_root(state)).unwrap_or(query);
+    if let Ok(owner) = crate::owner_location::locate(asked).await {
       return Some(owner);
     }
     // The round waited on its peers while the shard ran its other work: a refutation read meanwhile is seen now.
@@ -6441,6 +6446,7 @@ pub(crate) fn publish_created_volume(
     version_credit,
     metadata_credit,
     lock_credit,
+    adopted_seal: None,
   };
   match state.volumes.insert(slot) {
     Ok(h) => {
@@ -6987,13 +6993,33 @@ pub(crate) fn head_for_move(
 /// `Snapshot` verb takes one, which the record plane seals and places under this node's own placement. Returns the
 /// snapshot it superseded (the adopted head) and the new head epoch, or the refusal (the volume gone, an incomplete
 /// barrier while a writer's request is in flight), retried next period.
+///
+/// Taken once (A-488): the seal is recorded on the volume's slot, and a later call answers that record. The control
+/// shard asks for the seal until an answer reaches it, and an answer can be lost after the seal was taken: a shard
+/// that stops for a window has its call forgotten by the caller and runs it once it resumes. A second seal then
+/// superseded the first, so the settle dropped the first seal and left the adopted head behind for good.
 pub(crate) fn seal_adopted_head(
   state: &mut ShardState,
   id: DbVolumeId,
 ) -> Result<(DbSnapshotId, u64), Box<ReplyBody>> {
   let (handle, record) = find(state, VolumeId { bytes: id.bytes })?;
+  let recorded = state
+    .volumes
+    .get(handle)
+    .map_err(|_| Box::new(refused(Refusal::NotFound)))?
+    .adopted_seal;
+  if let Some(recorded) = recorded {
+    return Ok(recorded);
+  }
   let superseded = record.head;
-  snapshot_effect(state, handle, &record).map(|(_, _, epoch)| (superseded, epoch))
+  let (_, _, epoch) = snapshot_effect(state, handle, &record)?;
+  let seal = (superseded, epoch);
+  state
+    .volumes
+    .get_mut(handle)
+    .map_err(|_| Box::new(refused(Refusal::NotFound)))?
+    .adopted_seal = Some(seal);
+  Ok(seal)
 }
 
 /// Destroys `id`'s snapshot `snapshot` as the `DestroySnapshot` verb does, its caller the system (A-291: the adopted
@@ -10288,6 +10314,7 @@ pub(crate) fn publish_clone_as(
     version_credit: credits.version,
     metadata_credit: credits.metadata,
     lock_credit: credits.lock,
+    adopted_seal: None,
   };
   match state.volumes.insert(slot) {
     Ok(h) => {
@@ -17817,6 +17844,7 @@ fn rebuild_volume(
     version_credit,
     metadata_credit,
     lock_credit,
+    adopted_seal: None,
   };
   let handle = state
     .volumes

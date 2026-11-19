@@ -43,6 +43,8 @@ const FILE_MODE: u32 = 0o100_644;
 const EXECUTABLE_MODE: u32 = 0o100_755;
 /// Shape: a directory's mode.
 const DIR_MODE: u32 = 0o040_755;
+/// Shape: the same directory, its group's and others' access taken away (a base directory's metadata entry, A-501).
+const PRIVATE_DIR_MODE: u32 = 0o040_700;
 /// Shape: a witnessed file's size on the disk.
 const WITNESSED_SIZE: u64 = 3;
 /// Shape: a witnessed file's owner (judged by an overlay's verdict, not bound by the encoding).
@@ -77,6 +79,11 @@ const OLD_INO: u64 = 4;
 const MOVED_INO: u64 = 6;
 /// Shape: see `OLD_INO`.
 const CLEARED_INO: u64 = 10;
+/// Shape: the two base directories whose metadata alone changes (A-501), one inside the other, so the vectors pin that
+/// the deeper lands first.
+const SRC_INO: u64 = 7;
+/// Shape: see `SRC_INO`.
+const DEEP_INO: u64 = 8;
 /// Format: `FILE_ATTRIBUTE_SYSTEM`, the bit a field test flips in a word of Windows bits.
 const FLIP_SYSTEM: u16 = 0x4;
 /// Format: the owner's execute bit, which a field test flips in a mode.
@@ -175,6 +182,19 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
     permissions: EXECUTABLE_MODE & FileMeta::PERMISSIONS,
     windows: HIDDEN | ARCHIVE,
   };
+  // A base directory made private and read-only, and one beneath it hidden (A-501).
+  let directory = FileMeta {
+    permissions: DIR_MODE & FileMeta::PERMISSIONS,
+    windows: 0,
+  };
+  let private = FileMeta {
+    permissions: PRIVATE_DIR_MODE & FileMeta::PERMISSIONS,
+    windows: READONLY,
+  };
+  let hidden = FileMeta {
+    windows: HIDDEN,
+    ..directory
+  };
   let mut entries = vec![
     entry(
       "/src/new.rs",
@@ -263,6 +283,28 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
           basis,
           none,
         ),
+        entry(
+          "/src",
+          Action::ChmodDir {
+            from: directory,
+            to: private,
+          },
+          Some(witness(SRC_INO, DIR_MODE, 0, 0)),
+          Some(overlay(0, 0, PRIVATE_DIR_MODE)),
+          basis,
+          bits(READONLY, Kind::Dir),
+        ),
+        entry(
+          "/src/deep",
+          Action::ChmodDir {
+            from: directory,
+            to: hidden,
+          },
+          Some(witness(DEEP_INO, DIR_MODE, 0, 0)),
+          Some(made_directory()),
+          basis,
+          bits(HIDDEN, Kind::Dir),
+        ),
       ]);
     }
     // A captured clone's manifest makes no clear and no rename (A-291): a moved directory is its paths removed and made.
@@ -306,6 +348,28 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
           None,
           basis,
           none,
+        ),
+        entry(
+          "/src",
+          Action::ChmodDir {
+            from: directory,
+            to: private,
+          },
+          Some(content_witness(0, directory)),
+          Some(overlay(0, 0, PRIVATE_DIR_MODE)),
+          basis,
+          bits(READONLY, Kind::Dir),
+        ),
+        entry(
+          "/src/deep",
+          Action::ChmodDir {
+            from: directory,
+            to: hidden,
+          },
+          Some(content_witness(0, directory)),
+          Some(made_directory()),
+          basis,
+          bits(HIDDEN, Kind::Dir),
         ),
       ]);
     }
@@ -495,12 +559,12 @@ fn common_changes() -> [(&'static str, Change); 11] {
       _ => {}
     }),
     ("metadata entry's base", |e| {
-      if let Action::Chmod { from, .. } = &mut e.action {
+      if let Action::Chmod { from, .. } | Action::ChmodDir { from, .. } = &mut e.action {
         from.windows ^= FLIP_SYSTEM;
       }
     }),
     ("metadata entry's target", |e| {
-      if let Action::Chmod { to, .. } = &mut e.action {
+      if let Action::Chmod { to, .. } | Action::ChmodDir { to, .. } = &mut e.action {
         to.permissions ^= FLIP_OTHERS_EXECUTE;
       }
     }),

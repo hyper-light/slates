@@ -199,19 +199,22 @@ fn a_short_stream_is_refused() {
   assert_eq!(Archive::decode(&[0u8; 8]), Err(ArchiveError::BadMagic));
 }
 
-/// `bytes` decoded a piece a step, each hashing one byte of the stream at most, and the steps it took.
+/// `bytes` fed a byte a step and then checked a piece a step (A-494), and the steps it took.
 fn decoded_in_pieces(bytes: &[u8]) -> (Result<Archive, ArchiveError>, usize) {
-  let mut decoding = match Decoding::new(bytes) {
-    Ok(decoding) => decoding,
-    Err(refusal) => return (Err(refusal), 0),
-  };
+  let mut decoding = Decoding::new(bytes.len() as u64);
   let mut steps = 0;
+  for byte in bytes.chunks(1) {
+    steps += 1;
+    if let Err(refusal) = decoding.feed(byte) {
+      return (Err(refusal), steps);
+    }
+  }
   loop {
     steps += 1;
-    match decoding.step(1, || true) {
+    match decoding.step(|| true) {
       Ok(Some(archive)) => {
         assert!(
-          matches!(decoding.step(1, || true), Ok(None)),
+          matches!(decoding.step(|| true), Ok(None)),
           "the archive is given once"
         );
         return (Ok(archive), steps);
@@ -222,9 +225,9 @@ fn decoded_in_pieces(bytes: &[u8]) -> (Result<Archive, ArchiveError>, usize) {
   }
 }
 
-/// A-453: do decode an archive a piece a step, no piece hashing more than one byte of the stream. Expect the archive
-/// the one-call decode gives, its manifest identity the header's, and at least a step for every byte the whole-archive
-/// hash covers (the stepped path ran, not one call: a non-vacuity count).
+/// A-453, A-494: do decode an archive fed a byte a step and checked a piece a step. Expect the archive the one-call
+/// decode gives, its manifest identity the header's, and at least a step for every byte the whole-archive hash covers
+/// (the stepped path ran, not one call: a non-vacuity count).
 #[test]
 fn an_archive_decoded_in_pieces_is_the_archive_decoded_whole() {
   let archive = sample();
@@ -237,9 +240,11 @@ fn an_archive_decoded_in_pieces_is_the_archive_decoded_whole() {
     "{steps} steps for {} bytes",
     bytes.len()
   );
+  let mut decoding = Decoding::new(bytes.len() as u64);
+  decoding.feed(&bytes).unwrap();
   assert_eq!(
-    Decoding::new(&bytes).unwrap().manifest_identity(),
-    archive.manifest_identity()
+    decoding.manifest_identity(),
+    Some(archive.manifest_identity())
   );
 }
 
