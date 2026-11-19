@@ -1,0 +1,21 @@
+[package]
+name = "slates-ssh"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "SSH's transport for slates' version-control servers (§4.17.2, A-594): RFC 4253's identification exchange, binary packets, algorithm negotiation with strict key exchange, curve25519-sha256 and ssh-ed25519 host keys, as a sans-io core over aws-lc-rs."
+
+[dependencies]
+# X25519, Ed25519, SHA-256, AES-256-GCM, OpenSSH's ChaCha20-Poly1305 and the system generator: the workspace's one
+# cryptographic library (A-66).
+aws-lc-rs = { workspace = true }
+
+[dev-dependencies]
+slates-test-seeds = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

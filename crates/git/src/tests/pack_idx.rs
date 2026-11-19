@@ -201,11 +201,10 @@ fn each_index_git_wrote_reads_as_git_listed_it() {
         .unwrap_or_else(|| panic!("{name}: {} not found", object.id));
       let entry = idx.entry(position).unwrap();
       assert_eq!(
-        (entry.id, entry.offset),
-        (object.id, object.offset),
+        (entry.id, entry.offset, idx.offset_of(&object.id)),
+        (object.id, object.offset, Some(object.offset)),
         "{name}"
       );
-      assert_eq!(idx.offset_of(&object.id), Some(object.offset), "{name}");
       let next = offsets
         .iter()
         .copied()
@@ -507,7 +506,7 @@ fn offsets_past_the_pack_are_refused() {
   let trailer = pack.trailer_at() as u64;
   for (base, offset) in [(OFS_IDX, trailer), (OFS_IDX, GIT_LIMIT)] {
     let past = changed(base, format, |bytes| {
-      put_word(bytes, layout.offset(3), offset as u32);
+      put_word(bytes, layout.offset(3), u32::try_from(offset).unwrap());
     });
     let idx = Idx::decode(&past, format).unwrap();
     assert_eq!(
@@ -628,7 +627,11 @@ fn shared_offsets_and_bytes_before_the_first_object_are_refused() {
     .unwrap();
   let shared_offset = idx.offset(4).unwrap();
   let shared = changed(OFS_IDX, format, |bytes| {
-    put_word(bytes, layout.offset(0), shared_offset as u32);
+    put_word(
+      bytes,
+      layout.offset(0),
+      u32::try_from(shared_offset).unwrap(),
+    );
   });
   let shared = Idx::decode(&shared, format).unwrap();
   assert_eq!(
@@ -793,7 +796,7 @@ fn synthetic_pack(
   blobs: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> (Vec<u8>, Vec<Entry>) {
   let mut pack = Vec::new();
-  let mut writer = Writer::new(format, blobs.len() as u32, &mut pack);
+  let mut writer = Writer::new(format, u32::try_from(blobs.len()).unwrap(), &mut pack);
   let mut entries = Vec::new();
   let mut offset = PACK_HEADER_LEN;
   for (id, blob) in blobs {
