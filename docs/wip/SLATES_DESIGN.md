@@ -11408,6 +11408,29 @@ absent at the head and unchanged after the base, and its source's tree unchanged
 > unlink or a directory's removal ignores a metadata change after its base; and a hard link to a target made again
 > links the new file.
 
+> **Status (2026-11-19, A-643: the green stays whole, and no work removes or links a node changed after its base).**
+> A-631's four siblings, each now refused or replaced by the rule:
+> - *A link renamed over a file replaces it.* A symbolic link or a hard link renamed over an unchanged regular file
+>   removes the file, its removal recorded (`file_removed`, so a later work based before it is answered as A-612
+>   says), and stands alone at the path, as a file renamed over a file does and as POSIX `rename` replaces its
+>   destination. A file the increment removes itself, by an unlink or a rename away, is removed once, by that. A hard
+>   link renamed over the file it names changes nothing, as POSIX `rename` does for two links to one file. Before, the
+>   file stayed beside the link at one path.
+> - *A removal is judged against its base in every dimension.* An unlink of a file, and a directory's removal, based
+>   before a change to the node in any dimension (its bytes, a remake, its mode or an attribute) is delete against
+>   modify (`DeleteModify`), read off the change index (`changed_after`). Before, an unlink judged a file's bytes alone
+>   and lost a mode or attribute change with it, and a directory's removal took no base and removed a directory made
+>   again since.
+> - *A hard link to a file removed after the work's base* is delete against modify on the link, unless the work makes
+>   the target itself. Before, it named the file made in its place, or nothing.
+>
+> Metadata stays keyed by path (A-618): a link that replaces a file keeps the path's mode and attributes unless the
+> work changes them, as a file renamed over a file does. Tests: `crates/merge/src/engine/replaced_node_tests.rs`, each
+> case red first, and a generated oracle whose model holds what stands at every path at every version; after every
+> event each path must hold the one node the model says, never two. Probed and owed (GAPS): a rename over a symbolic
+> link, a hard link or an IPC node is refused `TypeChanged` with no concurrent change, though POSIX replaces it; and a
+> hard link names its target by path, so the target's removal leaves the link naming whatever is made there next.
+
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
 into the increment's post-state chunks (`Extent{src: Chunk{chunk, off}}`, sub-chunk offsets
@@ -43426,6 +43449,56 @@ read, taken out of `report/tests.rs`).
 - **Owed** (GAPS): the drive over the index (A-553) and the green, with `svn_repos_deleted_rev` and
   `svn_fs_closest_copy`; the deltas of changed texts; the handler that answers the client's early answer and its
   answers to `close-edit` and `abort-edit`.
+
+### A-643 — the green stays whole, and no work removes or links a node changed after its base (2026-11-19, g267, UI goal 93; §4.16 "The verdict"; A-631's siblings)
+Applied in the same change to:
+- §4.16's verdict status; GAPS (A-631's four siblings, fixed; the siblings found here, filed open);
+- `crates/merge/src/engine.rs`: `merge_rename` (a link over a file replaces it; a hard link over the file it names
+  changes nothing), `merge_rmdir` (judged against its base), `merge_unlink` (a file judged in every dimension),
+  `merge_hardlink` (its target judged against its removal), and `decide` (the increment's own removals gathered once);
+- `crates/merge/src/engine/replaced_node_tests.rs`: the failing-first tests and a generated oracle of the whole state;
+- `docs/bugs/2026-11-19-a-link-renamed-over-a-file-left-both-and-removals-ignored-their-base.md`.
+- **The defects**, A-631's siblings, probed on r810:
+  - a symbolic link or a hard link renamed over an unchanged regular file was accepted, and the green held both at one
+    path;
+  - a directory's removal took no base, and removed a directory made again since;
+  - an unlink of a file or a directory's removal ignored a mode or attribute change made after its base, which was
+    lost with the node;
+  - a hard link made to a file removed after its base named the file made in its place, or nothing.
+
+  A fifth was found while fixing the first: with a link renamed over a file replacing it, a hard link renamed over the
+  file it names removed the file's bytes and left the link naming itself.
+- **The rule, from §4.16, D-27 and POSIX `rename`.**
+  - A rename replaces an unchanged file at its destination, whatever the source names. The link's set takes the path,
+    and the file's removal is an effect of its own, recorded as A-612's removals are. The paths the increment removes
+    itself are not removed twice.
+  - Two names of one file renamed one over the other is a rename onto itself: nothing changes.
+  - A removal deletes the node the work saw. Changed after the base in any dimension (`changed_after`, one lookup in
+    the change index, which keeps every path's last change through folding), the node is another's change, and its
+    removal is delete against modify.
+  - A link names the file the work saw. Removed after the base, that file is gone for the work: delete against modify
+    on the link, unless the work makes the target itself.
+- **Metadata stays keyed by path** (A-618): a link that replaces a file keeps the path's mode and attributes unless the
+  work changes them, as a file renamed over a file does.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 4 to 7), green on kiln r880 and, merged with main, r899: `cargo test
+  -p slates-merge --lib`, 99 of 99 on both; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests: each sibling's case, the same-file
+  rename, and a rotation (a file renamed away and a link over its path in one work, the file removed once). The oracle
+  generates histories over two files, a symlink, a hard link and a directory. At the head, nodes are removed and made
+  again and their mode or attributes changed; works behind the head remove a node, link a file, or rename a link over
+  either file. A model of what stands at every path at every version is compared with the green after every event,
+  every answer is held to the rule, and a census of nine answers requires each to run.
+
+  Red on r880 with all of A-643's engine change reversed: 6 of 7 failed, the rotation passing either way. The link over
+  the file left `[File, Symlink]` at `f`; the directory made again was removed (`Accepted { version: 3 }`); the hard
+  link to a file made again was made; the file whose mode and attribute changed was removed with both; and the oracle
+  shrank to one rename of the symlink over `f`. With only the same-file rule reversed, `g` became a link to itself
+  with its bytes gone, and the oracle shrank to that rename.
+- **Siblings found, not changed** (GAPS):
+  - a rename over a symbolic link, a hard link or an IPC node is refused `TypeChanged` with no concurrent change, though
+    POSIX replaces it;
+  - a hard link names its target by path, so the head's removal of a file that links name is accepted and the links
+    then name whatever is made there next;
+  - the IPC node's unlink scans every attribute change and every hard link once per unlink.
 
 ### A-637 — A submodule's link is a special node holding its commit: encoded beside A-294's device kinds, made by a push, moved as the same kind (2026-11-19, g225, UI goal 93 (kiln 51cef9f7); §4.17.2 "Trees as a volume" item 5; §4.16's names with no content; §4.17.1 "A push is a work"; after A-294, A-618, A-638)
 
