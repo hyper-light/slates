@@ -18,10 +18,11 @@
 //! 3. each work's verdict, held (`Green::judge`);
 //! 4. the whole entry, by the register's guard, the new greens counted held (`Partition::check_creating`).
 //!
-//! Only then does a git push's store commit its objects (`crate::vcs_store::commit`, A-662: the entry holds their
-//! record, which the guard charged), then the verdicts are committed (`Green::commit_judged`), and the new greens'
-//! records and the entry recorded as one log record. A store that committed for an entry then not recorded is made again
-//! from the log (`crate::vcs_store::rebuild`), and a push not committed gives back what its objects held. A refusal names every change refused and why ([`ChangeRefused`]), or the entry's refusal, and leaves
+//! Only then does a git push's store commit its objects (`crate::vcs_store::commit` through [`push_sealed`], A-662: the
+//! entry holds their record, which the guard charged), then the verdicts are committed (`Green::commit_judged`), and the
+//! new greens' records and the entry recorded as one log record. A store that committed for an entry then not recorded
+//! is made again from the log (`crate::vcs_store::rebuild`); a push not committed is left whole with its caller, for its
+//! next ref or to give back. A refusal names every change refused and why ([`ChangeRefused`]), or the entry's refusal, and leaves
 //! the greens, the namespace and the register as they were: a branch made in memory is retired, and every retention
 //! secured is given back.
 //!
@@ -84,7 +85,7 @@ pub(crate) enum BranchChange {
 }
 
 /// What a push's register entry carries beside its branches' own changes (A-603).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct EntryParts {
   /// Checks of logs' positions read before its changes (Mercurial's `check:heads`, §4.17.3 decision 6; A-642).
   pub(crate) checks: Vec<RepositoryCheck>,
@@ -92,9 +93,6 @@ pub(crate) struct EntryParts {
   pub(crate) names: Vec<NameChange>,
   /// The repository's own state moved (Mercurial's phase roots and markers).
   pub(crate) state: Vec<StateChange>,
-  /// A git push's objects, sealed with its moves (A-662): the entry holds their record, and the repository's store
-  /// commits them once the entry has passed the register's guard, before anything of it is applied.
-  pub(crate) sealed: Option<crate::vcs_store::SealedPush>,
 }
 
 /// What a push did to one branch, in the order of its changes.
@@ -284,31 +282,35 @@ pub(crate) fn push(
   principal: &Principal,
   repository: RepositoryId,
   changes: Vec<BranchChange>,
-  mut parts: EntryParts,
+  parts: EntryParts,
 ) -> Result<Appended, AppendRefused> {
-  let mut sealed = parts.sealed.take();
-  let pushed = push_holding(state, (principal, repository), changes, parts, &mut sealed);
-  // A push refused, or one that recorded nothing, gives back what its objects held; a committed one holds nothing.
-  if let Some(sealed) = sealed {
-    crate::vcs_store::abandon(state, sealed);
-  }
-  pushed
+  push_holding(state, (principal, repository), changes, parts, None)
 }
 
-/// [`push`] with its git objects' sealed push held in `sealed` until the store commits it.
+/// [`push`] of a git push whose objects `sealed` holds (A-662): the entry holds their record, and the repository's store
+/// commits them, with the moves `sealed` admitted, between the register's guard and the entry's apply. Appended, the
+/// store holds the objects; refused, `sealed` is as it was, for the push's next ref or to be given back.
+pub(crate) fn push_sealed(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  changes: Vec<BranchChange>,
+  parts: EntryParts,
+  sealed: &mut crate::vcs_store::SealedPush,
+) -> Result<Appended, AppendRefused> {
+  if sealed.repository() != repository {
+    return Err(AppendRefused::Repository(Refusal::NotFound));
+  }
+  push_holding(state, (principal, repository), changes, parts, Some(sealed))
+}
+
+/// [`push`] and [`push_sealed`]'s one path, with the sealed push if any.
 fn push_holding(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   changes: Vec<BranchChange>,
   parts: EntryParts,
-  sealed: &mut Option<crate::vcs_store::SealedPush>,
+  sealed: Option<&mut crate::vcs_store::SealedPush>,
 ) -> Result<Appended, AppendRefused> {
-  if sealed
-    .as_ref()
-    .is_some_and(|sealed| sealed.repository() != repository)
-  {
-    return Err(AppendRefused::Repository(Refusal::NotFound));
-  }
   let record = state
     .db
     .partition()
@@ -520,7 +522,7 @@ fn push_planned(
   record: &RepositoryRecord,
   (steps, parts): (Vec<Step>, EntryParts),
   held: &mut Held,
-  sealed: &mut Option<crate::vcs_store::SealedPush>,
+  mut sealed: Option<&mut crate::vcs_store::SealedPush>,
 ) -> Result<Appended, AppendRefused> {
   make(state, &steps, held).map_err(AppendRefused::Changes)?;
   secure(state, &steps, held).map_err(AppendRefused::Changes)?;
@@ -533,8 +535,8 @@ fn push_planned(
     })
     .collect();
   let mut entry = entry(record.id, (&steps, &verdicts), parts);
-  if let Some(sealed) = sealed.as_mut() {
-    entry.objects = sealed.take_record();
+  if let Some(sealed) = sealed.as_deref() {
+    entry.objects = sealed.record();
   }
   let changes_anything = !(entry.joined.is_empty()
     && entry.versions.is_empty()
@@ -547,12 +549,10 @@ fn push_planned(
     return Ok(answer(&steps, &verdicts));
   }
   // The store commits the push's objects between the guard and the apply (A-662), so a refusal here applies nothing.
-  let store_committed = match sealed.take() {
-    Some(mut taken) => {
-      if let Err(refused) = crate::vcs_store::commit(state, &mut taken) {
-        let refusal = crate::vcs_store::refusal_of(state, &refused);
-        *sealed = Some(taken);
-        return Err(AppendRefused::Entry(refusal));
+  let store_committed = match sealed.as_deref_mut() {
+    Some(sealed) => {
+      if let Err(refused) = crate::vcs_store::commit(state, sealed) {
+        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)));
       }
       true
     }

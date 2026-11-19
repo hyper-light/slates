@@ -98,7 +98,7 @@ pub(crate) struct Record<'a> {
 
 /// A record written as its push's objects are admitted (the module docs' encoding): the objects as they come, then the
 /// deepest chain and the moves once the push is sealed ([`RecordWriter::finish`]).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RecordWriter {
   /// The objects' part, encoded.
   objects: Vec<u8>,

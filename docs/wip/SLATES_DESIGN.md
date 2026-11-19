@@ -46372,8 +46372,11 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
     snapshot (`Repositories::objects`, `object_record`). They take no position, so an entry with objects and one green
     stays a single-green append and joins nothing (A-642).
   - **Guard then apply.** The store commits between the register's guard (`Partition::check_creating`, which charged
-    the record) and the entry's apply, inside the append, so a push a rule, a verdict or the guard refuses never reaches
-    the store; a store that refuses (its budget) refuses the entry with nothing applied. After the store committed, a
+    the record) and the entry's apply, inside the append (`repository::push::push_sealed`), so a push a rule, a verdict
+    or the guard refuses never reaches the store; a store that refuses (its budget) refuses the entry with nothing
+    applied. The caller keeps the sealed push across appends: a push without `atomic` appends each ref on its own, a
+    refused ref leaves the push whole for the next (`SealedPush::reseal`), and the first commit takes every object, so
+    later records hold their moves alone. After the store committed, a
     verdict's commit or the record not made durable leaves the store ahead of the log, so the store is made again from
     the log (`vcs_store::rebuild`), the recovery's own replay. A recovery (`verbs::rebuild_recovered`, after the
     members) makes every store again and replays each record, in log order, a record a unit of the recovery's slices,
@@ -46416,7 +46419,6 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
 - **Applied in the same change to:** §4.17.1 (a status block; shared piece 3's line); GAPS (the §4.17 entry);
   `crates/server/src/vcs_store.rs`, `vcs_store/record.rs` and `vcs_store/tests.rs` (new); `crates/server/src/lib.rs`,
   `state.rs`, `daemon.rs` (the field), `repository.rs` (`install_root` makes the store), `repository/push.rs`
-  (`EntryParts::sealed`, the store's commit between the guard and the apply, the rebuild), `lfs.rs` (the new field),
-  `verbs.rs` (the recovery's call); `crates/db/src/catalog.rs` (`RepositoryEntry::objects`, `RegisterRecord::objects`),
+  (`push_sealed`, the store's commit between the guard and the apply, the rebuild), `verbs.rs` (the recovery's call); `crates/db/src/catalog.rs` (`RepositoryEntry::objects`, `RegisterRecord::objects`),
   `repository.rs` (the register's objects, `objects`, `object_record`), `repository/entry.rs` (their charge) and its
   tests; `Cargo.toml` (slates-hg, slates-svn), `crates/server/Cargo.toml`, `Cargo.lock`.

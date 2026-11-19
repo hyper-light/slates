@@ -385,17 +385,22 @@ pub(crate) struct GitPush {
   record: RecordWriter,
 }
 
-/// A git push sealed, its moves admitted and its record made: what A-635's append commits beside its entry ([`commit`]).
+/// A git push sealed and its moves admitted: what A-635's append commits beside its entry (`repository::push::
+/// push_sealed`, [`commit`]). Its caller keeps it across appends: a push without `atomic` appends each ref on its own
+/// ([`SealedPush::reseal`] admits the next ref's move), and a refused append leaves it whole for the next. The first
+/// commit gives the store every object the push brought, so later records hold its moves alone.
 #[derive(Debug)]
 pub(crate) struct SealedPush {
   /// The repository.
   repository: RepositoryId,
-  /// The objects, in quarantine.
+  /// The objects, in quarantine until a commit takes them.
   push: Push,
-  /// The moves, in the order the store commits them.
+  /// The moves admitted, in the order the store commits them.
   moves: Vec<Move>,
-  /// The record, until the entry takes it.
-  record: Vec<u8>,
+  /// The same moves as the record names them.
+  keyed: Vec<RecordedMove>,
+  /// The record's objects, until a commit takes them.
+  objects: RecordWriter,
 }
 
 impl SealedPush {
@@ -404,9 +409,34 @@ impl SealedPush {
     self.repository
   }
 
-  /// Hands the record to the entry that holds it (`RepositoryEntry::objects`).
-  pub(crate) fn take_record(&mut self) -> Vec<u8> {
-    std::mem::take(&mut self.record)
+  /// The record the entry holds (`RepositoryEntry::objects`): the objects not yet committed and the moves now admitted.
+  pub(crate) fn record(&self) -> Vec<u8> {
+    self.objects.clone().finish(self.push.deepest(), &self.keyed)
+  }
+
+  /// Admits `moves` in place of the ones admitted before, against the store as it is now: the next ref of a push
+  /// without `atomic`, after an earlier ref's commit or refusal. Refused, the push keeps what it holds.
+  pub(crate) fn reseal(
+    &mut self,
+    state: &mut ShardState,
+    moves: &[(DbVolumeId, Option<ObjectId>)],
+  ) -> Result<(), GitRefused> {
+    let keyed: Vec<RecordedMove> = moves
+      .iter()
+      .map(|(green, head)| (green_key(*green), *head))
+      .collect();
+    let (content, store) = state
+      .vcs_stores
+      .git(self.repository)
+      .ok_or(GitRefused::NoStore)?;
+    self.moves = admit_moves(content, store, &self.push, &keyed)?;
+    self.keyed = keyed;
+    Ok(())
+  }
+
+  /// Gives back every hold the push took: a push no append committed. One a commit took holds nothing.
+  pub(crate) fn abandon(self, state: &mut ShardState) {
+    abandon_push(state, self.push);
   }
 }
 
@@ -459,15 +489,13 @@ impl GitPush {
       None => Err(GitRefused::NoStore),
     };
     match admitted {
-      Ok(admitted) => {
-        let record = self.record.finish(self.push.deepest(), &keyed);
-        Ok(SealedPush {
-          repository: self.repository,
-          push: self.push,
-          moves: admitted,
-          record,
-        })
-      }
+      Ok(admitted) => Ok(SealedPush {
+        repository: self.repository,
+        push: self.push,
+        moves: admitted,
+        keyed,
+        objects: self.record,
+      }),
       Err(refused) => {
         abandon_push(state, self.push);
         Err(refused)
@@ -494,12 +522,6 @@ impl GitPush {
       &self.push,
     )))
   }
-}
-
-/// Gives back every hold a sealed push took: a push its entry's guard or a verdict refused, or one that recorded
-/// nothing. A push the store committed holds nothing, so giving it back gives back nothing.
-pub(crate) fn abandon(state: &mut ShardState, sealed: SealedPush) {
-  abandon_push(state, sealed.push);
 }
 
 /// Gives back `push`'s holds, then settles.
@@ -551,6 +573,16 @@ fn seal_moves(
     .repository
     .seal(content, push)
     .map_err(GitRefused::Store)?;
+  admit_moves(content, store, push, moves)
+}
+
+/// Admits each of `moves` against the store and the sealed `push`, in order (A-614's `admit`).
+fn admit_moves(
+  content: &ContentStore,
+  store: &GitStore,
+  push: &Push,
+  moves: &[RecordedMove],
+) -> Result<Vec<Move>, GitRefused> {
   moves
     .iter()
     .map(|(green, head)| {
@@ -564,14 +596,15 @@ fn seal_moves(
 
 /// Commits `sealed` into its repository's store (module docs), once the entry that holds its record has passed the
 /// register's guard and before anything of the entry is applied: positions, rows and versions as A-614's commit makes
-/// them, then each moved green's derived value kept. Refused, nothing of the store changed and the push still holds its
-/// objects, for the caller to abandon.
+/// them, then each moved green's derived value kept. Committed, the store holds the push's objects and later records
+/// hold its moves alone. Refused, nothing of the store changed and the push still holds its objects.
 pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<(), GitRefused> {
   let repository = sealed.repository;
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
     commit_moves(content, store, &mut sealed.push, &sealed.moves)
   })?;
+  sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
   Ok(())
 }

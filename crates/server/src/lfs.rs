@@ -200,7 +200,6 @@ impl LogLocks<'_> {
       }],
       names: Vec::new(),
       state: vec![change],
-      sealed: None,
     };
     let appended = self
       .state

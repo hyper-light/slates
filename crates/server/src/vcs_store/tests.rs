@@ -668,24 +668,28 @@ fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
   });
 }
 
-/// One push through the shard: `objects` admitted, the work A-618 builds from `base` to the commit's tree, the push
-/// sealed with its move and appended through A-635's append. The version it made.
-fn push_through(
-  state: &mut ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  objects: &[Brought],
-  (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
-) -> u64 {
+/// A push begun on the shard with `objects` admitted.
+fn begun(state: &mut ShardState, repository: RepositoryId, objects: &[Brought]) -> GitPush {
   let mut push = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
   let arriving: Vec<Incoming<'_>> = objects.iter().map(|brought| incoming(brought, 0)).collect();
   push.admit_all(state, &arriving).expect("admitted");
+  push
+}
+
+/// A-618's work for `push` on `green`, from `base` (a version and its tree) to `head`'s tree, read through A-638's view.
+fn work_of(
+  state: &ShardState,
+  (push, green): (&GitPush, DbVolumeId),
+  (version, base): (u64, Option<ObjectId>),
+  (head, tree_id): (ObjectId, ObjectId),
+) -> slates_merge::engine::Increment {
   let key = |id: ObjectId| work::ObjectKey::new(id.as_bytes()).expect("a key");
-  let built = push
+  push
     .read(&state.vcs_stores, |view| {
       let engine = state.greens.get(&green).expect("the green's engine");
       let asked = work::Push {
         name: *b"A-662 a push through its entry..",
-        base_version: engine.head(),
+        base_version: version,
         base_tree: base.map(key),
         tree: key(tree_id),
         head: Some(head.as_bytes()),
@@ -693,19 +697,84 @@ fn push_through(
       work::build(&asked, &engine, view, ROOM).map(|built| built.increment)
     })
     .expect("a view")
-    .expect("the work");
-  let sealed = push.seal(state, &[(green, Some(head))]).expect("sealed");
-  let parts = EntryParts {
-    sealed: Some(sealed),
-    ..EntryParts::default()
-  };
-  let changes = vec![BranchChange::Update { green, work: built }];
-  let appended =
-    crate::repository::push::push(state, &owner(), repository, changes, parts).expect("appended");
-  match appended.changes.first() {
+    .expect("the work")
+}
+
+/// `work` on `green` appended with `sealed`'s objects through A-635's append.
+fn appended(
+  state: &mut ShardState,
+  (repository, green): (RepositoryId, DbVolumeId),
+  work: slates_merge::engine::Increment,
+  sealed: &mut super::SealedPush,
+) -> Result<crate::repository::push::Appended, crate::repository::push::AppendRefused> {
+  let changes = vec![BranchChange::Update { green, work }];
+  crate::repository::push::push_sealed(state, (&owner(), repository), changes, EntryParts::default(), sealed)
+}
+
+/// One push through the shard: `objects` admitted, the work from `base` to the commit's tree, the push sealed with its
+/// move and appended. The version it made.
+fn push_through(
+  state: &mut ShardState,
+  (repository, green): (RepositoryId, DbVolumeId),
+  objects: &[Brought],
+  (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
+) -> u64 {
+  let push = begun(state, repository, objects);
+  let version = state.greens.get(&green).expect("the green's engine").head();
+  let built = work_of(state, (&push, green), (version, base), (head, tree_id));
+  let mut sealed = push.seal(state, &[(green, Some(head))]).expect("sealed");
+  let made = appended(state, (repository, green), built, &mut sealed).expect("appended");
+  // Committed, the push holds nothing: giving it back gives back nothing.
+  sealed.abandon(state);
+  match made.changes.first() {
     Some(BranchAppended::Moved { version, .. }) => *version,
     other => panic!("not moved: {other:?}"),
   }
+}
+
+/// A-662 (a push without `atomic`: each ref its own append, the push kept whole by its caller). Do: push a first commit;
+/// then admit a second push's objects, seal its move and append it with a work made against the stale version 0, which
+/// the verdict refuses; reseal the same move and append the work made against version 1. Expect: the stale append
+/// refused with nothing applied, the store unmoved and the push still holding its objects; the second append accepted
+/// as version 2, its record holding every object the push brought, and the store's ref at the new head.
+#[test]
+fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
+  crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "tree", VcsTool::Git);
+    let files = [(b"README".to_vec(), b"one\n".to_vec())];
+    let (first, one) = commit_of(&files, &[], FIRST_DATE);
+    let first_tree = tree_of(&first);
+    push_through(state, (repository, root), &first, (None, one, first_tree));
+    let files = [(b"README".to_vec(), b"two\n".to_vec())];
+    let (second, two) = commit_of(&files, &[one], FIRST_DATE + 1);
+    let second_tree = tree_of(&second);
+    let push = begun(state, repository, &second);
+    let stale = work_of(state, (&push, root), (0, None), (two, second_tree));
+    let fresh = work_of(state, (&push, root), (1, Some(first_tree)), (two, second_tree));
+    let mut sealed = push.seal(state, &[(root, Some(two))]).expect("sealed");
+    let held = state.vcs_stores.content().map(ContentStore::used);
+    assert!(appended(state, (repository, root), stale, &mut sealed).is_err());
+    assert_eq!(state.vcs_stores.content().map(ContentStore::used), held);
+    assert_eq!(state.db.partition().repositories().objects(repository).count(), 1);
+    sealed.reseal(state, &[(root, Some(two))]).expect("resealed");
+    let made = appended(state, (repository, root), fresh, &mut sealed).expect("appended");
+    assert!(matches!(made.changes.first(), Some(BranchAppended::Moved { version: 2, .. })));
+    sealed.abandon(state);
+    let records: Vec<Vec<u8>> = state
+      .db
+      .partition()
+      .repositories()
+      .objects(repository)
+      .map(<[u8]>::to_vec)
+      .collect();
+    let last = records.last().expect("a record");
+    let read = Record::decode(last, FORMAT).expect("a record");
+    assert_eq!(read.objects.len(), second.len());
+    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
+    let key = green_key(root);
+    let newest = store.repository.versions(key).checked_sub(1).expect("a version");
+    assert_eq!(store.repository.head(content, key, newest), Some(two));
+  });
 }
 
 /// The root tree a commit's content names.
