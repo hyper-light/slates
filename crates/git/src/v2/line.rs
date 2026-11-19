@@ -357,7 +357,7 @@ mod tests {
       object_id(ObjectFormat::Sha1, upper, 7),
       Err(Refusal::ObjectId {
         at: 7,
-        refusal: HexRefusal::NotHex { at: 23 }
+        refusal: HexRefusal::NotHex { at: 25 }
       })
     );
     assert_eq!(
