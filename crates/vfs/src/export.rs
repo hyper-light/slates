@@ -1184,21 +1184,25 @@ mod tests {
 
   /// A generated file's bytes: one byte repeated (every codec shrinks it), text-like lines (zstd and LZ4 do), or noise
   /// (none does): up to a chunk and a half at the test store's chunk, so a file spans two chunks, and four such files
-  /// with their attributes stay within the test volume's quota.
+  /// with their attributes stay within the test volume's quota. Generated as a plain tuple, its first part the kind, so
+  /// the strategy needs no `Arc`-backed `prop_oneof!` (R2).
   fn generated_bytes() -> impl Strategy<Value = Vec<u8>> {
     let chunk = PAGE * 16;
-    prop_oneof![
-      (0..chunk * 3 / 2, any::<u8>()).prop_map(|(len, byte)| vec![byte; len]),
-      (0..chunk * 3 / 2).prop_map(|len| {
-        b"fn main() { println!(\"slates\"); }\n"
+    (
+      0u8..3,
+      (0..chunk * 3 / 2, any::<u8>()),
+      proptest::collection::vec(any::<u8>(), 0..chunk),
+    )
+      .prop_map(|(kind, (len, byte), noise)| match kind {
+        0 => vec![byte; len],
+        1 => b"fn main() { println!(\"slates\"); }\n"
           .iter()
           .copied()
           .cycle()
           .take(len)
-          .collect()
-      }),
-      proptest::collection::vec(any::<u8>(), 0..chunk),
-    ]
+          .collect(),
+        _ => noise,
+      })
   }
 
   proptest! {

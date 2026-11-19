@@ -5,9 +5,10 @@
 //! a snapshot's bytes elsewhere (Mantle, kiln's object store) and reads the file a page at a time. It runs as a build
 //! does: checked at once, walked in slices by a task of the volume's owner shard, its volume and the request's
 //! completion committed as one atom. And its way back, `archive import` (A-453): the archive file a consumer wrote into
-//! a volume of its own, its length admitted before a byte is read, then read, decoded and verified, restored and laid
-//! into a new volume, each a slice a turn on that volume's owner shard (`slates_archive::Decoding`, `Planning`,
-//! `Restoring`, the takeover's `verbs::Populating`), the new volume and the completion one atom as an export's are.
+//! a volume of its own, its length admitted before a byte is read, then read a slice at a time into the decoder that
+//! verifies it (`slates_archive::Decoding`, fed a slice a unit and never holding the file whole, A-494), restored and
+//! laid into a new volume, each a slice a turn on that volume's owner shard (`Planning`, `Restoring`, the takeover's
+//! `verbs::Populating`), the new volume and the completion one atom as an export's are.
 //!
 //! **Running.** Each verb checks what it can at once — the volume, the right, the name, the snapshot — and defers its
 //! reply to a task of the volume's owner shard, as a granted landing does (AUD-29-03). The task steps the work a slice
@@ -1761,6 +1762,11 @@ async fn archive_steps(job: &mut ArchiveJob) -> Result<(), Refusal> {
 /// volume a slice a turn, never in one long turn; how many turns the imports took.
 /// Format: a counter name in the daemon's status report.
 const IMPORT_SLICES: &str = "image.archive_import_slices";
+/// Counter: a unit of an import's reading that held more of the archive file than its bound (A-494,
+/// `slates_archive::Decoding::bound` of the unit's feed slice): its slice and the decoder's one field. Zero unless the
+/// reading regressed to holding the file.
+/// Format: a counter name in the daemon's status report.
+const IMPORT_STAGE_PAST_BOUND: &str = "image.archive_import_stage_past_bound";
 
 /// `ArchiveImport` (§4.11 "Archive", D-17; Mantle's CP-T10.4, A-453): checks the archive volume, the right and the name
 /// at once, then reads the archive file, decodes and verifies it, restores its tree and lays it into a new volume in a
@@ -1805,8 +1811,9 @@ pub(crate) fn import_verb(
     size,
     require_locked,
     file: InodeNo(0),
-    length: 0,
-    bytes: Vec::new(),
+    decoding: None,
+    slice: Vec::new(),
+    stage_high_water: 0,
     manifest: [0; 32],
     names: NamePolicy::Exact,
     admitted: None,
@@ -1843,10 +1850,14 @@ struct ImportJob {
   require_locked: bool,
   /// The archive file.
   file: InodeNo,
-  /// The archive file's length, as it was admitted.
-  length: usize,
-  /// The archive file's bytes, read a slice a unit.
-  bytes: Vec<u8>,
+  /// The decoder of the archive file's bytes, fed them a slice a unit and stepped through its checks
+  /// ([`ImportJob::feed_step`], [`ImportJob::decode_step`]); dropped once it gives the archive.
+  decoding: Option<slates_archive::Decoding>,
+  /// The slice of the archive file a unit reads before it feeds it: no longer than a feed slice, and emptied by the
+  /// feed, so the file is never held whole (A-494).
+  slice: Vec<u8>,
+  /// The most of the archive file the reading held at once: a unit's slice and the decoder's stage beside it.
+  stage_high_water: usize,
   /// The archive's manifest identity, verified against its tree.
   manifest: [u8; 32],
   /// The new volume's name policy: its archive's.
@@ -1876,11 +1887,12 @@ impl Drop for ImportJob {
 }
 
 impl ImportJob {
-  /// Finds the archive file in the archive volume's root and admits its length before a byte of it is read, then makes
-  /// room for it, allocated and never zeroed whole. No longer than the archive volume's class cap: every byte an
-  /// archive's writer put there was charged to that volume, so only a file with holes is longer, and no writer of an
-  /// archive makes one (refused `Malformed`). And no longer than the room this shard could admit, since the file is
-  /// held whole while it is decoded (owed: a streamed decoder, GAPS A-453): refused `BudgetExceeded` naming the room.
+  /// Finds the archive file in the archive volume's root and admits its length before a byte of it is read, and starts
+  /// its decoder. No longer than the archive volume's class cap: every byte an archive's writer put there was charged
+  /// to that volume, so only a file with holes is longer, and no writer of an archive makes one (refused `Malformed`).
+  /// And no longer than the room this shard could admit: the file is never held whole (A-494), but the archive it
+  /// decodes to, every record's payload and the manifest, is held until the tree is restored (owed in pieces, GAPS
+  /// A-453), and that is the file's bytes less its framing. Refused `BudgetExceeded` naming the room.
   fn open(&mut self, state: &mut ShardState) -> Result<(), Refusal> {
     let handle = slot_of(state, self.archive)?;
     let (file, length) = locate_archive(state, handle).map_err(|error| refusal_of_vfs(&error))?;
@@ -1890,44 +1902,71 @@ impl ImportJob {
       });
     }
     let room = state.store.admittable();
-    let over_room = || Refusal::BudgetExceeded { available: room };
     if length > room {
-      return Err(over_room());
+      return Err(Refusal::BudgetExceeded { available: room });
     }
-    let length = usize::try_from(length).map_err(|_| over_room())?;
-    self
-      .bytes
-      .try_reserve_exact(length)
-      .map_err(|_| over_room())?;
     self.file = file;
-    self.length = length;
+    self.decoding = Some(slates_archive::Decoding::new(length));
     Ok(())
   }
 
-  /// One slice of the reading, a copy slice a unit; `Some` once the buffer holds the file's admitted length, or all it
-  /// held (a file cut short meanwhile reads short, and its decode refuses it as cut off).
-  fn read_step(&mut self, state: &mut ShardState) -> Result<Option<()>, Refusal> {
-    let (archive, file, length) = (self.archive, self.file, self.length);
-    let bytes = &mut self.bytes;
+  /// One slice of the reading, a feed slice a unit ([`feed_slice_bytes`] of the live configuration, or the test's):
+  /// the archive file read from where its decoder stands into the job's slice and fed to the decoder, which keeps what
+  /// the archive keeps and stages at most one field, so the reading holds no more of the file than
+  /// `Decoding::bound(slice_bytes)` (counted past it). `Some` once the decoder holds the file's admitted length, or
+  /// all it held: a file cut short meanwhile reads short, and the decoder refuses it as cut off. A header this daemon
+  /// does not read is refused at its first slice, typed.
+  fn feed_step(
+    &mut self,
+    state: &mut ShardState,
+    slice_bytes: usize,
+  ) -> Result<Option<()>, Refusal> {
+    let (archive, file) = (self.archive, self.file);
+    let ImportJob {
+      decoding,
+      slice,
+      stage_high_water,
+      ..
+    } = self;
+    let decoding = decoding.as_mut().ok_or_else(unreachable)?;
+    let bound = slates_archive::Decoding::bound(slice_bytes);
     state.count(IMPORT_SLICES, 1);
     sliced(state, |s| {
-      let at = bytes.len();
-      let piece = usize::try_from(s.config.copy_slice_bytes())
+      let piece = usize::try_from(decoding.remaining())
         .unwrap_or(usize::MAX)
-        .max(1)
-        .min(length.saturating_sub(at));
+        .min(slice_bytes.max(1));
       if piece == 0 {
         return Ok(Some(()));
       }
       let handle = slot_of(s, archive)?;
-      bytes.resize(at.saturating_add(piece), 0);
-      let read = match bytes.get_mut(at..) {
-        Some(into) => read_archive(s, handle, file, u64::try_from(at).unwrap_or(u64::MAX), into)
-          .map_err(|error| refusal_of_vfs(&error))?,
-        None => 0,
-      };
-      bytes.truncate(at.saturating_add(read));
-      Ok((read == 0 || bytes.len() >= length).then_some(()))
+      slice.resize(piece, 0);
+      let read = read_archive(s, handle, file, decoding.fed(), slice.as_mut_slice())
+        .map_err(|error| refusal_of_vfs(&error))?;
+      decoding
+        .feed(slice.get(..read).unwrap_or_default())
+        .map_err(|error| refusal_of_import(&error, s.store.admittable()))?;
+      // The unit held its slice while the decoder staged a field from it, never more than the stage's largest.
+      let held = read.saturating_add(decoding.high_water());
+      *stage_high_water = (*stage_high_water).max(held);
+      if held > bound {
+        s.count(IMPORT_STAGE_PAST_BOUND, 1);
+      }
+      Ok((read == 0 || decoding.remaining() == 0).then_some(()))
+    })
+  }
+
+  /// One slice of the decoder's checks once the file is fed, a piece a unit (the trailer and the checksum; a chunk's
+  /// payload held to its identity; the manifest): the archive once whole and verified.
+  fn decode_step(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Result<Option<slates_archive::Archive>, Refusal> {
+    let decoding = self.decoding.as_mut().ok_or_else(unreachable)?;
+    state.count(IMPORT_SLICES, 1);
+    sliced(state, |_| {
+      decoding
+        .step(|| true)
+        .map_err(|error| refusal_of_import(&error, 0))
     })
   }
 
@@ -2029,8 +2068,11 @@ impl ImportJob {
   /// Releases a piece of what the import made, `true` while more is left: its buffer (one allocation), then the
   /// restored tree an entry a piece, then the archive a chunk a piece, then its manifest an entry a piece.
   fn shed(&mut self) -> bool {
-    if self.bytes.capacity() > 0 {
-      self.bytes = Vec::new();
+    if self.slice.capacity() > 0 {
+      self.slice = Vec::new();
+      return true;
+    }
+    if self.decoding.take().is_some() {
       return true;
     }
     if let Some(restored) = self.restored.as_mut() {
@@ -2152,7 +2194,8 @@ fn refusal_of_import(error: &slates_archive::ArchiveError, room: u64) -> Refusal
     | ArchiveError::TotalsMismatch
     | ArchiveError::BadExtents
     | ArchiveError::BadName
-    | ArchiveError::DuplicatePath => ArchiveFault::Malformed,
+    | ArchiveError::DuplicatePath
+    | ArchiveError::BadLayout => ArchiveFault::Malformed,
   };
   Refusal::ArchiveRefused { fault }
 }
@@ -2171,21 +2214,20 @@ fn refusal_of_laying(error: &slates_vfs::VfsError) -> Refusal {
   }
 }
 
-/// One slice of the decode, a piece a unit, no piece hashing more than an archive slice's bytes (half the live step
-/// quantum at the measured BLAKE3 rate); the archive once whole and verified.
-fn decode_step(
-  state: &mut ShardState,
-  decoding: &mut slates_archive::Decoding<'_>,
-) -> Result<Option<slates_archive::Archive>, Refusal> {
-  let slice_bytes = usize::try_from(state.config.archive_slice_bytes())
-    .unwrap_or(usize::MAX)
-    .max(1);
-  state.count(IMPORT_SLICES, 1);
-  sliced(state, |_| {
-    decoding
-      .step(slice_bytes, || true)
-      .map_err(|error| refusal_of_import(&error, 0))
-  })
+/// Derived (A-494, D-11): the bytes of the archive file one unit of an import's reading reads and feeds. Each byte is
+/// copied out of the archive volume, folded into the archive's BLAKE3 and copied into the chunk or manifest that keeps
+/// it, so a unit of `b` bytes takes `b/memcpy + b/blake3 + b/memcpy` of the shard's time. A unit fits the slice
+/// ([`sliced`], half the live step quantum) when `b = 1 / (2/copy_slice + 1/archive_slice)`, where `copy_slice_bytes`
+/// and `archive_slice_bytes` are half the quantum at the deployment's measured memcpy and BLAKE3 rates: `c·h / (2h + c)`,
+/// at least a byte. The reading's stage is bounded by it (`Decoding::bound`).
+fn feed_slice_bytes(config: &crate::DaemonConfig) -> usize {
+  let copy = u128::from(config.copy_slice_bytes().max(1));
+  let hash = u128::from(config.archive_slice_bytes().max(1));
+  let piece = copy
+    .saturating_mul(hash)
+    .checked_div(hash.saturating_mul(2).saturating_add(copy))
+    .unwrap_or(0);
+  usize::try_from(piece).unwrap_or(usize::MAX).max(1)
 }
 
 /// One slice of the restore's plan, a piece a unit; the plan once whole.
@@ -2282,27 +2324,32 @@ async fn run_import(mut job: ImportJob, alias: Option<NameAlias>) {
   shed_in_slices(|| job.shed()).await;
 }
 
-/// The import's slices: the archive file's length admitted and the file read; the archive decoded and verified (the
-/// file's bytes freed at once after, since the archive holds its own); the new volume admitted under the archive's name
-/// policy; the tree planned, admitted against what the volume may hold and the shard could admit, and restored; and
-/// laid into the volume.
+/// The import's slices: the archive file's length admitted, and the file read and fed to its decoder a feed slice a
+/// unit, never held whole (A-494); the archive's checks a piece a unit, the checksum first; the new volume admitted
+/// under the archive's name policy; the tree planned, admitted against what the volume may hold and the shard could
+/// admit, and restored; and laid into the volume.
 async fn import_steps(job: &mut ImportJob) -> Result<(), Refusal> {
   with(|s| job.open(s))?;
-  while with(|s| job.read_step(s))?.is_none() {
+  while with(|s| {
+    let slice = feed_slice_bytes(&s.config);
+    job.feed_step(s, slice)
+  })?
+  .is_none()
+  {
     slates_rt::futures::yield_now().await;
   }
-  let bytes = std::mem::take(&mut job.bytes);
-  let mut decoding =
-    slates_archive::Decoding::new(&bytes).map_err(|error| refusal_of_import(&error, 0))?;
   let archive = loop {
-    if let Some(archive) = with(|s| decode_step(s, &mut decoding))? {
+    if let Some(archive) = with(|s| job.decode_step(s))? {
       break archive;
     }
     slates_rt::futures::yield_now().await;
   };
-  job.manifest = decoding.manifest_identity();
-  drop(decoding);
-  drop(bytes);
+  job.manifest = job
+    .decoding
+    .take()
+    .and_then(|decoding| decoding.manifest_identity())
+    .ok_or_else(unreachable)?;
+  job.slice = Vec::new();
   with(|s| job.admit(s, archive.name_policy_id))?;
   let ImportJob {
     size,
@@ -2350,5 +2397,344 @@ async fn import_steps(job: &mut ImportJob) -> Result<(), Refusal> {
     if with(|s| populate_step(s, &mut populating, tree, &mut *volume))? {
       return Ok(());
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_archive::{Archive, Chunk, Decoding, Entry, Extent, Node, NodeMeta};
+  use slates_db::catalog::{Principal, VolumeId as DbVolumeId};
+  use slates_ipc::protocol::{ARCHIVE_FILE, NamePolicy, ReplyBody, RequestBody, SizeClass};
+  use slates_vfs::Volume;
+  use slates_vfs::dir::Child;
+  use slates_vfs::ids::InodeNo;
+  use slates_vfs::inode::Attrs;
+  use slates_wire::request::RequestId;
+
+  use super::{ImportJob, class_cap, plan_step, populate_step, restore_step};
+  use crate::state::ShardState;
+
+  /// Shape: the chunk the test archives are cut at, one 4 KiB base page as the takeover tests cut theirs, so a file
+  /// spans several records.
+  const TEST_CHUNK: usize = 4096;
+
+  /// Shape: the size a test volume may grow to: room for every test archive and its tree, many times over.
+  const ROOM: u64 = 1 << 26;
+
+  /// The importing principal, the owner of every test volume.
+  fn owner() -> Principal {
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    }
+  }
+
+  /// Noisy bytes no codec shrinks, from a xorshift seeded by `seed` (an odd seed: an even one starts as the odd one
+  /// after it).
+  fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+      .map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state.to_le_bytes()[0]
+      })
+      .collect()
+  }
+
+  /// A file node of `bytes` numbered `ino`, cut into [`TEST_CHUNK`]-byte chunks (LZ4-coded where that saves room),
+  /// each distinct chunk added to `chunks` once.
+  fn file(name: &str, ino: u64, bytes: &[u8], chunks: &mut Vec<Chunk>) -> Entry {
+    let mut extents = Vec::new();
+    for (piece, part) in bytes.chunks(TEST_CHUNK).enumerate() {
+      let chunk = Archive::compressed_chunk(part.to_vec());
+      extents.push(Extent {
+        offset: (piece * TEST_CHUNK) as u64,
+        len: part.len() as u64,
+        chunk: chunk.identity,
+        chunk_offset: 0,
+      });
+      if !chunks.iter().any(|kept| kept.identity == chunk.identity) {
+        chunks.push(chunk);
+      }
+    }
+    Entry {
+      name: name.to_owned(),
+      meta: NodeMeta {
+        ino,
+        mode: 0o100_640,
+        size: bytes.len() as u64,
+        nlink: 1,
+        uid: 1234,
+        gid: 456,
+        mtime_ns: 2_000 + i64::try_from(ino).unwrap(),
+        ..NodeMeta::default()
+      },
+      node: Node::File(extents),
+    }
+  }
+
+  /// An archive of the root's `entries` over `chunks`, as an export writes one.
+  fn archive(entries: Vec<Entry>, chunks: Vec<Chunk>) -> Archive {
+    Archive {
+      base_page_size: 4096,
+      chunk_min: 4096,
+      chunk_max: u32::try_from(TEST_CHUNK).unwrap(),
+      created_unix: 0,
+      volume_id: 1,
+      snapshot_id: 1,
+      name_policy_id: 0,
+      unicode_version: 0,
+      root_meta: NodeMeta {
+        mode: 0o040_751,
+        uid: 1234,
+        gid: 456,
+        mtime_ns: 9_000,
+        ..NodeMeta::default()
+      },
+      manifest: Node::Directory(entries),
+      chunks,
+    }
+  }
+
+  /// The archive the oracle imports: a directory `d` holding a file of noisy bytes spanning several records and a file
+  /// of repeated bytes (an LZ4 record), and an empty file in the root.
+  fn tree_archive() -> Archive {
+    let mut chunks = Vec::new();
+    let big = file("big", 3, &noise(1, 3 * TEST_CHUNK + 100), &mut chunks);
+    let small = file("small", 4, &[7; 2_000], &mut chunks);
+    let empty = file("empty", 5, &[], &mut chunks);
+    let directory = Entry {
+      name: "d".to_owned(),
+      meta: NodeMeta {
+        ino: 2,
+        mode: 0o040_750,
+        nlink: 2,
+        uid: 1234,
+        gid: 456,
+        mtime_ns: 3_000,
+        ..NodeMeta::default()
+      },
+      node: Node::Directory(vec![big, small]),
+    };
+    archive(vec![directory, empty], chunks)
+  }
+
+  /// A volume of the owner's whose root holds `bytes` as the archive file, as a consumer writes one back.
+  fn holding(state: &mut ShardState, name: &str, bytes: &[u8]) -> DbVolumeId {
+    let reply = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::Create {
+        name: name.to_owned(),
+        size: SizeClass::Dynamic { max: ROOM },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let ReplyBody::Created { id } = reply else {
+      panic!("{name}: {reply:?}")
+    };
+    let id = crate::verbs::to_db_volume(id);
+    let handle = *state.by_id.get(&id).unwrap();
+    let slot = state.volumes.get_mut(handle).unwrap();
+    let root = slot.volume.root_inode(&state.store).unwrap();
+    let archive_file = slot
+      .volume
+      .create_file_no(&mut state.store, root, ARCHIVE_FILE, 0o644)
+      .unwrap();
+    let mut at = 0;
+    while at < bytes.len() {
+      at += slot
+        .volume
+        .write(&mut state.store, archive_file, at as u64, &bytes[at..])
+        .unwrap();
+    }
+    id
+  }
+
+  /// An import of the archive file `holder` holds into a volume named `name`, as `import_verb` makes one.
+  fn import_of(holder: DbVolumeId, name: &str) -> ImportJob {
+    ImportJob {
+      request: (
+        0,
+        RequestId {
+          client: 0,
+          sequence: 0,
+        },
+      ),
+      principal: owner(),
+      archive: holder,
+      archive_cap: ROOM,
+      name: name.to_owned(),
+      size: SizeClass::Bounded { limit: ROOM },
+      require_locked: false,
+      file: InodeNo(0),
+      decoding: None,
+      slice: Vec::new(),
+      stage_high_water: 0,
+      manifest: [0; 32],
+      names: NamePolicy::Exact,
+      admitted: None,
+      id: None,
+      decoded: None,
+      restored: None,
+      shedding: Vec::new(),
+    }
+  }
+
+  /// Runs `job`'s import on `state` step by step as `import_steps` runs it, its file fed `slice` bytes a unit: the
+  /// archive it decoded, its tree laid into the job's volume (admitted, not published).
+  fn import_fed(state: &mut ShardState, job: &mut ImportJob, slice: usize) -> Archive {
+    job.open(state).unwrap();
+    while job.feed_step(state, slice).unwrap().is_none() {}
+    let archive = loop {
+      if let Some(archive) = job.decode_step(state).unwrap() {
+        break archive;
+      }
+    };
+    job.manifest = job
+      .decoding
+      .take()
+      .and_then(|decoding| decoding.manifest_identity())
+      .unwrap();
+    job.admit(state, archive.name_policy_id).unwrap();
+    let mut planning = slates_archive::Planning::new(&archive);
+    let planned = loop {
+      if let Some(planned) = plan_step(state, &mut planning).unwrap() {
+        break planned;
+      }
+    };
+    let own = job
+      .admitted
+      .as_ref()
+      .and_then(|volume| volume.credits.reservation)
+      .map_or(0, |reservation| reservation.bytes);
+    let (budget, room) =
+      crate::verbs::restore_budget(state, class_cap(job.size), own, planned.needed());
+    let mut restoring = planned.restoring(budget).unwrap();
+    let tree = loop {
+      if let Some(tree) = restore_step(state, &mut restoring, room).unwrap() {
+        break tree;
+      }
+    };
+    drop(restoring);
+    let volume = job.admitted.as_mut().unwrap();
+    let mut populating = crate::verbs::Populating::new();
+    while !populate_step(state, &mut populating, &tree, volume).unwrap() {}
+    archive
+  }
+
+  /// What `volume` holds at each of `paths` and at its root: the attributes and a file's bytes, read whole.
+  fn view(state: &ShardState, volume: &Volume, paths: &[&str]) -> Vec<(String, Attrs, Vec<u8>)> {
+    let root = volume.root_inode(&state.store).unwrap();
+    let mut view = vec![(
+      String::new(),
+      volume.stat(&state.store, root).unwrap(),
+      Vec::new(),
+    )];
+    for path in paths {
+      let located = volume.resolve(&state.store, path).unwrap();
+      let no = located.inode;
+      let attrs = volume.stat(&state.store, no).unwrap();
+      let mut bytes = Vec::new();
+      if matches!(located.child, Child::File(_)) {
+        bytes.resize(usize::try_from(attrs.size).unwrap(), 0);
+        let read = volume.read(&state.store, no, 0, &mut bytes).unwrap();
+        bytes.truncate(read);
+      }
+      view.push(((*path).to_owned(), attrs, bytes));
+    }
+    view
+  }
+
+  /// A-494 (the oracle): do write an archive (a directory of a file spanning several records and an LZ4-coded one, and
+  /// an empty file) into a volume's root, then import it twice: once its file fed to the decoder whole, one slice of
+  /// its length (as the import read it before A-494), and once fed 7 bytes a unit. Expect both imports to decode the
+  /// archive the whole-buffer decoder gives and to lay the same volume, byte for byte: every path's attributes (mode,
+  /// owner, link count, size, times) and bytes, and the root's; the whole import to have held the file whole and the
+  /// sliced one never more than `Decoding::bound(7)` of it (the two paths ran as named).
+  #[test]
+  fn an_archive_imported_a_slice_at_a_time_lays_the_volume_the_whole_file_lays() {
+    crate::daemon::audit_on_shard(|state| {
+      let archive = tree_archive();
+      let bytes = archive.encode();
+      let holder = holding(state, "holder", &bytes);
+      let mut whole = import_of(holder, "imported-whole");
+      let decoded_whole = import_fed(state, &mut whole, bytes.len());
+      let mut sliced = import_of(holder, "imported-sliced");
+      let decoded_sliced = import_fed(state, &mut sliced, 7);
+      assert_eq!(decoded_whole, Archive::decode(&bytes).unwrap());
+      assert_eq!(decoded_sliced, decoded_whole);
+      assert_eq!(sliced.manifest, archive.manifest_identity());
+      let paths = ["d", "d/big", "d/small", "empty"];
+      let laid_whole = view(state, &whole.admitted.as_ref().unwrap().volume, &paths);
+      let laid_sliced = view(state, &sliced.admitted.as_ref().unwrap().volume, &paths);
+      assert_eq!(laid_sliced, laid_whole, "the same volume either way");
+      assert_eq!(laid_whole[2].2, noise(1, 3 * TEST_CHUNK + 100));
+      assert_eq!(laid_whole[3].2, vec![7; 2_000]);
+      assert!(
+        whole.stage_high_water >= bytes.len(),
+        "the whole import held the file whole: {} of {}",
+        whole.stage_high_water,
+        bytes.len()
+      );
+      assert!(
+        sliced.stage_high_water <= Decoding::bound(7),
+        "the sliced import held {} of the file at once",
+        sliced.stage_high_water
+      );
+      whole.release(state);
+      sliced.release(state);
+    });
+  }
+
+  /// A-494 (the bound): do import an archive more than a hundred times longer than the reading's bound at a 64-byte
+  /// feed slice (eight files of noisy bytes, raw records). Expect its tree laid as the whole-buffer decoder reads it,
+  /// and the most of the file the reading held at once within `Decoding::bound(64)`: its slice and one field, never
+  /// the file.
+  #[test]
+  fn an_import_reads_an_archive_many_times_its_bound_within_it() {
+    crate::daemon::audit_on_shard(|state| {
+      let mut chunks = Vec::new();
+      let entries = (0..8u64)
+        .map(|number| {
+          file(
+            &format!("file-{number}"),
+            number + 2,
+            &noise(2 * number + 1, 3_000),
+            &mut chunks,
+          )
+        })
+        .collect();
+      let archive = archive(entries, chunks);
+      let bytes = archive.encode();
+      let slice = 64;
+      let bound = Decoding::bound(slice);
+      assert!(
+        bytes.len() > 100 * bound,
+        "{} bytes against a bound of {bound}",
+        bytes.len()
+      );
+      let holder = holding(state, "holder", &bytes);
+      let mut import = import_of(holder, "imported-bounded");
+      let decoded = import_fed(state, &mut import, slice);
+      assert_eq!(decoded, Archive::decode(&bytes).unwrap());
+      assert!(
+        import.stage_high_water <= bound,
+        "the reading held {} of the file at once, past its bound of {bound}",
+        import.stage_high_water
+      );
+      let laid = view(
+        state,
+        &import.admitted.as_ref().unwrap().volume,
+        &["file-7"],
+      );
+      assert_eq!(laid[1].2, noise(15, 3_000));
+      import.release(state);
+    });
   }
 }
