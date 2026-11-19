@@ -540,9 +540,17 @@
 > after (refused today), Subversion's replace with history, moves and second copies into a copied tree in one increment,
 > the server's change-index consumers treating a copy's destination as its tree (a Merkle identity over the radix trees
 > was weighed and declined, A-586). Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
-> ra_svn server's commands (its greeting and authentication built, A-599), with the lock verbs; hooks and `svnlook`; the
-> `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over `svn://` and `http://`, the differential
-> run against `svnserve`, and the measurements of §4.17.4 item 13. No speed is claimed until measured.
+> ra_svn server's commands (its greeting and authentication built, A-599; its reporter's commands and report, A-616 part
+> 1), with the lock verbs; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
+> suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
+> No speed is claimed until measured.
+> A-616 part 1 (2026-11-19, g234): the reporter's commands and its report (`report`): `update`, `switch`, `status`
+> and `diff` read through a port of `vparse_tuple`, the report kept and checked as `reporter.c` keeps and checks it,
+> every refusal in `svnserve`'s words, held to stock 1.15.0's sessions over one recorded history; `cargo test --locked
+> -p slates-svn --lib` 281 of 281 on the Mac Studio, red four ways first (see A-616). Owed from it: (1) part 2, the
+> editor drive answering a finished report over the index, its texts as svndiff, entry properties, absent entries,
+> copy sources and the early-error abort; (2) URLs read as `svn_uri_canonicalize` reads them, as A-599's item (1); (3)
+> the authentication `svnserve`'s `must_have_access` asks for mid-session when an anonymous `update` may not read.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
