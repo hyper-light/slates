@@ -557,13 +557,16 @@ pub struct Green {
   /// the deltas up to it are folded into the checkpoint, so a base below it is not mapped.
   deltas_from: u64,
   last_changed: BTreeMap<String, u64>,
-  /// The last version that removed the file at each path: an unlink, a rename away, or a rename onto it, which removes
-  /// the file it replaces (A-612). A work based before it names a file that is gone, whatever stands at the path now
-  /// (made again, renamed onto it), so the verdict answers delete against modify, and rename against rename for a
-  /// rename of it, never an edit or a move of the file that took its place. Unlike the content history it is never
-  /// folded, so a base below the fold floor meets it too. One entry a path the green ever removed a file at, as
-  /// `last_changed` holds one a path it ever changed; empty in a green restored from a checkpoint or made as a branch,
-  /// whose bases are never before its first version.
+  /// The last version that removed the file at each path, a file of any type: a regular file (an
+  /// unlink, a rename away, or a rename onto it, which removes the file it replaces; A-612), a
+  /// symbolic link, a hard link's name, an IPC node or a directory (A-631). A work based before it
+  /// names a file that is gone, whatever stands at the path now (made again, renamed onto it), so
+  /// the verdict answers delete against modify for an edit, a mode change or an attribute set or
+  /// removed there, and rename against rename for a rename of it, never a change or a move of the
+  /// file that took its place. Unlike the content history it is never folded, so a base below the
+  /// fold floor meets it too. One entry a path the green ever removed a file at, as `last_changed`
+  /// holds one a path it ever changed; empty in a green restored from a checkpoint or made as a
+  /// branch, whose bases are never before its first version.
   file_removed: BTreeMap<String, u64>,
   mode_changed: BTreeMap<String, u64>,
   symlink_changed: BTreeMap<String, u64>,
@@ -2433,14 +2436,9 @@ impl Green {
       .saturating_add(self.special_history_bytes)
   }
 
-  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
-  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
-  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
-  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
-  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
-  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
-  /// Whether the file at `path` was removed after version `base` (`file_removed`): unlinked, renamed away or renamed
-  /// onto after the base, whatever stands at the path now (A-612).
+  /// Whether the node at `path` was removed after version `base` (`file_removed`): a file of any
+  /// type, removed, renamed away or renamed onto after the base, whatever stands at the path now
+  /// (A-612, A-631).
   fn file_removed_since(&self, path: &str, base: u64) -> bool {
     self
       .file_removed
@@ -2448,6 +2446,12 @@ impl Green {
       .is_some_and(|version| *version > base)
   }
 
+  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
+  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
+  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
+  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
+  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
+  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
     if base < self.folded_below {
       return self.intervening_walk(path, base);
@@ -2956,6 +2960,11 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
+    // A file removed after the work's base is gone for it, whatever stands at the path now: the
+    // mode was set on a file that no longer exists (A-631, as A-612 for an edit).
+    if !established && self.file_removed_since(path, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
     if !established && self.special_kind_changed(path, base) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -3036,6 +3045,11 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
+    // An attribute set on a file removed after the work's base was set on a file that no longer
+    // exists (A-631).
+    if !established && self.file_removed_since(path, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
     if !established && self.special_kind_changed(path, base) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -3059,7 +3073,13 @@ impl Green {
     path: &str,
     name: &str,
     base: u64,
+    established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
+    // An attribute removed from a file removed after the work's base was removed from a file that
+    // no longer exists (A-631), whatever the file at the path now holds.
+    if !established && self.file_removed_since(path, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
     if self.special_kind_changed(path, base) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -3267,7 +3287,7 @@ impl Green {
       record(
         effects,
         windows,
-        self.merge_remove_xattr(path, name, inc.base),
+        self.merge_remove_xattr(path, name, inc.base, r.establishes(path)),
       );
     }
   }
@@ -3296,6 +3316,7 @@ impl Green {
 
   /// Remove the live inode and its metadata while retaining their historical values.
   fn remove_special(&mut self, path: String, version: u64) {
+    self.file_removed.insert(path.clone(), version);
     // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
     let at = self.seed_of(&self.special_history, &path, &path, version);
     seed(
@@ -3428,6 +3449,7 @@ impl Green {
             .push((version, true));
         }
         Effect::RemoveDir(path) => {
+          self.file_removed.insert(path.clone(), version);
           emptied.push(path.clone());
           let stood = self.dirs.contains_key(&path).then_some(true);
           let at = self.seed_of(&self.dir_history, &path, &path, version);
@@ -3472,6 +3494,7 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveSymlink(path) => {
+          self.file_removed.insert(path.clone(), version);
           emptied.push(path.clone());
           let at = self.seed_of(&self.symlink_history, &path, &path, version);
           seed(
@@ -3506,6 +3529,7 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveHardlink(path) => {
+          self.file_removed.insert(path.clone(), version);
           emptied.push(path.clone());
           let at = self.seed_of(&self.hardlink_history, &path, &path, version);
           seed(
@@ -4596,6 +4620,9 @@ mod node_exclusive_tests;
 
 #[cfg(test)]
 mod unseen_bytes_tests;
+
+#[cfg(test)]
+mod replaced_node_tests;
 
 #[cfg(test)]
 mod tests {

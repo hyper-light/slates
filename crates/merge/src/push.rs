@@ -153,6 +153,16 @@ pub enum Unavailable {
     /// The length of the bytes it gave.
     given: u64,
   },
+  /// The object's bytes are not an object of its type as its tool reads one: a tree git's tree walk cannot read, or
+  /// a type the tool has no name for.
+  Malformed,
+  /// Listing the tree needs more room than the store has left.
+  PastRoom {
+    /// The bytes the listing asked for.
+    asked: u64,
+    /// The bytes the store had left.
+    room: u64,
+  },
 }
 
 /// The objects a push names, read by their ids: the repository's store with the push's own objects above it in its

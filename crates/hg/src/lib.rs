@@ -92,6 +92,7 @@ mod read;
 pub mod revlog;
 pub mod serve;
 pub mod ssh;
+pub mod store;
 pub mod wire;
 
 pub use admission::{Admission, PastAdmission};
@@ -142,3 +143,7 @@ mod revlog_tests;
 #[cfg(test)]
 #[path = "tests/index.rs"]
 mod index_tests;
+
+#[cfg(test)]
+#[path = "tests/store.rs"]
+mod store_tests;
