@@ -8123,7 +8123,9 @@ mod clone_count_tests {
   /// which then makes [`AFTER`] more files and one more in the first directory, and removes one of each, leaving the
   /// second directory as it was: the origin, the snapshot, and that untouched directory, which the snapshot shares with
   /// the origin's head (A-395).
-  fn origin_whose_entries_changed_since_its_cut(store: &mut Store) -> (Volume, SnapshotId, InodeNo) {
+  fn origin_whose_entries_changed_since_its_cut(
+    store: &mut Store,
+  ) -> (Volume, SnapshotId, InodeNo) {
     let mut origin = Volume::create(store, config(ORIGIN_PREFIX)).unwrap();
     let root = origin.root_inode(store).unwrap();
     let inner = origin.mkdir_no(store, root, "d", DIR_MODE).unwrap();

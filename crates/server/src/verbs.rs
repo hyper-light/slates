@@ -10024,13 +10024,7 @@ pub(crate) fn admit_clone(
   let inherited = match inherited {
     Ok(inodes) => inodes,
     Err(refusal) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        refusal,
-      )));
+      return Err(Box::new(give_back(state, reservation, None, None, refusal)));
     }
   };
   let clone_allowance = inode_allowance(state, size).max(inherited);
@@ -22625,7 +22619,12 @@ mod clone_admission_tests {
   }
 
   /// Makes `count` empty files named `prefix-n` in `volume`'s root.
-  fn make_files(state: &mut ShardState, volume: slates_ipc::protocol::VolumeId, prefix: &str, count: u64) {
+  fn make_files(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    prefix: &str,
+    count: u64,
+  ) {
     on_core(state, volume, |core, store| {
       let root = core.root_inode(store).unwrap();
       for n in 0..count {
@@ -22637,11 +22636,18 @@ mod clone_admission_tests {
   }
 
   /// Removes the files `prefix-0` to `prefix-(count - 1)` from `volume`'s root.
-  fn remove_files(state: &mut ShardState, volume: slates_ipc::protocol::VolumeId, prefix: &str, count: u64) {
+  fn remove_files(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    prefix: &str,
+    count: u64,
+  ) {
     on_core(state, volume, |core, store| {
       let root = core.root_inode(store).unwrap();
       for n in 0..count {
-        core.unlink_no(store, root, &format!("{prefix}-{n}")).unwrap();
+        core
+          .unlink_no(store, root, &format!("{prefix}-{n}"))
+          .unwrap();
       }
     });
   }
@@ -22689,7 +22695,10 @@ mod clone_admission_tests {
         limit: BOUNDED_BYTES,
       };
       let fair = inode_allowance(state, size);
-      assert!(fair >= 2, "a share of at least two inodes leaves a file to remove: {fair}");
+      assert!(
+        fair >= 2,
+        "a share of at least two inodes leaves a file to remove: {fair}"
+      );
       let origin = made(state, "floored", size);
       on_core(state, origin, |core, _| {
         core.set_inode_allowance(fair + PAST_FAIR).unwrap();
@@ -22726,13 +22735,7 @@ mod clone_admission_tests {
   #[test]
   fn a_dynamic_clone_holds_a_version_slot_for_each_inode_its_snapshot_holds() {
     let (at_snapshot, count, hold) = crate::daemon::audit_on_shard(|state| {
-      let origin = made(
-        state,
-        "dynamic",
-        SizeClass::Dynamic {
-          max: DYNAMIC_BYTES,
-        },
-      );
+      let origin = made(state, "dynamic", SizeClass::Dynamic { max: DYNAMIC_BYTES });
       make_files(state, origin, "f", DYNAMIC_FILES);
       let (at_snapshot, clone) =
         snapshot_then_clone(state, origin, ("f", DYNAMIC_FILES - 1), "dynamic-clone");
