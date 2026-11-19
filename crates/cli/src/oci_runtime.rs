@@ -25,6 +25,9 @@ fn identity_text(rule: IdentityRule) -> &'static str {
     IdentityRule::ContainerIdsAsHostIds => {
       "container_ids_as_host_ids (no remapping; the kernel checks each id's permission bits, container root bypasses them)"
     }
+    IdentityRule::ContainerRootAsMountingUser => {
+      "container_root_as_mounting_user (run the container as its root, which the rootless engine maps to the user who mounted the volume; its other ids are not that user)"
+    }
   }
 }
 

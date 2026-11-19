@@ -4456,6 +4456,9 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > the rest of the handoff is the library's too, and the command line calls it: the engine's profile, judged before a
 > host mounts for it (`container_engine::engine_profile`, under `slates oci-runtime`), and the check just before the
 > runtime binds that the source is still the mount verified (`container::check_source`, under `slates oci-check`).
+> Since its third piece (`CONTRACT` = 48) the judge holds rootless podman on its own Linux host too, the profile
+> `a_rootless_container_reads_and_writes_the_volume_through_its_mount` ran through (2026-10-19): the container's root
+> is the user who mounted the volume, so a host runs its container as the container's root over an unshared mount.
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -9162,6 +9165,13 @@ it builds against the contract and adds to it rather than around it.
 > not in its shape, or a host that asks no engine); `container::check_source` and `ContainerBind::check_source`
 > judge whether a bind's source is still the mount verified, the table first and then the identity the kernel never
 > reuses, refusing `SourceFault`. `slates-bridge-oci` is linked on every platform, its judge's types the contract's.
+> **`CONTRACT` = 48 (A-520, third piece):** rootless podman holds its tested profile on its own Linux host. The
+> handshake speaks podman's own interface beside the Docker CLI's (`podman info`, one template: its operating system,
+> version, rootless and SELinux flags, and whether its service is remote), and the judge holds a local rootless podman
+> on Linux to T-4.13's rootless run (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`), its rules
+> `IdentityRule::ContainerRootAsMountingUser` (appended) and every hard link's name served at once; `Engine::Podman`
+> and `Endpoint::Local` are appended. A remote podman is refused `RemoteEngine`, one run as root `ProfileUntested`, a
+> labelling one `SelinuxLabelsUntested`, and every other rootless profile still `UserNamespaceUntested`.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -36620,3 +36630,73 @@ and `crates/cli/Cargo.toml` with `Cargo.lock` (the command line no longer links 
 - **Owed.** The judge's profiles for the engines slates has run since it was written (rootless podman, G-mount step 3,
   and podman's command line, both refused today), and Windows, which binds nothing (G-mount step 4) until a route into
   Docker Desktop's VM is measured (kiln's W9).
+
+### A-558 — A digest that finds another file at a clean entry's name leaves the inode on its file, as A-151 has it (2026-11-18, g230, UI goal 85, from g225's inventory; §4.15 "verified current", §4.5, A-151)
+Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-a-digest-pointed-an-open-base-inode-at-the-file-an-outsider-put-at-its-name.md`
+(new), and `crates/vfs/src/base.rs` (`verify_current`, `leave_name`, `Current`, `digest_begin`/`digest_begin_at`,
+`reopen_verified`, `DigestStats::replaced`, and its first unit test module).
+- **What was there.** `verify_current` opens a clean file's path afresh and compares its identity with the descriptor
+  the inode holds, the one check that sees a replacement racing the directory listing's validation. On a mismatch it
+  pointed the inode at the new file in place: it swapped in the new descriptor and adopted the new fingerprint. A handle
+  opened on the old file then read the outsider's bytes, and the name kept the old number. A-151 had made every relist
+  detach such an inode instead; this path was left as it was, with no test reaching it.
+- **The rule.** The inode leaves its name as a relist has it (`leave_name`): its descriptor is kept while a handle holds
+  it open (the opener reads the file it opened, POSIX), its directory's listing is reread, and the name leaves the node,
+  so the next lookup serves the disk's file as a new inode. `verify_current` answers `Current::Replaced`, counted
+  `DigestStats::replaced`, and so does an inode the validated listing itself took from its name, which was `NotFound`.
+  A digest by path looks the name up once more and digests the new entry; a second replacement is the disk changing it
+  now, refused `DigestUnverified`, as is a replacement between a digest's slices.
+- **Test.** `a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one` (`base.rs`' unit tests):
+  a base file opened as a mount's `OPEN` does, then its path digested with an outsider's replacement landing at each
+  seam call of the digest in turn, a scene each, until one lands after the digest. Each landing must leave the handle
+  reading the file it opened, the digest naming the outsider's file (or the opened one where the replacement landed
+  after the digest's last check) or refused `DigestUnverified`, never torn bytes, the name a new inode, and at least one
+  landing must reach `verify_current`'s identity check (`replaced` moved). Green on the Mac Studio (kiln r33, debug);
+  red once with the old in-place adoption restored (kiln r29): landing at call 4, the open handle read the outsider's
+  file and the name kept its number (`replaced` 1, so the path was reached).
+
+
+### A-520, third piece — Rootless podman holds its tested profile on its own Linux host, so a host runs containers under it (2026-11-19, g293, UI goal 88's kiln container engine, kiln goal 01a1f124; §4.6 A-9; AUD-29-67; `CONTRACT` = 48)
+Applied in the same change to: §4.6 (A-9's OCI record: the profiles held), §4.12's contract log (`CONTRACT` = 48), GAPS
+(the library's entry), `docs/library.md` (the profiles that hold evidence; what is owed), `docs/wip/oci-handoff.md`
+(§6's single profile superseded), `crates/bridge-oci/src/runtime.rs` (podman's interface and statement,
+`Interface`, `PodmanFacts`, `runtime_interface`, `podman_profile`; `Engine::Podman`, `Endpoint::Local` and
+`IdentityRule::ContainerRootAsMountingUser` appended; the judge's rootless-podman arm; the module's list of the profiles
+that hold evidence; and the tests), `crates/api/src/container_engine.rs` (podman's query and parser, the handshake
+routed by interface, and the tests), `crates/api/src/lib.rs` (`CONTRACT` = 48), and `crates/cli/src/oci_runtime.rs`
+(the new rule's words).
+- **Why.** kiln's container engine runs agents under the runtime a machine has, and on a Linux machine without
+  privilege that is rootless podman: R10's case. Slates had run a container workload through it by use
+  (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`, 2026-10-19; and G-mount step 3's map,
+  2026-10-25), yet its judge refused every rootless engine (`UserNamespaceUntested`) and podman's command line
+  (`RuntimeUnsupported`), so the library answered no profile for it.
+- **What podman is asked.** Podman's command line answers Docker's templates with its own fields and has no engine at
+  an endpoint, so the handshake speaks its own interface: one `podman info` template naming five fields of its
+  `libpod/define/info.go` (`Host.OS`, `Version.Version`, `Host.Security.Rootless`, `Host.Security.SELinuxEnabled`,
+  `Host.ServiceIsRemote`), small enough for the one page an answer may hold (its whole `info` is not), parsed as
+  hostile input. A podman whose service is remote (a `CONTAINER_HOST`, a podman machine's VM) is refused `RemoteEngine`,
+  as a Docker endpoint reached over a network is: a bind's source would resolve on the service's host. The Docker
+  endpoint's own admission still admits the Docker CLI's alone.
+- **The verdict.** A local rootless podman on Linux holds T-4.13's rootless leg: `IdentityRule::ContainerRootAsMountingUser`
+  (the container's root read, wrote, and was refused `EROFS` through a read-only bind as the user who mounted the volume,
+  over an unshared FUSE mount, which admits that user alone; so a host runs the container as its root) and
+  `HardLinkRule::EveryNameServedAtOnce` (the bind is the host's own FUSE mount with nothing shared between, as the Docker
+  Engine's measured). Podman run as root is `ProfileUntested` (no workload ran so); a labelling podman
+  `SelinuxLabelsUntested`; rootless podman on any other host, and every other rootless engine, `UserNamespaceUntested`.
+- **Tests.** `crates/bridge-oci/src/runtime.rs`: `podman_is_spoken_in_its_own_interface_and_never_at_a_docker_endpoint`,
+  `rootless_podman_on_its_own_linux_host_holds_its_tested_profile`,
+  `every_other_podman_and_every_other_rootless_profile_is_refused_typed`; `crates/api/src/container_engine.rs`:
+  `rootless_podman_on_linux_holds_its_tested_profile_asking_podman_alone` (podman asked its own statement alone) and
+  `every_other_podman_is_refused_typed` (with podman's hostile answers). `nothing_is_asked_past_a_refusal` names
+  nerdctl now, which the handshake still does not speak.
+- **Evidence (the Mac Studio, kiln, 2026-11-19, debug, load 15 to 22).** Red first, on a copy of this change made on
+  the Studio, never committed, whose interface left podman unspoken and whose judge refused every rootless profile,
+  as both were: `cargo test --locked -p slates-bridge-oci --lib runtime::` failed the three new tests, and `cargo
+  test --locked -p slates-api --lib -- container_engine:: contract_history` failed the two new podman tests and
+  passed the other six (run r47). Green with the change, the same copy restored from its commit: slates-bridge-oci's
+  whole `--lib` 8 passed; the same slates-api command 8 of 8, and its whole `--lib` 90 passed, 4 ignored. `cargo fmt
+  -p slates-api -p slates-cli -p slates-bridge-oci` laid the code out.
+- **Owed.** The profile's live check by use, filed for main: `slates oci-runtime podman` on a rootless Linux host
+  answering this evidence, the container's other ids refused through an unshared mount (the rule's second half, which
+  rests on FUSE's own rule today), and the hard-link probe through podman (the rule rests on the bind's mechanism, not
+  yet a podman run); podman's command line on macOS and Windows (a machine's VM), refused `RemoteEngine` until a run.
