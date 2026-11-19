@@ -41322,10 +41322,14 @@ unknown).
     - same-increment operations judged against the head: 2 failed.
   - The first green run failed one test, the cost test's own ordering: it read the retained figures, which walk the
     files for their sizes, after the walk counter. The ordering was fixed; the copy walked nothing.
-  - Merged with main (A-596's comments among its changes), at `5998d368a`, 04:46 UTC: 52 of 52 run, 2 ignored (main's),
-    7.66 s, `cargo fmt --check` clean. The census that run (generated cases differ run to run): 69 accepted, 619
-    refused, 9 from the root, 29 from an older version, 16 into their own source's tree, 84 refused for a changed
-    source, 12 keys changed beneath a copy. Red first for the reanchor fix: with `reanchor.rs` as it was before it, the
-    new test alone failed, `Err(NotLines)` where `Ok(Moved(0..4))` was due.
+  - Merged with main twice, A-596's comments and then A-612's removals among its changes. At `5998d368a` (04:46 UTC),
+    52 of 52 run, 2 of main's ignored. At `f5f1fdc05` (04:51 UTC, load 9 to 11), 58 of 58, 5.71 s, `cargo fmt --check`
+    clean, the census that run (generated cases differ run to run): 58 accepted, 594 refused, 5 from the root, 23 from
+    an older version, 9 into their own source's tree, 107 refused for a changed source, 11 keys changed beneath a copy.
+  - Red first for each interaction fix, on a copy of the merged tree:
+    - `reanchor.rs` as it was before its fix: the comment test alone failed, `Err(NotLines)` where `Ok(Moved(0..4))`
+      was due;
+    - `engine.rs` and `copy.rs` without `copied_in`: the same-increment test alone failed, the edited copied file
+      recorded as removed.
   - Main's: the integration suites (`crates/merge/tests/`, `ops_doc.rs` among them), clippy and `cargo xtask check`
     (the run-request queue).
