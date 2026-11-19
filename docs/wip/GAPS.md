@@ -79,6 +79,20 @@
 > a vector that reaches the checksums' collision refusal (no published collision begins with `PACK` or `\377tOc`).
 > A pack header's length is one number, A-582 part 3's `entry::PACK_HEADER_LEN`, which `pack` uses. Clippy, `xtask` and
 > the lint matrix over the change are main's (run requests).
+> **A-596 (2026-11-19, g267; shared piece 6, review records):** built in the engine and the metadata database. A
+> comment follows its lines by §4.16's position mapping (`Green::reanchor`, `crates/merge/src/engine/reanchor.rs`, over
+> the pure step of `crates/merge/src/review.rs`) and is outdated, never moved again, when a change meets them, text is
+> joined to them, or its file is removed or replaced. An approval binds to the version its approver saw; a policy
+> predicate makes it stale (`Reviews::staled_by`), and the standing ones are a policy's evidence. The records are six
+> operations on the repository's partition (`crates/db/src/review.rs`): guarded then applied, carried by the snapshot,
+> charged to the merge byte budget, each refusal typed. Tests on the Mac Studio (r504 red with the rules out, r529
+> green): `slates-merge --lib` 7 of 7 with the oracle against a diff of whole texts, `slates-db --lib` 11 of 11 with the
+> records' model test, `slates-server --lib error::` 3 of 3. Owed: the server's review verbs (write, move each comment
+> as its request gets a version, approve, stale by A-597's matcher, close with the request) and their typed wire
+> refusals (today `VolumeRefusal::Invalid`, which no verb emits yet); a comment's version held as a live reader of its
+> green's fold floor; following a renamed file with the engine's path remapping; the integration suites, clippy and
+> `xtask` over the change (main's; `crates/db/tests/wire_order.rs` against `Op` 90 to 95, published by hand). Two
+> verdict findings, below, are open.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) (2026-11-19; UI goals 91 and
@@ -172,20 +186,27 @@
 > history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive filesystem
 > applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on the Mac
 > Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store, §4.17.1
-> shared piece 3), and a large revision applied in slices (with the server). A-599 (2026-11-19, g234): ra_svn's
-> greeting and authentication (`handshake`), a state machine that does no I/O held to stock Subversion 1.15.0's own
-> sessions, `svn` against `svnserve` logged both ways by a relay (`crates/svn/fixtures/handshake/`), each answered byte
-> for byte as `svnserve` answered it but for the greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`,
-> `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's `hmac` and `md-5`, approved for this mechanism alone);
-> `cargo test --locked -p slates-svn --lib` 102 of 102 on the Mac Studio over main, the handshake's 28, red first on the
-> earlier draft (see A-599).
-> Owed from it: (1) the URL's canonical form, the repository it names and the root URL `repos-info` carries, as
-> `svnserve` derives them (`svn_uri_canonicalize_safe`; `find_repos`' `skip_scheme_part`, `repos_path_valid` and
-> `svn_path_remove_components`), with piece 7's connection task, which today gives the handshake those values; (2) a
-> limit on failed attempts per principal and per address, learned (`svnserve`'s loop has none, and neither has the
-> handshake), with §4.13's admission; (3) the CRAM-MD5 keyed contexts held across a restart without the secret, with
-> §4.13's secrets; (4) main's decision whether HMAC-MD5 moves into the vendored aws-lc-rs as a local change beside its
-> MD5, retiring `hmac` and `md-5`; (5) main's gates over the new module (clippy, the cross-target lints, `xtask`).
+> shared piece 3), and a large revision applied in slices (with the server).
+> A-605 (2026-11-19, g262, UI goal 92): mergeinfo, piece 9: the `svn:mergeinfo` value read and written as Subversion
+> reads and writes it, every refusal typed by its message; the range-list algebra transcribed from `mergeinfo.c`,
+> Subversion's inexact walk with inheritance compared kept as it is; inheritance and elision; and `get-mergeinfo` over
+> the index, its descendants found by the counts; held to `mergeinfo-test.c`'s vectors, the per-revision model and a
+> naive filesystem on generated histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio
+> (see A-605). Owed from it: `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra
+> with piece 7's location segments and log; the property's UTF-8 and CR checks with piece 7's property validation.
+> A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state machine that does no I/O held to
+> stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by a relay
+> (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the greeting's
+> `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's `hmac` and
+> `md-5`, approved for this mechanism alone); `cargo test --locked -p slates-svn --lib` 102 of 102 on the Mac Studio
+> over main, the handshake's 28, red first on the earlier draft (see A-599). Owed from it: (1) the URL's canonical form,
+> the repository it names and the root URL `repos-info` carries, as `svnserve` derives them
+> (`svn_uri_canonicalize_safe`; `find_repos`' `skip_scheme_part`, `repos_path_valid` and `svn_path_remove_components`),
+> with piece 7's connection task, which today gives the handshake those values; (2) a limit on failed attempts per
+> principal and per address, learned (`svnserve`'s loop has none, and neither has the handshake), with §4.13's
+> admission; (3) the CRAM-MD5 keyed contexts held across a restart without the secret, with §4.13's secrets; (4) main's
+> decision whether HMAC-MD5 moves into the vendored aws-lc-rs as a local change beside its MD5, retiring `hmac` and
+> `md-5`; (5) main's gates over the new module (clippy, the cross-target lints, `xtask`).
 > Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
 > head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
@@ -1792,6 +1813,34 @@
 > work to the same answer and head as the same work submitted, after a generated work merged ahead of it: 400 cases,
 > red-checked on each fix. `docs/bugs/2026-11-09-a-rebased-work-was-restated-into-other-bytes.md`.
 >
+> **A work based before its file was replaced is spliced into the replacement: found open (2026-11-19, A-596's oracle,
+> g267; §4.16 "Position mapping", "The verdict").** A work edits a file at its base; after that base the green unlinks
+> the file and makes it again, or renames another file onto it. The verdict finds the path's content present
+> (`merge_content`) and maps the work's ops through the path's deltas since the base. The replacement's delta is one
+> insert of the whole new file at offset 0 (`insert_whole`, from `merge_create` and `merge_rename`), so every op shifts
+> past the new bytes and is spliced at the new file's end: the edit of a file the work no longer has lands in one it
+> never saw, and the work is accepted. `fits_base` judged the ops against the file at the base only. Expected: a
+> conflict on the path (`DeleteModify`, as a work editing a path the green removed is answered). Red test, parked:
+> `a_work_based_before_its_file_was_replaced_conflicts` (`crates/merge/src/engine/reanchor/tests.rs`; Mac Studio,
+> kiln r504 and r529: accepted as version 3, the re-made file `<9>\nx`). Owed: the verdict refuses a work whose
+> path's content history records a removal or a replacement after its base, and the replacement's delta states the old
+> bytes' removal, so the position mapping of works and of review comments meets it. A-596's oracle bases no work before
+> its file's last replacement until then; a comment's step already refuses such a delta (`FileReplaced`). Bug record:
+> `docs/bugs/2026-11-19-a-work-based-before-its-file-was-replaced-is-spliced-into-the-replacement.md`.
+
+> **A truncate based before an append removes the appended bytes: found open (2026-11-19, A-596's oracle, g267; §4.16
+> "The verdict", "Splice").** A work removes a file's tail to its end, which the deriver composes as a truncate; after
+> its base another work appends at that end. The truncate's span ends where the append begins, so they meet only at its
+> edge and the verdict accepts, and the splice truncates to the end of the head's file (`apply`, `OpKind::Truncate`),
+> removing the append the work never saw. The version's delta still states the bytes the work saw, so a position mapping
+> through it misplaces what follows. Red test, parked: `a_truncate_based_before_an_append_keeps_the_appended_bytes`
+> (`crates/merge/src/engine/reanchor/tests.rs`; Mac Studio, kiln r529: accepted as version 2, the file `<1>\n`, the
+> appended `<3>\n` gone). Found by A-596's oracle in r504: a comment on an untouched first line was refused at that
+> version (`FileReplaced`, the delta states four bytes where eight left) while a diff kept the line. Owed: the truncate
+> removes only the bytes it saw at their mapped place, or conflicts with a change at its end; and its delta states what
+> left. A-596's oracle bases no truncating work behind the head until then. Bug record:
+> `docs/bugs/2026-11-19-a-truncate-based-before-an-append-removes-the-appended-bytes.md`.
+
 > **An edit after a rename was accepted and lost: fixed (2026-11-19, A-547, g225; found by perf, 2026-11-09, §4.16
 > "Composition at seal").** The verdict now maps the destination's ops through what changed the source since the work's
 > base and splices them into the bytes the rename moves (`Green::edits_after_rename`; an edit meeting such a change is
