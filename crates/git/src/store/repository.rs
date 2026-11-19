@@ -12,7 +12,8 @@ use crate::objects::tag::Tag;
 use crate::objects::tree::Tree;
 use crate::{Admission, to_u64};
 
-use super::fragment::{self, FragmentRefused, Learning, Named, Placed, Stored, ToEncode};
+use super::encoding::Encoding;
+use super::fragment::{self, FragmentRefused, Learning, Named, Placed, Stored};
 use super::learn::{Clock, Depth, Exchange, Levels, Rebuild, Window};
 use super::naming::{GitNaming, kind_of};
 use super::positions::Positions;
@@ -1370,10 +1371,7 @@ fn footprint(
 }
 
 /// A tree's entries that are objects of this repository: name, whether a subtree, id.
-type TreeEntries = BTreeMap<Vec<u8>, (bool, ObjectId)>;
-
-/// The objects to encode, split: commits, trees and tags, then blobs.
-type Split = (Vec<ToEncode>, Vec<ToEncode>);
+pub(super) type TreeEntries = BTreeMap<Vec<u8>, (bool, ObjectId)>;
 
 /// The slot of `green`'s version `version`'s fragments.
 fn fragments_slot(
@@ -1449,17 +1447,6 @@ fn keep_both(
   }
 }
 
-/// The order a fragment's objects are encoded in: by type, the largest first (a delta is tried
-/// against the larger objects before it), then by id.
-fn order(objects: &mut [ToEncode]) {
-  objects.sort_by(|a, b| {
-    a.kind
-      .cmp(&b.kind)
-      .then(b.bytes.len().cmp(&a.bytes.len()))
-      .then(a.id.cmp(&b.id))
-  });
-}
-
 /// The fragments' part (A-614 part 2; module docs and `fragment`'s).
 impl Repository {
   /// A version's record, or why there is none.
@@ -1475,7 +1462,11 @@ impl Repository {
   }
 
   /// An indexed object's type and bytes.
-  fn read(&self, store: &ContentStore, id: &ObjectId) -> Result<(Kind, Vec<u8>), StoreRefused> {
+  pub(super) fn read(
+    &self,
+    store: &ContentStore,
+    id: &ObjectId,
+  ) -> Result<(Kind, Vec<u8>), StoreRefused> {
     let (row, content) = self
       .indexed(store, id)
       .ok_or(StoreRefused::Missing { id: *id })?;
@@ -1486,7 +1477,7 @@ impl Repository {
   }
 
   /// A tree's entries that are objects of this repository.
-  fn tree_entries(
+  pub(super) fn tree_entries(
     &self,
     store: &ContentStore,
     tree: &ObjectId,
@@ -1507,45 +1498,8 @@ impl Repository {
     Ok(entries)
   }
 
-  /// For each tree or blob version `version` of `green` holds at a path where version
-  /// `version - 1` held another of its kind, that other: the bases REF deltas may name. The two
-  /// root trees are walked together, into the subtrees that differ only.
-  fn named_bases(
-    &self,
-    store: &ContentStore,
-    green: u64,
-    version: usize,
-  ) -> Result<BTreeMap<ObjectId, ObjectId>, StoreRefused> {
-    let mut named = BTreeMap::new();
-    let old = version
-      .checked_sub(1)
-      .and_then(|previous| self.tree(store, green, previous));
-    let (Some(new), Some(old)) = (self.tree(store, green, version), old) else {
-      return Ok(named);
-    };
-    let mut pending = vec![(new, old)];
-    while let Some((new, old)) = pending.pop() {
-      if new == old || named.insert(new, old).is_some() {
-        continue;
-      }
-      let olds = self.tree_entries(store, &old)?;
-      for (name, (is_dir, id)) in self.tree_entries(store, &new)? {
-        match olds.get(&name) {
-          Some((was_dir, was)) if *was_dir == is_dir && *was != id && is_dir => {
-            pending.push((id, *was));
-          }
-          Some((was_dir, was)) if *was_dir == is_dir && *was != id => {
-            named.insert(id, *was);
-          }
-          _ => {}
-        }
-      }
-    }
-    Ok(named)
-  }
-
   /// The object `id` names as a base a REF delta may name: its id, position and bytes.
-  fn named(&self, store: &ContentStore, id: &ObjectId) -> Result<Named, StoreRefused> {
+  pub(super) fn named(&self, store: &ContentStore, id: &ObjectId) -> Result<Named, StoreRefused> {
     let (row, content) = self
       .indexed(store, id)
       .ok_or(StoreRefused::Missing { id: *id })?;
@@ -1557,42 +1511,6 @@ impl Repository {
       position: row.position,
       bytes,
     })
-  }
-
-  /// The objects at `positions` to encode, split and each in its order, each with the object
-  /// `named` gives it and that object's bytes.
-  fn to_encode(
-    &self,
-    store: &ContentStore,
-    positions: &Positions,
-    named: &BTreeMap<ObjectId, ObjectId>,
-  ) -> Result<Split, StoreRefused> {
-    let (mut others, mut blobs) = (Vec::new(), Vec::new());
-    for position in positions.iter() {
-      let id = self
-        .id_at(store, position)
-        .ok_or(StoreRefused::NoPosition { position })?;
-      let (kind, bytes) = self.read(store, &id)?;
-      let named = match named.get(&id) {
-        Some(old) => Some(self.named(store, old)?),
-        None => None,
-      };
-      let object = ToEncode {
-        id,
-        position,
-        kind,
-        bytes,
-        named,
-      };
-      if kind == Kind::Blob {
-        blobs.push(object);
-      } else {
-        others.push(object);
-      }
-    }
-    order(&mut others);
-    order(&mut blobs);
-    Ok((others, blobs))
   }
 
   /// Counts a kept fragment's entries by how each holds its object.
@@ -1621,8 +1539,10 @@ impl Repository {
   }
 
   /// Encodes `green`'s version `version` as its two fragments (`fragment`'s docs), kept as
-  /// content: the owner calls it after the commit's answer, off the answer's path. A version is
-  /// encoded once. Refused, nothing is kept.
+  /// content, in one call: an [`Encoding`] driven to its end in one turn, for tests and tools. The
+  /// owner encodes a version a turn at a time under its quantum ([`Encoding::advance`], A-653
+  /// continued (2)), off the commit's answer's path. A version is encoded once. Refused, nothing is
+  /// kept.
   pub fn encode_fragments(
     &mut self,
     store: &mut ContentStore,
@@ -1630,24 +1550,70 @@ impl Repository {
     clock: &mut dyn Clock,
     exchange: Exchange,
   ) -> Result<(), StoreRefused> {
+    let encoding = Encoding::fragments(self, store, green, version)?;
+    encoding.finish(self, store, clock, exchange)
+  }
+
+  /// What `green`'s version `version` brought, still to encode as its fragments; `None` once they
+  /// are kept (A-653 continued (2)).
+  pub(super) fn unencoded(
+    &self,
+    green: u64,
+    version: usize,
+  ) -> Result<Option<Positions>, StoreRefused> {
     let record = self.version_record(green, version)?;
-    if record.fragments.is_some() {
-      return Ok(());
-    }
-    let brought = record.brought.clone();
-    let named = self.named_bases(store, green, version)?;
-    let (others, blobs) = self.to_encode(store, &brought, &named)?;
-    let mut learning = Learning {
+    Ok(record.fragments.is_none().then(|| record.brought.clone()))
+  }
+
+  /// `green`'s head version and every object it reaches: what its base pack is made from.
+  pub(super) fn head_reach(&self, green: u64) -> Result<(usize, Positions), StoreRefused> {
+    let none = StoreRefused::NoVersion { green, version: 0 };
+    let chain = self.chains.get(&green).ok_or(none)?;
+    let version = chain.versions.len().checked_sub(1).ok_or(none)?;
+    Ok((version, chain.reached.clone()))
+  }
+
+  /// The encoder's learned rules, this repository's own, with the owner's clock and exchange.
+  pub(super) fn learning<'a>(
+    &'a mut self,
+    exchange: Exchange,
+    clock: &'a mut dyn Clock,
+  ) -> Learning<'a> {
+    Learning {
       window: &mut self.window,
       levels: &mut self.levels,
       depth: self.depth.limit(),
       exchange,
       clock,
-    };
-    let objects = fragment::encode(others, &mut learning).map_err(StoreRefused::Encoding)?;
-    let blobs = fragment::encode(blobs, &mut learning).map_err(StoreRefused::Encoding)?;
+    }
+  }
+
+  /// Keeps a version's two encoded fragments as content and records them; a version whose
+  /// fragments were kept meanwhile keeps those. Refused, nothing is kept.
+  pub(super) fn keep_version(
+    &mut self,
+    store: &mut ContentStore,
+    (green, version): (u64, usize),
+    (objects, blobs): (fragment::Encoded, fragment::Encoded),
+  ) -> Result<(), StoreRefused> {
+    if self.version_record(green, version)?.fragments.is_some() {
+      return Ok(());
+    }
     let fragments = keep_both(store, objects, blobs)?;
     self.install(store, (green, version), fragments)
+  }
+
+  /// Keeps a base pack's two encoded parts as content in place of the old ones, made from
+  /// `green`'s version `version` in `ns` of the owner's time. Refused, the old base pack stays.
+  pub(super) fn keep_base(
+    &mut self,
+    store: &mut ContentStore,
+    (green, version): (u64, usize),
+    (objects, blobs): (fragment::Encoded, fragment::Encoded),
+    ns: u64,
+  ) -> Result<(), StoreRefused> {
+    let parts = keep_both(store, objects, blobs)?;
+    self.install_base(store, green, BasePack { version, parts }, ns)
   }
 
   /// Records a version's fragments and charges their entries; refused, the fragments' content is
@@ -1679,7 +1645,9 @@ impl Repository {
 
   /// Makes `green`'s base pack again from every object its current head reaches, self-contained
   /// (offset deltas only), as two parts (commits, trees and tags; then blobs), and teaches the
-  /// rebuild rule its measured time. Refused, the old base pack stays.
+  /// rebuild rule its measured time, in one call: an [`Encoding`] driven to its end in one turn,
+  /// for tests and tools. The owner makes it a turn at a time under its quantum
+  /// ([`Encoding::advance`], A-653 continued (2)). Refused, the old base pack stays.
   pub fn rebuild_base(
     &mut self,
     store: &mut ContentStore,
@@ -1687,30 +1655,8 @@ impl Repository {
     clock: &mut dyn Clock,
     exchange: Exchange,
   ) -> Result<(), StoreRefused> {
-    let chain = self
-      .chains
-      .get(&green)
-      .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
-    let version = chain
-      .versions
-      .len()
-      .checked_sub(1)
-      .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
-    let reached = chain.reached.clone();
-    let start = clock.now_ns();
-    let (objects, blobs) = self.to_encode(store, &reached, &BTreeMap::new())?;
-    let mut learning = Learning {
-      window: &mut self.window,
-      levels: &mut self.levels,
-      depth: self.depth.limit(),
-      exchange,
-      clock,
-    };
-    let objects = fragment::encode(objects, &mut learning).map_err(StoreRefused::Encoding)?;
-    let blobs = fragment::encode(blobs, &mut learning).map_err(StoreRefused::Encoding)?;
-    let ns = learning.clock.now_ns().saturating_sub(start);
-    let parts = keep_both(store, objects, blobs)?;
-    self.install_base(store, green, BasePack { version, parts }, ns)
+    let encoding = Encoding::base(self, green)?;
+    encoding.finish(self, store, clock, exchange)
   }
 
   /// Records a base pack in place of the old one, charges it, and teaches the rule its time.

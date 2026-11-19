@@ -3349,9 +3349,11 @@ impl Green {
   /// The home now of the node at `path` at version `base`: the file or IPC node a hard link there
   /// names, or the one there, while it has not changed since the base (A-646). A node changed or
   /// removed since, or moved away (its link changed, its file removed), is gone for a work based
-  /// before: delete against modify. A path holding a directory or a symlink is a type change, and
-  /// a path holding nothing is delete against modify, whether its node was removed since or none
-  /// stood there at the base (a link no work can make: `link(2)` answers `ENOENT`).
+  /// before: delete against modify. So is a file or IPC node made at `path` after the base where
+  /// none stood (A-676): it is no node the work saw, and only a forged link names it. A path
+  /// holding a directory or a symlink is a type change, and a path holding nothing is delete
+  /// against modify, whether its node was removed since or none stood there at the base (a link no
+  /// work can make: `link(2)` answers `ENOENT`).
   fn node_home(&self, path: &str, base: u64) -> Result<String, MergeConflictClass> {
     if let Some(home) = self.hardlinks.get(path) {
       if self.changed_after(path, base) {
@@ -3360,7 +3362,7 @@ impl Green {
       return Ok(home.clone());
     }
     if self.content.contains_key(path) || self.specials.contains_key(path) {
-      if self.file_removed_since(path, base) {
+      if self.file_removed_since(path, base) || !self.node_stood_at(path, base) {
         return Err(MergeConflictClass::DeleteModify);
       }
       return Ok(path.to_owned());
@@ -3369,6 +3371,15 @@ impl Green {
       return Err(MergeConflictClass::TypeChanged);
     }
     Err(MergeConflictClass::DeleteModify)
+  }
+
+  /// Whether a file or an IPC node stood at `path` at version `base` ([`Green::node_home`],
+  /// A-676), read off the histories by the one history rule and the copies, and never by copying
+  /// the file: a file a copy brought after the base stood nowhere then. Exact at and above the fold
+  /// floor, as [`Green::special_kind_changed`]'s read of the base is; the service folds only below
+  /// the oldest base a live reader names.
+  fn node_stood_at(&self, path: &str, base: u64) -> bool {
+    self.content_len_at(path, base).is_some() || self.special_at(path, base).is_some()
   }
 
   /// Merges an xattr set; a differing intervening value for the same `(path, name)` conflicts.

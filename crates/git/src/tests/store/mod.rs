@@ -16,6 +16,7 @@ use crate::store::{
   Progress, Push, PushRefused, Repository, StoreRefused, Turn, Upload, UploadCounters, Versions,
 };
 
+mod encoding;
 mod fragments;
 mod hook_view;
 mod oracle;

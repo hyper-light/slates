@@ -2823,18 +2823,12 @@ fn a_foreign_principal_cannot_drive_another_accounts_merge() {
       path: "d".to_owned(),
     },
   }));
-  assert_foreign_merge_refused(intruder.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::submit(work, Vec::new())));
   assert_foreign_merge_refused(intruder.call(&RequestBody::Rebase { work }));
   // The green never advanced under the foreign calls; the owner still drives its own submit to success.
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = owner.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  })
+  } = owner.call(&RequestBody::submit(work, Vec::new()))
   else {
     panic!("the owner submits its own work");
   };
@@ -2871,10 +2865,7 @@ fn a_shared_green_is_read_and_worked_by_the_principal_it_names() {
   ));
   let (green, work) = owner_green_and_work(&mut owner);
   assert!(matches!(
-    owner.call(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    }),
+    owner.call(&RequestBody::submit(work, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -2932,10 +2923,7 @@ fn the_sharer_reads_and_works_the_green(sharer: &mut Client, green: VolumeId) {
     }),
     ReplyBody::Edited
   ));
-  let submitted = sharer.call(&RequestBody::Submit {
-    work: own,
-    evidence: Vec::new(),
-  });
+  let submitted = sharer.call(&RequestBody::submit(own, Vec::new()));
   assert!(
     matches!(
       submitted,
@@ -2993,10 +2981,7 @@ fn merge_submit_scenario() {
   // A merges on the fast path; the chain advances.
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: a,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(a, Vec::new()))
   else {
     panic!("submit a");
   };
@@ -3034,10 +3019,7 @@ fn merge_submit_scenario() {
   // B, still based on version 0, touched the same file — it conflicts rather than clobbering A.
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: b,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(b, Vec::new()))
   else {
     panic!("submit b");
   };
@@ -3083,10 +3065,7 @@ fn merge_modify_scenario() {
   };
   edit(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3103,10 +3082,7 @@ fn merge_modify_scenario() {
   edit(&mut client, modw, 0, 5, b"world");
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: modw,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(modw, Vec::new()))
   else {
     panic!("submit");
   };
@@ -3156,10 +3132,7 @@ fn merge_lagging_scenario() {
   let (seed, _) = work(&mut client, "seed");
   create_file(&mut client, seed, "base", b"x");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3173,10 +3146,7 @@ fn merge_lagging_scenario() {
   create_file(&mut client, b, "b", b"b-content");
   // B submits first, advancing the green to version 2; A now lags at base 1.
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: b,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(b, Vec::new())),
     ReplyBody::Submitted {
       version: Some(2),
       ..
@@ -3185,10 +3155,7 @@ fn merge_lagging_scenario() {
   // A, based on version 1, touched a different file — it merges past version 2 as version 3.
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: a,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(a, Vec::new()))
   else {
     panic!("submit a");
   };
@@ -3263,10 +3230,7 @@ fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId)
 
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: tail,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(tail, Vec::new()))
   else {
     panic!("submit");
   };
@@ -3286,10 +3250,7 @@ fn rebase_conflict_part(client: &mut Client, green: slates_ipc::protocol::Volume
   edit_f(client, winner, 0, 2, b"PP");
   edit_f(client, loser, 0, 2, b"QQ");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: winner,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(winner, Vec::new())),
     ReplyBody::Submitted {
       version: Some(4),
       ..
@@ -3333,10 +3294,7 @@ fn merge_rebase_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"0123456789");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3345,10 +3303,7 @@ fn merge_rebase_scenario() {
   let front = work_over(&mut client, green, "front");
   edit_f(&mut client, front, 0, 0, b"AB");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: front,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(front, Vec::new())),
     ReplyBody::Submitted {
       version: Some(2),
       ..
@@ -3402,10 +3357,7 @@ fn declare_metadata_part(client: &mut Client, green: slates_ipc::protocol::Volum
   );
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: meta,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(meta, Vec::new()))
   else {
     panic!("submit meta");
   };
@@ -3444,10 +3396,8 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   let other = set(client, "xattr-c", b"BB");
 
   // The first sets the attribute; it advances the green to version 3, storing "AA".
-  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::Submit {
-    work: first,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::submit(first, Vec::new()))
+  else {
     panic!("submit xattr-a");
   };
   assert_eq!(version, Some(3), "the first xattr set is version 3");
@@ -3455,10 +3405,7 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   // The second, based on 2, sets a different value — it conflicts against the stored "AA".
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: other,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(other, Vec::new()))
   else {
     panic!("submit xattr-c");
   };
@@ -3534,10 +3481,7 @@ fn merge_declare_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3860,10 +3804,7 @@ fn edit_at(
 
 /// Submits `work` with no evidence and asserts it was accepted as `version`.
 fn submit_accepted(client: &mut Client, work: slates_ipc::protocol::VolumeId, version: u64) {
-  let reply = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let reply = client.call(&RequestBody::submit(work, Vec::new()));
   match reply {
     ReplyBody::Submitted {
       version: Some(got),
@@ -3876,10 +3817,7 @@ fn submit_accepted(client: &mut Client, work: slates_ipc::protocol::VolumeId, ve
 
 /// A `Submit` request with no evidence.
 fn submit_of(work: slates_ipc::protocol::VolumeId) -> RequestBody {
-  RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  }
+  RequestBody::submit(work, Vec::new())
 }
 
 /// An `Edit` request creating `f` on `work`.
@@ -4076,10 +4014,7 @@ fn role_evidence_part(client: &mut Client) {
     refusal_of(client, &submit_of(sw)),
     Refusal::EvidenceRequired
   );
-  let reply = client.call(&RequestBody::Submit {
-    work: sw,
-    evidence: vec![[7u8; 32]],
-  });
+  let reply = client.call(&RequestBody::submit(sw, vec![[7u8; 32]]));
   assert!(
     matches!(
       reply,
@@ -4700,10 +4635,7 @@ fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them(
   };
   assert_eq!(edit(&mut client, b"before"), ReplyBody::Edited);
   // Submitted, so the green holds the file and a new work's seeded copy of it costs bytes.
-  let submitted = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = client.call(&RequestBody::submit(work, Vec::new()));
   assert!(
     matches!(
       submitted,
