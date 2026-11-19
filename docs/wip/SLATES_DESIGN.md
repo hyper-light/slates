@@ -38534,3 +38534,25 @@ the rebuild), `crates/vfs/src/delta.rs` (`VolumeDelta::live_counter`, `delta`, `
   Studio (debug, 2026-11-19, load 19 to 23): `slates-vfs --lib` 90 of 90 (1 ignored), `slates-bridge-core --lib` 40 of
   40; red with the unrecorded counters dropped at the rebuild: the first test failed at its naming, its refusal holding;
   red with the ceiling's check removed: the hostile image rebuilt.
+
+### A-585 — A holder whose store is lost answers no read and accepts no record under its old id (2026-11-19, UI goal 81 (kiln dbe13f39, g250), part "Chaos across real processes", the failure half; §4.8 "Promotion and takeover"; D-26)
+Applied in the same change to: GAPS (the live-shipping entry's real-process chaos line) and `crates/db/src/ledger.rs`
+(`Cohort::lose_store`, `Holder::lost`; the takeover and the offer skip a lost holder).
+- **The fault.** A volume's store fails suddenly under a replica. The holder's records and its fence are gone.
+- **The rule it needs.** Such a holder answers no phase-one read and accepts no record under its old id. Its nothing
+  must never count toward a takeover's quorum as a promise. At `f = 2`, with a record committed on `f + 1` of the five
+  candidates, one of those holders losing its store and another host down leaves the record on one holder. A read of
+  the store-lost holder and the two that never held it would make a quorum that misses the record. The server meets
+  the rule by construction: each start takes a fresh member identity (`Daemon::member_identity`), so a host that
+  restarts without its store is a new member no cohort names until it is placed. The register's simulation now states
+  the rule and checks it.
+- **The invariants checked.** NoLoss and Continuity: the record is adopted. TotalOrder: the next record commits at the
+  next position. StaleNeverCommits: the superseded owner commits nothing more. Agreement: no position is held by a
+  quorum with two values. Also a client that disconnects mid-write: its write is kept whole or dropped whole by the
+  next owner, never split, and every committed write survives.
+- **Tests.** `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: the first takeover read three
+  empty logs and dropped the committed record) and `a_write_its_client_left_is_kept_or_dropped_whole`
+  (`crates/db/src/ledger.rs`). Kiln on the Mac Studio, 2026-11-19, debug: `slates-db` `ledger::` 3 of 3. Red once on a
+  mutated copy whose takeover read the store-lost holder: the takeover succeeded with an empty log (`Ok(0)`).
+- **Owed (main's).** The real-process runs of both faults: a replica's store destroyed under the live log, and a client
+  killed mid-write (run-requests.md).

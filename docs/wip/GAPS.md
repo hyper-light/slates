@@ -5335,7 +5335,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; since 2026-11-17 the credit
 > is the whole state's bytes, not a fixed two entries, A-200 amended, the entry at the top of this ledger); a candidate's copy kept across its own
 > restart; real-process chaos
-> (partitions, injected latency, volume failure, client disconnect). The owner's `put_wal` is its `Local` records,
+> (partitions, injected latency, volume failure, client disconnect). The volume-failure and client-disconnect faults
+> are in the register's simulation since A-585 (g250, 2026-11-19, goal 81): `ledger::Cohort::lose_store` (a store lost
+> under a replica: the holder answers no read and accepts no record under its old id, as a fresh-id restart does), with
+> `a_holder_whose_store_is_lost_answers_nothing_under_its_old_id` (red before: a store-lost holder answering with nothing
+> completed a quorum that missed a committed record at `f = 2`) and `a_write_its_client_left_is_kept_or_dropped_whole`;
+> the real-process runs of both faults are main's (run-requests.md). The owner's `put_wal` is its `Local` records,
 > resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
 > `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
 > waits up to the 100 ms record period before its commit starts.
