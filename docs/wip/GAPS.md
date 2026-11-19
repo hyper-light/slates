@@ -329,6 +329,13 @@
 > owner shard once its head names it, or a listener on each shard); a bearer credential's expiry handed with its
 > principal for LFS's actions (A-629 part 2); Mercurial's and Subversion's sites; the MCP edge onto this engine; the
 > live `git clone` over HTTPS (main's, once upload-pack serves).
+> **A-625 part 2, continued (2026-11-19, g299 under main's rulings):** no wait is unbounded: before a phase has learned,
+> RFC 6298's first RTO from the connection's own handshake round trip (`slates_rt::tcp::TcpStream::round_trip`, the
+> kernel's record on Linux, macOS and Windows), the edge's TLS work added, then the handshake's duration, floored by the
+> clock's measured granularity. A wait past its bound marks its connection overdue; the listener reaps the most overdue
+> only while every seat is taken and a new connection needs one, the reap teaching nothing and backing the phase off
+> once per bound (g294's SSH rule). `slates-server --lib vcs_` 69 of 69 and `slates-rt --lib round_trip` 2 of 2 on the
+> Mac Studio, red first twice (3 + 2, then 8 of 8). Owed: the Linux and Windows readers compiled and run.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -356,6 +363,20 @@
 > its path's previous object and similar objects OFS deltas, the window, zlib level, depth and rebuild point learned; the
 > base pack self-contained; packs read back through A-608's reader in the oracle; eleven mutations red. Owed of part 2:
 > the fetch's fragment choice (piece 7), cross-fragment chain depth, slicing, shared base packs.
+> **A-639 (2026-11-19, g083; piece 7's packs from fragments):** `slates-git` (`store::upload`) streams upload-pack's
+> pack from A-615's answer, taken through a trait (`Answered`): the runs from their fragments (filtered, the want always),
+> the walk's objects covered by whole kept parts (a clone so the base pack and the fragments after it; a filter that
+> sends no blobs taking the parts without blobs whole), the rest encoded one object at a time with the learned rules.
+> A part is copied byte for byte when the client reads it as kept, entry by entry otherwise (an offset delta's distance
+> measured again, its base named by id without `ofs-delta`, a delta whose base the client cannot read sent whole), so a
+> client without `thin-pack` gets no base it lacks and the pack holds exactly the answer's objects. Streamed in units of
+> at most a window until the owner's quantum is spent, no borrow held between turns; a base pack in two parts; a push's
+> positions by type; `ContentStore::window_at` reads a window by its index. Held to an oracle over generated histories
+> (every answered pack read back through A-608's reader as the wanted closure less the client's, each object once),
+> thirteen mutations red (`cargo test -p slates-git --lib`, the store's 32 of 32, Mac Studio). This closes A-614 part
+> 2's "the fetch's fragment choice" and A-615's "the pack from the runs' fragments and the chosen objects". Owed: a part
+> only partly wanted read entry by entry; a delta search for an object past a window; the fragments' encoding sliced;
+> the stream wired into `fetch` (A-640); main's run, `git index-pack --strict` over the stream's packs.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
@@ -577,16 +598,22 @@
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
 > stub), the three captured sessions served whole. **Built (A-649 part 1):** every key of the index tagged by its kind
 > (`L`, `N`, and `O` for a push's object rows, `HgIndex::commit_objects`), so no log row can meet an object's id
-> whatever a path's length; red first (2 failed), 251 of 251. Owed, in order, after §4.17.1's seven pieces: (4, rest)
-> read serving: `obsolete`'s `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1,
-> held deltas in place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the
-> index's kept heads in place of the walks over the whole view; (5, rest) pushes: the changegroup verified and its
-> changesets classified into works (lines, bookmarks), each through A-618's builder over the flat manifests' paths; the
-> landing, each moved green appended at the position the push read and the greens the checks read compared there
-> (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt entry and A-635's verdict over
-> several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the pushkey namespaces' compare
-> and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole
-> in one call, bounded by the admission), and the bundle read in slices too (part 1 holds it whole);
+> whatever a path's length; red first (2 failed), 251 of 251. **Built (A-641 part 2):** the changegroup verified against
+> what the repository holds as 7.2's `addgroup` and `server.validate` check it, paths audited as 7.2's `pathauditor`
+> audits them (transcribed: the first audit, written from the design's summary, took `a/.hg/b`, which 7.2 refuses), and
+> a line's move made A-618's work over its flat manifests laid out as directories named by their content; held to stock
+> 7.2's bundles (each branch head landed holding exactly what `hg cat` recorded) and hand-made changegroups breaking
+> each rule; red nine ways. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
+> `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
+> texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
+> the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
+> (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index, part 2's
+> refusals in Mercurial's words; the landing, each moved green appended at the position the push read and the greens the
+> checks read compared there (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt
+> entry and A-635's verdict over several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the
+> pushkey namespaces' compare and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's
+> inflater runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds
+> it whole);
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
@@ -696,7 +723,9 @@
 > the caller's room, red-checked six ways, the fixtures recorded again for every command still owed; its third slice
 > (g297), `list`, `svn_repos_list`'s walk streamed, red-checked eight ways; its fourth slice (g297),
 > `get-location-segments`, red-checked five ways; its fifth slice (g297), `get-deleted-rev`, red-checked five ways.
-> Owed from it: `log` with merged revisions, `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> Its sixth slice, in part (g297): `log` without merged revisions (a log asking for them refused until built),
+> red-checked ten ways; reads asks A-616's one walk of copy roots. Owed from it: `log`'s merged revisions,
+> `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
@@ -733,8 +762,10 @@
 > alone on main from its seed (see A-628). Owed from it: the export in format 3 (`svnadmin dump --deltas`'s bytes need Subversion's
 > deltifier, `text_delta.c` and `xdelta.c`, ported); the wiring (a `CreateRepository` repository's records on its
 > shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
-> shard's budget); main's: clippy and `xtask` over the module. Found by it, for A-553's owner: the index refuses a
-> replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion comes first. Designed
+> shard's budget); main's: clippy and `xtask` over the module. Found by it and fixed by A-652 (2026-11-19, g264): the
+> index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
+> comes first; it takes it now as the copy FSFS makes, the index's and the verdict's oracles holding such replacements
+> (`cargo test -p slates-svn --lib --locked` 367 of 367 on the Mac Studio, red first 5 of 367). Designed
 > from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the head,
 > FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
@@ -792,8 +823,9 @@
 > A-616 part 2, its third slice (2026-11-19, g234): one report command's exchange on ra_svn (`report::exchange`), the
 > reporter, drive and writer joined as `accept_report` and `editorp.c` join them, the early answer, `close-edit`'s and
 > `abort-edit`'s answers and the client's errors read as `svnserve` reads them; all 34 recorded report commands
-> replayed against `svnserve`'s bytes; red six ways. Owed of A-616 now: the server's connection task that runs it
-> (piece 7's); the deltas of changed texts through A-652's generator; a recorded session of copy sources.
+> replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
+> them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
+> A-652's generator.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

@@ -6,18 +6,20 @@ use std::convert::Infallible;
 
 use slates_vcs::{ContentStore, Naming};
 
+use crate::negotiation::Filter;
 use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId, name_of};
 use crate::objects::tree::{Entry, Mode, compare, write_entries};
 use crate::store::learn::{Clock, Exchange};
 use crate::store::rows::{self, CommitRow, ObjectRow};
 use crate::store::{
-  COLLISION_WORDS, Entries, Found, GitNaming, Incoming, Move, NameRefused, Positions, Push,
-  PushRefused, Repository, StoreRefused,
+  Answered, COLLISION_WORDS, Entries, Found, GitNaming, Incoming, Move, NameRefused, Positions,
+  Progress, Push, PushRefused, Repository, StoreRefused, Turn, Upload, UploadCounters, Versions,
 };
 
 mod fragments;
 mod oracle;
 mod protect;
+mod upload;
 
 /// Shape: the window the tests' content store holds content in.
 const WINDOW: usize = 1 << 10;
@@ -149,6 +151,97 @@ fn push_and_move(
     push.abandon(store).unwrap();
   }
   committed
+}
+
+/// The tests' answer to a fetch (A-639): its runs and objects, the client's capabilities, and its filter.
+#[derive(Clone, Debug)]
+struct Answer {
+  runs: Vec<Versions>,
+  objects: Vec<u64>,
+  thin: bool,
+  ofs: bool,
+  filter: Option<Filter>,
+}
+
+impl Answer {
+  /// `objects` one by one, for a client that reads offset deltas and asked no thin pack.
+  fn objects(objects: &Positions) -> Answer {
+    Answer {
+      runs: Vec::new(),
+      objects: objects.iter().collect(),
+      thin: false,
+      ofs: true,
+      filter: None,
+    }
+  }
+}
+
+impl Answered for Answer {
+  fn runs(&self) -> &[Versions] {
+    &self.runs
+  }
+
+  fn objects(&self) -> &[u64] {
+    &self.objects
+  }
+
+  fn thin(&self) -> bool {
+    self.thin
+  }
+
+  fn ofs_delta(&self) -> bool {
+    self.ofs
+  }
+
+  fn admits(&self, kind: Kind, size: u64) -> bool {
+    self
+      .filter
+      .as_ref()
+      .is_none_or(|filter| filter.admits(kind, size, 0))
+  }
+}
+
+/// Shape: the turns a test's stream may take before the test calls it stuck.
+const TURNS: u64 = 1 << 24;
+
+/// The pack that answers `answer`, streamed in turns of `quantum` nanoseconds of the tests' clock, and what the stream
+/// did; a refusal fails the test.
+fn streamed(
+  repository: &Repository,
+  store: &ContentStore,
+  answer: Answer,
+  quantum: u64,
+) -> (Vec<u8>, UploadCounters) {
+  let mut upload = Upload::new(answer, repository);
+  let mut clock = Ticks(0);
+  let mut pack = Vec::new();
+  for _ in 0..TURNS {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: EXCHANGE,
+      quantum_ns: quantum,
+    };
+    if upload.advance(repository, store, turn, &mut pack).unwrap() == Progress::Done {
+      return (pack, upload.counters());
+    }
+  }
+  panic!("the stream took {TURNS} turns");
+}
+
+/// The pack of `objects` one by one, in one turn.
+fn pack_of(repository: &Repository, store: &ContentStore, objects: &Positions) -> Vec<u8> {
+  streamed(repository, store, Answer::objects(objects), u64::MAX).0
+}
+
+/// D(k) of `green`'s `versions`, joined.
+fn brought_by(
+  repository: &Repository,
+  green: u64,
+  versions: impl IntoIterator<Item = usize>,
+) -> Positions {
+  versions.into_iter().fold(Positions::new(), |all, version| {
+    all.union(repository.brought(green, version).unwrap())
+  })
 }
 
 /// The ids of a set of positions.
