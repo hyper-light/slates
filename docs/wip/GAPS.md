@@ -560,7 +560,7 @@
 > its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21
 > minutes. A hold now ends at the failover SLO, refused `DurabilityPending` and recorded as the request's outcome; the
 > writer still waits through a shorter silence. Test:
-> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again`.
+> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
@@ -4285,7 +4285,7 @@
 >   the membership horizon on the wall and ends only with a look begun after it, the direct route asked again after
 >   each round, within the failover SLO (`fleet.owner_location.gave_up`, `.budget_spent`, `.slo_ended`;
 >   `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget`,
->   `the_failover_slo_ends_a_forwards_location_budget`). Two longer budgets did not land: clients' polls and the horizon
+>   `the_failover_delay_ends_a_forwards_location_budget`). Two longer budgets did not land: clients' polls and the horizon
 >   followed by the control shard's two driver waits each run a forward's location to the failover SLO, the polls when
 >   rounds wait on a silent peer and the waits when the control shard is busy. On main as of `9addf53ef` every rewrite
 >   made the five-node takeover test fail some runs, where that base's own budget passed it; on main as of `bfc34cace`

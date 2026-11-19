@@ -7734,7 +7734,7 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > owner, never claimed durable, and a consumer runs the verb again under a new id (slates-api's
 > `RetryCause::DurabilityPending`, CONTRACT 22). A retry that joined a request's wait is answered with it, judged by the
 > request's first hold. Held by
-> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again`
+> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`
 > (`crates/server/tests/fleet.rs`: both survivors refuse the owner's register records, so a new live volume's head never
 > places; the write refused after 10.03 and 10.08 s, the same request answered the same refusal, and the write sent again
 > answered `FsDone` once the refusals lifted).
@@ -26994,7 +26994,7 @@ Applied in the same change to:
 - `crates/server/src/verbs.rs`: `locate_within_budget` (the give-up counted on the caller's side of the loop) and
   `locate_within_horizon`, and the counts `fleet.owner_location.gave_up`, `.budget_spent` and `.slo_ended`.
 - Tests (`crates/server/tests/fleet.rs`): `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` and
-  `the_failover_slo_ends_a_forwards_location_budget` (new), and
+  `the_failover_delay_ends_a_forwards_location_budget` (new), and
   `a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, judged by the location's own counts
   (clients' rewrite).
 - GAPS: the R3 debt of `LIVENESS_BUDGET_NS` (class B, the location budget).
@@ -27023,7 +27023,7 @@ Applied in the same change to:
 - **Evidence.** On GitHub's ubuntu-latest, macos-latest and windows-latest runners (2026-11-18):
   `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` failed 3 of 3 on each over main's budget,
   the location never looking again (`diag-g255-loc-red-1`, `-red-3`), and passed 3 of 3 on each with this form, as did
-  `the_failover_slo_ends_a_forwards_location_budget`, the false-death test and the location round's session-out test
+  `the_failover_delay_ends_a_forwards_location_budget`, the false-death test and the location round's session-out test
   (`-green-4`, run 44260988795); the five-node takeover test, 16 of 16 over main as of `bfc34cace` (above). Over
   A-315 and main as of `1e8f4a49e` (`diag-g255-land2-1`, run 44273659893), on each of the three runners the four
   location tests 3 of 3 each, the five-node takeover test and the left-out-head takeover test 6 of 6 each, and the
@@ -29399,7 +29399,7 @@ Applied in the same change to:
 - `crates/server/src/live_ship.rs`: `Awaiting::held_since_ns`, `judge_held` (at the period's visit to a live volume),
   `judge_held_destroys` (once a period on each shard), `held_past` (a request's entries judged by its first hold),
   counters `fleet.live.held_gave_up` and `fleet.destroy.held_gave_up`. `crates/server/src/verbs.rs`: the refusal's name.
-- Tests: `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again`
+- Tests: `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`
   (`crates/server/tests/fleet.rs`); `a_reply_held_past_its_durable_bound_is_a_retry` (`crates/api/src/error.rs`).
 - GAPS: the entry of 2026-11-18.
 - **What was there.** A deferred verb's reply ended only once its log was durable where its publication put it (or its
@@ -36612,3 +36612,9 @@ GAPS).
   with the delay at three windows a map is owed at two and a half and overdue at three and a half, and overdue at two
   and a half once the delay is two); red with today's rule (overdue at two and a half, past the old two seconds). The
   Linux wiring is filed for main's build, with the pmem flows that reclaim a copy (`crates/cli/tests/pmem.rs`).
+- **Names.** The three tests that still said `failover_slo` after A-525 deleted the placeholder now name the failover
+  delay they test: `a_held_replys_wait_ends_at_the_failover_delay_from_its_hold` (`crates/bridge-core/src/durable_bound.rs`,
+  whose docs and reason line said "failover SLO" too),
+  `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again` and
+  `the_failover_delay_ends_a_forwards_location_budget` (`crates/server/tests/fleet.rs`); their citations here and in
+  GAPS follow.
