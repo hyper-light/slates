@@ -44502,11 +44502,13 @@ fixtures `lock-steal.xml` and five request heads).
   `svn lock --force` with markup in its comment, `svn unlock` and `svn unlock --force` (each after the PROPFIND that
   finds the token), `svn info`; the bodies equal the earlier fixtures byte for byte, and the heads are the fixtures.
   Every source read is in the notes' §1 with its hash.
-- **Tests and the run.** 34 tests in `dav::drive` and `dav::locking`. `cargo test --locked -p slates-svn --lib` passed
-  351 of 351 on the Mac Studio (2026-11-19), fmt clean. Red on a copy with six mutations (replay's `dir` named
-  `directory`, no revision written 0, LOCK's blank line dropped, a held lock not 423, the clamp under `Timeout` gone,
-  a body's namespaces in tag order): seven tests failed; the namespace mutation passed until its test declared two
-  namespaces on one element, which a red run then showed failing.
+- **Tests and the run.** 33 tests in `dav::drive` (12) and `dav::locking` (21). `cargo test --locked -p slates-svn
+  --lib` on the Mac Studio, 2026-11-19: 351 of 351 on the branch (65078aed2), then 357 of 357 on the tree merged with
+  main (585458a4c); `cargo fmt -p slates-svn -- --check` clean. Red on a copy with six mutations (replay's `dir` named
+  `directory`, no revision written 0, LOCK's blank line dropped, a held lock not 423, the floor under `Timeout` gone,
+  a body's namespaces in tag order): 7 of 351 failed, each mutation's tests among them but the last's, whose test
+  declared one new namespace on an element, where both orders agree. With two declared, the namespace mutation alone
+  failed that test on the merged tree (1 of the 62 `dav` tests).
 - **Owed.** The update-report's resource walk (`S:resource-walk`, a pre-1.2 client's); the facts' revision as
   `dav_svn__get_safe_cr` gives it, since `svn_fs_node_created_rev` names a path that did not exist yet for a node
   beneath a copy not changed since (A-616's facts); main's live capture against Apache with `mod_dav_svn`.
