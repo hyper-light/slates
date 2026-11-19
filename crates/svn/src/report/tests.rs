@@ -661,6 +661,7 @@ fn trunk_context(session: &Session, room: usize) -> Context<'_> {
     session_path: "/trunk",
     youngest: YOUNGEST,
     readable: true,
+    authenticated_now: false,
     room,
     item_bytes: 1 << 16,
     most_open: MOST_OPEN,

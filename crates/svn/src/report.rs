@@ -512,7 +512,7 @@ pub(crate) fn join_fspath(base: &str, relpath: &str) -> String {
 
 /// `url` decoded as `svn_path_uri_decode` decodes it: each `%` with two hexadecimal digits the byte
 /// they name, and `+` a space past a `?`.
-fn uri_decode(url: &str) -> Vec<u8> {
+pub(crate) fn uri_decode(url: &str) -> Vec<u8> {
   let bytes = url.as_bytes();
   let mut decoded = Vec::with_capacity(bytes.len());
   let mut query = false;
@@ -781,6 +781,10 @@ pub struct Context<'a> {
   pub youngest: Revision,
   /// For `update`: whether the principal may read the target (`must_have_access`).
   pub readable: bool,
+  /// For `update`: whether the client has just authenticated for this command (`must_have_access`
+  /// asked, `serve.c` 826-836), so that no trivial auth request is written before the answer: the
+  /// authentication's request was the command's.
+  pub authenticated_now: bool,
   /// The most bytes the report may hold.
   pub room: usize,
   /// The most bytes one report command's item may take.
@@ -826,7 +830,9 @@ impl Reporter {
       ReportFailure::NotAuthorized.write(out)?;
       return Ok(Begun::Failed(ReportFailure::NotAuthorized));
     }
-    write_trivial_auth(out)?;
+    if !context.authenticated_now {
+      write_trivial_auth(out)?;
+    }
     let anchor = canonical_fspath(context.session_path);
     let target_path = match (&request.url, request.kind) {
       (Some(url), RequestKind::Switch | RequestKind::Diff) => {
