@@ -81,7 +81,9 @@ pub enum WatchState {
   Unavailable,
 }
 
-/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy.
+/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. A refusal the host gives a number is
+/// typed by the numbering it is in (A-527): an errno (`Unavailable`) or a Win32 error code (`Win32`), so a reader that
+/// tells refusals apart by an errno's number never reads a Win32 code as the errno of the same number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostError {
   /// The entry does not exist (any more).
@@ -92,8 +94,13 @@ pub enum HostError {
   NotFile,
   /// A handle the host no longer holds.
   StaleHandle,
-  /// The host cannot serve it: the errno.
+  /// The host cannot serve it: the errno, POSIX's numbering (Linux, macOS, and a Windows refusal the writer gives the
+  /// kind of an errno the landing tells apart: a name that exists, a full disk, a verb the filesystem lacks).
   Unavailable(i32),
+  /// The host cannot serve it: the Win32 error code (Windows), in Win32's own numbering, never read as an errno (A-527):
+  /// 17 is `ERROR_NOT_SAME_DEVICE` there and `EEXIST` in POSIX, 122 `ERROR_INSUFFICIENT_BUFFER` there and Linux's
+  /// `EDQUOT`.
+  Win32(u32),
   /// The path lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon serves;
   /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
   /// deadlock avoided by.
@@ -108,6 +115,7 @@ impl std::fmt::Display for HostError {
       Self::NotFile => f.write_str("not a regular file"),
       Self::StaleHandle => f.write_str("stale host handle"),
       Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
+      Self::Win32(code) => write!(f, "host unavailable (Win32 error {code})"),
       Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
     }
   }

@@ -790,6 +790,8 @@ impl Daemon {
       ServerError::Vfs(slates_vfs::error::VfsError::BaseUnavailable(match error {
         slates_vfs::host::HostError::Unavailable(code)
         | slates_vfs::host::HostError::OwnMount(code) => code,
+        // A Win32 code as its own number (A-527).
+        slates_vfs::host::HostError::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
         _ => 0,
       }))
     })?;
@@ -3825,11 +3827,6 @@ impl Daemon {
     if let Some(watchdog) = self.watchdog.as_ref() {
       watchdog.stopping();
     }
-    // Every replica of a green leaves before its owner is given up (A-457, A-273 step 5a; `slates_mem::sealed`,
-    // "Lifetimes"), while the shards still run to carry the registrations home.
-    if self.runtime.is_some() {
-      self.give_back_replicas();
-    }
     if let Some(runtime) = self.runtime.take()
       && let Err(error) = runtime.shutdown()
     {
@@ -3844,47 +3841,6 @@ impl Daemon {
     // window, then left to the process's end, never waited for without end.
     if let Some(mut log_writer) = self.log_writer.take() {
       log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
-    }
-  }
-}
-
-impl Daemon {
-  /// Closes every shard's green replicas and waits until no shard holds a registration of one, a replica, or a
-  /// registration owed home (A-457, A-273 step 5a; `crate::green_replicas::close`, `outstanding`), within an
-  /// observation's budget: an owner dropped with a replica registered keeps its blocks to the process's end
-  /// (`slates_mem::sealed::dropped_with_readers`). A shard that cannot be asked, and what is left at the budget, are
-  /// logged, never silent.
-  fn give_back_replicas(&self) {
-    for shard in &self.shards {
-      if let Err(error) = self.observe(Some(*shard), crate::green_replicas::close) {
-        slates_machine::log_line!(
-          "slates-server: stopping: shard {} gives back no replica: {error}",
-          shard.0
-        );
-      }
-    }
-    let started = slates_machine::clock::monotonic_ns();
-    loop {
-      let outstanding = self
-        .shards
-        .iter()
-        .filter_map(|shard| {
-          self
-            .observe(Some(*shard), crate::green_replicas::outstanding)
-            .ok()
-        })
-        .fold(0usize, usize::saturating_add);
-      if outstanding == 0 {
-        return;
-      }
-      if slates_machine::clock::monotonic_ns().saturating_sub(started) > OBSERVE_BUDGET_NS {
-        slates_machine::log_line!(
-          "slates-server: stopping with {outstanding} green replica registrations not given back: their owners keep \
-           their blocks to the process's end"
-        );
-        return;
-      }
-      std::thread::yield_now();
     }
   }
 }
@@ -4551,6 +4507,8 @@ async fn init_shard(
     learned_fuse: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]
     own_nfs_mounts: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "macos")]
+    unmount_watch: false,
     #[cfg(windows)]
     winfsp_mounts: std::collections::BTreeMap::new(),
     #[cfg(windows)]
@@ -4613,7 +4571,6 @@ async fn init_shard(
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
     told_times: crate::told::ToldTimes::default(),
-    unmount_times: crate::learned_wait::LearnedWait::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
@@ -4702,7 +4659,6 @@ async fn init_shard(
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
-    green_replicas: crate::green_replicas::GreenReplicas::default(),
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
@@ -4823,6 +4779,10 @@ async fn init_shard(
   // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
   let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(keeper);
+  // The NFS mounts this shard learned from its predecessor end their attachments when the kernel lets them go, as a
+  // mount bound later does (A-511): the shard's watch of the kernel's unmounts starts once it holds an own mount.
+  #[cfg(target_os = "macos")]
+  let _ = state::with_state_counted(crate::own_nfs::watch);
   Ok(slices.finish())
 }
 
@@ -6779,7 +6739,7 @@ mod limits {
 #[cfg(test)]
 pub(crate) use tests::{
   audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
-  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
+  audit_on_shard_configured, hold_busy, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -7025,17 +6985,6 @@ mod tests {
   ) -> T {
     daemon
       .observe(daemon.shards.first().copied(), history)
-      .expect("the observation completed")
-  }
-
-  /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
-  pub(crate) fn observe_at<T: Send + 'static>(
-    daemon: &super::Daemon,
-    partition: usize,
-    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
-  ) -> T {
-    daemon
-      .observe(daemon.shards.get(partition).copied(), history)
       .expect("the observation completed")
   }
 

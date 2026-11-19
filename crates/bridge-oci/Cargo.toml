@@ -11,12 +11,16 @@ description = "The OCI attachment form (§4.6 A-9, RQ-20; Phase 4): the kernel's
 [dependencies]
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# `getfsstat(MNT_NOWAIT)`: the one FFI call for which no safe wrapper exists (rustix has no mount-table
-# query); it returns the kernel's cached table without contacting any filesystem.
+# `getfsstat(MNT_NOWAIT)` and the unmount watch's `kevent` on `EVFILT_FS` (A-511): the two FFI calls for which no
+# safe wrapper exists (rustix has no mount-table query and no `EVFILT_FS`); the first returns the kernel's cached
+# table without contacting any filesystem.
 libc = { workspace = true }
+# The unmount watch's kqueue, made through rustix's safe wrapper (A-511).
+rustix = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# A read-only open and read of `/proc/self/mountinfo`, the kernel's own table (a query, never a write).
+# A read-only open and read of `/proc/self/mountinfo`, the kernel's own table (a query, never a write), and the
+# unmount watch's epoll instance over it (A-511).
 rustix = { workspace = true }
 
 [lints]
