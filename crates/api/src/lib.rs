@@ -17,7 +17,9 @@
 //!   overlay's drift as typed entries.
 //! - *Serving* ([`mount`], [`Instance::serve_shards`], [`Instance::serve_vhost_user`]): a host mount on bare metal, or
 //!   a descriptor a VMM takes; and a host mount bound into a container ([`container`], A-520), the entry the host's OCI
-//!   runtime performs, verified in the kernel's mount table.
+//!   runtime performs, verified in the kernel's mount table, the container engine's profile judged first
+//!   ([`container_engine`]) and the bind's source checked again just before the runtime binds it
+//!   ([`container::check_source`]).
 //! - *The chosen-path launcher* ([`exec`], A-370): a volume shown at a path one command names, in a namespace of its
 //!   own, served by the host's own executable; where the host's AppArmor restricts unprivileged user namespaces, it uses
 //!   slates' AppArmor profile only when its user opts in ([`AppArmor`]).
@@ -68,6 +70,7 @@
 
 pub mod asynchronous;
 pub mod container;
+pub mod container_engine;
 pub mod error;
 pub mod exec;
 pub mod grant;
@@ -87,7 +90,8 @@ pub mod start;
 pub mod volume;
 
 pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
-pub use container::ContainerBind;
+pub use container::{ContainerBind, SourceFault};
+pub use container_engine::{EngineFault, EngineProfile};
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HoldersUnread, HostFault, Invalid,
   IssuerFault, KindMismatch, Missing, MountFault, MountHolders, MountMissing, MoveTarget, Note,
@@ -257,9 +261,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// ([`S3Credentials`], whose `Debug` shows its access key id alone): the store's endpoint, the bucket's region, the
 /// bucket, the prefix and the addressing, each refused by its kind where no request could read it ([`NameRefused`]:
 /// [`EndpointFault`], [`BucketFault`], [`PrefixFault`]) (Mantle's CP-T10.5, A-524; 2026-11-19).
+/// 47: the rest of the container handoff as library calls (A-520; until then the command line's `slates oci-runtime` and
+/// `slates oci-check` alone): [`container_engine::engine_profile`] asks the runtime's engine for its profile and judges
+/// it, answering an [`EngineProfile`] (the endpoint, the profile, and the [`container_engine::TestedProfile`] it holds)
+/// or an [`EngineFault`] (the judge's [`container_engine::ProfileRefusal`] before any profile, or `Untested` with the
+/// profile it refused; an engine unreachable; an answer too large or not in its shape; or a host that asks no engine);
+/// [`container::check_source`] and
+/// [`ContainerBind::check_source`] judge whether a bind's source is still the mount verified, by the kernel's table
+/// and the identity it never reuses, refusing [`SourceFault`]; `slates-bridge-oci` is linked on every platform, its
+/// types the contract's (kiln's container engine, kiln goal 01a1f124; 2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 46;
+pub const CONTRACT: u32 = 47;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

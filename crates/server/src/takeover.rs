@@ -1564,8 +1564,10 @@ pub(crate) fn ready_objects(
       named_nothing: take.named_nothing.get(object).unwrap_or(&none_named),
       local: local_promises.then_some(local),
     };
-    let cohorts = regional.recovery_cohorts(departed, *object);
-    let current = regional.current_cohorts(departed, *object);
+    // The cohorts the round waits on, narrowed to the carried retirements that ranked the object into this one
+    // (A-556); the successors stay ranked over every recovery cohort.
+    let cohorts = regional.readiness_cohorts(departed, *object);
+    let current = regional.readiness_current_cohorts(departed, *object);
     match readiness(
       &cohorts,
       &current,
