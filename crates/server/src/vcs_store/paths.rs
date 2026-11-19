@@ -92,7 +92,7 @@ pub(crate) struct GreenStep {
 
 impl GreenStep {
   /// The history naming `at` alone: what a value's key is read through.
-  fn named(at: GreenAt) -> GreenStep {
+  pub(crate) fn named(at: GreenAt) -> GreenStep {
     GreenStep {
       at,
       parent: None,
@@ -186,7 +186,10 @@ pub(crate) fn advance(state: &mut ShardState, green: DbVolumeId, version: u64) {
   };
   let key = super::green_key(green);
   let step = (
-    GreenAt { green: key, version },
+    GreenAt {
+      green: key,
+      version,
+    },
     GreenAt {
       green: key,
       version: previous,
@@ -468,7 +471,9 @@ fn put_change(
 ) -> Result<Change, StepRefused> {
   let mut change = Change::new();
   for (name, file) in files {
-    let entry = file.map(|file| put_file(content, &file, held)).transpose()?;
+    let entry = file
+      .map(|file| put_file(content, &file, held))
+      .transpose()?;
     change.insert(name, entry);
   }
   Ok(change)
