@@ -14164,9 +14164,11 @@ and export by landing).
 > `( success ( ) )` alone (A-599's `handshake::Server::for_command`), then the command runs again as the principal
 > proved, with no trivial auth request, or is refused "Authorization failed" (170001): for `commit` and for `update`'s
 > target. Held to every recorded commit connection (`crates/svn/fixtures/commit/`, 16 and bob's race) replayed from its
-> first byte through the connection, every item byte for byte, and to `svnserve`'s own authentication for `lock-many`
-> (the reporter's `lock-a` session), byte for byte. Owed: the lock verbs; the read commands' authentication for one
-> command with their authorization (A-606); the daemon's commit once A-655 part 2b lands.
+> first byte through the connection, every item byte for byte but one property list `svnserve` wrote in its hash
+> table's order (`import`'s `get-dir`, compared as a set and counted; A-656 continued (1)), and to `svnserve`'s own
+> authentication for `lock-many` (the reporter's `lock-a` session), byte for byte. Owed: the lock verbs; the read
+> commands' authentication for one command with their authorization (A-606); the daemon's commit once A-655 part 2b
+> lands.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -47419,9 +47421,12 @@ Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `cr
   alice's `close-edit`) replayed from its first byte through a connection tunnelled as its user, bob's lock taken with
   its recorded token, every hook passing, each accepted work committed through A-655 part 2a's step into the owner's
   records (`Revision::of_work` at the instant `svnserve` recorded, the records' `commit`): `svnserve`'s greeting less
-  `svndiff1`, every item byte for byte, the youngest the recorded 13. `svnserve`'s own authentication for one command,
-  `lock-many`'s in the reporter's recorded `lock-a` session: the request, the challenge and the success alone, byte for
-  byte, through `Server::for_command`.
+  `svndiff1`, every item byte for byte but one, the youngest the recorded 13. The one: `import`'s `get-dir` before its
+  commit, whose entry properties `svnserve` wrote in its hash table's order (`get_props` fills the hash, `serve.c`
+  1089-1118 at `d434dc14`, and `svn_ra_svn__write_proplist` walks it, `marshal.c` 799-814) where slates writes them
+  sorted; a property list in another order is compared as a set and counted, the count held to 1. `svnserve`'s own
+  authentication for one command, `lock-many`'s in the reporter's recorded `lock-a` session: the request, the
+  challenge and the success alone, byte for byte, through `Server::for_command`.
 - **Tests.** Handshake: four (that recording, CRAM-MD5 and `EXTERNAL` for one command, no mechanism the caller's
   error). Connection: the commit replay; a commit answered with the revision made; an anonymous commit authenticated
   for write and refused as not made, the client's commands dropped until `abort-edit`; a commit refused after

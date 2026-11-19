@@ -9,8 +9,9 @@
 //! repository has none; each work the connection accepts is committed through A-655's step
 //! (`Revision::of_work` at the instant `svnserve` recorded, then the owner's records' `commit`),
 //! and what the connection writes must be what `svnserve` wrote, its greeting less `svndiff1` and
-//! every item byte for byte, but for the property lists `svnserve` writes in APR's seeded hash order
-//! (a read before `import`'s commit), compared as sets and counted.
+//! every item byte for byte, but for a property list `svnserve` wrote in its hash table's order
+//! (`get_props` fills the hash, `serve.c` 1089-1118 at `d434dc14`, and `svn_ra_svn__write_proplist`
+//! walks it, `marshal.c` 799-814): those are compared as sets, and counted.
 //! Bob's lock is taken as `svnserve` took it, with its recorded token, the lock verbs not being
 //! served yet; the read-only connections (the checkouts, the updates, `import.2`) are the reads'
 //! and the reporter's suites'.
@@ -74,9 +75,9 @@ const REPLAYED: usize = 17;
 /// The youngest revision once every recorded commit is made (`sessions.txt`: thirteen commits).
 const YOUNGEST: Revision = 13;
 
-/// The items `svnserve` wrote with a property list in another order than slates' sorted one, APR's
-/// seeded hash order: compared as sets, and counted so the count cannot grow unseen. One: the
-/// entry properties of `import`'s `get-dir` before its commit.
+/// The items `svnserve` wrote with a property list in another order than slates' sorted one, its
+/// hash table's order (`get_props`, `serve.c` 1089-1118): compared as sets, and counted so the
+/// count cannot grow unseen. One: the entry properties of `import`'s `get-dir` before its commit.
 /// Shape: measured on Windows x86_64 (jupiter), 2026-11-19.
 const IN_HASH_ORDER: usize = 1;
 

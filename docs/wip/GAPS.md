@@ -986,7 +986,8 @@
 > step's words, the client's commands then dropped until `abort-edit`; the crate's tests commit through A-655 part 2a's
 > step, the daemon refuses every work 200007 until part 2b), and `svnserve`'s authentication for one command
 > (`must_have_access`) for `commit` and `update`, held to every recorded commit connection and to `svnserve`'s own for
-> `lock-many`, byte for byte. Corrected: part 1 refused an anonymous `update` of an unreadable target at once, where
+> `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s `get-dir`,
+> compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at once, where
 > `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH tunnel's entry
 > point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's commit once
 > A-655 part 2b lands; the lock verbs; the read commands' authentication for one command with their authorization
