@@ -3,10 +3,11 @@
 //! `slates-http-edge`'s engine (A-625 part 1) over its socket; every wait on a client learned per phase ([`waits`]); the
 //! connections served at once and each request's room derived from the shard's budget ([`Bounds`]); and a site that
 //! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's ([`svn`],
-//! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, answered by `slates_svn::dav::site`) on the same
-//! edge, the daemon's handing each request to its tool's ([`ToolSites`], A-680 part 2a: Mercurial's for a query naming a
-//! command, as hgweb tells a wire request, git's for every other). A reply's status is `200` unless the exchange names
-//! another as its reply begins ([`Exchange::reply_status`]: a PROPFIND's `207`, or a refusal its body explains).
+//! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, and the `log-report`, answered by
+//! `slates_svn::dav::site`) on the same edge, the daemon's handing each request to its tool's ([`ToolSites`], A-680
+//! part 2a: Mercurial's for a query naming a command, as hgweb tells a wire request, git's for every other). A reply's
+//! status is `200` unless the exchange names another as its reply begins ([`Exchange::reply_status`]: a PROPFIND's
+//! `207`, or a refusal its body explains).
 //!
 //! **The listener** ([`serve`]) is a task on its shard and owns its connections: each is a child task
 //! (`slates_rt::futures::spawn_child`), detached so its slot is given back as soon as it ends, and cancelled and joined
@@ -54,12 +55,12 @@
 //!
 //! **Built since:** the daemon starting an edge (A-625 part 3: its address, the operator's identity, an authenticator
 //! over §4.13's principals and keys, the repositories' lookup on their partitions; `--vcs-http` from the CLI); git's
-//! receive-pack through the push driver on the repository's owner shard (A-654 part 3); Mercurial's site on the daemon's
-//! edge, each repository's served view lent from its store on its owner shard (A-680 part 2a).
+//! upload-pack served from each repository's store on its owner shard, lent from A-662's map by
+//! `crate::vcs_store::upload::ShardStores` (A-682); receive-pack through the push driver on the repository's owner shard
+//! (A-654 part 3); Mercurial's site on the daemon's edge, each repository's served view lent from its store on its
+//! owner shard (A-680 part 2a).
 //!
-//! **Owed** (GAPS, the §4.17 entry): upload-pack's server half
-//! handed the stores (A-615, A-662), which answers `503` until then;
-//! Mercurial's pushes (`unbundle`) through the push driver (A-680 part 2b);
+//! **Owed** (GAPS, the §4.17 entry): Mercurial's pushes (`unbundle`) through the push driver (A-680 part 2b);
 //! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
 //! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
 //! `501` until then; Subversion's site composed into the daemon's beside git's and Mercurial's ([`ToolSites`]); the MCP
@@ -795,7 +796,7 @@ enum Flow {
 /// `overdue` is called, once, and the same work goes on until it ends or its task is reaped (never dropped mid-way, so a
 /// write past its deadline loses no byte it handed the kernel). The work's output and whether it was overdue; refused
 /// only where no deadline can be armed (off a shard).
-async fn awaited<F: Future>(
+pub(crate) async fn awaited<F: Future>(
   work: F,
   deadline_ns: u64,
   mut overdue: impl FnMut(),

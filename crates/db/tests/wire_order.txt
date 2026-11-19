@@ -64,6 +64,10 @@ LandingState 8 Refused
 LandingState 9 Aborted
 LogName 0 Green
 LogName 1 State
+LoggedChange 0 Joined
+LoggedChange 1 Named
+LoggedChange 2 Left
+LoggedChange 3 Changed
 MemberOrigin 0 Root
 MemberOrigin 1 Branch
 NameChange 0 Bind
