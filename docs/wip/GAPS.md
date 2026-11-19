@@ -1174,6 +1174,20 @@
 >   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`). Owed:
 >   naming the processes that hold a busy mount; Linux's busy refusal typed (`fusermount3` reports no error number);
 >   the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
+> - **a host mount bound into a container, built 2026-11-18 (A-520, `CONTRACT` = 44; kiln's container engine, kiln goal
+>   01a1f124):** the OCI form (§4.6 A-9) was the wire's and the command line's alone (`slates attach --oci-source`), so
+>   a host that drives slates through the library alone (kiln) could not bind a volume into a container.
+>   `Instance::bind_into_container(volume, source, destination, intent)` and the seam's verb answer a `ContainerBind`
+>   (the binding's attachment and the `OciBinding` entry the runtime performs), refused typed as the daemon refuses the
+>   form; the source is spelled by its folder's real path, never by looking into the mount; the simulator binds the
+>   mounts it recorded in the daemon's order of checks and ends a bind with its mount. Unit tests: `container::tests`
+>   (a binding taken only from an answer that established one; the source's spelling) and `sim::tests` (the entry and
+>   its lifetime, every refusal with none holding room; Windows' refusal, on Windows' own build). By use, with a kernel
+>   mount: `a_mounted_volume_binds_into_a_container_through_the_library` (`crates/api/tests/api.rs`,
+>   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. Owed (A-520's next pieces): the
+>   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
+>   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
+>   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
 > - built 2026-11-18: the serving clause's DAX half through the library: the Shards stream end `serve_shards` hands
 >   keeps a `dax=inode` guest's `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` at `INIT`, with the host's page as the
 >   alignment, and marks a file of a DAX range or more `FUSE_ATTR_DAX` and a small one not
@@ -2409,10 +2423,16 @@
 >   placement names only the successor and the volume's current content candidates (`takeover::adopted_served`), the
 >   healer replacing an adopted volume's placement that names a member outside them rather than restoring it
 >   (`fleet.heal.adopted_replaced`). Tests: `a_round_confirms_only_once_its_adopted_volumes_are_served_from_its_placement`
->   (`crates/server/src/takeover.rs`, red with the gate removed) and the healer's decision test. Owed, in order: holders
->   let a stale copy's content go on such a confirmation or its completion record (the regional layout bumped, so a
->   mixed fleet cannot read an older build's confirmation as certified); an owner's settle certifies content the same
->   way (A-508's holders then drop content too).
+>   (`crates/server/src/takeover.rs`, red with the gate removed) and the healer's decision test. **Fixed (A-538, g250,
+>   2026-11-19): holders use it.** A stale copy judged on a certified confirmation or its completion record, its holder
+>   outside the successor's placement, lets go the content its own stale records name (`fleet.takeover.released_certified`),
+>   keeping only a placement ahead of them; each retirement and record carries its certification (regional layout 6), and
+>   a configuration an older build wrote (layout 5) is read with every takeover uncertified, whose holders keep the
+>   content as before. Tests: `a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation`
+>   (red before), the A-335 test on an uncertified takeover (red with an uncertified takeover's content let go),
+>   `a_layout_five_configuration_reads_its_takeovers_as_uncertified`, `a_takeover_this_build_makes_certifies_its_content`.
+>   Owed: an owner's settle certifies content the same way (A-508's holders then drop content too); a settled line's
+>   lagging holder still keeps content (it judges no successor's placement).
 > - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
 >   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
 >   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
@@ -4049,10 +4069,12 @@
 >   of the shard. Now the list is read, never taken (`verbs::unbuilt_works`), each ask is made once more after a lost
 >   answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
 >   nothing (`verbs::install_replayed_work`), where it once made the work afresh and charged it twice;
->   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). **Still owed
->   (A-513):** a work whose asks go unanswered twice keeps its record and stays unbuilt until the daemon's next start;
->   a retry after admission, and its verbs answering `Unpublished` (A-247's word) rather than `NotFound` meanwhile, are
->   not built. The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
+>   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). Its remainder closed
+>   by A-533 (2026-11-19, g225): a work whose asks go unanswered twice keeps its record and answers `Unpublished`, left
+>   unrecorded so its resend runs the verb again (`verbs::not_started`), and its shard asks its green's owner again as
+>   clients are let in, by messages each shard runs when it next runs, never a timer (`verbs::ask_owners_to_replay`;
+>   `an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt`,
+>   `an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it`). The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
 >   its exchange and answers copies of its ends, kept on the owner shard until the exchange settles the claim, retired
 >   once handed or claimable again;
 >   `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice`).
@@ -4100,8 +4122,11 @@
 >   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
 >   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
 >   C-b: the reply deadline's other users,
->   each a wait that cannot see the departure yet: a delivery's read (Linux: the socket's readability), the macOS
->   route's claim steps and the CLI's MCP edge, which borrows the reply deadline for its own. The synchronous send's
+>   each a wait that cannot see the departure yet: the macOS route's claim steps and the CLI's MCP edge, which borrows
+>   the reply deadline for its own. A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
+>   descriptor until its reply deadline and gave up `DeadlineExceeded` there; it now waits on the control socket itself,
+>   readable or hung up, with no clock (`ClientEnd::wait_delivery`), and ends `ChannelLost` once the daemon is gone with
+>   nothing delivered (`a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock`, Linux, main's to run). The synchronous send's
 >   wait for a slot on a full ring since A-523 (2026-11-18, g251b): it spun for a whole reply deadline (a second),
 >   asked the daemon's liveness at each one and paced its tries at a tenth of it; it now spins for the client's wake
 >   estimate, then parks, each pause twice the last and never past the next look, the looks on A-443's doubling
