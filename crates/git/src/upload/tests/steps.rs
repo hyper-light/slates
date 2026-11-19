@@ -23,18 +23,19 @@ fn stepped<P: PackSource>(
   source: &mut P,
 ) -> (Vec<u8>, Vec<usize>) {
   let served = serving(fixture, &REFS, MAIN_REF);
+  let mut admission = Admission::new(u64::MAX);
   let mut answer = serve(
     &served,
     Version::V2,
     Asked::Request(request),
     source,
-    &mut Admission::new(u64::MAX),
+    &mut admission,
   );
   let mut bytes = Vec::new();
   let mut steps = Vec::new();
   loop {
     let before = bytes.len();
-    let written = answer.write(&served, source, &mut bytes, room);
+    let written = answer.write(&served, source, &mut admission, &mut bytes, room);
     steps.push(bytes.len() - before);
     if written == Written::End {
       return (bytes, steps);
@@ -64,6 +65,7 @@ impl PackSource for Counting {
     &mut self,
     _: &Served<'_>,
     at: &mut usize,
+    _: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
@@ -98,11 +100,12 @@ impl PackSource for Called {
     &mut self,
     served: &Served<'_>,
     at: &mut usize,
+    admission: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
     self.calls += 1;
-    self.counting.write(served, at, out, room)
+    self.counting.write(served, at, admission, out, room)
   }
 }
 
@@ -113,18 +116,19 @@ fn calls_per_step(fixture: &served::Served, room: usize, len: usize) -> Vec<usiz
     counting: Counting { len },
     calls: 0,
   };
+  let mut admission = Admission::new(u64::MAX);
   let mut answer = serve(
     &served,
     Version::V2,
     Asked::Request(FETCH_CLONE_REQUEST),
     &mut source,
-    &mut Admission::new(u64::MAX),
+    &mut admission,
   );
   let mut bytes = Vec::new();
   let mut calls = Vec::new();
   loop {
     let before = source.calls;
-    let written = answer.write(&served, &mut source, &mut bytes, room);
+    let written = answer.write(&served, &mut source, &mut admission, &mut bytes, room);
     calls.push(source.calls - before);
     if written == Written::End {
       return calls;

@@ -22,7 +22,22 @@
 //!    their ids wants no head, and its blobs are found so.
 //! 3. **The rest**, which no part covered (a version not yet encoded), encoded in position order by the fragments'
 //!    encoder: a delta against an earlier one of its kind within the learned window and depth, at the learned level,
-//!    the rules copied from the repository when the stream begins.
+//!    the rules copied from the repository when the stream begins. An object past a window is searched by the same
+//!    rules against the earlier ones past a window of its kind, the nearest first, as many as the learned window
+//!    tries, through [`super::Search`] a window at a time (**Slices**), when the request's admission can hold the
+//!    search (A-653 continued (4)): the object's bytes, the largest candidate's, the search's index and delta
+//!    ([`super::Search::held_most`]), and the best delta kept while another candidate is searched, all charged with a
+//!    [`Hold`] before the first byte is read and given back once the entry is sent. Where the admission cannot hold
+//!    it, the object is sent whole and counted (`loose_unsearched`). git holds the same three for a trial and counts
+//!    them as its window's memory: the target's bytes, the source's and the source's index (`pack-objects.c` at
+//!    v2.50.1, `try_delta`, lines 2774, 2803 and 2813). It searches every object of a type it can read but those past
+//!    `core.bigFileThreshold` (`get_object_details`, lines 2541-2544, and `prepare_pack`, line 3326), and its
+//!    `pack.windowMemory`, unlimited by default (line 253), lets the oldest candidates go past it but never the nearest
+//!    (`find_deltas`, lines 2913-2919); slates takes neither constant (R3): the request's own admission decides. git
+//!    also skips a trial its sizes rule out: a source shorter than the target by half the target or more (less a
+//!    hash's length, the half scaled by the depth the source's chain leaves), or over 32 times the target's length
+//!    (`try_delta`, lines 2737-2755); slates' encoder tries every candidate its learned window holds, objects within a
+//!    window and past one alike, and the window learns what the trials save.
 //!
 //! The header counts the wanted objects; every one is sent exactly once, since each stage sends only what is still
 //! wanted and takes it out; the trailer is the checksum of every byte before it, made as the bytes pass, and the count
@@ -46,32 +61,35 @@
 //! its base ahead of it sends nothing the client has, so the pack holds exactly the answer's objects.
 //!
 //! **Slices.** [`Upload::advance`] does units of work until the owner's quantum is spent, at least one, and checks the
-//! owner's clock after each: a window of a kept part copied; a window of an object deflated (an object sent whole,
-//! or one past a window, is deflated a window a unit); one object at most a window long encoded, its delta trials
-//! within the learned window; a window's worth of the answer's handles read; one object of a run judged by its row;
-//! a window's worth of a part's wanted positions marked among its entries, each found by halving the part's entries
-//! in position order, so a part's reading costs what it sends and never the whole part; one wanted entry of a part
-//! judged; one object still wanted offered its version's parts. So no unit outgrows a window and the learned window's
-//! trials, and nothing is held
-//! whole: between turns the stream holds no borrow of the store or the repository, names what it reads by green,
-//! version, class and content, and holds the wanted and sent sets as runs of positions (§4.17.2 item 3).
+//! owner's clock after each: a window of a kept part copied; a window of an object deflated (an object sent whole, or
+//! one past a window, is deflated a window a unit, and so is a delta found for one); a window of an object past a
+//! window, or of a candidate base, read for its search, or a step of the search over the two, a window's bytes at most;
+//! one object at most a window long encoded, its delta trials within the learned window; a window's worth of the
+//! answer's handles read; one object of a run judged by its row; a window's worth of a part's wanted positions marked
+//! among its entries, each found by halving the part's entries in position order, so a part's reading costs what it
+//! sends and never the whole part; one wanted entry of a part judged; one object still wanted offered its version's
+//! parts. So no unit outgrows a window and the learned window's trials, and nothing is held whole but what a search
+//! holds, an object past a window and a candidate, while the request's admission holds them (**What it sends** 3):
+//! between turns the stream holds no borrow of the store or the repository, names what it reads by green, version,
+//! class and content, and holds the wanted and sent sets as runs of positions (§4.17.2 item 3).
 //!
 //! **A base pack made again** while a stream reads one of its parts entry by entry ends the stream refused
 //! ([`StoreRefused::BaseRebuilt`]), never a pack of two base packs' entries; the owner makes base packs between
 //! streams. A part copied whole names its content, which holds the bytes it was made with.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
 
 use flate2::{Compress, Compression};
 use slates_vcs::{ContentId, ContentStore};
 
-use crate::Admission;
 use crate::entry::{self, Header, PACK_HEADER_LEN, Representation};
 use crate::object_name::{Hasher, Kind, ObjectFormat, ObjectId};
 use crate::out::Out;
 use crate::pack;
+use crate::{Admission, Hold, PastAdmission};
 
+use super::deltas::{Search, SearchStep, delta_most};
 use super::fragment::{self, Encoder, FragmentRefused, Learning, Placed, Stored, ToEncode};
 use super::learn::{Clock, Exchange, Levels, Window};
 use super::positions::Positions;
@@ -151,6 +169,9 @@ pub struct UploadCounters {
   pub loose_whole: u64,
   /// Objects no part covered, encoded as deltas.
   pub loose_deltas: u64,
+  /// Objects past a window no part covered that had a candidate base, sent whole because the request's admission
+  /// could not hold their search (module docs, **What it sends** 3); each is counted in `loose_whole` too.
+  pub loose_unsearched: u64,
 }
 
 /// Where the stream is (module docs).
@@ -254,13 +275,57 @@ impl Chosen {
   }
 }
 
-/// An object being deflated whole, a window a unit.
+/// An object being deflated whole, or a delta made for one, a window a unit.
 struct Deflating {
-  content: ContentId,
+  from: Deflated,
   len: u64,
   /// Its window to feed next.
   next: u64,
   compress: Compress,
+}
+
+/// What a [`Deflating`] reads.
+enum Deflated {
+  /// A kept content.
+  Content(ContentId),
+  /// A delta the stream made, and the admission's hold on what its search kept, given back after its last window.
+  Made { delta: Vec<u8>, hold: Hold },
+}
+
+/// An object past a window that the loose stage sent: what a later one's search reads it by and names it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Large {
+  id: ObjectId,
+  kind: Kind,
+  len: u64,
+  content: ContentId,
+  /// Where its entry begins in the pack.
+  at: u64,
+  /// Its delta chain's depth.
+  depth: u64,
+}
+
+/// An object past a window being searched (module docs, **What it sends** 3): its bytes read a window a unit, then
+/// each candidate's, each searched a window's bytes a unit; the smallest delta shorter than the object wins.
+struct Searching {
+  /// The object.
+  target: (ObjectId, ObjectRow, ContentId),
+  /// The admission's hold on everything the search keeps.
+  hold: Hold,
+  /// The object's bytes read so far.
+  target_bytes: Vec<u8>,
+  /// The candidates, the nearest first.
+  candidates: Vec<Large>,
+  /// The candidate being tried, by its index in `candidates`.
+  trying: usize,
+  /// Its bytes read so far.
+  base_bytes: Vec<u8>,
+  /// Its search, begun once its bytes are whole.
+  search: Search,
+  /// The owner's nanoseconds its trial has taken so far.
+  trial_ns: u64,
+  /// The best delta so far, and the index of the candidate it names.
+  best: Option<(usize, Vec<u8>)>,
 }
 
 /// Bytes owed to the pack before anything else is judged.
@@ -274,14 +339,17 @@ enum Pending {
   },
   /// An object being deflated.
   Deflate(Deflating),
+  /// An object past a window being searched.
+  Search(Box<Searching>),
 }
 
-/// What a turn's units read: the repository, the store, the owner's clock and exchange.
+/// What a turn's units read: the repository, the store, the owner's clock and exchange, and the request's admission.
 struct Context<'c> {
   repository: &'c Repository,
   store: &'c ContentStore,
   clock: &'c mut dyn Clock,
   exchange: Exchange,
+  admission: &'c mut Admission,
 }
 
 /// upload-pack's pack, streamed (module docs).
@@ -312,6 +380,8 @@ pub struct Upload<A> {
   levels: Levels,
   depth: u64,
   encoder: Encoder,
+  /// For each kind, the objects past a window a later one's search may try, the nearest last.
+  large: BTreeMap<Kind, VecDeque<Large>>,
   by_entry: Option<ByEntry>,
   pending: Option<Pending>,
   counters: UploadCounters,
@@ -342,6 +412,7 @@ impl<A: Answered> Upload<A> {
       levels,
       depth,
       encoder,
+      large: BTreeMap::new(),
       by_entry: None,
       pending: None,
       counters: UploadCounters::default(),
@@ -353,13 +424,15 @@ impl<A: Answered> Upload<A> {
     self.counters
   }
 
-  /// One turn: units of work until the turn's quantum is spent, at least one, the bytes put to `out` (module docs).
-  /// Refused, every later turn is refused the same, and what was put is no pack.
+  /// One turn: units of work until the turn's quantum is spent, at least one, the bytes put to `out` (module docs),
+  /// what a search holds for a while charged to the request's `admission` and given back when it ends. Refused, every
+  /// later turn is refused the same, and what was put is no pack.
   pub fn advance(
     &mut self,
     repository: &Repository,
     store: &ContentStore,
     turn: Turn<'_>,
+    admission: &mut Admission,
     out: &mut impl Out,
   ) -> Result<Progress, StoreRefused> {
     let Turn {
@@ -374,6 +447,7 @@ impl<A: Answered> Upload<A> {
       store,
       clock,
       exchange,
+      admission,
     };
     loop {
       match self.step(&mut context, out) {
@@ -393,7 +467,7 @@ impl<A: Answered> Upload<A> {
   /// One unit of work: what is owed first, then a part's next entry, then the stage's next step.
   fn step(&mut self, cx: &mut Context<'_>, out: &mut impl Out) -> Result<Progress, StoreRefused> {
     if let Some(pending) = self.pending.take() {
-      self.pending = self.owed(cx.store, pending, out)?;
+      self.pending = self.owed(cx, pending, out)?;
       return Ok(Progress::More);
     }
     if let Some(by_entry) = self.by_entry.take() {
@@ -681,7 +755,8 @@ impl<A: Answered> Upload<A> {
     else {
       self.counters.made_whole = self.counters.made_whole.saturating_add(1);
       let found = cx.repository.stored_at(cx.store, entry.position)?;
-      return self.send_whole(cx, found, out);
+      self.pending = Some(self.send_whole(cx, found, out)?);
+      return Ok(());
     };
     let mut written = Vec::new();
     let header = Header {
@@ -765,14 +840,14 @@ impl<A: Answered> Upload<A> {
     Ok(self.answer.admits(row.kind, row.len))
   }
 
-  /// An object sent whole: its header now, its bytes deflated a window a unit, at the level learned for its kind or
-  /// chosen by sampling its first window.
+  /// An object sent whole: its header now, and what deflates its bytes a window a unit, at the level learned for its
+  /// kind or chosen by sampling its first window.
   fn send_whole(
     &mut self,
     cx: &mut Context<'_>,
     (id, row, content): (ObjectId, ObjectRow, ContentId),
     out: &mut impl Out,
-  ) -> Result<(), StoreRefused> {
+  ) -> Result<Pending, StoreRefused> {
     let mut written = Vec::new();
     let header = Header {
       representation: Representation::Whole(row.kind),
@@ -792,19 +867,19 @@ impl<A: Answered> Upload<A> {
     };
     let level = fragment::level(row.kind, first, &mut learning).map_err(StoreRefused::Encoding)?;
     self.emit(&written, out);
-    self.pending = Some(Pending::Deflate(Deflating {
-      content,
+    Ok(Pending::Deflate(Deflating {
+      from: Deflated::Content(content),
       len: row.len,
       next: 0,
       compress: Compress::new(Compression::new(level), true),
-    }));
-    Ok(())
+    }))
   }
 
-  /// One unit of what is owed: a window of kept bytes copied, or a window of an object deflated; what is owed after it.
+  /// One unit of what is owed: a window of kept bytes copied, a window of an object or a delta deflated, or a unit of
+  /// a search; what is owed after it.
   fn owed(
     &mut self,
-    store: &ContentStore,
+    cx: &mut Context<'_>,
     pending: Pending,
     out: &mut impl Out,
   ) -> Result<Option<Pending>, StoreRefused> {
@@ -814,8 +889,9 @@ impl<A: Answered> Upload<A> {
         len,
         from,
         to,
-      } => self.copy_window(store, (content, len), (from, to), out),
-      Pending::Deflate(deflating) => self.deflate_window(store, deflating, out),
+      } => self.copy_window(cx.store, (content, len), (from, to), out),
+      Pending::Deflate(deflating) => self.deflate_window(cx, deflating, out),
+      Pending::Search(searching) => self.search_unit(cx, searching, out),
     }
   }
 
@@ -857,23 +933,31 @@ impl<A: Answered> Upload<A> {
     }))
   }
 
-  /// The next window of an object being deflated, fed and what it gave sent; the stream ended after its last.
+  /// The next window of an object or a delta being deflated, fed and what it gave sent; the stream ended after its
+  /// last, and a delta's hold given back.
   fn deflate_window(
     &mut self,
-    store: &ContentStore,
+    cx: &mut Context<'_>,
     mut deflating: Deflating,
     out: &mut impl Out,
   ) -> Result<Option<Pending>, StoreRefused> {
-    let window = to_u64(store.window());
+    let window = to_u64(cx.store.window());
     let windows = deflating.len.div_ceil(window).max(1);
-    let bytes = store
-      .window_at(&deflating.content, deflating.len, deflating.next)
-      .ok_or(StoreRefused::FragmentUnreadable)?;
+    let bytes = match &deflating.from {
+      Deflated::Content(content) => cx
+        .store
+        .window_at(content, deflating.len, deflating.next)
+        .ok_or(StoreRefused::FragmentUnreadable)?,
+      Deflated::Made { delta, .. } => made_window(delta, window, deflating.next)?,
+    };
     let last = deflating.next.saturating_add(1) >= windows;
     let given = fragment::deflate_more(&mut deflating.compress, bytes, last)
       .map_err(StoreRefused::Encoding)?;
     self.emit(&given, out);
     if last {
+      if let Deflated::Made { hold, .. } = deflating.from {
+        cx.admission.release(hold);
+      }
       return Ok(None);
     }
     deflating.next = deflating.next.saturating_add(1);
@@ -960,7 +1044,8 @@ impl<A: Answered> Upload<A> {
   }
 
   /// One object no part covered (module docs, **What it sends** 3): encoded with the fragments' encoder when it is a
-  /// window long at most, deflated whole a window a unit otherwise.
+  /// window long at most; past a window, searched against the earlier ones past a window when the request's admission
+  /// holds the search, and sent whole otherwise (`loose_large`).
   fn loose(
     &mut self,
     cx: &mut Context<'_>,
@@ -976,8 +1061,7 @@ impl<A: Answered> Upload<A> {
       from: position.saturating_add(1),
     };
     if row.len > to_u64(cx.store.window()) {
-      self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
-      self.send_whole(cx, (id, row, content), out)?;
+      self.pending = Some(self.loose_large(cx, (id, row, content), out)?);
       return Ok(next);
     }
     let bytes = cx
@@ -1011,6 +1095,196 @@ impl<A: Answered> Upload<A> {
     Ok(next)
   }
 
+  /// An object past a window (module docs, **What it sends** 3): searched when it has candidates and the request's
+  /// admission can hold the search, sent whole otherwise, and counted when the admission was what refused. What is
+  /// owed next: the search, or the object's deflating.
+  fn loose_large(
+    &mut self,
+    cx: &mut Context<'_>,
+    target: (ObjectId, ObjectRow, ContentId),
+    out: &mut impl Out,
+  ) -> Result<Pending, StoreRefused> {
+    let candidates = self.candidates(target.1.kind, cx.exchange);
+    if !candidates.is_empty() {
+      match cx.admission.hold(search_charge(target.1.len, &candidates)) {
+        Ok(hold) => {
+          return Ok(Pending::Search(Box::new(searching(
+            target, candidates, hold,
+          ))));
+        }
+        // The admission cannot hold the search: the object goes whole, and the fall-back is counted.
+        Err(PastAdmission { .. }) => {
+          self.counters.loose_unsearched = self.counters.loose_unsearched.saturating_add(1);
+        }
+      }
+    }
+    self.large_whole(cx, target, out)
+  }
+
+  /// An object past a window sent whole and kept as a later one's candidate: what deflates it.
+  fn large_whole(
+    &mut self,
+    cx: &mut Context<'_>,
+    target: (ObjectId, ObjectRow, ContentId),
+    out: &mut impl Out,
+  ) -> Result<Pending, StoreRefused> {
+    self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
+    let large = Large {
+      id: target.0,
+      kind: target.1.kind,
+      len: target.1.len,
+      content: target.2,
+      at: self.at,
+      depth: 0,
+    };
+    let pending = self.send_whole(cx, target, out)?;
+    self.remember_large(large, cx.exchange);
+    Ok(pending)
+  }
+
+  /// The objects past a window of `kind` a search tries (module docs): none where the learned depth makes no delta,
+  /// otherwise the nearest first, as many as the learned window tries.
+  fn candidates(&self, kind: Kind, exchange: Exchange) -> Vec<Large> {
+    let Some(recent) = self.large.get(&kind).filter(|_| self.depth > 0) else {
+      return Vec::new();
+    };
+    let window = self.window.size(exchange, recent.len());
+    recent.iter().rev().take(window).copied().collect()
+  }
+
+  /// Keeps `large` as a later one's candidate while its chain has room, and lets go of those of its kind past what the
+  /// window tries now, as the fragments' encoder keeps its own.
+  fn remember_large(&mut self, large: Large, exchange: Exchange) {
+    if large.depth >= self.depth {
+      return;
+    }
+    let keep = self.window.size(exchange, usize::MAX);
+    let recent = self.large.entry(large.kind).or_default();
+    recent.push_back(large);
+    while recent.len() > keep {
+      recent.pop_front();
+    }
+  }
+
+  /// One unit of a search (module docs, **Slices**): a window of the object's bytes read, or of the candidate's, or a
+  /// step of the search over the two, a window's bytes at most; after the last candidate's trial, the entry.
+  fn search_unit(
+    &mut self,
+    cx: &mut Context<'_>,
+    mut searching: Box<Searching>,
+    out: &mut impl Out,
+  ) -> Result<Option<Pending>, StoreRefused> {
+    let (id, row, content) = &searching.target;
+    let target = (*id, row.len, *content);
+    if read_window(cx.store, target, &mut searching.target_bytes)? {
+      return Ok(Some(Pending::Search(searching)));
+    }
+    let Some(candidate) = searching.candidates.get(searching.trying).copied() else {
+      return self.searched(cx, *searching, out).map(Some);
+    };
+    let start = cx.clock.now_ns();
+    let base = (candidate.id, candidate.len, candidate.content);
+    let step = if read_window(cx.store, base, &mut searching.base_bytes)? {
+      SearchStep::More
+    } else {
+      let Searching {
+        search,
+        base_bytes,
+        target_bytes,
+        ..
+      } = &mut *searching;
+      search.step(base_bytes, target_bytes, cx.store.window())
+    };
+    let spent = cx.clock.now_ns().saturating_sub(start);
+    searching.trial_ns = searching.trial_ns.saturating_add(spent);
+    if let SearchStep::Done(delta) = step {
+      self.tried(&mut searching, delta);
+    }
+    Ok(Some(Pending::Search(searching)))
+  }
+
+  /// A trial's end, as the fragments' encoder ends one: taught to the window at its rank, its delta kept when it is
+  /// shorter than the best so far, the object itself the first best; then the next candidate's trial begun.
+  fn tried(&mut self, searching: &mut Searching, delta: Option<Vec<u8>>) {
+    let trying = searching.trying;
+    let rank = trying.saturating_add(1);
+    let best = searching
+      .best
+      .as_ref()
+      .map_or(searching.target_bytes.len(), |(_, kept)| kept.len());
+    let len = delta.as_ref().map_or(usize::MAX, Vec::len);
+    let saved = to_u64(best.saturating_sub(len));
+    self.window.record(rank, saved, searching.trial_ns);
+    if len < best {
+      searching.best = delta.map(|kept| (trying, kept));
+    }
+    searching.trying = rank;
+    searching.base_bytes = Vec::new();
+    searching.search = Search::new();
+    searching.trial_ns = 0;
+  }
+
+  /// The entry of a searched object: a delta against the candidate whose delta was shortest, named by its offset back
+  /// or, for a client without `ofs-delta`, by its id, deflated a window a unit and its hold given back after it; or
+  /// whole, its hold given back now, when no delta was shorter than the object.
+  fn searched(
+    &mut self,
+    cx: &mut Context<'_>,
+    searching: Searching,
+    out: &mut impl Out,
+  ) -> Result<Pending, StoreRefused> {
+    let Searching {
+      target,
+      hold,
+      candidates,
+      best,
+      ..
+    } = searching;
+    let found = best.and_then(|(index, delta)| Some((candidates.get(index).copied()?, delta)));
+    let Some((base, delta)) = found else {
+      cx.admission.release(hold);
+      return self.large_whole(cx, target, out);
+    };
+    let (id, row, content) = target;
+    let representation = if self.answer.ofs_delta() {
+      Representation::OfsDelta { base: base.at }
+    } else {
+      Representation::RefDelta { base: base.id }
+    };
+    let header = Header {
+      representation,
+      size: to_u64(delta.len()),
+    };
+    let mut written = Vec::new();
+    entry::write(header, self.at, &mut written).map_err(entry_refused)?;
+    let first = delta.get(..cx.store.window()).unwrap_or(delta.as_slice());
+    let mut learning = Learning {
+      window: &mut self.window,
+      levels: &mut self.levels,
+      depth: self.depth,
+      exchange: cx.exchange,
+      clock: &mut *cx.clock,
+    };
+    let level = fragment::level(row.kind, first, &mut learning).map_err(StoreRefused::Encoding)?;
+    let large = Large {
+      id,
+      kind: row.kind,
+      len: row.len,
+      content,
+      at: self.at,
+      depth: base.depth.saturating_add(1),
+    };
+    self.emit(&written, out);
+    self.counters.loose_deltas = self.counters.loose_deltas.saturating_add(1);
+    self.remember_large(large, cx.exchange);
+    Ok(Pending::Deflate(Deflating {
+      len: to_u64(delta.len()),
+      from: Deflated::Made { delta, hold },
+      next: 0,
+      compress: Compress::new(Compression::new(level), true),
+    }))
+  }
+
   /// The trailer, once the entries sent are the ones the header counted.
   fn trailer(&mut self, out: &mut impl Out) -> Result<Stage, StoreRefused> {
     if self.entries != self.counted {
@@ -1034,6 +1308,84 @@ impl<A: Answered> Upload<A> {
     out.put(bytes);
     self.at = self.at.saturating_add(to_u64(bytes.len()));
   }
+}
+
+/// A search of `target` against `candidates`, with the admission's `hold` on what it keeps, nothing yet read.
+fn searching(
+  target: (ObjectId, ObjectRow, ContentId),
+  candidates: Vec<Large>,
+  hold: Hold,
+) -> Searching {
+  Searching {
+    target,
+    hold,
+    target_bytes: Vec::new(),
+    candidates,
+    trying: 0,
+    base_bytes: Vec::new(),
+    search: Search::new(),
+    trial_ns: 0,
+    best: None,
+  }
+}
+
+/// What a search of an object `target_len` bytes long against `candidates` holds at most (module docs, **What it
+/// sends** 3): the object's bytes, the largest candidate's, a search over the two, and the best delta kept while
+/// another candidate is searched. Every byte where a length does not fit in memory, which no admission holds.
+fn search_charge(target_len: u64, candidates: &[Large]) -> u64 {
+  let largest = candidates
+    .iter()
+    .map(|candidate| candidate.len)
+    .max()
+    .unwrap_or(0);
+  let (Ok(target), Ok(source)) = (usize::try_from(target_len), usize::try_from(largest)) else {
+    return u64::MAX;
+  };
+  let kept = if candidates.len() > 1 {
+    to_u64(delta_most(source, target))
+  } else {
+    0
+  };
+  target_len
+    .saturating_add(largest)
+    .saturating_add(Search::held_most(source, target))
+    .saturating_add(kept)
+}
+
+/// Reads the next window of the object `(id, len, content)` names into `bytes`, made with room for the whole object
+/// when the first is read: whether one was read, none once the object is whole.
+fn read_window(
+  store: &ContentStore,
+  (id, len, content): (ObjectId, u64, ContentId),
+  bytes: &mut Vec<u8>,
+) -> Result<bool, StoreRefused> {
+  let read = to_u64(bytes.len());
+  if read >= len {
+    return Ok(false);
+  }
+  let unreadable = StoreRefused::Unreadable { id };
+  if bytes.is_empty() {
+    *bytes = Vec::with_capacity(usize::try_from(len).map_err(|_| unreadable)?);
+  }
+  let window = to_u64(store.window());
+  let index = read.checked_div(window).ok_or(unreadable)?;
+  let next = store.window_at(&content, len, index).ok_or(unreadable)?;
+  let whole_windows = read.checked_rem(window) == Some(0);
+  if !whole_windows || to_u64(next.len()) != window.min(len.saturating_sub(read)) {
+    return Err(unreadable);
+  }
+  bytes.extend_from_slice(next);
+  Ok(true)
+}
+
+/// Window `index` of a delta the stream made, cut as the store cuts a content into windows of `window` bytes.
+fn made_window(delta: &[u8], window: u64, index: u64) -> Result<&[u8], StoreRefused> {
+  let from = index.saturating_mul(window);
+  let to = from.saturating_add(window).min(to_u64(delta.len()));
+  let (Ok(from), Ok(to)) = (usize::try_from(from), usize::try_from(to)) else {
+    return Err(StoreRefused::FragmentUnreadable);
+  };
+  delta.get(from..to).ok_or(StoreRefused::FragmentUnreadable)
 }
 
 /// The part `part` names of `green`, with its source, when it is kept.

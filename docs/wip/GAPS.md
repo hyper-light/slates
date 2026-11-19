@@ -586,14 +586,18 @@
 > store's parts, every version encoded and a base pack made, each object once; `Streamed::counters`. A-653
 > continued (2): a version's fragments and a base pack encoded a unit at a time under the owner's quantum
 > (`store::Encoding`: a pair of trees walked, a window's worth of rows read, or one object encoded, a unit), the same
-> bytes over any turns; closes A-639's "the fragments' encoding sliced". Owed: the live clone over the HTTP edge
-> (A-625 part 3's store per repository), and with it the owner driving encodings by turns; a delta search past a
-> window, of which part 1 is built (A-653 continued (3): `store::Search`, git's delta search a bounded amount a step,
-> byte for byte the one pass's, `delta_of` one search run to its end) and part 2 owed (the stream's objects past a
-> window searched through it, their buffers and index charged to the request's admission, sent whole only where it
-> cannot hold them, that case counted; git's rule read from `pack-objects.c` at v2.50.1 first); within an encoding,
-> one object (its delta trials until `Encoder::put` steps them through a `Search`), a pair of trees and a part's put
-> each still a unit whole; the red-checks and the other platforms' runs (main's).
+> bytes over any turns; closes A-639's "the fragments' encoding sliced". A-653 continued (3) and (4): a delta search
+> past a window, `store::Search` (git's delta search a bounded amount a step, byte for byte the one pass's, `delta_of`
+> one search run to its end), and the stream's objects past a window no part covers searched through it, what the
+> search holds (the object, the largest candidate, the index and the delta) charged to the request's own admission as
+> a hold given back once the entry is sent (`Admission::hold`, `Admission::release`), the object sent whole only where
+> the admission cannot hold it, that case counted (`loose_unsearched`); git's rule cited from `pack-objects.c` at
+> v2.50.1, none of its constants taken; closes A-639's "a delta search for an object past a window". Owed: the live
+> clone over the HTTP edge (A-625 part 3's store per repository), and with it the owner driving encodings by turns;
+> within an encoding, one object (its delta trials until `Encoder::put` steps them through a `Search`), a pair of trees
+> and a part's put each still a unit whole; a search across a window's edge (an object past a window trying earlier
+> ones within one, and the reverse, as git's order by name and size would); the red-checks and the other platforms'
+> runs (main's).
 > **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
 > (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
 > `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's

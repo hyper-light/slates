@@ -17,10 +17,23 @@
 //! and the caller hands every step the same source and target. Each step runs the one pass's own
 //! loop from where the last stopped, so a search over any budgets writes the delta one pass writes,
 //! byte for byte: [`delta_of`] is one search run to its end.
+//!
+//! **What a search holds (A-653 continued (4)).** Besides the source and the target its caller
+//! hands it, a search holds its index and its delta, and [`Search::held_most`] bounds both before
+//! it begins, so a caller can charge them to a request's admission first. The index keeps at most
+//! one entry a whole block of the source, each charged at the most a `BTreeMap` entry can cost (the
+//! standard library's node layout, as `slates-cluster`'s content hold derives it, AUD-29-43). The
+//! delta is reserved whole when the scan begins, at the most the scan can write: its two sizes, the
+//! target's bytes, an insert opcode for every [`INSERT_MAX`] bytes and one more, since a copy costs
+//! at most [`COPY_BYTES`] and covers more, and each run of inserts a copy ends may cost an opcode;
+//! a `Vec` made with a capacity has exactly that capacity (`Vec`'s "Guarantees" \[B\]), so the
+//! delta never grows past what was charged.
 
 use std::collections::BTreeMap;
+use std::mem::size_of;
 
-use crate::delta::{Sizes, write_copy, write_insert, write_sizes};
+use crate::delta::{INSERT_MAX, Sizes, write_copy, write_insert, write_sizes};
+use crate::out::Measure;
 use crate::to_u64;
 
 /// Format: the most bytes a copy instruction takes: its opcode and seven operand bytes, four of
@@ -33,6 +46,65 @@ const COPY_MAX: usize = 1 << 16;
 /// Derived: the rolling hash's multiplier, the 64-bit golden ratio (Knuth's multiplicative
 /// hashing): odd, so multiplying by it loses no bit.
 const MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The branching factor of the standard library's B-tree (`B` in
+/// `alloc::collections::btree::node`, Rust std source; tier C): a node holds at most `2B - 1`
+/// entries, every node but the root at least `B - 1`. The index's charge is derived from it
+/// ([`index_most`]), as `slates-cluster`'s content hold derives its own (`btree_entry_bytes`).
+/// Format: the standard library's constant, restated so the charge follows the structure it bounds.
+const BTREE_B: usize = 6;
+
+/// The heap bytes one node of the index can take, leaf and internal: a leaf holds `2B - 1` keys and
+/// values, its parent link, its index in the parent and its length; an internal node adds `2B`
+/// child links. Each is rounded up to a power of two, the largest size-class rounding a
+/// general-purpose allocator applies.
+fn index_node_bytes() -> (u64, u64) {
+  let capacity = BTREE_B.saturating_mul(2).saturating_sub(1);
+  let link = size_of::<usize>();
+  let leaf = link
+    .saturating_add(size_of::<u16>().saturating_mul(2))
+    .saturating_add(
+      size_of::<u64>()
+        .saturating_add(size_of::<usize>())
+        .saturating_mul(capacity),
+    );
+  let internal = leaf.saturating_add(link.saturating_mul(capacity.saturating_add(1)));
+  let rounded = |bytes: usize| to_u64(bytes.checked_next_power_of_two().unwrap_or(bytes));
+  (rounded(leaf), rounded(internal))
+}
+
+/// The most heap bytes the index of a `source_len`-byte source can take: an entry a whole block
+/// at most, `n` entries in at most `n / (B - 1)` leaves and as many internal nodes, and a root
+/// that may hold as few as one entry, a leaf and an internal node beyond the entries' share.
+fn index_most(source_len: usize) -> u64 {
+  let (leaf, internal) = index_node_bytes();
+  let nodes = leaf.saturating_add(internal);
+  let entries = to_u64(source_len.checked_div(COPY_BYTES).unwrap_or(0));
+  let fewest = to_u64(BTREE_B.saturating_sub(1)).max(1);
+  entries
+    .saturating_mul(nodes)
+    .div_ceil(fewest)
+    .saturating_add(nodes)
+}
+
+/// The most bytes the delta of a `target_len`-byte target against a `source_len`-byte source can
+/// take as the scan writes it (module docs): its sizes, the target's bytes, an opcode for every
+/// [`INSERT_MAX`] of them, and one more.
+pub(crate) fn delta_most(source_len: usize, target_len: usize) -> usize {
+  let mut sizes = Measure::default();
+  write_sizes(
+    Sizes {
+      source: to_u64(source_len),
+      target: to_u64(target_len),
+    },
+    &mut sizes,
+  );
+  usize::try_from(sizes.0)
+    .unwrap_or(usize::MAX)
+    .saturating_add(target_len)
+    .saturating_add(target_len.div_ceil(INSERT_MAX))
+    .saturating_add(1)
+}
 
 /// The hash of `bytes`, a block.
 fn hash(bytes: &[u8]) -> u64 {
@@ -168,6 +240,12 @@ impl Search {
     self.counters
   }
 
+  /// The most heap bytes a search over a `source_len`-byte source and a `target_len`-byte target
+  /// holds besides the two (module docs, **What a search holds**): its index and its delta.
+  pub fn held_most(source_len: usize, target_len: usize) -> u64 {
+    index_most(source_len).saturating_add(to_u64(delta_most(source_len, target_len)))
+  }
+
   /// One step over `source` and `target`, the same two every step (module docs): at most
   /// `budget`'s whole blocks of the source indexed, one at least, or the target scanned past
   /// `budget` bytes, one at least. Handed other lengths than the first step was, the search ends
@@ -221,6 +299,7 @@ impl Search {
       source: source_len,
       target: target_len,
     };
+    self.out = Vec::with_capacity(delta_most(source.len(), target.len()));
     write_sizes(sizes, &mut self.out);
     self.stage = Stage::Scan {
       at: 0,
