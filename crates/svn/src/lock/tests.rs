@@ -817,7 +817,9 @@ impl Fsfs {
     // fs-loader.c 1832-1839: the comment must be XML-safe, the expiration not negative.
     let comment = match &request.comment {
       Some(bytes) if !is_xml_safe(bytes) => return Err(LockRefusal::UnescapableComment),
-      Some(bytes) => Some(String::from_utf8(bytes.clone()).unwrap()),
+      Some(bytes) => {
+        Some(String::from_utf8(bytes.clone()).map_err(|_| LockRefusal::UnescapableComment)?)
+      }
       None => None,
     };
     let expiration_date = request.expires.map_or(0, |expires| expires.0);
@@ -1421,47 +1423,67 @@ enum Step {
   },
 }
 
+/// One of `choices`, each drawn in proportion to its weight: a plain range mapped through the cumulative weights, so
+/// the strategy needs no `Arc`-backed union (R2).
+fn weighted<T: Copy + Debug + 'static>(choices: &'static [(u32, T)]) -> impl Strategy<Value = T> {
+  let total: u32 = choices.iter().map(|(weight, _)| weight).sum();
+  (0..total).prop_map(move |draw| pick(choices, draw))
+}
+
+/// The choice a draw below the weights' total lands on; the last for any draw past it.
+fn pick<T: Copy>(choices: &[(u32, T)], draw: u32) -> T {
+  let mut left = draw;
+  for (weight, choice) in choices {
+    if left < *weight {
+      return *choice;
+    }
+    left -= weight;
+  }
+  choices[choices.len() - 1].1
+}
+
 /// A step's principal: one of [`USERS`], now and then none.
 fn user() -> impl Strategy<Value = Option<usize>> {
-  prop_oneof![8 => (0..USERS.len()).prop_map(Some), 1 => Just(None)]
+  (0..9u32, 0..USERS.len()).prop_map(|(draw, user)| (draw < 8).then_some(user))
 }
 
 /// A path's index: [`UNIVERSE`]'s, and now and then [`NOT_CANONICAL`]'s.
 fn path() -> impl Strategy<Value = usize> {
-  prop_oneof![30 => 0..UNIVERSE.len(), 1 => Just(UNIVERSE.len())]
+  (0..31u32, 0..UNIVERSE.len())
+    .prop_map(|(draw, path)| if draw < 30 { path } else { UNIVERSE.len() })
 }
 
 /// A lock request's step.
 fn lock_step() -> impl Strategy<Value = Step> {
-  let current = prop_oneof![
-    6 => Just(Current::None),
-    2 => Just(Current::Youngest),
-    2 => Just(Current::Created),
-    1 => Just(Current::Older),
-    1 => Just(Current::Future),
-  ];
-  let supply = prop_oneof![
-    12 => Just(Supply::Drawn),
-    2 => Just(Supply::Valid),
-    1 => Just(Supply::BadScheme),
-    1 => Just(Supply::Control),
-  ];
-  let comment = prop_oneof![
-    6 => Just(Comment::None),
-    3 => Just(Comment::Plain),
-    1 => Just(Comment::Allowed),
-    1 => Just(Comment::Control),
-    1 => Just(Comment::Nul),
-    1 => Just(Comment::NotUtf8),
-  ];
-  let expires = prop_oneof![
-    6 => Just(Expiry::Never),
-    1 => Just(Expiry::Zero),
-    3 => Just(Expiry::Soon),
-    1 => Just(Expiry::Later),
-    2 => Just(Expiry::Past),
-    1 => Just(Expiry::Negative),
-  ];
+  let current = weighted(&[
+    (6, Current::None),
+    (2, Current::Youngest),
+    (2, Current::Created),
+    (1, Current::Older),
+    (1, Current::Future),
+  ]);
+  let supply = weighted(&[
+    (12, Supply::Drawn),
+    (2, Supply::Valid),
+    (1, Supply::BadScheme),
+    (1, Supply::Control),
+  ]);
+  let comment = weighted(&[
+    (6, Comment::None),
+    (3, Comment::Plain),
+    (1, Comment::Allowed),
+    (1, Comment::Control),
+    (1, Comment::Nul),
+    (1, Comment::NotUtf8),
+  ]);
+  let expires = weighted(&[
+    (6, Expiry::Never),
+    (1, Expiry::Zero),
+    (3, Expiry::Soon),
+    (1, Expiry::Later),
+    (2, Expiry::Past),
+    (1, Expiry::Negative),
+  ]);
   let targets = proptest::collection::vec((path(), current, supply), 0..4);
   (
     user(),
@@ -1481,13 +1503,13 @@ fn lock_step() -> impl Strategy<Value = Step> {
 
 /// The token a step sends for a path.
 fn present() -> impl Strategy<Value = Present> {
-  prop_oneof![
-    6 => Just(Present::Own),
-    2 => Just(Present::Another),
-    1 => Just(Present::Stale),
-    1 => Just(Present::Garbage),
-    2 => Just(Present::Absent),
-  ]
+  weighted(&[
+    (6, Present::Own),
+    (2, Present::Another),
+    (1, Present::Stale),
+    (1, Present::Garbage),
+    (2, Present::Absent),
+  ])
 }
 
 /// An unlock request's step.
@@ -1504,12 +1526,12 @@ fn unlock_step() -> impl Strategy<Value = Step> {
 
 /// A commit's step.
 fn commit_step() -> impl Strategy<Value = Step> {
-  let action = prop_oneof![
-    4 => Just(Action::Modify),
-    2 => Just(Action::Delete),
-    1 => Just(Action::Add),
-    1 => Just(Action::Replace),
-  ];
+  let action = weighted(&[
+    (4, Action::Modify),
+    (2, Action::Delete),
+    (1, Action::Add),
+    (1, Action::Replace),
+  ]);
   let changes = proptest::collection::vec((path(), action), 1..4);
   let presented = proptest::collection::vec((path(), present()), 0..4);
   (user(), changes, presented, proptest::bool::weighted(0.3)).prop_map(
@@ -1522,16 +1544,25 @@ fn commit_step() -> impl Strategy<Value = Step> {
   )
 }
 
-/// One step of a history: more locks than anything, the clock moving a little or past every expiry now and then.
+/// One step of a history: more locks than anything, the clock moving a little or past every expiry now and then. Each
+/// kind of step is generated and a weighted draw keeps one, so no `Arc`-backed union is needed (R2).
 fn step() -> impl Strategy<Value = Step> {
-  let tick =
-    prop_oneof![3 => 0..4i64, 1 => 1_000..100_000i64].prop_map(|micros| Step::Tick { micros });
-  prop_oneof![5 => lock_step(), 2 => unlock_step(), 3 => commit_step(), 2 => tick]
+  let tick = (0..4u32, 0..4i64, 1_000..100_000i64).prop_map(|(draw, small, large)| Step::Tick {
+    micros: if draw < 3 { small } else { large },
+  });
+  (0..12u32, lock_step(), unlock_step(), commit_step(), tick).prop_map(
+    |(draw, lock, unlock, commit, tick)| match draw {
+      0..=4 => lock,
+      5..=6 => unlock,
+      7..=9 => commit,
+      _ => tick,
+    },
+  )
 }
 
 /// A history: its room, and its steps.
 fn histories() -> impl Strategy<Value = (usize, Vec<Step>)> {
-  let room = prop_oneof![Just(2usize), Just(3), Just(5), Just(ALL_ROOM)];
+  let room = weighted(&[(1, 2usize), (1, 3), (1, 5), (1, ALL_ROOM)]);
   (room, proptest::collection::vec(step(), 1..48))
 }
 

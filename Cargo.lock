@@ -1687,9 +1687,11 @@ dependencies = [
  "crc32fast",
  "flate2",
  "proptest",
+ "serde_json",
  "sha1-checked",
  "slates-http",
  "slates-test-seeds",
+ "slates-vcs",
 ]
 
 [[package]]
@@ -1708,6 +1710,7 @@ dependencies = [
  "proptest",
  "sha1-checked",
  "slates-test-seeds",
+ "slates-vcs",
  "zstd",
 ]
 

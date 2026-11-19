@@ -1,5 +1,5 @@
-//! A command's arguments, whichever transport carries them (A-569; `internals.wireprotocol` [B];
-//! `wireprotov1server.py` [C]). Each command of 7.2's table names its arguments in a *spec*, a space-separated list in
+//! A command's arguments, whichever transport carries them (A-569; `internals.wireprotocol` \[B\];
+//! `wireprotov1server.py` \[C\]). Each command of 7.2's table names its arguments in a *spec*, a space-separated list in
 //! which `*` stands for a dictionary of every argument the spec does not name: `cmds *` for `batch`, `one two *` for
 //! `debugwireargs`, `*` for `getbundle`, nothing for `heads`. Over SSH each argument travels with its length
 //! ([`crate::ssh`]); over HTTP as a form field ([`crate::http`]); either way the server reads them into

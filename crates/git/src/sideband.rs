@@ -1,12 +1,12 @@
 //! side-band-64k (A-582; git's `gitprotocol-capabilities.txt` "side-band, side-band-64k" and `gitprotocol-v2.txt`
-//! "packfile section", `sideband-all` [B]; `sideband.c` [C]): a pack is streamed in data packets whose first byte names
+//! "packfile section", `sideband-all` \[B\]; `sideband.c` \[C\]): a pack is streamed in data packets whose first byte names
 //! a band. Band 1 carries the pack's bytes, band 2 progress for the client to show, band 3 a fatal error, after which the
 //! stream ends. side-band-64k's packets are pkt-lines of up to their full 65520 bytes, so each carries at most
 //! [`MAX_BAND_DATA`] bytes after its band byte. Under protocol v2's `sideband-all` every data packet of a response is
 //! multiplexed so, its section names and lines included; the special packets (flush, delimiter, response end) never
 //! are.
 //!
-//! [`demux`] reads one data packet's band; [`write`] writes bytes on a band in as many packets as they take.
+//! [`demux`] reads one data packet's band; [`write`](fn@write) writes bytes on a band in as many packets as they take.
 
 use crate::out::Out;
 use crate::pktline::{self, HEADER_LEN, MAX_DATA};
@@ -98,7 +98,7 @@ pub fn write(band: Band, bytes: &[u8], out: &mut impl Out) {
   }
 }
 
-/// The bytes [`write`] writes for `len` bytes on one band: each packet's length and band byte besides the bytes.
+/// The bytes [`write`](fn@write) writes for `len` bytes on one band: each packet's length and band byte besides the bytes.
 pub fn written_len(len: u64) -> u64 {
   let packets = len.div_ceil(to_u64(MAX_BAND_DATA));
   len.saturating_add(packets.saturating_mul(to_u64(HEADER_LEN.saturating_add(BAND_LEN))))

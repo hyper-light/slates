@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><D:propertyupdate xmlns:D="DAV:" xmlns:V="http://subversion.tigris.org/xmlns/dav/" xmlns:C="http://subversion.tigris.org/xmlns/custom/" xmlns:S="http://subversion.tigris.org/xmlns/svn/"><D:set><D:prop><S:log>a new message</S:log></D:prop></D:set></D:propertyupdate>

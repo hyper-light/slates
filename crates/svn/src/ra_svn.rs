@@ -101,7 +101,7 @@ pub struct Bounds {
 }
 
 impl Bounds {
-  /// The tightest bounds that admit `value` as [`write`] writes it: its written length, its longest word, its depth and
+  /// The tightest bounds that admit `value` as [`write`](fn@write) writes it: its written length, its longest word, its depth and
   /// its item count. `None` when a measure overflows.
   pub fn of(value: &Value<'_>) -> Option<Self> {
     let mut bounds = Self::default();

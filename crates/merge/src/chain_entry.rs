@@ -34,16 +34,17 @@ use crate::special::SpecialNode;
 /// an earlier layout) are refused at the first word rather than misread.
 const MAGIC: u32 = u32::from_le_bytes(*b"GCHN");
 /// Format: the chain entry encoding's version; a decoder refuses any other. 2 since A-255 added the completion key, 3
-/// since A-288 added the submitting work beside it, 4 since A-321 added the signature's verdict.
-const VERSION: u32 = 4;
+/// since A-288 added the submitting work beside it, 4 since A-321 added the signature's verdict, 5 since A-621 widened
+/// an op's path index to 64 bits (its record is the ops document's, version 2).
+const VERSION: u32 = 5;
 /// Format: a head identity and the entry's digest, each a BLAKE3 hash.
 const HASH_BYTES: usize = 32;
 /// Format: the byte that marks a head identity, a completion key or a submitting work present.
 const PRESENT: u8 = 1;
 /// Format: the byte that marks a head identity, a completion key or a submitting work absent.
 const ABSENT: u8 = 0;
-/// Format: an op's fixed record, as [`crate::ops_doc::OpsDoc::encode`] writes it.
-const OP_BYTES: usize = 28;
+/// Format: an op's fixed record, as [`crate::ops_doc::OpsDoc::encode`] writes it: one definition, the ops document's.
+const OP_BYTES: usize = crate::ops_doc::OP_BYTES;
 /// Format: a work volume's id.
 const WORK_BYTES: usize = 16;
 /// Format: a completion key and its work: the origin host, the client, the sequence, and the submitting work's marker
@@ -424,7 +425,7 @@ fn take_ops(reader: &mut Reader<'_>) -> Result<Vec<Op>, DocDecodeError> {
   for _ in 0..count {
     let kind = OpKind::from_wire(reader.u8()?).ok_or(DocDecodeError::BadKind)?;
     let flags = reader.u8()?;
-    let path = reader.u16()?;
+    let path = reader.u64()?;
     let at = reader.u64()?;
     let len = reader.u64()?;
     let src = reader.u64()?;
@@ -582,17 +583,76 @@ fn take_applied(reader: &mut Reader<'_>, increment: &Increment) -> Result<Applie
 /// The source version of the `Copy` operation `increment` declares from `from` to `dst` (A-586); `None` when it declares
 /// none, which no entry the engine recorded holds.
 fn declared_copy(increment: &Increment, dst: &str, from: &str) -> Option<u64> {
-  let path = |index: u64| {
-    u16::try_from(index)
-      .ok()
-      .and_then(|index| increment.doc.paths.path(index))
-  };
+  // Each index is 64 bits (A-621): narrowed to 16, a copy past the 65,535th path was never found.
+  let path = |index: u64| increment.doc.paths.path(index);
   increment
     .doc
     .ops
     .iter()
-    .find(|op| {
-      op.kind == OpKind::Copy && path(u64::from(op.path)) == Some(dst) && path(op.src) == Some(from)
-    })
+    .find(|op| op.kind == OpKind::Copy && path(op.path) == Some(dst) && path(op.src) == Some(from))
     .map(|op| op.at)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::ops_doc::OpsDoc;
+
+  /// A-621 (the chain entry's version 5). Do: record a version whose increment names 65,537 paths, its splice on the
+  /// last path an op the verdict mapped (so the entry writes the op whole, its path index with it) and its splice on
+  /// the first path the op as declared (so the entry names the path alone), then decode the entry. Expect both effects
+  /// back as recorded: the mapped op's 64-bit path index naming the last path, past what 16 bits held, and the declared
+  /// one found again in the increment.
+  #[test]
+  fn an_entry_keeps_an_ops_path_index_past_sixteen_bits() {
+    let names: Vec<String> = (0..(1usize << 16) + 1)
+      .map(|n| format!("tree/{n:06}.c"))
+      .collect();
+    let mut doc = OpsDoc::new();
+    for name in &names {
+      doc.paths.intern(name);
+    }
+    let (first, last) = (
+      doc.paths.intern(&names[0]),
+      doc.paths.intern(&names[names.len() - 1]),
+    );
+    assert_eq!(last, 1 << 16, "the names were interned in their order");
+    for path in [first, last] {
+      doc.ops.push(Op {
+        kind: OpKind::Overwrite,
+        flags: 0,
+        path,
+        at: 0,
+        len: 1,
+        src: 0,
+      });
+    }
+    doc.canonicalize();
+    let increment = Increment {
+      id: [7; 32],
+      base: 0,
+      doc,
+      post_state: b"x".to_vec(),
+      evidence: Vec::new(),
+    };
+    let mapped = Op {
+      at: 5,
+      ..increment.doc.ops[1]
+    };
+    let applied = vec![
+      Applied::Spliced(names[0].clone(), vec![increment.doc.ops[0]]),
+      Applied::Spliced(names[names.len() - 1].clone(), vec![mapped]),
+    ];
+    let bytes = encode(&increment.encode(), &increment, &applied, None, None, None);
+    let entry = decode(&bytes).unwrap();
+    assert_eq!(entry.applied, applied);
+    let Applied::Spliced(path, ops) = &entry.applied[1] else {
+      panic!("not a splice: {:?}", entry.applied[1]);
+    };
+    assert_eq!(ops[0].path, 1 << 16);
+    assert_eq!(
+      entry.increment.doc.paths.path(ops[0].path),
+      Some(path.as_str())
+    );
+  }
 }

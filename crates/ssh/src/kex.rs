@@ -5,7 +5,7 @@
 //! `SSH_MSG_KEX_ECDH_REPLY` with its host key `K_S`, its public key `Q_S` and its signature of the exchange hash. Both
 //! keys are 32 bytes, and "Clients and servers MUST also abort if the length of the received public keys are not the
 //! expected lengths"; the server checks "whether the computed Diffie-Hellman shared secret is the all-zero value and
-//! abort[s] if so" [B: RFC 8731 §3], by OR-ing its bytes as RFC 7748 §6.1 suggests, whatever AWS-LC already refused.
+//! abort\[s\] if so" [B: RFC 8731 §3], by OR-ing its bytes as RFC 7748 §6.1 suggests, whatever AWS-LC already refused.
 //!
 //! **The shared secret's form.** "The 32 or 56 bytes of X are converted into K by interpreting the octets as an unsigned
 //! fixed-length integer encoded in network byte order", then written as an `mpint` [B: RFC 8731 §3.1]. `K` enters the
@@ -17,7 +17,7 @@
 //!
 //! **The keys.** `HASH(K || H || X || session_id)` for each letter `X`, extended by `HASH(K || H || key so far)` until
 //! long enough [B: RFC 4253 §7.2]: IVs "A" (client to server) and "B", keys "C" and "D". The integrity keys "E" and "F"
-//! are not derived: both ciphers are AEADs and "the integrity key is not used" [B: RFC 5647 §5.1]. [`derive`] takes its
+//! are not derived: both ciphers are AEADs and "the integrity key is not used" [B: RFC 5647 §5.1]. [`derive`](fn@derive) takes its
 //! hash as a parameter so NIST's SHA-1 vectors exercise the extension (a 192-bit key from a 160-bit hash) that
 //! ChaCha20-Poly1305's 64-byte key needs from SHA-256.
 //!

@@ -57,8 +57,8 @@
 //! writer measures a line before it writes it and refuses one past a pkt-line's data, [`MAX_DATA`], writing nothing;
 //! a message is checked whole before its first byte is written.
 //!
-//! **Sources** (read 2026-11-19, git 2.50.1). The documents [B]: `gitprotocol-pack` ("pkt-line Format", "Reference
-//! Discovery", "Packfile Negotiation", their grammars) and `gitprotocol-capabilities`. The code [C]: `upload-pack.c`
+//! **Sources** (read 2026-11-19, git 2.50.1). The documents \[B\]: `gitprotocol-pack` ("pkt-line Format", "Reference
+//! Discovery", "Packfile Negotiation", their grammars) and `gitprotocol-capabilities`. The code \[C\]: `upload-pack.c`
 //! (`write_v0_ref`, `get_common_commits`, `process_shallow`, `process_deepen`, `process_deepen_since`,
 //! `send_shallow`, `send_unshallow`), `fetch-pack.c` (`find_common`, `get_ack`), `connect.c` (`get_remote_heads`,
 //! `process_capabilities`, `process_dummy_ref`, `parse_feature_value`), `protocol.c`

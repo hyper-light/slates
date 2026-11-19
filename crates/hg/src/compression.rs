@@ -1,7 +1,7 @@
 //! Compressed bundles: zlib (`GZ`), bzip2 (`BZ`) and zstd (`ZS`), inflated within the caller's admission and
 //! compressed as Mercurial 7.2 writes them (A-598; §4.17.3 piece 1; D-17).
 //!
-//! **What 7.2 writes** (`bundle2.py`, `utils/compression.py` [C]). A bundle1 names its compression in its six-byte
+//! **What 7.2 writes** (`bundle2.py`, `utils/compression.py` \[C\]). A bundle1 names its compression in its six-byte
 //! header: `HG10UN` and the changegroup, `HG10GZ` and a zlib stream of it, or `HG10` and a whole bzip2 stream, whose
 //! own magic `BZ` completes the header (`bundletypes`). A bundle2 names it in its `Compression` stream parameter
 //! (`GZ`, `BZ` or `ZS`), and every byte after the stream parameters, every part and the stream's end, is one stream of
@@ -66,7 +66,7 @@ use crate::quote;
 use crate::read::{Cursor, to_u64};
 use crate::{Admission, PastAdmission, Truncated, bundle1};
 
-/// A compression engine, as a bundle names it (`compressionengine.bundletype()` [C]).
+/// A compression engine, as a bundle names it (`compressionengine.bundletype()` \[C\]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
   /// `UN`: no compression (7.2's `none`).

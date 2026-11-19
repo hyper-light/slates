@@ -1416,6 +1416,16 @@ mod literals {
     while i < bytes.len() {
       let c = bytes[i];
       let prev_is_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+      // A tuple field's index (`top.3`, `pair.0.1`) is a position, as an array index is, never a quantity.
+      let tuple_field = i > 1
+        && bytes[i - 1] == b'.'
+        && (bytes[i - 2].is_ascii_alphanumeric() || matches!(bytes[i - 2], b'_' | b')' | b']'));
+      if c.is_ascii_digit() && tuple_field {
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+          i += 1;
+        }
+        continue;
+      }
       if c.is_ascii_digit() && !prev_is_ident {
         let start = i;
         let radix_prefix =
@@ -1455,8 +1465,9 @@ mod literals {
 
   /// 0, 1 and 2 are arithmetic, not tuning: halves, doubles, increments, sentinels.
   fn is_trivial(literal: &str) -> bool {
+    // A `_` before a type suffix (`0_usize`) separates; it is no digit of the value.
     matches!(
-      literal.trim_end_matches('.'),
+      literal.trim_end_matches(['.', '_']),
       "0" | "1" | "2" | "0.0" | "1.0" | "2.0"
     )
   }
@@ -1474,6 +1485,36 @@ mod literals {
       || before.ends_with("align(")
       || after.starts_with(']')
       || before.ends_with("u8")
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::{is_trivial, numeric_literals};
+
+    /// Do: read typed zeros and ones written with a separator before the suffix. Expect each judged as the value it is:
+    /// `0_usize` is 0, never the literal `0_`.
+    #[test]
+    fn a_separator_before_a_type_suffix_is_no_digit() {
+      for literal in numeric_literals("let (a, b, c) = (0_usize, 1_u64, 0_u32); (1_u64..)") {
+        assert!(is_trivial(&literal), "{literal}");
+      }
+      assert!(
+        !numeric_literals("let n = 7_usize;")
+          .iter()
+          .all(|literal| is_trivial(literal))
+      );
+    }
+
+    /// Do: read tuple fields by position, then a range and a float beside them. Expect the fields' indexes not read as
+    /// literals, and the range's end and the float still read.
+    #[test]
+    fn a_tuple_fields_index_is_a_position_not_a_literal() {
+      assert!(numeric_literals("top.3 = true; pair.0.1; f().4; v[i].5").is_empty());
+      assert_eq!(
+        numeric_literals("let r = 0..7; let x = 3.5;"),
+        vec!["0", "7", "3.5"]
+      );
+    }
   }
 }
 

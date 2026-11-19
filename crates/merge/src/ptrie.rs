@@ -607,6 +607,16 @@ fn copy_of<V: Clone>(
   copy
 }
 
+/// Points the child at `index` of the node at `slot` at `child`: the node's slot is unique-made already, so the
+/// edit touches no other map's node.
+fn set_child<V>(nodes: &mut Nodes<V>, slot: Slot, index: usize, child: Slot) {
+  if let Some(node) = nodes.node_mut(slot)
+    && let Some(entry) = node.children.get_mut(index)
+  {
+    entry.1 = child;
+  }
+}
+
 /// Hangs `top` (a subtree's top node, its label relative to the graft point) under `rest` below the unique-made node
 /// at `slot`, where no key starts with `rest`: the node's new slot.
 fn graft_at<V: Clone>(
@@ -660,11 +670,7 @@ fn graft_at<V: Clone>(
       if common == label.len() {
         let below = rest.get(common..).unwrap_or_default();
         let child = graft_at(nodes, child, below, top, holders);
-        if let Some(node) = nodes.node_mut(slot)
-          && let Some(entry) = node.children.get_mut(index)
-        {
-          entry.1 = child;
-        }
+        set_child(nodes, slot, index, child);
       } else {
         // The destination and the child part within the child's label: split it there.
         let child = unique(nodes, child, holders);
@@ -688,11 +694,7 @@ fn graft_at<V: Clone>(
           count: child_count.saturating_add(added),
           holders: 1,
         });
-        if let Some(node) = nodes.node_mut(slot)
-          && let Some(entry) = node.children.get_mut(index)
-        {
-          entry.1 = middle;
-        }
+        set_child(nodes, slot, index, middle);
       }
     }
   }
@@ -744,11 +746,7 @@ fn insert_at<V: Clone>(
       if common == label.len() {
         let below = rest.get(common..).unwrap_or_default();
         let (child, replaced) = insert_at(nodes, child, below, value, holders);
-        if let Some(node) = nodes.node_mut(slot)
-          && let Some(entry) = node.children.get_mut(index)
-        {
-          entry.1 = child;
-        }
+        set_child(nodes, slot, index, child);
         replaced
       } else {
         // The key leaves the child's label partway: split the label there.
@@ -784,11 +782,7 @@ fn insert_at<V: Clone>(
           _ => middle.value = Some(value),
         }
         let middle = nodes.alloc(middle);
-        if let Some(node) = nodes.node_mut(slot)
-          && let Some(entry) = node.children.get_mut(index)
-        {
-          entry.1 = middle;
-        }
+        set_child(nodes, slot, index, middle);
         None
       }
     }
@@ -856,10 +850,8 @@ fn tidied<V: Clone>(
   slot: Slot,
   holders: &mut impl Holders<V>,
 ) -> Option<Slot> {
-  let (bare, children) = match nodes.node(slot) {
-    Some(node) => (node.value.is_none(), node.children.clone()),
-    None => return None,
-  };
+  let node = nodes.node(slot)?;
+  let (bare, children) = (node.value.is_none(), node.children.clone());
   if !bare {
     return Some(slot);
   }
