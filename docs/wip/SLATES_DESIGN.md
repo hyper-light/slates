@@ -35163,6 +35163,31 @@ Applied in the same change to: `docs/wip/models/Lineage.tla`, the new `docs/wip/
 - **Owed.** Main's TLC runs of both configurations (run-requests.md, 2026-11-19); a counterexample comes back as a new
   piece. The Rust lineage model's mirror of A-508 is main's to compile and run.
 
+### A-526 — A DAX backing taken back from a dead daemon clears each range not filled before its first fill (2026-11-18, goal 85, g079; §4.6 the backed route, the Shards form; A-365, A-419)
+Applied in the same change to: GAPS (A-419's sibling line), `crates/vfs/src/shards_backing.rs` (`ShardsBacking`'s
+`inherited`, set by `ShardsBackings::adopt_vmm`; `owes_clear`), `crates/bridge-core/src/dax_backing.rs` (a range's fill
+begins by clearing one `owes_clear` names; the failing test), and the bug record
+`docs/bugs/2026-11-18-a-range-a-dead-daemons-dax-fill-left-part-way-showed-its-bytes-to-the-successors-guest.md`.
+- **What was there.** A successor takes a Shards stream's DAX object back from the anchor with the ranges the dead
+  daemon's range table names filled (A-365). The table names a range only once its ask was answered, so the range that
+  daemon was filling when it died, or one whose fill it had refused (A-419's uncleared range, kept in its memory alone),
+  is named by nothing, and its object may hold that fill's bytes. The successor's fill of such a range skips the
+  volume's holes and pages of zeros (§4.6), so where the file had become a hole or zeros since, the guest's map showed
+  the dead daemon's bytes.
+- **The rule.** A backing taken back is inherited: each range it has not filled is cleared before its first fill there,
+  as an uncleared range is (A-419). Once filled it is the successor's own, and nothing more is cleared.
+- **Why this and not another.** Recording each range in the table at its fill's start would name exactly the ranges to
+  clear, at the cost of a table write per range and a new table layout, which a daemon of the old layout clears whole.
+  Reading the object's allocated runs at adoption (`SEEK_DATA` on Linux) has no macOS counterpart for shared memory.
+  The clear costs nothing where nothing was stored: a hole punch over an empty range on Linux, a residency test over
+  it on macOS; Windows streams hold no resync.
+- **Left.** Bytes a dead daemon's fill left in an unnamed range are counted by nothing until the range is filled or the
+  backing goes: at most the ranges its fills had begun and not finished.
+- **Tests.** `a_range_a_dead_daemons_fill_left_part_way_reads_the_volume_once_filled_again` (`crates/bridge-core/src/
+  dax_backing.rs`, the lib's unit tests: an object holding `A` over a range's first slice, taken back with no range
+  named, the file zeroed there, the range filled through the session that took it back). Red without the rule on the
+  Mac Studio; green with it.
+
 ### A-500 — The Subversion server on greens and works: one green per repository whose version N is revision N, FSFS's own commit rule as a stock client's verdict, every tunable learned, and svndiff 0 and 2 built (2026-11-18, g292 for UI goal 91; new §4.17.4; D-27, D-28; A-497)
 Applied in the same change to: §4.17.4 (new), `research/vcs-servers-subversion.md` (new), `research/vcs-servers.md`
 (a pointer to it), GAPS (the §4.17.4 entry), `crates/svn` (new, `slates-svn`: `src/lib.rs`, `src/svndiff.rs`,
