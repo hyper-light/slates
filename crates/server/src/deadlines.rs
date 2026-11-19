@@ -796,11 +796,12 @@ mod tests {
 
   /// A-525 (A-414's owed list; A-522's keeper). Do: on a one-shard daemon whose failover delay is a tenth of a liveness
   /// window, injected through the daemon's seam so that every beat publishes it, not written into the shard's state,
-  /// which the control shard's beat overwrites with its estimate (A-574, A-660), seat a client and ask its status; capture the report, grown to several pages, only two delays later, as a
-  /// scatter on a starved daemon does; then look until the shard lets the capture go. Expect: the first page served at
-  /// the capture, and the capture held a delay from its capture, then let go by the keeper, within half a window. Before,
-  /// the deadline counted from the request by the operator's ten-second placeholder, so the capture was held ten seconds;
-  /// counted from the request by the delay, the first page would have been refused.
+  /// which the control shard's beat overwrites with its estimate (A-574, A-660), seat a client and ask its status;
+  /// capture the report, grown to several pages, only two delays later, as a scatter on a starved daemon does; then look
+  /// until the shard lets the capture go. Expect: the first page served at the capture, and the capture held a delay
+  /// from its capture, then let go by the keeper, within half a window. Before, the deadline counted from the request by
+  /// the operator's ten-second placeholder, so the capture was held ten seconds; counted from the request by the delay,
+  /// the first page would have been refused.
   #[test]
   fn a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request() {
     let daemon = crate::daemon::audit_daemon_of(1);
