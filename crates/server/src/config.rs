@@ -479,6 +479,9 @@ pub struct DaemonConfig {
   /// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3), when the operator starts one:
   /// none from [`DaemonConfig::derive`].
   pub vcs_http: Option<VcsHttpConfig>,
+  /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684), when the operator starts one: none from
+  /// [`DaemonConfig::derive`].
+  pub vcs_ssh: Option<VcsSshConfig>,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
@@ -493,6 +496,19 @@ pub struct VcsHttpConfig {
   pub address: slates_rt::tcp::SocketAddrV4,
   /// The certificate chain and key its HTTPS presents: the node's own, the identity its RPC-with-TLS export presents
   /// (§4.6, AUD-29-75), handed in by the command that read the operator's files (R1: the daemon reads none).
+  pub identity: Option<EdgeIdentity>,
+}
+
+/// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684): where it listens and whose key it presents.
+/// Its connections, seats and channel window are derived from the shard's budget, as the HTTP edge's are, never
+/// configured (`crate::vcs_http::Bounds::of_shard`).
+#[derive(Clone, Debug)]
+pub struct VcsSshConfig {
+  /// Where the edge listens: any address, since SSH encrypts every connection and proves the server by its host key.
+  pub address: slates_rt::tcp::SocketAddrV4,
+  /// A fleet node's own identity, whose key the edge presents as its host key when it is Ed25519
+  /// (`EdgeIdentity::ed25519_seed`); none for any other daemon, which serves with the key its anchor made at its start
+  /// and keeps in the segment (`slates_anchor::layout::SUP_SSH_HOST_SEED`), or, run alone, one it makes itself.
   pub identity: Option<EdgeIdentity>,
 }
 
@@ -526,6 +542,18 @@ impl EdgeIdentity {
       slates_http_edge::tls::TlsRefused::Setup(rustls::Error::General(reason.to_owned()))
     })?;
     slates_http_edge::tls::ServingIdentity::new(chain, key)
+  }
+
+  /// The key's seed as the SSH edge's host key takes it (A-684): the key's own 32 bytes (RFC 8032 §5.1.5) when it is an
+  /// Ed25519 key, which RFC 8410 §7 writes as a PKCS#8 document, read by AWS-LC; none for a key of any other algorithm,
+  /// which no `ssh-ed25519` host key can be (RFC 8709), the one host key algorithm the edge presents.
+  pub(crate) fn ed25519_seed(&self) -> Option<[u8; slates_ssh::hostkey::ED25519_SEED_LEN]> {
+    use aws_lc_rs::encoding::AsBigEndian;
+    let pair = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&self.key).ok()?;
+    // AWS-LC's buffer wipes its bytes when dropped.
+    let seed = pair.seed().ok()?.as_be_bytes().ok()?;
+    let bytes: &[u8] = seed.as_ref();
+    <[u8; slates_ssh::hostkey::ED25519_SEED_LEN]>::try_from(bytes).ok()
   }
 }
 
@@ -1194,6 +1222,7 @@ impl DaemonConfig {
       nfs_v4,
       inode_reserve,
       vcs_http: None,
+      vcs_ssh: None,
       derivations,
     }
     .with_control_shard_noted()

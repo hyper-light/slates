@@ -13689,8 +13689,8 @@ const STOCK_HG: &str = "SLATES_TEST_HG";
 
 /// Format: the start of the daemon's line naming its SSH edge's address, in the words of the HTTP edge's line (main's
 /// ruling, 2026-11-19); the port follows, and the line names the host key's SHA256 fingerprint too, so [`port_on`]
-/// reads the port's digits alone. A-684 (g299) makes the line with `--vcs-ssh <addr>`; until it lands no daemon starts
-/// the SSH edge (`crates/server/src/vcs_ssh.rs`, its Owed).
+/// reads the port's digits alone. The daemon role writes it when started with `--vcs-ssh <addr>` (A-684,
+/// `crates/api/src/role/daemon.rs`): the port, then [`VCS_SSH_KEY_WORDS`] and the key's fingerprint.
 const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves on 127.0.0.1:";
 
 /// Format: the user name stock hg gives, over SSH and as Basic's user name. It proves nothing: the key the test
@@ -14136,5 +14136,295 @@ fn each_tool_creates_with_its_defaults(instance: &str) {
   assert!(
     out.contains("\"repository\":\"a-sha256-one\"") && out.contains("\"id\":\""),
     "{out}"
+  );
+}
+
+/// Format: the words between the port and the host key's fingerprint in the daemon's SSH edge line, after
+/// [`VCS_SSH_LINE`] (`crates/api/src/role/daemon.rs`).
+const VCS_SSH_KEY_WORDS: &str = " with the ED25519 host key ";
+/// Format: SSH's messages the host key reader sends or reads (RFC 4250 §4.1.2; RFC 5656 §7.1): a disconnect, KEXINIT,
+/// the client's ephemeral key and the server's reply.
+const SSH_MSG_DISCONNECT: u8 = 1;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEXINIT: u8 = 20;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
+/// Format: the most bytes of a packet the reader takes: RFC 4253 §6.1's 35000, which every implementation processes.
+const SSH_PACKET_CAP: usize = 35_000;
+/// Format: the longest identification line, carriage return and line feed included (RFC 4253 §4.2).
+const SSH_LINE_CAP: usize = 255;
+/// Format: the block a cleartext packet's length aligns to, and its least padding (RFC 4253 §6: "or 8, whichever is
+/// larger"; "at least four bytes of padding").
+const SSH_CLEAR_BLOCK: usize = 8;
+/// Format: see [`SSH_CLEAR_BLOCK`].
+const SSH_LEAST_PADDING: usize = 4;
+/// Format: X25519's base point, u = 9 (RFC 7748 §4.1), as the reader's ephemeral public key: any 32 bytes are one (§5),
+/// and the reader keeps nothing the exchange derives, so its own key needs no secret half.
+const X25519_BASE_POINT: [u8; 32] = {
+  let mut point = [0u8; 32];
+  point[0] = 9;
+  point
+};
+
+/// The port and host key fingerprint `line` names, when it is a daemon's SSH edge line.
+fn ssh_edge_of(line: &str) -> Option<(u16, String)> {
+  let rest = line.strip_prefix(VCS_SSH_LINE)?;
+  let (port, fingerprint) = rest.trim().split_once(VCS_SSH_KEY_WORDS)?;
+  Some((port.parse().ok()?, fingerprint.to_owned()))
+}
+
+/// `bytes` as an SSH string (RFC 4251 §5): its length, then itself.
+fn put_ssh_string(out: &mut Vec<u8>, bytes: &[u8]) {
+  out.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+  out.extend_from_slice(bytes);
+}
+
+/// The SSH string at `at` in `bytes`, and where the next field starts; none past the end.
+fn ssh_string(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
+  let start = at.checked_add(4)?;
+  let length = u32::from_be_bytes(bytes.get(at..start)?.try_into().ok()?);
+  let end = start.checked_add(usize::try_from(length).ok()?)?;
+  Some((bytes.get(start..end)?, end))
+}
+
+/// `payload` as a cleartext SSH packet (RFC 4253 §6): its length, its padding's length, itself and its padding.
+fn ssh_packet(payload: &[u8]) -> Vec<u8> {
+  let unpadded = 4 + 1 + payload.len();
+  let mut padding = SSH_CLEAR_BLOCK - unpadded % SSH_CLEAR_BLOCK;
+  if padding < SSH_LEAST_PADDING {
+    padding += SSH_CLEAR_BLOCK;
+  }
+  let mut packet = Vec::new();
+  packet.extend_from_slice(
+    &u32::try_from(1 + payload.len() + padding)
+      .unwrap()
+      .to_be_bytes(),
+  );
+  packet.push(u8::try_from(padding).unwrap());
+  packet.extend_from_slice(payload);
+  packet.resize(packet.len() + padding, 0);
+  packet
+}
+
+/// The reader's KEXINIT (RFC 4253 §7.1): `curve25519-sha256` (RFC 8731) and `ssh-ed25519` (RFC 8709) alone, an AEAD
+/// cipher each way (whose MAC lists are not negotiated), no compression, no guess.
+fn ssh_kexinit() -> Vec<u8> {
+  let mut payload = vec![SSH_MSG_KEXINIT];
+  payload.extend_from_slice(&[0u8; 16]);
+  for list in [
+    "curve25519-sha256",
+    "ssh-ed25519",
+    "chacha20-poly1305@openssh.com",
+    "chacha20-poly1305@openssh.com",
+    "hmac-sha2-256",
+    "hmac-sha2-256",
+    "none",
+    "none",
+    "",
+    "",
+  ] {
+    put_ssh_string(&mut payload, list.as_bytes());
+  }
+  payload.push(0);
+  payload.extend_from_slice(&0u32.to_be_bytes());
+  payload
+}
+
+/// An error of the reader's, for what the server sent it.
+fn ssh_refusal(what: String) -> std::io::Error {
+  std::io::Error::new(std::io::ErrorKind::InvalidData, what)
+}
+
+/// Reads the server's identification line (RFC 4253 §4.2), passing over the lines a server may send before it.
+fn ssh_identification(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+  use std::io::Read;
+  loop {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while line.last() != Some(&b'\n') {
+      stream.read_exact(&mut byte)?;
+      line.extend_from_slice(&byte);
+      if line.len() > SSH_LINE_CAP {
+        return Err(ssh_refusal(format!("a line past {SSH_LINE_CAP} bytes")));
+      }
+    }
+    if line.starts_with(b"SSH-") {
+      return Ok(());
+    }
+  }
+}
+
+/// The payload of the next cleartext packet `stream` brings (RFC 4253 §6), one past [`SSH_PACKET_CAP`] refused.
+fn ssh_payload(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+  use std::io::Read;
+  let mut length = [0u8; 4];
+  stream.read_exact(&mut length)?;
+  let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+  if length > SSH_PACKET_CAP {
+    return Err(ssh_refusal(format!("a packet of {length} bytes")));
+  }
+  let mut packet = vec![0u8; length];
+  stream.read_exact(&mut packet)?;
+  let padding = usize::from(packet.first().copied().unwrap_or_default());
+  packet
+    .get(1..length.saturating_sub(padding))
+    .map(<[u8]>::to_vec)
+    .ok_or_else(|| ssh_refusal(format!("a packet of {length} bytes padded {padding}")))
+}
+
+/// The host key blob the SSH edge at loopback `port` sends in its first key exchange, waiting `patience` for each read:
+/// RFC 5656 §4's `K_S` in the server's `SSH_MSG_KEX_ECDH_REPLY`, cleartext before the keys are taken; or why there was
+/// none (a refused connection among them). A reader written for this test from the RFCs: it offers what
+/// [`ssh_kexinit`] lists, sends its ephemeral key once the server's KEXINIT came, and reads up to the server's reply.
+/// It checks no signature: the edge's own tests do, with slates-ssh's client written from the RFCs
+/// (`crates/server/src/vcs_ssh/tests/daemon_edge.rs`).
+fn ssh_host_key(port: u16, patience: Duration) -> std::io::Result<Vec<u8>> {
+  use std::io::Write;
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  stream.write_all(b"SSH-2.0-slates_cli_test\r\n")?;
+  stream.write_all(&ssh_packet(&ssh_kexinit()))?;
+  ssh_identification(&mut stream)?;
+  loop {
+    let payload = ssh_payload(&mut stream)?;
+    match payload.first().copied() {
+      Some(SSH_MSG_KEXINIT) => {
+        let mut init = vec![SSH_MSG_KEX_ECDH_INIT];
+        put_ssh_string(&mut init, &X25519_BASE_POINT);
+        stream.write_all(&ssh_packet(&init))?;
+      }
+      Some(SSH_MSG_KEX_ECDH_REPLY) => {
+        return ssh_string(&payload, 1)
+          .map(|(key, _)| key.to_vec())
+          .ok_or_else(|| ssh_refusal("a reply without its host key".to_owned()));
+      }
+      Some(SSH_MSG_DISCONNECT) => {
+        return Err(ssh_refusal("the edge disconnected".to_owned()));
+      }
+      _ => {}
+    }
+  }
+}
+
+/// The port and host key fingerprint the next daemon of an anchor names for its SSH edge, from the anchor's forwarded
+/// `lines`, read until that daemon says it serves (`serving_line`); none if it named none first.
+fn ssh_edge_before_serving(
+  lines: &std::sync::mpsc::Receiver<String>,
+  serving_line: &str,
+) -> Option<(u16, String)> {
+  let mut edge = None;
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the daemon served within the start's ceiling");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    edge = ssh_edge_of(&line).or(edge);
+    if line.starts_with(serving_line) {
+      return edge;
+    }
+  }
+}
+
+/// What an anchor's forwarded `lines` show of its daemon's restart after a kill, its SSH edge at `port`: the
+/// successor's pid; the host key the edge presents at `port` once the anchor said it restarted the daemon, asked
+/// before the successor served; and the port and fingerprint the successor names before it serves (`serving_line`).
+fn ssh_edge_across_a_restart(
+  lines: &std::sync::mpsc::Receiver<String>,
+  serving_line: &str,
+  port: u16,
+) -> (
+  Option<u32>,
+  Option<std::io::Result<Vec<u8>>>,
+  Option<(u16, String)>,
+) {
+  let (mut successor, mut while_restarting, mut again, mut served) = (None, None, None, false);
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served again: {line}"
+    );
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(ssh_host_key(port, START_CEILING));
+    }
+    again = ssh_edge_of(&line).or(again);
+    served |= line.starts_with(serving_line);
+  }
+  (successor, while_restarting, again)
+}
+
+/// A-684 (§4.17.2 "Transports" item 2). Do: start an anchor with the version-control SSH edge on loopback
+/// (`--vcs-ssh 127.0.0.1:0`); read the port and host key fingerprint its daemon names; take the edge's host key from a
+/// key exchange; kill the daemon; once the anchor says it restarted it, take the key again at the same port, before the
+/// successor serves; read what the successor names. Expect: the daemon names the edge's port and its key's fingerprint
+/// before it says it serves; the key the edge presents is the one the fingerprint names; the exchange begun while the
+/// daemon was gone is answered by its successor with the same key; and the successor names the same port and
+/// fingerprint: the anchor holds the edge's listener and its host key, so a restart keeps both and a client's
+/// `known_hosts` line stays good.
+#[test]
+fn an_anchors_vcs_ssh_edge_names_its_host_key_and_a_restart_keeps_port_and_key() {
+  let instance = format!("cli-vcs-ssh-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-ssh",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let (port, fingerprint) = ssh_edge_before_serving(&lines, &serving_line)
+    .expect("the daemon named its SSH edge's port and host key before it served");
+  let key = ssh_host_key(port, WAIT_FOR).expect("the edge's host key");
+  assert_eq!(
+    slates_server::credentials::key_fingerprint(&key),
+    fingerprint,
+    "the edge presents the key its daemon names"
+  );
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let (successor, while_restarting, again) = ssh_edge_across_a_restart(&lines, &serving_line, port);
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let restarted = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the edge's port was dropped while its daemon restarted: {error}")
+    });
+  assert_eq!(restarted, key, "the successor presents the anchor's key");
+  assert_eq!(
+    again,
+    Some((port, fingerprint)),
+    "the restarted daemon serves the edge on the port its anchor holds, with the key it holds"
   );
 }

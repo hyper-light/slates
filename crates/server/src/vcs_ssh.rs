@@ -59,15 +59,22 @@
 //! lifetimes this edge's authenticated connections lived (RFC 6298's estimator), the hour before any
 //! (`slates_ssh::keylife::key_time_limit_ns`). Only a connection that ended as its client ended it is a sample.
 //!
-//! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the host key's keeping, an edge state
-//! kept on every shard); the four services' server halves, each refused as not served until it lands (git's
-//! upload-pack, A-640; receive-pack, A-620; Mercurial's `serve --stdio`, A-650; Subversion's tunnel, §4.17.4 piece 12);
-//! Subversion's tunnel moved to the shard of the repository its greeting names; the live `git clone` over SSH (main's
-//! run).
+//! **The daemon's edge** ([`daemon_edge`], A-684): `--vcs-ssh ADDRESS` starts it, its listener on the control shard and
+//! an edge state kept on every shard, so a connection moves to its repository's owner; its listener and host key held
+//! by the anchor across daemon restarts (the fleet node's own key on a fleet node); and the daemon's log names its
+//! address and its host key's fingerprint.
+//!
+//! **Owed** (GAPS, the §4.17 entry): the four services' server halves, each refused as not served until it lands (git's
+//! upload-pack through the stores' lender, A-682; receive-pack, A-683; Mercurial's `serve --stdio`, A-650; Subversion's
+//! tunnel, §4.17.4 piece 12); Subversion's tunnel moved to the shard of the repository its greeting names; the live
+//! `git clone` over SSH (main's run).
 
+mod daemon_edge;
 mod git;
 pub(crate) mod site;
 mod waits;
+
+pub(crate) use daemon_edge::{bind, start};
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -146,7 +153,8 @@ impl std::fmt::Display for EdgeRefused {
   }
 }
 
-/// The host key's seed, overwritten with zeros when dropped (as `slates_ssh::kex::Secret` is).
+/// The host key's seed, overwritten with zeros when dropped (as `slates_ssh::kex::Secret` is): the edge's own, and each
+/// copy the daemon's start holds on its way there ([`daemon_edge`]).
 struct HostSeed([u8; ED25519_SEED_LEN]);
 
 impl Drop for HostSeed {

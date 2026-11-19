@@ -277,19 +277,19 @@ fn a_daemons_edge_moves_a_proven_request_to_its_repositorys_shard_and_refuses_th
 #[test]
 fn a_held_listener_is_adopted_only_where_the_configuration_says() {
   let at = |octets: [u8; 4], port: u16| SocketAddrV4::new(Ipv4Addr::from(octets), port);
-  assert!(super::listens_at(
+  assert!(crate::daemon::listens_at(
     at([127, 0, 0, 1], 8080),
     at([127, 0, 0, 1], 8080)
   ));
-  assert!(super::listens_at(
+  assert!(crate::daemon::listens_at(
     at([127, 0, 0, 1], 51234),
     at([127, 0, 0, 1], 0)
   ));
-  assert!(!super::listens_at(
+  assert!(!crate::daemon::listens_at(
     at([127, 0, 0, 1], 8081),
     at([127, 0, 0, 1], 8080)
   ));
-  assert!(!super::listens_at(
+  assert!(!crate::daemon::listens_at(
     at([0, 0, 0, 0], 8080),
     at([127, 0, 0, 1], 8080)
   ));

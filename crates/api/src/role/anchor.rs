@@ -206,6 +206,47 @@ fn hold_vcs_http_listener(
   Ok(())
 }
 
+/// Binds the version-control servers' SSH edge's listener at the address the operator gave (`--vcs-ssh`; A-684), as the
+/// daemon binds its own (`slates_server::daemon::bind_vcs_ssh_listener`), and gives it to `supervisor` to hand to every
+/// daemon it spawns ([`slates_anchor::ENV_VCS_SSH`]), as [`hold_vcs_http_listener`] does the HTTP edge's: an address that
+/// cannot be bound refuses the anchor's start by name, and one that cannot be made inheritable is not held, each daemon
+/// then binding its own.
+#[cfg(unix)]
+fn hold_vcs_ssh_listener(
+  supervisor: &mut Supervisor,
+  config: &DaemonConfig,
+  address: slates_rt::tcp::SocketAddrV4,
+) -> Result<(), Failure> {
+  let listener = slates_server::daemon::bind_vcs_ssh_listener(config, address)
+    .map_err(|e| failed("vcs-ssh", format!("{address}: {e}")))?;
+  let fd = listener.into_owned();
+  if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()) {
+    slates_machine::log_line!(
+      "slates anchor: the SSH edge's listener cannot be made inheritable ({e}); each daemon binds its own"
+    );
+    return Ok(());
+  }
+  supervisor.hold_vcs_ssh_listener(fd);
+  Ok(())
+}
+
+/// Makes the SSH edge's Ed25519 host key from the system's generator and publishes its seed in `segment`
+/// (`slates_anchor::layout::SUP_SSH_HOST_SEED`; A-684), before any daemon reads the segment: every daemon under this
+/// anchor serves the edge with it, so a restart keeps the key a client pinned, for as long as the anchor lives. A draw
+/// that fails refuses the anchor's start by name, as an address that cannot be bound does: the operator asked for the
+/// edge. The copy here is wiped once published.
+fn publish_ssh_host_key(segment: &mut AnchorSegment) -> Result<(), Failure> {
+  let mut seed = [0u8; slates_anchor::layout::SSH_HOST_SEED_BYTES];
+  slates_transport::handshake::secure_random(&mut seed)
+    .map_err(|e| failed("vcs-ssh host key", e))?;
+  let published = segment
+    .publish_ssh_host_seed(&seed)
+    .map_err(|e| failed("vcs-ssh host key", e));
+  seed.fill(0);
+  std::hint::black_box(&seed);
+  published
+}
+
 fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
   Failure::Failed(format!("{what}: {e}"))
 }
@@ -274,6 +315,12 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       .publish_launcher_secret(secret.bytes())
       .map_err(|e| failed("launcher secret", e))?;
   }
+  // The SSH edge's host key (A-684), made here at the anchor's start and published the same way, on the page locked
+  // above where the OS allows, so every daemon serves the edge with one key and a restart keeps it beside the port held
+  // below. A fleet node's edge presents the node's own key, read from its plan by each daemon, so its anchor makes none.
+  if options.vcs_ssh.is_some() && options.fleet.is_none() {
+    publish_ssh_host_key(&mut segment)?;
+  }
   // A crash loop's backoff doubles to its cap (A-311, [`restart_policy`]), logged with its derivation as the daemon's
   // derived constants are.
   let policy = restart_policy(&config);
@@ -304,6 +351,11 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   #[cfg(unix)]
   if let Some(address) = options.vcs_http {
     hold_vcs_http_listener(&mut supervisor, &config, address)?;
+  }
+  // And the SSH edge's (A-684), whose host key the segment already holds.
+  #[cfg(unix)]
+  if let Some(address) = options.vcs_ssh {
+    hold_vcs_ssh_listener(&mut supervisor, &config, address)?;
   }
   // The FUSE devices daemons mount are held the same way (A-61): a daemon sends each to the anchor, and the
   // next daemon takes back the mounts it recovers. A channel that cannot be opened refuses the anchor's start:

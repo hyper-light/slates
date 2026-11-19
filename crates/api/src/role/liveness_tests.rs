@@ -115,6 +115,7 @@ fn options(instance: String) -> ProcessOptions {
     shards: Some(TEST_SHARDS),
     fleet: None,
     vcs_http: None,
+    vcs_ssh: None,
   }
 }
 
