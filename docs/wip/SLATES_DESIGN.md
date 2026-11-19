@@ -12023,8 +12023,10 @@ is one more version, and the chain itself is never rewritten.
 > operation made has its git objects derived from the history alone (`slates_git::derived`, §4.17.2's status): its
 > trees from its path map's change, and its commit from its tree, its parents' commits, the merge record's principal
 > and time and the submit's message, so every holder computes the same commit (§4.16 "Apply on holders"); a version a
-> client pushed keeps the client's commit. Owed: item 4's identities in the principal's record and the refusals at
-> submit (A-664 part 1), the commit recorded with the version and admitted (part 3), Mercurial's and Subversion's.
+> client pushed keeps the client's commit. Item 4's identities are kept in each principal's record (A-664 part 1,
+> `slates-db`'s `IdentityRecord`). Owed: setting them on the control channel, a session carrying them from its first
+> submit, and the refusals at submit (part 1's server half), the commit recorded with the version and admitted (part
+> 3), Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -46434,3 +46436,31 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
 - **Applied in the same change to:** `crates/git/src/derived.rs`, `derived/tree.rs`, `derived/commit.rs` (new),
   `crates/git/src/lib.rs`; `crates/git/src/tests/derived/` (new); `crates/git/fixtures/made/` (new); §4.17.1 "A push is
   a work"'s status; §4.17.2's status and piece 13; A-645's entry; GAPS' §4.17 entry.
+
+### A-664 part 1, the record — A principal's tool identities as one record a principal, set whole from the version its setter read (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.13 "a principal's record"; §4.17.1 "A push is a work" item 4; §4.17.3 decision 7; after A-664 part 2, A-622)
+
+- **The record** (`slates_db::catalog::IdentityRecord`): the principal, git's author and committer (`GitIdentity`: the
+  name and the email as git writes them, which the server holds to git's own rules, `slates_git::derived::Identity`,
+  before it records them), Mercurial's user (`Name <address>`), and a version. One a principal, kept by the principal's
+  key on the partition that holds the principal's record, never grown by a workload.
+- **Set whole from the version read** (`Op::IdentitiesSet`, appended, wire tag 98 published): the record's version must
+  be the one after the version held (the first setting's 1), as A-622's repository policy is set, else refused
+  `PolicyChanged` naming the version now, with nothing changed. The partition's snapshot carries the records
+  (`identities`, appended), so a recovery holds them as they were.
+- **Main's ruling for the server half** (2026-11-19): a session's identities are resolved once, at its first submit,
+  from the principal's partition, and kept with the session; the submit carries them and the merge record stores them;
+  the green's owner never reads them per merge (§2 banned item 10's spirit), and an identity changed mid-session applies
+  from the next session.
+- **Tests** (`crates/db/src/tests/identities.rs`; Windows x86_64, jupiter, 2026-11-19, a fresh clone of the pushed branch
+  at ecf4ecc34 with its own target directory, while the Mac Studio was offline; the macOS run is owed): `cargo test
+  --locked -p slates-db --lib` 144 of 144 (main's 142 at 018d32ba2 and the 2 new), and `--test wire_order` 2 passed,
+  its writer ignored. A setting kept and then replaced whole; a stale, a skipped and another principal's non-first
+  setting each refused `PolicyChanged` naming the version held, nothing changed; an agent's and a host account's records
+  carried through the partition's snapshot, versions included. Red once on jupiter: the version guard taking any
+  version failed the version test; green again after.
+- **Owed.** The server half above (after main's `slates-server` baseline on jupiter); the Mercurial user held to
+  Mercurial's rules when it is set; part 3.
+- **Applied in the same change to:** `crates/db/src/catalog.rs` (`GitIdentity`, `IdentityRecord`), `op.rs`
+  (`IdentitiesSet`), `partition.rs` (the map, its check, apply and snapshot), `error.rs` (`PolicyChanged`'s words),
+  `crates/db/src/tests/identities.rs` (new), `crates/db/tests/wire_order.txt`; §4.17.1 "A push is a work"'s status;
+  GAPS' §4.17 entry.

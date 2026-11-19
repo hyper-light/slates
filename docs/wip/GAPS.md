@@ -6,17 +6,24 @@
 > **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** Derived data as one mechanism, part 1 BUILT (A-647, g302, 2026-11-19): `slates-vcs`'s `derived` module (a type a pure function of a version's change and its parents' values; values kept as content under (type, version) in an index whose rows never change, `Identical` or `Diverged`; eager or lazy by the type's declaration; a fill walking up to the nearest kept ancestors and deriving down a unit a step, its waiting versions charged to the budget; typed refusals; `Form::Derived` nodes that hold and free what they name) and its first type, a version's map of paths to contents (one hash array mapped trie a directory, the shape the names' alone, derived by path copying through the change's directories); its oracle holds every value to the map built from scratch and counts each derivation's directories against the change's (`cargo test --locked -p slates-vcs --lib`, 45 of 45, Mac Studio). Part 2 BUILT (A-647): A-614's D(k) and reached sets are a type (`slates-git`'s `store::ReachSets`), each version recording the version its set was remade from; over A-614's generated histories every derived value is the store's own sets and the value it kept, and each derivation walks what its admission walked (`slates-git --lib` 446 of 446). OWED: the git store serving D(k) from its values; A-553's and A-588's stores as types; the server's use of it; dropping values no version needs; releases and large derivations sliced; merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
 >
 > **A-664 (2026-11-19, g308; §4.17.1 "A push is a work" items 3 and 4; §4.17.2 piece 13; §4.17.3 decision 7 and piece
-> 6): the commits the server makes.** Part 2 BUILT: `slates-git`'s `derived` module makes a version's git objects as
+> 6): the commits the server makes.** Part 2 BUILT (main 78a670256): `slates-git`'s `derived` module makes a version's git objects as
 > two types of A-647's derived data: its trees (`Trees`, derived from the change the path map reads: each file's mode
 > from its class, git's order, only the change's directories made again, a directory past one node through lists) and
 > its commit (`Commits`: a pushed version's client commit, or the server's of the version's tree, its parents' commits,
 > the principal's identity at the merge record's time in UTC and the submit's message, as `git commit-tree -m` writes
 > it); every object made passes git's strict fsck. Golden vectors from stock git 2.50.1 (`fixtures/made`), an oracle
 > over generated histories against the trees built from each version's whole path map, and a determinism gate (A-664's
-> entry has the runs). OWED: part 1, each principal's record holding its tool identities (git's name and email,
-> Mercurial's `Name <address>`), set by its owner on the control channel, and a submit to a repository's green
-> carrying a message, refused `MessageRequired` without one and `IdentityRequired` for a principal with no identity in
-> the repository's tool, before any work is built; part 3, the made commit recorded with the version (the merge record
+> entry has the runs). Part 1's record BUILT: `slates-db`'s `IdentityRecord`, one a principal (git's name and email,
+> Mercurial's `Name <address>`), kept by principal key on the principal's partition, set whole as the version after
+> the one held (`Op::IdentitiesSet`, wire tag 98; a stale setting refused `PolicyChanged`, nothing changed) and carried
+> by the partition's snapshot (`slates-db --lib` 144 of 144 and `--test wire_order` on Windows x86_64, jupiter; the
+> macOS run owed). OWED: part 1's server half (after main's `slates-server` baseline on jupiter): the owner's setting on
+> the control channel (the launcher's proof, `Forbidden` on a consumer's channel, each identity held to its tool's
+> rules); a session's identities resolved once, at its first submit, from the principal's partition and kept with the
+> session (main's ruling: the owner never reads them per merge, and a change mid-session applies from the next
+> session); the submit carrying its message and the session's identities, refused at the green's owner
+> `MessageRequired` without a message and `IdentityRequired` without an identity in the repository's tool, before any
+> work is built; part 3, the made commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
 > it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
 > `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
