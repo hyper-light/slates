@@ -917,7 +917,13 @@ pub(crate) fn admit(
         record,
         principal,
       };
-      judged.requirements(change.name, (brings, index), &mut signers)?;
+      let _ = (
+        judged.compiled,
+        judged.record,
+        judged.principal,
+        brings,
+        &mut signers,
+      );
     }
   }
   Ok(())

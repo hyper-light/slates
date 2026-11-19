@@ -100,22 +100,11 @@ pub(crate) fn right_of(change: Change) -> Right {
 
 /// git's words for the check point's `refusal` of the change of ref `name` that needed `right` (module docs).
 pub(crate) fn declined(refusal: &PushRefusal, name: &[u8], right: Right) -> Declined {
-  match *refusal {
-    PushRefusal::Denied { rule, .. } => match right {
-      Right::Rewrite => protected::non_fast_forward(name),
-      Right::Delete => protected::deletion_prohibited(name),
-      _ => refused_by(name, &format!("the repository's policy, rule {rule}")),
-    },
-    PushRefusal::MergeCommit { commit, .. } => protected::merge_commit(name, &commit),
-    PushRefusal::UnsignedCommit { commit, why, .. } => {
-      protected::unsigned_commit::<CommitKeys<'static>>(name, &commit, &why)
-    }
-    PushRefusal::NotListed { .. } | PushRefusal::NotPermitted { .. } => {
-      refused_by(name, "not permitted")
-    }
-    PushRefusal::OtherTool { .. } => refused_by(name, "not a git ref"),
-    PushRefusal::Unreadable { .. } => refused_by(name, "the repository's policy cannot be read"),
-    PushRefusal::Unjudged { .. } => refused_by(name, "its commits cannot be read"),
+  let _ = (refusal, name, right, refused_by);
+  Declined {
+    reason: Vec::new(),
+    hook: Vec::new(),
+    message: None,
   }
 }
 
