@@ -23,7 +23,7 @@ const DRAFT_WIRE: &str = "2c3ecce4a5bc05895bf07a7ba956b6c68829ac7c83b780b7000ecd
 fn draft_payload() -> Vec<u8> {
   let text = b"Lorem ipsum dolor sit amet, consectetur adipisicing elit";
   let mut payload = vec![0x5e, 0, 0, 0, 0];
-  payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
+  payload.extend_from_slice(&u32::try_from(text.len()).unwrap().to_be_bytes());
   payload.extend_from_slice(text);
   payload
 }
@@ -164,10 +164,10 @@ fn gcm_follows_rfc_5647s_nonce_and_additional_data() {
       "the plaintext after the length is a multiple of 16"
     );
     assert_eq!(out.len(), LENGTH_LEN + length + TAG_LEN);
-    let padding = (length - 1 - payload.len()) as u8;
+    let padding = u8::try_from(length - 1 - payload.len()).unwrap();
     let mut plain = vec![padding];
     plain.extend_from_slice(payload);
-    let mut padding_bytes = vec![0u8; padding as usize];
+    let mut padding_bytes = vec![0u8; usize::from(padding)];
     crate::entropy::Entropy::fill(&mut Seeded::new(index as u64 + 1), &mut padding_bytes).unwrap();
     plain.extend_from_slice(&padding_bytes);
     let mut nonce = [0u8; 12];
@@ -180,11 +180,11 @@ fn gcm_follows_rfc_5647s_nonce_and_additional_data() {
     let tag = by_hand
       .seal_in_place_separate_tag(
         Nonce::assume_unique_for_key(nonce),
-        Aad::from((length as u32).to_be_bytes()),
+        Aad::from(u32::try_from(length).unwrap().to_be_bytes()),
         &mut plain,
       )
       .unwrap();
-    let mut expected = (length as u32).to_be_bytes().to_vec();
+    let mut expected = u32::try_from(length).unwrap().to_be_bytes().to_vec();
     expected.extend_from_slice(&plain);
     expected.extend_from_slice(tag.as_ref());
     assert_eq!(out, expected, "packet {index}");
@@ -339,7 +339,7 @@ proptest! {
     selector in 0usize..3,
   ) {
     let cipher = [None, Some(Cipher::ChaCha20Poly1305), Some(Cipher::Aes256Gcm)][selector];
-    let payload: Vec<u8> = (0..payload_len).map(|index| index as u8).collect();
+    let payload: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
     let (mut sealer, mut opener, alignment, tag) = pair(cipher);
     let mut out = Vec::new();
     prop_assert_eq!(sealer.seal(&payload, &mut Seeded::new(seed), &mut out), Ok(()));

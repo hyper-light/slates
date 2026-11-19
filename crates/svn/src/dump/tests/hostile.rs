@@ -28,10 +28,15 @@ fn end_here(reader: &Reader, held: &[u8]) -> Result<Vec<Owned>, DumpError> {
         push(&mut events, Owned::of(event));
         start += consumed;
       }
-      Read::NeedMore { .. } => panic!("asked for more after the stream's end"),
+      Read::NeedMore { .. } => asked_for_more_after_the_end(),
       Read::End => return Ok(events),
     }
   }
+}
+
+/// A reader that asked for more after the stream's end broke its promise.
+fn asked_for_more_after_the_end() -> ! {
+  panic!("asked for more after the stream's end")
 }
 
 /// Reads on with the stream open as far as `held` allows, dropping what the reader consumes.

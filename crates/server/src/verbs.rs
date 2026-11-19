@@ -9330,9 +9330,10 @@ fn judge_submission(
   };
   let bound =
     slates_merge::chain_entry::entry_bound(increment_bytes.len(), &inc).saturating_add(room);
-  // Judged as the record will be: a member's version is an entry of its repository's register (A-603).
-  let next = state.db.partition().green_head(green_id).saturating_add(1);
-  let admission = crate::repository::version_record(state, green_id, next, vec![0; bound]);
+  let admission = Op::GreenAdvanced {
+    green: green_id,
+    increment: vec![0; bound],
+  };
   let now = state.clock.monotonic_ns();
   if let Err(refusal) = chain_admits(state, green_id, &admission, now) {
     return refused(refusal);
@@ -9496,8 +9497,11 @@ fn record_accepted(
     identity,
     crate::signed_work::to_entry(verification),
   );
-  // A member's version is an entry of its repository's register (§4.17.1 shared piece 2, A-603).
-  let record = crate::repository::version_record(state, green, version, entry);
+  // A version alone is an append to its own green's log (A-642): no position of a whole repository moves.
+  let record = Op::GreenAdvanced {
+    green,
+    increment: entry,
+  };
   let now = state.clock.monotonic_ns();
   state
     .db

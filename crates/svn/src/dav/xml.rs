@@ -270,8 +270,26 @@ impl XmlRefusal {
   }
 }
 
+/// A body read whole: its root element, and the namespaces it declares as `apr_xml_parse` keeps them, which
+/// `apr_xml_to_text` declares again when it writes an element whole (`APR_XML_X2T_FULL_NS_LANG`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Document {
+  /// The root element.
+  pub root: Element,
+  /// Every namespace the body declares, each once and quoted as `apr_xml_quote_string` quotes it with its quotes flag
+  /// set: `DAV:` first, which the parser holds before it reads a byte (`apr_xml_parser_create`), then each new one in
+  /// the order `start_handler` meets it, elements in document order and an element's declarations last first, since
+  /// its attribute list is built in reverse (`apr_xml.c` 162-169, 200-225, 399).
+  pub namespaces: Vec<String>,
+}
+
 /// Reads `body` whole into its root element, within `bounds`.
 pub fn parse(body: &[u8], bounds: &Bounds) -> Result<Element, XmlRefusal> {
+  parse_document(body, bounds).map(|document| document.root)
+}
+
+/// Reads `body` whole into its root element and the namespaces it declares, within `bounds`.
+pub fn parse_document(body: &[u8], bounds: &Bounds) -> Result<Document, XmlRefusal> {
   if body.len() > bounds.body_bytes {
     return Err(XmlRefusal::TooLarge {
       bytes: body.len(),
@@ -289,6 +307,7 @@ pub fn parse(body: &[u8], bounds: &Bounds) -> Result<Element, XmlRefusal> {
     bounds,
     elements: 0,
     scopes: vec![(String::from("xml"), String::from(XML_NAMESPACE))],
+    declared: vec![String::from(super::DAV)],
   };
   reader.declaration()?;
   reader.misc()?;
@@ -298,7 +317,10 @@ pub fn parse(body: &[u8], bounds: &Bounds) -> Result<Element, XmlRefusal> {
   let root = reader.root()?;
   reader.misc()?;
   if reader.rest().is_empty() {
-    Ok(root)
+    Ok(Document {
+      root,
+      namespaces: reader.declared,
+    })
   } else {
     Err(XmlRefusal::TrailingContent { at: reader.at })
   }
@@ -326,6 +348,8 @@ struct Reader<'b> {
   elements: usize,
   /// The namespace bindings in scope, innermost last: each a prefix (empty for the default) and its namespace.
   scopes: Vec<(String, String)>,
+  /// The namespaces declared so far, in `apr_xml_parse`'s order ([`Document::namespaces`]).
+  declared: Vec<String>,
 }
 
 impl Reader<'_> {
@@ -586,13 +610,20 @@ impl Reader<'_> {
     Ok(value)
   }
 
-  /// Puts the namespace declarations among `raw` in scope.
+  /// Puts the namespace declarations among `raw` in scope, and records each namespace new to the body.
   fn declare(&mut self, raw: &[(String, String)]) {
     for (name, value) in raw {
       if name == XMLNS {
         self.scopes.push((String::new(), value.clone()));
       } else if let Some(prefix) = name.strip_prefix("xmlns:") {
         self.scopes.push((prefix.to_owned(), value.clone()));
+      }
+    }
+    for (name, value) in raw.iter().rev() {
+      let declaration = name == XMLNS || name.starts_with("xmlns:");
+      let quoted = quote(value, true);
+      if declaration && !self.declared.iter().any(|known| *known == quoted) {
+        self.declared.push(quoted.into_owned());
       }
     }
   }
@@ -862,6 +893,49 @@ pub fn base64_lines(bytes: &[u8]) -> String {
     out.push('\n');
   }
   out
+}
+
+/// Base64 with no line breaks over bytes that arrive a piece at a time, as `svn_base64_encode2` writes it into a stream
+/// with `break_lines` off (`dav_svn__make_base64_output_stream`): each group of three bytes is written as it becomes
+/// whole, the bytes of a group not yet whole are carried, and the last group is padded when the stream ends. The text
+/// is the same however the bytes were split.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Base64Stream {
+  /// The bytes of a group not yet whole: fewer than three.
+  carried: Vec<u8>,
+}
+
+impl Base64Stream {
+  /// A stream that has written nothing.
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// The text of every group `bytes` makes whole; the rest is carried to the next push.
+  pub fn push(&mut self, bytes: &[u8]) -> String {
+    let (group_bytes, group_characters) = BASE64_GROUP;
+    self.carried.extend_from_slice(bytes);
+    let whole = self
+      .carried
+      .len()
+      .saturating_sub(self.carried.len().checked_rem(group_bytes).unwrap_or(0));
+    let groups = whole.checked_div(group_bytes).unwrap_or(0);
+    let mut out = String::with_capacity(groups.saturating_mul(group_characters));
+    for group in self.carried.get(..whole).unwrap_or(&[]).chunks(group_bytes) {
+      push_base64_group(&mut out, group);
+    }
+    self.carried = self.carried.get(whole..).unwrap_or(&[]).to_vec();
+    out
+  }
+
+  /// Ends the stream: the carried bytes as the last group, padded; nothing when no byte is carried.
+  pub fn finish(self) -> String {
+    let mut out = String::new();
+    if !self.carried.is_empty() {
+      push_base64_group(&mut out, &self.carried);
+    }
+    out
+  }
 }
 
 /// One group of up to three bytes in base64, padded.

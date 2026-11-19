@@ -169,6 +169,11 @@ mod vcs_hooks;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod hook_driver;
+// The version-control servers' HTTP edge on the runtime's TCP (A-625 part 2): the listener, one connection a task, each
+// phase's wait learned, the bounds derived from the shard's budget, and git's site. No caller outside tests until the
+// daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_http;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

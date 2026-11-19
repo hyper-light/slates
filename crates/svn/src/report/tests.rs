@@ -9,12 +9,11 @@
 //! Subversion's canonical paths and URL decoding, the first refusal kept, the bounds, calls out of
 //! turn, and every cut of every report.
 
-use super::recorded::{ROOT_URL, Recorded, command, items, recorded, session, value_of};
+use super::recorded::{
+  ROOT_URL, Recorded, YOUNGEST, context, items, recorded, report_command, session, value_of,
+};
 use super::*;
 use crate::handshake::Session;
-
-/// The youngest revision of `history.txt`'s repository.
-const YOUNGEST: Revision = 6;
 
 /// The items the handshake takes from the server's bytes: greeting, auth request, success,
 /// repos-info.
@@ -25,57 +24,6 @@ const TARGET_REV: &[u8] = b"( target-rev ";
 
 /// A trivial auth request, `serve.c`'s `trivial_auth_request`.
 const TRIVIAL_AUTH: &[u8] = b"( success ( ( ) 0: ) ) ";
-
-/// The repository path a URL names, for the tests' own bookkeeping of the session's path.
-fn path_of(url: &[u8]) -> String {
-  let rest = &url[ROOT_URL.len()..];
-  if rest.is_empty() {
-    "/".to_owned()
-  } else {
-    String::from_utf8(rest.to_vec()).unwrap()
-  }
-}
-
-/// Where a recorded connection's report begins: the session's path when its report command came
-/// (the answer's URL, then each `reparent`'s), the command's index among the client's items, and
-/// its request.
-fn report_command(recorded: Recorded) -> (String, usize, Request) {
-  let items = items(recorded.client);
-  let Value::List(answer) = value_of(items[0]) else {
-    panic!("{}: an answer", recorded.name)
-  };
-  let Value::String(url) = answer[2] else {
-    panic!("{}: an answer's URL", recorded.name)
-  };
-  let mut session_path = path_of(url);
-  for (index, item) in items.iter().enumerate() {
-    let Some((name, params)) = command(item) else {
-      continue;
-    };
-    if name == "reparent" {
-      let Value::String(url) = params[0] else {
-        panic!("a reparent's URL")
-      };
-      session_path = path_of(url);
-    }
-    if let Some(kind) = RequestKind::of(&name) {
-      return (session_path, index, Request::read(kind, &params).unwrap());
-    }
-  }
-  panic!("{}: no command begins a report", recorded.name)
-}
-
-/// The context a recorded connection's report is read in: everything readable, room to spare.
-fn context<'a>(session: &'a Session, session_path: &'a str, client: &[u8]) -> Context<'a> {
-  Context {
-    session,
-    session_path,
-    youngest: YOUNGEST,
-    readable: true,
-    room: client.len() * PATH_INFO_BYTES,
-    item_bytes: client.len() * PARSED_ITEM_BYTES,
-  }
-}
 
 /// How a replayed report ended.
 #[derive(Debug, PartialEq, Eq)]

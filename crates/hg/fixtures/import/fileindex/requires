@@ -1,0 +1,6 @@
+fileindex-v1
+generaldelta
+revlog-compression-zstd
+revlogv1
+sparserevlog
+store

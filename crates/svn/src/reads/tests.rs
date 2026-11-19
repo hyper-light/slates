@@ -505,6 +505,8 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("hostile-get-file"), 0),
     (transcript!("list"), 16),
     (transcript!("hostile-list"), 0),
+    (transcript!("get-location-segments"), 16),
+    (transcript!("get-deleted-rev"), 15),
     (transcript!("unknown-command"), 2),
     (transcript!("hostile-malformed"), 0),
   ];
@@ -543,6 +545,8 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "get-deleted-rev",
+    "get-location-segments",
     "list",
     "hostile-list",
     "svn-ls",
@@ -1001,6 +1005,48 @@ fn list_parameters_are_read_as_svnserve_reads_them() {
   );
 }
 
+/// A-613 part 2 (`get-location-segments`): its parameters as `svn_ra_svn__parse_tuple(params, "c(?r)(?r)(?r)")`
+/// reads them, a missing or bare revision ending the connection with nothing written; and its walk streams a turn a
+/// slice in a room of one byte, the same bytes as in a room past the answer.
+#[test]
+fn location_segments_are_read_as_svnserve_reads_them_and_stream() {
+  for malformed in [
+    b"( get-location-segments ( 11:trunk/a.txt ( ) ( ) ) ) ".as_slice(),
+    b"( get-location-segments ( 11:trunk/a.txt 5 ( ) ( ) ) ) ",
+    b"( get-location-segments ( 11:trunk/a.txt ( ) ( 3 ) 0 ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+  let fixture = Fixture::new();
+  let command = b"( get-location-segments ( 17:branches/b1/a.txt ( 11 ) ( 11 ) ( 0 ) ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!((narrow, narrow_slices, wide_slices), (wide, 3, 1));
+}
+
+/// A-613 part 2 (`get-deleted-rev`): its parameters as `svn_ra_svn__parse_tuple(params, "crr")` reads them: a missing
+/// revision, a revision in a list and a path that is no string each end the connection with nothing written.
+#[test]
+fn deleted_revision_parameters_are_read_as_svnserve_reads_them() {
+  for malformed in [
+    b"( get-deleted-rev ( 15:trunk/dir/b.txt 5 ) ) ".as_slice(),
+    b"( get-deleted-rev ( 15:trunk/dir/b.txt ( 5 ) 11 ) ) ",
+    b"( get-deleted-rev ( 5 1 11 ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+}
+
 /// The bounds a hostile command is read within.
 fn hostile_bounds() -> Bounds {
   Bounds {
@@ -1046,7 +1092,8 @@ proptest! {
   fn hostile_commands_are_answered_or_end_the_connection(
     name in prop::sample::select(vec![
       "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat",
-      "get-mergeinfo", "get-iprops", "get-file", "list", "no-such-command",
+      "get-mergeinfo", "get-iprops", "get-file", "list", "get-location-segments", "get-deleted-rev",
+      "no-such-command",
     ]),
     params in prop::collection::vec(hostile_param(), 0..5),
   ) {

@@ -5,8 +5,8 @@ use proptest::prelude::*;
 
 use super::support::{Owned, ROOMY, digests, read, read_whole, write};
 use crate::dump::{
-  CopyFrom, DeltaBase, Format, NodeAction, NodeHeader, Property, PropertySection, RevisionHeader,
-  TextSection, Uuid, section_len,
+  CopyFrom, DeltaBase, DumpError, Format, NodeAction, NodeHeader, Property, PropertySection,
+  RevisionHeader, TextSection, Uuid, section_len,
 };
 use crate::index::NodeKind;
 use crate::svndiff::{Compression, Encoder, Instruction, Version, Window};
@@ -32,9 +32,12 @@ struct StreamPlan {
   revisions: Vec<(Option<Vec<(Vec<u8>, Vec<u8>)>>, Vec<NodePlan>)>,
 }
 
-/// Bytes that may stand in a header's value: anything but a line feed and a NUL.
+/// Bytes that may stand in a header's value: anything but a line feed and a NUL, the line feed's place taken by the
+/// byte above it.
 fn header_bytes(most: usize) -> impl Strategy<Value = Vec<u8>> {
-  prop::collection::vec(prop_oneof![1u8..=9, 11u8..=255], 0..most)
+  let line_feed = b'\n';
+  let byte = (1u8..=254).prop_map(move |byte| if byte >= line_feed { byte + 1 } else { byte });
+  prop::collection::vec(byte, 0..most)
 }
 
 /// A property name: anything but a NUL.
@@ -86,16 +89,16 @@ fn stream_plan() -> impl Strategy<Value = StreamPlan> {
     })
 }
 
-/// A UUID made of 16 bytes, in its record's form.
+/// A UUID made of 16 bytes, in its record's form: 4, 2, 2, 2 and 6 bytes in hex, joined by `-`.
 fn uuid_of(bytes: [u8; 16]) -> Uuid {
-  let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  let hex = |part: &[u8]| -> String { part.iter().map(|byte| format!("{byte:02x}")).collect() };
   let text = format!(
     "{}-{}-{}-{}-{}",
-    &hex[..8],
-    &hex[8..12],
-    &hex[12..16],
-    &hex[16..20],
-    &hex[20..]
+    hex(&bytes[..4]),
+    hex(&bytes[4..6]),
+    hex(&bytes[6..8]),
+    hex(&bytes[8..10]),
+    hex(&bytes[10..])
   );
   Uuid::parse(text.as_bytes()).unwrap()
 }
@@ -170,7 +173,7 @@ fn delta_text(bytes: &[u8], mode: u8) -> (TextSection, Vec<Owned>) {
       .unwrap();
   }
   let (md5, sha1) = digests(bytes);
-  let base = if mode % 2 == 0 {
+  let base = if mode.is_multiple_of(2) {
     DeltaBase::default()
   } else {
     DeltaBase {
@@ -306,11 +309,12 @@ proptest! {
   fn a_generated_stream_is_read_back_to_its_events_and_written_again_to_its_bytes(
     plan in stream_plan(), piece in 1usize..64
   ) {
+    let failed = |refusal: DumpError| TestCaseError::fail(format!("{refusal:?}"));
     let events = build(&plan);
-    let bytes = write(&events).unwrap();
-    let read_back = read_whole(&bytes).unwrap();
+    let bytes = write(&events).map_err(failed)?;
+    let read_back = read_whole(&bytes).map_err(failed)?;
     prop_assert_eq!(&read_back, &events);
-    prop_assert_eq!(&read(&bytes, piece, ROOMY).unwrap().events, &events);
-    prop_assert_eq!(write(&read_back).unwrap(), bytes);
+    prop_assert_eq!(&read(&bytes, piece, ROOMY).map_err(failed)?.events, &events);
+    prop_assert_eq!(write(&read_back).map_err(failed)?, bytes);
   }
 }
