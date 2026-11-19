@@ -3279,9 +3279,15 @@
 >       `xshard::AnswerUnstarted` deliver theirs unrecorded).~~ Fixed 2026-11-19 by A-563 (g225): `retry_deferred`
 >       leaves a `not_started` reply unrecorded, as `recorded_unless_deferred` does, so the resend runs the scatter
 >       again (`a_resend_of_a_read_scatter_refused_overloaded_runs_it_again`;
->       `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`). Open beside it:
+>       `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`). ~~Open beside it:
 >       `consensus_on_control` answers `Overloaded` after its operation ran, and its resend now runs it again (a
->       bootstrap is idempotent; `Recover`'s second run is not yet read).
+>       bootstrap is idempotent; `Recover`'s second run is not yet read).~~ Fixed 2026-11-19 by A-566 (g225): an
+>       operation that ran and whose publication a shard did not apply answers `DurabilityPending`, recorded, so its
+>       resend meets it (`a_recover_answered_after_it_ran_says_so_and_its_resend_takes_effect_once`;
+>       `docs/bugs/2026-11-19-a-consensus-operation-that-ran-was-answered-overloaded.md`). Still so, by A-65's rule: a
+>       control shard given up while wedged may run the operation it held once its poll ends, after its client was
+>       told `Overloaded`. Each of the three operations meets the resend's second run as its first's outcome, read:
+>       a bootstrap already authorized is acknowledged, and a recovery with the same digest returns its receipt.
 >
 > - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
 >   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply

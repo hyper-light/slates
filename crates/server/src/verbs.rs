@@ -22675,8 +22675,7 @@ mod tests {
     let daemon = crate::daemon::audit_daemon_of(3);
     let (digest, proof) = crate::daemon::observe_first(&daemon, |state| {
       let reviewed = crate::consensus_recovery::plan(state, true, None).unwrap();
-      let proof =
-        crate::consensus_recovery::recovery_proof(&state.issuer_secret, &reviewed.digest);
+      let proof = crate::consensus_recovery::recovery_proof(&state.issuer_secret, &reviewed.digest);
       (reviewed.digest, proof)
     });
     let before = root_group(&daemon);

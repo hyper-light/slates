@@ -7164,6 +7164,13 @@ failure.
 > request's completion. It now leaves a `not_started` reply unrecorded as well
 > (`a_resend_of_a_read_scatter_refused_overloaded_runs_it_again`;
 > `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`).
+>
+> A-566 (2026-11-19): an operation that ran is never answered `Overloaded`. A consensus operation (a bootstrap, a
+> recovery) runs on the control shard, then is published to every other shard. When a shard did not apply that
+> publication, the answer was `Overloaded` naming that shard, so after A-563 the resend ran the operation again. It is
+> now `DurabilityPending`. That answer says the operation ran, it is recorded, and its resend meets it
+> (`a_recover_answered_after_it_ran_says_so_and_its_resend_takes_effect_once`;
+> `docs/bugs/2026-11-19-a-consensus-operation-that-ran-was-answered-overloaded.md`).
 
 > **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
 > its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
@@ -37043,3 +37050,34 @@ platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.
   suites and the xwin check (the Windows writer's rule, the deadlock and over-long codes), the anchor's cross-process
   test `a_segment_from_before_typed_host_codes_is_refused_at_start`, the land integration suites over
   `Outcome::Failed { code: Option<OsCode> }`, and clippy.
+
+### A-566 — A consensus operation that ran is never answered Overloaded (2026-11-19, goal 85 via g225; §4.8 explicit quorum-loss recovery, §4.9 RIFL; A-563's sibling, A-65)
+
+- **What was there.** `consensus_on_control` runs a bootstrap or a recovery on the control shard, then publishes it to
+  every other shard and waits for each in its own time. A shard that did not apply the publication made the answer
+  `Overloaded { shard }`, though the operation had run and stood on the control shard. That refusal says not started, so
+  since A-563 its resend ran the operation again. Before A-563 it was recorded, and the resend met it for good.
+- **The rule.** Once the operation ran, its answer says so. A publication a shard did not apply answers
+  `DurabilityPending { held_ns }` (`published_or_pending`): the operation ran and stands on the control shard but is not
+  yet where its answer waits for it. That is the request's recorded outcome. A resend under the id meets it, and a new
+  id runs the operation again, whose run publishes again. `Overloaded` answers only an operation that has not run: its
+  task unspawned, or its control shard refusing it or given up before it ran. Every caller was read:
+  - a second `Bootstrap` is acknowledged or refused `ConsensusAlreadyInitialized`;
+  - a plan is a read;
+  - a second `Recover` with the same digest returns its receipt.
+
+  So a resend takes effect once wherever it runs.
+- **Test.** `a_recover_answered_after_it_ran_says_so_and_its_resend_takes_effect_once` (`crates/server/src/verbs.rs`):
+  a three-shard daemon with its third shard fenced; a client on the second shard recovers the root group, then resends
+  under its id. Red before the fix: `Overloaded { shard: 2 }` after the root group was replaced (0.74 s, Mac Studio).
+  Green: `DurabilityPending`, met again by the resend, and the root group replaced once.
+- **Reported, not changed.**
+  - A control shard given up while wedged (A-65's rule, pinned by `cross_shard_wait.rs`) answers `Overloaded`, then may
+    run the queued operation once its poll ends. The resend's second run then meets the first's outcome as above.
+  - A forwarded submit is answered `Overloaded` when its acceptance outlived the owner's budget, though it ran (§4.9's
+    2026-11-06 status). Its resend meets the completion recorded at the commit.
+
+Applied in the same change to: §4.9 (the 2026-11-17 status), GAPS (the A-563 entry's "open beside it", closed with the
+wedged case left), `crates/server/src/verbs.rs` (`consensus_on_control`, `published_or_pending`, the test and its
+helpers), `crates/ipc/src/protocol.rs` (the doc of `Refusal::DurabilityPending`; the wire is unchanged), the bug record
+`docs/bugs/2026-11-19-a-consensus-operation-that-ran-was-answered-overloaded.md`.
