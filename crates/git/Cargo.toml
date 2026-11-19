@@ -25,6 +25,9 @@ slates-vcs = { workspace = true }
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
+# The LFS tests' oracle (A-610): JSON compared by meaning with what the stock git-lfs client accepted, and the other leg
+# of the JSON validator's differential test. Tests only; the codecs read and write JSON themselves.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

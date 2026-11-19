@@ -230,6 +230,22 @@
 > slates-git --lib store::`, 14 of 14, Mac Studio; see A-614). Owed: part 2, the pack fragments and the base pack with
 > their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters; the walks and a
 > commit sliced under the shard's budget; the versions' records as content.
+> **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
+> stock client speaks it, at git-lfs v3.8.1:
+> - the batch API's requests and verify callbacks;
+> - its answers: the basic adapter's actions with headers checked, nothing for an object held, per-object errors with
+>   LFS's codes;
+> - the locks API's bodies and its list query as Go writes it, and its answers with `next_cursor`;
+> - the pointer file, read as git-lfs's own reader reads it, canonical told apart, and written as its one encoding.
+> JSON is validated as a loop, its nesting charged to the admission; malformed JSON, unknown operations, oids that are
+> not 64 lower-case hexadecimal digits, negative sizes and numbers past Go's `int64` are refused by kind. Golden
+> vectors: git-lfs's documents verbatim, its pointer tests, and the stock git-lfs 3.8.1 client's 24 recorded exchanges
+> (`fixtures/lfs/`). `cargo test -p slates-git --lib` on the Mac Studio: 126 of 126, the 50 new failing first against
+> stubs.
+> Owed: serving it (the routes in the smart HTTP server, authorization by operation and lock owner, the object store
+> with each object's SHA-256 an index row and uploads checked against it, lock records per repository); expiries
+> learned from the deployment's token lifetimes; the stock client end to end against slates' own server (main's run);
+> Mercurial's `lfs` (§4.17.3), which moves the module to a crate both servers use.
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
