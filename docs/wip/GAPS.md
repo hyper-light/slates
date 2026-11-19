@@ -11806,7 +11806,7 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; part 3 owed)
+### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; its host, oracle and naming built, A-524; the volume over it owed)
 
 > - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
 >   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
@@ -11827,14 +11827,31 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   store on loopback, over TLS and in the clear; the framing's five, twenty-three hostile answers among them; the
 >   waits' three); red once each (a `412` untyped, `If-Match` not sent, no back-off, a length past its cap let
 >   through); `cargo xwin check -p slates-base` (Windows x86_64) clean.
+> - **Built (part 3, A-524).** `S3Host` (`crates/base/src/s3/host.rs`), the host seam over the base's objects, sans-io:
+>   a miss answers `HostError::Pending` (`VfsError::BasePending`, `Unpublished` on the wire) and names its fetch, one
+>   however many calls miss on it; a directory is its delimited listing, serving one learned round trip and listed again
+>   after it while it answers; a file bound to its object by `If-Match` and its version (a versioned bucket's replaced
+>   object still reads its own version; elsewhere `412` or `404` makes the handle stale); chunks and listings cached
+>   within the caller's budget. `SimS3` (`sim.rs`) is its oracle; `S3Base` (`name.rs`) the library's naming, exported by
+>   `slates-api` (contract 43). Proven (Mac Studio, debug, 2026-11-19): `cargo test --locked -p slates-base --lib -- s3`
+>   49 of 49 (the host's eight, the oracle over 256 generated histories on versioned and unversioned buckets, `SimS3`'s
+>   two, the naming's four); the api's naming and contract tests 2 of 2; red first four ways (a landed range unkept, a
+>   `412` taken for an unavailable store, a version unbound, a stale listing never listed again).
 > - **Owed.**
 >   - Part 2's remainder: the platform's trust roots (a source of roots to choose: compiled-in or the operating
 >     system's store), name resolution (the caller resolves the endpoint today), the read-ahead from the measured
 >     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
 >     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
->   - Part 3: the `HostFs` implementation from a RAM cache with misses parked and run again, `SimS3` as its oracle and
->     the N=1 differential, the library's way to name an S3 base and hand its credential, the anchor's hold of the
->     credential across a restart.
+>   - The volume over an S3 base (A-524's status in §4.15): the wire's create naming a base and the credential's
+>     hand-off, held in RAM by the owner shard and by the anchor across a restart; the shard's driver running the host's
+>     fetches on the client; the server parking a request on `BasePending` and running it again when its fetch lands,
+>     for every bridge (each answers it by its catch-all until then: FUSE `EIO`, NFS `NFS3ERR_SERVERFAULT`); the base
+>     plane's host calls audited for a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s
+>     `open_file(..).ok()?`); recovery over an S3 base (a pending reacquisition marks its directory unavailable, errno
+>     0); and the N=1 differential through `SimS3`.
+>   - The fetches under way are bounded by the parked requests, not yet by the cache: many concurrent misses on a cache
+>     of a few chunks could shed each other's landed runs before their requests run again (the server's parking piece
+>     holds a landed run until its waiters have run).
 >   - The listing page and request caps assume a continuation token no longer than an encoded key (S3 states no
 >     length): the client counts the longest a listing names (`Counts::longest_token`); the live run reads it.
 >   - The cross-target lint of `slates-base` with its new `aws-lc-rs`, `rustls`, `slates-rt` and `slates-transport`

@@ -1308,6 +1308,7 @@ dependencies = [
  "serde_json",
  "slates-anchor",
  "slates-archive",
+ "slates-base",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
  "slates-bridge-oci",

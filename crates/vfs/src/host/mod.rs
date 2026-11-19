@@ -105,6 +105,10 @@ pub enum HostError {
   /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
   /// deadlock avoided by.
   OwnMount(i32),
+  /// The host is fetching what the call needs and has not got it yet (an S3 base's miss, §4.15 "An S3 base", A-524):
+  /// nothing changed, and the same call is answered once the fetch lands. The caller parks the request and runs it
+  /// again then; a host that reads a local disk never answers it.
+  Pending,
 }
 
 impl std::fmt::Display for HostError {
@@ -117,6 +121,7 @@ impl std::fmt::Display for HostError {
       Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
       Self::Win32(code) => write!(f, "host unavailable (Win32 error {code})"),
       Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
+      Self::Pending => f.write_str("the host's fetch is pending"),
     }
   }
 }
