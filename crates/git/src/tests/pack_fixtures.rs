@@ -1,10 +1,11 @@
 //! The packs stock git 2.50.1 wrote with offset deltas and with reference deltas, and `git verify-pack -v`'s listing of
-//! each (A-582 part 1's `fixtures/make-fixtures.sh`, run once on the Mac Studio on 2026-11-19), with what A-582 part
-//! 3's tests read from them: each listed entry; the file `text` at each of the fixture repository's three commits,
-//! rebuilt by the script's own recipe; and the two deltas the packs carry, inflated once by
+//! each (A-582 part 1's `fixtures/make-fixtures.sh`, run once on the Mac Studio on 2026-11-19), and the same history in
+//! a SHA-256 repository with every pack's own `.idx` (A-591's `fixtures/make-index-fixtures.sh`), with what A-582 part
+//! 3's and A-608's tests read from them: each listed entry; the file `text` at each of the fixture repository's three
+//! commits, rebuilt by the script's own recipe; and the two deltas the packs carry, inflated once by
 //! `fixtures/make-delta-fixtures.sh`. The crate has no inflater yet (§4.17.2 piece 3), so the tests tie each captured
-//! delta, and each whole file, back to its entry by the Adler-32 its zlib stream ends with (RFC 1950 §2.2). Compiled in,
-//! never read at run time.
+//! delta, and each whole file, back to its entry by the Adler-32 its zlib stream ends with (RFC 1950 §2.2). Compiled
+//! in, never read at run time.
 
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 
@@ -16,6 +17,16 @@ const OFS_LISTING: &str = include_str!("../../fixtures/ofs.verify.txt");
 const REF_PACK: &[u8] = include_bytes!("../../fixtures/ref.pack");
 /// Its listing.
 const REF_LISTING: &str = include_str!("../../fixtures/ref.verify.txt");
+/// The same history in a SHA-256 repository, packed with offset deltas (A-591's `make-index-fixtures.sh`).
+const SHA256_PACK: &[u8] = include_bytes!("../../fixtures/sha256.pack");
+/// Its listing.
+const SHA256_LISTING: &str = include_str!("../../fixtures/sha256.verify.txt");
+/// The index `git index-pack` wrote for `ofs.pack`.
+const OFS_IDX: &[u8] = include_bytes!("../../fixtures/ofs.idx");
+/// The index `git index-pack` wrote for `ref.pack`.
+const REF_IDX: &[u8] = include_bytes!("../../fixtures/ref.idx");
+/// The index `git index-pack` wrote for `sha256.pack`.
+const SHA256_IDX: &[u8] = include_bytes!("../../fixtures/sha256.idx");
 /// Each object of the fixture repository with its type and size, as `git cat-file` gave them.
 const OBJECTS: &str = include_str!("../../fixtures/objects.txt");
 
@@ -55,11 +66,13 @@ pub(crate) struct Listed {
   pub(crate) offset: u64,
   /// For a delta, its base's name.
   pub(crate) base: Option<ObjectId>,
+  /// For a delta, how many deltas deep it lies.
+  pub(crate) depth: Option<u64>,
 }
 
-/// A pack under test: its name, its bytes, how its deltas name their bases, and its listing.
+/// A pack under test: its name, its bytes, how its deltas name their bases, its listing, its format and its index.
 pub(crate) struct Pack {
-  /// `ofs` or `ref`.
+  /// `ofs`, `ref` or `sha256`.
   pub(crate) name: &'static str,
   /// The pack's bytes.
   pub(crate) bytes: &'static [u8],
@@ -67,6 +80,10 @@ pub(crate) struct Pack {
   pub(crate) bases: Bases,
   /// Its entries, as listed.
   pub(crate) listing: Vec<Listed>,
+  /// The hash its objects and trailer are in.
+  pub(crate) format: ObjectFormat,
+  /// The index `git index-pack` wrote for it.
+  pub(crate) idx: &'static [u8],
 }
 
 impl Pack {
@@ -87,13 +104,13 @@ impl Pack {
   }
 }
 
-/// The entries of a listing; its summary lines at the end name no object, so they are passed over.
-fn listed(listing: &str) -> Vec<Listed> {
+/// The entries of a listing in `format`; its summary lines at the end name no object, so they are passed over.
+fn listed(listing: &str, format: ObjectFormat) -> Vec<Listed> {
   listing
     .lines()
     .filter_map(|line| {
       let fields: Vec<&str> = line.split_whitespace().collect();
-      let id = ObjectId::from_hex(ObjectFormat::Sha1, fields.first()?.as_bytes()).ok()?;
+      let id = ObjectId::from_hex(format, fields.first()?.as_bytes()).ok()?;
       Some(Listed {
         id,
         kind: Kind::from_name(fields[1].as_bytes()).unwrap(),
@@ -102,28 +119,47 @@ fn listed(listing: &str) -> Vec<Listed> {
         offset: fields[4].parse().unwrap(),
         base: fields
           .get(6)
-          .map(|hex| ObjectId::from_hex(ObjectFormat::Sha1, hex.as_bytes()).unwrap()),
+          .map(|hex| ObjectId::from_hex(format, hex.as_bytes()).unwrap()),
+        depth: fields.get(5).map(|depth| depth.parse().unwrap()),
       })
     })
     .collect()
 }
 
-/// Both packs.
+/// Both SHA-1 packs.
 pub(crate) fn packs() -> [Pack; 2] {
   [
     Pack {
       name: "ofs",
       bytes: OFS_PACK,
       bases: Bases::ByOffset,
-      listing: listed(OFS_LISTING),
+      listing: listed(OFS_LISTING, ObjectFormat::Sha1),
+      format: ObjectFormat::Sha1,
+      idx: OFS_IDX,
     },
     Pack {
       name: "ref",
       bytes: REF_PACK,
       bases: Bases::ById,
-      listing: listed(REF_LISTING),
+      listing: listed(REF_LISTING, ObjectFormat::Sha1),
+      format: ObjectFormat::Sha1,
+      idx: REF_IDX,
     },
   ]
+}
+
+/// Every captured pack: both SHA-1 packs and the SHA-256 one.
+pub(crate) fn every_pack() -> [Pack; 3] {
+  let [ofs, by_id] = packs();
+  let sha256 = Pack {
+    name: "sha256",
+    bytes: SHA256_PACK,
+    bases: Bases::ByOffset,
+    listing: listed(SHA256_LISTING, ObjectFormat::Sha256),
+    format: ObjectFormat::Sha256,
+    idx: SHA256_IDX,
+  };
+  [ofs, by_id, sha256]
 }
 
 /// The object `id`'s size, from `objects.txt`.
