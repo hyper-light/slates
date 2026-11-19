@@ -12192,6 +12192,17 @@ engine: the verdict, rebase, position mapping, the register).
 > its LF as git writes that line, and read either way, as git's readers read it. A capability git does not define is
 > kept by name; a malformed object name or line is refused by kind and place. Proven against fifteen exchanges and six
 > advertisements stock git wrote under protocol.version 0 and 1. Serving a v0 or v1 fetch is piece 14's next part.
+>
+> **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
+> answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
+> `ACK` for each have the store holds) and `ready` (each want reaches a have the client holds, or one of its parents,
+> searched by generation number); one round on a version head, the run of versions M+1 to N whenever those all
+> fast-forwarded; the walk otherwise, in generation order, sending the commits the wants reach and the haves do not, and
+> their trees less the edge commits' trees, as git's `pack-objects` sends without bitmaps; `deepen`, `deepen-relative`,
+> `deepen-since` and `deepen-not` with their `shallow` and `unshallow` lines; the filters `blob:none`, `blob:limit`,
+> `tree:<depth>`, `object:type` and `combine:` (`sparse:oid` read and refused, owed); and `include-tag`. Proven against
+> an oracle computing each answer from full reachability over generated histories. Building the pack from the runs and
+> the objects is piece 7's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -41526,3 +41537,91 @@ cannot hold, refused.
 Part 1 applied in the same change to: `crates/git` (`refname.rs` and `tests/refname.rs`, new; `objects/refname.rs` and
 `v2/refname.rs`, removed; `objects/tag.rs`, `v2/fetch.rs` and `v2/ls_refs.rs` on the shared module; the `mod` line in
 `lib.rs`), GAPS (the §4.17 entry).
+
+**Part 2: upload-pack v2's negotiation** (`crates/git/src/negotiation`; §4.17.2 "A fetch" items 2 and 3, "Pieces (git)"
+piece 7). Sources, read 2026-11-19 at git v2.50.1: `upload-pack.c` (`parse_want`, `got_oid`, `do_got_oid`,
+`ok_to_give_up`, `send_acks`, `process_shallow`, `deepen`, `deepen_by_rev_list`, `send_shallow`, `send_unshallow`,
+`get_reachable_list`, `create_pack_file`), `commit-reach.c` (`can_all_from_reach_with_flag`), `shallow.c`
+(`get_shallow_commits`, `get_shallow_commits_by_rev_list`), `list-objects-filter.c`, `list-objects-filter-options.c`,
+`list-objects.c` and `builtin/pack-objects.c` (`add_tag_chain`) [C]; `gitprotocol-v2` and `rev-list-options` [B].
+
+- **The trait** (`Graph`). What the negotiation reads of a repository, A-614's store implementing it and the tests a
+  graph over generated histories: an object's handle, name and kind; a commit's row (generation number, committer date,
+  root tree) and parents; a tree's held entries; a blob's size; a tag's target; every ref's object; the annotated tags
+  under `refs/tags/`; the greens a commit heads with their current version; the versions a commit headed; whether a
+  version fast-forwarded the one before; and D(k). Neither crate names the other's modules.
+- **Acknowledgments.** An `ACK` for each have the store holds, once, in the order sent: the document's rule, where git
+  also leaves out a have it had marked as an earlier have's parent. `NAK` for none; after `done`, no section.
+- **`ready`**, never under `wait-for-done`: there is a common have, and each want, peeled through its tags, reaches a
+  common commit or one of its parents (git's `THEY_HAVE`); a want that is no commit holds nothing back. git prunes that
+  search at the oldest have's commit date, which a parent dated before its child defeats; here the search stops below
+  the least generation among those commits, which nothing below can reach, so it is exact, remembering across wants what
+  each commit reaches.
+- **One round on a version head** (§4.17.2: "the objects to send are D(M+1) to D(N), and the answer is `ready` in the
+  first round"). A want that heads a green at version N, with a common have that headed it at version M, is answered by
+  the run M+1 to N, the latest M, the shortest run among greens, with no walk and no search. It is taken only where the
+  union is exact: every version M+1 to N fast-forwarded (D(k) is what version k reaches and k-1 does not, so over
+  fast-forwards the union telescopes to what N reaches and M does not; a rewrite between would add what it dropped,
+  and since such a rewrite lies between every earlier M and N too, only the latest M is tried), the client is not
+  shallow and asks no deepening, and the filter, if any, decides each object by its row (`blob:none`, `blob:limit`,
+  `object:type`, `combine:` of those), so the pack can apply it to the run's fragments.
+- **The walk**: one queue in decreasing generation order, the walked wants painting `WANT` and the common haves (peeled
+  to commits), the commits a cut makes whole and the wants a run answers painting `HAVE`; each commit taken passes its
+  paint to its parents, a graft (a shallow commit) to none; the walk stops when no queued commit is painted `WANT`
+  alone. The commits sent are those painted `WANT` alone. The trees and blobs sent are those of their trees less those
+  of the edge commits' trees (each parent of a sent commit that is not sent) and of the haves that are no commits, as
+  git's `pack-objects` sends without bitmaps (`mark_edges_uninteresting`); whatever the client lacks is in it, and
+  nothing the wants do not reach. A smaller exact set from reached-set bitmaps is the store's to give.
+- **Shallow.** `deepen <n>`: each commit's least depth from the wants, 1 at a want, found breadth first where git's
+  depth-first walk keeps the least; the commits at depth `n` shallow, a root among them as git marks it.
+  `deepen-relative`: from the client's shallow commits the refs reach, to depth `n + 1`. `INFINITE_DEPTH` (what
+  `--unshallow` sends): every client shallow commit made whole. `deepen-since` and `deepen-not`: the commits `rev-list`
+  selects, those the wants reach not reached from a commit older than the time (`--max-age` marks it uninteresting with
+  its parents) nor from the `deepen-not` objects, found by the same walk with old commits painted `HAVE` as they are
+  taken; a selected commit with a parent not selected is shallow, and selecting none is refused as git refuses it. A
+  shallow commit the client holds is not sent again; a client shallow commit the cut makes whole is `unshallow`, its
+  parents wanted and itself had; every shallow commit, the client's and the new, is a graft. A shallow client asking no
+  deepening gets an empty shallow-info section, as git sends one. A shallow line naming an object the store does not
+  hold is left out and one naming no commit is refused, as git does.
+- **Filters** (`negotiation::filter`): `blob:none`; `blob:limit=<n>` with `k`, `m`, `g`, sending blobs smaller than
+  `n`; `tree:<depth>`, the root tree at depth 0, sending trees and blobs whose least depth is under it, a tree met again
+  shallower opened again; `object:type=<type>`; `combine:`, its sub-specs percent-decoded and refused, as git refuses
+  them, when they hold a reserved byte. Commits and tags are sent but under `object:type`; the wants and their tags'
+  chains whatever the filter, as git sends what a client named. Refused by kind: an unknown spec, a number that is not
+  canonical decimal with a unit (git's `git_parse_ulong` also reads `0x`, octal and a sign, which no client writes), an
+  unknown type, an empty combination, a nested one (git reads it; its own client writes every filter into one
+  `combine:`), `sparse:path=` (dropped by git), and `sparse:oid=` (read, not served: owed).
+- **`include-tag`**: each annotated tag under `refs/tags/` whose chain ends at an object the pack carries, its runs'
+  objects included, sent with every tag of its chain, as `add_tag_chain` adds them.
+- **Bounds.** Every walk is iterative; every entry it keeps (a commit's paint, a queued commit, a tree opened, an object
+  chosen, a search frame) is charged to the caller's admission before it is kept, at its own size, so a negotiation past
+  it is refused, typed. Nothing else bounds a walk: no count is fixed here.
+- **Tests** (`cargo test -p slates-git --lib negotiation`: 11). An oracle computes each answer from full reachability by
+  the rules above, never by the module's walks, over generated histories (merges, skewed dates, tags of tags, greens
+  whose versions run along a head's first-parent ancestry with a rewrite now and then, haves on version heads and
+  elsewhere, shallow clients, every deepening and filter, unheld wants and haves); 4,096 cases a run, the answers equal
+  refusals included, the one-round count equal, and no commit walked or searched where every want was answered in one
+  round. A census of what the cases met fails the test if any of 21 outcomes went unmet (every answer, the one-round
+  path alone and beside a walk, shallow and unshallow lines and the empty section, each filter, `include-tag`, each
+  refusal): the first generator met the one-round path 0 to 2 times in 1,024 cases, and was rebuilt until it met it 28
+  to 50 times. A second property holds, over 1,024 cases with no filter or shallow client, that a pack carries
+  everything the wants reach that the common haves do not and nothing the wants do not reach, and that each run carries
+  exactly what its head reaches and its have's version head does not. Deterministic cases: a client three versions
+  behind answered in one round with nothing walked; a rewrite between taking the walk; `wait-for-done` and `done`; a
+  clone at depth 1 (git's `fetch-shallow` fixture's shape); a tree met again shallower under `tree:4`; the admission
+  refused; and the filter specs, refusals and rules.
+- **Checks** (Mac Studio, `cargo test -p slates-git --lib`, 2026-11-19): 216 of 216, three runs in a row on one tree,
+  `cargo fmt --check` clean. Failing first: with `negotiate` stubbed to answer nothing, the 7 negotiation tests that
+  call it failed. Red six ways, one guard at a time in the Studio's clone: `ready` without the haves' parents failed the
+  oracle; the one-round path without its fast-forward check failed 3 tests; the edge commits' trees not left out failed
+  the oracle; grafts followed failed 2; the depth cut one too deep failed 2; and a tree never opened again shallower
+  failed the test written for it, after the oracle had missed it once the generator favoured the one-round path.
+- **Next** (GAPS): `sparse:oid` (git's gitignore matcher over a blob's patterns, and a revision's name resolved); the
+  server's mapping of a v2 `fetch` request onto `negotiation::Request` (`want-ref` and `deepen-not` resolved through
+  the refs); the pack itself, from the runs' fragments with the filter applied by row and from the chosen objects
+  (thin packs, offset deltas), piece 7's next part; `object-info`; the walks in cooperative slices under the shard's
+  budget; and A-614's store implementing `Graph`.
+
+Part 2 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`negotiation`, new:
+`mod.rs`, `filter.rs`, `ready.rs`, `one_round.rs`, `paint.rs`, `shallow.rs`, `objects.rs` and their tests; the `mod`
+line in `lib.rs`).

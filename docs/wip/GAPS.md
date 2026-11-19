@@ -142,6 +142,16 @@
 > (A-590's tag-name check, A-582 part 2's protocol names) are one module, `refname`, which both callers ask; A-590's
 > golden fsck fixtures and A-582's cases both run against it, with a property test against refs.c's check transcribed
 > (144 of 144 on the Mac Studio, red twice). Owed in A-615: part 2, §4.17.2 piece 7's negotiation for upload-pack v2.
+> **A-615 part 2 (2026-11-19, g296; piece 7's negotiation):** `slates-git` (`negotiation`) answers a `fetch` request
+> over a trait the store implements (`Graph`): acknowledgments and `ready` (exact, by generation number), one round on a
+> version head over fast-forward runs, the walk otherwise (git's object set without bitmaps), every deepening with its
+> shallow and unshallow lines, the filters `blob:none`, `blob:limit`, `tree:<depth>`, `object:type` and `combine:`, and
+> `include-tag`; held to an oracle over 4,096 generated histories a run, whose census fails the test if any of 21
+> outcomes goes unmet, and red six ways (216 of 216 on the Mac Studio). Owed: `sparse:oid` (git's gitignore matcher and
+> a revision's name resolved); the server's mapping of a v2 `fetch` onto the negotiation (`want-ref` and `deepen-not`
+> through the refs); the pack from the runs' fragments and the chosen objects (piece 7's next part); `object-info`; the
+> walks in cooperative slices under the shard's budget, and the collections' own overhead charged (entries are charged
+> at their size); exact object sets from reached-set bitmaps; A-614's store implementing `Graph`.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
