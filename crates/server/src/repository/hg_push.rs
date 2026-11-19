@@ -70,6 +70,7 @@ use crate::state::ShardState;
 #[cfg(unix)]
 use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outcome, PendingView};
 use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
+use crate::verbs::hex_of;
 
 #[cfg(test)]
 mod tests;
@@ -537,14 +538,14 @@ pub(crate) fn transaction_id(name: &[u8; 32]) -> String {
   let mut hasher = blake3::Hasher::new_derive_key(TRANSACTION_CONTEXT);
   hasher.update(name);
   let digest = hasher.finalize();
-  let mut hex = TRANSACTION_TAG.as_bytes().to_vec();
+  let mut id = TRANSACTION_TAG.to_owned();
   if let Some(node) = digest
     .as_bytes()
     .first_chunk::<{ core::mem::size_of::<Node>() }>()
   {
-    slates_hg::node::write_hex(node, &mut hex);
+    id.push_str(&hex_of(node));
   }
-  String::from_utf8(hex).unwrap_or_default()
+  id
 }
 
 /// Slates' words for a changegroup verification refused, 7.2's where it has them.
@@ -921,11 +922,7 @@ fn acl_words(principal: &Principal, ask: &Ask, verdict: &[u8]) -> Vec<u8> {
   words.extend_from_slice(b" \"");
   words.extend_from_slice(ask.name.as_bytes());
   words.push(b'"');
-  let hex = |node: Node| {
-    let mut digits = Vec::new();
-    slates_hg::node::write_hex(&node, &mut digits);
-    digits
-  };
+  let hex = |node: Node| hex_of(&node).into_bytes();
   let named = match ask.namespace {
     Namespace::Bookmark => Some(ask.changeset.map(hex).unwrap_or_default()),
     Namespace::Branch | Namespace::Topic => ask.changeset.map(|node| {
@@ -940,14 +937,6 @@ fn acl_words(principal: &Principal, ask: &Ask, verdict: &[u8]) -> Vec<u8> {
     words.extend_from_slice(ACL_END);
   }
   words
-}
-
-/// A node's hexadecimal digits, as a hook's environment carries them.
-#[cfg(unix)]
-fn hex_text(node: &Node) -> String {
-  let mut hex = Vec::new();
-  slates_hg::node::write_hex(node, &mut hex);
-  String::from_utf8(hex).unwrap_or_default()
 }
 
 /// One hook the repository's policy configures, as a push runs it: its configured name, its program, and what it is
@@ -981,8 +970,8 @@ fn configured(
     return Vec::new();
   };
   let changes = vcs_hooks::Changegroup {
-    first: hex_text(&first),
-    last: hex_text(&last),
+    first: hex_of(&first),
+    last: hex_of(&last),
     url: url.to_owned(),
     transaction: transaction.to_owned(),
   };
