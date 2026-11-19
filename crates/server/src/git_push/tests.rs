@@ -619,10 +619,6 @@ fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
 // ---------------------------------------------------------------------------------------------------------------------
 // The hooks (A-665 part 3; Unix, where the hook driver runs).
 
-/// Shape: the most turns of a view's sealing a push here may take, far past what the fixtures' packs need.
-#[cfg(unix)]
-const SEALING_TURNS: u32 = 1 << 20;
-
 /// A hook program: a shell script running `body`, in a scratch directory of its own removed with it, and its
 /// configuration at `point` under `name`.
 #[cfg(unix)]
@@ -650,72 +646,74 @@ fn script(point: HookPointName, name: &str, body: &str) -> Script {
   Script { _dir: dir, config }
 }
 
-/// Runs `call`'s hook on a runtime of its own, as an edge runs it off the shard's step, with a client that stays; the
-/// test gives up past its bound.
+/// Shape: how long a test waits for a push whose hooks run: a test's bound for each of its three hooks and one for the
+/// push itself.
 #[cfg(unix)]
-fn ran(call: super::HookCall) -> super::HookAnswer {
-  let runtime = crate::git_hooks::tests::runtime();
+const PUSH_WAIT_NS: u64 = 4 * crate::git_hooks::tests::TEST_BOUND_NS;
+
+/// What a push driven with its hooks answered: what the driver wrote, what it received, and how many views the
+/// presenter showed and withdrew; or why the drive stopped.
+#[cfg(unix)]
+type Driven = Result<(Vec<u8>, Received, (u32, u32)), String>;
+
+/// `request` pushed to `repository` by its owner as the HTTP edge pushes one (`vcs_http::git::receive`): a task on the
+/// daemon's shard drives the push a step at a time, the shard's state lent for each step, yielding while a view is
+/// sealed and running each hook off the shard's step in a view the scratch presenter shows. What it answered.
+#[cfg(unix)]
+fn pushed_with_hooks(daemon: &crate::Daemon, repository: RepositoryId, request: &[u8]) -> Driven {
   let (sent, got) = std::sync::mpsc::channel();
-  runtime
-    .spawn(async move {
-      let bound = crate::git_hooks::tests::TEST_BOUND_NS;
-      let answered = slates_rt::futures::within(bound, call.run(std::future::pending())).await;
-      let _ = sent.send(answered.ok().flatten());
-    })
-    .expect("the hook's task");
-  runtime.run_until_idle();
+  let request = request.to_vec();
+  crate::daemon::observe_first(daemon, move |_| {
+    let task = slates_rt::futures::spawn(drive(repository, request, sent)).expect("the push's task");
+    slates_rt::futures::detach(task).expect("the task detached");
+  });
   got
-    .recv()
-    .ok()
-    .flatten()
-    .expect("the hook answered within the test's bound")
+    .recv_timeout(std::time::Duration::from_nanos(PUSH_WAIT_NS))
+    .expect("the push answered within the test's bound")
 }
 
-/// `request` pushed to `repository` by its owner, each hook's view shown in a scratch directory and each hook run as an
-/// edge runs it, step by step: what the driver wrote, what it received, and the presenter.
+/// Drives the push of [`pushed_with_hooks`] and sends what it answered on `sent`.
 #[cfg(unix)]
-fn pushed_with_hooks(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  request: &[u8],
-) -> (
-  Vec<u8>,
-  Received,
-  crate::git_hooks::tests::ScratchPresenter,
-) {
+async fn drive(repository: RepositoryId, request: Vec<u8>, sent: std::sync::mpsc::Sender<Driven>) {
+  let _ = sent.send(driven(repository, &request).await);
+}
+
+/// The push of [`pushed_with_hooks`], driven.
+#[cfg(unix)]
+async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
+  use crate::state::with_state;
   let presenter = crate::git_hooks::tests::ScratchPresenter::default();
-  let mut advertised = Vec::new();
-  let mut push = ReceivePack::start(
-    state,
-    (&owner(), repository),
-    (ROOM, false),
-    &mut advertised,
-    presenter,
-  )
-  .expect("started");
+  let mut push = with_state(|state| {
+    ReceivePack::start(state, (&owner(), repository), (ROOM, false), &mut Vec::new(), presenter)
+  })
+  .ok_or("no state to start")?
+  .map_err(|failed| format!("not started: {failed:?}"))?;
   for piece in request.chunks(PIECE) {
-    push.input(state, piece).expect("taken");
+    with_state(|state| push.input(state, piece))
+      .ok_or("no state for the request")?
+      .map_err(|failed| format!("not taken: {failed:?}"))?;
   }
-  push.end(state).expect("ended");
+  with_state(|state| push.end(state))
+    .ok_or("no state for the end")?
+    .map_err(|failed| format!("not ended: {failed:?}"))?;
   let mut answer = Vec::new();
-  let mut turns = 0_u32;
   let received = loop {
-    match push.answer_step(state, &mut answer).expect("a step") {
+    let step = with_state(|state| push.answer_step(state, &mut answer))
+      .ok_or("no state for a step")?
+      .map_err(|failed| format!("a step failed: {failed:?}"))?;
+    match step {
       Answering::Answered(received) => break received,
-      Answering::Sealing => {
-        turns += 1;
-        assert!(turns < SEALING_TURNS, "a view's sealing never ended");
-      }
+      Answering::Sealing => slates_rt::futures::yield_now().await,
       Answering::Hook(call) => {
-        let answer_of_hook = ran(call);
-        push
-          .hook_ran(state, answer_of_hook, &mut answer)
-          .expect("the hook's answer taken");
+        let ran = call.run(std::future::pending()).await;
+        with_state(|state| push.hook_ran(state, ran, &mut answer))
+          .ok_or("no state for the hook's answer")?
+          .map_err(|failed| format!("its answer not taken: {failed:?}"))?;
       }
     }
   };
-  let presenter = core::mem::take(&mut push.presenter);
-  (answer, received, presenter)
+  let shown = (push.presenter.presented, push.presenter.withdrawn);
+  Ok((answer, received, shown))
 }
 
 /// Each packet of `answer` in order, as its band and payload: band 0 for a packet not multiplexed, none for a flush.
@@ -754,107 +752,141 @@ fn pack_of(request: &[u8]) -> &[u8] {
   &request[at..]
 }
 
+/// The files the green `name` of `repository` holds on `daemon`'s shard, and the records its register holds.
+#[cfg(unix)]
+fn held(daemon: &crate::Daemon, repository: RepositoryId, name: &'static str) -> (Vec<(String, Vec<u8>)>, usize, bool) {
+  crate::daemon::observe_first(daemon, move |state| {
+    let is_bound = bound(state, repository, name);
+    let held_files = if is_bound {
+      files(state, repository, name)
+    } else {
+      Vec::new()
+    };
+    (held_files, records(state, repository), is_bound)
+  })
+}
+
+/// Makes git repository `name` on `daemon`'s shard with `hooks` configured: its id.
+#[cfg(unix)]
+fn hooked_repository(daemon: &crate::Daemon, name: &'static str, hooks: &[&Script]) -> RepositoryId {
+  let configs: Vec<HookConfig> = hooks.iter().map(|hook| hook.config.clone()).collect();
+  crate::daemon::observe_first(daemon, move |state| {
+    let repository = git_repository(state, name);
+    set_policy(state, name, 0, (Vec::new(), configs));
+    repository
+  })
+}
+
 /// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `execute_commands`, `copy_to_sideband`). Do: configure a
-/// `pre-receive` hook that writes a line and exits 1; push stock git's `create` with each hook's view shown in a
-/// scratch directory. Expect: `main` refused `pre-receive hook declined`; the hook's line on band 2, once; nothing
-/// appended and `main` holding no file; one view shown and withdrawn.
+/// `pre-receive` hook that writes a line and exits 1; push stock git's `create` as the HTTP edge pushes, each hook's view
+/// shown in a scratch directory. Expect: `main` refused `pre-receive hook declined`; the hook's line on band 2, once;
+/// nothing appended and `main` holding no file; one view shown and withdrawn.
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothing() {
-  crate::daemon::audit_on_shard(|state| {
-    let repository = git_repository(state, "refused");
-    let hook = script(
-      HookPointName::GitPreReceive,
-      "pre-receive",
-      "cat >/dev/null\necho 'no pushes today'\nexit 1",
-    );
-    set_policy(state, "refused", 0, (Vec::new(), vec![hook.config.clone()]));
-    let (answer, received, presenter) =
-      pushed_with_hooks(state, repository, scenario!("create").request);
-    assert_eq!(reasons(&received), [protected::PRE_RECEIVE_HOOK_DECLINED]);
-    assert_eq!(band_two(&answer), "no pushes today\n");
-    assert_eq!(records(state, repository), 0);
-    assert!(files(state, repository, "main").is_empty());
-    assert_eq!((presenter.presented, presenter.withdrawn), (1, 1));
-  });
+  let daemon = crate::daemon::audit_daemon();
+  let hook = script(
+    HookPointName::GitPreReceive,
+    "pre-receive",
+    "cat >/dev/null\necho 'no pushes today'\nexit 1",
+  );
+  let repository = hooked_repository(&daemon, "refused", &[&hook]);
+  let driven = pushed_with_hooks(&daemon, repository, scenario!("create").request);
+  let held = held(&daemon, repository, "main");
+  daemon.stop();
+  let (answer, received, shown) = driven.unwrap();
+  assert_eq!(reasons(&received), [protected::PRE_RECEIVE_HOOK_DECLINED]);
+  assert_eq!(band_two(&answer), "no pushes today\n");
+  assert_eq!(held, (Vec::new(), 0, true));
+  assert_eq!(shown, (1, 1));
 }
 
 /// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `execute_commands`, `update()` and the end of
 /// `cmd_receive_pack`). Do: configure `pre-receive` and `update` hooks that write what they were handed and exit 0, and
 /// a `post-receive` hook that writes its standard input and the `packed-refs` of the repository it runs in; push stock
-/// git's `create`. Expect: `main` applied and holding the first text, one record appended; on band 2, `pre-receive`'s
-/// line naming the create, then `update`'s naming the ref and its two ids, before the report on band 1, then
-/// `post-receive`'s lines after it, its view's `packed-refs` naming `main` at the pushed commit: it ran after the
-/// update; three views shown and withdrawn.
+/// git's `create` as the HTTP edge pushes. Expect: `main` applied and holding the first text, one record appended; on
+/// band 2, `pre-receive`'s line naming the create, then `update`'s naming the ref and its two ids, before the report on
+/// band 1, then `post-receive`'s lines after it, its view's `packed-refs` naming `main` at the pushed commit: it ran
+/// after the update; three views shown and withdrawn.
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update() {
-  crate::daemon::audit_on_shard(|state| {
-    let repository = git_repository(state, "accepted");
-    let hooks = [
-      script(
-        HookPointName::GitPreReceive,
-        "pre-receive",
-        "echo \"pre-receive $(cat)\"",
-      ),
-      script(HookPointName::GitUpdate, "update", "echo \"update $1 $2 $3\""),
-      script(
-        HookPointName::GitPostReceive,
-        "post-receive",
-        "echo \"post-receive $(cat)\"\ncat packed-refs",
-      ),
-    ];
-    let configs = hooks.iter().map(|hook| hook.config.clone()).collect();
-    set_policy(state, "accepted", 0, (Vec::new(), configs));
-    let (answer, received, presenter) =
-      pushed_with_hooks(state, repository, scenario!("create").request);
-    assert_eq!(reasons(&received), [b"ok"]);
-    assert_eq!(files(state, repository, "main"), [("text".to_owned(), text(false))]);
-    assert_eq!(records(state, repository), 1);
-    let zero = "0".repeat(FIRST.len());
-    let said = band_two(&answer);
-    let pre = format!("pre-receive {zero} {FIRST} refs/heads/main\n");
-    let update = format!("update refs/heads/main {zero} {FIRST}\n");
-    let post = format!("post-receive {zero} {FIRST} refs/heads/main\n");
-    assert!(said.starts_with(&format!("{pre}{update}{post}")), "{said}");
-    assert!(said.contains(&format!("\n{FIRST} refs/heads/main\n")), "{said}");
-    let order: Vec<u8> = bands(&answer).iter().map(|(band, _)| *band).collect();
-    let report = order.iter().position(|band| *band == 1).unwrap();
-    assert!(order[..report].iter().all(|band| *band == 2), "{order:?}");
-    assert!(order[report + 1..].iter().all(|band| *band == 2), "{order:?}");
-    assert!(report >= 2 && report + 1 < order.len(), "{order:?}");
-    assert_eq!((presenter.presented, presenter.withdrawn), (3, 3));
-  });
+  let daemon = crate::daemon::audit_daemon();
+  let pre = script(
+    HookPointName::GitPreReceive,
+    "pre-receive",
+    "echo \"pre-receive $(cat)\"",
+  );
+  let update = script(HookPointName::GitUpdate, "update", "echo \"update $1 $2 $3\"");
+  let post = script(
+    HookPointName::GitPostReceive,
+    "post-receive",
+    "echo \"post-receive $(cat)\"\ncat packed-refs",
+  );
+  let repository = hooked_repository(&daemon, "accepted", &[&pre, &update, &post]);
+  let driven = pushed_with_hooks(&daemon, repository, scenario!("create").request);
+  let held = held(&daemon, repository, "main");
+  daemon.stop();
+  let (answer, received, shown) = driven.unwrap();
+  assert_eq!(reasons(&received), [b"ok"]);
+  assert_eq!(held, (vec![("text".to_owned(), text(false))], 1, true));
+  let zero = "0".repeat(FIRST.len());
+  let said = band_two(&answer);
+  let lines = format!(
+    "pre-receive {zero} {FIRST} refs/heads/main\nupdate refs/heads/main {zero} {FIRST}\n\
+     post-receive {zero} {FIRST} refs/heads/main\n"
+  );
+  assert!(said.starts_with(&lines), "{said}");
+  assert!(said.contains(&format!("\n{FIRST} refs/heads/main\n")), "{said}");
+  assert_report_between_the_hooks(&answer);
+  assert_eq!(shown, (3, 3));
+}
+
+/// Asserts that `answer`'s report, on band 1, comes after two band-2 packets (`pre-receive`'s and `update`'s words) and
+/// before at least one (`post-receive`'s), every other packet being band 2's.
+#[cfg(unix)]
+fn assert_report_between_the_hooks(answer: &[u8]) {
+  let order: Vec<u8> = bands(answer).iter().map(|(band, _)| *band).collect();
+  let report = order.iter().position(|band| *band == 1).unwrap();
+  let others: Vec<u8> = order
+    .iter()
+    .enumerate()
+    .filter(|(at, _)| *at != report)
+    .map(|(_, band)| *band)
+    .collect();
+  assert!(others.iter().all(|band| *band == 2), "{order:?}");
+  assert!(report >= 2 && report + 1 < order.len(), "{order:?}");
 }
 
 /// A-665 part 3 (§4.17.2 "Hooks, in git's terms"; git's `update()`, `run_update_hook()`). Do: configure an `update`
 /// hook that refuses `refs/heads/other` with a line and lets every other ref through; push one pack creating `main` and
-/// `other` at the fixtures' first commit. Expect: `main` applied and holding the first text; `other` refused `hook
-/// declined`, the hook's line then git's `error: hook declined to update refs/heads/other` on band 2, and left unbound;
-/// one record appended; two views shown and withdrawn, the second command's hook having run too.
+/// `other` at the fixtures' first commit, as the HTTP edge pushes. Expect: `main` applied and holding the first text;
+/// `other` refused `hook declined`, the hook's line then git's `error: hook declined to update refs/heads/other` on
+/// band 2, and left unbound; one record appended; two views shown and withdrawn, the second command's hook having run
+/// too.
 #[cfg(unix)]
 #[test]
 fn t_a665_an_update_hook_refuses_its_own_command_alone() {
-  crate::daemon::audit_on_shard(|state| {
-    let repository = git_repository(state, "update");
-    let hook = script(
-      HookPointName::GitUpdate,
-      "update",
-      "if [ \"$1\" = refs/heads/other ]; then echo \"no $1\"; exit 1; fi",
-    );
-    set_policy(state, "update", 0, (Vec::new(), vec![hook.config.clone()]));
-    let pack = pack_of(scenario!("create").request);
-    let main: &[u8] = b"refs/heads/main";
-    let other: &[u8] = b"refs/heads/other";
-    let both = request(&[("", FIRST, main), ("", FIRST, other)], CAPABILITIES, pack);
-    let (answer, received, presenter) = pushed_with_hooks(state, repository, &both);
-    assert_eq!(reasons(&received), [b"ok".as_slice(), protected::HOOK_DECLINED]);
-    assert_eq!(files(state, repository, "main"), [("text".to_owned(), text(false))]);
-    assert!(!bound(state, repository, "other"));
-    assert_eq!(records(state, repository), 1);
-    let said = band_two(&answer);
-    let words = "no refs/heads/other\nerror: hook declined to update refs/heads/other\n";
-    assert_eq!(said, words);
-    assert_eq!((presenter.presented, presenter.withdrawn), (2, 2));
-  });
+  let daemon = crate::daemon::audit_daemon();
+  let hook = script(
+    HookPointName::GitUpdate,
+    "update",
+    "if [ \"$1\" = refs/heads/other ]; then echo \"no $1\"; exit 1; fi",
+  );
+  let repository = hooked_repository(&daemon, "update", &[&hook]);
+  let pack = pack_of(scenario!("create").request);
+  let main: &[u8] = b"refs/heads/main";
+  let other: &[u8] = b"refs/heads/other";
+  let both = request(&[("", FIRST, main), ("", FIRST, other)], CAPABILITIES, pack);
+  let driven = pushed_with_hooks(&daemon, repository, &both);
+  let main_held = held(&daemon, repository, "main");
+  let other_held = held(&daemon, repository, "other");
+  daemon.stop();
+  let (answer, received, shown) = driven.unwrap();
+  assert_eq!(reasons(&received), [b"ok".as_slice(), protected::HOOK_DECLINED]);
+  assert_eq!(main_held, (vec![("text".to_owned(), text(false))], 1, true));
+  assert!(!other_held.2);
+  let words = "no refs/heads/other\nerror: hook declined to update refs/heads/other\n";
+  assert_eq!(band_two(&answer), words);
+  assert_eq!(shown, (2, 2));
 }

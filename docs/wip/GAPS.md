@@ -667,6 +667,15 @@
 > driver (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until
 > they land); git's words for each outcome. Found, reported to main: a git hook inherits the daemon's `GIT_*` repository
 > variables, which `update` and `post-receive` would read in place of the view's objects.
+> **A-665 part 3 (2026-11-19, g293; git's push runs its hooks):** `slates-server` (`git_push`, its `hooks`) runs
+> `pre-receive`, `update` and `post-receive` as receive-pack 2.50.1 does, a step at a time (a view sealed in the
+> shard's slices, the hook run by the edge off the shard's step), in git's words (`pre-receive hook declined`; `hook
+> declined` with `error: hook declined to update <ref>`; accepted hooks' and `post-receive`'s words on band 2, the
+> report's last flush after `post-receive`), over a presenter seam (`git_hooks::PresentView`). Held by tests through a
+> presenter that writes each view into a scratch directory (macOS arm64, Mac Studio, @@RUNS). Owed: the daemon's
+> presenter, a read-only attachment the mount edges serve (a read-only volume whose base-plane host reads the
+> repository's content store, under the root mount): until it lands a push whose repository configures a git hook is
+> refused `hook not run`, as before; the edges' signal of a client gone; the hooks' learned times; the SSH channel's call.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
