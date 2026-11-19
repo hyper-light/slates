@@ -53,8 +53,8 @@ use crate::verbs::{forbidden, refused, to_db_volume, to_wire_volume};
 // until one calls it, a daemon build calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod push;
-// Mercurial's unbundle landed through the push (A-657): until the hg site serves unbundle (A-650's), a daemon build calls
-// none of it.
+// Mercurial's unbundle landed through the push (A-657): until the hg site serves unbundle (A-650's), a daemon build
+// calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod hg_push;
 

@@ -112,8 +112,8 @@ pub struct Verified {
   pub files: Vec<(Vec<u8>, Vec<Arrived>)>,
   /// The revisions the repository held already, passed over.
   pub passed_over: u64,
-  /// The changesets among them, in the bundle's order: what 7.2's `changegroup.apply` calls `duprevs`, which a publishing
-  /// repository publishes with the new ones (A-657).
+  /// The changesets among them, in the bundle's order: what 7.2's `changegroup.apply` calls `duprevs`, which a
+  /// publishing repository publishes with the new ones (A-657).
   pub held_changesets: Vec<Node>,
   /// Each new changeset's position, by node.
   changeset_at: BTreeMap<Node, usize>,

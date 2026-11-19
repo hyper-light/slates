@@ -1,7 +1,7 @@
 //! A-657's server tests: Mercurial pushes landed on a daemon's owning shard through A-635's append, held to what stock
 //! 7.2 answered (`crates/hg/fixtures/push`, made by `make-push-fixtures.sh`): the fixtures' repository rebuilt from its
-//! texts in a new Mercurial repository (every node 7.2's), then each stock push landed on it and its reply compared byte
-//! for byte with 7.2's.
+//! texts in a new Mercurial repository (every node 7.2's), then each stock push landed on it and its reply compared
+//! byte for byte with 7.2's.
 
 use std::collections::BTreeSet;
 
@@ -67,7 +67,9 @@ fn hex(node: &Node) -> String {
 
 /// A node from its forty hexadecimal digits, as 7.2's `bin` reads them.
 fn parsed(hex: &str) -> Node {
-  slates_hg::pushkey::hex_node(hex.as_bytes()).unwrap().unwrap()
+  slates_hg::pushkey::hex_node(hex.as_bytes())
+    .unwrap()
+    .unwrap()
 }
 
 /// A served view a test builds from a fixture's listings: `{rev} {node} {p1} {p2} {phase} {branch}` a line, and
@@ -517,10 +519,10 @@ fn assert_rebuilt(state: &ShardState, hg: &Hg, made: &[Made]) {
 
 /// A-657, AC-HG.3 (T-HG.3; golden, by meaning and byte for byte). Do: rebuild the fixtures' repository from its texts
 /// in a new Mercurial repository (`base` and `second` landed as one push to its empty first line, both published by a
-/// `phase-heads` part, bookmark `main` made at `second`), then land stock 7.2's `push-plain`, then land it again without
-/// its race checks (a client that heard no answer). Expect: the rebuilt nodes 7.2's; `main` a green of its own at
-/// `second`, no draft root; `push-plain` answered byte for byte as 7.2 answered it, `default`'s line at its changeset,
-/// which is a draft root and held by the index; sent again it is answered alike and records nothing.
+/// `phase-heads` part, bookmark `main` made at `second`), then land stock 7.2's `push-plain`, then land it again
+/// without its race checks (a client that heard no answer). Expect: the rebuilt nodes 7.2's; `main` a green of its
+/// own at `second`, no draft root; `push-plain` answered byte for byte as 7.2 answered it, `default`'s line at its
+/// changeset, which is a draft root and held by the index; sent again it is answered alike and records nothing.
 #[test]
 fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
   crate::daemon::audit_on_shard(|state| {
@@ -717,8 +719,8 @@ fn a_bookmark_moves_on_its_own_green() {
   });
 }
 
-/// A-657 (the namespace, decided). Do: name lines and bookmarks of names stock clients make and of hostile ones. Expect:
-/// a stock name reads as itself; `:`, `%`, a control byte and bytes not UTF-8 escaped.
+/// A-657 (the namespace, decided). Do: name lines and bookmarks of names stock clients make and of hostile ones.
+/// Expect: a stock name reads as itself; `:`, `%`, a control byte and bytes not UTF-8 escaped.
 #[test]
 fn names_read_as_themselves_and_escape_what_would_meet() {
   assert_eq!(line_name(b"default", 0), "branch:default:0");

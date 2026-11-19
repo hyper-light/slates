@@ -11,7 +11,7 @@
 //! therefore prefix-free by construction: the two tags differ at their second byte and end in `:`, so no name of one
 //! kind begins as one of the other; a label ends at the first `:` after its tag, so `branch:<B>:` begins exactly the
 //! lines of branch `B` and no other branch's (`stable` and `stable2`, `a` and `a/b` stay apart), and `bookmark:<M>:`
-//! begins exactly one name, so a [`RepositoryCheck::Names`] under it checks that bookmark's presence or absence exactly.
+//! begins exactly one name, so a [`RepositoryCheck::Names`] under it checks that bookmark's presence or absence.
 //! Every name a stock client can make reads as itself, since Mercurial refuses `:` in a label (`scmutil.checknewlabel`
 //! \[C\]); the escapes only keep a hostile or damaged name from meeting another. A line made by a push takes the lowest
 //! number its branch does not use; a Mercurial repository's first line, the green its verb makes, is
