@@ -20,10 +20,8 @@
 //!   `svn:date` parsed and written again (time 0's for a revision without one; a date that does not parse refuses the
 //!   listing).
 //! - A name matches a pattern as `svn_utf__fuzzy_glob_match` matches it: folded, then APR's `apr_fnmatch` with no
-//!   flags. The fold is utf8proc's decomposition with case folding and marks stripped, composed again; over ASCII that
-//!   is the letters `A` to `Z` lowered and nothing else, which is what this port does. A name beyond ASCII is matched
-//!   with its ASCII letters lowered alone: utf8proc's case folding and mark stripping need Unicode's tables, owed
-//!   (GAPS).
+//!   flags, the pattern as the client sent it. The fold is utf8proc's decomposition with case folding and marks
+//!   stripped, composed again ([`super::fold`], Unicode's own tables: `Ärger` is `arger` and `Straße` is `strasse`).
 //!
 //! The walk is a [`super::Stream`]: each slice ends once the bytes it wrote and the entries it visited reach the room
 //! the caller gives, so a slice's output and work are bounded by the room. What it keeps is one level of names per
@@ -35,6 +33,7 @@ use super::{
   Repository, SEPARATOR, SVN_ERR_FS_NOT_FOUND, bool_word, c_string_of, child_path, format_time,
   kind_word, parse_time, path_and_revision,
 };
+use super::fold::fold;
 use crate::authz::fnmatch;
 use crate::index::{Node, NodeKind, Revision};
 use crate::ra_svn::{ItemError, Value, write};
@@ -200,8 +199,8 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     let Some(request) = ListRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    if !self.must_read(&request.path)? {
-      return Ok(Outcome::Answered);
+    if let Some(outcome) = self.must_read(&request.path)? {
+      return Ok(outcome);
     }
     match self.at_or_youngest(request.revision) {
       Ok(revision) => Ok(Outcome::Streaming(Stream::list(ListStream::new(
@@ -569,12 +568,6 @@ fn optional(item: Option<Value<'_>>) -> Value<'_> {
 /// `svn_dirent_basename`: the last name of a path, empty for the root.
 fn basename(path: &str) -> &str {
   path.rsplit(SEPARATOR).next().unwrap_or_default()
-}
-
-/// `svn_utf__xfrm` with case folding and marks stripped, over ASCII: the letters `A` to `Z` lowered (module
-/// documentation for a name beyond ASCII).
-fn fold(name: &str) -> Vec<u8> {
-  name.bytes().map(|byte| byte.to_ascii_lowercase()).collect()
 }
 
 /// The walk's end: `done`, then `( success ( ) )` or the refusal.

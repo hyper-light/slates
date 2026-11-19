@@ -26,6 +26,7 @@ use crate::report::recorded::{
   value_of,
 };
 use std::collections::BTreeMap;
+use std::ffi::CString;
 
 mod commit;
 
@@ -138,6 +139,7 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
   let mut next = client.iter();
   let mut held: Vec<u8> = Vec::new();
   let mut established = false;
+  let mut challenges = 0;
   loop {
     let given = established.then_some(&sources);
     let before = items(&out).len();
@@ -161,10 +163,60 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
         held.drain(..consumed);
         established = true;
       }
+      Ok(Turn::ChallengeNeeded { consumed }) => {
+        held.drain(..consumed);
+        let (nonce, time_micros, host) = recorded_challenge(recorded, challenges);
+        challenges += 1;
+        connection
+          .challenge(nonce, time_micros, &host, &mut out)
+          .unwrap();
+      }
+      Ok(Turn::KeyNeeded { user, consumed }) => {
+        let key = CramKey::from_secret(recorded_secret(user)).unwrap();
+        held.drain(..consumed);
+        connection.key(Some(&key), &mut out).unwrap();
+      }
       Ok(Turn::Unserved { .. }) => return (out, Ending::Unserved(before)),
       Ok(other) => panic!("{}: {other:?}", recorded.name),
       Err(refused) => return (out, Ending::Refused(refused)),
     }
+  }
+}
+
+/// The parts of the `n`-th CRAM-MD5 challenge `svnserve` sent in `recorded`, `<nonce.time@host>`
+/// (`cram.c` `make_nonce`), so the connection sends the very challenge its client answered.
+fn recorded_challenge(recorded: Recorded, n: usize) -> (u64, i64, CString) {
+  let challenge = items(recorded.server)
+    .iter()
+    .filter_map(|item| match value_of(item) {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::Word("step"), Value::List(challenge)] => match challenge.as_slice() {
+          [Value::String(text)] => Some(text.to_vec()),
+          _ => None,
+        },
+        _ => None,
+      },
+      _ => None,
+    })
+    .nth(n)
+    .unwrap();
+  let text = std::str::from_utf8(&challenge).unwrap();
+  let inner = text.strip_prefix('<').unwrap().strip_suffix('>').unwrap();
+  let (nonce, rest) = inner.split_once('.').unwrap();
+  let (time_micros, host) = rest.split_once('@').unwrap();
+  (
+    nonce.parse().unwrap(),
+    time_micros.parse().unwrap(),
+    CString::new(host).unwrap(),
+  )
+}
+
+/// The secret the recorder's password file gives `user` (`make-fixtures.py` `PASSWD`).
+fn recorded_secret(user: &[u8]) -> &'static [u8] {
+  match user {
+    b"alice" => ALICE_SECRET,
+    b"bob" => b"bob's secret",
+    other => panic!("no key for {}", String::from_utf8_lossy(other)),
   }
 }
 
@@ -884,7 +936,7 @@ fn external_request() -> String {
 /// anonymous principal's having been compiled for `dir`), then, alice's still, a directory after
 /// the trivial request.
 #[test]
-fn a_read_the_principal_may_not_make_authenticates_first_and_is_judged_by_the_new_principals_rules() {
+fn a_denied_read_authenticates_first_and_is_judged_by_the_new_principals_rules() {
   let fixture = fixture();
   let anonymous = FixtureGuards::anonymous();
   let mut connection = established();
@@ -947,6 +999,44 @@ fn a_tunnels_anonymous_read_authenticates_as_the_tunnels_user() {
   let (out, turn) = send(&fixture, &FixtureGuards::default(), &mut connection, b"");
   let wrote = Ok(format!("{:?}", Turn::Wrote));
   assert_eq!((out.as_str(), turn), ("( success ( dir ) ) ", wrote));
+}
+
+/// The recorded reads that authenticate in the middle of their command (`make-fixtures.py`
+/// `read-auth-*`): stock `svn cat` and `svn ls` of `/trunk/secret` as alice, and `svn cat` as bob.
+const READ_AUTH: [Recorded; 3] = [
+  Recorded {
+    name: "read-auth-cat.1",
+    client: include_bytes!("../../fixtures/report/read-auth-cat.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-cat.1.server.bin"),
+  },
+  Recorded {
+    name: "read-auth-ls.1",
+    client: include_bytes!("../../fixtures/report/read-auth-ls.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-ls.1.server.bin"),
+  },
+  Recorded {
+    name: "read-auth-cat-bob.1",
+    client: include_bytes!("../../fixtures/report/read-auth-cat-bob.1.client.bin"),
+    server: include_bytes!("../../fixtures/report/read-auth-cat-bob.1.server.bin"),
+  },
+];
+
+/// A-613 part 2, step 7, against stock `svnserve` 1.15.0 (`make-fixtures.py` `read-auth-*`): replay
+/// stock `svn cat` and `svn ls` of `/trunk/secret` as alice and `svn cat` of it as bob, each
+/// anonymous after the handshake and asked to authenticate in the middle of its read, through a
+/// connection over the fixtures' repository, with the challenge `svnserve` sent and each user's key
+/// from the recorder's password file; expect every item as `svnserve` wrote it: the request
+/// listing `CRAM-MD5` alone, the challenge and `( success ( ) )`, then alice's answer with no
+/// trivial auth request before it, and bob refused "Authorization failed" (170001).
+#[test]
+fn reads_that_authenticate_in_the_middle_of_their_command_are_answered_as_svnserve_answered_them() {
+  let fixture = fixture();
+  let texts = texts_by_md5(&fixture.green);
+  for recorded in READ_AUTH {
+    let (out, ending) = replay(&fixture, recorded, PLENTY);
+    assert_eq!(ending, Ending::Waiting, "{}", recorded.name);
+    assert_as_svnserve(recorded.name, &items(&out), recorded.server, &texts);
+  }
 }
 
 /// A-656 with A-655 (`serve.c` `commit` 1471-1580): commit, through a tunnel as alice, a drive

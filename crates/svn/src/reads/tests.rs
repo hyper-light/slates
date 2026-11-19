@@ -402,6 +402,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
       uuid: UUID,
       capabilities,
       authz,
+      authentication: Authentication::Settled,
     };
     let mut out = Vec::new();
     let outcome = answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap();
@@ -425,6 +426,7 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
         at = same_answer(name, word, &items(&out), &answers, at);
         return closed(name, word, at, answers.len(), answered);
       }
+      Outcome::Authenticate => panic!("{name}: {word} asked for an authentication"),
     }
   }
   assert_eq!(
@@ -965,6 +967,7 @@ const ROOT_SESSION: Session<'static> = Session {
   uuid: UUID,
   capabilities: STOCK_CAPABILITIES,
   authz: None,
+  authentication: Authentication::Settled,
 };
 
 /// What stock `svn` 1.15.0 announces (recorded: every session's greeting): `svndiff1`, `accepts-svndiff2`,
@@ -1501,6 +1504,7 @@ const SVNDIFF0_SESSION: Session<'static> = Session {
     ..STOCK_CAPABILITIES
   },
   authz: None,
+  authentication: Authentication::Settled,
 };
 
 /// A-613 part 2 (`get-file-revs` in svndiff 0, `svndiff.c`): a window of new data alone, the first revision's, is
@@ -1721,6 +1725,123 @@ fn a_copy_from_a_hidden_source_shows_no_source_and_the_author_and_date_alone() {
   );
 }
 
+/// The paths a listing's answer names, in byte order.
+fn listed_paths(out: &[u8]) -> Vec<String> {
+  let mut paths: Vec<String> = items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::String(path), Value::Word(_), ..] => {
+          Some(String::from_utf8_lossy(path).into_owned())
+        }
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect();
+  paths.sort();
+  paths
+}
+
+/// A-613 part 2, step 7 (`svn_repos_list` with patterns, `svn_utf__fuzzy_glob_match`): commit `Ärger.txt` and
+/// `Straße` beneath `/trunk`, then list `/trunk`'s entries with the patterns `arger*` and `strasse`, then with `Ärger*`
+/// alone; expect both entries named by the first listing, each name folded as utf8proc folds it before it is matched,
+/// and none by the second, a pattern the client did not fold, since the server folds the names alone.
+#[test]
+fn a_listing_matches_names_beyond_ascii_folded_as_utf8proc_folds_them() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/Ärger.txt file add", "row 12 /trunk/Straße file add"]);
+  let folded = "( list ( 5:trunk ( 12 ) immediates ( kind ) ( 6:arger* 7:strasse ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, folded.as_bytes(), usize::MAX);
+  assert_eq!(
+    listed_paths(&out),
+    [String::from("/trunk/Straße"), String::from("/trunk/Ärger.txt")]
+  );
+  let unfolded = "( list ( 5:trunk ( 12 ) immediates ( kind ) ( 7:Ärger* ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, unfolded.as_bytes(), usize::MAX);
+  assert_eq!(listed_paths(&out), Vec::<String>::new());
+}
+
+/// The anonymous principal's rules over a root it reads whole but `/branches` (A-606).
+fn branches_hidden() -> PrincipalRules {
+  let rules_text = b"[/]\n* = r\n\n[/branches]\n* =\n";
+  Authz::parse(rules_text, None, crate::authz::Bounds::of(rules_text, None))
+    .unwrap()
+    .rules(b"repo", Principal::Anonymous)
+}
+
+/// One command answered at the root under `rules` with `authentication`: its outcome, a streamed answer drained, and
+/// what was written.
+fn answered_with(
+  rules: &PrincipalRules,
+  authentication: Authentication,
+  command: &[u8],
+) -> (Outcome, String) {
+  let fixture = Fixture::new();
+  let session = Session {
+    authz: Some(rules),
+    authentication,
+    ..ROOT_SESSION
+  };
+  let value = items(command).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(&fixture.index, &fixture.green, &session, &value, &mut out).unwrap();
+  let outcome = drained(outcome, &fixture, &session, &mut out);
+  (outcome, String::from_utf8(out).unwrap())
+}
+
+/// A-613 part 2, step 7 (`must_have_access` 829-834, where the client could authenticate): ask for each of the six
+/// reads that check their path first, of a path the anonymous rules hide, in a session whose client could
+/// authenticate; expect each to answer that an authentication is to be asked for, with nothing written, so the
+/// connection can ask before any word of the command's answer.
+#[test]
+fn a_hidden_path_asks_for_an_authentication_where_the_client_could_give_one() {
+  let rules = branches_hidden();
+  for command in [
+    b"( check-path ( 8:branches ( ) ) ) ".as_slice(),
+    b"( stat ( 8:branches ( ) ) ) ",
+    b"( get-dir ( 8:branches ( ) true true ) ) ",
+    b"( get-file ( 17:branches/b1/a.txt ( ) true false ) ) ",
+    b"( get-iprops ( 8:branches ( ) ) ) ",
+    b"( list ( 8:branches ( ) infinity ( kind ) ) ) ",
+  ] {
+    let answered = answered_with(&rules, Authentication::Available, command);
+    assert_eq!(
+      answered,
+      (Outcome::Authenticate, String::new()),
+      "{}",
+      String::from_utf8_lossy(command)
+    );
+  }
+}
+
+/// A-613 part 2, step 7 (`must_have_access` after its `auth_request`): run `check-path` again once the client has
+/// authenticated for it, of a path the new principal may read and of one it may not; expect the first answered with no
+/// trivial authentication request before it, and the second refused "Authorization failed" (170001) with nothing
+/// before it; and a readable path asked where the client could authenticate answered as ever, the trivial request
+/// first.
+#[test]
+fn a_read_run_again_after_its_authentication_has_no_trivial_request() {
+  let rules = branches_hidden();
+  let refusal = "( failure ( ( 170001 20:Authorization failed 0: 0 ) ) ) ";
+  let trunk = b"( check-path ( 5:trunk ( ) ) ) ";
+  assert_eq!(
+    answered_with(&rules, Authentication::Done, trunk),
+    (Outcome::Answered, String::from("( success ( dir ) ) "))
+  );
+  assert_eq!(
+    answered_with(&rules, Authentication::Done, b"( check-path ( 8:branches ( ) ) ) "),
+    (Outcome::Answered, String::from(refusal))
+  );
+  assert_eq!(
+    answered_with(&rules, Authentication::Available, trunk),
+    (
+      Outcome::Answered,
+      String::from("( success ( ( ) 0: ) ) ( success ( dir ) ) ")
+    )
+  );
+}
+
 /// The bounds a hostile command is read within.
 fn hostile_bounds() -> Bounds {
   Bounds {
@@ -1782,7 +1903,7 @@ fn hostile_command_holds(command: &str) -> Result<(), TestCaseError> {
   )
   .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
   let mut stream = match outcome {
-    Outcome::Close | Outcome::Elsewhere => {
+    Outcome::Close | Outcome::Elsewhere | Outcome::Authenticate => {
       prop_assert!(out.is_empty());
       return Ok(());
     }
