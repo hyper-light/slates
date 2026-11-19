@@ -60,6 +60,8 @@ use moved::Change;
 pub use tree::{TreeBase, TreeNode};
 
 #[cfg(test)]
+mod handed_tests;
+#[cfg(test)]
 mod oracle;
 #[cfg(test)]
 mod tests;
@@ -89,6 +91,10 @@ pub struct Upper {
 }
 
 /// What landing one work of a stack answered ([`Green::land_stack`]), in the stack's order: the bottom first.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "an accepted work is the common outcome: boxing it would allocate per landed work, to shrink the rare refusals"
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Landed {
   /// The work landed.
@@ -233,10 +239,12 @@ impl Green {
       let change = self.change_at(&levels, &path)?;
       changes.insert(path, change);
     }
+    let landed: BTreeSet<u64> = levels.iter().map(Level::landed).collect();
     let against = Against {
       changes: &changes,
       at,
       unchanged: Change::default(),
+      since: (bottom.base, &landed),
     };
     let judged = self.judge_upper((&work, &resolved), &against);
     Ok(judged.map(|ops| {
