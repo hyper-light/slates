@@ -291,9 +291,10 @@ fn record(id: RepositoryId) -> RepositoryRecord {
   }
 }
 
-/// A-651 part 2 (the site's step 3). Do: start upload-pack for a repository whose store the lender holds, for one whose
-/// store it does not hold, and receive-pack and Mercurial's session for the held one. Expect: upload-pack started for the
-/// held store alone; every other start not served.
+/// A-651 part 2 and A-683 (the site's step 3). Do: start upload-pack and receive-pack for a repository whose store the
+/// lender holds and for one whose store it does not hold, and Mercurial's session for the held one. Expect: upload-pack
+/// started for the held store alone; receive-pack for both, as its driver reads the store the shard holds, never a
+/// lender's; Mercurial's session not served.
 #[test]
 fn upload_pack_starts_only_over_a_store_the_lender_holds() {
   let mut services = ToolServices::new(Lends::empty(), ROOM);
@@ -304,6 +305,7 @@ fn upload_pack_starts_only_over_a_store_the_lender_holds() {
     (Service::GitUploadPack, &held),
     (Service::GitUploadPack, &unheld),
     (Service::GitReceivePack, &held),
+    (Service::GitReceivePack, &unheld),
     (Service::Mercurial { hidden: false }, &held),
   ]
   .map(|(service, repository)| {
@@ -315,8 +317,5 @@ fn upload_pack_starts_only_over_a_store_the_lender_holds() {
     };
     services.start(&start).err()
   });
-  assert_eq!(
-    answers,
-    [None, Some(Unserved), Some(Unserved), Some(Unserved)]
-  );
+  assert_eq!(answers, [None, Some(Unserved), None, None, Some(Unserved)]);
 }
