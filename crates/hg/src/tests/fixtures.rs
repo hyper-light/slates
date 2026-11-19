@@ -872,7 +872,6 @@ pub(crate) mod import {
       .find(|(known, _)| *known == name)
       .map(|(_, bytes)| *bytes)
   }
-
 }
 
 /// The state's golden vectors (A-649 part 2): one history with phases, bookmarks and obsolescence markers stored by

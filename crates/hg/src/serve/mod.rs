@@ -193,6 +193,14 @@ impl RevSet {
     }
   }
 
+  /// Removes `rev`.
+  pub(crate) fn remove(&mut self, rev: Rev) {
+    let (word, bit) = Self::place(rev);
+    if let Some(word) = self.words.get_mut(word) {
+      *word &= !bit;
+    }
+  }
+
   /// Whether the set holds `rev`.
   pub(crate) fn contains(&self, rev: Rev) -> bool {
     let (word, bit) = Self::place(rev);

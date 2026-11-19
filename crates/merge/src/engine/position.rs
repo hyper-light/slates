@@ -4,10 +4,16 @@
 //! **Units.** A verdict is reached unit by unit. A unit is one run of the verdict that reads the green only at its own
 //! paths, its footprint: a special node's path; a rename's two ends; a created, removed or edited file; a directory made,
 //! or removed together with what stands beneath it; a mode, a symbolic link or an attribute; a hard link and the node it
-//! names; a node-exclusive path. The units' effects and windows, taken in order, are the whole verdict's, pushed in the
-//! order a whole verdict pushes them. Two units are not footprints of paths: what the work and its base alone decide (an
-//! op no verdict can apply, an edit that does not fit its base), which never changes, and a work's copies, judged
-//! together. A content edit's unit also keeps where each of its ops stood at the head it was judged at ([`Placed`]).
+//! names; a node-exclusive path; a path the work writes and, when the work hands a node on to a link there with its
+//! writes, the home the node passes from (A-669). A removal, or a replacement by a rename, reads the hard links naming
+//! its file too, since a link made after the work's base refuses it (A-670). The units' effects and windows, taken in
+//! order, are the whole verdict's, pushed in the order a whole verdict pushes them, and which units there are is the
+//! work's alone, never the head's, so the units reached at one head pair one to one with those reached at another. Two
+//! units are not footprints of paths. One holds what the work and its base decide (an op no verdict can apply, an edit
+//! that does not fit what it edits), which the head turns in one place only: an edit declared at a link edits the file
+//! whose node the work hands on to the link, so this unit reads the links naming the files the work removes or replaces.
+//! The other is a work's copies, judged together. A content edit's unit also keeps where each of its ops stood at the
+//! head it was judged at ([`Placed`]).
 //!
 //! **Committed by position.** The owner takes a [`Computed`](super::Computed) made anywhere
 //! ([`Green::judge_computed`](super::Green::judge_computed)) and answers it as a submit does: an increment accepted
@@ -28,7 +34,12 @@
 //! heads, and its effects (a file's bytes, a link's home) are the same too. A copy made since changes the last change of
 //! every path in its tree without naming each, so a footprint in the tree of a copy made since is met as well. What only
 //! the copies' verdict reads (the reverse map of hard links, the head's version, the fold floor) is covered by judging
-//! the copies again.
+//! the copies again. A hard link's change (made, removed, or turned to another file, a node move's included) is recorded
+//! at the link's own name and never at the file it names, so what changed since also names, for each link changed, the
+//! file it named at the earlier head and the one it names at the later ([`Since`]): the links naming a file read the same
+//! at both heads unless one of them changed. No copy changes them: a copy never brings a hard link, and never lands
+//! over one or over a file one names (its verdict refuses each, `copy`'s module docs), so no link has a copy made since
+//! above it.
 //!
 //! **The oracle** (`compute_tests.rs`): generated concurrent histories on a green that judges every work serially at its
 //! head and a green that commits by position the verdicts a lagging copy computed, both held equal at every step.
@@ -130,12 +141,15 @@ impl Unit {
   }
 }
 
-/// The paths a unit's verdict reads (module docs): at most two paths, each read at itself, and a directory whose
-/// children are read.
+/// The paths a unit's verdict reads (module docs): at most two paths, each read at itself; a directory whose children
+/// are read; and files whose naming hard links are read.
 #[derive(Clone, Copy)]
 pub(super) struct Footprint<'a> {
   paths: [Option<&'a str>; 2],
   beneath: Option<&'a str>,
+  /// The files whose naming hard links the unit reads (A-669, A-670): which links name each at the head, and when each
+  /// last changed.
+  linked: &'a [&'a str],
 }
 
 impl<'a> Footprint<'a> {
@@ -144,14 +158,16 @@ impl<'a> Footprint<'a> {
     Footprint {
       paths: [Some(path), None],
       beneath: None,
+      linked: &[],
     }
   }
 
-  /// Two paths: a rename's ends, a hard link and the node it names.
+  /// Two paths: a rename's ends, a hard link and the node it names, a link a node passes to and its home.
   pub(super) fn pair(first: &'a str, second: &'a str) -> Footprint<'a> {
     Footprint {
       paths: [Some(first), Some(second)],
       beneath: None,
+      linked: &[],
     }
   }
 
@@ -160,6 +176,26 @@ impl<'a> Footprint<'a> {
     Footprint {
       paths: [Some(path), None],
       beneath: Some(path),
+      linked: &[],
+    }
+  }
+
+  /// The hard links naming each of `files`, and no path of its own: whether an edit declared at a link fits the file
+  /// whose node the work hands on to the link (A-669).
+  pub(super) fn links_naming(files: &'a [&'a str]) -> Footprint<'a> {
+    Footprint {
+      paths: [None, None],
+      beneath: None,
+      linked: files,
+    }
+  }
+
+  /// This footprint and the hard links naming each of `files`: a removal, or a replacement by a rename, is refused while
+  /// a link made after the work's base names its file (A-670).
+  pub(super) fn and_links_naming(self, files: &'a [&'a str]) -> Footprint<'a> {
+    Footprint {
+      linked: files,
+      ..self
     }
   }
 }
@@ -172,22 +208,27 @@ pub(super) struct Since {
   changed: BTreeSet<String>,
   /// The destinations of the copies made in `(at, head]`, each standing for its tree.
   copied: Vec<String>,
+  /// The files whose naming hard links changed in `(at, head]`: the file each link changed there named at `at`, and the
+  /// one it names at the head. A link's change is recorded at the link's own name, never at its file's.
+  relinked: BTreeSet<String>,
   /// Whether a work's copies are judged again: the green moved, or its fold floor is not the one they were judged over.
   copies: bool,
 }
 
 impl Since {
-  /// What changed since `at`: the paths the change index names, the copies made among them, and whether copies are
-  /// judged again.
+  /// What changed since `at`: the paths the change index names, the copies made among them, the files whose naming
+  /// links changed, and whether copies are judged again.
   pub(super) fn new(
     at: u64,
     (changed, copied): (BTreeSet<String>, Vec<String>),
+    relinked: BTreeSet<String>,
     copies: bool,
   ) -> Since {
     Since {
       at,
       changed,
       copied,
+      relinked,
       copies,
     }
   }
@@ -207,6 +248,10 @@ impl Since {
       || footprint
         .beneath
         .is_some_and(|dir| self.changed_beneath(dir) || self.copied_above(dir))
+      || footprint
+        .linked
+        .iter()
+        .any(|file| self.relinked.contains(*file))
   }
 
   /// Whether a copy made since holds `path` in its tree.
@@ -253,12 +298,6 @@ impl Units {
       prior: Some((units.into_iter(), since)),
       again: 0,
     }
-  }
-
-  /// What the work and its base alone decide: reached once, and taken as it was at every later head.
-  pub(super) fn constant(&mut self, judge: impl FnOnce() -> Unit) {
-    let taken = self.prior.as_mut().and_then(|(units, _)| units.next());
-    self.done.push(taken.unwrap_or_else(judge));
   }
 
   /// A work's copies: judged again whenever the green moved or its floor differs (module docs).

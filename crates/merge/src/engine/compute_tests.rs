@@ -20,6 +20,7 @@ use crate::increment::Base;
 use crate::ops_doc::{Op, OpKind, OpsDoc};
 use crate::origin::Origin;
 use crate::push::{HEAD_ATTRIBUTE, ROOT};
+use crate::verdict::MergeConflictClass;
 
 /// Shape: the files a generated work names, two at the root and two in a directory, few so works collide often.
 const FILES: [&str; 4] = ["a", "b", "d/c", "d/e"];
@@ -1107,4 +1108,133 @@ fn a_verdict_from_a_copy_of_another_green_is_refused_typed() {
   let taken = stranger.judge_computed(&second, claimed).map(|_| ());
   assert_eq!(taken, Err(PositionRefused::NotRecorded { version: 2 }));
   assert_eq!(seen(&mut stranger), before);
+}
+
+/// An owner and a serial green at version 1, which links `LINK` to `a`.
+fn linked_pair() -> (Green, Green) {
+  let (mut owner, mut serial) = (Green::with_origin(origin()), Green::with_origin(origin()));
+  landed(&mut owner, &[Edit::Link(0)], 1);
+  landed(&mut serial, &[Edit::Link(0)], 1);
+  (owner, serial)
+}
+
+/// Removes the hard link `LINK` at `green`'s head, as increment `id`: the version made.
+fn link_removed(green: &mut Green, id: u64) -> u64 {
+  let mut draft = Draft::default();
+  draft.alone(OpKind::Unlink, LINK);
+  match green.submit(&increment(draft, green.head(), id)) {
+    Outcome::Accepted { version } => version,
+    other => panic!("not accepted: {other:?}"),
+  }
+}
+
+/// The serial green's verdict of `inc` at its head, its kind and each window's path and class, once the owner has taken
+/// `computed` by position as the same verdict and judged at least one unit again.
+fn taken_as_serial(
+  (owner, serial): (&mut Green, &mut Green),
+  inc: &Increment,
+  computed: Computed,
+) -> (Answer, Vec<(String, MergeConflictClass)>) {
+  let again = owner.judged_again();
+  let by_position = owner
+    .judge_computed(inc, computed)
+    .expect("taken by position");
+  assert!(owner.judged_again() > again, "no unit judged again");
+  let serially = serial.judge(inc);
+  let answer = judged_answer(&serially);
+  let classes = match &serially {
+    Judgment::Conflict { windows } => windows
+      .iter()
+      .map(|window| (window.path.clone(), window.class))
+      .collect(),
+    _ => Vec::new(),
+  };
+  same_judgment(serially, by_position).expect("the serial verdict");
+  (answer, classes)
+}
+
+/// A-658 with A-670 (a link made after the position meets a removal): a removal reads the links naming its file, and a
+/// link's change is recorded at the link's name, never at the file's. Do: compute, on a copy at version 0, a work based
+/// there that removes `a`; land, on the owner and the serial green, version 1 linking `h` to `a`; hand the owner the
+/// computed verdict. Expect: the copy accepted the removal; the owner refuses it as the serial green does, delete
+/// against modify at `a`, a link made after the work's base keeping the node; the unit judged again.
+#[test]
+fn a_link_made_after_the_position_meets_the_removal_of_its_file() {
+  let copy = Green::with_origin(origin());
+  let removing = work(&copy, 0, &[Edit::Remove(0)], 2);
+  let computed = copy.compute(&removing).expect("computed at version 0");
+  assert_eq!(computed_answer(&computed), Answer::Accepted);
+  let (mut owner, mut serial) = linked_pair();
+  let refused = (FILES[0].to_owned(), MergeConflictClass::DeleteModify);
+  assert_eq!(
+    taken_as_serial((&mut owner, &mut serial), &removing, computed),
+    (Answer::Conflict, vec![refused])
+  );
+}
+
+/// A-658 with A-670 (a link made after the position meets a replacement): a rename over a file reads the links naming
+/// the file it replaces. Do: compute, on a copy at version 0, a work based there that renames `b` over `a`; land, on
+/// the owner and the serial green, version 1 linking `h` to `a`; hand the owner the computed verdict. Expect: the copy
+/// accepted the rename; the owner refuses it as the serial green does, rename against rename at `a`.
+#[test]
+fn a_link_made_after_the_position_meets_a_rename_over_its_file() {
+  let copy = Green::with_origin(origin());
+  let replacing = work(&copy, 0, &[Edit::Rename(1, 0)], 3);
+  let computed = copy.compute(&replacing).expect("computed at version 0");
+  assert_eq!(computed_answer(&computed), Answer::Accepted);
+  let (mut owner, mut serial) = linked_pair();
+  let refused = (FILES[0].to_owned(), MergeConflictClass::RenameRename);
+  assert_eq!(
+    taken_as_serial((&mut owner, &mut serial), &replacing, computed),
+    (Answer::Conflict, vec![refused])
+  );
+}
+
+/// A-658 with A-670 (a link removed after the position meets a removal of the file it named): the links naming a file
+/// at the earlier head count as well as those at the later. Do: compute, on a copy at version 1 (`h` linked to `a`), a
+/// work based at version 0 that removes `a`; land, on the owner and the serial green, version 2 removing `h`; hand the
+/// owner the computed verdict. Expect: the copy refused the removal, the link made after its base; the owner accepts
+/// it as the serial green does, no link naming `a` any longer.
+#[test]
+fn a_link_removed_after_the_position_meets_the_removal_of_the_file_it_named() {
+  let (copy, _) = linked_pair();
+  let removing = work(&copy, 0, &[Edit::Remove(0)], 3);
+  let computed = copy.compute(&removing).expect("computed at version 1");
+  assert_eq!(computed_answer(&computed), Answer::Conflict);
+  let (mut owner, mut serial) = linked_pair();
+  for green in [&mut owner, &mut serial] {
+    assert_eq!(link_removed(green, 2), 2);
+  }
+  assert_eq!(
+    taken_as_serial((&mut owner, &mut serial), &removing, computed),
+    (Answer::Accepted, Vec::new())
+  );
+}
+
+/// A-658 with A-669 (the writes a node takes to a link, and what they fit): an edit declared at a link edits the file
+/// whose node the work hands on to the link, which the links naming the files the work removes decide. Do: compute, on
+/// a copy at version 1 (`h` linked to `a`), a work based there that writes two bytes at `h`, as the deriver declares
+/// writes to a removed file at its base link, and removes `a`; land, on the owner and the serial green, version 2
+/// removing `h`; hand the owner the computed verdict. Expect: the copy accepted it, the node and the writes handed on to
+/// `h`; the owner refuses it as the serial green does: the writes fit no file at `h` (`TypeChanged`) and the file they
+/// edit at `h` is gone (delete against modify), in that order.
+#[test]
+fn a_link_removed_after_the_position_meets_the_fit_of_the_writes_handed_to_it() {
+  let (copy, _) = linked_pair();
+  let mut draft = Draft::default();
+  draft.content(OpKind::Overwrite, LINK, 0, b"AL");
+  draft.alone(OpKind::Unlink, FILES[0]);
+  let handing = increment(draft, 1, 3);
+  let computed = copy.compute(&handing).expect("computed at version 1");
+  assert_eq!(computed_answer(&computed), Answer::Accepted);
+  let (mut owner, mut serial) = linked_pair();
+  for green in [&mut owner, &mut serial] {
+    assert_eq!(link_removed(green, 2), 2);
+  }
+  let unfit = (LINK.to_owned(), MergeConflictClass::TypeChanged);
+  let gone = (LINK.to_owned(), MergeConflictClass::DeleteModify);
+  assert_eq!(
+    taken_as_serial((&mut owner, &mut serial), &handing, computed),
+    (Answer::Conflict, vec![unfit, gone])
+  );
 }
