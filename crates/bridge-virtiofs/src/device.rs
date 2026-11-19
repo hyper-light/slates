@@ -1414,6 +1414,24 @@ impl Device {
     }
   }
 
+  /// A write-back the volume refused before this request, answered where its asker reads an answer, so a guest's fsync
+  /// or close fails rather than claim its stores durable (A-163's rule): the error reply's length for an FSYNC, a FLUSH
+  /// or a READ, and none for any other request (a RELEASE's answer the kernel ignores, and a FORGET has none).
+  #[cfg(unix)]
+  fn refused_write_back_answer(
+    &mut self,
+    ingested: Option<&Ingested>,
+    opcode: Option<Opcode>,
+    header: Option<&InHeader>,
+  ) -> Option<usize> {
+    let errno = ingested?.refused?;
+    if !matches!(opcode, Some(Opcode::FSync | Opcode::Flush | Opcode::Read)) {
+      return None;
+    }
+    let unique = header?.unique;
+    Some(ReplyHeader::write_error(unique, errno, &mut self.reply).unwrap_or(0))
+  }
+
   /// Holds, unserved, a chain whose request asks for the guest's stores through its maps to reach the volume first,
   /// while they are written back ([`crate::backed`]): whether it was held. A chain already through its ingest (`fresh`
   /// false) is served, with how the ingest came out.
@@ -1501,14 +1519,10 @@ impl Device {
     // fsync or close fails rather than claim its stores durable (A-163's rule; a RELEASE's answer the kernel ignores,
     // and a FORGET has none).
     #[cfg(unix)]
-    if let Some(Ingested {
-      refused: Some(errno),
-      ..
-    }) = ingested
-      && matches!(opcode, Some(Opcode::FSync | Opcode::Flush | Opcode::Read))
-      && let Some(h) = header.as_ref()
+    if let Some(answered) =
+      self.refused_write_back_answer(ingested.as_ref(), opcode, header.as_ref())
     {
-      written = ReplyHeader::write_error(h.unique, errno, &mut self.reply).unwrap_or(0);
+      written = answered;
     }
     if written == 0 && expects_reply(header.as_ref()) && reply_room >= OUT_HEADER_LEN {
       // The reply does not fit the guest's buffers (a driver posted less room than the ABI's reply
