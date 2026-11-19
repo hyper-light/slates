@@ -3,13 +3,14 @@
 //! `do_fetch_pack_v2`, `process_ack` [C]): its arguments, and its response's sections.
 //!
 //! **Arguments.** `want <id>`, `want-ref <ref>`, `have <id>`, `done`, `thin-pack`, `no-progress`, `include-tag`,
-//! `ofs-delta`, `shallow <id>`, `deepen <depth>`, `deepen-since <time>`, `deepen-not <rev>`, `deepen-relative`,
-//! `filter <spec>`, `packfile-uris <protocols>`, `sideband-all` and `wait-for-done`, each a whole line, in any order;
-//! anything else is refused, as `process_args` dies on it ("unexpected line"). A depth is git's `int`, positive
+//! `ofs-delta`, `shallow <id>`, `deepen <depth>`, `deepen-since <time>`, `deepen-not <rev>`, `deepen-relative`, `filter
+//! <spec>`, `packfile-uris <protocols>`, `sideband-all` and `wait-for-done`, each a whole line, in any order; anything
+//! else is refused, as `process_args` dies on it ("unexpected line"). A depth is git's `int`, positive
 //! (`process_deepen`); a time is git's `timestamp_t`, all but its largest, which revision.c reads as "no limit"
 //! (`process_deepen_since`). `filter` and `packfile-uris` come at most once, as git dies on a second of each, and
-//! `deepen` with `deepen-since` or `deepen-not` is refused, which the document says "Cannot be used with" it. A filter's
-//! spec, a rev and a list of protocols are kept as sent, for the pieces that read them; each must name something.
+//! `deepen` with `deepen-since` or `deepen-not` is refused, which the document says "Cannot be used with" it. A
+//! filter's spec, a rev and a list of protocols are kept as sent, for the pieces that read them; each must name
+//! something.
 //!
 //! **The response**, in the order the grammar gives:
 //!
