@@ -89,10 +89,13 @@ const SESSIONS: [Session; 17] = [
   ),
 ];
 
-/// The longest word a stock 1.15 parser reads (`marshal.c` `MAX_WORD_LENGTH`), which bounds the recorded streams' words.
+/// The longest word a stock parser reads, which bounds the recorded streams' words.
+/// Format: `marshal.c` `MAX_WORD_LENGTH` (66) less one: `read_item` refuses a word that reaches its 25th byte, "Word
+/// is too long" (1343-1385).
 const WORD_BYTES: usize = 24;
 
-/// The deepest list a commit session's client sends: `( commit ( ... ( ( name value ) ) ) )`.
+/// The deepest list a commit session's client sends.
+/// Shape: `( commit ( ... ( ( name value ) ) ) )`: the command, its parameters, the revision properties, a pair.
 const DEPTH: usize = 4;
 
 /// One item of a stream and the bytes it took, its terminating space included.
@@ -282,7 +285,7 @@ fn applied(stream: &[u8], path: &[u8], base: &[u8]) -> Vec<u8> {
   svndiff::apply_all(base, &windows).unwrap()
 }
 
-/// A-617 (§4.17.4 item 3.2, "A text change"; `editorp.c` 762-827: a file's `textdelta-chunk`s are one svndiff stream).
+/// A-617 (§4.17.4 item 3.2, "A text change"; `editorp.c` 762-826: a file's `textdelta-chunk`s are one svndiff stream).
 /// Do: gather each recorded file's chunks between `apply-textdelta` and `textdelta-end`, decode every stream whole,
 /// and apply five of them to the texts the recording script made. Expect: every stream decodes; the import's `a.txt`
 /// and binary file (its session rooted at the trunk, so `project/...`), the edit's `a.txt`, the replacement's `c.txt`
@@ -456,7 +459,7 @@ fn malformed<T>() -> Result<T, EditRefusal> {
   Err(EditRefusal::Malformed(Malformation::Shape))
 }
 
-/// A-617 (`vparse_tuple` 1608-1715: an item missing, an item of another kind, a copy's list with its path alone). Do:
+/// A-617 (`vparse_tuple` 1608-1718: an item missing, an item of another kind, a copy's list with its path alone). Do:
 /// read `open-file` without its revision's list, with a word for its path, with a number for its revision list,
 /// `add-file` with a copy list holding only a path, and `open-file` with an item past its prototype. Expect: the first
 /// four refused malformed, `E210004`, ending the connection; the last read, the extra item ignored.
@@ -518,7 +521,7 @@ fn a_command_out_of_its_prototype_is_malformed_and_items_past_it_are_ignored() {
   );
 }
 
-/// A-617 (`editorp.c` 1103-1108: an unknown command is a command error; `read_tuple`'s `"wl"`). Do: read a command
+/// A-617 (`editorp.c` 1127-1132: an unknown command is a command error; `read_tuple`'s `"wl"`). Do: read a command
 /// named `rename-file`, an item that is a word, and a command whose parameters are a string. Expect: the first refused
 /// as unknown, `E210001`, the connection kept (`svnserve` writes a failure and aborts the edit); the others malformed.
 #[test]
@@ -581,7 +584,7 @@ fn a_nul_in_a_c_string_and_a_revision_past_svn_revnum_t_are_refused() {
   );
 }
 
-/// A-617 (`serve.c` `commit` 1497-1510 and `add_lock_tokens` 1395-1430). Do: read a request of one item, one of
+/// A-617 (`serve.c` `commit` 1495-1510 and `add_lock_tokens` 1360-1409). Do: read a request of one item, one of
 /// three items without revision properties, one whose keep-locks is not a boolean, one missing it, one whose
 /// revision properties hold a string, and the lock tokens of requests holding a string, a pair whose path is a number,
 /// a pair whose token is a word, a pair of one item and a path with a NUL. Expect: the one-item form keeps its locks
@@ -664,7 +667,7 @@ enum Got<'a> {
   Absent,
 }
 
-/// `marshal.c` `vparse_tuple` (1608-1715), transcribed: reads `items` with `format` from `*at`, pushing what it reads.
+/// `marshal.c` `vparse_tuple` (1608-1718), transcribed: reads `items` with `format` from `*at`, pushing what it reads.
 fn vparse<'a>(
   items: &[Value<'a>],
   format: &[u8],
@@ -750,7 +753,7 @@ fn fill_absent(format: &[u8], at: &mut usize, got: &mut Vec<Got<'_>>) -> Result<
   Ok(())
 }
 
-/// Each editor command's prototype, as its handler reads it (`editorp.c` 532-933); the commands that read no
+/// Each editor command's prototype, as its handler reads it (`editorp.c` 532-935); the commands that read no
 /// parameters have none.
 const PROTOTYPES: [(&str, &str); 20] = [
   ("target-rev", "r"),

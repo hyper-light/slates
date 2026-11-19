@@ -5,22 +5,24 @@
 //! commands until `close-edit` or `abort-edit` (`subversion/libsvn_ra_svn/protocol` §3.1.1 and §3.1.2; Subversion's
 //! `1.14.x` branch at `d434dc14`). This module turns each item the item codec ([`crate::ra_svn`]) read into a typed
 //! value, refusing exactly what `svnserve` refuses and how:
-//! - **The commit's request** (`serve.c` `commit` 1471-1550): `( logmsg:string ? ( ( lock-path lock-token ) ... )
-//!   keep-locks:bool ? rev-props:proplist )`, read as `svn_ra_svn__parse_tuple(params, "clb?l")`, or a client before
-//!   1.2's one-item form `"c"`, which keeps its locks. Its revision properties are read as `svn_ra_svn__parse_proplist`
-//!   reads them (`marshal.c`). Its lock tokens are read later, after the authentication request, as `add_lock_tokens`
-//!   reads them ([`CommitRequest::lock_tokens`]): a malformed one there is a command failure, not the connection's end.
-//! - **Each editor command** (`editorp.c` `svn_ra_svn_drive_editor2` 1073-1211 and its handlers 532-933): an item
+//! - **The commit's request** (`serve.c` `commit` 1470-1583, its parameters read at 1495-1510):
+//!   `( logmsg:string ? ( ( lock-path lock-token ) ... ) keep-locks:bool ? rev-props:proplist )`, read as
+//!   `svn_ra_svn__parse_tuple(params, "clb?l")`, or a client before 1.2's one-item form `"c"`, which keeps its locks.
+//!   Its revision properties are read as `svn_ra_svn__parse_proplist` reads them (`marshal.c`). Its lock tokens are
+//!   read later, after the authentication request, as `add_lock_tokens` reads them ([`CommitRequest::lock_tokens`]): a
+//!   malformed one there is a command failure, not the connection's end.
+//! - **Each editor command** (`editorp.c` `svn_ra_svn_drive_editor2` 1073-1212 and its handlers 532-935): an item
 //!   `( name:word params:list )` read as `svn_ra_svn__read_tuple(conn, pool, "wl", ...)`, then its parameters with the
 //!   handler's own prototype, from `open-root`'s `"(?r)s"` to `close-file`'s `"s(?c)"`.
 //!
-//! Reading a prototype is `marshal.c` `vparse_tuple` (1608-1715): items past the prototype are ignored; `?` lets the
+//! Reading a prototype is `marshal.c` `vparse_tuple` (1608-1718): items past the prototype are ignored; `?` lets the
 //! rest be absent; `( ... )` is a list whose own `?` lets it be empty; a word, number, string or list where the
-//! prototype names another kind is "Malformed network data" ([`EditRefusal::Malformed`], `SVN_ERR_RA_SVN_MALFORMED_DATA`),
-//! which ends the connection, since the drive returns it outside a command error. A command no handler knows is
-//! "Unknown editor command" ([`EditRefusal::UnknownCommand`], `SVN_ERR_RA_SVN_UNKNOWN_CMD`), which `svnserve` writes as a
-//! command failure, the edit aborted (1105-1110). Which command may come when, a token's kind, and every check the
-//! commit editor makes are the drive's, not this module's.
+//! prototype names another kind is "Malformed network data" ([`EditRefusal::Malformed`],
+//! `SVN_ERR_RA_SVN_MALFORMED_DATA`), which ends the connection, since the drive returns it outside a command error. A
+//! command no handler knows is "Unknown editor command" ([`EditRefusal::UnknownCommand`],
+//! `SVN_ERR_RA_SVN_UNKNOWN_CMD`), which `svnserve` writes as a command failure, the edit aborted (1127-1132, written
+//! at 1149-1174). Which command may come when, a token's kind, and every check the commit editor makes are the
+//! drive's, not this module's.
 //!
 //! **Where this is stricter than `svnserve`**, each a hostile input no stock client sends:
 //! - a C string (`vparse_tuple`'s `c`: a path, a property's name, a checksum, a copy's source, the log message)
@@ -46,7 +48,7 @@ const SVN_ERR_RA_SVN_MALFORMED_DATA: u32 = 210_004;
 
 /// The greatest revision a revision number may name: what `svn_revnum_t`, a C `long`, holds on the 64-bit platforms
 /// slates ships.
-/// Format: `svn_types.h` `typedef long svn_revnum_t`; `vparse_tuple` casts an `r` number to it (1652).
+/// Format: `svn_types.h` `typedef long svn_revnum_t`; `vparse_tuple` casts an `r` number to it (1643-1644).
 const LARGEST_REVISION: u64 = i64::MAX.unsigned_abs();
 
 /// The word that is a boolean's true.
@@ -109,7 +111,7 @@ fn shape() -> EditRefusal {
 /// A directory's or file's token: the string the client named it by when it opened it.
 pub type Token<'a> = &'a [u8];
 
-/// A copy's source as an editor command names it: a URL in a commit, an fspath in a replay (`editorp.c` 598-605), and
+/// A copy's source as an editor command names it: a URL in a commit, an fspath in a replay (`editorp.c` 601-609), and
 /// the revision it is read in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CopiedFrom<'a> {
@@ -254,16 +256,16 @@ pub enum EditCommand<'a> {
   CloseEdit,
   /// `abort-edit ( )`.
   AbortEdit,
-  /// `finish-replay ( )`: a replay's end, which a commit's drive does not take (`editorp.c` 922-933).
+  /// `finish-replay ( )`: a replay's end, which a commit's drive does not take (`editorp.c` 922-935).
   FinishReplay,
-  /// `failure ( ... )`: the peer's error status in place of a command (`editorp.c` 1110-1121).
+  /// `failure ( ... )`: the peer's error status in place of a command (`editorp.c` 1115-1126).
   Failure,
 }
 
 /// The commit's request (`protocol` §3.1.1), its strings borrowed from the bytes it was read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitRequest<'v, 'a> {
-  /// The log message, which `svnserve` uses only when no revision properties came (`serve.c` 1520-1525).
+  /// The log message, which `svnserve` uses only when no revision properties came (`serve.c` 1526-1534).
   pub log_message: &'a [u8],
   /// The rest, absent in a client before 1.2's one-item form.
   pub rest: Option<CommitRest<'v, 'a>>,
@@ -281,7 +283,7 @@ pub struct CommitRest<'v, 'a> {
   pub revision_properties: Option<Vec<(&'a [u8], &'a [u8])>>,
 }
 
-/// Why the commit's lock tokens are refused: `add_lock_tokens`' messages (`serve.c` 1395-1430), each
+/// Why the commit's lock tokens are refused: `add_lock_tokens`' messages (`serve.c` 1360-1409), each
 /// `SVN_ERR_RA_SVN_MALFORMED_DATA` written as a command failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LockTokensRefusal {
@@ -567,7 +569,7 @@ impl<'a> EditCommand<'a> {
   }
 }
 
-/// `open-root`'s `"(?r)s"` (`editorp.c` 553).
+/// `open-root`'s `"(?r)s"` (`editorp.c` 555).
 fn open_root<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefusal> {
   let revision = optional_revision(tuple)?;
   Ok(EditCommand::OpenRoot {
@@ -576,7 +578,7 @@ fn open_root<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefus
   })
 }
 
-/// `delete-entry`'s `"c(?r)s"` (572).
+/// `delete-entry`'s `"c(?r)s"` (574).
 fn delete_entry<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefusal> {
   let path = tuple.cstring()?;
   let revision = optional_revision(tuple)?;
@@ -594,7 +596,7 @@ fn node<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<(&'a [u8], Token<'a>, Token<'a>
   Ok((path, parent, tuple.string()?))
 }
 
-/// `add-dir`'s `"css(?cr)"` (596).
+/// `add-dir`'s `"css(?cr)"` (595).
 fn add_dir<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefusal> {
   let (path, parent, child) = node(tuple)?;
   Ok(EditCommand::AddDir {
@@ -605,7 +607,7 @@ fn add_dir<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefusal
   })
 }
 
-/// `open-dir`'s `"css(?r)"` (631).
+/// `open-dir`'s `"css(?r)"` (630).
 fn open_dir<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefusal> {
   let (path, parent, child) = node(tuple)?;
   Ok(EditCommand::OpenDir {
@@ -627,7 +629,7 @@ fn add_file<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefusa
   })
 }
 
-/// `open-file`'s `"css(?r)"` (745).
+/// `open-file`'s `"css(?r)"` (746).
 fn open_file<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefusal> {
   let (path, directory, file) = node(tuple)?;
   Ok(EditCommand::OpenFile {
@@ -663,7 +665,7 @@ fn change_file_prop<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, Ed
   Ok(EditCommand::ChangeFileProp { file, name, value })
 }
 
-/// `apply-textdelta`'s `"s(?c)"` (773).
+/// `apply-textdelta`'s `"s(?c)"` (774).
 fn apply_textdelta<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefusal> {
   let file = tuple.string()?;
   Ok(EditCommand::ApplyTextdelta {
@@ -780,7 +782,7 @@ impl<'v, 'a> CommitRequest<'v, 'a> {
     })
   }
 
-  /// Whether the client keeps its locks: the one-item form always does (`serve.c` 1506).
+  /// Whether the client keeps its locks: the one-item form always does (`serve.c` 1501).
   pub fn keep_locks(&self) -> bool {
     self.rest.as_ref().is_none_or(|rest| rest.keep_locks)
   }
@@ -788,7 +790,8 @@ impl<'v, 'a> CommitRequest<'v, 'a> {
   /// The lock tokens, each a path and a token in the order sent, read as `add_lock_tokens` reads them.
   ///
   /// # Errors
-  /// [`LockTokensRefusal`] for a list that is not one of pairs of strings, which `svnserve` writes as a command failure.
+  /// [`LockTokensRefusal`] for a list that is not one of pairs of strings, which `svnserve` writes as a command
+  /// failure.
   pub fn lock_tokens(&self) -> Result<Vec<(&'a [u8], &'a [u8])>, LockTokensRefusal> {
     let Some(rest) = &self.rest else {
       return Ok(Vec::new());

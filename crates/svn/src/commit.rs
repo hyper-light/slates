@@ -160,8 +160,8 @@ impl From<IndexRefusal> for CommitRefusal {
 }
 
 /// The drive's out-of-date test for one editor command naming the node at `path`, which the client holds at revision
-/// `client` (§4.17.4 item 3.2; `commit.c` `check_out_of_date` 179-198): `open-file` (627-634), `delete-entry` (504-509)
-/// and a directory's first property change (710-726) carry it, each only when the client names a revision.
+/// `client` (§4.17.4 item 3.2; `commit.c` `check_out_of_date` 179-198): `open-file` (627-634), `delete-entry`
+/// (504-509) and a directory's first property change (710-726) carry it, each only when the client names a revision.
 ///
 /// `created` is the node's created revision in the transaction when the command arrives, as `svn_fs_node_created_rev`
 /// reads the transaction's root: for a node the transaction has not changed, its own (the index's
