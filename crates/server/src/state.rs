@@ -544,6 +544,10 @@ pub struct ShardState {
   /// what no adoption takes is let go once adoption ends. Bounded by the partition's attachment cap.
   #[cfg(target_os = "linux")]
   pub(crate) learned_fuse: BTreeMap<u64, crate::fuse::OwnMountRecord>,
+  /// The FUSE helpers (`fusermount3`, a mount's and an unmount's) this shard waited on, learned for the next one's
+  /// bound (A-525, `crate::helper_runs`). Memory only: a restarted shard learns them again.
+  #[cfg(target_os = "linux")]
+  pub(crate) fuse_helpers: crate::helper_runs::HelperRuns,
   /// The macOS NFS mounts this shard's attachments are bound to, recorded as this daemon's own (A-227,
   /// `crate::own_nfs`): bound by the CLI or learned at the shard's start, each let go with its attachment. Bounded by
   /// the partition's attachment cap.

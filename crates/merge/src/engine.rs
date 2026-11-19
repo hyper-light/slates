@@ -526,6 +526,27 @@ pub struct Green {
   deltas_visited: std::cell::Cell<u64>,
 }
 
+/// The paths a node-exclusive operation changes, each with the class its conflict is named by (§4.17.4 item 3): the
+/// operation's own path, and a move's source, which Subversion sends as a copy and a delete of the source.
+fn node_exclusive_paths(op: &Op) -> impl Iterator<Item = (u16, MergeConflictClass)> {
+  let class = match op.kind {
+    OpKind::Create | OpKind::Mkdir | OpKind::Symlink | OpKind::Link | OpKind::Mknod => {
+      MergeConflictClass::CreateCreate
+    }
+    OpKind::Unlink | OpKind::Rmdir => MergeConflictClass::DeleteModify,
+    OpKind::Rename => MergeConflictClass::RenameRename,
+    OpKind::SetMode | OpKind::SetXattr | OpKind::RemoveXattr => MergeConflictClass::MetaMeta,
+    OpKind::Overwrite | OpKind::Extend | OpKind::Truncate | OpKind::Insert | OpKind::Delete => {
+      MergeConflictClass::Overlap
+    }
+  };
+  let source = (op.kind == OpKind::Rename)
+    .then(|| u16::try_from(op.src).ok())
+    .flatten()
+    .map(|index| (index, MergeConflictClass::RenameRename));
+  std::iter::once((op.path, class)).chain(source)
+}
+
 /// The bytes a retained conflict window costs the rejected-result cache: its path, its range and
 /// its class — what the cache actually holds for it.
 fn window_bytes(window: &ConflictWindow) -> usize {
@@ -2702,11 +2723,40 @@ impl Green {
     self.decide_content(inc, r, &mut effects, &mut windows);
     self.decide_directories(r, &mut effects, &mut windows);
     self.decide_metadata(inc, r, &mut effects, &mut windows);
+    self.decide_node_exclusive(inc, &mut windows);
     if windows.is_empty() {
       Ok(effects)
     } else {
       Err(windows)
     }
+  }
+
+  /// The node-exclusive rule (§4.17.4 item 3, rules 1 and 2; A-542): a path an operation marked node-exclusive changes,
+  /// a move's source among them, that changed in any dimension after the increment's base is a conflict, however
+  /// disjoint the bytes and however identical the change, as FSFS's commit-time merge judges a node (`tree.c`
+  /// `merge()`: a file changed on both sides fails, "even an identical replacement", and two additions are "not
+  /// auto-mergeable"). The dimension verdicts have run and added their own windows; this pass refuses only what they
+  /// would accept. Each path is one lookup of its last change in the change index (`latest_change`), and is judged once.
+  fn decide_node_exclusive(&self, inc: &Increment, windows: &mut Vec<ConflictWindow>) {
+    let mut judged: BTreeSet<&str> = BTreeSet::new();
+    for op in inc.doc.ops.iter().filter(|op| op.is_node_exclusive()) {
+      for (index, class) in node_exclusive_paths(op) {
+        let Some(path) = inc.doc.paths.path(index) else {
+          continue;
+        };
+        if judged.insert(path) && self.changed_after(path, inc.base) {
+          windows.push(Green::window(path, class));
+        }
+      }
+    }
+  }
+
+  /// Whether `path` changed in any dimension after version `base`: its last change in the change index is past it.
+  fn changed_after(&self, path: &str, base: u64) -> bool {
+    self
+      .latest_change
+      .get(path)
+      .is_some_and(|version| *version > base)
   }
 
   /// The content dimension: renames, creates, unlinks and edits.
@@ -3859,6 +3909,9 @@ fn special_payload(
   let end = start.checked_add(len).ok_or(DocDecodeError::Truncated)?;
   SpecialNode::decode(post.get(start..end).ok_or(DocDecodeError::Truncated)?)
 }
+
+#[cfg(test)]
+mod node_exclusive_tests;
 
 #[cfg(test)]
 mod tests {

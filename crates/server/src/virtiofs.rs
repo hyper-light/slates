@@ -565,6 +565,7 @@ fn guest_record(
     },
     // A guest presents no mount capability: the zero token is refused by every edge that checks one.
     token: [0; 16],
+    mount: None,
   }
 }
 

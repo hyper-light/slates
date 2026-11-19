@@ -60,7 +60,8 @@
 > authorization file, and a learned estimator for every tunable. Built: `slates-svn`'s svndiff codec (versions 0 and
 > 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
 > `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
-> Owed, in order: node-exclusive operations and `Copy` in the engine; the Subversion index; the
+> A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. Owed, in order: `Copy` in the
+> engine (on A-534's persistent radix tree); the Subversion index; the
 > commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
 > mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
@@ -1171,9 +1172,8 @@
 >   take no mount down. macOS and the BSDs now call `unmount(2)` (`MNT_FORCE` for the busy one), and every Unix host
 >   judges an unmount by the kernel's mount table: nothing mounted at the path is `NotMounted` before any call,
 >   `EBUSY` is `MountFault::Busy`, and the table still listing the mount after a call that said done is
->   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`). Owed:
->   naming the processes that hold a busy mount; Linux's busy refusal typed (`fusermount3` reports no error number);
->   the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
+>   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`).
+>   Owed: the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
 > - **a host mount bound into a container, built 2026-11-18 (A-520, `CONTRACT` = 44; kiln's container engine, kiln goal
 >   01a1f124):** the OCI form (§4.6 A-9) was the wire's and the command line's alone (`slates attach --oci-source`), so
 >   a host that drives slates through the library alone (kiln) could not bind a volume into a container.
@@ -1188,6 +1188,20 @@
 >   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
 >   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
 >   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+> - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
+>   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
+>   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
+>   `EBUSY` is on macOS. Every `Busy` carries `MountHolders`, read on that refusal alone from the kernel's own tables
+>   without touching the mount (`slates_bridge_oci::mount_holders`): on Linux each process's descriptors, working and
+>   root directories, `statx`ed through `/proc` with `AT_STATX_DONT_SYNC` and compared by device, bounded by
+>   `pid_max` and `nr_open` and refused `PastBound` past them; another user's process counted unreadable. Tests:
+>   `a_plain_unmount_its_helper_refused_while_the_table_lists_the_mount_is_busy`,
+>   `a_busy_mounts_holders_are_named_as_the_kernel_listed_them` (every host), the reader's tally and bound tests, and
+>   `the_caller_is_named_holding_the_mount_its_root_is_on` (Linux, by use). **Not read on macOS (A-537's judgment):**
+>   every libproc answer that reports a file is filled by xnu's `fill_vnodeinfo`, which runs `vn_stat` on the vnode,
+>   and `proc_listpidspath` starts with `stat(2)` of the path; on the `hard` loopback NFS mount either waits without bound
+>   once the daemon has gone, the case a busy unmount meets, so macOS answers `HoldersUnread::NoReader`. Owed: a macOS
+>   reader that does not ask the filesystem (libproc offers none); the Linux reader's run on Linux (filed for main);
 > - built 2026-11-18: the serving clause's DAX half through the library: the Shards stream end `serve_shards` hands
 >   keeps a `dax=inode` guest's `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` at `INIT`, with the host's page as the
 >   alignment, and marks a file of a DAX range or more `FUSE_ATTR_DAX` and a small one not
@@ -1416,6 +1430,18 @@
 > (`create.c` 1036-1043), failing test first (an exclusive open under one spelling, then the other: NTFS's
 > `ERROR_SHARING_VIOLATION`). The roster's workloads open no file under two spellings, so the Windows workloads cell,
 > which runs on a folding volume to match NTFS (A-300), does not meet it.
+> - **Built, part 1 of 2 (2026-11-18, A-543, goal 85, g079): the path an open names as the volume stores it.**
+>   `slates_bridge_core::stored_path` walks a `\`-separated path from the root and names each component as its
+>   directory stores it (`Bridge::stored_entry`, over `Volume::stored_name_no`): on a folding volume every spelling of a
+>   file answers the spelling it was made with, on an exact one the path as asked. Held by
+>   `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (bridge-core's unit tests, every
+>   host), red with the open named as asked on the Mac Studio.
+> - **Owed, part 2 (Windows-only, main's to write and compile, run-requests.md):** the drive declares
+>   `CaseSensitiveSearch` only for an exact volume (`Mounted::new`'s `params.flags`, given the volume's name policy by
+>   `crates/server/src/winfsp.rs`); an open or create on a folding volume answers its `stored_path` as WinFsp's
+>   normalized name (`FSP_FSCTL_OPEN_FILE_INFO`'s `NormalizedName`, copied when it fits `NormalizedNameSize`, else
+>   none), and the open's ledger and `OpenNames` record that path, the name the driver's file node takes; then the drive
+>   test above.
 
 > **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
 > owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
@@ -2425,8 +2451,16 @@
 >   content as before. Tests: `a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation`
 >   (red before), the A-335 test on an uncertified takeover (red with an uncertified takeover's content let go),
 >   `a_layout_five_configuration_reads_its_takeovers_as_uncertified`, `a_takeover_this_build_makes_certifies_its_content`.
->   Owed: an owner's settle certifies content the same way (A-508's holders then drop content too); a settled line's
->   lagging holder still keeps content (it judges no successor's placement).
+>   **Fixed (A-546, g250, 2026-11-19): an owner's settle certifies content the same way.** An owner reports its
+>   neighbourhood placed only once every volume it owns is served from within it (the healer replacing, while the
+>   change is in flight, a placement naming a host outside the current neighbourhood: `fleet.heal.unsettled_replaced`),
+>   so a settle certifies that no head it serves names a holder outside its neighbourhoods; A-508's holders then let go
+>   the content their own records name (`fleet.settle.released_content`). The configuration lists the certified settles
+>   (regional layout 7; layouts 6 and 5 read with every settle uncertified, whose holders keep content). Tests:
+>   `a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go` (red before), A-508's test on an uncertified
+>   settle (red with an uncertified settle's content let go), `an_unsettled_owners_placement_outside_its_current_
+>   neighbourhood_is_replaced`, `a_settle_this_build_records_certifies_its_content`, the layout test. Owed: a settled
+>   line's lagging holder still keeps content (it judges no successor's placement).
 > - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
 >   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
 >   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
@@ -3945,14 +3979,13 @@
 > `fs/nfs/nfs4renewd.c`) and a liveness window, in whole seconds (6 s), one number for the lease advertised, the
 > delegation recall's and quiet period's waits, the NFSv3 gate's and a landing's recall wait (`nfs::v4_lease_ns`).
 > Owed beside it: the client table's lapse judged per client, from each client's own renewal gaps (A-384's accrual), so
-> a client slower than Linux's floor keeps its state too. **Since A-525** a move's overdue bound and the telemetry
-> freshness horizon read the failover delay, and the anchor's crash-loop cap is the NFSv4 lease. Still on the
-> placeholder, each owed a term of its own: the FUSE helpers' bounds and the status capture's deadline (it should
-> count from the capture, not the request). Owed, each in its own
-> change: each other lease takes its term from a φ-accrual
-> detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
-> pulses' running overrun for the rest of class D; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets
-> `F`. The boot-time sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the
+> a client slower than Linux's floor keeps its state too. **Since A-525 the operator's placeholder is gone**
+> (`FAILOVER_SLO_NS`, `with_failover_slo`, `DaemonConfig::failover_slo_ns`): a move's overdue bound and the telemetry
+> freshness horizon read the failover delay, the anchor's crash-loop cap is the NFSv4 lease, a FUSE helper's wait is
+> learned from its shard's helper runs (backed off to the failover delay), and a status capture is held the failover
+> delay from its capture. Owed, each in its own change: each other lease takes its term from a φ-accrual detector of its
+> own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the pulses' running
+> overrun for the rest of class D. The boot-time sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the
 > recovery's cross-shard passes and the image's alias steps** (A-359's class A list on the wall) wait in their target's
 > own time (`xshard::call_in_shard_time`), so W's floor for them is the target's measured progress, not a boot snapshot.
 > **Since A-455 (2026-11-18, goal g255, D-a) the watchdog judges each shard by its own window**
@@ -4116,8 +4149,11 @@
 >   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
 >   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
 >   C-b: the reply deadline's other users,
->   each a wait that cannot see the departure yet: the macOS route's claim steps and the CLI's MCP edge, which borrows
->   the reply deadline for its own. A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
+>   each a wait that cannot see the departure yet: the CLI's MCP edge, which borrows the reply deadline for its own. The
+>   macOS route's claim steps since A-523 (2026-11-18, g251b): each socket step waited the caller's reply deadline at a
+>   time and asked the daemon's liveness when it ran out; it now waits while the route's connection lives, as the
+>   daemon's side waits on the client's since A-492, a daemon gone closing its end
+>   (`a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound`). A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
 >   descriptor until its reply deadline and gave up `DeadlineExceeded` there; it now waits on the control socket itself,
 >   readable or hung up, with no clock (`ClientEnd::wait_delivery`), and ends `ChannelLost` once the daemon is gone with
 >   nothing delivered (`a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock`, Linux, main's to run). The synchronous send's
@@ -4180,7 +4216,15 @@
 >   `a_mount_the_kernel_lets_go_after_any_wait_still_ends_its_attachment`,
 >   `a_mount_that_left_before_its_watch_started_ends_at_the_watchs_first_read`); owed: the live CLI mount suite on macOS
 >   (the real event, `umount -f` too), and the Linux half of the seam (`/proc/self/mountinfo`'s `EPOLLPRI` through an
->   epoll instance) has no server user, since Linux host mounts are FUSE and end at their device. Class B (the
+>   epoll instance) has no server user, since Linux host mounts are FUSE and end at their device. A-511's owed restart
+>   closed by A-540 (2026-11-19, g232): the mount's id lives in its attachment's durable record once seen
+>   (`Op::AttachmentMountSeen`, appended), and a start reads the table once and ends every attachment whose recorded
+>   mount it no longer names (`a_restart_ends_an_attachment_whose_recorded_mount_the_table_no_longer_lists`,
+>   `a_restart_holds_an_attachment_whose_recorded_mount_the_table_still_lists`,
+>   `an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart`,
+>   `a_held_mount_keeps_its_id_in_its_attachments_record`, and in `slates-db`
+>   `an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot`); an attachment never seen mounted keeps the
+>   rule before, since the table's silence about its point proves nothing. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -7935,6 +7979,18 @@ Residual literals: none in `src/`; the bench's shape constants (files per direct
 bytes, groups, the 4 KiB block) carry their measurements. The example targets of the four
 benched crates share the name `bench`; cargo warns of the output collision and may make it an
 error, so a rename to `<crate>-bench` is owed before the Phase 2 crates add theirs.
+
+**Fixed 2026-11-19 (A-541, goal 85, g234): a clone's live-inode count started from its origin's head.** A clone took
+its origin's count at the moment of the clone, not its snapshot's, so every file the origin made after the snapshot
+counted against the clone's inode allowance and every file it removed did not, until a restart recounted the clone's
+tree (`docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`). A snapshot now keeps its count,
+and a clone starts from it; a recovered snapshot's is its image's entries. AC-1.7's two counters were compared after
+every step, but no step cloned a snapshot its origin had changed since. **Open, found by the sweep:** the server's
+clone admission still reads the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s `inherited`:
+a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it should read
+the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension, `entry_allowance`) starts
+from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart recounts it (the bug record
+names the effects of each).
 
 ## 8d. Phase 2 record (2026-09-05)
 

@@ -97,6 +97,22 @@ pub struct Op {
   pub src: u64,
 }
 
+/// The flag bit that makes an operation node-exclusive (§4.17.4 item 3, A-542): the path it changes is judged whole, so
+/// any change to that path after the increment's base, in any dimension, is a conflict, however disjoint its bytes and
+/// however identical the change. A Subversion client's commit declares it: FSFS's commit-time merge fails a node changed
+/// on both sides, "even an identical replacement" (`libsvn_fs_fs/tree.c` `merge()`), and the client records each node it
+/// committed as made at the new revision with its own bytes and properties.
+/// Format: the high bit of `Op::flags`, which no operation kind sets otherwise, so a document that never sets it means
+/// what it always meant.
+pub const NODE_EXCLUSIVE: u8 = 0x80;
+
+impl Op {
+  /// Whether the operation is node-exclusive ([`NODE_EXCLUSIVE`]).
+  pub fn is_node_exclusive(&self) -> bool {
+    self.flags & NODE_EXCLUSIVE != 0
+  }
+}
+
 /// The path table: the distinct paths an ops document names, sorted, so a path index is stable
 /// and the document's identity does not depend on the order operations were declared in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

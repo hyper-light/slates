@@ -95,6 +95,9 @@ pub struct Snapshot {
   pub next: Option<SnapshotId>,
   /// `referenced_bytes` at the snapshot.
   pub referenced_bytes: u64,
+  /// The live inodes the head held at the snapshot (§4.2's inode dimension): its inode table's entries, which a clone of
+  /// the snapshot starts its own count from (A-541), as it starts its bytes from `referenced_bytes`.
+  pub live_inodes: u64,
   /// The op log's head sequence at the snapshot: the deriver reads the records after it.
   pub seq: u64,
   /// The Merkle identity, computed lazily (Phase 7) and `None` until then.
