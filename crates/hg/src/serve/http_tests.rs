@@ -23,6 +23,11 @@ const HEADER_LINE: u64 = 1024;
 /// Format: a request's room, as the session's tests admit one.
 const ROOM: u64 = 1 << 20;
 
+/// Shape: room to inflate a stream these tests read. 7.2's zstd frames name level 3's 2 MiB window and no content size,
+/// so the decoder is charged 2,490,432 bytes for one before it inflates any (`compression`'s charge), past `ROOM`; the
+/// captured streams inflate to 4,955 bytes at most.
+const INFLATE_ROOM: u64 = 1 << 22;
+
 /// One captured exchange: what the client sent, and the head and body (de-chunked) 7.2 answered.
 #[derive(Clone, Copy)]
 struct Exchange {
@@ -212,7 +217,7 @@ fn inflated(body: &[u8]) -> (Vec<u8>, Vec<u8>) {
   compression::inflate(
     engine_named,
     payload,
-    &mut Admission::new(ROOM),
+    &mut Admission::new(INFLATE_ROOM),
     &mut stream,
   )
   .unwrap();
