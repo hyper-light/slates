@@ -12,14 +12,14 @@
 //! connection waits for, a tunnel's user, and a repository that admits no one.
 
 use super::*;
+use crate::index::Index;
 use crate::report::drive::Sources;
-use crate::report::drive::green::{FixtureGuards, Green, guards_of, normalize, repository};
 use crate::report::drive::green::texts_by_md5;
+use crate::report::drive::green::{FixtureGuards, Green, guards_of, normalize, repository};
 use crate::report::recorded::{
   ROOT_URL, Recorded, SESSIONS, UUID, command, drive_items, finished_report, items, read_drive,
   value_of,
 };
-use crate::index::Index;
 use std::collections::BTreeMap;
 
 /// A budget past anything one call of the fixtures writes.
@@ -122,7 +122,10 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
       Ok(Turn::Wrote) => {}
       Ok(Turn::Opened { consumed, .. }) => {
         held.drain(..consumed);
-        assert_eq!(connection.open(&fixtures_repository(), &mut out), Ok(Access::Asked));
+        assert_eq!(
+          connection.open(&fixtures_repository(), &mut out),
+          Ok(Access::Asked)
+        );
       }
       Ok(Turn::Established { consumed, .. }) => {
         held.drain(..consumed);
@@ -185,9 +188,7 @@ fn tree(value: &Value<'_>) -> Tree {
     Value::String(bytes) => Tree::Bytes(bytes.to_vec()),
     Value::List(items) => {
       let mut trees: Vec<Tree> = items.iter().map(tree).collect();
-      let named = |tree: &Tree| {
-        matches!(tree, Tree::List(record) if record.len() >= 2 && matches!(record[0], Tree::Bytes(_)))
-      };
+      let named = |tree: &Tree| matches!(tree, Tree::List(record) if record.len() >= 2 && matches!(record[0], Tree::Bytes(_)));
       if !trees.is_empty() && trees.iter().all(named) {
         trees.sort();
       }
@@ -248,7 +249,10 @@ fn assert_as_svnserve(
   let theirs = items(server);
   let greeting: Vec<u8> = {
     let greeting = theirs[0];
-    let at = greeting.windows(SVNDIFF1.len()).position(|window| window == SVNDIFF1).unwrap();
+    let at = greeting
+      .windows(SVNDIFF1.len())
+      .position(|window| window == SVNDIFF1)
+      .unwrap();
     [&greeting[..at], &greeting[at + SVNDIFF1.len()..]].concat()
   };
   assert_eq!(ours[0], greeting.as_slice(), "{name}: the greeting");
@@ -261,9 +265,18 @@ fn assert_as_svnserve(
   assert_items(name, &ours[1..our_start], &theirs[1..their_start], hidden);
   let our_drive = read_drive(&ours[our_start..our_end]).calls;
   let their_drive = read_drive(&theirs[their_start..their_end]).calls;
-  assert_eq!(normalize(our_drive, texts), normalize(their_drive, texts), "{name}: the drive");
+  assert_eq!(
+    normalize(our_drive, texts),
+    normalize(their_drive, texts),
+    "{name}: the drive"
+  );
   let after = ours.len() - our_end;
-  assert_items(name, &ours[our_end..], &theirs[their_end..their_end + after], hidden);
+  assert_items(
+    name,
+    &ours[our_end..],
+    &theirs[their_end..their_end + after],
+    hidden,
+  );
 }
 
 /// A-656 (`serve.c`'s command loop against stock `svnserve` 1.15.0): replay every recorded session
@@ -290,12 +303,21 @@ fn every_recorded_session_is_answered_as_svnserve_answered_it() {
       Ending::Refused(refused) => {
         // svnserve ended this connection before it flushed the trivial auth request it had
         // answered `update` with (A-616 part 1): only what it flushed is compared.
-        assert_eq!(recorded.name, "hostile-report-malformed-set-path.1", "{refused:?}");
+        assert_eq!(
+          recorded.name, "hostile-report-malformed-set-path.1",
+          "{refused:?}"
+        );
         ours.len().min(items(recorded.server).len())
       }
       Ending::Waiting => ours.len(),
     };
-    assert_as_svnserve(recorded.name, &ours[..compared], recorded.server, &texts, &mut hidden);
+    assert_as_svnserve(
+      recorded.name,
+      &ours[..compared],
+      recorded.server,
+      &texts,
+      &mut hidden,
+    );
   }
   assert_eq!(replayed, REPLAYED);
   assert_eq!(hidden, HIDDEN_LISTINGS);
@@ -307,8 +329,16 @@ fn every_recorded_session_is_answered_as_svnserve_answered_it() {
 fn a_connection_writes_alike_under_the_smallest_budget() {
   let fixture = fixture();
   for name in ["checkout-r1.1", "update-to-head.1", "diff-r1-r6.2"] {
-    let recorded = SESSIONS.iter().copied().find(|session| session.name == name).unwrap();
-    assert_eq!(replay(&fixture, recorded, SMALLEST), replay(&fixture, recorded, PLENTY), "{name}");
+    let recorded = SESSIONS
+      .iter()
+      .copied()
+      .find(|session| session.name == name)
+      .unwrap();
+    assert_eq!(
+      replay(&fixture, recorded, SMALLEST),
+      replay(&fixture, recorded, PLENTY),
+      "{name}"
+    );
   }
 }
 
@@ -335,7 +365,12 @@ fn established(fixture: &Fixture, guards: &FixtureGuards) -> (Connection, Vec<u8
   let opening = opening("svn://127.0.0.1/repo/trunk");
   let mut rest = opening.as_slice();
   while connection.session().is_none() {
-    let turn = connection.receive(None::<&Sources<'_, Green, FixtureGuards>>, rest, &mut out, PLENTY);
+    let turn = connection.receive(
+      None::<&Sources<'_, Green, FixtureGuards>>,
+      rest,
+      &mut out,
+      PLENTY,
+    );
     match turn.unwrap() {
       Turn::Opened { consumed, .. } => {
         rest = &rest[consumed..];
@@ -377,14 +412,32 @@ fn reparent_moves_the_session_within_its_repository() {
   let fixture = fixture();
   let guards = FixtureGuards::anonymous();
   let (mut connection, _) = established(&fixture, &guards);
-  let (out, turn) = send(&fixture, &guards, &mut connection, b"( reparent ( 25:svn://127.0.0.1/repo/tags ) ) ");
+  let (out, turn) = send(
+    &fixture,
+    &guards,
+    &mut connection,
+    b"( reparent ( 25:svn://127.0.0.1/repo/tags ) ) ",
+  );
   assert_eq!(out, "( success ( ( ) 0: ) ) ( success ( ) ) ");
   assert!(turn.unwrap().starts_with("Took"));
-  let (out, _) = send(&fixture, &guards, &mut connection, b"( check-path ( 5:a.txt ( 6 ) ) ) ");
+  let (out, _) = send(
+    &fixture,
+    &guards,
+    &mut connection,
+    b"( check-path ( 5:a.txt ( 6 ) ) ) ",
+  );
   assert!(out.ends_with("( success ( none ) ) "), "{out}");
-  let (out, _) = send(&fixture, &guards, &mut connection, b"( reparent ( 23:svn://example.org/other ) ) ");
+  let (out, _) = send(
+    &fixture,
+    &guards,
+    &mut connection,
+    b"( reparent ( 23:svn://example.org/other ) ) ",
+  );
   let message = "'svn://example.org/other' is not the same repository as 'svn://127.0.0.1/repo'";
-  let failure = format!("( failure ( ( 170000 {}:{message} 0: 0 ) ) ) ", message.len());
+  let failure = format!(
+    "( failure ( ( 170000 {}:{message} 0: 0 ) ) ) ",
+    message.len()
+  );
   assert_eq!(out, format!("( success ( ( ) 0: ) ) {failure}"));
   let (out, turn) = send(&fixture, &guards, &mut connection, b"( reparent ( 5 ) ) ");
   assert_eq!((out.as_str(), turn), ("", Err(Refused::Malformed)));
@@ -400,9 +453,25 @@ fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
   let (mut connection, _) = established(&fixture, &guards);
   let (out, turn) = send(&fixture, &guards, &mut connection, b"( commit ( 3:msg ) ) ");
   let message = "Unknown editor command 'commit'";
-  assert_eq!(out, format!("( failure ( ( 210001 {}:{message} 0: 0 ) ) ) ", message.len()));
-  assert_eq!(turn, Ok(String::from("Unserved { command: \"commit\", consumed: 21 }")));
-  let (out, _) = send(&fixture, &guards, &mut connection, b"( get-latest-rev ( ) ) ");
+  assert_eq!(
+    out,
+    format!(
+      "( failure ( ( 210001 {}:{message} 0: 0 ) ) ) ",
+      message.len()
+    )
+  );
+  assert_eq!(
+    turn,
+    Ok(String::from(
+      "Unserved { command: \"commit\", consumed: 21 }"
+    ))
+  );
+  let (out, _) = send(
+    &fixture,
+    &guards,
+    &mut connection,
+    b"( get-latest-rev ( ) ) ",
+  );
   assert!(out.ends_with("( success ( 6 ) ) "), "{out}");
   let (out, turn) = send(&fixture, &guards, &mut connection, b"5 ");
   assert_eq!((out.as_str(), turn), ("", Err(Refused::Malformed)));
@@ -432,7 +501,11 @@ fn a_call_without_sources_or_after_the_end_is_the_callers_error() {
 #[test]
 fn a_connection_names_what_it_waits_for() {
   let fixture = fixture();
-  let recorded = SESSIONS.iter().copied().find(|session| session.name == "checkout-r1.1").unwrap();
+  let recorded = SESSIONS
+    .iter()
+    .copied()
+    .find(|session| session.name == "checkout-r1.1")
+    .unwrap();
   let guards = FixtureGuards::anonymous();
   let sources = Sources {
     index: &fixture.index,
@@ -446,7 +519,10 @@ fn a_connection_names_what_it_waits_for() {
   let (mut next, mut held, mut established) = (client.iter(), Vec::new(), false);
   loop {
     let given = established.then_some(&sources);
-    match connection.receive(given, &held, &mut out, SMALLEST).unwrap() {
+    match connection
+      .receive(given, &held, &mut out, SMALLEST)
+      .unwrap()
+    {
       Turn::NeedMore { .. } => match next.next() {
         Some(item) => held.extend_from_slice(item),
         None => break,
@@ -531,7 +607,13 @@ fn an_update_of_a_target_the_principal_may_not_read_is_refused() {
     b"( update ( ( 6 ) 6:secret true infinity false false ) ) ",
   );
   let message = "Authorization failed";
-  assert_eq!(out, format!("( failure ( ( 170001 {}:{message} 0: 0 ) ) ) ", message.len()));
+  assert_eq!(
+    out,
+    format!(
+      "( failure ( ( 170001 {}:{message} 0: 0 ) ) ) ",
+      message.len()
+    )
+  );
   assert!(turn.unwrap().starts_with("Took"));
   assert_eq!(connection.waiting(), Waiting::Command);
   let (out, _) = send(

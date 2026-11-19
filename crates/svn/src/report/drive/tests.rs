@@ -467,10 +467,18 @@ fn a_changed_text_is_sent_as_a_delta_against_its_base() {
     .count();
   let new_data: usize = windows.iter().map(|window| window.new_data.len()).sum();
   assert!(copies > 0, "no window copied from the base");
-  assert!(new_data * 100 < target.len(), "{new_data} new bytes of {}", target.len());
+  assert!(
+    new_data * 100 < target.len(),
+    "{new_data} new bytes of {}",
+    target.len()
+  );
   let closed = calls[at..].iter().find_map(|call| match call {
     Written::CloseFile(md5) => Some(*md5),
     _ => None,
   });
-  assert_eq!(Some(md5(&target)), closed, "the text made is not the one closed");
+  assert_eq!(
+    Some(md5(&target)),
+    closed,
+    "the text made is not the one closed"
+  );
 }

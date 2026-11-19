@@ -850,6 +850,12 @@
 > replayed against `svnserve`'s bytes; red six ways. Copy sources held to two recorded `svnserve` sessions asking for
 > them. Owed of A-616 now: the server's connection task that runs it (piece 7's); the deltas of changed texts through
 > A-652's generator.
+> A-656 part 1 (2026-11-19, g234): one ra_svn connection's server side with no I/O (`serve`), the handshake then every
+> command as `serve.c`'s loop answers it (reads, `reparent`, the report exchange; the rest 210001 until their pieces
+> land), held to all 40 recorded sessions replayed whole; A-616's drive sends changed texts through A-652's deltifier.
+> Owed of A-656: part 2, the server's listener and the SSH tunnel's entry point; commit through A-655; the lock verbs
+> and the mid-session authentication. Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal
+> (`/trunk/secret` for anonymous): the read commands' authorization is owed (A-606).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

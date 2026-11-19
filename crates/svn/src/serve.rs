@@ -274,9 +274,13 @@ impl Connection {
       Phase::Commands(established) => {
         self.command(established, sources.ok_or(Refused::NoSources)?, input, out)
       }
-      Phase::Streaming(established, stream) => {
-        self.stream(established, stream, sources.ok_or(Refused::NoSources)?, out, budget)
-      }
+      Phase::Streaming(established, stream) => self.stream(
+        established,
+        stream,
+        sources.ok_or(Refused::NoSources)?,
+        out,
+        budget,
+      ),
       Phase::Reporting(established, exchange) => {
         let sources = sources.ok_or(Refused::NoSources)?;
         self.exchange(established, exchange, sources, input, out, budget)
@@ -525,7 +529,13 @@ impl Connection {
       uuid: &established.uuid,
     };
     let progress = stream
-      .resume(sources.index, sources.repository, &session, out, budget.room)
+      .resume(
+        sources.index,
+        sources.repository,
+        &session,
+        out,
+        budget.room,
+      )
       .map_err(Refused::Item)?;
     self.phase = match progress {
       reads::Progress::More => Phase::Streaming(established, stream),

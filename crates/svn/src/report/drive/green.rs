@@ -531,10 +531,7 @@ pub(crate) enum Normal {
 }
 
 /// The calls in their shared form, every delta applied to the text whose MD5 it names.
-pub(crate) fn normalize(
-  calls: Vec<Written>,
-  texts: &BTreeMap<[u8; 16], Vec<u8>>,
-) -> Vec<Normal> {
+pub(crate) fn normalize(calls: Vec<Written>, texts: &BTreeMap<[u8; 16], Vec<u8>>) -> Vec<Normal> {
   let mut normal = Vec::new();
   for call in calls {
     match call {

@@ -63,8 +63,8 @@ use crate::index::{
 };
 use crate::reads::Repository;
 use crate::svndiff::{Instruction, WINDOW_LIMIT, Window, deltas};
-use std::num::NonZeroUsize;
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 /// The facts of the node an [`Call::OpenRoot`], [`Call::Open`] or [`Call::Add`] names, as the
