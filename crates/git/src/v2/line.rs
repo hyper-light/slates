@@ -108,16 +108,11 @@ pub(super) fn check_text(value: &[u8], at: u64) -> Result<(), Refusal> {
   Ok(())
 }
 
-/// The object id `hex` writes in `format`: exactly the format's digits, each `0-9` or `a-f`.
+/// The object id `hex` writes in `format`: exactly the format's digits, each of either case, as git's server reads an
+/// id (`get_oid_hex`, through `hex.c`'s `hexval`) and as gitprotocol-pack asks of every receiver ("both MUST treat
+/// obj-id as case-insensitive"). An encode writes the id in lower case, as `oid_to_hex` does (A-624).
 pub(super) fn object_id(format: ObjectFormat, hex: &[u8], at: u64) -> Result<ObjectId, Refusal> {
-  let id = ObjectId::from_hex(format, hex).map_err(|refusal| Refusal::ObjectId { at, refusal })?;
-  match hex.iter().position(u8::is_ascii_uppercase) {
-    Some(digit) => Err(Refusal::ObjectId {
-      at,
-      refusal: HexRefusal::NotHex { at: to_u64(digit) },
-    }),
-    None => Ok(id),
-  }
+  ObjectId::from_hex(format, hex).map_err(|refusal| Refusal::ObjectId { at, refusal })
 }
 
 /// Refused when `id` is not of `format`, so it would not be written in the format's length.
@@ -344,20 +339,22 @@ mod tests {
     assert_eq!(text(b"done\n\n", 9), Err(Refusal::NotText { at: 9 }));
   }
 
-  /// A-582 part 2 (gitprotocol-common's `HEXDIG` is lower case): do read ids of each length, case and digit. Expect:
-  /// lower case read; upper case refused at its digit, though git's `get_oid_hex` reads it; a short, long or
-  /// non-hexadecimal id refused by kind.
+  /// A-582 part 2, A-624 (git's server reads an id with `get_oid_hex`, either case): do read ids of each length, case
+  /// and digit. Expect: lower and upper case read as one id, written in lower case; a short, long or non-hexadecimal
+  /// id refused by kind, the bad digit named.
   #[test]
-  fn an_object_id_is_the_formats_lower_case_digits_and_nothing_else() {
+  fn an_object_id_is_the_formats_digits_of_either_case_and_nothing_else() {
     let hex = b"d0f175d3390380c935e9b56e0cebb715995d838d";
     let id = object_id(ObjectFormat::Sha1, hex, 0).unwrap();
     assert_eq!(id.to_string().as_bytes(), hex);
     let upper = b"d0f175d3390380c935e9b56e0CEBB715995d838d";
+    assert_eq!(object_id(ObjectFormat::Sha1, upper, 7), Ok(id));
+    let not_hex = b"d0f175d3390380c935e9b56e0cebb715995d838g";
     assert_eq!(
-      object_id(ObjectFormat::Sha1, upper, 7),
+      object_id(ObjectFormat::Sha1, not_hex, 7),
       Err(Refusal::ObjectId {
         at: 7,
-        refusal: HexRefusal::NotHex { at: 25 }
+        refusal: HexRefusal::NotHex { at: 39 }
       })
     );
     assert_eq!(

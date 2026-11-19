@@ -193,6 +193,13 @@
 > driver that starts them; each tool's words for the outcomes; review events' hooks; a repository-owned queue for
 > observing hooks that must outlive their push. Main's: clippy, `xtask` and the lint matrix over the three modules (no
 > platform code in them).
+> **A-622 part 1 (2026-11-19, g255; the policy held in the repository record):** a repository's record holds its
+> policy (rules and hooks), empty at creation, set whole by its owner with `SetRepositoryPolicy` from the version read
+> (`Op::RepositoryPolicySet`, tag 97; `RequestBody` 86): a stale read refused `PolicyChanged`, a rule or hook its tool
+> cannot hold refused by index (`DatabaseRefusal` 8 and 9), its bytes charged to the merge budget and charged again
+> after a snapshot. Lib tests on the Mac Studio: db `repository::` 15 of 15, server `repository::` 5 of 5, ipc's lib,
+> both wire-order tests; red first on a mutated copy. Owed: the push paths' check (part 2) and the hook driver (part 3);
+> the verb's client and CLI forms.
 > **A-595 (2026-11-19, g076b; piece 8's first part):** HTTP/1.1's request codec is its own crate, `crates/http`
 > (`slates-http`), which the Mercurial and Subversion servers share without depending on git's: a head read as it
 > arrives, each byte scanned once, lines held to RFC 9112 §3's 8000 octets, its bytes and field index charged to the
@@ -246,6 +253,12 @@
 > with each object's SHA-256 an index row and uploads checked against it, lock records per repository); expiries
 > learned from the deployment's token lifetimes; the stock client end to end against slates' own server (main's run);
 > Mercurial's `lfs` (§4.17.3), which moves the module to a crate both servers use.
+> **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
+> digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
+> case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
+> encodes back byte for byte. This is main's answer to A-604's question: v0 and v2 read alike. Red first (2 of 39 v2
+> tests), then `cargo test -p slates-git --lib` 221 of 221 over main with it. Owed of A-624: `object-info` and `bundle-uri` read and
+> answered over a store trait, and the server's `packfile-uris` choice (piece 14's rest).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
@@ -382,7 +395,13 @@
 > `mergeinfo-test.c`'s vectors, the per-revision model and a naive filesystem on generated histories, red-checked eight
 > ways; `cargo test -p slates-svn --lib` on the Mac Studio (see A-605). Owed from it: `svn mergeinfo --show-revs`'s
 > eligible and merged revisions, composed from its algebra with piece 7's location segments and log; the property's
-> UTF-8 and CR checks with piece 7's property validation. A-599 (2026-11-19, g234): ra_svn's greeting and authentication
+> UTF-8 and CR checks with piece 7's property validation.
+> A-613 (2026-11-19, g262, UI goal 93), its first part: the ra_svn read commands' sans-io handler, `get-latest-rev`,
+> `get-dated-rev`, `rev-proplist`, `rev-prop`, `check-path`, `stat`, `get-mergeinfo` and `get-iprops`, held to
+> transcripts of stock `svnserve` 1.15.0 (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn
+> --lib reads` on the Mac Studio, red-checked six ways (see A-613). Owed from it: the other read commands, then
+> `svn mergeinfo --show-revs`, and read access by A-606's rules.
+> A-599 (2026-11-19, g234): ra_svn's greeting and authentication
 > (`handshake`), a state machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against
 > `svnserve` logged both ways by a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve`
 > answered it but for the greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5`

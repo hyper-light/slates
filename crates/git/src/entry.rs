@@ -1,7 +1,7 @@
 //! A pack entry's header (A-582 part 3; §4.17.2 "Pieces (git)", piece 2, "a pack entry's header"): what an entry
 //! holds, how many bytes its data inflates to, and for a delta which base it applies to.
 //!
-//! **Sources** (read 2026-11-19, git v2.50.1). The document [B], `Documentation/gitformat-pack.adoc`:
+//! **Sources** (read 2026-11-19, git v2.50.1). The document \[B\], `Documentation/gitformat-pack.adoc`:
 //! - an entry is "n-byte type and length (3-bit type, (n-1)*7+4-bit length)", then a REF_DELTA's "base object name" or
 //!   an OFS_DELTA's "negative relative offset from the delta object's position in the pack", then the compressed data
 //!   (lines 51-66), whose size "is the size before compression" for an object and "the size of the delta data that
@@ -11,14 +11,14 @@
 //! - the offset encoding: "n bytes with MSB set in all but the last one", and "for n >= 2 adding 2^7 + 2^14 + ... +
 //!   2^(7*(n-1)) to the result" (257-262).
 //!
-//! The code [C], which clients and git's own receive-pack run, followed where the document leaves room: `packfile.c`'s
+//! The code \[C\], which clients and git's own receive-pack run, followed where the document leaves room: `packfile.c`'s
 //! `unpack_object_header_buffer` (1116-1139) and `get_delta_base` (1238-1277); `builtin/index-pack.c`'s
 //! `unpack_raw_entry` (520-582); `pack-write.c`'s `encode_in_pack_object_header` (505-526); and
 //! `builtin/pack-objects.c`'s offset writer (548-559). The four object types and their numbers are A-600's
 //! ([`Kind::pack_number`]), and a REF_DELTA's base is an [`ObjectId`] in the pack's [`ObjectFormat`].
 //!
 //! [`read`] reads one header from the bytes a pack stream has delivered so far, `None` until its last byte arrives, so
-//! the pack reader (§4.17.2 piece 3) reads each entry as it comes; [`write`] writes one as `pack-objects` does, each
+//! the pack reader (§4.17.2 piece 3) reads each entry as it comes; [`write`](fn@write) writes one as `pack-objects` does, each
 //! number in the fewest bytes, and [`written_len`] says how long that is beforehand.
 //!
 //! **Hostile input (§4.9).** Every byte is untrusted, and every refusal is a typed variant naming where its entry

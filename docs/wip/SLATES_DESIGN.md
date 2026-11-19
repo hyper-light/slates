@@ -143,7 +143,7 @@ the two equal):
 <!-- host-path-sites:begin -->
 | Crate | Why it may name a host path |
 |---|---|
-| `slates-machine` | reads the kernel's pseudo-files (/proc, /sys) as queries; never writes |
+| `slates-machine` | reads the kernel's pseudo-files (/proc, /sys) as queries, and writes one: a pressure-stall trigger to /proc/pressure/memory, the kernel's own interface (A-570, psi.rst); never a host path |
 | `slates-base` | read-only access to the directories overlay volumes sit on (§4.15) |
 | `slates-land` | the only writer of host paths, under a grant (§4.15) |
 | `slates-ipc` | the per-OS rendezvous, which creates no filesystem entry (§4.7); on macOS the Shards stream's socket route, one owner-only socket node in the user's own temporary directory, removed with its daemon (A-161; socket files authorized by Ada 2026-10-22 when what crosses them is encrypted) |
@@ -11986,6 +11986,17 @@ is one more version, and the chain itself is never rewritten.
 > for its hooks and the driver that starts a hook over it in its own process group; each tool's words for the
 > outcomes; the hooks of review events; and a repository-owned queue for observing hooks that must outlive their push
 > (§4.17.3).
+>
+> **Status (2026-11-19, A-622 part 1: the policy held in the repository record).** A repository's policy is part of its
+> record (`slates_db::catalog::RepositoryPolicy`): its rules (what each names, its pattern, the right, allow or deny,
+> and whom it speaks to) and its hooks (the point, the name, the program by absolute path), empty at creation. Its
+> owner sets it whole with `SetRepositoryPolicy`, from the version the owner read: `Op::RepositoryPolicySet` (tag 97),
+> guarded then applied on the repository's partition, an entry of its register of that one change. The guard refuses a
+> stale read (`PolicyChanged`, naming the version now), a rule naming what the repository's tool does not have or a
+> pattern its matcher would refuse, and a hook at another tool's point, named other than its point allows (one hook a
+> git or Subversion point; Mercurial's `point.suffix` names, each once), or running a program that is not an absolute
+> path. Its rules' and hooks' encoded bytes are charged to the partition's merge budget, given back when it is
+> replaced or its repository leaves, and charged again by a partition rebuilt from its snapshot.
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12093,7 +12104,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
    commit, under learned deadlines (A-597 built the matcher with each tool's precedence, the hooks' inputs, their
-   learned deadlines and the runner; the policy's place in the record, the views and the driver are owed).
+   learned deadlines and the runner; A-622 part 1 the policy in the repository record and its verb; the push paths'
+   check and the hook driver are owed, A-622's next parts).
 
 Each server's pieces follow these, in its own section.
 
@@ -12240,6 +12252,10 @@ engine: the verdict, rebase, position mapping, the register).
 > a number past Go's `int64` are refused by kind. Proven against git-lfs v3.8.1's documents and pointer tests and
 > against what the stock git-lfs 3.8.1 client sent and accepted, recorded. Serving it (routes, the object store, lock
 > records, who may do what) is the server's part.
+>
+> **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
+> case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
+> re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -13120,6 +13136,19 @@ and export by landing).
 > dumps stock `svnadmin` 1.15.0 wrote (golden, SHA-256 checked), to `svnlook changed`, to format 3 rebuilding format
 > 2's trees, to every cut and bit flip. Owed of piece 6: the verbs over it (`svnadmin create`, `load`, `dump`,
 > `setrevprop`, `setlog`, `info`, `uuid`, `youngest`) and the dump round trip.
+>
+> **Status (2026-11-19, A-613, its first part).** Built: the ra_svn read commands' handler (`slates-svn`'s `reads`,
+> piece 7's second part): a sans-io answer to one parsed command of a session after its handshake, the session taken
+> as a value (its base path); `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s search over dates read as
+> `svn_time_from_cstring` and APR read them), `rev-proplist`, `rev-prop`, `check-path`, `stat`, `get-mergeinfo` (A-605's
+> catalog) and `get-iprops`, each writing what `svnserve` writes: the trivial authentication request first, refusals
+> with Subversion's numbers and messages, an unknown command refused, malformed parameters ending the connection.
+> Held to transcripts of stock `svnserve` 1.15.0 answering stock `svn` 1.15.0 and scripted clients
+> (`crates/svn/fixtures/reads`, recorded by its `make-fixtures.py` through a relay, each file's SHA-256 in
+> `SHA256SUMS`), property lists compared as sets: `svnserve` writes them in APR's per-table seeded hash order, three
+> recordings gave three orders, and slates writes them in name order. Owed: `get-file`, `get-dir`, `list`, `log` with
+> merged revisions, `get-locations`, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, then
+> `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -41839,6 +41868,113 @@ Applied in the same change to:
   - Each action's expiry learned from the deployment's own token lifetimes (§4.17.1's rule).
   - The stock client driven end to end against slates' own server, main's run once the routes exist.
   - Mercurial's `lfs` (§4.17.3).
+
+### A-613 — The ra_svn read commands, a sans-io handler over the index and mergeinfo, held to stock svnserve's transcripts; its first part (2026-11-19, g262, UI goal 93; §4.17.4 "4. Reads", "5. The wire" and piece 7's second part; A-531, A-553, A-599, A-605)
+Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 entry),
+`docs/wip/research/vcs-servers-subversion.md` (§13, new), `crates/svn/src/reads.rs` and `crates/svn/src/reads/tests.rs`
+(new), `crates/svn/fixtures/reads/` (new: the recorder, 28 transcripts, the repository's record, `sessions.txt`,
+`subversion-version.txt`, `SHA256SUMS`), `crates/svn/src/lib.rs` (its `mod` line).
+- **What was there.** Item 4 named the reads and item 5 the wire; the item codec (A-531), the index (A-553), the
+  handshake (A-599) and mergeinfo (A-605) were built; nothing answered a command after the handshake.
+- **The decision.** One function answers one parsed command against the index, the green (a `Repository` seam: revision
+  properties and property lists, beside A-605's `Contents`) and the session's value (its base path; A-599 hands it
+  over), appending what `svnserve` writes and saying whether it answered, whether the connection ends (malformed
+  parameters, which `svnserve` ends without a word) or whether another piece answers. Each command is `serve.c`'s at
+  `1.14.x` `d434dc14` (notes §13), its bytes held to stock `svnserve` 1.15.0's own: the trivial authentication request
+  before a command's work, so a revision past the youngest is refused after it; parameters as `svn_ra_svn__parse_tuple`
+  reads them (extra ones ignored, C strings to their NUL, a number past 2^63 - 1 a negative revision); paths joined to
+  the base and made canonical; refusals as `( failure ( ( code message 0: 0 ) ) )`; `get-iprops` without a revision
+  refused as `svnserve` refuses it ("Invalid revision number '-1'"); dates read by `svn__strtoul` fields and APR's day
+  count, written by `gmtime`'s. Property lists are written in name order: `svnserve`'s order is APR's per-table seeded
+  hash order, which three recordings showed changing, and a client reads the list into a hash.
+- **The fixtures.** `make-fixtures.py` builds a repository from a dump it writes (fixed UUID, authors, dates and logs,
+  revision 0's date set after the load), serves it with `svnserve -i` behind a relay on a fixed port that logs each
+  connection both ways, and records stock `svn` sessions and scripted ones that send exact commands, refusals among
+  them. It ran on the Mac Studio (stock 1.15.0 from Homebrew), and its output reached the tree through kiln, bytes
+  never retyped: one program ran the recorder there and wrote its archive here.
+- **Tests** (the Mac Studio, `cargo test -p slates-svn --lib reads`, 2026-11-19): 7 of 7; the fixtures' sums checked
+  with `shasum -a 256 -c` first. Eight scripted sessions (49 commands) and four stock sessions (`svn info` of the root
+  and at a date, `svn propget --revprop`, `svn proplist --revprop`) replayed command by command, every answer item
+  `svnserve`'s; the parameters' edges; commands handed back and unknown ones; dates and the dated search's edges; and
+  hostile commands, never a panic. Red-checked six ways (a directory's size 0, `get-iprops` taking the youngest, an
+  authentication request before an unknown command's refusal, a huge revision read as malformed, mergeinfo keys left
+  absolute, dates before 1970 accepted): each failed its tests.
+- **Owed** (the next parts): `get-file`, `get-dir`, `list`, `log` with merged revisions, `get-locations`,
+  `get-location-segments`, `get-file-revs`, `get-deleted-rev`, each with its transcripts (two stock sessions recorded
+  here already ask for `get-locations` and `get-dir`); then `svn mergeinfo --show-revs`'s eligible and merged
+  revisions from the segments and the log; read access by A-606's rules, and the authentication request a denied
+  anonymous read makes when the session could authenticate.
+
+### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git/src/v2` (`line.rs`'s `object_id`; `mod.rs`'s rule and `Refusal::ObjectId`; the tests in `line.rs`,
+  `tests/request.rs`, `tests/ls_refs.rs` and `tests/mod.rs`).
+- **The rule.** Main settled A-604's question. v0 read ids in either case, as gitprotocol-pack's "both MUST treat
+  obj-id as case-insensitive" asks; v2 refused upper case, by gitprotocol-common's `HEXDIG`. A server reads what git's
+  own server accepts and writes git's form: git's server reads every id with `get_oid_hex` or `parse_oid_hex`, whose
+  `hexval` takes both cases, so v2 now does, and writes `oid_to_hex`'s lower case. A line's LF stays optional and
+  recorded, so stock git's streams re-encode exactly. Bytes after an id and numbers not in canonical decimal stay
+  refused, since no git writes them.
+- **Tests** (Mac Studio M3 Ultra, kiln, 2026-11-19). Failing first: an upper-case `want` in a `fetch` request and an
+  upper-case id in an `ls-refs` answer, both refused `NotHex` before (2 of 39 v2 tests red). Then `cargo test --locked
+  -p slates-git --lib` 221 of 221 over main with this change, fmt clean. The cases that pinned the refusal (one in `tests/request.rs`, one in
+  `tests/ls_refs.rs`, the unit test in `line.rs`) now pin the reading, and the bit-flip test takes a flip that
+  upper-cases an id's digit as the same id, written back as the original byte.
+- **Owed of A-624:** `object-info` and `bundle-uri`, read and answered over a store trait (A-614 builds the store), and
+  the server's `packfile-uris` choice.
+
+### A-622 — A repository's policy held in its record, set whole by its owner from the version read (2026-11-19, g255, UI goal 93; §4.17.1 "Policy: protected branches, access and hooks" and shared piece 7's rest, part 1; after A-597 and A-603)
+Applied in the same change to:
+- §4.17.1's policy paragraph (a status) and its pieces list (piece 7);
+- GAPS (the §4.17 entry);
+- `crates/db` (`catalog.rs`: `RepositoryPolicy` and its rule and hook types, and `RepositoryRecord::policy`, appended;
+  `op.rs`: `Op::RepositoryPolicySet`, tag 97, appended; `error.rs`; `repository.rs` with `repository/policy.rs`, new;
+  `partition.rs`; the test helpers' records; `tests/wire_order.rs` and `.txt`, the appended tag and six new enums);
+- `crates/ipc` (`protocol.rs`: `RequestBody::SetRepositoryPolicy`, tag 86, `DatabaseRefusal` 8 and 9, the policy's wire
+  types, `Refusal::PolicyChanged`'s doc; `tests/wire_order.rs` and `.txt`);
+- `crates/server` (`repository.rs`: `set_policy`; `verbs.rs`: its route and dispatch; `error.rs`: the refusals).
+
+- **The record.** A repository's policy is part of its record, so a partition's snapshot carries it and a replay sets it
+  again, as the record's other fields. It holds a version (how many times it was set), its rules in order, and its hooks
+  in order. A rule names what its pattern covers (git's refs; Mercurial's branches, bookmarks or topics; Subversion's
+  paths), the pattern in its tool's form, the right (read, submit, rewrite, delete), allow or deny, and whom it speaks
+  to (everyone, or entries naming a principal or every principal but one). A hook names its point, its name and its
+  program. A repository is created with an empty policy at version 0, and a create that carries one is refused.
+- **The verb.** `SetRepositoryPolicy { repository, read, rules, hooks }`, its owner's (another principal is refused
+  `Forbidden`, as the branch verbs are), routed to the partition the repository's name hashes to. It records
+  `Op::RepositoryPolicySet` with version `read + 1`, which the guard accepts only when the policy's version is `read`:
+  a raced or replayed setting is refused `PolicyChanged` with the version now, as A-285's volume policy is, so the
+  setter reads again. Answered `Acknowledged`. The op is an entry of the repository's register of that one change, so
+  it takes the next position (A-603).
+- **What the guard refuses** (`repository/policy.rs`): a rule whose names the repository's tool has not, or whose
+  pattern is empty, holds a NUL, or is a Subversion path that does not start at the root (`/path` or `:glob:/path`),
+  which are the rules the server's matcher reads a pattern by (A-597), so a recorded policy always compiles; a hook at
+  another tool's point; one named other than its point allows (git and Subversion keep one hook file a point, so their
+  hooks take the point's own name, once; Mercurial's take the point's name alone or with a `.suffix`, each name once);
+  and a program that is not an absolute path or holds a NUL. Each refusal is typed on the wire
+  (`DatabaseRefusal::PolicyRuleMalformed` or `PolicyHookMalformed`, naming the item by index).
+- **The bound.** A policy's rules' and hooks' encoded bytes are charged to the partition's merge byte budget, the bound
+  every repository's own state shares (A-603, A-596), with `Capacity` past it; a setting gives back the policy it
+  replaces, a destroyed repository gives back its policy, and a partition rebuilt from its snapshot charges the
+  policies again (`Repositories::state_bytes`). One policy is also bounded by one log record, since it is set whole.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19; `cargo fmt --all` applied from the Studio's run):
+  `cargo test --locked -p slates-db --lib -- repository::` 15 of 15, `-p slates-server --lib -- repository::` 5 of 5,
+  `-p slates-ipc --lib` all passing, and both crates' `--test wire_order` 2 of 2 (the appended tags published by hand
+  and checked by the test). Red first, on a copy with the version check, the rule and hook checks, the create's check,
+  the snapshot's charge and the guard's release taken out: the four tests that guard them failed, nothing else.
+  - The guard's own tests: each tool's names, each kind of malformed pattern, the hooks' points and names, the charge.
+  - The partition's: a policy set from version 0 and held at 1 with the register a position on; a stale setting, a
+    branch rule in a git repository, a relative program and a create carrying a policy each refused by kind, nothing
+    changed; the rebuilt and the replayed partitions answering as the live one.
+  - The budget's, by use: a replacement fits because the old policy is given back; a second repository's policy
+    refused `Capacity` on the live partition and on the rebuilt one alike; and admitted once the first repository has
+    left.
+  - The server's: the verb end to end, the owner's principal mapped to the catalog's, each refusal on the wire.
+- **Owed (A-622's next parts):** the push paths' check against the policy (one function the git, Mercurial and
+  Subversion push pieces call, with a typed refusal), and the hook driver (an owned hook process over a read-only
+  attachment of the work, its learned deadline from A-597's runner). A client and CLI form of the verb are owed with
+  the servers' administration.
 
 ### A-621 — an ops document names as many paths as its work declares: 64-bit path indices and interning through a map (2026-11-19, g267, UI goal 93; §4.16 "Data model"; found on the push path by g225, A-618)
 Applied in the same change to:

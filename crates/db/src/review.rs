@@ -531,6 +531,7 @@ mod tests {
         format: ObjectFormat::Sha1,
         default_branch: None,
         owner: person(0),
+        policy: crate::catalog::RepositoryPolicy::default(),
       },
     }
   }
