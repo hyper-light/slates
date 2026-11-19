@@ -17,7 +17,7 @@
 //! - Otherwise the next location is the node's created path in its created revision, reported.
 //!
 //! The root changes in every revision and is never copied, so its history is every revision down to 0
-//! (`fs_history_prev`'s special case). `fs_history_prev` steps until a location is reported, which takes at most two
+//! (`fs_history_prev`'s special case, kept for its cost: the general step answers the same, reading the index). `fs_history_prev` steps until a location is reported, which takes at most two
 //! steps ([`PREVIOUS_STEPS`]): a passed-over location is a copy's, and the step after it starts at the copy's source,
 //! where every case reports. `tree.c`'s shortcut through linear history (`next_copy`, `current_id`) answers as the
 //! steps do, so it is not kept.

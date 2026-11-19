@@ -40,9 +40,10 @@ use crate::ra_svn::{ItemError, Value, write};
 /// Format: `SVN_PROP_REVISION_LOG` (`svn_props.h`).
 const LOG_PROPERTY: &[u8] = b"svn:log";
 
-/// The three revision properties an entry carries in their own places, and the count of them `revision_receiver` takes
-/// for "only these" (`apr_hash_count(log_entry->revprops) == 3`).
-/// Format: `svn_compat_log_revprops_out_string` (`compat.c`) and `revision_receiver` (`serve.c`).
+/// The three revision properties an entry carries in their own places, never among the rest it counts and lists.
+/// Format: `svn_compat_log_revprops_out_string` and `svn_compat_log_revprops_clear` (`compat.c`), called by
+/// `revision_receiver` (`serve.c`), whose shortcut for an entry with these three alone (`apr_hash_count(...) == 3`)
+/// gives the same answer as removing them: nothing left.
 const STANDARD_REVPROPS: [&[u8]; 3] = [AUTHOR_PROPERTY, DATE_PROPERTY, LOG_PROPERTY];
 
 /// `SVN_ERR_UNSUPPORTED_FEATURE`, answered for a log of merged revisions until they are built (module documentation).
@@ -600,19 +601,11 @@ impl LogStream {
       find(DATE_PROPERTY),
       find(LOG_PROPERTY),
     );
-    let standard = author.is_some()
-      && date.is_some()
-      && message.is_some()
-      && properties.len() == STANDARD_REVPROPS.len();
-    let rest: Vec<(&[u8], &[u8])> = if standard {
-      Vec::new()
-    } else {
-      properties
-        .iter()
-        .copied()
-        .filter(|(name, _)| !STANDARD_REVPROPS.contains(name))
-        .collect()
-    };
+    let rest: Vec<(&[u8], &[u8])> = properties
+      .iter()
+      .copied()
+      .filter(|(name, _)| !STANDARD_REVPROPS.contains(name))
+      .collect();
     if !self.receiver.started {
       reads.out.extend_from_slice(LIST_OPEN);
       reads.out.extend_from_slice(LIST_OPEN);
