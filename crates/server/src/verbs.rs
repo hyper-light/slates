@@ -1188,7 +1188,8 @@ async fn await_deferred_completion(
     .await;
     match recorded {
       Ok(Some(bytes)) => {
-        return ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest));
+        return ReplyBody::from_bytes(&bytes)
+          .unwrap_or_else(|_| refused(Refusal::DuplicateRequest));
       }
       Ok(None) if slates_rt::futures::now_ns() < deadline => {}
       Ok(None) => return refused(Refusal::Overloaded { shard }),
@@ -22814,7 +22815,10 @@ mod tests {
       .and_then(slates_rt::futures::detach)
       .is_ok()
     });
-    assert!(spawned, "the forward's task was spawned on the control shard");
+    assert!(
+      spawned,
+      "the forward's task was spawned on the control shard"
+    );
     let bytes = received
       .recv_timeout(std::time::Duration::from_nanos(
         crate::daemon::OBSERVE_BUDGET_NS,
