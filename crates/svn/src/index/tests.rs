@@ -2243,3 +2243,28 @@ fn the_index_equals_a_naive_filesystem_replaying_the_same_revisions() {
     "a relation never met: {census:?}"
   );
 }
+
+/// A-655 (`Index::plan`, `Index::commit_planned`; `transaction.c` `commit_body` 3784-3786). Do: plan a change of
+/// `/trunk/README` after revision 1, append another revision, then commit the plan; plan the change again and commit
+/// it. Expect: the stale plan refused out of date (`E160028`), the index as the append left it; the fresh plan
+/// committed as revision 3, the index equal to the one `append` makes of the same record.
+#[test]
+fn a_plan_is_refused_once_a_revision_was_appended_after_it() {
+  let mut index = trunk();
+  let record = || RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: vec![edit("/trunk/README", 3)],
+  };
+  let stale = index.plan(record(), ALL_ROOM).unwrap();
+  commit(&mut index, vec![edit("/trunk/lib/a.c", 4)]);
+  let before = format!("{index:?}");
+  let refusal = index.commit_planned(stale).unwrap_err();
+  let answered = (refusal.subversion_code(), format!("{index:?}"));
+  assert_eq!(refusal, IndexRefusal::OutOfDate { planned: 2, next: 3 });
+  assert_eq!(answered, (160_028, before));
+  let mut appended = index.clone();
+  let fresh = index.plan(record(), ALL_ROOM).unwrap();
+  assert_eq!(index.commit_planned(fresh), Ok(3));
+  assert_eq!(appended.append(record(), ALL_ROOM), Ok(3));
+  assert_eq!(format!("{index:?}"), format!("{appended:?}"));
+}
