@@ -709,12 +709,48 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
   }
 }
 
-/// A-613: the recorder's `SHA256SUMS` names every transcript the tests read, and the recorder's record of the
-/// repository; the Studio run checks each sum with `shasum -a 256 -c`.
+/// A-613 part 2 (read access, A-606): stock `svn` 1.15.0's own sessions against the `locked` repository, read by an
+/// anonymous user under its rules (`ls -v -R`, `log -v` and `log -g` of `/trunk`, `blame -g` of `/trunk/a.txt`, `cat`
+/// of the readable `/trunk/dir/b.txt` and of the hidden `/branches/b1/a.txt`, `proplist -v --show-inherited-props` of
+/// `/trunk/dir/b.txt`), answered as `svnserve` answered them, `log -g` refused "Item is not readable" (220001) and the
+/// hidden file's `cat` "Authorization failed" (170001) among them; the locks `ls` asks for are the lock piece's.
+#[test]
+fn stock_locked_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript!("locked-svn-ls"), 2),
+    (transcript!("locked-svn-log"), 4),
+    (transcript!("locked-svn-log-g"), 4),
+    (transcript!("locked-svn-blame-g"), 5),
+    (transcript!("locked-svn-cat"), 3),
+    (transcript!("locked-svn-cat-denied"), 2),
+    (transcript!("locked-svn-proplist"), 4),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(
+      replay(name, client, server, &["get-lock", "get-locks"]),
+      commands,
+      "{name}"
+    );
+  }
+}
+
+/// A-613: the recorder's `SHA256SUMS` names every transcript the tests read, the recorder's record of the repository
+/// and the `locked` repository's rules; the Studio run checks each sum with `shasum -a 256 -c`.
 #[test]
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
   for name in [
+    "locked-reads",
+    "locked-log",
+    "locked-file-revs",
+    "locked-file-revs-abort",
+    "locked-svn-ls",
+    "locked-svn-log",
+    "locked-svn-log-g",
+    "locked-svn-blame-g",
+    "locked-svn-cat",
+    "locked-svn-cat-denied",
+    "locked-svn-proplist",
     "get-file-revs",
     "svn-blame",
     "svn-blame-g",
@@ -780,6 +816,7 @@ fn every_fixture_has_its_recorded_sum() {
     );
   }
   assert!(sums.lines().any(|line| line.ends_with("  repository.txt")));
+  assert!(sums.lines().any(|line| line.ends_with("  authz")));
 }
 
 /// One command's answer against the fixture's repository.
