@@ -304,98 +304,42 @@ fn every_endpoint_is_routed_by_its_path_and_method() {
 
 /// A-629: do route requests each wrong one way: an endpoint asked by another method; no
 /// repository, a `.` segment, an oid that is none, an unknown endpoint; an escape naming a slash,
-/// a malformed escape, a repository path that is not UTF-8; a JSON body of another type or none;
-/// an `Accept` that covers no LFS body. Expect each refused by its kind, with its status.
+/// a repository path that is not UTF-8; a JSON body of another type or none; an `Accept` that
+/// covers no LFS body. Expect each refused by its kind, with its status; and a malformed escape
+/// refused by slates-http's reader before any route reads it (RFC 3986 §2.1).
 #[test]
 fn every_misrouted_request_is_refused_by_kind() {
+  const PLAIN_TEXT: (&str, &str) = ("Content-Type", "text/plain");
+  const HTML: (&str, &str) = ("Accept", "text/html");
   let object = lfs(&format!("/objects/{}", LfsNaming::oid(b"x")));
-  let not_allowed = RouteRefused::MethodNotAllowed;
-  let cases: [(&str, String, Fields<'_>, RouteRefused, u16); 13] = [
-    (
-      "GET",
-      lfs("/objects/batch"),
-      &[],
-      not_allowed(Allow::Post),
-      405,
-    ),
-    (
-      "DELETE",
-      lfs("/locks"),
-      &[],
-      not_allowed(Allow::GetPost),
-      405,
-    ),
-    ("POST", object, &[JSON], not_allowed(Allow::GetPut), 405),
-    (
-      "GET",
-      "/info/lfs/locks".into(),
-      &[],
-      RouteRefused::NotFound,
-      404,
-    ),
-    (
-      "GET",
-      "/a/./info/lfs/locks".into(),
-      &[],
-      RouteRefused::NotFound,
-      404,
-    ),
-    ("GET", lfs("/objects/zz"), &[], RouteRefused::NotFound, 404),
-    ("GET", lfs("/elsewhere"), &[], RouteRefused::NotFound, 404),
-    (
-      "GET",
-      "/a%2Fb/info/lfs/locks".into(),
-      &[],
-      RouteRefused::BadPath,
-      400,
-    ),
-    (
-      "GET",
-      "/a%zz/info/lfs/locks".into(),
-      &[],
-      RouteRefused::BadPath,
-      400,
-    ),
-    (
-      "GET",
-      "/a%ff/info/lfs/locks".into(),
-      &[],
-      RouteRefused::BadPath,
-      400,
-    ),
-    ("POST", lfs("/objects/batch"), &[], unsupported(), 415),
-    (
-      "POST",
-      lfs("/locks"),
-      &[("Content-Type", "text/plain")],
-      unsupported(),
-      415,
-    ),
-    (
-      "POST",
-      lfs("/locks"),
-      &[JSON, ("Accept", "text/html")],
-      RouteRefused::NotAcceptable,
-      406,
-    ),
+  let allow = RouteRefused::MethodNotAllowed;
+  let (not_found, bad_path) = (RouteRefused::NotFound, RouteRefused::BadPath);
+  let (unsupported, not_acceptable) = (
+    RouteRefused::UnsupportedMediaType,
+    RouteRefused::NotAcceptable,
+  );
+  let cases: [(&str, String, Fields<'_>, RouteRefused, u16); 12] = [
+    ("GET", lfs("/objects/batch"), &[], allow(Allow::Post), 405),
+    ("DELETE", lfs("/locks"), &[], allow(Allow::GetPost), 405),
+    ("POST", object, &[JSON], allow(Allow::GetPut), 405),
+    ("GET", "/info/lfs/locks".into(), &[], not_found, 404),
+    ("GET", "/a/./info/lfs/locks".into(), &[], not_found, 404),
+    ("GET", lfs("/objects/zz"), &[], not_found, 404),
+    ("GET", lfs("/elsewhere"), &[], not_found, 404),
+    ("GET", "/a%2Fb/info/lfs/locks".into(), &[], bad_path, 400),
+    ("GET", "/a%ff/info/lfs/locks".into(), &[], bad_path, 400),
+    ("POST", lfs("/objects/batch"), &[], unsupported, 415),
+    ("POST", lfs("/locks"), &[PLAIN_TEXT], unsupported, 415),
+    ("POST", lfs("/locks"), &[JSON, HTML], not_acceptable, 406),
   ];
   for (method, target, fields, refused, status) in cases {
-    assert_eq!(
-      routed(method, &target, fields),
-      Err(refused),
-      "{method} {target}"
-    );
-    assert_eq!(
-      refused.status(Version::Http11).code,
-      status,
-      "{method} {target}"
-    );
+    let which = format!("{method} {target}");
+    assert_eq!(routed(method, &target, fields), Err(refused), "{which}");
+    assert_eq!(refused.status(Version::Http11).code, status, "{which}");
   }
-}
-
-/// A `415`.
-fn unsupported() -> RouteRefused {
-  RouteRefused::UnsupportedMediaType
+  let malformed = request_bytes("GET", "/a%zz/info/lfs/locks", &[]);
+  let read = HeadReader::new().read(&malformed, &mut HttpAdmission::new(ROOM));
+  assert!(read.is_err(), "{read:?}");
 }
 
 /// A JSON request to `locks`, its body's type in another case with a charset, whose `Accept` is
