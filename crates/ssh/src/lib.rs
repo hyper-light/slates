@@ -27,7 +27,9 @@
 //! 8032, 8308, 8709 and 8731 \[B\]; OpenSSH's `PROTOCOL` at `fa4b2a82` \[B\], which since moved its three transport
 //! extensions into the SSHM working group's drafts: `draft-ietf-sshm-strict-kex-03`, `draft-ietf-sshm-chacha20-poly1305-04`
 //! and `draft-miller-sshm-aes-gcm-01` \[B\]; OpenSSH's `kex.c` and `packet.c` at the same commit \[C\], followed where the
-//! documents leave room, each place saying so.
+//! documents leave room, each place saying so. Above it (§5.7): RFC 4252, 4254 and 8332 \[B\], and git's, Mercurial's and
+//! Subversion's clients \[C\]. The hybrid (§5.8): `draft-ietf-sshm-mlkem-hybrid-kex-10` and FIPS 203 \[B\], OpenSSH's
+//! release notes for 10.0 to 10.2 and its post-quantum page \[B\], and AWS-LC's ML-KEM as vendored \[C\].
 //!
 //! **Bounds, none of them a tuning literal.** A packet is held to the caller's cap, which RFC 4253 §6.1 floors at 35000
 //! bytes, and its length is checked before its body is read. One packet is buffered at a time. One event waits at a

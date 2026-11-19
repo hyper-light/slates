@@ -7,7 +7,7 @@
 //! [`negotiate`] refuses by the list's kind.
 //!
 //! **What the server offers.** Key exchange `mlkem768x25519-sha256` first, the post-quantum hybrid that OpenSSH 10.0
-//! made its default and whose absence OpenSSH 10.1 warns of (A-634; research notes §5.7), then `curve25519-sha256`
+//! made its default and whose absence OpenSSH 10.1 warns of (A-634; research notes §5.8), then `curve25519-sha256`
 //! (RFC 8731); host key `ssh-ed25519` (RFC 8709); ciphers `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`,
 //! both AEADs, so MAC negotiation is skipped: "When an AEAD mode is selected ..., MAC negotiation MUST be skipped and the
 //! contents of the "mac_algorithms" field ignored" [B: the AES-GCM draft §2; the chacha draft §5 says the same]. Its own MAC lists still name one algorithm, since RFC 4253 §7.1

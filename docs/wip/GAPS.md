@@ -176,6 +176,14 @@
 > the server's own rekey (`cargo test -p slates-ssh --lib`, 105 of 105; red five ways). Owed: the listener on
 > slates-rt with the reaper and the lifetime estimator, the host key's keeping, the key store, serving each command,
 > ECDSA and FIDO user keys, and main's live interop with stock `ssh`, `git`, `hg` and `svn`.
+> **A-634 (2026-11-19, g294; piece 9, the post-quantum exchange):** the transport runs `mlkem768x25519-sha256`
+> (ML-KEM-768 with X25519 through aws-lc-rs; `draft-ietf-sshm-mlkem-hybrid-kex-10`) and offers it first, a client
+> without it getting `curve25519-sha256`; `C_INIT`'s length checked, FIPS 203 §7.2's modulus check held to AWS-LC by a
+> hostile test, `K = SHA-256(K_PQ || K_CL)` entered as a string. OpenSSH's release notes checked: 10.0 made the hybrid
+> its default and 10.1 warns on every connection without a post-quantum exchange (`WarnWeakCrypto`, on by default), so
+> stock clients no longer warn here (`cargo test -p slates-ssh --lib`, 110 of 110; red four ways). Not offered:
+> `sntrup761x25519-sha512` (AWS-LC has no NTRU Prime). Owed: main's live interop with OpenSSH 10.2 and a golden
+> transcript from a client with a fixed ML-KEM key.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence

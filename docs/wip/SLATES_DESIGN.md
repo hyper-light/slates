@@ -12279,6 +12279,16 @@ engine: the verdict, rebase, position mapping, the register).
 > close end the channel in order. The listener on the runtime, the host key's keeping and the commands' serving are
 > owed.
 >
+> **Status (2026-11-19, A-634: the post-quantum key exchange built).** The transport runs `mlkem768x25519-sha256`, the
+> ML-KEM-768 and X25519 hybrid OpenSSH made its default in 10.0, and offers it first; a client that does not list it
+> gets `curve25519-sha256`, since the client's first choice decides. The server checks `C_INIT`'s length, encapsulates
+> to the client's ML-KEM key through aws-lc-rs (AWS-LC runs FIPS 203 §7.2's modulus check inside the encapsulation),
+> keeps RFC 8731's checks on the X25519 half, and enters `K = SHA-256(K_PQ || K_CL)` into the hash and the key
+> derivation as a string. OpenSSH 10.1 and later warn on every connection whose exchange is not post-quantum, and each
+> of them lists the hybrid first, so none warns here. Held to whole handshakes and rekeys against the test client,
+> which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
+> mutations of the secret's encoding and order, the reply's order and the length check, each caught.
+>
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
 > inflated through flate2 over zlib-rs (A-607) into room for exactly the size its header names, then the trailer, which
@@ -12450,7 +12460,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    bound to its one endpoint and refusing every transfer coding, lent its line bound and its staged close, and moving it
    onto the codec is owed. The git edge adds TLS, authentication and streaming responses.
 2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
-   one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
+   one session channel [B: RFC 4254]. Key exchange `mlkem768x25519-sha256` first, ML-KEM-768 with X25519
+   [B: `draft-ietf-sshm-mlkem-hybrid-kex-10`; FIPS 203], OpenSSH's default since 10.0, whose clients since 10.1 warn on
+   every connection without a post-quantum exchange [B: OpenSSH 10.0 and 10.1 release notes] (A-634), then
+   `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
    [B: RFC 8709], and user keys in RSA under `rsa-sha2-512` and `rsa-sha2-256` [B: RFC 8332] (A-633), with the ECDSA
    and FIDO key forms users also hold as owed reading; ciphers `aes256-gcm@openssh.com`
    and `chacha20-poly1305@openssh.com`, the forms OpenSSH clients speak ("Because of problems with the design of the
@@ -43219,7 +43232,8 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
 Applied in the same change to:
 - §4.17.2's status and its SSH item (RSA user keys under RFC 8332; Mercurial's and Subversion's commands); §4.17.3's
   transports and §4.17.4's svn+ssh (slates' own SSH server reads their commands); GAPS (the §4.17 entry);
-  `research/vcs-servers.md` §5.6 (new: the sources, pinned by hash);
+  `research/vcs-servers.md` §5.7 (new: the sources, pinned by hash; first numbered §5.6, beside A-624's, and renumbered
+  by A-634);
 - `crates/ssh` (new: `userauth`, `channel`, `command`, `session`; `transport` sends EXT_INFO and gives each upper-layer
   message its sequence number; `refusal` gains reason 14; their tests; `fixtures/userauth` with `make-fixtures.sh`).
 - **Authentication** (RFC 4252). `none` is answered with a failure naming `publickey` and is never counted. A query is
@@ -43280,3 +43294,74 @@ Applied in the same change to:
 - **Owed.** The listener on slates-rt with the reaper and the connection-lifetime estimator (A-594's key time); the
   host key's keeping; the key store over §4.13's principals; serving each command (§4.17.2-§4.17.4's pieces); ECDSA and
   FIDO user keys; main's live interop with stock `ssh`, `git`, `hg` and `svn` clients.
+
+### A-634 — The SSH server's post-quantum key exchange: `mlkem768x25519-sha256`, ML-KEM-768 with X25519 through aws-lc-rs, offered first, and OpenSSH's warning checked against its release notes (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2; after A-594 and A-633)
+Applied in the same change to:
+- §4.17.2's status and its SSH item (the key exchange); GAPS (the §4.17 entry); `research/vcs-servers.md` §5.8 (new:
+  the draft, FIPS 203's checks where AWS-LC runs them, OpenSSH's release notes and its post-quantum page, pinned by
+  hash), with A-633's sources renumbered §5.7 and moved into §5, where a merge had left them after §6 under A-624's
+  number;
+- `crates/ssh`: `kex` (the hybrid's half; one X25519 step both methods share, the all-zero check in it alone);
+  `kexinit` (the method list, `KexMethod::Mlkem768X25519Sha256`); `transport` (each method's half; `Algorithms::kex`);
+  `entropy` (the one draw that does not pass through it); the tests (the hybrid's half, hostile values, negotiation,
+  whole handshakes; the test client decapsulates for itself and lists OpenSSH 10's default methods; the tests'
+  narrowing casts are checked conversions now).
+- **The claim, checked.** The brief said OpenSSH 10 "may warn on every non-post-quantum exchange". The release notes
+  say so of 10.1, not 10.0. OpenSSH 10.0 (released 2025-04-09) made the hybrid its default: "the hybrid post-quantum
+  algorithm mlkem768x25519-sha256 is now used by default for key agreement" [B: release-10.0]. OpenSSH 10.1
+  (2025-10-06), among its potentially incompatible changes, has `ssh(1)` "add a warning when the connection negotiates
+  a non-post quantum key agreement algorithm", "due to the risk of "store now, decrypt later" attacks", controlled by
+  "a new WarnWeakCrypto ssh_config option, defaulting to on" [B: release-10.1]. OpenSSH 10.2 (2025-10-10) changes
+  nothing here. The warning is the client's, on every such connection: "** WARNING: connection is not using a
+  post-quantum key exchange algorithm." It stays silent when the server offers `mlkem768x25519-sha256` or
+  `sntrup761x25519-sha512` [B: openssh.com/pq.html]. So `git` and `hg` over OpenSSH 10.1 or later would have warned
+  on every connection to slates before this change. Now none does, since every such client lists the hybrid first
+  (`KEX_CLIENT_KEX` in `myproposal.h` at `fa4b2a82`) [C].
+- **Not offered: `sntrup761x25519-sha512`**, OpenSSH's post-quantum default from 9.0 to 9.8. AWS-LC has no Streamlined
+  NTRU Prime, and every client that warns offers the hybrid; a 9.0 to 9.8 client gets `curve25519-sha256` here and does
+  not warn.
+- **The exchange** (the draft §2.1 to §2.5). Messages 30 and 31 carry longer values: `C_INIT` is the client's
+  ML-KEM-768 encapsulation key (1184 bytes) and then its X25519 key, and `S_REPLY` is the ciphertext (1088 bytes) and
+  then the server's X25519 key. The server checks that `C_INIT` is exactly 1216 bytes ("MUST check that the length of
+  the C_INIT is the sum of the expected length of each public key"), runs the X25519 half with RFC 8731's checks,
+  encapsulates through aws-lc-rs, and computes `K = SHA-256(K_PQ || K_CL)` over the two secrets as fixed-length byte
+  strings. "K is encoded as a string" in the hash and the key derivation, not as an `mpint` (§2.5). Every refusal ends
+  the connection with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, as §2.1 requires. OpenSSH's server does the same
+  (`kex_kem_mlkem768x25519_enc` in `kexmlkem768x25519.c` at `fa4b2a82`) [C].
+- **FIPS 203 §7.2's checks.** The length check is the server's own. The modulus check is part of ML-KEM's encapsulation
+  as FIPS 203 defines its input checking, and AWS-LC runs it there: `mlk_kem_enc_derand` calls `mlk_kem_check_pk`,
+  "Implements @[FIPS203, Section 7.2, Modulus check]" (`vendor/aws-lc-sys/aws-lc/crypto/fipsmodule/ml_kem/mlkem/kem.c`
+  line 331, aws-lc-sys 0.45.0). The crate does not check it again, since a second check would be a second path doing
+  the same thing; a hostile test holds AWS-LC to it instead: a coefficient at q or at 4095 is refused, one at q - 1
+  served.
+- **Negotiation.** The method is the client's first that the server runs (RFC 4253 §7.1): the hybrid for a client
+  listing it first, `curve25519-sha256` for one that prefers it or lacks the hybrid. A guess is judged by the first
+  names as before, so a client listing the hybrid first now guesses right. `Established` and `Rekeyed` name the method
+  (`Algorithms::kex`), so a deployment can count the connections that ran it.
+- **Randomness.** The encapsulation's 32 random bytes come from AWS-LC's generator inside AWS-LC, the source
+  `SystemEntropy` reads. aws-lc-rs encapsulates from no given bytes, and AWS-LC's encapsulation that does
+  (`EVP_PKEY_encapsulate_deterministic`) is experimental and unwrapped. Production's source is unchanged, but a hybrid
+  transcript is not reproducible from the test seeds, so the determinism test holds the classical exchange (`entropy`'s
+  module doc says this). Measured: 64 encapsulations to one key gave 64 different ciphertexts, as the draft's §6 asks
+  ("MUST NOT reuse randomness in the generation of ML-KEM ciphertexts").
+- **Tests** (`cargo test --locked -p slates-ssh --lib`, Mac Studio d1323898). 110 of 110 at a064d221.
+  - Red first at bdb2fb7d: 100 passed and the 10 new and changed tests failed, with the server offering the classical
+    exchange alone and the hybrid's half a stub that refused.
+  - Green at 07650154 on its first build, 110 of 110.
+  - The hybrid's half against a client decapsulating with its own key, with RFC 7748's X25519 values on both sides,
+    over 64 runs that must include a hash with its top bit set, where an `mpint` and a `string` differ.
+  - Hostile `C_INIT`s refused by kind beside served controls: a byte short or long, a classical key, a coefficient at
+    q or 4095, the all-zero point.
+  - Negotiation by the client's choice; the KEXINIT's lists; guesses right and wrong, counted by the exchange messages
+    the client sent.
+  - Whole connections against the test client: handshakes under both ciphers with and without strict key exchange,
+    client and server rekeys, and every session and authentication test, all running the hybrid; a classical client
+    and one preferring `curve25519-sha256`, each through a handshake and a rekey.
+  - Red four ways on the Studio:
+    - `K` written as an `mpint`: 23 of 110 failed, the unit test only by chance, so it now requires a top-bit run and
+      failed each of 3 runs;
+    - the two secrets swapped: 35 failed;
+    - the length check removed: both hostile tests failed;
+    - the reply's two parts swapped: 35 failed.
+- **Owed.** Main's live interop with OpenSSH 10.2 (`ssh -v` naming `mlkem768x25519-sha256`, and no warning), and a
+  golden transcript with known keys, which needs a client with a fixed ML-KEM key, since the draft gives no vector.
