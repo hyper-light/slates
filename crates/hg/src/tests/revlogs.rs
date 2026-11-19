@@ -3,6 +3,7 @@
 //! the reader's refusals on damaged and hostile bytes.
 
 use crate::fixtures::revlogs::{file, find};
+use crate::compression::StreamRefusal;
 use crate::revlog::{self, Format, Mode, NONE, Refused, Revlog};
 use crate::{Admission, Node};
 use proptest::prelude::*;
@@ -346,8 +347,8 @@ fn first_chunk(name: &str) -> (Vec<u8>, u32) {
 }
 
 /// AC-HG.9, A-611: do read one-revision revlogs whose chunk is 7.2's own zlib stream or zstd frame with a byte after
-/// it, or cut short by a byte. Expect each refused as a chunk that does not inflate exactly; the chunk as stored read
-/// to its text's length.
+/// it, or cut short by a byte. Expect the byte after refused as one trailing byte and the cut stream as cut short, both
+/// by the inflater compressed bundles use; the chunk as stored read to its text's length.
 #[test]
 fn a_compressed_chunk_must_end_exactly() {
   for name in ["zlib-data_grow.i", "zstd-data_grow.i"] {
@@ -358,18 +359,24 @@ fn a_compressed_chunk_must_end_exactly() {
       log.chunk(0, &mut room()).map(|text| text.len()),
       Ok(usize::try_from(len).unwrap())
     );
-    for damaged in [
-      [chunk.as_slice(), b"!"].concat(),
-      chunk[..chunk.len() - 1].to_vec(),
-    ] {
-      let index = one_revision(&damaged, len);
-      let log = Revlog::open(&index, &[], &mut room()).unwrap();
-      assert_eq!(
+    let trailing = one_revision(&[chunk.as_slice(), b"!"].concat(), len);
+    let log = Revlog::open(&trailing, &[], &mut room()).unwrap();
+    assert!(
+      matches!(
         log.chunk(0, &mut room()),
-        Err(Refused::Inflate { rev: 0 }),
-        "{name}"
-      );
-    }
+        Err(Refused::Stream { rev: 0, refusal: StreamRefusal::TrailingBytes { bytes: 1, .. } })
+      ),
+      "{name}"
+    );
+    let cut = one_revision(&chunk[..chunk.len() - 1], len);
+    let log = Revlog::open(&cut, &[], &mut room()).unwrap();
+    assert!(
+      matches!(
+        log.chunk(0, &mut room()),
+        Err(Refused::Stream { rev: 0, refusal: StreamRefusal::Truncated { .. } })
+      ),
+      "{name}"
+    );
   }
 }
 
@@ -413,7 +420,11 @@ proptest! {
   /// AC-HG.9, A-611: do read a docket cut at any byte or with any byte changed. Expect a docket or a refusal; never a
   /// panic.
   #[test]
-  fn damaged_dockets_never_panic(at in any::<proptest::sample::Index>(), byte in any::<u8>(), cut in any::<bool>()) {
+  fn damaged_dockets_never_panic(
+    at in any::<proptest::sample::Index>(),
+    byte in any::<u8>(),
+    cut in any::<bool>(),
+  ) {
     let mut docket = file("v2-00changelog.i").to_vec();
     let place = at.index(docket.len());
     if cut { docket.truncate(place) } else { docket[place] = byte }

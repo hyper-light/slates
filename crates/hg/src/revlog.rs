@@ -15,9 +15,10 @@
 //!
 //! **A chunk** is routed by its first byte: `x` is a zlib stream (its header), `(` a zstd frame (its magic), `u` raw
 //! bytes after the `u`, and NUL raw bytes, the NUL kept; empty is empty. Version 2 records a mode per chunk instead:
-//! plain (raw, no header), the docket's default engine (the frame as written), or routed as version 1's. zlib is
-//! flate2 over zlib-rs and zstd the workspace's crate (A-607); every byte inflated is charged to the caller's
-//! admission as it is made, and a stream that does not end exactly at the chunk's end is refused.
+//! plain (raw, no header), the docket's default engine (the frame as written), or routed as version 1's. A compressed
+//! chunk is inflated by the crate's one inflater, the one compressed bundles use (`compression::inflate`, A-598, on
+//! A-607's engines): the decoder's memory and every byte of room charged to the caller's admission first, and a stream
+//! cut short, corrupt, or not ending exactly at the chunk's end refused by kind.
 //!
 //! **A text** is its chain's base chunk patched by each later chunk in order (7.2's `_deltachain`: an empty delta
 //! passed over), through slates-hg's own delta applier, every patched text charged to the admission; it must be as long
@@ -28,8 +29,7 @@
 //! base or a parent after its revision, a chunk past its file, bytes after a compressed stream, version 0, and revision
 //! flags whose texts do not hash to their nodes (censored, ellipsis, externally stored: owed with their pieces).
 
-use std::io::{Read, Write};
-
+use crate::compression::{self, Engine, StreamRefusal};
 use crate::delta;
 use crate::node;
 use crate::{Admission, NODE_LEN, NULL_NODE, Node, PastAdmission};
@@ -186,7 +186,7 @@ pub struct Docket<'a> {
 }
 
 /// Why a revlog, or one of its revisions, was refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
   /// A version or flags 7.2's reader would not take, or version 0.
   Version {
@@ -217,10 +217,13 @@ pub enum Refused {
     /// The byte.
     header: u8,
   },
-  /// A compressed chunk that does not inflate exactly.
-  Inflate {
+  /// A compressed chunk its engine refused: cut short, corrupt, or with bytes after its stream
+  /// ([`compression::inflate`]).
+  Stream {
     /// The revision.
     rev: u32,
+    /// The engine's refusal.
+    refusal: StreamRefusal,
   },
   /// A delta that does not apply.
   Delta {
@@ -605,8 +608,8 @@ impl<'a> Revlog<'a> {
       None => copy(stored, admission),
       Some(RAW_NUL) => copy(stored, admission),
       Some(RAW) => copy(stored.get(1..).unwrap_or_default(), admission),
-      Some(ZLIB) => inflate_zlib(rev, stored, admission),
-      Some(ZSTD) => inflate_zstd(rev, stored, admission),
+      Some(ZLIB) => inflate(rev, Engine::Zlib, stored, admission),
+      Some(ZSTD) => inflate(rev, Engine::Zstd, stored, admission),
       Some(header) => Err(Refused::Compression { rev, header }),
     }
   }
@@ -775,70 +778,14 @@ fn copy(stored: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refused> {
   Ok(stored.to_vec())
 }
 
-/// Where a decoder's bytes go: kept only once charged to the admission.
-struct Charged<'x> {
-  /// The bytes kept.
-  out: Vec<u8>,
-  /// The room they are charged to.
-  admission: &'x mut Admission,
-  /// The charge refused, if one was.
-  refused: Option<PastAdmission>,
-}
-
-impl Write for Charged<'_> {
-  fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-    if let Err(past) = self.admission.charge(crate::read::to_u64(bytes.len())) {
-      self.refused = Some(past);
-      return Err(std::io::Error::other("past the admission"));
-    }
-    self.out.extend_from_slice(bytes);
-    Ok(bytes.len())
-  }
-
-  fn flush(&mut self) -> std::io::Result<()> {
-    Ok(())
-  }
-}
-
-/// Reads a decoder to its end, every byte charged to `admission` before it is kept.
-fn read_charged(
-  rev: u32,
-  reader: &mut impl Read,
-  admission: &mut Admission,
-) -> Result<Vec<u8>, Refused> {
-  let mut sink = Charged {
-    out: Vec::new(),
-    admission,
-    refused: None,
-  };
-  match std::io::copy(reader, &mut sink) {
-    Ok(_) => Ok(sink.out),
-    Err(_) => Err(match sink.refused {
-      Some(past) => Refused::PastAdmission(past),
-      None => Refused::Inflate { rev },
-    }),
-  }
-}
-
-/// A zlib chunk inflated whole: a stream cut short is refused by flate2's reader ("incomplete deflate stream"), and one
-/// that ends before the chunk does by its count of the bytes it took.
-fn inflate_zlib(rev: u32, stored: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refused> {
-  let mut reader = flate2::bufread::ZlibDecoder::new(stored);
-  let out = read_charged(rev, &mut reader, admission)?;
-  if reader.total_in() != crate::read::to_u64(stored.len()) {
-    return Err(Refused::Inflate { rev });
-  }
-  Ok(out)
-}
-
-/// A zstd chunk decompressed: one frame, ending exactly at the chunk's end.
-fn inflate_zstd(rev: u32, stored: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refused> {
-  let mut reader = zstd::stream::read::Decoder::with_buffer(stored)
-    .map_err(|_| Refused::Inflate { rev })?
-    .single_frame();
-  let out = read_charged(rev, &mut reader, admission)?;
-  if !reader.finish().is_empty() {
-    return Err(Refused::Inflate { rev });
-  }
+/// A compressed chunk inflated by the crate's one inflater, the one compressed bundles use ([`compression::inflate`]):
+/// the decoder's memory and every byte of room charged to `admission` first, and a stream cut short, corrupt or
+/// followed by more bytes refused by kind.
+fn inflate(rev: u32, engine: Engine, stored: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refused> {
+  let mut out = Vec::new();
+  compression::inflate(engine, stored, admission, &mut out).map_err(|refusal| match refusal {
+    StreamRefusal::PastAdmission { past, .. } => Refused::PastAdmission(past),
+    refusal => Refused::Stream { rev, refusal },
+  })?;
   Ok(out)
 }

@@ -465,15 +465,21 @@ mod tests {
 
   const MANIFEST: &[u8] = b"38a51fca0cbc207c4af656034604724b2e089ff6";
 
-  /// The text `encode` writes for `changeset`, checked at the length `encoded_len` gave.
-  fn written(changeset: &Changeset<'_>) -> Result<Vec<u8>, EncodeRefusal> {
+  /// What `encode` and `encoded_len` answer for `changeset`: the text written or the refusal, and the length given.
+  fn written(
+    changeset: &Changeset<'_>,
+  ) -> (Result<Vec<u8>, EncodeRefusal>, Result<u64, EncodeRefusal>) {
     let mut out = Vec::new();
-    encode(changeset, &mut out)?;
-    assert_eq!(
-      encoded_len(changeset),
-      Ok(u64::try_from(out.len()).unwrap())
-    );
-    Ok(out)
+    let text = encode(changeset, &mut out).map(|()| out);
+    (text, encoded_len(changeset))
+  }
+
+  /// The text `encode` writes for `changeset`, held to the length `encoded_len` gave.
+  fn written_text(changeset: &Changeset<'_>) -> Vec<u8> {
+    let (text, len) = written(changeset);
+    let text = text.unwrap();
+    assert_eq!(len, Ok(u64::try_from(text.len()).unwrap()));
+    text
   }
 
   /// A-588: do read a changeset with files and one without, as 7.2 writes them, and one whose timezone is empty, as a
@@ -500,7 +506,7 @@ mod tests {
     let no_zone = decode(&silly).unwrap();
     assert_eq!((no_zone.timezone, no_zone.extras), (&b""[..], None));
     for (text, changeset) in [(&with_files, read), (&without, empty), (&silly, no_zone)] {
-      assert_eq!(written(&changeset).as_ref(), Ok(text));
+      assert_eq!(&written_text(&changeset), text);
     }
   }
 
@@ -742,7 +748,11 @@ mod tests {
     /// A-588: do write extras of any bytes and read them back. Expect the same extras, sorted by key.
     #[test]
     fn any_extras_read_back(
-      generated in proptest::collection::btree_map("[a-z]{1,6}", proptest::collection::vec(any::<u8>(), 0..12), 0..4),
+      generated in proptest::collection::btree_map(
+        "[a-z]{1,6}",
+        proptest::collection::vec(any::<u8>(), 0..12),
+        0..4,
+      ),
     ) {
       let pairs: Vec<(&[u8], &[u8])> =
         generated.iter().map(|(key, value)| (key.as_bytes(), value.as_slice())).collect();
@@ -761,7 +771,8 @@ mod tests {
       let manifest = crate::fixtures::hex(&generated.manifest);
       let mut extras_field = Vec::new();
       if let Some(extras) = &generated.extras {
-        let pairs: Vec<(&[u8], &[u8])> = extras.iter().map(|(key, value)| (key.as_slice(), value.as_slice())).collect();
+        let pairs: Vec<(&[u8], &[u8])> =
+          extras.iter().map(|(key, value)| (key.as_slice(), value.as_slice())).collect();
         encode_extras(&pairs, &mut extras_field).unwrap();
       }
       let joined = generated.files.join(&b'\n');
@@ -774,17 +785,21 @@ mod tests {
         files: &joined,
         description: &generated.description,
       };
-      let text = written(&changeset).unwrap();
+      let text = written_text(&changeset);
       prop_assert_eq!(decode(&text), Ok(changeset));
     }
 
     /// AC-HG.9, A-588: do read arbitrary bytes as a changeset and its extras. Expect a refusal, or a changeset written
     /// back to exactly the same bytes; never a panic.
     #[test]
-    fn arbitrary_bytes_read_back_or_are_refused(bytes in proptest::collection::vec(any::<u8>(), 0..96)) {
+    fn arbitrary_bytes_read_back_or_are_refused(
+      bytes in proptest::collection::vec(any::<u8>(), 0..96),
+    ) {
       let text = [MANIFEST, b"\n", &bytes].concat();
       if let Ok(read) = decode(&text) {
-        prop_assert_eq!(written(&read), Ok(text.clone()));
+        let (again, len) = written(&read);
+        prop_assert_eq!(again, Ok(text.clone()));
+        prop_assert_eq!(len, Ok(crate::read::to_u64(text.len())));
         let mut buffer = Vec::new();
         let _extras = read.extras(&mut room(), &mut buffer).map(|extras| extras.len());
       }

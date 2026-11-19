@@ -462,7 +462,8 @@ impl HgIndex {
     log: Log<'_>,
     planned: &[Planned],
   ) -> Result<(), Refused> {
-    let mut rows: Vec<(Vec<u8>, &[ContentId], Vec<u8>)> = Vec::with_capacity(planned.len().saturating_mul(2));
+    let mut rows: Vec<(Vec<u8>, &[ContentId], Vec<u8>)> =
+      Vec::with_capacity(planned.len().saturating_mul(2));
     for revision in planned {
       rows.push((
         log.row_key(revision.rev),
