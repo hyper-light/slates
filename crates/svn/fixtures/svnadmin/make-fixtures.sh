@@ -5,17 +5,20 @@
 #
 # Each case records what svnadmin wrote to stdout and stderr and its exit status, as `<case>.out`, `<case>.err` and
 # `<case>.status`; a dump a case writes is `<case>.dump`. The cases:
-# - load-full: `svnadmin load` of full.dump into an empty repository (the progress lines), then its own dump, which must
-#   be full.dump again (`load-full.dump`);
-# - load-deltas: the same from deltas.dump (format 3), its dump `load-deltas.dump`;
-# - load-parts: part1.dump then part2.dump loaded one after the other (`load-parts-1`, `load-parts-2`), its dump;
-# - load-range: part1.dump, then full.dump with `-r 4:13` (revisions 0 to 3 skipped), its dump;
+# - load-full: `svnadmin load` of full.dump into an empty repository (the progress lines);
+# - load-deltas: the same from deltas.dump (format 3);
+# - load-parts: part1.dump then part2.dump loaded one after the other (`load-parts-1`, `load-parts-2`);
+# - load-range: part1.dump, then full.dump with `-r 4:13` (revisions 0 to 3 skipped);
+#   each of these four repositories' own `svnadmin dump` is full.dump again, byte for byte: `redumps.txt` holds each
+#   one's SHA-256 beside full.dump's, rather than four copies of it;
 # - load-parent: `svn mkdir --parents` of sub/dir (revision 1), then full.dump with `--parent-dir sub/dir`: every
-#   revision renumbered, copy sources and svn:mergeinfo moved and renumbered; its dump;
+#   revision renumbered, copy sources and svn:mergeinfo moved and renumbered; its dump's first revisions
+#   (`load-parent-early.dump`, 0 to 4) and, incrementally, the three that renumber and move svn:mergeinfo and a copy
+#   (`load-parent-late.dump`, 11 to 13);
 # - load-uuid-*: full.dump into a repository whose UUID is set first, with no option, `--ignore-uuid` and
 #   `--force-uuid`; each dump's UUID record is what the option decided;
-# - dump-r6-8 and dump-r6-8-incremental, dump-r8-13, dump-r13: ranges, the first revision of a range that is not
-#   incremental a whole tree in the order `svn_repos_dir_delta2` walks it;
+# - dump-r3-6, dump-r3-6-incremental and dump-r5: ranges, the first revision of a range that is not incremental a
+#   whole tree in the order `svn_repos_dir_delta2` walks it (kept before revision 7, whose text would double each);
 # - dump-quiet: `svnadmin dump -q`, which writes nothing to stderr;
 # - errors: `dump -r 20` (past the youngest), `dump -r 5:3`, a second load of full.dump into the loaded repository (its
 #   first record conflicts), a load of a cut dump, and a load of a dump whose text checksum is wrong.
@@ -69,28 +72,26 @@ fresh() {
 
 R=$(fresh full)
 load load-full "$DUMPS/full.dump" "$R"
-svnadmin dump -q "$R" > "$OUT/load-full.dump"
-
 D=$(fresh deltas)
 load load-deltas "$DUMPS/deltas.dump" "$D"
-svnadmin dump -q "$D" > "$OUT/load-deltas.dump"
-
 P=$(fresh parts)
 load load-parts-1 "$DUMPS/part1.dump" "$P"
 load load-parts-2 "$DUMPS/part2.dump" "$P"
-svnadmin dump -q "$P" > "$OUT/load-parts.dump"
-
 G=$(fresh range)
 load load-range-1 "$DUMPS/part1.dump" "$G"
 load load-range-2 "$DUMPS/full.dump" -r 4:13 "$G"
-svnadmin dump -q "$G" > "$OUT/load-range.dump"
+for repo in full deltas parts range; do
+  printf '%s %s\n' "$repo" "$(svnadmin dump -q "$WORK/$repo" | shasum -a 256 | cut -d' ' -f1)"
+done > "$OUT/redumps.txt"
+printf 'full.dump %s\n' "$(shasum -a 256 < "$DUMPS/full.dump" | cut -d' ' -f1)" >> "$OUT/redumps.txt"
 
 N=$(fresh parent)
 svn mkdir -q --parents -m 'the parent directory' "file://$N/sub/dir"
 printf '2005-04-07T22:12:59.000000Z' > "$WORK/date1"
 svnadmin setrevprop -r 1 "$N" svn:date "$WORK/date1"
 load load-parent "$DUMPS/full.dump" --parent-dir sub/dir "$N"
-svnadmin dump -q "$N" > "$OUT/load-parent.dump"
+svnadmin dump -q -r 0:4 "$N" > "$OUT/load-parent-early.dump"
+svnadmin dump -q -r 11:13 --incremental "$N" > "$OUT/load-parent-late.dump"
 
 for option in default ignore force; do
   U=$(fresh "uuid-$option" "$OTHER_UUID")
@@ -101,12 +102,11 @@ for option in default ignore force; do
   svnadmin dump -q -r 0 "$U" > "$OUT/load-uuid-$option.dump"
 done
 
-run dump-r6-8 dump -r 6:8 "$R"
-run dump-r6-8-incremental dump -r 6:8 --incremental "$R"
-run dump-r8-13 dump -r 8:13 "$R"
-run dump-r13 dump -r 13 "$R"
+run dump-r3-6 dump -r 3:6 "$R"
+run dump-r3-6-incremental dump -r 3:6 --incremental "$R"
+run dump-r5 dump -r 5 "$R"
 run dump-quiet dump -q -r 0:2 "$R"
-for name in dump-r6-8 dump-r6-8-incremental dump-r8-13 dump-r13 dump-quiet; do
+for name in dump-r3-6 dump-r3-6-incremental dump-r5 dump-quiet; do
   mv "$OUT/$name.out" "$OUT/$name.dump"
 done
 
