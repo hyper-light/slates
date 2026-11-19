@@ -1,0 +1,1 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 42:svn://127.0.0.1:58678/r/trunk/with%20space 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( CRAM-MD5 ( ) ) 40:jrandom 9c4d64d820d9f451c310e561c79ad6d7 ( lock-many ( ( ) false ( ( 5:b.txt ( 2 ) ) ) ) ) 

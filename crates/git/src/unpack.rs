@@ -369,6 +369,8 @@ pub struct Reader<'index, L: Locate + ?Sized = NoIndex> {
   partial: Vec<u8>,
   /// The objects the header counts that have not yet begun.
   remaining: u32,
+  /// The objects the header counts, once its twelve bytes are in.
+  objects: Option<u32>,
   /// Every entry read, in pack order.
   entries: Vec<Record>,
 }
@@ -385,6 +387,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       stage: Stage::PackHeader,
       partial: Vec::new(),
       remaining: 0,
+      objects: None,
       entries: Vec::new(),
     }
   }
@@ -403,6 +406,21 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       };
       used = used.saturating_add(took);
     }
+  }
+
+  /// The hash the pack's objects and trailer are in.
+  pub fn format(&self) -> ObjectFormat {
+    self.format
+  }
+
+  /// The objects the pack's header counts, once its twelve bytes have been read.
+  pub fn objects(&self) -> Option<u32> {
+    self.objects
+  }
+
+  /// Whether the pack is whole: its trailer read, and it holds.
+  pub fn is_whole(&self) -> bool {
+    matches!(self.stage, Stage::Done(_))
   }
 
   /// Ends the pack: refused unless its trailer has been read; then resolves the waiting deltas and answers every object
@@ -490,6 +508,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     charge_items::<Record>(admission, count)?;
     reserve(&mut self.entries, count)?;
     self.remaining = header.objects;
+    self.objects = Some(header.objects);
     self.stage = self.after_entry();
     Ok(take)
   }
