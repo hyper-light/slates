@@ -62,21 +62,21 @@ use crate::wire::{Reader, WireRefusal, put_byte, put_string, put_uint32};
 pub const DISCONNECT: u8 = 1;
 /// `SSH_MSG_IGNORE`.
 pub const IGNORE: u8 = 2;
-/// `SSH_MSG_UNIMPLEMENTED`.
+/// Format: `SSH_MSG_UNIMPLEMENTED`.
 pub const UNIMPLEMENTED: u8 = 3;
-/// `SSH_MSG_DEBUG`.
+/// Format: `SSH_MSG_DEBUG`.
 pub const DEBUG: u8 = 4;
-/// `SSH_MSG_SERVICE_REQUEST`.
+/// Format: `SSH_MSG_SERVICE_REQUEST`.
 pub const SERVICE_REQUEST: u8 = 5;
-/// `SSH_MSG_SERVICE_ACCEPT`.
+/// Format: `SSH_MSG_SERVICE_ACCEPT`.
 pub const SERVICE_ACCEPT: u8 = 6;
-/// `SSH_MSG_NEWKEYS`.
+/// Format: `SSH_MSG_NEWKEYS`.
 pub const NEWKEYS: u8 = 21;
-/// The first number of the key exchange methods' own messages (RFC 4250 §4.1.2: 30 to 49).
+/// Format: the first number of the key exchange methods' own messages (RFC 4250 §4.1.2: 30 to 49).
 pub const FIRST_KEX_METHOD: u8 = 30;
-/// The last.
+/// Format: the last.
 pub const LAST_KEX_METHOD: u8 = 49;
-/// The first number of the layers above the transport (RFC 4250 §4.1.2: 50 and up).
+/// Format: the first number of the layers above the transport (RFC 4250 §4.1.2: 50 and up).
 pub const FIRST_UPPER_LAYER: u8 = 50;
 /// The service the server runs (RFC 4252 §1).
 pub const USERAUTH_SERVICE: &str = "ssh-userauth";
