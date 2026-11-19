@@ -26,7 +26,9 @@
 //! **The drive.** [`Drive`] walks the report and the two revisions as `reporter.c` does, over the
 //! index (A-553) for every node's identity, kind, created revision, text and property list, the
 //! green ([`Repository`]) for directories' entries, property lists, revision properties and texts,
-//! the session's [`Guards`] for its locks, and the rules its principal reads by ([`Sources::rules`],
+//! A-602's lock table for the locks held ([`Sources::locks`] at [`Sources::now`], the one record of
+//! a repository's locks, which a commit's and the lock verbs' checks read too), and the rules its
+//! principal reads by ([`Sources::rules`],
 //! the session's one read rule, which its read commands ask too). Its walk is an explicit stack of
 //! frames, never recursion, so the depth of a path is data, not stack: the
 //! anchor, each directory being compared (`delta_dirs`), each file being sent (`delta_files`). The
@@ -63,6 +65,7 @@ use crate::index::{
   ContentIdentity, Index, IndexRefusal, Node, NodeId, NodeKind, NodeRevisionId, PropertyList,
   Revision, Text,
 };
+use crate::lock::{AprTime, LockTable};
 use crate::reads::Repository;
 use crate::svndiff::{Instruction, WINDOW_LIMIT, Window, deltas};
 use std::collections::{BTreeMap, VecDeque};
@@ -215,13 +218,6 @@ const SVN_ERR_FS_NOT_FOUND: u32 = 160_013;
 /// `SVN_ERR_AUTHZ_ROOT_UNREADABLE`, for an edit whose root the principal may not read.
 /// Format: the authorization category's start, 220,000, plus 0 (`svn_error_codes.h`).
 const SVN_ERR_AUTHZ_ROOT_UNREADABLE: u32 = 220_000;
-
-/// What a drive asks of the session beyond the repository and its read rules: the locks held now
-/// (§4.17.4 item 10).
-pub trait Guards {
-  /// The token of the lock held on `path` now (`svn_fs_get_lock`); none when it is not locked.
-  fn lock_token(&self, path: &str) -> Option<&[u8]>;
-}
 
 /// A refusal the drive met, answered after its [`Call::AbortEdit`]: Subversion's error number and
 /// its message as the C code formats it.
@@ -583,15 +579,19 @@ enum Frame {
   File(Box<FileFrame>),
 }
 
-/// What a drive reads: the index, the green, the session's guards and its read rules.
+/// What a drive reads: the index, the green, the repository's locks at an instant and the session's
+/// read rules.
 #[derive(Debug)]
-pub struct Sources<'s, R: ?Sized, G: ?Sized> {
+pub struct Sources<'s, R: ?Sized> {
   /// The index (A-553).
   pub index: &'s Index,
   /// The green: entries, property lists, revision properties and texts.
   pub repository: &'s R,
-  /// The session's locks.
-  pub guards: &'s G,
+  /// The repository's lock table (A-602, §4.17.4 item 7), the one record of its locks: the drive
+  /// reads a held lock's token there (`svn_fs_get_lock`).
+  pub locks: &'s LockTable,
+  /// The owner's instant at this call, at which a lock is judged expired or not.
+  pub now: AprTime,
   /// The rules the session's principal reads by (A-606), the ones its read commands ask, compiled once
   /// for the principal by the connection: [`may_read`] judges every path the drive reads by them
   /// (`authz_check_access_cb`). None where the repository names no authorization file, and then
@@ -670,9 +670,9 @@ impl Drive {
 
   /// The next call, made within `steps` steps of the walk; [`Next::Paused`] when they are spent
   /// first, [`Next::Ended`] after the last call.
-  pub fn next<R: Repository + ?Sized, G: Guards + ?Sized>(
+  pub fn next<R: Repository + ?Sized>(
     &mut self,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     steps: usize,
   ) -> Next<'_> {
     self.current = None;
@@ -707,10 +707,7 @@ impl Drive {
   }
 
   /// One step of the walk.
-  fn step<R: Repository + ?Sized, G: Guards + ?Sized>(
-    &mut self,
-    sources: &Sources<'_, R, G>,
-  ) -> Result<(), DriveFailure> {
+  fn step<R: Repository + ?Sized>(&mut self, sources: &Sources<'_, R>) -> Result<(), DriveFailure> {
     match self.frames.pop() {
       None if !self.started => self.start(sources),
       None => {
@@ -728,9 +725,9 @@ impl Drive {
   }
 
   /// `drive`: the anchor checked, the target revision and the root, then the target compared.
-  fn start<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn start<R: Repository + ?Sized>(
     &mut self,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     self.started = true;
     let info = self.target_info.take().ok_or_else(DriveFailure::corrupt)?;
@@ -815,10 +812,10 @@ impl Drive {
 
   /// The target compared within the root: as a directory when the anchor is the target, else as
   /// one entry of the anchor, whose close follows it.
-  fn enter_target<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn enter_target<R: Repository + ?Sized>(
     &mut self,
     entry: EntryUpdate,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     if self.operand.is_empty() {
       let start_empty = entry.info.as_ref().is_some_and(|info| info.start_empty);
@@ -836,10 +833,10 @@ impl Drive {
   }
 
   /// One step of a directory's comparison.
-  fn step_directory<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn step_directory<R: Repository + ?Sized>(
     &mut self,
     directory: DirectoryFrame,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     match directory.phase {
       DirectoryPhase::Properties => self.directory_properties(directory, sources),
@@ -855,10 +852,10 @@ impl Drive {
 
   /// `delta_dirs`' start: the properties compared, all of them when the directory starts empty,
   /// then both revisions' entries read when the depth asked reaches them.
-  fn directory_properties<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn directory_properties<R: Repository + ?Sized>(
     &mut self,
     mut directory: DirectoryFrame,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let source = (!directory.start_empty)
       .then_some(directory.s_path.as_deref())
@@ -880,10 +877,10 @@ impl Drive {
 
   /// `delta_dirs`' report loop, one path beneath the directory at a time: a reported deletion only
   /// noted, every other path updated, its name then done in both revisions' entries.
-  fn report_entry<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn report_entry<R: Repository + ?Sized>(
     &mut self,
     mut directory: DirectoryFrame,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let Some((name, info)) = self.fetch_path_info(&directory.e_path) else {
       directory.phase = DirectoryPhase::Deletions;
@@ -908,10 +905,10 @@ impl Drive {
 
   /// `delta_dirs`' deletions, one source entry at a time in name order: each the target no longer
   /// holds, within the working copy's depth, deleted with the revision it was deleted in.
-  fn deletion<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn deletion<R: Repository + ?Sized>(
     &mut self,
     mut directory: DirectoryFrame,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let next = match &directory.deleted_after {
       None => directory.s_entries.iter().next(),
@@ -947,10 +944,10 @@ impl Drive {
 
   /// `delta_dirs`' target loop, one entry the report did not name at a time in name order: each
   /// within the depths updated, its source forgotten when the working copy is being made deeper.
-  fn target_entry<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn target_entry<R: Repository + ?Sized>(
     &mut self,
     mut directory: DirectoryFrame,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let Some((name, t_entry)) = directory.t_entries.pop_first() else {
       directory.phase = DirectoryPhase::Close;
@@ -967,10 +964,10 @@ impl Drive {
 
   /// `update_entry`: the source and target followed where the report sends them, the entry left
   /// alone when nothing changed, deleted when unrelated, then made absent, opened or added.
-  fn update_entry<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn update_entry<R: Repository + ?Sized>(
     &mut self,
     mut entry: EntryUpdate,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     self.follow_report(&mut entry, sources)?;
     if entry.s_path.is_some() && entry.s_entry.is_none() {
@@ -1011,10 +1008,10 @@ impl Drive {
 
   /// `update_entry`'s following of the report: a link's target outside a switch, and the reported
   /// revision and link for the source.
-  fn follow_report<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn follow_report<R: Repository + ?Sized>(
     &self,
     entry: &mut EntryUpdate,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let Some(info) = entry.info.as_ref() else {
       return Ok(());
@@ -1043,10 +1040,10 @@ impl Drive {
 
   /// `update_entry`'s relation of source and target: none when the entry needs nothing, else
   /// whether the two are related.
-  fn relate<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn relate<R: Repository + ?Sized>(
     &self,
     entry: &EntryUpdate,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Option<bool> {
     let (Some(source), Some(target)) = (entry.s_entry, entry.t_entry) else {
       return Some(false);
@@ -1071,10 +1068,10 @@ impl Drive {
 
   /// Whether an unchanged entry needs nothing: unreported, or reported with its entries and with no
   /// lock token, or with the token of the lock held now.
-  fn left_alone<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn left_alone<R: Repository + ?Sized>(
     &self,
     entry: &EntryUpdate,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> bool {
     match &entry.info {
       None => true,
@@ -1082,16 +1079,16 @@ impl Drive {
       Some(info) => info
         .lock_token
         .as_deref()
-        .is_none_or(|token| sources.guards.lock_token(&entry.t_path) == Some(token)),
+        .is_none_or(|token| held_token(sources, &entry.t_path) == Some(token)),
     }
   }
 
   /// `update_entry`'s deletion of a source unrelated to its target, with the revision it was
   /// deleted in, or the one before the target's when the path still holds a node.
-  fn delete_unrelated<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn delete_unrelated<R: Repository + ?Sized>(
     &mut self,
     entry: &EntryUpdate,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let deleted = history::deleted_revision(
       sources.index,
@@ -1135,12 +1132,12 @@ impl Drive {
 
   /// A file opened when related, else added (`add_file_smartly`, with its copy source when the
   /// client asked for them), then sent against its source or its copy source.
-  fn enter_file<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn enter_file<R: Repository + ?Sized>(
     &mut self,
     entry: EntryUpdate,
     t_entry: Dirent,
     related: bool,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let facts = t_entry.facts(&entry.t_path);
     let (s_rev, s_path) = if related {
@@ -1178,10 +1175,10 @@ impl Drive {
 
   /// `add_file_smartly`'s copy source: the file's own copy, when the client asked for copy sources
   /// and may read the source.
-  fn copy_source<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn copy_source<R: Repository + ?Sized>(
     &self,
     t_path: &str,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<Option<(String, Revision)>, DriveFailure> {
     if !self.send_copyfrom_args {
       return Ok(None);
@@ -1203,10 +1200,10 @@ impl Drive {
   }
 
   /// One step of a file's sending.
-  fn step_file<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn step_file<R: Repository + ?Sized>(
     &mut self,
     mut file: FileFrame,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     match file.phase {
       FilePhase::Properties => {
@@ -1237,10 +1234,10 @@ impl Drive {
 
   /// `delta_files`' text: none when the source's is the same, else the delta begun against the
   /// source's MD5, its windows next when the client asked for texts.
-  fn text<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn text<R: Repository + ?Sized>(
     &mut self,
     file: &mut FileFrame,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let base = match file.s_path.as_deref() {
       Some(s_path) => {
@@ -1267,10 +1264,10 @@ impl Drive {
   /// [`WINDOW_LIMIT`] bytes made from the source's piece at the same place, by Subversion's
   /// deltifier ([`deltas`]), or as new data once the source has run out, its view where the source
   /// ended; at the text's end, the delta's end next.
-  fn window<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn window<R: Repository + ?Sized>(
     &mut self,
     file: &mut FileFrame,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
   ) -> Result<(), DriveFailure> {
     let Some(text) = file.target.text.filter(|text| file.sent < text.size) else {
       file.phase = FilePhase::End;
@@ -1293,9 +1290,9 @@ impl Drive {
 
   /// `delta_proplists`: the entry properties, the lock token's removal when the lock is gone, then
   /// the node's own properties against the source's, or all of them when there is no source.
-  fn properties<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn properties<R: Repository + ?Sized>(
     &mut self,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     s_rev: Revision,
     s_path: Option<&str>,
     t_path: &str,
@@ -1305,7 +1302,7 @@ impl Drive {
       dirent(sources, t_path, self.target_revision)?.ok_or_else(DriveFailure::corrupt)?;
     self.entry_properties(sources, target.created, s_path.is_some())?;
     if let Some(token) = lock_token
-      && sources.guards.lock_token(t_path) != Some(token)
+      && held_token(sources, t_path) != Some(token)
     {
       self
         .pending
@@ -1330,9 +1327,9 @@ impl Drive {
 
   /// The entry properties of a node created in `created`: its revision, then that revision's date
   /// and author (each removed when the revision has none and a source holds one), then the UUID.
-  fn entry_properties<R: Repository + ?Sized, G: Guards + ?Sized>(
+  fn entry_properties<R: Repository + ?Sized>(
     &mut self,
-    sources: &Sources<'_, R, G>,
+    sources: &Sources<'_, R>,
     created: Revision,
     has_source: bool,
   ) -> Result<(), DriveFailure> {
@@ -1519,9 +1516,18 @@ fn target_update(directory: &DirectoryFrame, name: &str, t_entry: Dirent) -> Opt
   })
 }
 
+/// The token of the lock held on `path` at the sources' instant (`svn_fs_get_lock`: an expired lock
+/// is none), read from A-602's lock table.
+fn held_token<'s, R: ?Sized>(sources: &Sources<'s, R>, path: &str) -> Option<&'s [u8]> {
+  sources
+    .locks
+    .get_lock(path, sources.now)
+    .map(|lock| lock.token.as_str().as_bytes())
+}
+
 /// The node at `path` in `revision` as an entry; none when absent there or out of canonical form.
-fn dirent<R: ?Sized, G: ?Sized>(
-  sources: &Sources<'_, R, G>,
+fn dirent<R: ?Sized>(
+  sources: &Sources<'_, R>,
   path: &str,
   revision: Revision,
 ) -> Result<Option<Dirent>, DriveFailure> {
@@ -1529,8 +1535,8 @@ fn dirent<R: ?Sized, G: ?Sized>(
 }
 
 /// The entries of the directory at `path` in `revision`, by name (`svn_fs_dir_entries`).
-fn entries<R: Repository + ?Sized, G: ?Sized>(
-  sources: &Sources<'_, R, G>,
+fn entries<R: Repository + ?Sized>(
+  sources: &Sources<'_, R>,
   path: &str,
   revision: Revision,
 ) -> Result<BTreeMap<String, Dirent>, DriveFailure> {
