@@ -1901,6 +1901,7 @@ dependencies = [
  "slates-conformance",
  "slates-db",
  "slates-git",
+ "slates-hg",
  "slates-http",
  "slates-http-edge",
  "slates-image",
@@ -1911,6 +1912,8 @@ dependencies = [
  "slates-merge",
  "slates-rt",
  "slates-seal",
+ "slates-ssh",
+ "slates-svn",
  "slates-test-seeds",
  "slates-transport",
  "slates-vcs",
@@ -1939,6 +1942,7 @@ dependencies = [
  "md-5",
  "proptest",
  "slates-test-seeds",
+ "unicode-normalization",
 ]
 
 [[package]]

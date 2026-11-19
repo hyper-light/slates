@@ -13,6 +13,9 @@ relay between the two before it forwards it:
 - Stock sessions run `svn` with an empty configuration directory, non-interactive, no authentication cache.
 - Scripted sessions send the stock client's own greeting and ANONYMOUS answer (taken from the first stock session), then
   exact commands, the server's refusals among them, and close their sending half; the server answers each in turn.
+  `get-file-revs-svndiff0` sends the greeting without `svndiff1` and `accepts-svndiff2`, so its deltas are svndiff 0.
+- A second repository, `locked` (`svnadmin hotcopy` of the first), names an authorization file (`AUTHZ_RULES`, written
+  beside the transcripts as `authz`) and no password database; the `locked-*` sessions read it as an anonymous user.
 - A-613 part 2 added revisions 8 to 11 (a 10,000-byte text and its change, an empty text, a name in capitals, a path
   added again after its deletion, a file replaced by a copy, a revision without an author, mergeinfo taken away) and
   the sessions of get-file, list, get-location-segments, get-deleted-rev, log (with merged revisions) and
@@ -190,6 +193,17 @@ def make_repository(root):
     run(["svnadmin", "setrevprop", path, "-r", "0", "svn:date", date])
     with open(os.path.join(path, "conf", "svnserve.conf"), "w") as handle:
         handle.write("[general]\nanon-access = read\nauth-access = write\n")
+
+
+def make_locked_repository(root):
+    """The repository at ROOT/LOCKED: a hot copy of ROOT/REPOSITORY, the same history and identity, serving AUTHZ_RULES
+    to anonymous readers with no password database."""
+    path = os.path.join(root, LOCKED)
+    run(["svnadmin", "hotcopy", os.path.join(root, REPOSITORY), path])
+    with open(os.path.join(path, "conf", "authz"), "w") as handle:
+        handle.write(AUTHZ_RULES)
+    with open(os.path.join(path, "conf", "svnserve.conf"), "w") as handle:
+        handle.write("[general]\nanon-access = read\nauth-access = write\nauthz-db = authz\n")
 
 
 class Relay:
@@ -501,6 +515,104 @@ SCRIPTED = {
     ],
 }
 
+# Scripted sessions of a client that takes svndiff 0 alone: the stock greeting without `svndiff1` and
+# `accepts-svndiff2`, so `svnserve` writes every delta uncompressed (`svn_ra_svn__svndiff_version`) and the tests hold
+# its strings byte for byte, `send_simple_insertion_window`'s among them.
+SCRIPTED_SVNDIFF0 = {
+    "get-file-revs-svndiff0": [
+        command("get-file-revs", b"trunk/a.txt", (0,), (11,)),
+        command("get-file-revs", b"trunk/a.txt", (0,), (11,), "true"),
+        command("get-file-revs", b"trunk/big.txt", (0,), (11,)),
+        command("get-file-revs", b"trunk/empty.txt", (), ()),
+        command("get-file-revs", b"trunk/a.txt", (11,), (0,)),
+    ],
+}
+
+# A-613 part 2, read access (A-606): a second repository holding the same history (`svnadmin hotcopy`), served to
+# anonymous readers under an authorization file and no password database, so a path the rules hide is refused or left
+# out as `svnserve` refuses or leaves it out, never asked to authenticate.
+LOCKED = "locked"
+LOCKED_URL = "svn://127.0.0.1:%d/%s" % (PORT, LOCKED)
+# The rules, in Subversion's authz syntax: the root hidden, and `/branches` with it; `/trunk` readable but its `dir`
+# hidden, save `dir/b.txt`; `/tags` readable. Written beside the transcripts as `authz`, which the tests compile.
+AUTHZ_RULES = (
+    "[/]\n* =\n\n"
+    "[/trunk]\n* = r\n\n"
+    "[/trunk/dir]\n* =\n\n"
+    "[/trunk/dir/b.txt]\n* = r\n\n"
+    "[/tags]\n* = r\n"
+)
+
+# Scripted sessions against LOCKED: the stock greeting naming LOCKED_URL, then the commands. A revision's readability:
+# 1, 7 and 9 in part (a hidden changed path beside readable ones), 3 and 4 not at all, the rest whole.
+SCRIPTED_LOCKED = {
+    "locked-reads": [
+        command("rev-proplist", 1),
+        command("rev-proplist", 4),
+        command("rev-proplist", 9),
+        command("rev-proplist", 0),
+        command("rev-prop", 4, b"svn:author"),
+        command("rev-prop", 9, b"svn:log"),
+        command("rev-prop", 9, b"svn:author"),
+        command("check-path", b"trunk/dir", ()),
+        command("check-path", b"trunk/dir/b.txt", ()),
+        command("stat", b"branches", ()),
+        command("stat", b"trunk/dir/b.txt", ()),
+        command("get-dir", b"trunk", (), "true", "true"),
+        command("get-dir", b"", (), "false", "true"),
+        command("get-dir", b"tags/t1", (11,), "false", "true", ("kind",), "true"),
+        command("get-file", b"trunk/dir/b.txt", (), "true", "false", "true"),
+        command("get-file", b"branches/b1/a.txt", (), "true", "false"),
+        command("get-iprops", b"trunk/dir/b.txt", (11,)),
+        command("get-iprops", b"trunk/dir", (11,)),
+        command("get-mergeinfo", (b"trunk", b"branches/b1", b"tags/t1"), (), "inherited", "false"),
+        command("get-mergeinfo", (b"branches/b1",), (), "inherited", "false"),
+        command("get-locations", b"tags/t1/dir", 11, (11, 7, 5, 1)),
+        command("get-locations", b"branches/b1/a.txt", 11, (11, 9)),
+        command("get-locations", b"branches/b1/a.txt", 99, (11,)),
+        command("get-location-segments", b"tags/t1/dir", (11,), (11,), (0,)),
+        command("get-location-segments", b"branches/b1", (11,), (11,), (0,)),
+        command("list", b"trunk", (), "infinity", ("kind",)),
+        command("list", b"tags", (), "infinity", ("kind",)),
+        command("get-deleted-rev", b"branches/b1/a.txt", 4, 11),
+        command("get-latest-rev"),
+    ],
+    "locked-log": [
+        command("log", (b"trunk",), (11,), (0,), "true", "false", 0, "false", "all-revprops", ()),
+        command("log", (b"trunk",), (0,), (11,), "true", "false", 0, "false", "revprops", (b"svn:author", b"svn:log")),
+        command("log", (b"",), (11,), (0,), "false", "false", 0, "false", "all-revprops", ()),
+        command("log", (b"trunk/dir",), (11,), (0,), "true", "false", 0, "false", "all-revprops", ()),
+        command("log", (b"tags/t1/dir",), (11,), (0,), "true", "false", 0, "false", "all-revprops", ()),
+        command("log", (b"trunk",), (11,), (0,), "false", "false", 0, "true", "all-revprops", ()),
+        command("log", (b"trunk/dir/b.txt",), (11,), (0,), "true", "true", 0, "true", "all-revprops", ()),
+        command("get-latest-rev"),
+    ],
+    "locked-file-revs": [
+        command("get-file-revs", b"trunk/a.txt", (0,), (11,), "true"),
+        command("get-file-revs", b"tags/t1/dir/b.txt", (0,), (11,)),
+        command("get-file-revs", b"trunk/a.txt", (11,), (0,)),
+        command("get-latest-rev"),
+    ],
+    # The file's first location hidden: `svn_repos_get_file_revs2` asserts its mainline is not empty, and `svnserve`
+    # sets no malfunction handler, so the process aborts and the connection ends with nothing written for the command:
+    # the authentication request is still in the unflushed buffer.
+    "locked-file-revs-abort": [
+        command("get-file-revs", b"branches/b1/a.txt", (0,), (11,)),
+        command("get-latest-rev"),
+    ],
+}
+
+# Stock sessions against LOCKED.
+STOCK_LOCKED = {
+    "locked-svn-ls": [["ls", "-v", "-R", LOCKED_URL + "/trunk"]],
+    "locked-svn-log": [["log", "-v", LOCKED_URL + "/trunk"]],
+    "locked-svn-log-g": [["log", "-g", LOCKED_URL + "/trunk"]],
+    "locked-svn-blame-g": [["blame", "-g", LOCKED_URL + "/trunk/a.txt"]],
+    "locked-svn-cat": [["cat", LOCKED_URL + "/trunk/dir/b.txt"]],
+    "locked-svn-cat-denied": [["cat", LOCKED_URL + "/branches/b1/a.txt"]],
+    "locked-svn-proplist": [["proplist", "-v", "--show-inherited-props", LOCKED_URL + "/trunk/dir/b.txt"]],
+}
+
 # Stock sessions: each a list of `svn` argument lists, run one after another.
 STOCK = {
     "svn-info": [["info", URL]],
@@ -534,11 +646,12 @@ def main():
     config = os.path.join(workdir, "config")
     os.makedirs(config)
     make_repository(root)
+    make_locked_repository(root)
     relay = Relay(root)
     sessions = []
     written = []
     greeting = None
-    for name, commands in STOCK.items():
+    for name, commands in list(STOCK.items()) + list(STOCK_LOCKED.items()):
         for arguments in commands:
             done = subprocess.run(
                 ["svn", "--config-dir", config, "--non-interactive", "--no-auth-cache"] + arguments,
@@ -550,9 +663,14 @@ def main():
                 greeting = bytes(record["client"])
             written += write_pair(outdir, "%s.%d" % (name, number), record)
     opening = opening_items(greeting)
-    for name, commands in SCRIPTED.items():
+    scripted = [(opening, name, commands) for name, commands in SCRIPTED.items()]
+    plain = svndiff0_opening(opening)
+    scripted += [(plain, name, commands) for name, commands in SCRIPTED_SVNDIFF0.items()]
+    locked = locked_opening(opening)
+    scripted += [(locked, name, commands) for name, commands in SCRIPTED_LOCKED.items()]
+    for first, name, commands in scripted:
         peer = socket.create_connection(("127.0.0.1", PORT), timeout=STEP_SECONDS)
-        peer.sendall(opening + b"".join(commands))
+        peer.sendall(first + b"".join(commands))
         peer.shutdown(socket.SHUT_WR)
         while peer.recv(CHUNK):
             pass
@@ -563,6 +681,7 @@ def main():
     relay.listener.close()
     write(outdir, "sessions.txt", ("\n".join(sessions) + "\n").encode(), written)
     write(outdir, "repository.txt", repository_record().encode(), written)
+    write(outdir, "authz", AUTHZ_RULES.encode(), written)
     versions = run(["svn", "--version", "--quiet"]).stdout + run(["svnserve", "--version", "--quiet"]).stdout
     write(outdir, "subversion-version.txt", versions, written)
     sums = "".join("%s  %s\n" % (digest, name) for name, digest in sorted(written))
@@ -612,6 +731,28 @@ def opening_items(greeting):
     if b"ANONYMOUS" not in opening[first:]:
         sys.exit("the stock client's second item is not ANONYMOUS: %r" % opening)
     return opening
+
+
+def locked_opening(opening):
+    """The stock client's opening with its greeting's URL, a counted string, naming LOCKED_URL instead of URL."""
+    first = item_end(opening, 0)
+    greeting = opening[:first]
+    named = b"%d:%s " % (len(URL), URL.encode())
+    if greeting.count(named) != 1:
+        sys.exit("the stock greeting does not name %r once: %r" % (URL, greeting))
+    greeting = greeting.replace(named, b"%d:%s " % (len(LOCKED_URL), LOCKED_URL.encode()))
+    return greeting + opening[first:]
+
+
+def svndiff0_opening(opening):
+    """The stock client's opening with `svndiff1` and `accepts-svndiff2` taken from its greeting's capability words."""
+    first = item_end(opening, 0)
+    greeting = opening[:first]
+    for word in (b" svndiff1 ", b" accepts-svndiff2 "):
+        if greeting.count(word) != 1:
+            sys.exit("the stock greeting does not announce %r once: %r" % (word, greeting))
+        greeting = greeting.replace(word, b" ")
+    return greeting + opening[first:]
 
 
 def write_pair(outdir, stem, record):

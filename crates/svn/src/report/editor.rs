@@ -10,11 +10,16 @@
 //! - **Absent entries** are written only to a client that announced `absent-entries`; to any other
 //!   nothing is written, as `ra_svn_absent_dir` and `ra_svn_absent_file` skip them.
 //! - **A text delta** is `apply-textdelta`, then the svndiff stream as `textdelta-chunk`s, then
-//!   `textdelta-end`. The stream's four-byte header is one chunk, written at its first window or,
-//!   with none, at its end (`svndiff.c` `window_handler` writes it on its first call, the last
-//!   one's empty window included). Each window is up to three chunks, as `window_handler`'s three
-//!   stream writes make them: its integers, then its instruction section and its new-data section,
-//!   each when it is not empty.
+//!   `textdelta-end`, the chunks as `svndiff.c`'s stream writes make them (`d434dc14` and 1.15.0
+//!   alike). A version-0 window of new data alone, no source copy and one instruction, is
+//!   `send_simple_insertion_window`'s (89-151, chosen at 259-261): the stream's four-byte header,
+//!   when it is not out yet, its integers and its instruction as one chunk, then its new data.
+//!   Every other window is `window_handler`'s (250-303): the header as a chunk of its own when it
+//!   is not out yet, then up to three chunks, its integers, its instruction section and its
+//!   new-data section, each when it is not empty. A delta with no window has the header alone at
+//!   its end (the last call's empty window writes it). `DeltaWrites` is the one writer of these
+//!   writes: `get-file-revs` sends its deltas through it too, a string for each write, as
+//!   `svnserve` does (`crate::reads`, A-613; A-616 continued (7)).
 //! - **The svndiff version** is 2, each section LZ4 when that is shorter, to a client that accepts
 //!   it; 0 to any other (`svn_ra_svn__svndiff_version`). Never 1, which is zlib: slates sends no
 //!   zlib, and every client takes 0 (A-500).
@@ -34,7 +39,9 @@ use super::drive::Call;
 use crate::handshake::ClientCapabilities;
 use crate::index::{NodeKind, Revision};
 use crate::ra_svn::{self, ItemError, Value};
-use crate::svndiff::{Compression, Encoder, INTEGER_LIMIT, SvndiffError, Version, Window};
+use crate::svndiff::{
+  Compression, Encoder, HEADER_LEN, INTEGER_LIMIT, Instruction, SvndiffError, Version, Window,
+};
 
 /// The first letter of a directory's token.
 /// Format: `editorp.c`'s `make_token('d', ...)` in `ra_svn_open_root`, `ra_svn_add_dir` and
@@ -194,15 +201,6 @@ struct OpenNode {
   token: String,
 }
 
-/// The text delta being written.
-#[derive(Clone, Debug)]
-struct Delta {
-  /// The svndiff encoder, which holds the previous window's source view.
-  encoder: Encoder,
-  /// Whether the stream's header chunk is written.
-  header_written: bool,
-}
-
 /// Writes one drive's calls as ra_svn's editor commands, holding the tokens of the nodes open.
 #[derive(Clone, Debug)]
 pub struct EditorWriter {
@@ -218,8 +216,8 @@ pub struct EditorWriter {
   next_token: u64,
   /// The nodes open now, the innermost last.
   open: Vec<OpenNode>,
-  /// The text delta being written, if any.
-  delta: Option<Delta>,
+  /// The text delta being written, if any: its svndiff stream's writes.
+  delta: Option<DeltaWrites>,
   /// Where the edit stands.
   phase: Phase,
   /// One window's encoding, kept between windows.
@@ -446,15 +444,12 @@ impl EditorWriter {
     }
     out.extend_from_slice(END_LIST);
     out.extend_from_slice(END_COMMAND);
-    self.delta = Some(Delta {
-      encoder: Encoder::new(self.version),
-      header_written: false,
-    });
+    self.delta = Some(DeltaWrites::new(self.version));
     Ok(())
   }
 
-  /// One window of the open delta: the stream's header first if it is not out, then the window's
-  /// sections as `window_handler` writes them.
+  /// One window of the open delta, a chunk for each of its stream's writes (`DeltaWrites`, module
+  /// documentation). The delta moves past the window only once every chunk is written.
   fn window(&mut self, window: &Window, out: &mut Vec<u8>) -> Result<(), EditorRefused> {
     let (Phase::Rooted, Some(file), Some(delta)) =
       (self.phase, self.open.last(), self.delta.as_mut())
@@ -464,20 +459,14 @@ impl EditorWriter {
     if file.kind != NodeKind::File {
       return Err(EditorRefused::OutOfOrder);
     }
-    let mut encoder = delta.encoder.clone();
-    self.window_bytes.clear();
-    encoder
+    let mut writes = delta.clone();
+    let window_writes = writes
       .window(window, self.compression, &mut self.window_bytes)
       .map_err(EditorRefused::Window)?;
-    let sections = window_sections(&self.window_bytes)?;
-    if !delta.header_written {
-      chunk(&file.token, &encoder.header(), out)?;
+    for write in window_writes.iter() {
+      chunk(&file.token, write, out)?;
     }
-    for section in sections.into_iter().filter(|section| !section.is_empty()) {
-      chunk(&file.token, section, out)?;
-    }
-    delta.encoder = encoder;
-    delta.header_written = true;
+    *delta = writes;
     Ok(())
   }
 
@@ -490,8 +479,8 @@ impl EditorWriter {
     if file.kind != NodeKind::File {
       return Err(EditorRefused::OutOfOrder);
     }
-    if !delta.header_written {
-      chunk(&file.token, &delta.encoder.header(), out)?;
+    if let Some(header) = delta.end() {
+      chunk(&file.token, &header, out)?;
     }
     out.extend_from_slice(TEXTDELTA_END);
     string(file.token.as_bytes(), out)?;
@@ -641,11 +630,114 @@ fn hex_digit(nibble: u8) -> u8 {
   HEX_DIGITS.get(usize::from(nibble)).copied().unwrap_or(b'0')
 }
 
+/// An svndiff stream written a window at a time as `svn_txdelta_to_svndiff3` writes it (module
+/// documentation, "A text delta"): the one writer of those writes. `svnserve` sends each write as a
+/// string of its own, a `textdelta-chunk` in an edit (`editorp.c`) and one of a revision's delta
+/// strings in `get-file-revs` (`serve.c` `svndiff_handler`; `crate::reads`, A-613), so both callers
+/// send the same bytes for the same windows (A-616 continued (7)).
+#[derive(Clone, Debug)]
+pub(crate) struct DeltaWrites {
+  /// The svndiff version of the stream.
+  version: Version,
+  /// The svndiff encoder, which holds the previous window's source view.
+  encoder: Encoder,
+  /// Whether the stream's header is written.
+  header_written: bool,
+}
+
+impl DeltaWrites {
+  /// A stream in `version` with nothing written yet.
+  pub(crate) fn new(version: Version) -> Self {
+    Self {
+      version,
+      encoder: Encoder::new(version),
+      header_written: false,
+    }
+  }
+
+  /// Encodes `window` into `buffer`, cleared first, and answers its writes: a version-0 window of
+  /// new data alone in two, `send_simple_insertion_window`'s, the stream's header when it is not
+  /// out yet leading the first; any other as `window_handler` writes it, the header on its own
+  /// first when it is not out yet, then the window's integers, its instruction section and its
+  /// new-data section.
+  ///
+  /// # Errors
+  /// The refusal a decoder would make of the window ([`SvndiffError`]); the stream is as it was.
+  pub(crate) fn window<'buffer>(
+    &mut self,
+    window: &Window,
+    compression: Compression,
+    buffer: &'buffer mut Vec<u8>,
+  ) -> Result<Writes<'buffer>, SvndiffError> {
+    let malformed = SvndiffError::CorruptWindowHeader;
+    let mut encoder = self.encoder.clone();
+    buffer.clear();
+    if !self.header_written {
+      buffer.extend_from_slice(&encoder.header());
+    }
+    let lead = buffer.len();
+    encoder.window(window, compression, buffer)?;
+    let bytes: &'buffer Vec<u8> = buffer;
+    let [integers, instructions, new_data] = window_sections(bytes.get(lead..).ok_or(malformed)?)?;
+    let writes: [&'buffer [u8]; WINDOW_WRITES] = if simple_insertion(self.version, window) {
+      let joined_end = lead
+        .saturating_add(integers.len())
+        .saturating_add(instructions.len());
+      [
+        bytes.get(..joined_end).ok_or(malformed)?,
+        new_data,
+        &[],
+        &[],
+      ]
+    } else {
+      [
+        bytes.get(..lead).ok_or(malformed)?,
+        integers,
+        instructions,
+        new_data,
+      ]
+    };
+    self.encoder = encoder;
+    self.header_written = true;
+    Ok(Writes(writes))
+  }
+
+  /// The stream's end: its header alone when no window wrote it (`window_handler`'s last call, with
+  /// no window), else nothing.
+  pub(crate) fn end(&self) -> Option<[u8; HEADER_LEN]> {
+    (!self.header_written).then(|| self.encoder.header())
+  }
+}
+
+/// The most writes one window makes, `window_handler`'s.
+/// Shape: the header, the integers, the instruction section and the new-data section, one
+/// `svn_stream_write` each (`svndiff.c` 263-270 and 288-300 at `d434dc14`, 1.15.0 alike).
+const WINDOW_WRITES: usize = 4;
+
+/// One window's stream writes in order, slices of the buffer `DeltaWrites::window` encoded it into.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Writes<'bytes>([&'bytes [u8]; WINDOW_WRITES]);
+
+impl<'bytes> Writes<'bytes> {
+  /// The writes in order. A part `svndiff.c` does not write, being empty (no header owed, an empty
+  /// section; `send_simple_insertion_window`'s `if (len)`), is no write.
+  pub(crate) fn iter(self) -> impl Iterator<Item = &'bytes [u8]> {
+    self.0.into_iter().filter(|write| !write.is_empty())
+  }
+}
+
+/// Whether `svndiff.c` writes `window` through `send_simple_insertion_window` (`window_handler`
+/// 259-261: version 0, no source copy and one instruction, which is then the new data making the
+/// whole target, 101-104).
+fn simple_insertion(version: Version, window: &Window) -> bool {
+  version == Version::Zero && matches!(window.instructions.as_slice(), [Instruction::New { .. }])
+}
+
 /// An encoded window split as `window_handler` writes it: its integers, its instruction section and
 /// its new-data section. Refused when the encoding does not hold its own lengths, which the encoder
 /// never writes.
-fn window_sections(encoded: &[u8]) -> Result<[&[u8]; 3], EditorRefused> {
-  let malformed = EditorRefused::Window(SvndiffError::CorruptWindowHeader);
+fn window_sections(encoded: &[u8]) -> Result<[&[u8]; 3], SvndiffError> {
+  let malformed = SvndiffError::CorruptWindowHeader;
   let mut at = 0usize;
   let mut integers = [0u64; WINDOW_HEADER_INTEGERS];
   for slot in &mut integers {

@@ -34,6 +34,9 @@
 //!
 //! **Names.** A member's volume name is `<repository>:<branch>:<id>`: readable in a listing, unique on its partition by
 //! its id.
+//!
+//! **The store.** `CreateRepository` makes the repository's tool store beside its record, on this owner shard
+//! (`crate::vcs_store`, A-662).
 
 use slates_db::catalog::{
   BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy, PolicyRecord,
@@ -53,6 +56,10 @@ use crate::verbs::{forbidden, refused, to_db_volume, to_wire_volume};
 // until one calls it, a daemon build calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod push;
+// Mercurial's unbundle landed through the push (A-657): until the hg site serves unbundle (A-650's), a daemon build
+// calls none of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod hg_push;
 
 /// The database's form of a repository's tool.
 fn db_tool(tool: VcsTool) -> slates_db::catalog::VcsTool {
@@ -343,6 +350,16 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
   }
   if !adopted {
     crate::merge_service::enqueue_record(state, root, 0, [0u8; 32], 0, Vec::new(), (None, None));
+  }
+  // The repository's tool store, beside its record, on its owner shard (A-662).
+  if let Some(record) = state
+    .db
+    .partition()
+    .repositories()
+    .repository(repository)
+    .cloned()
+  {
+    crate::vcs_store::make(state, &record);
   }
 }
 
@@ -784,8 +801,9 @@ mod tests {
     )
   }
 
-  /// Makes `green`'s next version through a work of its own, file `f` set to `bytes`; the work is destroyed after, so
-  /// no reader is left holding the green's floor. The version made.
+  /// Makes `green`'s next version through a work of its own, file `f` set to `bytes`, submitted with a message and the
+  /// session's identities as a repository's green requires (A-664); the work is destroyed after, so no reader is left
+  /// holding the green's floor. The version made.
   fn write(state: &mut ShardState, green: VolumeId, bytes: &[u8], serial: u32) -> u64 {
     let ReplyBody::WorkCreated { id: work, .. } = ask(
       state,
@@ -810,14 +828,8 @@ mod tests {
       },
     );
     assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-    let submitted = ask(
-      state,
-      &owner(),
-      RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
-    );
+    let message = format!("f, version {serial}");
+    let submitted = ask(state, &owner(), crate::identities::authored(work, &message));
     let ReplyBody::Submitted {
       version: Some(version),
       ..

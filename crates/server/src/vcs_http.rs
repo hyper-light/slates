@@ -2,8 +2,8 @@
 //! "Pieces (git)" piece 8; §4.3, R6): a listener on the runtime's TCP, one connection a task, each driving
 //! `slates-http-edge`'s engine (A-625 part 1) over its socket; every wait on a client learned per phase ([`waits`]); the
 //! connections served at once and each request's room derived from the shard's budget ([`Bounds`]); and a site that
-//! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's (§4.17.3) and Subversion's (§4.17.4) on the same
-//! edge.
+//! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's (§4.17.4) on
+//! the same edge.
 //!
 //! **The listener** ([`serve`]) is a task on its shard and owns its connections: each is a child task
 //! (`slates_rt::futures::spawn_child`), detached so its slot is given back as soon as it ends, and cancelled and joined
@@ -33,19 +33,34 @@
 //! reset that can erase it (A-183). The listener's waits for a seat, the overdue marks and the reaps are counted
 //! ([`Counts`]).
 //!
+//! **A connection moves to its repository's shard** (main's ruling, 2026-11-19; A-625 part 3). Once a proven request's
+//! head names a repository another shard's partition holds, the connection goes there whole, as the NFS export moves a
+//! mount's connection (§4.6, `crate::nfs`'s `migrate`): its socket's handle, its engine with the head still undecided,
+//! and its waits, as one spawn on that shard's control channel, sharing by move. Its seat here is given back first, and
+//! there it takes one of that shard's seats as a new connection would ([`seat_arrival`]): a free one, or the most overdue
+//! connection's, or it waits, and at most as many arrivals wait as the shard has seats, past which the arrival is closed
+//! and counted, as a refused move closes an NFS connection. There the head is decided again, and every step lends the
+//! repository's store on its own shard with no crossing. Each shard keeps its own edge state ([`keep_here`]): its seats,
+//! its learned waits and its counts.
+//!
 //! **One connection's loop** asks the engine what it needs next and does it: writes its bytes, reads within the phase's
 //! wait, asks the site to decide a whole head (the answer says whether the credentials proved a principal), hands each run
 //! of the body to the service the site started and then its end, passes the service's reply on, and half-closes and
 //! drains for a staged close. One body run or one reply run a turn (§4.3): the task yields after each, so a large push or
 //! clone never holds its shard, and a drain yields after each read it drops.
 //!
-//! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the operator's identity, an authenticator
-//! over §4.13's principals and keys, the repositories' lookup on their partitions); the services' server halves (git's
-//! upload-pack, A-615; receive-pack's commit, A-620 part 2), which answer `503` until they land; Mercurial's and
-//! Subversion's sites; the MCP edge onto this engine; the live `git clone` over HTTPS (main's run).
+//! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the operator's identity, an
+//! authenticator over §4.13's principals and keys, the repositories' lookup on their partitions); the services' server
+//! halves (git's upload-pack, A-615; receive-pack's commit, A-620 part 2), which answer `503` until they land;
+//! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
+//! Subversion's site; the MCP edge onto this engine; the live `git clone` and `hg clone` over HTTPS (main's runs).
 
-mod git;
-mod waits;
+mod daemon_edge;
+pub(crate) mod git;
+mod hg;
+pub(crate) mod waits;
+
+pub(crate) use daemon_edge::start;
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -61,7 +76,7 @@ use slates_rt::futures::{
   cancel, detach, now_ns, scheduler_overrun_ns, sleep, spawn_child, yield_now,
 };
 use slates_rt::shard::Kept;
-use slates_rt::tcp::{SocketAddrV4, TcpListener, TcpStream};
+use slates_rt::tcp::{OwnedStream, SocketAddrV4, TcpListener, TcpStream};
 
 use waits::{Overdue, PhaseWaits, Tracker};
 
@@ -92,6 +107,13 @@ const REAPED: &str = "vcs_http.reaped";
 const NOT_REAPED: &str = "vcs_http.not_reaped";
 /// A connection whose socket failed.
 const SOCKET_FAILED: &str = "vcs_http.socket";
+/// A move its target shard's control channel refused: the descriptor dropped with the spawn, so the connection closed.
+const MOVE_REFUSED: &str = "vcs_http.move_refused";
+/// A connection that arrived on a shard keeping no edge state, or whose socket could not be adopted there.
+const ARRIVAL_LOST: &str = "vcs_http.arrival_lost";
+/// A connection that arrived on a shard whose seats were all taken with as many arrivals already waiting as it has
+/// seats: closed.
+const ARRIVAL_REFUSED: &str = "vcs_http.arrival_refused";
 
 /// What bounds an edge, derived from its shard's budget (the module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +147,7 @@ impl Bounds {
   /// The clock granularity `G` a wait starting now is floored by: the timer's tick, or the lateness the shard's scheduler
   /// has shown when that is longer (`slates_rt::futures::scheduler_overrun_ns`, the floor the fleet's detector and the MCP
   /// edge put under their windows).
-  fn granularity_ns(self) -> u64 {
+  pub(crate) fn granularity_ns(self) -> u64 {
     self.tick_ns.max(scheduler_overrun_ns())
   }
 }
@@ -169,6 +191,11 @@ pub(crate) trait Exchange {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed>;
   /// The request's body has ended.
   async fn body_end(&mut self) -> Result<(), Failed>;
+  /// The fields the reply's head carries after the decision's, asked once as the reply begins, after the body has
+  /// ended: none unless the reply's outcome decides them, as a Mercurial command's decides its media type (A-650).
+  async fn reply_fields(&mut self) -> Result<Fields, Failed> {
+    Ok(Fields::new())
+  }
   /// Appends the reply's next run to `out`: `true` while more follows, `false` once the reply has ended.
   async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed>;
 }
@@ -190,6 +217,12 @@ pub(crate) enum Answer<E> {
     status: Status,
     /// The fields.
     fields: Fields,
+  },
+  /// Decide it on runtime shard `shard`, where its repository lives: the connection moves there whole, its head
+  /// undecided (the module doc).
+  Move {
+    /// The shard.
+    shard: u16,
   },
 }
 
@@ -226,6 +259,12 @@ pub(crate) struct Counts {
   pub(crate) failed: u64,
   /// Connections a refusal ended.
   pub(crate) refused: u64,
+  /// Connections this shard moved to their repository's shard.
+  pub(crate) moved: u64,
+  /// Connections that moved to this shard and took a seat here.
+  pub(crate) arrived: u64,
+  /// Connections that moved to this shard and were closed with every seat taken and the arrivals' bound reached.
+  pub(crate) arrivals_refused: u64,
 }
 
 /// A taken seat: its connection's task once spawned, whether its wait on its client is past its bound, and whether it is
@@ -261,8 +300,11 @@ pub(crate) struct EdgeState {
   identity: Option<ServingIdentity>,
   /// Each seat, free or taken: as many as the edge serves at once.
   seats: RefCell<Vec<Option<Taken>>>,
-  /// The listener, when it waits for a seat.
-  waiting: RefCell<Option<Waker>>,
+  /// Who waits for a seat: the listener, and connections that moved here, at most one of each kind a seat and the
+  /// listener ([`EdgeState::arriving`]).
+  waiting: RefCell<Vec<Waker>>,
+  /// The connections that moved here and wait for a seat: at most as many as the shard has seats.
+  arriving: Cell<usize>,
   /// Every phase's learned waits.
   waits: RefCell<PhaseWaits>,
   /// The counts.
@@ -276,7 +318,8 @@ impl EdgeState {
       bounds,
       identity,
       seats: RefCell::new(vec![None; bounds.connections]),
-      waiting: RefCell::new(None),
+      waiting: RefCell::new(Vec::new()),
+      arriving: Cell::new(0),
       waits: RefCell::new(PhaseWaits::default()),
       counts: Cell::new(Counts::default()),
     }
@@ -329,16 +372,40 @@ impl EdgeState {
       .map(|mut seats| f(&mut seats))
   }
 
-  /// Wakes the listener if it waits.
+  /// Wakes whoever waits for a seat: each looks again ([`seat_for`]).
   fn wake_listener(&self) {
     let waiting = self
       .waiting
       .try_borrow_mut()
-      .ok()
-      .and_then(|mut waiting| waiting.take());
-    if let Some(waker) = waiting {
+      .map(|mut waiting| std::mem::take(&mut *waiting))
+      .unwrap_or_default();
+    for waker in waiting {
       waker.wake();
     }
+  }
+
+  /// Keeps `waker` to be woken when a seat comes back or a connection becomes overdue, once.
+  fn wait_for_seat(&self, waker: &Waker) {
+    if let Ok(mut waiting) = self.waiting.try_borrow_mut()
+      && !waiting.iter().any(|kept| kept.will_wake(waker))
+    {
+      waiting.push(waker.clone());
+    }
+  }
+
+  /// Admits one more connection that moved here to wait for a seat, while fewer than the shard's seats wait.
+  fn admit_arrival(&self) -> bool {
+    let arriving = self.arriving.get();
+    if arriving >= self.bounds.connections {
+      return false;
+    }
+    self.arriving.set(arriving.saturating_add(1));
+    true
+  }
+
+  /// One connection that waited here for a seat stopped waiting.
+  fn arrival_seated(&self) {
+    self.arriving.set(self.arriving.get().saturating_sub(1));
   }
 
   /// How the listener, holding an accepted connection, stands for a seat (the module doc): a free seat; or, with every
@@ -352,9 +419,7 @@ impl EdgeState {
     if matches!(seating, Seating::Free(_)) {
       return seating;
     }
-    if let Ok(mut waiting) = self.waiting.try_borrow_mut() {
-      *waiting = Some(waker.clone());
-    }
+    self.wait_for_seat(waker);
     if first {
       self.count(|counts| counts.full = counts.full.saturating_add(1));
     }
@@ -504,17 +569,37 @@ async fn seat_for(state: Kept<EdgeState>) -> Result<usize, EdgeRefused> {
   .await
 }
 
+thread_local! {
+  /// This shard's edge state, once kept here ([`keep_here`]): where a connection that moves here is seated.
+  static HERE: Cell<Option<Kept<EdgeState>>> = const { Cell::new(None) };
+}
+
+/// Keeps `state` on this shard for its life as the shard's edge (the module doc): the listener's shard keeps the one
+/// with the identity, every other shard one without, so a connection that moves to a shard finds its seats there. Called
+/// once a shard, at the daemon's start; refused off a shard's thread.
+pub(crate) fn keep_here(state: EdgeState) -> Result<Kept<EdgeState>, RtError> {
+  let kept = slates_rt::registry::with_current(|context| context.keep(state))
+    .ok_or(RtError::NotOnShardThread)??;
+  HERE.with(|here| here.set(Some(kept)));
+  Ok(kept)
+}
+
+/// This shard's edge state, if one was kept here.
+fn here() -> Option<Kept<EdgeState>> {
+  HERE.with(Cell::get)
+}
+
 /// Serves the edge `state` keeps on `listener` until the listener fails or its task ends (the module doc): each
-/// connection a child task deciding its requests with a site `site` makes for it. Refused at once for a cleartext edge
-/// off loopback, and when `state` is not on this shard.
+/// connection a child task deciding its requests with a site `site` makes for it, here or on the shard it moves to.
+/// Refused at once for a cleartext edge off loopback, and when `state` is not on this shard.
 pub(crate) async fn serve<S, M>(
   listener: TcpListener,
   state: Kept<EdgeState>,
-  mut site: M,
+  site: M,
 ) -> Result<(), EdgeRefused>
 where
   S: Site + 'static,
-  M: FnMut() -> S,
+  M: Fn() -> S + Clone + Send + 'static,
 {
   let address = listener.local_addr().map_err(EdgeRefused::Listener)?;
   let secure = state
@@ -543,7 +628,7 @@ where
     let slot = seat_for(state).await?;
     let seat = Seat::take(state, slot).ok_or(EdgeRefused::StateGone)?;
     let tracker = Tracker::new(round_trip);
-    match spawn_child(drive(stream, connection, site(), seat, tracker)) {
+    match spawn_child(drive(stream, connection, site.clone(), seat, tracker)) {
       Ok(task) => {
         let _ = state.with(|state| state.set_task(slot, task));
         if detach(task).is_err() {
@@ -586,6 +671,8 @@ enum Flow {
   Go,
   /// It ends.
   End(Why),
+  /// It goes on on runtime shard `shard`, its head undecided.
+  Move(u16),
 }
 
 /// Awaits `work` with no end of its own: once `deadline_ns` (on the shard's clock) passes with it still waiting,
@@ -672,12 +759,14 @@ fn waited<T>(outcome: Raced<T>, started_ns: u64) -> (Waited<T>, bool) {
   }
 }
 
-/// A service a decided request started, and whether its reply is the head alone.
+/// A service a decided request started, whether its reply is the head alone, and whether its reply's fields were asked.
 struct Started<E> {
   /// The exchange.
   exchange: E,
   /// Whether the reply is the head alone.
   head_only: bool,
+  /// Whether the exchange's reply fields have been asked for and given to the engine.
+  fields_given: bool,
 }
 
 /// One connection's parts beside its engine: its socket, its edge and seat, its waits, its site and the service its
@@ -822,6 +911,7 @@ impl<S: Site> Parts<S> {
       let _ = self.learning(|tracker, waits| tracker.prove(waits));
     }
     match decided.answer {
+      Answer::Move { shard } => return Flow::Move(shard),
       Answer::Serve {
         fields,
         head_only,
@@ -830,6 +920,7 @@ impl<S: Site> Parts<S> {
         self.service = Some(Started {
           exchange,
           head_only,
+          fields_given: false,
         });
         connection.decide(Decision::Serve { fields, head_only });
       }
@@ -875,12 +966,24 @@ impl<S: Site> Parts<S> {
     Flow::Go
   }
 
-  /// Passes the service's next reply run to the engine, or the reply's end, then yields: one run a turn.
+  /// Passes the service's next reply run to the engine, or the reply's end, then yields: one run a turn. The service's
+  /// reply fields go to the engine first, once, before any of the reply.
   async fn reply(&mut self, connection: &mut Connection) -> Flow {
     let Some(started) = self.service.as_mut() else {
       connection.fail(Status::INTERNAL_SERVER_ERROR);
       return Flow::Go;
     };
+    if !started.fields_given {
+      started.fields_given = true;
+      match started.exchange.reply_fields().await {
+        Ok(fields) => connection.reply_fields(fields),
+        Err(Failed(status)) => {
+          self.service = None;
+          connection.fail(status);
+          return Flow::Go;
+        }
+      }
+    }
     if started.head_only {
       self.service = None;
       connection.reply_end();
@@ -939,14 +1042,26 @@ impl<S: Site> Parts<S> {
   }
 }
 
-/// Serves one connection until it ends (the module doc's loop), its seat given back however it ends.
-async fn drive<S: Site>(
+/// How a connection's loop left: it ended, or its connection moves to another shard.
+enum Exit {
+  /// It ended.
+  Ended(Why),
+  /// It moves to runtime shard `shard`.
+  Moved(u16),
+}
+
+/// Serves one connection until it ends or moves to its repository's shard (the module doc's loop), its seat here given
+/// back however it leaves; `make` makes its site here, and there.
+async fn drive<S, M>(
   stream: TcpStream,
   mut connection: Connection,
-  site: S,
+  make: M,
   seat: Seat,
   tracker: Tracker,
-) {
+) where
+  S: Site + 'static,
+  M: Fn() -> S + Clone + Send + 'static,
+{
   let mut parts = Parts {
     socket: Socket {
       stream,
@@ -955,12 +1070,12 @@ async fn drive<S: Site>(
     state: seat.state,
     slot: seat.slot,
     tracker,
-    site,
+    site: make(),
     secure: connection.secure(),
     service: None,
     reply: Vec::new(),
   };
-  let why = loop {
+  let exit = loop {
     let flow = match connection.next() {
       Next::Write => parts.write(&mut connection).await,
       Next::Read => parts.read(&mut connection).await,
@@ -975,12 +1090,177 @@ async fn drive<S: Site>(
       Next::Drain => Flow::End(parts.drain().await),
       Next::Close => Flow::End(Why::Closed),
     };
-    if let Flow::End(why) = flow {
-      break why;
+    match flow {
+      Flow::Go => {}
+      Flow::End(why) => break Exit::Ended(why),
+      Flow::Move(shard) => break Exit::Moved(shard),
     }
   };
-  count_end(parts.state, why, connection.ended());
-  drop(seat);
+  match exit {
+    Exit::Ended(why) => {
+      count_end(parts.state, why, connection.ended());
+      drop(seat);
+    }
+    Exit::Moved(shard) => {
+      let Parts {
+        socket,
+        tracker,
+        state,
+        ..
+      } = parts;
+      let _ =
+        state.with(|state| state.count(|counts| counts.moved = counts.moved.saturating_add(1)));
+      // The seat here comes back before the connection leaves (the module doc).
+      drop(seat);
+      migrate::<S, M>(
+        shard,
+        Moving {
+          stream: socket.stream.into_owned(),
+          connection,
+          tracker,
+          make,
+        },
+      );
+    }
+  }
+}
+
+/// A connection on its way to the shard its repository lives on (the module doc): its socket's handle, its engine with
+/// the head undecided, its waits, and what makes its site there. Each part is plain data, so it moves whole.
+struct Moving<M> {
+  /// The socket's handle, its readiness armed on no shard between awaits.
+  stream: OwnedStream,
+  /// The engine, its head whole and undecided.
+  connection: Connection,
+  /// Its waits.
+  tracker: Tracker,
+  /// What makes its site.
+  make: M,
+}
+
+/// Moves `moving` to runtime shard `shard`: one spawn on that shard's control channel carrying the connection, which
+/// there adopts the socket and is seated and served ([`arrived`]). A spawn the channel refuses dropped the handle with
+/// it, so the connection closed; it is counted, as the NFS export counts a refused move.
+fn migrate<S, M>(shard: u16, moving: Moving<M>)
+where
+  S: Site + 'static,
+  M: Fn() -> S + Clone + Send + 'static,
+{
+  let arrive = slates_rt::task::SpawnRequest::new(
+    Box::pin(async move {
+      arrived::<S, M>(moving);
+    }),
+    None,
+  );
+  if slates_rt::registry::send_control(shard, slates_rt::control::Control::Spawn(Box::new(arrive)))
+    .is_err()
+  {
+    crate::fleet::count_refusal(MOVE_REFUSED);
+  }
+}
+
+/// A connection arrived on this shard ([`migrate`]): its socket adopted here and its serving a task of this shard's,
+/// which seats it ([`seat_arrival`]) and drives it on. Lost, and counted, on a shard keeping no edge state or where the
+/// socket cannot be adopted.
+fn arrived<S, M>(moving: Moving<M>)
+where
+  S: Site + 'static,
+  M: Fn() -> S + Clone + Send + 'static,
+{
+  let Moving {
+    stream,
+    connection,
+    tracker,
+    make,
+  } = moving;
+  let (Some(state), Ok(stream)) = (here(), TcpStream::from_owned(stream)) else {
+    crate::fleet::count_refusal(ARRIVAL_LOST);
+    return;
+  };
+  match slates_rt::futures::spawn(serve_arrival::<S, M>(
+    state, stream, connection, tracker, make,
+  )) {
+    Ok(task) => {
+      if detach(task).is_err() {
+        crate::fleet::count_refusal(NOT_DETACHED);
+      }
+    }
+    Err(_) => {
+      crate::fleet::count_refusal(SPAWN_REFUSED);
+    }
+  }
+}
+
+/// Seats a connection that moved here and serves it on: its task is the seat's, so a reap here cancels it.
+async fn serve_arrival<S, M>(
+  state: Kept<EdgeState>,
+  stream: TcpStream,
+  connection: Connection,
+  tracker: Tracker,
+  make: M,
+) where
+  S: Site + 'static,
+  M: Fn() -> S + Clone + Send + 'static,
+{
+  let Ok(slot) = seat_arrival(state).await else {
+    let _ = state.with(|state| {
+      state.count(|counts| counts.arrivals_refused = counts.arrivals_refused.saturating_add(1));
+    });
+    crate::fleet::count_refusal(ARRIVAL_REFUSED);
+    return;
+  };
+  let Some(seat) = Seat::take(state, slot) else {
+    crate::fleet::count_refusal(ARRIVAL_LOST);
+    return;
+  };
+  let _ = state.with(|state| {
+    if let Some(task) = slates_rt::futures::current_task() {
+      state.set_task(slot, task);
+    }
+    state.count(|counts| counts.arrived = counts.arrived.saturating_add(1));
+  });
+  drive(stream, connection, make, seat, tracker).await;
+}
+
+/// Why a connection that moved here was not seated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrivalRefused {
+  /// Every seat is taken and as many arrivals already wait as the shard has seats.
+  Full,
+  /// The edge's state is gone.
+  Gone,
+}
+
+/// A seat for a connection that moved here (the module doc): a free one at once; with every seat taken, as a new
+/// connection is seated by the listener ([`seat_for`]: the most overdue connection's, or the next to come back), while
+/// fewer arrivals wait than the shard has seats; refused past that.
+async fn seat_arrival(state: Kept<EdgeState>) -> Result<usize, ArrivalRefused> {
+  let free = state
+    .with(|state| state.with_seats(|seats| seats.iter().position(Option::is_none)))
+    .ok_or(ArrivalRefused::Gone)?
+    .flatten();
+  if let Some(slot) = free {
+    return Ok(slot);
+  }
+  if !state
+    .with(EdgeState::admit_arrival)
+    .ok_or(ArrivalRefused::Gone)?
+  {
+    return Err(ArrivalRefused::Full);
+  }
+  let _waiting = Arriving(state);
+  seat_for(state).await.map_err(|_| ArrivalRefused::Gone)
+}
+
+/// A connection that moved here, counted among the arrivals waiting for a seat for as long as it waits, however its wait
+/// ends: seated, refused, or cancelled with its task.
+struct Arriving(Kept<EdgeState>);
+
+impl Drop for Arriving {
+  fn drop(&mut self) {
+    // Off its shard (the runtime gone) no edge is left to count it in.
+    let _ = self.0.with(EdgeState::arrival_seated);
+  }
 }
 
 /// Counts how a connection ended: by its loop's reason, then by the engine's. Called before the connection's socket

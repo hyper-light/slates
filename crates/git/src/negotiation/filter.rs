@@ -10,9 +10,10 @@
 //! - `object:type=<type>`: objects of that type alone (`filter_object_type`), commits and tags included.
 //! - `combine:<spec>+<spec>...`: what every spec sends. Each sub-spec is percent-decoded, and refused, as git refuses it,
 //!   when its encoded form holds a space, a control byte or one of ``~`!@#$^&*()[]{}\;'",<>?``.
-//! - `sparse:oid=<blob-ish>`: read, and refused as not served: it takes git's gitignore matcher over the blob's patterns
-//!   and a revision's name resolved; A-615 records it owed. `sparse:path=`, which git dropped, is refused as git refuses
-//!   it.
+//! - `sparse:oid=<blob-ish>`: read, and refused as not served until the walk takes it: its blob's patterns are read and
+//!   asked as git reads and asks them ([`super::sparse`], A-640 part 4), and the walk by path, with the tree frames
+//!   git's filter keeps, and the blob's name resolved are owed. `sparse:path=`, which git dropped, is refused as git
+//!   refuses it.
 //!
 //! Commits and tags are sent under every filter but `object:type`; the objects a request names, and what their tags
 //! name, are sent under every filter, as git sends the objects a client named (`--filter-provided-objects` off). A

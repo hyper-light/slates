@@ -547,6 +547,7 @@ mod tests {
         control: None,
         revoked: false,
         consumer_policy: None,
+        identities: None,
         owner_route: None,
         read_ahead: None,
         read_ahead_pending: 0,

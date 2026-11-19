@@ -54,6 +54,10 @@ pub struct ClientSlot {
   /// channel's merges and landings are held to it before they are routed (`verbs::consumer_gate`). `None` for an
   /// account's channel, and for a consumer with no policy set.
   pub consumer_policy: Option<slates_db::catalog::WritePolicy>,
+  /// The session's tool identities (A-664): read once, at its first submit, from its principal's record, and carried by
+  /// every submit after (`crate::identities`). `None` until read; a principal with none reads as no identity in any
+  /// tool. A setting made after the read applies from the next session.
+  pub identities: Option<slates_ipc::protocol::ToolIdentities>,
   /// The last successful remote route, released with this client. One slot, no global catalog.
   pub(crate) owner_route: Option<crate::owner_location::CachedRoute>,
   /// The read-ahead window of this client's latest forwarded read (`crate::verbs::ReadAhead`): the pages after the
@@ -765,6 +769,10 @@ pub struct ShardState {
   /// no engine is installed and every verb naming one is refused typed, while its durable origin and chain
   /// stay untouched as the evidence a reviewed recovery works from. Bounded by the partition's greens.
   pub fenced_greens: BTreeMap<VolumeId, crate::merge_service::GreenFence>,
+  /// The version-control repositories' stores on this shard (A-662, `crate::vcs_store`): one content store, and each
+  /// repository's tool store with its derived values, made with its record and made again by a recovery from its
+  /// entries' objects. Bounded by the shard's memory budget, which every byte of it is charged to.
+  pub(crate) vcs_stores: crate::vcs_store::VcsStores,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,

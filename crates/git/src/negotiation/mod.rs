@@ -47,6 +47,7 @@ mod one_round;
 mod paint;
 mod ready;
 mod shallow;
+pub mod sparse;
 
 use crate::object_name::{Kind, ObjectId};
 use crate::{Admission, PastAdmission};
@@ -148,6 +149,10 @@ pub struct Request<'r> {
   pub filter: Option<&'r Filter>,
   /// `include-tag`: send the annotated tags of objects the pack carries.
   pub include_tag: bool,
+  /// `thin-pack`: the client takes a pack whose deltas name bases it holds. In a shallow exchange git's server then
+  /// leaves out every had commit's tree, not the edges' alone (`pack-objects --objects-edge-aggressive`), and so does
+  /// this.
+  pub thin: bool,
 }
 
 /// The acknowledgments section.
@@ -335,6 +340,50 @@ pub fn negotiate<S: Graph>(
     }),
     counters,
   })
+}
+
+/// Whether a server whose client holds `common` is ready to send the pack (A-640 part 3: protocol v0's
+/// `ok_to_give_up`, which `get_common_commits` asks again as each have arrives): there is a common object, and each
+/// want, peeled through its tags, reaches a common commit or one of its parents, as `ready` above is decided.
+pub fn ready<S: Graph>(
+  graph: &S,
+  wants: &[ObjectId],
+  common: &[ObjectId],
+  admission: &mut Admission,
+) -> Result<bool, Refusal> {
+  let wants = ready::wants(graph, wants, admission)?;
+  let common = ready::common(graph, common, admission)?;
+  ready::is_ready(
+    graph,
+    &wants,
+    &[],
+    &common,
+    admission,
+    &mut Counters::default(),
+  )
+}
+
+/// The shallow-update `request`'s deepening makes, the shallow-info section's lines (A-640 part 3: protocol v0 sends
+/// them before any acknowledgment, `receive_needs`, so ahead of the pack's walk): `None` when it asks for no deepening.
+pub fn shallow_update<S: Graph>(
+  graph: &S,
+  request: &Request<'_>,
+  admission: &mut Admission,
+) -> Result<Option<ShallowInfo>, Refusal> {
+  if request.deepen.is_none() {
+    return Ok(None);
+  }
+  let wants = ready::wants(graph, request.wants, admission)?;
+  let client = shallow::client(graph, request.shallow, admission)?;
+  let cut = shallow::cut(
+    graph,
+    request,
+    &wants,
+    &client,
+    admission,
+    &mut Counters::default(),
+  )?;
+  Ok(cut.info)
 }
 
 #[cfg(test)]

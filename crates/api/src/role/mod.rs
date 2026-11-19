@@ -59,8 +59,8 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_NEVER_SERVED: u8 = 5;
 
 /// Format: the role arguments [`Role::parse`] takes, for its usage message.
-pub const ROLE_USAGE: &str =
-  "[--instance NAME] (anchor | daemon) [--shards N] [--quick] [--fleet PATH --node NAME]";
+pub const ROLE_USAGE: &str = "[--instance NAME] (anchor | daemon) [--shards N] [--quick] [--fleet PATH --node NAME] \
+   [--vcs-http ADDRESS]";
 
 /// Options of the anchor and the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +73,10 @@ pub struct ProcessOptions {
   pub shards: Option<u16>,
   /// The fleet to join, when this daemon is a fleet node (§2.6 boot step 6); a laptop has none.
   pub fleet: Option<FleetSelection>,
+  /// Where the version-control servers' shared HTTP edge listens, when the operator starts one (`--vcs-http ADDRESS`,
+  /// §4.17.2 "Transports" item 1; A-625 part 3): HTTPS presenting a fleet node's own identity, or cleartext on a
+  /// loopback address for a daemon that is no fleet node ([`vcs_http_address`]). None starts no edge.
+  pub vcs_http: Option<slates_rt::tcp::SocketAddrV4>,
 }
 
 /// Which fleet node this process is: the operator's shared manifest and this node's name in it
@@ -180,6 +184,7 @@ struct Given {
   shards: Option<String>,
   fleet: Option<String>,
   node: Option<String>,
+  vcs_http: Option<String>,
   quick: bool,
   word: Option<String>,
 }
@@ -192,6 +197,7 @@ impl Given {
       "--shards" => &mut self.shards,
       "--fleet" => &mut self.fleet,
       "--node" => &mut self.node,
+      "--vcs-http" => &mut self.vcs_http,
       other => return Err(RoleArgsError::UnknownFlag(other.to_owned())),
     };
     *slot = Some(value);
@@ -214,11 +220,21 @@ impl Given {
       (None, None) => None,
       _ => return Err(RoleArgsError::HalfAFleet),
     };
+    let vcs_http = self
+      .vcs_http
+      .map(|text| {
+        vcs_http_address(&text, fleet.is_some()).map_err(|reason| RoleArgsError::BadValue {
+          flag: "--vcs-http",
+          reason,
+        })
+      })
+      .transpose()?;
     Ok(ProcessOptions {
       instance: self.instance.unwrap_or_else(slates_ipc::instance_from_env),
       quick: self.quick,
       shards,
       fleet,
+      vcs_http,
     })
   }
 }
@@ -240,9 +256,38 @@ pub fn shard_count(text: &str) -> Result<u16, String> {
   Ok(shards)
 }
 
+/// Reads a `--vcs-http` address, the version-control servers' shared HTTP edge's (§4.17.2 "Transports" item 1; A-625
+/// part 3): an IPv4 address and port, `127.0.0.1:8080`, port 0 taking one the system picks, which the daemon logs; or
+/// why it is not one. A daemon that is no fleet node (`fleet_node` false) has no identity to present, so its edge serves
+/// cleartext, which the edge does on a loopback address alone (Basic's password and a bearer token cross in the clear,
+/// RFC 7617 §4 and RFC 6750 §5.3): any other address is refused here, before anything starts, as a shard count past
+/// the registry is ([`shard_count`]), rather than by a daemon that would start without its edge. A fleet node's edge
+/// presents the node's own identity, the one its RPC-with-TLS export presents, at any address. The roles here and the
+/// `slates` command read the flag with this.
+pub fn vcs_http_address(
+  text: &str,
+  fleet_node: bool,
+) -> Result<slates_rt::tcp::SocketAddrV4, String> {
+  let address = text
+    .parse::<slates_rt::tcp::SocketAddrV4>()
+    .map_err(|error| {
+      format!("{text}: {error}; an IPv4 address and port, such as 127.0.0.1:8080")
+    })?;
+  if !fleet_node && !address.ip().is_loopback() {
+    return Err(format!(
+      "{address}: a daemon that is no fleet node serves its edge in cleartext, on a loopback address alone; HTTPS \
+       presents a fleet node's own identity (--fleet PATH --node NAME)"
+    ));
+  }
+  Ok(address)
+}
+
 /// Whether `flag` takes a value.
 fn takes_value(flag: &str) -> bool {
-  matches!(flag, "--instance" | "--shards" | "--fleet" | "--node")
+  matches!(
+    flag,
+    "--instance" | "--shards" | "--fleet" | "--node" | "--vcs-http"
+  )
 }
 
 impl Role {
@@ -312,6 +357,11 @@ impl Role {
       args.push(fleet.manifest.clone());
       args.push("--node".to_owned());
       args.push(fleet.node.clone());
+    }
+    // The shared HTTP edge is the daemon's; the anchor passes the address through to the daemon it starts.
+    if let Some(address) = options.vcs_http {
+      args.push("--vcs-http".to_owned());
+      args.push(address.to_string());
     }
     args
   }
@@ -418,6 +468,7 @@ mod tests {
         quick: true,
         shards: Some(2),
         fleet: None,
+        vcs_http: None,
       })
     );
     let daemon = Role::parse(&words("daemon --instance a --fleet /f.json --node a")).unwrap();
@@ -431,6 +482,7 @@ mod tests {
           manifest: "/f.json".into(),
           node: "a".into(),
         }),
+        vcs_http: None,
       })
     );
     for role in [anchor, daemon] {
@@ -470,6 +522,55 @@ mod tests {
     assert_eq!(
       Role::parse(&words("daemon --node a")),
       Err(RoleArgsError::HalfAFleet)
+    );
+  }
+
+  /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: parse a daemon asked for the version-control HTTP edge on a
+  /// loopback address (its value joined by `=`), and a fleet node's anchor asked for one on an address any interface
+  /// reaches; make each role's arguments and parse them back. Then ask a daemon that is no fleet node for an edge off
+  /// loopback, and give the flag a name where an address belongs. Expect: each address read, and carried back whole
+  /// through the arguments an anchor starts its daemon with; the edge off loopback without a fleet refused as a bad
+  /// `--vcs-http` that names loopback (it would serve cleartext there), and the name refused as a bad `--vcs-http`,
+  /// both before anything starts.
+  #[test]
+  fn a_roles_vcs_http_edge_reads_back_and_cleartext_off_loopback_is_refused() {
+    let daemon = Role::parse(&words("daemon --vcs-http=127.0.0.1:8080")).unwrap();
+    assert_eq!(
+      daemon.options().vcs_http,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::LOCALHOST,
+        8080
+      ))
+    );
+    let anchor = Role::parse(&words(
+      "anchor --fleet /f.json --node b --vcs-http 0.0.0.0:443",
+    ))
+    .unwrap();
+    assert_eq!(
+      anchor.options().vcs_http,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::UNSPECIFIED,
+        443
+      ))
+    );
+    for role in [daemon, anchor] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+    }
+    let cleartext = Role::parse(&words("daemon --vcs-http 10.0.0.7:8080"));
+    assert!(
+      matches!(&cleartext, Err(RoleArgsError::BadValue { flag: "--vcs-http", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
+    let named = Role::parse(&words("daemon --vcs-http localhost:8080"));
+    assert!(
+      matches!(
+        &named,
+        Err(RoleArgsError::BadValue {
+          flag: "--vcs-http",
+          ..
+        })
+      ),
+      "{named:?}"
     );
   }
 

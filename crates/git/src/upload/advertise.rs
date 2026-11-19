@@ -13,15 +13,12 @@
 //! and its object format, SHA-1 where it names none, is the repository's (`mismatched object format`). The features a
 //! `fetch` or `ls-refs` uses need no check of their own: every one is advertised.
 
-use super::{Refusal, charged};
+use super::{AGENT, Refusal, charged};
 use crate::Admission;
 use crate::object_name::ObjectFormat;
 use crate::v2::advertisement::{self, Advertisement};
 use crate::v2::request::{Command, CommandRequest};
 use crate::v2::{Capability, Ending, Line};
-
-/// Format: the name this server gives itself in `agent`, its crate's version after it.
-const AGENT: &str = concat!("slates/", env!("CARGO_PKG_VERSION"));
 
 /// Format: the capability naming the repository's object format, whose value is filled in when advertised.
 const OBJECT_FORMAT: &[u8] = b"object-format";

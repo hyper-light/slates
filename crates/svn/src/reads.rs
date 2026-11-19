@@ -6,10 +6,10 @@
 //! Every answer is `serve.c`'s (Subversion `1.14.x` at `d434dc14`; the deployed binaries stock 1.15.0), held to
 //! transcripts of stock `svnserve` answering stock `svn` and scripted clients (`crates/svn/fixtures/reads`, each file's
 //! SHA-256 in `SHA256SUMS`):
-//! - **The order of a command's writes.** A command whose path is checked for read access (`check-path`, `stat`,
-//!   `get-iprops`) or that runs at all writes the trivial authentication request first, `( success ( ( ) 0: ) )`
-//!   (`trivial_auth_request`, the protocol's §2 "auth-request" with no mechanism), then its answer or its refusal; so a
-//!   revision past the youngest is refused after it.
+//! - **The order of a command's writes.** A command that runs at all writes the trivial authentication request first,
+//!   `( success ( ( ) 0: ) )` (`trivial_auth_request`, the protocol's §2 "auth-request" with no mechanism), then its
+//!   answer or its refusal; so a revision past the youngest is refused after it. A command refused read access writes
+//!   its refusal alone (below).
 //! - **Parameters as `svn_ra_svn__parse_tuple` reads them.** Missing or of the wrong kind is malformed data, which
 //!   `svnserve` answers by ending the connection without a word ([`Outcome::Close`]); parameters past the prototype
 //!   are ignored; a string read as a C string ends at its first NUL; a revision is the number cast to a signed long, so
@@ -21,6 +21,24 @@
 //!   (commit, update, locks, the rest of piece 7) is handed back untouched ([`Outcome::Elsewhere`]).
 //! - **Paths.** A command's path is the session's base path joined with the given relative path made canonical
 //!   (`svn_relpath_canonicalize_safe`, `svn_fspath__join`): empty and `.` names dropped, `..` kept, so it names nothing.
+//! - **Read access** (A-606; `serve.c` `must_have_access`, `lookup_access`, `authz_check_access`). A session carries
+//!   its principal's rules when the repository names an authorization file ([`Session::authz`]); without one every path
+//!   is readable. `get-file`, `get-dir`, `check-path`, `stat`, `get-iprops` and `list` check their path first:
+//!   readable, the trivial authentication request; not, the refusal "Authorization failed" (170001) and nothing before
+//!   it. Then each command passes over or stops at what the session may not read, as `libsvn_repos` does: a directory's
+//!   and a listing's hidden entries, hidden ancestors' properties and hidden requested mergeinfo paths are left out;
+//!   revision properties show as much as the revision is readable (all, the author and the date, or none:
+//!   `svn_repos_check_revision_access`); `get-locations`, `get-location-segments` and `log -g`'s history refuse a
+//!   hidden path 220001 "Unreadable path encountered; access denied" and end at a hidden copy source; `log` refuses a
+//!   hidden path or root 220001 "Item is not readable", ends a path's history at a hidden location and censors each
+//!   revision as `detect_changed` finds it; `get-file-revs` ends at a hidden location, and ends the connection with
+//!   nothing written for the command where `svnserve`'s assertion aborts its process (its authentication request still
+//!   in the unflushed buffer, as the recording shows). `get-latest-rev`, `get-dated-rev` and `get-deleted-rev` check
+//!   nothing. Where the session is anonymous and the client could authenticate for read access
+//!   ([`Authentication::Available`]), a path check that fails asks it to instead of refusing, as `must_have_access`
+//!   does: nothing is written ([`Outcome::Authenticate`]), the connection asks, and the command runs again with the
+//!   principal the client proved ([`Authentication::Done`]), its answer with no trivial request before it, or refused
+//!   "Authorization failed" where that principal may not read the path either.
 //! - **Property lists in name order.** `svnserve` writes a property list in its hash table's order, which APR seeds per
 //!   table (`apr_hash_make` since APR 1.5), so three recordings of one repository gave three orders; a client reads the
 //!   list into a hash. The handler writes them in byte order of their names, and the tests compare them as sets.
@@ -32,10 +50,9 @@
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
 //! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
-//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments`, `get-deleted-rev` and `log` (each
-//! its own module, `file`, `list`, `segments`, `deleted` and `log`, over FSFS's node history in `history`). Owed with
-//! this piece: `log`'s merged revisions, `get-file-revs`, and read access by the authorization rules (A-606): today
-//! every path is readable, as in an `anon-access = read` repository with no rules.
+//! (`svn_repos_trace_node_locations`), `get-file`, `list`, `get-location-segments`, `get-deleted-rev`, `log` with its
+//! merged revisions and `get-file-revs` (each its own module, `file`, `list`, `segments`, `deleted`, `log` and
+//! `file_revs`, over FSFS's node history in `history`).
 //! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
 //! never a server command.)
 //!
@@ -46,6 +63,8 @@
 //!
 //! No I/O, no clock, no randomness, no panic.
 
+use crate::authz::{PrincipalRules, may_read};
+use crate::handshake::ClientCapabilities;
 use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
 use crate::ra_svn::{ItemError, Value, write};
@@ -170,7 +189,7 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 17] = [
+const ELSEWHERE: [&str; 16] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
@@ -179,7 +198,6 @@ const ELSEWHERE: [&str; 17] = [
   "switch",
   "status",
   "diff",
-  "get-file-revs",
   "lock",
   "lock-many",
   "unlock",
@@ -295,14 +313,86 @@ const WRAP_MONTHS: i64 = 9;
 /// Format: `svn__strtoul` and `TIMESTAMP_FORMAT` (`time.c`).
 const DECIMAL: u64 = 10;
 
+/// `SVN_ERR_RA_NOT_AUTHORIZED`, `must_have_access`'s refusal of a path the session may not read, made without a
+/// message and so sent with the error's own, "Authorization failed".
+/// Format: the RA category's start, 120,000 + 10 × 5,000 = 170,000, plus 1 (`svn_error_codes.h` 982-984).
+const SVN_ERR_RA_NOT_AUTHORIZED: u32 = 170_001;
+
+/// `SVN_ERR_AUTHZ_UNREADABLE`, the refusal of a path a command needs that the session may not read.
+/// Format: the authz category's start, 120,000 + 20 × 5,000 = 220,000, plus 1 (`svn_error_codes.h` 1658-1660).
+const SVN_ERR_AUTHZ_UNREADABLE: u32 = 220_001;
+
+/// The revision properties a partly readable revision shows (`svn_repos_fs_revision_proplist`,
+/// `svn_repos_fs_revision_prop`, `fill_log_entry`).
+/// Format: `svn:author` and `svn:date`, as all three name them.
+const PARTLY_READABLE_PROPERTIES: [&[u8]; 2] = [AUTHOR_PROPERTY, DATE_PROPERTY];
+
 /// The session a command runs in, as the handshake (A-599) hands it over once the client is authenticated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Session<'session> {
   /// The repository's path the session's URL names, canonical (`svnserve`'s `fs_path`): every path a command names is
   /// beneath it, and the paths it answers with are relative to it.
   pub base: &'session str,
   /// The repository's UUID, which a node's properties carry as `svn:entry:uuid`.
   pub uuid: &'session str,
+  /// What the client announced it takes (the handshake's, A-599): `get-file-revs` sends svndiff 2 to a client that
+  /// accepts it, 0 to any other.
+  pub capabilities: ClientCapabilities,
+  /// The rules the repository's authorization file gives the session's principal (A-606: [`crate::authz::Authz`]'s
+  /// rules for the repository's name and the session's user, compiled once); `None` when the repository names no
+  /// authorization file, and then every path is readable (`authz_check_access` grants every path without one).
+  pub authz: Option<&'session PrincipalRules>,
+  /// Where the session's authentication stands for the command's path check (`must_have_access`).
+  pub authentication: Authentication,
+}
+
+/// Where a session's authentication stands for the command a path check is made in (`serve.c` `must_have_access`,
+/// 809-850).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authentication {
+  /// No authentication can be asked for: a path the session may not read is refused "Authorization failed" (170001)
+  /// with nothing before it, and a readable one is answered after the trivial authentication request.
+  Settled,
+  /// The session is anonymous and the client could authenticate for read access (`must_have_access`' condition: no
+  /// user yet, authenticated users granted read access, and a way to authenticate): a path the session may not read is
+  /// answered with nothing written, [`Outcome::Authenticate`], for the connection to ask the client.
+  Available,
+  /// The command runs again once the client has authenticated for it: its answer has no trivial authentication request
+  /// before it, the authentication's own success standing for it, and a path the new principal may not read either is
+  /// refused "Authorization failed" with nothing before it.
+  Done,
+}
+
+/// How much of a revision the session may read (`svn_repos_revision_access_level_t`), judged from its changed paths
+/// and the sources of those copied (`svn_repos_check_revision_access`, `detect_changed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RevisionAccess {
+  /// Every changed path and copy source is readable, or the revision changed nothing: every revision property shows.
+  Full,
+  /// Some changed path or copy source is not: the author and the date alone show.
+  Partial,
+  /// No changed path is readable: no revision property shows.
+  Nothing,
+}
+
+impl RevisionAccess {
+  /// The level decided from what was found (`decision:`): nothing readable, some of each, or all readable.
+  fn of(found_readable: bool, found_unreadable: bool) -> Self {
+    match (found_readable, found_unreadable) {
+      (false, _) => Self::Nothing,
+      (true, true) => Self::Partial,
+      (true, false) => Self::Full,
+    }
+  }
+
+  /// Whether a revision property named `name` shows at this level.
+  fn shows(self, name: &[u8]) -> bool {
+    match self {
+      Self::Full => true,
+      Self::Partial => PARTLY_READABLE_PROPERTIES.contains(&name),
+      Self::Nothing => false,
+    }
+  }
 }
 
 /// What the read commands read from the green beyond the index and the mergeinfo queries' [`Contents`]: revision
@@ -333,6 +423,10 @@ pub enum Outcome {
   Close,
   /// A command of the main set another piece answers. Nothing is appended.
   Elsewhere,
+  /// The path the command names is one the anonymous session may not read, and the client could authenticate
+  /// ([`Authentication::Available`]): nothing is appended. The caller asks the client to authenticate, as
+  /// `must_have_access` does with a username needed, then runs the command again with [`Authentication::Done`].
+  Authenticate,
 }
 
 /// Answers one command of a session: appends its answer to `out` and says what it made of it.
@@ -358,6 +452,8 @@ pub fn answer<R: Repository + ?Sized>(
     repository,
     base: session.base,
     uuid: session.uuid,
+    authz: session.authz,
+    authentication: session.authentication,
     out,
   };
   match *name {
@@ -376,6 +472,7 @@ pub fn answer<R: Repository + ?Sized>(
     "get-location-segments" => reads.location_segments(params),
     "get-deleted-rev" => reads.deleted_revision(params),
     "log" => reads.log(params),
+    "get-file-revs" => reads.file_revisions(params, session.capabilities),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -425,6 +522,31 @@ impl Failure {
     Self::new(SVN_ERR_FS_CORRUPT, String::from("Filesystem is corrupt"))
   }
 
+  /// `must_have_access`' refusal, made without a message: "Authorization failed", the error's own.
+  fn not_authorized() -> Self {
+    Self::new(
+      SVN_ERR_RA_NOT_AUTHORIZED,
+      String::from("Authorization failed"),
+    )
+  }
+
+  /// `SVN_ERR_AUTHZ_UNREADABLE` made without a message (`get_path_histories`, `svn_repos_get_logs5`'s shortcut):
+  /// "Item is not readable", the error's own.
+  fn unreadable_item() -> Self {
+    Self::new(
+      SVN_ERR_AUTHZ_UNREADABLE,
+      String::from("Item is not readable"),
+    )
+  }
+
+  /// `check_readability`'s refusal (`rev_hunt.c`): "Unreadable path encountered; access denied".
+  fn unreadable_path() -> Self {
+    Self::new(
+      SVN_ERR_AUTHZ_UNREADABLE,
+      String::from("Unreadable path encountered; access denied"),
+    )
+  }
+
   /// `( failure ( ( code message 0: 0 ) ) )`, a release build's empty file and zero line.
   fn value(&self) -> Value<'_> {
     let error = Value::List(vec![
@@ -472,6 +594,10 @@ struct Reads<'reads, R: ?Sized> {
   base: &'reads str,
   /// The repository's UUID.
   uuid: &'reads str,
+  /// The session's read rules, `None` reading every path.
+  authz: Option<&'reads PrincipalRules>,
+  /// Where the session's authentication stands for the command's path check.
+  authentication: Authentication,
   /// The output.
   out: &'reads mut Vec<u8>,
 }
@@ -562,33 +688,46 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     parse_time(c_string_of(date)).ok_or_else(Failure::bogus_date)
   }
 
-  /// `rev-proplist ( rev:number )`: a revision's properties.
+  /// `rev-proplist ( rev:number )`: a revision's properties, as many as the session may read of the revision
+  /// (`svn_repos_fs_revision_proplist`: all, the author and the date, or none).
   fn revision_list(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let Some(revision) = revnum(params.first()) else {
       return Ok(Outcome::Close);
     };
     self.trivial_auth()?;
-    match self.existing(revision) {
-      Ok(revision) => {
+    let found = self
+      .existing(revision)
+      .and_then(|revision| Ok((revision, self.revision_access(revision)?)));
+    match found {
+      Ok((revision, access)) => {
         let properties = self
           .repository
           .revision_properties(revision)
-          .unwrap_or_default();
+          .unwrap_or_default()
+          .into_iter()
+          .filter(|(name, _)| access.shows(name))
+          .collect();
         self.success(vec![proplist(properties)])
       }
       Err(failure) => self.failure(&failure),
     }
   }
 
-  /// `rev-prop ( rev:number name:string )`: one revision property, or none.
+  /// `rev-prop ( rev:number name:string )`: one revision property, or none, none too where the session may not read it
+  /// (`svn_repos_fs_revision_prop`).
   fn revision_property_command(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let (Some(revision), Some(name)) = (revnum(params.first()), c_string(params.get(1))) else {
       return Ok(Outcome::Close);
     };
     self.trivial_auth()?;
-    match self.existing(revision) {
-      Ok(revision) => {
-        let value = self.revision_property(revision, name);
+    let found = self
+      .existing(revision)
+      .and_then(|revision| Ok((revision, self.revision_access(revision)?)));
+    match found {
+      Ok((revision, access)) => {
+        let value = self
+          .revision_property(revision, name)
+          .filter(|_| access.shows(name));
         self.success(vec![Value::List(
           value.map(Value::String).into_iter().collect(),
         )])
@@ -597,12 +736,15 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     }
   }
 
-  /// `check-path ( path:string [ rev:number ] )`: the kind of node at the path, `none` where there is none.
+  /// `check-path ( path:string [ rev:number ] )`: the kind of node at the path, `none` where there is none; refused
+  /// first where the session may not read the path (`must_have_access`).
   fn check_path(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let Some((path, revision)) = path_and_revision(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
+    if let Some(outcome) = self.must_read(&path)? {
+      return Ok(outcome);
+    }
     let found = self
       .at_or_youngest(revision)
       .and_then(|revision| self.node(&path, revision));
@@ -615,12 +757,15 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     }
   }
 
-  /// `stat ( path:string [ rev:number ] )`: the node's dirent (`svn_repos_stat`), or nothing where there is none.
+  /// `stat ( path:string [ rev:number ] )`: the node's dirent (`svn_repos_stat`), or nothing where there is none;
+  /// refused first where the session may not read the path (`must_have_access`).
   fn stat(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let Some((path, revision)) = path_and_revision(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
+    if let Some(outcome) = self.must_read(&path)? {
+      return Ok(outcome);
+    }
     let found = self
       .at_or_youngest(revision)
       .and_then(|revision| self.node(&path, revision))
@@ -667,7 +812,15 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     };
     self.trivial_auth()?;
     let found = self.at_or_youngest(request.revision).and_then(|revision| {
-      let paths: Vec<&str> = request.paths.iter().map(String::as_str).collect();
+      let paths: Vec<&str> = request
+        .paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| self.readable(path))
+        .collect();
+      if paths.is_empty() {
+        return Ok(Vec::new());
+      }
       mergeinfo::catalog(
         self.index,
         self.repository,
@@ -696,14 +849,17 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     }
   }
 
-  /// `get-iprops ( path:string [ rev:number ] )`: the property lists of the path's ancestors that have any, the root's
-  /// first (`svn_repos_fs_get_inherited_props`). An absent revision is not the youngest here: `svnserve` opens the
-  /// root of the invalid revision, and so refuses it.
+  /// `get-iprops ( path:string [ rev:number ] )`: the property lists of the path's ancestors that have any and the
+  /// session may read, the root's first (`svn_repos_fs_get_inherited_props`); refused first where the session may not
+  /// read the path (`must_have_access`). An absent revision is not the youngest here: `svnserve` opens the root of the
+  /// invalid revision, and so refuses it.
   fn inherited(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let Some((path, revision)) = path_and_revision(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
+    if let Some(outcome) = self.must_read(&path)? {
+      return Ok(outcome);
+    }
     let found = self
       .existing(revision.unwrap_or(-1))
       .and_then(|revision| self.present_for_iprops(&path, revision))
@@ -736,7 +892,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     }
   }
 
-  /// The ancestors of `path` holding properties, root first, each by its path without the leading separator.
+  /// The ancestors of `path` holding properties that the session may read, root first, each by its path without the
+  /// leading separator (`svn_repos_fs_get_inherited_props`: an unreadable ancestor is passed over).
   fn ancestors_properties<'path>(
     &self,
     path: &'path str,
@@ -745,7 +902,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     let mut found = Vec::new();
     let mut place = parent(path);
     while let Some(ancestor) = place {
-      if let Some(node) = self.node(ancestor, revision)?
+      if self.readable(ancestor)
+        && let Some(node) = self.node(ancestor, revision)?
         && let PropertyList::Held { identity, .. } = node.properties()
       {
         let properties = self.repository.properties(&identity).unwrap_or_default();
@@ -784,7 +942,9 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     let Some(request) = DirectoryRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
+    if let Some(outcome) = self.must_read(&request.path)? {
+      return Ok(outcome);
+    }
     match self.directory_answer(&request) {
       Ok(answer) => {
         let mut items = vec![
@@ -867,7 +1027,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     Ok(properties)
   }
 
-  /// A directory's entries as `get_dir` writes them (`svn_fs_dir_entries`): refused for an absent path and for a file.
+  /// A directory's entries as `get_dir` writes them (`svn_fs_dir_entries`), each one the session may not read left out
+  /// (`lookup_access`); refused for an absent path and for a file.
   fn entries(
     &self,
     path: &str,
@@ -889,6 +1050,7 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       .ok_or_else(Failure::corrupt)?;
     names
       .into_iter()
+      .filter(|name| self.readable(&child_path(path, name)))
       .map(|name| self.dirent_of(path, name, revision, fields))
       .collect()
   }
@@ -946,12 +1108,20 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
 
   /// `svn_repos_trace_node_locations`: the revisions younger than the peg kept while the node's line reaches back to
   /// the same path, then each copy crossed back to its source, then the revisions where the path holds the same line.
+  /// With rules, the peg revision is opened first and an unreadable path refused (`check_readability`), and a copy's
+  /// source the session may not read ends the trace with the locations found before it.
   fn trace_locations(
     &self,
     path: &str,
     peg: i64,
     mut revisions: Vec<i64>,
   ) -> Result<Vec<(u64, String)>, Failure> {
+    if self.authz.is_some() {
+      self.existing(peg)?;
+      if !self.readable(path) {
+        return Err(Failure::unreadable_path());
+      }
+    }
     revisions.sort_unstable_by(|left, right| right.cmp(left));
     let mut wanted = revisions.into_iter().peekable();
     let mut start = peg;
@@ -979,6 +1149,9 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       }
       while wanted.next_if(|&at| at > previous_revision).is_some() {}
       (place, revision) = (previous, previous_revision);
+      if !self.readable(&place) {
+        return Ok(found);
+      }
     }
     let line = self
       .existing(revision)
@@ -1116,6 +1289,65 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       None => Ok(self.index.youngest()),
       Some(revision) => self.existing(revision),
     }
+  }
+
+  /// Whether the session may read `path`: the session's one read rule ([`crate::authz::may_read`]), which an update's
+  /// target and its drive ask too.
+  fn readable(&self, path: &str) -> bool {
+    may_read(self.authz, path)
+  }
+
+  /// `must_have_access` for reading `path` (`serve.c` 809-850): `None` when the session may read it, the command going
+  /// on after the trivial authentication request (none once the client has just authenticated for it); else the
+  /// command's outcome: [`Outcome::Authenticate`], nothing written, where the client could authenticate, or the
+  /// refusal "Authorization failed" with nothing before it.
+  fn must_read(&mut self, path: &str) -> Result<Option<Outcome>, ItemError> {
+    if self.readable(path) {
+      if self.authentication != Authentication::Done {
+        self.trivial_auth()?;
+      }
+      return Ok(None);
+    }
+    if self.authentication == Authentication::Available {
+      return Ok(Some(Outcome::Authenticate));
+    }
+    self.failure(&Failure::not_authorized())?;
+    Ok(Some(Outcome::Answered))
+  }
+
+  /// `svn_repos_check_revision_access`: how much of `revision` the session may read. Without rules, or for a
+  /// revision that changed nothing, all of it; else from each changed path and, for one a copy added, its source, until
+  /// one of each kind is found.
+  fn revision_access(&self, revision: Revision) -> Result<RevisionAccess, Failure> {
+    if self.authz.is_none() {
+      return Ok(RevisionAccess::Full);
+    }
+    let changes = self
+      .index
+      .changes(revision)
+      .map_err(|refusal| Failure::of_index(&refusal))?;
+    if changes.is_empty() {
+      return Ok(RevisionAccess::Full);
+    }
+    let (mut found_readable, mut found_unreadable) = (false, false);
+    for change in changes {
+      if self.readable(&change.path) {
+        found_readable = true;
+      } else {
+        found_unreadable = true;
+      }
+      if change
+        .copy_from
+        .as_ref()
+        .is_some_and(|source| !self.readable(&source.path))
+      {
+        found_unreadable = true;
+      }
+      if found_readable && found_unreadable {
+        break;
+      }
+    }
+    Ok(RevisionAccess::of(found_readable, found_unreadable))
   }
 
   /// `trivial_auth_request`: `( success ( ( ) 0: ) )`.
@@ -1683,6 +1915,8 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 mod deleted;
 mod file;
+mod file_revs;
+mod fold;
 mod history;
 mod list;
 mod log;

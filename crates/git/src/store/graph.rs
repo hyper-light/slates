@@ -289,12 +289,18 @@ impl Graph for StoreGraph<'_> {
   }
 
   fn brought(&self, green: u64, version: u64) -> impl Iterator<Item = u64> {
-    let index = usize::try_from(version).ok();
-    index
-      .and_then(|index| self.repository.brought(green, index))
-      .map(|positions| positions.iter().collect::<Vec<u64>>())
-      .unwrap_or_default()
-      .into_iter()
+    let read = usize::try_from(version)
+      .map_err(|_| StoreRefused::NoVersion { green, version })
+      .and_then(|index| self.repository.brought(self.store, green, index));
+    let positions = match read {
+      Ok(positions) => positions.iter().collect::<Vec<u64>>(),
+      Err(StoreRefused::NoVersion { .. }) => Vec::new(),
+      Err(refused) => {
+        self.failed(GraphFault::Store(refused));
+        Vec::new()
+      }
+    };
+    positions.into_iter()
   }
 }
 

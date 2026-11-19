@@ -5,14 +5,15 @@
 //! back into calls, its deltas decoded into windows, and written again. The writer must write the
 //! same calls, and every item byte for byte, a chunk of a delta `svnserve` stored LZ4-compressed
 //! aside, whose windows must decode alike. Beside them: absent entries to a client that did not
-//! announce them, svndiff version 0 to a client that does not accept version 2, every call out of
-//! the editor's order refused with nothing written, the bound on nodes open, and hostile window
-//! encodings.
+//! announce them, svndiff version 0 to a client that does not accept version 2, its chunks as
+//! `svndiff.c` writes them (a window of new data alone in two, the stream's header in the first),
+//! every call out of the editor's order refused with nothing written, the bound on nodes open, and
+//! hostile window encodings.
 
 use super::*;
 use crate::report::drive::Facts;
 use crate::report::recorded::{
-  SESSIONS, Written, drive_items, items, read_drive, stock_capabilities,
+  SESSIONS, Written, drive_items, items, read_drive, stock_capabilities, value_of,
 };
 
 /// The most nodes the tests' writers hold open: past the fixtures' deepest path.
@@ -202,6 +203,140 @@ fn a_client_that_does_not_accept_svndiff2_is_sent_version_0() {
   }
   assert_eq!(again.len(), read.calls.len());
   assert!(deltas > 0, "the checkout holds deltas");
+}
+
+/// Every `textdelta-chunk`'s bytes in `written`, in order.
+fn chunks_of(written: &[u8]) -> Vec<Vec<u8>> {
+  items(written)
+    .into_iter()
+    .filter_map(|item| {
+      let Value::List(parts) = value_of(item) else {
+        return None;
+      };
+      let [Value::Word("textdelta-chunk"), Value::List(params)] = parts.as_slice() else {
+        return None;
+      };
+      let [_, Value::String(bytes)] = params.as_slice() else {
+        return None;
+      };
+      Some(bytes.to_vec())
+    })
+    .collect()
+}
+
+/// A-616 part 2, its sibling bug of 2026-11-19 (`svndiff.c` at `d434dc14` and 1.15.0 alike:
+/// `window_handler` 259-261 hands a version-0 window holding no source copy and one instruction to
+/// `send_simple_insertion_window` 89-151, which writes the stream's header, when it is not out yet,
+/// with the window's integers and its instruction as one chunk, then its new data as another; every
+/// other window has the header written first as a chunk of its own, 263-270, then its integers, its
+/// instructions and its new data, each a chunk when it is not empty, 288-300): write, for a client
+/// that does not accept svndiff2, an added file's two windows of new data; an opened file's window
+/// copying its base, then one of new data past the base's end; an empty added file; and an added
+/// file whose one window copies no source but holds two instructions, a byte of new data and a copy
+/// of the target repeating it; expect `SVN\0` with the first window's integers and instruction as
+/// one chunk, its new data, the second window's integers and instruction, its new data; then
+/// `SVN\0` alone, the copying window's integers and instructions, the last window's integers and
+/// instruction and its new data; then `SVN\0` alone; then `SVN\0` alone, the two-instruction
+/// window's integers, its instructions and its new data; and for a stock client, `SVN\x02` alone
+/// first.
+#[test]
+fn a_version_0_window_of_new_data_alone_carries_the_streams_header_in_its_first_chunk() {
+  let new_data = three_bytes();
+  let copy = Window {
+    source_offset: 0,
+    source_len: 3,
+    target_len: 3,
+    instructions: vec![crate::svndiff::Instruction::Source {
+      offset: 0,
+      length: 3,
+    }],
+    new_data: Vec::new(),
+  };
+  let past_the_base = Window {
+    source_offset: 3,
+    ..three_bytes()
+  };
+  let repeated = Window {
+    source_offset: 0,
+    source_len: 0,
+    target_len: 4,
+    instructions: vec![
+      crate::svndiff::Instruction::New { length: 1 },
+      crate::svndiff::Instruction::Target {
+        offset: 0,
+        length: 3,
+      },
+    ],
+    new_data: b"a".to_vec(),
+  };
+  let md5 = [0u8; 16];
+  let added = |path| Call::Add {
+    kind: NodeKind::File,
+    path,
+    copy_from: None,
+    node: TEST_FACTS,
+  };
+  let drive = [
+    Call::TargetRevision(1),
+    Call::OpenRoot {
+      base: Some(1),
+      node: TEST_FACTS,
+    },
+    added("a.txt"),
+    Call::ApplyTextDelta { base_md5: None },
+    Call::Window(&new_data),
+    Call::Window(&new_data),
+    Call::TextDeltaEnd,
+    Call::CloseFile { md5 },
+    Call::Open {
+      kind: NodeKind::File,
+      path: "b.txt",
+      base: Some(1),
+      node: TEST_FACTS,
+    },
+    Call::ApplyTextDelta {
+      base_md5: Some(md5),
+    },
+    Call::Window(&copy),
+    Call::Window(&past_the_base),
+    Call::TextDeltaEnd,
+    Call::CloseFile { md5 },
+    added("c.txt"),
+    Call::ApplyTextDelta { base_md5: None },
+    Call::TextDeltaEnd,
+    Call::CloseFile { md5 },
+    added("d.txt"),
+    Call::ApplyTextDelta { base_md5: None },
+    Call::Window(&repeated),
+    Call::TextDeltaEnd,
+    Call::CloseFile { md5 },
+    Call::CloseDirectory,
+    Call::CloseEdit,
+  ];
+  let mut older = stock_capabilities();
+  older.accepts_svndiff2 = false;
+  let expected: [&[u8]; 14] = [
+    b"SVN\0\x00\x00\x03\x01\x03\x83",
+    b"abc",
+    b"\x00\x00\x03\x01\x03\x83",
+    b"abc",
+    b"SVN\0",
+    b"\x00\x03\x03\x02\x00",
+    b"\x03\x00",
+    b"\x03\x00\x03\x01\x03\x83",
+    b"abc",
+    b"SVN\0",
+    b"SVN\0",
+    b"\x00\x00\x04\x03\x01",
+    b"\x81\x43\x00",
+    b"a",
+  ];
+  assert_eq!(chunks_of(&write_all(&drive, &older)), expected);
+  let stock = chunks_of(&write_all(&drive, &stock_capabilities()));
+  assert_eq!(
+    stock.first().map(Vec::as_slice),
+    Some(b"SVN\x02".as_slice())
+  );
 }
 
 /// A call and whether the writer must take it, in a sequence a test writes.
@@ -405,7 +540,7 @@ fn svndiff_integers_are_read_within_the_format() {
 /// refused as a corrupt window, and a whole one split into its three sections.
 #[test]
 fn a_window_encoding_whose_lengths_do_not_hold_is_refused() {
-  let corrupt = Err(EditorRefused::Window(SvndiffError::CorruptWindowHeader));
+  let corrupt = Err(SvndiffError::CorruptWindowHeader);
   let encodings: [&[u8]; 4] = [
     b"",
     b"\x00\x00\x03\x01",

@@ -26,8 +26,9 @@
 //! **The drive.** [`Drive`] walks the report and the two revisions as `reporter.c` does, over the
 //! index (A-553) for every node's identity, kind, created revision, text and property list, the
 //! green ([`Repository`]) for directories' entries, property lists, revision properties and texts,
-//! and the session's [`Guards`] for its locks and what its principal may read. Its walk is an
-//! explicit stack of frames, never recursion, so the depth of a path is data, not stack: the
+//! the session's [`Guards`] for its locks, and the rules its principal reads by ([`Sources::rules`],
+//! the session's one read rule, which its read commands ask too). Its walk is an explicit stack of
+//! frames, never recursion, so the depth of a path is data, not stack: the
 //! anchor, each directory being compared (`delta_dirs`), each file being sent (`delta_files`). The
 //! report's paths are read as `reporter.c` reads its spill buffer: one ahead, each consumed by the
 //! directory it falls beneath (`fetch_path_info`, `skip_path_info`, `any_path_info`).
@@ -42,26 +43,30 @@
 //!   come in APR's per-table seeded hash order (three recordings of one repository gave three);
 //! - property lists and texts are compared by their content identity, where FSFS compares a
 //!   representation's place unless asked strictly (`svn_fs_props_changed`): a property list changed
-//!   and changed back is the same list here, as rep-sharing makes a text;
-//! - a text is sent as new data, a window of up to 102,400 bytes at a time; its delta against the
-//!   client's base is owed (`xdelta.c`), as FSFS sends a stored delta when it holds one.
+//!   and changed back is the same list here, as rep-sharing makes a text.
+//!
+//! **Texts.** A changed text's windows are Subversion's deltifier's against the client's base
+//! (A-652's [`deltas`], `txdelta_next_window` and `xdelta.c`), a window of up to 102,400 bytes at a
+//! time, the very windows a stock server sends, stored or computed; an added text's are new data.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
 #[cfg(test)]
-pub(in crate::report) mod green;
+pub(crate) mod green;
 pub(crate) mod history;
 #[cfg(test)]
 mod tests;
 
 use super::{Depth, PathInfo, Report, join_fspath, join_relpath};
+use crate::authz::{PrincipalRules, may_read};
 use crate::index::{
   ContentIdentity, Index, IndexRefusal, Node, NodeId, NodeKind, NodeRevisionId, PropertyList,
   Revision, Text,
 };
 use crate::reads::Repository;
-use crate::svndiff::{Instruction, WINDOW_LIMIT, Window};
+use crate::svndiff::{Instruction, WINDOW_LIMIT, Window, deltas};
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 /// The facts of the node an [`Call::OpenRoot`], [`Call::Open`] or [`Call::Add`] names, as the
@@ -211,14 +216,11 @@ const SVN_ERR_FS_NOT_FOUND: u32 = 160_013;
 /// Format: the authorization category's start, 220,000, plus 0 (`svn_error_codes.h`).
 const SVN_ERR_AUTHZ_ROOT_UNREADABLE: u32 = 220_000;
 
-/// What a drive asks of the session beyond the repository: the locks held now and what its
-/// principal may read (§4.17.4 items 9 and 10).
+/// What a drive asks of the session beyond the repository and its read rules: the locks held now
+/// (§4.17.4 item 10).
 pub trait Guards {
   /// The token of the lock held on `path` now (`svn_fs_get_lock`); none when it is not locked.
   fn lock_token(&self, path: &str) -> Option<&[u8]>;
-
-  /// Whether the session's principal may read `path` (`svnserve`'s `authz_check_access_cb`).
-  fn may_read(&self, path: &str) -> bool;
 }
 
 /// A refusal the drive met, answered after its [`Call::AbortEdit`]: Subversion's error number and
@@ -564,6 +566,8 @@ struct FileFrame {
   lock_token: Option<Vec<u8>>,
   /// Where it stands.
   phase: FilePhase,
+  /// The text its delta applies to, once the delta is begun against one.
+  source: Option<Text>,
   /// How many bytes of its text the windows have sent.
   sent: u64,
 }
@@ -579,15 +583,20 @@ enum Frame {
   File(Box<FileFrame>),
 }
 
-/// What a drive reads: the index, the green and the session's guards.
+/// What a drive reads: the index, the green, the session's guards and its read rules.
 #[derive(Debug)]
 pub struct Sources<'s, R: ?Sized, G: ?Sized> {
   /// The index (A-553).
   pub index: &'s Index,
   /// The green: entries, property lists, revision properties and texts.
   pub repository: &'s R,
-  /// The session's locks and read access.
+  /// The session's locks.
   pub guards: &'s G,
+  /// The rules the session's principal reads by (A-606), the ones its read commands ask, compiled once
+  /// for the principal by the connection: [`may_read`] judges every path the drive reads by them
+  /// (`authz_check_access_cb`). None where the repository names no authorization file, and then
+  /// every path is readable.
+  pub rules: Option<&'s PrincipalRules>,
 }
 
 /// A drive answering one finished report (module documentation).
@@ -663,16 +672,9 @@ impl Drive {
   /// first, [`Next::Ended`] after the last call.
   pub fn next<R: Repository + ?Sized, G: Guards + ?Sized>(
     &mut self,
-    index: &Index,
-    repository: &R,
-    guards: &G,
+    sources: &Sources<'_, R, G>,
     steps: usize,
   ) -> Next<'_> {
-    let sources = Sources {
-      index,
-      repository,
-      guards,
-    };
     self.current = None;
     let mut left = steps;
     while self.pending.is_empty() && !self.ended {
@@ -680,7 +682,7 @@ impl Drive {
         return Next::Paused;
       };
       left = rest;
-      if let Err(failure) = self.step(&sources) {
+      if let Err(failure) = self.step(sources) {
         self.fail(failure);
       }
     }
@@ -737,7 +739,7 @@ impl Drive {
     } else {
       dirname(&self.target_path).to_owned()
     };
-    if !sources.guards.may_read(&t_anchor) {
+    if !may_read(sources.rules, &t_anchor) {
       return Err(DriveFailure {
         code: SVN_ERR_AUTHZ_ROOT_UNREADABLE,
         message: String::from("Not authorized to open root of edit operation"),
@@ -991,7 +993,7 @@ impl Drive {
       self.skip_path_info(&entry.e_path);
       return Ok(());
     };
-    if !sources.guards.may_read(&entry.t_path) {
+    if !may_read(sources.rules, &entry.t_path) {
       self
         .pending
         .push_back(Owned::Absent(t_entry.kind, entry.e_path.clone()));
@@ -1168,6 +1170,7 @@ impl Drive {
       target: t_entry,
       lock_token: entry.info.and_then(|info| info.lock_token),
       phase: FilePhase::Properties,
+      source: None,
       sent: 0,
     })));
     Ok(())
@@ -1196,7 +1199,7 @@ impl Drive {
       let (path, revision) = node.copy_from()?;
       Some((path.to_owned(), revision))
     });
-    Ok(source.filter(|(path, _)| sources.guards.may_read(path)))
+    Ok(source.filter(|(path, _)| may_read(sources.rules, path)))
   }
 
   /// One step of a file's sending.
@@ -1246,6 +1249,7 @@ impl Drive {
           file.phase = FilePhase::Close;
           return Ok(());
         }
+        file.source = source.text;
         Some(source.md5())
       }
       None => None,
@@ -1259,8 +1263,10 @@ impl Drive {
     Ok(())
   }
 
-  /// The delta's next window: up to [`WINDOW_LIMIT`] bytes of the target's text as new data; at the
-  /// text's end, the delta's end next.
+  /// The delta's next window, `txdelta_next_window`'s: the target's next piece of up to
+  /// [`WINDOW_LIMIT`] bytes made from the source's piece at the same place, by Subversion's
+  /// deltifier ([`deltas`]), or as new data once the source has run out, its view where the source
+  /// ended; at the text's end, the delta's end next.
   fn window<R: Repository + ?Sized, G: Guards + ?Sized>(
     &mut self,
     file: &mut FileFrame,
@@ -1270,16 +1276,18 @@ impl Drive {
       file.phase = FilePhase::End;
       return Ok(());
     };
-    let new_data = read_window(sources.repository, &text, file.sent)?;
-    let length = u64::try_from(new_data.len()).map_err(|_| DriveFailure::corrupt())?;
+    let target = read_window(sources.repository, &text, file.sent)?;
+    let source_size = file.source.map_or(0, |source| source.size);
+    let view = file.sent.min(source_size);
+    let source = match file.source {
+      Some(source) if view < source.size => read_window(sources.repository, &source, view)?,
+      _ => Vec::new(),
+    };
+    let mut window = window_of(&source, &target)?;
+    window.source_offset = view;
+    let length = u64::try_from(target.len()).map_err(|_| DriveFailure::corrupt())?;
     file.sent = file.sent.saturating_add(length);
-    self.pending.push_back(Owned::Window(Window {
-      source_offset: 0,
-      source_len: 0,
-      target_len: length,
-      instructions: vec![Instruction::New { length }],
-      new_data,
-    }));
+    self.pending.push_back(Owned::Window(window));
     Ok(())
   }
 
@@ -1586,6 +1594,30 @@ fn property_changes(
     }
   }
   changes
+}
+
+/// The one window that makes `target`, at most a window's room, from `source`, at most as much: the
+/// target as new data when the source is empty (`compute_window`), else the deltifier's window, its
+/// source view counted from the source piece's start.
+fn window_of(source: &[u8], target: &[u8]) -> Result<Window, DriveFailure> {
+  let length = u64::try_from(target.len()).map_err(|_| DriveFailure::corrupt())?;
+  if source.is_empty() {
+    return Ok(Window {
+      source_offset: 0,
+      source_len: 0,
+      target_len: length,
+      instructions: vec![Instruction::New { length }],
+      new_data: target.to_vec(),
+    });
+  }
+  let room = usize::try_from(WINDOW_LIMIT)
+    .ok()
+    .and_then(NonZeroUsize::new)
+    .ok_or_else(DriveFailure::corrupt)?;
+  deltas(source, target, room)
+    .map_err(|_| DriveFailure::corrupt())?
+    .next()
+    .ok_or_else(DriveFailure::corrupt)
 }
 
 /// Up to [`WINDOW_LIMIT`] bytes of `text` from `offset`, gathered from the green's runs.

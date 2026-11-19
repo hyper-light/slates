@@ -84,6 +84,7 @@ mod held_copy;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod held_send;
 pub mod histogram;
+mod identities;
 mod image;
 pub mod landing;
 mod landing_entries;
@@ -151,10 +152,12 @@ mod deadlines;
 mod hangup;
 mod reap;
 mod repository;
-// git's `wildmatch` with `WM_PATHNAME`: the glob of a git repository's ref patterns and of a Subversion glob rule's
-// segments (A-597). No caller outside tests until the version-control servers' policy reads it (their pieces).
-#[cfg_attr(not(test), allow(dead_code))]
-mod wildmatch;
+// git's `dowild` transcribed line for line, the oracle `vcs_policy`'s tests hold its glob rules to (A-597): the file
+// that `slates_vcs::wildmatch`'s own tests read as their `reference`, compiled into this crate's tests too, so both
+// crates' tests hold one transcription and no product build links it (A-671). The matcher is `slates_vcs::wildmatch`.
+#[cfg(test)]
+#[path = "../../vcs/src/wildmatch/reference.rs"]
+mod wildmatch_reference;
 // §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597), and the push's check point over the
 // policy the repository's record holds (`admit`, A-622). No caller outside tests until the servers' push paths ask it
 // (their pieces: git's receive-pack, Subversion's commit editor, Mercurial's unbundle).
@@ -170,11 +173,38 @@ mod vcs_hooks;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod hook_driver;
-// The version-control servers' HTTP edge on the runtime's TCP (A-625 part 2): the listener, one connection a task, each
-// phase's wait learned, the bounds derived from the shard's budget, and git's site. No caller outside tests until the
-// daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
+// The version-control credentials a human enrolls for a principal (A-625 part 3): SSH keys by fingerprint and HTTP tokens
+// by their hash, on the partition each id routes to; the enroll and revoke verbs the issuer proves, and the lookup the
+// HTTP and SSH edges authenticate through. Public for the issuer's proofs, the token's text and the key line's reading.
+pub mod credentials;
+// Subversion's hooks as the server runs them (A-661): the glue between the Subversion server's call points and the hook
+// driver, Unix alone with it. No caller outside tests until the commit drive and the svn:// connection task call it
+// (A-655, A-656) and DAV's LOCK and UNLOCK (A-661's next part).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod svn_hooks;
+// The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
+// each phase's wait learned, the bounds derived from the shard's budget, git's site, Mercurial's (A-650), a connection
+// moved to its repository's shard, and the daemon's start. Upload-pack's store lender has no caller outside tests until
+// each repository's store lives on its owner shard (A-662).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
+// §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
+// phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
+// dispatched by its tool. No caller outside tests until the daemon starts an edge (its piece: the address, the host
+// key's keeping, the key store and the repositories).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_ssh;
+// The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
+// tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
+// from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654), and
+// its Mercurial import (A-675) none until the verb that asks for one (its piece).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_store;
+// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). Its caller is
+// the store map's import (`vcs_store::hg_import`, A-675), which has none outside tests until its verb.
+#[cfg_attr(not(test), allow(dead_code))]
+mod hg_base;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

@@ -6,6 +6,7 @@
 //! against hold one history, which the tests check against `changed.txt` (`svnlook changed`).
 
 use super::Guards;
+use crate::authz::{Authz, Bounds, Principal, PrincipalRules};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PropertyList, Revision,
   RevisionRecord, Text,
@@ -19,10 +20,10 @@ use aws_lc_rs::digest::{MD5_FOR_LEGACY_USE_ONLY, SHA1_FOR_LEGACY_USE_ONLY, SHA25
 use std::collections::BTreeMap;
 
 /// The history every report fixture was recorded against.
-pub(in crate::report) const HISTORY: &str = include_str!("../../../fixtures/report/history.txt");
+pub(crate) const HISTORY: &str = include_str!("../../../fixtures/report/history.txt");
 
 /// `svnlook changed` of every revision, as the recorder kept it.
-pub(in crate::report) const CHANGED: &str = include_str!("../../../fixtures/report/changed.txt");
+pub(crate) const CHANGED: &str = include_str!("../../../fixtures/report/changed.txt");
 
 /// The text of a `lines:` file's line (`make-fixtures.py` `LINE`).
 const LINE: &str = " of a text long enough to need several windows\n";
@@ -69,13 +70,13 @@ struct Row {
 /// The green of the fixtures' repository: every revision's tree, the property lists and texts by
 /// identity, and every revision's properties.
 #[derive(Debug, Default)]
-pub(in crate::report) struct Green {
+pub(crate) struct Green {
   /// Every revision's whole tree, by repository path.
   trees: Vec<BTreeMap<String, GreenNode>>,
   /// The property lists, by identity.
   lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
   /// The texts, by identity.
-  pub(in crate::report) texts: BTreeMap<ContentIdentity, Vec<u8>>,
+  pub(crate) texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// Every revision's properties.
   revisions: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
 }
@@ -139,34 +140,66 @@ impl Repository for Green {
   }
 }
 
-/// The session's guards in the fixtures: what the anonymous principal may not read
-/// (`make-fixtures.py` `AUTHZ`: `/trunk/secret` and beneath), and the locks held now.
-#[derive(Clone, Debug, Default)]
-pub(in crate::report) struct FixtureGuards {
-  /// The repository paths hidden, each with everything beneath it.
-  pub(in crate::report) hidden: Vec<String>,
-  /// The locks held, by path: their tokens.
-  pub(in crate::report) locks: BTreeMap<String, Vec<u8>>,
+impl crate::commit::drive::Green for Green {
+  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
+    self.texts.get(identity).map(Vec::as_slice)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    Repository::properties(self, identity)
+  }
+
+  fn name_text(&self, text: &[u8]) -> ContentIdentity {
+    digest_of(&SHA256, text)
+  }
+
+  fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
+    let encoded = encoded_list(
+      properties
+        .iter()
+        .map(|(name, value)| (name.as_slice(), value.as_slice())),
+    );
+    digest_of(&SHA256, &encoded)
+  }
 }
 
-impl FixtureGuards {
-  /// The anonymous principal's guards with no lock held.
-  pub(in crate::report) fn anonymous() -> Self {
-    Self {
-      hidden: vec![String::from("/trunk/secret")],
-      locks: BTreeMap::new(),
-    }
+/// A property list's bytes as the green names them: each name and value after its length, in the
+/// list's order.
+fn encoded_list<'p>(properties: impl Iterator<Item = (&'p [u8], &'p [u8])>) -> Vec<u8> {
+  let mut encoded = Vec::new();
+  for (name, value) in properties {
+    encoded.extend_from_slice(&u64::try_from(name.len()).unwrap().to_le_bytes());
+    encoded.extend_from_slice(name);
+    encoded.extend_from_slice(&u64::try_from(value.len()).unwrap().to_le_bytes());
+    encoded.extend_from_slice(value);
   }
+  encoded
+}
+
+/// The session's guards in the fixtures: the locks held now. What a principal may read is
+/// [`rules_of`]'s.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FixtureGuards {
+  /// The locks held, by path: their tokens.
+  pub(crate) locks: BTreeMap<String, Vec<u8>>,
 }
 
 impl Guards for FixtureGuards {
   fn lock_token(&self, path: &str) -> Option<&[u8]> {
     self.locks.get(path).map(Vec::as_slice)
   }
+}
 
-  fn may_read(&self, path: &str) -> bool {
-    !self.hidden.iter().any(|hidden| at_or_beneath(path, hidden))
-  }
+/// The fixtures' authorization file (`make-fixtures.py` `AUTHZ`): everyone reads, alice writes, and
+/// `/trunk/secret` is alice's alone.
+pub(crate) const AUTHZ: &[u8] = b"[/]\n* = r\nalice = rw\n[/trunk/secret]\n* =\nalice = rw\n";
+
+/// The rules [`AUTHZ`] gives `user` (none: the anonymous principal) in the fixtures' repository,
+/// compiled as the connection compiles a session's (A-606): the one read rule a drive judges paths
+/// by.
+pub(crate) fn rules_of(user: Option<&[u8]>) -> PrincipalRules {
+  let authz = Authz::parse(AUTHZ, None, Bounds::of(AUTHZ, None)).unwrap();
+  authz.rules(b"repo", Principal::named(user))
 }
 
 /// Whether `place` is `path` or beneath it.
@@ -187,7 +220,7 @@ fn digest_of<const N: usize>(
 }
 
 /// The MD5 of `bytes`.
-pub(in crate::report) fn md5(bytes: &[u8]) -> [u8; 16] {
+pub(crate) fn md5(bytes: &[u8]) -> [u8; 16] {
   digest_of(&MD5_FOR_LEGACY_USE_ONLY, bytes)
 }
 
@@ -242,7 +275,7 @@ fn content(spec: &str) -> Vec<u8> {
 }
 
 /// The fixtures' repository: its index and its green.
-pub(in crate::report) fn repository() -> (Index, Green) {
+pub(crate) fn repository() -> (Index, Green) {
   let mut index = Index::new();
   let mut green = Green::default();
   let root = GreenNode {
@@ -438,13 +471,11 @@ impl Green {
     if properties.is_empty() {
       return PropertyList::Empty;
     }
-    let mut encoded = Vec::new();
-    for (name, value) in properties {
-      encoded.extend_from_slice(&u64::try_from(name.len()).unwrap().to_le_bytes());
-      encoded.extend_from_slice(name.as_bytes());
-      encoded.extend_from_slice(&u64::try_from(value.len()).unwrap().to_le_bytes());
-      encoded.extend_from_slice(value);
-    }
+    let encoded = encoded_list(
+      properties
+        .iter()
+        .map(|(name, value)| (name.as_bytes(), value.as_slice())),
+    );
     let identity: ContentIdentity = digest_of(&SHA256, &encoded);
     let list = properties
       .iter()
@@ -514,11 +545,11 @@ fn revision_of(word: &str) -> Revision {
 }
 
 /// The prefix that begins every entry property's name.
-pub(in crate::report) const ENTRY_PREFIX: &str = "svn:entry:";
+pub(crate) const ENTRY_PREFIX: &str = "svn:entry:";
 
 /// A drive's calls in a form two drives of one edit share.
 #[derive(Debug, PartialEq, Eq)]
-pub(in crate::report) enum Normal {
+pub(crate) enum Normal {
   /// A call as it was.
   Call(Written),
   /// A run of property changes on one node: the entry properties in their order, then the rest
@@ -531,10 +562,7 @@ pub(in crate::report) enum Normal {
 }
 
 /// The calls in their shared form, every delta applied to the text whose MD5 it names.
-pub(in crate::report) fn normalize(
-  calls: Vec<Written>,
-  texts: &BTreeMap<[u8; 16], Vec<u8>>,
-) -> Vec<Normal> {
+pub(crate) fn normalize(calls: Vec<Written>, texts: &BTreeMap<[u8; 16], Vec<u8>>) -> Vec<Normal> {
   let mut normal = Vec::new();
   for call in calls {
     match call {
@@ -561,7 +589,7 @@ pub(in crate::report) fn normalize(
 }
 
 /// A run of property changes with its entry properties kept in order and the rest sorted by name.
-pub(in crate::report) fn sort_own_properties(properties: &mut [(String, Option<Vec<u8>>)]) {
+pub(crate) fn sort_own_properties(properties: &mut [(String, Option<Vec<u8>>)]) {
   let entry = properties
     .iter()
     .take_while(|(name, _)| name.starts_with(ENTRY_PREFIX))
@@ -570,7 +598,7 @@ pub(in crate::report) fn sort_own_properties(properties: &mut [(String, Option<V
 }
 
 /// A delta applied to the text whose MD5 it names, none naming no bytes.
-pub(in crate::report) fn applied(
+pub(crate) fn applied(
   base: Option<[u8; 16]>,
   windows: &[Window],
   texts: &BTreeMap<[u8; 16], Vec<u8>>,
@@ -581,7 +609,7 @@ pub(in crate::report) fn applied(
 }
 
 /// The fixtures' texts by MD5, the empty one among them.
-pub(in crate::report) fn texts_by_md5(green: &Green) -> BTreeMap<[u8; 16], Vec<u8>> {
+pub(crate) fn texts_by_md5(green: &Green) -> BTreeMap<[u8; 16], Vec<u8>> {
   let mut texts: BTreeMap<[u8; 16], Vec<u8>> = green
     .texts
     .values()
@@ -591,10 +619,10 @@ pub(in crate::report) fn texts_by_md5(green: &Green) -> BTreeMap<[u8; 16], Vec<u
   texts
 }
 
-/// The guards a recorded session's drive ran under: the anonymous principal's, and in the session
-/// that holds `a.txt`'s lock, the lock its report names.
-pub(in crate::report) fn guards_of(name: &str, report: &Report) -> FixtureGuards {
-  let mut guards = FixtureGuards::anonymous();
+/// The guards a recorded session's drive ran under: no lock held, and in the session that holds
+/// `a.txt`'s lock, the lock its report names.
+pub(crate) fn guards_of(name: &str, report: &Report) -> FixtureGuards {
+  let mut guards = FixtureGuards::default();
   if name == "update-with-lock.1" {
     let held = report
       .paths

@@ -21,8 +21,8 @@ use crate::unpack::{NoIndex, Object, Outside, Reader, Refusal};
 use super::fragments::{commit_over, text};
 use super::oracle::{GREENS, Model, Real, apply, op};
 use super::{
-  Answer, EXCHANGE, Made, Ticks, blob, brought_by, commit, ids, push_and_move, store, streamed,
-  tree,
+  Answer, EXCHANGE, Made, Ticks, WINDOW, blob, brought_by, commit, ids, push_and_move, reached_now,
+  store, streamed, tree,
 };
 
 /// The objects a client holds: a thin pack's bases.
@@ -137,7 +137,7 @@ fn run_answer(thin: bool, filter: Option<Filter>) -> Answer {
 
 /// The ids D(1) and D(2) of green 1 hold.
 fn run_ids(repository: &Repository, store: &ContentStore) -> BTreeSet<ObjectId> {
-  ids(repository, store, &brought_by(repository, 1, [1, 2]))
+  ids(repository, store, &brought_by(repository, store, 1, [1, 2]))
     .into_iter()
     .collect()
 }
@@ -151,7 +151,7 @@ fn a_clone_is_the_base_pack_then_the_fragments_after_it() {
   for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
     let mut store = store();
     let (repository, versions) = three_versions(format, &mut store, true);
-    let reached = repository.reached(1).unwrap().clone();
+    let reached = reached_now(&repository, &store, 1);
     let (pack, counters) = streamed(&repository, &store, Answer::objects(&reached), u64::MAX);
     let parts = [
       repository.base_part(1, false).unwrap().1,
@@ -214,7 +214,7 @@ fn a_fetch_is_its_runs_fragments_then_what_no_fragment_covers() {
   )
   .unwrap();
   let mut answer = run_answer(true, None);
-  answer.objects = repository.brought(2, 0).unwrap().iter().collect();
+  answer.objects = repository.brought(&store, 2, 0).unwrap().iter().collect();
   let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
   let read = read_back(format, &pack, &Held::of(&versions[0])).unwrap();
   let mut expected = run_ids(&repository, &store);
@@ -292,7 +292,7 @@ fn without_ofs_delta_no_entry_names_its_base_by_offset() {
   let mut store = store();
   let (repository, objects) = similar_files(format, &mut store);
   let expected: BTreeSet<ObjectId> = objects.iter().map(|object| object.id).collect();
-  let mut answer = Answer::objects(repository.brought(1, 0).unwrap());
+  let mut answer = Answer::objects(&repository.brought(&store, 1, 0).unwrap());
   let is_offset =
     |representation: &Representation| matches!(representation, Representation::OfsDelta { .. });
   for ofs in [false, true] {
@@ -318,7 +318,7 @@ fn a_pack_streamed_a_unit_a_turn_is_the_pack_in_one_turn() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, _) = three_versions(format, &mut store, true);
-  let clone = Answer::objects(repository.reached(1).unwrap());
+  let clone = Answer::objects(&reached_now(&repository, &store, 1));
   for answer in [clone, run_answer(true, None)] {
     let (whole, single) = streamed(&repository, &store, answer.clone(), u64::MAX);
     let (sliced, turns) = streamed(&repository, &store, answer, 1);
@@ -357,13 +357,13 @@ fn a_filter_sends_the_runs_objects_it_admits_and_the_want_always() {
   repository.release(&mut store).unwrap();
 }
 
-/// A-639 (§4.17.2 "Filters": "`blob:none` and `object:type` choose fragment classes"; `blob:limit` chooses objects by
+/// A-653 (§4.17.2 "Filters": "`blob:none` and `object:type` choose fragment classes"; `blob:limit` chooses objects by
 /// their rows). Do: answer a clone under `blob:limit=1000`, its objects one by one as the negotiation filtered them:
 /// every commit and tree, and the one small file. Expect: the base pack's part without blobs and the newest version's
-/// copied whole; the parts holding a large blob, partly wanted, left, and their one wanted object encoded afresh; read
-/// back, exactly the filtered closure, each once.
+/// copied whole; the base pack's blobs, partly wanted, read entry by entry for the small file; nothing encoded afresh;
+/// read back, exactly the filtered closure, each once.
 #[test]
-fn a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded() {
+fn a_blob_limit_clone_reads_a_partly_wanted_part_entry_by_entry() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, versions) = three_versions(format, &mut store, true);
@@ -374,11 +374,7 @@ fn a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded() {
     .filter(|made| filter.admits(made.kind, u64::try_from(made.content.len()).unwrap(), 0))
     .map(|made| made.id)
     .collect();
-  let positions = wanted
-    .iter()
-    .map(|id| repository.object(&store, id).unwrap().position)
-    .collect();
-  let mut answer = Answer::objects(&Positions::of(positions));
+  let mut answer = Answer::objects(&positions_of(&repository, &store, &wanted));
   answer.filter = Some(filter);
   let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
   assert_eq!(
@@ -388,7 +384,108 @@ fn a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded() {
   let loose = counters.loose_whole + counters.loose_deltas;
   assert_eq!(
     (counters.parts_copied, counters.parts_by_entry, loose),
-    (2, 0, 1)
+    (2, 1, 0)
+  );
+  repository.release(&mut store).unwrap();
+}
+
+/// The positions of `ids` in `repository`.
+fn positions_of(
+  repository: &Repository,
+  store: &ContentStore,
+  ids: &BTreeSet<ObjectId>,
+) -> Positions {
+  Positions::of(
+    ids
+      .iter()
+      .map(|id| repository.object(store, id).unwrap().position)
+      .collect(),
+  )
+}
+
+/// One version over `count` files, `f000` on, file `n` holding `file n` and a newline, so the files' lengths differ
+/// by the number's digits and a fragment's entries, kept largest first, are not in their objects' position order; its
+/// fragments encoded. The repository and the files, by number.
+fn files_in_one_version(
+  format: ObjectFormat,
+  store: &mut ContentStore,
+  count: usize,
+) -> (Repository, Vec<Made>) {
+  let mut repository = Repository::new(format);
+  let files: Vec<Made> = (0..count)
+    .map(|at| blob(format, format!("file {at}\n").as_bytes()))
+    .collect();
+  let names: Vec<String> = (0..count).map(|at| format!("f{at:03}")).collect();
+  let entries: Vec<(Mode, &[u8], ObjectId)> = names
+    .iter()
+    .zip(&files)
+    .map(|(name, file)| (Mode::File, name.as_bytes(), file.id))
+    .collect();
+  let root = tree(format, &entries);
+  let head = commit(format, root.id, &[], 1);
+  let mut objects = vec![head.clone(), root];
+  objects.extend(files.iter().cloned());
+  push_and_move(&mut repository, store, objects, &[(1, Some(head.id))]).unwrap();
+  repository
+    .encode_fragments(store, (1, 0), &mut Ticks(0), EXCHANGE)
+    .unwrap();
+  (repository, files)
+}
+
+/// A-653 (a part read entry by entry judges its wanted entries alone, so a fetch of a few objects from a large part
+/// costs the few). Do: push one version over forty files, encode it, and answer two of the files one by one. Expect:
+/// read back, exactly the two; their part read entry by entry with two entries judged, of its forty.
+#[test]
+fn only_the_wanted_entries_of_a_part_are_judged() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let (repository, files) = files_in_one_version(format, &mut store, 40);
+  let wanted: BTreeSet<ObjectId> = [files[7].id, files[31].id].into_iter().collect();
+  let answer = Answer::objects(&positions_of(&repository, &store, &wanted));
+  let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
+  assert_eq!(
+    once(&read_back(format, &pack, &Held::none()).unwrap()),
+    wanted
+  );
+  assert_eq!(
+    (counters.parts_by_entry, counters.entries_judged),
+    (1, 2),
+    "{counters:?}"
+  );
+  repository.release(&mut store).unwrap();
+}
+
+/// A-653 (module docs, **Slices**: a part's wanted positions marked a window's worth of handles a unit, a bit an entry
+/// in words of marks, and the marked entries read word after word). Do: push one version over three units' worth of
+/// files, encode it, and answer two of every three files one by one: more positions than one unit marks, their entries
+/// in every word of the marks. Expect: read back, exactly the files answered; their part read entry by entry, each of
+/// them judged once.
+#[test]
+fn a_parts_wanted_entries_are_marked_over_units_and_read_over_words() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  // Shape: one unit marks a window's worth of handles, eight bytes each (`store::upload`'s `handles`); three units'
+  // worth of files, two of every three wanted, are more than one unit marks and lie in every word of the marks.
+  let handles = WINDOW / size_of::<u64>();
+  let thirds = 3;
+  let (repository, files) = files_in_one_version(format, &mut store, handles * thirds);
+  let wanted: BTreeSet<ObjectId> = files
+    .iter()
+    .enumerate()
+    .filter(|(at, _)| !at.is_multiple_of(thirds))
+    .map(|(_, file)| file.id)
+    .collect();
+  assert!(wanted.len() > handles);
+  let answer = Answer::objects(&positions_of(&repository, &store, &wanted));
+  let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
+  assert_eq!(
+    once(&read_back(format, &pack, &Held::none()).unwrap()),
+    wanted
+  );
+  assert_eq!(
+    (counters.parts_by_entry, counters.entries_judged),
+    (1, u64::try_from(wanted.len()).unwrap()),
+    "{counters:?}"
   );
   repository.release(&mut store).unwrap();
 }
@@ -473,10 +570,10 @@ fn upload_packs_for_git_index_pack() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, _) = three_versions(format, &mut store, true);
-  let clone = Answer::objects(repository.reached(1).unwrap());
+  let clone = Answer::objects(&reached_now(&repository, &store, 1));
   let mut no_ofs = clone.clone();
   no_ofs.ofs = false;
-  let base = Answer::objects(repository.brought(1, 0).unwrap());
+  let base = Answer::objects(&repository.brought(&store, 1, 0).unwrap());
   let packs = [
     ("clone", clone),
     ("base", base),
@@ -502,7 +599,7 @@ fn a_base_pack_made_again_under_a_stream_ends_it_refused() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (mut repository, _) = three_versions(format, &mut store, true);
-  let mut answer = Answer::objects(repository.reached(1).unwrap());
+  let mut answer = Answer::objects(&reached_now(&repository, &store, 1));
   answer.ofs = false;
   let mut upload = Upload::new(answer, &repository);
   let mut clock = Ticks(0);
@@ -691,7 +788,10 @@ fn check_answer(real: &Real, model: &Model, fetch: (u64, Option<usize>, usize), 
   for object in &read {
     assert_eq!(object.content, model.objects[&object.id].content);
   }
-  let brought = real.repository.brought(green, through).unwrap();
+  let brought = real
+    .repository
+    .brought(&real.store, green, through)
+    .unwrap();
   if after.is_none() && filter.is_none() && !brought.is_empty() {
     assert!(
       counters.parts_copied + counters.parts_by_entry > 0,

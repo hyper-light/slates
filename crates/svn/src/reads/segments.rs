@@ -158,13 +158,17 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       ));
     }
     let peg = self.existing(peg)?;
+    if !self.readable(&request.path) {
+      return Err(Failure::unreadable_path());
+    }
     let as_revision = |revision: i64| Revision::try_from(revision).map_err(|_| Failure::corrupt());
     Ok((peg, as_revision(start)?, as_revision(end)?))
   }
 
   /// One turn of `svn_repos_node_location_segments`' loop at `path` in `revision`: the segment from the closest copy
   /// (or the node's origin) to `revision`, sent where it meets `end..=start`, the gap down to the copy's source sent
-  /// likewise, and the copy's source to move to. Refused when the path is absent.
+  /// likewise, and the copy's source to move to. Refused when the path is absent; a path the session may not read
+  /// ends the walk there, nothing sent (`authz muster`).
   pub(super) fn segment_turn(
     &self,
     path: &str,
@@ -189,6 +193,12 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
         Some((previous_path, unsigned(previous_revision)?))
       }
     };
+    if !self.readable(path) {
+      return Ok(Turn {
+        sent: Vec::new(),
+        next: None,
+      });
+    }
     let mut sent = Vec::new();
     let reached = match cropped(&segment, start, end) {
       Some(segment) => {

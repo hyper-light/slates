@@ -10,7 +10,9 @@
 //! revision a path was deleted in, copy sources, pausing at any step, and generated hostile
 //! reports, whose drives must end and stay in the editor's order.
 
-use super::green::{CHANGED, FixtureGuards, Green, guards_of, normalize, repository, texts_by_md5};
+use super::green::{
+  CHANGED, FixtureGuards, Green, guards_of, md5, normalize, repository, rules_of, texts_by_md5,
+};
 use super::*;
 use crate::handshake::ClientCapabilities;
 use crate::ra_svn::Value;
@@ -31,12 +33,20 @@ const COMPARED_DRIVES: usize = 29;
 /// The most nodes a writer checking a generated drive holds open: past any path a report names.
 const MOST_OPEN: usize = 64;
 
-/// A drive's calls, owned as a recording's are.
+/// A drive's calls, owned as a recording's are, its reads judged by the anonymous principal's
+/// rules.
 fn run(drive: &mut Drive, index: &Index, green: &Green, guards: &FixtureGuards) -> Vec<Written> {
   let mut calls = Vec::new();
   let mut delta: Option<(Option<[u8; 16]>, Vec<Window>)> = None;
+  let anonymous = rules_of(None);
+  let sources = Sources {
+    index,
+    repository: green,
+    guards,
+    rules: Some(&anonymous),
+  };
   loop {
-    let call = match drive.next(index, green, guards, STEPS) {
+    let call = match drive.next(&sources, STEPS) {
       Next::Call(call) => call,
       Next::Paused => panic!("a call needed more steps than {STEPS}"),
       Next::Ended => return calls,
@@ -252,7 +262,7 @@ fn trunk_report(from: Revision, to: Revision, send_copyfrom_args: bool) -> Repor
 #[test]
 fn an_added_copy_names_its_source_when_the_client_asks() {
   let (index, green) = repository();
-  let guards = FixtureGuards::anonymous();
+  let guards = FixtureGuards::default();
   let calls = |copies| {
     run(
       &mut Drive::new(trunk_report(3, 4, copies), b"u"),
@@ -296,7 +306,7 @@ fn an_added_copy_names_its_source_when_the_client_asks() {
 #[test]
 fn a_drive_paused_at_any_step_makes_the_same_calls() {
   let (index, green) = repository();
-  let guards = FixtureGuards::anonymous();
+  let guards = FixtureGuards::default();
   let session = SESSIONS
     .iter()
     .find(|session| session.name == "checkout-head.1")
@@ -315,7 +325,8 @@ fn a_drive_paused_at_any_step_makes_the_same_calls() {
   }
 }
 
-/// A drive's calls with `steps` steps a call, resumed after every pause, and the pauses counted.
+/// A drive's calls with `steps` steps a call, resumed after every pause, and the pauses counted,
+/// its reads judged by the anonymous principal's rules.
 fn run_paused(
   drive: &mut Drive,
   index: &Index,
@@ -326,8 +337,15 @@ fn run_paused(
   let mut calls = Vec::new();
   let mut pauses = 0;
   let mut delta: Option<(Option<[u8; 16]>, Vec<Window>)> = None;
+  let anonymous = rules_of(None);
+  let sources = Sources {
+    index,
+    repository: green,
+    guards,
+    rules: Some(&anonymous),
+  };
   loop {
-    match drive.next(index, green, guards, steps) {
+    match drive.next(&sources, steps) {
       Next::Paused => pauses += 1,
       Next::Ended => return (calls, pauses),
       Next::Call(Call::ApplyTextDelta { base_md5 }) => delta = Some((base_md5, Vec::new())),
@@ -410,7 +428,7 @@ proptest! {
     ),
   ) {
     let (index, green) = repository();
-    let guards = FixtureGuards::anonymous();
+    let guards = FixtureGuards::default();
     let mut report = trunk_report(from, to, true);
     report.requested_depth = DEPTHS[requested];
     report.paths = paths.iter().map(path_info).collect();
@@ -426,11 +444,64 @@ proptest! {
     let mut writer = EditorWriter::new(&capabilities, MOST_OPEN);
     let mut out = Vec::new();
     let mut calls = 0usize;
-    while let Next::Call(call) = drive.next(&index, &green, &guards, STEPS) {
+    let anonymous = rules_of(None);
+    let sources = Sources {
+      index: &index,
+      repository: &green,
+      guards: &guards,
+      rules: Some(&anonymous),
+    };
+    while let Next::Call(call) = drive.next(&sources, STEPS) {
       prop_assert_eq!(writer.write(&call, &mut out), Ok(()));
       calls += 1;
       prop_assert!(calls < STEPS, "the drive does not end");
     }
     prop_assert!(calls > 0);
   }
+}
+
+/// A-616 part 2 with A-652 (`delta_files` through Subversion's deltifier): drive `/trunk` from r5
+/// to r6, where one line of `big.txt`'s 6,000 changed; expect its delta against the r5 text's MD5,
+/// windows that copy from that text and carry far less new data than the text, and the r6 text
+/// made of them.
+#[test]
+fn a_changed_text_is_sent_as_a_delta_against_its_base() {
+  let (index, green) = repository();
+  let guards = FixtureGuards::default();
+  let mut drive = Drive::new(trunk_report(5, 6, false), b"u");
+  let calls = run(&mut drive, &index, &green, &guards);
+  let at = calls
+    .iter()
+    .position(|call| matches!(call, Written::Open(NodeKind::File, path, _) if path == "big.txt"))
+    .unwrap();
+  let Some(Written::Delta(base, _, windows)) = calls[at..]
+    .iter()
+    .find(|call| matches!(call, Written::Delta(..)))
+  else {
+    panic!("big.txt sent no delta");
+  };
+  let texts = texts_by_md5(&green);
+  let source = &texts[&base.unwrap()];
+  let target = crate::svndiff::apply_all(source, windows).unwrap();
+  let copies = windows
+    .iter()
+    .flat_map(|window| &window.instructions)
+    .filter(|instruction| matches!(instruction, crate::svndiff::Instruction::Source { .. }))
+    .count();
+  let new_data: usize = windows.iter().map(|window| window.new_data.len()).sum();
+  assert!(copies > 0, "no window copied from the base");
+  assert!(
+    new_data * 100 < target.len(),
+    "{new_data} new bytes of {}",
+    target.len()
+  );
+  let closed = calls[at..].iter().find_map(|call| match call {
+    Written::CloseFile(md5) => Some(*md5),
+    _ => None,
+  });
+  assert_eq!(
+    Some(md5(&target)),
+    closed,
+    "the text made is not the one closed"
+  );
 }

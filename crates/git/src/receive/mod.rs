@@ -118,6 +118,14 @@ impl HiddenRefs for NoneHidden {
   }
 }
 
+/// What a borrowed predicate hides: a session owns its hidden refs ([`Session`]), and a caller that
+/// keeps the predicate itself hands the session a reference.
+impl<T: HiddenRefs + ?Sized> HiddenRefs for &T {
+  fn is_hidden(&self, name: &[u8]) -> bool {
+    (**self).is_hidden(name)
+  }
+}
+
 /// A repository's objects, as the pack reader takes a thin pack's bases from.
 struct Bases<'r, R: ?Sized>(&'r R);
 

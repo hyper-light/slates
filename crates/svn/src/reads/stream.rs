@@ -1,8 +1,8 @@
 //! The rest of a streaming answer (§4.17.4 "4. Reads": long reads are sliced under the shard's budget; item 11: no file
 //! is held whole anywhere on the path; A-613 part 2): what a command writes after its head, resumed a slice at a time.
 //!
-//! A command whose answer grows with the repository (a file's text, a listing, a node's location segments, and with
-//! the commands that follow, a log, a file's revisions) writes its head into the caller's output and hands back a
+//! A command whose answer grows with the repository (a file's text, a listing, a node's location segments, a log, a
+//! file's revisions) writes its head into the caller's output and hands back a
 //! [`Stream`]. The caller writes that output to the connection, then calls [`Stream::resume`] with the room it can give
 //! the next slice, and so on until it answers [`Progress::Done`]. Each call makes progress, so a stream always ends: it
 //! writes at least one item, or takes at least one step of a walk. It stops once the bytes it wrote, and the steps it
@@ -13,6 +13,7 @@
 //! A stream reads only fixed revisions, which never change, so the index and the green may grow between slices.
 
 use super::file::TextStream;
+use super::file_revs::FileRevsStream;
 use super::list::ListStream;
 use super::log::LogStream;
 use super::segments::SegmentStream;
@@ -38,6 +39,8 @@ enum Rest {
   Segments(SegmentStream),
   /// `log`'s walk, its `done` and its answer, boxed: its frames make it the largest.
   Log(Box<LogStream>),
+  /// `get-file-revs`' revisions, their deltas, `done` and the answer, boxed beside the log.
+  FileRevs(Box<FileRevsStream>),
 }
 
 /// Whether a streaming answer has more to write.
@@ -47,6 +50,10 @@ pub enum Progress {
   More,
   /// The answer is whole.
   Done,
+  /// The connection ends here without a further word, as `svnserve`'s does where an assertion aborts its process
+  /// (`get-file-revs` of a file whose first location the session may not read); nothing more is written, and the
+  /// caller ends the connection.
+  Close,
 }
 
 impl Stream {
@@ -68,6 +75,13 @@ impl Stream {
   pub(super) fn log(log: LogStream) -> Self {
     Self {
       rest: Rest::Log(Box::new(log)),
+    }
+  }
+
+  /// A file's revisions to stream.
+  pub(super) fn file_revisions(revisions: FileRevsStream) -> Self {
+    Self {
+      rest: Rest::FileRevs(Box::new(revisions)),
     }
   }
 
@@ -96,6 +110,8 @@ impl Stream {
       repository,
       base: session.base,
       uuid: session.uuid,
+      authz: session.authz,
+      authentication: session.authentication,
       out,
     };
     match &mut self.rest {
@@ -103,6 +119,7 @@ impl Stream {
       Rest::List(list) => list.resume(&mut reads, room),
       Rest::Segments(segments) => segments.resume(&mut reads, room),
       Rest::Log(log) => log.resume(&mut reads, room),
+      Rest::FileRevs(revisions) => revisions.resume(&mut reads, room),
     }
   }
 }

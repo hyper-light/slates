@@ -20,15 +20,14 @@
 //!   `svn:date` parsed and written again (time 0's for a revision without one; a date that does not parse refuses the
 //!   listing).
 //! - A name matches a pattern as `svn_utf__fuzzy_glob_match` matches it: folded, then APR's `apr_fnmatch` with no
-//!   flags. The fold is utf8proc's decomposition with case folding and marks stripped, composed again; over ASCII that
-//!   is the letters `A` to `Z` lowered and nothing else, which is what this port does. A name beyond ASCII is matched
-//!   with its ASCII letters lowered alone: utf8proc's case folding and mark stripping need Unicode's tables, owed
-//!   (GAPS).
+//!   flags, the pattern as the client sent it. The fold is utf8proc's decomposition with case folding and marks
+//!   stripped, composed again ([`super::fold`], Unicode's own tables: `Ärger` is `arger` and `Straße` is `strasse`).
 //!
 //! The walk is a [`super::Stream`]: each slice ends once the bytes it wrote and the entries it visited reach the room
 //! the caller gives, so a slice's output and work are bounded by the room. What it keeps is one level of names per
 //! directory on the path from the listed one, as `svn_repos_list` keeps them.
 
+use super::fold::fold;
 use super::stream::{Progress, Stream};
 use super::{
   AUTHOR_PROPERTY, DATE_PROPERTY, DIRECTORY_SIZE, DIRENT_FIELDS, DONE, Failure, Outcome, Reads,
@@ -194,13 +193,15 @@ fn patterns_of(items: &[Value<'_>]) -> Option<Vec<Vec<u8>>> {
 }
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
-  /// `list ( path [ rev ] depth ? ( field ... ) ? ( pattern ... ) )` (`serve.c` `list`): the authentication request,
-  /// the revision opened, then a [`Stream`] of the walk.
+  /// `list ( path [ rev ] depth ? ( field ... ) ? ( pattern ... ) )` (`serve.c` `list`): the read access checked
+  /// (`must_have_access`), the revision opened, then a [`Stream`] of the walk.
   pub(super) fn list(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
     let Some(request) = ListRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
+    if let Some(outcome) = self.must_read(&request.path)? {
+      return Ok(outcome);
+    }
     match self.at_or_youngest(request.revision) {
       Ok(revision) => Ok(Outcome::Streaming(Stream::list(ListStream::new(
         request, revision,
@@ -352,8 +353,9 @@ impl ListStream {
     )
   }
 
-  /// `do_list`'s next entry: its dirent when it matches, then its own entries at depth `infinity`; the deepest
-  /// directory left when its entries are done, and the walk's end when the last is.
+  /// `do_list`'s next entry: passed over, its own entries too, when the session may not read it; else its dirent when
+  /// it matches, then its own entries at depth `infinity`. The deepest directory is left when its entries are done,
+  /// and the walk ends when the last is.
   fn visit<R: Repository + ?Sized>(
     &self,
     mut levels: Vec<Level>,
@@ -366,6 +368,9 @@ impl ListStream {
         Ok(Walk::Levels(levels))
       };
     };
+    if !reads.readable(&path) {
+      return Ok(Walk::Levels(levels));
+    }
     if entry.matches {
       let node = reads
         .node(&path, self.revision)?
@@ -563,12 +568,6 @@ fn optional(item: Option<Value<'_>>) -> Value<'_> {
 /// `svn_dirent_basename`: the last name of a path, empty for the root.
 fn basename(path: &str) -> &str {
   path.rsplit(SEPARATOR).next().unwrap_or_default()
-}
-
-/// `svn_utf__xfrm` with case folding and marks stripped, over ASCII: the letters `A` to `Z` lowered (module
-/// documentation for a name beyond ASCII).
-fn fold(name: &str) -> Vec<u8> {
-  name.bytes().map(|byte| byte.to_ascii_lowercase()).collect()
 }
 
 /// The walk's end: `done`, then `( success ( ) )` or the refusal.

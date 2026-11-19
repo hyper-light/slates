@@ -719,6 +719,73 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   `interesting_merge` calls the client's changed-path receiver before it judges, and `send_log` checks
   `nested_merges` after `fill_log_entry`, so a merged revision passed over has had its changed paths written, which
   join the next entry's (not recorded: the recorded `-g -v` logs pass none over with changed paths).
+- **`get-file-revs`** [C: `serve.c` `get_file_revs`, `file_rev_handler`, `svndiff_handler`, `svndiff_close_handler`;
+  `rev_hunt.c` `svn_repos_get_file_revs2`, `find_interesting_revisions`, `get_merged_mergeinfo`,
+  `find_merged_revisions`, `compare_path_revisions`, `send_path_revision`, `get_file_revs_backwards`; `marshal.c`
+  `svn_ra_svn__svndiff_version`; `svndiff.c` `window_handler`, `send_simple_insertion_window`, `encode_window`;
+  `fs-loader.c` `svn_fs_contents_different`; `dag.c` `svn_fs_fs__dag_things_different`; at 1.15.0,
+  `libsvn_fs_fs/fs_fs.c` `fc2b7fc8bd7a409b` (`svn_fs_fs__file_text_rep_equal`, `svn_fs_fs__prop_rep_equal`) and
+  `libsvn_fs_fs/cached_data.c` `b8cb7bcca34e04eb` (`svn_fs_fs__get_file_delta_stream`); recorded]: `c(?r)(?r)?B`, each
+  revision the youngest when missing or negative; a start after the end walks newest first and refuses merged revisions,
+  200007 with `svn_strerror`'s message, since the error is made without one. Every revision is found before the first is
+  sent. `compare_path_revisions` sorts the merged revisions newest first (its comment says increasing) with `qsort`,
+  which keeps no order among equals, over a list gathered in the merged mergeinfo's seeded hash order, so two merged
+  files changed in one revision have no order to match. `svn_fs_contents_different` and `svn_fs_props_different` are
+  strict: FSFS compares texts and property lists by content, counting no text and a zero-length text both empty and
+  equal, then MD5 and SHA-1. The svndiff version is `svn_ra_svn__svndiff_version`'s: 0 at compression level 0, else 2
+  for `accepts-svndiff2`, 1 (zlib) for `svndiff1`, 0 otherwise. Each stream write is one string: `window_handler` writes
+  the header alone, then each window's integers and its instruction and new-data sections when not empty (an svndiff 2
+  section is never empty: it starts with its original length); in svndiff 0 a window of one new-data instruction goes to
+  `send_simple_insertion_window`, which writes the header if it is not out, the integers and the instruction as one
+  write, then the new data. The report editor wrote its svndiff 0 windows' header as a chunk of its own, which no
+  recording held, until A-616 continued (6); both writers now judge such a window by its `simple_insertion`. FSFS sends
+  a stored delta as it is when its base is the source's representation and otherwise makes one
+  with `svn_txdelta2`; both are `compute_window` over 100 KiB pieces, so the deltifier's windows are the same.
+- **Read access** [C: `serve.c` `authz_check_access`, `lookup_access`, `must_have_access`, `current_access`, the
+  handshake's checks at 4347-4360, `get_dir`'s entries at 1877, every command's `authz_check_access_cb_func`;
+  `fs-wrap.c` `svn_repos_fs_revision_prop`, `svn_repos_fs_revision_proplist`, `svn_repos_fs_get_mergeinfo2`,
+  `svn_repos_fs_get_inherited_props`; `log.c` `svn_repos_check_revision_access`, `detect_changed`, `fill_log_entry`,
+  `get_history`, `get_path_histories`, `get_paths_history_as_mergeinfo`, `svn_repos_get_logs5`'s shortcut; `rev_hunt.c`
+  `check_readability`, `svn_repos_trace_node_locations`, `svn_repos_node_location_segments`,
+  `find_interesting_revisions`, `get_file_revs_backwards`, `svn_repos_get_file_revs2`'s `SVN_ERR_ASSERT`; `list.c`
+  `svn_repos_list`, `do_list`; at 1.15.0, `svnserve/svnserve.c` `3de22e31a26902f9` and `libsvn_subr/error.c` (the
+  default malfunction handler aborts, and neither `svnserve` nor `svn_cmdline_init` sets another); recorded on the Mac
+  Studio, 2026-11-19, kiln r88]: the
+  handshake checks only the blanket access (`anon-access`, `auth-access`), never the rules, so a session opens beneath a
+  hidden root. Six commands check their path with `must_have_access` (`get-file`, `get-dir`, `check-path`, `stat`,
+  `get-iprops`, `list`): denied, and no way to authenticate, the answer is `SVN_ERR_RA_NOT_AUTHORIZED` made without a
+  message, "Authorization failed", with no authentication request before it; a session that is anonymous and could
+  authenticate is sent an authentication request mid-command instead, and after it the command goes on without the
+  trivial one. The rest hand the rules to `libsvn_repos`, whose checks differ by site: a revision's access level counts
+  each changed path and, for one a copy added, its source (none readable: nothing; some: author and date; a revision
+  that changed nothing is whole); `check_readability` answers 220001 with its own words, while `get_path_histories` and
+  the log shortcut make the error without one, which the client reads as "Item is not readable"; `get_path_histories`
+  refuses before `ignore_missing_locations` is consulted, so a merge source the session may not read refuses a whole
+  `log -g`; `svn_repos_fs_get_mergeinfo2` filters the requested paths and, by its own comment, not the paths its catalog
+  names; `get_file_revs_backwards` has no assertion, the forward walk does, and a failed `SVN_ERR_ASSERT` aborts
+  `svnserve` before its buffered authentication request is flushed: the recording holds nothing after the handshake,
+  and `svnserve`'s standard error "E235000: In file 'subversion/libsvn_repos/rev_hunt.c' line 1695: assertion failed
+  (mainline_path_revisions->nelts > 0)".
+- **A read's authentication mid-command** [C: `serve.c` `must_have_access` 809-850, `lookup_access` 762-793,
+  `internal_auth_request` 696-727, `send_mechs` 582-592; the six reads' calls, `get_file` 1627, `get_dir` 1813,
+  `check_path` 2559, `stat_cmd` 2594, `get_inherited_props` 3635, `list` 3753, each with `needs_username` false and
+  first in its command; at 1.15.0; recorded on the Mac Studio, kiln r149]: a lookup that fails sends an anonymous
+  session, whose repository grants authenticated users the access and keeps a way in (a tunnel's user, a password
+  database, SASL), an authentication request made with a username needed (`EXTERNAL`, `CRAM-MD5`, never `ANONYMOUS`),
+  then looks up again: refused "Authorization failed" with nothing before it, or the command goes on with no trivial
+  request after the authentication's success. Stock `svn` 1.15.0 answers `ANONYMOUS` at the handshake when it is
+  offered, even with a username, so it meets this request: `svn cat` and `svn ls` of `/trunk/secret` as alice, and
+  `svn cat` as bob, refused after his `( success ( ) )`.
+- **The fold of a listed name** [C: `libsvn_subr/utf8proc.c` 77-182 (`unicode_decomposition`, `normalize_cstring`),
+  238-275 (`svn_utf__xfrm`, `svn_utf__fuzzy_glob_match`), `libsvn_repos/list.c` `matches_any` 100-106; utf8proc
+  2.12.0, Homebrew's `libutf8proc.3.3.0` that the Mac Studio's `svnserve` links, whose tables are Unicode 18.0.0;
+  recorded through ctypes, `crates/svn/fixtures/fold`]: the name is decomposed with `UTF8PROC_DECOMPOSE | STABLE |
+  CASEFOLD | STRIPMARK` and reencoded with `UTF8PROC_COMPOSE | STABLE`, the pattern left as the client sent it, and a
+  name utf8proc refuses matches nothing. `utf8proc_decompose_char` takes a Hangul syllable apart first, drops a mark
+  (Mn, Mc, Me) before it could fold, then case-folds (CaseFolding.txt's C and F lines, `ß` to `ss`), then decomposes,
+  each code point of a folding or a decomposition taken through the same steps; canonical order follows, then
+  composition with composition exclusions excluded. Unicode's CaseFolding.txt 17.0.0 (sha256 `ff8d8fef…`, 87,539
+  bytes, 1,585 C and F lines) is the fold's own table; `unicode-normalization` 0.1.25's are 17.0.0 too.
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
