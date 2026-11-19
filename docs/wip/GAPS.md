@@ -461,6 +461,16 @@
 > 2's "the fetch's fragment choice" and A-615's "the pack from the runs' fragments and the chosen objects". Owed: a part
 > only partly wanted read entry by entry; a delta search for an object past a window; the fragments' encoding sliced;
 > the stream wired into `fetch` (A-640); main's run, `git index-pack --strict` over the stream's packs.
+> **A-653 (2026-11-19, g083; partly wanted parts):** A-639's stream reads a kept part only partly wanted entry by entry,
+> its wanted entries alone judged: each kept part keeps its entries' indexes in position order (four bytes an entry,
+> charged), so a stream marks the entries it wants by halving, a window's worth of handles a unit, and a fetch of two
+> files of forty judges two. A `blob:limit` clone takes its small blobs from the kept parts; each object still wanted
+> after the head cover is offered the parts of the version its row says brought it, so a partial clone's later fetch
+> of blobs by id is answered from the fragments. One pack source, g296's `upload::Fragments` (A-640 part 3); this
+> piece's own adapter was dropped for it. Closes A-639's "a part only partly wanted read entry by entry". Owed: the
+> real clone's requests (small.git, A-582's five) answered through `Fragments` with every version encoded and a base
+> pack made, each object once (the next piece; A-640 part 3 landed at f607f424c); a delta search past a window; the
+> fragments' encoding sliced; the marking's red-checks and the other platforms' runs (main's).
 > **A-665 part 1 (2026-11-19, g293; piece 10's read-only bare repository a hook runs in):** `slates-git`
 > (`store::hook_view`) answers from the store, the refs a push read and the push a tree a volume serves lazily: `HEAD`,
 > `config` and `packed-refs` as stock git 2.50.1 writes them; packs each whole by itself (a base pack; a version's
@@ -895,7 +905,12 @@
 > Its sixth slice, in part (g297): `log` without merged revisions (a log asking for them refused until built),
 > red-checked ten ways; reads asks A-616's one walk of copy roots; the sixth slice whole, `log`'s merged revisions
 > (nested walks of each merge's runs; `svn log -g` and `svn mergeinfo --show-revs` replayed whole), red-checked
-> thirteen ways. Owed from it: `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> thirteen ways; its seventh slice (g297), `get-file-revs` (its 13 scripted commands, `svn blame` and `svn blame -g`
+> replayed whole; Windows x86_64, jupiter, 444 of 444; macOS arm64, Mac Studio, its `reads::`, `serve::` and
+> `report::editor::` tests 58 of 58, a file property taken away and a mainline and a merged revision of one number
+> among them), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s writes as read until the
+> `get-file-revs-svndiff0` session is recorded against stock `svnserve` 1.15.0. Owed
+> from it: `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
