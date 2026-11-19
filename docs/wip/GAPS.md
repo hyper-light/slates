@@ -3935,6 +3935,13 @@
 > shard's keeper on its timing wheel (`crate::deadlines`), off the tick. Still on the tick: leases, lapsed CLI
 > attachments, destroys, grants, the owed audit, departed hosts' attachments (A-222), held copies, the pressure hold,
 > NFS purges, base hints with their delegation recalls, the idle seal and the huge-page re-arm.
+> **Since A-536 (piece 3)** write leases, lapsed CLI attachments and destroys are off the tick too: the keeper sleeps to
+> the lease wheel's next deadline and to the partition's new index of CLI terms, woken by whatever records an earlier one
+> (each state borrow hands it the partition's note); a takeover's relinquish wakes the serve loop that steps destroys,
+> and a refused destroy record is retried at its own deadline; a deadline still past after a pass is retried a window
+> on, never spun on (job 3's red check found that spin). Still on the tick: grants, the owed audit (piece 4), departed
+> hosts' attachments (A-222), held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the
+> idle seal and the huge-page re-arm.
 > Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.

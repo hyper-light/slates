@@ -4901,6 +4901,18 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-19, A-536: leases, CLI attachments and destroys leave the tick).** The shard's deadline keeper
+> (`crate::deadlines`) also sleeps to the lease wheel's next deadline, releasing or renewing a lapsed write lease at its
+> term, and to the next CLI attachment's lapse, which the partition now keeps in an index of terms (derived from the
+> records and made again at a restore), so no attachment is walked to find the lapsed. Whatever path records a lease or
+> a term (a take, a renewal, a replay), the partition notes the earliest it entered and each state borrow closes by
+> handing that to the keeper (`deadlines::after_borrow`). Destroys are stepped by the serve loop once woken: a takeover's
+> relinquish now wakes it, as a destroy and a move's release already did, and a refused completion record is tried
+> again at its own deadline, the shard's window on. A deadline still past after the keeper's pass (a job that could not
+> end it) is tried again a window on, never spun on (`deadlines::armed_for`, counted `deadline.stuck`). Off the tick so
+> far: dead clients (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536);
+> grants and the owed audit are next.
+
 > **Status (2026-11-19, A-522: a claim names its process; staging and status captures keep their own deadlines).**
 > A claim on macOS and Windows carries its claimant's start beside its pid (the claim slot's `AT_STARTED`, the bootstrap
 > layout `SLB5`): on macOS the start time the kernel keeps for the process (`proc_pidinfo(PROC_PIDTBSDINFO)`, in
@@ -35492,3 +35504,47 @@ steps `return_dead_recovery` and `purge_write_log`, each timed by a clock it is 
   steps timed by the wall clock again, which learned 21,239 bytes and then 82,598 from the steps' real wall time where
   the CPU said 16,384, 32,768 and 98,304. The recovery test's give-back case is filed for main.
 
+
+### A-536 — Leases, CLI attachments and destroys leave the reap loop's tick, each kept at its own deadline or woken by its own event (2026-11-19, built for goal g255; the event-driven reaper's piece 3, jobs 1–3 of 5; §4.7; D-16, A-230, A-475, A-522)
+
+- **What was there.** The reap loop's tick, once a liveness window, released lapsed write leases (`verbs::expire_leases`,
+  the partition's lease wheel popped), ended lapsed CLI attachments (`verbs::expire_lapsed_attachments`, a walk of every
+  attachment record), and stepped destroys (`verbs::step_destroys`), which besides the serve loop's own rounds was the
+  only thing that started a takeover's relinquished teardown and retried a destroy whose completion record the catalog
+  refused.
+- **Leases (job 1).** The keeper (`crate::deadlines`, A-522) sleeps to the lease wheel's next deadline as well
+  (`Partition::next_lease_expiry`, the wheel's tick at or after the earliest expiry, so a pass then finds it due) and
+  runs `expire_leases` in its pass (a lease a live write attachment keeps is renewed, A-414). A lease is recorded by many
+  paths (a take, the keeper's own renewal, a replay), so the partition notes the earliest it entered
+  (`Partition::take_noted_lease`), and every state borrow closes by handing that note to the keeper
+  (`deadlines::after_borrow`, in `state::try_with_state`), which wakes it only for a deadline before the one it sleeps
+  for. The serve round's own lease pass stays (a wheel pop, nothing scanned).
+- **CLI attachments (job 2).** The partition keeps its termed attachments in an index by their lapse
+  (`termed_by_expiry`: one entry a termed attachment, kept at the add, the renewal and every removal, derived from the
+  records and made again at a restore), so `expire_lapsed_attachments` reads the lapsed alone (`Partition::lapsed_terms`)
+  where it walked every attachment; the keeper sleeps to the next lapse (`next_term_lapse`), noted as leases are
+  (`take_noted_term`).
+- **Destroys (job 3).** The serve loop steps destroys in its rounds once woken: a takeover's relinquish
+  (`verbs::relinquish_superseded`) now wakes it, as a destroy and a move's release already did. A completion record the
+  catalog refused is tried again at its own deadline, the shard's window on (`verbs::retry_destroy_at_window`,
+  `ShardState::destroy_retry_at`), when the keeper wakes the serve loop to step it.
+- **Never a spin.** Job 3's red check (the keeper never taking a retry it had armed for) found the keeper spinning: a
+  deadline still past after its pass re-armed a zero span, `within` answered at once, and the watchdog ended the test
+  daemon, its shard 3.5 s on its CPU without a step. So a deadline still past after a pass (a job that could not end it,
+  a record refused) is tried again the shard's window on (`deadlines::armed_for`) and counted `deadline.stuck`.
+- **Tests.** `crates/server/src/deadlines.rs`: `a_lapsed_write_lease_is_released_at_its_term_without_a_tick`,
+  `a_lapsed_cli_attachment_ends_at_its_term_without_a_tick`, `a_refused_destroys_retry_is_kept_at_its_deadline_without_a_tick`,
+  `a_deadline_still_past_after_its_pass_is_tried_again_a_window_on`; `crates/server/src/verbs.rs`:
+  `a_relinquished_volume_is_torn_down_without_a_tick`. Each failed first against its job's mutation (one red run each).
+- **Evidence.** On the Mac Studio (kiln, d1323898, 2026-11-19 00:38–00:54 UTC, load 15–34, debug build), each job's run
+  green then red: a lease due in 100 ms released 105–110 ms after it was recorded, a CLI attachment with a 100 ms term
+  ended 113.7–114.5 ms after it was made, a relinquished volume torn down 40.9 ms after the relinquish, a destroy's
+  retry due in 100 ms kept at 101.9 ms; the last run 15 of 15 (`deadlines::tests`, the two lease tests, the relinquish,
+  `hangup::tests`, `reap::tests`), `slates-db --lib` 109 of 109. Each red run failed exactly its guarded tests.
+- **Left on the tick for piece 4:** grants past their term, the owed audit's resend; and after them departed hosts'
+  attachments, held copies, the pressure hold, NFS purges, base hints with their delegation recalls, the idle seal and
+  the huge-page re-arm.
+
+Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/db/src/partition.rs`,
+`crates/server/src/deadlines.rs`, `crates/server/src/state.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/verbs.rs`.
