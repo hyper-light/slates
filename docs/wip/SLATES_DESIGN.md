@@ -47860,5 +47860,16 @@ credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`
   counted, as a refused NFS move closes its connection. Holding the old seat while waiting for the new one was rejected:
   two shards each full of connections waiting to move to the other would deadlock. Authentication comes before the
   move, so a client that proved no one never moves a connection.
-- **Tests.** EVIDENCE
+- **Tests.** macOS arm64 (Mac Studio, kiln r46, 2026-11-19, the tree merged over main 71a43cd97; `cargo test --locked`;
+  fmt clean on the six crates): `-p slates-db --lib credentials` 5 of 5 (a credential found by its id until revoked and
+  kept by a snapshot; its expiry; a held id's enrollment and an unheld id's revocation refused; the table byte budget;
+  the rules' model over every generated history); `-p slates-server --lib credentials` 9 of 9 (the id OpenSSH and FIPS
+  180-4 name; a key line read as `ssh-keygen` writes it; a credential found from any shard; a human enrolling and
+  revoking while an agent cannot; a token held as its hash and a key the edge cannot take refused; and four site and
+  LFS tests the filter meets) and `--lib vcs_http` 32 of 32 (among them the move to the repository's shard, a
+  credential that proves no one typed by why, and the daemon's edge moving a proven request and refusing the rest by
+  kind); `-p slates-http-edge --lib` 31 of 31; `-p slates-cli --bin slates credential` 1 of 1 (the grammar);
+  `--test wire_order` 2 of 2 in `slates-db` and in `slates-ipc` (the appended tags as published); `-p slates-ipc --lib
+  protocol` 5 of 5. The first build (r17) refused four type errors (the `Clock` trait unimported where the verbs read
+  the clock; two spawn-refusal arms giving the counter's `u64` as a statement's value), fixed in the same change.
 - **Owed.** As the status says.

@@ -426,10 +426,13 @@
 > enrolled and revoked only under the issuer's proof (`slates credential key|token|revoke`; `Forbidden` on a consumer's
 > channel), found by both edges through `credentials::find`. The daemon starts the HTTP edge from
 > `DaemonConfig::vcs_http`; a proven request's connection moves to its repository's shard and is decided there; every
-> refusal typed. EVIDENCE. Owed: upload-pack served once A-662's stores land (`503` until then), A-654's session,
-> LFS's routes on the site (main's Streamed/AfterBody ruling), the operator's flag for the edge's address and the fleet
-> identity's hand-in, a consumer's revocation in the SSH edge's key holders (A-651), listing credentials, Mercurial's
-> and Subversion's sites, the live `git clone` (main's).
+> refusal typed. macOS arm64 (Mac Studio, kiln r46, the tree merged over main 71a43cd97, fmt clean): `slates-db --lib
+> credentials` 5 of 5, `slates-server --lib credentials` 9 of 9 and `--lib vcs_http` 32 of 32, `slates-http-edge --lib`
+> 31 of 31, `slates-cli` `credential` 1 of 1, `--test wire_order` 2 of 2 in `slates-db` and `slates-ipc`. Owed:
+> upload-pack served once A-662's stores land (`503` until then), A-654's session, LFS's routes on the site (main's
+> Streamed/AfterBody ruling), the operator's flag for the edge's address and the fleet identity's hand-in, a consumer's
+> revocation in the SSH edge's key holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live
+> `git clone` (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the

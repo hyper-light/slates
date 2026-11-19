@@ -1163,7 +1163,9 @@ where
         crate::fleet::count_refusal(NOT_DETACHED);
       }
     }
-    Err(_) => crate::fleet::count_refusal(SPAWN_REFUSED),
+    Err(_) => {
+      crate::fleet::count_refusal(SPAWN_REFUSED);
+    }
   }
 }
 
