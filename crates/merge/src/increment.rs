@@ -1037,7 +1037,7 @@ fn link_states(
 fn heirs_of_writes(
   base: &Base,
   entities: &[Entity],
-  links: &std::collections::BTreeMap<String, LinkState>,
+  links: (&std::collections::BTreeMap<String, LinkState>, &LinkedNodes),
 ) -> Result<std::collections::BTreeMap<usize, String>, DeriveError> {
   let mut heirs = std::collections::BTreeMap::new();
   for (index, entity) in entities.iter().enumerate() {
@@ -1066,66 +1066,69 @@ fn heirs_of_writes(
   Ok(heirs)
 }
 
-/// The link paths naming `origin`'s base node once the journal's links apply (`links`, each link path the journal
-/// touched; an untouched base link keeps its base target): those the base had to the file and the journal left as
-/// they were (the first set), and the others (links the journal made to the file, or to a link naming it).
+/// The link paths standing at the seal that name `origin`'s base node (`nodes`, [`linked_nodes`]): those the base had
+/// to the file and the journal left as they were (`links`, each link path the journal touched), the first set, and the
+/// others.
 fn node_names(
   base: &Base,
-  links: &std::collections::BTreeMap<String, LinkState>,
+  (links, nodes): (&std::collections::BTreeMap<String, LinkState>, &LinkedNodes),
   origin: &str,
 ) -> (
   std::collections::BTreeSet<String>,
   std::collections::BTreeSet<String>,
 ) {
-  let paths: std::collections::BTreeSet<&str> = base
-    .hardlinks
-    .iter()
-    .map(|(path, _)| path.as_str())
-    .chain(links.keys().map(String::as_str))
-    .collect();
-  let mut naming: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-  // A link names the node its target names: the file itself, or a link already found naming it. A pass adds a link or
-  // ends the search, so it takes at most one pass a link.
-  for _ in 0..=paths.len() {
-    let found: Vec<&str> = paths
-      .iter()
-      .copied()
-      .filter(|path| !naming.contains(path))
-      .filter(|path| {
-        standing_target(base, links, path)
-          .is_some_and(|target| target == origin || naming.contains(target))
-      })
-      .collect();
-    if found.is_empty() {
-      break;
-    }
-    naming.extend(found);
-  }
-  let as_based = |path: &&str| {
+  let as_based = |path: &&String| {
     base_hardlink_target(base, path) == Some(origin)
       && links
-        .get(*path)
+        .get(path.as_str())
         .is_none_or(|(here, target, node)| *here && target == origin && *node == NodeOrigin::Base)
   };
-  let (kept, made): (Vec<&str>, Vec<&str>) = naming.into_iter().partition(as_based);
+  let (kept, made): (Vec<&String>, Vec<&String>) = nodes
+    .iter()
+    .filter(|(_, node)| node.as_deref() == Some(origin))
+    .map(|(path, _)| path)
+    .partition(as_based);
   (
-    kept.into_iter().map(str::to_owned).collect(),
-    made.into_iter().map(str::to_owned).collect(),
+    kept.into_iter().cloned().collect(),
+    made.into_iter().cloned().collect(),
   )
 }
 
-/// The target the link at `path` names once the journal's links apply (`links`), or its base target where the journal
-/// left it alone; `None` where no link stands.
-fn standing_target<'a>(
-  base: &'a Base,
-  links: &'a std::collections::BTreeMap<String, LinkState>,
-  path: &str,
-) -> Option<&'a str> {
-  match links.get(path) {
-    Some((true, target, _)) => Some(target.as_str()),
-    Some((false, ..)) => None,
-    None => base_hardlink_target(base, path),
+/// Each hard link standing at the seal and the base node it names, by link path: `None` for a node the journal made
+/// or moved.
+type LinkedNodes = std::collections::BTreeMap<String, Option<String>>;
+
+/// The node each hard link standing at the seal names (A-646: a link names the node at its target when it is made, so
+/// a link made to a link names that link's node then, whatever becomes of that link after). A link the base had names
+/// its base target's node until the journal removes it; a link the journal makes names what its target named then:
+/// the node a standing link named, a base file's own, or a node the journal made or moved there (`None`, whose later
+/// move or removal the deriver refuses, `made_target_moved`). A-669's first green run found a link resolved through
+/// the links standing at the seal: `ln h l; rm h` lost `l`'s node, and with it a write handed on to `l`.
+fn linked_nodes(base: &Base, journal: &[VolumeOp]) -> LinkedNodes {
+  let mut nodes: LinkedNodes = base
+    .hardlinks
+    .iter()
+    .map(|(link, target)| (link.clone(), Some(target.clone())))
+    .collect();
+  let mut made = std::collections::BTreeSet::new();
+  for op in journal {
+    match op {
+      VolumeOp::Link { path, target } => {
+        let node = match nodes.get(target) {
+          Some(named) => named.clone(),
+          None if made.contains(target) => None,
+          None => Some(target.clone()),
+        };
+        nodes.insert(path.clone(), node);
+      }
+      VolumeOp::Unlink { path } => {
+        nodes.remove(path);
+      }
+      _ => {}
+    }
+    note_made(op, &mut made);
   }
+  nodes
 }
 
 /// The links a composed state declares: a link standing where the base had none, or another, or
@@ -1266,7 +1269,8 @@ pub fn compose_volume_planned(
   let present_dirs = present_directories(base, journal);
   let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
   let xattrs = compose_xattrs(base, journal, &survivors, &renamed_away, &present_dirs)?;
-  let heirs = heirs_of_writes(base, &entities, &link_state)?;
+  let nodes = linked_nodes(base, journal);
+  let heirs = heirs_of_writes(base, &entities, (&link_state, &nodes))?;
   let hardlinks = link_emissions(base, link_state);
   let mut plan = PostStatePlan::new();
   let mut doc = seal(
