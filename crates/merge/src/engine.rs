@@ -3802,3 +3802,119 @@ fn special_payload(
   let end = start.checked_add(len).ok_or(DocDecodeError::Truncated)?;
   SpecialNode::decode(post.get(start..end).ok_or(DocDecodeError::Truncated)?)
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// An increment under construction: its ops document and the post-state its content ops add from.
+  #[derive(Default)]
+  struct Steps {
+    doc: OpsDoc,
+    post: Vec<u8>,
+  }
+
+  impl Steps {
+    /// `bytes` inserted into `path` at `at`.
+    fn insert(mut self, path: &str, at: u64, bytes: &[u8]) -> Steps {
+      let path = self.doc.paths.intern(path);
+      let src = self.post.len() as u64;
+      self.post.extend_from_slice(bytes);
+      self.doc.ops.push(Op {
+        kind: OpKind::Insert,
+        flags: 0,
+        path,
+        at,
+        len: bytes.len() as u64,
+        src,
+      });
+      self
+    }
+
+    /// `path` created holding `bytes`.
+    fn create(mut self, path: &str, bytes: &[u8]) -> Steps {
+      let index = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::Create,
+        flags: 0,
+        path: index,
+        at: 0,
+        len: 0,
+        src: u64::MAX,
+      });
+      self.insert(path, 0, bytes)
+    }
+
+    /// `from` renamed to `to` (the op is keyed at its destination, its source the `src` path index).
+    fn rename(mut self, from: &str, to: &str) -> Steps {
+      let to = self.doc.paths.intern(to);
+      let from = self.doc.paths.intern(from);
+      self.doc.ops.push(Op {
+        kind: OpKind::Rename,
+        flags: 0,
+        path: to,
+        at: 0,
+        len: 0,
+        src: u64::from(from),
+      });
+      self
+    }
+
+    /// The increment `id` based on version `base`.
+    fn at(self, id: u8, base: u64) -> Increment {
+      Increment {
+        id: [id; 32],
+        base,
+        doc: self.doc,
+        post_state: self.post,
+        evidence: Vec::new(),
+      }
+    }
+  }
+
+  /// A-547 (GAPS "an edit after a rename is accepted and lost", 2026-11-09; §4.16 "Composition at seal"). Do: make a
+  /// green holding files `a` and `b`; submit a work based on that version that renames `a` over `b` and then appends
+  /// `XY` at `b`'s end; replay the version's chain entry, encoded and decoded, on a green that holds the version before
+  /// it. Expect: the work accepted, and `b` holding `a`'s bytes and the edit, `0123456789XY`, with `a` gone, live and
+  /// replayed alike. Before, the verdict copied `a`'s head bytes to `b` and dropped `b`'s own ops, so the submit was
+  /// accepted and the edit lost.
+  #[test]
+  fn an_edit_after_a_rename_over_a_file_is_merged_with_the_renamed_bytes() {
+    let first = Steps::default()
+      .create("a", b"0123456789")
+      .create("b", b"bbbbbbbbbbbbbbbb")
+      .at(1, 0);
+    let mut green = Green::new();
+    let mut replayed = Green::new();
+    assert_eq!(green.submit(&first), Outcome::Accepted { version: 1 });
+    assert_eq!(replayed.submit(&first), Outcome::Accepted { version: 1 });
+    let edited = Steps::default()
+      .rename("a", "b")
+      .insert("b", 10, b"XY")
+      .at(2, 1);
+    let (outcome, applied) = green.submit_resolved(&edited);
+    assert_eq!(outcome, Outcome::Accepted { version: 2 });
+    assert_eq!(
+      green.content("b"),
+      Some(b"0123456789XY".as_slice()),
+      "the edit after the rename is lost"
+    );
+    assert_eq!(green.content("a"), None, "the rename's source is gone");
+    let applied = applied.expect("an accepted version's effects");
+    let entry = crate::chain_entry::encode(&edited.encode(), &edited, &applied, None, None, None);
+    let decoded = crate::chain_entry::decode(&entry).expect("the entry decodes");
+    assert_eq!(
+      decoded.applied, applied,
+      "the entry carries what the verdict resolved"
+    );
+    assert_eq!(
+      replayed.apply_recorded(&decoded.increment, &decoded.applied),
+      2
+    );
+    assert_eq!(
+      replayed.content("b"),
+      Some(b"0123456789XY".as_slice()),
+      "the replayed version lost the edit"
+    );
+  }
+}
