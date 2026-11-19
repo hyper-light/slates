@@ -4053,6 +4053,9 @@ pub use reanchor::{ReanchorRefused, Reanchored};
 mod node_exclusive_tests;
 
 #[cfg(test)]
+mod unseen_bytes_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
 
