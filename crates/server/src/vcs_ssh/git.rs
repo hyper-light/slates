@@ -95,6 +95,8 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   advertised: bool,
   /// The answer being written.
   answer: Option<Answer<<L::Packs as PackSource>::Pack>>,
+  /// The admission of the request it answers, lent to each step of its writing (A-653 continued (4)).
+  admission: Admission,
   /// What follows it.
   after: After,
 }
@@ -113,11 +115,13 @@ impl<L: StoreLender> UploadCommand<L> {
       out: Vec::new(),
       advertised: false,
       answer: None,
+      admission: Admission::new(room),
       after: After::Next,
     }
   }
 
-  /// Answers `asked` over the lent store, within a fresh admission of the room; refused when the store is no longer held.
+  /// Answers `asked` over the lent store, within a fresh admission of the room, kept for the answer's writing; refused
+  /// when the store is no longer held.
   fn serve(&mut self, asked: Asked<'_>) -> Result<(), Refused> {
     let Self {
       lender,
@@ -125,13 +129,14 @@ impl<L: StoreLender> UploadCommand<L> {
       version,
       room,
       answer,
+      admission,
       after,
       ..
     } = self;
-    let mut admission = Admission::new(*room);
+    *admission = Admission::new(*room);
     let made = lender
       .lend(*repository, |served, packs| {
-        upload::serve(served, *version, asked, packs, &mut admission)
+        upload::serve(served, *version, asked, packs, admission)
       })
       .ok_or_else(unheld)?;
     *after = if made.ends_session() {
@@ -151,6 +156,7 @@ impl<L: StoreLender> UploadCommand<L> {
       lender,
       repository,
       answer,
+      admission,
       out,
       after,
       ..
@@ -160,7 +166,7 @@ impl<L: StoreLender> UploadCommand<L> {
     };
     let written = lender
       .lend(*repository, |served, packs| {
-        made.write(served, packs, out, MAX_LEN)
+        made.write(served, packs, admission, out, MAX_LEN)
       })
       .ok_or_else(unheld)?;
     if written == Written::More {

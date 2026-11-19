@@ -1294,6 +1294,17 @@ pub enum RequestBody {
     /// The keyed hash under the launcher's secret, over the principal, the identities and the version read.
     proof: [u8; 32],
   },
+  /// Import the Mercurial repository at the host directory `path` into repository `repository`'s store (§4.17.3 piece 3;
+  /// §4.15, read-only; A-675, A-678), on the partition its name hashes to. The repository's owner asks, and its store
+  /// must be the empty one its record was made with. The import runs a turn at a time on the owner shard, and the request
+  /// is answered when it ends: `RepositoryImported` with what it took, or `ImportRefused` with its fault, every refusal
+  /// by kind. Appended.
+  ImportRepository {
+    /// The repository's name.
+    repository: String,
+    /// The host directory that holds the repository's `.hg`.
+    path: String,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2329,7 +2340,8 @@ impl RequestBody {
       | RequestBody::CreateBranch { .. }
       | RequestBody::BindBranch { .. }
       | RequestBody::RetireBranch { .. }
-      | RequestBody::SetRepositoryPolicy { .. } => None,
+      | RequestBody::SetRepositoryPolicy { .. }
+      | RequestBody::ImportRepository { .. } => None,
     }
   }
 
@@ -4413,6 +4425,12 @@ pub enum Refusal {
     /// The repository's tool.
     tool: VcsTool,
   },
+  /// A repository's import was refused (`ImportRepository`, A-678), by its fault; the repository's store is as it was.
+  /// Appended.
+  ImportRefused {
+    /// Why.
+    fault: ImportFault,
+  },
 }
 
 /// Why the bytes an `ArchiveImport` read make no volume ([`Refusal::ArchiveRefused`], A-453): each the class of the
@@ -4432,6 +4450,38 @@ pub enum ArchiveFault {
   /// out of canonical form, a total, extent, name or path that does not hold, or a tree that does not restore. A
   /// faulty or hostile writer made it.
   Malformed,
+}
+
+/// Why a repository's import was refused ([`Refusal::ImportRefused`], A-678): each the class of the import's refusals a
+/// caller acts on alike. Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum ImportFault {
+  /// The repository serves another tool than Mercurial.
+  NotMercurial,
+  /// The repository's store holds a history: an import takes the place of the empty store its creation made.
+  NotEmpty,
+  /// An import of the repository is under way: its end answers the request that started it.
+  UnderWay,
+  /// The request reached the repository's owner from another node, whose client the owner cannot answer later: ask the
+  /// owner's node.
+  Unawaited,
+  /// The repository's format is one the import does not read: a requirement it does not know, or does not take.
+  Format,
+  /// A file of the repository's store is missing, not of its format, or at odds with the rest: its path under `.hg`,
+  /// empty where the fault names no one file.
+  Damaged {
+    /// The path under `.hg`.
+    path: String,
+  },
+  /// A file, the listing or a text is larger than an import may hold at once.
+  PastRoom {
+    /// The bytes an import may hold at once.
+    room: u64,
+  },
+  /// A file is still being fetched from the base's store (an S3 base): ask again once it has landed.
+  Pending,
+  /// The import was given back before its end: its repository was freed.
+  Abandoned,
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
@@ -5342,6 +5392,19 @@ pub enum ReplyBody {
   IdentitiesSet {
     /// The version now.
     version: u64,
+  },
+  /// A repository's directory imported into its store (`ImportRepository`, A-678): what the import took. Appended.
+  RepositoryImported {
+    /// The changesets.
+    changesets: u32,
+    /// The manifest revisions.
+    manifests: u32,
+    /// The file logs.
+    file_logs: u64,
+    /// The file revisions, over every file log.
+    file_revisions: u64,
+    /// The obsolescence markers.
+    markers: u64,
   },
 }
 

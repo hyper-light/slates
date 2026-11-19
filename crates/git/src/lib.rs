@@ -63,7 +63,7 @@ pub mod upload;
 pub mod v0;
 pub mod v2;
 
-pub use admission::{Admission, PastAdmission};
+pub use admission::{Admission, Hold, PastAdmission};
 
 /// A count or a length as `u64`. Every `usize` fits on the targets slates ships (Appendix B.2), and one that did not
 /// would saturate, which every caller then refuses, rather than wrap.

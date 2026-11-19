@@ -184,7 +184,8 @@
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
 #   NFS-listener descriptor (`daemon.rs`, added 2026-09-09 for the anchor-held listener, §4.6):
-#   `OwnedFd::from_raw_fd` on the number the anchor handed over across the spawn (1, Unix only);
+#   `OwnedFd::from_raw_fd` on the number the anchor handed over across the spawn (1, Unix only; since
+#   2026-11-19 the one site `held_listener` adopts the version-control edge's held listener too, A-625 part 3);
 #   and the daemon adopting a fleet node's inherited serve sockets (`fleet.rs` `adopt_inherited`,
 #   added 2026-09-28 with the anchor-held fleet ports, §4.8): the same `OwnedFd::from_raw_fd` on each
 #   number in `SLATES_ANCHOR_FLEET_SERVE`, one site called per plane (1, Unix only).

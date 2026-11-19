@@ -15,14 +15,17 @@ use crate::entry::{self, PACK_HEADER_LEN, Representation};
 use crate::negotiation::Filter;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::tree::Mode;
-use crate::store::{Positions, Progress, Repository, StoreRefused, Turn, Upload, Versions};
+use crate::store::{
+  Positions, Progress, Repository, Search, StoreRefused, Turn, Upload, UploadCounters, Versions,
+};
+use crate::to_u64;
 use crate::unpack::{NoIndex, Object, Outside, Reader, Refusal};
 
 use super::fragments::{commit_over, text};
 use super::oracle::{GREENS, Model, Real, apply, op};
 use super::{
   Answer, EXCHANGE, Made, Ticks, WINDOW, blob, brought_by, commit, ids, push_and_move, reached_now,
-  store, streamed, tree,
+  store, streamed, streamed_within, tree,
 };
 
 /// The objects a client holds: a thin pack's bases.
@@ -280,6 +283,136 @@ fn similar_files(format: ObjectFormat, store: &mut ContentStore) -> (Repository,
     .encode_fragments(store, (1, 0), &mut Ticks(0), EXCHANGE)
     .unwrap();
   (repository, objects)
+}
+
+/// One version of green 1 never encoded, a commit over two files past the tests' window: each a 200-line text with
+/// one line edited, the same length, so a search of either against the other is charged alike. The repository and
+/// the version's objects, the two files last.
+fn two_large_files(format: ObjectFormat, store: &mut ContentStore) -> (Repository, Vec<Made>) {
+  let mut repository = Repository::new(format);
+  let files = [
+    blob(format, &text(200, &[50])),
+    blob(format, &text(200, &[150])),
+  ];
+  assert!(files.iter().all(|file| file.content.len() > WINDOW));
+  let root = tree(
+    format,
+    &[
+      (Mode::File, b"a", files[0].id),
+      (Mode::File, b"b", files[1].id),
+    ],
+  );
+  let head = commit(format, root.id, &[], 1);
+  let mut objects = vec![head.clone(), root];
+  objects.extend(files);
+  push_and_move(
+    &mut repository,
+    store,
+    objects.clone(),
+    &[(1, Some(head.id))],
+  )
+  .unwrap();
+  (repository, objects)
+}
+
+/// How an entry names its base, as the pack's bytes say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Names {
+  /// None: the object is whole.
+  Whole,
+  /// Its offset back.
+  Offset,
+  /// Its id.
+  Id(ObjectId),
+}
+
+/// The pack that answers `answer` within an admission of `room`, streamed in one turn and again a unit a turn, the
+/// two packs the same or the test fails: the pack, what the one-turn stream did, and each admission's room afterwards.
+fn within_room(
+  repository: &Repository,
+  store: &ContentStore,
+  answer: &Answer,
+  room: u64,
+) -> (Vec<u8>, UploadCounters, [u64; 2]) {
+  let mut whole = Admission::new(room);
+  let (pack, counters) = streamed_within(repository, store, answer.clone(), u64::MAX, &mut whole);
+  let mut sliced = Admission::new(room);
+  let (by_units, _) = streamed_within(repository, store, answer.clone(), 1, &mut sliced);
+  assert_eq!(by_units, pack, "a unit a turn wrote another pack");
+  (pack, counters, [whole.left(), sliced.left()])
+}
+
+/// The pack read back to `objects`, each once, the two files last of them: each file's id and how its entry names its
+/// base, in pack order.
+fn files_named(format: ObjectFormat, pack: &[u8], objects: &[Made]) -> Vec<(ObjectId, Names)> {
+  let read = read_back(format, pack, &Held::none()).unwrap();
+  let expected: BTreeSet<ObjectId> = objects.iter().map(|object| object.id).collect();
+  assert_eq!(once(&read), expected);
+  let files: BTreeSet<ObjectId> = objects[2..].iter().map(|object| object.id).collect();
+  let read: Vec<Object> = read
+    .into_iter()
+    .filter(|object| files.contains(&object.id))
+    .collect();
+  let names = representations(format, pack, &read)
+    .into_iter()
+    .map(|representation| match representation {
+      Representation::Whole(_) => Names::Whole,
+      Representation::OfsDelta { .. } => Names::Offset,
+      Representation::RefDelta { base } => Names::Id(base),
+    });
+  read.iter().map(|object| object.id).zip(names).collect()
+}
+
+/// A-653 continued (4) (module docs, **What it sends** 3: an object past a window is searched when the request's
+/// admission can hold its search, and sent whole and counted otherwise). Do: answer a never-encoded version of two
+/// similar files past the window, its objects one by one, within an admission of exactly what the later file's search
+/// holds (the two files' bytes and `Search::held_most` of them), with `ofs-delta` and without, in one turn and a unit
+/// a turn; then within one byte less. Expect: with the room, the earlier file whole and the later a delta naming it,
+/// by its offset back or, without `ofs-delta`, by its id; the same bytes over any turns; every byte given back by the
+/// stream's end; read back to the version's objects, each once. One byte short: both files whole, the fall-back
+/// counted once, every byte given back.
+#[test]
+fn an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admission() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let (repository, objects) = two_large_files(format, &mut store);
+  let (first, second) = (objects[2].content.len(), objects[3].content.len());
+  let charge = to_u64(first + second) + Search::held_most(first, second);
+  let mut answer = Answer::objects(&repository.brought(&store, 1, 0).unwrap());
+  for ofs in [true, false] {
+    answer.ofs = ofs;
+    let (pack, counters, left) = within_room(&repository, &store, &answer, charge);
+    let named = files_named(format, &pack, &objects);
+    let base = named[0].0;
+    let later = if ofs { Names::Offset } else { Names::Id(base) };
+    assert_eq!(
+      (named[0].1, named[1].1, left),
+      (Names::Whole, later, [charge, charge])
+    );
+    let loose = (
+      counters.loose_whole,
+      counters.loose_deltas,
+      counters.loose_unsearched,
+    );
+    assert_eq!(loose, (3, 1, 0), "{counters:?}");
+  }
+  let (pack, counters, left) = within_room(&repository, &store, &answer, charge - 1);
+  let named = files_named(format, &pack, &objects);
+  let loose = (
+    counters.loose_whole,
+    counters.loose_deltas,
+    counters.loose_unsearched,
+  );
+  assert_eq!(
+    (named[0].1, named[1].1, loose, left),
+    (
+      Names::Whole,
+      Names::Whole,
+      (4, 0, 1),
+      [charge - 1, charge - 1]
+    )
+  );
+  repository.release(&mut store).unwrap();
 }
 
 /// A-639 (gitprotocol-capabilities `ofs-delta`). Do: answer a version whose fragment holds offset deltas, its objects
@@ -611,7 +744,13 @@ fn a_base_pack_made_again_under_a_stream_ends_it_refused() {
       exchange: EXCHANGE,
       quantum_ns: 1,
     };
-    match upload.advance(&repository, &store, turn, &mut pack) {
+    match upload.advance(
+      &repository,
+      &store,
+      turn,
+      &mut Admission::new(u64::MAX),
+      &mut pack,
+    ) {
       Ok(Progress::More) => {}
       Ok(Progress::Done) => panic!("the stream ended over a base pack made again"),
       Err(refused) => break refused,
