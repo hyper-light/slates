@@ -480,13 +480,16 @@ pub struct Green {
   /// the deltas up to it are folded into the checkpoint, so a base below it is not mapped.
   deltas_from: u64,
   last_changed: BTreeMap<String, u64>,
-  /// The last version that removed the file at each path: an unlink, a rename away, or a rename onto it, which removes
-  /// the file it replaces (A-612). A work based before it names a file that is gone, whatever stands at the path now
-  /// (made again, renamed onto it), so the verdict answers delete against modify, and rename against rename for a
-  /// rename of it, never an edit or a move of the file that took its place. Unlike the content history it is never
-  /// folded, so a base below the fold floor meets it too. One entry a path the green ever removed a file at, as
-  /// `last_changed` holds one a path it ever changed; empty in a green restored from a checkpoint or made as a branch,
-  /// whose bases are never before its first version.
+  /// The last version that removed the file at each path, a file of any type: a regular file (an
+  /// unlink, a rename away, or a rename onto it, which removes the file it replaces; A-612), a
+  /// symbolic link, a hard link's name, an IPC node or a directory (A-631). A work based before it
+  /// names a file that is gone, whatever stands at the path now (made again, renamed onto it), so
+  /// the verdict answers delete against modify for an edit, a mode change or an attribute set or
+  /// removed there, and rename against rename for a rename of it, never a change or a move of the
+  /// file that took its place. Unlike the content history it is never folded, so a base below the
+  /// fold floor meets it too. One entry a path the green ever removed a file at, as `last_changed`
+  /// holds one a path it ever changed; empty in a green restored from a checkpoint or made as a
+  /// branch, whose bases are never before its first version.
   file_removed: BTreeMap<String, u64>,
   mode_changed: BTreeMap<String, u64>,
   symlink_changed: BTreeMap<String, u64>,
@@ -2356,14 +2359,9 @@ impl Green {
       .saturating_add(self.special_history_bytes)
   }
 
-  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
-  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
-  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
-  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
-  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
-  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
-  /// Whether the file at `path` was removed after version `base` (`file_removed`): unlinked, renamed away or renamed
-  /// onto after the base, whatever stands at the path now (A-612).
+  /// Whether the node at `path` was removed after version `base` (`file_removed`): a file of any
+  /// type, removed, renamed away or renamed onto after the base, whatever stands at the path now
+  /// (A-612, A-631).
   fn file_removed_since(&self, path: &str, base: u64) -> bool {
     self
       .file_removed
@@ -2371,6 +2369,12 @@ impl Green {
       .is_some_and(|version| *version > base)
   }
 
+  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
+  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
+  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
+  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
+  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
+  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
     if base < self.folded_below {
       return self.intervening_walk(path, base);
@@ -2524,10 +2528,20 @@ impl Green {
     &self,
     (dst, ops): (&str, &[Op]),
     (base, post_state): (u64, &[u8]),
-    from: &str,
+    (from, cleared): (&str, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
   ) -> Result<(), ConflictWindow> {
     if from == dst {
+      return Ok(());
+    }
+    // A hard link renamed over the file it names is that file renamed onto itself: POSIX `rename`
+    // does nothing when both names are links to one file, and neither does the verdict, which
+    // would otherwise remove the file and leave the link naming itself (A-643).
+    if self
+      .hardlinks
+      .get(from)
+      .is_some_and(|target| target.as_str() == dst)
+    {
       return Ok(());
     }
     // The source must still name something — a file, a symlink or a hard link. A source an
@@ -2553,6 +2567,12 @@ impl Green {
     if self.changed_last(self.last_changed.get(dst), dst) > base {
       return Err(Green::window(dst, MergeConflictClass::RenameRename));
     }
+    // A link renamed over a file replaces the file, as a file renamed over one does and as POSIX
+    // `rename` replaces its destination: the file is removed and its removal recorded
+    // (`file_removed`), so no path holds a file and a link at once. A file the increment removes
+    // itself, by an unlink or a rename away, is removed by that, once (A-643).
+    let replaced = (!source_is_file && self.content.contains_key(dst) && !cleared.contains(dst))
+      .then(|| Effect::RemoveContent(dst.to_owned()));
     // Move whatever the source names, capturing its current value so an intervening change to the
     // source follows the move, and removing the source name.
     if let Some(source) = self.content.get(from) {
@@ -2567,9 +2587,11 @@ impl Green {
       ));
       effects.push(Effect::RemoveContent(from.to_owned()));
     } else if let Some(target) = self.symlinks.get(from) {
+      effects.extend(replaced);
       effects.push(Effect::Symlink(dst.to_owned(), target.clone()));
       effects.push(Effect::RemoveSymlink(from.to_owned()));
     } else if let Some(target) = self.hardlinks.get(from) {
+      effects.extend(replaced);
       effects.push(Effect::Hardlink(dst.to_owned(), target.clone()));
       effects.push(Effect::RemoveHardlink(from.to_owned()));
     }
@@ -2643,7 +2665,8 @@ impl Green {
   /// Merges an unlink at `path`.
   /// Merges an unlink of whatever the path names — a regular file, a symlink, or a hard link
   /// (§4.16). Each is a delete/modify conflict if that dimension changed since the increment's base;
-  /// a path that names nothing is a no-op (idempotent removal). A directory is not unlinked (rmdir
+  /// a regular file, if it changed in any dimension, its mode and attributes too (A-643); a path
+  /// that names nothing is a no-op (idempotent removal). A directory is not unlinked (rmdir
   /// removes directories); a path that is a directory falls through to the no-op.
   fn merge_unlink(&self, path: &str, base: u64) -> Result<Option<Effect>, ConflictWindow> {
     if self.specials.contains_key(path) {
@@ -2660,7 +2683,10 @@ impl Green {
       return Ok(Some(Effect::RemoveSpecial(path.to_owned())));
     }
     if self.content.contains_key(path) {
-      if self.changed_last(self.last_changed.get(path), path) > base {
+      // A file changed after the base in any dimension, its bytes, its mode or an attribute, is
+      // not the one the work removes: delete against modify in either direction (A-643; the
+      // bytes alone were judged before, and the head's mode or attribute went with the file).
+      if self.changed_after(path, base) {
         return Err(Green::window(path, MergeConflictClass::DeleteModify));
       }
       return Ok(Some(Effect::RemoveContent(path.to_owned())));
@@ -2822,10 +2848,12 @@ impl Green {
     Ok(Some(Effect::MakeDir(path.to_owned())))
   }
 
-  /// Merges a directory removal against the increment's own removals.
+  /// Merges a directory removal against the increment's own removals, and against its base: a
+  /// directory changed after the base in any dimension is delete against modify (A-643).
   fn merge_rmdir(
     &self,
     path: &str,
+    base: u64,
     cleared: &BTreeSet<String>,
   ) -> Result<Option<Effect>, ConflictWindow> {
     if self.content.contains_key(path)
@@ -2837,6 +2865,12 @@ impl Green {
     }
     if !self.dirs.contains_key(path) {
       return Ok(None);
+    }
+    // A directory changed after the base in any dimension (removed and made again, its mode or an
+    // attribute changed) is not the one the work removes: delete against modify (A-643; the
+    // removal had no base, and removed a directory made again since).
+    if self.changed_after(path, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
     let prefix = format!("{path}/");
     if self.has_live_child(&prefix, cleared) {
@@ -2879,6 +2913,11 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
+    // A file removed after the work's base is gone for it, whatever stands at the path now: the
+    // mode was set on a file that no longer exists (A-631, as A-612 for an edit).
+    if !established && self.file_removed_since(path, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
     if !established && self.special_kind_changed(path, base) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -2916,12 +2955,13 @@ impl Green {
     Ok(Some(Effect::Symlink(path.to_owned(), target.to_owned())))
   }
 
-  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict).
+  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict, and so is a
+  /// target removed after the base, A-643).
   fn merge_hardlink(
     &self,
     path: &str,
     base: u64,
-    target: &str,
+    (target, target_established): (&str, bool),
   ) -> Result<Option<Effect>, ConflictWindow> {
     // A file, directory or symlink already at this path is a different kind — a type conflict. An
     // existing hard link is not: that is the retarget case decided just below.
@@ -2931,6 +2971,12 @@ impl Green {
       || self.specials.contains_key(path)
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
+    }
+    // A target removed after the work's base is gone for the work, whatever stands at its path
+    // now: a link to it is delete against modify on the link, never a name for the file made in
+    // its place, unless the work makes the target itself (A-643).
+    if !target_established && self.file_removed_since(target, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
     if self.changed_last(self.hardlink_changed.get(path), path) > base {
       if self.hardlinks.get(path).map(String::as_str) == Some(target) {
@@ -2959,6 +3005,11 @@ impl Green {
     {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
+    // An attribute set on a file removed after the work's base was set on a file that no longer
+    // exists (A-631).
+    if !established && self.file_removed_since(path, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
     if !established && self.special_kind_changed(path, base) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -2982,7 +3033,13 @@ impl Green {
     path: &str,
     name: &str,
     base: u64,
+    established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
+    // An attribute removed from a file removed after the work's base was removed from a file that
+    // no longer exists (A-631), whatever the file at the path now holds.
+    if !established && self.file_removed_since(path, base) {
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
     if self.special_kind_changed(path, base) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -2997,7 +3054,9 @@ impl Green {
   }
 
   /// An IPC creation compares the complete captured metadata, without ever comparing stream
-  /// bytes. A different kind is a type conflict; a differing concurrent creation conflicts.
+  /// bytes. A different kind is a type conflict; a differing concurrent creation conflicts. A submodule's link moved to
+  /// another commit is the same kind with another commit ([`SpecialKind::same_type`](crate::special::SpecialKind::same_type), A-637): accepted, or a
+  /// `CreateCreate` conflict when another work moved it since the base.
   fn merge_special(
     &self,
     path: &str,
@@ -3012,7 +3071,7 @@ impl Green {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     if let Some(current) = self.specials.get(path) {
-      if current.kind != node.kind {
+      if !current.kind.same_type(node.kind) {
         return Err(Green::window(path, MergeConflictClass::TypeChanged));
       }
       if current == &node {
@@ -3066,8 +3125,11 @@ impl Green {
         self.merge_special(path, inc.base, *node),
       );
     }
-    self.decide_content(inc, r, &mut effects, &mut windows);
-    self.decide_directories(r, &mut effects, &mut windows);
+    // The paths the increment removes itself: a rename over a file and a directory's removal read
+    // them.
+    let cleared = r.cleared();
+    self.decide_content(inc, (r, &cleared), &mut effects, &mut windows);
+    self.decide_directories((inc.base, r, &cleared), &mut effects, &mut windows);
     self.decide_metadata(inc, r, &mut effects, &mut windows);
     self.decide_node_exclusive(inc, &mut windows);
     if windows.is_empty() {
@@ -3107,13 +3169,15 @@ impl Green {
   fn decide_content(
     &mut self,
     inc: &Increment,
-    r: &Resolved,
+    (r, cleared): (&Resolved, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
     for (dst, from) in &r.renames {
       let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
-      if let Err(window) = self.merge_rename((dst, ops), (inc.base, &inc.post_state), from, effects)
+      let source = (from.as_str(), cleared);
+      if let Err(window) =
+        self.merge_rename((dst, ops), (inc.base, &inc.post_state), source, effects)
       {
         windows.push(window);
       }
@@ -3141,16 +3205,15 @@ impl Green {
   /// The directory dimension: creation and removal (removal against the increment's own removals).
   fn decide_directories(
     &self,
-    r: &Resolved,
+    (base, r, cleared): (u64, &Resolved, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
-    let cleared = r.cleared();
     for path in &r.mkdirs {
       record(effects, windows, self.merge_mkdir(path));
     }
     for path in &r.rmdirs {
-      record(effects, windows, self.merge_rmdir(path, &cleared));
+      record(effects, windows, self.merge_rmdir(path, base, cleared));
     }
   }
 
@@ -3176,7 +3239,7 @@ impl Green {
       record(
         effects,
         windows,
-        self.merge_hardlink(path, inc.base, target),
+        self.merge_hardlink(path, inc.base, (target, r.establishes(target))),
       );
     }
     for (path, name, value) in &r.xattr_sets {
@@ -3190,7 +3253,7 @@ impl Green {
       record(
         effects,
         windows,
-        self.merge_remove_xattr(path, name, inc.base),
+        self.merge_remove_xattr(path, name, inc.base, r.establishes(path)),
       );
     }
   }
@@ -3219,6 +3282,7 @@ impl Green {
 
   /// Remove the live inode and its metadata while retaining their historical values.
   fn remove_special(&mut self, path: String, version: u64) {
+    self.file_removed.insert(path.clone(), version);
     // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
     let at = self.seed_of(&self.special_history, &path, &path, version);
     seed(
@@ -3351,6 +3415,7 @@ impl Green {
             .push((version, true));
         }
         Effect::RemoveDir(path) => {
+          self.file_removed.insert(path.clone(), version);
           emptied.push(path.clone());
           let stood = self.dirs.contains_key(&path).then_some(true);
           let at = self.seed_of(&self.dir_history, &path, &path, version);
@@ -3395,6 +3460,7 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveSymlink(path) => {
+          self.file_removed.insert(path.clone(), version);
           emptied.push(path.clone());
           let at = self.seed_of(&self.symlink_history, &path, &path, version);
           seed(
@@ -3429,6 +3495,7 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveHardlink(path) => {
+          self.file_removed.insert(path.clone(), version);
           emptied.push(path.clone());
           let at = self.seed_of(&self.hardlink_history, &path, &path, version);
           seed(
@@ -4480,6 +4547,9 @@ mod node_exclusive_tests;
 
 #[cfg(test)]
 mod unseen_bytes_tests;
+
+#[cfg(test)]
+mod replaced_node_tests;
 
 #[cfg(test)]
 mod tests {

@@ -163,6 +163,12 @@ mod vcs_policy;
 // tests until the servers' push paths start hooks (their pieces).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_hooks;
+// A hook run as a process of its own over a read-only view of the work, held to `vcs_hooks`' runner (A-622 part 3):
+// Unix alone until its Windows part (a job object, `slates_ipc::win_spawn`). No caller outside tests until the servers'
+// push paths start hooks (their pieces).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod hook_driver;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 part 2): the listener, one connection a task, each
 // phase's wait learned, the bounds derived from the shard's budget, and git's site. No caller outside tests until the
 // daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
