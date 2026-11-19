@@ -63,8 +63,16 @@ impl Argument {
   /// The argument a line's text writes, its id in `format`: refused when it writes none (`cap_object_info`'s
   /// "unexpected line"), or an id that is none.
   pub(crate) fn parse(text: &[u8], format: ObjectFormat, at: u64) -> Result<Argument, Refusal> {
-    let _ = (text, format);
-    Err(Refusal::UnknownArgument { at })
+    if text == SIZE {
+      return Ok(Argument::Size);
+    }
+    match text
+      .strip_prefix(OID)
+      .and_then(|rest| rest.strip_prefix(&[SP]))
+    {
+      Some(hex) => line::object_id(format, hex, at).map(Argument::Oid),
+      None => Err(Refusal::UnknownArgument { at }),
+    }
   }
 
   /// Refused when the argument's id is not in `format`.
@@ -235,8 +243,13 @@ pub fn decode_answer<'a>(
   format: ObjectFormat,
   admission: &mut Admission,
 ) -> Result<Vec<Line<Info>>, Refusal> {
-  let _ = (bytes, format, admission);
-  Err(Refusal::Unfinished { at: 0 })
+  let count = walk(bytes, format, |_| {})?;
+  admission
+    .charge_items::<Line<Info>>(count)
+    .map_err(Refusal::PastAdmission)?;
+  let mut lines = Vec::with_capacity(count);
+  walk(bytes, format, |line| lines.push(line))?;
+  Ok(lines)
 }
 
 /// Writes an `object-info` answer of `lines`, each as it ended, its ids in `format`, then its flush. Refused, nothing
@@ -246,8 +259,8 @@ pub fn encode_answer(
   format: ObjectFormat,
   out: &mut impl Out,
 ) -> Result<(), Refusal> {
-  let _ = (lines, format, out);
-  Err(Refusal::Line { at: 0 })
+  write_answer(lines, format, &mut Measure::default())?;
+  write_answer(lines, format, out)
 }
 
 /// Writes the answer's lines to `out`, checking each before it writes it.
@@ -276,8 +289,8 @@ pub fn answer(
   sizes: &impl ObjectSizes,
   out: &mut impl Out,
 ) -> Result<(), Refusal> {
-  let _ = (arguments, format, sizes, out);
-  Err(Refusal::Line { at: 0 })
+  write_answer_to(arguments, format, sizes, &mut Measure::default())?;
+  write_answer_to(arguments, format, sizes, out)
 }
 
 /// Writes the answer to `arguments` to `out`, checking each line before it writes it.

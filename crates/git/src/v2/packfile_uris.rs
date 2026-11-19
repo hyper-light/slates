@@ -147,8 +147,27 @@ pub fn choose(
   offered: &[UriPack<'_>],
   admission: &mut Admission,
 ) -> Result<Choice, Refusal> {
-  let _ = (arguments, units, offered, admission, tile, follow);
-  Err(Refusal::Line { at: 0 })
+  let taken = Taken::of(arguments);
+  let room = core::mem::size_of::<usize>()
+    .saturating_add(core::mem::size_of::<Best>())
+    .saturating_add(core::mem::size_of::<usize>())
+    .saturating_mul(offered.len());
+  admission
+    .charge(to_u64(room))
+    .map_err(Refusal::PastAdmission)?;
+  let mut eligible: Vec<usize> = (0..offered.len())
+    .filter(|index| {
+      offered
+        .get(*index)
+        .is_some_and(|pack| taken.allows(pack, units))
+    })
+    .collect();
+  eligible.sort_unstable_by_key(|index| {
+    let first = offered.get(*index).map_or(0, |pack| pack.first);
+    (core::cmp::Reverse(first), *index)
+  });
+  let table = tile(&eligible, offered, units);
+  Ok(follow(&table, offered, units))
 }
 
 /// The best tiling from each unit an eligible pack starts at to the run's end, found from the end back: the table, its

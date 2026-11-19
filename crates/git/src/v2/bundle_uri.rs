@@ -171,15 +171,20 @@ pub fn decode_answer<'a>(
   bytes: &'a [u8],
   admission: &mut Admission,
 ) -> Result<Vec<Line<Pair<'a>>>, Refusal> {
-  let _ = (bytes, admission);
-  Err(Refusal::Unfinished { at: 0 })
+  let count = walk(bytes, |_| {})?;
+  admission
+    .charge_items::<Line<Pair<'a>>>(count)
+    .map_err(Refusal::PastAdmission)?;
+  let mut lines = Vec::with_capacity(count);
+  walk(bytes, |line| lines.push(line))?;
+  Ok(lines)
 }
 
 /// Writes a `bundle-uri` answer of `lines`, each as it ended, then its flush. Refused, nothing written, when a line is
 /// one git's client refuses or longer than a packet carries.
 pub fn encode_answer(lines: &[Line<Pair<'_>>], out: &mut impl Out) -> Result<(), Refusal> {
-  let _ = (lines, out);
-  Err(Refusal::Line { at: 0 })
+  write_lines(lines, &mut Measure::default())?;
+  write_lines(lines, out)
 }
 
 /// Writes the lines to `out`, checking each before it writes it.
@@ -203,8 +208,9 @@ fn write_lines(lines: &[Line<Pair<'_>>], out: &mut impl Out) -> Result<(), Refus
 /// it offers no list. Refused, nothing written, when a bundle's id is empty or holds `=`, its URI is empty, or a part
 /// holds bytes no text line holds or a line is longer than a packet carries.
 pub fn answer(bundles: &impl Bundles, out: &mut impl Out) -> Result<(), Refusal> {
-  let _ = (bundles, out);
-  Err(Refusal::Line { at: 0 })
+  let list = bundles.bundle_list();
+  write_list(list.as_ref(), &mut Measure::default())?;
+  write_list(list.as_ref(), out)
 }
 
 /// Writes `list` to `out`, checking each line before it writes it.
