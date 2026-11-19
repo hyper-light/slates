@@ -2506,7 +2506,7 @@
 >    124 of 124, merged 126 of 126 on r1032). In the ops document (2b), version 3 holds a node table a link names, the
 >    node at its target at the work's base or the one the work makes, its golden vectors re-derived independently
 >    (218 bytes, `553a422f…6c0d92`) and the determinism gate holding with nodes (red on r1104, 12 failed; green 134
->    of 134). Bug record: `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+>    of 134; merged with main on r1111, 141 of 141). Bug record: `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
 >    (`links_to`), two lookups where it scanned every attribute change and every hard link; a counter test shows 2
 >    entries examined where the scan examined 2,000 (r960). Since part 2a it is one lookup, its last change: the links

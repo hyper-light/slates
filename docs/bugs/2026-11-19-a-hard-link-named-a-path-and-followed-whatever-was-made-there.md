@@ -59,4 +59,4 @@ node table, and a link names one of its records: the node at the target at the w
 there. The deriver records which, and the engine resolves a made node through the work's own renames and links. So
 `ln g l; mv f g` keeps `l` on `g`'s old node, and `mv f g; ln g l` names `f`'s. The golden vectors were re-derived
 independently (218 bytes, `553a422f…6c0d92`). Red on kiln r1104 (12 of the 45 tests the run selected failed); green on
-r1104, `cargo test -p slates-merge --lib` 134 of 134.
+r1104, `cargo test -p slates-merge --lib` 134 of 134; merged with main (r1111), 141 of 141.

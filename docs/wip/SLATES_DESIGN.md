@@ -45741,8 +45741,8 @@ Applied in the same change to:
 - **Sibling fixed in passing:** `tests/common/mod.rs`'s index still returned `u16` after A-621 widened interning to
   `u64`, so the ten integration suites that include it did not compile. It is `u64` now; those suites are main's to
   run.
-- **Tests** (debug, Mac Studio, 2026-11-19, load 12 to 16), green on kiln r1104: `cargo test -p slates-merge --lib`,
-  134 of 134; `cargo fmt -p slates-merge -- --check`, clean. The failing-first tests:
+- **Tests** (debug, Mac Studio, 2026-11-19, load 3 to 16), green on kiln r1104 and, merged with main, r1111:
+  `cargo test -p slates-merge --lib`, 134 of 134 and 141 of 141; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests:
   - the golden vectors;
   - the node table's round trip, a node named twice recorded once;
   - the determinism gate with nodes;
