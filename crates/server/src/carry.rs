@@ -566,7 +566,11 @@ mod tests {
     let head = crate::daemon::observe_first(&daemon, move |state| sealed_head(state, clone));
     let (record, mark, ..) = looked_until_recorded(&daemon, clone, head)
       .expect("the carry was recorded for its first head of its own");
-    assert_eq!(mark, Some(head), "the record's mark is the clone's own head");
+    assert_eq!(
+      mark,
+      Some(head),
+      "the record's mark is the clone's own head"
+    );
     assert_eq!(record.head, IDENTITY, "the record is for that head");
     let refused =
       crate::daemon::observe_first(&daemon, |state| state.refusals.get(CARRY_REFUSED).copied());

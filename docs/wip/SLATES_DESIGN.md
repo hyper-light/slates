@@ -36590,6 +36590,11 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   record and free after it; the record for the head, its mark the head, naming the rewritten file as captured and the
   made one as absent), `a544_a_fresh_captured_clone_carries_nothing_until_its_first_snapshot` and
   `a544_the_carry_of_a_clone_the_shard_no_longer_serves_is_forgotten_at_the_walks_end` (`crates/server/src/carry.rs`).
+  Red first on the Mac Studio (2026-11-18, `cargo test --locked -p slates-server --lib -- a544`): with the five rules
+  taken out and their calls kept (no creation record, no head held back, any sealed head taken as the clone's own, a
+  move never waiting, nothing forgotten), 0 of 5 passed, each failing at its own assertion; with them, 5 of 5, and 50
+  of 50 over the lib's `a544`, `carry::`, `moves::`, `catalog::`, `landing::` and `fleet::` tests; `slates-db`'s
+  carried-capture tests 3 of 3.
 - **Owed.** The fleet's own test of a takeover (three daemons: a captured clone's owner killed after a sealed head, its
   successor landing it against its capture), filed for main. A live-shipped clone's record for the head its log rebuilt.
   A captured clone sealed at its making (its content shares its origin's chunks, so its placement puts little), or its
