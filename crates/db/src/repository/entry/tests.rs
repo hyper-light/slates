@@ -1,7 +1,10 @@
-//! A-603's tests (§4.17.1 shared piece 2): an entry of a repository's register, driven through the partition's guard
-//! and apply, and through a database over a real anchor segment. The model test runs generated histories of entries,
-//! destroys, snapshots and crashes against the design's rules kept over plain maps, the database dropped and recovered
-//! from its segment at random points.
+//! A-603's and A-635's tests (§4.17.1 shared piece 2, rebuilt by A-642): an entry of a repository's logs, driven
+//! through the partition's guard and apply, and through a database over a real anchor segment. Each green keeps its own
+//! log and the repository's own state its logs of its own; an entry appends to each green only while it is at the
+//! position the push read; an entry moving two logs or more is an atomic record, which a holder applies at its join and
+//! a cut holds whole or not at all. The model test runs generated histories of entries, single-green appends,
+//! checkpoints, destroys, snapshots and crashes against the design's rules kept over plain maps, the database dropped
+//! and recovered from its segment at random points, holding NoLoss, Agreement and StaleNeverCommits.
 
 // proptest's strategy types carry `Arc` (D-8's harness exception).
 #![allow(clippy::disallowed_types)]
@@ -15,10 +18,10 @@ use slates_anchor::{AnchorSegment, Geometry};
 use slates_machine::facts::Identity;
 
 use crate::catalog::{
-  BaseRecord, GreenVersion, MemberOrigin, MemberRecord, NameBinding, NameChange, NamePolicy,
-  ObjectFormat, PolicyRecord, Principal, RepositoryCheck, RepositoryEntry, RepositoryId,
-  RepositoryRecord, Role, SizeClass, SnapshotId, StateChange, VcsTool, VolumeId, VolumeRecord,
-  VolumeState,
+  AtomicRecord, BaseRecord, GreenVersion, Join, LogName, LogSpan, MemberOrigin, MemberRecord,
+  NameBinding, NameChange, NamePolicy, ObjectFormat, PolicyRecord, Principal, RepositoryCheck,
+  RepositoryEntry, RepositoryId, RepositoryRecord, Role, SizeClass, SnapshotId, StateChange,
+  StateLog, VcsTool, VolumeId, VolumeRecord, VolumeState,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -136,11 +139,10 @@ fn advance(partition: &mut Partition, entry: RepositoryEntry) -> Result<(), DbEr
   run(partition, &Op::RepositoryAdvanced { entry })
 }
 
-/// An entry of `repository`'s register at `position`, changing nothing yet.
-fn at(repository: RepositoryId, position: u64) -> RepositoryEntry {
+/// An entry of `repository`'s logs, changing nothing yet.
+fn at(repository: RepositoryId) -> RepositoryEntry {
   RepositoryEntry {
     repository,
-    position,
     ..RepositoryEntry::default()
   }
 }
@@ -215,12 +217,47 @@ fn marker(bytes: &[u8]) -> StateChange {
   }
 }
 
+fn locked(path: &str, lock: &[u8]) -> StateChange {
+  StateChange::LockTaken {
+    path: path.to_owned(),
+    lock: lock.to_vec(),
+  }
+}
+
+fn unlocked(path: &str, lock: &[u8]) -> StateChange {
+  StateChange::LockReleased {
+    path: path.to_owned(),
+    lock: lock.to_vec(),
+  }
+}
+
+/// The refusal of a green that moved from the position the push read.
+fn moved(green: VolumeId, read: u64, at: u64) -> DbError {
+  DbError::Moved {
+    green: green.bytes,
+    read,
+    at,
+  }
+}
+
 fn chain(partition: &Partition, green: VolumeId) -> Vec<Vec<u8>> {
   partition.green_chain(green).to_vec()
 }
 
-fn position(partition: &Partition, repository: RepositoryId) -> Option<u64> {
-  partition.repositories().position(repository)
+fn log_position(partition: &Partition, repository: RepositoryId, log: StateLog) -> Option<u64> {
+  partition.repositories().log_position(repository, log)
+}
+
+fn green_log(green: VolumeId) -> LogName {
+  LogName::Green { green }
+}
+
+fn state_log(repository: RepositoryId, log: StateLog) -> LogName {
+  LogName::State { repository, log }
+}
+
+fn span(log: LogName, from: u64, to: u64) -> LogSpan {
+  LogSpan { log, from, to }
 }
 
 /// A partition rebuilt from `partition`'s snapshot answers as `partition` does, whole.
@@ -231,8 +268,8 @@ fn assert_snapshot_rebuilds(partition: &Partition, caps: PartitionCaps) {
 }
 
 /// A repository on `HOME` whose lineage holds a root `a` and branches `b` and `c` made from it, bound to `main`, `topic`
-/// and `other` by its register's first entry, and beside them a plain volume and a green of another partition: the
-/// partition, the repository, and `[a, b, c, plain, foreign]`.
+/// and `other` by its first entry, and beside them a plain volume and a green of another partition: the partition, the
+/// repository, and `[a, b, c, plain, foreign]`.
 fn three_branches(caps: PartitionCaps) -> (Partition, RepositoryId, [VolumeId; 5]) {
   let mut partition = Partition::new(caps, 0);
   let ids = [
@@ -259,7 +296,7 @@ fn three_branches(caps: PartitionCaps) -> (Partition, RepositoryId, [VolumeId; 5
     from: a,
     version: 0,
   };
-  let mut first = at(repo, 0);
+  let mut first = at(repo);
   first.joined = vec![
     member(repo, a, MemberOrigin::Root),
     member(repo, b, made_from_a),
@@ -270,58 +307,30 @@ fn three_branches(caps: PartitionCaps) -> (Partition, RepositoryId, [VolumeId; 5
   (partition, repo, ids)
 }
 
-/// A-603 (§4.17.1 item 2: git's atomic push, "Either all refs are updated or none", as one register append). Do: commit
-/// versions of two of a repository's three greens in one entry; then send an entry whose second version skips one, one
-/// made for a stale position, and entries naming a green outside the lineage; then land two versions of one green in one
-/// entry (a stack landed whole). Expect: the first entry moves both chains and the register one position, the third
-/// green untouched; each refused entry is refused by its kind (`OutOfOrder` naming what it named and what was next,
-/// `NotFound` for a green the lineage does not hold) with every chain and the position as they were; the stack lands
-/// both versions in order; a partition rebuilt from its snapshot answers the same.
+/// A-603, A-642 (§4.17.1 item 2: git's atomic push, one record for several greens). Do: commit versions of two of a
+/// repository's three greens in one entry; then send an entry whose second version skips one, one naming a version
+/// made from a position its green moved past, and entries naming a green outside the lineage; then land two versions of
+/// one green in one entry (a stack landed whole). Expect: the first entry moves both chains, and is one atomic record
+/// that each green's log points to at its new position; each refused entry is refused by its kind (`Moved`, naming the
+/// green that moved, the position read and the one it is at; `NotFound` for a green the lineage does not hold) with
+/// every chain as it was; the stack moves one green only, so it is no atomic record; a partition rebuilt from its
+/// snapshot answers the same.
 #[test]
 fn an_entry_commits_several_greens_versions_together_or_none_of_them() {
   let (mut partition, repo, [a, b, c, plain, foreign]) = three_branches(caps(ROOMY));
-  assert_eq!(position(&partition, repo), Some(1));
-  let mut push = at(repo, 1);
+  let mut push = at(repo);
   push.versions = vec![version(a, 1, b"a1"), version(b, 1, b"b1")];
   advance(&mut partition, push).unwrap();
   assert_eq!(chain(&partition, a), vec![b"a1".to_vec()]);
   assert_eq!(chain(&partition, b), vec![b"b1".to_vec()]);
   assert!(chain(&partition, c).is_empty());
-  assert_eq!(position(&partition, repo), Some(2));
-  let before = partition.to_snapshot(0);
-  let mut skipping = at(repo, 2);
-  skipping.versions = vec![version(a, 2, b"a2"), version(b, 3, b"b3")];
-  assert_eq!(
-    advance(&mut partition, skipping),
-    Err(DbError::OutOfOrder {
-      named: 3,
-      expected: 2
-    })
-  );
-  let mut stale = at(repo, 1);
-  stale.versions = vec![version(c, 1, b"c1")];
-  assert_eq!(
-    advance(&mut partition, stale),
-    Err(DbError::OutOfOrder {
-      named: 1,
-      expected: 2
-    })
-  );
-  for outsider in [plain, foreign, green(99)] {
-    let mut outside = at(repo, 2);
-    outside.versions = vec![version(c, 1, b"c1"), version(outsider, 1, b"x")];
-    assert_eq!(
-      advance(&mut partition, outside),
-      Err(DbError::NotFound),
-      "{outsider:?}"
-    );
-  }
-  assert_eq!(
-    partition.to_snapshot(0),
-    before,
-    "a refused entry applied something"
-  );
-  let mut stack = at(repo, 2);
+  let record = AtomicRecord {
+    spans: vec![span(green_log(a), 0, 1), span(green_log(b), 0, 1)],
+  };
+  assert_eq!(partition.repositories().atomic_at(a, 1), Some(&record));
+  assert_eq!(partition.repositories().atomic_at(b, 1), Some(&record));
+  assert_stale_and_outside_entries_are_refused(&mut partition, repo, [a, b, c, plain, foreign]);
+  let mut stack = at(repo);
   stack.versions = vec![version(a, 2, b"a2"), version(a, 3, b"a3")];
   advance(&mut partition, stack).unwrap();
   assert_eq!(
@@ -329,64 +338,67 @@ fn an_entry_commits_several_greens_versions_together_or_none_of_them() {
     vec![b"a1".to_vec(), b"a2".to_vec(), b"a3".to_vec()]
   );
   assert_eq!(partition.green_head(a), 3);
-  assert_eq!(position(&partition, repo), Some(3));
+  assert_eq!(partition.repositories().atomic_at(a, 3), None);
   assert_snapshot_rebuilds(&partition, caps(ROOMY));
 }
 
-/// A-603 (§4.17.3 decision 6: `check:heads` and `unbundle`'s heads, every head unchanged, checked in the push's own
-/// register step). Do: commit an entry checking every name of the repository and an unmoved green's head; move that green
-/// in another entry and send the first entry's checks again; retire a name and check the names under prefixes; check a
-/// green's head at the version the entry itself makes and at the one before it; check heads of greens outside the
-/// repository; bind a name under a checked prefix. Expect: the checks hold at first; after the move the entry is
-/// refused `CheckFailed` naming the check's index, nothing of it applied, its retire included; a prefix's check fails
-/// once a name under it is retired or added and holds while names elsewhere change; a check reads the position before
-/// the entry's own changes; a head outside the repository never holds.
+/// The refused entries of [`an_entry_commits_several_greens_versions_together_or_none_of_them`]: nothing of them
+/// applied.
+fn assert_stale_and_outside_entries_are_refused(
+  partition: &mut Partition,
+  repo: RepositoryId,
+  [a, b, c, plain, foreign]: [VolumeId; 5],
+) {
+  let before = partition.to_snapshot(0);
+  let mut skipping = at(repo);
+  skipping.versions = vec![version(a, 2, b"a2"), version(b, 3, b"b3")];
+  assert_eq!(advance(partition, skipping), Err(moved(b, 2, 1)));
+  let mut stale = at(repo);
+  stale.versions = vec![version(c, 1, b"c1"), version(a, 1, b"a-again")];
+  assert_eq!(advance(partition, stale), Err(moved(a, 0, 1)));
+  for outsider in [plain, foreign, green(99)] {
+    let mut outside = at(repo);
+    outside.versions = vec![version(c, 1, b"c1"), version(outsider, 1, b"x")];
+    assert_eq!(advance(partition, outside), Err(DbError::NotFound), "{outsider:?}");
+  }
+  assert_eq!(
+    partition.to_snapshot(0),
+    before,
+    "a refused entry applied something"
+  );
+}
+
+/// A-603, A-642 (§4.17.3 decision 6: `check:heads` and `unbundle`'s heads, every head unchanged, each green's position
+/// compared). Do: commit an entry checking every name and an unmoved green's head; move that green and send the first
+/// entry's checks again; retire a name and check names under prefixes; check a green's head at the version the entry
+/// itself makes and at the one before it; check heads outside the repository; check a state log's position. Expect: the
+/// checks hold at first; a moved head refuses the entry `Moved`, naming the green, nothing of it applied; a names check
+/// refuses `CheckFailed` naming its index once a name under its prefix changed, and holds while names elsewhere change;
+/// a check reads before the entry's own changes; a head outside the repository never holds; a state log's check holds
+/// at its position and refuses past it.
 #[test]
-fn checks_read_the_register_at_the_entrys_position_and_refuse_the_whole_entry() {
+fn checks_read_each_logs_position_and_refuse_the_whole_entry() {
   let (mut partition, repo, [a, b, c, plain, _]) = three_branches(caps(ROOMY));
   let every = || names("", &[("main", a), ("other", c), ("topic", b)]);
-  let mut push = at(repo, 1);
+  let mut push = at(repo);
   push.checks = vec![every(), head(c, 0)];
   push.versions = vec![version(a, 1, b"a1")];
   advance(&mut partition, push).unwrap();
-  let mut other = at(repo, 2);
+  let mut other = at(repo);
   other.versions = vec![version(c, 1, b"c1")];
   advance(&mut partition, other).unwrap();
   let before = partition.to_snapshot(0);
-  let mut late = at(repo, 3);
+  let mut late = at(repo);
   late.checks = vec![every(), head(c, 0)];
   late.versions = vec![version(a, 2, b"a2")];
   late.names = vec![retire("topic")];
-  assert_eq!(
-    advance(&mut partition, late),
-    Err(DbError::CheckFailed { index: 1 })
-  );
+  assert_eq!(advance(&mut partition, late), Err(moved(c, 0, 1)));
   assert_eq!(partition.to_snapshot(0), before);
-  let mut retiring = at(repo, 3);
-  retiring.names = vec![retire("topic")];
-  advance(&mut partition, retiring).unwrap();
-  let mut named = at(repo, 4);
-  named.checks = vec![names("t", &[("topic", b)])];
-  assert_eq!(
-    advance(&mut partition, named),
-    Err(DbError::CheckFailed { index: 0 })
-  );
-  let mut narrow = at(repo, 4);
-  narrow.checks = vec![names("o", &[("other", c)]), head(c, 1)];
-  narrow.versions = vec![version(a, 2, b"a2")];
-  advance(&mut partition, narrow).unwrap();
-  let mut own = at(repo, 5);
-  own.checks = vec![head(a, 3)];
-  own.versions = vec![version(a, 3, b"a3")];
-  assert_eq!(
-    advance(&mut partition, own.clone()),
-    Err(DbError::CheckFailed { index: 0 })
-  );
-  own.checks = vec![head(a, 2)];
-  advance(&mut partition, own).unwrap();
+  assert_names_checks_follow_their_prefixes(&mut partition, repo, [a, b, c]);
+  assert_checks_read_before_the_entrys_own_changes(&mut partition, repo, a);
   let elsewhere = second_repository_with_root(&mut partition, green(6));
   for outsider in [plain, elsewhere, green(99)] {
-    let mut outside = at(repo, 6);
+    let mut outside = at(repo);
     outside.checks = vec![head(outsider, 0)];
     assert_eq!(
       advance(&mut partition, outside),
@@ -394,17 +406,64 @@ fn checks_read_the_register_at_the_entrys_position_and_refuse_the_whole_entry() 
       "{outsider:?}"
     );
   }
-  let mut adding = at(repo, 6);
+  assert_a_state_logs_check_holds_at_its_position(&mut partition, repo);
+}
+
+fn assert_names_checks_follow_their_prefixes(
+  partition: &mut Partition,
+  repo: RepositoryId,
+  [a, b, c]: [VolumeId; 3],
+) {
+  let mut retiring = at(repo);
+  retiring.names = vec![retire("topic")];
+  advance(partition, retiring).unwrap();
+  let mut named = at(repo);
+  named.checks = vec![names("t", &[("topic", b)])];
+  assert_eq!(
+    advance(partition, named),
+    Err(DbError::CheckFailed { index: 0 })
+  );
+  let mut narrow = at(repo);
+  narrow.checks = vec![names("o", &[("other", c)]), head(c, 1)];
+  narrow.versions = vec![version(a, 2, b"a2")];
+  advance(partition, narrow).unwrap();
+  let mut adding = at(repo);
   adding.names = vec![bind("topic", b)];
   adding.checks = vec![names("", &[("main", a), ("other", c)])];
-  advance(&mut partition, adding).unwrap();
-  let mut stale = at(repo, 7);
-  stale.checks = vec![names("o", &[("other", c)]), every()];
-  advance(&mut partition, stale.clone()).unwrap();
-  stale.position = 8;
+  advance(partition, adding).unwrap();
+  let mut stale = at(repo);
   stale.checks = vec![names("", &[("main", a), ("other", c)])];
   assert_eq!(
-    advance(&mut partition, stale),
+    advance(partition, stale),
+    Err(DbError::CheckFailed { index: 0 })
+  );
+}
+
+fn assert_checks_read_before_the_entrys_own_changes(
+  partition: &mut Partition,
+  repo: RepositoryId,
+  a: VolumeId,
+) {
+  let mut own = at(repo);
+  own.checks = vec![head(a, 3)];
+  own.versions = vec![version(a, 3, b"a3")];
+  assert_eq!(advance(partition, own.clone()), Err(moved(a, 3, 2)));
+  own.checks = vec![head(a, 2)];
+  advance(partition, own).unwrap();
+}
+
+fn assert_a_state_logs_check_holds_at_its_position(partition: &mut Partition, repo: RepositoryId) {
+  let phases = log_position(partition, repo, StateLog::Phases).unwrap();
+  let mut moving = at(repo);
+  moving.checks = vec![RepositoryCheck::Log {
+    log: StateLog::Phases,
+    position: phases,
+  }];
+  moving.state = vec![root_added(1, 9)];
+  advance(partition, moving.clone()).unwrap();
+  moving.state = vec![root_added(1, 8)];
+  assert_eq!(
+    advance(partition, moving),
     Err(DbError::CheckFailed { index: 0 })
   );
 }
@@ -421,70 +480,82 @@ fn second_repository_with_root(partition: &mut Partition, root: VolumeId) -> Vol
   let record = repository(10, "other");
   let second = record.id;
   run(partition, &Op::RepositoryCreated { record }).unwrap();
-  let mut first = at(second, 0);
+  let mut first = at(second);
   first.joined = vec![member(second, root, MemberOrigin::Root)];
   advance(partition, first).unwrap();
   root
 }
 
-/// A-603 (§4.17.3 decisions 3 and 4: phase roots and obsolescence markers commit in the step of the push that moves
-/// them, or alone). Do: commit a version with a phase root and two markers; move phases alone (a root removed, two
-/// added); send entries, each with a version, whose state change was made against another state: a root added that is
-/// one, a root removed that is not, a held marker, a marker twice, a root added, removed and removed again; then add a
-/// marker. Expect: the roots read back in (phase, node) order and the markers in the order received; each wrong change
-/// refuses its entry `StateChanged` naming its index, nothing applied, the version included; a partition rebuilt from
-/// its snapshot answers the same.
+/// A-603, A-642 (§4.17.3 decisions 3 and 4; the repository's own state in logs of its own). Do: commit a version with a
+/// phase root and two markers; move phases alone; take and release LFS locks alone; send entries, each with a version,
+/// whose state change was made against another state (a root that is one, one that is not, a held marker, a marker
+/// twice, a lock on a locked path, a release of another lock). Expect: the roots, markers and locks read back in their
+/// orders; each state log at a position of its own, moved only by its own changes; the version with state is one
+/// atomic record over the green's log and the state logs it moved, and a state move alone is none; each wrong change
+/// refuses its entry `StateChanged` naming its index, nothing applied; a partition rebuilt from its snapshot answers
+/// the same.
 #[test]
-fn the_repositorys_state_moves_with_its_push_or_alone_and_only_from_the_state_it_was_made_against()
-{
+fn the_repositorys_state_moves_in_logs_of_its_own_with_its_push_or_alone() {
   let (mut partition, repo, [a, ..]) = three_branches(caps(ROOMY));
-  let roots = |partition: &Partition| -> Vec<(u8, Vec<u8>)> {
-    partition
-      .repositories()
-      .phase_roots(repo)
-      .map(|(phase, node)| (phase, node.to_vec()))
-      .collect()
-  };
-  let markers = |partition: &Partition| -> Vec<Vec<u8>> {
-    partition
-      .repositories()
-      .markers(repo)
-      .map(<[u8]>::to_vec)
-      .collect()
-  };
-  let mut push = at(repo, 1);
+  let mut push = at(repo);
   push.versions = vec![version(a, 1, b"a1")];
   push.state = vec![root_added(1, 1), marker(b"m1"), marker(b"m2")];
   advance(&mut partition, push).unwrap();
-  assert_eq!(roots(&partition), vec![(1, vec![1; 20])]);
-  assert_eq!(markers(&partition), vec![b"m1".to_vec(), b"m2".to_vec()]);
-  let mut phases = at(repo, 2);
-  phases.state = vec![root_removed(1, 1), root_added(1, 2), root_added(2, 1)];
-  advance(&mut partition, phases).unwrap();
-  assert_eq!(roots(&partition), vec![(1, vec![2; 20]), (2, vec![1; 20])]);
-  assert_eq!(
-    chain(&partition, a).len(),
-    1,
-    "a phase move alone moved a green"
-  );
-  assert_eq!(position(&partition, repo), Some(3));
+  let record = AtomicRecord {
+    spans: vec![
+      span(green_log(a), 0, 1),
+      span(state_log(repo, StateLog::Phases), 0, 1),
+      span(state_log(repo, StateLog::Markers), 0, 2),
+    ],
+  };
+  assert_eq!(partition.repositories().atomic_at(a, 1), Some(&record));
+  let mut alone = at(repo);
+  alone.state = vec![root_removed(1, 1), root_added(1, 2), locked("x.bin", b"lock-1")];
+  advance(&mut partition, alone).unwrap();
+  assert_state_logs_read_back(&partition, repo);
+  assert_wrong_state_changes_are_refused(&mut partition, repo, a);
+  assert_snapshot_rebuilds(&partition, caps(ROOMY));
+}
+
+fn assert_state_logs_read_back(partition: &Partition, repo: RepositoryId) {
+  let repositories = partition.repositories();
+  let roots: Vec<(u8, Vec<u8>)> = repositories
+    .phase_roots(repo)
+    .map(|(phase, node)| (phase, node.to_vec()))
+    .collect();
+  assert_eq!(roots, vec![(1, vec![2; 20])]);
+  let markers: Vec<&[u8]> = repositories.markers(repo).collect();
+  assert_eq!(markers, vec![&b"m1"[..], &b"m2"[..]]);
+  let locks: Vec<(&str, &[u8])> = repositories.locks(repo).collect();
+  assert_eq!(locks, vec![("x.bin", &b"lock-1"[..])]);
+  let positions: Vec<Option<u64>> = [
+    StateLog::Names,
+    StateLog::Phases,
+    StateLog::Markers,
+    StateLog::Locks,
+  ]
+  .into_iter()
+  .map(|log| log_position(partition, repo, log))
+  .collect();
+  assert_eq!(positions, vec![Some(6), Some(3), Some(2), Some(1)]);
+}
+
+fn assert_wrong_state_changes_are_refused(partition: &mut Partition, repo: RepositoryId, a: VolumeId) {
   let before = partition.to_snapshot(0);
   for (state, index) in [
     (vec![root_added(1, 2)], 0),
     (vec![marker(b"m3"), root_removed(1, 1)], 1),
     (vec![marker(b"m1")], 0),
     (vec![marker(b"m3"), marker(b"m3")], 1),
-    (
-      vec![root_added(1, 3), root_removed(1, 3), root_removed(1, 3)],
-      2,
-    ),
+    (vec![locked("y.bin", b"l"), locked("x.bin", b"l")], 1),
+    (vec![unlocked("x.bin", b"another")], 0),
   ] {
-    let mut wrong = at(repo, 3);
+    let mut wrong = at(repo);
     wrong.versions = vec![version(a, 2, b"a2")];
     wrong.state = state;
     assert_eq!(
-      advance(&mut partition, wrong),
-      Err(DbError::StateChanged { index }),
+      advance(partition, wrong),
+      Err(DbError::StateChanged { index })
     );
   }
   assert_eq!(
@@ -492,54 +563,42 @@ fn the_repositorys_state_moves_with_its_push_or_alone_and_only_from_the_state_it
     before,
     "a refused entry applied something"
   );
-  let mut later = at(repo, 3);
-  later.state = vec![marker(b"m0")];
-  advance(&mut partition, later).unwrap();
-  assert_eq!(
-    markers(&partition),
-    vec![b"m1".to_vec(), b"m2".to_vec(), b"m0".to_vec()]
-  );
-  assert_snapshot_rebuilds(&partition, caps(ROOMY));
+  let mut release = at(repo);
+  release.state = vec![unlocked("x.bin", b"lock-1")];
+  advance(partition, release).unwrap();
+  assert_eq!(partition.repositories().locks(repo).count(), 0);
 }
 
-/// A-603 (bounded growth: an entry's versions and the repository's state are charged to the partition's merge budget).
-/// Do: on a partition whose merge budget holds 256 bytes, add a marker of 100 bytes, then one of 200; send an entry of two
-/// versions of 100 bytes each, which fit one at a time and not together; destroy the repository; then add the larger
-/// marker to a new repository. Expect: the larger marker and the two versions are each refused `Capacity` while the
-/// first marker is held, nothing applied; the destroy gives the first's bytes back, so the larger fits after it; a
-/// partition rebuilt from its snapshot charges the same.
+/// A-603, A-642 (bounded growth). Do: on a partition whose merge budget holds 256 bytes, add a marker of 100 bytes, then
+/// one of 200; send two versions of 100 bytes each, which fit one at a time and not together; take a lock of 200; destroy
+/// the repository; then add the larger marker to a new repository. Expect: the larger marker, the two versions and the
+/// lock are each refused `Capacity` while the first marker is held, nothing applied; the destroy gives the first's bytes
+/// back, so the larger fits after it; a partition rebuilt from its snapshot charges the same.
 #[test]
 fn the_repositorys_state_is_charged_to_the_merge_budget_and_given_back_with_it() {
   let budget = caps(256);
   let (mut partition, repo, [a, b, ..]) = three_branches(budget);
-  let mut small = at(repo, 1);
+  let mut small = at(repo);
   small.state = vec![marker(&[1; 100])];
   advance(&mut partition, small).unwrap();
   let before = partition.to_snapshot(0);
-  let mut large = at(repo, 2);
+  let full = Err(DbError::Capacity {
+    table: "green_chains",
+  });
+  let mut large = at(repo);
   large.state = vec![marker(&[2; 200])];
-  assert_eq!(
-    advance(&mut partition, large.clone()),
-    Err(DbError::Capacity {
-      table: "green_chains"
-    })
-  );
-  let mut together = at(repo, 2);
+  assert_eq!(advance(&mut partition, large.clone()), full);
+  let mut together = at(repo);
   together.versions = vec![version(a, 1, &[3; 100]), version(b, 1, &[4; 100])];
-  assert_eq!(
-    advance(&mut partition, together),
-    Err(DbError::Capacity {
-      table: "green_chains"
-    })
-  );
+  assert_eq!(advance(&mut partition, together), full);
+  let mut lock = at(repo);
+  lock.state = vec![locked("big", &[5; 200])];
+  assert_eq!(advance(&mut partition, lock), full);
   assert_eq!(partition.to_snapshot(0), before);
-  assert_snapshot_rebuilds(&partition, budget);
   let mut rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), budget, 0).unwrap();
   assert_eq!(
     advance(&mut rebuilt, large),
-    Err(DbError::Capacity {
-      table: "green_chains"
-    }),
+    full,
     "a rebuilt partition charges the state it carries"
   );
   run(
@@ -547,134 +606,126 @@ fn the_repositorys_state_is_charged_to_the_merge_budget_and_given_back_with_it()
     &Op::RepositoryDestroyed { repository: repo },
   )
   .unwrap();
-  assert_eq!(position(&partition, repo), None);
-  let root = second_repository_with_root(&mut partition, green(6));
-  let second = repository_id(10);
-  let mut again = at(second, 1);
+  assert_eq!(log_position(&partition, repo, StateLog::Names), None);
+  second_repository_with_root(&mut partition, green(6));
+  let mut again = at(repository_id(10));
   again.state = vec![marker(&[2; 200])];
   advance(&mut partition, again).unwrap();
-  assert_eq!(partition.repositories().markers(second).count(), 1);
-  assert!(partition.volume(root).is_some());
 }
 
-/// A-603 (one position names one state of a repository). Do: create a repository, then change it by every operation that
-/// can (A-515's and A-575's single operations, a member's version recorded alone, an entry, a member's destroy), and make
-/// operations that do not change it (a version of a green outside its lineage, a refused retire, a destroy of a green
-/// it does not hold); then destroy it. Expect: each change takes the next position and nothing else moves it; the
-/// destroyed repository has no register.
+/// A-642 (no global reference: each green and each state log at its own position). Do: append to one green alone, to
+/// two at once, and to a third alone after an entry was made against the first's position before the second moved;
+/// change names alone; record a member's version alone (`GreenAdvanced`); check a log after another log moved. Expect:
+/// each green's position moves only by its own versions and each state log's only by its own changes; an entry made
+/// against one green's position commits whatever other greens did meanwhile; a lone version is no atomic record; the
+/// A-515 and A-575 operations move the names log alone.
 #[test]
-fn every_change_of_a_repository_takes_one_position() {
-  let mut partition = Partition::new(caps(ROOMY), 0);
-  let [a, b, outsider] = [green(1), green(2), green(3)];
-  for id in [a, b, outsider] {
-    run(
-      &mut partition,
-      &Op::VolumeCreated {
-        record: volume(id, true),
-      },
-    )
-    .unwrap();
-  }
-  let record = repository(9, "linux");
-  let repo = record.id;
-  run(&mut partition, &Op::RepositoryCreated { record }).unwrap();
-  assert_eq!(position(&partition, repo), Some(0));
-  let steps: Vec<(Op, Option<u64>)> = vec![
-    (
-      Op::RepositoryGreenJoined {
-        record: member(repo, a, MemberOrigin::Root),
-      },
-      Some(1),
-    ),
-    (
-      Op::RepositoryBranchAdded {
-        record: crate::catalog::BranchRecord {
-          repository: repo,
-          name: "main".to_owned(),
-          green: a,
-        },
-      },
-      Some(2),
-    ),
-    (
-      Op::RepositoryDefaultSet {
-        repository: repo,
-        branch: Some("main".to_owned()),
-      },
-      Some(3),
-    ),
-    (
-      Op::GreenAdvanced {
-        green: a,
-        increment: b"a1".to_vec(),
-      },
-      Some(4),
-    ),
-    (
-      Op::GreenAdvanced {
-        green: outsider,
-        increment: b"x".to_vec(),
-      },
-      Some(4),
-    ),
-    (
-      Op::RepositoryGreenJoined {
-        record: member(
-          repo,
-          b,
-          MemberOrigin::Branch {
-            from: a,
-            version: 1,
-          },
-        ),
-      },
-      Some(5),
-    ),
-    (
-      Op::RepositoryBranchRetired {
-        repository: repo,
-        name: "main".to_owned(),
-      },
-      Some(6),
-    ),
-    (
-      Op::RepositoryAdvanced {
-        entry: RepositoryEntry {
-          names: vec![bind("main", a)],
-          ..at(repo, 6)
-        },
-      },
-      Some(7),
-    ),
-    (Op::VolumeDestroyed { id: b }, Some(8)),
-    (Op::VolumeDestroyed { id: outsider }, Some(8)),
-  ];
-  for (op, expected) in steps {
-    run(&mut partition, &op).unwrap();
-    assert_eq!(position(&partition, repo), expected, "after {}", op.name());
-  }
+fn no_change_waits_on_another_logs_position() {
+  let (mut partition, repo, [a, b, c, ..]) = three_branches(caps(ROOMY));
+  let names_at = log_position(&partition, repo, StateLog::Names);
+  let mut made_against_a = at(repo);
+  made_against_a.versions = vec![version(a, 1, b"a1")];
+  made_against_a.checks = vec![head(a, 0)];
+  let mut both = at(repo);
+  both.versions = vec![version(b, 1, b"b1"), version(c, 1, b"c1")];
+  advance(&mut partition, both).unwrap();
+  advance(&mut partition, made_against_a).unwrap();
   assert_eq!(
-    run(
-      &mut partition,
-      &Op::RepositoryBranchRetired {
-        repository: repo,
-        name: "gone".to_owned(),
-      },
-    ),
-    Err(DbError::NotFound)
+    [a, b, c].map(|green| partition.green_head(green)),
+    [1, 1, 1]
   );
-  assert_eq!(
-    run(&mut partition, &Op::VolumeDestroyed { id: green(99) }),
-    Err(DbError::NotFound)
-  );
-  assert_eq!(position(&partition, repo), Some(8));
-  assert_snapshot_rebuilds(&partition, caps(ROOMY));
+  assert_eq!(partition.repositories().atomic_at(a, 1), None);
+  assert_eq!(log_position(&partition, repo, StateLog::Names), names_at);
   run(
     &mut partition,
-    &Op::RepositoryDestroyed { repository: repo },
+    &Op::GreenAdvanced {
+      green: a,
+      increment: b"a2".to_vec(),
+    },
   )
   .unwrap();
-  assert_eq!(position(&partition, repo), None);
+  assert_eq!(partition.green_head(a), 2);
+  assert_eq!(partition.green_head(b), 1);
+  run(
+    &mut partition,
+    &Op::RepositoryBranchRetired {
+      repository: repo,
+      name: "other".to_owned(),
+    },
+  )
+  .unwrap();
+  assert_eq!(
+    log_position(&partition, repo, StateLog::Names),
+    names_at.map(|position| position + 1)
+  );
+  assert_eq!(log_position(&partition, repo, StateLog::Phases), Some(0));
+}
+
+/// A-642 requirements 1 and 2 (a holder applies an atomic record only at its join; a replica refuses a cut that splits
+/// one). Do: commit one entry moving two greens and a state log; read where holders at various positions stand against
+/// it; ask the partition about cuts of the logs. Expect: every log at its predecessor is `Ready`; one behind is
+/// `Waiting`; all past it `Applied`; one past and one at its predecessor `Diverged`; a cut holding one green's new
+/// position beside another's old one is refused naming the record, while cuts holding all of it, none of it, or naming
+/// one of its logs alone are consistent.
+#[test]
+fn a_holder_applies_an_atomic_record_at_its_join_and_a_cut_holds_all_of_it_or_none() {
+  let (mut partition, repo, [a, b, ..]) = three_branches(caps(ROOMY));
+  let mut push = at(repo);
+  push.versions = vec![version(a, 1, b"a1"), version(b, 1, b"b1")];
+  push.state = vec![marker(b"m")];
+  advance(&mut partition, push).unwrap();
+  let record = partition.repositories().atomic_at(b, 1).cloned().unwrap();
+  let markers = state_log(repo, StateLog::Markers);
+  let holder = |at_a: u64, at_b: u64, at_markers: u64| {
+    move |log: &LogName| match log {
+      LogName::Green { green } if *green == a => at_a,
+      LogName::Green { .. } => at_b,
+      LogName::State { .. } => at_markers,
+    }
+  };
+  assert_eq!(record.join(holder(0, 0, 0)), Join::Ready);
+  assert_eq!(record.join(holder(1, 1, 1)), Join::Applied);
+  assert_eq!(record.join(holder(1, 0, 0)), Join::Diverged);
+  let lagging = AtomicRecord {
+    spans: vec![span(green_log(a), 3, 4), span(green_log(b), 1, 2)],
+  };
+  assert_eq!(lagging.join(holder(2, 1, 0)), Join::Waiting);
+  let split = [(green_log(a), 1), (green_log(b), 0)];
+  assert_eq!(partition.repositories().split_by(&split), Some(&record));
+  for consistent in [
+    vec![(green_log(a), 1), (green_log(b), 1), (markers, 1)],
+    vec![(green_log(a), 0), (green_log(b), 0)],
+    vec![(green_log(a), 1)],
+  ] {
+    assert_eq!(partition.repositories().split_by(&consistent), None);
+  }
+}
+
+/// A-642 requirement 3's retention (an atomic record lives while a green's log points to it). Do: commit a record over
+/// two greens; checkpoint one past it; then destroy the other; and rebuild from a snapshot between. Expect: the record
+/// stays while the second green's log points to it, and the snapshot carries it; it goes with the second's destroy.
+#[test]
+fn an_atomic_record_lives_while_a_greens_log_points_to_it() {
+  let (mut partition, repo, [a, b, c, ..]) = three_branches(caps(ROOMY));
+  let mut push = at(repo);
+  push.versions = vec![version(b, 1, b"b1"), version(c, 1, b"c1")];
+  advance(&mut partition, push).unwrap();
+  let record = partition.repositories().atomic_at(b, 1).cloned().unwrap();
+  run(
+    &mut partition,
+    &Op::GreenCheckpointed {
+      green: b,
+      version: 1,
+      checkpoint: b"checkpoint".to_vec(),
+    },
+  )
+  .unwrap();
+  assert_eq!(partition.repositories().atomic_at(b, 1), None);
+  assert_eq!(partition.repositories().atomic_at(c, 1), Some(&record));
+  assert_snapshot_rebuilds(&partition, caps(ROOMY));
+  run(&mut partition, &Op::VolumeDestroyed { id: c }).unwrap();
+  assert_eq!(partition.repositories().atomic_records().count(), 0);
+  assert!(partition.volume(a).is_some());
 }
 
 // The model test.
@@ -697,7 +748,7 @@ const PREFIXES: [&str; 3] = ["", "n", "n1"];
 const NODES: u8 = 3;
 /// Shape: see [`NODES`].
 const PHASES: u8 = 2;
-/// Shape: the markers a history adds.
+/// Shape: the markers a history adds, and the paths its locks name.
 const MARKERS: u8 = 3;
 /// Shape: the database's log ring, and each snapshot slot, in bytes: a history's records and its partition fit.
 const SEGMENT_BYTES: u64 = 1 << 16;
@@ -706,6 +757,13 @@ const SEGMENT_BYTES: u64 = 1 << 16;
 const SNAPSHOT_EVERY: u64 = 1 << 11;
 /// Shape: the segment's page.
 const PAGE: u64 = 4096;
+/// Shape: the state logs, in log order.
+const STATE_LOGS: [StateLog; 4] = [
+  StateLog::Names,
+  StateLog::Phases,
+  StateLog::Markers,
+  StateLog::Locks,
+];
 
 /// The volume a history's index names: the greens and the plain volume on `HOME`, the foreign green on `ELSEWHERE`, and
 /// an id on `HOME` that nothing holds. Each index is its id's last byte.
@@ -730,7 +788,7 @@ fn name_of(index: u8) -> String {
   }
 }
 
-/// How a step's value departs from the one the model holds right: mostly it does not, so histories are mostly accepted.
+/// How a step's value departs from the one the model holds right: mostly it does not.
 #[derive(Clone, Copy, Debug)]
 enum Skew {
   Exact,
@@ -739,6 +797,14 @@ enum Skew {
 }
 
 impl Skew {
+  fn of(choice: u8) -> Skew {
+    match choice % 10 {
+      0 => Skew::Below,
+      1 => Skew::Above,
+      _ => Skew::Exact,
+    }
+  }
+
   fn apply(self, value: u64) -> u64 {
     match self {
       Skew::Exact => value,
@@ -755,10 +821,21 @@ enum Pick {
   Volume(u8),
 }
 
+impl Pick {
+  fn of((choice, n): (u8, u8)) -> Pick {
+    if choice % 5 == 0 {
+      Pick::Volume(n % VOLUMES)
+    } else {
+      Pick::Member(n)
+    }
+  }
+}
+
 #[derive(Clone, Debug)]
 enum CheckStep {
   Head { green: Pick, skew: Skew },
   Names { prefix: u8, skew: Skew },
+  Log { log: u8, skew: Skew },
 }
 
 #[derive(Clone, Debug)]
@@ -779,15 +856,15 @@ enum StateStep {
   Add { phase: u8, node: u8 },
   Remove { phase: u8, node: u8 },
   Marker { marker: u8 },
+  Lock { path: u8, lock: u8 },
+  Unlock { path: u8, lock: u8 },
 }
 
 #[derive(Clone, Debug)]
 struct EntryStep {
-  /// Whether the entry keeps only its items that hold, judged in order on the model, at the right position and
-  /// versions: an entry the rules accept whole, so histories reach entries of several greens, stacks and state moves
-  /// often, and not refusals alone.
+  /// Whether the entry keeps only its items that hold, judged in order on the model, at the right versions: an entry the
+  /// rules accept whole, so histories reach records of several greens and state moves often, not refusals alone.
   clean: bool,
-  skew: Skew,
   checks: Vec<CheckStep>,
   joins: Vec<JoinStep>,
   versions: Vec<(Pick, Skew)>,
@@ -798,78 +875,96 @@ struct EntryStep {
 #[derive(Clone, Debug)]
 enum Step {
   Advance(EntryStep),
+  /// One member's version alone (`Op::GreenAdvanced`), a single-green push between the records.
+  Single { green: u8 },
+  /// A member's checkpoint `back` versions below its head.
+  Checkpoint { green: u8, back: u8 },
   Destroy { volume: u8 },
   Snapshot,
   Crash,
 }
 
-fn skew() -> impl Strategy<Value = Skew> {
-  prop_oneof![
-    8 => Just(Skew::Exact),
-    1 => Just(Skew::Below),
-    1 => Just(Skew::Above),
-  ]
+fn pick() -> impl Strategy<Value = Pick> {
+  (any::<u8>(), any::<u8>()).prop_map(Pick::of)
 }
 
-fn pick() -> impl Strategy<Value = Pick> {
-  prop_oneof![
-    4 => any::<u8>().prop_map(Pick::Member),
-    1 => (0..VOLUMES).prop_map(Pick::Volume),
-  ]
+fn skew() -> impl Strategy<Value = Skew> {
+  any::<u8>().prop_map(Skew::of)
+}
+
+fn check_step() -> impl Strategy<Value = CheckStep> {
+  (0..3u8, pick(), 0..4u8, skew()).prop_map(|(kind, green, n, skew)| match kind {
+    0 => CheckStep::Head { green, skew },
+    1 => CheckStep::Names { prefix: n, skew },
+    _ => CheckStep::Log { log: n, skew },
+  })
+}
+
+fn name_step() -> impl Strategy<Value = NameStep> {
+  (0..6u8, 0..=NAMES, pick(), any::<bool>()).prop_map(|(kind, name, green, some)| match kind {
+    0..=2 => NameStep::Bind { name, green },
+    3 | 4 => NameStep::Retire {
+      name: name % NAMES,
+    },
+    _ => NameStep::Default {
+      name: some.then_some(name),
+    },
+  })
+}
+
+fn state_step() -> impl Strategy<Value = StateStep> {
+  (0..5u8, 0..PHASES, 0..NODES, 0..MARKERS).prop_map(|(kind, phase, node, n)| match kind {
+    0 => StateStep::Add { phase, node },
+    1 => StateStep::Remove { phase, node },
+    2 => StateStep::Marker { marker: n },
+    3 => StateStep::Lock { path: n, lock: node },
+    _ => StateStep::Unlock { path: n, lock: node },
+  })
 }
 
 fn entry_step() -> impl Strategy<Value = EntryStep> {
-  let check = prop_oneof![
-    (pick(), skew()).prop_map(|(green, skew)| CheckStep::Head { green, skew }),
-    (0..3u8, skew()).prop_map(|(prefix, skew)| CheckStep::Names { prefix, skew }),
-  ];
-  let join = (
-    0..VOLUMES,
-    proptest::option::weighted(0.9, (pick(), 0..4u8)),
-  )
-    .prop_map(|(volume, from)| JoinStep { volume, from });
-  let name = prop_oneof![
-    3 => (0..=NAMES, pick()).prop_map(|(name, green)| NameStep::Bind { name, green }),
-    2 => (0..NAMES).prop_map(|name| NameStep::Retire { name }),
-    1 => proptest::option::of(0..=NAMES).prop_map(|name| NameStep::Default { name }),
-  ];
-  let state = prop_oneof![
-    (0..PHASES, 0..NODES).prop_map(|(phase, node)| StateStep::Add { phase, node }),
-    (0..PHASES, 0..NODES).prop_map(|(phase, node)| StateStep::Remove { phase, node }),
-    (0..MARKERS).prop_map(|marker| StateStep::Marker { marker }),
-  ];
+  let join = (0..VOLUMES, any::<u8>(), pick(), 0..4u8).prop_map(|(volume, root, from, version)| {
+    JoinStep {
+      volume,
+      from: (root % 10 != 0).then_some((from, version)),
+    }
+  });
   (
     proptest::bool::weighted(0.6),
-    skew(),
-    proptest::collection::vec(check, 0..3),
+    proptest::collection::vec(check_step(), 0..3),
     proptest::collection::vec(join, 0..2),
     proptest::collection::vec((pick(), skew()), 0..5),
-    proptest::collection::vec(name, 0..3),
-    proptest::collection::vec(state, 0..4),
+    proptest::collection::vec(name_step(), 0..3),
+    proptest::collection::vec(state_step(), 0..4),
   )
-    .prop_map(
-      |(clean, skew, checks, joins, versions, names, state)| EntryStep {
-        clean,
-        skew,
-        checks,
-        joins,
-        versions,
-        names,
-        state,
-      },
-    )
+    .prop_map(|(clean, checks, joins, versions, names, state)| EntryStep {
+      clean,
+      checks,
+      joins,
+      versions,
+      names,
+      state,
+    })
 }
 
 fn step() -> impl Strategy<Value = Step> {
-  prop_oneof![
-    12 => entry_step().prop_map(Step::Advance),
-    1 => (0..VOLUMES).prop_map(|volume| Step::Destroy { volume }),
-    1 => Just(Step::Snapshot),
-    2 => Just(Step::Crash),
-  ]
+  (
+    0..20u8,
+    entry_step(),
+    0..VOLUMES,
+    any::<u8>(),
+  )
+    .prop_map(|(kind, entry, volume, n)| match kind {
+      0..=10 => Step::Advance(entry),
+      11..=13 => Step::Single { green: n },
+      14 => Step::Checkpoint { green: n, back: volume },
+      15 => Step::Destroy { volume },
+      16 => Step::Snapshot,
+      _ => Step::Crash,
+    })
 }
 
-/// What an operation was answered, by kind, with what a register refusal names.
+/// What an operation was answered, by kind, with what an entry's refusal names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Answer {
   Ok,
@@ -878,7 +973,7 @@ enum Answer {
   NotGreen,
   InvalidName,
   BranchedFrom,
-  OutOfOrder { named: u64, expected: u64 },
+  Moved { green: u8, read: u64, at: u64 },
   CheckFailed(u32),
   StateChanged(u32),
   Unexpected(String),
@@ -892,20 +987,35 @@ fn answer_of(result: Result<u64, DbError>) -> Answer {
     Err(DbError::NotGreen) => Answer::NotGreen,
     Err(DbError::InvalidName) => Answer::InvalidName,
     Err(DbError::BranchedFrom { .. }) => Answer::BranchedFrom,
-    Err(DbError::OutOfOrder { named, expected }) => Answer::OutOfOrder { named, expected },
+    Err(DbError::Moved { green, read, at }) => Answer::Moved {
+      green: green[15],
+      read,
+      at,
+    },
     Err(DbError::CheckFailed { index }) => Answer::CheckFailed(index),
     Err(DbError::StateChanged { index }) => Answer::StateChanged(index),
     Err(other) => Answer::Unexpected(format!("{other:?}")),
   }
 }
 
-/// The design's rules for one repository (§4.17.1 items 2 to 5, shared piece 2; A-515, A-575, A-603), kept over plain
-/// maps by volume index: the serial reference the partition must equal after every step. An entry is judged on a copy
-/// of the model, item by item, and the copy kept only when every item held: all or none, by construction.
+/// One green's log in the model: the version its checkpoint folded to, and the entries after it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GreenLog {
+  floor: u64,
+  entries: Vec<Vec<u8>>,
+}
+
+impl GreenLog {
+  fn head(&self) -> u64 {
+    self.floor + self.entries.len() as u64
+  }
+}
+
+/// The design's rules for one repository (§4.17.1 items 2 to 5, shared piece 2; A-515, A-575, A-603, A-642), kept over
+/// plain maps by volume index: the serial reference the partition must equal after every step. An entry is judged on a
+/// copy of the model, item by item, and the copy kept only when every item held: all or none, by construction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Model {
-  /// The register's next position.
-  position: u64,
   /// The volumes the partition holds, by index.
   alive: BTreeSet<u8>,
   /// The lineage in the order it joined: each member and, for a branch, the member and version it was made at.
@@ -914,14 +1024,20 @@ struct Model {
   names: BTreeMap<String, u8>,
   /// The default branch.
   default: Option<String>,
-  /// Each green's head, where it has a version.
-  heads: BTreeMap<u8, u64>,
-  /// Each green's chain entries, where it has any.
-  chains: BTreeMap<u8, Vec<Vec<u8>>>,
+  /// Each green's log, where it has a version or a checkpoint.
+  logs: BTreeMap<u8, GreenLog>,
+  /// The state logs' positions, the markers' being their count.
+  names_position: u64,
+  phases_position: u64,
+  locks_position: u64,
   /// The phase roots.
   roots: BTreeSet<(u8, Vec<u8>)>,
   /// The markers, in the order received.
   markers: Vec<Vec<u8>>,
+  /// The locks, by path.
+  locks: BTreeMap<String, Vec<u8>>,
+  /// The atomic records kept, by key, each with the positions of greens' logs that point to it.
+  records: BTreeMap<(LogName, u64), (AtomicRecord, BTreeSet<(u8, u64)>)>,
 }
 
 impl Model {
@@ -930,7 +1046,16 @@ impl Model {
   }
 
   fn head(&self, volume: u8) -> u64 {
-    self.heads.get(&volume).copied().unwrap_or(0)
+    self.logs.get(&volume).map_or(0, GreenLog::head)
+  }
+
+  fn state_position(&self, log: StateLog) -> u64 {
+    match log {
+      StateLog::Names => self.names_position,
+      StateLog::Phases => self.phases_position,
+      StateLog::Markers => self.markers.len() as u64,
+      StateLog::Locks => self.locks_position,
+    }
   }
 
   /// The green `pick` names at this state.
@@ -975,88 +1100,116 @@ impl Model {
     Ok(())
   }
 
-  /// Judges and, when it is accepted, applies `entry`: the rules in the design's order.
-  fn advance(&mut self, entry: &RepositoryEntry) -> Answer {
-    if entry.position != self.position {
-      return Answer::OutOfOrder {
-        named: entry.position,
-        expected: self.position,
-      };
+  /// Whether `check` holds at this state, the refusal when it does not.
+  fn holds(&self, index: usize, check: &RepositoryCheck) -> Result<(), Answer> {
+    let failed = Answer::CheckFailed(u32::try_from(index).unwrap_or(u32::MAX));
+    match check {
+      RepositoryCheck::Head { green, version } => {
+        let green = index_of(*green);
+        if !self.is_member(green) {
+          return Err(failed);
+        }
+        let at = self.head(green);
+        if at != *version {
+          return Err(Answer::Moved {
+            green,
+            read: *version,
+            at,
+          });
+        }
+        Ok(())
+      }
+      RepositoryCheck::Names { prefix, bound } if self.under(prefix) != *bound => Err(failed),
+      RepositoryCheck::Log { log, position } if self.state_position(*log) != *position => Err(failed),
+      _ => Ok(()),
     }
+  }
+
+  /// Judges and, when it is accepted, applies `entry`: the rules in the design's order.
+  fn advance(&mut self, repository: RepositoryId, entry: &RepositoryEntry) -> Answer {
     for (index, check) in entry.checks.iter().enumerate() {
-      if !self.holds(check) {
-        return Answer::CheckFailed(u32::try_from(index).unwrap());
+      if let Err(answer) = self.holds(index, check) {
+        return answer;
       }
     }
     let mut next = self.clone();
-    for joined in &entry.joined {
-      if let Err(answer) = next.join(joined) {
-        return answer;
-      }
+    if let Err(answer) = next.apply(entry) {
+      return answer;
     }
-    for version in &entry.versions {
-      if let Err(answer) = next.version(version) {
-        return answer;
-      }
-    }
-    for change in &entry.names {
-      if let Err(answer) = next.name(change) {
-        return answer;
-      }
-    }
-    for (index, change) in entry.state.iter().enumerate() {
-      if !next.state(change) {
-        return Answer::StateChanged(u32::try_from(index).unwrap());
-      }
-    }
-    next.position += 1;
+    next.keep_record(repository, self, entry);
     *self = next;
     Answer::Ok
   }
 
-  /// Whether `check` holds at this state.
-  fn holds(&self, check: &RepositoryCheck) -> bool {
-    match check {
-      RepositoryCheck::Head { green, version } => {
-        self.is_member(index_of(*green)) && self.head(index_of(*green)) == *version
-      }
-      RepositoryCheck::Names { prefix, bound } => self.under(prefix) == *bound,
+  /// Applies `entry`'s items in order, each against what the items before it left.
+  fn apply(&mut self, entry: &RepositoryEntry) -> Result<(), Answer> {
+    for joined in &entry.joined {
+      self.join(joined)?;
     }
+    for version in &entry.versions {
+      self.version(version)?;
+    }
+    for change in &entry.names {
+      self.name(change)?;
+    }
+    self.names_position += (entry.joined.len() + entry.names.len()) as u64;
+    for (index, change) in entry.state.iter().enumerate() {
+      if !self.state(change) {
+        return Err(Answer::StateChanged(
+          u32::try_from(index).unwrap_or(u32::MAX),
+        ));
+      }
+    }
+    Ok(())
   }
 
-  /// `entry` with only its items that hold, judged in order on a copy of this state, at this position and with each
-  /// version the one after its green's head: an entry the rules accept whole.
-  fn cleaned(&self, entry: RepositoryEntry) -> RepositoryEntry {
-    let mut scratch = self.clone();
-    let mut kept = at(entry.repository, self.position);
-    kept.checks = entry
-      .checks
-      .into_iter()
-      .filter(|check| self.holds(check))
-      .collect();
-    for joined in entry.joined {
-      if scratch.join(&joined).is_ok() {
-        kept.joined.push(joined);
+  /// Keeps the atomic record an accepted `entry` makes, judged from `before`, the state it was applied to: its greens'
+  /// spans from their heads before and the state logs it moved; kept when it moved two logs or more, a green among them.
+  fn keep_record(&mut self, repository: RepositoryId, before: &Model, entry: &RepositoryEntry) {
+    let mut spans: BTreeMap<LogName, LogSpan> = BTreeMap::new();
+    for version in &entry.versions {
+      let log = green_log(version.green);
+      spans
+        .entry(log)
+        .and_modify(|span| span.to = span.to.max(version.version))
+        .or_insert(span(log, before.head(index_of(version.green)), version.version));
+    }
+    for log in STATE_LOGS {
+      let (from, to) = (before.state_position(log), self.state_position(log));
+      if to > from {
+        let name = state_log(repository, log);
+        spans.insert(name, span(name, from, to));
       }
     }
-    for made in entry.versions {
-      let green = index_of(made.green);
-      let next = version(made.green, scratch.head(green) + 1, &made.entry);
-      if scratch.version(&next).is_ok() {
-        kept.versions.push(next);
+    let spans: Vec<LogSpan> = spans.into_values().collect();
+    let moves_a_green = spans
+      .iter()
+      .any(|span| matches!(span.log, LogName::Green { .. }));
+    let Some(first) = spans.first().copied() else {
+      return;
+    };
+    if spans.len() < 2 || !moves_a_green {
+      return;
+    }
+    let mut pointers = BTreeSet::new();
+    for span in &spans {
+      if let LogName::Green { green } = span.log {
+        for position in span.from + 1..=span.to {
+          pointers.insert((index_of(green), position));
+        }
       }
     }
-    for change in entry.names {
-      if scratch.name(&change).is_ok() {
-        kept.names.push(change);
-      }
+    self
+      .records
+      .insert((first.log, first.to), (AtomicRecord { spans }, pointers));
+  }
+
+  /// `green`'s log folded through `floor`: its pointers there go, and each record left with none.
+  fn fold_records(&mut self, green: u8, floor: u64) {
+    for (_, pointers) in self.records.values_mut() {
+      pointers.retain(|(at, position)| *at != green || *position > floor);
     }
-    for change in entry.state {
-      if scratch.state(&change) {
-        kept.state.push(change);
-      }
-    }
-    kept
+    self.records.retain(|_, (_, pointers)| !pointers.is_empty());
   }
 
   fn join(&mut self, joined: &MemberRecord) -> Result<(), Answer> {
@@ -1084,18 +1237,19 @@ impl Model {
     if !self.is_member(green) {
       return Err(Answer::NotFound);
     }
-    let expected = self.head(green) + 1;
-    if version.version != expected {
-      return Err(Answer::OutOfOrder {
-        named: version.version,
-        expected,
+    let at = self.head(green);
+    if version.version != at + 1 {
+      return Err(Answer::Moved {
+        green,
+        read: version.version.saturating_sub(1),
+        at,
       });
     }
-    self.heads.insert(green, version.version);
     self
-      .chains
+      .logs
       .entry(green)
       .or_default()
+      .entries
       .push(version.entry.clone());
     Ok(())
   }
@@ -1133,7 +1287,7 @@ impl Model {
   }
 
   fn state(&mut self, change: &StateChange) -> bool {
-    match change {
+    let applied = match change {
       StateChange::PhaseRootAdded { phase, node } => self.roots.insert((*phase, node.clone())),
       StateChange::PhaseRootRemoved { phase, node } => self.roots.remove(&(*phase, node.clone())),
       StateChange::MarkerAdded { marker } => {
@@ -1141,13 +1295,48 @@ impl Model {
           return false;
         }
         self.markers.push(marker.clone());
-        true
+        return true;
       }
+      StateChange::LockTaken { path, lock } => {
+        if self.locks.contains_key(path) {
+          return false;
+        }
+        self.locks.insert(path.clone(), lock.clone());
+        self.locks_position += 1;
+        return true;
+      }
+      StateChange::LockReleased { path, lock } => {
+        if self.locks.get(path) != Some(lock) {
+          return false;
+        }
+        self.locks.remove(path);
+        self.locks_position += 1;
+        return true;
+      }
+    };
+    if applied {
+      self.phases_position += 1;
     }
+    applied
   }
 
-  /// A volume's destroy: refused while a member was made from it; its name and membership leave with it, and a
-  /// repository it leaves takes a position.
+  /// A member's version alone (`Op::GreenAdvanced`): its log's next entry, no record.
+  fn single(&mut self, green: u8, entry: Vec<u8>) {
+    self.logs.entry(green).or_default().entries.push(entry);
+  }
+
+  /// A checkpoint of `green` at `version`, inside its log: its entries through it fold, and so do its pointers.
+  fn checkpoint(&mut self, green: u8, version: u64) {
+    if let Some(log) = self.logs.get_mut(&green) {
+      let folded = usize::try_from(version - log.floor).unwrap();
+      log.entries.drain(..folded);
+      log.floor = version;
+    }
+    self.fold_records(green, version);
+  }
+
+  /// A volume's destroy: refused while a member was made from it; its name, membership, log and pointers leave with it,
+  /// and the names log moves when it was bound or a member.
   fn destroy(&mut self, volume: u8) -> Answer {
     if !self.alive.contains(&volume) {
       return Answer::NotFound;
@@ -1163,10 +1352,10 @@ impl Model {
     self.alive.remove(&volume);
     self.members.retain(|(member, _)| *member != volume);
     self.names.retain(|_, bound| *bound != volume);
-    self.heads.remove(&volume);
-    self.chains.remove(&volume);
+    self.logs.remove(&volume);
+    self.fold_records(volume, u64::MAX);
     if changed {
-      self.position += 1;
+      self.names_position += 1;
     }
     Answer::Ok
   }
@@ -1181,98 +1370,153 @@ impl Model {
     made
   }
 
+  /// `entry` with only its items that hold, judged in order on a copy of this state, each version the one after its
+  /// green's head: an entry the rules accept whole.
+  fn cleaned(&self, entry: RepositoryEntry) -> RepositoryEntry {
+    let mut scratch = self.clone();
+    let mut kept = at(entry.repository);
+    kept.checks = entry
+      .checks
+      .into_iter()
+      .enumerate()
+      .filter(|(index, check)| self.holds(*index, check).is_ok())
+      .map(|(_, check)| check)
+      .collect();
+    for joined in entry.joined {
+      if scratch.join(&joined).is_ok() {
+        kept.joined.push(joined);
+      }
+    }
+    for made in entry.versions {
+      let next = version(made.green, scratch.head(index_of(made.green)) + 1, &made.entry);
+      if scratch.version(&next).is_ok() {
+        kept.versions.push(next);
+      }
+    }
+    for change in entry.names {
+      if scratch.name(&change).is_ok() {
+        kept.names.push(change);
+      }
+    }
+    for change in entry.state {
+      if scratch.state(&change) {
+        kept.state.push(change);
+      }
+    }
+    kept
+  }
+
   /// The entry a step makes as it stands.
   fn made(&self, repository: RepositoryId, step: &EntryStep) -> RepositoryEntry {
-    let mut heads = self.heads.clone();
-    RepositoryEntry {
-      repository,
-      position: step.skew.apply(self.position),
-      checks: step
-        .checks
-        .iter()
-        .map(|check| match check {
-          CheckStep::Head { green, skew } => {
-            let green = self.picked(*green);
-            head(volume_of(green), skew.apply(self.head(green)))
-          }
-          CheckStep::Names { prefix, skew } => {
-            let prefix = PREFIXES[usize::from(*prefix) % PREFIXES.len()];
-            let mut bound = self.under(prefix);
-            match skew {
-              Skew::Exact => {}
-              Skew::Below => {
-                bound.pop();
-              }
-              Skew::Above => bound.push(NameBinding {
-                name: format!("{prefix}~"),
-                green: volume_of(0),
-              }),
-            }
-            RepositoryCheck::Names {
-              prefix: prefix.to_owned(),
-              bound,
-            }
-          }
-        })
-        .collect(),
-      joined: step
-        .joins
-        .iter()
-        .map(|join| MemberRecord {
-          repository,
-          green: volume_of(join.volume),
-          origin: match join.from {
-            None => MemberOrigin::Root,
-            Some((from, version)) => MemberOrigin::Branch {
-              from: volume_of(self.picked(from)),
-              version: u64::from(version),
-            },
+    let mut heads: BTreeMap<u8, u64> = BTreeMap::new();
+    let mut entry = at(repository);
+    entry.checks = step.checks.iter().map(|check| self.check_of(check)).collect();
+    entry.joined = step
+      .joins
+      .iter()
+      .map(|join| MemberRecord {
+        repository,
+        green: volume_of(join.volume),
+        origin: match join.from {
+          None => MemberOrigin::Root,
+          Some((from, version)) => MemberOrigin::Branch {
+            from: volume_of(self.picked(from)),
+            version: u64::from(version),
           },
-        })
-        .collect(),
-      versions: step
-        .versions
-        .iter()
-        .map(|(green, skew)| {
-          let green = self.picked(*green);
-          let version = skew.apply(heads.get(&green).copied().unwrap_or(0) + 1);
-          heads.insert(green, version);
-          GreenVersion {
-            green: volume_of(green),
-            version,
-            entry: format!("{green}@{version}").into_bytes(),
-          }
-        })
-        .collect(),
-      names: step
-        .names
-        .iter()
-        .map(|change| match change {
-          NameStep::Bind { name, green } => bind(&name_of(*name), volume_of(self.picked(*green))),
-          NameStep::Retire { name } => retire(&name_of(*name)),
-          NameStep::Default { name } => NameChange::Default {
-            branch: name.map(name_of),
-          },
-        })
-        .collect(),
-      state: step
-        .state
-        .iter()
-        .map(|change| match change {
-          StateStep::Add { phase, node } => root_added(phase + 1, *node),
-          StateStep::Remove { phase, node } => root_removed(phase + 1, *node),
-          StateStep::Marker { marker } => self::marker(format!("marker-{marker}").as_bytes()),
-        })
-        .collect(),
+        },
+      })
+      .collect();
+    for (green, skew) in &step.versions {
+      let green = self.picked(*green);
+      let next = heads.get(&green).copied().unwrap_or_else(|| self.head(green)) + 1;
+      let version_made = skew.apply(next);
+      heads.insert(green, version_made);
+      let bytes = format!("{green}@{version_made}").into_bytes();
+      entry.versions.push(version(volume_of(green), version_made, &bytes));
     }
+    entry.names = step.names.iter().map(|change| self.name_of_step(change)).collect();
+    entry.state = step.state.iter().map(state_of_step).collect();
+    entry
+  }
+
+  fn check_of(&self, check: &CheckStep) -> RepositoryCheck {
+    match check {
+      CheckStep::Head { green, skew } => {
+        let green = self.picked(*green);
+        head(volume_of(green), skew.apply(self.head(green)))
+      }
+      CheckStep::Names { prefix, skew } => {
+        let prefix = PREFIXES[usize::from(*prefix) % PREFIXES.len()];
+        let mut bound = self.under(prefix);
+        match skew {
+          Skew::Exact => {}
+          Skew::Below => {
+            bound.pop();
+          }
+          Skew::Above => bound.push(NameBinding {
+            name: format!("{prefix}~"),
+            green: volume_of(0),
+          }),
+        }
+        RepositoryCheck::Names {
+          prefix: prefix.to_owned(),
+          bound,
+        }
+      }
+      CheckStep::Log { log, skew } => {
+        let log = STATE_LOGS[usize::from(*log) % STATE_LOGS.len()];
+        RepositoryCheck::Log {
+          log,
+          position: skew.apply(self.state_position(log)),
+        }
+      }
+    }
+  }
+
+  fn name_of_step(&self, change: &NameStep) -> NameChange {
+    match change {
+      NameStep::Bind { name, green } => bind(&name_of(*name), volume_of(self.picked(*green))),
+      NameStep::Retire { name } => retire(&name_of(*name)),
+      NameStep::Default { name } => NameChange::Default {
+        branch: name.map(name_of),
+      },
+    }
+  }
+}
+
+fn state_of_step(change: &StateStep) -> StateChange {
+  match change {
+    StateStep::Add { phase, node } => root_added(phase + 1, *node),
+    StateStep::Remove { phase, node } => root_removed(phase + 1, *node),
+    StateStep::Marker { marker: n } => marker(format!("marker-{n}").as_bytes()),
+    StateStep::Lock { path, lock } => locked(&format!("p{path}"), &[*lock]),
+    StateStep::Unlock { path, lock } => unlocked(&format!("p{path}"), &[*lock]),
   }
 }
 
 /// What the partition holds of the repository, in the model's terms.
 fn observed(partition: &Partition, repository: RepositoryId) -> Model {
   let repositories = partition.repositories();
+  let position = |log| repositories.log_position(repository, log).unwrap_or(u64::MAX);
+  let records = repositories
+    .atomic_records()
+    .map(|record| {
+      let first = record.spans[0];
+      let pointers = record
+        .spans
+        .iter()
+        .filter_map(|span| match span.log {
+          LogName::Green { green } => Some((green, span)),
+          LogName::State { .. } => None,
+        })
+        .flat_map(|(green, span)| (span.from + 1..=span.to).map(move |at| (green, at)))
+        .filter(|(green, at)| repositories.atomic_at(*green, *at) == Some(record))
+        .map(|(green, at)| (index_of(green), at))
+        .collect();
+      ((first.log, first.to), (record.clone(), pointers))
+    })
+    .collect();
   Model {
-    position: repositories.position(repository).unwrap_or(u64::MAX),
     alive: (0..VOLUMES)
       .filter(|index| partition.volume(volume_of(*index)).is_some())
       .collect(),
@@ -1293,14 +1537,20 @@ fn observed(partition: &Partition, repository: RepositoryId) -> Model {
     default: repositories
       .repository(repository)
       .and_then(|record| record.default_branch.clone()),
-    heads: (0..GREENS)
-      .map(|index| (index, partition.green_head(volume_of(index))))
-      .filter(|(_, head)| *head > 0)
+    logs: (0..GREENS)
+      .map(|index| {
+        let green = volume_of(index);
+        let log = GreenLog {
+          floor: partition.green_floor(green),
+          entries: partition.green_chain(green).to_vec(),
+        };
+        (index, log)
+      })
+      .filter(|(_, log)| log.head() > 0)
       .collect(),
-    chains: (0..GREENS)
-      .map(|index| (index, partition.green_chain(volume_of(index)).to_vec()))
-      .filter(|(_, chain)| !chain.is_empty())
-      .collect(),
+    names_position: position(StateLog::Names),
+    phases_position: position(StateLog::Phases),
+    locks_position: position(StateLog::Locks),
     roots: repositories
       .phase_roots(repository)
       .map(|(phase, node)| (phase, node.to_vec()))
@@ -1309,6 +1559,11 @@ fn observed(partition: &Partition, repository: RepositoryId) -> Model {
       .markers(repository)
       .map(<[u8]>::to_vec)
       .collect(),
+    locks: repositories
+      .locks(repository)
+      .map(|(path, lock)| (path.to_owned(), lock.to_vec()))
+      .collect(),
+    records,
   }
 }
 
@@ -1346,29 +1601,29 @@ fn failed(error: impl std::fmt::Debug) -> TestCaseError {
 /// stopped making the steps that matter fails rather than passes on trivial histories.
 #[derive(Debug, Default)]
 struct Census {
-  /// Accepted entries committing versions of two greens or more.
+  /// Accepted entries committing versions of two greens or more: atomic records over greens.
   several_greens: u64,
-  /// Accepted entries committing two versions or more of one green (a stack landed whole).
-  stacked: u64,
-  /// Accepted entries moving the repository's state with versions.
+  /// Single-green appends accepted after an atomic record of the same history: pushes interleaved with records.
+  interleaved_singles: u64,
+  /// Accepted entries moving the repository's state with versions, and alone.
   state_with_versions: u64,
-  /// Accepted entries moving the repository's state alone.
+  /// See [`Census::state_with_versions`].
   state_alone: u64,
-  /// Accepted entries whose checks held.
-  checks_held: u64,
-  /// Entries refused by a check, by a state change, out of order, and by a rule of the lineage or the namespace.
+  /// Entries refused `Moved`, naming the green that moved: StaleNeverCommits met.
+  stale_refused: u64,
+  /// Entries refused by a check, by a state change, and by a rule of the lineage or the namespace.
   check_failed: u64,
   /// See [`Census::check_failed`].
   state_changed: u64,
   /// See [`Census::check_failed`].
-  out_of_order: u64,
-  /// See [`Census::check_failed`].
   refused_by_rule: u64,
-  /// Destroys of a member, which take the register a position.
+  /// Checkpoints and destroys that let an atomic record go, and destroys of members.
+  records_folded: u64,
+  /// See [`Census::records_folded`].
   member_destroyed: u64,
-  /// Recoveries from a snapshot and the log after it.
+  /// Recoveries from a snapshot and the log after it, and from the log alone, with an atomic record held.
   recovered_from_snapshot: u64,
-  /// Recoveries from the log alone.
+  /// See [`Census::recovered_from_snapshot`].
   recovered_from_log: u64,
 }
 
@@ -1379,104 +1634,197 @@ impl Census {
     match answer {
       Answer::Ok => {
         self.several_greens += u64::from(greens.len() > 1);
-        self.stacked += u64::from(greens.len() < entry.versions.len());
         let moves_state = !entry.state.is_empty();
         self.state_with_versions += u64::from(moves_state && !entry.versions.is_empty());
         self.state_alone += u64::from(moves_state && entry.versions.is_empty());
-        self.checks_held += u64::from(!entry.checks.is_empty());
       }
+      Answer::Moved { .. } => self.stale_refused += 1,
       Answer::CheckFailed(_) => self.check_failed += 1,
       Answer::StateChanged(_) => self.state_changed += 1,
-      Answer::OutOfOrder { .. } => self.out_of_order += 1,
       _ => self.refused_by_rule += 1,
     }
+  }
+
+  fn met(&self) -> [u64; 12] {
+    [
+      self.several_greens,
+      self.interleaved_singles,
+      self.state_with_versions,
+      self.state_alone,
+      self.stale_refused,
+      self.check_failed,
+      self.state_changed,
+      self.refused_by_rule,
+      self.records_folded,
+      self.member_destroyed,
+      self.recovered_from_snapshot,
+      self.recovered_from_log,
+    ]
+  }
+}
+
+/// One history's database, model and clock.
+struct History {
+  seg: AnchorSegment,
+  db: crate::replay::Db,
+  model: Model,
+  repo: RepositoryId,
+  now_ns: u64,
+}
+
+/// The policy a history's database snapshots by.
+const POLICY: SnapshotPolicy = SnapshotPolicy {
+  bytes_between_snapshots: SNAPSHOT_EVERY,
+};
+
+impl History {
+  /// A database over its own segment holding the volumes and the repository, its root `n0` joined and bound.
+  fn start() -> Result<History, TestCaseError> {
+    let mut seg = segment(&format!("slates-db-a635-{}", std::process::id()));
+    let (mut db, _) = recover(&mut seg, 0, caps(ROOMY), 0).map_err(failed)?;
+    db.set_policy(POLICY);
+    let repo = repository_id(9);
+    let mut model = Model::default();
+    for index in 0..UNKNOWN {
+      let record = volume(volume_of(index), index != PLAIN);
+      db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+        .map_err(failed)?;
+      model.alive.insert(index);
+    }
+    db.mutate(
+      &mut seg,
+      &Op::RepositoryCreated {
+        record: repository(9, "linux"),
+      },
+      0,
+    )
+    .map_err(failed)?;
+    let mut first = at(repo);
+    first.joined = vec![member(repo, volume_of(0), MemberOrigin::Root)];
+    first.names = vec![bind("n0", volume_of(0))];
+    prop_assert_eq!(model.advance(repo, &first), Answer::Ok);
+    db.mutate(&mut seg, &Op::RepositoryAdvanced { entry: first }, 0)
+      .map_err(failed)?;
+    Ok(History {
+      seg,
+      db,
+      model,
+      repo,
+      now_ns: 0,
+    })
+  }
+
+  fn mutate(&mut self, op: &Op) -> Answer {
+    answer_of(self.db.mutate(&mut self.seg, op, self.now_ns))
+  }
+
+  /// Runs one step against the database and the model; the answers must agree.
+  fn step(&mut self, step: &Step, census: &mut Census) -> Result<(), TestCaseError> {
+    self.now_ns += 1;
+    match step {
+      Step::Advance(made) => {
+        let entry = self.model.build(self.repo, made);
+        let expected = self.model.advance(self.repo, &entry);
+        census.entry(&entry, &expected);
+        let real = self.mutate(&Op::RepositoryAdvanced { entry });
+        prop_assert_eq!(real, expected, "step {:?}", step);
+      }
+      Step::Single { green } => self.single(*green, census)?,
+      Step::Checkpoint { green, back } => self.checkpoint(*green, *back, census)?,
+      Step::Destroy { volume } => {
+        let member = self.model.is_member(*volume);
+        let records = self.model.records.len();
+        let expected = self.model.destroy(*volume);
+        census.member_destroyed += u64::from(member && expected == Answer::Ok);
+        census.records_folded += u64::from(self.model.records.len() < records);
+        let real = self.mutate(&Op::VolumeDestroyed {
+          id: volume_of(*volume),
+        });
+        prop_assert_eq!(real, expected, "step {:?}", step);
+      }
+      Step::Snapshot => self.db.snapshot(&mut self.seg).map_err(failed)?,
+      Step::Crash => self.crash(census)?,
+    }
+    Ok(())
+  }
+
+  /// A member's version alone.
+  fn single(&mut self, green: u8, census: &mut Census) -> Result<(), TestCaseError> {
+    let green = self.model.picked(Pick::Member(green));
+    if !self.model.is_member(green) {
+      return Ok(());
+    }
+    let bytes = format!("single-{green}@{}", self.model.head(green) + 1).into_bytes();
+    self.model.single(green, bytes.clone());
+    census.interleaved_singles += u64::from(!self.model.records.is_empty());
+    let real = self.mutate(&Op::GreenAdvanced {
+      green: volume_of(green),
+      increment: bytes,
+    });
+    prop_assert_eq!(real, Answer::Ok);
+    Ok(())
+  }
+
+  /// A member's checkpoint inside its log, when it has one to fold.
+  fn checkpoint(&mut self, green: u8, back: u8, census: &mut Census) -> Result<(), TestCaseError> {
+    let green = self.model.picked(Pick::Member(green));
+    let Some(log) = self.model.logs.get(&green).cloned() else {
+      return Ok(());
+    };
+    if log.entries.is_empty() {
+      return Ok(());
+    }
+    let version = log.head().saturating_sub(u64::from(back) % log.entries.len() as u64);
+    let records = self.model.records.len();
+    self.model.checkpoint(green, version);
+    census.records_folded += u64::from(self.model.records.len() < records);
+    let real = self.mutate(&Op::GreenCheckpointed {
+      green: volume_of(green),
+      version,
+      checkpoint: format!("checkpoint-{green}@{version}").into_bytes(),
+    });
+    prop_assert_eq!(real, Answer::Ok);
+    Ok(())
+  }
+
+  /// The database dropped and recovered from its segment: NoLoss, the recovered partition equal to the live one whole.
+  fn crash(&mut self, census: &mut Census) -> Result<(), TestCaseError> {
+    let live = self.db.partition().to_snapshot(0);
+    let seq = self.db.next_seq();
+    // The live database's memory is lost: only the segment is read back.
+    let (recovered, stats) = recover(&mut self.seg, 0, caps(ROOMY), self.now_ns).map_err(failed)?;
+    drop(std::mem::replace(&mut self.db, recovered));
+    prop_assert_eq!(
+      self.db.partition().to_snapshot(0),
+      live,
+      "recovery differs from the live partition"
+    );
+    prop_assert_eq!(self.db.next_seq(), seq);
+    prop_assert!(!stats.torn, "a clean crash has no torn tail");
+    let held = !self.model.records.is_empty();
+    if stats.snapshot.is_some() {
+      census.recovered_from_snapshot += u64::from(held);
+    } else {
+      census.recovered_from_log += u64::from(held);
+    }
+    self.db.set_policy(POLICY);
+    Ok(())
   }
 }
 
 /// Runs a generated history through a database over its own segment: every answer and the whole repository equal the
-/// model's after every step; at every crash the database is dropped and recovered from the segment, and the recovered
-/// partition equals the live one whole.
+/// model's after every step (Agreement, StaleNeverCommits); at every crash the database is dropped and recovered from
+/// the segment, and the recovered partition equals the live one whole (NoLoss).
 fn every_history_equals_the_rules_and_survives_every_crash(
   steps: &[Step],
   census: &mut Census,
 ) -> Result<(), TestCaseError> {
-  let mut seg = segment(&format!("slates-db-a603-{}", std::process::id()));
-  let policy = SnapshotPolicy {
-    bytes_between_snapshots: SNAPSHOT_EVERY,
-  };
-  let (mut db, _) = recover(&mut seg, 0, caps(ROOMY), 0).map_err(failed)?;
-  db.set_policy(policy);
-  let repo = repository_id(9);
-  let mut model = Model::default();
-  for index in 0..UNKNOWN {
-    let record = volume(volume_of(index), index != PLAIN);
-    db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
-      .map_err(failed)?;
-    model.alive.insert(index);
-  }
-  db.mutate(
-    &mut seg,
-    &Op::RepositoryCreated {
-      record: repository(9, "linux"),
-    },
-    0,
-  )
-  .map_err(failed)?;
-  let mut first = at(repo, 0);
-  first.joined = vec![member(repo, volume_of(0), MemberOrigin::Root)];
-  first.names = vec![bind("n0", volume_of(0))];
-  prop_assert_eq!(model.advance(&first), Answer::Ok);
-  db.mutate(&mut seg, &Op::RepositoryAdvanced { entry: first }, 0)
-    .map_err(failed)?;
-  let mut now_ns = 0;
+  let mut history = History::start()?;
   for step in steps {
-    now_ns += 1;
-    match step {
-      Step::Advance(made) => {
-        let entry = model.build(repo, made);
-        let expected = model.advance(&entry);
-        census.entry(&entry, &expected);
-        let real = answer_of(db.mutate(&mut seg, &Op::RepositoryAdvanced { entry }, now_ns));
-        prop_assert_eq!(real, expected, "step {:?}", step);
-      }
-      Step::Destroy { volume } => {
-        let member = model.is_member(*volume);
-        let expected = model.destroy(*volume);
-        census.member_destroyed += u64::from(member && expected == Answer::Ok);
-        let real = answer_of(db.mutate(
-          &mut seg,
-          &Op::VolumeDestroyed {
-            id: volume_of(*volume),
-          },
-          now_ns,
-        ));
-        prop_assert_eq!(real, expected, "step {:?}", step);
-      }
-      Step::Snapshot => db.snapshot(&mut seg).map_err(failed)?,
-      Step::Crash => {
-        let live = db.partition().to_snapshot(0);
-        let seq = db.next_seq();
-        drop(db);
-        let (recovered, stats) = recover(&mut seg, 0, caps(ROOMY), now_ns).map_err(failed)?;
-        prop_assert_eq!(
-          recovered.partition().to_snapshot(0),
-          live,
-          "recovery differs from the live partition"
-        );
-        prop_assert_eq!(recovered.next_seq(), seq);
-        prop_assert!(!stats.torn, "a clean crash has no torn tail");
-        if stats.snapshot.is_some() {
-          census.recovered_from_snapshot += 1;
-        } else {
-          census.recovered_from_log += 1;
-        }
-        db = recovered;
-        db.set_policy(policy);
-      }
-    }
+    history.step(step, census)?;
     prop_assert_eq!(
-      observed(db.partition(), repo),
-      model.clone(),
+      observed(history.db.partition(), history.repo),
+      history.model.clone(),
       "after {:?}",
       step
     );
@@ -1484,16 +1832,18 @@ fn every_history_equals_the_rules_and_survives_every_crash(
   Ok(())
 }
 
-/// A-603 (§4.17.1 shared piece 2; the pattern of `crates/db/src/partition.rs` and `crates/db/tests/model.rs`). Do: run
-/// generated histories over one repository through a database over a real anchor segment: entries joining members,
-/// committing versions of one or several greens, changing names and the default, moving phase roots and adding markers,
-/// with checks of heads and of names under prefixes, each item mostly right and sometimes made against another state;
-/// destroys of any volume; snapshots; and crashes, at each of which the database is dropped and recovered from its
-/// segment. Expect: every answer (accepted, or which refusal and what it names) and the whole repository after every
-/// step (its position, members in the order they joined, names, default, every green's head and chain, phase roots,
-/// markers in the order received) equal the design's rules kept over plain maps, where an entry is all or none by
-/// construction; every recovered partition equals the live one whole; and the census shows every kind of entry,
-/// refusal, destroy and recovery was met.
+/// A-603, A-635 (A-642's requirement 4; the pattern of `crates/db/src/partition.rs` and `crates/db/tests/model.rs`).
+/// Do: run generated histories over one repository through a database over a real anchor segment: entries joining
+/// members, committing versions of one or several greens (some made against positions their greens moved past),
+/// changing names and the default, moving phase roots, markers and locks, with checks of heads, of names under
+/// prefixes and of state logs' positions; single members' versions between them; checkpoints; destroys of any volume;
+/// snapshots; and crashes, at each of which the database is dropped and recovered from its segment. Expect: every
+/// answer and the whole repository after every step (each green's log, its floor and entries; each state log's position
+/// and what it holds; the namespace and the lineage; every atomic record and the positions pointing to it) equal the
+/// design's rules kept over plain maps, where an entry is all or none by construction (Agreement), an entry made
+/// against a position its green moved past is refused naming it and nothing of it lands (StaleNeverCommits), and every
+/// recovered partition equals the live one whole (NoLoss); the census shows each kind of record, single-green appends
+/// interleaved with records, refusals, folds, destroys and recoveries were met.
 #[test]
 fn every_history_of_entries_equals_the_rules_and_every_crash_recovers_it() {
   let census = RefCell::new(Census::default());
@@ -1508,22 +1858,8 @@ fn every_history_of_entries_equals_the_rules_and_every_crash_recovers_it() {
     panic!("{failure}");
   }
   let census = census.into_inner();
-  let met = [
-    census.several_greens,
-    census.stacked,
-    census.state_with_versions,
-    census.state_alone,
-    census.checks_held,
-    census.check_failed,
-    census.state_changed,
-    census.out_of_order,
-    census.refused_by_rule,
-    census.member_destroyed,
-    census.recovered_from_snapshot,
-    census.recovered_from_log,
-  ];
   assert!(
-    met.iter().all(|&count| count > 0),
+    census.met().iter().all(|&count| count > 0),
     "a kind of step never met: {census:?}"
   );
 }

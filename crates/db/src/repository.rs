@@ -30,13 +30,17 @@
 //! from. A membership leaves with its green, and outlives its repository's record, since a destroyed repository leaves
 //! its greens.
 //!
-//! **The register (A-603).** A repository's greens share one register, and every change of the repository is an entry
-//! of it at the next position: an `Op::RepositoryAdvanced` entry commits several greens' versions, greens joining the
-//! lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence markers) as one
-//! step, its checks read at its position first (`entry`); every other operation that changes a repository is an entry
-//! of that one change (a namespace operation, a member's version recorded alone, a member's destroy), so the position
-//! counts every change and one position names one state of the repository. The register is created with its
-//! repository, carried whole by a partition snapshot, and goes with its repository.
+//! **The logs (A-603, rebuilt by A-642).** Each green keeps its own log, its chain of versions, and the repository's own
+//! state is kept in logs of its own: the names log (the namespace and the lineage's joins), the phases log, the markers
+//! log and the locks log, each at its own position and moved only by its own changes; the policy's version is its own
+//! log's position (A-622). Nothing counts every change of a repository, so a push to one green never waits on another's.
+//! An `Op::RepositoryAdvanced` entry commits several greens' versions, greens joining, namespace changes and state
+//! changes as one step, all or none: each version appended only while its green is at the position the push read,
+//! refused `Moved` naming the green otherwise, and its checks read against each log's position first (`entry`). An entry
+//! that moves two logs or more, a green's among them, is kept as an atomic record ([`AtomicRecord`]): each position it
+//! took on each green's log points to it, a holder applies it only at its join, and a cut that splits it is refused
+//! ([`Repositories::split_by`]). Records go once no green's log points to them (its checkpoint, or its destroy). The
+//! state is created with its repository, carried whole by a partition snapshot, and goes with its repository.
 //!
 //! **The policy (A-622).** A repository's policy, its rules by name pattern and its hooks (§4.17.1 "Policy"), is part
 //! of its record: empty at creation, set whole by `Op::RepositoryPolicySet` from the version its setter read (`policy`
@@ -47,8 +51,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{
-  BranchRecord, MemberOrigin, MemberRecord, NameChange, PhaseRoot, RegisterRecord, RepositoryId,
-  RepositoryPolicy, RepositoryRecord, StateChange, VolumeId,
+  AtomicRecord, BranchRecord, LockRecord, LogName, LogSpan, MemberOrigin, MemberRecord, NameChange,
+  PhaseRoot, RegisterRecord, RepositoryId, RepositoryPolicy, RepositoryRecord, StateChange,
+  StateLog, VolumeId,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -84,22 +89,33 @@ pub struct Repositories {
   members: BTreeMap<VolumeId, MemberRecord>,
   /// Each lineage's members in the order they joined, the order a recovery rebuilds them in (A-575).
   lineages: BTreeMap<RepositoryId, Vec<VolumeId>>,
-  /// Each repository's register: its next position and its own state (A-603).
+  /// Each repository's own state, in logs of its own (A-603, A-642).
   registers: BTreeMap<RepositoryId, Register>,
+  /// The atomic records kept (A-642), by key: the first log a record moved and the position it took it to; each with how
+  /// many positions of greens' logs point to it.
+  atomic: BTreeMap<(LogName, u64), (AtomicRecord, u64)>,
+  /// Derived: each position an atomic record took a green's log to, to the record's key: each green's log's pointers.
+  atomic_at: BTreeMap<(VolumeId, u64), (LogName, u64)>,
 }
 
-/// A repository's register (§4.17.1 shared piece 2, A-603): the position its next entry takes, and the repository's
-/// own state, which its entries move.
+/// A repository's own state (§4.17.1 shared piece 2; A-603, A-642): its logs of its own, each at its own position,
+/// moved only by changes of it. A push that moves none of them passes none of their positions.
 #[derive(Debug, Default)]
 struct Register {
-  /// The position the next entry takes: every change of the repository takes one, so it counts them.
-  next: u64,
+  /// The names log's position: the namespace's changes and the lineage's joins.
+  names: u64,
+  /// The phases log's position.
+  phases: u64,
+  /// The locks log's position.
+  locks_position: u64,
   /// The phase roots: each phase's root nodes.
   phase_roots: BTreeMap<u8, BTreeSet<Vec<u8>>>,
-  /// The obsolescence markers, in the order the register received them.
+  /// The obsolescence markers, in the order the log received them: the markers log's position is their count.
   markers: Vec<Vec<u8>>,
   /// Derived: each held marker's identity (`entry::marker_id`).
   marker_ids: BTreeSet<[u8; 32]>,
+  /// The locks, by path.
+  locks: BTreeMap<String, Vec<u8>>,
 }
 
 impl Register {
@@ -111,51 +127,109 @@ impl Register {
       .is_some_and(|nodes| nodes.contains(node))
   }
 
+  /// The lock `path` holds.
+  fn lock(&self, path: &str) -> Option<&[u8]> {
+    self.locks.get(path).map(Vec::as_slice)
+  }
+
+  /// Every state log's position, in log order.
+  fn positions(&self) -> [(StateLog, u64); 4] {
+    [
+      StateLog::Names,
+      StateLog::Phases,
+      StateLog::Markers,
+      StateLog::Locks,
+    ]
+    .map(|log| (log, self.position(log)))
+  }
+
+  /// `log`'s position.
+  fn position(&self, log: StateLog) -> u64 {
+    match log {
+      StateLog::Names => self.names,
+      StateLog::Phases => self.phases,
+      StateLog::Markers => u64::try_from(self.markers.len()).unwrap_or(u64::MAX),
+      StateLog::Locks => self.locks_position,
+    }
+  }
+
   /// Applies one state change, unconditionally, as a replay must: a root added that is one, a root removed that is not,
-  /// or a marker held changes nothing and counts nothing. What it added and released.
+  /// a marker held, or a lock change its path does not allow changes nothing and counts nothing. Each change applied
+  /// takes its log's next position. What it added and released.
   fn apply(&mut self, change: &StateChange) -> StateBytes {
-    match change {
-      StateChange::PhaseRootAdded { phase, node } => {
-        if self
-          .phase_roots
-          .entry(*phase)
-          .or_default()
-          .insert(node.clone())
-        {
-          return StateBytes {
-            added: entry::root_bytes(node),
-            released: 0,
-          };
-        }
-        StateBytes::default()
-      }
-      StateChange::PhaseRootRemoved { phase, node } => {
-        let Some(nodes) = self.phase_roots.get_mut(phase) else {
-          return StateBytes::default();
-        };
-        let removed = nodes.remove(node.as_slice());
-        if nodes.is_empty() {
-          self.phase_roots.remove(phase);
-        }
-        if !removed {
-          return StateBytes::default();
-        }
-        StateBytes {
-          added: 0,
-          released: entry::root_bytes(node),
-        }
-      }
+    let bytes = match change {
+      StateChange::PhaseRootAdded { phase, node } => self.root_added(*phase, node),
+      StateChange::PhaseRootRemoved { phase, node } => self.root_removed(*phase, node),
       StateChange::MarkerAdded { marker } => {
         if !self.marker_ids.insert(entry::marker_id(marker)) {
           return StateBytes::default();
         }
         self.markers.push(marker.clone());
-        StateBytes {
+        return StateBytes {
           added: marker.len(),
           released: 0,
-        }
+        };
       }
+      StateChange::LockTaken { path, lock } => {
+        if self.locks.contains_key(path) {
+          return StateBytes::default();
+        }
+        self.locks.insert(path.clone(), lock.clone());
+        Some(StateBytes {
+          added: entry::lock_bytes(path, lock),
+          released: 0,
+        })
+      }
+      StateChange::LockReleased { path, lock } => {
+        if self.lock(path) != Some(lock.as_slice()) {
+          return StateBytes::default();
+        }
+        self.locks.remove(path);
+        Some(StateBytes {
+          added: 0,
+          released: entry::lock_bytes(path, lock),
+        })
+      }
+    };
+    let Some(bytes) = bytes else {
+      return StateBytes::default();
+    };
+    match change {
+      StateChange::LockTaken { .. } | StateChange::LockReleased { .. } => {
+        self.locks_position = self.locks_position.saturating_add(1);
+      }
+      _ => self.phases = self.phases.saturating_add(1),
     }
+    bytes
+  }
+
+  /// `node` added as a root of `phase`, unless it is one.
+  fn root_added(&mut self, phase: u8, node: &[u8]) -> Option<StateBytes> {
+    if !self
+      .phase_roots
+      .entry(phase)
+      .or_default()
+      .insert(node.to_vec())
+    {
+      return None;
+    }
+    Some(StateBytes {
+      added: entry::root_bytes(node),
+      released: 0,
+    })
+  }
+
+  /// `node` removed as a root of `phase`, if it is one.
+  fn root_removed(&mut self, phase: u8, node: &[u8]) -> Option<StateBytes> {
+    let nodes = self.phase_roots.get_mut(&phase)?;
+    let removed = nodes.remove(node);
+    if nodes.is_empty() {
+      self.phase_roots.remove(&phase);
+    }
+    removed.then(|| StateBytes {
+      added: 0,
+      released: entry::root_bytes(node),
+    })
   }
 
   /// The bytes its state holds, as the merge budget charged them.
@@ -171,14 +245,21 @@ impl Register {
       .iter()
       .map(Vec::len)
       .fold(0, usize::saturating_add);
-    roots.saturating_add(markers)
+    let locks = self
+      .locks
+      .iter()
+      .map(|(path, lock)| entry::lock_bytes(path, lock))
+      .fold(0, usize::saturating_add);
+    roots.saturating_add(markers).saturating_add(locks)
   }
 
-  /// The register as a snapshot carries it.
+  /// The state as a snapshot carries it.
   fn record(&self, repository: RepositoryId) -> RegisterRecord {
     RegisterRecord {
       repository,
-      next: self.next,
+      names_position: self.names,
+      phases_position: self.phases,
+      locks_position: self.locks_position,
       phase_roots: self
         .phase_roots
         .iter()
@@ -190,18 +271,28 @@ impl Register {
         })
         .collect(),
       markers: self.markers.clone(),
+      locks: self
+        .locks
+        .iter()
+        .map(|(path, lock)| LockRecord {
+          path: path.clone(),
+          lock: lock.clone(),
+        })
+        .collect(),
     }
   }
 
-  /// The register a snapshot carried. A root or a marker listed twice is a corrupt snapshot, refused rather than half
-  /// restored.
+  /// The state a snapshot carried. A root, a marker or a lock's path listed twice is a corrupt snapshot, refused rather
+  /// than half restored.
   fn restored(record: &RegisterRecord) -> Result<Register, DbError> {
     let corrupt = DbError::Corrupt {
       seq: 0,
-      reason: "a snapshot's repository register lists a phase root or a marker twice",
+      reason: "a snapshot's repository state lists a phase root, a marker or a lock twice",
     };
     let mut register = Register {
-      next: record.next,
+      names: record.names_position,
+      phases: record.phases_position,
+      locks_position: record.locks_position,
       ..Register::default()
     };
     for root in &record.phase_roots {
@@ -219,6 +310,15 @@ impl Register {
         return Err(corrupt);
       }
       register.markers.push(marker.clone());
+    }
+    for held in &record.locks {
+      if register
+        .locks
+        .insert(held.path.clone(), held.lock.clone())
+        .is_some()
+      {
+        return Err(corrupt);
+      }
     }
     Ok(register)
   }
@@ -357,12 +457,49 @@ impl Repositories {
       })
   }
 
-  /// The position the next entry of `repository`'s register takes (A-603); `None` for no such repository.
-  pub fn position(&self, repository: RepositoryId) -> Option<u64> {
+  /// The position of one of `repository`'s own state logs (A-642); `None` for no such repository.
+  pub fn log_position(&self, repository: RepositoryId, log: StateLog) -> Option<u64> {
     self
       .registers
       .get(&repository)
-      .map(|register| register.next)
+      .map(|register| register.position(log))
+  }
+
+  /// `repository`'s locks, each `(path, lock)`, in path order (A-642).
+  pub fn locks(&self, repository: RepositoryId) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+    self
+      .registers
+      .get(&repository)
+      .into_iter()
+      .flat_map(|register| register.locks.iter())
+      .map(|(path, lock)| (path.as_str(), lock.as_slice()))
+  }
+
+  /// The atomic record version `version` of `green` belongs to, if one does (A-642: each green's log points to it).
+  pub fn atomic_at(&self, green: VolumeId, version: u64) -> Option<&AtomicRecord> {
+    let key = self.atomic_at.get(&(green, version))?;
+    self.atomic.get(key).map(|(record, _)| record)
+  }
+
+  /// Every atomic record kept, in key order: what a snapshot carries (A-642).
+  pub fn atomic_records(&self) -> impl Iterator<Item = &AtomicRecord> + '_ {
+    self.atomic.values().map(|(record, _)| record)
+  }
+
+  /// The first atomic record kept that `cut` splits (A-642): a cut of logs at positions that holds part of the record
+  /// and not the rest, which a replica's read refuses. `None` when the cut is consistent with every record kept.
+  pub fn split_by(&self, cut: &[(LogName, u64)]) -> Option<&AtomicRecord> {
+    let at = |log: &LogName| {
+      cut
+        .iter()
+        .find(|(named, _)| named == log)
+        .map(|(_, position)| *position)
+    };
+    self
+      .atomic
+      .values()
+      .map(|(record, _)| record)
+      .find(|record| record.split_by(at))
   }
 
   /// `repository`'s phase roots, each `(phase, node)`, in that order (A-603).
@@ -411,6 +548,28 @@ impl Repositories {
   /// the state it adds, against the state it removes (A-603).
   pub fn entry_bytes(entry: &crate::catalog::RepositoryEntry) -> StateBytes {
     entry::bytes(entry)
+  }
+
+  /// What each green an entry moves goes from and to (A-642): from its head before the entry, `head`, to the last
+  /// version the entry names for it, in green order.
+  pub fn green_spans(
+    entry: &crate::catalog::RepositoryEntry,
+    head: impl Fn(VolumeId) -> u64,
+  ) -> Vec<LogSpan> {
+    let mut spans: BTreeMap<VolumeId, LogSpan> = BTreeMap::new();
+    for version in &entry.versions {
+      spans
+        .entry(version.green)
+        .and_modify(|span| span.to = span.to.max(version.version))
+        .or_insert(LogSpan {
+          log: LogName::Green {
+            green: version.green,
+          },
+          from: head(version.green),
+          to: version.version,
+        });
+    }
+    spans.into_values().collect()
   }
 
   /// The guard for an entry of a repository's register (A-603), `held` and `head` as [`Repositories::check`] takes
@@ -591,10 +750,11 @@ impl Repositories {
   }
 
   /// Applies a guarded repository operation; unconditional, so replay is deterministic. A record the operation names
-  /// that is missing (a corrupted history) is a typed refusal, before anything changes. Every operation that changes a
-  /// repository takes its register's next position (A-603). Returns what the repositories' own state gained and
-  /// released, which the partition charges to its merge budget (an entry's versions are the partition's chains, charged
-  /// there). Other operations are not the repositories' and change nothing.
+  /// that is missing (a corrupted history) is a typed refusal, before anything changes. A change of the namespace or the
+  /// lineage takes the names log's next position (A-642); an entry is applied by [`Repositories::apply_advanced`], with
+  /// its greens' spans. Returns what the repositories' own state gained and released, which the partition charges to
+  /// its merge budget (an entry's versions are the partition's chains, charged there). Other operations are not the
+  /// repositories' and change nothing.
   pub fn apply(&mut self, op: &Op) -> Result<StateBytes, DbError> {
     match op {
       Op::RepositoryCreated { record } => {
@@ -605,7 +765,7 @@ impl Repositories {
       }
       Op::RepositoryBranchAdded { record } => {
         self.bind(record);
-        self.advance(record.repository);
+        self.names_moved(record.repository, 1);
         Ok(StateBytes::default())
       }
       Op::RepositoryBranchRetired { repository, name } => {
@@ -614,29 +774,33 @@ impl Repositories {
           .remove(&(*repository, name.clone()))
           .ok_or(DbError::NotFound)?;
         self.bound.remove(&green);
-        self.advance(*repository);
+        self.names_moved(*repository, 1);
         Ok(StateBytes::default())
       }
       Op::RepositoryDefaultSet { repository, branch } => {
         let record = self.records.get_mut(repository).ok_or(DbError::NotFound)?;
         record.default_branch = branch.clone();
-        self.advance(*repository);
+        self.names_moved(*repository, 1);
         Ok(StateBytes::default())
       }
       Op::RepositoryGreenJoined { record } => {
         self.join(record);
-        self.advance(record.repository);
+        self.names_moved(record.repository, 1);
         Ok(StateBytes::default())
       }
-      Op::RepositoryAdvanced { entry } => self.apply_entry(entry),
+      // An entry needs its greens' spans, which only the partition knows: `apply_advanced` takes them.
+      Op::RepositoryAdvanced { .. } => Err(DbError::Corrupt {
+        seq: 0,
+        reason: "an entry is applied with its greens' spans",
+      }),
       Op::RepositoryPolicySet { repository, policy } => {
         let record = self.records.get_mut(repository).ok_or(DbError::NotFound)?;
         let bytes = StateBytes {
           added: policy::bytes(policy),
           released: policy::bytes(&record.policy),
         };
+        // The policy's own version is its log's position (A-622): nothing else moves.
         record.policy = policy.clone();
-        self.advance(*repository);
         Ok(bytes)
       }
       Op::RepositoryDestroyed { repository } => {
@@ -665,16 +829,20 @@ impl Repositories {
     }
   }
 
-  /// Applies an entry the guard admitted (A-603), unconditionally: its members join, its names change and its state
-  /// moves, in order, and it takes the register's next position; its versions are the partition's chains. An entry of a
+  /// Applies an entry the guard admitted (A-603, A-642), unconditionally: its members join, its names change and its
+  /// state moves, in order, each change taking its own log's next position; its versions are the partition's chains,
+  /// which moved each green in `greens` (`Repositories::green_spans`). An entry that moved two logs or more, a green's
+  /// among them, is kept as an atomic record, each position it took on each green's log pointing to it. An entry of a
   /// repository this partition does not hold is a corrupted history, refused before anything changes.
-  fn apply_entry(
+  pub fn apply_advanced(
     &mut self,
     entry: &crate::catalog::RepositoryEntry,
+    greens: Vec<LogSpan>,
   ) -> Result<StateBytes, DbError> {
-    if !self.records.contains_key(&entry.repository)
-      || !self.registers.contains_key(&entry.repository)
-    {
+    let Some(before) = self.registers.get(&entry.repository).map(Register::positions) else {
+      return Err(DbError::NotFound);
+    };
+    if !self.records.contains_key(&entry.repository) {
       return Err(DbError::NotFound);
     }
     for member in &entry.joined {
@@ -699,29 +867,80 @@ impl Repositories {
         }
       }
     }
+    let namespace = entry.joined.len().saturating_add(entry.names.len());
+    self.names_moved(entry.repository, u64::try_from(namespace).unwrap_or(u64::MAX));
     let mut bytes = StateBytes::default();
+    let mut spans = greens;
     if let Some(register) = self.registers.get_mut(&entry.repository) {
       for change in &entry.state {
         bytes.add(register.apply(change));
       }
-      register.next = register.next.saturating_add(1);
+      let after = register.positions();
+      for ((log, from), (_, to)) in before.into_iter().zip(after) {
+        if to > from {
+          spans.push(LogSpan {
+            log: LogName::State {
+              repository: entry.repository,
+              log,
+            },
+            from,
+            to,
+          });
+        }
+      }
+    }
+    let moves_a_green = spans
+      .iter()
+      .any(|span| matches!(span.log, LogName::Green { .. }));
+    if spans.len() > 1 && moves_a_green {
+      self.keep_atomic(AtomicRecord { spans });
     }
     Ok(bytes)
   }
 
-  /// `repository`'s register takes its next position, for a change of the repository made by an operation other than
-  /// an entry (A-603). A repository that is gone has no register to move.
-  fn advance(&mut self, repository: RepositoryId) {
+  /// The names log of `repository` takes `changes` positions (A-642). A repository that is gone has no log to move.
+  fn names_moved(&mut self, repository: RepositoryId, changes: u64) {
     if let Some(register) = self.registers.get_mut(&repository) {
-      register.next = register.next.saturating_add(1);
+      register.names = register.names.saturating_add(changes);
     }
   }
 
-  /// A version of `green` was recorded alone (`Op::GreenAdvanced`): a member's is an entry of its repository's register,
-  /// so the register takes a position for it (A-603). A green no lineage holds moves no register.
-  pub fn versioned(&mut self, green: VolumeId) {
-    if let Some(repository) = self.members.get(&green).map(|member| member.repository) {
-      self.advance(repository);
+  /// Keeps `record`, its spans in log order, and points each position it took on each green's log to it (A-642).
+  fn keep_atomic(&mut self, mut record: AtomicRecord) {
+    record.spans.sort_by_key(|span| span.log);
+    let Some(first) = record.spans.first() else {
+      return;
+    };
+    let key = (first.log, first.to);
+    let mut pointers = 0u64;
+    for span in &record.spans {
+      if let LogName::Green { green } = span.log {
+        for position in span.from.saturating_add(1)..=span.to {
+          self.atomic_at.insert((green, position), key);
+          pointers = pointers.saturating_add(1);
+        }
+      }
+    }
+    self.atomic.insert(key, (record, pointers));
+  }
+
+  /// `green`'s log folded through `floor` (its checkpoint, or everything at its destroy): its pointers there go, and so
+  /// does each atomic record no green's log points to any more (A-642).
+  pub fn fold_atomic(&mut self, green: VolumeId, floor: u64) {
+    let folded: Vec<((VolumeId, u64), (LogName, u64))> = self
+      .atomic_at
+      .range((green, 0)..=(green, floor))
+      .map(|(at, key)| (*at, *key))
+      .collect();
+    for (at, key) in folded {
+      self.atomic_at.remove(&at);
+      let gone = self.atomic.get_mut(&key).is_some_and(|(_, pointers)| {
+        *pointers = pointers.saturating_sub(1);
+        *pointers == 0
+      });
+      if gone {
+        self.atomic.remove(&key);
+      }
     }
   }
 
@@ -746,8 +965,10 @@ impl Repositories {
   }
 
   /// A destroyed green leaves the namespace that bound it (§4.17.1: deleting a branch's green deletes the branch), and
-  /// its lineage (A-575). Each repository it leaves changed, so its register takes a position (A-603).
+  /// its lineage (A-575): each repository whose names it leaves takes a position on its names log, and its log's
+  /// pointers to atomic records go (A-642).
   pub fn green_removed(&mut self, green: VolumeId) {
+    self.fold_atomic(green, u64::MAX);
     let mut changed = BTreeSet::new();
     if let Some(key) = self.bound.remove(&green) {
       changed.insert(key.0);
@@ -763,7 +984,7 @@ impl Repositories {
       }
     }
     for repository in changed {
-      self.advance(repository);
+      self.names_moved(repository, 1);
     }
   }
 
@@ -776,6 +997,7 @@ impl Repositories {
     bindings: &[BranchRecord],
     members: &[MemberRecord],
     registers: &[RegisterRecord],
+    atomic: &[AtomicRecord],
   ) -> Result<Repositories, DbError> {
     let mut repositories = Repositories::new();
     for record in records {
@@ -827,6 +1049,16 @@ impl Repositories {
         seq: 0,
         reason: "a snapshot's repository carries no register",
       });
+    }
+    for record in atomic {
+      let kept = repositories.atomic.len();
+      repositories.keep_atomic(record.clone());
+      if repositories.atomic.len() == kept {
+        return Err(DbError::Corrupt {
+          seq: 0,
+          reason: "a snapshot's atomic record is listed twice, or moves no log",
+        });
+      }
     }
     Ok(repositories)
   }
@@ -1660,8 +1892,8 @@ mod tests {
   /// A-622 (§4.17.1 "Policy"). Do: create a git repository; set its policy from version 0 with a rule and a hook; set
   /// it again from the stale version 0; set one holding a branch rule, which a git repository has not, and one running
   /// a relative program; create a repository already holding a policy; then rebuild the partition from its snapshot,
-  /// and apart from it replay its recorded operations. Expect: the record holds the policy at version 1 and the register
-  /// moved one position; the stale setting is refused naming version 1, the malformed ones by kind and index, the create
+  /// and apart from it replay its recorded operations. Expect: the record holds the policy at version 1, its own log's
+  /// position, and no other log moved (A-642); the stale setting is refused naming version 1, the malformed ones by kind and index, the create
   /// naming version 0, none of them changing anything; the rebuilt and the replayed partitions answer as the live one.
   #[test]
   fn a_policy_is_set_whole_from_the_version_read_and_kept_by_a_snapshot_and_a_replay() {
@@ -1672,7 +1904,9 @@ mod tests {
     let created = Op::RepositoryCreated { record };
     run(&mut partition, &created).unwrap();
     log.push(created);
-    let position = partition.repositories().position(repo);
+    let names = partition
+      .repositories()
+      .log_position(repo, crate::catalog::StateLog::Names);
     let mut policy = rules_policy(1, vec![ref_rule("refs/heads/release/*")]);
     policy.hooks.push(crate::catalog::HookConfig {
       point: crate::catalog::HookPointName::GitPreReceive,
@@ -1693,8 +1927,10 @@ mod tests {
       policy
     );
     assert_eq!(
-      partition.repositories().position(repo),
-      position.map(|position| position + 1)
+      partition
+        .repositories()
+        .log_position(repo, crate::catalog::StateLog::Names),
+      names
     );
     let before = answers(&partition);
     let stale = Op::RepositoryPolicySet {
@@ -1745,8 +1981,10 @@ mod tests {
     let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
     assert_eq!(answers(&rebuilt), answers(&partition));
     assert_eq!(
-      rebuilt.repositories().position(repo),
-      partition.repositories().position(repo)
+      rebuilt
+        .repositories()
+        .log_position(repo, crate::catalog::StateLog::Names),
+      names
     );
     let mut replayed = Partition::new(caps(), 0);
     for op in &log {

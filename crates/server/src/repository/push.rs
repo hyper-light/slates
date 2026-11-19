@@ -1,11 +1,13 @@
 //! A push of several works at once (§4.17.1 "A push is a work" and "The repository and its greens" item 2; §4.17.2 "A
 //! push" steps 6 and 7; §4.17.3 "Push" step 6; A-635): the verdict over every branch a push changes, all of them or
-//! none, recorded as one entry of the repository's register (A-603).
+//! none, recorded as one entry of the repository's logs (A-603, rebuilt by A-642): one append on each green it moves,
+//! each only while its green is at the position the push read, and one atomic record when it moves two logs or more.
 //!
-//! **One function**, [`push`], for git's receive-pack and Mercurial's unbundle. Each branch the push changes is a
+//! **One interface**, [`RepositoryLogs::append`], for git's receive-pack, Mercurial's unbundle and the LFS locks, which
+//! the shard's state implements ([`push`]) and their tests may fake. Each branch the push changes is a
 //! [`BranchChange`]: a work A-618's `slates_merge::push::build` made against a branch's green; a new branch made at a
 //! version of another without a walk and moved by such a work; or a branch retired, its green kept. Beside them,
-//! [`EntryParts`] carries what else the entry holds: checks read at its position (Mercurial's `check:heads`), names, and
+//! [`EntryParts`] carries what else the entry holds: checks of logs' positions (Mercurial's `check:heads`), names, and
 //! the repository's own state (phase roots, obsolescence markers).
 //!
 //! **All or none.** Nothing is applied until everything has passed, in this order:
@@ -81,7 +83,7 @@ pub(crate) enum BranchChange {
 /// What a push's register entry carries beside its branches' own changes (A-603).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EntryParts {
-  /// Checks read at the entry's position, before its changes (Mercurial's `check:heads`, §4.17.3 decision 6).
+  /// Checks of logs' positions read before its changes (Mercurial's `check:heads`, §4.17.3 decision 6; A-642).
   pub(crate) checks: Vec<RepositoryCheck>,
   /// Names bound or retired after the branches' own (Mercurial's bookmarks).
   pub(crate) names: Vec<NameChange>,
@@ -120,8 +122,34 @@ pub(crate) enum BranchPushed {
 pub(crate) struct Pushed {
   /// Each change's result, in the order given.
   pub(crate) changes: Vec<BranchPushed>,
-  /// The register position its entry took; `None` when it changed nothing (every work sent again).
-  pub(crate) position: Option<u64>,
+  /// Whether it recorded anything: false when every work was sent before and nothing else changed.
+  pub(crate) recorded: bool,
+}
+
+/// A repository's logs, as a version-control server appends a push to them (§4.17.1 shared piece 2; A-635, A-642): one
+/// record, all of it or none. The owner shard's state implements it ([`push`]); a tool's push code (git's receive-pack,
+/// Mercurial's unbundle, the LFS locks) is written against it, and its tests may implement it.
+pub(crate) trait RepositoryLogs {
+  /// Appends `changes` with `parts` to `repository`'s logs as one record, by `principal`, its owner (module docs).
+  fn append(
+    &mut self,
+    principal: &Principal,
+    repository: RepositoryId,
+    changes: Vec<BranchChange>,
+    parts: EntryParts,
+  ) -> Result<Pushed, PushRefused>;
+}
+
+impl RepositoryLogs for ShardState {
+  fn append(
+    &mut self,
+    principal: &Principal,
+    repository: RepositoryId,
+    changes: Vec<BranchChange>,
+    parts: EntryParts,
+  ) -> Result<Pushed, PushRefused> {
+    push(self, principal, repository, changes, parts)
+  }
 }
 
 /// Why one change was refused.
@@ -167,9 +195,9 @@ pub(crate) enum PushRefused {
   Repository(Refusal),
   /// The changes refused, each named by its index.
   Changes(Vec<ChangeRefused>),
-  /// The entry the push would record, refused at its register position: a check (`Database { CheckFailed }`), a name
-  /// of `EntryParts`, the state (`Database { StateChanged }`), the budget (`TableAtCapacity`), or its record not made
-  /// durable.
+  /// The entry the push would record, refused: a green moved since it was read (`Database { Moved }`, naming it), a
+  /// check (`Database { CheckFailed }`), a name of `EntryParts`, the state (`Database { StateChanged }`), the budget
+  /// (`TableAtCapacity`), or its record not made durable.
   Entry(Refusal),
 }
 
@@ -467,7 +495,7 @@ fn push_planned(
       _ => None,
     })
     .collect();
-  let entry = entry(state, record.id, (&steps, &verdicts), parts)?;
+  let entry = entry(record.id, (&steps, &verdicts), parts);
   let changes_anything = !(entry.joined.is_empty()
     && entry.versions.is_empty()
     && entry.names.is_empty()
@@ -476,11 +504,10 @@ fn push_planned(
   if !changes_anything {
     // Every work was sent before and nothing else changes: nothing is recorded, and what was secured is given back.
     settle_secured(state, held);
-    return Ok(answer(&steps, &verdicts, None));
+    return Ok(answer(&steps, &verdicts));
   }
   let committed = commit(state, &steps, verdicts)?;
   let entry = recorded_entry(state, entry, &steps, &committed);
-  let position = entry.position;
   let mut ops: Vec<Op> = made
     .into_iter()
     .map(|record| Op::VolumeCreated { record })
@@ -490,7 +517,7 @@ fn push_planned(
   // Recorded: the new greens are the repository's now, and nothing is given back.
   held.made.clear();
   after(state, &steps, &committed, held);
-  Ok(answer_committed(&steps, &committed, Some(position)))
+  Ok(answer_committed(&steps, &committed, true))
 }
 
 /// Makes each new branch's member in memory (`Lineage::branch`), nothing recorded.
@@ -612,24 +639,17 @@ fn judge(
   }
 }
 
-/// The entry the push records, at the register's next position: the deletes' checks then `parts`'; the new members;
-/// each held verdict's version, its chain entry as large as one for its work can be (the real one is made once the
-/// verdict commits, A-257); the deletes' retires, the creates' binds, then `parts`' names; `parts`' state.
+/// The entry the push records: the deletes' checks then `parts`'; the new members; each held verdict's version, the one
+/// after the head its verdict was held at (the position the push read, A-642), its chain entry as large as one for its
+/// work can be (the real one is made once the verdict commits, A-257); the deletes' retires, the creates' binds, then
+/// `parts`' names; `parts`' state.
 fn entry(
-  state: &ShardState,
   repository: RepositoryId,
   (steps, verdicts): (&[Step], &[Option<Verdict>]),
   parts: EntryParts,
-) -> Result<RepositoryEntry, PushRefused> {
-  let position = state
-    .db
-    .partition()
-    .repositories()
-    .position(repository)
-    .ok_or(PushRefused::Repository(Refusal::NotFound))?;
+) -> RepositoryEntry {
   let mut entry = RepositoryEntry {
     repository,
-    position,
     ..RepositoryEntry::default()
   };
   for step in steps {
@@ -678,7 +698,7 @@ fn entry(
   entry.checks.extend(parts.checks);
   entry.names.extend(parts.names);
   entry.state = parts.state;
-  Ok(entry)
+  entry
 }
 
 /// The entry judged whole by the register's guard, the new greens counted held, before anything is applied; a chain
@@ -845,7 +865,7 @@ fn settle_secured(state: &mut ShardState, held: &mut Held) {
 }
 
 /// The answer of a push that recorded nothing: every work's version from before.
-fn answer(steps: &[Step], verdicts: &[Option<Verdict>], position: Option<u64>) -> Pushed {
+fn answer(steps: &[Step], verdicts: &[Option<Verdict>]) -> Pushed {
   let committed: Committed = verdicts
     .iter()
     .map(|verdict| match verdict {
@@ -853,11 +873,11 @@ fn answer(steps: &[Step], verdicts: &[Option<Verdict>], position: Option<u64>) -
       _ => None,
     })
     .collect();
-  answer_committed(steps, &committed, position)
+  answer_committed(steps, &committed, false)
 }
 
 /// The answer, change by change.
-fn answer_committed(steps: &[Step], committed: &Committed, position: Option<u64>) -> Pushed {
+fn answer_committed(steps: &[Step], committed: &Committed, recorded: bool) -> Pushed {
   let changes = steps
     .iter()
     .zip(committed)
@@ -879,5 +899,5 @@ fn answer_committed(steps: &[Step], committed: &Committed, position: Option<u64>
       Step::Delete { green, .. } => BranchPushed::Deleted { green: *green },
     })
     .collect();
-  Pushed { changes, position }
+  Pushed { changes, recorded }
 }

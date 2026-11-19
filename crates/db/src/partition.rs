@@ -183,9 +183,11 @@ pub struct PartitionSnapshot {
   pub review_comments: Vec<crate::catalog::ReviewCommentRecord>,
   /// Their approvals (A-596; appended), by repository, request and approver.
   pub review_approvals: Vec<crate::catalog::ReviewApprovalRecord>,
-  /// Every repository's register: its next position and its own state (§4.17.1 shared piece 2, A-603; appended), by
-  /// repository order.
+  /// Every repository's own state: its state logs' positions and what they hold (§4.17.1 shared piece 2, A-603 rebuilt
+  /// by A-642; appended), by repository order.
   pub repository_registers: Vec<crate::catalog::RegisterRecord>,
+  /// The atomic records kept, by key (A-642; appended).
+  pub atomic_records: Vec<crate::catalog::AtomicRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -638,6 +640,8 @@ impl Partition {
     self
       .green_checkpoints
       .insert(green, (version, bytes.to_vec()));
+    // The green's log below the checkpoint is folded: its pointers to atomic records there go with it (A-642).
+    self.repositories.fold_atomic(green, version);
   }
 
   /// A green volume's encoded origin (§4.16), or `None` for a green that started from scratch
@@ -2415,8 +2419,6 @@ impl Partition {
           .entry(*green)
           .or_default()
           .push(increment.clone());
-        // A member's version recorded alone is an entry of its repository's register (A-603).
-        self.repositories.versioned(*green);
         Ok(())
       }
       Op::GreenOriginated { green, origin } => {
@@ -2485,7 +2487,15 @@ impl Partition {
   /// the greens' chain entries, each charged to the merge budget with what the repositories' state gained, less what it
   /// released.
   fn apply_repository(&mut self, op: &Op) -> Result<(), DbError> {
-    let bytes = self.repositories.apply(op)?;
+    let bytes = match op {
+      // Each green an entry moves goes from its head before it (A-642): what its atomic record holds of its log.
+      Op::RepositoryAdvanced { entry } => {
+        let greens =
+          crate::repository::Repositories::green_spans(entry, |green| self.green_head(green));
+        self.repositories.apply_advanced(entry, greens)?
+      }
+      _ => self.repositories.apply(op)?,
+    };
     if let Op::RepositoryAdvanced { entry } = op {
       for version in &entry.versions {
         self.green_chain_bytes = self.green_chain_bytes.saturating_add(version.entry.len());
@@ -2778,6 +2788,7 @@ impl Partition {
       review_comments: self.reviews.comment_records().cloned().collect(),
       review_approvals: self.reviews.approval_records().cloned().collect(),
       repository_registers: self.repositories.registers().collect(),
+      atomic_records: self.repositories.atomic_records().cloned().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -3027,6 +3038,7 @@ impl Partition {
       &snapshot.repository_branches,
       &snapshot.repository_members,
       &snapshot.repository_registers,
+      &snapshot.atomic_records,
     )?;
     // The repositories' own state is charged to the merge budget as it was when recorded (A-603).
     p.green_chain_bytes = p

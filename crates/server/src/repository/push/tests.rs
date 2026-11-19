@@ -6,8 +6,8 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{
-  Principal, RepositoryCheck, RepositoryId, StateChange, VolumeId as DbVolumeId, WriteMode,
-  WritePolicy,
+  AtomicRecord, LogName, Principal, RepositoryCheck, RepositoryId, StateChange, StateLog,
+  VolumeId as DbVolumeId, WriteMode, WritePolicy,
 };
 use slates_db::op::Op;
 use slates_ipc::protocol::{ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
@@ -186,15 +186,39 @@ fn head(state: &ShardState, green: DbVolumeId) -> Option<Vec<u8>> {
     .and_then(|engine| engine.xattr(ROOT, HEAD_ATTRIBUTE).map(<[u8]>::to_vec))
 }
 
-/// The register's position.
-fn position(state: &ShardState, repository: RepositoryId) -> Option<u64> {
-  state.db.partition().repositories().position(repository)
+/// The names log's position (A-642).
+fn names_position(state: &ShardState, repository: RepositoryId) -> Option<u64> {
+  state
+    .db
+    .partition()
+    .repositories()
+    .log_position(repository, StateLog::Names)
 }
 
-/// What a refused push must leave as it was: the register's position and namespace, each green's durable and engine
-/// heads, identity and chain, and every engine the shard holds. (A conflict's windows stay in its green's rejected
-/// cache, as a submit's do, so its retention charge is not among them.)
-type Kept = (Option<u64>, Vec<(String, DbVolumeId)>, Vec<GreenKept>, usize);
+/// The atomic record version `version` of `green` belongs to (A-642).
+fn record_at(state: &ShardState, green: DbVolumeId, version: u64) -> Option<AtomicRecord> {
+  state
+    .db
+    .partition()
+    .repositories()
+    .atomic_at(green, version)
+    .cloned()
+}
+
+/// The logs an atomic record moved, in log order.
+fn logs_of(record: &AtomicRecord) -> Vec<LogName> {
+  record.spans.iter().map(|span| span.log).collect()
+}
+
+/// What a refused push must leave as it was: the names log's position and the namespace, each green's durable and
+/// engine heads, identity and chain, the atomic records, and every engine the shard holds. (A conflict's windows stay
+/// in its green's rejected cache, as a submit's do, so its retention charge is not among them.)
+type Kept = (
+  Option<u64>,
+  Vec<(String, DbVolumeId)>,
+  Vec<GreenKept>,
+  (usize, usize),
+);
 
 /// One green's part of [`Kept`].
 type GreenKept = (u64, Option<u64>, Option<[u8; 32]>, usize);
@@ -223,7 +247,13 @@ fn kept(state: &mut ShardState, repository: RepositoryId, greens: &[DbVolumeId])
       )
     })
     .collect();
-  (position(state, repository), names, greens, state.greens.keys().count())
+  let records = state.db.partition().repositories().atomic_records().count();
+  (
+    names_position(state, repository),
+    names,
+    greens,
+    (records, state.greens.keys().count()),
+  )
 }
 
 /// A repository `tree` whose `main` is at version 1 (file `f` = `one`, head `c1`) and whose `topic`, made from `main` at
@@ -255,17 +285,16 @@ fn two_branches(state: &mut ShardState) -> (RepositoryId, [DbVolumeId; 2], Store
   (repo, [main, topic], store, one)
 }
 
-/// A-635 (§4.17.2 step 7: with `atomic`, one register entry for all the refs). Do: push works to two branches in one
+/// A-635 (§4.17.2 step 7: with `atomic`, one record for all the refs; A-642). Do: push works to two branches in one
 /// push; push the same works again; then push a good work beside a stale one (based at a version another push moved
-/// past). Expect: both branches move in one entry, one position, each holding the pushed files and head; the same push
-/// again is answered its versions, recorded nothing; the stale push is refused naming its stale change's index with the
-/// verdict's windows, and nothing of it is applied, the good work included: positions, names, heads, identities,
-/// chains, retention and engines as they were.
+/// past). Expect: both branches move in one atomic record, which each green's log points to at its new version, each
+/// holding the pushed files and head; the same push again is answered its versions and records nothing; the stale push
+/// is refused naming its stale change's index with the verdict's windows, and nothing of it is applied, the good work
+/// included: names, heads, identities, chains, records, retention and engines as they were.
 #[test]
 fn a_push_moves_every_branch_or_none_of_them() {
   crate::daemon::audit_on_shard(|state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
-    let at = position(state, repo).expect("the register");
     let two = store.put_tree(&[("f", b"two")]);
     let topical = store.put_tree(&[("g", b"topic")]);
     let together = vec![
@@ -278,8 +307,8 @@ fn a_push_moves_every_branch_or_none_of_them() {
         work: work(state, topic, (0, None), (topical, b"t1"), (&store, 3)),
       },
     ];
-    assert_both_moved_in_one_entry(state, (repo, at), [main, topic], together.clone());
-    assert_sent_again_records_nothing(state, (repo, at), [main, topic], together);
+    assert_both_moved_in_one_record(state, repo, [main, topic], together.clone());
+    assert_sent_again_records_nothing(state, repo, [main, topic], together);
     let three = store.put_tree(&[("f", b"three")]);
     let stale = store.put_tree(&[("g", b"stale")]);
     let charged = state.green_retention.get(&main).copied();
@@ -302,9 +331,9 @@ fn a_push_moves_every_branch_or_none_of_them() {
   });
 }
 
-fn assert_both_moved_in_one_entry(
+fn assert_both_moved_in_one_record(
   state: &mut ShardState,
-  (repo, at): (RepositoryId, u64),
+  repo: RepositoryId,
   [main, topic]: [DbVolumeId; 2],
   together: Vec<BranchChange>,
 ) {
@@ -324,10 +353,15 @@ fn assert_both_moved_in_one_entry(
           before: false
         },
       ],
-      position: Some(at),
+      recorded: true,
     })
   );
-  assert_eq!(position(state, repo), Some(at + 1), "one entry for both");
+  let record = record_at(state, main, 2).expect("one atomic record for both");
+  assert_eq!(record_at(state, topic, 1), Some(record.clone()));
+  assert_eq!(
+    logs_of(&record),
+    vec![LogName::Green { green: main }, LogName::Green { green: topic }]
+  );
   assert_eq!(file(state, main, "f").as_deref(), Some(&b"two"[..]));
   assert_eq!(file(state, topic, "g").as_deref(), Some(&b"topic"[..]));
   assert_eq!(head(state, topic).as_deref(), Some(&b"t1"[..]));
@@ -335,10 +369,11 @@ fn assert_both_moved_in_one_entry(
 
 fn assert_sent_again_records_nothing(
   state: &mut ShardState,
-  (repo, at): (RepositoryId, u64),
+  repo: RepositoryId,
   [main, topic]: [DbVolumeId; 2],
   together: Vec<BranchChange>,
 ) {
+  let before = kept(state, repo, &[main, topic]);
   let again = push(state, &owner(), repo, together, EntryParts::default());
   let moved = |green, version| BranchPushed::Moved {
     green,
@@ -349,10 +384,10 @@ fn assert_sent_again_records_nothing(
     again,
     Ok(Pushed {
       changes: vec![moved(main, 2), moved(topic, 1)],
-      position: None,
+      recorded: false,
     })
   );
-  assert_eq!(position(state, repo), Some(at + 1));
+  assert_eq!(kept(state, repo, &[main, topic]), before);
 }
 
 /// Pushes `changes`, expected refused with the changes at `indexes`, and nothing of it applied.
@@ -375,13 +410,13 @@ fn assert_refused_whole(
 
 /// A-635 (§4.17.2 step 6: a create makes a new green from a version, a delete retires its green). Do: in one push,
 /// create `feature` at `main`'s version 1 moved by a work, delete `topic` at the version the client saw, and move
-/// `main`. Expect: one entry; `feature` binds a new member holding `main`'s version 1 and the work's file, its head the
-/// pushed one, at its version 1; `topic` leaves the namespace and its green stays; `main` moves.
+/// `main`. Expect: one atomic record over the new green's log, `main`'s and the names log; `feature` binds a new member
+/// holding `main`'s version 1 and the work's file, its head the pushed one, at its version 1; `topic` leaves the
+/// namespace and its green stays; `main` moves.
 #[test]
 fn a_push_creates_and_deletes_branches_in_the_same_step() {
   crate::daemon::audit_on_shard(|state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
-    let at = position(state, repo).expect("the register");
     let featured = store.put_tree(&[("f", b"one"), ("h", b"new")]);
     let two = store.put_tree(&[("f", b"two")]);
     let changes = vec![
@@ -401,8 +436,7 @@ fn a_push_creates_and_deletes_branches_in_the_same_step() {
       },
     ];
     let pushed = push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
-    assert_eq!(pushed.position, Some(at));
-    assert_eq!(position(state, repo), Some(at + 1), "one entry");
+    assert!(pushed.recorded);
     assert_created_deleted_and_moved(state, repo, &pushed, [main, topic]);
   });
 }
@@ -425,6 +459,12 @@ fn assert_created_deleted_and_moved(
   assert_eq!(file(state, feature, "h").as_deref(), Some(&b"new"[..]));
   assert_eq!(head(state, feature).as_deref(), Some(&b"fe1"[..]));
   assert_eq!(state.db.partition().green_head(feature), 1);
+  let record = record_at(state, main, 2).expect("one atomic record");
+  assert_eq!(record_at(state, feature, 1), Some(record.clone()));
+  assert!(logs_of(&record).contains(&LogName::State {
+    repository: repo,
+    log: StateLog::Names
+  }));
   assert_eq!(
     pushed.changes.get(1..),
     Some(
@@ -625,7 +665,6 @@ fn assert_the_state_moves_with_the_push(
   main: DbVolumeId,
   moving: Increment,
 ) {
-  let at = position(state, repo).expect("the register");
   let parts = EntryParts {
     state: vec![
       StateChange::PhaseRootAdded {
@@ -643,9 +682,21 @@ fn assert_the_state_moves_with_the_push(
     work: moving,
   }];
   let pushed = push(state, &owner(), repo, changes, parts);
-  assert_eq!(pushed.map(|pushed| pushed.position), Ok(Some(at)));
+  assert_eq!(pushed.map(|pushed| pushed.recorded), Ok(true));
+  let record = record_at(state, main, 2).expect("one atomic record");
+  let state_log = |log| LogName::State {
+    repository: repo,
+    log,
+  };
+  assert_eq!(
+    logs_of(&record),
+    vec![
+      LogName::Green { green: main },
+      state_log(StateLog::Phases),
+      state_log(StateLog::Markers),
+    ]
+  );
   let repositories = state.db.partition().repositories();
-  assert_eq!(repositories.position(repo), Some(at + 1));
   assert_eq!(repositories.phase_roots(repo).count(), 1);
   assert_eq!(repositories.markers(repo).count(), 1);
 }
