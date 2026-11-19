@@ -73,7 +73,7 @@ impl Work {
   }
 
   fn set_xattr(&mut self, path: &str, name: &str, value: &[u8]) -> &mut Work {
-    let name = u64::from(self.doc.paths.intern(name));
+    let name = self.doc.paths.intern(name);
     let src = self.stash(value);
     self.push(
       OpKind::SetXattr,
@@ -85,7 +85,7 @@ impl Work {
   }
 
   fn rename(&mut self, from: &str, to: &str) -> &mut Work {
-    let from = u64::from(self.doc.paths.intern(from));
+    let from = self.doc.paths.intern(from);
     self.push(OpKind::Rename, to, 0, 0, from)
   }
 

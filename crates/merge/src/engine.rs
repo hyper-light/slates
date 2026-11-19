@@ -563,7 +563,7 @@ pub struct Green {
 
 /// The paths a node-exclusive operation changes, each with the class its conflict is named by (§4.17.4 item 3): the
 /// operation's own path, and a move's source, which Subversion sends as a copy and a delete of the source.
-fn node_exclusive_paths(op: &Op) -> impl Iterator<Item = (u16, MergeConflictClass)> {
+fn node_exclusive_paths(op: &Op) -> impl Iterator<Item = (u64, MergeConflictClass)> {
   let class = match op.kind {
     OpKind::Create
     | OpKind::Mkdir
@@ -578,10 +578,7 @@ fn node_exclusive_paths(op: &Op) -> impl Iterator<Item = (u16, MergeConflictClas
       MergeConflictClass::Overlap
     }
   };
-  let source = (op.kind == OpKind::Rename)
-    .then(|| u16::try_from(op.src).ok())
-    .flatten()
-    .map(|index| (index, MergeConflictClass::RenameRename));
+  let source = (op.kind == OpKind::Rename).then_some((op.src, MergeConflictClass::RenameRename));
   std::iter::once((op.path, class)).chain(source)
 }
 
@@ -2432,17 +2429,10 @@ impl Green {
   /// Resolves an increment's ops document into per-dimension groups by path.
   fn resolve(inc: &Increment) -> Resolved {
     let mut r = Resolved::default();
-    // Resolve a path-table reference (given as a `u64` field) to its name.
-    let name = |index: u64| {
-      inc
-        .doc
-        .paths
-        .path(u16::try_from(index).unwrap_or(u16::MAX))
-        .unwrap_or_default()
-        .to_owned()
-    };
+    // Resolve a path-table reference (a 64-bit index, A-621) to its name; an index the table does not hold names nothing.
+    let name = |index: u64| inc.doc.paths.path(index).unwrap_or_default().to_owned();
     for op in &inc.doc.ops {
-      let path = name(u64::from(op.path));
+      let path = name(op.path);
       match op.kind {
         _ if is_content(op.kind) => r.content.entry(path).or_default().push(*op),
         OpKind::Mknod => match special_payload(&inc.doc, &inc.post_state, op) {
@@ -3882,11 +3872,7 @@ impl Green {
     for op in &inc.doc.ops {
       paths.extend(inc.doc.paths.path(op.path));
       if op.kind == OpKind::Rename {
-        paths.extend(
-          u16::try_from(op.src)
-            .ok()
-            .and_then(|index| inc.doc.paths.path(index)),
-        );
+        paths.extend(inc.doc.paths.path(op.src));
       }
     }
     let links = paths
@@ -3906,18 +3892,14 @@ impl Green {
 
   /// The bytes the copies `inc` declares add to the change index's charge: one record each (A-586).
   fn copy_records_reservation(inc: &Increment) -> usize {
-    let name = |index: u64| {
-      u16::try_from(index)
-        .ok()
-        .and_then(|index| inc.doc.paths.path(index))
-        .unwrap_or_default()
-    };
+    // Each index is 64 bits (A-621); one the table does not hold names nothing.
+    let name = |index: u64| inc.doc.paths.path(index).unwrap_or_default();
     inc
       .doc
       .ops
       .iter()
       .filter(|op| op.kind == OpKind::Copy)
-      .map(|op| copy::appearance_bytes(name(u64::from(op.path)), name(op.src)))
+      .map(|op| copy::appearance_bytes(name(op.path), name(op.src)))
       .fold(0usize, usize::saturating_add)
   }
 
@@ -3952,9 +3934,7 @@ impl Green {
         replaced.insert(path);
       }
       if op.kind == OpKind::Rename
-        && let Some(source) = u16::try_from(op.src)
-          .ok()
-          .and_then(|index| inc.doc.paths.path(index))
+        && let Some(source) = inc.doc.paths.path(op.src)
       {
         replaced.insert(source);
       }

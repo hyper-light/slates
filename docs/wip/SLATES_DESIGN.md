@@ -11282,9 +11282,9 @@ struct VersionRecord { version: Version, snapshot: SnapshotId, manifest: Option<
 struct Increment { id: IncrementId /* blake3(work_volume, base, post_state, ops_doc, filter) */, work_volume: VolumeId,
                    base: (VolumeId, Version), post_state: SnapshotId, ops_doc: Blake3 /* a sealed chunk */, filter: FilterId,
                    evidence: SmallVec<Blake3> /* opaque to slates */ }
-#[repr(C)] struct OpRecord { kind: u8, flags: u8, path_idx: u16, reserved: u32, at: u64, len: u64, src: u64 }   // 32 bytes, little-endian
+struct OpRecord { kind: u8, flags: u8, path: u64, at: u64, len: u64, src: u64 }   // 34 bytes, little-endian, written field by field (version 2, A-621)
 enum OpKind { Overwrite, Extend, Truncate, Insert, Delete, Create, Unlink, Mkdir, Rmdir, Rename, Link, Symlink, SetMode, SetXattr, RemoveXattr, Mknod }
-struct OpsDoc { header: WireHeader, paths: PathTable /* path_idx → path bytes, sorted */, ops: [OpRecord] }
+struct OpsDoc { header: WireHeader /* magic, version 2, path and op counts as u64 */, paths: PathTable /* path → bytes, sorted, unique */, ops: [OpRecord] }
 struct CanonicalDelta { version: Version, ops: Handle<OpsDoc>, effects: Art<PathKey, RangeSet> /* per path: ranges touched and size shifts */ }
 struct MergeRecord { green: VolumeId, version: Version, increment: IncrementId, verdict: VerdictSummary, manifest: Blake3, host_epoch: u64 }
 struct ConflictWindow { path: PathKey, mine: (u64, u64), theirs: (u64, u64), theirs_version: Version, class: MergeConflictClass }
@@ -11295,6 +11295,19 @@ post-state are sealed chunks and a snapshot on the work volume's owner shard, re
 shard by handle while pinned (D-7); the merge record is an entry of the green's ledger register
 (a partition log append on a laptop; a record sent to the green's candidate holders in a fleet,
 §4.8); nothing in this plane is shared mutable state.
+
+> **Status (2026-11-19, A-621: a work names as many paths as it declares).** An op's path index is 64 bits, in memory
+> and on the wire, and the ops document's header counts its paths and operations in 64 bits (`crates/merge/src/ops_doc.rs`,
+> version 2; the chain entry, which writes an op's record the same way, version 5). So a work names as many paths as
+> its caller's admission allows, with no fixed cap: a kernel tree's first push (about 97,000 files) is one work. Until
+> then an index was 16 bits, and interning answered `u16::MAX` for every name past the 65,535th, so the 65,536th and
+> every later name aliased one path. The deriver's index lookup, the verdict's reading of a rename's or an attribute's
+> index, and the server's laying-in of an attribute's value narrowed the same way, the last silently skipping the
+> value. Interning looks a name up in an ordered map, so a table of n names costs O(n log n) comparisons, where the
+> scan it replaced cost O(n²); a test counts them. A table naming a path twice is refused at decode (`DuplicatePath`):
+> read as the first, every later index would name the path after its own. A version 1 document, and a version 4 chain
+> entry, are refused `BadVersion`, never read under the other layout. The golden vectors are version 2's, derived by
+> an independent encoder and BLAKE3 that reproduce version 1's vector from version 1's layout.
 
 **Declared operations (the journal, §4.5).** Every mutation is declared at the boundary where it
 happens: through a mount, `write(off, len)` is `Overwrite` (or `Extend` past the end) and
@@ -11973,6 +11986,17 @@ is one more version, and the chain itself is never rewritten.
 > for its hooks and the driver that starts a hook over it in its own process group; each tool's words for the
 > outcomes; the hooks of review events; and a repository-owned queue for observing hooks that must outlive their push
 > (§4.17.3).
+>
+> **Status (2026-11-19, A-622 part 1: the policy held in the repository record).** A repository's policy is part of its
+> record (`slates_db::catalog::RepositoryPolicy`): its rules (what each names, its pattern, the right, allow or deny,
+> and whom it speaks to) and its hooks (the point, the name, the program by absolute path), empty at creation. Its
+> owner sets it whole with `SetRepositoryPolicy`, from the version the owner read: `Op::RepositoryPolicySet` (tag 97),
+> guarded then applied on the repository's partition, an entry of its register of that one change. The guard refuses a
+> stale read (`PolicyChanged`, naming the version now), a rule naming what the repository's tool does not have or a
+> pattern its matcher would refuse, and a hook at another tool's point, named other than its point allows (one hook a
+> git or Subversion point; Mercurial's `point.suffix` names, each once), or running a program that is not an absolute
+> path. Its rules' and hooks' encoded bytes are charged to the partition's merge budget, given back when it is
+> replaced or its repository leaves, and charged again by a partition rebuilt from its snapshot.
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12080,7 +12104,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
    commit, under learned deadlines (A-597 built the matcher with each tool's precedence, the hooks' inputs, their
-   learned deadlines and the runner; the policy's place in the record, the views and the driver are owed).
+   learned deadlines and the runner; A-622 part 1 the policy in the repository record and its verb; the push paths'
+   check and the hook driver are owed, A-622's next parts).
 
 Each server's pieces follow these, in its own section.
 
@@ -12227,6 +12252,10 @@ engine: the verdict, rebase, position mapping, the register).
 > a number past Go's `int64` are refused by kind. Proven against git-lfs v3.8.1's documents and pointer tests and
 > against what the stock git-lfs 3.8.1 client sent and accepted, recorded. Serving it (routes, the object store, lock
 > records, who may do what) is the server's part.
+>
+> **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
+> case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
+> re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12600,6 +12629,22 @@ signature verification).
 > version 2), sparse-revlog's intermediate snapshots among its chains, every entry equal to 7.2's `debugindex --debug`
 > and every text to its `debugdata`. Owed with the import: walking a store (the fncache, the path encodings, a version 2
 > store's file index) and censored, ellipsis and externally stored revisions, refused by kind for now.
+>
+> **Status (2026-11-19, A-588 part 2: the index's tables on the shared object store built).** `slates-hg`'s `index`
+> keeps a repository's changelog, manifest log and file logs as rows of one A-581 `slates-vcs` index, so they are
+> content tables under a tail, shared by a fork and folded by the shared rule, and nothing of a log is held anywhere
+> else: a log row (`L`, the log's key, the revision's number big-endian) holds the node, the parents' and the link's
+> numbers, 7.2's flags, the length and the content (a changeset's text with its manifest node, branch and closed head;
+> a file revision's bytes and its block apart), and a node row (`N`, the node, the log's key) its number, since one
+> file node can stand in several file logs. A group is numbered as 7.2's `revlog.addgroup` numbers one (a node held
+> passed over; a parent missing from the log and the group, or a link the changelog lacks, refuses the whole group, with
+> nothing written); a log's length is read from its rows by doubling lookups. Mercurial's naming is the shared store's
+> `Naming` parameter (`HgNaming`: the parents and a file revision's framed block as context, the bytes alone as the
+> object). Proven against the history 7.2 stored in A-588's fixtures (every number, parent and link as its `debugindex`
+> lists them), the shared quarantine admitting each of its 30 revisions under its node and refusing a node one bit off,
+> and a model of `addgroup` over generated histories. The revlog reader's compressed chunks are now inflated by the
+> crate's one inflater, A-598's `compression::inflate`. Owed: the phase roots, markers and branch heads of the index
+> sketched below (pieces 5 and 7), and the import's walk of a store.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12713,6 +12758,10 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   never changes a node, which hashes them in order of value.
 - The tail is folded into a new table when the lookups it served since the last fold cost more than a fold (the table
   of learned tunables).
+- As built (A-588 part 2): the logs are rows of one shared `slates-vcs` index rather than tables apart, keyed so that
+  a log's rows are contiguous and in order (`L`, the log's key, the number) and a node finds its number in each log
+  that holds it (`N`, the node, the log's key); a changeset's branch is kept as its name, and a file revision's block
+  and bytes as two contents of its row.
 
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
@@ -12985,7 +13034,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    index's tables, and an existing repository's store imported as a base. Built (A-588, `crates/hg`: `changeset`,
    `manifest`, `filerev`, `node`): the objects and their nodes. Built (A-611, `crates/hg`: `revlog`): the import's
    revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
-   holding inflated bytes. Owed: the index's tables on A-581's `slates-vcs`, then the import's walk of a store.
+   holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
+   Mercurial's naming as its `Naming`. Owed: the import's walk of a store.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
@@ -41876,6 +41926,173 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   here already ask for `get-locations` and `get-dir`); then `svn mergeinfo --show-revs`'s eligible and merged
   revisions from the segments and the log; read access by A-606's rules, and the authentication request a denied
   anonymous read makes when the session could authenticate.
+
+### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git/src/v2` (`line.rs`'s `object_id`; `mod.rs`'s rule and `Refusal::ObjectId`; the tests in `line.rs`,
+  `tests/request.rs`, `tests/ls_refs.rs` and `tests/mod.rs`).
+- **The rule.** Main settled A-604's question. v0 read ids in either case, as gitprotocol-pack's "both MUST treat
+  obj-id as case-insensitive" asks; v2 refused upper case, by gitprotocol-common's `HEXDIG`. A server reads what git's
+  own server accepts and writes git's form: git's server reads every id with `get_oid_hex` or `parse_oid_hex`, whose
+  `hexval` takes both cases, so v2 now does, and writes `oid_to_hex`'s lower case. A line's LF stays optional and
+  recorded, so stock git's streams re-encode exactly. Bytes after an id and numbers not in canonical decimal stay
+  refused, since no git writes them.
+- **Tests** (Mac Studio M3 Ultra, kiln, 2026-11-19). Failing first: an upper-case `want` in a `fetch` request and an
+  upper-case id in an `ls-refs` answer, both refused `NotHex` before (2 of 39 v2 tests red). Then `cargo test --locked
+  -p slates-git --lib` 221 of 221 over main with this change, fmt clean. The cases that pinned the refusal (one in `tests/request.rs`, one in
+  `tests/ls_refs.rs`, the unit test in `line.rs`) now pin the reading, and the bit-flip test takes a flip that
+  upper-cases an id's digit as the same id, written back as the original byte.
+- **Owed of A-624:** `object-info` and `bundle-uri`, read and answered over a store trait (A-614 builds the store), and
+  the server's `packfile-uris` choice.
+
+### A-622 — A repository's policy held in its record, set whole by its owner from the version read (2026-11-19, g255, UI goal 93; §4.17.1 "Policy: protected branches, access and hooks" and shared piece 7's rest, part 1; after A-597 and A-603)
+Applied in the same change to:
+- §4.17.1's policy paragraph (a status) and its pieces list (piece 7);
+- GAPS (the §4.17 entry);
+- `crates/db` (`catalog.rs`: `RepositoryPolicy` and its rule and hook types, and `RepositoryRecord::policy`, appended;
+  `op.rs`: `Op::RepositoryPolicySet`, tag 97, appended; `error.rs`; `repository.rs` with `repository/policy.rs`, new;
+  `partition.rs`; the test helpers' records; `tests/wire_order.rs` and `.txt`, the appended tag and six new enums);
+- `crates/ipc` (`protocol.rs`: `RequestBody::SetRepositoryPolicy`, tag 86, `DatabaseRefusal` 8 and 9, the policy's wire
+  types, `Refusal::PolicyChanged`'s doc; `tests/wire_order.rs` and `.txt`);
+- `crates/server` (`repository.rs`: `set_policy`; `verbs.rs`: its route and dispatch; `error.rs`: the refusals).
+
+- **The record.** A repository's policy is part of its record, so a partition's snapshot carries it and a replay sets it
+  again, as the record's other fields. It holds a version (how many times it was set), its rules in order, and its hooks
+  in order. A rule names what its pattern covers (git's refs; Mercurial's branches, bookmarks or topics; Subversion's
+  paths), the pattern in its tool's form, the right (read, submit, rewrite, delete), allow or deny, and whom it speaks
+  to (everyone, or entries naming a principal or every principal but one). A hook names its point, its name and its
+  program. A repository is created with an empty policy at version 0, and a create that carries one is refused.
+- **The verb.** `SetRepositoryPolicy { repository, read, rules, hooks }`, its owner's (another principal is refused
+  `Forbidden`, as the branch verbs are), routed to the partition the repository's name hashes to. It records
+  `Op::RepositoryPolicySet` with version `read + 1`, which the guard accepts only when the policy's version is `read`:
+  a raced or replayed setting is refused `PolicyChanged` with the version now, as A-285's volume policy is, so the
+  setter reads again. Answered `Acknowledged`. The op is an entry of the repository's register of that one change, so
+  it takes the next position (A-603).
+- **What the guard refuses** (`repository/policy.rs`): a rule whose names the repository's tool has not, or whose
+  pattern is empty, holds a NUL, or is a Subversion path that does not start at the root (`/path` or `:glob:/path`),
+  which are the rules the server's matcher reads a pattern by (A-597), so a recorded policy always compiles; a hook at
+  another tool's point; one named other than its point allows (git and Subversion keep one hook file a point, so their
+  hooks take the point's own name, once; Mercurial's take the point's name alone or with a `.suffix`, each name once);
+  and a program that is not an absolute path or holds a NUL. Each refusal is typed on the wire
+  (`DatabaseRefusal::PolicyRuleMalformed` or `PolicyHookMalformed`, naming the item by index).
+- **The bound.** A policy's rules' and hooks' encoded bytes are charged to the partition's merge byte budget, the bound
+  every repository's own state shares (A-603, A-596), with `Capacity` past it; a setting gives back the policy it
+  replaces, a destroyed repository gives back its policy, and a partition rebuilt from its snapshot charges the
+  policies again (`Repositories::state_bytes`). One policy is also bounded by one log record, since it is set whole.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19; `cargo fmt --all` applied from the Studio's run):
+  `cargo test --locked -p slates-db --lib -- repository::` 15 of 15, `-p slates-server --lib -- repository::` 5 of 5,
+  `-p slates-ipc --lib` all passing, and both crates' `--test wire_order` 2 of 2 (the appended tags published by hand
+  and checked by the test). Red first, on a copy with the version check, the rule and hook checks, the create's check,
+  the snapshot's charge and the guard's release taken out: the four tests that guard them failed, nothing else.
+  - The guard's own tests: each tool's names, each kind of malformed pattern, the hooks' points and names, the charge.
+  - The partition's: a policy set from version 0 and held at 1 with the register a position on; a stale setting, a
+    branch rule in a git repository, a relative program and a create carrying a policy each refused by kind, nothing
+    changed; the rebuilt and the replayed partitions answering as the live one.
+  - The budget's, by use: a replacement fits because the old policy is given back; a second repository's policy
+    refused `Capacity` on the live partition and on the rebuilt one alike; and admitted once the first repository has
+    left.
+  - The server's: the verb end to end, the owner's principal mapped to the catalog's, each refusal on the wire.
+- **Owed (A-622's next parts):** the push paths' check against the policy (one function the git, Mercurial and
+  Subversion push pieces call, with a typed refusal), and the hook driver (an owned hook process over a read-only
+  attachment of the work, its learned deadline from A-597's runner). A client and CLI form of the verb are owed with
+  the servers' administration.
+
+### A-588 part 2 — Mercurial's index on the shared object store's tables: logs as rows of one slates-vcs index, numbered as 7.2's addgroup numbers them, Mercurial's node rule as the store's naming (2026-11-19, g291 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.17.1 shared piece 3; A-581, A-588, A-598, A-611)
+Applied in the same change to: §4.17.3 (its status, the index's "as built" line, piece 3), `crates/hg` (`index`, new;
+`node::compute_prefixed`; `revlog`'s compressed chunks inflated by `compression::inflate`, its own inflaters gone and
+its `Inflate` refusal now `Stream`, the engine's own; `changeset`'s tests' `written` split so that no function
+returning `Result` asserts or unwraps, main's clippy findings, and its other tests' types named and long tests split;
+`revlog`'s four- and eight-byte reads and the docket's sizes given their `Format:` markers), `Cargo.lock` (slates-hg's
+entry names slates-vcs, which git's object store had already made a workspace dependency), GAPS (the §4.17.3 entry).
+- **What it does.** `index::HgIndex` keeps a repository's logs in one `slates-vcs` `Index`: a log row (`L`, the log's
+  key: `c`, `m`, or `f`, the path and a NUL; then the number big-endian) with the node, the parents' and link's
+  numbers (`u32::MAX` for none), 7.2's flags, the length, a changeset's manifest node, closed head and branch, and as
+  contents a changeset's or manifest's text or a file revision's bytes and block; and a node row (`N`, the node, the
+  log's key) with the number. `append_changesets` and `append_revisions` take a group in the order it arrived, as
+  7.2's `revlog.addgroup` does ("this can happen if two branches make the same change": a held node passed over; each
+  parent looked up, "unknown parent", in the log or earlier in the group), refuse a group whole on a missing parent or
+  link, and write it as one sorted batch. A log's length is the first number without a row, found by doubling and
+  halving lookups. `HgNaming` is Mercurial's node rule as the shared store's `Naming`: its context the two parents
+  then a file revision's block between its markers, its object the bytes alone, hashed in place
+  (`node::compute_prefixed`), a collision attack refused.
+- **Why rows of one index.** A-581's index holds rows by key under a tail and folds them by the shared rule; keying a
+  log's rows by its key and the number makes each log contiguous and ordered, and a fork shares them all. The log's
+  length kept nowhere but its rows means a fork or a restart needs no counter.
+- **One inflater (main, 2026-11-19).** The revlog reader (A-611) had its own zlib and zstd inflaters beside A-598's;
+  its chunks now go through `compression::inflate`, which also charges the decoder's memory to the admission, so the
+  crate inflates in one place and a chunk's refusal is the engine's own kind.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 188 of 188 at 02e608d67
+  (the first build, before the inflater and clippy changes), 188 of 188 at dbcee659e, 189 of 189 at d522d8a27 (the
+  damaged-revlog test now two), and 189 of 189 with `cargo fmt -p slates-hg -- --check` clean on the tree merged with
+  main at 38e48e3df (load 5.1). Golden: A-588's
+  fixtures' history appended log by log, every revision's number, parents and link as 7.2's `debugindex` lists them,
+  each node found under its number and its number under its node, the branches and the closed head kept, a copy's block
+  apart; the shared quarantine admitting all 30 revisions by `HgNaming` and refusing each node one bit off. Hostile: a
+  missing parent, a missing link, a parent from another file's log, each refusing its group with nothing written; a
+  group passed over whole when brought again; one node in two files' logs; a fork keeping its own revision. Model:
+  generated histories in generated groups (parents anywhere in the history, revisions brought twice) equal to a model
+  of `addgroup` after every group.
+- **Owed.** The phase roots, markers and branch heads of §4.17.3's index (pieces 5 and 7); the import's walk of a
+  store, which appends what the revlog reader reads into this index.
+
+### A-621 — an ops document names as many paths as its work declares: 64-bit path indices and interning through a map (2026-11-19, g267, UI goal 93; §4.16 "Data model"; found on the push path by g225, A-618)
+Applied in the same change to:
+- §4.16's data model (the op record and the document's header) and its status; GAPS (a §4.16 entry, the A-612 siblings
+  filed open, and a sibling found here);
+- `crates/merge`:
+  - `ops_doc.rs`: version 2, `Op::path` `u64`, `PathTable`'s ordered index, `DuplicatePath`; its tests moved from
+    `tests/ops_doc.rs` into `src/ops_doc/tests.rs`;
+  - `chain_entry.rs`: version 5, an op's record the ops document's;
+  - `engine.rs` and `increment.rs`: the index conversions;
+  - `tests/increment.rs`, `tests/special.rs` and `tests/chain_replay.rs`, updated to the wider index;
+- `crates/server/src/verbs.rs`: an attribute's name index read whole;
+- `docs/bugs/2026-11-19-a-work-naming-more-than-65535-paths-aliased-them.md`.
+- **The defect.** An op named its path by a 16-bit index, and `PathTable::intern` answered `u16::MAX` for every name
+  past the 65,535th, so the 65,536th and every later name of one work aliased one path: their edits would land on the
+  wrong file. The same narrowing stood in the deriver (`index_of`), in the verdict's reading of a rename's source and an
+  attribute's name, and in the server's laying-in of an attribute's value, which skipped it. Interning scanned every
+  name, O(n²) for a table of n.
+- **The format, the design's way.**
+  - The ops document's version is 2: a path index, and the header's path and op counts, are 64 bits, the op record 34
+    bytes written field by field. Its golden vectors are re-derived: the 152 bytes of the golden document, recorded field
+    by field in the test, and its identity
+    `11ede55e9cfe1c944e971c5bd45cc1628911d8c93d92ea5ea51c1ff8d370763b`. Both came from an independent encoder and
+    BLAKE3 (Python), which reproduces version 1's vector `67613f8e…19b677d` from version 1's layout of the same
+    document.
+  - The determinism gate holds at 65,537 names: the document is built twice, its names declared in opposite orders,
+    with the same bytes and identity.
+  - The chain entry, which writes an op's record the same way, is version 5.
+  - Old versions are refused `BadVersion` (a version 1 document, a version 4 entry): replaced, not layered.
+- **No fixed cap.** A table's length always fits 64 bits on the targets slates builds for, so the conversion never
+  fails. Its unreachable refusal answers `u64::MAX`, which names no path, so it can never alias another path as
+  `u16::MAX` did. A work's names are bounded by its caller's admission (g225's push path charges them, A-618).
+- **Interning.** An ordered map from name to index (`BTreeMap`). Its order is the canonical one, so
+  `canonicalize` reads the sort off the map in one pass, moving each path once. Decode refuses a table naming a path
+  twice (`DuplicatePath`).
+- **Tests** (debug, Mac Studio, 2026-11-19, load 8 to 26), green on kiln r692:
+  - `cargo test -p slates-merge --lib`, the whole suite, 60 of 60;
+  - `cargo test -p slates-server --lib -- green merge_origin`, 31 of 31;
+  - `cargo fmt -p slates-merge -p slates-server -- --check`, clean.
+
+  The failing-first tests:
+  - 65,537 distinct names each keep their own index, and each op names the path it was declared for, through
+    canonicalization, encode and decode;
+  - the comparison counter shows doubling the names less than triples the comparisons (a scan quadruples them), and
+    the total stays far below a scan's;
+  - the chain entry keeps an op's index past 16 bits.
+
+  Red on r705, with the old scan and 16-bit index restored inside the new types and the chain entry keeping an index's
+  low 16 bits: all four failed. The 65,537th name took the 65,536th's index (65,535); the determinism gate's two
+  orders differed; the chain entry's index came back clipped. Doubling the names took 2,149,245,934 comparisons against
+  537,633,163, four times, the scan's square.
+- **Merged with A-586** (Subversion's `Copy`, op kind 16, landed meanwhile). Its copy lookups narrowed an index to 16
+  bits the same way: `chain_entry::declared_copy`, which would never have found a copy past the 65,535th path, and
+  `Green::copy_records_reservation`. Both read the 64-bit index now. `Copy`, an appended kind, needs no version of its
+  own.
+- **Sibling found, not changed** (GAPS): a chain entry's encoding finds each splice's declared ops by scanning every op
+  of the increment (`chain_entry::declared_ops`). That is O(splices × ops) for a version that edits many existing
+  files, though not for a first push, whose files are created.
 
 ### A-627 — `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token` read (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part, in part; A-609, A-602)
 Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), `research/vcs-servers-subversion.md` (§1's
