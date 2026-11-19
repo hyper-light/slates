@@ -2,9 +2,11 @@
 //! derivation enters only its change's directories, each fill derives exactly the versions it had to, one unit a step,
 //! a value is immutable under its type and version, and every refusal is typed.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
+use proptest::test_runner::TestRunner;
 
 use super::paths::{Change, Entry, PathChanges, PathMap, PathsRefused};
 use super::{Derivations, DerivedRefused, Fill, Graph, Mode, Progress, Read};
@@ -255,14 +257,40 @@ fn hostile(parent: &Files, mut change: Change, (kind, at): (u8, usize), entry: E
   change
 }
 
+/// `change` with a run of the wide directory's files set (kind 2) or removed (kind 3), each kept only while the change
+/// stays valid; the other kinds add none.
+fn wide_run(
+  parent: &Files,
+  mut change: Change,
+  (kind, first, len): (u8, usize, usize),
+  entry: Entry,
+) -> Change {
+  for at in first..first + len {
+    let path = format!("w/{:02}", at % 40).into_bytes();
+    let set = match kind {
+      2 => Some(entry),
+      3 if parent.contains_key(&path) => None,
+      _ => continue,
+    };
+    let mut trial = change.clone();
+    trial.insert(path, set);
+    if model_apply(parent, &trial, LAZY_WINDOW).is_ok() {
+      change = trial;
+    }
+  }
+  change
+}
+
 /// One version to record: its parents (each a pick among the versions both declarations derive, or none), its file
-/// removals and sets (a path, a content and a class), and a hostile operation.
+/// removals and sets (a path, a content and a class), a run of the wide directory's files set or removed at once (its
+/// kind, first and length), and a hostile operation.
 #[derive(Clone, Debug)]
 struct Recording {
   first: (bool, usize),
   second: (bool, usize),
   removes: Vec<usize>,
   sets: Vec<(usize, usize, u8)>,
+  run: (u8, usize, usize),
   hostile: (u8, usize),
 }
 
@@ -275,7 +303,9 @@ enum Step {
   Read(usize),
 }
 
-/// A step, generated as plain tuples and a weighted selector (no `Arc`-backed `prop_oneof!`, R2): record 7, read 3.
+/// A step, generated as plain tuples and a weighted selector (no `Arc`-backed `prop_oneof!`, R2): record 7, read 3. A
+/// recording's run sets a run of the wide directory's files a fourth of the time and removes one another fourth, so the
+/// directory crosses the window's threshold both ways.
 fn step() -> impl Strategy<Value = Step> {
   (
     0_u8..10,
@@ -283,21 +313,70 @@ fn step() -> impl Strategy<Value = Step> {
     (proptest::bool::weighted(0.3), 0_usize..64),
     proptest::collection::vec(0_usize..64, 0..10),
     proptest::collection::vec((0_usize..64, 0_usize..BLOBS, 0_u8..3), 0..6),
+    (0_u8..4, 0_usize..40, 1_usize..30),
     (0_u8..14, 0_usize..64),
   )
-    .prop_map(|(selector, first, second, removes, sets, hostile)| {
+    .prop_map(|(selector, first, second, removes, sets, run, hostile)| {
       if selector < 7 {
         Step::Record(Recording {
           first,
           second,
           removes,
           sets,
+          run,
           hostile,
         })
       } else {
         Step::Read(first.1)
       }
     })
+}
+
+/// What the oracle's histories met, summed over every case: proof that each path the oracle holds to the model ran.
+#[derive(Debug, Default)]
+struct Census {
+  versions: u64,
+  merges: u64,
+  fills_of_two_or_more: u64,
+  splits: u64,
+  collapses: u64,
+  refusals: BTreeSet<&'static str>,
+}
+
+impl Census {
+  /// Each kind met at least once: merges, lazy fills of several versions, both halves of the trie's rule in a
+  /// derivation, and every refusal the generator makes.
+  fn assert_met(&self) {
+    let met = [
+      self.merges,
+      self.fills_of_two_or_more,
+      self.splits,
+      self.collapses,
+    ];
+    assert!(met.iter().all(|count| *count > 0), "{self:?}");
+    let kinds = ["BadPath", "EntryPastWindow", "RemovedAbsent", "Shadowed"];
+    assert_eq!(self.refusals, BTreeSet::from(kinds), "{self:?}");
+  }
+
+  fn add(&mut self, other: &Census) {
+    self.versions += other.versions;
+    self.merges += other.merges;
+    self.fills_of_two_or_more += other.fills_of_two_or_more;
+    self.splits += other.splits;
+    self.collapses += other.collapses;
+    self.refusals.extend(&other.refusals);
+  }
+}
+
+/// A refusal's kind, as the census names it.
+fn kind_of(refused: &PathsRefused) -> &'static str {
+  match refused {
+    PathsRefused::BadPath { .. } => "BadPath",
+    PathsRefused::RemovedAbsent { .. } => "RemovedAbsent",
+    PathsRefused::Shadowed { .. } => "Shadowed",
+    PathsRefused::EntryPastWindow { .. } => "EntryPastWindow",
+    _ => "other",
+  }
 }
 
 /// A version as the model holds it.
@@ -320,6 +399,7 @@ struct Run {
   lazy: PathMap<History>,
   blobs: Vec<ContentId>,
   models: Vec<Model>,
+  census: Census,
 }
 
 impl Run {
@@ -336,6 +416,7 @@ impl Run {
       lazy: PathMap::declare(LAZY_WINDOW, Mode::Lazy).unwrap(),
       blobs,
       models: Vec::new(),
+      census: Census::default(),
     }
   }
 
@@ -379,6 +460,7 @@ impl Run {
       class: 0,
       content: self.blobs[0],
     };
+    let change = wide_run(parent, change, recording.run, entry);
     hostile(parent, change, recording.hostile, entry)
   }
 
@@ -398,6 +480,8 @@ impl Run {
       .map(|at| at as u64)
       .collect();
     self.history.record(version, &parents, change.clone());
+    self.census.versions += 1;
+    self.census.merges += u64::from(parents.len() == 2);
     self.models.push(Model {
       parents,
       eager: model_apply(&parent_files, &change, EAGER_WINDOW),
@@ -405,6 +489,15 @@ impl Run {
       change,
       lazy_kept: false,
     });
+    for refused in [
+      &self.models[version as usize].eager,
+      &self.models[version as usize].lazy,
+    ]
+    .into_iter()
+    .filter_map(|model| model.as_ref().err())
+    {
+      self.census.refusals.insert(kind_of(refused));
+    }
     self.fill_eager(version);
     let lazy = self
       .derivations
@@ -438,6 +531,7 @@ impl Run {
         let derived = self.derivations.counters().derived - before.0.derived;
         let entered = self.eager.counters().directories - before.1.directories;
         assert_eq!((derived, entered), (1, reached(&model.change)));
+        self.census.splits += self.eager.counters().splits - before.1.splits;
         let files = files.clone();
         same_as_naive(&mut self.store, &mut self.eager, root, &files);
       }
@@ -498,6 +592,8 @@ impl Run {
           (to_fill.len() as u64, to_fill.len() as u64, expected)
         );
         self.kept(&to_fill);
+        self.census.splits += self.lazy.counters().splits - before.1.splits;
+        self.census.fills_of_two_or_more += u64::from(derived >= 2);
         same_as_naive(&mut self.store, &mut self.lazy, root, &files);
       }
       (Err(refused), Err(answer)) => {
@@ -518,8 +614,10 @@ impl Run {
   }
 
   /// Gives everything back: once the values are released only the files' contents are held, once each, and once they
-  /// are, the store is empty and charges nothing.
-  fn finish(mut self) {
+  /// are, the store is empty and charges nothing. The run's census, with the collapses its derivations made (a build
+  /// never collapses).
+  fn finish(mut self) -> Census {
+    self.census.collapses = self.eager.counters().collapses + self.lazy.counters().collapses;
     self.derivations.release(&mut self.store).unwrap();
     assert_eq!(self.store.len(), self.blobs.len());
     for blob in &self.blobs {
@@ -528,6 +626,7 @@ impl Run {
     }
     assert!(self.store.is_empty());
     assert_eq!((self.store.used(), self.store.charged()), (0, 0));
+    self.census
   }
 }
 
@@ -548,25 +647,42 @@ fn same_as_naive(
   store.release(&naive).unwrap();
 }
 
-proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(96), ..ProptestConfig::default() }))]
-
-  /// A-647 (A-645 "Derived data, one mechanism"). Do: record generated histories (roots, first parents, merges' second
-  /// parents, removals and sets over nested and wide directories, and one hostile operation in some: a removal of an
-  /// absent path, a file beneath a file, a file over a directory, a bad path, a name past the eager window), the eager
-  /// declaration filling each version as it is recorded, and read versions through the lazy declaration. Expect: every
-  /// value reads as the model's map and is, identity for identity, the map built from scratch (the naive recomputation
-  /// from the root); each derivation entered exactly its change's directories (the non-vacuity counter); each fill
-  /// derived and walked exactly the versions it had to, one unit a step; every refusal is the model's; and once the
-  /// values are released the store holds the files' contents alone.
-  #[test]
-  fn t_a647_every_value_equals_a_naive_recomputation_from_the_root(steps in proptest::collection::vec(step(), 1..40)) {
+/// A-647 (A-645 "Derived data, one mechanism"). Do: record generated histories (roots, first parents, merges' second
+/// parents, removals and sets over nested and wide directories, runs of the wide directory's files set or removed at
+/// once, and one hostile operation in some: a removal of an absent path, a file beneath a file, a file over a
+/// directory, a bad path, a name past the eager window), the eager declaration filling each version as it is recorded,
+/// and read versions through the lazy declaration. Expect: every value reads as the model's map and is, identity for
+/// identity, the map built from scratch (the naive recomputation from the root); each derivation entered exactly its
+/// change's directories (the non-vacuity counter); each fill derived and walked exactly the versions it had to, one
+/// unit a step; every refusal is the model's; once the values are released the store holds the files' contents alone;
+/// and the census, printed every run, met merges, lazy fills of several versions, splits and collapses made by
+/// derivations, and every refusal kind.
+#[test]
+#[allow(
+  clippy::print_stderr,
+  reason = "the census is the oracle's evidence, printed with every run"
+)]
+fn t_a647_every_value_equals_a_naive_recomputation_from_the_root() {
+  let census = RefCell::new(Census::default());
+  let config = ProptestConfig {
+    cases: slates_test_seeds::cases(96),
+    ..ProptestConfig::default()
+  };
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(config));
+  let result = runner.run(&proptest::collection::vec(step(), 1..40), |steps| {
     let mut run = Run::new();
     for step in &steps {
       run.apply(step);
     }
-    run.finish();
+    census.borrow_mut().add(&run.finish());
+    Ok(())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
   }
+  let census = census.into_inner();
+  eprintln!("derived data census: {census:?}");
+  census.assert_met();
 }
 
 /// A store, a chain of `len` versions each setting `f<n>` and changing `shared`, the contents they name.

@@ -176,6 +176,10 @@ pub struct PathCounters {
   pub nodes_put: u64,
   /// Nodes read by derivations and builds.
   pub nodes_read: u64,
+  /// Branches made because a directory's names, or a branch's share of them, were past one leaf: the rule's first half.
+  pub splits: u64,
+  /// Branches a derivation made one leaf again because their entries came to fit one: the rule's second half.
+  pub collapses: u64,
 }
 
 impl PathCounters {
@@ -184,6 +188,8 @@ impl PathCounters {
       directories: self.directories.saturating_add(more.directories),
       nodes_put: self.nodes_put.saturating_add(more.nodes_put),
       nodes_read: self.nodes_read.saturating_add(more.nodes_read),
+      splits: self.splits.saturating_add(more.splits),
+      collapses: self.collapses.saturating_add(more.collapses),
     }
   }
 }
@@ -792,6 +798,7 @@ impl<'s> Work<'s> {
     {
       return Err(PathsRefused::EntryPastWindow { name: name.clone() });
     }
+    self.counters.splits = self.counters.splits.saturating_add(1);
     let mut groups: BTreeMap<u8, Entries> = BTreeMap::new();
     for (name, slot) in entries {
       let digit = digit(&place(&name), level).ok_or(PathsRefused::Unsplittable)?;
@@ -873,6 +880,7 @@ impl<'s> Work<'s> {
       return if now == 0 { Ok(None) } else { Err(malformed) };
     }
     if self.fits(now) {
+      self.counters.collapses = self.counters.collapses.saturating_add(1);
       let entries = gather(&mut |node| self.read(node), children.into_values())?;
       return self.put_set(entries, level);
     }
