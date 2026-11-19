@@ -92,12 +92,24 @@ pub(crate) enum HookPoint {
   HgPretxnchangegroup,
   /// Mercurial's `changegroup`.
   HgChangegroup,
+  /// Subversion's `start-commit`.
+  SvnStartCommit,
   /// Subversion's `pre-commit`.
   SvnPreCommit,
   /// Subversion's `pre-revprop-change`.
   SvnPreRevpropChange,
   /// Subversion's `post-commit`.
   SvnPostCommit,
+  /// Subversion's `post-revprop-change`.
+  SvnPostRevpropChange,
+  /// Subversion's `pre-lock`.
+  SvnPreLock,
+  /// Subversion's `post-lock`.
+  SvnPostLock,
+  /// Subversion's `pre-unlock`.
+  SvnPreUnlock,
+  /// Subversion's `post-unlock`.
+  SvnPostUnlock,
 }
 
 impl HookPoint {
@@ -107,9 +119,17 @@ impl HookPoint {
       Self::GitPreReceive
       | Self::GitUpdate
       | Self::HgPretxnchangegroup
+      | Self::SvnStartCommit
       | Self::SvnPreCommit
-      | Self::SvnPreRevpropChange => Phase::Admission,
-      Self::GitPostReceive | Self::HgChangegroup | Self::SvnPostCommit => Phase::Observing,
+      | Self::SvnPreRevpropChange
+      | Self::SvnPreLock
+      | Self::SvnPreUnlock => Phase::Admission,
+      Self::GitPostReceive
+      | Self::HgChangegroup
+      | Self::SvnPostCommit
+      | Self::SvnPostRevpropChange
+      | Self::SvnPostLock
+      | Self::SvnPostUnlock => Phase::Observing,
     }
   }
 
@@ -121,20 +141,39 @@ impl HookPoint {
       Self::GitPostReceive => "post-receive",
       Self::HgPretxnchangegroup => "pretxnchangegroup",
       Self::HgChangegroup => "changegroup",
+      Self::SvnStartCommit => "start-commit",
       Self::SvnPreCommit => "pre-commit",
       Self::SvnPreRevpropChange => "pre-revprop-change",
       Self::SvnPostCommit => "post-commit",
+      Self::SvnPostRevpropChange => "post-revprop-change",
+      Self::SvnPreLock => "pre-lock",
+      Self::SvnPostLock => "post-lock",
+      Self::SvnPreUnlock => "pre-unlock",
+      Self::SvnPostUnlock => "post-unlock",
     }
   }
 
   /// The streams its words come from.
   pub(crate) fn words_from(self) -> WordsFrom {
     match self {
-      Self::SvnPreCommit | Self::SvnPreRevpropChange | Self::SvnPostCommit => {
-        WordsFrom::ErrorStream
-      }
+      Self::SvnStartCommit
+      | Self::SvnPreCommit
+      | Self::SvnPreRevpropChange
+      | Self::SvnPostCommit
+      | Self::SvnPostRevpropChange
+      | Self::SvnPreLock
+      | Self::SvnPostLock
+      | Self::SvnPreUnlock
+      | Self::SvnPostUnlock => WordsFrom::ErrorStream,
       _ => WordsFrom::BothStreams,
     }
+  }
+
+  /// Whether the hook's standard output is read rather than sent to the null device: Subversion's `pre-lock` alone,
+  /// whose output is the lock's token, or the server's own when it is empty (`svn_repos__hooks_pre_lock` passes
+  /// `run_hook_cmd` a result, `hooks.c`).
+  pub(crate) fn output_is_lock_token(self) -> bool {
+    matches!(self, Self::SvnPreLock)
   }
 
   /// What it answers with no hook configured.
@@ -183,8 +222,12 @@ pub(crate) struct HookInput {
   pub(crate) point: HookPoint,
   /// Its arguments, after the program.
   pub(crate) args: Vec<Vec<u8>>,
-  /// Its environment's changes, in order.
+  /// Its environment's changes, in order; or, when `clean_environment`, its whole environment.
   pub(crate) env: Vec<(String, EnvValue)>,
+  /// Whether the hook starts with `env` alone and nothing of the server's environment: Subversion's hooks, which
+  /// `run_hook_cmd` starts with exactly their hooks-env section (`svn_io_start_cmd3` with `inherit` false, an empty
+  /// environment when the section is absent). git's and Mercurial's hooks inherit the server's.
+  pub(crate) clean_environment: bool,
   /// Its standard input, whole.
   pub(crate) stdin: Vec<u8>,
   /// What it runs over.
@@ -245,6 +288,7 @@ pub(crate) fn git_pre_receive(
     args: Vec::new(),
     env: push_option_env(options),
     stdin: update_lines(updates),
+    clean_environment: false,
     view: View::Pending(view),
   }
 }
@@ -260,6 +304,7 @@ pub(crate) fn git_update(view: PendingView, update: &RefUpdate) -> HookInput {
     ],
     env: Vec::new(),
     stdin: Vec::new(),
+    clean_environment: false,
     view: View::Pending(view),
   }
 }
@@ -276,6 +321,7 @@ pub(crate) fn git_post_receive(
     args: Vec::new(),
     env: push_option_env(options),
     stdin: update_lines(applied),
+    clean_environment: false,
     view: View::Committed(view),
   }
 }
@@ -327,6 +373,7 @@ pub(crate) fn hg_pretxnchangegroup(
     args: Vec::new(),
     env,
     stdin: Vec::new(),
+    clean_environment: false,
     view: View::Pending(view),
   }
 }
@@ -343,6 +390,7 @@ pub(crate) fn hg_changegroup(
     args: Vec::new(),
     env: changegroup_env(HookPoint::HgChangegroup, hook_name, changes),
     stdin: Vec::new(),
+    clean_environment: false,
     view: View::Committed(view),
   }
 }
@@ -356,35 +404,155 @@ pub(crate) struct LockToken {
   pub(crate) token: String,
 }
 
-/// Format: the first line of `pre-commit`'s standard input (`lock_token_content`, `hooks.c`).
+/// A repository's hook environment: the sections of its `hooks-env` file (`svnserve.conf`'s `hooks-env`, by default
+/// `conf/hooks-env`), each a section's variables, read by the server from the file as Subversion's configuration
+/// format reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SvnHooksEnv {
+  sections: Vec<(String, Vec<(String, Vec<u8>)>)>,
+}
+
+/// Format: the section that names every hook's environment unless the hook has its own
+/// (`SVN_REPOS__HOOKS_ENV_DEFAULT_SECTION`, `repos.h`).
+const HOOKS_ENV_DEFAULT_SECTION: &str = "default";
+
+impl SvnHooksEnv {
+  /// The environment of the file whose sections are `sections`, each with its variables in file order; a variable set
+  /// twice in a section keeps its last value, as Subversion's configuration keeps it.
+  pub(crate) fn new(sections: Vec<(String, Vec<(String, Vec<u8>)>)>) -> Self {
+    let sections = sections
+      .into_iter()
+      .map(|(name, variables)| {
+        let mut kept: Vec<(String, Vec<u8>)> = Vec::new();
+        for (variable, value) in variables {
+          match kept.iter_mut().find(|(held, _)| *held == variable) {
+            Some(slot) => slot.1 = value,
+            None => kept.push((variable, value)),
+          }
+        }
+        (name, kept)
+      })
+      .collect();
+    Self { sections }
+  }
+
+  /// The whole environment `point`'s hook runs with: its own section if the file has one, else the default section,
+  /// else nothing (`run_hook_cmd`, `hooks.c`): a hook's own section replaces the default section, it adds nothing to
+  /// it, and nothing of the server's environment is passed.
+  pub(crate) fn for_point(&self, point: HookPoint) -> Vec<(String, EnvValue)> {
+    let section = |name: &str| self.sections.iter().rev().find(|(held, _)| held == name);
+    section(point.name())
+      .or_else(|| section(HOOKS_ENV_DEFAULT_SECTION))
+      .map(|(_, variables)| {
+        variables
+          .iter()
+          .map(|(variable, value)| (variable.clone(), EnvValue::Bytes(value.clone())))
+          .collect()
+      })
+      .unwrap_or_default()
+  }
+}
+
+/// Format: the first line of `pre-commit`'s standard input when the commit presents lock tokens
+/// (`lock_token_content`, `hooks.c`).
 const LOCK_TOKENS_HEADER: &str = "LOCK-TOKENS:\n";
 
-/// Subversion's `pre-commit`: the repository's directory and the transaction's name as arguments; on standard input
-/// `LOCK-TOKENS:`, a `path|token` line a token, and a blank line (`lock_token_content`).
+/// Format: Subversion's flag argument for a stolen lock or a broken one (`"1"` or `"0"`, `hooks.c`).
+fn flag(set: bool) -> Vec<u8> {
+  if set { b"1".to_vec() } else { b"0".to_vec() }
+}
+
+/// A Subversion hook's input: its arguments after the program, its standard input, and its whole environment from
+/// `hooks_env`.
+fn svn_input(
+  point: HookPoint,
+  hooks_env: &SvnHooksEnv,
+  args: Vec<Vec<u8>>,
+  stdin: Vec<u8>,
+  view: View,
+) -> HookInput {
+  HookInput {
+    point,
+    args,
+    env: hooks_env.for_point(point),
+    clean_environment: true,
+    stdin,
+    view,
+  }
+}
+
+/// Paths a line each, every line ended (`svn_cstring_join2` with a trailing separator, `hooks.c`).
+fn path_lines(paths: &[&str]) -> Vec<u8> {
+  paths
+    .iter()
+    .flat_map(|path| {
+      path
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(b'\n'))
+    })
+    .collect()
+}
+
+/// Subversion's `start-commit`: the repository's directory, the user (empty for none), the client's capabilities
+/// joined by `:`, and the transaction's name; no standard input of its own (`svn_repos__hooks_start_commit`).
+pub(crate) fn svn_start_commit(
+  view: PendingView,
+  hooks_env: &SvnHooksEnv,
+  repository: &str,
+  user: &str,
+  capabilities: &[&str],
+  transaction: &str,
+) -> HookInput {
+  let args = vec![
+    repository.as_bytes().to_vec(),
+    user.as_bytes().to_vec(),
+    capabilities.join(":").into_bytes(),
+    transaction.as_bytes().to_vec(),
+  ];
+  svn_input(
+    HookPoint::SvnStartCommit,
+    hooks_env,
+    args,
+    Vec::new(),
+    View::Pending(view),
+  )
+}
+
+/// Subversion's `pre-commit`: the repository's directory and the transaction's name as arguments. With lock tokens,
+/// standard input is `LOCK-TOKENS:`, a `path|token` line a token, and a blank line (`lock_token_content`); without
+/// any, it is the null device's nothing (`svn_repos__hooks_pre_commit` gives `lock_token_content` only a non-empty
+/// set).
 pub(crate) fn svn_pre_commit(
   view: PendingView,
+  hooks_env: &SvnHooksEnv,
   repository: &str,
   transaction: &str,
   tokens: &[LockToken],
 ) -> HookInput {
-  let mut stdin = LOCK_TOKENS_HEADER.as_bytes().to_vec();
-  for token in tokens {
-    stdin.extend_from_slice(format!("{}|{}\n", token.path, token.token).as_bytes());
+  let mut stdin = Vec::new();
+  if !tokens.is_empty() {
+    stdin.extend_from_slice(LOCK_TOKENS_HEADER.as_bytes());
+    for token in tokens {
+      stdin.extend_from_slice(format!("{}|{}\n", token.path, token.token).as_bytes());
+    }
+    stdin.push(b'\n');
   }
-  stdin.push(b'\n');
-  HookInput {
-    point: HookPoint::SvnPreCommit,
-    args: vec![
-      repository.as_bytes().to_vec(),
-      transaction.as_bytes().to_vec(),
-    ],
-    env: Vec::new(),
+  let args = vec![
+    repository.as_bytes().to_vec(),
+    transaction.as_bytes().to_vec(),
+  ];
+  svn_input(
+    HookPoint::SvnPreCommit,
+    hooks_env,
+    args,
     stdin,
-    view: View::Pending(view),
-  }
+    View::Pending(view),
+  )
 }
 
-/// How a revision property would change: added, modified or deleted (`pre-revprop-change`'s action letter).
+/// How a revision property would change: added, modified or deleted (the revision-property hooks' action letter).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RevpropAction {
   /// `A`.
@@ -406,50 +574,181 @@ impl RevpropAction {
   }
 }
 
-/// Subversion's `pre-revprop-change`: the repository's directory, the revision, the author (empty for none), the
-/// property's name and the action as arguments; the new value on standard input, nothing for a deletion.
+/// A revision-property change as its hooks are told of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RevpropChange<'a> {
+  /// The repository's directory.
+  pub(crate) repository: &'a str,
+  /// The revision.
+  pub(crate) revision: u64,
+  /// The user making the change (empty for none).
+  pub(crate) author: &'a str,
+  /// The property's name.
+  pub(crate) property: &'a str,
+  /// What happens to it.
+  pub(crate) action: RevpropAction,
+}
+
+/// The revision-property hooks' arguments: the repository's directory, the revision, the author, the property's name
+/// and the action's letter.
+fn revprop_args(change: RevpropChange<'_>) -> Vec<Vec<u8>> {
+  vec![
+    change.repository.as_bytes().to_vec(),
+    change.revision.to_string().into_bytes(),
+    change.author.as_bytes().to_vec(),
+    change.property.as_bytes().to_vec(),
+    change.action.letter().to_vec(),
+  ]
+}
+
+/// Subversion's `pre-revprop-change`: [`revprop_args`]; the new value on standard input, nothing for a deletion.
 pub(crate) fn svn_pre_revprop_change(
   view: CommittedView,
-  repository: &str,
-  revision: u64,
-  author: &str,
-  property: &str,
-  action: RevpropAction,
+  hooks_env: &SvnHooksEnv,
+  change: RevpropChange<'_>,
   new_value: &[u8],
 ) -> HookInput {
-  HookInput {
-    point: HookPoint::SvnPreRevpropChange,
-    args: vec![
-      repository.as_bytes().to_vec(),
-      revision.to_string().into_bytes(),
-      author.as_bytes().to_vec(),
-      property.as_bytes().to_vec(),
-      action.letter().to_vec(),
-    ],
-    env: Vec::new(),
-    stdin: new_value.to_vec(),
-    view: View::Committed(view),
-  }
+  let args = revprop_args(change);
+  svn_input(
+    HookPoint::SvnPreRevpropChange,
+    hooks_env,
+    args,
+    new_value.to_vec(),
+    View::Committed(view),
+  )
+}
+
+/// Subversion's `post-revprop-change`: [`revprop_args`]; the old value on standard input, nothing for an addition.
+pub(crate) fn svn_post_revprop_change(
+  view: CommittedView,
+  hooks_env: &SvnHooksEnv,
+  change: RevpropChange<'_>,
+  old_value: &[u8],
+) -> HookInput {
+  let args = revprop_args(change);
+  svn_input(
+    HookPoint::SvnPostRevpropChange,
+    hooks_env,
+    args,
+    old_value.to_vec(),
+    View::Committed(view),
+  )
 }
 
 /// Subversion's `post-commit`: the repository's directory, the new revision and the transaction's name as arguments.
 pub(crate) fn svn_post_commit(
   view: CommittedView,
+  hooks_env: &SvnHooksEnv,
   repository: &str,
   revision: u64,
   transaction: &str,
 ) -> HookInput {
-  HookInput {
-    point: HookPoint::SvnPostCommit,
-    args: vec![
-      repository.as_bytes().to_vec(),
-      revision.to_string().into_bytes(),
-      transaction.as_bytes().to_vec(),
-    ],
-    env: Vec::new(),
-    stdin: Vec::new(),
-    view: View::Committed(view),
-  }
+  let args = vec![
+    repository.as_bytes().to_vec(),
+    revision.to_string().into_bytes(),
+    transaction.as_bytes().to_vec(),
+  ];
+  svn_input(
+    HookPoint::SvnPostCommit,
+    hooks_env,
+    args,
+    Vec::new(),
+    View::Committed(view),
+  )
+}
+
+/// Subversion's `pre-lock`: the repository's directory, the path, the user, the comment (empty for none) and whether
+/// the lock is stolen (`1` or `0`); no standard input of its own. Its standard output is the lock's token
+/// ([`HookPoint::output_is_lock_token`]).
+pub(crate) fn svn_pre_lock(
+  view: CommittedView,
+  hooks_env: &SvnHooksEnv,
+  repository: &str,
+  path: &str,
+  user: &str,
+  comment: &str,
+  steal: bool,
+) -> HookInput {
+  let args = vec![
+    repository.as_bytes().to_vec(),
+    path.as_bytes().to_vec(),
+    user.as_bytes().to_vec(),
+    comment.as_bytes().to_vec(),
+    flag(steal),
+  ];
+  svn_input(
+    HookPoint::SvnPreLock,
+    hooks_env,
+    args,
+    Vec::new(),
+    View::Committed(view),
+  )
+}
+
+/// Subversion's `post-lock`: the repository's directory and the user as arguments; the locked paths on standard input,
+/// a line each.
+pub(crate) fn svn_post_lock(
+  view: CommittedView,
+  hooks_env: &SvnHooksEnv,
+  repository: &str,
+  user: &str,
+  paths: &[&str],
+) -> HookInput {
+  let args = vec![repository.as_bytes().to_vec(), user.as_bytes().to_vec()];
+  svn_input(
+    HookPoint::SvnPostLock,
+    hooks_env,
+    args,
+    path_lines(paths),
+    View::Committed(view),
+  )
+}
+
+/// Subversion's `pre-unlock`: the repository's directory, the path, the user (empty for none), the token presented
+/// (empty for none, as when a lock is broken) and whether the lock is broken (`1` or `0`); no standard input of its
+/// own.
+pub(crate) fn svn_pre_unlock(
+  view: CommittedView,
+  hooks_env: &SvnHooksEnv,
+  repository: &str,
+  path: &str,
+  user: &str,
+  token: &str,
+  break_lock: bool,
+) -> HookInput {
+  let args = vec![
+    repository.as_bytes().to_vec(),
+    path.as_bytes().to_vec(),
+    user.as_bytes().to_vec(),
+    token.as_bytes().to_vec(),
+    flag(break_lock),
+  ];
+  svn_input(
+    HookPoint::SvnPreUnlock,
+    hooks_env,
+    args,
+    Vec::new(),
+    View::Committed(view),
+  )
+}
+
+/// Subversion's `post-unlock`: the repository's directory and the user (empty for none) as arguments; the unlocked
+/// paths on standard input, a line each.
+pub(crate) fn svn_post_unlock(
+  view: CommittedView,
+  hooks_env: &SvnHooksEnv,
+  repository: &str,
+  user: &str,
+  paths: &[&str],
+) -> HookInput {
+  let args = vec![repository.as_bytes().to_vec(), user.as_bytes().to_vec()];
+  svn_input(
+    HookPoint::SvnPostUnlock,
+    hooks_env,
+    args,
+    path_lines(paths),
+    View::Committed(view),
+  )
 }
 
 /// The back-off's ceiling: none of the runner's own, since every run ends when its client leaves (§4.17.2's table,
@@ -830,13 +1129,17 @@ impl HookRun {
 
 #[cfg(test)]
 mod tests {
+  use std::collections::BTreeSet;
+
   use proptest::prelude::*;
 
   use super::{
-    Changegroup, CommittedView, EnvValue, Event, ExitStatus, HookPoint, HookRun, HookTimes,
-    LockToken, Outcome, PendingView, Phase, RefUpdate, RevpropAction, StartRefused, Step,
-    Unconfigured, View, Words, WordsFrom, git_post_receive, git_pre_receive, git_update,
-    hg_changegroup, hg_pretxnchangegroup, svn_post_commit, svn_pre_commit, svn_pre_revprop_change,
+    Changegroup, CommittedView, EnvValue, Event, ExitStatus, HookInput, HookPoint, HookRun,
+    HookTimes, LockToken, Outcome, PendingView, Phase, RefUpdate, RevpropAction, RevpropChange,
+    StartRefused, Step, SvnHooksEnv, Unconfigured, View, Words, WordsFrom, git_post_receive,
+    git_pre_receive, git_update, hg_changegroup, hg_pretxnchangegroup, svn_post_commit,
+    svn_post_lock, svn_post_revprop_change, svn_post_unlock, svn_pre_commit, svn_pre_lock,
+    svn_pre_revprop_change, svn_pre_unlock, svn_start_commit,
   };
   use crate::daemon::LIVENESS_BUDGET_NS;
 
@@ -936,6 +1239,42 @@ mod tests {
         "post-commit",
         WordsFrom::ErrorStream,
       ),
+      (
+        HookPoint::SvnStartCommit,
+        Phase::Admission,
+        "start-commit",
+        WordsFrom::ErrorStream,
+      ),
+      (
+        HookPoint::SvnPostRevpropChange,
+        Phase::Observing,
+        "post-revprop-change",
+        WordsFrom::ErrorStream,
+      ),
+      (
+        HookPoint::SvnPreLock,
+        Phase::Admission,
+        "pre-lock",
+        WordsFrom::ErrorStream,
+      ),
+      (
+        HookPoint::SvnPostLock,
+        Phase::Observing,
+        "post-lock",
+        WordsFrom::ErrorStream,
+      ),
+      (
+        HookPoint::SvnPreUnlock,
+        Phase::Admission,
+        "pre-unlock",
+        WordsFrom::ErrorStream,
+      ),
+      (
+        HookPoint::SvnPostUnlock,
+        Phase::Observing,
+        "post-unlock",
+        WordsFrom::ErrorStream,
+      ),
     ];
     for (point, phase, name, from) in points {
       assert_eq!(point.phase(), phase, "{name}");
@@ -949,6 +1288,11 @@ mod tests {
         Unconfigured::Accepted
       };
       assert_eq!(point.unconfigured(), expected, "{name}");
+      assert_eq!(
+        point.output_is_lock_token(),
+        point == HookPoint::SvnPreLock,
+        "{name}"
+      );
     }
   }
 
@@ -1062,13 +1406,12 @@ mod tests {
     assert_eq!(committed.view, View::Committed(CommittedView(4)));
   }
 
-  /// A-597 (Subversion's inputs, `hooks.c`). Do: build pre-commit with two lock tokens and with none,
-  /// pre-revprop-change for a modification and a deletion, and post-commit. Expect: pre-commit's arguments are the
-  /// repository and the transaction, its input `LOCK-TOKENS:`, a `path|token` line a token and a blank line;
-  /// pre-revprop-change's five arguments end in the action's letter, with the new value on input and nothing for a
-  /// deletion; post-commit's are the repository, the revision and the transaction.
+  /// A-597, A-623 (Subversion's inputs, `hooks.c`). Do: build pre-commit with two lock tokens and with none.
+  /// Expect: its arguments are the repository and the transaction; with tokens its input is `LOCK-TOKENS:`, a
+  /// `path|token` line a token and a blank line; with none it is nothing at all, since `hooks.c` hands the hook the
+  /// null device then (the recorded run agrees: `subversions_commit_hooks_get_what_svnserve_gave_them`).
   #[test]
-  fn subversions_hooks_get_what_hooks_c_gives_them() {
+  fn subversions_pre_commit_gets_its_lock_tokens_as_hooks_c_writes_them() {
     let tokens = [
       LockToken {
         path: "/trunk/a%20b.c".to_owned(),
@@ -1079,23 +1422,37 @@ mod tests {
         token: "opaquelocktoken:2".to_owned(),
       },
     ];
-    let pre = svn_pre_commit(PendingView(1), "/srv/repos/x", "41-1a", &tokens);
+    let env = SvnHooksEnv::default();
+    let pre = svn_pre_commit(PendingView(1), &env, "/srv/repos/x", "41-1a", &tokens);
     assert_eq!(pre.args, vec![b"/srv/repos/x".to_vec(), b"41-1a".to_vec()]);
     assert_eq!(
       pre.stdin,
       b"LOCK-TOKENS:\n/trunk/a%20b.c|opaquelocktoken:1\n/trunk/c.c|opaquelocktoken:2\n\n".to_vec()
     );
     assert_eq!(
-      svn_pre_commit(PendingView(1), "/srv/repos/x", "41-1a", &[]).stdin,
-      b"LOCK-TOKENS:\n\n".to_vec()
+      svn_pre_commit(PendingView(1), &env, "/srv/repos/x", "41-1a", &[]).stdin,
+      Vec::<u8>::new(),
+      "no tokens, the null device: nothing"
     );
+  }
+
+  /// A-597 (Subversion's inputs, `hooks.c`). Do: build pre-revprop-change for a modification, a deletion and an
+  /// addition, and post-commit. Expect: pre-revprop-change's five arguments end in the action's letter, with the new
+  /// value on input and nothing for a deletion; post-commit's are the repository, the revision and the transaction.
+  #[test]
+  fn subversions_revprop_and_post_commit_hooks_get_what_hooks_c_gives_them() {
+    let env = SvnHooksEnv::default();
+    let change = |author, property, action| RevpropChange {
+      repository: "/srv/repos/x",
+      revision: 40,
+      author,
+      property,
+      action,
+    };
     let modified = svn_pre_revprop_change(
       CommittedView(2),
-      "/srv/repos/x",
-      40,
-      "ada",
-      "svn:log",
-      RevpropAction::Modified,
+      &env,
+      change("ada", "svn:log", RevpropAction::Modified),
       b"a better message",
     );
     assert_eq!(
@@ -1111,11 +1468,8 @@ mod tests {
     assert_eq!(modified.stdin, b"a better message".to_vec());
     let deleted = svn_pre_revprop_change(
       CommittedView(2),
-      "/srv/repos/x",
-      40,
-      "",
-      "svn:log",
-      RevpropAction::Deleted,
+      &env,
+      change("", "svn:log", RevpropAction::Deleted),
       b"",
     );
     assert_eq!(deleted.args.get(2), Some(&Vec::new()));
@@ -1123,19 +1477,331 @@ mod tests {
     assert!(deleted.stdin.is_empty());
     let added = svn_pre_revprop_change(
       CommittedView(2),
-      "/srv/repos/x",
-      40,
-      "ada",
-      "ci:status",
-      RevpropAction::Added,
+      &env,
+      change("ada", "ci:status", RevpropAction::Added),
       b"green",
     );
     assert_eq!(added.args.get(4), Some(&b"A".to_vec()));
     assert_eq!(added.stdin, b"green".to_vec());
-    let post = svn_post_commit(CommittedView(3), "/srv/repos/x", 41, "40-1a");
+    let post = svn_post_commit(CommittedView(3), &env, "/srv/repos/x", 41, "40-1a");
     assert_eq!(
       post.args,
       vec![b"/srv/repos/x".to_vec(), b"41".to_vec(), b"40-1a".to_vec()]
+    );
+  }
+
+  /// One hook run recorded by `crates/svn/fixtures/svnlook/make-svnlook-fixtures.sh` under stock `svnserve -d`
+  /// 1.15.0 on the Mac Studio (A-623): its arguments after its path, NUL-ended; its standard input; its environment
+  /// from `env -0`. Each file's SHA-256 is in the fixtures' `SHA256SUMS`.
+  struct Recorded {
+    args: &'static [u8],
+    stdin: &'static [u8],
+    env: &'static [u8],
+  }
+
+  /// The recorded run whose files are named `stem`.
+  macro_rules! recorded {
+    ($stem:literal) => {
+      Recorded {
+        args: include_bytes!(concat!("../../svn/fixtures/svnlook/hooks/", $stem, ".args")),
+        stdin: include_bytes!(concat!(
+          "../../svn/fixtures/svnlook/hooks/",
+          $stem,
+          ".stdin"
+        )),
+        env: include_bytes!(concat!("../../svn/fixtures/svnlook/hooks/", $stem, ".env")),
+      }
+    };
+  }
+
+  /// The repository's directory as the recorded hooks were given it.
+  const RECORDED_REPOSITORY: &str =
+    include_str!("../../svn/fixtures/svnlook/meta/repository-path.txt");
+
+  /// What `/bin/sh` adds to a hook's environment on its own: the recorded hook run under `env -i`.
+  const SH_OWN_ENV: &[u8] = include_bytes!("../../svn/fixtures/svnlook/hooks/000-control.env");
+
+  /// The token the recording's second lock was given, which its owner handed back to unlock it.
+  const RECORDED_TOKEN: &str = "opaquelocktoken:82bf5e5b-37ac-4989-8af7-a6f70d739a1d";
+
+  /// The recording's `hooks-env` file (the script's `conf/hooks-env`), as its sections.
+  fn recorded_hooks_env() -> SvnHooksEnv {
+    let variable = |name: &str, value: &str| (name.to_owned(), value.as_bytes().to_vec());
+    SvnHooksEnv::new(vec![
+      (
+        "default".to_owned(),
+        vec![
+          variable("LANG", "en_US.UTF-8"),
+          variable("SLATES_FIXTURE", "default section"),
+        ],
+      ),
+      (
+        "pre-commit".to_owned(),
+        vec![variable("SLATES_FIXTURE", "pre-commit section")],
+      ),
+    ])
+  }
+
+  /// NUL-ended fields.
+  fn fields(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut fields: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
+    fields.pop();
+    fields
+  }
+
+  /// A `NAME=value` field as its name and its value.
+  fn variable(field: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut parts = field.splitn(2, |byte| *byte == b'=');
+    let name = parts.next().unwrap_or_default().to_vec();
+    (name, parts.next().unwrap_or_default().to_vec())
+  }
+
+  /// A recorded environment's variables, without what `/bin/sh` adds.
+  fn svn_environment(env: &[u8]) -> BTreeSet<(Vec<u8>, Vec<u8>)> {
+    let sh_names: BTreeSet<Vec<u8>> = fields(SH_OWN_ENV)
+      .into_iter()
+      .map(|field| variable(field).0)
+      .collect();
+    fields(env)
+      .into_iter()
+      .map(variable)
+      .filter(|(name, _)| !sh_names.contains(name))
+      .collect()
+  }
+
+  /// `input` is what the recorded run was given: its arguments and standard input byte for byte, and its whole
+  /// environment, compared as a set since Subversion passes a section in hash order.
+  fn assert_recorded(input: &HookInput, recorded: &Recorded) {
+    let args: Vec<&[u8]> = input.args.iter().map(Vec::as_slice).collect();
+    assert_eq!(args, fields(recorded.args), "{:?}", input.point);
+    assert_eq!(input.stdin, recorded.stdin, "{:?}", input.point);
+    let ours: BTreeSet<(Vec<u8>, Vec<u8>)> = input
+      .env
+      .iter()
+      .map(|(name, value)| match value {
+        EnvValue::Bytes(bytes) => (name.as_bytes().to_vec(), bytes.clone()),
+        other => panic!("{other:?}"),
+      })
+      .collect();
+    assert_eq!(ours, svn_environment(recorded.env), "{:?}", input.point);
+    assert!(input.clean_environment, "{:?}", input.point);
+  }
+
+  /// A-623 (golden: stock svnserve's own hooks). Do: build start-commit, pre-commit and post-commit for each of the
+  /// recording's seven commits, its transactions named `<base>-<sequence>` as FSFS named them. Expect: each the
+  /// recorded run byte for byte, start-commit with the client's capability, pre-commit with nothing on standard input
+  /// (no lock token was presented) and its own hooks-env section alone, the others the default section.
+  #[test]
+  fn subversions_commit_hooks_get_what_svnserve_gave_them() {
+    let env = recorded_hooks_env();
+    let commits = [
+      (
+        "jrandom",
+        recorded!("001-start-commit"),
+        recorded!("002-pre-commit"),
+        recorded!("003-post-commit"),
+      ),
+      (
+        "jrandom",
+        recorded!("004-start-commit"),
+        recorded!("005-pre-commit"),
+        recorded!("006-post-commit"),
+      ),
+      (
+        "jrandom",
+        recorded!("007-start-commit"),
+        recorded!("008-pre-commit"),
+        recorded!("009-post-commit"),
+      ),
+      (
+        "jrandom",
+        recorded!("010-start-commit"),
+        recorded!("011-pre-commit"),
+        recorded!("012-post-commit"),
+      ),
+      (
+        "jrandom",
+        recorded!("013-start-commit"),
+        recorded!("014-pre-commit"),
+        recorded!("015-post-commit"),
+      ),
+      (
+        "jconstant",
+        recorded!("016-start-commit"),
+        recorded!("017-pre-commit"),
+        recorded!("018-post-commit"),
+      ),
+      (
+        "jrandom",
+        recorded!("019-start-commit"),
+        recorded!("020-pre-commit"),
+        recorded!("021-post-commit"),
+      ),
+    ];
+    let mut revision = 0u64;
+    for (user, start, pre, post) in &commits {
+      let transaction = format!("{revision}-{revision}");
+      revision += 1;
+      let started = svn_start_commit(
+        PendingView(1),
+        &env,
+        RECORDED_REPOSITORY,
+        user,
+        &["mergeinfo"],
+        &transaction,
+      );
+      assert_recorded(&started, start);
+      let checked = svn_pre_commit(PendingView(1), &env, RECORDED_REPOSITORY, &transaction, &[]);
+      assert_recorded(&checked, pre);
+      let committed = svn_post_commit(
+        CommittedView(1),
+        &env,
+        RECORDED_REPOSITORY,
+        revision,
+        &transaction,
+      );
+      assert_recorded(&committed, post);
+    }
+  }
+
+  /// A-623 (golden). Do: build the lock hooks for the recording's locks: one taken with a two-line comment, stolen by
+  /// another user, broken by the first; one taken without a comment and given back with its token. Expect: each the
+  /// recorded run byte for byte: pre-lock and pre-unlock with nothing on standard input, the comment, the token and
+  /// the steal and break flags as arguments; post-lock and post-unlock with the path on a line.
+  #[test]
+  fn subversions_lock_hooks_get_what_svnserve_gave_them() {
+    let env = recorded_hooks_env();
+    let (view, repository) = (CommittedView(1), RECORDED_REPOSITORY);
+    let (main, noeol) = ("/trunk/src/main.c", "/trunk/noeol");
+    let comment = "First line of the comment.\nSecond line.";
+    assert_recorded(
+      &svn_pre_lock(view, &env, repository, main, "jrandom", comment, false),
+      &recorded!("022-pre-lock"),
+    );
+    assert_recorded(
+      &svn_post_lock(view, &env, repository, "jrandom", &[main]),
+      &recorded!("023-post-lock"),
+    );
+    assert_recorded(
+      &svn_pre_lock(view, &env, repository, main, "jconstant", "Stolen.", true),
+      &recorded!("024-pre-lock"),
+    );
+    assert_recorded(
+      &svn_post_lock(view, &env, repository, "jconstant", &[main]),
+      &recorded!("025-post-lock"),
+    );
+    assert_recorded(
+      &svn_pre_unlock(view, &env, repository, main, "jrandom", "", true),
+      &recorded!("026-pre-unlock"),
+    );
+    assert_recorded(
+      &svn_post_unlock(view, &env, repository, "jrandom", &[main]),
+      &recorded!("027-post-unlock"),
+    );
+    assert_recorded(
+      &svn_pre_lock(view, &env, repository, noeol, "jrandom", "", false),
+      &recorded!("028-pre-lock"),
+    );
+    assert_recorded(
+      &svn_post_lock(view, &env, repository, "jrandom", &[noeol]),
+      &recorded!("029-post-lock"),
+    );
+    let given_back = svn_pre_unlock(
+      view,
+      &env,
+      repository,
+      noeol,
+      "jrandom",
+      RECORDED_TOKEN,
+      false,
+    );
+    assert_recorded(&given_back, &recorded!("030-pre-unlock"));
+    assert_recorded(
+      &svn_post_unlock(view, &env, repository, "jrandom", &[noeol]),
+      &recorded!("031-post-unlock"),
+    );
+  }
+
+  /// A-623 (golden). Do: build the revision-property hooks for the recording's three changes: `svn:log` modified, a
+  /// custom property deleted, another added. Expect: each the recorded run byte for byte: pre-revprop-change with the
+  /// new value on standard input (nothing for the deletion), post-revprop-change with the old one (nothing for the
+  /// addition).
+  #[test]
+  fn subversions_revision_property_hooks_get_what_svnserve_gave_them() {
+    let env = recorded_hooks_env();
+    let view = CommittedView(1);
+    let change = |revision, property, action| RevpropChange {
+      repository: RECORDED_REPOSITORY,
+      revision,
+      author: "jrandom",
+      property,
+      action,
+    };
+    let edited = change(2, "svn:log", RevpropAction::Modified);
+    let old_log = "Edit the README; add util.c and a binary.".as_bytes();
+    assert_recorded(
+      &svn_pre_revprop_change(view, &env, edited, b"Edited log message."),
+      &recorded!("032-pre-revprop-change"),
+    );
+    assert_recorded(
+      &svn_post_revprop_change(view, &env, edited, old_log),
+      &recorded!("033-post-revprop-change"),
+    );
+    let deleted = change(2, "custom", RevpropAction::Deleted);
+    assert_recorded(
+      &svn_pre_revprop_change(view, &env, deleted, b""),
+      &recorded!("034-pre-revprop-change"),
+    );
+    assert_recorded(
+      &svn_post_revprop_change(view, &env, deleted, b"value"),
+      &recorded!("035-post-revprop-change"),
+    );
+    let added = change(1, "slates:note", RevpropAction::Added);
+    assert_recorded(
+      &svn_pre_revprop_change(view, &env, added, b"added later"),
+      &recorded!("036-pre-revprop-change"),
+    );
+    assert_recorded(
+      &svn_post_revprop_change(view, &env, added, b""),
+      &recorded!("037-post-revprop-change"),
+    );
+  }
+
+  /// A-623 (`run_hook_cmd`: a hook's own section, else the default section, else nothing). Do: ask a hooks-env with a
+  /// default section and a pre-commit section, one variable set twice, for pre-commit, post-commit and pre-lock; ask an
+  /// empty one. Expect: pre-commit gets its own section alone, the others the default section with the variable's last
+  /// value, and without a file every hook an empty environment.
+  #[test]
+  fn a_hooks_own_section_replaces_the_default_one() {
+    let bytes = |text: &str| EnvValue::Bytes(text.as_bytes().to_vec());
+    let env = SvnHooksEnv::new(vec![
+      (
+        "default".to_owned(),
+        vec![
+          ("LANG".to_owned(), b"C".to_vec()),
+          ("PATH".to_owned(), b"/usr/bin".to_vec()),
+          ("LANG".to_owned(), b"en_US.UTF-8".to_vec()),
+        ],
+      ),
+      (
+        "pre-commit".to_owned(),
+        vec![("ONLY".to_owned(), b"pre-commit".to_vec())],
+      ),
+    ]);
+    assert_eq!(
+      env.for_point(HookPoint::SvnPreCommit),
+      vec![("ONLY".to_owned(), bytes("pre-commit"))]
+    );
+    let default = vec![
+      ("LANG".to_owned(), bytes("en_US.UTF-8")),
+      ("PATH".to_owned(), bytes("/usr/bin")),
+    ];
+    assert_eq!(env.for_point(HookPoint::SvnPostCommit), default);
+    assert_eq!(env.for_point(HookPoint::SvnPreLock), default);
+    assert!(
+      SvnHooksEnv::default()
+        .for_point(HookPoint::SvnStartCommit)
+        .is_empty()
     );
   }
 
