@@ -321,7 +321,7 @@ fn prop(element: &str, name: &str, value: &[u8]) -> String {
 }
 
 /// A delta's svndiff bytes in base64 with no line breaks, as the base64 output stream writes them.
-fn delta(windows: &[Window], version: Version) -> Result<String, DavRefusal> {
+pub(crate) fn delta(windows: &[Window], version: Version) -> Result<String, DavRefusal> {
   let mut encoder = Encoder::new(version);
   let mut bytes = encoder.header().to_vec();
   for window in windows {

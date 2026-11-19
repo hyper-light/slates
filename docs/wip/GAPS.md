@@ -415,31 +415,32 @@
 > the Mac Studio (see A-609). Owed from it: the update-report and replay editor drives, PROPPATCH, LOCK and UNLOCK,
 > `list-report` and `file-revs-report`, and main's live capture against `mod_dav_svn`. A-627 (2026-11-19, g250):
 > `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token`
-> read; owed: the update-report and replay drives and LOCK's answer. A-531 (2026-11-19): the ra_svn item codec, its
-> bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
-> (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
-> identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its
-> oracle a naive filesystem applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p
-> slates-svn --lib` on the Mac Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with
-> the object store, §4.17.1 shared piece 3), and a large revision applied in slices (with the server). A-605
-> (2026-11-19, g262, UI goal 92): mergeinfo, piece 9: the `svn:mergeinfo` value read and written as Subversion reads and
-> writes it, every refusal typed by its message; the range-list algebra transcribed from `mergeinfo.c`, Subversion's
-> inexact walk with inheritance compared kept as it is; inheritance and elision; and `get-mergeinfo` over the index, its
-> descendants found by the counts; held to `mergeinfo-test.c`'s vectors, the per-revision model and a naive filesystem
-> on generated histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio (see A-605). Owed
-> from it: `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra with piece 7's
-> location segments and log; the property's UTF-8 and CR checks with piece 7's property validation. A-613 (2026-11-19,
-> g262, UI goal 93), its first part: the ra_svn read commands' sans-io handler, `get-latest-rev`, `get-dated-rev`,
-> `rev-proplist`, `rev-prop`, `check-path`, `stat`, `get-mergeinfo` and `get-iprops`, held to transcripts of stock
-> `svnserve` 1.15.0 (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn --lib reads` on the Mac
-> Studio, red-checked six ways (see A-613). Owed from it: the other read commands, then `svn mergeinfo --show-revs`, and
-> read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
-> machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
-> a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
-> greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's
-> `hmac` and `md-5`, approved for this mechanism alone); `cargo test --locked -p slates-svn --lib` 139 of 139 on the Mac
-> Studio over main (575188f7f), the handshake's 28, red first on the earlier draft (see A-599). Owed from it: (1) the
-> URL's canonical form, the repository it names and the root URL `repos-info` carries, as `svnserve` derives them
+> read; the update-report drive written as `update.c` writes it in send-all mode (A-627, continued); owed: the replay
+> drive, LOCK's answer, and LOCK and UNLOCK onto the A-602 guards. A-531 (2026-11-19): the ra_svn item codec, its bounds
+> the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see
+> A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root identities,
+> predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive
+> filesystem applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on
+> the Mac Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store,
+> §4.17.1 shared piece 3), and a large revision applied in slices (with the server). A-605 (2026-11-19, g262, UI goal
+> 92): mergeinfo, piece 9: the `svn:mergeinfo` value read and written as Subversion reads and writes it, every refusal
+> typed by its message; the range-list algebra transcribed from `mergeinfo.c`, Subversion's inexact walk with
+> inheritance compared kept as it is; inheritance and elision; and `get-mergeinfo` over the index, its descendants found
+> by the counts; held to `mergeinfo-test.c`'s vectors, the per-revision model and a naive filesystem on generated
+> histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio (see A-605). Owed from it: `svn
+> mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra with piece 7's location segments and
+> log; the property's UTF-8 and CR checks with piece 7's property validation. A-613 (2026-11-19, g262, UI goal 93), its
+> first part: the ra_svn read commands' sans-io handler, `get-latest-rev`, `get-dated-rev`, `rev-proplist`, `rev-prop`,
+> `check-path`, `stat`, `get-mergeinfo` and `get-iprops`, held to transcripts of stock `svnserve` 1.15.0
+> (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn --lib reads` on the Mac Studio, red-checked
+> six ways (see A-613). Owed from it: the other read commands, then `svn mergeinfo --show-revs`, and read access by
+> A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state machine that does
+> no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by a relay
+> (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the greeting's
+> `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's `hmac` and
+> `md-5`, approved for this mechanism alone); `cargo test --locked -p slates-svn --lib` 139 of 139 on the Mac Studio
+> over main (575188f7f), the handshake's 28, red first on the earlier draft (see A-599). Owed from it: (1) the URL's
+> canonical form, the repository it names and the root URL `repos-info` carries, as `svnserve` derives them
 > (`svn_uri_canonicalize_safe`; `find_repos`' `skip_scheme_part`, `repos_path_valid` and `svn_path_remove_components`),
 > with piece 7's connection task, which today gives the handshake those values; (2) a limit on failed attempts per
 > principal and per address, learned (`svnserve`'s loop has none, and neither has the handshake), with §4.13's
