@@ -174,9 +174,10 @@ mod hook_driver;
 // by their hash, on the partition each id routes to; the enroll and revoke verbs the issuer proves, and the lookup the
 // HTTP and SSH edges authenticate through. Public for the issuer's proofs, the token's text and the key line's reading.
 pub mod credentials;
-// The version-control servers' HTTP edge on the runtime's TCP (A-625 part 2): the listener, one connection a task, each
-// phase's wait learned, the bounds derived from the shard's budget, and git's site. No caller outside tests until the
-// daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
+// The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
+// each phase's wait learned, the bounds derived from the shard's budget, git's site, a connection moved to its
+// repository's shard, and the daemon's start. Upload-pack's store lender has no caller outside tests until each
+// repository's store lives on its owner shard (A-662).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
