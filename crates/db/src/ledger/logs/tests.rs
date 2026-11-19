@@ -523,6 +523,82 @@ fn a_takeover_that_cannot_read_every_log_adopts_none_and_the_logs_it_read_stay_f
   );
 }
 
+/// A-636 part 2a (a holder's join under a takeover refused part way; found by the model test's first green run, a holder
+/// that applied part of a record): do commit a record over green A and the names log; take the repository over with
+/// only A's holders in reach, so A's round fences A and B's refuses the takeover before the names log is asked; offer
+/// every log again as the first owner with every host back; then take the repository over with every host in reach and
+/// offer every log again as the new owner. Expect, after the first owner's offer, every holder's applied cut whole, no
+/// holder of both logs having applied the record's names position without its A position (A's holders refuse the first
+/// owner, the names log's do not); and, after the second takeover's offer, every holder of either log having applied
+/// the record.
+#[test]
+fn a_holder_fenced_on_one_log_of_a_record_applies_none_of_it_until_it_holds_the_rest() {
+  let mut world = Apart::new();
+  let (a, names) = (world.a, world.names);
+  let mut first = LogsOwner::bootstrap(&world.cohort);
+  let whole = first
+    .append(
+      &mut world.cohort,
+      record(1, &[(a, 0, 1), (names, 0, 1)]),
+      &Reach::All,
+    )
+    .unwrap()
+    .whole;
+  assert!(whole, "committed whole");
+  let successor = world.co_holders(&a).first().copied().unwrap();
+  let reach = world.only(&a);
+  let refused = LogsOwner::take_over(&mut world.cohort, successor, &reach);
+  assert_eq!(
+    refused.map(|_| ()).unwrap_err().fenced,
+    vec![a],
+    "A fenced alone"
+  );
+  first.announce(&mut world.cohort, &Reach::All);
+  assert_eq!(
+    split_holders(&world),
+    Vec::new(),
+    "no holder applied part of the record"
+  );
+  assert_eq!(
+    applied_beside(&world, names, a),
+    Vec::new(),
+    "a holder of both logs waits on the names log for A"
+  );
+  let mut taken = LogsOwner::take_over(&mut world.cohort, successor, &Reach::All).unwrap();
+  taken.owner.announce(&mut world.cohort, &Reach::All);
+  assert_eq!(split_holders(&world), Vec::new(), "still whole");
+  assert_applied_by_every_holder(&world, a, 1);
+  assert_applied_by_every_holder(&world, names, 1);
+}
+
+/// The holders of both `log` and `other` that applied some position of `log`.
+fn applied_beside(world: &Apart, log: LogName, other: LogName) -> Vec<HostId> {
+  let both = world.holders(&other);
+  world
+    .holders(&log)
+    .into_iter()
+    .filter(|host| both.contains(host))
+    .filter(|host| {
+      world
+        .cohort
+        .applied(*host)
+        .get(&log)
+        .is_some_and(|at| *at > 0)
+    })
+    .collect()
+}
+
+/// The hosts whose applied cut a replica's read refuses: one holding part of a record and not the rest.
+fn split_holders(world: &Apart) -> Vec<HostId> {
+  hosts(1)
+    .into_iter()
+    .filter(|host| {
+      let applied = world.cohort.applied(*host);
+      world.cohort.read(*host, &applied).is_err()
+    })
+    .collect()
+}
+
 /// A-636 part 2a (each log is its own register; the state logs' class): do place a repository's three greens and its
 /// four state logs at `f = 1`. Expect seven distinct registers: each green's log the green's own register; each state
 /// log the repository's register of the log's class, the four on the repository's candidates; and the greens spread

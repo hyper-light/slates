@@ -49022,3 +49022,68 @@ the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` sha
   `crates/client/src/client.rs`; the submit sites of `crates/server/tests/{daemon,fleet,verdict_pages,works_off_owner}.rs`,
   `crates/client/tests/edit_and_submit.rs`, `crates/client/examples/load_bench.rs`; §4.17.1 "A push is a work"'s
   status; GAPS' §4.17 entry.
+
+### A-636 part 2a — The state logs' register class, and each log's promise on the wire a log at a time: a repository's state moves as one, and a takeover reads every log or adopts none (2026-11-19, g261, UI goal 93; §4.17.1 shared piece 2, the fleet half's live plane; §4.8 "Data model" and "Promotion and takeover"; AUD-29-17; after A-636 part 1 and A-642)
+
+- **Why.** A-636 part 1 built the fleet half's protocol over object ids its caller named, with holders read in memory
+  and a takeover that asked every log's round before fencing any. The live plane needs every log of a repository to be a
+  register the fleet places and takes over (a green's log is the green's own register; the four state logs had none),
+  each log's holders answering a takeover on the wire, and a takeover rule a live round can keep. This is the first of
+  part 2's three pieces (g306's split): (2a) this; (2b) the partition's records shipped to each log's holders a log at a
+  time; (2c) the server's takeover by this rule.
+- **The register class** (`crates/db/src/register.rs`: `RegisterClass`, `ObjectId::class`, `ObjectId::in_class`;
+  `crates/db/src/catalog.rs`: `LogName::register`). An object's registers are its own (a volume's head and chain, a
+  green's log of versions), its catalog (AUD-29-17) and, for a repository, its four state logs (its names, Mercurial's
+  phase roots and markers, Git LFS's locks). The class is in the counter's top byte (byte 10 of the id): the catalog
+  keeps the top bit alone, as AUD-29-17 laid it; a state log sets the second bit, and the top and third bits name which
+  (names 0x40, phases 0x60, markers 0xC0, locks 0xE0). `placement_key` clears the class: the top bit alone while the
+  second is clear, so every id with the second bit clear keeps its class, its placement and its catalog's round trip
+  exactly (`the_catalog_class_is_as_it_was_for_every_id_it_named_before`, over all 128 such values of the byte); all
+  three bits otherwise. A state log's register is its repository's id in the log's class: it is placed on the
+  repository's candidates and taken over by the repository's successor, as a volume's catalog is by its volume's.
+  - Why the repository's placement and not each state log's own: a takeover hands the repository's state to one writer
+    (§4.17.1: a repository lives on one owner shard), so all four must name one successor; and a record over several
+    state logs then needs one copyset's quorum, not several. The greens' logs keep their own ids, so pushes to different
+    greens still land on different copysets (A-642).
+  - The cost: three class bits in place of one, so a partition mints at most 2^45 − 1 ids (`MAX_OBJECT_COUNTER`, 2^47 −
+    1 before; about 35 trillion, eleven years of minting at a hundred thousand log entries a second on one partition).
+    Three bits is the least that holds six classes (own, catalog, four state logs). An id minted under the cap carries
+    no class bit, so each of its registers leads back to it; one minted past it does not (tested), which is why the
+    minter refuses past it (`slates_server::verbs::fresh_volume_id`, unchanged but for the cap it reads).
+- **Each log's promise on the wire** (`crates/db/src/ledger.rs`). A holder answers a takeover's phase one as a live
+  holder does: its fence raised to the round's epoch, then its whole log in a `LedgerPromise` naming its register, as
+  bytes (`Cohort::promise`; a refusal is the empty reply `slates_cluster::serve_ledger_promotion` gives). The successor
+  counts a reply toward one register's round only when it decodes, names the host it came from, binds the round's
+  prepare (register, epoch, generation) and comes from a candidate not counted before (`PhaseOne::hear`, answering
+  `Heard::{Counted, Malformed, Forged, Unbound, NotCandidate, Twice}`), and adopts at `f + 1` by `ledger::adopt`, the
+  cluster plane's rule. The state logs share holders, so a holder answers each state log's round with that log alone,
+  and the class is what keeps one log's promise from counting in another's round (tested: a phases promise offered to
+  the names round is `Unbound`). `Owner::take_over` runs through these, so the ledger's own tests and models run the
+  codec and the counting.
+- **A takeover a log at a time** (`crates/db/src/ledger/logs.rs`, `LogsOwner::take_over`). Part 1 asked every log's
+  round first and fenced none unless all could run. A live round cannot do that: a holder raises its fence as it
+  promises, and no message lowers it. So the takeover now runs each log's round in turn and adopts the repository only
+  once every log's round has read `f + 1`; a log whose round cannot run refuses it with nothing adopted, naming the logs
+  fenced before it (`LogsTakeoverRefused::fenced`), which stay fenced. That is safe: a fence only stops the superseded
+  owner on those logs (StaleNeverCommits, a log at a time), and a later takeover's epochs are above it. The model test
+  now meets such refusals and holds each to the rule (the logs it names fenced are exactly those before the log it
+  stopped at). `Cohort::can_take_over` is gone with the rule it served.
+- **Tests** (macOS arm64, Mac Studio, kiln, debug, `CARGO_BUILD_JOBS=2`).
+  - Red first, r27 at 5b362ef20 (`agents/g261-a636p2a-red`: the tests with the change stubbed, the encoding and cap
+    before it, a round that counts nothing, part 1's ask-first takeover), `cargo test --locked -p slates-db --lib --
+    register::class_tests ledger::`: 6 failed, 11 passed. Failed, each on its rule: the state logs placed apart from
+    their repository (12 registers); registers misnamed; every log off its register's home (the four state logs); the
+    state logs' holders apart in the wire test; the refused takeover naming no log fenced; and the model test, on the
+    two-step history `Partition { mask: 12521 }, TakeOver { host: 0 }` at `f = 1` ("fenced, wrongly"). Passed: part 1's
+    eleven unchanged tests but one replaced, and the catalog guard, as a guard does before and after.
+  - Green: EVIDENCE-PENDING.
+- **Owed.** (2b) the partition's records shipped to each log's holders a log at a time (the state logs have registers
+  now; nothing ships to them yet); (2c) the server's takeover adopting a repository's logs by this rule. Found while
+  building this, for 2c: a repository's greens still each follow their own id's successor
+  (`RegionalConfiguration::successor` ranks by the object's own placement key), so a takeover can hand one repository's
+  greens to different hosts while its state logs go to the repository's successor; one writer needs every log of a
+  repository to follow one successor (one route: a green that joins a repository moved onto its line by the
+  configuration, D-14's home change). Main's gates (clippy, xtask, the doc build, other platforms) and the db and server
+  suites whole.
+- **Applied in the same change to:** §4.8's catalog-class status (the state logs' class); §4.17.1's status and shared
+  piece 2; GAPS (A-642's headline, the §4.17 entry); `crates/db/src/register/class_tests.rs` (new); this entry.

@@ -298,13 +298,24 @@ impl LogsCohort {
   }
 
   /// `host`, which acknowledged the owner's whole log of every log in `held`, applies the owner's committed `cut` over
-  /// them. The cut holds every record whole, so every log of a record the host holds reaches the record in this one
-  /// step: its join. What it applied before stays applied, since committed positions never change.
+  /// them: its join. The cut holds every record whole, so every log of a record the host acknowledged reaches the
+  /// record in this one step. A log the host holds and did not acknowledge this time (a takeover refused part way
+  /// fenced it there, A-636 part 2a) stays where the host left it, so the cut is first lowered to what that leaves
+  /// whole: a record that also moves such a log waits for it, and the host never applies part of a record. What it
+  /// applied before stays applied, since committed positions never change.
   fn apply(&mut self, host: HostId, held: &BTreeSet<LogName>, cut: &Cut) {
+    let mut limits = cut.clone();
+    for (name, log) in &self.logs {
+      if log.candidates().contains(&host) && !held.contains(name) {
+        limits.insert(*name, self.applied_at(host, name));
+      }
+    }
+    let identity_at = |name: &LogName, position: usize| self.logs.get(name)?.committed_at(position);
+    let joined = whole_cut(limits, &identity_at, &self.records);
     let applied = self.applied.entry(host).or_default();
     for name in held {
       let at = applied.entry(*name).or_insert(0);
-      *at = (*at).max(cut.get(name).copied().unwrap_or(0));
+      *at = (*at).max(joined.get(name).copied().unwrap_or(0));
     }
   }
 }
