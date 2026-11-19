@@ -1,7 +1,7 @@
 //! A `sparse:oid` filter's blob, resolved and read by the service (A-640 part 4; git v2.50.1's `list-objects-filter.c`
-//! `filter_sparse_oid__init`, `object-file.c` `read_object_with_reference` and `dir.c` `add_patterns_from_blob_to_list`,
-//! the name resolved by the `revision` module; held to stock git's own answers in `fixtures/fetch-sparse-*` and
-//! `fixtures/v0/sparse-*`).
+//! `filter_sparse_oid__init`, `object-file.c` `read_object_with_reference` and `dir.c`
+//! `add_patterns_from_blob_to_list`, the name resolved by the `revision` module; held to stock git's own answers in
+//! `fixtures/fetch-sparse-*` and `fixtures/v0/sparse-*`).
 //!
 //! **What names the blob**: `<blob-ish>` read as `get_oid_with_context` reads it in a repository with no work tree,
 //! which a served one is (the `revision` module): an object's full or abbreviated name, `git describe`'s, or a ref by
@@ -24,6 +24,7 @@
 //! patterns in the round that sends the pack, so a blob past the request's admission is refused in a round git answers
 //! with acknowledgments alone (the fetch fails either way; protocol v0 reads it only when the pack is due, as git).
 
+use super::answer::Said;
 use super::revision::{Named, Resolver};
 use super::{Refusal, Served};
 use crate::Admission;
@@ -40,8 +41,8 @@ pub(super) struct Read {
   pub(super) patterns: Option<Patterns>,
   /// Why `pack-objects` dies, when it does.
   pub(super) dies: Option<Refusal>,
-  /// What git wrote to its error stream while it read the filter's name, a write each, in order.
-  pub(super) said: Vec<Vec<u8>>,
+  /// What git wrote to its error stream while it read the filter's name, as its server reads it.
+  pub(super) said: Said,
 }
 
 /// What `filter` brings when it is `sparse:oid` alone (a combination holding one the negotiation refuses): its blob
@@ -60,18 +61,21 @@ pub(super) fn read(
   let named = resolver
     .blob_ish(name, admission)
     .map_err(Refusal::PastAdmission)?;
-  let said = resolver.said();
+  let mut said = resolver.said();
   let refusal = match named {
-    Named::Object(id) => match patterns_of(graph, id, admission)? {
-      Ok(patterns) => {
-        return Ok(Read {
-          patterns: Some(patterns),
-          dies: None,
-          said,
-        });
+    Named::Object(id) => {
+      said.read();
+      match patterns_of(graph, id, admission)? {
+        Ok(patterns) => {
+          return Ok(Read {
+            patterns: Some(patterns),
+            dies: None,
+            said,
+          });
+        }
+        Err(refusal) => refusal,
       }
-      Err(refusal) => refusal,
-    },
+    }
     Named::Nothing => Refusal::SparseBlob { name: name.clone() },
     Named::Form => Refusal::SparseForm { name: name.clone() },
     Named::Relative => Refusal::SparseRelative,

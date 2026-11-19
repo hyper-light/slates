@@ -187,22 +187,23 @@ impl<K> Answer<K> {
   /// the filter's name; `Refusal::warning`'s line; then `refusal`'s words as its `fatal:` line) as git's server relays
   /// it ([`relay`]), then git's band-3 words, and no flush, as none follows git's. With no band, `head` alone: git's
   /// server writes those lines to its own error stream, and the client finds the pack missing. The packets are charged
-  /// to `admission` first.
+  /// to `admission` first. The `fatal:` line joins `said`'s last run when git read nothing since, as it dies at once
+  /// of a name that names nothing after it listed an abbreviation's candidates.
   pub(super) fn died(
     mut head: Vec<u8>,
-    said: &[Vec<u8>],
+    mut said: Said,
     refusal: Refusal,
     banded: bool,
     admission: &mut Admission,
   ) -> Result<Answer<K>, Refusal> {
     if banded {
-      let dying: Vec<Vec<u8>> = refusal
-        .warning()
-        .map(|words| reported(WARNING, &words))
-        .into_iter()
-        .chain([reported(FATAL, &refusal.words())])
-        .collect();
-      relay(said.iter().chain(&dying), &mut head, admission)?;
+      if let Some(words) = refusal.warning() {
+        said.write(&reported(WARNING, &words));
+        // git frees the blob it read, past its limit, before it dies.
+        said.read();
+      }
+      said.write(&reported(FATAL, &refusal.words()));
+      relay(&said, &mut head, admission)?;
       admission
         .charge(sideband::written_len(to_u64(ABORT.len())))
         .map_err(Refusal::PastAdmission)?;
@@ -399,24 +400,55 @@ impl<K> Streaming<K> {
   }
 }
 
-/// Each read git's server makes of the writes `writes` of `pack-objects`' error stream (`create_pack_file`): at most
-/// `RELAYED` bytes, each write read alone, as git reads each one the dying or warning process makes before its next.
-pub(super) fn reads<'w>(writes: impl Iterator<Item = &'w Vec<u8>>) -> impl Iterator<Item = &'w [u8]> {
-  writes.flat_map(|write| write.chunks(RELAYED))
+/// What git's `pack-objects` writes to its error stream before its pack or its death, kept as git's server reads it
+/// (A-640 part 4; `create_pack_file` reads at most `RELAYED` bytes a read): writes made one after another reach the
+/// pipe together, so a read takes as much of them as it holds; git reading an object between two writes lets its
+/// server read the first before the second comes, so no read spans two runs of writes. Stock git's own recordings show
+/// both (`fixtures/fetch-sparse-*`): a refname warning and its advice read together; an abbreviation's `error:` line
+/// read alone before git reads the candidates it lists, then its advice and the `fatal:` line together; a refname
+/// warning before git reads the object it names, and the `fatal:` line after it, read apart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Said {
+  /// The runs of writes made with no object read between them, each whole, in order.
+  runs: Vec<Vec<u8>>,
+  /// Whether git read an object since the last write, so the next write begins a run.
+  read_since: bool,
 }
 
-/// Puts `writes`, writes `pack-objects` makes to its error stream, after `out` on band 2 as git's server relays them: a
-/// packet each read ([`reads`]); the packets charged to `admission` first.
-pub(super) fn relay<'w>(
-  writes: impl Iterator<Item = &'w Vec<u8>> + Clone,
+impl Said {
+  /// Adds a write: to the last run, unless git read an object since it.
+  pub(super) fn write(&mut self, bytes: &[u8]) {
+    match self.runs.last_mut() {
+      Some(run) if !self.read_since => run.extend_from_slice(bytes),
+      _ => self.runs.push(bytes.to_vec()),
+    }
+    self.read_since = false;
+  }
+
+  /// Marks that git reads an object, or frees one, before its next write.
+  pub(super) fn read(&mut self) {
+    self.read_since = true;
+  }
+
+  /// Each read git's server makes of the writes: at most `RELAYED` bytes, never across two runs.
+  pub(super) fn reads(&self) -> impl Iterator<Item = &[u8]> {
+    self.runs.iter().flat_map(|run| run.chunks(RELAYED))
+  }
+}
+
+/// Puts what `said` holds after `out` on band 2 as git's server relays it: a packet each read ([`Said::reads`]); the
+/// packets charged to `admission` first.
+pub(super) fn relay(
+  said: &Said,
   out: &mut Vec<u8>,
   admission: &mut Admission,
 ) -> Result<(), Refusal> {
-  let len = reads(writes.clone())
+  let len = said
+    .reads()
     .map(|read| sideband::written_len(to_u64(read.len())))
     .fold(0, u64::saturating_add);
   admission.charge(len).map_err(Refusal::PastAdmission)?;
-  for read in reads(writes) {
+  for read in said.reads() {
     sideband::write(Band::Progress, read, out);
   }
   Ok(())

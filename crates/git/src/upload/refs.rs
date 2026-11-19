@@ -14,9 +14,9 @@
 //! **Names a `fetch` gives.** A `want-ref` is a ref's full name, `HEAD` read through to the default branch
 //! (`refs_read_ref`). A `deepen-not` is tried, as `expand_ref` tries it, as each of git's patterns (the name itself, then
 //! under `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, and `refs/remotes/<name>/HEAD`), and must name exactly
-//! one ref. A `sparse:oid` filter's revision is the first ref those patterns find, as `repo_dwim_ref` takes it, with how
-//! many find one, which git warns of past one (A-640 part 4). A ref whose green has no version names nothing, as no git
-//! ref does.
+//! one ref. A `sparse:oid` filter's revision is the first ref those patterns find, as `repo_dwim_ref` takes it, with
+//! how many find one, which git warns of past one (A-640 part 4). A ref whose green has no version names nothing, as no
+//! git ref does.
 
 use core::cmp::Ordering;
 

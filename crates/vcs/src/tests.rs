@@ -611,9 +611,23 @@ fn rows_from_a_start_inside_a_run_of_many_tables_are_read_from_there_on() {
   for key in [1u8, 31, 99] {
     insert_plain(&mut index, &mut store, key);
   }
-  let every: Vec<u8> = (0..80u8).step_by(2).chain([1, 31, 99]).collect::<BTreeSet<u8>>().into_iter().collect();
-  let not_before = |start: u8| every.iter().copied().filter(|key| *key >= start).collect::<Vec<u8>>();
-  assert_eq!(index.run_tables().iter().map(Vec::len).collect::<Vec<_>>(), vec![7]);
+  let every: Vec<u8> = (0..80u8)
+    .step_by(2)
+    .chain([1, 31, 99])
+    .collect::<BTreeSet<u8>>()
+    .into_iter()
+    .collect();
+  let not_before = |start: u8| {
+    every
+      .iter()
+      .copied()
+      .filter(|key| *key >= start)
+      .collect::<Vec<u8>>()
+  };
+  assert_eq!(
+    index.run_tables().iter().map(Vec::len).collect::<Vec<_>>(),
+    vec![7]
+  );
   assert_eq!(
     [&[][..], &[26], &[27], &[100]].map(|start| keys_from(&index, &store, start)),
     [every.clone(), not_before(26), not_before(27), Vec::new()]

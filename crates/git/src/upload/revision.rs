@@ -31,15 +31,16 @@
 //! trees and blobs, each kind in name order; each by its shortest unique abbreviation (`StoreGraph::unique_digits`)
 //! and what it is: a commit's author date in the author's own zone and its subject (its first paragraph's lines,
 //! each without its trailing white space, joined by spaces, blank lines before it skipped), a tag's tagger date in UTC
-//! and its name, a tree or a blob. A `warning:` or `error:` line is formatted as `vfreportf` formats one, the advice of
-//! refs named like an object is one print, and each advice line is one print; git's server relays each write alone
-//! (the `answer` module). Each is charged to the request's admission as it is made.
+//! and its name, a tree or a blob. A `warning:` or `error:` line is formatted as `vfreportf` formats one; the advice of
+//! refs named like an object, and each advice line, is one print. Each is charged to the request's admission as it is
+//! made, and kept as git's server reads it (`answer::Said`): git reads the candidates between the `error:` line and its
+//! advice, and the object a name names, or a tree on a path, after the name.
 //!
 //! **Not git's.** git takes a commit's subject from its message re-encoded to UTF-8 by its `encoding` header; this
 //! server takes the bytes as they are. git dies of a date before 1970 in its own zone, and writes a year past 9999 in
 //! more digits; this server writes the first in the proleptic calendar and the second as the epoch's date.
 
-use super::answer::{ERROR, WARNING, reported};
+use super::answer::{ERROR, Said, WARNING, reported};
 use super::{Served, refs};
 use crate::lfs::Timestamp;
 use crate::negotiation::Graph;
@@ -116,14 +117,22 @@ const CANDIDATES: &[u8] = b"The candidates are:";
 /// Format: what begins each candidate's line within the advice (`show_ambiguous_object`: "  %s\n").
 const CANDIDATE_INDENT: &[u8] = b"  ";
 
-/// Format: what git writes of a candidate after its abbreviation, by kind (`show_ambiguous_object`): a commit's and a
-/// tag's words before their date, the words between a date and a subject or a tag's name, a tree's and a blob's words,
-/// and a tag git cannot parse.
+/// Format: what git writes of a commit after its abbreviation, before its date (`show_ambiguous_object`).
 const COMMIT_WORDS: &[u8] = b" commit ";
+
+/// Format: what git writes of a tag after its abbreviation, before its date.
 const TAG_WORDS: &[u8] = b" tag ";
+
+/// Format: what git writes between a commit's or a tag's date and its subject or name.
 const DATE_DASH: &[u8] = b" - ";
+
+/// Format: what git writes of a tree after its abbreviation.
 const TREE_WORDS: &[u8] = b" tree";
+
+/// Format: what git writes of a blob after its abbreviation.
 const BLOB_WORDS: &[u8] = b" blob";
+
+/// Format: what git writes of a tag it cannot parse after its abbreviation.
 const BAD_TAG_WORDS: &[u8] = b" [bad tag, could not parse it]";
 
 /// Format: the order git lists candidates' kinds in (`sort_ambiguous`: `type % 4`, tags first).
@@ -173,8 +182,6 @@ pub(super) enum Named {
 /// What an abbreviated name's lookup is for (`get_short_oid`'s disambiguation hint).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hint {
-  /// Anything: no hint (`GET_OID_QUIETLY` alone, `core.disambiguate` unset).
-  Anything,
   /// A blob (`GET_OID_BLOB`: the filter's own name).
   Blob,
   /// A tree, a commit, or a tag that peels to either (`GET_OID_TREEISH`: the revision before a path).
@@ -206,8 +213,8 @@ enum Short {
   },
 }
 
-/// An abbreviated name's objects, counted as `update_candidates` counts them: how many its digits begin and the first,
-/// and how many of those the hint takes and the first; each count stops mattering past two.
+/// An abbreviated name's objects, counted as `update_candidates` counts them with a hint: how many its digits begin and
+/// the first, and how many of those the hint takes and the first; each count stops mattering past two.
 #[derive(Clone, Copy, Debug, Default)]
 struct Tally {
   /// The objects whose names begin with the digits.
@@ -221,22 +228,19 @@ struct Tally {
 }
 
 impl Tally {
-  /// Whether more objects could change the decision: not once two match and two are taken (or there is no hint).
-  fn settled(&self, hint: Hint) -> bool {
-    self.matched > 1 && (hint == Hint::Anything || self.taken > 1)
+  /// Whether more objects could change the decision: not once two match and two are taken.
+  fn settled(&self) -> bool {
+    self.matched > 1 && self.taken > 1
   }
 
   /// git's decision (`update_candidates`, `finish_object_disambiguation`): none; one, whatever it is, unchecked; of
   /// several, the one the hint takes when exactly one does, and otherwise ambiguous.
-  fn decided(&self, hint: Hint) -> Short {
+  fn decided(&self) -> Short {
     let Some(first) = self.first else {
       return Short::Missing;
     };
     if self.matched == 1 {
       return Short::Found(first);
-    }
-    if hint == Hint::Anything {
-      return Short::Ambiguous { all: true };
     }
     match (self.taken, self.first_taken) {
       (1, Some(taken)) => Short::Found(taken),
@@ -255,8 +259,8 @@ pub(super) struct Resolver<'a, 'g> {
   graph: &'a StoreGraph<'g>,
   /// The repository and its refs.
   served: &'a Served<'g>,
-  /// What git wrote, a write each, in order.
-  said: Vec<Vec<u8>>,
+  /// What git wrote, as its server reads it.
+  said: Said,
 }
 
 impl<'a, 'g> Resolver<'a, 'g> {
@@ -265,12 +269,12 @@ impl<'a, 'g> Resolver<'a, 'g> {
     Resolver {
       graph,
       served,
-      said: Vec::new(),
+      said: Said::default(),
     }
   }
 
-  /// What git wrote to its error stream while it read, a write each, in order.
-  pub(super) fn said(self) -> Vec<Vec<u8>> {
+  /// What git wrote to its error stream while it read, as its server reads it.
+  pub(super) fn said(self) -> Said {
     self.said
   }
 
@@ -296,6 +300,7 @@ impl<'a, 'g> Resolver<'a, 'g> {
     if is_relative(path) {
       return Ok(Named::Relative);
     }
+    self.said.read();
     Ok(
       tree_of(self.graph, &id)
         .and_then(|tree| walked(self.graph, tree, path))
@@ -389,7 +394,7 @@ impl<'a, 'g> Resolver<'a, 'g> {
     let Some(abbrev) = Abbrev::parse(digits) else {
       return Ok(None);
     };
-    match self.tally(&abbrev, hint).decided(hint) {
+    match self.tally(&abbrev, hint).decided() {
       Short::Missing => Ok(None),
       Short::Found(id) => Ok(Some(id)),
       Short::Ambiguous { all } => {
@@ -411,7 +416,7 @@ impl<'a, 'g> Resolver<'a, 'g> {
         tally.taken = tally.taken.saturating_add(1);
         tally.first_taken.get_or_insert(id);
       }
-      if tally.settled(hint) {
+      if tally.settled() {
         break;
       }
     }
@@ -422,7 +427,6 @@ impl<'a, 'g> Resolver<'a, 'g> {
   /// every tag it names in turn for a tree's hint.
   fn takes(&self, hint: Hint, node: u64, kind: Kind) -> bool {
     match hint {
-      Hint::Anything => true,
       Hint::Blob => kind == Kind::Blob,
       Hint::Commit => kind == Kind::Commit,
       Hint::Treeish => {
@@ -447,6 +451,7 @@ impl<'a, 'g> Resolver<'a, 'g> {
   ) -> Result<(), PastAdmission> {
     let words = [AMBIGUOUS_SHORT[0], &abbrev.hex(), AMBIGUOUS_SHORT[1]].concat();
     self.say(reported(ERROR, &words), admission)?;
+    self.said.read();
     let mut candidates: Vec<Candidate> = Vec::new();
     for (id, node, kind) in self.graph.abbreviated(abbrev) {
       if all || self.takes(hint, node, kind) {
@@ -544,8 +549,7 @@ impl<'a, 'g> Resolver<'a, 'g> {
   /// Keeps `write`, one write git makes to its error stream, charged to `admission` first.
   fn say(&mut self, write: Vec<u8>, admission: &mut Admission) -> Result<(), PastAdmission> {
     admission.charge(to_u64(write.len()))?;
-    admission.charge_items::<Vec<u8>>(1)?;
-    self.said.push(write);
+    self.said.write(&write);
     Ok(())
   }
 }
@@ -625,7 +629,10 @@ fn zone_seconds(zone: &[u8]) -> i64 {
 /// lines of its first paragraph, read as a C string to its first NUL, each without its trailing white space, joined by
 /// single spaces.
 fn subject(message: &[u8]) -> Vec<u8> {
-  let text = message.split(|byte| *byte == NUL).next().unwrap_or_default();
+  let text = message
+    .split(|byte| *byte == NUL)
+    .next()
+    .unwrap_or_default();
   let mut subject = Vec::new();
   let paragraph = text
     .split_inclusive(|byte| *byte == NEWLINE)
@@ -717,8 +724,8 @@ fn unresolved(rev: &[u8]) -> Named {
   }
 }
 
-/// Whether `head` is `<ref>-<count>` (`ref_and_count_parts_valid`): the count one hexadecimal digit or more, and the ref
-/// a one-level name `check_refname_format` passes (its components' rule, and not `@` alone).
+/// Whether `head` is `<ref>-<count>` (`ref_and_count_parts_valid`): the count one hexadecimal digit or more, and the
+/// ref a one-level name `check_refname_format` passes (its components' rule, and not `@` alone).
 fn counted_ref(head: &[u8]) -> bool {
   let count = head
     .iter()

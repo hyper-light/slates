@@ -95,7 +95,7 @@ pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
-pub use repository::abbrev::{Abbrev, FALLBACK_DEFAULT_ABBREV, MINIMUM_ABBREV, MOST_DIGITS};
+pub use repository::abbrev::Abbrev;
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
 pub use repository::protect::{Change, CommitSigners, Unsigned};
 pub use repository::reach::{ReachRefused, ReachSets, Sets};

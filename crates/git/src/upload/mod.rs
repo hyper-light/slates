@@ -328,7 +328,8 @@ impl Refusal {
 const SPARSE_BLOB: &[u8] = b"unable to access sparse blob in '";
 
 /// Format: why a `<blob-ish>` of a form this server does not resolve is answered as naming nothing: what it resolves.
-const SPARSE_FORMS: &[u8] = b"this server resolves an object's full or abbreviated name, git describe's name or a \
+const SPARSE_FORMS: &[u8] =
+  b"this server resolves an object's full or abbreviated name, git describe's name or a \
   ref, alone or with :<path>";
 
 /// Format: the words for a request past its admission.

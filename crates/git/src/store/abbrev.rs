@@ -5,9 +5,10 @@
 //! object alone.
 //!
 //! **An abbreviated name** is 4 digits to 64, either case (`MINIMUM_ABBREV`; `GIT_MAX_HEXSZ`, SHA-256's length), each
-//! digit a nibble, high first. git keeps every name in 32 bytes, those past a shorter format's hash zero (`oidread`), and
-//! compares an abbreviation's digits against them all, so in a SHA-1 repository 41 digits to 64 name the object of
-//! their first 40 when the rest are all `0`, and nothing otherwise; this search reads them so.
+//! digit a nibble, high first. git keeps every name in 32 bytes, those past a shorter format's hash zero (`oidread`),
+//! and compares an abbreviation's digits against them all, so in a SHA-1 repository 41 digits to 64 name the object of
+//! their first 40 when the rest are all `0`, and nothing otherwise; this search reads them so (stock git 2.50.1 serves
+//! a `0` after a blob's name as the blob: `fixtures/fetch-sparse-abbrev-padded`).
 //!
 //! **The digits that name an object alone** (`repo_find_unique_abbrev_r`): git's default, then one more than the most
 //! digits any other object's name shares with it. With `core.abbrev` unset git's default is half the bits of its count
@@ -22,14 +23,14 @@ use super::rows::{self, OBJECT_KEY, ObjectRow};
 use crate::object_name::{ObjectFormat, ObjectId};
 
 /// Format: the fewest digits git reads as an abbreviated name (`MINIMUM_ABBREV`).
-pub const MINIMUM_ABBREV: usize = 4;
+const MINIMUM_ABBREV: usize = 4;
 
 /// Format: the most digits git reads as an abbreviated name: the longest name it knows (`GIT_MAX_HEXSZ`).
-pub const MOST_DIGITS: usize = 64;
+const MOST_DIGITS: usize = 64;
 
 /// Format: git's fewest digits for an object's unique abbreviation with `core.abbrev` unset
 /// (`FALLBACK_DEFAULT_ABBREV`).
-pub const FALLBACK_DEFAULT_ABBREV: usize = 7;
+const FALLBACK_DEFAULT_ABBREV: usize = 7;
 
 /// Format: the bits one hexadecimal digit holds.
 const DIGIT_BITS: u32 = 4;
@@ -130,7 +131,7 @@ impl Abbrev {
         .map(|pair| {
           let high = pair.first().copied().unwrap_or_default();
           let low = pair.get(1).copied().unwrap_or_default();
-          (high << DIGIT_BITS) | low
+          high.checked_shl(DIGIT_BITS).unwrap_or_default() | low
         }),
     );
     key
@@ -139,13 +140,13 @@ impl Abbrev {
 
 /// Digit `at` of `id`'s name, high nibble first; zero past its format's length, as git keeps a name.
 fn nibble(id: &ObjectId, at: usize) -> u8 {
-  let byte = id
-    .as_bytes()
-    .get(at / DIGITS_PER_BYTE)
+  let byte = at
+    .checked_div(DIGITS_PER_BYTE)
+    .and_then(|index| id.as_bytes().get(index))
     .copied()
     .unwrap_or_default();
   if at.is_multiple_of(DIGITS_PER_BYTE) {
-    byte >> DIGIT_BITS
+    byte.checked_shr(DIGIT_BITS).unwrap_or_default()
   } else {
     byte & LOW_DIGIT
   }

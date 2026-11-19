@@ -160,9 +160,9 @@ sparse abbrev-padded 4cdb2265d30204be5463b38174b2e8e7179824050
 sparse abbrev-unpadded 4cdb2265d30204be5463b38174b2e8e7179824051
 sparse describe v1-1-g4cdb
 # Objects whose names begin alike (their contents found by a search of names): two blobs whose names share eight
-# digits, `5ad7d2ca`, in a tree under a commit of their own; two commits sharing four, `67fd`, each by an author five and
-# a half hours east of UTC with a subject of two lines; two tags sharing four, `2188`. Each is reached by a ref, and the
-# eight are kept in `ambiguous.pack` for the tests to serve them.
+# digits, `5ad7d2ca`, in a tree under a commit of their own; two commits sharing four, `67fd`, each by an author five
+# and a half hours east of UTC with a subject of two lines; two tags sharing four, `2188`. Each is reached by a ref;
+# the tests make the eight from these same bytes (`upload/tests/names.rs`), so their names are checked here.
 BLOB_A=$(printf 'collide 26350\n' | git hash-object -w --stdin)
 BLOB_B=$(printf 'collide 62386\n' | git hash-object -w --stdin)
 PAIR=$(printf '100644 blob %s\ta\n100644 blob %s\tb\n' "$BLOB_A" "$BLOB_B" | git mktree)
@@ -185,8 +185,6 @@ done
 BEGINS=$(printf '%s\n' $ALIKE | cut -c1-8 | tr '\n' ' ')
 [ "$BEGINS" = '5ad7d2ca 5ad7d2ca 3af7e09f c6d52c1b 67fd0f47 67fdbfcb 2188e00e 21887657 ' ] \
   || { echo "the alike names changed: $ALIKE" >&2; exit 1; }
-printf '%s\n' $ALIKE | git pack-objects -q --delta-base-offset --window=10 --depth=50 "$WORK/alike" > "$WORK/alike.name"
-cp "$WORK/alike-$(cat "$WORK/alike.name").pack" "$OUT/ambiguous.pack"
 # Ambiguous abbreviations: the blobs' (git lists the two blobs); the commits' (no blob among them, so git lists every
 # one), and the same before a path (both commits are trees' commits, so git lists both); and the tags'.
 sparse ambiguous-blobs 5ad7

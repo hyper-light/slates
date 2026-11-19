@@ -608,11 +608,11 @@ fn with_pack<P: PackSource>(
   };
   let banded = chosen.framing.is_banded();
   if let Some(refusal) = sparse.dies {
-    return Answer::died(head, &sparse.said, refusal, banded, admission)
+    return Answer::died(head, sparse.said, refusal, banded, admission)
       .map(|answer| answer.counted(outcome.counters));
   }
   if banded {
-    answer::relay(sparse.said.iter(), &mut head, admission)?;
+    answer::relay(&sparse.said, &mut head, admission)?;
   }
   let plan = PackPlan {
     runs: &pack.runs,

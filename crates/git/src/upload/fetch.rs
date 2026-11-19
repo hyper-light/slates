@@ -20,7 +20,7 @@
 //! refs were wanted by name, then the packfile section's header; the pack follows as the answer is stepped, or, when
 //! the request's `sparse:oid` filter's blob was not resolved or read, git's words for it (the `answer` module).
 
-use super::answer::{self, Answer, Framing};
+use super::answer::{Answer, Framing, Said};
 use super::sparse;
 use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
 use crate::Admission;
@@ -299,9 +299,17 @@ fn written<P: PackSource>(
           Header::First
         };
         let (bytes, _) = charged(admission, |out| {
-          before_pack(&pack, &asked.wanted, format, multiplexed, header, &[], out)
+          before_pack(
+            &pack,
+            &asked.wanted,
+            format,
+            multiplexed,
+            header,
+            &Said::default(),
+            out,
+          )
         })?;
-        return Answer::died(bytes, &sparse.said, refusal, true, admission)
+        return Answer::died(bytes, sparse.said, refusal, true, admission)
           .map(|answer| answer.counted(outcome.counters));
       }
       let plan = PackPlan {
@@ -320,7 +328,7 @@ fn written<P: PackSource>(
         Header::First
       };
       let (bytes, (response, at)) = charged(admission, |out| {
-        let said = sparse.said.as_slice();
+        let said = &sparse.said;
         before_pack(&pack, &asked.wanted, format, multiplexed, header, said, out)
       })?;
       Answer::streaming(bytes, Framing::V2(response), at, source, admission)
@@ -338,7 +346,7 @@ fn before_pack(
   format: ObjectFormat,
   multiplexed: bool,
   header: Header,
-  said: &[Vec<u8>],
+  said: &Said,
   out: &mut Sink<'_>,
 ) -> Result<(Response, u64), Refusal> {
   let mut writer = Writer::new(format, multiplexed, out);
@@ -355,7 +363,7 @@ fn before_pack(
   if header == Header::First {
     writer.event(&Event::Header(Line::lf(Section::Packfile)))?;
   }
-  for read in answer::reads(said.iter()) {
+  for read in said.reads() {
     writer.event(&Event::Progress(read))?;
   }
   if header == Header::AtThePack {
