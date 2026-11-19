@@ -141,6 +141,14 @@ pub(crate) fn write_hex(node: &Node, out: &mut impl Out) {
   }
 }
 
+/// The SHA-1 of `bytes` as 7.2's `hashutil.sha1` computes it, with collision detection: what a store's hashed file names
+/// are made from (A-630).
+pub(crate) fn sha1(bytes: &[u8]) -> Result<Node, CollisionAttack> {
+  let mut hasher = Hasher::new();
+  hasher.update(bytes);
+  hasher.finish()
+}
+
 /// Checks that `node` is what `p1`, `p2` and `text` hash to.
 pub fn check(node: &Node, p1: &Node, p2: &Node, text: &[u8]) -> Result<(), Refusal> {
   let computed = compute(p1, p2, text)?;

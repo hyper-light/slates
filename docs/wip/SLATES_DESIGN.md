@@ -12732,6 +12732,18 @@ signature verification).
 > (`crates/hg/fixtures/serve`): eight answers byte for byte. Owed of piece 4: the changegroup the choice names (its
 > manifests and files, held deltas or full texts), the bundle2 a `getbundle` answers, then `slates hg serve --stdio`'s
 > loop and HTTP version 1; the heads the index keeps will replace the walks over the whole view.
+>
+> **Status (2026-11-19, A-630 part 1: a store's names and its fncache built).** `slates-hg`'s `store` names the revlog
+> of each tracked path as an existing repository's `.hg/store` names it: 7.2's `encodedir`, its filename encoding
+> (capitals as `_x`, reserved bytes as `~xx`), Windows' reserved names and a last (with `dotencode`, a first) period or
+> space escaped, and a path longer than 120 bytes hashed under `dh/` with its directories' prefixes, a filler and its
+> SHA-1 (collision-detecting, as 7.2's `hashutil`); both of 7.2's encodings (`dotencode`'s `_pathencode` and the
+> hybrid one); the `fncache` read (`decodedir`, a final newline and no empty line required) and the requirements'
+> layout. Proven against two stores stock 7.2 wrote of one history (`crates/hg/fixtures/store`, the command in
+> `make-store-fixtures.sh`): every fncache entry encoded to exactly the data revlogs stored, three of them hashed, a
+> case collision, every reserved name and byte. Owed: the import itself (each revlog through `revlog` into `index`,
+> through §4.15's read seam; its golden vectors, every revision's `debugdata`, are in the same fixtures) and version
+> 2's file index.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13122,7 +13134,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    `manifest`, `filerev`, `node`): the objects and their nodes. Built (A-611, `crates/hg`: `revlog`): the import's
    revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
    holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
-   Mercurial's naming as its `Naming`. Owed: the import's walk of a store.
+   Mercurial's naming as its `Naming`. Built (A-630 part 1, `crates/hg`: `store`): a store's names (both of 7.2's
+   encodings, the hashed long names) and its fncache. Owed: the import into the index, and version 2's file index.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 part 1, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets and its
    phase heads and bookmarks; owed: the changegroup and bundle2 assembly, the stdio loop, HTTP.
@@ -42597,3 +42610,36 @@ Applied in the same change to:
   and the request room derived from the shard's budget, refusals counted; git's site: `slates-git`'s routes, the
   authenticator from a credential to a principal of §4.13, the policy's decision (§4.17.1, A-597, A-622), and
   upload-pack and receive-pack as services (A-620, A-624); the live run with a stock `git clone` over HTTPS (main's).
+
+### A-630 part 1 — A Mercurial store's names and its fncache, as stock 7.2 names and lists them (2026-11-19, g291 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3, the import; A-588, A-611)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`store`, new; `node::sha1`;
+`fixtures/store/` and its `make-store-fixtures.sh`), `.gitattributes` (the store fixtures kept as stored), GAPS (the
+§4.17.3 entry).
+- **What it does.** `store::encode_path` gives the store name of a revlog path as 7.2's `store.py` does: `encodedir`,
+  `_encodefname`, `_auxencode`, and `_hashencode` past 120 bytes, in both of 7.2's encodings (`_pathencode` for a
+  `dotencode` store, which also hashes a raw path past 120; `_hybridencode` without). `encode_dir` and `decode_dir`
+  rename `.i`, `.d` and `.hg` directories and back; `read_fncache` reads the fncache (`decodedir`, every line an entry,
+  a final newline and no empty line, as `fncache._load` and `_checkentries` require), charged to an admission;
+  `read_layout` reads the requirements a store walk needs (`store`, `fncache`, `dotencode`, `exp-revlogv2.2`,
+  `fileindex-v1`).
+- **From the sources.** 7.2's `store.py` (read from Homebrew's 7.2): `_encodedir`, `decodedir`, `_reserved` (0 to 31,
+  126 to 255, `\:*?"<>|`), `_buildencodefun`, `_buildlowerencodefun`, `_auxencode`, `_hashencode`
+  (`_maxstorepathlen` 120, `_dirprefixlen` 8, `_maxshortdirslen` 68), `_hybridencode`, `_pathencode`, `fncache`; its
+  doctests are this module's unit vectors.
+- **Golden vectors.** `crates/hg/fixtures/store`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 at 05:14 UTC,
+  by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the branch at b16ddf6, exactly: `bash
+  crates/hg/fixtures/store/make-store-fixtures.sh "$D/out"`. One history in a `dotencode` store and a hybrid one, its
+  names taking every branch of the encoding (capitals and underscores, `FOO` removed then `foo`, `aux.txt`, `con`,
+  `com1`, `lpt9.x`, `prn.d`, `:?*"<>|\~` and `é`, a leading and a trailing period and space, `x.i/`, `y.d/` and `z.hg/`,
+  a path long raw, one long once encoded, and a deep one hashed with seven directory prefixes, one rewritten to end in
+  `_`): each store whole, its file list, its requirements, its paths, and every revision's `debugdata`; 94 files, each
+  SHA-256 checked equal after the copy. The stores differ only where `dotencode` does (the leading period and space).
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 195 of 195 at its second
+  build (the first's one error a borrowed temporary, E0716), 6 of them this part's; rustfmt's layout taken from that
+  run; 203 of 203 with rustfmt clean on the tree merged with main (A-619's read serving among them) at b412d90. Golden: in each store every fncache entry encoded to exactly the data revlogs 7.2 stored (the sets equal, each a
+  fixture), every tracked path's revlog in the fncache, three hashed names and the case collision among them. Unit:
+  7.2's doctests of `_encodedir`, `decodedir`, `_buildencodefun`, `encodefilename` and `_auxencode`; long paths hashed
+  in both encodings. Hostile: an fncache without its newline, with an empty line, or past its admission.
+- **Owed of A-630.** The import (each revlog the fncache names read through `revlog` and appended to `index`, links by
+  changelog number, through §4.15's read seam; golden: every changeset's node and every file's bytes equal to the
+  fixtures' `debugdata`), then version 2's file index (`store_utils/file_index.py`).
