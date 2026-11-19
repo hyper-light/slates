@@ -5,7 +5,8 @@
 //! channel, proven by the keyed hash under its secret (`crate::landing::identities_proof`), and refused `Forbidden` on a
 //! channel bound to a consumer whatever its proof, so an agent never names its own author. git's identity is held to
 //! git's own rules (`slates_git::derived::Identity`: no byte git would strip or drop, a name not empty) and
-//! Mercurial's user to a changeset's (one line, not empty), so the record holds the bytes every commit carries. The
+//! Mercurial's user to a changeset's (not empty, one line, and no byte Mercurial strips from its ends, as its
+//! `changelog.add` does before it writes one), so the record holds the bytes every commit carries. The
 //! record lives on the principal's partition (a consumer's, the one its id names; any other's, the one its key hashes
 //! to), set whole as the version after the one its setter read (`Op::IdentitiesSet`, `PolicyChanged` from a stale read).
 //!
@@ -71,6 +72,23 @@ fn wire_identities(record: Option<&IdentityRecord>) -> ToolIdentities {
   })
 }
 
+/// Format: the bytes Mercurial strips from both ends of a changeset's user before it writes the changeset, ASCII
+/// whitespace as Python's `bytes.strip()` takes it: space, tab, newline, carriage return, vertical tab and form feed.
+/// Rust's `u8::is_ascii_whitespace` leaves the vertical tab out, so it is not the test \[C: mercurial/changelog.py
+/// `changelog.add`, Mercurial 7.2, read 2026-11-19; Python 3.14.7's `bytes.strip()` removes bytes 9 to 13 and 32\].
+const MERCURIAL_STRIPS: &[char] = &[' ', '\t', '\n', '\r', '\x0b', '\x0c'];
+
+/// Whether `user` is a changeset's user as Mercurial writes it: not empty, one line, and nothing Mercurial strips from
+/// its ends. `changelog.add` strips the user, then refuses an empty one ("empty username") or one holding a newline
+/// (as `MERCURIAL_STRIPS` cites), so a user it would change is refused here and never recorded as bytes no changeset of
+/// Mercurial's own would carry. A carriage return or a NUL inside is refused too, so the user shows as one line.
+fn as_mercurial_writes(user: &str) -> bool {
+  !user.is_empty()
+    && !user.contains(['\n', '\r', '\0'])
+    && !user.starts_with(MERCURIAL_STRIPS)
+    && !user.ends_with(MERCURIAL_STRIPS)
+}
+
 /// Why `identities` cannot be recorded: the part and the rule, as a `BadRequest`'s reason.
 fn invalid(identities: &ToolIdentities) -> Option<String> {
   if let Some(git) = &identities.git
@@ -79,8 +97,9 @@ fn invalid(identities: &ToolIdentities) -> Option<String> {
     return Some(format!("git identity: {refusal:?}"));
   }
   let mercurial = identities.mercurial.as_deref()?;
-  let one_line = !mercurial.is_empty() && !mercurial.contains(['\n', '\r', '\0']);
-  (!one_line).then(|| "Mercurial user: empty, or more than one line".to_owned())
+  (!as_mercurial_writes(mercurial)).then(|| {
+    "Mercurial user: empty, more than one line, or with a byte Mercurial strips".to_owned()
+  })
 }
 
 /// Serves `SetIdentities` on the control channel (module docs): the channel's own checks here, then, as a task, the

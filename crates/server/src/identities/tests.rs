@@ -310,20 +310,32 @@ fn t_a664_a_git_identity_git_would_change_is_refused() {
   );
 }
 
-/// A-664 part 1 (§4.17.3 decision 7: a changeset's user is one line). Do: set a Mercurial user of two lines, with the
-/// launcher's proof. Expect: `BadRequest` naming Mercurial's user.
+/// A-664 part 1 (§4.17.3 decision 7: a changeset's user is the principal's `Name <address>`; Mercurial 7.2's
+/// `changelog.add` strips the user, then refuses an empty one or one holding a newline). Do: set a Mercurial user of
+/// two lines, an empty one, one beginning with a space and one ending with a vertical tab, each with the launcher's
+/// proof. Expect: each `BadRequest` naming Mercurial's user, so no record holds a user Mercurial would refuse or change.
 #[test]
-fn t_a664_a_mercurial_user_of_more_than_one_line_is_refused() {
-  let answer = crate::daemon::audit_on_shard(|state| {
-    let two_lines = ToolIdentities {
-      mercurial: Some("Ada\n<ada@example.com>".to_owned()),
-      ..git_only("Ada")
-    };
-    set_at_once(state, &owner(), two_lines, None)
+fn t_a664_a_mercurial_user_mercurial_would_refuse_or_change_is_refused() {
+  let answers = crate::daemon::audit_on_shard(|state| {
+    [
+      "Ada\n<ada@example.com>",
+      "",
+      " Ada <ada@example.com>",
+      "Ada <ada@example.com>\x0b",
+    ]
+    .map(|user| {
+      let identities = ToolIdentities {
+        mercurial: Some(user.to_owned()),
+        ..git_only("Ada")
+      };
+      set_at_once(state, &owner(), identities, None)
+    })
   });
   assert!(
-    refused_naming(answer.as_ref(), "Mercurial user"),
-    "{answer:?}"
+    answers
+      .iter()
+      .all(|answer| refused_naming(answer.as_ref(), "Mercurial user")),
+    "{answers:?}"
   );
 }
 
@@ -581,6 +593,59 @@ fn t_a664_a_later_read_never_replaces_the_identities_a_session_keeps() {
   });
   let refused = Some(Refusal::IdentityRequired { tool: VcsTool::Git });
   assert_eq!(answered, (refused, Some(ToolIdentities::default())));
+}
+
+/// A read of git's identity returning for [`FIRST_SESSION`]'s submit of an edited work over a new git repository named
+/// `name` to the seat `seat` is now: what the submit is answered and what the seat then keeps; then the version the
+/// owner's own submit of the work is accepted at, which says whether the returning submit built anything.
+fn returned_to(
+  state: &mut ShardState,
+  (name, seat): (&str, Handle<ClientSlot>),
+) -> (Option<Refusal>, Option<ToolIdentities>, Option<u64>) {
+  let work = repository_work(state, name, VcsTool::Git);
+  let id = RequestId {
+    client: FIRST_SESSION,
+    sequence: 1,
+  };
+  let resumed = Resumed {
+    client_index: seat.index(),
+    request: id.word(),
+    key: (state.origin_anchor.0, id, FIRST_SESSION),
+    principal: owner(),
+  };
+  let body = submit(work, Some("the change"), ToolIdentities::default());
+  let answer = match resumed.route(state, body, git_only("Ada")) {
+    Served::Reply(reply) => refusal(reply),
+    Served::Forwarded => None,
+  };
+  let kept = state
+    .clients
+    .get(seat)
+    .ok()
+    .and_then(|slot| slot.identities.clone());
+  let owners = ask(state, submit(work, Some("the change"), git_only("Ada")));
+  (answer, kept, accepted_version(&owners))
+}
+
+/// A-664 part 1 (module docs: a read is kept with the session that asked, while its seat is still that session's). Do:
+/// a read of git's identity returns for a session's submit over a git repository's green, once to the session's seat
+/// as another session, an agent's, now holds it, and once to the session's own seat while it retires; then the owner
+/// submits each work itself. Expect: each returning submit refused `NotFound`, neither seat keeping an identity, no
+/// read counted; each owner's submit accepted at version 1, so neither returning submit built anything.
+#[test]
+fn t_a664_a_read_returning_to_a_seat_its_session_left_is_kept_by_no_one_and_runs_nothing() {
+  let answered = crate::daemon::audit_on_shard(|state| {
+    let (taken, _taken_region) = seat(state, SECOND_SESSION, agent());
+    let (retiring, _retiring_region) = seat(state, FIRST_SESSION, owner());
+    if let Ok(slot) = state.clients.get_mut(retiring) {
+      slot.retiring = true;
+    }
+    let returned = [("taken", taken), ("retiring", retiring)]
+      .map(|(name, seat)| returned_to(state, (name, seat)));
+    (returned, state.refusals.get(READ).copied())
+  });
+  let each = (Some(Refusal::NotFound), None, Some(1));
+  assert_eq!(answered, ([each.clone(), each], None));
 }
 
 /// A-664 part 1 (module docs; A-563: a verb that never ran answers `Overloaded` and is never recorded, so a resend under
