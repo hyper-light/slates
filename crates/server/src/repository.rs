@@ -62,7 +62,7 @@ fn db_format(format: ObjectFormat) -> slates_db::catalog::ObjectFormat {
 
 /// `op` judged by the partition's guard without recording it: a verb that records several operations judges each one a
 /// later step could refuse before its first, since what a refused verb recorded commits with its refusal.
-fn admits(state: &ShardState, op: &Op) -> Result<(), Refusal> {
+fn admits(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
   let now = state.clock.monotonic_ns();
   state
     .db
@@ -127,7 +127,7 @@ fn member_name(repository: &str, branch: &str, id: DbVolumeId) -> Result<String,
 
 /// The catalog record of a new member green: a green owned by `principal`, its versions judged with `require_evidence`.
 fn member_record(
-  state: &ShardState,
+  state: &mut ShardState,
   principal: &Principal,
   (id, name): (DbVolumeId, String),
   require_evidence: bool,
