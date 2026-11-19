@@ -53,6 +53,9 @@ libc = { workspace = true }
 rustix = { workspace = true }
 # The macOS mount fetches the root handle over loopback and passes it to mount(2) (§4.6 A-34).
 slates-bridge-nfs = { workspace = true }
+# The kernel's mount table an unmount is judged by (A-507): `getfsstat(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo` on
+# Linux, neither touching a mount.
+slates-bridge-oci = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # The roles' stop flag: the console control handler (`role::signal`). And a fleet node's nameservers, the DNS servers

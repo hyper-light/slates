@@ -7183,6 +7183,7 @@ mod tests {
         write: None,
         write_version: 0,
         signers: Vec::new(),
+        carried: None,
       }
       .to_record_bytes()
     };

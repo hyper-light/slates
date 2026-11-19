@@ -23,15 +23,19 @@ pub const MAX_KEYS: u64 = 1_000;
 pub const KEY_MAX_BYTES: u64 = 1_024;
 /// Format: the bytes URL encoding writes for one byte at most (`%XX`).
 const ENCODED_BYTE_MAX: u64 = 3;
+/// Format: a percent escape's length, `%` and two hex digits (RFC 3986 §2.1), as [`ENCODED_BYTE_MAX`] counts it.
+const PERCENT_ESCAPE_LEN: usize = 3;
+/// Format: the radix of a percent escape's digits and of a hex character reference (`&#xN;`, XML 1.0 §4.1).
+const HEX_RADIX: u32 = 16;
 /// Format: the deepest element the response syntax names, counting the root: `ListBucketResult`, `Contents`,
 /// `RestoreStatus`, `IsRestoreInProgress`.
 pub const MAX_DEPTH: usize = 4;
-/// Format: the bytes of one `Contents` element's markup and fields other than its key, at most, from the response
-/// syntax, about 1,200: every documented child's tags (`Key`, `LastModified`, `ETag`, `Size`, `StorageClass`, the ten
-/// checksum algorithms and the checksum type, `Owner` with `DisplayName` and `ID`, `RestoreStatus` with its two
-/// children, about 600 bytes of tags), a multipart ETag (38 bytes) with its quotes as entities (12), a 24-byte
-/// timestamp, a 20-digit size, an owner's 64-hex id and a display name of as many, a restore's date, and the
-/// indentation S3 writes, rounded up to a power of two.
+/// The bytes of one `Contents` element's markup and fields other than its key, at most, from the response syntax:
+/// every documented child's tags (`Key`, `LastModified`, `ETag`, `Size`, `StorageClass`, the ten checksum algorithms
+/// and the checksum type, `Owner` with `DisplayName` and `ID`, `RestoreStatus` with its two children, about 600 bytes
+/// of tags), a multipart ETag (38 bytes) with its quotes as entities (12), a 24-byte timestamp, a 20-digit size, an
+/// owner's 64-hex id and a display name of as many, a restore's date, and the indentation S3 writes.
+/// Format: those parts' sum, about 1,200 bytes, rounded up to a power of two.
 const ENTRY_OVERHEAD_BYTES: u64 = 2_048;
 /// Format: the bytes of a page's own markup and short fields, at most, about 400: the declaration, the root with its
 /// namespace, `Name` (a bucket name, 63 bytes at most), `KeyCount`, `MaxKeys`, `IsTruncated`, `Delimiter`,
@@ -385,7 +389,7 @@ fn entity(name: &str) -> Option<char> {
     "quot" => return Some('"'),
     "apos" => return Some('\''),
     _ => match name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
-      Some(hex) if !hex.is_empty() => u32::from_str_radix(hex, 16).ok()?,
+      Some(hex) if !hex.is_empty() => u32::from_str_radix(hex, HEX_RADIX).ok()?,
       _ => {
         let decimal = name.strip_prefix('#')?;
         if decimal.is_empty() || !decimal.bytes().all(|b| b.is_ascii_digit()) {
@@ -475,13 +479,13 @@ fn url_decode(text: &str) -> Result<String, ListError> {
     match byte {
       b'%' => {
         let hex = text
-          .get(at.saturating_add(1)..at.saturating_add(3))
+          .get(at.saturating_add(1)..at.saturating_add(PERCENT_ESCAPE_LEN))
           .ok_or(ListError::BadEncoding)?;
         if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
           return Err(ListError::BadEncoding);
         }
-        out.push(u8::from_str_radix(hex, 16).map_err(|_| ListError::BadEncoding)?);
-        at = at.saturating_add(3);
+        out.push(u8::from_str_radix(hex, HEX_RADIX).map_err(|_| ListError::BadEncoding)?);
+        at = at.saturating_add(PERCENT_ESCAPE_LEN);
       }
       b'+' => {
         out.push(b' ');
@@ -735,7 +739,7 @@ mod tests {
     /// whole page.
     #[test]
     fn a_page_cut_short_anywhere_is_refused(cut in 0usize..SAMPLE.len()) {
-      prop_assert!(page(&SAMPLE[..cut]).is_err());
+      prop_assert!(page(SAMPLE.get(..cut).unwrap()).is_err());
     }
 
     /// A-464 (hostile input): do read arbitrary bytes, and the sample page with one byte changed anywhere. Expect a

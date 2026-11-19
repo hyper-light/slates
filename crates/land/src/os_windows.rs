@@ -60,7 +60,7 @@
 //! security identifier. A target on one of this daemon's own WinFsp drives is refused before any open (`OwnMount`,
 //! A-227), as the Unix walk refuses a component on one of its mounts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
@@ -106,10 +106,12 @@ const TEMP_ACCESS: u32 =
   FILE_GENERIC_WRITE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
 /// Format: an entry opened to be moved or removed: nothing of its data, its attributes, and `DELETE`.
 const MOVE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-/// Format: a file opened to have its attributes set (a landing's metadata entry, A-458): its attributes read and written
-/// (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`), and `FILE_WRITE_DATA`, which its batch's barrier needs to flush it
-/// (A-472: `FlushFileBuffers` "writes all the buffered information for a specified file", through a handle that "must
-/// have the GENERIC_WRITE access right"); none of its data is written.
+/// Format: a directory opened to have its attributes set (a base directory's metadata entry, A-501): its attributes read
+/// and written (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`), and `FILE_WRITE_DATA`, a directory's `FILE_ADD_FILE`,
+/// which its batch's barrier needs to flush it (A-472: `FlushFileBuffers` "writes all the buffered information for a
+/// specified file", through a handle that "must have the GENERIC_WRITE access right"); nothing in it is written. MS-FSA
+/// 2.1.5.1.2.1 refuses those rights to a read-only data file alone, never a directory. A file's metadata entry opens as
+/// `crate::windows_bits::meta_open` says (A-519).
 const CHMOD_ACCESS: u32 =
   FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | SYNCHRONIZE;
 /// Format: a directory this writer makes: listed, traversed and its attributes read, as the host retains one.
@@ -165,12 +167,16 @@ struct Temp {
 pub struct OsLand {
   host: OsHost,
   temps: BTreeMap<u64, Temp>,
+  /// The metadata entries' files opened write-through (A-519): read-only files, each set through them stored as it
+  /// returns, which no barrier flushes, since their handles may not write.
+  through: BTreeSet<u64>,
 }
 
 /// A writer's own state while it has lent its host away ([`OsLand::lend`]).
 #[derive(Debug)]
 pub struct Away {
   temps: BTreeMap<u64, Temp>,
+  through: BTreeSet<u64>,
 }
 
 impl std::fmt::Debug for OsLand {
@@ -178,6 +184,7 @@ impl std::fmt::Debug for OsLand {
     f.debug_struct("OsLand")
       .field("host", &self.host)
       .field("temps", &self.temps.len())
+      .field("through", &self.through.len())
       .finish()
   }
 }
@@ -952,6 +959,7 @@ impl OsLand {
       Self {
         host,
         temps: BTreeMap::new(),
+        through: BTreeSet::new(),
       },
       LandingTarget {
         dir,
@@ -972,7 +980,13 @@ impl OsLand {
 
   /// Lends the host back between a sliced landing's slices (AUD-29-25); [`OsLand::resume`] takes it back.
   pub fn lend(self) -> (OsHost, Away) {
-    (self.host, Away { temps: self.temps })
+    (
+      self.host,
+      Away {
+        temps: self.temps,
+        through: self.through,
+      },
+    )
   }
 
   /// The writer again, over the host it lent and its own state.
@@ -980,6 +994,7 @@ impl OsLand {
     Self {
       host,
       temps: away.temps,
+      through: away.through,
     }
   }
 
@@ -1108,6 +1123,7 @@ impl HostFs for OsLand {
 
   fn close_file(&mut self, file: HostFile) {
     self.temps.remove(&file.0);
+    self.through.remove(&file.0);
     self.host.close_file(file);
   }
 
@@ -1230,9 +1246,12 @@ impl LandFs for OsLand {
     write_out_file(self.file(file)?)
   }
 
+  /// The batch's barrier over its own handle of each file but a read-only file's metadata entry, which its write-through
+  /// handle stored as it was set and which may not be flushed (A-519).
   fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
     let files = files
       .iter()
+      .filter(|file| !self.through.contains(&file.0))
       .map(|file| {
         self
           .file(*file)?
@@ -1251,42 +1270,101 @@ impl LandFs for OsLand {
     ran
   }
 
-  /// The file opened to have its attributes set (A-458) and its batch's barrier flush it (A-472: `CHMOD_ACCESS`),
-  /// relative to its directory's handle, as a file (`FILE_NON_DIRECTORY_FILE`) and never through a link: opened with
-  /// `FILE_OPEN_REPARSE_POINT`, a reparse point is refused `NotFile`, closed again. NTFS refuses a read-only file a
-  /// handle that may write, and the entry fails alone (GAPS, A-472).
+  /// The file opened to have its attributes set (A-458) and its batch's barrier flush it (A-472), relative to its
+  /// directory's handle, as a file and never through a link (`crate::windows_bits::meta_open`): a reparse point is
+  /// refused `NotFile`, closed again. NTFS refuses a read-only file the handle that may write (MS-FSA 2.1.5.1.2.1), so
+  /// one is opened again to write its attributes alone, write-through: each set through it is stored as it returns, and
+  /// its barrier leaves it out (A-519). Any other refusal of the first open stands.
   fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
-    let opened = nt_create(
-      self.dir(dir)?,
+    let parent = self.dir(dir)?;
+    let flushed = crate::windows_bits::meta_open(false);
+    let (opened, through) = match nt_create(
+      parent,
       name,
-      CHMOD_ACCESS,
+      flushed.access,
       nt::FILE_OPEN,
-      nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+      flushed.options,
       0,
-    )?;
+    ) {
+      Ok(opened) => (opened, false),
+      Err(refused) => {
+        let stored = crate::windows_bits::meta_open(true);
+        let Ok(opened) = nt_create(
+          parent,
+          name,
+          stored.access,
+          nt::FILE_OPEN,
+          stored.options,
+          0,
+        ) else {
+          return Err(refused);
+        };
+        match attributes(opened.as_handle()) {
+          Ok(held) if crate::windows_bits::read_only(held) => (opened, true),
+          _ => return Err(refused),
+        }
+      }
+    };
     if attributes(opened.as_handle())?
       & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
       != 0
     {
       return Err(HostError::NotFile);
     }
+    let file = self.host.adopt_file(opened)?;
+    if through {
+      self.through.insert(file.0);
+    }
+    Ok(file)
+  }
+
+  /// The directory opened to have its attributes set and its batch's barrier flush it (A-501): `CHMOD_ACCESS`, whose
+  /// `FILE_WRITE_DATA` is a directory's `FILE_ADD_FILE`, the access `NtFlushBuffersFile` asks of a directory too; as a
+  /// directory (`FILE_DIRECTORY_FILE`) and never through a link: opened with `FILE_OPEN_REPARSE_POINT`, a reparse point is
+  /// refused `NotDirectory`, closed again.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let opened = nt_create(
+      self.dir(dir)?,
+      name,
+      CHMOD_ACCESS,
+      nt::FILE_OPEN,
+      nt::FILE_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+      0,
+    )?;
+    if attributes(opened.as_handle())?
+      & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+      != 0
+    {
+      return Err(HostError::NotDirectory);
+    }
     self.host.adopt_file(opened)
   }
 
   /// The one bit a mode decides on Windows, `READONLY`, with every other bit the temporary holds kept
-  /// (`crate::windows_bits::mode_word`).
+  /// (`crate::windows_bits::mode_word`). A directory's read-only is among its Windows bits (A-451), and Windows keeps no
+  /// POSIX mode, so a directory's mode decides nothing here (A-501), as at its `mkdir`.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     let handle = self.file(file)?;
-    let wanted = crate::windows_bits::mode_word(attributes(handle)?, mode);
-    set_attributes(handle, wanted)
+    let held = attributes(handle)?;
+    if held & FILE_ATTRIBUTE_DIRECTORY != 0 {
+      return Ok(());
+    }
+    set_attributes(handle, crate::windows_bits::mode_word(held, mode))
   }
 
   /// The volume's Windows bits on the temporary (A-451, `give_bits`): every bit the volume keeps, set or cleared and
   /// read back, the read-only state its mode gave it kept. The rename that places it sets `ARCHIVE` again (NTFS's own
   /// rule for a renamed file, measured by A-185), so a landed file is `ARCHIVE` whatever the volume held: the truth that
-  /// it changed, which a backup reads.
+  /// it changed, which a backup reads. A base directory's metadata entry (A-501) gives a directory's bits, its read-only
+  /// among them.
   fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError> {
-    give_bits(self.file(file)?, windows, crate::windows_bits::Made::File)
+    let handle = self.file(file)?;
+    let made = if attributes(handle)? & FILE_ATTRIBUTE_DIRECTORY != 0 {
+      crate::windows_bits::Made::Dir
+    } else {
+      crate::windows_bits::Made::File
+    };
+    give_bits(handle, windows, made)
   }
 
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {
