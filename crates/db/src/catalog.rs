@@ -506,6 +506,33 @@ pub struct SnapshotRecord {
   pub taken_ns: u64,
 }
 
+/// What a captured clone's move carried of its capture (§4.15 `capture_base`, A-291's move; A-503, stage 2 of a captured
+/// clone's landing): the identity of the head the move handed over (its archive manifest's, the same wherever the tree
+/// is exported), and the captured state of every path where the capture and that head differ, in
+/// `slates_vfs::captured::CarriedCapture`'s canonical encoding (opaque here: this crate keeps it, the volume core reads
+/// it). Shipped in the volume's catalog register, so the member a move hands the volume to judges its landings against
+/// the capture as the member that made the clone did.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct CarriedRecord {
+  /// The head the carried paths are relative to, by its archive manifest's identity.
+  pub head: [u8; 32],
+  /// The carried paths, encoded by the volume core.
+  pub entries: Vec<u8>,
+}
+
+/// A volume's carried capture as a partition keeps it (A-503): what its catalog ships ([`CarriedRecord`]) and, when this
+/// node holds that head's tree as one of the volume's snapshots, that snapshot, the **mark** its landings are judged from.
+/// The mark is this node's own snapshot id, so it is never shipped.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct CarriedCaptureRecord {
+  /// The volume.
+  pub volume: VolumeId,
+  /// What its catalog ships.
+  pub carried: CarriedRecord,
+  /// Its snapshot holding the head `carried` is relative to, when this node holds one.
+  pub mark: Option<SnapshotId>,
+}
+
 /// A lineage edge: a clone and its origin.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct LineageEdge {

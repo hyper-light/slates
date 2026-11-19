@@ -857,6 +857,73 @@ fn a_file_whose_archive_bit_a_backup_cleared_is_replaced_by_a_landing() {
   );
 }
 
+/// Sets the `READONLY` bit of the file at `path`, as a person's `attrib +R` does (its argument takes backslashes).
+#[cfg(windows)]
+fn set_read_only(path: &Path) {
+  let set = Command::new("attrib")
+    .arg("+R")
+    .arg(path.to_string_lossy().replace('/', "\\"))
+    .output()
+    .unwrap();
+  assert!(set.status.success(), "attrib +R: {set:?}");
+  assert_eq!(
+    attributes_of(path) & READONLY,
+    READONLY,
+    "attrib +R set the bit"
+  );
+}
+
+/// A-519 (a read-only file's metadata entry lands). Do: over a real directory on NTFS holding a file a person made
+/// read-only (`attrib +R`), mark the file hidden through an overlay, its bytes and mode untouched, and land. Expect the
+/// landing `Done` with its one entry written: the disk's file `HIDDEN` and still `READONLY`, its bytes as they were.
+/// Before A-519 the entry failed alone: NTFS refuses a read-only file the handle that may write (MS-FSA 2.1.5.1.2.1),
+/// which the barrier's `FlushFileBuffers` needed; the file is now opened to write its attributes alone, write-through.
+#[cfg(windows)]
+#[test]
+fn a_read_only_files_metadata_entry_lands() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "read-only-meta");
+  seed_file(&ws.path.join("locked"), b"read only");
+  set_read_only(&ws.path.join("locked"));
+  let (mut host, target) = OsLand::open_target(&ws.path).unwrap();
+  let mut store = store();
+  let mut vol = overlay_over(&mut host, target.dir, &mut store);
+  common::set_windows_bits(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/locked",
+    HIDDEN | ARCHIVE,
+    slates_vfs::inode::Kind::File,
+  );
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  let after = attributes_of(&ws.path.join("locked"));
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(
+    report
+      .entries
+      .iter()
+      .map(|entry| entry.outcome.clone())
+      .collect::<Vec<_>>(),
+    vec![Some(Outcome::Written)],
+    "attributes after: {after:#x}; {report:?}"
+  );
+  assert_eq!(
+    after & (READONLY | HIDDEN),
+    READONLY | HIDDEN,
+    "attributes after: {after:#x}"
+  );
+  assert_eq!(read(&ws.path.join("locked")).unwrap(), b"read only");
+}
+
 /// §4.15 step 6 (a directory's mode lands as recorded). Do: under the conventional umask 022, land a scratch
 /// volume holding `/shared` (0775), `/private` (0700) and a file in each into an empty real directory. Expect:
 /// each directory on the disk has exactly its recorded mode. Before 2026-10-01 the landed directory was made

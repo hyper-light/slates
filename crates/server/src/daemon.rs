@@ -621,7 +621,7 @@ pub struct ReplicaAccount {
   pub hold: u64,
 }
 
-/// Clients found dead and reclaimed (a health signal; T-2.3).
+/// Clients found dead and reclaimed: retirements the reaper finished after their hang-up (a health signal; T-2.3, A-475).
 pub static CLIENTS_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The loopback port the NFS transport serves on (§4.6), 0 until the listener is bound. Published as
 /// a process-global word (like the health signals) so a verb handler on any shard can report it to a
@@ -4583,6 +4583,8 @@ async fn init_shard(
     refusals: std::collections::BTreeMap::new(),
     deferred: Vec::new(),
     server_task: None,
+    dead_clients: std::collections::VecDeque::new(),
+    reaper_task: None,
     scatters: std::collections::BTreeMap::new(),
     grant_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
@@ -4645,6 +4647,7 @@ async fn init_shard(
     live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     moves_out: std::collections::BTreeMap::new(),
+    move_carries: std::collections::BTreeMap::new(),
     move_adoptions: std::collections::BTreeMap::new(),
     move_records: std::collections::BTreeMap::new(),
     moves_forgotten: std::collections::BTreeSet::new(),
@@ -4811,6 +4814,9 @@ async fn init_shard(
   let _ = futures::detach(serve);
   let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reap);
+  // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
+  let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(reaper);
   Ok(slices.finish())
 }
 
@@ -4858,10 +4864,11 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's sweep for dead clients and expired leases, at the liveness cadence: the same
-/// budget the anchor allows the daemon's own heartbeat, so a peer silent that long is asked
-/// about (§4.7 "Failure matrix"). Derived: the cadence is the budget; a client is asked about
-/// once silent for the budget, so a death is seen within two budgets at most.
+/// The shard's tick for the deadlines and the cold work it still owns, at the liveness cadence: expired leases, lapsed
+/// CLI attachments, destroys and grants, the audit owed, departed hosts' attachments, the pressure hold, base hints and
+/// the idle seal. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's
+/// reaper retires it then (`crate::reap`). The jobs left here leave a piece at a time for the events or deadlines that
+/// own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4872,6 +4879,14 @@ async fn reap_loop() {
   loop {
     pace(cadence).await;
     state::with_state(|s| {
+      // Abandoned staging buffers and expired status pages, a lease after their last use (`crate::staging`,
+      // `crate::status_pages`): deadlines this tick keeps until the deadline wheel takes them (A-475 moved them here
+      // from the dead-client sweep).
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+      s.staging.expire(now, &mut s.store.metadata);
+      for (_, client) in s.clients.iter_mut_all() {
+        client.status_pages.expire(now, &mut s.store.metadata);
+      }
       let _ = verbs::expire_leases(s);
       // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
       let _ = verbs::expire_lapsed_attachments(s);
@@ -4886,13 +4901,9 @@ async fn reap_loop() {
     });
     // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
     crate::remote_attach::sweep_departed().await;
-    let reaped = crate::reap::sweep(cadence).await;
     // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
     #[cfg(target_os = "linux")]
     let _reclaimed = crate::held_copy::reclaim_unclaimed().await;
-    if reaped > 0 {
-      CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
-    }
     refresh_pressure_hold().await;
 
     crate::nfs::purge_owed_here().await;
@@ -5733,7 +5744,12 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
       "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
     );
   }
-  rebuild_remote_works(origin, shards).await;
+  let owed = rebuild_remote_works(origin, shards).await;
+  if owed > 0 {
+    slates_machine::log_line!(
+      "slates-server: {owed} work(s) left unbuilt at recovery: their shards did not answer twice; their records are kept"
+    );
+  }
   drop_pending_creations(origin, shards).await;
   let floors = reconcile_work_floors(origin, shards).await;
   if floors > 0 {
@@ -5744,55 +5760,79 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
 }
 
 /// Replays each work whose green lives on another partition through that green's owner (A-247), its log being read
-/// from the work's partition. A shard that does not answer leaves its works unbuilt, and a retry of their verbs answers
-/// `NotFound`, as a work whose log would not replay does.
-async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
+/// from the work's partition, and installs the outcome on the work's shard. Every ask is made once more when its answer
+/// was lost ([`ask_once_more`], A-513): the list is read from the work's shard, never taken
+/// (`verbs::unbuilt_works`), and the install ends the work's record there (`verbs::install_replayed_work`), so a
+/// second ask behind a first that ran finds what the first left. Taken, one lost answer left every work of that shard
+/// unbuilt for the daemon's life: unserved, every change it acknowledged out of reach, and its floor holding its green's
+/// checkpoint at its base. A work whose asks went unanswered twice keeps its record and stays unbuilt until the daemon's
+/// next start replays it from its log (a retry after admission is owed, GAPS). Returns how many works were left so.
+async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) -> usize {
+  let mut owed = 0usize;
   for shard in shards.iter().copied() {
-    let Some(unbuilt) = crate::xshard::call_in_shard_time(
-      origin,
-      shard.0,
-      |s| std::mem::take(&mut s.work_home.unbuilt),
-      LIVENESS_BUDGET_NS,
-    )
-    .await
+    let Some(unbuilt) = ask_once_more(origin, shard.0, |s| crate::verbs::unbuilt_works(s)).await
     else {
+      slates_machine::log_line!(
+        "slates-server: shard {} did not list its works to rebuild at recovery",
+        shard.0
+      );
       continue;
     };
     for work in unbuilt {
-      let id = work.work;
-      let Some(entries) = crate::xshard::call_in_shard_time(
-        origin,
-        shard.0,
-        move |s| s.db.partition().work_log(id).to_vec(),
-        LIVENESS_BUDGET_NS,
-      )
-      .await
-      else {
-        continue;
-      };
-      let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
-      let Some(owner) = shards.get(usize::from(partition)) else {
-        continue;
-      };
-      let (green, created_at) = (work.green, work.created_at);
-      let Some(replayed) = crate::xshard::call_in_shard_time(
-        origin,
-        owner.0,
-        move |s| crate::verbs::owner_replay(s, green, created_at, &entries),
-        LIVENESS_BUDGET_NS,
-      )
-      .await
-      else {
-        continue;
-      };
-      let _ = crate::xshard::call_in_shard_time(
-        origin,
-        shard.0,
-        move |s| crate::verbs::install_replayed_work(s, &work, replayed),
-        LIVENESS_BUDGET_NS,
-      )
-      .await;
+      if !rebuild_remote_work(origin, shards, shard, work).await {
+        owed = owed.saturating_add(1);
+      }
     }
+  }
+  owed
+}
+
+/// One work of [`rebuild_remote_works`]: its log read on its shard, replayed through its green's owner, the outcome
+/// installed on its shard. Whether every ask was answered.
+async fn rebuild_remote_work(
+  origin: u16,
+  shards: &[ShardId],
+  shard: ShardId,
+  work: crate::work_home::Unbuilt,
+) -> bool {
+  let id = work.work;
+  let Some(entries) = ask_once_more(origin, shard.0, move |s| {
+    s.db.partition().work_log(id).to_vec()
+  })
+  .await
+  else {
+    return false;
+  };
+  let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
+  let Some(owner) = shards.get(usize::from(partition)) else {
+    return false;
+  };
+  let (green, created_at) = (work.green, work.created_at);
+  let Some(replayed) = ask_once_more(origin, owner.0, move |s| {
+    crate::verbs::owner_replay(s, green, created_at, &entries)
+  })
+  .await
+  else {
+    return false;
+  };
+  ask_once_more(origin, shard.0, move |s| {
+    crate::verbs::install_replayed_work(s, &work, replayed);
+  })
+  .await
+  .is_some()
+}
+
+/// Asks `shard` to run `work` in its own time, and once more when no answer came back (A-513, as A-505 asks a map's
+/// send): the second ask runs behind the first on the shard's channel, so a first ask that ran is answered from what it
+/// left there. Only for work that reads, or whose second run finds the record its first left.
+async fn ask_once_more<T: Send + 'static>(
+  origin: u16,
+  shard: u16,
+  work: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+) -> Option<T> {
+  match crate::xshard::call_in_shard_time(origin, shard, work.clone(), LIVENESS_BUDGET_NS).await {
+    Some(answer) => Some(answer),
+    None => crate::xshard::call_in_shard_time(origin, shard, work, LIVENESS_BUDGET_NS).await,
   }
 }
 
@@ -6207,15 +6247,27 @@ async fn control_loop(
             // The server task may be idle with its parked flags set on the clients it knew;
             // a wake makes it mark the new client too before it idles again.
             let server = state::with_state(|s| {
-              let last_seen_ns = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+              // Its hang-up is watched from its seat on (A-475). A client whose hang-up cannot be watched is not seated,
+              // since nothing would reclaim it: its control closes with this task, which its client reads as the daemon
+              // gone, and the admission gives its id back.
+              let hangup = match crate::hangup::Hangup::of_client(control.as_ref(), pid) {
+                Ok(hangup) => hangup,
+                Err(refusal) => {
+                  s.count(crate::reap::UNWATCHABLE, 1);
+                  slates_machine::log_line!(
+                    "slates-server: client {client_id} is not seated: its hang-up cannot be watched ({refusal})"
+                  );
+                  return None;
+                }
+              };
               match s.clients.insert(ClientSlot {
                 status_pages: crate::status_pages::StatusPages::default(),
                 end,
                 principal,
                 client_id,
                 pid,
-                last_seen_ns,
                 retiring: false,
+                watch: None,
                 proven: false,
                 control,
                 revoked: false,
@@ -6226,7 +6278,11 @@ async fn control_loop(
                 remote_volumes: Vec::new(),
                 maps_sent: std::collections::BTreeSet::new(),
               }) {
-                Ok(_) => admission.seat(),
+                Ok(seat) => {
+                  if crate::reap::start_watch(s, seat, client_id, hangup) {
+                    admission.seat();
+                  }
+                }
                 Err(e) => {
                   slates_machine::log_line!(
                     "slates-server: client {client_id} refused by the shard's table: {e}"

@@ -3590,13 +3590,14 @@ impl Beginning {
 
   /// [`Beginning::new`] for a clone of a captured base (§4.15 `capture_base`, A-291's landing): its manifest is the
   /// change of `request.source` since the capture `base` (a snapshot's tree in the same store, pinned while the clone
-  /// lives), every entry judged by content ([`crate::manifest::PlanWalk::against_capture`]), and its finish leaves the
-  /// volume as it was.
+  /// lives; or, for a clone a move brought here, what the move carried of the capture and the clone's mark, A-503),
+  /// every entry judged by content ([`crate::manifest::PlanWalk::against_capture`]), and its finish leaves the volume
+  /// as it was.
   pub fn against_capture(
     vol: &Volume,
     target: &LandingTarget,
     request: &LandingRequest,
-    base: slates_vfs::captured::FrozenTree,
+    base: impl Into<slates_vfs::captured::CaptureBase>,
   ) -> Result<Beginning, LandingRefusal> {
     let began = Instant::now();
     let walk = crate::manifest::PlanWalk::against_capture(vol, request.source, base)

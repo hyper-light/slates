@@ -587,6 +587,29 @@ pub enum Op {
     /// The snapshot.
     snapshot: crate::catalog::SnapshotId,
   },
+  /// A captured clone's move carried its capture (A-503): what the volume's catalog ships from now on, and the snapshot
+  /// here holding the head the move hands over (its mark, should the move thaw). Raises the catalog register's sequence,
+  /// so the catalog ships it before the move is reported. Replaces any carried capture the volume held. Appended
+  /// (2026-11-18).
+  CaptureCarried {
+    /// The volume.
+    volume: VolumeId,
+    /// What the move carries.
+    carried: crate::catalog::CarriedRecord,
+    /// The snapshot holding the head it is relative to.
+    mark: Option<crate::catalog::SnapshotId>,
+  },
+  /// A volume a move brought here was materialized with the carried capture its adopted catalog holds (A-503), its mark
+  /// the snapshot it was materialized as when that is the head the capture was carried against, else none. The catalog
+  /// is the adopted one, unchanged, so its sequence stays. Appended (2026-11-18).
+  CaptureAdopted {
+    /// The volume.
+    volume: VolumeId,
+    /// What its adopted catalog carries.
+    carried: crate::catalog::CarriedRecord,
+    /// Its snapshot holding that head, when it holds one.
+    mark: Option<crate::catalog::SnapshotId>,
+  },
   /// A repository was created, its namespace empty (§4.17.1, A-515). Appended.
   RepositoryCreated {
     /// The record.
@@ -705,6 +728,8 @@ impl Op {
       Op::AuditBatchAppended { .. } => "audit_batch_appended",
       Op::VolumeReleased { .. } => "volume_released",
       Op::BaseCaptured { .. } => "base_captured",
+      Op::CaptureCarried { .. } => "capture_carried",
+      Op::CaptureAdopted { .. } => "capture_adopted",
       Op::RepositoryCreated { .. } => "repository_created",
       Op::RepositoryBranchAdded { .. } => "repository_branch_added",
       Op::RepositoryBranchRetired { .. } => "repository_branch_retired",

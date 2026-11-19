@@ -7,12 +7,15 @@
 //! ([`PlanWalk::against_capture`]): its source tree against the captured snapshot's, over the paths where the two part
 //! (`slates_vfs::captured`), every entry judged by content alone ([`Judged::Content`]). Its files hold no witness of
 //! the target (the capture made every body the volume's own, and the target is another folder than the one the
-//! capture read), so a witness there is the BLAKE3 of the bytes the capture held and nothing else.
+//! capture read), so a witness there is the BLAKE3 of the bytes the capture held and nothing else. A clone that moved
+//! to another member (A-503) is planned the same way against what its move carried of the capture and the head it
+//! handed over (`slates_vfs::captured::CaptureBase::Carried`): the capture's state at each path is the same either
+//! way, so the entries are too.
 
 use std::collections::BTreeMap;
 
 use slates_vfs::base::{Diverged, Divergence};
-use slates_vfs::captured::{ChangedPaths, FrozenTree, Held};
+use slates_vfs::captured::{CaptureBase, CaptureSearch, CapturedState, FrozenTree, Held};
 use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
@@ -497,16 +500,16 @@ enum PlanStage {
   },
   /// A clone of a captured base: the paths where its source parts from the capture, being found.
   CaptureChanges {
-    /// The captured snapshot's tree.
-    base: FrozenTree,
+    /// The capture: the captured snapshot's tree, or what a move carried of it (A-503).
+    base: CaptureBase,
     /// The source's tree (a snapshot's, for a sliced plan).
     source: FrozenTree,
     /// The search.
-    changed: ChangedPaths,
+    changed: CaptureSearch,
   },
   /// Each candidate judged against the capture, in path order.
   CaptureEntries {
-    base: FrozenTree,
+    base: CaptureBase,
     source: FrozenTree,
     paths: Vec<String>,
     next: usize,
@@ -532,23 +535,26 @@ impl PlanWalk {
 
   /// A plan of `source` judged against the captured base `base` (§4.15 `capture_base`, A-291's landing): the paths
   /// where `source` parts from the capture, each an entry judged by content ([`Judged::Content`]). For a clone of a
-  /// captured snapshot, which shares that snapshot's nodes; `base` must stay frozen while the plan runs (a capture is
-  /// pinned while a clone of it lives).
+  /// captured snapshot, which shares that snapshot's nodes, or a clone a move brought here with what it carried of the
+  /// capture and its mark, a snapshot of the clone itself (A-503); the trees must stay frozen while the plan runs (a
+  /// capture is pinned while a clone of it lives, and a mark is a snapshot the clone keeps).
   pub fn against_capture(
     vol: &Volume,
     source: Source,
-    base: FrozenTree,
+    base: impl Into<CaptureBase>,
   ) -> Result<PlanWalk, VfsError> {
     let tree = match source {
       Source::Head => vol.head_tree(),
       Source::Snapshot(id) => vol.frozen_tree(id)?,
     };
+    let base = base.into();
+    let changed = base.search(tree);
     Ok(PlanWalk {
       source,
       stage: PlanStage::CaptureChanges {
         base,
         source: tree,
-        changed: ChangedPaths::new(base, tree),
+        changed,
       },
     })
   }
@@ -649,8 +655,7 @@ impl PlanWalk {
           )));
         };
         if filter.keeps(path) {
-          let trees = (base, source);
-          entries.extend(capture_entries(store, vol.policy(), trees, path)?);
+          entries.extend(capture_entries(store, vol.policy(), (&base, source), path)?);
         } else {
           filtered_out = filtered_out.saturating_add(1);
         }
@@ -700,19 +705,7 @@ fn tree_identity(
   no: InodeNo,
   size: u64,
 ) -> Result<[u8; 32], VfsError> {
-  let mut bytes = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
-  let read = slates_vfs::captured::read_file(store, tree, no, 0, &mut bytes)?;
-  bytes.truncate(read);
-  Ok(*blake3::hash(&bytes).as_bytes())
-}
-
-/// What the capture held at a path, as a witness judged by content: a file's bytes' identity, a symlink's target's.
-fn captured_identity(store: &Store, base: FrozenTree, held: &Held) -> Result<[u8; 32], VfsError> {
-  match held {
-    Held::File { no, size, .. } => tree_identity(store, base, *no, *size),
-    Held::Symlink { target, .. } => Ok(*blake3::hash(target.as_bytes()).as_bytes()),
-    Held::Absent | Held::Dir { .. } | Held::Special => Ok([0; 32]),
-  }
+  slates_vfs::captured::file_identity(store, tree, no, size)
 }
 
 /// The entries one candidate path makes (§4.15 step 1 for a captured clone, A-291): none where the capture and the
@@ -724,10 +717,10 @@ fn captured_identity(store: &Store, base: FrozenTree, held: &Held) -> Result<[u8
 fn capture_entries(
   store: &Store,
   policy: NameEquivalence,
-  (base, source): (FrozenTree, FrozenTree),
+  (base, source): (&CaptureBase, FrozenTree),
   path: &str,
 ) -> Result<Vec<LandingEntry>, VfsError> {
-  let was = slates_vfs::captured::held_at(store, base, policy, path)?;
+  let was = base.state_at(store, policy, path)?;
   let now = slates_vfs::captured::held_at(store, source, policy, path)?;
   let entry = |action: Action,
                witnessed: Option<Witness>,
@@ -741,12 +734,11 @@ fn capture_entries(
     windows,
   };
   match (&was, &now) {
-    (Held::Absent, Held::Absent) => Ok(Vec::new()),
+    (CapturedState::Absent, Held::Absent) => Ok(Vec::new()),
     (
-      Held::Dir {
+      CapturedState::Dir {
         mode: was_mode,
         windows: was_windows,
-        ..
       },
       Held::Dir {
         mode,
@@ -755,7 +747,8 @@ fn capture_entries(
       },
     ) => {
       // A directory both held, its mode or bits changed (A-501); an unchanged one makes nothing.
-      let from = FileMeta::of_volume_dir(*was_mode, *was_windows);
+      let was_windows = WindowsAttributes::from_image(*was_windows, Kind::Dir);
+      let from = FileMeta::of_volume_dir(*was_mode, was_windows);
       let to = FileMeta::of_volume_dir(*mode, *windows);
       Ok(if from == to {
         Vec::new()
@@ -774,7 +767,8 @@ fn capture_entries(
       })
     }
     (
-      Held::File {
+      CapturedState::File {
+        identity: captured,
         mode: was_mode,
         windows: was_windows,
         ..
@@ -787,7 +781,8 @@ fn capture_entries(
         windows,
       },
     ) => {
-      let captured = captured_identity(store, base, &was)?;
+      let captured = *captured;
+      let was_windows = WindowsAttributes::from_image(*was_windows, Kind::File);
       let hash = tree_identity(store, source, *no, *size)?;
       let overlay = Some(OverlayIdentity {
         hash,
@@ -795,7 +790,7 @@ fn capture_entries(
         mode: *mode,
         mtime_ns: *mtime_ns,
       });
-      let from = FileMeta::of_volume(*was_mode, *was_windows);
+      let from = FileMeta::of_volume(*was_mode, was_windows);
       let to = FileMeta::of_volume(*mode, *windows);
       let action = if hash != captured {
         Action::Replace
@@ -811,8 +806,8 @@ fn capture_entries(
         *windows,
       )])
     }
-    (Held::Symlink { target: before, .. }, Held::Symlink { target, windows }) => {
-      Ok(if before == target {
+    (CapturedState::Symlink { target: before, .. }, Held::Symlink { target, windows }) => {
+      Ok(if before.as_str() == target.as_ref() {
         Vec::new()
       } else {
         vec![entry(
@@ -827,7 +822,7 @@ fn capture_entries(
     }
     _ => {
       let mut out = Vec::new();
-      if let Some((action, witness)) = removal_of(store, base, &was)? {
+      if let Some((action, witness)) = removal_of(&was) {
         out.push(entry(
           action,
           Some(witness),
@@ -845,19 +840,14 @@ fn capture_entries(
 
 /// What removing what the capture held at a path does: a file, symlink or special name deleted while it is still what
 /// the capture held, a directory removed once emptied; nothing for a name the capture did not hold.
-fn removal_of(
-  store: &Store,
-  base: FrozenTree,
-  was: &Held,
-) -> Result<Option<(Action, Witness)>, VfsError> {
-  Ok(match was {
-    Held::Absent => None,
-    Held::Dir { .. } => Some((Action::Rmdir, content_witness([0; 32]))),
-    Held::File { .. } | Held::Symlink { .. } | Held::Special => Some((
-      Action::Delete,
-      content_witness(captured_identity(store, base, was)?),
-    )),
-  })
+fn removal_of(was: &CapturedState) -> Option<(Action, Witness)> {
+  match was {
+    CapturedState::Absent => None,
+    CapturedState::Dir { .. } => Some((Action::Rmdir, content_witness([0; 32]))),
+    CapturedState::File { .. } | CapturedState::Symlink { .. } | CapturedState::Special => {
+      Some((Action::Delete, content_witness(was.identity())))
+    }
+  }
 }
 
 /// What making `held` writes: its action, for a file or directory its identity, and its Windows bits (A-451).
