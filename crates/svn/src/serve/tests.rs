@@ -19,6 +19,7 @@
 
 use super::*;
 use crate::index::{Action, Index};
+use crate::lock::{Lock, LockEntry, LockToken};
 use crate::report::drive::green::texts_by_md5;
 use crate::report::drive::green::{AUTHZ, FixtureGuards, Green, guards_of, normalize, repository};
 use crate::report::recorded::{
@@ -837,6 +838,63 @@ fn an_update_and_the_reads_judge_one_path_by_the_one_rule_set() {
   );
   assert!(edit.contains("( absent-dir ( 6:secret "), "{edit}");
   assert!(!edit.contains("( add-dir ( 6:secret "), "{edit}");
+}
+
+/// The token of the lock the lock tests hold on `/trunk/a.txt`: `opaquelocktoken:` and a UUID, as
+/// `svn_fs_fs__generate_lock_token` writes one.
+const A_TXT_TOKEN: &str = "opaquelocktoken:5b2b37fb-8a42-4f4a-9c0d-6a3e1f2d0c11";
+
+/// An update of the session's path, `/trunk`, at r6 from a working copy at r6 whose `a.txt` holds
+/// [`A_TXT_TOKEN`], with its report.
+const UPDATE_TRUNK_HOLDING_A_TXTS_LOCK: &[u8] =
+  b"( update ( ( 6 ) 0: true infinity false false ) ) \
+  ( set-path ( 0: 6 false ( ) infinity ) ) \
+  ( set-path ( 5:a.txt 6 false \
+  ( 52:opaquelocktoken:5b2b37fb-8a42-4f4a-9c0d-6a3e1f2d0c11 ) infinity ) ) \
+  ( finish-report ( ) ) ";
+
+/// alice's lock on `/trunk/a.txt`, [`A_TXT_TOKEN`], made at the epoch and never expiring.
+fn a_txts_lock() -> LockEntry {
+  LockEntry::Set(Lock {
+    path: String::from("/trunk/a.txt"),
+    token: LockToken::supplied(A_TXT_TOKEN).unwrap(),
+    owner: String::from("alice"),
+    comment: None,
+    is_dav_comment: false,
+    created: AprTime(0),
+    expires: None,
+  })
+}
+
+/// A-656 continued (3), one source for locks (`reporter.c` `update_entry` and `delta_files`, which
+/// ask `svn_fs_get_lock`; A-602's lock table is the record of truth): update `/trunk` from a working
+/// copy at r6 whose `a.txt` holds a lock token, once with the repository's lock table holding that
+/// lock on `a.txt` and once with the table holding none, the caller's guards holding no lock either
+/// time; expect `a.txt` left alone where the table holds the lock, and its lock token taken away
+/// (`svn:entry:lock-token` with no value) where the table holds none: the update reads the table a
+/// commit's and the lock verbs' checks read.
+#[test]
+fn an_update_keeps_a_lock_the_lock_table_holds_and_takes_away_one_it_does_not() {
+  let mut held = fixture();
+  held.locks.apply(&a_txts_lock()).unwrap();
+  let no_guards = FixtureGuards::default();
+  let mut connection = established();
+  let kept = send_in_slices(
+    &held,
+    &no_guards,
+    &mut connection,
+    UPDATE_TRUNK_HOLDING_A_TXTS_LOCK,
+  );
+  assert!(!kept.contains("svn:entry:lock-token"), "{kept}");
+  let none = fixture();
+  let mut connection = established();
+  let taken = send_in_slices(
+    &none,
+    &no_guards,
+    &mut connection,
+    UPDATE_TRUNK_HOLDING_A_TXTS_LOCK,
+  );
+  assert!(taken.contains("20:svn:entry:lock-token ( )"), "{taken}");
 }
 
 /// Sends `command` on an established connection a byte of room and a step a call, until the
