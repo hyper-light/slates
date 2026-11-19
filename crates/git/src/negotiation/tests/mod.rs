@@ -786,6 +786,7 @@ struct Plan {
   since: u8,
   filter: u8,
   filter_value: u8,
+  mode: u8,
 }
 
 /// A generated plan: up to 6 blobs, 6 trees, 14 commits, 4 tags, 3 greens of up to 6 versions, and a request.
@@ -823,12 +824,13 @@ fn any_plan() -> impl Strategy<Value = Plan> {
       any::<u8>(),
       any::<u8>(),
       any::<u8>(),
+      any::<u8>(),
     ),
   )
     .prop_map(
       |(
         (blobs, trees, commits, tags, greens),
-        (wants, haves, shallow, flags, deepen, depth, since, filter, filter_value),
+        (wants, haves, shallow, flags, deepen, depth, since, filter, filter_value, mode),
       )| Plan {
         blobs,
         trees,
@@ -844,6 +846,7 @@ fn any_plan() -> impl Strategy<Value = Plan> {
         since,
         filter,
         filter_value,
+        mode,
       },
     )
 }
@@ -918,6 +921,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
   graph.tags = tags.clone();
   let mut current = Vec::new();
   let mut versions = Vec::new();
+  let mut chains: Vec<Vec<u32>> = Vec::new();
   for (head, picks, rewrite) in &plan.greens {
     let head = pick(&commits, *head);
     let chain = first_parents(&graph, head);
@@ -934,6 +938,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
       heads.insert(place + 1, pick(&commits, rewrite.wrapping_add(7)));
     }
     versions.extend(heads.iter().copied());
+    chains.push(heads.clone());
     current.push(head);
     graph.new_green(&heads);
     graph.tips.push(head);
@@ -1007,7 +1012,35 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
     ])),
     _ => Some(Filter::SparseOid(b"main:.sparse".to_vec())),
   };
+  if plan.mode % 3 == 0 {
+    one_round_friendly(&graph, plan, &current, &chains, &mut asks);
+  }
   (graph, asks)
+}
+
+/// A third of the plans: what closes the one-round path cleared (shallow lines, a deepening, a filter by depth or
+/// pattern, a want the store does not hold), and a have on an earlier version of the first want's green, when the
+/// first want heads one.
+fn one_round_friendly(
+  graph: &TestGraph,
+  plan: &Plan,
+  current: &[u32],
+  chains: &[Vec<u32>],
+  asks: &mut Asks,
+) {
+  asks.shallow.clear();
+  asks.deepen = None;
+  asks.filter = (plan.filter % 2 == 1).then_some(Filter::BlobNone);
+  asks.wants.retain(|id| graph.node(id).is_some());
+  let Some(first) = plan.wants.first() else {
+    return;
+  };
+  let green = usize::from(*first) % current.len();
+  let heads = &chains[green];
+  if heads.len() >= 2 {
+    let earlier = heads[usize::from(plan.mode / 3) % (heads.len() - 1)];
+    asks.haves.push(graph.id(earlier));
+  }
 }
 
 /// What the generated cases met, so a passing oracle test cannot be a vacuous one.
