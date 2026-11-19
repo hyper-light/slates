@@ -14438,16 +14438,17 @@ and export by landing).
 >
 > **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
 > `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
-> (`reads::Repository`: entries, property lists, revision properties, texts in runs), the session's `Guards` (its locks)
-> and its one compiled read rule, which its read commands ask too (A-656 continued (2)): an explicit stack of frames,
-> never recursion, a step at a time under the caller's budget, the report read one path ahead as `reporter.c` reads it;
-> entry properties, lock tokens removed, property differences, absent entries, deletions with `svn_repos_deleted_rev`'s
-> revision, depth upgrades and exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve`
-> makes in its words. Held to every drive `svnserve` made in the recorded sessions (27, the early answer's being the
-> handler's), replayed from each session's own report over `history.txt` rebuilt into an index and a green and checked
-> against `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by
-> what its delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base
-> (`xdelta.c`), sent today as new data; and the handler.
+> (`reads::Repository`: entries, property lists, revision properties, texts in runs), A-602's lock table at the call's
+> instant, the one record of locks (A-656 continued (3)), and the session's one compiled read rule, which its read
+> commands ask too (A-656 continued (2)): an explicit stack of frames, never recursion, a step at a time under the
+> caller's budget, the report read one path ahead as `reporter.c` reads it; entry properties, lock tokens removed,
+> property differences, absent entries, deletions with `svn_repos_deleted_rev`'s revision, depth upgrades and
+> exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve` makes in its words. Held to
+> every drive `svnserve` made in the recorded sessions (27, the early answer's being the handler's), replayed from each
+> session's own report over `history.txt` rebuilt into an index and a green and checked against `svnlook changed`: call
+> for call, a node's own properties and a directory's deletions as sets, each text by what its delta makes of its base;
+> red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`), sent today as new data; and
+> the handler.
 >
 > **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
 > (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
@@ -49978,6 +49979,36 @@ comment where `published` chooses a new shipper's holders); GAPS (the register n
     `a_successors_live_log_goes_on_past_every_position_durable_before_it` and
     `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to`.
   - The Linux and Windows runs are owed.
+
+### A-656, continued (3) — One record of locks: an update reads A-602's lock table (bug, 2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (A-616 part 2's second slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/report/drive.rs` (`Guards` removed, `Sources::locks` and `Sources::now`, `held_token`),
+`report/drive/green.rs` (`FixtureGuards` removed, `locks_of`, `NOW`) and the drive's tests;
+`crates/svn/src/report/exchange.rs` and its tests; `crates/svn/src/serve.rs` (`Sources::guards` removed,
+`Sources::now`) and its tests;
+`docs/bugs/2026-11-19-an-update-judged-locks-by-the-callers-guards-not-the-lock-table.md`.
+
+- **Found** while landing A-656 continued (2): an update's drive asked the caller's `Guards::lock_token` for the lock
+  held on a path (`reporter.c`'s `svn_fs_get_lock` in `update_entry` and `delta_files`), while a commit's checks, the
+  lock verbs and DAV's lock answers read A-602's lock table: two sources for one fact. With a lock the table held and
+  the guards did not, an update told the client its lock was gone (`svn:entry:lock-token` with no value) though a
+  commit with that token is honored; the reverse kept a token the table no longer held.
+- **One record.** The drive reads the lock table (`Sources::locks`) at the instant the caller gives with every call
+  (`Sources::now`, as a commit's `CommitStart::now`): `LockTable::get_lock`, which leaves an expired lock out as
+  `svn_fs_get_lock` does. `Guards` and `serve::Sources::guards` are gone, with the generic parameter every function
+  carried for them; the connection hands the drive the table its `Sources` hold.
+- **Tests.** `an_update_keeps_a_lock_the_lock_table_holds_and_takes_away_one_it_does_not` (`serve/tests.rs`): an
+  update of `/trunk` from a working copy at r6 whose `a.txt` holds a token, once with the table holding that lock and
+  once with it holding none: `a.txt` left alone, then its token taken away. Red before the change (macOS arm64, Mac
+  Studio, 2026-11-19, over main at `901be4f52`, the guards holding no lock): `( open-file ( 5:a.txt 2:d0 2:c1 ( 6 ) )
+  )` and `( change-file-prop ( 2:c1 20:svn:entry:lock-token ( ) ) )` where the table held the lock. The recorded
+  `update-with-lock` session's lock, which the fixtures' guards held by hand, is now a lock in the table its replays
+  read (`green::locks_of`). Run (macOS arm64, Mac Studio): `cargo test --locked -p slates-svn --lib -- commit::
+  serve:: lock:: report::` 130 of 130 on the tree landed over main at `bb535bd4d` (126 of 126 before main's
+  `a5ceb9c02`, whose new tests read the lock table too), `cargo fmt -p slates-svn -- --check` clean; the crate has no
+  integration target.
+- **Owed.** The commit drive's second compile of `Policy::authz` (it should take the session's set: main's next
+  piece); the Windows run and red-checks (main's).
 
 ### A-640 part 4, second slice — The walk by path: git's sparse frames over named tree entries (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-615 part 2, A-640 part 4 first slice)
 Applied in the same change to:

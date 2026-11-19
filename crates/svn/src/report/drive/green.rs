@@ -5,12 +5,12 @@
 //! kept as trees for a green. So the index, the green and the `svnserve` the sessions were recorded
 //! against hold one history, which the tests check against `changed.txt` (`svnlook changed`).
 
-use super::Guards;
 use crate::authz::{Authz, Bounds, Principal, PrincipalRules};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PropertyList, Revision,
   RevisionRecord, Text,
 };
+use crate::lock::{AprTime, Lock, LockEntry, LockTable, LockToken};
 use crate::mergeinfo::Contents;
 use crate::reads::Repository;
 use crate::report::Report;
@@ -176,19 +176,9 @@ fn encoded_list<'p>(properties: impl Iterator<Item = (&'p [u8], &'p [u8])>) -> V
   encoded
 }
 
-/// The session's guards in the fixtures: the locks held now. What a principal may read is
-/// [`rules_of`]'s.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct FixtureGuards {
-  /// The locks held, by path: their tokens.
-  pub(crate) locks: BTreeMap<String, Vec<u8>>,
-}
-
-impl Guards for FixtureGuards {
-  fn lock_token(&self, path: &str) -> Option<&[u8]> {
-    self.locks.get(path).map(Vec::as_slice)
-  }
-}
+/// The instant the fixtures' drives judge locks at: the epoch. No lock the fixtures hold expires.
+/// Format: `apr_time_t`, microseconds since the Unix epoch.
+pub(crate) const NOW: AprTime = AprTime(0);
 
 /// The fixtures' authorization file (`make-fixtures.py` `AUTHZ`): everyone reads, alice writes, and
 /// `/trunk/secret` is alice's alone.
@@ -619,17 +609,28 @@ pub(crate) fn texts_by_md5(green: &Green) -> BTreeMap<[u8; 16], Vec<u8>> {
   texts
 }
 
-/// The guards a recorded session's drive ran under: no lock held, and in the session that holds
-/// `a.txt`'s lock, the lock its report names.
-pub(crate) fn guards_of(name: &str, report: &Report) -> FixtureGuards {
-  let mut guards = FixtureGuards::default();
+/// The lock table a recorded session's drive ran under: empty, and in the session that holds
+/// `a.txt`'s lock, that lock, its token the one its report names (alice's, never expiring).
+pub(crate) fn locks_of(name: &str, report: &Report) -> LockTable {
+  let mut locks = LockTable::new();
   if name == "update-with-lock.1" {
     let held = report
       .paths
       .iter()
       .find_map(|info| info.lock_token.clone())
       .unwrap();
-    guards.locks.insert(String::from("/trunk/a.txt"), held);
+    let token = LockToken::supplied(std::str::from_utf8(&held).unwrap()).unwrap();
+    locks
+      .apply(&LockEntry::Set(Lock {
+        path: String::from("/trunk/a.txt"),
+        token,
+        owner: String::from("alice"),
+        comment: None,
+        is_dav_comment: false,
+        created: NOW,
+        expires: None,
+      }))
+      .unwrap();
   }
-  guards
+  locks
 }
