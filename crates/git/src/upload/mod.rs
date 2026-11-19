@@ -70,6 +70,7 @@ mod answer;
 mod fetch;
 mod fragments;
 mod refs;
+mod revision;
 mod sparse;
 mod v0;
 
@@ -229,9 +230,9 @@ pub enum Refusal {
     /// The `<blob-ish>`, as the client sent it.
     name: Vec<u8>,
   },
-  /// A `sparse:oid` filter's `<blob-ish>` in a form of git's revision syntax this server does not resolve: a parent or
-  /// an ancestor (`~`, `^`), a peel or a reflog (`^{...}`, `@{...}`), an abbreviated name or `git describe`'s, or a
-  /// search of commit messages (`:/`). Answered with git's words for a name that names nothing, and why.
+  /// A `sparse:oid` filter's `<blob-ish>` in a form of git's revision syntax this server does not resolve yet: a parent
+  /// or an ancestor (`~`, `^`), a peel or a reflog (`^{...}`, `@{...}`), or a search of commit messages (`:/`).
+  /// Answered with git's words for a name that names nothing, and why.
   SparseForm {
     /// The `<blob-ish>`, as the client sent it.
     name: Vec<u8>,
@@ -327,8 +328,8 @@ impl Refusal {
 const SPARSE_BLOB: &[u8] = b"unable to access sparse blob in '";
 
 /// Format: why a `<blob-ish>` of a form this server does not resolve is answered as naming nothing: what it resolves.
-const SPARSE_FORMS: &[u8] =
-  b"this server resolves an object's full name or a ref, alone or with :<path>";
+const SPARSE_FORMS: &[u8] = b"this server resolves an object's full or abbreviated name, git describe's name or a \
+  ref, alone or with :<path>";
 
 /// Format: the words for a request past its admission.
 const PAST_ADMISSION: &[u8] = b"upload-pack: the request needs more room than the server admits";
