@@ -32438,3 +32438,45 @@ names its file, `holds_unsynced_metadata`).
   --lib` 35 of 35, the writer ignored; `slates-vfs --lib -- host::sim captured` 3 of 3. Red-checked once: with the
   barrier given the batch's temporaries alone, the same 3 failed. `cargo fmt` laid the lines out. Filed for main: the
   crash oracle, whose metadata entries now take a barrier.
+
+### A-501 — A `touch` alone and a base directory's mode alone land, each a metadata entry judged by A-458's per-field rule and synced by its batch's barrier (2026-11-18, g085, UI goal 88; §4.5 copy-up, §4.15 steps 1, 4, 5 and 8; A-458, A-466, A-469, A-472)
+Applied in the same change to: §4.5 (a base directory's witness), §4.15 step 4 (the time field; a directory's metadata
+entry), step 5 (its order), step 8 (its sync), GAPS (A-185's owed list: fixed, with what it leaves; A-472's made
+directory, asked and left), `docs/bugs/2026-11-18-a-touch-alone-and-a-base-directorys-mode-alone-never-landed.md`,
+`crates/land` (`src/manifest.rs`: a touched file a `Chmod`, `Action::ChmodDir`, tag 9 and class 6, `FileMeta`'s
+directory forms, `dir_meta_entry`, a captured clone's directory entry, the bottom-up order; `src/verdict.rs`:
+`with_modified`, `MetaVerdict::Set`'s time, `chmod_dir_verdict`; `src/engine.rs`: `MetaChange`, the directory's open,
+the time set first; `src/os.rs`, `src/os_windows.rs`: `open_dir_to_chmod`, the Windows writer's directory mode and
+bits; `src/manifest_vectors.rs` and `.txt`: two directory entries a layout, republished; the tests), `crates/vfs`
+(`src/base.rs`: `witness_directory`, the diverged walk, `check_directory_drift`, `rewitness_directory`,
+`witnessed_path`, the landed directory's witness forgotten, `Since::ChangedDir` and `rebase_directory`;
+`src/host/mod.rs`: the seam's `open_dir_to_chmod`; `src/host/sim.rs`: the directory's open, a time set in place
+unsynced until a barrier; `tests/base.rs`, the directory witness's test) and `crates/server` (`src/landing_entries.rs`,
+`src/landing.rs`: a directory's entry presents and counts as a chmod).
+- **What was there.** A file's metadata entry (A-458) carried its permission bits and Windows bits; a time was no part
+  of it, so a file whose bytes and mode were its witness's was a replacement its verdict passed by. A base directory's
+  metadata change took no witness, the diverged walk named no directory but a made, moved or opaque one, and a captured
+  clone's plan made nothing of two held directories, so a directory's mode never landed.
+- **The rule.** A witnessed file whose bytes are its witness's and whose time moved is a `Chmod`; an overlay's verdict
+  judges the time as a field beside the mode and bits (`with_modified`: set where the disk still holds the witnessed
+  time, identical where it holds the volume's, a conflict where it holds a third), and the write sets it through the
+  file's handle before the bits and the mode; a captured clone's judges none, its capture having read another folder. A
+  base directory's first metadata change takes a witness (its fingerprint through its listing's handle, homed at its
+  parent and name, so an image keeps it), and the walk names it `Witnessed`. Its entry, `ChmodDir`, is judged as a
+  file's metadata is, against the directory the disk holds there, and set through a handle the directory itself is
+  opened by, never a link; it lands after every removal, deepest first, so a mode that bars writing or searching stands
+  only once everything beneath has landed, and is synced by its batch's barrier (A-472). Its drift is its own identity
+  and metadata, never its times, which move with its entries; `rewitness` takes the disk's directory again; a landed
+  one's witness is forgotten, and a snapshot landing rebases one whose mode or bits the head changed since onto what
+  landed, so the head's change lands next. Windows keeps no POSIX mode for a directory: there its bits alone are set,
+  its read-only among them, through a handle that asks `FILE_ADD_FILE` for the flush as the writer's directory sync does.
+- **Tests.** Failing first on the Mac Studio (kiln r478): 3 of 38 `slates-land` lib tests failed — a touch alone
+  (`Skipped(Drift)`), a base directory's mode alone (no entry) and a captured clone's directory mode (no entry). With
+  the change (kiln r75 and the final run at 9bf3a46f3, load 9.5 to 18.4, debug): `cargo test --locked -p slates-land
+  --lib` 41 passed and the writer ignored, among them the verdict's time and directory table, the order, the golden
+  vectors and a directory's mode past a landed snapshot; `slates-vfs --lib -- host:: captured` 13 of 13; `cargo fmt`
+  clean. The golden vectors were republished from the encoder and agree byte for byte with the independent encoder's
+  (588265a1). The first run's `crates/vfs/tests/base.rs` found a recovered status naming the directory `inode N`, since a
+  directory has no home for `path_of_inode` to read; fixed (`witnessed_path`), and that integration test's rerun is
+  filed for main with the other checks main runs (clippy, `cargo xtask check`, the cross-target checks, the oracle and
+  crash oracle, the Windows `--test os` suite).
