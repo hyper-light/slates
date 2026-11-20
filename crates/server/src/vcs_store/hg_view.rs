@@ -76,6 +76,10 @@ impl HgStores for ServedViews {
   ) -> Option<Outcome> {
     crate::state::with_state(|state| push_in(state, id, pushing, room)).flatten()
   }
+
+  fn push_room(&self) -> Option<u64> {
+    crate::state::with_state(|state| crate::git_push::push_room(state))
+  }
 }
 
 /// Lands a push on repository `id` over what `state` holds now (module docs, "Pushes"); none when it is not lent, an
