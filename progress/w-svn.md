@@ -114,3 +114,11 @@
   slates-svn's lib-test build on main for one push; fixed by 5ff74820f (landed 1d7c602ec). Landed tree: svn 157/157
   (reads/dav/serve), server lib tests compile. Lesson: re-run after the last merge even when only tests changed.
 - NEXT: w-perf's slice 2. My queue: A-702 part 2 waits on w-reaper's hooks piece; A-703 replay/replay-range next.
+
+## A-703 replay/replay-range -- LANDED main 2963b7ad2 (commit 5fd097b10, verified)
+- report::drive::replay (svn_repos_replay2 + path_driver3), serve::replays (streamed, budgeted), fixtures
+  crates/svn/fixtures/replay (svnsync, svnrdump, 6 scripted; recorded on the Studio, moved via kiln code_run).
+- Tests: 31 revisions call for call; every session through a connection (also byte+step a call). Local svn 296/296,
+  server 35/35 on the landing tree (merged with A-730's lock hooks; serve.rs conflicts kept both sides).
+- Run request: live svnsync/svnrdump over svn:// against a daemon vs svnsync.dump / svnrdump-dump.dump.
+- NEXT: A-702 part 2 on A-730's hooks (vcs_svn::run_hook with HookPoint::SvnPreRevpropChange).
