@@ -47,6 +47,12 @@
   added); node.<n>.<c>(+.props/.children), props, next-ids, changes, txn-protorevs/<txn>.rev streamed. Oracle on
   Studio-1: each golden revision's work tried on R-1 -> svnlook -t == svnlook -r (changed/info/tree/dirs-changed/diff).
   NEXT: P3 waits for A-727 a2 (w-perf) + SLATES_ROOT placement (b); then P4 (git), then (a) root mount publication.
+  URGENT (main) A-740 LANDED: spin reports name the task. slates_rt::label (TaskLabel Site via #[track_caller] at every
+  spawn entry / Named via futures::doing guard; interned table 4096 cells), Pulse::polling (label+polls, one store per
+  poll), watchdog lines "in task L, at its poll P", segment SUP_STUCK_* record -> anchor lapse kill line. Named steps:
+  hg_push::{unbundle,record,rebase,take}, vcs_svn::{answer,land}. Tests: rt spin_label, anchor stuck record, liveness
+  a_spinning_shard_stops_the_beat (red without the record). Seen: anchor a_table_past_the_old_exec_limit fails sendmsg
+  ENOBUFS(55) here -- unrelated to A-740, left for main.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
