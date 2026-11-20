@@ -15438,3 +15438,41 @@ to write it whole and P3 hands the stored delta through. Layout is about 0.3 ms 
 first representation, which a delta names its base by). Both stream, so the view's own memory is a megabyte or two over
 the import either way; one P3 run (256 KiB, round 2) peaked 132 MB over its baseline, unexplained, the other four within
 a megabyte. Kept: P3. Rejected: P1's whole texts.
+
+## Whole-file rewrites recovered as the edits they were: token grain, Myers anchored on unique tokens (A-776; D-O17; 2026-11-20)
+
+The A/B that settled `slates_merge::refine`'s shape. Command: `cargo run --release -p slates-merge --example rewrite_ab`
+(one arm alone: `... -- myers/token`). Corpus: six of the merge crate's own source files (462 KiB) at main 46951a489.
+Workloads: 240 pairs each of two agents saving whole files from one base, the second judged after the first by the real
+green (`Green::submit`). `lines`: one token changed on each of two different lines. `tokens`: two different tokens of
+one line. `format`: a re-indent of every line beside a one-token edit. `clash`: one token changed differently by both,
+where an accept is a silent merge. "Wrong" counts a green file differing from the oracle, or an accept on `clash`.
+Cost: the refinement alone, µs per KiB of the larger file, median and p99 over 3,840 saves; the median is the fastest of
+five interleaved rounds, all five shown. Scratch: the refiner's high-water. Apple M3 Ultra (32 cores), macOS arm64,
+release, load 18.5 at the start (other agents' builds), 14:03 PST.
+
+| arm | lines conflicts | tokens conflicts | format conflicts | clash conflicts (wrong) | median µs/KiB | p99 µs/KiB | scratch KiB | rounds (median) |
+|---|---|---|---|---|---|---|---|---|
+| whole (before) | 240/240 | 240/240 | 240/240 | 240/240 (0) | 0.000 | 0.007 | 0 | 0.000 ×5 |
+| trim only | 0/240 | 0/240 | 215/240 | 240/240 (0) | 0.467 | 6.567 | 1,024 | 0.480 0.484 0.480 0.480 0.467 |
+| Myers, bytes | 0/240 | 0/240 | 156/240 | 0/240 (**240**) | 0.486 | 174.5 | 4,211 | 0.497 0.494 0.500 0.503 0.486 |
+| **Myers, tokens (kept)** | **0/240** | **0/240** | **0/240** | **240/240 (0)** | **0.479** | **51.2** | **1,480** | 0.488 0.479 0.483 0.479 0.484 |
+| Myers, lines | 0/240 | 240/240 | 182/240 | 240/240 (0) | 0.484 | 24.0 | 441 | 0.536 0.484 0.486 0.487 0.485 |
+
+No arm produced a wrong file on the three accepting workloads. Every arm above runs anchored on unique units when Myers
+alone exhausts its budget.
+
+- **Rejected: bytes.** They accepted all 240 one-token clashes, merging two agents' changes inside one identifier into a
+  word neither wrote. That is the silent interleave D-27 forbids.
+- **Rejected: lines, and with them patience and histogram.** Those two anchor on lines and answer at line grain. Two
+  edits to different tokens of one line conflicted 240 of 240.
+- **Rejected: trim alone.** A formatter pass beside an edit conflicted 215 of 240.
+- **Rejected: Myers over tokens without anchoring** (the first run, budget 64 steps a unit). 148 of 240 formatter pairs
+  conflicted, the re-indent kept whole at the budget, and p99 was 191 µs/KiB.
+- **The budgets, measured on the token arm.** Steps a unit for Myers alone, then for the anchored search: (1, 16) gave a
+  p99 of 50.5 µs/KiB; (2, 16) 53.8; (4, 16) 59.7; (2, 32) 53.8; (1, 64) 50.5. All gave 0/240 format conflicts. One shared
+  budget of 16, 4 and 1 a unit gave 0, 28 and 78 of 240. Kept: (1, 16).
+- **Competitor.** `git diff --no-index --diff-algorithm={myers,histogram,patience}` (git 2.50.1) of the same re-indent
+  of `engine.rs` (274 KiB to 300 KiB) takes 10 to 40 ms a process, at line grain and including process start. The
+  refiner's p99 save, at token grain, is about 14 ms for that file.
+
