@@ -175,3 +175,9 @@
   arches); B7a/B7b tests pass on Windows x86_64 (jupiter); GAPS records the B-list closed and B6 unknown.
 - Slip: `git switch -c` used once to name a detached diag worktree's branch (no harm); no repeat.
 - Goal 87 parts done; waiting for main's next piece.
+- LANDED main b56e5766d: the WinFsp fsx record re-recorded (diag-w-bugs-fsxrec-1: x86_64 + arm64 both pass seed 1
+  whole, list empty) and conformance.md's matrix re-rendered; matrix test 4/4 (main's doc-truth red from my A-725).
+- NEXT PIECE (main, goal 93): Subversion's fetch rule (§4.17.1 "A fetch's answer", A-745): measure checkout +
+  update-report of a large repo over svn:// and DAV (past-budget counter, admitted sizes); if past budget or whole-answer
+  admission, slice the editor drive on both edges, red first (checkout larger than a request's room), svnadmin-identical
+  bytes as oracle, generation hold test. w-svn owns the svn crates: inbox note first.
