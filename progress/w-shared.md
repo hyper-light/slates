@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 part a2 = fd679ecd4 (main 57ea648f2): hook Daemon::serve_works_on_holders / WorkHome::on_holders;
+  work_home::green_elsewhere, admit_over_fleet; verbs::base_engine (replica reads on control shard); verdict/rebase
+  refused Unsupported (part c), floor moves counted owed FLOOR_OWED_HOLDER (part b). NEXT: part b (floors at the owner:
+  tell_floor for green_elsewhere -> forwarded floor move/drop to A, e.g. an appended verb or AdmitWork-like WorkFloor
+  verb; owner keeps history at floors). Worktree ~/slates-work/g261-a636p2b2.
+
 ## LANDED 2026-11-20: A-697 part a1 = b856352cb (main 0831c5a0d; ledger c8e444a18): AdmitWork/WorkAdmitted, verbs::admit_work
   (forwarded-only, owner_admit), Daemon::work_floor, fleet test a_holders_work_is_admitted_... NEXT: part a2 (holder B
   serves CreateWork locally behind a TEST-ONLY daemon hook; mints id on B's partition; asks AdmitWork over the forward;
