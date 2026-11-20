@@ -12,8 +12,8 @@ env:
 
 jobs:
   measure:
-    name: svn fetch on ubuntu-latest
-    runs-on: ubuntu-latest
+    name: svn fetch on macos-latest
+    runs-on: macos-latest
     timeout-minutes: 150
     env:
       RESULTS_BRANCH: ${{ github.ref_name }}-results-${{ github.run_id }}
@@ -25,7 +25,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Subversion and the dataset
         run: |
-          sudo apt-get update && sudo apt-get install -y subversion
+          brew install subversion > /dev/null 2>&1 || brew install subversion
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           git clone -q --bare https://github.com/git/git.git "$RUNNER_TEMP/src.git"
           python3 crates/cli/bench/git_to_svn_dump.py "$RUNNER_TEMP/src.git" master 1000 > "$RUNNER_TEMP/git-1000.dump"
           ls -l "$RUNNER_TEMP/git-1000.dump"
@@ -39,7 +40,7 @@ jobs:
           export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
           out="$RUNNER_TEMP/out"; mkdir -p "$out" "$RUNNER_TEMP/cfg" "$RUNNER_TEMP/home"
           r="$out/results.txt"
-          echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD); $(nproc) CPUs; svn $(svn --version --quiet)" > "$out/status.txt"
+          echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD); $(sysctl -n hw.ncpu) CPUs; svn $(svn --version --quiet)" > "$out/status.txt"
           B="$GITHUB_WORKSPACE/target/release/slates"; inst="svnf-$$"; log="$out/anchor.log"
           "$B" --instance "$inst" anchor --vcs-svn 127.0.0.1:0 --vcs-http 127.0.0.1:0 > /dev/null 2> "$log" &
           for i in $(seq 1 120); do
@@ -51,12 +52,12 @@ jobs:
           echo "svn:// $svnport, http $httpport" >> "$r"
           "$B" --instance "$inst" bootstrap root >> "$r" 2>&1
           "$B" --instance "$inst" repository create project --tool svn >> "$r" 2>&1
-          t0=$(date +%s.%N); "$B" --instance "$inst" repository import project "$RUNNER_TEMP/git-1000.dump" >> "$r" 2>&1; echo "import exit $? $(echo "$(date +%s.%N) - $t0" | bc) s" >> "$r"
+          t0=$(python3 -c 'import time; print(time.time())'); "$B" --instance "$inst" repository import project "$RUNNER_TEMP/git-1000.dump" >> "$r" 2>&1; echo "import exit $? $(python3 -c "import time; print(round(time.time() - $t0, 3))") s" >> "$r"
           minted=$(env $exports "$B" --instance "$inst" credential token 2>&1)
           echo "credential token: exit $?; exports $(echo "$exports" | wc -w) words; its lines but the token's:" >> "$r"
           echo "$minted" | grep -v '^token:' | sed 's/^/  /' >> "$r"
           id=$(echo "$minted" | sed -n 's/^id: //p'); token=$(echo "$minted" | sed -n 's/^token: //p')
-          timed() { local what=$1; shift; local t0=$(date +%s.%N); "$@" > "$out/$what.txt" 2>&1; local code=$?; echo "$what exit $code $(echo "$(date +%s.%N) - $t0" | bc) s" >> "$r"; }
+          timed() { local what=$1; shift; local t0=$(python3 -c 'import time; print(time.time())'); "$@" > "$out/$what.txt" 2>&1; local code=$?; echo "$what exit $code $(python3 -c "import time; print(round(time.time() - $t0, 3))") s" >> "$r"; }
           for edge in svn http; do
             if [ $edge = svn ]; then url="svn://127.0.0.1:$svnport/project/trunk"; user="$id"; else url="http://127.0.0.1:$httpport/project/trunk"; user="slates"; fi
             S=(env "HOME=$RUNNER_TEMP/home" LC_ALL=C svn --non-interactive --no-auth-cache --config-dir "$RUNNER_TEMP/cfg" --username "$user" --password "$token")
