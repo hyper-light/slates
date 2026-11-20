@@ -4878,7 +4878,8 @@ fn settled_holders(fleet: &Fleet, owner_index: usize, volume: &str) -> Vec<usize
     }
     assert!(
       Instant::now() < deadline,
-      "the owner's holders settled within the fleet wait: {owner:?}"
+      "the owner's holders settled within the fleet wait: {owner:?}\n{}",
+      diagnosis(&fleet.instances, volume)
     );
     pause();
   }
