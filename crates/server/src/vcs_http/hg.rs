@@ -584,9 +584,16 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       self.answered = Some(Made::Whole(answered.media_type, answered.body));
       return Ok(());
     }
+    // A whole answer is admitted the room a fetch's turn is (A-745 rule 2): what the repository's owner shard could admit
+    // now, never what the request's bytes left of the edge's room. Found by use: `lookup default` over hg's own history
+    // reads each head's manifest for its `.hgtags` (179,155 bytes), refused with 85,302 left.
+    let mut answering = self
+      .stores
+      .fetch_turn(id)
+      .map_or(self.room, |(room, _)| Admission::new(room));
     if let Some((principal, posted)) = &self.batcher {
       let batching = (id, principal, *posted);
-      let answered = answered_batch(&mut self.stores, batching, &request, &mut admission).await?;
+      let answered = answered_batch(&mut self.stores, batching, &request, &mut answering).await?;
       let answered = answered.ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
       self.answered = Some(Made::Whole(answered.media_type, answered.body));
       return Ok(());
@@ -600,7 +607,7 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       Some(principal) => answered_push(&mut self.stores, (id, principal), &request, &mut admission)
         .await
         .map(|answered| Made::Whole(answered.media_type, answered.body)),
-      None => self.stores.lend(id, &mut admission, |store, room| {
+      None => self.stores.lend(id, &mut answering, |store, room| {
         match hg_http::begin(store, &request, header_line(), &mut Fastest, room) {
           hg_http::Begun::Answered(answered) => Made::Whole(answered.media_type, answered.body),
           hg_http::Begun::Streamed(streamed) => Made::Streamed(streamed),

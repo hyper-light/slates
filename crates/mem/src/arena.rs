@@ -200,7 +200,7 @@ fn purge_run(
 ) -> (usize, usize) {
   slot.dirty.take(first, reach);
   let (mut kept, mut discarded) = (0usize, 0usize);
-  for (piece, inside) in pieces_against(region, (first, reach), keep) {
+  for_each_piece(region, (first, reach), keep, |piece, inside| {
     let piece_len = piece.1.saturating_sub(piece.0);
     if inside {
       // The reserve's pages stay resident and counted (A-214).
@@ -210,37 +210,38 @@ fn purge_run(
       // A range shorter than the discard size stays resident: keeping it costs less than faulting it back.
       discarded = discarded.saturating_add(piece_len);
     }
-  }
+  });
   (kept, discarded)
 }
 
-/// The pieces of the run `(first, reach)` in `region`, in address order, each with whether a run of `keep` covers it.
-fn pieces_against(
+/// Visits the pieces of the run `(first, reach)` in `region`, in address order, each with whether a run of `keep`
+/// covers it. Allocates nothing (w-sizing, MEMORY SIZING's zero-alloc rule: it ran once per resident free run of every
+/// idle purge pass, and built a sorted copy of the covers and a list of pieces each time): each step takes the cover
+/// that starts first past the position, a scan of `keep`, which holds a handful of runs (the reserve's adjacent blocks
+/// merge into one run a region, `ChunkArena::upcoming`).
+fn for_each_piece(
   region: u16,
   (first, reach): (usize, usize),
   keep: &[KeptRun],
-) -> Vec<((usize, usize), bool)> {
-  let mut covers: Vec<(usize, usize)> = keep
-    .iter()
-    .filter(|run| run.region == region && run.start < reach && run.end > first)
-    .map(|run| (run.start.max(first), run.end.min(reach)))
-    .collect();
-  covers.sort_unstable();
-  let mut pieces = Vec::new();
+  mut visit: impl FnMut((usize, usize), bool),
+) {
   let mut at = first;
-  for (start, end) in covers {
+  while at < reach {
+    let next_cover = keep
+      .iter()
+      .filter(|run| run.region == region && run.start < reach && run.end > at)
+      .map(|run| (run.start.max(at), run.end.min(reach)))
+      .min();
+    let Some((start, end)) = next_cover else {
+      visit((at, reach), false);
+      return;
+    };
     if start > at {
-      pieces.push(((at, start), false));
+      visit((at, start), false);
     }
-    if end > at {
-      pieces.push(((start.max(at), end), true));
-      at = end;
-    }
+    visit((start, end), true);
+    at = end;
   }
-  if at < reach {
-    pieces.push(((at, reach), false));
-  }
-  pieces
 }
 
 impl std::fmt::Debug for ChunkArena {
@@ -348,10 +349,13 @@ impl ChunkArena {
     let discard_from = self.discard_from;
     let mut done = Purged::default();
     let mut visited = 0usize;
-    let order = self.order.clone();
     let start = self.purge_cursor.take();
     let mut started = start.is_none();
-    for region in order {
+    // By index, not over a copy of the order: the walk borrows each slot mutably, and a copy was an allocation a pass.
+    for index in 0..self.order.len() {
+      let Some(&region) = self.order.get(index) else {
+        break;
+      };
       let from = match start {
         Some((at_region, at)) if at_region == region => {
           started = true;
@@ -1283,6 +1287,72 @@ impl ChunkArena {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The reference the allocation-free walk replaced: the covers clipped to the run, sorted, and the pieces between.
+  fn pieces_by_sorting(
+    region: u16,
+    (first, reach): (usize, usize),
+    keep: &[KeptRun],
+  ) -> Vec<(usize, bool)> {
+    let mut covers: Vec<(usize, usize)> = keep
+      .iter()
+      .filter(|run| run.region == region && run.start < reach && run.end > first)
+      .map(|run| (run.start.max(first), run.end.min(reach)))
+      .collect();
+    covers.sort_unstable();
+    let mut inside = vec![false; reach];
+    for (start, end) in covers {
+      inside[start..end].fill(true);
+    }
+    (first..reach).map(|unit| (unit, inside[unit])).collect()
+  }
+
+  /// One run `(first, reach)` of region 0 walked against `keep` with `for_each_piece`: the pieces tile it, contiguous and
+  /// in address order, and cover exactly the units the sorting reference covers.
+  fn walk_matches_sorting((first, reach): (usize, usize), keep: &[KeptRun]) {
+    let mut walked = Vec::new();
+    let mut at = first;
+    for_each_piece(0, (first, reach), keep, |(start, end), inside| {
+      assert_eq!(start, at, "the pieces are contiguous, in address order");
+      assert!(end > start, "no empty piece");
+      walked.extend((start..end).map(|unit| (unit, inside)));
+      at = end;
+    });
+    assert_eq!(at, reach, "the pieces reach the run's end");
+    assert_eq!(walked, pieces_by_sorting(0, (first, reach), keep));
+  }
+
+  /// w-sizing (MEMORY SIZING, zero-alloc). Do: walk every run `(first, reach)` of a 12-unit region against every set
+  /// of up to three kept runs (overlapping, adjacent, out of order, outside the run, in another region) with
+  /// `for_each_piece`, and with the sorting reference it replaced. Expect the pieces to tile the run exactly, in address
+  /// order, each unit covered exactly when the reference covers it.
+  #[test]
+  fn the_allocation_free_walk_tiles_a_run_as_the_sorting_one_did() {
+    const UNITS: usize = 12;
+    let mut runs = Vec::new();
+    for start in 0..UNITS {
+      for end in start + 1..=UNITS {
+        for region in [0u16, 1] {
+          runs.push(KeptRun { region, start, end });
+        }
+      }
+    }
+    let mut checked = 0usize;
+    for (a, first) in runs.iter().enumerate().step_by(7) {
+      for second in runs.iter().skip(a).step_by(11) {
+        for third in runs.iter().step_by(13) {
+          let keep = [*third, *first, *second];
+          for run_first in 0..UNITS {
+            for run_reach in run_first + 1..=UNITS {
+              walk_matches_sorting((run_first, run_reach), &keep);
+              checked += 1;
+            }
+          }
+        }
+      }
+    }
+    assert!(checked > 10_000, "the enumeration ran: {checked} walks");
+  }
 
   fn page() -> usize {
     if cfg!(miri) {

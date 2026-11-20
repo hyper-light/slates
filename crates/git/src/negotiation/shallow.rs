@@ -20,17 +20,18 @@
 //! an empty shallow-info section, as git sends one. A client's shallow line naming an object the store does not hold is
 //! left out, as git leaves it out, and one naming an object that is no commit is refused.
 
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 use super::paint::{HAVE, Paint, WANT};
 use super::ready::peel;
-use super::{Counters, Deepen, Graph, INFINITE_DEPTH, Peak, Refusal, Request, ShallowInfo, charge};
+use super::{
+  Counters, Deepen, Graph, Held, INFINITE_DEPTH, Peak, Refusal, Request, ShallowInfo, charge,
+};
 use crate::Admission;
 use crate::object_name::ObjectId;
 
 /// A deepening's answer: the shallow commits, and the commits kept whole.
-type ShallowAndWhole<N> = (BTreeSet<N>, BTreeSet<N>);
+type ShallowAndWhole<N> = (BTreeSet<N>, Held);
 
 /// What a request's shallow lines and deepening make of the walk.
 pub(super) struct Cut<N> {
@@ -148,23 +149,30 @@ enum Walk<N> {
     next: usize,
     /// The least generation among the client's shallow commits.
     floor: u64,
-    /// The commits met.
-    seen: BTreeSet<N>,
+    /// The commits met, as runs or bits (A-745 rule 1: a bit or a word a commit, never an entry).
+    seen: Held,
     /// The commits to search.
     stack: Vec<N>,
     /// That stack's cost: its deepest.
     stack_peak: Peak,
   },
-  /// `deepen <depth>`: breadth first from the roots, each commit's least depth.
+  /// `deepen <depth>`: breadth first from the roots, a level at a time, so each commit is met first at its least depth
+  /// (A-745 rule 1: the commits met and kept whole held as runs or bits, never an entry a commit, so a deepening
+  /// reaching most of a history, as `--deepen 100` reaches 24,885 of git v2.0.0's 36,430 commits, fits one request's
+  /// room).
   Depth {
     /// The depth at which a commit is shallow.
     limit: u32,
-    /// Each commit met's least depth.
-    depths: BTreeMap<N, u32>,
-    /// The commits to take.
-    queue: VecDeque<N>,
-    /// That queue's cost: its longest.
-    queue_peak: Peak,
+    /// The depth of the commits in `frontier`.
+    level: u32,
+    /// The commits at `level` still to take.
+    frontier: Vec<N>,
+    /// The commits met at the next level.
+    next: Vec<N>,
+    /// The two levels' cost: their most.
+    peak: Peak,
+    /// Every commit met.
+    seen: Held,
     /// The shallow commits and those kept whole.
     found: ShallowAndWhole<N>,
   },
@@ -215,7 +223,13 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
       Some(Deepening::Depth {
         depth: INFINITE_DEPTH,
         ..
-      }) => Walk::Finish((BTreeSet::new(), grafts.clone())),
+      }) => {
+        let mut whole = Held::default();
+        for node in &grafts {
+          whole.insert(*node, admission)?;
+        }
+        Walk::Finish((BTreeSet::new(), whole))
+      }
       Some(Deepening::Depth {
         depth,
         relative: true,
@@ -227,7 +241,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
           .map(|node| super::ready::generation(graph, *node))
           .min()
           .unwrap_or(u64::MAX),
-        seen: BTreeSet::new(),
+        seen: Held::default(),
         stack: Vec::new(),
         stack_peak: Peak::default(),
       },
@@ -280,8 +294,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
         stack_peak,
       } => {
         if let Some(commit) = stack.pop() {
-          if super::ready::generation(graph, commit) >= *floor && seen.insert(commit) {
-            charge::<N>(admission)?;
+          if super::ready::generation(graph, commit) >= *floor && seen.insert(commit, admission)? {
             stack.extend(graph.parents(commit));
             stack_peak.reach::<N>(stack.len(), admission)?;
           }
@@ -298,37 +311,42 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
         let roots: Vec<N> = client
           .iter()
           .copied()
-          .filter(|node| seen.contains(node))
+          .filter(|node| seen.contains(*node))
           .collect();
         self.walk = by_depth(roots, depth.saturating_add(1), admission)?;
       }
       Walk::Depth {
         limit,
-        depths,
-        queue,
-        queue_peak,
+        level,
+        frontier,
+        next,
+        peak,
+        seen,
         found,
       } => {
-        let Some(commit) = queue.pop_front() else {
-          let found = core::mem::take(found);
-          self.walk = Walk::Finish(found);
+        let Some(commit) = frontier.pop() else {
+          if next.is_empty() {
+            let found = core::mem::take(found);
+            self.walk = Walk::Finish(found);
+          } else {
+            core::mem::swap(frontier, next);
+            *level = level.saturating_add(1);
+          }
           return Ok(None);
         };
-        let at = depths.get(&commit).copied().unwrap_or(*limit);
-        charge::<N>(admission)?;
-        if at >= *limit {
-          found.0.insert(commit);
+        if *level >= *limit {
+          if found.0.insert(commit) {
+            charge::<N>(admission)?;
+          }
           return Ok(None);
         }
-        found.1.insert(commit);
+        found.1.insert(commit, admission)?;
         for parent in graph.parents(commit) {
-          if let Entry::Vacant(slot) = depths.entry(parent) {
-            charge::<(N, u32)>(admission)?;
-            slot.insert(at.saturating_add(1));
-            queue.push_back(parent);
+          if seen.insert(parent, admission)? {
+            next.push(parent);
           }
         }
-        queue_peak.reach::<N>(queue.len(), admission)?;
+        peak.reach::<N>(frontier.len().saturating_add(next.len()), admission)?;
       }
       Walk::Paint { paint, since } => {
         let since = *since;
@@ -341,7 +359,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
             paint,
             next: 0,
             any: false,
-            found: (BTreeSet::new(), BTreeSet::new()),
+            found: (BTreeSet::new(), Held::default()),
           };
         }
       }
@@ -374,7 +392,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
         {
           found.0.insert(commit);
         } else {
-          found.1.insert(commit);
+          found.1.insert(commit, admission)?;
         }
       }
       Walk::Finish(found) => {
@@ -390,28 +408,28 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
 }
 
 /// `deepen <depth>` (or `deepen-relative`'s `depth + 1`) from `roots`, begun: each root at depth 1.
-fn by_depth<N: Copy + Ord>(
+fn by_depth<N: Copy + Ord + Into<u64>>(
   roots: Vec<N>,
   limit: u32,
   admission: &mut Admission,
 ) -> Result<Walk<N>, Refusal> {
-  let mut depths: BTreeMap<N, u32> = BTreeMap::new();
-  let mut queue = VecDeque::new();
+  let mut seen = Held::default();
+  let mut frontier = Vec::new();
   for root in roots {
-    if let Entry::Vacant(slot) = depths.entry(root) {
-      charge::<(N, u32)>(admission)?;
-      slot.insert(1);
-      queue.push_back(root);
+    if seen.insert(root, admission)? {
+      frontier.push(root);
     }
   }
-  let mut queue_peak = Peak::default();
-  queue_peak.reach::<N>(queue.len(), admission)?;
+  let mut peak = Peak::default();
+  peak.reach::<N>(frontier.len(), admission)?;
   Ok(Walk::Depth {
     limit,
-    depths,
-    queue,
-    queue_peak,
-    found: (BTreeSet::new(), BTreeSet::new()),
+    level: 1,
+    frontier,
+    next: Vec::new(),
+    peak,
+    seen,
+    found: (BTreeSet::new(), Held::default()),
   })
 }
 
@@ -421,13 +439,13 @@ fn finish<S: Graph>(
   client: &[S::Node],
   mut grafts: BTreeSet<S::Node>,
   shallow: BTreeSet<S::Node>,
-  whole: &BTreeSet<S::Node>,
+  whole: &Held,
   admission: &mut Admission,
 ) -> Result<Cut<S::Node>, Refusal> {
   let made_whole: Vec<S::Node> = client
     .iter()
     .copied()
-    .filter(|node| whole.contains(node))
+    .filter(|node| whole.contains(*node))
     .collect();
   let mut wants = Vec::new();
   for parent in made_whole.iter().flat_map(|node| graph.parents(*node)) {

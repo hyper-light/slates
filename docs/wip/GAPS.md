@@ -45,7 +45,9 @@
 > shard). **Closed quiet by A-400** (a work on its client's shard): Linux arm64 accept p50 51–55 → 20–21 µs (before W1
 > 18), the Mac 155 → 40–43 (before W1 48–54); loaded on Linux main is three times lower than before W1 (p99 21.0 →
 > 4.6–7.0 ms). **Open:** (a) about 10 µs added to every quiet lone submit since A-400 (Linux accept p50 20–21 → 31–35
-> µs, conflict 17–18 → 27–28; in `f2081a3c8..a5233e228`, bisect under way); (b) the shared Mac loaded, where main is
+> µs, conflict 17–18 → 27–28; bisected over `f2081a3c8..a5233e228`: small steps, the reproducible ones in code a submit
+> never runs, so the release build's layout, not a fix to find; an instruction-count gate on the lone submit is owed
+> to hold it); (b) the shared Mac loaded, where main is
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
 >
@@ -410,9 +412,10 @@
 >
 > **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
-> `ContentUnread` while unread. OWED: part 2, the commit's file blocks built a slice a unit and published in one step;
-> the server's `Objects` over vcs_store's plane and the svn landing's turns (w-svn); replay reading a chain entry's
-> runs first; items 3-7 (the green's block naming the plane's object, no copy).
+> `ContentUnread` while unread. Part 2 BUILT: each run read into its own buffer, which the commit makes the file with
+> no copy (`judge_named`); the server's `PlaneObjects` over vcs_store's plane (range reads); replay reads runs a slice a
+> step. OWED: the svn landing's turns (w-svn); a partial splice of a run copies at the commit; items 3-7 (the green's
+> block naming the plane's object, no copy).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1828,6 +1831,12 @@
 > 300 generated `.hgtags` sequences and to `hg log -r` on a recorded repository). Owed: a branch made at a changeset no
 > line or bookmark heads (a tag inside a line's history), refused `Unsupported` until a green can be branched at the
 > version whose head it was.
+> FIXED by use (w-hg's r15, 2026-11-20, release at 1d4909821): `hg clone -r default` of hg's own history aborted
+> `PastAdmission { asked: 179155, left: 85302 }`. The served `lookup`'s tag step reads each head's manifest for its
+> `.hgtags`, charged to what the request left of the edge's room. Both edges now admit a whole answer (`lookup`,
+> `heads`, a batch) the room a fetch's turn is (`HgStores::fetch_turn`, the owner shard's `vcs_share::room`), as A-745
+> admits each streamed turn and 4136fcd89 admits git's upload-pack answer. Red first:
+> `vcs_http::hg::tests::a_lookup_is_answered_within_a_fetchs_room_not_its_requests`.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -3161,7 +3170,9 @@
 >   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
 >   309,760 after). **A-768 (2026-11-20):** a whole publication's content is read in turns from pinned chunks, a quantum a
 >   turn, the publications made meanwhile queued behind it (before: 4.5 to 6 ms of its turn, debug; its image's 2.0 to
->   3.0 ms is still one turn)); and, after A-347's open, the takeover's
+>   3.0 ms is still one turn). **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
+>   content, in steps of a page (before, debug: a whole entry's open 56 to 59 ms of one turn, the archive's hashing 93 to
+>   99 ms of another)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -3785,7 +3796,9 @@
 >   root, remote or labelling stays refused typed. Owed: that profile's live check by use (filed 2026-11-19: `slates
 >   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
 >   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
->   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+>   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured. **Built 2026-11-20
+>   (A-769, `CONTRACT` = 57):** the export route's judge (`container_engine::export_engine`), asked on every host:
+>   Windows' Docker Desktop over its named pipe is taken, mounting the export from its VM; owed: its run on Windows;
 > - **a volume exported to one client, built 2026-11-19 (A-521, `CONTRACT` = 50; kiln's Kubernetes engine, kiln goal
 >   28e73c34's part 01a1f124, its `docs/agentic.md` W10):** §4.6's export was the command line's (`slates export`) and
 >   the raw client's alone, so a host that drives slates through the library alone (kiln) could not serve a pod's volume
@@ -7316,9 +7329,14 @@
 >   their stock clients' `exit_within` keeps `PATIENCE`, owed: a client waiting on a stock server has no slates tree to
 >   judge beside it. `load_scale` since 2026-11-20: its `eventually` and its wait for an anchor's daemon judged the
 >   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
->   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `vm`, `start_judgment`
->   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
->   are not listed yet), `winfsp`, `live_winfsp` and `winfsp_semantics`
+>   5 s `START_WAIT` retry gone. `winfsp` since 2026-11-20: its daemon's successor, adoptions, counters and recovered
+>   daemon judged in the daemon's own CPU (`DaemonWatch`, re-aimed at each daemon `status` names); a drive's arrival and
+>   departure, a process's exit and a view following a change held to the observation budget (`KERNEL_WAIT`; owed:
+>   Windows' device-change event for the drive, which needs a window's message loop); the purge race's wedge bound kept;
+>   `recovered::await_recovered`'s wall form removed with its last caller. `start_judgment`, `shards`, `winfsp_semantics` and `live_winfsp` since
+>   2026-11-20, judged on Windows by the anchor's process or the daemon's (the pid its `status` names), since Windows
+>   lists no instance's processes by command line and a tree's children are not listed there; `start_judgment`'s
+>   replacement bound and `winfsp_semantics`' wedge bound (`within_wait`) kept as what those tests prove
 >   (`recovered::await_recovered`'s wall form goes with `winfsp`, which runs only on Windows); the VM harness `vm` and
 >   its suites (`guest_dax`, `guest_image`, `guest_vhost`) since 2026-11-20: the guest's boot, replies, console lines
 >   and power-off waited for while the VM's process tree gains CPU (`process_wait::Judged`; `BOOT_WAIT`, `REPLY_WAIT` and

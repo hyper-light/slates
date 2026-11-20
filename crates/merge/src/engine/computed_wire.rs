@@ -154,7 +154,7 @@ impl Green {
           effects: unit
             .applied
             .iter()
-            .map(|applied| self.verdict_effect(applied, (&inc.post_state, &copies)))
+            .map(|applied| self.verdict_effect(applied, (inc.post(), &copies)))
             .collect(),
           windows: unit.windows,
           placed: unit.placed,
@@ -164,7 +164,11 @@ impl Green {
   }
 
   /// The effect the live verdict holds for `applied` (module docs): a splice unmade, every other as a replay rebuilds it.
-  fn verdict_effect(&self, applied: &Applied, sources: (&[u8], &EntryCopies<'_>)) -> Effect {
+  fn verdict_effect(
+    &self,
+    applied: &Applied,
+    sources: (crate::named::Post<'_>, &EntryCopies<'_>),
+  ) -> Effect {
     match applied {
       Applied::Spliced(path, ops) => {
         Effect::SetContent(path.clone(), None, ops.clone(), ContentSource::Mapped)

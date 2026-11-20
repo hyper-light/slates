@@ -701,7 +701,7 @@ fn text_headers(subject: &Subject<'_>) -> Headers {
   };
   headers.push(("Cache-Control", String::from(cache)));
   if subject.place.public
-    && let Some(modified) = subject.date.as_deref().and_then(rfc1123)
+    && let Some(modified) = subject.date.and_then(rfc1123)
   {
     headers.push(("Last-Modified", modified));
   }
@@ -1482,11 +1482,8 @@ fn dav_value<R: ?Sized>(
       .live_media_type()
       .map(|media| quote(&media, false).into_owned()),
     "getetag" => Some(subject.etag()),
-    "creationdate" => subject
-      .date
-      .as_deref()
-      .map(|date| quote(date, true).into_owned()),
-    "getlastmodified" => subject.date.as_deref().and_then(rfc1123),
+    "creationdate" => subject.date.map(|date| quote(date, true).into_owned()),
+    "getlastmodified" => subject.date.and_then(rfc1123),
     _ => dav_version_value(served, subject, name),
   }
 }
@@ -1514,7 +1511,7 @@ fn dav_version_value<R: ?Sized>(
       "<D:href>{root}/{SPECIAL}/vcc/{DEFAULT_VCC}</D:href>"
     )),
     "version-name" => Some(subject.created.to_string()),
-    "creator-displayname" => subject.author.as_deref().map(author_value),
+    "creator-displayname" => subject.author.map(author_value),
     _ => None,
   }
 }

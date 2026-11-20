@@ -4571,6 +4571,12 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > Since its third piece (`CONTRACT` = 48) the judge holds rootless podman on its own Linux host too, the profile
 > `a_rootless_container_reads_and_writes_the_volume_through_its_mount` ran through (2026-10-19): the container's root
 > is the user who mounted the volume, so a host runs its container as the container's root over an unshared mount.
+> Since A-769 (2026-11-20, `CONTRACT` = 57, kiln's export route by Ada's ruling) the judge answers a second question
+> for a host whose engine mounts the volume's NFS export as a volume of its own rather than binding a host mount:
+> `container_engine::export_engine` (`slates_bridge_oci::runtime::judge_export`), on every host, Windows' Docker Desktop
+> over its named pipe among them, answering where the engine mounts the export from (`MountsFrom`: the host's kernel,
+> or Docker Desktop's VM at `host.docker.internal`) or a typed refusal (`RootlessCannotMount`, appended). The bind's
+> profiles stay for Slates' own bind form.
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -57090,10 +57096,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
 - **Measured.** `named_tests::a_named_text_is_read_a_slice_a_step_then_lands_whole`: a 4 MiB text read in 64 steps of
   at most 64 KiB, refused `ContentUnread` before, accepted after with the green's file the text's bytes; its encoding
   under 4 KiB (the names), decoded with its run unread again.
-- **Owed, named.** Part 2: the commit building the green's file blocks a slice a unit off the green and publishing in
-  one step (today `Green::commit` copies the file's bytes in one call); the server's `Objects` over vcs_store's plane
-  and the landing's turns (w-svn's `svn.land.*` counters); replay reading a chain entry's runs before
-  `apply_recorded`; items 3-7 then name the plane's object from the green's block with no copy.
+- **Part 2, held once and landed in turns** (main's piece; Ada's sizing rule: a landing's memory bounded by a slice
+  beside the file, never the file twice). A run is read into a buffer of its own (`named::Read`, one a run, reserved at
+  its length, pages made as written), never onto the post-state; the engine reads every added byte through one view
+  (`named::Post`: the inline bytes, then the runs). `Green::judge_named` moves the runs' buffers into the verdict held
+  (`Green::judge` copies them, so no caller loses bytes), and the commit makes each file whose bytes are exactly one
+  run's, made by no other file, of that buffer, moved (`take_whole_runs`): the text is the green's file with no copy.
+  A created file's bytes are made at the commit, not in the verdict (`merge_create` builds them only to compare with
+  a file standing there). The server reads a run from vcs_store's content plane (`vcs_store::named_objects::
+  PlaneObjects`: identity -> the node-local root, `ContentStore::window_range_in` reading a window's range straight
+  into the run's buffer, so a read copies its own bytes); a recovery's replay, which holds the shard read-only, reads
+  with the shard's chunk store given in place of a lent one (`WindowStorage::read_range_in`'s `kept_in`), the entry
+  kept a copy slice a step until its runs are read (`GreenReplayPhase::Chain::reading`; a missing object fences
+  `ContentMissing`). Measured (`t_a760_a_large_named_text_lands_a_slice_a_turn_held_once`, debug): an 8 MiB text read
+  in 149 turns of a 56,656-byte copy slice, no turn reading more; the committed file the read buffer itself.
+- **Owed, named.** w-svn's landing driving the turns (`svn.land.*`); a splice of part of a run still copies the file at
+  the commit; items 3-7 then name the plane's object from the green's block, so the text is held once in all.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
 
@@ -57358,3 +57376,59 @@ live let a capture's pins go), `crates/vfs/tests/pinned_chunks.rs`.
   read in one turn: 1 turn), `a_whole_capture_in_turns_queues_what_publishes_behind_it_and_lets_its_pins_go` (red: the
   first turn `Done`), `a_capture_dropped_or_forgotten_leaks_no_pin`; `slates-vfs` `pinned_chunks` (red with a pin that
   holds nothing: the overwrite freed the pinned chunk at once).
+
+### A-769 — The export route's judge: whether a container engine mounts a volume's NFS export as a volume of its own, and from where, asked on every host (2026-11-20, w-k90-a520; main's ruling on kiln's export route, Ada's ruling ~09:30 PST; §4.6 A-9, A-520, A-521, A-115, A-184; `CONTRACT` = 57)
+Applied in the same change to: §4.6 (A-520's form through the library: a status line), GAPS (the library's container
+entry), `crates/bridge-oci/src/runtime.rs` (`MountsFrom`, `ExportProfile`, `judge_export`, `ProfileRefusal::
+RootlessCannotMount` appended) and `crates/api/src/container_engine.rs` (`ExportEngine`, `export_engine`, the
+profile's establishment shared by both judges, an `ask` for a host with no Unix pipes to poll, and their tests),
+`crates/api/src/lib.rs` (`CONTRACT` = 57).
+- **Why.** kiln's container engine no longer binds the machine's mount into a container (Ada's ruling, 2026-11-20): the
+  engine mounts the volume's NFS export (`Instance::export`, A-521) as a volume of its own, as kubelet does for kiln's
+  Kubernetes engine. The judge asked only the bind's question, which has no answer on Windows (no host mount is bound
+  into a container there, G-mount step 4), so `engine_profile` refused Windows `Unsupported` before asking any engine,
+  and a Windows runner with Docker Desktop could never run an agent's container though its VM reaches the host's NFS
+  export (Slates' NFS server runs on Windows: A-184).
+- **The question.** Whether the engine can mount the export itself from where it runs, and where that is: a rootful
+  Docker Engine, or podman as root, on its own Linux host from the host's kernel at its loopback; Docker Desktop on
+  macOS (its socket) and on Windows (its named pipe) from its Linux VM, reaching the host's loopback as
+  `host.docker.internal`. No share of the host's folders plays a part, so none of the bind's identity or hard-link
+  rules does: the container runs as the uid the export is bound to, every other id a stranger (A-115). Refused, typed:
+  a rootless engine (`RootlessCannotMount`: the kernel mounts a file system for a process with `CAP_SYS_ADMIN` in its
+  initial user namespace alone), a remapping one (`UserNamespaceUntested`), a labelling one (`SelinuxLabelsUntested`),
+  a remote one (`RemoteEngine`, as before), and any engine on a host not named (`ProfileUntested`).
+- **Rejected.** Removing the bind's profiles with kiln's bind: Slates' own bind form (`slates attach --oci-source`,
+  `slates oci-runtime`, the conformance suite, the transports' report) still uses them, so they go when that form does.
+  Taking the engine's word from `docker info` in kiln itself on Windows: the judge stays one implementation (A-520).
+- **Tests.** Red first, on a copy whose `judge_export` refused every profile: `the_export_route_takes_docker_desktop_
+  on_windows_and_macos_from_its_vm_and_a_rootful_linux_engine_from_the_host` and `the_export_route_refuses_a_rootless_
+  engine_and_an_unnamed_host_typed` failed; green with this change: `cargo test --locked -p slates-api --lib --
+  container_engine contract_history` 10 passed, `cargo test --locked -p slates-bridge-oci` all passed (macOS arm64,
+  Adas-Mac-Studio-4, local). Owed: the Windows `ask`'s run on Windows (main's, §8), and the export route's live run there
+  (kiln's container drive on jupiter, w-k90-containers).
+
+### A-771 — A live takeover's rebuild applies a payload, and hashes its archive's content, in steps (2026-11-20, w-forming; main's order, item (a): the takeover's rebuild turn; §4.10 "Live shipping", g251's rebuild in turns, A-374)
+Applied in the same change to: GAPS (the live owner's long-turn line), `crates/cluster/src/sealed.rs` (`RawOpening`),
+`crates/server/src/live_ship.rs` (`Rebuilding::advance`, `step`, `apply_publication`, `lay_step`; `Applying`, `Begun`,
+`begin_applying`, `apply_record`, `Laying`, `hashed_chunk`, `open_step_bytes`; `apply_payload` and `open_payload` gone),
+`crates/server/src/fleet.rs` (`rebuild_in_turns`' doc), `crates/cluster/tests/sealed.rs`.
+- **What was there.** g251 made a live log's rebuild a slice a turn, with a payload as its unit, and laid the rebuilt
+  volume out as an archive in one turn after it. A whole entry carries the volume's every byte, so it was one step: a
+  1.39 MB whole entry's open took 59 ms of one debug successor turn and a 1.75 MB one's 56 ms (its decode 1.5 to 1.7 ms,
+  its runs' overlay 0.8 to 1.1 ms). The archive's layout hashed every content chunk in its turn, 93 to 99 ms for 1.5 to
+  1.75 MB of runs (w-forming's probe, debug under `taskpolicy -b`, live_chaos's takeover flow, base a7df9ccf0). A
+  1 MiB sealed piece's open measured 13 ms in a debug build, nearly all of it the identity's BLAKE3.
+- **The change.** A payload is applied in steps, the slice's clock read between them. A sealed body's pieces are opened
+  by `slates_cluster::sealed::RawOpening`, which opens segments, then hashes the content against its identity, a budget
+  of bytes a call (an archive page a step), and accepts and refuses what `open_chunk` does for a raw chunk, the form a
+  body is sealed in. The record is applied once the body is open, and each run is laid over the rebuild's as a step of
+  its own. Once every payload is applied, the image's content spans are gathered from the runs and hashed, a page a
+  step (`Laying`), and the archive's layout makes each chunk from its span's bytes and the identity hashed for it, with
+  no hash of its own.
+- **Tests.** `slates-cluster` sealed `a_raw_chunk_opened_in_steps_is_the_chunk_opened_whole` (the oracle against
+  `open_chunk`: lengths about the segment and up to 1 MiB, budgets of a byte to everything, each segment's bit flipped,
+  the last cut, another tenant's naming). `live_ship::tests::a_rebuilds_large_payload_is_applied_in_steps_and_lays_out_the_same_volume`
+  (a whole body of two 512 KiB files, clear and sealed, rebuilt at a slice never spent and at one spent every step: the
+  same archive, every chunk verified against its identity; 27 and 64 steps, at least a page each. Red: one call a
+  payload; with the payload stepped and the archive hashed whole, 6 steps for 16 pages). The server fleet tests'
+  live takeovers and rebuilds (32 passed).

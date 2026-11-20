@@ -1035,7 +1035,9 @@ fn observe(
         failed_in_a_row,
       } => {
         slates_machine::log_line!(
-          "slates anchor: daemon exited ({exit_code:?}); restarted as pid {} ({failed_in_a_row} failed starts in a row)",
+          "slates anchor: daemon exited ({exit_code:?}: {}); restarted as pid {} ({failed_in_a_row} failed starts in a \
+           row)",
+          exit_cause(exit_code, kill_sent),
           supervisor
             .child_pid()
             .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
@@ -1061,7 +1063,8 @@ fn observe(
         // Never given up on (A-119): every hard mount waits for the daemon. The loop is recorded for the health
         // plane and the restart comes after the backoff.
         slates_machine::log_line!(
-          "slates anchor: the daemon is in a crash loop (last exit {exit_code:?}); restarting it in {} ms",
+          "slates anchor: the daemon is in a crash loop (last exit {exit_code:?}: {}); restarting it in {} ms",
+          exit_cause(exit_code, kill_sent),
           retry_in_ns / NS_PER_MS
         );
         kill_sent = false;
@@ -1191,6 +1194,71 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, (budget_ns, gap_ns): (u64
 /// to the NFSv4 lease the daemon `config` derives grants its clients (A-525, `RestartPolicy::derive`).
 fn restart_policy(config: &DaemonConfig) -> slates_machine::Derived<RestartPolicy> {
   RestartPolicy::derive(config.nfs_v4.lease_ns)
+}
+
+/// Format: the base a POSIX shell adds a signal's number to for the status of a process the signal ended (POSIX.1-2017,
+/// Shell Command Language §2.8.2, "Exit Status for Commands": greater than 128), and the base Git Bash's `kill` (the
+/// MSYS2 runtime) passes `TerminateProcess` for a native Windows process, so its exit code reads as a shell's would.
+const SIGNALLED_EXIT_BASE: i32 = 128;
+/// Format: SIGTERM's number (POSIX), the termination request a shell's `kill` sends by default.
+const SIGTERM_NUMBER: i32 = 15;
+/// Format: SIGKILL's number (POSIX).
+const SIGKILL_NUMBER: i32 = 9;
+
+/// Why the daemon's process ended, in words, for the anchor's restart and crash-loop lines (main's ruling of 2026-11-20:
+/// a legitimate exit is said, not left as a bare code). `kill_sent`: the anchor itself killed it (a stuck start, a lapsed
+/// beat), whose own line came first. Pure, so the words are tested on every host.
+///
+/// The case that asked for it: on jupiter, w-interop's matrix script ended with `kill $ANCHOR` from Git Bash, which ends
+/// a native Windows process's tree, its children first, each by `TerminateProcess` with 128 + SIGTERM's 15; the daemon
+/// went first and the anchor logged "daemon exited (Some(143)); restarted" before it went too (reproduced there,
+/// 2026-11-20, with the run's own binary: the same line, nothing after it, no slates process left).
+fn exit_cause(exit_code: Option<i32>, kill_sent: bool) -> &'static str {
+  if kill_sent {
+    return "the anchor's own kill, said above";
+  }
+  match exit_code {
+    None => "ended by a signal, which leaves no exit code (Unix)",
+    Some(0) => "it exited by itself, cleanly",
+    Some(code) if code == i32::from(super::EXIT_FAILED) => {
+      "it ended itself as failed: its watchdog judged a shard stuck, or a start step failed (its last lines say which)"
+    }
+    Some(code) if code == SIGNALLED_EXIT_BASE.saturating_add(SIGTERM_NUMBER) => {
+      "ended from outside by a termination request, not by slates: 128 + SIGTERM's 15, what a shell's `kill` leaves, \
+       and on Windows what Git Bash's `kill` passes `TerminateProcess` for each process of a native tree it ends, \
+       children first, so the anchor may log this restart just before it is ended too"
+    }
+    Some(code) if code == SIGNALLED_EXIT_BASE.saturating_add(SIGKILL_NUMBER) => {
+      "killed from outside, not by slates: 128 + SIGKILL's 9, what a shell's `kill -9` leaves (Git Bash's on Windows)"
+    }
+    Some(_) => "an exit code of its own, which its last lines explain",
+  }
+}
+
+#[cfg(test)]
+mod exit_cause_tests {
+  use super::*;
+
+  /// The Windows exit 143 (w-interop's matrices on jupiter, 2026-11-20: "daemon exited (Some(143)); restarted" with no
+  /// kill line, the run's last line). Reproduced there: Git Bash's `kill` of the anchor ends the native process tree,
+  /// the daemon first with 128 + SIGTERM's 15, so the anchor logs a restart before it goes too. Do: name the exits the
+  /// anchor meets. Expect 143 said as a termination from outside naming Git Bash's `kill`, 137 as a kill from outside,
+  /// the watchdog's failure code as the watchdog's, a clean exit as clean, no code as a signal's, and any exit after the
+  /// anchor's own kill as that kill, whatever its code.
+  #[test]
+  fn a_daemons_exit_is_named_in_words_143_as_a_termination_from_outside() {
+    let outside = exit_cause(Some(143), false);
+    assert!(
+      outside.contains("ended from outside") && outside.contains("Git Bash"),
+      "143: {outside:?}"
+    );
+    assert!(exit_cause(Some(137), false).contains("killed from outside"));
+    assert!(exit_cause(Some(i32::from(super::super::EXIT_FAILED)), false).contains("watchdog"));
+    assert!(exit_cause(Some(0), false).contains("cleanly"));
+    assert!(exit_cause(None, false).contains("signal"));
+    assert!(exit_cause(Some(143), true).contains("the anchor's own kill"));
+    assert!(exit_cause(Some(7), false).contains("its own"));
+  }
 }
 
 #[cfg(test)]

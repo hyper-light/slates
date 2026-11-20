@@ -14,6 +14,9 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 use std::io::BufRead;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::{Child, Command, Stdio};
@@ -28,8 +31,14 @@ use windows_sys::Win32::System::Threading::{
 
 /// Shape: shards for the test daemon.
 const SHARDS: &str = "2";
-/// Shape: how long the anchor and its daemon get to come up, and a successor to answer (`cli.rs`' `START_WAIT`).
+/// Shape: the bound [`a_stuck_start_is_killed_and_restarted`] proves a stuck start is replaced within, past the
+/// liveness window: 20 s (`cli.rs`' old `START_WAIT`). Every wait of this suite's is judged in the anchor's own CPU
+/// (`process_wait::Judged`) since 2026-11-20, or on the kernel's word; this is the test's subject, not a wait.
 const START_WAIT: Duration = Duration::from_secs(20);
+
+/// Derived: how long a terminated process's exit may take to show (`WaitForSingleObject` on its handle, the kernel's
+/// word): the observation budget, from its one source (`slates_machine::budgets`); the exit is the kernel's work.
+const EXIT_WAIT: Duration = Duration::from_nanos(slates_machine::budgets::observe_budget_ns());
 /// Shape: the pause between polls of a start.
 const POLL: Duration = Duration::from_millis(20);
 /// Shape: consecutive answers to `volume list` a start waits for, so the anchor's one startup restart has settled.
@@ -98,17 +107,17 @@ fn daemon_pid(instance: &str) -> Option<u32> {
     .ok()
 }
 
-/// The daemon that answers, other than `replaced`, within [`START_WAIT`].
-fn await_daemon(instance: &str, replaced: Option<u32>) -> u32 {
-  let started = Instant::now();
+/// The daemon that answers, other than `replaced`, waited for while `anchor`'s process gains CPU
+/// (`process_wait::Judged`; until 2026-11-20 within `START_WAIT`).
+fn await_daemon(anchor: &AnchorProcess, instance: &str, replaced: Option<u32>) -> u32 {
+  let mut judged = process_wait::Judged::of(anchor.child.id());
   loop {
     if let Some(pid) = daemon_pid(instance).filter(|pid| Some(*pid) != replaced) {
       return pid;
     }
-    assert!(
-      started.elapsed() < START_WAIT,
-      "no daemon other than {replaced:?} answered at {instance} within {START_WAIT:?}"
-    );
+    judged.look(&format!(
+      "a daemon other than {replaced:?} answered at {instance}"
+    ));
     pause();
   }
 }
@@ -132,12 +141,16 @@ impl Drop for AnchorProcess {
 }
 
 impl AnchorProcess {
-  /// The next line the anchor writes, within [`START_WAIT`].
+  /// The next line the anchor writes, waited for while its process gains CPU (`process_wait::Judged`; until 2026-11-20
+  /// within `START_WAIT`).
   fn next_line(&self) -> String {
-    match self.lines.recv_timeout(START_WAIT) {
-      Ok(line) => line,
-      Err(RecvTimeoutError::Timeout) => panic!("the anchor wrote nothing in {START_WAIT:?}"),
-      Err(RecvTimeoutError::Disconnected) => panic!("the anchor ended (its lines are above)"),
+    let mut judged = process_wait::Judged::of(self.child.id());
+    loop {
+      match self.lines.recv_timeout(POLL) {
+        Ok(line) => return line,
+        Err(RecvTimeoutError::Timeout) => judged.look("the anchor wrote a line"),
+        Err(RecvTimeoutError::Disconnected) => panic!("the anchor ended (its lines are above)"),
+      }
     }
   }
 
@@ -250,11 +263,11 @@ impl Opened {
     unsafe { NtResumeProcess(self.0.as_raw_handle()) == 0 }
   }
 
-  /// Ends the process and observes its exit within [`START_WAIT`].
+  /// Ends the process and observes its exit on the kernel's word, within [`EXIT_WAIT`] (until 2026-11-20 `START_WAIT`).
   fn terminate(&self) {
     // SAFETY: a live process handle this test owns; the exit code carries no pointer.
     assert_ne!(unsafe { TerminateProcess(self.0.as_raw_handle(), 1) }, 0);
-    assert!(self.exits_within(START_WAIT), "the killed daemon exited");
+    assert!(self.exits_within(EXIT_WAIT), "the killed daemon exited");
   }
 
   /// Whether the process has exited by the end of `wait`.
@@ -320,7 +333,7 @@ fn a_starved_start_that_makes_progress_is_not_killed() {
     std::thread::sleep(runs);
   }
   let _ = process.resume();
-  let answered = await_daemon(&instance, Some(killed));
+  let answered = await_daemon(&anchor, &instance, Some(killed));
   let start_kills = anchor.start_kills();
   drop(anchor);
   assert_eq!(
@@ -348,7 +361,7 @@ fn a_stuck_start_is_killed_and_restarted() {
   let (stuck, process) = successor_of(&anchor, killed);
   assert!(process.suspend(), "NtSuspendProcess({stuck})");
   let stopped = Instant::now();
-  let answered = await_daemon(&instance, Some(stuck));
+  let answered = await_daemon(&anchor, &instance, Some(stuck));
   let replaced_after = stopped.elapsed();
   let stuck_gone = process.exits_within(Duration::ZERO);
   if !stuck_gone {

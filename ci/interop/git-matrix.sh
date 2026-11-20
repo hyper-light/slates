@@ -74,7 +74,15 @@ ISSUER=$(sed -n 's/.*issuer surface: export //p' anchor.log | head -1)
 s() { "$SLATES" --instance "$INSTANCE" "$@"; }
 for _ in $(seq 100); do s volume list >/dev/null 2>&1 && s volume list >/dev/null 2>&1 && break; sleep 0.1; done
 s bootstrap root >/dev/null || { echo "bootstrap root failed"; exit 1; }
-s repository create project --tool git --default-branch "$(git -C "$SOURCE" symbolic-ref --short HEAD)" >/dev/null || { echo "repository create failed"; exit 1; }
+# The default branch: the first push's destination branch where PUSH_REFS names one (a cut pushes one commit to a branch
+# whatever the source's HEAD names, and a HEAD naming an unpushed branch leaves every clone empty, as stock git's does),
+# else the source's own.
+DEFAULT_BRANCH=$(git -C "$SOURCE" symbolic-ref --short HEAD)
+FIRST_DESTINATION=${PUSH_REFS[0]#*:}
+if [[ $FIRST_DESTINATION == refs/heads/* && $FIRST_DESTINATION != *'*'* ]]; then
+  DEFAULT_BRANCH=${FIRST_DESTINATION#refs/heads/}
+fi
+s repository create project --tool git --default-branch "$DEFAULT_BRANCH" >/dev/null || { echo "repository create failed"; exit 1; }
 TOKEN=$(env $ISSUER "$SLATES" --instance "$INSTANCE" credential token | sed -n 's/^token: //p')
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/key" || exit 1
 env $ISSUER "$SLATES" --instance "$INSTANCE" credential key "$(cat "$WORK/key.pub")" >/dev/null || exit 1
