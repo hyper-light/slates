@@ -171,3 +171,7 @@
 - LANDED main 15d25e8b2: the A-498 race test (A-725 cures the hang: pre-A-725 x86_64 2/3 hung, post 6/6) and the
   A-576/A-737 folding-drive test; A-551 drive tests red-checked; workloads pass on stock WinFsp both arches. GAPS updated.
 - Goal 87's assigned items done. Open: B8, B9 (reading, main's); B6 no record anywhere.
+- e8788ea65 (docs): A-551 sharing-violation + normalized-name parts red-checked apart (win-red-1 / win-nred-1, both
+  arches); B7a/B7b tests pass on Windows x86_64 (jupiter); GAPS records the B-list closed and B6 unknown.
+- Slip: `git switch -c` used once to name a detached diag worktree's branch (no harm); no repeat.
+- Goal 87 parts done; waiting for main's next piece.
