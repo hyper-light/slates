@@ -753,11 +753,35 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
   go_on(stream, conversation, seat).await;
 }
 
+thread_local! {
+  /// DIAG (w-bugs): the last conversation's room, for its end line.
+  static DIAG_ROOM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// DIAG (w-bugs): the room the last stepped conversation was given.
+fn conversation_room_hint() -> usize {
+  DIAG_ROOM.get()
+}
+
 /// Goes on with `conversation` over `stream` until it ends here or moves to the shard its repository's name lives on
 /// ([`migrate`]), its seat here given back as it leaves.
 async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
   let mut out = Vec::new();
   let mut last_poll = None;
+  // DIAG (w-bugs, never for main): the shard's long polls and longest poll across this conversation, its turns and
+  // the most bytes a turn wrote, against the step quantum and the room.
+  let diag_before = slates_rt::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
+  let (mut diag_turns, mut diag_most, mut diag_bytes) = (0u64, 0usize, 0u64);
+  let diag_end = |turns: u64, most: usize, bytes: u64| {
+    let after = slates_rt::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
+    slates_machine::log_line!(
+      "diag-svnfetch svn:// conversation: turns {turns}, bytes {bytes}, most a turn {most}, room {}, quantum_ns {}, long_steps +{}, longest_step_ns {}",
+      conversation_room_hint(),
+      slates_rt::futures::step_budget_ns().unwrap_or(0),
+      after.long_steps.saturating_sub(diag_before.long_steps),
+      after.longest_step_ns
+    );
+  };
   loop {
     // The shard's polls so far: unchanged since the last turn began, this turn follows it with nothing run between.
     let poll = futures::polls_so_far();
@@ -766,6 +790,10 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
     }
     last_poll = poll;
     let went = step(&stream, &mut conversation, &mut out, &seat).await;
+    DIAG_ROOM.set(conversation.limits.item_bytes);
+    diag_turns = diag_turns.saturating_add(1);
+    diag_most = diag_most.max(out.len());
+    diag_bytes = diag_bytes.saturating_add(out.len() as u64);
     // A turn that never waited yields before the next: a long answer (a replay-range over a whole history, a checkout)
     // or commands pipelined in one read are many turns with no wait between, and a client that drains the socket as
     // fast as it is written never makes a write wait either, so without the yield the shard never steps (git/git's
@@ -775,7 +803,10 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
     }
     match went {
       Stepped::Go => {}
-      Stepped::End => return,
+      Stepped::End => {
+        diag_end(diag_turns, diag_most, diag_bytes);
+        return;
+      }
       Stepped::Elsewhere(found, located) => {
         migrate(Moving {
           stream: stream.into_owned(),
