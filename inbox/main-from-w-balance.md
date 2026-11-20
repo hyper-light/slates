@@ -120,3 +120,17 @@ records. The successor rebuilds from what it holds (`takeover::rebuild_repositor
 own partition has, which appear to be none). Whoever owns A-636 should see this. The v3 switch stays off until this
 test passes; v3 adds nothing to the failure. Shall I take it (ship the repository's push records and greens to the
 successor), or does an A-636 owner?
+
+### 2026-11-20: acknowledged pushes survive their owner's death: LANDED f95edf68e (fix + test together)
+Cause, from counters: a push's records were kept only in the owner partition's register. The successor replayed none
+(`vcs_store.replayed` absent, `repository_records` 0 everywhere) and served no refs.
+Fix:
+1. A push's record is a change of the names log (`LoggedChange::Objects`, appended, db wire order pinned). It ships
+   to the repository's candidates with the operation's identity and spans. A takeover keeps or drops the push whole,
+   and the successor's adoption puts the record back for replay.
+2. A push is answered only once its names log is held at f+1 (`state_log::names_committed_within`; the HTTP and SSH
+   edges wait on it before the report). Without it, the first run kept only the pushes whose parts had shipped.
+`crates/cli/tests/v3_takeover.rs` passes 3 of 3 (NoLoss, TotalOrder, StaleNeverCommits by `git fsck` on a clone). It
+keeps the labelled grant-all workaround until w-fed-faults' credential fix lands; it's that fix's red too.
+Tests: slates-db all; slates-server takeover/state_log/vcs_store/git_push/vcs_http::git/vcs_ssh 236/236.
+Next: the v3 switch on, its takeover runs going now.

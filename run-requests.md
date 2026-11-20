@@ -6873,3 +6873,8 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - What the logs show (C:\Users\corph\.cache\w-interop\matrix-git\anchor.log): the daemon was killed (exit 143) at
   12:42:43.98 and restarted as pid 470456. That is after the last row's log (ssh-fetch, 12:42:42), and the successor
   logged nothing before the run ended. No row log in logs\ holds the "Failed to connect" text.
+
+## 2026-11-20, w-forming: A-771 rebuild in steps (main b831a2877; commit cb1b698f0, base a7df9ccf0)
+- clippy + xtask over `crates/cluster/src/sealed.rs` (RawOpening) and `crates/server/src/live_ship.rs` (Rebuilding steps, Laying, hashed_chunk).
+- Flows: live_chaos takeover flows and live_fleet takeovers (macOS arm64 debug, `SLATES_TEST_CLI=1`, `taskpolicy -b`); red = `fleet.live.takeover_refused.layout` or `.open` counted, or a successor's bytes differing from the owner's. Expect `fleet.live.rebuild_slices` up by about a page of log a slice.
+- `cargo test -p slates-server --test fleet a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` under full-suite load: failed once at fleet.rs:17261 (setup: cut && given_up) in a 32-test run, 3/3 alone.

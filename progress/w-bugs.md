@@ -252,3 +252,11 @@
   daemon_edge (2,000 then 2,900 blobs); local matrix 25/27 -> 27/27. (1) deepen: not reproduced locally (passes on a
   612-commit source and on a merge-heavy test history); asked w-interop for the log at 514500813; suspected cause the
   scattered plan's runs (A-745's owed item).
+- 2026-11-20 deepen FIXED (A-770): 02a478233, merged 618220deb. Reproduced on the stock-git v2.0.0 release matrix:
+  two refusals. (a) The shallow depth walk kept an entry a commit: now level by level on Held sets, 65,445 -> 23,373
+  bytes for a depth-100 deepen of a 4,000-commit merge-heavy history (red at 32 KiB). (b) The pack plan charged 16
+  bytes a run of a bit table (525,472 asked of 278,528; traced). 7ffddbdf0 (three forms) landed meanwhile; on top of
+  it `Planned::of` now charges `bytes()`. Red: a plan of 32,000 scattered runs asked 512,000 in 64 KiB. Matrix at
+  cbf7c84c3: push-all 97 s, shallow-clone 3 s, deepen 217 s, partial-clone 50 s, partial-blame pass. Owed to the
+  stream's owner: read_objects remakes every run of a bit table each window.
+- 2026-11-20 svn diag run 13 (after 2502607c4, base 2d3f218cb) reported to main.
