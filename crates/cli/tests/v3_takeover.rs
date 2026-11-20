@@ -53,7 +53,8 @@ const SERVING_LINE: &str = "slates daemon: instance ";
 const ISSUER_SURFACE_LINE: &str = "slates anchor: issuer surface: export ";
 /// Format: the daemon's line naming where its HTTP edge serves; a fleet node's serves HTTPS under the node's own
 /// identity.
-const VCS_HTTP_LINE: &str = "slates daemon: the version-control HTTP edge serves HTTPS on 127.0.0.1:";
+const VCS_HTTP_LINE: &str =
+  "slates daemon: the version-control HTTP edge serves HTTPS on 127.0.0.1:";
 /// Format: the anchor's line naming its daemon's pid.
 const DAEMON_PID: &str = "daemon pid ";
 
@@ -121,8 +122,19 @@ fn value_of(text: &str, key: &str) -> Option<String> {
 }
 
 fn scratch_dir(tag: &str) -> ScratchDir {
-  let path = format!("{}/slates-v3-takeover-{tag}-{}", env!("CARGO_TARGET_TMPDIR"), std::process::id());
-  assert!(Command::new("mkdir").args(["-p", &path]).output().unwrap().status.success());
+  let path = format!(
+    "{}/slates-v3-takeover-{tag}-{}",
+    env!("CARGO_TARGET_TMPDIR"),
+    std::process::id()
+  );
+  assert!(
+    Command::new("mkdir")
+      .args(["-p", &path])
+      .output()
+      .unwrap()
+      .status
+      .success()
+  );
   ScratchDir { path }
 }
 
@@ -171,7 +183,11 @@ fn port_blocks() -> Vec<HeldBlock> {
     let held = (0..PORT_ATTEMPTS)
       .find_map(|_| {
         let sockets: Option<Vec<std::net::UdpSocket>> = (0..PORTS_PER_NODE)
-          .map(|k| base.checked_add(k).and_then(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).ok()))
+          .map(|k| {
+            base
+              .checked_add(k)
+              .and_then(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).ok())
+          })
           .collect();
         let found = sockets.map(|sockets| HeldBlock { base, sockets });
         base = base.checked_add(PORTS_PER_NODE).unwrap_or(PORT_FLOOR);
@@ -200,10 +216,23 @@ fn start_node(instance: &str, manifest: &str, node: &str, held: &HeldBlock) -> N
   let (probe, record) = (inheritable(probe), inheritable(record));
   let mut anchor = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
-      "--instance", instance, "anchor", "--quick", "--shards", SHARDS, "--fleet", manifest, "--node", node,
-      "--vcs-http", "127.0.0.1:0",
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--fleet",
+      manifest,
+      "--node",
+      node,
+      "--vcs-http",
+      "127.0.0.1:0",
     ])
-    .env(slates_anchor::ENV_FLEET_SERVE, format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()))
+    .env(
+      slates_anchor::ENV_FLEET_SERVE,
+      format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()),
+    )
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
@@ -231,12 +260,15 @@ fn start_node(instance: &str, manifest: &str, node: &str, held: &HeldBlock) -> N
   let deadline = Instant::now() + FLEET_WAIT;
   while !served || port.is_none() || issuer.is_none() {
     let left = deadline.saturating_duration_since(Instant::now());
-    let line = read
-      .recv_timeout(left)
-      .unwrap_or_else(|_| panic!("node {node} did not serve with its HTTP edge and issuer surface named"));
+    let line = read.recv_timeout(left).unwrap_or_else(|_| {
+      panic!("node {node} did not serve with its HTTP edge and issuer surface named")
+    });
     served |= line.starts_with(&serving);
     if let Some(rest) = line.strip_prefix(VCS_HTTP_LINE) {
-      port = rest.split(|c: char| !c.is_ascii_digit()).next().and_then(|digits| digits.parse().ok());
+      port = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok());
     }
     if let Some(pairs) = line.trim().strip_prefix(ISSUER_SURFACE_LINE) {
       issuer = Some(
@@ -248,7 +280,10 @@ fn start_node(instance: &str, manifest: &str, node: &str, held: &HeldBlock) -> N
       );
     }
     if let Some((_, rest)) = line.split_once(DAEMON_PID) {
-      daemon_pid = rest.split(|c: char| !c.is_ascii_digit()).next().and_then(|digits| digits.parse().ok());
+      daemon_pid = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok());
     }
   }
   drop(read);
@@ -277,7 +312,10 @@ fn wait_formed(nodes: &[Node]) -> Vec<u64> {
         ))
       })
       .collect();
-    if views.iter().all(|view| view.is_some_and(|(_, members, probed)| members == 3 && probed == 2)) {
+    if views
+      .iter()
+      .all(|view| view.is_some_and(|(_, members, probed)| members == 3 && probed == 2))
+    {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
     assert!(Instant::now() < deadline, "the fleet formed: {views:?}");
@@ -294,7 +332,11 @@ fn run_ready(node: &Node, args: &[&str]) -> String {
     if code == 0 {
       return out;
     }
-    assert!(Instant::now() < deadline, "{args:?} on {}: {out}{err}", node.instance);
+    assert!(
+      Instant::now() < deadline,
+      "{args:?} on {}: {out}{err}",
+      node.instance
+    );
     pause();
   }
 }
@@ -308,8 +350,22 @@ fn stock_git() -> Option<String> {
 /// Runs stock git with `args` in `dir`, a bearer `token` on every request: its exit code and both outputs.
 fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
   let output = Command::new("git")
-    .args(["-c", &format!("http.extraHeader=Authorization: Bearer {token}"), "-c", "user.name=t", "-c", "user.email=t@t"])
-    .args(["-c", "commit.gpgsign=false", "-c", "protocol.version=0", "-c", "http.sslVerify=false"])
+    .args([
+      "-c",
+      &format!("http.extraHeader=Authorization: Bearer {token}"),
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+    ])
+    .args([
+      "-c",
+      "commit.gpgsign=false",
+      "-c",
+      "protocol.version=0",
+      "-c",
+      "http.sslVerify=false",
+    ])
     .args(args)
     .current_dir(dir)
     .env("GIT_TERMINAL_PROMPT", "0")
@@ -328,9 +384,16 @@ fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
 /// A commit on `dir`'s `main`, a file of its own, whose id is answered.
 fn commit(dir: &str, token: &str, n: usize) -> String {
   #[allow(clippy::disallowed_methods)]
-  std::fs::write(format!("{dir}/file-{n}.txt"), format!("push {n}\n").repeat(64)).unwrap();
+  std::fs::write(
+    format!("{dir}/file-{n}.txt"),
+    format!("push {n}\n").repeat(64),
+  )
+  .unwrap();
   assert_eq!(git(dir, token, &["add", "."]).0, 0);
-  assert_eq!(git(dir, token, &["commit", "-qm", &format!("push {n}")]).0, 0);
+  assert_eq!(
+    git(dir, token, &["commit", "-qm", &format!("push {n}")]).0,
+    0
+  );
   git(dir, token, &["rev-parse", "HEAD"]).1.trim().to_owned()
 }
 
@@ -350,7 +413,9 @@ fn remote_main(dir: &str, token: &str, url: &str) -> Option<String> {
 #[test]
 fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
-    eprintln!("skipping the repository takeover flow: set SLATES_TEST_CLI=1 to run it (three anchors)");
+    eprintln!(
+      "skipping the repository takeover flow: set SLATES_TEST_CLI=1 to run it (three anchors)"
+    );
     return;
   }
   if stock_git().is_none() {
@@ -377,7 +442,10 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   run_ready(&nodes[bootstrap], &["bootstrap", "root"]);
   // The repository on another node than the bootstrap's, so its death is not the root council's leader's alone.
   let owner = (bootstrap + 1) % nodes.len();
-  run_ready(&nodes[owner], &["repository", "create", REPOSITORY, "--tool", "git"]);
+  run_ready(
+    &nodes[owner],
+    &["repository", "create", REPOSITORY, "--tool", "git"],
+  );
   eprintln!("V3TAKEOVER: repository created on node {owner}");
   // WORKAROUND, until w-fed-faults' fix lands (main's ruling of 2026-11-20): a credential minted on the owner is not
   // known to the successor once the owner is gone (401), and a survivor's own token names its own account (403, A-237).
@@ -386,7 +454,8 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   // their node; this test is that fix's red too.
   {
     use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
-    let mut client = slates_client::Client::connect(&nodes[owner].instance, slates_api::deadlines()).unwrap();
+    let mut client =
+      slates_client::Client::connect(&nodes[owner].instance, slates_api::deadlines()).unwrap();
     let mut policy = client.describe_repository_policy(REPOSITORY).unwrap();
     for right in [PolicyRight::Read, PolicyRight::Submit] {
       policy.rules.push(PolicyRule {
@@ -399,11 +468,19 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
     }
     client.set_repository_policy(REPOSITORY, &policy).unwrap();
   }
-  let token = value_of(&run_ready(&nodes[owner], &["credential", "token"]), "token").expect("a token");
+  let token =
+    value_of(&run_ready(&nodes[owner], &["credential", "token"]), "token").expect("a token");
   // A fleet node's edge presents the node's own certificate (self-signed here): git is told not to verify it.
   let url = |node: &Node| format!("https://127.0.0.1:{}/{REPOSITORY}", node.port);
   let work = format!("{}/work", scratch.path);
-  assert!(Command::new("mkdir").args(["-p", &work]).output().unwrap().status.success());
+  assert!(
+    Command::new("mkdir")
+      .args(["-p", &work])
+      .output()
+      .unwrap()
+      .status
+      .success()
+  );
   assert_eq!(git(&work, &token, &["init", "-q", "-b", "main"]).0, 0);
   let mut acknowledged = Vec::new();
   for n in 0..PUSHES {
@@ -417,7 +494,14 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   let in_flight = commit(&work, &token, PUSHES);
   let owner_url = url(&nodes[owner]);
   let (work_dir, flight_token) = (work.clone(), token.clone());
-  let flight = std::thread::spawn(move || git(&work_dir, &flight_token, &["push", "-q", &owner_url, "main"]).0);
+  let flight = std::thread::spawn(move || {
+    git(
+      &work_dir,
+      &flight_token,
+      &["push", "-q", &owner_url, "main"],
+    )
+    .0
+  });
   kill_node(&mut nodes[owner]);
   let flight_code = flight.join().unwrap();
   eprintln!("V3TAKEOVER: owner killed, in-flight push answered {flight_code}");
@@ -428,7 +512,10 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
     // A survivor's own credential (the owner's is gone with it), the repository's policy letting every principal in.
     let found = survivors.iter().find_map(|at| {
       let node = &nodes[*at];
-      let token = value_of(&slates(&node.instance, &node.issuer, &["credential", "token"]).1, "token")?;
+      let token = value_of(
+        &slates(&node.instance, &node.issuer, &["credential", "token"]).1,
+        "token",
+      )?;
       remote_main(&work, &token, &url(node)).map(|head| (*at, head, token))
     });
     if let Some((at, head, token)) = found {
@@ -440,18 +527,34 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
         .iter()
         .map(|at| {
           let node = &nodes[*at];
-          let own = value_of(&slates(&node.instance, &node.issuer, &["credential", "token"]).1, "token").unwrap_or_default();
+          let own = value_of(
+            &slates(&node.instance, &node.issuer, &["credential", "token"]).1,
+            "token",
+          )
+          .unwrap_or_default();
           let (code, out, err) = git(&work, &own, &["ls-remote", &url(node)]);
           let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
           let counted: Vec<&str> = status
             .lines()
             .filter(|line| {
-              ["takeover", "vcs_store", "repositor", "state_log", "part", "held", "record"]
-                .iter()
-                .any(|word| line.contains(word))
+              [
+                "takeover",
+                "vcs_store",
+                "repositor",
+                "state_log",
+                "part",
+                "held",
+                "record",
+              ]
+              .iter()
+              .any(|word| line.contains(word))
             })
             .collect();
-          format!("node {at}: ls-remote {code} {}{}; counted {counted:?}", out.trim(), err.trim())
+          format!(
+            "node {at}: ls-remote {code} {}{}; counted {counted:?}",
+            out.trim(),
+            err.trim()
+          )
         })
         .collect();
       panic!("no survivor served the repository: {seen:#?}");
@@ -469,15 +572,31 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
     assert_eq!(head, in_flight, "an acknowledged push lost (NoLoss)");
   }
   let clone = format!("{}/clone", scratch.path);
-  let (code, out, err) = git(&scratch.path, &successor_token, &["clone", "-q", &url(&nodes[at]), &clone]);
+  let (code, out, err) = git(
+    &scratch.path,
+    &successor_token,
+    &["clone", "-q", &url(&nodes[at]), &clone],
+  );
   assert_eq!(code, 0, "the clone from the successor: {out}{err}");
   let (code, out, err) = git(&clone, &successor_token, &["fsck", "--full", "--strict"]);
-  assert_eq!(code, 0, "the successor's repository whole (StaleNeverCommits): {out}{err}");
+  assert_eq!(
+    code, 0,
+    "the successor's repository whole (StaleNeverCommits): {out}{err}"
+  );
   let (_, log, _) = git(&clone, &successor_token, &["rev-list", "--reverse", "main"]);
   let order: Vec<String> = log.lines().map(str::to_owned).collect();
-  let positions: Vec<Option<usize>> = acknowledged.iter().map(|id| order.iter().position(|seen| seen == id)).collect();
-  assert!(positions.iter().all(Option::is_some), "an acknowledged push missing (NoLoss): {positions:?}");
-  assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "pushes out of order (TotalOrder): {positions:?}");
+  let positions: Vec<Option<usize>> = acknowledged
+    .iter()
+    .map(|id| order.iter().position(|seen| seen == id))
+    .collect();
+  assert!(
+    positions.iter().all(Option::is_some),
+    "an acknowledged push missing (NoLoss): {positions:?}"
+  );
+  assert!(
+    positions.windows(2).all(|pair| pair[0] < pair[1]),
+    "pushes out of order (TotalOrder): {positions:?}"
+  );
   drop(nodes);
   drop(scratch);
 }
