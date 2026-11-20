@@ -51,3 +51,15 @@
   call; literals fails only on vcs/src/share.rs:130 (EPSILON * 64.0, 4bbf7f4ba) -- needs its author's derivation.
 - Totals round 0: 583 errors fixed (549 clippy, 34 literals), 2 compile breaks, 36 commits (all unsigned, Ada's OK).
 - Next: hourly rounds (fetch, ff ~/slates-work/w-lint, same commands, fix and land). One target dir only.
+
+## 2026-11-20 main's rulings on round 0's leftovers
+- c9137cb9f: deploy.rs rustls Arc test allowed in place (D-8 test-harness exception, as the other rustls tests);
+  carry.rs looked_until_recorded is a RECORD_WAIT (Derived) deadline wait re-checking each look; part B's park loops
+  judged: hook_driver `gone` + vcs_http `marked_within` are real condition waits (kept); the two `park_for` helpers
+  (hook "sleep" role, ssh client pauses) now sleep on slates_rt's timer on a LocalRuntime (elapsed time is the input).
+- share.rs:130 literal: w-balance's (A-724), skipped per main.
+- Windows: native clippy on jupiter via kiln run (on jupiter, target C:\Users\corph\.cache\w-lint-target), CI's
+  three Windows steps; run r2 in flight.
+- Hourly rounds: session cron b32dcdb1 at :17 (session-only, 7-day expiry).
+- Note: the blobless clone once reported a commit "in the commit graph but not in the object database" on fetch;
+  a plain retry fetched fine (likely background maintenance racing). Watch for it.

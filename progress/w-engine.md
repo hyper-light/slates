@@ -60,3 +60,13 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   and after a removal: for each Block slot all of whose refs are the value's own pieces and whose block's only holder is
   the history, copy the named runs into one owned chunk when they are less than the block; else keep. Needs
   Blocks::holders.
+
+## Slice 2 (A-728 part 2) LANDED
+- bf9a7ff23 (merges 6f56f5adb, 158ab2bac, 99ecba1b1), confirmed on origin/main 99ecba1b1.
+- Charge rule: a Block chunk counts the runs its value was made with (whole for named, added for a splice), so
+  history_reservation/admission is unchanged. Finding for main: that figure (as before A-728) counts the file before a
+  path's first small edit as current; really it is history (one file per edited path until a fold; fold now frees it).
+- Findings sent: stack oracle flake on main (2/10 at PROPTEST_CASES=3000); A-724 Piece 5a/6 bullets appended under
+  A-728's entry in the amendment log; I used `git checkout --ours` once to resolve a conflict (banned; no harm: only
+  my own two files).
+- NEXT: part 3: svn_scale.sh 1,000 revisions before (e71043ff6, pre-A-728) and after (origin/main), BENCHMARKS.md.
