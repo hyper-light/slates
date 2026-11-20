@@ -6,7 +6,8 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
 1. Pin: HOLDS. vendor/MANIFEST.toml [projects.slates] commit 38ed3dfd8e69 (git, take/own lists), vendor/slates/UPSTREAM.md;
    checked by .kiln/ci.yaml job `vendor` (`scripts/vendor.py check --kind git`), green in ci run
    01a1f734930b762286bc66a7ec300a10 (kiln main, 2026-11-19). Root Cargo.toml patches slates-api/slates-ipc to
-   vendor/slates; tests/vendored.rs holds one revision.
+   vendor/slates; tests/vendored.rs holds one revision. Local re-check 2026-11-20 (this Mac): `vendor.py check slates`:
+   1355 files at 38ed3dfd, 2 recorded changes, 0 differences.
 2. No CLI: HOLDS in code. crates/kiln uses slates_api only; anchor/daemon = kiln's own exe (`kiln slates-role`,
    slates_api::role::main); tests/slates_roles.rs asserts no `slates` binary runs; slates_e2e's CLI const is only
    used to assert absence. workspace/slates.rs is the library port (no Command for slates; Commands only for git,
@@ -24,4 +25,11 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   slates-macos-arm64, slates-linux-arm64 (linux/arm64 container on an Apple-silicon runner's Docker, 31-62 GiB VMs):
   build kiln + `--lib workspace::slates`, `--test vendored --test slates_roles`. UI mock text fixed.
   Validated 0 errors. Trial run 01a1f9fb06537697bf01eb3419a51470 (jobs filter, queued 'headroom').
-- NEXT: land on green; then Windows x86-64 lane (w-k90-win) and Windows arm64 (no runner: main/Ada).
+- main 09:55: Windows arm64 follows from the platform rule; cross `cargo check --target aarch64-pc-windows-msvc`
+  (Slates' cross-lint way) since kiln reaches no windows-11-arm. kiln fb5062a85 (branch): job
+  slates-windows-arm64-cross (target added inside a linux/arm64 container; C-free crates slates-wire/-mem/-rt/-ipc/
+  -merge/-db/-wire-derive at kiln's lock). Dispatched on the branch.
+- Local macOS arm64 lane (~/kiln-work/w-k90-pin-logs/lane.sh, target ~/.cache/w-k90-pin-target.noindex, debug 0):
+  build ok; tests compiling. Land 2898dfe42 (+fb5062a85) on its green, merge-base confirmed.
+- Clause 2 sweep (docs, README, deploy, scripts, ci, Dockerfile, src, ui/src, .kiln): only agentic.md 717/877 name
+  Slates' own CLI beside the library call kiln makes; no instruction to run it. Holds.
