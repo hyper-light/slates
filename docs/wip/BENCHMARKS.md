@@ -8816,6 +8816,13 @@ is 4 to 9 times shorter. The catch-up itself is slower: 1.3 to 2.0 times main's 
 it streams 20,000 entries instead of sending one image. Landed for the owner shard's health (the neighbour's tail, no
 whole images on the shard), with the arm catch-up time owed a look.
 
+**The command on today's main** (since 2026-11-20; the diag flow was never on main): `SLATES_TEST_CLI=1
+SLATES_CATCH_UP_BACKLOG=20000 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture
+--test-threads=1 --exact a_resumed_holders_catch_up_beside_a_busy_volume`. It prints the same `LD-CU` lines, plus the
+backlog's change bytes and the catch-up's milliseconds per MiB behind. The baseline for an A/B on today's main is
+`agents/g227-catchup-baseline`, today's main at the flow's commit with the pair's three changes reverted. It is for
+measurement only and never lands.
+
 **Earlier A/Bs, recorded.** diag-73 measured the fold's cost (1.4 ms a reply 1,000 behind, 7.1 ms 5,000 behind; writes
 fell to about 210 a second; 6 of 24 x86 runs never within 50 entries). diag-76 (the flow, main against the fold fix) and
 diag-81 (the neighbour, at 5,000 and 20,000 behind) did not separate, because the stale tail sent most of the backlog as
