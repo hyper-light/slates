@@ -152,6 +152,19 @@ pub(crate) trait SvnStores {
   type Repository: Repository + ?Sized;
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
+  /// A fetch's hold on the generation of a repository's records it began on (A-745, §4.17.1 "A fetch's answer" rule 4),
+  /// given back as it is dropped.
+  type Hold;
+  /// Holds repository `id`'s records as they are now: taken in the step a report's answer began, so its later slices
+  /// read what that one read; none when they are not held here.
+  fn hold(&mut self, id: RepositoryId) -> Option<Self::Hold>;
+  /// Runs `step` over the records `hold` holds as `principal` reads them; none when they are gone.
+  fn lend_held<T>(
+    &mut self,
+    hold: &Self::Hold,
+    principal: &Principal,
+    step: impl FnOnce(&Lent<'_, Self::Repository>) -> T,
+  ) -> Option<T>;
   /// The time each slice of a fetch's answer may run (A-745, §4.17.1 "A fetch's answer" rule 3): the shard's step
   /// quantum; `None` where the lender names none, and a slice is as many steps as its room.
   fn fetch_quantum(&self) -> Option<u64> {
@@ -499,22 +512,22 @@ fn served_of<'a, R: ?Sized>(lent: &'a Lent<'a, R>, root: &'a str) -> Served<'a, 
   }
 }
 
-/// Steps `report` until its first bytes or its end, the store lent for each slice of `room` and the task yielding
+/// Steps `report` until its first bytes or its end, the records `hold` holds lent for each slice of `room` and the task yielding
 /// between them (§4.3): what they come to decides the status the reply begins with, as `dav_method_report` answers a
 /// report's error only while it has sent nothing. A refusal after its first bytes, within these slices, fails the
 /// request `500` before any of it is sent, where `mod_dav` would have sent the bytes and ended the connection.
 async fn first_slices<S: SvnStores>(
   stores: &mut S,
-  asker: (RepositoryId, &Principal, &str),
+  asker: (&S::Hold, &Principal, &str),
   mut report: Report,
   room: usize,
 ) -> Result<Answered, Failed> {
-  let (repository, principal, root) = asker;
+  let (hold, principal, root) = asker;
   let mut pending = Vec::new();
   loop {
     let budget = slice_budget(room, stores.fetch_quantum());
     let progress = stores
-      .lend(repository, principal, |lent| {
+      .lend_held(hold, principal, |lent| {
         report.resume(&served_of(lent, root), &mut pending, budget)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
@@ -545,9 +558,12 @@ async fn first_slices<S: SvnStores>(
 
 /// A served request's exchange (the module doc's bounds): its route, method and depth copied from the head, its body,
 /// and its answer once the body has ended.
-pub(crate) struct SvnExchange<S> {
+pub(crate) struct SvnExchange<S: SvnStores> {
   /// Where the repository's store is read.
   stores: S,
+  /// A report's hold on the generation of the records it began on (A-745 rule 4), from the step that made it to the
+  /// exchange's end.
+  generation: Option<S::Hold>,
   /// The repository.
   repository: RepositoryId,
   /// The repository root's URL path, decoded (`/repo`).
@@ -632,7 +648,7 @@ struct CommitHeaders {
   lock_token: Option<String>,
 }
 
-impl<S> SvnExchange<S> {
+impl<S: SvnStores> SvnExchange<S> {
   /// The exchange for `asked` on `repository`, its route, method and depth copied and charged to `room`; none past it
   /// or for a `Depth` that is no text.
   fn new(
@@ -695,6 +711,7 @@ impl<S> SvnExchange<S> {
       room: admission,
       request_room: room,
       answered: None,
+      generation: None,
     })
   }
 }
@@ -1561,8 +1578,18 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         offset: 0,
       },
       SiteAnswer::Report(report) => {
-        let asker = (self.repository, &self.principal, root);
-        first_slices(&mut self.stores, asker, report, room).await?
+        let hold = self
+          .stores
+          .hold(self.repository)
+          .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+        let held = self.generation.insert(hold);
+        first_slices(
+          &mut self.stores,
+          (held, &self.principal, root),
+          report,
+          room,
+        )
+        .await?
       }
     };
     self.answered = Some(answered);
@@ -1631,9 +1658,13 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         }
         let root = self.root.as_str();
         let budget = slice_budget(to_usize(self.request_room), self.stores.fetch_quantum());
+        let hold = self
+          .generation
+          .as_ref()
+          .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
         let progress = self
           .stores
-          .lend(self.repository, &self.principal, |lent| {
+          .lend_held(hold, &self.principal, |lent| {
             report.resume(&served_of(lent, root), out, budget)
           })
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;

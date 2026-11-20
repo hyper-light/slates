@@ -703,6 +703,15 @@ impl Connection {
     }
   }
 
+  /// Whether a read's answer is under way over many calls: a read streaming, a replay, or a report command's exchange
+  /// (A-745, §4.17.1 "A fetch's answer" rule 4: the caller holds the records it began on until it ends).
+  pub fn fetching(&self) -> bool {
+    matches!(
+      self.phase,
+      Phase::Streaming(..) | Phase::Replaying(..) | Phase::Reporting(..)
+    )
+  }
+
   /// The established session, once the client has authenticated.
   pub fn session(&self) -> Option<&Session> {
     match &self.phase {

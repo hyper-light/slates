@@ -337,6 +337,20 @@ struct Stores {
 
 impl SvnStores for Stores {
   type Repository = Repo;
+  type Hold = RepositoryId;
+
+  fn hold(&mut self, id: RepositoryId) -> Option<RepositoryId> {
+    self.holds(id).then_some(id)
+  }
+
+  fn lend_held<T>(
+    &mut self,
+    hold: &RepositoryId,
+    principal: &Principal,
+    step: impl FnOnce(&Lent<'_, Repo>) -> T,
+  ) -> Option<T> {
+    self.lend(*hold, principal, step)
+  }
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == REPO

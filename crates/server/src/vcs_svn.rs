@@ -83,9 +83,10 @@ use slates_vfs::clock::Clock;
 use crate::config::DaemonConfig;
 use crate::repository::svn_commit;
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
+use crate::vcs_http::svn::Lent;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
-use crate::vcs_store::svn_view::lend_in;
+use crate::vcs_store::svn_view::{SvnHold, hold_in, lend_held_in, lend_in};
 
 /// Counter: a listener the control shard could not keep the state of, or whose task its arena refused.
 const NOT_STARTED: &str = "vcs_svn.not_started";
@@ -711,6 +712,10 @@ struct Conversation {
   principal: Option<Principal>,
   /// The commits the connection began, which name their transactions.
   commits: u64,
+  /// A read's hold on the generation of the records it began on, while its answer is under way over many calls
+  /// ([`Connection::fetching`]; A-745, §4.17.1 "A fetch's answer" rule 4): given back as it ends, and before the
+  /// conversation moves to another shard.
+  held: Option<SvnHold>,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -749,6 +754,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     opened: None,
     principal: None,
     commits: 0,
+    held: None,
   };
   go_on(stream, conversation, seat).await;
 }
@@ -777,6 +783,8 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
       Stepped::Go => {}
       Stepped::End => return,
       Stepped::Elsewhere(found, located) => {
+        // A hold is given back on the shard that holds its records.
+        conversation.held = None;
         migrate(Moving {
           stream: stream.into_owned(),
           conversation,
@@ -937,16 +945,23 @@ fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
     input,
     opened,
     principal,
+    held,
     ..
   } = conversation;
   let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
     let turn = connection.receive(None::<&Sources<'_, Unresolved>>, input, out, budget);
     return next_of(connection, turn, out);
   };
-  let lent = lent_sources(opened, principal, |sources| {
+  let lent = held_sources(opened, principal, held.as_ref(), |sources| {
     let turn = connection.receive(Some(sources), input, out, budget);
     next_of(connection, turn, out)
   });
+  // A read whose answer goes on past this call holds the records this call read, in the same step (A-745 rule 4).
+  if !connection.fetching() {
+    *held = None;
+  } else if held.is_none() {
+    *held = crate::state::with_state(|state| hold_in(state, opened.id)).flatten();
+  }
   lent.unwrap_or_else(|| {
     crate::fleet::count_refusal(STORE_MISSING);
     Next::End
@@ -960,9 +975,20 @@ fn lent_sources<T>(
   principal: &Principal,
   step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
 ) -> Option<T> {
+  held_sources(opened, principal, None, step)
+}
+
+/// [`lent_sources`], or over the records `held` holds while a read's answer is under way ([`lend_held_in`]); none when
+/// the shard holds them no longer.
+fn held_sources<T>(
+  opened: &Opened,
+  principal: &Principal,
+  held: Option<&SvnHold>,
+  step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
+) -> Option<T> {
   crate::state::with_state(|state| {
     let authenticated = authenticated_access(state, &opened.name, principal);
-    lend_in(state, opened.id, |lent| {
+    let sources_of = |lent: &Lent<'_, SvnRecords>| {
       step(&Sources {
         index: lent.index,
         repository: lent.repository,
@@ -975,7 +1001,11 @@ fn lent_sources<T>(
           filesystem: &opened.name,
         },
       })
-    })
+    };
+    match held {
+      Some(hold) => lend_held_in(state, hold, sources_of),
+      None => lend_in(state, opened.id, sources_of),
+    }
   })
   .flatten()
 }
