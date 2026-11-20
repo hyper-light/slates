@@ -136,3 +136,12 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - Design + one call sent: inbox/main-from-w-engine-a752.md (may a green be held out across turns during commit?).
 - Part 2 in progress: Building (walk/base/compose/post/identity in units), async deriver with Pace, ServerJudge::ready.
 - w-perf answered the seam (inbox/w-engine-from-w-perf.md): items 3-7 after A-752 and the log give-back.
+- Part 2 committed locally 004f072d4 (merged with main 5a9a5d41e as 7cd9da8db), suites running before landing:
+  Building + async deriver under Pace (no Arc: turn lent via thread-local Cell in Pace::drive), Verdicts::prepare from
+  ServerJudge::ready, status push.build.*. t_a752 (debug, 1,500 flat files): ~160k build turns a push, past_budget 0,
+  longest build turn 1.13 ms (one tree's listing). Livelock found and fixed on the way (a turn shorter than a unit:
+  the composition's tick never got the turn's first unit).
+- Main is clippy-red outside my files at 5a9a5d41e: git store/staging.rs:223, server daemon.rs:928,
+  vcs_store.rs:2402, verbs.rs:955 (cognitive complexity), svn report/drive.rs:72/1734, migration/records.rs:231.
+- NEXT: land part 2; 2b: git tree listing an entry a unit (PushObjects::listing, owned bytes + entry_at); part 3 the
+  apply (waiting main's call: green held out across commit turns?).
