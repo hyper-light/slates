@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "suite": "workloads",
+  "transport": "native-windows-winfsp",
+  "host": {
+    "os": "Microsoft Windows [Version 10.0.26100.33828]",
+    "kernel": "Microsoft Windows [Version 10.0.26100.33828]",
+    "arch": "x86_64",
+    "privilege": "root"
+  },
+  "date": "2026-11-20",
+  "command": "sh -c '<roster script>' in <host scratch>/<tool> and <mount>/<tool>, per tool of crates/conformance/src/workload.rs ROSTER; trees compared by manifest",
+  "bound": "4 tools run, one script each",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "workloads",
+      "tools": [
+        {
+          "name": "git",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "git-history",
+          "status": {
+            "kind": "stated",
+            "lines": [
+              "output line 1: host \"objects with two names after the clone: 5 of 5\", mount \"objects with two names after the clone: 0 of 5\""
+            ]
+          }
+        },
+        {
+          "name": "mercurial",
+          "status": {
+            "kind": "stated",
+            "lines": [
+              "output line 5: host \"store files with two names after the clone: 7 of 9\", mount \"store files with two names after the clone: 0 of 9\"",
+              "output line 6: host \"store files with two names after the clone's commit: 4\", mount \"store files with two names after the clone's commit: 0\""
+            ]
+          }
+        },
+        {
+          "name": "subversion",
+          "status": {
+            "kind": "identical"
+          }
+        }
+      ]
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 237477,
+  "notes": [
+    "the volume was created with --fold=true to match the host scratch's name policy; git identity and dates fixed; sqlite busy timeout 5000 ms; watcher wait 3 s",
+    "the mount refused a hard link (one file given a second name in its workload root before the workloads ran)",
+    "on Windows the roster runs its version-control workloads (A-300); owed a Windows form: cargo, npm, python, rg, rsync, sqlite, editor, watcher",
+    "git-history: identical but for the route's stated difference: output line 1: host \"objects with two names after the clone: 5 of 5\", mount \"objects with two names after the clone: 0 of 5\"",
+    "mercurial: identical but for the route's stated differences: output line 5: host \"store files with two names after the clone: 7 of 9\", mount \"store files with two names after the clone: 0 of 9\"; output line 6: host \"store files with two names after the clone's commit: 4\", mount \"store files with two names after the clone's commit: 0\""
+  ]
+}
