@@ -2239,17 +2239,19 @@ fn append_entry(
     return Err(NotAppended::Gone);
   };
   // A whole record is a checkpoint and may go one past the credit (`Shipper::append_checkpoint`); a delta waits for it.
+  // The head alone back: the entry stays in the retained tail, and its identity is hashed once (w-forming,
+  // 2026-11-20: asked here twice more, each a copy and a hash of the payload).
   let appended = if whole {
-    live.shipper.append_checkpoint(payload.clone())
+    live.shipper.append_checkpoint_kept(payload.clone())
   } else {
-    live.shipper.append(payload.clone())
+    live.shipper.append_kept(payload.clone())
   };
-  let entry = appended.map_err(NotAppended::Refused)?;
+  let head = appended.map_err(NotAppended::Refused)?;
   let published_ns = live
     .publishing_ns
     .take()
     .unwrap_or_else(slates_machine::clock::monotonic_ns);
-  live.newest = Some((entry.head().position, published_ns));
+  live.newest = Some((head.position, published_ns));
   let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
   if whole {
     live.owes_whole = false;
@@ -2263,7 +2265,6 @@ fn append_entry(
   // where later publications are captured past it (A-377); the record period makes it once the volume is clean.
   let image_owed = live.owes_image && !whole && image_now;
   if whole {
-    let head = entry.head();
     live.shipper.mark_checkpoint(head);
     // Derived (AC-8.9, A-200 amended 2026-11-17): the credit and the retained tail are both this whole record's
     // size, the install a laggard would be sent instead: the deltas outstanding never cost more than the whole

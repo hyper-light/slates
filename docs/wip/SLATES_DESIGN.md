@@ -56532,3 +56532,23 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   that work released, B's counter moved, the name made again at a new id). Red with the creation dropped as before: A's
   floor never released (the poll gave up). Fleet `a_holder` 23 of 23; `slates-server --lib work_home verbs::
   takeover::`, `slates-db --lib` and `--test alias`; fmt clean.
+
+### A-757 — The live append turn bounded (2026-11-20, w-forming; main's order: a measured gap fixed up front; §4.10 "Live shipping"; A-377, A-755; CLAUDE.md "Bounded work everywhere")
+
+- **What was measured.** The turn that appends a live entry hashed its whole payload three times, each over a fresh
+  copy of the canonical bytes (`db::live::Shipper::append_unchecked`'s head, then `live_ship::append_entry`'s two
+  `entry.head()`), and cloned the entry into the retained tail: 223 to 498 ms of the owner shard's CPU for a whole
+  entry's append and 128 to 331 ms for a 1.8 to 2.5 MB delta in a debug fleet under `taskpolicy -b`; 3.1 to 4.6 ms for
+  2.4 MB in release, against seal quanta of 14 to 784 us.
+- **Part 1 (this change).** `Entry::identity` hashes the canonical bytes as the fields stream, with no copy (equal to
+  `blake3(encode())` byte for byte); `Shipper::append_kept` and `append_checkpoint_kept` keep the entry in the retained
+  tail without a clone and return the head hashed once; `live_ship::append_entry` reads that head. Release, 2.4 MB,
+  best and median of 9: a delta 3.63 / 4.59 ms before, 1.39 / 1.63 ms after; a whole state 3.06 / 3.42 ms before,
+  0.94 / 0.97 ms after (`slates-db --test live measure_the_live_append_turn`, ignored, a measurement).
+- **Owed.** Part 2: the remaining hash in quantum slices across turns (a whole build's after sealing; a large delta's as
+  a build of its own). Part 3: the body held once, by identity in the content store (A-727) or an arena handle, so the
+  retained entry and the volume's whole state name one copy.
+- **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
+  `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
+- **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
+  `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
