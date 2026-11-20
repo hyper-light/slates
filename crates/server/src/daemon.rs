@@ -212,6 +212,16 @@ impl SegmentSource {
       }
     }
   }
+
+  /// The rendezvous a daemon started over this source adopts (A-114): the one the anchor across the spawn named in the
+  /// environment, the one held beside a handoff, or none for a daemon that makes its own.
+  fn adoption(&self) -> Result<Option<Adoption>, ServerError> {
+    Ok(match self {
+      SegmentSource::Create { .. } => None,
+      SegmentSource::FromEnv => Adoption::from_env()?,
+      SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
+    })
+  }
 }
 
 /// A held register record as a holder keeps it ([`Daemon::fleet_held_record`]).
@@ -918,6 +928,22 @@ impl Daemon {
     Self::start_with_fleet(profile, config, source, None)
   }
 
+  /// The observability gate (§2.6, §4.14): refused, naming what is missing, unless every chokepoint span has
+  /// registered its emitter.
+  fn chokepoints_ready() -> Result<(), ServerError> {
+    let chokepoints = registered_chokepoints();
+    if chokepoints.is_ready() {
+      return Ok(());
+    }
+    Err(ServerError::ChokepointsUnregistered {
+      missing: chokepoints
+        .missing()
+        .into_iter()
+        .map(Chokepoint::name)
+        .collect(),
+    })
+  }
+
   /// Like [`start`](Daemon::start) but **joins a fleet** (§4.8, boot step 6): `fleet_transport` — this
   /// node's fleet TLS identity, its advertised accept socket, and its peers — drives the control shard's
   /// membership loop, which probes the peers, serves their probes, and folds the converged view into the
@@ -935,16 +961,7 @@ impl Daemon {
     // span has registered its emitter, so a daemon never serves with a silently missing span source.
     // Fail-closed and checked before any resource is acquired — an incomplete roster stops the boot
     // here, naming what is missing, rather than serving blind.
-    let chokepoints = registered_chokepoints();
-    if !chokepoints.is_ready() {
-      return Err(ServerError::ChokepointsUnregistered {
-        missing: chokepoints
-          .missing()
-          .into_iter()
-          .map(Chokepoint::name)
-          .collect(),
-      });
-    }
+    Self::chokepoints_ready()?;
     // This daemon's own mounts (A-227), recorded as each is made, so no daemon thread opens a path on one; room for one
     // a live attachment the shards can hold, the bound the anchor's device holds take.
     slates_base::own_mounts::install(config.held_device_bound()).map_err(|error| {
@@ -955,11 +972,7 @@ impl Daemon {
     let supervision = source.supervision();
     // The rendezvous comes from wherever the segment does (A-114): an anchor across the spawn names both in the
     // environment, an anchor in this process hands both over, and a daemon with no anchor makes its own.
-    let adoption = match &source {
-      SegmentSource::Create { .. } => None,
-      SegmentSource::FromEnv => Adoption::from_env()?,
-      SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
-    };
+    let adoption = source.adoption()?;
     // The owner first (A-254, the rule of A-176 and A-178): a second daemon of a live instance is refused here, having
     // created nothing. On macOS a segment's creation unlinks any holder of its name and its drop unlinks the name again,
     // so a refused start that had created one took the live daemon's name with it. Every Linux rendezvous is sealed

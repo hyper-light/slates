@@ -3638,3 +3638,93 @@ fn measure_the_delta_append_turn() {
     at_once[0], at_once[median], hashed[0], hashed[median], slices[0], slices[median]
   );
 }
+
+/// A-757 part 3 (w-forming, 2026-11-20): the whole state the owner keeps is the entry's one copy, lent while the retained
+/// tail holds it and after the tail lets it go. Do: bound a shipper's tail to two small entries, append a whole state and
+/// keep it, then append deltas until the tail has let it go; then keep a later delta's position, then none. Expect the
+/// whole state's payload lent at each step until another is kept, then not; nothing lent once none is kept.
+#[test]
+fn a_kept_whole_state_is_lent_after_the_retained_tail_lets_it_go() {
+  const SMALL: usize = 16;
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    bounds_of(64, 2, SMALL),
+  );
+  let whole: Vec<u8> = vec![7; SMALL];
+  let head = shipper.append_checkpoint_kept(whole.clone()).unwrap();
+  shipper.keep(Some(head.position));
+  shipper.mark_checkpoint(head);
+  assert_eq!(shipper.payload_at(head.position), Some(whole.as_slice()));
+  let mut last = head;
+  for value in 0..4u8 {
+    last = shipper.append_kept(vec![value; SMALL]).unwrap();
+  }
+  assert!(
+    !shipper.retains_after(head.position),
+    "the tail let the whole state go"
+  );
+  assert_eq!(
+    shipper.payload_at(head.position),
+    Some(whole.as_slice()),
+    "the kept whole state is still lent"
+  );
+  shipper.keep(Some(last.position));
+  assert_eq!(
+    shipper.payload_at(head.position),
+    None,
+    "the old one let go"
+  );
+  shipper.keep(None);
+  for value in 4..8u8 {
+    shipper.append_kept(vec![value; SMALL]).unwrap();
+  }
+  assert_eq!(
+    shipper.payload_at(last.position),
+    None,
+    "none kept, none lent"
+  );
+}
+
+/// Shape: the live volumes the at-rest measurement holds whole states for.
+const MEASURED_VOLUMES: usize = 50;
+
+/// A measurement (w-forming's A/B for A-757 part 3; run alone in release under `/usr/bin/time -l` for its peak RSS):
+/// [`MEASURED_VOLUMES`] owners each holding a [`MEASURED_APPEND_BYTES`] whole state as `live_ship` held it before part 3,
+/// the payload cloned into the shipper and its own copy kept beside it.
+#[test]
+#[ignore = "a measurement: run alone in release under /usr/bin/time -l"]
+fn measure_whole_states_held_twice() {
+  let held: Vec<(Shipper, Vec<u8>)> = (0..MEASURED_VOLUMES)
+    .map(|_| {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+      let head = shipper.append_checkpoint_kept(payload.clone()).unwrap();
+      shipper.mark_checkpoint(head);
+      (shipper, payload)
+    })
+    .collect();
+  println!("WHOLE_STATES_HELD path=twice volumes={}", held.len());
+}
+
+/// The same owners as part 3 holds them: the payload moved into the shipper and kept there, lent back.
+#[test]
+#[ignore = "a measurement: run alone in release under /usr/bin/time -l"]
+fn measure_whole_states_held_once() {
+  let held: Vec<Shipper> = (0..MEASURED_VOLUMES)
+    .map(|_| {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let head = shipper
+        .append_checkpoint_kept(vec![0x5a_u8; MEASURED_APPEND_BYTES])
+        .unwrap();
+      shipper.keep(Some(head.position));
+      shipper.mark_checkpoint(head);
+      assert!(shipper.payload_at(head.position).is_some());
+      shipper
+    })
+    .collect();
+  println!("WHOLE_STATES_HELD path=once volumes={}", held.len());
+}

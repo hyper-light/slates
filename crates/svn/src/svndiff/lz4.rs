@@ -363,7 +363,9 @@ impl Compressing {
   /// The last literals' token and length (`handle_last_literals`), their bytes next.
   fn last_token(&mut self, len: usize) {
     let literals = len.saturating_sub(self.literal_start);
-    self.out.push(token(literals, 0) & 0xF0);
+    self
+      .out
+      .push(token(literals, 0) & (u8::MAX << LITERAL_SHIFT));
     if literals >= NIBBLE {
       self.length(literals.saturating_sub(NIBBLE));
     }
@@ -427,15 +429,16 @@ impl Compressing {
 
 /// A sequence's token: the literal length's nibble above the match length's, each 15 when it is written on.
 fn token(literals: usize, duplicate: usize) -> u8 {
-  let high = u8::try_from(literals.min(NIBBLE)).unwrap_or(0xF) << LITERAL_SHIFT;
-  high | u8::try_from(duplicate.min(NIBBLE)).unwrap_or(0xF)
+  let nibble = u8::MAX >> LITERAL_SHIFT;
+  let high = u8::try_from(literals.min(NIBBLE)).unwrap_or(nibble) << LITERAL_SHIFT;
+  high | u8::try_from(duplicate.min(NIBBLE)).unwrap_or(nibble)
 }
 
 /// The four bytes at `at`, native-endian (`get_batch`); zero past the end, where no caller reads.
 fn batch(input: &[u8], at: usize) -> u32 {
   input
-    .get(at..at.saturating_add(4))
-    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+    .get(at..at.saturating_add(size_of::<u32>()))
+    .and_then(|bytes| <[u8; size_of::<u32>()]>::try_from(bytes).ok())
     .map_or(0, u32::from_ne_bytes)
 }
 
@@ -443,8 +446,8 @@ fn batch(input: &[u8], at: usize) -> u32 {
 #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
 fn hash5(input: &[u8], at: usize) -> usize {
   let sequence = input
-    .get(at..at.saturating_add(8))
-    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+    .get(at..at.saturating_add(size_of::<u64>()))
+    .and_then(|bytes| <[u8; size_of::<u64>()]>::try_from(bytes).ok())
     .map_or(0, u64::from_ne_bytes);
   let product = (sequence << HASH5_UP).wrapping_mul(HASH5_PRIME) >> HASH5_SHIFT;
   usize::try_from(product).unwrap_or(0)
