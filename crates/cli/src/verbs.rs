@@ -970,6 +970,24 @@ fn emit_repository_imported(
   Ok(())
 }
 
+/// A branch verb's answer (A-575): the repository, the branch and its green where it has one, as text (`name: value`
+/// lines) or one JSON object.
+fn emit_branch(repository: &str, name: &str, green: Option<VolumeId>, json: bool) {
+  let id = green.map(volume_id_text);
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "repository": repository, "branch": name, "id": id })
+    );
+  } else {
+    slates_machine::out_line!("repository: {repository}");
+    slates_machine::out_line!("branch: {name}");
+    if let Some(id) = id {
+      slates_machine::out_line!("id: {id}");
+    }
+  }
+}
+
 /// `repository policy` (A-622): the policy read, each named point's hooks replaced by the ones given for it (an empty
 /// program clearing it), every other part kept, then set from the version read; the version it is at now, and its hooks,
 /// as text (`name: value` lines) or one JSON object.
@@ -1693,6 +1711,27 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::RepositoryPolicy { repository, hooks } => {
       emit_repository_policy(client, repository, hooks, json)?;
+    }
+    Verb::BranchCreate {
+      repository,
+      name,
+      from,
+      version,
+    } => {
+      let green = client.create_branch(repository, (name, from, *version))?;
+      emit_branch(repository, name, Some(green), json);
+    }
+    Verb::BranchBind {
+      repository,
+      name,
+      green,
+    } => {
+      client.bind_branch(repository, name, *green)?;
+      emit_branch(repository, name, Some(*green), json);
+    }
+    Verb::BranchRetire { repository, name } => {
+      client.retire_branch(repository, name)?;
+      emit_branch(repository, name, None, json);
     }
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }

@@ -1022,7 +1022,7 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
   let terms = (false, HISTORY_PUSH, PUSH_ROOM);
   let prepared =
     hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land(state, (&owner(), id), prepared, &mut room);
+  let landed = hg_push::land(state, (&owner(), id), prepared);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),
     "{landed:?}"

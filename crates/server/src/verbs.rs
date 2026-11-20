@@ -8582,6 +8582,19 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       path: key(path),
       name,
     },
+    // A copy made through a work (A-626 part 4): of the work's base unless it names a version; the green's owner
+    // composes it against the copied tree (`merge.work.copy_composed_by_owner`).
+    WorkOp::Copy {
+      from,
+      to,
+      version,
+      replace,
+    } => VolumeOp::Copy {
+      from: key(from),
+      to: key(to),
+      version: version.unwrap_or(w.base_version),
+      replace,
+    },
   };
   // The work is charged for what the declaration adds before it changes anything (`crate::work_charge`): a moved
   // file it now holds, a removal it records, the operation itself. The base is read while its green is lent.
@@ -9351,6 +9364,13 @@ impl SubmitPolicy {
   }
 }
 
+/// What a submit carries besides its work: its evidence, its signature and its authorship.
+type SubmitCarried = (
+  Vec<[u8; 32]>,
+  Option<Vec<u8>>,
+  slates_ipc::protocol::Authorship,
+);
+
 /// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
 /// declared operations into the canonical document, seal the post-state, hash the identity, and run
 /// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
@@ -9361,11 +9381,7 @@ fn submit(
   state: &mut ShardState,
   principal: &Principal,
   work: VolumeId,
-  (evidence, signature, authorship): (
-    Vec<[u8; 32]>,
-    Option<Vec<u8>>,
-    slates_ipc::protocol::Authorship,
-  ),
+  (evidence, signature, authorship): SubmitCarried,
   approval: Approval,
 ) -> ReplyBody {
   let (work_id, green_id) =
@@ -10116,7 +10132,7 @@ pub(crate) fn owner_judge(
       id,
       route: Some(back),
       kind: ParkedKind::Owner {
-        sealed,
+        sealed: Box::new(sealed),
         evidence,
         policy,
       },
@@ -10191,8 +10207,8 @@ pub(crate) fn answer_overdue(state: &ShardState, parked: ParkedSubmit) -> bool {
 enum ParkedKind {
   /// Asked from a work's shard.
   Owner {
-    /// The work.
-    sealed: crate::work_home::SealedWork,
+    /// The work (boxed: it is most of a parked submit's size).
+    sealed: Box<crate::work_home::SealedWork>,
     /// Its evidence.
     evidence: Vec<[u8; 32]>,
     /// Its policy.
@@ -10254,7 +10270,7 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
         evidence,
         policy,
       } => {
-        route.and_then(|back| owner_judge(state, (origin, id), (sealed, evidence, policy), back))
+        route.and_then(|back| owner_judge(state, (origin, id), (*sealed, evidence, policy), back))
       }
       ParkedKind::Local {
         principal,
@@ -10283,15 +10299,7 @@ fn resumed_local(
   (origin, id): (u64, RequestId),
   route: Option<crate::merge_service::ReplyRoute>,
   principal: &Principal,
-  (work, carried, approval): (
-    VolumeId,
-    (
-      Vec<[u8; 32]>,
-      Option<Vec<u8>>,
-      slates_ipc::protocol::Authorship,
-    ),
-    Approval,
-  ),
+  (work, carried, approval): (VolumeId, SubmitCarried, Approval),
 ) -> Option<ReplyBody> {
   state.db.begin();
   state.current_request = Some((origin, id));

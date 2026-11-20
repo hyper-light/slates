@@ -862,6 +862,30 @@ impl Index {
     })
   }
 
+  /// Derived: the most a fork of this index could charge the store as it is made ([`Index::fork`]): its tail sealed into
+  /// tables (the rows' bytes, a frame and a fence a table, held beside the tail they replace until it is given back) and
+  /// every run's fences copied.
+  pub fn fork_room(&self) -> u64 {
+    let fences = self
+      .runs
+      .iter()
+      .fold(0_u64, |charged, run| charged.saturating_add(run.charged));
+    let tail = self
+      .tail_bytes
+      .saturating_add(TABLE_FRAME_BYTES)
+      .saturating_add(FENCE_SLOT_BYTES)
+      .saturating_mul(2);
+    fences.saturating_add(u64::try_from(tail).unwrap_or(u64::MAX))
+  }
+
+  /// Whether this index would adopt `fork` now ([`Index::adopt`]): it is a fork, and this index took in no row since it
+  /// was made.
+  pub fn adoptable(&self, fork: &Index) -> bool {
+    fork.forked.is_some_and(|(inherited, keys_added)| {
+      keys_added == self.keys_added && inherited <= fork.runs.len()
+    })
+  }
+
   /// Takes in `fork`, a fork of this index, whole (A-722: a push's index rows staged in its own fork, then made the
   /// repository's as the push lands): the fork's tail sealed into tables of its own, its holds on the runs it took from
   /// this index given back, and its own runs added as this index's newest, holding what they held. It copies no row and

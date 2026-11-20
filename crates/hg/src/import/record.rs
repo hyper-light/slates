@@ -5,7 +5,8 @@
 //! **One kind for imports and pushes** (main's ruling, 2026-11-19): the record holds revisions to append to a
 //! repository's index, in groups, each one log's revisions in the order they were appended, and the markers after them.
 //! An import's record ([`write`], [`Source::Import`]) is every revision its index holds: the changelog's group, the
-//! manifest log's, then each file log's in its path's order. A push's ([`write_revisions`], [`Source::Push`]) is the
+//! manifest log's, then each file log's in its path's order. A push's whole-text record ([`write_revisions`], the
+//! tests' and a made changeset's; a live push writes its changegroup, below) is the
 //! revisions it brought that the repository lacked, in the order its landing appended them (`push::commit`), so a
 //! recovery appends them where the live push did. [`replay`] is the one entry point for both.
 //!
@@ -24,7 +25,17 @@
 //! store as they were. An import's record replays only into an empty index, as the live landing takes only an empty
 //! store. Not checked again: that each path a changeset names has a file log, which the import held its listing to.
 //!
-//! **The encoding**, little-endian as git's record is: the magic `SHGR` (a slates Mercurial record) and the version; the
+//! **A push's changegroup** (A-729 part 2, version 2): a push's record is the changegroup as the client sent it, its
+//! version's name and its bytes after the head ([`ChangegroupWriter`]), deltas never texts, so a push's record and the
+//! entry its landing appends are the size of what arrived; its replay takes the changegroup again through the live
+//! push's own intake (`push::intake`), against the index as the push met it, so it keeps the same rows.
+//!
+//! **A manifest as its delta** (A-729 part 2, version 3, an import's): after a revision's flags, a form byte: 0 its
+//! length and text as below, 1 the node of its delta's base, then the delta's length and bytes, as the index keeps a
+//! manifest (A-729 part 1), never rebuilt for the record. The replay rebuilds it from the manifest replayed before it or
+//! from the fork, then keeps it as any revision.
+//!
+//! **The encoding** of version 1, little-endian as git's record is: the magic `SHGR` (a slates Mercurial record) and the version; the
 //! source (0 an import, 1 a push); the room; the groups' count, then each group's log (0 the changelog, 1 the manifest
 //! log, 2 a file log, its path's length and path after it), its revisions' count and each revision: node, parents, link
 //! (not a changeset's), flags, text length and text; the markers' count, then each marker's length and bytes. Every
@@ -39,8 +50,11 @@ use super::{
   CHANGELOG, DATA, Held, ImportRefused, MANIFEST, PlannedChangeset, append_changeset, branch_of,
   changeset_refused, keep_revision, refuse_flags, settle,
 };
+use crate::changegroup::Version;
 use crate::filerev::{self, MARKER};
 use crate::index::{HgIndex, Log, NONE, NewRevision};
+use crate::push::intake::{Intake, Stepped};
+use crate::push::verify::LogOf;
 use crate::read::to_u64;
 use crate::{Admission, NODE_LEN, NULL_NODE, Node, changeset, node, obsmarkers};
 
@@ -48,8 +62,20 @@ use crate::{Admission, NODE_LEN, NULL_NODE, Node, changeset, node, obsmarkers};
 /// the first word.
 const MAGIC: u32 = u32::from_le_bytes(*b"SHGR");
 
-/// Format: the record's version; a replay refuses any other.
+/// Format: the version of a record that holds revisions whole (an import's, a made changeset's).
 const VERSION: u32 = 1;
+/// Format: the version of a push's record that holds its changegroup as it arrived (A-729 part 2): deltas, never texts.
+/// A replay refuses any version but these two.
+const CHANGEGROUP_VERSION: u32 = 2;
+/// Format: the version of a record of revisions each given whole or as the delta the index keeps it as (A-729 part 2,
+/// an import's): a form byte after a revision's flags, and a delta's base after it.
+const DELTA_VERSION: u32 = 3;
+/// Format: the form byte of a revision given whole.
+const TEXT_FORM: u8 = 0;
+/// Format: the form byte of a revision given as its delta, its base's node after the byte.
+const DELTA_FORM: u8 = 1;
+/// Format: the bytes of a changegroup version's name (`01` to `05`).
+const CHANGEGROUP_NAME_BYTES: usize = 2;
 
 /// Format: the bytes of a word: the magic, the version.
 const WORD_BYTES: usize = size_of::<u32>();
@@ -160,6 +186,24 @@ pub enum Refused {
   /// revision numbered other than its log's own, a link or a manifest the index lacks, the index's or the content
   /// store's refusal (its budget among them).
   Import(ImportRefused<Infallible>),
+  /// A revision given as a delta whose base its log does not hold, or in a log the index keeps whole.
+  Base {
+    /// Its revlog's radix.
+    revlog: Box<[u8]>,
+    /// The revision.
+    rev: u32,
+  },
+  /// A revision's delta that does not apply to its base.
+  Delta {
+    /// Its revlog's radix.
+    revlog: Box<[u8]>,
+    /// The revision.
+    rev: u32,
+    /// What applying it found.
+    refusal: crate::delta::Refusal,
+  },
+  /// A push's changegroup refused as the live push's intake refuses it (A-729 part 2).
+  Intake(crate::push::intake::Refused),
   /// Giving back what a refused replay held was refused too; `cause` is the replay's refusal.
   Unreleased {
     /// The replay's refusal.
@@ -255,8 +299,10 @@ pub(crate) struct Kept {
   block: Option<ContentId>,
   /// The text, or a file revision's bytes.
   bytes: ContentId,
-  /// A manifest kept as a delta: its text, rebuilt from its chain (A-729).
+  /// A manifest kept as a delta: its text, rebuilt from its chain (A-729), where its reader asked for texts.
   rebuilt: Option<Vec<u8>>,
+  /// A manifest kept as a delta: its base's node, `bytes` then the delta (A-729 part 2).
+  base: Option<Node>,
 }
 
 /// The record of the index an import made (module docs), `room` the room it ran within: every revision it holds, the
@@ -283,6 +329,8 @@ pub struct Writer {
   out: Vec<u8>,
   /// Whether the markers are written.
   done: bool,
+  /// Whether a revision kept as a delta is written as its delta ([`DELTA_VERSION`], an import's) or rebuilt whole.
+  deltas: bool,
 }
 
 impl Writer {
@@ -300,7 +348,7 @@ impl Writer {
         .file_logs(store)
         .map(|path| (FILE_TAG, path.to_vec(), 0)),
     );
-    Writer::of(logs, (Source::Import, room))
+    Writer::of(logs, (Source::Import, room), true)
   }
 
   /// Starts a push's record (A-680 part 2c, A-720) of the revisions it kept in `logs` (each a log and its first kept
@@ -319,25 +367,28 @@ impl Writer {
       LogOf::Manifests => (MANIFEST_TAG, Vec::new(), *first),
       LogOf::File(path) => (FILE_TAG, path.clone(), *first),
     }));
-    Writer::of(kept, (Source::Push, room))
+    Writer::of(kept, (Source::Push, room), false)
   }
 
   /// A writer of `logs` from `source`'s head.
   fn of(
     logs: Vec<(u8, Vec<u8>, u32)>,
     (source, room): (Source, u64),
+    deltas: bool,
   ) -> Result<Writer, WriteRefused> {
     let mut out = Vec::new();
     out
       .try_reserve(HEAD_BYTES.saturating_add(LONG_BYTES))
       .map_err(|_| WriteRefused::Allocation)?;
-    write_head(&mut out, (source, room), to_u64(logs.len()));
+    let version = if deltas { DELTA_VERSION } else { VERSION };
+    write_head(&mut out, (version, source, room), to_u64(logs.len()));
     let at = (0, logs.first().map_or(0, |(_, _, first)| *first));
     Ok(Writer {
       logs,
       at,
       out,
       done: false,
+      deltas,
     })
   }
 
@@ -377,8 +428,14 @@ impl Writer {
       write_group_head(&mut part, log, u64::from(len.saturating_sub(first)));
     }
     if rev < len {
-      let kept = kept(index, store, log, rev).ok_or_else(|| unreadable(&radix, rev))?;
-      write_kept_revision(&mut part, store, &kept).ok_or_else(|| unreadable(&radix, rev))?;
+      let kept =
+        kept(index, store, log, rev, !self.deltas).ok_or_else(|| unreadable(&radix, rev))?;
+      let written = if self.deltas {
+        write_formed_revision(&mut part, store, &kept)
+      } else {
+        write_kept_revision(&mut part, store, &kept)
+      };
+      written.ok_or_else(|| unreadable(&radix, rev))?;
       self.at = (at, rev.saturating_add(1));
     }
     if rev.saturating_add(1) >= len {
@@ -427,6 +484,30 @@ fn write_kept_revision(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> 
   (write_text(out, store, kept) == kept.len).then_some(())
 }
 
+/// One kept revision as a [`DELTA_VERSION`] record writes it: its node, parents, link, flags, then its form: whole
+/// (its length and text), or the delta the index keeps it as (its base's node, the delta's length and bytes).
+fn write_formed_revision(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> Option<()> {
+  out.extend_from_slice(&kept.node);
+  out.extend_from_slice(&kept.p1);
+  out.extend_from_slice(&kept.p2);
+  if let Some(link) = kept.link {
+    out.extend_from_slice(&link);
+  }
+  out.extend_from_slice(&kept.flags.to_le_bytes());
+  let Some(base) = kept.base else {
+    out.push(TEXT_FORM);
+    out.extend_from_slice(&kept.len.to_le_bytes());
+    return (write_text(out, store, kept) == kept.len).then_some(());
+  };
+  out.push(DELTA_FORM);
+  out.extend_from_slice(&base);
+  out.extend_from_slice(&window_bytes(store, &kept.bytes).to_le_bytes());
+  for window in store.windows(&kept.bytes) {
+    out.extend_from_slice(&window);
+  }
+  Some(())
+}
+
 /// The record of revisions given whole (module docs): a push's, the revisions it appended in `groups`, in their order,
 /// then its `markers` each alone in its obsstore's format; `room` the room its landing ran within. Refused, nothing is
 /// written.
@@ -461,7 +542,7 @@ pub fn write_revisions(
   out
     .try_reserve_exact(usize::try_from(len).map_err(|_| WriteRefused::Allocation)?)
     .map_err(|_| WriteRefused::Allocation)?;
-  write_head(&mut out, (source, room), to_u64(groups.len()));
+  write_head(&mut out, (VERSION, source, room), to_u64(groups.len()));
   for (log, revisions) in groups {
     write_group_head(&mut out, *log, to_u64(revisions.len()));
     for revision in *revisions {
@@ -537,6 +618,83 @@ pub fn write_kept(
   writer.finish().ok_or(WriteRefused::Allocation)
 }
 
+/// A push's record as its changegroup arrived (A-729 part 2, [`CHANGEGROUP_VERSION`]): the head (the magic, the
+/// version, the push's source, the room its intake ran within), the changegroup's version name, its length and its
+/// bytes: deltas as the client sent them, never the texts they rebuild, so the record is the size of what arrived. Its
+/// replay takes the changegroup again through the live push's intake ([`Replay`]). Written a part a step, so a large
+/// push's record never holds its shard past a step: each step copies the changegroup's mean revision's bytes.
+pub struct ChangegroupWriter {
+  /// The record so far.
+  out: Vec<u8>,
+  /// The changegroup's bytes copied so far.
+  at: usize,
+  /// The changegroup's length.
+  len: usize,
+  /// Derived: the bytes a step copies, the changegroup's length over its revisions (its mean revision's bytes), at
+  /// least one.
+  part: usize,
+}
+
+impl ChangegroupWriter {
+  /// Starts the record of a changegroup of `version`, `len` bytes holding `revisions` revisions, `room` the room the
+  /// push's intake ran within: the head written, the whole record's room reserved.
+  pub fn begin(
+    room: u64,
+    (version, len): (Version, usize),
+    revisions: u64,
+  ) -> Result<ChangegroupWriter, WriteRefused> {
+    let head = WORD_BYTES
+      .saturating_add(WORD_BYTES)
+      .saturating_add(TAG_BYTES)
+      .saturating_add(LONG_BYTES)
+      .saturating_add(CHANGEGROUP_NAME_BYTES)
+      .saturating_add(LONG_BYTES);
+    let mut out = Vec::new();
+    out
+      .try_reserve(head.checked_add(len).ok_or(WriteRefused::Allocation)?)
+      .map_err(|_| WriteRefused::Allocation)?;
+    out.extend_from_slice(&MAGIC.to_le_bytes());
+    out.extend_from_slice(&CHANGEGROUP_VERSION.to_le_bytes());
+    out.push(Source::Push.byte());
+    out.extend_from_slice(&room.to_le_bytes());
+    out.extend_from_slice(version.name());
+    out.extend_from_slice(&to_u64(len).to_le_bytes());
+    let revisions = usize::try_from(revisions).unwrap_or(usize::MAX).max(1);
+    Ok(ChangegroupWriter {
+      out,
+      at: 0,
+      len,
+      part: len.div_ceil(revisions).max(1),
+    })
+  }
+
+  /// Copies the next part of `payload`, the changegroup [`ChangegroupWriter::begin`] was sized for: whether more
+  /// follow.
+  pub fn step(&mut self, payload: &[u8]) -> Result<bool, WriteRefused> {
+    let end = self.at.saturating_add(self.part).min(self.len);
+    let part = payload.get(self.at..end).ok_or(WriteRefused::Allocation)?;
+    self.out.extend_from_slice(part);
+    self.at = end;
+    Ok(self.at < self.len)
+  }
+
+  /// The record, once every byte is copied.
+  pub fn finish(self) -> Option<Vec<u8>> {
+    (self.at == self.len).then_some(self.out)
+  }
+}
+
+/// A push's changegroup record written whole ([`ChangegroupWriter`]'s steps at once).
+pub fn write_changegroup(
+  room: u64,
+  (version, payload): (Version, &[u8]),
+  revisions: u64,
+) -> Result<Vec<u8>, WriteRefused> {
+  let mut writer = ChangegroupWriter::begin(room, (version, payload.len()), revisions)?;
+  while writer.step(payload)? {}
+  writer.finish().ok_or(WriteRefused::Allocation)
+}
+
 /// One log's arrived revisions as a push's record holds them: flags 0, and a link only where the log has one.
 fn pushed(arrived: &[crate::push::verify::Arrived], linked: bool) -> Vec<Revision<'_>> {
   arrived
@@ -553,9 +711,9 @@ fn pushed(arrived: &[crate::push::verify::Arrived], linked: bool) -> Vec<Revisio
 }
 
 /// Writes the head: the magic, the version, the source, the room, and the groups' count.
-fn write_head(out: &mut Vec<u8>, (source, room): (Source, u64), groups: u64) {
+fn write_head(out: &mut Vec<u8>, (version, source, room): (u32, Source, u64), groups: u64) {
   out.extend_from_slice(&MAGIC.to_le_bytes());
-  out.extend_from_slice(&VERSION.to_le_bytes());
+  out.extend_from_slice(&version.to_le_bytes());
   out.push(source.byte());
   if let Source::Made { green, version } = source {
     out.extend_from_slice(&green.to_le_bytes());
@@ -625,7 +783,13 @@ fn unreadable(radix: &[u8], rev: u32) -> WriteRefused {
 
 /// Revision `rev` of `log` as the record holds it, its parents and link read back to their nodes; `None` where the
 /// index does not answer one of them.
-pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<Kept> {
+pub(crate) fn kept(
+  index: &HgIndex,
+  store: &ContentStore,
+  log: Log<'_>,
+  rev: u32,
+  texts: bool,
+) -> Option<Kept> {
   if log == Log::Changelog {
     let row = index.changeset(store, rev)?;
     let parent = |number: u32| changeset_node(index, store, number);
@@ -639,6 +803,7 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
       block: None,
       bytes: row.text,
       rebuilt: None,
+      base: None,
     });
   }
   let row = index.revision(store, log, rev)?;
@@ -648,11 +813,14 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
     }
     index.revision(store, log, number).map(|parent| parent.node)
   };
-  // A manifest kept as a delta (A-729): its text rebuilt from its chain, the one revision's text held.
-  let rebuilt = if row.base == NONE {
-    None
+  // A manifest kept as a delta (A-729): its base named, and its text rebuilt from its chain where texts are asked for,
+  // the one revision's text held.
+  let (rebuilt, base) = if row.base == NONE {
+    (None, None)
+  } else if texts {
+    (Some(index.revision_text(store, log, rev)?), None)
   } else {
-    Some(index.revision_text(store, log, rev)?)
+    (None, Some(index.revision(store, log, row.base)?.node))
   };
   Some(Kept {
     node: row.node,
@@ -664,6 +832,7 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
     block: row.block,
     bytes: row.bytes,
     rebuilt,
+    base,
   })
 }
 
@@ -732,8 +901,10 @@ struct Read<'a> {
   link: Node,
   /// 7.2's index flags.
   flags: u16,
-  /// The text.
+  /// The text; a revision given as a delta, its delta.
   text: &'a [u8],
+  /// A revision given as a delta: its base's node.
+  base: Option<Node>,
 }
 
 impl<'a> Reader<'a> {
@@ -801,13 +972,18 @@ impl<'a> Reader<'a> {
   }
 
   /// One revision: a changeset's when `linked` is false, else a manifest's or file revision's.
-  fn revision(&mut self, linked: bool) -> Result<Read<'a>, Refused> {
+  fn revision(&mut self, linked: bool, formed: bool) -> Result<Read<'a>, Refused> {
     let node = self.node()?;
     let p1 = self.node()?;
     let p2 = self.node()?;
     let link = if linked { self.node()? } else { NULL_NODE };
     let flags =
       <[u8; FLAGS_BYTES]>::try_from(self.take(FLAGS_BYTES)?).map_err(|_| Refused::Truncated)?;
+    let base = match formed.then(|| self.byte()).transpose()? {
+      None | Some(TEXT_FORM) => None,
+      Some(DELTA_FORM) => Some(self.node()?),
+      Some(tag) => return Err(Refused::Tag { tag }),
+    };
     let text = self.bytes()?;
     Ok(Read {
       node,
@@ -816,6 +992,7 @@ impl<'a> Reader<'a> {
       link,
       flags: u16::from_le_bytes(flags),
       text,
+      base,
     })
   }
 }
@@ -848,14 +1025,11 @@ pub fn replay(
   }
 }
 
-/// A record replayed a unit at a time (A-732: a recovery of a large repository's record in one step spun its shard past
-/// the watchdog's window at every restart): the unit [`replay`] takes whole, cut into steps its owner advances within
-/// its step budget, a yield between. A step takes one unit: a group's head, one revision of it (kept and appended into
-/// the fork as [`replay`] keeps it), one new changeset's manifest held to the manifest log, or the markers and the
-/// record's end. Its place in the record is a byte offset, so it borrows nothing between steps: its owner hands it the
-/// record's bytes again at each step ([`Replay::step`]). Finished, the fork takes the index's place ([`Replay::finish`]);
-/// given up, the fork is given back and the index is as it was ([`Replay::abandon`]).
-pub struct Replay {
+/// A record of revisions replayed a unit at a time (A-732: a recovery of a large repository's record in one step spun its
+/// shard past the watchdog's window at every restart): a step takes one unit, a group's head, one revision of it (kept
+/// and appended into the fork as [`replay`] keeps it), one new changeset's manifest held to the manifest log, or the
+/// markers and the record's end. Its place in the record is a byte offset, so it borrows nothing between steps.
+struct Revisions {
   /// The record's source.
   source: Source,
   /// The room the record was written within.
@@ -877,17 +1051,192 @@ pub struct Replay {
   done: bool,
   /// What was replayed.
   replayed: Replayed,
+  /// Whether each revision names its form ([`DELTA_VERSION`]).
+  formed: bool,
+  /// The manifest replayed last and its text: the next one's base where its delta names it.
+  last: Option<(Node, Vec<u8>)>,
+}
+
+/// A record replayed a unit at a time (A-732: a recovery of a large repository's record in one step spun its shard past
+/// the watchdog's window at every restart): the unit [`replay`] takes whole, cut into steps its owner advances within
+/// its step budget, a yield between. A record of revisions ([`VERSION`]) is replayed a group's head, a revision, a
+/// manifest's check or the markers a step; a push's changegroup ([`CHANGEGROUP_VERSION`], A-729 part 2) is taken
+/// again through the live push's own intake (`push::intake`), a unit a step, against the index as the push met it. Its
+/// place in the record is a byte offset, so it borrows nothing between steps: its owner hands it the record's bytes
+/// again at each step ([`Replay::step`]). Finished, the fork takes the index's place ([`Replay::finish`]); given up,
+/// the fork is given back and the index is as it was ([`Replay::abandon`]).
+pub struct Replay {
+  /// The record's kind, replayed.
+  kind: Kind,
+}
+
+/// What a record holds, being replayed.
+enum Kind {
+  /// Revisions whole.
+  Revisions(Box<Revisions>),
+  /// A push's changegroup as it arrived.
+  Changegroup(Box<Retaken>),
+}
+
+/// A push's changegroup taken again through the intake (A-729 part 2).
+struct Retaken {
+  /// The intake, into its own fork of the index.
+  intake: Intake,
+  /// Where the changegroup lies in the record's bytes.
+  payload: core::ops::Range<usize>,
+  /// The room the push's intake ran within.
+  room: Admission,
+  /// The changelog's and the manifest log's lengths before the record.
+  first: (u32, u32),
+  /// Whether every unit is taken.
+  done: bool,
 }
 
 impl Replay {
-  /// Starts replaying `bytes` into a fork of `index`: its head read, an import's record held to an empty index.
+  /// Starts replaying `bytes` into a fork of `index`: its head read, an import's record held to an empty index, a
+  /// push's changegroup framed.
   pub fn begin(
     bytes: &[u8],
     index: &mut HgIndex,
     store: &mut ContentStore,
   ) -> Result<Replay, Refused> {
     let mut reader = Reader { rest: bytes };
-    let (source, room) = head(&mut reader)?;
+    let (version, source, room) = head(&mut reader)?;
+    let kind = if version == CHANGEGROUP_VERSION {
+      Kind::Changegroup(Box::new(Retaken::begin(
+        (bytes, reader),
+        room,
+        index,
+        store,
+      )?))
+    } else {
+      let begun = Revisions::begin((bytes, reader), (version, source, room), index, store)?;
+      Kind::Revisions(Box::new(begun))
+    };
+    Ok(Replay { kind })
+  }
+
+  /// Replays the next unit of `bytes`, the record [`Replay::begin`] was given: whether more follow. Refused, its owner
+  /// gives the fork back ([`Replay::abandon`]).
+  pub fn step(&mut self, bytes: &[u8], store: &mut ContentStore) -> Result<bool, Refused> {
+    match &mut self.kind {
+      Kind::Revisions(revisions) => revisions.step(bytes, store),
+      Kind::Changegroup(retaken) => retaken.step(bytes, store),
+    }
+  }
+
+  /// The fork in the index's place, what was replayed answered.
+  pub fn finish(self, index: &mut HgIndex, store: &mut ContentStore) -> Result<Replayed, Refused> {
+    match self.kind {
+      Kind::Revisions(revisions) => revisions.finish(index, store),
+      Kind::Changegroup(retaken) => retaken.finish(index, store),
+    }
+  }
+
+  /// Gives the fork back: the index as it was before the replay began.
+  pub fn abandon(self, store: &mut ContentStore) -> Result<(), IndexRefused> {
+    match self.kind {
+      Kind::Revisions(revisions) => revisions.abandon(store),
+      Kind::Changegroup(retaken) => retaken.intake.abandon(store),
+    }
+  }
+}
+
+impl Retaken {
+  /// Frames the changegroup after the head `reader` has read, and begins its intake into a fork of `index`.
+  fn begin(
+    (bytes, mut reader): (&[u8], Reader<'_>),
+    mut room: Admission,
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<Retaken, Refused> {
+    let name = reader.take(CHANGEGROUP_NAME_BYTES)?;
+    let version = Version::from_name(name).map_err(|_| Refused::Tag {
+      tag: name.first().copied().unwrap_or_default(),
+    })?;
+    let payload = reader.bytes()?;
+    if !reader.rest.is_empty() {
+      return Err(Refused::Trailing);
+    }
+    let end = bytes.len();
+    let start = end.saturating_sub(payload.len());
+    let first = (
+      index.len(store, Log::Changelog),
+      index.len(store, Log::Manifest),
+    );
+    let intake =
+      Intake::begin((version, payload), index, store, &mut room).map_err(Refused::Intake)?;
+    Ok(Retaken {
+      intake,
+      payload: start..end,
+      room,
+      first,
+      done: false,
+    })
+  }
+
+  /// Takes the next unit of the changegroup in `bytes`: whether more follow.
+  fn step(&mut self, bytes: &[u8], store: &mut ContentStore) -> Result<bool, Refused> {
+    if self.done {
+      return Ok(false);
+    }
+    let payload = bytes.get(self.payload.clone()).ok_or(Refused::Truncated)?;
+    let stepped = self
+      .intake
+      .step(payload, store, &mut self.room)
+      .map_err(Refused::Intake)?;
+    self.done = stepped == Stepped::Done;
+    Ok(!self.done)
+  }
+
+  /// The fork in the index's place, what was replayed answered.
+  fn finish(self, index: &mut HgIndex, store: &mut ContentStore) -> Result<Replayed, Refused> {
+    let (changesets, manifests) = self.first;
+    let (fork, intaken) = match self.intake.finish() {
+      Ok(finished) => finished,
+      Err(intake) => {
+        return Err(match intake.abandon(store) {
+          Ok(()) => Refused::Truncated,
+          Err(release) => Refused::Unreleased {
+            cause: Box::new(Refused::Truncated),
+            release,
+          },
+        });
+      }
+    };
+    let changesets = fork.len(store, Log::Changelog).saturating_sub(changesets);
+    let manifests = fork.len(store, Log::Manifest).saturating_sub(manifests);
+    let file_logs = intaken
+      .logs
+      .iter()
+      .filter(|(log, _)| matches!(log, LogOf::File(_)))
+      .count();
+    let file_revisions = intaken
+      .kept
+      .saturating_sub(u64::from(changesets))
+      .saturating_sub(u64::from(manifests));
+    let replaced = core::mem::replace(index, fork);
+    Ok(Replayed {
+      changesets,
+      manifests,
+      file_logs: to_u64(file_logs),
+      file_revisions,
+      markers: 0,
+      whole: replaced.release(store).is_ok(),
+      made: None,
+    })
+  }
+}
+
+impl Revisions {
+  /// Starts replaying `bytes`, whose head `reader` has read, into a fork of `index`: an import's record held to an
+  /// empty index.
+  fn begin(
+    (bytes, mut reader): (&[u8], Reader<'_>),
+    (version, source, room): (u32, Source, Admission),
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<Revisions, Refused> {
     if source == Source::Import && index.rows().rows() != 0 {
       return Err(Refused::NotEmpty);
     }
@@ -897,7 +1246,7 @@ impl Replay {
       .fork(store)
       .map_err(|refused| ImportRefused::<Infallible>::Index(refused.into()))?;
     let first = fork.len(store, Log::Changelog);
-    Ok(Replay {
+    Ok(Revisions {
       source,
       room,
       fork,
@@ -908,12 +1257,13 @@ impl Replay {
       check: None,
       done: false,
       replayed: Replayed::default(),
+      formed: version == DELTA_VERSION,
+      last: None,
     })
   }
 
-  /// Replays the next unit of `bytes`, the record [`Replay::begin`] was given: whether more follow. Refused, its owner
-  /// gives the fork back ([`Replay::abandon`]).
-  pub fn step(&mut self, bytes: &[u8], store: &mut ContentStore) -> Result<bool, Refused> {
+  /// Replays the next unit of `bytes`: whether more follow.
+  fn step(&mut self, bytes: &[u8], store: &mut ContentStore) -> Result<bool, Refused> {
     if self.done {
       return Ok(false);
     }
@@ -926,8 +1276,8 @@ impl Replay {
   }
 
   /// The fork in the index's place, what was replayed answered.
-  pub fn finish(self, index: &mut HgIndex, store: &mut ContentStore) -> Result<Replayed, Refused> {
-    let Replay {
+  fn finish(self, index: &mut HgIndex, store: &mut ContentStore) -> Result<Replayed, Refused> {
+    let Revisions {
       fork,
       mut replayed,
       done,
@@ -948,7 +1298,7 @@ impl Replay {
   }
 
   /// Gives the fork back: the index as it was before the replay began.
-  pub fn abandon(self, store: &mut ContentStore) -> Result<(), IndexRefused> {
+  fn abandon(self, store: &mut ContentStore) -> Result<(), IndexRefused> {
     self.fork.release(store)
   }
 
@@ -1028,9 +1378,17 @@ impl Replay {
       _ => (Log::File(path), [DATA, path].concat()),
     };
     let linked = log != Log::Changelog;
-    let read = reader.revision(linked)?;
+    let read = reader.revision(linked, self.formed)?;
     let rev = self.fork.len(store, log);
-    if linked {
+    if log == Log::Manifest {
+      self.manifest(store, radix.as_slice(), (rev, &read))?;
+    } else if read.base.is_some() {
+      // Only a manifest is kept as a delta, so only a manifest is written as one.
+      return Err(Refused::Base {
+        revlog: radix.into_boxed_slice(),
+        rev,
+      });
+    } else if linked {
       replay_revision(&mut self.fork, store, (log, radix.as_slice()), (rev, &read))?;
     } else {
       replay_changeset(&mut self.fork, store, (rev, &read), self.room)?;
@@ -1043,9 +1401,58 @@ impl Replay {
     Ok(())
   }
 
+  /// One manifest, given whole or as its delta against the one replayed last or one the fork holds: rebuilt, then
+  /// kept and appended as [`replay`] keeps it, its text held for the next.
+  fn manifest(
+    &mut self,
+    store: &mut ContentStore,
+    radix: &[u8],
+    (rev, read): (u32, &Read<'_>),
+  ) -> Result<(), Refused> {
+    let text = match read.base {
+      None => read.text.to_vec(),
+      Some(base) => {
+        let unheld = || Refused::Base {
+          revlog: Box::from(radix),
+          rev,
+        };
+        let held;
+        let base_text: &[u8] = match &self.last {
+          Some((node, text)) if *node == base => text,
+          _ => {
+            let number = self
+              .fork
+              .rev(store, Log::Manifest, &base)
+              .ok_or_else(unheld)?;
+            held = self
+              .fork
+              .revision_text(store, Log::Manifest, number)
+              .ok_or_else(unheld)?;
+            &held
+          }
+        };
+        let mut room = self.room;
+        crate::delta::apply(base_text, read.text, &mut room).map_err(|refusal| Refused::Delta {
+          revlog: Box::from(radix),
+          rev,
+          refusal,
+        })?
+      }
+    };
+    let whole = Read {
+      text: &text,
+      base: None,
+      ..*read
+    };
+    replay_revision(&mut self.fork, store, (Log::Manifest, radix), (rev, &whole))?;
+    self.last = Some((read.node, text));
+    Ok(())
+  }
+
   /// A group read whole: counted, and the next group's head next.
   fn group_done(&mut self, tag: u8, revisions: u32) {
     self.group = None;
+    self.last = None;
     let replayed = &mut self.replayed;
     match tag {
       CHANGELOG_TAG => replayed.changesets = replayed.changesets.saturating_add(revisions),
@@ -1058,13 +1465,14 @@ impl Replay {
   }
 }
 
-/// The record's head read: its magic and version held to this build's, its source, and the room it was written within.
-fn head(reader: &mut Reader<'_>) -> Result<(Source, Admission), Refused> {
+/// The record's head read: its magic, its version held to the two this build reads, its source (a changegroup's record
+/// a push's alone), and the room it was written within.
+fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
   if reader.word()? != MAGIC {
     return Err(Refused::Magic);
   }
   let version = reader.word()?;
-  if version != VERSION {
+  if ![VERSION, CHANGEGROUP_VERSION, DELTA_VERSION].contains(&version) {
     return Err(Refused::Version { version });
   }
   let source = match reader.byte()? {
@@ -1076,7 +1484,10 @@ fn head(reader: &mut Reader<'_>) -> Result<(Source, Admission), Refused> {
     },
     tag => return Err(Refused::Tag { tag }),
   };
-  Ok((source, Admission::new(reader.long()?)))
+  if version == CHANGEGROUP_VERSION && source != Source::Push {
+    return Err(Refused::Tag { tag: source.byte() });
+  }
+  Ok((version, source, Admission::new(reader.long()?)))
 }
 
 /// Holds `read`'s flags to what 7.2 knows and its text to its node, as the import's revlog reader holds them.

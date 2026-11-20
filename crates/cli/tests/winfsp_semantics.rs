@@ -1497,16 +1497,21 @@ impl OtherAccount {
     Some(account)
   }
 
-  /// Opens `path` for reading as this account (this thread impersonates it for the one call): `Ok` or the Win32 error.
-  fn open(&self, path: &str) -> Result<(), i32> {
-    let name = wide(path);
-    // SAFETY: the account's live token; this thread reverts below before anything else runs on it.
+  /// This thread impersonates the account until [`revert_to_self`]; a test fails where it cannot.
+  fn impersonate(&self) {
+    // SAFETY: the account's live token; the caller reverts before anything else runs on this thread.
     let impersonated = unsafe { windows_sys::Win32::Security::ImpersonateLoggedOnUser(self.token) };
     assert!(
       impersonated != 0,
       "ImpersonateLoggedOnUser: {}",
       std::io::Error::last_os_error()
     );
+  }
+
+  /// Opens `path` for reading as this account (this thread impersonates it for the one call): `Ok` or the Win32 error.
+  fn open(&self, path: &str) -> Result<(), i32> {
+    let name = wide(path);
+    self.impersonate();
     // SAFETY: a terminated path, no security attributes and no template; a valid handle is closed at once.
     let handle = unsafe {
       windows_sys::Win32::Storage::FileSystem::CreateFileW(
@@ -1520,13 +1525,7 @@ impl OtherAccount {
       )
     };
     let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
-    // SAFETY: ends this thread's impersonation, which the call above began.
-    let reverted = unsafe { windows_sys::Win32::Security::RevertToSelf() };
-    assert!(
-      reverted != 0,
-      "RevertToSelf: {}",
-      std::io::Error::last_os_error()
-    );
+    revert_to_self();
     if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
       return Err(error);
     }
@@ -1534,6 +1533,17 @@ impl OtherAccount {
     unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
     Ok(())
   }
+}
+
+/// Ends this thread's impersonation ([`OtherAccount::impersonate`]); a test fails where it cannot.
+fn revert_to_self() {
+  // SAFETY: ends this thread's impersonation, which `impersonate` began.
+  let reverted = unsafe { windows_sys::Win32::Security::RevertToSelf() };
+  assert!(
+    reverted != 0,
+    "RevertToSelf: {}",
+    std::io::Error::last_os_error()
+  );
 }
 
 impl Drop for OtherAccount {

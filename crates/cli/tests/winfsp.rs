@@ -791,7 +791,7 @@ fn a_read_longer_than_the_bridges_cap_returns_every_byte_asked_for() {
   let content: Vec<u8> = (0..LONG_READ_BYTES + FILE_BYTES)
     .map(|offset| u8::try_from(offset % 251).unwrap())
     .collect();
-  std::fs::write(format!("{root}long.bin"), &content).unwrap();
+  write_through_drive(&format!("{root}long.bin"), &content).unwrap();
   let handle = std::fs::OpenOptions::new()
     .read(true)
     .custom_flags(FILE_FLAG_NO_BUFFERING)

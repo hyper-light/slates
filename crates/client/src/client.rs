@@ -3900,6 +3900,61 @@ impl Client {
     }
   }
 
+  /// Makes branch `name` of repository `repository` at `version` of branch `from`, its head when `None`, its owner asking
+  /// (A-575; `slates repository branch create`): the new branch's green. Refused typed (`NotFound`, `Forbidden`,
+  /// `AlreadyExists` for a name bound, and the version's own refusals).
+  pub fn create_branch(
+    &mut self,
+    repository: &str,
+    (name, from, version): (&str, &str, Option<u64>),
+  ) -> Result<VolumeId, ClientError> {
+    match self.call(&RequestBody::CreateBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      from: from.to_owned(),
+      version,
+    })? {
+      ReplyBody::GreenCreated { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create_branch",
+      }),
+    }
+  }
+
+  /// Binds branch `name` of repository `repository` to `green`, a member of its lineage no name binds (A-575; `slates
+  /// repository branch bind`): what restores a retired branch. Refused typed.
+  pub fn bind_branch(
+    &mut self,
+    repository: &str,
+    name: &str,
+    green: VolumeId,
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::BindBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      green,
+    })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "bind_branch",
+      }),
+    }
+  }
+
+  /// Retires branch `name` of repository `repository`: the name leaves the namespace and its green stays in the lineage
+  /// (A-575; `slates repository branch retire`). Refused typed.
+  pub fn retire_branch(&mut self, repository: &str, name: &str) -> Result<(), ClientError> {
+    match self.call(&RequestBody::RetireBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+    })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "retire_branch",
+      }),
+    }
+  }
+
   /// Reads repository `repository`'s policy whole, its owner asking (A-622; `slates repository policy`): its version and
   /// every part. Refused typed (`NotFound`, `Forbidden` for a principal but the owner).
   pub fn describe_repository_policy(
