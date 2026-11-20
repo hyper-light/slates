@@ -54715,6 +54715,12 @@ Applied in the same change to:
   is passed; an index is cut into `2^b` ranges by object id, each range held where rendezvous over `(family, range)`
   ranks first, `b` one integer in the repository's record, a push's rows committed by the owner's one landing record.
   Nothing built yet.
+- **Piece 7, starvation held to the fair share (2026-11-20, main's ruling).** BENCHMARKS.md, "Many repositories on one
+  daemon, held to their fair share": against the fair share of today's placement (a repository's intake on its owner
+  shard) no class is starved (every p99 ratio 0.72 to 0.87); against a repository spread over as many shards as it has
+  pushes, a hot repository's 19 pushes are 7.61 times slower and the small class 2.72 times: the gap A-722's intake off
+  the owner shard closes, w-balance supplying its placement policy. Per-repository lanes on a shard were measured dead
+  even and rejected.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
