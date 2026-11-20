@@ -64,7 +64,7 @@ fn parent_of(state: &ShardState, repository: RepositoryId, node: &Node) -> Optio
 
 /// A client's push of a changeset adding `pushed.txt` over `parent`: its node, landed as the driver lands it.
 fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> Node {
-  let verified = {
+  let verified = crate::vcs_store::lent_state(state, |state| {
     let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
     let authored = Authored {
       user: b"Client <c@example.com>",
@@ -84,7 +84,7 @@ fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> No
       &mut Admission::new(u64::MAX),
     )
     .unwrap()
-  };
+  });
   let (changeset, manifest) = (&verified.changesets[0], &verified.manifests[0]);
   let (path, files) = &verified.files[0];
   let one = Made {
