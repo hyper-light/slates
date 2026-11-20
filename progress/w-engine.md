@@ -70,3 +70,20 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   A-728's entry in the amendment log; I used `git checkout --ours` once to resolve a conflict (banned; no harm: only
   my own two files).
 - NEXT: part 3: svn_scale.sh 1,000 revisions before (e71043ff6, pre-A-728) and after (origin/main), BENCHMARKS.md.
+
+## Part 3 (measure) in progress
+- Before = main 99ecba1b1 with crates/merge/src/{history,dims,engine,engine/branch,engine/reanchor}.rs from e71043ff6
+  (only A-728 and a test lint touched them since): worktree ~/slates-work/w-engine-before. After = main 99ecba1b1.
+- Method: ~/.cache/w-engine-bench/mem.sh (w-perf's mem.sh + MallocStackLogging + malloc_history -allBySize) on
+  ~/.cache/w-perf/data/git-1000.dump (read only); classify.py sums stacks through slates_merge::history.
+- FINDING (reading w-perf's mh-1000.txt): the "234.8 MiB" of the brief is NOT history chunks: of Green::commit's
+  285.1 MiB, 50.3 MiB is history (Value::whole, flat 250->1000 since the service folds) and ~226 MiB is the new file
+  bytes built in commit/apply that become the file blocks (the current files). Expect A-728 to save ~50 MiB here.
+
+## Part 3 LANDED -- S2 DONE (queue empty)
+- 4aad39d29 (merges to 52c1d8af5), confirmed on origin/main. BENCHMARKS.md "A green's history names the file's block":
+  history 50.3 -> 2.0 MiB, Green::commit 285.1 -> 200.0 MiB (-85.1 MiB, 30%); footprint 2.5 -> 2.4-2.5 GB (rounding).
+- Scratch: ~/.cache/w-engine-bench (binaries, runs; deletable), ~/.cache/w-engine-target, ~/.cache/w-engine-clone on
+  studio-2. Worktree ~/slates-work/w-engine (at main).
+- Open for main (not mine to decide): the history retention figure (admission) counts a first small edit's earlier file
+  as current, as it did before A-728; honest accounting would charge it until a fold.
