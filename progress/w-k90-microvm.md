@@ -35,7 +35,15 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   green on macOS; mutation red. Shards main merge is its coordinator's (R15). Owed: live daemon-kill run, scripts/lint.
 - Kiln half: worktree ~/kiln-work/w-k90-microvm-resync (branch agents/w-k90-microvm-resync from kiln main fa96bcc47):
   D288 applied to vendor/shards, Hex `Servers::stream_resyncing` (default: none) + hex-runtime served.rs passes it,
-  kiln sandbox/served.rs returns Slates' resync end on Unix. Next: vendor.py record shards/hex, check, build, test.
+  kiln sandbox/served.rs returns Slates' resync end on Unix. Recorded: vendor/patches/shards/0002 (vendor.py record;
+  check shards: 2 changes, 0 differences), vendor/patches/hex/0003 written by hand (Hex's pin b4db7e69c is on no
+  remote this Mac reaches: GitHub hex lacks it, kiln's vendor cache too; so `vendor.py check hex` can't run here),
+  both UPSTREAM.md rows; agentic.md W8's "owed" paragraph rewritten. New drive test slates_e2e.rs
+  microvm::g90_an_agents_share_outlives_its_slates_daemon (WRITE, SIGKILL the instance's daemon, wait for the anchor's
+  successor, WRITE again). `--lib sandbox::` 73/74: the one failure, windows_path w8_p2 (/mnt/c vs /work), is
+  PRE-EXISTING on main (af97d9029 agentenv merge), not this piece's: reported, not chased.
+- Running: HVF `microvm::` (g266 + g90) on this Mac, log ~/.cache/w-k90-microvm-logs/hvf-resync.log; KVM r4 (piece 1
+  tree) on adacachy.
 - (Old, superseded) why it looked blocked:
 - Slates hands `ShardsStream { stream, resync: Option<StreamEnd> }`; kiln's served.rs returns `served.stream` alone
   because Hex's `hex_api::serve::Servers::stream` returns one `Stream`, and Shards' `ServedStream` /
