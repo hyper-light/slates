@@ -52303,7 +52303,9 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   verdict when its post-state is one git cannot hold; a whole build and a whole map's release sliced a unit at a time
   (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
   source's head is the version it was made at (BUILT 2026-11-20, `paths::branch_before`: the branch's version 0 is that
-  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (A-636's fleet half); a copy made through a work
+  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (BUILT 2026-11-20 through A-636 part 2c-2: a successor's
+  rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a copy
+  made through a work
   driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
   by the same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
@@ -54293,6 +54295,22 @@ Applied in the same change to:
   delta's in the repository), no whole pack held; admission charging that working set and the content charged as it is
   stored (A-714's retention), refused typed at the shard's room; the quarantine's admission and the verdicts made a turn
   at a time; the by-use proof over w-interop's v2.0.0 cut and whole git/git.
+
+### A-664 holders' maps — A successor's rebuilt repository holds each green's map and trees (2026-11-20, w-shared for UI goal 93)
+- **Why.** A-664 part 3 keeps each git green's map of paths and its head's trees on the owner, made again by a recovery
+  and a rebuild; a successor that rebuilt a repository it took over (A-636 part 2c-2) made its store and no map, so its
+  greens' next versions could not derive their commits from the head they adopted.
+- **Change.** `vcs_store::make_whole`: the store made from the log, then each member green's map and trees from its
+  head (`paths::remake`), in one step; `vcs_store::rebuild` and `takeover::rebuild_repository` both call it. The maps
+  are derived from the greens' own content, so they need nothing shipped beside the logs.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::paths::tests::t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map` (two versions of a
+  file, the repository's record and store dropped leaving its green, rebuilt from its record and names log as a
+  successor does: the head's map equal to its model, remade once; the next version derived from it): `cargo test
+  --locked -p slates-server --lib -- vcs_store::paths:: vcs_store::commits:: fleet::state_log_tests takeover::
+  --test-threads=4` 34 of 34; fmt clean.
+- **Owed.** The fleet gate by use (a git repository's owner killed, its successor answering a stock clone and taking the
+  next submit), main's.
 
 ### A-719 part 2 — A pack is read into a keeper, its working set bounded whatever its size (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" item 3)
 - **Change.** `slates_git::unpack::Keep`: the reader hands its keeper each object as it resolves, with the hold
