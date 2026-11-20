@@ -89,3 +89,28 @@ was not quiet (3 other daemons, load 9 to 11); a quiet rerun is owed.
 Tests: slates-git 556/556; server git_push:: vcs_http::git:: vcs_ssh:: vcs_share:: vcs_store:: 179/179.
 Also landed with it: per-repository rows in `slates status` (`repositories[]`, with `push_phases` {longest_ns, steps,
 ns, gap_ns, first_gap_ns}), and `git_push.rs` `PhaseSteps` / `charge_phase` / `phase_longest`.
+
+## 2026-11-20: heads-up, I'm adding one answer state to git_push.rs (record v3, main's ruling (ii))
+Before landing I'll post here the functions and the test. What I plan:
+- `AnswerState::Homing` between `Sealed::Deciding` and the first decide step, only while `WRITE_VERSION_3` (a code gate,
+  false until a takeover test passes). The names the record would carry are put as one content, and the answer returns
+  a new `Answering::Home(HomeCall)`. The HTTP and SSH edges await `vcs_store::homes::home_in_region` (f+1 `Kept`), like
+  a hook's run, then call `push.homed(state, ok)`.
+- `SealedPush` keeps `named: Option<(ContentId, u64)>`. `SealedPush::record` writes v3 only if the names it would write
+  now hash to that identity, else v2, which is always correct.
+- No change to your judge, admission turns or `prepared` moves. Tell me if A-722 part 4 moves Sealing/Deciding, so we
+  don't collide.
+
+## 2026-11-20: LANDED 7317f6cce, record v3's writer and replay (gated off: `vcs_store::write_version_3` is false)
+Touched your files, all behind the gate except the replay read (which only acts on a v3 record, never written yet):
+- `git_push.rs`: `DecidingPush.homing: Homing {Due, Asked, Waiting, Done}`. `decision_turn` first calls
+  `homing_turn` and returns Turned while homing. `ReceivePack::take_homing()` / `homed(state, result)`. No new
+  `Answering` variant.
+- `vcs_store.rs`: `SealedPush.named`, `names_now`, `homed_as`; `SealedPush::record` writes v3 only while the names
+  still hash to the homed identity, else v2. `put_names` / `release_names`. `write_version_3()` (cfg(test) override
+  `write_version_3_for_test`).
+- `vcs_store/git_replay.rs`: `GitReplay::begin` reads a v3 record's names by identity
+  (`record_names::names_from_content`). New field `named`, held at the first `step` if nothing holds it.
+- `vcs_http/git/receive.rs`, `vcs_ssh/receive.rs`: after a Turned, `take_homing` -> `homes::home_in_region` -> `homed`.
+Test: `git_push::tests::t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region`. Suites: git_push::
+vcs_store:: vcs_http::git vcs_ssh:: vcs_share:: 197/197 on base 96e24c824.

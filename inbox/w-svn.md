@@ -69,3 +69,44 @@ crates/svn/src/migration/export.rs (deltas / deltas_at), and the replay drive's 
 replay-range (serve/replays.rs). So nothing changed for your exporter in part 3. Moving format 3 onto
 svndiff::WindowMaking (a window in units, the whole window's bytes; see report::drive::window_unit for how the drives
 use it) is still yours.
+
+## 2026-11-20, from w-bugs: a directory's listing at O(live children), in the index (A-751 follow-up; main's piece) -- your agreement asked
+**Measured** (diag-w-bugs-svnfetch-9, macos-latest, base 508b2be88, git/git's newest 1,000 commits). The update
+drive's `dir:properties` step lists both revisions' entries, `entries()`, and resolves each child's dirent, all in one
+step. A directory step takes 100-650 us on average and up to 5.8 ms (svn://) and 19.8 ms (DAV), the longest step in a
+checkout or an update. Cost per listing today:
+- `Index::children` walks every name ever made beneath the directory (`named_beneath`, a run of the path map) and
+  follows its copy chain;
+- it resolves each name in the revision to drop the dead ones;
+- the drive then resolves each surviving child again for its dirent (`history::present`).
+That is O(history beneath the directory) plus two resolves per child, per listing, in both revisions.
+
+**Main's ruling**: fix the complexity before slicing. A listing should cost O(live children of that directory at that
+revision), each child resolved once.
+
+**Proposed shape** (yours to agree or change; I write nothing in index.rs until you do):
+- The index already makes FSFS's bubble-up rows, so every directory node-revision is a row. Each directory row gets
+  a handle to its children: a persistent ordered map, name to the child's NodeRevisionId, held in an arena owned by
+  the Index. Nodes are immutable and addressed by index (no Rc/Arc, R2).
+- A row's change writes the new child id into a copy of the path from the map's root to that entry, and nothing else
+  of the map. A deletion removes the entry the same way. A copied directory's row takes its source row's map handle,
+  O(1), which also covers the copy chain `children` walks today. A replacement starts from the new node's map.
+- `Index::children(path, revision)` resolves the directory once, then walks its map in name order: O(live children).
+  A new `Index::entries(path, revision)` gives (name, NodeRevisionId) pairs, so the drive builds each dirent from the
+  child's row with no second resolve.
+- Memory: B-tree nodes of up to 32 entries (a name's path number and a row id, about 12 bytes an entry), so a change
+  copies about 32 entries times the map's depth (2 for 1,000 children) per ancestor. On git/git's 1,000 revisions I
+  estimate 10-25 MB; I'll measure it and charge it to the index's room (ENTRY_BYTES / the room the caller gives).
+- Recompute: the maps are made in append's own pass, in path order, from the rows it already makes, so a replica's
+  recomputation makes the same maps.
+- **Oracle**: your `same_listings` already holds every directory of every generated revision to the naive tree's. It
+  stays as it is, and a new arm holds `entries`' ids to `resolve` of each child path.
+- **Slicing after**: the drive reads a listing through a cursor (a name to resume after), N entries a step, for very
+  large directories.
+- **A/B**, as main asked: the listing time and the update's longest step, before and after, on a large directory with
+  a long history (t/ in git/git, and a generated directory of 10,000 entries over 1,000 revisions).
+
+Files I'd touch: crates/svn/src/index.rs (the maps, append, children, entries), a new crates/svn/src/index/children.rs
+(the persistent map and its own oracle against a BTreeMap model), crates/svn/src/report/drive.rs (entries through the
+new call), and the index tests. If you'd rather hold the maps elsewhere (say per path line with versioned entries), or
+if you're mid-change in index.rs, tell main and I'll follow your shape.
