@@ -105,3 +105,13 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   control as backpressure.
 - NEXT: S1: read crates/server/src/vcs_store/record.rs (RecordWriter, record_of) + repository/push.rs + db entry.rs;
   git entry record: keep moves + non-blob objects; blobs named by id, bytes in store; replay path reads them.
+- A-723 S1 LANDED main de50bf0f5 (claimed on ledger 9f52804): git record v2 = names + pack as sent (Session::take_pack;
+  pack::of_whole for server commits); replay via unpack reader (StoreBases, ReplayRefused::Pack); v1 still read.
+  Tests local: server vcs_store:: git_push 58/58 on landed tree; git receive:: 46/46. Amendment written (end state,
+  push bound, S1-S5, hot/cold duplication, owed: bounded parts across entries; held objects left out).
+- S4 split with w-svn: its slates-svn slice 1 (TextSource trait, records name texts) now; my server slice 2 after
+  (TextSource over Green::held, svn_commit drops text bytes from record, rebuild replays green first, held table
+  in checkpoint or re-held at rebuild).
+- NEXT: S2 (merge engine: content history's latest value names the file's block instead of a chunk copy). Then
+  S4 server slice. Then bounded parts across entries. push_load re-run after S3 (w-git A-722).
+- Worktree: ~/slates-work/w-perf-a723 (agents/w-perf-a723). Disk this Mac ~44 GB free now.
