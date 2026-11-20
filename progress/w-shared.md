@@ -1,5 +1,15 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## NOW: hard-link copy (inbox note to w-engine pushed 8afb8e625). DESIGN: crates/merge/src/engine/copy.rs: copy_of_source
+  refuses `self.hardlinks.holds_tree(&spec.source)` (TypeChanged) ~L913 -> stop refusing; at commit of Effect::CopyTree
+  (find where CopyTree applies; dims graft of files etc.), for each (L, P) in hardlinks under source at version: L' = dst +
+  rel(L); P inside source -> hardlinks[L'] = P' and links_to[P'] += L'; P outside -> files[L'] = files[P] value (by
+  reference) + P's metadata (metadata_path) to L'. Identity: explicit keys move the sum as ordinary changes; check
+  head_identity_from_scratch, replica replay (replica_reads_alike), checkpoint restore (restored_reads). copy_fix's
+  "hard link stood in the tree at it" stays refused (owed, own typed refusal). Step 4 (typed refusals, never TypeChanged)
+  likely needs a new MergeConflictClass (wire u8 class; ipc/SDK docs) - decide with main after the build.
+  Failing tests: merge copy_tests (inside link remapped, outside link own file) + server paths::tests repro.
+
 ## LANDED 2026-11-20: copy surfaces b6f6426ac (main 807a6f3c0). NOW: engine copy of hard links (main's 4 steps; inbox note to
   w-engine on files first). Python venv at ~/slates-work/w-shared-scratch/venv (maturin develop); Node addon = cdylib copied
   to scratch slates.node; daemon = ~/.cache/w-shared-local-target/debug/slates (cargo build -p slates-cli).

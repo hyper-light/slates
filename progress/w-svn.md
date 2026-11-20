@@ -140,3 +140,13 @@
   between turns) + test pipelined_commands_are_answered_one_turn_a_shard_poll (64 pipelined, count 0 both shards).
   Red [1,68] on a469a6b85's parent, [1,2] on a469a6b85 (handshake turns), so the yield moved to go_on after any turn
   whose run did not move the shard's polls: red [1,67] without, green 13/13 with.
+
+## no-hook revprop doubled request -- LANDED main 90d405247 (commit c83698017)
+- vcs_svn::step cleared out after writing (trivial auth was written twice; stock svn read the 2nd as success).
+  Windows run_svn_hook sibling answers 165006 (w-lint's jupiter lane compiles it). svn_interop no-hook test un-ignored.
+## svn branch verbs refused by kind -- LANDED main 00a135af4 (commit 3efe27247); §4.17.4 amended.
+## A-652 export half (taken over from g268): g268's staged work saved as origin/agents/g268-a652-3b-land2 (== wip2 code);
+  carried onto main in w-svn-a703 as 272a543ca (pushed origin/agents/w-svn-a652-3b-wip). One red:
+  t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it (image.units_past_budget=41, reply.undeliverable=2).
+  NEXT: failing test with units_past_budget at 0, slice that path, then see full.dump / the 2 undeliverable replies.
+  Disk: one worktree only; CARGO_INCREMENTAL=0.

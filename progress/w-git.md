@@ -125,3 +125,18 @@
   keeps no tail, so fork timing never changes tables and log replay matches. Replay stages too (InOrder keeper keeps
   resolution order); intake Queue keeps resolution order. Removed legacy fresh/positions_for/rows_for/insert.
   A-639 by-type positions given up (arrival order) -> flag to main to measure fragment-set runs.
+- REGRESSION found before landing part 3: long-history push 6s/fetch 15.5s vs main 1.9s/4.1s (arrival-order positions
+  break A-639 by-type runs; per-object staging slow). REWORK: stage the whole push at SEAL (positions by type then id
+  as before, rows via insert_all into a fork), landing adopts (or restages = stage again). Revert per-object stage,
+  arrival order, intake ordered Queue, replay InOrder. Part 4: slice seal+stage pass and make record replay the same
+  sliced intake path (main 2026-11-20: replay of a big pack record runs in ONE turn -> crash-loop; failing test first:
+  replaying a many-object pack record takes many turns).
+- A-722 part 3 LANDED 82ff3bc79 (main 7b93d68c3), 2026-11-20 ~03:15: seal stages whole push into index fork (by-type
+  positions), landing adopts or restages; push 2.0s/fetch 3.7s vs main 1.9/4.1. Ledger + run-request done.
+- A-743 LANDED f6ca826e6 (main 4d9de40c9), ~03:45: CreateBranch records new green's git ref (no-object push record,
+  vcs_store::commits::branch_made); git_interop stock_git_sees_the_branches un-ignored. Finding sent: assert_made_again_whole
+  fails after plain pushes (content holders differ).
+- NEXT: A-722 part 4 in worktree ~/slates-work/w-git-refs (reuse after fetch): (a) failing test first: replaying a
+  many-object pack record takes many turns; (b) slice the seal+stage pass and moves' admission; (c) remaining O(objects)
+  in commit; (d) sliced restage on stale. Then concurrency proof 19/100, arrival-shard decode (w-balance seam),
+  t_a665 derived deadline, ruling B.
