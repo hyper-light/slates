@@ -112,3 +112,10 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   replay measure; removing needs a non-decoding replay measure: main's call).
 - Unsafe: large.rs every site SAFETY-directly-above; fold of unmap kept 79; +1 mincore -> 80; xtask unsafe ok.
 - ~/.cache/w-engine-bench deleted.
+
+## A-746 LANDED 9f57288b2 (merge aaadfae5e); sweep test fix de381e643
+- Register split: chain 133.1 + checkpoints 137.4 = 270.5 MiB > records 222.4 MiB -> items 3-7 on A-727's seam.
+- Seam proposal sent to w-perf (inbox/w-perf-from-w-engine-block-seam.md); numbers to w-svn. No seam code until w-perf
+  answers (inbox/w-engine-from-w-perf.md).
+- Meanwhile: the log ring's released pages (88 MiB resident past the live tail) given back.
+- main's calls: log decode-after-encode stays (A-420); unsafe gate green at 80.
