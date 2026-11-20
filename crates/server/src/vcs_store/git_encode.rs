@@ -8,8 +8,8 @@
 //! objects) spent about 72% of the daemon's CPU in `slates_git::store::deltas::Search::step` and took 2.816 s against
 //! `git daemon`'s 0.300 s (BENCHMARKS.md, A-699's git row). git's own server sends the deltas its pack already holds.
 //!
-//! **What it does.** Before a fetch's answer is made, the request drives [`turn`] until it answers [`Turned::Idle`]:
-//! each turn takes the repository's first version whose fragments are not kept (`Repository::first_unencoded`, by green
+//! **What it does.** Before a fetch's answer is made, the request drives [`turn`] until it answers [`Turned::Idle`]
+//! (or its wait ends, "A bounded wait" below): each turn takes the repository's first version whose fragments are not kept (`Repository::first_unencoded`, by green
 //! and then version), begins its encoding if none is under way, and advances it one turn (`Encoding::advance`): units of
 //! work until the shard's quantum (§4.3's step budget) is spent on the shard's clock, at least one, lent every byte the
 //! shard could admit now, then the arena grown by what the turn kept and the charge trued up, as the map's every step is
@@ -29,6 +29,10 @@
 //! **Refused.** An encoding refused (the content store's room, a damaged record) is dropped, the version left
 //! unencoded and counted ([`REFUSED`]); the fetch goes on and its stream searches that version's objects as before, so
 //! a refusal costs time, never an answer. A refused version is offered again by the next fetch.
+//!
+//! **A bounded wait** (A-718 continued). A fetch waits for the encoding at most one liveness window (`encode_for_fetch`);
+//! past it the answer begins, its stream searching what is still unencoded, and a task finishes the encoding behind it
+//! (`encode_behind`), one a repository, so a long history pushed whole never holds a fetch's first byte past the window.
 //!
 //! **Owed** (GAPS' §4.17 entry). The parts' bytes an encoding holds between turns are charged to no budget until the
 //! last unit keeps them as content. A push's own intake could record each object's delta as it arrives, so a pushed
@@ -54,12 +58,24 @@ pub(crate) const BEGUN: &str = "vcs_store.git_encode.begun";
 pub(crate) const ENCODED: &str = "vcs_store.git_encode.encoded";
 /// Counter: an encoding's turns. Format: a counter name.
 pub(crate) const TURNS: &str = "vcs_store.git_encode.turns";
+/// Counter: fetches that stopped waiting for their repository's encoding and answered, a task finishing it behind them.
+pub(crate) const BEHIND: &str = "vcs_store.git_encode.behind";
+
+/// How long a fetch waits for its repository's encoding before it answers (A-718 continued): one liveness window, the
+/// time the daemon allows any step's work before it is presumed stuck, so a client sees its answer begin within it
+/// however many versions a push left unencoded. Past it the fetch's stream searches what is still unencoded, a turn's
+/// object at a time as before A-718, and a task finishes the encoding for the fetches after it.
+const FETCH_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
 /// The encodings under way, one a repository (the module doc's bounds), each with the green and version it encodes.
 #[derive(Default)]
-pub(crate) struct Encodings(BTreeMap<RepositoryId, (Encoding, (u64, usize))>);
+pub(crate) struct Encodings(
+  BTreeMap<RepositoryId, (Encoding, (u64, usize))>,
+  /// The repositories whose encoding a task finishes behind a fetch that stopped waiting for it ([`encode_for_fetch`]).
+  std::collections::BTreeSet<RepositoryId>,
+);
 
 impl fmt::Debug for Encodings {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -280,6 +296,7 @@ pub(crate) fn relieve(
 /// Drops repository `id`'s encoding under way, if any: its repository is freed.
 pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   state.vcs_stores.encodings.0.remove(&id);
+  state.vcs_stores.encodings.1.remove(&id);
 }
 
 /// Turns repository `id`'s encoding until every version's fragments are kept, yielding between turns (the module doc):
@@ -292,3 +309,50 @@ pub(crate) async fn settle_encodings(id: RepositoryId) {
     }
   }
 }
+
+/// A fetch's encoding (A-718 continued): repository `id`'s encoding turned as [`settle_encodings`] turns it, for at most
+/// [`FETCH_WAIT_NS`]; past it the fetch answers, and a task finishes the encoding behind it ([`encode_behind`]).
+pub(crate) async fn encode_for_fetch(id: RepositoryId) {
+  encode_within(id, FETCH_WAIT_NS).await;
+}
+
+/// [`encode_for_fetch`] with the wait `wait_ns` long: whether the encoding was idle when it returned.
+pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
+  let began = slates_rt::futures::now_ns();
+  loop {
+    match crate::state::with_state_counted(|state| turn(state, id)) {
+      Some(Turned::More) if slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns => {
+        let _ = crate::state::with_state_counted(|state| encode_behind(state, id));
+        return false;
+      }
+      Some(Turned::More) => slates_rt::futures::yield_now().await,
+      Some(Turned::Idle) | None => return true,
+    }
+  }
+}
+
+/// Starts a task finishing repository `id`'s encoding behind a fetch that stopped waiting, unless one is at it already;
+/// counted [`BEHIND`]. The task ends when the encoding is idle, the repository freed or the shard's state gone.
+fn encode_behind(state: &mut ShardState, id: RepositoryId) {
+  state.count(BEHIND, 1);
+  if !state.vcs_stores.encodings.1.insert(id) {
+    return;
+  }
+  let behind = async move {
+    settle_encodings(id).await;
+    let _ = crate::state::with_state_counted(|state| state.vcs_stores.encodings.1.remove(&id));
+  };
+  match slates_rt::futures::spawn(behind) {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+    }
+    // No task to spare: the next fetch turns the encoding on, as before.
+    Err(_) => {
+      state.vcs_stores.encodings.1.remove(&id);
+    }
+  }
+}
+
+#[cfg(test)]
+#[path = "git_encode/tests.rs"]
+mod tests;

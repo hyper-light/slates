@@ -72,21 +72,26 @@ impl KeyHolders for OwnerKeys {
 /// them, and the services the daemon's sites run: upload-pack lent each store from A-662's map ([`ShardStores`], A-682),
 /// `serve --stdio` each served view ([`ServedViews`], A-680 part 2a), and each push lent the state of the shard the
 /// connection runs on ([`ThisShard`]) and admitted [`ROOM`].
-fn site() -> ToolSite<OwnerKeys, ShardRepositories, DaemonServices> {
+fn site_within(room: u64) -> ToolSite<OwnerKeys, ShardRepositories, DaemonServices> {
   ToolSite::new(
     OwnerKeys,
     ShardRepositories,
-    ToolServices::new(ShardStores, ServedViews, ThisShard, ROOM),
+    ToolServices::new(ShardStores, ServedViews, ThisShard, room),
   )
 }
 
-/// The daemon's services ([`site`]).
+/// The daemon's services ([`site_within`]).
 type DaemonServices = ToolServices<ShardStores, ServedViews, ThisShard>;
 
-/// Makes git repository [`NAME`] on the shard and serves the edge there with [`site`], its listener on a loopback port:
+/// Makes git repository [`NAME`] on the shard and serves the edge there with [`site_within`], its listener on a loopback port:
 /// the repository, the listener's address, and the advertisement the driver makes the owner now (git's refs in the
 /// repository, none yet, under this server's capabilities).
 fn serving(state: &mut ShardState) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
+  serving_within(state, ROOM)
+}
+
+/// [`serving`], each request admitted `room`.
+fn serving_within(state: &mut ShardState, room: u64) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
   let repository = git_repository(state, NAME);
   let mut advertised = Vec::new();
   ReceivePack::start(
@@ -106,7 +111,7 @@ fn serving(state: &mut ShardState) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
       .expect("the shard's thread")
       .expect("the edge's state kept on its shard");
   slates_rt::futures::spawn(async move {
-    let _ = serve(listener, edge, site).await;
+    let _ = serve(listener, edge, move || site_within(room)).await;
   })
   .and_then(slates_rt::futures::detach)
   .expect("the listener's task");
@@ -116,6 +121,11 @@ fn serving(state: &mut ShardState) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
 /// Opens a session, passes `protocol` as `GIT_PROTOCOL` when given (an `env` request before the command, as git's
 /// client passes it), and asks the session to run [`COMMAND`]: whether the server accepted.
 fn exec_asking(peer: &mut Peer, protocol: Option<&[u8]>) -> bool {
+  exec_command(peer, protocol, COMMAND)
+}
+
+/// [`exec_asking`] for `command`.
+fn exec_command(peer: &mut Peer, protocol: Option<&[u8]>, command: &[u8]) -> bool {
   let mut open = vec![90];
   put_string(&mut open, b"session");
   for word in [CLIENT_CHANNEL, CLIENT_WINDOW, CLIENT_PACKET] {
@@ -142,7 +152,7 @@ fn exec_asking(peer: &mut Peer, protocol: Option<&[u8]>) -> bool {
   request.extend_from_slice(&peer.channel.to_be_bytes());
   put_string(&mut request, b"exec");
   request.push(1);
-  put_string(&mut request, COMMAND);
+  put_string(&mut request, command);
   peer.send(&request);
   peer
     .next(&[99, 100])
@@ -307,4 +317,61 @@ fn t_a683_a_repository_gone_before_its_push_starts_is_refused_in_gits_words() {
     refused,
     Err(died("'gone' does not appear to be a git repository"))
   );
+}
+
+/// Shape: one request's room in [`a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room`]: 64 KiB,
+/// about one ring region of a shard's budget, far below the long history's pack.
+const REQUEST_ROOM: u64 = 1 << 16;
+
+/// A-745 (§4.17.1 "A fetch's answer": a request's room bounds a slice, never a repository; found by use with A-713:
+/// git/git cut at v1.0.0 cloned over SSH was refused for its room). Do: on an audit daemon's shard, serve the SSH edge
+/// with the production site, each request admitted [`REQUEST_ROOM`]; push a line of the HTTP edge's long history
+/// (`vcs_http::daemon_edge_tests::LONG_HISTORY` commits) over SSH; then clone it over SSH as git's client does at protocol
+/// v2 (`git-upload-pack` with `GIT_PROTOCOL=version=2`, a `fetch` of its last commit with `done`, then a flush). Expect:
+/// the push exits 0; the clone exits 0, its answer after the advertisement a packfile section holding every object
+/// pushed, in a pack larger than one request's room.
+#[test]
+fn a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room() {
+  use crate::vcs_http::daemon_edge_tests::{
+    LONG_HISTORY, fetch_of, fetched_pack, ids_in, long_history, packets_from,
+  };
+  let daemon = audit_daemon();
+  let (_, address, _) = observe_first(&daemon, |state| serving_within(state, REQUEST_ROOM));
+  let (request, last) = long_history(LONG_HISTORY);
+  let pushed = pushed_over_ssh(address, None, &request);
+  let fetched = fetched_over_ssh(address, &fetch_of(last));
+  daemon.stop();
+  assert_eq!(pushed.map(|transcript| transcript.status), Some(Some(0)));
+  let fetched = fetched.expect("the clone's session");
+  assert_eq!(
+    fetched.status,
+    Some(0),
+    "{}",
+    String::from_utf8_lossy(&fetched.err)
+  );
+  let (_, advertised_end) = packets_from(&fetched.out, 0);
+  let answer = fetched.out.get(advertised_end..).unwrap_or_default();
+  let pack = fetched_pack(answer);
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_pack = request.get(commands_end..).expect("the push's pack");
+  assert_eq!(ids_in(&pack).len(), ids_in(pushed_pack).len());
+  assert!(
+    u64::try_from(pack.len()).unwrap_or(u64::MAX) > REQUEST_ROOM,
+    "a pack of {} bytes",
+    pack.len()
+  );
+}
+
+/// A clone session with the held key: authenticate, run `git-upload-pack '/pushed'` at protocol v2, send `request` and a
+/// flush that ends the session, and read to the end.
+fn fetched_over_ssh(address: SocketAddrV4, request: &[u8]) -> Option<Transcript> {
+  let mut peer = Peer::connect(address)?;
+  (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+  (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+  exec_command(&mut peer, Some(b"version=2"), b"git-upload-pack '/pushed'").then_some(())?;
+  for piece in request.chunks(PIECE) {
+    send_data(&mut peer, piece);
+  }
+  send_data(&mut peer, b"0000");
+  Some(transcript(&mut peer))
 }

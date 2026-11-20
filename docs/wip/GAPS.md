@@ -163,7 +163,9 @@
 > commit clone negotiated within 4 KiB); piece 2b part 1: the choice of the pack's objects a unit at a time
 > (`negotiation::begin`, `Negotiating::step`); part 2: `upload::serve_in_turns` and `Answer::write_within` choose them
 > within the owner's quantum, the answer the same bytes; piece 3a: sets in runs or bits, whichever is smaller, and packets
-> sized from the room (a clone within 4 KiB). Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> sized from the room (a clone within 4 KiB); piece 3b: both edges admit a fetch a request's room and answer it in turns
+> (the 3,000-commit clone by use over HTTP and SSH). Owed: protocol v0 in turns, `begin`'s walks in units, scattered
+> plans, rule 4's generation hold; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -177,7 +179,10 @@
 > live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
 > in place); the landing appends that, where it appended every text whole. An import's record (version 3) writes a
 > manifest the index keeps as a delta as that delta and its base's node, never rebuilt (Mercurial's own manifests:
-> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. A made changeset's
+> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. A file revision is
+> written as one hunk against the revision before it in its log, from their common prefix to their common suffix
+> (`delta::encode_span`), where that is shorter than its text (found by use, w-perf: Mercurial's import record was
+> 4,657,833,574 bytes with file texts whole, and its landing's one-step append spun the shard). A made changeset's
 > record (version 3 too) writes its manifest as its delta against its first parent's text (`write_made`'s `parent`,
 > read from the index; replayed through the same rebuild, held by A-731's rebuild test). Owed: the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.
@@ -190,8 +195,10 @@
 > (`record::Writer::begin_kept`, `hg_push::record_sliced`), again after a re-base, where the landing wrote it whole.
 > Part 3 FIXED: a Mercurial store's rebuild (`vcs_store::rebuild`, after a commit refused past its store's step)
 > replays its records a step a turn in a task, the store lent to nothing meanwhile (`VcsStores::rebuilding`), its
-> generation moved after. The landing's append is now the size of the push's changegroup (A-729 part 2). Owed:
-> w-perf's and w-interop's by-use reruns.
+> generation moved after. The landing's append is now the size of the push's changegroup (A-729 part 2). Owed: an
+> import's landing appends its whole record as one entry in one step (w-perf, 2026-11-20: 4.66 GB spun shard 9 past
+> its window; the record is now cut by file deltas, but its append is still unbounded: parts across entries, or
+> identity-only records once A-727 a3 lands, main's ruling asked); w-perf's and w-interop's by-use reruns.
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
@@ -215,6 +222,12 @@
 > answer is (`session::Producing`); its bytes are `render::revlogs`' byte for byte (test), a step's least room below the
 > whole answer's (test), and a stream clone of a file twice a request's room is answered through the daemon's edge
 > (test). Owed: `stream2` (bundle2's stream part) and stock `hg clone --stream` by use; w-interop's matrix rerun.
+> `stream2` as stock 7.2 writes it (read 2026-11-20 from Homebrew's 7.2, `hg bundle --type 'none-v2;stream=v2'` of two
+> public changesets): one mandatory part with `bytecount`, `filecount` and the quoted `requirements`; each entry its
+> vfs byte (`s` store, `c` cache), the name's and the data's lengths as uvarints, the name, the data; small revlogs
+> inline (`data/a.i` alone), the changelog's `.d` before its `.i`, cache files (`branch2-served`, `rbc-names-v2`,
+> `rbc-revs-v2`, `tags2`) after; an empty `phaseroots` left out. Open before it is served: which store files a draft
+> repository's stream carries (`phaseroots`, `obsstore`), and the requirements a server without zstd revlogs names.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -4657,8 +4670,11 @@
 > owner's asks over the fleet exchange, and the lease gate on the owner's half of a remote verdict.
 > Progress (A-697, 2026-11-20): part a1 built, the owner's admission of another node's work by a forwarded
 > `AdmitWork` (rights from the green's record, the floor at the head, answered once); part a2 built behind a test hook
-> (a holder makes the work on its client's partition, admitted over the fleet, its base read from its replica); parts
-> b to f and the routing flip are open.
+> (a holder makes the work on its client's partition, admitted over the fleet, its base read from its replica); part b
+> built (the holder moves and drops the work's floor at the owner, `MoveWorkFloor`, monotone); part c built (a
+> holder's submit committed by the verdict its replica computed, taken by position at the owner, `SubmitComputed`);
+> parts d to f, a holder work's rebase and copies, an increment too large for the forward lane, and the routing flip
+> are open.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's

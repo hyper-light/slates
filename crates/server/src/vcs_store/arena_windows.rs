@@ -164,19 +164,19 @@ fn read_piece(bytes: &[u8]) -> Result<PieceRead, PieceRefused> {
       .map(u64::from_le_bytes)
       .map_err(|_| PieceRefused::Malformed)
   };
-  let len = usize::try_from(le8(take(8)?)?).map_err(|_| PieceRefused::Malformed)?;
+  let len = usize::try_from(le8(take(size_of::<u64>())?)?).map_err(|_| PieceRefused::Malformed)?;
   let has = take(1)?.first().copied();
   let region = take(2)?
     .try_into()
     .map(u16::from_le_bytes)
     .map_err(|_| PieceRefused::Malformed)?;
-  let offset = le8(take(8)?)?;
-  let block = le8(take(8)?)?;
-  let used = take(4)?
+  let offset = le8(take(size_of::<u64>())?)?;
+  let block = le8(take(size_of::<u64>())?)?;
+  let used = take(size_of::<u32>())?
     .try_into()
     .map(u32::from_le_bytes)
     .map_err(|_| PieceRefused::Malformed)?;
-  let born = le8(take(8)?)?;
+  let born = le8(take(size_of::<u64>())?)?;
   let placed = match has {
     Some(0) => None,
     Some(1) => Some((region, offset, block, used, born)),
