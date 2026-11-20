@@ -54759,6 +54759,15 @@ Applied in the same change to:
   `place::tests::a_repositorys_index_ranges_spread_over_the_partitions_by_rendezvous`. Owed (9b): `b` in the repository's
   record; a push's rows sent to their ranges' partitions and committed by the owner's landing record (needs 8c's names
   by identity, proposed to w-perf); look-ups routed by range; the split's moves.
+- **Piece 8a in admission, the snapshot slot a second resource (2026-11-20).** `crate::vcs_share::room` divides memory and
+  the partition's snapshot slot's room left (`Db::snapshot_room`) together by dominant-resource fairness: each
+  repository holds its records' bytes of the slot (`Repositories::objects_bytes`) and claims them with its traffic's
+  mean, and its room is the lesser headroom, its bound naming the binding resource's share; a repository alone gets
+  the lesser of what the shard admits and the slot's room (`Bound::Snapshot { room }`). So a push whose record could
+  not fit the snapshot is refused at admission, before its body, not at its commit. Tests: `vcs_share::tests`
+  (`t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot`: a slot shrunk below the admittable room binds
+  alone and is divided beside another; the share test against the lesser resource), 23 of 23 with `git_push::` and
+  `vcs_store::upload::`; `vcs_http::git:: vcs_http::hg vcs_ssh::` 88 of 88.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
