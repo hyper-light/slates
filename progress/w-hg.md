@@ -86,3 +86,10 @@
 - A-720 part 2b (stale fork re-based by node at landing; land never swaps in a stale fork; side-by-side pushes land)
   LANDED main (piece 64d457979, merge 5df3c5a18). Local: hg 72/72, server 45/45 (32/32 hg filters on landed tree).
 - NEXT: part 3 (import room per repository; ImportRefused PastRoom{278528} on Mercurial's repo), then S5.
+- A-720 part 3 (import room = shard's admittable, charge trued up to Import::holding each turn) LANDED main (piece
+  08d45661e, merge 99c0f7877). Local: server import/hg 15/15 + 40/40, hg 72/72. By-use proof owed to w-perf.
+- SSH test fix (stock push over SSH awaits steps; was "a step that waits") LANDED main (b1ec1fe00, merge 7477a94a7);
+  server `-- hg` 54/54 on landed tree. NOTE: use filter `-- hg` (my `vcs_ssh::hg` missed vcs_ssh::tests::hg).
+- Target trimmed: 24 GB -> ~1.3 GB (incremental, release, orphaned *.rcgu.o); disk 78 GB free.
+- QUEUE NEXT: S5 (main's convergence plan; main will send hg's step details), then the server-made hg changeset
+  (hg_made::make hook in verbs::judge_submission, per w-shared's seam message), then the inventory list.
