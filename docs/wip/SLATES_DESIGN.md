@@ -15272,7 +15272,9 @@ and export by landing).
 > **Status (2026-11-19, A-693 part 1: ra_svn's lock reads).** `get-lock` and `get-locks` are answered from the
 > repository's lock table at the call's instant (`slates_svn::reads::answer_lock_read`, `serve.c` 3366-3446): a held
 > lock as `write_lock` writes it, an expired one and one on an unreadable path left out, a depth `get_locks` refuses in
-> its words. Owed: `lock`, `lock-many`, `unlock`, `unlock-many` through the owner's step.
+> its words. Part 2 (2026-11-19): `lock`, `lock-many`, `unlock` and `unlock-many` judged against the table
+> (`slates_svn::serve::locks`), their entries landed through the owner's step as a `Record::Locks`, then answered as
+> `svnserve` answers them, over `svn://` and `svn+ssh://`. Owed: the pre-lock and post-lock hooks.
 >
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the

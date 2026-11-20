@@ -683,3 +683,71 @@ fn a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_n
   });
   assert_eq!(seen, (answered(1), true, Some(1), answered(2)));
 }
+
+/// The head as the lock guard reads it, over the records' index.
+struct IndexHead<'i>(&'i slates_svn::index::Index);
+
+impl slates_svn::lock::HeadView for IndexHead<'_> {
+  fn youngest(&self) -> u64 {
+    self.0.youngest()
+  }
+
+  fn node(&self, path: &str) -> Option<(NodeKind, u64)> {
+    let node = self.0.node(path, self.0.youngest()).ok()??;
+    Some((node.kind(), node.created_revision()))
+  }
+}
+
+/// A-693 part 2 (a lock verb's entries through the owner's step). Do: land revision 1; judge alice's lock of
+/// `/trunk/a.txt` against the records' table, as the ra_svn connection judges `lock-many`, and land its entries as a
+/// `Record::Locks`; then make the repository's store again from its log. Expect: the step lands the entries; the
+/// records hold alice's lock, the register holds the record as `locks`; the store made again from the log holds the
+/// same lock, so a lock is as durable as a revision.
+#[test]
+fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (svn, _green) = subversion(state, "svn");
+    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+    let records = state.vcs_stores.subversion_records(svn).unwrap();
+    let request = slates_svn::lock::LockRequest {
+      user: Some("alice".to_owned()),
+      comment: Some(b"held".to_vec()),
+      targets: BTreeMap::from([(
+        "/trunk/a.txt".to_owned(),
+        slates_svn::lock::LockTarget::default(),
+      )]),
+      ..slates_svn::lock::LockRequest::default()
+    };
+    let decision = records
+      .locks()
+      .lock(
+        &request,
+        &IndexHead(records.index()),
+        AprTime(1),
+        8,
+        &mut || [7; 16],
+      )
+      .unwrap();
+    let landed = super::record(state, (&owner(), svn), Record::Locks(decision.entries));
+    let owner_of = |state: &ShardState| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .and_then(|records| {
+          records
+            .locks()
+            .get_lock("/trunk/a.txt", AprTime(1))
+            .map(|lock| lock.owner.clone())
+        })
+    };
+    let held = owner_of(state);
+    let kinds: Vec<bool> = logged(state, svn)
+      .iter()
+      .map(|bytes| matches!(Record::decode(bytes), Ok(Record::Locks(_))))
+      .collect();
+    crate::vcs_store::rebuild(state, svn);
+    (landed, held, kinds.last().copied(), owner_of(state))
+  });
+  let alice = Some("alice".to_owned());
+  assert_eq!(seen, (Ok(()), alice.clone(), Some(true), alice));
+}

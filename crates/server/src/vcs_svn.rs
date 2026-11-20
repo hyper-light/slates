@@ -161,6 +161,15 @@ const CHALLENGE_HOST: &std::ffi::CStr = c"slates";
 /// Format: nanoseconds in a microsecond, the unit of the challenge's time (`apr_time_now`).
 const NANOS_PER_MICRO: i64 = 1_000;
 
+/// Counter: a lock verb's entries the owner's step refused, answered in each judged path's place.
+const LOCKS_REFUSED: &str = "vcs_svn.locks_refused";
+
+/// Counter: a lock verb whose new token the system's generator could not draw: its landing refused.
+const TOKEN_UNDRAWN: &str = "vcs_svn.token_undrawn";
+
+/// Format: `SVN_ERR_FS_LOCK_OPERATION_FAILED` (`svn_error_codes.h`: the filesystem category's start, 160,000, plus 59).
+const LOCK_OPERATION_FAILED: u32 = 160_059;
+
 /// Counter: an accepted work the owner's commit step refused, answered as `close-edit`'s failure.
 const COMMIT_REFUSED: &str = "vcs_svn.commit_refused";
 
@@ -648,6 +657,8 @@ enum Next {
     /// The bytes taken.
     consumed: usize,
   },
+  /// The client asked for a lock verb, its first `consumed` bytes: judge it, land its entries, answer it.
+  LockAsked(usize),
   /// The commit's drive accepted `work` at `close-edit`, its first `consumed` bytes taken: land it.
   Accepted {
     /// The work.
@@ -789,6 +800,13 @@ async fn step(
         .drain(..consumed.min(conversation.input.len()));
       let begun = begin_commit(conversation, out);
       written(stream, begun, out).await
+    }
+    Next::LockAsked(consumed) => {
+      conversation
+        .input
+        .drain(..consumed.min(conversation.input.len()));
+      let answered = lock(conversation, out);
+      written(stream, answered, out).await
     }
     Next::Hook { due, consumed } => {
       conversation
@@ -934,6 +952,7 @@ fn next_of(
       consumed,
     },
     Ok(Turn::CommitAsked { consumed }) => Next::CommitAsked(consumed),
+    Ok(Turn::LockAsked { consumed }) => Next::LockAsked(consumed),
     Ok(Turn::Hook { due, consumed }) => Next::Hook { due, consumed },
     Ok(Turn::Accepted { work, consumed }) => Next::Accepted { work, consumed },
     Err(_) => Next::End,
@@ -972,6 +991,64 @@ fn begin_commit(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
     connection.commit(start, sources, out)
   });
   matches!(begun, Some(Ok(())))
+}
+
+/// Judges the lock verb the client asked for over the repository's sources on its owner, lands the lock entries it
+/// makes through the owner's step (a `Record::Locks`, durable as a revision is; `repository::svn_commit::record`), and
+/// answers it (A-693 part 2; `slates_svn::serve` `locks`): whether the conversation goes on, the answer in `out`. Each
+/// new token is drawn from the system's generator; one it cannot give refuses the landing. The table holds at most as
+/// many locks as one item has bytes.
+fn lock(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
+  let room = conversation.limits.item_bytes;
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return false;
+  };
+  let undrawn = Cell::new(false);
+  let mut draw = || {
+    let mut token = [0u8; slates_svn::lock::UUID_BYTES];
+    if aws_lc_rs::rand::fill(&mut token).is_err() {
+      undrawn.set(true);
+    }
+    token
+  };
+  let judged = lent_sources(opened, principal, |sources| {
+    connection.lock_verb(sources, &mut draw, room, out)
+  });
+  let entries = match judged {
+    Some(Ok(Some(entries))) => entries,
+    Some(Ok(None)) => return true,
+    Some(Err(_)) | None => return false,
+  };
+  let landed = if undrawn.get() {
+    crate::fleet::count_refusal(TOKEN_UNDRAWN);
+    Err((
+      LOCK_OPERATION_FAILED,
+      "No lock token could be drawn".to_owned(),
+    ))
+  } else if entries.is_empty() {
+    Ok(())
+  } else {
+    let id = opened.id;
+    crate::state::with_state(|state| {
+      svn_commit::record(
+        state,
+        (principal, id),
+        slates_svn::commit::record::Record::Locks(entries),
+      )
+    })
+    .unwrap_or(Err(svn_commit::Uncommitted::NotHeld))
+    .map_err(|refused| {
+      crate::fleet::count_refusal(LOCKS_REFUSED);
+      refused.failure()
+    })
+  };
+  connection.locks_landed(landed, out).is_ok()
 }
 
 /// Answers the hook the commit's drive waits for, as the `svn+ssh://` tunnel answers it: passed where the repository's

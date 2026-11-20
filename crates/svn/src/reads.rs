@@ -1756,7 +1756,7 @@ fn path_and_revision(params: &[Value<'_>], base: &str) -> Option<(String, Option
 
 /// The session's base joined with a relative path made canonical (`svn_relpath_canonicalize_safe`,
 /// `svn_fspath__join`): empty and `.` names dropped, every other name kept, `..` among them.
-fn full_path(base: &str, relative: &[u8]) -> String {
+pub(crate) fn full_path(base: &str, relative: &[u8]) -> String {
   let relative = String::from_utf8_lossy(relative);
   let names: Vec<&str> = relative
     .split(SEPARATOR)
@@ -1958,7 +1958,7 @@ mod file_revs;
 mod fold;
 mod history;
 mod list;
-mod locks;
+pub(crate) mod locks;
 mod log;
 mod segments;
 mod stream;
