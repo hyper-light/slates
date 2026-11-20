@@ -5,22 +5,25 @@
 //! **A step.** A command line, its arguments by 7.2's spec for it (`wireprotov1server.commands`), then its answer: a
 //! string (`<length>\n<value>`), a raw bundle2 stream for `getbundle`, or an out-of-band error (an empty line on
 //! stdout and the message then `\n-\n` on stderr). An empty line ends the session. A name 7.2's table lacks is
-//! answered with an empty string and no argument read, as 7.2 answers it. A command 7.2 serves and this server does not
-//! (pushes, `lookup`, stream clones, clone bundles, `debugwireargs`) has its arguments read, so the session stays in
-//! step, and is answered with an out-of-band error. `batch` runs each call of a command that answers a string and joins
+//! answered with an empty string and no argument read, as 7.2 answers it. A push's `unbundle` is taken by the session's
+//! carrier before this step, since its bundle follows its request (over SSH [`super::stdio`], over HTTP
+//! `super::http::unbundle_request`). A command 7.2 serves and this server does not (`pushkey`, `lookup`, stream clones,
+//! clone bundles, `debugwireargs`) has its arguments read, so the session stays in step, and is answered with an
+//! out-of-band error. `batch` runs each call of a command that answers a string and joins
 //! the escaped answers with `;`. A `getbundle` refused where the client asked for bundle2 is answered as 7.2 answers an
 //! abort there: a bundle2 stream of one `ERROR:ABORT` part with the message; a bundle1 request is answered out of band.
 //!
 //! **What is advertised.** `hello` and `capabilities` list what is served, sorted as 7.2 sorts them: `batch`,
-//! `branchmap`, `bundle2` (the parts a `getbundle` answer carries, and `error=abort`), `getbundle`, `known` and
-//! `protocaps`. A 7.2 client asks the same `getbundle` of it as of a stock server (`exchange._pullbundle2` reads
-//! `phases`, `bookmarks`, `listkeys` and `obsmarkers` from it); it lacks `lookup` (a pull of a named revision is refused
-//! by the client), `pushkey`, `unbundle` and stream clones, which later pieces serve. Over HTTP, where pushes are served
-//! (A-680 part 2b, `super::http::pushed`), `unbundle` is listed with 7.2's value and `bundle2` with what a push needs
-//! beside, as 7.2 lists them: `changegroup=01,02,03` (the versions a push is taken in), `checkheads=related` (decided:
-//! the verdict is per line, so a client checks only the heads it moves), `error=abort,unsupportedcontent,pushraced,
-//! pushkey` and `pushkey`. No `pushkey` command is listed: a 7.2 client that reads `bookmarks` and `phases=heads` moves
-//! both in its bundle and never calls it.
+//! `branchmap`, `bundle2`, `getbundle`, `known`, `protocaps` and `unbundle`. A 7.2 client asks the same `getbundle` of
+//! it as of a stock server (`exchange._pullbundle2` reads `phases`, `bookmarks`, `listkeys` and `obsmarkers` from it);
+//! it lacks `lookup` (a pull of a named revision is refused by the client), `pushkey` and stream clones, which later
+//! pieces serve. Pushes are served over both transports (over HTTP A-680 part 2b, `super::http::pushed`; over SSH
+//! A-696, `super::stdio`), so `unbundle` is listed with 7.2's value and `bundle2` holds, beside the parts a `getbundle`
+//! answer carries, what a push needs, as 7.2 lists them: `changegroup=01,02,03` (the versions a push is taken in),
+//! `checkheads=related` (decided: the verdict is per line, so a client checks only the heads it moves),
+//! `error=abort,unsupportedcontent,pushraced,pushkey` and `pushkey`. A 7.2 client reads these to build its bundle, so a
+//! stock client sends this server the bundle it sends a stock server (A-696's golden). No `pushkey` command is listed: a
+//! 7.2 client that reads `bookmarks` and `phases=heads` moves both in its bundle and never calls it.
 //!
 //! **Shared with HTTP** (A-650 part 1). [`dispatch`] answers a command whatever carries it, giving 7.2's three kinds
 //! of answer (a string, a stream, an error out of band) for its transport to frame. The transport decides what
@@ -65,26 +68,34 @@ const COMMANDS: [(&[u8], &[u8]); 21] = [
   (b"unbundle", b"heads"),
 ];
 
-/// Format: the capabilities advertised, sorted as `capabilities` sorts them; `bundle2`'s value is made from
-/// [`BUNDLE2_SERVED`].
-const SERVED: [&[u8]; 6] = [
+/// Format: the capabilities advertised over SSH, sorted as `capabilities` sorts them; `bundle2`'s value is made from
+/// [`BUNDLE2_SERVED`], and `unbundle` is listed since pushes are served over SSH (A-696).
+const SERVED: [&[u8]; 7] = [
   b"batch",
   b"branchmap",
   b"bundle2",
   b"getbundle",
   b"known",
   b"protocaps",
+  b"unbundle",
 ];
 
-/// Format: the bundle2 capabilities advertised, by name: what a `getbundle` answer carries (A-619 part 2).
-const BUNDLE2_SERVED: [(&[u8], &[&[u8]]); 7] = [
+/// Format: the bundle2 capabilities advertised over either transport, by name (module docs): what a `getbundle` answer
+/// carries (A-619 part 2), and what a push needs beside, as 7.2's `getrepocaps` names them for a server
+/// (`bundle2.capabilities`, `concurrent-push-mode`'s `check-related`; A-680 part 2b, A-696).
+const BUNDLE2_SERVED: [(&[u8], &[&[u8]]); 9] = [
   (b"HG20", &[]),
   (b"bookmarks", &[]),
-  (b"changegroup", &[b"02", b"03"]),
-  (b"error", &[b"abort"]),
+  (b"changegroup", &[b"01", b"02", b"03"]),
+  (b"checkheads", &[b"related"]),
+  (
+    b"error",
+    &[b"abort", b"unsupportedcontent", b"pushraced", b"pushkey"],
+  ),
   (b"listkeys", &[]),
   (b"obsmarkers", &[b"V0", b"V1"]),
   (b"phases", &[b"heads"]),
+  (b"pushkey", &[]),
 ];
 
 /// Format: the capabilities advertised over HTTP, sorted as `capabilities` sorts them: SSH's but `protocaps` (an HTTP
@@ -100,23 +111,6 @@ const SERVED_HTTP: [&[u8]; 9] = [
   b"httpmediatype",
   b"known",
   b"unbundle",
-];
-
-/// Format: the bundle2 capabilities advertised over HTTP, by name (module docs): SSH's, and what a push needs beside, as
-/// 7.2's `getrepocaps` names them for a server (`bundle2.capabilities`, `concurrent-push-mode`'s `check-related`).
-const BUNDLE2_SERVED_HTTP: [(&[u8], &[&[u8]]); 9] = [
-  (b"HG20", &[]),
-  (b"bookmarks", &[]),
-  (b"changegroup", &[b"01", b"02", b"03"]),
-  (b"checkheads", &[b"related"]),
-  (
-    b"error",
-    &[b"abort", b"unsupportedcontent", b"pushraced", b"pushkey"],
-  ),
-  (b"listkeys", &[]),
-  (b"obsmarkers", &[b"V0", b"V1"]),
-  (b"phases", &[b"heads"]),
-  (b"pushkey", &[]),
 ];
 
 /// Format: `unbundle`'s value, the bundle1 formats 7.2 lists for a push (`bundle2.bundlepriority`); a bundle1 push is
@@ -409,24 +403,19 @@ fn string_answer<'a>(
   Ok(())
 }
 
-/// Writes the capabilities line of what is served over `transport`: over SSH [`SERVED`], `bundle2`'s value the quoted
-/// blob of [`BUNDLE2_SERVED`]; over HTTP [`SERVED_HTTP`], `httpheader`'s value the transport's and `bundle2`'s the quoted
-/// blob of [`BUNDLE2_SERVED_HTTP`].
+/// Writes the capabilities line of what is served over `transport`: over SSH [`SERVED`]; over HTTP [`SERVED_HTTP`],
+/// `httpheader`'s value the transport's; over either, `bundle2`'s value the quoted blob of [`BUNDLE2_SERVED`].
 fn advertised(
   transport: Transport,
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refused> {
-  let (names, served, header_line): (&[&[u8]], &[(&[u8], &[&[u8]])], u64) = match transport {
-    Transport::Ssh => (SERVED.as_slice(), BUNDLE2_SERVED.as_slice(), 0),
-    Transport::Http { header_line } => (
-      SERVED_HTTP.as_slice(),
-      BUNDLE2_SERVED_HTTP.as_slice(),
-      header_line,
-    ),
+  let (names, header_line): (&[&[u8]], u64) = match transport {
+    Transport::Ssh => (SERVED.as_slice(), 0),
+    Transport::Http { header_line } => (SERVED_HTTP.as_slice(), header_line),
   };
   let mut blob = Vec::new();
-  capabilities::encode_bundle2(served, &mut blob);
+  capabilities::encode_bundle2(&BUNDLE2_SERVED, &mut blob);
   let mut quoted = Vec::new();
   capabilities::encode_bundle2_value(&blob, &mut quoted);
   let header_line = Decimal::unsigned(header_line);

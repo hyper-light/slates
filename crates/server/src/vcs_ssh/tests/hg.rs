@@ -4,13 +4,18 @@
 //! session with, over the repository the probe asked rebuilt from the fixture's listing: the command answers it byte for
 //! byte as 7.2 did at every cut, and so does the edge. Then what the command adds to the session (7.2's warning to a
 //! client asking for hidden changesets, the store going away, the window's bookkeeping), the services starting it, and
-//! the site refusing a repository argument as 7.2's dispatch refuses it before anything is opened.
+//! the site refusing a repository argument as 7.2's dispatch refuses it before anything is opened. Then pushes (A-696):
+//! a push handed to the lender as its client sent it, by the key's principal, its reply sent back as it is; and stock
+//! 7.2's push over SSH (`crates/hg/fixtures/wire`'s `ssh-push`, made by `make-wire-fixtures.sh`) replayed whole against
+//! a daemon's shard holding what 7.2's server held, through the daemon's lenders, every answer after `hello` 7.2's.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use slates_db::catalog::{
   ObjectFormat, Principal, RepositoryId, RepositoryPolicy, RepositoryRecord, VcsTool,
@@ -19,11 +24,13 @@ use slates_git::Admission;
 use slates_git::upload::{PackPlan, PackRefused, PackSource, Served};
 use slates_hg::obsmarkers::Marker;
 use slates_hg::phases::Phase;
-use slates_hg::push::Outcome;
+use slates_hg::push::reply::{Replied, Reply};
+use slates_hg::push::{Asks, BookmarkAt, Outcome, Taken, Unbundle};
 use slates_hg::serve::getbundle::{Logged, Store};
 use slates_hg::serve::stdio::{EXIT_STATUS, Progress, Stdio};
 use slates_hg::serve::{Repository, Rev};
-use slates_hg::{NULL_NODE, Node, pushkey};
+use slates_hg::{NULL_NODE, Node, capabilities, pushkey};
+use slates_ipc::protocol::{ObjectFormat as IpcFormat, ReplyBody, RequestBody, VcsTool as IpcTool};
 use slates_rt::tcp::SocketAddrV4;
 use slates_ssh::command::Command as Asked;
 
@@ -36,10 +43,14 @@ use super::{
   HELD_SEED, HOLDER, Keys, ONE_SEAT, Peer, ROOM_BYTES, TICK_NS, Transcript, exec, query, send_data,
   served_by, sign, transcript,
 };
-use crate::repository::hg_push::Pushing;
+use crate::repository::hg_push::tests::{Commit, changegroup, history_of};
+use crate::repository::hg_push::{self, Pushing, line_name};
+use crate::state::ShardState;
 use crate::vcs_http::Bounds;
 use crate::vcs_http::git::{Located, Repositories, StoreLender, ThisShard};
 use crate::vcs_http::hg::HgStores;
+use crate::vcs_store::hg_view::{self, ServedViews};
+use crate::vcs_store::upload::ShardStores;
 
 /// Shape: the repository whose store the tests' lender holds.
 const HG: RepositoryId = RepositoryId { bytes: [3; 16] };
@@ -333,15 +344,29 @@ impl HgStores for Lends {
     self.holds(id).then(|| step(self.probed, room))
   }
 
-  /// No push lands: the SSH session's `unbundle` is not served (its pushes are A-680 part 2b's driver's, over HTTP).
+  /// A push is answered with what reached the lender ([`echoed`]): a reply whose one `output` part holds it.
   fn push(
     &mut self,
-    _id: RepositoryId,
-    _pushing: Pushing<'_>,
+    id: RepositoryId,
+    pushing: Pushing<'_>,
     _room: &mut slates_hg::Admission,
   ) -> Option<Outcome> {
-    None
+    let echo = Replied::Output {
+      in_reply_to: None,
+      words: echoed(pushing),
+    };
+    self
+      .holds(id)
+      .then(|| Outcome::Accepted(Reply::accepted(&[echo], true)))
   }
+}
+
+/// What a push handed to the lender holds, as the tests' lender echoes it: its principal and its `heads` argument as
+/// `Debug` writes them, a line end, then its bundle.
+fn echoed((principal, heads, bundle): Pushing<'_>) -> Vec<u8> {
+  let mut words = format!("{principal:?} {heads:?}\n").into_bytes();
+  words.extend_from_slice(bundle);
+  words
 }
 
 /// The pack source of a git lender that lends nothing: no value has this type.
@@ -512,7 +537,8 @@ impl Channel {
 /// A session over the store `lends` lends, the principal `hidden` names asking for hidden changesets, handed `input` in
 /// pieces of `cut` bytes, driven after each, then the end of its input: what its channel took.
 fn session(lends: Lends, hidden: Option<&Principal>, input: &[u8], cut: usize) -> Channel {
-  let mut command = HgCommand::new(lends, HG, room(), hidden);
+  let principal = hidden.cloned().unwrap_or(HOLDER);
+  let mut command = HgCommand::new(lends, (HG, principal), room(), hidden.is_some());
   let mut channel = Channel::default();
   for piece in input.chunks(cut) {
     command.input(piece).expect("within the window");
@@ -589,7 +615,7 @@ fn the_probe_is_answered_as_stock_7_2_answered_it_at_every_cut() {
 fn a_client_asking_for_hidden_changesets_is_warned_as_7_2_warns_and_served_the_view() {
   let lends = Lends::probed();
   let holder = HOLDER;
-  let started = HgCommand::new(lends, HG, room(), Some(&holder));
+  let started = HgCommand::new(lends, (HG, holder.clone()), room(), true);
   let first = (started.output().0.to_vec(), started.output().1.to_vec());
   let input = [HELLO, NULL_PAIR, PROBE_CLIENT].concat();
   let warned = session(lends, Some(&holder), &input, input.len());
@@ -614,7 +640,7 @@ fn a_store_that_goes_away_ends_the_session_as_not_served() {
     gone: Some(gone),
     ..Lends::probed()
   };
-  let mut command = HgCommand::new(lends, HG, room(), None);
+  let mut command = HgCommand::new(lends, (HG, HOLDER), room(), false);
   let mut channel = Channel::default();
   command.input(HELLO).expect("within the window");
   channel.drive(&mut command);
@@ -639,7 +665,7 @@ fn a_store_that_goes_away_ends_the_session_as_not_served() {
 /// given back to the window at the next step; and the command exited 0.
 #[test]
 fn input_the_session_drops_is_given_back_to_the_window() {
-  let mut command = HgCommand::new(Lends::probed(), HG, SMALL_ROOM, None);
+  let mut command = HgCommand::new(Lends::probed(), (HG, HOLDER), SMALL_ROOM, false);
   let past = command.input(&[b'x'; PAST_SMALL_ROOM]);
   command.input(TOO_LONG_REQUEST).expect("within the window");
   let refused_whole = ready(command.step());
@@ -847,5 +873,283 @@ fn an_hg_client_is_served_over_the_edge_as_7_2_serves_it() {
   assert_eq!(
     (seen.counts.commands_run, seen.counts.commands_refused),
     (2, 1)
+  );
+}
+
+/// Format: a bundle as a push's chunks carry it: `<length>\n<data>` twice, then the empty chunk `0\n` that ends it.
+const CHUNKED: &[u8] = b"5\nHG20\x003\n\0\0\x000\n";
+/// Format: the bundle [`CHUNKED`] carries, its chunks joined.
+const CHUNKED_BUNDLE: &[u8] = b"HG20\0\0\0\0";
+/// Format: the request a bundle2 push opens with, as 7.2's client writes it: `unbundle`, its `heads` argument `force` in
+/// hexadecimal (`wireprotov1peer.unbundle`: a bundle2 push sends `force`).
+const UNBUNDLE_FORCE: &[u8] = b"unbundle\nheads 10\n666f726365";
+
+/// A-696 (the command's pushes). Do: over the tests' lender, which answers a push with what reached it, send `unbundle`
+/// with `force` and a bundle in two chunks, then end the input, a byte, seven bytes, a kilobyte and the whole at a time.
+/// Expect at every cut: the empty answer that asks for the bundle, then the lender's reply as it is (a bundle2 holding
+/// the principal the key proved, the `heads` argument read as `force` and the bundle's bytes joined); nothing on
+/// standard error; every byte consumed; exit 0.
+#[test]
+fn a_push_reaches_the_lender_as_its_client_sent_it_and_its_reply_goes_back_as_it_is() {
+  let input = [UNBUNDLE_FORCE, CHUNKED].concat();
+  let echo = Replied::Output {
+    in_reply_to: None,
+    words: echoed((
+      &HOLDER,
+      &slates_hg::push::check::HeadsArgument::Force,
+      CHUNKED_BUNDLE,
+    )),
+  };
+  let mut reply = Vec::new();
+  Reply::accepted(&[echo], true)
+    .encode(&mut reply)
+    .expect("an encodable reply");
+  let expected = Channel {
+    stderr: Vec::new(),
+    stdout: [&b"0\n"[..], &reply].concat(),
+    consumed: input.len(),
+    exited: Some(EXIT_STATUS),
+  };
+  for cut in CUTS.into_iter().chain([input.len()]) {
+    assert_eq!(
+      session(Lends::probed(), None, &input, cut),
+      expected,
+      "cut {cut}"
+    );
+  }
+}
+
+/// Format: stock 7.2's push over SSH (`crates/hg/fixtures/wire`, `make-wire-fixtures.sh`'s `ssh-push`): what its client
+/// wrote (the handshake, discovery, `unbundle` with `third` and its race checks, then `listkeys phases`), what its server
+/// answered on standard output, and on standard error.
+const SSH_PUSH_CLIENT: &[u8] = include_bytes!("../../../../hg/fixtures/wire/ssh-push.client");
+/// Format: see [`SSH_PUSH_CLIENT`].
+const SSH_PUSH_SERVER: &[u8] = include_bytes!("../../../../hg/fixtures/wire/ssh-push.server");
+/// Format: see [`SSH_PUSH_CLIENT`].
+const SSH_PUSH_STDERR: &[u8] = include_bytes!("../../../../hg/fixtures/wire/ssh-push.stderr");
+/// Format: 7.2's progress words while it took that push, all its standard error held (`changegroup.apply`,
+/// `scmutil.registersummarycallback`), which slates leaves out (`slates_hg::serve::stdio`'s module doc).
+const PROGRESS_WORDS: &[u8] = b"adding changesets\nadding manifests\nadding file changes\n\
+  added 1 changesets with 1 changes to 1 files\n";
+/// Format: the history 7.2's server held before that push, as the script made it with stock 7.2 (user `test`, date `0
+/// 0`): `base` and `second`, each adding one file, committed on the server, so both draft there.
+const WIRE_HISTORY: [Commit; 2] = [
+  ("base", "a", b"a\n", None, "default"),
+  ("second", "b", b"b\n", Some(0), "default"),
+];
+/// Format: `third`, the changeset the push carried.
+const THIRD: &str = "d62662368ebecf4e7b3e39404f37e3b36d25a79e";
+/// Format: what 7.2's client reads in a server's capabilities to build a push's bundle (`exchange._pushbundle2` and the
+/// part generators it runs: `changegroup`'s versions, `checkheads`, `phases`, `bookmarks`, `pushkey`, `error`'s
+/// `pushkey`).
+const PUSH_CAPABILITIES: [&[u8]; 6] = [
+  b"bookmarks",
+  b"changegroup",
+  b"checkheads",
+  b"error",
+  b"phases",
+  b"pushkey",
+];
+/// Shape: the room a daemon test's push is prepared within, far past these trees.
+const PUSH_ROOM: u64 = 1 << 20;
+/// Shape: the name the repository's history was pushed under.
+const HISTORY_PUSH: [u8; 32] = [7; 32];
+/// Shape: how long a daemon test waits for its session: four liveness budgets.
+const PATIENCE: Duration = Duration::from_nanos(4 * crate::daemon::LIVENESS_BUDGET_NS);
+
+/// The owner the daemon tests make their repository as, and push as.
+fn owner() -> Principal {
+  Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1234,
+  }
+}
+
+/// Makes Mercurial repository `name` on `state`'s shard holding what 7.2's server held before `ssh-push`: `base` and
+/// `second` landed draft, as a non-publishing push lands them, with bookmark `main` at `base`; its record.
+fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
+  let reply = crate::verbs::dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::CreateRepository {
+      name: name.to_owned(),
+      tool: IpcTool::Mercurial,
+      format: IpcFormat::Sha1,
+      default_branch: line_name(b"default", 0),
+      green: None,
+    },
+  );
+  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
+  let id = state
+    .db
+    .partition()
+    .repositories()
+    .repository_named(name)
+    .expect("the repository made")
+    .id;
+  let made = history_of(&WIRE_HISTORY);
+  let mark = BookmarkAt {
+    name: b"main".to_vec(),
+    node: Some(made[0].node),
+  };
+  let unbundle = Unbundle {
+    parts: vec![
+      Taken {
+        id: 0,
+        mandatory: true,
+        asks: Asks::Changegroup(changegroup(&made, &[0, 1])),
+      },
+      Taken {
+        id: 1,
+        mandatory: true,
+        asks: Asks::Bookmarks(vec![mark]),
+      },
+    ],
+  };
+  let mut room = slates_hg::Admission::new(u64::MAX);
+  let terms = (false, HISTORY_PUSH, PUSH_ROOM);
+  let prepared = hg_view::with_view(state, id, &mut room, |view, held, room| {
+    hg_push::prepare(state, id, &unbundle, (view, &held), terms, room)
+  })
+  .expect("the empty repository's view")
+  .expect("the history prepared");
+  let landed = hg_push::land(state, (&owner(), id), prepared, &mut room);
+  assert!(
+    landed.answer.is_ok() && landed.released.is_ok(),
+    "{landed:?}"
+  );
+  state
+    .db
+    .partition()
+    .repositories()
+    .repository(id)
+    .cloned()
+    .expect("the record")
+}
+
+/// Stock 7.2's client bytes of `ssh-push` sent to `record`'s repository as the SSH site starts `serve --stdio` over the
+/// daemon's lenders for its owner, a kilobyte at a time, then the end of its input: what its channel took.
+fn stock_push_session(record: &RepositoryRecord) -> Result<Channel, String> {
+  let mut services = ToolServices::new(ShardStores, ServedViews, room());
+  let principal = owner();
+  let start = Start {
+    service: Service::Mercurial { hidden: false },
+    repository: Some(record),
+    principal: &principal,
+    git_protocol: None,
+  };
+  let mut command = services
+    .start(&start)
+    .map_err(|unserved| format!("{unserved:?}"))?;
+  let mut channel = Channel::default();
+  for piece in SSH_PUSH_CLIENT.chunks(CUTS[2]) {
+    command
+      .input(piece)
+      .map_err(|refused| format!("{refused:?}"))?;
+    channel.drive(&mut command);
+  }
+  command.input_end();
+  channel.drive(&mut command);
+  Ok(channel)
+}
+
+/// The first string answer of `stdout` and what follows it.
+fn after_first_answer(stdout: &[u8]) -> (&[u8], &[u8]) {
+  let line = stdout
+    .iter()
+    .position(|byte| *byte == b'\n')
+    .expect("a length line");
+  let length: usize = std::str::from_utf8(&stdout[..line])
+    .expect("digits")
+    .parse()
+    .expect("a length");
+  stdout[line + 1..].split_at(length)
+}
+
+/// Each capability of `PUSH_CAPABILITIES` in the `bundle2` value of a `hello` answer's capabilities line, with its
+/// values; and `unbundle`'s value.
+fn push_capabilities(hello: &[u8]) -> (Vec<(Vec<u8>, Vec<Vec<u8>>)>, Option<Vec<u8>>) {
+  let listed = capabilities::decode_hello(hello).expect("a capabilities line");
+  let mut room = slates_hg::Admission::new(u64::MAX);
+  let (mut quoted, mut unquoted) = (Vec::new(), Vec::new());
+  let blob = listed
+    .get(capabilities::BUNDLE2)
+    .flatten()
+    .expect("bundle2 listed");
+  let blob = capabilities::decode_bundle2_value(blob, &mut room, &mut quoted).expect("a blob");
+  let bundle2 = capabilities::decode_bundle2(blob, &mut room, &mut unquoted).expect("its list");
+  let pushed = PUSH_CAPABILITIES
+    .iter()
+    .map(|name| {
+      let values = bundle2
+        .get(name)
+        .map(|values| values.iter().map(|value| value.to_vec()).collect());
+      (name.to_vec(), values.unwrap_or_default())
+    })
+    .collect();
+  let unbundle = listed.get(b"unbundle").flatten().map(<[u8]>::to_vec);
+  (pushed, unbundle)
+}
+
+/// A-696 (golden: stock 7.2's push over SSH, `crates/hg/fixtures/wire`'s `ssh-push`; §4.17.3 pieces 4 and 5). Do: on a
+/// daemon's shard, make a Mercurial repository holding what 7.2's server held (`base` and `second` draft, `main` at
+/// `base`); then, from a task there, start `hg serve --stdio` through the SSH site's services over the daemon's lenders
+/// for its owner and send it what stock 7.2's client wrote: the handshake, discovery (`protocaps`, a `batch` of `heads`
+/// and `known`, `listkeys` of phases and bookmarks, `branchmap`), `unbundle` with `third` and its race checks, and
+/// `listkeys phases` after. Expect: the push's capabilities a 7.2 client builds its bundle from listed as 7.2 lists
+/// them, and `unbundle` with 7.2's value, so a stock client sends this server the bytes it sent; every answer after
+/// `hello` 7.2's byte for byte (discovery over the draft history; the empty answer asking for the bundle; the reply,
+/// `reply:changegroup` naming the changegroup part with one head more; the draft root gone after it, `publishing`
+/// alone); 7.2's standard error its progress words alone, which slates leaves out, so nothing there; every byte
+/// consumed and exit 0; and `default`'s line at `third` afterwards.
+#[test]
+fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it() {
+  let daemon = crate::daemon::audit_daemon();
+  let record =
+    crate::daemon::observe_first(&daemon, |state| drafted_history(state, "pushed-over-ssh"));
+  let id = record.id;
+  let (sent, outcome) = mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(stock_push_session(&record));
+    })
+    .expect("the session's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let channel = outcome.recv_timeout(PATIENCE).expect("the session ended");
+  let line = crate::daemon::observe_first(&daemon, move |state| {
+    let green = state
+      .db
+      .partition()
+      .repositories()
+      .branch(id, &line_name(b"default", 0))?;
+    let head = state
+      .greens
+      .get(&green)?
+      .xattr(slates_merge::push::ROOT, slates_merge::push::HEAD_ATTRIBUTE)?;
+    Some(crate::verbs::hex_of(&Node::try_from(head).ok()?))
+  });
+  daemon.stop();
+  let channel = channel.expect("the session served");
+  let (ours_hello, ours) = after_first_answer(&channel.stdout);
+  let (theirs_hello, theirs) = after_first_answer(SSH_PUSH_SERVER);
+  assert_eq!(
+    push_capabilities(ours_hello),
+    push_capabilities(theirs_hello)
+  );
+  assert_eq!(
+    String::from_utf8_lossy(ours),
+    String::from_utf8_lossy(theirs)
+  );
+  assert_eq!(SSH_PUSH_STDERR, PROGRESS_WORDS);
+  assert_eq!(
+    (channel.stderr, channel.consumed, channel.exited, line),
+    (
+      Vec::new(),
+      SSH_PUSH_CLIENT.len(),
+      Some(EXIT_STATUS),
+      Some(THIRD.to_owned())
+    )
   );
 }

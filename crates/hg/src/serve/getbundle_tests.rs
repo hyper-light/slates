@@ -597,6 +597,7 @@ fn check_hello(ours: &[u8], theirs: &[u8]) {
     b"getbundle",
     b"known",
     b"protocaps",
+    b"unbundle",
   ];
   assert_eq!(names, served);
   for (name, value) in ours.iter() {
