@@ -1,0 +1,124 @@
+==== round 1 at 06:59:58
+==== slates.exe pid 9264 round 1 dump exit 0
+==== slates.exe pid 2616 round 1 dump exit 124
+==== fsx.exe pid 5920 round 1 dump exit 0
+==== round 2 at 07:04:23
+==== slates.exe-2616-1.dmp
+
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.015 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.9457 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [D:\a\_temp\dumps\slates.exe-2616-1.dmp]
+Could not open dump file [D:\a\_temp\dumps\slates.exe-2616-1.dmp], NTSTATUS 0xC000011E
+    "An attempt was made to map a file of size zero with the maximum size specified as zero."
+Debuggee initialization failed, NTSTATUS 0xC000011E
+An attempt was made to map a file of size zero with the maximum size specified as zero.
+==== slates.exe-9264-1.dmp
+
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.032 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.9457 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [D:\a\_temp\dumps\slates.exe-9264-1.dmp]
+User Mini Dump File: Only registers, stack and portions of memory are available
+
+
+Response                         Time (ms)     Location
+Deferred                                       srv*c:\symbols*https://msdl.microsoft.com/download/symbols
+OK                                             D:\a\slates\slates\target\debug
+OK                                             D:\a\slates\slates\target\debug\deps
+Symbol search path is: srv*c:\symbols*https://msdl.microsoft.com/download/symbols;D:\a\slates\slates\target\debug;D:\a\slates\slates\target\debug\deps
+Executable search path is: 
+Windows 10 Version 26100 MP (4 procs) Free x64
+Product: Server, suite: TerminalServer DataCenter SingleUserTS
+Edition build lab: 26100.1.amd64fre.ge_release.240331-1435
+Debug session time: Fri Nov 20 07:00:01.000 2026 (UTC + 0:00)
+System Uptime: 0 days 0:12:55.240
+Process Uptime: 0 days 0:01:09.000
+...............
+This dump file has an exception of interest stored in it.
+The stored exception information can be accessed via .ecxr.
+(2430.2478): Wake debugger - code 80000007 (first/second chance not available)
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+For analysis of this file, run !analyze -v
+ntdll!NtWaitForMultipleObjects+0x14:
+00007ff9`f8f22e14 c3              ret
+0:000> cdb: Reading initial command '~*kn 60; q'
+
+.  0  Id: 2430.2478 Suspend: 0 Teb: 00000016`ec16a000 Unfrozen "main"
+ # Child-SP          RetAddr               Call Site
+00 00000016`ebf69738 00007ff9`f67738f3     ntdll!NtWaitForMultipleObjects+0x14
+01 00000016`ebf69740 00007ff9`f67737c1     KERNELBASE!WaitForMultipleObjectsEx+0x123
+02 00000016`ebf69a30 00007ff6`91fec2f0     KERNELBASE!WaitForMultipleObjects+0x11
+03 00000016`ebf69a70 00007ff6`8e5240f7     slates!slates_anchor::supervise::Supervisor::await_work+0x230
+04 00000016`ebf69c00 00007ff6`8e525a52     slates!slates_api::role::anchor::await_observation+0x37
+05 00000016`ebf69c60 00007ff6`8e527bab     slates!slates_api::role::anchor::observe+0x10e2
+06 00000016`ebf6abc0 00007ff6`8e5247e9     slates!slates_api::role::anchor::supervise+0x148b
+07 00000016`ebf6ea70 00007ff6`8e53084b     slates!slates_api::role::anchor::run+0xf9
+08 00000016`ebf6ebf0 00007ff6`8e3e878a     slates!slates_api::role::serve+0x7b
+09 00000016`ebf6ec70 00007ff6`8e4158fb     slates!slates::main+0x71a
+0a 00000016`ebf6f6d0 00007ff6`8e403e6e     slates!core::ops::function::FnOnce::call_once<std::process::ExitCode (*)(),tuple$<> >+0xb
+0b 00000016`ebf6f710 00007ff6`8e4105d1     slates!std::sys::backtrace::__rust_begin_short_backtrace<std::process::ExitCode (*)(),std::process::ExitCode>+0xe
+0c 00000016`ebf6f750 00007ff6`92306230     slates!std::rt::lang_start::closure$0<std::process::ExitCode>+0x11
+0d (Inline Function) --------`--------     slates!std::rt::lang_start_internal::closure$0+0x96
+0e (Inline Function) --------`--------     slates!std::panicking::catch_unwind::do_call+0x96
+0f (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x96
+10 (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x96
+11 00000016`ebf6f790 00007ff6`8e40f26a     slates!std::rt::lang_start_internal+0xb0
+12 00000016`ebf6f820 00007ff6`8e3ee839     slates!std::rt::lang_start<std::process::ExitCode>+0x3a
+13 00000016`ebf6f880 00007ff6`9250a13f     slates!main+0x19
+14 (Inline Function) --------`--------     slates!invoke_main+0x22
+15 00000016`ebf6f8b0 00007ff9`f7a6dd37     slates!__scrt_common_main_seh+0x10f
+16 00000016`ebf6f8f0 00007ff9`f8dff2bc     kernel32!BaseThreadInitThunk+0x17
+17 00000016`ebf6f920 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+quit:
