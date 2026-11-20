@@ -142,7 +142,12 @@
 > its chain's delta bytes stay within its text's length, else whole (derived: a text rebuilds from at most its own
 > length of deltas, 7.2's bound); `HgIndex::revision_text` rebuilds it for every reader (the served view, the push's
 > held texts, the record writer, a re-base). Mercurial's own manifests, 5,501,443,727 bytes whole, are 9.4 MB as revlog
-> deltas. Owed: part 2, records naming identities with the changegroup's deltas (no texts), replay re-taking them;
+> deltas. Part 2 BUILT (the push's half): a push's record is its changegroup as it arrived (`SHGR` version 2:
+> the head, the room the intake began within, the changegroup's version and bytes; deltas, never texts), written a
+> mean revision's bytes a step (`record::ChangegroupWriter`) and replayed by taking the changegroup again through the
+> live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
+> in place); the landing appends that, where it appended every text whole. Owed: an import's and a made changeset's
+> records still hold texts (version 1); the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.
 > **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
 > FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
@@ -153,8 +158,8 @@
 > (`record::Writer::begin_kept`, `hg_push::record_sliced`), again after a re-base, where the landing wrote it whole.
 > Part 3 FIXED: a Mercurial store's rebuild (`vcs_store::rebuild`, after a commit refused past its store's step)
 > replays its records a step a turn in a task, the store lent to nothing meanwhile (`VcsStores::rebuilding`), its
-> generation moved after. Owed: the landing's append of an entry as large as its record, and the record's size itself
-> (S5, A-729 part 2: identities, no texts); w-perf's and w-interop's by-use reruns.
+> generation moved after. The landing's append is now the size of the push's changegroup (A-729 part 2). Owed:
+> w-perf's and w-interop's by-use reruns.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

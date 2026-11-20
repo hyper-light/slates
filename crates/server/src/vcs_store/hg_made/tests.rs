@@ -102,9 +102,14 @@ fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> No
     }],
   };
   let (_, part) = unbundle.changegroup().unwrap();
-  let forked = take_whole(state, repository, part, &mut Admission::new(u64::MAX))
-    .unwrap()
-    .unwrap();
+  let forked = take_whole(
+    state,
+    repository,
+    (part.version, part.payload.clone()),
+    &mut Admission::new(u64::MAX),
+  )
+  .unwrap()
+  .unwrap();
   let landed = land_in(
     state,
     repository,
