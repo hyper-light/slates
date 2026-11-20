@@ -6878,3 +6878,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - clippy + xtask over `crates/cluster/src/sealed.rs` (RawOpening) and `crates/server/src/live_ship.rs` (Rebuilding steps, Laying, hashed_chunk).
 - Flows: live_chaos takeover flows and live_fleet takeovers (macOS arm64 debug, `SLATES_TEST_CLI=1`, `taskpolicy -b`); red = `fleet.live.takeover_refused.layout` or `.open` counted, or a successor's bytes differing from the owner's. Expect `fleet.live.rebuild_slices` up by about a page of log a slice.
 - `cargo test -p slates-server --test fleet a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` under full-suite load: failed once at fleet.rs:17261 (setup: cut && given_up) in a 32-test run, 3/3 alone.
+
+## 2026-11-20, w-work-cow: a work costs its divergence, the grid (main baa470b90; commit 819341ab4)
+- Grid, release, macOS arm64 Mac Studio (and Linux): `for f in 1000 10000 100000; do for b in 1024 65536 10240; do for w in 1 10 100; do SLATES_WORK_COW_FILES=$f SLATES_WORK_COW_FILE_BYTES=$b SLATES_WORK_COW_WORKS=$w cargo test --locked --release -p slates-server --test work_cow -- --nocapture | grep work_cow:; done; done; done` (pick f x b for 1 MB to 1 GB greens). Red = the assert fails, or per-work resident or time grows with the green's size.
+- clippy + xtask over `crates/server/tests/work_cow.rs`.
