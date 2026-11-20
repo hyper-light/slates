@@ -23,13 +23,31 @@
 //! byte of an answer is charged to the request's admission before it is made, a compressed stream's at its engine's
 //! documented bound ([`compression::bound`]).
 //!
+//! **A push** (A-680 part 2b; 7.2's `wireprotov1server.unbundle` and `_callhttp`). [`unbundle_request`] reads
+//! `unbundle`'s `heads` argument by its spec and takes the body after any arguments there as the bundle; the caller
+//! lands the push (`crate::push`'s steps over the repository it holds) and [`pushed`] frames what it came to as 7.2
+//! frames each answer of `unbundle`: a bundle2 reply (accepted, or holding its error part) in
+//! `application/mercurial-0.1` as it is, with no engine whatever the client reads (`streamreslegacy`); a refusal before
+//! the bundle2 was processed as `pusherr` in `0.1` (`0`, a line end, the words, a line end); a bundle1 in 7.2's
+//! `bundle2required` words, out of band.
+//!
 //! **Stricter than 7.2, on purpose.** A named argument the request lacks, or post arguments that are not a length
-//! within the body, is answered out of band, where 7.2's `KeyError` and `int()` end in a `500`.
+//! within the body, is answered out of band, where 7.2's `KeyError` and `int()` end in a `500`; so is a `heads` item
+//! that is not hexadecimal, where 7.2's `bin` fails.
+//!
+//! **Differs from 7.2, on purpose.** Over HTTP 7.2 captures what its server prints while it takes a push (`adding
+//! changesets`, `added 1 changesets with 1 changes to 1 files`; `exchange.unbundle`'s `captureoutput` for a `remote:http`
+//! URL) into `output` parts of the reply, which its client prints after `remote:`. They are its progress words, not the
+//! push's answer: no part a client acts on, so a reply here carries none of them, as a push over SSH here prints none.
 
+use super::Refusal;
 use super::getbundle::Store;
-use super::session::{self, Answer, Refused, Transport, dispatch, spec_of};
+use super::session::{self, Answer, BUNDLE2_REQUIRED, Refused, Transport, dispatch, spec_of};
 use crate::compression::{self, Engine};
 use crate::http::{self, MEDIA_TYPE_ERROR, MEDIA_TYPE_V1, MEDIA_TYPE_V2, ProtocolCaps, Request};
+use crate::push::Outcome;
+use crate::push::check::{self, HeadsArgument, HeadsArgumentRefusal};
+use crate::push::reply::Reply;
 use crate::read::to_u64;
 use crate::{Admission, PastAdmission};
 
@@ -46,6 +64,14 @@ const V2_LENGTH_BYTE: u64 = 1;
 /// Format: the commands 7.2's table marks `push` (`wireprotov1server`'s `permission=b'push'`); every other command it
 /// holds is `pull`.
 const PUSH_COMMANDS: [&[u8]; 2] = [b"pushkey", b"unbundle"];
+
+/// Format: the command a push's bundle is sent with, and the argument its spec names (`unbundle`, `heads`).
+pub const UNBUNDLE: &[u8] = b"unbundle";
+/// Format: see [`UNBUNDLE`].
+const HEADS: &[u8] = b"heads";
+
+/// Format: the bytes `pusherr` frames its words with (`0` and a line end before them, a line end after).
+const PUSH_ERROR_FRAMING: u64 = 3;
 
 /// What a command asks of its caller's principal, as 7.2's table states it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +191,87 @@ pub fn answer(
       },
       Err(refused) => error(refused),
     },
+  }
+}
+
+/// What an HTTP `unbundle` brings (the module doc's push): its `heads` argument, read by `unbundle`'s spec from the query
+/// and the `X-HgArg` headers or the body's front, and its bundle, the body after any arguments there; or, out of band,
+/// the answer to arguments that cannot be read. Everything read is charged to `admission`.
+pub fn unbundle_request<'r>(
+  request: &Request<'r>,
+  admission: &mut Admission,
+) -> Result<(HeadsArgument, &'r [u8]), Answered> {
+  let mut buffer = Vec::new();
+  let fields = http::fields(request, admission, &mut buffer)
+    .map_err(|refusal| error(Refused::Http(refusal)))?;
+  let spec = spec_of(UNBUNDLE).ok_or_else(not_available)?;
+  let arguments = fields
+    .arguments(spec, admission)
+    .map_err(|refusal| error(Refused::Http(refusal)))?;
+  let value = arguments
+    .get(spec, HEADS)
+    .ok_or_else(|| error(Refused::MissingArgument { name: HEADS }))?;
+  let heads = check::heads_argument(value, admission).map_err(|refusal| {
+    error(match refusal {
+      HeadsArgumentRefusal::NotHex { at } => Refused::Serve(Refusal::NodeList { at }),
+      HeadsArgumentRefusal::PastAdmission(past) => Refused::from(past),
+    })
+  })?;
+  let bundle = http::payload(request).map_err(|refusal| error(Refused::Http(refusal)))?;
+  Ok((heads, bundle))
+}
+
+/// The answer to a push over HTTP (the module doc's push): a reply in `application/mercurial-0.1` as it is, its length
+/// charged to `admission` before it is written; a refusal before the bundle2 was processed as `pusherr`; a bundle1 in
+/// 7.2's `bundle2required` words. A refused push reports [`Refused::Push`]; its words are in its answer.
+pub fn pushed(outcome: &Outcome, admission: &mut Admission) -> Answered {
+  match outcome {
+    Outcome::Accepted(reply) => replied(reply, None, admission),
+    Outcome::Refused(reply) => replied(reply, Some(Refused::Push), admission),
+    Outcome::Unprocessed(words) => push_error(words, admission),
+    Outcome::Bundle1 => Answered {
+      media_type: MEDIA_TYPE_ERROR,
+      body: BUNDLE2_REQUIRED.to_vec(),
+      refused: Some(Refused::Serve(Refusal::NoBundle2)),
+    },
+  }
+}
+
+/// A push's reply in `0.1`, as it is, charged first; `refused` reports a reply holding an error part.
+fn replied(reply: &Reply, refused: Option<Refused>, admission: &mut Admission) -> Answered {
+  let unencodable = || {
+    error(Refused::Serve(Refusal::Unencodable {
+      what: "a push's reply",
+    }))
+  };
+  let Ok(length) = reply.encoded_len() else {
+    return unencodable();
+  };
+  if let Err(past) = admission.charge(length) {
+    return error(Refused::from(past));
+  }
+  let mut body = Vec::new();
+  match reply.encode(&mut body) {
+    Ok(()) => Answered {
+      media_type: MEDIA_TYPE_V1,
+      body,
+      refused,
+    },
+    Err(_) => unencodable(),
+  }
+}
+
+/// 7.2's `pusherr` in `0.1` for `words`, charged first.
+fn push_error(words: &[u8], admission: &mut Admission) -> Answered {
+  if let Err(past) = admission.charge(to_u64(words.len()).saturating_add(PUSH_ERROR_FRAMING)) {
+    return error(Refused::from(past));
+  }
+  let mut body = Vec::new();
+  http::encode_push_error(words, &mut body);
+  Answered {
+    media_type: MEDIA_TYPE_V1,
+    body,
+    refused: Some(Refused::Push),
   }
 }
 

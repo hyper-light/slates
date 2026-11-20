@@ -20,16 +20,23 @@
 //!
 //! **Bounds.** The register's roots and bookmarks a view reads are copied, each list charged to the request's room
 //! before it is made, as the view charges its own state there.
+//!
+//! **Pushes** (A-680 part 2b). The lender lands a push too ([`HgStores::push`]): on the same terms (not while an import
+//! fills the store, an unmade view counted), the shard's state is handed to `crate::repository::hg_push::unbundle`,
+//! which judges the push over the view [`with_view`] makes and lands it into the repository's store in the map, both in
+//! one step, so nothing moves between the view the push read and its entry.
 
 use core::mem::size_of;
 
 use slates_db::catalog::RepositoryId;
 use slates_hg::phases::{Phase, PhaseHead};
+use slates_hg::push::Outcome;
+use slates_hg::push::held::IndexHeld;
 use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, Node, PastAdmission};
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 
-use crate::repository::hg_push::{BOOKMARK_TAG, bookmark_of};
+use crate::repository::hg_push::{self, BOOKMARK_TAG, Pushing, bookmark_of};
 use crate::state::ShardState;
 use crate::vcs_http::hg::HgStores;
 
@@ -37,8 +44,9 @@ use crate::vcs_http::hg::HgStores;
 /// view past the request's room), answered as not served. Format: a counter name in the status report.
 pub(crate) const UNMADE: &str = "vcs_store.hg_view.unmade";
 
-/// Decided (module docs, "Publishing"): whether a repository publishes, until its record carries 7.2's `phases.publish`.
-const PUBLISHING: bool = true;
+/// Decided (module docs, "Publishing"): whether a repository publishes, until its record carries 7.2's `phases.publish`;
+/// a push lands on the same terms (`hg_push::unbundle`).
+pub(crate) const PUBLISHING: bool = true;
 
 /// The daemon's lender (module docs): the served views of the Mercurial repositories this shard's map holds.
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,6 +67,33 @@ impl HgStores for ServedViews {
   ) -> Option<R> {
     crate::state::with_state(|state| lend_in(state, id, room, step)).flatten()
   }
+
+  fn push(
+    &mut self,
+    id: RepositoryId,
+    pushing: Pushing<'_>,
+    room: &mut Admission,
+  ) -> Option<Outcome> {
+    crate::state::with_state(|state| push_in(state, id, pushing, room)).flatten()
+  }
+}
+
+/// Lands a push on repository `id` over what `state` holds now (module docs, "Pushes"); none when it is not lent, an
+/// unmade view counted.
+fn push_in(
+  state: &mut ShardState,
+  id: RepositoryId,
+  pushing: Pushing<'_>,
+  room: &mut Admission,
+) -> Option<Outcome> {
+  if !held(state, id) {
+    return None;
+  }
+  let outcome = hg_push::unbundle(state, id, pushing, room);
+  if outcome.is_none() {
+    crate::fleet::count_refusal_in(state, UNMADE);
+  }
+  outcome
 }
 
 /// Whether repository `id`'s Mercurial store is held here with no import filling it.
@@ -77,25 +112,31 @@ fn lend_in<R>(
   if !held(state, id) {
     return None;
   }
-  let made = {
-    let shard: &ShardState = state;
-    let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
-    register_of(shard, id, room)
-      .ok()
-      .and_then(|(roots, bookmarks)| {
-        let read = State {
-          roots: &roots,
-          bookmarks: &bookmarks,
-          publishing: PUBLISHING,
-        };
-        let view = Indexed::new(&store.index, content, read, room).ok()?;
-        Some(step(&view, room))
-      })
-  };
+  let made = with_view(state, id, room, |view, _, room| step(view, room));
   if made.is_none() {
     crate::fleet::count_refusal_in(state, UNMADE);
   }
   made
+}
+
+/// Runs `step` over repository `id`'s served view, made within `room` from what `shard` holds now, and what its index
+/// holds as a push verifies against it (`IndexHeld`); none when its store is not in the map or the view cannot be made
+/// (module docs, "Not lent"), which the caller counts.
+pub(crate) fn with_view<R>(
+  shard: &ShardState,
+  id: RepositoryId,
+  room: &mut Admission,
+  step: impl for<'s> FnOnce(&Indexed<'s>, IndexHeld<'s>, &mut Admission) -> R,
+) -> Option<R> {
+  let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
+  let (roots, bookmarks) = register_of(shard, id, room).ok()?;
+  let read = State {
+    roots: &roots,
+    bookmarks: &bookmarks,
+    publishing: PUBLISHING,
+  };
+  let view = Indexed::new(&store.index, content, read, room).ok()?;
+  Some(step(&view, IndexHeld::new(&store.index, content), room))
 }
 
 /// `count` values of `T` charged to `room`, before they are made.

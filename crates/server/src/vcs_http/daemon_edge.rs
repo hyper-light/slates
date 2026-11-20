@@ -26,7 +26,7 @@
 //! through the push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3).
 //! Mercurial's commands, a request whose query names one ([`ToolSites`]), from each repository's served view over its
 //! store on the shard the connection moved to, lent for each step (`ServedViews`, A-680 part 2); its pushes
-//! (`unbundle`) are not served yet.
+//! (`unbundle`) landed there by the same lender into the repository's store (A-680 part 2b).
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
 use slates_http_edge::credential::Credential;

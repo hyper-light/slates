@@ -13975,6 +13975,37 @@ signature verification).
 > those two, where slates' view of it answered `feature@1` too. Proven on macOS arm64 (Mac Studio, kiln r340 red and
 > r356 green, 2026-11-19; the other platforms owed): `slates-hg --lib serve:: push:: bookmarks::` 93 passed and 0
 > failed, fmt clean (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
+>
+> **Status (2026-11-19, A-680 part 2b: Mercurial's pushes over HTTP land in each repository's store).** Mercurial's
+> site serves `unbundle`: once the policy has admitted the push (`POST`, a right to submit, rewrite or delete), its
+> `heads` argument and bundle are read from the request (`serve::http::unbundle_request`) and handed to the lender
+> (`HgStores::push`), which runs the driver both edges call, `repository::hg_push::unbundle`, in one step on the
+> repository's owner shard and in 7.2's order: `heads` judged against the served view, a race answered before the bundle
+> is read as 7.2's `pusherr`; the bundle read as 7.2's `unbundle` reads it (`push::read_bundle`: a bundle2 made plain,
+> decoded and read part by part, its refusals 7.2's error parts; a bundle1 refused as bundle2 required; a stream that is
+> no bundle, or of a version 7.2 lacks, refused in 7.2's words); then `prepare` over the served view and what the store's
+> index holds, the policy (`admitted`), a gate refusing every push while a Mercurial hook is configured (the hook's view
+> of the push is piece 9's: no push lands that a configured hook was not asked about, as git's push refuses), and the
+> landing, whose revisions now go into a fork of the index in the repository's store in A-662's map (`hg_push::land`
+> over the Mercurial arm), each step over the store lent the shard's room and settled after. The push's name is hashed
+> from its repository and its bundle, so a push sent again makes the same works. Its answer is framed as 7.2 frames
+> `unbundle`'s (`serve::http::pushed`): a bundle2 reply in `application/mercurial-0.1`, uncompressed; `pusherr` in
+> `0.1`; a bundle1 out of band. HTTP's capabilities list `unbundle` and the bundle2 capabilities a push needs as 7.2
+> lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
+> `pushkey`). Differs from 7.2 on purpose: the `output` parts in which 7.2 captures its own progress words over HTTP
+> (`adding changesets`, `added 1 changesets with 1 changes to 1 files`) are not sent; they are no part a client acts on.
+> Not yet durable: a push's entry records its lines', bookmarks' and phase roots' moves and no record of its revisions,
+> so a restart's store lacks them while the register keeps their moves (A-687 makes Mercurial's record kind; A-680 part
+> 2c records pushes with it). Proven on macOS arm64 (Mac Studio, kiln r467 and r480, 2026-11-19; the other platforms
+> owed):
+> red first, the edge's push test over main without the fix failing, its first push answered `200`
+> `application/hg-error` `command not served here` (kiln r467 over 10df7becc); then `slates-hg --lib push:: serve::` 93
+> of 93 (r467), `slates-server --lib` filtered to `vcs_http::`, `vcs_store::hg_view` and `repository::hg_push` 64 of 64
+> (r480), fmt clean: a two-shard daemon's edge, over TLS with stock hg's fields and a bearer token, takes the captured
+> server's history and then the very bundle stock 7.2 pushed to it over HTTP, answers 7.2's own reply but its progress
+> words, then `heads` the pushed changeset and `listkeys phases` 7.2's own answer byte for byte; the driver lands stock
+> `push-plain` over the real served view, answered byte for byte as 7.2 answered it, and refuses a hooked repository's
+> push naming its hook with nothing recorded; the bundles 7.2 does not read are answered in its words.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14392,10 +14423,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
    index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
-   owed: the process around the stdio session, the learned response compression (the first value until then), and the
-   site's pushes (`unbundle` through `hg_push`, A-680 part 2b). Built (A-680 part 2a, `vcs_http::ToolSites`,
-   `vcs_store::hg_view`): the site on the daemon's edge, each repository's served view lent from its store on its owner
-   shard.
+   owed: the process around the stdio session and the learned response compression (the first value until then).
+   Built (A-680 part 2a, `vcs_http::ToolSites`, `vcs_store::hg_view`): the site on the daemon's edge, each repository's
+   served view lent from its store on its owner shard; and its pushes (A-680 part 2b), `unbundle` through
+   `hg_push::unbundle`.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -14404,7 +14435,11 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    `push::commit`, slates-server's `repository::hg_push`): which lines, bookmarks and phases a push moves, its names
    (`branch:<label>:<number>`, `bookmark:<label>:`), its race checks as positions, the landing through A-635's append on
    each green's log with the phase roots in the same entry, the index kept. Built (A-657 part 4): the policy before the
-   verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after.
+   verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after. Built (A-680
+   part 2b, `push::read_bundle`, `repository::hg_push::unbundle`): the driver both edges call, the bundle read as 7.2's
+   `unbundle` reads it, the revisions landed into the repository's store (A-662's Mercurial arm), a configured hook
+   refusing every push until its view is served; owed: each push's record (A-680 part 2c, A-687's record kind), the
+   bundle read in slices.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -51830,3 +51865,60 @@ Applied in the same change to: §4.17.3 (its status), `crates/hg` (`bookmarks::d
 - **Siblings.** A-691 (next): `listkeys phases` answers the served view's draft roots, where 7.2 answers its stored
   draft roots read from the unfiltered changelog (`phases.py` 1049-1058), so a hidden draft root is left out here.
 - **Owed.** The other platforms' runs, and the oracle's red-check with the filter taken out (main's).
+
+### A-680 part 2b — Mercurial's pushes over HTTP: `unbundle` read as 7.2 reads it, landed through `hg_push` into the repository's store on its owner shard, answered as 7.2 frames `unbundle`'s answers (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Push" steps 1 to 7, "Hooks" and pieces 4 and 5; A-641, A-657, A-662, A-680 parts 1 and 2a)
+Applied in the same change to: §4.17.3 (a status block, pieces 4's and 5's lines), `crates/hg` (`push`: `read_bundle`,
+`Outcome`, `Refusal::refused`; `serve::http`: `unbundle_request`, `pushed`; `serve::session`: HTTP's capabilities and
+bundle2 capabilities for a push, `Refused::Push`; their tests), `crates/server` (`repository::hg_push`: `land` over the
+store's Mercurial arm, the driver `unbundle`, the hook gate, the push's name, its tests' history builders shared;
+`vcs_store::hg_view`: `with_view`, `ServedViews::push`; `vcs_http::hg`: `HgStores::push`, `unbundle` routed to it;
+`vcs_http::daemon_edge`'s doc; the edge's and the site's tests), `crates/cli` (the stock-hg round trip waits on A-686
+alone), GAPS (the §4.17.3 entry).
+- **Why.** A stock `hg push` over HTTP met `command not served here`: the site answered `unbundle` out of band, and
+  `hg_push` landed into an index and content store its caller held (`Objects`), which no caller in the daemon held:
+  A-662's map keeps each repository's store, and handing `hg_push` its Mercurial arm was owed.
+- **7.2's order** (`wireprotov1server.unbundle`, `exchange.readbundle`, `bundle2.getunbundler`, `exchange.unbundle`
+  \[C\]). The `heads` argument is judged before the bundle is read (`check_heads`, "preparing changes"), and a race there,
+  or any abort before bundle2's processing, is `pusherr`: over HTTP `0`, a line end, the words, a line end, in
+  `application/mercurial-0.1`. A bundle1 is refused with 7.2's `bundle2required` words out of band, as a 7.2 server whose
+  `server.bundle1` is off refuses one (bundle1 is not served, as `getbundle`'s is not). A bundle2's refusals are its
+  reply's error parts: an unknown mandatory stream parameter, part or parameter `error:unsupportedcontent`, every other
+  fault `error:abort` in slates' words. The reply goes as 7.2's `streamreslegacy` goes: `0.1`, uncompressed, whatever
+  the client reads.
+- **One step.** The driver judges `heads`, reads the bundle, prepares the push over the served view the same step makes
+  (`hg_view::with_view`, the view every client is answered from) and what the store's index holds, asks the policy,
+  passes the hook gate, and lands, on the owner shard with nothing awaited between, so the entry commits against the
+  view the push read; A-642's positions hold it there too.
+- **Decided.** `checkheads=related` is advertised (the design's "always, since the verdict is per line"), so a 7.2
+  client checks only the heads it moves (`check:updated-heads`). A Mercurial hook configured for the repository refuses
+  every push, naming it, until piece 9 serves its view of the push, as git's push refuses (`git_push`); the admission
+  hooks' driver (A-657 part 4) waits for that view. A push's name is BLAKE3 over its repository and its bundle (A-618:
+  a push sent again makes the same works). Every repository publishes (decision 3, A-680 part 2a). 7.2's captured
+  progress words (`output` parts over HTTP) are not sent.
+- **Not yet durable** (GAPS §4.17.3). The entry holds the push's moves and phase roots and no record of its revisions; a
+  recovery replays no Mercurial record (A-662's arm refuses one `Owed`), so after a restart the store lacks what pushes
+  brought while the register keeps their moves. A-687 makes Mercurial's record kind (the import's); recording each
+  push's objects with it is A-680 part 2c, never a second kind.
+- **Tests** (macOS arm64, Mac Studio, kiln r467 and r480, 2026-11-19, rustc 1.98.1). Red first: kiln r467 over 10df7becc (main f1fbd2c44 with the edge's
+  test and the test helpers' visibility alone): `cargo test --locked -p slates-server --lib -- a_stock_mercurial_push
+  --test-threads=4` 0 passed and 1 failed, the history's push answered `(200, "application/hg-error", "command not
+  served here\n")`. Green: r467 over c9975fb8e, `cargo test --locked -p slates-hg --lib -- push:: serve::` 93 passed
+  and 0 failed (the four new among them), `cargo fmt -p slates-hg -p slates-server -- --check` clean; its server arm did
+  not compile (the push's `Outcome` met `vcs_hooks::Outcome` among `hg_push`'s unix imports), so it is `PushOutcome`
+  there; r480 over bd10c37e0, `cargo test --locked -p slates-server --lib -- vcs_http:: vcs_store::hg_view
+  repository::hg_push --test-threads=4` 64 passed and 0 failed, fmt clean.
+  `a_stock_mercurial_push_over_the_daemons_edge_lands_on_its_repositorys_shard`: a two-shard daemon over TLS takes, with
+  stock hg's fields, the captured server's history (`base`, `second`, `third` rebuilt to 7.2's nodes, `main` at `base`;
+  an empty reply) and then the very bundle stock 7.2 pushed to that server (`crates/hg/fixtures/wire`'s `http-push`),
+  answering 7.2's reply part for part but its two `output` parts, `heads` then `fourth` alone and `listkeys phases`
+  7.2's own answer byte for byte. `a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits`: stock
+  `push-plain` through the driver over the real served view answered byte for byte as 7.2 answered it, its changeset in
+  the store's index; a repository configuring a `pretxnchangegroup` hook refused naming it, its green unmoved and its
+  index without the changeset. slates-hg: stock 7.2's HTTP push bundle read part by part; 7.2's own replies to an
+  unknown mandatory part and parameter byte for byte; every header 7.2 does not read answered in its words; a reply, a
+  `pusherr` and a bundle1 framed over HTTP (the last 7.2's `bundle2required` answer byte for byte); arguments and
+  framings past the room out of band. A-657's pushes now land through the store's arm. The stock-hg CLI round trip
+  stays ignored until A-686.
+- **Owed.** A-680 part 2c (each push's record with A-687's kind, and its replay); the SSH edge's pushes (A-679's loop
+  calls the same driver); the bundle read in slices; the stock-hg round trip over the edge once A-686 lands; the other
+  platforms' runs (main's).
