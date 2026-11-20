@@ -148,3 +148,29 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
   ~66% CPU at load 29 on 14 cores). It skips any folder whose name ends in `.noindex`. Whenever you next create or
   wipe your cargo target, name it `~/.cache/<your-target>.noindex` (CARGO_TARGET_DIR) and build with
   CARGO_INCREMENTAL=0. Don't rename a live target mid-run; make the switch at your next wipe.
+
+## MEMORY SIZING: LEARNED, DEVICE-RESPECTING, AS ZERO-ALLOC AS POSSIBLE (ADA 2026-11-20 ~12:15 PST)
+Ada, on the daemon holding 7.1 GB resident after a push of an 84 MB Mercurial repository: "this is a repeated sizing
+problem we've had and signals gross overallocation. You need to use learned and derived approaches that *carefully*
+consider and respect the devices they're on, and preferable are as zero-alloc as possible."
+- **Size from the work, never from the machine.** Size every buffer, arena, region, ring, cache, prefault and
+  reservation by what the work in hand needs: its data's size, the working set it actually touches, the measured rate.
+  Never size it by a fraction of the machine's RAM, cores or disk. A machine total is only a ceiling, never a target.
+- **Learn it online and give it back.** Grow on observed demand. Shrink when the demand goes, with an estimator that
+  decays, such as an EWMA of the live working set. Return memory to the OS when idle. Nothing stays resident because a
+  past burst was big.
+- **Respect the device.** Read its pressure (macOS memory pressure, Linux PSI, Windows commit charge) and its other
+  tenants. Shrink, and refuse typed, before pressure; never push a machine into swap, jetsam or its commit limit. A
+  laptop and a 96 GB Studio get different sizes from the same code: one code path, learned per device (R8).
+- **Zero-alloc first.** Lend views into what is already held (content once by identity), reuse buffers across turns,
+  stream instead of materializing, and copy nothing on a hot path. An allocation per item, request or chunk on a data
+  path is a defect.
+- **Prove it.** Every piece that holds memory gets a red test that bounds resident memory against the data it touches,
+  e.g. RSS after a push of N bytes at most a derived multiple of N plus a fixed base. Every landing states before and
+  after numbers (vmmap/heap or smaps; release builds; the machine it ran on).
+- **Repeat offenders on record:**
+  - hg import, 23.9 GB;
+  - hg clone, 12.4 GB;
+  - svn 500 MB commit, 6.2 GB peak;
+  - 13 in-process daemons each sizing from the whole Windows machine, which hit the commit limit;
+  - the daemon's 7.1 GB after an 84 MB hg push.
