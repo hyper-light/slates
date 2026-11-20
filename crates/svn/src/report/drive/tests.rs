@@ -521,15 +521,6 @@ fn a_changed_text_is_sent_as_a_delta_against_its_base() {
   );
 }
 
-/// The time no drive step may take: far past one of [`STEP_WORK`] units even in a debug build, far short of a whole
-/// window's making there (milliseconds).
-pub(crate) const STEP_BUDGET: std::time::Duration = std::time::Duration::from_micros(500);
-
-/// How many more times a step past [`STEP_BUDGET`] is timed again from its state before it: a step's time is the least
-/// of its timings, so time the machine took away from the test (a preemption, measured up to 3.6 ms under the suite's
-/// load) is not charged to it, while a step whose own work is past the budget stays past it every time.
-pub(crate) const RETIMES: usize = 2;
-
 /// The svndiff stream the whole-window path made of `/trunk/big.txt` from its text at `from` to its text at `to`
 /// (`read_window`, `window_of`, `Encoder::window`): the bytes a drive's pieces must make.
 pub(crate) fn big_text_stream(
@@ -554,62 +545,45 @@ pub(crate) fn big_text_stream(
 }
 
 /// A-751, main's red at the drive ("a large text's window driven with the past-budget counter at 0, and the bytes equal
-/// to the whole window's"). Do: drive `/trunk` from r5 to r6, where `big.txt` (6,000 lines, several windows) is edited,
-/// and from r4, where it is added, in version 0 and in version 2 with LZ4, a step a call, timing each call (a call past
-/// the budget timed again from its state before, [`RETIMES`]). Expect: no call past [`STEP_BUDGET`]; `big.txt`'s delta the stream the whole-window path made,
-/// byte for byte. Red before the change: a window was made and written in one step, milliseconds in a debug build.
+/// to the whole window's"), held by units, which contention cannot blur: drive `/trunk` from r5 to r6, where `big.txt`
+/// (6,000 lines, several windows) is edited, and from r4, where it is added, in version 0 and in version 2 with LZ4, a
+/// step a call. Expect: no window step past [`WINDOW_STEP_UNITS`] units (bytes read or sent, or the maker's units),
+/// at least a step for every [`STEP_WORK`] bytes of the text, no piece past [`STEP_WORK`] bytes, and `big.txt`'s delta the
+/// stream the whole-window path made, byte for byte. Red before the change: a window was made and written in one step,
+/// its units the whole window's. Its time in release is read by `window_step_times` and the diagnostics runs.
 #[test]
 fn a_large_texts_windows_are_driven_with_no_step_past_its_budget() {
-  let (index, green) = repository();
+  let (index, green, five, six) = big_texts();
   let locks = LockTable::new();
-  let anonymous = rules_of(None);
   let sources = Sources {
     index: &index,
     repository: &green,
     locks: &locks,
     now: NOW,
-    rules: Some(&anonymous),
+    rules: None,
   };
-  let text_at = |revision: Revision| {
-    let text = dirent(&sources, "/trunk/big.txt", revision)
-      .unwrap()
-      .unwrap()
-      .text
-      .unwrap();
-    green.texts[&text.identity].clone()
-  };
-  let encodings = [
-    (Version::Zero, Compression::Stored),
-    (Version::Two, Compression::Lz4),
-  ];
-  for (from, base) in [(5, Some(text_at(5))), (4, None)] {
-    for encoding in encodings {
-      let expected = big_text_stream((base.as_deref(), &text_at(6)), encoding);
+  for (from, base) in [(5, Some(five.clone())), (4, None)] {
+    for encoding in [
+      (Version::Zero, Compression::Stored),
+      (Version::Two, Compression::Lz4),
+    ] {
+      let expected = big_text_stream((base.as_deref(), &six), encoding);
       let mut drive =
         Drive::new(trunk_report(from, 6, false), b"u").with_encoding(encoding.0, encoding.1);
-      let (mut past, mut longest, mut streams) = (0usize, std::time::Duration::ZERO, Vec::new());
-      let mut stream: Option<Vec<u8>> = None;
+      let (mut most, mut window_steps, mut largest_piece) = (0usize, 0usize, 0usize);
+      let (mut streams, mut stream) = (Vec::new(), None::<Vec<u8>>);
+      take_most_window_units();
       loop {
-        let before = drive.clone();
-        let began = std::time::Instant::now();
         let next = drive.next(&sources, 1);
-        let mut took = began.elapsed();
-        for _ in 0..RETIMES {
-          if took <= STEP_BUDGET {
-            break;
-          }
-          let mut again = before.clone();
-          let began = std::time::Instant::now();
-          let _ = again.next(&sources, 1);
-          took = took.min(began.elapsed());
-        }
-        longest = longest.max(took);
-        past += usize::from(took > STEP_BUDGET);
+        let units = take_most_window_units();
+        most = most.max(units);
+        window_steps += usize::from(units > 0);
         match next {
           Next::Ended => break,
           Next::Call(Call::ApplyTextDelta { .. }) => stream = Some(Vec::new()),
           Next::Call(Call::DeltaPiece { bytes, .. }) => {
-            stream.as_mut().unwrap().extend_from_slice(bytes)
+            largest_piece = largest_piece.max(bytes.len());
+            stream.as_mut().unwrap().extend_from_slice(bytes);
           }
           Next::Call(Call::TextDeltaEnd) => streams.push(stream.take().unwrap()),
           _ => {}
@@ -619,9 +593,49 @@ fn a_large_texts_windows_are_driven_with_no_step_past_its_budget() {
         streams.contains(&expected),
         "r{from}, {encoding:?}: big.txt's stream"
       );
-      assert_eq!(past, 0, "r{from}, {encoding:?}: longest step {longest:?}");
+      assert_eq!(
+        (
+          most <= WINDOW_STEP_UNITS,
+          largest_piece <= STEP_WORK,
+          window_steps >= six.len() / STEP_WORK
+        ),
+        (true, true, true),
+        "r{from}, {encoding:?}: most units {most}, largest piece {largest_piece}, window steps {window_steps}"
+      );
     }
   }
+}
+
+/// A-751's by-use signal in release (`cargo test --release -p slates-svn --lib -- --ignored window_step_times
+/// --nocapture`): the drive of `big.txt` from r5 to r6 a step a call, each call's wall time, printed: the longest and
+/// the calls past the measured quantum's order (5 us). Measured, not asserted: a timing under contention is the
+/// machine's as much as the step's.
+#[test]
+#[ignore = "a measurement, run in release"]
+fn window_step_times() {
+  let (index, green, _, _) = big_texts();
+  let locks = LockTable::new();
+  let sources = Sources {
+    index: &index,
+    repository: &green,
+    locks: &locks,
+    now: NOW,
+    rules: None,
+  };
+  let mut drive = Drive::new(trunk_report(5, 6, false), b"u");
+  let (mut calls, mut past, mut longest) = (0usize, 0usize, std::time::Duration::ZERO);
+  loop {
+    let began = std::time::Instant::now();
+    let ended = matches!(drive.next(&sources, 1), Next::Ended);
+    let took = began.elapsed();
+    calls += 1;
+    longest = longest.max(took);
+    past += usize::from(took > std::time::Duration::from_micros(5));
+    if ended {
+      break;
+    }
+  }
+  eprintln!("window_step_times: {calls} calls, {past} past 5 us, longest {longest:?}");
 }
 
 /// The report fixtures' repository and `/trunk/big.txt`'s text where it is added (r5) and where it is edited (r6), for
@@ -648,4 +662,84 @@ pub(crate) fn big_texts() -> (Index, Green, Vec<u8>, Vec<u8>) {
     (text_at(5), text_at(6))
   };
   (index, green, five, six)
+}
+
+/// A history of one directory, `/trunk/big`, gaining `per_revision` files in each of `revisions` revisions, the first
+/// file of the revision before deleted and its last edited in each: a large directory with a long history, in
+/// `history.txt`'s grammar.
+pub(crate) fn long_directory_history(revisions: usize, per_revision: usize) -> String {
+  let date = "2026-01-01T00:00:01.000000Z";
+  let mut history = format!("\nrevision alice {date}\nmkdir trunk\nmkdir trunk/big\n");
+  for revision in 0..revisions {
+    history.push_str(&format!("\nrevision alice {date}\n"));
+    for file in 0..per_revision {
+      let number = revision * per_revision + file;
+      history.push_str(&format!(
+        "put trunk/big/f{number:07}.txt file {number}\\n\n"
+      ));
+    }
+    if revision > 0 {
+      let first = (revision - 1) * per_revision;
+      let last = first + per_revision - 1;
+      history.push_str(&format!("rm trunk/big/f{first:07}.txt\n"));
+      history.push_str(&format!(
+        "put trunk/big/f{last:07}.txt edited in {revision}\\n\n"
+      ));
+    }
+  }
+  history
+}
+
+/// A-751 follow-up's A/B (main's: "listing time ... before and after, on a large directory with a long history"), in
+/// release (`cargo test --release -p slates-svn --lib -- --ignored listing_times --nocapture`): `/trunk/big` after
+/// 1,000 revisions of 10 files each (9,001 live, 10,000 named), listed at the youngest revision and at the middle one.
+/// Printed for each: `Index::children`; a dirent for every child listed (`history::present`, as the drive's `entries`
+/// makes one); and the two together, the server's listing. Measured, not asserted.
+#[test]
+#[ignore = "a measurement, run in release"]
+fn listing_times() {
+  let (index, green) = green::repository_from(&long_directory_history(1_000, 10));
+  let locks = LockTable::new();
+  let sources = Sources {
+    index: &index,
+    repository: &green,
+    locks: &locks,
+    now: NOW,
+    rules: None,
+  };
+  let youngest = index.youngest();
+  for revision in [youngest, youngest / 2] {
+    let best = |run: &dyn Fn() -> usize| {
+      (0..5)
+        .map(|_| {
+          let began = std::time::Instant::now();
+          let count = run();
+          (began.elapsed(), count)
+        })
+        .min()
+        .unwrap()
+    };
+    let (children, live) = best(&|| {
+      index
+        .children("/trunk/big", revision)
+        .unwrap()
+        .unwrap()
+        .len()
+    });
+    let names = index.children("/trunk/big", revision).unwrap().unwrap();
+    let (dirents, _) = best(&|| {
+      names
+        .iter()
+        .filter(|name| {
+          dirent(&sources, &join_fspath("/trunk/big", name), revision)
+            .unwrap()
+            .is_some()
+        })
+        .count()
+    });
+    eprintln!(
+      "listing_times r{revision}: {live} live; children {children:?}; dirents {dirents:?}; listing {:?}",
+      children + dirents
+    );
+  }
 }

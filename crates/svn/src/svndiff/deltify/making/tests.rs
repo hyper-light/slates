@@ -8,7 +8,6 @@ use super::*;
 use crate::svndiff::{Encoder, Window, deltas};
 use proptest::prelude::*;
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
 
 /// The encodings the tests make every window in.
 const ENCODINGS: [(Version, Compression); 3] = [
@@ -139,56 +138,40 @@ fn every_window_is_the_whole_windows_bytes_under_any_unit() {
 /// The units the red test gives each step: a few hundred, as a drive's step takes.
 const STEP_WORK: usize = 256;
 
-/// The time no step of [`STEP_WORK`] units may take: far past such a step even in a debug build (tens of
-/// microseconds), far short of a whole window's making there (milliseconds).
-const STEP_BUDGET: Duration = Duration::from_micros(500);
-
-/// How many more times a step past [`STEP_BUDGET`] is timed again from its state before it: a step's time is the least
-/// of its timings, so time the machine took away from the test (a preemption, measured up to 3.6 ms under the suite's
-/// load) is not charged to it, while a step whose own work is past the budget stays past it every time.
-const RETIMES: usize = 2;
-
 /// A-751, the red (main's: "a large text's window driven with the past-budget counter at 0, and the bytes equal to the
-/// whole window's"). Do: make a full 102,400-byte window of a text edited every 997 bytes against its source, in each
-/// encoding, [`STEP_WORK`] units a step, timing each step (a step past the budget timed again from its state before,
-/// [`RETIMES`]). Expect: no step past [`STEP_BUDGET`] (the units-past-budget counter at 0), many steps, and the bytes the whole window's. Red before the
-/// change: the window was made in one call, milliseconds in a debug build.
+/// whole window's"), held by units, which contention cannot blur. Do: make a full 102,400-byte window of a text edited
+/// every 997 bytes against its source, and one of a text no block of which its source holds (every look-up a miss), in
+/// each encoding, [`STEP_WORK`] units a step. Expect: no step past [`STEP_WORK`] and [`STEP_OVERRUN`] units by the
+/// making's own count, a step for every [`STEP_WORK`] bytes at least, and the bytes the whole window's. Red before the
+/// change: the window was made in one call, its units the whole window's.
 #[test]
 fn a_large_texts_window_is_made_with_no_step_past_its_budget() {
   let source = varied(WINDOW_LIMIT as usize, 11);
-  let target = edited(&source, 997);
-  for encoding in ENCODINGS {
-    let expected = whole(&source, &target, encoding);
-    let mut making =
-      WindowMaking::new((0, source.len()), target.len(), encoding.0, encoding.1).unwrap();
-    let (mut steps, mut past, mut longest) = (0usize, 0usize, Duration::ZERO);
-    loop {
-      let before = making.clone();
-      let began = Instant::now();
-      let done = making.step(&source, &target, STEP_WORK).unwrap();
-      let mut took = began.elapsed();
-      for _ in 0..RETIMES {
-        if took <= STEP_BUDGET {
+  for target in [edited(&source, 997), varied(WINDOW_LIMIT as usize, 12)] {
+    for encoding in ENCODINGS {
+      let expected = whole(&source, &target, encoding);
+      let mut making =
+        WindowMaking::new((0, source.len()), target.len(), encoding.0, encoding.1).unwrap();
+      let (mut steps, mut most) = (0usize, 0u64);
+      loop {
+        let before = making.units_taken();
+        let done = making.step(&source, &target, STEP_WORK).unwrap();
+        most = most.max(making.units_taken() - before);
+        steps += 1;
+        if done {
           break;
         }
-        let mut again = before.clone();
-        let began = Instant::now();
-        again.step(&source, &target, STEP_WORK).unwrap();
-        took = took.min(began.elapsed());
       }
-      steps += 1;
-      longest = longest.max(took);
-      past += usize::from(took > STEP_BUDGET);
-      if done {
-        break;
-      }
+      assert!(
+        most <= (STEP_WORK + STEP_OVERRUN) as u64,
+        "{encoding:?}: a step of {most} units"
+      );
+      assert!(making.made().unwrap().bytes() == expected, "{encoding:?}");
+      assert!(
+        steps > target.len() / STEP_WORK,
+        "{encoding:?}: {steps} steps"
+      );
     }
-    assert_eq!(past, 0, "{encoding:?}: {steps} steps, longest {longest:?}");
-    assert!(making.made().unwrap().bytes() == expected, "{encoding:?}");
-    assert!(
-      steps > target.len() / STEP_WORK,
-      "{encoding:?}: {steps} steps"
-    );
   }
 }
 

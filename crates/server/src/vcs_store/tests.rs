@@ -193,6 +193,7 @@ fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   assert_eq!(bytes, expected);
   let read = Record {
     names: vec![(Kind::Blob, noted.identity, 2)],
+    named: None,
     pack: b"PACK-bytes",
     deepest: 3,
     moves: moves.clone(),
@@ -213,12 +214,65 @@ fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   };
   let read = Record {
     names: Vec::new(),
+    named: None,
     pack: &[],
     deepest: 3,
     moves,
     objects: vec![object],
   };
   assert_eq!(Record::decode(&inflated, FORMAT), Ok(read));
+}
+
+/// A-724 piece 8c (record version 3, main's ruling of 2026-11-20 (ii)). Do: write the record of one move and one object
+/// as version 3, its names put as one content first, then read it back. Expect: the bytes the module's encoding states:
+/// the head at version 3, then the names' identity (the BLAKE3 of the names' rows) and their count in place of each
+/// name, then the pack; read back with the same moves and pack, the names named, none inline.
+#[test]
+fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
+  let head = ObjectId::from_bytes(FORMAT, &[0xab; 20]).expect("an id");
+  let (mut content, noted) = holding(Kind::Blob, b"hi");
+  let mut writer = RecordWriter::default();
+  writer.object(noted);
+  writer.keep_pack(b"PACK-bytes".to_vec());
+  let moves: Vec<RecordedMove> = vec![(9, 5, Some(head))];
+  let names = writer.names_of(|_| true);
+  let (identity, count) =
+    super::record_names::names_to_content(&mut content, &names).expect("names put");
+  assert_eq!(count, 1);
+  let mut rows = vec![Kind::Blob.pack_number()];
+  rows.extend_from_slice(&noted.identity.0);
+  rows.extend_from_slice(&2u64.to_le_bytes());
+  assert_eq!(
+    identity,
+    slates_vcs::ContentId::of(&rows),
+    "the names' identity is the BLAKE3 of their rows"
+  );
+  let bytes = writer
+    .finish_named((&content, FORMAT), |_| true, (3, &moves), (identity, count))
+    .expect("written");
+  let mut expected = Vec::new();
+  expected.extend_from_slice(b"SGPR");
+  expected.extend_from_slice(&3u32.to_le_bytes());
+  expected.extend_from_slice(&3u64.to_le_bytes());
+  expected.extend_from_slice(&1u64.to_le_bytes());
+  expected.extend_from_slice(&9u64.to_le_bytes());
+  expected.extend_from_slice(&5u64.to_le_bytes());
+  expected.push(1);
+  expected.extend_from_slice(&[0xab; 20]);
+  expected.extend_from_slice(&identity.0);
+  expected.extend_from_slice(&1u64.to_le_bytes());
+  expected.extend_from_slice(&10u64.to_le_bytes());
+  expected.extend_from_slice(b"PACK-bytes");
+  assert_eq!(bytes, expected);
+  let read = Record {
+    names: Vec::new(),
+    named: Some((identity, 1)),
+    pack: b"PACK-bytes",
+    deepest: 3,
+    moves,
+    objects: Vec::new(),
+  };
+  assert_eq!(Record::decode(&bytes, FORMAT), Ok(read));
 }
 
 /// A-662, A-723 (the record written when an append commits). Do: note three objects; write the record with the second
@@ -333,10 +387,10 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
   );
   let magic = with(0..4, b"GCHN");
   assert_eq!(Record::decode(&magic, FORMAT), Err(RecordRefused::Magic));
-  let version = with(4..8, &3u32.to_le_bytes());
+  let version = with(4..8, &4u32.to_le_bytes());
   assert_eq!(
     Record::decode(&version, FORMAT),
-    Err(RecordRefused::Version { version: 3 })
+    Err(RecordRefused::Version { version: 4 })
   );
   // Format: the objects' count follows the header (24 bytes), the move's key, version and marker (17) and its head (20).
   let objects_at = 24 + 17 + 20;
@@ -1023,6 +1077,75 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   ));
   assert_eq!(store.facts(), before);
   assert_a_head_nobody_sent_is_refused_and_leaves_nothing(&mut store, &before);
+}
+
+/// `v2`, a version-2 record, written as version 3 (A-724 piece 8c): its names put into `content` as one content and
+/// named by its identity and count in their place. The identity, beside the bytes.
+fn as_version_3(v2: &[u8], content: &mut ContentStore) -> (Vec<u8>, slates_vcs::ContentId) {
+  let read = Record::decode(v2, FORMAT).expect("a version-2 record");
+  let (identity, count) =
+    super::record_names::names_to_content(content, &read.names).expect("names put");
+  // Format: after the moves come the names' count (8), each name (41), the pack's length (8) and the pack.
+  let tail = 8 + 41 * read.names.len() + 8 + read.pack.len();
+  let mut v3 = v2[..v2.len() - tail].to_vec();
+  v3.splice(4..8, 3u32.to_le_bytes());
+  v3.extend_from_slice(&identity.0);
+  v3.extend_from_slice(&count.to_le_bytes());
+  v3.extend_from_slice(&(read.pack.len() as u64).to_le_bytes());
+  v3.extend_from_slice(read.pack);
+  (v3, identity)
+}
+
+/// A-724 piece 8c (main's ruling of 2026-11-20 (ii): replay reads a version-3 record's names locally, else from their
+/// region homes, and holds them by identity). Do: push a commit, write its record as version 3, and replay it into an
+/// empty store twice: once holding its names (as a fetch from the region leaves them, or a restart's restored window
+/// held for no one), once without them. Expect: the first made again equal to the live store beside the names' content,
+/// held for the record; the second
+/// refused `Names` (missing, to be fetched first), the store left as it was.
+#[test]
+fn t_a724_a_version_3_record_replays_from_its_names_by_identity_and_refuses_without_them() {
+  let mut live = Live::new();
+  let (objects, head) = commit_of(&[(b"a".to_vec(), b"bytes".to_vec())], &[], FIRST_DATE);
+  live
+    .push(&objects, vec![(0, Some(head))], 0)
+    .expect("pushed");
+  let before = live.facts();
+  let v2 = live.records.first().expect("a record").clone();
+  let mut content = empty_content();
+  let (v3, identity) = as_version_3(&v2, &mut content);
+  // What the names' content is charged in the store, measured as it was put into an empty one.
+  let names_charge = content.used();
+  let mut store = GitStore::new(FORMAT, WINDOW);
+  replay_git(&mut content, &mut store, &v3).expect("replayed from its names");
+  assert!(
+    content.holders(&identity) >= 1,
+    "the names are held for the record"
+  );
+  let made = Live {
+    content,
+    store,
+    records: vec![v3.clone()],
+    heads: live.heads.clone(),
+    greens: live.greens.clone(),
+    blobs: live.blobs.clone(),
+  };
+  // The same store as the live one, beside the names' content itself, which a version-3 store holds for its record.
+  let mut facts = made.facts();
+  facts.contents.retain(|(held, _)| *held != identity);
+  facts.used -= names_charge;
+  assert_eq!(facts, before);
+  let mut bare = empty_content();
+  let mut store = GitStore::new(FORMAT, WINDOW);
+  assert!(matches!(
+    replay_git(&mut bare, &mut store, &v3),
+    Err(ReplayRefused::Names(
+      super::record_names::NamesRefused::Rows(slates_vcs::rows::RowsRefused::Missing)
+    ))
+  ));
+  assert!(
+    store.versions(0).is_empty(),
+    "a refused replay made nothing"
+  );
 }
 
 /// The last case of [`t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing`]: a record whose head names a

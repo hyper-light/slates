@@ -135,6 +135,9 @@ fn an_anchor_role() {
   {
     return;
   }
+  // A clear memory level in the host's place, as the daemon role takes: the anchor judges a frozen or wedged daemon,
+  // which on a host under memory pressure it would rightly spare as one waiting on memory (A-336).
+  slates_machine::memory_stall::put_in_place(Some(false));
   let instance = std::env::var(INSTANCE).unwrap();
   let daemon_args: Vec<String> = ["--ignored", "--exact", DAEMON_ROLE, "--nocapture"]
     .iter()
@@ -152,6 +155,9 @@ fn a_daemon_role() {
   if std::env::var_os(slates_anchor::supervise::ENV_ANCHOR_PID).is_none() {
     return;
   }
+  // A clear memory level in the host's place: what these tests drive is a wedge, a freeze or a starved CPU, never a
+  // memory stall, which on a host under memory pressure the watchdog would rightly see first (A-336).
+  slates_machine::memory_stall::put_in_place(Some(false));
   let Ok(instance) = std::env::var(INSTANCE) else {
     return;
   };

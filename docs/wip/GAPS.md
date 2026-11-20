@@ -2868,6 +2868,18 @@
 > - **Owed (A-354):** the reply a write through the successor held waited without a bound; held replies of the slates
 >   protocol are judged by no time bound (NFS and FUSE judge theirs by `durable_bound` up to the failover SLO).
 
+> **The watchdog and anchor tests that drive a wedge failed on a host under memory pressure (2026-11-20; CLOSED, g226;
+> main's ruling).** On a Mac whose kernel reported memory pressure throughout (`kern.memorystatus_vm_pressure_level`
+> above normal), the watchdog and the anchor rightly took a blocked or frozen shard for one waiting on memory (A-336),
+> so the tests that drive a wedge, a syscall block, a blocked-thread wait or a frozen process never saw it judged:
+> `slates-api`'s `an_anchored_daemons_wedged_shard_…` and `an_anchored_daemon_stopped_whole_…`, and server
+> `liveness.rs`' wedged, syscall and blocked-thread roles (2 of 3 and 3 of 12 failed, with or without other changes).
+> Each now drives the condition it means: a clear memory level stands in the host's place
+> (`slates_machine::memory_stall::put_in_place`, process-wide, which the anchor reads; the daemon's own
+> `inject_memory_stall` in server roles), so the wedge is judged a wedge on any host; the A-336 tests keep driving a
+> pressed level. On base ab0344f04 under that pressure: 3 of 3 and 12 of 12 pass, and with the levels reversed 2 and 3
+> fail.
+
 > **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
 > work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
 > at v2.0.0 left the daemon in a restart loop: 78 exits, each `daemon exited (Some(0))`. Each restart served,
@@ -2883,8 +2895,15 @@
 > the control shard held alone by busy work for the old budget at this build's cost and a window more; Adas-Mac-Studio-4,
 > base cdfbb4020: busy 31.8 s and the watch still waiting after it, ending at its reason at 32.3 s; with the change
 > reversed, the wait ended at 31.4 s while the shard was busy for 32.2 s, the refusal the daemon stopped on). Owed (w-k90-vendor):
-> slicing the encode poll (`git_encode.rs:345`); owed (R3): `OBSERVE_BUDGET_NS`, ten liveness windows, still bounds every
-> other observation.
+> slicing the encode poll (`git_encode.rs:345`). The same hazard in every other default observation since 2026-11-20
+> (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows, and a shard that stepped busy
+> past that budget's CPU without reaching the question refused it; a default observation now waits while its shard
+> lives (`Observation::patient`, looked at every liveness window, ended only by the shard's going; A-232's rule), and its
+> watchdog ends a stuck one (`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`, base 26e125adb:
+> the control shard held alone 31.6 s, answered after it; with the change reversed, refused at 31.9 s mid-work; and
+> `a_patient_wait_goes_on_while_the_shard_lives_and_ends_at_its_going`). Owed (R3): `OBSERVE_BUDGET_NS` still caps the
+> watchdog's window (`WINDOW_CEILING_NS`), the anchor's lapse bound and `live_ship`'s key wait, and bounds the daemon's
+> test-support waits (an explicit observation's budget is its asker's).
 
 > **A forward lane's floor was logged once a forward: about a million lines, 260 MB, in one flow (2026-11-20; CLOSED,
 > g226; found by w-fed-faults).** A lane left with nothing was dropped, so each forward made it afresh and measured its
@@ -2960,8 +2979,11 @@
 >   shipper append of a large delta (128 to 331 ms for 1.8 to 2.5 MB; 29 ms for 4.8 KB, so not the payload's size
 >   alone). **A-757 part 1 (2026-11-20):** the entry's identity is hashed once per append, as its fields stream (it was
 >   hashed three times, each over a copy): 2.4 MB in release 3.1 to 4.6 ms a turn before, 0.94 to 1.63 ms after;
->   parts 2 (the identity hashed in quantum slices across turns) and 3 (the body held once) owed); and, after A-347's
->   open, the takeover's
+>   **A-757 part 2 (2026-11-20):** a whole build's identity is hashed in slices across its turns after the last piece is
+>   sealed, sized to the quantum left at the rate it measures, and the build appends with it: 2.4 MB in release, the
+>   append turn 0.92 to 0.94 ms before, about 0.46 us after, each hashing turn at most 27 to 32 us; peak RSS unchanged
+>   (8.8 MB). **Owed:** a large delta still seals and hashes in its publication's turn (A-757 part 2b), and the body is
+>   held twice (part 3)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -7062,7 +7084,11 @@
 >   `server/tests` since 2026-11-20 (g226, main's ruling): `recovery` (a connect, two create retries, a pool's return,
 >   a heartbeat's stop, a stop's end and nine condition loops), `give_back`, `cross_shard_wait`, `consumers`,
 >   `attachment_term`, `reply_room` and `forward_retry` wait on their event while the daemon lives, its watchdog the
->   bound (A-232). Owed: `client/tests` and its examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
+>   bound (A-232). In `client/tests` since 2026-11-20 (g226): `driver`, `merge_identity`, `merge_chaos`,
+>   `edit_and_submit`, `merge_post_state`, `async_core`, `waits`, `consumer`, `client` and `lone_daemon` (a connect is
+>   one claim, a full ring is waited out, a listing, a reply, an edit, a seat and a returned id are waited for while the
+>   daemon lives, a child's tagged line while the child lives, `lone_daemon`'s role a clear memory level in the host's
+>   place). Owed: the client's examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
 >   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the

@@ -327,7 +327,10 @@ const REQUEST_ROOM: u64 = 1 << 16;
 /// git/git cut at v1.0.0 cloned over SSH was refused for its room). Do: on an audit daemon's shard, serve the SSH edge
 /// with the production site, each request admitted [`REQUEST_ROOM`]; push a line of the HTTP edge's long history
 /// (`vcs_http::daemon_edge_tests::LONG_HISTORY` commits) over SSH; then clone it over SSH as git's client does at protocol
-/// v2 (`git-upload-pack` with `GIT_PROTOCOL=version=2`, a `fetch` of its last commit with `done`, then a flush). Expect:
+/// v2 (`git-upload-pack` with `GIT_PROTOCOL=version=2`, a `fetch` of its last commit with `done`, then a flush), each
+/// client waiting for its answer while its session is open, as git's does (a fixed patience failed it 3 of 3 on a
+/// loaded machine, and 2 of 2 on the Mac Studio's efficiency cores, where the push answers in 6.1 s and the clone in
+/// 18.1 s, both exiting 0). Expect:
 /// the push exits 0; the clone exits 0, its answer after the advertisement a packfile section holding every object
 /// pushed, in a pack larger than one request's room.
 #[test]
@@ -338,7 +341,7 @@ fn a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room() {
   let daemon = audit_daemon();
   let (_, address, _) = observe_first(&daemon, |state| serving_within(state, REQUEST_ROOM));
   let (request, last) = long_history(LONG_HISTORY);
-  let pushed = pushed_over_ssh(address, None, &request);
+  let pushed = pushed_patiently(address, &request);
   let fetched = fetched_over_ssh(address, &fetch_of(last));
   daemon.stop();
   assert_eq!(pushed.map(|transcript| transcript.status), Some(Some(0)));
@@ -362,10 +365,23 @@ fn a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room() {
   );
 }
 
+/// [`pushed_over_ssh`] at protocol v0, its client patient: it waits for the push's answer while the session is open,
+/// however long the push's work takes on a loaded machine (`Peer::connect_patient`).
+fn pushed_patiently(address: SocketAddrV4, request: &[u8]) -> Option<Transcript> {
+  let mut peer = Peer::connect_patient(address)?;
+  (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+  (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+  exec_asking(&mut peer, None).then_some(())?;
+  for piece in request.chunks(PIECE) {
+    send_data(&mut peer, piece);
+  }
+  Some(transcript(&mut peer))
+}
+
 /// A clone session with the held key: authenticate, run `git-upload-pack '/pushed'` at protocol v2, send `request` and a
-/// flush that ends the session, and read to the end.
+/// flush that ends the session, and read to the end, patient as [`pushed_patiently`] is.
 fn fetched_over_ssh(address: SocketAddrV4, request: &[u8]) -> Option<Transcript> {
-  let mut peer = Peer::connect(address)?;
+  let mut peer = Peer::connect_patient(address)?;
   (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
   (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
   exec_command(&mut peer, Some(b"version=2"), b"git-upload-pack '/pushed'").then_some(())?;
