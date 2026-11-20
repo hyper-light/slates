@@ -2103,48 +2103,58 @@ pub(crate) async fn recover(
     .cloned()
     .collect();
   for record in records {
-    make(state, &record);
-    let mut index = 0usize;
-    loop {
-      // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
-      // shard past the watchdog's window at every restart.
-      let outcome = if record.tool == VcsTool::Mercurial {
-        replay_hg_sliced(state, record.id, index, slices).await
-      } else {
-        // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
-        let ns = state.config.step_quantum_ns();
-        match record_turn(state, (record.id, index), ns) {
-          Some(RecordTurn::More) => {
-            slices.unit_done().await;
-            continue;
-          }
-          Some(RecordTurn::Replayed(outcome)) => Some(outcome),
-          None => None,
-        }
-      };
-      let Some(outcome) = outcome else {
-        break;
-      };
-      if !replayed(state, record.id, outcome) {
-        break;
-      }
-      index = index.saturating_add(1);
-      slices.unit_done().await;
-    }
-    // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
-    let greens: Vec<DbVolumeId> = state
-      .db
-      .partition()
-      .repositories()
-      .members_of(record.id)
-      .map(|member| member.green)
-      .collect();
-    for green in greens {
-      paths::remake_green_sliced(state, green, slices).await;
-      slices.unit_done().await;
-    }
-    paths::whole_build::resume_owed(state, record.id);
+    recover_repository(state, &record, slices).await;
   }
+}
+
+/// Makes `record`'s store again and replays its records in log order, a record a unit of the recovery's slices, then
+/// makes each green's map of its head again, a green a unit.
+async fn recover_repository(
+  state: &mut ShardState,
+  record: &RepositoryRecord,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
+  make(state, record);
+  let mut index = 0usize;
+  loop {
+    // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
+    // shard past the watchdog's window at every restart.
+    let outcome = if record.tool == VcsTool::Mercurial {
+      replay_hg_sliced(state, record.id, index, slices).await
+    } else {
+      // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
+      let ns = state.config.step_quantum_ns();
+      match record_turn(state, (record.id, index), ns) {
+        Some(RecordTurn::More) => {
+          slices.unit_done().await;
+          continue;
+        }
+        Some(RecordTurn::Replayed(outcome)) => Some(outcome),
+        None => None,
+      }
+    };
+    let Some(outcome) = outcome else {
+      break;
+    };
+    if !replayed(state, record.id, outcome) {
+      break;
+    }
+    index = index.saturating_add(1);
+    slices.unit_done().await;
+  }
+  // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
+  let greens: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .repositories()
+    .members_of(record.id)
+    .map(|member| member.green)
+    .collect();
+  for green in greens {
+    paths::remake_green_sliced(state, green, slices).await;
+    slices.unit_done().await;
+  }
+  paths::whole_build::resume_owed(state, record.id);
 }
 
 /// Makes repository `id`'s store again from the log (module docs): what a commit whose entry was not made durable left

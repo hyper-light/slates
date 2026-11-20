@@ -25,6 +25,13 @@
 //! order) and every text as the windows of Subversion's deltifier ([`crate::svndiff::deltas`], A-652) against its
 //! comparison's text, the empty text for an addition without history, svndiff version 0 (`store_delta`), naming the
 //! base's checksums where it has a text.
+//!
+//! **Bounded calls** (A-652's slicing). One call of [`Exporter::export`] writes a revision's record, or one changed
+//! path's records up to its text, or one window of that text (a whole text's next [`WINDOW_LIMIT`] bytes, or the
+//! deltifier's next window, taken up again from [`DeltasAt`]), or the closing of the revision's open directories. A
+//! record's header names its text's length first: a whole text's is its own (`index::Text::size`), so it is walked once;
+//! a delta's is its svndiff's, which nothing keeps, so a first walk measures it keeping no window, in the record's call
+//! (owed: that walk resumable too), and a second writes it.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
@@ -38,8 +45,10 @@ use crate::dump::{
   CopyFrom, DeltaBase, Event, Format, NodeAction, NodeHeader, Property, PropertySection,
   RevisionHeader, TextSection, Writer, section_len,
 };
-use crate::index::{Action, ChangedPath, NodeKind, Revision};
-use crate::svndiff::{Compression, Encoder, HEADER_LEN, Version, WINDOW_LIMIT, Window, deltas};
+use crate::index::{Action, ChangedPath, NodeKind, Revision, Text};
+use crate::svndiff::{
+  Compression, DeltasAt, Encoder, HEADER_LEN, Version, WINDOW_LIMIT, Window, deltas, deltas_at,
+};
 
 /// What one call of [`Exporter::export`] wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +91,31 @@ struct Pending {
   stack: Vec<Directory>,
   /// The last path visited, or its directory.
   last: Option<String>,
+  /// The text of the record written last, while it is being written a window a call.
+  text: Option<Texting>,
+}
+
+/// A record's text being written a window a call (the module documentation): its header and property section are
+/// written, so the text's length was read before it (format 2: the text's own, `index::Text::size`; format 3: the
+/// svndiff's, measured by a walk of its windows that kept none).
+#[derive(Clone, Copy, Debug)]
+enum Texting {
+  /// A whole text: how many of its bytes are written.
+  Whole {
+    /// The text; none for a node without one, whose text is empty.
+    text: Option<Text>,
+    /// Its bytes written.
+    sent: u64,
+  },
+  /// A delta against `source`'s text making `target`'s: where the deltifier stands, none before its first window.
+  Delta {
+    /// The comparison's text; none for the empty text.
+    source: Option<Text>,
+    /// The record's text; none for the empty text.
+    target: Option<Text>,
+    /// The deltifier's position.
+    at: Option<DeltasAt>,
+  },
 }
 
 impl Exporter {
@@ -199,6 +233,7 @@ impl Exporter {
       at: 0,
       stack: Vec::new(),
       last: None,
+      text: None,
     });
     Ok(false)
   }
@@ -214,6 +249,11 @@ impl Exporter {
     let deltas = deltas_room(self.format)?;
     let Exporter { writer, drive, .. } = self;
     let pending = drive.as_mut().ok_or(MigrationRefusal::Corrupt)?;
+    if let Some(texting) = pending.text {
+      let mut stream = Stream { writer, out };
+      pending.text = write_text(repository, &mut stream, texting)?;
+      return Ok(false);
+    }
     let mut drive = Drive {
       repository,
       revision,
@@ -221,6 +261,7 @@ impl Exporter {
       stream: Stream { writer, out },
       stack: std::mem::take(&mut pending.stack),
       last: pending.last.take(),
+      text: None,
     };
     let Some(row) = pending.rows.get(pending.at) else {
       drive.finish()?;
@@ -230,6 +271,7 @@ impl Exporter {
     pending.at = pending.at.saturating_add(1);
     pending.stack = drive.stack;
     pending.last = drive.last;
+    pending.text = drive.text;
     Ok(false)
   }
 }
@@ -299,6 +341,8 @@ struct Drive<'a> {
   stack: Vec<Directory>,
   /// The last path visited, or its directory (`path_driver.c`'s `last_path`).
   last: Option<String>,
+  /// The text the record it wrote last owes, written by the calls after it.
+  text: Option<Texting>,
 }
 
 impl<'a> Drive<'a> {
@@ -518,7 +562,7 @@ impl<'a> Drive<'a> {
     (with_properties, with_text): (bool, bool),
     before: Option<&Facts>,
     now: &Facts,
-  ) -> Result<Sections<'a>, MigrationRefusal> {
+  ) -> Result<Sections, MigrationRefusal> {
     let properties = if with_properties {
       Some(self.property_plan(before, now)?)
     } else {
@@ -557,33 +601,28 @@ impl<'a> Drive<'a> {
     }
   }
 
-  /// A text section: the node's whole text, or (format 3) the deltifier's windows against `before`'s text, the empty
-  /// text when there is no comparison or it has none (`store_delta`).
-  fn text_plan(
-    &self,
-    before: Option<&Facts>,
-    now: &Facts,
-  ) -> Result<TextPlan<'a>, MigrationRefusal> {
-    let target = self.text_bytes(now)?;
+  /// A text section: the node's whole text, its length the record's (one walk, the writing); or (format 3) the
+  /// deltifier's windows against `before`'s text, the empty text when there is no comparison or it has none
+  /// (`store_delta`), their svndiff's length measured by a walk that keeps no window (the first of two).
+  fn text_plan(&self, before: Option<&Facts>, now: &Facts) -> Result<TextPlan, MigrationRefusal> {
     let Some(room) = self.deltas else {
-      return Ok(TextPlan::Whole(target));
+      return Ok(TextPlan::Whole(now.text));
     };
+    let target = self.text_bytes(now)?;
     let base_text = before.and_then(|before| before.text);
     let source = match before {
       Some(before) => self.text_bytes(before)?,
       None => &[],
     };
-    let windows: Vec<Window> = deltas(source, target, room)
-      .map_err(MigrationRefusal::Delta)?
-      .collect();
-    let length = encoded_len(&windows)?;
+    let length = encoded_len(deltas(source, target, room).map_err(MigrationRefusal::Delta)?)?;
     Ok(TextPlan::Delta {
       base: DeltaBase {
         md5: base_text.map(|text| text.md5),
         sha1: base_text.map(|text| text.sha1),
       },
-      windows,
       length,
+      source: base_text,
+      target: now.text,
     })
   }
 
@@ -602,7 +641,7 @@ impl<'a> Drive<'a> {
   fn record_with_sections(
     &mut self,
     header: &NodeHeader,
-    sections: Sections<'_>,
+    sections: Sections,
   ) -> Result<(), MigrationRefusal> {
     self.record(header)?;
     if let Some(properties) = sections.properties {
@@ -615,22 +654,20 @@ impl<'a> Drive<'a> {
       }
       self.stream.event(&Event::PropertiesEnd)?;
     }
-    match sections.text {
-      Some(TextPlan::Whole(bytes)) => {
-        if !bytes.is_empty() {
-          self.stream.event(&Event::Text(bytes))?;
-        }
-        self.stream.event(&Event::TextEnd)
-      }
-      Some(TextPlan::Delta { windows, .. }) => {
+    // The text itself is written by the calls after this one, a window a call (`write_text`).
+    self.text = match sections.text {
+      Some(TextPlan::Whole(text)) => Some(Texting::Whole { text, sent: 0 }),
+      Some(TextPlan::Delta { source, target, .. }) => {
         self.stream.event(&Event::Delta(Version::Zero))?;
-        for window in windows {
-          self.stream.event(&Event::Window(window))?;
-        }
-        self.stream.event(&Event::TextEnd)
+        Some(Texting::Delta {
+          source,
+          target,
+          at: None,
+        })
       }
-      None => Ok(()),
-    }
+      None => None,
+    };
+    Ok(())
   }
 
   /// Writes a node record's header.
@@ -653,26 +690,28 @@ struct PropertyPlan {
 }
 
 /// A record's text as it is written.
-enum TextPlan<'a> {
-  /// Whole.
-  Whole(&'a [u8]),
+enum TextPlan {
+  /// Whole: the text, none for the empty one.
+  Whole(Option<Text>),
   /// As the deltifier's windows against a base the header names by its checksums, `length` bytes of svndiff.
   Delta {
     /// The base's checksums.
     base: DeltaBase,
-    /// The windows.
-    windows: Vec<Window>,
     /// The svndiff's length.
     length: u64,
+    /// The base's text, none for the empty one.
+    source: Option<Text>,
+    /// The record's text, none for the empty one.
+    target: Option<Text>,
   },
 }
 
 /// What a record carries after its headers.
-struct Sections<'a> {
+struct Sections {
   /// Its property section.
   properties: Option<PropertyPlan>,
   /// Its text.
-  text: Option<TextPlan<'a>>,
+  text: Option<TextPlan>,
 }
 
 /// The deltifier's window room for a stream of `format`: Subversion's, `SVN_DELTA_WINDOW_SIZE`, for format 3; none for
@@ -681,21 +720,89 @@ fn deltas_room(format: Format) -> Result<Option<NonZeroUsize>, MigrationRefusal>
   if format == Format::Two {
     return Ok(None);
   }
-  let room = usize::try_from(WINDOW_LIMIT).map_err(|_| MigrationRefusal::Corrupt)?;
-  NonZeroUsize::new(room)
-    .map(Some)
-    .ok_or(MigrationRefusal::Corrupt)
+  window_room().map(Some)
 }
 
-/// The svndiff length of `windows`: the header and each window as svndiff version 0 writes it.
-fn encoded_len(windows: &[Window]) -> Result<u64, MigrationRefusal> {
+/// The most bytes of a text one call writes: Subversion's window, `SVN_DELTA_WINDOW_SIZE` ([`WINDOW_LIMIT`]), a delta
+/// window's most, so a whole text goes in pieces of the room a delta's window has.
+fn window_room() -> Result<NonZeroUsize, MigrationRefusal> {
+  let room = usize::try_from(WINDOW_LIMIT).map_err(|_| MigrationRefusal::Corrupt)?;
+  NonZeroUsize::new(room).ok_or(MigrationRefusal::Corrupt)
+}
+
+/// The bytes of `text`, the empty text for none.
+fn bytes_of<'r>(
+  repository: &'r Repository,
+  text: Option<Text>,
+) -> Result<&'r [u8], MigrationRefusal> {
+  match text {
+    Some(text) => repository
+      .content(&text.identity)
+      .ok_or(MigrationRefusal::Corrupt),
+    None => Ok(&[]),
+  }
+}
+
+/// Writes the next window of a record's text, or its end: the texting still owed, none once its end is written.
+fn write_text(
+  repository: &Repository,
+  stream: &mut Stream<'_>,
+  texting: Texting,
+) -> Result<Option<Texting>, MigrationRefusal> {
+  let room = window_room()?;
+  match texting {
+    Texting::Whole { text, sent } => {
+      let bytes = bytes_of(repository, text)?;
+      let start = usize::try_from(sent).map_err(|_| MigrationRefusal::Corrupt)?;
+      let rest = bytes.get(start..).unwrap_or_default();
+      let piece = rest.get(..room.get()).unwrap_or(rest);
+      if !piece.is_empty() {
+        stream.event(&Event::Text(piece))?;
+      }
+      let sent = start.saturating_add(piece.len());
+      if sent >= bytes.len() {
+        stream.event(&Event::TextEnd)?;
+        return Ok(None);
+      }
+      Ok(Some(Texting::Whole {
+        text,
+        sent: u64::try_from(sent).map_err(|_| MigrationRefusal::Corrupt)?,
+      }))
+    }
+    Texting::Delta { source, target, at } => {
+      let (from, to) = (bytes_of(repository, source)?, bytes_of(repository, target)?);
+      let mut made = match at {
+        Some(at) => deltas_at(from, to, room, at),
+        None => deltas(from, to, room),
+      }
+      .map_err(MigrationRefusal::Delta)?;
+      match made.next() {
+        Some(window) => {
+          stream.event(&Event::Window(window))?;
+          Ok(Some(Texting::Delta {
+            source,
+            target,
+            at: Some(made.at()),
+          }))
+        }
+        None => {
+          stream.event(&Event::TextEnd)?;
+          Ok(None)
+        }
+      }
+    }
+  }
+}
+
+/// The svndiff length of `windows`: the header and each window as svndiff version 0 writes it, none of them kept.
+fn encoded_len(windows: impl Iterator<Item = Window>) -> Result<u64, MigrationRefusal> {
   let mut encoder = Encoder::new(Version::Zero);
   let mut scratch = Vec::new();
   let mut length = u64::try_from(HEADER_LEN).map_err(|_| MigrationRefusal::Corrupt)?;
   for window in windows {
     scratch.clear();
     encoder
-      .window(window, Compression::Stored, &mut scratch)
+      .window(&window, Compression::Stored, &mut scratch)
       .map_err(MigrationRefusal::Delta)?;
     let bytes = u64::try_from(scratch.len()).map_err(|_| MigrationRefusal::Corrupt)?;
     length = length.checked_add(bytes).ok_or(MigrationRefusal::Corrupt)?;
@@ -723,7 +830,7 @@ fn header(
   kind: NodeKind,
   action: NodeAction,
   copy_from: Option<CopyFrom>,
-  sections: &Sections<'_>,
+  sections: &Sections,
   now: &Facts,
 ) -> Result<NodeHeader, MigrationRefusal> {
   let properties = match &sections.properties {
@@ -739,7 +846,7 @@ fn header(
   };
   let text = sections.text.as_ref().map(|plan| {
     let (delta, length) = match plan {
-      TextPlan::Whole(bytes) => (None, u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+      TextPlan::Whole(text) => (None, text.map_or(0, |text| text.size)),
       TextPlan::Delta { base, length, .. } => (Some(*base), *length),
     };
     TextSection {
