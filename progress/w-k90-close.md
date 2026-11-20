@@ -19,5 +19,16 @@ POLICY_READ: briefs/common.md + briefs/w-k90-close.md + relaunch-2026-11-19.md. 
 3. Live: kiln server + home runner (fleet node, export) + agents_image (fake-claude + act) -> agents.start pod ->
    kubelet NFS mount -> write -> review/drift/land through grant.
 
+## Done so far (2026-11-20 ~08:05 PST)
+- Told main (agents_send) the KIND finding + plan.
+- adacachy: `sudo modprobe tls` done; node image k90-close-kicbase:tls built (kicbase v0.0.50 + tlshd from
+  oracle/ktls-utils 0.11 source + openssl; ~/.cache/w-k90-close/node-image/Dockerfile).
+- kiln branch agents/w-k90-close (394670a97, pushed over SSH from this Mac): crates/kiln/tests/k8s_agent_live.rs
+  (KILN_K8S_LIVE=1 gate), fixtures/k8s-agent/{Dockerfile,claude,act}, common::Tables{listen,kubernetes}.
+- r19: clone ~/.cache/w-k90-close/kiln2 (branch) + `cargo test --no-run` (target ~/.cache/w-k90-close/target).
+  r20: `minikube start -p k90-close` 2 nodes, KUBECONFIG=~/.cache/w-k90-close/kubeconfig (never ~/.kube/config).
+- NEXT: agent image k90-close-agent:live (stripped debug kiln) -> `minikube -p k90-close image load`; ns
+  kiln-agents-live; run the test; red -> fix.
+
 ## For main to delete
-(none)
+- adacachy ~/.cache/w-k90-close/kiln (a partial clone stuck on HTTPS creds; 84K)
