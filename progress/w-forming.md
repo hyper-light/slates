@@ -1,3 +1,10 @@
+# STATUS 2026-11-20 end (w-forming): main's three items DONE. A-768 586cf5035 (sliced capture, pins), A-771 cb1b698f0
+# (rebuild payload + archive hashing in steps), A-775 035df1690 via 419557ac6 (base b831a2877): a taken-over volume
+# given up while its cohort members were away is judged afresh once one is heard at a later incarnation (anchor:
+# takeover-stall-pr15-run1.log; red in process 23 attempts then unserved 415 s; after served 24/24 in 8.25 s). Bug
+# record docs/bugs/2026-11-20-a-live-volume-given-up-while-its-holder-was-away-was-never-served.md. Left: greens given
+# up stay final (sibling noted); the image capture 2-3 ms and a large delta's runs 3.3 ms (debug) still one turn.
+
 # STATUS 2026-11-20 later (w-forming): A-771 LANDED cb1b698f0 (main merge b831a2877; base a7df9ccf0): a takeover's
 # rebuild applies a payload in steps (RawOpening: segments then hash a page a call) and hashes the archive's content a
 # page a step (Laying), archive_of hashing nothing. Probe (debug -b): whole entry open 56-59 ms/turn, archive_of 93-99
