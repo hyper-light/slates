@@ -78,3 +78,11 @@
   Windows pipes stdio over it (KILN_REACH_ADDR/KILN_REACH_TOKEN); Claude's --mcp-config is a user-only file in
   %TEMP%\kiln-mcp. Mac: 4/4 new tests green. r31 (jupiter): Windows clippy + reach::loopback tests.
 - Python on jupiter still needed for the e2e drive there (inbox/main-from-w-k90-win.md).
+
+## 2026-11-20 ~14:50 PST: Python on jupiter (Ada's word via main, ~11:45 PST)
+- Installed CPython **3.15.2** (current stable; 3.16 is alpha), python.org python-3.15.2-amd64.exe, SHA-256 06e225a2...
+  = python.org's published; Authenticode Valid (CN=Python Software Foundation). r36: /quiet InstallAllUsers=0
+  TargetDir=C:\Users\corph\bin PrependPath=0 Include_launcher=0, exit 0, NO UAC. python3.exe = copy of python.exe.
+  C:\Users\corph\bin is already on every kiln run's PATH there (no runner restart): `python`/`python3` -> 3.15.2.
+  Told w-k90-whp (inbox/w-k90-whp-from-w-k90-win.md). My files: C:\Users\corph\w-k90-win\python-*.
+- Found: a per-user Python 3.13.17 installed 2026-11-19 23:25 (someone's), registry PATH only (runner started before it).

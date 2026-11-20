@@ -209,3 +209,10 @@
 - xtask helm_chart golden fails here only because local helm is v4.1.0 and CI pins v4.3.0 (blank lines between
   documents); not a main breakage.
 - r38/r39 (Linux) lost to a runner restart / no room; r40 running on the Linux runner.
+- Landed on main (2e4415441): the api Windows `ask` condition wait (088e05d50; its jupiter check r41/r42 lost to kiln
+  timeouts, landed per Ada's don't-block rule since Windows clippy was already red on that code), and git
+  negotiation/shallow.rs mem::take + checked test casts in merge named_tests and server vcs_store/named_objects
+  (git negotiation:: 30, merge named 22, server named_objects 1 pass here).
+- g226 native: Linux r40 clippy on slates-mem/ipc/anchor clean on a7df9cc (mallinfo2 compiles natively); its heap
+  test and every Windows run since (r37, r41, r42, r43, and a last pair) were lost to kiln: server timeouts, runner
+  restarts on both 451397fc (Linux) and jupiter. Next round retries both lanes on current main.
