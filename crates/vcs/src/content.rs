@@ -60,6 +60,13 @@ use std::num::NonZeroUsize;
 /// Format: a content identity's bytes, BLAKE3's output length.
 pub const IDENTITY_BYTES: usize = blake3::OUT_LEN;
 
+/// What a store kept or let go since its owner last took it ([`ContentStore::changes`]): each list with its bytes, none
+/// once freed; each name with its root, none once unnamed.
+pub type Changes<'a> = (
+  Vec<(ContentId, Option<&'a [u8]>)>,
+  Vec<(ContentId, Option<ContentId>)>,
+);
+
 /// Format: the context a list's identity is derived under ([`Form::List`]), in the form the `blake3` crate's
 /// `derive_key` documents: "\[application\] \[commit timestamp\] \[purpose\]".
 const LIST_CONTEXT: &str =
@@ -1121,12 +1128,7 @@ impl ContentStore {
 
   /// The lists and names kept or let go since the owner last took them ([`ContentStore::clear_changes`]): each list
   /// with its bytes, none once freed; each name with its root, none once unnamed (A-727 slice a3b: a delta carries them).
-  pub fn changes(
-    &self,
-  ) -> (
-    Vec<(ContentId, Option<&[u8]>)>,
-    Vec<(ContentId, Option<ContentId>)>,
-  ) {
+  pub fn changes(&self) -> Changes<'_> {
     let lists = self
       .lists_changed
       .iter()
@@ -1195,8 +1197,10 @@ impl ContentStore {
         .and_then(Held::here)
         .map(|bytes| {
           bytes
-            .chunks_exact(IDENTITY_BYTES)
-            .filter_map(ContentId::from_slice)
+            .as_chunks::<IDENTITY_BYTES>()
+            .0
+            .iter()
+            .filter_map(|chunk| ContentId::from_slice(chunk))
             .collect()
         })
         .unwrap_or_default();
@@ -2079,14 +2083,7 @@ mod tests {
       before.put_object(&first).unwrap(),
       before.put_object(&second).unwrap(),
     );
-    let mut storage = RestoredWindows::default();
-    for (identity, held) in &before.entries {
-      if held.form == Form::Window {
-        let bytes = before.bytes_of(identity).unwrap().into_owned();
-        let kept = storage.inner.put(&bytes).unwrap();
-        storage.kept.push((*identity, kept, bytes.len()));
-      }
-    }
+    let storage = kept_windows(&before);
     let lists: Vec<(ContentId, Vec<u8>)> = before
       .lists()
       .map(|(identity, bytes)| (identity, bytes.to_vec()))
@@ -2098,19 +2095,41 @@ mod tests {
     let len = u64::try_from(first.len()).unwrap();
     assert_eq!(after.object_bytes(&one, len), Some(first.clone()));
     assert_eq!(after.object_bytes(&two, len), Some(second.clone()));
-    let stored = after.counters().stored;
-    assert_eq!(after.put_object(&first).unwrap(), one);
-    assert_eq!(
-      after.counters().stored,
-      stored,
-      "the restored nodes answer the put"
-    );
-    assert_eq!(after.holders(&one), 1);
+    assert_put_again_answered_by_the_restored(&mut after, &first, one);
     let freed = after.release_unheld();
     assert!(freed > 0, "the second object's nodes freed");
     assert_eq!(after.object_bytes(&two, len), None);
     assert_eq!(after.object_bytes(&one, len), Some(first));
     after.release(&one).unwrap();
     assert!(after.is_empty() && after.used() == 0);
+  }
+
+  /// A storage that kept every window `before` holds, as one kept across a restart.
+  fn kept_windows(before: &ContentStore) -> RestoredWindows {
+    let mut storage = RestoredWindows::default();
+    for (identity, held) in &before.entries {
+      if held.form == Form::Window {
+        let bytes = before.bytes_of(identity).unwrap().into_owned();
+        let kept = storage.inner.put(&bytes).unwrap();
+        storage.kept.push((*identity, kept, bytes.len()));
+      }
+    }
+    storage
+  }
+
+  /// `first` put again into the restored store `after` is answered by the nodes kept (nothing new stored), held once.
+  fn assert_put_again_answered_by_the_restored(
+    after: &mut ContentStore,
+    first: &[u8],
+    one: ContentId,
+  ) {
+    let stored = after.counters().stored;
+    assert_eq!(after.put_object(first).unwrap(), one);
+    assert_eq!(
+      after.counters().stored,
+      stored,
+      "the restored nodes answer the put"
+    );
+    assert_eq!(after.holders(&one), 1);
   }
 }
