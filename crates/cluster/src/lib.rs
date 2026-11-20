@@ -397,6 +397,12 @@ pub struct Stragglers {
   // At most two channels per dispatch: content offers and the chunk transfers they start. All other
   // dispatches use only the first slot; no user-scaled channel list is retained.
   replies: [Option<std::sync::mpsc::Receiver<Reply>>; 2],
+  /// The task the dispatch's reply channel wakes at each send ([`reply_channel`]): the collector, made in the task that
+  /// dispatched. A wait for the next report in that task is woken by it ([`Stragglers::reported`]).
+  collector: Option<slates_rt::TaskId>,
+  /// The waits [`Stragglers::reported`] ended at a report's wake, and those it ended at a timer tick (a task the sends do
+  /// not wake): the non-vacuity counts of the woken wait.
+  waits: (u64, u64),
 }
 
 impl Stragglers {
@@ -404,6 +410,8 @@ impl Stragglers {
   pub fn none() -> Self {
     Self {
       replies: [None, None],
+      collector: None,
+      waits: (0, 0),
     }
   }
 
@@ -411,6 +419,8 @@ impl Stragglers {
   pub fn pending(replies: std::sync::mpsc::Receiver<Reply>) -> Self {
     Self {
       replies: [Some(replies), None],
+      collector: slates_rt::futures::current_task(),
+      waits: (0, 0),
     }
   }
 
@@ -422,6 +432,8 @@ impl Stragglers {
   ) -> Self {
     Self {
       replies: [Some(offers), Some(puts)],
+      collector: slates_rt::futures::current_task(),
+      waits: (0, 0),
     }
   }
 
@@ -466,8 +478,8 @@ impl Stragglers {
   /// whether all have reported. For a caller about to end the task that made the dispatch: a straggler's request is a
   /// child of that task, and a task's end cancels its children, so a request still in flight then is dropped with the
   /// session in it and never reported, and the session's slot stays lent for good. Each request is bounded by its
-  /// dispatch's deadline, so this waits at most that. Checked once per timer tick, the finest park there is; a task off a
-  /// shard, which cannot be timed, gets what has come back so far and `false`.
+  /// dispatch's deadline, so this waits at most that, woken by each report ([`Stragglers::reported`]); a task off a
+  /// shard, which cannot wait, gets what has come back so far and `false`.
   pub async fn settle(&mut self) -> (Vec<(HostId, TimedReply, Endpoint)>, bool) {
     let mut settled = Vec::new();
     loop {
@@ -476,11 +488,41 @@ impl Stragglers {
       if done {
         return (settled, true);
       }
-      // Shape: one tick of the shard's timer wheel (`sleep` rounds up to it).
-      if slates_rt::futures::sleep(1).await.is_err() {
+      if !self.reported(u64::MAX).await {
         return (settled, false);
       }
     }
+  }
+
+  /// Waits, for at most `left_ns`, until a straggler may have reported: in the task that dispatched (the collector),
+  /// until its next send wakes it, so a report is taken in the step after it lands; in any other task, which the sends
+  /// do not wake, one timer tick. Whether a wait could be made (`false` off a shard, where none can, so the caller stops
+  /// rather than spins). Before 2026-11-20 every wait was a tick at a time, or the fleet's poll interval (a location
+  /// round), so a report landing just after a look waited out the rest of it (main's sweep after A-697's release
+  /// bench). A wake for anything else only makes the caller look again.
+  pub async fn reported(&mut self, left_ns: u64) -> bool {
+    let woken_by_reports = self.woken_by_reports();
+    let (woken, ticked) = self.waits;
+    if woken_by_reports {
+      self.waits = (woken.saturating_add(1), ticked);
+      return slates_rt::futures::within(left_ns, slates_rt::futures::idle())
+        .await
+        .is_ok();
+    }
+    self.waits = (woken, ticked.saturating_add(1));
+    // Shape: one tick of the shard's timer wheel (`sleep` rounds up to it), the finest park there is.
+    slates_rt::futures::sleep(1).await.is_ok()
+  }
+
+  /// Whether this task is the dispatch's collector, which every straggler's send wakes ([`reply_channel`]).
+  fn woken_by_reports(&self) -> bool {
+    self.collector.is_some() && slates_rt::futures::current_task() == self.collector
+  }
+
+  /// How many waits for a report [`Stragglers::reported`] made woken by the reports themselves, and how many a timer tick
+  /// at a time: the non-vacuity counts a test reads.
+  pub fn waits(&self) -> (u64, u64) {
+    self.waits
   }
 }
 

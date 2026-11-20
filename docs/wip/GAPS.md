@@ -4975,8 +4975,8 @@
 > that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
-> pace between looks). Owed from that sweep, each with its own wake: a broadcast's stragglers (`owner_location.rs`), a
-> FUSE mount helper's exit (`fuse.rs`); the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
+> pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
+> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
