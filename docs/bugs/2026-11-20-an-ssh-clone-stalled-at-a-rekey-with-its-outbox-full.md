@@ -25,5 +25,7 @@ after the first is recorded with its trigger (`RekeyTrigger::{KeyTime, KeyUsage,
 the SSH edge logs each. Red then green: `slates-ssh` `a_rekey_with_its_outbox_full_still_reads_the_clients_exchange`
 (the rekey never finished, nothing delivered); w-git's long-history SSH clone passes with it.
 
-**Open for main.** The key time's derivation (no floor: a long transfer rekeys every tail interval) is cheap now that a
-rekey cannot stall, but RFC 4253 §9 asks once an hour or a gigabyte; A-594's owner to rule.
+**The key time, ruled** (main, 2026-11-20). RFC 4253 §9's rule replaces the learned time: a key is due after a
+gigabyte of packets either way or after an hour, and at any client's request; nothing an earlier session measured
+moves it (`slates_ssh::keylife`, `vcs_ssh::EdgeState::key_time_ns`). Red: one short session had set the edge's key time
+to 31 ms (`a_held_key_runs_its_command_and_its_connection_teaches_the_edge`, now the hour).
