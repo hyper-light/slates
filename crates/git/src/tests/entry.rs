@@ -64,26 +64,33 @@ fn every_entry_stock_git_packed_reads_as_its_listing_says_and_writes_back_to_its
     let deltas = pack.listing.iter().filter(|entry| entry.base.is_some());
     assert_eq!(deltas.count(), 2, "{name}: two deltas, a chain of two");
     for entry in &pack.listing {
-      let bytes = pack.starting_at(entry);
-      let mut admission = unbounded();
-      let (header, len) = read(bytes, entry.offset, ObjectFormat::Sha1, &mut admission)
-        .unwrap()
-        .unwrap();
-      assert_eq!(header, listed_header(&pack, entry), "{name} {:?}", entry.id);
-      assert_eq!(u64::MAX - admission.left(), entry.size, "{name}: charged");
-      assert!(begins_zlib_stream(&bytes[len..]), "{name} {:?}", entry.id);
-      assert_eq!(
-        written(header, entry.offset),
-        bytes[..len],
-        "{name} {:?}",
-        entry.id
-      );
-      assert_eq!(
-        written_len(header, entry.offset),
-        Ok(u64::try_from(len).unwrap())
-      );
+      reads_as_listed_and_writes_back(&pack, entry);
     }
   }
+}
+
+/// Holds `entry`'s header in `pack` to its listing: read as listed, its size charged and nothing else, its compressed
+/// data beginning where the header ends, and written back to the very bytes git wrote, as long as `written_len` says.
+fn reads_as_listed_and_writes_back(pack: &Pack, entry: &Listed) {
+  let name = pack.name;
+  let bytes = pack.starting_at(entry);
+  let mut admission = unbounded();
+  let (header, len) = read(bytes, entry.offset, ObjectFormat::Sha1, &mut admission)
+    .unwrap()
+    .unwrap();
+  assert_eq!(header, listed_header(pack, entry), "{name} {:?}", entry.id);
+  assert_eq!(u64::MAX - admission.left(), entry.size, "{name}: charged");
+  assert!(begins_zlib_stream(&bytes[len..]), "{name} {:?}", entry.id);
+  assert_eq!(
+    written(header, entry.offset),
+    bytes[..len],
+    "{name} {:?}",
+    entry.id
+  );
+  assert_eq!(
+    written_len(header, entry.offset),
+    Ok(u64::try_from(len).unwrap())
+  );
 }
 
 /// A-582 part 3 (hostile input: every cut). Do: give the reader every listed header of both packs cut short at each of

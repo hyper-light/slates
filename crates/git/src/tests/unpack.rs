@@ -163,9 +163,12 @@ fn blob_id(format: ObjectFormat, content: &[u8]) -> ObjectId {
   name_of(format, Kind::Blob, content).unwrap()
 }
 
+/// What an object of a pack must read as: where it begins, its type, its content and its delta chain.
+type Expected = (u64, Kind, Vec<u8>, Option<Chain>);
+
 /// The small pack every cut and every bit flip is tried on, in `format`, with what its five objects must read as: a
 /// blob, a commit and a tag stored whole, an offset delta on the blob, and a reference delta on that delta.
-fn small_pack(format: ObjectFormat) -> (Vec<u8>, Vec<(u64, Kind, Vec<u8>, Option<Chain>)>) {
+fn small_pack(format: ObjectFormat) -> (Vec<u8>, Vec<Expected>) {
   let blob: &[u8] = b"hello world\n";
   let edited: &[u8] = b"hello there world\n";
   let edited_again: &[u8] = b"hello there, world!\n";

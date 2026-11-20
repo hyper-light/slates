@@ -461,7 +461,6 @@ fn a_pushed_tree_reads_its_modes_as_gits_tree_walk_does() {
     counters,
     "the pushed tree spans two windows"
   );
-  drop(view);
   push.abandon(&mut store).unwrap();
 }
 
@@ -496,7 +495,6 @@ fn objects_the_view_cannot_give_are_refused_by_kind() {
   let wide_key = ObjectKey::new(&[7_u8; 32]).unwrap();
   assert_eq!(view.blob(wide_key), Err(Unavailable::Missing));
   assert_eq!(view.tree(key(unreadable)), Err(Unavailable::Malformed));
-  drop(view);
   push.abandon(&mut store).unwrap();
 }
 
@@ -584,10 +582,38 @@ fn a_push_read_through_the_store_becomes_the_work_holding_the_clients_bytes() {
     &guide,
     &[],
   );
-  let view = PushedObjects::new(&repository, &store, &first);
+  the_first_push_reads_every_object_once(&store, &repository, &first, &mut green, &one, &guide);
+  commit(&mut store, &mut repository, first, one.head);
+  let mut second = Push::new(ObjectFormat::Sha1);
+  let two = push_branch(
+    &mut store,
+    &repository,
+    &mut second,
+    b"pub fn two() {}\n",
+    &guide,
+    &[one.head],
+  );
+  assert_eq!(two.docs, one.docs, "docs is named by its committed id");
+  let view = PushedObjects::new(&repository, &store, &second);
+  let push = work_push(&green, Some(one.root), two.root, &two.head);
+  the_second_push_reads_only_what_changed(&view, &push, &mut green, &guide);
+  second.abandon(&mut store).unwrap();
+}
+
+/// The first push built through the store's view: every tree and blob read once, through both of the view's paths,
+/// and accepted as version 1 holding the client's bytes and modes.
+fn the_first_push_reads_every_object_once(
+  store: &ContentStore,
+  repository: &Repository,
+  first: &Push,
+  green: &mut Green,
+  one: &BranchPush,
+  guide: &[u8],
+) {
+  let view = PushedObjects::new(repository, store, first);
   let built = work::build(
-    &work_push(&green, None, one.root, &one.head),
-    &green,
+    &work_push(green, None, one.root, &one.head),
+    green,
     &view,
     u64::MAX,
   )
@@ -608,23 +634,19 @@ fn a_push_read_through_the_store_becomes_the_work_holding_the_clients_bytes() {
     matches!(outcome, Outcome::Accepted { version: 1 }),
     "{outcome:?}"
   );
-  assert_eq!(green.content("docs/guide.md"), Some(guide.as_slice()));
+  assert_eq!(green.content("docs/guide.md"), Some(guide));
   assert_eq!(green.mode("run.sh"), Some(0o755));
-  drop(view);
-  commit(&mut store, &mut repository, first, one.head);
-  let mut second = Push::new(ObjectFormat::Sha1);
-  let two = push_branch(
-    &mut store,
-    &repository,
-    &mut second,
-    b"pub fn two() {}\n",
-    &guide,
-    &[one.head],
-  );
-  assert_eq!(two.docs, one.docs, "docs is named by its committed id");
-  let view = PushedObjects::new(&repository, &store, &second);
-  let push = work_push(&green, Some(one.root), two.root, &two.head);
-  let built = work::build(&push, &green, &view, u64::MAX).unwrap();
+}
+
+/// The second push built through `view`: both sides of the root and `src`, the one changed blob, and `docs` not at
+/// all; accepted as version 2 holding the client's bytes and modes.
+fn the_second_push_reads_only_what_changed(
+  view: &PushedObjects<'_>,
+  push: &work::Push<'_>,
+  green: &mut Green,
+  guide: &[u8],
+) {
+  let built = work::build(push, green, view, u64::MAX).unwrap();
   let reads = Reads {
     trees: 4,
     blobs: 1,
@@ -638,8 +660,6 @@ fn a_push_read_through_the_store_becomes_the_work_holding_the_clients_bytes() {
   );
   assert_eq!(green.content("src/lib.rs"), Some(&b"pub fn two() {}\n"[..]));
   assert_eq!(green.content("src/main.rs"), Some(&b"fn main() {}\n"[..]));
-  assert_eq!(green.content("docs/guide.md"), Some(guide.as_slice()));
+  assert_eq!(green.content("docs/guide.md"), Some(guide));
   assert_eq!(green.mode("run.sh"), Some(0o755));
-  drop(view);
-  second.abandon(&mut store).unwrap();
 }

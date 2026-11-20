@@ -1,5 +1,5 @@
 //! One connection's request loop (§4.17.2 "Transports" item 1), a state machine its listener drives: it asks for what
-//! it needs next ([`Connection::next`]), and the listener does that and tells it what happened.
+//! it needs next ([`Connection::next_step`]), and the listener does that and tells it what happened.
 //!
 //! **The loop.** [`Next::Write`] comes first whenever the connection has bytes to send, so it never holds more than one
 //! step's output. Then, by phase: [`Next::Read`] while a head or a body is incomplete; [`Next::Decide`] once a head is
@@ -195,6 +195,9 @@ struct Reply {
   mode: StatusMode,
 }
 
+/// A reply started: its request, whether it is the head alone, and its head's bytes still to be sent.
+type ReplyStart = (Request, bool, Vec<u8>);
+
 /// Where the loop is.
 enum State {
   /// The TLS handshake is running.
@@ -214,8 +217,8 @@ enum State {
     request: Request,
     /// Its framing, being removed.
     reader: BodyReader,
-    /// Its gzip coding, being removed, when it has one.
-    gunzip: Option<Gunzip>,
+    /// Its gzip coding, being removed, when it has one: boxed, its inflate window being most of the state's size.
+    gunzip: Option<Box<Gunzip>>,
     /// The reply to come.
     reply: Reply,
   },
@@ -259,7 +262,7 @@ enum Pending {
   Inflated,
 }
 
-/// What [`Connection::next`] answers, before a body run is lent.
+/// What [`Connection::next_step`] answers, before a body run is lent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
   /// [`Next::Write`].
@@ -346,7 +349,7 @@ impl Connection {
   }
 
   /// What the connection needs next.
-  pub fn next(&mut self) -> Next<'_> {
+  pub fn next_step(&mut self) -> Next<'_> {
     match self.kind() {
       Kind::Write => Next::Write,
       Kind::Read => Next::Read,
@@ -610,7 +613,7 @@ impl Connection {
         return;
       }
     }
-    let gunzip = (request.coding == Coding::Gzip).then(Gunzip::new);
+    let gunzip = (request.coding == Coding::Gzip).then(|| Box::new(Gunzip::new()));
     self.state = State::Body {
       request,
       reader: BodyReader::new(request.framing),
@@ -746,8 +749,9 @@ impl Connection {
   /// The status the service names for its reply's head as its reply begins (the module doc), in place of `200`. Taken
   /// only before any of the reply is sent, and only while a reply is under way: on a route that decides it after the
   /// body ([`StatusMode::AfterBody`]) any status a reply's content may follow, on a streamed route `200` alone, its
-  /// own. Any other (`1xx`, `204`, `205`, `304`, a code outside RFC 9110 §15's classes, or a status other than `200` on
-  /// a streamed route) fails the request `500`, in stages.
+  /// own, and `204` (A-681: a WebDAV `DELETE`'s and an updating `PUT`'s answer), whose head is written with no framing
+  /// field and nothing after it, the service's runs dropped. Any other (`1xx`, `205`, `304`, a code outside RFC 9110
+  /// §15's classes, or a status other than `200` on a streamed route) fails the request `500`, in stages.
   pub fn reply_status(&mut self, status: Status) {
     let State::Reply { reply, .. } = &mut self.state else {
       return;
@@ -756,7 +760,7 @@ impl Connection {
       return;
     }
     let taken = match reply.mode {
-      StatusMode::AfterBody => carries_content(status),
+      StatusMode::AfterBody => carries_content(status) || status.code == NO_CONTENT,
       StatusMode::Streamed => status == Status::OK,
     };
     if taken {
@@ -768,7 +772,7 @@ impl Connection {
 
   /// A reply under way: its request, whether it is the head alone, and its head's bytes when they are still to be sent
   /// (rendered now, the reply then started). `None` off a reply; `Some(Err(_))` where a field cannot be carried.
-  fn begin_reply(&mut self) -> Option<Result<(Request, bool, Vec<u8>), BadField>> {
+  fn begin_reply(&mut self) -> Option<Result<ReplyStart, BadField>> {
     let State::Reply { request, reply } = &mut self.state else {
       return None;
     };
@@ -780,7 +784,11 @@ impl Connection {
       reply.started = true;
       reply.fields = Fields::new();
     }
-    Some(Ok((*request, reply.head_only, head)))
+    Some(Ok((
+      *request,
+      reply.head_only || reply.status.code == NO_CONTENT,
+      head,
+    )))
   }
 
   /// The service's next bytes of its reply: the head before the first, each run chunked (HTTP/1.1) or as it is
@@ -875,6 +883,7 @@ fn rendered(
   out: &mut Vec<u8>,
 ) -> Result<(), BadField> {
   let body = match request.version {
+    _ if status.code == NO_CONTENT => Body::Empty,
     Version::Http11 => Body::Chunked,
     Version::Http10 => Body::UntilClose,
   };

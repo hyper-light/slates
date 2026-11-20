@@ -62,38 +62,7 @@ fn the_store_reads_back_as_the_negotiations_graph() {
   let served = served::served();
   let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
   for object in &served.objects {
-    let node = graph.node(&object.id).unwrap();
-    assert_eq!(graph.id(node), object.id);
-    assert_eq!(graph.kind(node), object.kind);
-    match object.kind {
-      Kind::Blob => assert_eq!(
-        graph.size(node),
-        u64::try_from(object.content.len()).unwrap()
-      ),
-      Kind::Tree => {
-        let tree = Tree::parse(
-          &object.content,
-          ObjectFormat::Sha1,
-          &mut Admission::new(u64::MAX),
-        )
-        .unwrap();
-        let expected: BTreeSet<u64> = tree
-          .entries()
-          .iter()
-          .map(|entry| {
-            graph
-              .node(&entry.object_id(ObjectFormat::Sha1).unwrap())
-              .unwrap()
-          })
-          .collect();
-        assert_eq!(graph.entries(node).collect::<BTreeSet<_>>(), expected);
-      }
-      Kind::Tag => assert_eq!(graph.target(node), graph.node(&id(SECOND))),
-      Kind::Commit => {
-        let tree = ObjectId::from_hex(ObjectFormat::Sha1, &object.content[5..45]).unwrap();
-        assert_eq!(graph.commit(node).unwrap().tree, graph.node(&tree).unwrap());
-      }
-    }
+    reads_back_as_the_pack_holds_it(&graph, object);
   }
   let [first, second, third] = [FIRST, SECOND, THIRD].map(|hex| graph.node(&id(hex)).unwrap());
   let generations = [first, second, third].map(|node| graph.commit(node).unwrap().generation);
@@ -102,6 +71,43 @@ fn the_store_reads_back_as_the_negotiations_graph() {
   assert_eq!(graph.parents(second).collect::<Vec<_>>(), [first]);
   assert_eq!(graph.parents(first).count(), 0);
   assert_eq!(graph.fault(), None);
+}
+
+/// Holds `object` read through `graph` to the pack: its name and node round trip; its kind and blob size; a commit's
+/// root tree; a tree's entries as git's tree parser reads them; the tag's object.
+fn reads_back_as_the_pack_holds_it(graph: &StoreGraph<'_>, object: &crate::unpack::Object) {
+  let node = graph.node(&object.id).unwrap();
+  assert_eq!(graph.id(node), object.id);
+  assert_eq!(graph.kind(node), object.kind);
+  match object.kind {
+    Kind::Blob => assert_eq!(
+      graph.size(node),
+      u64::try_from(object.content.len()).unwrap()
+    ),
+    Kind::Tree => {
+      let tree = Tree::parse(
+        &object.content,
+        ObjectFormat::Sha1,
+        &mut Admission::new(u64::MAX),
+      )
+      .unwrap();
+      let expected: BTreeSet<u64> = tree
+        .entries()
+        .iter()
+        .map(|entry| {
+          graph
+            .node(&entry.object_id(ObjectFormat::Sha1).unwrap())
+            .unwrap()
+        })
+        .collect();
+      assert_eq!(graph.entries(node).collect::<BTreeSet<_>>(), expected);
+    }
+    Kind::Tag => assert_eq!(graph.target(node), graph.node(&id(SECOND))),
+    Kind::Commit => {
+      let tree = ObjectId::from_hex(ObjectFormat::Sha1, &object.content[5..45]).unwrap();
+      assert_eq!(graph.commit(node).unwrap().tree, graph.node(&tree).unwrap());
+    }
+  }
 }
 
 /// A-640 part 1: do ask the graph of the refs and versions. Expect: every ref's head a tip and the annotated tag the
@@ -126,6 +132,13 @@ fn refs_versions_and_fast_forwards_read_as_the_store_kept_them() {
   let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
   let [first, second, third, tag] =
     [FIRST, SECOND, THIRD, TAG].map(|hex| graph.node(&id(hex)).unwrap());
+  tips_and_greens_read_as_kept(&graph, [first, second, third, tag]);
+  fast_forwards_and_what_each_version_brought_read_as_kept(&graph, [second, third]);
+}
+
+/// Every ref's head a tip and the annotated tag the one tag; the greens each commit heads now, with their current
+/// versions; the versions each commit headed.
+fn tips_and_greens_read_as_kept(graph: &StoreGraph<'_>, [first, second, third, tag]: [u64; 4]) {
   assert_eq!(
     graph.tips().collect::<BTreeSet<_>>(),
     BTreeSet::from([third, first, tag])
@@ -136,12 +149,20 @@ fn refs_versions_and_fast_forwards_read_as_the_store_kept_them() {
   assert_eq!(graph.greens_at(second).count(), 0);
   assert_eq!(graph.versions_at(MAIN, first).collect::<Vec<_>>(), [0]);
   assert_eq!(graph.versions_at(SIDE, first).collect::<Vec<_>>(), [0, 2]);
+}
+
+/// Each of `main`'s versions a fast-forward, a rewound one not; and D(k) what the version's head reaches and the head
+/// before did not.
+fn fast_forwards_and_what_each_version_brought_read_as_kept(
+  graph: &StoreGraph<'_>,
+  [second, third]: [u64; 2],
+) {
   assert!(graph.fast_forward(MAIN, 1) && graph.fast_forward(MAIN, 2));
   assert!(graph.fast_forward(SIDE, 1), "first to third fast-forwards");
   assert!(!graph.fast_forward(SIDE, 2), "third back to first rewinds");
   assert!(!graph.fast_forward(MAIN, 0) && !graph.fast_forward(MAIN, 3));
-  let expected: BTreeSet<u64> = reach(&graph, third)
-    .difference(&reach(&graph, second))
+  let expected: BTreeSet<u64> = reach(graph, third)
+    .difference(&reach(graph, second))
     .copied()
     .collect();
   assert_eq!(graph.brought(MAIN, 2).collect::<BTreeSet<_>>(), expected);

@@ -33,11 +33,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use slates_vcs::{ContentStore, IndexRefused};
 
 use super::ChangegroupPart;
+use super::classify::ReadChangeset;
 use super::commit::{Unindexed, keep_one};
 use super::held::IndexHeld;
 use super::verify::{Arrived, Held, LogOf, Unverified, audit};
 use crate::changegroup::{Changegroup, Revision};
-use crate::index::{HgIndex, Log};
+use crate::index::{HgIndex, Log, NONE};
 use crate::read::to_u64;
 use crate::{Admission, NULL_NODE, Node, changeset, delta, filerev, manifest, node};
 
@@ -82,6 +83,9 @@ pub struct Intaken {
   pub kept: u64,
   /// The bytes of the texts kept.
   pub bytes: u64,
+  /// Each log the push kept revisions in, in the order kept, and the number of its first: its kept revisions are the
+  /// fork's from that number on, which its record is written from.
+  pub logs: Vec<(LogOf, u32)>,
 }
 
 /// Whether there is more to take.
@@ -131,6 +135,8 @@ pub struct Intake<'g> {
   manifests: Vec<(Node, Node)>,
   /// The text kept last, and its node: the next revision's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
+  /// Whether the log being taken has kept a revision yet.
+  logged: bool,
   /// What was brought.
   intaken: Intaken,
 }
@@ -157,6 +163,7 @@ impl<'g> Intake<'g> {
       manifest_of: Vec::new(),
       manifests: Vec::new(),
       last: None,
+      logged: false,
       intaken: Intaken::default(),
     })
   }
@@ -184,12 +191,13 @@ impl<'g> Intake<'g> {
     }
   }
 
-  /// The fork and what was brought, once every unit is taken; the intake itself while there is more.
-  pub fn finish(self) -> Result<(HgIndex, Intaken), Self> {
+  /// The fork and what was brought, once every unit is taken; the intake itself (boxed: it is large) while there is
+  /// more.
+  pub fn finish(self) -> Result<(HgIndex, Intaken), Box<Self>> {
     if self.stage == Stage::Done {
       Ok((self.fork, self.intaken))
     } else {
-      Err(self)
+      Err(Box::new(self))
     }
   }
 
@@ -224,6 +232,7 @@ impl<'g> Intake<'g> {
   fn enter(&mut self, stage: Stage) {
     self.brought.clear();
     self.last = None;
+    self.logged = false;
     self.stage = stage;
   }
 
@@ -301,6 +310,15 @@ impl<'g> Intake<'g> {
       link: revision.link,
       text,
     };
+    if !self.logged {
+      let named = log_of(log);
+      admission.charge_items::<(LogOf, u32)>(1)?;
+      if let LogOf::File(path) = &named {
+        admission.charge(to_u64(path.len()))?;
+      }
+      self.intaken.logs.push((named, self.fork.len(store, log)));
+      self.logged = true;
+    }
     keep_one(&mut self.fork, store, log, &arrived, &mut room)?;
     admission.charge_items::<Node>(1)?;
     self.brought.insert(revision.node);
@@ -486,6 +504,42 @@ impl<'g> Intake<'g> {
     self.stage = Stage::FilesPresent(at.saturating_add(1));
     Ok(Stepped::More)
   }
+}
+
+/// The changesets `intaken` brought as their rows in `fork` keep them (A-720 part 2): node, parents, branch and close,
+/// for classifying the push without its texts; each charged to `admission`. `None` where the fork lacks one.
+pub fn read_changesets(
+  fork: &HgIndex,
+  store: &ContentStore,
+  intaken: &Intaken,
+  admission: &mut Admission,
+) -> Result<Option<Vec<ReadChangeset>>, crate::PastAdmission> {
+  admission.charge_items::<ReadChangeset>(intaken.changesets.len())?;
+  let mut read = Vec::with_capacity(intaken.changesets.len());
+  let node_of = |number: u32| match number {
+    NONE => Some(NULL_NODE),
+    number => fork.changeset(store, number).map(|row| row.node),
+  };
+  for node in &intaken.changesets {
+    let Some(row) = fork
+      .rev(store, Log::Changelog, node)
+      .and_then(|rev| fork.changeset(store, rev))
+    else {
+      return Ok(None);
+    };
+    admission.charge(to_u64(row.branch.len()))?;
+    let (Some(p1), Some(p2)) = (node_of(row.p1), node_of(row.p2)) else {
+      return Ok(None);
+    };
+    read.push(ReadChangeset {
+      node: *node,
+      p1,
+      p2,
+      branch: row.branch.to_vec(),
+      closes: row.closed,
+    });
+  }
+  Ok(Some(read))
 }
 
 /// The step that rebuilds a revision's text: its delta applied to its base's text (module docs: the step a later

@@ -303,7 +303,7 @@ pub fn write(header: Header, at: u64, out: &mut impl Out) -> Result<(), Refusal>
   let code = match header.representation {
     Representation::Whole(kind) => kind.pack_number(),
     Representation::OfsDelta { base } => {
-      base_before(at, at.checked_sub(base).unwrap_or(0))?;
+      base_before(at, at.saturating_sub(base))?;
       OBJ_OFS_DELTA
     }
     Representation::RefDelta { .. } => OBJ_REF_DELTA,

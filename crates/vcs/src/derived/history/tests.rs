@@ -411,7 +411,7 @@ impl Grower {
     let (at, tip) = self.tip(one);
     let mut map = self.built.map(tip);
     let path = self.pick_path(two);
-    if map.contains_key(&path) && three % 3 == 0 {
+    if map.contains_key(&path) && three.is_multiple_of(3) {
       map.remove(&path);
     } else {
       set_file(&mut map, &path, Grower::entry(three));
@@ -531,7 +531,7 @@ impl Grower {
     let (ours, theirs) = (self.tips[first], self.tips[second]);
     let map = Grower::merged(&self.built.map(ours), &self.built.map(theirs), three);
     self.tips[first] = self.built.record(&[ours, theirs], map, Sources::new());
-    if three % 5 == 0 {
+    if three.is_multiple_of(5) {
       self.tips.remove(second);
     }
   }
@@ -1578,7 +1578,14 @@ fn t_a666_p2_refusals_by_kind_leave_the_store_as_it_was() {
   ));
   fixture.store.set_budget(BUDGET);
   assert_eq!(state(&fixture.store), before);
-  let root = fixture.roots[index(v2)];
+  assert_questions_refused(&mut fixture, v2, before);
+  fixture.finish();
+}
+
+/// The refusals' questions: `log` of a path naming the reserved name under `version`'s root, and of a root that is
+/// no value (a blob), each refused by its kind with the store left at `before`.
+fn assert_questions_refused(fixture: &mut Fixture, version: u64, before: (usize, u64, u64)) {
+  let root = fixture.roots[index(version)];
   let reserved = log(&mut fixture.store, root, b"a/\0", false, u64::MAX);
   assert_eq!(
     reserved,
@@ -1592,7 +1599,6 @@ fn t_a666_p2_refusals_by_kind_leave_the_store_as_it_was() {
     Err(HistoryRefused::Malformed { node: blob })
   );
   assert_eq!(state(&fixture.store), before);
-  fixture.finish();
 }
 
 /// A-666 part 2, a forged history. Do: put a node of generation 3 whose parent claims generation 5, in a tree under a

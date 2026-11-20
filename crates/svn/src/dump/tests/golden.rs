@@ -287,10 +287,10 @@ impl Replay {
       self.counts.replacements_by_copy += 1;
     }
     assert!(
-      (copy.revision as usize) < self.building(),
+      usize::try_from(copy.revision).unwrap() < self.building(),
       "a copy from its own revision or later"
     );
-    let source = &self.trees[copy.revision as usize];
+    let source = &self.trees[usize::try_from(copy.revision).unwrap()];
     let copied: Vec<(Vec<u8>, Entry)> = source
       .iter()
       .filter(|(existing, _)| at_or_beneath(existing, &copy.path))

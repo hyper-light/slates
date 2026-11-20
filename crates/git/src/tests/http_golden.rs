@@ -289,6 +289,14 @@ fn every_request_git_sent_reads_and_routes_as_git_meant_it() {
 /// 1400 commits (HEAD's wanted twice, as git asks for it).
 #[test]
 fn every_body_git_sent_reads_back_as_git_wrote_it() {
+  length_framed_bodies_read_back_as_sent();
+  chunked_bodies_read_back_as_the_recording_host_hashed_them();
+  the_gzip_fetch_inflates_back();
+}
+
+/// The length-framed bodies, whole: each its data as sent, and whole pkt-lines ending in a flush (the probes a flush
+/// alone).
+fn length_framed_bodies_read_back_as_sent() {
   for (number, length) in [(4, 182), (9, 4), (11, 4)] {
     let body = part(number, "request-body.bin");
     assert_eq!(body.len(), length);
@@ -303,6 +311,11 @@ fn every_body_git_sent_reads_back_as_git_wrote_it() {
     );
   }
   assert_eq!(packets(part(9, "request-body.bin")), vec![Packet::Flush]);
+}
+
+/// The chunked bodies, whole and a byte at a time: each its data as the recording host hashed it, whole pkt-lines, and
+/// the large fetch 1401 wants of 1400 commits.
+fn chunked_bodies_read_back_as_the_recording_host_hashed_them() {
   for number in [10, 12] {
     let raw = part(number, "request-chunked.bin");
     let recorded = String::from_utf8(part(number, "request-data.sha256").to_vec()).unwrap();
@@ -330,6 +343,10 @@ fn every_body_git_sent_reads_back_as_git_wrote_it() {
       assert_eq!((wants.len(), distinct.len()), (1401, 1400));
     }
   }
+}
+
+/// The inflated fetch gzipped again and inflated in cuts: its bytes back, whole pkt-lines.
+fn the_gzip_fetch_inflates_back() {
   let inflated = part(5, "request-inflated.bin");
   assert!(inflated.len() > 1024, "git gzips a request past 1024 bytes");
   let mut encoder = GzEncoder::new(Vec::new(), Compression::default());

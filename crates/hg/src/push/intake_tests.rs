@@ -10,7 +10,7 @@ use super::{Intake, Intaken, Refused, Stepped};
 use crate::bundle2::Bundle2;
 use crate::fixtures::CG03;
 use crate::index::{HgIndex, Log};
-use crate::push::commit::fork_with;
+use crate::push::commit::{Unindexed, fork_with};
 use crate::push::verify::{Held, Unverified, Verified, verify};
 use crate::push::{ChangegroupPart, read};
 use crate::{Admission, Node};
@@ -67,7 +67,7 @@ fn intake(
       Ok(Stepped::More) => {}
       Ok(Stepped::Done) => break,
       Err(refused) => {
-        intake.abandon(store).unwrap();
+        intake.abandon(store).map_err(Unindexed::Fork)?;
         return Err(refused);
       }
     }
@@ -184,4 +184,35 @@ fn a_refused_intake_leaves_the_index_and_the_store_as_they_were() {
   );
   assert_eq!(index.len(&store, Log::Changelog), 0);
   assert_eq!(store.len(), 0, "a refused intake kept a hold");
+}
+
+/// A-720 part 2 (the record from the fork). Do: take stock 7.2's bundle through the intake, then write its record from
+/// the fork (`record::write_kept`) and from the whole verification (`record::write_push`), and read its changesets back
+/// from the fork's rows. Expect the two records equal byte for byte, and each changeset read back with the parents and
+/// branch its text names.
+#[test]
+fn the_record_and_the_changesets_read_from_the_fork_are_the_whole_verifications() {
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  let verified = verify(&part, &Nothing, &mut room()).unwrap();
+  let from_fork = crate::import::record::write_kept(&fork, &store, &intaken.logs, 1 << 20).unwrap();
+  let whole = crate::import::record::write_push(&verified, 1 << 20).unwrap();
+  assert_eq!(from_fork, whole);
+  let read = super::read_changesets(&fork, &store, &intaken, &mut room())
+    .unwrap()
+    .unwrap();
+  for (read, arrived) in read.iter().zip(&verified.changesets) {
+    let text = crate::changeset::decode(&arrived.text).unwrap();
+    let (branch, closes) = crate::import::branch_of(&text, &mut room()).unwrap();
+    assert_eq!(
+      (read.node, read.p1, read.p2),
+      (arrived.node, arrived.p1, arrived.p2)
+    );
+    assert_eq!((read.branch.clone(), read.closes), (branch, closes));
+  }
+  assert_eq!(read.len(), verified.changesets.len());
+  fork.release(&mut store).unwrap();
+  index.release(&mut store).unwrap();
 }

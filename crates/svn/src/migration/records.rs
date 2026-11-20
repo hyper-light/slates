@@ -237,7 +237,7 @@ impl Repository {
   }
 
   /// Commits `record` as the commit step commits it (A-652 part 3): a revision checked and applied
-  /// ([`Repository::commit`]), the UUID set, a revision's properties set whole. A creation is refused: a repository is
+  /// ([`Repository::commit`]), the UUID set, a revision's properties set whole, a lock verb's lock entries applied. A creation is refused: a repository is
   /// made by its creation's record once ([`Repository::new`]). What a caller that holds the records alone commits an
   /// import's records through, and what a recovery replays every record after the creation's through.
   ///
@@ -255,6 +255,7 @@ impl Repository {
         properties,
       } => self.set_revision_properties(revision, properties),
       Record::Revision(revision) => self.commit(revision).map(drop),
+      Record::Locks(entries) => self.apply_lock_entries(&entries),
     }
   }
 

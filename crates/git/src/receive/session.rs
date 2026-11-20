@@ -68,6 +68,10 @@ pub struct Session<'s, H> {
   /// The first object of the pack git's checks refuse, found as each object was kept (A-719 part 3:
   /// its bytes in hand, so the checks after the pack read none of them again for this).
   refused: Option<(ObjectId, crate::objects::FsckId)>,
+  /// The pack's bytes as the client sent them, compressed and with its deltas, charged to the admission as they arrive
+  /// (A-723): what the push's record keeps durably in place of its objects inflated, taken once by the caller
+  /// ([`Session::take_pack`]).
+  pack: Vec<u8>,
 }
 
 impl<'s, H: HiddenRefs> Session<'s, H> {
@@ -79,6 +83,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       state: State::Request(RequestReader::new(advertised)),
       held: Held::default(),
       refused: None,
+      pack: Vec::new(),
     }
   }
 
@@ -152,6 +157,10 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     let State::Pack { reader, .. } = &mut self.state else {
       return Ok(false);
     };
+    admission
+      .charge(crate::to_u64(rest.len()))
+      .map_err(Refusal::PastAdmission)?;
+    self.pack.extend_from_slice(rest);
     let mut fscking = Fscking {
       site: &mut *site,
       format: self.advertised.format,
@@ -277,6 +286,12 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       return Ok(None);
     };
     decide(checked, contents, judge, admission).map(Some)
+  }
+
+  /// The pack's bytes as the client sent them (A-723), taken once: the caller's record keeps them durably, compressed and
+  /// with their deltas, so a push's objects are never recorded inflated. Empty when no pack was sent, or once taken.
+  pub fn take_pack(&mut self) -> Vec<u8> {
+    core::mem::take(&mut self.pack)
   }
 
   /// Whether the push is answered, or was refused.

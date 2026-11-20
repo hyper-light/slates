@@ -1196,9 +1196,9 @@ mod tests {
   /// A-293 (the workload roster over Linux FUSE, Ada's goal of 2026-11-18). Do: open the workloads cell's session on
   /// the Linux FUSE transport as `conformance run --suite workloads` opens it, its reach taken from the capability
   /// table, as a user with no root; write a file through the mount and give it a second name, as a local git or
-  /// Mercurial clone links its objects. Expect: the kernel lists the session's mount as a FUSE mount (no NFS
-  /// adapter), the file reads back through its second name, and both names report two links. Skips loudly without a
-  /// built CLI or `fusermount3`.
+  /// Mercurial clone links its objects. Expect: the fsx and fsstress cells take the same reach (goal 226), the kernel
+  /// lists the session's mount as a FUSE mount (no NFS adapter), the file reads back through its second name, and both
+  /// names report two links. Skips loudly without a built CLI or `fusermount3`.
   #[cfg(target_os = "linux")]
   #[test]
   #[allow(clippy::unwrap_used)]
@@ -1234,6 +1234,10 @@ mod tests {
       Reach::Own,
       "the table names no adapter for the cell"
     );
+    // fsx and fsstress reach the volume the same way (goal 226): the mount made below is theirs too.
+    for suite in [Suite::Fsx, Suite::Fsstress] {
+      assert_eq!(Reach::of(transport, suite), Reach::Own, "{suite:?}");
+    }
     let session = Session::open_with(
       &run,
       SlatesBinary::at(PathBuf::from(binary)),

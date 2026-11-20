@@ -122,6 +122,7 @@ impl<'a> Reader<'_, 'a> {
         Some(value) => Field::Boolean(value),
         None => return Ok(Step::Mismatch),
       },
+      // Format: `marshal.c` `vparse_tuple`'s `3`, a tristate, read from a word as `b` is.
       (b'3', Value::Word(word)) => match truth(word) {
         Some(value) => Field::Tristate(Some(value)),
         None => return Ok(Step::Mismatch),
@@ -161,6 +162,7 @@ fn absent(code: u8) -> Option<Field<'static>> {
     b'c' | b's' => Field::String(None),
     b'w' => Field::Word(None),
     b'b' => Field::Boolean(false),
+    // Format: an absent `3` is `svn_tristate_unknown` (`marshal.c` `vparse_tuple`).
     b'3' => Field::Tristate(None),
     b'r' => Field::Revision(None),
     b'n' => Field::Number(None),

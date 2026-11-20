@@ -29,12 +29,14 @@
 use core::mem::size_of;
 
 use slates_db::catalog::RepositoryId;
+use slates_hg::index::HgIndex;
 use slates_hg::phases::{Phase, PhaseHead};
 use slates_hg::push::Outcome;
 use slates_hg::push::held::IndexHeld;
 use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, Node, PastAdmission};
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
+use slates_vcs::ContentStore;
 
 use crate::repository::hg_push::{self, BOOKMARK_TAG, Pushing, bookmark_of};
 use crate::state::ShardState;
@@ -68,36 +70,28 @@ impl HgStores for ServedViews {
     crate::state::with_state(|state| lend_in(state, id, room, step)).flatten()
   }
 
-  fn push(
+  async fn push(
     &mut self,
     id: RepositoryId,
     pushing: Pushing<'_>,
     room: &mut Admission,
   ) -> Option<Outcome> {
-    crate::state::with_state(|state| push_in(state, id, pushing, room)).flatten()
+    if !crate::state::with_state(|state| held(state, id)).unwrap_or(false) {
+      return None;
+    }
+    let outcome = hg_push::unbundle(id, pushing, room).await;
+    if outcome.is_none() {
+      crate::state::with_state(|state| {
+        crate::fleet::count_refusal_in(state, UNMADE);
+      })
+      .unwrap_or_default();
+    }
+    outcome
   }
 
-  fn push_room(&self) -> Option<u64> {
-    crate::state::with_state(|state| crate::git_push::push_room(state))
+  fn push_room(&self, id: RepositoryId) -> Option<u64> {
+    crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes)
   }
-}
-
-/// Lands a push on repository `id` over what `state` holds now (module docs, "Pushes"); none when it is not lent, an
-/// unmade view counted.
-fn push_in(
-  state: &mut ShardState,
-  id: RepositoryId,
-  pushing: Pushing<'_>,
-  room: &mut Admission,
-) -> Option<Outcome> {
-  if !held(state, id) {
-    return None;
-  }
-  let outcome = hg_push::unbundle(state, id, pushing, room);
-  if outcome.is_none() {
-    crate::fleet::count_refusal_in(state, UNMADE);
-  }
-  outcome
 }
 
 /// Whether repository `id`'s Mercurial store is held here with no import filling it.
@@ -141,6 +135,28 @@ pub(crate) fn with_view<R>(
   };
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   Some(step(&view, IndexHeld::new(&store.index, content), room))
+}
+
+/// [`with_view`] with the texts read through `over` where it is given (A-720: a push's fork, which holds the
+/// repository's revisions and the push's), the served view still the store's index as it is; `step` is handed the
+/// content store too.
+pub(crate) fn with_view_over<R>(
+  shard: &ShardState,
+  id: RepositoryId,
+  over: Option<&HgIndex>,
+  room: &mut Admission,
+  step: impl for<'s> FnOnce(&Indexed<'s>, IndexHeld<'s>, &'s ContentStore, &mut Admission) -> R,
+) -> Option<R> {
+  let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
+  let (roots, bookmarks) = register_of(shard, id, room).ok()?;
+  let read = State {
+    roots: &roots,
+    bookmarks: &bookmarks,
+    publishing: PUBLISHING,
+  };
+  let view = Indexed::new(&store.index, content, read, room).ok()?;
+  let held = IndexHeld::new(over.unwrap_or(&store.index), content);
+  Some(step(&view, held, content, room))
 }
 
 /// `count` values of `T` charged to `room`, before they are made.

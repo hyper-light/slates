@@ -97,34 +97,40 @@ fn every_object_is_named_as_stock_git_names_it_in_both_formats() {
     let golden = golden(format);
     assert_eq!(golden.len(), 5, "{format:?}: four types and the empty blob");
     for (kind, content, name) in golden {
-      assert_eq!(
-        name_of(format, kind, content),
-        Ok(name),
-        "{format:?} {kind:?}"
-      );
-      let mut hasher = Hasher::object(
-        format,
-        Header {
-          kind,
-          size: u64::try_from(content.len()).unwrap(),
-        },
-      );
-      for byte in content {
-        hasher.update(core::slice::from_ref(byte));
-      }
-      assert_eq!(
-        hasher.finish(),
-        Ok(name),
-        "{format:?} {kind:?}, fed a byte at a time"
-      );
-      let hex = name.to_string();
-      assert_eq!(hex.len(), format.hex_len());
-      assert_eq!(hex, hex.to_ascii_lowercase());
-      assert_eq!(ObjectId::from_hex(format, hex.as_bytes()), Ok(name));
-      assert_eq!(name.as_bytes().len(), format.raw_len());
-      assert_eq!(name.format(), format);
+      named_as_stock_git_named_it(format, kind, content, name);
     }
   }
+}
+
+/// Holds `content` of `kind` to being named `name` in `format`, at once and fed a byte at a time, and `name` to being
+/// written back as git writes it, in lower-case hexadecimal of the format's length.
+fn named_as_stock_git_named_it(format: ObjectFormat, kind: Kind, content: &[u8], name: ObjectId) {
+  assert_eq!(
+    name_of(format, kind, content),
+    Ok(name),
+    "{format:?} {kind:?}"
+  );
+  let mut hasher = Hasher::object(
+    format,
+    Header {
+      kind,
+      size: u64::try_from(content.len()).unwrap(),
+    },
+  );
+  for byte in content {
+    hasher.update(core::slice::from_ref(byte));
+  }
+  assert_eq!(
+    hasher.finish(),
+    Ok(name),
+    "{format:?} {kind:?}, fed a byte at a time"
+  );
+  let hex = name.to_string();
+  assert_eq!(hex.len(), format.hex_len());
+  assert_eq!(hex, hex.to_ascii_lowercase());
+  assert_eq!(ObjectId::from_hex(format, hex.as_bytes()), Ok(name));
+  assert_eq!(name.as_bytes().len(), format.raw_len());
+  assert_eq!(name.format(), format);
 }
 
 /// A-600 (git's `sha1dc_git.c`: detection on, the safe hash off; `t/t0013-sha1dc.sh`). Do: hash git's own t0013

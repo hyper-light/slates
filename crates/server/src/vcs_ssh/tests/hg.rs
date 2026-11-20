@@ -49,7 +49,7 @@ use crate::state::ShardState;
 use crate::vcs_http::Bounds;
 use crate::vcs_http::git::{Located, Repositories, StoreLender, ThisShard};
 use crate::vcs_http::hg::HgStores;
-use crate::vcs_store::hg_view::{self, ServedViews};
+use crate::vcs_store::hg_view::ServedViews;
 use crate::vcs_store::upload::ShardStores;
 
 /// Shape: the repository whose store the tests' lender holds.
@@ -345,7 +345,7 @@ impl HgStores for Lends {
   }
 
   /// A push is answered with what reached the lender ([`echoed`]): a reply whose one `output` part holds it.
-  fn push(
+  async fn push(
     &mut self,
     id: RepositoryId,
     pushing: Pushing<'_>,
@@ -408,7 +408,7 @@ impl StoreLender for NoGit {
     false
   }
 
-  fn room(&mut self) -> Option<u64> {
+  fn room(&mut self, _repository: RepositoryId) -> Option<u64> {
     None
   }
 
@@ -1013,11 +1013,8 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
   };
   let mut room = slates_hg::Admission::new(u64::MAX);
   let terms = (false, HISTORY_PUSH, PUSH_ROOM);
-  let prepared = hg_view::with_view(state, id, &mut room, |view, held, room| {
-    hg_push::prepare(state, id, &unbundle, (view, &held), terms, room)
-  })
-  .expect("the empty repository's view")
-  .expect("the history prepared");
+  let prepared =
+    hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
   let landed = hg_push::land(state, (&owner(), id), prepared, &mut room);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),

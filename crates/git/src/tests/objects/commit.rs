@@ -24,35 +24,45 @@ fn a_commit_is_read_header_by_header_and_written_back_byte_for_byte() {
   for format in FORMATS {
     let golden = golden(format, "ok-commit-merge");
     let commit = Commit::parse(golden.bytes, &mut ample()).unwrap();
-    assert_eq!(
-      commit.tree(format),
-      Some(super::golden(format, "ok-tree").id)
-    );
-    let parents: Vec<_> = commit.parents(format).collect();
-    assert_eq!(parents.len(), 2);
-    assert_eq!(parents[0], super::golden(format, "ok-commit-root").id);
-    assert_eq!(Ident::parse(commit.author().unwrap()), Ok(AUTHOR));
-    let committer = Ident::parse(commit.committer().unwrap()).unwrap();
-    assert_eq!(
-      (committer.name, committer.email),
-      (&b"C O Mitter"[..], &b"committer@example.com"[..])
-    );
-    assert_eq!(commit.message(), Some(&b"merge\n"[..]));
-    assert_eq!(commit.encoding(), None);
-    assert_eq!(commit.extra_headers().count(), 0);
-    let mut written = Vec::new();
-    commit.write(&mut written);
-    assert_eq!(written, golden.bytes);
-    let other = match format {
-      ObjectFormat::Sha1 => ObjectFormat::Sha256,
-      ObjectFormat::Sha256 => ObjectFormat::Sha1,
-    };
-    assert_eq!(
-      commit.tree(other),
-      None,
-      "an id of the other format's length is no id"
-    );
+    merge_reads_header_by_header(format, &commit);
+    merge_writes_back_byte_for_byte(format, &commit, golden.bytes);
   }
+}
+
+/// The merge's tree, its two parents in order, its author and committer in their parts, and its message.
+fn merge_reads_header_by_header(format: ObjectFormat, commit: &Commit<'_>) {
+  assert_eq!(
+    commit.tree(format),
+    Some(super::golden(format, "ok-tree").id)
+  );
+  let parents: Vec<_> = commit.parents(format).collect();
+  assert_eq!(parents.len(), 2);
+  assert_eq!(parents[0], super::golden(format, "ok-commit-root").id);
+  assert_eq!(Ident::parse(commit.author().unwrap()), Ok(AUTHOR));
+  let committer = Ident::parse(commit.committer().unwrap()).unwrap();
+  assert_eq!(
+    (committer.name, committer.email),
+    (&b"C O Mitter"[..], &b"committer@example.com"[..])
+  );
+  assert_eq!(commit.message(), Some(&b"merge\n"[..]));
+  assert_eq!(commit.encoding(), None);
+  assert_eq!(commit.extra_headers().count(), 0);
+}
+
+/// The merge written back as `bytes`, and no tree read from it in the other format.
+fn merge_writes_back_byte_for_byte(format: ObjectFormat, commit: &Commit<'_>, bytes: &[u8]) {
+  let mut written = Vec::new();
+  commit.write(&mut written);
+  assert_eq!(written, bytes);
+  let other = match format {
+    ObjectFormat::Sha1 => ObjectFormat::Sha256,
+    ObjectFormat::Sha256 => ObjectFormat::Sha1,
+  };
+  assert_eq!(
+    commit.tree(other),
+    None,
+    "an id of the other format's length is no id"
+  );
 }
 
 /// A-590 (gitformat-signature; commit.c's `parse_buffer_signed_by_header`; t1450 "commit with multiple signatures is

@@ -1027,8 +1027,9 @@ fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
 
 /// A-719 part 3 (§4.17.1 "A push's intake", rule 1). Do: push a create of `main` at a commit whose one file is a
 /// mebibyte, handing the driver its request a piece at a time, then answer it. Expect: once its bytes are all taken,
-/// the file in the push's quarantine and the push's admission holding less than a sixteenth of the file (each object's
-/// bytes given back once the quarantine took it); then `main` created.
+/// the file in the push's quarantine and the push's admission holding the pack as sent (A-723's record) and less than
+/// a sixteenth of the file beside it (each object's bytes given back once the quarantine took it); then `main`
+/// created.
 #[test]
 fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
   crate::daemon::audit_on_shard(|state| {
@@ -1045,7 +1046,12 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
       .as_ref()
       .and_then(|quarantine| quarantine.quarantine().object(&blob));
     assert!(quarantined.is_some(), "the file is not in the quarantine");
-    assert!(held < (LARGE as u64) / 16, "the push holds {held} bytes");
+    // The pack as the client sent it is the record's (A-723); nothing inflated is held beside it.
+    let sent = request.len() as u64;
+    assert!(
+      held < sent + (LARGE as u64) / 16,
+      "the push holds {held} bytes of a {sent}-byte request"
+    );
     push.end(state).expect("ended");
     let mut answer = Vec::new();
     let received = loop {
@@ -1056,5 +1062,55 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
       }
     };
     assert_eq!(reasons(&received), [b"ok"]);
+  });
+}
+
+/// A-724 piece 1 (§4.17.5 "What a repository costs, counted"). Do: push stock git's fixture pushes into one repository
+/// while a second repository on the same shard is left alone. Expect: the pushed repository's usage row counts every
+/// push begun and answered, every byte the client sent, and steps that took the shard's time, with its owner the one
+/// principal named for all of them; the idle repository has no row.
+#[test]
+fn t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row() {
+  crate::daemon::audit_on_shard(|state| {
+    let pushed_to = git_repository(state, "pushed");
+    let idle = git_repository(state, "idle");
+    let mut sent = 0u64;
+    for (scenario, _) in chain() {
+      let (_, mut push) = started(state, pushed_to);
+      answered(state, &mut push, scenario.request);
+      sent += u64::try_from(scenario.request.len()).unwrap();
+    }
+    let pushes = u64::try_from(chain().len()).unwrap();
+    let usage = state
+      .vcs_usage
+      .usage(&pushed_to)
+      .expect("a row for the pushed repository");
+    assert_eq!(
+      (
+        usage.intake.begun,
+        usage.intake.answered,
+        usage.intake.bytes_in
+      ),
+      (pushes, pushes, sent)
+    );
+    assert!(
+      usage.intake.steps >= pushes,
+      "every push takes steps: {usage:?}"
+    );
+    assert!(
+      usage.intake.step_ns > 0,
+      "the steps took the shard's time: {usage:?}"
+    );
+    assert_eq!(usage.fetch, slates_vcs::WorkUsage::default());
+    let named: Vec<_> = usage
+      .principals()
+      .iter()
+      .map(|slot| (slot.principal.clone(), slot.count, slot.overstated))
+      .collect();
+    assert_eq!(named, vec![(owner(), pushes, 0)]);
+    assert!(
+      state.vcs_usage.usage(&idle).is_none(),
+      "the idle repository was counted"
+    );
   });
 }

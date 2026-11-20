@@ -673,9 +673,12 @@ fn ended_through_another_branch(lines: &[LineRead], after: &View) -> bool {
   })
 }
 
+/// A changeset made by hand: its parents (earlier indices), its branch, and whether it closes it.
+type ByHand<'b> = ([Option<usize>; 2], &'b [u8], bool);
+
 /// A history made by hand: each changeset's parents (earlier indices), branch and close, the first `old` the view's,
 /// every one of the view's public.
-fn made(changesets: &[([Option<usize>; 2], &[u8], bool)], old: usize) -> (Whole, View) {
+fn made(changesets: &[ByHand<'_>], old: usize) -> (Whole, View) {
   let mut whole = Whole {
     old,
     ..Whole::default()
@@ -959,7 +962,7 @@ fn bookmarks_move_as_7_2_moves_them() {
   };
   let plan = classify(
     &unbundle,
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &marks),
     false,
@@ -972,7 +975,7 @@ fn bookmarks_move_as_7_2_moves_them() {
     .push(part(3, pushkey(b"bookmarks", b"m", (&hex([1; 20]), b""))));
   let refused = classify(
     &unbundle,
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &marks),
     false,
@@ -1038,7 +1041,7 @@ fn phases_move_only_toward_public_as_7_2_moves_them() {
   };
   let plan = classify(
     &unbundle,
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &[]),
     false,
@@ -1063,7 +1066,7 @@ fn phases_move_only_toward_public_as_7_2_moves_them() {
   };
   let refused = classify(
     &unknown,
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &[]),
     false,
@@ -1096,7 +1099,7 @@ fn a_divergent_bookmark_is_refused_in_7_2s_words() {
   };
   let divergent = classify(
     &named(b"a@b", [2; 20]),
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &[]),
     false,
@@ -1111,7 +1114,7 @@ fn a_divergent_bookmark_is_refused_in_7_2s_words() {
   );
   let unknown = classify(
     &named(b"a@", [7; 20]),
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &[]),
     false,

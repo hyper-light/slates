@@ -294,39 +294,80 @@ fn is_out_of_line_test_module(path: &Path) -> bool {
     .any(|candidate| {
       std::fs::read_to_string(candidate).is_ok_and(|source| declared_under_cfg_test(&source, &name))
     })
+    || is_test_module_by_path(path, &file_name.to_string_lossy())
+}
+
+/// Whether a file beside `path` declares it, by `#[path = "<file_name>"]`, as a module under `#[cfg(test)]`
+/// (`#[cfg(test)] #[path = "getbundle_tests.rs"] mod tests;` in `crates/hg/src/serve/getbundle.rs`): a module's
+/// `#[path]` is read from the directory of the file declaring it. Until 2026-11-20 only a file named for its module was
+/// seen, and hg's seven `*_tests.rs` files read as 125 tuning literals.
+fn is_test_module_by_path(path: &Path, file_name: &str) -> bool {
+  let Some(Ok(siblings)) = path.parent().map(std::fs::read_dir) else {
+    return false;
+  };
+  siblings
+    .filter_map(Result::ok)
+    .map(|entry| entry.path())
+    .filter(|candidate| {
+      candidate.as_path() != path && candidate.extension().is_some_and(|ext| ext == "rs")
+    })
+    .any(|candidate| {
+      std::fs::read_to_string(&candidate)
+        .is_ok_and(|source| declared_by_path_under_cfg_test(&source, file_name))
+    })
 }
 
 /// Whether `source` declares the module `name` out of line (`mod name;`, any visibility) under a `#[cfg(...)]` that
 /// names `test` and not `not(test)`, with only attributes, comments and blank lines between: the same lexical reading
 /// [`lines_with_test_flag`] gives an inline test module.
 fn declared_under_cfg_test(source: &str, name: &str) -> bool {
+  out_of_line_cfg_test_modules(source).any(|(_, module)| module == name)
+}
+
+/// Whether `source` declares a module out of line under `#[cfg(test)]` (read as [`declared_under_cfg_test`] reads it)
+/// whose `#[path = "..."]` is `file_name`.
+fn declared_by_path_under_cfg_test(source: &str, file_name: &str) -> bool {
+  out_of_line_cfg_test_modules(source).any(|(path, _)| path == Some(file_name))
+}
+
+/// The modules `source` declares out of line under a `#[cfg(...)]` naming `test` and not `not(test)`, each with the
+/// `#[path = "..."]` among its attributes, if any.
+fn out_of_line_cfg_test_modules(source: &str) -> impl Iterator<Item = (Option<&str>, &str)> {
   let mut armed = false;
-  for line in source.lines() {
+  let mut path_attr = None;
+  source.lines().filter_map(move |line| {
     let trimmed = line.trim_start();
     if trimmed.starts_with("#[cfg(") {
       armed = trimmed.contains("test") && !trimmed.contains("not(test");
-      continue;
+      return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("#[path") {
+      path_attr = rest.split('"').nth(1);
+      return None;
     }
     if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
-      continue;
+      return None;
     }
-    if armed {
-      let declared = trimmed
-        .trim_start_matches("pub(crate) ")
-        .trim_start_matches("pub(super) ")
-        .trim_start_matches("pub ");
-      if declared
-        .strip_prefix("mod ")
-        .and_then(|rest| rest.strip_suffix(';'))
-        .map(str::trim)
-        == Some(name)
-      {
-        return true;
-      }
-    }
+    let module = without_visibility(trimmed)
+      .strip_prefix("mod ")
+      .and_then(|rest| rest.strip_suffix(';'))
+      .map(str::trim)
+      .filter(|_| armed)
+      .map(|module| (path_attr, module));
     armed = false;
-  }
-  false
+    path_attr = None;
+    module
+  })
+}
+
+/// An item's line without its visibility (`pub`, `pub(crate)`, `pub(super)`), so `pub(crate) mod tests {` reads as
+/// a module as `mod tests {` does (2026-11-20: `crates/server/src/hg_base.rs`'s `pub(crate) mod tests` read as
+/// production code, its fixtures as 21 tuning literals).
+fn without_visibility(line: &str) -> &str {
+  line
+    .trim_start_matches("pub(crate) ")
+    .trim_start_matches("pub(super) ")
+    .trim_start_matches("pub ")
 }
 
 /// Splits a source file into lines, marking the ones inside a `#[cfg(test)]` module.
@@ -343,7 +384,7 @@ fn lines_with_test_flag(source: &str) -> Vec<(usize, &str, bool)> {
     let trimmed = line.trim_start();
     if trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
       armed = true;
-    } else if armed && trimmed.starts_with("mod ") {
+    } else if armed && without_visibility(trimmed).starts_with("mod ") {
       in_test = true;
       armed = false;
       depth = 0;
@@ -1031,7 +1072,44 @@ mod structural {
 
   #[cfg(test)]
   mod out_of_line_test_modules {
-    use crate::declared_under_cfg_test;
+    use crate::{declared_by_path_under_cfg_test, declared_under_cfg_test, lines_with_test_flag};
+
+    /// 2026-11-20 (R3). Do: mark the lines of an inline test module declared with a visibility, then a production item
+    /// after it. Expect: the module's lines are test code and the item's are not.
+    #[test]
+    fn an_inline_test_module_with_a_visibility_is_test_code() {
+      let source =
+        "#[cfg(test)]\npub(crate) mod tests {\n  const N: u32 = 9;\n}\nconst M: u32 = 9;\n";
+      let flags: Vec<bool> = lines_with_test_flag(source)
+        .into_iter()
+        .map(|(_, _, in_test)| in_test)
+        .collect();
+      assert_eq!(flags, vec![false, true, true, true, false]);
+    }
+
+    /// 2026-11-20 (R3). Do: read declaring files that put a module under `#[cfg(test)]` with a `#[path]` naming a file,
+    /// before or after the `cfg`, and files whose `#[path]` module is not under `cfg(test)` or names another file.
+    /// Expect: only the first two declare that file a test module.
+    #[test]
+    fn a_module_whose_path_names_the_file_under_cfg_test_is_test_code() {
+      let file = "getbundle_tests.rs";
+      assert!(declared_by_path_under_cfg_test(
+        "#[cfg(test)]\n#[path = \"getbundle_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+      assert!(declared_by_path_under_cfg_test(
+        "#[path = \"getbundle_tests.rs\"]\n#[cfg(test)]\nmod tests;\n",
+        file
+      ));
+      assert!(!declared_by_path_under_cfg_test(
+        "#[path = \"getbundle_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+      assert!(!declared_by_path_under_cfg_test(
+        "#[cfg(test)]\n#[path = \"other_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+    }
 
     /// 2026-11-19 (R3, A-500). Do: read declaring files that put `tests` under `#[cfg(test)]` out of line, with an
     /// attribute between and with a visibility, and files that declare it plainly, under `cfg(not(test))`, after a
@@ -1420,6 +1498,12 @@ mod literals {
       let tuple_field = i > 1
         && bytes[i - 1] == b'.'
         && (bytes[i - 2].is_ascii_alphanumeric() || matches!(bytes[i - 2], b'_' | b')' | b']'));
+      // A character literal's digit (`b'9'`, `'3'`) is a character, never a quantity.
+      let char_literal = i > 0 && bytes[i - 1] == b'\'' && bytes.get(i + 1) == Some(&b'\'');
+      if c.is_ascii_digit() && char_literal {
+        i += 1;
+        continue;
+      }
       if c.is_ascii_digit() && tuple_field {
         while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
           i += 1;
@@ -1510,6 +1594,7 @@ mod literals {
     #[test]
     fn a_tuple_fields_index_is_a_position_not_a_literal() {
       assert!(numeric_literals("top.3 = true; pair.0.1; f().4; v[i].5").is_empty());
+      assert!(numeric_literals("b'0'..=b'9' => d, '3' => t").is_empty());
       assert_eq!(
         numeric_literals("let r = 0..7; let x = 3.5;"),
         vec!["0", "7", "3.5"]

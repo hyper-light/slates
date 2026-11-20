@@ -65,6 +65,7 @@
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_svn::commit::drive::{Due, Green, Work};
 use slates_svn::handshake::{self, Access, Repository, Unserved as Refusal};
+use slates_svn::lock::LockEntry;
 use slates_svn::ra_svn::ItemError;
 use slates_svn::reads;
 use slates_svn::report::{self, exchange::Budget};
@@ -88,6 +89,8 @@ const STORE_NOT_HELD: &str = "vcs_ssh.svn_store_not_held";
 const NO_ACCESS: &str = "vcs_ssh.svn_no_access";
 /// Format: the refusal count of a tunnel ended with no words: where `svnserve` aborts, or on the tunnel's own error.
 const UNWORDED_END: &str = "vcs_ssh.svn_unworded_end";
+/// Format: `SVN_ERR_FS_LOCK_OPERATION_FAILED` (`svn_error_codes.h`: the filesystem category's start, 160,000, plus 59).
+const LOCK_OPERATION_FAILED: u32 = 160_059;
 /// Format: the refusal count of an accepted work the owner's commit step refused.
 const COMMIT_REFUSED: &str = "vcs_ssh.svn_commit_refused";
 
@@ -163,6 +166,14 @@ pub(crate) trait SvnStores {
     principal: &Principal,
     work: Work,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>>;
+  /// Lands the lock `entries` a lock verb by `principal` made on repository `id` through the owner's step (a
+  /// `Record::Locks`, A-693 part 2): whether they landed; none when its store is not held here.
+  fn land_locks(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    entries: Vec<LockEntry>,
+  ) -> Option<Result<(), svn_commit::Uncommitted>>;
   /// Runs `step` over repository `id`'s sources at the owner's instant; none when its store is not held here.
   fn lend<T>(
     &mut self,
@@ -327,6 +338,8 @@ enum Received {
   Key(usize),
   /// The client asked for a commit.
   CommitAsked(usize),
+  /// The client asked for a lock verb.
+  LockAsked(usize),
   /// The commit's drive waits for a hook.
   Hook {
     /// The hook.
@@ -365,6 +378,7 @@ impl Received {
       Turn::ChallengeNeeded { consumed } => Received::Challenge(consumed),
       Turn::KeyNeeded { consumed, .. } => Received::Key(consumed),
       Turn::CommitAsked { consumed } => Received::CommitAsked(consumed),
+      Turn::LockAsked { consumed } => Received::LockAsked(consumed),
       Turn::Hook { due, consumed } => Received::Hook { due, consumed },
       Turn::Accepted { work, consumed } => Received::Accepted { work, consumed },
     }
@@ -425,6 +439,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       }
       Received::CommitAsked(consumed) => {
         self.begin_commit();
+        consumed
+      }
+      Received::LockAsked(consumed) => {
+        self.lock_verb();
         consumed
       }
       Received::Hook { due, consumed } => {
@@ -562,6 +580,54 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       Ok(()) => self.ends_with(code, &message),
       Err(refused) => self.end(refused),
     }
+  }
+
+  /// Judges the lock verb the client asked for over the lent sources, lands its entries through the owner's step and
+  /// answers it (A-693 part 2): each new token drawn from the system's generator, one it cannot give refusing the
+  /// landing; the table holding at most as many locks as one item has bytes.
+  fn lock_verb(&mut self) {
+    let Some(id) = self.opened.as_ref().map(|record| record.id) else {
+      return self.not_held();
+    };
+    let room = self.bounds.limits.item_bytes;
+    let undrawn = std::cell::Cell::new(false);
+    let mut draw = || {
+      let mut token = [0u8; slates_svn::lock::UUID_BYTES];
+      if aws_lc_rs::rand::fill(&mut token).is_err() {
+        undrawn.set(true);
+      }
+      token
+    };
+    let Self {
+      connection,
+      stores,
+      out,
+      ..
+    } = self;
+    let judged = stores.lend(id, |sources| {
+      connection.lock_verb(sources, &mut draw, room, out)
+    });
+    let entries = match judged {
+      None => return self.not_held(),
+      Some(Err(refused)) => return self.end(refused),
+      Some(Ok(None)) => return,
+      Some(Ok(Some(entries))) => entries,
+    };
+    let landed = if undrawn.get() {
+      Err((
+        LOCK_OPERATION_FAILED,
+        "No lock token could be drawn".to_owned(),
+      ))
+    } else if entries.is_empty() {
+      Ok(())
+    } else {
+      match self.stores.land_locks(id, &self.principal, entries) {
+        None => return self.not_held(),
+        Some(landed) => landed.map_err(|refused| refused.failure()),
+      }
+    };
+    let answered = self.connection.locks_landed(landed, &mut self.out);
+    self.end_if_refused(answered);
   }
 
   /// Begins the commit the client asked for, its transaction named as the module doc says, over the lent sources.

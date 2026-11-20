@@ -589,11 +589,7 @@ mod tests {
     );
   }
 
-  /// Shape: how long the re-arm test lets its daemon run before the decline: past the reap loop's first look a window
-  /// into the start, by half a window, so the loop's next look comes half a window after the decline.
-  const PAST_THE_FIRST_LOOK_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2 * 3;
-
-  /// A-570 (the huge-page re-arm off the tick). Do: on a one-shard daemon past the reap loop's first look, remember a
+  /// A-570 (the huge-page re-arm off the tick). Do: on a one-shard daemon, remember a
   /// lasting decline of a huge-page placement, as a declined collapse does (`ShardsBackings::place`); watch for the
   /// re-arm. Expect: re-armed no sooner than a window after the decline and within half a window more, by the keeper.
   /// The reap loop's tick re-armed at its looks whatever their phase: half a window after the decline here, and at once
@@ -601,9 +597,6 @@ mod tests {
   #[test]
   fn a_declined_placement_is_asked_again_a_window_after_the_decline() {
     let daemon = crate::daemon::audit_daemon_of(1);
-    // The harness waits out the reap loop's first look; the daemon under test runs on.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
     let declined = Instant::now();
     crate::daemon::observe_first(&daemon, |state| {
       state.store.shards_backings.remember_decline();

@@ -29,6 +29,9 @@ use super::{Counters, Deepen, Graph, INFINITE_DEPTH, Refusal, Request, ShallowIn
 use crate::Admission;
 use crate::object_name::ObjectId;
 
+/// A deepening's answer: the shallow commits, and the commits kept whole.
+type ShallowAndWhole<N> = (BTreeSet<N>, BTreeSet<N>);
+
 /// What a request's shallow lines and deepening make of the walk.
 pub(super) struct Cut<N> {
   /// The shallow-info section, when one is due.
@@ -147,7 +150,7 @@ fn by_depth<S: Graph>(
   depth: u32,
   relative: bool,
   admission: &mut Admission,
-) -> Result<(BTreeSet<S::Node>, BTreeSet<S::Node>), Refusal> {
+) -> Result<ShallowAndWhole<S::Node>, Refusal> {
   let (roots, limit) = if relative {
     (
       reached_from_tips(graph, client, admission)?,
@@ -234,7 +237,7 @@ fn by_rev_list<S: Graph>(
   not: &[ObjectId],
   admission: &mut Admission,
   counters: &mut Counters,
-) -> Result<(BTreeSet<S::Node>, BTreeSet<S::Node>), Refusal> {
+) -> Result<ShallowAndWhole<S::Node>, Refusal> {
   let mut paint = Paint::new();
   for want in wants.iter().filter_map(|want| peel(graph, *want)) {
     if graph.commit(want).is_some() {

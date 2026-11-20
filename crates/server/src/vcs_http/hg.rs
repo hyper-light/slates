@@ -128,16 +128,16 @@ pub(crate) trait HgStores {
   /// Lands a push on repository `id` (the module doc's push): `pushing`'s principal, `heads` argument and bundle,
   /// everything it builds charged to `room`; what it came to, none when the store is not lent here or no view of it
   /// could be made.
-  fn push(
+  async fn push(
     &mut self,
     id: RepositoryId,
     pushing: Pushing<'_>,
     room: &mut Admission,
   ) -> Option<Outcome>;
   /// The room a push is admitted (A-711): what the repository's owner shard could admit now (the daemon's,
-  /// `crate::git_push::push_room`, as A-704 admits a git push), never one request's room; `None` where the lender
+  /// `crate::vcs_share::room`, as A-704 and A-724 admit a git push), never one request's room; `None` where the lender
   /// names none, and the edge's request room bounds it.
-  fn push_room(&self) -> Option<u64> {
+  fn push_room(&self, _repository: RepositoryId) -> Option<u64> {
     None
   }
 }
@@ -251,7 +251,7 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     }
     let pusher = routed.unbundle.then_some(principal);
     let room = match pusher {
-      Some(_) => self.stores.push_room().unwrap_or(self.room),
+      Some(_) => self.stores.push_room(repository.id).unwrap_or(self.room),
       None => self.room,
     };
     match HgExchange::new(self.stores.clone(), (repository, pusher), head, room) {
@@ -530,7 +530,9 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       return Ok(());
     }
     let answered = match &self.pusher {
-      Some(principal) => answered_push(&mut self.stores, (id, principal), &request, &mut admission),
+      Some(principal) => {
+        answered_push(&mut self.stores, (id, principal), &request, &mut admission).await
+      }
       None => self.stores.lend(id, &mut admission, |store, room| {
         hg_http::answer(store, &request, header_line(), &mut Fastest, room)
       }),
@@ -562,7 +564,7 @@ const PAST_ROOM: &[u8] = b"push refused: its bundle is larger than its repositor
 /// The answer to an `unbundle` by `principal` on repository `id` (the module doc's push): its `heads` and bundle read
 /// from `request`, the push landed through `stores`, and what it came to framed as 7.2 frames it; none when the store is
 /// not lent.
-fn answered_push<S: HgStores>(
+async fn answered_push<S: HgStores>(
   stores: &mut S,
   (id, principal): (RepositoryId, &Principal),
   request: &hg_wire::Request<'_>,
@@ -572,7 +574,9 @@ fn answered_push<S: HgStores>(
     Ok(read) => read,
     Err(answered) => return Some(answered),
   };
-  let outcome = stores.push(id, (principal, &heads, bundle), admission)?;
+  let outcome = stores
+    .push(id, (principal, &heads, bundle), admission)
+    .await?;
   Some(hg_http::pushed(&outcome, admission))
 }
 

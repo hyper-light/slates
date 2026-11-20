@@ -52,6 +52,7 @@
 //!
 //! No I/O, no clock, no randomness, no panic.
 
+pub mod commit;
 pub mod drive;
 pub mod listing;
 pub mod locking;
@@ -59,6 +60,7 @@ pub mod request;
 pub mod response;
 pub mod site;
 mod time;
+pub mod update;
 pub mod xml;
 
 /// The `DAV:` namespace (RFC 4918).

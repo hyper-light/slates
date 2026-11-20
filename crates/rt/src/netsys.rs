@@ -881,7 +881,51 @@ mod imp {
     Ok(None)
   }
 
-  #[cfg(all(test, target_os = "linux"))]
+  /// Ends both directions of the connection, whoever else holds a copy of its descriptor.
+  pub(crate) fn shutdown(socket: &Socket) -> Result<(), RtError> {
+    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Both)
+      .map_err(|e| refused("shutdown", e))
+  }
+
+  /// Ends this side's sending (`SHUT_WR`) and keeps its receiving: the peer reads end of stream after every byte sent.
+  pub(crate) fn shutdown_write(socket: &Socket) -> Result<(), RtError> {
+    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Write)
+      .map_err(|e| refused("shutdown(SHUT_WR)", e))
+  }
+
+  /// A listening socket handed over (a supervisor's, across an exec), made non-blocking and close-on-exec.
+  pub(crate) fn adopt_listener(fd: OwnedStream) -> Result<Socket, RtError> {
+    set_nonblocking_cloexec(&fd)?;
+    Ok(Socket { fd })
+  }
+
+  /// A connected stream handed over (from another shard, or across an exec), made ready to serve ([`prepared`]).
+  pub(crate) fn adopt_stream(fd: OwnedStream) -> Result<Socket, RtError> {
+    prepared(fd)
+  }
+
+  /// The socket's descriptor, borrowed: to hand a duplicate to another process by `SCM_RIGHTS`.
+  pub(crate) fn as_fd(socket: &Socket) -> std::os::fd::BorrowedFd<'_> {
+    std::os::fd::AsFd::as_fd(&socket.fd)
+  }
+
+  /// A send the kernel took nothing of without blocking: the stream is broken (`EPIPE`).
+  pub(crate) fn broken_pipe(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::PIPE)
+  }
+
+  /// A request the caller's own arguments made impossible (`EINVAL`).
+  pub(crate) fn invalid(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::INVAL)
+  }
+
+  /// A call that would have had to wait where the caller knew it would not (`EAGAIN`).
+  pub(crate) fn would_block(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::AGAIN)
+  }
+
+  #[cfg(test)]
+  #[cfg(target_os = "linux")]
   mod tests {
     use std::os::fd::OwnedFd;
 
@@ -926,49 +970,6 @@ mod imp {
       }
       assert_eq!(bytes_handed(&socket), Ok(Some(1_000)), "read by the peer");
     }
-  }
-
-  /// Ends both directions of the connection, whoever else holds a copy of its descriptor.
-  pub(crate) fn shutdown(socket: &Socket) -> Result<(), RtError> {
-    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Both)
-      .map_err(|e| refused("shutdown", e))
-  }
-
-  /// Ends this side's sending (`SHUT_WR`) and keeps its receiving: the peer reads end of stream after every byte sent.
-  pub(crate) fn shutdown_write(socket: &Socket) -> Result<(), RtError> {
-    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Write)
-      .map_err(|e| refused("shutdown(SHUT_WR)", e))
-  }
-
-  /// A listening socket handed over (a supervisor's, across an exec), made non-blocking and close-on-exec.
-  pub(crate) fn adopt_listener(fd: OwnedStream) -> Result<Socket, RtError> {
-    set_nonblocking_cloexec(&fd)?;
-    Ok(Socket { fd })
-  }
-
-  /// A connected stream handed over (from another shard, or across an exec), made ready to serve ([`prepared`]).
-  pub(crate) fn adopt_stream(fd: OwnedStream) -> Result<Socket, RtError> {
-    prepared(fd)
-  }
-
-  /// The socket's descriptor, borrowed: to hand a duplicate to another process by `SCM_RIGHTS`.
-  pub(crate) fn as_fd(socket: &Socket) -> std::os::fd::BorrowedFd<'_> {
-    std::os::fd::AsFd::as_fd(&socket.fd)
-  }
-
-  /// A send the kernel took nothing of without blocking: the stream is broken (`EPIPE`).
-  pub(crate) fn broken_pipe(call: &'static str) -> RtError {
-    refused(call, rustix::io::Errno::PIPE)
-  }
-
-  /// A request the caller's own arguments made impossible (`EINVAL`).
-  pub(crate) fn invalid(call: &'static str) -> RtError {
-    refused(call, rustix::io::Errno::INVAL)
-  }
-
-  /// A call that would have had to wait where the caller knew it would not (`EAGAIN`).
-  pub(crate) fn would_block(call: &'static str) -> RtError {
-    refused(call, rustix::io::Errno::AGAIN)
   }
 }
 

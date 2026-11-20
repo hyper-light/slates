@@ -67,20 +67,23 @@ use slates_db::catalog::{
 use slates_hg::import::record;
 use slates_hg::index::HgIndex;
 use slates_hg::push::check::{self, CheckRefusal, HeadsArgument, Moment, RACED};
+use slates_hg::push::classify::ReadChangeset;
 use slates_hg::push::classify::{
   self, BookmarkMove, BookmarkRead, DRAFT, LineMove, LineRead, Plan, RootChange,
 };
-use slates_hg::push::commit::{self, Unindexed};
+use slates_hg::push::commit::Unindexed;
+use slates_hg::push::held::IndexHeld;
+use slates_hg::push::intake::{self, Intake, Intaken, Refused as IntakeRefused, Stepped};
 use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::tree::{self, Move};
-use slates_hg::push::verify::{self, Held, Unverified, Verified};
-use slates_hg::push::{Asks, Outcome as PushOutcome, Unbundle, read_bundle};
+use slates_hg::push::verify::{Held, Unverified, Verified};
+use slates_hg::push::{Asks, ChangegroupPart, Outcome as PushOutcome, Unbundle, read_bundle};
 use slates_hg::serve::Repository;
 use slates_hg::{Admission, Node};
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::engine::Increment;
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
-use slates_vcs::IndexRefused;
+use slates_vcs::{ContentStore, IndexRefused};
 
 use super::push::{self, AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
 #[cfg(unix)]
@@ -147,6 +150,11 @@ const NOT_AUTHORIZED: &[u8] = b"push not authorized";
 const POLICY_UNREADABLE: &[u8] = b"the repository's policy cannot be read";
 /// Slates' words: the repository's store is not held on this shard (the lender lends none it does not hold).
 const NO_STORE: &[u8] = b"the repository's store is not held here";
+/// Slates' words for a push whose fork was made from an index another push replaced before it landed (A-720 part 2a; a
+/// later part re-bases it instead).
+const MOVED: &[u8] = b"the repository changed while this push was taken; push again";
+/// Slates' words for a push whose changesets its fork could not give back (A-720).
+const UNREAD: &[u8] = b"the push's changesets could not be read back";
 /// Slates' words for a push whose record could not be written (A-680 part 2c).
 const UNRECORDED: &[u8] = b"the push's record could not be written";
 /// Slates' words for a push refused while a Mercurial hook is configured (module docs, "The hook gate"), before the
@@ -460,8 +468,8 @@ pub(crate) struct Prepared {
   changes: Vec<BranchChange>,
   /// The entry's checks and state.
   parts: EntryParts,
-  /// The revisions it keeps in the index.
-  verified: Verified,
+  /// The fork its changegroup was taken into (A-720), none for a push without one.
+  forked: Option<Forked>,
   /// The reply's parts, in stream order.
   replied: Vec<Replied>,
   /// Whether the client asked for a reply (`replycaps`).
@@ -534,6 +542,7 @@ pub(crate) fn prepare<V: Repository, H: Held>(
   repository: RepositoryId,
   unbundle: &Unbundle,
   (view, held): Sources<'_, V, H>,
+  (brought, held_changesets): (&[ReadChangeset], &[Node]),
   terms: Terms,
   admission: &mut Admission,
 ) -> Result<Prepared, Refused> {
@@ -541,17 +550,13 @@ pub(crate) fn prepare<V: Repository, H: Held>(
     CheckRefusal::Raced { words } => Refused::PushRaced { message: words },
     CheckRefusal::View(_) => abort(VIEW_REFUSED.to_vec()),
   })?;
-  let verified = match unbundle.changegroup() {
-    Some((_, part)) => {
-      verify::verify(part, held, admission).map_err(|fault| abort(unverified_words(&fault)))?
-    }
-    None => Verified::default(),
-  };
+  // The push's revisions are the fork's (A-720): every text the works read is read through `held`, the fork.
+  let verified = Verified::default();
   let read = Read::of(state, repository, unbundle);
   let (publishing, ..) = terms;
   let plan = classify::classify(
     unbundle,
-    (&verified.changesets, &verified.held_changesets),
+    (brought, held_changesets),
     view,
     (&read.line_reads(), &read.mark_reads()),
     publishing,
@@ -569,7 +574,7 @@ pub(crate) fn prepare<V: Repository, H: Held>(
     asked: asked(&plan, &read),
     changegroup: unbundle.changegroup().map(|(id, _)| id),
     transaction: transaction_id(&terms.1),
-    verified,
+    forked: None,
   })
 }
 
@@ -1166,35 +1171,35 @@ pub(crate) fn land(
   let Prepared {
     changes,
     parts,
-    verified,
+    forked,
     replied,
     wanted,
     ..
   } = prepared;
-  // The push's record, the revisions it brought written as the landing appends them, within the room it runs within
-  // (A-680 part 2c); a push that brought none records none.
-  let brings =
-    !(verified.changesets.is_empty() && verified.manifests.is_empty() && verified.files.is_empty());
-  let record = match brings.then(|| record::write_push(&verified, admission.left())) {
+  let Some(Forked { fork, intaken, .. }) = forked else {
+    let appended = RepositoryLogs::append(state, principal, repository, changes, parts);
+    return Landed {
+      answer: appended
+        .map(|_| Reply::accepted(&replied, wanted))
+        .map_err(|refused| append_refused(&refused)),
+      released: Ok(()),
+    };
+  };
+  // The push's record, the revisions it kept written from the fork in the order kept, within the room the landing runs
+  // within (A-680 part 2c, A-720); a push that kept none records none.
+  let written = (!intaken.logs.is_empty()).then(|| {
+    state
+      .vcs_stores
+      .mercurial_ref(repository)
+      .map(|(content, _)| record::write_kept(&fork, content, &intaken.logs, admission.left()))
+  });
+  let record = match written {
     None => None,
-    Some(Ok(bytes)) => Some(bytes),
-    Some(Err(_)) => {
+    Some(Some(Ok(bytes))) => Some(bytes),
+    Some(_) => {
       return Landed {
         answer: Err(abort(UNRECORDED.to_vec())),
-        released: Ok(()),
-      };
-    }
-  };
-  let forked = vcs_store::within_budget(state, brought(&verified), |stores| {
-    let (content, store) = stores.mercurial(repository).ok_or(Unforked::NoStore)?;
-    commit::fork_with(&mut store.index, content, &verified, admission).map_err(Unforked::Unindexed)
-  });
-  let fork = match forked {
-    Ok(fork) => fork,
-    Err(why) => {
-      return Landed {
-        answer: Err(abort(unforked_words(&why))),
-        released: Ok(()),
+        released: release_index(state, fork),
       };
     }
   };
@@ -1214,36 +1219,6 @@ pub(crate) fn land(
   }
 }
 
-/// Why a landing's fork of the index was not made.
-#[derive(Debug)]
-enum Unforked {
-  /// No Mercurial store of the repository is held here.
-  NoStore,
-  /// The index could not keep the revisions.
-  Unindexed(Unindexed),
-}
-
-/// Slates' words for a fork not made.
-fn unforked_words(why: &Unforked) -> Vec<u8> {
-  match why {
-    Unforked::NoStore => NO_STORE.to_vec(),
-    Unforked::Unindexed(fault) => unindexed_words(fault),
-  }
-}
-
-/// What a push's revisions bring to the content store, their texts' bytes: the room its fork is lent from the arena's
-/// pool beyond what the shard could admit already (`vcs_store::within_budget`).
-fn brought(verified: &Verified) -> u64 {
-  verified
-    .changesets
-    .iter()
-    .chain(&verified.manifests)
-    .chain(verified.files.iter().flat_map(|(_, revisions)| revisions))
-    .fold(0, |total: u64, arrived| {
-      total.saturating_add(u64::try_from(arrived.text.len()).unwrap_or(u64::MAX))
-    })
-}
-
 /// Puts `fork` in repository `repository`'s index's place and gives back the index it replaces, settling the shard's
 /// charge; a store no longer held gives the fork back instead.
 fn replace_index(
@@ -1251,9 +1226,13 @@ fn replace_index(
   repository: RepositoryId,
   fork: HgIndex,
 ) -> Result<(), IndexRefused> {
-  vcs_store::within_budget(state, 0, |stores| match stores.mercurial(repository) {
-    Some((content, store)) => core::mem::replace(&mut store.index, fork).release(content),
-    None => release_in(stores, fork),
+  vcs_store::within_budget(state, 0, |stores| {
+    let replaced = match stores.mercurial(repository) {
+      Some((content, store)) => core::mem::replace(&mut store.index, fork).release(content),
+      None => return release_in(stores, fork),
+    };
+    stores.index_changed(repository);
+    replaced
   })
 }
 
@@ -1273,19 +1252,433 @@ fn release_in(stores: &mut VcsStores, index: HgIndex) -> Result<(), IndexRefused
 /// bundle's bytes.
 pub(crate) type Pushing<'p> = (&'p Principal, &'p HeadsArgument, &'p [u8]);
 
-/// One `unbundle` on `repository`'s owner shard (module docs, "The driver"): what it came to, as 7.2 answers it before
-/// a transport frames the answer; none when no served view of the repository could be made.
-pub(crate) fn unbundle(
-  state: &mut ShardState,
+/// A push's changegroup taken into its own fork (A-720): the fork, what it brought, and the generation of the index it
+/// was forked from, so a landing knows whether another push landed meanwhile.
+#[derive(Debug)]
+pub(crate) struct Forked {
+  /// The fork: the repository's revisions as they were, and the push's.
+  pub(crate) fork: HgIndex,
+  /// What the push brought.
+  pub(crate) intaken: Intaken,
+  /// The generation of the index the fork was made from (`vcs_store::VcsStores::generation_of`).
+  pub(crate) generation: u64,
+}
+
+/// One `unbundle` on `repository`'s owner shard (module docs, "The driver"; A-720): its `heads` argument judged and its
+/// bundle read over the served view; its changegroup taken into its own fork a slice at a time, each slice within the
+/// shard's step quantum and a yield between, so a push of any size never holds the shard past a step and pushes to one
+/// repository are taken side by side; then, in one step, judged over the view as it is at landing and landed. What it
+/// came to, as 7.2 answers it before a transport frames the answer; none when no served view could be made.
+pub(crate) async fn unbundle(
   repository: RepositoryId,
-  pushing: Pushing<'_>,
+  (principal, heads, bundle): Pushing<'_>,
   room: &mut Admission,
 ) -> Option<PushOutcome> {
-  let (principal, ..) = pushing;
-  let prepared = match judged(state, repository, pushing, room)? {
-    Ok(prepared) => prepared,
+  let fronted = crate::state::with_state(|state| front(state, repository, (heads, bundle), room));
+  let unbundle = match fronted.flatten()? {
+    Ok(unbundle) => unbundle,
     Err(outcome) => return Some(outcome),
   };
+  let forked = match unbundle.changegroup() {
+    None => None,
+    Some((_, part)) => match take_sliced(repository, part, lend_of(bundle), room).await? {
+      Ok(forked) => Some(forked),
+      Err(outcome) => return Some(outcome),
+    },
+  };
+  crate::state::with_state(|state| {
+    landing(
+      state,
+      repository,
+      (principal, bundle),
+      &unbundle,
+      forked,
+      room,
+    )
+  })
+  .flatten()
+}
+
+/// [`unbundle`] in one call, every slice at once: the driver's steps for a caller that holds the shard's state (the
+/// tests), never the daemon's path.
+#[cfg(test)]
+pub(crate) fn unbundle_in(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (principal, heads, bundle): Pushing<'_>,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  let unbundle = match front(state, repository, (heads, bundle), room)? {
+    Ok(unbundle) => unbundle,
+    Err(outcome) => return Some(outcome),
+  };
+  let forked = match unbundle.changegroup() {
+    None => None,
+    Some((_, part)) => match take_whole(state, repository, part, room)? {
+      Ok(forked) => Some(forked),
+      Err(refused) => return Some(PushOutcome::refused(&refused)),
+    },
+  };
+  landing(
+    state,
+    repository,
+    (principal, bundle),
+    &unbundle,
+    forked,
+    room,
+  )
+}
+
+/// Derived: the room each slice of a push's intake is lent from the arena's pool beyond what the shard could admit
+/// already (`vcs_store::within_budget`): its bundle's length, the bytes its revisions arrived in.
+fn lend_of(bundle: &[u8]) -> u64 {
+  u64::try_from(bundle.len()).unwrap_or(u64::MAX)
+}
+
+/// The driver's first step (module docs, "The driver"): `heads` judged at the served view before the bundle is read
+/// (7.2's `pusherr` for a race), then the bundle read; none when no view could be made.
+fn front(
+  state: &ShardState,
+  repository: RepositoryId,
+  (heads, bundle): (&HeadsArgument, &[u8]),
+  room: &mut Admission,
+) -> Option<Result<Unbundle, PushOutcome>> {
+  hg_view::with_view(state, repository, room, |view, _, room| {
+    heads_hold(heads, view, room)?;
+    read_bundle(bundle, room)
+  })
+}
+
+/// A push's intake while it is taken (A-720), given back by its drop if it is not finished: a push whose connection
+/// ends mid-intake leaves the store as it was.
+pub(crate) struct Taking<'g> {
+  /// The intake, until it is finished or given back.
+  intake: Option<Intake<'g>>,
+  /// The generation of the index it forked.
+  generation: u64,
+}
+
+impl Taking<'_> {
+  /// One slice: units taken until the intake is done or the shard's quantum is spent, within the room `lend` gives the
+  /// stores; none when the content store is gone.
+  fn slice(
+    &mut self,
+    state: &mut ShardState,
+    lend: u64,
+    room: &mut Admission,
+  ) -> Option<Result<Stepped, IntakeRefused>> {
+    let intake = self.intake.as_mut()?;
+    let quantum = vcs_store::hg_import::quantum_of(state);
+    let start = slates_rt::futures::now_ns();
+    vcs_store::within_budget(state, lend, |stores| {
+      let content = stores.content_mut()?;
+      Some(loop {
+        match intake.step(content, room) {
+          Ok(Stepped::More) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          other => break other,
+        }
+      })
+    })
+  }
+
+  /// The fork once every unit is taken.
+  fn finish(mut self) -> Option<Forked> {
+    let intake = self.intake.take()?;
+    match intake.finish() {
+      Ok((fork, intaken)) => Some(Forked {
+        fork,
+        intaken,
+        generation: self.generation,
+      }),
+      Err(intake) => {
+        self.intake = Some(*intake);
+        None
+      }
+    }
+  }
+
+  /// Gives the fork back over `state`, counted where its release is refused.
+  fn abandon_in(mut self, state: &mut ShardState) {
+    if let Some(intake) = self.intake.take() {
+      abandon(state, intake);
+    }
+  }
+}
+
+impl Drop for Taking<'_> {
+  fn drop(&mut self) {
+    if let Some(intake) = self.intake.take() {
+      // Dropped mid-intake (its connection ended): given back on the shard that holds its store.
+      crate::state::with_state(|state| abandon(state, intake)).unwrap_or_default();
+    }
+  }
+}
+
+/// Gives `intake`'s fork back, settling the shard's charge; a refused release counted.
+fn abandon(state: &mut ShardState, intake: Intake<'_>) {
+  let released = vcs_store::within_budget(state, 0, |stores| {
+    stores
+      .content_mut()
+      .map_or(Ok(()), |content| intake.abandon(content))
+  });
+  if released.is_err() {
+    state.count(vcs_store::RELEASE_REFUSED, 1);
+  }
+}
+
+/// Starts taking `part` into a fork of `repository`'s index (A-720); none when its store is not held here.
+fn begin_intake<'g>(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  part: &'g ChangegroupPart,
+  lend: u64,
+  room: &mut Admission,
+) -> Option<Result<Taking<'g>, Refused>> {
+  vcs_store::within_budget(state, lend, |stores| {
+    let generation = stores.generation_of(repository)?;
+    let (content, store) = stores.mercurial(repository)?;
+    Some(match Intake::begin(part, &mut store.index, content, room) {
+      Ok(intake) => Ok(Taking {
+        intake: Some(intake),
+        generation,
+      }),
+      Err(refused) => Err(intake_refused(&refused)),
+    })
+  })
+}
+
+/// `part` taken into its fork a slice at a time, a yield between slices (A-720); none when the store went away.
+async fn take_sliced(
+  repository: RepositoryId,
+  part: &ChangegroupPart,
+  lend: u64,
+  room: &mut Admission,
+) -> Option<Result<Forked, PushOutcome>> {
+  let begun = crate::state::with_state(|state| begin_intake(state, repository, part, lend, room));
+  let mut taking = match begun.flatten()? {
+    Ok(taking) => taking,
+    Err(refused) => return Some(Err(PushOutcome::refused(&refused))),
+  };
+  loop {
+    let sliced = crate::state::with_state(|state| taking.slice(state, lend, room));
+    match sliced.flatten()? {
+      Ok(Stepped::More) => slates_rt::futures::yield_now().await,
+      Ok(Stepped::Done) => return taking.finish().map(Ok),
+      Err(refused) => return Some(Err(intake_outcome(&refused))),
+    }
+  }
+}
+
+/// `part` taken into its fork every slice at once: [`take_sliced`]'s steps for a caller that holds the shard's state.
+#[cfg(test)]
+pub(crate) fn take_whole(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  part: &ChangegroupPart,
+  room: &mut Admission,
+) -> Option<Result<Forked, Refused>> {
+  let lend = u64::MAX;
+  let mut taking = match begin_intake(state, repository, part, lend, room)? {
+    Ok(taking) => taking,
+    Err(refused) => return Some(Err(refused)),
+  };
+  loop {
+    match taking.slice(state, lend, room) {
+      Some(Ok(Stepped::More)) => {}
+      Some(Ok(Stepped::Done)) => return taking.finish().map(Ok),
+      Some(Err(refused)) => {
+        taking.abandon_in(state);
+        return Some(Err(intake_refused(&refused)));
+      }
+      None => {
+        taking.abandon_in(state);
+        return None;
+      }
+    }
+  }
+}
+
+/// What an intake's refusal answers: verification's and the keeping's words, as 7.2 aborts.
+fn intake_refused(refused: &IntakeRefused) -> Refused {
+  abort(match refused {
+    IntakeRefused::Unverified(fault) => unverified_words(fault),
+    IntakeRefused::Unindexed(fault) => unindexed_words(fault),
+  })
+}
+
+/// [`intake_refused`] as the push's outcome.
+fn intake_outcome(refused: &IntakeRefused) -> PushOutcome {
+  PushOutcome::refused(&intake_refused(refused))
+}
+
+/// [`prepare`] over `view` with `unbundle`'s changegroup taken whole into a fork first, the prepared push holding the
+/// fork: the driver's steps for the tests, which judge a push over a view of their own.
+#[cfg(test)]
+pub(crate) fn prepare_whole<V: Repository>(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  unbundle: &Unbundle,
+  view: &V,
+  terms: Terms,
+  room: &mut Admission,
+) -> Result<Prepared, Refused> {
+  let forked = forked_whole(state, repository, unbundle, room)?;
+  let prepared = match state.vcs_stores.mercurial_ref(repository) {
+    None => Err(abort(NO_STORE.to_vec())),
+    Some((content, store)) => {
+      let held = IndexHeld::new(
+        forked.as_ref().map_or(&store.index, |forked| &forked.fork),
+        content,
+      );
+      brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
+        prepare(
+          state,
+          repository,
+          unbundle,
+          (view, &held),
+          (&brought, &held_changesets),
+          terms,
+          room,
+        )
+      })
+    }
+  };
+  attach(state, prepared, forked)
+}
+
+/// [`prepare_whole`] over the served view.
+#[cfg(test)]
+pub(crate) fn prepare_served(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  unbundle: &Unbundle,
+  terms: Terms,
+  room: &mut Admission,
+) -> Result<Prepared, Refused> {
+  let forked = forked_whole(state, repository, unbundle, room)?;
+  let over = forked.as_ref().map(|forked| &forked.fork);
+  let prepared = hg_view::with_view_over(
+    state,
+    repository,
+    over,
+    room,
+    |view, held, content, room| {
+      brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
+        prepare(
+          state,
+          repository,
+          unbundle,
+          (view, &held),
+          (&brought, &held_changesets),
+          terms,
+          room,
+        )
+      })
+    },
+  )
+  .unwrap_or_else(|| Err(abort(NO_STORE.to_vec())));
+  attach(state, prepared, forked)
+}
+
+/// `unbundle`'s changegroup taken whole into a fork, none without one.
+#[cfg(test)]
+fn forked_whole(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  unbundle: &Unbundle,
+  room: &mut Admission,
+) -> Result<Option<Forked>, Refused> {
+  let Some((_, part)) = unbundle.changegroup() else {
+    return Ok(None);
+  };
+  match take_whole(state, repository, part, room) {
+    Some(Ok(forked)) => Ok(Some(forked)),
+    Some(Err(refused)) => Err(refused),
+    None => Err(abort(NO_STORE.to_vec())),
+  }
+}
+
+/// The prepared push holding `forked`, or the refusal with the fork given back.
+#[cfg(test)]
+fn attach(
+  state: &mut ShardState,
+  prepared: Result<Prepared, Refused>,
+  forked: Option<Forked>,
+) -> Result<Prepared, Refused> {
+  match prepared {
+    Ok(mut prepared) => {
+      prepared.forked = forked;
+      Ok(prepared)
+    }
+    Err(refused) => {
+      if let Some(forked) = forked {
+        if release_index(state, forked.fork).is_err() {
+          state.count(vcs_store::RELEASE_REFUSED, 1);
+        }
+      }
+      Err(refused)
+    }
+  }
+}
+
+/// The changesets a fork's push brought, read back from its rows, and those its changegroup carried that were held:
+/// none without a fork.
+fn brought_of(
+  forked: Option<&Forked>,
+  content: &ContentStore,
+  room: &mut Admission,
+) -> Result<(Vec<ReadChangeset>, Vec<Node>), Refused> {
+  let Some(forked) = forked else {
+    return Ok((Vec::new(), Vec::new()));
+  };
+  let read = intake::read_changesets(&forked.fork, content, &forked.intaken, room)
+    .map_err(|past| abort(unverified_words(&Unverified::PastAdmission(past))))?
+    .ok_or_else(|| abort(UNREAD.to_vec()))?;
+  Ok((read, forked.intaken.held_changesets.clone()))
+}
+
+/// The driver's last step (A-720): a fork made from an index another push has replaced since is refused; else the push
+/// judged over the served view as it is now, its texts read through its fork, admitted, and landed. Every refusal gives
+/// the fork back.
+fn landing(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (principal, bundle): (&Principal, &[u8]),
+  unbundle: &Unbundle,
+  forked: Option<Forked>,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  let moved = forked
+    .as_ref()
+    .is_some_and(|forked| state.vcs_stores.generation_of(repository) != Some(forked.generation));
+  let judged = if moved {
+    Some(Err(PushOutcome::Unprocessed(MOVED.to_vec())))
+  } else {
+    judged_over(
+      state,
+      repository,
+      (principal, bundle),
+      unbundle,
+      forked.as_ref(),
+      room,
+    )
+  };
+  let mut prepared = match judged {
+    Some(Ok(prepared)) => prepared,
+    other => {
+      if let Some(forked) = forked
+        && release_index(state, forked.fork).is_err()
+      {
+        state.count(vcs_store::RELEASE_REFUSED, 1);
+      }
+      return other.map(|judged| {
+        judged
+          .err()
+          .unwrap_or(PushOutcome::Unprocessed(MOVED.to_vec()))
+      });
+    }
+  };
+  prepared.forked = forked;
   let landed = land(state, (principal, repository), prepared, room);
   if landed.released.is_err() {
     state.count(vcs_store::RELEASE_REFUSED, 1);
@@ -1296,27 +1689,46 @@ pub(crate) fn unbundle(
   })
 }
 
-/// [`unbundle`]'s judging over the served view, in 7.2's order (module docs, "The driver"): the push prepared and
-/// admitted, or what refused it; none when no view could be made.
-fn judged(
+/// The landing's judging, in 7.2's order (module docs, "The driver"): over the served view as it is at landing, the
+/// push's changesets read back from its fork, its texts read through it; prepared and admitted, or what refused it; none
+/// when no view could be made.
+fn judged_over(
   state: &ShardState,
   repository: RepositoryId,
-  (principal, heads, bundle): Pushing<'_>,
+  (principal, bundle): (&Principal, &[u8]),
+  unbundle: &Unbundle,
+  forked: Option<&Forked>,
   room: &mut Admission,
 ) -> Option<Result<Prepared, PushOutcome>> {
-  hg_view::with_view(state, repository, room, |view, held, room| {
-    heads_hold(heads, view, room)?;
-    let unbundle = read_bundle(bundle, room)?;
-    let terms = (PUBLISHING, push_name(repository, bundle), room.left());
-    let prepared = prepare(state, repository, &unbundle, (view, &held), terms, room)
+  let over = forked.map(|forked| &forked.fork);
+  hg_view::with_view_over(
+    state,
+    repository,
+    over,
+    room,
+    |view, held, content, room| {
+      let (brought, held_changesets) =
+        brought_of(forked, content, room).map_err(|refused| PushOutcome::refused(&refused))?;
+      let terms = (PUBLISHING, push_name(repository, bundle), room.left());
+      let sources = (view, &held);
+      let prepared = prepare(
+        state,
+        repository,
+        unbundle,
+        sources,
+        (&brought, &held_changesets),
+        terms,
+        room,
+      )
       .map_err(|refused| PushOutcome::refused(&refused))?;
-    admitted(state, (principal, repository), &prepared)
-      .map_err(|refused| PushOutcome::refused(&refused))?;
-    match hook_refused(state, repository) {
-      Some(refused) => Err(PushOutcome::refused(&refused)),
-      None => Ok(prepared),
-    }
-  })
+      admitted(state, (principal, repository), &prepared)
+        .map_err(|refused| PushOutcome::refused(&refused))?;
+      match hook_refused(state, repository) {
+        Some(refused) => Err(PushOutcome::refused(&refused)),
+        None => Ok(prepared),
+      }
+    },
+  )
 }
 
 /// Whether `unbundle`'s `heads` argument holds at `view` before the bundle is read (7.2's `check_heads`, "preparing
