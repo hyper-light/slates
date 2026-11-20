@@ -54883,6 +54883,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   Studio, every push landed, but the small repositories' p99 was 14.1 times their push alone while one hot repository
   pushed: piece 3's memory share does not schedule CPU, so the shard's step quanta scheduled fairly by repository is next.
   R = 1,000 waits on one copy a byte (A-723, A-727). A push of git/git v2.0.0 ends the daemon (reported).
+- **Piece 5, A-727's barrier at the homes (2026-11-20, agreed with w-perf).** `vcs_store::homes::keep_here` and `home`
+  answer a `HomeTicket { shard, generation }`: the home and the first of its images that holds the window. The home's
+  barrier (A-727, w-perf's) calls `image_begun(g)` when image g captures the shard's content table and
+  `image_published(g)` when it is durable; `published(origin, ticket, budget)` waits on the home, as a task there, until
+  its image of the ticket's generation is published, so an entry's request awaits it and no step waits. Agreed with
+  w-perf (proposal in inbox `w-perf-from-w-balance.md`, its reply by kiln message, 2026-11-20): rows {identity, length, home} with the holder count
+  at the owner, bytes at the home; reads `Read::Here(Cow)` or `Read::Elsewhere { home }`, fetched between steps into a
+  charged per-request cache; `let_go` batched; the owner the default home for small repositories. Test:
+  `vcs_store::homes::tests::a_homed_windows_ticket_is_published_only_once_its_homes_image_is`. Owed: `home_many`,
+  `read_many` and the batched `let_go` (after w-perf's slice a3).
+- **Piece 3c, fair turns by repository: measured and rejected (2026-11-20).** BENCHMARKS.md, "Fair turns by
+  repository on a shard": at R = 100 the toys' p99 grew from 14.1 to 22.8 times alone and the daemon ended. The toys'
+  wait is not the owner shard's CPU; the R = 100 step is to be profiled first. Also in this change: `share::divide`'s
+  full-resource tolerance is derived from Higham's bound for the solver's own operations (w-lint's R3 finding).
 
 
 ### A-730 — ra_svn runs a repository's hooks (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 9; A-661 part 2, A-622, A-623, A-648)
