@@ -1295,7 +1295,7 @@ fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge()
   assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
 }
 
-/// A fetch's answer (§4.17.1, main's ruling 2026-11-20: a clone's working set is bounded whatever the repository's size;
+/// A-745. A fetch's answer (§4.17.1, main's ruling 2026-11-20: a clone's working set is bounded whatever the repository's size;
 /// found by use, w-interop: every clone of Mercurial's own history, 57,035 revisions, was refused `PastAdmission`, its
 /// answer built whole within one request's room). Do: start a two-shard daemon whose edge serves loopback TLS, each
 /// request admitted one ring region; push, as stock hg posts it, one changeset whose one file is twice that room; then
@@ -1303,7 +1303,6 @@ fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge()
 /// uncompressed). Expect `200`, and the answer's changegroup carrying the file's bytes whole: an answer is made a slice
 /// at a time from what is stored, each slice admitted, never the whole answer within one request's room.
 #[test]
-#[ignore = "red for A-745 (a fetch's answer streamed in slices): the answer is still built whole within the request's room"]
 fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
   let (identity, certificate) = identity();
   let (daemon, instance) = daemon_named(Some(identity));

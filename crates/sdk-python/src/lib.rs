@@ -66,7 +66,28 @@ pyo3::create_exception!(
 /// Turns a client refusal into the SDK's Python exception, preserving the refusal's text so the kind
 /// is legible to Python (per-refusal exception subclasses are owed).
 fn refusal(error: ClientError) -> PyErr {
+  if let ClientError::Refused(slates_client::Refusal::CopyRefused { path, case }) = &error {
+    let case = copy_case_name(*case);
+    return SlatesError::new_err(format!(
+      "CopyRefused: the copy to {path} is refused: {case}"
+    ));
+  }
   SlatesError::new_err(format!("{error:?}"))
+}
+
+/// The name a refused copy's case is reported by (A-586; main's ruling of 2026-11-20): every case of the wire's
+/// `CopyCase` by an exhaustive match, so a case appended to the wire breaks this build until this surface names it.
+fn copy_case_name(case: slates_client::CopyCase) -> &'static str {
+  use slates_client::CopyCase;
+  match case {
+    CopyCase::Root => "root",
+    CopyCase::PastHead => "past_head",
+    CopyCase::SourceEmpty => "source_empty",
+    CopyCase::VersionFolded => "version_folded",
+    CopyCase::OutsideNodeChanged => "outside_node_changed",
+    CopyCase::ChangedSourceLink => "changed_source_link",
+    CopyCase::LinkAcrossCopy => "link_across_copy",
+  }
 }
 
 /// Renders a volume id as lowercase hex — the plain value Python holds and passes back. Uses the

@@ -84,6 +84,9 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 4b (2026-11-20, w-git).** BUILT: a push's seal and stage a unit at a time (`Staging`, `Index::seal_step`)
+> on the live push and in a replay. Owed: the moves' admission, the landing's whole passes and a stale restage sliced.
+>
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
@@ -182,8 +185,16 @@
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
 > lands ignored. Piece 1 BUILT: `getbundle::Answering`, the answer a slice at a time, a clone of every head walked by
 > its links (the request holds ranges and a place), its least room a slice less than the whole answer's (test), the
-> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Owed: the server driving it
-> a turn at a time over HTTP and SSH (piece 2, which turns the red green); the stream clone's; w-interop's matrix rerun.
+> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Piece 2a BUILT (HTTP): the
+> edge begins a `getbundle` (`serve::http::begin`) and makes its body a turn at a time (`HgExchange::turn`): the view
+> lent for the turn alone, the shard's room (`vcs_share::room`) and step quantum (`HgStores::fetch_turn`), the stream
+> compressed as it is made (`compression::StreamCompressor`, each slice's engine bound charged first); a step past a
+> turn's room after others waits for the next turn's. The red is GREEN: the clone of a file twice a request's room is
+> answered whole. Piece 2b BUILT (SSH): the session begins a `getbundle` (`session::begin_serving`), the `Stdio`
+> holds its answer and makes it a slice at a time (`Stdio::stream`), the server's step streaming it within the shard's
+> room and quantum, a turn ending once a room's worth waits to be sent; an SSH clone of a file twice a request's room
+> is answered whole (test). Owed: a hold on the index generation a fetch began on (rule 4: a push landing mid-clone is
+> read by the clone's later turns; next); the stream clone's; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -1948,9 +1959,11 @@
 > and two calls, both formats byte for byte). **Part 2 (same day):** a text a window a call, `Text` pieces of
 > `WINDOW_LIMIT` (format 2, one walk: its length and checksums the record's) or one deltified window (format 3, taken
 > up again by `svndiff::deltas_at`); held by `every_export_call_writes_one_changed_path_or_one_window_of_its_text`
-> (largest call 102,400 and 102,413 bytes, the 107 KB text no longer one). Owed (part 3, next): format 3's measuring
-> walk, which its record's header needs first (the svndiff's length is kept nowhere), still one call over the whole
-> text, keeping no window (§4.17.4 item 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> (largest call 102,400 and 102,413 bytes, the 107 KB text no longer one). **Part 3 (same day):** format 3's
+> measuring walk a window a call before the record's call (the step run first on copies, its writes dropped, to learn
+> its delta's texts); held by `a_large_delta_is_measured_and_written_a_window_a_call` (a five-window change: 15 calls,
+> each within a window and `CALL_HEADROOM`, where by count the record's call measured all five). The dump export's
+> calls are bounded by a window now; a call's time against the shard's slice is main's to measure in release. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -1972,8 +1985,10 @@
 > destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
 > key, the identity one entry a copy, hard links refused by kind (BUILT 2026-11-20, w-shared, main's ruling: a copied
 > tree's links share the copy's nodes, a link naming a node outside it gets a node of its own, `Green::copy_link_effects`;
-> refused only where that outside node changed after the copy's version, still as `TypeChanged`, owed its own typed
-> refusal), the root a source and never a destination, a branch
+> refused only where that outside node changed after the copy's version) and every copy it does not make refused before
+> any verdict by its own case, never a conflict (2026-11-20, `Refusal::CopyRefused`/`CopyCase`: `Root`, `PastHead`,
+> `SourceEmpty` as FSFS refuses them; `VersionFolded` by retention; `OutsideNodeChanged`, `ChangedSourceLink`,
+> `LinkAcrossCopy` owed work), the root a source and never a destination, a branch
 > made before a copy cutting it, a review comment on a copied file moving with it (A-596); held to a reference green
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain
@@ -3735,6 +3750,11 @@
 >   `names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two` (`ɐ`/`Ɐ` one file, `ς`/`σ` two,
 >   as on NTFS) passes, and fails with the same forced flag. The roster's git, Mercurial and Subversion workloads pass
 >   over the drive on both (WinFsp as released makes no hard link, so the stated hard-link lines apply).
+>   A-551's other two parts, each red-checked apart on both architectures: the sharing violation (with
+>   `CaseSensitiveSearch` forced, `a.txt` opened beside an unshared `A.TXT`: `Ok(())` where `ERROR_SHARING_VIOLATION`
+>   was expected; diag-w-bugs-win-red-1), and the stored spelling as WinFsp's normalized name (with no normalized name
+>   answered, the sharing violation held but `CAFÉ.TXT`'s final path read `CAFÉ.TXT` where the stored `Café.txt` was
+>   expected; diag-w-bugs-win-nred-1), both in `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows`.
 > - **Owed (main, filed in run-requests.md):** the Windows build of A-551 (`host.rs`, the server's `winfsp.rs`) and the
 >   drive tests `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` (red before: `a.txt` opened beside
 >   an unshared `A.TXT`, final path `a.txt`) and `an_exact_drive_keeps_two_spellings_two_files`
@@ -22130,7 +22150,18 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     it gives the charge back and refuses `Object`. The ordering is held on every host by
     `a_range_is_charged_before_anything_is_made_for_it` (bridge-core's unit tests), red with the old order on the Mac
     Studio. Record: `docs/bugs/2026-11-18-a-windows-dax-range-was-committed-before-its-budget-charge-was-asked.md`.
-    **Owed (main's):** the Windows run of the lib tests and a Windows Shards DAX map past the budget.
+    **Owed (main's):** the Windows run of the lib tests and a Windows Shards DAX map past the budget. **Run 2026-11-20
+    (w-bugs, goal 87):** `a_range_is_charged_before_anything_is_made_for_it` and
+    `a_range_a_dead_daemons_fill_left_part_way_reads_the_volume_once_filled_again` pass on Windows x86_64 (jupiter, main
+    d0dd51bd4); the Shards DAX map past the budget stays owed.
+- **The goal-83 audit's B-list (B2-B16), closed 2026-11-20 (w-bugs, goal 87):** B2 (A-543, A-551), B3 (A-725), B7a
+  (A-526), B7b (A-530), B10 (A-573), B12 (A-550), B13 (A-535), B14 (A-739) and B16 landed; B4 was fixed by A-560; B5
+  and B11 did not reproduce by use (B5's arm64 open 229 µs against WinFsp memfs's 186 µs; B11 80 of 80 runs, 50 under
+  load); B15 is answered (every reviewed-list entry carries its reason). B8 and B9 are findings from reading with no
+  use behind them, not chased under Ada's rule that a bug is fixed once use reproduces it. **B6 has no record
+  anywhere:** not in the repository, the goal stack, the coordination files or this ledger; the list rebuilt on
+  2026-11-19 from an agent's transcript after the coordination folder was wiped already lacked it, so what B6 named is
+  unknown here.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
     prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost

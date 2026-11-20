@@ -19,9 +19,9 @@
 //! Each test's copies, its key and git's home live in a scratch directory in the build output (`CARGO_TARGET_TMPDIR`),
 //! named with the process id and removed at its end. A credential is minted with the anchor's issuer surface, which
 //! the anchor names on macOS and Windows; on Linux the surface is a descriptor only the anchor's children hold, so a
-//! leg that needs a credential skips loudly there (`tests/cli.rs`, `PRINTS_ISSUER_SURFACE`). Unix only, as
-//! `tests/cli.rs` is: the SSH leg runs OpenSSH's `ssh`.
-#![cfg(unix)]
+//! leg that needs a credential skips loudly there (`tests/cli.rs`, `PRINTS_ISSUER_SURFACE`). Every platform: on Windows
+//! (jupiter) stock git is Git for Windows and `ssh` the OpenSSH the PATH names first (MSYS2's there), which read the
+//! scratch directory's forward-slashed paths and `/dev/null` as on Unix.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -112,7 +112,9 @@ const VCS_SSH_KEY_TYPE: &str = "ed25519";
 
 /// A scratch directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a
 /// count, removed when dropped, even when an assertion fails (A-50: a test's host files live in the build output, never
-/// `/tmp`). Made by `mkdir`, as `tests/cli.rs` makes its own.
+/// `/tmp`). Its path is written with forward slashes, which every stock client on every platform reads (Git for Windows,
+/// MSYS2's OpenSSH and Mercurial's `ssh` command on Windows among them), and without Windows' `\\?\` prefix, which
+/// they do not.
 struct Scratch {
   path: String,
 }
@@ -129,24 +131,33 @@ impl Scratch {
     );
     made_directory(&raw);
     Scratch {
-      path: std::fs::canonicalize(&raw)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned(),
+      path: portable(&std::fs::canonicalize(&raw).unwrap()),
     }
   }
 }
 
 impl Drop for Scratch {
+  // The test's own scratch directory, inside the build output (R1's wall is shipped code's).
+  #[allow(clippy::disallowed_methods)]
   fn drop(&mut self) {
-    let _ = Command::new("rm").args(["-rf", &self.path]).output();
+    let _ = std::fs::remove_dir_all(&self.path);
   }
 }
 
-/// Makes directory `path` and any parent it lacks, by `mkdir -p`.
+/// Makes directory `path` and any parent it lacks, inside the test's build output.
+#[allow(clippy::disallowed_methods)]
 fn made_directory(path: &str) {
-  let made = Command::new("mkdir").args(["-p", path]).output().unwrap();
-  assert!(made.status.success(), "mkdir -p {path}: {made:?}");
+  std::fs::create_dir_all(path).unwrap_or_else(|error| panic!("making {path}: {error}"));
+}
+
+/// `path` as every stock client reads it: forward slashes, and on Windows no `\\?\` verbatim prefix, which
+/// `canonicalize` adds and Git for Windows and MSYS2's tools refuse.
+fn portable(path: &std::path::Path) -> String {
+  let text = path.to_string_lossy();
+  text
+    .strip_prefix(r"\\?\")
+    .unwrap_or(&text)
+    .replace('\\', "/")
 }
 
 /// Stock git's command, or `None` when this host runs none, which the caller skips loudly: the words [`STOCK_GIT`]
@@ -401,7 +412,17 @@ fn stock_git_round_trip_holds_against_stock_git() {
     &scratch.path,
     &["init", "-q", "--bare", "-b", BRANCH, &bare],
   );
-  round_trip(&git, &format!("file://{bare}"));
+  round_trip(&git, &file_url(&bare));
+}
+
+/// Git's local URL of the directory at `path`, a forward-slashed absolute path: `file:///C:/…` for a Windows path
+/// (RFC 8089's form, which Git for Windows reads), `file:///…` for a Unix one.
+fn file_url(path: &str) -> String {
+  if path.starts_with('/') {
+    format!("file://{path}")
+  } else {
+    format!("file:///{path}")
+  }
 }
 
 /// The anchor process, killed and reaped when dropped, so a failed assertion leaves no daemon behind; what it says

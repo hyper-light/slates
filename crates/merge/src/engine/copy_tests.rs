@@ -209,7 +209,9 @@ fn windows(outcome: &Outcome) -> Option<Vec<(String, MergeConflictClass)>> {
         .map(|window| (window.path.clone(), window.class))
         .collect(),
     ),
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } => None,
+    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } | Outcome::CopyRefused { .. } => {
+      None
+    }
   }
 }
 
@@ -495,7 +497,27 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
   nested.copy("t2", "y", 5).copy("trunk", "y/a", 5);
   let mut moved = Work::exclusive();
   moved.copy("t2", "y", 4).rename("trunk/a", "y/q");
+  use crate::engine::CopyRefusal::{
+    LinkAcrossCopy, OutsideNodeChanged, PastHead, Root, SourceEmpty,
+  };
   use MergeConflictClass::{CreateCreate, DeleteModify, TypeChanged};
+  // Refused before any verdict, typed (main's ruling of 2026-11-20): none is a change a rebase could answer.
+  let refused = [
+    (one_copy("t2", "", 5), ("", Root)),
+    (one_copy("nothing", "y", 5), ("y", SourceEmpty)),
+    (one_copy("t2", "y", 6), ("y", PastHead)),
+    (one_copy("h2", "y", 2), ("y", OutsideNodeChanged)),
+    (moved, ("y/q", LinkAcrossCopy)),
+  ];
+  for (index, (work, (path, case))) in refused.into_iter().enumerate() {
+    let outcome = green.submit(&work.at(200 + index as u64, 5));
+    let expected = Outcome::CopyRefused {
+      path: path.to_owned(),
+      case,
+    };
+    assert_eq!(outcome, expected, "refused case {index}");
+    assert_eq!(green.head(), head, "refused case {index} committed");
+  }
   /// A case: the work, the version it is judged at, and the conflicts expected of it.
   type Case<'a> = (Work, u64, Vec<(&'a str, MergeConflictClass)>);
   let cases: Vec<Case<'_>> = vec![
@@ -505,14 +527,9 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
       5,
       vec![("trunk/a", CreateCreate)],
     ),
-    (one_copy("t2", "", 5), 5, vec![("", TypeChanged)]),
-    (one_copy("nothing", "y", 5), 5, vec![("y", TypeChanged)]),
-    (one_copy("t2", "y", 6), 5, vec![("y", TypeChanged)]),
-    (one_copy("h2", "y", 2), 5, vec![("y", TypeChanged)]),
     (one_copy("t2", "gone", 5), 3, vec![("gone", CreateCreate)]),
     (both, 5, vec![("y", TypeChanged)]),
     (nested, 5, vec![("y/a", CreateCreate)]),
-    (moved, 5, vec![("y/q", TypeChanged)]),
     (
       replace_copy("t2", "taken", 5),
       1,
@@ -1275,7 +1292,8 @@ fn an_edit_beneath_a_copy_from_an_older_version_lands_on_the_bytes_it_brings() {
 
 /// A-626 part 2 (a copy from a version whose values are folded away). Do: fold the green's histories below version 3,
 /// then copy the trunk at version 1 (changed at 2, so its values then are needed) and at version 3 (unchanged since).
-/// Expect: the first a type conflict naming its destination, the green unchanged; the second accepted.
+/// Expect: the first refused typed, `VersionFolded`, naming its destination (main's ruling of 2026-11-20: no conflict),
+/// the green unchanged; the second accepted.
 #[test]
 fn a_copy_from_a_folded_version_is_refused_typed() {
   let mut green = trunk_changed_after_1();
@@ -1283,8 +1301,11 @@ fn a_copy_from_a_folded_version_is_refused_typed() {
   let head = green.head();
   let stale = green.submit(&one_copy("trunk", "b", 1).at(4, head));
   assert_eq!(
-    windows(&stale),
-    Some(vec![("b".to_owned(), MergeConflictClass::TypeChanged)])
+    stale,
+    Outcome::CopyRefused {
+      path: "b".to_owned(),
+      case: crate::engine::CopyRefusal::VersionFolded,
+    }
   );
   assert_eq!(green.head(), head);
   assert_eq!(

@@ -36,7 +36,7 @@
 //! answered out of band and the session goes on, where 7.2's exceptions end the process. A batch call of a command that
 //! does not answer a string is refused (7.2 asserts).
 
-use super::getbundle::{Asked, Store, getbundle};
+use super::getbundle::{Answering, Asked, Store, getbundle};
 use super::{Refusal, discovery, lookup, pull, stream};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::decimal::Decimal;
@@ -226,13 +226,49 @@ impl From<PastAdmission> for Refused {
 }
 
 /// Serves the request at the front of `input`: `Done(step, consumed)`, or `More` where the buffer holds only part of
-/// it. Answers go to `stdout` and, for an error, `stderr`; everything held is charged to `admission`.
+/// it. Answers go to `stdout` and, for an error, `stderr`; everything held is charged to `admission`. A `getbundle`'s
+/// answer is made whole here ([`begin_serving`]'s, its steps at once); a refusal past its stream's start ends the
+/// session, as 7.2 fails mid-stream.
 pub fn serve(
   store: &impl Store,
   input: &[u8],
   admission: &mut Admission,
   stdout: &mut Vec<u8>,
   stderr: &mut Vec<u8>,
+) -> Read<Step> {
+  let mut answering = None;
+  let read = begin_serving(store, input, admission, (stdout, stderr), &mut answering);
+  let Some(mut answering) = answering else {
+    return read;
+  };
+  loop {
+    match answering.step(store, admission, stdout) {
+      Ok(true) => {}
+      Ok(false) => return read,
+      Err(refusal) => {
+        let consumed = match read {
+          Read::Done(_, consumed) => consumed,
+          Read::More { .. } => 0,
+        };
+        return Read::Done(
+          Step::Ended {
+            refused: Some(Refused::Serve(refusal)),
+          },
+          consumed,
+        );
+      }
+    }
+  }
+}
+
+/// Serves the request at the front of `input` as [`serve`] does, but a `getbundle` whose answer begins is handed back in
+/// `answering` to be made a slice at a time (A-745), nothing of it written yet.
+pub fn begin_serving(
+  store: &impl Store,
+  input: &[u8],
+  admission: &mut Admission,
+  (stdout, stderr): (&mut Vec<u8>, &mut Vec<u8>),
+  answering: &mut Option<Box<Answering>>,
 ) -> Read<Step> {
   let longest = COMMANDS
     .iter()
@@ -261,8 +297,23 @@ pub fn serve(
     }
     Err(refusal) => return ended(Refused::Request(refusal), input.len(), stdout, stderr),
   };
+  let consumed = used.saturating_add(taken);
+  if command == b"getbundle" {
+    let asked = getbundle_asked(&arguments);
+    let refused = match Answering::begin(store, &asked, admission) {
+      Ok(begun) => {
+        *answering = Some(Box::new(begun));
+        None
+      }
+      Err(refusal) => {
+        let answered = getbundle_refused(refusal, Transport::Ssh);
+        framed(answered, admission, stdout, stderr)
+      }
+    };
+    return Read::Done(Step::Answered { refused }, consumed);
+  }
   let refused = answer(store, command, spec, &arguments, admission, stdout, stderr);
-  Read::Done(Step::Answered { refused }, used.saturating_add(taken))
+  Read::Done(Step::Answered { refused }, consumed)
 }
 
 /// Answers an unreadable request out of band and ends the session, the rest of the input taken.
@@ -292,7 +343,18 @@ fn answer(
   stdout: &mut Vec<u8>,
   stderr: &mut Vec<u8>,
 ) -> Option<Refused> {
-  let (answered, refused) = dispatch(store, Transport::Ssh, command, spec, arguments, admission);
+  let answered = dispatch(store, Transport::Ssh, command, spec, arguments, admission);
+  framed(answered, admission, stdout, stderr)
+}
+
+/// An answer and its refusal framed over SSH (`_runsshserver`): a string as `<length>\n<value>`, a stream as it is, an
+/// error out of band; the refusal its error answer reports, if any.
+fn framed(
+  (answered, refused): (Answer, Option<Refused>),
+  admission: &mut Admission,
+  stdout: &mut Vec<u8>,
+  stderr: &mut Vec<u8>,
+) -> Option<Refused> {
   match answered {
     Answer::Bytes(value) => match admission.charge(ssh::respond_len(&value)) {
       Ok(()) => {
@@ -527,7 +589,23 @@ fn getbundle_answer(
   arguments: &Arguments<'_>,
   admission: &mut Admission,
 ) -> (Answer, Option<Refused>) {
-  let asked = Asked {
+  let asked = getbundle_asked(arguments);
+  let mut stream = Vec::new();
+  match getbundle(store, &asked, admission, &mut stream) {
+    Ok(()) => {
+      let answer = Answer::Stream {
+        stream,
+        prefer_uncompressed: false,
+      };
+      (answer, None)
+    }
+    Err(refusal) => getbundle_refused(refusal, transport),
+  }
+}
+
+/// What a `getbundle`'s arguments ask.
+pub(crate) fn getbundle_asked<'a>(arguments: &Arguments<'a>) -> Asked<'a> {
+  Asked {
     heads: arguments.entry(b"heads").unwrap_or_default(),
     common: arguments.entry(b"common").unwrap_or_default(),
     bundlecaps: arguments.entry(b"bundlecaps").unwrap_or_default(),
@@ -536,18 +614,15 @@ fn getbundle_answer(
     bookmarks: arguments.entry(b"bookmarks"),
     obsmarkers: arguments.entry(b"obsmarkers"),
     listkeys: arguments.entry(b"listkeys"),
-  };
-  let mut stream = Vec::new();
-  let refusal = match getbundle(store, &asked, admission, &mut stream) {
-    Ok(()) => {
-      let answer = Answer::Stream {
-        stream,
-        prefer_uncompressed: false,
-      };
-      return (answer, None);
-    }
-    Err(refusal) => refusal,
-  };
+  }
+}
+
+/// The answer to a `getbundle` refused before its stream began: a bundle2 request's as an `ERROR:ABORT` part, sent
+/// uncompressed; a bundle1 request's out of band, over HTTP in 7.2's own words ([`BUNDLE2_REQUIRED`]).
+pub(crate) fn getbundle_refused(
+  refusal: Refusal,
+  transport: Transport,
+) -> (Answer, Option<Refused>) {
   let refused = Refused::Serve(refusal);
   let words = match (refusal, transport) {
     (Refusal::NoBundle2, Transport::Http { .. }) => BUNDLE2_REQUIRED.to_vec(),

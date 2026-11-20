@@ -57,7 +57,28 @@ const HEX_RADIX: u32 = 16;
 /// Turns a client refusal into a JS error, preserving the refusal's text so the kind is legible in
 /// Node (richer error classes are owed).
 fn refusal(error: ClientError) -> Error {
+  if let ClientError::Refused(slates_client::Refusal::CopyRefused { path, case }) = &error {
+    let case = copy_case_name(*case);
+    return Error::from_reason(format!(
+      "CopyRefused: the copy to {path} is refused: {case}"
+    ));
+  }
   Error::from_reason(format!("{error:?}"))
+}
+
+/// The name a refused copy's case is reported by (A-586; main's ruling of 2026-11-20): every case of the wire's
+/// `CopyCase` by an exhaustive match, so a case appended to the wire breaks this build until this surface names it.
+fn copy_case_name(case: slates_client::CopyCase) -> &'static str {
+  use slates_client::CopyCase;
+  match case {
+    CopyCase::Root => "root",
+    CopyCase::PastHead => "past_head",
+    CopyCase::SourceEmpty => "source_empty",
+    CopyCase::VersionFolded => "version_folded",
+    CopyCase::OutsideNodeChanged => "outside_node_changed",
+    CopyCase::ChangedSourceLink => "changed_source_link",
+    CopyCase::LinkAcrossCopy => "link_across_copy",
+  }
 }
 
 /// A JS number is an `f64`; a nanosecond deadline or size that crossed as one is range-checked back to
