@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 
 use slates_vcs::ContentStore;
 
+use super::abbrev::Abbrev;
 use super::{Chain, Place, Repository, StoreRefused};
 use crate::negotiation::{CommitRow, Graph};
 use crate::object_name::{Kind, ObjectId};
@@ -172,18 +173,20 @@ impl<'r> StoreGraph<'r> {
     }
   }
 
-  /// The bytes of the blob `id` names, its length charged to `admission` before they are read (A-640 part 4: the blob a
-  /// `sparse:oid` filter reads its patterns from): `None` when the store holds no blob of that name, or cannot read it
+  /// The bytes of the object `id` names when it is of `kind`, its length charged to `admission` before they are read
+  /// (A-640 part 4: the blob a `sparse:oid` filter reads its patterns from; a commit or a tag git describes when it
+  /// lists an abbreviation's objects): `None` when the store holds no object of that name and kind, or cannot read it
   /// (kept as a fault).
-  pub(crate) fn blob_bytes(
+  pub(crate) fn object_bytes(
     &self,
     id: &ObjectId,
+    kind: Kind,
     admission: &mut Admission,
   ) -> Result<Option<Vec<u8>>, PastAdmission> {
     let Some((row, content)) = self.repository.indexed(self.store, id) else {
       return Ok(None);
     };
-    if row.kind != Kind::Blob {
+    if row.kind != kind {
       return Ok(None);
     }
     admission.charge(row.len)?;
@@ -195,6 +198,26 @@ impl<'r> StoreGraph<'r> {
         Ok(None)
       }
     }
+  }
+
+  /// The objects whose names begin with `abbrev`'s digits, in name order, each by name, position and kind (A-640 part
+  /// 4: an abbreviated name's objects, `Repository::abbreviated`).
+  pub(crate) fn abbreviated(
+    &self,
+    abbrev: &Abbrev,
+  ) -> impl Iterator<Item = (ObjectId, u64, Kind)> + use<'r> {
+    self
+      .repository
+      .abbreviated(self.store, abbrev)
+      .map(|(id, row)| (id, row.position, row.kind))
+  }
+
+  /// How many digits of `id`'s name git writes for it with `core.abbrev` unset: the fewest from git's default that no
+  /// other object's name begins with (A-640 part 4, `Repository::unique_digits`).
+  pub(crate) fn unique_digits(&self, id: &ObjectId) -> usize {
+    self
+      .repository
+      .unique_digits(self.store, id, self.repository.default_digits())
   }
 
   /// What git's tree walk finds for `path` in the tree at `position` (A-640 part 4: a `sparse:oid` filter's

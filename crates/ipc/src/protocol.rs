@@ -1298,15 +1298,18 @@ pub enum RequestBody {
     /// The keyed hash under the launcher's secret, over the principal, the identities and the version read.
     proof: [u8; 32],
   },
-  /// Import the Mercurial repository at the host directory `path` into repository `repository`'s store (§4.17.3 piece 3;
-  /// §4.15, read-only; A-675, A-678), on the partition its name hashes to. The repository's owner asks, and its store
-  /// must be the empty one its record was made with. The import runs a turn at a time on the owner shard, and the request
-  /// is answered when it ends: `RepositoryImported` with what it took, or `ImportRefused` with its fault, every refusal
-  /// by kind. Appended.
+  /// Import a repository's history from the host into repository `repository`'s store (§4.15, read-only), on the
+  /// partition its name hashes to; the repository's owner asks. A Mercurial repository's comes from the host directory
+  /// `path` holding its `.hg` (§4.17.3 piece 3; A-675, A-678), and its store must be the empty one its record was made
+  /// with. A Subversion repository's comes from the dump stream `svnadmin dump` wrote (format 2 or 3) in the host file
+  /// `path` (§4.17.4 piece 6; A-628, A-652 part 3), which continues the repository's history, each revision committed
+  /// as a client's commit is. The import runs a turn at a time on the owner shard, and the request is answered when it
+  /// ends: `RepositoryImported` or `DumpImported` with what it took, or `ImportRefused` with its fault, every refusal by
+  /// kind. Appended.
   ImportRepository {
     /// The repository's name.
     repository: String,
-    /// The host directory that holds the repository's `.hg`.
+    /// The host directory that holds a Mercurial repository's `.hg`, or the host file that holds a Subversion dump.
     path: String,
   },
 }
@@ -4429,8 +4432,8 @@ pub enum Refusal {
     /// The repository's tool.
     tool: VcsTool,
   },
-  /// A repository's import was refused (`ImportRepository`, A-678), by its fault; the repository's store is as it was.
-  /// Appended.
+  /// A repository's import was refused (`ImportRepository`, A-678), by its fault; the repository's store is as it was,
+  /// but for the revisions a Subversion dump's import committed before its fault (A-652 part 3). Appended.
   ImportRefused {
     /// Why.
     fault: ImportFault,
@@ -4460,7 +4463,8 @@ pub enum ArchiveFault {
 /// caller acts on alike. Append-only.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub enum ImportFault {
-  /// The repository serves another tool than Mercurial.
+  /// The repository serves a tool whose history the import does not read: neither Mercurial's (its directory) nor
+  /// Subversion's (a dump, A-652 part 3).
   NotMercurial,
   /// The repository's store holds a history: an import takes the place of the empty store its creation made.
   NotEmpty,
@@ -4486,6 +4490,17 @@ pub enum ImportFault {
   Pending,
   /// The import was given back before its end: its repository was freed.
   Abandoned,
+  /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3): Subversion's error
+  /// number, the revision being loaded, and the path the refusal names. The revisions committed before it stay, as
+  /// `svnadmin load` keeps them. Appended.
+  Subversion {
+    /// Subversion's error number (`svn_error_codes.h`).
+    code: u32,
+    /// The revision being loaded; none before the stream's first revision record.
+    revision: Option<u64>,
+    /// The path the refusal names, empty where it names none.
+    path: String,
+  },
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
@@ -5409,6 +5424,14 @@ pub enum ReplyBody {
     file_revisions: u64,
     /// The obsolescence markers.
     markers: u64,
+  },
+  /// A Subversion dump imported into its repository (`ImportRepository`, A-652 part 3): the revisions it committed, and
+  /// the repository's youngest revision now. Appended.
+  DumpImported {
+    /// The revisions committed.
+    revisions: u64,
+    /// The youngest revision.
+    youngest: u64,
   },
 }
 

@@ -2725,3 +2725,102 @@ fn a_wait_and_its_transaction_are_one_durable_step() {
     Seen::Completed(b"seven".to_vec())
   );
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// A-694: volume ids minted per record.
+
+/// One step of a minting history (A-694).
+#[derive(Clone, Debug)]
+enum MintStep {
+  /// Volumes created in one record, each id minted at its own offset before any of them is recorded, as an append's new
+  /// branches are.
+  Together(u8),
+  /// A volume created in a record of its own.
+  Alone,
+  /// A record that creates no volume.
+  Other,
+  /// The database dropped and recovered from the segment.
+  Crash,
+}
+
+/// A minting step: mostly creations, alone or several to a record, beside other records and crashes.
+fn mint_step() -> impl Strategy<Value = MintStep> {
+  (0u8..8, 1u8..5).prop_map(|(kind, count)| match kind {
+    0 => MintStep::Crash,
+    1 | 2 => MintStep::Alone,
+    3 => MintStep::Other,
+    _ => MintStep::Together(count),
+  })
+}
+
+/// A volume whose id the server's layout mints: host and partition zero, and `counter` in its last six bytes.
+fn minted_volume(counter: u64) -> VolumeRecord {
+  let mut record = volume(0, &format!("m{counter}"));
+  let mut bytes = [0u8; 16];
+  bytes[10..].copy_from_slice(&counter.to_be_bytes()[2..]);
+  record.id = VolumeId { bytes };
+  record
+}
+
+/// Runs a minting history (A-694): every id minted is new, whether minted alone or several before one record, and after
+/// every crash the recovered partition equals the live one and mints the next id the live database would.
+fn every_mint_is_new_and_a_recovery_mints_alike(steps: &[MintStep]) -> Result<(), TestCaseError> {
+  let mut seg = segment("slates-db-model-mint", LOG_BYTES);
+  let mut db = open(&mut seg);
+  let mut minted = std::collections::BTreeSet::new();
+  let mut instance = 0u32;
+  for step in steps {
+    match step {
+      MintStep::Crash => {
+        let (live, next) = (db.partition().to_snapshot(0), db.volume_counter_at(0));
+        drop(db);
+        let (recovered, _) = recover(&mut seg, 0, caps(), 0).map_err(failed)?;
+        prop_assert_eq!(recovered.partition().to_snapshot(0), live);
+        prop_assert_eq!(recovered.volume_counter_at(0), next);
+        db = recovered;
+      }
+      MintStep::Alone => {
+        let counter = db
+          .volume_counter_at(0)
+          .ok_or_else(|| failed("ids exhausted"))?;
+        let record = minted_volume(counter);
+        db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+          .map_err(failed)?;
+        prop_assert!(minted.insert(counter), "{} minted twice", counter);
+      }
+      MintStep::Together(count) => {
+        let counters: Vec<u64> = (0..u64::from(*count))
+          .map(|offset| db.volume_counter_at(offset))
+          .collect::<Option<_>>()
+          .ok_or_else(|| failed("ids exhausted"))?;
+        db.begin();
+        for counter in &counters {
+          let record = minted_volume(*counter);
+          db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+            .map_err(failed)?;
+          prop_assert!(minted.insert(*counter), "{} minted twice", counter);
+        }
+        db.commit(&mut seg).map_err(failed)?;
+      }
+      MintStep::Other => {
+        instance += 1;
+        db.mutate(&mut seg, &Op::NfsInstanceAdvanced { instance }, 0)
+          .map_err(failed)?;
+      }
+    }
+  }
+  Ok(())
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(60), ..ProptestConfig::default() }))]
+
+  /// A-694 (§4.8 "Recovery"; guard then apply): do run generated histories of volumes created alone and several to one
+  /// record, each id minted from the database's counter at its offset before its record (as an append mints its new
+  /// branches'), beside records that create none, dropping and recovering the database at random points. Expect every
+  /// id minted new, and every recovery equal to the live partition, minting the next id the live database would.
+  #[test]
+  fn t_a694_every_mint_is_new_and_a_recovery_mints_alike(steps in proptest::collection::vec(mint_step(), 1..120)) {
+    every_mint_is_new_and_a_recovery_mints_alike(&steps)?;
+  }
+}

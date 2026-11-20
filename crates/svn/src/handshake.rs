@@ -299,6 +299,32 @@ pub enum Unserved<'a> {
   NoAccess,
 }
 
+impl Unserved<'_> {
+  /// The error `svnserve` answers the URL with, its number and message: what [`Server::refuse`]
+  /// writes as the command failure, and what `svnserve -t` then ends with on its standard error
+  /// (A-688: each recorded so from stock `svnserve -t` 1.15.0).
+  pub fn failure(&self) -> (u32, Vec<u8>) {
+    match *self {
+      Unserved::BadUrl { url } => (
+        SVN_ERR_BAD_URL,
+        quoted(b"Non-svn URL passed to svn server: '", url),
+      ),
+      Unserved::BadPath => (
+        SVN_ERR_BAD_FILENAME,
+        b"Couldn't determine repository path".to_vec(),
+      ),
+      Unserved::NoRepository { url } => (
+        SVN_ERR_RA_SVN_REPOS_NOT_FOUND,
+        quoted(b"No repository found in '", url),
+      ),
+      Unserved::NoAccess => (
+        SVN_ERR_RA_NOT_AUTHORIZED,
+        b"No access allowed to this repository".to_vec(),
+      ),
+    }
+  }
+}
+
 /// What [`Server::open`] answered the client's URL with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -882,24 +908,7 @@ impl Server {
     if !matches!(self.state, State::Opening(_)) {
       return Err(Refused::OutOfTurn);
     }
-    let (code, message) = match unserved {
-      Unserved::BadUrl { url } => (
-        SVN_ERR_BAD_URL,
-        quoted(b"Non-svn URL passed to svn server: '", url),
-      ),
-      Unserved::BadPath => (
-        SVN_ERR_BAD_FILENAME,
-        b"Couldn't determine repository path".to_vec(),
-      ),
-      Unserved::NoRepository { url } => (
-        SVN_ERR_RA_SVN_REPOS_NOT_FOUND,
-        quoted(b"No repository found in '", url),
-      ),
-      Unserved::NoAccess => (
-        SVN_ERR_RA_NOT_AUTHORIZED,
-        b"No access allowed to this repository".to_vec(),
-      ),
-    };
+    let (code, message) = unserved.failure();
     self.state = State::Ended;
     write_command_failure(code, &message, out)
   }

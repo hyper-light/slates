@@ -695,7 +695,7 @@ fn put_tagged_paths(out: &mut Vec<u8>, tag: u8, paths: &[&str]) {
 /// over the increment's ops, once per entry encoded or decoded; finding them by scanning every op
 /// for each splice and each copy cost O(effects × ops), quadratic for a version that splices many
 /// files.
-struct Declared<'a> {
+pub(crate) struct Declared<'a> {
   /// Each path's content ops, in the increment's order.
   ops: BTreeMap<&'a str, Vec<Op>>,
   /// Each copy's source version and whether it replaces, by destination, then source; the first a
@@ -705,7 +705,7 @@ struct Declared<'a> {
 
 impl<'a> Declared<'a> {
   /// The index of what `increment` declares: every op visited once.
-  fn of(increment: &'a Increment) -> Declared<'a> {
+  pub(crate) fn of(increment: &'a Increment) -> Declared<'a> {
     let mut declared = Declared {
       ops: BTreeMap::new(),
       copies: BTreeMap::new(),
@@ -745,7 +745,9 @@ impl<'a> Declared<'a> {
   }
 }
 
-fn put_applied(out: &mut Vec<u8>, declared: &Declared<'_>, applied: &Applied) {
+/// Appends one effect as an entry records it (module docs); a computed verdict's wire form writes its effects so too
+/// (`crate::engine`'s `computed_wire`, A-658 part 3a).
+pub(crate) fn put_applied(out: &mut Vec<u8>, declared: &Declared<'_>, applied: &Applied) {
   match applied {
     Applied::Special(path, node) => {
       put_tagged_paths(out, tag::SPECIAL, &[path]);
@@ -804,7 +806,8 @@ fn put_applied(out: &mut Vec<u8>, declared: &Declared<'_>, applied: &Applied) {
   }
 }
 
-fn take_applied(
+/// Reads one effect [`put_applied`] wrote, refused typed.
+pub(crate) fn take_applied(
   reader: &mut Reader<'_>,
   declared: &Declared<'_>,
 ) -> Result<Applied, DocDecodeError> {
