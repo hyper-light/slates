@@ -147,6 +147,10 @@ pub(crate) const WINDOWS_RESTORED: &str = "vcs_store.windows_restored";
 pub(crate) const WINDOWS_UNRESTORED: &str = "vcs_store.windows_unrestored";
 /// Counter (A-727 slice a3): restored windows no replayed record named, freed once the records were replayed.
 pub(crate) const WINDOWS_UNHELD: &str = "vcs_store.windows_unheld";
+/// Counter (A-727 slice a3b): a content store's lists and names a recovery took back from the shard image.
+pub(crate) const NODES_RESTORED: &str = "vcs_store.nodes_restored";
+/// Counter (A-727 slice a3b): lists and names of the shard image a recovery could not take back.
+pub(crate) const NODES_UNRESTORED: &str = "vcs_store.nodes_unrestored";
 /// Counter: a store a recovery could not make again from its records: zero in every correct use. Format: a counter name.
 pub(crate) const REPLAY_REFUSED: &str = "vcs_store.replay_refused";
 /// Counter: a store made again from the log after its commit's entry was not made durable. Format: a counter name.
@@ -216,6 +220,10 @@ pub(crate) struct VcsStores {
   /// Where the content store keeps its windows once it is made (A-727 slice a2): the shard's repository arena, given by
   /// the shard's start; none in a test's stores, whose content store keeps them in memory.
   window_storage: Option<Box<dyn slates_vcs::WindowStorage>>,
+  /// A recovery's lists and names of the content store (A-727 slice a3b), taken in when the store is made.
+  restored_nodes: Option<RestoredNodes>,
+  /// What the content store took back of them: restored, refused (counted by the recovery).
+  nodes_restored: (u64, u64),
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -1123,6 +1131,14 @@ impl VcsStores {
         None => ContentStore::new(self.charged, window),
       }?;
       self.content = Some(content);
+      // A recovery's lists and names (a3b), over the windows the storage handed back: counted by the owner.
+      if let (Some((lists, names)), Some(content)) =
+        (self.restored_nodes.take(), self.content.as_mut())
+      {
+        let offered = u64::try_from(lists.len().saturating_add(names.len())).unwrap_or(u64::MAX);
+        let refused = content.restore_nodes(lists, names);
+        self.nodes_restored = (offered.saturating_sub(refused), refused);
+      }
     }
     Ok(())
   }
@@ -1146,6 +1162,13 @@ impl VcsStores {
     }
   }
 }
+
+/// A content store's lists, each by identity with its bytes, and its names, an object's identity with its root, as a
+/// shard image carried them (A-727 slice a3b).
+type RestoredNodes = (
+  Vec<(slates_vcs::ContentId, Vec<u8>)>,
+  Vec<(slates_vcs::ContentId, slates_vcs::ContentId)>,
+);
 
 /// The shard's chunk store lent to the repository content store for one step (A-727 slice a2, `arena_windows`): taken
 /// in when made, handed back when dropped, so no path out of the step keeps it, and the shard budget extended by what
@@ -2511,8 +2534,22 @@ pub(crate) fn chunk_windows_mut(
 /// Takes the repository windows the shard image names back (A-727 slice a3), before the volumes and the records: each
 /// chunk's block claimed in the shard's chunk store and its chunk recorded, the windows handed to the content store the
 /// first repository's replay makes. Only before a content store is made; counted restored and not.
-pub(crate) fn restore_windows(state: &mut ShardState, pieces: &[(u64, Vec<u8>)]) {
-  if pieces.is_empty() || state.vcs_stores.content.is_some() {
+pub(crate) fn restore_windows(
+  state: &mut ShardState,
+  pieces: &[(u64, Vec<u8>)],
+  (lists, names): (
+    &[(slates_vcs::ContentId, Vec<u8>)],
+    &[(slates_vcs::ContentId, slates_vcs::ContentId)],
+  ),
+) {
+  if state.vcs_stores.content.is_some() {
+    return;
+  }
+  // The lists and names are taken in when the content store is made over the windows (`VcsStores::content_made`).
+  if !lists.is_empty() || !names.is_empty() {
+    state.vcs_stores.restored_nodes = Some((lists.to_vec(), names.to_vec()));
+  }
+  if pieces.is_empty() {
     return;
   }
   let (windows, refused) =
@@ -2528,6 +2565,9 @@ pub(crate) fn restore_windows(state: &mut ShardState, pieces: &[(u64, Vec<u8>)])
 /// Frees the restored windows no replayed record named (A-727 slice a3), once every record is replayed, and settles the
 /// shard's charge.
 fn release_unheld_windows(state: &mut ShardState) {
+  let (restored, refused) = std::mem::take(&mut state.vcs_stores.nodes_restored);
+  state.count(NODES_RESTORED, restored);
+  state.count(NODES_UNRESTORED, refused);
   let freed = {
     let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
     lent

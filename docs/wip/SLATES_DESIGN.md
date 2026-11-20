@@ -55233,6 +55233,13 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   replayed (`vcs_store.windows_restored`, `.windows_unrestored`, `.windows_unheld`). Test
   `daemon::tests::t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image`. Owed: records naming
   identities only (slice b, with w-balance's name rows and the `homes` tickets); a homed window's holders.
+- **The identity rule and slice a3b (2026-11-20, main's ruling; R8).** An identity that crosses a node is plain BLAKE3 of
+  the bytes: `ContentStore::put_object`, `finish_object` and `object_id` answer it whatever window the store cuts at
+  (sixteen base pages: 256 KiB on macOS arm64, 64 KiB on 4 KiB Linux), the root a node-local name every lookup resolves
+  (9010c5630). a3b: the store's lists and names ride the shard image beside the windows (kinds 12 and 13), restored
+  before the records, so an object past a window is whole by its identity after a restart with no record's bytes.
+  Test `daemon::tests::t_a727_a3b_an_object_past_a_window_survives_a_warm_restart_by_its_identity` (1 MiB file),
+  red with the pieces left out.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)

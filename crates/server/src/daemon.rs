@@ -7759,6 +7759,106 @@ mod tests {
     assert_eq!(seen, Some((true, true, 0, 0, vec![3])));
   }
 
+  /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained
+  /// anchor segment and content object, push a create of `main` whose one file is 1 MiB (past any node's window); read
+  /// the file's object by its identity, the BLAKE3 of its bytes; publish; stop; start a successor and read it again.
+  /// Expect: the object whole by its identity on both; the successor taking back every list and name of the content
+  /// store from the shard image (none refused), so the records' replay stores no list again.
+  #[test]
+  fn t_a727_a3b_an_object_past_a_window_survives_a_warm_restart_by_its_identity() {
+    use slates_anchor::AnchorSegment;
+    const LARGE: usize = 1 << 20;
+    let profile = test_profile();
+    let instance = format!("a727-a3b-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let (request, _) = crate::git_push::tests::large_create(LARGE);
+    let blob: Vec<u8> = (0..LARGE)
+      .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
+      .collect();
+    let identity = slates_vcs::ContentId::of(&blob);
+    let len = u64::try_from(LARGE).unwrap();
+    let read = move |state: &mut crate::state::ShardState| {
+      let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+      lent
+        .stores
+        .content()
+        .and_then(|content| content.object_bytes(&identity, len))
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let before = first
+      .observe(first.shards.first().copied(), move |state| {
+        let repository = crate::git_push::tests::git_repository(state, "large");
+        let received = crate::git_push::tests::pushed(state, repository, &request);
+        let _ = received;
+        crate::vcs_store::paths::whole_build::settle(state);
+        read(state)
+      })
+      .unwrap();
+    first.publish_every_shard().unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let observe = || {
+      second
+        .observe(shard, move |state| {
+          let bytes = read(state);
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          let lists = state
+            .vcs_stores
+            .content()
+            .map(|content| content.counters().lists);
+          (
+            bytes,
+            count(crate::vcs_store::NODES_RESTORED),
+            count(crate::vcs_store::NODES_UNRESTORED),
+            lists,
+          )
+        })
+        .ok()
+    };
+    let mut seen = observe();
+    for _ in 0..600 {
+      if seen.as_ref().is_some_and(|seen| seen.0.is_some()) {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(50));
+      seen = observe();
+    }
+    second.stop();
+    assert_eq!(
+      before.as_deref(),
+      Some(blob.as_slice()),
+      "the object by its identity before"
+    );
+    let (after, restored, unrestored, lists) = seen.expect("the successor answered");
+    assert_eq!(
+      after.as_deref(),
+      Some(blob.as_slice()),
+      "the object by its identity after"
+    );
+    assert!(restored > 0, "the lists and names taken back");
+    assert_eq!(
+      (unrestored, lists),
+      (0, Some(0)),
+      "none refused, no list stored again"
+    );
+  }
+
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
   /// git repository and push the fixtures' `create` and `update` into it; publish every shard; stop; start a successor
   /// over the same segment. Expect: every window the first daemon kept (by identity, with its holders and its bytes)
