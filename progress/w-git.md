@@ -149,3 +149,9 @@
   AnswerState::Sealing + SealingPush::turn, replay seal through Staging, Drop gives back Sealing/Deciding.
   NEXT 4c: moves' admission (admit_moves / SealedPush::admit walk) + landing O(objects) passes + stale restage sliced;
   then by-use proof 10/19 concurrent pushes after w-balance resolve-in-turns lands.
+- A-722 part 4c LANDED 51fff3e6f (main d435c91b7, ~05:15): slates_git::store::Admitting (walk/descent/base/beyond units),
+  Repository::admit = units to end; receive::Judge::ready (default true) called before verdict in each_step/atomic_step;
+  ServerJudge::ready → SealedPush::admission_turn keeps Move in sealed.prepared; SealedPush::admit takes it when
+  to + current_head match. Measured & sent: work build + apply dominate (works/merge).
+  NEXT 4d: store commit passes (brought_by, landed_runs, plan/members_positions, release_holds) + stale restage sliced;
+  by-use 10/19 proof when w-balance-fix1 (76070d077) lands on main.
