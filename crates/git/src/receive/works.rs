@@ -39,7 +39,7 @@
 //! that moved, `missing necessary objects`) and in slates' own words otherwise, one reason for each
 //! refusal, with a band-2 line naming the path.
 
-use slates_merge::pace::Pace;
+use slates_merge::pace::{Pace, Slices};
 use slates_merge::push::{Building, Built, ObjectKey, Push, PushObjects, PushRefused, build};
 use slates_merge::{ConflictWindow, Green, Increment};
 use std::cell::Cell;
@@ -329,13 +329,15 @@ where
   /// One turn of `command`'s work, built against the green and base its verdict will read (A-752): whether it is
   /// ready, so this step judges it (a delete, a command whose verdict refuses before any work, or a work built); not
   /// ready, the turn, begun at `began`, ended at `deadline` on `clock` (the owner's, nanoseconds) and `preparing` keeps
-  /// the build for the next. What the turn did before its first unit is its opening ([`Preparing::opening_ns`]). A build for another command or push is begun again.
+  /// the build for the next, each unit moving at most the owner's derived `slices`. What the turn did before its first
+  /// unit is its opening ([`Preparing::opening_ns`]). A build for another command or push is begun again.
   pub fn prepare(
     &self,
     command: &Command,
     pushed: &Pushed<'_>,
     preparing: &mut Option<Preparing>,
     (clock, began, deadline): (fn() -> u64, u64, u64),
+    slices: Slices,
   ) -> bool {
     if command.is_delete() {
       return true;
@@ -375,7 +377,7 @@ where
         return true;
       };
       let pace = prepared.building.pace();
-      pace.turn_from(began, deadline);
+      pace.turn_from(began, (deadline, slices));
       prepared.done = prepared.building.advance(green, self.objects);
       prepared.done.is_some()
     };

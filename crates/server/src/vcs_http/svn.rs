@@ -797,7 +797,7 @@ impl<S: SvnStores> SvnExchange<S> {
 
   /// What this repository's hooks need of it (A-733): its id, name and REPOS.
   fn hooked(&self) -> Hooked {
-    Hooked::new(self.repository, &self.name)
+    Hooked::new(self.repository, &self.name, Hooked::published_root())
   }
 
   /// A POST making a transaction: its revision properties from the body's skel, the principal its author.
@@ -1630,7 +1630,7 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
     )
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
     match &mut self.answered {
       Some(Answered::Whole { body, .. }) => {
         out.append(body);

@@ -58,11 +58,15 @@ impl Store {
       let after = read.last().map(|(name, _)| name.clone());
       let (part, more) = entries_after(self, root, after.as_deref(), most).unwrap();
       assert!(part.len() <= most);
-      read.extend(
-        part
-          .into_iter()
-          .map(|(key, id)| (self.key_name(key as u32).unwrap().to_owned(), id.0)),
-      );
+      read.extend(part.into_iter().map(|(key, id)| {
+        (
+          self
+            .key_name(u32::try_from(key).unwrap())
+            .unwrap()
+            .to_owned(),
+          id.0,
+        )
+      }));
       if !more {
         return read;
       }
@@ -74,7 +78,15 @@ impl Store {
     entries(self, root)
       .unwrap()
       .into_iter()
-      .map(|(key, id)| (self.key_name(key as u32).unwrap().to_owned(), id.0))
+      .map(|(key, id)| {
+        (
+          self
+            .key_name(u32::try_from(key).unwrap())
+            .unwrap()
+            .to_owned(),
+          id.0,
+        )
+      })
       .collect()
   }
 }
@@ -91,6 +103,23 @@ enum Change {
 /// A name of the run: a few thousand, so maps grow several levels deep.
 fn name(number: u16) -> String {
   format!("n{number:05}")
+}
+
+/// The map of `root` reads as `model`, whole and by a cursor of `page` names at a time.
+fn assert_reads_as_the_model(
+  store: &Store,
+  root: u32,
+  model: &BTreeMap<String, usize>,
+  page: usize,
+) {
+  assert_eq!(
+    store.read(root),
+    model.clone().into_iter().collect::<Vec<_>>()
+  );
+  assert_eq!(
+    store.read_by_cursor(root, page),
+    model.clone().into_iter().collect::<Vec<_>>()
+  );
 }
 
 /// Applies `changes` to an empty map and to the model, committing (a revision's end) after every `batch` of them;
@@ -114,14 +143,7 @@ fn run(changes: &[Change], batch: usize) {
     }
     let check = at % CHECK_EVERY == 0 || at + 1 == changes.len();
     if check {
-      assert_eq!(
-        store.read(root),
-        model.clone().into_iter().collect::<Vec<_>>()
-      );
-      assert_eq!(
-        store.read_by_cursor(root, 1 + at % 13),
-        model.clone().into_iter().collect::<Vec<_>>()
-      );
+      assert_reads_as_the_model(&store, root, &model, 1 + at % 13);
     }
     if (at + 1) % batch == 0 {
       store.committed = store.nodes.len();
@@ -187,10 +209,12 @@ proptest! {
   #[test]
   fn a_generated_run_is_the_models(
     changes in proptest::collection::vec(
-      prop_oneof![
-        (0u16..200, any::<bool>(), 0usize..1_000).prop_map(|(n, c, id)| Change::Set(n, c, id)),
-        (0u16..200).prop_map(Change::Remove),
-      ],
+      proptest::strategy::Union::new([
+        (0u16..200, any::<bool>(), 0usize..1_000)
+          .prop_map(|(n, c, id)| Change::Set(n, c, id))
+          .boxed(),
+        (0u16..200).prop_map(Change::Remove).boxed(),
+      ]),
       0..400,
     ),
     batch in 1usize..20,

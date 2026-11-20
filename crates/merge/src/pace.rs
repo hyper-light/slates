@@ -41,6 +41,27 @@ struct Turn {
   longest_unit: u64,
   /// The last turn's opening, nanoseconds: from its owner's mark to its first ask.
   opening: u64,
+  /// The bytes a unit may copy or hash this turn ([`Slices`]).
+  slices: Slices,
+}
+
+/// The bytes one unit may move this turn, its owner's derived slices (R3: the merge engine measures no machine, so its
+/// owner gives them, as it gives the clock): what a unit copies or zeroes (the owner's copy slice, at its measured
+/// memcpy rate) and what it hashes (its hash slice, at its measured BLAKE3 rate). Unbounded, a unit is the whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slices {
+  /// The bytes a unit copies or zeroes.
+  pub copy_bytes: u64,
+  /// The bytes a unit hashes.
+  pub hash_bytes: u64,
+}
+
+impl Slices {
+  /// No bound: a unit moves the whole.
+  pub const WHOLE: Slices = Slices {
+    copy_bytes: u64::MAX,
+    hash_bytes: u64::MAX,
+  };
 }
 
 /// The clock of an unbounded turn, never read.
@@ -59,6 +80,7 @@ impl Turn {
     asked_at: 0,
     longest_unit: 0,
     opening: 0,
+    slices: Slices::WHOLE,
   };
 
   /// Whether another unit runs this turn ([`Pace::more`]).
@@ -136,8 +158,9 @@ impl Pace {
   /// [`Pace::turn`] for a turn its owner began at `began_ns` on the clock: what the owner did before its first ask is the
   /// turn's opening ([`Pace::opening_ns`]), the units between its asks ([`Pace::longest_unit_ns`]), and what follows
   /// its last ask ([`Pace::asked_at_ns`]) its owner's again.
-  pub fn turn_from(&self, began_ns: u64, deadline_ns: u64) {
+  pub fn turn_from(&self, began_ns: u64, (deadline_ns, slices): (u64, Slices)) {
     self.with(|turn| {
+      turn.slices = slices;
       turn.deadline = deadline_ns;
       turn.fresh = false;
       turn.opened = true;
@@ -160,6 +183,11 @@ impl Pace {
       self.turn.set(turn);
     }
     polled
+  }
+
+  /// The bytes a unit may copy or hash this turn ([`Slices`]): the whole until a turn gives its owner's.
+  pub fn slices(&self) -> Slices {
+    self.turn.get().slices
   }
 
   /// The units granted so far, every turn.
@@ -240,24 +268,28 @@ pub fn finish<F: Future>(work: F) -> F::Output {
   done
 }
 
-/// `items` sorted by `order`, stably, a unit an item moved (A-752): a bottom-up merge of runs, so no unit is the whole
-/// sort. Equal items keep their order, as `slice::sort_by` keeps it.
+/// `items` sorted by `order`, stably, a unit an item moved (A-752): a bottom-up merge of the input's own runs, so no
+/// unit is the whole sort. The first pass cuts the items into their maximal non-decreasing runs, an item a unit, so the
+/// runs' length is the data's own (an input in order is one run, merged no further), never a tuned number (R3). Equal
+/// items keep their order, as `slice::sort_by` keeps it.
 pub async fn sort_by<T>(
   items: Vec<T>,
   ticks: &Ticks,
   mut order: impl FnMut(&T, &T) -> core::cmp::Ordering,
 ) -> Vec<T> {
-  /// The items a first run holds, sorted whole as one unit.
-  const RUN: usize = 16;
   let mut runs: std::collections::VecDeque<Vec<T>> = std::collections::VecDeque::new();
-  let mut items = items.into_iter();
-  loop {
+  let mut run: Vec<T> = Vec::new();
+  for item in items {
     ticks.tick().await;
-    let mut run: Vec<T> = items.by_ref().take(RUN).collect();
-    if run.is_empty() {
-      break;
+    if run
+      .last()
+      .is_some_and(|last| order(&item, last) == core::cmp::Ordering::Less)
+    {
+      runs.push_back(core::mem::take(&mut run));
     }
-    run.sort_by(&mut order);
+    run.push(item);
+  }
+  if !run.is_empty() {
     runs.push_back(run);
   }
   while runs.len() > 1 {

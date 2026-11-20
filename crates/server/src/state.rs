@@ -790,6 +790,11 @@ pub struct ShardState {
   /// bounded by the hooks their policies configure. Unix alone, where hooks run.
   #[cfg(unix)]
   pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
+  /// The root mount this daemon published (§4.6, D-1; A-645 P3): the point the host shows every volume beneath, which a
+  /// hook is handed its repository's view beneath. The daemon's own record of the mount it made, written on every shard
+  /// when it publishes the mount, never a configured value that could drift from the mount (main's ruling of
+  /// 2026-11-20). None until then, and a configured hook is refused, typed, while it is none.
+  pub(crate) root_mount: Option<std::path::PathBuf>,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,

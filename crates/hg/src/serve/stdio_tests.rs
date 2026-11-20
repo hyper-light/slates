@@ -472,3 +472,96 @@ proptest! {
     prop_assert!(stdio.finished());
   }
 }
+
+/// A-758 (7.2's `wireprotov1server.batch` runs a batched `pushkey` among its calls). Do: hand a session a `batch` of
+/// `listkeys bookmarks`, a `pushkey` of bookmark `moved-bm`, and `listkeys namespaces`; land the push it hands over,
+/// its reply saying the key moved; step again. Expect the batch's request taken whole by the first step with nothing
+/// answered, one push handed over (heads `force`, one advisory `pushkey` part for `moved-bm`), and once it lands one
+/// answer: three results, the first `listkeys bookmarks`' own answer, the second `1` (moved), the third listing the
+/// namespaces.
+#[test]
+fn a_batched_pushkey_is_landed_between_its_neighbours() {
+  let served = cloned();
+  let node = "0123456789abcdef0123456789abcdef01234567";
+  let cmds = format!(
+    "listkeys namespace=bookmarks;pushkey namespace=bookmarks,key=moved-bm,old=,new={node};\
+     listkeys namespace=namespaces"
+  );
+  let input = format!("batch\n* 0\ncmds {}\n{cmds}", cmds.len());
+  let mut stdio = Stdio::new(1 << 16);
+  stdio.receive(input.as_bytes()).unwrap();
+  let first = stdio.step(&served, ROOM);
+  let before = stdio.stdout().to_vec();
+  let push = stdio.take_push().unwrap();
+  let read = crate::push::read_bundle(&push.bundle, &mut Admission::new(ROOM)).unwrap();
+  let keys: Vec<(bool, Vec<u8>)> = read
+    .parts
+    .iter()
+    .filter_map(|taken| match &taken.asks {
+      crate::push::Asks::Pushkey(ask) => Some((taken.mandatory, ask.key.clone())),
+      _ => None,
+    })
+    .collect();
+  let moved = Outcome::Accepted(Reply::accepted(
+    &[reply::Replied::Pushkey {
+      in_reply_to: 1,
+      moved: true,
+    }],
+    true,
+  ));
+  let mut left = push.admission;
+  stdio.pushed(&moved, &mut left);
+  let after = stdio.step(&served, ROOM);
+  let crate::ssh::Read::Done(value, _) =
+    crate::ssh::string(stdio.stdout(), &Admission::new(ROOM)).unwrap()
+  else {
+    panic!("a string answer");
+  };
+  let mut buffer = Vec::new();
+  let results = crate::batch::results(value, &mut Admission::new(ROOM), &mut buffer).unwrap();
+  let (mut alone, mut ignored) = (Vec::new(), Vec::new());
+  super::super::session::serve(
+    &served,
+    b"listkeys\nnamespace 9\nbookmarks",
+    &mut Admission::new(ROOM),
+    &mut alone,
+    &mut ignored,
+  );
+  let crate::ssh::Read::Done(listed, _) =
+    crate::ssh::string(&alone, &Admission::new(ROOM)).unwrap()
+  else {
+    panic!("a string answer");
+  };
+  assert_eq!(
+    (
+      first,
+      before.is_empty(),
+      push.heads,
+      keys,
+      after,
+      results.len(),
+      results.first().copied(),
+      results.get(1).copied(),
+      results
+        .get(2)
+        .is_some_and(|names| names.starts_with(b"bookmarks\t")),
+    ),
+    (
+      Progress::Stepped {
+        step: Step::Answered { refused: None },
+        consumed: input.len()
+      },
+      true,
+      HeadsArgument::Force,
+      vec![(false, b"moved-bm".to_vec())],
+      Progress::Stepped {
+        step: Step::Answered { refused: None },
+        consumed: 0
+      },
+      3,
+      Some(listed),
+      Some(&b"1\n"[..]),
+      true,
+    )
+  );
+}
