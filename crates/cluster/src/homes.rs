@@ -298,35 +298,46 @@ mod tests {
   use slates_db::identity_homes::homes;
   use slates_db::register::HostId;
 
+  /// Any message, each kind alike. The union is built as `prop_oneof!` builds one of more than ten arms, from boxed
+  /// strategies: its shorter forms hold their arms in `Arc`s (R2).
   fn message() -> impl Strategy<Value = HomeMessage> {
     let identity = proptest::array::uniform32(any::<u8>());
     let bytes = proptest::collection::vec(any::<u8>(), 0..2048);
-    prop_oneof![
-      (identity.clone(), bytes.clone())
-        .prop_map(|(identity, bytes)| HomeMessage::Put { identity, bytes }),
+    proptest::strategy::Union::new([
+      (identity, bytes.clone())
+        .prop_map(|(identity, bytes)| HomeMessage::Put { identity, bytes })
+        .boxed(),
       identity
-        .clone()
-        .prop_map(|identity| HomeMessage::Read { identity }),
+        .prop_map(|identity| HomeMessage::Read { identity })
+        .boxed(),
       identity
-        .clone()
-        .prop_map(|identity| HomeMessage::LetGo { identity }),
-      (identity.clone(), any::<u64>()).prop_map(|(identity, generation)| HomeMessage::Answer {
-        identity,
-        outcome: HomeOutcome::Kept { generation }
-      }),
-      (identity.clone(), bytes).prop_map(|(identity, bytes)| HomeMessage::Answer {
-        identity,
-        outcome: HomeOutcome::Bytes(bytes)
-      }),
-      identity.clone().prop_map(|identity| HomeMessage::Answer {
-        identity,
-        outcome: HomeOutcome::LetGo
-      }),
-      identity.prop_map(|identity| HomeMessage::Answer {
-        identity,
-        outcome: HomeOutcome::Refused(HomeRefusal::NotAHome)
-      }),
-    ]
+        .prop_map(|identity| HomeMessage::LetGo { identity })
+        .boxed(),
+      (identity, any::<u64>())
+        .prop_map(|(identity, generation)| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::Kept { generation },
+        })
+        .boxed(),
+      (identity, bytes)
+        .prop_map(|(identity, bytes)| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::Bytes(bytes),
+        })
+        .boxed(),
+      identity
+        .prop_map(|identity| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::LetGo,
+        })
+        .boxed(),
+      identity
+        .prop_map(|identity| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::Refused(HomeRefusal::NotAHome),
+        })
+        .boxed(),
+    ])
   }
 
   proptest! {

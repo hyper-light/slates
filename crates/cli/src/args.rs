@@ -38,6 +38,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   changed-since GREEN VERSION [--json]             files changed since a version
   work GREEN NAME [--json]                         a work volume over a green
   edit WORK PATH AT DELETE TEXT [--json]           declare an edit (a splice)
+  copy WORK FROM TO [--version N] [--replace] [--json]   declare a copy of FROM's tree to TO (the work's base when no N)
   submit WORK [--evidence HEX] [--json]            submit a work's increment
   rebase WORK [--json]                             rebase a work onto its green's head
   checkout GREEN VOLUME ATTACHMENT --snapshot N [--json]   write a green's head into the volume it was made from
@@ -350,6 +351,20 @@ pub(crate) enum Verb {
     delete_len: u64,
     /// Bytes inserted.
     bytes: Vec<u8>,
+  },
+  /// Declare a copy on a work volume (A-626 part 4): `from`'s tree, as version `version` of the work's green held it
+  /// (the work's base when none), copied to `to` by reference, replacing what `to` holds when `replace`.
+  Copy {
+    /// The work volume.
+    work: slates_client::VolumeId,
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from; none for the work's base.
+    version: Option<u64>,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
   },
   /// Submit a work volume's increment to its green.
   Submit {
@@ -872,6 +887,7 @@ const SWITCHES: &[&str] = &[
   "--keep",
   "--apparmor-profile",
   "--hold",
+  "--replace",
 ];
 
 /// Takes the untouched command after `--` (`exec` and `run` share this boundary).
@@ -2551,6 +2567,22 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         },
       ))
     }
+    ["copy", work, from, to] => {
+      taken.only(&Spec {
+        values: &["--version"],
+        switches: &["--replace"],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::Copy {
+          work: volume(work)?,
+          from: (*from).to_owned(),
+          to: (*to).to_owned(),
+          version: taken.value("--version").map(number).transpose()?,
+          replace: taken.switch("--replace"),
+        },
+      ))
+    }
     ["submit", work] => parse_submit(&taken, work),
     ["rebase", work] => {
       taken.only(&NONE)?;
@@ -3374,6 +3406,16 @@ mod tests {
         at: 0,
         delete_len: 5,
         bytes: b"hello".to_vec(),
+      }
+    );
+    assert_eq!(
+      verb(&format!("copy {id} /d /e --version 3 --replace")),
+      Verb::Copy {
+        work: vid,
+        from: "/d".into(),
+        to: "/e".into(),
+        version: Some(3),
+        replace: true,
       }
     );
     assert_eq!(

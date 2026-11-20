@@ -119,17 +119,16 @@ struct ModelPort {
 impl Port<Refusal> for ModelPort {
   fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>, Refusal> {
     self.asks.send((self.id, Ask::Receive)).unwrap();
-    match self.answers.recv().unwrap() {
-      Answer::Batch(batch) => {
-        if batch.is_empty() {
-          std::thread::sleep(IDLE_RECEIVE);
-        }
-        buffer[..batch.len()].copy_from_slice(&batch);
-        Ok(Some(batch.len()))
-      }
-      Answer::Stopped => Ok(None),
-      Answer::Sent => panic!("a receive answered as a send"),
+    let Some(batch) = batch_of(self.answers.recv().unwrap()) else {
+      return Ok(None);
+    };
+    if batch.is_empty() {
+      // WinFsp's receive idles up to its bound before it gives back an empty batch; woken early, it gives it back
+      // sooner, as the driver may.
+      std::thread::park_timeout(IDLE_RECEIVE);
     }
+    buffer[..batch.len()].copy_from_slice(&batch);
+    Ok(Some(batch.len()))
   }
 
   fn send(&mut self, response: &[u8]) -> Result<(), Refusal> {
@@ -137,11 +136,27 @@ impl Port<Refusal> for ModelPort {
       .asks
       .send((self.id, Ask::Send(response.to_vec())))
       .unwrap();
-    match self.answers.recv().unwrap() {
-      Answer::Sent => Ok(()),
-      _ => panic!("a send answered as a receive"),
-    }
+    sent(self.answers.recv().unwrap());
+    Ok(())
   }
+}
+
+/// A receive's answer: its batch, or `None` once the driver stopped; a test fails where a receive was answered as a
+/// send.
+fn batch_of(answer: Answer) -> Option<Vec<u8>> {
+  match answer {
+    Answer::Batch(batch) => Some(batch),
+    Answer::Stopped => None,
+    Answer::Sent => panic!("a receive answered as a send"),
+  }
+}
+
+/// A send's answer; a test fails where a send was answered as a receive.
+fn sent(answer: Answer) {
+  assert!(
+    matches!(answer, Answer::Sent),
+    "a send answered as a receive"
+  );
 }
 
 /// The modelled shard: answers every request with success, its own kind and hint.
