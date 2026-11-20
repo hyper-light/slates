@@ -101,3 +101,22 @@ NOT COMPLETE (keep open):
 - Next, the takeover test (NoLoss, StaleNeverCommits, TotalOrder) in crates/server/tests/fleet.rs. It needs the git
   HTTP edge on the in-process fleet daemons, a token for the owner, and a raw receive-pack client; none exist there
   today. The switch flips in the same commit that adds the passing test. ETA: this afternoon.
+
+### 2026-11-20 ~13:00: the takeover test is RED on v2 records: a successor serves a taken-over repository with NO refs
+Test: crates/cli/tests/v3_takeover.rs, on branch agents/w-balance-takeover-test (7e5ce95dc, not on main: it is red). Three
+`slates anchor --fleet` processes at f = 1 with their HTTPS edges; a repository on one node; three pushes acknowledged
+by stock git; a fourth in flight as the owner's anchor and daemon are SIGKILLed. Gated by SLATES_TEST_CLI.
+Four runs, the same each time:
+1. A survivor ADOPTS and REBUILDS the repository: `fleet.takeover.repository_adopted 1`,
+   `fleet.takeover.repository_rebuilt 1`, failover about 3 to 5 s.
+2. It serves the repository (ls-remote exit 0), but advertises NO refs at all. Every acknowledged push is lost (NoLoss
+   fails). The other survivor answers "repository not found".
+3. Credentials: a token minted on the owner is unknown on the successor (401), and a token minted on the successor names
+   its own account (403, A-237). So the test grants every principal read and push before the kill; a real client loses
+   access too.
+So "committed push records reach the successor by construction" doesn't hold for repositories today, even with v2
+records. The successor rebuilds from what it holds (`takeover::rebuild_repository` applies `RepositoryRebuilt
+{ record, parts }` with the names/phases/markers/locks logs, then `vcs_store::rebuild` replays the object records its
+own partition has, which appear to be none). Whoever owns A-636 should see this. The v3 switch stays off until this
+test passes; v3 adds nothing to the failure. Shall I take it (ship the repository's push records and greens to the
+successor), or does an A-636 owner?

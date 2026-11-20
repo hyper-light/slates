@@ -190,3 +190,69 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
 - NEXT: Windows (jupiter r57) results; then Linux when adacachy has room.
 - r67 release hg whole push on main 7b93d68c3: PUSH PASSES 142 s (~400 rev/s), RSS 5,460 MiB; clones refused
   PastAdmission (asked 228144 / stream 7081) -> w-hg; matrix 4/24. Reported.
+- Windows by use (jupiter, slates.exe from 9e9cfbd, MSYS git-matrix, git/git v1.0.0 cut fetched by tag; full mirror
+  clone fails schannel): push HTTP+SSH, ls-remote pass; clone spins shard 0 (2.3 s) -> daemon killed x3; edges come back
+  on NEW ports after restart (Windows-only; macOS keeps). 4/27. Reported. r73: rebuild at current main + rerun.
+- r73 (jupiter): rebuild at main 95044a3; slates_server rustc alone runs 25+ min single-core (debug) -- slow, not
+  stuck; no foreign lock holder (mine oldest cargo, 03:50:39). Main's rulings: Windows edge port parity -> w-reaper
+  (WSADuplicateSocketW); clone spin -> rerun on current main, send A-740 line if it still spins.
+- r73 Windows on main 95044a3 (build 75 min): 4/27; clone spins in vcs_http.rs:834 drive task (poll 11, 2437 ms);
+  restarted daemon spins in daemon.rs:1094 start_shard (poll 12, 2328 ms); ports change per restart. Reported.
+- Windows binary now current at C:\Users\corph\.cache\w-interop-target\debug\slates.exe (main 95044a3).
+- NEXT: hg matrix on Windows (uvx hg) with the same binary; Linux when adacachy has room.
+- Windows hg (r80, main 95044a3): 4/24; push 80 s; clones PastAdmission. hg on Windows via wrapper
+  C:\Users\corph\.cache\w-interop\bin\hg (uv run --with mercurial==7.2 python -c dispatch.run) since uvx hg.exe can't
+  load python312.dll.
+- LANDED cefd516dd (on main, checked): GAPS per-platform interop counts. Reported.
+- NEXT: Linux (adacachy) when it has room; re-run matrices as w-git/w-hg/w-reaper land fixes.
+- Linux (adacachy: git 2.56, ssh, uv, no svn, load 56): BLOCKED by a gap -- no Linux path to mint VCS credentials
+  (issuer surface = anchor-child descriptor; anchor runs no child). Reported to main with routes. Not building there.
+- Waiting on: w-git (v2.0.0 push spin, clone spin on Windows, CLI branches as refs), w-hg (clone admission), w-reaper
+  (Windows held edge listener), w-svn (change-rev-prop2 no-hook), Linux credential route. Re-run matrices as they land.
+
+## Piece 9 (main ~05:40Z): svn_interop on >=90d405247; hg bookmarks by-use test; hg release clone rows >=2aeeac954
+- hg_interop.rs is on main (w-reaper's move landed): test stock_hg_sees_the_bookmarks_the_cli_makes_retires_and_binds
+  written there (scratch 5652882a9, agents/w-interop-hgbook). r?? Studio: svn_interop + hg_interop + git_interop.
+- Then: release hg matrix clone rows (clone, clone-b, clone-rev, ssh-clone; stream expected red) + hg verify + RSS.
+- svn_interop 7/0 ignored, git_interop 6/0 ignored, hg_interop new bookmarks test passes with --from branch:default:0
+  (`--from default` NotFound: plain names are bookmarks; asked w-hg). LANDED 295d8723d (on main, checked).
+- r86: release hg full matrix on main >=2aeeac954 with RSS sampling (clone rows + verify).
+- r86 release hg on main 295d8723d: push 142 s; HTTP clone 41 s + verify 12 s, clone-b 36, clone-rev 39, stream 50 PASS;
+  20 rows passed; ssh-clone STALLS (0% CPU both sides, 25 MB) -> w-hg; daemon RSS >=12.4 GB during clones. Reported.
+- hg matrix bookmark-push row fixed (hg exits 1 on no changes even when exporting): scratch 3e1983bc9
+  (agents/w-interop-hgrow). r89: hg cut 0.9 + git v1.0.0/v2.0.0 on main with A-745 git 3a/3b. NEXT: land row fix,
+  report git, rerun Windows git matrix with a fresh jupiter build (75 min).
+- r89 (3e1983bc9, debug): git v1.0.0 27/27 GREEN. git v2.0.0: encode spin git_encode.rs:345 (poll 162167) then 78x
+  restart loop: each daemon "stop watch could not be installed (budget 10000 ms ... 35963 ms); stopping", exit 0.
+  Reported. hg 0.9 23/24 (bookmark-push row: DIAG commit 513211478 prints debugpushkey; rerun pending).
+- Main's routing: ssh-clone deadlock + clone RSS -> w-hg; `--from default` lookup -> w-hg (then switch test);
+  Linux issuer -> w-reaper; Windows ports A-748 -> w-reaper; Windows clone spin -> w-k90-vendor; restart spin -> w-git.
+- Next runs as fixes land: hg ssh-clone row (RSS sampled to the end, no stops); Windows git+hg on current main;
+  Linux matrices after w-reaper's issuer.
+- r95 (release, SSH_VERBOSE) hg 21/24, peak RSS 11,257 MiB, wall 1768 s: ssh-clone stalls after "exec request accepted"
+  (24M written, 1200 s limit); ssh-push downstream; bookmark-push FAIL. Reported.
+- bookmark-push root cause: the server never advertises the `pushkey` wire capability, so stock hg's listkeys returns {}
+  without asking (debugpushkey --debug sends capabilities only). Reported to main for w-hg (offered to land it).
+- LANDED 699c4aed9 (merge 7e1b7da88): hg_interop stock_hg_pushes_a_bookmark_and_a_clone_sees_it (6/6 pass), the matrix
+  bookmark-push row checks the server via debugpushkey (FAIL until pushkey is advertised), SSH_VERBOSE.
+- A-758 claimed (fanout-state 732d315c9) and LANDED dbd497bbc: hg `pushkey` advertised + served over SSH and HTTP through
+  the one push driver (serve::keys: one advisory pushkey part, heads force), unknown namespace typed refusal answered 0
+  with words; red-first by-use tests stock_hg_lists_and_moves_keys_over_the_{vcs_http,ssh}_edge (incoming -B,
+  outgoing -B, debugpushkey list/move/stale/delete/foreign). hg lib 123, server hg 36, hg_interop 8/8 green on merged
+  commit. Fixed my wrong A-654 citation on 699c4aed9's test (-> A-657). Force-pushed my own scratch branch once (rule
+  breach, reported). OWED: pushkey inside `batch`.
+- r103 running (release, main 36c6ed55d): hg matrix with -vv (ssh-clone after rekey fix 422a75ec9), then git v2.0.0.
+- r103 (release, base 36c6ed55d): hg 23/24, ssh-clone PASS 54 s after rekey fix (9 rekeys), RSS 8,246 MiB, wall 438 s;
+  bookmark-push FAIL (pushkey after base). git v2.0.0 22/27, RSS 8,735 MiB, wall 680 s: restart loop gone; encode spin
+  git_encode.rs:345 remains; deepen needs-more-room; partial-clone promisor fetch; git ssh-clone MAC incorrect (new). Sent.
+- Local worktrees w-interop-land and w-interop-a681-land removed (landed). r110 running: hg + git v2.0.0 release on
+  current main (has 0012cc171, dbd497bbc). Rule: merge origin/main before each piece/test, name base commit.
+- r110 (release, base 944588f6a): hg 24/24 (first all-green; RSS 10,681 MiB, wall 444 s). git v2.0.0 7/27: encode spin
+  killed -> restart -> start_shard recovery spin daemon.rs:1179 loop; clones cut (curl 18). Routed by main.
+- LANDED 04c3fa62d (merge 441bf8392): batched pushkey (session::Batch; SSH resumes after push; HTTP by POST only, GET
+  405 as 7.2). Red 49933eeea, green on merge 5e7b3c9f5: hg lib 124, server hg 37, hg_interop 10/10.
+- Main is now session slates-72 (slates-7a gone). r119 running: git v2.0.0 release on current main (6737b04a7), then hg
+  after 306214c57.
+- Main is now session slates-9a (kiln restarted sessions). r119 git v2.0.0 (base 85d66d9cb, has 6737b04a7 + 67dd4ef40):
+  24/27, 0 spins/kills/restarts; FAIL deepen (needs more room), partial-clone (promisor), partial-blame. RSS lost with the
+  kiln restart. Reported. r2 running on Studio: hg full + git v2.0.0 release, RSS sampled, log to ~/.cache/w-interop/r-*.txt.

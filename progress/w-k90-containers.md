@@ -127,3 +127,80 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 
 ## STATUS 2026-11-20: nothing waits on main. Waiting: r24 (live W9 on adacachy, load 74), r33 (Windows cargo check,
    queued for jupiter). Blocked on a PERSON only: W9 Windows measurement (WinFsp, console-session runner, Docker Desktop).
+
+## 2026-11-20: Windows `cargo check -p kiln --bins --tests` at 2b5a3d559 PASSED on jupiter (r33). r24 failed on adacachy /tmp full (my TMPDIR mistake) -> r36 queued with TMPDIR under ~/.cache.
+
+## RULE (Ada 2026-11-20, common.md): fetch + merge origin/main at each piece start, before each reported test run, every 30 min; name the base (origin/main short hash) with every result; delete landed worktrees by exact path.
+
+## 2026-11-20 ~08:xx live W9 (main: drive it): r24/r36 crawled on adacachy (load ~70, rootful docker -> would only skip)
+   -> stopped. Live run on main's MacBook (e30189ea) with Docker Desktop 29.3.1 (started by me, quit after): binaries
+   built here (base ed8991d29), served to it over LAN (python http.server on 192.168.1.82:18497, my task), run from
+   ~/.cache/w-k90-containers-live there.
+- r52 RED: "this process keeps no workspaces" (test lacked slates::init) -> test fixed (state under ~/.cache = /Users share).
+- r54 RED (real bug): container ran on the bind, read+wrote the volume, went; then the mount stayed BUSY, held by
+  com.apple.Virtualization.VirtualMachine (Docker Desktop's share). Cleaned up by hand (quit Docker, umount -f, anchor gone).
+- Fix (uncommitted): slates::remove_after_container (let go of a busy mount once container+bind are gone), used by
+  workspace::container end + workspace::release for container sessions + the live test; unit test w9_a_containers_busy_...
+  11/11 local; bins check clean. r61 = green attempt.
+
+## LANDED 2026-11-20 fa86489f5 (on origin/main 09ea9b826): container end lets a busy workspace mount go
+   (slates::remove_after_container) + workspace::container_live_tests. LIVE GREEN r70: macOS arm64 Adas-MacBook-Pro-2,
+   Docker Desktop 29.3.1, alpine:3.22, binaries at base ed8991d29 + piece: 1 passed 10.99 s, mounts left 0 (red r54 before
+   the fix: mount busy, held by com.apple.Virtualization.VirtualMachine). Unit on merged tree (base 6965eaf63): 13/13.
+   NOTE: fa86489f5's message says "merged on base 6965eaf63, 11 passed" -- that run was actually on ed8991d29; the
+   merged run is 13/13 above.
+## Ada's ruling 09:30: container engine moves to a `local` nfs Docker volume of Slates' export (owner w-k90-a520);
+   bind route goes after its A/B. I don't edit sandbox::container / workspace::container. Hand-offs written:
+   inbox/w-k90-a520-from-w-k90-containers.md (+ agents_send), inbox/w-k90-win-from-w-k90-containers.md (r33 findings).
+## MINE NEXT: proof by use of the OCI/Docker engine through the NEW route on Linux (adacachy), macOS (Docker Desktop),
+   Windows (jupiter, once w-k90-win's build + WinFsp) -- after w-k90-a520 lands the route.
+
+## 2026-11-20 ~11:00 PST: restarted after the big Studio's reboot (10:35). Nothing lost: kiln clone clean (fa86489f5 on
+   main), now merged to origin/main da441f112. Unpushed state commit (hand-off notes + progress) pushed via the MacBook (r1).
+   GitHub https from this Studio times out since the reboot.
+## GOAL (plan 01a1fa36 step 2): OCI/Docker engine proven by use through the EXPORT route on adacachy, a Mac with Docker
+   Desktop, and jupiter: kiln starts an agent with the container engine, it writes in its volume, review/drift/landing
+   under a grant, landed files byte-equal, no host copy.
+- w-k90-a520 (01a1f9c04dbb...) built the route on branch agents/w-k90-a520 (4d6bbc7a9 slates_e2e container drive,
+  1f928c612 route, d9adef305 A/B, 4004e6a91 docs); not on main yet. Its goal also says "proven on adacachy": asked it
+  to split (me: Mac + Windows, or it hands adacachy to me) and pointed out its bind-side hang was a /private/var/folders
+  workspace (Desktop shares /Users; my green r70 used ~/.cache).
+- PLAN once it lands: run `cargo test -p kiln --test slates_e2e container::...` (its drive covers review, drift,
+  landing by mode, byte-equality) on a Mac with Docker Desktop (bin over LAN as before), adacachy (TMPDIR off /tmp,
+  sized needs), jupiter (needs WinFsp + Docker Desktop + a console-session runner: a person; w-k90-win owns the build).
+
+## 2026-11-20: split agreed with w-k90-a520: it keeps adacachy (A/B + proof); I take the Mac (Docker Desktop) and Windows
+   (jupiter) proofs from main once its route lands (it will message me). Tests to drive, with CONTAINER_E2E=1 SLATES_E2E=1:
+   slates_e2e container::a520_in_a_container_on_its_volume_an_agents_work_is_reviewed_and_landed_by_its_mode and
+   container::a520_in_a_container_a_file_changed_on_disk_after_the_agent_changed_it_is_drift_and_no_landing_writes_over_it.
+
+## 2026-11-20 ~12:05 PST: Mac leg through the EXPORT route, run r8 (Adas-MacBook-Pro-2, Docker Desktop 29.3.1)
+- Split agreed with w-k90-a520: it runs adacachy; I run Mac + jupiter.
+- Binaries built here from agents/w-k90-a520 4004e6a91 (+ local fix slates_e2e.rs:1824 workspaces_ready(&f, Engine::BareMetal),
+  reported, NOT committed: its file), served over LAN (this Studio is 192.168.1.88 since the reboot), kiln binary placed at
+  its compile-time path on the MacBook, repo files from a shallow clone at the same path (92ee4dfd).
+- slates_e2e container:: 1 passed 1 failed (393 s): drift drive PASSED; review/landing drive PROVEN up to the end
+  (export nfs volume, change request exact, landing approved, folder byte-exact, HEAD/index unchanged) then FAILED:
+  container + engine volume outlived the session at the check (gone a minute later); drift's Bypass session leaked its
+  engine volume (removed by hand). Reported to w-k90-a520 + main. Re-run when it fixes the end.
+- Docker Desktop on the MacBook: its API answered 500 once; restarted (quit + TERM my leftovers + open); left running.
+- jupiter: WinFsp now installed; Docker Desktop's engine started from the runner (r12, 29.9.1 linux). BLOCKER for the
+  Windows leg is code, not the machine: engine_profile is Unsupported on Windows -> facts_of says Platform -> no container
+  agents on Windows. Asked w-k90-a520 (owner) how to lift it under the export route (Slates judging Desktop on Windows,
+  or kiln judging via `docker info`), and whether Slates serves its NFS export on Windows (A-184).
+
+## RULE (main, 2026-11-20): no `rm -r` and no globbed rm at all (kiln's gate holds them for a person). Ship packages go
+   into a fresh uniquely named folder each time; old ones stay.
+## For main to delete (this Studio, d1323898; all mine, none in use once the Mac leg is done):
+- ~/.cache/w-k90-containers-ship (the binaries served to the MacBook over LAN: kiln.zst, slates_e2e.zst)
+- ~/.cache/w-k90-containers-target-a520 (cargo target for w-k90-a520's branch builds)
+- On Adas-MacBook-Pro-2: ~/.cache/w-k90-containers-e2e (test binary + logs), ~/.cache/w-k90-containers-target-a520/debug/kiln
+  (kiln binary at its compile-time path), ~/kiln-work/w-k90-containers-a520 (shallow clone of agents/w-k90-a520),
+  ~/.cache/w-k90-containers-live-r70.log
+## 2026-11-20 ~12:45: export route ON MAIN (a82ce7ede; my clone at 64412a674). main: Mac leg proved the route end to end
+   except the end; w-k90-a520 now does (a) the end fixes (my diagnosis: kill/next release race; volume rm `?` skips the
+   export detach) and (b) Slates' judge accepting Docker Desktop on Windows for the export route. When both land: re-run
+   Mac (no stale slates: mounts there, checked 0) then jupiter (WinFsp + Docker Desktop up). Watcher b0zdxv38e on main.
+   Worktree ~/kiln-work/w-k90-containers-a520 NOT removed (holds my superseded local patch; no --force).
+## For main to delete (add): worktree ~/kiln-work/w-k90-containers-a520 (`git -C ~/kiln-work/w-k90-containers-kiln worktree
+   remove --force /Users/adalundhe/kiln-work/w-k90-containers-a520`; its only change, the slates_e2e.rs:1824 fix, is on main).

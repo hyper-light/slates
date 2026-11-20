@@ -43,5 +43,15 @@ POLICY_READ: briefs/common.md + briefs/w-k90-close.md + relaunch-2026-11-19.md. 
   KILN_K8S_LIVE=1 KUBECONFIG=~/.cache/w-k90-close/kubeconfig KILN_K8S_HOST=192.168.94.1
   KILN_K8S_NODES=k90-close,k90-close-m02 KILN_K8S_IMAGE=k90-close-agent:live.
 
+## 2026-11-20 ~12:30 PST
+- LANDED kiln main 83a03cd1ac4 (dae14868d30: agents.start takes isolation pod) and d582cee16fc (2b4b69b5564: pod
+  session's land/drift/change routed to its home via AgentPods::holds; k8s_agent_live + fixtures + common::Tables).
+- 5c (6965eaf6310) superseded by Ada's export-route ruling (1f928c61243, w-k90-containers): A-520 piece 5 = theirs, done.
+- Live (adacachy, minikube k90-close; server+home in container w-k90-close-live at 192.168.94.50 on network k90-close
+  because ufw drops bridge->host; scripts ~/.cache/w-k90-close/{cycle-test.sh,live.sh}, units w-k90-close-live<N>,
+  logs live-<N>.log + logs-<N>/): PROVEN fleet node, node tlshd certs, pod start, pod folder = kubelet nfs4 xprtsec=mtls.
+  Open red: harness (fake-claude) runs in pod but opening prompt never reaches it (status stays starting). Run 7 diagnoses.
+- Each new commit rebuilds the kiln lib (~40 min under load: build.rs embeds the commit).
+
 ## For main to delete
 - adacachy ~/.cache/w-k90-close/kiln2 (partial SSH clone, 84K) and ~/.cache/w-k90-close/wt (broken half-checkout; `git -C ~/.cache/w-k90-close/kiln3 worktree remove` needs --force)
