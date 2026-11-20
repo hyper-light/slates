@@ -1011,7 +1011,7 @@ fn unknown_nodes_are_refused_except_common_ones() {
     Outgoing {
       heads: vec![5],
       common: Vec::new(),
-      missing: [0..6].into_iter().collect()
+      missing: std::iter::once(0..6).collect()
     }
   );
 }

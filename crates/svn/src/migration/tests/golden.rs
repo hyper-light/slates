@@ -7,8 +7,8 @@
 use std::fmt::Write as _;
 
 use super::support::{
-  ADMISSION, History, VECTOR_UUID, created, export, export_all, export_deltas, export_in, history,
-  import, import_whole,
+  ADMISSION, CALL_HEADROOM, History, VECTOR_UUID, created, export, export_all, export_deltas,
+  export_in, history, import, import_whole,
 };
 use crate::commit::record::Record;
 use crate::dump::Format;
@@ -228,14 +228,17 @@ fn a_history_exported_in_parts_imports_to_the_history_exported_whole() {
 }
 
 /// A-652 (the export's units): do export the whole history stock `svnadmin` dumped, in each format, a call at a time.
-/// Expect every revision written over its changed paths' count and two more calls (its revision record, then the
-/// directories closed), revision 0 in one, so no call writes more than one changed path's records; and the bytes
-/// `svnadmin dump` wrote (`full.dump`, `deltas.dump`). Before, a call wrote a revision whole: a revision with a large
-/// text was one unit of the daemon's export (2.4 ms against a 14 µs slice, measured in debug, 2026-11-20).
+/// Expect every revision written over at least its changed paths' count and two more calls (its revision record, then
+/// the directories closed), revision 0 in one; no call appending more than one window of text and [`CALL_HEADROOM`],
+/// though the history holds a 107 KB text; and the bytes `svnadmin dump` wrote (`full.dump`, `deltas.dump`). Before, a
+/// call wrote a revision whole, then a changed path with its whole text: a revision with a large text was one unit of
+/// the daemon's export (2.4 ms against a 14 µs slice, measured in debug, 2026-11-20).
 #[test]
-fn every_export_call_writes_one_changed_path_of_its_revision() {
+fn every_export_call_writes_one_changed_path_or_one_window_of_its_text() {
   use crate::migration::{Exporter, Exporting};
+  use crate::svndiff::WINDOW_LIMIT;
   let source = imported(&["full.dump"]);
+  let bound = usize::try_from(WINDOW_LIMIT).unwrap() + CALL_HEADROOM;
   for (format, expected) in [
     (Format::Two, vector("full.dump")),
     (Format::Three, vector("deltas.dump")),
@@ -243,23 +246,27 @@ fn every_export_call_writes_one_changed_path_of_its_revision() {
     let mut exporter = Exporter::new(&source, 0, source.youngest(), format).unwrap();
     let mut out = Vec::new();
     let mut calls = std::collections::BTreeMap::<u64, usize>::new();
-    while let Exporting::Wrote(revision) = exporter.export(&source, &mut out).unwrap() {
+    let mut largest = 0;
+    loop {
+      let before = out.len();
+      let Exporting::Wrote(revision) = exporter.export(&source, &mut out).unwrap() else {
+        break;
+      };
+      largest = largest.max(out.len() - before);
       *calls.entry(revision).or_default() += 1;
     }
-    let paths = |revision: u64| source.index().changes(revision).unwrap().len();
-    let expected_calls: std::collections::BTreeMap<u64, usize> = (0..=source.youngest())
-      .map(|revision| {
-        (
-          revision,
-          if revision == 0 {
-            1
-          } else {
-            paths(revision) + 2
-          },
-        )
-      })
-      .collect();
-    assert_eq!(calls, expected_calls, "{format:?}");
+    for revision in 0..=source.youngest() {
+      let least = match revision {
+        0 => 1,
+        _ => source.index().changes(revision).unwrap().len() + 2,
+      };
+      let made = calls.get(&revision).copied().unwrap_or(0);
+      assert!(made >= least, "{format:?} r{revision}: {made} calls");
+    }
+    assert!(
+      largest <= bound,
+      "{format:?}: a call appended {largest} bytes"
+    );
     assert!(out == expected, "{format:?}: the bytes svnadmin dump wrote");
   }
 }

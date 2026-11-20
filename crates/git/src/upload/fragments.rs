@@ -19,6 +19,7 @@ use super::{PackPlan, PackRefused, PackSource, Served};
 use crate::Admission;
 use crate::negotiation::Filter;
 use crate::object_name::Kind;
+use crate::positions::Positions;
 use crate::store::learn::{Clock, Exchange};
 use crate::store::{Answered, Progress, Turn, Upload, UploadCounters, Versions};
 
@@ -28,8 +29,8 @@ use crate::store::{Answered, Progress, Turn, Upload, UploadCounters, Versions};
 pub struct Planned {
   /// The runs of versions, in the negotiation's order.
   runs: Vec<Versions>,
-  /// The single objects, by position, in ascending order.
-  objects: Vec<u64>,
+  /// The single objects, by position, as runs (A-745).
+  objects: Positions,
   /// The request's filter, one that decides by an object's own row.
   filter: Option<Filter>,
   /// `thin-pack`.
@@ -43,7 +44,7 @@ impl Planned {
   fn of(plan: &PackPlan<'_>, admission: &mut Admission) -> Result<Planned, PackRefused> {
     admission
       .charge_items::<Versions>(plan.runs.len())
-      .and_then(|()| admission.charge_items::<u64>(plan.objects.len()))
+      .and_then(|()| admission.charge_items::<(u64, u64)>(plan.objects.runs()))
       .map_err(PackRefused::PastAdmission)?;
     Ok(Planned {
       runs: plan
@@ -55,7 +56,7 @@ impl Planned {
           through: run.through,
         })
         .collect(),
-      objects: plan.objects.to_vec(),
+      objects: plan.objects.clone(),
       filter: plan.filter.cloned(),
       thin: plan.thin,
       ofs_delta: plan.ofs_delta,
@@ -68,7 +69,7 @@ impl Answered for Planned {
     &self.runs
   }
 
-  fn objects(&self) -> &[u64] {
+  fn objects(&self) -> &Positions {
     &self.objects
   }
 

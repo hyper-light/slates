@@ -122,6 +122,13 @@ pub enum Landed {
   },
   /// It could not be restated over the version below it, typed.
   Refused(RestateRefused),
+  /// A copy it declares is refused before any verdict (as [`super::Outcome::CopyRefused`]).
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: super::CopyRefusal,
+  },
   /// Never judged: a work below it did not land.
   LowerRefused {
     /// The place in the stack of the first work below it that did not land (the bottom is 0).
@@ -300,6 +307,7 @@ impl Green {
       },
       Judgment::Conflict { windows } => Landed::Conflict { windows },
       Judgment::BaseUnavailable { base, floor } => Landed::BaseUnavailable { base, floor },
+      Judgment::CopyRefused { path, case } => Landed::CopyRefused { path, case },
     }
   }
 }

@@ -84,6 +84,47 @@ pub fn deltas<'a>(
   })
 }
 
+/// Where a delta's making stands between two windows ([`Deltas::at`]), so a caller that cannot hold the texts' borrow
+/// between calls takes it up again over the same texts ([`deltas_at`]) and makes the windows it would have made next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltasAt {
+  /// The source bytes the windows so far have viewed.
+  source_read: usize,
+  /// Whether the next window views more of the source.
+  more_source: bool,
+  /// The target bytes the windows so far have made.
+  target_read: usize,
+}
+
+/// [`deltas`] taken up at `at`, a position [`Deltas::at`] gave over the same `source` and `target`: the windows the
+/// first would have made from there.
+///
+/// # Errors
+/// [`deltas`]'s.
+pub fn deltas_at<'a>(
+  source: &'a [u8],
+  target: &'a [u8],
+  window_room: NonZeroUsize,
+  at: DeltasAt,
+) -> Result<Deltas<'a>, SvndiffError> {
+  let mut made = deltas(source, target, window_room)?;
+  made.source_read = at.source_read;
+  made.more_source = at.more_source;
+  made.target_read = at.target_read;
+  Ok(made)
+}
+
+impl Deltas<'_> {
+  /// Where the making stands: the start of the window it makes next.
+  pub fn at(&self) -> DeltasAt {
+    DeltasAt {
+      source_read: self.source_read,
+      more_source: self.more_source,
+      target_read: self.target_read,
+    }
+  }
+}
+
 /// The windows of one delta, made one at a time as they are asked for ([`deltas`]).
 #[derive(Clone, Debug)]
 pub struct Deltas<'a> {

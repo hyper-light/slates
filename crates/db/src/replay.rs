@@ -612,10 +612,7 @@ impl Db {
     self.logged.extend(made);
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
-    self
-      .stats
-      .tail_split
-      .add_entry(&entry, u64::try_from(bytes).unwrap_or(u64::MAX));
+    self.stats.tail_split.add_entry(&entry, bytes);
     self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(seq)
@@ -699,10 +696,7 @@ impl Db {
     self.logged.extend(made);
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
-    self
-      .stats
-      .tail_split
-      .add_entry(&entry, u64::try_from(bytes).unwrap_or(u64::MAX));
+    self.stats.tail_split.add_entry(&entry, bytes);
     self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(Some(seq))

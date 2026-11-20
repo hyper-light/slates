@@ -1308,31 +1308,38 @@ impl GitPush {
     })
   }
 
-  /// Seals the push: every commit's generation number, its parents read from the push or the repository (A-614). Each
-  /// append then admits its own moves ([`SealedPush::admit`]). Refused, the push is abandoned and its holds given back.
-  pub(crate) fn seal(mut self, state: &mut ShardState) -> Result<SealedPush, GitRefused> {
-    // Its rows written for its landing to adopt (A-722 part 3), with the room they take lent.
-    let rows = state
-      .vcs_stores
-      .git_ref(self.repository)
-      .map_or(0, |(_, store)| store.repository.stage_room(&self.push));
-    let push = &mut self.push;
+  /// Seals the push whole: [`GitPush::sealing`]'s turns run to their end in one step (a commit the server makes, whose
+  /// push is a version's few objects). Refused, the push is abandoned and its holds given back.
+  pub(crate) fn seal(self, state: &mut ShardState) -> Result<SealedPush, GitRefused> {
+    let mut sealing = self.sealing(state)?;
+    loop {
+      match sealing.turn(state, u64::MAX)? {
+        SealTurn::More(more) => sealing = *more,
+        SealTurn::Sealed(sealed) => return Ok(sealed),
+      }
+    }
+  }
+
+  /// The push's seal begun (A-722 part 4, `slates_git::store::Repository::sealing`): every commit's generation number,
+  /// its parents read from the push or the repository (A-614), then its rows written for its landing to adopt (A-722
+  /// part 3), a turn at a time ([`SealingPush::turn`]). Each append then admits its own moves ([`SealedPush::admit`]).
+  /// Refused, the push is abandoned and its holds given back.
+  pub(crate) fn sealing(mut self, state: &mut ShardState) -> Result<SealingPush, GitRefused> {
     let repository = self.repository;
-    let sealed = within_budget(state, rows, |stores| match stores.git(repository) {
+    let push = &mut self.push;
+    let begun = within_budget(state, 0, |stores| match stores.git(repository) {
       Some((content, store)) => store
         .repository
-        .seal(content, push)
-        .and_then(|()| store.repository.stage(content, push))
+        .sealing(content, push)
+        .map(|staging| (staging, store.repository.stage_room(push)))
         .map_err(GitRefused::Store),
       None => Err(GitRefused::NoStore),
     });
-    match sealed {
-      Ok(()) => Ok(SealedPush {
-        repository: self.repository,
-        push: self.push,
-        moves: Vec::new(),
-        keyed: Vec::new(),
-        objects: self.record,
+    match begun {
+      Ok((staging, room)) => Ok(SealingPush {
+        push: self,
+        staging,
+        room,
       }),
       Err(refused) => {
         abandon_push(state, self.push);
@@ -1362,6 +1369,77 @@ impl GitPush {
         &self.push,
       )))
     })
+  }
+}
+
+/// A git push being sealed a turn at a time (A-722 part 4; [`GitPush::sealing`]).
+pub(crate) struct SealingPush {
+  /// The push.
+  push: GitPush,
+  /// Its seal and stage under way.
+  staging: slates_git::store::Staging,
+  /// Derived: the most its rows could charge the store, lent each turn (`Repository::stage_room`).
+  room: u64,
+}
+
+/// What a turn of a push's seal left.
+pub(crate) enum SealTurn {
+  /// More turns remain (boxed: the push is most of its size).
+  More(Box<SealingPush>),
+  /// Sealed and staged.
+  Sealed(SealedPush),
+}
+
+impl SealingPush {
+  /// One turn of the seal, held to `ns` of the shard's clock and a unit at least, its rows' room lent. Refused, the push
+  /// and its staging are given back.
+  pub(crate) fn turn(mut self, state: &mut ShardState, ns: u64) -> Result<SealTurn, GitRefused> {
+    let repository = self.push.repository;
+    let (push, staging) = (&mut self.push.push, &mut self.staging);
+    let turned = within_budget(state, self.room, |stores| match stores.git(repository) {
+      Some((content, store)) => {
+        let mut clock = crate::git_push::ShardClock;
+        let quantum = slates_git::store::hook_view::Quantum {
+          clock: &mut clock,
+          ns,
+        };
+        store
+          .repository
+          .stage_turn(content, push, staging, quantum)
+          .map_err(GitRefused::Store)
+      }
+      None => Err(GitRefused::NoStore),
+    });
+    match turned {
+      Ok(false) => Ok(SealTurn::More(Box::new(self))),
+      Ok(true) => Ok(SealTurn::Sealed(SealedPush {
+        repository,
+        push: self.push.push,
+        moves: Vec::new(),
+        keyed: Vec::new(),
+        objects: self.push.record,
+      })),
+      Err(refused) => {
+        self.abandon(state);
+        Err(refused)
+      }
+    }
+  }
+
+  /// Gives back every hold the push and its staging took.
+  pub(crate) fn abandon(self, state: &mut ShardState) {
+    let given = {
+      let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+      lent
+        .stores
+        .content
+        .as_mut()
+        .map_or(Ok(()), |content| self.staging.abandon(content))
+    };
+    if given.is_err() {
+      state.count(RELEASE_REFUSED, 1);
+    }
+    abandon_push(state, self.push.push);
   }
 }
 
@@ -2103,48 +2181,58 @@ pub(crate) async fn recover(
     .cloned()
     .collect();
   for record in records {
-    make(state, &record);
-    let mut index = 0usize;
-    loop {
-      // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
-      // shard past the watchdog's window at every restart.
-      let outcome = if record.tool == VcsTool::Mercurial {
-        replay_hg_sliced(state, record.id, index, slices).await
-      } else {
-        // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
-        let ns = state.config.step_quantum_ns();
-        match record_turn(state, (record.id, index), ns) {
-          Some(RecordTurn::More) => {
-            slices.unit_done().await;
-            continue;
-          }
-          Some(RecordTurn::Replayed(outcome)) => Some(outcome),
-          None => None,
-        }
-      };
-      let Some(outcome) = outcome else {
-        break;
-      };
-      if !replayed(state, record.id, outcome) {
-        break;
-      }
-      index = index.saturating_add(1);
-      slices.unit_done().await;
-    }
-    // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
-    let greens: Vec<DbVolumeId> = state
-      .db
-      .partition()
-      .repositories()
-      .members_of(record.id)
-      .map(|member| member.green)
-      .collect();
-    for green in greens {
-      paths::remake_green_sliced(state, green, slices).await;
-      slices.unit_done().await;
-    }
-    paths::whole_build::resume_owed(state, record.id);
+    recover_repository(state, &record, slices).await;
   }
+}
+
+/// Makes `record`'s store again and replays its records in log order, a record a unit of the recovery's slices, then
+/// makes each green's map of its head again, a green a unit.
+async fn recover_repository(
+  state: &mut ShardState,
+  record: &RepositoryRecord,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
+  make(state, record);
+  let mut index = 0usize;
+  loop {
+    // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
+    // shard past the watchdog's window at every restart.
+    let outcome = if record.tool == VcsTool::Mercurial {
+      replay_hg_sliced(state, record.id, index, slices).await
+    } else {
+      // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
+      let ns = state.config.step_quantum_ns();
+      match record_turn(state, (record.id, index), ns) {
+        Some(RecordTurn::More) => {
+          slices.unit_done().await;
+          continue;
+        }
+        Some(RecordTurn::Replayed(outcome)) => Some(outcome),
+        None => None,
+      }
+    };
+    let Some(outcome) = outcome else {
+      break;
+    };
+    if !replayed(state, record.id, outcome) {
+      break;
+    }
+    index = index.saturating_add(1);
+    slices.unit_done().await;
+  }
+  // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
+  let greens: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .repositories()
+    .members_of(record.id)
+    .map(|member| member.green)
+    .collect();
+  for green in greens {
+    paths::remake_green_sliced(state, green, slices).await;
+    slices.unit_done().await;
+  }
+  paths::whole_build::resume_owed(state, record.id);
 }
 
 /// Makes repository `id`'s store again from the log (module docs): what a commit whose entry was not made durable left

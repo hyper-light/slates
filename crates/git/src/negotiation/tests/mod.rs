@@ -14,7 +14,17 @@ use super::{
   Refusal, Request, Run, ShallowInfo, filter, negotiate,
 };
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
+use crate::positions::Positions;
 use crate::{Admission, to_u64};
+
+/// The objects `pack` sends one by one, as the graph names them (A-745: the answer keeps them as runs of positions).
+fn nodes(pack: &Pack<u32, u32>) -> Vec<u32> {
+  pack
+    .objects
+    .iter()
+    .map(|position| u32::try_from(position).unwrap())
+    .collect()
+}
 
 /// The index of `node`.
 fn at(node: u32) -> usize {
@@ -529,7 +539,8 @@ fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
     acknowledgments,
     shallow_info: cut.info.clone(),
     runs,
-    objects,
+    objects: Positions::of(objects.iter().map(|node| u64::from(*node)).collect()),
+    _node: core::marker::PhantomData,
   };
   Ok(Expected {
     answer: Answer::Pack(pack),
@@ -1502,8 +1513,7 @@ impl Census {
     }
     self.filter(graph, asks.filter.as_ref(), pack);
     let wanted: Vec<u32> = held(graph, &asks.wants);
-    let tag_included = pack
-      .objects
+    let tag_included = nodes(pack)
       .iter()
       .any(|node| graph.objects[at(*node)].kind == Kind::Tag && !wanted.contains(node));
     self.tags_included += u64::from(asks.include_tag && tag_included);
@@ -1621,7 +1631,7 @@ fn check_carried(plan: &Plan, census: &mut Census) -> Result<(), TestCaseError> 
   census.packs_checked += 1;
   let wants = held(&graph, &asks.wants);
   let common = held(&graph, &asks.haves);
-  let mut carried: BTreeSet<u32> = pack.objects.iter().copied().collect();
+  let mut carried: BTreeSet<u32> = nodes(&pack).into_iter().collect();
   for run in &pack.runs {
     census.runs_checked += 1;
     let mut union = BTreeSet::new();
@@ -1756,7 +1766,7 @@ fn a_rewrite_between_takes_the_walk() {
     panic!("{:?}", outcome.answer)
   };
   assert!(pack.runs.is_empty());
-  assert_eq!(pack.objects, [blob, tree, side, top]);
+  assert_eq!(nodes(&pack), [blob, tree, side, top]);
   assert_eq!(outcome.counters.one_round, 0);
   assert!(outcome.counters.walked >= 2);
 }
@@ -1829,7 +1839,7 @@ fn a_clone_at_depth_one_sends_the_head_alone_and_names_it_shallow() {
     graph.objects[at(head.tree)].entries[0],
   ];
   expected.sort();
-  assert_eq!(pack.objects, expected);
+  assert_eq!(nodes(&pack), expected);
 }
 
 /// A-615 part 2 (§4.2): do negotiate a walk with one byte of room, and with none needed by a request with no wants.
@@ -1878,7 +1888,7 @@ fn a_tree_met_again_shallower_is_opened_again_under_a_depth_filter() {
   let Answer::Pack(pack) = outcome.answer else {
     panic!()
   };
-  assert!(pack.objects.contains(&blob), "{:?}", pack.objects);
+  assert!(nodes(&pack).contains(&blob), "{:?}", pack.objects);
   let mut expected = vec![
     blob,
     inner,
@@ -1890,18 +1900,19 @@ fn a_tree_met_again_shallower_is_opened_again_under_a_depth_filter() {
     second,
   ];
   expected.sort();
-  assert_eq!(pack.objects, expected);
+  assert_eq!(nodes(&pack), expected);
 }
 
 /// Whether `pack` holds a tree without one of the blobs in it: a sparse filter left that blob out (A-640 part 4).
 fn left_a_blob(graph: &TestGraph, pack: &Pack<u32, u32>) -> bool {
-  pack.objects.iter().any(|node| {
+  let sent = nodes(pack);
+  sent.iter().any(|node| {
     let object = &graph.objects[at(*node)];
     object.kind == Kind::Tree
       && object
         .entries
         .iter()
-        .any(|entry| graph.objects[at(*entry)].kind == Kind::Blob && !pack.objects.contains(entry))
+        .any(|entry| graph.objects[at(*entry)].kind == Kind::Blob && !sent.contains(entry))
   })
 }
 
@@ -1936,7 +1947,7 @@ fn sparse_clone(
   };
   let outcome = negotiate(graph, &request, &mut Admission::new(u64::MAX))?;
   match outcome.answer {
-    Answer::Pack(pack) => Ok((pack.objects, outcome.counters.trees)),
+    Answer::Pack(pack) => Ok((nodes(&pack), outcome.counters.trees)),
     _ => Ok((Vec::new(), outcome.counters.trees)),
   }
 }

@@ -52,6 +52,13 @@ Conformance 3 VerifiedSourceExport
 Conformance 4 SimulatedGuestDriver
 Conformance 5 LiveGuestWorkloads
 Conformance 6 SimulatedShardsDevice
+CopyCase 0 Root
+CopyCase 1 PastHead
+CopyCase 2 SourceEmpty
+CopyCase 3 VersionFolded
+CopyCase 4 OutsideNodeChanged
+CopyCase 5 ChangedSourceLink
+CopyCase 6 LinkAcrossCopy
 CredentialMaterial 0 SshKey
 CredentialMaterial 1 HttpToken
 DatabaseRefusal 0 Corrupt
@@ -294,6 +301,7 @@ Refusal 75 BaseUnavailableWin32
 Refusal 76 MessageRequired
 Refusal 77 IdentityRequired
 Refusal 78 ImportRefused
+Refusal 79 CopyRefused
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed

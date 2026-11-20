@@ -4698,9 +4698,10 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
 }
 
 /// AC (§4.8 "Lookup": a lookup by id routes to the volume's creator, whatever the asker's region). Three daemons in
-/// one region; a volume is created and write-attached on a. Do: through clients of b and c, ask its status, make a
-/// directory in it under b's client's own attachment of it (A-222: a forward through a's attachment is refused since
-/// 2026-11-05), and list its root. Expect: each is served by a, the directory b made is the
+/// one region; a volume is created and write-attached on a. Do: through clients of b and c, ask its status; let a's write
+/// attachment go (A-414: while it lives the write lease stays a's, and another host's attach for writing is refused
+/// `LeaseHeld`); make a directory in it under b's client's own attachment of it (A-222: a forward through a's attachment
+/// is refused since 2026-11-05), and list its root. Expect: each is served by a, the directory b made is the
 /// one c lists, and a lists it too. Before 2026-10-07 only a volume homed in another region was forwarded; a client
 /// of b or c was answered `NotFound` for a's volume (found on two Docker networks, `docs/wip/GAPS.md`).
 #[test]
@@ -4756,23 +4757,33 @@ fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_thr
   let (status_served, status_last) =
     poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
   // b's client writes under its own attachment, which a records under b's host (A-222): a forward through a's own
-  // attachment is refused, as a forward naming another host's attachment always is.
-  let _ = attachment;
+  // attachment is refused, as a forward naming another host's attachment always is. a lets its own write attachment go
+  // first: while it lives the write lease stays a's and b's attach for writing is refused `LeaseHeld` (A-414); once it
+  // has gone the lease lasts one term more, which b's attach below waits out.
+  assert!(
+    matches!(
+      client_a.call(&RequestBody::Detach { attachment }),
+      ReplyBody::Detached
+    ),
+    "a detached its write attachment"
+  );
   let mut b_attachment = None;
   let mut made = None;
   let made_served = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
     COUNCIL_RETIRE_DEADLINE,
     || {
-      if b_attachment.is_none()
-        && let ReplyBody::Attached { attachment, .. } = client_b.call(&RequestBody::Attach {
+      if b_attachment.is_none() {
+        match client_b.call(&RequestBody::Attach {
           volume: id,
           snapshot: None,
           intent: Intent::Write,
           form: AttachRequest::Root,
-        })
-      {
-        b_attachment = Some(attachment);
+        }) {
+          ReplyBody::Attached { attachment, .. } => b_attachment = Some(attachment),
+          // What refused b's attach is what the failure says, not `None`.
+          refused => made = Some(refused),
+        }
       }
       let Some(attachment) = b_attachment else {
         return Ok(false);

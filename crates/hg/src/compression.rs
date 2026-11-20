@@ -1150,6 +1150,196 @@ fn compress_zstd(level: i32, plain: &[u8], out: &mut Vec<u8>) -> Result<(), Enco
   }
 }
 
+/// One stream compressed as its plain bytes arrive, a run at a time (A-745: a fetch's answer is sent as it is made, so
+/// it is compressed so too): what [`compress`] writes of the whole, as one zlib stream, one bzip2 stream or one zstd
+/// frame (which names no content size, since the content is not known when it begins), or the bytes as they are.
+pub enum StreamCompressor {
+  /// The bytes as they are.
+  Uncompressed,
+  /// One zlib stream.
+  Zlib(Box<ZlibCompress>),
+  /// One bzip2 stream.
+  Bzip2(Box<Bzip2Compress>),
+  /// One zstd frame.
+  Zstd(Box<CCtx<'static>>),
+}
+
+impl StreamCompressor {
+  /// A stream of `engine` at `level`; refused for a level outside the engine's range.
+  pub fn new(engine: Engine, level: i32) -> Result<StreamCompressor, EncodeRefusal> {
+    if !engine.levels().contains(&level) {
+      return Err(EncodeRefusal::Level { engine, level });
+    }
+    Ok(match engine {
+      Engine::Uncompressed => StreamCompressor::Uncompressed,
+      Engine::Zlib => {
+        let level = u32::try_from(level).map_err(|_| EncodeRefusal::Level { engine, level })?;
+        StreamCompressor::Zlib(Box::new(ZlibCompress::new(ZlibLevel::new(level), true)))
+      }
+      Engine::Bzip2 => {
+        let level = u32::try_from(level)
+          .ok()
+          .and_then(Bzip2Level::try_new)
+          .ok_or(EncodeRefusal::Level { engine, level })?;
+        StreamCompressor::Bzip2(Box::new(Bzip2Compress::new(level, 0)))
+      }
+      Engine::Zstd => {
+        let mut context =
+          CCtx::try_create().ok_or(EncodeRefusal::OutOfMemory { engine, asked: 0 })?;
+        context
+          .set_parameter(CParameter::CompressionLevel(level))
+          .map_err(|code| EncodeRefusal::Engine {
+            engine,
+            reason: zstd_safe::get_error_name(code),
+          })?;
+        StreamCompressor::Zstd(Box::new(context))
+      }
+    })
+  }
+
+  /// Appends `plain`, the stream's next bytes, compressed as far as the engine writes them now.
+  pub fn put(&mut self, plain: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+    self.run(plain, false, out)
+  }
+
+  /// Appends the stream's end: what the engine still holds, and its trailer.
+  pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+    self.run(&[], true, out)
+  }
+
+  /// Feeds `plain` whole, and ends the stream where `end`.
+  fn run(&mut self, plain: &[u8], end: bool, out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+    match self {
+      StreamCompressor::Uncompressed => {
+        out
+          .try_reserve(plain.len())
+          .map_err(|_| EncodeRefusal::OutOfMemory {
+            engine: Engine::Uncompressed,
+            asked: to_u64(plain.len()),
+          })?;
+        out.extend_from_slice(plain);
+        Ok(())
+      }
+      StreamCompressor::Zlib(encoder) => zlib_run(encoder, plain, end, out),
+      StreamCompressor::Bzip2(encoder) => bzip2_run(encoder, plain, end, out),
+      StreamCompressor::Zstd(context) => zstd_run(context, plain, end, out),
+    }
+  }
+}
+
+/// Feeds `plain` to a zlib stream, finishing it where `end`.
+fn zlib_run(
+  encoder: &mut ZlibCompress,
+  plain: &[u8],
+  end: bool,
+  out: &mut Vec<u8>,
+) -> Result<(), EncodeRefusal> {
+  let engine = Engine::Zlib;
+  let mut read: usize = 0;
+  loop {
+    let rest = plain.get(read..).unwrap_or_default();
+    if rest.is_empty() && !end {
+      return Ok(());
+    }
+    let flush = if end && rest.is_empty() {
+      FlushCompress::Finish
+    } else {
+      FlushCompress::None
+    };
+    make_room(out, engine)?;
+    let (before, written) = (encoder.total_in(), out.len());
+    let status = encoder
+      .compress_vec(rest, out, flush)
+      .map_err(|_| EncodeRefusal::Engine {
+        engine,
+        reason: "the zlib compressor refused its call",
+      })?;
+    let step = consumed(before, encoder.total_in());
+    read = read.saturating_add(step);
+    if status == ZlibStatus::StreamEnd {
+      return Ok(());
+    }
+    if step == 0 && out.len() == written && out.len() < out.capacity() {
+      return Err(stuck(engine));
+    }
+  }
+}
+
+/// Feeds `plain` to a bzip2 stream, finishing it where `end`.
+fn bzip2_run(
+  encoder: &mut Bzip2Compress,
+  plain: &[u8],
+  end: bool,
+  out: &mut Vec<u8>,
+) -> Result<(), EncodeRefusal> {
+  let engine = Engine::Bzip2;
+  let mut read: usize = 0;
+  loop {
+    let rest = plain.get(read..).unwrap_or_default();
+    if rest.is_empty() && !end {
+      return Ok(());
+    }
+    let action = if end && rest.is_empty() {
+      Bzip2Action::Finish
+    } else {
+      Bzip2Action::Run
+    };
+    make_room(out, engine)?;
+    let (before, written) = (encoder.total_in(), out.len());
+    let status = encoder
+      .compress_vec(rest, out, action)
+      .map_err(|_| EncodeRefusal::Engine {
+        engine,
+        reason: "the bzip2 compressor refused its call",
+      })?;
+    let step = consumed(before, encoder.total_in());
+    read = read.saturating_add(step);
+    if status == Bzip2Status::StreamEnd {
+      return Ok(());
+    }
+    if step == 0 && out.len() == written && out.len() < out.capacity() {
+      return Err(stuck(engine));
+    }
+  }
+}
+
+/// Feeds `plain` to a zstd frame, ending it where `end`.
+fn zstd_run(
+  context: &mut CCtx<'static>,
+  plain: &[u8],
+  end: bool,
+  out: &mut Vec<u8>,
+) -> Result<(), EncodeRefusal> {
+  let engine = Engine::Zstd;
+  let refused = |code| EncodeRefusal::Engine {
+    engine,
+    reason: zstd_safe::get_error_name(code),
+  };
+  let directive = if end {
+    ZSTD_EndDirective::ZSTD_e_end
+  } else {
+    ZSTD_EndDirective::ZSTD_e_continue
+  };
+  let mut source = InBuffer::around(plain);
+  loop {
+    make_room(out, engine)?;
+    let (before, written) = (source.pos(), out.len());
+    let pending = {
+      let mut sink = OutBuffer::around_pos(&mut *out, written);
+      context
+        .compress_stream2(&mut sink, &mut source, directive)
+        .map_err(refused)?
+    };
+    let fed = source.pos() >= plain.len();
+    if (end && pending == 0) || (!end && fed) {
+      return Ok(());
+    }
+    if source.pos() == before && out.len() == written && out.len() < out.capacity() {
+      return Err(stuck(engine));
+    }
+  }
+}
+
 /// The refusal of a bundle that is not plain.
 fn not_plain(reason: &'static str) -> EncodeRefusal {
   EncodeRefusal::NotPlain { reason }
