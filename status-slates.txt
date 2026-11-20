@@ -1,0 +1,184 @@
+pid: 28310
+generation: 1
+restarts: 0
+anchor_hold_refusals: 0
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+dumps_local_full: false
+heartbeat_age_ns: 70696000
+clients_reaped: 4
+clients_refused: 0
+shards: 2
+fleet_host: 9727469334321375820
+fleet_f: 0
+fleet_host_epoch: 1
+fleet_members: 9727469334321375820
+fleet_peers_probed: 0
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 0
+fleet_held_records: 0
+fleet_takeovers_pending: 0
+fleet_configuration_version: 0
+anchor: 3686618249860036831
+recovered: true
+seal: minted
+seal_root: 9a2c778fd69a17263778b190a934c019
+seal_recipient: cfff50817806a64fed80e2de5661110d
+seal_key_slots: 1024
+seal_keys_held: 4
+fleet_configuration_members: 1
+fleet_settled_generation: 0
+fleet_neighbourhood_generation: 0
+fleet_council_leads: true
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 0
+fleet_council_rtt_spread_ns: 0
+fleet_council_samples: 0
+fleet_council_term: 1
+fleet_council_priority_ns: 0
+fleet_council_priority_spread_ns: 0
+fleet_council_rank: 0
+fleet_council_leader_lease: false
+fleet_council_pre_elections: 0
+fleet_council_elections: 1
+fleet_council_pre_votes_granted: 0
+fleet_council_pre_votes_refused: 0
+fleet_council_refused_role: 0
+fleet_council_refused_leased: 0
+fleet_council_refused_term: 0
+fleet_council_refused_log: 0
+fleet_council_voters: 1
+fleet_council_joint: false
+fleet_council_voter_ids: 9727469334321375820
+fleet_root_leads: true
+fleet_root_base_periods: 10
+fleet_root_span_periods: 10
+fleet_root_rtt_tail_ns: 0
+fleet_root_rtt_spread_ns: 0
+fleet_root_samples: 0
+fleet_root_term: 1
+fleet_root_priority_ns: 0
+fleet_root_priority_spread_ns: 0
+fleet_root_rank: 0
+fleet_root_leader_lease: false
+fleet_root_pre_elections: 0
+fleet_root_elections: 1
+fleet_root_pre_votes_granted: 0
+fleet_root_pre_votes_refused: 0
+fleet_root_refused_role: 0
+fleet_root_refused_leased: 0
+fleet_root_refused_term: 0
+fleet_root_refused_log: 0
+fleet_root_voters: 1
+fleet_root_joint: false
+fleet_root_voter_ids: 9727469334321375820
+fleet_detector_pool: configured=false samples=0 refused= expected_ns=0 margin_ns=0
+fleet_detector_relays: due_ns=0 stated=0
+fleet_detector_granularity_ns: 0
+fleet_peers_in_contact: 0
+fleet_peers_unmeshed: 0
+fleet_learner: council_version=0 fetched_version=0 asked=0 last_asked_ago_ms=never
+fleet_failover: total_ns=3006561000 detection_ns=2006561000 (detector periods 804) confirmation_ns=0 (coordinator periods 0) recovery_ns=1000000000 (takeovers 0 volumes 0)
+shard 0: clients=0 volumes=0 served=2 replayed=0 replay_ns=108958 torn=false mapped=1073741824 locked=0 reserve=1073741824 committed=646696952 retained=646696952 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 0 refused client.reaped_by_hangup: 2
+shard 0 refused content.give_back.left_for_next_tick: 16
+shard 0 refused content.purged_bytes: 2751823872
+shard 0 refused content.ticks.idle: 3645
+shard 0 refused fleet.failover_fan.sent: 2
+shard 0 refused merge.checkpoint.taken: 4
+shard 0 refused recovery.returned_bytes: 2445672448
+shard 0 refused repository.import.answered: 1
+shard 0 refused repository.import.held: 1
+shard 0 refused vcs_store.charge_short: 1
+shard 0 refused vcs_store.replayed: 1
+shard 0 refused vcs_store.svn_import.done: 1
+shard 0 refused vcs_store.svn_import.revisions: 1000
+shard 0 refused vcs_store.svn_import.started: 1
+shard 0 refused vcs_store.svn_import.turns: 65996
+shard 0 refused vcs_store.svn_texts.held: 9579
+shard 0 refused vcs_svn.overdue: 10
+shard 0 refused mem.large.mapped: 644
+shard 0 refused mem.large.unmapped: 574
+shard 0 refused mem.large.mapped_bytes: 298303488
+shard 0 refused mem.large.returned_bytes: 5159698432
+shard 0 refused content_range.arena.allocated: 0
+shard 0 refused content_range.arena.prefault_reserve: 0
+shard 0 refused content_range.register_log.repository_records: 10141049
+shard 0 refused content_range.register_log.chain_entries: 10107740
+shard 0 refused content_range.register_log.checkpoints: 0
+shard 0 refused content_range.register_log.rest: 10429
+shard 0 refused content_range.register_snapshot.repository_records: 223014294
+shard 0 refused content_range.register_snapshot.chain_entries: 33316084
+shard 0 refused content_range.register_snapshot.checkpoints: 48705422
+shard 0 refused content_range.register_snapshot.rest: 5688
+shard 0 refused content_range.sweep.completed: 0
+shard 0 refused content_range.sweep.past_budget: 0
+shard 0 refused content_range.sweep.longest_ns: 9000
+shard 0 catalog.volumes: 0 (age 0 ns)
+shard 0 log.replay_ns: 108958 (age 84826199000 ns)
+shard 0 lease.expiring: 0 (age 0 ns)
+shard 0 ring.depth: 0 (age 0 ns)
+shard 0 shard.clients: 0 (age 0 ns)
+shard 0 shard.deferred: 0 (age 0 ns)
+shard 0 nfs.local_p50_ns: absent/unknown (age 84826199000 ns)
+shard 0 nfs.local_p99_ns: absent/unknown (age 84826199000 ns)
+shard 0 nfs.local_off_cpu_p99_ns: absent/unknown (age 84826199000 ns)
+shard 0 nfs.forwarded_p99_ns: absent/unknown (age 84826199000 ns)
+shard 0 shard.watch_window_ns: 1000000000 (age 0 ns)
+shard 0 telemetry: spans_held=8 spans_dropped=0
+shard 0 registry_attachments: 0
+shard 0 snapshots: taken=2 written=488497415 longest_ns=588845583 log_appended=641756847 tail_bytes=20259218 tail_replay_ns=14980580 budget_ns=1000000000 floor_bytes=305041488
+shard 0 drain: spans=8 window_ns=84826964000 horizon_ns=3100000000 shed_before=0 dropped_total=0 remaining=0 missing_links=0
+shard 0 span bridge.request: absent/unknown (never; producer filesystem bridge expected here)
+shard 0 span ring.request: absent/unknown (last seen 76245646000 ns ago; producer client verb expected here)
+shard 0 span shard.op: absent/unknown (last seen 84529260000 ns ago; producer client verb expected here)
+shard 0 span log.append: absent/unknown (last seen 84529260000 ns ago; producer client verb expected here)
+shard 0 span ship.record: absent/unknown (never; no producer here (record replication (f ≥ 1)))
+shard 0 span consensus.step: absent/unknown (never; no producer here (configuration group))
+shard 0 span archive.chunk: absent/unknown (never; no producer here (archive codec))
+shard 0 span land.entry: absent/unknown (never; producer landing under grant expected here)
+shard 0 span merge.verdict: absent/unknown (never; producer client verb expected here)
+shard 1: clients=1 volumes=0 served=2 replayed=0 replay_ns=53375 torn=false mapped=0 locked=0 reserve=0 committed=0 retained=0 replicated=0 retained_versions=0 metadata=795177722 committed_metadata=0 tasks_refused=0 landings_awaiting=0/2248 landings_in_flight=0 target_leases=0
+shard 1 refused client.reaped_by_hangup: 2
+shard 1 refused content.purged_bytes: 272711680
+shard 1 refused content.ticks.idle: 2470
+shard 1 refused content_range.arena.allocated: 0
+shard 1 refused content_range.arena.prefault_reserve: 0
+shard 1 refused content_range.register_log.repository_records: 0
+shard 1 refused content_range.register_log.chain_entries: 0
+shard 1 refused content_range.register_log.checkpoints: 0
+shard 1 refused content_range.register_log.rest: 251
+shard 1 refused content_range.register_snapshot.repository_records: 0
+shard 1 refused content_range.register_snapshot.chain_entries: 0
+shard 1 refused content_range.register_snapshot.checkpoints: 0
+shard 1 refused content_range.register_snapshot.rest: 0
+shard 1 refused content_range.sweep.completed: 0
+shard 1 refused content_range.sweep.past_budget: 0
+shard 1 refused content_range.sweep.longest_ns: 17000
+shard 1 catalog.volumes: 0 (age 0 ns)
+shard 1 log.replay_ns: 53375 (age 84825683000 ns)
+shard 1 lease.expiring: 0 (age 0 ns)
+shard 1 ring.depth: 0 (age 0 ns)
+shard 1 shard.clients: 1 (age 0 ns)
+shard 1 shard.deferred: 0 (age 0 ns)
+shard 1 nfs.local_p50_ns: absent/unknown (age 84825683000 ns)
+shard 1 nfs.local_p99_ns: absent/unknown (age 84825683000 ns)
+shard 1 nfs.local_off_cpu_p99_ns: absent/unknown (age 84825683000 ns)
+shard 1 nfs.forwarded_p99_ns: absent/unknown (age 84825683000 ns)
+shard 1 shard.watch_window_ns: 1000000000 (age 0 ns)
+shard 1 telemetry: spans_held=6 spans_dropped=0
+shard 1 registry_attachments: 0
+shard 1 snapshots: taken=0 written=0 longest_ns=0 log_appended=251 tail_bytes=251 tail_replay_ns=101624 budget_ns=1000000000 floor_bytes=0
+shard 1 drain: spans=9 window_ns=84826893000 horizon_ns=3100000000 shed_before=0 dropped_total=0 remaining=0 missing_links=0
+shard 1 span bridge.request: absent/unknown (never; producer filesystem bridge expected here)
+shard 1 span ring.request: spans=7 latest_age_ns=55000
+shard 1 span shard.op: absent/unknown (last seen 76245929000 ns ago; producer client verb expected here)
+shard 1 span log.append: absent/unknown (last seen 76245929000 ns ago; producer client verb expected here)
+shard 1 span ship.record: absent/unknown (never; no producer here (record replication (f ≥ 1)))
+shard 1 span consensus.step: absent/unknown (never; no producer here (configuration group))
+shard 1 span archive.chunk: absent/unknown (never; no producer here (archive codec))
+shard 1 span land.entry: absent/unknown (never; producer landing under grant expected here)
+shard 1 span merge.verdict: absent/unknown (never; producer client verb expected here)
