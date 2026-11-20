@@ -1903,6 +1903,11 @@ impl Partition {
         Ok(())
       }
       Op::LandingStateChanged { id, .. } => self.landing(*id).map(|_| ()).ok_or(DbError::NotFound),
+      // Only a landing still awaiting its grant is superseded, and only by another landing this partition holds.
+      Op::LandingSuperseded { id, by } => match (self.landing(*id), self.landing(*by)) {
+        (Some(older), Some(_)) if older.state == LandingState::AwaitingGrant && id != by => Ok(()),
+        _ => Err(DbError::NotFound),
+      },
       // The audit is never refused (A-265): its records are the history of what happened, kept or counted as dropped.
       Op::AuditAppended { .. }
       | Op::AuditOwed { .. }
@@ -2598,6 +2603,14 @@ impl Partition {
         landing.conflicts = *conflicts;
         let volume = landing.volume;
         self.note_awaiting(volume, *id, *state);
+        Ok(())
+      }
+      Op::LandingSuperseded { id, by } => {
+        let landing = self.landings.get_mut(id).ok_or(DbError::NotFound)?;
+        landing.state = LandingState::Superseded;
+        landing.superseded_by = Some(*by);
+        let volume = landing.volume;
+        self.note_awaiting(volume, *id, LandingState::Superseded);
         Ok(())
       }
       Op::AuditAppended { record } => {

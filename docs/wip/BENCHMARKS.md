@@ -15611,7 +15611,13 @@ What it says:
   is 150 against 82 µs at p50, and its file section 0.21 against 0.03 s. Raw, the two read alike: best p50 10 against
   7 µs, p99 204 against 190 µs.
 - **Memory meets the sizing rule.** Import and peak stay at or below half the history's text bytes.
-- Owed: stock FSFS's bytes for the same history (`svnadmin load`, about 0.15 s a revision), and N=3 on a quiet machine.
+- **Stock FSFS for the same history** (`svnadmin create` then `svnadmin load -q` of the same dump, its SHA-256
+  e005db1c… matching; svn 1.15.0, FSFS format 8, logical addressing, default `fsfs.conf`; adas-mac-studio.local-2,
+  2026-11-20 15:28 PST, load 39 to 42; kiln r10): load wall 105.9 s (slates' import: 2.6 s best on the MacBook), revision
+  files (`db/revs`) **41.0 MiB**, revision properties 7.8 MiB, the repository 49.8 MiB (`du -sk`). Both arms' logs (33.2
+  MiB raw, 26.1 to 27.3 MiB under zstd 1) hold the texts in 0.81 and 0.64 to 0.67 times stock's revision files, which
+  also carry node-revisions and changed-path lists.
+- Owed: N=3 on a quiet machine.
 
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
