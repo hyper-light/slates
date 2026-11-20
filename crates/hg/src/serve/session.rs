@@ -633,9 +633,10 @@ pub enum BatchStep {
 impl Batch {
   /// The batch `cmds` lists, its calls read and copied within `admission`.
   pub fn begin(cmds: &[u8], admission: &mut Admission) -> Result<Batch, Refused> {
+    // The owned copies take at most the escaped bytes again, charged before the calls are read.
+    admission.charge(crate::read::to_u64(cmds.len()))?;
     let mut buffer = Vec::new();
     let calls = batch::calls(cmds, admission, &mut buffer)?;
-    admission.charge(crate::read::to_u64(buffer.len()))?;
     admission.charge_items::<OwnedCall>(calls.len())?;
     admission.charge_items::<Vec<u8>>(calls.len())?;
     let calls = calls
