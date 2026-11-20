@@ -44,6 +44,8 @@
 //!   resource (`!svn/me`, where a stock client sends it) or a node's URL is answered from A-616's drive by A-627's
 //!   writer, streamed the same way ([`super::update`]; checkout, update, switch and export). Every other report is
 //!   `501` in `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
+//! - An HTTPv2 commit's methods (POST to `!svn/me`, PUT, MKCOL, DELETE, COPY and PROPPATCH under `!svn/txr/`, MERGE)
+//!   are the caller's, which holds each transaction between its requests and drives it through [`super::commit`].
 //! - Every other method: `501`, `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
 //!
 //! **Read access** (`mod_authz_svn`'s questions with HTTP, §4.17.4 item 10). A request whose node's path the

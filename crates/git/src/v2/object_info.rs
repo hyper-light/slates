@@ -213,8 +213,8 @@ fn parts<'a>(
 }
 
 /// Walks the answer in `bytes`, handing each line to `each`: how many there were.
-fn walk<'a>(
-  bytes: &'a [u8],
+fn walk(
+  bytes: &[u8],
   format: ObjectFormat,
   mut each: impl FnMut(Line<Info>),
 ) -> Result<usize, Refusal> {
@@ -238,8 +238,8 @@ fn walk<'a>(
 /// object line with a size and no `size` line before it, or one without a size after it), an id or a size is none, a
 /// packet comes where the answer has none, the bytes end before its flush or go on after it; or when its lines would
 /// take more than `admission` has left, charged before the list is made.
-pub fn decode_answer<'a>(
-  bytes: &'a [u8],
+pub fn decode_answer(
+  bytes: &[u8],
   format: ObjectFormat,
   admission: &mut Admission,
 ) -> Result<Vec<Line<Info>>, Refusal> {

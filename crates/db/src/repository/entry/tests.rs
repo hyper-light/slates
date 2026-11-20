@@ -1106,8 +1106,11 @@ struct Model {
   /// The locks, by path.
   locks: BTreeMap<String, Vec<u8>>,
   /// The atomic records kept, by key, each with the positions of greens' logs that point to it.
-  records: BTreeMap<(LogName, u64), (AtomicRecord, BTreeSet<(u8, u64)>)>,
+  records: BTreeMap<(LogName, u64), KeptRecord>,
 }
+
+/// An atomic record the model keeps, with the positions `(green, position)` of greens' logs that point to it.
+type KeptRecord = (AtomicRecord, BTreeSet<(u8, u64)>);
 
 impl Model {
   fn is_member(&self, volume: u8) -> bool {
@@ -2025,28 +2028,9 @@ fn spanned(record: &crate::catalog::StateLogRecord) -> (StateLog, u64, u64, usiz
 /// two operations naming one identity.
 #[test]
 fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
-  use crate::catalog::LoggedChange;
   let (mut partition, repo, [a, b, c, ..]) = three_branches(caps(ROOMY));
   let first = partition.take_state_log_records();
-  assert_eq!(
-    first.iter().map(spanned).collect::<Vec<_>>(),
-    vec![(StateLog::Names, 0, 6, 6)]
-  );
-  assert_eq!(
-    first[0].spans,
-    vec![span(state_log(repo, StateLog::Names), 0, 6)]
-  );
-  assert!(matches!(
-    first[0].changes.as_slice(),
-    [
-      LoggedChange::Joined { .. },
-      _,
-      _,
-      LoggedChange::Named { .. },
-      _,
-      _
-    ]
-  ));
+  assert_the_create_records_its_joins_then_its_binds(&first, repo);
   let mut push = at(repo);
   push.versions = vec![version(a, 1, b"a1"), version(b, 1, b"b1")];
   push.names = vec![retire("other")];
@@ -2100,6 +2084,33 @@ fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
     vec![(StateLog::Locks, 1, 2, 1)]
   );
   assert!(identities.insert(released[0].identity));
+}
+
+/// The create's records: one of the names log, positions 0 to 6, its three joins then its three binds.
+fn assert_the_create_records_its_joins_then_its_binds(
+  first: &[crate::catalog::StateLogRecord],
+  repo: RepositoryId,
+) {
+  use crate::catalog::LoggedChange;
+  assert_eq!(
+    first.iter().map(spanned).collect::<Vec<_>>(),
+    vec![(StateLog::Names, 0, 6, 6)]
+  );
+  assert_eq!(
+    first[0].spans,
+    vec![span(state_log(repo, StateLog::Names), 0, 6)]
+  );
+  assert!(matches!(
+    first[0].changes.as_slice(),
+    [
+      LoggedChange::Joined { .. },
+      _,
+      _,
+      LoggedChange::Named { .. },
+      _,
+      _
+    ]
+  ));
 }
 
 /// The push of [`each_operation_records_what_it_moved_of_each_state_log_named_alike`]: one record of each state log it

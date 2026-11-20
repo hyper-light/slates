@@ -71,6 +71,7 @@ pub mod content;
 pub mod derived;
 pub mod index;
 pub mod rule;
+pub mod share;
 pub mod table;
 pub mod usage;
 pub mod wildmatch;
@@ -86,6 +87,7 @@ pub use derived::{
 };
 pub use index::{Batch, Index, IndexCounters, IndexRefused, Inserted, NewRow};
 pub use rule::Compaction;
+pub use share::{Claim, Granted, divide};
 pub use table::{RowRef, TableRefused, TableView};
 pub use usage::{Ledger, PrincipalCount, Usage, Work, WorkUsage};
 

@@ -1301,10 +1301,10 @@ fn page<L: Locks>(
     }
     page.locks.push(record);
   }
-  if let Some(next) = &page.next {
-    if page.locks.is_empty() || admission.charge(locks::cursor_len(next)).is_err() {
-      return Err(PageRefused::Room);
-    }
+  if let Some(next) = &page.next
+    && (page.locks.is_empty() || admission.charge(locks::cursor_len(next)).is_err())
+  {
+    return Err(PageRefused::Room);
   }
   Ok(page)
 }

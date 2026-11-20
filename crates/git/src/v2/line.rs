@@ -62,6 +62,9 @@ impl Ending {
   }
 }
 
+/// A text line as a list gives it: its text, how it ended and where its packet begins.
+pub(super) type TextLine<'a> = (&'a [u8], Ending, u64);
+
 /// A value read from one text line, and how the line ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Line<T> {
@@ -282,7 +285,7 @@ impl<'a> Packets<'a> {
 
   /// The next line of a list that a flush closes: its text, how it ended and where its packet begins; `None` at the
   /// flush. Refused when the bytes end first, at a delimiter or response end, or at a line that is not text.
-  pub(super) fn next_line(&mut self) -> Result<Option<(&'a [u8], Ending, u64)>, Refusal> {
+  pub(super) fn next_line(&mut self) -> Result<Option<TextLine<'a>>, Refusal> {
     let at = self.at();
     match self.next_packet()? {
       None => Err(Refusal::Unfinished { at }),
