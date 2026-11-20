@@ -23,6 +23,9 @@
 # Usage: [SERVERS="stock slates"] [SLATES=slates] hg_scale.sh HG SOURCE WORK [RUNS] [BOUND]
 #   SERVERS the servers measured, in the order each run starts them (default "stock")
 #   SLATES  the release `slates` binary (`cargo build --release --locked -p slates-cli`), for the slates server
+#   PUSH_CHUNK  when set, the first push is made as one push of each PUSH_CHUNK-th revision in turn (`-r REV -f`, its
+#           ancestors with it) and a last push of the rest, timed together, for a server that refuses the whole history
+#           in one request; recorded as "push-chunked"
 #   HG      the `hg` executable (Mercurial 7.2 here: the `hg` of `uvx --from mercurial==7.2`'s environment)
 #   SOURCE  a clone of the dataset (`hg clone -U https://www.mercurial-scm.org/repo/hg`)
 #   WORK    a scratch directory, made empty here and removed at the end
@@ -36,6 +39,7 @@ WORK=$3
 RUNS=${4:-3}
 BOUND=${5:-1800}
 SERVERS=${SERVERS:-stock}
+PUSH_CHUNK=${PUSH_CHUNK:-0}
 SLATES=${SLATES:-slates}
 
 rm -rf "$WORK"
@@ -66,6 +70,24 @@ timed() {
   end=$(now)
   echo "$name $(perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$start" "$end") $status" | tee -a "$RESULTS"
   if [ "$status" != ok ]; then tail -5 "$WORK/err.${name// /-}" | sed 's/^/    /'; fi
+}
+
+# Pushes SOURCE to URL a PUSH_CHUNK of revisions at a time, then the rest, the pushes timed together as step $1; the
+# first refused push ends it, recorded as failed.
+push_chunked() {
+  local name=$1 start end status=ok tip rev
+  tip=$(h -R "$SOURCE" log -r tip -T '{rev}')
+  start=$(now)
+  for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do
+    if ! bounded "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$SOURCE" push -q -f -r "$rev" "$URL" \
+      > "$WORK/out.${name// /-}" 2> "$WORK/err.${name// /-}"; then
+      status="failed($?)"
+      tail -3 "$WORK/err.${name// /-}" | sed "s/^/    at -r $rev: /"
+      break
+    fi
+  done
+  end=$(now)
+  echo "$name $(perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$start" "$end") $status" | tee -a "$RESULTS"
 }
 
 # A repository's changeset ids (sorted) and its tags, into $2.changesets and $2.tags.
@@ -163,7 +185,11 @@ check() {
 # Runs the steps against the server started for run $2 ($1 its name).
 steps() {
   local server=$1 run=$2 clone="$WORK/$1-clone-$2" scratch="$WORK/$1-scratch-$2" new
-  timed "$server push $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$SOURCE" push -q "$URL"
+  if [ "$PUSH_CHUNK" -gt 0 ]; then
+    push_chunked "$server push-chunked $run"
+  else
+    timed "$server push $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$SOURCE" push -q "$URL"
+  fi
   [ "$server" = slates ] && echo "slates daemon rss after push: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   timed "$server clone $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q -U "$URL" "$clone"
   [ "$run" = 1 ] && check "$clone" "$server"
@@ -202,7 +228,7 @@ for run in $(seq 1 "$RUNS"); do
 done
 
 echo "== results (seconds; every run shown)"
-for step in push clone incremental-push incremental-pull stream; do
+for step in push push-chunked clone incremental-push incremental-pull stream; do
   for server in $SERVERS; do
   printf '%-18s %-6s' "$step" "$server"
   grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
