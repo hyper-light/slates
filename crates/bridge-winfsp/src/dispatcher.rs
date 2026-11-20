@@ -193,7 +193,14 @@ pub(crate) fn announce_ready(
   control: HANDLE,
   intents: &crate::purge_intents::Intents,
 ) -> Result<(), WinFspError> {
-  transaction(control, TRANSACT_READY, &[], &mut [], intents).map(|_| ())
+  transaction(
+    control,
+    TRANSACT_READY,
+    &[],
+    &mut [],
+    intents.completion_event(),
+  )
+  .map(|_| ())
 }
 
 /// The only receive thread. Its owner closes the stop channel and joins before freeing the DLL object.
@@ -203,13 +210,14 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
-  /// Starts the receive thread. `bound` is the open bound, and `spin_ceiling` the most the thread may spin for a reply
-  /// (the step quantum of the shard that started the mount, A-560): the thread learns its window from its own wakes
-  /// under it ([`crate::reply::start`]).
+  /// Starts the receive thread, which starts its relief (A-725, [`inflight::relief`]). `bound` is the open bound,
+  /// `spin_ceiling` the most a receiver may spin for a reply (the step quantum of the shard that started the mount,
+  /// A-560): each receiver learns its window from its own wakes under it ([`crate::reply::start`]); and `relief_beat`
+  /// how long the primary must be held inside one send before the relief serves in its place.
   pub(crate) fn start(
     file_system: usize,
     section: OwnedHandle,
-    (bound, spin_ceiling): (usize, std::time::Duration),
+    (bound, spin_ceiling, relief_beat): (usize, std::time::Duration, std::time::Duration),
     outcomes: std::sync::mpsc::SyncSender<crate::host::Outcome>,
     wake: std::task::Waker,
     confirmations: SyncSender<crate::host::Request>,
@@ -219,11 +227,10 @@ impl Worker {
     let thread = std::thread::Builder::new()
       .name("slates-winfsp-receive".to_owned())
       .spawn(move || {
-        crate::reply::start(spin_ceiling);
         if let Err(error) = receive_loop(
           file_system,
           section,
-          bound,
+          (bound, spin_ceiling, relief_beat),
           Receive {
             stopped,
             confirmations: &confirmations,
@@ -291,16 +298,43 @@ impl CaptureView {
     })
   }
 
-  fn capture(&mut self) -> Result<Capture<'_>, WinFspError> {
-    let address = self
+  /// The primary's journal region and the relief's (A-725), each its own run of [`inflight::capture::BYTES`] at the
+  /// suffix's start, one after the other, lent for as long as this view is borrowed.
+  fn regions(&mut self) -> Result<(RegionAt<'_>, RegionAt<'_>), WinFspError> {
+    let primary = self
       .address
       .checked_add(self.offset)
       .ok_or(WinFspError::Capture(Refusal::Length))?;
-    // SAFETY: new checked the whole section and suffix offset. Only this worker touches the suffix, and the mutable
-    // borrow ends before any other capture borrow. No Rust slice covers the shard-owned prefix.
+    let relief = primary
+      .checked_add(inflight::capture::BYTES)
+      .ok_or(WinFspError::Capture(Refusal::Length))?;
+    Ok((
+      RegionAt {
+        address: primary,
+        _view: std::marker::PhantomData,
+      },
+      RegionAt {
+        address: relief,
+        _view: std::marker::PhantomData,
+      },
+    ))
+  }
+}
+
+/// One receiver's journal region inside a [`CaptureView`], borrowed from it, so the view outlives every region.
+struct RegionAt<'v> {
+  address: usize,
+  _view: std::marker::PhantomData<&'v mut CaptureView>,
+}
+
+impl inflight::relief::Region for RegionAt<'_> {
+  fn capture(&mut self) -> Result<Capture<'_>, Refusal> {
+    // SAFETY: CaptureView::new checked that the section holds both regions after the suffix offset (`opens::bytes`),
+    // and the two regions are disjoint; each is touched only by the receiver it was handed to, through this borrow.
+    // No Rust slice covers the shard-owned prefix.
     let bytes =
-      unsafe { std::slice::from_raw_parts_mut(address as *mut u8, inflight::capture::BYTES) };
-    Capture::new(bytes).map_err(WinFspError::Capture)
+      unsafe { std::slice::from_raw_parts_mut(self.address as *mut u8, inflight::capture::BYTES) };
+    Capture::new(bytes)
   }
 }
 
@@ -329,10 +363,10 @@ fn transaction(
   code: u32,
   input: &[u8],
   output: &mut [u8],
-  intents: &crate::purge_intents::Intents,
+  event: HANDLE,
 ) -> Result<usize, WinFspError> {
   let mut overlapped = OVERLAPPED {
-    hEvent: intents.completion_event(),
+    hEvent: event,
     ..OVERLAPPED::default()
   };
   let mut done = 0;
@@ -383,52 +417,27 @@ fn transaction(
 #[repr(align(8))]
 struct Packet([u8; RESPONSE_MAX]);
 
-/// The receive worker's edges for [`inflight::settle`]: the driver's transaction, the DLL's operation table and the
-/// owner shard's channel, with the private-open state and the working packet every operation uses, made once for the
-/// worker's life. Zeroing two fresh packets a request cost 2.6-4.4 us of each IRP on arm64 and 1.7-2.0 us on x86_64
-/// (diagnostics run 42091919319); WinFsp's own dispatcher clears nothing (dll/fs.c:303-305).
-struct Dll<'a> {
-  file_system: *mut FileSystem,
-  control: HANDLE,
+/// The state an operation needs, moved between the primary receiver and its relief and never shared (A-725,
+/// [`inflight::relief`]): the DLL's operation table, the owner shard's channel, the private-open state, the working
+/// packet every operation uses, the confirmation in flight and the opens made by a caller who may make links. Made once
+/// for the mount's life. Zeroing two fresh packets a request cost 2.6-4.4 us of each IRP on arm64 and 1.7-2.0 us on
+/// x86_64 (diagnostics run 42091919319); WinFsp's own dispatcher clears nothing (dll/fs.c:303-305).
+struct DllStation {
+  file_system: usize,
   private: PrivateOpens,
   working: Box<Packet>,
-  stopped: &'a Receiver<()>,
-  confirmations: &'a SyncSender<crate::host::Request>,
-  wake: &'a std::task::Waker,
+  confirmations: SyncSender<crate::host::Request>,
+  wake: std::task::Waker,
   bound: usize,
-  /// The answer of the open's confirmation posted last, until it is taken (audit step 7, cut (c)): at most one.
+  /// The answer of the open's confirmation posted last, until it is taken (audit step 7, cut (c)): at most one, here
+  /// whichever receiver holds the station.
   confirming: Option<crate::host::Confirming>,
+  /// A-275's opens whose caller held `SeCreateSymbolicLinkPrivilege`, lent to the operating thread's
+  /// `OPENS_THAT_MAY_LINK` for the length of each operation, so either receiver sees every one.
+  may_link: std::collections::BTreeSet<u64>,
 }
 
-impl inflight::settle::Edges for Dll<'_> {
-  type Error = WinFspError;
-
-  fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>, WinFspError> {
-    let reported = transaction(
-      self.control,
-      TRANSACT_BATCH,
-      &[],
-      buffer,
-      &self.private.intents,
-    )?;
-    // Keep a batch taken while stopping intact for the successor, without invoking another operation on this owner.
-    if is_stopped(self.stopped) {
-      return Ok(None);
-    }
-    Ok(Some(reported))
-  }
-
-  fn send(&mut self, response: &[u8]) -> Result<(), WinFspError> {
-    transaction(
-      self.control,
-      TRANSACT_BATCH,
-      response,
-      &mut [],
-      &self.private.intents,
-    )
-    .map(|_| ())
-  }
-
+impl inflight::relief::Station<WinFspError> for DllStation {
   fn operate(
     &mut self,
     request: &Request<'_>,
@@ -436,13 +445,15 @@ impl inflight::settle::Edges for Dll<'_> {
     replaying: bool,
   ) -> Result<usize, WinFspError> {
     REPLAYING.set(replaying);
+    OPENS_THAT_MAY_LINK.with_borrow_mut(|opens| std::mem::swap(opens, &mut self.may_link));
     let length = operation(
-      self.file_system,
+      self.file_system as *mut FileSystem,
       request,
       &mut self.private,
       &mut self.working,
       response,
     );
+    OPENS_THAT_MAY_LINK.with_borrow_mut(|opens| std::mem::swap(opens, &mut self.may_link));
     REPLAYING.set(false);
     length
   }
@@ -453,8 +464,8 @@ impl inflight::settle::Edges for Dll<'_> {
       return Err(WinFspError::Capture(Refusal::Unsettled));
     }
     self.confirming = Some(crate::host::post_confirm(
-      self.confirmations,
-      self.wake,
+      &self.confirmations,
+      &self.wake,
       context,
     )?);
     Ok(())
@@ -462,13 +473,69 @@ impl inflight::settle::Edges for Dll<'_> {
 
   fn confirmed(&mut self) -> Result<(), WinFspError> {
     match self.confirming.take() {
-      Some(answer) => crate::host::confirmed_open(&answer, self.wake),
+      Some(answer) => crate::host::confirmed_open(&answer, &self.wake),
       None => Ok(()),
     }
   }
 
   fn rename_open_names(&mut self, from: &str, to: &str) -> Result<(), WinFspError> {
-    crate::host::rename_open_names(self.confirmations, self.wake, from, to, self.bound)
+    crate::host::rename_open_names(&self.confirmations, &self.wake, from, to, self.bound)
+  }
+}
+
+/// One receiver's transactions with the driver, each on the receiver's own completion event: the primary's, which
+/// alone hears the owner's stop, and the relief's.
+struct WinPort {
+  control: usize,
+  completed: OwnedHandle,
+  stopped: Option<Receiver<()>>,
+  spin_ceiling: std::time::Duration,
+}
+
+impl WinPort {
+  fn new(
+    control: usize,
+    stopped: Option<Receiver<()>>,
+    spin_ceiling: std::time::Duration,
+  ) -> Result<Self, WinFspError> {
+    Ok(Self {
+      control,
+      completed: crate::purge_intents::new_event("make a receiver's completion event")?,
+      stopped,
+      spin_ceiling,
+    })
+  }
+}
+
+impl inflight::relief::Port<WinFspError> for WinPort {
+  fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>, WinFspError> {
+    let reported = transaction(
+      self.control as HANDLE,
+      TRANSACT_BATCH,
+      &[],
+      buffer,
+      self.completed.as_raw_handle(),
+    )?;
+    // Keep a batch taken while stopping intact for the successor, without invoking another operation on this owner.
+    if self.stopped.as_ref().is_some_and(is_stopped) {
+      return Ok(None);
+    }
+    Ok(Some(reported))
+  }
+
+  fn send(&mut self, response: &[u8]) -> Result<(), WinFspError> {
+    transaction(
+      self.control as HANDLE,
+      TRANSACT_BATCH,
+      response,
+      &mut [],
+      self.completed.as_raw_handle(),
+    )
+    .map(|_| ())
+  }
+
+  fn started(&mut self) {
+    crate::reply::start(self.spin_ceiling);
   }
 }
 
@@ -562,7 +629,7 @@ struct Receive<'a> {
 fn receive_loop(
   file_system: usize,
   section: OwnedHandle,
-  bound: usize,
+  (bound, spin_ceiling, relief_beat): (usize, std::time::Duration, std::time::Duration),
   channels: Receive<'_>,
 ) -> Result<(), WinFspError> {
   let Receive {
@@ -572,27 +639,44 @@ fn receive_loop(
     outcomes,
     private,
   } = channels;
-  let file_system = file_system as *mut FileSystem;
   // SAFETY: the mount owner cannot delete this DLL object until the receive thread is joined.
-  let control = unsafe { (*file_system).volume_handle };
-  let mut edges = Dll {
+  let control = unsafe { (*(file_system as *mut FileSystem)).volume_handle }.addr();
+  let station = Box::new(DllStation {
     file_system,
-    control,
     private,
     working: Box::new(Packet([0; RESPONSE_MAX])),
-    stopped: &stopped,
-    confirmations,
-    wake,
+    confirmations: confirmations.clone(),
+    wake: wake.clone(),
     bound,
     confirming: None,
-  };
-  let mut response = Box::new(Packet([0; RESPONSE_MAX]));
+    may_link: std::collections::BTreeSet::new(),
+  });
   let mut view = CaptureView::new(section, bound)?;
-  // This worker's index of its batch's frames, reserved once, so taking a batch allocates nothing (audit step 7).
-  let mut scratch = inflight::Scratch::new().map_err(WinFspError::Capture)?;
-  if let Some(settled) =
-    inflight::settle::recover(view.capture()?, &mut scratch, &mut edges, &mut response.0)?
-  {
+  let (mut primary_region, mut relief_region) = view.regions()?;
+  let (mut primary_response, mut relief_response) = (
+    Box::new(Packet([0; RESPONSE_MAX])),
+    Box::new(Packet([0; RESPONSE_MAX])),
+  );
+  let hand = inflight::relief::Hand::default();
+  // Each receiver's index of its batch's frames, reserved once, so taking a batch allocates nothing (audit step 7).
+  let desks = (
+    inflight::relief::Desk {
+      port: WinPort::new(control, Some(stopped), spin_ceiling)?,
+      region: &mut primary_region,
+      scratch: inflight::Scratch::new().map_err(WinFspError::Capture)?,
+      response: &mut primary_response.0,
+    },
+    inflight::relief::Desk {
+      port: WinPort::new(control, None, spin_ceiling)?,
+      region: &mut relief_region,
+      scratch: inflight::Scratch::new().map_err(WinFspError::Capture)?,
+      response: &mut relief_response.0,
+    },
+  );
+  inflight::relief::serve(&hand, desks, station, relief_beat, |settled| {
+    if settled.answered == 0 {
+      return Ok(());
+    }
     slates_machine::log_line!(
       "slates-winfsp: settled {} captured requests before receiving, {} of them a replayed cleanup or close refused",
       settled.answered,
@@ -605,19 +689,15 @@ fn receive_loop(
       })
       .map_err(|_| WinFspError::MountThread)?;
     wake.wake_by_ref();
+    Ok(())
+  })?;
+  if hand.relieved() > 0 {
+    slates_machine::log_line!(
+      "slates-winfsp: the relief served {} times while the primary was held in a send",
+      hand.relieved()
+    );
   }
-  // What this owner's last batch filled; its first receive clears the whole buffer.
-  let mut used = None;
-  loop {
-    if is_stopped(&stopped) {
-      return Ok(());
-    }
-    let receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
-    match inflight::settle::receive(receiving, &mut scratch, &mut edges, &mut response.0)? {
-      Some(filled) => used = Some(filled),
-      None => return Ok(()),
-    }
-  }
+  Ok(())
 }
 
 fn is_stopped(stopped: &Receiver<()>) -> bool {

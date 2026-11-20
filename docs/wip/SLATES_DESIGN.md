@@ -5444,6 +5444,15 @@ drops.
 > `Deadlines::reconnect_ns` remains only for the waits on a fleet owner's takeover (a request refused for now held for
 > its resend, the pause between resends, `call_through_transient`), whose own bound, the failover delay, is owed in GAPS.
 
+> **Status (2026-11-20, A-735): a macOS claim made in a replaced daemon's bootstrap object ends.** A daemon that holds
+> its own rendezvous makes the object again at its start (the create unlinks a dead predecessor's), and takes the
+> owner's bootstrap name a claim's life is judged by. A client that opened the predecessor's object (before the
+> successor's start, or between its taking the name and making the object) waited for good on a slot no daemon reads.
+> Each look on the claim's owner now also reads its own slot in the object under the name: a slot that does not name
+> this client by its pid and start (A-522; only the claimant writes them) means the object was made again, and the
+> claim is taken back and refused `DaemonUnavailable`, which a reconnect claims again. An anchor's object outlives its
+> daemon's restarts, so a claim under one keeps waiting (A-114, A-468).
+
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
 = ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = F, R9's provisioning floor, 50 µs
@@ -15383,6 +15392,11 @@ and export by landing).
 > **Status (2026-11-19, S4 slice 1, with A-716).** A Subversion text is read through a source its reader is lent
 > (`slates_svn::migration::TextSource`; `WithTexts` pairs the records with one), so the green's content index can
 > serve every text once the records stop holding text bytes (slice 2).
+>
+> **Status (2026-11-20, A-703).** `replay` and `replay-range` serve `svnsync` and `svnrdump`: a revision driven as
+> `svn_repos_replay2` drives it (`slates_svn::report::drive::replay`), streamed over the connection's editor with each
+> range revision's readable properties, the answers held to stock `svnserve`'s recordings of stock `svnsync` and
+> `svnrdump` (`crates/svn/fixtures/replay`).
 >
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
@@ -52549,7 +52563,9 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
   `paths::remake_green_sliced`), a push's whole build sliced by a task with submits parked until it ends (BUILT
-  2026-11-20, `paths::whole_build`), a submit's own whole build and a whole map's release owed; a copy made through a work
+  2026-11-20, `paths::whole_build`), a submit's own whole build too, its commit owed durably in the submit's
+  transaction and made at the build's end from what it staged (BUILT 2026-11-20, `vcs_store::owed`), a whole map's
+  release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name; its copies and symbolic links owed); Mercurial's manifests by the
   same rule.
@@ -55020,6 +55036,138 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
   restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
   (main's).
+
+### A-719 part 4 — A push is decided a command a step (bug, 2026-11-20, w-git for UI goal 93; found by use by w-perf: stock git 2.50.1's push of all of git/git, 1,027 refs, into a release slates over `--vcs-http` spun shard 10, 1,046 ms of CPU without a step, the anchor killed the daemon and git hung on `unable to rewind rpc post data`; §4.17.1 "A push's intake", rule 3)
+- **Change.** `slates_git::receive::Deciding`: a checked push decided a command at a time; without `atomic` each step
+  judges one command and, accepted, appends it; under `atomic` each step judges one, then one step appends all or none.
+  `decide` runs the same machine whole. `Session::take_checked` hands a checked push over. The server's push answers
+  through `AnswerState::Deciding` (`git_push::DecidingPush`): one step of the decision an answer step, `Turned` between,
+  with or without hooks (`post-receive` follows the last).
+- **Tests.** `slates-server` `git_push::tests::t_a719_a_push_is_decided_a_command_a_step` (forty branch creates: every
+  one `ok`, at least a step a command while it is decided; red with the decision made whole, 0 such steps);
+  `vcs_http::daemon_edge::tests::a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemons_edge`
+  (3,000 commits and a hundred branches through the daemon's edge, every ref `ok`, the watchdog armed). A step's wall
+  time is not asserted: on this Mac at a load average of 71 it measured the host (a debug step of the whole decision
+  1.09 s; of the stepped one's checks 0.4 to 1.7 s).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- receive::
+  protected_fixtures store::` 138 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- git_push::
+  git_hooks:: git_protect vcs_http::git:: vcs_http::daemon_edge:: vcs_ssh::receive vcs_ssh::tests::receive
+  vcs_ssh::tests::git vcs_store::` 105 of 105; fmt clean.
+- **Owed (A-722, main's ruling 2026-11-20).** What still runs whole in one step, measured on a 9,000-object push
+  (debug): the first append's commit of every object into the index (159 ms), each append's moves' admission (54 ms)
+  and the seal (26 ms); the walk's propagation. A-722 stages the index rows a slice at a time as objects land, so the
+  append only makes them visible, and slices the moves' admission and the seal. git/git by use (w-perf's
+  `git_scale.sh`) after it.
+
+### A-664 live whole builds, part 2 — A submit whose map is built whole owes its commit durably, made at the build's end from what it staged (2026-11-20, w-shared for UI goal 93; main's ruling (a) and its three requirements)
+- **Why.** A green's first submit, or one past a copy, built the whole head's map in its own step, which part 1 moved
+  off the shard's steps for a push. A submit's commit is made over that map, so moving the build defers the commit past
+  the version's own transaction; what makes it (message, identity, the owner's second) lived only in the submit's step,
+  and a restart between the two would have left the version with no commit.
+- **Change.** `commits::after_submit`, from `verbs::judge_submission`: where the step would build whole
+  (`paths::needs_whole`), the submit stages an owed commit (`vcs_store::owed::Owed`: the green's key and version, the
+  second, the message and the identity; magic "SGOC", typed refusals) in its own transaction, as an entry of the register
+  holding it alone, then begins the build (`paths::whole_build::start`). The build's end keeps the map, then makes the
+  commit from the staged record alone, never the clock (`commits::make_owed`, in a transaction of its own), before the
+  submits parked behind it run. The made commit's move of the green to that version settles it (`commit_moves`, live and
+  in a replay alike). A replay restores an owed record no made commit settled (`replay_git`), and a store made again
+  (`make_whole`, a recovery) starts its build again, which, the map made again already, makes the commit alone
+  (`whole_build::resume_owed`). One owed a green: submits to a green whose build runs are parked (part 1).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::owed::tests::an_owed_commit_reads_back_whole_and_refuses_every_damaged_form` (every cut `Short` or
+  `Foreign`, a trailing byte, a push record's magic); `vcs_store::commits::tests::
+  t_a664_owed_a_first_submits_commit_is_owed_then_made_at_its_staged_second` (owed and staged, none made; then made at
+  the staged second with its message, nothing owed); `t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_record`
+  (main's determinism rule: two restarts before the build ends, then the commit's text exactly the staged record's
+  over its tree, and a store made again after it lists the same commit and owes nothing). The submit tests drive a
+  first submit's build to its end (`whole_build::settle`); a commit git refuses leaves its owed record in the register
+  until the next made commit settles it. `cargo test --locked -p slates-server --lib -- vcs_store:: repository::
+  git_push:: vcs_http::git work_home:: identities:: --test-threads=4` 148 of 148; fmt clean.
+- **Owed.** The push storm (a build moved to the newest head at a slice boundary, never restarted; main's next); a
+  parked submit's wait bounded by the failover delay; a whole map's release sliced.
+
+### A-722 part 1 — A repository's index adopts a fork whole (2026-11-20, w-git for UI goal 93; main's ruling on A-722's design, points 1 and 5; §4.17.1 "A push's intake", rules 1 and 4)
+- **The design (A-722, approved 2026-11-20).** A push stages its index rows in its own fork of the repository's index
+  as its objects land (concurrent pushes each their own fork), positions taken as each object arrives with readers
+  tolerating holes (no compaction at landing); commit rows and generation numbers in a sliced pass after the pack; the
+  moves' admission sliced before the append; the landing (the register append, ordered per repository) adopts the
+  fork's runs in O(runs) with the staged values, O(changes); a fork the parent outran is re-based in slices first;
+  admission the push's window and post-state on `vcs_share::room`. Then (ruling B) the index resolves an id to its
+  place in the stored pack and readers decode in place; head files come from the green.
+- **Change (this part).** `slates_vcs::Index::adopt`: a parent takes in a fork of itself whole, the fork's tail sealed
+  into tables of its own, its holds on the runs it took from the parent given back, and its own runs added as the
+  parent's newest: no row copied, no table written but the tail's. A fork records the runs it took and its parent's
+  count of rows taken in (`Index::fork`); a parent that took in rows since is refused `AdoptRefused::Stale` and an index
+  made by no fork `NotAFork`, the fork handed back whole.
+- **Tests.** `slates-vcs` `tests::a_parent_adopts_its_forks_rows_and_refuses_a_stale_fork`.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-vcs --lib` 92 of 92; fmt clean.
+- **Owed.** The rest of A-722 above.
+### A-725 — A WinFsp drive's receiver is relieved while it is held in a send: a second receiver with its own journal serves in its place, the operation state moved between them (bug, 2026-11-20, w-bugs for goal 87, goal-83 B3; amends A-198's single receiver; §4.6 Windows)
+
+- **Found by use.** fsx seed 1 over the WinFsp drive stopped for good after its shrink (operation 45, `TRUNCATE DOWN`
+  249,552 to 56,848) on every run, on both Windows architectures, listed `fsx-seed-1-unfinished:10000` since
+  2026-11-05. A diagnostics-only log of each operation and send (diag-w-bugs-b3-9, windows-latest, 2026-11-20) ended
+  `send begins kind 8` with no `send returned` for about 59 s, where every other send took at most 481 µs: the one
+  receive worker was held inside its own send of the shrink's answer (record:
+  `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`, "Shown 2026-11-20").
+- **Cause.** WinFsp v2.1 completes an answered request on the thread that sent the answer (`src/sys/volume.c`
+  1089-1102); SetInformation's end-of-file completion runs `CcSetFileSizes` there (`src/sys/fileinfo.c` 1407,
+  `src/sys/file.c` 1852), which can wait on a paging request for the file's last page. A-198 made slates' receive worker
+  the drive's only receiver, so that request reached no one. WinFsp's own dispatcher runs at least two receivers
+  (`src/dll/fs.c` 26, 384-401) for this reason.
+- **Change.** `crate::inflight::relief` (bridge-winfsp): a primary receiver and a relief, each with its own retained
+  journal region (`opens::JOURNALS` = 2 after the open frames; `capture`'s protocol unchanged in each). The operation
+  state (`DllStation`: the DLL's operation table, private opens, working packet, shard channel, the confirmation in
+  flight, A-275's may-link set) is moved between them, never shared (R2, D-7): the primary parks it in a one-pointer
+  slot before each send and takes it back after (two atomic exchanges a send, no wake); the relief looks once a beat
+  (the daemon's watchdog beat, `HEARTBEAT_NS`, passed to the mount as `RELIEF_BEAT`) and, when the primary has been
+  inside the same send a whole beat, takes the state and serves its own region until the primary, its send returned,
+  asks for it back. So one thread operates at a time, as A-198 requires: the DLL has one caller, the shard channel's
+  bound (`REQUEST_BOUND`) and the one outstanding confirmation are unchanged, and recovery settles both regions before
+  either receives; the ledger's one unconfirmed open is kept when either journal's saved response vouches for it
+  (`Ledger::settle_pending` over both).
+- **Tests.** `inflight::relief::tests::a_send_whose_completion_waits_on_another_request_is_relieved` (every host): a
+  modelled driver on its own thread whose completion of a shrink's answer issues a nested read and returns the send
+  only once that read is answered, over the real journal regions. Red with the relief taken out (macOS arm64, Mac
+  Studio, 2026-11-20): "the shrink's answer never completed in 10.1 s: its nested read reached no receiver"; green in
+  0.03 s. The crash oracle (`inflight::oracle`) and the ledger's tests pass unchanged over the new `settle_pending`.
+- **By use (CI, 2026-11-20).** windows-latest and windows-11-arm (diag-w-bugs-b3-11): fsx seed 1 over the drive
+  passed on both (it had stopped at operation 45 on every run since 2026-11-05); `slates-cli --test winfsp_semantics`
+  and `--test winfsp` passed; `slates-bridge-winfsp --lib` with WinFsp (the live taken-request and recovery oracles)
+  127 passed on both, against 126 on main's tree with the same test support (diag-w-bugs-lib-fix-1 /
+  -control-1); the one failure in both arms, the same, is A-576's `the_volumes_upcase_table_is_the_systems` (109 units
+  where Windows' table differs from the published one), not this change's. jupiter (Windows x86_64, no WinFsp):
+  `--lib` 127 passed, the same one failing.
+- **Found on the way, fixed here because the runs above needed them.** (1) The harness judged the WinFsp fsx port by a
+  success line naming exactly the operations asked, but the port also counts each MAPWRITE's extension of the file
+  (`fsx.c` 1330-1337 at 6ac65cd): a whole run of 10,000 printed 10,770 and was called failed. It now takes a count of
+  at least the operations asked (`the_winfsp_ports_count_includes_its_extensions`, red then green). (2)
+  bridge-winfsp's Windows test support had not compiled since A-551 changed `Mounted::new` (`tests/support/transact.rs`)
+  and read the anchor's handoff from the environment where A-460 put it in a section (`tests/support/host.rs`, "handoff
+  checksum absent"): both brought to the daemon's own reading.
+- **Residual.** A relief itself held in a send is relieved by no one (two completions each waiting on the drive at
+  once); the relief's receive may run its transaction timeout (1 s) before it hands the state back.
+- **Applied in the same change to** GAPS (the delete/purge hang entry), the fsx bug record, amendments.tsv.
+
+### A-735 — A macOS claim made in a replaced daemon's bootstrap object ends (bug, 2026-11-20, w-forming; found by use: main's forming sweep, live_chaos `a_member_that_never_held_the_log_never_stands_in_for_its_holder` under `taskpolicy -b`, run 25; amends A-443's macOS look; §4.7 "Rendezvous")
+
+- **What happened.** The flow replaced fleet member `a` with a fresh daemon and asked it `volume list` while it started.
+  The client hung 30+ minutes in `Claim::wait` against a daemon serving with both shards parked: read at the hang, the
+  bootstrap object under the instance's name (its start stamp the fresh daemon's) had all 64 claim slots free and no
+  slot naming either hung client's pid.
+- **Cause.** A daemon run alone takes the owner's bootstrap name (`take_ownership`), then makes the object again
+  (`owned_object`; `SharedObject::create` unlinks the dead predecessor's). A client that opened the predecessor's object,
+  still published since a killed daemon never takes its stamp back, claimed a slot there; its look asked only whether the
+  owner's name was held, and the successor held it, so the claim was due for good.
+- **The fix.** `Claim::look` (macOS) also asks `made_again`: the object now under the name is opened and the claim's slot
+  read; a pid or start other than this process's (A-522's fields, written only by the claimant) means the object was made
+  again, and the claim is taken back and refused `DaemonUnavailable`. No object under the name yet reads not made again,
+  so the next look asks again. An anchor's object outlives its daemon's restarts, so its claims keep waiting.
+- **Tests.** `slates-ipc` `rendezvous::platform::tests::a_claim_on_a_rendezvous_made_again_by_a_new_owner_ends`: red
+  before (still due 2.000 s after the object was made again), refused 178 µs after it with the fix. macOS arm64, Mac
+  Studio (adas-mac-studio-4), local: `cargo test --locked -p slates-ipc --lib rendezvous::` 16 of 16,
+  `--test rendezvous` 14 of 14, fmt clean.
+- **Applied in the same change to.** §4.7's A-468 status (a status line), GAPS (the rendezvous waits entry).
 
 ### A-733 — The DAV site runs a repository's hooks (2026-11-20, w-reaper, UI goal 93; §4.17.4 items 5 "HTTP" and 9; A-730, A-681, A-627, A-661)
 
