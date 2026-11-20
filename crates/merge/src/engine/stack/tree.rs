@@ -159,7 +159,7 @@ impl Green {
       if now == Some(base.as_ref()) {
         continue;
       }
-      if frame == path && now == Some(apply(&base, ops, &work.post_state).as_slice()) {
+      if frame == path && now == Some(apply(&base, ops, work.post()).as_slice()) {
         identical.insert(path.clone());
         continue;
       }

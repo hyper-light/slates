@@ -55263,6 +55263,14 @@ Applied in the same change to:
   a credential minted on the owner is unknown to the successor (401) and a survivor's own token names its own account
   (403). Tests: slates-db 18 suites; slates-server `takeover state_log vcs_store:: git_push:: vcs_http::git vcs_ssh::`
   236 of 236.
+- **Record version 3 on (2026-11-20; main's ruling (ii)).** `vcs_store::write_version_3` is true: a push's names are
+  homed in the region at f + 1 before its record names them, and the record holds their BLAKE3 and count. The takeover
+  test passes with it, 4 of 4 runs. One run's counts: the successor replayed 3 records (`vcs_store.replayed`) and read one
+  record's names from a region home (`vcs_store.names_fetched` 1); each survivor homed 2 objects, served 19 region
+  exchanges, and its homing waits published its home shard themselves 11 and 13 times (`published_for_ticket`). The first
+  runs hung: main's refactor of the HTTP answer loop (`answer_until`) had dropped the edge's `take_homing`, so a decision
+  waited for a homing nobody ran. The edge homes again, and a decision whose asked homing is not taken by its next turn
+  now gives the names back and writes version 2 (`vcs_store.homes.homing_untaken`), never waits.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -57097,10 +57105,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
 - **Measured.** `named_tests::a_named_text_is_read_a_slice_a_step_then_lands_whole`: a 4 MiB text read in 64 steps of
   at most 64 KiB, refused `ContentUnread` before, accepted after with the green's file the text's bytes; its encoding
   under 4 KiB (the names), decoded with its run unread again.
-- **Owed, named.** Part 2: the commit building the green's file blocks a slice a unit off the green and publishing in
-  one step (today `Green::commit` copies the file's bytes in one call); the server's `Objects` over vcs_store's plane
-  and the landing's turns (w-svn's `svn.land.*` counters); replay reading a chain entry's runs before
-  `apply_recorded`; items 3-7 then name the plane's object from the green's block with no copy.
+- **Part 2, held once and landed in turns** (main's piece; Ada's sizing rule: a landing's memory bounded by a slice
+  beside the file, never the file twice). A run is read into a buffer of its own (`named::Read`, one a run, reserved at
+  its length, pages made as written), never onto the post-state; the engine reads every added byte through one view
+  (`named::Post`: the inline bytes, then the runs). `Green::judge_named` moves the runs' buffers into the verdict held
+  (`Green::judge` copies them, so no caller loses bytes), and the commit makes each file whose bytes are exactly one
+  run's, made by no other file, of that buffer, moved (`take_whole_runs`): the text is the green's file with no copy.
+  A created file's bytes are made at the commit, not in the verdict (`merge_create` builds them only to compare with
+  a file standing there). The server reads a run from vcs_store's content plane (`vcs_store::named_objects::
+  PlaneObjects`: identity -> the node-local root, `ContentStore::window_range_in` reading a window's range straight
+  into the run's buffer, so a read copies its own bytes); a recovery's replay, which holds the shard read-only, reads
+  with the shard's chunk store given in place of a lent one (`WindowStorage::read_range_in`'s `kept_in`), the entry
+  kept a copy slice a step until its runs are read (`GreenReplayPhase::Chain::reading`; a missing object fences
+  `ContentMissing`). Measured (`t_a760_a_large_named_text_lands_a_slice_a_turn_held_once`, debug): an 8 MiB text read
+  in 149 turns of a 56,656-byte copy slice, no turn reading more; the committed file the read buffer itself.
+- **Owed, named.** w-svn's landing driving the turns (`svn.land.*`); a splice of part of a run still copies the file at
+  the commit; items 3-7 then name the plane's object from the green's block, so the text is held once in all.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
 
@@ -57395,6 +57415,32 @@ profile's establishment shared by both judges, an `ask` for a host with no Unix 
   container_engine contract_history` 10 passed, `cargo test --locked -p slates-bridge-oci` all passed (macOS arm64,
   Adas-Mac-Studio-4, local). Owed: the Windows `ask`'s run on Windows (main's, §8), and the export route's live run there
   (kiln's container drive on jupiter, w-k90-containers).
+
+### A-771 — A live takeover's rebuild applies a payload, and hashes its archive's content, in steps (2026-11-20, w-forming; main's order, item (a): the takeover's rebuild turn; §4.10 "Live shipping", g251's rebuild in turns, A-374)
+Applied in the same change to: GAPS (the live owner's long-turn line), `crates/cluster/src/sealed.rs` (`RawOpening`),
+`crates/server/src/live_ship.rs` (`Rebuilding::advance`, `step`, `apply_publication`, `lay_step`; `Applying`, `Begun`,
+`begin_applying`, `apply_record`, `Laying`, `hashed_chunk`, `open_step_bytes`; `apply_payload` and `open_payload` gone),
+`crates/server/src/fleet.rs` (`rebuild_in_turns`' doc), `crates/cluster/tests/sealed.rs`.
+- **What was there.** g251 made a live log's rebuild a slice a turn, with a payload as its unit, and laid the rebuilt
+  volume out as an archive in one turn after it. A whole entry carries the volume's every byte, so it was one step: a
+  1.39 MB whole entry's open took 59 ms of one debug successor turn and a 1.75 MB one's 56 ms (its decode 1.5 to 1.7 ms,
+  its runs' overlay 0.8 to 1.1 ms). The archive's layout hashed every content chunk in its turn, 93 to 99 ms for 1.5 to
+  1.75 MB of runs (w-forming's probe, debug under `taskpolicy -b`, live_chaos's takeover flow, base a7df9ccf0). A
+  1 MiB sealed piece's open measured 13 ms in a debug build, nearly all of it the identity's BLAKE3.
+- **The change.** A payload is applied in steps, the slice's clock read between them. A sealed body's pieces are opened
+  by `slates_cluster::sealed::RawOpening`, which opens segments, then hashes the content against its identity, a budget
+  of bytes a call (an archive page a step), and accepts and refuses what `open_chunk` does for a raw chunk, the form a
+  body is sealed in. The record is applied once the body is open, and each run is laid over the rebuild's as a step of
+  its own. Once every payload is applied, the image's content spans are gathered from the runs and hashed, a page a
+  step (`Laying`), and the archive's layout makes each chunk from its span's bytes and the identity hashed for it, with
+  no hash of its own.
+- **Tests.** `slates-cluster` sealed `a_raw_chunk_opened_in_steps_is_the_chunk_opened_whole` (the oracle against
+  `open_chunk`: lengths about the segment and up to 1 MiB, budgets of a byte to everything, each segment's bit flipped,
+  the last cut, another tenant's naming). `live_ship::tests::a_rebuilds_large_payload_is_applied_in_steps_and_lays_out_the_same_volume`
+  (a whole body of two 512 KiB files, clear and sealed, rebuilt at a slice never spent and at one spent every step: the
+  same archive, every chunk verified against its identity; 27 and 64 steps, at least a page each. Red: one call a
+  payload; with the payload stepped and the archive hashed whole, 6 steps for 16 pages). The server fleet tests'
+  live takeovers and rebuilds (32 passed).
 
 ### A-773 — The session log: what needs the human, named first, read from what it shows (2026-11-20, w-sessionlog; Ada's dispatch after the Slates-vs-Sapling comparison; §4.16, §4.15; R10)
 Ten agents over one green left their supervisor cross-referencing volume ids, `versions`, a conflict's JSON and the

@@ -181,6 +181,29 @@ pub trait WindowStorage: std::fmt::Debug {
   fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused>;
   /// The bytes kept under `window`: borrowed where the storage can lend them, copied out where it cannot.
   fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>>;
+  /// [`WindowStorage::read`], given what this storage keeps its windows in when none is lent to it now (A-760: a
+  /// recovery's replay reads a work's named text read-only, the shard's chunk store in its place). A storage that keeps
+  /// its windows itself reads them as [`WindowStorage::read`] does.
+  fn read_in<'a>(
+    &'a self,
+    window: StoredWindow,
+    _kept_in: &'a dyn std::any::Any,
+  ) -> Option<Cow<'a, [u8]>> {
+    self.read(window)
+  }
+  /// Copies `into.len()` bytes kept under `window` from `offset` into `into`, nothing else of the window copied (A-760:
+  /// a read a slice long costs the slice); `kept_in` as [`WindowStorage::read_in`]. None past the window's bytes.
+  fn read_range_in(
+    &self,
+    window: StoredWindow,
+    (offset, into): (usize, &mut [u8]),
+    kept_in: &dyn std::any::Any,
+  ) -> Option<()> {
+    let bytes = self.read_in(window, kept_in)?;
+    let from = bytes.get(offset..offset.checked_add(into.len())?)?;
+    into.copy_from_slice(from);
+    Some(())
+  }
   /// Lets the bytes kept under `window` go.
   fn release(&mut self, window: StoredWindow);
 
@@ -1293,6 +1316,18 @@ impl ContentStore {
   /// A reader that resumes at a window reads the lists above it alone, never the windows before it. `None` past the
   /// object's last window, or where the store does not hold the path down whole.
   pub fn window_at(&self, root: &ContentId, len: u64, index: u64) -> Option<Cow<'_, [u8]>> {
+    self.window_at_in(root, len, (index, &()))
+  }
+
+  /// Copies `into.len()` bytes of window `index` of the object `root` (`len` bytes long) from `offset` in the window
+  /// into `into`, its storage reading from `kept_in` where none is lent to it now (A-760: a named run read a slice a
+  /// step, no more of the window copied). None past the window's bytes or for a window not held.
+  pub fn window_range_in(
+    &self,
+    (root, len, index): (&ContentId, u64, u64),
+    (offset, into): (usize, &mut [u8]),
+    kept_in: &dyn std::any::Any,
+  ) -> Option<()> {
     let root = &self.resolve(root);
     let window = u64::try_from(self.window.get()).ok()?;
     let fanout = u64::try_from(self.fanout.get()).ok()?;
@@ -1307,7 +1342,38 @@ impl ContentStore {
       .get(&identity)
       .filter(|held| held.form == Form::Window)?;
     match held_window(held) {
-      Some(window) => self.storage.read(window),
+      Some(stored) => self.storage.read_range_in(stored, (offset, into), kept_in),
+      None => {
+        let here = held.here()?;
+        into.copy_from_slice(here.get(offset..offset.checked_add(into.len())?)?);
+        Some(())
+      }
+    }
+  }
+
+  /// [`ContentStore::window_at`], its storage reading from `kept_in` where none is lent to it now
+  /// ([`WindowStorage::read_in`], A-760).
+  pub fn window_at_in<'a>(
+    &'a self,
+    root: &ContentId,
+    len: u64,
+    (index, kept_in): (u64, &'a dyn std::any::Any),
+  ) -> Option<Cow<'a, [u8]>> {
+    let root = &self.resolve(root);
+    let window = u64::try_from(self.window.get()).ok()?;
+    let fanout = u64::try_from(self.fanout.get()).ok()?;
+    let windows = len.div_ceil(window).max(1);
+    if index >= windows {
+      return None;
+    }
+    let height = list_levels(windows, fanout)?;
+    let identity = self.window_identity(root, (height, fanout), index)?;
+    let held = self
+      .entries
+      .get(&identity)
+      .filter(|held| held.form == Form::Window)?;
+    match held_window(held) {
+      Some(window) => self.storage.read_in(window, kept_in),
       None => held.here().map(Cow::Borrowed),
     }
   }
