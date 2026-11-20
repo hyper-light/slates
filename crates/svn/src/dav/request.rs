@@ -305,6 +305,8 @@ pub enum Report {
   InheritedProps(InheritedPropsReport),
   /// `replay-report`.
   Replay(ReplayReport),
+  /// `file-revs-report` (`svn blame`; A-726).
+  FileRevs(super::listing::FileRevsReport),
 }
 
 /// Reads an OPTIONS body; no body asks for nothing.
@@ -384,6 +386,7 @@ pub fn report(body: &[u8], bounds: &Bounds) -> Result<Report, DavRefusal> {
     "get-deleted-rev-report" => get_deleted_rev(&root).map(Report::GetDeletedRev),
     "inherited-props-report" => Ok(Report::InheritedProps(inherited_props(&root)?)),
     "replay-report" => replay(&root).map(Report::Replay),
+    "file-revs-report" => super::listing::file_revs_from(&root).map(Report::FileRevs),
     _ => Err(unknown(&root)),
   }
 }

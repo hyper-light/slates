@@ -15211,6 +15211,19 @@ and export by landing).
 > into the daemon's `ToolSites`; a repository's authorization file and a principal's Subversion user, which no
 > record names yet, so the lender gives no read rules (every path the policy lets the principal read).
 >
+> **Status (2026-11-20, A-726, part 1).** Built: the `file-revs-report` and the `get-locations` report over HTTP, so
+> stock `svn blame` (with or without `-r`), `svn cat -r` and `svn diff` of a URL at a peg read a repository through the
+> edge. `svn blame`'s report is the svn:// command's walk (`svn_repos_get_file_revs2`) with `file-revs.c`'s handler as
+> its writer (`reads::DavFileRevs`), streamed a revision a step: the header before the first revision, each revision's
+> `S:file-rev` (revision properties, property changes, `S:merged-revision`, the text's delta in base64), the end; a
+> walk refused before its first byte answered `dav_svn__convert_err`'s status with the error in `D:error`, one after it
+> ending the connection. `get-locations` is the svn:// trace (`svn_repos_trace_node_locations`) written as
+> `get-locations.c` writes it. Held to the fixture repository (each revision's delta replayed to the text the site's GET
+> serves there; a directory refused; a file traced back across its copy) and to stock svn 1.15 against `svnserve -t`
+> over one history: seven commands, every answer byte for byte the same but for the author. Departures: deltas in
+> svndiff 0, as the update-report writes them; locations in the trace's order, where `mod_dav_svn` walks a hash. Owed:
+> the `mergeinfo-report` (`svn blame -g`, `svn merge`).
+>
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
 > `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
@@ -54452,3 +54465,25 @@ Applied in the same change to:
   the paper's own 9-CPU, 18-GB example; a monorepo beside a toy; degenerate claims never not-a-number). The oracle's
   first runs found a resource with no room left that the remaining claims never use stopping them at level zero, fixed.
   Owed: the demands read from the usage rows and the weights learned (piece 2's other half), feeding admission (3).
+
+### A-726 — `svn blame` and `svn diff` over HTTP: the `file-revs-report` and `get-locations` served through the DAV site (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 5 "HTTP"; A-681, A-627, A-613)
+
+- **What was there.** The DAV site answered every REPORT but the log and the update-report `501` ("The requested report
+  is unknown"): stock `svn blame` over HTTP failed `E200007`, and so did any command resolving a URL's peg to an older
+  revision (`svn blame -r N URL`, `svn cat -r N URL`). A-627 had read the `file-revs-report` and written its answer
+  whole; nothing routed it.
+- **Change.** `request::report` reads `file-revs-report` (A-627's reader, `listing::file_revs_from`). The svn:// walk
+  (`reads::file_revs`) takes a writer: `svnserve`'s items, or `file-revs.c`'s elements (`listing::file_rev_element`),
+  so `reads::DavFileRevs` streams the answer a revision a step (`dav::report_file_revs`). `reads::trace_node_locations`
+  opens the svn:// trace to the site, and `dav::report_locations` writes `get-locations.c`'s answer. `svn diff` asked
+  nothing new: its update-report was served (A-681 part B).
+- **Tests.** `slates-svn` `dav::report_file_revs::tests` (2: deltas replayed to the GET's texts at every revision,
+  streamed at the least room and the whole room alike; a directory refused before the first byte),
+  `dav::report_locations::tests` (a copy traced back; a peg past the youngest `404`), `dav::tests`' refusals (a
+  file-revs-report without its path `400`); `slates-cli` `svn_http_reports`
+  `stock_svn_blames_and_diffs_over_the_vcs_http_edge_as_against_svnserve` (stock svn 1.15.0 on the Mac Studio: `blame`,
+  `blame -r 2`, `diff -r 1:3`, `diff -c 2`, `diff --summarize`, a two-peg diff, `cat -r 1`, each equal to `svnserve -t`'s).
+- **Applied in the same change to** §4.17.4's status, GAPS (A-681's owed reports), amendments.tsv.
+- **Owed.** Part 2: the `mergeinfo-report` and `SVN-Repository-MergeInfo: yes` (`svn blame -g`, `svn merge`). Deltas in
+  the svndiff version `Accept-Encoding` prefers. The interop harness copied into `svn_http_reports.rs` folded into one
+  module with `svn_interop.rs` once that file's pieces land.

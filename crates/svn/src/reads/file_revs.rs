@@ -38,17 +38,23 @@
 //! is owed (§4.17.4 item 11, GAPS).
 
 use super::history::skip_ancestor;
+use super::log::dav::DavLogProgress;
 use super::stream::{Progress, Stream};
+use super::{Authentication, ROOT, full_path};
 use super::{
   DONE, Failure, Outcome, Reads, Repository, SVN_ERR_FS_NOT_FOUND, boolean, optional_revnum,
   path_and_revision, proplist,
+};
+use crate::authz::PrincipalRules;
+use crate::dav::listing::{
+  FILE_REVS_END, FILE_REVS_START, FileRev, FileRevsReport, file_rev_element,
 };
 use crate::handshake::ClientCapabilities;
 use crate::index::{Node, NodeKind, PropertyList, Revision, Text};
 use crate::mergeinfo::{Compare, Mergeinfo, MergeinfoInheritance, mergeinfo_at};
 use crate::ra_svn::{ItemError, Value, write};
 use crate::report::editor::DeltaWrites;
-use crate::svndiff::{Compression, Version, WINDOW_LIMIT, deltas};
+use crate::svndiff::{Compression, Version, WINDOW_LIMIT, Window, deltas};
 use std::collections::{BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
@@ -60,6 +66,11 @@ const SVN_ERR_FS_NOT_FILE: u32 = 160_017;
 /// Format: the miscellaneous category's start, 120,000 + 16 × 5,000 = 200,000, plus 7 (`svn_error_codes.h`); recorded
 /// (fixture `get-file-revs`).
 const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
+
+/// The svndiff version a `file-revs-report`'s deltas are written in: 0, as the update-report's are (`dav::update`), which
+/// every client decodes. `mod_dav_svn` writes the version the request's `Accept-Encoding` prefers (`repos.c`
+/// `negotiate_encoding_prefs`); a client decodes whichever it is sent, so blame's answer is the same (A-726).
+const DAV_SVNDIFF: Version = Version::Zero;
 
 /// One revision of the file to send (`struct path_revision`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,8 +154,27 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       pending: None,
       last: None,
       ended: false,
+      writer: RevsWriter::Items,
     })))
   }
+}
+
+/// Where a file's revisions are written: as `svnserve`'s `file_rev_handler` writes them on an ra_svn connection, or as
+/// `mod_dav_svn`'s writes a `file-revs-report` (`reports/file-revs.c`; A-726).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RevsWriter {
+  /// `serve.c`'s items.
+  Items,
+  /// `file-revs.c`'s elements.
+  Dav {
+    /// Whether the header is still to be written (`needs_header`).
+    needs_header: bool,
+    /// The refusal that ended the walk, for the caller to answer.
+    refused: Option<Failure>,
+    /// Whether the walk aborted where `svn_repos_get_file_revs2`'s assertion fails: httpd's child ends, and with it the
+    /// connection, whatever was written.
+    aborted: bool,
+  },
 }
 
 /// A `get-file-revs` answer still to write.
@@ -162,6 +192,8 @@ pub(super) struct FileRevsStream {
   last: Option<Last>,
   /// Whether `done` and the answer are written.
   ended: bool,
+  /// Where the revisions are written.
+  writer: RevsWriter,
 }
 
 impl FileRevsStream {
@@ -180,6 +212,9 @@ impl FileRevsStream {
         Err(Stop::Refused(failure)) => self.finish(reads, Some(&failure))?,
         Err(Stop::Aborted) => {
           self.ended = true;
+          if let RevsWriter::Dav { aborted, .. } = &mut self.writer {
+            *aborted = true;
+          }
           return Ok(Progress::Close);
         }
         Err(Stop::Unwritten(error)) => return Err(error),
@@ -200,7 +235,7 @@ impl FileRevsStream {
   fn step<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>) -> Result<(), Stop> {
     let Some(pending) = self.pending.as_mut() else {
       let found = reads.file_revisions_to_send(&self.request);
-      if !matches!(found, Err(Stop::Aborted)) {
+      if !matches!(found, Err(Stop::Aborted)) && self.writer == RevsWriter::Items {
         reads.trivial_auth()?;
       }
       self.pending = Some(found?);
@@ -240,18 +275,43 @@ impl FileRevsStream {
       .repository
       .revision_properties(revision.revision)
       .unwrap_or_default();
-    let item = Value::List(vec![
-      Value::String(revision.path.as_bytes()),
-      Value::Number(revision.revision),
-      proplist(revision_properties),
-      Value::List(diffs.iter().map(diff_value).collect()),
-      Value::Word(super::bool_word(revision.merged)),
-    ]);
-    write(&item, reads.out)?;
-    if changed {
-      self.delta(reads, &node)?;
+    if self.writer == RevsWriter::Items {
+      let item = Value::List(vec![
+        Value::String(revision.path.as_bytes()),
+        Value::Number(revision.revision),
+        proplist(revision_properties),
+        Value::List(diffs.iter().map(diff_value).collect()),
+        Value::Word(super::bool_word(revision.merged)),
+      ]);
+      write(&item, reads.out)?;
+      if changed {
+        self.delta(reads, &node)?;
+      }
+      write(&Value::String(b""), reads.out)?;
+    } else {
+      let delta = if changed {
+        Some(self.windows(reads, &node)?)
+      } else {
+        None
+      };
+      let element = file_rev_element(
+        &FileRev {
+          path: revision.path.clone(),
+          revision: revision.revision,
+          rev_props: owned_names(&revision_properties),
+          props: diffs
+            .iter()
+            .map(|(name, value)| (lossy(name), value.map(<[u8]>::to_vec)))
+            .collect(),
+          merged: revision.merged,
+          delta,
+        },
+        DAV_SVNDIFF,
+      )
+      .map_err(|_| Failure::corrupt())?;
+      self.dav_header(reads.out);
+      reads.out.extend_from_slice(element.as_bytes());
     }
-    write(&Value::String(b""), reads.out)?;
     self.last = Some(Last {
       path: revision.path.clone(),
       revision: revision.revision,
@@ -270,16 +330,9 @@ impl FileRevsStream {
     reads: &mut Reads<'_, R>,
     node: &Node<'_>,
   ) -> Result<(), Stop> {
-    let source = match &self.last {
-      Some(last) => reads.whole_text(last.text)?,
-      None => Vec::new(),
-    };
-    let target = reads.whole_text(node.text())?;
-    let room = NonZeroUsize::new(usize::try_from(WINDOW_LIMIT).map_err(|_| Failure::corrupt())?)
-      .ok_or_else(Failure::corrupt)?;
     let mut writes = DeltaWrites::new(self.version);
     let mut encoded = Vec::new();
-    for window in deltas(&source, &target, room).map_err(|_| Failure::corrupt())? {
+    for window in self.windows(reads, node)? {
       let window_writes = writes
         .window(&window, self.compression, &mut encoded)
         .map_err(|_| Failure::corrupt())?;
@@ -293,13 +346,54 @@ impl FileRevsStream {
     Ok(())
   }
 
-  /// `done`, then `( success ( ) )` or the refusal.
+  /// The windows of the delta from the previous revision's text (none for the first) to `node`'s: Subversion's
+  /// (A-652's deltifier).
+  fn windows<R: Repository + ?Sized>(
+    &self,
+    reads: &Reads<'_, R>,
+    node: &Node<'_>,
+  ) -> Result<Vec<Window>, Failure> {
+    let source = match &self.last {
+      Some(last) => reads.whole_text(last.text)?,
+      None => Vec::new(),
+    };
+    let target = reads.whole_text(node.text())?;
+    let room = NonZeroUsize::new(usize::try_from(WINDOW_LIMIT).map_err(|_| Failure::corrupt())?)
+      .ok_or_else(Failure::corrupt)?;
+    Ok(
+      deltas(&source, &target, room)
+        .map_err(|_| Failure::corrupt())?
+        .into_iter()
+        .collect(),
+    )
+  }
+
+  /// `maybe_send_header`: the DAV answer's start, once, before its first revision or its end.
+  fn dav_header(&mut self, out: &mut Vec<u8>) {
+    if let RevsWriter::Dav { needs_header, .. } = &mut self.writer
+      && std::mem::take(needs_header)
+    {
+      out.extend_from_slice(FILE_REVS_START.as_bytes());
+    }
+  }
+
+  /// `done`, then `( success ( ) )` or the refusal; for DAV, the report's end, or the refusal kept for the caller.
   fn finish<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
     failure: Option<&Failure>,
   ) -> Result<(), ItemError> {
     self.ended = true;
+    if let RevsWriter::Dav { refused, .. } = &mut self.writer {
+      match failure {
+        Some(failure) => *refused = Some(failure.clone()),
+        None => {
+          self.dav_header(reads.out);
+          reads.out.extend_from_slice(FILE_REVS_END.as_bytes());
+        }
+      }
+      return Ok(());
+    }
     write(&Value::Word(DONE), reads.out)?;
     match failure {
       None => reads.success(Vec::new())?,
@@ -623,5 +717,121 @@ impl From<Failure> for Stop {
 impl From<ItemError> for Stop {
   fn from(error: ItemError) -> Self {
     Self::Unwritten(error)
+  }
+}
+
+/// Revision properties with their names as text, as `send_prop` writes them.
+fn owned_names(properties: &[(&[u8], &[u8])]) -> Vec<(String, Vec<u8>)> {
+  properties
+    .iter()
+    .map(|(name, value)| (lossy(name), value.to_vec()))
+    .collect()
+}
+
+/// A property name as text.
+fn lossy(name: &[u8]) -> String {
+  String::from_utf8_lossy(name).into_owned()
+}
+
+/// A `file-revs-report`'s answer still to write (`reports/file-revs.c`, A-726): `svn_repos_get_file_revs2`'s walk above,
+/// with `mod_dav_svn`'s handler in place of `svnserve`'s. The request's path is joined to the repository path of the
+/// resource the REPORT names (`svn_fspath__join`); its revisions are read as the svn:// command reads them. The answer
+/// is written a revision a step: the header before the first revision (`maybe_send_header`), each revision's
+/// `S:file-rev` with its revision properties, its property changes, `S:merged-revision` where merged, and its text's
+/// delta in base64 where it changed, then the report's end. A refusal before anything is written is the caller's to
+/// answer as `mod_dav` answers a report's error; one after, or the walk's abort, ends the connection ([`Self::begun`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DavFileRevs {
+  /// The walk, its revisions going to `mod_dav_svn`'s writer.
+  stream: FileRevsStream,
+}
+
+impl DavFileRevs {
+  /// The walk `report` asks for, its path beneath `target`, the repository path of the resource the REPORT names.
+  pub fn new(report: &FileRevsReport, target: &str) -> Self {
+    let signed = |revision: Revision| i64::try_from(revision).unwrap_or(i64::MAX);
+    let request = FileRevsRequest {
+      path: full_path(target, report.path.as_bytes()),
+      start: report.start.map(signed),
+      end: report.end.map(signed),
+      merged: report.include_merged_revisions,
+    };
+    Self {
+      stream: FileRevsStream {
+        request,
+        version: DAV_SVNDIFF,
+        compression: Compression::Stored,
+        pending: None,
+        last: None,
+        ended: false,
+        writer: RevsWriter::Dav {
+          needs_header: true,
+          refused: None,
+          aborted: false,
+        },
+      },
+    }
+  }
+
+  /// Writes the answer's next part into `out`, read from `index` and `repository` with each path judged by `rules`
+  /// (none: every path readable), until what this slice wrote and the steps it took reach `room`, at least one step,
+  /// or the walk ends.
+  pub fn resume<R: Repository + ?Sized>(
+    &mut self,
+    index: &crate::index::Index,
+    repository: &R,
+    rules: Option<&PrincipalRules>,
+    out: &mut Vec<u8>,
+    room: usize,
+  ) -> DavLogProgress {
+    let mut reads = Reads {
+      index,
+      repository,
+      base: ROOT,
+      uuid: "",
+      authz: rules,
+      authentication: Authentication::Settled,
+      out,
+    };
+    match self.stream.resume(&mut reads, room) {
+      Ok(Progress::More) => DavLogProgress::More,
+      Ok(Progress::Done | Progress::Close) => match &self.stream.writer {
+        RevsWriter::Dav {
+          refused: Some(failure),
+          ..
+        } => DavLogProgress::Refused {
+          code: failure.code,
+          message: failure.message.clone(),
+        },
+        RevsWriter::Dav { aborted: true, .. } => {
+          let corrupt = Failure::corrupt();
+          DavLogProgress::Refused {
+            code: corrupt.code,
+            message: corrupt.message,
+          }
+        }
+        _ => DavLogProgress::Done,
+      },
+      // An item that cannot be written is `svnserve`'s writer's alone; this writer writes no item.
+      Err(_) => {
+        let corrupt = Failure::corrupt();
+        DavLogProgress::Refused {
+          code: corrupt.code,
+          message: corrupt.message,
+        }
+      }
+    }
+  }
+
+  /// Whether any of the answer is written, or the walk aborted: either way a refusal can only end the connection.
+  pub fn begun(&self) -> bool {
+    match &self.stream.writer {
+      RevsWriter::Dav {
+        needs_header,
+        aborted,
+        ..
+      } => !needs_header || *aborted,
+      RevsWriter::Items => true,
+    }
   }
 }
