@@ -1,3 +1,16 @@
+# RESUME HERE (2026-11-19 ~22:15 PST, Mac Studio d1323898; supersedes everything below)
+- PIECE 1 LANDED: kiln main 30c5929 (A-580 harness builds on every Unix; agents.start id /agents/0/id, volume
+  /info/workspace/made/volume, runs_on /agent/machine, runners get KILN_MACHINE_ID=name, no second start_server).
+  macOS arm64, Mac Studio, local: --test slates_fleet_faults 4 passed (skipping off Linux).
+- PIECE 2 (A-708) in flight: worktree ~/slates-work/w-fed-faults-a708land (branch agents/w-fed-faults-a708-land off
+  origin/main 30c5929, 473a560ed cherry-picked -n, conflict resolved, uncommitted). Build logs
+  ~/.cache/w-fed-faults-logs/p2-lib.log, p2-int.log. Next: green -> one commit -> land.
+- PUSHING: this Studio has no GitHub credentials (HTTPS none; ssh agent hangs). Land via kiln `run` on
+  cec37f60f22c5a60d27f08f4d2e5daa8 (or 2768d0d5...; both have GitHub SSH) with cwd ~/.cache/w-fed-faults-ship (a tiny
+  git folder holding land.sh + <patch>.b64): `PATCH="$(cat X.b64)" PATHS=<sparse paths> bash ./land.sh` clones main
+  sparse, git am, push HEAD:main, is-ancestor check, retries on rejection.
+- State copy: ~/fanout-state-w-fed-faults (private). Target ~/.cache/w-fed-faults-target, JOBS=8.
+
 # RESUME HERE (w-fed-faults checkpointed 2026-11-19 on main's order; nothing in flight; local build stopped)
 - Pushed kiln branches (both off kiln origin/main 44cfdf353, nothing uncommitted):
   1. agents/w-fed-faults @ 72cef952d (worktree ~/slates-work/w-fed-faults-kiln): PIECE 1, A-580's harness
