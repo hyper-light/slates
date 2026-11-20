@@ -27,14 +27,16 @@
 //! current head, found back through the commit rows by generation, walking only what lies beyond it: a branch made at
 //! another's head costs no walk.
 //!
-//! **D(k) as derived data** (A-647 parts 2 and 3, [`ReachSets`]). A version's two sets are a type of `slates-vcs`'s
+//! **D(k) as derived data** (A-647 parts 2 to 4, [`ReachSets`]). A version's two sets are a type of `slates-vcs`'s
 //! derived data: a pure function of the version's record and its parents' values (version `k - 1`'s, and that of the
 //! version a remade set came from, which each version records), so any tier derives them with the admission's own walks
 //! over the committed index. The store keeps a version's sets as its value alone: its commit puts the sets its
 //! admission walked as the version's value, held by the version's record, and it serves every version's D(k) and
 //! reached set from it ([`Repository::brought`], [`Repository::reached`]), an older version's as well as the newest's;
-//! the owner keeps the same value under (type, version) with no second walk ([`Repository::reach_value`]). A value
-//! names its sets' bytes as an object of any length, so no set is too large to keep.
+//! the owner keeps the same value under (type, version) with no second walk ([`Repository::reach_value`]). Each set is
+//! a tree of nodes over fixed blocks of positions, a function of the set and the store's window alone, so no set is
+//! too large to keep and a version's value adds to the store only the nodes no earlier set had: what it brought, on its
+//! paths down from the roots, never its reached set again.
 //!
 //! **A version read as a tree.** A version's head and its root tree are read from its commit row, and a path is
 //! resolved one tree a component down ([`Repository::entry`]): no walk of history and none of the tree. Making a
@@ -95,6 +97,7 @@ pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
+pub use repository::abbrev::Abbrev;
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
 pub use repository::protect::{Change, CommitSigners, Unsigned};
 pub use repository::reach::{ReachRefused, ReachSets, Sets};

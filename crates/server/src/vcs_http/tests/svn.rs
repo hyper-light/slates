@@ -26,8 +26,11 @@ use slates_svn::mergeinfo::Contents;
 use slates_svn::reads::Repository;
 
 use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
-use super::{Lent, NoSvnStores, SvnExchange, SvnSite, SvnStores};
+use slates_svn::dav::site::{self, Answer as SiteAnswer, ReportProgress};
+
+use super::{Lent, SvnExchange, SvnSite, SvnStores, served_of, xml_bounds};
 use crate::vcs_http::{Answer, Bounds, Decided, EdgeState, Exchange, Fields, serve};
+use crate::vcs_store::svn_view::ServedRecords;
 
 /// Shape: room enough for every request these tests send.
 const ROOM: u64 = 1 << 20;
@@ -418,8 +421,8 @@ fn ready<F: Future>(future: F) -> F::Output {
   panic!("the tests' exchanges answer within {POLLS} polls");
 }
 
-/// How the site decided `method target` with `fields`, on a TLS connection: moved to a shard, refused with a status,
-/// or served; and whether the credentials proved a principal.
+/// How the site decided `method target` with `fields`, on any connection (the site reads none since A-686): moved to a
+/// shard, refused with a status, or served; and whether the credentials proved a principal.
 fn decided(
   site: &mut SvnSite<Tokens, Held, Stores>,
   method: &str,
@@ -427,7 +430,7 @@ fn decided(
   fields: &[&str],
 ) -> (String, bool) {
   let bytes = request(method, target, fields);
-  let decided: Decided<SvnExchange<Stores>> = ready(site.answer(&head(&bytes), true));
+  let decided: Decided<SvnExchange<Stores>> = ready(site.answer(&head(&bytes)));
   let outcome = match decided.answer {
     Answer::Move { shard } => format!("moved {shard}"),
     Answer::Refuse { status, .. } => format!("refused {}", status.code),
@@ -477,26 +480,194 @@ fn each_request_is_decided_in_the_module_docs_order() {
   assert_eq!(asked.to_vec(), expected);
 }
 
-/// A-681 (the module doc's step 6): do ask a site over the stores the daemon has today ([`NoSvnStores`]) for the
-/// owner's repository by OPTIONS, PROPFIND and GET, as the owner; expect each proven and refused `503`: no Subversion
-/// store is lent on any shard until the site is handed them.
-#[test]
-fn until_the_stores_land_every_request_a_principal_may_make_is_503() {
-  let mut site = SvnSite::new(REALM.to_owned(), ROOM, Tokens, Held, NoSvnStores);
-  let owner = basic("alice", OWNER_TOKEN);
-  let asked: Vec<(u16, bool)> = ["OPTIONS", "PROPFIND", "GET"]
-    .into_iter()
-    .map(|method| {
-      let bytes = request(method, "/repo/trunk/a.txt", &[owner.as_str()]);
-      let decided: Decided<SvnExchange<NoSvnStores>> = ready(site.answer(&head(&bytes), true));
-      let status = match decided.answer {
-        Answer::Refuse { status, .. } => status.code,
-        Answer::Move { .. } | Answer::Serve { .. } => 0,
-      };
-      (status, decided.proven)
+/// Shape: how long the lender's test waits for its task on the daemon's shard.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Shape: the repository the lender's test makes on the daemon's shard.
+const COMMITTED: &str = "committed";
+
+/// Shape: a `log-report` of every revision with every property and the changed paths.
+const LOG_EVERY: &[u8] = b"<S:log-report xmlns:S=\"svn:\"><S:start-revision>1</S:start-revision>\
+<S:end-revision>0</S:end-revision><S:discover-changed-paths/><S:all-revprops/><S:path></S:path></S:log-report>";
+
+/// The principal the daemon's test repository is made and read by.
+fn daemon_owner() -> Principal {
+  Principal::Uid {
+    host: HostId(0),
+    uid: 1234,
+  }
+}
+
+/// `bytes`' content identity as the records name content: BLAKE3.
+fn blake(bytes: &[u8]) -> ContentIdentity {
+  *blake3::hash(bytes).as_bytes()
+}
+
+/// An addition of the node of `kind` at `path` bringing `text`, as the owner's step takes a row (its digests are the
+/// drive's to check).
+fn added_row(path: &str, kind: NodeKind, text: Option<&[u8]>) -> ChangedPath {
+  ChangedPath {
+    path: path.to_owned(),
+    action: Action::Add,
+    kind,
+    copy_from: None,
+    text: text.map(|bytes| Text {
+      identity: blake(bytes),
+      md5: [0; 16],
+      sha1: [0; 20],
+      size: u64::try_from(bytes.len()).unwrap(),
+    }),
+    properties: None,
+    mergeinfo_modified: false,
+  }
+}
+
+/// Makes Subversion repository [`COMMITTED`] on a daemon's shard and commits its revision 1 through the owner's step
+/// (A-655 part 2b): `/trunk`, `/trunk/a.txt`, `/trunk/sub` and `/trunk/sub/b.txt`, by alice. Its id.
+fn committed_repository(state: &mut crate::state::ShardState) -> RepositoryId {
+  let create = slates_ipc::protocol::RequestBody::CreateRepository {
+    name: COMMITTED.to_owned(),
+    tool: slates_ipc::protocol::VcsTool::Subversion,
+    format: slates_ipc::protocol::ObjectFormat::Revisions,
+    default_branch: "main".to_owned(),
+    green: None,
+  };
+  let reply = crate::verbs::dispatch(state, 1, &daemon_owner(), create);
+  assert!(
+    matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
+    "{reply:?}"
+  );
+  let repositories = state.db.partition().repositories();
+  let id = repositories
+    .repository_named(COMMITTED)
+    .expect("the record")
+    .id;
+  let (a, b): (&[u8], &[u8]) = (b"alpha\n", b"beta\n");
+  let revision = slates_svn::commit::revision::Revision {
+    head: 0,
+    record: RevisionRecord {
+      transaction: "0-1".to_owned(),
+      changes: vec![
+        added_row("/trunk", NodeKind::Directory, None),
+        added_row("/trunk/a.txt", NodeKind::File, Some(a)),
+        added_row("/trunk/sub", NodeKind::Directory, None),
+        added_row("/trunk/sub/b.txt", NodeKind::File, Some(b)),
+      ],
+    },
+    properties: BTreeMap::from([
+      (b"svn:author".to_vec(), b"alice".to_vec()),
+      (b"svn:date".to_vec(), DATE.as_bytes().to_vec()),
+      (b"svn:log".to_vec(), b"the first".to_vec()),
+    ]),
+    contents: [a, b]
+      .iter()
+      .map(|bytes| (blake(bytes), bytes.to_vec()))
+      .collect(),
+    lock_entries: Vec::new(),
+  };
+  let committed =
+    crate::repository::svn_commit::commit(state, (&daemon_owner(), id), revision, None);
+  assert!(committed.is_ok(), "{committed:?}");
+  id
+}
+
+/// What the site reads of [`COMMITTED`] through the daemon's lender, from a task on its shard: whether the lender holds
+/// it and another repository; the PROPFIND of `/trunk` at depth 1; the text the GET of `/trunk/sub/b.txt` streams; the
+/// `log-report` of every revision.
+fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, Vec<u8>) {
+  let mut stores = ServedRecords;
+  let held = (
+    stores.holds(id),
+    stores.holds(RepositoryId { bytes: [9; 16] }),
+  );
+  let (owner, root) = (daemon_owner(), format!("/{COMMITTED}"));
+  let (bounds, room) = (xml_bounds(ROOM), usize::try_from(ROOM).unwrap());
+  let mut answer = |method: &str, path: &str, depth: Option<&str>, body: &[u8]| {
+    let request = site::Request {
+      method,
+      path,
+      depth,
+      body,
+    };
+    stores
+      .lend(id, &owner, |lent| {
+        site::answer(&served_of(lent, &root), &request, &bounds, room)
+      })
+      .expect("the records lent")
+  };
+  let SiteAnswer::Whole(listing) = answer("PROPFIND", "/trunk", Some("1"), PROPFIND_KIND) else {
+    panic!("no listing");
+  };
+  let SiteAnswer::Text {
+    text: Some(text), ..
+  } = answer("GET", "/trunk/sub/b.txt", None, b"")
+  else {
+    panic!("no text");
+  };
+  let SiteAnswer::Report(mut report) = answer("REPORT", "/", None, LOG_EVERY) else {
+    panic!("no report");
+  };
+  let fetched = stores
+    .lend(id, &owner, |lent| {
+      lent.repository.text(&text.identity, 0).map(<[u8]>::to_vec)
     })
-    .collect();
-  assert_eq!(asked, vec![(503, true); 3]);
+    .flatten()
+    .expect("the text");
+  let mut log = Vec::new();
+  while stores
+    .lend(id, &owner, |lent| {
+      report.resume(&served_of(lent, &root), &mut log, room)
+    })
+    .expect("the records lent")
+    == ReportProgress::More
+  {}
+  (held.0, held.1, listing.body, fetched, log)
+}
+
+/// A-681 (`crate::vcs_store::svn_view`, the daemon's lender; `Index::children`): do make a Subversion repository on a
+/// daemon's shard and commit its revision 1 through the owner's step, then read it from a task on that shard through
+/// the daemon's lender: whether it holds the repository and another, a PROPFIND of `/trunk` at depth 1, the GET of
+/// `/trunk/sub/b.txt` and a `log-report` of every revision; expect the repository held and the other not, the trunk
+/// listed with its two children (the index's listing, which no green lent before), the file's text, and revision 1 by
+/// alice with its message and its four added paths, then revision 0.
+#[test]
+fn the_daemons_lender_serves_a_repositorys_committed_records() {
+  let daemon = crate::daemon::audit_daemon();
+  let id = crate::daemon::observe_first(&daemon, committed_repository);
+  let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(read_through_the_lender(id));
+    })
+    .expect("the reading task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let read = outcome.recv_timeout(PATIENCE);
+  daemon.stop();
+  let (held, other, listing, text, log) = read.expect("the lender's task answered");
+  let (listing, log) = (
+    String::from_utf8(listing).unwrap(),
+    String::from_utf8(log).unwrap(),
+  );
+  let listed = [
+    "/committed/trunk/",
+    "/committed/trunk/a.txt",
+    "/committed/trunk/sub/",
+  ]
+  .map(|href| listing.contains(&format!("<D:href>{href}</D:href>")));
+  let logged = [
+    "<D:version-name>1</D:version-name>",
+    "<D:creator-displayname>alice</D:creator-displayname>",
+    "<D:comment>the first</D:comment>",
+    ">/trunk/sub/b.txt</S:added-path>",
+    "<D:version-name>0</D:version-name>",
+  ]
+  .map(|line| log.contains(line));
+  assert_eq!(
+    (held, other, listed, text, logged),
+    (true, false, [true; 3], b"beta\n".to_vec(), [true; 5]),
+    "{listing}\n{log}"
+  );
 }
 
 /// What the owner's served `method target` with `depth` and `body` answers: its status, its fields and its reply's
@@ -513,7 +684,7 @@ fn exchanged(
   let mut fields = vec![owner.as_str()];
   fields.extend(depth.as_deref());
   let bytes = request(method, target, &fields);
-  let Answer::Serve { mut exchange, .. } = ready(site.answer(&head(&bytes), true)).answer else {
+  let Answer::Serve { mut exchange, .. } = ready(site.answer(&head(&bytes))).answer else {
     panic!("{method} {target} not served");
   };
   if !body.is_empty() {

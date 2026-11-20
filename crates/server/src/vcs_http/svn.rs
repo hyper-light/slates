@@ -10,13 +10,15 @@
 //! 1. The route. A path whose escapes are malformed or name a slash or a NUL is `400`; a path past the request's room is
 //!    `414`; a path naming no repository (the server's root) is `404`.
 //! 2. The credentials, judged as git's and Mercurial's sites judge them: none, or none proving a principal, is `401`
-//!    with the challenges the connection accepts (Basic over TLS alone, RFC 7617 §4: stock svn sends Basic after one
-//!    challenge and on every request after, as recorded); a repeated or malformed `Authorization` is `400`; a credential
-//!    record that did not answer is `503`.
+//!    with the edge's challenges, Basic's first and then Bearer's, on every connection (stock svn sends Basic after one
+//!    challenge and on every request after, as recorded; A-686: Basic with the token as the password is taken on the
+//!    loopback cleartext edge as over TLS); a repeated or malformed `Authorization` is `400`; a credential record that
+//!    did not answer is `503`.
 //! 3. The repository's shard. A repository another shard holds moves the connection there whole (`Answer::Move`).
 //! 4. The repository. None of that name, or one of another tool, is `404`.
 //! 5. The policy. A principal the policy lets read none of the repository is `403`, for every request.
-//! 6. The store. A repository whose store this shard does not hold is `503` (the daemon lends none yet: [`NoSvnStores`]).
+//! 6. The store. A repository whose store this shard does not hold is `503` (the daemon's lender:
+//!    `crate::vcs_store::svn_view::ServedRecords`, the records of the repositories this shard's map holds).
 //!
 //! A served request's body is read whole within the request's room (`413` past it), then answered at its end from the
 //! store as `slates_svn::dav::site` decides: its status, which the reply names as it begins (`207` for a PROPFIND; the
@@ -128,56 +130,6 @@ pub(crate) trait SvnStores {
   ) -> Option<T>;
 }
 
-/// The stores as the daemon has them until the site is handed Subversion's (each repository's index and green on its
-/// owner shard, its lock table, its authorization file and a principal's Subversion user): none, so every Subversion
-/// request a principal may make is `503`.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct NoSvnStores;
-
-/// The green no repository has yet: no value has this type.
-pub(crate) enum NoGreen {}
-
-impl slates_svn::mergeinfo::Contents for NoGreen {
-  fn entries(&self, _directory: &str, _revision: u64) -> Option<Vec<String>> {
-    match *self {}
-  }
-
-  fn mergeinfo_value(&self, _properties: &[u8; 32]) -> Option<&[u8]> {
-    match *self {}
-  }
-}
-
-impl Repository for NoGreen {
-  fn revision_properties(&self, _revision: u64) -> Option<Vec<(&[u8], &[u8])>> {
-    match *self {}
-  }
-
-  fn properties(&self, _identity: &[u8; 32]) -> Option<Vec<(&[u8], &[u8])>> {
-    match *self {}
-  }
-
-  fn text(&self, _identity: &[u8; 32], _offset: u64) -> Option<&[u8]> {
-    match *self {}
-  }
-}
-
-impl SvnStores for NoSvnStores {
-  type Repository = NoGreen;
-
-  fn holds(&self, _id: RepositoryId) -> bool {
-    false
-  }
-
-  fn lend<T>(
-    &mut self,
-    _id: RepositoryId,
-    _principal: &Principal,
-    _step: impl FnOnce(&Lent<'_, NoGreen>) -> T,
-  ) -> Option<T> {
-    None
-  }
-}
-
 /// What a routed head names: its repository, and the path below its root.
 struct Routed {
   /// The repository's name.
@@ -230,15 +182,15 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
     }
   }
 
-  /// The answer to `head`, on a connection that is TLS when `secure`, in the module doc's order.
-  pub(crate) async fn answer(&mut self, head: &Head<'_>, secure: bool) -> Decided<SvnExchange<S>> {
+  /// The answer to `head`, on any connection, in the module doc's order.
+  pub(crate) async fn answer(&mut self, head: &Head<'_>) -> Decided<SvnExchange<S>> {
     let routed = match route(head, self.room) {
       Ok(routed) => routed,
       Err(status) => return refused_with(status, Fields::new(), false),
     };
-    let principal = match self.proof(head, secure).await {
+    let principal = match self.proof(head).await {
       Proof::Principal(principal) => principal,
-      Proof::Unauthorized => return self.unauthorized(secure),
+      Proof::Unauthorized => return self.unauthorized(),
       Proof::Refused(status) => return refused_with(status, Fields::new(), false),
     };
     if let Located::Elsewhere(shard) = self.repositories.locate(&routed.name) {
@@ -283,8 +235,8 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
   }
 
   /// What `head`'s credentials prove, as git's and Mercurial's sites read them.
-  async fn proof(&self, head: &Head<'_>, secure: bool) -> Proof {
-    let credential = match credential::credential(head, secure) {
+  async fn proof(&self, head: &Head<'_>) -> Proof {
+    let credential = match credential::credential(head) {
       Ok(Some(credential)) => credential,
       Ok(None) => return Proof::Unauthorized,
       Err(refused) if refused.status() == Status::UNAUTHORIZED => return Proof::Unauthorized,
@@ -299,9 +251,9 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
     }
   }
 
-  /// `401` with the challenges a connection that is TLS when `secure` accepts.
-  fn unauthorized(&self, secure: bool) -> Decided<SvnExchange<S>> {
-    let Ok(challenges) = credential::challenges(&self.realm, secure) else {
+  /// `401` with the challenges, Basic's first and then Bearer's.
+  fn unauthorized(&self) -> Decided<SvnExchange<S>> {
+    let Ok(challenges) = credential::challenges(&self.realm) else {
       // A realm a challenge cannot carry is the operator's misconfiguration, never the client's.
       return refused_with(Status::INTERNAL_SERVER_ERROR, Fields::new(), false);
     };
@@ -316,8 +268,9 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
 impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> Site for SvnSite<A, R, S> {
   type Exchange = SvnExchange<S>;
 
-  async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
-    self.answer(head, secure).await
+  /// The site's answer, whatever the connection: no step of it reads whether the connection is TLS (A-686).
+  async fn decide(&mut self, head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
+    self.answer(head).await
   }
 }
 

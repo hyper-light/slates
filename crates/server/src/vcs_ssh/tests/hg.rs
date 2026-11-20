@@ -36,7 +36,7 @@ use super::{
   served_by, sign, transcript,
 };
 use crate::vcs_http::Bounds;
-use crate::vcs_http::git::{Located, Repositories, StoreLender};
+use crate::vcs_http::git::{Located, Repositories, StoreLender, ThisShard};
 use crate::vcs_http::hg::HgStores;
 
 /// Shape: the repository whose store the tests' lender holds.
@@ -245,6 +245,23 @@ impl Repository for Probed {
       .iter()
       .map(|(name, node)| (name.as_slice(), *node))
   }
+
+  /// The repository is the served changesets a probe listed and hides nothing, so the roots its register would keep
+  /// are its draft changesets none of whose parents is draft (A-691).
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    self
+      .changesets
+      .iter()
+      .filter(|changeset| {
+        changeset.phase == Phase::Draft
+          && changeset
+            .parents
+            .iter()
+            .flatten()
+            .all(|parent| self.phase(*parent) == Phase::Public)
+      })
+      .map(|changeset| changeset.node)
+  }
 }
 
 impl Store for Probed {
@@ -407,11 +424,15 @@ impl Repositories for OneRepository {
 
 /// The site the edge serves Mercurial with: the production site over [`OneRepository`], its services over the probed
 /// store and no git store, each request admitted the edge's room.
-type HgSite = ToolSite<Keys, OneRepository, ToolServices<NoGit, Lends>>;
+type HgSite = ToolSite<Keys, OneRepository, ToolServices<NoGit, Lends, ThisShard>>;
 
 /// The production site over the store `lends` lends.
 fn site(lends: Lends) -> HgSite {
-  ToolSite::new(Keys, OneRepository, ToolServices::new(NoGit, lends, room()))
+  ToolSite::new(
+    Keys,
+    OneRepository,
+    ToolServices::new(NoGit, lends, ThisShard, room()),
+  )
 }
 
 /// `future`'s output, polled once: the command's steps never wait.
@@ -643,7 +664,7 @@ fn input_the_session_drops_is_given_back_to_the_window() {
 /// What `services` answers a start of `service` over `repository` for [`HOLDER`]: the command it started, by its kind
 /// and whether it warns first, or not served.
 fn started(
-  services: &mut ToolServices<NoGit, Lends>,
+  services: &mut ToolServices<NoGit, Lends, ThisShard>,
   service: Service,
   repository: &RepositoryRecord,
 ) -> &'static str {
@@ -658,6 +679,7 @@ fn started(
     Ok(ToolCommand::Mercurial(command)) if command.output().0.is_empty() => "session",
     Ok(ToolCommand::Mercurial(_)) => "warned session",
     Ok(ToolCommand::Upload(_)) => "upload-pack",
+    Ok(ToolCommand::Receive(_)) => "receive-pack",
     Err(Unserved) => "not served",
   }
 }
@@ -667,7 +689,7 @@ fn started(
 /// lent. Expect: both sessions over the held store started, the hidden one warning first; the others not served.
 #[test]
 fn mercurials_session_starts_only_over_a_store_the_lender_holds() {
-  let mut services = ToolServices::new(NoGit, Lends::probed(), room());
+  let mut services = ToolServices::new(NoGit, Lends::probed(), ThisShard, room());
   let (held, unheld) = (record(HG, HG_NAME), record(UNHELD, HG_NAME));
   let answers = [
     (Service::Mercurial { hidden: false }, &held),

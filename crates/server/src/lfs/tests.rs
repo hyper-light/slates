@@ -1,16 +1,14 @@
 //! A-629 part 2b-ii: Git LFS on a shard, its locks in the repository's locks log through the
-//! shard's `RepositoryLogs`, judged by the repository's policy.
-
-use std::collections::BTreeMap;
+//! shard's `RepositoryLogs`, judged by the repository's policy; A-629 part 3: its objects in the
+//! repository's store, each upload an entry of its logs, made again from them.
 
 use slates_db::HostId;
 use slates_db::catalog::{
   ObjectFormat as DbFormat, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule,
   PolicyWho, Principal, RepositoryId, RepositoryPolicy, RepositoryRecord, VcsTool as DbTool,
 };
-use slates_git::lfs::Oid;
-use slates_git::lfs::objects::{Admitted, LfsNaming, ObjectRefused};
-use slates_git::lfs::serve::{Access, Answer, Need, Objects, Routed, route};
+use slates_git::lfs::objects::LfsNaming;
+use slates_git::lfs::serve::{Access, Answer, Need, Routed, route};
 use slates_http::Admission as HttpAdmission;
 use slates_http::head::{HeadReader, Progress, Target};
 use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
@@ -38,31 +36,6 @@ fn stranger() -> Principal {
   Principal::Uid {
     host: HostId(0),
     uid: 2_000,
-  }
-}
-
-/// Objects in a map, each checked against its oid: the seam's simplest store.
-#[derive(Default)]
-struct MapObjects(BTreeMap<Oid, Vec<u8>>);
-
-impl Objects for MapObjects {
-  fn held(&self, oid: &Oid) -> Option<u64> {
-    self
-      .0
-      .get(oid)
-      .map(|bytes| u64::try_from(bytes.len()).unwrap())
-  }
-
-  fn bytes(&self, oid: &Oid) -> Option<Vec<u8>> {
-    self.0.get(oid).cloned()
-  }
-
-  fn admit(&mut self, oid: &Oid, bytes: &[u8]) -> Result<Admitted, ObjectRefused> {
-    if LfsNaming::oid(bytes) != *oid {
-      return Err(ObjectRefused::Mismatch);
-    }
-    self.0.insert(*oid, bytes.to_vec());
-    Ok(Admitted::New)
   }
 }
 
@@ -118,7 +91,7 @@ fn serve(
     request_id: Some("test"),
     room: ROOM,
   };
-  answer(state, &mut MapObjects::default(), &call)
+  answer(state, &call)
 }
 
 /// The text after `"key":"` in an answer's body, to its closing quote.
@@ -285,4 +258,87 @@ fn access_is_the_policy_s_verdict_on_the_ref_a_request_names() {
     (true, [true, true, false, false, false], false)
   );
   assert!(id_of(7, "a").starts_with("7."));
+}
+
+/// The records repository `repository`'s logs hold: what a recovery replays into its store.
+fn records(state: &ShardState, repository: RepositoryId) -> usize {
+  let repositories = state.db.partition().repositories();
+  (0..)
+    .take_while(|index| repositories.object_record(repository, *index).is_some())
+    .count()
+}
+
+/// An object's bytes, longer than a content window so the store cuts them into windows.
+fn object_bytes() -> Vec<u8> {
+  (0..1_u32 << 17)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect()
+}
+
+/// A-629 part 3 (an acknowledged upload survives a restart). Do: as the repository's owner, upload
+/// an object, upload it again, then make the repository's store again from its logs, as a
+/// recovery does, and download it and ask the batch API for it. Expect the upload `200` with one
+/// record more in the logs, the second `200` with none more, and after the store is made again
+/// the download `200` with the object's bytes and the batch naming a download for it.
+#[test]
+fn an_uploaded_object_is_durable_and_served_after_the_store_is_made_again() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = repository(state);
+    let owner = owner();
+    let me = Some(&owner);
+    let bytes = object_bytes();
+    let oid = LfsNaming::oid(&bytes);
+    let object = format!("/repo.git/info/lfs/objects/{oid}");
+    let before = records(state, repository);
+    let uploaded = serve(state, me, ("PUT", &object, &bytes)).status.code;
+    let logged = records(state, repository) - before;
+    let again = serve(state, me, ("PUT", &object, &bytes)).status.code;
+    let logged_again = records(state, repository) - before;
+    crate::vcs_store::rebuild(state, repository);
+    let downloaded = serve(state, me, ("GET", &object, b""));
+    let batch = format!(
+      r#"{{"operation":"download","objects":[{{"oid":"{oid}","size":{}}}]}}"#,
+      bytes.len()
+    );
+    let listed = serve(
+      state,
+      me,
+      ("POST", "/repo.git/info/lfs/objects/batch", batch.as_bytes()),
+    );
+    assert_eq!((uploaded, logged, again, logged_again), (200, 1, 200, 1));
+    assert_eq!(
+      (downloaded.status.code, downloaded.body == bytes),
+      (200, true)
+    );
+    let listed_body = String::from_utf8(listed.body).unwrap();
+    assert_eq!(
+      (
+        listed.status.code,
+        listed_body.contains(r#""download":{"href":"#)
+      ),
+      (200, true),
+      "{listed_body}"
+    );
+  });
+}
+
+/// A-629 part 3 (hostile input). Do: as the repository's owner, upload bytes under another
+/// object's oid, then download that oid. Expect the upload `422`, no record in the logs, and the
+/// download `404`: nothing of the bytes was kept or recorded.
+#[test]
+fn an_upload_whose_bytes_are_not_its_oid_is_refused_and_nothing_is_recorded() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = repository(state);
+    let owner = owner();
+    let me = Some(&owner);
+    let oid = LfsNaming::oid(b"the bytes the client named");
+    let object = format!("/repo.git/info/lfs/objects/{oid}");
+    let before = records(state, repository);
+    let refused = serve(state, me, ("PUT", &object, b"other bytes"))
+      .status
+      .code;
+    let logged = records(state, repository) - before;
+    let downloaded = serve(state, me, ("GET", &object, b"")).status.code;
+    assert_eq!((refused, logged, downloaded), (422, 0, 404));
+  });
 }

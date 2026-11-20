@@ -111,6 +111,22 @@ impl Repository for History {
       .iter()
       .map(|(name, node)| (name.as_slice(), *node))
   }
+  /// A history hides nothing, so the roots its register would keep are its draft changesets none of whose parents is
+  /// draft.
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    self
+      .revs
+      .iter()
+      .filter(|changeset| {
+        changeset.phase == Phase::Draft
+          && changeset
+            .parents
+            .iter()
+            .flatten()
+            .all(|parent| self.phase(*parent) == Phase::Public)
+      })
+      .map(|changeset| changeset.node)
+  }
 }
 
 /// A node no two revisions of a history share: splitmix64 of the revision's seed, so node order is not revision order.

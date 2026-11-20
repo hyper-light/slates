@@ -210,14 +210,15 @@ mod vcs_http;
 mod vcs_svn;
 // §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
 // phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
-// dispatched by its tool. No caller outside tests until the daemon starts an edge (its piece: the address, the host
-// key's keeping, the key store and the repositories).
+// dispatched by its tool, git's receive-pack through the push driver (A-683). The daemon starts it with `--vcs-ssh`
+// (A-684, `vcs_ssh::daemon_edge`); the services' parts whose entry points have not landed (`site::NotYet`) are reached
+// by tests alone.
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_ssh;
 // git's push on its repository's owner shard (A-654 part 2): the one driver both edges call a step at a time (the
 // advertisement, the request and pack as they arrive, then the answer: the hook gate, the quarantine, the policy, the
 // verdicts over the shard's greens and A-635's append with A-662's store, git's report). The daemon's HTTP site calls
-// it for receive-pack (A-654 part 3); the SSH channel's call is owed (g294).
+// it for receive-pack (A-654 part 3), and the SSH site for its git-receive-pack (A-683).
 #[cfg_attr(not(test), allow(dead_code))]
 mod git_push;
 // The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
