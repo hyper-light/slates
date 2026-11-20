@@ -2450,6 +2450,16 @@ async fn recover_repository(
     index = index.saturating_add(1);
     slices.unit_done().await;
   }
+  remake_greens(state, record, slices).await;
+}
+
+/// Each of `record`'s greens' map of its head made again as the live store holds it (A-664 part 3), and a Subversion
+/// green's head texts held again (S4 c1), a green a unit of the recovery's slices.
+async fn remake_greens(
+  state: &mut ShardState,
+  record: &RepositoryRecord,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
   // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
   let greens: Vec<DbVolumeId> = state
     .db
