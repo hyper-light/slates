@@ -574,9 +574,11 @@ async fn mount_without_blocking(
             let _ = state::with_state_counted(|s| s.count(HELPER_EXIT_UNWATCHED, 1));
           }
         }
-        let readiness = exit_watch
-          .as_ref()
-          .and_then(|watch| watch.readiness().map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd)));
+        let readiness = exit_watch.as_ref().and_then(|watch| {
+          watch
+            .readiness()
+            .map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd))
+        });
         match readiness {
           Some(fd) => {
             let _ = futures::within(left, slates_rt::readiness::readable(fd)).await;

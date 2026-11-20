@@ -741,10 +741,16 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
   );
   // Every mount's helper exit was awaited by its exit watch, never a tick at a time (main's sweep, 2026-11-20).
   assert!(
-    refusals.get("fuse.helper_exit.watched").is_some_and(|count| *count >= 1),
+    refusals
+      .get("fuse.helper_exit.watched")
+      .is_some_and(|count| *count >= 1),
     "the helpers' exits were watched: {refusals:?}"
   );
-  assert_eq!(refusals.get("fuse.helper_exit.unwatched"), None, "{refusals:?}");
+  assert_eq!(
+    refusals.get("fuse.helper_exit.unwatched"),
+    None,
+    "{refusals:?}"
+  );
 }
 
 /// AUD-29-64 (a fenced shard's mounts). Do: on a one-shard daemon (its control shard owns the volume), attach a
