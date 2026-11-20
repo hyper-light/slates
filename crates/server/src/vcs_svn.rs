@@ -802,11 +802,19 @@ async fn follow(
 ) -> Stepped {
   let went = match next {
     Next::Read => return read_step(stream, conversation, seat).await,
+    // A turn that read nothing from the client yields before the next: a long answer (a replay-range over a whole
+    // history, a checkout) or commands pipelined in one read are many turns with no wait between, and a client that
+    // drains the socket as fast as it is written never makes a write wait either, so without the yield the shard never
+    // steps (git/git's last 2,000 commits through `svnrdump dump`: "shard 0 is spinning: 3596 ms" after 53 MB).
     Next::Consume(taken) => {
       consume(conversation, taken);
+      futures::yield_now().await;
       return Stepped::Go;
     }
-    Next::Again => return Stepped::Go,
+    Next::Again => {
+      futures::yield_now().await;
+      return Stepped::Go;
+    }
     Next::End => return Stepped::End,
     Next::Challenge(consumed) => {
       consume(conversation, consumed);
