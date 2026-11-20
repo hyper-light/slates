@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(unix, windows))]
 use slates_client::{
-  Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, ReadAt, SizeClass, VolumeId,
+  Client, CreateSpec, Deadlines, Intent, NamePolicy, ReadAt, SizeClass, VolumeId,
 };
 #[cfg(any(unix, windows))]
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -45,7 +45,6 @@ const DEFAULT_SAMPLES: usize = 15;
 const PROBE_MS: u64 = 5;
 /// Shape: how long a client retries the rendezvous while the daemon starts.
 #[cfg(any(unix, windows))]
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the volume a file lives in holds this many times its bytes, room for its records and its rewrites.
 #[cfg(any(unix, windows))]
 const ROOM_FACTOR: u64 = 8;
@@ -63,16 +62,10 @@ fn deadlines() -> Deadlines {
 }
 
 #[cfg(any(unix, windows))]
+/// The claim waits while the rendezvous's holder lives (A-468), so a refusal is the run's failure, never a wait (until
+/// 2026-11-20 a five-second retry, `START_WAIT`).
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT => {}
-      Err(e) => panic!("{e}"),
-    }
-  }
+  Client::connect(instance, deadlines()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The machine's load average, where the OS reports one: `/proc/loadavg` on Linux, `vm.loadavg` on macOS.

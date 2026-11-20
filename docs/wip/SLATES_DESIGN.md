@@ -55703,6 +55703,24 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4e — A stage a landing overtook is made again in turns before its append (2026-11-20, w-git for UI goal 93; the answer's 74 ms at 100 concurrent pushes)
+- **Why.** At 100 concurrent pushes to one repository the answer's longest step was 73.7 ms: every push sealed while
+  another landed had its stage overtaken, and its append's commit staged it again whole, in that step.
+- **Change.** The judge's `ready` (A-722 part 4c) first makes a push's overtaken stage again a turn at a time
+  (`SealedPush::restage_turn`, `Repository::needs_stage`), and starts it over if another landing overtakes it while it
+  is made. A stage that gives no position (every object indexed already, the usual case once one of the pushes landed)
+  can never be overtaken: the commit gives its fork back, adopts nothing and keeps the repository's next position. A
+  commit that still stages a push again whole is counted (`StoreCounters::restaged`).
+- **Found with it.** `Deciding`'s `each_step` called `ready` only where the checks' table had an empty slot for the
+  command, and the table is empty when no check refused: part 4c's turns never ran in a live push. It asks `ready` for
+  every command no check refused now.
+- **Tests.** `slates-server` `git_push::tests::t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append`
+  (twelve pushes answered a step of each in turn: every one `ok`, `restaged` 0; red: 9, then 8 with `each_step` fixed).
+  `slates-git --lib -- store:: receive:: upload:: hook_view` 206 passed, 4 ignored; `slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 199 passed and the two long-history
+  edge tests past their client's read wait at a load of 56 to 67, as they are with `ready` doing nothing (main's own
+  behaviour), the load-only bug main named (next piece); fmt clean (macOS arm64, this Mac, local).
+
 ### A-753 — A branch created at a commit another branch holds is made from it, and a resent object is read from the index (bug, 2026-11-20, w-git for UI goal 93; found by use in A-722's proof)
 - **Found by use.** A-722's proof on the 32-core Studio (release, git/git): 100 concurrent v1.5.0 pushes to one
   repository, each creating its own branch, answered 80 `ok` and 20 `ng refs/heads/pN failed to update ref`, twice; a
