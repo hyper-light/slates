@@ -5,14 +5,17 @@
 //! alike):
 //! - the read commands (A-613's [`reads::answer`]), a long answer's rest resumed a slice at a time
 //!   within the caller's room ([`reads::Stream`]);
+//! - `get-lock` and `get-locks` from [`Sources::locks`] at [`Sources::now`] (A-693 part 1,
+//!   [`reads::answer_lock_read`]);
 //! - `reparent`: a trivial auth request, then the session moved to the URL's path, or "'…' is not
 //!   the same repository as '…'" (170000) for a URL outside the repository;
 //! - `update`, `switch`, `status` and `diff`: the reporter's exchange (A-616's [`Exchange`]), its
 //!   drive written within the caller's room and steps;
 //! - `commit`: A-655's entry point and drive (**A commit**, below);
-//! - every other command of `svnserve`'s set, until its piece lands (the lock verbs, `replay`,
-//!   `replay-range`, `change-rev-prop`): answered as a command `svnserve` does not know, "Unknown
-//!   editor command '…'" (210001), which a stock client reads as a server without it, and counted
+//! - every other command of `svnserve`'s set, until its piece lands (`lock`, `unlock` and their
+//!   `-many` forms, `replay`, `replay-range`, `change-rev-prop`): answered as a command `svnserve`
+//!   does not know, "Unknown editor command '…'" (210001), which a stock client reads as a server
+//!   without it, and counted
 //!   ([`Turn::Unserved`]); the connection goes on;
 //! - an item that is no command ends the connection, as `svnserve` ends it.
 //!
@@ -1068,8 +1071,7 @@ impl Connection {
     };
     let authentication = established.reads_authentication(&sources.policy);
     let session = established.reads_session(&sources.policy, authentication);
-    let outcome = reads::answer(sources.index, sources.repository, &session, &value, out)
-      .map_err(Refused::Item)?;
+    let outcome = read_answer(sources, &session, &value, out).map_err(Refused::Item)?;
     match outcome {
       Outcome::Answered => {
         self.phase = Phase::Commands(established);
@@ -1232,8 +1234,7 @@ impl Connection {
   {
     let value = self.whole_item(command)?;
     let session = established.reads_session(&sources.policy, reads::Authentication::Done);
-    let outcome = reads::answer(sources.index, sources.repository, &session, &value, out)
-      .map_err(Refused::Item)?;
+    let outcome = read_answer(sources, &session, &value, out).map_err(Refused::Item)?;
     self.phase = match outcome {
       Outcome::Answered => Phase::Commands(established),
       Outcome::Streaming(stream) => Phase::Streaming(established, Box::new(stream)),
@@ -1618,6 +1619,22 @@ fn reparent(
     }
     Err(failure) => failure.write(out).map_err(Refused::Report),
   }
+}
+
+/// A read command's answer: `get-lock` and `get-locks` from the lock table at the call's instant (A-693 part 1),
+/// every other one by [`reads::answer`].
+fn read_answer<R>(
+  sources: &Sources<'_, R>,
+  session: &reads::Session<'_>,
+  value: &Value<'_>,
+  out: &mut Vec<u8>,
+) -> Result<Outcome, ItemError>
+where
+  R: reads::Repository + ?Sized,
+{
+  let locks = (sources.locks, sources.now);
+  reads::answer_lock_read(sources.index, sources.repository, locks, session, value, out)
+    .unwrap_or_else(|| reads::answer(sources.index, sources.repository, session, value, out))
 }
 
 /// A command item's name, lent from the client's bytes, and its parameters.

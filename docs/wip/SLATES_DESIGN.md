@@ -15190,6 +15190,11 @@ and export by landing).
 > once a mechanism exists; `svn_uri_canonicalize` before the lookup (a stock client's URL
 > is already canonical); the tunnel's own move to the owner (A-688's site, which finds repositories on its shard
 > alone).
+>
+> **Status (2026-11-19, A-693 part 1: ra_svn's lock reads).** `get-lock` and `get-locks` are answered from the
+> repository's lock table at the call's instant (`slates_svn::reads::answer_lock_read`, `serve.c` 3366-3446): a held
+> lock as `write_lock` writes it, an expired one and one on an unreadable path left out, a depth `get_locks` refuses in
+> its words. Owed: `lock`, `lock-many`, `unlock`, `unlock-many` through the owner's step.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),

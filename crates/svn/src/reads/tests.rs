@@ -389,6 +389,8 @@ fn drained(
 /// the session as `svnserve` ended it; answers how many commands were answered here.
 fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize {
   let fixture = Fixture::new();
+  // The recorded repositories hold no lock.
+  let no_locks = LockTable::new();
   let answers = items(server);
   let commands = items(client);
   let (repository, mut base) = session_place(&commands[0]);
@@ -407,7 +409,17 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
       authentication: Authentication::Settled,
     };
     let mut out = Vec::new();
-    let outcome = answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap();
+    let locks = (&no_locks, AprTime(0));
+    let outcome = answer_lock_read(
+      &fixture.index,
+      &fixture.green,
+      locks,
+      &session,
+      command,
+      &mut out,
+    )
+    .unwrap_or_else(|| answer(&fixture.index, &fixture.green, &session, command, &mut out))
+    .unwrap();
     match drained(outcome, &fixture, &session, &mut out) {
       Outcome::Streaming(_) => panic!("{name}: a drained stream streams"),
       Outcome::Answered => {
@@ -689,30 +701,26 @@ fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
 }
 
 /// A-613: stock `svn` 1.15.0's own sessions, `info` of the root and at a date, and a revision property read and
-/// listed, answered as `svnserve` answered them; the lock it asks for is the lock piece's.
+/// listed, answered as `svnserve` answered them, the locks it asks for among them (A-693 part 1: none held).
 #[test]
 fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
   let sessions = [
-    (transcript!("svn-info"), 3),
-    (transcript!("svn-info-dated"), 4),
+    (transcript!("svn-info"), 4),
+    (transcript!("svn-info-dated"), 5),
     (transcript!("svn-revprop-get"), 1),
     (transcript!("svn-revprop-list"), 1),
-    (transcript!("svn-info-file"), 5),
+    (transcript!("svn-info-file"), 6),
     (transcript!("svn-proplist-inherited"), 4),
     (transcript!("svn-cat"), 4),
     (transcript!("svn-cat-big"), 3),
-    (transcript!("svn-ls"), 2),
+    (transcript!("svn-ls"), 3),
     (transcript!("svn-log"), 4),
     (transcript!("svn-log-g"), 4),
     (transcript!("svn-blame"), 5),
     (transcript!("svn-blame-g"), 5),
   ];
   for ((name, client, server), commands) in sessions {
-    assert_eq!(
-      replay(name, client, server, &["get-lock", "get-locks"]),
-      commands,
-      "{name}"
-    );
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
   }
 }
 
@@ -720,11 +728,11 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
 /// anonymous user under its rules (`ls -v -R`, `log -v` and `log -g` of `/trunk`, `blame -g` of `/trunk/a.txt`, `cat`
 /// of the readable `/trunk/dir/b.txt` and of the hidden `/branches/b1/a.txt`, `proplist -v --show-inherited-props` of
 /// `/trunk/dir/b.txt`), answered as `svnserve` answered them, `log -g` refused "Item is not readable" (220001) and the
-/// hidden file's `cat` "Authorization failed" (170001) among them; the locks `ls` asks for are the lock piece's.
+/// hidden file's `cat` "Authorization failed" (170001) among them, and the locks `ls` asks for (A-693 part 1: none held).
 #[test]
 fn stock_locked_sessions_are_answered_as_svnserve_answered_them() {
   let sessions = [
-    (transcript!("locked-svn-ls"), 2),
+    (transcript!("locked-svn-ls"), 3),
     (transcript!("locked-svn-log"), 4),
     (transcript!("locked-svn-log-g"), 4),
     (transcript!("locked-svn-blame-g"), 5),
@@ -733,11 +741,7 @@ fn stock_locked_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("locked-svn-proplist"), 4),
   ];
   for ((name, client, server), commands) in sessions {
-    assert_eq!(
-      replay(name, client, server, &["get-lock", "get-locks"]),
-      commands,
-      "{name}"
-    );
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
   }
 }
 
@@ -2610,4 +2614,74 @@ fn a_negative_log_limit_is_no_walk() {
     panic!("not a log-report: {asked:?}");
   };
   assert_eq!(DavLog::new(&report, ROOT), None);
+}
+
+/// A lock alice holds on `path`, made at one second past the epoch, with a comment, expiring at `expires`.
+fn alices_lock(path: &str, expires: Option<AprTime>) -> crate::lock::Lock {
+  crate::lock::Lock {
+    path: path.to_owned(),
+    token: crate::lock::LockToken::drawn([0x5a; crate::lock::UUID_BYTES]),
+    owner: String::from("alice"),
+    comment: Some(String::from("note")),
+    is_dav_comment: false,
+    created: AprTime(1_000_000),
+    expires,
+  }
+}
+
+/// What `get-lock` or `get-locks` answers to `command` at `now`, the session anonymous under the `locked` rules.
+fn lock_read(locks: &LockTable, now: AprTime, command: &[u8]) -> String {
+  let fixture = Fixture::new();
+  let rules = locked_rules();
+  let session = Session {
+    authz: Some(&rules),
+    ..ROOT_SESSION
+  };
+  let command = items(command).remove(0);
+  let mut out = Vec::new();
+  let outcome =
+    answer_lock_read(&fixture.index, &fixture.green, (locks, now), &session, &command, &mut out);
+  assert!(matches!(outcome, Some(Ok(Outcome::Answered))));
+  String::from_utf8(out).unwrap()
+}
+
+/// A-693 part 1 (`serve.c` 3366-3446): `get-lock` and `get-locks` write a held lock as `write_lock` does
+/// (`ccc(?c)c(?c)`, each date by `svn_time_to_cstring`), leave out an expired lock and one on a path the session may
+/// not read, and refuse a depth `get_locks` does not take in its words, the connection going on.
+#[test]
+fn the_lock_reads_answer_from_the_lock_table_as_svnserve_writes_them() {
+  let mut locks = LockTable::new();
+  let readable = alices_lock("/trunk/a.txt", Some(AprTime(2_000_000)));
+  let hidden = alices_lock("/branches/b1/a.txt", None);
+  for lock in [&readable, &hidden] {
+    locks
+      .apply(&crate::lock::LockEntry::Set(lock.clone()))
+      .unwrap();
+  }
+  let token = readable.token.as_str();
+  let held = format!(
+    "( {}:/trunk/a.txt {}:{token} 5:alice ( 4:note ) 27:1970-01-01T00:00:01.000000Z ( \
+     27:1970-01-01T00:00:02.000000Z ) ) ",
+    "/trunk/a.txt".len(),
+    token.len()
+  );
+  let trivial = "( success ( ( ) 0: ) ) ";
+  let before = AprTime(1_500_000);
+  let after = AprTime(3_000_000);
+  let get_lock = b"( get-lock ( 11:trunk/a.txt ) ) ";
+  let get_locks = b"( get-locks ( 0: ( infinity ) ) ) ";
+  let answers = [
+    lock_read(&locks, before, get_lock),
+    lock_read(&locks, before, get_locks),
+    lock_read(&locks, after, get_lock),
+    lock_read(&locks, before, b"( get-locks ( 0: ( exclude ) ) ) "),
+  ];
+  let refusal = "Invalid 'depth' specified in get-locks request";
+  let expected = [
+    format!("{trivial}( success ( ( {held}) ) ) "),
+    format!("{trivial}( success ( ( {held}) ) ) "),
+    format!("{trivial}( success ( ( ) ) ) "),
+    format!("( failure ( ( 200004 {}:{refusal} 0: 0 ) ) ) ", refusal.len()),
+  ];
+  assert_eq!(answers, expected);
 }
