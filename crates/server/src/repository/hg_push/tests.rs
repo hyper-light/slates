@@ -171,6 +171,22 @@ impl Repository for View {
       })
       .map(|held| held.0)
   }
+
+  fn tags_file(
+    &self,
+    _rev: slates_hg::serve::Rev,
+    _admission: &mut slates_hg::Admission,
+  ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
+    Ok(None)
+  }
+
+  fn tags_text(
+    &self,
+    _node: &Node,
+    _admission: &mut slates_hg::Admission,
+  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
+    Err(slates_hg::serve::Refusal::Store { what: "tags" })
+  }
 }
 
 /// A changeset of the fixtures' repository as `make-push-fixtures.sh` made it with stock 7.2 (user `test`, date `0

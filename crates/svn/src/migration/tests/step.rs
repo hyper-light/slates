@@ -520,7 +520,7 @@ fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
     }
   }
   const LEN: usize = 512 * 1024;
-  let mut bytes: Vec<u8> = (0..LEN).map(|at| (at % 251) as u8).collect();
+  let mut bytes: Vec<u8> = (0..LEN).map(|at| u8::try_from(at % 251).unwrap()).collect();
   let mut repository = created();
   let mut opening = first();
   let (alpha, _) = content(b"alpha\n");

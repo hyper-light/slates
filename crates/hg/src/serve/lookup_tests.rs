@@ -131,3 +131,106 @@ fn hex_of(node: &Node) -> String {
   crate::pushkey::encode_hex(node, &mut out);
   String::from_utf8(out).unwrap()
 }
+
+/// Shape: the tagged repository's nodes, by revision (`tags_record.sh`, recorded on 2026-11-20 with mercurial 7.2
+/// through uvx): `v1` tagged at 0 in 1; `default` at 2 in 3, a tag named as the branch; bookmark `shadow` at 0 and a
+/// tag `shadow` at 2 in 4; `gone` tagged at 2 in 5 and removed in 6; then 7 off 1, a second head, and `v1` moved to 7
+/// in 8 on that head alone.
+const TAGGED: [&str; 9] = [
+  "6043a6cbd72101eebf720bd8591369c2dab09984",
+  "651fbdca0542d3cac1852a775b4c3d71c36a9dd2",
+  "fff3d73b80c6d7c5d2c128d4057cb56ea4b53b96",
+  "39a561bf6eb89b79977ecc629e2063449f04c9d8",
+  "a3fd5e626742a823433a1589bff691358bb9011f",
+  "c9a897c43c0f18b3a07f87a1ba74a888ef670ff9",
+  "e8acda7d2727692eb87b05383c1a8d76e0cba0c0",
+  "b54712bcf6d45237f265bbb05607111ca45ae19c",
+  "a85780e1f99f36d9e53badb9ece6e1670dce1db1",
+];
+
+/// The tagged repository as a served view: each head's `.hgtags` file revision as 7.2 wrote it.
+fn tagged() -> History {
+  let mut history = History {
+    publishing: true,
+    ..History::default()
+  };
+  for (rev, hex) in TAGGED.iter().enumerate() {
+    let parent = match rev {
+      0 => None,
+      7 => Some(1),
+      _ => Some(u32::try_from(rev - 1).unwrap()),
+    };
+    history.push(Changeset {
+      node: node(hex),
+      parents: [parent, None],
+      branch: b"default".to_vec(),
+      closes: false,
+      phase: Phase::Public,
+    });
+  }
+  history
+    .bookmarks
+    .push((b"shadow".to_vec(), node(TAGGED[0])));
+  let line = |rev: usize, name: &str| format!("{} {name}\n", TAGGED[rev]);
+  let removed = format!("{} gone\n", "0".repeat(40));
+  let at_six = [
+    line(0, "v1"),
+    line(2, "default"),
+    line(2, "shadow"),
+    line(2, "gone"),
+    line(2, "gone"),
+    removed,
+  ]
+  .concat();
+  let at_eight = [line(0, "v1"), line(0, "v1"), line(7, "v1")].concat();
+  history.hgtags.insert(
+    6,
+    (
+      node("88aa26a679cc4bc289c91cb59f4d0aae77850233"),
+      at_six.into_bytes(),
+    ),
+  );
+  history.hgtags.insert(
+    8,
+    (
+      node("7a0e5a71f1fd17eeca0000df609bbdc4fb3c200d"),
+      at_eight.into_bytes(),
+    ),
+  );
+  history
+}
+
+/// A-575 (`--from` names a tag), §4.17.3 `lookup`: do look up, in the tagged repository, a tag moved on one head, a tag
+/// named as the branch, a name both a bookmark and a tag, a removed tag, and `tip`. Expect stock 7.2's answers (`hg log
+/// -r`, which resolves as `lookup` does): `v1` the tip-most head's word (7), `default` the tag (2) over the branch's
+/// tip (8), `shadow` the bookmark (0) over the tag, `gone` unknown, and `tip` 8.
+#[test]
+fn a_tag_resolves_after_a_bookmark_and_before_a_branch_as_7_2_resolves_it() {
+  let history = tagged();
+  let found = |rev: usize| format!("1 {}\n", TAGGED[rev]);
+  let cases = [
+    ("v1", found(7)),
+    ("default", found(2)),
+    ("shadow", found(0)),
+    ("gone", "0 unknown revision 'gone'\n".to_owned()),
+    ("tip", found(8)),
+  ];
+  for (key, expected) in cases {
+    assert_eq!(answer(&history, key), expected, "key {key:?}");
+  }
+}
+
+/// A-575: do look up a tag whose word names a node the view does not serve, in a repository with a branch of that
+/// name. Expect it unknown, never the branch's tip: 7.2's `revsymbol` refuses the tag's node rather than trying the
+/// next namespace.
+#[test]
+fn a_tag_naming_a_node_not_served_is_unknown_not_a_branch() {
+  let mut history = tagged();
+  let text = format!("{} default\n", "ab".repeat(20)).into_bytes();
+  history.hgtags.insert(8, (node(&"cd".repeat(20)), text));
+  history.hgtags.remove(&6);
+  assert_eq!(
+    answer(&history, "default"),
+    "0 unknown revision 'default'\n"
+  );
+}
