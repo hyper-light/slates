@@ -3206,7 +3206,7 @@ impl MountThread {
     (read_only, search): (bool, NameSearch),
     requests: SyncSender<Request>,
     wake: Waker,
-    open_bound: usize,
+    (open_bound, relief_beat): (usize, std::time::Duration),
     inherited: Option<Inherited>,
   ) -> Result<MountThread, WinFspError> {
     let (commands, command_rx) = sync_channel::<Command>(COMMAND_BOUND);
@@ -3223,7 +3223,7 @@ impl MountThread {
           (requests, wake, spin_ceiling),
           &command_rx,
           &outcome_tx,
-          open_bound,
+          (open_bound, relief_beat),
           inherited,
         );
       },
@@ -3292,7 +3292,7 @@ fn run_mount(
   (requests, wake, spin_ceiling): (SyncSender<Request>, Waker, std::time::Duration),
   commands: &Receiver<Command>,
   outcomes: &SyncSender<Outcome>,
-  open_bound: usize,
+  (open_bound, relief_beat): (usize, std::time::Duration),
   inherited: Option<Inherited>,
 ) {
   let report = |outcome: Outcome| {
@@ -3337,16 +3337,23 @@ fn run_mount(
         )
       }
     };
-    let mut captured = vec![0; crate::inflight::capture::BYTES];
-    let at = crate::opens::capture_offset(open_bound).map_err(WinFspError::Ledger)?;
+    // The one unconfirmed open may have its saved response in either receiver's journal (A-725).
+    let first = crate::opens::capture_offset(open_bound).map_err(WinFspError::Ledger)?;
+    let mut saved_opens = [None; crate::opens::JOURNALS];
+    for (journal, saved) in saved_opens.iter_mut().enumerate() {
+      let mut captured = vec![0; crate::inflight::capture::BYTES];
+      let at = crate::inflight::capture::BYTES
+        .checked_mul(journal)
+        .and_then(|before| first.checked_add(before))
+        .ok_or(WinFspError::Ledger(crate::opens::Refusal::Bound))?;
+      ledger
+        .memory()
+        .read(at, &mut captured)
+        .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+      *saved = crate::inflight::settle::saved_open(&mut captured).map_err(WinFspError::Capture)?;
+    }
     ledger
-      .memory()
-      .read(at, &mut captured)
-      .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
-    let saved_open =
-      crate::inflight::settle::saved_open(&mut captured).map_err(WinFspError::Capture)?;
-    ledger
-      .settle_pending(saved_open)
+      .settle_pending(&saved_opens)
       .map_err(WinFspError::Ledger)?;
     let mounted = Mounted::new(
       mount_point,
@@ -3408,7 +3415,7 @@ fn run_mount(
       match crate::dispatcher::Worker::start(
         mounted.file_system.addr(),
         section,
-        (open_bound, spin_ceiling),
+        (open_bound, spin_ceiling, relief_beat),
         outcomes.clone(),
         wake.clone(),
         confirmations,

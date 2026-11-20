@@ -3462,7 +3462,10 @@
 > every earlier send returned within 481 µs and no request was received after it (diagnostics branch
 > `diag-w-bugs-b3-9`; record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`, "Shown
 > 2026-11-20"). SetInformation's completion runs `CcSetFileSizes` on the sender (`fileinfo.c` 1407, `file.c` 1852), so
-> the one receiver waits on the drive it alone receives for. The fix (a receive never waits on a send) is owed.
+> the one receiver waits on the drive it alone receives for. **Fixed by A-725 (2026-11-20):** a relief receiver with its own journal
+> serves while the primary is held in a send (`crate::inflight::relief`); fsx seed 1 now runs whole over the drive.
+> Open: whether the delete racing a coherent purge above had the same cause (the VM race, rerun with A-725); a relief
+> held in a send of its own is relieved by no one.
 > - WinFsp completes an answered IRP inline, on the thread that sent the answer. `FspVolumeTransact`
 >   (`src/sys/volume.c:1089-1102`) calls `FspIopDispatchComplete` for each answer, and the kind's `FSP_LEAVE_IOC`
 >   (`src/sys/driver.h:289-306`) ends in `IoCompleteRequest` (`src/sys/iop.c:321`).
