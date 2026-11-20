@@ -121,6 +121,42 @@ pub fn fork_with(
   }
 }
 
+/// Keeps one revision a push brought in `fork`'s `log` (A-720, the sliced intake): its text kept as content once and its
+/// row appended, numbered its log's next, as [`fork_with`] keeps a group; the holds its puts took given back. Refused,
+/// what it put is given back and `fork` holds none of it.
+pub(crate) fn keep_one(
+  fork: &mut HgIndex,
+  store: &mut ContentStore,
+  log: Log<'_>,
+  arrived: &Arrived,
+  admission: &mut Admission,
+) -> Result<(), Unindexed> {
+  let mut puts = Puts::default();
+  let one = core::slice::from_ref(arrived);
+  let kept = match log {
+    Log::Changelog => changesets(fork, store, one, &mut puts, admission),
+    Log::Manifest | Log::File(_) => {
+      let files = matches!(log, Log::File(_));
+      revisions(store, one, &mut puts, admission, files).and_then(|group| {
+        fork
+          .append_revisions(store, log, &group)
+          .map(drop)
+          .map_err(Unindexed::from)
+      })
+    }
+  };
+  let given = puts.give_back(store).map_err(IndexRefused::Content);
+  match (kept, given) {
+    (Ok(()), Ok(())) => Ok(()),
+    (Ok(()), Err(release)) => Err(Unindexed::Fork(release)),
+    (Err(cause), Ok(())) => Err(cause),
+    (Err(cause), Err(release)) => Err(Unindexed::Unreleased {
+      cause: Box::new(cause),
+      release,
+    }),
+  }
+}
+
 /// Appends the changelog's, the manifest log's and each file log's new revisions to `fork`.
 fn append(
   fork: &mut HgIndex,
