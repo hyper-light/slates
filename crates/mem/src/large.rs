@@ -274,7 +274,7 @@ mod tests {
     let floor = floor();
     let before = stats();
     let layout = Layout::from_size_align(floor, 8).unwrap();
-    // SAFETY (test): the layouts are valid and each block is freed once, by the layout it was last given.
+    // SAFETY: (test) the layouts are valid and each block is freed once, by the layout it was last given.
     unsafe {
       let block = allocator.alloc(layout);
       assert!(!block.is_null());
@@ -316,7 +316,7 @@ mod tests {
     let allocator = LargeMapped;
     for size in [64, floor(), floor() + 1] {
       let layout = Layout::from_size_align(size, 8).unwrap();
-      // SAFETY (test): a valid layout, freed once.
+      // SAFETY: (test) a valid layout, freed once.
       unsafe {
         let block = allocator.alloc_zeroed(layout);
         assert!(
