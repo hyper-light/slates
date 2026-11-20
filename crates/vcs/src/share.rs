@@ -161,6 +161,7 @@ pub fn divide<const R: usize>(capacity: &[f64; R], claims: &[Claim<R>]) -> Vec<G
 /// subtraction and one division; the use is a sum of `claims` products of a division (the fraction) and a demand. So the
 /// operations a use passes through number at most `k = 3 × claims + 4`, and `γ_k` bounds its relative error.
 fn rounding_bound(claims: usize) -> f64 {
+  // Derived: k = 3 × claims + 4 operations (the doc above).
   let operations =
     crate::share::amount_of(u64::try_from(claims).unwrap_or(u64::MAX)).mul_add(3.0, 4.0);
   let unit = f64::EPSILON / 2.0;

@@ -2726,6 +2726,26 @@ mod tests {
     });
   }
 
+  /// A volume id minted before the atom that records it is the shard's alone (found by A-652's export: two exports side
+  /// by side minted one id at their walks' end, the second refused `AlreadyExists` at its record). Do: import one archive
+  /// twice side by side, both admitted (each minting its volume's id) before either is published. Expect two distinct
+  /// ids, so both can be recorded; red while every mint before a record named the database's next sequence.
+  #[test]
+  fn two_imports_admitted_side_by_side_mint_distinct_volume_ids() {
+    crate::daemon::audit_on_shard(|state| {
+      let bytes = tree_archive().encode();
+      let holder = holding(state, "holder", &bytes);
+      let mut first = import_of(holder, "first");
+      import_fed(state, &mut first, bytes.len());
+      let mut second = import_of(holder, "second");
+      import_fed(state, &mut second, bytes.len());
+      let ids = (first.id, second.id);
+      first.release(state);
+      second.release(state);
+      assert!(ids.0.is_some() && ids.0 != ids.1, "{ids:?}");
+    });
+  }
+
   /// A-494 (the bound): do import an archive more than a hundred times longer than the reading's bound at a 64-byte
   /// feed slice (eight files of noisy bytes, raw records). Expect its tree laid as the whole-buffer decoder reads it,
   /// and the most of the file the reading held at once within `Decoding::bound(64)`: its slice and one field, never
