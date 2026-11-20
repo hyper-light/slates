@@ -39,6 +39,12 @@
   bounds only; its RAM cost is the prefault cap + admission; the rest is address space.
 - True macOS give-back design (to scope with main): pool extents as purgeable Mach memory entries (VM_PURGABLE_EMPTY frees
   while the anchor still maps it), handed to the anchor by port; replaces shm_open's one content object on macOS.
+- No-prefault removal written, tested, NOT landed: branch agents/w-sizing-noprefault (1fe113d5b + dbf369922, base
+  5518fb2bc): -907 lines (reserve, refill, burst fields, status row, arena prefault/upcoming/KeptRun, Buddy::upcoming);
+  red/bound test a_burst_leaves_nothing_resident_behind_it_but_its_data (Linux). Local: mem 36/36, server idle_sweep 2/2,
+  recovery deleted-file 1/1. To land: fresh worktree from origin/main, squash, docs (A-214 status, GAPS, BENCHMARKS).
+- A/B now branch-based (A = branch~2, B = branch tip), no sync: r6 macOS, r7 Linux (both queued). r5 was stopped by me
+  just as it started on d1323898 (mistake).
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 
