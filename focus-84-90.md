@@ -972,3 +972,6 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   per step (rebuild vs stored base, node check, kept once); working set one revision's texts. RULING for p2: intakes
   run concurrently even per repository (a fork per push); only the landing verdict is ordered per repository.
   common.md: name branches with `git branch`/push HEAD:refs/heads/<name>, never checkout -b (two breaches tonight).
+- ~01:30 PST w-hg p2 plan APPROVED: fork per push, concurrent intake; ordered landing rebases the fork by node
+  (renumber rows; reuse stored content; skip revisions already landed; sliced) when the index moved. Added: judge
+  bundle2 check:heads / check:updated-heads at landing against current heads; advertise checkheads=related.
