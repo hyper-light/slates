@@ -115,3 +115,4 @@
 - A-722 part 2 (rows w/o green/version; landing map bringer_of) LANDED e42c53886 (c1aa1a5b1). Next part 3: stage rows
   into a per-push fork as objects land (positions at arrival; commit rows + generation sliced after pack), landing
   adopts the fork. Then concurrency (19/100 pushes) and arrival-shard decode (w-balance seam).
+- TODO after part 3: t_a665 hook tests wait on push's own answer with deadline derived from shard step time x steps (like w-shared da4dc2ff0), not fixed PUSH_WAIT_NS.

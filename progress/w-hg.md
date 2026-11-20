@@ -103,3 +103,7 @@
   import-crash-looped-the-daemon.md. Local hg 74/74, server 131/131 (+ flaky git test t_a664_live... passes alone).
 - NEXT (main's order): (2) the whole 57k push over HTTP still spins shard 0 ~183 s in (w-interop, release 1533d52b,
   RSS 13.9 GB): find the unsliced step (landing/record write/classify), failing test first; then (3) S5 (A-729).
+- A-732 part 2 (push record written in slices before landing: record::Writer::begin_kept, hg_push::record_sliced)
+  LANDED main (piece d8b23d0e5, merge 5a917afcd). Local hg 75/75, server 136/136 (61/61 on landed tree).
+  Still one step: the landing's append of an entry as large as the record -> S5 (A-729) fixes by identity-only records.
+- NOW: S5 (A-729).
