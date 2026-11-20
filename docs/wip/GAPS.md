@@ -583,8 +583,10 @@
 > repository, its state logs and its greens have one set of holders and one successor with nothing stored per green; a
 > green joins only its repository's family (`repository::in_family`); a lone green is a family of its own, which an
 > adopting repository joins. Owed: a green minted under no family (an older build's) cannot be adopted (refused
-> `Unsupported`); a repository made by an older build, whose id is of no family, can join no new green; the successor
-> adopting a repository's logs by the rule (2c).
+> `Unsupported`); a repository made by an older build, whose id is of no family, can join no new green.
+> **A-636 part 2c-1 (2026-11-20, w-shared):** a repository's record is its own register (`REPOSITORY_CLASS`), shipped
+> to its family's candidates at each policy setting or names change and adopted by its successor as a pending
+> repository. Owed: the successor's rebuild of the repository from its record and its logs by part 1's rule (2c-2).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -6331,8 +6333,9 @@
 > **Since A-709 (piece 6)** base hints are drained at the kernel's report: one hint set a shard (epoll or kqueue, keyed
 > by the volume's generational handle) awaited by one task, and a delegation nobody returned lapses at its own deadline
 > on the keeper. Left on the tick: the idle seal with its purge, then the tick's deletion.
-> Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
-> series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
+> **Since A-715 (the series' last piece)** the idle sweep runs a pass at its own deadline, armed by the write,
+> allocation or free that owes it, and an idle shard runs none; the reap loop and its tick are deleted. Closed.
+> Still on `W` itself (class D): nothing of the reaper's since A-715 deleted the reap loop's tick (`reap_loop`). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
 > the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for

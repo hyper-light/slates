@@ -154,6 +154,9 @@ pub struct Store {
   /// publishes before its next unit of work, which tops the reserve up. Set by [`Volume::next_no`] and at recovery,
   /// cleared by the owner when a publication commits.
   pub counters_low: bool,
+  /// Whether a write stamped a file for the idle sweep since the owner last looked (A-715): set where a sealing volume's
+  /// write is stamped, taken by the owner, which arms its sweep's deadline then rather than sweeping on a tick.
+  pub sweep_owed: bool,
 }
 
 /// Shape: the share of [`Store::inode_reserve`] under which a volume's reserve is topped up (A-150): a half. The reserve
@@ -241,6 +244,7 @@ impl Store {
       shards_backings: crate::shards_backing::ShardsBackings::new(config.max_chunks),
       inode_reserve: 0,
       counters_low: false,
+      sweep_owed: false,
     }
   }
 
@@ -1493,6 +1497,12 @@ impl Volume {
       self.written.remove(&no);
       self.idle_pending.insert(no);
     }
+  }
+
+  /// Whether the idle sweep still owes this volume a pass (A-715): a file written and not yet aged, or aged and not yet
+  /// sealed.
+  pub fn sweep_owes(&self) -> bool {
+    !self.written.is_empty() || !self.idle_pending.is_empty()
   }
 
   /// Seals the open extents of files due a seal, until `budget_bytes` of open bytes are sealed (one cooperative slice);
@@ -6484,6 +6494,7 @@ impl Volume {
     if self.seal_key.is_some() && landed.written > 0 {
       self.written.insert(inode.no, self.sweep_tick);
       self.idle_pending.remove(&inode.no);
+      store.sweep_owed = true;
     }
     self.reconcile(before, content_by_epoch_within(store, handle, touched));
     match landed.refused {
