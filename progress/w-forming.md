@@ -13,6 +13,7 @@
   holder move holders [1150..,7405..] -> moving_to [1150..,10913..(fresh)] never completed; writes refused ~40 s
   ("covers candidates false", head 1410 durable 1409); panic live_chaos.rs:4879 "the owner's holders settled within
   the fleet wait". Log ~/.cache/w-forming-runs/fm1/run-7.log (this Mac). Out of my goal's scope -> reported to main.
+- fm1 done: 11/12 PASS; formation reached every candidate in 12/12 (load ~3/14 cores, not one-CPU). Next fm2: 12 runs under taskpolicy -b.
 - Nothing finished, so nothing to land on main.
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
