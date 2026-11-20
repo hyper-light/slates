@@ -198,6 +198,17 @@ mod tests {
   /// each range's lines back. Expect each run of lines covered from its first byte through its last newline (or the
   /// text's end), the same lines read back, and lines past the text, a reversed run, a range starting inside a line,
   /// one ending inside a line, an empty one and one past the text's end each refused.
+  /// The lines of a text with no final newline, and of one with an empty line, named and read back.
+  fn lines_without_a_final_newline_or_with_an_empty_one() {
+    let open = b"zero\none";
+    assert_eq!(line_range(open, 1, 1), Some(Range::new(5, 3)));
+    assert_eq!(lines_of(open, Range::new(5, 3)), Some((1, 1)));
+    assert_eq!(lines_of(open, Range::new(0, 8)), Some((0, 1)));
+    let blank = b"a\n\nb\n";
+    assert_eq!(line_range(blank, 1, 1), Some(Range::new(2, 1)));
+    assert_eq!(lines_of(blank, Range::new(2, 3)), Some((1, 2)));
+  }
+
   #[test]
   fn a_run_of_lines_is_the_bytes_from_its_first_byte_through_its_last_newline() {
     let text = b"zero\none\ntwo\n";
@@ -206,13 +217,7 @@ mod tests {
     assert_eq!(line_range(text, 2, 3), None);
     assert_eq!(line_range(text, 2, 1), None);
     assert_eq!(lines_of(text, Range::new(5, 8)), Some((1, 2)));
-    let open = b"zero\none";
-    assert_eq!(line_range(open, 1, 1), Some(Range::new(5, 3)));
-    assert_eq!(lines_of(open, Range::new(5, 3)), Some((1, 1)));
-    assert_eq!(lines_of(open, Range::new(0, 8)), Some((0, 1)));
-    let blank = b"a\n\nb\n";
-    assert_eq!(line_range(blank, 1, 1), Some(Range::new(2, 1)));
-    assert_eq!(lines_of(blank, Range::new(2, 3)), Some((1, 2)));
+    lines_without_a_final_newline_or_with_an_empty_one();
     for (range, why) in [
       (Range::new(1, 4), "starts inside a line"),
       (Range::new(0, 3), "ends inside a line"),
