@@ -38,6 +38,8 @@
   Started sw48c: clean 48 on exact origin/main 69d1f2ec3 (has A-735), built from ~/slates-work/w-forming-repro,
   taskpolicy -b, nothing of mine beside it (another agent's g227 suite loop does run on this Mac). Bg task bff43ui5h.
 - sw48c run 21 FAIL after forming (formed, fresh b rejoined 37 s): new owner d served the volume after 19.7 s of takeover (6254 writes acked), then its shard 0 spun 5628 ms CPU without a step -> watchdog exit 4 -> a write unanswered 40 s (live_chaos.rs:1779). Same spin as run 25: on a successor owner right after a takeover. Log ~/.cache/w-forming-runs/sw48c/run-21.log (diagnosis printed).
+- DONE sw48c (09:41Z end): formed+settled 48/48, fresh member rejoined 48/48, test 47/48 (run 21 = takeover spin).
+  GAPS line landed 2add29641 (verified on origin/main). Reported to main for the forming goal.
 - Queue after sw48c: run-7 stall chase; then run-25 spin (main 2026-11-20: name the unsliced task, fix failing-test
   first or hand main its location). Tool: ~/.cache/w-forming-scripts/spin-sampler.sh <runs-dir> samples every chaos
   daemon on a >=300 ms poll line; use with repro loops only, never during evidence runs.
