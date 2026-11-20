@@ -7874,6 +7874,130 @@ mod tests {
     );
   }
 
+  /// §4.17.1 "A push's intake" part 2 (main's ruling (B), A-727 slice b's barrier). Do: on a daemon over a retained
+  /// anchor segment, land a Subversion work whose text spans several copy slices through `svn_commit::land_work`: its
+  /// text put into the content store a slice a turn, its revision appended naming the text by identity only once the
+  /// text is durable; then stop the daemon without publishing anything more, as a crash right after the entry, and
+  /// start a successor over the same segment. Expect: the successor replays the revision with its stored text held, no
+  /// replay refused, and the text read back whole from the store. Without the barrier (the entry appended right after
+  /// the puts) the text is in no image and the replay is refused `SvnStored`.
+  #[test]
+  fn a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry() {
+    use slates_anchor::AnchorSegment;
+    use slates_svn::commit::drive::TextSink;
+    let profile = test_profile();
+    let instance = format!("svn-intake-barrier-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let bytes: Vec<u8> = (0..3 * 65_536 + 17)
+      .map(|at: u32| (at % 251) as u8)
+      .collect();
+    let text = slates_svn::commit::drive::text_of(&bytes).unwrap();
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    let put = bytes.clone();
+    first
+      .observe(shard, move |state| {
+        let (repository, _) = crate::repository::svn_commit::tests::subversion(state, "barrier");
+        let task = slates_rt::futures::spawn(async move {
+          let texts = slates_svn::commit::drive::HeldTexts::new();
+          let staged = texts.stage().unwrap();
+          texts.append(staged, &put).unwrap();
+          texts.seal(staged, text.identity).unwrap();
+          let work = slates_svn::commit::drive::Work {
+            head: 0,
+            record: slates_svn::index::RevisionRecord {
+              transaction: "0-1".to_owned(),
+              changes: vec![slates_svn::index::ChangedPath {
+                path: "/a.txt".to_owned(),
+                action: slates_svn::index::Action::Add,
+                kind: slates_svn::index::NodeKind::File,
+                copy_from: None,
+                text: Some(text),
+                properties: None,
+                mergeinfo_modified: false,
+              }],
+            },
+            lock_entries: Vec::new(),
+            revision_properties: vec![(b"svn:author".to_vec(), b"alice".to_vec())],
+            texts: std::iter::once(text.identity).collect(),
+            property_lists: std::collections::BTreeMap::new(),
+            locks: slates_svn::lock::CommitLocks::default(),
+          };
+          let owner = crate::repository::svn_commit::tests::owner();
+          let landed =
+            crate::repository::svn_commit::land_work((&owner, repository), work, &texts).await;
+          let _ = sent.send((repository, landed.map(|landed| landed.map(|_| ()))));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let (repository, landed) = got
+      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
+      .expect("the landing answered");
+    assert_eq!(landed.map(|landed| landed.is_ok()), Some(true));
+    // The crash: nothing more published.
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let identity = text.identity;
+    let read = || {
+      second
+        .observe(shard, move |state| {
+          let refused = state
+            .refusals
+            .get(crate::vcs_store::REPLAY_REFUSED)
+            .copied()
+            .unwrap_or(0);
+          let recovered = state.vcs_stores.unrecovered(repository).is_none()
+            && !state.vcs_stores.rebuilding(repository)
+            && state.vcs_stores.holds(repository);
+          let whole = crate::vcs_store::lent_state(state, |state| {
+            let len = state
+              .vcs_stores
+              .subversion_records(repository)?
+              .stored_len(&identity)?;
+            let store = state.vcs_stores.content()?;
+            store.object_bytes(&store.root_of(&slates_vcs::ContentId(identity)), len)
+          });
+          (recovered, refused, whole)
+        })
+        .ok()
+    };
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    let mut seen = read();
+    while std::time::Instant::now() < deadline
+      && !seen
+        .as_ref()
+        .is_some_and(|seen| (seen.0 && seen.2.is_some()) || seen.1 > 0)
+    {
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+      seen = read();
+    }
+    second.stop();
+    drop(segment);
+    let seen =
+      seen.map(|(recovered, refused, whole)| (recovered, refused, whole == Some(bytes.clone())));
+    assert_eq!(seen, Some((true, 0, true)));
+  }
+
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
   /// git repository and push the fixtures' `create` and `update` into it; publish every shard; stop; start a successor
   /// over the same segment. Expect: every window the first daemon kept (by identity, with its holders and its bytes)

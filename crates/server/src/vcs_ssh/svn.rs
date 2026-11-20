@@ -155,7 +155,7 @@ pub(crate) struct Opening<'a> {
 /// shard with its record), afresh for each step, as git's site's `StoreLender` and Mercurial's `HgStores` lend theirs.
 pub(crate) trait SvnStores {
   /// The repository's green, which the connection's reads and a commit's drive read.
-  type Green: reads::Repository + Green;
+  type Green<'a>: reads::Repository + Green;
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
   /// Runs `step` over what repository `id`'s sessions are opened with; none when its store is not held here.
@@ -163,7 +163,7 @@ pub(crate) trait SvnStores {
   /// Lands `work`, which `principal`'s commit made on repository `id` and the connection accepted, through the owner's
   /// commit step (`repository::svn_commit::commit_work` at the owner's instant, A-698): the revision it made, or why
   /// not; none when its store is not held here.
-  fn commit(
+  async fn commit(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
@@ -184,7 +184,7 @@ pub(crate) trait SvnStores {
     &mut self,
     id: RepositoryId,
     texts: &dyn TextSink,
-    step: impl FnOnce(&Sources<'_, Self::Green>) -> T,
+    step: impl FnOnce(&Sources<'_, Self::Green<'_>>) -> T,
   ) -> Option<T>;
 }
 
@@ -503,7 +503,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       ..
     } = self;
     if connection.session().is_none() {
-      let sources: Option<&Sources<'_, V::Green>> = None;
+      let sources: Option<&Sources<'_, V::Green<'_>>> = None;
       return connection
         .receive(sources, input, out, budget)
         .map_or_else(Received::Ended, Received::of);
@@ -878,7 +878,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let policy = record.policy.clone();
     let hooked = Hooked::new(id, &record.name);
     let transaction = work.record.transaction.clone();
-    let landed = self.stores.commit(id, &self.principal, work, &self.texts);
+    let landed = self
+      .stores
+      .commit(id, &self.principal, work, &self.texts)
+      .await;
     self.texts.clear();
     let Some(landed) = landed else {
       return self.not_held();

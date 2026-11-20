@@ -85,6 +85,9 @@ pub struct Revision {
   /// The texts and property lists the rows name, by content identity: a text's bytes, a property list in FSFS's form
   /// (`hash.c` `svn_hash_write2`). The step keeps those its repository does not hold.
   pub contents: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts the rows name that its commit stored in the repository's content store, each with its length: named
+  /// here, their bytes held there once (§4.17.1 "A push's intake"; the records keep them as references).
+  pub stored: BTreeMap<ContentIdentity, u64>,
   /// The lock entries its verdict decided, applied with it: the presented locks a commit releases and the expired
   /// locks it met (A-602); none for an import.
   pub lock_entries: Vec<LockEntry>,
@@ -97,21 +100,26 @@ impl Revision {
   /// # Errors
   /// [`StepRefusal::Date`] for an instant this writer cannot write as `svn_time_to_cstring` does: before 1970 or past
   /// the year 9999, which no owner's clock reads.
-  pub fn of_work(
-    work: Work,
-    now: AprTime,
-    texts: &dyn crate::commit::drive::TextSink,
-  ) -> Result<Self, StepRefusal> {
+  pub fn of_work(work: Work, now: AprTime) -> Result<Self, StepRefusal> {
     let date = crate::dav::response::svn_time(now).map_err(|_| StepRefusal::Date { now })?;
     let mut properties: Properties = work.revision_properties.into_iter().collect();
     properties.insert(REVISION_DATE.to_vec(), date.into_bytes());
-    // The work's texts are its sink's, read back for the revision's record until the records keep identities alone
-    // (A-716, w-perf's slices).
-    let mut contents = BTreeMap::new();
+    // The work's texts are in the content store, named with the length the rows give them; no byte is read here.
+    let lengths: BTreeMap<ContentIdentity, u64> = work
+      .record
+      .changes
+      .iter()
+      .filter_map(|change| change.text.map(|text| (text.identity, text.size)))
+      .collect();
+    let mut stored = BTreeMap::new();
     for identity in work.texts {
-      let bytes = texts.sealed(&identity).ok_or(StepRefusal::Corrupt)?;
-      contents.insert(identity, bytes.into_owned());
+      let len = lengths
+        .get(&identity)
+        .copied()
+        .ok_or(StepRefusal::Corrupt)?;
+      stored.insert(identity, len);
     }
+    let mut contents = BTreeMap::new();
     for (identity, list) in work.property_lists {
       let list: Properties = list.into_iter().collect();
       contents.insert(identity, encode(&list));
@@ -121,6 +129,7 @@ impl Revision {
       record: work.record,
       properties,
       contents,
+      stored,
       lock_entries: work.lock_entries,
     })
   }

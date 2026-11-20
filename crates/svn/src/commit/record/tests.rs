@@ -77,6 +77,7 @@ fn revision() -> Revision {
     },
     properties: BTreeMap::from([(b"svn:log".to_vec(), b"x".to_vec())]),
     contents: BTreeMap::from([(*blake3::hash(HELLO).as_bytes(), HELLO.to_vec())]),
+    stored: BTreeMap::from([([0x55; 32], 7)]),
     lock_entries: vec![
       LockEntry::Removed {
         path: "/a".to_owned(),
@@ -89,7 +90,7 @@ fn revision() -> Revision {
 
 /// The tests' revision as the record lays it out, written by hand from the module documentation.
 fn revision_bytes() -> Vec<u8> {
-  let header: Vec<u8> = [b"SSVR".as_slice(), &1u32.to_le_bytes(), &[1]].concat();
+  let header: Vec<u8> = [b"SSVR".as_slice(), &2u32.to_le_bytes(), &[1]].concat();
   let text: Vec<u8> = [[0x11u8; 32].as_slice(), &[0x22; 16], &[0x33; 20], &long(5)].concat();
   let path = string(b"/a");
   let row: Vec<u8> = [
@@ -131,6 +132,9 @@ fn revision_bytes() -> Vec<u8> {
     &long(1),
     blake3::hash(HELLO).as_bytes(),
     string(HELLO).as_slice(),
+    &long(1),
+    &[0x55; 32],
+    &long(7),
     &long(2),
     removed.as_slice(),
     set.as_slice(),
@@ -144,7 +148,7 @@ fn revision_bytes() -> Vec<u8> {
 fn t_a655_the_records_bytes_are_pinned_and_read_back() {
   let created: Vec<u8> = [
     b"SSVR".as_slice(),
-    &1u32.to_le_bytes(),
+    &2u32.to_le_bytes(),
     &[0],
     UUID,
     string(DATE).as_slice(),
@@ -210,6 +214,7 @@ fn rows_of_every_shape() -> Revision {
     },
     properties: BTreeMap::new(),
     contents: BTreeMap::new(),
+    stored: BTreeMap::new(),
     lock_entries: vec![LockEntry::Set(lock)],
   }
 }
@@ -227,6 +232,7 @@ fn t_a655_every_shape_reads_back_and_encodes_again_the_same() {
     },
     properties: BTreeMap::new(),
     contents: BTreeMap::new(),
+    stored: BTreeMap::new(),
     lock_entries: Vec::new(),
   };
   for record in [
@@ -294,7 +300,8 @@ fn places() -> Places {
   let row_end = path + 8 + 2 + 4 + (32 + 16 + 20 + 8) + 1 + 32 + 2;
   let properties_end = row_end + 8 + (8 + 7) + (8 + 1);
   let content = properties_end + 8 + 32 + 8;
-  let token = content + 5 + 8 + 1 + (8 + 2) + 8;
+  // The stored texts' count and one entry (identity, length) lie between the content and the lock entries.
+  let token = content + 5 + (8 + 32 + 8) + 8 + 1 + (8 + 2) + 8;
   Places {
     rows,
     path,
@@ -316,8 +323,8 @@ fn t_a655_hostile_records_are_refused_by_kind() {
   let cases = [
     (patched(&revision, 0, b"SGPR"), RecordRefused::Magic),
     (
-      patched(&revision, 4, &2u32.to_le_bytes()),
-      RecordRefused::Version { version: 2 },
+      patched(&revision, 4, &3u32.to_le_bytes()),
+      RecordRefused::Version { version: 3 },
     ),
     (patched(&revision, 8, &[7]), RecordRefused::Tag { byte: 7 }),
     (
@@ -366,6 +373,7 @@ fn revision_unordered_base() -> Revision {
     },
     properties: BTreeMap::new(),
     contents: BTreeMap::new(),
+    stored: BTreeMap::new(),
     lock_entries: Vec::new(),
   }
 }
@@ -421,7 +429,7 @@ fn properties_set() -> Record {
 
 /// A record's first bytes: the magic, the version and the kind byte `kind`.
 fn head_of(kind: u8) -> Vec<u8> {
-  [b"SSVR".as_slice(), &1u32.to_le_bytes(), &[kind]].concat()
+  [b"SSVR".as_slice(), &2u32.to_le_bytes(), &[kind]].concat()
 }
 
 /// The bytes of revision 0's properties set to the two entries `first` and `second`, in that order.
@@ -507,4 +515,27 @@ fn t_a652_a_flipped_byte_of_either_record_never_panics_and_what_reads_is_canonic
       }
     }
   }
+}
+
+/// The record's version 2 (§4.17.1 "A push's intake"): a revision names the texts its commit stored. Do: read the tests'
+/// revision written as version 1 wrote it, with no stored texts' count. Expect: read back as the revision with no
+/// stored texts, so a log written before version 2 replays.
+#[test]
+fn a_version_one_revision_reads_back_with_no_stored_texts() {
+  let current = revision_bytes();
+  let places = places();
+  // The stored texts' count follows the content's bytes.
+  let stored_at = places.content + HELLO.len();
+  let older: Vec<u8> = [
+    b"SSVR".as_slice(),
+    &1u32.to_le_bytes(),
+    &current[8..stored_at],
+    &current[stored_at + 8 + 32 + 8..],
+  ]
+  .concat();
+  let expected = Revision {
+    stored: BTreeMap::new(),
+    ..revision()
+  };
+  assert_eq!(Record::decode(&older), Ok(Record::Revision(expected)));
 }

@@ -362,8 +362,22 @@ impl Repositories for Held {
   }
 }
 
-/// A Subversion repository's records as the connection reads a green: one version of them, kept for the test's life.
-struct View(&'static Records);
+/// A Subversion repository's records as the connection reads a green: one version of them, kept for the test's life,
+/// with the texts its landings stored, as the content store holds them beside the records.
+struct View(&'static Records, &'static StoredTexts);
+
+/// The texts the landings stored, by identity.
+type StoredTexts = std::cell::RefCell<std::collections::BTreeMap<ContentIdentity, Vec<u8>>>;
+
+impl View {
+  /// `identity`'s stored text from `offset`, when a landing stored it.
+  fn stored(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let stored = self.1.borrow();
+    let text = stored.get(identity)?;
+    let from = usize::try_from(offset).ok()?;
+    Some(std::borrow::Cow::Owned(text.get(from..)?.to_vec()))
+  }
+}
 
 impl Contents for View {
   fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
@@ -391,13 +405,13 @@ impl reads::Repository for View {
   }
 
   fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
-    reads::Repository::text(self.0, identity, offset)
+    reads::Repository::text(self.0, identity, offset).or_else(|| self.stored(identity, offset))
   }
 }
 
 impl Green for View {
   fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
-    Green::text(self.0, identity)
+    Green::text(self.0, identity).or_else(|| self.stored(identity, 0))
   }
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
@@ -420,6 +434,8 @@ struct Created {
   current: Cell<&'static Records>,
   /// How many works were landed or refused.
   commits: Cell<u64>,
+  /// The texts landed works stored.
+  stored: StoredTexts,
 }
 
 /// What the recordings' repository's sessions open with (`anon-access = none`, `auth-access = write`): its UUID its
@@ -461,6 +477,7 @@ impl Lends {
       created: Box::leak(Box::new(Created {
         current: Cell::new(Box::leak(Box::new(records))),
         commits: Cell::new(0),
+        stored: StoredTexts::default(),
       })),
       full: false,
     }
@@ -478,9 +495,16 @@ fn landed(
   work: Work,
   now: AprTime,
   texts: &dyn slates_svn::commit::drive::TextSink,
+  stored: &StoredTexts,
 ) -> Result<(Records, Committed), Unlanded> {
   let locks = work.locks.clone();
-  let revision = RevisionToCommit::of_work(work, now, texts).map_err(Unlanded::Step)?;
+  let revision = RevisionToCommit::of_work(work, now).map_err(Unlanded::Step)?;
+  for (identity, len) in &revision.stored {
+    let len = usize::try_from(*len).unwrap_or(usize::MAX);
+    if let Some(text) = texts.sealed_piece(identity, 0, len) {
+      stored.borrow_mut().insert(*identity, text);
+    }
+  }
   let (date, author) = (
     revision.date().map(str::to_owned),
     revision.author().map(str::to_owned),
@@ -499,7 +523,7 @@ fn landed(
 }
 
 impl SvnStores for Lends {
-  type Green = View;
+  type Green<'a> = View;
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HELD
@@ -509,7 +533,7 @@ impl SvnStores for Lends {
     self.holds(id).then(|| step(&OPENING))
   }
 
-  fn commit(
+  async fn commit(
     &mut self,
     id: RepositoryId,
     _principal: &Principal,
@@ -525,7 +549,7 @@ impl SvnStores for Lends {
       return Some(Err(Unlanded::Budget { available: 0 }));
     }
     Some(
-      landed(created.current.get(), work, NOW, texts).map(|(next, committed)| {
+      landed(created.current.get(), work, NOW, texts, &created.stored).map(|(next, committed)| {
         created.current.set(Box::leak(Box::new(next)));
         committed
       }),
@@ -563,7 +587,7 @@ impl SvnStores for Lends {
     let records = self.created.current.get();
     Some(step(&Sources {
       index: records.index(),
-      repository: &View(records),
+      repository: &View(records, &self.created.stored),
       locks: records.locks(),
       now: NOW,
       policy: POLICY,
