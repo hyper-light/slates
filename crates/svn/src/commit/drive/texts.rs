@@ -82,6 +82,13 @@ impl HeldTexts {
     std::mem::take(&mut *self.sealed.borrow_mut())
   }
 
+  /// Gives back every staged and sealed text: a drive that ended without landing, or one whose revision now holds
+  /// them.
+  pub fn clear(&self) {
+    self.staged.borrow_mut().clear();
+    self.sealed.borrow_mut().clear();
+  }
+
   /// How many texts are being staged.
   pub fn staged_count(&self) -> usize {
     self.staged.borrow().len()

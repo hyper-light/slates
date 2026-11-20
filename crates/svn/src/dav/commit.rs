@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::locking::{HttpAnswer, convert_status, error_answer};
 use super::xml::{Element, parse};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
-use crate::commit::drive::{Drive, Due, Edited, Green, Setup, Work};
+use crate::commit::drive::{Drive, Due, Edited, Green, Setup, TextSink, Work};
 use crate::commit::edit::{CopiedFrom, EditCommand};
 use crate::index::{Index, NodeKind, PropertyPairs, Revision};
 use crate::lock::LockTable;
@@ -99,8 +99,6 @@ pub struct World<'a, G: ?Sized> {
   pub green: &'a G,
   /// The locks.
   pub locks: &'a LockTable,
-  /// Where the commit's new texts go, a window at a time (§4.17.1 rule 1).
-  pub texts: &'a dyn crate::commit::drive::TextSink,
 }
 
 /// The caller's answer to a hook due: passed, or its errors, outermost first.
@@ -122,8 +120,9 @@ pub struct Put<'a> {
 /// What a MERGE came to.
 #[derive(Debug)]
 pub enum Merged {
-  /// The work the verdict accepted: the caller commits it and answers with [`super::response::merge`].
-  Accepted(Box<Work>),
+  /// The work the verdict accepted, with the sink holding its texts: the caller commits it, reading its texts from the
+  /// sink, and answers with [`super::response::merge`].
+  Accepted(Box<Work>, Box<dyn TextSink>),
   /// Refused: this is the answer.
   Refused(HttpAnswer),
 }
@@ -221,6 +220,9 @@ pub struct DavCommit {
   over: bool,
   /// The PUT whose text is being taken, between its body's runs ([`DavCommit::begin_put`]).
   putting: Option<Putting>,
+  /// Where its new texts go, a window at a time (§4.17.1 rule 1; [`TextSink`]): the caller's, handed back with the
+  /// accepted work, dropped with a commit that ends otherwise.
+  texts: Box<dyn TextSink>,
 }
 
 /// A PUT whose delta is open: its file's token, its path, whether it adds the file, and the result checksum its
@@ -270,8 +272,9 @@ impl DavCommit {
     setup: Setup,
     world: &World<'_, G>,
     hooks: Hooks<'_>,
+    texts: Box<dyn TextSink>,
   ) -> Result<Self, HttpAnswer> {
-    let (mut commit, due) = Self::begin_hooked(setup, world)?;
+    let (mut commit, due) = Self::begin_hooked(setup, world, texts)?;
     if let Some(due) = due {
       commit.resume_begin(world, hooks(&due))?;
     }
@@ -286,8 +289,10 @@ impl DavCommit {
   pub fn begin_hooked<G: Green + ?Sized>(
     setup: Setup,
     world: &World<'_, G>,
+    texts: Box<dyn TextSink>,
   ) -> Result<(Self, Option<Due>), HttpAnswer> {
     let mut commit = Self {
+      texts,
       repository_url: setup.repository_url.clone(),
       drive: Drive::new(setup),
       directories: BTreeMap::new(),
@@ -568,7 +573,11 @@ impl DavCommit {
     match edited {
       Ok(Edited::Accepted(work)) => {
         self.over = true;
-        Merged::Accepted(work)
+        let texts = std::mem::replace(
+          &mut self.texts,
+          Box::new(crate::commit::drive::HeldTexts::new()),
+        );
+        Merged::Accepted(work, texts)
       }
       Ok(_) => {
         self.over = true;
@@ -941,7 +950,7 @@ impl DavCommit {
     }
     let edited = self
       .drive
-      .edit(world.index, world.green, world.locks, world.texts, command);
+      .edit(world.index, world.green, world.locks, &*self.texts, command);
     self.edit_step(edited)
   }
 
@@ -954,9 +963,10 @@ impl DavCommit {
     if self.over {
       return Err(no_such_transaction(self.drive.pending().transaction));
     }
-    let edited = self
-      .drive
-      .resume_edit(world.index, world.green, world.locks, world.texts, answer);
+    let edited =
+      self
+        .drive
+        .resume_edit(world.index, world.green, world.locks, &*self.texts, answer);
     self.edit_step(edited)
   }
 

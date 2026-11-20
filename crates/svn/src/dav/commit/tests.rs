@@ -106,14 +106,18 @@ fn a_posts_skel_names_the_revision_properties_the_principal_authors() {
 fn a_commit_over_http_adds_a_directory_and_a_file_and_lands_as_revision_one() {
   let mut repository = empty();
   let hooks: Hooks<'_> = &passed;
-  let sink = crate::commit::drive::HeldTexts::new();
   let world = World {
     index: repository.index(),
     green: &repository,
     locks: repository.locks(),
-    texts: &sink,
   };
-  let mut commit = DavCommit::begin(setup(&repository), &world, hooks).unwrap();
+  let mut commit = DavCommit::begin(
+    setup(&repository),
+    &world,
+    hooks,
+    Box::new(crate::commit::drive::HeldTexts::new()),
+  )
+  .unwrap();
   let made = commit.mkcol(&world, hooks, "/trunk").status;
   let put = Put {
     body: HELLO_DELTA,
@@ -124,7 +128,7 @@ fn a_commit_over_http_adds_a_directory_and_a_file_and_lands_as_revision_one() {
   let written = commit.put(&world, hooks, "/trunk/a.txt", &put).status;
   let patched = commit.proppatch(&world, hooks, ("/trunk/a.txt", None), (PROPPATCH, &BOUNDS));
   let patched_text = String::from_utf8_lossy(&patched.body).into_owned();
-  let Merged::Accepted(work) = commit.merge(&world, hooks) else {
+  let Merged::Accepted(work, sink) = commit.merge(&world, hooks) else {
     panic!("the MERGE was refused");
   };
   let paths: Vec<String> = work
@@ -136,17 +140,14 @@ fn a_commit_over_http_adds_a_directory_and_a_file_and_lands_as_revision_one() {
   let texts: Vec<Vec<u8>> = work
     .texts
     .iter()
-    .filter_map(|identity| {
-      use crate::commit::drive::TextSink;
-      sink.sealed(identity).map(|bytes| bytes.into_owned())
-    })
+    .filter_map(|identity| sink.sealed(identity).map(|bytes| bytes.into_owned()))
     .collect();
   let log = work
     .revision_properties
     .iter()
     .find(|(name, _)| name.as_slice() == b"svn:log")
     .map(|(_, value)| value.clone());
-  let committed = repository.commit(RevisionToCommit::of_work(*work, NOW, &sink).unwrap());
+  let committed = repository.commit(RevisionToCommit::of_work(*work, NOW, &*sink).unwrap());
   assert_eq!(
     (
       made,
@@ -180,14 +181,18 @@ fn a_commit_over_http_adds_a_directory_and_a_file_and_lands_as_revision_one() {
 fn a_refused_request_ends_its_transaction() {
   let repository = empty();
   let hooks: Hooks<'_> = &passed;
-  let sink = crate::commit::drive::HeldTexts::new();
   let world = World {
     index: repository.index(),
     green: &repository,
     locks: repository.locks(),
-    texts: &sink,
   };
-  let mut commit = DavCommit::begin(setup(&repository), &world, hooks).unwrap();
+  let mut commit = DavCommit::begin(
+    setup(&repository),
+    &world,
+    hooks,
+    Box::new(crate::commit::drive::HeldTexts::new()),
+  )
+  .unwrap();
   let put = Put {
     body: HELLO_DELTA,
     base_md5: None,
@@ -237,14 +242,18 @@ fn an_if_header_presents_its_lock_tokens_and_no_resource_tag() {
 fn a_puts_body_taken_a_byte_at_a_time_makes_the_text_it_makes_whole() {
   let repository = empty();
   let hooks: Hooks<'_> = &passed;
-  let sink = crate::commit::drive::HeldTexts::new();
   let world = World {
     index: repository.index(),
     green: &repository,
     locks: repository.locks(),
-    texts: &sink,
   };
-  let mut commit = DavCommit::begin(setup(&repository), &world, hooks).unwrap();
+  let mut commit = DavCommit::begin(
+    setup(&repository),
+    &world,
+    hooks,
+    Box::new(crate::commit::drive::HeldTexts::new()),
+  )
+  .unwrap();
   let start = PutStart {
     base_md5: None,
     result_md5: Some("b1946ac92492d2347c6235b4d2611184"),
@@ -257,16 +266,13 @@ fn a_puts_body_taken_a_byte_at_a_time_makes_the_text_it_makes_whole() {
       .is_ok()
   });
   let ended = commit.end_put(&world, hooks).status;
-  let Merged::Accepted(work) = commit.merge(&world, hooks) else {
+  let Merged::Accepted(work, sink) = commit.merge(&world, hooks) else {
     panic!("the MERGE was refused");
   };
   let texts: Vec<Vec<u8>> = work
     .texts
     .iter()
-    .filter_map(|identity| {
-      use crate::commit::drive::TextSink;
-      sink.sealed(identity).map(|bytes| bytes.into_owned())
-    })
+    .filter_map(|identity| sink.sealed(identity).map(|bytes| bytes.into_owned()))
     .collect();
   assert_eq!(
     (taken, ended, texts),

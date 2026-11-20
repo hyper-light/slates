@@ -557,14 +557,15 @@ fn t_a698_a_clients_accepted_work_lands_through_the_step() {
         (b"svn:author".to_vec(), b"alice".to_vec()),
         (b"svn:log".to_vec(), b"a change".to_vec()),
       ],
-      texts: BTreeMap::new(),
+      texts: std::collections::BTreeSet::new(),
       property_lists: BTreeMap::new(),
       locks: CommitLocks {
         user: Some("alice".to_owned()),
         ..CommitLocks::default()
       },
     };
-    let landed = commit_work(state, (&owner(), svn), work, DATE_INSTANT);
+    let texts = slates_svn::commit::drive::HeldTexts::new();
+    let landed = commit_work(state, (&owner(), svn), work, DATE_INSTANT, &texts);
     let made = revision(
       0,
       vec![row("/trunk", Action::Add, NodeKind::Directory)],
