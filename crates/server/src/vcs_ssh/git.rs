@@ -40,7 +40,7 @@ use slates_git::pktline::{self, MAX_LEN};
 use slates_git::upload::{self, Answer, Asked, PackSource, Written};
 use slates_git::v2::request::whole_len;
 
-use super::site::{Command, GIT_DIE_STATUS, Next, Refused, Stepped};
+use super::site::{ClientGone, Command, GIT_DIE_STATUS, Next, Refused, Stepped};
 use crate::vcs_http::git::StoreLender;
 
 /// Format: git's error packet's prefix (gitprotocol-pack: an `ERR` pkt-line, whose reason the client shows).
@@ -249,7 +249,7 @@ impl<L: StoreLender> Command for UploadCommand<L> {
     self.input_ended = true;
   }
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
+  async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     if self.answer.is_some() {
       let next = self.write_answer()?;
       return Ok(Stepped { consumed: 0, next });
