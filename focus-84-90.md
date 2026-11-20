@@ -931,3 +931,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   names blobs by the green's ContentIdentity (trees/commits stay git's), order vs w-perf's T4 agreed between them;
   w-hg: folded into (1)+(2): filelog texts named by ContentIdentity, manifests/changelogs as deltas; w-perf: A-716
   (svn), then register entry objects (A-662) for every tool.
+- ~00:25 PST svn 5,000-rev import rerun (w-perf, release b705a24c5): 3,540 revs committed (was 1,685), then refused
+  Unpublished{record 3560: segment profile 803,344,210 B > 746,962,928-byte region}; RSS 5,331 MiB. BUG BY USE -> w-svn
+  TOP (before lock): after the refusal every svn commit E160004 (green ahead of records; repository wedged) -> green
+  advance + record one atom, failing test first. Region wall -> A-716 + entry objects (w-perf, A-716 now).
