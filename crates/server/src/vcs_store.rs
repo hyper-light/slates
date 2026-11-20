@@ -310,7 +310,22 @@ pub(crate) enum ReplayRefused {
   LfsRecord(LfsRecordRefused),
   /// An LFS object the repository's LFS index refused again: bytes that are not their oid's, or past the budget.
   Lfs(ObjectRefused),
+  /// A version-2 git record's pack (A-723) that git's reader refuses: its bytes, or a base outside it the store lacks.
+  Pack(slates_git::unpack::Refusal),
 }
+
+/// The repository's objects as the bases a replayed pack's reference deltas may name (A-723), read through the index view
+/// a live push reads them by.
+struct StoreBases<'a>(slates_git::store::views::IndexedObjects<'a>);
+
+impl slates_git::unpack::Outside for StoreBases<'_> {
+  fn object(&self, id: &ObjectId) -> Option<(slates_git::object_name::Kind, &[u8])> {
+    slates_git::receive::Repository::object(&self.0, id)
+  }
+}
+
+/// No pack index: a replayed pack names its own objects and the store's (A-723).
+static NO_INDEX: slates_git::unpack::NoIndex = slates_git::unpack::NoIndex;
 
 /// Why a git push's step was refused. Each leaves the store as it was, and the push holding what it held.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,11 +341,11 @@ pub(crate) enum GitRefused {
 }
 
 /// A record not written, in a push's terms: an object whose bytes the content store does not hold whole is one the
-/// store cannot read, as its own refusal names it.
+/// store cannot read, as its own refusal names it; a pack not made or a room refused, the record's room.
 fn unwritten(refused: WriteRefused) -> GitRefused {
   match refused {
     WriteRefused::Unreadable { id } => GitRefused::Store(StoreRefused::Unreadable { id }),
-    WriteRefused::Allocation => GitRefused::Allocation,
+    WriteRefused::Whole(_) | WriteRefused::Allocation => GitRefused::Allocation,
   }
 }
 
@@ -898,6 +913,12 @@ impl GitPush {
     })
   }
 
+  /// Keeps the push's pack as the client sent it (A-723), which the push's first record holds in place of its objects'
+  /// bytes.
+  pub(crate) fn keep_pack(&mut self, pack: Vec<u8>) {
+    self.record.keep_pack(pack);
+  }
+
   /// Admits `objects`, in the order the push brought them, with the room their bytes take lent for the step. Refused at
   /// the first object refused; the push keeps what it admitted before, for its caller to abandon.
   pub(crate) fn admit_all(
@@ -1021,7 +1042,8 @@ fn admit_object(
 }
 
 /// The record a commit of `moves` writes now (`record::RecordWriter::finish`): `deepest` and `moves`, then each object
-/// `writer` noted that the repository lacks now, its bytes read back from `content`. Lacking is the predicate the
+/// `writer` noted that the repository lacks now, named by type, content identity and length, and the push's pack as the
+/// client sent it (A-723). Lacking is the predicate the
 /// store's commit gives positions by (`Repository::object`, the index its `fresh` reads), so the record holds exactly
 /// the objects the commit that follows positions.
 pub(crate) fn record_of(
@@ -1031,7 +1053,11 @@ pub(crate) fn record_of(
   moves: &[RecordedMove],
 ) -> Result<Vec<u8>, GitRefused> {
   writer
-    .finish(content, lacks(content, store), (deepest, moves))
+    .finish(
+      (content, store.repository.format()),
+      lacks(content, store),
+      (deepest, moves),
+    )
     .map_err(unwritten)
 }
 
@@ -1239,6 +1265,9 @@ fn recorded_alike(
   let admitted = remade
     .lacked(lacks(content, store))
     .map(|noted| (noted.kind, noted.identity, noted.len));
+  if record.objects.is_empty() {
+    return admitted.eq(record.names.iter().copied());
+  }
   let recorded = record.objects.iter().map(|object| {
     let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
     (object.kind, object.identity, len)
@@ -1253,6 +1282,9 @@ fn replay_objects(
   (push, remade): (&mut Push, &mut RecordWriter),
   record: &Record<'_>,
 ) -> Result<(), ReplayRefused> {
+  if !record.pack.is_empty() {
+    return replay_pack(content, store, (push, remade), record);
+  }
   for object in &record.objects {
     if content.object_id(object.content) != object.identity {
       return Err(ReplayRefused::Identity);
@@ -1262,6 +1294,45 @@ fn replay_objects(
       claimed: None,
       content: object.content,
       depth: record.deepest,
+    };
+    admit_object(content, store, (&mut *push, &mut *remade), incoming)
+      .map_err(ReplayRefused::Git)?;
+  }
+  Ok(())
+}
+
+/// Admits a version-2 record's objects (A-723): its pack read through git's own reader, a reference delta's base from the
+/// pack or the store, within the room the content store has left; then each object admitted as a live push admits it,
+/// at its place in its chain. The names the record holds are compared after ([`recorded_alike`]), so a pack that makes
+/// other objects than the live push recorded is refused.
+fn replay_pack(
+  content: &mut ContentStore,
+  store: &GitStore,
+  (push, remade): (&mut Push, &mut RecordWriter),
+  record: &Record<'_>,
+) -> Result<(), ReplayRefused> {
+  let unpacked = {
+    let room = content.room();
+    let bases = StoreBases(slates_git::store::views::IndexedObjects::new(
+      &store.repository,
+      content,
+      room,
+    ));
+    let mut admission = slates_git::Admission::new(room);
+    let mut reader = slates_git::unpack::Reader::new(store.repository.format(), &NO_INDEX);
+    reader
+      .read(record.pack, &mut admission)
+      .map_err(ReplayRefused::Pack)?;
+    reader
+      .finish_with(&bases, &mut admission)
+      .map_err(ReplayRefused::Pack)?
+  };
+  for object in &unpacked.objects {
+    let incoming = Incoming {
+      kind: object.kind,
+      claimed: Some(object.id),
+      content: &object.content,
+      depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
     };
     admit_object(content, store, (&mut *push, &mut *remade), incoming)
       .map_err(ReplayRefused::Git)?;

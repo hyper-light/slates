@@ -54328,3 +54328,47 @@ Applied in the same change to:
   protected_fixtures store:: upload::` 224 passed, 4 ignored, the new test named; fmt clean.
 - **Owed.** Part 3: git's intake keeping into the repository's store as the pack is read (the session and the push
   driver over a store keeper, the checks reading objects back from it), on w-perf's byte table once it lands.
+
+### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
+
+Applied in the same change to: `crates/git` (`receive::Session::take_pack`: the pack's bytes kept as they arrive,
+charged to the session's admission); `crates/server` (`vcs_store/record.rs`, version 2; `vcs_store.rs`'s replay of a
+version-2 record through git's own reader, `StoreBases`, `ReplayRefused::Pack`, `GitPush::keep_pack`; `slates_git::pack::of_whole`; `git_push.rs`'s
+`prepare`); §4.17.1's status; GAPS (§4.17); BENCHMARKS.md's concurrent-push entry, which measured the cost.
+
+- **The end state** (main's convergence plan, approved 2026-11-20). One copy of every file byte, in the greens' files,
+  deduplicated by identity (§4.11; §4.17.1 row "Objects"); each tool's own objects an index by the tool's id over
+  content identities, small; a push a work whose post-state carries what it brings, judged by §4.16's verdict, durable
+  when its merge record commits (§4.17 "Role"); fragments and packs derived and charged to the shard. A repository then
+  costs about one to two times its compressed pack. Today it costs far more: one 3.43 MB push of git/git cut at v1.0.0
+  kept 229 MiB (the store's inflated objects 69.1 MiB, the register entry's copy 63.5 MiB, the arena grown for them
+  63.7 MiB), and a Subversion text was held four times (BENCHMARKS.md).
+- **The push bound.** A push streams: per connection the server holds the window it is decoding (one ring region's
+  worth, derived) and a delta's base, and the rest of the pack waits in the client's socket, so TCP's flow control is
+  the backpressure, never the server's memory. Admission charges each push's window and post-state to its owner
+  shard's budget, and a push past it is refused typed before its body is read (git's `unpacker error`, HTTP 503 with a
+  retry), never by running out of memory. A work is cheap to make (R9), so ten thousand concurrent pushes cost ten
+  thousand windows plus what they bring, once.
+- **The steps.** S1 (w-perf, this entry): a register entry holds no inflated copy. S2 (w-perf): the content history's
+  latest value names the file's block, so a green holds a changed file once; A-716's identity table stays as the
+  green's identity -> block index, and its hold by bytes goes once S3 and S5 land bytes as work operations. S3 (w-git,
+  A-722): git's streaming intake lands blobs as the push work's file operations and keeps the store as an index with
+  the client's deltas. S4 (w-svn and w-perf, A-716 slices 2 and 3): Subversion's records name texts by identity. S5
+  (w-hg): Mercurial's filelog texts as green files by identity, its changelogs and manifests as deltas in its index.
+- **What remains duplicated, said plainly.** A head version's blobs exist raw in the green (what a checkout mounts) and
+  compressed in the recorded pack (what a recovery replays): the hot and cold copies §4.11's cost model would choose
+  between, kept until S3's index reads the pack in place.
+- **S1, built.** A git push's record (version 2) names each object the repository lacked by its type, content identity
+  and length (41 bytes), then holds the push's pack as the client sent it, compressed and with its deltas; only the
+  first append of a push that brings objects carries it. The receive session keeps the pack's bytes as they arrive,
+  charged to its admission (`Session::take_pack`). A replay reads the objects back through git's own reader, a
+  reference delta's base from the pack or the store, admits each as a live push does, and refuses a pack whose objects
+  are not the names, in order (`Diverged`), or one git's reader refuses (`Pack`). Objects no client sent as a pack (the
+  server's own commits, A-664 part 3) are recorded as a pack of whole objects, deflated
+  (`slates_git::pack::of_whole`), so every record is a pack and a replay has one path. Version-1 records, each object inflated, are still read: a segment
+  holds entries written by them. For the measured push the entry goes from 63.5 MiB to about the pack's 3.4 MB.
+- **Owed.** A pack past an entry's bound recorded in bounded parts across entries (git/git's whole pack is 607 MiB
+  against the Studio's 746,962,928-byte segment region, the wall a 5,000-revision Subversion import met at revision
+  3,540); the objects the repository already holds left out of the recorded pack; the push_load re-run at N = 1, 10 and
+  100 once S1 and S3 are in, against today's 229 MiB a push.
+
