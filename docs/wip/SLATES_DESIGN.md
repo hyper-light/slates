@@ -55726,6 +55726,14 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4f — A push's connectivity propagation a step of its stack a unit (2026-11-20, w-git for UI goal 93; the check's 57.9 ms at 100 concurrent pushes)
+- **Change.** `slates_git::receive::connect`'s walk carries the worst state back over the edges with its explicit stack
+  kept between turns (`Walk::propagation_unit`): a unit is one edge followed, one object finished, or the next root
+  opened; before, the whole propagation was one unit, the check's longest step at 100 concurrent v1.5.0 pushes (57.9 ms).
+- **Tests.** `slates-git` `receive::tests::session::a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole`
+  now holds a push to five turns an object at least (red with the whole propagation: `create`, 11 turns for 3
+  objects); `slates-git --lib -- receive::` 46 passed; fmt clean (macOS arm64, this Mac, local).
+
 ### A-722 part 4e — A stage a landing overtook is made again in turns before its append (2026-11-20, w-git for UI goal 93; the answer's 74 ms at 100 concurrent pushes)
 - **Why.** At 100 concurrent pushes to one repository the answer's longest step was 73.7 ms: every push sealed while
   another landed had its stage overtaken, and its append's commit staged it again whole, in that step.

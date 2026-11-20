@@ -181,11 +181,9 @@ fn connect(instance: &str) -> Client {
     slates_db::replay::RECOVERY_BUDGET_NS,
   )
   .get();
-  loop {
-    match Client::connect(instance, deadlines) {
-      Ok(client) => return client,
-      Err(e) => panic!("{e}"),
-    }
+  match Client::connect(instance, deadlines) {
+    Ok(client) => client,
+    Err(e) => panic!("{e}"),
   }
 }
 
