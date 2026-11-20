@@ -174,3 +174,8 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   Tests: merge 408/408 incl. named_tests (4 MiB in 64 steps of <= 64 KiB, encoded < 4 KiB); server repository::,
   work_home, vcs_store::, git_push:: green. NEXT part 2: commit's file blocks a slice a unit, published in one step;
   server Objects over vcs_store's plane; replay reads runs first.
+- QUEUE (main ~12:50): pacing gap, Pace owner: a step runs as many cheap units as fill the quantum, learned per unit
+  kind (EWMA of measured cost), yielding only when the quantum is spent (w-git: an 820 KB / 9,000-object answer in
+  8,498 release / 29,177 debug steps, ~10 s at load 60 for ms of CPU). Red: N cheap units take ~work/quantum steps, not
+  N; longest step under the quantum. After A-760 part 2 (not quick: git's Quantum paths and the shard's quantum size
+  are in it too).
