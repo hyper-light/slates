@@ -1199,7 +1199,10 @@ fn expect_the_anchors_own_image(
     // Gone between the reap check and the look is the anchor ending, which the next check reaps.
     let verdict = judged.judge();
     assert!(
-      !matches!(verdict, process_wait::Verdict::Stalled),
+      !matches!(
+        verdict,
+        process_wait::Verdict::Stalled | process_wait::Verdict::SpentItsBudget
+      ),
       "the anchor ended after refusing: it stays without gaining CPU ({verdict:?})"
     );
     pause();
@@ -3617,6 +3620,11 @@ struct StartProgress {
   seen: Option<(Vec<u32>, u64)>,
   moved_at: Instant,
   began: Instant,
+  /// Each process's CPU at the last look, nanoseconds; empty before the first.
+  cpu: std::collections::BTreeMap<u32, u64>,
+  /// The CPU the processes spent since the wait began: each one's gain between looks, and a process that came during
+  /// the wait (a successor) all it ran.
+  spent: Duration,
 }
 
 impl StartProgress {
@@ -3626,11 +3634,13 @@ impl StartProgress {
       seen: None,
       moved_at: now,
       began: now,
+      cpu: std::collections::BTreeMap::new(),
+      spent: Duration::ZERO,
     }
   }
 
   /// Ends the test, saying it waited for `what`, once the instance's processes made no progress for
-  /// [`process_wait::STALL`] or none is left.
+  /// [`process_wait::STALL`], spent [`process_wait::CPU_BUDGET`] since the wait began, or none is left.
   fn check(&mut self, instance: &str, what: &str) {
     self.check_all(&[instance], what);
   }
@@ -3647,6 +3657,12 @@ impl StartProgress {
       "waited for {what} at {instance}: {} ({:?} after the wait began; {:?})",
       if self.seen.as_ref().is_none_or(|(pids, _)| pids.is_empty()) {
         "none of its processes is left".to_owned()
+      } else if self.spent_its_budget(instances.len()) {
+        format!(
+          "its processes spent {:?} of CPU without it, the budget {:?} a node",
+          self.spent,
+          process_wait::CPU_BUDGET
+        )
       } else {
         format!(
           "its processes made no progress for {:?}",
@@ -3658,8 +3674,9 @@ impl StartProgress {
     );
   }
 
-  /// Whether a wait on `instance` goes on: some of its processes are left, and they made progress within
-  /// [`process_wait::STALL`].
+  /// Whether a wait on `instance` goes on: some of its processes are left, they made progress within
+  /// [`process_wait::STALL`], and they have not spent [`process_wait::CPU_BUDGET`] since the wait began (as
+  /// `live_chaos` judges its starts: a daemon that runs and never brings the answer about is not waited on forever).
   fn look(&mut self, instance: &str) -> bool {
     self.look_all(&[instance])
   }
@@ -3675,16 +3692,36 @@ impl StartProgress {
       self.seen = None;
       return false;
     }
-    let total = pids
+    let readings: Vec<(u32, slates_machine::process_clock::ProcessCpu)> = pids
       .iter()
-      .filter_map(|pid| slates_machine::process_clock::process_cpu(*pid))
-      .fold(0u64, |sum, cpu| sum.wrapping_add(cpu.progress));
+      .filter_map(|pid| Some((*pid, slates_machine::process_clock::process_cpu(*pid)?)))
+      .collect();
+    let first = self.cpu.is_empty();
+    let mut cpu = std::collections::BTreeMap::new();
+    for (pid, reading) in &readings {
+      let gained = match self.cpu.get(pid) {
+        Some(then) => reading.spent_ns.saturating_sub(*then),
+        None if first => 0,
+        None => reading.spent_ns,
+      };
+      self.spent = self.spent.saturating_add(Duration::from_nanos(gained));
+      cpu.insert(*pid, reading.spent_ns);
+    }
+    self.cpu = cpu;
+    let total = readings
+      .iter()
+      .fold(0u64, |sum, (_, cpu)| sum.wrapping_add(cpu.progress));
     let now = Some((pids, total));
     if now != self.seen {
       self.seen = now;
       self.moved_at = Instant::now();
     }
-    self.moved_at.elapsed() < process_wait::STALL
+    self.moved_at.elapsed() < process_wait::STALL && !self.spent_its_budget(instances.len())
+  }
+
+  /// Whether the processes of `nodes` instances spent [`process_wait::CPU_BUDGET`] each since the wait began.
+  fn spent_its_budget(&self, nodes: usize) -> bool {
+    self.spent >= process_wait::CPU_BUDGET.saturating_mul(u32::try_from(nodes).unwrap_or(u32::MAX))
   }
 }
 
@@ -5762,7 +5799,10 @@ fn wait_exit(child: &mut Child) -> Option<std::process::ExitStatus> {
     if let Ok(Some(status)) = child.try_wait() {
       return Some(status);
     }
-    if judged.judge() == process_wait::Verdict::Stalled {
+    if matches!(
+      judged.judge(),
+      process_wait::Verdict::Stalled | process_wait::Verdict::SpentItsBudget
+    ) {
       return None;
     }
     pause();

@@ -7168,8 +7168,9 @@
 >   claim, its host reactor waits until the signal and through a live daemon's deadlines, its listings and attachment
 >   counts are waited for and its stream ends read without a timeout, its daemon in-process (A-232); `start.rs`'
 >   `NOBODY_WAIT` is the deadline its test proves, and stays. In `cli/tests` since 2026-11-20 (g226), judged in the waited-on processes' own CPU
->   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone or stalled
->   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`; `recovered::await_recovered_while_alive`):
+>   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone, stalled
+>   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`, or has spent `CPU_BUDGET` without the answer, as
+>   `live_chaos`' `START_CPU` judges a start; `recovered::await_recovered_while_alive`):
 >   `held_rendezvous`, `merge_kill` (its killer's wait for the client's submit ends too at the client's end),
 >   `nfs_v4_restart` (Linux's, compiled here) and `nfs_held` (its NFS sockets read without a timeout, the anchor holding
 >   them across a restart, A-113); `cli`'s `START_WAIT` waits (`StartProgress` judges every process of the instance,
