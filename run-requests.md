@@ -6783,3 +6783,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - A-721 landed main 0cb5120b1: rerun w-perf's 5,000-revision svn import (refused record must no longer wedge commits) [w-svn]
 - 2026-11-20 w-shared A-664 holders' maps (main f0b23d651): clippy + xtask; Linux/Windows `cargo test -p slates-server --lib -- vcs_store::paths:: vcs_store::commits::`; the fleet gate by use (a git repository's owner killed, its successor answering a stock clone and taking the next submit)
 - 2026-11-20 w-git main 183150ab8 (A-719 part 2, unpack::Keep): clippy + xtask; Linux/Windows cargo test -p slates-git --lib -- unpack:: receive:: store:: upload::
+- 2026-11-20 w-shared A-664 sliced whole builds part 1 (main 469436cce): clippy + xtask; Linux/Windows `cargo test -p slates-server --lib -- vcs_store::paths:: vcs_store::tests`; recovery timing over a large git repository (recovery's longest slice CPU in the boot log)
