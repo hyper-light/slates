@@ -44,6 +44,8 @@ pub mod error;
 pub mod exit_watch;
 #[cfg(windows)]
 pub mod handle_route;
+#[cfg(target_os = "linux")]
+pub mod issuer_route;
 pub mod looks;
 /// The owner's token on macOS (A-176, A-178): a Mach bootstrap name that ends with its holder, so one live process
 /// owns an instance's rendezvous, as Windows's named Event token and Linux's abstract address make it there. A

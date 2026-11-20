@@ -15256,6 +15256,8 @@ blocks as the sink, the increment setting the path from the held identity, the r
   part 3, is the one left in one step).
 - **Cost:** the paced build (async deriver, merge sort, indexed base) builds a 3,500-file push in 85 ms where the
   one-call form took 66 ms (merge-level probe of the whole build, debug, unbounded pace).
+- **Part 2b** (git's trees listed an entry a unit, same command and machine, 2026-11-20): longest build unit 1.12 ->
+  0.22 ms, longest build turn 1.13 -> 0.49 ms, past budget 0, turns unchanged (158,681 and 163,182).
 
 ## Mercurial's own repository imported: the record 7.8 times smaller in three steps, the landing still one step (A-727, A-732, S5; UI goal 93; 2026-11-20)
 

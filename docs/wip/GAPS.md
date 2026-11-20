@@ -330,9 +330,10 @@
 >
 > **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
 > deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict
-> (`Judge::ready`), the deriver async under a `Pace`. OWED (part 2b): units still one object's size: a tree's
-> listing (`PushObjects::tree` gives a whole tree: a flat 1,500-entry tree 1.1 ms debug), a blob read and laid whole,
-> the green's hard links (none in git or Mercurial greens), a copy's tree (a push makes none). OWED (part 3): the
+> (`Judge::ready`), the deriver async under a `Pace`. Part 2b: git's trees listed an entry a unit
+> (`PushObjects::listing`), the longest build unit 1.12 -> 0.22 ms (flat 1,500 files, debug). OWED: units still one
+> object's size: a blob read and laid whole, a tree's bytes copied once, the green's hard links (none in git or
+> Mercurial greens), a copy's tree (a push makes none); Mercurial's trees still listed whole. OWED (part 3): the
 > entry apply (`apply_planned`: the engine's verdict and commit, the record) in one step, 92 ms for 1,500 files debug.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
@@ -1100,7 +1101,8 @@
 > fetches over it with OpenSSH 10.2p1 (macOS arm64, Mac Studio, kiln r1 over 43c86824e: `cargo test --locked -p
 > slates-cli --test git_interop -- --test-threads=1` 5 passed, 0 ignored, the SSH leg alone 1 of 1 in 7.4 s;
 > `cargo fmt -p slates-cli -- --check` clean). A credential is minted with the anchor's issuer surface, so on Linux, where
-> that surface is a descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln
+> that surface was a descriptor only the anchor's children hold, those legs skipped loudly (since A-754, 2026-11-20, the
+> Linux anchor prints its issuer route and secret, and they run). macOS arm64 (Mac Studio, kiln
 > r426 over main 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2
 > ignored; with `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication
 > failed for 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the

@@ -347,6 +347,20 @@ fn parse_mode(digits: &[u8]) -> u16 {
   u16::try_from(wide & u32::from(u16::MAX)).unwrap_or(u16::MAX)
 }
 
+/// The entry of the tree `bytes` that begins at `from` and where the next begins, read alone (A-752 part 2b: a tree
+/// listed an entry a unit, as [`Tree::parse`] reads each); none past the last entry; or the refusal [`Tree::parse`]
+/// gives the tree there.
+pub fn entry_after(
+  bytes: &[u8],
+  from: usize,
+  format: ObjectFormat,
+) -> Result<Option<(Entry<'_>, usize)>, ObjectRefused> {
+  if from >= bytes.len() {
+    return Ok(None);
+  }
+  entry_at(bytes, from, format).map(Some)
+}
+
 /// Every entry of `bytes` in order, ending at the first refusal.
 fn entries(
   bytes: &[u8],

@@ -9698,7 +9698,8 @@ that the current uid-based implementation enforces them.
 > `enroll`, `revoke` and `share`. Proven across real processes: the workload holds the capability in no
 > argument or environment value and owns what it creates; a sibling without the delivery is the
 > account; the Windows arm runs in the CI lanes. Owed: the SDKs' own spawn helpers, the fleet leg, MCP
-> roots, and the Linux issuer surface. Record: `docs/wip/enrollment.md` (2026-09-14 section).
+> roots, and the Linux issuer surface (built by A-754, 2026-11-20). Record: `docs/wip/enrollment.md` (2026-09-14
+> section).
 
 > **Status (2026-09-28).** The delivery name carries the channel's identity, not only its number. On Unix
 > it is `NUMBER:DEVICE:INODE:MTIME:MTIME_NSEC`, the pipe's `fstat` after the record is written. On Windows
@@ -10147,7 +10148,8 @@ would need a privilege slates never holds (R10).
 >
 > **Reconciled 2026-11-06 (VFS plan Step 15).** BUG-5 is swept (991c84e; GAP-A9-3), apart from the base entries' owner
 > fields and the mounted conformance run. BUG-11 is closed (9c97ce6b, 5127b4b3). `slates grant` issues a grant
-> (596bfb04); the Linux issuer surface stays owed (GAPS).
+> (596bfb04); the Linux issuer surface stays owed (GAPS). *Built by A-754 (2026-11-20): the anchor prints its issuer
+> route and secret, and a process that presents the secret over the route is handed the segment's descriptor.*
 
 > **Status (2026-11-18, A-287: the full entry list on demand).** Built: a presentation keeps its manifest's entries
 > (moved from the plan, never copied) and the conflict classes its preliminary pass found, for as long as A-46 keeps
@@ -56517,9 +56519,11 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   every platform): an anchor with all three listeners on loopback ports the system picks; the daemon killed; each port
   asked while no daemon runs and answered by the successor (`401`, `SSH-2.0-`, svnserve's greeting); the successor
   naming the same three ports. Green on Windows x86_64 (jupiter, kiln r33: 61321, 61322 and 61323 before and after the
-  kill, 2.10 s) and macOS arm64 (Mac Studio 2, 3.1 s). Pure: rt's `share` codec (a record whose every field differs,
-  back whole; a byte short or long refused) and the anchor's `shared_listeners` (three shares back in order; every cut
-  inside a record refused `Truncated`; too many, too long).
+  kill, 2.10 s) and macOS arm64 (Mac Studio 2, 3.1 s). Red on Windows (jupiter, kiln r36, the same tree with the anchor
+  role's change alone reversed, which is main's behaviour before: the anchor held no listener): the killed daemon's
+  successor named the HTTP edge at 62797 where its predecessor had served 62786, and the test failed (7.81 s). Pure:
+  rt's `share` codec (a record whose every field differs, back whole; a byte short or long refused) and the anchor's
+  `shared_listeners` (three shares back in order; every cut inside a record refused `Truncated`; too many, too long).
 - **Applied in the same change to** A-625 part 3's status and decision 3, `docs/wip/platforms.md` gap 2,
   `unsafe-budget.toml`, amendments.tsv.
 
@@ -56644,8 +56648,14 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   no build turn (the work built inside the verdict's step); after, about 160,000 build turns a push, `past_budget` 0,
   the longest build turn 1.13 ms, its longest unit one tree's listing. A build in one-unit turns equals the one-call
   build over every generated push history (`push::tests::land`).
-- **Owed, named.** Part 2b: units still one object's size: a tree's listing (`PushObjects::tree` gives a whole tree),
-  a blob read and laid whole, the green's hard links, a copy's tree. Part 3: the entry apply in turns: the verdict
+- **Part 2b, a tree an entry a unit.** `PushObjects::listing` gives a tree's entries to read one a unit (`Listing`):
+  git's view owns the tree's bytes (one copy) and decodes an entry at each read with `tree::entry_after`, the decoder
+  `Tree::parse` runs, charging each entry as the whole listing does; a store with no such decoder lists whole (the
+  trait's default; Mercurial's for now). A tree git's walk cannot read is refused at the entry where it stops, the same
+  `Malformed`. Measured: the longest build unit 1.12 -> 0.22 ms and the longest build turn 1.13 -> 0.49 ms (t_a752,
+  debug).
+- **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
+  hard links, a copy's tree. Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
   the commit (main's call asked: the green held out across the commit's turns, or staged and published whole); the
   record's encode and append.
@@ -56669,3 +56679,34 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
   captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
   `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.
+
+### A-754 — The Linux issuer surface: the anchor prints an issuer route and its secret, and a separate process that presents the secret is handed the segment (2026-11-20, w-reaper, main's ruling; §4.13 "Grants", A-299; closes the Linux issuer surface owed since 2026-09-13)
+
+- **Found by use.** w-interop: on Linux no user process could mint a credential (`slates credential token|key`). The
+  issuer surface was "a descriptor only the anchor's children hold", and `slates anchor` runs no child an operator
+  uses, so stock git, hg and svn could not authenticate to any edge there, and the Linux interop matrix could not run
+  (`PRINTS_ISSUER_SURFACE` false on Linux, every credential leg skipping).
+- **Change (main's ruling, matching macOS and Windows rather than widening anything).** At its start a Linux anchor
+  binds an abstract-namespace socket of its own, `slates-issuer-<instance>/<uid>` (`slates_ipc::issuer_route`), draws
+  a 256-bit secret from the system's generator, and prints both (`slates anchor: issuer surface: export
+  SLATES_ANCHOR_ISSUER_ROUTE=… SLATES_ANCHOR_ISSUER_SECRET=…`). Each turn of its loop it answers the claims waiting:
+  a peer whose user is the anchor's (`SO_PEERCRED`) and that sends the printed secret, compared in constant time, is
+  handed the segment's memfd (`SCM_RIGHTS`) and its length; any other is closed unanswered. A process given those
+  variables (`slates_api::Issuer::from_environment`) claims the descriptor at each proof, attaches the segment, reads
+  the daemon's issuer secret and lets both go. Same-uid alone is not enough: whoever holds the printed secret can issue,
+  exactly as whoever holds the printed name can on macOS and Windows; no anchor-child wrapper is needed. The route is
+  abstract, so no file names it, and it lives as long as the anchor.
+- **Tests.** `slates-ipc` `issuer_route::tests` (a printed secret read back, every wrong form refused, compared whole;
+  across a socket, the right secret handed the descriptor of the very object and its length, a wrong one nothing).
+  `crates/cli/tests/issuer_surface.rs` across processes, every platform: a separate `slates credential token` given
+  the printed surface mints a token, one given none is refused, and on Linux one given the route with a secret one bit
+  off, or the route alone, is refused. `PRINTS_ISSUER_SURFACE` is true on every platform in `tests/cli.rs`,
+  `git_interop`, `svn_interop`, `hg_interop` and `svn_http_reports`, so their credential legs run on Linux, where they
+  skipped. macOS arm64 (Mac Studio 2, main 8281ea29): `issuer_surface` 1 of 1. Linux x86_64 (CI ubuntu-latest, diag
+  run 44762814986 over 0ed39544): `slates-ipc --lib issuer_route` 2 of 2; `issuer_surface` 1 of 1; `git_interop` 6 of
+  6 with no leg skipped (stock git 2.56.1 minting its credential through the route and authenticating to both edges);
+  `svn_interop`'s legs skipped, ubuntu's Subversion not of the 1.15 line. The Linux code clippy-clean for
+  `x86_64-unknown-linux-gnu` from the Studio (`slates-ipc`, `slates-anchor`, `slates-mem`; `slates-api` and
+  `slates-cli` with `--no-deps`, main's `slates-git` holding a lint of its own).
+- **Applied in the same change to** §4.13's status (the Linux issuer surface owed since 2026-09-13), GAPS, the test
+  harnesses' `PRINTS_ISSUER_SURFACE` and their words, amendments.tsv.
