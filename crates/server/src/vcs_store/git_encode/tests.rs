@@ -80,28 +80,20 @@ fn a718_no_unit_of_a_56_mb_packs_encoding_outgrows_the_step_quantum() {
   request.extend_from_slice(b"0000");
   request.extend_from_slice(&pack);
   drop(pack);
-  // D-8's test-harness exception: the outcome is shared by two owners, the shard's task that writes it once and this
-  // test thread that reads it.
-  let done = std::sync::Arc::new(std::sync::Mutex::new(None));
+  // The shard's task sends the outcome once; this test thread waits for it.
+  let (told, done) = std::sync::mpsc::channel();
   let daemon = crate::daemon::audit_daemon();
-  let told = std::sync::Arc::clone(&done);
   crate::daemon::observe_first(&daemon, move |state| {
     let id = crate::git_push::tests::git_repository(state, "large");
     let task = async move {
-      let outcome = drive(id, request).await;
-      *told.lock().unwrap() = Some(outcome);
+      let _ = told.send(drive(id, request).await);
     };
     let _ = slates_rt::futures::detach(slates_rt::futures::spawn(task).unwrap());
   });
-  // Derived: a debug build's push and encoding of 56 MB, looked at a second apart for an hour at most.
-  let mut seen = None;
-  for _ in 0..3_600 {
-    if let Some(outcome) = done.lock().unwrap().take() {
-      seen = Some(outcome);
-      break;
-    }
-    std::thread::sleep(std::time::Duration::from_secs(1));
-  }
+  // Derived: a debug build's push and encoding of 56 MB, an hour at most.
+  let seen = done
+    .recv_timeout(std::time::Duration::from_secs(3_600))
+    .ok();
   daemon.stop();
   let (ok, past, turns, longest, quantum, counters) =
     seen.expect("the push and its encoding ended");
