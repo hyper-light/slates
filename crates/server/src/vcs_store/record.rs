@@ -57,6 +57,7 @@ const VERSION_INFLATED: u32 = 1;
 /// the count; written only once the names are durable at `f + 1` homes in the region (`super::homes`), so a replay on
 /// any node can read them. Read always; written only where the writer is asked for it (records stay version 2 until a
 /// takeover proves the region path).
+/// Format: this version's number on the wire.
 const VERSION_NAMED: u32 = 3;
 
 /// Format: the bytes of a word: the magic, the version.

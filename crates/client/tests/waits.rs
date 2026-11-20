@@ -88,11 +88,9 @@ fn one_shard_daemon(instance: &str) -> Daemon {
 
 /// A client of `instance` with `deadlines`, retrying the rendezvous while the daemon starts.
 fn connect(instance: &str, deadlines: Deadlines) -> Client {
-  loop {
-    match Client::connect(instance, deadlines) {
-      Ok(client) => return client,
-      Err(e) => panic!("{e}"),
-    }
+  match Client::connect(instance, deadlines) {
+    Ok(client) => client,
+    Err(e) => panic!("{e}"),
   }
 }
 

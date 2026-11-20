@@ -1389,7 +1389,8 @@ impl Grown {
     let node = |seed: u64| {
       let mut node = [0; 20];
       for (at, byte) in node.iter_mut().enumerate() {
-        *byte = (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (at % 8 * 8)) as u8 ^ at as u8;
+        *byte = (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (at % 8 * 8)).to_le_bytes()[0]
+          ^ at.to_le_bytes()[0];
       }
       node
     };
@@ -1398,7 +1399,9 @@ impl Grown {
       texts: Vec::new(),
       manifests: Vec::new(),
       files: Vec::new(),
-      bytes: (0..GROWN_FILE).map(|at| (at % 251) as u8 | 1).collect(),
+      bytes: (0..GROWN_FILE)
+        .map(|at| u8::try_from(at % 251).unwrap() | 1)
+        .collect(),
     };
     let mut listing = Vec::new();
     for rev in 0..GROWN_CHANGESETS {
@@ -1428,13 +1431,13 @@ impl Grown {
       .changesets
       .iter()
       .position(|held| held == node)
-      .map(|at| at as Rev)
+      .map(|at| Rev::try_from(at).unwrap())
   }
 }
 
 impl Repository for Grown {
   fn count(&self) -> Rev {
-    self.changesets.len() as Rev
+    Rev::try_from(self.changesets.len()).unwrap()
   }
   fn node(&self, rev: Rev) -> Option<Node> {
     self.changesets.get(rev as usize).copied()
@@ -1528,7 +1531,7 @@ impl Store for Grown {
     let (node, _) = self.manifests.get(at)?;
     Some(slates_hg::serve::getbundle::Linked {
       node: *node,
-      link: Some(at as Rev),
+      link: Some(Rev::try_from(at).unwrap()),
     })
   }
 
@@ -1547,7 +1550,7 @@ impl Store for Grown {
           0,
           slates_hg::serve::getbundle::Linked {
             node: *node,
-            link: Some(at as Rev),
+            link: Some(Rev::try_from(at).unwrap()),
           },
         )
       })
@@ -1633,7 +1636,7 @@ fn transcript_adjusting(peer: &mut Peer) -> Transcript {
         } else {
           transcript.err.extend_from_slice(&data);
         }
-        unadjusted += data.len() as u32;
+        unadjusted += u32::try_from(data.len()).unwrap();
         if unadjusted >= super::CLIENT_WINDOW / 2 {
           let mut adjust = vec![93];
           adjust.extend_from_slice(&peer.channel.to_be_bytes());
@@ -1642,7 +1645,7 @@ fn transcript_adjusting(peer: &mut Peer) -> Transcript {
           unadjusted = 0;
           // A client whose reader is slower than the wire, as hg behind OpenSSH's pipe is: the socket's buffers fill
           // while it pauses, so the server's writes wait on the socket, not on the window.
-          std::thread::sleep(Duration::from_millis(GROWN_PAUSE_MS));
+          super::pause(GROWN_PAUSE_MS.saturating_mul(1_000_000));
         }
       }
       98 if string(5) == b"exit-status" => {
@@ -1705,7 +1708,7 @@ fn an_ssh_clone_past_many_windows_is_answered_whole() {
     "{sent} bytes of the answer read"
   );
   assert!(
-    sent > GROWN_CHANGESETS as usize * GROWN_FILE,
+    sent > usize::try_from(GROWN_CHANGESETS).unwrap() * GROWN_FILE,
     "{sent} bytes of the answer read"
   );
 }
