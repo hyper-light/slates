@@ -102,14 +102,13 @@ const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves o
 /// (`credential token|key`) refuse without them.
 const ISSUER_SURFACE_LINE: &str = "slates anchor: issuer surface: export ";
 
-/// Shape: whether the anchor names its issuer surface through the environment: on macOS and Windows; on Linux the
-/// surface is a descriptor only its children hold (`tests/cli.rs`, `PRINTS_ISSUER_SURFACE`, which records why this is
-/// a platform fact and never read from the order of two processes' lines).
-const PRINTS_ISSUER_SURFACE: bool = cfg!(not(target_os = "linux"));
+/// Shape: whether the anchor names its issuer surface through the environment: on every platform since A-754 (macOS
+/// and Windows the segment's name, Linux its issuer route and secret; `tests/cli.rs`, `PRINTS_ISSUER_SURFACE`).
+const PRINTS_ISSUER_SURFACE: bool = true;
 
 /// Format: why a leg that mints a credential skips where the anchor names no issuer surface ([`PRINTS_ISSUER_SURFACE`]).
 const NO_ISSUER_SURFACE: &str = "this platform publishes no issuer surface through the environment, so a separate \
-  process cannot mint a credential (on Linux it is a descriptor only the anchor's children hold)";
+  process cannot mint a credential";
 
 /// A scratch directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a
 /// count, removed when dropped, even when an assertion fails (A-50: a test's host files live in the build output, never
