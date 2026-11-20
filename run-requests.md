@@ -6780,3 +6780,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-fed-faults A-580/A-708 (kiln main 30c5929, e33c470): owed (main): Linux x86_64 `SLATES_FLEET_FAULTS=1 cargo test -p kiln --test slates_fleet_faults -- --nocapture --test-threads 1` (six flows: killed, partitioned, restarted, move cut midway, slow lossy link, runner cut off; never run yet); kiln clippy on the change.
 - 2026-11-20 w-git main 20ffba05f (A-719 part 1, push checks sliced): clippy + xtask; Linux/Windows cargo test -p slates-git --lib -- receive:: and -p slates-server --lib -- git_push:: vcs_http::git:: vcs_ssh::receive; git-matrix push rows by use
 - 2026-11-20 w-reaper tick-name cleanup (main 4c6445f): owed (main): Linux compile of crates/server/tests/recovery.rs (IDLE_INTERVALS_WATCHED, cfg linux); clippy.
+- A-721 landed main 0cb5120b1: rerun w-perf's 5,000-revision svn import (refused record must no longer wedge commits) [w-svn]

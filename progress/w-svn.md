@@ -87,3 +87,10 @@
 
 ## NOW: wedge bug (main): green advanced but svn record rolled back ("record 3560 not published ... profile exceeds
 ## region"), then every commit E160004 Diverged. Fix: one atom. Worktree ~/slates-work/w-svn-atom from origin/main.
+
+## A-721 wedge fix -- LANDED main 0cb5120b1 (commit 3169466fe, verified on origin/main; ledger A-721 pushed bb4bb3a)
+- verbs::reconcile_unpublished_effects -> remake_greens_ahead (lone engine / single-member lineage replayed from
+  checkpoint+chain; wider lineages counted green_ahead_kept, owed). Test a_revision_refused_at_publication_...
+  red then green; local 10/10 + 21/21, rechecked after the final merge.
+- DAV pieces (A-681 rows) moved to w-interop by main. NEXT: A-693 part 2 from agents/w-svn-a693p2-wip (worktree
+  ~/slates-work/w-svn-a714).

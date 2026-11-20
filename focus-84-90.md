@@ -975,3 +975,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - ~01:30 PST w-hg p2 plan APPROVED: fork per push, concurrent intake; ordered landing rebases the fork by node
   (renumber rows; reuse stored content; skip revisions already landed; sliced) when the index moved. Added: judge
   bundle2 check:heads / check:updated-heads at landing against current heads; advertise checkheads=related.
+- ~01:40 PST A-721 LANDED 0cb5120b1 (w-svn, 3169466fe): E160004 wedge fixed: reconcile_unpublished_effects remakes a
+  green whose engine is past its durable head from checkpoint + chain (lone engine / single-member lineage = every svn
+  repo). Owed (GAPS): multi-member lineages (git branches) counted (merge.unpublished.green_ahead_kept) not remade; a
+  submit's vcs_store paths/commits not taken back -> left for use to find (likely at git's region wall). w-perf to
+  confirm by the 5,000-rev import at its next release build. w-svn next: A-693 p2 (svn:// lock).
