@@ -1956,7 +1956,12 @@
 > measuring walk a window a call before the record's call (the step run first on copies, its writes dropped, to learn
 > its delta's texts); held by `a_large_delta_is_measured_and_written_a_window_a_call` (a five-window change: 15 calls,
 > each within a window and `CALL_HEADROOM`, where by count the record's call measured all five). The dump export's
-> calls are bounded by a window now; a call's time against the shard's slice is main's to measure in release. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> calls are bounded by a window now; a call's time against the shard's slice is measured in release (BENCHMARKS).
+> **Found by reading, not chased (2026-11-20, g268's queue, by main's ruling):** a commit's drive judges a path's lock
+> at the commit's start (`commit::drive`'s `setup.now`), where FSFS judges each call at its own instant (`lock.c` 457),
+> so a lock that expires while a commit is driven could refuse a change FSFS takes. `svnserve` never makes an expiring
+> lock (both its lock calls pass expiration 0); only a DAV `LOCK` with a `Timeout` does, so the case needs a timed DAV
+> lock and a commit spanning its expiry, off the scale path. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
