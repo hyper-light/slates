@@ -1,5 +1,20 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## (a) PUSH HALF DESIGN (in progress, worktree ~/slates-work/g261-a636p2b2, nothing committed yet for it)
+- New child module crates/server/src/vcs_store/paths/whole_build.rs (child of paths: uses Plan::Put, made_holding,
+  give_back, git_file, map_path, put_file, count, BUILT). Builds(BTreeMap<green, Build>) in VcsStores.whole_builds.
+  Build{repository, version, paths: Vec<String> engine paths (whole_head's names), at, entries, held, parked, task}.
+- push.rs:749 calls paths::advance_after_push: whole plan -> whole_build::start (spawn task: loop with_state_counted(slice)
+  + yield_now, like git_encode::settle_encodings; TaskId kept, detached; cancel on abandon); else step inline.
+- slice: take the build out of the map; head moved -> restart at new head; put files (lend per file, settle_in at end)
+  until slates_rt::futures::step_budget_ns spent (>=1); done -> made_holding(Plan::Put) keep head, count BUILT, resume parked.
+- Park: owner_judge (remote work path) before db.begin; local submit() before take_sealed (park the verb's args, set
+  acceptance_deferred). Parked enum {Owner{sealed,evidence,policy}, Local{principal,work,evidence,signature,authorship,
+  approval}} + origin,id, route Option<ReplyRoute>. Bound: clients_per_shard x region.slots (base_wait's), refuse Overloaded.
+  Resume: owner_judge / a local transaction (begin, current_request, reply_route, submit, record_completion unless deferred,
+  commit), deliver via xshard::hand_reply_home like merge_service resolve (~3437).
+- vcs_store::free -> whole_build::abandon(repository): give back held, cancel task, resume parked.
+
 ## LANDED 2026-11-20: svn:author = cb1cc1782 (main 707d513ab). hg half -> w-hg (main's ruling; seam note sent). Main APPROVED (a)
   design: owed commit staged durably in the submit's transaction (green, version, message, identity, second); completion
   entry settles it in the same transaction as the made commit; replay never reads the clock (determinism test: crash after
