@@ -421,8 +421,8 @@ fn ready<F: Future>(future: F) -> F::Output {
   panic!("the tests' exchanges answer within {POLLS} polls");
 }
 
-/// How the site decided `method target` with `fields`, on a TLS connection: moved to a shard, refused with a status,
-/// or served; and whether the credentials proved a principal.
+/// How the site decided `method target` with `fields`, on any connection (the site reads none since A-686): moved to a
+/// shard, refused with a status, or served; and whether the credentials proved a principal.
 fn decided(
   site: &mut SvnSite<Tokens, Held, Stores>,
   method: &str,
@@ -430,7 +430,7 @@ fn decided(
   fields: &[&str],
 ) -> (String, bool) {
   let bytes = request(method, target, fields);
-  let decided: Decided<SvnExchange<Stores>> = ready(site.answer(&head(&bytes), true));
+  let decided: Decided<SvnExchange<Stores>> = ready(site.answer(&head(&bytes)));
   let outcome = match decided.answer {
     Answer::Move { shard } => format!("moved {shard}"),
     Answer::Refuse { status, .. } => format!("refused {}", status.code),
@@ -684,7 +684,7 @@ fn exchanged(
   let mut fields = vec![owner.as_str()];
   fields.extend(depth.as_deref());
   let bytes = request(method, target, &fields);
-  let Answer::Serve { mut exchange, .. } = ready(site.answer(&head(&bytes), true)).answer else {
+  let Answer::Serve { mut exchange, .. } = ready(site.answer(&head(&bytes))).answer else {
     panic!("{method} {target} not served");
   };
   if !body.is_empty() {
