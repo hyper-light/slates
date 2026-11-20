@@ -177,7 +177,10 @@
 > live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
 > in place); the landing appends that, where it appended every text whole. An import's record (version 3) writes a
 > manifest the index keeps as a delta as that delta and its base's node, never rebuilt (Mercurial's own manifests:
-> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. A made changeset's
+> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. A file revision is
+> written as one hunk against the revision before it in its log, from their common prefix to their common suffix
+> (`delta::encode_span`), where that is shorter than its text (found by use, w-perf: Mercurial's import record was
+> 4,657,833,574 bytes with file texts whole, and its landing's one-step append spun the shard). A made changeset's
 > record (version 3 too) writes its manifest as its delta against its first parent's text (`write_made`'s `parent`,
 > read from the index; replayed through the same rebuild, held by A-731's rebuild test). Owed: the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.
@@ -190,8 +193,10 @@
 > (`record::Writer::begin_kept`, `hg_push::record_sliced`), again after a re-base, where the landing wrote it whole.
 > Part 3 FIXED: a Mercurial store's rebuild (`vcs_store::rebuild`, after a commit refused past its store's step)
 > replays its records a step a turn in a task, the store lent to nothing meanwhile (`VcsStores::rebuilding`), its
-> generation moved after. The landing's append is now the size of the push's changegroup (A-729 part 2). Owed:
-> w-perf's and w-interop's by-use reruns.
+> generation moved after. The landing's append is now the size of the push's changegroup (A-729 part 2). Owed: an
+> import's landing appends its whole record as one entry in one step (w-perf, 2026-11-20: 4.66 GB spun shard 9 past
+> its window; the record is now cut by file deltas, but its append is still unbounded: parts across entries, or
+> identity-only records once A-727 a3 lands, main's ruling asked); w-perf's and w-interop's by-use reruns.
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)

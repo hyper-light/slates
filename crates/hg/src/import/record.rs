@@ -333,6 +333,8 @@ pub struct Writer {
   done: bool,
   /// Whether a revision kept as a delta is written as its delta ([`DELTA_VERSION`], an import's) or rebuilt whole.
   deltas: bool,
+  /// A file log's revision written last and its text: the next one's base, where its delta is shorter than its text.
+  last: Option<(Node, Vec<u8>)>,
 }
 
 impl Writer {
@@ -391,6 +393,7 @@ impl Writer {
       out,
       done: false,
       deltas,
+      last: None,
     })
   }
 
@@ -429,13 +432,16 @@ impl Writer {
     if rev == first {
       write_group_head(&mut part, log, u64::from(len.saturating_sub(first)));
     }
+    if rev == first {
+      self.last = None;
+    }
     if rev < len {
       let kept =
         kept(index, store, log, rev, !self.deltas).ok_or_else(|| unreadable(&radix, rev))?;
-      let written = if self.deltas {
-        write_formed_revision(&mut part, store, &kept)
-      } else {
-        write_kept_revision(&mut part, store, &kept)
+      let written = match log {
+        Log::File(_) if self.deltas => self.write_file(&mut part, store, &kept),
+        _ if self.deltas => write_formed_revision(&mut part, store, &kept),
+        _ => write_kept_revision(&mut part, store, &kept),
       };
       written.ok_or_else(|| unreadable(&radix, rev))?;
       self.at = (at, rev.saturating_add(1));
@@ -446,6 +452,46 @@ impl Writer {
     }
     self.put(&part)?;
     Ok(true)
+  }
+
+  /// A file revision of an import's record (A-729 part 2): its delta against the revision written before it in its log
+  /// where that is shorter than its text ([`crate::delta::encode_span`]), else whole; its text kept for the next. None
+  /// where its text is not its length.
+  fn write_file(&mut self, out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> Option<()> {
+    let mut text = Vec::new();
+    if write_text(&mut text, store, kept) != kept.len {
+      return None;
+    }
+    let mut delta = Vec::new();
+    let base = match &self.last {
+      Some((node, last)) => {
+        crate::delta::encode_span(last, &text, &mut delta).ok()?;
+        (delta.len() < text.len()).then_some(*node)
+      }
+      None => None,
+    };
+    out.extend_from_slice(&kept.node);
+    out.extend_from_slice(&kept.p1);
+    out.extend_from_slice(&kept.p2);
+    if let Some(link) = kept.link {
+      out.extend_from_slice(&link);
+    }
+    out.extend_from_slice(&kept.flags.to_le_bytes());
+    match base {
+      Some(base) => {
+        out.push(DELTA_FORM);
+        out.extend_from_slice(&base);
+        out.extend_from_slice(&to_u64(delta.len()).to_le_bytes());
+        out.extend_from_slice(&delta);
+      }
+      None => {
+        out.push(TEXT_FORM);
+        out.extend_from_slice(&kept.len.to_le_bytes());
+        out.extend_from_slice(&text);
+      }
+    }
+    self.last = Some((kept.node, text));
+    Some(())
   }
 
   /// Whether the record is an import's, whose markers it holds.
@@ -1463,10 +1509,10 @@ impl Revisions {
     let linked = log != Log::Changelog;
     let read = reader.revision(linked, self.formed)?;
     let rev = self.fork.len(store, log);
-    if log == Log::Manifest {
-      self.manifest(store, radix.as_slice(), (rev, &read))?;
+    if self.formed && linked {
+      self.formed_revision(store, (log, radix.as_slice()), (rev, &read))?;
     } else if read.base.is_some() {
-      // Only a manifest is kept as a delta, so only a manifest is written as one.
+      // A changeset is never written as a delta, nor any revision before the form byte.
       return Err(Refused::Base {
         revlog: radix.into_boxed_slice(),
         rev,
@@ -1484,12 +1530,13 @@ impl Revisions {
     Ok(())
   }
 
-  /// One manifest, given whole or as its delta against the one replayed last or one the fork holds: rebuilt, then
-  /// kept and appended as [`replay`] keeps it, its text held for the next.
-  fn manifest(
+  /// One manifest or file revision of a record that names forms, given whole or as its delta against the revision
+  /// replayed last or one the fork holds: rebuilt, then kept and appended as [`replay`] keeps it, its text held for the
+  /// next.
+  fn formed_revision(
     &mut self,
     store: &mut ContentStore,
-    radix: &[u8],
+    (log, radix): (Log<'_>, &[u8]),
     (rev, read): (u32, &Read<'_>),
   ) -> Result<(), Refused> {
     let text = match read.base {
@@ -1503,13 +1550,10 @@ impl Revisions {
         let base_text: &[u8] = match &self.last {
           Some((node, text)) if *node == base => text,
           _ => {
-            let number = self
-              .fork
-              .rev(store, Log::Manifest, &base)
-              .ok_or_else(unheld)?;
+            let number = self.fork.rev(store, log, &base).ok_or_else(unheld)?;
             held = self
               .fork
-              .revision_text(store, Log::Manifest, number)
+              .revision_text(store, log, number)
               .ok_or_else(unheld)?;
             &held
           }
@@ -1527,7 +1571,7 @@ impl Revisions {
       base: None,
       ..*read
     };
-    replay_revision(&mut self.fork, store, (Log::Manifest, radix), (rev, &whole))?;
+    replay_revision(&mut self.fork, store, (log, radix), (rev, &whole))?;
     self.last = Some((read.node, text));
     Ok(())
   }
