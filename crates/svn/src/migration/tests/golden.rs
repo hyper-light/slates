@@ -389,6 +389,14 @@ impl crate::migration::TextSource for HeldApart {
       .get(identity)
       .map(|text| std::borrow::Cow::Borrowed(text.as_slice()))
   }
+
+  fn read_step(
+    &self,
+    identity: &crate::index::ContentIdentity,
+    reading: &mut crate::migration::TextReading,
+  ) -> Option<bool> {
+    self.0.get(identity).map(|text| reading.copy_step(text))
+  }
 }
 
 /// S4 (A-716's seam: a text held once, named by identity). Do: import `full.dump`; take a text a revision names; read
