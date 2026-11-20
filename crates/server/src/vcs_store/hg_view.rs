@@ -89,8 +89,8 @@ impl HgStores for ServedViews {
     outcome
   }
 
-  fn push_room(&self) -> Option<u64> {
-    crate::state::with_state(|state| crate::git_push::push_room(state))
+  fn push_room(&self, id: RepositoryId) -> Option<u64> {
+    crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes)
   }
 }
 
