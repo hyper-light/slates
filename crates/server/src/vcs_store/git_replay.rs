@@ -7,8 +7,8 @@
 //! pack is read again from the register's bytes at each turn by its place in them, never copied. Once the pack's
 //! objects are in, the names the admission would record are compared with the record's; the push is sealed and staged
 //! a unit at a time as a live push is (`slates_git::store::Staging`); then the moves and the commit follow, as
-//! [`super::replay_push`] runs them. Owed their own slices: a thin pack's resolve of its outside bases
-//! (`Reader::finish_with`), the moves' admission and the landing's whole passes.
+//! [`super::replay_push`] runs them. A pack's waiting deltas resolve a delta a unit (`Reader::resolve_turn_with`, w-balance's
+//! resolution in turns). Owed their own slices: the moves' admission and the landing's whole passes.
 //!
 //! **Not stepped.** An owed commit's record, an LFS record and a record carrying no pack replay whole in their turn,
 //! as before: none holds a pack's objects.
@@ -59,6 +59,7 @@ impl core::fmt::Debug for GitReplay {
       Stage::Reading { read, .. } => format!("reading at {read}"),
       Stage::Admitting { objects, next } => format!("admitting {next} of {}", objects.len()),
       Stage::Sealing { .. } => "sealing".to_owned(),
+      Stage::Resolving { .. } => "resolving".to_owned(),
     };
     f.debug_struct("GitReplay")
       .field("names", &self.names.len())
@@ -70,6 +71,13 @@ impl core::fmt::Debug for GitReplay {
 
 /// A replay's stage.
 enum Stage {
+  /// The pack whole, its waiting deltas resolved a delta a unit (`Reader::resolve_turn_with`).
+  Resolving {
+    /// Git's reader of the pack (boxed, as reading's is).
+    reader: Box<Reader<'static, NoIndex>>,
+    /// What the reading holds.
+    admission: Admission,
+  },
   /// The push sealed and staged a unit at a time, once every object is in and the names compared.
   Sealing {
     /// The seal and stage under way (boxed: it is most of the stage's size).
@@ -191,8 +199,10 @@ impl GitReplay {
         let took = reader
           .read(piece, &mut admission)
           .map_err(ReplayRefused::Pack)?;
-        if reader.is_whole() || piece.is_empty() || took == 0 {
-          // Whole, or no more to give it: ended, a pack cut short refused by its end.
+        if reader.is_whole() {
+          (Stage::Resolving { reader, admission }, false)
+        } else if piece.is_empty() || took == 0 {
+          // No more to give it: ended, a pack cut short refused by its end.
           let bases = StoreBases(slates_git::store::views::IndexedObjects::new(
             &store.repository,
             content,
@@ -254,6 +264,40 @@ impl GitReplay {
           )
         }
       },
+      Stage::Resolving {
+        mut reader,
+        mut admission,
+      } => {
+        let bases = StoreBases(slates_git::store::views::IndexedObjects::new(
+          &store.repository,
+          content,
+          content.room(),
+        ));
+        let mut still = Still;
+        let quantum = slates_git::store::hook_view::Quantum {
+          clock: &mut still,
+          ns: 0,
+        };
+        let resolved = reader
+          .resolve_turn_with(&bases, &mut admission, quantum)
+          .map_err(ReplayRefused::Pack)?;
+        if !resolved {
+          return {
+            self.stage = Stage::Resolving { reader, admission };
+            Ok(false)
+          };
+        }
+        let unpacked = reader
+          .finish_with(&bases, &mut admission)
+          .map_err(ReplayRefused::Pack)?;
+        (
+          Stage::Admitting {
+            objects: unpacked.objects,
+            next: 0,
+          },
+          false,
+        )
+      }
       Stage::Sealing { mut staging } => {
         let mut still = Still;
         let quantum = slates_git::store::hook_view::Quantum {
