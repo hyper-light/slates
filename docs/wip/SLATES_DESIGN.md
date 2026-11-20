@@ -12418,6 +12418,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > whole-window steps made several of about 3 ms. Their deltas are the whole-window path's byte for byte, and the
 > recorded svnserve sessions (replay, `get-file-revs`, svndiff 0) are unchanged. The dump exporter computes its own
 > windows (`migration::export`, `deltas_at`); its format 3 adopting the maker is w-svn's.
+> **The tests hold units, not time (same day, A-751, main's red from w-perf).** The four window tests timed each step
+> against 500 us in a debug build, and failed on main under w-perf's load. They now hold each step to its own unit
+> count, which contention cannot change. The maker counts the units its steps take (`WindowMaking::units_taken`), and a
+> step takes at most those it was given plus one block's look-up (`svndiff::STEP_OVERRUN`). A window step of the drives
+> and of `get-file-revs` takes at most `report::drive::WINDOW_STEP_UNITS` (1,088): bytes read or sent, or the maker's
+> units. Red with whole-window steps: 205,172 units in a step, and 329,608 in the maker's own test. The bound found a
+> hole: a failed block look-up went back to the walk's top unchecked, so a run of misses could fill one step; the walk
+> now checks its units there. Time stays the by-use signal, read in release: the diagnostics runs' past-budget counters,
+> and `window_step_times` (`--ignored`, release). On an M-series Mac, `big.txt` r5 to r6 took 1,310 calls; 5 were past
+> 5 us, the longest 54 us.
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
