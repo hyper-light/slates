@@ -404,17 +404,12 @@ impl Held {
     })
   }
 
-  /// The positions held, as runs, the set given up.
+  /// The positions held, the set given up: its bit table handed over as it is, never turned back into a run a position
+  /// (A-745 item 4: a plan of scattered positions costs at most what each object's handle cost).
   pub(super) fn into_positions(self) -> Positions {
     match self.form {
       Form::Runs(runs) => runs,
-      Form::Bits { .. } => {
-        let mut runs = Positions::new();
-        for position in self.iter() {
-          runs.insert(position);
-        }
-        runs
-      }
+      Form::Bits { start, words } => Positions::of_bits(start, words),
     }
   }
 
