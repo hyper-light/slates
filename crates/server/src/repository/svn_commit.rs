@@ -303,6 +303,62 @@ pub(crate) fn commit(
   landed
 }
 
+/// A revision the server made of a version a work submitted to `repository`'s green (A-664's Subversion objects,
+/// `crate::vcs_store::svn_made`): checked as an import's is, its record appended in the submit's own transaction in an
+/// entry of the register holding it alone (the version moved the green already), then applied. Its revision.
+pub(crate) fn land_made(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  revision: Revision,
+) -> Result<u64, Uncommitted> {
+  if !crate::vcs_store::lend_svn(state, repository, brought(&revision)) {
+    return Err(Uncommitted::NotHeld);
+  }
+  let landed = checked(state, repository, revision, None)
+    .and_then(|checked| append_made(state, repository, checked));
+  crate::vcs_store::settle_svn(state, repository);
+  landed
+}
+
+/// [`land_made`]'s entry: the record's bytes admitted and its growth charged, the entry appended in the running
+/// transaction, then the records applied; an apply refused once the entry recorded it is counted and the records are
+/// made again from the log.
+fn append_made(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (checked, record): (Checked, Vec<u8>),
+) -> Result<u64, Uncommitted> {
+  crate::vcs_store::admit_objects(state, record.len())
+    .map_err(|available| Uncommitted::Budget { available })?;
+  let growth = grown(&checked);
+  crate::vcs_store::reserve_svn(state, repository, growth)
+    .map_err(|available| Uncommitted::Budget { available })?;
+  let entry = slates_db::op::Op::RepositoryAdvanced {
+    entry: slates_db::catalog::RepositoryEntry {
+      repository,
+      objects: record,
+      ..slates_db::catalog::RepositoryEntry::default()
+    },
+  };
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  if let Err(error) = state.db.mutate(&mut state.segment, &entry, now) {
+    crate::vcs_store::unreserve_svn(state, repository, growth);
+    let refusal = crate::error::refusal_of_db(&error);
+    return Err(Uncommitted::Append(AppendRefused::Entry(refusal)));
+  }
+  let revision = checked.revision();
+  let applied = state
+    .vcs_stores
+    .subversion(repository)
+    .and_then(|svn| svn.records.as_mut())
+    .map(|records| records.apply(checked));
+  if applied != Some(Ok(revision)) {
+    state.count(APPLY_REFUSED, 1);
+    crate::vcs_store::rebuild(state, repository);
+  }
+  Ok(revision)
+}
+
 /// The repository's one green (item 1): its default branch's, here and not fenced. `NotHeld` otherwise, and for a
 /// repository not here or not Subversion's.
 fn green_of(state: &ShardState, repository: RepositoryId) -> Result<DbVolumeId, Uncommitted> {

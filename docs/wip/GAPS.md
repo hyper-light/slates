@@ -60,7 +60,12 @@
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's, a green's first submit's, past a copy) and a whole map's release sliced a unit at a time, and the build of
 > the put files in slices of its own (a recovery's remake puts the files a unit each, BUILT 2026-11-20); a branch's first
-> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
+> Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
+> `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
+> read before from the records and after from the green, recorded in the submit's transaction), its copies as rows with
+> their sources, symbolic links as `svn:special` files and `svn:author` owed; Mercurial's changesets of a submitted
+> version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
 > commit is not made, counted); a `.gitmodules` blob's own checks; blob ids read by content from the git
