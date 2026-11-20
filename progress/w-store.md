@@ -7,6 +7,15 @@
 - Mantle origin cloned: ~/.cache/w-store-mantle at 87ab09e1 (2026-11-08) = the vendoring pin. Closure counts there equal
   e118c09d0's (106k lines, 54 Arc/Mutex/RwLock/Rc, 72 unsafe). hyper-rt is a dep of engine and hyper-block: to be cut (D-9).
 
+- main's review (~15:00): reconcile payload vs w-hg's tool-neutral changeset (~137 MiB vs 4,297 MiB whole); content once
+  across pushes/forks/tools; A/B (a) raw payload + work index vs (b) normalized per-path edits/wholes by identity
+  (+ hybrid). Agree with w-hg/w-git/w-svn, record in A-767, then build.
+- A/B phase 1 script: scratch-w-store/ab/changeset_ab.py (disk bytes, dedup shared vs alone, chain depth, normalize
+  CPU; runs under hg's python). Smoke on mantle ranges OK. Phase 2 (Rust: landing CPU/alloc/RSS, serving, old read).
+- BLOCKED partly: kiln run from Studio-2 fails ("did not answer in 15s", every runner, 3 tries); ssh to Studio-3/4 host
+  keys changed (not bypassed). hg arm + cross-tool need a Studio with hg (datasets ~/.cache/w-interop on the big
+  Studio). Running the git half here: git.git cloned to ~/.cache/w-store-ab/.
+
 ## Earlier
 - A-767 claimed on the ledger (state branch 3a6db5515).
 - Worktree: ~/slates-work/w-store-design (detached at origin/main 6337049f6). Design draft:
