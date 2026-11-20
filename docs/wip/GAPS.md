@@ -152,7 +152,8 @@
 > upload-pack, HTTP and SSH, admits each request what its repository's shard could admit (`StoreLender::room`), as A-704
 > admits a push. A-745 git piece 1 (2026-11-20, w-k90-vendor): the plan carries its objects as runs of positions, never a
 > handle an object; piece 2a: the negotiation's walk keeps its sets as runs, its stacks charged at their deepest (a 3,000-
-> commit clone negotiated within 4 KiB). Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> commit clone negotiated within 4 KiB); piece 2b part 1: the choice of the pack's objects a unit at a time
+> (`negotiation::begin`, `Negotiating::step`). Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
