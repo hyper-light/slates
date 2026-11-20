@@ -46,6 +46,9 @@
 > A-682's lender fetches it; a commit git would refuse or the budget refuses not made, counted, the version standing.
 > A branch's first map derived from its source's (2026-11-20, w-shared): BUILT where the source's head is the version the
 > branch was made at (its version 0); built whole otherwise (`paths::branch_before`; macOS arm64, this Mac, local).
+> The holders' maps (2026-11-20, w-shared): BUILT through A-636 part 2c-2's rebuild: a successor's rebuilt repository
+> makes its store and each member green's map and trees from its adopted head (`vcs_store::make_whole`), as a rebuild
+> does (macOS arm64, this Mac, local).
 > OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); the holders'
@@ -54,8 +57,7 @@
 > creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' whole builds and a
 > whole map's release sliced a unit at a time (each is one step, as A-662's replay of a record is); a branch's first
-> map derived from its source's where the source's head is the version it was made at; the holders' maps (A-636's
-> fleet half); a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
 > commit is not made, counted); a `.gitmodules` blob's own checks; blob ids read by content from the git
@@ -66,6 +68,10 @@
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. The partition's records shipped a log at a time BUILT (A-636 part 2b): each state log's record of each operation, carrying the operation's identity and spans, held by its holders as a prefix of the log; every server dispatch by the register's class. OWED: a repository's greens placed on its holders at their joins (A-636 part 2b-2), then the server's takeover by the rule, every log of a repository following one successor (2c).
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
+>
+> **A-719 part 2 (2026-11-20, w-git).** BUILT: the pack reader's keeper seam (`unpack::Keep`): each object handed to its
+> keeper as it resolves and a delta's base read back from it, so a keeper that stores elsewhere bounds the reader's
+> working set; §4.17.1's intake rule written. Owed: part 3, git's intake keeping into the store as it reads.
 >
 > **A-719 part 1 (2026-11-20, w-git; stock git's push of git/git spun its shard, found by use).** BUILT: a push's
 > checks (every object fsck'd, then the connectivity walk's passes) made a turn at a time under the shard's step quantum
@@ -1400,6 +1406,11 @@
 > (`ToolSites`, a request Subversion's by a method no other client sends or its `!svn` segment, `svn::dav_request`;
 > `DaemonSvnSite` over `ServedRecords`): stock svn 1.15's `info`, `ls`, `cat`, `log` and `log -v` over HTTP pass (svn
 > matrix, ROUTE=http, Mac Studio); checkout, update, diff and export wait on the update-report, commits on POST.
+> **A-681, the update-report (w-interop, 2026-11-20):** `dav::update` answers an update-report on `!svn/me` (or a
+> node's URL) from A-616's drive through A-627's writer, streamed a slice at a time (`Drive::take_written`), its
+> working-copy state checked by the ra_svn reporter's own rules (`report::whole_report`); OPTIONS says
+> `SVN-Allow-Bulk-Updates: Prefer`, so stock svn asks send-all. Stock svn 1.15's checkout (2,000 git/git revisions'
+> trunk in 5 s), export and update over HTTP pass; blame and diff ask reports still `501`; commits wait on POST.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

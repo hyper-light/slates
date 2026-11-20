@@ -40,8 +40,10 @@
 //!   A-609 reads it, then the resource's node, `404` without one; a `log-report` answered `200`, `text/xml`, from
 //!   A-613's log walk with `mod_dav_svn`'s receivers (`crate::reads::DavLog`), which the caller streams a slice a reply
 //!   run ([`Report`]): a walk refused before its first byte is answered with its error, `dav_svn__convert_err`'s status
-//!   and the error in `D:error`, and one refused after it ends the connection. Every other report is `501` in
-//!   `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
+//!   and the error in `D:error`, and one refused after it ends the connection. An `update-report` on HTTPv2's `me`
+//!   resource (`!svn/me`, where a stock client sends it) or a node's URL is answered from A-616's drive by A-627's
+//!   writer, streamed the same way ([`super::update`]; checkout, update, switch and export). Every other report is
+//!   `501` in `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
 //! - Every other method: `501`, `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
 //!
 //! **Read access** (`mod_authz_svn`'s questions with HTTP, §4.17.4 item 10). A request whose node's path the
