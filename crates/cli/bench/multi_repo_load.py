@@ -469,6 +469,14 @@ def main():
                     others = (by_shard.get(row.get("partition"), 0) - row.get("intake_step_ns", 0)) / 1e9
                     print(f"    r{rank} on shard {row.get('partition')}: span {span:.3f} s, served "
                           f"{row.get('intake_step_ns', 0) / 1e9:.3f} s, others' steps on its shard {others:.3f} s", flush=True)
+                # Each class's intake steps: how long one step holds its shard on average (step time over steps).
+                for cls in range(len(packs)):
+                    names = [f"r{rank}" for rank in range(1, repositories + 1) if classes[rank - 1] == cls]
+                    took = sum(rows[name].get("intake_step_ns", 0) for name in names if name in rows)
+                    steps = sum(rows[name].get("intake_steps", 0) for name in names if name in rows)
+                    if steps:
+                        print(f"    class {cls} intake: {steps} steps, {took / 1e9:.3f} s, a step {took / steps / 1e6:.2f} ms "
+                              "on average", flush=True)
                 busiest = sorted(by_shard.items(), key=lambda item: -item[1])[:3]
                 print("    busiest shards by step time: " + ", ".join(f"{part}: {ns / 1e9:.2f} s" for part, ns in busiest), flush=True)
                 print(f"    {len(served)} one-push repositories: served p50 {quantile(served, 0.5):.3f} s p99 "
