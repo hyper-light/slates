@@ -55209,6 +55209,22 @@ Applied in the same change to:
   `vcs_share::turns::tests::a_repositorys_pushes_share_one_turn_a_round_of_the_shard` (three pushes of one repository
   took 3 turns between the small one's, now at most 1). Tests: slates-server `vcs_share:: git_push:: vcs_http::git
   vcs_ssh::` 106 of 106. The cap-3 and cap-10 by-use proof follows in BENCHMARKS.md.
+- **Acknowledged pushes lost at a takeover, found and fixed (2026-11-20; main's order: top item, A-636's author gone).**
+  `crates/cli/tests/v3_takeover.rs` (three `slates anchor --fleet` processes at f = 1, stock git over their HTTPS edges,
+  the owner SIGKILLed with a push in flight) was red on version-2 records: the successor adopted and rebuilt the
+  repository (`fleet.takeover.repository_adopted`, `repository_rebuilt`) and served it with no refs at all. The counters
+  named the cause: no record replayed (`vcs_store.replayed` absent, `repository_records` 0 on every partition). A push's
+  records were kept only in the owner partition's register ("the objects take no position", A-662), so nothing shipped
+  them. Fixed: a push's record is a change of the names log (`LoggedChange::Objects`, appended; db wire order pinned),
+  so it ships to the repository's candidates with the operation's identity and spans, a takeover keeps or drops the push
+  whole, and the successor's adoption puts the record back for the store's replay. A first run of the fix kept only the
+  first push: pushes acknowledged before their parts shipped were lost, so a push is now answered only once its names
+  log is held at f + 1 (`state_log::names_committed_within`, §4.8's commit rule; the HTTP and SSH edges wait on it before
+  the report). The test passes, 3 of 3 runs: every acknowledged push on the successor, in order, its clone whole by
+  `git fsck`. The test grants every principal read and push before the kill, a workaround until w-fed-faults' fix:
+  a credential minted on the owner is unknown to the successor (401) and a survivor's own token names its own account
+  (403). Tests: slates-db 18 suites; slates-server `takeover state_log vcs_store:: git_push:: vcs_http::git vcs_ssh::`
+  236 of 236.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 

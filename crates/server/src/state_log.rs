@@ -28,7 +28,13 @@
 //! otherwise ([`admit`]), so the parts never pass it by more than one operation's records. A laptop (`f = 0`, no remote
 //! candidate) keeps none.
 //!
-//! **Owed** (A-636's entry): a push's answer waiting for its records to commit at `f + 1` (the barrier); a candidate
+//! **A push's records ride the names log** (A-724 piece 8c, found by `crates/cli/tests/v3_takeover.rs`): before, they
+//! were kept only in the owner's own partition, so a successor rebuilt a taken-over repository with no refs at all.
+//! Each push's record is now a change of the names log (`LoggedChange::Objects`), shipped here with the operation's
+//! identity and spans, and a push is answered only once its names log is held at `f + 1` ([`names_committed_within`],
+//! the barrier, §4.8's commit rule): the HTTP and SSH edges wait on it before the report goes out.
+//!
+//! **Owed** (A-636's entry): a candidate
 //! that joins a log's placement past parts every earlier candidate held, which needs the log's state installed before
 //! its next part (a state-log checkpoint, which also lets holders drop the records below it); the parts rebuilt after
 //! the owner restarts; parts batched a shipment; a repository's destroy forgetting its four state logs' registers; and
