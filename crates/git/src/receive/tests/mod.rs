@@ -169,7 +169,7 @@ impl Repo {
       .into_iter()
       .map(|object| (object.id, object.kind, object.content))
       .collect();
-    objects.sort_by(|a, b| a.0.cmp(&b.0));
+    objects.sort_by_key(|a| a.0);
     Self { objects }
   }
 
@@ -177,7 +177,7 @@ impl Repo {
   fn with(&mut self, kind: Kind, content: &[u8]) -> ObjectId {
     let id = name_of(ObjectFormat::Sha1, kind, content).unwrap();
     self.objects.push((id, kind, content.to_vec()));
-    self.objects.sort_by(|a, b| a.0.cmp(&b.0));
+    self.objects.sort_by_key(|a| a.0);
     id
   }
 }

@@ -19,9 +19,14 @@ fn read(kind: Kind, format: ObjectFormat, bytes: &[u8]) -> Result<Vec<u8>, Objec
     Kind::Tree => Tree::parse(bytes, format, &mut ample())?.write(&mut out),
     Kind::Commit => Commit::parse(bytes, &mut ample())?.write(&mut out),
     Kind::Tag => Tag::parse(bytes, &mut ample())?.write(&mut out),
-    Kind::Blob => panic!("blobs are not this piece's"),
+    Kind::Blob => no_blob(),
   }
   Ok(out)
+}
+
+/// A blob met where only trees, commits and tags are read: the test's own failure.
+fn no_blob() -> ! {
+  panic!("blobs are not this piece's")
 }
 
 /// `bytes` checked as an object of `kind` in `format`: every finding, under each strictness.
@@ -110,7 +115,7 @@ fn entry_ends(golden: &Golden) -> Option<Vec<usize>> {
   for entry in tree.entries() {
     let mut written = Vec::new();
     entry.write(&mut written);
-    ends.push(ends.last().unwrap() + written.len());
+    ends.push(ends.last()? + written.len());
   }
   Some(ends)
 }

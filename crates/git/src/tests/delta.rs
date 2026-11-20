@@ -54,19 +54,29 @@ fn applied(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, Refusal> {
   let mut out = Vec::new();
   match apply_to(source, delta, &mut out) {
     Ok(sizes) => {
-      assert_eq!(u64::try_from(out.len()).unwrap(), sizes.target);
-      assert_eq!(u64::try_from(source.len()).unwrap(), sizes.source);
+      check_applied(source, &out, sizes);
       Ok(out)
     }
     Err(refusal) => {
-      assert!(
-        out.is_empty(),
-        "{refusal:?}, yet {} bytes written",
-        out.len()
-      );
+      check_refused(&out, &refusal);
       Err(refusal)
     }
   }
+}
+
+/// Holds an applied delta to its declared sizes: `out` the target's length, `source` the source's.
+fn check_applied(source: &[u8], out: &[u8], sizes: Sizes) {
+  assert_eq!(u64::try_from(out.len()).unwrap(), sizes.target);
+  assert_eq!(u64::try_from(source.len()).unwrap(), sizes.source);
+}
+
+/// Holds a refused delta to having written nothing.
+fn check_refused(out: &[u8], refusal: &Refusal) {
+  assert!(
+    out.is_empty(),
+    "{refusal:?}, yet {} bytes written",
+    out.len()
+  );
 }
 
 /// A-582 part 3 (golden vectors: the two deltas `fixtures/make-delta-fixtures.sh` inflated from `ofs.pack` and
@@ -193,8 +203,10 @@ fn gits_deltas_read_to_instructions_that_write_back_to_their_very_bytes() {
 ///   delta\nline 10` that lines 108 and 109 hold; copy the rest from 5407, line 101's last digit on.
 #[test]
 fn each_delta_stock_git_wrote_reads_as_the_instructions_git_chose() {
+  /// A delta stock git wrote: its object, its sizes and its instructions, each with where it begins.
+  type Expected<'a> = (&'a str, Sizes, Vec<(u64, Instruction<'a>)>);
   let copy = |offset, len| Instruction::Copy { offset, len };
-  let expected: [(&str, Sizes, Vec<(u64, Instruction<'_>)>); 2] = [
+  let expected: [Expected<'_>; 2] = [
     (
       "41debd467a3aa189a01c4e1dc6896eb686b604dc",
       Sizes {
