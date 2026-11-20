@@ -898,6 +898,12 @@ impl GitPush {
     })
   }
 
+  /// The objects admitted so far, in quarantine, read only: what a pack being read reads a delta's base back from and a
+  /// push's checks read its objects from (A-719 part 3).
+  pub(crate) fn quarantine(&self) -> &Push {
+    &self.push
+  }
+
   /// Admits `objects`, in the order the push brought them, with the room their bytes take lent for the step. Refused at
   /// the first object refused; the push keeps what it admitted before, for its caller to abandon.
   pub(crate) fn admit_all(

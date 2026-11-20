@@ -5,7 +5,7 @@ use flate2::{Compress, Compression, FlushCompress};
 use proptest::prelude::*;
 
 use super::{
-  Chain, IndexMismatch, Keep, Locate, NoIndex, NoObjects, Object, Outside, Reader, Refusal,
+  Chain, Contents, IndexMismatch, Keep, Locate, NoIndex, Object, Outside, Reader, Refusal,
   Unpacked, check_index, read_whole,
 };
 use crate::delta::{self, Sizes};
@@ -824,6 +824,12 @@ impl Keep for Elsewhere {
     Ok(())
   }
 
+  fn release(&mut self, hold: Hold, admission: &mut Admission) {
+    admission.release(hold);
+  }
+}
+
+impl Contents for Elsewhere {
   fn content(&self, at: usize, id: &ObjectId) -> Option<std::borrow::Cow<'_, [u8]>> {
     self
       .objects
@@ -831,9 +837,11 @@ impl Keep for Elsewhere {
       .filter(|object| object.id == *id)
       .map(|object| std::borrow::Cow::Borrowed(object.content.as_slice()))
   }
+}
 
-  fn release(&mut self, hold: Hold, admission: &mut Admission) {
-    admission.release(hold);
+impl Outside for Elsewhere {
+  fn object(&self, _id: &ObjectId) -> Option<(Kind, &[u8])> {
+    None
   }
 }
 
@@ -873,9 +881,7 @@ fn a_pack_read_into_a_keeper_that_stores_elsewhere_holds_a_bounded_working_set()
       Ok(piece.len())
     );
   }
-  let kept = reader
-    .finish_into(&NoObjects, &mut admission, &mut keeper)
-    .unwrap();
+  let kept = reader.finish_into(&mut admission, &mut keeper).unwrap();
   let placed: Vec<(ObjectId, u64)> = kept
     .objects
     .iter()

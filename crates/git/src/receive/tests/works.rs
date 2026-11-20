@@ -247,15 +247,10 @@ fn pushed(served: &mut Served, bytes: &[u8], logs: &mut Logs) -> Received {
   assert_eq!(super::checked_in_turns(&mut session, &indexed).1, Ok(true));
   drop(indexed);
   let mut quarantine = Push::new(ObjectFormat::Sha1);
-  for object in session.checked().unwrap().objects() {
+  for (at, object) in session.checked().unwrap().objects().iter().enumerate() {
+    let content = session.kept().content(at, &object.id).unwrap();
     let (store, repository) = (&mut served.store, &served.repository);
-    admitted(
-      store,
-      repository,
-      &mut quarantine,
-      object.kind,
-      &object.content,
-    );
+    admitted(store, repository, &mut quarantine, object.kind, &content);
   }
   served
     .repository
