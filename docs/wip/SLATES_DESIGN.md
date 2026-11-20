@@ -1388,6 +1388,15 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > 1,000-revision import the owner partition's register holds 222.4 MiB of repository records, 133.1 MiB of chain
 > entries and 137.4 MiB of checkpoints (BENCHMARKS.md).
 
+> **Status (2026-11-20, the daemon's memory by kind; A-232's gotcha).** `slates status` (and `--json`'s `memory`) reports
+> the daemon's mapped memory by kind, read in its own process with nothing suspended: `segment` and `content` (the
+> anchor segment and content object whole, swept on the control shard), `arenas` (the shards' arena extents, which lie
+> in the content object), `regions` (the clients' ring regions), each with its mappings, reserved bytes, resident bytes
+> and written bytes where the OS says (the A-744 sweep, now armed by a status request to run to completion a step a
+> turn), and `heap` (the system allocator's own statistics and the large path's mappings, `slates_mem::heap`). A fresh
+> debug daemon on the Mac Studio read every kind within 8 status calls (2.5 s), its longest advance 0.67 ms, none past
+> its budget. It replaces suspending the daemon with `vmmap` or `heap`, which past the anchor's window kills it (A-232).
+
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
 **Data model.**
@@ -9664,6 +9673,16 @@ server, not inferred from command names.
 > proven under the issuer secret as an enrollment is; a consumer's channel is refused `Forbidden`, and MCP and the SDKs
 > carry no proof. The one record keeps an SSH key by its fingerprint and an HTTP token by its hash alone, each with the
 > principal it proves and its expiry (§4.17.2's A-625 part 3 status).
+>
+> **Status (2026-11-20, A-764: credentials are fleet state).** A credential is the region's, not its issuing node's: the
+> node that enrolls or revokes one sends it to every other member (`slates_cluster::credentials`, the record session's
+> stream 31), and each holds it on the partition its id routes to, so the edges still authenticate with one local
+> lookup, and a client's token proves its principal on a successor after the issuing node is lost. An enrollment is
+> acknowledged once `f + 1` members hold it, a revocation only once every member has let it go (a member that kept it
+> would go on proving a revoked credential); short of that each is refused `CredentialUnreplicated` and asked again
+> reaches the rest. At each configuration change every member offers what it holds, so one that joined holds what the
+> region holds. Owed: a member partitioned through a revocation and back with its state keeps the record until the
+> revocation is asked again; a revocation's tombstone would close it (GAPS).
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -12375,7 +12394,14 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > writes nothing until they are decided (`upload::fetch::Before`), the acknowledgments alone when not ready, a refusal
 > before them answered as one refused whole. By test: over 2,000 commits and 500 tags, `begin` read 3,499 parents of
 > the graph on main (the whole search and cut), at most 4 now, and each step at most 2, the answer the one made whole.
-> Owed for git: protocol v0's fetch in turns, a plan of scattered positions (16 bytes a run); the live `git clone` rows
+> **Protocol v0's fetch in turns BUILT (same day):** a v0 or v1 request is read and checked when its answer is made,
+> then the answer's steps make it (`upload::v0::answer_in_turns`, `Opening`): its acknowledgments a have a unit, each
+> `ready` the server asks a parent a unit (`negotiation::Ready`, the stepped form of `negotiation::ready`), and its
+> negotiation (`done` taken, as a stateless v0 request's is) its cut and its choice; the head (the shallow-update, then
+> the acknowledgments) written once both are known, the pack begun from the choice. Every v0 test's exchange is answered
+> both ways and held to the same bytes, refusal and counters (git's stateless exchanges, the cut-and-flip property);
+> made, a v0 answer has decided nothing, and a pack's takes more than one step. Before it, `serve_in_turns` answered v0
+> whole as the answer was made. Owed for git: a plan of scattered positions (16 bytes a run); the live `git clone` rows
 > of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
@@ -13898,7 +13924,19 @@ cooperative slices (§4.3).
 > most a window and one row, the daemon living; `vcs_store::git_encode::tests::a718_no_unit_...`, ignored, its pack
 > named by `SLATES_ENCODE_PACK`). Owed: the encoding from the push's own intake (git's pack reuse, w-git's streaming
 > intake), the base pack's rebuild, kept fragments across a recovery, the parts' bytes held between turns charged, a pair
-> of trees read whole and the parts' record made in one unit.
+> of trees read whole and the parts' record made in one unit. **The encoder's bytes one function of its input (same day,
+> w-k90-vendor; main's ruling):** the zlib level and the delta window had been chosen from each level's sample and each
+> trial timed on the shard's clock, so one snapshot's objects deflated to other bytes from run to run and replica to
+> replica (A-745 rule 4's held-answer test found two streams of one generation deflating a tag at two levels), and every
+> fragment sampled every level again. Now the owner measures what the work costs once a process
+> (`slates_git::store::learn::Rates::measure`: each level's nanoseconds a KiB over a seeded text corpus of two deflate
+> windows, and a delta search's; `DaemonConfig::git_rates`, logged with the boot's derivations), carried in the exchange;
+> a level's sample and a trial are charged those rates over their bytes, and a kind's levels are sampled once, on the
+> first object of it a repository encodes. Held: a version's fragments the same bytes under a clock ticking a nanosecond
+> a read and one jumping by large random amounts (`a_versions_fragments_are_the_same_bytes_whatever_the_owners_clock_reads`,
+> red on main: the commit's entry deflated apart); rule 4's held answer now the start generation's byte for byte. Owed:
+> the release A/B on git/git (CPU per encoded MiB and bytes out, per-object timing against the rates; main's run), and
+> one deployment's rates shared by its nodes (each node measures its own today, so two machines may choose apart).
 
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
@@ -14642,7 +14680,12 @@ markers and topics, which git has no counterpart for, are decided here.
    closed heads.
 2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. The owner's branch
    verbs name it as Mercurial does (`topic`), spelled `bookmark:topic:` in the namespace; a line's or bookmark's
-   namespace spelling passes as it is (A-575, `hg_push::owner_name`). A bookmark moves only
+   namespace spelling passes as it is (A-575, `hg_push::owner_name`). The name a branch is made *from* is resolved as
+   Mercurial resolves a name (main's ruling of 2026-11-20; 7.2's `revsymbol`): a revision number or node, then a
+   bookmark, a global tag (the `.hgtags` of the view's heads, folded as 7.2 folds them), then a branch's tip-most open
+   head, so `--from default` is the line heading `default`'s tip; the branch is made from the green that heads that
+   changeset (the bookmark named, else the line, else another bookmark). A changeset no green heads (a tag inside a
+   line's history) is refused `Unsupported` until a branch can be made at a changeset below a head. A bookmark moves only
    when a push names it (the `bookmarks` part or a `bookmarks` pushkey), and every move is a compare and swap on the old
    value the client sent (a pushkey "should succeed iff value was old" [C: `pushkey.py`]; `check:bookmarks` [B:
    `internals.bundle2`]), so the head operation decides it as it decides a git ref. A deletion retires the green.
@@ -20945,6 +20988,9 @@ Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
   back.
 - Amended by A-214 (2026-11-05): an idle shard keeps its last write burst's net growth of free pages pre-faulted, and
   the purge gives back every free block beyond it.
+- Amended by A-765 (2026-11-20, w-sizing): that reserve decays. It is the burst whole for one sweep interval after the
+  pass that closed it, then halved each interval (`daemon::decayed_reserve`), and the sweep stays armed while a
+  reserve is held, so an idle shard gives a burst's pages back within log2(burst / discard size) intervals.
 - Owed:
   - macOS: built by A-110 (2026-10-06).
   - Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.
@@ -29769,6 +29815,15 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+- **An inspector's suspension is a freeze, by design (2026-11-20, main's ruling; the bug record
+  `docs/bugs/2026-11-20-the-anchor-killed-a-daemon-an-inspector-suspended.md`).** A tool that suspends the daemon's task
+  to read it (`vmmap`, `heap`, `footprint`, a debugger) stops its watchdog with every other thread, and the anchor sees
+  what a wedged daemon shows: no beat, no CPU, nothing runnable, every thread in a wait (the suspend count is readable
+  only through the task port). Past the anchor's window it kills the daemon as frozen, as this rule asks: w-hg's
+  `vmmap -summary` of a daemon mapping ~220 GB took 2.42 s and lost the daemon at each look. Read the daemon's memory
+  from the daemon instead: `slates status` reports it by kind (segment, content, arenas, regions, heap), read in process
+  with nothing suspended (§4.14).
 
 ### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
 
@@ -55739,6 +55794,40 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722's keepalive while the pack is read (2026-11-20, w-git for UI goal 93; main's ruling)
+- **Found** (w-k90-vendor; reproduced on adas-mac-studio.local-2, debug, load 51 to 63, 7 of 9 failed): with the head
+  written at once the status line came in 24 ms, but a debug daemon read and decoded the long-history tests' 820 KB
+  pack for over the client's 10 s read window after the client's last byte, writing nothing.
+- **Change.** `Connection::interim`: on an AtHead route whose head is out, a run the service gives while the request's
+  body is still being read is written at once, chunked. The driver asks the exchange after each body run
+  (`Exchange::interim`, nothing by default), and receive-pack gives git's `0005\1` once the client's commands show
+  side-band-64k and the keepalive interval has passed since it last wrote (`git_keepalive_ns`, git's
+  `receive.keepAlive`).
+- **Tests.** `slates-http-edge` `connection::tests::an_at_head_route_writes_an_interim_run_while_its_body_is_read`
+  (red with the interim run dropped); `slates-http-edge --lib` 36 passed; `slates-server --lib -- vcs_http:: git_push::
+  vcs_ssh::` 162 passed; fmt clean (kiln, adas-mac-studio.local-2). The debug-load rerun is in run-requests.md. Owed:
+  the read itself measured per byte and per object (main's push-back: 820 KB should be milliseconds).
+
+### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
+- **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
+  never main): a push of git/git's v1.5.0 (9.4 MiB, 34,296 objects) holds a transient working set of 16.9 MiB after its
+  input and 34.4 MiB at its peak, and leaves the content store at 309 MiB: every object kept inflated (git counts
+  304.6 MiB: blobs 231.0, trees 69.1, commits 4.5), 33 times the pack. Identical objects are already held once by
+  identity; the cost is the inflation.
+- **Change** (part 1 of 4, used by nothing yet). `slates_git::store::packed::read`: the object whose entry begins at an
+  offset of a held pack, its header and data read across the pack's lent pieces, a delta's base followed to a whole
+  object (an earlier entry, or a named base its caller locates: an entry of a pack or an object handed over whole), then
+  inflated and applied going up through a reused `Scratch`, so a read allocates nothing once its scratch has grown;
+  `Scratch::shrink` gives room back. One seam for where a pack is held (`PackSource`; Ada's storage ruling: an
+  in-flight push's pack in RAM, a landed repository's on disk in w-store's store): the content store implements it now,
+  w-store's store next (inbox/w-store-from-w-git-pack-source-2026-11-20.md).
+- **Next parts.** B2: rows name an object by its pack and offset, every reader through `packed::read`; B3: the
+  quarantine keeps entry places, not inflated objects; B4: `object_bytes`/`put_object` copies gone; each with a red bound
+  on resident memory against the pack.
+- **Tests.** `slates-git` `store::tests::packed::every_object_read_in_place_from_a_held_pack_is_the_object_read_whole`
+  (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
+  `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
+
 ### A-722's head at once — A git service's reply head is written before its body is read (2026-11-20, w-git for UI goal 93; main's ruling)
 - **Why.** The edge's engine wrote a reply's status and headers only once the service's reply began, after the whole
   request body was read. A long push's pack is decoded as its body is read, so after the client's last byte the
@@ -56023,8 +56112,31 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   hook_driver, vcs_hooks 227 of 228, the one failure `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_
   lands_a_stock_commit` ("The commit's texts were not made durable: Unanswered"), which fails alike on main 359da238
   without this change.
-- **Owed.** P3's presenter (the view a hook runs in, under the root mount, once the vfs's referenced file is agreed with
-  w-perf, main's ruling 2), P4, the root mount's publication (A-645 (a)).
+- **Part 3, its third piece (2026-11-20, main's ruling 2): a read-only file of content-store references, the vfs side.**
+  `slates_vfs::referenced`: a file kind (`Body::Referenced`) whose content is an ordered list of pieces, each a whole
+  content-store object by identity and length (`Piece::Content`) or a few bytes the presenter made (`Piece::Made`: an
+  FSFS header, an entry list, a trailer); its length is the pieces' sum, set at creation, so a stat reads nothing. A
+  read (`Volume::read_referenced`) takes the store's run at each offset through a seam (`ReferencedContent::run_at`) and
+  copies it into the caller's buffer, so no object is assembled; the plain read, lent no store, serves made bytes and
+  refuses content `ReferenceUnresolved` (EIO), never zeros. `Volume::create_referenced` holds every identity through a
+  second seam (`ReferencedHolds`, so a read borrows the store shared) before the file exists, and the volume's ledger
+  keeps the holds until `Volume::release_references`; a destroy or a clone before that is refused `ReferencesHeld`
+  (EBUSY), and a refused hold or create gives back what it took. Every write, truncate, allocation and edit is refused
+  `EROFS`. A recovery image carries the pieces (`BodyImage::Referenced`, appended), and a recovered volume owes its holds
+  to its successor's store (`Volume::hold_owed_references`). The non-vacuity counters `ReferencedCounts` (`bytes_read`,
+  `bytes_copied`, a run the store copied rather than lent) hold a view of 64 texts read whole at zero bytes copied and
+  its whole length read, and the same view over a store that only copies at every content byte. The server's seam
+  (`vcs_store::referenced`, `Lent` and `Holding`) reads through `ContentStore::window_at`, which resolves the identity
+  (9010c5630), and holds and releases through `hold` and `release`. The store keeps no object's length, so the length
+  is the record's; the seam refuses one the store can tell is wrong (a one-window object's other length, a tree's of
+  one window or less). Deviation from the proposal to w-perf, which w-perf reviews and amends: the holds belong to the
+  volume, not the inode, since an inode is copied on write and kept by snapshots, and a piece shows a whole object,
+  since a prefix's length would find another tree. Red first: the tests did not compile against main 051bf8f4, where the
+  API did not exist. macOS arm64, merged main 051bf8f4: `slates-vfs --test referenced` 6 of 6, `--lib`, `--test recover`,
+  `--test image`, `--test special` 167 of 167; `slates-server --lib vcs_store::referenced` 2 of 2; `slates-api --lib
+  volume_core` 3 of 3.
+- **Owed.** P3's presenter (the view a hook runs in, under the root mount, made of referenced files), P4, the root mount's
+  publication (A-645 (a)), and the presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -56944,3 +57056,80 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   `apply_recorded`; items 3-7 then name the plane's object from the green's block with no copy.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
+
+### A-763 — A live write ships the bytes it changed (2026-11-20, w-forming; main's order, item 1; found by use: 32 KiB NFS writes to a 3 MiB live file shipped about 245 KB of delta each, 54 MB over 221 appends; §4.10 "Live shipping"; A-126, A-200)
+
+- **Cause.** A live delta's content runs (`live_ship::content_runs`) carried every extent of each patched file's image,
+  and a patch's image carries every extent in the windows its writes touched (A-126's `Dirty::windows`, the write's
+  window and the open extent's): a page written into a 3 MiB file shipped about 313 KB.
+- **The change.** The volume keeps the byte ranges each publication's writes changed (`Dirty::writes`, from the old end
+  of the file when a write grows it, since the zeros it opens are new; cleared into `Dirty::published_writes` at
+  `mark_published`, read through `Volume::published_writes`); a patched file's runs are those ranges clipped to its
+  extents (`clipped_to_writes`), a file changed otherwise ships its extents as before. A successor's rebuild overlays
+  the runs by byte range per inode (`overlay_run`: the later bytes over the earlier, the rest kept) and reads each
+  extent from them (`run_bytes`, refused where a byte is missing, as before), so a window's unwritten bytes come from the
+  entries before it. The delta record's format is unchanged.
+- **Tests.** `slates-cli` live_fleet `a_live_write_ships_the_bytes_it_changed_not_its_window` (64 page writes spread over
+  a 3 MiB live file, the delta bytes held within the bytes written and a page a publication): red before (20,063,216
+  bytes shipped for 262,144 written in 64 appends), 309,760 after (bytes, not time: the same in a release build).
+  `live_ship::tests::overlaid_runs_read_back_the_latest_bytes_and_refuse_a_gap` (a byte-array oracle) and
+  `a_patched_files_spans_are_clipped_to_its_writes`; the takeover flows that serve written volumes from a successor's
+  rebuild (live_fleet's warm-restart, no-copy and stopped-successor takeovers; the live_chaos fresh-member flow).
+
+### §4.8 amended — A borrower waiting for a record session out on loan is woken by its return, never paced (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family one of three)
+Applied in the same change to: §4.8 "Lookup" (a forward that finds its peer's session out), GAPS (the sweep's line),
+`crates/server/src/fleet.rs` (`session_returned`, `SessionChange`, `sessions_changed`, `return_sessions`, the link's
+install, refresh and removals, `take_campaign_sessions`), `crates/server/src/forward_lane.rs` (`drive_turn`),
+`crates/server/src/live_ship.rs` (`borrow_session`, the lost links), `crates/server/src/owner_location.rs`
+(`wait_for_returning_sessions`), `crates/server/src/member_task.rs`, `crates/server/src/daemon.rs`
+(`hold_record_session`), `crates/server/src/state.rs` (`session_waiters`, `session_woken`), `crates/server/tests/fleet.rs`.
+- **What was there.** A borrower that found its peer's record session out on another borrower's loan slept a pace and
+  looked again: the forward lane a tenth of a period (10 ms), a live write's shipper one timer tick at a time, a
+  campaign and a location round the fleet's poll interval, the test hook a tenth of a period. A session handed back just
+  after a look waited out the rest of the pace, and the tick-at-a-time wait parked and looked once a tick for as long as
+  the session was out.
+- **Change.** `fleet::session_returned(hosts, left)` waits, within the caller's own deadline, for a change of one of
+  those peers' record links: a `Send` future that registers its task's waker under each peer at its first poll, on the
+  control shard where the sessions are, and takes its registrations away when dropped. `fleet::sessions_changed(host)`
+  wakes every wait for that peer once (and takes it off the other peers' lists) wherever `record_sessions` changes:
+  every arm of `return_sessions` (handed back, dropped as reset or silent, a stale return), the link's install and its
+  discovery refresh, and each removal (the link task's, a learned id's replacement, a restarted peer's, the live
+  shipper's lost links). No wait possible (off a shard) ends the caller's wait as a refused sleep did; a test's campaign
+  hold, which ends at an instant and not at an event, caps the campaign's wait at that instant.
+- **Counters.** `fleet.session_wait.woken`, `fleet.session_wait.elapsed`, and `fleet.session_wait.returned`: the waits
+  woken by the session's own return, the test's red (a discovery refresh also wakes a wait, so the plain woken count
+  passed with the return's wake removed).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_forward_waiting_for_its_lent_session_is_woken_by_its_return` (two nodes at `f = 1`; B holds its session to A out for
+  50 ms by the test hook while a client on B asks A's green's versions, three times: answered in 52.3 to 53.2 ms, B's
+  returned counter moved by three, none elapsed). Red with the return's wake removed: the returned counter 0 and the
+  test failed; with the plain woken counter as the check, the forwards took 532, 916 and 965 ms, woken only by a later
+  refresh. Focused runs listed with the landing.
+
+### A-764 — A credential is fleet state: enrolled or revoked in the region, acknowledged at f + 1 holders, healed at each configuration change (2026-11-20, w-fed-faults, main's ruling; §4.13 "Principals", A-625 part 3)
+
+- **Found by use.** w-balance's `crates/cli/tests/v3_takeover.rs` (three `slates anchor --fleet` nodes at `f = 1`, stock
+  git over each node's HTTPS edge): after the owner's anchor and daemon were killed, the successor answered the owner's
+  token 401, and a token minted there proved another host's account (403), so the test granted every principal before
+  the kill. Logs: a credential lived on the partition its id routes to on the issuing daemon alone
+  (`credentials::owner_of` over that daemon's shards); nothing sent it to another member, so the successor held none.
+- **Change (main's ruling: a principal and its tokens are fleet state, never node-local).** `slates_cluster::credentials`
+  (stream 31): enroll (the record in its wire encoding), revoke (the id), answer (held or not). The node that enrolls or
+  revokes serves the request on its channel as a task (`verbs::credential_on_channel`): recorded on its own partition as
+  before, then sent to every other member (`credentials::enroll_in_region`, `revoke_in_region`); an enrollment answered
+  once `f + 1` hold it, a revocation once every member has let it go, otherwise refused `CredentialUnreplicated { held,
+  needed }` (appended, wire tag 80; `slates_api::RetryCause::CredentialUnreplicated`). A member applies a message
+  idempotently on the partition its id routes to (`credentials::apply_here`, `serve_remote`). At each configuration
+  change every member offers every credential it holds to every other (`credentials::heal_region`, beside the homes'
+  healer). The edges' lookup is unchanged: one local lookup, now finding the region's credentials.
+- **Tests.** `slates-cluster --lib credentials` 3 (the messages round-trip, hostile bytes refused, `f + 1`);
+  `slates-server --lib credentials` 12, `a764_a_members_enrollment_and_revocation_are_held_here_and_idempotent` new;
+  `slates-ipc --test wire_order` 2. By use: `v3_takeover` with its grant-all and its survivor's token removed, the
+  owner's token used throughout: before, both survivors answered 401; after, each survivor counts
+  `credential.fleet.applied` and the successor authenticates the owner's token (`ls-remote` exit 0). The test's own
+  verdict still fails on the refs a takeover loses, w-balance's half. macOS arm64, Mac Studio, local.
+- **Owed.** A member partitioned through a revocation that comes back with its state keeps the record until the
+  revocation is asked again: a revocation's tombstone, kept and offered as enrollments are, closes it. The healer
+  offers every credential at each configuration version, idempotent but repeated while a fleet forms (13 and 14 offers
+  in the test's run).
+

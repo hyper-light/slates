@@ -71,6 +71,14 @@ pub struct Dirty {
   /// file's ranges are ascending, disjoint and coalesced, so there are at most as many as the file has windows, and a
   /// write adds at most two. One entry per written file; cleared at every publication.
   windows: BTreeMap<u64, Vec<WindowSpan>>,
+  /// The byte ranges each written inode's writes changed since the last publication (from the old end of the file when a
+  /// write grows it, so the zeros it opens count), ascending, disjoint and coalesced: what a live log's delta ships of a
+  /// patched file (`Volume::published_writes`), where [`Dirty::windows`] is the extents its image carries. Cleared into
+  /// [`Dirty::published_writes`] at every publication (w-forming, 2026-11-20: a live delta shipped every window a write
+  /// touched, about 245 KB for a 32 KiB NFS write).
+  writes: BTreeMap<u64, Vec<WindowSpan>>,
+  /// [`Dirty::writes`] as the last committed publication carried them.
+  published_writes: BTreeMap<u64, Vec<WindowSpan>>,
   /// The inode a write is changing now: its own marks are the write's, not [`Dirty::others`].
   writing: Option<u64>,
   /// Whether anything changed since the last publication, recorded or not: what lets a volume that records no
@@ -159,7 +167,8 @@ impl Dirty {
 
   /// Records a write to inode `no` that could change its extents within `windows` (`touched_windows`), or, with
   /// `None`, a write to a body that was not chunked, which images the inode whole.
-  pub(crate) fn written(&mut self, no: u64, windows: Option<[(u64, u64); 2]>) {
+  /// `bytes` is the byte range the write changes ([`Dirty::writes`]).
+  pub(crate) fn written(&mut self, no: u64, windows: Option<[(u64, u64); 2]>, bytes: (u64, u64)) {
     if !self.recording() {
       return;
     }
@@ -170,6 +179,10 @@ impl Dirty {
     let spans = self.windows.entry(no).or_default();
     for (from, to) in [first, second] {
       add_span(spans, WindowSpan { from, to });
+    }
+    let (from, to) = bytes;
+    if from < to {
+      add_span(self.writes.entry(no).or_default(), WindowSpan { from, to });
     }
   }
 
@@ -225,6 +238,7 @@ impl Dirty {
     self.inodes.clear();
     self.others.clear();
     self.windows.clear();
+    self.published_writes = std::mem::take(&mut self.writes);
     self.entries.clear();
     self.names.clear();
     self.references.clear();
@@ -441,6 +455,13 @@ impl Volume {
   /// had a base): a delta carries no base plane, so such a volume must publish the whole image.
   fn base_plane_changed(&self) -> bool {
     self.base_change_token() != self.dirty.published_base_token
+  }
+
+  /// The byte ranges the writes of the last committed publication changed in inode `no`, when it was patched by writes
+  /// alone (`Dirty::writes`): a live log's delta ships these bytes of it, not the windows its image carries. `None` when
+  /// that publication recorded no write to it.
+  pub fn published_writes(&self, no: u64) -> Option<&[WindowSpan]> {
+    self.dirty.published_writes.get(&no).map(Vec::as_slice)
   }
 
   /// Whether nothing changed since this volume's last committed publication: a barrier need not record it.

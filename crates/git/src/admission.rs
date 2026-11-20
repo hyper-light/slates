@@ -85,6 +85,15 @@ impl Admission {
     Ok(Hold { bytes })
   }
 
+  /// The bytes charged since this admission had `before` left, kept as a hold to give back once what they bought is
+  /// dropped (A-745: a request's parsed lists are needed only until its answer is made, so they never pin the room
+  /// its answer is written within).
+  pub(crate) fn held_since(&mut self, before: u64) -> Hold {
+    let bytes = before.saturating_sub(self.left);
+    self.held = self.held.saturating_add(bytes);
+    Hold { bytes }
+  }
+
   /// Gives `hold`'s bytes back, at most what this admission's holds still keep (module docs).
   pub fn release(&mut self, hold: Hold) {
     let back = hold.bytes.min(self.held);

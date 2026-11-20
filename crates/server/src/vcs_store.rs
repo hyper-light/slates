@@ -112,8 +112,11 @@ pub(crate) mod lfs_record;
 pub(crate) mod owed;
 pub(crate) mod paths;
 pub(crate) mod record;
+// Owed caller: A-645 P3's presenter, which makes a hook's view of referenced files.
 #[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
 pub(crate) mod record_names;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod referenced;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
 pub(crate) mod svn_texts;

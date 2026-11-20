@@ -56,6 +56,24 @@ fn report() -> ReplyBody {
       dumps_local_full: true,
       anchor: 97,
       recovered: true,
+      memory: vec![
+        slates_ipc::protocol::MemoryKindReport {
+          kind: "segment".to_owned(),
+          mappings: 1,
+          reserved_bytes: 107,
+          resident_bytes: 109,
+          modified_bytes: Some(113),
+          measured: true,
+        },
+        slates_ipc::protocol::MemoryKindReport {
+          kind: "heap".to_owned(),
+          mappings: 127,
+          reserved_bytes: 131,
+          resident_bytes: 137,
+          modified_bytes: None,
+          measured: false,
+        },
+      ],
       fleet: FleetReport {
         host: 19,
         f: 0,

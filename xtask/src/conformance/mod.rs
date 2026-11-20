@@ -26,11 +26,15 @@
 //! records a privilege skip when it is refused, never a prompt.
 
 mod bench;
+// The suites' judgment of a wait on slates processes (their own CPU; `crates/cli/tests/support/process_wait.rs`), one
+// source for the CLI tests and this harness.
 mod container;
 mod fetch;
 mod hermeticity;
 mod live_fleet;
 mod mount;
+#[path = "../../../crates/cli/tests/support/process_wait.rs"]
+mod process_wait;
 mod slates;
 mod suites;
 mod trace_process;

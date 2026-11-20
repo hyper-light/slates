@@ -430,6 +430,14 @@ pub enum RetryCause {
   /// A move's records were not placed within the fleet's failover SLO, so it was not reported and the volume thawed
   /// (A-291): ask for the move again.
   MoveUnplaced,
+  /// A credential's enrollment or revocation reached `held` of the `needed` members of the region (A-764): what was done
+  /// stands where it reached; ask again to reach the rest.
+  CredentialUnreplicated {
+    /// The members that hold it as asked.
+    held: u64,
+    /// The members it must reach.
+    needed: u64,
+  },
 }
 
 /// Why no daemon answers.
@@ -964,6 +972,10 @@ impl Error {
       Refusal::ArchiveRefused { fault } => Error::Invalid(Invalid::Archive(fault)),
       Refusal::ImportRefused { fault } => Error::Invalid(Invalid::Import(fault)),
       Refusal::CopyRefused { path, case } => Error::Invalid(Invalid::Copy { path, case }),
+      Refusal::CredentialUnreplicated { held, needed } => retry(
+        RetryCause::CredentialUnreplicated { held, needed },
+        pause_ns,
+      ),
       Refusal::OwnMount { path, used_as } => Error::Invalid(Invalid::OwnMount { path, used_as }),
       Refusal::Destroying => Error::Unusable(Unusable::Destroying),
       Refusal::Archived => Error::Unusable(Unusable::Archived),
@@ -1006,7 +1018,9 @@ impl Error {
   /// A volume-core refusal, by the class of thing a consumer does about it (A-299).
   fn of_volume(refusal: VolumeRefusal) -> Error {
     match refusal {
-      VolumeRefusal::Pinned | VolumeRefusal::DaxMapped => Error::Busy(Busy::Volume(refusal)),
+      VolumeRefusal::Pinned | VolumeRefusal::DaxMapped | VolumeRefusal::ReferencesHeld => {
+        Error::Busy(Busy::Volume(refusal))
+      }
       VolumeRefusal::StaleHandle | VolumeRefusal::BaseDrift => Error::Stale(Stale::Volume(refusal)),
       VolumeRefusal::NotPermitted | VolumeRefusal::LinkProtected => {
         Error::Denied(Denied::Volume(refusal))
@@ -1016,9 +1030,9 @@ impl Error {
       | VolumeRefusal::DigestCacheFull
       | VolumeRefusal::Memory
       | VolumeRefusal::RetentionExceeded => Error::Exhausted(Exhausted::Volume(refusal)),
-      VolumeRefusal::JournalIncomplete { .. } | VolumeRefusal::RecoveryVersion { .. } => {
-        Error::Unusable(Unusable::Volume(refusal))
-      }
+      VolumeRefusal::JournalIncomplete { .. }
+      | VolumeRefusal::RecoveryVersion { .. }
+      | VolumeRefusal::ReferenceUnresolved => Error::Unusable(Unusable::Volume(refusal)),
       VolumeRefusal::NotDirectory
       | VolumeRefusal::IsDirectory
       | VolumeRefusal::NotEmpty
@@ -1796,7 +1810,7 @@ mod tests {
   #[test]
   fn a_volume_cores_holders_and_moved_views_are_typed() {
     use slates_ipc::protocol::VolumeRefusal as V;
-    for held in [V::Pinned, V::DaxMapped] {
+    for held in [V::Pinned, V::DaxMapped, V::ReferencesHeld] {
       assert_eq!(volume_refused(held), Error::Busy(Busy::Volume(held)));
     }
     for moved in [V::StaleHandle, V::BaseDrift] {
@@ -1836,7 +1850,7 @@ mod tests {
       found: 3,
       expected: 4,
     };
-    for unusable in [journal, image] {
+    for unusable in [journal, image, V::ReferenceUnresolved] {
       assert_eq!(
         volume_refused(unusable),
         Error::Unusable(Unusable::Volume(unusable))

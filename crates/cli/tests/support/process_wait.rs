@@ -12,9 +12,11 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Derived: how long a waited-on tree may gain no CPU before the wait fails: the anchor's own ceiling on judging a lapse
-/// (`slates_server::daemon::OBSERVE_BUDGET_NS`, which its lapse bound never exceeds), past which a live anchor has
-/// judged a stuck daemon and the tree would show its restart.
-pub(crate) const STALL: Duration = Duration::from_nanos(slates_server::daemon::OBSERVE_BUDGET_NS);
+/// (the observation budget, `slates_server::daemon::OBSERVE_BUDGET_NS`, which its lapse bound never exceeds), past which
+/// a live anchor has judged a stuck daemon and the tree would show its restart. Read from its one source,
+/// `slates_machine::budgets`, so `xtask`, which includes this file too, derives it as the daemon does.
+pub(crate) const STALL: Duration =
+  Duration::from_nanos(slates_machine::budgets::observe_budget_ns());
 
 /// Shape: the CPU a waited-on tree may spend, from the wait's start, before the wait fails without the answer:
 /// `live_chaos`' `START_CPU`, over twice the 13 s of CPU a lone debug daemon's start measured on a loaded Mac
@@ -24,7 +26,8 @@ pub(crate) const CPU_BUDGET: Duration = Duration::from_secs(30);
 
 /// A wait on the process tree under `root` (an anchor and its daemon, or a daemon alone), judged in its own CPU.
 pub(crate) struct Judged {
-  root: u32,
+  /// The roots of the trees judged together (an anchor's, and a client's that waits on it).
+  roots: Vec<u32>,
   /// The tree's CPU at the last look that saw it gain some.
   mark: Option<Duration>,
   /// When that look was.
@@ -49,9 +52,17 @@ pub(crate) enum Verdict {
 impl Judged {
   /// A wait on the tree under `root`, from now.
   pub(crate) fn of(root: u32) -> Judged {
+    Judged::of_all(vec![root])
+  }
+
+  /// A wait on the trees under `roots` together, from now: they progress while any of them gains CPU, and are gone once
+  /// every root is. For a client of a daemon, which spends no CPU while the daemon works for it, judged beside the
+  /// daemon's anchor.
+  pub(crate) fn of_all(roots: Vec<u32>) -> Judged {
+    let mark = trees_cpu(&roots);
     Judged {
-      root,
-      mark: tree_cpu(root),
+      roots,
+      mark,
       since: Instant::now(),
       spent: Duration::ZERO,
     }
@@ -63,9 +74,9 @@ impl Judged {
     match self.judge() {
       Verdict::Waiting { .. } => {}
       gave_up => panic!(
-        "{what}: the processes under {} are {gave_up:?} (no CPU gained for {:?}, the bound {STALL:?}; {:?} of CPU \
+        "{what}: the processes under {:?} are {gave_up:?} (no CPU gained for {:?}, the bound {STALL:?}; {:?} of CPU \
          spent, the budget {CPU_BUDGET:?})",
-        self.root,
+        self.roots,
         self.since.elapsed(),
         self.spent
       ),
@@ -75,7 +86,7 @@ impl Judged {
   /// The tree's verdict now, moving the mark on progress; for a waiter that ends its own wait when the root leaves
   /// (reaping it), where a root gone between its check and this look is no failure.
   pub(crate) fn judge(&mut self) -> Verdict {
-    let now = tree_cpu(self.root);
+    let now = trees_cpu(&self.roots);
     if let (Some(then), Some(now)) = (self.mark, now) {
       self.spent = self.spent.saturating_add(now.saturating_sub(then));
     }
@@ -245,6 +256,14 @@ pub(crate) fn verdict(
     return Verdict::Stalled;
   }
   Verdict::Waiting { progressed: false }
+}
+
+/// The CPU the trees under `roots` have run together, or `None` once every root is gone.
+fn trees_cpu(roots: &[u32]) -> Option<Duration> {
+  roots
+    .iter()
+    .filter_map(|root| tree_cpu(*root))
+    .reduce(Duration::saturating_add)
 }
 
 /// The CPU (user and system) the process `root` and its children have run, or `None` once `root` is gone.

@@ -316,6 +316,9 @@ pub enum Body {
   /// a body that is already larger, so no inode should grow (`cargo run -p slates-vfs --example tree_heap` prints
   /// `Inode`'s size, 168 bytes before this variant).
   Device(DeviceNumber),
+  /// A read-only file of content-store references (A-645 P3 ruling 2, [`crate::referenced`]): its pieces, boxed so no
+  /// inode grows. Read through the shard's content store; every change refused `EROFS`.
+  Referenced(Box<crate::referenced::ReferencedBody>),
 }
 
 /// An inode's extended attributes (§4.5): each name and the attribute inode that holds its value,

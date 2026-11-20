@@ -63,7 +63,7 @@ use crate::out::{Measure, Out};
 use crate::store::{GraphFault, NamedRef, Repository, StoreGraph, StoreRefused};
 use crate::v2::request::{self, Arguments, Command, CommandRequest};
 use crate::v2::{self, Line, object_info};
-use crate::{Admission, PastAdmission};
+use crate::{Admission, Hold, PastAdmission};
 
 mod advertise;
 mod answer;
@@ -435,6 +435,9 @@ fn serve_with<P: PackSource>(
     (Version::V0 | Version::V1, Asked::Advertise) => v0::advertisement(served, version, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
+    (Version::V0 | Version::V1, Asked::Request(bytes)) if turns => {
+      v0::answer_in_turns::<P>(served, bytes, admission).map_err(Refused::plain)
+    }
     (Version::V0 | Version::V1, Asked::Request(bytes)) => {
       v0::answer(served, bytes, packs, admission).map_err(Refused::plain)
     }
@@ -451,35 +454,44 @@ fn request<P: PackSource>(
   turns: bool,
 ) -> Result<Answer<P::Pack>, Refused> {
   refs::check_order(served.refs).map_err(Refused::plain)?;
+  let before = admission.left();
   let command = match request::decode(bytes, admission) {
     Ok(request::Request::End) => return Ok(Answer::end()),
     Ok(request::Request::Command(command)) => command,
     Err(refusal) => return Err(Refused::plain(Refusal::Wire(refusal))),
   };
+  // A-745: the decoded command lives until its answer is made, then is dropped, so its charge is given back then and
+  // never pins the room the answer is written within.
+  let decoded = admission.held_since(before);
   advertise::check(&command, served.repository.format()).map_err(Refused::plain)?;
   let graph = StoreGraph::new(served.repository, served.store, served.refs);
-  command_answer(served, &graph, &command, packs, admission, turns)
+  command_answer(served, &graph, (command, decoded), packs, admission, turns)
 }
 
 /// Answers `command`, held to the advertisement already.
 fn command_answer<P: PackSource>(
   served: &Served<'_>,
   graph: &StoreGraph<'_>,
-  command: &CommandRequest<'_>,
+  (command, decoded): (CommandRequest<'_>, Hold),
   packs: &mut P,
   admission: &mut Admission,
   turns: bool,
 ) -> Result<Answer<P::Pack>, Refused> {
-  match &command.arguments {
-    Arguments::LsRefs(arguments) => refs::ls_refs(graph, served, arguments, admission)
+  let answered = match command.arguments {
+    // A fetch gives its decoded lines back as soon as it has read them (A-745), before its negotiation's tables.
+    Arguments::Fetch(arguments) => {
+      return fetch::answer(graph, served, (arguments, decoded), packs, admission, turns);
+    }
+    Arguments::LsRefs(arguments) => refs::ls_refs(graph, served, &arguments, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
-    Arguments::Fetch(arguments) => fetch::answer(graph, served, arguments, packs, admission, turns),
-    Arguments::ObjectInfo(arguments) => object_info_answer(served, arguments, admission)
+    Arguments::ObjectInfo(arguments) => object_info_answer(served, &arguments, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
     Arguments::BundleUri => Err(Refused::plain(Refusal::Command(Command::BundleUri))),
-  }
+  };
+  admission.release(decoded);
+  answered
 }
 
 /// The `object-info` answer to `arguments`, each size from the store's rows (A-624's `Stored`).
