@@ -401,6 +401,33 @@ impl Store for Indexed<'_> {
         .flat_map(|markers| markers.iter())
     })
   }
+
+  /// A stream is served unless a secret root the changelog holds makes a changeset secret (7.2's
+  /// `allowservergeneration` over `phases.hassecret`); hidden changesets are streamed, as 7.2 streams them.
+  fn streams(&self) -> bool {
+    !self.state.roots.iter().any(|root| {
+      root.phase == Phase::Secret
+        && self
+          .index
+          .rev(self.store, Log::Changelog, &root.node)
+          .is_some()
+    })
+  }
+
+  fn stream_files(
+    &self,
+    room: &mut Admission,
+  ) -> Result<Option<Vec<crate::render::File>>, Refusal> {
+    if !self.streams() {
+      return Ok(None);
+    }
+    crate::render::revlogs(self.index, self.store, room)
+      .map(Some)
+      .map_err(|refused| match refused {
+        crate::render::Refused::Past(past) => Refusal::PastAdmission(past),
+        _ => Refusal::Store { what: "a revlog" },
+      })
+  }
 }
 
 /// The refusal of a marker the store cannot read.

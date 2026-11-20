@@ -31,6 +31,13 @@ use crate::read::to_u64;
 use crate::store::{encode_dir, encode_path};
 use crate::{Admission, NODE_LEN, Node, PastAdmission};
 
+/// Format: the store's directory from the repository's root.
+const STORE: &[u8] = b".hg/store/";
+/// Format: a file log's store path's prefix.
+const DATA: &[u8] = b"data/";
+/// Format: the requirements a rendered store needs of a stream clone's client, as `streamreqs` lists them (7.2's
+/// `streamed_requirements`: the store's formats among `.hg/requires`, sorted and joined by commas).
+pub const STREAM_REQUIREMENTS: &[u8] = b"generaldelta,revlogv1,sparserevlog";
 /// Format: `.hg/requires`, sorted as 7.2 writes it.
 const REQUIRES: &[u8] = b"dotencode\nfncache\ngeneraldelta\nrevlogv1\nsparserevlog\nstore\n";
 /// Format: the index header: revlog version 1 with generaldelta (`FLAG_GENERALDELTA`, bit 17), big-endian.
@@ -83,23 +90,17 @@ pub fn render(
   admission: &mut Admission,
 ) -> Result<Vec<File>, Refused> {
   let mut files = vec![file(b".hg/requires", REQUIRES.to_vec(), admission)?];
-  let (index_file, data) = revlog(index, store, Log::Changelog, admission)?;
-  files.push((b".hg/store/00changelog.i".to_vec(), index_file));
-  files.push((b".hg/store/00changelog.d".to_vec(), data));
-  let (index_file, data) = revlog(index, store, Log::Manifest, admission)?;
-  files.push((b".hg/store/00manifest.i".to_vec(), index_file));
-  files.push((b".hg/store/00manifest.d".to_vec(), data));
   let mut fncache = Vec::new();
-  for path in index.file_logs(store) {
-    let (index_file, data) = revlog(index, store, Log::File(path), admission)?;
-    for (suffix, bytes) in [(&b".i"[..], index_file), (b".d", data)] {
-      let store_path = [b"data/", path, suffix].concat();
+  for (store_path, bytes) in revlogs(index, store, admission)? {
+    let named = if store_path.starts_with(DATA) {
       admission.charge(to_u64(store_path.len()).saturating_add(1))?;
       fncache.extend_from_slice(&encode_dir(&store_path));
       fncache.push(b'\n');
-      let encoded = encode_path(&store_path, true).map_err(Refused::Path)?;
-      files.push(([b".hg/store/", encoded.as_slice()].concat(), bytes));
-    }
+      encode_path(&store_path, true).map_err(Refused::Path)?
+    } else {
+      store_path
+    };
+    files.push(([STORE, named.as_slice()].concat(), bytes));
   }
   files.push((b".hg/store/fncache".to_vec(), fncache));
   let phases: Vec<(Vec<u8>, Node)> = roots
@@ -117,6 +118,31 @@ pub fn render(
   )?);
   if let Some(obsstore) = obsstore(index, store, admission)? {
     files.push((b".hg/store/obsstore".to_vec(), obsstore));
+  }
+  Ok(files)
+}
+
+/// Every log as a split revlog, each file by its store path before encoding (`data/<path>.i`, `00manifest.d`), in the
+/// order 7.2's `store.walk` lists them for a stream: the file logs by path, then the manifest log, then the changelog,
+/// each index file before its data file (stream clones part 2's `stream_out` sends them so).
+pub fn revlogs(
+  index: &HgIndex,
+  store: &ContentStore,
+  admission: &mut Admission,
+) -> Result<Vec<File>, Refused> {
+  let mut paths: Vec<&[u8]> = index.file_logs(store).collect();
+  paths.sort_unstable();
+  let mut logs: Vec<(Log<'_>, Vec<u8>)> = paths
+    .into_iter()
+    .map(|path| (Log::File(path), [DATA, path].concat()))
+    .collect();
+  logs.push((Log::Manifest, b"00manifest".to_vec()));
+  logs.push((Log::Changelog, b"00changelog".to_vec()));
+  let mut files = Vec::with_capacity(logs.len().saturating_mul(2));
+  for (log, radix) in logs {
+    let (index_file, data) = revlog(index, store, log, admission)?;
+    files.push(([radix.as_slice(), b".i"].concat(), index_file));
+    files.push(([radix.as_slice(), b".d"].concat(), data));
   }
   Ok(files)
 }
