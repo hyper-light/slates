@@ -103,3 +103,12 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - Live start: run r19 (linux/amd64, cpus=4, mem=32g) building + running workspace::container_live_tests (file
   uncommitted in the clone: crates/kiln/src/workspace/container_live_tests.rs + mod.rs line); commit it when r19 reports.
 ## NEXT: W10 ephemeral one-session runner (`kiln agent --ephemeral --session`), pod start + reaper; then Windows items.
+
+## 2026-11-20 later: LANDED 8728d0807 BUILD FIX (sandbox::container was cfg(test) since a69822973 -> non-test build broken
+   4eda3a697..8728d0807; told main), 3a7e4116c (kiln agent --ephemeral --session), a3d2d7edf (k8s::volume::agent_pod).
+- RULE for me now: `cargo check --locked -p kiln --bins` before every landing (lib tests run cfg(test) only).
+- r19 (live container test on linux) still queued (adacachy under strain); it syncs at start (fixed tree + uncommitted
+  container_live_tests.rs).
+## NEXT: W10 (b) the pod start: lineage `isolation: {"kind":"pod"}`/engine? -> hold at home (Ask::Hold via ask_runner) ->
+   [slates_fleet.nodes] host/port -> objects -> make -> create agent_pod with a one-time token -> on the pod runner's
+   connect open the session there (cwd = folder; review/drift/landing asked of the home by session id) ; (c) reaper.
