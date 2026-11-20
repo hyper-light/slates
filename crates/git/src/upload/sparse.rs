@@ -5,11 +5,11 @@
 //!
 //! **What names the blob**: `<blob-ish>` read as `get_oid_with_context` reads it in a repository with no work tree,
 //! which a served one is (the `revision` module): an object's full or abbreviated name, `git describe`'s, or a ref by
-//! git's patterns, alone or before `:<path>`; an index path names nothing. A form git reads that this server does not
-//! resolve yet is refused by kind ([`Refusal::SparseForm`]): a parent or an ancestor, a peel or a reflog, or a search
-//! of commit messages (`:/<text>`). What git writes to its error stream while it reads the name (a warning of a ref
-//! name that names something else too; an abbreviation's candidates) is relayed as git's server relays it, before the
-//! pack or before the lines it dies with (`Read::said`).
+//! git's patterns, with a parent's or an ancestor's suffix, a peel or a log's entry, alone or before `:<path>`; an
+//! index path names nothing. A search of commit messages (`:/<text>`, `^{/<text>}`), which this server does not resolve
+//! yet, is refused by kind ([`Refusal::SparseForm`]). What git writes to its error stream while it reads the name (a
+//! warning of a ref name that names something else too; an abbreviation's candidates) is relayed as git's server relays
+//! it, before the pack or before the lines it dies with (`Read::said`).
 //!
 //! **Reading it.** The blob's bytes are charged to the request's admission before they are read, then its patterns
 //! ([`Patterns::read`]); a blob past git's limit is refused unread when its length alone is past it.
@@ -79,6 +79,7 @@ pub(super) fn read(
     Named::Nothing => Refusal::SparseBlob { name: name.clone() },
     Named::Form => Refusal::SparseForm { name: name.clone() },
     Named::Relative => Refusal::SparseRelative,
+    Named::Died(refusal) => refusal,
   };
   Ok(Read {
     patterns: Some(Patterns::default()),

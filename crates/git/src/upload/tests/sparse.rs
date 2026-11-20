@@ -91,18 +91,9 @@ const RELATIVE: [&str; 5] = [
   ":0:../dir/file",
 ];
 
-/// Format: each `<blob-ish>` of a form git reads that this server does not resolve yet: an ancestor, a parent, a
-/// numbered parent, a peel, a reflog entry, a branch checked out before, an upstream, and a search of commit messages.
-const FORMS: [&str; 8] = [
-  "main~1:dir/file",
-  "main^:dir/file",
-  "main^2:dir/file",
-  "main^{tree}:dir/file",
-  "main@{1}:dir/file",
-  "@{-1}:dir/file",
-  "main@{upstream}",
-  ":/third",
-];
+/// Format: each `<blob-ish>` of a form git reads that this server does not resolve yet: a search of commit messages
+/// from every ref, and one from a revision before a path.
+const FORMS: [&str; 2] = [":/third", "main^{/third}:dir/file"];
 
 /// The answer to a clone of `main` under `sparse:oid=<name>`, and why it was refused, if it was.
 fn cloned(fixture: &served::Served, name: &[u8]) -> (Vec<u8>, Option<Refusal>) {
@@ -204,9 +195,9 @@ fn a_relative_path_and_a_form_not_resolved_are_answered_in_their_words() {
       "relative path syntax can't be used outside working tree".to_owned(),
     ),
     (
-      "main~1:dir/file",
-      "unable to access sparse blob in 'main~1:dir/file': this server resolves an object's full or abbreviated \
-       name, git describe's name or a ref, alone or with :<path>"
+      ":/third",
+      "unable to access sparse blob in ':/third': this server resolves every revision but a search of commit \
+       messages"
         .to_owned(),
     ),
   ];

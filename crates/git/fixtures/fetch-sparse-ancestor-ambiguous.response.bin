@@ -1,0 +1,7 @@
+000dpackfile
+002eerror: short object ID 67fd is ambiguous
+0085hint: The candidates are:
+hint:   67fd0f4 commit 2005-04-08 - collide 136 second line
+hint:   67fdbfc commit 2005-04-08 - collid0050e 151 second line
+fatal: unable to access sparse blob in '67fd~1:dir/file'
+0047aborting due to possible repository corruption on the remote side.

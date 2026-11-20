@@ -1,0 +1,4 @@
+000dpackfile
+0085error: main^{blob}: expected blob type, but the object dereferences to tree type
+fatal: unable to access sparse blob in 'main^{b000blob}'
+0047aborting due to possible repository corruption on the remote side.

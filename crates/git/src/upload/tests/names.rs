@@ -5,11 +5,11 @@
 
 use std::collections::BTreeSet;
 
-use super::{MAIN_REF, answer_of};
+use super::{MAIN_REF, answer_of, command, naming};
 use crate::http::Version;
 use crate::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use crate::pktline::{self, Packet};
-use crate::served::{self, REFS, THIRD, id};
+use crate::served::{self, REFS, TAG, THIRD, id};
 use crate::store::{Abbrev, NamedRef};
 use crate::unpack::Object;
 use crate::upload::{Asked, Refusal};
@@ -360,10 +360,10 @@ fn abbreviated_and_described_names_are_read_as_git_reads_them() {
 
 /// A-640 part 4 (`get_oid_basic`'s warning, `expand_ref`; git's `fetch-sparse-warn-*`): do clone `main` under
 /// `sparse:oid=main:dir/file` with a tag `main` beside the branch, `4cdb` with a branch `4cdb` (which also abbreviates
-/// the blob `dir/file`'s name alone), and main's head's full name before `:dir/file` with a branch of that name. Expect:
-/// each answered as git answered it: its warning on band 2 after the packfile section's header, and the advice of refs
-/// named like an object after the last; then the pack of `main:dir/file`'s clone for the first and last, and for the
-/// second, the branch's commit taken, git's words for an object that is no blob, read apart from the warning.
+/// the blob `dir/file`'s name alone), and main's head's full name before `:dir/file` with a branch of that name.
+/// Expect: each answered as git answered it: its warning on band 2 after the packfile section's header, and the advice
+/// of refs named like an object after the last; then the pack of `main:dir/file`'s clone for the first and last, and
+/// for the second, the branch's commit taken, git's words for an object that is no blob, read apart from the warning.
 #[test]
 fn a_name_that_names_a_ref_and_something_else_is_warned_of_as_git_warns() {
   let fixture = served_alike();
@@ -422,4 +422,188 @@ fn the_alike_objects_are_the_ones_the_recorder_made() {
     .map(|object| object.id.to_string().get(..8).unwrap().to_owned())
     .collect();
   assert_eq!(begins, ALIKE_BEGINS);
+}
+
+/// Format: the full name of `main`'s branch, which a log's entry and a branch mark name.
+const MAIN_BRANCH: &[u8] = b"refs/heads/main";
+
+/// Why git dies of a `<blob-ish>` that names nothing: `name`, as sent.
+fn naming_nothing(name: &str) -> Option<Refusal> {
+  Some(Refusal::SparseBlob {
+    name: name.as_bytes().to_vec(),
+  })
+}
+
+/// Why git dies of a `<blob-ish>` that names the object `hex`, which is no blob.
+fn naming_no_blob(hex: &str) -> Option<Refusal> {
+  Some(Refusal::SparseData { id: id(hex) })
+}
+
+/// A-640 part 4, fifth slice (`get_oid_1`'s suffixes, `get_parent`, `get_nth_ancestor`, `lookup_commit_reference`;
+/// git's `fetch-sparse-{ancestor,parent}*`): do clone `main` under `sparse:oid=` a parent or an ancestor before
+/// `:dir/file` (of `main` by `~1`, `~`, `^`, `^0`; of `@`; of the tag `v1` by `^0`), `main^2`, `main~3` (past the
+/// root), `main~2147483648` (past git's largest count), `main~2` (whose commit has no `dir/file`), a blob's ancestor,
+/// and the alike commits' abbreviation's. Expect: each answered as git answered it: the paths served as
+/// `main:dir/file` is, the others naming nothing, git's error that the blob is no commit before its `fatal:` line, and
+/// the two commits listed for the abbreviation.
+#[test]
+fn parents_and_ancestors_are_read_as_git_reads_them() {
+  let fixture = served_alike();
+  let cases = [
+    (golden!("ancestor"), None),
+    (golden!("ancestor-bare"), None),
+    (golden!("parent"), None),
+    (golden!("parent-zero"), None),
+    (golden!("ancestor-head"), None),
+    (golden!("parent-tag"), None),
+    (golden!("parent-second"), naming_nothing("main^2:dir/file")),
+    (golden!("ancestor-past"), naming_nothing("main~3")),
+    (golden!("ancestor-huge"), naming_nothing("main~2147483648")),
+    (
+      golden!("ancestor-pathless"),
+      naming_nothing("main~2:dir/file"),
+    ),
+    (
+      golden!("ancestor-blob"),
+      naming_nothing("4cdb2265d30204be5463b38174b2e8e717982405~1"),
+    ),
+    (
+      golden!("ancestor-ambiguous"),
+      naming_nothing("67fd~1:dir/file"),
+    ),
+  ];
+  let goldens: Vec<Golden<'_>> = cases
+    .into_iter()
+    .map(|((name, request, response), refusal)| (name, request, response, refusal))
+    .collect();
+  held_to_git(&fixture, &REFS, &goldens);
+}
+
+/// A-640 part 4, fifth slice (`peel_onion`, `repo_peel_to_type`, `deref_tag`; git's `fetch-sparse-peel-*`): do clone
+/// `main` under `sparse:oid=` peels: `main^{tree}`, `main^{commit}`, `v1^{}` and `main^{/}` before `:dir/file`;
+/// `v1^{tag}`; `main^{blob}` (a commit peels to its tree, no blob); an abbreviated blob's `^{blob}`; `main^{object}`;
+/// `main^{foo}`; and `main^{commit}x}`. Expect: each answered as git answered it: the paths and the blob served, the
+/// tag and the commits naming no blob, git's error for the tree met before its `fatal:` line, `^{foo}` naming nothing,
+/// and the words after the last `^{` read as a prefix, so `^{commit}x}` names the commit.
+#[test]
+fn peels_are_read_as_git_reads_them() {
+  let fixture = served_alike();
+  let cases = [
+    (golden!("peel-tree"), None),
+    (golden!("peel-commit"), None),
+    (golden!("peel-deref"), None),
+    (golden!("peel-search-empty"), None),
+    (golden!("peel-blob"), None),
+    (golden!("peel-tag"), naming_no_blob(TAG)),
+    (golden!("peel-object"), naming_no_blob(THIRD)),
+    (golden!("peel-trailing"), naming_no_blob(THIRD)),
+    (golden!("peel-blob-mismatch"), naming_nothing("main^{blob}")),
+    (golden!("peel-unknown"), naming_nothing("main^{foo}")),
+  ];
+  let goldens: Vec<Golden<'_>> = cases
+    .into_iter()
+    .map(|((name, request, response), refusal)| (name, request, response, refusal))
+    .collect();
+  held_to_git(&fixture, &REFS, &goldens);
+}
+
+/// A-640 part 4, fifth slice (`get_oid_basic`'s log, `read_ref_at`, `interpret_branch_mark`, `branch_get_upstream`,
+/// `branch_get_push`; git's `fetch-sparse-{reflog,prior,upstream,push}*`, recorded with no log, as a bare repository
+/// keeps): do clone `main` under `sparse:oid=` `main@{1}`, `@{0}` and `HEAD@{0}` before `:dir/file`; `@{1}`,
+/// `@{yesterday}`, `@{garbage}` and `@{jan}`; `@{-1}` before `:dir/file` and `main@{-1}`; and the marks
+/// `main@{upstream}` (alone and before `:dir/file`), `@{u}`, `nosuch@{u}`, `main@{push}` and `nosuch@{push}`. Expect:
+/// each answered as git answered it: `@{0}` serving `HEAD`'s commit's path, the named logs and the branches checked
+/// out before naming nothing, git's death of the empty log for a count and the dates, nothing for a word that is no
+/// date, and git's deaths for the marks.
+#[test]
+fn a_log_entry_and_a_branch_mark_are_read_as_git_reads_them_with_no_log() {
+  let fixture = served_alike();
+  let empty = Some(Refusal::SparseEmptyLog {
+    refname: MAIN_BRANCH.to_vec(),
+  });
+  let upstream = Some(Refusal::SparseNoUpstream {
+    branch: b"main".to_vec(),
+  });
+  let nosuch = Some(Refusal::SparseNoBranch {
+    branch: b"nosuch".to_vec(),
+  });
+  let cases = [
+    (golden!("reflog-head-zero"), None),
+    (
+      golden!("reflog-branch"),
+      naming_nothing("main@{1}:dir/file"),
+    ),
+    (
+      golden!("reflog-named-head"),
+      naming_nothing("HEAD@{0}:dir/file"),
+    ),
+    (golden!("reflog-head-one"), empty.clone()),
+    (golden!("reflog-head-date"), empty.clone()),
+    (golden!("reflog-head-month"), empty),
+    (golden!("reflog-head-word"), naming_nothing("@{garbage}")),
+    (golden!("prior"), naming_nothing("@{-1}:dir/file")),
+    (golden!("prior-late"), naming_nothing("main@{-1}")),
+    (golden!("upstream"), upstream.clone()),
+    (golden!("upstream-path"), upstream.clone()),
+    (golden!("upstream-short"), upstream.clone()),
+    (golden!("push"), upstream),
+    (golden!("upstream-nosuch"), nosuch.clone()),
+    (golden!("push-nosuch"), nosuch),
+  ];
+  let goldens: Vec<Golden<'_>> = cases
+    .into_iter()
+    .map(|((name, request, response), refusal)| (name, request, response, refusal))
+    .collect();
+  held_to_git(&fixture, &REFS, &goldens);
+}
+
+/// Why a clone of `main` under `sparse:oid=<name>` is refused, served with `head` as the default branch.
+fn refused_with_head(fixture: &served::Served, name: &str, head: &[u8]) -> Option<Refusal> {
+  let filter = [b"filter sparse:oid=".as_slice(), name.as_bytes()].concat();
+  let request = command("fetch", &[&naming("want", THIRD), &filter, b"done"]);
+  let (_, answer) = answer_of(fixture, &REFS, head, Version::V2, Asked::Request(&request));
+  answer.refusal().cloned()
+}
+
+/// A-640 part 4, fifth slice (git's code, past the recordings: `approxidate_alpha` and `match_string`, `at_mark`'s
+/// `strncasecmp`, `interpret_branch_mark` past a `:`, `interpret_empty_at`, `branch_get_upstream` with no branch): do
+/// clone `main` under `sparse:oid=` `HEAD`'s log at `@{last}`, `@{NoW}`, `@{3}`, `@{Sept}` and `@{tea-time}`, and at
+/// `@{lastly}`, `@{se}` and `@{nowhere}`; `main@{U}`, `@@{u}` and `x:y@{u}`; and `@{u}` with a tag as the default
+/// branch. Expect: git's death of the empty log for the first five (a number's name, a special word in any case, a
+/// digit, a month's first letters, a special word before a dash) and nothing for the next three (a word past `last`,
+/// two of a month's letters, a word past `now`); no upstream configured for `main` for the marks in capitals and after
+/// `@` alone, nothing for a mark after a `:`; and `HEAD` naming no branch.
+#[test]
+fn dates_marks_and_a_head_on_no_branch_are_read_as_gits_code_reads_them() {
+  let fixture = served_alike();
+  let refused = |name: &str| refused_with_head(&fixture, name, MAIN_REF);
+  let empty = Some(Refusal::SparseEmptyLog {
+    refname: MAIN_BRANCH.to_vec(),
+  });
+  let dated = ["@{last}", "@{NoW}", "@{3}", "@{Sept}", "@{tea-time}"].map(refused);
+  let undated = ["@{lastly}", "@{se}", "@{nowhere}"].map(refused);
+  assert_eq!(
+    (dated, undated),
+    (
+      [(); 5].map(|()| empty.clone()),
+      ["@{lastly}", "@{se}", "@{nowhere}"].map(naming_nothing)
+    )
+  );
+  let upstream = Some(Refusal::SparseNoUpstream {
+    branch: b"main".to_vec(),
+  });
+  assert_eq!(
+    [
+      refused("main@{U}"),
+      refused("@@{u}"),
+      refused("x:y@{u}"),
+      refused_with_head(&fixture, "@{u}", b"refs/tags/v1"),
+    ],
+    [
+      upstream.clone(),
+      upstream,
+      naming_nothing("x:y@{u}"),
+      Some(Refusal::SparseDetached)
+    ]
+  );
 }

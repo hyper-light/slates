@@ -230,9 +230,8 @@ pub enum Refusal {
     /// The `<blob-ish>`, as the client sent it.
     name: Vec<u8>,
   },
-  /// A `sparse:oid` filter's `<blob-ish>` in a form of git's revision syntax this server does not resolve yet: a parent
-  /// or an ancestor (`~`, `^`), a peel or a reflog (`^{...}`, `@{...}`), or a search of commit messages (`:/`).
-  /// Answered with git's words for a name that names nothing, and why.
+  /// A `sparse:oid` filter's `<blob-ish>` that searches commit messages (`:/<text>`, `^{/<text>}`), which this server
+  /// does not resolve yet. Answered with git's words for a name that names nothing, and why.
   SparseForm {
     /// The `<blob-ish>`, as the client sent it.
     name: Vec<u8>,
@@ -251,6 +250,27 @@ pub enum Refusal {
   SparseTooLarge {
     /// The blob.
     id: ObjectId,
+  },
+  /// A `sparse:oid` filter's `<blob-ish>` that asks the upstream or the push destination (`@{upstream}`, `@{u}`,
+  /// `@{push}`) of a branch the repository holds, which a served repository configures none for (git's
+  /// `branch_get_upstream`: "no upstream configured for branch '%s'"; a push destination's default is the upstream).
+  SparseNoUpstream {
+    /// The branch, as named.
+    branch: Vec<u8>,
+  },
+  /// The same of a branch the repository does not hold ("no such branch: '%s'").
+  SparseNoBranch {
+    /// The branch, as named.
+    branch: Vec<u8>,
+  },
+  /// The same of `HEAD`'s branch when `HEAD` names none ("HEAD does not point to a branch").
+  SparseDetached,
+  /// A `sparse:oid` filter's `<blob-ish>` that asks `HEAD`'s branch's log for a count past its current entry or for a
+  /// date (`@{1}`, `@{yesterday}`), where a served repository, which is bare, keeps no log (`read_ref_at`: "log for %s
+  /// is empty").
+  SparseEmptyLog {
+    /// The branch's full name.
+    refname: Vec<u8>,
   },
   /// The negotiation refused (A-615).
   Negotiation(negotiation::Refusal),
@@ -299,6 +319,12 @@ impl Refusal {
       Refusal::SparseRelative => {
         said(&[b"relative path syntax can't be used outside working tree"])
       }
+      Refusal::SparseNoUpstream { branch } => {
+        said(&[b"no upstream configured for branch '", branch, b"'"])
+      }
+      Refusal::SparseNoBranch { branch } => said(&[b"no such branch: '", branch, b"'"]),
+      Refusal::SparseDetached => said(&[b"HEAD does not point to a branch"]),
+      Refusal::SparseEmptyLog { refname } => said(&[b"log for ", refname, b" is empty"]),
       Refusal::SparseData { id } | Refusal::SparseTooLarge { id } => {
         said(&[b"unable to parse sparse filter data in ", &hex(id)])
       }
@@ -327,10 +353,8 @@ impl Refusal {
 /// quote (`list-objects-filter.c` `filter_sparse_oid__init`).
 const SPARSE_BLOB: &[u8] = b"unable to access sparse blob in '";
 
-/// Format: why a `<blob-ish>` of a form this server does not resolve is answered as naming nothing: what it resolves.
-const SPARSE_FORMS: &[u8] =
-  b"this server resolves an object's full or abbreviated name, git describe's name or a \
-  ref, alone or with :<path>";
+/// Format: why a `<blob-ish>` that searches commit messages is answered as naming nothing: what this server resolves.
+const SPARSE_FORMS: &[u8] = b"this server resolves every revision but a search of commit messages";
 
 /// Format: the words for a request past its admission.
 const PAST_ADMISSION: &[u8] = b"upload-pack: the request needs more room than the server admits";
