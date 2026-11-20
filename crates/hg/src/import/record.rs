@@ -222,9 +222,9 @@ pub type Group<'g> = (Log<'g>, &'g [Revision<'g>]);
 
 /// One revision as the record holds it, read from the index: its node, parents, link (none for a changeset), flags,
 /// text length, and the contents its text is made of.
-struct Kept {
+pub(crate) struct Kept {
   /// The node.
-  node: Node,
+  pub(crate) node: Node,
   /// The first parent's node.
   p1: Node,
   /// The second parent's node.
@@ -232,9 +232,9 @@ struct Kept {
   /// The link's node, a manifest's or file revision's.
   link: Option<Node>,
   /// 7.2's index flags.
-  flags: u16,
+  pub(crate) flags: u16,
   /// The text's length, a file revision's block and its markers included.
-  len: u64,
+  pub(crate) len: u64,
   /// A file revision's metadata block, written between its markers before the bytes.
   block: Option<ContentId>,
   /// The text, or a file revision's bytes.
@@ -480,7 +480,7 @@ fn unreadable(radix: &[u8], rev: u32) -> WriteRefused {
 
 /// Revision `rev` of `log` as the record holds it, its parents and link read back to their nodes; `None` where the
 /// index does not answer one of them.
-fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<Kept> {
+pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<Kept> {
   if log == Log::Changelog {
     let row = index.changeset(store, rev)?;
     let parent = |number: u32| changeset_node(index, store, number);
@@ -547,7 +547,7 @@ fn write_log(
 }
 
 /// Writes a revision's text as 7.2 stores it, a file revision's block between its markers first: the bytes written.
-fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> u64 {
+pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> u64 {
   let mut written = 0u64;
   let mut put = |bytes: &[u8], written: &mut u64| {
     out.extend_from_slice(bytes);

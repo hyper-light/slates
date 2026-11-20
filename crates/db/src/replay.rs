@@ -379,6 +379,18 @@ impl Db {
       .filter(|counter| *counter <= crate::register::MAX_OBJECT_COUNTER)
   }
 
+  /// The number the `offset`-th family id minted now takes (A-636 part 2b-2): one past the highest number of any family
+  /// id created here (`Partition::family_counter`), plus `offset`, as [`Db::volume_counter_at`] mints the counters of
+  /// ids of no family. A family's numbers move only at a creation, never with the log's sequence, so the four billion a
+  /// number holds are the partition's repositories and greens, not its records. `None` past the largest number.
+  pub fn family_number_at(&self, offset: u64) -> Option<u32> {
+    self
+      .partition
+      .family_counter()
+      .checked_add(offset)
+      .and_then(|number| u32::try_from(number).ok())
+  }
+
   /// Pins a fixed cadence: the snapshots after it come every `policy.bytes_between_snapshots` of log, whatever the
   /// measured work (a model test that drives snapshots at a chosen rate; a bench that wants none).
   pub fn set_policy(&mut self, policy: SnapshotPolicy) {

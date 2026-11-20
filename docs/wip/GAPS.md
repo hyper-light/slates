@@ -530,8 +530,15 @@
 > see A-636 part 2b's amendment entry. Owed: a push's answer waiting for its records to commit (the barrier); a
 > candidate that joins a log's placement past parts every earlier one held (the log's state installed first, with a
 > state-log checkpoint, which also bounds the holders' copies); the parts rebuilt after the owner restarts; parts
-> batched; a destroyed repository's state-log registers forgotten; the greens placed on their repository's holders at
-> their joins (2b-2); the successor adopting a repository's logs by the rule (2c).
+> batched; a destroyed repository's state-log registers forgotten; the successor adopting a repository's logs by the
+> rule (2c).
+> **A-636 part 2b-2 (2026-11-20, w-shared; routed by id):** a repository's id and every green minted to join it carry
+> its family (`ObjectId::family`; tag, number), and rendezvous hashes the family (`ObjectId::line_key`), so a
+> repository, its state logs and its greens have one set of holders and one successor with nothing stored per green; a
+> green joins only its repository's family (`repository::in_family`); a lone green is a family of its own, which an
+> adopting repository joins. Owed: a green minted under no family (an older build's) cannot be adopted (refused
+> `Unsupported`); a repository made by an older build, whose id is of no family, can join no new green; the successor
+> adopting a repository's logs by the rule (2c).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -1307,8 +1314,10 @@
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
 > `check:phases` (one position for every phase) measured under concurrent pushes before it is kept; (6) the changesets
-> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream
-> clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
+> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (rendered
+> since A-706, `render::render`: split revlog v1 generaldelta revlogs of full texts, fncache, phaseroots, bookmarks,
+> obsstore; stock 7.2 `hg verify` passes on the rendered `dot` and `states` fixtures; owed: deltas and compression,
+> rendering in slices as versions commit; then `stream_out`, `stream2`, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
 > lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
 > against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
