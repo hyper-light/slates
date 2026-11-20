@@ -3000,6 +3000,10 @@ fn a_resumed_holders_catch_up_beside_a_busy_volume() {
     "LD-CU quiet v2 n {} p50 {q50:.0} us p99 {q99:.0} us max {qmax:.0} us",
     quiet_took.len()
   );
+  // The holder's counters are read before it is stopped (nothing moves them while it is): a stopped daemon is alive to
+  // its clients, so a status asked of it waits until it resumes.
+  let installs_before = counter(&holder, "fleet.live.install_taken");
+  let held_before = counter(&holder, "fleet.live.held");
   fleet.stop(target);
   let stopped_at = Instant::now();
   let change_before = counter(&owner, "fleet.live.change_bytes");
@@ -3027,14 +3031,7 @@ fn a_resumed_holders_catch_up_beside_a_busy_volume() {
       .find(|state| state.holding)
       .and_then(|state| state.head)
   };
-  let behind = v1_head().unwrap_or(0).saturating_sub(held().unwrap_or(0));
-  eprintln!(
-    "LD-CU before resume: owner v1 head {:?}, holder v1 head {:?}, {behind} behind",
-    v1_head(),
-    held()
-  );
-  let installs_before = counter(&holder, "fleet.live.install_taken");
-  let held_before = counter(&holder, "fleet.live.held");
+  eprintln!("LD-CU before resume: owner v1 head {:?}", v1_head());
   fleet.resume(target);
   let resumed = Instant::now();
   let stop = AtomicBool::new(false);
