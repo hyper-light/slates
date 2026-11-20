@@ -38,8 +38,7 @@
 //! system refused).
 //!
 //! **Bounds.** The client's input held is at most the channel's window, which the session refuses to exceed; each step
-//! hands all of it to the driver, which keeps what it must within the push's room (the edge's request room, as each of
-//! upload-pack's requests is admitted), and the window is given back. The step that ends the pack checks the whole push
+//! hands all of it to the driver, which keeps what it must within the push's room (what its shard could admit, A-704), and the window is given back. The step that ends the pack checks the whole push
 //! and the next decides it, each within that room: the driver's own steps. The advertisement and the report are written
 //! whole: a line a ref the pusher may read, and a line a command.
 //!
@@ -81,8 +80,6 @@ pub(crate) struct ReceiveCommand<S> {
   name: String,
   /// The protocol version the client asked for (`GIT_PROTOCOL`).
   version: Version,
-  /// The push's room: its request, its pack, and what reading and answering them builds.
-  room: u64,
   /// The push, once started.
   push: Option<ReceivePack>,
   /// Whether the driver has read the push whole and checked it, so it waits for its answer.
@@ -96,14 +93,13 @@ pub(crate) struct ReceiveCommand<S> {
 }
 
 impl<S: ShardLender> ReceiveCommand<S> {
-  /// A push of `principal`'s to the repository `repository` named `name`, at protocol `version`, admitted `room` bytes,
-  /// its shard's state lent by `lender`.
+  /// A push of `principal`'s to the repository `repository` named `name`, at protocol `version`, its
+  /// shard's state lent by `lender`; the push's room is the driver's (`crate::git_push::push_room`, A-704).
   pub(crate) fn new(
     lender: S,
     principal: Principal,
     (repository, name): (RepositoryId, String),
     version: Version,
-    room: u64,
   ) -> Self {
     Self {
       lender,
@@ -111,7 +107,6 @@ impl<S: ShardLender> ReceiveCommand<S> {
       repository,
       name,
       version,
-      room,
       push: None,
       checked: false,
       input: Vec::new(),
@@ -130,18 +125,11 @@ impl<S: ShardLender> ReceiveCommand<S> {
       lender,
       principal,
       repository,
-      room,
       out,
       ..
     } = self;
     let started = lent(lender, |state| {
-      ReceivePack::start(
-        state,
-        (&*principal, *repository),
-        (*room, true),
-        out,
-        Unpresented,
-      )
+      ReceivePack::start(state, (&*principal, *repository), true, out, Unpresented)
     })?;
     self.push = Some(started.map_err(|failed| refused(failed, &self.name))?);
     Ok(Stepped {

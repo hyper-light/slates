@@ -634,6 +634,134 @@ fn a_stock_git_push_over_the_daemons_edge_lands_through_the_push_driver() {
   assert_eq!(last, after);
 }
 
+/// Format: the most bytes one stored DEFLATE block holds (RFC 1951 §3.2.4: `LEN` is two bytes).
+const STORED_BLOCK: usize = 0xffff;
+
+/// Format: Adler-32's modulus, the largest prime below 2^16 (RFC 1950 §8.2).
+const ADLER_MODULUS: u32 = 65_521;
+
+/// `data` as a zlib stream of stored blocks (RFC 1950 §2.2, RFC 1951 §3.2.4): what git's reader inflates to `data`,
+/// a few bytes longer than it, so a pack of it is longer than its content.
+fn stored_zlib(data: &[u8]) -> Vec<u8> {
+  let mut out = vec![0x78, 0x01];
+  let mut blocks = data.chunks(STORED_BLOCK).peekable();
+  while let Some(block) = blocks.next() {
+    out.push(u8::from(blocks.peek().is_none()));
+    let len = u16::try_from(block.len()).expect("a stored block's length");
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(block);
+  }
+  let (low, high) = data.iter().fold((1u32, 0u32), |(low, high), byte| {
+    let low = (low + u32::from(*byte)) % ADLER_MODULUS;
+    (low, (high + low) % ADLER_MODULUS)
+  });
+  out.extend_from_slice(&((high << 16) | low).to_be_bytes());
+  out
+}
+
+/// A pack of `objects`, each stored whole in stored blocks.
+fn stored_pack(objects: &[(slates_git::object_name::Kind, &[u8])]) -> Vec<u8> {
+  use slates_git::entry::{self, Header, Representation};
+  let mut out = Vec::new();
+  let count = u32::try_from(objects.len()).expect("a count");
+  let mut writer = slates_git::pack::Writer::new(GitFormat::Sha1, count, &mut out);
+  let mut at = entry::PACK_HEADER_LEN;
+  for (kind, content) in objects {
+    let header = Header {
+      representation: Representation::Whole(*kind),
+      size: u64::try_from(content.len()).expect("a size"),
+    };
+    let zlib = stored_zlib(content);
+    entry::write(header, at, &mut writer).expect("the entry's header");
+    slates_git::out::Out::put(&mut writer, &zlib);
+    let len = entry::written_len(header, at).expect("the header's length");
+    at += len + u64::try_from(zlib.len()).expect("a length");
+  }
+  writer.finish().expect("the trailer");
+  out
+}
+
+/// The name git gives an object of `kind` holding `content`.
+fn git_name(kind: slates_git::object_name::Kind, content: &[u8]) -> ObjectId {
+  slates_git::object_name::name_of(GitFormat::Sha1, kind, content).expect("named")
+}
+
+/// Stock git's request creating `main` at a root commit whose one file is `bytes` long, and that commit: the file's
+/// bytes counted out by a 64-bit LCG (Knuth's MMIX constants), so no two windows of it repeat.
+fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
+  use slates_git::object_name::Kind;
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  let blob: Vec<u8> = (0..bytes)
+    .map(|_| {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      state.to_be_bytes()[0]
+    })
+    .collect();
+  let blob_id = git_name(Kind::Blob, &blob);
+  let mut tree = b"100644 large\0".to_vec();
+  tree.extend_from_slice(blob_id.as_bytes());
+  let tree_id = git_name(Kind::Tree, &tree);
+  let commit = format!(
+    "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\nlarge\n"
+  )
+  .into_bytes();
+  let commit_id = git_name(Kind::Commit, &commit);
+  let pack = stored_pack(&[
+    (Kind::Commit, &commit),
+    (Kind::Tree, &tree),
+    (Kind::Blob, &blob),
+  ]);
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {commit_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  (request, commit_id)
+}
+
+/// A-704 (found by use, 2026-11-19: stock git's push of git/git, a 324 MiB pack, answered `413`, and its
+/// `refs/tags/v0.99` alone `unpack eof before pack header was fully read`; receive.maxInputSize is git's own bound, and
+/// it is unset by default). Do: start a two-shard daemon whose edge serves loopback TLS, each request admitted one ring
+/// region (the edge's `Bounds::room`); create a git repository and push, as stock git posts it, a create of `main` at a
+/// commit whose one file is twice that room, so the pack and what reading it builds are each past it; then ask for the
+/// advertisement. Expect: the push `200`, its report `unpack ok` and `ok refs/heads/main`; `main` advertised at the
+/// commit: a push is bounded by what its repository's shard can hold, never by one request's room.
+#[test]
+fn a_push_whose_pack_is_larger_than_one_ring_region_lands_through_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let room = super::bounds_of(&crate::DaemonConfig::derive(
+    &crate::daemon::test_profile(),
+    &instance,
+    Some(SHARDS),
+  ))
+  .room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(usize::try_from(room * 2).expect("a size"));
+  let created = pushed(edge, &name, &request);
+  let after = advertised(edge, &name);
+  daemon.stop();
+  let mut report = Vec::new();
+  for line in [b"unpack ok\n".as_slice(), b"ok refs/heads/main\n"] {
+    pktline::write(Packet::Data(line), &mut report).expect("a line");
+  }
+  pktline::write(Packet::Flush, &mut report).expect("the flush");
+  let main = [(commit, b"refs/heads/main".as_slice())];
+  assert_eq!(
+    (created.0, String::from_utf8_lossy(&created.1)),
+    (200, String::from_utf8_lossy(&report))
+  );
+  assert_eq!(after, (200, served_advertisement(&main)));
+}
+
 /// Shape: the room a pack is read whole within here: far past the `create` push's three small objects.
 const PACK_ROOM: u64 = 1 << 20;
 

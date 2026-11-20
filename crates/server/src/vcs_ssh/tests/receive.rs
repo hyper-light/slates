@@ -92,7 +92,7 @@ fn serving(state: &mut ShardState) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
   ReceivePack::start(
     state,
     (&owner(), repository),
-    (ROOM, true),
+    true,
     &mut advertised,
     Unpresented,
   )
@@ -280,7 +280,7 @@ fn died(message: &str) -> Refused {
 #[test]
 fn t_a683_a_push_whose_shard_is_not_lent_is_refused_as_not_served() {
   let mut command =
-    ReceiveCommand::new(NotLent, owner(), (GONE, NAME.to_owned()), Version::V1, ROOM);
+    ReceiveCommand::new(NotLent, owner(), (GONE, NAME.to_owned()), Version::V1);
   assert_eq!(
     ready(command.step()),
     Err(died("git-receive-pack is not served yet"))
@@ -300,7 +300,6 @@ fn t_a683_a_repository_gone_before_its_push_starts_is_refused_in_gits_words() {
       owner(),
       (GONE, "gone".to_owned()),
       Version::V0,
-      ROOM,
     );
     ready(command.step())
   });

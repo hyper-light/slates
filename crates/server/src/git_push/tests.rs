@@ -21,9 +21,6 @@ use super::{AGENT, Answering, HOOK_NOT_RUN, ReceivePack, Unpresented};
 use crate::state::ShardState;
 use crate::verbs::dispatch;
 
-/// Shape: the room each test push is admitted: far past the largest fixture's bytes and what reading it builds.
-const ROOM: u64 = 1 << 24;
-
 /// Shape: the bytes an edge hands the driver at a time: fewer than any request holds and no multiple of a packet's
 /// length, so every push arrives over several calls and some packet across two.
 const PIECE: usize = 97;
@@ -305,7 +302,7 @@ fn started(state: &mut ShardState, repository: RepositoryId) -> (Vec<u8>, Receiv
   let push = ReceivePack::start(
     state,
     (&owner(), repository),
-    (ROOM, true),
+    true,
     &mut advertised,
     Unpresented,
   )
@@ -694,7 +691,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
     ReceivePack::start(
       state,
       (&owner(), repository),
-      (ROOM, false),
+      false,
       &mut Vec::new(),
       presenter,
     )

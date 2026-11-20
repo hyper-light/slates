@@ -8,7 +8,7 @@
 //! owner shard, where the site moved the connection (A-625 part 3), and holds nothing of the shard after it returns; the
 //! exchange keeps the driver between the edge's turns and is lent the shard's state afresh for each step, so a push never
 //! holds its shard across a wait. The request's body goes to the driver a run at a time as it arrives, charged to the
-//! edge's request room; once the body has ended the push is answered a step at a time (A-665 part 3): the shard yielded
+//! push's room, what its shard could admit (A-704); once the body has ended the push is answered a step at a time (A-665 part 3): the shard yielded
 //! between the turns of a hook's view's sealing, and a hook run off the shard's step, its answer handed back in a step
 //! of its own. What the push wrote is given back a pkt-line's room at a time (`slates_git::pktline::MAX_LEN`), as
 //! upload-pack's answer is, so no reply run is longer. The daemon's presenter shows no hook's view yet
@@ -62,21 +62,19 @@ impl ShardLender for ThisShard {
   }
 }
 
-/// git's receive-pack through the push driver on the shard `lender` lends, each push admitted `room` bytes: its
-/// request, its pack and what reading and answering them builds. upload-pack is not its half: it answers `503` for it
+/// git's receive-pack through the push driver on the shard `lender` lends, each push admitted what its shard could
+/// admit (`crate::git_push::push_room`, A-704), never the edge's request room. upload-pack is not its half: it answers `503` for it
 /// ([`super::Halves`] pairs the two).
 #[derive(Clone, Debug)]
 pub(crate) struct ReceiveServices<L> {
   /// Where the shard's state is lent.
   lender: L,
-  /// The bytes each push may hold: the edge's request room.
-  room: u64,
 }
 
 impl<L> ReceiveServices<L> {
-  /// receive-pack over the state `lender` lends, each push admitted `room` bytes.
-  pub(crate) fn new(lender: L, room: u64) -> Self {
-    Self { lender, room }
+  /// receive-pack over the state `lender` lends.
+  pub(crate) fn new(lender: L) -> Self {
+    Self { lender }
   }
 }
 
@@ -93,7 +91,7 @@ impl<L: ShardLender + Clone> GitServices for ReceiveServices<L> {
         .map_err(|_| ServiceRefused::Unwritable)?;
     }
     let who = (start.principal, start.repository.id);
-    let asked = (self.room, start.advertise);
+    let asked = start.advertise;
     let push = self
       .lender
       .lend(|state| ReceivePack::start(state, who, asked, &mut given, Unpresented))

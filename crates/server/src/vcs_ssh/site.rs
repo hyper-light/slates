@@ -360,7 +360,6 @@ where
           start.principal.clone(),
           (repository.id, repository.name.clone()),
           version,
-          self.room,
         ))))
       }
       (Service::Mercurial { hidden }, Some(repository)) if self.hg.holds(repository.id) => {
