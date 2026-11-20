@@ -2862,6 +2862,24 @@
 > - **Owed (A-354):** the reply a write through the successor held waited without a bound; held replies of the slates
 >   protocol are judged by no time bound (NFS and FUSE judge theirs by `durable_bound` up to the failover SLO).
 
+> **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
+> work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
+> at v2.0.0 left the daemon in a restart loop: 78 exits, each `daemon exited (Some(0))`. Each restart served,
+> re-started its recovered fragment encoding (97% CPU, one poll 3.5 s), then logged "the stop watch could not be
+> installed (the budget of 10000 ms elapsed at execution after 1 attempt(s) (35963 ms)); stopping", while a
+> `git clone --depth 1` waited 16 minutes. The stop watch was installed by an observation of the control shard under the
+> observe budget (ten liveness windows), which a shard busy past that budget's CPU refused, and the role read the
+> refusal as its reason to stop. The watch now reaches the control shard over a channel its start receives
+> (`ShardHolds::stop_watch`), taken in at the heartbeat; `Daemon::wait_for_stop` only sends it, so no work on the shard
+> can refuse it and the install has no budget. Priority was not the lever: a shard held alone runs nothing else by design
+> (`spawn_alone`), so an install that needs a shard turn waits for the work however it is ordered. Test:
+> `a_stop_watch_asked_of_a_busy_control_shard_is_installed_and_waits_for_a_reason` (`crates/server/tests/daemon.rs`:
+> the control shard held alone by busy work for the old budget at this build's cost and a window more; Adas-Mac-Studio-4,
+> base cdfbb4020: busy 31.8 s and the watch still waiting after it, ending at its reason at 32.3 s; with the change
+> reversed, the wait ended at 31.4 s while the shard was busy for 32.2 s, the refusal the daemon stopped on). Owed (w-k90-vendor):
+> slicing the encode poll (`git_encode.rs:345`); owed (R3): `OBSERVE_BUDGET_NS`, ten liveness windows, still bounds every
+> other observation.
+
 > **A forward lane's floor was logged once a forward: about a million lines, 260 MB, in one flow (2026-11-20; CLOSED,
 > g226; found by w-fed-faults).** A lane left with nothing was dropped, so each forward made it afresh and measured its
 > floor from nothing; where the floor sat past the failover delay (3,102 ms against 3,100), every forward crossed it

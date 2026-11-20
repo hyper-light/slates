@@ -250,6 +250,8 @@ pub struct RecordDialReport {
 
 /// The daemon.
 pub struct Daemon {
+  /// Where [`Self::wait_for_stop`] hands the control shard its watch, taken in at the next heartbeat.
+  stop_watch_send: std::sync::mpsc::SyncSender<StopWatch>,
   runtime: Option<Runtime>,
   segment: AnchorSegment,
   doorbell: Option<DoorbellThread>,
@@ -1101,6 +1103,11 @@ impl Daemon {
       crate::watchdog::own_window_ns,
       HEARTBEAT_NS,
     );
+    // The process thread's stop watch reaches the control shard over this channel, not as a question the shard must
+    // answer: a shard busy with recovered work answers late, and a watch refused for it stopped the daemon, whose anchor
+    // restarted it into the same work (w-interop's restart loop, 2026-11-20). One slot: one process thread waits.
+    let (stop_watch_send, stop_watch_install) = std::sync::mpsc::sync_channel::<StopWatch>(1);
+    let mut stop_watch_install = Some(stop_watch_install);
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();
@@ -1108,8 +1115,15 @@ impl Daemon {
       let partition = u16::try_from(index).unwrap_or(u16::MAX);
       let all: Vec<u16> = shards.iter().map(|s| s.0).collect();
       let retained = retained.clone();
+      // The stop watch's channel goes to the control shard, in its state before anything runs on the shard.
+      let stop_watch = if index == 0 {
+        stop_watch_install.take()
+      } else {
+        None
+      };
       #[cfg(unix)]
       let holds = ShardHolds {
+        stop_watch,
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
@@ -1117,6 +1131,7 @@ impl Daemon {
       };
       #[cfg(windows)]
       let holds = ShardHolds {
+        stop_watch,
         winfsp: inherited_winfsp.next().unwrap_or_default(),
         channel: if index == 0 {
           windows_channel.take()
@@ -1263,6 +1278,7 @@ impl Daemon {
     // every shard keeping its seats for the connections that move to their repository's owner.
     let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
     Ok(Daemon {
+      stop_watch_send,
       runtime: Some(runtime),
       segment,
       doorbell,
@@ -2135,22 +2151,25 @@ impl Daemon {
   /// returning true (the caller's own reasons: a signal, a gone parent). Both are asked at the control shard's
   /// heartbeat, which beats at this cadence anyway, so the waiting thread wakes for nothing else. Before 2026-10-10 the
   /// daemon process's thread polled the same three questions every heartbeat on its own, ten wakeups a second at rest
-  /// (BENCHMARKS). Returns once a reason holds, or when the control shard's state ends (its watch dropped); the caller
-  /// asks which reason it was. A refusal to install the watch is the control shard's typed refusal.
-  pub fn wait_for_stop(
-    &self,
-    also: impl Fn() -> bool + Clone + Send + 'static,
-  ) -> Result<(), ObserveError> {
+  /// (BENCHMARKS). Returns once a reason holds, or when the control shard's state ends (its watch dropped).
+  ///
+  /// The watch is handed to the control shard over the channel its start received, and taken in at its next heartbeat:
+  /// nothing here waits on the shard's work, so a shard busy with recovered work cannot refuse it. Until 2026-11-20 the
+  /// watch was installed by an observation under the observe budget (ten liveness windows, a fixed 10,000 ms), and a
+  /// control shard whose recovered encoding held it past that refused the install; the daemon stopped itself, exited 0,
+  /// and its anchor restarted it into the same work, 78 times in w-interop's git matrix, its clients waiting meanwhile.
+  pub fn wait_for_stop(&self, also: impl Fn() -> bool + Send + 'static) {
     let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
-    self.observe(self.shards.first().copied(), move |s| {
-      s.stop_watch = Some(StopWatch {
-        also: Box::new(also.clone()),
-        wake: wake.clone(),
-      });
-    })?;
+    let watch = StopWatch {
+      also: Box::new(also),
+      wake,
+    };
+    // A send refused means the control shard's state, and the channel with it, is gone: the daemon is stopping.
+    if self.stop_watch_send.send(watch).is_err() {
+      return;
+    }
     // Either a reason was sent, or the watch's sender went with the control shard's state: both end the wait.
     let _reason_or_gone = woken.recv();
-    Ok(())
   }
 
   /// Hands off every consensus leadership this daemon holds before it stops (thesis §3.10;
@@ -4371,6 +4390,8 @@ fn shard_arena(
 #[cfg(unix)]
 #[derive(Debug, Default)]
 struct ShardHolds {
+  /// Where the process thread's stop watch arrives (the control shard's alone; [`StopWatch`]).
+  stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
   /// The held devices.
   devices: Vec<crate::fuse_hold::HeldDevice>,
   /// The held writable copies.
@@ -4384,6 +4405,8 @@ struct ShardHolds {
 /// control shard's alone), and its Shards streams' resync ends (A-433) and DAX sections (A-448).
 #[cfg(windows)]
 struct ShardHolds {
+  /// Where the process thread's stop watch arrives (the control shard's alone; [`StopWatch`]).
+  stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
   /// The held WinFsp mounts.
   winfsp: Vec<crate::winfsp::InheritedMount>,
   /// The hold channel's daemon end: the control shard installs it.
@@ -4550,6 +4573,7 @@ async fn init_shard(
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
   #[cfg(windows)]
   let ShardHolds {
+    stop_watch: stop_watch_install,
     winfsp: inherited_winfsp,
     channel: windows_channel,
     resync: inherited_resync,
@@ -4557,6 +4581,8 @@ async fn init_shard(
   } = holds;
   #[cfg(unix)]
   let inherited_dax = holds.dax;
+  #[cfg(unix)]
+  let stop_watch_install = holds.stop_watch;
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
   // failure, as a refused serve loop is below.
@@ -4943,6 +4969,7 @@ async fn init_shard(
     pressure_task: None,
     pressure_asked: false,
     stop_watch: None,
+    stop_watch_install,
     nfs_purges_refused: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
@@ -6741,6 +6768,15 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
       Err(_) => (false, None),
     };
     state::with_state(|s| {
+      // A watch the process thread sent since the last beat is taken in now ([`Daemon::wait_for_stop`]).
+      if s.stop_watch.is_none()
+        && let Some(watch) = s
+          .stop_watch_install
+          .as_ref()
+          .and_then(|install| install.try_recv().ok())
+      {
+        s.stop_watch = Some(watch);
+      }
       if let Some(watch) = s.stop_watch.as_ref()
         && (requested || (watch.also)())
       {

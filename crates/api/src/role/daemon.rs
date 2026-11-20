@@ -294,12 +294,8 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
   // The process thread waits for a reason to stop without polling: the control shard's heartbeat asks the anchor's
   // stop request and these two at its own cadence and wakes this thread once one holds.
   let watch = parent;
-  let waited = daemon.wait_for_stop(move || signal::stop_requested() || !watch.anchor_alive());
-  if let Err(refusal) = waited {
-    slates_machine::log_line!(
-      "slates daemon: the stop watch could not be installed ({refusal}); stopping"
-    );
-  } else if signal::stop_requested() || daemon.stop_requested() {
+  daemon.wait_for_stop(move || signal::stop_requested() || !watch.anchor_alive());
+  if signal::stop_requested() || daemon.stop_requested() {
     // A planned stop: hand off any consensus leadership first, so the groups pay a handoff rather than the
     // election timeout a leader loss waits out (bounded; the anchor holds the daemon to its declaration).
     match daemon.drain_leadership() {
