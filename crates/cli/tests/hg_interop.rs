@@ -706,3 +706,94 @@ fn stock_hg_clones_over_the_ssh_edge() {
     "hg pull over the SSH edge: {code} {out}{err}"
   );
 }
+
+/// A-575 and A-654 (`slates repository branch create|retire|bind` in a Mercurial repository, where a plain name is a
+/// bookmark; 62fb88997). Do: over the HTTP edge, push a first changeset to `default` as stock hg 7.2; make `topic` from
+/// `default` with the CLI and list a fresh clone's bookmarks; retire `topic` and list another fresh clone's; bind `topic`
+/// again to the green the create printed and list a third's. Expect `topic` at the pushed changeset after the create,
+/// gone after the retire, and back at the same changeset after the bind: stock hg sees the namespace the CLI changes.
+/// Skips loudly without stock hg 7.2 ([`STOCK_HG`]) and where the platform names no issuer surface ([`issuer_of`]).
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_sees_the_bookmarks_the_cli_makes_retires_and_binds() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping the branch verbs under stock hg: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-bookmarks-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "the branch verbs under stock hg") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let url = format!("{prefix}r");
+  let scratch = Scratch::new("hg-bookmarks");
+  let local = format!("{}/local", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(
+    &hg,
+    &local,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  hg_ok(&hg, &local, &with_config(&["push", &url], &config));
+  let pushed = hg_nodes(&hg, &local).into_iter().next().unwrap_or_default();
+  let verb = |args: &[&str]| {
+    let (code, out, err) = slates(&instance, &[], args);
+    assert_eq!(code, 0, "{args:?}: {out}{err}");
+    out
+  };
+  let mut clones = 0;
+  let mut bookmarks = || {
+    clones += 1;
+    let copy = format!("{}/copy-{clones}", scratch.path);
+    hg_ok(
+      &hg,
+      &scratch.path,
+      &with_config(&["clone", "-U", &url, &copy], &config),
+    );
+    hg_ok(
+      &hg,
+      &copy,
+      &["bookmarks", "--template", "{bookmark} {node}\\n"],
+    )
+  };
+  let made = verb(&[
+    "repository",
+    "branch",
+    "create",
+    "r",
+    "topic",
+    "--from",
+    "default",
+  ]);
+  let green = value_of(&made, "id");
+  let after_create = bookmarks();
+  verb(&["repository", "branch", "retire", "r", "topic"]);
+  let after_retire = bookmarks();
+  verb(&["repository", "branch", "bind", "r", "topic", &green]);
+  let after_bind = bookmarks();
+  let topic = format!("topic {pushed}");
+  assert_eq!(
+    (
+      after_create.contains(&topic),
+      after_retire.contains("topic "),
+      after_bind.contains(&topic),
+    ),
+    (true, false, true),
+    "created: {after_create}; retired: {after_retire}; bound: {after_bind}"
+  );
+}
