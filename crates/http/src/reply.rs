@@ -146,6 +146,10 @@ pub enum Body {
   /// No framing field: the body ends when the connection does (RFC 9112 §6.3 item 8), the framing an HTTP/1.0 client
   /// reads. `Connection: close` is written whatever the caller asked.
   UntilClose,
+  /// No content and no framing field: a `204` (RFC 9110 §8.6, "A server MUST NOT send a Content-Length header field in
+  /// any response with a status code of 1xx (Informational) or 204 (No Content)"; RFC 9112 §6.1, the same for
+  /// `Transfer-Encoding`), whose end is its head's.
+  Empty,
 }
 
 /// A field a reply could not carry: its name is no token, or its value holds a control byte other than HTAB.
@@ -227,7 +231,7 @@ fn framing(body: Body, close: bool, out: &mut Vec<u8>) {
   match body {
     Body::Length(length) => field(CONTENT_LENGTH, length.to_string().as_bytes(), out),
     Body::Chunked => field(TRANSFER_ENCODING, CHUNKED, out),
-    Body::UntilClose => {}
+    Body::UntilClose | Body::Empty => {}
   }
   if close || body == Body::UntilClose {
     field(CONNECTION, CLOSE, out);

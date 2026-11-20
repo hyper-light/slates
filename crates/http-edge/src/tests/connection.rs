@@ -860,3 +860,49 @@ fn a_service_names_its_reply_status_as_its_reply_begins() {
     (named, late)
   );
 }
+
+/// A-681 (RFC 9110 §15.3.5, §8.6; RFC 9112 §6.1): do serve a request whose service names `204 No Content` as its reply
+/// begins (a WebDAV `DELETE`'s or an updating `PUT`'s answer, which stock svn requires), the service writing nothing,
+/// then one request more on the connection. Expect the head `204` with neither `Content-Length` nor
+/// `Transfer-Encoding`, no body or last chunk after it, and the connection kept for the next request.
+#[test]
+fn a_service_may_answer_no_content_with_no_framing_and_no_body() {
+  let no_content = Status {
+    code: 204,
+    reason: "No Content",
+  };
+  let mut connection = Connection::clear(ROOM);
+  let (mut written, mut fed, mut asked) = (Vec::new(), 0, 0);
+  let mut named = false;
+  let written = loop {
+    match connection.next() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Read if fed == 2 => connection.peer_closed(),
+      Next::Read => {
+        fed += 1;
+        connection.receive(b"DELETE /repo/!svn/txr/1-2/a HTTP/1.1\r\nHost: h\r\n\r\n");
+      }
+      Next::Decide => {
+        asked += 1;
+        connection.decide(Decision::Serve {
+          fields: Fields::new(),
+          head_only: false,
+          status: StatusMode::AfterBody,
+        });
+        named = false;
+      }
+      Next::Body(_) => connection.body_taken(),
+      Next::BodyEnd => {}
+      Next::Reply if !named => {
+        named = true;
+        connection.reply_status(no_content);
+      }
+      Next::Reply => connection.reply_end(),
+      Next::CloseWrite | Next::Drain | Next::Close => {
+        break String::from_utf8_lossy(&written).into_owned();
+      }
+    }
+  };
+  let one = "HTTP/1.1 204 No Content\r\n\r\n";
+  assert_eq!((written, asked), (format!("{one}{one}"), 2));
+}
