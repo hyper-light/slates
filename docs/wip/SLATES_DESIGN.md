@@ -55444,6 +55444,23 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-743 — Every name the namespace binds is a ref git's site serves (bug, 2026-11-20, w-git for UI goal 93; main's ruling; found by use by w-interop)
+- **Found by use.** Stock git 2.50.1 over the HTTP edge: a branch made with `slates repository branch create project
+  topic --from main` never showed in `git ls-remote --heads`. The advertisement listed each bound name whose green held a
+  git version in the store, and a branch the CLI made held none.
+- **Change.** `CreateBranch` records the new green's first store version, at its head version, naming the commit its
+  branch was made at (`vcs_store::commits::branch_made`, the made commit's parent rule), as a push of no objects moving
+  one ref is recorded, so it is replayed with the log. The advertisement, upload-pack's lender and a push all read it:
+  `RetireBranch` drops the ref, `BindBranch` brings it back, and a push to `refs/heads/topic` moves the green the CLI made.
+  A refusal is counted (`vcs_commits.branch_ref_unmade`).
+- **Tests.** `slates-server` `git_push::tests::t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_green`
+  (red before: `(false, false, false)`); `crates/cli/tests/git_interop.rs`
+  `stock_git_sees_the_branches_the_cli_makes_retires_and_binds` un-ignored and passing under stock git 2.50.1. The
+  atomic test's unborn CLI branch is now made at `main`'s version before its first push.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- git_push::tests
+  repository:: vcs_store:: vcs_http::git` 146 passed; `cargo test --locked -p slates-cli --test git_interop --
+  stock_git_sees_the_branches` 1 passed; fmt clean.
+
 ### A-664 live whole builds, the push storm — A push landing mid-build moves the build to the newest head at a slice's boundary, never starts it again (2026-11-20, w-shared for UI goal 93; main's ruling)
 - **Why.** Part 1 started a green's whole build again from nothing at every push that landed while it ran, so under
   a steady stream of pushes (the target is tens of thousands concurrent) a busy repository's build never ended.
