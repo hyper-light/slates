@@ -720,8 +720,8 @@ fn read_one<'a>(
       vparse(inner, format, at, got)?;
       return Ok(Step::Read);
     }
-    (b'c' | b's', Some(Value::String(bytes))) => Got::Bytes(letter, *bytes),
-    (b'w', Some(Value::Word(word))) => Got::Word(*word),
+    (b'c' | b's', Some(Value::String(bytes))) => Got::Bytes(letter, bytes),
+    (b'w', Some(Value::Word(word))) => Got::Word(word),
     (b'b', Some(Value::Word("true"))) => Got::Boolean(true),
     (b'b', Some(Value::Word("false"))) => Got::Boolean(false),
     (b'n' | b'r', Some(Value::Number(number))) => Got::Number(letter, *number),

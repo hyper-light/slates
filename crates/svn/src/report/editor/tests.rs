@@ -514,12 +514,15 @@ fn a_node_past_the_bound_on_nodes_open_is_refused() {
   );
 }
 
+/// An svndiff integer case: its bytes, and the value and length read, or none.
+type IntegerCase = (&'static [u8], Option<(u64, usize)>);
+
 /// A-616 part 2 (`notes/svndiff`'s integers, read back from the writer's own encoding): read
 /// integers at their limits and past them; expect each value and length, and none for a cut, an
 /// eleventh byte or a value past 64 bits.
 #[test]
 fn svndiff_integers_are_read_within_the_format() {
-  let cases: [(&[u8], Option<(u64, usize)>); 7] = [
+  let cases: [IntegerCase; 7] = [
     (b"\x00", Some((0, 1))),
     (b"\x7f", Some((127, 1))),
     (b"\x81\x00", Some((128, 2))),

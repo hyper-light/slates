@@ -8487,86 +8487,85 @@ mod clone_count_tests {
     (volume.inode_usage().0, volume.entry_usage().0)
   }
 
-  /// Makes `case`'s origin, clone and clone of the clone, images them, restarts, and compares: `Ok` when the restart
-  /// rebuilt each and every volume made of them reads and counts as before it, else the step that refused or the
-  /// first difference.
-  fn rebuilt_as_it_was(case: u32) -> Result<(), String> {
-    let mut store = store();
+  /// `case`'s origin: d with its files and the root's, a snapshot, files made after it and before-0 removed, and d
+  /// changed when the case says so. Returns the origin and its snapshot.
+  fn make_origin(store: &mut Store, case: u32) -> Result<(Volume, SnapshotId), String> {
     let mut origin = step(
       "make the origin",
-      Volume::create(&mut store, config(ORIGIN_PREFIX)),
+      Volume::create(store, config(ORIGIN_PREFIX)),
     )?;
-    let root = step("the origin's root", origin.root_inode(&store))?;
-    let inner = step("make d", origin.mkdir_no(&mut store, root, "d", DIR_MODE))?;
+    let root = step("the origin's root", origin.root_inode(store))?;
+    let inner = step("make d", origin.mkdir_no(store, root, "d", DIR_MODE))?;
     for n in 0..INNER {
       let name = format!("inner-{n}");
       step(
         "make d's files",
-        origin.create_file_no(&mut store, inner, &name, FILE_MODE),
+        origin.create_file_no(store, inner, &name, FILE_MODE),
       )?;
     }
     for n in 0..BEFORE {
       let name = format!("before-{n}");
       step(
         "make the root's files",
-        origin.create_file_no(&mut store, root, &name, FILE_MODE),
+        origin.create_file_no(store, root, &name, FILE_MODE),
       )?;
     }
-    let cut = step("snapshot the origin", origin.snapshot(&mut store))?;
+    let cut = step("snapshot the origin", origin.snapshot(store))?;
     for n in 0..AFTER {
       let name = format!("after-{n}");
       step(
         "make files after the snapshot",
-        origin.create_file_no(&mut store, root, &name, FILE_MODE),
+        origin.create_file_no(store, root, &name, FILE_MODE),
       )?;
     }
-    step(
-      "remove before-0",
-      origin.unlink_no(&mut store, root, "before-0"),
-    )?;
+    step("remove before-0", origin.unlink_no(store, root, "before-0"))?;
     if case & ORIGIN_CHANGES_D != 0 {
       step(
         "make inner-after",
-        origin.create_file_no(&mut store, inner, "inner-after", FILE_MODE),
+        origin.create_file_no(store, inner, "inner-after", FILE_MODE),
       )?;
-      step(
-        "remove inner-0",
-        origin.unlink_no(&mut store, inner, "inner-0"),
-      )?;
+      step("remove inner-0", origin.unlink_no(store, inner, "inner-0"))?;
     }
-    let mut clone = step(
-      "clone the origin's snapshot",
-      Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)),
-    )?;
-    let clone_root = step("the clone's root", clone.root_inode(&store))?;
-    let clone_inner = step("the clone's d", clone.lookup_no(&store, clone_root, "d"))?.inode;
+    Ok((origin, cut))
+  }
+
+  /// `case`'s changes to `clone`: a file made, an inherited file removed, a directory made, a snapshot of its own with
+  /// a file made after it, and an inherited file rewritten, each when the case says so. Returns the clone's snapshot,
+  /// if it took one.
+  fn change_clone(
+    store: &mut Store,
+    clone: &mut Volume,
+    case: u32,
+  ) -> Result<Option<SnapshotId>, String> {
+    let clone_root = step("the clone's root", clone.root_inode(store))?;
+    let clone_inner = step("the clone's d", clone.lookup_no(store, clone_root, "d"))?.inode;
     let inherited = step(
       "the clone's before-1",
-      clone.lookup_no(&store, clone_root, "before-1"),
+      clone.lookup_no(store, clone_root, "before-1"),
     )?
     .inode;
     step(
       "make clone-made",
-      clone.create_file_no(&mut store, clone_root, "clone-made", FILE_MODE),
+      clone.create_file_no(store, clone_root, "clone-made", FILE_MODE),
     )?;
     if case & CLONE_REMOVES_INHERITED != 0 {
       step(
         "remove inner-1 in the clone",
-        clone.unlink_no(&mut store, clone_inner, "inner-1"),
+        clone.unlink_no(store, clone_inner, "inner-1"),
       )?;
     }
     if case & CLONE_MAKES_DIRECTORY != 0 {
       step(
         "make e in the clone",
-        clone.mkdir_no(&mut store, clone_root, "e", DIR_MODE),
+        clone.mkdir_no(store, clone_root, "e", DIR_MODE),
       )?;
     }
     let clone_cut = if case & CLONE_SNAPSHOT != 0 {
-      let clone_cut = step("snapshot the clone", clone.snapshot(&mut store))?;
+      let clone_cut = step("snapshot the clone", clone.snapshot(store))?;
       let after = "after-the-clones-snapshot";
       step(
         "make a file after the clone's snapshot",
-        clone.create_file_no(&mut store, clone_root, after, FILE_MODE),
+        clone.create_file_no(store, clone_root, after, FILE_MODE),
       )?;
       Some(clone_cut)
     } else {
@@ -8575,9 +8574,23 @@ mod clone_count_tests {
     if case & CLONE_REWRITES_INHERITED != 0 {
       step(
         "rewrite before-1 in the clone",
-        clone.write(&mut store, inherited, 0, REWRITTEN),
+        clone.write(store, inherited, 0, REWRITTEN),
       )?;
     }
+    Ok(clone_cut)
+  }
+
+  /// Makes `case`'s origin, clone and clone of the clone, images them, restarts, and compares: `Ok` when the restart
+  /// rebuilt each and every volume made of them reads and counts as before it, else the step that refused or the
+  /// first difference.
+  fn rebuilt_as_it_was(case: u32) -> Result<(), String> {
+    let mut store = store();
+    let (mut origin, cut) = make_origin(&mut store, case)?;
+    let mut clone = step(
+      "clone the origin's snapshot",
+      Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)),
+    )?;
+    let clone_cut = change_clone(&mut store, &mut clone, case)?;
     let clone_of_clone = match clone_cut {
       Some(clone_cut) if case & CLONE_OF_CLONE != 0 => Some(step(
         "clone the clone's snapshot",

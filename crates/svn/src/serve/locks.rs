@@ -121,10 +121,13 @@ pub(super) struct Pending {
   /// Which verb.
   verb: Verb,
   /// Each path's answer in the client's order: its lock (an unlock's none), or its failure.
-  answers: Vec<(Vec<u8>, Result<Option<Lock>, Failure>)>,
+  answers: Vec<PathAnswer>,
   /// The whole request's refusal.
   whole: Option<Failure>,
 }
+
+/// A path and its answer: its lock (an unlock's none), or its failure.
+type PathAnswer = (Vec<u8>, Result<Option<Lock>, Failure>);
 
 /// The head as the lock guard reads it: the index's youngest revision and its nodes.
 struct IndexHead<'i>(&'i Index);
