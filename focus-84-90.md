@@ -975,3 +975,30 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - ~01:30 PST w-hg p2 plan APPROVED: fork per push, concurrent intake; ordered landing rebases the fork by node
   (renumber rows; reuse stored content; skip revisions already landed; sliced) when the index moved. Added: judge
   bundle2 check:heads / check:updated-heads at landing against current heads; advertise checkheads=related.
+- ~01:40 PST A-721 LANDED 0cb5120b1 (w-svn, 3169466fe): E160004 wedge fixed: reconcile_unpublished_effects remakes a
+  green whose engine is past its durable head from checkpoint + chain (lone engine / single-member lineage = every svn
+  repo). Owed (GAPS): multi-member lineages (git branches) counted (merge.unpublished.green_ahead_kept) not remade; a
+  submit's vcs_store paths/commits not taken back -> left for use to find (likely at git's region wall). w-perf to
+  confirm by the 5,000-rev import at its next release build. w-svn next: A-693 p2 (svn:// lock).
+- ~02:00 PST ADA (direction): "Don't we have an entire operations based merge mechanism to help with and solve this?"
+  / "This is our entire advantage ... we aren't just a git/mercurial/svn server too, we use our merge mechanisms and
+  default concurrent scale ... higher throughput, lower resource usage." = §4.17/D-28 as written (push = work, one
+  copy by identity). Ruling: slice 1b/1c (SetFromHeld OpKind, hold log) OFF; w-perf writes the convergence plan
+  (every copy measured vs §4.11/§4.17.1, steps + owners), then (2) entry objects by identity. w-git: compressed
+  deltas in the EXISTING ContentStore OK; no hold_bytes, no new store. w-hg/w-svn: no new store; wait for steps.
+  w-perf attribution: one 3.43 MB push = +229 MiB dirty (ContentStore inflated 69.1, register entry 63.5, arena
+  63.7), never released; load test N=1/10/100 ok, RSS 386 MiB / 3.3 GB / 28.2 GB.
+- ~02:05 PST ADA: "a single server should be able to facilitate numerous repositories ... balance consumption and usage
+  between them based upon agent, usage patterns. Dispatch an agent ... toy repos to Google's or Meta's *in multiple*."
+  -> w-balance (briefs/w-balance.md): design first (outline before code), then pieces, proven by a multi-repo push_load.
+- ~02:15 PST CONVERGENCE PLAN APPROVED (w-perf): today a 3.43 MB git push = inflated store 69.1 + entry 63.5 + arena
+  63.7 MiB (+ A-718 fragments 100-125 MiB later); svn text held ~4x (records 305.6, entries 244.7, history chunks
+  234.8 MiB, blocks ~585 MB @1,000 revs). Steps: S1 (w-perf, REVISED) the entry holds the pack as sent (compressed,
+  deltified, minus held objects) + moves, replay re-indexes; bounded parts past an entry's bound; S2 (w-perf) history's
+  latest value names the block, held.rs stays as identity->block, hold_bytes goes after S3/S5; S3 (w-git) store = index
+  oid->identity over the record's pack, blobs land as the push work's file ops, fragments from intake; S4 (w-svn +
+  w-perf) records name texts by identity; S5 (w-hg) filelogs as green files by identity, changelog/manifest deltas.
+  Push bound: streamed window per connection, TCP backpressure, admission charges window + post-state, typed refusal
+  before body; 10,000 x 256 KiB = 2.5 GiB.
+- w-git A-719 p2 landed 183150ab8 (569868917): unpack::Keep (objects handed to a keeper as resolved; bounded working
+  set); §4.17.1 "A push's intake" rule written. Next p3: keep into quarantine as read; admit_all goes.

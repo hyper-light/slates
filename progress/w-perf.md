@@ -88,3 +88,20 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   "A-718 first" after it landed; told main. w-git's store-once intake merges over it.
 - NEXT: A-716 (svn texts held once, keyed by ContentIdentity surviving checkpoint folding; record's text bytes out of
   the entry). Then the concurrent-push load test. Then entry objects named by identity (every tool).
+- A-716 slice 1a LANDED main 5efce021a: merge held.rs identity table (hold_path shares the file block; hold_bytes;
+  held; release_held; set_held_room; AtRoom/Holders/NoFile/NotHeld). Tests merge --lib held_tests 3/3 local.
+  Worktree ~/slates-work/w-perf-a716 (agents/w-perf-a716). Load test draft on agents/w-perf-pushload
+  (crates/cli/bench/push_load.py), worktree ~/slates-work/w-perf-pushload.
+- NEXT: slice 1b: a green op that sets a path from a held identity reusing its block (ops-doc OpKind? or a
+  push-builder op): read crates/merge/src/ops_doc.rs + push.rs; no re-hash on VFS path. Then 1c: held table in the
+  checkpoint (new format version, presence byte like copies). Then load test (+ svn 5000 re-run after A-721: region
+  wall, commit lands, log names it -> w-svn + main). Then svn slices 2-3 (seam with w-svn). Then entry objects by id.
+- LANDED 54fa10ec5: push_load.py + BENCHMARKS (N=1/10/100 all ok; ~250-300 MiB kept per 3.4 MB push; 1,000 would OOM;
+  attribution put_object 69.1 / entry 63.5 / arena 63.7 MiB). Main: 1b/1c OFF (Ada: push = work, content once by
+  identity, D-28/§4.11/§4.17.1). No more load on the shared box until the plan is approved.
+- Convergence plan sent to main ~10:00Z: S1 entries hold no file bytes (me, now); S2 history latest value = file block,
+  held.rs stays as identity index, hold_bytes goes after S3/S5 (me); S3 git intake blobs as work ops + index (w-git);
+  S4 svn records by identity (w-svn + me); S5 hg (w-hg). Bound: per-connection window + admission refusal, TCP flow
+  control as backpressure.
+- NEXT: S1: read crates/server/src/vcs_store/record.rs (RecordWriter, record_of) + repository/push.rs + db entry.rs;
+  git entry record: keep moves + non-blob objects; blobs named by id, bytes in store; replay path reads them.

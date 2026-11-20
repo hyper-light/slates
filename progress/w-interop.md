@@ -100,3 +100,13 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   ToolSites<G,H,S> with Svn arm; daemon_edge DaemonSvnSite over ServedRecords. Scratch b8903064f pushed as
   agents/w-interop-a681. MISTAKE: ran `git checkout -b x` in w-interop-matrix-land (rule breach; no file change) -- the
   worktree is now on local branch `x` (same commits); left as is, told main. Mac disk 33 GB -> tests on the Studio.
+- LANDED part A: 04da3ae92 (merge 7b46fbdcd; on main, checked). Unit 7/7 (Studio r24-ish), stock svn over HTTP:
+  info/ls/cat/log pass. Worktree ~/slates-work/w-interop-a681-land (branch agents/w-interop-a681-land) for B and C.
+- Part B next: REPORT on `!svn/me` (ra_serf report target under HTTPv2, util.c svn_ra_serf__report_resource) is
+  Resource::Unserved -> "requested report is unknown". Need: resolve `me` for REPORT; Asked::Update(UpdateReport) ->
+  report::drive::Drive (new(report, uuid)) -> dav::drive::Drive writing; streamed as Report variant like log.
+- Part B written (scratch 3e4dfd7de, pushed agents/w-interop-a681b; worktree w-interop-a681-land): report.rs
+  WholeCommand/WholeItem/WholeRefusal/whole_report (reuses Reporter checks); dav/update.rs UpdateWalk (src/dst URL ->
+  repos path, depth, items, streamed resume via dav::Drive::take_written + Body::drain); site.rs Resource::Me (!svn/me),
+  Walk {Log, Update}, Answer/Report now Debug-only derives, OPTIONS SVN-Allow-Bulk-Updates Prefer; test
+  an_update_report_on_me_streams_a_checkout_and_refuses_a_revision_past_the_youngest. r25 on Studio running.

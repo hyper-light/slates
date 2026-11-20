@@ -50,3 +50,7 @@
   against stored bases, bounded working set, admission by working set, §4.17.1 rule in the amendment); prove with
   w-interop's v2.0.0 cut then git/git. Coordinate with w-perf (A-718 lands first; tell w-perf before changing how a
   fragment's bytes are held; keep pushed deltas for pack reuse). Also owed: quarantine admission + verdicts sliced.
+- A-719 part 2 (unpack::Keep keeper seam; §4.17.1 "A push's intake" rule incl. concurrency clause) LANDED 183150ab8.
+  Main: no hold_bytes, no new store; keeping client deltas compressed in the EXISTING ContentStore is OK; convergence
+  plan from w-perf decides blobs later. Next: part 3 = session/driver keep straight into the quarantine as the pack is
+  read (removes reader + Checked in-RAM copies; admit_all gone), checks reading objects back from the store.
