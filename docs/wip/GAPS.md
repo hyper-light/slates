@@ -166,7 +166,9 @@
 > shard's chunk arena of the anchor's content object, its table in the shard image recovered before the records, records
 > naming identities (git v3: names + the pack's root identity), entries waiting on the next image barrier (group commit).
 > (a1) BUILT: `ContentStore::windows`/`window_at` answer `Cow` (a sealed arena window is copied out), every reader in
-> git, hg, the server and vcs moved over; lists and tables stay lent (`get`). OWED: (a2) arena storage, (a3) image table
+> git, hg, the server and vcs moved over; lists and tables stay lent (`get`). (a2) step 1 BUILT: windows kept through a
+> `WindowStorage` seam (`HeapWindows` for tests and tools; `ContentStore::with_storage`), read by `bytes_of`, sized by `len_of`.
+> OWED: (a2) step 2 the daemon's arena storage (a repository chunk store per home shard, own pool owner-tag range), (a3) image table
 > + recovery order, (b) git v3, (c) svn, (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
@@ -779,9 +781,17 @@
 > and post-lock or post-unlock once over the paths changed after their answers, its failure after `done`, the locks
 > standing (`fs-wrap.c`); `slates_svn::serve`'s lock verb is four calls now (`lock_verb`, `lock_judged`, `locks_landed`,
 > `locks_finished`). **Part 3 (same day):** the `svn+ssh://` tunnel runs the same hooks through the same runner
-> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). Owed: the tunnel's signal of its client
-> gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); the revprop hooks'
+> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). **A-736 (2026-11-20, w-k90-vendor):**
+> the SSH edge tells a command stepping that its client has gone (`vcs_ssh::site::ClientGone`: the client's bytes taken
+> while the step runs, kept for the session, its end of stream or a reset gone), so a hook's run over SSH ends with
+> its client, git's receive-pack and the tunnel's (which then ends E210002, as `svnserve` ends where its client leaves
+> inside a command). Owed: the revprop hooks'
 > calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
+> **A-733 (2026-11-20, w-reaper):** svn over http(s) runs the hooks too, where `mod_dav_svn` runs them, through A-730's
+> runner (`HookSite::Http`): start-commit at the POST, pre-commit at the MERGE, post-commit's failure in the MERGE's
+> `S:post-commit-err`, pre-lock/post-lock around a LOCK (pre-lock's token the lock's), pre-unlock/post-unlock around an
+> UNLOCK, a post-hook's failure logged, never told (`lock.c`). DAV's commit and lock hooks closed; owed still: the
+> revprop hooks' calls (A-702 part 2), the SSH edge's client-gone signal, REPOS as A-645's view (w-reaper, next).
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
@@ -3563,6 +3573,14 @@
 >   replaces the entry, and a decomposed and a precomposed `é` are two names. Such a volume and its drive take the same
 >   names for one, so neither residual above that comes from the two rules (the first and the last) can arise on it.
 >   Held by vfs's unit tests on every host (red 5 of 10 with the table removed, green 10 of 10, Mac Studio).
+> - **Fixed, A-737 (2026-11-20, w-bugs, goal 87; found by use): the table was not Windows'.** The Windows check
+>   (`the_volumes_upcase_table_is_the_systems`) failed on CI's x86_64 and arm64 runners: 109 units apart. Windows' own
+>   table (dumped through `RtlUpcaseUnicodeChar` on both, identical: 973 units mapped, no two to one, TableChecksum of
+>   the whole table E61F453Bh) leaves final sigma `ς` as it is, folds the case pairs Unicode added after the exFAT
+>   table (`ɐ`/`Ɐ`, `ͱ`/`Ͱ`, ...), and leaves `Ⱥ` (the exFAT table mapped it to the lowercase `ⱥ`). `Upcase` now folds by
+>   Windows' table; the "names the table folds alike and the volume keeps apart" residual above does not arise (every
+>   pair it folds alike, NFC and lowercasing fold alike too), and `ς` beside `σ` is two names, as on NTFS. No volume was
+>   made `Upcase` before (no client can choose it until part 2), so no stored name changes meaning.
 > - **Owed, A-576 part 2:** the policy in the protocol and the catalog (`NamePolicy`, `DbNamePolicy`, appended and
 >   published), its choice in the CLI, the SDKs and MCP, an archive importing it (refused `Unsupported` until then), and
 >   what a WinFsp mount of a `Fold` volume does once a drive's volume can be made `Upcase`. Main's: the Windows check
@@ -6638,7 +6656,12 @@
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
 >   waited each time), and within the caller's restart bound only where a live anchor holds the rendezvous
 >   (`a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served`,
->   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Windows since A-447 (2026-11-18, g251): the
+>   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). A macOS claim made in a replaced daemon's
+>   object since A-735 (2026-11-20, w-forming, found by use): a daemon holding its own rendezvous makes the object again
+>   at its start, so a claim made in its dead predecessor's object waited for good on the owner's name the successor held
+>   (a replaced fleet member's `volume list` hung 30+ minutes, every claim slot of the live object free); each look now
+>   reads its own slot in the object under the name and ends `DaemonUnavailable` when it is another
+>   (`a_claim_on_a_rendezvous_made_again_by_a_new_owner_ends`). Windows since A-447 (2026-11-18, g251): the
 >   daemon writes its process id and creation time into the bootstrap header (layout `SLB3`), and a claim with no live
 >   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
 >   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a

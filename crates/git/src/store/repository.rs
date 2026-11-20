@@ -1763,9 +1763,7 @@ impl Repository {
             let bytes = [&fragments.objects, &fragments.blobs]
               .into_iter()
               .map(|kept| {
-                let content = store
-                  .get(&kept.content)
-                  .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                let content = store.len_of(&kept.content).unwrap_or(0);
                 let runs = kept.positions.runs().saturating_add(kept.references.runs());
                 content
                   .saturating_add(bytes(

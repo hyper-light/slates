@@ -112,7 +112,7 @@ impl super::Command for Idle {
 
   fn input_end(&mut self) {}
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
+  async fn step(&mut self, _gone: super::ClientGone<'_>) -> Result<Stepped, Refused> {
     Ok(Stepped {
       consumed: 0,
       next: super::Next::Exited(0),
