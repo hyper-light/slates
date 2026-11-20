@@ -89,3 +89,6 @@
   replays recorded pack into ContentStore; paths::put_file copies blobs into ContentStore. Design note owed to main.
 - TOP PRIORITY (main): git/git push spin. Doing: slates-git receive::Deciding (one command a step; decide() = same
   machine whole) DONE (builds); next server AnswerState::Deciding + hooks path; then seal sliced; then staged commit.
+- A-719 part 4 (decision a command a step) LANDED main c9100be04 (e4f2aeaf7). A-645 hook view moved to w-reaper; SSH
+  client-gone to w-k90-vendor. Stay on A-722: staged index rows as objects land (append only makes visible), moves'
+  admission + seal sliced, landing O(changes), vcs_share::room seam. Design note (~20 lines) owed to main.
