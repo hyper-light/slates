@@ -144,3 +144,8 @@
   archive_slice_bytes_within(ns), objects admitted one a unit, deadline = step quantum; record_turn in rebuild turns
   and recovery units; Lent guard per turn since A-727 a2). Next 4b: slice seal+stage pass and moves' admission (live
   GitPush::seal + admit), then landing's O(objects) passes, stale restage; thin-pack resolve waits on w-balance's slicing.
+- A-722 part 4b LANDED 8ceff213f (main 5014be90a, ~04:40): slates_git::store::Staging (generations, fresh via
+  Quarantine::object_after cursor, positions by per-kind counts, rows inserted per object, Index::seal_step), live
+  AnswerState::Sealing + SealingPush::turn, replay seal through Staging, Drop gives back Sealing/Deciding.
+  NEXT 4c: moves' admission (admit_moves / SealedPush::admit walk) + landing O(objects) passes + stale restage sliced;
+  then by-use proof 10/19 concurrent pushes after w-balance resolve-in-turns lands.

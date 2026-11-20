@@ -6821,3 +6821,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-shared hard-link copy (main 95044a373): clippy + xtask; slates-merge whole lib + its copy proptest at a high case count; Linux/Windows
 - 2026-11-20 w-bugs A-747 (main 4e9c31aba): owed (main): clippy ipc/server; Linux run of slates-ipc --lib route:: (accept on Linux: departed path).
 - 2026-11-20 w-shared typed copy refusals (main c2de447a8): clippy + xtask (ipc Refusal/CopyCase appended, merge Outcome/Judgment/Rebased/Landed variants); SDK lane; Linux/Windows slates-merge lib + server t_a626_p4
+- 2026-11-20 w-git A-722 part 4b (main 5014be90a): push intake seal now turn-sliced; w-perf git_scale.sh / push_load.py rerun requested
