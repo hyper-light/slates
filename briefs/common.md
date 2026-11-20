@@ -206,3 +206,14 @@ ideal." And on Mantle's code: "Copy into slates".
   deltas, blame, and checkpoints for reading old versions. No tool keeps a second stored unit (per-file delta chains,
   a pack store, stored texts) as truth. A pack or bundle held while a push is judged is the change in flight, not
   history. Each version's full-text identity is recorded in metadata, so verification and content-once still hold.
+
+## CLAUDE.md §8 BINDS: WHAT AN AGENT RUNS (main 2026-11-20 ~14:10, correcting main's own earlier notes)
+slates' CLAUDE.md §8 (Ada, 2026-11-18, "binding on every agent and subagent, forever"): an agent implements, runs its
+**focused** unit and integration tests, merges, and ends.
+- **Not the agent's to run:** clippy, the lint matrix, xtask, cross-target or other platforms' builds (Linux-only or
+  Windows-only code included), suites, CI waits, repeated runs and load runs. Put them in run-requests.md with the exact
+  command, the platform, and what red looks like. w-lint, main's lint keeper, and main run them.
+- **Main's earlier "agents start their own Linux and Windows runs" was wrong, and is withdrawn.**
+- **The one addition, from Ada 2026-11-20 ("make your agents do A|B testing and back their decisions with data"):** a
+  design decision between competing shapes is settled by the agent's own A/B: release builds, interleaved, all N
+  shown, built as a measured example where possible (w-hg's changeset_ab.rs).
