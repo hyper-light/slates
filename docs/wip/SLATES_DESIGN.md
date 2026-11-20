@@ -14542,7 +14542,8 @@ is offered only when it holds nothing the principal may not read. The same rende
 admission hooks see and what an export lands (§4.15).
 Status (A-706, stream clones part 1): `slates_hg::render` renders the index whole into those files, each revision a full
 text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
-deltas, the rendering appended as versions commit, `stream_out` and `stream2` are later parts.
+deltas, the rendering appended as versions commit and `stream2` are later parts; `stream_out` (A-712) sends the
+rendered revlogs as 7.2's version 1 stream, refused `1\n` while a changeset is secret.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:

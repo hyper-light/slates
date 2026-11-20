@@ -175,6 +175,11 @@ pub fn answer(
       body,
       refused,
     },
+    Answer::Legacy(body) => Answered {
+      media_type: MEDIA_TYPE_V1,
+      body,
+      refused,
+    },
     Answer::OutOfBand(words) => Answered {
       media_type: MEDIA_TYPE_ERROR,
       body: ended(words),
