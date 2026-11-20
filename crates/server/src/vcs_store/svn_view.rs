@@ -24,7 +24,7 @@
 //! one whose creation's record has not been replayed. The site answers it `503`.
 
 use slates_db::catalog::{Principal, RepositoryId};
-use slates_svn::lock::AprTime;
+use slates_svn::lock::{AprTime, LockEntry, UUID_BYTES};
 use slates_svn::migration::Repository as SvnRecords;
 use slates_vfs::clock::Clock;
 
@@ -37,6 +37,9 @@ use crate::repository::svn_commit::{self, Committed};
 use crate::state::ShardState;
 use crate::vcs_http::svn::{Lent, SvnStores};
 use crate::vcs_ssh::svn::Opening;
+
+/// Counter: an HTTP lock verb whose new token the system's generator could not draw: its landing refused.
+const TOKEN_UNDRAWN: &str = "vcs_http.svn_token_undrawn";
 
 /// The daemon's lender (module docs): the records of the Subversion repositories this shard's map holds.
 #[derive(Clone, Copy, Debug, Default)]
@@ -124,6 +127,43 @@ impl SvnStores for ServedRecords {
       let now = AprTime::from_wall_ns(state.clock.wall_ns());
       svn_commit::commit_work(state, (principal, id), work, now)
     })
+  }
+  fn lock_verb(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    judge: impl FnOnce(
+      &Lent<'_, SvnRecords>,
+      &mut dyn FnMut() -> [u8; UUID_BYTES],
+    ) -> (Vec<LockEntry>, HttpAnswer),
+  ) -> Option<Result<HttpAnswer, svn_commit::Uncommitted>> {
+    crate::state::with_state(|state| {
+      let undrawn = std::cell::Cell::new(false);
+      let mut draw = || {
+        let mut token = [0u8; UUID_BYTES];
+        if aws_lc_rs::rand::fill(&mut token).is_err() {
+          undrawn.set(true);
+        }
+        token
+      };
+      let (entries, answer) = lend_in(state, id, |lent| judge(lent, &mut draw))?;
+      if undrawn.get() {
+        crate::fleet::count_refusal(TOKEN_UNDRAWN);
+        return Some(Err(svn_commit::Uncommitted::NotHeld));
+      }
+      if entries.is_empty() {
+        return Some(Ok(answer));
+      }
+      Some(
+        svn_commit::record(
+          state,
+          (principal, id),
+          slates_svn::commit::record::Record::Locks(entries),
+        )
+        .map(|()| answer),
+      )
+    })
+    .flatten()
   }
 }
 

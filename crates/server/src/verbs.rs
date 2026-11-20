@@ -9600,6 +9600,9 @@ fn judge_submission(
       // transaction and admitted to the repository's store (A-664 part 3, `vcs_store::commits`).
       crate::vcs_store::paths::advance(state, green_id, version);
       crate::vcs_store::commits::make(state, green_id, version, &policy.authorship);
+      // A Subversion repository's green: the version becomes the revision the server makes of it, recorded in this
+      // transaction (A-664's Subversion objects, `vcs_store::svn_made`).
+      crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship);
       // The acceptance is published only once the version's merge record is **committed at the
       // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
       // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply

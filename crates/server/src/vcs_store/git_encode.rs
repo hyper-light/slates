@@ -43,6 +43,8 @@ use slates_db::catalog::RepositoryId;
 use slates_git::store::learn::Clock;
 use slates_git::store::{Encoding, Progress, StoreRefused, Turn};
 
+use slates_vcs::{Prices, Rebuildable, amount_of, choose, whole_units};
+
 use super::upload::{ShardClock, exchange};
 use crate::state::ShardState;
 
@@ -55,9 +57,9 @@ pub(crate) const TURNS: &str = "vcs_store.git_encode.turns";
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
-/// The encodings under way, one a repository (the module doc's bounds).
+/// The encodings under way, one a repository (the module doc's bounds), each with the green and version it encodes.
 #[derive(Default)]
-pub(crate) struct Encodings(BTreeMap<RepositoryId, Encoding>);
+pub(crate) struct Encodings(BTreeMap<RepositoryId, (Encoding, (u64, usize))>);
 
 impl fmt::Debug for Encodings {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -76,6 +78,21 @@ pub(crate) enum Turned {
 
 /// One turn of repository `id`'s encoding (the module doc), within the shard's quantum on its clock.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
+  let began = slates_rt::futures::now_ns();
+  let (turned, kept) = turn_uncounted(state, id);
+  // A-724 piece 4: the turn's time and, once a version's fragments are kept, their bytes, on the repository's usage row,
+  // so what making a byte of fragments again costs is learned from this repository's own encodings.
+  let now = slates_rt::futures::now_ns();
+  if turned == Turned::More || kept > 0 {
+    state
+      .vcs_usage
+      .derived(&id, (now.saturating_sub(began), kept), now);
+  }
+  turned
+}
+
+/// [`turn`]'s work: what it came to, and the bytes of the fragments it kept (zero unless a version was finished).
+fn turn_uncounted(state: &mut ShardState, id: RepositoryId) -> (Turned, u64) {
   let quantum_ns = state.config.step_quantum_ns();
   let exchange = exchange(&state.config);
   let mut clock = ShardClock;
@@ -86,28 +103,30 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
     (stores.content.as_mut(), stores.entries.get_mut(&id))
   else {
     super::settle(state);
-    return Turned::Idle;
+    return (Turned::Idle, 0);
   };
   let mut begun = false;
   if !stores.encodings.0.contains_key(&id) {
     let Some((green, version)) = store.repository.first_unencoded() else {
       super::settle(state);
-      return Turned::Idle;
+      return (Turned::Idle, 0);
     };
     match Encoding::fragments(&store.repository, content, green, version) {
       Ok(encoding) => {
-        stores.encodings.0.insert(id, encoding);
+        stores.encodings.0.insert(id, (encoding, (green, version)));
         begun = true;
       }
       Err(_) => {
         super::settle(state);
         state.count(REFUSED, 1);
-        return Turned::Idle;
+        return (Turned::Idle, 0);
       }
     }
   }
+  let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
+  let mut kept = 0;
   let advanced: Option<Result<Progress, StoreRefused>> =
-    stores.encodings.0.get_mut(&id).map(|encoding| {
+    stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
       encoding.advance(
         &mut store.repository,
         content,
@@ -122,6 +141,7 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
     Some(Ok(Progress::More)) => Turned::More,
     Some(Ok(Progress::Done)) => {
       stores.encodings.0.remove(&id);
+      kept = encoded_bytes(stores, id, encoding_at);
       state.count(ENCODED, 1);
       Turned::More
     }
@@ -136,7 +156,111 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   }
   state.count(TURNS, 1);
   super::settle(state);
-  turned
+  (turned, kept)
+}
+
+/// The bytes repository `id`'s version at `at` keeps as its fragments (`Repository::kept_fragments`), once encoded.
+fn encoded_bytes(stores: &super::VcsStores, id: RepositoryId, at: Option<(u64, usize)>) -> u64 {
+  let (Some(at), Some(content), Some(super::RepositoryStore::Git(store))) =
+    (at, stores.content.as_ref(), stores.entries.get(&id))
+  else {
+    return 0;
+  };
+  store
+    .repository
+    .kept_fragments(content)
+    .into_iter()
+    .find(|(version, _)| *version == at)
+    .map_or(0, |(_, bytes)| bytes)
+}
+
+/// Counter: a version's kept fragments dropped for its repository's overrun (A-724 piece 4). Format: a counter name.
+pub(crate) const DROPPED: &str = "vcs_store.git_encode.dropped";
+
+/// The bytes repository `id`'s kept fragments give back if dropped (`Repository::kept_fragments`): what of its holding
+/// is derived and can be made again (A-724 piece 4). Zero for a store not a git store held here.
+pub(crate) fn kept_bytes(state: &ShardState, id: RepositoryId) -> u64 {
+  let stores = &state.vcs_stores;
+  let (Some(content), Some(super::RepositoryStore::Git(store))) =
+    (stores.content.as_ref(), stores.entries.get(&id))
+  else {
+    return 0;
+  };
+  store
+    .repository
+    .kept_fragments(content)
+    .into_iter()
+    .fold(0u64, |total, (_, bytes)| total.saturating_add(bytes))
+}
+
+/// Gives back up to `overrun` bytes of repository `id`'s kept fragments, chosen by §4.11's cost model at `pressure`
+/// (`slates_vcs::cold::choose`, A-724 piece 4): each version's fragments priced at their bytes against their making
+/// again, at the time a byte of this repository's fragments took to make (its usage row's `derive_ns / derive_bytes`)
+/// on each read its row says to expect before the next push (its fetches over its answered intakes). The bytes given
+/// back. Nothing is dropped while the repository's encoding is under way (it may read a dropped version's entries as a
+/// base) or before any of its encodings was measured (nothing to price a rebuild by).
+pub(crate) fn relieve(
+  state: &mut ShardState,
+  id: RepositoryId,
+  overrun: u64,
+  pressure: f64,
+) -> u64 {
+  if overrun == 0 || state.vcs_stores.encodings.0.contains_key(&id) {
+    return 0;
+  }
+  let Some(row) = state.vcs_usage.usage(&id) else {
+    return 0;
+  };
+  if row.derive_bytes == 0 {
+    return 0;
+  }
+  let per_byte_ns = amount_of(row.derive_ns) / amount_of(row.derive_bytes);
+  let reads = amount_of(row.fetch.begun) / amount_of(row.intake.answered.max(1));
+  let price = exchange(&state.config);
+  let prices = Prices {
+    ns_per_byte: amount_of(price.ns) / amount_of(price.bytes.max(1)),
+    pressure,
+  };
+  let kept: Vec<((u64, usize), u64)> = {
+    let stores = &state.vcs_stores;
+    match (stores.content.as_ref(), stores.entries.get(&id)) {
+      (Some(content), Some(super::RepositoryStore::Git(store))) => {
+        store.repository.kept_fragments(content)
+      }
+      _ => return 0,
+    }
+  };
+  let candidates: Vec<Rebuildable> = kept
+    .iter()
+    .map(|(_, bytes)| Rebuildable {
+      bytes: *bytes,
+      rebuild_ns: whole_units(amount_of(*bytes) * per_byte_ns),
+      reads,
+    })
+    .collect();
+  let chosen = choose(overrun, &candidates, prices);
+  if chosen.is_empty() {
+    return 0;
+  }
+  super::lend(&mut state.store, &mut state.vcs_stores, 0);
+  let mut given = 0u64;
+  let mut dropped = 0u64;
+  {
+    let stores = &mut state.vcs_stores;
+    if let (Some(content), Some(super::RepositoryStore::Git(store))) =
+      (stores.content.as_mut(), stores.entries.get_mut(&id))
+    {
+      for (at, bytes) in chosen.iter().filter_map(|index| kept.get(*index)) {
+        if let Ok(true) = store.repository.drop_fragments(content, *at) {
+          given = given.saturating_add(*bytes);
+          dropped = dropped.saturating_add(1);
+        }
+      }
+    }
+  }
+  super::settle(state);
+  state.count(DROPPED, dropped);
+  given
 }
 
 /// Drops repository `id`'s encoding under way, if any: its repository is freed.
