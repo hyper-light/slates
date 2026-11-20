@@ -1725,7 +1725,7 @@ fn an_http_commit_idle_past_the_edges_idle_bound_is_released() {
   };
   let commit = DavCommit::begin(setup, &world, &|_| Ok(())).unwrap();
   let id = RepositoryId { bytes: [6; 16] };
-  let mut stores = VcsStores::default();
+  let mut stores = super::VcsStores::default();
   stores.begin_dav_commit(id, b"alice", String::from("0-1"), (commit, 1_000));
   stores.release_idle_dav_commits(1_500, Some(1_000));
   let taken = stores.take_dav_commit(id, b"alice", ("0-1", 1_500));
