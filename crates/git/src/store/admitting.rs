@@ -86,8 +86,11 @@ struct Walk {
   /// The positions the push's stage gives the new objects met, and that stage (its base and how many positions it
   /// gives), while every one met had one under the same stage; none once one had none or the stage was made again.
   /// Kept so the commit that adopts that stage takes them rather than looking each up in its step (one word an object).
-  staged: Option<(Option<(u64, usize)>, Vec<u64>)>,
+  staged: Option<StagedRun>,
 }
+
+/// The stage a walk's new objects met (its base and how many positions it gives, once known) and their positions in it.
+type StagedRun = (Option<(u64, usize)>, Vec<u64>);
 
 /// A walk back from a commit by generation number, newest first, a unit a commit.
 #[derive(Debug)]

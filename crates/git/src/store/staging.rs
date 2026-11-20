@@ -347,33 +347,9 @@ impl Repository {
         base,
         fresh,
         at,
-        mut next_of,
-        mut positions,
-      } => {
-        let Some((id, kind, ..)) = fresh.get(at).copied() else {
-          return Ok(Step::Rows {
-            base,
-            fresh,
-            at: 0,
-            positions,
-            fork,
-          });
-        };
-        let Some(next) = next_of.get_mut(&kind) else {
-          fork.release(store)?;
-          return Err(StoreRefused::Malformed { id });
-        };
-        positions.insert(id, *next);
-        *next = next.saturating_add(1);
-        Ok(Step::Positions {
-          fork,
-          base,
-          fresh,
-          at: at.saturating_add(1),
-          next_of,
-          positions,
-        })
-      }
+        next_of,
+        positions,
+      } => positions_unit(store, (fork, base), (fresh, at), (next_of, positions)),
       Step::Rows {
         base,
         fresh,
@@ -492,4 +468,37 @@ impl Repository {
     )?;
     Ok(())
   }
+}
+
+/// One unit of [`Step::Positions`]: the fresh object at `at` given its kind's next position, or, past the last, the
+/// rows begun. An object of a kind the push did not count is malformed, and the fork is given back.
+fn positions_unit(
+  store: &mut ContentStore,
+  (fork, base): (Index, u64),
+  (fresh, at): (Vec<Fresh>, usize),
+  (mut next_of, mut positions): (BTreeMap<Kind, u64>, BTreeMap<ObjectId, u64>),
+) -> Result<Step, StoreRefused> {
+  let Some((id, kind, ..)) = fresh.get(at).copied() else {
+    return Ok(Step::Rows {
+      base,
+      fresh,
+      at: 0,
+      positions,
+      fork,
+    });
+  };
+  let Some(next) = next_of.get_mut(&kind) else {
+    fork.release(store)?;
+    return Err(StoreRefused::Malformed { id });
+  };
+  positions.insert(id, *next);
+  *next = next.saturating_add(1);
+  Ok(Step::Positions {
+    fork,
+    base,
+    fresh,
+    at: at.saturating_add(1),
+    next_of,
+    positions,
+  })
 }

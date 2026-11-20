@@ -1965,7 +1965,10 @@ fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
       .collect();
     assert_eq!(versions, vec![2]);
     assert_eq!(
-      state.refusals.get(crate::vcs_store::homes::HOMING_UNTAKEN).copied(),
+      state
+        .refusals
+        .get(crate::vcs_store::homes::HOMING_UNTAKEN)
+        .copied(),
       Some(1)
     );
     crate::vcs_store::write_version_3_for_test(false);
