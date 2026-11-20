@@ -43,3 +43,14 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - is-ancestor confirmed from the Studio. Merges: config.rs/slates_fleet (re-ran 14/14), review.rs/git.rs (w-k90-vendor
   filemode), docs/agentic.md status-row conflict (main's row + my W9 sentence). Reported to main (agents_send).
 - NEXT: 5b-i (sandbox::container), then 5b-ii (Engine::Container).
+
+## 5b-i (2026-11-20 ~01:xxZ): committed a69822973 on agents/w-k90-containers-5a (worktree ~/kiln-work/w-k90-containers-kiln)
+- sandbox::container::ContainerSandbox (keeper `tail -f /dev/null` + engine `exec --interactive`, env by name only,
+  release on end/kill), workspace::container::{release, Plan.entrypoint}; 4 new tests; 11/11 locally.
+- Merge 7e77ebecd brought main's re-vendor (Slates 38ed3dfd8, CONTRACT 50: Instance::export now vendored) -> re-run in
+  flight (target ~/.cache/w-k90-containers-target). Then push via adas-mac-studio-2.
+## K8s builders (main asked ~01:xxZ): worktree ~/kiln-work/w-k90-containers-k8s (branch agents/w-k90-containers-k8s
+  from 7e77ebecd), target ~/.cache/w-k90-containers-target-k8s: crates/kiln/src/k8s/volume.rs (objects(): PV nfs
+  xprtsec=mtls/claimRef/Retain, claim volumeName "", pod volume+mount+runAsUser/Group; PodExport Debug hides token;
+  Unbuildable), 2 w10 tests; W10 doc line. RBAC deferred to the engine piece (first code that creates PVs). Run in flight.
+- Next K8s piece: kiln's call of Instance::export (workspace::slates::export) + the engine/home + RBAC.
