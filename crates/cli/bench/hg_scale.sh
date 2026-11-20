@@ -75,13 +75,16 @@ timed() {
 # Pushes SOURCE to URL a PUSH_CHUNK of revisions at a time, then the rest, the pushes timed together as step $1; the
 # first refused push ends it, recorded as failed.
 push_chunked() {
-  local name=$1 start end status=ok tip rev
+  local name=$1 start end status=ok tip rev code
   tip=$(h -R "$SOURCE" log -r tip -T '{rev}')
   start=$(now)
   for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do
-    if ! bounded "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$SOURCE" push -q -f -r "$rev" "$URL" \
-      > "$WORK/out.${name// /-}" 2> "$WORK/err.${name// /-}"; then
-      status="failed($?)"
+    bounded "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$SOURCE" push -q -f -r "$rev" "$URL" \
+      > "$WORK/out.${name// /-}" 2> "$WORK/err.${name// /-}"
+    code=$?
+    # hg push exits 1 when the revision is there already.
+    if [ "$code" -gt 1 ]; then
+      status="failed($code)"
       tail -3 "$WORK/err.${name// /-}" | sed "s/^/    at -r $rev: /"
       break
     fi
