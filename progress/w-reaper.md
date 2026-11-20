@@ -10,14 +10,15 @@
   CARGO_TARGET_DIR=~/.cache/w-reaper-target). svn sources (1.15.0) fetched to ~/slates-work/svn-src.
   A-726 PART 2 LANDED: main 4511d1d (merged eae99ac): dav/report_mergeinfo.rs, reads::repository_mergeinfo, OPTIONS
   mergeinfo yes. Stock svn merge/blame -g/mergeinfo over HTTP == svnserve (svn_http_reports 2/2 on Studio-1).
-  PIECE (2) BLOCKED (reported to main 2026-11-20): pre-lock/post-lock cannot "run as the other svn hooks run" -- no
-  svn hook runs on any route: svn://, svn+ssh:// and HTTP refuse a configured start/pre-commit hook ("This server does
-  not run this repository's hooks yet"; vcs_svn.rs 1095, vcs_ssh/svn.rs 679, vcs_http/svn.rs 736). svn_hooks::run
-  (A-661 part 1 glue) has no caller; A-661 part 2 (the calls) never landed. Running any hook needs a presented
-  read-only view of the repository (hook_driver Launch::view_root; git_hooks PresentView "the read-only attachment the
-  mount edges serve, owed") -- git's and hg's run_hooks have no production caller either. Also no CLI/client verb
-  sends SetRepositoryPolicy, so no user can configure a hook: the lock verbs ignoring a configured pre-lock (svn
-  locks granted where commits are refused) is a reading finding, not reproducible by use. Waiting for main's next piece.
+  PIECE (2) RE-SCOPED by main: ra_svn runs ALL svnserve hooks (svn:// + svn+ssh://) = A-730. Not blocked: svn hooks
+  run in "/" (HookPoint::directory), view_root unused; REPOS = "/<name>" until A-645's FSFS view (design item 9).
+  A-730 PART 1 LANDED: main e2a65fe (merged b8e4591): svn:// start-commit/pre-commit/post-commit (vcs_svn::run_hook,
+  answer_hook + land async; svn Pending::lock_tokens). Tests vcs_svn 7/7 (+2), svn_hooks/vcs_hooks/hook_driver/vcs_svn
+  58/58, svn commit::/serve:: 90/90. Test hook scripts are warmed once (macOS assesses a new executable 0.16-0.29 s at
+  its first exec -- NOT a driver latency; an earlier "finding" withdrawn).
+  NEXT part 2: svn:// lock hooks: pre-lock per path (token from stdout), post-lock once; pre-unlock per path,
+  post-unlock once -- split serve/locks.rs lock_verb/locks_landed so the server can run hooks between judging and
+  answering. Then part 3: svn+ssh:// (vcs_ssh/svn.rs). Worktree ~/slates-work/w-reaper-a730 (branch w-reaper-a730).
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
