@@ -6808,3 +6808,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-bugs A-737 (main 2a80ea399): owed (main): clippy vfs/bridge-winfsp; nothing Windows-only changed beyond tests.
 - 2026-11-20 w-git main e42c53886 (A-722 part 2, landing map): clippy + xtask; Linux/Windows cargo test -p slates-git --lib -- store:: upload:: hook_view
 - 2026-11-20 w-bugs A-739 (main 137bf3633): owed (main): clippy server/cli; Linux arm64 run of cli a_file_an_ended_mount_held_is_given_back + the takeover one; the full fuse lanes.
+- 2026-11-20 w-shared A-664 push storm (main c0071e402): clippy + xtask; by use: a stream of pushes to one large git branch during its first build; the build ends (restarted 0 in status), a submit after it answered
