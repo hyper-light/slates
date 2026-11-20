@@ -1,0 +1,137 @@
+name: diag-measurer
+
+# g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
+# single-client regression at three shards? Four arms, each built from its own source extract, rotated each round,
+# loaded then quiet: 8dff8fcad (before W1), 379dfe750 (W1 and A-296, just before A-400), f2081a3c8 (A-400 landed),
+# a5233e228 (main now). Loaded on Linux = the supervisor's controlled load (A-224's lane). A diagnostics lane run only
+# from `diag-measurer-*` branches (never main); every log is an artifact.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  ARMS: "8dff8fcad238b37a69f2ae093da300840d14a055 379dfe750ab544863961af458be3075eb365efca f2081a3c8cc6924ba4c16471ea07b1919b6a6097 a5233e228978b8e60ccc0306c54b440564596807"
+  ROUNDS: "3"
+
+jobs:
+  edit-merge-ab:
+    name: edit and merge A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build both arms (one target dir, each arm's sources extracted just before its build, so newer)
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          W="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/msr"; mkdir -p "$W/logs"
+          native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
+          export CARGO_TARGET_DIR="$(native "$W/target")"
+          EXE=""; [ "${RUNNER_OS}" = Windows ] && EXE=".exe"
+          for arm in $ARMS; do
+            s="${arm:0:9}"; mkdir -p "$W/src-$s" "$W/bin-$s"
+            git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$s"
+            ( cd "$W/src-$s" && cargo build --release --locked -p slates-client --example edit_merge_bench ) > "$W/logs/build-$s.log" 2>&1 \
+              || { tail -40 "$W/logs/build-$s.log"; exit 1; }
+            grep -E "Compiling slates-(server|client)|Finished" "$W/logs/build-$s.log" | tail -3
+            cp "$W/target/release/examples/edit_merge_bench$EXE" "$W/bin-$s/edit_merge_bench$EXE"
+            sha256sum "$W/bin-$s/edit_merge_bench$EXE" 2>/dev/null || shasum -a 256 "$W/bin-$s/edit_merge_bench$EXE"
+          done
+      - name: The machine and the load's form
+        run: |
+          W="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/msr"
+          uname -a; nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "NUMBER_OF_PROCESSORS=$NUMBER_OF_PROCESSORS"
+          if [ "${RUNNER_OS}" = Linux ]; then
+            free -m | head -2
+            if systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 true 2>/dev/null; then
+              echo "systemd" > "$W/constraint"
+            else
+              echo "taskset" > "$W/constraint"
+            fi
+            # Does the newer daemon run inside 256 MB? One short loaded accept under the cap decides; else CPUs only.
+            if [ "$(cat "$W/constraint")" = systemd ] && timeout 300 systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 \
+                 "$W/bin-a5233e228/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept </dev/null > "$W/logs/probe.log" 2>&1; then
+              echo "cap: AllowedCPUs=0-1 MemoryMax=256M" | tee "$W/capnote"
+            else
+              echo "cap: AllowedCPUs=0-1 only (the 256 MB probe failed: $(tail -2 "$W/logs/probe.log" | tr '\n' ' '))" | tee "$W/capnote"
+              echo "nomem" > "$W/nomem"
+            fi
+          else
+            echo "cap: none (the harness's own spinners, two a core)" | tee "$W/capnote"
+          fi
+      - name: Interleaved rounds, loaded then quiet
+        run: |
+          W="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/msr"; EXE=""; [ "${RUNNER_OS}" = Windows ] && EXE=".exe"
+          load() { uptime 2>/dev/null || powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average" 2>/dev/null; }
+          ARGS="--files 10 --files 1000 --form accept --form conflict"
+          cat > "$W/loaded.sh" <<'EOS'
+          #!/bin/bash
+          ( while true; do dd if=/dev/zero of="$2/fsync.bin" bs=1M count=16 conv=fsync status=none; done ) &
+          writer=$!
+          "$1" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict
+          status=$?
+          kill $writer; wait $writer 2>/dev/null; rm -f "$2/fsync.bin"
+          exit $status
+          EOS
+          chmod +x "$W/loaded.sh"
+          set +e
+          order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{print $3, $1, $4, $2}';; esac; }
+          for round in $(seq 1 "$ROUNDS"); do
+            for arm in $(order $round); do
+              s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; L="$W/logs/loaded-$s-r$round.log"
+              echo "== loaded round $round arm $s $(date -u +%FT%TZ) load: $(load) $(cat "$W/capnote")" | tee "$L"
+              if [ "${RUNNER_OS}" = Linux ]; then
+                if [ "$(cat "$W/constraint")" = systemd ]; then
+                  MEM="-p MemoryMax=256M"; [ -f "$W/nomem" ] && MEM=""
+                  timeout 1200 systemd-run --user --scope -q $MEM -p AllowedCPUs=0-1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
+                else
+                  timeout 1200 taskset -c 0,1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
+                fi
+              else
+                perl -e 'alarm shift; exec @ARGV' 1200 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+              fi
+              echo "exit $?" >> "$L"; grep -E "goal|WRONG|ratchet-info|exit" "$L" | cut -c1-220
+            done
+          done
+          for round in $(seq 1 "$ROUNDS"); do
+            for arm in $(order $round); do
+              s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; L="$W/logs/quiet-$s-r$round.log"
+              echo "== quiet round $round arm $s $(date -u +%FT%TZ) load: $(load)" | tee "$L"
+              perl -e 'alarm shift; exec @ARGV' 1200 "$B" --quiet-only $ARGS </dev/null >> "$L" 2>&1
+              echo "exit $?" >> "$L"; grep -E "goal|WRONG|ratchet-info|exit" "$L" | cut -c1-220
+            done
+          done
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: measurer-arms-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn
