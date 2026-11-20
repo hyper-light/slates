@@ -1,3 +1,14 @@
+# RESUME (checkpoint 2026-11-19, for main's kiln move): w-unresolved's QUEUE IS DONE. Nothing to resume.
+- Landed on main: A-707 (05e3a2ddc), the lineage model's mirror of A-508 and A-556; then the goal 84 audit
+  (b2a544735), the GAPS table.
+- Queue item 2 (the Lineage.tla text) was already on main as A-518.
+- No work is uncommitted or unpushed, and no run is in flight. The worktree ~/slates-work/w-unresolved-check and
+  ~/.cache/w-unresolved-local-target are deleted. The branch agents/w-unresolved-check is local only, its commits all
+  on main.
+- Left for goal 84, all main's runs: the store-destroyed live_chaos flow on merged main (Linux, both architectures);
+  MC_Lineage_two.cfg run to its end; lineage_model past its default cases (run-requests.md).
+- Ada decides whether a volume recovered past tolerance refuses writes until an operator acknowledges it.
+
 # w-unresolved progress (kiln goal 84 d9f7a795, "An unresolved object is recovered", A-272 (ii))
 
 Role: implementer, headless worker; supervisor "slates-7a". Rules: briefs/common.md FAST LANDING LOOP + OWN TARGET DIR
