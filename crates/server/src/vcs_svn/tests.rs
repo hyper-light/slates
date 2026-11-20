@@ -1,12 +1,16 @@
-//! Tests of the daemon's svn:// listener (A-689; §4.17.4 piece 7): a daemon in-process starts it from its
+//! Tests of the daemon's svn:// listener (A-689, A-695; §4.17.4 piece 7): a daemon in-process starts it from its
 //! configuration, and a client over loopback writes the bytes stock `svn` 1.15.0 wrote to stock `svnserve` 1.15.0 for a
-//! URL no repository holds (`crates/svn/fixtures/handshake/no-repository.client.bin` and `.server.bin`).
+//! URL no repository holds and for a repository that allows no one (`crates/svn/fixtures/handshake/no-repository.*.bin`
+//! and `no-access.*.bin`).
 
 use std::io::{Read, Write};
 use std::net::TcpStream as ClientStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use slates_db::HostId;
+use slates_db::catalog::Principal;
+use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 
 use crate::daemon::{Daemon, SegmentSource};
@@ -30,6 +34,22 @@ const REFUSAL_START: &[u8] = b"( failure ";
 /// sender uses zlib only with a peer that announced `svndiff1` (`marshal.c`), so slates never receives zlib (§4.17.4
 /// "5. The wire"; `slates_svn::handshake`).
 const SVNDIFF1: &str = "svndiff1 ";
+/// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`NONE_URL`], a repository whose
+/// configuration allows no one: its greeting, then "No access allowed to this repository" (recorded on the Mac Studio,
+/// 2026-11-19).
+const NO_ACCESS_SERVER: &[u8] =
+  include_bytes!("../../../svn/fixtures/handshake/no-access.server.bin");
+/// Format: what that client wrote: its answer to the greeting, naming [`NONE_URL`].
+const NO_ACCESS_CLIENT: &[u8] =
+  include_bytes!("../../../svn/fixtures/handshake/no-access.client.bin");
+/// Format: the URL the recorded client named for the repository that allows no one.
+const NONE_URL: &str = "svn://127.0.0.1/none";
+/// Shape: the partition of the listener's shard, the control shard.
+const LISTENER: usize = 0;
+/// Shape: the partition of the other shard, which a connection moves to.
+const OTHER: usize = 1;
+/// Shape: the uid of the repositories' owner.
+const OWNER: u32 = 1234;
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for the svn:// listener at `address`.
 fn daemon(address: SocketAddrV4) -> Daemon {
@@ -123,39 +143,117 @@ fn read_up_to(stream: &mut ClientStream, wanted: usize) -> Vec<u8> {
   read
 }
 
+/// Connects to the listener at loopback `port`, reads as many bytes as a greeting of `greeting_bytes` holds, writes
+/// `answer`, and reads until the listener ends the connection: what came before the answer, and after, as text.
+fn exchange(port: u16, greeting_bytes: usize, answer: &[u8]) -> (String, String) {
+  let mut stream = ClientStream::connect(("127.0.0.1", port)).expect("the listener takes it");
+  stream
+    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .expect("a read timeout");
+  let greeted = read_up_to(&mut stream, greeting_bytes);
+  stream.write_all(answer).expect("the answer is sent");
+  let mut rest = Vec::new();
+  stream
+    .read_to_end(&mut rest)
+    .expect("the listener ends the connection");
+  (text(&greeted), text(&rest))
+}
+
+/// `bytes` as text, for a comparison that prints both sides.
+fn text(bytes: &[u8]) -> String {
+  String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// A-689 (§4.17.4 piece 7). Do: start a daemon asked for the svn:// listener on loopback at a port the system picks;
 /// connect to the port it reports, read its first bytes, answer them as stock `svn` 1.15.0 answered `svnserve`, naming
 /// the repository `missing` at the listener's port, and read until the connection ends. Expect: the greeting is
 /// `svnserve`'s byte for byte but for `svndiff1` (§4.17.4 "5. The wire"), and the answer is refused as `svnserve`
 /// refused it, "No repository found in" the URL the client named (210005), after which the listener closes the
-/// connection, as `svnserve` does.
+/// connection, as `svnserve` does; since A-695 the name was looked up on the shard its partition is, and none held it.
 #[test]
 fn a_connection_is_greeted_as_svnserve_greets_and_its_url_refused_in_svnserves_words() {
   let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
   let port = daemon.vcs_svn_port().expect("the listener started");
   let (greeting, refusal) = svnserves_answers(port);
-  let mut stream = ClientStream::connect(("127.0.0.1", port)).expect("the listener takes it");
-  stream
-    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
-    .expect("a read timeout");
-  let greeted = read_up_to(&mut stream, greeting.len());
   assert_eq!(
-    String::from_utf8_lossy(&greeted),
-    String::from_utf8_lossy(&greeting),
-    "the listener greets as svnserve does, svndiff1 aside"
+    exchange(port, greeting.len(), &answer_naming(port)),
+    (text(&greeting), text(&refusal)),
+    "the listener greets as svnserve does, svndiff1 aside, and refuses the URL as svnserve refuses it"
   );
-  stream
-    .write_all(&answer_naming(port))
-    .expect("the answer is sent");
-  let mut refused = Vec::new();
-  stream
-    .read_to_end(&mut refused)
-    .expect("the listener ends the connection");
-  assert_eq!(
-    String::from_utf8_lossy(&refused),
-    String::from_utf8_lossy(&refusal),
-    "the URL is refused as svnserve refuses it"
-  );
+}
+
+/// The owner of the tests' repositories, the principal of the human's channel that creates them.
+fn owner() -> Principal {
+  Principal::Uid {
+    host: HostId(0),
+    uid: OWNER,
+  }
+}
+
+/// A Subversion repository's name beginning `prefix` that routes to partition `partition`.
+fn name_on(prefix: &str, partition: usize) -> String {
+  (0u32..)
+    .map(|serial| format!("{prefix}{serial}"))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == partition)
+    .expect("a name routes there")
+}
+
+/// Creates the Subversion repository `name` on partition `partition`, owned by [`owner`], with the defaults `slates
+/// repository create NAME --tool svn` sends (A-685).
+fn create_svn(daemon: &Daemon, partition: usize, name: &str) {
+  let name = name.to_owned();
+  let created = crate::daemon::observe_at(daemon, partition, move |state| {
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.clone(),
+        tool: VcsTool::Subversion,
+        format: ObjectFormat::Sha1,
+        default_branch: "trunk".to_owned(),
+        green: None,
+      },
+    )
+  });
+  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+}
+
+/// A-695 (§4.17.4 piece 7). Do: on a daemon of two shards, create a Subversion repository whose name routes to the
+/// listener's own partition, one whose name routes to the other shard's, and one there whose name holds a `/`; for each,
+/// connect and answer the greeting as stock `svn` 1.15.0 answered `svnserve` for a repository that allows no one,
+/// naming the repository at the listener's port (the last with a path beneath it), and read until the connection ends.
+/// Expect: each is greeted as `svnserve` greets, `svndiff1` aside, and answered as `svnserve` answered, "No access
+/// allowed to this repository" (170001): each was found on the shard that owns its name, the other's after the
+/// connection moved there, the slashed one as the longest run of the path's segments naming a repository, and opened
+/// with the mechanisms it allows, none yet (no anonymous principal, §4.13; CRAM-MD5's keys, A-692). Before A-695 each
+/// was "No repository found".
+#[test]
+fn a_repository_on_either_shard_is_opened_on_its_owner_as_svnserve_opens_one_allowing_no_one() {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let refusal = &NO_ACCESS_SERVER[refusal_at..];
+  let cases = [
+    ("svn-", LISTENER, ""),
+    ("svn-", OTHER, ""),
+    ("team/svn-", OTHER, "/trunk/a"),
+  ];
+  for (prefix, partition, beneath) in cases {
+    let name = name_on(prefix, partition);
+    create_svn(&daemon, partition, &name);
+    let url = format!("svn://127.0.0.1:{port}/{name}{beneath}");
+    let answer = replaced(NO_ACCESS_CLIENT, &string_item(NONE_URL), &string_item(&url));
+    assert_eq!(
+      exchange(port, greeting.len(), &answer),
+      (text(&greeting), text(refusal)),
+      "{url}"
+    );
+  }
 }
 
 /// A-689 (§4.17.4 piece 7). Do: start a daemon that is no fleet node asked for the svn:// listener on every interface,

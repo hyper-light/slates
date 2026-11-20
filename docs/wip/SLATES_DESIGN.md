@@ -14174,6 +14174,37 @@ signature verification).
 > owed): `slates-hg --lib serve:: push::` 91 passed and 0 failed, `slates-server --lib repository::hg_push
 > vcs_http::tests::hg` 13 passed and 0 failed, fmt clean
 > (`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`).
+>
+> **Status (2026-11-19, A-680 part 2b: Mercurial's pushes over HTTP land in each repository's store).** Mercurial's
+> site serves `unbundle`: once the policy has admitted the push (`POST`, a right to submit, rewrite or delete), its
+> `heads` argument and bundle are read from the request (`serve::http::unbundle_request`) and handed to the lender
+> (`HgStores::push`), which runs the driver both edges call, `repository::hg_push::unbundle`, in one step on the
+> repository's owner shard and in 7.2's order: `heads` judged against the served view, a race answered before the bundle
+> is read as 7.2's `pusherr`; the bundle read as 7.2's `unbundle` reads it (`push::read_bundle`: a bundle2 made plain,
+> decoded and read part by part, its refusals 7.2's error parts; a bundle1 refused as bundle2 required; a stream that is
+> no bundle, or of a version 7.2 lacks, refused in 7.2's words); then `prepare` over the served view and what the store's
+> index holds, the policy (`admitted`), a gate refusing every push while a Mercurial hook is configured (the hook's view
+> of the push is piece 9's: no push lands that a configured hook was not asked about, as git's push refuses), and the
+> landing, whose revisions now go into a fork of the index in the repository's store in A-662's map (`hg_push::land`
+> over the Mercurial arm), each step over the store lent the shard's room and settled after. The push's name is hashed
+> from its repository and its bundle, so a push sent again makes the same works. Its answer is framed as 7.2 frames
+> `unbundle`'s (`serve::http::pushed`): a bundle2 reply in `application/mercurial-0.1`, uncompressed; `pusherr` in
+> `0.1`; a bundle1 out of band. HTTP's capabilities list `unbundle` and the bundle2 capabilities a push needs as 7.2
+> lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
+> `pushkey`). Differs from 7.2 on purpose: the `output` parts in which 7.2 captures its own progress words over HTTP
+> (`adding changesets`, `added 1 changesets with 1 changes to 1 files`) are not sent; they are no part a client acts on.
+> Not yet durable: a push's entry records its lines', bookmarks' and phase roots' moves and no record of its revisions,
+> so a restart's store lacks them while the register keeps their moves (A-687 makes Mercurial's record kind; A-680 part
+> 2c records pushes with it). Proven on macOS arm64 (Mac Studio, kiln r467 and r480, 2026-11-19; the other platforms
+> owed):
+> red first, the edge's push test over main without the fix failing, its first push answered `200`
+> `application/hg-error` `command not served here` (kiln r467 over 10df7becc); then `slates-hg --lib push:: serve::` 93
+> of 93 (r467), `slates-server --lib` filtered to `vcs_http::`, `vcs_store::hg_view` and `repository::hg_push` 64 of 64
+> (r480), fmt clean: a two-shard daemon's edge, over TLS with stock hg's fields and a bearer token, takes the captured
+> server's history and then the very bundle stock 7.2 pushed to it over HTTP, answers 7.2's own reply but its progress
+> words, then `heads` the pushed changeset and `listkeys phases` 7.2's own answer byte for byte; the driver lands stock
+> `push-plain` over the real served view, answered byte for byte as 7.2 answered it, and refuses a hooked repository's
+> push naming its hook with nothing recorded; the bundles 7.2 does not read are answered in its words.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -14592,10 +14623,11 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
    index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
    owed: the process around the stdio session, the learned response compression (the first value until then), and the
-   site's pushes (`unbundle` through `hg_push`, A-680 part 2b) and the SSH edge's (`unbundle` in the stdio session).
-   Built (A-680 part 2a, `vcs_http::ToolSites`, `vcs_store::hg_view`): the site on the daemon's edge, each
-   repository's served view lent from its store on its owner shard. Built (A-679, `crates/server` `vcs_ssh::hg`): the
-   stdio session behind the daemon's SSH edge, over the same lender; the daemon starting that edge is A-684's.
+   SSH edge's pushes (`unbundle` in the stdio session, through the same driver). Built (A-680 part 2a,
+   `vcs_http::ToolSites`, `vcs_store::hg_view`): the site on the daemon's edge, each repository's served view lent from
+   its store on its owner shard; and its pushes (A-680 part 2b), `unbundle` through `hg_push::unbundle`. Built (A-679,
+   `crates/server` `vcs_ssh::hg`): the stdio session behind the daemon's SSH edge, over the same lender; the daemon
+   starting that edge is A-684's.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
@@ -14604,7 +14636,11 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    `push::commit`, slates-server's `repository::hg_push`): which lines, bookmarks and phases a push moves, its names
    (`branch:<label>:<number>`, `bookmark:<label>:`), its race checks as positions, the landing through A-635's append on
    each green's log with the phase roots in the same entry, the index kept. Built (A-657 part 4): the policy before the
-   verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after.
+   verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after. Built (A-680
+   part 2b, `push::read_bundle`, `repository::hg_push::unbundle`): the driver both edges call, the bundle read as 7.2's
+   `unbundle` reads it, the revisions landed into the repository's store (A-662's Mercurial arm), a configured hook
+   refusing every push until its view is served; owed: each push's record (A-680 part 2c, A-687's record kind), the
+   bundle read in slices.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -15090,6 +15126,25 @@ and export by landing).
 > sources lent with every call, CRAM-MD5 keys over §4.13's principals, each phase's wait learned (one mechanism for the
 > HTTP, SSH and svn:// edges), and the SSH tunnel's entry point. Windows keeps no listener across a restart
 > (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
+>
+> **Status (2026-11-19, A-695: where an svn:// URL leads, A-656 part 2's second slice).** Built: the listener resolves
+> the client's URL as `svnserve`'s `find_repos` does (`slates_svn::find`, `serve.c` 3884-3955): no `svn://` URL is
+> "Non-svn URL passed to svn server", a path climbing with `..` (decoded first, so `%2E%2E` climbs) "Couldn't determine
+> repository path", and the server's root "No repository found". The repository is the longest run of the path's
+> leading segments that names one, as `svn_repos_find_root_path` walks up (a name may hold a `/`): each candidate is
+> asked of the shard its name's partition is on, every shard once (`vcs_svn::locate`, which the `svn+ssh://` tunnel
+> can call too), and a repository another shard owns moves the connection there whole (the socket's handle, the
+> connection with its answer read, its unread bytes and deadline), where it takes a seat as a new connection would
+> (every shard keeps the listener's seats). On the owner a name no Subversion repository has is "No repository
+> found"; its records are read as the shared lender lends them there (`vcs_store::svn_view::lend_in`, A-681), and a
+> repository is opened with its UUID, its root URL (the client's URL less the components beneath the
+> repository) and the mechanisms it allows, none yet: a client that has not authenticated is no principal (§4.13), and
+> CRAM-MD5 waits on the keyed contexts of enrolled credentials (A-692), so every repository answers as `svnserve`
+> answers one that allows no one. Proven on a two-shard daemon against stock `svnserve` 1.15.0's recorded `no-access`
+> session, a repository on each shard. Owed: the authenticated session's sources, read each call through the same lender
+> once a mechanism exists; `svn_uri_canonicalize` before the lookup (a stock client's URL
+> is already canonical); the tunnel's own move to the owner (A-688's site, which finds repositories on its shard
+> alone).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -53426,6 +53481,106 @@ endpoint, the module doc, and its tests; `vcs_http/daemon_edge.rs`: `ShardLfs` s
 - **Owed.** Uploads by others than the owner (A-635's policy check, the queue's next piece); a streaming put in
   `slates-vcs`, so an upload is not held whole and its record not copied whole; the stock git-lfs client end to end
   against a daemon (the queue's next piece); a snapshot carrying the index by its tables, as A-662 owes for the store.
+
+### A-680 part 2b — Mercurial's pushes over HTTP: `unbundle` read as 7.2 reads it, landed through `hg_push` into the repository's store on its owner shard, answered as 7.2 frames `unbundle`'s answers (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Push" steps 1 to 7, "Hooks" and pieces 4 and 5; A-641, A-657, A-662, A-680 parts 1 and 2a)
+Applied in the same change to: §4.17.3 (a status block, pieces 4's and 5's lines), `crates/hg` (`push`: `read_bundle`,
+`Outcome`, `Refusal::refused`; `serve::http`: `unbundle_request`, `pushed`; `serve::session`: HTTP's capabilities and
+bundle2 capabilities for a push, `Refused::Push`; their tests), `crates/server` (`repository::hg_push`: `land` over the
+store's Mercurial arm, the driver `unbundle`, the hook gate, the push's name, its tests' history builders shared;
+`vcs_store::hg_view`: `with_view`, `ServedViews::push`; `vcs_http::hg`: `HgStores::push`, `unbundle` routed to it;
+`vcs_http::daemon_edge`'s doc; the edge's and the site's tests), `crates/cli` (the stock-hg round trip waits on A-686
+alone), GAPS (the §4.17.3 entry).
+- **Why.** A stock `hg push` over HTTP met `command not served here`: the site answered `unbundle` out of band, and
+  `hg_push` landed into an index and content store its caller held (`Objects`), which no caller in the daemon held:
+  A-662's map keeps each repository's store, and handing `hg_push` its Mercurial arm was owed.
+- **7.2's order** (`wireprotov1server.unbundle`, `exchange.readbundle`, `bundle2.getunbundler`, `exchange.unbundle`
+  \[C\]). The `heads` argument is judged before the bundle is read (`check_heads`, "preparing changes"), and a race there,
+  or any abort before bundle2's processing, is `pusherr`: over HTTP `0`, a line end, the words, a line end, in
+  `application/mercurial-0.1`. A bundle1 is refused with 7.2's `bundle2required` words out of band, as a 7.2 server whose
+  `server.bundle1` is off refuses one (bundle1 is not served, as `getbundle`'s is not). A bundle2's refusals are its
+  reply's error parts: an unknown mandatory stream parameter, part or parameter `error:unsupportedcontent`, every other
+  fault `error:abort` in slates' words. The reply goes as 7.2's `streamreslegacy` goes: `0.1`, uncompressed, whatever
+  the client reads.
+- **One step.** The driver judges `heads`, reads the bundle, prepares the push over the served view the same step makes
+  (`hg_view::with_view`, the view every client is answered from) and what the store's index holds, asks the policy,
+  passes the hook gate, and lands, on the owner shard with nothing awaited between, so the entry commits against the
+  view the push read; A-642's positions hold it there too.
+- **Decided.** `checkheads=related` is advertised (the design's "always, since the verdict is per line"), so a 7.2
+  client checks only the heads it moves (`check:updated-heads`). A Mercurial hook configured for the repository refuses
+  every push, naming it, until piece 9 serves its view of the push, as git's push refuses (`git_push`); the admission
+  hooks' driver (A-657 part 4) waits for that view. A push's name is BLAKE3 over its repository and its bundle (A-618:
+  a push sent again makes the same works). Every repository publishes (decision 3, A-680 part 2a). 7.2's captured
+  progress words (`output` parts over HTTP) are not sent.
+- **Not yet durable** (GAPS §4.17.3). The entry holds the push's moves and phase roots and no record of its revisions; a
+  recovery replays no Mercurial record (A-662's arm refuses one `Owed`), so after a restart the store lacks what pushes
+  brought while the register keeps their moves. A-687 makes Mercurial's record kind (the import's); recording each
+  push's objects with it is A-680 part 2c, never a second kind.
+- **Tests** (macOS arm64, Mac Studio, kiln r467 and r480, 2026-11-19, rustc 1.98.1). Red first: kiln r467 over 10df7becc (main f1fbd2c44 with the edge's
+  test and the test helpers' visibility alone): `cargo test --locked -p slates-server --lib -- a_stock_mercurial_push
+  --test-threads=4` 0 passed and 1 failed, the history's push answered `(200, "application/hg-error", "command not
+  served here\n")`. Green: r467 over c9975fb8e, `cargo test --locked -p slates-hg --lib -- push:: serve::` 93 passed
+  and 0 failed (the four new among them), `cargo fmt -p slates-hg -p slates-server -- --check` clean; its server arm did
+  not compile (the push's `Outcome` met `vcs_hooks::Outcome` among `hg_push`'s unix imports), so it is `PushOutcome`
+  there; r480 over bd10c37e0, `cargo test --locked -p slates-server --lib -- vcs_http:: vcs_store::hg_view
+  repository::hg_push --test-threads=4` 64 passed and 0 failed, fmt clean.
+  `a_stock_mercurial_push_over_the_daemons_edge_lands_on_its_repositorys_shard`: a two-shard daemon over TLS takes, with
+  stock hg's fields, the captured server's history (`base`, `second`, `third` rebuilt to 7.2's nodes, `main` at `base`;
+  an empty reply) and then the very bundle stock 7.2 pushed to that server (`crates/hg/fixtures/wire`'s `http-push`),
+  answering 7.2's reply part for part but its two `output` parts, `heads` then `fourth` alone and `listkeys phases`
+  7.2's own answer byte for byte. `a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits`: stock
+  `push-plain` through the driver over the real served view answered byte for byte as 7.2 answered it, its changeset in
+  the store's index; a repository configuring a `pretxnchangegroup` hook refused naming it, its green unmoved and its
+  index without the changeset. slates-hg: stock 7.2's HTTP push bundle read part by part; 7.2's own replies to an
+  unknown mandatory part and parameter byte for byte; every header 7.2 does not read answered in its words; a reply, a
+  `pusherr` and a bundle1 framed over HTTP (the last 7.2's `bundle2required` answer byte for byte); arguments and
+  framings past the room out of band. A-657's pushes now land through the store's arm. The stock-hg CLI round trip
+  stays ignored until A-686.
+- **Owed.** A-680 part 2c (each push's record with A-687's kind, and its replay); the SSH edge's pushes (A-679's loop
+  calls the same driver); the bundle read in slices; the stock-hg round trip over the edge once A-686 lands; the other
+  platforms' runs (main's).
+
+### A-695 — Where an svn:// URL leads: `svnserve`'s `find_repos`, the longest run of segments naming a repository asked of each shard once, and the connection moved to the repository's owner (2026-11-19, g234, UI goal 93; §4.17.4 piece 7, A-656 part 2's second slice; after A-689)
+Applied in the same change to: §4.17.4's status; GAPS (the A-656 entry); `crates/svn/src/find.rs` and
+`find/tests.rs` (new), `lib.rs`, `report.rs` (`uri_decode_bytes`); `crates/server/src/vcs_svn.rs` (`locate`,
+`Location`, `Located`, the move and the open), `vcs_svn/tests.rs`, `daemon.rs` (the listener's seats kept on every
+shard); `docs/cli.md`.
+
+- **Why.** A-689's listener answered every URL "No repository found": nothing looked a repository up, so no stock
+  client could reach one, and the `svn+ssh://` tunnel (A-688) looked only on its own shard.
+- **The rule.** `slates_svn::find` is `find_repos` with no I/O (`serve.c` 3884-3955, 1.15.0): `skip_scheme_part`
+  (`svn://` or `svn+NAME://`, else `BadUrl`), the authority skipped, the path made a canonical relative path and
+  percent-decoded, a `..` segment `BadPath` (after the decoding), no segment `NoRepository`. Its candidates are the
+  path's leading runs of segments joined by `/`, longest first, as `svn_repos_find_root_path` walks up from the whole
+  path; a repository's name may hold a `/` (only an empty name or a NUL is refused), so the HTTP site's first-segment
+  rule (`SVNParentPath`) would miss what `svnserve -r` finds. The root URL is the client's URL less the components
+  beneath the repository (`svn_path_remove_components`).
+- **Asking the shards.** `vcs_svn::locate` groups the candidates by the shard their names' partitions are on and asks
+  each shard once (`xshard::call_in_shard_time_given_room` within the liveness budget), so a lookup costs at most one
+  question per shard whatever the path's depth; the longest name held as a Subversion repository wins, and a shard that
+  does not answer ends the connection, counted, rather than settle on a shorter name it might be shadowing. The tunnel
+  can call the same function from its shard.
+- **The move.** A repository another shard owns moves the connection there whole, as the HTTP edge moves one: its
+  handle, the connection with its answer read, its unread bytes and its deadline, one spawn on the owner's control
+  channel; its seat here is given back as it leaves, and there it takes a seat as a new connection would (every shard
+  keeps the listener's seats; arrivals waiting are bounded by the seats).
+- **Opened.** On the owner the record is read again and the store through the shared lender
+  (`vcs_store::svn_view::lend_in`, A-681, the records as it lends them to the DAV site; a repository gone meanwhile is
+  "No repository found"; records not held close the connection, counted), and the repository is opened with its UUID, also its realm,
+  and the mechanisms it allows: none yet, since a client that has not authenticated is no principal (§4.13) and
+  CRAM-MD5 waits on A-692's keyed contexts, so every repository answers "No access allowed to this repository", as
+  `svnserve` answers one that allows no one.
+- **Tests.** Red first (macOS arm64, Mac Studio, kiln r477, the test alone over main 574185afa): the repository on the
+  listener's partition was answered "No repository found in 'svn://127.0.0.1:50226/svn-1'" where `svnserve` answers
+  "No access allowed to this repository". Green (r508, 2026-11-20 00:10-00:14Z, over main 574185afa):
+  `cargo test --locked -p slates-svn --lib -- find:: report::tests::` 21 of 21 (the candidates and root URLs, the
+  refusals); `-p slates-server --lib -- vcs_svn:: vcs_http::daemon_edge::` 9 of 9, among them a two-shard daemon
+  answering stock `svnserve` 1.15.0's recorded `no-access` session for a repository on the listener's partition, one
+  on the other shard and one there whose name holds a `/`, named through a path beneath it; `-p slates-cli --test cli
+  -- vcs_svn svn_listeners` 2 of 2; `cargo fmt -p slates-svn -p slates-server -- --check` clean once rustfmt's three
+  rewraps were applied as it wrote them.
+- **Owed.** The authenticated session's sources, read each call through the same lender once a mechanism exists
+  (A-692); the tunnel calling `locate` and moving its SSH connection to the owner, with its test over
+  the SSH site; `svn_uri_canonicalize` before the lookup; the other platforms' runs (main's).
 
 ### A-692 — `svn://`'s CRAM-MD5 against enrolled tokens: a token's record keeps HMAC-MD5's keyed contexts, never the token (2026-11-19, g307, UI goal 93; §4.17.4 item 10, §4.13; A-599's owed (3), A-625 part 3; found by the Subversion interop tests)
 Applied in the same change to: §4.17.4 item 10's status; GAPS (the §4.17.4 entry: A-599's owed (3), the interop tests'

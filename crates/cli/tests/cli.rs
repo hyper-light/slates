@@ -13942,12 +13942,11 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 /// run with the anchor's issuer surface: [`anchor_with_edges_and_issuer`]); with the token as Basic's password
 /// (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and pull it back
 /// ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips loudly without
-/// stock hg 7.2 ([`STOCK_HG`]), and where the platform names no issuer surface ([`NO_ISSUER_SURFACE`]). Ignored until
-/// it can pass: the hg site's pushes (`unbundle` through `hg_push`) are A-680 part 2b (g303); `slates repository
-/// create` (A-685), the hg site on the daemon's edge (A-680 part 2a) and the edge's Basic, its challenge first and
-/// taken on the loopback edge (A-686, [`stock_hg_without_credentials_is_refused_in_its_own_words`]), are built.
+/// stock hg 7.2 ([`STOCK_HG`]), and where the platform names no issuer surface ([`NO_ISSUER_SURFACE`]). Everything
+/// it needs is built: `slates repository create` (A-685), the hg site on the daemon's edge (A-680 part 2a), its pushes
+/// (`unbundle` through `hg_push`, A-680 part 2b) and the edge's Basic, its challenge first and taken on the loopback
+/// edge (A-686, [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
 #[test]
-#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push)"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13997,11 +13996,11 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 /// ([`NO_ISSUER_SURFACE`]). Ignored until it can
 /// pass: no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag --vcs-ssh`, kiln r174 over
 /// main 34d10acb5), and the edge's Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`, over
-/// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece, as the
-/// HTTP site's pushes wait on A-680 part 2b.
+/// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece (A-696),
+/// as the HTTP site's pushes do through `hg_push` since A-680 part 2b.
 #[test]
-#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>) and the pushes over hg serve --stdio (unbundle in the stdio \
-            session, through hg_push as A-680 part 2b lands the HTTP site's)"]
+#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>) and the pushes over hg serve --stdio (A-696: unbundle in the \
+            stdio session, through hg_push as the HTTP site's are since A-680 part 2b)"]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   let Some(hg) = stock_hg() else {

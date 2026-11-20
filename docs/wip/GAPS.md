@@ -430,8 +430,9 @@
 > over 5206419be, r454, 106 of 106 over be892650b, r492, 119 of 119 over 0b0c8e12e, r512, and 124 of 124 over
 > 20ae700a7, r530, the daemon's site serving it since A-684; macOS arm64, Mac Studio).
 > Owed: a push over a connection A-651 part 4 moved to its owner shard (a two-shard daemon, as the HTTP site's push
-> test runs); main's live `git push` over SSH (`git_interop.rs`'s `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`,
-> ignored until A-684 and A-683, its ignore lifted).
+> test runs). Stock git's live `git push` over SSH runs since 2026-11-20 (`git_interop.rs`'s
+> `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`, un-ignored by w-interop, passing; its evidence on g083's
+> stock git line).
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -705,8 +706,13 @@
 > bearer credential (`http.extraHeader`), which passes: stock git 2.50.1 clones a repository `slates repository create`
 > made, pushes to it and fetches from it over the daemon's edge. The round trip with the token as Basic's password in
 > the URL runs since A-686 (g258), its one wait (the cleartext edge's `401` offered Bearer alone, so git answered
-> `Authentication failed`); the one over the SSH edge is ignored naming its waits (A-684, g299: `--vcs-ssh`; A-683,
-> g302: git-receive-pack on the SSH edge). A credential is minted with the anchor's issuer surface, so on Linux, where
+> `Authentication failed`); the one over the SSH edge runs since A-684 (g299: `--vcs-ssh`) and A-683 (g302:
+> git-receive-pack on the SSH edge), un-ignored by w-interop (2026-11-20): git runs OpenSSH with the enrolled key alone,
+> trusting only the host key the daemon's SSH line names (a `known_hosts` written by `ssh-keyscan`, its `ssh-keygen -l`
+> fingerprint checked against the printed one, `StrictHostKeyChecking=yes`), and stock git 2.50.1 clones, pushes and
+> fetches over it with OpenSSH 10.2p1 (macOS arm64, Mac Studio, kiln r1 over 43c86824e: `cargo test --locked -p
+> slates-cli --test git_interop -- --test-threads=1` 5 passed, 0 ignored, the SSH leg alone 1 of 1 in 7.4 s;
+> `cargo fmt -p slates-cli -- --check` clean). A credential is minted with the anchor's issuer surface, so on Linux, where
 > that surface is a descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln
 > r426 over main 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2
 > ignored; with `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication
@@ -727,8 +733,8 @@
 > (kiln r392 and r429: both in hg's crash report), then 10 of 10, 52 of 52 and 4 of 4 (r415, r429), fmt clean. g309's
 > stock git round trip with the token as Basic's password in the URL against a real anchor (`git_interop`), its one
 > wait this piece, un-ignored as main merged it in (red there: `fatal: Authentication failed`, g309's kiln r426).
-> Owed: g083's stock-hg round trip over the anchor's edge, once the hg site takes pushes (A-680 part 2b); stock `hg
-> identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
+> g083's stock-hg round trip over the anchor's edge runs un-ignored since A-680 part 2b (the hg site's pushes). Owed:
+> stock `hg identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
 > found here, main's); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
@@ -1197,6 +1203,21 @@
 > `phases.publish`. `slates-server --lib` filtered 51 of 51 and fmt clean on macOS arm64 (Mac Studio, kiln r357,
 > 2026-11-19): a daemon's edge answers `capabilities` and `heads` of a repository on another shard holding
 > `fixtures/state`'s `states` by an import; the other platforms owed.
+> **Built (A-680 part 2b):** Mercurial's pushes over HTTP: the site reads `unbundle`'s `heads` argument and bundle and
+> hands them to the lender's driver (`repository::hg_push::unbundle`), one step on the owner shard in 7.2's order
+> (`heads` judged against the served view, `pusherr` for a race; the bundle read as 7.2's `unbundle` reads it,
+> `push::read_bundle`; `prepare`, the policy, a gate refusing every push while a Mercurial hook is configured, the
+> landing), its revisions kept in a fork of the index in the repository's store in A-662's map (`hg_push::land` over
+> the Mercurial arm, `Objects` gone), its answer framed as 7.2 frames `unbundle`'s (`serve::http::pushed`); HTTP's
+> capabilities list `unbundle` and a push's bundle2 capabilities. Red first (the edge's push test over main without the fix:
+> `200` `application/hg-error`, kiln r467); `slates-hg --lib push:: serve::` 93 of 93, `slates-server --lib` filtered 64
+> of 64 and fmt clean on macOS arm64 (Mac Studio, kiln r467 and r480, 2026-11-19): stock 7.2's own HTTP push over a
+> two-shard daemon's TLS edge answered with 7.2's reply but its progress words, `heads` the pushed changeset after it;
+> the other platforms owed.
+> **Open (A-680 part 2b): a push's revisions are not durable.** Its entry records its moves and phase roots and no
+> record of its revisions, and a recovery replays no Mercurial record, so after a restart the store lacks what pushes
+> brought while the register keeps their moves: `heads` answered from a store that no longer holds them. A-687 makes
+> Mercurial's record kind (the import's); A-680 part 2c records each push's objects with it and replays them.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -1220,7 +1241,8 @@
 > last wait: the daemon's edge served git's site alone until A-680 part 2a (hg met `404`), and the site's `401`
 > offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
 > first challenge alone), until A-686 put Basic's challenge first and took Basic with the token as password on the
-> loopback edge. The HTTP round trip waits on the hg site's pushes (A-680 part 2b, g303); the SSH one on the pushes
+> loopback edge. The HTTP round trip passes since the hg site's pushes (A-680 part 2b: stock hg 7.2, macOS arm64, Mac
+> Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one waits on the pushes
 > over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
 > (A-679, built) reads as the HTTP site does (A-680).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
@@ -1250,12 +1272,10 @@
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
 > step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes (A-657 part 4
 > built the policy before the verdict in `acl`'s words and the `pretxnchangegroup` and `changegroup` hooks through
-> the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
-> (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
-> it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
-> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the HTTP site's pushes through them (A-680 part
-> 2b; the served view and the site's lender are built) and the SSH edge's (`unbundle` in `serve --stdio`'s session,
-> which A-679 serves for reads alone);
+> the driver): the principal's Mercurial identity in `acl`'s words (§4.13); each push's record and its replay at
+> recovery (A-680 part 2c, with A-687's record kind; A-662 refuses a Mercurial record `Owed` until then; the landing
+> into the store's Mercurial arm and the HTTP site's pushes are built, A-680 part 2b); the SSH edge's pushes through the
+> same driver (`unbundle` in `serve --stdio`'s session, which A-679 serves for reads alone);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
@@ -1682,6 +1702,15 @@
 > repositories' lookup (the rest of `find_repos`, the owner shard), the sources with every call, CRAM-MD5 keys, learned
 > waits (one mechanism for the three edges), the SSH tunnel's entry point; Windows and Linux runs (main's); Windows
 > holds no listener across a restart (`docs/wip/platforms.md`, gap 2).
+> Part 2, second slice, 2026-11-19 (A-695): where a URL leads. `slates_svn::find` ports `find_repos` (BadUrl, BadPath
+> after decoding, the root NoRepository); the repository is the longest run of the path's segments naming one, each
+> candidate asked of its name's shard, every shard once (`vcs_svn::locate`); one another shard owns moves the connection
+> there, where its records are read through the landed lender (`vcs_store::svn_view::lend_in`, A-681); every
+> repository answers "No access allowed" until a mechanism exists. Red then green on macOS arm64 (Mac
+> Studio, kiln r477, r508): svn find 21 of 21, server 9 of 9 (a two-shard daemon answering `svnserve`'s recorded
+> `no-access` session for repositories on both shards, one name with a `/`), cli 2 of 2. Owed: the authenticated
+> session's per-call sources through the same lender (after A-692's CRAM-MD5); the tunnel's move to the owner
+> (A-688 looks on its own shard alone) and its test over the SSH site; `svn_uri_canonicalize`.
 > A-692 (2026-11-19, g307): `svn://`'s CRAM-MD5 against enrolled tokens. A token's credential record keeps HMAC-MD5's
 > keyed contexts beside its hash (`CredentialKind::HttpToken`'s `cram_md5_contexts`, Dovecot's layout), derived by the
 > CLI's issuer as it mints the token, so the daemon holds neither the token nor anything that gives it back; a client

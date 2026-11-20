@@ -29,7 +29,8 @@
 //! (A-629 part 2c), the batch API and the transfers over its store's LFS index, an upload answered once its entry is
 //! durable (A-629 part 3). Mercurial's commands, a request whose query names one ([`ToolSites`]), from each
 //! repository's served view over its store on the shard the connection moved to, lent for each step (`ServedViews`,
-//! A-680 part 2); its pushes (`unbundle`) are not served yet.
+//! A-680 part 2); its pushes (`unbundle`) landed there by the same lender into the repository's store
+//! (A-680 part 2b).
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
 use slates_git::lfs::serve::{Answer as LfsAnswer, Endpoint};

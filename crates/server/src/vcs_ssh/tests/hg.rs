@@ -19,6 +19,7 @@ use slates_git::Admission;
 use slates_git::upload::{PackPlan, PackRefused, PackSource, Served};
 use slates_hg::obsmarkers::Marker;
 use slates_hg::phases::Phase;
+use slates_hg::push::Outcome;
 use slates_hg::serve::getbundle::{Logged, Store};
 use slates_hg::serve::stdio::{EXIT_STATUS, Progress, Stdio};
 use slates_hg::serve::{Repository, Rev};
@@ -35,6 +36,7 @@ use super::{
   HELD_SEED, HOLDER, Keys, ONE_SEAT, Peer, ROOM_BYTES, TICK_NS, Transcript, exec, query, send_data,
   served_by, sign, transcript,
 };
+use crate::repository::hg_push::Pushing;
 use crate::vcs_http::Bounds;
 use crate::vcs_http::git::{Located, Repositories, StoreLender, ThisShard};
 use crate::vcs_http::hg::HgStores;
@@ -329,6 +331,16 @@ impl HgStores for Lends {
     step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
   ) -> Option<R> {
     self.holds(id).then(|| step(self.probed, room))
+  }
+
+  /// No push lands: the SSH session's `unbundle` is not served (its pushes are A-680 part 2b's driver's, over HTTP).
+  fn push(
+    &mut self,
+    _id: RepositoryId,
+    _pushing: Pushing<'_>,
+    _room: &mut slates_hg::Admission,
+  ) -> Option<Outcome> {
+    None
   }
 }
 

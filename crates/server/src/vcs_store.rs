@@ -65,8 +65,9 @@
 //!
 //! **Owed** (each in GAPS' §4.17 entry). A snapshot carrying each store's sealed tables by identity, so a recovery
 //! replays only the log's suffix; the replay and a rebuild sliced a unit at a time within a record (a record is one unit
-//! today, as a commit is one step); Mercurial's records and their replay (g304's push), whose arm is placed here and
-//! whose records a recovery refuses typed until then; the Subversion index charged by the bytes it holds, once
+//! today, as a commit is one step); Mercurial's records and their replay (A-687 makes the import's record kind; A-680
+//! part 2c records each push's objects with it; a push lands into the arm today, `repository::hg_push::land`), which a
+//! recovery refuses typed until then; the Subversion index charged by the bytes it holds, once
 //! slates-svn measures them (its entries are bounded meanwhile); a version's pack fragments encoded again after a
 //! recovery, off the answer's path as a live version's are (A-654); and the fleet half, holders replaying the same
 //! records (A-636).
@@ -282,7 +283,7 @@ pub(crate) enum ReplayRefused {
   SvnStep(StepRefusal),
   /// A Subversion record out of its order: a creation once the records are made, or a revision before them.
   SvnOrder,
-  /// A record of a tool whose replay is owed: Mercurial's (g304's push).
+  /// A record of a tool whose replay is owed: Mercurial's (A-687, A-680 part 2c).
   Owed,
   /// An LFS object's record's bytes (A-629 part 3).
   LfsRecord(LfsRecordRefused),

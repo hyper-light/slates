@@ -6,7 +6,7 @@ use proptest::prelude::*;
 
 use super::check::{self, CheckRefusal, HeadsArgument, Moment};
 use super::reply::{self, Refused, Replied, Reply};
-use super::{Asks, BookmarkAt, Fault, Refusal, Unbundle, read};
+use super::{Asks, BookmarkAt, Fault, Outcome, Refusal, Unbundle, read, read_bundle};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::changegroup::Version;
 use crate::fixtures::node;
@@ -1102,6 +1102,105 @@ fn claim(view: &View, (which, picks): &Claim) -> Asks {
         .collect(),
     ),
   }
+}
+
+/// Format: stock 7.2's push over HTTP (`fixtures/wire`, `make-wire-fixtures.sh`'s `http-push`): the request its client
+/// sent with `unbundle`, its head then its bundle.
+const HTTP_PUSH: &[u8] = include_bytes!("../../fixtures/wire/http-push.07.request");
+
+/// What follows a captured HTTP request's head: its body.
+fn body_of(request: &[u8]) -> &[u8] {
+  let end = request
+    .windows(4)
+    .position(|four| four == b"\r\n\r\n")
+    .unwrap();
+  &request[end + 4..]
+}
+
+/// A-680 part 2b (golden: stock 7.2's push over HTTP, and the bundles its server refused over SSH). Do: read the bundle
+/// stock 7.2's client sent with `unbundle` over HTTP, and the two bundles 7.2's server refused for an unknown mandatory
+/// part and parameter, as `unbundle` reads a push's bundle. Expect: the first read part by part as 7.2's handlers take
+/// it (`replycaps`, `check:phases`, `check:updated-heads`, a version 03 changegroup, `phase-heads`); each refused bundle
+/// refused with the reply 7.2's server wrote, byte for byte.
+#[test]
+fn a_pushs_bundle_is_read_as_7_2s_unbundle_reads_it() {
+  let unbundle = read_bundle(body_of(HTTP_PUSH), &mut room()).unwrap();
+  assert_eq!(
+    kinds(&unbundle),
+    [
+      "replycaps",
+      "check:phases",
+      "check:updated-heads",
+      "changegroup",
+      "phase-heads"
+    ]
+  );
+  let (_, part) = unbundle.changegroup().unwrap();
+  assert_eq!(part.version, Version::V03);
+  for name in ["push-unsupported-part", "push-unsupported-param"] {
+    let push = fixture(name);
+    match read_bundle(push.request, &mut room()) {
+      Err(Outcome::Refused(reply)) => assert_replies_as_7_2(&reply, &push),
+      other => panic!("{name}: {other:?}"),
+    }
+  }
+}
+
+/// A bundle2 stream naming `parameter` and holding no part.
+fn with_stream_parameter(parameter: &[u8]) -> Vec<u8> {
+  let mut out = b"HG20".to_vec();
+  out.extend_from_slice(&u32::try_from(parameter.len()).unwrap().to_be_bytes());
+  out.extend_from_slice(parameter);
+  out.extend_from_slice(&[0; 4]);
+  out
+}
+
+/// A-680 part 2b (7.2's `exchange.readbundle`, `bundle2.getunbundler`, `changegroup.readexactly` and
+/// `wireprotov1server.unbundle`). Do: read as a push's bundle nothing, two bytes, a bundle1, a headerless bundle1, a
+/// stream that is no bundle, a bundle2 version 7.2 lacks, a version of no family it reads, a bundle2 naming an unknown
+/// mandatory stream parameter, and the HTTP push cut short. Expect: 7.2's `pusherr` words for nothing, two bytes, no
+/// bundle and both unknown versions; bundle2 required for both bundle1s; `error:unsupportedcontent` naming the
+/// parameter and no part; an `error:abort` for the cut.
+#[test]
+fn bundles_7_2_does_not_read_are_answered_in_its_words() {
+  let unprocessed = |words: &str| Err(Outcome::Unprocessed(words.as_bytes().to_vec()));
+  let unsupported = Outcome::refused(&Refused::Unsupported {
+    parttype: None,
+    params: vec![b"Xyz".to_vec()],
+  });
+  let parameter = with_stream_parameter(b"Xyz");
+  let cases: [(&[u8], Result<Unbundle, Outcome>); 8] = [
+    (
+      b"",
+      unprocessed("stream ended unexpectedly (got 0 bytes, expected 4)"),
+    ),
+    (
+      b"HG",
+      unprocessed("stream ended unexpectedly (got 2 bytes, expected 4)"),
+    ),
+    (b"HG10UN\0\0\0\0", Err(Outcome::Bundle1)),
+    (b"\0\0\0\x10", Err(Outcome::Bundle1)),
+    (b"PK\x03\x04", unprocessed("stream: not a Mercurial bundle")),
+    (b"HG21", unprocessed("unknown bundle version 21")),
+    (b"HGS1", unprocessed("stream: unknown bundle version S1")),
+    (&parameter, Err(unsupported)),
+  ];
+  for (bytes, expected) in cases {
+    assert_eq!(
+      read_bundle(bytes, &mut room()),
+      expected,
+      "{}",
+      String::from_utf8_lossy(bytes)
+    );
+  }
+  let body = body_of(HTTP_PUSH);
+  let cut = &body[..body.len() / 2];
+  let Err(Outcome::Refused(reply)) = read_bundle(cut, &mut room()) else {
+    panic!("the cut bundle was not refused in its reply");
+  };
+  let parts = meaning(&written(&reply));
+  assert_eq!(parts.len(), 1);
+  assert_eq!(parts[0].0, b"ERROR:ABORT");
 }
 
 proptest! {
