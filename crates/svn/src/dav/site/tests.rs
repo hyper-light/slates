@@ -521,6 +521,15 @@ fn a_mime_type_is_judged_as_subversion_judges_it() {
 /// Shape: the `log-report` `svn log -v` sent (A-609's fixture): two entries at most, from revision 5 down.
 const LOG_VERBOSE: &[u8] = include_bytes!("../fixtures/log-report-verbose.xml");
 
+/// A budget of `room` bytes and as many steps, untimed: a slice as the site's callers gave one before A-745's quantum.
+fn untimed(room: usize) -> Budget {
+  Budget {
+    room,
+    steps: room,
+    quantum: None,
+  }
+}
+
 /// The answer a REPORT streams, a slice of `room` at a time, as the principal `rules` compile for reads it: its
 /// headers, what it wrote and how it ended.
 fn reported(
@@ -534,7 +543,7 @@ fn reported(
   };
   let mut out = Vec::new();
   loop {
-    match report.resume(&fixture.served(rules), &mut out, room) {
+    match report.resume(&fixture.served(rules), &mut out, untimed(room)) {
       ReportProgress::More => {}
       ended => return (report.headers(), out, ended),
     }
@@ -728,4 +737,102 @@ fn an_update_report_on_me_streams_a_checkout_and_refuses_a_revision_past_the_you
     ),
     (404, true)
   );
+}
+
+/// Shape: an `svn update` of a working copy of the trunk at revision 1 to revision 5, as ra_serf 1.15 writes it in
+/// send-all mode.
+fn update_report() -> Vec<u8> {
+  String::from_utf8_lossy(CHECKOUT_REPORT)
+    .replace("rev=\"5\" depth=\"infinity\" start-empty=\"true\"", "rev=\"1\" depth=\"infinity\"")
+    .into_bytes()
+}
+
+/// An update-report's answer on `!svn/me` (`body`), each slice `budget` makes alone.
+fn slices(fixture: &Fixture, body: &[u8], budget: Budget) -> Vec<Vec<u8>> {
+  let anonymous = rules_of(None);
+  let rules = Some(&anonymous);
+  let Answer::Report(mut report) = fixture.ask(rules, "REPORT", ("/!svn/me", None), body) else {
+    panic!("not a report");
+  };
+  let mut slices = Vec::new();
+  loop {
+    let mut out = Vec::new();
+    let progress = report.resume(&fixture.served(rules), &mut out, budget);
+    slices.push(out);
+    match progress {
+      ReportProgress::More => {}
+      ReportProgress::Done => return slices,
+      ended => panic!("ended {ended:?}"),
+    }
+  }
+}
+
+/// A report's whole answer, and each of its calls' bytes: a slice of the smallest room is one call, or the answer's
+/// end.
+fn whole_and_calls(fixture: &Fixture, body: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+  let whole = slices(fixture, body, untimed(ROOM)).concat();
+  let mut calls = slices(fixture, body, untimed(1));
+  calls.retain(|call| !call.is_empty());
+  (whole, calls)
+}
+
+/// A-745 rule 2 on DAV (§4.17.1 "A fetch's answer": admission charges only the slice in flight): do a checkout's and an
+/// update's REPORT under rooms from below one call's bytes up to many calls'; expect every slice within its room, or one
+/// call alone, and every room's slices the bytes the whole room wrote (the bytes
+/// `an_update_report_on_me_streams_a_checkout_and_refuses_a_revision_past_the_youngest` holds to `update.c`'s).
+#[test]
+fn no_slice_of_an_update_report_passes_its_room_but_by_one_call_alone() {
+  let fixture = Fixture::new();
+  for body in [CHECKOUT_REPORT.to_vec(), update_report()] {
+    let (whole, calls) = whole_and_calls(&fixture, &body);
+    assert!(calls.len() > 4, "{} calls", calls.len());
+    for room in [32, 64, 128, 256, 512, 1024, 4096] {
+      let sliced = slices(&fixture, &body, untimed(room));
+      let past: Vec<usize> = sliced
+        .iter()
+        .filter(|slice| slice.len() > room && !calls.contains(slice))
+        .map(Vec::len)
+        .collect();
+      assert_eq!(past, [0; 0], "room {room}: slices past it");
+      assert!(sliced.concat() == whole, "room {room}: other bytes");
+    }
+  }
+}
+
+thread_local! {
+  /// [`tick`]'s clock.
+  static TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A clock one nanosecond on at every reading: a quantum of one has run by the first boundary after a slice's start.
+fn tick() -> u64 {
+  TICKS.with(|ticks| {
+    let now = ticks.get().wrapping_add(1);
+    ticks.set(now);
+    now
+  })
+}
+
+/// A-745 rule 3 on DAV (every slice under the step quantum): do a checkout's and an update's REPORT with room and steps
+/// past the whole answer, but a quantum that has run by the first boundary between the drive's steps; expect each slice
+/// one step, so one call at most, and the bytes the untimed room wrote.
+#[test]
+fn a_slice_of_an_update_report_ends_at_the_first_step_past_its_quantum() {
+  let fixture = Fixture::new();
+  let timed = Budget {
+    room: ROOM,
+    steps: 1,
+    quantum: Some(Quantum { now_ns: tick, ns: 1 }),
+  };
+  for body in [CHECKOUT_REPORT.to_vec(), update_report()] {
+    let (whole, calls) = whole_and_calls(&fixture, &body);
+    let sliced = slices(&fixture, &body, timed);
+    let past: Vec<usize> = sliced
+      .iter()
+      .filter(|slice| !slice.is_empty() && !calls.contains(slice))
+      .map(Vec::len)
+      .collect();
+    assert_eq!(past, [0; 0], "slices of more than one call");
+    assert!(sliced.concat() == whole, "other bytes");
+  }
 }

@@ -26,10 +26,15 @@ use std::collections::BTreeMap;
 const PLENTY: Budget = Budget {
   room: 1 << 24,
   steps: 1 << 20,
+  quantum: None,
 };
 
 /// The smallest budget: one byte, so one of the drive's calls a turn, and one step.
-const SMALLEST: Budget = Budget { room: 1, steps: 1 };
+const SMALLEST: Budget = Budget {
+  room: 1,
+  steps: 1,
+  quantum: None,
+};
 
 /// The sessions the golden replay must meet: every recorded one with a report command (22 stock, 15
 /// hand-made) but the malformed one, whose connection ends before `svnserve` flushed anything.
@@ -535,5 +540,141 @@ fn an_answer_past_its_bounds_ends_the_connection() {
       "{ending:?}"
     );
     assert!(out.ends_with(b"( close-edit ( ) ) "));
+  }
+}
+
+/// What one turn of a replayed exchange wrote, and whether it was the drive's: any turn but the
+/// command's beginning and its answer.
+type Written = (Vec<u8>, bool);
+
+/// Replays recorded session `recorded`'s exchange with `budget` a turn at a time, its report handed
+/// over whole and its answer once asked: each turn's bytes, after the command's own answer.
+fn turns_of(fixture: &Fixture, recorded: Recorded, budget: Budget) -> Vec<Written> {
+  let (session_path, index, request) = report_command(recorded);
+  let established = session();
+  let context = context(&established, &session_path, recorded.client);
+  let (mut input, mut answer) = client_parts(recorded, index);
+  let locks = session_locks(recorded);
+  let mut out = Vec::new();
+  let Opened::Reporting(mut exchange) = Exchange::begin(&context, request, &mut out).unwrap() else {
+    panic!("{}: refused at its beginning", recorded.name);
+  };
+  let anonymous = rules_of(None);
+  let sources = Sources {
+    index: &fixture.index,
+    repository: &fixture.green,
+    locks: &locks,
+    now: NOW,
+    rules: Some(&anonymous),
+  };
+  let mut turns = vec![(out, false)];
+  loop {
+    let mut wrote = Vec::new();
+    let turn = exchange.receive(&sources, &input, &mut wrote, budget).unwrap();
+    turns.push((wrote, !matches!(turn, Turn::Answered { .. })));
+    match turn {
+      Turn::NeedMore { .. } if !answer.is_empty() => input.append(&mut answer),
+      Turn::NeedMore { .. } => panic!("{}: waits past its client's answer", recorded.name),
+      Turn::Took { consumed } => drop(input.drain(..consumed)),
+      Turn::Wrote => {}
+      Turn::Answered { .. } => return turns,
+    }
+  }
+}
+
+/// The recorded checkout and update the slicing tests replay.
+const SLICED: [&str; 2] = ["checkout-r1.1", "update-to-head.1"];
+
+/// What recorded session `name`'s exchange writes under the whole budget, and each of its drive's
+/// calls' bytes: a turn of the smallest room is one call.
+fn whole_and_calls(fixture: &Fixture, recorded: Recorded) -> (Vec<u8>, Vec<Vec<u8>>) {
+  let whole = turns_of(fixture, recorded, PLENTY)
+    .into_iter()
+    .flat_map(|(bytes, _)| bytes)
+    .collect();
+  let calls = turns_of(fixture, recorded, SMALLEST)
+    .into_iter()
+    .filter(|(bytes, drive)| *drive && !bytes.is_empty())
+    .map(|(bytes, _)| bytes)
+    .collect();
+  (whole, calls)
+}
+
+/// A-745 rule 2 on svn:// (§4.17.1 "A fetch's answer": admission charges only the slice in flight):
+/// replay a recorded checkout and update under rooms from below one call's bytes up to many calls';
+/// expect every turn of the drive within its room, or one call alone, and every room's turns the
+/// bytes the whole budget wrote (what `svnserve` wrote:
+/// `every_recorded_exchange_is_answered_as_svnserve_answered_it`).
+#[test]
+fn no_turn_of_a_drive_passes_its_room_but_by_one_call_alone() {
+  let fixture = fixture();
+  for name in SLICED {
+    let source = recorded(name);
+    let (whole, calls) = whole_and_calls(&fixture, source);
+    for room in [16, 48, 100, 200, 400, 1000, 4000] {
+      let budget = Budget { room, ..PLENTY };
+      let turns = turns_of(&fixture, source, budget);
+      let past: Vec<usize> = turns
+        .iter()
+        .filter(|(bytes, drive)| *drive && bytes.len() > room && !calls.contains(bytes))
+        .map(|(bytes, _)| bytes.len())
+        .collect();
+      assert_eq!(past, [0; 0], "{name}: room {room}: turns past it");
+      let sliced: Vec<u8> = turns.into_iter().flat_map(|(bytes, _)| bytes).collect();
+      assert!(sliced == whole, "{name}: room {room}: other bytes");
+    }
+  }
+}
+
+thread_local! {
+  /// [`tick`]'s clock.
+  static TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A clock one nanosecond on at every reading: a quantum of one has run by the first boundary after
+/// a turn's start.
+fn tick() -> u64 {
+  TICKS.with(|ticks| {
+    let now = ticks.get().wrapping_add(1);
+    ticks.set(now);
+    now
+  })
+}
+
+/// A-745 rule 3 on svn:// (every slice under the step quantum): replay a recorded checkout and
+/// update with room and steps past the whole drive, but a quantum that has run by the first boundary
+/// between the drive's steps; expect each turn of the drive one step, so one call at most, and the
+/// bytes the untimed budget wrote.
+#[test]
+fn a_turn_of_a_drive_ends_at_the_first_step_past_its_quantum() {
+  let fixture = fixture();
+  let timed = Budget {
+    steps: 1,
+    quantum: Some(Quantum { now_ns: tick, ns: 1 }),
+    ..PLENTY
+  };
+  for name in SLICED {
+    let source = recorded(name);
+    let (whole, calls) = whole_and_calls(&fixture, source);
+    let turns = turns_of(&fixture, source, timed);
+    let drive: Vec<&Vec<u8>> = turns
+      .iter()
+      .filter(|(bytes, drive)| *drive && !bytes.is_empty())
+      .map(|(bytes, _)| bytes)
+      .collect();
+    let past: Vec<usize> = drive
+      .iter()
+      .filter(|bytes| !calls.contains(bytes))
+      .map(|bytes| bytes.len())
+      .collect();
+    assert_eq!(
+      (drive.len() >= calls.len(), past),
+      (true, vec![]),
+      "{name}: {} turns, {} calls",
+      drive.len(),
+      calls.len()
+    );
+    let sliced: Vec<u8> = turns.into_iter().flat_map(|(bytes, _)| bytes).collect();
+    assert!(sliced == whole, "{name}: other bytes");
   }
 }

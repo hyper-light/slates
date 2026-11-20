@@ -81,6 +81,7 @@ use crate::index::{Index, Node, NodeKind, NodeRelation, PropertyList, Revision, 
 use crate::lock::{AprTime, LockTable};
 use crate::reads::{DavLog, DavLogProgress, Repository};
 use crate::report::drive::history as copies;
+pub use crate::report::exchange::{Budget, Quantum};
 
 /// The special URI's name: where `mod_dav_svn` keeps every resource that is no node's public URL.
 /// Format: `SVNSpecialURI`'s default, `!svn` (`mod_dav_svn.c`).
@@ -285,14 +286,16 @@ impl Report {
     vec![("Content-Type", String::from(DAV_XML_CONTENT_TYPE))]
   }
 
-  /// Writes the answer's next slice into `out` from `served`, until what it wrote and the steps it took reach `room`,
-  /// at least one step, or the answer ends.
+  /// Writes the answer's next slice into `out` from `served`, until what it wrote and the steps it took reach the
+  /// budget's room, at least one step, or the answer ends; an update-report's walk within the budget's quantum too, and
+  /// its room by any call but one larger than the room alone ([`UpdateWalk::resume`]).
   pub fn resume<R: Repository + ?Sized>(
     &mut self,
     served: &Served<'_, R>,
     out: &mut Vec<u8>,
-    room: usize,
+    budget: Budget,
   ) -> ReportProgress {
+    let room = budget.room;
     let log = match &mut self.walk {
       Walk::Log(log) => log,
       Walk::FileRevs(revisions) => return revisions.resume(served, out, room),
@@ -304,7 +307,7 @@ impl Report {
           now: served.now,
           rules: served.rules,
         };
-        return walk.resume(&walked, out, room);
+        return walk.resume(&walked, out, budget);
       }
     };
     let progress = log.resume(served.index, served.repository, served.rules, out, room);
