@@ -2863,6 +2863,18 @@
 > - **Owed (A-354):** the reply a write through the successor held waited without a bound; held replies of the slates
 >   protocol are judged by no time bound (NFS and FUSE judge theirs by `durable_bound` up to the failover SLO).
 
+> **The watchdog and anchor tests that drive a wedge failed on a host under memory pressure (2026-11-20; CLOSED, g226;
+> main's ruling).** On a Mac whose kernel reported memory pressure throughout (`kern.memorystatus_vm_pressure_level`
+> above normal), the watchdog and the anchor rightly took a blocked or frozen shard for one waiting on memory (A-336),
+> so the tests that drive a wedge, a syscall block, a blocked-thread wait or a frozen process never saw it judged:
+> `slates-api`'s `an_anchored_daemons_wedged_shard_…` and `an_anchored_daemon_stopped_whole_…`, and server
+> `liveness.rs`' wedged, syscall and blocked-thread roles (2 of 3 and 3 of 12 failed, with or without other changes).
+> Each now drives the condition it means: a clear memory level stands in the host's place
+> (`slates_machine::memory_stall::put_in_place`, process-wide, which the anchor reads; the daemon's own
+> `inject_memory_stall` in server roles), so the wedge is judged a wedge on any host; the A-336 tests keep driving a
+> pressed level. On base ab0344f04 under that pressure: 3 of 3 and 12 of 12 pass, and with the levels reversed 2 and 3
+> fail.
+
 > **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
 > work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
 > at v2.0.0 left the daemon in a restart loop: 78 exits, each `daemon exited (Some(0))`. Each restart served,
