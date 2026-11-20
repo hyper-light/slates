@@ -62,6 +62,21 @@ pub(crate) trait StoreLender {
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
   ) -> Option<R>;
 
+  /// A request's hold on the generation of a repository its answer began on (A-745, §4.17.1 "A fetch's answer" rule 4):
+  /// what every step of that answer is lent, whatever lands, is re-based or rebuilt meanwhile; given back by its drop.
+  type Hold;
+
+  /// Holds repository `id` as it stands now for a request of `reader`, with the refs that principal may read and the
+  /// branch `HEAD` names as they stand (as [`StoreLender::lend`] reads them); none when the store is not held here.
+  fn hold(&mut self, id: RepositoryId, reader: &Principal) -> Option<Self::Hold>;
+
+  /// Runs `step` over the generation `hold` holds, with the pack source; none when it can no longer be lent.
+  fn lend_held<R>(
+    &mut self,
+    hold: &Self::Hold,
+    step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
+  ) -> Option<R>;
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
@@ -109,6 +124,7 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       admission: Admission::new(room),
       request: Vec::new(),
       answer: None,
+      generation: None,
     })
   }
 }
@@ -132,6 +148,8 @@ pub(crate) struct Upload<L: StoreLender> {
   request: Vec<u8>,
   /// The answer, once made.
   answer: Option<Answer<<L::Packs as PackSource>::Pack>>,
+  /// The generation a request's answer began on, held until the answer is written (A-745 rule 4).
+  generation: Option<L::Hold>,
 }
 
 impl<L: StoreLender> Exchange for Upload<L> {
@@ -154,18 +172,29 @@ impl<L: StoreLender> Exchange for Upload<L> {
       admission,
       request,
       answer,
+      generation,
     } = self;
-    let asked = if *advertise {
-      Asked::Advertise
+    let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
+    let made = if *advertise {
+      lender.lend((*repository, reader), |served, packs| {
+        upload::serve_in_turns(served, *version, Asked::Advertise, packs, admission)
+      })
     } else {
       lender.encode(*repository).await;
-      Asked::Request(request.as_slice())
-    };
-    let made = lender
-      .lend((*repository, reader), |served, packs| {
-        upload::serve_in_turns(served, *version, asked, packs, admission)
-      })
-      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+      let held = lender.hold(*repository, reader).ok_or(unavailable)?;
+      let made = lender.lend_held(&held, |served, packs| {
+        upload::serve_in_turns(
+          served,
+          *version,
+          Asked::Request(request.as_slice()),
+          packs,
+          admission,
+        )
+      });
+      *generation = Some(held);
+      made
+    }
+    .ok_or(unavailable)?;
     *answer = Some(made);
     Ok(())
   }
@@ -176,17 +205,25 @@ impl<L: StoreLender> Exchange for Upload<L> {
       repository,
       admission,
       answer,
+      generation,
       ..
     } = self;
-    let Some(answer) = answer.as_mut() else {
+    let Some(made) = answer.as_mut() else {
       return Err(Failed(Status::INTERNAL_SERVER_ERROR));
     };
-    let written = lender
-      .lend_objects(*repository, |served, packs| {
-        let mut spent = packs.turn();
-        answer.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
-      })
-      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    let step = |served: &Served<'_>, packs: &mut L::Packs| {
+      let mut spent = packs.turn();
+      made.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
+    };
+    let written = match generation.as_ref() {
+      Some(held) => lender.lend_held(held, step),
+      None => lender.lend_objects(*repository, step),
+    }
+    .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    if written != Written::More {
+      // The answer is written: its generation is given back.
+      *generation = None;
+    }
     Ok(written == Written::More)
   }
 }

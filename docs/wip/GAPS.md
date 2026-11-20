@@ -164,8 +164,9 @@
 > (`negotiation::begin`, `Negotiating::step`); part 2: `upload::serve_in_turns` and `Answer::write_within` choose them
 > within the owner's quantum, the answer the same bytes; piece 3a: sets in runs or bits, whichever is smaller, and packets
 > sized from the room (a clone within 4 KiB); piece 3b: both edges admit a fetch a request's room and answer it in turns
-> (the 3,000-commit clone by use over HTTP and SSH). Owed: protocol v0 in turns, `begin`'s walks in units, scattered
-> plans, rule 4's generation hold; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> (the 3,000-commit clone by use over HTTP and SSH); rule 4: a fetch holds the generation it began on (a shared fork at
+> the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects). Owed:
+> protocol v0 in turns, `begin`'s walks in units, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -6999,8 +7000,12 @@
 >   `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`). Owed (A-571's next part):
 >   `shards.rs`'s guest windows (`Guest::await_answer`, A-65 and A-228's rule sized by `CREDIT_WAIT`), its condition
 >   polls (`wait_until`, `wait_for_count`), its attach's answer and its stream reads, each still five seconds on the
->   wall; `daemon.rs`'s raw client, the same constant and the same two waits; and `common/client.rs`'s `START_WAIT`, a
->   connect retried five seconds while a daemon starts. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   wall; and `common/client.rs`'s `START_WAIT`, a connect retried five seconds while a daemon starts. `daemon.rs`'s
+>   raw client since 2026-11-20 (g226, goal 88's last part), and `nfs_mount.rs`', `virtiofs.rs`' and
+>   `nfs_v4_kernel.rs`' (unlisted until then): a connect is one claim, a full ring is waited out by
+>   `send_when_room`, a shard task's handshake is a plain `recv`, `nfs_mount.rs`' NFS socket has no timeout, and
+>   `daemon.rs`' five destroy-in-slices polls wait while the daemon answers (A-232's rule), each by the rule A-468 and
+>   A-571 proved red, where all five seconds on the wall. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the
