@@ -1126,8 +1126,8 @@ fn t_a687_hostile_records_are_refused_by_kind() {
   let obsstore = state_fixtures::find("states/obsstore").unwrap();
   let cases: [RecordCase; 6] = [
     (with(0, b'X'), |refused| *refused == RecordRefused::Magic),
-    (with(4, 2), |refused| {
-      *refused == RecordRefused::Version { version: 2 }
+    (with(4, 3), |refused| {
+      *refused == RecordRefused::Version { version: 3 }
     }),
     (count, |refused| *refused == RecordRefused::Count),
     (trailing, |refused| *refused == RecordRefused::Trailing),

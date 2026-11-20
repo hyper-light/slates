@@ -59,11 +59,11 @@ fn intake(
   store: &mut ContentStore,
   admission: &mut Admission,
 ) -> Result<(HgIndex, Intaken, u64), Refused> {
-  let mut intake = Intake::begin(part, index, store, admission)?;
+  let mut intake = Intake::begin((part.version, &part.payload), index, store, admission)?;
   let mut steps = 0_u64;
   loop {
     steps += 1;
-    match intake.step(store, admission) {
+    match intake.step(&part.payload, store, admission) {
       Ok(Stepped::More) => {}
       Ok(Stepped::Done) => break,
       Err(refused) => {
@@ -286,4 +286,52 @@ fn a_pushs_record_is_written_a_revision_a_step() {
   );
   fork.release(&mut store).unwrap();
   index.release(&mut store).unwrap();
+}
+
+/// A-729 part 2 (a push's record holds its changegroup as it arrived). Do: take stock 7.2's bundle through the intake,
+/// write its record from the changegroup a part a step (`record::ChangegroupWriter`) and whole
+/// (`record::write_changegroup`), and replay it into another empty index (`record::replay`, which takes the changegroup
+/// again through the intake). Expect the two writings equal byte for byte, the record the changegroup and its head;
+/// the replayed index the intake's fork row for row, with the changesets and revisions counted; and a record cut short or with a byte after it refused by kind.
+#[test]
+fn a_pushs_record_holds_its_changegroup_and_replays_through_the_intake() {
+  use crate::import::record::{self, ChangegroupWriter, Refused as RecordRefused};
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (mut fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  let revisions = intaken.kept + intaken.passed_over;
+  let whole = record::write_changegroup(1 << 20, (part.version, &part.payload), revisions).unwrap();
+  let mut writer =
+    ChangegroupWriter::begin(1 << 20, (part.version, part.payload.len()), revisions).unwrap();
+  let mut steps = 1_u64;
+  while writer.step(&part.payload).unwrap() {
+    steps += 1;
+  }
+  assert_eq!(writer.finish(), Some(whole.clone()));
+  assert!(steps > 1, "the record was copied in one step");
+  // A delta's header is larger than this fixture's few-byte texts, so the record is held to the changegroup's size,
+  // not to the texts' (the saving is a large history's: each text there is a short delta against its parent's).
+  assert!(whole.len() < part.payload.len() + 64);
+  let mut replayed_index = HgIndex::new();
+  let replayed = record::replay(&whole, &mut replayed_index, &mut store).unwrap();
+  assert_eq!(rows(&mut replayed_index, &store), rows(&mut fork, &store));
+  assert_eq!(
+    u64::from(replayed.changesets),
+    u64::try_from(intaken.changesets.len()).unwrap()
+  );
+  assert_eq!(
+    u64::from(replayed.changesets) + u64::from(replayed.manifests) + replayed.file_revisions,
+    intaken.kept
+  );
+  let cut = record::replay(&whole[..whole.len() - 1], &mut HgIndex::new(), &mut store);
+  assert_eq!(cut.err(), Some(RecordRefused::Truncated));
+  let mut trailing = whole.clone();
+  trailing.push(0);
+  let after = record::replay(&trailing, &mut HgIndex::new(), &mut store);
+  assert_eq!(after.err(), Some(RecordRefused::Trailing));
+  for index in [replayed_index, fork, index] {
+    index.release(&mut store).unwrap();
+  }
+  assert_eq!(store.len(), 0, "a hold was kept");
 }
