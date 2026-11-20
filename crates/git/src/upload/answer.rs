@@ -512,7 +512,7 @@ impl<K> Answer<K> {
       Opening::V2(before) => before
         .write(sections, admission)
         .map(|written| match written {
-          Sections::Died(answer) => Err(answer),
+          Sections::Died(answer) => Err(Box::new(answer)),
           Sections::Pack(head, framing, at) => Ok((head, framing, at)),
         }),
       Opening::V0(opening) => match opening.write(sections.1, admission) {
@@ -522,7 +522,7 @@ impl<K> Answer<K> {
           return false;
         }
         written => written.map(|opened| match opened {
-          Opened::NoPack(answer) | Opened::Whole(answer) => Err(answer),
+          Opened::NoPack(answer) | Opened::Whole(answer) => Err(Box::new(answer)),
           Opened::Pack(head, framing) => Ok((head, framing, 0)),
         }),
       },
@@ -548,7 +548,7 @@ impl<K> Answer<K> {
       Ok(Err(died)) => {
         *self = match counters {
           Some(counters) => died.counted(counters),
-          None => died,
+          None => *died,
         };
         false
       }

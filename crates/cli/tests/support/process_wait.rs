@@ -69,7 +69,8 @@ impl Judged {
   }
 
   /// One look: returns while the tree lives and has gained CPU within [`STALL`]; fails the test naming `what` once it is
-  /// gone or stalled.
+  /// gone or stalled. A test's alone: `xtask`, which includes this file, judges with [`Judged::judge`].
+  #[cfg(test)]
   pub(crate) fn look(&mut self, what: &str) {
     match self.judge() {
       Verdict::Waiting { .. } => {}
@@ -221,13 +222,15 @@ impl InstanceWait {
   }
 }
 
-/// The pids of `instance`'s processes: its anchor and its daemon run as `slates --instance NAME anchor|daemon …`.
+/// The pids of `instance`'s processes: its anchor and its daemon run as `slates --instance NAME anchor|daemon …`. None
+/// where `pgrep` cannot run, which a wait judges as none left and fails, naming it.
 pub(crate) fn instance_processes(instance: &str) -> Vec<u32> {
-  let out = Command::new("pgrep")
+  let stdout = Command::new("pgrep")
     .args(["-f", "--", &format!("--instance {instance} ")])
     .output()
-    .unwrap();
-  let mut pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+    .map(|out| out.stdout)
+    .unwrap_or_default();
+  let mut pids: Vec<u32> = String::from_utf8_lossy(&stdout)
     .split_whitespace()
     .filter_map(|pid| pid.parse().ok())
     .collect();
