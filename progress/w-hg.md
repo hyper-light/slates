@@ -77,3 +77,9 @@
 - NEXT part 2: server drives Intake in slices (with_state per slice, yield between, quantum = step_budget_ns), one
   intake per repository at a time, prepare/classify/tree over IndexHeld(fork), land with the fork, record from fork.
   Storage: point at w-perf's identity table when it lands (crates/merge slice 1); no second store meanwhile.
+- A-720 part 2a (server drives the intake in slices, async HgStores::push, own fork per push, generation stamps,
+  landing judged at landing, record from fork) LANDED main (piece 6e1896f22, merge 49439c77e). Local: hg push:: import
+  71/71, server focused 44/44 (incl. after final merge). Removed ~/slates-work/w-hg-a711; cleared target's release +
+  incremental (disk was 17-18 GB free).
+- NEXT: part 2b (re-base a stale fork by node at landing instead of MOVED), then part 3 (import room per repository),
+  then S5 per main's convergence plan (file texts as green files by identity, changelog/manifest deltas, rows by id).

@@ -110,3 +110,16 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   repos path, depth, items, streamed resume via dav::Drive::take_written + Body::drain); site.rs Resource::Me (!svn/me),
   Walk {Log, Update}, Answer/Report now Debug-only derives, OPTIONS SVN-Allow-Bulk-Updates Prefer; test
   an_update_report_on_me_streams_a_checkout_and_refuses_a_revision_past_the_youngest. r25 on Studio running.
+- LANDED part B: 7f81be683 (fast-forward; on main, checked). r26: svn dav::/report:: 116/116, fmt clean; matrix
+  ROUTE=http: checkout/export/update pass (12/27); blame/diff unknown reports; commits POST 501.
+- Worktrees now: ~/slates-work/w-interop-a681-land (scratch, branch agents/w-interop-a681-land) and
+  ~/slates-work/w-interop-land (LANDING: branch agents/w-interop-land == main tip; next landing: `git merge --ff-only
+  origin/main` then `git merge --squash <scratch branch>`; scratch branches carry "(scratch)" commits).
+- Part C next: HTTPv2 commits. ra_serf commit.c flow: POST !svn/me create-txn (skel body) -> 201 + SVN-Txn-Name,
+  PROPPATCH !svn/txn/NAME (log), PUT !svn/txr/NAME/path (svndiff), MKCOL, DELETE, COPY (Destination), MERGE on the
+  public URL (body names txn) -> commit via repository::svn_commit::commit_work; DELETE txn on abort.
+- Part C (svn side green r29: dav::commit 3 new tests, 135/135): dav/commit.rs DavCommit (POST skel, PUT/MKCOL/DELETE/
+  COPY/PROPPATCH/MERGE -> EditCommands via Drive::edit typed API added in commit/drive.rs). Server side written:
+  VcsStores.dav_commits table (one per repo+principal), SvnStores begin_commit/on_commit/land (defaults None;
+  ServedRecords implements), SvnExchange::commit_side, Status CREATED/NO_CONTENT/CONFLICT/PRECONDITION_FAILED/LOCKED.
+  Scratch on agents/w-interop-a681c. NEXT: Studio run server vcs_http::svn + svn_interop http --ignored.
