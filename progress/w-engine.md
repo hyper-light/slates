@@ -87,3 +87,10 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   studio-2. Worktree ~/slates-work/w-engine (at main).
 - Open for main (not mine to decide): the history retention figure (admission) counts a first small edit's earlier file
   as current, as it did before A-728; honest accounting would charge it until a fold.
+
+## Rulings of 2026-11-20 (main): 1 honest charge LANDED 529144e79; 2 stack oracle fix LANDED 183604041 (merge 2103b1177)
+- 2: 3/30 failed on main (A-728 did not fix it; earlier 0/10 was chance). Cause: a delete between makes two inserts one
+  in the green's order (design's answer); the oracle's bottom branch was too strict. 0/30 after; regression test named.
+- 1: measured delta at rest on the 1,000-rev import = 0 (committed 646,696,917 both; history folded as it imports).
+  Owed: slates status --json prints no retained_bytes.
+- 3: ranked table sent: inbox/w-perf-from-w-engine.md. Biggest: ~850 MiB freed-but-retained malloc pages.
