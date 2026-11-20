@@ -11315,6 +11315,9 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > block whole (`Green::rename_alone`), so the earlier blocks it shared runs of go. A block chunk is charged the runs its
 > value was made with, the copy it replaces, so admission's reservation is unchanged. Counted:
 > `Green::history_splices_named` (splices named, values sealed and the bytes copied).
+>
+> **Status (2026-11-20, A-728 part 3: measured).** A 1,000-revision Subversion import: the history's heap 50.3 to
+> 2.0 MiB, `Green::commit`'s 285.1 to 200.0 MiB (BENCHMARKS.md).
 
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
@@ -54774,8 +54777,11 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   green_retention`; fmt clean. Found by running: the stack oracle
   (`a_stack_lands_as_its_works_applied_in_order_to_whole_trees_over_every_history`) refuses a bottom on origin/main at
   `PROPTEST_CASES=3000` in 2 of 10 runs, with or without this change (0 of 10 with it): reported, not chased.
-- **Owed.** Part 3: the 1,000-revision Subversion profile (`crates/cli/bench/svn_scale.sh`) before and after, in
-  BENCHMARKS.md.
+- **Part 3, measured (BENCHMARKS.md, "A green's history names the file's block").** A 1,000-revision Subversion
+  import of git/git (223 MiB) on the Mac Studio, release builds differing by A-728 alone, the daemon's live heap by
+  stack (`crates/cli/bench/svn_history_mem.sh`, three runs each, identical): the content history 50.3 MiB before,
+  2.0 MiB after; everything under `Green::commit` 285.1 MiB before, 200.0 MiB after (85.1 MiB, 30%, less). A-723's
+  234.8 MiB was that `Green::commit` row, mostly the current files' blocks, which stay.
 - **Piece 5a, identity homes across a node's shards (2026-11-20).** `crate::vcs_store::homes`: a window (at most one
   window of content, named by its plain BLAKE3) is homed at the shard of the node that rendezvous ranks first for its
   identity, kept there in that shard's one content store (deduplicated with what its repositories hold, charged to its
