@@ -450,6 +450,7 @@ impl<P> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Begun, PushFailed> {
     let record = record_of(state, self.repository)?;
+    let pack = self.session.take_pack();
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     #[cfg(unix)]
     let hooked = git_hook(&record).is_some();
@@ -457,7 +458,7 @@ impl<P> ReceivePack<P> {
       let answering = self.declined(&mut Declining::hook(hook), out)?;
       return Ok(Begun::Answering(answering));
     }
-    match prepare(state, &record, checked)? {
+    match prepare(state, &record, checked, pack)? {
       Prepared::Declined(mut declining) => {
         Ok(Begun::Answering(self.declined(&mut declining, out)?))
       }
@@ -797,8 +798,10 @@ fn prepare(
   state: &mut ShardState,
   record: &RepositoryRecord,
   checked: &Checked,
+  pack: Vec<u8>,
 ) -> Result<Prepared, PushFailed> {
   let mut push = GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?;
+  push.keep_pack(pack);
   let judged = checked.early.iter().any(Option::is_none);
   let objects = if judged { checked.objects() } else { &[] };
   let incoming: Vec<Incoming<'_>> = objects.iter().map(incoming_of).collect();

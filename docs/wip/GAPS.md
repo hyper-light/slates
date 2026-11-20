@@ -116,6 +116,12 @@
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
 >
+> **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
+> name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
+> entry's bound in bounded parts across entries (git/git's 607 MiB pack vs a 747 MB segment region); objects already
+> held left out of the pack; S2 (history's latest value = the file's block), S3 (w-git, A-722), S4 (svn texts by identity),
+> S5 (w-hg); the push bound (a streamed window per connection, admission refusal before the body); push_load re-run.
+>
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
 > room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the

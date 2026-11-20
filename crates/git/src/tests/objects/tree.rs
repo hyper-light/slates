@@ -87,52 +87,62 @@ fn git_orders_a_subtree_as_if_its_name_ended_with_a_slash() {
 #[test]
 fn a_mode_is_read_as_git_reads_it_and_served_as_written() {
   for format in FORMATS {
-    let entry_of = |name: &str| {
-      let golden = golden(format, name);
-      let tree = Tree::parse(golden.bytes, format, &mut ample()).unwrap();
-      let entry = tree.entries()[0];
-      let mut written = Vec::new();
-      tree.write(&mut written);
-      assert_eq!(written, golden.bytes);
-      (entry.mode_text.to_vec(), entry.mode, entry.standard_mode())
-    };
-    assert_eq!(
-      entry_of("ok-tree-mode-wraps"),
-      (b"1100644".to_vec(), 0o100644, Some(Mode::File))
-    );
-    assert_eq!(
-      entry_of("warn-tree-zero-padded"),
-      (b"040000".to_vec(), 0o40000, Some(Mode::Directory))
-    );
-    assert_eq!(
-      entry_of("ok-tree-mode-664"),
-      (b"100664".to_vec(), 0o100664, None)
-    );
-    assert_eq!(
-      entry_of("info-tree-bogus-mode"),
-      (b"100000".to_vec(), 0o100000, None)
-    );
-    let group_writable = golden(format, "ok-tree-mode-664");
-    let check = |strictness| {
-      tree::fsck(group_writable.bytes, format, strictness, &mut ample())
-        .unwrap()
-        .report
-    };
-    assert_eq!(check(Strictness::Default).reported().count(), 0);
-    assert_eq!(
-      check(Strictness::Strict).warnings().collect::<Vec<_>>(),
-      [FsckId::BadFilemode]
-    );
-    assert_eq!(
-      check(Strictness::Strict).refusal(),
-      None,
-      "an info stays a warning under the strict check"
-    );
+    modes_are_read_as_git_reads_them(format);
+    the_group_writable_mode_is_a_strict_warning(format);
   }
   for mode in Mode::ALL {
     assert_eq!(Mode::from_bits(mode.bits()), Some(mode));
     assert!(!mode.text().starts_with(b"0"), "git writes no leading zero");
   }
+}
+
+/// Each mode fixture's first entry read as git reads it, and the tree written back as written.
+fn modes_are_read_as_git_reads_them(format: ObjectFormat) {
+  let entry_of = |name: &str| {
+    let golden = golden(format, name);
+    let tree = Tree::parse(golden.bytes, format, &mut ample()).unwrap();
+    let entry = tree.entries()[0];
+    let mut written = Vec::new();
+    tree.write(&mut written);
+    assert_eq!(written, golden.bytes);
+    (entry.mode_text.to_vec(), entry.mode, entry.standard_mode())
+  };
+  assert_eq!(
+    entry_of("ok-tree-mode-wraps"),
+    (b"1100644".to_vec(), 0o100644, Some(Mode::File))
+  );
+  assert_eq!(
+    entry_of("warn-tree-zero-padded"),
+    (b"040000".to_vec(), 0o40000, Some(Mode::Directory))
+  );
+  assert_eq!(
+    entry_of("ok-tree-mode-664"),
+    (b"100664".to_vec(), 0o100664, None)
+  );
+  assert_eq!(
+    entry_of("info-tree-bogus-mode"),
+    (b"100000".to_vec(), 0o100000, None)
+  );
+}
+
+/// `100664` accepted by `git fsck`, and a warning, never a refusal, under the strict check.
+fn the_group_writable_mode_is_a_strict_warning(format: ObjectFormat) {
+  let group_writable = golden(format, "ok-tree-mode-664");
+  let check = |strictness| {
+    tree::fsck(group_writable.bytes, format, strictness, &mut ample())
+      .unwrap()
+      .report
+  };
+  assert_eq!(check(Strictness::Default).reported().count(), 0);
+  assert_eq!(
+    check(Strictness::Strict).warnings().collect::<Vec<_>>(),
+    [FsckId::BadFilemode]
+  );
+  assert_eq!(
+    check(Strictness::Strict).refusal(),
+    None,
+    "an info stays a warning under the strict check"
+  );
 }
 
 /// A-590 (fsck.c's `gitmodules_found` and `gitattributes_found`). Do: check the tree stock git wrote with a
@@ -238,10 +248,13 @@ proptest! {
   }
 }
 
+/// What `find_tree_entry` finds for a path: the entry's name and the path left below it.
+type Found = (&'static [u8], &'static [u8]);
+
 /// Format: paths looked up in stock git's `ok-tree` (`lib-x`, `lib.rs`, the subtree `lib`, `link`, `run`, the
 /// submodule `sub`, in git's order), each with what git's `find_tree_entry` finds, traced by hand through its loop: the
 /// entry's name and the path left below it.
-const FOUND: [(&[u8], Option<(&[u8], &[u8])>); 12] = [
+const FOUND: [(&[u8], Option<Found>); 12] = [
   (b"lib-x", Some((b"lib-x", b""))),
   (b"lib.rs", Some((b"lib.rs", b""))),
   (b"lib", Some((b"lib", b""))),

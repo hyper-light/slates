@@ -1,5 +1,5 @@
 //! One connection's request loop (§4.17.2 "Transports" item 1), a state machine its listener drives: it asks for what
-//! it needs next ([`Connection::next`]), and the listener does that and tells it what happened.
+//! it needs next ([`Connection::next_step`]), and the listener does that and tells it what happened.
 //!
 //! **The loop.** [`Next::Write`] comes first whenever the connection has bytes to send, so it never holds more than one
 //! step's output. Then, by phase: [`Next::Read`] while a head or a body is incomplete; [`Next::Decide`] once a head is
@@ -195,6 +195,9 @@ struct Reply {
   mode: StatusMode,
 }
 
+/// A reply started: its request, whether it is the head alone, and its head's bytes still to be sent.
+type ReplyStart = (Request, bool, Vec<u8>);
+
 /// Where the loop is.
 enum State {
   /// The TLS handshake is running.
@@ -214,8 +217,8 @@ enum State {
     request: Request,
     /// Its framing, being removed.
     reader: BodyReader,
-    /// Its gzip coding, being removed, when it has one.
-    gunzip: Option<Gunzip>,
+    /// Its gzip coding, being removed, when it has one: boxed, its inflate window being most of the state's size.
+    gunzip: Option<Box<Gunzip>>,
     /// The reply to come.
     reply: Reply,
   },
@@ -259,7 +262,7 @@ enum Pending {
   Inflated,
 }
 
-/// What [`Connection::next`] answers, before a body run is lent.
+/// What [`Connection::next_step`] answers, before a body run is lent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
   /// [`Next::Write`].
@@ -346,7 +349,7 @@ impl Connection {
   }
 
   /// What the connection needs next.
-  pub fn next(&mut self) -> Next<'_> {
+  pub fn next_step(&mut self) -> Next<'_> {
     match self.kind() {
       Kind::Write => Next::Write,
       Kind::Read => Next::Read,
@@ -610,7 +613,7 @@ impl Connection {
         return;
       }
     }
-    let gunzip = (request.coding == Coding::Gzip).then(Gunzip::new);
+    let gunzip = (request.coding == Coding::Gzip).then(|| Box::new(Gunzip::new()));
     self.state = State::Body {
       request,
       reader: BodyReader::new(request.framing),
@@ -769,7 +772,7 @@ impl Connection {
 
   /// A reply under way: its request, whether it is the head alone, and its head's bytes when they are still to be sent
   /// (rendered now, the reply then started). `None` off a reply; `Some(Err(_))` where a field cannot be carried.
-  fn begin_reply(&mut self) -> Option<Result<(Request, bool, Vec<u8>), BadField>> {
+  fn begin_reply(&mut self) -> Option<Result<ReplyStart, BadField>> {
     let State::Reply { request, reply } = &mut self.state else {
       return None;
     };

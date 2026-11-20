@@ -111,6 +111,9 @@ fn shape() -> EditRefusal {
 /// A directory's or file's token: the string the client named it by when it opened it.
 pub type Token<'a> = &'a [u8];
 
+/// Pairs of strings as read: a lock's path and token, or a property's name and value.
+pub type StringPairs<'a> = Vec<(&'a [u8], &'a [u8])>;
+
 /// A copy's source as an editor command names it: a URL in a commit, an fspath in a replay (`editorp.c` 601-609), and
 /// the revision it is read in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -640,10 +643,11 @@ fn open_file<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<EditCommand<'a>, EditRefus
   })
 }
 
+/// A property change as read: the node's token, the property's name, and its value or none.
+type PropertyChange<'a> = (Token<'a>, &'a [u8], Option<&'a [u8]>);
+
 /// A token, a name and a value or none: `change-dir-prop`'s and `change-file-prop`'s `"sc(?s)"`.
-fn property<'a>(
-  tuple: &mut Tuple<'_, 'a>,
-) -> Result<(Token<'a>, &'a [u8], Option<&'a [u8]>), EditRefusal> {
+fn property<'a>(tuple: &mut Tuple<'_, 'a>) -> Result<PropertyChange<'a>, EditRefusal> {
   let token = tuple.string()?;
   let name = tuple.cstring()?;
   Ok((token, name, optional_value(tuple)?))
@@ -792,7 +796,7 @@ impl<'v, 'a> CommitRequest<'v, 'a> {
   /// # Errors
   /// [`LockTokensRefusal`] for a list that is not one of pairs of strings, which `svnserve` writes as a command
   /// failure.
-  pub fn lock_tokens(&self) -> Result<Vec<(&'a [u8], &'a [u8])>, LockTokensRefusal> {
+  pub fn lock_tokens(&self) -> Result<StringPairs<'a>, LockTokensRefusal> {
     let Some(rest) = &self.rest else {
       return Ok(Vec::new());
     };
@@ -818,7 +822,7 @@ impl<'v, 'a> CommitRequest<'v, 'a> {
 }
 
 /// `svn_ra_svn__parse_proplist`: each item a list read as `"ss"`.
-fn proplist<'a>(items: &[Value<'a>]) -> Result<Vec<(&'a [u8], &'a [u8])>, EditRefusal> {
+fn proplist<'a>(items: &[Value<'a>]) -> Result<StringPairs<'a>, EditRefusal> {
   items
     .iter()
     .map(|item| {

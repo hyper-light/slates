@@ -293,6 +293,25 @@ fn a_truncate_after_a_rename_keeps_what_the_green_appended_to_the_source() {
   assert_eq!(text(&green, "f"), None);
 }
 
+/// `answer` as the span test expects of the case `what`: accepted with `f` reading `now`, or a conflict of one `class`.
+fn judged_as(
+  green: &Green,
+  answer: &Outcome,
+  expected: Result<&str, MergeConflictClass>,
+  what: &str,
+) {
+  match expected {
+    Ok(now) => {
+      assert!(
+        matches!(answer, Outcome::Accepted { .. }),
+        "{what}: {answer:?}"
+      );
+      assert_eq!(text(green, "f").as_deref(), Some(now), "{what}");
+    }
+    Err(class) => assert_eq!(classes(answer), Ok(vec![class]), "{what}"),
+  }
+}
+
 /// A-612's sweep (§4.16 "The verdict": overlap or containment conflicts, an edge does not; `slates_vfs::algebra`'s
 /// rule). Do: on a three-line file, submit a work based at 0 that truncates after the first line, against each change
 /// the green made at its cut after the base; and the other way round, a work based at 0 that changes bytes at the cut
@@ -336,16 +355,7 @@ fn a_truncate_and_a_change_at_its_cut_are_judged_by_their_spans() {
     let mut green = green_of(&[("f", file)], &[]);
     accept(&mut green, &first.at(0, 1), 1);
     let answer = green.submit(&truncate().at(0, 2));
-    match expected {
-      Ok(now) => {
-        assert!(
-          matches!(answer, Outcome::Accepted { .. }),
-          "{what}: {answer:?}"
-        );
-        assert_eq!(text(&green, "f").as_deref(), Some(now), "{what}");
-      }
-      Err(class) => assert_eq!(classes(&answer), Ok(vec![class]), "{what}"),
-    }
+    judged_as(&green, &answer, expected, what);
   }
   let against: [(&str, Work, Result<&str, MergeConflictClass>); 3] = [
     (
@@ -368,23 +378,11 @@ fn a_truncate_and_a_change_at_its_cut_are_judged_by_their_spans() {
     let mut green = green_of(&[("f", file)], &[]);
     accept(&mut green, &truncate().at(0, 1), 1);
     let answer = green.submit(&later.at(0, 2));
-    match expected {
-      Ok(now) => {
-        assert!(
-          matches!(answer, Outcome::Accepted { .. }),
-          "against the green's truncate, {what}: {answer:?}"
-        );
-        assert_eq!(
-          text(&green, "f").as_deref(),
-          Some(now),
-          "against the green's truncate, {what}"
-        );
-      }
-      Err(class) => assert_eq!(
-        classes(&answer),
-        Ok(vec![class]),
-        "against the green's truncate, {what}"
-      ),
-    }
+    judged_as(
+      &green,
+      &answer,
+      expected,
+      &format!("against the green's truncate, {what}"),
+    );
   }
 }

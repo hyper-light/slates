@@ -29,8 +29,12 @@ struct NodePlan {
 struct StreamPlan {
   three: bool,
   uuid: Option<[u8; 16]>,
-  revisions: Vec<(Option<Vec<(Vec<u8>, Vec<u8>)>>, Vec<NodePlan>)>,
+  revisions: Vec<RevisionPlan>,
 }
+
+/// A revision before it is made into events: its properties, if it has a properties section, and
+/// its nodes.
+type RevisionPlan = (Option<Vec<(Vec<u8>, Vec<u8>)>>, Vec<NodePlan>);
 
 /// Bytes that may stand in a header's value: anything but a line feed and a NUL, the line feed's place taken by the
 /// byte above it.
