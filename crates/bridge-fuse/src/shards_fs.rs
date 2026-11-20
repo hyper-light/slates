@@ -24,7 +24,7 @@ use std::io;
 
 use slates_bridge_core::{Bridge, OpContext};
 
-use crate::abi::{COMPAT_SETXATTR_IN_BYTES, OUT_HEADER_LEN, Opcode, SETXATTR_IN_BYTES};
+use crate::abi::{OUT_HEADER_LEN, Opcode};
 use crate::bridge::{EINVAL, EIO, EPERM, FUSE_ROOT_ID, dispatch, reply_error, takes_reply};
 use crate::init::{MAX_WRITE, max_pages};
 use crate::reply::ReplyHeader;
@@ -226,19 +226,17 @@ impl OwnerWord {
 /// `FUSE_SETXATTR_EXT` (`extended`, A-378), the setter's flags and a pad, then the name and its NUL, then the value: read
 /// in the form the stream's guest sends, as the dispatch reads every other `SETXATTR` (A-587; read in the short form
 /// alone, a guest whose kernel kept the extended one never had its word taken, so its run was shown its share owned by
-/// the host and refused its writes `EACCES`). The flags (`XATTR_CREATE`, `XATTR_REPLACE`) and the setter's flags are
+/// the host and refused its writes `EACCES`), each request's own form decided by its bytes, since a guest's init sets
+/// the word as it mounts, often before its kernel took `INIT`'s reply, and so in the short form ([`crate::abi::setxattr_head`],
+/// A-741). The flags (`XATTR_CREATE`, `XATTR_REPLACE`) and the setter's flags are
 /// ignored, as Shards' server ignores them, since the word names no attribute a file keeps. The value may end in NULs,
 /// which are dropped.
 pub fn owner_word(request: &[u8], extended: bool) -> Option<OwnerWord> {
-  let head = if extended {
-    SETXATTR_IN_BYTES
-  } else {
-    COMPAT_SETXATTR_IN_BYTES
-  };
   let parsed = Request::parse(request).ok()?;
   if parsed.opcode != Some(Opcode::SetXattr) {
     return None;
   }
+  let (head, _setter) = crate::abi::setxattr_head(parsed.body, extended);
   let rest = parsed.body.get(head..)?;
   let end = rest.iter().position(|b| *b == 0)?;
   if rest.get(..end)? != OWNER_WORD {
