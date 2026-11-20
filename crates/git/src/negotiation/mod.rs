@@ -51,6 +51,7 @@ mod shallow;
 pub mod sparse;
 
 use crate::object_name::{Kind, ObjectId};
+use crate::positions::Positions;
 use crate::{Admission, PastAdmission};
 
 pub use filter::Filter;
@@ -65,7 +66,9 @@ pub const INFINITE_DEPTH: u32 = i32::MAX.unsigned_abs();
 pub trait Graph {
   /// One object the store holds, named by the store's own handle (its position in the repository's index), so a walk
   /// keeps handles rather than names.
-  type Node: Copy + Ord + core::fmt::Debug;
+  /// Its position in the index is its number (A-745): the answer carries the objects it sends as runs of positions
+  /// ([`Positions`]), never one at a time.
+  type Node: Copy + Ord + core::fmt::Debug + Into<u64> + TryFrom<u64>;
   /// A green, one branch of the repository, whose versions each have a head.
   type Green: Copy + Ord + core::fmt::Debug;
 
@@ -201,8 +204,11 @@ pub struct Pack<G, N> {
   pub shallow_info: Option<ShallowInfo>,
   /// Runs of versions sent whole; the request's filter applies to their objects.
   pub runs: Vec<Run<G>>,
-  /// Objects sent one by one, each once, in handle order.
-  pub objects: Vec<N>,
+  /// Objects sent one by one, by position, as runs (A-745: a fetch holds what it sends as runs, which one push's objects
+  /// make one of, never an object at a time); `N` names the graph's objects elsewhere in the answer.
+  pub objects: Positions,
+  /// The graph's objects, named in the answer's other sections.
+  pub(crate) _node: core::marker::PhantomData<N>,
 }
 
 /// What a `fetch` request is answered.
@@ -345,6 +351,7 @@ pub fn negotiate<S: Graph>(
       shallow_info: cut.info,
       runs: runs.runs,
       objects,
+      _node: core::marker::PhantomData,
     }),
     counters,
   })
