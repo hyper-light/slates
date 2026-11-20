@@ -214,3 +214,15 @@
   (release, cold/warm; main's push-back: 820 KB should be ms) and fix if it's the gap; then B2 in-flight half
   (quarantine reads the pushed pack in place while judged; landing via w-store's seam, no pack store; Ada's changeset
   ruling: history = changesets; git objects derived & cached by identity).
+- ~14:40 decode measured (diag branch agents/w-git-decodediag): release cold input 25.9 ms (2.9 us/obj, 31.6 ns/B), answer
+  71 ms/8.5k steps; debug cold input 300 ms, answer 1.42 s/29k steps -> decode not the gap; reported to main.
+- B2 IN-FLIGHT HALF DESIGN (Ada's changeset ruling: what lands is changesets via w-store's seam; no pack store):
+  * The pushed pack is already kept whole in RAM (session take_pack -> GitPush::keep_pack -> RecordWriter.pack). Make it
+    the in-flight PackSource (a RAM pack: slice source over that Vec, identity = ContentId::of / pack checksum).
+  * Quarantine (slates_vcs::arrival::Quarantine Staged{kind, content, len}) gains an in-pack place for git objects:
+    the intake keeper (git_push::intake::Intake::keep) names each resolved object (SHA-1) then keeps only its entry
+    offset, dropping the inflated bytes; Contents::content / Quarantined::content read through store::packed::read.
+  * Landing (Repository::commit) still needs object bytes in the content store until w-store's changeset store: put
+    them at the commit from the pack (turned), so the in-flight peak drops; landed size unchanged until w-store.
+  * Red: in-flight resident of a v1.5.0 push before landing <= k*pack + base (today the quarantine holds inflated).
+  * Worktree ~/slates-work/w-git-packed has a DIAG commit at HEAD: make a fresh worktree from origin/main first.
