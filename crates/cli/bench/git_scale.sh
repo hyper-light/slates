@@ -215,8 +215,8 @@ echo "== results (seconds; every run shown)"
 for step in push clone incremental-push incremental-fetch shallow partial; do
   for server in $SERVERS; do
     printf '%-18s %-6s' "$step" "$server"
-    grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $3, ($4 == "ok" ? "" : "(" $4 ")") }
-      $4 == "ok" && (best == "" || $3 < best) { best = $3 } END { printf "  best %s", (best == "" ? "-" : best) }'
+    grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
+      $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  best %s", (best == "" ? "-" : best) }'
     echo
   done
 done

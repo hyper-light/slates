@@ -13,30 +13,31 @@
 # The steps, each timed on the wall clock and bounded (`alarm`), a failure recorded and the run going on:
 # 1. load: `svnadmin load` of the whole dump into a fresh repository (Subversion's own import of a history), timed
 #    once, on the first run; every later run serves its own copy of that repository (`cp -c`, APFS's clone);
-# 2. checkout: `svn checkout` of trunk at its youngest revision; on the first run the working copy is checked: its
-#    files equal REFERENCE's (`diff -r`, `.svn` left out);
+# 2. checkout: `svn checkout` of trunk at its youngest revision; on the first run the working copy is checked: every
+#    regular file's git blob id and path equal those of SOURCE's tree at REF (links and submodules left out; ids, not a
+#    checkout, since git's own checkout rewrites `eol=crlf` files);
 # 3. log: `svn log -q` of the whole history, which must name every revision;
 # 4. incremental: one new file committed from a copy of the working copy (`commit`), then the working copy updated to
 #    it (`update`), which must then hold it;
 # 5. update-1000: the working copy taken back 1,000 revisions (untimed), then updated to the youngest.
 #
 # svn runs with its own empty configuration directory, never prompts, and speaks C. Everything is written under WORK,
-# which is made empty and removed at the end; DUMP and REFERENCE are only read.
+# which is made empty and removed at the end; DUMP and SOURCE are only read.
 #
-# Usage: svn_scale.sh DUMP REFERENCE WORK [RUNS] [BOUND]
-#   DUMP       the dataset's dump (`git_to_svn_dump.py src.git master > dump`)
-#   REFERENCE  the dataset's youngest tree (`git archive master | tar -x -C REFERENCE`, its submodule directories
-#              removed), to check a checkout against
+# Usage: svn_scale.sh DUMP SOURCE REF WORK [RUNS] [BOUND]
+#   DUMP       the dataset's dump (`git_to_svn_dump.py SOURCE REF 5000 > DUMP`)
+#   SOURCE     the git repository the dump was made from, and REF its tip, to check a checkout against
 #   WORK       a scratch directory, made empty here and removed at the end
 #   RUNS       the runs (default 3)
 #   BOUND      the seconds any one step may take before it is killed and recorded as such (default 3600)
 set -uo pipefail
 
 DUMP=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-REFERENCE=$(cd "$2" && pwd)
-WORK=$3
-RUNS=${4:-3}
-BOUND=${5:-3600}
+SOURCE=$(cd "$2" && pwd)
+REF=$3
+WORK=$4
+RUNS=${5:-3}
+BOUND=${6:-3600}
 UPDATE_SPAN=1000
 
 rm -rf "$WORK"
@@ -70,7 +71,9 @@ timed() {
 }
 
 REVISIONS=$(grep -ac '^Revision-number: ' "$DUMP")
-echo "dataset: $DUMP, $(du -h "$DUMP" | cut -f1), $REVISIONS revisions; reference tree $(find "$REFERENCE" -type f | wc -l | tr -d ' ') files"
+git -C "$SOURCE" ls-tree -r --format='%(objectmode) %(objectname) %(path)' "$REF" | sed -n 's/^100[0-7]* //p' \
+  | LC_ALL=C sort > "$WORK/source.files"
+echo "dataset: $DUMP, $(du -h "$DUMP" | cut -f1), $REVISIONS revisions; $SOURCE at $(git -C "$SOURCE" rev-parse "$REF"), $(wc -l < "$WORK/source.files" | tr -d ' ') regular files"
 echo "svn: $(svn --version --quiet); svnserve: $(svnserve --version --quiet)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
@@ -100,18 +103,22 @@ start_stock() {
   echo "stock run $1: svnserve on 127.0.0.1:$port"
 }
 
-# Checks working copy $1 of server $2 against REFERENCE.
+# Checks working copy $1 of server $2 against SOURCE's tree at REF: each regular file's blob id and path.
 check() {
   local copy=$1 server=$2
   if [ ! -d "$copy" ]; then
     echo "$server check skipped: no working copy" | tee -a "$RESULTS"
     return 0
   fi
-  if diff -rq -x .svn "$REFERENCE" "$copy" > "$WORK/$server.diff" 2>&1; then
-    echo "$server check tree identical ($(find "$REFERENCE" -type f | wc -l | tr -d ' ') files)" | tee -a "$RESULTS"
+  (cd "$copy" && find . -name .svn -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort > "$WORK/$server.paths" \
+    && git hash-object --no-filters --stdin-paths < "$WORK/$server.paths" | paste -d' ' - "$WORK/$server.paths" \
+    | LC_ALL=C sort > "$WORK/$server.files")
+  if cmp -s "$WORK/source.files" "$WORK/$server.files"; then
+    echo "$server check tree identical ($(wc -l < "$WORK/source.files" | tr -d ' ') files)" | tee -a "$RESULTS"
   else
-    echo "$server check tree DIFFER: $(wc -l < "$WORK/$server.diff" | tr -d ' ') lines" | tee -a "$RESULTS"
-    head -5 "$WORK/$server.diff" | sed 's/^/    /'
+    echo "$server check tree DIFFER: $(comm -3 "$WORK/source.files" "$WORK/$server.files" | wc -l | tr -d ' ') lines" \
+      | tee -a "$RESULTS"
+    comm -3 "$WORK/source.files" "$WORK/$server.files" | head -5 | sed 's/^/    /'
   fi
 }
 
@@ -124,9 +131,9 @@ steps() {
   youngest=$(s info --show-item revision "$URL")
   named=$(grep -c '^r[0-9]' "$WORK/out.$server-log-$run")
   if [ "$named" = "$youngest" ]; then
-    echo "$server log check named $named revisions" | tee -a "$RESULTS"
+    echo "$server check log named $named revisions" | tee -a "$RESULTS"
   else
-    echo "$server log check MISSED: $named named of $youngest" | tee -a "$RESULTS"
+    echo "$server check log MISSED: $named named of $youngest" | tee -a "$RESULTS"
   fi
   cp -R "$copy" "$other"
   echo "one more revision, $server run $run" > "$other/a-699-scale.txt"
@@ -153,8 +160,8 @@ done
 echo "== results (seconds; every run shown)"
 for step in load checkout log commit update "update-$UPDATE_SPAN"; do
   printf '%-18s %-6s' "$step" stock
-  grep "^stock $step " "$RESULTS" | awk '{ printf " %s%s", $3, ($4 == "ok" ? "" : "(" $4 ")") }
-    $4 == "ok" && (best == "" || $3 < best) { best = $3 } END { printf "  best %s", (best == "" ? "-" : best) }'
+  grep "^stock $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
+    $5 == "ok" && (best == "" || $4 < best) { best = $4 } END { printf "  best %s", (best == "" ? "-" : best) }'
   echo
 done
 echo "load at the end: $(uptime | sed 's/.*load averages*: //')"
