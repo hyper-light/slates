@@ -1693,6 +1693,50 @@ fn a_pack_carries_what_the_client_lacks_and_nothing_unwanted() {
   );
 }
 
+/// A-745 (§4.17.1 "A fetch's answer", rule 3: every slice a turn at a time). Do: negotiate generated requests over
+/// generated histories (every path, deepening and filter of `every_answer_is_the_oracles`) whole, and again begun and
+/// stepped one unit a step, the quantum spent after every unit, counting the steps. Expect: the same outcome, refusals
+/// included, answer and counters alike; and some pack chosen over more than one step, so the walk is cut and resumed.
+#[test]
+fn a745_a_negotiation_stepped_a_unit_at_a_time_answers_as_one_made_whole() {
+  let most_steps = RefCell::new(0u64);
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
+    cases: 1024,
+    ..Config::default()
+  }));
+  let result = runner.run(&any_plan(), |plan| {
+    let (graph, asks) = build(&plan);
+    let request = asks.request();
+    let whole = negotiate(&graph, &request, &mut Admission::new(u64::MAX));
+    let mut admission = Admission::new(u64::MAX);
+    let stepped = match super::begin(&graph, &request, &mut admission) {
+      Err(refusal) => Err(refusal),
+      Ok(super::Begun::Answered(outcome)) => Ok(outcome),
+      Ok(super::Begun::Selecting(mut negotiating)) => {
+        let mut steps = 0u64;
+        loop {
+          steps += 1;
+          match negotiating.step(&graph, &mut admission, &mut || true) {
+            Err(refusal) => break Err(refusal),
+            Ok(Some(outcome)) => break Ok(outcome),
+            Ok(None) => {}
+          }
+        }
+        .inspect(|_| {
+          let mut most = most_steps.borrow_mut();
+          *most = (*most).max(steps);
+        })
+      }
+    };
+    prop_assert_eq!(stepped, whole);
+    Ok(())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  assert!(*most_steps.borrow() > 1, "no pack took more than one step");
+}
+
 /// A straight history, `count` commits each with its own tree and blob, and one green whose versions are its commits.
 fn straight(count: u64) -> (TestGraph, Vec<u32>) {
   let mut graph = TestGraph::default();
@@ -1766,7 +1810,7 @@ fn a_rewrite_between_takes_the_walk() {
     panic!("{:?}", outcome.answer)
   };
   assert!(pack.runs.is_empty());
-  assert_eq!(nodes(&pack), [blob, tree, side, top]);
+  assert_eq!(nodes(pack), [blob, tree, side, top]);
   assert_eq!(outcome.counters.one_round, 0);
   assert!(outcome.counters.walked >= 2);
 }
@@ -1861,6 +1905,74 @@ fn a_negotiation_past_its_admission_is_refused() {
       .map(|outcome| outcome.answer),
     Ok(Answer::Nothing)
   );
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rule 1: a fetch's working set is bounded whatever the repository's size). Do: make
+/// a straight history of 3,000 commits, each with a tree of its own blob, given positions as one push gives them (every
+/// blob, then every tree, then every commit, each kind one run), and clone it, every object wanted and none held, within
+/// 4 KiB. Expect: the pack's 9,000 objects chosen, as one run: what the walk keeps is a run a range of positions,
+/// where its sets and stacks had charged 8 bytes and more an object (72,000 for the objects alone).
+#[test]
+fn a745_a_long_history_pushed_in_one_piece_is_negotiated_within_a_few_kilobytes() {
+  const COMMITS: usize = 3_000;
+  let mut graph = TestGraph::default();
+  let blobs: Vec<u32> = (0..COMMITS)
+    .map(|n| graph.new_blob(u64::try_from(n).unwrap() + 1))
+    .collect();
+  let trees: Vec<u32> = blobs.iter().map(|blob| graph.new_tree(&[*blob])).collect();
+  let mut head = None;
+  for (n, tree) in trees.iter().enumerate() {
+    let parents: Vec<u32> = head.into_iter().collect();
+    head = Some(graph.new_commit(&parents, *tree, u64::try_from(n).unwrap()));
+  }
+  let asks = Asks {
+    wants: vec![graph.id(head.unwrap())],
+    done: true,
+    ..Asks::default()
+  };
+  let outcome = negotiate(&graph, &asks.request(), &mut Admission::new(4096)).unwrap();
+  let Answer::Pack(pack) = outcome.answer else {
+    panic!("{:?}", outcome.answer)
+  };
+  assert_eq!(pack.objects.len(), u64::try_from(3 * COMMITS).unwrap());
+  assert_eq!(
+    pack.objects.runs(),
+    1,
+    "blobs, trees and commits, one push's positions, make one run"
+  );
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rule 1). Do: make a straight history of 3,000 commits whose push gave each commit,
+/// then its tree, then its blob, positions in turn (so the commits alone are every third position, 3,000 runs), and
+/// clone it within 8 KiB. Expect: the pack's 9,000 objects chosen, one run: the walk keeps each set of commits (wanted,
+/// taken, sent) in a bit table across their span, about 1.1 KiB each, where runs would cost 16 bytes a commit (48 KB a
+/// set) and the walk's sets had charged 8 bytes and more an object.
+#[test]
+fn a745_a_long_history_pushed_interleaved_is_negotiated_within_a_few_kilobytes() {
+  const COMMITS: usize = 3_000;
+  let mut graph = TestGraph::default();
+  let mut head = None;
+  for n in 0..COMMITS {
+    let commit_at = graph.objects.len();
+    let tree_at = u32::try_from(commit_at + 1).unwrap();
+    let parents: Vec<u32> = head.into_iter().collect();
+    let commit = graph.new_commit(&parents, tree_at, u64::try_from(n).unwrap());
+    let blob_at = u32::try_from(commit_at + 2).unwrap();
+    assert_eq!(graph.new_tree(&[blob_at]), tree_at);
+    assert_eq!(graph.new_blob(u64::try_from(n).unwrap() + 1), blob_at);
+    head = Some(commit);
+  }
+  let asks = Asks {
+    wants: vec![graph.id(head.unwrap())],
+    done: true,
+    ..Asks::default()
+  };
+  let outcome = negotiate(&graph, &asks.request(), &mut Admission::new(8192)).unwrap();
+  let Answer::Pack(pack) = outcome.answer else {
+    panic!("{:?}", outcome.answer)
+  };
+  assert_eq!(pack.objects.len(), u64::try_from(3 * COMMITS).unwrap());
+  assert_eq!(pack.objects.runs(), 1);
 }
 
 /// A-615 part 2 (`list-objects-filter.c` `filter_trees_depth`: a tree met again shallower is walked again, "minimum
@@ -2011,4 +2123,48 @@ fn a_sparse_filter_without_its_patterns_or_combined_is_refused() {
     sparse_clone(&graph, commit, &combined, Some(b"*\n")),
     Err(Refusal::Filter(filter::Refusal::SparseCombined))
   );
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// A-745 (a walk's set in whichever of runs or a bit table is smaller). Do: insert positions drawn dense, sparse or
+  /// every third into a set and an ordered set beside it, asking after each what each holds. Expect: the same answer to
+  /// "was it new" and to membership at every drawn position, the same least position at or after each, the same members
+  /// in order, the same runs once given up; and what the set charged no more than the smaller form costs, a word
+  /// either way.
+  #[test]
+  fn a745_a_walks_set_holds_what_an_ordered_set_holds_in_its_smaller_form(
+    step in proptest::strategy::Union::new([Just(1u64).boxed(), Just(3u64).boxed(), (1u64..400).boxed()]),
+    drawn in proptest::collection::vec(0u64..600, 0..400),
+  ) {
+    let mut held = super::Held::default();
+    let mut model = BTreeSet::new();
+    let mut admission = Admission::new(u64::MAX);
+    let mut most = 0;
+    for at in &drawn {
+      let position = at * step;
+      prop_assert_eq!(held.insert(position, &mut admission).unwrap(), model.insert(position));
+      let run_bytes = 16 * crate::to_u64(Positions::of(model.iter().copied().collect()).runs());
+      let (first, last) = (model.first().copied().unwrap_or(0), model.last().copied().unwrap_or(0));
+      let bit_bytes = (last / 64 - first / 64 + 1) * 8;
+      let bytes = held.bytes();
+      prop_assert!(
+        bytes <= run_bytes.min(bit_bytes) || bytes <= bit_bytes,
+        "costs {} with runs {} and bits {}",
+        bytes,
+        run_bytes,
+        bit_bytes
+      );
+      most = most.max(bytes);
+    }
+    prop_assert_eq!(u64::MAX - admission.left(), most, "charged its most, once");
+    for at in &drawn {
+      let position = at * step;
+      prop_assert!(held.contains(position));
+      prop_assert_eq!(held.next_from(position + 1), model.range(position + 1..).next().copied());
+    }
+    prop_assert_eq!(held.iter().collect::<Vec<_>>(), model.iter().copied().collect::<Vec<_>>());
+    prop_assert_eq!(held.into_positions(), Positions::of(model.into_iter().collect()));
+  }
 }

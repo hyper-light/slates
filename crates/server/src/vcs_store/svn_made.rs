@@ -29,8 +29,12 @@
 //! **Symbolic links** become files as Subversion keeps them: the text `link ` and the target, the property list
 //! `svn:special` set to `*` alone, brought with the revision.
 //!
-//! **Owed** (GAPS, A-664): a copy as a row with its source, once a work can make one (A-626 part 4); a symbolic link
-//! with properties of its own (refused, counted).
+//! **Copies** (A-626 part 4's `WorkOp::Copy`): the submit hands the version's copies over (`copies_of`); a copy's
+//! destination is a row with its copy source, `add`, or `replace` where something stood there or it replaces, its text
+//! and property list set where the head differs from the source's; a path beneath it is judged against the source's
+//! node at the copy-from revision, and a directory above a node added beneath it stood where it stood in the source.
+//!
+//! **Owed** (GAPS, A-664): a symbolic link with properties of its own (refused, counted).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -40,7 +44,8 @@ use slates_ipc::protocol::Authorship;
 use slates_merge::engine::Green;
 use slates_svn::commit::revision::Revision;
 use slates_svn::index::{
-  Action, ChangedPath, ContentIdentity, Index, NodeKind, PropertyList, RevisionRecord, Text,
+  Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PropertyList, RevisionRecord,
+  Text,
 };
 use slates_svn::lock::AprTime;
 use slates_svn::migration::Repository as SvnRecords;
@@ -104,8 +109,9 @@ pub(crate) fn make(
   green: DbVolumeId,
   version: u64,
   authorship: &Authorship,
+  copies: &[MadeCopy],
 ) {
-  match made(state, green, version, authorship) {
+  match made(state, green, version, (authorship, copies)) {
     Ok(true) => state.count(MADE, 1),
     Ok(false) => {}
     Err(why) => {
@@ -123,7 +129,7 @@ fn made(
   state: &mut ShardState,
   green: DbVolumeId,
   version: u64,
-  authorship: &Authorship,
+  (authorship, copies): (&Authorship, &[MadeCopy]),
 ) -> Result<bool, Unmade> {
   let Some(repository) = subversion_repository_of(state, green) else {
     return Ok(false);
@@ -144,7 +150,7 @@ fn made(
     state,
     (repository, green),
     (youngest, version),
-    (authorship, now),
+    (authorship, now, copies),
   )?;
   land_made(state, repository, revision).map_err(Unmade::Step)?;
   Ok(true)
@@ -163,7 +169,7 @@ fn revision_of(
   state: &ShardState,
   (repository, green): (RepositoryId, DbVolumeId),
   (youngest, version): (u64, u64),
-  (authorship, now): (&Authorship, AprTime),
+  (authorship, now, copies): (&Authorship, AprTime, &[MadeCopy]),
 ) -> Result<Revision, Unmade> {
   let engine = state.greens.get(&green).ok_or(Unmade::NotNext)?;
   let records = state
@@ -175,12 +181,23 @@ fn revision_of(
   }
   let mut rows = BTreeMap::new();
   let mut contents = BTreeMap::new();
+  let index = records.index();
   for path in engine.changed_between(youngest, version) {
-    if engine.copied_after(&path, youngest) {
+    let at = svn_path(&path);
+    if let Some(copy) = copies.iter().find(|copy| copy.to == at) {
+      let after = after(&engine, records, &path)?;
+      let row = copy_row(index, youngest, copy, after, &mut contents)?;
+      rows.insert(at, row);
+      continue;
+    }
+    let beneath = copy_beneath(copies, &at);
+    if beneath.is_none() && engine.copied_after(&path, youngest) {
       return Err(Unmade::Copy);
     }
-    let at = svn_path(&path);
-    let before = before(records.index(), &at, youngest)?;
+    let before = match &beneath {
+      Some((source, revision)) => before(index, source, *revision)?,
+      None => before(index, &at, youngest)?,
+    };
     let after = after(&engine, records, &path)?;
     if engine.symlink(&path).is_some() {
       // A symbolic link's `svn:special` list, brought with the revision as any list a row names.
@@ -190,7 +207,7 @@ fn revision_of(
       rows.insert(at, row);
     }
   }
-  add_parents(records.index(), youngest, &mut rows)?;
+  add_parents(index, (youngest, copies), &mut rows)?;
   keep_outermost_deletions(&mut rows);
   let date = slates_svn::dav::response::svn_time(now).map_err(|_| Unmade::Unreadable)?;
   let mut properties = BTreeMap::from([(DATE.to_vec(), date.into_bytes())]);
@@ -366,7 +383,7 @@ fn text_of(
 /// Each directory above a node a row adds or replaces that did not stand in `youngest` and no row names, added.
 fn add_parents(
   index: &Index,
-  youngest: u64,
+  (youngest, copies): (u64, &[MadeCopy]),
   rows: &mut BTreeMap<String, ChangedPath>,
 ) -> Result<(), Unmade> {
   let made: Vec<String> = rows
@@ -380,7 +397,11 @@ fn add_parents(
       if above.is_empty() || rows.contains_key(above) {
         break;
       }
-      if before(index, above, youngest)?.is_none() {
+      let stood = match copy_beneath(copies, above) {
+        Some((source, revision)) => before(index, &source, revision)?,
+        None => before(index, above, youngest)?,
+      };
+      if stood.is_none() {
         let added = ChangedPath {
           path: above.to_owned(),
           action: Action::Add,
@@ -396,6 +417,102 @@ fn add_parents(
     }
   }
   Ok(())
+}
+
+/// A copy a submitted version made (A-626 part 4's `WorkOp::Copy`), as its revision's row names it: its destination and
+/// its source, Subversion's canonical paths, the source's version (version N of the green is revision N, so it is the
+/// copy-from revision), and whether it replaces what its destination held.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MadeCopy {
+  /// The destination.
+  to: String,
+  /// The source.
+  from: String,
+  /// The source's version: the copy-from revision.
+  version: u64,
+  /// Whether it replaces what the destination held.
+  replace: bool,
+}
+
+impl MadeCopy {
+  /// Its destination and its source, as paths of the green with no leading `/` (A-731: a Mercurial changeset's copy).
+  pub(crate) fn green_paths(&self) -> (&str, &str) {
+    (self.to.trim_matches('/'), self.from.trim_matches('/'))
+  }
+}
+
+/// The copies `inc` declares ([`MadeCopy`]), in its document's order.
+pub(crate) fn copies_of(inc: &slates_merge::engine::Increment) -> Vec<MadeCopy> {
+  inc
+    .doc
+    .ops
+    .iter()
+    .filter(|op| op.kind == slates_merge::ops_doc::OpKind::Copy)
+    .filter_map(|op| {
+      Some(MadeCopy {
+        to: svn_path(inc.doc.paths.path(op.path)?),
+        from: svn_path(inc.doc.paths.path(op.src)?),
+        version: op.at,
+        replace: op.replaces(),
+      })
+    })
+    .collect()
+}
+
+/// The copy-from row of `copy` (§4.17.4 item 3.5): `add`, or `replace` where its destination stood or it replaces,
+/// the source's kind at its revision and the copy source; its text and property list where the head differs from the
+/// source's.
+fn copy_row(
+  index: &Index,
+  youngest: u64,
+  copy: &MadeCopy,
+  after: After<'_>,
+  contents: &mut BTreeMap<ContentIdentity, Vec<u8>>,
+) -> Result<ChangedPath, Unmade> {
+  let (kind, text, listed) = before(index, &copy.from, copy.version)?.ok_or(Unmade::Unreadable)?;
+  let stood = before(index, &copy.to, youngest)?.is_some();
+  let mut row = ChangedPath {
+    path: copy.to.clone(),
+    action: if copy.replace || stood {
+      Action::Replace
+    } else {
+      Action::Add
+    },
+    kind,
+    copy_from: Some(CopySource {
+      path: copy.from.clone(),
+      revision: copy.version,
+    }),
+    text: None,
+    properties: None,
+    mergeinfo_modified: false,
+  };
+  if let Some((_, bytes, properties)) = after {
+    if let Some(bytes) = bytes {
+      let made = text_of(&bytes, contents)?;
+      if text.map(|text| text.identity) != Some(made.identity) {
+        row.text = Some(made);
+      }
+    }
+    if listed != properties {
+      row.mergeinfo_modified = listed.has_mergeinfo() || properties.has_mergeinfo();
+      row.properties = Some(properties);
+    }
+  }
+  Ok(row)
+}
+
+/// Where a path beneath one of `copies`' destinations stood in its source, at the copy-from revision: what a row there
+/// is judged against, since the copy brought it.
+fn copy_beneath(copies: &[MadeCopy], path: &str) -> Option<(String, u64)> {
+  copies.iter().find_map(|copy| {
+    let rest = path.strip_prefix(copy.to.as_str())?;
+    let rel = rest.strip_prefix('/').filter(|rel| !rel.is_empty())?;
+    Some((
+      format!("{}/{rel}", copy.from.trim_end_matches('/')),
+      copy.version,
+    ))
+  })
 }
 
 /// Drops each deletion beneath a directory another row deletes: FSFS records the directory's alone.

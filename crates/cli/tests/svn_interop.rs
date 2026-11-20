@@ -846,6 +846,7 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh() {
 
 /// Writes a hook program at `path` that allows what it is asked, as an administrator writes `exit 0` into a
 /// repository's `hooks/` directory, made executable.
+#[cfg(unix)]
 #[allow(clippy::disallowed_methods)]
 fn allowing_hook(path: &str) {
   use std::os::unix::fs::PermissionsExt;
@@ -886,6 +887,8 @@ fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
 /// (`slates repository policy project --hook pre-revprop-change=PROGRAM`, the owner's verb), change revision 1's
 /// `svn:log` with stock `svn propset --revprop`, and read it. Expect the verb's answer naming the hook at policy version
 /// 1, the change taken, and the value read back.
+// Unix alone: hooks run where the hook driver does.
+#[cfg(unix)]
 #[test]
 fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
   let instance = format!("svn-revprop-{}", std::process::id());

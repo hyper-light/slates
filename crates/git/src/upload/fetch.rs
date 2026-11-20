@@ -24,7 +24,7 @@ use super::answer::{Answer, Framing, Said};
 use super::sparse;
 use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
 use crate::Admission;
-use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, Pack, ShallowInfo};
+use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, ShallowInfo};
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::store::StoreGraph;
 use crate::v2::fetch::{Argument, Event, Response, Section, WantedRef};
@@ -132,6 +132,7 @@ pub(super) fn answer<P: PackSource>(
   arguments: &[Line<Argument<'_>>],
   packs: &mut P,
   admission: &mut Admission,
+  turns: bool,
 ) -> Result<Answer<P::Pack>, Refused> {
   let multiplexed = arguments
     .iter()
@@ -154,9 +155,23 @@ pub(super) fn answer<P: PackSource>(
     include_tag: asked.flags.include_tag,
     thin: asked.flags.thin,
   };
-  let outcome = negotiation::negotiate(graph, &request, admission)
-    .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?;
-  let answer = written(served, &asked, outcome, packs, sparse, admission).map_err(refused)?;
+  let answer = if turns {
+    match negotiation::begin(graph, &request, admission)
+      .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?
+    {
+      negotiation::Begun::Answered(outcome) => {
+        written(served, &asked, outcome, packs, sparse, admission)
+      }
+      negotiation::Begun::Selecting(negotiating) => {
+        choosing(served, &asked, *negotiating, sparse, admission)
+      }
+    }
+    .map_err(refused)?
+  } else {
+    let outcome = negotiation::negotiate(graph, &request, admission)
+      .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?;
+    written(served, &asked, outcome, packs, sparse, admission).map_err(refused)?
+  };
   match graph.fault() {
     Some(fault) => Err(refused(Refusal::Store(fault))),
     None => Ok(answer),
@@ -300,7 +315,7 @@ fn written<P: PackSource>(
         };
         let (bytes, _) = charged(admission, |out| {
           before_pack(
-            &pack,
+            (pack.acknowledgments.as_ref(), pack.shallow_info.as_ref()),
             &asked.wanted,
             format,
             multiplexed,
@@ -329,7 +344,16 @@ fn written<P: PackSource>(
       };
       let (bytes, (response, at)) = charged(admission, |out| {
         let said = &sparse.said;
-        before_pack(&pack, &asked.wanted, format, multiplexed, header, said, out)
+        let sections = (pack.acknowledgments.as_ref(), pack.shallow_info.as_ref());
+        before_pack(
+          sections,
+          &asked.wanted,
+          format,
+          multiplexed,
+          header,
+          said,
+          out,
+        )
       })?;
       Answer::streaming(bytes, Framing::V2(response), at, source, admission)
         .map(|answer| answer.counted(outcome.counters))
@@ -337,11 +361,75 @@ fn written<P: PackSource>(
   }
 }
 
+/// The answer to a fetch whose pack's objects are still being chosen (A-745): the sections before the pack encoded now,
+/// as [`written`] encodes them for a pack (they rest on what the request bounds decided, never on the objects), and the
+/// choice left to the answer's steps, whose last begins the pack. A `sparse:oid` filter whose blob dies unread is
+/// answered now as [`written`] answers it, since no pack follows.
+fn choosing<K>(
+  served: &Served<'_>,
+  asked: &Asked<'_>,
+  negotiating: negotiation::Negotiating<u64, u64>,
+  sparse: sparse::Read,
+  admission: &mut Admission,
+) -> Result<Answer<K>, Refusal> {
+  let format = served.repository.format();
+  let multiplexed = asked.flags.multiplexed;
+  let at_the_pack = multiplexed && asked.flags.uris;
+  let sections = (negotiating.acknowledgments(), negotiating.shallow_info());
+  if let Some(refusal) = sparse.dies {
+    let header = if at_the_pack {
+      Header::Never
+    } else {
+      Header::First
+    };
+    let (bytes, _) = charged(admission, |out| {
+      before_pack(
+        sections,
+        &asked.wanted,
+        format,
+        multiplexed,
+        header,
+        &Said::default(),
+        out,
+      )
+    })?;
+    return Answer::died(bytes, sparse.said, refusal, true, admission);
+  }
+  let header = if at_the_pack {
+    Header::AtThePack
+  } else {
+    Header::First
+  };
+  let (bytes, (response, at)) = charged(admission, |out| {
+    before_pack(
+      sections,
+      &asked.wanted,
+      format,
+      multiplexed,
+      header,
+      &sparse.said,
+      out,
+    )
+  })?;
+  Answer::choosing(
+    bytes,
+    super::answer::Choosing::new(
+      negotiating,
+      asked.filter.clone(),
+      asked.flags.thin,
+      asked.flags.ofs_delta,
+      Framing::V2(response),
+      at,
+    ),
+    admission,
+  )
+}
+
 /// Writes the sections before a pack, then the packfile section's header and what `pack-objects` wrote to its error
 /// stream before its pack (`said`, relayed on band 2 a read a packet), in the order `header` says: the response's
 /// grammar after them, and how many bytes they took.
 fn before_pack(
-  pack: &Pack<u64, u64>,
+  sections: (Option<&Acknowledgments>, Option<&ShallowInfo>),
   wanted: &[WantedRef<'_>],
   format: ObjectFormat,
   multiplexed: bool,
@@ -350,11 +438,12 @@ fn before_pack(
   out: &mut Sink<'_>,
 ) -> Result<(Response, u64), Refusal> {
   let mut writer = Writer::new(format, multiplexed, out);
-  if let Some(acknowledgments) = &pack.acknowledgments {
+  let (acknowledgments, shallow_info) = sections;
+  if let Some(acknowledgments) = acknowledgments {
     writer.acknowledgments(acknowledgments)?;
     writer.event(&Event::Delim)?;
   }
-  if let Some(shallow_info) = &pack.shallow_info {
+  if let Some(shallow_info) = shallow_info {
     writer.shallow_info(shallow_info)?;
   }
   if !wanted.is_empty() {

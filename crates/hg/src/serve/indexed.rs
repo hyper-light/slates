@@ -450,19 +450,8 @@ impl Store for Indexed<'_> {
     })
   }
 
-  fn stream_files(
-    &self,
-    room: &mut Admission,
-  ) -> Result<Option<Vec<crate::render::File>>, Refusal> {
-    if !self.streams() {
-      return Ok(None);
-    }
-    crate::render::revlogs(self.index, self.store, room)
-      .map(Some)
-      .map_err(|refused| match refused {
-        crate::render::Refused::Past(past) => Refusal::PastAdmission(past),
-        _ => Refusal::Store { what: "a revlog" },
-      })
+  fn revlogs(&self) -> Option<(&HgIndex, &ContentStore)> {
+    self.streams().then_some((self.index, self.store))
   }
 }
 

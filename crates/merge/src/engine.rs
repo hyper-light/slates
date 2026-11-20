@@ -4927,7 +4927,30 @@ impl Green {
     inc: &Increment,
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     // One verdict for a submit and a push (A-635): judged, then committed at once, at the head it was judged at.
-    match self.judge(inc) {
+    let judgment = self.judge(inc);
+    self.commit_judgment(judgment)
+  }
+
+  /// [`Green::submit_resolved`] for a verdict computed on another copy of this green (A-658 part 3b; A-697 part c: a
+  /// holder's replica computed it, and its owner takes it by position): judged by [`Green::judge_computed`], then
+  /// committed at once at the head it was judged at, so the outcome and what the chain records equal what
+  /// [`Green::submit_resolved`] gives at that head. Refused, typed, nothing judged or applied, as `judge_computed` is.
+  pub fn submit_computed(
+    &mut self,
+    inc: &Increment,
+    computed: Computed,
+  ) -> Result<(Outcome, Option<Vec<crate::chain_entry::Applied>>), PositionRefused> {
+    let judgment = self.judge_computed(inc, computed)?;
+    Ok(self.commit_judgment(judgment))
+  }
+
+  /// A judgment committed at once where it accepted, as a submit's outcome, with what the chain records of a new
+  /// version (`None` beside every other outcome).
+  fn commit_judgment(
+    &mut self,
+    judgment: Judgment,
+  ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
+    match judgment {
       Judgment::Accepted(judged) => {
         let (version, applied) = self.commit_held(judged);
         (Outcome::Accepted { version }, Some(applied))

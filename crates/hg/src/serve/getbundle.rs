@@ -115,14 +115,10 @@ pub trait Store: Repository {
     false
   }
 
-  /// The revlogs a stream clone sends ([`crate::render::revlogs`]), charged to `room`; `None` where none is served
-  /// ([`Store::streams`]).
-  fn stream_files(
-    &self,
-    room: &mut Admission,
-  ) -> Result<Option<Vec<crate::render::File>>, Refusal> {
-    let _ = room;
-    Ok(None)
+  /// The index and content store a stream clone's revlogs are rendered from as they are sent
+  /// ([`crate::render::Streaming`], A-745); `None` where none is served ([`Store::streams`]).
+  fn revlogs(&self) -> Option<(&crate::index::HgIndex, &slates_vcs::ContentStore)> {
+    None
   }
 }
 

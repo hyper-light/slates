@@ -19,7 +19,9 @@ use std::io::Write as _;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
-use super::{Answer, Asked, PackPlan, PackRefused, PackSource, Served, Written, serve};
+use super::{
+  Answer, Asked, PackPlan, PackRefused, PackSource, Served, Written, serve, serve_in_turns,
+};
 use crate::Admission;
 use crate::entry::{self, Representation};
 use crate::http::Version;
@@ -177,6 +179,28 @@ pub(super) fn answer_of(
     answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX),
     Written::End
   );
+  // A-745: the same exchange answered in turns, the choice of the pack's objects stepped a unit a write, is the same
+  // answer byte for byte, refusal and counters alike: every test here holds both.
+  let mut in_turns = WholeObjects::new(&fixture.objects);
+  let mut turns_admission = Admission::new(u64::MAX);
+  let mut stepped = serve_in_turns(&served, version, asked, &mut in_turns, &mut turns_admission);
+  let mut stepped_bytes = Vec::new();
+  while stepped.write_within(
+    &served,
+    &mut in_turns,
+    &mut turns_admission,
+    &mut stepped_bytes,
+    usize::MAX,
+    &mut || true,
+  ) == Written::More
+  {}
+  assert_eq!(stepped_bytes, bytes, "answered in turns");
+  assert_eq!(stepped.refusal(), answer.refusal(), "answered in turns");
+  // A pack that dies as it begins (a `sparse:oid` blob not read) is answered in turns before any walk, as git's
+  // `pack-objects` dies before it walks; whole, the walk ran first. Its words are the same either way.
+  if answer.refusal().is_none() {
+    assert_eq!(stepped.counters(), answer.counters(), "answered in turns");
+  }
   (bytes, answer)
 }
 

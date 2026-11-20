@@ -129,7 +129,9 @@ use crate::repository::push::{
 };
 use crate::state::ShardState;
 use crate::vcs_policy::{Asked, Brings, Compiled, Name, PushRefusal, Right, admit, admit_right};
-use crate::vcs_store::{GitPush, GitRefused, GitStore, SealedPush, Target, green_key, with_room};
+use crate::vcs_store::{
+  GitPush, GitRefused, GitStore, SealTurn, SealedPush, SealingPush, Target, green_key, with_room,
+};
 use crate::verbs::to_wire_volume;
 
 #[cfg(unix)]
@@ -269,11 +271,19 @@ impl crate::git_hooks::PresentView for Unpresented {
 enum Begun {
   /// The answer, written; boxed, as the hooks' state is, since a received push is far larger.
   Answering(Box<Answering>),
-  /// The push sealed, its hooks before the verdicts due.
-  #[cfg(unix)]
-  Hooking(Box<hooks::Hooking>),
-  /// The push sealed, its commands decided a step at a time.
-  Deciding(Box<DecidingPush>),
+  /// The push's seal begun, a turn at a time.
+  Sealing(Box<SealingAnswer>),
+}
+
+/// A push's answer while its objects are sealed and staged a turn at a time (A-722 part 4; `AnswerState::Sealing`), so
+/// a push of git/git's size never runs past its step before its verdicts.
+struct SealingAnswer {
+  /// The repository's record as the answer read it.
+  record: RepositoryRecord,
+  /// The push's seal under way.
+  sealing: SealingPush,
+  /// The push's name (module docs).
+  name: [u8; 32],
 }
 
 /// A push's answer while its commands are decided a step at a time (A-719; `AnswerState::Deciding`):
@@ -289,6 +299,8 @@ struct DecidingPush {
   verdicts: HookVerdicts,
   /// The decision under way.
   deciding: Deciding<Entry>,
+  /// The admission of the command under way's move, a turn at a time (A-722 part 4c).
+  admitting: Option<slates_git::store::Admitting>,
   /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
   #[cfg(unix)]
   then: Option<hooks::PushHooks>,
@@ -298,6 +310,8 @@ struct DecidingPush {
 enum AnswerState {
   /// Not begun.
   Unbegun,
+  /// Its objects being sealed and staged a turn at a time.
+  Sealing(Box<SealingAnswer>),
   /// Its objects sealed in quarantine, its hooks before the verdicts under way.
   #[cfg(unix)]
   Hooking(Box<hooks::Hooking>),
@@ -355,12 +369,15 @@ impl<P> ReceivePack<P> {
         .map_err(PushFailed::Exchange)?;
     }
     // A-724 piece 1: the push is counted on its repository's row as it begins.
-    state.vcs_usage.begun(
-      &repository,
-      principal,
-      Work::Intake,
-      slates_rt::futures::now_ns(),
-    );
+    let begun = slates_rt::futures::now_ns();
+    state
+      .vcs_usage
+      .begun(&repository, principal, Work::Intake, begun);
+    PHASE_LONGEST.with(|longest| {
+      if let Ok(mut longest) = longest.try_borrow_mut() {
+        longest.entry(repository).or_default().begun_at = Some(begun);
+      }
+    });
     Ok(ReceivePack {
       repository,
       principal: principal.clone(),
@@ -460,6 +477,21 @@ impl<P> ReceivePack<P> {
   /// deletes, checked as its request ended, answers so at once. A refusal of the exchange ends the
   /// push.
   fn check_turn(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
+    // The pack's waiting deltas resolve a turn at a time first (A-724's starvation fix: resolved whole in the last input
+    // step, git/git v1.5.0's held its shard 1.4 s, starving the small repositories there), what each turn resolves
+    // admitted to the quarantine as an input's is.
+    if self.session.is_resolving() {
+      let ns = state.config.step_quantum_ns();
+      self.intake(state, |session, site, admission| {
+        let mut clock = ShardClock;
+        let quantum = Quantum {
+          clock: &mut clock,
+          ns,
+        };
+        session.resolve_turn_into(site, admission, quantum)
+      })?;
+      return Ok(false);
+    }
     if !self.session.is_checking() {
       return Ok(self.session.checked().is_some());
     }
@@ -512,8 +544,6 @@ impl<P> ReceivePack<P> {
     let record = record_of(state, self.repository)?;
     let pack = self.session.take_pack();
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
-    #[cfg(unix)]
-    let hooked = git_hook(&record).is_some();
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       self.give_back(state);
       let answering = self.declined(&mut Declining::hook(hook), out)?;
@@ -524,17 +554,48 @@ impl<P> ReceivePack<P> {
       Prepared::Declined(mut declining) => Ok(Begun::Answering(Box::new(
         self.declined(&mut declining, out)?,
       ))),
-      Prepared::Sealed { sealed, name } => {
-        let sealed = *sealed;
-        #[cfg(unix)]
-        if hooked {
-          let hooking = hooks::Hooking::new(record, (sealed, name), checked);
-          return Ok(Begun::Hooking(Box::new(hooking)));
-        }
-        let deciding = self.deciding((record, sealed, name), HookVerdicts::default())?;
-        Ok(Begun::Deciding(Box::new(deciding)))
-      }
+      Prepared::Sealing { sealing, name } => Ok(Begun::Sealing(Box::new(SealingAnswer {
+        record,
+        sealing: *sealing,
+        name,
+      }))),
     }
+  }
+
+  /// One turn of the push's seal (A-722 part 4), for the shard's step quantum and a unit at least: another turn due, or,
+  /// sealed, its hooks before the verdicts due where a git hook is configured and its verdicts otherwise; every
+  /// command refused when the store refused the seal.
+  fn seal_turn(
+    &mut self,
+    state: &mut ShardState,
+    answer: SealingAnswer,
+  ) -> Result<Sealed, PushFailed> {
+    let SealingAnswer {
+      record,
+      sealing,
+      name,
+    } = answer;
+    let ns = state.config.step_quantum_ns();
+    let sealed = match sealing.turn(state, ns) {
+      Ok(SealTurn::More(sealing)) => {
+        self.answer = AnswerState::Sealing(Box::new(SealingAnswer {
+          record,
+          sealing: *sealing,
+          name,
+        }));
+        return Ok(Sealed::Turned);
+      }
+      Ok(SealTurn::Sealed(sealed)) => *sealed,
+      Err(refused) => return Ok(Sealed::Declined(Declining::unadmitted(&refused))),
+    };
+    #[cfg(unix)]
+    if git_hook(&record).is_some() {
+      let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
+      let hooking = hooks::Hooking::new(record, (sealed, name), checked);
+      return Ok(Sealed::Hooking(Box::new(hooking)));
+    }
+    let deciding = self.deciding((record, sealed, name), HookVerdicts::default())?;
+    Ok(Sealed::Deciding(Box::new(deciding)))
   }
 
   /// Every command refused by `declining`, and the report written: what was received.
@@ -569,6 +630,7 @@ impl<P> ReceivePack<P> {
       name,
       verdicts,
       deciding,
+      admitting: None,
       #[cfg(unix)]
       then: None,
     })
@@ -590,6 +652,7 @@ impl<P> ReceivePack<P> {
         name,
         verdicts,
         deciding,
+        admitting,
         ..
       } = &mut decision;
       let mut judge = ServerJudge {
@@ -599,6 +662,7 @@ impl<P> ReceivePack<P> {
         principal: &self.principal,
         name: *name,
         hooks: verdicts,
+        admitting,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -656,15 +720,31 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
         let can_present = self.presenter.can_present();
         match self.begin(state, can_present, out)? {
           Begun::Answering(answering) => Ok(*answering),
-          Begun::Hooking(hooking) => self.hooking(state, *hooking, out),
-          Begun::Deciding(decision) => self.decide_step(state, *decision, out),
+          Begun::Sealing(sealing) => self.sealing_step(state, *sealing, out),
         }
       }
+      AnswerState::Sealing(sealing) => self.sealing_step(state, *sealing, out),
       AnswerState::Hooking(hooking) => self.hooking(state, *hooking, out),
       AnswerState::Deciding(decision) => self.decide_step(state, *decision, out),
       AnswerState::Observing(observing) => hooks::observe(self, state, *observing, out),
       AnswerState::Reported(received) => Ok(Answering::Answered(received)),
       AnswerState::Done => Err(PushFailed::Unchecked),
+    }
+  }
+
+  /// One step of the seal ([`Self::seal_turn`]): another step due, every command refused, or the
+  /// hooks before the verdicts or the verdicts begun in the same step.
+  fn sealing_step(
+    &mut self,
+    state: &mut ShardState,
+    sealing: SealingAnswer,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
+    match self.seal_turn(state, sealing)? {
+      Sealed::Turned => Ok(Answering::Turned),
+      Sealed::Declined(mut declining) => self.declined(&mut declining, out),
+      Sealed::Hooking(hooking) => self.hooking(state, *hooking, out),
+      Sealed::Deciding(decision) => self.decide_step(state, *decision, out),
     }
   }
 
@@ -738,10 +818,26 @@ impl<P> ReceivePack<P> {
       }
       AnswerState::Unbegun => match self.begin(state, false, out)? {
         Begun::Answering(answering) => Ok(*answering),
-        Begun::Deciding(decision) => self.decide_step(state, *decision, out),
+        Begun::Sealing(sealing) => self.sealing_step(state, *sealing, out),
       },
+      AnswerState::Sealing(sealing) => self.sealing_step(state, *sealing, out),
       AnswerState::Deciding(decision) => self.decide_step(state, *decision, out),
       AnswerState::Done => Err(PushFailed::Unchecked),
+    }
+  }
+
+  /// One step of the seal ([`Self::seal_turn`]): another step due, every command refused, or the
+  /// verdicts begun in the same step.
+  fn sealing_step(
+    &mut self,
+    state: &mut ShardState,
+    sealing: SealingAnswer,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
+    match self.seal_turn(state, sealing)? {
+      Sealed::Turned => Ok(Answering::Turned),
+      Sealed::Declined(mut declining) => self.declined(&mut declining, out),
+      Sealed::Deciding(decision) => self.decide_step(state, *decision, out),
     }
   }
 
@@ -777,9 +873,41 @@ impl<P> Drop for ReceivePack<P> {
         );
       }
     }
-    #[cfg(unix)]
-    hooks::dropped(core::mem::replace(&mut self.answer, AnswerState::Done));
+    let answer = core::mem::replace(&mut self.answer, AnswerState::Done);
+    // A push dropped while its seal or its decision is under way gives back its sealing push or its sealed push
+    // (A-722 part 4); one dropped mid-hooks gives back what its hooks hold.
+    let held = match answer {
+      AnswerState::Sealing(sealing) => Some(Held::Sealing(Box::new(sealing.sealing))),
+      AnswerState::Deciding(decision) => Some(Held::Sealed(Box::new(decision.sealed))),
+      #[cfg(unix)]
+      other => {
+        hooks::dropped(other);
+        None
+      }
+      #[cfg(not(unix))]
+      _ => None,
+    };
+    if let Some(held) = held {
+      let given = crate::state::with_state(|state| match held {
+        Held::Sealing(sealing) => sealing.abandon(state),
+        Held::Sealed(sealed) => sealed.abandon(state),
+      });
+      if given.is_none() {
+        slates_machine::log_line!(
+          "slates-server: a git push dropped mid-seal or mid-decision could not give back its push: the \
+           shard's state was not lent to its drop"
+        );
+      }
+    }
   }
+}
+
+/// What a push dropped mid-answer still holds of the shard.
+enum Held {
+  /// Its seal under way (boxed, as each of them: the two differ by hundreds of bytes).
+  Sealing(Box<SealingPush>),
+  /// Its sealed push, its commands being decided.
+  Sealed(Box<SealedPush>),
 }
 
 /// `repository`'s record on this shard's partition.
@@ -919,13 +1047,26 @@ impl HiddenRefs for PolicyHidden {
 enum Prepared {
   /// Every command refused before any verdict.
   Declined(Declining),
-  /// The push's objects sealed in quarantine.
-  Sealed {
-    /// The sealed push (boxed: it is most of a preparation's size).
-    sealed: Box<SealedPush>,
+  /// The push's objects' seal begun, a turn at a time (A-722 part 4).
+  Sealing {
+    /// The seal under way (boxed: it is most of a preparation's size).
+    sealing: Box<SealingPush>,
     /// The push's name (module docs).
     name: [u8; 32],
   },
+}
+
+/// What a turn of a push's seal left (`ReceivePack::seal_turn`).
+enum Sealed {
+  /// Another turn is due.
+  Turned,
+  /// The store refused the seal: every command refused.
+  Declined(Declining),
+  /// Sealed, its hooks before the verdicts due.
+  #[cfg(unix)]
+  Hooking(Box<hooks::Hooking>),
+  /// Sealed, its commands decided a step at a time.
+  Deciding(Box<DecidingPush>),
 }
 
 /// Prepares `checked`, a push to `record`'s repository (module docs, "Answering", item 2), its
@@ -955,9 +1096,9 @@ fn prepare(
     GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?
   };
   push.keep_pack(pack);
-  match push.seal(state) {
-    Ok(sealed) => Ok(Prepared::Sealed {
-      sealed: Box::new(sealed),
+  match push.sealing(state) {
+    Ok(sealing) => Ok(Prepared::Sealing {
+      sealing: Box::new(sealing),
       name: push_name(record.id, &checked.request),
     }),
     Err(refused) => Ok(Prepared::Declined(Declining::unadmitted(&refused))),
@@ -967,13 +1108,108 @@ fn prepare(
 /// Counts a step of a push of `repository`'s that began at `began` on the shard's clock and read `bytes_in` of the
 /// client's bytes on the repository's usage row (A-724 piece 1, `slates_vcs::usage`).
 fn charge_step(state: &mut ShardState, repository: RepositoryId, began: u64, bytes_in: u64) {
-  let now = slates_rt::futures::now_ns();
-  state.vcs_usage.stepped(
-    &repository,
-    Work::Intake,
-    (now.saturating_sub(began), bytes_in),
-    now,
+  charge_phase(
+    state,
+    repository,
+    began,
+    bytes_in,
+    if bytes_in > 0 { PHASE_INPUT } else { PHASE_END },
   );
+}
+
+/// Format: a push step's phase in [`PhaseLongest`]: a run of the body read.
+const PHASE_INPUT: usize = 0;
+/// Format: the step that ends the body.
+const PHASE_END: usize = 1;
+/// Format: a turn of the pack's checks (A-719), an answer step that answers `Turned`.
+const PHASE_CHECK: usize = 2;
+/// Format: the answer's last step (seal, hooks' views, verdicts, commit and report), one that answers `Answered`.
+const PHASE_ANSWER: usize = 3;
+/// Derived: the phases a push's steps are counted in, the last one's index and one.
+const PHASES: usize = PHASE_ANSWER + 1;
+
+/// Each phase's steps of a git push on this shard, per repository (A-724's profile: where a push holds its shard, and
+/// how long it waits between its steps): indexed by phase [input, end, check turn, answer].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PhaseSteps {
+  /// The longest step of each phase, nanoseconds.
+  pub(crate) longest: [u64; PHASES],
+  /// Steps of each phase.
+  pub(crate) steps: [u64; PHASES],
+  /// The nanoseconds those steps ran.
+  pub(crate) ns: [u64; PHASES],
+  /// The nanoseconds from the repository's previous push step's end to each step's start, summed by the step's phase:
+  /// before a check turn or an answer step, the time the push waited for its shard (it was ready); before an input step,
+  /// that and the client's bytes.
+  pub(crate) gap_ns: [u64; PHASES],
+  /// The nanoseconds from each push's beginning (its session made, `vcs_usage`'s `begun`) to its first step.
+  pub(crate) first_gap_ns: u64,
+  /// The shard clock at the repository's latest push step's end; zero before its first.
+  last_end: u64,
+  /// The shard clock at a push's beginning while its first step is still to come.
+  begun_at: Option<u64>,
+}
+
+/// [`PhaseSteps`] by repository on this shard: one entry a repository with a push stepped here, so bounded by the
+/// partition's repositories.
+pub(crate) type PhaseLongest = std::collections::BTreeMap<RepositoryId, PhaseSteps>;
+
+std::thread_local! {
+  /// This shard's [`PhaseLongest`].
+  static PHASE_LONGEST: std::cell::RefCell<PhaseLongest> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// `repository`'s push steps by phase on this shard ([`PhaseSteps`]): zeros where none ran.
+pub(crate) fn phase_longest(repository: RepositoryId) -> PhaseSteps {
+  PHASE_LONGEST.with(|longest| {
+    longest
+      .try_borrow()
+      .ok()
+      .and_then(|longest| longest.get(&repository).copied())
+      .unwrap_or_default()
+  })
+}
+
+/// Counts a step of phase `phase` ([`PhaseSteps`]) on the repository's usage row and its phase's steps.
+fn charge_phase(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  began: u64,
+  bytes_in: u64,
+  phase: usize,
+) {
+  let now = slates_rt::futures::now_ns();
+  let step_ns = now.saturating_sub(began);
+  state
+    .vcs_usage
+    .stepped(&repository, Work::Intake, (step_ns, bytes_in), now);
+  PHASE_LONGEST.with(|longest| {
+    if let Ok(mut longest) = longest.try_borrow_mut() {
+      let entry = longest.entry(repository).or_default();
+      let gap = match entry.begun_at.take() {
+        Some(begun) => {
+          entry.first_gap_ns = entry
+            .first_gap_ns
+            .saturating_add(began.saturating_sub(begun));
+          0
+        }
+        None if entry.last_end == 0 => 0,
+        None => began.saturating_sub(entry.last_end),
+      };
+      entry.last_end = now;
+      if let (Some(most), Some(steps), Some(ns), Some(gaps)) = (
+        entry.longest.get_mut(phase),
+        entry.steps.get_mut(phase),
+        entry.ns.get_mut(phase),
+        entry.gap_ns.get_mut(phase),
+      ) {
+        *most = (*most).max(step_ns);
+        *steps = steps.saturating_add(1);
+        *ns = ns.saturating_add(step_ns);
+        *gaps = gaps.saturating_add(gap);
+      }
+    }
+  });
 }
 
 /// Counts a step of a push's answer that began at `began` (A-724 piece 1), and the push as answered when the step
@@ -984,7 +1220,12 @@ fn charge_answer(
   began: u64,
   stepped: &Result<Answering, PushFailed>,
 ) {
-  charge_step(state, repository, began, 0);
+  let phase = if matches!(stepped, Ok(Answering::Answered(_))) {
+    PHASE_ANSWER
+  } else {
+    PHASE_CHECK
+  };
+  charge_phase(state, repository, began, 0, phase);
   if let Ok(Answering::Answered(_)) = stepped {
     state
       .vcs_usage
@@ -1155,10 +1396,32 @@ struct ServerJudge<'j> {
   name: [u8; 32],
   /// What the push's hooks before the verdicts decided of its commands.
   hooks: &'j mut HookVerdicts,
+  /// The admission of the command under way's move, a turn at a time (A-722 part 4c).
+  admitting: &'j mut Option<slates_git::store::Admitting>,
 }
 
 impl Judge for ServerJudge<'_> {
   type Accepted = Entry;
+
+  /// A turn of the admission of `command`'s move (A-722 part 4c), for the shard's step quantum and a unit at least: the
+  /// walk of what it brings, which its append then takes whole ([`SealedPush::admit`]). A delete needs none.
+  fn ready(&mut self, command: &Command, _pushed: &Pushed<'_>) -> bool {
+    if command.is_delete() {
+      return true;
+    }
+    let repository = self.record.id;
+    let green = {
+      let state = &*self.state;
+      let Some(store) = state.vcs_stores.git_ref(repository) else {
+        return true;
+      };
+      born(state, (repository, &command.name), store).unwrap_or_else(|| unheld_key(repository))
+    };
+    let ns = self.state.config.step_quantum_ns();
+    self
+      .push
+      .admission_turn(self.state, (green, command.new), (self.admitting, ns))
+  }
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
     if let Some(declined) = self.hooks.declined(&command.name) {

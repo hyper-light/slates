@@ -447,6 +447,7 @@ where
           self.lender.clone(),
           (repository.id, start.principal.clone()),
           version,
+          self.room,
         )))
       }
       (Service::GitReceivePack, Some(repository)) => {
@@ -472,7 +473,7 @@ where
 
 /// A command [`ToolServices`] started: one of the tools' sessions, receive-pack's boxed, so its push's session (A-620's)
 /// does not set the size every connection's command takes (clippy's `large_enum_variant` is denied).
-pub(crate) enum ToolCommand<L: StoreLender, H, S> {
+pub(crate) enum ToolCommand<L: StoreLender, H: HgStores, S> {
   /// git's upload-pack.
   Upload(UploadCommand<L>),
   /// git's receive-pack.

@@ -27,6 +27,7 @@
 //!
 //! **Owed** (GAPS, A-731): copies as file revisions naming their source; the holders' changesets (A-636's fleet half).
 
+use super::svn_made::MadeCopy;
 use slates_db::catalog::{RepositoryEntry, RepositoryId, VcsTool, VolumeId as DbVolumeId};
 use slates_db::op::Op;
 use slates_hg::Node;
@@ -97,8 +98,9 @@ pub(crate) fn make(
   green: DbVolumeId,
   version: u64,
   authorship: &Authorship,
+  copies: &[MadeCopy],
 ) {
-  match made(state, green, version, authorship) {
+  match made(state, green, version, authorship, copies) {
     Ok(true) => state.count(MADE, 1),
     Ok(false) => {}
     Err(why) => {
@@ -149,6 +151,7 @@ fn made(
   green: DbVolumeId,
   version: u64,
   authorship: &Authorship,
+  copies: &[MadeCopy],
 ) -> Result<bool, Unmade> {
   let Some(repository) = mercurial_repository_of(state, green) else {
     return Ok(false);
@@ -178,6 +181,7 @@ fn made(
       (before, version),
       parent,
       (user, message, seconds),
+      copies,
     )
   })?;
   let Some(verified) = verified else {
@@ -204,6 +208,7 @@ fn changeset_of(
   (before, version): (u64, u64),
   parent: Node,
   (user, message, seconds): (&str, &str, u64),
+  copies: &[MadeCopy],
 ) -> Result<Option<Verified>, Unmade> {
   let engine = state.greens.get(&green).ok_or(Unmade::NotHead)?;
   if engine.head() != version {
@@ -214,7 +219,12 @@ fn changeset_of(
     .mercurial_ref(repository)
     .ok_or(Unmade::NotHead)?;
   let paths = engine.changed_between(before, version);
-  let changes: Vec<Change<'_>> = paths.iter().map(|path| change_of(&engine, path)).collect();
+  let sources: Vec<Option<String>> = paths.iter().map(|path| copied_from(path, copies)).collect();
+  let changes: Vec<Change<'_>> = paths
+    .iter()
+    .zip(&sources)
+    .map(|(path, source)| change_of(&engine, path, source.as_deref()))
+    .collect();
   let branch = branch_of(state, (repository, green), (&store.index, content), parent);
   let authored = Authored {
     user: user.as_bytes(),
@@ -237,7 +247,26 @@ fn changeset_of(
 }
 
 /// One changed path as the changeset takes it: its bytes and flag at the head, or removed.
-fn change_of<'g>(engine: &'g Green, path: &'g str) -> Change<'g> {
+/// The path `path` was copied from, where one of `copies` (the version's, A-626 part 4) copied it: a copy's destination
+/// itself, or a path under a copied directory, its source the same path under the copy's source; the last copy that
+/// names it, as the version's operations apply in order.
+fn copied_from(path: &str, copies: &[MadeCopy]) -> Option<String> {
+  let path = path.trim_matches('/');
+  copies.iter().rev().find_map(|copy| {
+    let (to, from) = copy.green_paths();
+    if path == to {
+      return Some(from.to_owned());
+    }
+    let rest = path.strip_prefix(to)?.strip_prefix('/')?;
+    Some(if from.is_empty() {
+      rest.to_owned()
+    } else {
+      format!("{from}/{rest}")
+    })
+  })
+}
+
+fn change_of<'g>(engine: &'g Green, path: &'g str, source: Option<&'g str>) -> Change<'g> {
   let after = match engine.symlink(path) {
     Some(target) => Some((target.as_bytes(), Flag::Link)),
     None => engine.content(path).map(|bytes| {
@@ -255,6 +284,7 @@ fn change_of<'g>(engine: &'g Green, path: &'g str) -> Change<'g> {
   Change {
     path: path.as_bytes(),
     after,
+    copied_from: source.map(str::as_bytes),
   }
 }
 
@@ -296,8 +326,27 @@ fn recorded(
     .map(|changeset| changeset.node)
     .ok_or(Unmade::Record)?;
   let room = crate::vcs_share::room(state, repository).bytes;
-  let objects = slates_hg::import::record::write_made(verified, (green_key(green), version), room)
-    .map_err(|_| Unmade::Record)?;
+  // The made manifest's record is its delta against its first parent's text (A-729 part 2), read from the index.
+  let parent = verified
+    .manifests
+    .first()
+    .map(|manifest| manifest.p1)
+    .filter(|p1| *p1 != slates_hg::NULL_NODE)
+    .and_then(|p1| {
+      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
+      slates_hg::push::verify::Held::manifest_text(
+        &slates_hg::push::held::IndexHeld::new(&store.index, content),
+        &p1,
+      )
+      .map(std::borrow::Cow::into_owned)
+    });
+  let objects = slates_hg::import::record::write_made(
+    verified,
+    (green_key(green), version),
+    parent.as_deref(),
+    room,
+  )
+  .map_err(|_| Unmade::Record)?;
   let entry = Op::RepositoryAdvanced {
     entry: RepositoryEntry {
       repository,

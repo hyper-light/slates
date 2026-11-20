@@ -24,11 +24,13 @@
 //! band-3 words, and no flush; with no band, what came before the pack alone. What `pack-objects` writes as it reads
 //! the filter's name and lives on (a warning) is relayed the same way before the pack.
 
-use super::{ABORT, PackRefused, PackSource, Refusal, Refused, Served};
+use super::{ABORT, PackPlan, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::Counters;
+use crate::negotiation::{Answer as NegotiatedAnswer, Filter, Negotiating};
 use crate::out::Out;
 use crate::pktline::{self, Packet};
 use crate::sideband::{self, Band, MAX_BAND_DATA};
+use crate::store::StoreGraph;
 use crate::v2::fetch::{Event, Response};
 use crate::{Admission, to_u64};
 
@@ -70,9 +72,27 @@ const ABORT_PACKET: usize = ABORT
   .len()
   .saturating_add(pktline::MAX_LEN.saturating_sub(MAX_BAND_DATA));
 
-/// Format: the most one framing holds: a packet at the format's longest, then the flush after the pack's last data or,
-/// after the data a source wrote before it refused, git's band-3 words, whichever is longer.
-const FRAMED_MOST: usize = pktline::MAX_LEN.saturating_add(longer(FLUSH.len(), ABORT_PACKET));
+/// Derived: the parts of a request's room one packet's data may take while its pack is framed (A-745, §4.17.1 "A fetch's
+/// answer" rule 2: a request's room bounds a slice, never a repository): the data being filled and the packet framed
+/// from it, each with as much again for the step that writes it, so a quarter of the room left as the pack begins.
+const PACKET_SHARE: u64 = 4;
+
+/// The most data one packet of a pack framed as `framing` carries within a request whose room has `left` bytes when the
+/// pack begins: the format's own most where the room holds it four times over ([`PACKET_SHARE`]), else a quarter of the
+/// room, at least a byte. A client reads packets of any length up to the format's most, so a smaller room only means more
+/// of them.
+fn packet_data(framing: Framing, left: u64) -> usize {
+  let share = usize::try_from(left / PACKET_SHARE).unwrap_or(usize::MAX);
+  framing.data().min(share).max(1)
+}
+
+/// The most one framing of packets of `data` bytes holds: a packet, its length and band byte, then the flush after the
+/// pack's last data or git's band-3 words, whichever is longer.
+fn framed_most(data: usize) -> usize {
+  data
+    .saturating_add(pktline::MAX_LEN.saturating_sub(MAX_BAND_DATA))
+    .saturating_add(longer(FLUSH.len(), ABORT_PACKET))
+}
 
 /// The longer of two lengths, for the bounds above.
 const fn longer(first: usize, second: usize) -> usize {
@@ -132,6 +152,50 @@ pub struct Answer<K> {
   counters: Option<Counters>,
   /// Whether the request was a flush alone, which ends the client's session.
   ends_session: bool,
+  /// The pack's objects still being chosen, before its source begins (A-745).
+  choosing: Option<Box<Choosing>>,
+}
+
+/// A fetch's pack whose objects are still being chosen (A-745, §4.17.1 "A fetch's answer" rule 3): the negotiation's
+/// choice, stepped within the owner's quantum by [`Answer::write_within`], and what the pack's source begins with once it
+/// ends: the request's filter, `thin-pack`, `ofs-delta`, the framing and where the response stands.
+pub(super) struct Choosing {
+  /// The choice.
+  negotiating: Negotiating<u64, u64>,
+  /// The request's filter.
+  filter: Option<Filter>,
+  /// `thin-pack`.
+  thin: bool,
+  /// `ofs-delta`.
+  ofs_delta: bool,
+  /// How the pack's data will be framed.
+  framing: Framing,
+  /// How many bytes of the response come before the pack.
+  at: u64,
+  /// The most data one packet of the pack carries, sized as the answer is made ([`packet_data`]).
+  packet: usize,
+}
+
+impl Choosing {
+  /// The choice `negotiating` makes, and what the pack begins with after it.
+  pub(super) fn new(
+    negotiating: Negotiating<u64, u64>,
+    filter: Option<Filter>,
+    thin: bool,
+    ofs_delta: bool,
+    framing: Framing,
+    at: u64,
+  ) -> Choosing {
+    Choosing {
+      negotiating,
+      filter,
+      thin,
+      ofs_delta,
+      framing,
+      at,
+      packet: framing.data(),
+    }
+  }
 }
 
 /// A pack being framed.
@@ -144,6 +208,8 @@ struct Streaming<K> {
   at: u64,
   /// The data of the packet being filled, as its source wrote it, until the packet is full or the pack has ended.
   data: Vec<u8>,
+  /// The most data one packet carries ([`packet_data`]).
+  packet: usize,
   /// The packet framed and not yet written whole, with the flush after it when it is the pack's last.
   framed: Vec<u8>,
   /// How much of them is written.
@@ -162,6 +228,7 @@ impl<K> Answer<K> {
       refusal: None,
       counters: None,
       ends_session: false,
+      choosing: None,
     }
   }
 
@@ -226,21 +293,108 @@ impl<K> Answer<K> {
     source: K,
     admission: &mut Admission,
   ) -> Result<Answer<K>, Refusal> {
+    let packet = packet_data(framing, admission.left());
     admission
-      .charge(to_u64(MAX_BAND_DATA).saturating_add(to_u64(FRAMED_MOST)))
+      .charge(to_u64(packet).saturating_add(to_u64(framed_most(packet))))
       .map_err(Refusal::PastAdmission)?;
     Ok(Answer {
       pack: Some(Streaming {
         source,
         framing,
         at,
-        data: Vec::with_capacity(MAX_BAND_DATA),
-        framed: Vec::with_capacity(FRAMED_MOST),
+        data: Vec::with_capacity(packet),
+        packet,
+        framed: Vec::with_capacity(framed_most(packet)),
         framed_written: 0,
         closed: false,
       }),
       ..Answer::whole(head)
     })
+  }
+
+  /// An answer of `head`, the sections before a pack, then the pack whose objects `choosing` is still choosing: the two
+  /// packet buffers the pack is framed through charged to `admission` now, as [`Answer::streaming`] charges them.
+  pub(super) fn choosing(
+    head: Vec<u8>,
+    choosing: Choosing,
+    admission: &mut Admission,
+  ) -> Result<Answer<K>, Refusal> {
+    let packet = packet_data(choosing.framing, admission.left());
+    admission
+      .charge(to_u64(packet).saturating_add(to_u64(framed_most(packet))))
+      .map_err(Refusal::PastAdmission)?;
+    Ok(Answer {
+      choosing: Some(Box::new(Choosing { packet, ..choosing })),
+      ..Answer::whole(head)
+    })
+  }
+
+  /// Steps the choice of the pack's objects within `spent` ([`Answer::write_within`]), the repository lent for the step;
+  /// once it ends, the pack's source begun from the plan it made.
+  fn choose<P: PackSource<Pack = K>>(
+    &mut self,
+    served: &Served<'_>,
+    packs: &mut P,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) {
+    let Some(choosing) = self.choosing.as_mut() else {
+      return;
+    };
+    let graph = StoreGraph::new(served.repository, served.store, served.refs);
+    let stepped = choosing.negotiating.step(&graph, admission, spent);
+    if let Some(fault) = graph.fault() {
+      return self.abandon(Refusal::Store(fault));
+    }
+    let outcome = match stepped {
+      Err(refusal) => return self.abandon(Refusal::Negotiation(refusal)),
+      Ok(None) => return,
+      Ok(Some(outcome)) => outcome,
+    };
+    self.counters = Some(outcome.counters);
+    let Some(choosing) = self.choosing.take() else {
+      return;
+    };
+    let NegotiatedAnswer::Pack(pack) = outcome.answer else {
+      return;
+    };
+    let plan = PackPlan {
+      runs: &pack.runs,
+      objects: &pack.objects,
+      filter: choosing.filter.as_ref(),
+      thin: choosing.thin,
+      ofs_delta: choosing.ofs_delta,
+    };
+    match packs.begin(served, &plan, admission) {
+      Ok(source) => {
+        self.pack = Some(Streaming {
+          source,
+          framing: choosing.framing,
+          at: choosing.at,
+          data: Vec::with_capacity(choosing.packet),
+          packet: choosing.packet,
+          framed: Vec::with_capacity(framed_most(choosing.packet)),
+          framed_written: 0,
+          closed: false,
+        });
+      }
+      Err(refused) => {
+        self.choosing = Some(choosing);
+        self.abandon(Refusal::Pack(refused));
+      }
+    }
+  }
+
+  /// Ends the response of a pack whose choice was refused, or whose source could not begin, after the sections before
+  /// it: git's band-3 words where the framing has a band to say them on, else nothing, so the pack is missing; refused
+  /// with `refusal`. Their packet is within what [`Answer::choosing`] charged.
+  fn abandon(&mut self, refusal: Refusal) {
+    if let Some(choosing) = self.choosing.take()
+      && choosing.framing.is_banded()
+    {
+      sideband::write(Band::Error, ABORT, &mut self.head);
+    }
+    self.refusal = Some(refusal);
   }
 
   /// This answer, with how its negotiation went.
@@ -284,10 +438,38 @@ impl<K> Answer<K> {
     out: &mut impl Out,
     room: usize,
   ) -> Written {
+    self.write_within(served, packs, admission, out, room, &mut || false)
+  }
+
+  /// [`Answer::write`], a pack whose objects are still being chosen ([`super::serve_in_turns`]) stepped first until
+  /// `spent` says the owner's quantum is spent, at least one unit a step, the repository lent for the step alone; the
+  /// pack's source begun once the last object is chosen. A choice refused, or a source that cannot begin, after the
+  /// sections before the pack were written ends the response with git's band-3 words for a pack that could not be
+  /// finished, as a pack refused midway ends.
+  pub fn write_within<P: PackSource<Pack = K>>(
+    &mut self,
+    served: &Served<'_>,
+    packs: &mut P,
+    admission: &mut Admission,
+    out: &mut impl Out,
+    room: usize,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Written {
     let put = put_from(&self.head, self.head_written, out, room);
     self.head_written = self.head_written.saturating_add(put);
     if self.head_written < self.head.len() {
       return Written::More;
+    }
+    if self.choosing.is_some() {
+      self.choose(served, packs, admission, spent);
+      return if self.head_written < self.head.len()
+        || self.choosing.is_some()
+        || self.pack.is_some()
+      {
+        Written::More
+      } else {
+        Written::End
+      };
     }
     let Some(streaming) = self.pack.as_mut() else {
       return Written::End;
@@ -337,9 +519,9 @@ impl<K> Streaming<K> {
   ) -> Result<(), Refusal> {
     self.framed.clear();
     self.framed_written = 0;
-    let room = self.framing.data().saturating_sub(self.data.len());
+    let room = self.packet.saturating_sub(self.data.len());
     match packs.write(served, &mut self.source, admission, &mut self.data, room) {
-      Ok(true) if self.data.len() < self.framing.data() => Ok(()),
+      Ok(true) if self.data.len() < self.packet => Ok(()),
       Ok(more) => self
         .frame_data(more)
         .or_else(|refusal| self.end_early(refusal)),

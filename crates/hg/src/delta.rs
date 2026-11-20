@@ -186,6 +186,39 @@ pub fn encode_hunk(hunk: &Hunk<'_>, out: &mut Vec<u8>) -> Result<(), Refusal> {
   Ok(())
 }
 
+/// Appends a delta turning `base` into `text` as one hunk: what lies between their common prefix and their common suffix
+/// replaced (A-729 part 2: a file revision in an import's record against the one before it); none where they are
+/// equal. Linear in their lengths, with no table: the hunk is never shorter than the bytes that changed, and as long as
+/// the span from the first change to the last.
+pub fn encode_span(base: &[u8], text: &[u8], out: &mut Vec<u8>) -> Result<(), Refusal> {
+  let prefix = base
+    .iter()
+    .zip(text)
+    .take_while(|(left, right)| left == right)
+    .count();
+  let room = base.len().min(text.len()).saturating_sub(prefix);
+  let suffix = base
+    .iter()
+    .rev()
+    .zip(text.iter().rev())
+    .take(room)
+    .take_while(|(left, right)| left == right)
+    .count();
+  let (end, kept) = (
+    base.len().saturating_sub(suffix),
+    text.len().saturating_sub(suffix),
+  );
+  if prefix == end && prefix == kept {
+    return Ok(());
+  }
+  let start = u32::try_from(prefix).map_err(|_| Refusal::TooLong {
+    value: to_u64(prefix),
+  })?;
+  let end = u32::try_from(end).map_err(|_| Refusal::TooLong { value: to_u64(end) })?;
+  let data = text.get(prefix..kept).unwrap_or_default();
+  encode_hunk(&Hunk { start, end, data }, out)
+}
+
 /// Appends the delta Mercurial sends for a full text against the null base: one hunk inserting the whole text
 /// (`mdiff.trivialdiffheader`, `changegroup._revisiondeltatochunks`).
 pub fn encode_full_text(text: &[u8], out: &mut Vec<u8>) -> Result<(), Refusal> {

@@ -765,11 +765,11 @@ fn a_push_whose_pack_is_larger_than_one_ring_region_lands_through_the_daemons_ed
 
 /// Shape: the commits of [`long_history`]: as many as git/git's history to v1.0.0 (2,930), whose every clone was refused
 /// for its room.
-const LONG_HISTORY: usize = 3_000;
+pub(crate) const LONG_HISTORY: usize = 3_000;
 
 /// Stock git's request creating `main` at the last of `commits` commits in one line, each changing the one file, and that
 /// commit: three objects a commit.
-fn long_history(commits: usize) -> (Vec<u8>, ObjectId) {
+pub(crate) fn long_history(commits: usize) -> (Vec<u8>, ObjectId) {
   let (request, made) = long_history_refs(commits, 0);
   (request, made.last().copied().expect("a commit"))
 }
@@ -845,7 +845,7 @@ fn a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemon
 }
 
 /// A v2 `fetch` of `want` with `done` and no progress, as `git clone` asks for a branch's commit.
-fn fetch_of(want: ObjectId) -> Vec<u8> {
+pub(crate) fn fetch_of(want: ObjectId) -> Vec<u8> {
   let mut request = Vec::new();
   pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
   pktline::write(Packet::Delim, &mut request).expect("the delimiter");
@@ -902,7 +902,7 @@ const PACK_ROOM: u64 = 1 << 26;
 
 /// The data packets of `bytes` from `at` to the first flush, each whole, and where that flush ends; bytes that end
 /// before one fail the test.
-fn packets_from(bytes: &[u8], mut at: usize) -> (Vec<Vec<u8>>, usize) {
+pub(crate) fn packets_from(bytes: &[u8], mut at: usize) -> (Vec<Vec<u8>>, usize) {
   let mut lines = Vec::new();
   loop {
     let rest = bytes.get(at..).unwrap_or_default();
@@ -918,7 +918,7 @@ fn packets_from(bytes: &[u8], mut at: usize) -> (Vec<Vec<u8>>, usize) {
 }
 
 /// The ids of the objects `pack` holds, read whole as git's index-pack reads one, in name order.
-fn ids_in(pack: &[u8]) -> Vec<String> {
+pub(crate) fn ids_in(pack: &[u8]) -> Vec<String> {
   let mut admission = Admission::new(PACK_ROOM);
   let unpacked = unpack::read_whole(pack, GitFormat::Sha1, &NoIndex, &mut admission);
   let unpacked = unpacked.expect("a whole pack");
@@ -932,7 +932,7 @@ fn ids_in(pack: &[u8]) -> Vec<String> {
 }
 
 /// The pack a protocol v2 `fetch` answer carries: its `packfile` section's band-1 data, joined.
-fn fetched_pack(answer: &[u8]) -> Vec<u8> {
+pub(crate) fn fetched_pack(answer: &[u8]) -> Vec<u8> {
   let (lines, _) = packets_from(answer, 0);
   let (section, packets) = lines.split_first().expect("a section");
   assert_eq!(section.as_slice(), b"packfile\n", "{answer:?}");
@@ -1359,6 +1359,65 @@ fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons
     .position(|window| window == &large[..64])
     .expect("the file's bytes");
   assert_eq!(payload.get(found..found + large.len()), Some(large));
+}
+
+/// A-745 (§4.17.1 "A fetch's answer"; found by use, w-interop: `clone --stream` of Mercurial's own history refused
+/// `PastAdmission`). Do: start a two-shard daemon whose edge serves loopback TLS, each request admitted one ring region;
+/// push one changeset whose one file is twice that room; then ask `stream_out` as `hg clone --stream` asks it. Expect
+/// `200` in `application/mercurial-0.1`, the answer `0` and its counts, and the file's revlog carrying its bytes whole:
+/// the revlogs sent a row at a time, never rendered whole within one request's room.
+#[test]
+fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let room = super::bounds_of(&crate::DaemonConfig::derive(
+    &crate::daemon::test_profile(),
+    &instance,
+    Some(SHARDS),
+  ))
+  .room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let mut state = 0x6a09_e667_f3bc_c908u64;
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|_| {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      state.to_be_bytes()[0] | 1
+    })
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let (port, certificate) = edge;
+  let request = format!(
+    "GET /{name}?cmd=stream_out HTTP/1.1\r\nHost: localhost\r\nAccept: application/mercurial-0.1\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  let streamed = typed_exchange(port, certificate, request.as_bytes());
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(
+    (streamed.0, streamed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&streamed.2[..streamed.2.len().min(200)])
+  );
+  assert!(
+    streamed.2.starts_with(b"0\n"),
+    "{:?}",
+    &streamed.2[..streamed.2.len().min(40)]
+  );
+  let found = streamed
+    .2
+    .windows(64)
+    .position(|window| window == &large[..64])
+    .expect("the file's bytes");
+  assert_eq!(streamed.2.get(found..found + large.len()), Some(large));
 }
 
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP

@@ -2275,6 +2275,7 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "target_leases": s.target_leases,
     "nfs_calls": s.nfs_calls,
     "registry_attachments": s.registry_attachments,
+    "repositories": repositories_json(&s.repositories),
     "telemetry": telemetry.map(telemetry_json),
   })
 }
@@ -2287,6 +2288,43 @@ pub fn signal_json(s: &Signal) -> Value {
     "value": s.value,
     "absence": s.absence.name(),
     "freshness_ns": s.freshness_ns,
+  })
+}
+
+/// Each repository's usage row in `slates status` (A-724), apart so the status object stays within `json!`'s recursion.
+fn repositories_json(repositories: &[slates_ipc::protocol::RepositoryUsageReport]) -> Value {
+  Value::Array(
+    repositories
+      .iter()
+      .map(|r| {
+        json!({
+          "name": r.name,
+          "intakes_begun": r.intakes_begun,
+          "intakes_answered": r.intakes_answered,
+          "intake_steps": r.intake_steps,
+          "intake_step_ns": r.intake_step_ns,
+          "intake_bytes_in": r.intake_bytes_in,
+          "fetches_begun": r.fetches_begun,
+          "fetch_step_ns": r.fetch_step_ns,
+          "first_ns": r.first_ns,
+          "last_ns": r.last_ns,
+          "longest_intake_step_ns": r.longest_intake_step_ns,
+          "push_phases": push_phases_json(r),
+        })
+      })
+      .collect(),
+  )
+}
+
+/// A repository's git push steps by phase in `slates status` (A-724's profile), apart so the status object stays within
+/// `json!`'s recursion.
+fn push_phases_json(r: &slates_ipc::protocol::RepositoryUsageReport) -> serde_json::Value {
+  json!({
+    "longest_ns": r.longest_push_phases_ns,
+    "steps": r.push_phase_steps,
+    "ns": r.push_phase_ns,
+    "gap_ns": r.push_phase_gap_ns,
+    "first_gap_ns": r.push_first_gap_ns,
   })
 }
 
