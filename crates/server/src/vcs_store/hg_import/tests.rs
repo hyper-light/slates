@@ -13,8 +13,8 @@ use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 use slates_vcs::ContentStore;
 
 use super::{
-  ABANDONED, DONE, Finished, ImportFailed, LANDED, LANDING_REFUSED, REFUSED, STARTED, TURNS,
-  Turned, begin, land, run, turn,
+  ABANDONED, DONE, Finished, ImportFailed, Importing, LANDED, LANDING_REFUSED, REFUSED, STARTED,
+  Stage, TURNS, Turned, begin, land, run, turn,
 };
 use crate::hg_base::HgBase;
 use crate::hg_base::tests::{Files, STATES, laid_out};
@@ -214,6 +214,51 @@ fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_import
       count(state, LANDED),
     ];
     assert_eq!(counted, [1, 1, turns, 1]);
+  });
+}
+
+/// A-720 part 3 (found by use, w-perf: `slates repository import` of Mercurial's own repository refused `ImportRefused
+/// { PastRoom { room: 278528 } }`, its room one client region). Do: import the `states` repository a unit a turn,
+/// comparing after each turn the shard's charge for the import with what the import holds, then land it. Expect:
+/// imported and landed; the shard charged exactly what the import held after every turn (its room is only a bound, what
+/// its shard could admit, never reserved whole); and once it landed, the import's charge given back. (The by-use proof,
+/// Mercurial's own repository, is w-perf's run: no fixture here holds more than a page.)
+#[test]
+fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
+  crate::daemon::audit_on_shard(|state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    let mut clock = Ticking(0);
+    let mut charged_turns = 0_u64;
+    let ended = (1..=TURNS_AT_MOST).find_map(|_| {
+      let turned = turn(state, id, (&mut clock, 1));
+      if let Some(Importing {
+        stage: Stage::Running { import, .. },
+        reserved,
+      }) = state.vcs_stores.imports.get(&id)
+      {
+        assert_eq!(
+          *reserved,
+          import.holding(),
+          "the charge is not what the import holds"
+        );
+        charged_turns += u64::from(*reserved > 0);
+      }
+      match turned {
+        Some(Ok(Turned::More)) => None,
+        other => Some(other),
+      }
+    });
+    assert!(
+      matches!(ended, Some(Some(Ok(Turned::Done(_))))),
+      "{ended:?}"
+    );
+    assert!(
+      charged_turns > 1,
+      "the import was charged on {charged_turns} turns"
+    );
+    assert_eq!(land(state, id), Ok(()));
+    check_settled(state, id);
   });
 }
 
