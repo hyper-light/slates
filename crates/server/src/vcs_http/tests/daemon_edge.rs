@@ -87,6 +87,14 @@ fn daemon(identity: EdgeIdentity) -> Daemon {
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`, or serving
 /// cleartext without one, and its instance's name, which its edge's realm names (`slates <instance>`).
 fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
+  daemon_configured(identity, |_| {})
+}
+
+/// [`daemon_named`], its configuration changed by `configure` before it starts.
+fn daemon_configured(
+  identity: Option<EdgeIdentity>,
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+) -> (Daemon, String) {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -99,6 +107,7 @@ fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
     address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
     identity,
   });
+  configure(&mut config);
   let daemon = Daemon::start(
     &profile,
     config,
@@ -806,7 +815,8 @@ fn long_history_refs(commits: usize, branches: usize) -> (Vec<u8>, Vec<ObjectId>
     .map(|(kind, bytes)| (*kind, bytes.as_slice()))
     .collect();
   let mut request = Vec::new();
-  let line = format!("{ZERO} {last} refs/heads/main\0 report-status");
+  // Stock git's capabilities (A-722's keepalive: the answer multiplexed, so the edge can keep it alive while it is made).
+  let line = format!("{ZERO} {last} refs/heads/main\0{CAPABILITIES}");
   pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
   for branch in 0..branches {
     let at = made[branch * commits / branches.max(1)];
@@ -858,6 +868,44 @@ pub(crate) fn fetch_of(want: ObjectId) -> Vec<u8> {
   }
   pktline::write(Packet::Flush, &mut request).expect("the flush");
   request
+}
+
+/// Shape: the commits of [`a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`]'s push: enough
+/// that its answer takes many turns.
+const KEPT_ALIVE_HISTORY: usize = 300;
+
+/// A-722's keepalive (the load-only edge tests: a long push's answer wrote nothing until its report, and the client's
+/// read gave up on the silence at a load of 56 to 67; git's receive-pack writes `0005\1` every `receive.keepAlive`
+/// while it processes a push under side-band-64k). Do: start a daemon whose keepalive interval is none; push a history
+/// of [`KEPT_ALIVE_HISTORY`] commits under side-band-64k over its edge. Expect: `200`; the answer begun with git's
+/// keepalive, and its report whole after the keepalives (`unpack ok`, `ok refs/heads/main`).
+#[test]
+fn a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report() {
+  let (identity, certificate) = identity();
+  let (daemon, _) = daemon_configured(Some(identity), |config| config.git_keepalive_ns = 0);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (request, _) = long_history(KEPT_ALIVE_HISTORY);
+  let (status, answer) = pushed((port, &certificate), &name, &request);
+  daemon.stop();
+  assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+  let keepalive = b"0005\x01";
+  assert!(
+    answer.starts_with(keepalive),
+    "{}",
+    String::from_utf8_lossy(&answer)
+  );
+  let mut rest = answer.as_slice();
+  while let Some(after) = rest.strip_prefix(keepalive.as_slice()) {
+    rest = after;
+  }
+  let report = String::from_utf8_lossy(rest);
+  assert!(
+    report.contains("unpack ok") && report.contains("ok refs/heads/main"),
+    "{report}"
+  );
 }
 
 /// A-713 (found by use, 2026-11-20: with git/git cut at v1.0.0, 2,930 commits in a 3.4 MB pack, the push landed and every
@@ -1754,6 +1802,10 @@ fn create_svn_hooked(
   name: &str,
   hooks: Vec<(slates_ipc::protocol::HookPointName, String)>,
 ) {
+  // A hook is shown its repository beneath the root mount the daemon published (A-645 P3).
+  daemon
+    .record_root_mount(std::path::Path::new(crate::vcs_svn::tests::TEST_ROOT))
+    .expect("the root mount recorded");
   let name = name.to_owned();
   let replies = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
     let created = crate::verbs::dispatch(
@@ -1999,7 +2051,7 @@ fn a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them() {
       .collect()
   };
   let (started, precommitted) = (lines("start.args"), lines("pre.args"));
-  let repos = format!("/{name}");
+  let repos = format!("{}/{name}", crate::vcs_svn::tests::TEST_ROOT);
   assert_eq!(
     (
       (posted, put, merged),
@@ -2063,4 +2115,64 @@ fn a_dav_lock_runs_pre_lock_and_its_refusal_answers_the_lock() {
       && body.contains("Lock blocked by pre-lock hook (exit code 1) with output:\nno locks here"),
     "{status}: {body}"
   );
+}
+
+/// Shape: the blobs a partial clone's checkout fetches lazily in one request, as `git clone --filter=blob:none` asks
+/// for every blob of its checkout: two thousand, as w-interop's matrix source checked out.
+const LAZY_BLOBS: usize = 2_000;
+
+/// A v2 `fetch` as git's promisor fetch asks for missing objects (`promisor-remote.c` `fetch_objects`: `git fetch
+/// --filter=blob:none --stdin` with the no-op negotiator): a `want` for each of `ids`, the filter, no haves, `done`.
+fn lazy_fetch_of(ids: &[ObjectId]) -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  let mut arguments: Vec<String> = ids.iter().map(|id| format!("want {id}\n")).collect();
+  arguments.extend([
+    "filter blob:none\n".to_owned(),
+    "no-progress\n".to_owned(),
+    "done\n".to_owned(),
+  ]);
+  for argument in arguments {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// A-745 (found by use: w-interop's stock-git matrix, rows partial-clone and partial-blame, r103 on 36c6ed55d and r110
+/// on 944588f6a, and w-bugs' own run of the matrix on 612 commits over 2,000 files: `git clone --filter=blob:none` exited
+/// 128, "could not fetch <blob> from promisor remote", its checkout's lazy fetch refused `upload-pack: the request needs
+/// more room than the server admits`). Do: push a line of [`LONG_HISTORY`] commits through the daemon's edge, each
+/// request admitted one ring region; then fetch [`LAZY_BLOBS`] of its blobs as git's promisor fetch asks for a
+/// checkout's missing blobs. Expect: the fetch `200`, a packfile section holding every blob asked: a fetch's answer is
+/// admitted a slice at a time, never sized by its whole request.
+#[test]
+fn a_partial_clones_lazy_fetch_of_many_blobs_is_answered_over_the_daemons_edge() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, _) = long_history(LONG_HISTORY);
+  let created = pushed(edge, &name, &request);
+  let blobs: Vec<ObjectId> = (0..LAZY_BLOBS)
+    .map(|at| git_name(Kind::Blob, format!("line {at}\n").as_bytes()))
+    .collect();
+  let fetched = uploaded(edge, &name, &lazy_fetch_of(&blobs));
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  let answer = String::from_utf8_lossy(
+    fetched
+      .1
+      .get(..fetched.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert_eq!(fetched.0, 200, "{answer}");
+  assert!(answer.starts_with("000dpackfile\n"), "{answer}");
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), LAZY_BLOBS);
 }

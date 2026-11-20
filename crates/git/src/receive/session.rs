@@ -365,6 +365,18 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     self.state = State::Checking(Checking::fscked(request, Some(unpacked)));
   }
 
+  /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read: what lets the edge
+  /// send git's keepalive while the push is answered (A-722's keepalive, git's `receive.keepAlive`).
+  pub fn side_band(&self) -> bool {
+    let request = match &self.state {
+      State::Pack { request, .. } | State::Resolving { request, .. } => Some(request),
+      State::Checking(checking) => Some(checking.request()),
+      State::Checked(checked) => Some(&checked.request),
+      State::Request(_) | State::Done => None,
+    };
+    request.is_some_and(|request| request.requested.side_band_64k)
+  }
+
   /// Whether the pack's checks are still to make: its waiting deltas still resolving, or its checks under way.
   pub fn is_checking(&self) -> bool {
     matches!(self.state, State::Resolving { .. } | State::Checking(_))

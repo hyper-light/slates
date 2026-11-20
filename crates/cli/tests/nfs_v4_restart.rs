@@ -172,12 +172,12 @@ fn nfsv4_opens_and_locks_survive_a_daemon_restart() {
     String::from_utf8_lossy(&output.stderr).replace(&capability, "<capability>")
   );
 
-  held_file_survives_restart(&mut client, &mount.0);
+  held_file_survives_restart(&mut client, &mount.0, &anchor);
 }
 
 /// Opens and locks a file, restarts the daemon, and checks the open and the lock carried over.
 #[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
-fn held_file_survives_restart(client: &mut slates_client::Client, root: &Path) {
+fn held_file_survives_restart(client: &mut slates_client::Client, root: &Path, anchor: &Anchor) {
   use rustix::fs::{FlockOperation, flock};
   let path = root.join("journal");
   let mut held = std::fs::OpenOptions::new()

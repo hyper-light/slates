@@ -12293,6 +12293,7 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
 > landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
 > revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
+> The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
 mirrored).** One server serves tens of thousands of concurrent clones, many of one repository, so an answer is held to
@@ -55738,6 +55739,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722's keepalive — A long push's answer writes git's keepalive while it is made (2026-11-20, w-git for UI goal 93; main's order: the two load-only edge tests)
+- **Why.** Over the HTTP edge a push's answer was made whole in the exchange's `body_end` and written only after it, so a
+  long push wrote nothing until its report: at a load of 56 to 67 the long-history edge tests' client gave up reading
+  after its 10 s wait. git's receive-pack writes `0005\1` (an empty band-1 packet) every `receive.keepAlive`, 5 s by
+  default, while it processes a pack under side-band-64k.
+- **Change.** `vcs_http::git::receive`: under side-band-64k a push is answered in `body_end` until its answer would have
+  been silent for `DaemonConfig::git_keepalive_ns` (`GIT_KEEPALIVE_NS`, git's 5 s), then in the reply's turns with
+  git's keepalive written whenever as long passes with nothing else to write; `Exchange::reply` is handed the client's
+  going (`ClientGone`) as `body_end` is, so a hook run in the reply's turns ends with its client. A push without
+  side-band is answered whole as before, and a refusal before any reply still answers with a status. The edge tests'
+  long-history requests now ask stock git's capabilities (`report-status-v2 side-band-64k ...`).
+- **Owed.** The silence before the reply begins: the edge's engine writes the status only once the body is read, while
+  git's `http-backend` writes its head before it reads the body, so a long pack's decode after the client's last byte
+  is silent (the two long-history tests still meet their 10 s read wait at a load of 40 to 50). The status written at
+  the head on a streamed route is an `http-edge` change (proposed to main).
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`
+  (a daemon whose interval is none: the answer begins with `0005\1`, its report whole after the keepalives);
+  `slates-server --lib -- vcs_http:: git_push:: vcs_ssh::` 156 passed, the two long-history tests (owed above) and
+  `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit` failing (its commit's texts not
+  made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
+  this Mac, local).
+
 ### A-722 part 4g — A replayed record's moves are admitted an object a turn (bug, 2026-11-20, w-git for UI goal 93; main's report: a restarted daemon recovering git/git's v2.0.0 spun and was killed again)
 - **Found by use.** r110 (w-interop, git v2.0.0): every daemon restarted after the push spun in A-662's recovery of the
   pushed repository (`daemon.rs` `spawn_alone`) and the watchdog killed it again, 7 of 27 steps answered.
@@ -55971,8 +55994,25 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `svnadmin verify` passes the view, `svnadmin dump` and `--deltas` give `full.dump` and `deltas.dump` byte for byte,
   `svnlook changed` gives `changed.txt`, and `svnlook -t` reads each work as `-r` reads its revision. The A/B against
   P1's whole texts is in BENCHMARKS.md (128 and 460 times fewer view bytes, reads 8 and 27 times faster).
-- **Owed.** P3 (the presenter under SLATES_ROOT, after A-727 a2: the hook drivers handing the view's path as REPOS),
-  P4, the root mount's publication.
+- **Part 3, its second piece (2026-11-20, main's ruling 1): a hook is shown its repository beneath the root mount the
+  daemon published, and refused, typed, before there is one.** No configured value: the daemon's own record of the
+  root mount it published (`ShardState::root_mount`, written on every shard by `Daemon::record_root_mount`, which the
+  root mount's publication calls, A-645 (a), owed). Subversion's hooks (svn://, svn+ssh://, DAV) are given REPOS
+  `<root mount>/<repository>`; before publication a configured hook is never started and its point is refused
+  `SVN_ERR_UNSUPPORTED_FEATURE` "This server cannot run this repository's hooks: its root mount is not yet published"
+  (post-commit's `post-commit-err` too). The fallback REPOS `/<name>`, a path that held nothing, is gone (banned item 7).
+  A git push whose repository configures a hook is refused `root mount not yet published` before publication, and `hook
+  not run` after while nothing yet shows its view. The tunnel reads the root through its stores
+  (`vcs_ssh::svn::SvnStores::root_mount`), the listener and the DAV site from the shard. Red first:
+  `vcs_svn::tests::a_hook_before_the_root_mount_is_published_is_refused_typed` (the hook ran with REPOS `/<name>`; now
+  refused, never run, revision 0) and the git push test's refusal (`hook not run` before; now `root mount not yet
+  published`, and `hook not run` after publication); every hook test that runs a hook publishes a root and holds REPOS to
+  it. macOS arm64, main 359da238: `slates-server --lib` vcs_svn, vcs_ssh, vcs_http, git_push, git_hooks, svn_hooks,
+  hook_driver, vcs_hooks 227 of 228, the one failure `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_
+  lands_a_stock_commit` ("The commit's texts were not made durable: Unanswered"), which fails alike on main 359da238
+  without this change.
+- **Owed.** P3's presenter (the view a hook runs in, under the root mount, once the vfs's referenced file is agreed with
+  w-perf, main's ruling 2), P4, the root mount's publication (A-645 (a)).
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -56694,6 +56734,17 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   41 ns given the identity; each 64 KiB slice 27 / 34 us (`measure_the_holders_take_turn`). Tests:
   `a_holder_hashing_an_entry_in_slices_admits_what_the_hashing_guard_admits`; the fleet large-delta test holds the
   holders to at least a page a turn under the cut quantum, red before (0 turns).
+- **Part 5 (install images).** The record-plane coordinator's longest polls (185 to 312 ms of CPU, debug under
+  `taskpolicy -b`) were `refresh_image` sealing a 3 MiB volume's whole image in the record period's one turn. A sealed
+  image of more than one piece (`sealed_in_pieces`) is now an `ImageBuild`: the plain body captured at the shipper's head
+  in the turn that owed it (A-377's memcpy a byte), sealed a piece a turn at the measured rate (`piece_bytes`) by a task
+  of the shard (counted `fleet.live.image_builds`, `fleet.live.image_build_turns`), and made the install image
+  (`install_image`, the old tail of `refresh_image`) only if the head is still the one it was captured at; a moved head,
+  a fence or an owed whole record drops it (`fleet.live.image_stale`) and the image stays owed. While one builds, no
+  other is begun and installs wait, as they did for an owed image. Test: `slates-cli` live_fleet
+  `a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns` (a 3 MiB file, a candidate
+  stopped while it is overwritten, then resumed), red before (the image made in one turn), 65 turns after with one stale
+  build dropped and made again.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
 
@@ -56708,10 +56759,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Part 2, the build in turns.** `slates_merge::push::Building` owns a build across turns and borrows the green and
   the objects for one ([`Building::advance`]): the walk an entry of a tree a unit (`Comparing`: each side's listing
   named, then each name), the base a named path a unit (`Green::base_entries`, read at the push's base version, which
-  no later version changes), the composition, the post-state an operation or 64 KiB of zeros a unit, the identity a
-  piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or 64 KiB of the post-state a unit.
+  no later version changes), the composition, the post-state an operation or a copy slice of zeros a unit, the
+  identity a piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or a hash slice of the
+  post-state a unit. The slices are the owner's, derived from its measured memcpy and BLAKE3 rates and the quantum
+  (`pace::Slices`; the server's `copy_slice_bytes_within`, `archive_slice_bytes_within`; R3, main's 10:29 ruling).
   `build` is a `Building` run in one call. The deriver is `async` (R6): `compose_paced`'s every loop awaits a tick,
-  its sorts are a paced stable merge sort (`pace::sort_by`), its base lookups indexed (`BaseIndex`), so no unit is
+  its sorts are a paced stable merge sort of the input's own non-decreasing runs
+  (`pace::sort_by`, no tuned run length), its base lookups indexed (`BaseIndex`), so no unit is
   O(files); `compose_volume_planned` is its one-poll facade, one implementation. A `Pace` holds the turn's deadline
   and the owner's clock (a function: the merge engine reads no clock of its own); the first unit of a turn always
   runs; the composition is polled through `Pace::drive`, which lends the turn to the thread for that poll (a `Copy`
@@ -56840,3 +56894,15 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   4.9 ms, the best within a heartbeat). Red with the waiter never attached: each waited out the liveness budget, about
   1.02 s. Fleet `a_forwarded_submit` and `a_holder`; `slates-server --lib merge_service:: verbs:: xshard:: work_home`;
   fmt clean.
+
+### A-762 — The dump exporter reads a text a bounded step a call (2026-11-20, w-svn for UI goal 93; main's item 2; §4.17.1 "A fetch's answer", rule 3)
+
+- Found by reading: c2's exporter `load` rebuilt a text through its whole delta chain in one call. Measured (debug): a
+  512 KiB text with a chain of 6, the longest export call 6.18 ms against a whole read of 6.04 ms.
+- `TextSource::read_step` with `migration::TextReading`: the records rebuild a chain one svndiff window a step, its
+  first delta first; `svn_texts::HeadTexts` reads a stored text a store window a step (`ContentStore::window_at`) and a
+  green's held text a window's room a step. The exporter's call whose texts are not whole takes one step and writes
+  nothing; its cache holds a delta's two texts and the one being read.
+- Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read; red before) and
+  `a_stored_text_is_read_a_store_window_a_step`.
+- **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.
