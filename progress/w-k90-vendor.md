@@ -94,3 +94,12 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
     write_within with their quantum (they already step write per turn); admission = the request's room (revert A-713's
     StoreLender::room); red BY USE first: daemon_edge clone of a long history whose pack is past one request's room,
     over HTTP and over SSH. Owed after: v0 in turns, begin's ready/cut + include-tag scan in units, rule 4 generation.
+ P3a LANDED slates main 57ea648f..5a93963f: Held hybrid (runs or bit table, Roaring), Paint::chosen -> Held;
+    answer::packet_data (packets <= room/4 as the pack begins). Found by use: 64 KiB per request -> 3,000-commit clone
+    refused "needs more room" (framing asked 131,106 after a 2.7 KB walk); with 3a answered whole.
+    adas-mac-studio-2 (b24c) stopped answering kiln ~05:4x; MacBook Pro-2 (e30189) pushes over HTTPS
+    (clone ~/.cache/w-k90-vendor-slates-push there).
+ NEXT P3b (server): UploadServices::new(lender, room) (room from daemon_edge site) and SSH UploadCommand given
+    ToolServices.room; admission = min(request room, StoreLender::room); serve_in_turns + write_within with
+    PackSource::turn() (new provided method; ShardPacks overrides with the shard clock + quantum); by-use tests: HTTP
+    long-history clone (existing A-713 test now at the request room) + an SSH long-history clone (new).
