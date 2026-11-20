@@ -247,3 +247,8 @@
   no one owns. verify_current and the NFS purge are already fixed (bug-claims.md struck); the completion record's
   framing is g262's; the svnserve_t red is A-761's (w-svn told). The jupiter fleet six are filed in run-requests.md.
   Asked main which to take.
+- 2026-11-20 pieces from main (w-interop's stock-git matrix): (2) partial clone FIXED: 4136fcd89 (the HTTP fetch's
+  answer gets its own room) and edbc3838c (decoded lines and lists given back), merged 514500813; red tests in
+  daemon_edge (2,000 then 2,900 blobs); local matrix 25/27 -> 27/27. (1) deepen: not reproduced locally (passes on a
+  612-commit source and on a merge-heavy test history); asked w-interop for the log at 514500813; suspected cause the
+  scattered plan's runs (A-745's owed item).
