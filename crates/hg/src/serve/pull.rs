@@ -7,7 +7,8 @@
 //! head that is no ancestor of a common revision, oldest first. One walk finds it: down the revisions from the newest
 //! named, each marked as reached from a head, from a common revision or both, those reached from a head alone being
 //! missing, until no revision reached from a head alone is left below (7.2's `missingancestors`); its marks are a byte
-//! for each revision of the view, charged first.
+//! for each revision of the view, charged first and let go once the walk ends. What the walk finds is kept as ranges of
+//! revisions ([`Ranges`], A-745: a full clone's is one range, a pull's a few), never a list of every revision.
 //!
 //! **Phases** (`_getbundlephasespart`): a publishing repository sends every head public. Another sends each head in its
 //! own phase, and with draft heads also the public heads among what the draft heads hold and the public ones do not
@@ -49,6 +50,67 @@ const FROM_COMMON: u8 = 1 << 1;
 /// Format: a revision found missing.
 const MISSING: u8 = 1 << 2;
 
+/// Revisions as ascending, disjoint ranges, none adjacent to the next (A-745, §4.17.1 "A fetch's answer" rule 1): the
+/// changesets a fetch sends, held in the request as a few ranges whatever the history's length.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ranges(Vec<core::ops::Range<Rev>>);
+
+impl Ranges {
+  /// How many revisions the ranges hold.
+  pub fn len(&self) -> u64 {
+    self.0.iter().fold(0_u64, |total, range| {
+      total.saturating_add(u64::from(range.end.saturating_sub(range.start)))
+    })
+  }
+
+  /// Whether they hold none.
+  pub fn is_empty(&self) -> bool {
+    self.0.is_empty()
+  }
+
+  /// Whether they hold `rev`.
+  pub fn contains(&self, rev: Rev) -> bool {
+    let at = self.0.partition_point(|range| range.end <= rev);
+    self.0.get(at).is_some_and(|range| range.start <= rev)
+  }
+
+  /// The first revision they hold at or after `rev`.
+  pub fn next_from(&self, rev: Rev) -> Option<Rev> {
+    let at = self.0.partition_point(|range| range.end <= rev);
+    self.0.get(at).map(|range| range.start.max(rev))
+  }
+
+  /// Every revision they hold, ascending.
+  pub fn iter(&self) -> impl Iterator<Item = Rev> + '_ {
+    self.0.iter().flat_map(Clone::clone)
+  }
+
+  /// Adds `rev`, after every revision held, its one range's room charged to `admission` where it starts a range.
+  fn push(&mut self, rev: Rev, admission: &mut Admission) -> Result<(), crate::PastAdmission> {
+    if let Some(last) = self.0.last_mut()
+      && last.end == rev
+    {
+      last.end = rev.saturating_add(1);
+      return Ok(());
+    }
+    admission.charge_items::<core::ops::Range<Rev>>(1)?;
+    self.0.push(rev..rev.saturating_add(1));
+    Ok(())
+  }
+}
+
+impl FromIterator<core::ops::Range<Rev>> for Ranges {
+  /// Ranges from ascending, disjoint ones, as a caller that knows them gives them.
+  fn from_iter<I: IntoIterator<Item = core::ops::Range<Rev>>>(ranges: I) -> Self {
+    Ranges(
+      ranges
+        .into_iter()
+        .filter(|range| !range.is_empty())
+        .collect(),
+    )
+  }
+}
+
 /// What a `getbundle` sends: its heads, the client's common revisions, and the changesets the client lacks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outgoing {
@@ -57,8 +119,8 @@ pub struct Outgoing {
   /// The client's common nodes the served view holds, oldest first; none stands for the null revision.
   pub common: Vec<Rev>,
   /// The changesets the client lacks: every ancestor of a head (the head too) that is no ancestor of a common
-  /// revision, oldest first.
-  pub missing: Vec<Rev>,
+  /// revision, as ranges (A-745).
+  pub missing: Ranges,
 }
 
 /// Appends `listkeys`'s answer for `namespace` (`wireprotov1server.listkeys`: the namespace's keys sorted, encoded as
@@ -201,10 +263,10 @@ pub fn missing(
   heads: &[Rev],
   common: &[Rev],
   admission: &mut Admission,
-) -> Result<Vec<Rev>, Refusal> {
+) -> Result<Ranges, Refusal> {
   let count = repo.count();
   let Some(top) = heads.iter().chain(common).copied().max() else {
-    return Ok(Vec::new());
+    return Ok(Ranges::default());
   };
   if top >= count {
     return Err(Refusal::Graph { rev: top });
@@ -217,7 +279,6 @@ pub fn missing(
       add_mark(&mut marks, *rev, mark, &mut live);
     }
   }
-  let mut found: usize = 0;
   for rev in (0..=top).rev() {
     if live == 0 {
       break;
@@ -235,7 +296,6 @@ pub fn missing(
       FROM_COMMON
     } else {
       live = live.saturating_sub(1);
-      found = found.saturating_add(1);
       if let Some(slot) = marks.get_mut(usize::try_from(rev).unwrap_or(usize::MAX)) {
         *slot |= MISSING;
       }
@@ -245,13 +305,14 @@ pub fn missing(
       add_mark(&mut marks, parent, reached, &mut live);
     }
   }
-  admission.charge_items::<Rev>(found)?;
-  let mut missing = Vec::with_capacity(found);
-  missing.extend((0..=top).filter(|rev| {
+  let mut missing = Ranges::default();
+  for rev in (0..=top).filter(|rev| {
     marks
       .get(usize::try_from(*rev).unwrap_or(usize::MAX))
       .is_some_and(|mark| mark & MISSING != 0)
-  }));
+  }) {
+    missing.push(rev, admission)?;
+  }
   Ok(missing)
 }
 
@@ -290,10 +351,9 @@ pub fn phase_heads(
   }
   if !draft.is_empty() {
     let only = missing(repo, &draft, &public, admission)?;
-    admission.charge_items::<(Rev, bool)>(only.len())?;
+    admission.charge_items::<(Rev, bool)>(usize::try_from(only.len()).unwrap_or(usize::MAX))?;
     let held: Vec<Rev> = only
       .iter()
-      .copied()
       .filter(|rev| repo.phase(*rev) == Phase::Public)
       .collect();
     let mut parent_of_held = vec![false; held.len()];

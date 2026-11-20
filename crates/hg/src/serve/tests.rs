@@ -521,7 +521,10 @@ proptest! {
     let asked: Vec<Rev> = if heads.is_empty() { naive_heads(&history) } else { heads.iter().copied().collect::<BTreeSet<_>>().into_iter().collect() };
     prop_assert_eq!(&chosen.heads, &asked);
     prop_assert_eq!(&chosen.common, &common.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>());
-    prop_assert_eq!(&chosen.missing, &naive_missing(&history, &asked, &common));
+    prop_assert_eq!(
+      &chosen.missing.iter().collect::<Vec<_>>(),
+      &naive_missing(&history, &asked, &common)
+    );
     prop_assert_eq!(phase_heads_of(&history, &chosen.heads), oracle_phase_heads(&history, &chosen.heads));
     let marks = marks_of(&history);
     let mut expected: Vec<(&[u8], Node)> =
@@ -1008,7 +1011,7 @@ fn unknown_nodes_are_refused_except_common_ones() {
     Outgoing {
       heads: vec![5],
       common: Vec::new(),
-      missing: (0..6).collect()
+      missing: [0..6].into_iter().collect()
     }
   );
 }
