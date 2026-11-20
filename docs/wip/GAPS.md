@@ -741,6 +741,15 @@
 > ra_svn and DAV. Linux x86_64 (adacachy): server lib 630 passed beside main's 624, the glue's five tests new and
 > nothing failing that main's tree passed; each of four choices broken in a copy failed only its own tests; the macOS
 > run owed. Owed: DAV's LOCK and UNLOCK wired (A-661's next part, after g298's serving); the hook times' table.
+> **A-730 part 1 (2026-11-20, w-reaper; A-661 part 2's first calls):** the `svn://` listener runs a repository's
+> start-commit (at `open-root`: REPOS, the user, `mergeinfo` where announced, the transaction), pre-commit (at
+> `close-edit`: REPOS, the transaction, the presented lock tokens' lines as the client sent each path) and post-commit
+> (after the append: REPOS, the revision, the transaction; its failure `commit-info`'s `post-commit-err`) through the
+> driver, held to the hook's learned bound, ended if the client hangs up, the lesson taught to the shard's hook times;
+> where it refused any commit to a repository with a hook configured ("does not run this repository's hooks yet").
+> REPOS is `/<name>` until A-645's read-only FSFS-layout view gives `svnlook` a directory. Windows keeps the refusal
+> (no driver there). Owed: the lock and unlock hooks (part 2), `svn+ssh://` (part 3), the revprop hooks' calls (A-702
+> part 2, w-svn, on this runner), DAV's.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`

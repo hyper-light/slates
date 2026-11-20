@@ -510,3 +510,206 @@ fn read_items_or_word(stream: &mut ClientStream) -> String {
   }
   format!("{}{}", text(&word), read_items(stream, 1))
 }
+
+/// A hook program written as a shell script into `dir`, named for its point, made executable: its path. A hook's
+/// environment is its repository's hooks-env alone (A-623), so the script names every program by its absolute path.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn hook_script(dir: &std::path::Path, point: &str, body: &str) -> String {
+  use std::os::unix::fs::PermissionsExt;
+  let path = dir.join(point);
+  std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("the hook written");
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("made executable");
+  // Run once here, as a hook already in place has run before: macOS assesses an executable at its first run, 0.16 to
+  // 0.29 s for a new script on the Mac Studio, and longer under parallel tests, which is no part of the hook's run.
+  let _ = std::process::Command::new(&path)
+    .env_clear()
+    .current_dir(dir)
+    .output();
+  path.to_string_lossy().into_owned()
+}
+
+/// Configures Subversion repository `name`'s policy, from its first version, to run `hooks` (each a point and its
+/// program), with no hooks-env.
+#[cfg(unix)]
+fn set_svn_hooks(
+  daemon: &Daemon,
+  partition: usize,
+  name: &str,
+  hooks: Vec<(slates_ipc::protocol::HookPointName, String)>,
+) {
+  let name = name.to_owned();
+  let reply = crate::daemon::observe_at(daemon, partition, move |state| {
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::SetRepositoryPolicy {
+        repository: name.clone(),
+        read: 0,
+        rules: Vec::new(),
+        hooks: hooks
+          .iter()
+          .map(|(point, program)| slates_ipc::protocol::HookConfig {
+            point: *point,
+            name: point_name(*point).to_owned(),
+            program: program.clone(),
+          })
+          .collect(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+      },
+    )
+  });
+  assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// The name Subversion gives a hook at `point` (its file's name under `hooks/`), which a hook of the point is named for.
+#[cfg(unix)]
+fn point_name(point: slates_ipc::protocol::HookPointName) -> &'static str {
+  use slates_ipc::protocol::HookPointName as Point;
+  match point {
+    Point::SvnStartCommit => "start-commit",
+    Point::SvnPreCommit => "pre-commit",
+    Point::SvnPostCommit => "post-commit",
+    Point::SvnPreRevpropChange => "pre-revprop-change",
+    Point::SvnPostRevpropChange => "post-revprop-change",
+    Point::SvnPreLock => "pre-lock",
+    Point::SvnPostLock => "post-lock",
+    Point::SvnPreUnlock => "pre-unlock",
+    Point::SvnPostUnlock => "post-unlock",
+    _ => "other",
+  }
+}
+
+/// What a hook script recorded in `dir` under `file`: its lines.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn recorded_lines(dir: &std::path::Path, file: &str) -> Vec<String> {
+  std::fs::read_to_string(dir.join(file))
+    .unwrap_or_default()
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Signs in to a fresh Subversion repository on the other shard's partition whose policy runs `hooks`, and sends stock
+/// `svn` 1.15.0's recorded `mkdir` commit of `/trunk`: the repository's name, the commit's answer (`items` items: five
+/// for a commit made, three for one refused at `open-root`) and the youngest revision then, asked on a second
+/// connection, since a refused commit's client sends `abort-edit`, which the recording does not hold.
+#[cfg(unix)]
+fn commit_under_hooks(
+  items: usize,
+  hooks: impl FnOnce(&str) -> Vec<(slates_ipc::protocol::HookPointName, String)>,
+) -> (String, String, String) {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-hooked-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  set_svn_hooks(&daemon, OTHER, &name, hooks(&name));
+  let root = format!("svn://127.0.0.1:{port}/{name}");
+  let mut signed = sign_in(port, &greeting, &root);
+  // A hook's process is started and reaped within the answer: the client waits ten windows for it.
+  signed
+    .stream
+    .set_read_timeout(Some(Duration::from_nanos(10 * PATIENCE_NS)))
+    .expect("the client's wait");
+  let commit_at = MKDIR_COMMIT
+    .windows(COMMIT_START.len())
+    .position(|window| window == COMMIT_START)
+    .expect("the recorded commit");
+  let committed = asked(&mut signed.stream, &MKDIR_COMMIT[commit_at..], items);
+  let mut other = sign_in(port, &greeting, &root);
+  let latest = asked(&mut other.stream, b"( get-latest-rev ( ) ) ", 2);
+  (name, committed, latest)
+}
+
+/// A-730 (`svn_repos__hooks_start_commit`, `check_hook_result`). Do: configure a start-commit hook that writes to standard
+/// error and exits 1, and send the recorded commit. Expect: the commit refused at `open-root` in `svnserve`'s words,
+/// "Commit blocked by start-commit hook (exit code 1) with output:" and the hook's standard error (E165001), and the
+/// youngest revision still 0. Before A-730 the listener refused any commit to a repository with a hook configured, in
+/// its own words ("does not run this repository's hooks yet"), whatever the hook would have said.
+#[cfg(unix)]
+#[test]
+fn a_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words() {
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let refusing = hook_script(&dir.path, "start-commit", "echo 'not today' >&2\nexit 1");
+  let (_, committed, latest) = commit_under_hooks(3, |_| {
+    vec![(
+      slates_ipc::protocol::HookPointName::SvnStartCommit,
+      refusing,
+    )]
+  });
+  let words = "Commit blocked by start-commit hook (exit code 1) with output:\nnot today\n";
+  assert!(
+    committed.contains("165001") && committed.contains(&format!("{}:{words}", words.len())),
+    "{committed}"
+  );
+  assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 0 ) ) ");
+}
+
+/// A-730 (`hooks.c` and `commit.c`, as A-623 recorded stock `svnserve` 1.15.0's runs). Do: configure a start-commit hook
+/// and a pre-commit hook that each record their arguments (and pre-commit its standard input) and accept, and a
+/// post-commit hook that writes to standard error and exits 1; send the recorded commit. Expect: start-commit given the
+/// repository, the user, `mergeinfo` (the client announced it) and the transaction; pre-commit the repository and the
+/// same transaction, its standard input empty (no lock tokens); the commit made as revision 1, its `commit-info` carrying
+/// post-commit's failure in `svnserve`'s words as `post-commit-err`.
+#[cfg(unix)]
+#[test]
+fn a_commit_over_svn_runs_its_repositorys_commit_hooks_as_svnserve_runs_them() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let start = hook_script(
+    &dir.path,
+    "start-commit",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/start.args"),
+  );
+  let pre = hook_script(
+    &dir.path,
+    "pre-commit",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args\n/bin/cat > {at}/pre.stdin"
+    ),
+  );
+  let post = hook_script(&dir.path, "post-commit", "echo 'post said no' >&2\nexit 1");
+  let (name, committed, latest) = commit_under_hooks(5, |_| {
+    vec![
+      (HookPointName::SvnStartCommit, start),
+      (HookPointName::SvnPreCommit, pre),
+      (HookPointName::SvnPostCommit, post),
+    ]
+  });
+  let started = recorded_lines(&dir.path, "start.args");
+  let precommitted = recorded_lines(&dir.path, "pre.args");
+  let repos = format!("/{name}");
+  assert_eq!(
+    (
+      started.first(),
+      started.get(2).map(String::as_str),
+      started.len(),
+      precommitted.first(),
+      precommitted.get(1),
+      precommitted.len(),
+      recorded_lines(&dir.path, "pre.stdin").len(),
+    ),
+    (
+      Some(&repos),
+      Some("mergeinfo"),
+      4,
+      Some(&repos),
+      started.get(3),
+      2,
+      0
+    ),
+    "start-commit {started:?}, pre-commit {precommitted:?}"
+  );
+  assert!(committed.contains("post said no"), "{committed}");
+  assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 1 ) ) ");
+}
