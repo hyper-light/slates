@@ -168,3 +168,8 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - PLAN once it lands: run `cargo test -p kiln --test slates_e2e container::...` (its drive covers review, drift,
   landing by mode, byte-equality) on a Mac with Docker Desktop (bin over LAN as before), adacachy (TMPDIR off /tmp,
   sized needs), jupiter (needs WinFsp + Docker Desktop + a console-session runner: a person; w-k90-win owns the build).
+
+## 2026-11-20: split agreed with w-k90-a520: it keeps adacachy (A/B + proof); I take the Mac (Docker Desktop) and Windows
+   (jupiter) proofs from main once its route lands (it will message me). Tests to drive, with CONTAINER_E2E=1 SLATES_E2E=1:
+   slates_e2e container::a520_in_a_container_on_its_volume_an_agents_work_is_reviewed_and_landed_by_its_mode and
+   container::a520_in_a_container_a_file_changed_on_disk_after_the_agent_changed_it_is_drift_and_no_landing_writes_over_it.
