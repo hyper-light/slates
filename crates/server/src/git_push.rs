@@ -160,6 +160,10 @@ const REFS: &str = "refs/";
 /// commands a hook could not judge, its view not opened, sealed or shown.
 pub(crate) const HOOK_NOT_RUN: &[u8] = b"hook not run";
 
+/// Slates' words: the reason every command of a push is given while a git hook is configured for its repository and
+/// this daemon has published no root mount to show the hook its view beneath (A-645 P3, main's ruling 1).
+pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"root mount not yet published";
+
 /// Slates' words: the reason every command of a push is given whose objects its repository's store did not admit (the
 /// shard's budget, or an object the store refused).
 pub(crate) const NOT_ADMITTED: &[u8] = b"objects not admitted";
@@ -581,7 +585,7 @@ impl<P> ReceivePack<P> {
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       self.give_back(state);
-      let answering = self.declined(&mut Declining::hook(hook), out)?;
+      let answering = self.declined(&mut Declining::hook(hook, state.root_mount.is_some()), out)?;
       return Ok(Begun::Answering(Box::new(answering)));
     }
     let quarantine = (self.quarantine.take(), self.unadmitted.take());
@@ -1414,8 +1418,19 @@ struct Declining {
 
 impl Declining {
   /// Every command refused while `hook` is configured and nothing here shows its view (module docs,
-  /// "Answering", item 1).
-  fn hook(hook: &HookConfig) -> Declining {
+  /// "Answering", item 1): before this daemon has published its root mount (`root_published` false) in words naming
+  /// that, since a hook is shown its view beneath it (A-645 P3, main's ruling 1); after, `hook not run`.
+  fn hook(hook: &HookConfig, root_published: bool) -> Declining {
+    if !root_published {
+      let why = format!(
+        "the repository's {} hook cannot run here: this daemon's root mount is not yet published",
+        hook.name
+      );
+      return Declining {
+        reason: ROOT_UNPUBLISHED,
+        why: why.into_bytes(),
+      };
+    }
     let why = format!(
       "the repository's {} hook cannot run here yet: its view of the push is not served",
       hook.name
@@ -1734,8 +1749,14 @@ impl ServerJudge<'_> {
       preparing,
       ..
     } = self;
-    let budget = state.config.step_quantum_ns() / 2;
+    let quantum = state.config.step_quantum_ns();
+    let budget = quantum / 2;
     let deadline = began.saturating_add(budget);
+    // A unit's bytes: the shard's copy and hash slices, derived from its measured memcpy and BLAKE3 rates (R3).
+    let slices = slates_merge::pace::Slices {
+      copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),
+      hash_bytes: state.config.archive_slice_bytes_within(quantum).max(1),
+    };
     let built = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
         return Ok::<bool, Declined>(true);
@@ -1755,6 +1776,7 @@ impl ServerJudge<'_> {
         pushed,
         preparing,
         (slates_rt::futures::now_ns, began, deadline),
+        slices,
       );
       Ok(built)
     })

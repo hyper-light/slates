@@ -204,3 +204,66 @@ fn a_large_texts_replayed_windows_are_made_with_no_step_past_its_budget() {
     }
   }
 }
+
+/// A history of `/trunk/big` holding 10,000 files (100 revisions of 100) and `/branches`, then one revision copying
+/// `/trunk/big` to `/branches/big`: in `history.txt`'s grammar, the copy its last revision.
+fn large_copy_history() -> String {
+  let date = "2026-01-01T00:00:01.000000Z";
+  let mut history =
+    format!("\nrevision alice {date}\nmkdir trunk\nmkdir trunk/big\nmkdir branches\n");
+  for revision in 0..100 {
+    history.push_str(&format!("\nrevision alice {date}\n"));
+    for file in 0..100 {
+      let number = revision * 100 + file;
+      history.push_str(&format!(
+        "put trunk/big/f{number:05}.txt file {number}\\n\n"
+      ));
+    }
+  }
+  history.push_str(&format!(
+    "\nrevision alice {date}\ncp 101 trunk/big branches/big\n"
+  ));
+  history
+}
+
+/// A-759, main's red for the replay drive's `add_subdir`: a copied directory listed through the index's cursor, held by
+/// entries per step, which contention cannot blur. Do: replay the revision copying a 10,000-entry `/trunk/big` to
+/// `/branches/big` with the low-water mark at that revision, so the copy is added whole, a step a call. Expect: no
+/// step lists more than `LIST_STEP` entries, and the copy's additions are exactly the source's 10,000 names in order.
+/// Red before the change: the copy's whole listing was one step.
+#[test]
+fn a_copied_large_directory_is_added_whole_a_few_entries_a_step() {
+  use crate::report::drive::green::repository_from;
+  use crate::report::drive::{Call, LIST_STEP, take_most_listed};
+  let (index, green) = repository_from(&large_copy_history());
+  let copy = index.youngest();
+  let names: Vec<String> = index
+    .children("/trunk/big", copy - 1)
+    .unwrap()
+    .unwrap()
+    .into_iter()
+    .map(|name| format!("branches/big/{name}"))
+    .collect();
+  assert_eq!(names.len(), 10_000);
+  let mut replay = Replay::new(copy, "/", copy, false);
+  let (mut most, mut added) = (0usize, Vec::new());
+  take_most_listed();
+  loop {
+    let next = replay.next_within((&index, &green), None, 1).unwrap();
+    most = most.max(take_most_listed());
+    match next {
+      Stepped::Ended => break,
+      Stepped::Call(Call::Add { path, .. }) if path.starts_with("branches/big/") => {
+        added.push(path.to_owned());
+      }
+      _ => {}
+    }
+  }
+  assert!(
+    added == names,
+    "the copy's additions: {} of {}",
+    added.len(),
+    names.len()
+  );
+  assert!(most <= LIST_STEP, "a step listed {most}");
+}

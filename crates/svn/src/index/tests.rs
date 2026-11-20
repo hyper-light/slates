@@ -1040,6 +1040,39 @@ fn a_transaction_name_outside_what_svn_fs_h_promises_is_refused() {
   assert_eq!(index.transaction(2).unwrap(), Some("41-Zz.9"));
 }
 
+/// The entries `record` would make `index` hold: what its plan with no room is refused naming.
+fn needed_by(index: &Index, record: RevisionRecord) -> usize {
+  match index.plan(record, 0).unwrap_err() {
+    IndexRefusal::Room { needed, .. } => needed,
+    other => panic!("{other:?}"),
+  }
+}
+
+/// A deletion, which changes its parent's map, needs more than its own entries past `needed`: refused one entry short
+/// of them, accepted with exactly them.
+fn assert_a_deletion_refused_one_entry_past_its_room(index: &mut Index, needed: usize) {
+  let deletion = RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: vec![deleted("/trunk/README", NodeKind::File)],
+  };
+  let after_deletion = needed_by(index, deletion.clone());
+  assert!(
+    after_deletion > needed + 2 + 1,
+    "the maps uncharged: {after_deletion}"
+  );
+  assert_eq!(
+    index
+      .append(deletion.clone(), after_deletion - 1)
+      .unwrap_err(),
+    IndexRefusal::Room {
+      needed: after_deletion,
+      room: after_deletion - 1
+    }
+  );
+  assert_eq!(index.append(deletion, after_deletion).unwrap(), 3);
+  assert_eq!(index.entries(), after_deletion);
+}
+
 /// A-553 (§2 ban 8: every structure has a bound and a typed refusal at it), with A-759's maps charged: a revision
 /// that would take the index past the room its caller gives, by one entry, is refused and changes nothing; the same
 /// revision with exactly the room it needs is accepted. The edit makes four node-revisions (the file, its two
@@ -1048,10 +1081,6 @@ fn a_transaction_name_outside_what_svn_fs_h_promises_is_refused() {
 #[test]
 fn an_index_that_would_outgrow_its_room_is_refused_one_entry_past_it() {
   let mut index = trunk();
-  let needed_by = |index: &Index, record: RevisionRecord| match index.plan(record, 0).unwrap_err() {
-    IndexRefusal::Room { needed, .. } => needed,
-    other => panic!("{other:?}"),
-  };
   let record = || RevisionRecord {
     transaction: TRANSACTION.to_owned(),
     changes: vec![edit("/trunk/lib/a.c", 3)],
@@ -1071,26 +1100,7 @@ fn an_index_that_would_outgrow_its_room_is_refused_one_entry_past_it() {
   assert_eq!(format!("{index:?}"), before);
   assert_eq!(index.append(record(), needed).unwrap(), 2);
   assert_eq!(index.entries(), needed);
-  let deletion = RevisionRecord {
-    transaction: TRANSACTION.to_owned(),
-    changes: vec![deleted("/trunk/README", NodeKind::File)],
-  };
-  let after_deletion = needed_by(&index, deletion.clone());
-  assert!(
-    after_deletion > needed + 2 + 1,
-    "the maps uncharged: {after_deletion}"
-  );
-  assert_eq!(
-    index
-      .append(deletion.clone(), after_deletion - 1)
-      .unwrap_err(),
-    IndexRefusal::Room {
-      needed: after_deletion,
-      room: after_deletion - 1
-    }
-  );
-  assert_eq!(index.append(deletion, after_deletion).unwrap(), 3);
-  assert_eq!(index.entries(), after_deletion);
+  assert_a_deletion_refused_one_entry_past_its_room(&mut index, needed);
 }
 
 /// A-553: a node-revision another index made, or none made, is refused as `SVN_ERR_FS_ID_NOT_FOUND`; a relation to

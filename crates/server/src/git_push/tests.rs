@@ -17,7 +17,7 @@ use slates_ipc::protocol::{
   PolicyRule, PolicyWho, ReplyBody, RequestBody, VcsTool,
 };
 
-use super::{AGENT, Answering, HOOK_NOT_RUN, ReceivePack, Unpresented};
+use super::{AGENT, Answering, HOOK_NOT_RUN, ROOT_UNPUBLISHED, ReceivePack, Unpresented};
 use crate::state::ShardState;
 use crate::verbs::dispatch;
 
@@ -473,6 +473,26 @@ fn t_a654_stock_gits_pushes_are_answered_as_git_answered_and_each_ref_holds_its_
   });
 }
 
+/// A-645 P3 (main's ruling 1): with a `pre-receive` hook configured, `delete` is refused in words naming the root mount
+/// before this daemon has published it, and `hook not run` once it has (nothing yet shows the hook's view); each names
+/// the hook and records nothing past `held`.
+fn assert_a_configured_hook_refuses(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  delete: &[u8],
+  held: usize,
+) {
+  let received = pushed(state, repository, delete);
+  assert_eq!(reasons(&received), [ROOT_UNPUBLISHED]);
+  assert_first_line_names(&received, b"pre-receive");
+  assert_eq!(records(state, repository), held);
+  state.root_mount = Some(std::path::PathBuf::from("/slates-root"));
+  let received = pushed(state, repository, delete);
+  assert_eq!(reasons(&received), [HOOK_NOT_RUN]);
+  assert_first_line_names(&received, b"pre-receive");
+  assert_eq!(records(state, repository), held);
+}
+
 /// A-654 part 2 (§4.17.1 "Policy"; §4.17.2 "Access", "Protected branches, in git's terms" and "Hooks, in git's
 /// terms"; A-622). Do: push the fixtures' `create`, `update` and `copy`; then delete `copy` under a policy denying
 /// everyone its reading, then its deletion; create `other` at a commit held under a rule denying its submission; delete
@@ -525,10 +545,7 @@ fn t_a654_the_policy_hides_and_refuses_in_gits_words_and_a_configured_hook_refus
     );
     assert_declined_as_a_hook(&pushed(state, repository, &create), other, b"rule 0");
     set_policy(state, "policy", 3, (Vec::new(), vec![pre_receive()]));
-    let received = pushed(state, repository, &delete);
-    assert_eq!(reasons(&received), [HOOK_NOT_RUN]);
-    assert_first_line_names(&received, b"pre-receive");
-    assert_eq!(records(state, repository), held);
+    assert_a_configured_hook_refuses(state, repository, &delete, held);
     assert!(bound(state, repository, "copy") && !bound(state, repository, "other"));
     set_policy(state, "policy", 4, (Vec::new(), Vec::new()));
     assert_eq!(reasons(&pushed(state, repository, &delete)), [b"ok"]);
@@ -890,8 +907,8 @@ fn script(point: HookPointName, name: &str, body: &str) -> Script {
 }
 
 /// Shape: how long a test waits for a push whose hooks run: a test's bound (`git_hooks::tests::TEST_BOUND_NS`, ten
-/// liveness budgets) for each of its three hooks and one for the push itself. Every platform: the pushes without hooks
-/// wait by it too.
+/// liveness budgets) for each of its three hooks and one for the push itself. Unix alone, as its one reader is.
+#[cfg(unix)]
 const PUSH_WAIT_NS: u64 = 4 * 10 * crate::daemon::LIVENESS_BUDGET_NS;
 
 /// What a push driven with its hooks answered: what the driver wrote, what it received, and how

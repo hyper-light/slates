@@ -12455,7 +12455,9 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > (release, M-series Mac). By test (`a_very_large_directory_is_listed_a_few_entries_a_step`, 1,801 live entries;
 > a checkout and an update from r100): no step lists more than 16, where whole listings listed 1,801 in a step. The
 > checkout adds exactly the live names in order, and the update deletes exactly those gone. The replay drive's
-> `add_subdir` still lists a copied directory whole through `Repository::entries` (now the map walk).
+> `add_subdir` (A-759 part 3) adds a copied directory's source entries through the same cursor, `LIST_STEP` read a step
+> (`a_copied_large_directory_is_added_whole_a_few_entries_a_step`: a copy of a 10,000-entry directory, red 10,000
+> entries listed in one step, now at most 16, its additions the source's names in order).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -55991,8 +55993,25 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `svnadmin verify` passes the view, `svnadmin dump` and `--deltas` give `full.dump` and `deltas.dump` byte for byte,
   `svnlook changed` gives `changed.txt`, and `svnlook -t` reads each work as `-r` reads its revision. The A/B against
   P1's whole texts is in BENCHMARKS.md (128 and 460 times fewer view bytes, reads 8 and 27 times faster).
-- **Owed.** P3 (the presenter under SLATES_ROOT, after A-727 a2: the hook drivers handing the view's path as REPOS),
-  P4, the root mount's publication.
+- **Part 3, its second piece (2026-11-20, main's ruling 1): a hook is shown its repository beneath the root mount the
+  daemon published, and refused, typed, before there is one.** No configured value: the daemon's own record of the
+  root mount it published (`ShardState::root_mount`, written on every shard by `Daemon::record_root_mount`, which the
+  root mount's publication calls, A-645 (a), owed). Subversion's hooks (svn://, svn+ssh://, DAV) are given REPOS
+  `<root mount>/<repository>`; before publication a configured hook is never started and its point is refused
+  `SVN_ERR_UNSUPPORTED_FEATURE` "This server cannot run this repository's hooks: its root mount is not yet published"
+  (post-commit's `post-commit-err` too). The fallback REPOS `/<name>`, a path that held nothing, is gone (banned item 7).
+  A git push whose repository configures a hook is refused `root mount not yet published` before publication, and `hook
+  not run` after while nothing yet shows its view. The tunnel reads the root through its stores
+  (`vcs_ssh::svn::SvnStores::root_mount`), the listener and the DAV site from the shard. Red first:
+  `vcs_svn::tests::a_hook_before_the_root_mount_is_published_is_refused_typed` (the hook ran with REPOS `/<name>`; now
+  refused, never run, revision 0) and the git push test's refusal (`hook not run` before; now `root mount not yet
+  published`, and `hook not run` after publication); every hook test that runs a hook publishes a root and holds REPOS to
+  it. macOS arm64, main 359da238: `slates-server --lib` vcs_svn, vcs_ssh, vcs_http, git_push, git_hooks, svn_hooks,
+  hook_driver, vcs_hooks 227 of 228, the one failure `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_
+  lands_a_stock_commit` ("The commit's texts were not made durable: Unanswered"), which fails alike on main 359da238
+  without this change.
+- **Owed.** P3's presenter (the view a hook runs in, under the root mount, once the vfs's referenced file is agreed with
+  w-perf, main's ruling 2), P4, the root mount's publication (A-645 (a)).
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -56714,6 +56733,17 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   41 ns given the identity; each 64 KiB slice 27 / 34 us (`measure_the_holders_take_turn`). Tests:
   `a_holder_hashing_an_entry_in_slices_admits_what_the_hashing_guard_admits`; the fleet large-delta test holds the
   holders to at least a page a turn under the cut quantum, red before (0 turns).
+- **Part 5 (install images).** The record-plane coordinator's longest polls (185 to 312 ms of CPU, debug under
+  `taskpolicy -b`) were `refresh_image` sealing a 3 MiB volume's whole image in the record period's one turn. A sealed
+  image of more than one piece (`sealed_in_pieces`) is now an `ImageBuild`: the plain body captured at the shipper's head
+  in the turn that owed it (A-377's memcpy a byte), sealed a piece a turn at the measured rate (`piece_bytes`) by a task
+  of the shard (counted `fleet.live.image_builds`, `fleet.live.image_build_turns`), and made the install image
+  (`install_image`, the old tail of `refresh_image`) only if the head is still the one it was captured at; a moved head,
+  a fence or an owed whole record drops it (`fleet.live.image_stale`) and the image stays owed. While one builds, no
+  other is begun and installs wait, as they did for an owed image. Test: `slates-cli` live_fleet
+  `a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns` (a 3 MiB file, a candidate
+  stopped while it is overwritten, then resumed), red before (the image made in one turn), 65 turns after with one stale
+  build dropped and made again.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
 
@@ -56728,10 +56758,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Part 2, the build in turns.** `slates_merge::push::Building` owns a build across turns and borrows the green and
   the objects for one ([`Building::advance`]): the walk an entry of a tree a unit (`Comparing`: each side's listing
   named, then each name), the base a named path a unit (`Green::base_entries`, read at the push's base version, which
-  no later version changes), the composition, the post-state an operation or 64 KiB of zeros a unit, the identity a
-  piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or 64 KiB of the post-state a unit.
+  no later version changes), the composition, the post-state an operation or a copy slice of zeros a unit, the
+  identity a piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or a hash slice of the
+  post-state a unit. The slices are the owner's, derived from its measured memcpy and BLAKE3 rates and the quantum
+  (`pace::Slices`; the server's `copy_slice_bytes_within`, `archive_slice_bytes_within`; R3, main's 10:29 ruling).
   `build` is a `Building` run in one call. The deriver is `async` (R6): `compose_paced`'s every loop awaits a tick,
-  its sorts are a paced stable merge sort (`pace::sort_by`), its base lookups indexed (`BaseIndex`), so no unit is
+  its sorts are a paced stable merge sort of the input's own non-decreasing runs
+  (`pace::sort_by`, no tuned run length), its base lookups indexed (`BaseIndex`), so no unit is
   O(files); `compose_volume_planned` is its one-poll facade, one implementation. A `Pace` holds the turn's deadline
   and the owner's clock (a function: the merge engine reads no clock of its own); the first unit of a turn always
   runs; the composition is polled through `Pace::drive`, which lends the turn to the thread for that poll (a `Copy`

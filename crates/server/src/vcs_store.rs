@@ -2618,17 +2618,21 @@ pub(crate) fn chunk_windows_mut(
   storage.as_any_mut()?.downcast_mut()
 }
 
+/// A content store's lists (each identity with its bytes), names (each identity with its root) and region holds, as a
+/// restart restores them.
+pub(crate) type NodesToRestore<'a> = (
+  &'a [(slates_vcs::ContentId, Vec<u8>)],
+  &'a [(slates_vcs::ContentId, slates_vcs::ContentId)],
+  &'a [slates_vcs::ContentId],
+);
+
 /// Takes the repository windows the shard image names back (A-727 slice a3), before the volumes and the records: each
 /// chunk's block claimed in the shard's chunk store and its chunk recorded, the windows handed to the content store the
 /// first repository's replay makes. Only before a content store is made; counted restored and not.
 pub(crate) fn restore_windows(
   state: &mut ShardState,
   pieces: &[(u64, Vec<u8>)],
-  (lists, names, region): (
-    &[(slates_vcs::ContentId, Vec<u8>)],
-    &[(slates_vcs::ContentId, slates_vcs::ContentId)],
-    &[slates_vcs::ContentId],
-  ),
+  (lists, names, region): NodesToRestore<'_>,
 ) {
   if state.vcs_stores.content.is_some() {
     return;

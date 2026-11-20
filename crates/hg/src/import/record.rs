@@ -1592,7 +1592,7 @@ impl Revisions {
     let numbers = self
       .fork
       .append_stored(store, log, &[(row, stored)])
-      .map_err(|refused| ImportRefused::<Infallible>::Index(refused))?;
+      .map_err(ImportRefused::<Infallible>::Index)?;
     settle::<Infallible>(&mut self.fork, store, radix, rev, &numbers)?;
     Ok(())
   }

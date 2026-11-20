@@ -60,6 +60,7 @@ use slates_hg::serve::getbundle::Store;
 use slates_hg::serve::http::{
   self as hg_http, Answered, Compression, Compressor, Media, Permission,
 };
+use slates_hg::serve::session::{BatchStep, Transport};
 use slates_hg::{Admission, http as hg_wire};
 use slates_http::head::{Head, Target};
 use slates_http::percent::{self, Plus};
@@ -201,6 +202,8 @@ struct Routed {
   unbundle: bool,
   /// Whether the command is `pushkey`, landed as a push of one key (A-758).
   pushkey: bool,
+  /// Whether the command is `batch`, whose `pushkey` calls are landed between its others (A-758).
+  batch: bool,
 }
 
 /// What a request's credentials came to.
@@ -280,6 +283,9 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     if !self.stores.holds(repository.id) {
       return refused_with(Status::SERVICE_UNAVAILABLE, Fields::new(), true);
     }
+    let batcher = routed
+      .batch
+      .then(|| (principal.clone(), head.method == PUSH_METHOD));
     let pusher = (routed.unbundle || routed.pushkey).then_some(principal);
     let room = match pusher {
       Some(_) => self.stores.push_room(repository.id).unwrap_or(self.room),
@@ -287,15 +293,18 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     };
     let pushing = (repository, pusher, routed.pushkey);
     match HgExchange::new(self.stores.clone(), pushing, head, room) {
-      Some(exchange) => Decided {
-        answer: Answer::Serve {
-          fields: Fields::new(),
-          head_only: false,
-          status: StatusMode::Streamed,
-          exchange,
-        },
-        proven: true,
-      },
+      Some(mut exchange) => {
+        exchange.batcher = batcher;
+        Decided {
+          answer: Answer::Serve {
+            fields: Fields::new(),
+            head_only: false,
+            status: StatusMode::Streamed,
+            exchange,
+          },
+          proven: true,
+        }
+      }
       None => refused_with(Status::FIELDS_TOO_LARGE, Fields::new(), true),
     }
   }
@@ -415,6 +424,7 @@ fn route(head: &Head<'_>, room: u64) -> Result<Routed, Status> {
     permission: command.as_deref().and_then(hg_http::permission),
     unbundle: command.as_deref() == Some(hg_http::UNBUNDLE),
     pushkey: command.as_deref() == Some(slates_hg::serve::keys::COMMAND),
+    batch: command.as_deref() == Some(hg_http::BATCH),
   })
 }
 
@@ -467,6 +477,8 @@ pub(crate) struct HgExchange<S: HgStores> {
   pusher: Option<Principal>,
   /// Whether the push is a `pushkey`'s, answered as that command's string (A-758).
   pushkey: bool,
+  /// Who sends a `batch`, and whether it came by `POST`, which a `pushkey` call among its calls needs (A-758).
+  batcher: Option<(Principal, bool)>,
   /// The request's query.
   query: Vec<u8>,
   /// The request's `X-Hg` fields, name and value.
@@ -523,6 +535,7 @@ impl<S: HgStores> HgExchange<S> {
       repository,
       pusher,
       pushkey,
+      batcher: None,
       query: query.to_vec(),
       fields,
       body: Vec::new(),
@@ -568,6 +581,13 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     let id = self.repository.id;
     if self.past_room {
       let answered = hg_http::pushed(&Outcome::Unprocessed(PAST_ROOM.to_vec()), &mut admission);
+      self.answered = Some(Made::Whole(answered.media_type, answered.body));
+      return Ok(());
+    }
+    if let Some((principal, posted)) = &self.batcher {
+      let batching = (id, principal, *posted);
+      let answered = answered_batch(&mut self.stores, batching, &request, &mut admission).await?;
+      let answered = answered.ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
       self.answered = Some(Made::Whole(answered.media_type, answered.body));
       return Ok(());
     }
@@ -691,6 +711,48 @@ async fn answered_push<S: HgStores>(
     .push(id, (principal, &heads, bundle), admission)
     .await?;
   Some(hg_http::pushed(&outcome, admission))
+}
+
+/// The answer to a `batch` by `principal` on repository `id` (A-758, `slates_hg::serve::session::Batch`): its calls
+/// answered a call at a time, each step over the view `stores` lends, a `pushkey` call's push landed through `stores` as
+/// a lone `pushkey`'s is, only where the batch came by `POST` (`posted`; 7.2's "push requires POST request", `405`);
+/// none when the store is not lent.
+async fn answered_batch<S: HgStores>(
+  stores: &mut S,
+  (id, principal, posted): (RepositoryId, &Principal, bool),
+  request: &hg_wire::Request<'_>,
+  admission: &mut Admission,
+) -> Result<Option<Answered>, Failed> {
+  let mut batch = match hg_http::batch_request(request, admission) {
+    Ok(batch) => batch,
+    Err(answered) => return Ok(Some(answered)),
+  };
+  let transport = Transport::Http {
+    header_line: header_line(),
+  };
+  loop {
+    let stepped = stores.lend(id, admission, |store, room| {
+      batch.step(store, transport, room)
+    });
+    let bundle = match stepped {
+      None => return Ok(None),
+      Some(Ok(BatchStep::Push(bundle))) => bundle,
+      Some(Ok(BatchStep::Answered(answer))) => return Ok(Some(hg_http::batched(Ok(answer)))),
+      Some(Err(refused)) => return Ok(Some(hg_http::batched(Err(refused)))),
+    };
+    if !posted {
+      return Err(Failed(Status::METHOD_NOT_ALLOWED));
+    }
+    let Some(outcome) = stores
+      .push(id, (principal, &HeadsArgument::Force, &bundle), admission)
+      .await
+    else {
+      return Ok(None);
+    };
+    if let Err(refused) = batch.pushed(&outcome, admission) {
+      return Ok(Some(hg_http::batched(Err(refused))));
+    }
+  }
 }
 
 /// The answer to a `pushkey` by `principal` on repository `id` (A-758, `slates_hg::serve::keys`): the push it is landed
