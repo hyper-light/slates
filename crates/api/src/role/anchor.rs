@@ -433,8 +433,9 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       .unwrap_or(0),
     config.runtime.shards
   );
-  announce_issuer_surface(&supervisor);
-  observe(&mut supervisor, &mut clock, now)
+  let issuer = IssuerSurface::open(&options.instance)?;
+  announce_issuer_surface(&supervisor, &issuer);
+  observe(&mut supervisor, &mut clock, now, &issuer)
 }
 
 /// The issuer surface (§4.13 "Grants"; `slates grant`, `enroll`, `revoke`, `run`): a command that
@@ -443,7 +444,7 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
 /// mode and per-user name are the authentication, so any process of this user may open it — and it is
 /// printed for the anchor's shell to export.
 #[cfg(not(target_os = "linux"))]
-fn announce_issuer_surface(supervisor: &Supervisor) {
+fn announce_issuer_surface(supervisor: &Supervisor, _issuer: &IssuerSurface) {
   if let Ok(handoff) = supervisor.segment().handoff_env() {
     let exports: Vec<String> = handoff
       .iter()
@@ -456,10 +457,69 @@ fn announce_issuer_surface(supervisor: &Supervisor) {
   }
 }
 
-/// On Linux the handoff is a descriptor (a memfd) only this process's children hold; there is
-/// nothing a shell could export, so nothing is printed.
+/// On Linux the handoff is a descriptor (a memfd) only this process's children hold, so the anchor prints its issuer
+/// route's name and the secret it answers to instead (A-754, `slates_ipc::issuer_route`): a process that exports them
+/// claims the segment's descriptor over the route, where the anchor checks its user and the secret, and proves as a
+/// child would. Whoever holds the printed secret can issue, as whoever holds the printed name can on macOS and Windows.
 #[cfg(target_os = "linux")]
-fn announce_issuer_surface(_supervisor: &Supervisor) {}
+fn announce_issuer_surface(_supervisor: &Supervisor, issuer: &IssuerSurface) {
+  slates_machine::log_line!(
+    "slates anchor: issuer surface: export {}={} {}={}",
+    slates_ipc::issuer_route::ENV_ISSUER_ROUTE,
+    issuer.route.name(),
+    slates_ipc::issuer_route::ENV_ISSUER_SECRET,
+    slates_ipc::issuer_route::secret_text(&issuer.secret)
+  );
+}
+
+/// The anchor's issuer route on Linux (A-754): its abstract socket and the secret printed for it, made at the anchor's
+/// start from the system's generator and kept for the anchor's life. Nothing elsewhere, where the segment's name is the
+/// surface.
+struct IssuerSurface {
+  #[cfg(target_os = "linux")]
+  route: slates_ipc::issuer_route::IssuerRoute,
+  #[cfg(target_os = "linux")]
+  secret: [u8; slates_ipc::issuer_route::SECRET_BYTES],
+}
+
+impl IssuerSurface {
+  /// Binds `instance`'s issuer route and draws its secret (Linux); nothing to make elsewhere. A route that cannot be
+  /// bound, or a secret that cannot be drawn, refuses the anchor's start by name: without them no separate process
+  /// could issue.
+  #[cfg(target_os = "linux")]
+  fn open(instance: &str) -> Result<IssuerSurface, Failure> {
+    let route = slates_ipc::issuer_route::IssuerRoute::bind(instance)
+      .map_err(|e| failed("issuer route", e))?;
+    let mut secret = [0u8; slates_ipc::issuer_route::SECRET_BYTES];
+    slates_transport::handshake::secure_random(&mut secret)
+      .map_err(|e| failed("issuer secret", e))?;
+    Ok(IssuerSurface { route, secret })
+  }
+
+  /// See the Linux arm: the segment's printed name is the surface here.
+  #[cfg(not(target_os = "linux"))]
+  fn open(_instance: &str) -> Result<IssuerSurface, Failure> {
+    Ok(IssuerSurface {})
+  }
+
+  /// Answers every claim waiting on the route (Linux): one with the printed secret from this user is handed the
+  /// segment's descriptor and length; each read within a beat, so a turn of the loop is never held longer.
+  #[cfg(target_os = "linux")]
+  fn answer(&self, supervisor: &Supervisor) {
+    let segment = supervisor.segment();
+    let len = u64::try_from(segment.len()).unwrap_or(u64::MAX);
+    let _ = self.route.answer_waiting(
+      &self.secret,
+      segment.object_fd(),
+      len,
+      Duration::from_nanos(HEARTBEAT_NS),
+    );
+  }
+
+  /// See the Linux arm: nothing waits elsewhere.
+  #[cfg(not(target_os = "linux"))]
+  fn answer(&self, _supervisor: &Supervisor) {}
+}
 
 /// Stops the daemon through the graceful protocol (`slates_anchor::layout::SUP_STOP`): asks it to stop, then
 /// steps the stop each heartbeat until it exits — on its own after handing off any consensus leadership it
@@ -825,6 +885,7 @@ fn observe(
   supervisor: &mut Supervisor,
   clock: &mut HostClock,
   started: u64,
+  issuer: &IssuerSurface,
 ) -> Result<(), Failure> {
   let mut starting_since = Some(started);
   // The start under way, judged in the daemon's own CPU time and its beats until its watchdog takes the beat over
@@ -873,6 +934,8 @@ fn observe(
       stop_gracefully(supervisor, clock, &lateness)?;
       return Ok(());
     }
+    // A process claiming the segment over the issuer route is answered within a turn (A-754).
+    issuer.answer(supervisor);
     let now = clock.monotonic_ns();
     let bound = lateness.lapse_bound_ns();
     publish_lapse_bound(supervisor, bound, &mut published_bound);

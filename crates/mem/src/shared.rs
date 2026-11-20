@@ -437,6 +437,13 @@ impl SparseObject {
     })
   }
 
+  /// A borrow of the object's descriptor, for an anchor handing it to a process that proved the issuer's secret over its
+  /// issuer route (A-754, Linux's `SCM_RIGHTS`). Unix only; no reference to the bytes is formed.
+  #[cfg(unix)]
+  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.inner.as_fd()
+  }
+
   /// The owned Windows section's handle value, borrowed until an acknowledged duplicate or receive view is made.
   #[cfg(windows)]
   pub fn handle_value(&self) -> Result<u64, MemError> {

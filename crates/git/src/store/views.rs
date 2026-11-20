@@ -28,7 +28,9 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::mem::size_of;
 
-use slates_merge::push::{EntryKind, ObjectKey, PushObjects, TreeEntry, Unavailable};
+use slates_merge::push::{
+  Decoder, EntryKind, Listing, ObjectKey, PushObjects, TreeEntry, Unavailable,
+};
 use slates_vcs::{ContentId, ContentStore};
 
 use crate::object_name::{Kind, ObjectId};
@@ -229,6 +231,34 @@ impl PushObjects for PushedObjects<'_> {
         })
       })
       .collect()
+  }
+
+  /// The tree's bytes, owned (one unit: a copy of one object), decoded an entry at each read as [`Tree::parse`] reads
+  /// each (A-752 part 2b), each entry charged as the whole listing charges them.
+  fn listing(&self, id: ObjectKey) -> Result<Listing, Unavailable> {
+    let (kind, content, len) = self.locate(id)?;
+    if kind != Kind::Tree {
+      return Err(Unavailable::NotATree);
+    }
+    let bytes = self.bytes(&content, len)?.into_owned();
+    let mut admission = Admission::new(self.store.room());
+    admission.charge(to_u64(bytes.len())).map_err(past_room)?;
+    let format = self.repository.format();
+    let decode: Decoder = Box::new(move |bytes: &[u8], from: usize| {
+      let Some((entry, next)) = crate::objects::tree::entry_after(bytes, from, format)
+        .map_err(|refused| unreadable(refused.refusal))?
+      else {
+        return Ok(None);
+      };
+      admission.charge_items::<TreeEntry>(1).map_err(past_room)?;
+      let listed = TreeEntry {
+        name: entry.name.to_vec(),
+        kind: entry_kind(entry.canonical_mode()),
+        id: ObjectKey::new(entry.id).ok_or(Unavailable::Malformed)?,
+      };
+      Ok(Some((listed, next)))
+    });
+    Ok(Listing::read(bytes, decode))
   }
 
   fn blob_len(&self, id: ObjectKey) -> Result<u64, Unavailable> {

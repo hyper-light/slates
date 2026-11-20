@@ -2597,22 +2597,10 @@ impl Green {
   ) -> crate::increment::Base {
     let named: BTreeSet<&str> = journal.iter().flat_map(|op| op.names()).flatten().collect();
     let mut base = crate::increment::Base::of_files(Vec::new());
-    let at_head = version >= self.head();
     for path in &named {
-      if at_head {
-        self.head_entries(path, &mut base);
-      } else {
-        self.entries_at(path, version, &mut base);
-      }
+      self.base_entries(version, path, &mut base);
     }
-    // A link named by the journal, or one aimed at a path it names (an unlink of a primary path is refused while
-    // aliases survive). Hard links are few, and no index by target exists yet.
-    let named_link = |link: &str, target: &str| named.contains(link) || named.contains(target);
-    base.hardlinks = self
-      .links_at(version)
-      .into_iter()
-      .filter(|(link, target)| named_link(link, target))
-      .collect();
+    base.hardlinks = self.base_links(version, |path| named.contains(path));
     // Each copy the journal declares, in its order, brings its source's tree at the copy's version to its destination,
     // in place of what the destination's tree held there (A-626 part 4, `copy_restate`).
     for op in journal {
@@ -2620,10 +2608,38 @@ impl Green {
         from, to, version, ..
       } = op
       {
-        self.copied_base((from, to, *version), &mut base);
+        self.base_copied((from, to, *version), &mut base);
       }
     }
     base
+  }
+
+  /// One named path's entries of [`Green::base_for`]'s base at `version`, added to `base`: a unit of a build made over
+  /// turns (A-752, `crate::push::Building`). The head's entries where `version` is the head, else the history's; the
+  /// same entries either way, so a head that moves between two units changes none.
+  pub fn base_entries(&self, version: u64, path: &str, base: &mut crate::increment::Base) {
+    if version >= self.head() {
+      self.head_entries(path, base);
+    } else {
+      self.entries_at(path, version, base);
+    }
+  }
+
+  /// [`Green::base_for`]'s hard links at `version`: each link `named` names, or one aimed at a path it names (an unlink
+  /// of a primary path is refused while aliases survive). One unit, O(the green's hard links): hard links are few (a
+  /// git or Mercurial green holds none), and no index by target exists yet.
+  pub fn base_links(&self, version: u64, named: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    self
+      .links_at(version)
+      .into_iter()
+      .filter(|(link, target)| named(link) || named(target))
+      .collect()
+  }
+
+  /// [`Green::base_for`]'s copy `(from, to, version)`: its source's tree at the copy's version brought to its
+  /// destination in `base` (A-626 part 4). One unit, O(the copied tree): a push's walk makes no copy.
+  pub fn base_copied(&self, copy: (&str, &str, u64), base: &mut crate::increment::Base) {
+    self.copied_base(copy, base);
   }
 
   /// Every hard link at `version` and its target: the head's, or each link's value then by the module's one history

@@ -80,11 +80,11 @@ impl Part {
 enum Current {
   /// Reading the object's bytes, then its named base's.
   Read {
-    object: Reading,
-    named: Option<Reading>,
+    object: Box<Reading>,
+    named: Option<Box<Reading>>,
   },
-  /// Its entry being made.
-  Put(Putting),
+  /// Its entry being made (boxed: the encoder's state is most of the object's size).
+  Put(Box<Putting>),
 }
 
 /// An object's bytes being read a window a unit: its id, position, type, length, content and the bytes read so far.
@@ -105,7 +105,7 @@ impl Reading {
       return Ok(false);
     }
     let window = to_u64(store.window().max(1));
-    let index = to_u64(self.bytes.len()) / window;
+    let index = to_u64(self.bytes.len()).checked_div(window).unwrap_or(0);
     let bytes = store
       .window_at(&self.content, self.len, index)
       .ok_or(StoreRefused::Unreadable { id })?;
@@ -123,7 +123,7 @@ enum Stage {
   /// Encoding the commits, trees and tags' part, or the blobs' when `blobs`: the object under way, if any.
   Encode {
     blobs: bool,
-    part: Part,
+    part: Box<Part>,
     current: Option<Box<Current>>,
   },
   /// Putting a part's bytes into the content store a window a unit (A-718): the commits, trees and tags' part first
@@ -134,7 +134,7 @@ enum Stage {
     blobs: Encoded,
     putting_blobs: bool,
     next: usize,
-    writing: Writing,
+    writing: Box<Writing>,
     objects_root: Option<ContentId>,
   },
   /// Kept, or nothing to encode.
@@ -160,6 +160,7 @@ pub struct EncodingCounters {
   /// to split).
   pub units_past_quantum: u64,
   /// The longest unit of each stage, in the owner's nanoseconds: the walk, the gather, the encoding, the keeping.
+  /// Shape: one a stage, four.
   pub longest_unit_ns: [u64; 4],
   /// The most bytes one unit read, put into the store, or was given to search or deflate (A-718: a window at most).
   pub most_bytes_a_unit: u64,
@@ -308,6 +309,7 @@ impl Encoding {
       Stage::Walk { .. } => 0,
       Stage::Gather { .. } => 1,
       Stage::Encode { .. } => 2,
+      // Format: each stage's index, in the order of `longest_unit_ns`.
       Stage::Keep { .. } | Stage::Done | Stage::Refused(_) => 3,
     }
   }
@@ -328,7 +330,7 @@ impl Encoding {
         blobs,
         part,
         current,
-      } => self.encode(repository, store, clock, exchange, (blobs, part, current))?,
+      } => self.encode(repository, store, clock, exchange, (blobs, *part, current))?,
       keeping @ Stage::Keep { .. } => self.keep(repository, store, keeping)?,
       Stage::Done => return Ok(Progress::Done),
       Stage::Refused(refused) => return Err(refused),
@@ -395,7 +397,7 @@ impl Encoding {
     let Some(position) = self.positions.next_from(from) else {
       return Ok(Stage::Encode {
         blobs: false,
-        part: Part::new(),
+        part: Box::new(Part::new()),
         current: None,
       });
     };
@@ -466,7 +468,7 @@ impl Encoding {
           };
           let learning = repository.learning(exchange, clock);
           let putting = part.encoder.begin(to_encode, at, &learning);
-          Some(Box::new(Current::Put(putting)))
+          Some(Box::new(Current::Put(Box::new(putting))))
         }
       }
       Current::Put(ref mut putting) => {
@@ -492,7 +494,7 @@ impl Encoding {
     };
     Ok(Stage::Encode {
       blobs,
-      part,
+      part: Box::new(part),
       current: next,
     })
   }
@@ -542,8 +544,11 @@ impl Encoding {
     };
     Ok(Stage::Encode {
       blobs,
-      part,
-      current: Some(Box::new(Current::Read { object, named })),
+      part: Box::new(part),
+      current: Some(Box::new(Current::Read {
+        object: Box::new(object),
+        named: named.map(Box::new),
+      })),
     })
   }
 
@@ -554,7 +559,7 @@ impl Encoding {
       self.objects = Some(encoded);
       return Stage::Encode {
         blobs: true,
-        part: Part::new(),
+        part: Box::new(Part::new()),
         current: None,
       };
     }
@@ -563,7 +568,7 @@ impl Encoding {
       blobs: encoded,
       putting_blobs: false,
       next: 0,
-      writing: Writing::default(),
+      writing: Box::default(),
       objects_root: None,
     }
   }
@@ -600,7 +605,7 @@ impl Encoding {
       let to = next.saturating_add(window).min(bytes.len());
       if let Err(refused) = store.put_window(&mut writing, bytes.get(next..to).unwrap_or_default())
       {
-        give_back(store, writing, objects_root);
+        give_back(store, *writing, objects_root);
         return Err(refused.into());
       }
       self.counters.most_bytes_a_unit = self
@@ -619,7 +624,7 @@ impl Encoding {
     let root = match store.finish_object(&mut writing) {
       Ok(root) => root,
       Err(refused) => {
-        give_back(store, writing, objects_root);
+        give_back(store, *writing, objects_root);
         return Err(refused.into());
       }
     };
@@ -629,7 +634,7 @@ impl Encoding {
         blobs,
         putting_blobs: true,
         next: 0,
-        writing: Writing::default(),
+        writing: Box::default(),
         objects_root: Some(root),
       });
     }

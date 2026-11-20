@@ -84,6 +84,10 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
+> position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
+> store commit's whole passes; the check's propagation in one unit (57.9 ms at 100 pushes).
+>
 > **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
 > resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.
 >
@@ -323,6 +327,16 @@
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
 > the log ring's released pages given back (88 MiB resident past the live tail); `projected_snapshot_bytes`'s encode.
+>
+> **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
+> deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict
+> (`Judge::ready`), the deriver async under a `Pace`. Part 2b: git's trees listed an entry a unit
+> (`PushObjects::listing`), the longest build unit 1.12 -> 0.22 ms (flat 1,500 files, debug). OWED: units still one
+> object's size: a blob read and laid whole, a tree's bytes copied once, the green's hard links (none in git or
+> Mercurial greens), a copy's tree (a push makes none); Mercurial's trees still listed whole. OWED (part 3): the
+> entry apply in one step: part 3a moved the paths map's step after a push into slices (94 -> 42 ms, 1,500 files
+> debug); left: the engine's verdict (8.3 ms) and commit (10.9), the recorded entry (4.7), retention's secure (5.0),
+> and the git store's record and commit (11.5, w-git's A-722).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1089,7 +1103,8 @@
 > fetches over it with OpenSSH 10.2p1 (macOS arm64, Mac Studio, kiln r1 over 43c86824e: `cargo test --locked -p
 > slates-cli --test git_interop -- --test-threads=1` 5 passed, 0 ignored, the SSH leg alone 1 of 1 in 7.4 s;
 > `cargo fmt -p slates-cli -- --check` clean). A credential is minted with the anchor's issuer surface, so on Linux, where
-> that surface is a descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln
+> that surface was a descriptor only the anchor's children hold, those legs skipped loudly (since A-754, 2026-11-20, the
+> Linux anchor prints its issuer route and secret, and they run). macOS arm64 (Mac Studio, kiln
 > r426 over main 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2
 > ignored; with `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication
 > failed for 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the
@@ -7116,7 +7131,7 @@
 >   `edit_and_submit`, `merge_post_state`, `async_core`, `waits`, `consumer`, `client` and `lone_daemon` (a connect is
 >   one claim, a full ring is waited out, a listing, a reply, an edit, a seat and a returned id are waited for while the
 >   daemon lives, a child's tagged line while the child lives, `lone_daemon`'s role a clear memory level in the host's
->   place). Owed: the client's examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
+>   place), and its examples (`load_bench`'s stamp tests and `map_read_ab`, one claim each). Owed: `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
 >   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the

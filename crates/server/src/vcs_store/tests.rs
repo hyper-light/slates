@@ -2127,3 +2127,99 @@ fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
   });
   assert_eq!(seen, (true, 1, 0, true));
 }
+
+/// A-752 part 3 (main's order of 2026-11-20: a push changing every file of a 1,500-file head stepped its map in its
+/// answer's step, 52 ms debug). Do: push a commit of [`MANY_FILES`] files and build its map; push a second changing every
+/// file but one and removing one; step the map's change build a slice at a time, each slice given no budget (one path),
+/// counting the slices; then build the head's map whole. Expect: the change build begun once, its first path put in the
+/// push's own step and each other in a slice of its own (62 of the change's 63 paths: 62 changed, one removed), the map
+/// at the first version until they ran; its map and trees derived (not built whole), and equal, roots and all, to the
+/// ones built from the whole head.
+#[test]
+fn t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "change-build", VcsTool::Git);
+    let files = |word: &str, count: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
+      (0..count)
+        .map(|n| {
+          let bytes = if n == 0 {
+            "kept\n".to_owned()
+          } else {
+            format!("{word} {n}\n")
+          };
+          (format!("f{n:03}").into_bytes(), bytes.into_bytes())
+        })
+        .collect()
+    };
+    let (objects, first) = commit_of(&files("first", MANY_FILES), &[], FIRST_DATE);
+    let first_tree = tree_of(&objects);
+    push_through(
+      state,
+      (repository, root),
+      &objects,
+      (None, first, first_tree),
+    );
+    crate::vcs_store::paths::whole_build::settle(state);
+    let (objects, second) = commit_of(&files("second", MANY_FILES - 1), &[first], FIRST_DATE + 1);
+    let begun_before = state
+      .refusals
+      .get(super::paths::whole_build::CHANGE_BEGUN)
+      .copied();
+    let derived_before = state
+      .refusals
+      .get(super::paths::DERIVED)
+      .copied()
+      .unwrap_or(0);
+    push_unsettled(
+      state,
+      (repository, root),
+      &objects,
+      (Some(first_tree), second, tree_of(&objects)),
+    );
+    let version = state.greens.get(&root).expect("the green's engine").head();
+    let key = green_key(root);
+    let head_version = |state: &ShardState| {
+      state
+        .vcs_stores
+        .git_ref(repository)
+        .and_then(|(_, git)| git.heads.get(&key).map(|head| head.version))
+    };
+    let pending = head_version(state) == Some(version - 1);
+    let mut slices = 0usize;
+    while super::paths::whole_build::building(state, root) {
+      super::paths::whole_build::step_once(state);
+      slices = slices.saturating_add(1);
+    }
+    let derived = state
+      .refusals
+      .get(super::paths::DERIVED)
+      .copied()
+      .unwrap_or(0)
+      - derived_before;
+    let begun = state
+      .refusals
+      .get(super::paths::whole_build::CHANGE_BEGUN)
+      .copied()
+      .unwrap_or(0)
+      - begun_before.unwrap_or(0);
+    let stepped = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(_, git)| git.heads.get(&key).copied())
+      .expect("the change build's map");
+    super::paths::remake_green(state, root);
+    let whole = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(_, git)| git.heads.get(&key).copied())
+      .expect("the whole build's map");
+    (
+      pending,
+      begun,
+      slices >= MANY_FILES - 2,
+      derived,
+      (stepped.version, stepped.root, stepped.trees) == (whole.version, whole.root, whole.trees),
+    )
+  });
+  assert_eq!(seen, (true, 1, true, 1, true));
+}

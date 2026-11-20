@@ -2248,18 +2248,19 @@ fn the_verbs_emit_json_with_the_json_flag() {
 
 /// Whether this platform's anchor prints its issuer surface as an `export` line.
 ///
-/// **A platform fact stated as a `cfg`, because it is structural rather than something to sniff for.** On macOS and
-/// Windows the anchor names its segment and prints an `export` line a shell can pass to `grant`/`enroll`; on Linux
-/// the segment is a **descriptor only the anchor's children hold**, so no such line exists and no separate process
-/// can issue those verbs at all.
+/// **A platform fact, stated rather than sniffed for.** On macOS and Windows the anchor names its segment and prints an
+/// `export` line a shell can pass to `grant`/`enroll`. On Linux the segment is a descriptor only the anchor's children
+/// hold, so until A-754 no such line existed and no separate process could issue those verbs; since A-754 the anchor
+/// prints its issuer route's name and secret instead, which a separate process presents for the descriptor.
 ///
 /// Getting this wrong twice on 2026-10-20 is why it is a `cfg` and not a heuristic. First the Linux arm hung: it read
 /// stderr for a line that platform never sends, and only each caller's own skip kept the suite green. Then a bound
 /// that stopped at the anchor's "up; daemon pid" greeting broke macOS instead, because there the greeting is printed
 /// *first* and the issuer line second — so the bound returned "no surface" on the one platform that has one. A
 /// platform difference stated as a `cfg` cannot be wrong about the order of two log lines, and [`await_serving`]
-/// assumes no order at all.
-const PRINTS_ISSUER_SURFACE: bool = cfg!(not(target_os = "linux"));
+/// assumes no order at all. Since A-754 (2026-11-20) Linux prints one too, its issuer route's name and secret, so the
+/// surface is printed on every platform.
+const PRINTS_ISSUER_SURFACE: bool = true;
 
 /// The exports of the anchor's issuer-surface line (`slates anchor: issuer surface: export NAME=VALUE ...`), or
 /// `None` for any other line.

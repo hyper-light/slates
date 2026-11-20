@@ -2966,8 +2966,6 @@ mod tests {
   const STAMP_SHARDS: u16 = 1;
   /// Shape: each probe's wall budget for the stamp tests' machine profile (milliseconds).
   const PROBE_MS: u64 = 5;
-  /// Shape: how long the stamp tests' client retries the rendezvous while its daemon starts.
-  const START_WAIT: Duration = Duration::from_secs(10);
   /// Shape: how long the stamp tests' host keeps the worker off its CPU: far past what one quiet shard takes to answer a
   /// work's creation (microseconds), so the daemon answers while the worker is away, and well inside the watchdog's
   /// one-second window, which the hold before it spends no more than this of.
@@ -3045,17 +3043,8 @@ mod tests {
     )
     .unwrap();
     daemon.bootstrap(true).unwrap();
-    let started = Instant::now();
-    let connect = || loop {
-      match Client::connect(&instance, deadlines()) {
-        Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-          if started.elapsed() < START_WAIT =>
-        {
-          std::thread::yield_now();
-        }
-        other => return other.unwrap(),
-      }
-    };
+    // The claim waits while the rendezvous's holder lives (A-468; until 2026-11-20 a ten-second retry, `START_WAIT`).
+    let connect = || Client::connect(&instance, deadlines()).unwrap();
     let mut observer = connect();
     let green = observer.create_green("g", false).unwrap();
     let (seed, _) = observer.create_work(green, "seed").unwrap();

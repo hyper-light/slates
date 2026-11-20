@@ -57,6 +57,8 @@
 
 use crate::derive::{ContentOp, compose_content_sized};
 use crate::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
+use crate::pace::Ticks;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One declared operation, as the journal records it (§4.5). Content coordinates are current-file
 /// at the moment the operation happened.
@@ -444,40 +446,105 @@ impl Base {
   }
 }
 
-/// The base hard link target of `path`, if the base has a hard link there.
-fn base_hardlink_target<'a>(base: &'a Base, path: &str) -> Option<&'a str> {
-  base
-    .hardlinks
-    .iter()
-    .find(|(candidate, _)| candidate == path)
-    .map(|(_, target)| target.as_str())
+/// The base's entries by path (A-752): what the deriver's lookups read, each O(log n), where a scan of the base's lists
+/// made one operation's unit O(base). A path's first entry, as those scans found it.
+struct BaseIndex<'b> {
+  /// The base files' lengths.
+  files: BTreeMap<&'b str, u64>,
+  /// The base directories.
+  dirs: BTreeSet<&'b str>,
+  /// The base modes.
+  modes: BTreeMap<&'b str, u32>,
+  /// The base symlinks' targets.
+  symlinks: BTreeMap<&'b str, &'b str>,
+  /// The base xattrs' values, by path then name.
+  xattrs: BTreeMap<&'b str, BTreeMap<&'b str, &'b [u8]>>,
+  /// The base hard links' targets.
+  hardlinks: BTreeMap<&'b str, &'b str>,
+  /// The paths a base hard link targets.
+  link_targets: BTreeSet<&'b str>,
 }
 
-/// The base value of the xattr `name` on `path`, if the base recorded one.
-fn base_xattr<'a>(base: &'a Base, path: &str, name: &str) -> Option<&'a [u8]> {
-  base
-    .xattrs
-    .iter()
-    .find(|(candidate_path, candidate_name, _)| candidate_path == path && candidate_name == name)
-    .map(|(_, _, value)| value.as_slice())
-}
+impl<'b> BaseIndex<'b> {
+  /// `base` indexed, an entry a unit.
+  async fn of(base: &'b Base, pace: &Ticks) -> BaseIndex<'b> {
+    let mut index = BaseIndex {
+      files: BTreeMap::new(),
+      dirs: BTreeSet::new(),
+      modes: BTreeMap::new(),
+      symlinks: BTreeMap::new(),
+      xattrs: BTreeMap::new(),
+      hardlinks: BTreeMap::new(),
+      link_targets: BTreeSet::new(),
+    };
+    index.paths(base, pace).await;
+    index.links(base, pace).await;
+    index
+  }
 
-/// The base symlink target of `path`, if the base has a symlink there.
-fn base_symlink_target<'a>(base: &'a Base, path: &str) -> Option<&'a str> {
-  base
-    .symlinks
-    .iter()
-    .find(|(candidate, _)| candidate == path)
-    .map(|(_, target)| target.as_str())
-}
+  /// The base's files, directories and modes indexed, an entry a unit.
+  async fn paths(&mut self, base: &'b Base, pace: &Ticks) {
+    for (path, len) in &base.files {
+      pace.tick().await;
+      self.files.entry(path.as_str()).or_insert(*len);
+    }
+    for dir in &base.dirs {
+      pace.tick().await;
+      self.dirs.insert(dir.as_str());
+    }
+    for (path, mode) in &base.modes {
+      pace.tick().await;
+      self.modes.entry(path.as_str()).or_insert(*mode);
+    }
+  }
 
-/// The base mode of `path`, if the base recorded one.
-fn base_mode_of(base: &Base, path: &str) -> Option<u32> {
-  base
-    .modes
-    .iter()
-    .find(|(candidate, _)| candidate == path)
-    .map(|(_, mode)| *mode)
+  /// The base's symlinks, xattrs and hard links indexed, an entry a unit.
+  async fn links(&mut self, base: &'b Base, pace: &Ticks) {
+    for (path, target) in &base.symlinks {
+      pace.tick().await;
+      self
+        .symlinks
+        .entry(path.as_str())
+        .or_insert(target.as_str());
+    }
+    for (path, name, value) in &base.xattrs {
+      pace.tick().await;
+      self
+        .xattrs
+        .entry(path.as_str())
+        .or_default()
+        .entry(name.as_str())
+        .or_insert(value.as_slice());
+    }
+    for (link, target) in &base.hardlinks {
+      pace.tick().await;
+      self
+        .hardlinks
+        .entry(link.as_str())
+        .or_insert(target.as_str());
+      self.link_targets.insert(target.as_str());
+    }
+  }
+
+  /// The base hard link target of `path`, if the base has a hard link there.
+  fn hardlink_target(&self, path: &str) -> Option<&'b str> {
+    self.hardlinks.get(path).copied()
+  }
+
+  /// The base value of the xattr `name` on `path`, if the base recorded one.
+  fn xattr(&self, path: &str, name: &str) -> Option<&'b [u8]> {
+    self.xattrs.get(path)?.get(name).copied()
+  }
+
+  /// The base symlink target of `path`, if the base has a symlink there.
+  fn symlink_target(&self, path: &str) -> Option<&'b str> {
+    self.symlinks.get(path).copied()
+  }
+
+  /// The base mode of `path`, if the base recorded one.
+  fn mode_of(&self, path: &str) -> Option<u32> {
+    self.modes.get(path).copied()
+  }
 }
 
 /// One file tracked during replay.
@@ -513,22 +580,18 @@ struct Entities<'b> {
   /// The base file an unlink left at its own path, neither recreated nor clobbered: at most one a path.
   unlinked: std::collections::BTreeMap<String, usize>,
   /// The base's file lengths by path.
-  base: std::collections::BTreeMap<&'b str, u64>,
+  base: &'b BTreeMap<&'b str, u64>,
 }
 
 impl<'b> Entities<'b> {
   /// None yet, over `base`.
-  fn over(base: &'b Base) -> Entities<'b> {
+  fn over(base: &'b BTreeMap<&'b str, u64>) -> Entities<'b> {
     Entities {
       list: Vec::new(),
-      live: std::collections::BTreeMap::new(),
-      origins: std::collections::BTreeSet::new(),
-      unlinked: std::collections::BTreeMap::new(),
-      base: base
-        .files
-        .iter()
-        .map(|(path, len)| (path.as_str(), *len))
-        .collect(),
+      live: BTreeMap::new(),
+      origins: BTreeSet::new(),
+      unlinked: BTreeMap::new(),
+      base,
     }
   }
 
@@ -779,13 +842,18 @@ fn resolve_rename_target(
 /// The directories present at seal: the base directories, with the journal's mkdir/rmdir applied,
 /// and the root. (Validity — no mkdir over an existing directory, no rmdir of an absent one — is
 /// checked by [`compose_directories`], which runs first.)
-fn present_directories(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeSet<String> {
-  let mut present: std::collections::BTreeSet<String> = base.dirs.iter().cloned().collect();
+async fn present_directories(base: &Base, journal: &[VolumeOp], pace: &Ticks) -> BTreeSet<String> {
+  let mut present: BTreeSet<String> = BTreeSet::new();
+  for dir in &base.dirs {
+    pace.tick().await;
+    present.insert(dir.clone());
+  }
   // The root, the empty path (the server keys a volume's `/` so), is always present: nothing makes or removes it, and
   // its mode and attributes compose as any directory's (A-618: a push's head is an attribute of the root, §4.17.1 "A
   // push is a work" item 3; and an agent's `chmod` or `setxattr` of a mount's root declares the same).
   present.insert(String::new());
   for op in journal {
+    pace.tick().await;
     match op {
       VolumeOp::Mkdir { path } => {
         present.insert(path.clone());
@@ -805,17 +873,21 @@ fn present_directories(base: &Base, journal: &[VolumeOp]) -> std::collections::B
 /// before the rename, or a base file's own mode, is declared at the new path (2026-11-20: keyed by its
 /// path alone, chmod then rename was refused and a renamed base file lost its mode). A mode left on a
 /// renamed-away path is a typed `Unsupported` refusal; a mode on a path present nowhere is `SetModeMissing`.
-fn compose_modes(
-  base: &Base,
+async fn compose_modes(
+  base: &BaseIndex<'_>,
   journal: &[VolumeOp],
-  survivors: &std::collections::BTreeSet<String>,
-  renamed_away: &std::collections::BTreeSet<String>,
-  present_dirs: &std::collections::BTreeSet<String>,
+  (survivors, renamed_away, present_dirs): (
+    &BTreeSet<String>,
+    &BTreeSet<String>,
+    &BTreeSet<String>,
+  ),
+  pace: &Ticks,
 ) -> Result<Vec<(String, u32)>, DeriveError> {
-  let mut final_mode: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+  let mut final_mode: BTreeMap<String, u32> = BTreeMap::new();
   // Paths a rename moved a file from or over: a base mode there no longer names the base's file.
-  let mut moved: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+  let mut moved: BTreeSet<&str> = BTreeSet::new();
   for op in journal {
+    pace.tick().await;
     match op {
       VolumeOp::SetMode { path, mode } => {
         final_mode.insert(path.clone(), *mode);
@@ -826,7 +898,7 @@ fn compose_modes(
       VolumeOp::Rename { from, to } if from != to => {
         let carried = final_mode.remove(from).or_else(|| {
           (!moved.contains(from.as_str()))
-            .then(|| base_mode_of(base, from))
+            .then(|| base.mode_of(from))
             .flatten()
         });
         final_mode.remove(to);
@@ -841,13 +913,14 @@ fn compose_modes(
   }
   let mut emissions = Vec::new();
   for (path, mode) in final_mode {
+    pace.tick().await;
     if renamed_away.contains(&path) {
       return Err(DeriveError::Unsupported(path));
     }
     if !survivors.contains(&path) && !present_dirs.contains(&path) {
       return Err(DeriveError::SetModeMissing(path));
     }
-    if base_mode_of(base, &path) != Some(mode) {
+    if base.mode_of(&path) != Some(mode) {
       emissions.push((path, mode));
     }
   }
@@ -867,18 +940,21 @@ enum XattrEmission {
 /// and only where the path is present at seal (a surviving file or a present directory). An xattr
 /// on a renamed-away path is the owed `Unsupported` refusal; one on a path present nowhere is
 /// `XattrMissing`.
-fn compose_xattrs(
-  base: &Base,
+async fn compose_xattrs(
+  base: &BaseIndex<'_>,
   journal: &[VolumeOp],
-  survivors: &std::collections::BTreeSet<String>,
-  renamed_away: &std::collections::BTreeSet<String>,
-  present_dirs: &std::collections::BTreeSet<String>,
+  (survivors, renamed_away, present_dirs): (
+    &BTreeSet<String>,
+    &BTreeSet<String>,
+    &BTreeSet<String>,
+  ),
+  pace: &Ticks,
 ) -> Result<Vec<XattrEmission>, DeriveError> {
   // The final state of each attribute: `Some(value)` set, `None` removed. Keyed sorted so the
   // emissions (and the post-state layout of the values) are deterministic.
-  let mut state: std::collections::BTreeMap<(String, String), Option<Vec<u8>>> =
-    std::collections::BTreeMap::new();
+  let mut state: BTreeMap<(String, String), Option<Vec<u8>>> = BTreeMap::new();
   for op in journal {
+    pace.tick().await;
     match op {
       VolumeOp::SetXattr { path, name, value } => {
         state.insert((path.clone(), name.clone()), Some(value.clone()));
@@ -891,13 +967,14 @@ fn compose_xattrs(
   }
   let mut emissions = Vec::new();
   for ((path, name), final_value) in state {
+    pace.tick().await;
     if renamed_away.contains(&path) {
       return Err(DeriveError::Unsupported(path));
     }
     if !survivors.contains(&path) && !present_dirs.contains(&path) {
       return Err(DeriveError::XattrMissing(path));
     }
-    let base_value = base_xattr(base, &path, &name);
+    let base_value = base.xattr(&path, &name);
     match final_value {
       Some(value) => {
         if base_value != Some(value.as_slice()) {
@@ -960,10 +1037,14 @@ enum SymlinkEmission {
 }
 
 /// The paths this increment treats as symlinks: those a `Symlink` op names, and the base symlinks.
-fn symlink_paths(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeSet<String> {
-  let mut paths: std::collections::BTreeSet<String> =
-    base.symlinks.iter().map(|(path, _)| path.clone()).collect();
+async fn symlink_paths(base: &Base, journal: &[VolumeOp], pace: &Ticks) -> BTreeSet<String> {
+  let mut paths: BTreeSet<String> = BTreeSet::new();
+  for (path, _) in &base.symlinks {
+    pace.tick().await;
+    paths.insert(path.clone());
+  }
   for op in journal {
+    pace.tick().await;
     if let VolumeOp::Symlink { path, .. } = op {
       paths.insert(path.clone());
     }
@@ -975,21 +1056,22 @@ fn symlink_paths(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeSe
 /// A new or retargeted symlink is one `Symlink`; a base symlink removed is one `Unlink`; a symlink
 /// created then unlinked, or a base symlink removed then recreated to the same target, is nothing.
 /// A symlink over a present symlink, or an unlink of an absent one, is a typed refusal.
-fn compose_symlinks(
-  base: &Base,
+async fn compose_symlinks(
+  base: &BaseIndex<'_>,
   journal: &[VolumeOp],
-  paths: &std::collections::BTreeSet<String>,
+  paths: &BTreeSet<String>,
+  pace: &Ticks,
 ) -> Result<Vec<SymlinkEmission>, DeriveError> {
   // Per symlink path: whether it is present and, if so, its target.
-  let mut state: std::collections::BTreeMap<String, (bool, String)> =
-    std::collections::BTreeMap::new();
+  let mut state: BTreeMap<String, (bool, String)> = BTreeMap::new();
   let initial = |path: &str| -> (bool, String) {
-    match base_symlink_target(base, path) {
+    match base.symlink_target(path) {
       Some(target) => (true, target.to_owned()),
       None => (false, String::new()),
     }
   };
   for op in journal {
+    pace.tick().await;
     match op {
       VolumeOp::Symlink { path, target } => {
         let here = state.entry(path.clone()).or_insert_with(|| initial(path));
@@ -1011,7 +1093,8 @@ fn compose_symlinks(
   }
   let mut emissions = Vec::new();
   for (path, (here, target)) in state {
-    let base_target = base_symlink_target(base, &path);
+    pace.tick().await;
+    let base_target = base.symlink_target(&path);
     if here {
       if base_target != Some(target.as_str()) {
         emissions.push(SymlinkEmission::Made(path, target));
@@ -1085,13 +1168,14 @@ fn made_target_moved<'a>(
 
 /// The paths this increment treats as hard links: those a `Link` op names, and the base hard
 /// links.
-fn hardlink_paths(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeSet<String> {
-  let mut paths: std::collections::BTreeSet<String> = base
-    .hardlinks
-    .iter()
-    .map(|(path, _)| path.clone())
-    .collect();
+async fn hardlink_paths(base: &Base, journal: &[VolumeOp], pace: &Ticks) -> BTreeSet<String> {
+  let mut paths: BTreeSet<String> = BTreeSet::new();
+  for (path, _) in &base.hardlinks {
+    pace.tick().await;
+    paths.insert(path.clone());
+  }
   for op in journal {
+    pace.tick().await;
     if let VolumeOp::Link { path, .. } = op {
       paths.insert(path.clone());
     }
@@ -1106,14 +1190,15 @@ fn hardlink_paths(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeS
 /// shared content survives an unlink is the merge's concern at apply time, not the composition's;
 /// the writes a removed file leaves to a link are the seal's ([`heirs_of_writes`], A-669). The
 /// states are each link path the journal touched, from its base state.
-fn link_states(
-  base: &Base,
+async fn link_states(
+  base: &BaseIndex<'_>,
   journal: &[VolumeOp],
-  paths: &std::collections::BTreeSet<String>,
-) -> Result<std::collections::BTreeMap<String, LinkState>, DeriveError> {
-  let mut state: std::collections::BTreeMap<String, LinkState> = std::collections::BTreeMap::new();
+  paths: &BTreeSet<String>,
+  pace: &Ticks,
+) -> Result<BTreeMap<String, LinkState>, DeriveError> {
+  let mut state: BTreeMap<String, LinkState> = BTreeMap::new();
   let initial = |path: &str| -> LinkState {
-    match base_hardlink_target(base, path) {
+    match base.hardlink_target(path) {
       Some(target) => (true, target.to_owned(), NodeOrigin::Base),
       None => (false, String::new(), NodeOrigin::Base),
     }
@@ -1121,9 +1206,10 @@ fn link_states(
   // The paths the increment has made so far, and the targets of the links it made to a node it
   // made (A-646): a link names the node at its target when it is made, the increment's own or the
   // base's.
-  let mut made = std::collections::BTreeSet::new();
-  let mut linked_made = std::collections::BTreeSet::new();
+  let mut made = BTreeSet::new();
+  let mut linked_made = BTreeSet::new();
   for op in journal {
+    pace.tick().await;
     if let Some(moved) = made_target_moved(op, &linked_made) {
       return Err(DeriveError::Unsupported(moved.to_owned()));
     }
@@ -1165,13 +1251,16 @@ fn link_states(
 /// the journal made still name, and writes to a file the journal made again at its own name, whose new node is
 /// composed as an edit of the old one (GAPS). Until A-669 the writes were dropped with the file, and the green handed
 /// the link the head's bytes.
-fn heirs_of_writes(
-  base: &Base,
+async fn heirs_of_writes(
+  base: &BaseIndex<'_>,
   entities: &[Entity],
-  links: (&std::collections::BTreeMap<String, LinkState>, &LinkedNodes),
-) -> Result<std::collections::BTreeMap<usize, String>, DeriveError> {
-  let mut heirs = std::collections::BTreeMap::new();
+  (links, nodes): (&BTreeMap<String, LinkState>, &LinkedNodes),
+  pace: &Ticks,
+) -> Result<BTreeMap<usize, String>, DeriveError> {
+  let (live_origins, by_node) = heir_indexes(entities, nodes, pace).await;
+  let mut heirs = BTreeMap::new();
   for (index, entity) in entities.iter().enumerate() {
+    pace.tick().await;
     let Some(origin) = entity.origin.as_deref().filter(|_| !entity.live) else {
       continue;
     };
@@ -1179,14 +1268,13 @@ fn heirs_of_writes(
     if writes.is_empty() {
       continue;
     }
-    let (kept, made) = node_names(base, links, origin);
+    let named = by_node.get(origin).map(Vec::as_slice).unwrap_or_default();
+    let (kept, made) = node_names(base, links, named, origin);
     if kept.is_empty() && made.is_empty() {
       // The node goes with its last name, and its writes with it.
       continue;
     }
-    let made_again = entities
-      .iter()
-      .any(|other| other.live && other.origin.as_deref() == Some(origin));
+    let made_again = live_origins.contains(origin);
     match kept.into_iter().next() {
       Some(heir) if !made_again => {
         heirs.insert(index, heir);
@@ -1197,28 +1285,48 @@ fn heirs_of_writes(
   Ok(heirs)
 }
 
+/// [`heirs_of_writes`]'s indexes, built once (A-752) so no entity's unit scans every entity or every link: the base
+/// paths a live entity came from, and each base node's standing links.
+async fn heir_indexes<'e>(
+  entities: &'e [Entity],
+  nodes: &'e LinkedNodes,
+  pace: &Ticks,
+) -> (BTreeSet<&'e str>, BTreeMap<&'e str, Vec<&'e String>>) {
+  let mut live_origins: BTreeSet<&str> = BTreeSet::new();
+  for entity in entities {
+    pace.tick().await;
+    if entity.live
+      && let Some(origin) = entity.origin.as_deref()
+    {
+      live_origins.insert(origin);
+    }
+  }
+  let mut by_node: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+  for (path, node) in nodes {
+    pace.tick().await;
+    if let Some(node) = node.as_deref() {
+      by_node.entry(node).or_default().push(path);
+    }
+  }
+  (live_origins, by_node)
+}
+
 /// The link paths standing at the seal that name `origin`'s base node (`nodes`, [`linked_nodes`]): those the base had
 /// to the file and the journal left as they were (`links`, each link path the journal touched), the first set, and the
 /// others.
 fn node_names(
-  base: &Base,
-  (links, nodes): (&std::collections::BTreeMap<String, LinkState>, &LinkedNodes),
+  base: &BaseIndex<'_>,
+  links: &BTreeMap<String, LinkState>,
+  named: &[&String],
   origin: &str,
-) -> (
-  std::collections::BTreeSet<String>,
-  std::collections::BTreeSet<String>,
-) {
+) -> (BTreeSet<String>, BTreeSet<String>) {
   let as_based = |path: &&String| {
-    base_hardlink_target(base, path) == Some(origin)
+    base.hardlink_target(path) == Some(origin)
       && links
         .get(path.as_str())
         .is_none_or(|(here, target, node)| *here && target == origin && *node == NodeOrigin::Base)
   };
-  let (kept, made): (Vec<&String>, Vec<&String>) = nodes
-    .iter()
-    .filter(|(_, node)| node.as_deref() == Some(origin))
-    .map(|(path, _)| path)
-    .partition(as_based);
+  let (kept, made): (Vec<&String>, Vec<&String>) = named.iter().copied().partition(as_based);
   (
     kept.into_iter().cloned().collect(),
     made.into_iter().cloned().collect(),
@@ -1235,14 +1343,15 @@ type LinkedNodes = std::collections::BTreeMap<String, Option<String>>;
 /// the node a standing link named, a base file's own, or a node the journal made or moved there (`None`, whose later
 /// move or removal the deriver refuses, `made_target_moved`). A-669's first green run found a link resolved through
 /// the links standing at the seal: `ln h l; rm h` lost `l`'s node, and with it a write handed on to `l`.
-fn linked_nodes(base: &Base, journal: &[VolumeOp]) -> LinkedNodes {
-  let mut nodes: LinkedNodes = base
-    .hardlinks
-    .iter()
-    .map(|(link, target)| (link.clone(), Some(target.clone())))
-    .collect();
-  let mut made = std::collections::BTreeSet::new();
+async fn linked_nodes(base: &Base, journal: &[VolumeOp], pace: &Ticks) -> LinkedNodes {
+  let mut nodes: LinkedNodes = BTreeMap::new();
+  for (link, target) in &base.hardlinks {
+    pace.tick().await;
+    nodes.insert(link.clone(), Some(target.clone()));
+  }
+  let mut made = BTreeSet::new();
   for op in journal {
+    pace.tick().await;
     match op {
       VolumeOp::Link { path, target } => {
         let node = match nodes.get(target) {
@@ -1265,13 +1374,15 @@ fn linked_nodes(base: &Base, journal: &[VolumeOp]) -> LinkedNodes {
 /// The links a composed state declares: a link standing where the base had none, or another, or
 /// one naming a node the increment made (another node, whatever its path); a base link no longer
 /// standing, removed.
-fn link_emissions(
-  base: &Base,
-  state: std::collections::BTreeMap<String, LinkState>,
+async fn link_emissions(
+  base: &BaseIndex<'_>,
+  state: BTreeMap<String, LinkState>,
+  pace: &Ticks,
 ) -> Vec<LinkEmission> {
   let mut emissions = Vec::new();
   for (path, (here, target, origin)) in state {
-    let base_target = base_hardlink_target(base, &path);
+    pace.tick().await;
+    let base_target = base.hardlink_target(&path);
     if here {
       let unchanged = origin == NodeOrigin::Base && base_target == Some(target.as_str());
       if !unchanged {
@@ -1349,74 +1460,219 @@ pub fn compose_volume_planned(
   base: &Base,
   journal: &[VolumeOp],
 ) -> Result<(OpsDoc, PostStatePlan), DeriveError> {
-  let specials = crate::special::Composition::of(base, journal)?;
-  check_copies(journal)?;
-  check_no_file_directory_collision(base, journal)?;
-  let directories = compose_directories(base, journal)?;
-  let sym_paths = symlink_paths(base, journal);
-  let symlinks = compose_symlinks(base, journal, &sym_paths)?;
-  let link_paths = hardlink_paths(base, journal);
-  let link_state = link_states(base, journal, &link_paths)?;
-  let mut indexed = Entities::over(base);
-  for op in journal {
-    if op.is_directory()
-      || op.is_symlink()
-      || op.is_link()
-      || matches!(op, VolumeOp::Mknod { .. } | VolumeOp::Copy { .. })
-    {
-      continue;
-    }
-    // An unlink on a symlink or hard link path is that composition's removal, done above.
-    if let VolumeOp::Unlink { path } = op
-      && (sym_paths.contains(path.as_str())
-        || link_paths.contains(path.as_str())
-        || specials.paths.contains(path))
-    {
-      continue;
-    }
-    apply_op(&mut indexed, op)?;
+  crate::pace::finish(compose_paced(base, journal, &Ticks))
+}
+
+/// [`compose_volume_planned`] a unit at a time under `pace` (A-752; §4.3's step budget): an entry of the base, an
+/// operation of the journal, an entity, an emission or a path a unit, its sorts paced merge sorts, so a push's work
+/// over any number of files composes over turns, no unit O(files). The same document and plan, whatever the pace.
+pub async fn compose_paced(
+  base: &Base,
+  journal: &[VolumeOp],
+  pace: &Ticks,
+) -> Result<(OpsDoc, PostStatePlan), DeriveError> {
+  let index = BaseIndex::of(base, pace).await;
+  let checked = Checked::of(base, &index, journal, pace).await?;
+  let entities = replay(&index, journal, &checked, pace).await?;
+  let (survivors, renamed_away) =
+    present_at_seal(base, &entities, &checked.specials.survivors, pace).await;
+  let present_dirs = present_directories(base, journal, pace).await;
+  let present = (&survivors, &renamed_away, &present_dirs);
+  let (modes, xattrs) = attributes(&index, journal, present, pace).await?;
+  let nodes = linked_nodes(base, journal, pace).await;
+  let heirs = heirs_of_writes(&index, &entities, (&checked.link_state, &nodes), pace).await?;
+  Ok(
+    sealed(
+      &index,
+      journal,
+      (entities, &heirs),
+      (checked, modes, xattrs),
+      pace,
+    )
+    .await,
+  )
+}
+
+/// The document and plan of what was composed: the hard links' emissions, the seal, the IPC nodes' and the copies'
+/// operations.
+async fn sealed(
+  index: &BaseIndex<'_>,
+  journal: &[VolumeOp],
+  files: (Vec<Entity>, &BTreeMap<usize, String>),
+  (checked, modes, xattrs): (Checked, Vec<(String, u32)>, Vec<XattrEmission>),
+  pace: &Ticks,
+) -> (OpsDoc, PostStatePlan) {
+  let Checked {
+    specials,
+    directories,
+    symlinks,
+    link_state,
+    ..
+  } = checked;
+  let hardlinks = link_emissions(index, link_state, pace).await;
+  let mut plan = PostStatePlan::new();
+  let mut doc = seal(
+    files,
+    (directories, modes, symlinks, xattrs, hardlinks),
+    &mut plan,
+    pace,
+  )
+  .await;
+  specials.emit(&mut doc, pace).await;
+  emit_copies(&mut doc, journal, pace).await;
+  (doc, plan)
+}
+
+/// The modes and xattrs composed ([`compose_modes`], [`compose_xattrs`]) over what is present at the seal.
+async fn attributes(
+  index: &BaseIndex<'_>,
+  journal: &[VolumeOp],
+  present: (&BTreeSet<String>, &BTreeSet<String>, &BTreeSet<String>),
+  pace: &Ticks,
+) -> Result<(Vec<(String, u32)>, Vec<XattrEmission>), DeriveError> {
+  let modes = compose_modes(index, journal, present, pace).await?;
+  let xattrs = compose_xattrs(index, journal, present, pace).await?;
+  Ok((modes, xattrs))
+}
+
+/// What a composition checks and composes before it replays the files: the IPC nodes, the paths that are symlinks and
+/// hard links, the directories, symlinks and links composed, each refusal typed.
+struct Checked {
+  /// The IPC nodes' composition.
+  specials: crate::special::Composition,
+  /// The paths the increment treats as symlinks.
+  sym_paths: BTreeSet<String>,
+  /// The paths it treats as hard links.
+  link_paths: BTreeSet<String>,
+  /// The directories it declares.
+  directories: Vec<DirectoryEmission>,
+  /// The symlinks it declares.
+  symlinks: Vec<SymlinkEmission>,
+  /// Each link path's composed state.
+  link_state: BTreeMap<String, LinkState>,
+}
+
+impl Checked {
+  /// `journal` checked and composed over `base`, a unit an entry or an operation.
+  async fn of(
+    base: &Base,
+    index: &BaseIndex<'_>,
+    journal: &[VolumeOp],
+    pace: &Ticks,
+  ) -> Result<Checked, DeriveError> {
+    let specials =
+      crate::special::Composition::of(base, (&index.link_targets, journal), pace).await?;
+    check_copies(journal, pace).await?;
+    let sym_paths = symlink_paths(base, journal, pace).await;
+    let link_paths = hardlink_paths(base, journal, pace).await;
+    check_no_file_directory_collision(
+      index,
+      journal,
+      (&sym_paths, &link_paths, &specials.paths),
+      pace,
+    )
+    .await?;
+    let directories = compose_directories(index, journal, pace).await?;
+    let symlinks = compose_symlinks(index, journal, &sym_paths, pace).await?;
+    let link_state = link_states(index, journal, &link_paths, pace).await?;
+    Ok(Checked {
+      specials,
+      sym_paths,
+      link_paths,
+      directories,
+      symlinks,
+      link_state,
+    })
   }
-  let entities = indexed.list;
-  // The files present at seal: the live entities' final paths, plus base files no entity ever
-  // touched (still present, e.g. a base file that was only chmod'd).
-  let entity_origins: std::collections::BTreeSet<&str> = entities
-    .iter()
-    .filter_map(|entity| entity.origin.as_deref())
-    .collect();
-  let mut survivors: std::collections::BTreeSet<String> = entities
-    .iter()
-    .filter(|entity| entity.live)
-    .map(|entity| entity.final_path.clone())
-    .collect();
+}
+
+/// The journal's file operations replayed over the base's files, an operation a unit: the entities at the seal.
+async fn replay(
+  index: &BaseIndex<'_>,
+  journal: &[VolumeOp],
+  checked: &Checked,
+  pace: &Ticks,
+) -> Result<Vec<Entity>, DeriveError> {
+  let mut indexed = Entities::over(&index.files);
+  for op in journal {
+    pace.tick().await;
+    if replays(op, checked) {
+      apply_op(&mut indexed, op)?;
+    }
+  }
+  Ok(indexed.list)
+}
+
+/// Whether `op` is the files' to replay: not a directory, symlink, link, node or copy, nor an unlink of a path one of
+/// those compositions removes (done there).
+fn replays(op: &VolumeOp, checked: &Checked) -> bool {
+  if op.is_directory()
+    || op.is_symlink()
+    || op.is_link()
+    || matches!(op, VolumeOp::Mknod { .. } | VolumeOp::Copy { .. })
+  {
+    return false;
+  }
+  !matches!(op, VolumeOp::Unlink { path }
+    if checked.sym_paths.contains(path.as_str())
+      || checked.link_paths.contains(path.as_str())
+      || checked.specials.paths.contains(path))
+}
+
+/// The files present at seal, a unit an entity or a base file: the live entities' final paths, base files no entity
+/// ever touched (still present, e.g. a base file that was only chmod'd) and the surviving IPC nodes; and the base paths
+/// live files were renamed away from.
+async fn present_at_seal(
+  base: &Base,
+  entities: &[Entity],
+  special_survivors: &BTreeSet<String>,
+  pace: &Ticks,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+  let mut entity_origins: BTreeSet<&str> = BTreeSet::new();
+  let mut survivors: BTreeSet<String> = BTreeSet::new();
+  let mut renamed_away: BTreeSet<String> = BTreeSet::new();
+  for entity in entities {
+    pace.tick().await;
+    if let Some(origin) = entity.origin.as_deref() {
+      entity_origins.insert(origin);
+    }
+    if !entity.live {
+      continue;
+    }
+    survivors.insert(entity.final_path.clone());
+    if let Some(origin) = &entity.origin
+      && origin != &entity.final_path
+    {
+      renamed_away.insert(origin.clone());
+    }
+  }
+  untouched(
+    base,
+    &entity_origins,
+    special_survivors,
+    (&mut survivors, pace),
+  )
+  .await;
+  (survivors, renamed_away)
+}
+
+/// The base files no entity came from and the surviving IPC nodes, added to `survivors`, a unit a path.
+async fn untouched(
+  base: &Base,
+  entity_origins: &BTreeSet<&str>,
+  special_survivors: &BTreeSet<String>,
+  (survivors, pace): (&mut BTreeSet<String>, &Ticks),
+) {
   for (path, _) in &base.files {
+    pace.tick().await;
     if !entity_origins.contains(path.as_str()) {
       survivors.insert(path.clone());
     }
   }
-  survivors.extend(specials.survivors.iter().cloned());
-  let renamed_away: std::collections::BTreeSet<String> = entities
-    .iter()
-    .filter(|entity| entity.live)
-    .filter_map(|entity| match &entity.origin {
-      Some(origin) if origin != &entity.final_path => Some(origin.clone()),
-      _ => None,
-    })
-    .collect();
-  let present_dirs = present_directories(base, journal);
-  let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
-  let xattrs = compose_xattrs(base, journal, &survivors, &renamed_away, &present_dirs)?;
-  let nodes = linked_nodes(base, journal);
-  let heirs = heirs_of_writes(base, &entities, (&link_state, &nodes))?;
-  let hardlinks = link_emissions(base, link_state);
-  let mut plan = PostStatePlan::new();
-  let mut doc = seal(
-    (entities, &heirs),
-    (directories, modes, symlinks, xattrs, hardlinks),
-    &mut plan,
-  );
-  specials.emit(&mut doc);
-  emit_copies(&mut doc, journal);
-  Ok((doc, plan))
+  for path in special_survivors {
+    pace.tick().await;
+    survivors.insert(path.clone());
+  }
 }
 
 /// Whether `path` lies in `root`'s tree: `root` itself or beneath it; every path, for the root (the empty path).
@@ -1432,19 +1688,33 @@ fn within(path: &str, root: &str) -> bool {
 /// journal holding copies is composed against holds each copied tree where its copy puts it (`Green::base_for`), so an
 /// earlier operation there would be composed against what the copy brings, not what it changed: owed
 /// (`DeriveError::Unsupported`), as the deriver's other compositions over a reused name are.
-fn check_copies(journal: &[VolumeOp]) -> Result<(), DeriveError> {
+async fn check_copies(journal: &[VolumeOp], pace: &Ticks) -> Result<(), DeriveError> {
+  // Each name the journal has named so far, and where it was first named: a copy's refusal names the earliest
+  // operation's name in its tree, as a scan of the operations before it found it, each lookup a range of the names.
+  let mut named: BTreeMap<&str, usize> = BTreeMap::new();
   for (index, op) in journal.iter().enumerate() {
-    let VolumeOp::Copy { to, .. } = op else {
-      continue;
-    };
-    let earlier = journal.get(..index).unwrap_or_default();
-    if let Some(name) = earlier
-      .iter()
-      .flat_map(VolumeOp::names)
-      .flatten()
-      .find(|name| within(name, to))
-    {
-      return Err(DeriveError::Unsupported(name.to_owned()));
+    pace.tick().await;
+    if let VolumeOp::Copy { to, .. } = op {
+      let mut earliest: Option<(usize, &str)> = None;
+      for (name, at) in named.range(to.as_str()..) {
+        pace.tick().await;
+        if !name.starts_with(to.as_str()) {
+          break;
+        }
+        if within(name, to) && earliest.is_none_or(|(first, _)| *at < first) {
+          earliest = Some((*at, name));
+        }
+      }
+      if let Some((_, name)) = earliest {
+        return Err(DeriveError::Unsupported((*name).to_owned()));
+      }
+    }
+    for (slot, name) in op.names().into_iter().enumerate() {
+      if let Some(name) = name {
+        named
+          .entry(name)
+          .or_insert(index.saturating_mul(2).saturating_add(slot));
+      }
     }
   }
   Ok(())
@@ -1453,21 +1723,23 @@ fn check_copies(journal: &[VolumeOp]) -> Result<(), DeriveError> {
 /// Emits the journal's copies (A-626 part 4) by destination, so their order is not the journal's: each one `Copy`,
 /// its destination the op's path, its source the `src`, the source's version the `at`, and `REPLACE` where it replaces
 /// what its destination holds.
-fn emit_copies(doc: &mut OpsDoc, journal: &[VolumeOp]) {
-  let mut copies: Vec<(&str, &str, u64, bool)> = journal
-    .iter()
-    .filter_map(|op| match op {
-      VolumeOp::Copy {
-        from,
-        to,
-        version,
-        replace,
-      } => Some((to.as_str(), from.as_str(), *version, *replace)),
-      _ => None,
-    })
-    .collect();
-  copies.sort_unstable();
+async fn emit_copies(doc: &mut OpsDoc, journal: &[VolumeOp], pace: &Ticks) {
+  let mut copies: Vec<(&str, &str, u64, bool)> = Vec::new();
+  for op in journal {
+    pace.tick().await;
+    if let VolumeOp::Copy {
+      from,
+      to,
+      version,
+      replace,
+    } = op
+    {
+      copies.push((to.as_str(), from.as_str(), *version, *replace));
+    }
+  }
+  let copies = crate::pace::sort_by(copies, pace, Ord::cmp).await;
   for (to, from, version, replace) in copies {
+    pace.tick().await;
     let path = doc.paths.intern(to);
     let src = doc.paths.intern(from);
     doc.ops.push(Op {
@@ -1491,112 +1763,159 @@ enum DirectoryEmission {
 
 /// Refuses when any path is used as both a file and a directory this increment (including against
 /// the base's kinds): a file/directory transition at a path, whose composition is owed.
-fn check_no_file_directory_collision(base: &Base, journal: &[VolumeOp]) -> Result<(), DeriveError> {
-  let sym_paths = symlink_paths(base, journal);
-  let link_paths = hardlink_paths(base, journal);
-  let specials = crate::special::Composition::of(base, journal)?;
-  let mut file_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-  let mut dir_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-  let mut sym_intent: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-  let mut link_intent: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-  for op in journal {
-    match op {
-      VolumeOp::Mkdir { path } | VolumeOp::Rmdir { path } => {
-        dir_paths.insert(path);
-      }
-      VolumeOp::Symlink { path, .. } => {
-        sym_intent.insert(path);
-      }
-      VolumeOp::Link { path, .. } => {
-        link_intent.insert(path);
-      }
-      VolumeOp::Rename { from, to } => {
-        file_paths.insert(from);
-        file_paths.insert(to);
-      }
-      // An unlink on a symlink or hard link path is that removal, not a file operation.
-      VolumeOp::Unlink { path }
-        if sym_paths.contains(path.as_str())
-          || link_paths.contains(path.as_str())
-          || specials.paths.contains(path) => {}
-      other => {
-        if let Some(path) = other.single_path() {
-          file_paths.insert(path);
-        }
-      }
-    }
-  }
-  let base_file = |path: &str| base.files.iter().any(|(file, _)| file == path);
-  let base_dir = |path: &str| base.dirs.iter().any(|dir| dir == path);
-  let base_sym = |path: &str| base.symlinks.iter().any(|(link, _)| link == path);
-  let base_link = |path: &str| base.hardlinks.iter().any(|(link, _)| link == path);
-  for path in &specials.paths {
-    if file_paths.contains(path.as_str())
-      || dir_paths.contains(path.as_str())
-      || sym_intent.contains(path.as_str())
-      || link_intent.contains(path.as_str())
+async fn check_no_file_directory_collision(
+  base: &BaseIndex<'_>,
+  journal: &[VolumeOp],
+  removals: (&BTreeSet<String>, &BTreeSet<String>, &BTreeSet<String>),
+  pace: &Ticks,
+) -> Result<(), DeriveError> {
+  let special_paths = removals.2;
+  let intents = Intents::of(journal, removals, pace).await;
+  let Intents {
+    files,
+    dirs,
+    syms,
+    links,
+  } = &intents;
+  let base_file = |path: &str| base.files.contains_key(path);
+  let base_dir = |path: &str| base.dirs.contains(path);
+  let base_sym = |path: &str| base.symlinks.contains_key(path);
+  let base_link = |path: &str| base.hardlinks.contains_key(path);
+  let any_kind = |path: &str| {
+    files.contains(path)
+      || dirs.contains(path)
+      || syms.contains(path)
+      || links.contains(path)
       || base_file(path)
       || base_dir(path)
       || base_sym(path)
       || base_link(path)
-    {
-      return Err(DeriveError::PathKindConflict(path.clone()));
-    }
-  }
+  };
+  let kind_conflict = DeriveError::PathKindConflict;
+  let file_and_dir = DeriveError::PathIsFileAndDirectory;
+  let specials = special_paths.iter().map(String::as_str);
+  refuse_any(specials, any_kind, kind_conflict, pace).await?;
   // A file operation must not fall on a base directory or symlink.
-  for path in &file_paths {
-    if dir_paths.contains(path) || base_dir(path) || base_sym(path) || base_link(path) {
-      return Err(DeriveError::PathIsFileAndDirectory((*path).to_owned()));
-    }
-  }
+  let on_dir =
+    |path: &str| dirs.contains(path) || base_dir(path) || base_sym(path) || base_link(path);
+  refuse_any(files.iter().copied(), on_dir, file_and_dir, pace).await?;
   // A directory operation must not fall on a base file or symlink, nor share a path with one.
-  for path in &dir_paths {
-    if file_paths.contains(path) || base_file(path) || base_sym(path) {
-      return Err(DeriveError::PathIsFileAndDirectory((*path).to_owned()));
-    }
-  }
+  let on_file = |path: &str| files.contains(path) || base_file(path) || base_sym(path);
+  refuse_any(dirs.iter().copied(), on_file, file_and_dir, pace).await?;
   // A symlink create must not fall on a base file or directory, nor share a path with a file or
   // directory operation.
-  for path in &sym_intent {
-    if file_paths.contains(path)
-      || dir_paths.contains(path)
-      || link_intent.contains(path)
+  let sym_clash = |path: &str| {
+    files.contains(path)
+      || dirs.contains(path)
+      || links.contains(path)
       || base_file(path)
       || base_dir(path)
       || base_link(path)
-    {
-      return Err(DeriveError::PathKindConflict((*path).to_owned()));
-    }
-  }
-  for path in &link_intent {
-    if file_paths.contains(path)
-      || dir_paths.contains(path)
+  };
+  refuse_any(syms.iter().copied(), sym_clash, kind_conflict, pace).await?;
+  let link_clash = |path: &str| {
+    files.contains(path)
+      || dirs.contains(path)
       || base_file(path)
       || base_dir(path)
       || base_sym(path)
-    {
-      return Err(DeriveError::PathKindConflict((*path).to_owned()));
+  };
+  refuse_any(links.iter().copied(), link_clash, kind_conflict, pace).await
+}
+
+/// The first of `paths` that `clashes`, refused as `refusal` names it, a unit a path.
+async fn refuse_any<'p>(
+  paths: impl Iterator<Item = &'p str>,
+  clashes: impl Fn(&str) -> bool,
+  refusal: fn(String) -> DeriveError,
+  pace: &Ticks,
+) -> Result<(), DeriveError> {
+  for path in paths {
+    pace.tick().await;
+    if clashes(path) {
+      return Err(refusal(path.to_owned()));
     }
   }
   Ok(())
+}
+
+/// The paths a journal's operations use as each kind ([`check_no_file_directory_collision`]).
+struct Intents<'j> {
+  /// The paths a file operation names.
+  files: BTreeSet<&'j str>,
+  /// The paths a directory is made or removed at.
+  dirs: BTreeSet<&'j str>,
+  /// The paths a symlink is made at.
+  syms: BTreeSet<&'j str>,
+  /// The paths a hard link is made at.
+  links: BTreeSet<&'j str>,
+}
+
+impl<'j> Intents<'j> {
+  /// `journal`'s paths by kind, an operation a unit: an unlink of a path a symlink, hard link or IPC node composition
+  /// removes (`removals`) is that removal, not a file operation.
+  async fn of(
+    journal: &'j [VolumeOp],
+    (sym_paths, link_paths, special_paths): (
+      &BTreeSet<String>,
+      &BTreeSet<String>,
+      &BTreeSet<String>,
+    ),
+    pace: &Ticks,
+  ) -> Intents<'j> {
+    let mut intents = Intents {
+      files: BTreeSet::new(),
+      dirs: BTreeSet::new(),
+      syms: BTreeSet::new(),
+      links: BTreeSet::new(),
+    };
+    for op in journal {
+      pace.tick().await;
+      match op {
+        VolumeOp::Mkdir { path } | VolumeOp::Rmdir { path } => {
+          intents.dirs.insert(path);
+        }
+        VolumeOp::Symlink { path, .. } => {
+          intents.syms.insert(path);
+        }
+        VolumeOp::Link { path, .. } => {
+          intents.links.insert(path);
+        }
+        VolumeOp::Rename { from, to } => {
+          intents.files.insert(from);
+          intents.files.insert(to);
+        }
+        VolumeOp::Unlink { path }
+          if sym_paths.contains(path.as_str())
+            || link_paths.contains(path.as_str())
+            || special_paths.contains(path) => {}
+        other => {
+          intents.files.extend(other.single_path());
+        }
+      }
+    }
+    intents
+  }
 }
 
 /// Composes the directory operations into a create or remove per touched directory path: a base
 /// directory removed is a `Rmdir`; a new directory that survives is a `Mkdir`; a mkdir then an
 /// rmdir cancels, and a base directory removed then recreated is unchanged (directories have no
 /// content). A mkdir over a present directory, or an rmdir of an absent one, is a typed refusal.
-fn compose_directories(
-  base: &Base,
+async fn compose_directories(
+  base: &BaseIndex<'_>,
   journal: &[VolumeOp],
+  pace: &Ticks,
 ) -> Result<Vec<DirectoryEmission>, DeriveError> {
-  let mut present: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+  let mut present: BTreeMap<String, bool> = BTreeMap::new();
   for op in journal {
+    pace.tick().await;
     let (path, making) = match op {
       VolumeOp::Mkdir { path } => (path, true),
       VolumeOp::Rmdir { path } => (path, false),
       _ => continue,
     };
-    let base_is_dir = base.dirs.iter().any(|dir| dir == path);
+    let base_is_dir = base.dirs.contains(path.as_str());
     let here = present.entry(path.clone()).or_insert(base_is_dir);
     if making {
       if *here {
@@ -1612,7 +1931,8 @@ fn compose_directories(
   }
   let mut emissions = Vec::new();
   for (path, here) in present {
-    let base_is_dir = base.dirs.iter().any(|dir| dir == &path);
+    pace.tick().await;
+    let base_is_dir = base.dirs.contains(path.as_str());
     if here && !base_is_dir {
       emissions.push(DirectoryEmission::Made(path));
     } else if !here && base_is_dir {
@@ -1644,14 +1964,16 @@ struct Emission {
 /// file occupies it (a rename or content replacement onto that path covers its removal). A gone
 /// base file whose writes a link inherits (`heirs`, by entity index, [`heirs_of_writes`]) is also an
 /// emission at that link: the writes, which the seal reads there (A-669).
-fn classify(
+async fn classify(
   entities: Vec<Entity>,
-  heirs: &std::collections::BTreeMap<usize, String>,
+  heirs: &BTreeMap<usize, String>,
+  pace: &Ticks,
 ) -> (Vec<Emission>, Vec<String>) {
   let mut emissions: Vec<Emission> = Vec::new();
-  let mut survivors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+  let mut survivors: BTreeSet<String> = BTreeSet::new();
   let mut gone: Vec<String> = Vec::new();
   for (index, entity) in entities.into_iter().enumerate() {
+    pace.tick().await;
     if let Some(heir) = heirs.get(&index) {
       let (ops, _) = compose_content_sized(entity.base_len, &entity.content);
       emissions.push(Emission {
@@ -1663,152 +1985,209 @@ fn classify(
     }
     if entity.live {
       survivors.insert(entity.final_path.clone());
-      let (ops, _) = compose_content_sized(entity.base_len, &entity.content);
-      let created = entity.origin.is_none();
-      let renamed = matches!(&entity.origin, Some(origin) if origin != &entity.final_path);
-      if !created && !renamed && ops.is_empty() {
-        continue;
-      }
-      let source = if renamed { entity.origin.clone() } else { None };
-      emissions.push(Emission {
-        final_path: entity.final_path,
-        source,
-        created,
-        ops,
-      });
+      emissions.extend(survivor_emission(entity));
     } else if let Some(origin) = entity.origin {
       gone.push(origin);
     }
   }
-  let mut removed: Vec<String> = gone
-    .into_iter()
-    .filter(|origin| !survivors.contains(origin))
-    .collect();
-  removed.sort_unstable();
-  removed.dedup();
+  let mut removed: Vec<String> = Vec::new();
+  for origin in gone {
+    pace.tick().await;
+    if !survivors.contains(&origin) {
+      removed.push(origin);
+    }
+  }
+  let removed = sorted_names(removed, pace).await;
   (emissions, removed)
+}
+
+/// A live entity's emission: none for a base file edited to no net change.
+fn survivor_emission(entity: Entity) -> Option<Emission> {
+  let (ops, _) = compose_content_sized(entity.base_len, &entity.content);
+  let created = entity.origin.is_none();
+  let renamed = matches!(&entity.origin, Some(origin) if origin != &entity.final_path);
+  if !created && !renamed && ops.is_empty() {
+    return None;
+  }
+  let source = if renamed { entity.origin } else { None };
+  Some(Emission {
+    final_path: entity.final_path,
+    source,
+    created,
+    ops,
+  })
+}
+
+/// `names` sorted and deduplicated, a unit a name (A-752): what `sort_unstable` then `dedup` gave.
+async fn sorted_names(names: Vec<String>, pace: &Ticks) -> Vec<String> {
+  let sorted = crate::pace::sort_by(names, pace, Ord::cmp).await;
+  let mut unique: Vec<String> = Vec::with_capacity(sorted.len());
+  for name in sorted {
+    pace.tick().await;
+    if unique.last() != Some(&name) {
+      unique.push(name);
+    }
+  }
+  unique
 }
 
 /// Every path the document names — the emissions' final paths, their rename sources, the removed
 /// paths, and the directory paths — sorted and deduplicated, so the path table is sorted and the
 /// indices are stable (a rename's source index is a table index, which the sorted table keeps
 /// valid).
-fn document_names(
-  emissions: &[Emission],
-  removed: &[String],
-  directories: &[DirectoryEmission],
-  modes: &[(String, u32)],
-  symlinks: &[SymlinkEmission],
-  xattrs: &[XattrEmission],
-  hardlinks: &[LinkEmission],
+async fn document_names(
+  (emissions, removed): (&[Emission], &[String]),
+  (directories, modes, symlinks, xattrs, hardlinks): NamespaceRefs<'_>,
+  pace: &Ticks,
 ) -> Vec<String> {
   let mut names: Vec<String> = Vec::new();
   for emission in emissions {
+    pace.tick().await;
     names.push(emission.final_path.clone());
-    if let Some(source) = &emission.source {
-      names.push(source.clone());
-    }
+    names.extend(emission.source.iter().cloned());
   }
-  names.extend(removed.iter().cloned());
-  for directory in directories {
-    match directory {
-      DirectoryEmission::Made(path) | DirectoryEmission::Removed(path) => names.push(path.clone()),
-    }
-  }
-  for (path, _) in modes {
+  for path in removed {
+    pace.tick().await;
     names.push(path.clone());
   }
+  directory_names((directories, modes), &mut names, pace).await;
+  link_names((symlinks, xattrs, hardlinks), &mut names, pace).await;
+  sorted_names(names, pace).await
+}
+
+/// The names the directories and modes declare, added to `names`, a unit an emission.
+async fn directory_names(
+  (directories, modes): (&[DirectoryEmission], &[(String, u32)]),
+  names: &mut Vec<String>,
+  pace: &Ticks,
+) {
+  for directory in directories {
+    pace.tick().await;
+    let (DirectoryEmission::Made(path) | DirectoryEmission::Removed(path)) = directory;
+    names.push(path.clone());
+  }
+  for (path, _) in modes {
+    pace.tick().await;
+    names.push(path.clone());
+  }
+}
+
+/// The names the symlinks, xattrs and hard links declare, added to `names`, a unit an emission.
+async fn link_names(
+  (symlinks, xattrs, hardlinks): (&[SymlinkEmission], &[XattrEmission], &[LinkEmission]),
+  names: &mut Vec<String>,
+  pace: &Ticks,
+) {
   for symlink in symlinks {
+    pace.tick().await;
     match symlink {
-      SymlinkEmission::Made(path, target) => {
-        names.push(path.clone());
-        names.push(target.clone());
-      }
+      SymlinkEmission::Made(path, target) => names.extend([path.clone(), target.clone()]),
       SymlinkEmission::Removed(path) => names.push(path.clone()),
     }
   }
   for xattr in xattrs {
-    match xattr {
-      XattrEmission::Set(path, name, _) | XattrEmission::Removed(path, name) => {
-        names.push(path.clone());
-        names.push(name.clone());
-      }
-    }
+    pace.tick().await;
+    let (XattrEmission::Set(path, name, _) | XattrEmission::Removed(path, name)) = xattr;
+    names.extend([path.clone(), name.clone()]);
   }
   for link in hardlinks {
+    pace.tick().await;
     match link {
-      LinkEmission::Made(path, target, _) => {
-        names.push(path.clone());
-        names.push(target.clone());
-      }
+      LinkEmission::Made(path, target, _) => names.extend([path.clone(), target.clone()]),
       LinkEmission::Removed(path) => names.push(path.clone()),
     }
   }
-  names.sort_unstable();
-  names.dedup();
-  names
 }
+
+/// The namespace emissions a document names, borrowed: directories, modes, symlinks, xattrs and hard links.
+type NamespaceRefs<'n> = (
+  &'n [DirectoryEmission],
+  &'n [(String, u32)],
+  &'n [SymlinkEmission],
+  &'n [XattrEmission],
+  &'n [LinkEmission],
+);
+
+/// The namespace operations [`emit_namespace`] lays: the removed base files, directories, modes, symlinks and hard
+/// links.
+type NamespaceOps = (
+  Vec<String>,
+  Vec<DirectoryEmission>,
+  Vec<(String, u32)>,
+  Vec<SymlinkEmission>,
+  Vec<LinkEmission>,
+);
 
 /// Emits the namespace operations — unlinks of removed base files, directory create/remove, mode
 /// changes, and symlink create/remove — into the document, resolving each path to its table index.
-fn emit_namespace(
+async fn emit_namespace(
   doc: &mut OpsDoc,
   names: &[String],
-  removed: Vec<String>,
-  directories: Vec<DirectoryEmission>,
-  modes: Vec<(String, u32)>,
-  symlinks: Vec<SymlinkEmission>,
-  hardlinks: Vec<LinkEmission>,
+  (removed, directories, modes, symlinks, hardlinks): NamespaceOps,
+  pace: &Ticks,
 ) {
-  // A name's index is its place among the sorted names; one not among them is `u64::MAX`, which names no path, never
-  // another's (A-621: a 16-bit index answered `u16::MAX`, the 65,536th name's, for both).
-  let index_of = |name: &str| -> u64 {
-    names
-      .binary_search_by(|candidate| candidate.as_str().cmp(name))
-      .map_or(u64::MAX, |position| {
-        u64::try_from(position).unwrap_or(u64::MAX)
-      })
-  };
   for origin in removed {
+    pace.tick().await;
     doc
       .ops
-      .push(namespace_op(OpKind::Unlink, index_of(&origin)));
+      .push(namespace_op(OpKind::Unlink, index_in(names, &origin)));
   }
   for directory in directories {
-    match directory {
-      DirectoryEmission::Made(path) => doc.ops.push(namespace_op(OpKind::Mkdir, index_of(&path))),
-      DirectoryEmission::Removed(path) => {
-        doc.ops.push(namespace_op(OpKind::Rmdir, index_of(&path)));
-      }
-    }
+    pace.tick().await;
+    let op = match directory {
+      DirectoryEmission::Made(path) => namespace_op(OpKind::Mkdir, index_in(names, &path)),
+      DirectoryEmission::Removed(path) => namespace_op(OpKind::Rmdir, index_in(names, &path)),
+    };
+    doc.ops.push(op);
   }
   for (path, mode) in modes {
-    doc.ops.push(set_mode_op(index_of(&path), mode));
+    pace.tick().await;
+    doc.ops.push(set_mode_op(index_in(names, &path), mode));
   }
+  emit_links(doc, names, (symlinks, hardlinks), pace).await;
+}
+
+/// The symlink and hard link operations laid into `doc`, a unit an emission.
+async fn emit_links(
+  doc: &mut OpsDoc,
+  names: &[String],
+  (symlinks, hardlinks): (Vec<SymlinkEmission>, Vec<LinkEmission>),
+  pace: &Ticks,
+) {
   for symlink in symlinks {
-    match symlink {
+    pace.tick().await;
+    let op = match symlink {
       SymlinkEmission::Made(path, target) => {
-        doc.ops.push(symlink_op(index_of(&path), index_of(&target)));
+        symlink_op(index_in(names, &path), index_in(names, &target))
       }
-      SymlinkEmission::Removed(path) => {
-        doc.ops.push(namespace_op(OpKind::Unlink, index_of(&path)));
-      }
-    }
+      SymlinkEmission::Removed(path) => namespace_op(OpKind::Unlink, index_in(names, &path)),
+    };
+    doc.ops.push(op);
   }
   for link in hardlinks {
-    match link {
+    pace.tick().await;
+    let op = match link {
       LinkEmission::Made(path, target, origin) => {
         let node = doc.nodes.intern(NodeRef {
-          path: index_of(&target),
+          path: index_in(names, &target),
           origin,
         });
-        doc.ops.push(link_op(index_of(&path), node));
+        link_op(index_in(names, &path), node)
       }
-      LinkEmission::Removed(path) => {
-        doc.ops.push(namespace_op(OpKind::Unlink, index_of(&path)));
-      }
-    }
+      LinkEmission::Removed(path) => namespace_op(OpKind::Unlink, index_in(names, &path)),
+    };
+    doc.ops.push(op);
   }
+}
+
+/// A name's index: its place among the sorted `names`; one not among them is `u64::MAX`, which names no path, never
+/// another's (A-621: a 16-bit index answered `u16::MAX`, the 65,536th name's, for both).
+fn index_in(names: &[String], name: &str) -> u64 {
+  names
+    .binary_search_by(|candidate| candidate.as_str().cmp(name))
+    .map_or(u64::MAX, |position| {
+      u64::try_from(position).unwrap_or(u64::MAX)
+    })
 }
 
 /// The namespace emissions a seal lays out besides the files: directories, modes, symlinks, xattrs and hard links.
@@ -1820,84 +2199,91 @@ type Namespace = (
   Vec<LinkEmission>,
 );
 
-fn seal(
-  (entities, heirs): (Vec<Entity>, &std::collections::BTreeMap<usize, String>),
+async fn seal(
+  (entities, heirs): (Vec<Entity>, &BTreeMap<usize, String>),
   (directories, modes, symlinks, xattrs, hardlinks): Namespace,
   plan: &mut PostStatePlan,
+  pace: &Ticks,
 ) -> OpsDoc {
-  let (mut emissions, removed) = classify(entities, heirs);
+  let (emissions, removed) = classify(entities, heirs, pace).await;
   let names = document_names(
-    &emissions,
-    &removed,
-    &directories,
-    &modes,
-    &symlinks,
-    &xattrs,
-    &hardlinks,
-  );
-
+    (&emissions, &removed),
+    (&directories, &modes, &symlinks, &xattrs, &hardlinks),
+    pace,
+  )
+  .await;
   let mut doc = OpsDoc::new();
   for name in &names {
+    pace.tick().await;
     doc.paths.intern(name);
   }
-  // A name's index is its place among the sorted names; one not among them is `u64::MAX`, which names no path, never
-  // another's (A-621: a 16-bit index answered `u16::MAX`, the 65,536th name's, for both).
-  let index_of = |name: &str| -> u64 {
-    names
-      .binary_search_by(|candidate| candidate.as_str().cmp(name))
-      .map_or(u64::MAX, |position| {
-        u64::try_from(position).unwrap_or(u64::MAX)
-      })
-  };
-
-  // The emissions in sorted final-path order: the post-state's runs follow it, each at the next offset.
-  emissions.sort_by(|a, b| a.final_path.cmp(&b.final_path));
-  let mut region_offset = 0u64;
-  for emission in emissions {
-    let destination = index_of(&emission.final_path);
-    if let Some(source) = &emission.source {
-      doc.ops.push(rename_op(destination, index_of(source)));
-    } else if emission.created {
-      doc.ops.push(namespace_op(OpKind::Create, destination));
-    }
-    push_content(
-      &mut doc,
-      emission.ops,
-      destination,
-      (&mut region_offset, plan),
-    );
-  }
-  // Xattr values are laid out in the post-state after the file content, in sorted order.
-  for xattr in xattrs {
-    match xattr {
-      XattrEmission::Set(path, name, value) => {
-        let value_len = value.len() as u64;
-        doc.ops.push(set_xattr_op(
-          index_of(&path),
-          index_of(&name),
-          region_offset,
-          value_len,
-        ));
-        region_offset = region_offset.saturating_add(value_len);
-      }
-      XattrEmission::Removed(path, name) => {
-        doc
-          .ops
-          .push(remove_xattr_op(index_of(&path), index_of(&name)));
-      }
-    }
-  }
+  let region_offset = emit_files(&mut doc, &names, (emissions, plan), pace).await;
+  emit_xattrs(&mut doc, &names, (xattrs, region_offset), pace).await;
   emit_namespace(
     &mut doc,
     &names,
-    removed,
-    directories,
-    modes,
-    symlinks,
-    hardlinks,
-  );
-  doc.canonicalize();
+    (removed, directories, modes, symlinks, hardlinks),
+    pace,
+  )
+  .await;
+  doc.canonicalize_paced(pace).await;
   doc
+}
+
+/// The files' operations laid into `doc`, a unit an emission, in sorted final-path order: the post-state's runs follow
+/// it, each at the next offset, planned in `plan`. The offset past the last run.
+async fn emit_files(
+  doc: &mut OpsDoc,
+  names: &[String],
+  (emissions, plan): (Vec<Emission>, &mut PostStatePlan),
+  pace: &Ticks,
+) -> u64 {
+  let emissions =
+    crate::pace::sort_by(emissions, pace, |a, b| a.final_path.cmp(&b.final_path)).await;
+  let mut region_offset = 0u64;
+  for emission in emissions {
+    pace.tick().await;
+    let destination = index_in(names, &emission.final_path);
+    if let Some(source) = &emission.source {
+      doc
+        .ops
+        .push(rename_op(destination, index_in(names, source)));
+    } else if emission.created {
+      doc.ops.push(namespace_op(OpKind::Create, destination));
+    }
+    push_content(doc, emission.ops, destination, (&mut region_offset, plan));
+  }
+  region_offset
+}
+
+/// The xattr operations laid into `doc`, a unit an emission: a set's value in the post-state after the file content,
+/// from `region_offset`, in sorted order.
+async fn emit_xattrs(
+  doc: &mut OpsDoc,
+  names: &[String],
+  (xattrs, mut region_offset): (Vec<XattrEmission>, u64),
+  pace: &Ticks,
+) {
+  for xattr in xattrs {
+    pace.tick().await;
+    let op = match xattr {
+      XattrEmission::Set(path, name, value) => {
+        let value_len = value.len() as u64;
+        let op = set_xattr_op(
+          index_in(names, &path),
+          index_in(names, &name),
+          region_offset,
+          value_len,
+        );
+        region_offset = region_offset.saturating_add(value_len);
+        op
+      }
+      XattrEmission::Removed(path, name) => {
+        remove_xattr_op(index_in(names, &path), index_in(names, &name))
+      }
+    };
+    doc.ops.push(op);
+  }
 }
 
 /// Pushes a file's content ops into the document, setting their path index and giving each content-adding op the
