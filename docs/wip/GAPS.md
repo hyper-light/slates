@@ -3784,7 +3784,9 @@
 >   root, remote or labelling stays refused typed. Owed: that profile's live check by use (filed 2026-11-19: `slates
 >   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
 >   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
->   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+>   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured. **Built 2026-11-20
+>   (A-769, `CONTRACT` = 57):** the export route's judge (`container_engine::export_engine`), asked on every host:
+>   Windows' Docker Desktop over its named pipe is taken, mounting the export from its VM; owed: its run on Windows;
 > - **a volume exported to one client, built 2026-11-19 (A-521, `CONTRACT` = 50; kiln's Kubernetes engine, kiln goal
 >   28e73c34's part 01a1f124, its `docs/agentic.md` W10):** §4.6's export was the command line's (`slates export`) and
 >   the raw client's alone, so a host that drives slates through the library alone (kiln) could not serve a pod's volume

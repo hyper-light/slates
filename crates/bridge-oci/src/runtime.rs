@@ -276,6 +276,9 @@ pub enum ProfileRefusal {
     /// The host.
     host: &'static str,
   },
+  /// The engine runs rootless, and a rootless engine can't mount a volume's NFS export itself (A-520's export route:
+  /// the kernel mounts a file system for a process with `CAP_SYS_ADMIN` in its initial user namespace alone).
+  RootlessCannotMount,
 }
 
 impl std::fmt::Display for ProfileRefusal {
@@ -301,6 +304,9 @@ impl std::fmt::Display for ProfileRefusal {
       Self::ProfileUntested { engine, host } => write!(
         f,
         "ProfileUntested: no container workload has run through {engine:?} on {host}"
+      ),
+      Self::RootlessCannotMount => f.write_str(
+        "RootlessCannotMount: the engine runs rootless, and a rootless engine can't mount a volume's NFS export itself",
       ),
     }
   }
@@ -437,6 +443,81 @@ pub fn judge(profile: &RuntimeProfile, host: Host) -> Result<TestedProfile, Prof
       identity: IdentityRule::ContainerRootAsMountingUser,
       hard_links: HardLinkRule::EveryNameServedAtOnce,
     }),
+    _ => Err(ProfileRefusal::ProfileUntested {
+      engine: profile.operating_system.clone(),
+      host: host.name(),
+    }),
+  }
+}
+
+/// Format: what put the export route's profiles through a container workload: kiln's drives of an agent in a container
+/// on its volume's export (`slates_e2e`'s `container::`, A-520's fifth piece), and its A/B of the export route against
+/// the bind (`workspace::container_ab_tests`), each on the host it names.
+const EXPORT_TESTED_BY: &str = "kiln's container drives and A/B (A-520's export route)";
+
+/// Where an engine mounts a volume's NFS export from (A-520's export route): the engine makes an ordinary volume of its
+/// own from the export (Docker's and podman's `local` driver, `type=nfs`) and mounts it where it runs its containers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountsFrom {
+  /// This host's own kernel, reaching the daemon's NFS listener at its loopback: a rootful Docker Engine, or podman run
+  /// as root, on its own Linux host.
+  HostKernel,
+  /// Docker Desktop's Linux VM, reaching this host's loopback as `host.docker.internal`: on macOS (the
+  /// Virtualization framework's VM) and on Windows (WSL 2's), where Slates' NFS server runs too (A-184).
+  DesktopVm,
+}
+
+/// The export route's profile: the evidence it holds and where the engine mounts the export from ([`judge_export`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExportProfile {
+  /// What put a container workload through this profile.
+  pub test: &'static str,
+  /// The profile, in words.
+  pub description: &'static str,
+  /// Where the engine mounts the export from.
+  pub mounts_from: MountsFrom,
+}
+
+/// Whether `profile` on `host` can mount a volume's NFS export as an engine volume of its own (A-520's export route),
+/// and from where; or why not, typed. No share of the host's folders plays a part, so none of the bind's rules does
+/// ([`judge`]'s identity and hard-link rules): the container runs as the uid the export is bound to and every other id
+/// is a stranger to Slates (A-115). Refused: a rootless engine (it can't mount a file system), one that remaps users
+/// (the export's uid would not be the container's), one that labels for SELinux (an NFS mount is labelled whole, which
+/// nothing authorizes), and every engine on a host it doesn't run on as named here.
+pub fn judge_export(profile: &RuntimeProfile, host: Host) -> Result<ExportProfile, ProfileRefusal> {
+  if profile.rootless {
+    return Err(ProfileRefusal::RootlessCannotMount);
+  }
+  if profile.user_namespace_remap {
+    return Err(ProfileRefusal::UserNamespaceUntested);
+  }
+  if profile.selinux_labels {
+    return Err(ProfileRefusal::SelinuxLabelsUntested);
+  }
+  let profile_of = |description: &'static str, mounts_from| {
+    Ok(ExportProfile {
+      test: EXPORT_TESTED_BY,
+      description,
+      mounts_from,
+    })
+  };
+  match (profile.engine, &profile.endpoint, host) {
+    (Engine::DockerDesktop, Endpoint::UnixSocket(_), Host::MacOs) => profile_of(
+      "Docker Desktop on macOS over its local socket, its VM mounting the export at host.docker.internal",
+      MountsFrom::DesktopVm,
+    ),
+    (Engine::DockerDesktop, Endpoint::NamedPipe(_), Host::Windows) => profile_of(
+      "Docker Desktop on Windows over its named pipe, its WSL 2 VM mounting the export at host.docker.internal",
+      MountsFrom::DesktopVm,
+    ),
+    (Engine::DockerEngine, Endpoint::UnixSocket(_), Host::Linux) => profile_of(
+      "a rootful Docker Engine on its own Linux host over its local socket, the host's kernel mounting the export at its loopback",
+      MountsFrom::HostKernel,
+    ),
+    (Engine::Podman, Endpoint::Local, Host::Linux) => profile_of(
+      "podman run as root on its own Linux host, the host's kernel mounting the export at its loopback",
+      MountsFrom::HostKernel,
+    ),
     _ => Err(ProfileRefusal::ProfileUntested {
       engine: profile.operating_system.clone(),
       host: host.name(),
