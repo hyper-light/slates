@@ -770,3 +770,51 @@ fn a_key_lookup_that_must_wait_defers_its_request() {
     (vec![52], true, Err(SessionUse::NoKeyWanted))
   );
 }
+
+/// A-745 (found by use, w-interop: an SSH clone wrote 25 MB, then the daemon and the client both sat at 0% CPU). RFC
+/// 4253 §9: a party must keep reading its peer's exchange while its own data waits for new keys. Do: start the server's
+/// own key exchange, then queue data on the session until it takes no more (its outbox at its cap, the client's window
+/// far larger, so the outbox is what stops it); then hand the client the server's `KEXINIT` and let both sides run.
+/// Expect the exchange recorded as the key time's, the client's exchange read, the server's new keys taken (a second
+/// `NEWKEYS`), every queued byte delivered after them, and `Writable` raised: the session never stops reading input on an outbox that only the exchange it is
+/// waiting for can drain.
+#[test]
+fn a_rekey_with_its_outbox_full_still_reads_the_clients_exchange() {
+  let mut configured = config();
+  configured.transport.key_time_ns = 1_000;
+  let (mut pair, channel) = fetching(configured, u32::MAX >> 1, 1 << 15);
+  let _ = channel;
+  pair.server.poll_timers(1_000).unwrap();
+  let trigger = pair.server.take_rekey().map(|rekeyed| rekeyed.trigger);
+  let kexinit = pair.server.pending_output().to_vec();
+  let chunk = vec![7u8; 1 << 15];
+  let mut queued = 0usize;
+  loop {
+    let taken = pair.server.send_data(&chunk).unwrap();
+    if taken == 0 {
+      break;
+    }
+    queued += taken;
+  }
+  pair.server.consume_output(kexinit.len()).unwrap();
+  pair.client.feed(&kexinit);
+  pair.pump().unwrap();
+  let delivered: usize = pair
+    .client
+    .received
+    .iter()
+    .filter(|payload| payload.first() == Some(&94))
+    .map(|payload| payload.len().saturating_sub(9))
+    .sum();
+  let writable = pair.events.contains(&SessionEvent::Writable);
+  assert!(queued > 0, "nothing was queued");
+  assert_eq!(
+    (pair.client.server_newkeys, delivered, writable, trigger),
+    (
+      2,
+      queued,
+      true,
+      Some(crate::transport::RekeyTrigger::KeyTime)
+    )
+  );
+}

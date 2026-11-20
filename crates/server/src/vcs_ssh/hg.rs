@@ -8,7 +8,8 @@
 //! handshake is `hello`, then `between` with the null pair), each request is served once it is whole and the last
 //! answer has gone to the channel, an error's words go on standard error before its empty line on standard output, and
 //! the session ends at an empty line, at a request it cannot read, or at the end of the client's input once the whole
-//! requests before it are served. It then exits 0 whatever it answered ([`EXIT_STATUS`]), as `hg serve --stdio` does.
+//! requests before it are served. It then exits 0 whatever it answered (`EXIT_STATUS`), as `hg serve --stdio` does,
+//! but where an answer was refused past its stream's start (`Stdio::exit_status`, A-745).
 //! The input a step consumed is given back to the channel's window. Bytes that arrive after the session ended, which it
 //! drops as an exited process reads none, are given back at the next step, so the window is never left short.
 //!
@@ -53,7 +54,7 @@
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_hg::Admission;
-use slates_hg::serve::stdio::{EXIT_STATUS, PastWindow, Progress, Push, Stdio};
+use slates_hg::serve::stdio::{PastWindow, Progress, Push, Stdio};
 
 use super::channel_window;
 use super::site::{self, ClientGone, Command, HG_ABORT_STATUS, Next, Refused, Service, Stepped};
@@ -234,7 +235,7 @@ impl<S: HgStores> Command for HgCommand<S> {
       Progress::Waiting => (0, Next::Input),
     };
     let next = if stdio.finished() {
-      Next::Exited(EXIT_STATUS)
+      Next::Exited(stdio.exit_status())
     } else {
       next
     };

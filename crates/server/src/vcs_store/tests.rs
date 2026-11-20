@@ -242,7 +242,11 @@ fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
   let mut rows = vec![Kind::Blob.pack_number()];
   rows.extend_from_slice(&noted.identity.0);
   rows.extend_from_slice(&2u64.to_le_bytes());
-  assert_eq!(identity, slates_vcs::ContentId::of(&rows), "the names' identity is the BLAKE3 of their rows");
+  assert_eq!(
+    identity,
+    slates_vcs::ContentId::of(&rows),
+    "the names' identity is the BLAKE3 of their rows"
+  );
   let bytes = writer
     .finish_named((&content, FORMAT), |_| true, (3, &moves), (identity, count))
     .expect("written");
@@ -1113,7 +1117,10 @@ fn t_a724_a_version_3_record_replays_from_its_names_by_identity_and_refuses_with
   let names_charge = content.used();
   let mut store = GitStore::new(FORMAT, WINDOW);
   replay_git(&mut content, &mut store, &v3).expect("replayed from its names");
-  assert!(content.holders(&identity) >= 1, "the names are held for the record");
+  assert!(
+    content.holders(&identity) >= 1,
+    "the names are held for the record"
+  );
   let made = Live {
     content,
     store,
@@ -1131,11 +1138,14 @@ fn t_a724_a_version_3_record_replays_from_its_names_by_identity_and_refuses_with
   let mut store = GitStore::new(FORMAT, WINDOW);
   assert!(matches!(
     replay_git(&mut bare, &mut store, &v3),
-    Err(ReplayRefused::Names(super::record_names::NamesRefused::Rows(
-      slates_vcs::rows::RowsRefused::Missing
-    )))
+    Err(ReplayRefused::Names(
+      super::record_names::NamesRefused::Rows(slates_vcs::rows::RowsRefused::Missing)
+    ))
   ));
-  assert!(store.versions(0).is_empty(), "a refused replay made nothing");
+  assert!(
+    store.versions(0).is_empty(),
+    "a refused replay made nothing"
+  );
 }
 
 /// The last case of [`t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing`]: a record whose head names a

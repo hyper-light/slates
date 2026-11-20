@@ -22,8 +22,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 
 /// The machine profile this binary's daemons derive from, measured **once per process** (§4.1), as production
 /// measures once at the anchor's boot. Measured afresh per test, the wake probe runs beside the other tests'
@@ -275,11 +273,10 @@ fn submit_lists(client: &mut Client, driver: &mut Driver, count: usize) -> (Vec<
 }
 
 /// Connects from the loop: the claim begun, then polled at the pacing it asks for, every step timed.
+/// The claim waits while the rendezvous's holder lives (A-468), so a refused begin is the test's failure, never a wait
+/// (until 2026-11-20 retried five seconds, `START_WAIT`).
 fn connect_from_the_loop(instance: &str, deadlines: Deadlines, ticker: &mut Ticker) -> Client {
-  let started = Instant::now();
-  loop {
-    let step = Instant::now();
-    let connect_switches = slates_machine::bench::involuntary_switches();
+  {
     match Client::begin_connect(instance, deadlines) {
       Ok(mut connecting) => loop {
         let step = Instant::now();
@@ -301,16 +298,6 @@ fn connect_from_the_loop(instance: &str, deadlines: Deadlines, ticker: &mut Tick
           Err(e) => panic!("{e}"),
         }
       },
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        ticker.note(
-          "Client::begin_connect",
-          step.elapsed(),
-          slates_machine::bench::involuntary_switches_since(connect_switches),
-        );
-        std::hint::spin_loop();
-      }
       Err(e) => panic!("{e}"),
     }
   }
@@ -530,10 +517,10 @@ fn a_ready_call_is_reported_once_until_it_is_finished() {
       Box::new(|client: &mut Client| client.list_begin()),
     )
     .unwrap();
-  let started = Instant::now();
   let first = loop {
     let events = driver.pump(&mut client);
-    if !events.is_empty() || started.elapsed() > START_WAIT {
+    // Waited for while the daemon lives (A-232's rule; until 2026-11-20 five seconds, `START_WAIT`).
+    if !events.is_empty() {
       break events;
     }
     std::hint::spin_loop();

@@ -256,7 +256,11 @@ impl RecordWriter {
       .map_err(|_| WriteRefused::Allocation)?;
     write_head(
       &mut out,
-      if named.is_some() { VERSION_NAMED } else { VERSION },
+      if named.is_some() {
+        VERSION_NAMED
+      } else {
+        VERSION
+      },
       (deepest, moves),
     );
     match named {

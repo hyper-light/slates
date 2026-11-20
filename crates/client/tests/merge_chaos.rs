@@ -18,7 +18,7 @@
   clippy::indexing_slicing
 )]
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use slates_client::{Client, ClientError, Deadlines, ReadAt, Submitted, VolumeId};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -29,8 +29,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards for the test daemon: two, so clients land on both and their submits cross to the green's shard.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while the daemon starts.
-const START_WAIT: Duration = Duration::from_secs(10);
 /// Shape: the racing clients.
 const CLIENTS: usize = 8;
 /// Shape: submits per client.
@@ -47,13 +45,12 @@ fn deadlines() -> Deadlines {
 }
 
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
   loop {
     match Client::connect(instance, deadlines()) {
       Ok(client) => return client,
-      Err(ClientError::Ipc(
-        slates_ipc::IpcError::DaemonUnavailable { .. } | slates_ipc::IpcError::RingFull,
-      )) if started.elapsed() < START_WAIT => std::thread::yield_now(),
+      // A full ring is waited out while the daemon lives (A-571); a refused claim is the test's failure (A-468; until
+      // 2026-11-20 both were retried ten seconds, `START_WAIT`).
+      Err(ClientError::Ipc(slates_ipc::IpcError::RingFull)) => std::thread::yield_now(),
       Err(e) => panic!("{e}"),
     }
   }

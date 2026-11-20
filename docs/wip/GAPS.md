@@ -227,6 +227,11 @@
 > answer is (`session::Producing`); its bytes are `render::revlogs`' byte for byte (test), a step's least room below the
 > whole answer's (test), and a stream clone of a file twice a request's room is answered through the daemon's edge
 > (test). Owed: `stream2` (bundle2's stream part) and stock `hg clone --stream` by use; w-interop's matrix rerun.
+> FIXED (found by use, w-interop: `ssh-clone` stalled at 25 MB with both sides idle): an SSH session stopped reading
+> its client while its outbox was full of sends a key re-exchange held back, so the exchange could never end
+> (`Session::blocked` now reads on while `ServerTransport::is_rekeying`); every rekey is logged with its trigger
+> (`docs/bugs/2026-11-20-an-ssh-clone-stalled-at-a-rekey-with-its-outbox-full.md`). An answer refused past its
+> stream's start ends the SSH session as an abort, 255 and its words on stderr (it exited 0).
 > `stream2` as stock 7.2 writes it (read 2026-11-20 from Homebrew's 7.2, `hg bundle --type 'none-v2;stream=v2'` of two
 > public changesets): one mandatory part with `bytecount`, `filecount` and the quoted `requirements`; each entry its
 > vfs byte (`s` store, `c` cache), the name's and the data's lengths as uvarints, the name, the data; small revlogs
@@ -7081,7 +7086,11 @@
 >   `server/tests` since 2026-11-20 (g226, main's ruling): `recovery` (a connect, two create retries, a pool's return,
 >   a heartbeat's stop, a stop's end and nine condition loops), `give_back`, `cross_shard_wait`, `consumers`,
 >   `attachment_term`, `reply_room` and `forward_retry` wait on their event while the daemon lives, its watchdog the
->   bound (A-232). Owed: `client/tests` and its examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
+>   bound (A-232). In `client/tests` since 2026-11-20 (g226): `driver`, `merge_identity`, `merge_chaos`,
+>   `edit_and_submit`, `merge_post_state`, `async_core`, `waits`, `consumer`, `client` and `lone_daemon` (a connect is
+>   one claim, a full ring is waited out, a listing, a reply, an edit, a seat and a returned id are waited for while the
+>   daemon lives, a child's tagged line while the child lives, `lone_daemon`'s role a clear memory level in the host's
+>   place). Owed: the client's examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
 >   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the

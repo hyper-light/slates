@@ -54,6 +54,10 @@ use crate::ssh::{self, Read};
 /// answered.
 pub const EXIT_STATUS: u32 = 0;
 
+/// Format: the status a session ends with where an answer failed past its stream's start, as 7.2's `hg serve --stdio`
+/// exits on an abort (`error.Abort`'s `detailed_exit_code`, 255 without detailed codes).
+pub const FAILED_STATUS: u32 = 255;
+
 /// Format: the command a push's bundle is sent with, and the argument its spec names (`unbundle`, `heads`).
 const UNBUNDLE: &[u8] = b"unbundle";
 /// Format: see [`UNBUNDLE`].
@@ -88,6 +92,9 @@ pub struct Stdio {
   push_room: Option<u64>,
   /// A `getbundle`'s answer being made a slice at a time (A-745): the session serves no other request until it ends.
   answering: Option<session::Producing>,
+  /// Whether an answer was refused past its stream's start: the session ends as a process that failed does, its
+  /// refusal on standard error, never with the status of one that served (A-745).
+  failed: bool,
 }
 
 /// A push this session took whole (the module doc's push): its `heads` argument, its bundle's bytes, and what is left of
@@ -166,6 +173,7 @@ impl Stdio {
       push: Pushing::None,
       push_room: None,
       answering: None,
+      failed: false,
     }
   }
 
@@ -248,8 +256,15 @@ impl Stdio {
         Progress::Streamed { more: false }
       }
       Err(refusal) => {
+        // Past its start a stream cannot carry an error part where the client reads one, so the session ends as 7.2's
+        // process does when it fails mid-stream: its words on standard error, a failing status.
         self.answering = None;
         self.ended = true;
+        self.failed = true;
+        let words = session::message(&Refused::Serve(refusal));
+        self.stderr.extend_from_slice(b"abort: ");
+        self.stderr.extend_from_slice(&words);
+        self.stderr.push(b'\n');
         Progress::Stepped {
           step: Step::Ended {
             refused: Some(Refused::Serve(refusal)),
@@ -486,9 +501,20 @@ impl Stdio {
     self.ended
   }
 
-  /// Whether the session has ended and every answer was taken: the caller ends the channel with [`EXIT_STATUS`].
+  /// Whether the session has ended and every answer was taken: the caller ends the channel with
+  /// [`Stdio::exit_status`].
   pub fn finished(&self) -> bool {
     self.ended && self.stdout.is_empty() && self.stderr.is_empty()
+  }
+
+  /// The status the session's channel ends with: [`EXIT_STATUS`], or [`FAILED_STATUS`] where an answer was refused past
+  /// its stream's start.
+  pub fn exit_status(&self) -> u32 {
+    if self.failed {
+      FAILED_STATUS
+    } else {
+      EXIT_STATUS
+    }
   }
 }
 
