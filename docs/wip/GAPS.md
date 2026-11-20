@@ -2878,8 +2878,15 @@
 > the control shard held alone by busy work for the old budget at this build's cost and a window more; Adas-Mac-Studio-4,
 > base cdfbb4020: busy 31.8 s and the watch still waiting after it, ending at its reason at 32.3 s; with the change
 > reversed, the wait ended at 31.4 s while the shard was busy for 32.2 s, the refusal the daemon stopped on). Owed (w-k90-vendor):
-> slicing the encode poll (`git_encode.rs:345`); owed (R3): `OBSERVE_BUDGET_NS`, ten liveness windows, still bounds every
-> other observation.
+> slicing the encode poll (`git_encode.rs:345`). The same hazard in every other default observation since 2026-11-20
+> (g226, main's ruling): `Daemon::observe` had the observe budget, ten liveness windows, and a shard that stepped busy
+> past that budget's CPU without reaching the question refused it; a default observation now waits while its shard
+> lives (`Observation::patient`, looked at every liveness window, ended only by the shard's going; A-232's rule), and its
+> watchdog ends a stuck one (`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`, base 26e125adb:
+> the control shard held alone 31.6 s, answered after it; with the change reversed, refused at 31.9 s mid-work; and
+> `a_patient_wait_goes_on_while_the_shard_lives_and_ends_at_its_going`). Owed (R3): `OBSERVE_BUDGET_NS` still caps the
+> watchdog's window (`WINDOW_CEILING_NS`), the anchor's lapse bound and `live_ship`'s key wait, and bounds the daemon's
+> test-support waits (an explicit observation's budget is its asker's).
 
 > **A forward lane's floor was logged once a forward: about a million lines, 260 MB, in one flow (2026-11-20; CLOSED,
 > g226; found by w-fed-faults).** A lane left with nothing was dropped, so each forward made it afresh and measured its
