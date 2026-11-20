@@ -22,3 +22,18 @@ I'm changing, on branch agents/w-bugs-svnfetch-* (red first):
 - crates/server/src/vcs_svn.rs and crates/server/src/vcs_http/svn.rs (each turn bounded by the shard's quantum, as
   A-745's vcs_http/hg.rs HgExchange::turn does; the generation the report began on held).
 If you're mid-change in any of these, tell main and I'll rebase onto yours.
+
+## 2026-11-20, from w-bugs: the svn fetch change's whole file list (branch agents/w-bugs-svnslice)
+Beyond the files above, the change touches:
+- crates/svn/src/serve.rs: one new method, `Connection::fetching()`.
+- crates/svn/src/dav/site.rs: `Report::resume` now takes a `Budget` (re-exported from report::exchange), not a room.
+- crates/svn/src/report/exchange.rs: `Budget` gains `quantum: Option<Quantum>`. Every `Budget { room, steps }` literal
+  needs `quantum: None`.
+- crates/server/src/vcs_store.rs: `SvnStore.generation`; `free()` keeps a held store's records aside
+  (hold_svn / release_svn_hold / held_svn_records).
+- crates/server/src/vcs_store/svn_view.rs: SvnHold, hold_in, lend_held_in.
+- crates/server/src/vcs_ssh/{svn.rs,daemon_edge.rs}: the tunnel's budget timed by the quantum.
+- tests in crates/svn/src/{report/exchange,dav/site,dav/report_file_revs}/tests.rs and
+  crates/server/src/{repository/svn_commit,vcs_http,vcs_ssh}/tests.
+drive.rs is untouched. No overflow is split: a call that would pass the room after others is held whole for the next
+slice.
