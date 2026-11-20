@@ -176,3 +176,7 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   follow owner epochs: takeover release_certified, retain_object late copies, tombstone forget_object, ledger
   compaction). Keep it keyed by content id; healer reads membership + rank only.
 - NEXT: P6 fleet half per Q3; then 9b.
+- 58f756e0a LANDED P6 region rule: slates_db::identity_homes (homes, heal) by membership+rank only.
+- P6 transport PROPOSED to goal-91 + w-shared (inbox goal91-...md, bottom): HomeContent/HomeRead/HomeLetGo request kinds
+  keyed by content id, authority = configuration's homes(), ack after home image; healer per config change. Waiting.
+- NEXT: 9b (repository record's b; range rows routing) while waiting; 8c v3 switch after A-727 a3.
