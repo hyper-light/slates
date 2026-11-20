@@ -218,8 +218,8 @@ pub fn encode_lines(base: &[u8], text: &[u8], out: &mut Vec<u8>) -> Result<(), R
       if let Some(run) = open.take() {
         hunk_of(run, (kept, put), text, out)?;
       }
-      at_old += 1;
-      at_new += 1;
+      at_old = at_old.saturating_add(1);
+      at_new = at_new.saturating_add(1);
       continue;
     }
     let from_base = left.map_or(base.len(), |(at, _)| at);
@@ -227,15 +227,15 @@ pub fn encode_lines(base: &[u8], text: &[u8], out: &mut Vec<u8>) -> Result<(), R
     open.get_or_insert((from_base, from_text));
     match (left, right) {
       (Some((_, line)), Some((_, other))) => match key(line).cmp(key(other)) {
-        core::cmp::Ordering::Less => at_old += 1,
-        core::cmp::Ordering::Greater => at_new += 1,
+        core::cmp::Ordering::Less => at_old = at_old.saturating_add(1),
+        core::cmp::Ordering::Greater => at_new = at_new.saturating_add(1),
         core::cmp::Ordering::Equal => {
-          at_old += 1;
-          at_new += 1;
+          at_old = at_old.saturating_add(1);
+          at_new = at_new.saturating_add(1);
         }
       },
-      (Some(_), None) => at_old += 1,
-      _ => at_new += 1,
+      (Some(_), None) => at_old = at_old.saturating_add(1),
+      _ => at_new = at_new.saturating_add(1),
     }
   }
   match open {

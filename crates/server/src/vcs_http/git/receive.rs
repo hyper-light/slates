@@ -138,6 +138,9 @@ impl<L: ShardLender> Exchange for Receive<L> {
   }
 
   async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
+    // The client's going ends a hook's run alone, and no hook runs off unix.
+    #[cfg(not(unix))]
+    let _ = gone;
     if self.advertise {
       return Ok(());
     }
@@ -159,6 +162,7 @@ impl<L: ShardLender> Exchange for Receive<L> {
       match step {
         Answering::Answered(_) => return Ok(()),
         Answering::Turned => slates_rt::futures::yield_now().await,
+        #[cfg(unix)]
         Answering::Hook(call) => {
           let answer = call.run(gone.gone()).await;
           lender

@@ -400,7 +400,7 @@ impl Hg {
   }
 
   fn land(&mut self, state: &mut ShardState, prepared: Prepared) -> Landed {
-    let landed = land(state, (&owner(), self.repository), prepared, &mut room());
+    let landed = land(state, (&owner(), self.repository), prepared);
     assert_eq!(
       landed.released,
       Ok(()),
@@ -722,9 +722,14 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
     let bundle = fixture!("push-plain.hg");
     let unbundle = stock(bundle);
     let (_, part) = unbundle.changegroup().unwrap();
-    let forked = super::take_whole(state, hg.repository, part, &mut room())
-      .unwrap()
-      .unwrap();
+    let forked = super::take_whole(
+      state,
+      hg.repository,
+      (part.version, part.payload.clone()),
+      &mut room(),
+    )
+    .unwrap()
+    .unwrap();
     let other = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[2])))],
     };
@@ -766,9 +771,14 @@ fn two_pushes_taken_side_by_side_both_land() {
     };
     let fork_of = |state: &mut ShardState, unbundle: &Unbundle| {
       let (_, part) = unbundle.changegroup().unwrap();
-      super::take_whole(state, hg.repository, part, &mut room())
-        .unwrap()
-        .unwrap()
+      super::take_whole(
+        state,
+        hg.repository,
+        (part.version, part.payload.clone()),
+        &mut room(),
+      )
+      .unwrap()
+      .unwrap()
     };
     let (first_fork, second_fork) = (fork_of(state, &first), fork_of(state, &second));
     let principal = owner();
@@ -833,9 +843,14 @@ fn a_push_is_refused_when_a_green_it_only_checked_moved() {
     // Its changegroup taken into its fork first (A-720); another push moves `stable`; then it lands as the driver lands
     // it, its stale fork re-based and `check:heads` judged at landing.
     let (_, part) = checked.changegroup().unwrap();
-    let forked = super::take_whole(state, hg.repository, part, &mut room())
-      .unwrap()
-      .unwrap();
+    let forked = super::take_whole(
+      state,
+      hg.repository,
+      (part.version, part.payload.clone()),
+      &mut room(),
+    )
+    .unwrap()
+    .unwrap();
     let again = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[5])))],
     };

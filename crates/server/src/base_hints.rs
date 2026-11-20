@@ -27,7 +27,9 @@ use std::collections::BTreeSet;
 
 use slates_mem::Handle;
 
-use crate::state::{self, ShardState, VolumeSlot};
+#[cfg(unix)]
+use crate::state;
+use crate::state::{ShardState, VolumeSlot};
 
 /// Counter: overlay volumes whose watcher hints could not be processed (the host refused a re-check); the hints are
 /// taken again at the watcher's next report, so none is lost, but a refusal is never silent.

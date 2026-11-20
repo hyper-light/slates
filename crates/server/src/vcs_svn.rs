@@ -1166,9 +1166,8 @@ fn land_locks(
     (principal, opened.id),
     slates_svn::commit::record::Record::Locks(entries),
   )
-  .map_err(|failure| {
+  .inspect_err(|_| {
     crate::fleet::count_refusal(LOCKS_REFUSED);
-    failure
   })
 }
 
@@ -1463,20 +1462,26 @@ pub(crate) struct HookAnswer {
 /// repository's name beneath `/`, as `SVNParentPath` lays repositories out, until A-645's read-only FSFS-layout view
 /// gives `svnlook` a directory to read: design §4.17.4 item 9).
 pub(crate) struct Hooked {
-  /// The repository's id, which its hooks' learned times are kept under.
+  /// The repository's id, which its hooks' learned times are kept under (unix alone, where hooks run).
+  #[cfg(unix)]
   id: RepositoryId,
   /// Its name, which its record is found by on its owner shard.
   name: String,
-  /// REPOS.
+  /// REPOS (unix alone, where hooks run).
+  #[cfg(unix)]
   repos: String,
 }
 
 impl Hooked {
   /// What the hooks of the repository `id`, named `name`, need of it.
   pub(crate) fn new(id: RepositoryId, name: &str) -> Self {
+    #[cfg(not(unix))]
+    let _ = id;
     Self {
+      #[cfg(unix)]
       id,
       name: name.to_owned(),
+      #[cfg(unix)]
       repos: format!("/{name}"),
     }
   }
