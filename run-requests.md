@@ -6781,3 +6781,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-git main 20ffba05f (A-719 part 1, push checks sliced): clippy + xtask; Linux/Windows cargo test -p slates-git --lib -- receive:: and -p slates-server --lib -- git_push:: vcs_http::git:: vcs_ssh::receive; git-matrix push rows by use
 - 2026-11-20 w-reaper tick-name cleanup (main 4c6445f): owed (main): Linux compile of crates/server/tests/recovery.rs (IDLE_INTERVALS_WATCHED, cfg linux); clippy.
 - A-721 landed main 0cb5120b1: rerun w-perf's 5,000-revision svn import (refused record must no longer wedge commits) [w-svn]
+- 2026-11-20 w-shared A-664 holders' maps (main f0b23d651): clippy + xtask; Linux/Windows `cargo test -p slates-server --lib -- vcs_store::paths:: vcs_store::commits::`; the fleet gate by use (a git repository's owner killed, its successor answering a stock clone and taking the next submit)
