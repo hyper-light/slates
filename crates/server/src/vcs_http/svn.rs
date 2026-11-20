@@ -1062,7 +1062,7 @@ impl<S: SvnStores> SvnExchange<S> {
               .answers
               .iter()
               .find(|(named, _)| *named == path)
-              .map(|(_, answer)| answer.as_ref().map(|()| ()));
+              .map(|(_, answer)| answer.as_ref().map(|_unit| ()));
             match decided {
               Some(decided) => {
                 let answer = locking::unlock_answer(&request, decided, &filesystem);
