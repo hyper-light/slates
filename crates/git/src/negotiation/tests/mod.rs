@@ -1863,6 +1863,41 @@ fn a_negotiation_past_its_admission_is_refused() {
   );
 }
 
+/// A-745 (§4.17.1 "A fetch's answer", rule 1: a fetch's working set is bounded whatever the repository's size). Do: make
+/// a straight history of 3,000 commits, each with a tree of its own blob, given positions as one push gives them (every
+/// blob, then every tree, then every commit, each kind one run), and clone it, every object wanted and none held, within
+/// 4 KiB. Expect: the pack's 9,000 objects chosen, as one run: what the walk keeps is a run a range of positions,
+/// where its sets and stacks had charged 8 bytes and more an object (72,000 for the objects alone).
+#[test]
+fn a745_a_long_history_pushed_in_one_piece_is_negotiated_within_a_few_kilobytes() {
+  const COMMITS: usize = 3_000;
+  let mut graph = TestGraph::default();
+  let blobs: Vec<u32> = (0..COMMITS)
+    .map(|n| graph.new_blob(u64::try_from(n).unwrap() + 1))
+    .collect();
+  let trees: Vec<u32> = blobs.iter().map(|blob| graph.new_tree(&[*blob])).collect();
+  let mut head = None;
+  for (n, tree) in trees.iter().enumerate() {
+    let parents: Vec<u32> = head.into_iter().collect();
+    head = Some(graph.new_commit(&parents, *tree, u64::try_from(n).unwrap()));
+  }
+  let asks = Asks {
+    wants: vec![graph.id(head.unwrap())],
+    done: true,
+    ..Asks::default()
+  };
+  let outcome = negotiate(&graph, &asks.request(), &mut Admission::new(4096)).unwrap();
+  let Answer::Pack(pack) = outcome.answer else {
+    panic!("{:?}", outcome.answer)
+  };
+  assert_eq!(pack.objects.len(), u64::try_from(3 * COMMITS).unwrap());
+  assert_eq!(
+    pack.objects.runs(),
+    1,
+    "blobs, trees and commits, one push's positions, make one run"
+  );
+}
+
 /// A-615 part 2 (`list-objects-filter.c` `filter_trees_depth`: a tree met again shallower is walked again, "minimum
 /// depth if an object is located at multiple depths"): do fetch two unrelated commits under `tree:4`, the first holding
 /// a tree `x` at depth 2 and the second at depth 1, `x` holding a tree that holds a blob. Expect: the blob, at depth 4
