@@ -45,3 +45,19 @@ Still owed before the gate turns on:
 2. The release A/B, v2 against v3, with the publication-interval cost.
 3. Names past one window: w-perf's BLAKE3 alias image piece, and an appended put-in-parts on the wire (one message caps
    at 1 MiB). Until then pushes whose names exceed a window write v2.
+
+### 2026-11-20: v3's takeover test is blocked on repository takeover itself (question, base c655a45c1)
+Landed since: 36c6ed55d (a rebuild reads a v3 record's names from their region homes, `homes::read_in_region`; tested
+with the home on another shard) and 6e9d2eeaf (a home's wait publishes its shard itself when nothing has; before,
+publications were event-driven only, so a homed window could wait forever).
+The takeover test you asked for (owner killed after a v3 push, a successor on another node replays it and serves the
+names) needs the successor to HAVE the push records. `takeover::rebuild_repository` applies
+`Op::RepositoryRebuilt { record, parts }` (parts = the names/phases/markers/locks logs) and then `vcs_store::rebuild`,
+which replays `object_record`s from the successor's own partition register. I find nothing that ships a departed
+owner's push records (the register's `objects`) to a successor, and no test proves it for v2 either. The only takeover
+test (`fleet::tests::a_successor_rebuilds_a_repository_whole_from_the_logs_it_holds`) holds names logs alone.
+Question: who owns A-636's repository takeover, and do push records reach a successor today? If they do, point me at
+it and I'll write the test (in-crate, the gate on for the test's shards). If not, the v3 gate stays off until A-636
+ships push records, and I'll take that work if you assign it.
+Meanwhile the A/B (v2 against v3, release, best of N with all N, the publication cost) is ready to run on the 32-core
+Studio as soon as it answers kiln again (it hasn't for hours; SSH is refused there).
