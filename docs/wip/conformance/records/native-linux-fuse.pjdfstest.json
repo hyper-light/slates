@@ -4,39 +4,36 @@
   "transport": "native-linux-fuse",
   "host": {
     "os": "Ubuntu 26.04.1 LTS",
-    "kernel": "Linux 7.0.0-1019-azure",
+    "kernel": "Linux 7.0.0-1020-azure",
     "arch": "x86_64",
     "privilege": "root"
   },
-  "date": "2026-11-18",
-  "command": "sudo -n sh <each of 238 tests/**/*.t of pjd/pjdfstest@85a8aea> in a directory inside the mount; binary <scratch>/tools/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7/pjdfstest",
+  "date": "2026-11-20",
+  "command": "sudo -n sh <each of 238 tests/**/*.t of pjd/pjdfstest@85a8aea> in a directory inside the mount that root owns (owner and group 0); binary <scratch>/tools/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7/pjdfstest",
   "bound": "every test file at the pinned commit (238 files), 300s per file",
   "outcome": {
-    "kind": "limited",
-    "adapter": "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS)",
-    "not_covered": "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with `user_allow_other`)",
+    "kind": "ran",
     "counts": {
       "suite": "pjdfstest",
       "files": 238,
       "cases": 8798,
-      "passed": 8768,
-      "failed": 2,
+      "passed": 8770,
+      "failed": 0,
       "needs_root": 0,
       "todo": 28,
-      "expected_failures": 2,
+      "expected_failures": 0,
       "unexpected_failures": 0,
       "listed_now_passing": 0
     }
   },
   "expected_failure_list": {
     "path": "docs/wip/conformance/expected-failures/native-linux-fuse.pjdfstest.txt",
-    "blake3": "53507cfdea2ea24304014952c3055f6d7cfbdafb8f884527a08b9aa6f89b2dc5",
-    "entries": 2
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "entries": 0
   },
-  "duration_ms": 259487,
+  "duration_ms": 194910,
   "notes": [
     "pjdfstest: pjd/pjdfstest@85a8aea (BSD-2-Clause), tarball sha256 2005cdd83b76204177cf136792b1f2058a7418b4fc5b203f51274a698547d754, built `cc -O2 -w -I. pjdfstest.c` over a config.h the harness probed (HAVE_: FACCESSAT FCHMODAT FCHOWNAT FSTATAT LCHMOD LINKAT MKDIRAT MKFIFOAT MKNODAT OPENAT POSIX_FALLOCATE READLINKAT RENAMEAT SYMLINKAT UTIMENSAT SYS_SYSMACROS_H STRUCT_STAT_ST_ATIM STRUCT_STAT_ST_CTIM STRUCT_STAT_ST_MTIM)",
-    "2 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
-    "failures by shape (2 of 2 shapes; names folded to N, inode numbers to <inode>): 1 × lstat N mtime, expected <inode>, got <inode>; 1 × open N O_RDONLY : unlink N : fstat 0 nlink, expected 0, got 1"
+    "0 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent"
   ]
 }
