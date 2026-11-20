@@ -15134,3 +15134,19 @@ The commit is refused by one request's room (the listener's `Limits::item_bytes`
 §4.17.1's rule 2 refuses only past the shard's room; and below that room the commit's work holds every new text whole
 (`commit::drive::Work::texts`, by reading), where rule 1 bounds the working set whatever the text's size. Neither rule
 holds for Subversion's intake yet (GAPS).
+
+## A push's compose over a flat tree: the deriver's replay was quadratic in the head's files (A-752 part 1; main's order of 2026-11-20; 2026-11-20)
+
+w-git measured one command bringing 3,502 objects over a flat 3,500-file tree (debug): the work build 374-642 ms in
+one step. Most of it was `compose_volume_planned`'s replay, which looked each path up by scanning every entity (live
+entity, base length, consumed origin, unlinked base file): O(files^2). The replay now keeps an index (path -> live
+entity, origins, unlinked base files, base lengths): O(files log files). Same entities out; all merge tests pass.
+
+| flat head files (debug, Mac Studio) | compose before | compose after | build before | build after |
+|---|---|---|---|---|
+| 875   | 11.7 ms  | 6.9 ms  |  -     |  -     |
+| 1,750 | 37.7 ms  | 12.7 ms |  -     |  -     |
+| 3,500 | 129.4 ms | 28.1 ms | 149 ms | 50 ms  |
+| 7,000 | 457.7 ms | 57.9 ms | 502 ms | 102 ms |
+
+Still one step each: the build and the entry apply are sliced under the step quantum next (A-752 parts 2-3).

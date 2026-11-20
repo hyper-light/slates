@@ -140,8 +140,8 @@
 > Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
 > The daemon's end at ten large pushes fixed: a pack's waiting deltas resolve a delta a unit in the answer's turns
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
-> repositories' wait (3.34 times their fair share; about a second before a push's first step unaccounted), a quiet
-> rerun of the cap-10 proof.
+> repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
+> its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -272,8 +272,13 @@
 > (a1) BUILT: `ContentStore::windows`/`window_at` answer `Cow` (a sealed arena window is copied out), every reader in
 > git, hg, the server and vcs moved over; lists and tables stay lent (`get`). (a2) step 1 BUILT: windows kept through a
 > `WindowStorage` seam (`HeapWindows` for tests and tools; `ContentStore::with_storage`), read by `bytes_of`, sized by `len_of`.
-> OWED: (a2) step 2 the daemon's arena storage (a repository chunk store per home shard, own pool owner-tag range), (a3) image table
-> + recovery order, (b) git v3, (c) svn, (d) replication.
+> (a2) BUILT 479f950ed: windows are chunks of the shard's own chunk store, lent per step by a swap under a guard (main's
+> ruling (ii)). (a3) BUILT 782eb711c: the windows' table in the shard image (held pieces), claimed before the volumes,
+> held again by the replay. (c) c1 BUILT: a Subversion head's texts held by the green by path (`vcs_store::svn_texts`),
+> held again at a recovery; `HeadTexts` reads the green, then the records: that second read path is OWED away with c3
+> (the reads switched to it, the records dropping text bytes), in one series. OWED: (b) git v3 (w-balance's names, on
+> main's f+1 ruling), (c) c2 (an old text kept as an svndiff delta in the repository store before the green folds it)
+> and c3, (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -2463,6 +2468,12 @@
 > formed and settled (sw48c 48/48, rp2 40/40, rp3 54/55, rp4 5/5 with the CPU-judged start wait), past the 143 at which
 > a 1-in-48 stall shows with 95% odds; the one other run (rp3 run 9) never reached forming, an initial daemon starved
 > past the old 30 s wall start wait (fixed in b25a5b7a6). No stall of membership in any run.
+> **A holder move onto the replaced member stalled once, not reproduced (2026-11-20, w-forming):** in fm1 run 7 (main
+> a6764af1e, unthrottled) the fleet formed and the replaced member rejoined, then the owner's holder move from
+> [1150.., 7405..] to [1150.., the replaced member] never completed and writes were refused about 40 s ("covers
+> candidates false": the last whole entry held no key for the replaced member's anchor), failing
+> `settled_holders`. Not seen again in the 147 runs that formed since (sw48c, rp2, rp3, rp4, each with the flow's
+> holder move); not chased. Its log was ~/.cache/w-forming-runs/fm1/run-7.log on adas-mac-studio-4.
 > **Start waits under load (2026-11-20, w-forming; same box):** at load 29 to 31 on its 14 CPUs (other agents' builds,
 > Spotlight indexing cargo targets, a VM), the fleet daemons' control shards went 8 to 12 s between heartbeat turns
 > ("the control shard's beat task ran 12053 ms after its last turn", against windows of 1 to 4.2 s, with 4 to 35 long
@@ -2834,6 +2845,17 @@
 >   which keeps StaleNeverCommits.
 > - **Owed (A-354):** the reply a write through the successor held waited without a bound; held replies of the slates
 >   protocol are judged by no time bound (NFS and FUSE judge theirs by `durable_bound` up to the failover SLO).
+
+> **A forward lane's floor was logged once a forward: about a million lines, 260 MB, in one flow (2026-11-20; CLOSED,
+> g226; found by w-fed-faults).** A lane left with nothing was dropped, so each forward made it afresh and measured its
+> floor from nothing; where the floor sat past the failover delay (3,102 ms against 3,100), every forward crossed it
+> again and `forward_lane::note_floor` wrote a line (CLAUDE.md §2 item 8). A lane is now kept while idle (idle lanes of
+> peers gone from the configuration are pruned, `ForwardLanes::prune_idle`), and a floor is said only where the log's
+> last line about the lane differs from what is so, at most once a window (the longer of the delay and the floor), with
+> the crossings since (`fleet.forward.floor_logged`). Test: `a_lane_measured_past_the_failover_delay_logs_it_once`
+> (`crates/server/tests/fleet.rs`, 40 forwards through b; Adas-Mac-Studio-4, 2026-11-20, the delay held at 1 s, the
+> floor 3,107 ms: 1 crossing and 1 line with the fix, 41 crossings and 41 lines with `forward_lane.rs` reversed) and
+> `an_idle_lane_is_kept_for_a_member_and_pruned_for_a_peer_gone` (`crates/server/src/forward_lane.rs`).
 
 > **A verb's reply held for durability had no time bound: refused at the failover SLO (2026-11-18, A-354, §4.10 "Live
 > shipping"; g230).** `live_ship::defer` and `defer_destroy` held a reply until its log was durable, its owner fenced or
@@ -4684,9 +4706,8 @@
 > built (the holder moves and drops the work's floor at the owner, `MoveWorkFloor`, monotone); part c built (a
 > holder's submit committed by the verdict its replica computed, taken by position at the owner, `SubmitComputed`);
 > part d built (the submit settles once the holder's replica holds the version); part e built (a holder's work comes
-> back from its log over the holder's replica after a restart); part f (takeover and the routing flip), a holder work's
-> rebase and copies, an increment too large for the forward lane, and the floor of a creation a restart dropped are
-> open.
+> back from its log over the holder's replica after a restart); a holder work's rebase and copies built over the
+> replica; an increment too large for the forward lane, the floor of a creation a restart dropped, and part f (takeover and the routing flip) are open.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's

@@ -145,3 +145,41 @@ fn a_hold_past_the_tables_room_is_refused_and_holds_nothing() {
   green.hold_bytes(identity(1), b"x").unwrap();
   assert_eq!(green.held_count(), 2);
 }
+
+/// A-716 (a text staged a piece at a time: §4.17.1 "A push's intake", rule 1). Do: stage "abc" in three pieces and seal
+/// it; stage "abc" again in two and seal it under the same identity; stage a text and discard it; stage one past the
+/// table's room and seal it. Expect: the first held whole, three bytes staged; the second adds a holder and gives its
+/// block back (the blocks alive as after the first); the discarded one leaves no block; the one past the room is
+/// refused `AtRoom` and leaves no block either.
+#[test]
+fn a_text_staged_a_piece_at_a_time_is_held_once_or_given_back() {
+  let mut green = Green::new();
+  green.set_held_room(1);
+  let mut staged = green.stage();
+  for piece in [&b"a"[..], b"b", b"c"] {
+    green.append_staged(&mut staged, piece);
+  }
+  assert_eq!(staged.length(), 3);
+  green.seal_staged(staged, identity(1)).unwrap();
+  assert_eq!(green.held(&identity(1)), Some(&b"abc"[..]));
+  let alive = green.content.blocks().live();
+  let mut again = green.stage();
+  green.append_staged(&mut again, b"ab");
+  green.append_staged(&mut again, b"c");
+  green.seal_staged(again, identity(1)).unwrap();
+  let dropped = green.stage();
+  green.discard_staged(dropped);
+  assert_eq!(green.content.blocks().live(), alive);
+  let mut past = green.stage();
+  green.append_staged(&mut past, b"z");
+  assert_eq!(
+    green.seal_staged(past, identity(2)),
+    Err(HeldRefused::AtRoom { room: 1 })
+  );
+  assert_eq!(
+    (green.content.blocks().live(), green.held(&identity(2))),
+    (alive, None)
+  );
+  green.release_held(&identity(1)).unwrap();
+  assert_eq!(green.held(&identity(1)), Some(&b"abc"[..]));
+}

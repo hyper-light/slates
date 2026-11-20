@@ -80,6 +80,19 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
     .ok_or(RtError::NotOnShardThread)?
 }
 
+/// Spawns a joinable task on the current shard with no parent, labelled with `site` (A-740): a helper that spawns the
+/// work its caller hands it passes its caller's site (taken by `#[track_caller]`), so a stuck shard's report names the
+/// line that asked for the work, where [`spawn`] inside the helper would name the helper's own line for every task it
+/// carries.
+pub fn spawn_at<F: Future<Output = ()> + 'static>(
+  site: &'static std::panic::Location<'static>,
+  future: F,
+) -> Result<TaskId, RtError> {
+  let label = crate::label::intern(crate::label::TaskLabel::Site(site));
+  registry::with_current(|ctx| ctx.spawn_labelled(boxed(future), None, label))
+    .ok_or(RtError::NotOnShardThread)?
+}
+
 /// Spawns a joinable task on the current shard that the shard runs alone until it ends: no other task is polled
 /// meanwhile, and each of its yields still ends a step (`ShardContext::spawn_alone`). A daemon's shard start, whose
 /// recovery yields between slices while nothing else may yet reach the shard's state, is the use.

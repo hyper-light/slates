@@ -214,6 +214,14 @@ impl Blocks {
     }
   }
 
+  /// Appends `bytes` to `block`'s bytes: a staged text's next piece (A-716, [`crate::held::Staged`]), whose block no
+  /// other holder shares while it is staged.
+  pub(crate) fn append(&mut self, block: Block, bytes: &[u8]) {
+    if let Some(Some((held, _))) = self.slots.get_mut(block.0) {
+      held.extend_from_slice(bytes);
+    }
+  }
+
   /// One holder of `block` fewer; the block is freed with its last.
   pub(crate) fn release(&mut self, block: Block) {
     let Some(place) = self.slots.get_mut(block.0) else {
@@ -349,6 +357,11 @@ impl Files {
   /// A new block holding `bytes`, with one holder and named by no path (A-716: a text held before any file names it).
   pub(crate) fn add_unnamed_block(&mut self, bytes: Vec<u8>) -> Block {
     self.blocks.add(bytes)
+  }
+
+  /// Appends `bytes` to a staged text's block (A-716, [`crate::held::Staged`]).
+  pub(crate) fn append_to_block(&mut self, block: Block, bytes: &[u8]) {
+    self.blocks.append(block, bytes);
   }
 
   /// A held block's bytes; none for a block that is gone (never, while the table holds it).
