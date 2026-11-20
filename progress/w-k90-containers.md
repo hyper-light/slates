@@ -43,3 +43,55 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - is-ancestor confirmed from the Studio. Merges: config.rs/slates_fleet (re-ran 14/14), review.rs/git.rs (w-k90-vendor
   filemode), docs/agentic.md status-row conflict (main's row + my W9 sentence). Reported to main (agents_send).
 - NEXT: 5b-i (sandbox::container), then 5b-ii (Engine::Container).
+
+## 5b-i (2026-11-20 ~01:xxZ): committed a69822973 on agents/w-k90-containers-5a (worktree ~/kiln-work/w-k90-containers-kiln)
+- sandbox::container::ContainerSandbox (keeper `tail -f /dev/null` + engine `exec --interactive`, env by name only,
+  release on end/kill), workspace::container::{release, Plan.entrypoint}; 4 new tests; 11/11 locally.
+- Merge 7e77ebecd brought main's re-vendor (Slates 38ed3dfd8, CONTRACT 50: Instance::export now vendored) -> re-run in
+  flight (target ~/.cache/w-k90-containers-target). Then push via adas-mac-studio-2.
+## K8s builders (main asked ~01:xxZ): worktree ~/kiln-work/w-k90-containers-k8s (branch agents/w-k90-containers-k8s
+  from 7e77ebecd), target ~/.cache/w-k90-containers-target-k8s: crates/kiln/src/k8s/volume.rs (objects(): PV nfs
+  xprtsec=mtls/claimRef/Retain, claim volumeName "", pod volume+mount+runAsUser/Group; PodExport Debug hides token;
+  Unbuildable), 2 w10 tests; W10 doc line. RBAC deferred to the engine piece (first code that creates PVs). Run in flight.
+- Next K8s piece: kiln's call of Instance::export (workspace::slates::export) + the engine/home + RBAC.
+
+## 5b-i LANDED 2026-11-20 ~02:0xZ kiln main ..7e77ebecd (a69822973); reported to main.
+## K8s builders: committed d5d613ef6 (worktree w-k90-containers-k8s), 2/2 green; push run r8 (b24c) in flight.
+## 5b-ii (in progress, worktree ~/kiln-work/w-k90-containers-kiln, uncommitted):
+- Engine::Container (kiln-ci facts), [agent] container_image (runner::probe::Declared), ContainerFacts.image +
+  ContainerMissing::Image; harness::engine: containers(), held(asked, can, boxed) (never container by default), asked_of
+  "container", set 409 unless containers usable, session_engine()/split/drained, view "container"/"containers";
+  session::InContainer + Spec/Info.container (copied at host.rs/registry.rs/session.rs; Info::differs);
+  lineage::container_at + on_engine arms; registry::open_as sets spec.container for new non-isolated conversations;
+  narrow::Whole::Container; sandbox::container::{launch_of, launch}; session launch branch (no MCP, no kind.prepare);
+  experiments' matches (Container grouped with Host). Docs W9 + status row.
+- Tests added: engine w9_a_runner_holds_container_only_..., a_put_sets_host_microvm_container_or_null...,
+  lineage w9_a_container_runners_new_conversations_take_its_image..., sandbox::container
+  w9_a_sessions_container_launch_is_its_harness_by_name..., workspace::container facts test (image).
+- Run t1 in flight (KILN_WRITE_TS=1).
+- Gap to report: a harness in a container has no sign-in (image's own or a credential grant: next piece).
+
+## 5b-ii LANDED 2026-11-20 ~02:4xZ kiln main 4eda3a697 (fast-forward; is-ancestor confirmed); reported to main.
+- NOT done (told main): browser check of the Runners page (Chromium/WebKit); live container start.
+- ui/node_modules installed in ~/kiln-work/w-k90-containers-kiln/ui (npm ci) for UI checks.
+## K8s builders d5d613ef6: push r8 still running on b24c (slow first sync of the k8s worktree path).
+## NEXT: W10 engine scoping (export call over the link, PV/claim/pod creation, RBAC), W9 sign-in in container.
+
+## LANDED 2026-11-20: K8s builders kiln main 948ca0a57 (d5d613ef6); W9 .nfs.* silly-rename exclusion 3046fed87.
+- r8 (worktree sync) hung >1h: git worktrees sync badly via kiln run -> land everything from ONE clone
+  (~/kiln-work/w-k90-containers-kiln); k8s worktree + its target removed.
+- Reported not built: Docker Desktop share check (settings key unverified; no Desktop on this Studio).
+## NEXT: W10 home holder: workspace::Ask::{Hold, Release} (no proto change), workspace/held.rs map keyed by pod
+   session id, slates::export wrapper (Instance::export), loops::workspace falls back to held map; then server side.
+
+## W10 home holder LANDED 2026-11-20 kiln main fce36c347 (workspace::held, Ask::{Hold,Release}, feature workspace.hold).
+## NEXT: W10 server side: pod start -> hold at home -> host/port from [slates_fleet.nodes] -> k8s::volume::objects ->
+   kubeapi create PV/claim/pod (new verbs) + chart RBAC (Role pvc create/delete in jobs ns; ClusterRole PV create/get/delete);
+   end/reaper: delete pod, claim, PV; release at home.
+
+## W10 cluster piece LANDED 2026-11-20 kiln main 8c501c906 (kubeapi PV/claim verbs, k8s::volume::{make,unmake}, chart rbac.agentPods).
+## BLOCKED on main (asked 2026-11-20 ~00:4x PST):
+- W10 pod start: ephemeral one-session runner in the pod (my pick) vs harness-only pod.
+- W9 harness sign-in in a container: image's own vs credential grant by name.
+## Owed by others: live container start + Runners page browser check (main); Docker Desktop share key (needs a Mac with
+   Desktop); Windows (jupiter BLOCKED).

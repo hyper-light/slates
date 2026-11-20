@@ -117,3 +117,12 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - NEXT: P3c CPU share: each shard's step quanta scheduled fairly by repository (WFQ / DRF CPU dimension), proven by
   rerunning multi_repo_load R=100 (target: small class p99 near alone). Then P5b/A-727 seam with w-perf, P6 region
   half (Q3), P8, P9.
+- 9e9cfbd58 LANDED (from worktree ~/slates-work/w-balance-land2): homes ticket/published; share tolerance from
+  Higham gamma_k (w-lint item done); P3c fair turns rejected (BENCHMARKS "Fair turns by repository on a shard"):
+  branch agents/w-balance-cpu fdfcf2421 holds the rejected code. run4 log on .local-2 ~/.cache/w-balance/run4.log.
+- w-perf agreed seam (kiln message): ticket+published first (DONE, told it), batch forms after its a3.
+- Worktrees now: ~/slates-work/w-balance (local main has wip commits: never push from it), ~/slates-work/w-balance-land2
+  (detached at 9e9cfbd58; fast-forward from origin/main before each piece).
+- NEXT: profile the R=100 step to find why toys wait 14x (sample the daemon on .local-2 during the burst: `sample`
+  per shard, or a slates status counter dump), then fix by evidence. Then batch forms (after a3), P6 region half
+  (Q3), P8, P9.
