@@ -58,6 +58,27 @@ mod tests {
   /// Shape: every code Win32's system error codes reach (winerror.h numbers them below 16,000), and past it.
   const CODES: u32 = 1 << 16;
 
+  /// Every code the writer names no kind of, the colliding five among them, kept as the Win32 code it is.
+  fn assert_every_other_code_kept() {
+    let kept = |code: u32| HostError::Unavailable(OsCode::Win32(code));
+    for code in COLLIDING {
+      assert_eq!(refusal_of(code), kept(code), "{code}");
+    }
+    for code in 0..CODES {
+      if ![
+        FILE_EXISTS,
+        ALREADY_EXISTS,
+        HANDLE_DISK_FULL,
+        DISK_FULL,
+        PRIVILEGE_NOT_HELD,
+      ]
+      .contains(&code)
+      {
+        assert_eq!(refusal_of(code), kept(code), "{code}");
+      }
+    }
+  }
+
   /// A-527, A-539 (the seam's numbering is typed). Do: map through the writer's rule every Win32 code up to 65,535, the
   /// five whose numbers are errnos the engine once told apart among them, and the four the writer names as kinds.
   /// Expect a name that exists (`ERROR_FILE_EXISTS`, `ERROR_ALREADY_EXISTS`) named `Exists` and a full disk
@@ -80,23 +101,7 @@ mod tests {
         "{code}"
       );
     }
-    let kept = |code: u32| HostError::Unavailable(OsCode::Win32(code));
-    for code in COLLIDING {
-      assert_eq!(refusal_of(code), kept(code), "{code}");
-    }
-    for code in 0..CODES {
-      if ![
-        FILE_EXISTS,
-        ALREADY_EXISTS,
-        HANDLE_DISK_FULL,
-        DISK_FULL,
-        PRIVILEGE_NOT_HELD,
-      ]
-      .contains(&code)
-      {
-        assert_eq!(refusal_of(code), kept(code), "{code}");
-      }
-    }
+    assert_every_other_code_kept();
     assert_eq!(
       unsupported(NOT_SUPPORTED),
       HostError::Unsupported(OsCode::Win32(NOT_SUPPORTED))
