@@ -6882,3 +6882,8 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 ## 2026-11-20, w-work-cow: a work costs its divergence, the grid (main baa470b90; commit 819341ab4)
 - Grid, release, macOS arm64 Mac Studio (and Linux): `for f in 1000 10000 100000; do for b in 1024 65536 10240; do for w in 1 10 100; do SLATES_WORK_COW_FILES=$f SLATES_WORK_COW_FILE_BYTES=$b SLATES_WORK_COW_WORKS=$w cargo test --locked --release -p slates-server --test work_cow -- --nocapture | grep work_cow:; done; done; done` (pick f x b for 1 MB to 1 GB greens). Red = the assert fails, or per-work resident or time grows with the green's size.
 - clippy + xtask over `crates/server/tests/work_cow.rs`.
+
+## 2026-11-20, w-work-mount: mounted works end to end (A-774; main 089bc78a0, commit a2415c930)
+- clippy + xtask over `crates/server/src/mounted_work.rs`, `crates/server/tests/mounted_work.rs` (all targets incl. Linux and Windows lint; the module is cfg-free).
+- Suites touched: `cargo test -p slates-server --test nfs_mount --test snapshot_landing --test green_post_state` and `-p slates-client --test client --test edit_and_submit` (attach of a work now makes its slot; land of a green now presents instead of refusing Unsupported). Red: any refusal/mismatch there.
+- Owed next (mine, gated kernel variant): ten real editor processes on kernel NFS mounts of ten works (macOS `mount_nfs`, Linux `mount -t nfs`, root), the same verdicts and landing; will land as `mounted_work_kernel` gated on SLATES_TEST_MOUNTED_WORK_KERNEL=1.
