@@ -846,6 +846,7 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh() {
 
 /// Writes a hook program at `path` that allows what it is asked, as an administrator writes `exit 0` into a
 /// repository's `hooks/` directory, made executable.
+#[cfg(unix)]
 #[allow(clippy::disallowed_methods)]
 fn allowing_hook(path: &str) {
   use std::os::unix::fs::PermissionsExt;
@@ -886,6 +887,8 @@ fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
 /// (`slates repository policy project --hook pre-revprop-change=PROGRAM`, the owner's verb), change revision 1's
 /// `svn:log` with stock `svn propset --revprop`, and read it. Expect the verb's answer naming the hook at policy version
 /// 1, the change taken, and the value read back.
+// Unix alone: hooks run where the hook driver does.
+#[cfg(unix)]
 #[test]
 fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
   let instance = format!("svn-revprop-{}", std::process::id());
@@ -943,4 +946,143 @@ fn a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it()
     (true, "first"),
     "{refused:?}"
   );
+}
+
+/// Shape: the measured commit's file: 500 MB, the large text main's intake measurement names (§4.17.1 "A push's
+/// intake").
+const LARGE_COMMIT_BYTES: usize = 500 << 20;
+
+/// Shape: how long the measured commit may run before it is killed: a 500 MB text over loopback in a debug or release
+/// daemon, with room for a slow host.
+const LARGE_COMMIT_PATIENCE: Duration = Duration::from_secs(1800);
+
+/// Writes [`LARGE_COMMIT_BYTES`] of noisy bytes, which no window shortens, as working copy `copy`'s [`FILE`], a piece at
+/// a time: the test writes the file stock `svn` commits, inside the scratch directory it removes.
+#[allow(clippy::disallowed_methods)]
+fn put_large(copy: &str) {
+  let mut file = std::fs::File::create(format!("{copy}/{FILE}")).unwrap();
+  let mut state = 1u64;
+  let mut piece = vec![0u8; 1 << 20];
+  for _ in 0..LARGE_COMMIT_BYTES / piece.len() {
+    for byte in &mut piece {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      *byte = state.to_le_bytes()[0];
+    }
+    file.write_all(&piece).unwrap();
+  }
+}
+
+/// The resident bytes of instance `instance`'s daemon processes (every `slates` process naming the instance but its
+/// anchor), from `ps`, in KiB.
+fn daemon_rss_kib(instance: &str) -> u64 {
+  let listed = Command::new("ps")
+    .args(["-A", "-o", "rss=,command="])
+    .output()
+    .unwrap();
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter(|line| line.contains(instance) && !line.contains(" anchor"))
+    .filter_map(|line| line.split_whitespace().next()?.parse::<u64>().ok())
+    .sum()
+}
+
+/// Commits working copy `copy` with `svn`, sampling the daemon's resident bytes while it runs: the exit code, both
+/// outputs, the seconds it took, and the most resident KiB seen.
+fn commit_measured(svn: &Svn, copy: &str, instance: &str) -> (i32, String, String, f64, u64) {
+  let mut child = Command::new("svn")
+    .args(&svn.options)
+    .args(["commit", "--message", "large"])
+    .current_dir(copy)
+    .env("LC_ALL", "C")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let started = Instant::now();
+  let mut peak = 0;
+  let code = loop {
+    peak = peak.max(daemon_rss_kib(instance));
+    if let Some(status) = child.try_wait().unwrap() {
+      break status.code().unwrap_or(-1);
+    }
+    if started.elapsed() > LARGE_COMMIT_PATIENCE {
+      let _ = child.kill();
+      let _ = child.wait();
+      break -2;
+    }
+    pause();
+  };
+  let seconds = started.elapsed().as_secs_f64();
+  (
+    code,
+    out.join().unwrap(),
+    err.join().unwrap(),
+    seconds,
+    peak,
+  )
+}
+
+/// §4.17.1 "A push's intake" for Subversion (a measurement, not a gate; main's brief 2026-11-20). Do: over svn:// and
+/// over the HTTP edge in turn, check out the empty repository, add a [`LARGE_COMMIT_BYTES`] file and commit it with
+/// stock `svn` 1.15, sampling the daemon's resident bytes. Expect nothing: print each scheme's commit answer, seconds,
+/// the daemon's resident bytes before and at its peak against the text's size, and the daemon's status lines naming
+/// rooms, budgets and refusals.
+#[test]
+#[ignore = "a measurement: cargo test --release -p slates-cli --test svn_interop -- --ignored a_large_commit_measured --nocapture"]
+fn a_large_commit_measured() {
+  if !stock_svn() {
+    eprintln!(
+      "skipping the large commit's measurement: no stock Subversion 1.15 here (svn on the PATH)"
+    );
+    return;
+  }
+  for scheme in ["svn", "http"] {
+    let instance = format!("svn-large-{scheme}-{}", std::process::id());
+    let edge = format!("--vcs-{scheme}");
+    let (_anchor, lines, issuer) = start_anchor(&instance, &[&edge, "127.0.0.1:0"]);
+    let Some(issuer) = issuer_or_skip(issuer, "the large commit's measurement") else {
+      return;
+    };
+    create_repository(&instance);
+    let (id, token) = minted_token(&instance, &issuer);
+    let (user, url) = match scheme {
+      "svn" => (
+        id,
+        format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(&lines)),
+      ),
+      _ => (
+        USER.to_owned(),
+        format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(&lines)),
+      ),
+    };
+    let scratch = Scratch::new(&format!("svn-large-{scheme}"));
+    let svn = Svn::new(&scratch, "large", credentials(user, token));
+    let copy = svn.copy("copy");
+    svn.ok(&svn.scratch, &["checkout", &url, &copy]);
+    put_large(&copy);
+    svn.ok(&copy, &["add", FILE]);
+    let before = daemon_rss_kib(&instance);
+    let (code, out, err, seconds, peak) = commit_measured(&svn, &copy, &instance);
+    let (_, status, _) = slates(&instance, &["status"]);
+    let named: Vec<&str> = status
+      .lines()
+      .filter(|line| {
+        ["room", "budget", "refus", "admit", "svn"]
+          .iter()
+          .any(|word| line.contains(word))
+      })
+      .collect();
+    println!(
+      "a_large_commit_measured {scheme}: exit {code} in {seconds:.1} s; daemon RSS {before} KiB before, peak {peak} KiB, \
+       text {} KiB\n  svn: {}{}\n  status: {named:?}",
+      LARGE_COMMIT_BYTES >> 10,
+      out.trim(),
+      err.trim()
+    );
+  }
 }

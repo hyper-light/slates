@@ -260,6 +260,14 @@ impl Push {
     self.quarantine.objects()
   }
 
+  /// The first object held whose id is after `after` (the first for none), as [`Push::held`] answers it (A-722 part 4).
+  pub(crate) fn held_after(
+    &self,
+    after: Option<&[u8]>,
+  ) -> Option<(&[u8], u8, slates_vcs::ContentId, u64)> {
+    self.quarantine.object_after(after)
+  }
+
   /// Gives back the push's holds once its objects' rows hold them, leaving the push empty.
   pub(crate) fn release_holds(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     self.commits.clear();

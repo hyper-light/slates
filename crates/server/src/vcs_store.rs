@@ -109,8 +109,11 @@ pub(crate) mod lfs_record;
 pub(crate) mod owed;
 pub(crate) mod paths;
 pub(crate) mod record;
+#[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
+pub(crate) mod record_names;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
+pub(crate) mod svn_texts;
 pub(crate) mod svn_view;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
@@ -134,6 +137,12 @@ pub(crate) const VALUE_UNKEPT: &str = "vcs_store.value_unkept";
 /// Counter: a record replayed into its store by a recovery or a rebuild: the replay's non-vacuity counter. Format: a
 /// counter name.
 pub(crate) const REPLAYED: &str = "vcs_store.replayed";
+/// Counter (A-727 slice a3): repository windows a recovery took back from the shard image, their chunks claimed.
+pub(crate) const WINDOWS_RESTORED: &str = "vcs_store.windows_restored";
+/// Counter (A-727 slice a3): window pieces of the shard image a recovery could not take back (put again by replay).
+pub(crate) const WINDOWS_UNRESTORED: &str = "vcs_store.windows_unrestored";
+/// Counter (A-727 slice a3): restored windows no replayed record named, freed once the records were replayed.
+pub(crate) const WINDOWS_UNHELD: &str = "vcs_store.windows_unheld";
 /// Counter: a store a recovery could not make again from its records: zero in every correct use. Format: a counter name.
 pub(crate) const REPLAY_REFUSED: &str = "vcs_store.replay_refused";
 /// Counter: a store made again from the log after its commit's entry was not made durable. Format: a counter name.
@@ -184,6 +193,10 @@ pub(crate) struct VcsStores {
   /// The git records whose replay is under way a turn at a time (A-722 part 4, [`git_replay`]): at most one a
   /// repository, the record its rebuild or recovery replays now; bounded by the partition's repositories.
   git_replays: BTreeMap<RepositoryId, Box<git_replay::GitReplay>>,
+  /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
+  /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
+  /// bounded by the fetches the shard's edges seat.
+  git_forks: BTreeMap<RepositoryId, Vec<upload::GitFork>>,
   /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
   /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
   objects_charged: BTreeMap<RepositoryId, u64>,
@@ -213,6 +226,13 @@ pub(crate) struct VcsStores {
   dav_commits: BTreeMap<(RepositoryId, String), DavHeld>,
   /// The HTTP transactions this shard has named, which a transaction's name counts.
   dav_named: u64,
+  /// How many fetches hold each Subversion store's generation (A-749, §4.17.1 "A fetch's answer" rule 4,
+  /// [`hold_svn`]): bounded by the fetches in flight.
+  svn_holders: BTreeMap<u64, usize>,
+  /// The records of each Subversion store freed while a fetch held its generation ([`free`]), by that generation, with
+  /// their repository and what they hold of the shard's budget, until the last hold is given back
+  /// ([`release_svn_hold`]): bounded by the fetches in flight.
+  svn_held: BTreeMap<u64, (RepositoryId, SvnRecords, u64)>,
 }
 
 /// One repository's store, by its tool (module docs).
@@ -338,6 +358,9 @@ pub(crate) struct HgStore {
 /// A Subversion repository's store: its records, beside its one green (A-655 part 2b; module docs, "Subversion").
 #[derive(Debug, Default)]
 pub(crate) struct SvnStore {
+  /// The generation the store was made as: a store made again (a rebuild) is another, which a fetch's hold on this one
+  /// never reads (A-749 rule 4, [`hold_svn`]).
+  pub(crate) generation: u64,
   /// The records: none until the creation's record is replayed.
   pub(crate) records: Option<SvnRecords>,
   /// What the records hold of the shard's budget, charged as retention.
@@ -729,7 +752,10 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
       generation: stores.next_generation(),
       ..HgStore::default()
     })),
-    VcsTool::Subversion => RepositoryStore::Subversion(Box::default()),
+    VcsTool::Subversion => RepositoryStore::Subversion(Box::new(SvnStore {
+      generation: stores.next_generation(),
+      ..SvnStore::default()
+    })),
   };
   stores.entries.entry(record.id).or_insert(store);
   Ok(())
@@ -757,6 +783,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   }
   state.vcs_stores.unrecovered.remove(&id);
   state.vcs_usage.forget(&id);
+  keep_held_svn(&mut state.vcs_stores, id);
   if !release_charged(state, id) {
     state.count(RELEASE_REFUSED, 1);
   }
@@ -813,6 +840,70 @@ pub(crate) fn admit_objects(state: &ShardState, bytes: usize) -> Result<(), u64>
     return Err(room);
   }
   Ok(())
+}
+
+/// Subversion repository `id`'s records kept aside with their charge as its store is freed, where a fetch holds their
+/// generation (A-749, §4.17.1 "A fetch's answer" rule 4): the fetch ends on the records it began on, whatever rebuilds
+/// or removes the store meanwhile, and the last hold's release gives them and their charge back ([`release_svn_hold`]).
+fn keep_held_svn(stores: &mut VcsStores, id: RepositoryId) {
+  let Some(RepositoryStore::Subversion(store)) = stores.entries.get_mut(&id) else {
+    return;
+  };
+  if !stores.svn_holders.contains_key(&store.generation) {
+    return;
+  }
+  if let Some(records) = store.records.take() {
+    let charged = core::mem::take(&mut store.charged);
+    stores
+      .svn_held
+      .insert(store.generation, (id, records, charged));
+  }
+}
+
+/// A fetch's hold on Subversion repository `id`'s store as it is now (A-749 rule 4): its generation, counted held;
+/// none when its records are not lent here.
+pub(crate) fn hold_svn(stores: &mut VcsStores, id: RepositoryId) -> Option<u64> {
+  stores.subversion_records(id)?;
+  let generation = stores.subversion(id)?.generation;
+  let holders = stores.svn_holders.entry(generation).or_insert(0);
+  *holders = holders.saturating_add(1);
+  Some(generation)
+}
+
+/// Gives back one hold on `generation` ([`hold_svn`]): at the last, the records kept aside for it, if its store was
+/// freed meanwhile, are dropped and their charge given back to the shard's budget.
+pub(crate) fn release_svn_hold(state: &mut ShardState, generation: u64) {
+  let stores = &mut state.vcs_stores;
+  match stores.svn_holders.get_mut(&generation) {
+    Some(holders) if *holders > 1 => {
+      *holders = holders.saturating_sub(1);
+      return;
+    }
+    Some(_) => {
+      stores.svn_holders.remove(&generation);
+    }
+    None => return,
+  }
+  if let Some((_, _, charged)) = stores.svn_held.remove(&generation) {
+    state.store.budget.credit_retention(charged);
+  }
+}
+
+/// The records a fetch's hold on repository `id`'s `generation` reads (A-749 rule 4): those kept aside when its store
+/// was freed, else the store's own while it is that generation and lent; none otherwise.
+pub(crate) fn held_svn_records(
+  stores: &VcsStores,
+  id: RepositoryId,
+  generation: u64,
+) -> Option<&SvnRecords> {
+  if let Some((held, records, _)) = stores.svn_held.get(&generation) {
+    return (*held == id).then_some(records);
+  }
+  let records = stores.subversion_records(id)?;
+  match stores.entries.get(&id)? {
+    RepositoryStore::Subversion(store) if store.generation == generation => Some(records),
+    _ => None,
+  }
 }
 
 /// [`release`], the Subversion records' charge given back to the shard's budget first (A-655 part 2b).
@@ -1208,6 +1299,9 @@ pub(crate) struct SealedPush {
   keyed: Vec<RecordedMove>,
   /// The record's objects, until a commit takes them.
   objects: RecordWriter,
+  /// Moves admitted a turn at a time before their append (A-722 part 4c, `git_push`'s judge), each taken by its append
+  /// while its green's head is still the one it was admitted from.
+  prepared: Vec<Move>,
 }
 
 impl SealedPush {
@@ -1244,10 +1338,28 @@ impl SealedPush {
     stores: (&mut Store, &mut VcsStores),
     moves: Vec<RecordedMove>,
   ) -> Result<(), GitRefused> {
-    let (repository, push) = (self.repository, &self.push);
+    let (repository, push, prepared) = (self.repository, &self.push, &mut self.prepared);
     let admitted = lent_to_read(stores, |stores| {
       let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
-      admit_moves(content, store, push, &moves)
+      moves
+        .iter()
+        .map(|(green, _, head)| {
+          let taken = head.and_then(|to| {
+            let current = store.repository.current_head(*green);
+            let at = prepared
+              .iter()
+              .position(|admitted| admitted.to() == Some(to) && admitted.from_head() == current)?;
+            Some(prepared.swap_remove(at).of_green(*green))
+          });
+          match taken {
+            Some(admitted) => Ok(admitted),
+            None => store
+              .repository
+              .admit(content, push, *green, *head)
+              .map_err(GitRefused::Store),
+          }
+        })
+        .collect::<Result<Vec<Move>, GitRefused>>()
     })?;
     self.moves = admitted;
     self.keyed = moves;
@@ -1257,6 +1369,49 @@ impl SealedPush {
   /// Gives back every hold the push took: a push no append committed. One a commit took holds nothing.
   pub(crate) fn abandon(self, state: &mut ShardState) {
     abandon_push(state, self.push);
+  }
+
+  /// One turn of the admission of the move of the green keyed `green` to `to` (A-722 part 4c), begun where `admitting`
+  /// holds none, for `ns` of the shard's clock and a unit at least: whether it is done, its move kept for its append
+  /// ([`SealedPush::admit`]). A refusal ends it, the append admitting the move again and answering the refusal there.
+  pub(crate) fn admission_turn(
+    &mut self,
+    state: &mut ShardState,
+    (green, to): (u64, ObjectId),
+    (admitting, ns): (&mut Option<slates_git::store::Admitting>, u64),
+  ) -> bool {
+    let (repository, push, prepared) = (self.repository, &self.push, &mut self.prepared);
+    if prepared.iter().any(|admitted| admitted.to() == Some(to)) {
+      return true;
+    }
+    let turned = lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+      let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
+      let mut begun = match admitting.take() {
+        Some(begun) => begun,
+        None => store
+          .repository
+          .admitting(content, push, green, to)
+          .map_err(GitRefused::Store)?,
+      };
+      let mut clock = crate::git_push::ShardClock;
+      let quantum = slates_git::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns,
+      };
+      let done = store
+        .repository
+        .admit_turn(content, push, &mut begun, quantum)
+        .map_err(GitRefused::Store)?;
+      if done {
+        if let Some(admitted) = begun.admitted() {
+          prepared.push(admitted);
+        }
+      } else {
+        *admitting = Some(begun);
+      }
+      Ok::<bool, GitRefused>(done)
+    });
+    turned.unwrap_or(true)
   }
 }
 
@@ -1308,31 +1463,38 @@ impl GitPush {
     })
   }
 
-  /// Seals the push: every commit's generation number, its parents read from the push or the repository (A-614). Each
-  /// append then admits its own moves ([`SealedPush::admit`]). Refused, the push is abandoned and its holds given back.
-  pub(crate) fn seal(mut self, state: &mut ShardState) -> Result<SealedPush, GitRefused> {
-    // Its rows written for its landing to adopt (A-722 part 3), with the room they take lent.
-    let rows = state
-      .vcs_stores
-      .git_ref(self.repository)
-      .map_or(0, |(_, store)| store.repository.stage_room(&self.push));
-    let push = &mut self.push;
+  /// Seals the push whole: [`GitPush::sealing`]'s turns run to their end in one step (a commit the server makes, whose
+  /// push is a version's few objects). Refused, the push is abandoned and its holds given back.
+  pub(crate) fn seal(self, state: &mut ShardState) -> Result<SealedPush, GitRefused> {
+    let mut sealing = self.sealing(state)?;
+    loop {
+      match sealing.turn(state, u64::MAX)? {
+        SealTurn::More(more) => sealing = *more,
+        SealTurn::Sealed(sealed) => return Ok(*sealed),
+      }
+    }
+  }
+
+  /// The push's seal begun (A-722 part 4, `slates_git::store::Repository::sealing`): every commit's generation number,
+  /// its parents read from the push or the repository (A-614), then its rows written for its landing to adopt (A-722
+  /// part 3), a turn at a time ([`SealingPush::turn`]). Each append then admits its own moves ([`SealedPush::admit`]).
+  /// Refused, the push is abandoned and its holds given back.
+  pub(crate) fn sealing(mut self, state: &mut ShardState) -> Result<SealingPush, GitRefused> {
     let repository = self.repository;
-    let sealed = within_budget(state, rows, |stores| match stores.git(repository) {
+    let push = &mut self.push;
+    let begun = within_budget(state, 0, |stores| match stores.git(repository) {
       Some((content, store)) => store
         .repository
-        .seal(content, push)
-        .and_then(|()| store.repository.stage(content, push))
+        .sealing(content, push)
+        .map(|staging| (staging, store.repository.stage_room(push)))
         .map_err(GitRefused::Store),
       None => Err(GitRefused::NoStore),
     });
-    match sealed {
-      Ok(()) => Ok(SealedPush {
-        repository: self.repository,
-        push: self.push,
-        moves: Vec::new(),
-        keyed: Vec::new(),
-        objects: self.record,
+    match begun {
+      Ok((staging, room)) => Ok(SealingPush {
+        push: self,
+        staging,
+        room,
       }),
       Err(refused) => {
         abandon_push(state, self.push);
@@ -1362,6 +1524,78 @@ impl GitPush {
         &self.push,
       )))
     })
+  }
+}
+
+/// A git push being sealed a turn at a time (A-722 part 4; [`GitPush::sealing`]).
+pub(crate) struct SealingPush {
+  /// The push.
+  push: GitPush,
+  /// Its seal and stage under way.
+  staging: slates_git::store::Staging,
+  /// Derived: the most its rows could charge the store, lent each turn (`Repository::stage_room`).
+  room: u64,
+}
+
+/// What a turn of a push's seal left.
+pub(crate) enum SealTurn {
+  /// More turns remain (boxed: the push is most of its size).
+  More(Box<SealingPush>),
+  /// Sealed and staged (boxed too: a sealed push is hundreds of bytes).
+  Sealed(Box<SealedPush>),
+}
+
+impl SealingPush {
+  /// One turn of the seal, held to `ns` of the shard's clock and a unit at least, its rows' room lent. Refused, the push
+  /// and its staging are given back.
+  pub(crate) fn turn(mut self, state: &mut ShardState, ns: u64) -> Result<SealTurn, GitRefused> {
+    let repository = self.push.repository;
+    let (push, staging) = (&mut self.push.push, &mut self.staging);
+    let turned = within_budget(state, self.room, |stores| match stores.git(repository) {
+      Some((content, store)) => {
+        let mut clock = crate::git_push::ShardClock;
+        let quantum = slates_git::store::hook_view::Quantum {
+          clock: &mut clock,
+          ns,
+        };
+        store
+          .repository
+          .stage_turn(content, push, staging, quantum)
+          .map_err(GitRefused::Store)
+      }
+      None => Err(GitRefused::NoStore),
+    });
+    match turned {
+      Ok(false) => Ok(SealTurn::More(Box::new(self))),
+      Ok(true) => Ok(SealTurn::Sealed(Box::new(SealedPush {
+        repository,
+        push: self.push.push,
+        moves: Vec::new(),
+        keyed: Vec::new(),
+        objects: self.push.record,
+        prepared: Vec::new(),
+      }))),
+      Err(refused) => {
+        self.abandon(state);
+        Err(refused)
+      }
+    }
+  }
+
+  /// Gives back every hold the push and its staging took.
+  pub(crate) fn abandon(self, state: &mut ShardState) {
+    let given = {
+      let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+      lent
+        .stores
+        .content
+        .as_mut()
+        .map_or(Ok(()), |content| self.staging.abandon(content))
+    };
+    if given.is_err() {
+      state.count(RELEASE_REFUSED, 1);
+    }
+    abandon_push(state, self.push.push);
   }
 }
 
@@ -2105,6 +2339,62 @@ pub(crate) async fn recover(
   for record in records {
     recover_repository(state, &record, slices).await;
   }
+  release_unheld_windows(state);
+}
+
+/// The repository windows kept as chunks of the shard's chunk store (A-727, `arena_windows`), whether the content store
+/// is made over them yet or not; none where the stores keep their windows elsewhere (a test's heap).
+pub(crate) fn chunk_windows(stores: &VcsStores) -> Option<&arena_windows::ChunkWindows> {
+  let storage = match stores.content.as_ref() {
+    Some(content) => content.storage(),
+    None => &**stores.window_storage.as_ref()?,
+  };
+  storage.as_any()?.downcast_ref()
+}
+
+/// [`chunk_windows`], mutably.
+pub(crate) fn chunk_windows_mut(
+  stores: &mut VcsStores,
+) -> Option<&mut arena_windows::ChunkWindows> {
+  let storage = match stores.content.as_mut() {
+    Some(content) => content.storage_mut(),
+    None => &mut **stores.window_storage.as_mut()?,
+  };
+  storage.as_any_mut()?.downcast_mut()
+}
+
+/// Takes the repository windows the shard image names back (A-727 slice a3), before the volumes and the records: each
+/// chunk's block claimed in the shard's chunk store and its chunk recorded, the windows handed to the content store the
+/// first repository's replay makes. Only before a content store is made; counted restored and not.
+pub(crate) fn restore_windows(state: &mut ShardState, pieces: &[(u64, Vec<u8>)]) {
+  if pieces.is_empty() || state.vcs_stores.content.is_some() {
+    return;
+  }
+  let (windows, refused) =
+    arena_windows::ChunkWindows::restore(state.config.page, pieces, &mut state.store.content);
+  let restored = u64::try_from(pieces.len())
+    .unwrap_or(u64::MAX)
+    .saturating_sub(refused);
+  state.vcs_stores.window_storage = Some(Box::new(windows));
+  state.count(WINDOWS_RESTORED, restored);
+  state.count(WINDOWS_UNRESTORED, refused);
+}
+
+/// Frees the restored windows no replayed record named (A-727 slice a3), once every record is replayed, and settles the
+/// shard's charge.
+fn release_unheld_windows(state: &mut ShardState) {
+  let freed = {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map_or(0, ContentStore::release_unheld)
+  };
+  if freed > 0 {
+    state.count(WINDOWS_UNHELD, freed);
+  }
+  settle(state);
 }
 
 /// Makes `record`'s store again and replays its records in log order, a record a unit of the recovery's slices, then
@@ -2152,6 +2442,10 @@ async fn recover_repository(
     .collect();
   for green in greens {
     paths::remake_green_sliced(state, green, slices).await;
+    // A Subversion green made again holds none of its head's texts (S4 c1): every one held again, in byte order.
+    if record.tool == VcsTool::Subversion {
+      svn_texts::rehold_head(state, record.id, green);
+    }
     slices.unit_done().await;
   }
   paths::whole_build::resume_owed(state, record.id);

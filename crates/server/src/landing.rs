@@ -3621,7 +3621,7 @@ pub(crate) fn db_policy(policy: WritePolicy) -> slates_db::catalog::WritePolicy 
 }
 
 /// A wire mode as the catalog records it.
-fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
+pub(crate) fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
   match mode {
     WriteMode::Bypass => slates_db::catalog::WriteMode::Bypass,
     WriteMode::Ask => slates_db::catalog::WriteMode::Ask,
@@ -3629,16 +3629,20 @@ fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
   }
 }
 
-/// A recorded policy as the wire carries it.
-pub(crate) fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
-  let mode = |mode| match mode {
+/// A recorded mode as the wire carries it.
+pub(crate) fn wire_mode(mode: slates_db::catalog::WriteMode) -> WriteMode {
+  match mode {
     slates_db::catalog::WriteMode::Bypass => WriteMode::Bypass,
     slates_db::catalog::WriteMode::Ask => WriteMode::Ask,
     slates_db::catalog::WriteMode::Forbid => WriteMode::Forbid,
-  };
+  }
+}
+
+/// A recorded policy as the wire carries it.
+pub(crate) fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
   WritePolicy {
-    merge: mode(policy.merge),
-    land: mode(policy.land),
+    merge: wire_mode(policy.merge),
+    land: wire_mode(policy.land),
     require_signed_merges: policy.require_signed_merges,
   }
 }

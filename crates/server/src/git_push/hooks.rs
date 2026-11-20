@@ -460,6 +460,7 @@ fn admitted<P>(
     principal: &push.principal,
     name: hooking.name,
     hooks: &mut HookVerdicts::default(),
+    admitting: &mut None,
   };
   judge.admitted(command).is_ok()
 }

@@ -735,6 +735,28 @@ fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_gre
   });
 }
 
+/// A-722 part 4 (a record's replay a unit a turn, its pack's waiting deltas resolved a delta a unit). Do: push the
+/// fixtures' `create` and `update` (a thin pack, its delta's base outside it); make the store again from the log, each
+/// turn held to no time at all, counting the turns. Expect: more turns than records; the refs advertised after as
+/// before.
+#[test]
+fn t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "thin-replayed");
+    pushed_from_the_fixtures(state, repository, &["create", "update"]);
+    let before = super::advertised_refs(state, repository);
+    let held = records(state, repository);
+    crate::vcs_store::rebuild(state, repository);
+    let mut turns = 0usize;
+    while crate::vcs_store::rebuild_turn_once_within(state, repository, 0) {
+      turns += 1;
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    assert!(turns > held, "{turns} turns for {held} records");
+    assert_eq!(super::advertised_refs(state, repository), before);
+  });
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The hooks (A-665 part 3; Unix, where the hook driver runs).
 
@@ -1280,6 +1302,44 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
       deciding + 2 >= BRANCHES,
       "{deciding} decision steps for {BRANCHES} commands"
     );
+  });
+}
+
+/// A-724's starvation fix (found by use: a push's last input step resolved every delta waiting on a base in one poll,
+/// 1,435.7 ms for git/git v1.5.0 on the 32-core Studio, and the small repositories sharing its shard waited behind it).
+/// Do: push stock git's `create`, then hand the driver `update`'s request (a thin pack whose deltas wait on bases in the
+/// repository) whole, end it, and answer it a step at a time. Expect: once its bytes are in, the push is still resolving
+/// its deltas (no input step resolved them), and its answer, made over turns, is the one git's own server gave.
+#[test]
+fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_step() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "deferred");
+    let mut chained = chain().into_iter();
+    let (create, _) = chained.next().unwrap();
+    let (_, mut push) = started(state, repository);
+    answered(state, &mut push, create.request);
+    let (update, _) = chained.next().unwrap();
+    let (_, mut push) = started(state, repository);
+    push.input(state, update.request).expect("taken");
+    push.end(state).expect("ended");
+    assert!(
+      push.session.is_resolving(),
+      "the thin pack's deltas were resolved inside an input step"
+    );
+    let mut answer = Vec::new();
+    let mut turns = 0;
+    let received = loop {
+      turns += 1;
+      match push.answer_step(state, &mut answer).expect("answered") {
+        Answering::Answered(received) => break received,
+        Answering::Turned => {}
+        #[cfg(unix)]
+        step @ Answering::Hook(_) => panic!("no hook runs here: {step:?}"),
+      }
+    };
+    assert!(turns >= 2, "resolved and checked in one step");
+    assert_eq!(answer, gits_report(&update), "{}", update.name);
+    assert!(reasons(&received).iter().all(|reason| reason == b"ok"));
   });
 }
 

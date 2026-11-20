@@ -1623,6 +1623,64 @@ impl Green {
     Ok(())
   }
 
+  /// Starts a text staged a piece at a time (A-716; [`crate::held`]): a new block named by no path, empty, which
+  /// [`Green::append_staged`] fills and [`Green::seal_staged`] names or [`Green::discard_staged`] gives back.
+  pub fn stage(&mut self) -> crate::held::Staged {
+    crate::held::Staged {
+      block: self.content.add_unnamed_block(Vec::new()),
+      length: 0,
+    }
+  }
+
+  /// Appends `bytes` to the staged text: a commit's svndiff window, applied, as it arrives.
+  pub fn append_staged(&mut self, staged: &mut crate::held::Staged, bytes: &[u8]) {
+    self.content.append_to_block(staged.block, bytes);
+    let added = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    staged.length = staged.length.saturating_add(added);
+  }
+
+  /// Names the staged text `identity` (the caller names its bytes, as [`Green::hold_bytes`]'s caller does): held, one
+  /// holder; or, where `identity` is held already, one more holder of that block and the staged block given back.
+  /// Refused typed, the staged block given back and nothing held: the table at its room, or the identity's holders at
+  /// the most a count holds.
+  ///
+  /// # Errors
+  /// [`crate::held::HeldRefused`].
+  pub fn seal_staged(
+    &mut self,
+    staged: crate::held::Staged,
+    identity: crate::held::Identity,
+  ) -> Result<(), crate::held::HeldRefused> {
+    let crate::held::Staged { block, .. } = staged;
+    let held = match self.held.hold_again(&identity) {
+      Ok(true) => Ok(true),
+      Ok(false) => self.held.room_for_one().map(|()| false),
+      Err(refused) => Err(refused),
+    };
+    match held {
+      Ok(false) => {
+        self
+          .held
+          .entries
+          .insert(identity, crate::held::Entry { block, holders: 1 });
+        Ok(())
+      }
+      Ok(true) => {
+        self.content.release_block(block);
+        Ok(())
+      }
+      Err(refused) => {
+        self.content.release_block(block);
+        Err(refused)
+      }
+    }
+  }
+
+  /// Gives a staged text's block back: its commit aborted or was refused.
+  pub fn discard_staged(&mut self, staged: crate::held::Staged) {
+    self.content.release_block(staged.block);
+  }
+
   /// Holds `bytes` under `identity` with no path naming them (A-716; [`crate::held`]): an intake's object before any
   /// tree names it. Kept once: an identity already held gains a holder and its block stays. Refused typed, nothing held:
   /// the table at its room, or the identity's holders at the most a count holds.
@@ -4927,7 +4985,30 @@ impl Green {
     inc: &Increment,
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     // One verdict for a submit and a push (A-635): judged, then committed at once, at the head it was judged at.
-    match self.judge(inc) {
+    let judgment = self.judge(inc);
+    self.commit_judgment(judgment)
+  }
+
+  /// [`Green::submit_resolved`] for a verdict computed on another copy of this green (A-658 part 3b; A-697 part c: a
+  /// holder's replica computed it, and its owner takes it by position): judged by [`Green::judge_computed`], then
+  /// committed at once at the head it was judged at, so the outcome and what the chain records equal what
+  /// [`Green::submit_resolved`] gives at that head. Refused, typed, nothing judged or applied, as `judge_computed` is.
+  pub fn submit_computed(
+    &mut self,
+    inc: &Increment,
+    computed: Computed,
+  ) -> Result<(Outcome, Option<Vec<crate::chain_entry::Applied>>), PositionRefused> {
+    let judgment = self.judge_computed(inc, computed)?;
+    Ok(self.commit_judgment(judgment))
+  }
+
+  /// A judgment committed at once where it accepted, as a submit's outcome, with what the chain records of a new
+  /// version (`None` beside every other outcome).
+  fn commit_judgment(
+    &mut self,
+    judgment: Judgment,
+  ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
+    match judgment {
       Judgment::Accepted(judged) => {
         let (version, applied) = self.commit_held(judged);
         (Outcome::Accepted { version }, Some(applied))

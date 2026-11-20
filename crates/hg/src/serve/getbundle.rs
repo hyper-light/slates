@@ -115,14 +115,10 @@ pub trait Store: Repository {
     false
   }
 
-  /// The revlogs a stream clone sends ([`crate::render::revlogs`]), charged to `room`; `None` where none is served
-  /// ([`Store::streams`]).
-  fn stream_files(
-    &self,
-    room: &mut Admission,
-  ) -> Result<Option<Vec<crate::render::File>>, Refusal> {
-    let _ = room;
-    Ok(None)
+  /// The index and content store a stream clone's revlogs are rendered from as they are sent
+  /// ([`crate::render::Streaming`], A-745); `None` where none is served ([`Store::streams`]).
+  fn revlogs(&self) -> Option<(&crate::index::HgIndex, &slates_vcs::ContentStore)> {
+    None
   }
 }
 
@@ -231,6 +227,7 @@ pub fn getbundle(
 /// one payload chunk, or the parts after it and the stream's end. What the answer holds across steps is the parts after
 /// the changegroup (made when it begins: bookmarks, `listkeys`, markers, phase heads), the missing changesets as ranges
 /// ([`pull::Ranges`]) and its place in the changegroup ([`Walk`]); never a revision's text past its step.
+#[derive(Debug)]
 pub struct Answering {
   /// The stream's head and the changegroup part's header, until the first step writes them.
   head: Option<Vec<u8>>,
@@ -620,6 +617,7 @@ enum At {
 /// (`mdiff.trivialdiffheader`). The walk holds its place alone: the missing changesets as ranges, and the log and
 /// position next. It never collects the paths the changesets touch: the file logs are walked from one to the next
 /// ([`Store::file_linked_from`]), and a log whose revisions no missing changeset links sends no group.
+#[derive(Debug)]
 pub struct Walk {
   /// The changesets the client lacks.
   missing: pull::Ranges,

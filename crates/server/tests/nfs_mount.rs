@@ -23,7 +23,7 @@ use slates_ipc::protocol::{
   AttachRequest, Direction, Intent, NamePolicy, ReplyBody, RequestBody, SizeClass,
   SnapshotBoundary, VolumeId, pack, unpack,
 };
-use slates_ipc::{ClientEnd, IpcError, connect};
+use slates_ipc::{ClientEnd, connect};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
@@ -35,8 +35,6 @@ use common::nfs::{
 
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
-/// Shape: how long a client waits for the daemon or a full ring before giving up.
-const CREDIT_WAIT: Duration = Duration::from_secs(5);
 /// Format: `MNT3ERR_NOENT` (RFC 1813 §5.1.5) — what a `MNT` of a path the caller's capability does not
 /// make visible answers (AUD-01: a name without its capability is no entry, so nothing is disclosed).
 const MNT3ERR_NOENT: u32 = 2;
@@ -53,23 +51,16 @@ struct Client {
 }
 
 impl Client {
+  /// A client of `instance`, whose daemon started before this, its rendezvous held and published by then: the claim
+  /// waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait (A-571's rule;
+  /// until 2026-11-20 a five-second retry, `CREDIT_WAIT`).
   fn connect(instance: &str) -> Client {
-    let started = Instant::now();
-    loop {
-      match connect(instance) {
-        Ok(connected) => {
-          let client = connected.region.client_id();
-          return Client {
-            end: ClientEnd::connected(connected),
-            client,
-            sequence: 0,
-          };
-        }
-        Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-          std::hint::spin_loop();
-        }
-        Err(e) => panic!("{e}"),
-      }
+    let connected = connect(instance).unwrap_or_else(|e| panic!("{e}"));
+    let client = connected.region.client_id();
+    Client {
+      end: ClientEnd::connected(connected),
+      client,
+      sequence: 0,
     }
   }
 
@@ -88,14 +79,16 @@ impl Client {
       body,
     )
     .unwrap();
-    let started = Instant::now();
-    loop {
-      match self.end.send(&slot) {
-        Ok(()) => break,
-        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::hint::spin_loop(),
-        Err(e) => panic!("{e}"),
-      }
-    }
+    // A full ring is waited out while the daemon lives, as every client end waits (A-571).
+    let roomed = self
+      .end
+      .send_when_room(|end| end.send(&slot))
+      .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+      roomed,
+      slates_ipc::room::Roomed::Sent,
+      "the daemon went away while its ring was full"
+    );
     let reply = self.end.wait(Some(DEADLINE_NS)).unwrap();
     unpack(self.end.region(), reply.kind, &reply.payload).unwrap()
   }
@@ -427,8 +420,8 @@ fn a_mount_preserves_each_requests_unix_owner_across_shards() {
   let mut client = Client::connect(&instance);
   let port = daemon.nfs_port().unwrap();
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  stream.set_read_timeout(Some(CREDIT_WAIT)).unwrap();
-  stream.set_write_timeout(Some(CREDIT_WAIT)).unwrap();
+  // No timeout: the daemon answers while it lives, and its going closes the socket (A-571's rule; until 2026-11-20 five
+  // seconds on the wall, `CREDIT_WAIT`).
   // Shape: the two actual owner partitions, and two distinct ordinary Unix users.
   for partition in 0..2 {
     let name = (0..32)

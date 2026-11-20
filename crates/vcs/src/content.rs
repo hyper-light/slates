@@ -180,6 +180,29 @@ pub trait WindowStorage: std::fmt::Debug {
   fn hand_back(&mut self, _lent: &mut dyn std::any::Any) -> bool {
     false
   }
+
+  /// Names the window just kept under `window` by its identity (A-727 slice a3): what a storage that outlives the
+  /// process keeps beside it, so a store made again after a restart takes it back by identity
+  /// ([`WindowStorage::restored`]). A storage that does not outlive the process keeps nothing.
+  fn named(&mut self, _window: StoredWindow, _identity: &ContentId) {}
+
+  /// The windows this storage kept from before a restart (A-727 slice a3), each with its identity and length, handed
+  /// over once to the store made over it, which holds them for no one until a holder puts them again
+  /// ([`ContentStore::release_unheld`] frees the rest).
+  fn restored(&mut self) -> Vec<(ContentId, StoredWindow, usize)> {
+    Vec::new()
+  }
+
+  /// This storage as `Any`, for an owner that reads what its own storage type keeps (A-727 slice a3: the shard image's
+  /// table of the windows); none for a storage that offers nothing.
+  fn as_any(&self) -> Option<&dyn std::any::Any> {
+    None
+  }
+
+  /// [`WindowStorage::as_any`], mutably.
+  fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+    None
+  }
 }
 
 /// The windows kept in the process's memory: the storage of a store made with [`ContentStore::new`], for tests and
@@ -531,8 +554,10 @@ impl ContentStore {
       .checked_add(width(bytes.len())?)
       .ok_or(ContentRefused::CountExhausted)?;
     let kept = if form == Form::Window {
+      let window = self.storage.put(bytes)?;
+      self.storage.named(window, &identity);
       Kept::Stored {
-        window: self.storage.put(bytes)?,
+        window,
         len: bytes.len(),
       }
     } else {
@@ -850,7 +875,59 @@ impl ContentStore {
   ) -> Result<ContentStore, ContentRefused> {
     let mut store = ContentStore::new(budget, window)?;
     store.storage = storage;
+    // The windows the storage kept from before a restart (A-727 slice a3), held for no one until a holder puts them.
+    for (identity, kept, len) in store.storage.restored() {
+      let bytes = width(len)?;
+      store.content_bytes = store
+        .content_bytes
+        .checked_add(bytes)
+        .ok_or(ContentRefused::CountExhausted)?;
+      store.entries.insert(
+        identity,
+        Held {
+          kept: Kept::Stored { window: kept, len },
+          form: Form::Window,
+          holders: 0,
+        },
+      );
+    }
     Ok(store)
+  }
+
+  /// Frees every window the storage kept from before a restart that no holder put again (A-727 slice a3): what the
+  /// owner calls once the records are replayed, since a window no record names is held by no one. The count freed.
+  pub fn release_unheld(&mut self) -> u64 {
+    let unheld: Vec<ContentId> = self
+      .entries
+      .iter()
+      .filter(|(_, held)| held.holders == 0)
+      .map(|(identity, _)| *identity)
+      .collect();
+    let mut freed = 0u64;
+    for identity in unheld {
+      let Some(held) = self.entries.remove(&identity) else {
+        continue;
+      };
+      self.content_bytes = self
+        .content_bytes
+        .saturating_sub(u64::try_from(held.len()).unwrap_or(u64::MAX));
+      if let Kept::Stored { window, .. } = held.kept {
+        self.storage.release(window);
+      }
+      freed = freed.saturating_add(1);
+    }
+    self.counters.freed = self.counters.freed.saturating_add(freed);
+    freed
+  }
+
+  /// The storage the windows are kept in (A-727 slice a3: its owner images it).
+  pub fn storage(&self) -> &dyn WindowStorage {
+    &*self.storage
+  }
+
+  /// [`ContentStore::storage`], mutably.
+  pub fn storage_mut(&mut self) -> &mut dyn WindowStorage {
+    &mut *self.storage
   }
 
   /// The length in bytes of the content `identity` names, whatever its form, read without its bytes.
@@ -1459,5 +1536,120 @@ mod tests {
     store.release(&root).unwrap();
     assert_eq!(store.object_bytes(&root, len), None);
     assert_eq!(store.bytes_of(&short).as_deref(), Some(&b"short"[..]));
+  }
+
+  /// A storage that kept windows from before a restart (A-727 slice a3): the windows `kept` names, by identity, handed
+  /// to the store made over it.
+  #[derive(Debug, Default)]
+  struct RestoredWindows {
+    inner: HeapWindows,
+    kept: Vec<(ContentId, StoredWindow, usize)>,
+    named: Vec<(StoredWindow, ContentId)>,
+  }
+
+  impl WindowStorage for RestoredWindows {
+    fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused> {
+      self.inner.put(bytes)
+    }
+
+    fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>> {
+      self.inner.read(window)
+    }
+
+    fn release(&mut self, window: StoredWindow) {
+      self.inner.release(window);
+    }
+
+    fn named(&mut self, window: StoredWindow, identity: &ContentId) {
+      self.named.push((window, *identity));
+    }
+
+    fn restored(&mut self) -> Vec<(ContentId, StoredWindow, usize)> {
+      std::mem::take(&mut self.kept)
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+      Some(self)
+    }
+  }
+
+  /// A-727 slice a3 (windows kept across a restart). Do: give a storage three windows it kept before a restart; make a
+  /// store over it; put one of them again and a new one; free the windows no holder put again. Expect: the three held
+  /// for no one and counted in what the store holds, readable by identity; the put again answered by the window kept,
+  /// stored nothing new and held once; the new one stored and named to the storage by its identity; then the two no
+  /// one put freed, released from the storage, and the store holding the two that are held.
+  #[test]
+  fn windows_kept_from_before_a_restart_are_held_again_by_a_put_and_the_rest_freed() {
+    let mut storage = RestoredWindows::default();
+    let windows: [&[u8]; 3] = [
+      b"kept and put again",
+      b"kept, never named again",
+      b"kept too",
+    ];
+    for bytes in windows {
+      let window = storage.inner.put(bytes).unwrap();
+      storage
+        .kept
+        .push((ContentId::of(bytes), window, bytes.len()));
+    }
+    let mut store = ContentStore::with_storage(1 << 20, NARROW, Box::new(storage)).unwrap();
+    assert_kept_held_for_no_one(&store, windows);
+    let stored = store.counters().stored;
+    assert_eq!(store.put(windows[0]).unwrap(), ContentId::of(windows[0]));
+    assert_eq!(
+      store.counters().stored,
+      stored,
+      "the window kept answers the put"
+    );
+    assert_eq!(store.holders(&ContentId::of(windows[0])), 1);
+    let fresh = store.put(b"new since the restart").unwrap();
+    assert_eq!(store.release_unheld(), 2);
+    assert_eq!(store.len(), 2);
+    assert_eq!(store.bytes_of(&ContentId::of(windows[1])), None);
+    assert_eq!(
+      store.bytes_of(&ContentId::of(windows[0])).as_deref(),
+      Some(windows[0])
+    );
+    assert_eq!(
+      store.bytes_of(&fresh).as_deref(),
+      Some(&b"new since the restart"[..])
+    );
+    assert_only_the_new_window_named(&store, fresh);
+  }
+
+  /// The windows kept before the restart, held for no one, counted in what `store` holds and readable by identity.
+  fn assert_kept_held_for_no_one(store: &ContentStore, windows: [&[u8]; 3]) {
+    let held: u64 = windows
+      .iter()
+      .map(|bytes| u64::try_from(bytes.len()).unwrap())
+      .sum();
+    assert_eq!((store.len(), store.used()), (3, held));
+    for bytes in windows {
+      assert_eq!(store.holders(&ContentId::of(bytes)), 0);
+      assert_eq!(
+        store.bytes_of(&ContentId::of(bytes)).as_deref(),
+        Some(bytes)
+      );
+    }
+  }
+
+  /// Only `fresh`, the window stored since the restart, was named to the storage, by its identity.
+  fn assert_only_the_new_window_named(store: &ContentStore, fresh: ContentId) {
+    let named = store
+      .storage()
+      .as_any()
+      .and_then(|any| any.downcast_ref::<RestoredWindows>())
+      .map(|storage| {
+        storage
+          .named
+          .iter()
+          .map(|(_, identity)| *identity)
+          .collect::<Vec<_>>()
+      });
+    assert_eq!(
+      named,
+      Some(vec![fresh]),
+      "only the new window is named, by its identity"
+    );
   }
 }

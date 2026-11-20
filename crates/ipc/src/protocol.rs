@@ -1340,6 +1340,55 @@ pub enum RequestBody {
     /// The new volume's name.
     name: String,
   },
+  /// Admit work `work` over green `green` at the green's owner (A-247, A-697 part a): the node that will hold the work
+  /// asks the green's owner, which judges the relayed principal's rights from the green's record, records the work's
+  /// floor at the head (`WorkFloorSet`, which keeps the head's history while the work reads it), and answers
+  /// `WorkAdmitted` with the work and its base. A node's verb, never a client's: served only as a forward from another
+  /// node, under the forward's completion record (so a resent forward is answered once), and refused `Unsupported` from
+  /// a client of the green's own node. Refused as a creation is: `NotFound` for no such green, `NotShared` for a
+  /// principal of another node the green is not shared with, `Forbidden` for one without the right. Appended.
+  AdmitWork {
+    /// The green.
+    green: VolumeId,
+    /// The work, its id minted on the asking node's partition.
+    work: VolumeId,
+  },
+  /// Move work `work`'s floor on green `green` to version `base`, or drop it (`None`), at the green's owner (A-247,
+  /// A-697 part b): the node holding a work over a green another node owns tells the owner when the work's base rises or
+  /// the work is gone, so the owner keeps the history the work reads and no more. A node's verb, never a client's:
+  /// refused `Unsupported` from a client of either node. It is monotone and idempotent, so it forwards with no completion
+  /// record, as a read does: a floor only rises (a lower or equal base is a no-op), a drop is final, and a work with no
+  /// floor at the owner (never admitted, or dropped) is left without one, so a late or repeated move changes nothing.
+  /// Answered `WorkFloorMoved`; `NotFound` for no such green. Appended.
+  MoveWorkFloor {
+    /// The green.
+    green: VolumeId,
+    /// The work, a work of the asking node.
+    work: VolumeId,
+    /// The work's base now, or `None` when the work is gone.
+    base: Option<u64>,
+  },
+  /// Commit a work's increment by the verdict a holder computed (A-697 part c; A-658 part 3b; A-645 "Merges computed
+  /// anywhere, committed by position"): the node holding work `work` over green `green`, which another node owns,
+  /// composed the work's increment, computed its verdict on its replica of the green, and sends both to the owner, which
+  /// takes the verdict by position (`Green::judge_computed`: at the head it was computed against it stands, and once the
+  /// green moved only what the versions since changed is judged again) and commits it as a submit does, answering as a
+  /// submit is answered (`Submitted`, a conflict, or the submit's refusals). A node's verb, never a client's: served only
+  /// as a forward from another node, under the forward's completion record (keyed by the client's own submit), and
+  /// refused `Unsupported` from a client of either node. A verdict that is not this increment's, or one computed past
+  /// the owner's head, is refused `BadRequest`. Appended.
+  SubmitComputed {
+    /// The work, a work of the asking node.
+    work: VolumeId,
+    /// Its green.
+    green: VolumeId,
+    /// The increment, as `Increment::encode` writes it.
+    increment: Vec<u8>,
+    /// Its verdict, as `Computed::encode` writes it (A-658 part 3a).
+    computed: Vec<u8>,
+    /// What the owner judges the write policy, the signature and the commit by.
+    carried: ComputedSubmit,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2047,6 +2096,49 @@ pub struct ShardReport {
   /// This node's failover estimate (A-363): live on the control shard, which runs the coordinator; elsewhere the
   /// recovery prior alone. Appended.
   pub failover: FailoverReport,
+  /// Each repository this shard owns with an event since it was made here, and its usage (A-724 piece 1's ledger,
+  /// `slates_vcs::usage`): what the share model reads, reported so a load run can see where a shard's time went.
+  /// Appended.
+  pub repositories: Vec<RepositoryUsageReport>,
+}
+
+/// One repository's usage on its owner shard (A-724; `slates_vcs::usage::Usage`), as a shard's report carries it.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryUsageReport {
+  /// The repository's name.
+  pub name: String,
+  /// Intakes (pushes, commits) begun.
+  pub intakes_begun: u64,
+  /// Intakes answered.
+  pub intakes_answered: u64,
+  /// Intake steps run.
+  pub intake_steps: u64,
+  /// The shard clock's nanoseconds those steps ran.
+  pub intake_step_ns: u64,
+  /// Bytes the clients sent for them.
+  pub intake_bytes_in: u64,
+  /// Fetch requests begun.
+  pub fetches_begun: u64,
+  /// The shard clock's nanoseconds fetch steps ran.
+  pub fetch_step_ns: u64,
+  /// The shard clock's nanoseconds at its first event.
+  pub first_ns: u64,
+  /// The shard clock's nanoseconds at its latest event.
+  pub last_ns: u64,
+  /// The longest one intake step ran, in nanoseconds: how long an intake held its shard at once.
+  pub longest_intake_step_ns: u64,
+  /// A git push's longest step of each phase on this shard, in nanoseconds: a run of the body read, the body's end, a
+  /// turn of the pack's checks, and the answer's last step (seal, hooks, verdicts, commit, report). Zeros for others.
+  pub longest_push_phases_ns: Vec<u64>,
+  /// A git push's steps of each phase on this shard, in the phases' order above.
+  pub push_phase_steps: Vec<u64>,
+  /// The nanoseconds those steps ran, by phase.
+  pub push_phase_ns: Vec<u64>,
+  /// The nanoseconds from the repository's previous push step's end to each step's start, by the step's phase: before
+  /// a check turn or the answer, the push's wait for its shard; before an input step, that and the client's bytes.
+  pub push_phase_gap_ns: Vec<u64>,
+  /// The nanoseconds from each git push's beginning to its first step, summed.
+  pub push_first_gap_ns: u64,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last
@@ -2285,6 +2377,9 @@ impl RequestBody {
       | RequestBody::Versions { green: volume }
       | RequestBody::ChangedSince { green: volume, .. }
       | RequestBody::CreateWork { green: volume, .. }
+      | RequestBody::AdmitWork { green: volume, .. }
+      | RequestBody::MoveWorkFloor { green: volume, .. }
+      | RequestBody::SubmitComputed { green: volume, .. }
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
@@ -2399,6 +2494,8 @@ impl RequestBody {
         | RequestBody::CreateRepository { .. }
         | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
+        | RequestBody::AdmitWork { .. }
+        | RequestBody::SubmitComputed { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
@@ -2434,7 +2531,8 @@ impl RequestBody {
   /// Whether a verb is a **read** a node forwards to a volume's owner without a completion record: a volume-scoped
   /// query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup"). A staging verb
   /// forwards the same way: a retried put of bytes already written is answered unchanged, and a retried begin only
-  /// strands a charged buffer that expires within a lease.
+  /// strands a charged buffer that expires within a lease. So does a work's floor move (`MoveWorkFloor`), monotone and
+  /// idempotent at the owner.
   pub fn forwards_as_read(&self) -> bool {
     matches!(
       self,
@@ -2449,6 +2547,8 @@ impl RequestBody {
         | RequestBody::ReadDir { .. }
         | RequestBody::StageBegin { .. }
         | RequestBody::StagePut { .. }
+        // A floor's move is monotone and idempotent (A-697 part b), so a resent forward changes nothing.
+        | RequestBody::MoveWorkFloor { .. }
     )
   }
 
@@ -2476,6 +2576,28 @@ impl RequestBody {
   pub fn may_be_forwarded(&self) -> bool {
     self.forwards_as_read() || self.forwards_as_write()
   }
+}
+
+/// What a submit computed on a holder node carries to its green's owner beside its increment and its verdict
+/// (`RequestBody::SubmitComputed`, A-697 part c): what the owner judges the write policy (A-285), the signature (A-321)
+/// and the commit the server makes (A-664) by, read on the holder, where the work's record is, as a work's shard reads
+/// them for its green's owner on one node.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ComputedSubmit {
+  /// The work's merge mode.
+  pub work_mode: WriteMode,
+  /// Whether the submit asks to be held for approval (`SubmitHeld`).
+  pub held: bool,
+  /// The launcher's approval of exactly this increment, by its identity (`SubmitApproved`), verified on the holder.
+  pub approved: Option<[u8; 32]>,
+  /// The signature over the merge's statement, if the submit carries one.
+  pub signature: Option<Vec<u8>>,
+  /// The work's trusted signers, read for a submit that carries a signature.
+  pub signers: Vec<Vec<u8>>,
+  /// Whether merges from the work must be signed.
+  pub signed_required: bool,
+  /// The message and the session's identities for the commit the server makes of the work.
+  pub authorship: Authorship,
 }
 
 /// One record session to a peer, as this node last saw it (§4.8; condition 7's evidence): the sender's congestion
@@ -5548,6 +5670,17 @@ pub enum ReplyBody {
     /// The dump's length in bytes.
     dump_bytes: u64,
   },
+  /// A work admitted over its green at the green's owner (`AdmitWork`, A-697 part a): the work, and the green's version
+  /// it is based on, whose history the owner keeps while the work reads it. Appended.
+  WorkAdmitted {
+    /// The work.
+    id: VolumeId,
+    /// The green's version the work is based on.
+    base: u64,
+  },
+  /// A work's floor moved or dropped at its green's owner, or left as it was where the move changed nothing
+  /// (`MoveWorkFloor`, A-697 part b). Appended.
+  WorkFloorMoved,
 }
 
 /// What a checkout changed in its green's base volume (§4.16 A-201): the head's difference from the origin, by

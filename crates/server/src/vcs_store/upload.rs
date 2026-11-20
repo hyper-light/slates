@@ -92,10 +92,25 @@ impl StoreLender for ShardStores {
     crate::state::with_state_counted(|state| lend_on(state, (id, None), step)).flatten()
   }
 
+  type Hold = GitGeneration;
+
+  fn hold(&mut self, id: RepositoryId, reader: &Principal) -> Option<GitGeneration> {
+    crate::state::with_state_counted(|state| hold_in(state, id, reader)).flatten()
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    hold: &GitGeneration,
+    step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
+  ) -> Option<R> {
+    crate::state::with_state_counted(|state| lend_held_in(state, hold, step)).flatten()
+  }
+
   /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
-  /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]).
+  /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]); waited for
+  /// at most one liveness window, past which the answer begins and a task finishes the encoding behind it.
   async fn encode(&mut self, id: RepositoryId) {
-    super::git_encode::settle_encodings(id).await;
+    super::git_encode::encode_for_fetch(id).await;
   }
 }
 
@@ -156,6 +171,153 @@ fn lend_uncounted<R>(
     Some(step(&served, &mut packs))
   })
 }
+
+/// A fork of a git repository's store as it stood at `stamp` (A-745, §4.17.1 "A fetch's answer" rule 4;
+/// `slates_git::store::Repository::fork`), and how many fetches hold it.
+#[derive(Debug)]
+pub(crate) struct GitFork {
+  /// Where the repository stood when it was forked ([`slates_git::store::Repository::stamp`]).
+  stamp: (u64, u64),
+  /// The fork.
+  repository: slates_git::store::Repository,
+  /// The fetches holding it.
+  holders: u64,
+}
+
+/// A fetch's hold on the generation of a git repository it began on (A-745, §4.17.1 "A fetch's answer" rule 4): the fork
+/// its shard keeps at the stamp the repository stood at ([`GitFork`], shared by every fetch that began there), and the
+/// refs its reader could read and `HEAD`'s branch as they stood, so every step of its answer reads what its first step
+/// read whatever lands meanwhile. Given back by its drop, on the shard that keeps the fork; the fork with its last
+/// holder.
+pub(crate) struct GitGeneration {
+  /// The repository.
+  id: RepositoryId,
+  /// The stamp of the fork it holds.
+  stamp: (u64, u64),
+  /// The refs its reader could read, by full name and green, in name order.
+  refs: Vec<(Vec<u8>, u64)>,
+  /// The full name of the branch `HEAD` named.
+  head: Vec<u8>,
+}
+
+impl Drop for GitGeneration {
+  fn drop(&mut self) {
+    let (id, stamp) = (self.id, self.stamp);
+    crate::state::with_state(|state| release_fork(state, id, stamp)).unwrap_or_default();
+  }
+}
+
+/// Holds repository `id`'s generation as `state` holds it now for `reader` ([`GitGeneration`]): the fork at the stamp it
+/// stands at, made where none is kept; none when it is not lendable here or cannot be forked.
+fn hold_in(state: &mut ShardState, id: RepositoryId, reader: &Principal) -> Option<GitGeneration> {
+  let (record, head) = lendable(state, id)?;
+  let refs = readable_refs(state, record, reader)?;
+  let stamp = state.vcs_stores.git_ref(id)?.1.repository.stamp();
+  let kept = state
+    .vcs_stores
+    .git_forks
+    .get_mut(&id)
+    .and_then(|forks| forks.iter_mut().find(|fork| fork.stamp == stamp));
+  match kept {
+    Some(fork) => fork.holders = fork.holders.saturating_add(1),
+    None => {
+      // The fork's records charge the shard's budget, as the repository's do, lent for the fork alone.
+      let repository = super::within_budget(state, 0, |stores| {
+        let (content, store) = stores.git(id)?;
+        store.repository.fork(content).ok()
+      })?;
+      state
+        .vcs_stores
+        .git_forks
+        .entry(id)
+        .or_default()
+        .push(GitFork {
+          stamp,
+          repository,
+          holders: 1,
+        });
+    }
+  }
+  Some(GitGeneration {
+    id,
+    stamp,
+    refs,
+    head,
+  })
+}
+
+/// Runs `step` over the generation `hold` holds, counted as [`lend_on`] counts a step; none when its fork is gone.
+fn lend_held_in<R>(
+  state: &mut ShardState,
+  hold: &GitGeneration,
+  step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
+) -> Option<R> {
+  let began = slates_rt::futures::now_ns();
+  let refs: Vec<NamedRef<'_>> = hold
+    .refs
+    .iter()
+    .map(|(name, green)| NamedRef {
+      name,
+      green: *green,
+    })
+    .collect();
+  let mut packs = ShardPacks::of(&state.config);
+  let lent = super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+    let fork = stores
+      .git_forks
+      .get(&hold.id)?
+      .iter()
+      .find(|fork| fork.stamp == hold.stamp)?;
+    let served = Served {
+      repository: &fork.repository,
+      store: stores.content.as_ref()?,
+      refs: &refs,
+      head: &hold.head,
+    };
+    Some(step(&served, &mut packs))
+  });
+  if lent.is_some() {
+    let now = slates_rt::futures::now_ns();
+    state
+      .vcs_usage
+      .stepped(&hold.id, Work::Fetch, (now.saturating_sub(began), 0), now);
+  }
+  lent
+}
+
+/// Lets go of one hold on repository `id`'s fork at `stamp`, giving the fork back with its last holder; a refused
+/// release counted.
+fn release_fork(state: &mut ShardState, id: RepositoryId, stamp: (u64, u64)) {
+  let Some(forks) = state.vcs_stores.git_forks.get_mut(&id) else {
+    return;
+  };
+  let Some(at) = forks.iter().position(|fork| fork.stamp == stamp) else {
+    return;
+  };
+  let last = forks.get_mut(at).is_some_and(|fork| {
+    fork.holders = fork.holders.saturating_sub(1);
+    fork.holders == 0
+  });
+  if !last {
+    return;
+  }
+  let fork = forks.remove(at);
+  if forks.is_empty() {
+    state.vcs_stores.git_forks.remove(&id);
+  }
+  let released = super::within_budget(state, 0, |stores| {
+    stores
+      .content
+      .as_mut()
+      .map_or(Ok(()), |content| fork.repository.release(content))
+  });
+  if released.is_err() {
+    state.count(FORK_RELEASE_REFUSED, 1);
+  }
+}
+
+/// Format: the count of a git fetch's fork its content store refused to take back (A-745 rule 4).
+const FORK_RELEASE_REFUSED: &str = "vcs_store.git_fork_release";
 
 /// Repository `id`'s record and the full name of the branch its `HEAD` names, when its git store is held on `state`'s
 /// shard and can be lent (the module doc): none for a store not held here, one of another tool, or a repository with no
@@ -229,6 +391,14 @@ impl ShardPacks {
 
 impl PackSource for ShardPacks {
   type Pack = Streamed;
+
+  /// The shard's step quantum, begun now, on the shard's clock (§4.3; A-745): a fetch's choice of its pack's objects
+  /// stops between units once it is spent.
+  fn turn(&self) -> impl FnMut() -> bool + 'static {
+    let began = slates_rt::futures::now_ns();
+    let quantum = self.quantum_ns;
+    move || slates_rt::futures::now_ns().saturating_sub(began) >= quantum
+  }
 
   fn begin(
     &mut self,

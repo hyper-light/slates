@@ -26,7 +26,7 @@ const DATE: &str = "2026-11-19T20:00:00.000000Z";
 const DATE_INSTANT: AprTime = AprTime(1_795_118_400_000_000);
 
 /// The repository's owner.
-fn owner() -> Principal {
+pub(crate) fn owner() -> Principal {
   Principal::Uid {
     host: slates_db::HostId(0),
     uid: 1234,
@@ -34,7 +34,7 @@ fn owner() -> Principal {
 }
 
 /// Creates Subversion repository `name` on the shard: its id and its one green.
-fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
+pub(crate) fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
   let reply = dispatch(
     state,
     1,
@@ -56,7 +56,7 @@ fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) 
 }
 
 /// `bytes`' content identity.
-fn identity(bytes: &[u8]) -> ContentIdentity {
+pub(crate) fn identity(bytes: &[u8]) -> ContentIdentity {
   *blake3::hash(bytes).as_bytes()
 }
 
@@ -136,7 +136,7 @@ fn ignores() -> Vec<u8> {
 }
 
 /// Revision 1: `/trunk` holding a property list, `/trunk/a.txt`, and `/trunk/sub` holding `b.txt`.
-fn first() -> Revision {
+pub(crate) fn first() -> Revision {
   let trunk = ChangedPath {
     properties: Some(held(&ignores())),
     ..row("/trunk", Action::Add, NodeKind::Directory)
@@ -865,5 +865,240 @@ fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
     );
     assert_eq!(seen, Some(expected));
     assert_eq!(records.content(&identity(special)), Some(&special[..]));
+  });
+}
+
+/// A-664's Subversion objects (a copy; main's ruling: a work's copy as Subversion's copy-from row). Do: make a Subversion
+/// repository; submit a work making `/trunk/a.txt` and the directory `/branches`; submit a work copying `/trunk` to
+/// `/branches/b` from its base; then commit a client's revision on the youngest adding `/branches/b/c.txt`. Expect:
+/// revision 2's one row adds `/branches/b`, a directory, copied from `/trunk` at revision 1; the records hold
+/// `/branches/b/a.txt` at revision 2; the client's revision lands as revision 3.
+#[test]
+fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "copied");
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let first = vec![
+      crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n"),
+      crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Mkdir {
+        path: "/branches".to_owned(),
+      }),
+    ];
+    crate::vcs_store::paths::tests::version(state, ipc_green, 1, first);
+    let copy = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Copy {
+      from: "/trunk".to_owned(),
+      to: "/branches/b".to_owned(),
+      version: None,
+      replace: false,
+    });
+    assert_eq!(
+      crate::vcs_store::paths::tests::version(state, ipc_green, 2, vec![copy]),
+      2
+    );
+    let records = state
+      .vcs_stores
+      .subversion_records(svn)
+      .expect("the records");
+    let rows: Vec<(String, Action, NodeKind, Option<CopySource>)> = records
+      .index()
+      .changes(2)
+      .map(|rows| {
+        rows
+          .iter()
+          .map(|row| {
+            (
+              row.path.clone(),
+              row.action,
+              row.kind,
+              row.copy_from.clone(),
+            )
+          })
+          .collect()
+      })
+      .unwrap_or_default();
+    let copied = CopySource {
+      path: "/trunk".to_owned(),
+      revision: 1,
+    };
+    assert_eq!(
+      rows,
+      vec![(
+        "/branches/b".to_owned(),
+        Action::Add,
+        NodeKind::Directory,
+        Some(copied)
+      )]
+    );
+    let held = records
+      .index()
+      .node("/branches/b/a.txt", 2)
+      .ok()
+      .flatten()
+      .is_some();
+    assert!(held, "the copy brings /trunk/a.txt");
+    let rows = vec![file("/branches/b/c.txt", Action::Add, b"gamma\n")];
+    let committed = commit(
+      state,
+      (&owner(), svn),
+      revision(2, rows, &[b"gamma\n"]),
+      None,
+    );
+    assert_eq!(committed, answered(3));
+  });
+}
+
+/// What a fetch's hold on `svn`'s records reads: their youngest revision and `/trunk/a.txt`'s text; none when they are
+/// gone.
+fn read_held(
+  state: &mut ShardState,
+  hold: &crate::vcs_store::svn_view::SvnHold,
+) -> Option<(u64, Option<Vec<u8>>)> {
+  use slates_svn::reads::Repository as _;
+  crate::vcs_store::svn_view::lend_held_in(state, hold, |lent| {
+    let text = lent
+      .repository
+      .text(&identity(b"alpha\n"), 0)
+      .map(std::borrow::Cow::into_owned);
+    (lent.index.youngest(), text)
+  })
+}
+
+/// A-749 rule 4 (§4.17.1 "A fetch's answer": fetches run over the index generation they began on), for Subversion's
+/// records. Do: commit revision 1; hold the records as a fetch's answer does when it begins; make the store again from
+/// the log (a rebuild: the store freed, made empty and lent to nothing until its records are replayed, a turn each);
+/// read through the hold while it is lent to nothing and again once it is whole; give the hold back. Expect: the hold
+/// reads revision 1 and `/trunk/a.txt`'s text throughout; the records kept for it charged until it is given back, and
+/// then the shard charged for the store made again alone, as before the rebuild; a hold taken after reads the store made
+/// again. Red before the change: the hold read nothing once the store was freed.
+#[test]
+fn t_a745_a_fetchs_hold_reads_the_records_it_began_on_across_a_rebuild() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, _) = subversion(state, "held");
+    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+    let (_, _, charged) = kept(state, svn);
+    let retained = state.store.budget.retained();
+    let hold = crate::vcs_store::svn_view::hold_in(state, svn).expect("the records held");
+    crate::vcs_store::rebuild(state, svn);
+    let lent_to_nothing = state.vcs_stores.subversion_records(svn).is_none();
+    let during = read_held(state, &hold);
+    while crate::vcs_store::rebuild_turn_once(state, svn) {}
+    let made_again = kept(state, svn);
+    let both = state.store.budget.retained();
+    let after = read_held(state, &hold);
+    hold.give_back(state);
+    let given_back = state.store.budget.retained();
+    let again = crate::vcs_store::svn_view::hold_in(state, svn).expect("the store made again held");
+    let fresh = read_held(state, &again);
+    again.give_back(state);
+    let alpha = Some((1, Some(b"alpha\n".to_vec())));
+    assert_eq!(
+      (lent_to_nothing, during, after, fresh),
+      (true, alpha.clone(), alpha.clone(), alpha)
+    );
+    assert_eq!(made_again.0, 1);
+    assert_eq!(
+      (both, given_back),
+      (
+        retained.saturating_add(made_again.2),
+        retained
+          .saturating_sub(charged)
+          .saturating_add(made_again.2)
+      )
+    );
+  });
+}
+
+/// S4 slice 2 c1 (the head's texts held by the green, `vcs_store::svn_texts`). Do: commit revision 1 (`/trunk/a.txt`,
+/// `/trunk/sub/b.txt`); 2, `branched` (a copy of `/trunk` with `a.txt` changed beneath it and `sub` deleted); 3,
+/// deleting `/trunk`; 4, replacing `/branches/b/a.txt` by another text; reading each text through the sources' text
+/// source after each. Expect: after 1 the green holds both texts; after 2 those of `trunk` and the branch's changed
+/// `a.txt`, each once though two rows reach it; after 3 the branch's alone; after 4 only the replacing text; each held
+/// text read from the green, borrowed, and an earlier text still read from the records.
+#[test]
+fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    let held = |state: &ShardState| {
+      let engine = state.greens.get(&green).expect("the green");
+      let texts: [&[u8]; 5] = [b"alpha\n", b"beta\n", b"alpha 2\n", b"gamma\n", b"never\n"];
+      let each: Vec<bool> = texts
+        .iter()
+        .map(|bytes| engine.held(&identity(bytes)) == Some(*bytes))
+        .collect();
+      (engine.held_count(), each)
+    };
+    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+    assert_eq!(held(state), (2, vec![true, true, false, false, false]));
+    assert_eq!(
+      commit(state, (&owner(), svn), branched(), None),
+      answered(2)
+    );
+    assert_eq!(held(state), (3, vec![true, true, true, false, false]));
+    let deleted = revision(
+      2,
+      vec![row("/trunk", Action::Delete, NodeKind::Directory)],
+      &[],
+    );
+    assert_eq!(commit(state, (&owner(), svn), deleted, None), answered(3));
+    assert_eq!(held(state), (1, vec![false, false, true, false, false]));
+    let replacing = revision(
+      3,
+      vec![file("/branches/b/a.txt", Action::Replace, b"gamma\n")],
+      &[b"gamma\n"],
+    );
+    assert_eq!(commit(state, (&owner(), svn), replacing, None), answered(4));
+    assert_eq!(held(state), (1, vec![false, false, false, true, false]));
+    let engine = state.greens.get(&green).expect("the green");
+    let records = state
+      .vcs_stores
+      .subversion_records(svn)
+      .expect("the records");
+    let texts = crate::vcs_store::svn_texts::HeadTexts {
+      green: Some(&engine),
+      records,
+    };
+    use slates_svn::migration::TextSource;
+    assert!(matches!(
+      texts.text(&identity(b"gamma\n")),
+      Some(std::borrow::Cow::Borrowed(b"gamma\n"))
+    ));
+    assert_eq!(
+      texts.text(&identity(b"alpha\n")).as_deref(),
+      Some(&b"alpha\n"[..]),
+      "an earlier text is read from the records"
+    );
+  });
+}
+
+/// S4 slice 2 c1 (a recovery's green holds the head's texts again, `svn_texts::rehold_head`). Do: commit revision 1 and
+/// `branched`; let go of every text the green holds, as a green a recovery made again holds none; hold the head again,
+/// twice. Expect: the head's three texts held again, each once, as the commits had left them; the second call holding
+/// nothing more, since the green holds texts already.
+#[test]
+fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+    assert_eq!(
+      commit(state, (&owner(), svn), branched(), None),
+      answered(2)
+    );
+    let texts: [&[u8]; 3] = [b"alpha\n", b"beta\n", b"alpha 2\n"];
+    let mut engine = state.greens.get_mut(&green).expect("the green");
+    // Every holder of every text let go, as a green a recovery made again holds none.
+    while engine.held_count() > 0 {
+      for bytes in texts {
+        let _ = engine.release_held(&identity(bytes));
+      }
+    }
+    drop(engine);
+    crate::vcs_store::svn_texts::rehold_head(state, svn, green);
+    crate::vcs_store::svn_texts::rehold_head(state, svn, green);
+    let engine = state.greens.get(&green).expect("the green");
+    let held: Vec<bool> = texts
+      .iter()
+      .map(|bytes| engine.held(&identity(bytes)) == Some(*bytes))
+      .collect();
+    assert_eq!((engine.held_count(), held), (3, vec![true, true, true]));
   });
 }

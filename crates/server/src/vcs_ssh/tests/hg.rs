@@ -349,6 +349,20 @@ impl Lends {
 
 impl HgStores for Lends {
   type Store<'s> = Probed;
+  type Hold = RepositoryId;
+
+  fn hold(&mut self, id: RepositoryId, _room: &mut slates_hg::Admission) -> Option<RepositoryId> {
+    self.holds(id).then_some(id)
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    hold: &RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    self.lend(*hold, room, step)
+  }
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HG && !self.gone.is_some_and(|gone| gone.load(Ordering::Acquire))
@@ -422,6 +436,20 @@ struct NoGit;
 
 impl StoreLender for NoGit {
   type Packs = NoPacks;
+
+  type Hold = (RepositoryId, Principal);
+
+  fn hold(&mut self, id: RepositoryId, reader: &Principal) -> Option<(RepositoryId, Principal)> {
+    self.holds(id).then(|| (id, reader.clone()))
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    (id, reader): &(RepositoryId, Principal),
+    step: impl FnOnce(&slates_git::upload::Served<'_>, &mut NoPacks) -> R,
+  ) -> Option<R> {
+    self.lend((*id, reader), step)
+  }
 
   fn holds(&self, _id: RepositoryId) -> bool {
     false
@@ -1180,4 +1208,154 @@ fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it
       Some(THIRD.to_owned())
     )
   );
+}
+
+/// Makes Mercurial repository `name` on `state`'s shard holding one changeset whose one file is `bytes`: its record and
+/// the changeset's node.
+fn one_file_history(
+  state: &mut ShardState,
+  name: &str,
+  bytes: &'static [u8],
+) -> (RepositoryRecord, Node) {
+  let reply = crate::verbs::dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::CreateRepository {
+      name: name.to_owned(),
+      tool: IpcTool::Mercurial,
+      format: IpcFormat::Sha1,
+      default_branch: line_name(b"default", 0),
+      green: None,
+    },
+  );
+  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
+  let id = state
+    .db
+    .partition()
+    .repositories()
+    .repository_named(name)
+    .expect("the repository made")
+    .id;
+  let made = history_of(&[("large", "large", bytes, None, "default")]);
+  let unbundle = Unbundle {
+    parts: vec![Taken {
+      id: 0,
+      mandatory: true,
+      asks: Asks::Changegroup(changegroup(&made, &[0])),
+    }],
+  };
+  let mut room = slates_hg::Admission::new(u64::MAX);
+  // The push is past one request's room by design: it is admitted what the shard can hold.
+  let terms = (false, HISTORY_PUSH, u64::MAX);
+  let prepared =
+    hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
+  let landed = hg_push::land(state, (&owner(), id), prepared);
+  assert!(
+    landed.answer.is_ok() && landed.released.is_ok(),
+    "{landed:?}"
+  );
+  let record = state
+    .db
+    .partition()
+    .repositories()
+    .repository(id)
+    .cloned()
+    .expect("the record");
+  (record, made[0].node)
+}
+
+/// The SSH request of a clone of `head` as stock 7.2 asks it: `getbundle` with bundle2's changegroup 02 and 03 and
+/// nothing common, then the empty line that ends the session.
+fn clone_request(head: &Node) -> Vec<u8> {
+  let mut request = b"getbundle\n* 3\n".to_vec();
+  let bundlecaps = b"HG20,bundle2=HG20%0Achangegroup%3D02%2C03";
+  let common = "0".repeat(40);
+  let heads = crate::verbs::hex_of(head);
+  for (key, value) in [
+    (&b"bundlecaps"[..], &bundlecaps[..]),
+    (b"common", common.as_bytes()),
+    (b"heads", heads.as_bytes()),
+  ] {
+    request.extend_from_slice(key);
+    request.extend_from_slice(format!(" {}\n", value.len()).as_bytes());
+    request.extend_from_slice(value);
+  }
+  request.push(b'\n');
+  request
+}
+
+/// A-745 (§4.17.1 "A fetch's answer"; found by use, w-interop: `ssh-clone` of Mercurial's own history refused
+/// `PastAdmission`). Do: on a daemon's shard make a Mercurial repository of one changeset whose one file is twice a
+/// request's room, then clone it over SSH as stock 7.2 asks, through the daemon's lenders for its owner. Expect the
+/// session to exit cleanly, nothing on standard error, and its standard output a bundle2 whose changegroup carries the
+/// file's bytes whole: the answer made a turn at a time, each slice within the shard's room, never one request's.
+#[test]
+fn a_mercurial_clone_larger_than_a_requests_room_is_answered_over_ssh() {
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  let large: Vec<u8> = (0..usize::try_from(room() * 2).expect("a size"))
+    .map(|_| {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      state.to_be_bytes()[0]
+    })
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let daemon = crate::daemon::audit_daemon();
+  let (record, head) = crate::daemon::observe_first(&daemon, move |state| {
+    one_file_history(state, "cloned-over-ssh", large)
+  });
+  let (sent, outcome) = mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let session = async {
+        let mut services = ToolServices::new(ShardStores, ServedViews, ThisShard, room());
+        let principal = owner();
+        let start = Start {
+          service: Service::Mercurial { hidden: false },
+          repository: Some(&record),
+          principal: &principal,
+          git_protocol: None,
+        };
+        let mut command = services
+          .start(&start)
+          .map_err(|unserved| format!("{unserved:?}"))?;
+        let mut channel = Channel::default();
+        command
+          .input(&clone_request(&head))
+          .map_err(|refused| format!("{refused:?}"))?;
+        command.input_end();
+        channel.drive_awaiting(&mut command).await;
+        Ok::<Channel, String>(channel)
+      };
+      let _ = sent.send(session.await);
+    })
+    .expect("the session's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let channel = outcome.recv_timeout(PATIENCE).expect("the session ended");
+  daemon.stop();
+  let channel = channel.expect("the session served");
+  assert_eq!(
+    (String::from_utf8_lossy(&channel.stderr), channel.exited),
+    (String::new().into(), Some(EXIT_STATUS))
+  );
+  let bundle =
+    slates_hg::bundle2::Bundle2::decode(&channel.stdout, &mut slates_hg::Admission::new(u64::MAX))
+      .expect("a bundle2");
+  let (index, _) = bundle
+    .parts
+    .iter()
+    .enumerate()
+    .find(|(_, part)| part.kind.eq_ignore_ascii_case(b"changegroup"))
+    .expect("a changegroup part");
+  let payload = bundle
+    .payload_bytes(index, &mut slates_hg::Admission::new(u64::MAX))
+    .expect("its payload");
+  let found = payload
+    .windows(64)
+    .position(|window| window == &large[..64])
+    .expect("the file's bytes");
+  assert_eq!(payload.get(found..found + large.len()), Some(large));
 }

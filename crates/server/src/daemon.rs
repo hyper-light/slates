@@ -3086,6 +3086,22 @@ impl Daemon {
     })
   }
 
+  /// The version of `green` that `work` holds as its floor at the green's owner partition (A-247; A-697 part a: a work
+  /// another node holds is admitted by a forwarded ask), as the owner's record keeps it: `None` for no floor. The typed
+  /// refusal when the shard could not be observed.
+  pub fn work_floor(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+    work: slates_ipc::protocol::VolumeId,
+  ) -> Result<Option<u64>, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    let green = slates_db::catalog::VolumeId { bytes: green.bytes };
+    let work = slates_db::catalog::VolumeId { bytes: work.bytes };
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db.partition().work_floor(green, work)
+    })
+  }
+
   /// Test support: injects a merge-plane fault on this node's control shard (§4.16; never reachable
   /// from the wire): refuse every content put while set, so an owner's merge record must wait for its
   /// inputs to place; or corrupt the next inputs a record is recomputed from, so the recomputation
@@ -3095,6 +3111,17 @@ impl Daemon {
     fault: crate::merge_service::MergeFault,
   ) -> Result<(), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
+  }
+
+  /// Test support (A-697, until its last piece puts the rule in its place; never reachable from the wire): with `on`,
+  /// every shard of this node serves the works of greens another node owns (`work_home::green_elsewhere`): a creation is
+  /// made on its client's partition and admitted by the green's owner over the fleet, and the work's base reads are
+  /// answered by this node's replica of the green. `Ok` once every shard has it, else the first typed refusal.
+  pub fn serve_works_on_holders(&self, on: bool) -> Result<(), ObserveError> {
+    for shard in &self.shards {
+      self.observe(Some(*shard), move |s| s.work_home.on_holders = on)?;
+    }
+    Ok(())
   }
 
   /// Test support: loses the next verdict or admission the work's shard for `partition` is answered by its green's
@@ -6017,6 +6044,35 @@ async fn rebuild_remote_work(
   else {
     return false;
   };
+  // A work this node made as a holder replays over the node's replica of its green, on the control shard (A-697 part
+  // e); one whose replica is not here yet waits for it, asked again when it is installed.
+  if work.holder {
+    let (green, created_at, here) = (work.green, work.created_at, shard.0);
+    let Some(control) = shards.first() else {
+      return false;
+    };
+    let Some(replayed) =
+      ask_once_more(
+        origin,
+        control.0,
+        move |s| match crate::work_home::holder_replay(s, (green, created_at), &entries, here) {
+          crate::work_home::HolderReplay::Replayed(replayed) => Some(replayed),
+          crate::work_home::HolderReplay::Later => None,
+        },
+      )
+      .await
+    else {
+      return false;
+    };
+    let Some(replayed) = replayed else {
+      return true;
+    };
+    return ask_once_more(origin, shard.0, move |s| {
+      crate::verbs::install_replayed_work(s, &work, replayed);
+    })
+    .await
+    .is_some();
+  }
   let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
   let Some(owner) = shards.get(usize::from(partition)) else {
     return false;
@@ -7496,6 +7552,109 @@ mod tests {
         "restarting cannot grant a second vote in the same term"
       );
     }
+  }
+
+  /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
+  /// git repository and push the fixtures' `create` and `update` into it; publish every shard; stop; start a successor
+  /// over the same segment. Expect: every window the first daemon kept (by identity, with its holders and its bytes)
+  /// kept by the successor, taken back from the shard image (every one restored, none refused, none left unheld once
+  /// the records were replayed), so the replay's puts were answered by the windows kept, none stored again.
+  #[test]
+  fn t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image() {
+    use slates_anchor::AnchorSegment;
+    type Windows = Vec<(slates_vcs::ContentId, u64, Vec<u8>)>;
+    fn windows(state: &mut crate::state::ShardState) -> Windows {
+      let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+      let Some(content) = lent.stores.content() else {
+        return Vec::new();
+      };
+      content
+        .identities()
+        .filter(|identity| content.form(identity) == Some(slates_vcs::Form::Window))
+        .map(|identity| {
+          let bytes = content.bytes_of(identity).map(std::borrow::Cow::into_owned);
+          (
+            *identity,
+            content.holders(identity),
+            bytes.unwrap_or_default(),
+          )
+        })
+        .collect()
+    }
+    let profile = test_profile();
+    let instance = format!("a727-windows-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    // The content object holds the shard's arena, so the windows' chunks survive with it (§4.8).
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let before = first
+      .observe(shard, |state| {
+        let repository = crate::git_push::tests::git_repository(state, "kept");
+        crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create", "update"]);
+        crate::vcs_store::paths::whole_build::settle(state);
+        windows(state)
+      })
+      .unwrap();
+    first.publish_every_shard().unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    // The successor's own shard: shard ids are the process's, and another test's daemon may take the first's.
+    let shard = second.shards.first().copied();
+    // A loaded host may finish the repositories' replay after the start returns: read until every window is held
+    // again (a restored window is held by no one until its record's replay puts it), bounded.
+    let read = || {
+      second
+        .observe(shard, |state| {
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          let counts = (
+            count(crate::vcs_store::WINDOWS_RESTORED),
+            count(crate::vcs_store::WINDOWS_UNRESTORED),
+            count(crate::vcs_store::WINDOWS_UNHELD),
+          );
+          (windows(state), counts.0, counts.1, counts.2)
+        })
+        .ok()
+    };
+    // A shard still starting refuses the submission (`ShardGone`): read again, as for a replay still under way.
+    let mut seen = read();
+    // Derived: 600 looks 50 ms apart, the wait the successor is given to answer with every window held.
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+      if seen.as_ref().is_some_and(|seen| {
+        seen.0.len() == before.len() && seen.0.iter().all(|(_, holders, _)| *holders > 0)
+      }) {
+        break;
+      }
+      std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
+      seen = read();
+    }
+    let (after, restored, unrestored, unheld) = seen.expect("the successor answered");
+    second.stop();
+    assert!(!before.is_empty(), "the pushes kept windows");
+    assert_eq!(
+      after, before,
+      "the successor keeps every window, its holders and its bytes"
+    );
+    assert_eq!(
+      (restored, unrestored, unheld),
+      (u64::try_from(before.len()).unwrap(), 0, 0)
+    );
   }
 
   /// §4.8 "Neighbourhood changes" (joint writes) and "Leases and reads" (the joint lease): while an owner's

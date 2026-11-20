@@ -383,6 +383,8 @@ ReplyBody 77 RepositoryImported
 ReplyBody 78 DumpImported
 ReplyBody 79 RepositoryPolicy
 ReplyBody 80 DumpExported
+ReplyBody 81 WorkAdmitted
+ReplyBody 82 WorkFloorMoved
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -476,6 +478,9 @@ RequestBody 89 SetIdentities
 RequestBody 90 ImportRepository
 RequestBody 91 DescribeRepositoryPolicy
 RequestBody 92 ExportDump
+RequestBody 93 AdmitWork
+RequestBody 94 MoveWorkFloor
+RequestBody 95 SubmitComputed
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

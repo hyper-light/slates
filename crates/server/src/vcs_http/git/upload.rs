@@ -1,8 +1,12 @@
 //! git's upload-pack behind the HTTP edge (A-625 part 3; §4.17.2 "A fetch" and "Transports" item 1; A-640 part 2's
 //! `slates_git::upload`): `GET <repo>/info/refs?service=git-upload-pack` answered with the advertisement, and a `POST
 //! <repo>/git-upload-pack` answered as `git upload-pack --stateless-rpc` answers one, its request held whole once its
-//! body has ended (upload-pack reads a command request whole, `Asked::Request`) and charged to the request's room: what
-//! the repository's shard could admit when the request began ([`StoreLender::room`], A-713), never one ring region.
+//! body has ended (upload-pack reads a command request whole, `Asked::Request`) and charged to the request's room: the
+//! edge's request room, or what the repository's shard could admit when the request began where that is less
+//! ([`StoreLender::room`], A-713). A fetch fits it whatever the repository's size (A-745, §4.17.1 "A fetch's answer"): it
+//! is answered in turns (`slates_git::upload::serve_in_turns`), its pack's objects chosen a unit at a time within the
+//! shard's step quantum as the answer is written (`Answer::write_within`, the pack source's `turn`), its sets kept as
+//! runs or bits and its pack framed in packets sized from the room.
 //!
 //! **The store, lent a step at a time.** A repository's store is lent afresh for each step of an answer ([`StoreLender`];
 //! A-640 part 2: "It is lent afresh for each step of an answer, so a shard's state is never held across a wait"), and the
@@ -36,9 +40,8 @@ pub(crate) trait StoreLender {
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
 
-  /// The room a request is admitted (A-713): what the shard the stores live on could admit now, as a push is admitted
-  /// (A-704), since everything upload-pack keeps answering it is that shard's to hold; never one request's room, which a
-  /// long history's walk and its pack's list of objects pass. None when the shard's state is not lent.
+  /// What the shard the stores live on could admit now (A-713), as a push is admitted (A-704): a request is admitted the
+  /// edge's request room, or this where it is less (A-745). None when the shard's state is not lent.
   fn room(&mut self, repository: RepositoryId) -> Option<u64>;
 
   /// Runs `step` over the store of the repository `asked` names as upload-pack answers a request of the principal it
@@ -59,6 +62,21 @@ pub(crate) trait StoreLender {
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
   ) -> Option<R>;
 
+  /// A request's hold on the generation of a repository its answer began on (A-745, §4.17.1 "A fetch's answer" rule 4):
+  /// what every step of that answer is lent, whatever lands, is re-based or rebuilt meanwhile; given back by its drop.
+  type Hold;
+
+  /// Holds repository `id` as it stands now for a request of `reader`, with the refs that principal may read and the
+  /// branch `HEAD` names as they stand (as [`StoreLender::lend`] reads them); none when the store is not held here.
+  fn hold(&mut self, id: RepositoryId, reader: &Principal) -> Option<Self::Hold>;
+
+  /// Runs `step` over the generation `hold` holds, with the pack source; none when it can no longer be lent.
+  fn lend_held<R>(
+    &mut self,
+    hold: &Self::Hold,
+    step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
+  ) -> Option<R>;
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
@@ -72,12 +90,16 @@ pub(crate) trait StoreLender {
 pub(crate) struct UploadServices<L> {
   /// Where the stores are lent.
   lender: L,
+  /// The room one request may hold: the edge's (A-745, §4.17.1 "A fetch's answer" rule 2: a request's room bounds a
+  /// slice, never a repository).
+  room: u64,
 }
 
 impl<L> UploadServices<L> {
-  /// Upload-pack over `lender`'s stores.
-  pub(crate) fn new(lender: L) -> Self {
-    Self { lender }
+  /// Upload-pack over `lender`'s stores, each request admitted `room`, the edge's request room, or what its stores'
+  /// shard could admit when it began where that is less.
+  pub(crate) fn new(lender: L, room: u64) -> Self {
+    Self { lender, room }
   }
 }
 
@@ -88,10 +110,11 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
     if start.service != Service::UploadPack || !self.lender.holds(start.repository.id) {
       return Err(ServiceRefused::Unavailable);
     }
-    let room = self
+    let shard = self
       .lender
       .room(start.repository.id)
       .ok_or(ServiceRefused::Unavailable)?;
+    let room = self.room.min(shard);
     Ok(Upload {
       lender: self.lender.clone(),
       repository: start.repository.id,
@@ -101,6 +124,7 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       admission: Admission::new(room),
       request: Vec::new(),
       answer: None,
+      generation: None,
     })
   }
 }
@@ -124,6 +148,8 @@ pub(crate) struct Upload<L: StoreLender> {
   request: Vec<u8>,
   /// The answer, once made.
   answer: Option<Answer<<L::Packs as PackSource>::Pack>>,
+  /// The generation a request's answer began on, held until the answer is written (A-745 rule 4).
+  generation: Option<L::Hold>,
 }
 
 impl<L: StoreLender> Exchange for Upload<L> {
@@ -146,18 +172,29 @@ impl<L: StoreLender> Exchange for Upload<L> {
       admission,
       request,
       answer,
+      generation,
     } = self;
-    let asked = if *advertise {
-      Asked::Advertise
+    let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
+    let made = if *advertise {
+      lender.lend((*repository, reader), |served, packs| {
+        upload::serve_in_turns(served, *version, Asked::Advertise, packs, admission)
+      })
     } else {
       lender.encode(*repository).await;
-      Asked::Request(request.as_slice())
-    };
-    let made = lender
-      .lend((*repository, reader), |served, packs| {
-        upload::serve(served, *version, asked, packs, admission)
-      })
-      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+      let held = lender.hold(*repository, reader).ok_or(unavailable)?;
+      let made = lender.lend_held(&held, |served, packs| {
+        upload::serve_in_turns(
+          served,
+          *version,
+          Asked::Request(request.as_slice()),
+          packs,
+          admission,
+        )
+      });
+      *generation = Some(held);
+      made
+    }
+    .ok_or(unavailable)?;
     *answer = Some(made);
     Ok(())
   }
@@ -168,16 +205,25 @@ impl<L: StoreLender> Exchange for Upload<L> {
       repository,
       admission,
       answer,
+      generation,
       ..
     } = self;
-    let Some(answer) = answer.as_mut() else {
+    let Some(made) = answer.as_mut() else {
       return Err(Failed(Status::INTERNAL_SERVER_ERROR));
     };
-    let written = lender
-      .lend_objects(*repository, |served, packs| {
-        answer.write(served, packs, admission, out, MAX_LEN)
-      })
-      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    let step = |served: &Served<'_>, packs: &mut L::Packs| {
+      let mut spent = packs.turn();
+      made.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
+    };
+    let written = match generation.as_ref() {
+      Some(held) => lender.lend_held(held, step),
+      None => lender.lend_objects(*repository, step),
+    }
+    .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    if written != Written::More {
+      // The answer is written: its generation is given back.
+      *generation = None;
+    }
     Ok(written == Written::More)
   }
 }

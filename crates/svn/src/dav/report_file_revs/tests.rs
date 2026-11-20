@@ -2,7 +2,7 @@
 //! its deltas replayed and held to the texts the site's own GET serves at each revision.
 
 use super::super::Bounds;
-use super::super::site::{Answer, ReportProgress, Request, Served, answer};
+use super::super::site::{Answer, Budget, ReportProgress, Request, Served, answer};
 use super::super::xml::{self, Element};
 use crate::index::Index;
 use crate::lock::{AprTime, LockTable};
@@ -77,7 +77,7 @@ impl Fixture {
     };
     let mut out = Vec::new();
     loop {
-      match report.resume(&self.served(), &mut out, room) {
+      match report.resume(&self.served(), &mut out, untimed(room)) {
         ReportProgress::More => {}
         ended => return (out, ended),
       }
@@ -211,4 +211,13 @@ fn a_file_revs_report_on_a_directory_is_refused_before_its_first_byte() {
     (404, 0, true),
     "{words}"
   );
+}
+
+/// A budget of `room` bytes and as many steps, untimed: a slice as the site's callers gave one before A-749's quantum.
+fn untimed(room: usize) -> Budget {
+  Budget {
+    room,
+    steps: room,
+    quantum: None,
+  }
 }
