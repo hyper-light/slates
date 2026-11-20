@@ -38,6 +38,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   changed-since GREEN VERSION [--json]             files changed since a version
   work GREEN NAME [--json]                         a work volume over a green
   edit WORK PATH AT DELETE TEXT [--json]           declare an edit (a splice)
+  copy WORK FROM TO [--version N] [--replace] [--json]   declare a copy of FROM's tree to TO (the work's base when no N)
   submit WORK [--evidence HEX] [--json]            submit a work's increment
   rebase WORK [--json]                             rebase a work onto its green's head
   checkout GREEN VOLUME ATTACHMENT --snapshot N [--json]   write a green's head into the volume it was made from
@@ -84,6 +85,11 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   repository policy NAME [--hook POINT=PROGRAM]... [--json]   change a repository's policy, its owner alone,
             keeping every part not named: each POINT (pre-receive, changegroup.NAME, pre-revprop-change, ...) takes
             the programs given for it, in order (absolute host paths), an empty PROGRAM clearing it
+  repository branch create REPO NAME --from BRANCH [--version N] [--json]   make a branch at a version of another
+            (its head when no version is named), sharing what is unchanged; prints the new branch's green id
+  repository branch bind REPO NAME GREEN [--json]    bind a branch to a green of the repository's lineage (restores
+            a retired branch)
+  repository branch retire REPO NAME [--json]        retire a branch: the name goes, its green stays in the lineage
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
   exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
@@ -346,6 +352,20 @@ pub(crate) enum Verb {
     /// Bytes inserted.
     bytes: Vec<u8>,
   },
+  /// Declare a copy on a work volume (A-626 part 4): `from`'s tree, as version `version` of the work's green held it
+  /// (the work's base when none), copied to `to` by reference, replacing what `to` holds when `replace`.
+  Copy {
+    /// The work volume.
+    work: slates_client::VolumeId,
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from; none for the work's base.
+    version: Option<u64>,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
+  },
   /// Submit a work volume's increment to its green.
   Submit {
     /// The work volume.
@@ -560,6 +580,33 @@ pub(crate) enum Verb {
     repository: String,
     /// The host path the daemon reads, absolute.
     path: String,
+  },
+  /// Make a branch (`repository branch create REPO NAME --from BRANCH [--version N]`, A-575).
+  BranchCreate {
+    /// The repository's name.
+    repository: String,
+    /// The new branch's name.
+    name: String,
+    /// The branch it is made from.
+    from: String,
+    /// The version of `from` it is made at; its head when none.
+    version: Option<u64>,
+  },
+  /// Bind a branch to a green of its repository's lineage (`repository branch bind REPO NAME GREEN`, A-575).
+  BranchBind {
+    /// The repository's name.
+    repository: String,
+    /// The branch's name.
+    name: String,
+    /// The green.
+    green: slates_client::VolumeId,
+  },
+  /// Retire a branch (`repository branch retire REPO NAME`, A-575).
+  BranchRetire {
+    /// The repository's name.
+    repository: String,
+    /// The branch's name.
+    name: String,
   },
   /// Change a repository's policy, keeping every part not named (`repository policy NAME [--hook POINT=PROGRAM]...`,
   /// A-622): each named hook point's hooks become the ones given for it, in order, an empty program clearing it.
@@ -818,6 +865,7 @@ const VALUES: &[&str] = &[
   "--default-branch",
   "--root",
   "--hook",
+  "--from",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -839,6 +887,7 @@ const SWITCHES: &[&str] = &[
   "--keep",
   "--apparmor-profile",
   "--hold",
+  "--replace",
 ];
 
 /// Takes the untouched command after `--` (`exec` and `run` share this boundary).
@@ -1588,6 +1637,25 @@ fn parse_repository(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
     ["repository", "create", name] => repository_create(taken, name).map(Some),
     ["repository", "import", name, path] => repository_import(taken, name, path).map(Some),
     ["repository", "policy", name] => repository_policy(taken, name).map(Some),
+    ["repository", "branch", "create", repository, name] => {
+      branch_create(taken, repository, name).map(Some)
+    }
+    ["repository", "branch", "bind", repository, name, green] => {
+      branch_bind(taken, (repository, name, green)).map(Some)
+    }
+    ["repository", "branch", "retire", repository, name] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &[],
+      })?;
+      Ok(Some(client(
+        taken,
+        Verb::BranchRetire {
+          repository: (*repository).to_owned(),
+          name: (*name).to_owned(),
+        },
+      )))
+    }
     ["repository", ..] => Err(ParseError::Missing(REPOSITORY_FORMS)),
     _ => Ok(None),
   }
@@ -1595,7 +1663,8 @@ fn parse_repository(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
 
 /// The repository verbs' forms, named by a usage error.
 const REPOSITORY_FORMS: &str = "repository create NAME --tool git|hg|svn | repository import NAME PATH | repository \
-  policy NAME [--hook POINT=PROGRAM]...";
+  policy NAME [--hook POINT=PROGRAM]... | repository branch create REPO NAME --from BRANCH [--version N] | repository \
+  branch bind REPO NAME GREEN | repository branch retire REPO NAME";
 
 /// `repository import NAME PATH` (A-710): the daemon reads PATH, so it must be absolute, since the daemon's working
 /// directory is not the caller's; a relative one is a usage error before the daemon is asked.
@@ -1615,6 +1684,57 @@ fn repository_import(taken: &Taken, name: &str, path: &str) -> Result<Command, P
     Verb::RepositoryImport {
       repository: name.to_owned(),
       path: path.to_owned(),
+    },
+  ))
+}
+
+/// `repository branch create REPO NAME --from BRANCH [--version N]` (A-575): a branch at a version of another, its
+/// head where no version is named.
+fn branch_create(taken: &Taken, repository: &str, name: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--from", "--version"],
+    switches: &[],
+  })?;
+  let from = taken
+    .value("--from")
+    .ok_or(ParseError::Missing("--from BRANCH"))?
+    .to_owned();
+  let version = taken
+    .value("--version")
+    .map(|text| {
+      text.parse::<u64>().map_err(|_| ParseError::BadValue {
+        what: "--version",
+        reason: format!("{text}: not a version number"),
+      })
+    })
+    .transpose()?;
+  Ok(client(
+    taken,
+    Verb::BranchCreate {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      from,
+      version,
+    },
+  ))
+}
+
+/// `repository branch bind REPO NAME GREEN` (A-575): a branch bound to a green of its repository's lineage by the
+/// green's id.
+fn branch_bind(
+  taken: &Taken,
+  (repository, name, green): (&str, &str, &str),
+) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &[],
+    switches: &[],
+  })?;
+  Ok(client(
+    taken,
+    Verb::BranchBind {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      green: volume(green)?,
     },
   ))
 }
@@ -2447,6 +2567,22 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         },
       ))
     }
+    ["copy", work, from, to] => {
+      taken.only(&Spec {
+        values: &["--version"],
+        switches: &["--replace"],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::Copy {
+          work: volume(work)?,
+          from: (*from).to_owned(),
+          to: (*to).to_owned(),
+          version: taken.value("--version").map(number).transpose()?,
+          replace: taken.switch("--replace"),
+        },
+      ))
+    }
     ["submit", work] => parse_submit(&taken, work),
     ["rebase", work] => {
       taken.only(&NONE)?;
@@ -3273,6 +3409,16 @@ mod tests {
       }
     );
     assert_eq!(
+      verb(&format!("copy {id} /d /e --version 3 --replace")),
+      Verb::Copy {
+        work: vid,
+        from: "/d".into(),
+        to: "/e".into(),
+        version: Some(3),
+        replace: true,
+      }
+    );
+    assert_eq!(
       verb(&format!("submit {id}")),
       Verb::Submit {
         work: vid,
@@ -3593,6 +3739,67 @@ mod tests {
     assert_eq!(
       parse(&args("repository import r")),
       Err(ParseError::Missing(REPOSITORY_FORMS))
+    );
+  }
+
+  /// A-575. Do: parse `repository branch create` from a branch's head and at a version, `bind` and `retire`; then a
+  /// create with no `--from`, one at a version that is no number, and a bind to no volume id. Expect each verb's fields
+  /// as given; the missing `--from` named, the version and the green refused as bad values before the daemon is asked.
+  #[test]
+  fn the_grammar_parses_the_repository_branch_verbs() {
+    let green = "0123456789abcdef0123456789abcdef";
+    assert_eq!(
+      (
+        client_verb("repository branch create r topic --from main"),
+        client_verb("repository branch create r topic --from main --version 3 --json"),
+        client_verb(&format!("repository branch bind r topic {green}")),
+        client_verb("repository branch retire r topic"),
+      ),
+      (
+        Verb::BranchCreate {
+          repository: "r".to_owned(),
+          name: "topic".to_owned(),
+          from: "main".to_owned(),
+          version: None,
+        },
+        Verb::BranchCreate {
+          repository: "r".to_owned(),
+          name: "topic".to_owned(),
+          from: "main".to_owned(),
+          version: Some(3),
+        },
+        Verb::BranchBind {
+          repository: "r".to_owned(),
+          name: "topic".to_owned(),
+          green: parse_volume_id(green).unwrap(),
+        },
+        Verb::BranchRetire {
+          repository: "r".to_owned(),
+          name: "topic".to_owned(),
+        },
+      )
+    );
+    assert_eq!(
+      (
+        parse(&args("repository branch create r topic")),
+        matches!(
+          parse(&args(
+            "repository branch create r topic --from main --version x"
+          )),
+          Err(ParseError::BadValue {
+            what: "--version",
+            ..
+          })
+        ),
+        matches!(
+          parse(&args("repository branch bind r topic nogreen")),
+          Err(ParseError::BadValue {
+            what: "volume ID",
+            ..
+          })
+        ),
+      ),
+      (Err(ParseError::Missing("--from BRANCH")), true, true)
     );
   }
 

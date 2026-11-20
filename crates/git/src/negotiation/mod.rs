@@ -51,6 +51,7 @@ mod shallow;
 pub mod sparse;
 
 use crate::object_name::{Kind, ObjectId};
+use crate::positions::Positions;
 use crate::{Admission, PastAdmission};
 
 pub use filter::Filter;
@@ -65,7 +66,9 @@ pub const INFINITE_DEPTH: u32 = i32::MAX.unsigned_abs();
 pub trait Graph {
   /// One object the store holds, named by the store's own handle (its position in the repository's index), so a walk
   /// keeps handles rather than names.
-  type Node: Copy + Ord + core::fmt::Debug;
+  /// Its position in the index is its number (A-745): the answer carries the objects it sends as runs of positions
+  /// ([`Positions`]), never one at a time.
+  type Node: Copy + Ord + core::fmt::Debug + Into<u64> + TryFrom<u64>;
   /// A green, one branch of the repository, whose versions each have a head.
   type Green: Copy + Ord + core::fmt::Debug;
 
@@ -201,8 +204,11 @@ pub struct Pack<G, N> {
   pub shallow_info: Option<ShallowInfo>,
   /// Runs of versions sent whole; the request's filter applies to their objects.
   pub runs: Vec<Run<G>>,
-  /// Objects sent one by one, each once, in handle order.
-  pub objects: Vec<N>,
+  /// Objects sent one by one, by position, as runs (A-745: a fetch holds what it sends as runs, which one push's objects
+  /// make one of, never an object at a time); `N` names the graph's objects elsewhere in the answer.
+  pub objects: Positions,
+  /// The graph's objects, named in the answer's other sections.
+  pub(crate) _node: core::marker::PhantomData<N>,
 }
 
 /// What a `fetch` request is answered.
@@ -273,19 +279,331 @@ fn charge<T>(admission: &mut Admission) -> Result<(), Refusal> {
     .map_err(Refusal::PastAdmission)
 }
 
+/// A set of the graph's objects a walk keeps, by position (A-745, §4.17.1 "A fetch's answer" rule 1: a fetch's working
+/// set is a bit or a word an object at most, never an entry an object), in whichever of two forms is smaller, as
+/// Roaring keeps each container [A: Lemire, Ssi-Yan-Kai and Kaser, "Consistently faster and smaller compressed bitmaps
+/// with Roaring", 2016]: runs of positions ([`Positions`]), a few words for one push's objects whatever their number;
+/// or a bit for each position across the set's span, where the runs would cost more (a push's commits interleaved with
+/// its trees and blobs, every third position). Charged as it grows past what was charged before.
+#[derive(Debug, Default)]
+pub(super) struct Held {
+  /// The set, in its form.
+  form: Form,
+  /// The most bytes it has cost, each charged once.
+  charged: u64,
+}
+
+/// The two forms a [`Held`] keeps its positions in.
+#[derive(Debug)]
+enum Form {
+  /// Runs of positions.
+  Runs(Positions),
+  /// A bit for each position from `start`, a word for each 64 of them.
+  Bits {
+    /// The position of the first word's lowest bit.
+    start: u64,
+    /// The words.
+    words: Vec<u64>,
+  },
+}
+
+impl Default for Form {
+  fn default() -> Form {
+    Form::Runs(Positions::new())
+  }
+}
+
+/// Format: the positions one word of a bit table holds.
+const WORD_BITS: u64 = u64::BITS as u64;
+
+/// Format: the bytes one run of positions costs.
+const RUN_BYTES: u64 = (2 * core::mem::size_of::<u64>()) as u64;
+
+impl Held {
+  /// Adds `node`: whether it was not held, what the set costs past what was charged before charged now.
+  pub(super) fn insert<N: Into<u64>>(
+    &mut self,
+    node: N,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let position = node.into();
+    let new = match &mut self.form {
+      Form::Runs(runs) => runs.insert_new(position),
+      Form::Bits { start, words } => set_bit(start, words, position),
+    };
+    if new {
+      self.choose_form();
+      let bytes = self.bytes();
+      if bytes > self.charged {
+        admission
+          .charge(bytes.saturating_sub(self.charged))
+          .map_err(Refusal::PastAdmission)?;
+        self.charged = bytes;
+      }
+    }
+    Ok(new)
+  }
+
+  /// Whether `node` is held.
+  pub(super) fn contains<N: Into<u64>>(&self, node: N) -> bool {
+    let position = node.into();
+    match &self.form {
+      Form::Runs(runs) => runs.contains(position),
+      Form::Bits { start, words } => bit(*start, words, position),
+    }
+  }
+
+  /// Whether nothing is held.
+  pub(super) fn is_empty(&self) -> bool {
+    self.next_from(0).is_none()
+  }
+
+  /// The least position held at `from` or after it.
+  pub(super) fn next_from(&self, from: u64) -> Option<u64> {
+    match &self.form {
+      Form::Runs(runs) => runs.next_from(from),
+      Form::Bits { start, words } => {
+        let mut at = from.max(*start);
+        loop {
+          let offset = at.saturating_sub(*start);
+          let word_at = usize::try_from(offset / WORD_BITS).ok()?;
+          let word = *words.get(word_at)?;
+          let shifted = word
+            .checked_shr(u32::try_from(offset % WORD_BITS).unwrap_or(0))
+            .unwrap_or(0);
+          if shifted != 0 {
+            return Some(at.saturating_add(u64::from(shifted.trailing_zeros())));
+          }
+          at = start.saturating_add(
+            crate::to_u64(word_at)
+              .saturating_add(1)
+              .saturating_mul(WORD_BITS),
+          );
+        }
+      }
+    }
+  }
+
+  /// The positions held, ascending.
+  pub(super) fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+    let mut next = self.next_from(0);
+    core::iter::from_fn(move || {
+      let at = next?;
+      next = self.next_from(at.saturating_add(1));
+      Some(at)
+    })
+  }
+
+  /// The positions held, as runs, the set given up.
+  pub(super) fn into_positions(self) -> Positions {
+    match self.form {
+      Form::Runs(runs) => runs,
+      Form::Bits { .. } => {
+        let mut runs = Positions::new();
+        for position in self.iter() {
+          runs.insert(position);
+        }
+        runs
+      }
+    }
+  }
+
+  /// What the set costs in its form.
+  fn bytes(&self) -> u64 {
+    match &self.form {
+      Form::Runs(runs) => RUN_BYTES.saturating_mul(crate::to_u64(runs.runs())),
+      Form::Bits { words, .. } => {
+        crate::to_u64(core::mem::size_of::<u64>()).saturating_mul(crate::to_u64(words.len()))
+      }
+    }
+  }
+
+  /// Keeps the set in runs while they cost no more than a bit table over its span would, in bits once they cost more.
+  fn choose_form(&mut self) {
+    let Form::Runs(runs) = &self.form else {
+      return;
+    };
+    let (Some(&(first, _)), Some(&(_, end))) = (runs.run_pairs().first(), runs.run_pairs().last())
+    else {
+      return;
+    };
+    let span_words = end.saturating_sub(first).div_ceil(WORD_BITS);
+    let bits_bytes = span_words.saturating_mul(crate::to_u64(core::mem::size_of::<u64>()));
+    if RUN_BYTES.saturating_mul(crate::to_u64(runs.runs())) <= bits_bytes {
+      return;
+    }
+    let start = first.saturating_sub(first % WORD_BITS);
+    let mut words = Vec::new();
+    let mut start_at = start;
+    for position in runs.iter() {
+      set_bit(&mut start_at, &mut words, position);
+    }
+    self.form = Form::Bits {
+      start: start_at,
+      words,
+    };
+  }
+}
+
+/// Whether the bit table of `words` from `start` holds `position`.
+fn bit(start: u64, words: &[u64], position: u64) -> bool {
+  let Some(offset) = position.checked_sub(start) else {
+    return false;
+  };
+  let Ok(word_at) = usize::try_from(offset / WORD_BITS) else {
+    return false;
+  };
+  words
+    .get(word_at)
+    .is_some_and(|word| word & (1u64 << (offset % WORD_BITS)) != 0)
+}
+
+/// Sets `position`'s bit in the table of `words` from `start`, growing it either way to hold it (`start` stays a word's
+/// first position): whether it was not set.
+fn set_bit(start: &mut u64, words: &mut Vec<u64>, position: u64) -> bool {
+  let aligned = position.saturating_sub(position % WORD_BITS);
+  if words.is_empty() {
+    *start = aligned;
+  }
+  if aligned < *start {
+    let more = usize::try_from(start.saturating_sub(aligned) / WORD_BITS).unwrap_or(0);
+    words.splice(0..0, core::iter::repeat_n(0, more));
+    *start = aligned;
+  }
+  let offset = position.saturating_sub(*start);
+  let Ok(word_at) = usize::try_from(offset / WORD_BITS) else {
+    return false;
+  };
+  if word_at >= words.len() {
+    words.resize(word_at.saturating_add(1), 0);
+  }
+  let mask = 1u64 << (offset % WORD_BITS);
+  match words.get_mut(word_at) {
+    Some(word) if *word & mask == 0 => {
+      *word |= mask;
+      true
+    }
+    _ => false,
+  }
+}
+
+/// What a walk's transient list (a stack, a queue) has cost: its most entries, each charged once as the list first grows
+/// past it (A-745: a walk's stack is charged at its deepest, never once an entry pushed over the walk).
+#[derive(Debug, Default)]
+pub(super) struct Peak {
+  /// The most entries charged.
+  charged: usize,
+}
+
+impl Peak {
+  /// Charges `len` entries of `T` past the most charged before.
+  pub(super) fn reach<T>(&mut self, len: usize, admission: &mut Admission) -> Result<(), Refusal> {
+    if len > self.charged {
+      admission
+        .charge_items::<T>(len.saturating_sub(self.charged))
+        .map_err(Refusal::PastAdmission)?;
+      self.charged = len;
+    }
+    Ok(())
+  }
+}
+
 /// Answers `request` from `graph`, keeping what it must within `admission`.
 pub fn negotiate<S: Graph>(
   graph: &S,
   request: &Request<'_>,
   admission: &mut Admission,
 ) -> Result<Outcome<S::Green, S::Node>, Refusal> {
+  match begin(graph, request, admission)? {
+    Begun::Answered(outcome) => Ok(outcome),
+    Begun::Selecting(mut negotiating) => loop {
+      if let Some(outcome) = negotiating.step(graph, admission, &mut || false)? {
+        return Ok(outcome);
+      }
+    },
+  }
+}
+
+/// A negotiation begun (A-745): answered already (nothing, or the acknowledgments alone), or a pack whose objects are
+/// still being chosen, a unit at a time.
+pub enum Begun<G, N> {
+  /// Answered.
+  Answered(Outcome<G, N>),
+  /// A pack, its objects being chosen ([`Negotiating::step`]); boxed, the walk being most of its size.
+  Selecting(Box<Negotiating<G, N>>),
+}
+
+/// A negotiation whose pack's objects are being chosen a unit at a time (A-745, §4.17.1 "A fetch's answer" rule 3): what
+/// its answer says besides them (the acknowledgments, the shallow-info section and the runs), how it went so far, and
+/// the walk, which keeps its place across steps and is lent the graph for each.
+pub struct Negotiating<G, N> {
+  /// The acknowledgments, `None` after `done`.
+  acknowledgments: Option<Acknowledgments>,
+  /// The shallow-info section, when one is due.
+  shallow_info: Option<ShallowInfo>,
+  /// The runs the pack carries whole.
+  runs: Vec<Run<G>>,
+  /// How it went so far.
+  counters: Counters,
+  /// The walk choosing the objects sent one by one.
+  selecting: objects::Selecting<N, G>,
+}
+
+impl<G, N> Negotiating<G, N> {
+  /// The acknowledgments the answer gives before its pack, `None` after `done`.
+  pub fn acknowledgments(&self) -> Option<&Acknowledgments> {
+    self.acknowledgments.as_ref()
+  }
+
+  /// The shallow-info section, when one is due.
+  pub fn shallow_info(&self) -> Option<&ShallowInfo> {
+    self.shallow_info.as_ref()
+  }
+}
+
+impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
+  /// Does units of the choice until `spent` says the owner's quantum is spent, at least one (each a commit or a tree
+  /// entry): the outcome once the last object is chosen, `None` while more are left.
+  pub fn step<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Option<Outcome<G, N>>, Refusal> {
+    let Some(objects) = self
+      .selecting
+      .step(graph, admission, &mut self.counters, spent)?
+    else {
+      return Ok(None);
+    };
+    Ok(Some(Outcome {
+      answer: Answer::Pack(Pack {
+        acknowledgments: self.acknowledgments.take(),
+        shallow_info: self.shallow_info.take(),
+        runs: core::mem::take(&mut self.runs),
+        objects,
+        _node: core::marker::PhantomData,
+      }),
+      counters: self.counters,
+    }))
+  }
+}
+
+/// Begins answering `request` from `graph` (A-745): everything but the choice of the objects sent one by one, which is
+/// bounded by the request (its wants, haves and shallow lines, the one-round runs, `ready` and the cut), then the choice
+/// begun; within `admission`.
+pub fn begin<S: Graph>(
+  graph: &S,
+  request: &Request<'_>,
+  admission: &mut Admission,
+) -> Result<Begun<S::Green, S::Node>, Refusal> {
   let mut counters = Counters::default();
   let wants = ready::wants(graph, request.wants, admission)?;
   if wants.is_empty() && !request.wait_for_done {
-    return Ok(Outcome {
+    return Ok(Begun::Answered(Outcome {
       answer: Answer::Nothing,
       counters,
-    });
+    }));
   }
   let common = ready::common(graph, request.haves, admission)?;
   let client_shallow = shallow::client(graph, request.shallow, admission)?;
@@ -311,10 +629,10 @@ pub fn negotiate<S: Graph>(
       ready,
     };
     if !ready {
-      return Ok(Outcome {
+      return Ok(Begun::Answered(Outcome {
         answer: Answer::Acknowledgments(acknowledgments),
         counters,
-      });
+      }));
     }
     Some(acknowledgments)
   };
@@ -326,28 +644,29 @@ pub fn negotiate<S: Graph>(
     admission,
     &mut counters,
   )?;
-  let objects = objects::select(
+  let shallow_info = cut.info.clone();
+  admission
+    .charge_items::<Run<S::Green>>(runs.runs.len())
+    .map_err(Refusal::PastAdmission)?;
+  let selecting = objects::Selecting::begin(
     graph,
     request,
-    &objects::Sides {
-      wants: &wants,
-      one_round: &runs.wants,
-      common: &common,
-      cut: &cut,
+    objects::Sides {
+      wants,
+      one_round: runs.wants,
+      common,
+      cut,
     },
-    &runs.runs,
+    runs.runs.clone(),
     admission,
-    &mut counters,
   )?;
-  Ok(Outcome {
-    answer: Answer::Pack(Pack {
-      acknowledgments,
-      shallow_info: cut.info,
-      runs: runs.runs,
-      objects,
-    }),
+  Ok(Begun::Selecting(Box::new(Negotiating {
+    acknowledgments,
+    shallow_info,
+    runs: runs.runs,
     counters,
-  })
+    selecting,
+  })))
 }
 
 /// Whether a server whose client holds `common` is ready to send the pack (A-640 part 3: protocol v0's

@@ -8789,6 +8789,40 @@ the resume (GAPS). If it is the stale install answered late, the watch earns its
 catch-up, fixing that may erase the difference. The 4 of 12 x86 runs that never caught up, with the watch on or off,
 are that slow catch-up.
 
+### A resumed holder's catch-up: the retained tail and the reply fold, together (A-200; 2026-11-12, diag-live-durability-84; landed by g227 2026-11-19)
+
+**The flow.** A holder of a live volume stopped while the owner writes 20,000 entries ahead of it, then resumed; a
+neighbour volume on the owner's shard is written all through the catch-up. Catch-up is from the resume until the holder
+is within 50 entries of the owner's head, or none within 90 s. **Runners:** GitHub `ubuntu-latest` (x86_64) and
+`ubuntu-24.04-arm`, 4 CPUs each, release, 4 runs a leg, 24 of 24 passed, 2026-11-12. **Trees:** main 1e9f3287; retain-1
+alone 1d154518; both 42275fe6 (retain-1 with the fold fix merged). The landed change sits on a later main, whose byte
+bounds (`Bounds::of_whole`) and turned whole builds (A-377) these trees predate: its own run of this flow is owed.
+
+| leg | catch-up, each run (s) | installs | neighbour writes | neighbour p50 | p99 | max |
+|---|---|---|---|---|---|---|
+| main, x86 | 3.07 2.81 2.91 3.40 | 5 2 5 1 | 1,118–1,570 | 396–431 µs | 2.9–4.2 ms | 1.56–1.85 s |
+| retain-1 alone, x86 | none none none none | 1 0 1 1 | 345–482 | 201–279 ms | | 0.66–0.75 s |
+| both, x86 | 4.31 6.09 3.95 4.41 | 0 0 0 0 | 10,084–12,409 | 277–314 µs | 1.6–3.3 ms | 0.26–0.40 s |
+| main, arm | 2.17 2.33 2.44 2.20 | 3 3 3 4 | 745–1,051 | 359–484 µs | 3.4–4.6 ms | 1.16–1.47 s |
+| retain-1 alone, arm | none none none none | 0 0 0 1 | 1,588–2,669 | 32–44 ms | | 0.26–0.42 s |
+| both, arm | 9.66 9.76 13.34 9.38 | 0 1 0 0 | 8,958–9,818 | 803–1,053 µs | 3.9–5.3 ms | 0.16–0.22 s |
+
+**Reading.** On main a holder behind the retained tail is installed whole, 1 to 5 times a catch-up, each a 195 to
+219 MB image built on the owner's shard, and the neighbour waits up to 1.85 s behind it. retain-1 alone keeps the
+backlog as entries, but every reply of the lagging holder cloned each entry it lacked, so the owner's shard spent itself
+on those replies: no catch-up in 90 s, and the neighbour's median write 0.2 s on x86. With the fold fix too, the holder
+catches up from entries with no install in 7 of 8 runs, the neighbour writes 8 to 10 times as often, and its worst write
+is 4 to 9 times shorter. The catch-up itself is slower: 1.3 to 2.0 times main's on x86 and about 4 times on arm, where
+it streams 20,000 entries instead of sending one image. Landed for the owner shard's health (the neighbour's tail, no
+whole images on the shard), with the arm catch-up time owed a look.
+
+**Earlier A/Bs, recorded.** diag-73 measured the fold's cost (1.4 ms a reply 1,000 behind, 7.1 ms 5,000 behind; writes
+fell to about 210 a second; 6 of 24 x86 runs never within 50 entries). diag-76 (the flow, main against the fold fix) and
+diag-81 (the neighbour, at 5,000 and 20,000 behind) did not separate, because the stale tail sent most of the backlog as
+installs; diag-82's owner hooks found that tail (215,997 bytes at head 16,526). The record that rejected the fold fix on
+diag-81 (`agents/live-durability-catchup-record`) was withdrawn on 2026-11-19: diag-84 supersedes it, and its "about
+100% of a CPU" reading had counted a window that began before the resume.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
@@ -14801,6 +14835,45 @@ cutting the temporaries brought both down. Measured-and-rejected: `malloc_zone_p
 import released 0 bytes (footprint 2,457 and 2,545 MB). With the system allocator alone the freed memory came back on
 its schedule: five seconds after the import 1,565 to 1,834 MB in three runs and none in two others.
 
+## The anchor's memory by range after the svn import (A-744; UI goal 93; 2026-11-20)
+
+- **Machine and build:** the Mac Studio of the entries above, 2026-11-20 ~11:07 UTC, load average 12.25 (shared; not
+  quiesced). Release build of `slates-cli` with A-744.
+- **Data and command:** `git-1000.dump` (223 MiB); a fresh anchor, `slates repository create project --tool svn`,
+  `slates repository import project git-1000.dump`, then `slates status --json` until every shard's
+  `content_ranges.sweep.completed` is at least 1 (28 requests), summing each range over the shards; three runs.
+
+| Range | bytes (all shards) | in RAM, written (all shards) | owner shard 10 |
+|---|---|---|---|
+| content object: write log | 8,192 MiB | 0.7 MiB | 0 |
+| content object: image slots | 65,536 MiB | 0.7 MiB | 0 |
+| content object: delta log | 32,768 MiB | 0.4 MiB | 0 |
+| content object: DAX range table | 1 MiB | 0.5 MiB | 0 |
+| content object: chunk arena | 1,024 MiB (0 allocated) | 0 | 0 |
+| anchor segment: log ring | 8,192 MiB | 355.9 MiB | 355.2 MiB |
+| anchor segment: snapshot slots | 32,769 MiB | 226.5 MiB | 225.8 MiB |
+| total | | 584.7 MiB | 581.0 MiB |
+
+Identical in the three runs (bytes written 583.2 to 584.6 MiB; footprint 1,453 to 1,530 MB). The written shared memory
+`vmmap` showed after the import (581 MiB) is the owner partition's durable register in the anchor segment: its log ring
+(the repository records and chain entries the import logged) and its snapshot slots (the partition snapshot). The
+content object holds 2.3 MiB; a green's files are not in it.
+
+## The register by record kind after the svn import (A-746; UI goal 93; 2026-11-20)
+
+- **Machine, build, data and command:** as "The anchor's memory by range" above, with A-746's build: the import, then
+  `slates status --json` until every shard swept (28 requests); the owner shard's `content_ranges`; three runs.
+
+| Owner partition's register | repository records | chain entries | checkpoints | rest | total |
+|---|---|---|---|---|---|
+| log since the last snapshot | 87.5 MiB | 87.4 MiB | 92.2 MiB | 0.1 MiB | 267.2 MiB |
+| last snapshot | 134.9 MiB | 45.7 MiB | 45.2 MiB | 0.0 | 225.8 MiB |
+| both | 222.4 MiB | 133.1 MiB | 137.4 MiB | 0.1 MiB | 493.0 MiB |
+
+Identical in the three runs. In RAM: the log ring 355.2 MiB (the live 267.2 and 88 MiB released at the last snapshot
+and not given back), the snapshot slots 225.8 MiB (the last snapshot, exactly). The arena's prefault reserve 0. Chain
+entries and checkpoints (270.5 MiB) lead repository records (222.4 MiB).
+
 ## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
 
 - **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
@@ -14981,3 +15054,83 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
   99 percent CPU during the burst (`ps -M`). The `kevent` frames that topped `sample`'s stacks are the runtime's
   zero-timeout polls before it parks, busy and not idle; an earlier reading of them as idle was wrong.
 
+## A hot repository pushing large packs: the small repositories wait 3 to 4 times their fair share, and ten such pushes end the daemon (A-724 piece 7; 2026-11-20)
+
+- **The command:** `crates/cli/bench/multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0
+  --steps ... --per-repository-cap N` (the cap: at most N pushes to one repository a step, main's order to stay below the
+  pushes that end the daemon). adas-mac-studio.local-2, M3 Ultra, 32 cores, a 23-shard daemon; release built from
+  6526905e5 (main 6f9d93d21 with the cap); load 9 to 11; one run each.
+
+| R = 100, cap | small p99 / fair share (one shard) | medium | hot (v1.5.0, its pushes) | daemon |
+|---|---|---|---|---|
+| 10 | 5.81 (4.457 s) | 0.85 | 0.38, 10 refused (7 empty, 3 reset) | gone |
+| 5 | 3.07 (2.567 s, ideal 0.836 s) | 0.93 | 0.78 (5 ok) | alive |
+| 3 | 3.63 (1.800 s, ideal 0.497 s) | 1.18 | 0.84 (3 ok) | alive |
+| no v1.5.0 class (the section above) | 0.87 | | 0.72 | alive |
+
+- **What it says.** With a repository pushing 9.8 MB packs (each push holding about 770 MiB), the small repositories'
+  p99 is 3 to 4 times their fair share even when the hot repository has only three pushes under way; without large
+  packs it was within it. The hot repository's own shard cannot explain it (a small repository sharing it would wait
+  many seconds; the measured p99 is 1.8 to 2.6 s), so the wait is daemon-wide: the daemon grows by about 2.9 GB in
+  seconds, and memory's making is the next profile. The fair-share starvation is open, owed to that profile.
+- **The daemon's end.** Ten concurrent pushes of git/git v1.5.0 to one repository ended the daemon (the earlier record
+  had nineteen): A-722's by-use proof must hold at ten. Reported to main.
+
+## Waiting deltas resolved in turns: ten large pushes no longer end the daemon (A-724; main's ruling of 2026-11-20; 2026-11-20)
+
+- **The command:** as the section above, `--per-repository-cap 10`. adas-mac-studio.local-2, M3 Ultra, 32 cores, 23
+  shards; release built from agents/w-balance-fix2 (141cb9f5a). **Not quiet:** three other agents' daemons ran
+  throughout and the load was 9 to 11; a cap-3 run after it met a load of 34 and seven daemons, so its times are void
+  and not recorded. A quiet rerun is owed.
+
+| | before (profile, 6b887d508) | after |
+|---|---|---|
+| ten concurrent v1.5.0 pushes to one repository | daemon ended: `shard 20 is spinning ... vcs_http.rs:1404, at its poll 595` | 10 of 10 answered, daemon alive |
+| longest input step | 1,435.7 ms | 1.2 ms |
+| v1.5.0 pushed alone, held | about 758 MiB | 424 to 438 MiB |
+| longest step of any phase | 1,435.7 ms (input) | 245.9 ms (the answer's last step) |
+
+- **What it says.** The daemon's end was one poll resolving every delta waiting at a pack's end. Resolved a delta a
+  unit in the answer's turns, no step past the quantum remains in reading a pack. The small repositories' p99 is not
+  moved by it (3.34 times their fair share after, 3.66 before, in quiet runs of the profile branches): their wait is
+  elsewhere. Per-phase counters (the push's steps and the wait before each) show a small push taking about 6,000 check
+  turns of 23 µs, each waiting about 91 µs for its shard, and about a second between the push's beginning and its first
+  step not yet accounted.
+
+## Subversion dump export calls in release: a text's call runs 12 to 20 times the copy slice (A-652 slicing; UI goal 93; 2026-11-20)
+
+Hardware: the big Mac Studio (Adas-Mac-Studio, d1323898, 32 cores, 96 GB, macOS arm64), load averages 3.3 to 5.3
+during the runs. Tree: main bca18403d plus the measurement test. Command:
+`CARGO_INCREMENTAL=0 cargo test --release -p slates-svn --lib -- --ignored export_call_times --nocapture`
+(`migration::tests::rules::export_call_times`: a history whose revision 1 adds a 200-window file, 20 MB of noisy bytes,
+and whose revision 2 changes it whole, exported a call at a time, each call timed; one run).
+
+| Format | Calls | Median | p99 | Max |
+|---|---|---|---|---|
+| 2 (whole texts, 100 KB pieces) | 408 | 167.8 µs | 190.8 µs | 220.0 µs |
+| 3 (deltas, measured then written) | 814 | 9.6 µs | 289.6 µs | 303.9 µs |
+
+Against the 14 µs copy slice (`DaemonConfig::copy_slice_ns`, as the MacBook's debug daemon derived it; the Studio's
+release value not read): every format 2 text call and format 3's window calls run 12 to 20 times past it. Format 2's
+call is a 100 KB piece; the writer digests every piece (MD5 and SHA-1, the text's checksums checked as it is written),
+about 1.6 µs a KB, which a smaller piece shortens without changing a byte. Format 3's is one deltifier window (100 KB of
+target, Subversion's window size, which fixes the output's bytes), so only a window made in parts shortens it. Next:
+the piece and the window sliced to the shard's slice (owed, GAPS).
+
+## A 500 MB Subversion commit over svn:// and DAV: refused by one request's room, nothing held (§4.17.1 "A push's intake"; UI goal 93; 2026-11-20)
+
+Hardware and tree as above. Command:
+`CARGO_INCREMENTAL=0 cargo test --release -p slates-cli --test svn_interop -- --ignored a_large_commit_measured --nocapture`
+(`a_large_commit_measured`: an anchor and a two-shard release daemon per scheme, a repository and a token through the
+CLI, stock `svn` 1.15.0 checking out, adding a 500 MB file of noisy bytes and committing it; the daemon's resident
+bytes sampled every 20 ms by `ps`; two runs, the same both times).
+
+| Scheme | Answer | Seconds | Daemon RSS before | Peak | Text |
+|---|---|---|---|---|---|
+| `svn://` | E210009 "The client request size exceeds the configured limit" | 2.8 | 37.4 MB | 50.4 MB | 500 MB |
+| `http://` (DAV) | E210009, the same words | 5.0 | 38.1 MB | 50.4 MB | 500 MB |
+
+The commit is refused by one request's room (the listener's `Limits::item_bytes`, the DAV site's request room), where
+§4.17.1's rule 2 refuses only past the shard's room; and below that room the commit's work holds every new text whole
+(`commit::drive::Work::texts`, by reading), where rule 1 bounds the working set whatever the text's size. Neither rule
+holds for Subversion's intake yet (GAPS).

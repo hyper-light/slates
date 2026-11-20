@@ -224,11 +224,15 @@ async fn answer_step<S: ShardLender>(
   name: &str,
   gone: ClientGone<'_>,
 ) -> Result<Next, Refused> {
+  // The client's going ends a hook's run alone, and no hook runs off unix.
+  #[cfg(not(unix))]
+  let _ = gone;
   let answering = lent(lender, |state| push.answer_step(state, &mut *out))?
     .map_err(|failed| refused(failed, name))?;
   match answering {
     Answering::Answered(_) => Ok(Next::Exited(0)),
     Answering::Turned => Ok(Next::More),
+    #[cfg(unix)]
     Answering::Hook(call) => {
       let answer = call.run(gone.gone()).await;
       lent(lender, |state| push.hook_ran(state, answer, &mut *out))?

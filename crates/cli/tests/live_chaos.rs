@@ -83,8 +83,16 @@ use slates_client::{Client, ClientError, Deadlines, Intent, ReadAt, Refusal, Vol
 
 /// Shape: how long a fleet step may take on a loaded box: the formation wait of the process flows.
 const FLEET_WAIT: Duration = Duration::from_secs(40);
-/// Shape: how long a daemon may take to answer once started (or succeeded under its anchor).
+/// Shape: how long an anchor may take to start a successor daemon once its daemon was killed.
 const START_WAIT: Duration = Duration::from_secs(30);
+/// Shape: the CPU a node's processes may spend starting before its daemon must answer: the old wall bound, now counted
+/// in the start's own CPU ([`wait_answers`]). A lone debug daemon's start measured about 13 s on the wall of a loaded
+/// Mac (`MachineProfile::measure_patiently`, 2026-11-07), most of it on its CPU; this is over twice that.
+const START_CPU: Duration = Duration::from_secs(30);
+/// Shape: the wall window in which a start that gains no CPU at all is judged stuck ([`start_verdict`]): ten liveness
+/// windows (`slates_server::daemon::LIVENESS_BUDGET_NS`, a second), past Linux's CPU clock tick and past any wait for a
+/// CPU at the loads the box runs at (control shards went 8 to 12 s between beats at load 31, but kept running).
+const START_STALL: Duration = Duration::from_secs(10);
 /// Shape: the pause between polls.
 const POLL_MS: u64 = 20;
 /// Shape: shards per daemon: two, so a volume's owner shard need not be the control shard, where the sessions are.
@@ -348,15 +356,190 @@ fn start_node(
   FleetProcess { child }
 }
 
-fn wait_answers(instance: &str) {
-  let started = Instant::now();
+/// Waits until the daemon at `instance` answers, judged in its start's own time: while the processes it was started as
+/// (`root`: the daemon, or an anchor and its daemon) live and gain CPU, until they have spent [`START_CPU`]
+/// ([`start_verdict`]). A fixed wall bound lost to load: at load 31 a replaced member's daemon spent the whole 30 s
+/// measuring the machine, starved, and the flow failed at its start (w-forming's sweeps, 2026-11-20: sw48 run 16, rp3
+/// run 3), where a start that stopped or exited still fails at once.
+fn wait_answers(instance: &str, root: u32) {
+  let mut since = (Instant::now(), tree_cpu(root));
+  let mut spent = Duration::ZERO;
   while run(instance, &["volume", "list"]).0 != 0 {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the daemon at {instance} came up"
-    );
+    let now = tree_cpu(root);
+    let stalled_for = since.0.elapsed();
+    match start_verdict(spent, since.1, now, stalled_for) {
+      StartVerdict::Waiting {
+        spent: total,
+        progressed,
+      } => {
+        spent = total;
+        if progressed {
+          since = (Instant::now(), now);
+        }
+      }
+      verdict => panic!(
+        "the daemon at {instance} came up: {verdict:?} (its processes spent {spent:?} of CPU starting)"
+      ),
+    }
     pause();
   }
+}
+
+/// What a start waited on has come to, from its processes' CPU at the last progress (`then`) and now, the CPU it had
+/// spent before that progress, and how long since it ([`wait_answers`]).
+#[derive(Debug, PartialEq, Eq)]
+enum StartVerdict {
+  /// Still starting: the CPU spent so far, and whether this look saw progress.
+  Waiting { spent: Duration, progressed: bool },
+  /// Its processes are gone.
+  Exited,
+  /// No CPU gained in [`START_STALL`].
+  Stalled,
+  /// [`START_CPU`] spent without an answer.
+  SpentItsBudget,
+}
+
+/// [`wait_answers`]' rule, apart from the clocks it reads.
+fn start_verdict(
+  spent: Duration,
+  then: Option<Duration>,
+  now: Option<Duration>,
+  since_progress: Duration,
+) -> StartVerdict {
+  let Some(now) = now else {
+    return StartVerdict::Exited;
+  };
+  let gained = then.map_or(Duration::ZERO, |then| now.saturating_sub(then));
+  let total = spent.saturating_add(gained);
+  if total >= START_CPU {
+    return StartVerdict::SpentItsBudget;
+  }
+  if gained.is_zero() {
+    if since_progress >= START_STALL {
+      return StartVerdict::Stalled;
+    }
+    return StartVerdict::Waiting {
+      spent,
+      progressed: false,
+    };
+  }
+  StartVerdict::Waiting {
+    spent: total,
+    progressed: true,
+  }
+}
+
+/// The CPU (user and system) the process `root` and its children have run, or `None` once `root` is gone.
+fn tree_cpu(root: u32) -> Option<Duration> {
+  let own = process_cpu(root)?;
+  Some(
+    children_of(root)
+      .into_iter()
+      .filter_map(process_cpu)
+      .fold(own, Duration::saturating_add),
+  )
+}
+
+/// One process's CPU, as the anchor judges its daemon's start (`slates_machine::process_clock`, A-228).
+fn process_cpu(pid: u32) -> Option<Duration> {
+  slates_machine::process_clock::process_cpu(pid).map(|cpu| Duration::from_nanos(cpu.spent_ns))
+}
+
+/// The live children of `parent` (macOS: `proc_listchildpids`).
+#[cfg(target_os = "macos")]
+fn children_of(parent: u32) -> Vec<u32> {
+  /// Shape: room for a node's children: an anchor runs one daemon at a time.
+  const ROOM: usize = 16;
+  let mut pids = [0i32; ROOM];
+  let Ok(parent) = i32::try_from(parent) else {
+    return Vec::new();
+  };
+  // SAFETY: `pids` is this frame's own buffer of the byte length passed; the call writes at most that many.
+  let filled = unsafe {
+    libc::proc_listchildpids(
+      parent,
+      pids.as_mut_ptr().cast(),
+      i32::try_from(std::mem::size_of_val(&pids)).unwrap_or(0),
+    )
+  };
+  let count = usize::try_from(filled).unwrap_or(0).min(ROOM);
+  pids
+    .iter()
+    .take(count)
+    .filter_map(|pid| u32::try_from(*pid).ok())
+    .filter(|pid| *pid != 0)
+    .collect()
+}
+
+/// The live children of `parent` (Linux: each process's parent in `/proc/<pid>/stat`).
+#[cfg(target_os = "linux")]
+fn children_of(parent: u32) -> Vec<u32> {
+  let Ok(entries) = std::fs::read_dir("/proc") else {
+    return Vec::new();
+  };
+  entries
+    .flatten()
+    .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+    .filter(|pid| {
+      std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+          stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+        })
+        == Some(parent)
+    })
+    .collect()
+}
+
+/// [`start_verdict`] (w-forming, 2026-11-20; found by use: a replaced member's daemon starved past the old 30 s wall
+/// bound at load 31). Do: judge a start that gains a little CPU a look for longer than the old wall bound, one that
+/// gains none for [`START_STALL`], one whose processes are gone, and one that has spent [`START_CPU`]. Expect: the
+/// starved start still waited for with its CPU summed; the stalled one, the gone one and the spent one given up.
+#[test]
+fn a_start_is_judged_by_its_own_cpu_not_the_wall() {
+  let tick = Duration::from_millis(5);
+  let mut spent = Duration::ZERO;
+  let mut cpu = Duration::from_millis(100);
+  // A look each POLL_MS for twice the old wall bound, gaining 5 ms of CPU each: a quarter of the box's attention.
+  let looks = 2 * START_WAIT.as_millis() / u128::from(POLL_MS);
+  for _ in 0..looks {
+    let now = cpu + tick;
+    match start_verdict(spent, Some(cpu), Some(now), Duration::from_millis(POLL_MS)) {
+      StartVerdict::Waiting {
+        spent: total,
+        progressed: true,
+      } => spent = total,
+      other => panic!("a starved start was given up: {other:?} after {spent:?} of CPU"),
+    }
+    cpu = now;
+  }
+  assert!(spent < START_CPU, "the starved start spent {spent:?}");
+  assert_eq!(
+    start_verdict(spent, Some(cpu), Some(cpu), START_STALL),
+    StartVerdict::Stalled
+  );
+  assert_eq!(
+    start_verdict(spent, Some(cpu), Some(cpu), START_STALL / 2),
+    StartVerdict::Waiting {
+      spent,
+      progressed: false
+    }
+  );
+  assert_eq!(
+    start_verdict(spent, Some(cpu), None, Duration::ZERO),
+    StartVerdict::Exited
+  );
+  assert_eq!(
+    start_verdict(
+      START_CPU - tick,
+      Some(cpu),
+      Some(cpu + tick),
+      Duration::ZERO
+    ),
+    StartVerdict::SpentItsBudget
+  );
 }
 
 /// This node's member id and how many members and probed peers it holds, from `status`.
@@ -882,7 +1065,7 @@ impl Fleet {
         if let Some(relay) = &relay {
           relay.root(index, process.child.id());
         }
-        wait_answers(instance);
+        wait_answers(instance, process.child.id());
         Some(process)
       })
       .collect();
@@ -1023,8 +1206,9 @@ impl Fleet {
     if let Some(relay) = &self.relay {
       relay.root(index, process.child.id());
     }
+    let root = process.child.id();
     self.processes[index] = Some(process);
-    wait_answers(&self.instances[index]);
+    wait_answers(&self.instances[index], root);
   }
 
   /// Waits until every live node holds exactly the manifest's members with its probe mesh up ([`meshed`]): a succeeded

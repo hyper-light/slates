@@ -15,7 +15,11 @@
 //! **Not made** ([`Unmade`]): a parent the index does not hold, a field 7.2 would not write as it is, a version that
 //! changed no tracked file.
 //!
-//! **Owed** (GAPS, A-731): a copy as a file revision naming its source (`copy`, `copyrev`); a merge's second parent.
+//! **A copy** (A-626 part 4's copy, made as 7.2's `_filecommit` makes one): a path the version copied from another the
+//! parent's manifest holds is a file revision whose block names the source and its node there (`copy`, `copyrev`,
+//! sorted), its first parent null, whatever its bytes.
+//!
+//! **Owed** (GAPS, A-731): a merge's second parent.
 
 use std::collections::BTreeMap;
 
@@ -40,6 +44,8 @@ pub struct Change<'c> {
   pub path: &'c [u8],
   /// Its bytes and flag after the version; none where the version removed it.
   pub after: Option<(&'c [u8], Flag)>,
+  /// The path it was copied from, where the version copied it (A-626 part 4's copy).
+  pub copied_from: Option<&'c [u8]>,
 }
 
 /// Who made the version, when, on which branch, and why.
@@ -101,6 +107,29 @@ pub fn made(
       }
       continue;
     };
+    // A copy names its source and the source's node in the parent's manifest, its first parent null (7.2's
+    // `_filecommit`: `meta["copy"]`, `meta["copyrev"]`, `fparent1 = nullid`); a source the parent does not hold is no
+    // copy, as 7.2 warns and commits it plain.
+    let copy = change
+      .copied_from
+      .filter(|source| *source != change.path)
+      .and_then(|source| entries.get(source).map(|(node, _)| (source, *node)));
+    if let Some((source, source_node)) = copy {
+      let mut hex = Vec::new();
+      encode_hex(&source_node, &mut hex);
+      let metadata: [(&[u8], &[u8]); 2] = [(filerev::COPY, source), (filerev::COPY_REV, &hex)];
+      let len = filerev::packed_len(&metadata, bytes)
+        .map_err(|_| Unmade::Unencodable("a copy's file revision"))?;
+      admission.charge(len)?;
+      let mut text = Vec::new();
+      filerev::pack(&metadata, bytes, &mut text)
+        .map_err(|_| Unmade::Unencodable("a copy's file revision"))?;
+      let file = node::compute(&NULL_NODE, &NULL_NODE, &text).map_err(|_| Unmade::Collision)?;
+      files.push((change.path.to_vec(), vec![arrived(file, NULL_NODE, text)]));
+      entries.insert(change.path.to_vec(), (file, flag));
+      touched.push(change.path);
+      continue;
+    }
     let text = file_text(bytes, admission)?;
     // The same text as the parent's revision keeps the parent's node, as 7.2's `filelog.cmp` passes it over: only a
     // changed flag is then the change.

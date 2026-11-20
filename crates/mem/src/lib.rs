@@ -45,6 +45,7 @@ pub mod mpsc;
 pub mod prefault;
 mod ranges;
 pub mod region;
+pub mod resident;
 pub mod ring;
 pub mod segmented;
 pub mod shared;

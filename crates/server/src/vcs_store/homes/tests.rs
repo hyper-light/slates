@@ -505,3 +505,30 @@ fn the_healer_on_a_lone_node_moves_nothing_and_region_offers_are_idempotent() {
   let outcome = outcome.expect("the shards answered");
   assert!(outcome.is_empty(), "{outcome:#?}");
 }
+
+/// A-724 with A-727 a3, the barrier driven by the daemon's own publications. Do: keep a window on this shard (its
+/// ticket), then commit a publication of the shard's held pieces as `verbs::publish_shard` does (`held_committed`),
+/// then keep a second. Expect: the first ticket not published before the publication and published after it; the
+/// second's generation past it, so a window kept after a publication waits for the next.
+#[test]
+fn a_committed_publication_publishes_the_tickets_of_windows_kept_before_it() {
+  use super::{keep_here, published_here};
+  crate::daemon::audit_on_shard(|state| {
+    let (_, first) = keep_here(state, &window(1)).unwrap();
+    assert!(
+      !published_here(first.generation),
+      "durable before any publication"
+    );
+    crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), false);
+    assert!(
+      published_here(first.generation),
+      "a committed publication left its ticket unpublished"
+    );
+    let (_, second) = keep_here(state, &window(2)).unwrap();
+    assert!(second.generation > first.generation);
+    assert!(
+      !published_here(second.generation),
+      "a window kept after the publication counted durable"
+    );
+  });
+}

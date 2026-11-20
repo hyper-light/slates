@@ -483,7 +483,7 @@ impl Live {
     pending: &mut Pending,
     moves: &[RecordedMove],
   ) -> Result<(), GitRefused> {
-    let admitted = seal_moves(&self.content, &self.store, &mut pending.push, moves)?;
+    let admitted = seal_moves(&mut self.content, &mut self.store, &mut pending.push, moves)?;
     let deepest = pending.push.deepest();
     let record = record_of(
       &self.content,
@@ -1406,13 +1406,17 @@ pub(crate) fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u
     .collect()
 }
 
-/// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one
-/// whole over the refs keyed `greens`, every record replayed and none refused.
+/// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one,
+/// its whole builds settled, whole over the refs keyed `greens`, every record replayed and none refused.
 pub(crate) fn assert_made_again_whole(
   state: &mut ShardState,
   repository: RepositoryId,
   greens: &[u64],
 ) {
+  // The live store's whole builds run in slices after a push's answer, and a rebuild settles its own before it is
+  // compared (`settle_rebuild`), so the live store is compared settled too: otherwise a build under way holds what it
+  // has put so far and the two differ in holders and contents while their rows and refs agree.
+  super::paths::whole_build::settle(state);
   let live = {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     facts(content, store, greens)
@@ -1827,7 +1831,8 @@ fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId
 
 /// A-732's sibling for git (main's ruling of 2026-11-20: a large repository's rebuild in one step spun past the
 /// watchdog and crash-looped the daemon). Do: push five commits to a git repository; make its store again from the log.
-/// Expect: the rebuild under way and the store lent to nothing; its five records replayed one a turn; then the store
+/// Expect: the rebuild under way and the store lent to nothing; its five records replayed a turn each at least (a pack
+/// record over as many as its units take, A-722 part 4); then the store
 /// lent again and its green's map made again by its build. Red before the change: the store was made whole at once.
 #[test]
 fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
@@ -1850,7 +1855,151 @@ fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
       .vcs_stores
       .git_ref(repository)
       .is_some_and(|(_, git)| git.heads.contains_key(&green_key(root)));
-    (during, turns == records && records == 5, lent, mapped)
+    (during, turns >= records && records == 5, lent, mapped)
   });
   assert_eq!(seen, ((true, true), true, true, true));
+}
+
+/// Shape: the files of the one commit whose push's record holds many objects: enough that a replay a unit a turn takes
+/// many turns, few enough for a test's step.
+const MANY_FILES: usize = 64;
+
+/// A-722 part 4 (main's ruling 2026-11-20: a large pack record's replay ran in one turn and crash-looped the daemon). Do:
+/// push one commit of [`MANY_FILES`] files to a git repository, one record whose pack holds every blob, the tree and the
+/// commit; make its store again from the log, each turn held to no time at all. Expect: the one record replayed over
+/// at least as many turns as its pack has objects, and the store made again holding the commit at the green's head.
+/// Red before the change: the record was replayed whole in one turn.
+#[test]
+fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "many-objects", VcsTool::Git);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
+      .map(|n| {
+        (
+          format!("f{n}").into_bytes(),
+          format!("file {n}\n").into_bytes(),
+        )
+      })
+      .collect();
+    let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
+    let tree = tree_of(&objects);
+    push_through(state, (repository, root), &objects, (None, commit, tree));
+    let held = records(state, repository).len();
+    super::rebuild(state, repository);
+    let mut turns = 0usize;
+    while super::rebuild_turn_once_within(state, repository, 0) {
+      turns = turns.saturating_add(1);
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    let key = green_key(root);
+    let head = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(content, git)| {
+        let newest = git.repository.versions(key).checked_sub(1)?;
+        git.repository.head(content, key, newest)
+      });
+    (held, turns >= objects.len(), head == Some(commit))
+  });
+  assert_eq!(seen, (1, true, true));
+}
+
+/// A-722 part 4 (a push's seal and stage a unit at a time on the owner, `GitPush::sealing`). Do: begin a push of one
+/// commit of [`MANY_FILES`] files; seal it a turn at a time, each turn held to no time at all, counting the turns; land
+/// it. Expect: more turns than the push holds objects; the push landed, its green's head the commit.
+#[test]
+fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "many-sealed", VcsTool::Git);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
+      .map(|n| {
+        (
+          format!("f{n}").into_bytes(),
+          format!("file {n}\n").into_bytes(),
+        )
+      })
+      .collect();
+    let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
+    let tree = tree_of(&objects);
+    let push = begun(state, repository, &objects);
+    let version = state.greens.get(&root).expect("the green's engine").head();
+    let built = work_of(state, (&push, root), (version, None), (commit, tree));
+    let mut sealing = push.sealing(state).expect("sealing");
+    let mut turns = 0usize;
+    let mut sealed = loop {
+      turns += 1;
+      match sealing.turn(state, 0).expect("a turn") {
+        super::SealTurn::More(more) => sealing = *more,
+        super::SealTurn::Sealed(sealed) => break *sealed,
+      }
+    };
+    let changes = vec![BranchChange::Update {
+      green: root,
+      work: built,
+    }];
+    let moves = [(Target::Green(root), Some(commit))];
+    appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
+    sealed.abandon(state);
+    let key = green_key(root);
+    let head = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(content, git)| {
+        let newest = git.repository.versions(key).checked_sub(1)?;
+        git.repository.head(content, key, newest)
+      });
+    (turns > objects.len(), head == Some(commit))
+  });
+  assert_eq!(seen, (true, true));
+}
+
+/// A-722 part 4c (a move admitted a turn at a time before its append, `SealedPush::admission_turn`). Do: seal a push of
+/// one commit of [`MANY_FILES`] files; admit its green's move to the commit a turn at a time, each turn held to no time
+/// at all, counting the turns; append it. Expect: more turns than the push holds objects; the append took the move
+/// admitted before it (none left kept) and landed it, the green's head the commit.
+#[test]
+fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "many-admitted", VcsTool::Git);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
+      .map(|n| {
+        (
+          format!("f{n}").into_bytes(),
+          format!("file {n}\n").into_bytes(),
+        )
+      })
+      .collect();
+    let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
+    let tree = tree_of(&objects);
+    let push = begun(state, repository, &objects);
+    let version = state.greens.get(&root).expect("the green's engine").head();
+    let built = work_of(state, (&push, root), (version, None), (commit, tree));
+    let mut sealed = push.seal(state).expect("sealed");
+    let (mut admitting, mut turns) = (None, 0usize);
+    let key = green_key(root);
+    loop {
+      turns += 1;
+      if sealed.admission_turn(state, (key, commit), (&mut admitting, 0)) {
+        break;
+      }
+    }
+    let kept = sealed.prepared.len();
+    let changes = vec![BranchChange::Update {
+      green: root,
+      work: built,
+    }];
+    let moves = [(Target::Green(root), Some(commit))];
+    appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
+    let left = sealed.prepared.len();
+    sealed.abandon(state);
+    let head = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(content, git)| {
+        let newest = git.repository.versions(key).checked_sub(1)?;
+        git.repository.head(content, key, newest)
+      });
+    (turns > objects.len(), kept, left, head == Some(commit))
+  });
+  assert_eq!(seen, (true, 1, 0, true));
 }

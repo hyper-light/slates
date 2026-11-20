@@ -43,6 +43,7 @@ BOUND_VERBS = {
     "link",
     "set_xattr",
     "remove_xattr",
+    "copy",
     "client_id",
     "reconnects",
 }
@@ -141,6 +142,13 @@ class SlatesSdkSurface(unittest.TestCase):
         self.assertTrue(hasattr(slates, "Client"))
         self.assertTrue(hasattr(slates, "SlatesError"))
         self.assertTrue(BOUND_VERBS <= _client_verbs())
+        # Every work operation the SDK offers (its exhaustive map over the wire's `WorkOp`, A-626 part 4) is a verb of
+        # both clients, so an appended operation reaches this surface whole or breaks its build.
+        offered = set(slates.work_op_methods())
+        self.assertIn("copy", offered)
+        self.assertTrue(offered <= _client_verbs(), offered - _client_verbs())
+        asynchronous = {name for name in dir(slates.AsyncClient) if not name.startswith("_")}
+        self.assertTrue(offered <= asynchronous, offered - asynchronous)
 
     def test_connect_to_a_missing_daemon_raises_a_typed_error(self):
         """Connecting to an instance with no daemon raises SlatesError carrying the typed refusal — the
@@ -265,6 +273,24 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             self.assertTrue(ns_outcome["ok"], f"the namespace ops submitted cleanly: {ns_outcome}")
             ns_changed = client.changed_since(green, ns_base)
             self.assertTrue(any("keep.txt" in path for path in ns_changed), ns_changed)
+
+            # a copy (A-626 part 4): a work lands `/c/x.txt`; another copies `/c`'s tree to `/e` from its base by
+            # reference and submits; the CLI reads the copied file's bytes at the green's head.
+            source = client.create_work(green, "w-copy-source")
+            client.edit(source["id"], "/c/x.txt", 0, 0, b"copied")
+            self.assertTrue(client.submit(source["id"])["ok"])
+            copying = client.create_work(green, "w-copy")
+            client.copy(copying["id"], "/c", "/e")
+            copied = client.submit(copying["id"])
+            self.assertTrue(copied["ok"], f"the copy submits: {copied}")
+            self.assertEqual(_cli(binary, instance, "read", green, "/e/x.txt"), "copied")
+            # a copy of nothing is refused before any verdict, typed by its case (A-586).
+            empty = client.create_work(green, "w-copy-nothing")
+            client.copy(empty["id"], "/nothing", "/z")
+            with self.assertRaises(slates.SlatesError) as refused:
+                client.submit(empty["id"])
+            self.assertIn("CopyRefused", str(refused.exception))
+            self.assertIn("source_empty", str(refused.exception))
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:

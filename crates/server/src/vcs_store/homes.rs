@@ -26,7 +26,9 @@
 //! tells this module two things on the home's own thread: [`image_begun`] when an image captures the shard's content
 //! table (the next image is the one after it), and [`image_published`] when it is durable. The wait runs as a task on
 //! the home (`crate::xshard::task_in_shard_time`), so the owner's request awaits it and no step ever waits. One barrier
-//! serves every window kept before it: group commit per shard, never a publication per push.
+//! serves every window kept before it: group commit per shard, never a publication per push. The daemon drives it at
+//! each publication it commits ([`publication_committed`], from `crate::content_holder::held_committed`): a publication
+//! captures and commits in one turn, so the image begins and is published at once.
 //!
 //! **In batches** ([`home_many`], [`read_many`], [`let_go_many`]; agreed with w-perf). A request's windows go to their
 //! homes in one cross-shard call a home shard a turn, never one a window: each call works through its items until the
@@ -48,7 +50,7 @@
 //! not answer within the budget; an answer naming another identity than the bytes' (never in a correct home).
 
 use slates_db::register::rendezvous_ranked_by_key;
-use slates_vcs::{ContentId, ContentRefused, ContentStore};
+use slates_vcs::{ContentId, ContentRefused};
 
 use crate::state::ShardState;
 
@@ -127,6 +129,25 @@ pub(crate) fn image_published(generation: u64) {
   }
 }
 
+/// Whether this shard's image of `generation` is published ([`image_published`]).
+pub(crate) fn published_here(generation: u64) -> bool {
+  IMAGES.with(|images| {
+    images
+      .try_borrow()
+      .is_ok_and(|images| images.published >= generation)
+  })
+}
+
+/// A publication of this shard's image committed (`crate::content_holder::held_committed`, the end of every checkpoint
+/// and delta `crate::verbs::publish_shard` commits): every window kept before it is in it, since a publication captures
+/// and commits in one turn of the shard's thread, so the image a ticket kept now names begins and is published at once,
+/// and a window kept after waits for the next.
+pub(crate) fn publication_committed() {
+  let generation = IMAGES.with(|images| images.try_borrow().map_or(1, |images| images.next));
+  image_begun(generation);
+  image_published(generation);
+}
+
 /// The ticket of a window kept on this shard now.
 fn ticket_here(shard: u16) -> HomeTicket {
   let generation = IMAGES.with(|images| images.try_borrow().map_or(1, |images| images.next));
@@ -191,18 +212,21 @@ pub(crate) fn keep_here(
   state: &mut ShardState,
   bytes: &[u8],
 ) -> Result<(ContentId, HomeTicket), HomeRefused> {
-  if state.vcs_stores.content.is_none() {
-    let window = state.store.content.chunk_bytes();
-    let made = ContentStore::new(state.vcs_stores.charged, window).map_err(HomeRefused::Content)?;
-    state.vcs_stores.content = Some(made);
-  }
+  let window = state.store.content.chunk_bytes();
+  state
+    .vcs_stores
+    .content_made(window)
+    .map_err(HomeRefused::Content)?;
   let need = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   super::lend(&mut state.store, &mut state.vcs_stores, need);
-  let kept = state
-    .vcs_stores
-    .content
-    .as_mut()
-    .map(|content| content.put(bytes));
+  let kept = {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map(|content| content.put(bytes))
+  };
   super::settle(state);
   match kept {
     Some(Ok(identity)) => {
@@ -217,12 +241,15 @@ pub(crate) fn keep_here(
 
 /// The bytes of the window `identity` this shard keeps as its home, if it keeps it.
 pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<Vec<u8>> {
-  let bytes = state
-    .vcs_stores
-    .content
-    .as_ref()
-    .and_then(|content| content.bytes_of(identity))
-    .map(std::borrow::Cow::into_owned)?;
+  let bytes = {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_ref()
+      .and_then(|content| content.bytes_of(identity))
+      .map(std::borrow::Cow::into_owned)
+  }?;
   state.count(READ, 1);
   Some(bytes)
 }
@@ -238,11 +265,14 @@ pub(crate) fn let_go_here(state: &mut ShardState, identity: &ContentId) -> Resul
     return Err(HomeRefused::NotHeld);
   }
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
-  let released = state
-    .vcs_stores
-    .content
-    .as_mut()
-    .map(|content| content.release(identity));
+  let released = {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map(|content| content.release(identity))
+  };
   super::settle(state);
   match released {
     Some(Ok(_)) => {

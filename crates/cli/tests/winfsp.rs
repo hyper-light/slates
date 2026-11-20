@@ -433,6 +433,77 @@ fn a_cached_read_through_a_winfsp_mount_shows_another_paths_change() {
   let _ = &fixture.instance;
 }
 
+/// Shape: the rounds of the delete-racing-a-purge test: the race hung its deleter within 60 rounds in 4 of 4 runs on the
+/// test-signing VM (GAPS, 2026-11-18, A-360's race).
+const PURGE_RACE_ROUNDS: usize = 60;
+
+/// A-498 (goal 87; GAPS "A delete racing a coherent purge can hang its caller"), on WinFsp as released. Do: on a
+/// writable drive, for each of [`PURGE_RACE_ROUNDS`] files: write it through the SDK (the other path), open it through
+/// the drive and hold it, rewrite it through the SDK (the mount's next round purges the held file's cached pages,
+/// A-190), then close the handle and delete the file through the drive at once. Expect: every close and delete
+/// returns within [`WAIT_FOR`] and the file is gone. On the patched driver a hard link stood for the other path, and
+/// the deleter hung in `NtClose` within 60 rounds, every run.
+#[test]
+fn a_delete_racing_a_coherent_purge_returns_and_removes_the_file() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("purgerace");
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "purgerace", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let hex = value_of(&out, "id");
+  let volume = volume_id_of(&hex);
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut writer = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &hex, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  let root = format!("{drive}\\");
+  wait_ready(&root);
+  for round in 0..PURGE_RACE_ROUNDS {
+    let name = format!("race-{round}.bin");
+    let write = |writer: &mut slates_client::Client, fill: u8| {
+      writer
+        .fs_write((volume, attachment), &name, &[fill; FILE_BYTES], FILE_MODE)
+        .unwrap();
+    };
+    write(&mut writer, b'A');
+    let path = format!("{root}{name}");
+    let held = std::fs::File::open(&path).unwrap();
+    assert_eq!(read_page(&held), vec![b'A'; FILE_BYTES]);
+    write(&mut writer, b'B');
+    let (done, finished) = std::sync::mpsc::channel();
+    let deleting = path.clone();
+    std::thread::spawn(move || {
+      drop(held);
+      let removed = remove_through_drive(&deleting).map_err(|error| error.raw_os_error());
+      let _ = done.send(removed);
+    });
+    let removed = finished.recv_timeout(WAIT_FOR);
+    eprintln!("A-498 purge race round {round}: {removed:?}");
+    assert!(
+      matches!(removed, Ok(Ok(()))),
+      "round {round}: the close and delete returned {removed:?} within {WAIT_FOR:?}"
+    );
+    assert!(
+      !std::path::Path::new(&path).exists(),
+      "round {round}: the file is gone"
+    );
+  }
+}
+
 /// A read-only view of the first page of an open file (`CreateFileMappingW` `PAGE_READONLY`, `MapViewOfFile`
 /// `FILE_MAP_READ`), unmapped and closed on drop.
 struct MappedView {
@@ -791,7 +862,7 @@ fn a_read_longer_than_the_bridges_cap_returns_every_byte_asked_for() {
   let content: Vec<u8> = (0..LONG_READ_BYTES + FILE_BYTES)
     .map(|offset| u8::try_from(offset % 251).unwrap())
     .collect();
-  std::fs::write(format!("{root}long.bin"), &content).unwrap();
+  write_through_drive(&format!("{root}long.bin"), &content).unwrap();
   let handle = std::fs::OpenOptions::new()
     .read(true)
     .custom_flags(FILE_FLAG_NO_BUFFERING)
@@ -1090,6 +1161,12 @@ const VERBATIM_DRIVE_UNITS: usize = 6;
 #[allow(clippy::disallowed_methods)]
 fn write_through_drive(path: &str, bytes: &[u8]) -> std::io::Result<()> {
   std::fs::write(path, bytes)
+}
+
+/// Removes a file through the mounted drive, as [`write_through_drive`] writes: a volume in RAM, never the disk (R1).
+#[allow(clippy::disallowed_methods)]
+fn remove_through_drive(path: &str) -> std::io::Result<()> {
+  std::fs::remove_file(path)
 }
 
 /// Makes a directory through the mounted drive, as [`write_through_drive`] writes.

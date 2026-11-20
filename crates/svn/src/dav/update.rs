@@ -32,6 +32,7 @@ use crate::index::{Index, Revision};
 use crate::lock::{AprTime, LockTable};
 use crate::reads::Repository;
 use crate::report::drive::{Drive, Next, Sources};
+use crate::report::exchange::{Budget, Slice};
 use crate::report::{
   Depth, RequestKind, WholeCommand, WholeItem, WholeRefusal, uri_decode, whole_report,
 };
@@ -98,6 +99,9 @@ pub struct UpdateWalk {
   writer: Option<Writer>,
   /// Whether a call has been written, so a refusal can no longer be answered whole.
   begun: bool,
+  /// What would have taken the last slice past its room after others (a call's bytes, or the answer's end): written
+  /// first by the next slice (A-749, §4.17.1 "A fetch's answer" rule 2).
+  held: Vec<u8>,
 }
 
 impl UpdateWalk {
@@ -180,17 +184,23 @@ impl UpdateWalk {
       drive: Drive::new(whole, uuid.as_bytes()),
       writer: Some(writer),
       begun: false,
+      held: Vec::new(),
     })
   }
 
-  /// Writes the answer's next slice into `out` from `walked`: the drive's calls until it has written `room` bytes or
-  /// taken `room` calls and pauses, or the answer ends.
+  /// Writes the answer's next slice into `out` from `walked` within `budget` (A-749, §4.17.1 "A fetch's answer"): what
+  /// the last slice held first, then the drive's calls, `budget.steps` steps for each, until the slice has written its
+  /// room, or its quantum has run where it names one (else until it has taken as many steps as its room), or the answer
+  /// ends; at least one step. A call, or the answer's end, that would take the slice past its room after others is held
+  /// whole for the next, so a slice passes its room only by one call larger than the room alone.
   pub fn resume<R: Repository + ?Sized>(
     &mut self,
     walked: &Walked<'_, R>,
     out: &mut Vec<u8>,
-    room: usize,
+    budget: Budget,
   ) -> ReportProgress {
+    let room = budget.room.max(1);
+    let slice = Slice::begin(budget.quantum);
     let sources = Sources {
       index: walked.index,
       repository: walked.repository,
@@ -198,13 +208,19 @@ impl UpdateWalk {
       now: walked.now,
       rules: walked.rules,
     };
+    let mut written = std::mem::take(&mut self.held);
     let Some(mut writer) = self.writer.take() else {
+      out.append(&mut written);
       return ReportProgress::Done;
     };
-    let mut written = Vec::new();
+    let mut taken = !written.is_empty();
     let mut turns = 0usize;
     let stop = loop {
-      match self.drive.next(&sources, room.max(1)) {
+      if taken && slice.spent() {
+        break Stop::Full;
+      }
+      let before = written.len();
+      match self.drive.next(&sources, budget.steps.max(1)) {
         Next::Call(call) => {
           if writer.call(call).is_err() {
             break Stop::Refused;
@@ -214,10 +230,15 @@ impl UpdateWalk {
         Next::Ended => break Stop::Ended,
       }
       writer.take_written(&mut written);
-      turns = turns.saturating_add(STEPS_PER_BYTE);
-      if written.len() >= room || turns >= room {
+      if written.len() > room && before > 0 {
+        self.held = written.split_off(before);
         break Stop::Full;
       }
+      turns = turns.saturating_add(STEPS_PER_BYTE);
+      if written.len() >= room || (!slice.timed() && turns >= room) {
+        break Stop::Full;
+      }
+      taken = true;
     };
     let failure = self
       .drive
@@ -235,9 +256,17 @@ impl UpdateWalk {
       }
       (Stop::Ended, None) => {
         writer.take_written(&mut written);
-        out.extend_from_slice(&written);
         match writer.finish() {
+          Ok(mut rest)
+            if written.len().saturating_add(rest.len()) > room && !written.is_empty() =>
+          {
+            self.begun = true;
+            self.held.append(&mut rest);
+            out.extend_from_slice(&written);
+            ReportProgress::More
+          }
           Ok(rest) => {
+            out.extend_from_slice(&written);
             out.extend_from_slice(&rest);
             ReportProgress::Done
           }

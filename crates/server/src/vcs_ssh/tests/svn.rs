@@ -73,6 +73,7 @@ const BOUNDS: TunnelBounds = TunnelBounds {
   budget: Budget {
     room: 1 << 24,
     steps: 1 << 20,
+    quantum: None,
   },
   commit_room: 1 << 30,
 };
@@ -1190,7 +1191,7 @@ fn commit_under_hooks(hooks: Vec<slates_db::catalog::HookConfig>) -> (Answered, 
     owner: principal(OWNER),
     hooks,
   };
-  let services = SvnServices::new(NotYet, held.clone(), lends.clone(), BOUNDS);
+  let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
   let mut site = ToolSite::new(NoKeys, held, services);
   let Dispatched::Run(mut command) = site.dispatch(&principal(OWNER), &Asked::Subversion, None)
   else {

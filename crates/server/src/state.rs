@@ -306,6 +306,9 @@ pub struct ShardState {
   /// The content arena's allocation count at the last sweep pass: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
+  /// The sweep of the shard's slice of the anchor content object that the status report advances (A-744,
+  /// `crate::content_ranges`).
+  pub(crate) content_sweep: crate::content_ranges::Sweep,
   /// The content arena's allocation count and allocated bytes at the last idle sweep pass (A-214), `None` before the
   /// first: a later idle tick with another count ends a busy period, whose net growth is the allocated bytes' rise.
   pub(crate) burst_seen: Option<(u64, usize)>,
@@ -782,7 +785,8 @@ pub struct ShardState {
   /// repositories.
   pub(crate) vcs_usage: slates_vcs::Ledger<slates_db::catalog::RepositoryId, Principal>,
   /// The learned times of the hooks of this shard's repositories (A-622's table, `crate::vcs_hooks::HookTimesTable`):
-  /// bounded by the hooks their policies configure.
+  /// bounded by the hooks their policies configure. Unix alone, where hooks run.
+  #[cfg(unix)]
   pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
@@ -860,6 +864,10 @@ pub struct ShardState {
   /// and cleared by `run_recorded`: the verb's effects commit now, its completion is recorded when the
   /// deferred reply resolves, and no reply is written for it now.
   pub(crate) acceptance_deferred: bool,
+  /// The least volume counter no mint on this shard has named (`verbs::fresh_volume_id_at`): an id minted before the
+  /// record that holds it (an image's identity, a job's volume) is the shard's alone, never the next mint's too. Held in
+  /// memory alone: a restart ends every unrecorded mint's job, and the database's counter is past every recorded id.
+  pub(crate) volume_ids_minted: u64,
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,

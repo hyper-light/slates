@@ -282,7 +282,7 @@ mod tests {
   /// to zero as each guard drops; a tie keeps a push on the shard it arrived on.
   #[test]
   fn a_shards_decoding_count_follows_its_guards_and_a_tie_stays_where_it_arrived() {
-    let shard = slates_rt::registry::MAX_SHARDS as u16 - 1;
+    let shard = u16::try_from(slates_rt::registry::MAX_SHARDS - 1).unwrap();
     let before = decoding_on(shard);
     let first = Decoding::begin(shard);
     let second = Decoding::begin(shard);

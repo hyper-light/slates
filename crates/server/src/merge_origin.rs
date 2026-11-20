@@ -1385,6 +1385,8 @@ impl ReplicaSeed {
       return;
     }
     state.merge.replicas.entry(self.object).or_insert(replica);
+    // What waited for this replica on this holder: a submit's settling (A-697 part d), a recovered work's replay (e).
+    crate::work_home::replica_reached(state, self.object);
     if self.manifest.is_some() {
       state.count(REPLICA_SEEDED, 1);
     }

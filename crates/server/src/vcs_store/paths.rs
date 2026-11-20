@@ -59,8 +59,8 @@
 //! **Owed** (GAPS, A-664): a submit refused before its verdict when its post-state is one git cannot hold (a named
 //! pipe, a socket, a device, a `.git` name); a live whole build (a push's, a green's first submit's, past a copy) and a
 //! whole map's release sliced a unit at a time, and the map's and trees' build of the put files in slices of their
-//! own; and a copy made through a work, which no client verb makes yet (A-626 part 4), driven through this module's
-//! whole build by a test.
+//! own. A copy made through a work (`WorkOp::Copy`, A-626 part 4) is driven through this module's whole build by
+//! `tests::t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it`.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -301,19 +301,21 @@ pub(crate) async fn remake_green_sliced(
       return;
     };
     let mut held = Vec::new();
-    let answer = match put_sliced(vcs_stores, repository, files, &mut held, slices).await {
+    let lent = super::Lent::new(&mut *store, vcs_stores);
+    let answer = match put_sliced(lent.stores, repository, files, &mut held, slices).await {
       Ok(entries) => made_holding(
-        vcs_stores,
+        lent.stores,
         repository,
         (key, version),
         Plan::Put(entries),
         held,
       ),
       Err(refused) => {
-        give_back(vcs_stores, repository, &held);
+        give_back(lent.stores, repository, &held);
         Err(refused)
       }
     };
+    drop(lent);
     (answer, super::settle_in(store, vcs_stores))
   };
   if !charged_whole {
@@ -449,7 +451,10 @@ fn stepped(
     Err(refused) => return (Err(refused), true),
   };
   super::lend(store, stores, plan_bytes(&plan));
-  let answer = made(stores, repository, (key, version), plan);
+  let answer = {
+    let lent = super::Lent::new(&mut *store, stores);
+    made(lent.stores, repository, (key, version), plan)
+  };
   let charged_whole = super::settle_in(store, stores);
   (answer, charged_whole)
 }

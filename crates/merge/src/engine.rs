@@ -213,6 +213,14 @@ pub enum Outcome {
     /// The oldest base the green still judges.
     floor: u64,
   },
+  /// A copy the increment declares is refused before any verdict, typed ([`CopyRefusal`]; main's ruling of
+  /// 2026-11-20): no concurrent change caused it, so it is no conflict and no rebase answers it.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
+  },
 }
 
 /// A verdict reached and held, not yet committed (A-635; §4.17.1 "A push is a work"): an increment this green accepted,
@@ -283,6 +291,13 @@ pub enum Judgment {
     base: u64,
     /// The oldest base the green still judges.
     floor: u64,
+  },
+  /// A copy it declares is refused before any verdict (as [`Outcome::CopyRefused`]).
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -414,7 +429,7 @@ impl core::fmt::Debug for Computed {
 
 /// Why a green computes no verdict for an increment ([`Green::compute`], A-658), typed: it does not hold every version
 /// the increment is judged over. Neither is a verdict; the caller computes on a green that holds them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComputeRefused {
   /// The base is below the version this green was restored at from a checkpoint: the deltas it would be mapped through
   /// are folded away.
@@ -430,6 +445,13 @@ pub enum ComputeRefused {
     base: u64,
     /// This green's head.
     head: u64,
+  },
+  /// A copy the increment declares is refused before any verdict ([`CopyRefusal`]).
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -472,6 +494,14 @@ pub enum Rebased {
     base: u64,
     /// The green's head.
     head: u64,
+  },
+  /// A copy the work declares is refused, typed, as its submit refuses it ([`Outcome::CopyRefused`]): no rebase
+  /// answers it.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -1279,6 +1309,8 @@ struct Resolved {
   creates: BTreeSet<String>,
   specials: BTreeMap<String, SpecialNode>,
   invalid: BTreeSet<String>,
+  /// The renames and hard links declared with an end in a copied tree (`Green::copy_refusal`, A-586).
+  across_copies: BTreeSet<String>,
   unlinks: BTreeSet<String>,
   mkdirs: BTreeSet<String>,
   rmdirs: BTreeSet<String>,
@@ -4373,6 +4405,10 @@ impl Green {
     self.make_mapped(&mut effects, post_state);
     let moves = self.node_moves(&effects);
     effects.extend(moves);
+    // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from the
+    // head before the copies land and applied after them.
+    let linked = self.copy_link_effects(&effects);
+    effects.extend(linked);
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
     let mut staged = Staged::default();
@@ -4891,7 +4927,30 @@ impl Green {
     inc: &Increment,
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     // One verdict for a submit and a push (A-635): judged, then committed at once, at the head it was judged at.
-    match self.judge(inc) {
+    let judgment = self.judge(inc);
+    self.commit_judgment(judgment)
+  }
+
+  /// [`Green::submit_resolved`] for a verdict computed on another copy of this green (A-658 part 3b; A-697 part c: a
+  /// holder's replica computed it, and its owner takes it by position): judged by [`Green::judge_computed`], then
+  /// committed at once at the head it was judged at, so the outcome and what the chain records equal what
+  /// [`Green::submit_resolved`] gives at that head. Refused, typed, nothing judged or applied, as `judge_computed` is.
+  pub fn submit_computed(
+    &mut self,
+    inc: &Increment,
+    computed: Computed,
+  ) -> Result<(Outcome, Option<Vec<crate::chain_entry::Applied>>), PositionRefused> {
+    let judgment = self.judge_computed(inc, computed)?;
+    Ok(self.commit_judgment(judgment))
+  }
+
+  /// A judgment committed at once where it accepted, as a submit's outcome, with what the chain records of a new
+  /// version (`None` beside every other outcome).
+  fn commit_judgment(
+    &mut self,
+    judgment: Judgment,
+  ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
+    match judgment {
       Judgment::Accepted(judged) => {
         let (version, applied) = self.commit_held(judged);
         (Outcome::Accepted { version }, Some(applied))
@@ -4899,6 +4958,7 @@ impl Green {
       Judgment::AcceptedBefore { version } => (Outcome::Accepted { version }, None),
       Judgment::Conflict { windows } => (Outcome::Conflict { windows }, None),
       Judgment::BaseUnavailable { base, floor } => (Outcome::BaseUnavailable { base, floor }, None),
+      Judgment::CopyRefused { path, case } => (Outcome::CopyRefused { path, case }, None),
     }
   }
 
@@ -4934,6 +4994,9 @@ impl Green {
       });
     }
     let resolved = Green::resolve(inc);
+    if let Some((path, case)) = self.copy_refusal(&resolved) {
+      return Err(ComputeRefused::CopyRefused { path, case });
+    }
     let mut units = position::Units::first();
     self.decide_units(inc, &resolved, &mut units);
     Ok(computed(Reached::of(units.into_units().0)))
@@ -5002,6 +5065,7 @@ impl Green {
         base,
         floor: self.deltas_from,
       },
+      Err(ComputeRefused::CopyRefused { path, case }) => Judgment::CopyRefused { path, case },
     }
   }
 
@@ -5674,6 +5738,9 @@ impl Green {
       };
     }
     let resolved = Green::resolve(inc);
+    if let Some((path, case)) = self.copy_refusal(&resolved) {
+      return Rebased::CopyRefused { path, case };
+    }
     // The verdict is `submit`'s, on an immutable green; it adds to the fast-path counter (through `merge_content`),
     // which a rebase puts back, since it merges nothing.
     let fast_path_before = self.fast_path_hits.get();
@@ -6033,6 +6100,7 @@ mod branch;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 mod copy;
+pub use copy::CopyRefusal;
 
 mod copy_checkpoint;
 

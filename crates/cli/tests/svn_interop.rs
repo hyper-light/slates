@@ -24,8 +24,8 @@
 //! removed at its end; `svn` reads no user's configuration and caches no credential. A slates leg mints its credential
 //! (`slates credential token|key`, the issuer's verbs) with the anchor's issuer surface, which the anchor names on macOS
 //! and Windows; on Linux the surface is a descriptor only the anchor's children hold, so those legs skip loudly there.
-//! Unix only, as `tests/cli.rs` is: the control's tunnel runs through `sh`, and the SSH leg's through OpenSSH's `ssh`.
-#![cfg(unix)]
+//! Every platform: on a host without stock Subversion 1.15 (jupiter, until Ada decides on installing it) each leg skips
+//! loudly; the control's tunnel runs through `sh`, and the SSH leg's through OpenSSH's `ssh`.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -113,7 +113,9 @@ const NO_ISSUER_SURFACE: &str = "this platform publishes no issuer surface throu
 
 /// A scratch directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a
 /// count, removed when dropped, even when an assertion fails (A-50: a test's host files live in the build output, never
-/// `/tmp`). Made by `mkdir`, as `tests/cli.rs` makes its own.
+/// `/tmp`). Its path is written with forward slashes, which every stock client on every platform reads (Git for Windows,
+/// MSYS2's OpenSSH and Mercurial's `ssh` command on Windows among them), and without Windows' `\\?\` prefix, which
+/// they do not.
 struct Scratch {
   path: String,
 }
@@ -130,24 +132,33 @@ impl Scratch {
     );
     made_directory(&raw);
     Scratch {
-      path: std::fs::canonicalize(&raw)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned(),
+      path: portable(&std::fs::canonicalize(&raw).unwrap()),
     }
   }
 }
 
 impl Drop for Scratch {
+  // The test's own scratch directory, inside the build output (R1's wall is shipped code's).
+  #[allow(clippy::disallowed_methods)]
   fn drop(&mut self) {
-    let _ = Command::new("rm").args(["-rf", &self.path]).output();
+    let _ = std::fs::remove_dir_all(&self.path);
   }
 }
 
-/// Makes directory `path` and any parent it lacks, by `mkdir -p`.
+/// Makes directory `path` and any parent it lacks, inside the test's build output.
+#[allow(clippy::disallowed_methods)]
 fn made_directory(path: &str) {
-  let made = Command::new("mkdir").args(["-p", path]).output().unwrap();
-  assert!(made.status.success(), "mkdir -p {path}: {made:?}");
+  std::fs::create_dir_all(path).unwrap_or_else(|error| panic!("making {path}: {error}"));
+}
+
+/// `path` as every stock client reads it: forward slashes, and on Windows no `\\?\` verbatim prefix, which
+/// `canonicalize` adds and Git for Windows and MSYS2's tools refuse.
+fn portable(path: &std::path::Path) -> String {
+  let text = path.to_string_lossy();
+  text
+    .strip_prefix(r"\\?\")
+    .unwrap_or(&text)
+    .replace('\\', "/")
 }
 
 /// Whether this host runs stock Subversion's `svn` of the 1.15 line ([`SVN_LINE`]).
@@ -641,6 +652,11 @@ fn port_after(lines: &[String], prefix: &str) -> Option<u16> {
   })
 }
 
+/// The svn:// listener's port the daemon named in `lines`; a test fails when it named none.
+fn svn_listener_port(lines: &[String]) -> u16 {
+  port_after(lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port")
+}
+
 /// The HTTP edge's port the daemon named in `lines`; a test fails when it named none.
 fn http_edge_port(lines: &[String]) -> u16 {
   port_after(lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port")
@@ -718,7 +734,7 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   }
   let instance = format!("svn-protocol-{}", std::process::id());
   let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
-  let port = port_after(&lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port");
+  let port = svn_listener_port(&lines);
   let Some(issuer) = issuer_or_skip(issuer, "stock svn over svn://") else {
     return;
   };
@@ -830,6 +846,7 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh() {
 
 /// Writes a hook program at `path` that allows what it is asked, as an administrator writes `exit 0` into a
 /// repository's `hooks/` directory, made executable.
+#[cfg(unix)]
 #[allow(clippy::disallowed_methods)]
 fn allowing_hook(path: &str) {
   use std::os::unix::fs::PermissionsExt;
@@ -847,7 +864,7 @@ fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
     return None;
   }
   let (anchor, lines, issuer) = start_anchor(instance, &["--vcs-svn", "127.0.0.1:0"]);
-  let port = port_after(&lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port");
+  let port = svn_listener_port(&lines);
   let issuer = issuer_or_skip(issuer, "the revision property tests")?;
   create_repository(instance);
   let (id, token) = minted_token(instance, &issuer);
@@ -870,6 +887,8 @@ fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
 /// (`slates repository policy project --hook pre-revprop-change=PROGRAM`, the owner's verb), change revision 1's
 /// `svn:log` with stock `svn propset --revprop`, and read it. Expect the verb's answer naming the hook at policy version
 /// 1, the change taken, and the value read back.
+// Unix alone: hooks run where the hook driver does.
+#[cfg(unix)]
 #[test]
 fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
   let instance = format!("svn-revprop-{}", std::process::id());
@@ -905,11 +924,10 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
 /// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`: a repository with no pre-revprop-change hook refuses every
 /// revision property change). Do: over the svn:// listener, with revision 1 committed and no hook configured, change
 /// its `svn:log` with stock `svn propset --revprop` (ra_svn's `change-rev-prop2`). Expect it refused in svnserve's words
-/// (E165006) and the old value kept. Ignored until it can pass: by use (2026-11-20, Mac Studio) the change is taken
-/// (`property 'svn:log' set on repository revision 1`, exit 0); the server's own test sends `change-rev-prop`, which
-/// is refused, and stock svn 1.15 sends `change-rev-prop2`.
+/// (E165006) and the old value kept. Red by use (2026-11-20, Mac Studio) until the listener stopped writing a turn's
+/// trivial authentication request twice: stock svn read the second as the change's answer, a success (`property
+/// 'svn:log' set on repository revision 1`, exit 0), the refusal after it unread.
 #[test]
-#[ignore = "waits on w-svn: change-rev-prop2 with no pre-revprop-change hook is taken, where svnserve refuses E165006"]
 fn a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it() {
   let instance = format!("svn-nohook-{}", std::process::id());
   let Some((_anchor, _scratch, svn, url)) = revprop_leg(&instance) else {
@@ -928,4 +946,143 @@ fn a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it()
     (true, "first"),
     "{refused:?}"
   );
+}
+
+/// Shape: the measured commit's file: 500 MB, the large text main's intake measurement names (§4.17.1 "A push's
+/// intake").
+const LARGE_COMMIT_BYTES: usize = 500 << 20;
+
+/// Shape: how long the measured commit may run before it is killed: a 500 MB text over loopback in a debug or release
+/// daemon, with room for a slow host.
+const LARGE_COMMIT_PATIENCE: Duration = Duration::from_secs(1800);
+
+/// Writes [`LARGE_COMMIT_BYTES`] of noisy bytes, which no window shortens, as working copy `copy`'s [`FILE`], a piece at
+/// a time: the test writes the file stock `svn` commits, inside the scratch directory it removes.
+#[allow(clippy::disallowed_methods)]
+fn put_large(copy: &str) {
+  let mut file = std::fs::File::create(format!("{copy}/{FILE}")).unwrap();
+  let mut state = 1u64;
+  let mut piece = vec![0u8; 1 << 20];
+  for _ in 0..LARGE_COMMIT_BYTES / piece.len() {
+    for byte in &mut piece {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      *byte = state.to_le_bytes()[0];
+    }
+    file.write_all(&piece).unwrap();
+  }
+}
+
+/// The resident bytes of instance `instance`'s daemon processes (every `slates` process naming the instance but its
+/// anchor), from `ps`, in KiB.
+fn daemon_rss_kib(instance: &str) -> u64 {
+  let listed = Command::new("ps")
+    .args(["-A", "-o", "rss=,command="])
+    .output()
+    .unwrap();
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter(|line| line.contains(instance) && !line.contains(" anchor"))
+    .filter_map(|line| line.split_whitespace().next()?.parse::<u64>().ok())
+    .sum()
+}
+
+/// Commits working copy `copy` with `svn`, sampling the daemon's resident bytes while it runs: the exit code, both
+/// outputs, the seconds it took, and the most resident KiB seen.
+fn commit_measured(svn: &Svn, copy: &str, instance: &str) -> (i32, String, String, f64, u64) {
+  let mut child = Command::new("svn")
+    .args(&svn.options)
+    .args(["commit", "--message", "large"])
+    .current_dir(copy)
+    .env("LC_ALL", "C")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let started = Instant::now();
+  let mut peak = 0;
+  let code = loop {
+    peak = peak.max(daemon_rss_kib(instance));
+    if let Some(status) = child.try_wait().unwrap() {
+      break status.code().unwrap_or(-1);
+    }
+    if started.elapsed() > LARGE_COMMIT_PATIENCE {
+      let _ = child.kill();
+      let _ = child.wait();
+      break -2;
+    }
+    pause();
+  };
+  let seconds = started.elapsed().as_secs_f64();
+  (
+    code,
+    out.join().unwrap(),
+    err.join().unwrap(),
+    seconds,
+    peak,
+  )
+}
+
+/// §4.17.1 "A push's intake" for Subversion (a measurement, not a gate; main's brief 2026-11-20). Do: over svn:// and
+/// over the HTTP edge in turn, check out the empty repository, add a [`LARGE_COMMIT_BYTES`] file and commit it with
+/// stock `svn` 1.15, sampling the daemon's resident bytes. Expect nothing: print each scheme's commit answer, seconds,
+/// the daemon's resident bytes before and at its peak against the text's size, and the daemon's status lines naming
+/// rooms, budgets and refusals.
+#[test]
+#[ignore = "a measurement: cargo test --release -p slates-cli --test svn_interop -- --ignored a_large_commit_measured --nocapture"]
+fn a_large_commit_measured() {
+  if !stock_svn() {
+    eprintln!(
+      "skipping the large commit's measurement: no stock Subversion 1.15 here (svn on the PATH)"
+    );
+    return;
+  }
+  for scheme in ["svn", "http"] {
+    let instance = format!("svn-large-{scheme}-{}", std::process::id());
+    let edge = format!("--vcs-{scheme}");
+    let (_anchor, lines, issuer) = start_anchor(&instance, &[&edge, "127.0.0.1:0"]);
+    let Some(issuer) = issuer_or_skip(issuer, "the large commit's measurement") else {
+      return;
+    };
+    create_repository(&instance);
+    let (id, token) = minted_token(&instance, &issuer);
+    let (user, url) = match scheme {
+      "svn" => (
+        id,
+        format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(&lines)),
+      ),
+      _ => (
+        USER.to_owned(),
+        format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(&lines)),
+      ),
+    };
+    let scratch = Scratch::new(&format!("svn-large-{scheme}"));
+    let svn = Svn::new(&scratch, "large", credentials(user, token));
+    let copy = svn.copy("copy");
+    svn.ok(&svn.scratch, &["checkout", &url, &copy]);
+    put_large(&copy);
+    svn.ok(&copy, &["add", FILE]);
+    let before = daemon_rss_kib(&instance);
+    let (code, out, err, seconds, peak) = commit_measured(&svn, &copy, &instance);
+    let (_, status, _) = slates(&instance, &["status"]);
+    let named: Vec<&str> = status
+      .lines()
+      .filter(|line| {
+        ["room", "budget", "refus", "admit", "svn"]
+          .iter()
+          .any(|word| line.contains(word))
+      })
+      .collect();
+    println!(
+      "a_large_commit_measured {scheme}: exit {code} in {seconds:.1} s; daemon RSS {before} KiB before, peak {peak} KiB, \
+       text {} KiB\n  svn: {}{}\n  status: {named:?}",
+      LARGE_COMMIT_BYTES >> 10,
+      out.trim(),
+      err.trim()
+    );
+  }
 }

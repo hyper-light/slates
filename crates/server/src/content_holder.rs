@@ -195,6 +195,10 @@ const KIND_CONTENT_STAGE: u8 = 9;
 /// Format: the piece kind of a holder's durable checkpoint of a green's replica (A-404), keyed by the green.
 const KIND_REPLICA_CHECKPOINT: u8 = 10;
 
+/// Format: the piece kind of a repository window kept as a chunk of the shard's chunk store (A-727 slice a3), keyed by
+/// its handle (`vcs_store::arena_windows`).
+const KIND_VCS_WINDOW: u8 = 11;
+
 /// A held piece's key: what [`slates_vfs::recover::HELD_PIECE_KEY_BYTES`] says.
 type PieceKey = [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES];
 
@@ -303,6 +307,15 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
   // Every durable checkpoint of a replica this holder keeps (A-404).
   for (object, held) in &state.merge.checkpoints {
     pieces.push(checkpoint_piece(*object, held));
+  }
+  // Every repository window kept as a chunk of the shard's chunk store, its block named (A-727 slice a3).
+  if let Some(windows) = crate::vcs_store::chunk_windows(&state.vcs_stores) {
+    pieces.extend(windows.pieces().into_iter().map(|(handle, bytes)| {
+      slates_vfs::recover::HeldPiece {
+        key: piece_key(KIND_VCS_WINDOW, [0; 16], handle),
+        bytes,
+      }
+    }));
   }
   pieces
 }
@@ -600,6 +613,16 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   // The replica checkpoints this holder changed since the last committed publication (A-404): each kept now put, each
   // dropped removed.
   checkpoint_changes(state, (&mut put, &mut removed));
+  // The repository windows kept or let go since the last committed publication (A-727 slice a3).
+  if let Some(windows) = crate::vcs_store::chunk_windows(&state.vcs_stores) {
+    for (handle, piece) in windows.changes() {
+      let key = piece_key(KIND_VCS_WINDOW, [0; 16], handle);
+      match piece {
+        Some(bytes) => put.push(slates_vfs::recover::HeldPiece { key, bytes }),
+        None => removed.push(key),
+      }
+    }
+  }
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -680,6 +703,11 @@ pub(crate) fn held_committed(
   state.holder_records.clear_changed();
   state.live.held.clear_changed();
   state.merge.checkpoints_changed.clear();
+  if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
+    windows.clear_changes();
+  }
+  // The windows this publication carried are durable: every homes ticket kept before it answers so (A-724 with A-727 a3).
+  crate::vcs_store::homes::publication_committed();
 }
 
 /// Adopts what a committed publication carried of the held registers (A-367): each register's published positions as
@@ -780,6 +808,8 @@ pub(crate) struct RecoveredHeld {
   owned: Vec<([u8; 16], crate::live_ship::OwnedLive)>,
   /// The durable checkpoints of replicas this holder kept, by green (A-404).
   checkpoints: Vec<(ObjectId, crate::merge_service::HeldCheckpoint)>,
+  /// The repository windows kept as chunks of the shard's chunk store, each piece by handle (A-727 slice a3).
+  pub(crate) windows: Vec<(u64, Vec<u8>)>,
 }
 
 /// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
@@ -853,6 +883,7 @@ pub(crate) fn split_held(
     live: Vec::new(),
     owned: Vec::new(),
     checkpoints: Vec::new(),
+    windows: Vec::new(),
   };
   let mut heads: BTreeMap<[u8; 16], crate::live_ship::HeldLive> = BTreeMap::new();
   let mut entries: BTreeMap<[u8; 16], Vec<(u64, Vec<u8>)>> = BTreeMap::new();
@@ -899,6 +930,7 @@ pub(crate) fn split_held(
         crate::merge_service::HeldCheckpoint::from_piece(&piece.bytes)
           .ok_or(HeldRefused::Checkpoint(object))?,
       )),
+      KIND_VCS_WINDOW => held.windows.push((slot, piece.bytes.clone())),
       other => return Err(HeldRefused::UnknownKind(other)),
     }
   }

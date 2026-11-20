@@ -232,7 +232,7 @@ fn the_same_bytes_from_git_and_mercurial_are_one_content_held_by_both_repositori
   hg_repository.seal_all(&mut store).unwrap();
   assert_eq!(store.holders(&content), 2);
   git_repository.release(&mut store).unwrap();
-  assert_eq!(store.get(&content), Some(bytes));
+  assert_eq!(store.bytes_of(&content).as_deref(), Some(bytes));
   hg_repository.release(&mut store).unwrap();
   assert_empty(&store);
 }
@@ -383,7 +383,7 @@ fn an_object_longer_than_a_window_arrives_as_its_windows_and_reads_back_through_
   assert!(
     store
       .identities()
-      .all(|id| store.get(id).unwrap().len() <= WINDOW)
+      .all(|id| store.len_of(id).unwrap() <= u64::try_from(WINDOW).unwrap())
   );
   repository.release(&mut store).unwrap();
   assert_empty(&store);
@@ -1324,7 +1324,10 @@ fn check(real: &Real, model: &Model) {
   let tables = check_indexes(real, model);
   let named = model.named();
   for (content, bytes) in &named {
-    assert_eq!(real.store.get(content), Some(bytes.as_slice()));
+    assert_eq!(
+      real.store.bytes_of(content).as_deref(),
+      Some(bytes.as_slice())
+    );
   }
   for content in real.store.identities() {
     assert!(
@@ -1367,4 +1370,46 @@ proptest! {
     prop_assert!(real.store.is_empty());
     prop_assert_eq!((real.store.used(), real.store.charged()), (0, 0));
   }
+}
+
+/// A-722 part 4 (a large tail sealed over many turns). Do: insert the same forty rows into two indexes over two stores,
+/// under the tests' window; seal one whole at once (`seal_all`) and the other a table a step (`seal_step`), counting the
+/// steps. Expect: as many steps as tables; both indexes reading the same rows from the same tables in one run, with the
+/// same counters; both stores holding and charging alike; each given back whole.
+#[test]
+fn a_tail_sealed_a_table_a_step_is_the_tail_sealed_at_once() {
+  let made = || {
+    let mut store = store();
+    let mut index = Index::new();
+    for key in 0..40u8 {
+      insert_plain(&mut index, &mut store, key);
+    }
+    (index, store)
+  };
+  let (mut whole, mut whole_store) = made();
+  let (mut stepped, mut stepped_store) = made();
+  whole.seal_all(&mut whole_store).unwrap();
+  let mut steps = 0usize;
+  loop {
+    steps += 1;
+    if stepped.seal_step(&mut stepped_store).unwrap() {
+      break;
+    }
+  }
+  let tables = whole.run_tables();
+  assert_eq!(tables.len(), 1);
+  assert_eq!(steps, tables[0].len());
+  assert!(steps > 1);
+  assert_eq!(stepped.run_tables(), tables);
+  assert_eq!(read(&stepped, &stepped_store), read(&whole, &whole_store));
+  assert_eq!(stepped.counters(), whole.counters());
+  assert_eq!(
+    (stepped_store.used(), stepped_store.charged()),
+    (whole_store.used(), whole_store.charged())
+  );
+  assert_eq!(stepped.tail_len(), 0);
+  stepped.release(&mut stepped_store).unwrap();
+  whole.release(&mut whole_store).unwrap();
+  assert_empty(&stepped_store);
+  assert_empty(&whole_store);
 }

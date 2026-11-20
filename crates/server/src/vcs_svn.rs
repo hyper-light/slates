@@ -75,7 +75,7 @@ use slates_svn::handshake::{Access, Unserved};
 use slates_svn::index::{ContentIdentity, Revision};
 use slates_svn::lock::AprTime;
 use slates_svn::migration::Repository as SvnRecords;
-use slates_svn::report::exchange::Budget;
+use slates_svn::report::exchange::{Budget, Quantum};
 use slates_svn::serve::{CommitStart, Connection, Limits, Made, Policy, Sources, Turn};
 
 use slates_vfs::clock::Clock;
@@ -83,9 +83,10 @@ use slates_vfs::clock::Clock;
 use crate::config::DaemonConfig;
 use crate::repository::svn_commit;
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
+use crate::vcs_http::svn::Lent;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
-use crate::vcs_store::svn_view::lend_in;
+use crate::vcs_store::svn_view::{SvnHold, hold_in, lend_held_in, lend_in};
 
 /// Counter: a listener the control shard could not keep the state of, or whose task its arena refused.
 const NOT_STARTED: &str = "vcs_svn.not_started";
@@ -711,6 +712,10 @@ struct Conversation {
   principal: Option<Principal>,
   /// The commits the connection began, which name their transactions.
   commits: u64,
+  /// A read's hold on the generation of the records it began on, while its answer is under way over many calls
+  /// ([`Connection::fetching`]; A-749, §4.17.1 "A fetch's answer" rule 4): given back as it ends, and before the
+  /// conversation moves to another shard.
+  held: Option<SvnHold>,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -749,6 +754,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     opened: None,
     principal: None,
     commits: 0,
+    held: None,
   };
   go_on(stream, conversation, seat).await;
 }
@@ -777,6 +783,8 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
       Stepped::Go => {}
       Stepped::End => return,
       Stepped::Elsewhere(found, located) => {
+        // A hold is given back on the shard that holds its records.
+        conversation.held = None;
         migrate(Moving {
           stream: stream.into_owned(),
           conversation,
@@ -806,6 +814,10 @@ async fn step(
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
+  // Written: what follows (a revision property change's hooks, a commit's hook or landing, a lock verb) writes its own
+  // answer after it, never this again (a revision property change once wrote its trivial authentication request twice,
+  // which stock svn read as the change's success).
+  out.clear();
   follow(stream, conversation, next, out, seat).await
 }
 
@@ -904,31 +916,52 @@ async fn located_step(
   }
 }
 
+/// `budget` timed by the shard's step quantum (A-749, §4.17.1 "A fetch's answer" rule 3): a report's drive then taken a
+/// step at a time until the quantum has run, whatever its room; as it is where no shard's state is reached (the tests).
+pub(crate) fn timed(budget: Budget) -> Budget {
+  match crate::state::with_state(|state| crate::vcs_store::hg_import::quantum_of(state)) {
+    Some(ns) => Budget {
+      steps: 1,
+      quantum: Some(Quantum { now_ns, ns }),
+      ..budget
+    },
+    None => budget,
+  }
+}
+
 /// What the conversation's connection makes of the client's bytes, its output appended to `out` (the module doc):
 /// before a session is established the handshake asks for more bytes, hands over the client's answer, whose URL is
 /// resolved, or asks for a CRAM-MD5 challenge or key; once the client authenticated, each call is handed its
 /// repository's sources, lent afresh on the owner ([`lend_in`]). A commit, and any refusal, ends the connection, the
 /// refusal's words already in `out`.
 fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
-  let budget = Budget {
+  let budget = timed(Budget {
     room: conversation.limits.item_bytes,
     steps: conversation.limits.most_open,
-  };
+    quantum: None,
+  });
   let Conversation {
     connection,
     input,
     opened,
     principal,
+    held,
     ..
   } = conversation;
   let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
     let turn = connection.receive(None::<&Sources<'_, Unresolved>>, input, out, budget);
     return next_of(connection, turn, out);
   };
-  let lent = lent_sources(opened, principal, |sources| {
+  let lent = held_sources(opened, principal, held.as_ref(), |sources| {
     let turn = connection.receive(Some(sources), input, out, budget);
     next_of(connection, turn, out)
   });
+  // A read whose answer goes on past this call holds the records this call read, in the same step (A-749 rule 4).
+  if !connection.fetching() {
+    *held = None;
+  } else if held.is_none() {
+    *held = crate::state::with_state(|state| hold_in(state, opened.id)).flatten();
+  }
   lent.unwrap_or_else(|| {
     crate::fleet::count_refusal(STORE_MISSING);
     Next::End
@@ -942,9 +975,20 @@ fn lent_sources<T>(
   principal: &Principal,
   step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
 ) -> Option<T> {
+  held_sources(opened, principal, None, step)
+}
+
+/// [`lent_sources`], or over the records `held` holds while a read's answer is under way ([`lend_held_in`]); none when
+/// the shard holds them no longer.
+fn held_sources<T>(
+  opened: &Opened,
+  principal: &Principal,
+  held: Option<&SvnHold>,
+  step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
+) -> Option<T> {
   crate::state::with_state(|state| {
     let authenticated = authenticated_access(state, &opened.name, principal);
-    lend_in(state, opened.id, |lent| {
+    let sources_of = |lent: &Lent<'_, SvnRecords>| {
       step(&Sources {
         index: lent.index,
         repository: lent.repository,
@@ -957,7 +1001,11 @@ fn lent_sources<T>(
           filesystem: &opened.name,
         },
       })
-    })
+    };
+    match held {
+      Some(hold) => lend_held_in(state, hold, sources_of),
+      None => lend_in(state, opened.id, sources_of),
+    }
   })
   .flatten()
 }
@@ -1166,9 +1214,8 @@ fn land_locks(
     (principal, opened.id),
     slates_svn::commit::record::Record::Locks(entries),
   )
-  .map_err(|failure| {
+  .inspect_err(|_| {
     crate::fleet::count_refusal(LOCKS_REFUSED);
-    failure
   })
 }
 
@@ -1463,20 +1510,26 @@ pub(crate) struct HookAnswer {
 /// repository's name beneath `/`, as `SVNParentPath` lays repositories out, until A-645's read-only FSFS-layout view
 /// gives `svnlook` a directory to read: design §4.17.4 item 9).
 pub(crate) struct Hooked {
-  /// The repository's id, which its hooks' learned times are kept under.
+  /// The repository's id, which its hooks' learned times are kept under (unix alone, where hooks run).
+  #[cfg(unix)]
   id: RepositoryId,
   /// Its name, which its record is found by on its owner shard.
   name: String,
-  /// REPOS.
+  /// REPOS (unix alone, where hooks run).
+  #[cfg(unix)]
   repos: String,
 }
 
 impl Hooked {
   /// What the hooks of the repository `id`, named `name`, need of it.
   pub(crate) fn new(id: RepositoryId, name: &str) -> Self {
+    #[cfg(not(unix))]
+    let _ = id;
     Self {
+      #[cfg(unix)]
       id,
       name: name.to_owned(),
+      #[cfg(unix)]
       repos: format!("/{name}"),
     }
   }
@@ -1594,7 +1647,8 @@ async fn run_svn_hook(
 }
 
 /// No hook runs on Windows yet (the hook driver is Unix's alone, A-622 part 3): a point where the repository configures
-/// one refuses its change in the not-run words, as before A-730, and a point with none lets it go on.
+/// one refuses its change in the not-run words, as before A-730, and a point with none answers as `svnserve` does with
+/// none (`vcs_hooks::svn_told_unconfigured`): pre-revprop-change refuses every change (E165006), the rest go on.
 #[cfg(not(unix))]
 async fn run_svn_hook(
   policy: &slates_db::catalog::RepositoryPolicy,
@@ -1608,11 +1662,20 @@ async fn run_svn_hook(
     .hooks
     .iter()
     .any(|hook| HookPoint::of(hook.point) == point);
+  let unconfigured = match vcs_hooks::svn_told_unconfigured(point) {
+    Some(vcs_hooks::SvnTold::Failure(chain)) => Err(
+      chain
+        .into_iter()
+        .map(|error| (error.code, error.message))
+        .collect(),
+    ),
+    _ => Ok(()),
+  };
   HookAnswer {
     verdict: Some(if configured {
       Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
     } else {
-      Ok(())
+      unconfigured
     }),
     post_commit_error: None,
     token: None,

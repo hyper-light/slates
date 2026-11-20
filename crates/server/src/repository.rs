@@ -75,6 +75,8 @@ pub(crate) mod svn_commit;
 // The import verb (A-678): a Mercurial repository's directory imported into the repository's store through
 // `vcs_store::hg_import`, the request answered when the import ends.
 pub(crate) mod import;
+// The export verb (A-652 part 3): a Subversion repository's range of revisions written as a dump into a new volume.
+pub(crate) mod svn_export;
 
 /// Format: where RFC 4122's form puts a `-` among a UUID's sixteen bytes, written as two hexadecimal digits each:
 /// before bytes 4, 6, 8 and 10 (8-4-4-4-12 digits).
@@ -567,6 +569,15 @@ pub(crate) fn branch_version(
   Ok(version)
 }
 
+/// A branch's name as the owner's verbs give it, spelled as `record`'s namespace holds it: a Mercurial repository's
+/// names its bookmarks (`hg_push::owner_name`), every other tool's as given.
+fn spelled(record: &RepositoryRecord, name: &str) -> String {
+  match record.tool {
+    slates_db::catalog::VcsTool::Mercurial => hg_push::owner_name(name),
+    _ => name.to_owned(),
+  }
+}
+
 /// `CreateBranch` (module docs): branch `name` of `repository` at `version` of branch `from`, made without a walk.
 /// Answered `GreenCreated` with the new member.
 pub(crate) fn create_branch(
@@ -579,7 +590,11 @@ pub(crate) fn create_branch(
     Ok(record) => record,
     Err(reply) => return *reply,
   };
-  let Some(source) = state.db.partition().repositories().branch(record.id, from) else {
+  if let Some(reply) = no_subversion_branch(&record) {
+    return reply;
+  }
+  let (name, from) = (spelled(&record, name), spelled(&record, from));
+  let Some(source) = state.db.partition().repositories().branch(record.id, &from) else {
     return refused(Refusal::NotFound);
   };
   let version = match branch_version(state, source, version) {
@@ -598,7 +613,7 @@ pub(crate) fn create_branch(
   let made = record_branch(
     state,
     principal,
-    (&record, name),
+    (&record, &name),
     (source, version),
     require_evidence,
   );
@@ -616,6 +631,8 @@ pub(crate) fn create_branch(
     engine.set_rejected_budget(budget);
   }
   crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new(), (None, None));
+  // Git's site serves every name the namespace binds (A-743): the new branch's ref, at the commit it was made at.
+  crate::vcs_store::commits::branch_made(state, id);
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
   }
@@ -678,10 +695,13 @@ pub(crate) fn bind_branch(
     Ok(record) => record,
     Err(reply) => return *reply,
   };
+  if let Some(reply) = no_subversion_branch(&record) {
+    return reply;
+  }
   // One entry of the repository's register (A-603), whose guard binds a member of this lineage only.
   let entry = next_entry(state, record.id).map(|mut entry| {
     entry.names.push(NameChange::Bind {
-      name: name.to_owned(),
+      name: spelled(&record, name),
       green: to_db_volume(green),
     });
     entry
@@ -690,6 +710,19 @@ pub(crate) fn bind_branch(
     Ok(()) => ReplyBody::Acknowledged,
     Err(refusal) => refused(refusal),
   }
+}
+
+/// The refusal of a lineage branch verb on a Subversion repository (§4.17.4: the repository is one green whose version N
+/// is revision N, and a branch is a directory in it, made by a copy a client commits): `Unsupported`, by kind, so no verb
+/// makes a green no Subversion path serves or unbinds the one they serve; none for another tool's repository.
+fn no_subversion_branch(record: &RepositoryRecord) -> Option<ReplyBody> {
+  (record.tool == slates_db::catalog::VcsTool::Subversion).then(|| {
+    refused(Refusal::Unsupported {
+      feature: "a branch of a Subversion repository as a green of its own: Subversion's branches are directories in \
+                its one green, made by a copy (`svn copy`)"
+        .to_owned(),
+    })
+  })
 }
 
 /// `RetireBranch` (module docs): `name` leaves the namespace and its green stays a member. Answered `Acknowledged`.
@@ -702,10 +735,13 @@ pub(crate) fn retire_branch(
     Ok(record) => record,
     Err(reply) => return *reply,
   };
+  if let Some(reply) = no_subversion_branch(&record) {
+    return reply;
+  }
   // One entry of the repository's register (A-603).
   let entry = next_entry(state, record.id).map(|mut entry| {
     entry.names.push(NameChange::Retire {
-      name: name.to_owned(),
+      name: spelled(&record, name),
     });
     entry
   });

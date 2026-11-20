@@ -110,7 +110,7 @@ fn segment_words(geometry: &Geometry) -> Words {
           at.saturating_add(SUP_SSH_HOST_SEED),
           SSH_HOST_SEED_BYTES,
         ))
-        // The stuck task's record (A-740): its written word, shard, polls and label length, then the label's words.
+        // Format: the stuck task's record (A-740): four words (written, shard, polls, label length), then the label.
         .with(WordRun::strided(
           at.saturating_add(SUP_STUCK_WRITTEN),
           size_of::<u64>(),
@@ -807,7 +807,7 @@ impl AnchorSegment {
       .word_at(spec, SUP_STUCK_LABEL_LEN)?
       .store(u64::try_from(len).unwrap_or(0), Ordering::Relaxed);
     for (index, chunk) in bytes.chunks(size_of::<u64>()).enumerate() {
-      let mut word = [0u8; 8];
+      let mut word = [0u8; size_of::<u64>()];
       word
         .get_mut(..chunk.len())
         .unwrap_or_default()
@@ -959,6 +959,40 @@ impl AnchorSegment {
     );
     record.fill(0);
     Ok(Some(parsed))
+  }
+
+  /// What of a region is in RAM, and written where the OS says (`slates_mem::resident`, A-744): the kernel's page
+  /// table read, no byte of the segment touched.
+  pub fn region_residency(
+    &self,
+    kind: RegionKind,
+  ) -> Result<slates_mem::resident::Residency, AnchorError> {
+    let range = self.range(self.spec(kind)?)?;
+    Ok(
+      self
+        .object
+        .residency(range.start, range.end.saturating_sub(range.start))?,
+    )
+  }
+
+  /// [`AnchorSegment::region_residency`] of `len` bytes at `at` within the region, a span past the region refused
+  /// (`Geometry`): what a caller walking a large region a bounded step at a time asks (A-744). Words and payloads alike:
+  /// the kernel's page table is read, no byte.
+  pub fn region_residency_of(
+    &self,
+    kind: RegionKind,
+    at: usize,
+    len: usize,
+  ) -> Result<slates_mem::resident::Residency, AnchorError> {
+    let range = self.range(self.spec(kind)?)?;
+    let start = range
+      .start
+      .checked_add(at)
+      .filter(|start| start.saturating_add(len) <= range.end)
+      .ok_or(AnchorError::Geometry {
+        reason: "a residency span past its region",
+      })?;
+    Ok(self.object.residency(start, len)?)
   }
 
   /// A region's length in bytes.

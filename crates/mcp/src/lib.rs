@@ -902,6 +902,13 @@ struct McpError {
 /// daemon is its own code so an agent can distinguish "refused" from "gone".
 fn refusal(e: ClientError) -> McpError {
   match e {
+    ClientError::Refused(slates_ipc::protocol::Refusal::CopyRefused { path, case }) => McpError {
+      code: code::REFUSED,
+      message: format!(
+        "CopyRefused: the copy to {path} is refused: {}",
+        copy_case_name(case)
+      ),
+    },
     ClientError::Refused(refusal) => McpError {
       code: code::REFUSED,
       message: format!("{refusal:?}"),
@@ -915,6 +922,21 @@ fn refusal(e: ClientError) -> McpError {
       code: code::REFUSED,
       message: other.to_string(),
     },
+  }
+}
+
+/// The name a refused copy's case is reported by (A-586; main's ruling of 2026-11-20): every case of the wire's
+/// `CopyCase` by an exhaustive match, so a case appended to the wire breaks this build until this surface names it.
+pub fn copy_case_name(case: slates_ipc::protocol::CopyCase) -> &'static str {
+  use slates_ipc::protocol::CopyCase;
+  match case {
+    CopyCase::Root => "root",
+    CopyCase::PastHead => "past_head",
+    CopyCase::SourceEmpty => "source_empty",
+    CopyCase::VersionFolded => "version_folded",
+    CopyCase::OutsideNodeChanged => "outside_node_changed",
+    CopyCase::ChangedSourceLink => "changed_source_link",
+    CopyCase::LinkAcrossCopy => "link_across_copy",
   }
 }
 
@@ -1118,8 +1140,10 @@ fn tool_list() -> Vec<Value> {
       "slates.merge.declare",
       "Declare a namespace op on a work (the counterpart to edit). `op.kind` is one of unlink{path}, \
        rename{from,to}, mkdir{path}, rmdir{path}, set_mode{path,mode}, symlink{path,target}, \
-       link{path,target}, set_xattr{path,name,value}, remove_xattr{path,name}.",
-      json!({ "work": string, "op": { "type": "object", "properties": { "kind": string, "path": string, "from": string, "to": string, "target": string, "name": string, "value": string, "mode": integer }, "required": ["kind"] } }),
+       link{path,target}, set_xattr{path,name,value}, remove_xattr{path,name}, \
+       copy{from,to,version?,replace?} (`from`'s tree at the green's `version`, the work's base when absent, \
+       copied to `to` by reference; `replace` takes the place of what `to` holds).",
+      json!({ "work": string, "op": { "type": "object", "properties": { "kind": string, "path": string, "from": string, "to": string, "target": string, "name": string, "value": string, "mode": integer, "version": integer, "replace": { "type": "boolean" } }, "required": ["kind"] } }),
       json!(["work", "op"]),
     ),
     tool(
@@ -1441,6 +1465,27 @@ pub fn windows_json(windows: &[slates_ipc::protocol::MergeWindow]) -> Value {
   )
 }
 
+/// The `kind` an op object names `op` by on this surface, or none where MCP offers no such op: every operation of
+/// the wire's `WorkOp` named here by an exhaustive match, so an operation appended to it breaks this build until MCP
+/// decides whether and how to offer it (A-626 part 4's lesson: a copy verb reached the wire and no surface had it).
+/// A declared device or named pipe (`Mknod`) carries the declaring host's metadata, which a model has no way to know,
+/// so MCP offers none.
+pub fn work_op_kind(op: &WorkOp) -> Option<&'static str> {
+  match op {
+    WorkOp::Unlink { .. } => Some("unlink"),
+    WorkOp::Rename { .. } => Some("rename"),
+    WorkOp::Mkdir { .. } => Some("mkdir"),
+    WorkOp::Rmdir { .. } => Some("rmdir"),
+    WorkOp::SetMode { .. } => Some("set_mode"),
+    WorkOp::Symlink { .. } => Some("symlink"),
+    WorkOp::Link { .. } => Some("link"),
+    WorkOp::SetXattr { .. } => Some("set_xattr"),
+    WorkOp::RemoveXattr { .. } => Some("remove_xattr"),
+    WorkOp::Mknod { .. } => None,
+    WorkOp::Copy { .. } => Some("copy"),
+  }
+}
+
 /// Reads a `WorkOp` from an `op` object (§4.16): `kind` names the operation, the rest are its fields.
 /// The `WorkOp` enum stays inside the server — its wire form is this plain JSON object.
 fn work_op_from(op: &Value) -> Result<WorkOp, McpError> {
@@ -1477,6 +1522,12 @@ fn work_op_from(op: &Value) -> Result<WorkOp, McpError> {
     "remove_xattr" => WorkOp::RemoveXattr {
       path: path(op)?,
       name: string_arg(op, "name")?,
+    },
+    "copy" => WorkOp::Copy {
+      from: string_arg(op, "from")?,
+      to: string_arg(op, "to")?,
+      version: op.get("version").and_then(Value::as_u64),
+      replace: op.get("replace").and_then(Value::as_bool).unwrap_or(false),
     },
     other => {
       return Err(McpError {
@@ -2160,6 +2211,33 @@ fn group_json(g: &GroupReport) -> Value {
   })
 }
 
+/// Format: the prefix of a shard's content-range figures among its counters (A-744; the server's
+/// `content_ranges::PREFIX`): `content_range.<range>.<figure>`.
+const CONTENT_RANGE_PREFIX: &str = "content_range.";
+
+/// A shard's slice of the anchor content object, range by range (A-744): `{range: {figure: bytes}}` from its
+/// `content_range.<range>.<figure>` counters, the figures `bytes`, `resident`, `modified` (where the OS says) and the arena's
+/// `allocated`.
+fn content_ranges_json(counters: &[slates_ipc::protocol::RefusalCount]) -> Value {
+  let mut ranges = serde_json::Map::new();
+  for counter in counters {
+    let Some(rest) = counter.kind.strip_prefix(CONTENT_RANGE_PREFIX) else {
+      continue;
+    };
+    let Some((range, figure)) = rest.split_once('.') else {
+      continue;
+    };
+    if let Some(entry) = ranges
+      .entry(range.to_owned())
+      .or_insert_with(|| json!({}))
+      .as_object_mut()
+    {
+      entry.insert(figure.to_owned(), json!(counter.count));
+    }
+  }
+  Value::Object(ranges)
+}
+
 /// One shard's block of the daemon's status as JSON (§4.14): the fields the text form prints per
 /// shard, its health signals, and its telemetry drain when gathered.
 fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
@@ -2168,7 +2246,13 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "clients": s.clients,
     "volumes": s.volumes,
     "served": s.served,
-    "refusals": s.refusals.iter().map(|r| json!({ "kind": r.kind, "count": r.count })).collect::<Vec<_>>(),
+    "refusals": s
+      .refusals
+      .iter()
+      .filter(|r| !r.kind.starts_with(CONTENT_RANGE_PREFIX))
+      .map(|r| json!({ "kind": r.kind, "count": r.count }))
+      .collect::<Vec<_>>(),
+    "content_ranges": content_ranges_json(&s.refusals),
     "replayed_records": s.replayed_records,
     "replay_ns": s.replay_ns,
     "torn_tail": s.torn_tail,
@@ -2191,6 +2275,7 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "target_leases": s.target_leases,
     "nfs_calls": s.nfs_calls,
     "registry_attachments": s.registry_attachments,
+    "repositories": repositories_json(&s.repositories),
     "telemetry": telemetry.map(telemetry_json),
   })
 }
@@ -2203,6 +2288,43 @@ pub fn signal_json(s: &Signal) -> Value {
     "value": s.value,
     "absence": s.absence.name(),
     "freshness_ns": s.freshness_ns,
+  })
+}
+
+/// Each repository's usage row in `slates status` (A-724), apart so the status object stays within `json!`'s recursion.
+fn repositories_json(repositories: &[slates_ipc::protocol::RepositoryUsageReport]) -> Value {
+  Value::Array(
+    repositories
+      .iter()
+      .map(|r| {
+        json!({
+          "name": r.name,
+          "intakes_begun": r.intakes_begun,
+          "intakes_answered": r.intakes_answered,
+          "intake_steps": r.intake_steps,
+          "intake_step_ns": r.intake_step_ns,
+          "intake_bytes_in": r.intake_bytes_in,
+          "fetches_begun": r.fetches_begun,
+          "fetch_step_ns": r.fetch_step_ns,
+          "first_ns": r.first_ns,
+          "last_ns": r.last_ns,
+          "longest_intake_step_ns": r.longest_intake_step_ns,
+          "push_phases": push_phases_json(r),
+        })
+      })
+      .collect(),
+  )
+}
+
+/// A repository's git push steps by phase in `slates status` (A-724's profile), apart so the status object stays within
+/// `json!`'s recursion.
+fn push_phases_json(r: &slates_ipc::protocol::RepositoryUsageReport) -> serde_json::Value {
+  json!({
+    "longest_ns": r.longest_push_phases_ns,
+    "steps": r.push_phase_steps,
+    "ns": r.push_phase_ns,
+    "gap_ns": r.push_phase_gap_ns,
+    "first_gap_ns": r.push_first_gap_ns,
   })
 }
 

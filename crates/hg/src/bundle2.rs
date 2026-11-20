@@ -451,6 +451,18 @@ impl<'a> Bundle2<'a> {
     self.encode_into(out)
   }
 
+  /// Appends every event and the stream's end, without the magic and parameters: the parts a stream begun elsewhere
+  /// ends with (A-745: a `getbundle` answer written a slice at a time, its first part's payload streamed).
+  pub(crate) fn encode_parts(&self, out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+    let mut state = Replay::default();
+    for (at, event) in self.events.iter().enumerate() {
+      state.event(self, at, *event, out)?;
+    }
+    state.finish(self.events.len())?;
+    out.put(&END.to_be_bytes());
+    Ok(())
+  }
+
   /// Writes the stream: magic, parameters, every event, the end.
   fn encode_into(&self, out: &mut impl Out) -> Result<(), EncodeRefusal> {
     out.put(&MAGIC);
@@ -827,6 +839,27 @@ impl Replay {
     }
     Ok(())
   }
+}
+
+/// Appends a stream's magic and its empty parameter block: the head of a stream written a slice at a time (A-745).
+pub(crate) fn put_stream_head(out: &mut Vec<u8>) {
+  out.put(&MAGIC);
+  out.put(&0_i32.to_be_bytes());
+}
+
+/// Appends `part`'s header, its length first: a part whose payload is streamed after it (A-745).
+pub(crate) fn put_part_header(part: &Part<'_>, out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+  let header = encode_header(part)?;
+  put_length(out, header.len(), "part header")?;
+  out.put(&header);
+  Ok(())
+}
+
+/// Appends one payload chunk of a streamed part (A-745); the empty chunk, its end.
+pub(crate) fn put_payload_chunk(out: &mut Vec<u8>, chunk: &[u8]) -> Result<(), EncodeRefusal> {
+  put_length(out, chunk.len(), "payload chunk")?;
+  out.put(chunk);
+  Ok(())
 }
 
 /// Writes one payload chunk: its length, never 0, then its bytes.

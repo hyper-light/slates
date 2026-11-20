@@ -93,9 +93,10 @@ impl StoreLender for ShardStores {
   }
 
   /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
-  /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]).
+  /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]); waited for
+  /// at most one liveness window, past which the answer begins and a task finishes the encoding behind it.
   async fn encode(&mut self, id: RepositoryId) {
-    super::git_encode::settle_encodings(id).await;
+    super::git_encode::encode_for_fetch(id).await;
   }
 }
 
@@ -229,6 +230,14 @@ impl ShardPacks {
 
 impl PackSource for ShardPacks {
   type Pack = Streamed;
+
+  /// The shard's step quantum, begun now, on the shard's clock (§4.3; A-745): a fetch's choice of its pack's objects
+  /// stops between units once it is spent.
+  fn turn(&self) -> impl FnMut() -> bool + 'static {
+    let began = slates_rt::futures::now_ns();
+    let quantum = self.quantum_ns;
+    move || slates_rt::futures::now_ns().saturating_sub(began) >= quantum
+  }
 
   fn begin(
     &mut self,

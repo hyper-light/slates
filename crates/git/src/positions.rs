@@ -4,6 +4,10 @@
 //! runs however many objects it holds. These are the run containers of a compressed bitmap [A: Lemire, Ssi-Yan-Kai and
 //! Kaser, "Consistently faster and smaller compressed bitmaps with Roaring", Software: Practice and Experience 46,
 //! 2016], kept alone because this data is runs. A position is below `u64::MAX`, which the repository never gives.
+//!
+//! It is the crate's, not the store's: the negotiation's answer and the pack's plan carry the objects they send as
+//! positions too (A-745: a fetch holds what it sends as runs, never an object at a time), and the negotiation names no
+//! store.
 
 /// A set of positions as runs (module docs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -155,24 +159,47 @@ impl Positions {
     self.difference(other).is_empty()
   }
 
-  /// Adds `position` (A-639): in constant time at the end, as positions given in order arrive; anywhere else by a
-  /// union.
+  /// Adds `position` (A-639): in constant time at the end, as positions given in order arrive; anywhere else in place
+  /// ([`Positions::insert_new`]).
   pub fn insert(&mut self, position: u64) {
+    self.insert_new(position);
+  }
+
+  /// Adds `position` in place, wherever it falls (A-745: a walk meets positions in any order, a commit walk from the
+  /// newest down): whether the set did not hold it. Halving finds the run it falls in or beside; it extends that run or
+  /// the next, joins the two, or begins a run of its own, moving no more than the runs after it.
+  pub fn insert_new(&mut self, position: u64) -> bool {
     let end = position.saturating_add(1);
-    match self.runs.last().copied() {
-      Some((_, last)) if last == position => {
-        if let Some(run) = self.runs.last_mut() {
+    let after = self.runs.partition_point(|run| run.0 <= position);
+    let before = after.checked_sub(1);
+    let previous = before.and_then(|at| self.runs.get(at)).copied();
+    if previous.is_some_and(|run| position < run.1) {
+      return false;
+    }
+    let joins_previous = previous.is_some_and(|run| run.1 == position);
+    let next = self.runs.get(after).copied();
+    let joins_next = next.is_some_and(|run| run.0 == end);
+    match (joins_previous, joins_next, before) {
+      (true, true, Some(at)) => {
+        let next_end = next.map_or(end, |run| run.1);
+        if let Some(run) = self.runs.get_mut(at) {
+          run.1 = next_end;
+        }
+        self.runs.remove(after);
+      }
+      (true, false, Some(at)) => {
+        if let Some(run) = self.runs.get_mut(at) {
           run.1 = end;
         }
       }
-      Some((_, last)) if last < position => self.runs.push((position, end)),
-      None => self.runs.push((position, end)),
-      Some(_) => {
-        *self = self.union(&Positions {
-          runs: vec![(position, end)],
-        });
+      (false, true, _) => {
+        if let Some(run) = self.runs.get_mut(after) {
+          run.0 = position;
+        }
       }
+      _ => self.runs.insert(after, (position, end)),
     }
+    true
   }
 
   /// The least position the set holds at `from` or after it (A-639): the first run that ends after `from`, found by
@@ -180,5 +207,34 @@ impl Positions {
   pub fn next_from(&self, from: u64) -> Option<u64> {
     let at = self.runs.partition_point(|run| run.1 <= from);
     self.runs.get(at).map(|run| run.0.max(from))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::BTreeSet;
+
+  use proptest::prelude::*;
+
+  use super::Positions;
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+    /// A-745 (a walk inserts positions in any order). Do: insert random positions, repeats among them, in the order
+    /// drawn, into a set and into an ordered set beside it. Expect: after each insert, the same answer to "was it new",
+    /// the same members, and runs kept in their one form (each non-empty, ascending, a gap between each two), so the
+    /// set is equal to the set its members make.
+    #[test]
+    fn a745_positions_inserted_in_any_order_are_the_set_they_make(drawn in proptest::collection::vec(0u64..200, 0..300)) {
+      let mut set = Positions::new();
+      let mut model = BTreeSet::new();
+      for position in drawn {
+        prop_assert_eq!(set.insert_new(position), model.insert(position));
+        prop_assert!(Positions::from_runs(set.run_pairs().to_vec()).is_some(), "{:?}", set);
+      }
+      prop_assert_eq!(set.iter().collect::<Vec<_>>(), model.iter().copied().collect::<Vec<_>>());
+      prop_assert_eq!(set, Positions::of(model.into_iter().collect()));
+    }
   }
 }

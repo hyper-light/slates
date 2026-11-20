@@ -79,6 +79,7 @@ fn a_made_history_is_the_one_stock_7_2_commits() {
     &[Change {
       path: b"a",
       after: Some((b"a\n", Flag::Regular)),
+      copied_from: None,
     }],
     (b"default", b"one"),
   );
@@ -90,10 +91,12 @@ fn a_made_history_is_the_one_stock_7_2_commits() {
       Change {
         path: b"b",
         after: Some((b"b\n", Flag::Executable)),
+        copied_from: None,
       },
       Change {
         path: b"a",
         after: Some((b"a2\n", Flag::Regular)),
+        copied_from: None,
       },
     ],
     (b"default", b"two"),
@@ -105,6 +108,7 @@ fn a_made_history_is_the_one_stock_7_2_commits() {
     &[Change {
       path: b"a",
       after: None,
+      copied_from: None,
     }],
     (b"stable", b"three"),
   );
@@ -124,6 +128,7 @@ fn a_version_that_changes_nothing_or_names_no_parent_makes_none() {
     &[Change {
       path: b"a",
       after: Some((b"a\n", Flag::Regular)),
+      copied_from: None,
     }],
     (b"default", b"one"),
   );
@@ -137,6 +142,7 @@ fn a_version_that_changes_nothing_or_names_no_parent_makes_none() {
   let same = [Change {
     path: b"a",
     after: Some((b"a\n", Flag::Regular)),
+    copied_from: None,
   }];
   assert_eq!(
     made(&held, one.0, &same, &authored, &mut room()).err(),
@@ -146,5 +152,208 @@ fn a_version_that_changes_nothing_or_names_no_parent_makes_none() {
     made(&held, [7; 20], &same, &authored, &mut room()).err(),
     Some(Unmade::ParentUnknown)
   );
+  index.release(&mut store).unwrap();
+}
+
+/// A-729 part 2 (an import's record holds a manifest as the delta the index keeps it as). Do: make a history of 64
+/// files and then 15 changesets each changing one, kept in an index (whose manifests are kept as deltas, A-729 part 1);
+/// write its record (`record::write`) and the record of the same revisions with every text whole
+/// (`record::write_kept`); replay the first into an empty index. Expect the delta record less than half the whole one,
+/// and the replayed index the made one row for row, so the record of the next is the same bytes.
+#[test]
+fn an_imports_record_holds_its_manifests_as_deltas_and_replays_row_for_row() {
+  use crate::import::record;
+  use crate::push::verify::LogOf;
+  let mut store = ContentStore::new(1 << 26, WINDOW).unwrap();
+  let mut index = HgIndex::new();
+  let paths: Vec<Vec<u8>> = (0..64)
+    .map(|file| format!("src/file-{file:02}.rs").into_bytes())
+    .collect();
+  let added: Vec<Change<'_>> = paths
+    .iter()
+    .map(|path| Change {
+      path,
+      after: Some((b"fn main() {}\n", Flag::Regular)),
+      copied_from: None,
+    })
+    .collect();
+  let mut head = commit(
+    (&mut index, &mut store),
+    NULL_NODE,
+    &added,
+    (b"default", b"add"),
+  )
+  .0;
+  let bodies: Vec<Vec<u8>> = (0..15)
+    .map(|at| format!("fn main() {{ {at} }}\n").into_bytes())
+    .collect();
+  for (at, body) in bodies.iter().enumerate() {
+    let change = [Change {
+      path: &paths[at],
+      after: Some((body, Flag::Regular)),
+      copied_from: None,
+    }];
+    head = commit(
+      (&mut index, &mut store),
+      head,
+      &change,
+      (b"default", b"change"),
+    )
+    .0;
+  }
+  let deltas = record::write(&index, &store, u64::MAX).unwrap();
+  let mut logs = vec![(LogOf::Changelog, 0), (LogOf::Manifests, 0)];
+  logs.extend(
+    index
+      .file_logs(&store)
+      .map(|path| (LogOf::File(path.to_vec()), 0)),
+  );
+  let whole = record::write_kept(&index, &store, &logs, u64::MAX).unwrap();
+  assert!(
+    deltas.len() * 2 < whole.len(),
+    "{} bytes with deltas against {} whole",
+    deltas.len(),
+    whole.len()
+  );
+  let mut replay_store = ContentStore::new(1 << 26, WINDOW).unwrap();
+  let mut replayed = HgIndex::new();
+  let counted = record::replay(&deltas, &mut replayed, &mut replay_store).unwrap();
+  assert_eq!(counted.manifests, 16);
+  let rows = |index: &mut HgIndex, store: &ContentStore| -> Vec<(Vec<u8>, Vec<u8>)> {
+    index
+      .rows()
+      .iter(store)
+      .map(|row| (row.key().to_vec(), row.body().to_vec()))
+      .collect()
+  };
+  assert_eq!(rows(&mut replayed, &replay_store), rows(&mut index, &store));
+  assert_eq!(
+    record::write(&replayed, &replay_store, u64::MAX).unwrap(),
+    deltas
+  );
+  replayed.release(&mut replay_store).unwrap();
+  index.release(&mut store).unwrap();
+}
+
+/// Shape: stock 7.2's nodes for `one` (add `a`), `two` (`hg cp a b`) and `three` (`hg cp a c`, then `c` changed to
+/// `c2`), committed as the tests above commit (recorded 2026-11-20, macOS arm64, this Mac, mercurial 7.2 from
+/// Homebrew): each changeset's node and its manifest's.
+const COPIED: [(&str, &str); 3] = [
+  (
+    "951f20955075c11a8299b5dd1a8970f1eeb80bf5",
+    "a0c8bcbbb45c63b90b70ad007bf38961f64f2af0",
+  ),
+  (
+    "d0f53d73335f5ec35939a4529932b829993da8b5",
+    "0796472117e33ad9d223297bb640055aca5b0c18",
+  ),
+  (
+    "a726b80c089129ea379db9cb6f4c6fa1c39c9731",
+    "db0d8a056f0a17c5f68d3fffb7245b2019926030",
+  ),
+];
+
+/// A-731 (a copy, A-626 part 4). Do: make `one`, then `two` copying `a` to `b` unchanged, then `three` copying `a` to
+/// `c` with other bytes, as stock 7.2 committed them. Expect each changeset's and manifest's node stock 7.2's: the
+/// copy's file revision names its source and the source's node (`copy`, `copyrev`) with a null first parent, its
+/// bytes the copy's own.
+#[test]
+fn a_copy_is_made_as_stock_7_2_commits_one() {
+  let mut store = ContentStore::new(1 << 24, WINDOW).unwrap();
+  let mut index = HgIndex::new();
+  let plain = |path: &'static [u8], bytes: &'static [u8], copied_from| Change {
+    path,
+    after: Some((bytes, Flag::Regular)),
+    copied_from,
+  };
+  let one = commit(
+    (&mut index, &mut store),
+    NULL_NODE,
+    &[plain(b"a", b"a\n", None)],
+    (b"default", b"one"),
+  );
+  assert_eq!(one, (node(COPIED[0].0), node(COPIED[0].1)));
+  let two = commit(
+    (&mut index, &mut store),
+    one.0,
+    &[plain(b"b", b"a\n", Some(&b"a"[..]))],
+    (b"default", b"two"),
+  );
+  assert_eq!(two, (node(COPIED[1].0), node(COPIED[1].1)));
+  let three = commit(
+    (&mut index, &mut store),
+    two.0,
+    &[plain(b"c", b"c2\n", Some(&b"a"[..]))],
+    (b"default", b"three"),
+  );
+  assert_eq!(three, (node(COPIED[2].0), node(COPIED[2].1)));
+  index.release(&mut store).unwrap();
+}
+
+/// A-729 part 2 (an import's record holds a file revision as its delta against the one before). Do: make a history of
+/// one file grown by a line in each of 40 changesets, kept in an index; write its record (`record::write`) and the record
+/// of the same revisions with every text whole (`record::write_kept`); replay the first into an empty index. Expect the
+/// delta record less than half the whole one (18,755 bytes against 54,482 when written, the changesets whole), the
+/// replayed index the made one row for row, and its record the same bytes.
+#[test]
+fn an_imports_record_holds_a_files_revisions_as_deltas_and_replays_row_for_row() {
+  use crate::import::record;
+  use crate::push::verify::LogOf;
+  let mut store = ContentStore::new(1 << 26, WINDOW).unwrap();
+  let mut index = HgIndex::new();
+  let bodies: Vec<Vec<u8>> = (1..=40)
+    .map(|lines| {
+      (0..lines)
+        .map(|line| format!("line {line} of a file that grows a line a changeset\n"))
+        .collect::<String>()
+        .into_bytes()
+    })
+    .collect();
+  let mut head = NULL_NODE;
+  for body in &bodies {
+    let change = [Change {
+      path: b"grown.txt",
+      after: Some((body, Flag::Regular)),
+      copied_from: None,
+    }];
+    head = commit(
+      (&mut index, &mut store),
+      head,
+      &change,
+      (b"default", b"grow"),
+    )
+    .0;
+  }
+  let deltas = record::write(&index, &store, u64::MAX).unwrap();
+  let mut logs = vec![(LogOf::Changelog, 0), (LogOf::Manifests, 0)];
+  logs.extend(
+    index
+      .file_logs(&store)
+      .map(|path| (LogOf::File(path.to_vec()), 0)),
+  );
+  let whole = record::write_kept(&index, &store, &logs, u64::MAX).unwrap();
+  assert!(
+    deltas.len() * 2 < whole.len(),
+    "{} bytes with deltas against {} whole",
+    deltas.len(),
+    whole.len()
+  );
+  let mut replay_store = ContentStore::new(1 << 26, WINDOW).unwrap();
+  let mut replayed = HgIndex::new();
+  let counted = record::replay(&deltas, &mut replayed, &mut replay_store).unwrap();
+  assert_eq!(counted.file_revisions, 40);
+  let rows = |index: &mut HgIndex, store: &ContentStore| -> Vec<(Vec<u8>, Vec<u8>)> {
+    index
+      .rows()
+      .iter(store)
+      .map(|row| (row.key().to_vec(), row.body().to_vec()))
+      .collect()
+  };
+  assert_eq!(rows(&mut replayed, &replay_store), rows(&mut index, &store));
+  assert_eq!(
+    record::write(&replayed, &replay_store, u64::MAX).unwrap(),
+    deltas
+  );
+  replayed.release(&mut replay_store).unwrap();
   index.release(&mut store).unwrap();
 }

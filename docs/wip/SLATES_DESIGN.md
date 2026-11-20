@@ -1374,6 +1374,20 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > in the same time (BENCHMARKS.md). `slates status --json` prints each shard's `retained_bytes` and `retained_versions`,
 > and the control shard's `mem.large.*` give-back counters.
 
+> **Status (2026-11-20, A-744: the anchor's memory, range by range).** `slates status --json` prints, per shard,
+> `content_ranges`: its slice of the anchor content object (write log, image slots, delta log, DAX range table, chunk
+> arena with its allocated bytes) and its partition's regions of the anchor segment (log ring, snapshot slots), each
+> with its bytes, the bytes in RAM and the bytes written where the OS says (`slates_mem::resident`, the kernel's page
+> table), swept in bounded steps a status request. After a 1,000-revision Subversion import, 584.7 MiB of the anchor's
+> written pages are the owner partition's segment log ring (355.2 MiB) and snapshot slots (225.8 MiB); the content
+> object holds 2.3 MiB (BENCHMARKS.md).
+
+> **Status (2026-11-20, A-746: the register by record kind).** `content_ranges` adds `register_log` (the log since the
+> last snapshot) and `register_snapshot` (the last snapshot), each by repository records, green chain entries,
+> checkpoints and the rest (`slates_db::replay::RegisterSplit`), and the arena's `prefault_reserve`. After the
+> 1,000-revision import the owner partition's register holds 222.4 MiB of repository records, 133.1 MiB of chain
+> entries and 137.4 MiB of checkpoints (BENCHMARKS.md).
+
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
 **Data model.**
@@ -4596,7 +4610,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
   write the share it was given. It is read in the SETXATTR form the stream's INIT kept, the extended one where the
-  guest's kernel kept `FUSE_SETXATTR_EXT`, as the dispatch reads every other SETXATTR (A-587). It is taken from the
+  guest's kernel kept `FUSE_SETXATTR_EXT`, as the dispatch reads every other SETXATTR (A-587), each request's form read
+  from its own bytes, since one sized before INIT's reply arrived is short whatever INIT kept (A-741). It is taken from the
   guest's root on the stream's root alone, and refused otherwise
   as Shards' own server refuses it: `EPERM` from any other caller, `EINVAL` on any other node or for a value that is
   no `UID:GID`. From then on the guest is shown the owner the volume keeps for the stream's root as the run's owner,
@@ -7977,15 +7992,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`live_ship::judge_held_destroys`), answered `Refusal::DurabilityPending { held_ns }` and counted
 > `fleet.live.held_gave_up` (`fleet.destroy.held_gave_up`), with what durability lacked logged. Through a shorter
 > silence the writer still waits, as the 2026-11-05 sweep chose (a writer waits, never a false success), so a candidate
-> stopped for a few liveness budgets still answers the write when it resumes. The refusal is recorded as the request's
-> completion, as a fence's is, so a retry under the same id meets it (§4.9); the verb's effects stay committed on the
-> owner, never claimed durable, and a consumer runs the verb again under a new id (slates-api's
-> `RetryCause::DurabilityPending`, CONTRACT 22). A retry that joined a request's wait is answered with it, judged by the
-> request's first hold. Held by
-> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`
+> stopped for a few liveness budgets still answers the write when it resumes. Since 2026-11-20 (main's ruling, A-354's
+> amendment) the verb's own reply is recorded as the request's completion and the refusal is delivered unrecorded
+> (`live_ship::answer_given_up`): the verb took effect once on the owner, so its resend under the same id is answered its
+> own reply (§4.9) and a verb never takes effect twice. The client sends a `DurabilityPending` request again under its id
+> itself, once, on the sync and the async path (`slates_client::Client`), so a caller is handed that reply. A retry that
+> joined a request's wait is answered with it, judged by the request's first hold. Held by
+> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`
 > (`crates/server/tests/fleet.rs`: both survivors refuse the owner's register records, so a new live volume's head never
-> places; the write refused after 10.03 and 10.08 s, the same request answered the same refusal, and the write sent again
-> answered `FsDone` once the refusals lifted).
+> places; a directory made through the raw ring is refused at the failover delay, and its resend answered `FsDone`; one
+> made through `slates_client` is answered `FsDone`; each listed once). Until then the refusal was the recorded
+> completion and a consumer told to make the call again ran the verb a second time (g226).
 >
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
@@ -11668,7 +11685,10 @@ never the whole work. A verdict crosses from the copy that computed it to the ow
 `Computed::encode`): the units in the order the work's are visited, each its effects as the chain entry records them
 (content by reference to the increment's post-state), its windows and where its content ops stood; the owner reads it
 back against the increment it judged (`Green::computed_from`), each effect rebuilt as a replay rebuilds it, a splice left
-unmade for the commit to make.
+unmade for the commit to make. Its route (A-658 part 3b, built by A-697 part c, behind A-697's test hook until its last
+piece): a holder's work composes its increment, the holder's replica computes its verdict, and `SubmitComputed`
+carries both to the owner, which commits it by `Green::submit_computed` (`judge_computed`, then `commit_judged` at once)
+inside the submit's own step.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -12258,6 +12278,88 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > call, the checks reading commits and trees back from the store, the push holding none of their bytes). Owed: the
 > convergence plan's S3 (A-722: blobs as the push work's file ops, the git store an index); admission by the working
 > set; the verdicts and the seal a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
+
+**A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
+mirrored).** One server serves tens of thousands of concurrent clones, many of one repository, so an answer is held to
+four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, and Subversion's report cite:
+1. *Its working set is bounded whatever the repository's size.* The answer is made from what is stored (S5: revisions
+   kept as the deltas they arrived as, or the index's deltas) and sent as it is made, a slice at a time. Nothing holds
+   the whole answer, every text it sends, or a list of every revision it sends: across slices a fetch holds its place
+   (the log, the revision next), the one text a delta is made against, and tables of a bit or a word a changeset where
+   the protocol's order needs them (the missing set), charged as below.
+2. *Admission charges the slice in flight.* Each slice's bytes are charged to the request's room as they are made and
+   given back once sent; the tables of rule 1 are charged once, at the start. The answer's whole size never meets the
+   room, so a request's room bounds a slice, never a repository.
+3. *Every slice runs a turn at a time* under the shard's step quantum (§4.3), the repository's view lent for that turn
+   alone; a yield between slices.
+4. *Fetches run concurrently, one repository's too.* A fetch reads the index as it stood when it began (a hold on that
+   generation, given back as it ends), so a push landing meanwhile neither stops it nor changes its answer.
+
+> **Status (2026-11-20, A-745).** Red, by use: a clone whose answer is past one request's room is refused
+> `PastAdmission` (`vcs_http::daemon_edge`'s `a_mercurial_clone_larger_than_one_ring_region_...`, ignored until it
+> passes; w-interop's clone of Mercurial's 57,035 revisions, `asked: 228144, left: 218727`). Mercurial's `getbundle`
+> built the whole answer, then framed it. Piece 1 BUILT: `slates_hg::serve::getbundle::Answering` makes it a slice at a
+> time, each step its own room, a clone of every head walked by its links (7.2's `fastpathlinkrev`: the missing
+> changesets as ranges, the manifest log, then the file logs row to row through `HgIndex::file_revision_from`), any
+> other fetch by the changesets that name each revision (7.2's slow path, bounded by what it sends). Piece 2a BUILT:
+> HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
+> shard's room and quantum, the stream compressed as it is made; the red passes. Piece 2b BUILT: SSH the same
+> (`Stdio::stream`, `vcs_ssh::hg`). Rule 4 BUILT: a streamed answer holds its generation (`hg_view::Generation`, a
+> fork of the index with the register's roots and bookmarks), every turn lent a view over it. Piece 3 BUILT: the stream
+> clone (`stream_out`) is sent a row at a time (`slates_hg::render::Streaming`, counted first from the rows alone).
+> Owed: `stream2`, git's upload-pack (w-git).
+> **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
+> fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
+> none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
+> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). **Piece 2a BUILT (same
+> day):** the walk keeps what it meets as runs too (`negotiation::Held`: the paint's three sets, the commits sent, what
+> the client holds, the objects chosen, the trees done and opened, a `tree:` filter's depths aside), charged a run as a
+> set's runs grow, and its queue and stacks at their longest (`negotiation::Peak`), never once an entry pushed: a clone
+> of 3,000 commits pushed in one piece, 9,000 objects, is negotiated within 4 KiB (it was refused there, `PastAdmission`).
+> Positions met in no order (a set the store gave piece by piece) cost a run an object, 16 bytes against the 8 the sets
+> charged; one push's order costs a run a kind or less. **Piece 2b part 1 BUILT (same day):** the choice of what a pack
+> sends one by one is made a unit at a time (`negotiation::begin`, then `Negotiating::step` until its owner's quantum is
+> spent, at least one unit a step, a commit from the walk's queue or an entry from a tree walk's stack, its place kept:
+> the commit walk, what the client holds, the sent commits' trees, the wants, `include-tag`); `negotiate` is the same
+> stepped to its end, and a sparse walk's frames are held while they live, given back as they are left. Held to the
+> negotiation's oracle and to the whole answer on 1,024 generated requests stepped a unit at a time. **Piece 2b part 2
+> BUILT (same day):** `upload::serve_in_turns` answers a protocol v2 `fetch` with the sections before its pack encoded
+> from what `begin` decided, and `Answer::write_within` chooses the pack's objects within its owner's quantum (the
+> repository lent for each write), then begins the pack; a choice refused, or a pack that cannot begin, after those
+> sections ends the response with git's band-3 words, as a pack refused midway ends. `serve` still chooses them before
+> it answers. Every upload test's exchange is answered both ways and held to the same bytes and refusal (its counters
+> too, but where a `sparse:oid` blob dies unread: in turns it dies before any walk, as git's `pack-objects` does).
+> **Piece 3a BUILT (same day):** a walk's set keeps whichever form is smaller, runs or a bit table over its span
+> (`negotiation::Held`, Roaring's choice): a push's commits interleaved with their trees and blobs, every third
+> position, cost a bit each (3,000 of them about 1.1 KiB a set, where runs cost 48 KB); and a pack is framed in packets
+> of at most a quarter of the room left as it begins (`answer::packet_data`), the format's most where the room holds it
+> four times over, so the two packets it is framed through fit a request's room (they had cost two whole pkt-lines,
+> 128 KiB, past one ring region). A-582's clone is answered whole within 4 KiB, the same pack in more packets; with
+> each request held to 64 KiB, the 3,000-commit clone over the daemon's edge is answered whole, where it was refused
+> `the request needs more room than the server admits`. **Piece 3b BUILT (same day):** both edges admit a fetch the
+> edge's request room (or the shard's, where less: A-713's `StoreLender::room` now bounds it, never sets it) and answer
+> it in turns, the pack source's `turn` the shard's step quantum on the shard's clock (`ShardPacks`); an SSH session
+> dies as git's does on a refusal the answer gives as it is written. By use: the 3,000-commit clone over the daemon's
+> HTTP edge, each request one ring region, and the same history pushed and cloned over the SSH edge, each request 64
+> KiB, its pack far larger, each answered whole. Owed for git: protocol v0's fetch in turns, `begin`'s `ready` and cut
+> and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a run), and a fetch held to the index
+> generation it began on (rule 4); the live `git clone` rows of the matrix (main's).
+> **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
+> newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
+> both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
+> 278,528 B room. DAV's ran to 8.3 ms and 410,243 B. Each slice stopped only once its bytes had reached the room, so its
+> last call (a whole text window) went past it, and the drive was handed the room, or the nodes it may hold open, as one
+> call's step allowance. Now each slice of the editor drive (`report::exchange::Exchange::receive` for svn:// and
+> svn+ssh, `dav::update::UpdateWalk::resume` for a REPORT) stays within its room except for one call larger than the
+> room alone. A call that would pass the room after others is held whole and written first by the next slice. A slice
+> takes the drive a step at a time until the shard's quantum has run (`Budget::quantum`, the caller's clock). Rule 4: a
+> report, or a read streamed over many calls, holds its records' generation (`svn_view::SvnHold`). A rebuild or
+> removal meanwhile keeps those records aside, still charged, until the last hold drops (`vcs_store::keep_held_svn`).
+> The oracle is the whole room's bytes (stock `svnserve`'s, `update.c`'s): every room's slices make the same bytes. CI
+> also checks working copies against `svnadmin load`'s over `file://`. By use after (`diag-w-bugs-svnfetch-6`), the
+> working copies match svnadmin's over both edges after a checkout, an update back 500 revisions and the update forward.
+> The largest slice is 99,424 B on svn:// and 136,865 B on DAV. Rule 3 is still owed: one drive step, a text window's
+> delta, takes up to 4.7 ms on svn:// and 6.5 ms on DAV, so a window must be made in pieces (`report::drive`).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -14430,7 +14532,9 @@ markers and topics, which git has no counterpart for, are decided here.
    the second in one entry. A new named branch (`--new-branch`) is a line made at its first parent's version (item 4
    there). A closing changeset (`close=1`) is one more version, and its line stays, closed, as `branchmap` reports
    closed heads.
-2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. A bookmark moves only
+2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. The owner's branch
+   verbs name it as Mercurial does (`topic`), spelled `bookmark:topic:` in the namespace; a line's or bookmark's
+   namespace spelling passes as it is (A-575, `hg_push::owner_name`). A bookmark moves only
    when a push names it (the `bookmarks` part or a `bookmarks` pushkey), and every move is a compare and swap on the old
    value the client sent (a pushkey "should succeed iff value was old" [C: `pushkey.py`]; `check:bookmarks` [B:
    `internals.bundle2`]), so the head operation decides it as it decides a git ref. A deletion retires the green.
@@ -14593,6 +14697,9 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 Status (A-729 part 1, the index's storage): a manifest is kept as its delta against the one before while its chain's
 delta bytes stay within its text's length (derived, as 7.2's `deltas.py` bounds a delta), else whole; every reader
 rebuilds it through `HgIndex::revision_text`.
+Status (A-729 part 2): a push's record is its changegroup as it arrived (`SHGR` version 2), replayed through the same
+intake; the landing appends deltas, never texts. An import's record (version 3) writes each delta-kept manifest as its
+delta and base; a made changeset's record (version 3) its manifest as its delta against its first parent's.
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
 working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
 push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
@@ -14981,6 +15088,21 @@ and export by landing).
 > one, a copy from a version its source changed after, and Subversion's replace with history (a copy onto a path its
 > own increment removes), each in the A-586 entry.
 >
+> **Status (2026-11-20, A-586's hard link in a copied tree; main's ruling).** Built: a copy of a tree holding hard links.
+> The rule, a snapshot's: names in the copied tree that share a node keep sharing one new node in the copy (a copied
+> link names its node's copy); a name whose node lies outside the copied tree gets a node of its own in the copy,
+> holding that node's bytes, mode or IPC node, its bytes named by the content they hold. Derived at the commit from the
+> head before the copies land (`Green::copy_link_effects`), as a node's moves are, so a replay and a checkpoint hold the
+> same; a copy whose outside nodes changed after its version is refused.
+>
+> **Status (2026-11-20, A-586's copy refusals typed; main's ruling).** A copy this piece does not make is refused before
+> any verdict, by a submit and a rebase alike, as `Refusal::CopyRefused { path, case }` (the wire's `CopyCase`; the
+> engine's `CopyRefusal`), never a conflict: no concurrent change caused it and no rebase answers it. Refusals FSFS's
+> commit makes too: `Root` (the root as destination), `PastHead` (a source version past the head), `SourceEmpty`.
+> Following from retention: `VersionFolded` (the version's values folded away). Owed work, refused until built:
+> `OutsideNodeChanged` (a link naming an outside node changed since the version), `ChangedSourceLink` (a hard link in a
+> source changed since its version), `LinkAcrossCopy` (a rename or hard link declared across a copied tree's edge).
+>
 > **Status (2026-11-19, A-626 part 1).** Built: the engine's replace with history (`REPLACE`, a flag on `Copy`: the
 > destination's tree taken away key by key at the copy's version, judged as a removal against the base) and copies
 > nested in one increment, a second copy into a new branch and a move inside one (a copy and a removal) among them, so
@@ -15184,7 +15306,20 @@ and export by landing).
 > Subversion's error number, the revision being loaded and the path; the end answers `DumpImported`. Held to
 > `part1.dump` exported again byte for byte after its import through the daemon and after a rebuild from the log, and
 > to `part1.dump` then `part2.dump` exporting `full.dump`. Owed: the export verb (a range written as a dump into a
-> volume and landed under a grant); an import resumed across a restart.
+> volume and landed under a grant; built since, below); an import resumed across a restart.
+>
+> **Status (2026-11-20, A-652, part 3 continued: the export verb).** Built: a range of a Subversion repository's
+> revisions written by the daemon as the dump `svnadmin dump` writes for it (`slates-server`'s
+> `repository::svn_export`; A-628's exporter). `ExportDump { repository, first, last, deltas, name }`, for the
+> repository's owner, writes format 2, or format 3 with `deltas`, a range starting after revision 0 incrementally, into
+> a new volume `name` holding it as `DUMP_FILE` in its root, which the caller lands under a grant (§4.15, R10) or reads
+> through a mount. A task of the owner shard walks the range twice, a revision a unit within the shard's slice: the
+> first measures, so the volume is admitted exactly; the second writes a copy slice at a time, so no dump is ever held
+> whole, and a second walk that made other bytes than the first is refused, nothing kept; the volume's record, its
+> publication and the request's completion one atom. Refused by kind first: another tool's repository
+> (`Unsupported`), a range the repository does not hold (`BadRequest`, `svn_repos_dump_fs4`'s words), a name taken
+> (`AlreadyExists`). Held to `full.dump`, `part2.dump` (format 3, revisions 4 to 13) and `deltas.dump` written again
+> byte for byte from a history imported through the daemon. Owed: the CLI's and the SDKs' words for both verbs.
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -15715,6 +15850,12 @@ client's: it asks for mergeinfo, logs with merged revisions, location segments a
 copy and commits the result as any commit. The server never merges file contents (§2 ban 11).
 
 *Branches, tags, stacks, rebases and reviews* (what §4.17.1 leaves to this section).
+- The repository's lineage verbs (`CreateBranch`, `BindBranch`, `RetireBranch`; `slates repository branch`) are refused
+  `Unsupported` by kind on a Subversion repository (2026-11-20, found by reading after A-622's CLI verbs): a green of
+  its own is no branch any Subversion client reaches, and the root's binding is what every path serves. A branch is
+  made as a stock client makes one, by a copy it commits (`svn copy ^/trunk ^/branches/b`). Held by
+  `vcs_svn::tests::a_subversion_repositorys_branch_verbs_are_refused_by_kind` (each verb refused, the repository
+  served after them; before, `CreateBranch` answered `GreenCreated`).
 - A branch or a tag is a directory made by a copy of any path at any revision; Subversion has no other kind. Policy
   protects a path prefix (`/trunk`, `/tags/**`) as §4.17.1's policy protects a green's name pattern: who may commit
   under it, whether a directory under `/tags` may change after the revision that made it, what evidence a commit under
@@ -16053,8 +16194,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
    as its history, and a history exported as a dump for migration, each a server verb over the index and the records
    with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
-   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the import's wiring built,
-   A-652 part 3; the export's owed).
+   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the import's and the
+   export's wiring built, A-652 part 3).
    `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
    property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
@@ -22553,8 +22694,18 @@ named below, BENCHMARKS, GAPS.
 
 Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1, on main since
 2026-11-17 (g231). Step two (a work on the creating client's node, with the forward lanes of
-`crates/server/src/forward_lane.rs`) is not built: a `CreateWork` forwarded from another node still places the work on
-the green's shard. A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+`crates/server/src/forward_lane.rs`) is being built by A-697, with production routing unchanged until its last piece: a
+`CreateWork` forwarded from another node still places the work on the green's shard. Part a1 (2026-11-20): the green's
+owner admits a work another node will hold by `AdmitWork`, a forwarded verb, judging the relayed principal's rights from
+its green's record and recording the work's floor at the head (`verbs::admit_work`, `verbs::owner_admit`). Part a2
+(2026-11-20, behind the test hook `Daemon::serve_works_on_holders`): a holder makes the work on its client's partition,
+asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. Part b
+(2026-11-20): the holder moves and drops the work's floor at the owner by `MoveWorkFloor` (`work_home::tell_floor_over_fleet`,
+`verbs::move_work_floor`). Part c (2026-11-20): a holder's submit is committed by the verdict its replica computed,
+taken by position at the owner (`work_home::verdict_over_fleet`, `SubmitComputed`, `Green::submit_computed`). Part d
+(2026-11-20): the submit settles once the holder's replica holds the version (`work_home::hold_until_replica`,
+`replica_reached`). Part e (2026-11-20): a holder's work is recovered from its log over the holder's replica
+(`work_home::holder_replay`, `Unbuilt::holder`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22573,7 +22724,15 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     answered there with no hop between shards; only what needs the green crosses to the owner. Its name is held at the
     partition the name hashes to, as every name is: by an alias of the work's id when that is another partition
     (A-236's reservation, asked before the green's admission, confirmed once the creation commits). A creation
-    forwarded from another node is served on the green's owner, which places it there. Until A-400 a work was placed on
+    forwarded from another node is served on the green's owner, which places it there. Amended by A-697 (being built;
+    in force behind a test hook until its last piece): a node holding the green's replica makes the work itself, on
+    its client's partition, so the work's id names that node; the green's owner admits it by `AdmitWork`, forwarded,
+    judging the rights from its green's record and holding the base by the work's floor; and the work's base reads are
+    answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
+    by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
+    replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b), the submit answered once the
+    node's replica holds the version it made; after a restart it comes back from its log over the node's replica.
+    Its rebase, a copy it submits, and takeover follow in A-697's later parts. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -32965,9 +33124,22 @@ Applied in the same change to:
 - `crates/server/src/live_ship.rs`: `Awaiting::held_since_ns`, `judge_held` (at the period's visit to a live volume),
   `judge_held_destroys` (once a period on each shard), `held_past` (a request's entries judged by its first hold),
   counters `fleet.live.held_gave_up` and `fleet.destroy.held_gave_up`. `crates/server/src/verbs.rs`: the refusal's name.
-- Tests: `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`
+- Tests: `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`
   (`crates/server/tests/fleet.rs`); `a_reply_held_past_its_durable_bound_is_a_retry` (`crates/api/src/error.rs`).
 - GAPS: the entry of 2026-11-18.
+
+**Amended 2026-11-20 (main's ruling on g226's finding): a verb never takes effect twice.** At the failover delay the
+verb's own reply, not the refusal, is recorded as its completion, in one durable step as every completion is (A-127's
+pattern, `verbs::record_completion`), and `DurabilityPending` is delivered unrecorded (`live_ship::answer_given_up`, for
+`judge_held` and `judge_held_destroys`). A resend under the same id is answered the verb's own reply. `slates_client`
+sends a `DurabilityPending` request again under its id once, itself (`Client::exchange` on the sync path,
+`resent_for_durability` on the async one), so every caller of the client is handed that reply. A yielded volume's
+waiters (A-409) still record `DurabilityPending`: their write was made on a copy the successor passed, so it never took
+effect there, and the same request run again goes to the successor. Why: the refusal recorded as the completion told a
+consumer to make the call again under a new id, which ran the verb a second time over its own effect: a directory's
+second making refused `AlreadyExists`, an append landed twice. Applied in the same change to: §4.10's status,
+`crates/server/src/live_ship.rs`, `crates/client/src/client.rs`, `crates/api/src/error.rs` (`RetryCause::DurabilityPending`),
+the test (renamed `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`), GAPS.
 - **What was there.** A deferred verb's reply ended only once its log was durable where its publication put it (or its
   tombstone placed), its owner fenced, or its volume destroyed. The 2026-11-05 sweep chose to keep the writer waiting
   rather than refuse it at the transports' silent window, and nothing bounded the wait: a log that could never be held
@@ -41082,7 +41254,7 @@ GAPS).
 - **Names.** The three tests that still said `failover_slo` after A-525 deleted the placeholder now name the failover
   delay they test: `a_held_replys_wait_ends_at_the_failover_delay_from_its_hold` (`crates/bridge-core/src/durable_bound.rs`,
   whose docs and reason line said "failover SLO" too),
-  `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again` and
+  `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply` and
   `the_failover_delay_ends_a_forwards_location_budget` (`crates/server/tests/fleet.rs`); their citations here and in
   GAPS follow.
 
@@ -52583,7 +52755,7 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name, its symbolic links `svn:special`
-  files; its copies owed until a work makes one); Mercurial's manifests by the
+  files, its copies copy-from rows); Mercurial's manifests by the
   same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
@@ -54843,6 +55015,26 @@ Applied in the same change to:
   and `place::tests::a_repositorys_index_rows_route_by_its_cut_and_the_cut_steps_one_bit_at_a_time`; slates-db `--lib`
   180 of 180, `--test model` 26 of 26, both `wire_order` goldens; slates-server `repository:: takeover:: vcs_ssh::
   vcs_http:: git_protect:: lfs:: vcs_policy:: vcs_share::` 236 of 236.
+- **Piece 7, with a hot repository's large packs (2026-11-20).** BENCHMARKS.md, "A hot repository pushing large
+  packs": with v1.5.0's 9.8 MB packs in the mix, capped at 5 or 3 pushes to one repository, the small repositories' p99
+  is 3.07 and 3.63 times their fair share (within it without large packs); the wait is daemon-wide, to be profiled. Ten
+  such pushes to one repository end the daemon (A-722's proof must hold at ten).
+- **The daemon's end at ten large pushes, fixed: a pack's waiting deltas resolve a delta a unit, in the answer's
+  turns (2026-11-20; main's ruling of 2026-11-20).** Profiled with new per-repository counters in `slates status`
+  (each repository's usage row, a push's steps, time, longest step and the wait before them by phase): the kill's cause
+  line at ten v1.5.0 pushes named `vcs_http.rs:1404` at its poll 595, and the longest input step was 1,435.7 ms:
+  `slates_git::unpack::Reader::finish_into` resolved every delta waiting at a pack's end, and their dependents, in the
+  input step that brought the trailer. Now `Reader::resolve_turn` resolves them under a quantum (one unit at least, a
+  unit applying one delta or listing one entry's waiting children; a thin pack's outside bases one table row a unit),
+  the session holds `State::Resolving` between turns, and `ReceivePack::check_turn` gives it the turns the checks
+  get. The red: `unpack::tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time` counts each step resolving
+  past its budget (64 deltas on one late base, a budget of four): 0 for the input step and 0 over every turn (the first
+  form of the fix, a base's children one unit, counted 1). By use (BENCHMARKS.md, "Waiting deltas resolved in
+  turns"): ten concurrent v1.5.0 pushes, 10 of 10 answered, the daemon alive, the longest input step 1.2 ms; v1.5.0
+  alone holds 424 to 438 MiB (about 758 before). Not the small repositories' wait: their counters show about 6,000
+  check turns a push of 23 µs each, each waiting about 91 µs for its shard, and about a second before the first step
+  still unaccounted, profiled next. Tests: slates-git 556 of 556; slates-server `git_push:: vcs_http::git:: vcs_ssh::
+  vcs_share:: vcs_store::upload::` 106 of 106; slates-ipc and slates-mcp whole.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -54930,6 +55122,22 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   committed image names is not reused before a newer image commits; (a3) the content table in the shard image and its
   recovery before the records; (b) git's record version 3; (c) Subversion's texts with A-716's slices; (d) replication's
   content-before-record order, held by the two-node test.
+- **Slice a2, landed (2026-11-20; main's ruling (ii)).** The windows are chunks of the volume store's own chunk store
+  (`vcs_store::arena_windows::ChunkWindows`), one arena and one budget (A-64): a second arena over the same pool was
+  tried first and found nothing to claim. The chunk store is lent to the content store per step by a swap
+  (`WindowStorage::lend_in`/`hand_back`, `ChunkStore::empty` the placeholder) under a guard (`vcs_store::Lent`, and
+  `lent_state` for a step over the whole state), so readers keep `&ContentStore` and nothing is unsafe; a lend inside
+  a lend takes nothing; outside one a read answers none and a put is refused `ContentRefused::Storage`, typed, and a
+  release frees its chunk at the next lend. A put the arena has no block for grows it from its pool, the lend's end
+  extending the shard budget by the growth. The swap moves a `ChunkStore` (560 bytes); its release cost is measured with the slice's by-use run.
+  Tests (merged with main, local, own target): `slates-server` lib 947 of 947 run (`content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`, A-744's, skipped: it spins a debug shard past its window here, alone too, and touches no repository code), `arena_windows::tests` 2 of 2; `slates-vcs` 100, `slates-hg` 356, `slates-git` 557. Slice a2 step 1's three red `slates-vcs` tests read windows through `get()`, which lends only content held Here; they read through `bytes_of`/`len_of` now.
+- **Slice a3 (2026-11-20).** The windows' table rides the shard image as held pieces (kind 11, one a window: identity,
+  length, block), whole in a checkpoint and by its changes in a delta. A recovery claims every block they name before
+  the volumes and before `commit_live`, hands the windows to the content store made at the first replay, held for no
+  one; the replay's puts hold them again by identity, storing nothing, and the rest are freed once every record is
+  replayed (`vcs_store.windows_restored`, `.windows_unrestored`, `.windows_unheld`). Test
+  `daemon::tests::t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image`. Owed: records naming
+  identities only (slice b, with w-balance's name rows and the `homes` tickets); a homed window's holders.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
@@ -55381,6 +55589,117 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   vcs_http::git:: git_hooks::` 91 passed and one hook test past its bound under load (load average 71), passing alone
   (3 of 3); fmt clean.
 
+### A-722 part 3 — A push's rows are written before its landing, which only makes them visible (2026-11-20, w-git for UI goal 93; A-722's design, point 1)
+- **Change.** The seal stages the whole push (`Repository::stage`): its fresh objects' positions by type then id from
+  the repository's next position (A-639's runs kept), their rows written into a fork of the index
+  (`Index::fork`, `insert_all`, `seal_all`), held by the push (`push::Staged`), the rooms lent (`stage_room`). The
+  landing adopts the fork (`Index::adopt`) when no other landing moved the next position or the index since; otherwise
+  it stages again and adopts that. Every landing adopts a fork, so the index's tables never depend on when a fork was
+  made and a store made again from the log equals the live one (replay stages at its seal too).
+- **Tests.** `slates-git` `store::tests::a_staged_push_lands_the_rows_it_wrote_before_its_landing`,
+  `two_pushes_staged_at_once_both_land_and_no_position_goes_unused`; the store's recovery tests (remade = live).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- store:: upload::
+  receive:: hook_view` 202 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- vcs_store:: git_push::
+  vcs_http::git:: vcs_http::daemon_edge:: git_hooks:: git_protect` 119 of 119; fmt clean. The 3,000-commit push over
+  the daemon's edge 2.0 s, its fetch 3.7 s (main 1.9 s, 4.1 s; load average 43).
+- **Owed (part 4).** The seal's staging pass and the moves' admission sliced; the landing's remaining whole passes
+  (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
+  intake.
+
+### A-722 part 4b's race — A staging a landing overtakes is staged again, whatever step it was in (bug, 2026-11-20, w-git; found by reading after the 100-push run)
+- **Cause.** Part 4b made the stage's fork at its rows' step and read the next position at its positions' step, so a
+  push that landed during the staging's earlier turns could leave a stage that looked current (its fork made after
+  the landing) with positions or rows the landing had taken: a shared object's row met as `RowDiffers`, or two objects
+  at one position.
+- **Change.** The staging's first unit makes its fork and reads the next position (`Step::Forking`); every later step
+  carries them, and the stage records that base, so any landing in between leaves it stale and the commit stages it
+  again.
+- **Tests.** `slates-git` `store::tests::a_push_landed_while_another_is_staged_takes_no_position_of_the_others` (red:
+  `Index(RowDiffers)`); `slates-git --lib -- store:: receive::` 139 passed, 4 ignored; `slates-server --lib --
+  vcs_store:: git_push:: repository:: vcs_http::git` 170 passed; fmt clean (macOS arm64, this Mac, local).
+
+### A-722 part 4d — A replayed record's thin pack resolves its deltas a delta a unit (2026-11-20, w-git for UI goal 93)
+- **Change.** `slates_git::unpack::Reader::resolve_turn_with`: w-balance's resolution in turns (032617278) over the
+  reader's own keeper, a thin pack's outside bases read from the store; a git record's replay (`git_replay`) resolves
+  its pack's waiting deltas there, a delta a unit, before it admits the objects.
+- **Tests.** `slates-server` `git_push::tests::t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved`
+  (the fixtures' `create` and thin `update`, the store made again at a quantum of none: more turns than records, the
+  refs advertised alike).
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-server --lib -- vcs_store:: git_push:: repository::
+  vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 192 passed; fmt clean.
+
+### A-722 part 4c — A move is admitted a unit at a time before its append (2026-11-20, w-git for UI goal 93)
+- **Change.** `slates_git::store::Admitting` (`Repository::admitting`, `admit_turn`): A-614's admission of a move (the
+  walk of what it brings against the green's reached set, the fast-forward's descent by generation number, the search
+  for a base green, the walk beyond the base) cut into units, an object or a commit each; `Repository::admit` runs the
+  same units to their end. `slates_git::receive::Judge::ready` (default ready at once) lets a judge prepare a command
+  over turns before its verdict; the server's judge admits the command's move there (`SealedPush::admission_turn`, the
+  shard's step quantum a turn) and keeps it, and the append takes it whole while its green's head is still the one it
+  was admitted from (`SealedPush::admit`), admitting again otherwise.
+- **Measured** (debug, this Mac, one command bringing 3,502 objects of a 3,500-file tree, load 20 to 30): the work build
+  374 to 642 ms, the entry's apply 114 to 196 ms, the append's judge 67 to 86 ms, the store's commit 21 to 119 ms, the
+  store's admission 13 to 58 ms (now turns), the seal 59 to 163 ms (turns since part 4b). Sent to main: the work build
+  and the apply grow with the head's files and are the works' and merge's.
+- **Tests.** `slates-git` `store::tests::a_move_admitted_a_unit_a_turn_is_the_move_admitted_whole` (a create and a
+  fast-forward); `slates-server` `vcs_store::tests::t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands`.
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-git --lib -- receive:: store::` 138 passed, 4 ignored
+  (and `store:: upload:: receive:: hook_view` 204 before the receive change); `slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 185 passed; fmt clean.
+- **Owed.** The store commit's whole passes (members' positions, landed runs, holds' release) and a stale restage
+  sliced; the work build and the entry's apply (works, merge).
+
+### A-722 part 4b — A push is sealed and staged a unit at a time (2026-11-20, w-git for UI goal 93; main's ruling: what a push's landing ran whole held its shard past the watchdog's window at git/git's size)
+- **Change.** `slates_git::store::Staging` (`Repository::sealing`, `staging`, `stage_turn`): the seal and stage cut into
+  units, a turn taking as many as its quantum allows and one at least: a commit's generation number; a held object
+  checked against the index (a quarantine cursor, `Quarantine::object_after`); a new object's position, by type then
+  id from per-type running counts (no sort of the push); its object and position rows inserted into the fork; one table
+  of the fork's tail sealed (`slates_vcs::Index::seal_step`, which leaves exactly what `seal_all` leaves).
+  `Repository::stage` runs the same units to their end, so a push staged in one turn or many leaves the same tables
+  and a store made again from the log equals the live one. The server seals a push a turn at a time
+  (`vcs_store::SealingPush`, `git_push::AnswerState::Sealing`, a turn an answer step at the shard's step quantum), and a
+  replayed record's seal runs the same turns (`git_replay`). A push dropped mid-seal or mid-decision gives back what it
+  holds (found by reading: one dropped while its commands were decided kept its sealed push).
+- **Tests.** `slates-vcs` `tests::a_tail_sealed_a_table_a_step_is_the_tail_sealed_at_once`; `slates-git`
+  `store::tests::a_push_sealed_and_staged_a_unit_a_turn_lands_as_one_staged_whole`; `slates-server`
+  `vcs_store::tests::t_a722_p4_a_pushs_seal_takes_many_turns_and_lands`.
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-vcs --lib` 101 passed; `slates-git --lib -- store::
+  upload:: receive:: hook_view` 203 passed, 4 ignored; `slates-server --lib -- vcs_store:: git_push:: repository::
+  vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 181 passed, 1 ignored; fmt clean. The 3,000-commit push
+  over the daemon's edge 1.5 to 1.9 s and its fetch 2.6 to 2.9 s (three runs, load average 21 to 23; main 1.9 s, 4.1 s).
+- **Owed.** The moves' admission and the landing's whole passes (members' positions, landed runs, holds' release) and
+  a stale restage sliced; the replay's thin-pack resolve on w-balance's resolve-in-turns.
+
+### A-722 part 4a — A git record's pack is replayed a turn at a time (2026-11-20, w-git for UI goal 93; main's ruling: a large pack record's replay ran in one turn and crash-looped the daemon)
+- **Change.** `vcs_store::git_replay`: a version-2 record carrying a pack is decoded once as its replay begins (names,
+  moves and the pack's place in the record kept), then read a chunk at a time (`DaemonConfig::archive_slice_bytes_within`
+  of the turn) and its objects admitted one at a time, each turn held to the shard's step quantum and taking one unit
+  at least; the names compared, the seal, the moves and the commit at its end. A rebuild's turn and a recovery's unit
+  step it (`record_turn`); a replay under way is kept on the stores and given back if its rebuild is replaced. Owed,
+  sliced in turn: a thin pack's resolve of outside bases (`Reader::finish_with`, after w-balance's receive resolve
+  slicing lands), the seal's staging pass, the moves' admission and the landing's whole passes.
+- **Tests.** `slates-server` `vcs_store::tests::t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns`
+  (one record of 66 objects; red before: replayed in one turn); `t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn`
+  now a turn a record at least.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge` 165 passed, 1 ignored; fmt clean.
+
+### A-743 — Every name the namespace binds is a ref git's site serves (bug, 2026-11-20, w-git for UI goal 93; main's ruling; found by use by w-interop)
+- **Found by use.** Stock git 2.50.1 over the HTTP edge: a branch made with `slates repository branch create project
+  topic --from main` never showed in `git ls-remote --heads`. The advertisement listed each bound name whose green held a
+  git version in the store, and a branch the CLI made held none.
+- **Change.** `CreateBranch` records the new green's first store version, at its head version, naming the commit its
+  branch was made at (`vcs_store::commits::branch_made`, the made commit's parent rule), as a push of no objects moving
+  one ref is recorded, so it is replayed with the log. The advertisement, upload-pack's lender and a push all read it:
+  `RetireBranch` drops the ref, `BindBranch` brings it back, and a push to `refs/heads/topic` moves the green the CLI made.
+  A refusal is counted (`vcs_commits.branch_ref_unmade`).
+- **Tests.** `slates-server` `git_push::tests::t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_green`
+  (red before: `(false, false, false)`); `crates/cli/tests/git_interop.rs`
+  `stock_git_sees_the_branches_the_cli_makes_retires_and_binds` un-ignored and passing under stock git 2.50.1. The
+  atomic test's unborn CLI branch is now made at `main`'s version before its first push.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- git_push::tests
+  repository:: vcs_store:: vcs_http::git` 146 passed; `cargo test --locked -p slates-cli --test git_interop --
+  stock_git_sees_the_branches` 1 passed; fmt clean.
+
 ### A-664 live whole builds, the push storm — A push landing mid-build moves the build to the newest head at a slice's boundary, never starts it again (2026-11-20, w-shared for UI goal 93; main's ruling)
 - **Why.** Part 1 started a green's whole build again from nothing at every push that landed while it ran, so under
   a steady stream of pushes (the target is tens of thousands concurrent) a busy repository's build never ended.
@@ -55498,8 +55817,6 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `svn:special` list, which the records hold). `cargo test --locked -p slates-server --lib -- repository::svn_commit::
   vcs_svn vcs_store:: identities:: --test-threads=4` 102 of 102; fmt clean.
 
-
-
 ### A-742 — Freed memory returns to the OS, never by allocator luck: large allocations mapped directly, large temporaries made fewer and once (2026-11-20, w-engine; main's ruling; §4.2, D-12; A-723, A-728)
 
 Applied in the same change to: `crates/mem` (`large.rs`, the global allocator, its counters; `unsafe-budget.toml` +16);
@@ -55562,3 +55879,438 @@ control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, 
   takeover:: --test-threads=4` 307 of 309, the two others failing alike without this change (`vcs_store::homes`' and
   `vcs_http::daemon_edge`'s long history, each flaky alone, reported); fmt clean.
 - **Owed.** One git record (a large push's pack) is still one turn; a successor's rebuild (`make_whole`) is one step.
+
+### A-741 — A SETXATTR's form is the request's own: one sized before INIT was answered is short on a connection that kept the extended form (bug, 2026-11-20, w-k90-vendor, kiln goal 90; found by use: kiln's macOS microVM g266 drive refused a run's every write `EACCES`, intermittently; amends A-378 and A-587; §4.6)
+- **Why.** Linux sizes a `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c`
+  `fuse_setxattr`, lines 31-32 at master on 2026-11-20, sha256 89203290559bd37a:
+  `fc->setxattr_ext ? sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE`) and holds the request until `INIT`'s reply is in
+  (`fs/fuse/dev.c` `fuse_block_alloc`, lines 88-124, sha256 29cc467f872b1ef0; `fc->setxattr_ext` set in
+  `fs/fuse/inode.c` `process_init_reply`, line 1398). Shards' init sets its owner word (A-281) as it mounts the share,
+  often before its kernel took that reply, so the word travels in the short form on a connection that kept the
+  extended one. A Shards stream read it in the extended form alone (A-587), missed its name, and handed it to the
+  dispatch, which refused it `EOPNOTSUPP`; the run (uid 200000) was then shown its share owned by the host and refused
+  every create, append and removal `EACCES`. Recorded on the Mac Studio (kiln main 28ea7df79's vendored Slates, a
+  diagnostic of each stream request): `Init` kept `FUSE_SETXATTR_EXT`; then `SetXattr` node 1 uid 0, its body
+  `0d000000 00000000 "trusted.shards.owner\0" "200000:200000"`, errno 95; no owner word taken.
+- **Change.** `abi::setxattr_head(body, negotiated)`: on a connection that kept the extended form, the extended head is
+  read where the request's second 8 bytes are a known setter's flag (`FUSE_SETXATTR_ACL_KILL_SGID`) and a zero pad, the
+  short head otherwise: a name begins with its namespace, never a flag word and a zero word. The bridge's `SETXATTR`
+  and the stream's owner word both read through it; a body whose name ends nowhere stays `EIO`.
+- **Tests** (macOS arm64, Mac Studio, local, own target, 2026-11-20). `slates-bridge-fuse`
+  `shards_fs::tests::a741_an_owner_word_sized_before_init_was_answered_is_taken_on_a_stream_that_kept_the_extended_form`
+  (the recorded short word on an extended stream: the run named; red: left `None`) and `tests/shards_fs.rs`
+  `a741_a_setxattr_sized_before_init_was_answered_is_served_on_a_route_that_kept_the_extended_form` (a `user.` name
+  set short on an extended guest route reads back as set; red: errno 95). `--lib -- shards_fs:: bridge:: abi:: init::`
+  9 of 9, `--test shards_fs` 11 of 11 (A-378's ACL test among them), `slates-server --lib -- shards::` 11 of 11; fmt
+  clean. By use: kiln's macOS microVM g266 drive (`SLATES_E2E=1 VM_E2E=1 slates_e2e microvm::g266`, kiln main
+  28ea7df79 on the Mac Studio): without the change it failed on its first run three times running (every write
+  `EACCES`); with it vendored, six runs in a row passed (439, 355, 271, 303, 171 and 172 s).
+- **Owed.** kiln's re-vendor; the same race on slates' own FUSE mounts is closed by the same reader (a host kernel's
+  connection keeps no extended form, so its requests were never misread).
+
+- **A successor's rebuild too** (main's ruling, the same day): `takeover::rebuild_repository` makes the adopted
+  repository's store through `vcs_store::rebuild` (Mercurial's task, or this one), not `make_whole` in one step, since a
+  large repository's adoption would spin the successor's shard past the watchdog, the crash loop on another path. Its
+  test (`vcs_store::paths::tests::t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map`) asserts the
+  store rebuilding and lent to nothing after the takeover's step, then its map made by driving the turns and builds;
+  `cargo test --locked -p slates-server --lib -- takeover:: fleet::state_log_tests vcs_store:: repository:: git_push::
+  vcs_svn lfs:: --test-threads=4` 168 of 168.
+- **Owed.** One git record (a large push's pack) is still one turn (w-git, through the sliced intake).
+
+### A-626 part 4, the work verb — A work declares a copy (`WorkOp::Copy`), and its version holds the copied tree (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** A-626 parts 1 to 3 built the green's copy by reference and its rebase's restatement (`VolumeOp::Copy`,
+  `LoggedOp::Copy`, the owner's composition), but no client could ask a work for one: no `WorkOp` named a copy, so no
+  submitted version held one, and what reads a version's copies (a map's whole build, A-664; a Subversion revision's
+  copy-from rows) had nothing to read.
+- **Change.** `slates_ipc::protocol::WorkOp::Copy { from, to, version, replace }`, appended (wire order published):
+  `from`'s tree as version `version` of the work's green held it (the work's base when none) copied to `to` by
+  reference, replacing what `to` holds when `replace`. `verbs::declare` makes it the deriver's `VolumeOp::Copy`, which
+  the work logs (`LoggedOp::Copy`) and the green's owner composes against the copied tree
+  (`merge.work.copy_composed_by_owner`).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::paths::tests::
+  t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it` (`/d/a` submitted; a work copying `/d` to `/e` from its base:
+  version 2 accepted, its map built whole and equal to `d/a` and `e/a`, the green holding both, composed by the owner
+  once; A-664's owed copy through a work's whole build). `cargo test --locked -p slates-server --lib -- t_a626_p4
+  vcs_store:: verbs:: work_home:: work_log --test-threads=4` 135 of 135; `slates-ipc --test wire_order` published
+  (`WorkOp 10 Copy`); fmt clean.
+- **Owed.** The SDKs' (Python, Node), MCP's and the CLI's surfaces for a copy; Subversion's copy-from rows over it
+  (`vcs_store::svn_made`, next).
+
+### A-744 — The anchor's memory, range by range: the 581 MiB is the owner partition's durable register, not the content object; and A-742's leftovers (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.14, §4.17.1; A-64, A-420, A-626, A-727, A-742)
+
+Applied in the same change to: `crates/mem` (`resident.rs`, a mapped range's pages in RAM and written, by `mincore`;
+`SparseObject::residency`, `Region::residency`, `residency_of`; `unsafe-budget.toml` +1, named); `crates/anchor`
+(`AnchorSegment::region_residency`); `crates/server` (`content_ranges.rs`, the sweep the status report advances;
+`daemon::slice_start` visible; `repository::svn_commit::land` checkpoints first and appends once,
+`CHAIN_ROOM_CHECKPOINTED`); `crates/db` (`Partition::green_chain_room`); `crates/svn` (`Record::revision_bytes` reserved
+at its exact length); `crates/mcp` (a shard's `content_ranges`); §4.2's status; GAPS; BENCHMARKS.md.
+
+- **The question** (main's ruling): is the 581 MiB of written shared memory after the 1,000-revision import a green's
+  bytes in the content pool, so that A-64 for greens (a green's blocks in the pool) would remove a copy?
+- **The report.** For each shard, every range of its slice of the content object (write log, image slots, delta log,
+  DAX range table, chunk arena with its allocated bytes) and its partition's regions of the anchor segment (log ring,
+  snapshot slots): bytes, bytes in RAM, bytes written where the OS says (macOS's `MINCORE_MODIFIED`; Linux reports
+  residency alone; Windows is owed, a typed refusal). The kernel answers about 3 ns a page (1 GiB in 0.23 ms, 64 GiB in
+  11.9 ms on the Mac Studio), so a slice of tens of GiB of address space is past a turn: each status request advances
+  the shard's sweep for half its live step quantum, and the report is the last completed sweep with the count of sweeps.
+- **Measured** (three runs, identical): the owner shard's segment log ring 355.2 MiB written, its snapshot slots 225.8
+  MiB, 584.7 MiB with the rest of the shards' few pages; the content object's every range together 2.3 MiB; the arena
+  nothing allocated. So the 581 MiB is the durable register: the repository records and chain entries the import logged
+  (each revision's texts and increments) and the partition snapshot holding them again. A green's files are not in the
+  content object at all (A-742's design note: they are only the engine's), so A-64 for greens removes no resident copy
+  here; what it could still give is chain entries and checkpoints that name chunks instead of carrying bytes, which is
+  the same register's growth, and A-727 (w-perf: repository bytes out of the partition snapshot, records naming
+  identities) is aimed at it.
+- **The svn record** reserves its exact length (`revision_len`, `row_len`, `lock_len`, mirroring the encoder), so a
+  revision's record is one allocation, never grown.
+- **The svn commit** knows its chain entry's bound before the append (`entry_bound` of the increment's
+  `encoded_len`, with the copies' fixes' room, A-626), checkpoints the green first where the chains have less room
+  (`Partition::green_chain_room`), and appends once: the parts are moved into the entry, no copy kept for a retry.
+- **The log's decode-after-encode stays.** It is the measure of a record's replay work (A-420): timing the encode in
+  its place had let a record whose decode allocates what its encode copies (a thousand one-byte keys) replay past the
+  recovery budget. Its copy is a large temporary, which A-742's allocator returns to the OS at its free; removing the
+  copy needs a replay measure that does not decode, owed and main's call.
+- **Tests.** macOS arm64, Mac Studio, local: `slates-mem --lib resident` (written pages resident and modified, untouched
+  ones not modified), `large`; `slates-server --lib content_ranges` (a sweep completes within its bound and holds every
+  range to its bytes), `svn_commit` 13 (the chain-room checkpoint's counter moves where the merge budget is small),
+  `vcs_store::svn_import`; `slates-svn --lib commit::record` (every shape reserved at its exact length);
+  `slates-mcp --test mcp` (each shard's content ranges, none past its bytes); `cargo xtask unsafe` ok (slates-mem
+  80 of 80); fmt clean.
+
+### A-626 part 4, the work verb on every surface — `copy` on the CLI, both SDKs and MCP, each held to the wire's operations by an exhaustive match (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** A verb is done when every surface has it (R10: a copy is no grant verb, so the SDKs and MCP carry it too).
+  The surfaces named the wire's work operations by name, with no exhaustive match, which is how `WorkOp::Copy` reached
+  the wire with no surface having it and no build saying so.
+- **Change.** The CLI's `copy WORK FROM TO [--version N] [--replace] [--json]`; the Python SDK's `copy(work, from, to,
+  version=None, replace=False)` on `Client` and `AsyncClient`; the Node SDK's `copy(work, from, to, version?,
+  replace?)` on `Client` and `AsyncClient` (`beginSpinCopy`), typed in `index.d.ts`; MCP's `copy{from,to,version?,
+  replace?}` kind of `slates.merge.declare`, in its schema. MCP (`slates_mcp::work_op_kind`) and both SDKs
+  (`work_op_method`, exported as `work_op_methods()` / `workOpMethods()`) name each `WorkOp` by an exhaustive match, so
+  an operation appended to the wire breaks their builds until each decides whether and how to offer it (`Mknod`, a
+  declaring host's metadata, is offered on none of them); the SDKs' tests hold every listed method to both clients.
+- **Tests, by use against a real daemon** (macOS arm64, this Mac, local, own target, 2026-11-20). CLI:
+  `the_verbs_emit_json_with_the_json_flag` with `SLATES_TEST_CLI=1` (`merge_copy`: `/c/x.txt` lands, `copy WORK /c /e`
+  lands, `read GREEN /e/x.txt` streams it), and the argument parser's test; MCP: `cargo test -p slates-mcp --test mcp`
+  (`assert_copy_declared_and_read_back`, the in-process daemon); Python: `python -m unittest
+  crates/sdk-python/tests/test_sdk.py` with `SLATES_DAEMON` (4 of 4: the copy round trip read back by the CLI, and
+  every offered method on both clients), the extension built by `maturin develop`; Node: `node --test
+  tests/sdk.test.mjs tests/sdk_async.test.mjs` with `SLATES_NODE_ADDON` (the crate's cdylib) and `SLATES_DAEMON`, 9 of 9.
+- **Found by use** (reported, next piece): a copy of a tree holding a hard link is refused as a `TypeChanged` conflict at
+  its destination (A-586's "does not yet copy" case answering the wrong kind); the surfaces' tests copy a tree without
+  one.
+
+### A-652 part 3, continued — A Subversion repository's range of revisions exported by the daemon as a dump into a new volume, walked twice and never held whole (2026-11-20, g268 for UI goal 93 (kiln 51cef9f7); §4.17.4 piece 6; §4.15; R10; A-628, A-441, A-459)
+Applied in the same change to: §4.17.4 (a status block, piece 6's line, the import's status), GAPS (the §4.17.4
+entry), `crates/ipc` (`RequestBody::ExportDump` and `ReplyBody::DumpExported`, appended; `DUMP_FILE`; the routing of a
+repository's verbs; `tests/wire_order.txt`), `crates/server` (`repository/svn_export.rs` and its tests, new;
+`repository.rs`: the module's line; `verbs.rs`: the verb's route and dispatch; `image.rs`: `NameAlias`, `name_alias`,
+`reserve` and `settle` shared with the export; `vcs_store/svn_import.rs` and its tests: the import's test helpers
+shared with the export's).
+- **What was there.** A-628's exporter wrote a range of a repository's records as `svnadmin dump` writes it, in format
+  2 and, since A-652, format 3; only slates-svn's tests called it, over records they held themselves. The import's half
+  of part 3 brought a dump's history into a daemon's repository; nothing took one out.
+- **The verb.** `ExportDump { repository, first, last, deltas, name }` is served on the partition the repository's
+  name hashes to, for the repository's owner (`NotFound`, `Forbidden`). Refused by kind before anything is made: a
+  repository of another tool (`Unsupported`); a range the repository does not hold, in `svn_repos_dump_fs4`'s words
+  (`BadRequest`: "Start revision F is greater than end revision L", "End revision L is invalid (youngest revision is
+  Y)", `dump.c` 2072-2080 of Subversion's 1.15.x branch, read 2026-11-20); a name a volume, an alias or a work holds
+  (`AlreadyExists`); a request outside a recorded one (`Unsupported`). Where another partition holds the name, an
+  alias of it is reserved there before the volume is made and confirmed or released before the reply, as an archive's
+  is (A-236).
+- **The dump and its volume.** Format 2, or format 3 with `deltas` (`--deltas`), a range starting after revision 0
+  incrementally (`--incremental`), as A-628 writes it; written into a new plain volume `name`, bounded at the dump's
+  length rounded up to whole chunks (a write is charged its chunk window, §4.5), as the file `DUMP_FILE`
+  (`repository.dump`), readable and writable by its owner alone, owned as the root is. The disk is written only by the
+  caller's granted landing of the volume (§4.15, R10), or the file is read through a mount.
+- **Two walks, sliced, never held whole** (as A-459's archive). A task of the owner shard runs the export in slices of
+  the shard (`crate::image::sliced`), a revision a unit, a yield between slices: the first walk measures each
+  revision's records, hashes them (BLAKE3) and drops them, so the volume is admitted exactly; the second walks the range
+  again and writes each revision's records into the file a copy slice at a time (`DaemonConfig::copy_slice_bytes`),
+  hashing them as it goes. So the export holds one revision's records at most. A second walk that made other bytes than
+  the first measured (the revisions changed under it, as an import setting revision 0's properties does) is refused
+  `Unpublished` ("ask again"), counted (`repository.svn_export.walks_differed`), and the volume is given back. The
+  volume's record, its publication and the request's completion are one atom (`crate::image::complete`); the reply
+  `DumpExported { id, dump_bytes }` names the volume and the dump's length.
+- **Not taken (decided by the design, not measured).** One walk staging the whole dump before the volume is admitted:
+  it holds the whole history in memory once more, where two walks hold a revision. A volume that grows as the dump is
+  written (a dynamic volume): its admission could refuse midway, after work the exact admission refuses before.
+- **Tests** (`crates/server/src/repository/svn_export/tests.rs`). On a running shard, a history imported from
+  `part1.dump` and `part2.dump`, then revisions 0 to 13 in format 2 and 4 to 13 in format 3 asked under two requests:
+  both held, then both volumes published, their dump files `full.dump` and `part2.dump` byte for byte. Through the
+  job's two walks, a slice at a time: revisions 0 to 3 in format 2 as `part1.dump` and the whole range in format 3 as
+  `deltas.dump`, byte for byte. Revision 0's properties set through the owner's step between the walks: the second
+  walk refused `Unpublished`, counted once, the volume given back. Refused by kind: a repository nobody made, another
+  principal, a git repository, the two ranges in Subversion's words, the green's own name, and a request outside a
+  recorded one.
+- **Evidence** (w-svn, local, macOS arm64 MacBook, debug, 2026-11-20, over main 57839dd54): `cargo test -p
+  slates-server --lib -- repository::svn_export vcs_store::svn_import` 11 of 11, the two exports side by side byte for
+  byte (`full.dump` 223,752 bytes, `part2.dump` 112,741). Red first: the whole history's export refused
+  `AlreadyExists` naming the part's volume (both minted one fresh id at their walks' end), fixed by minting in the
+  publishing atom. Measured and owed: a unit is a whole revision (60 µs for 195 bytes, 2.4 ms for a 107 KB text,
+  against a 14 µs slice; `image.units_past_budget` 87), so the exporter must resume inside a revision (GAPS).
+- **Owed.** The CLI's and the SDKs' words for the import and the export; the export's volume landed by `slates land`
+  as any volume is (no new verb needed); main's runs (clippy, `xtask check`, the doc gate, Linux and Windows builds,
+  the mutation red-checks).
+
+### A-586's hard link in a copied tree — Names sharing a node share the copy's node; a name whose node lies outside gets one of its own (2026-11-20, w-shared for UI goal 93; main's ruling; found by use through MCP)
+- **Why.** A copy of a tree holding a hard link was refused (A-586: "does not yet copy"), and answered as a `TypeChanged`
+  conflict at the destination. An agent's workspace holds hard links routinely (`git clone --local` links its objects),
+  so the copy verb on every surface met it: MCP's by-use test did.
+- **The rule** (amended into A-586's status in §4.16 and `slates-merge`'s `engine/copy.rs` docs), as for a snapshot:
+  names in the copied tree that share a node keep sharing one new node in the copy; a name whose node also has a name
+  outside the copied tree, or lies outside it, gets a node of its own in the copy, holding the node's bytes, mode or IPC
+  node, its bytes named by the content they hold, never copied by the outside node.
+- **Change.** `Green::copy_link_effects`, called by `Green::commit` beside `node_moves`: for each copy, every hard link in
+  its source's tree becomes `Effect::Hardlink` naming its node's copy, or `RemoveHardlink` and the outside node's
+  `Special`, or its `Mode` and `SetContent` (`ContentSource::Copied`), applied after the graft; derived from the head,
+  never recorded, so a replay and a checkpoint hold the same. The verdict accepts a source holding hard links, refusing
+  only one whose outside nodes changed after the copy's version (`Green::outside_link_moved`): the head would not hold
+  what they held then.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-merge` `engine::copy_tests::
+  a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns_one` (an inside link names the copy's
+  node; an outside one is a file of its own with the node's bytes and mode; identity equal to its recount; a replayed
+  replica and a restored checkpoint read and hash alike); `a_copy_is_refused_typed_and_changes_nothing` (the refusal
+  now a copy from before its outside node changed); `cargo test --locked -p slates-merge --lib -- copy engine::` 163 of
+  163. `slates-server` `vcs_store::paths::tests::t_a626_p4_a_work_copies_a_tree_holding_a_hard_link` (red before: the
+  server's repro, refused `TypeChanged`), `-- t_a626_p4 vcs_store::paths:: vcs_store::commits::` 20 of 20; fmt clean.
+- **Owed.** The refusal kept, and A-586's other "does not yet copy" cases, answering their own typed refusals rather than
+  `TypeChanged` (next); a copy from before an outside node changed, read from its history.
+
+
+### A-746 — The register by record kind: chain entries and checkpoints lead (270.5 MiB) over repository records (222.4 MiB), so the next content-once step is a green's bytes named, not carried (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.16, §4.17.1; A-64, A-727, A-744)
+
+Applied in the same change to: `crates/db` (`replay::RegisterSplit`, `DbStats::tail_split` and `snapshot_split`, kept
+at each append and each snapshot); `crates/server` (`content_ranges`: the register's splits and the arena's
+`prefault_reserve`; `daemon::prefault_reserve_bytes`); §4.2's status; GAPS; BENCHMARKS.md.
+
+- **The question** (main's ruling): of the 581 MiB A-744 found in the owner partition's log ring and snapshot slots,
+  how much is repository records carrying texts, green chain entries carrying file bytes, checkpoints, and the rest?
+- **The split.** The log is counted as it is appended: each record's operations by what they carry (a green's advance
+  and origin, and the chain entries a repository entry carries for its greens; a checkpoint; a repository entry's
+  objects), the rest its other bytes; reset at each snapshot. A snapshot is counted when it is taken, its repository
+  registers', chains' and checkpoints' encoded lengths (exact: derived `Wire::encoded_len`), the rest the remainder.
+- **Measured** (three runs, identical): the log since the last snapshot 267.2 MiB (repository records 87.5, chain
+  entries 87.4, checkpoints 92.2, rest 0.1); the last snapshot 225.8 MiB, exactly its slot's resident pages (repository
+  records 134.9, chain entries 45.7, checkpoints 45.2). Over both, chain entries and checkpoints 270.5 MiB, repository
+  records 222.4 MiB. The ring's other 88 MiB in RAM (355.2 resident against the 267.2 live) are pages it released at its
+  last snapshot and never gave back. The prefault reserve was 0.
+- **The decision** (main's rule): chain entries and checkpoints lead, so a green's bytes named rather than carried is
+  next (A-742's design note, items 3 to 7: Files' blocks as chunk references through one block seam, chain entries and
+  checkpoints naming chunks), on A-727's seam with w-perf, agreed before code. The repository records go to A-727 (a3)
+  and S4 (w-perf, w-svn).
+- **Tests.** macOS arm64, Mac Studio, local: `slates-db --lib replay` (a record's bytes split by what its operations
+  carry), `--test model`; `slates-server --lib content_ranges`, `svn_commit`; `slates-mcp --test mcp`; fmt clean.
+- **Owed.** The log ring's released pages given back (as the write log's are, A-105); `projected_snapshot_bytes`
+  (A-724 piece 8) encodes a whole entry to read its length, where the derived `encoded_len` would do once every
+  field's is exact.
+
+### A-586's copy refusals typed — A copy this piece does not make is refused before any verdict by its own case, never a conflict (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** Each copy the engine does not make was answered as a `TypeChanged` conflict window at its destination, which
+  misnamed it: no concurrent change caused it and no rebase answers it.
+- **Change.** `slates-merge`: `CopyRefusal` (`Root`, `PastHead`, `SourceEmpty`, `VersionFolded`, `OutsideNodeChanged`,
+  `ChangedSourceLink`, `LinkAcrossCopy`), decided before any verdict (`Green::copy_refusal`, from `compute` and `rebase`;
+  `copy_fix` now answers its own two cases; `split_copies` keeps a rename or link across a copy apart from the invalid
+  document's paths), answered as `ComputeRefused::CopyRefused`, `Judgment::CopyRefused`, `Outcome::CopyRefused`,
+  `Rebased::CopyRefused` and `Landed::CopyRefused`. The wire: `Refusal::CopyRefused { path, case }` and `CopyCase`,
+  appended (wire order published); the server maps the engine's case by an exhaustive match (`verbs::copy_refused`) for a
+  submit, a rebase and a push's held judgment; `slates-api` types it `Invalid::Copy`; the Python and Node SDKs and MCP
+  name every case by an exhaustive match (`copy_case_name`), reporting "the copy to PATH is refused: CASE".
+- **Which is which.** Refused by FSFS's commit too: `Root`, `PastHead`, `SourceEmpty`. Following from retention:
+  `VersionFolded`. Owed work, kept visible: `OutsideNodeChanged`, `ChangedSourceLink`, `LinkAcrossCopy`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-merge` lib 224 of 224 (the refusal test's
+  five typed cases, the folded version, the rebase-equals-submit oracle refusing `LinkAcrossCopy` alike), `--test
+  engine --test checkpoint` 4 and 49; `slates-server` `vcs_store::paths::tests::t_a626_p4_a_copy_of_nothing_is_refused_by_its_case`
+  and the filters `t_a626_p4 vcs_store:: work_home:: verbs:: repository::` 192 of 192; `slates-api`
+  `a_copy_refusal_is_typed_invalid_by_its_case`; by use against a real daemon, a copy of nothing refused with its case:
+  MCP's test, the Python SDK 4 of 4, the Node SDK 9 of 9, the CLI's JSON flow (`SLATES_TEST_CLI=1`); `slates-ipc
+  --test wire_order` published; fmt clean.
+
+### A-664 Subversion objects, copies — A copy a work submits is the made revision's copy-from row (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Change.** `verbs::judge_submission` hands the version's copies (`vcs_store::svn_made::copies_of`, its increment's
+  `Copy` operations: destination, source, the source's version, which version N = revision N makes the copy-from
+  revision, and its replace) to `svn_made::make`. A copy's destination is a row with its copy source (`copy_row`): `add`,
+  or `replace` where something stood there or it replaces, the source's kind at its revision, its text and property list
+  set where the head differs from the source's; a path beneath it is judged against the source's node at the copy-from
+  revision (`copy_beneath`); a directory above a node added beneath it stood where it stood in the source. A copy the
+  version holds and the submit did not hand over is still refused, counted.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `repository::svn_commit::tests::
+  t_a664_svn_a_submitted_copy_is_a_copy_from_row` (red before: the copy refused, revision 2 unmade; green: its one row
+  adds `/branches/b` copied from `/trunk` at revision 1, the records hold `/branches/b/a.txt`, a client's revision lands
+  as 3); `cargo test --locked -p slates-server --lib -- repository::svn_commit:: vcs_svn vcs_store:: identities::
+  --test-threads=4` 116 of 116; fmt clean.
+- **Owed.** A stock `svn log -v` and `svn checkout` over the made copy by use (main's).
+
+### A-697 part a1 — The green's owner admits a work another node holds, by a forwarded verb (2026-11-20, w-shared for UI goal 93; main's plan for A-697, the briefs' g305)
+Applied in the same change to: §4.16 (A-247's status, step two), GAPS (A-247's step two), `crates/ipc/src/protocol.rs`,
+`crates/server/src/verbs.rs`, `crates/server/src/daemon.rs`, `crates/server/tests/fleet.rs`.
+- **Change.** `RequestBody::AdmitWork { green, work }` and `ReplyBody::WorkAdmitted { id, base }`, appended (wire order
+  published). The node that will hold a work over a green another node owns asks the owner: the verb names the green, so
+  it forwards as a write under the forward's completion record (`run_forwarded`, keyed by the authenticated origin), and
+  a resent ask is answered once. On the owner, `verbs::admit_work` serves it only when the request came from another
+  node (the request's origin is not this node's anchor); a client of the owner's node asks for a work by `CreateWork`,
+  and this verb from one is refused `Unsupported`. It runs `owner_admit`, as a work made on another shard of the
+  owner's node is admitted: the relayed principal's rights from the green's record (`NotShared` for a principal of
+  another node the green is not shared with, `Forbidden` without the right, `NotFound` for no such green), and the
+  work's floor recorded at the green's head (`WorkFloorSet`), which keeps that version's history while the work reads
+  it. Production routing is unchanged: nothing asks it yet; part a2 serves the holder's `CreateWork` on the holder
+  behind a test hook and asks it.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_is_admitted_by_its_greens_owner_once_and_by_the_owners_rights_alone` (two nodes at `f = 1`: B's ask
+  admitted by A at base 1, the head, and A's floor for the work at 1 read back by `Daemon::work_floor`; the resend
+  answered equal; the unshared green refused `NotShared` with no floor; A's own client refused `Unsupported`);
+  `a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`; `slates-server --lib work_home`
+  2 of 2; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2 of 2; fmt clean.
+
+### A-697 part a2 — A holder makes a work over a green another node owns, admitted there, its base read from the holder's replica (2026-11-20, w-shared for UI goal 93; main's plan for A-697; amends A-247's "Where a work lives")
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/work_home.rs`, `crates/server/src/verbs.rs`, `crates/server/src/daemon.rs`,
+`crates/server/tests/fleet.rs`.
+- **Change, behind a test hook.** Main's plan keeps production routing unchanged until A-697's last piece, which puts the
+  rule "replicated here" in the hook's place. With `Daemon::serve_works_on_holders(true)` (every shard's
+  `WorkHome::on_holders`, never set from the wire), a green another node owns (`work_home::green_elsewhere`: the
+  routing's owner, else the id's creator, not this node) is served here:
+  - a `CreateWork` is not forwarded (`verbs::owned_by_another_host`) but made on its client's partition: its pending
+    record holds the id and the name as any creation's does; the admission is `AdmitWork` (part a1), forwarded from the
+    control shard under the creation's request id once the pending record is committed (`work_home::admit_over_fleet`),
+    so a resend is answered by the owner's completion record; a refusal the owner gives is the creation's answer, and
+    no answer within the parked verb's bound, or one not started, is answered retryable, unrecorded;
+  - the work's base reads (`Files`, `Page`, `Sizes`) go to the node's control shard, which answers them from its
+    replica of the green (`verbs::base_engine`), once the replica holds the work's base version; until then the read is
+    answered retryable (`merge.work.replica_behind`);
+  - a verdict or a rebase of such a work is refused `Unsupported` (part c, the commit by position), and a floor's move
+    is counted owed (`merge.work.floor_owed_holder`, part b): the owner keeps the floor the admission recorded.
+- **Counters.** `merge.work.asked_owner_node`, `merge.work.read_from_replica` (the test's non-vacuity count),
+  `merge.work.replica_behind`, `merge.work.floor_owed_holder`, `merge.work.admission_unstaged`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_its_replica` (two nodes at `f = 1`, B
+  with the hook: the work's id names B, as a volume B made does, and not A; admitted at base 1 with A's floor at 1; `f`
+  read on B equal to A's green's "hello", the replica-read counter moved; the edit read back "hello world"; the same
+  name `AlreadyExists` naming the work; the unshared green `NotShared` from A). Red with the hook off: the work's id
+  named A. The fleet filter `a_holder` 16 of 16 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2,
+  `verbs::` 62 of 62; fmt clean.
+
+### A-697 part b — A holder's work moves and drops its floor at its green's owner, by a monotone forwarded verb (2026-11-20, w-shared for UI goal 93; main's plan for A-697)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/ipc/src/protocol.rs`, `crates/server/src/verbs.rs`, `crates/server/src/work_home.rs`,
+`crates/server/tests/fleet.rs`.
+- **Change.** `RequestBody::MoveWorkFloor { green, work, base: Option<u64> }` and `ReplyBody::WorkFloorMoved`,
+  appended (wire order published). Where a work on a holder node moves its floor (its base rises) or drops it (the
+  work is destroyed, or its creation lost its name after the admission), `work_home::tell_floor` hands the change to
+  `tell_floor_over_fleet`: once the verb's transaction has committed and its change took, `MoveWorkFloor` is forwarded
+  from the control shard to the green's owner. Part a2 had counted such a change owed and left the floor at the owner.
+- **Why it needs no completion record.** The owner's rule is monotone (`verbs::move_work_floor`): a floor only rises, so a
+  lower or equal base is a no-op; a drop is final; and a work with no floor there (never admitted, or dropped) is left
+  without one, so a late, repeated or reordered move changes nothing. So it forwards as a read does (`forwards_as_read`,
+  its doc amended), and a lost one only keeps more history, as a lost floor message between shards does (A-247).
+- **Who may send it.** A node's verb: the owner serves it only from another node (the relayed principal names another
+  node's anchor) and only for a work another node made (the id's creator); a client of the holder is refused at its
+  channel (`route_gated`), a client of the owner by the owner's check, both `Unsupported`. The owner cannot yet tell
+  which node made the work from the anchor alone (an id names a member id, which is derived from the anchor and the
+  boot's nonce), so any other member may move such a floor; members are mutually authenticated.
+- **Counters.** `merge.work.floor_told_owner_node` (the test's non-vacuity count), `merge.work.floor_not_sent`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed` (two nodes at `f = 1`, B with the hook:
+  A's floor 1 after the creation; B's and A's clients refused `Unsupported`, the floor still 1; after B's destroy, A's
+  floor gone and B's counter moved). Red with the forward removed: A's floor never dropped (the poll gave up). Fleet
+  `a_holder_makes_a_work`, `a_holders_work_is_admitted`, `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2,
+  `verbs::` 62 of 62; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2 of 2; fmt clean.
+
+### A-697 part c — A holder's submit is committed by the verdict its replica computed, taken by position at the owner (2026-11-20, w-shared for UI goal 93; main's plan for A-697; A-658 part 3b's route; A-645 "Merges computed anywhere, committed by position")
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status; "The verdict"'s wire-form
+sentence), GAPS (A-247's step two), `crates/merge/src/engine.rs` (`Green::submit_computed`, `commit_judgment`),
+`crates/merge/src/engine/compute_tests.rs`, `crates/ipc/src/protocol.rs`, `crates/server/src/verbs.rs`,
+`crates/server/src/work_home.rs`, `crates/server/src/landing.rs` (`wire_mode`, `db_mode` crate-visible),
+`crates/server/tests/fleet.rs`.
+- **Change, behind A-697's test hook.** A submit of a work on a holder node (`work_home::green_elsewhere`) composes its
+  increment on the work's shard as every work off its green's shard does (A-247), its base entries read from the
+  replica (part a2). Once its pending record is committed, the node's control shard computes the verdict on its replica
+  (`Green::compute`) and forwards `SubmitComputed { work, green, increment, computed, carried }` to the owner under the
+  submit's own request id (`work_home::verdict_over_fleet`): the increment as `Increment::encode` writes it, the verdict
+  in its wire form (A-658 part 3a), and `ComputedSubmit`, the policy the holder read where the work's record is (its
+  merge mode, the approval, the signature and the work's signers, the authorship). The owner (`verbs::submit_computed`,
+  a node's verb, refused `Unsupported` from a client of either node) runs `judge_submission` as for a submit asked
+  from a work's shard, with one difference: the verdict is read back (`Green::computed_from`) and taken by position
+  (`Green::submit_computed`: `judge_computed`, then `commit_judged` at once), counted `merge.verdict.taken_by_position`;
+  a form that does not read back, or a verdict not taken, is refused `BadRequest`, the retention it secured settled
+  first. The answer comes back over the forward (deferred to the quorum's commit at `f > 0`, as a forwarded submit's
+  is) and settles the submit on the holder, whose floor then rises at the owner (part b).
+- **Without a computed verdict.** The replica lacking the work's base (`BaseAhead`), or no replica: answered retryable,
+  `merge.work.replica_behind`; a base below the replica's restored floor: `UnknownBase`, as the owner answers; a copy the
+  verdict refuses: `CopyRefused` by its case. A copy the owner composes (a work holding one, `holds_copy`) and a rebase
+  of a work on a holder node are refused `Unsupported`, not built yet.
+- **Engine.** `Green::submit_computed` is `submit_resolved` with the verdict taken by position; the two share
+  `commit_judgment`, so the outcome and the chain's record are the same at the same head.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_position_at_the_owner` (two nodes at
+  `f = 1`, B with the hook: B's work edits `f` and submits, answered version 2; B's `computed_on_holder` and A's
+  `taken_by_position` each moved by one; A's green and B's work read "hello world"; A's floor for the work rose to 2).
+  `slates-merge` `engine::compute_tests::a_verdict_computed_on_a_copy_commits_through_its_wire_form_as_the_serial_submit`
+  (computed on a copy at version 50, the owner moved to 51, through the wire form: the outcome and the record equal the
+  serial submit's, both greens read alike, a second take answered version 52 with nothing committed); `slates-merge
+  --lib engine::` 151 of 151. Fleet `a_holder` 18 of 18 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of
+  2, `verbs::` 62 of 62, `landing::` 14 of 14; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2
+  of 2; fmt clean.
+- **Owed.** The increment rides the forward whole, so an increment the forward lane cannot carry is refused by the lane
+  (the inputs' placement before the record, A-286, would carry it by reference); a verdict computed at a replica head
+  the owner has moved past is judged again by position (the engine's oracle covers it; no fleet test forces the lag).
+
+### A-697 part d — A holder's submit settles once its replica holds the version the owner committed (2026-11-20, w-shared for UI goal 93; main's plan for A-697)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/work_home.rs`, `crates/server/src/merge_service.rs` (`recompute`), `crates/server/tests/fleet.rs`.
+- **Why.** At `f = 1` over three nodes the owner commits with any one holder, so the owner's answer to a holder's
+  submit can reach the holder before its own replica takes the version. Settled at once, the work would stand on a base
+  its node cannot read: every read of an unchanged file answered retryable (`merge.work.replica_behind`) until the
+  replica caught up.
+- **Change, behind A-697's test hook.** The owner's acceptance of a version the replica lacks is held on the control
+  shard, where the replica is (`work_home::hold_until_replica`, `WorkHome::replica_waits`), and the parked submit waits
+  under its own bound (`defer_oldest`, the deferred verdict's timer). Event-driven, no polling: when the replica takes a
+  version (`merge_service::recompute`), every held answer it now covers is handed to its work's shard
+  (`work_home::replica_reached`, then `answered_late`, which finds the submit by its key, so one already released is
+  not answered twice). Past the bound the submit is answered retryable and released; its resend meets the owner's
+  completion record and is held again until the replica has it. The holds are bounded by the parked verbs: one a
+  parked submit, the expired let go at each new hold. A replica rebuilt another way (a rewind, an adoption) wakes
+  nothing; its submits meet their bound.
+- **Counters.** `merge.work.settle_awaits_replica`, `merge.work.settled_on_replica` (the test's non-vacuity counts),
+  `merge.work.settle_unhanded`.
+- **Also.** Part b's fleet test read B's counter of floor moves right after A's floor dropped, which B counts only once
+  A's answer is back: it failed once in a batch run. It now waits for both.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committed` (three nodes at `f = 1`; B withholds
+  every merge record, so A commits with C; B's held-answer counter moves while B's replica is at version 1; once B takes
+  records again the submit is answered version 2, the settled counter moved, the replica at 2, the work reads "hello
+  world"). Red with the wake removed from `recompute`: the submit answered `Overloaded` at its bound. Fleet `a_holder`
+  19 of 19, `a_forwarded_submit`, part b's test 3 of 3 after the fix; `slates-server --lib work_home` 2 of 2,
+  `merge_service::` 14 of 14, `verbs::` 62 of 62; fmt clean.
+
+### A-697 part e — A holder's work comes back from its log over the holder's replica after a restart (2026-11-20, w-shared for UI goal 93; main's plan for A-697; A-207, A-313, A-513, A-533)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/work_home.rs`, `crates/server/src/verbs.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/merge_origin.rs`, `crates/server/tests/fleet.rs`.
+- **What was there.** A restarted node recovers each work from its log (A-207); a work whose green is on another
+  partition is replayed through that partition's owner shard (A-247, `daemon::rebuild_remote_works`). A holder's work's
+  green is no partition's here: its replay was asked of a shard without the green and refused, the work's records
+  dropped from the unbuilt list, so every edit it had acknowledged was out of reach; and one whose green's partition
+  number was its own shard's was skipped outright.
+- **Change.** Whether a green is another node's is now asked apart from the test hook (`work_home::owned_elsewhere`;
+  `green_elsewhere` is it with the hook on), since a restart starts with the hook off. A recovered work over such a green
+  is recorded unbuilt as a holder's (`Unbuilt::holder`), and its log is replayed on the control shard over the node's
+  replica of the green (`work_home::holder_replay`; from the recovery pass, `daemon::rebuild_remote_work`, and from the
+  ask as clients are let in, `verbs::ask_holder_replay`). A restart leaves the replica to be rebuilt from the records
+  the node holds (A-313), lazily: the replay starts that rebuild, and while it runs the work stays recorded, answering
+  `Unpublished` (A-533), and its shard is asked again once the replica is installed (`replica_reached` from
+  `merge_origin`'s install as from `recompute`). On a node whose work shard is its control shard the outcome is installed
+  in the same step: a message to its own shard ran inline and met the step's borrow, and the first run lost every
+  install so (the work answered `Unpublished` for good; the test's first run, by use).
+- **Counters.** `merge.work.replay_awaits_replica`, `merge.work.replayed_on_replica` (the test's non-vacuity count),
+  `merge.work.replay_ask_unhanded`.
+- **Owed.** A creation a restart caught waiting for the owner's admission is dropped here (`drop_pending_creations`),
+  and the floor the owner may have recorded for it stays there, since the pending record does not name the green: it
+  keeps more history, not less. Recovering a holder's pending submit is the existing path: the work's next verb runs it
+  again under its key, and the owner's completion record answers it.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_restart` (three nodes at `f = 1` keeping
+  their state across a restart; B makes a work over A's green and edits `f`, restarts over its own segment, turns the
+  hook on again: the work is served again reading "hello world", B's replay counter moved, its submit answered version
+  2). Its first run, before the same-step install, answered `Unpublished` for the poll's whole deadline (the red). Fleet
+  `a_holder` 20 of 20 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62,
+  `merge_origin::` 17 of 17, `merge_service::` 14 of 14, `takeover::` 18 of 18; fmt clean.

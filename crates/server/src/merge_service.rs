@@ -3819,6 +3819,8 @@ fn recompute(
   // later increment is based below it.
   fold_replica(state, &mut replica, value.folded_below);
   state.merge.replicas.insert(object, replica);
+  // A submit of a work on this holder node waits for its version here (A-697 part d).
+  crate::work_home::replica_reached(state, object);
   Ok(())
 }
 

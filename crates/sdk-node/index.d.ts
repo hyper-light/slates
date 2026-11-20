@@ -111,6 +111,7 @@ export class Client {
   link(work: string, path: string, target: string): void
   setXattr(work: string, path: string, name: string, value: Buffer): void
   removeXattr(work: string, path: string, name: string): void
+  copy(work: string, from: string, to: string, version?: number, replace?: boolean): void
   land(volume: string, target: string, snapshot?: number, include?: string[], exclude?: string[], grant?: number): LandingResult
 }
 
@@ -158,6 +159,7 @@ export class AsyncClient {
   link(work: string, path: string, target: string): Promise<void>
   setXattr(work: string, path: string, name: string, value: Buffer): Promise<void>
   removeXattr(work: string, path: string, name: string): Promise<void>
+  copy(work: string, from: string, to: string, version?: number, replace?: boolean): Promise<void>
   land(volume: string, target: string, snapshot?: number, include?: string[], exclude?: string[], grant?: number): Promise<LandingResult>
 }
 
@@ -187,3 +189,5 @@ export function execCommand(volume: string, at: string, command: string[], optio
  * the profile cannot name exactly.
  */
 export function apparmorProfile(executable: string): string
+/** The client methods that declare a work's operations, one an operation the SDK offers (A-626 part 4). */
+export declare function workOpMethods(): string[]
