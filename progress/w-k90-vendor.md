@@ -111,3 +111,15 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
  A-745 git half: DONE as asked (sliced answer, slice-only admission, request room, by-use HTTP+SSH). OWED (in GAPS):
     protocol v0's fetch in turns; begin's ready/cut walks + include-tag scan in units; plans of scattered positions
     (16 B/run); rule 4 (a fetch held to the index generation it began on); the live git clone matrix rows (main's).
+
+## Ada's rule "performance gaps upfront" (main, 2026-11-20): next 4 in order
+ 1. Rule 4 LANDED slates main ca204fc8..00b99ebb (3991b1df code, 00b99ebb docs). StoreLender::{Hold, hold, lend_held};
+    vcs_store::upload::GitGeneration (shared Repository::fork per (repo, Repository::stamp), refs+HEAD snapshot,
+    released within budget on last drop). Edges (HTTP upload, SSH git) hold on a Request, lend every later step from it.
+    Red: vcs_store::upload::tests::a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile (push +
+    tag v2 after step 0; held pack = start's objects in order, by id; unheld != start). Found: since P3b later steps had
+    no refs, so include-tag lost tags; fixed by the hold. Note: zlib bytes can't be byte-equal across two streams --
+    level sampling is timed on the shard's real clock (fragment::level), so objects compared by id (content hash).
+    Pre-existing on main, not mine: clippy cognitive_complexity in crates/git/src/store/staging.rs:223 `unit`.
+ 2. NEXT: begin's ready/cut walks + include-tag scan in turns. Then v0 in turns; then bounded scattered plans.
+    After 1+2: ask w-interop (via main) to rerun Windows git clone rows on current main.
