@@ -689,7 +689,6 @@ impl From<SvndiffError> for Stop {
   }
 }
 
-/// What the drive made of one item.
 /// What one command a caller made itself came to ([`Drive::edit`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Edited {
@@ -707,6 +706,7 @@ pub enum Edited {
   Closed,
 }
 
+/// What the drive made of one item.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
   /// The command was taken; nothing is written.
