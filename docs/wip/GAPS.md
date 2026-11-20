@@ -7199,9 +7199,11 @@
 >   and its `FLEET_WAIT` waits (every node's processes judged together, `StartProgress::look_all`; the fleet submit run
 >   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone; `cli`'s map,
 >   second-mount, journal-pipeline and referenced-bytes waits judged the same (`WAIT_FOR` now bounds only what no slates
->   process holds: a sibling test's child keeping a mount busy or a pipe's end open, and a container probe's map). Owed
->   in `cli/tests`: `cli`'s container waits (`CONTAINER_WAIT`, `DOCKER_INFO_WAIT`, on Docker) and `shards_reader`'s
->   read timeout, `live_fleet`, `vm`,
+>   process holds: a sibling test's child keeping a mount busy or a pipe's end open, and a container probe's map); its
+>   waits for an unmount to show in Linux's mount table wait on the table's own notification (`POLLPRI` on
+>   `/proc/self/mountinfo`) within the observation budget (`MOUNT_TABLE_WAIT`), no poll and no CPU budget (main's
+>   ruling: the waiter spends none); `shards_reader` reads its handed end without a timeout. Owed
+>   in `cli/tests`: `cli`'s container waits (`CONTAINER_WAIT`, `DOCKER_INFO_WAIT`, on Docker), `live_fleet`, `vm`,
 >   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module
