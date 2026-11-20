@@ -52,5 +52,28 @@ fix: ac1a78f64's plain scalar broke ci.yml parse ~1 min: GitHub runs 44784109897
 - Running: GitHub whp drive 44784112194 on main ac1a78f64. Next: read it; piece 3 if DAX reads fail EACCES.
 - Inbox note left for w-k90-win (its ci.yml step changed).
 
+## 2026-11-20 ~10:20 PST: Ada's word (via main): real guests on jupiter may make Shards' per-VM AppContainer profiles.
+The proof moves to jupiter (goal on my stack: plan 01a1fa36 step 6). Rules: only profiles Shards' own code makes; list
+every profile name a run leaves behind here; no other admin steps or installs.
+- jupiter (read-only, r6-r9): NASM 3.02 already in ~/.cache/kiln-nasm; Rust 1.98.1 with x86_64/aarch64-unknown-linux-musl
+  installed; Shards' pinned zig 0.16.0 already in ~/AppData/Local/shards/zig; HypervisorPresent True; WinFsp now there
+  (w-k90-win). So packing Shards needs NO download there. BLOCKER: C: 5.1 GB free (one drive). Biggest ~/.cache users
+  (none mine): kiln-gate 56G, slates-fluid-20261108 53G, w-k90-vendor-target 35G, w-interop-target 24G, w-reaper-target
+  22G, xplat 14G, w-bugs-target 12G. main is freeing space; share one target with w-k90-win.
+- GitHub WHP run 44784112194 (main ac1a78f64, windows-2025): past piece 4; session started, then FAILED at Slates:
+  "Slates' anchor ended before its instance answered: the host refused: the channel's shared memory refused: shared
+  layout refused at 0 for 64 bytes: TouchesWord". Source: vendor/slates/crates/ipc/src/region.rs:303 (daemon writes the
+  64-byte fixed header at 0) refused by mem/src/shared.rs check_copy (a declared word touches 0..64). Comes up as
+  Slates' instance starts: not microVM-specific (bare-metal job 136462100187 on windows-latest will say). Slates' bug,
+  reproduced by use: for main / Slates' owner. Log ~/.cache/w-k90-whp-logs/gh-44784112194.log.
+- windows-latest clippy (run 44784299374): my api.rs test's 8 serde_json indexings refused (indexing_slicing): fixed in
+  12e44704d (branch agents/w-k90-whp, not yet on main), plus the drive's first-turn failure now prints Slates' anchor log.
+  Other clippy errors there are NOT mine: workspace/container.rs (478,871,885,897,905,920), sandbox/container.rs:115,
+  workspace/slates.rs (361,386,573,1008), workspace/slates_fleet.rs:778.
+- kiln server unreachable from this session ~10:30 PST (run refused "not connected"); 12e44704d's focused run waits on it.
+
+## AppContainer profiles left on jupiter by my runs
+- (none yet: no guest run on jupiter so far)
+
 ## For main to delete
 - (none)
