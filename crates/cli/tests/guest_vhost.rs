@@ -51,9 +51,8 @@ use slates_bridge_virtiofs::serve::TOLD_ABANDONED;
 use slates_client::{Client, Intent, VolumeId};
 use slates_guest_probe::protocol::{Command as Ask, Mount, Reply};
 use vm::{
-  Anchor, Guest, MountPoint, QUIT_WAIT, REPLY_WAIT, START_WAIT, created_volume, daemon_of,
-  initramfs, kill_daemon, kill_the_daemon, pause, run, start_anchor, start_anchor_with, write_at,
-  write_whole,
+  Anchor, Guest, MountPoint, QUIT_WAIT, created_volume, daemon_of, initramfs, kill_daemon,
+  kill_the_daemon, pause, run, start_anchor, start_anchor_with, write_at, write_whole,
 };
 
 /// Shape: the pages the guest maps; the file never grows past them, so every byte of it lies in the map.
@@ -455,7 +454,7 @@ fn map_holds(guest: &mut Guest, model: &Model, (at, len): (u64, u64), what: &str
   if len == 0 {
     return;
   }
-  match guest.ask(&Ask::Read { at, len }, REPLY_WAIT) {
+  match guest.ask(&Ask::Read { at, len }) {
     Reply::Bytes(held) => {
       let end = at.checked_add(len).unwrap();
       assert_same(&held, &model.object[ix(at)..ix(end)], at, what, guest);
@@ -470,13 +469,10 @@ fn map_holds(guest: &mut Guest, model: &Model, (at, len): (u64, u64), what: &str
 /// Has `guest` map the file, which must be served through the DAX window, and tells the model the guest learned the
 /// size.
 fn map(guest: &mut Guest, model: &mut Model) {
-  match guest.ask(
-    &Ask::Map {
-      path: FILE.to_owned(),
-      pages: MAP_PAGES,
-    },
-    REPLY_WAIT,
-  ) {
+  match guest.ask(&Ask::Map {
+    path: FILE.to_owned(),
+    pages: MAP_PAGES,
+  }) {
     Reply::Mapped { dax: true } => model.remap(),
     other => panic!(
       "map {FILE} → {other:?}: the map is not DAX\n{}",
@@ -518,14 +514,12 @@ fn print_device_counters(instance: &str, test: &str) {
   eprintln!("{test}: the device's counters: {}", counted.join(" "));
 }
 
-/// Waits, polling, until `done` holds, for at most [`START_WAIT`].
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-  let started = Instant::now();
+/// Waits, polling, until `done` holds, while `instance`'s processes progress (`process_wait::InstanceWait`; until
+/// 2026-11-20 within the harness's `START_WAIT`, 20 s of the wall).
+fn wait_for(what: &str, instance: &str, mut done: impl FnMut() -> bool) {
+  let mut progress = process_wait::InstanceWait::new();
   while !done() {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "{what} within {START_WAIT:?}"
-    );
+    progress.check(instance, what);
     pause();
   }
 }
@@ -714,6 +708,7 @@ impl Rig {
   fn await_device_end(&self) {
     wait_for(
       "the device ended with the VM and let the file's backing go",
+      &self.instance,
       || counter(&self.instance, backed::RELEASED) >= 1,
     );
   }
@@ -730,17 +725,21 @@ fn device_attachment(guest: &Guest) -> String {
     .unwrap_or_else(|| panic!("no attachment announced\n{}", guest.transcript()))
 }
 
-/// Waits for the VM to end by itself, for at most [`QUIT_WAIT`]: its exit status, its VMM's last words drained into the
-/// transcript.
+/// Waits for the VM to end by itself, while its tree gains CPU (until 2026-11-20 within `QUIT_WAIT`): its exit status,
+/// its VMM's last words drained into the transcript.
 fn vm_end(guest: &mut Guest) -> std::process::ExitStatus {
-  let started = Instant::now();
+  let mut judged = process_wait::Judged::of(guest.vm.id());
   let status = loop {
     if let Some(status) = guest.vm.try_wait().unwrap() {
       break status;
     }
+    let verdict = judged.judge();
     assert!(
-      started.elapsed() < QUIT_WAIT,
-      "the VM ended within {QUIT_WAIT:?} once its device was gone\n{}",
+      matches!(
+        verdict,
+        process_wait::Verdict::Waiting { .. } | process_wait::Verdict::Gone
+      ),
+      "the VM ended once its device was gone: its processes are {verdict:?}\n{}",
       guest.transcript()
     );
     pause();
@@ -1699,12 +1698,12 @@ impl ToldRig {
     applied
   }
 
-  /// Waits until the host's map shows what the volume holds, for at most [`START_WAIT`]: the mount was told of whatever
+  /// Waits until the host's map shows what the volume holds, while the instance's processes progress: the mount was told of whatever
   /// the volume took. How long the map took to follow, from the moment the volume was read.
   fn map_follows_the_volume(&self, what: &str) -> Duration {
     let held = self.volume_file();
     let started = Instant::now();
-    wait_for(what, || self.map.seen() == held);
+    wait_for(what, &self.instance, || self.map.seen() == held);
     started.elapsed()
   }
 }
@@ -1830,6 +1829,7 @@ fn guests_killed_mid_write(gate: &Gate) {
     guest.kill();
     wait_for(
       "the killed guest's device ended and let its attachment go",
+      &rig.instance,
       || rig.attachments() == attachments,
     );
     let applied = rig.whole_after_cut(earlier, fill, "the volume after the guest's kill", &guest);
@@ -1897,7 +1897,8 @@ fn daemons_killed_mid_write(gate: &Gate) {
     let delay = sweep_step(took, kill, DAEMON_KILLS);
     // The daemon is killed once the anchor has judged it recovered (A-311): one killed sooner is a failed start, and the
     // second in a row is a crash loop the anchor backs off. Asked before the write is sent, so the sweep's timing holds.
-    recovered::await_recovered(&rig.instance, &|_| true, vm::POLL, START_WAIT);
+    let mut judged = process_wait::Judged::of(rig.anchor.child.id());
+    recovered::await_recovered_while_alive(&rig.instance, &|_| true, vm::POLL, &mut judged);
     let old = daemon_of(&rig.anchor).expect("the anchor runs a daemon");
     guest.send(&patch_page(fill));
     spin_for(delay);
@@ -2048,15 +2049,12 @@ fn withholds_set_id_and_devices(gate: &Gate) {
       "the control: run from the mount without nosuid, the set-id copy takes its owner's ids",
     ),
   ] {
-    let reply = guest.ask(
-      &Ask::Exec {
-        mount,
-        path: SET_ID.to_owned(),
-        uid: NOBODY,
-        gid: NOBODY,
-      },
-      REPLY_WAIT,
-    );
+    let reply = guest.ask(&Ask::Exec {
+      mount,
+      path: SET_ID.to_owned(),
+      uid: NOBODY,
+      gid: NOBODY,
+    });
     assert_eq!(
       reply,
       Reply::Identity {
@@ -2081,13 +2079,10 @@ fn withholds_set_id_and_devices(gate: &Gate) {
       "the control: without nodev the open reaches the device layer, which has no driver for 0/0",
     ),
   ] {
-    let reply = guest.ask(
-      &Ask::Open {
-        mount,
-        path: WHITEOUT.to_owned(),
-      },
-      REPLY_WAIT,
-    );
+    let reply = guest.ask(&Ask::Open {
+      mount,
+      path: WHITEOUT.to_owned(),
+    });
     assert_eq!(
       reply,
       Reply::Failed {

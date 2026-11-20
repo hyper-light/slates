@@ -2188,6 +2188,14 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **A-766, DeltaV v1 (2026-11-20, w-svn; clients without HTTPv2: svn before 1.7, and 1.7+ where OPTIONS has no v2
+> headers):** part 1 BUILT, the read side as `mod_dav_svn` 1.14.x answers it: `!svn/vcc/default` (its `checked-in` the
+> youngest baseline; the v1 update-report's target, its hrefs version resources), `!svn/bln/REV` (`D:baseline`, its
+> collection `!svn/bc/REV/`, `version-name`, its revision's properties as dead properties), `!svn/ver/REV/PATH` (the
+> node in REV, no `checked-in`). Owed: part 2 the commit verbs (MKACTIVITY, CHECKOUT, the working baseline's PROPPATCH,
+> `wrk`, MERGE and DELETE of the activity) over DavCommit, part 3 the server site, part 4 by-use; the PROPFIND
+> writer's per-property strings rewritten into the connection's buffer (MEMORY SIZING; its subjects now lend their
+> properties).
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -7300,9 +7308,12 @@
 >   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
 >   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `vm`, `start_judgment`
 >   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
->   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
->   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
->   own platforms), and `xtask`'s remaining `MOUNT_WAIT` uses (its tracers' bounds and the NFS attribute cache's
+>   are not listed yet), `winfsp`, `pmem`, `load_fleet` and the rest
+>   (`recovered::await_recovered`'s wall form goes with `winfsp`, which runs only on Windows); the VM harness `vm` and
+>   its suites (`guest_dax`, `guest_image`, `guest_vhost`) since 2026-11-20: the guest's boot, replies, console lines
+>   and power-off waited for while the VM's process tree gains CPU (`process_wait::Judged`; `BOOT_WAIT`, `REPLY_WAIT` and
+>   the start wait gone, `QUIT_WAIT` left bounding only the read of a VMM's last words after its exit), a daemon's
+>   restart and steadiness judged as `cli`'s are; written on macOS, compiled by w-lint on Linux, and `xtask`'s remaining `MOUNT_WAIT` uses (its tracers' bounds and the NFS attribute cache's
 >   `visible`, waits on other parties' work). Since 2026-11-20 a wait on the kernel's mount table, in the tests and in
 >   `xtask`'s mount, is `process_wait::await_mount_table`: woken by the kernel's own word (macOS `EVFILT_FS`, Linux
 >   `POLLPRI` on `/proc/self/mountinfo`), within the observation budget, never a poll (main's ruling). `xtask`'s conformance harness since 2026-11-20:
