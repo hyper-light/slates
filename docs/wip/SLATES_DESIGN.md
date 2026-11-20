@@ -10157,6 +10157,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
 
+> **Status (2026-11-20, A-779: a newer presentation supersedes the older).** A presentation of a volume into a target,
+> by any client, supersedes every earlier one of that volume and target still awaiting its grant: each leaves
+> `AwaitingGrant` for `Superseded`, naming the newer (`Op::LandingSuperseded`), drops off the session log (A-773), and a
+> grant of it is refused `LandingSuperseded { newer }`, so an older state never lands over a newer one. Nothing expires
+> on a clock (R3). A granted landing's presentation kept for its resume is not superseded. The session log lists only
+> the presentations a grant can still take, read from the shard's held presentations.
+
 **Special names (A-26).** A landing containing FIFO/socket creation refuses before its
 first host write. The current grant authorizes filesystem content, not new host IPC endpoints.
 No copy-up, hashing, archive or landing step opens a host special file as regular content. A landing containing a
@@ -28812,6 +28819,9 @@ Applied in the same change to:
   longer holds answers `ENOENT`; recovery refuses an overlay whose loaded base directory changed after its last
   publication.
 - **Evidence.** See the bug record's verification.
+- **Status (2026-11-20, A-781).** Without a birth time, an untouched entry whose change time (sub-second) and size
+  match what its inode recorded is proven its file and keeps its number across a takeover; only one the disk changed or
+  stamped in whole seconds is renumbered, as before.
 
 ### A-150 — An inode number goes out only under a published reservation (accepted 2026-10-22)
 Applied in the same change to:
@@ -55923,6 +55933,26 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's replay in place — a record's replay reads its pack as a live push does (2026-11-20, w-git for UI goal 93; B2's other side)
+- **Why.** A version-2 record's replay (`vcs_store::git_replay`) read its pack into git's reader whole
+  (`Reader::read`, `finish_with` into `Unpacked`), so every object was held inflated in the reader while each was put in
+  the content store as it was admitted: a v1.5.0 record held its 304.6 MiB of objects twice at its replay's peak.
+- **Change.** The replay reads its record's pack a chunk at a time into a site of its own (`git_replay::Site`: a
+  queue by pack position, the push and the repository read only through the live intake's `Quarantined`, the
+  repository's objects as a thin pack's bases), each chunk's bytes added to the push's own copy of the pack
+  (`Push::extend_pack`) and each object admitted as it resolves where it lies there (`admit_object` with its offset,
+  `Push::keep_read`), its hold given back; the waiting deltas resolve a unit at a time (`Reader::resolve_turn`) and are
+  admitted the same way; `Reader::finish_into` ends the pack. Its names are compared as sets (the replay order fix
+  above), so admitting in its own turns' order is the live push's own. Staging then puts what lands in resolution order,
+  as a live push's does.
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic: a v1.5.0 push, then its repository's store made
+  again from the log, each replay turn 1 ms): the process's peak RSS grew by 189.6 MiB across the replay before (772.6
+  to 962.2 MiB, 2,712 turns) and by 0.1 MiB after (781.8 to 781.9 MiB, 1,921 turns, 2.43 s); the content store's peak
+  is 309.0 MiB either way, what lands. The time before (6.39 s) was taken with every core busy, so the turns and the
+  resident bytes are the comparison.
+- **Tests.** `slates-server --lib -- git vcs_store` 163 passed, the replays of `t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved`
+  and `t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` among them (kiln, adas-mac-studio.local-2).
+
 ### A-722's replay order — a pack record's names compared as sets (2026-11-20, w-git for UI goal 93; found reading B2's replay)
 - **The bug.** A live push admits its pack's objects as they resolve: those read whole, or from a base already read,
   in pack order as the client's bytes arrive; a thin pack's waiting deltas (a REF_DELTA whose base is outside the pack)
@@ -57431,6 +57461,27 @@ Measured: import time; RSS, peak and idle; disk bytes; clone throughput; an old 
 history's first, middle and last tenth, cold and warm); checkpoint spacing as learned and its disk cost. Beside them the
 stock servers' numbers (`hg serve`, `git daemon`, `svnserve` over FSFS). The numbers go in BENCHMARKS and this entry.
 
+> **Status (2026-11-20, item 7's phase 1 measured; proposed to w-hg, w-git and w-svn, not yet agreed; BENCHMARKS "A
+> changeset's stored form").** Main's A/B (raw payload plus a work index, against normalized per-path edits or wholes
+> held once by identity) over hg's history, the same history by git, and git v2.0.0 with v2.1.0 as a second
+> repository, in one store. One tool alone: equal (about 46 MB for hg's history normalized at K=256, 44.6 MB as hg's
+> zstd bundle; w-hg's and w-svn's release arms: 0 to 5 % apart). Across tools: the second tool's push adds 85.2 MB raw
+> and **no text bytes** normalized. Across repositories of one project: 57.9 MB raw against **0.49 MB**. Serving: a git
+> pack computed from normalized content 6.3 s against 0.94 s reusing a stored one (git v2.0.0). Proposed, on that data:
+> - **On disk the changeset is normalized:** its `record` (the tool's own bytes), its `work`, and for each touched path
+>   the edit against p1's text, or a whole held once by identity where the path is new or its chain since its last
+>   whole would pass its length (w-hg's rule; K=256 measured at +7.7 % for hg, +3.7 % for git); a changeset record is
+>   itself held by identity, so forks share theirs. The received `payload` is not kept on disk.
+> - **The hybrid on the push's path:** in flight the payload stays as received and is read in place (w-git's B1,
+>   w-svn's `TextSource`); landing normalizes it in bounded slices, using the tool's own deltas where they are already
+>   against p1 (hg: no diff at the server), and is acknowledged once the normalized changeset is durable (item 4).
+> - **Wire forms are derived, cached by identity:** the received pack or bundle seeds the cache, so the first clone
+>   after a push reuses it; an evicted one is computed again from the changesets.
+> - **Layout:** changeset order, with the `O` rows naming each path's text by (changeset, offset) and a decoded-segment
+>   cache sized from a clone's working set, since changeset order decodes 6 (svn) to 10 (hg) times the segments a
+>   per-file order does (w-svn, w-hg).
+> - Owed before building: git's normalization timed in Rust (w-git), and agreement from w-hg, w-git and w-svn.
+
 **8. RAM: the change in flight and a bounded, learned cache (Ada's memory-sizing ruling).**
 - **In flight:** held as received, so a push of N bytes holds at most k·N + B, with k and B derived (k about 2: the
   received bytes and one decode window). An import holds one slice.
@@ -57672,3 +57723,59 @@ volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardSt
   main: given up after 23 attempts waiting on its live, unserved through the serve deadline; after: judged afresh once,
   served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
   fleet tests unchanged.
+
+### §4.8 amended — A dispatch's stragglers are waited for by their own reports' wakes, never a tick or a poll interval at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family two of three)
+Applied in the same change to: §4.8 "Lookup" (a location round's stragglers), GAPS (the sweep's line),
+`crates/cluster/src/lib.rs` (`Stragglers::reported`, `waits`, `settle`, the collector kept), `crates/cluster/tests/live.rs`,
+`crates/server/src/owner_location.rs` (`ask`).
+- **What was there.** A dispatch's reply channel already wakes its collector, the task that dispatched, at every send
+  (`ReplyTx::send`), but the waits for its stragglers did not use it: `Stragglers::settle`, which a live lane runs
+  before its task ends, looked once a timer tick; a location round's straggler loop looked once a poll interval (a
+  tenth of a period, 10 ms), so a report landing just after a look waited out the rest of it.
+- **Change.** `Stragglers` keeps its collector's task, read where the dispatch made it. `Stragglers::reported(left)` waits
+  until a straggler may have reported: in the collector, until its next send wakes it (`futures::idle` within `left`);
+  in any other task, which the sends do not wake, one timer tick, as before. `settle` and the location round wait so;
+  the round stops once its span is spent. `Stragglers::waits` counts the waits each way, the test's non-vacuity count.
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20). `slates-cluster --test live
+  a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back` now holds the settle to its reports' wakes (woken
+  at least once, ticked never) as well as every session back; `slates-cluster --lib` 247 of 247. The server's
+  `owner_location` lib tests, fmt and the red (the collector's wake disabled: the lane test must fail on its ticks) ran
+  on a kiln runner, this Mac being at 7 GiB free; their results are in the landing's commit.
+
+
+### A-779 — A newer presentation of a volume into a target supersedes the older, whose grant is refused by kind (2026-11-20, w-sessionlog; main's ruling 15:20 PST; §4.15 steps 2–3; AUD-29-07, A-773, R3, R10)
+Until A-779 only the same client's re-presentation replaced its earlier one, in the shard's memory alone: the earlier
+record still read `AwaitingGrant` (so the session log listed it), and another client's re-presentation left it
+grantable. Now any presentation of the same volume into the same target supersedes the earlier ones awaiting a grant:
+`Op::LandingSuperseded { id, by }` moves each record to `LandingState::Superseded` with `superseded_by` (both
+appended), the partition's waiting index drops it, and `grant` answers `Refusal::LandingSuperseded { newer }`
+(`slates_api::Stale::Superseded`). The session log reads the shard's held presentations, which are exactly the
+grantable ones (an abandoned one, AUD-29-07, is not there either). No clock expires a presentation (R3).
+Applied in the same change to: §4.15 (a status line), GAPS (A-773's owed presentation item closed), `crates/db`
+(`Superseded`, `superseded_by`, `Op::LandingSuperseded`, its model step), `crates/ipc` (`LandingStage::Superseded`,
+`Refusal::LandingSuperseded`, tags published), `crates/api` (`Stale::Superseded`, `LandingStage::Superseded`),
+`crates/server` (`superseded_by_presentation`, the grant's refusal, the log's source), `crates/server/tests/
+presentations.rs` (the replaced presentation is refused by kind).
+Evidence: `cargo test --locked -p slates-server --test session_log` 2 passed, the new
+`a_newer_presentation_supersedes_the_older_whose_grant_is_refused` red with the supersede disabled (`Refused(NotFound)`)
+and green with it; `--test presentations` 10 passed; `-p slates-db --test model every_recovery` 2 and `--test
+wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe` 2 (macOS arm64, this Mac, local).
+
+### A-781 — Without a birth time, an unchanged base file keeps its number across a takeover (2026-11-20, w-realtools; Ada's dispatch after the Slates-vs-Sapling comparison; amends A-151)
+- **What it answers.** EdenFS's own record (`eden/fs/docs/InodeStorage.md`): unstable inode numbers broke C++
+  `#pragma once`, which tells a header by its device and inode number. Under A-151, a recovered overlay over a disk that
+  records no birth time (tmpfs, NFS, older filesystems) renumbered every untouched entry at its first listing, in lookup
+  order. So a compiler that read `inc/s.h` before a daemon restart and `sub/../inc/s.h` after it saw two files and
+  included the header twice. Red: `without_birth_times_an_unchanged_base_file_keeps_its_number_and_times_across_a_takeover`
+  (three headers, numbers ...595-597 before, ...600-598 after; times unchanged).
+- **The change.** `Overlay::unprovable` also takes the change time as proof. An entry with no descriptor and no birth
+  time whose listed change time has a sub-second part and equals, with its size, what the inode recorded keeps its
+  number. The kernel stamps the change time when a file is made and at each change to it, so a file made at a freed
+  number later carries a later one. A whole-second stamp proves nothing: the reused file could share its second.
+- **What A-151 rejected stays rejected.** A-151 ruled out the change time *in place of* the birth time, because an
+  in-place edit would renumber the file. Here the change time is only an extra proof when there is no birth time. A
+  file whose change time moved is renumbered as before, so nothing that held under A-151 is weakened.
+- **Tests.** `base_identity`: the red test above, now green; `without_birth_times_a_reused_number_is_still_a_new_entry_after_a_takeover`
+  (the guard: two saves give the number back, and the lookup is a new inode); A-151's renumbering test, now documented
+  as covering whole-second stamps. Real-tool runs over a kernel mount (macOS NFS, Linux FUSE, Windows WinFsp) are owed
+  to main's run requests.

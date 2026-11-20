@@ -1,5 +1,10 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **REAL TOOLS ACROSS SNAPSHOTS, EVICTION AND TAKEOVER (w-realtools, 2026-11-20).** A-781 BUILT: without a birth time,
+> an unchanged base file keeps its inode number across a takeover (`#pragma once`). Open: the kernel-mount acceptance
+> runs (a `#pragma once` build, `make`, `cargo build` and `git status` over a mount across a snapshot, a restart and a
+> takeover) on macOS NFS, Linux FUSE and Windows WinFsp.
+
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
 > only a ceiling. **A-777 BUILT:** the idle prefault reserve (A-214) is removed: provisioning p99 unchanged, NFS peak
@@ -43,6 +48,15 @@
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
 > - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
 >   the reserve's per-pass run list removed with the reserve (A-777).
+> - The anchor segment (45.9 GB mapped on the big Studio, 23 shards): each partition's log ring is `table_bytes` and each
+>   of its two snapshot slots twice that, a share of `reserve_per_shard` (`config.rs`), where `Geometry`'s own docs say
+>   "recovery budget x measured replay throughput" and "the measured partition state size x the growth headroom"
+>   (drift; no replay rate is measured). Address space only (backed where written). -> With the content extents
+>   proposal (main's inbox): sized from the measured state, grown by new regions.
+> - Allocations per NFS request (by reading, `bridge-nfs`): each procedure builds its results in a fresh `XdrWriter`
+>   (31 in `procedures.rs`, 15 in `multi.rs`, the v4 compound), and `reply_record` frames them into a second `Vec`,
+>   copying the results once (a READ's data). Some replies are kept (`nfs_replay::record`, `hold_reply`). -> Write into
+>   the connection's own buffer behind a reserved header; keep a reply by moving that buffer out only when it is kept.
 >
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
@@ -63,7 +77,8 @@
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. Owed: identical submissions told apart from accepted ones (a field on the submit's reply), the
-> MCP tool and the SDKs' read, and a presentation never granted stays listed (no presentation expires yet).
+> MCP tool and the SDKs' read. A-779 closed the stale presentation: a newer one of the same volume into the same target
+> supersedes it (typed refusal, off the log), and the log lists only grantable presentations.
 
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
@@ -2223,6 +2238,17 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **A-780, the svn DAV site's PROPFIND written in place (2026-11-20, w-svn; Ada's MEMORY SIZING rule):** every
+> property's value and element is written into one reused buffer (`dav::site` `write_live`, `push_dead`, the value
+> writers), responses streamed into the body as described; allprop of a 32-file directory at depth 1 makes 445
+> allocations (was 5,691), six properties 487 (was 1,876) (`crates/svn/tests/propfind_allocations.rs`, red on the old
+> writer). Owed: the ~14 a response left (a child's place and href, its property list, the lock discovery), and writing
+> into the connection's own buffer rather than an answer's body (the site's `HttpAnswer`).
+> **A-772, svnsync's replay (2026-11-20, w-svn; main's order after w-interop's matrix r10: 0.54 s a revision of
+> git-2000.dump, 2,511 MiB peak against the 447 MiB dump):** the drive's share measured and fixed by w-perf's per-reader
+> `WindowCache` (b51f908f2): `replay_bench` 328 s to 1.82 s for r1..r2000 (BENCHMARKS), held by
+> `a_replay_makes_each_delta_window_a_bounded_number_of_times`. Owed: the server's per-turn cost (~960 one-step turns a
+> revision) and the peak against the dump, measured through the daemon's SSH site next.
 > **A-766, DeltaV v1 (2026-11-20, w-svn; clients without HTTPv2: svn before 1.7, and 1.7+ where OPTIONS has no v2
 > headers):** part 1 BUILT, the read side as `mod_dav_svn` 1.14.x answers it: `!svn/vcc/default` (its `checked-in` the
 > youngest baseline; the v1 update-report's target, its hrefs version resources), `!svn/bln/REV` (`D:baseline`, its
@@ -4996,8 +5022,8 @@
 > that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
-> pace between looks). Owed from that sweep, each with its own wake: a broadcast's stragglers (`owner_location.rs`), a
-> FUSE mount helper's exit (`fuse.rs`); the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
+> pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
+> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against

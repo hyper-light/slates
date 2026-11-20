@@ -1536,9 +1536,10 @@ mod tests {
   /// repository, write its root until the service folds its first version (`write_until_folded`: as many writes as the
   /// doubling rule's own inputs ask), branch it at that version and then at its head, retire the branch's name and bind
   /// it again, write the branch; then write a green no repository holds, and send a bind the guard refuses.
-  /// Expect: each verb moves the names log alone, by each change it makes; each member's version moves its own green's
-  /// log alone; the refused branch, the lone green's version and the refused bind move no log of the repository; and no
-  /// verb or lone version is an atomic record.
+  /// Expect: each verb moves the names log alone, by each change it makes, and each record the repository's register
+  /// keeps moves it by one (A-724 piece 8c: a version's record rides the names log to the repository's candidates); each
+  /// member's version moves its own green's log alone; the refused branch, the lone green's version and the refused bind
+  /// move no log of the repository; and no verb or lone version is an atomic record.
   #[test]
   fn each_verb_moves_the_names_log_and_each_members_version_its_own_log() {
     crate::daemon::audit_on_shard(|state| {
@@ -1551,29 +1552,42 @@ mod tests {
           .repositories()
           .log_position(repo, slates_db::catalog::StateLog::Names)
       };
+      // The names log moves by each verb's changes and by each record the repository's register keeps (A-724 piece 8c:
+      // a version's record rides the names log to the repository's candidates, so a successor replays it).
+      let records = |state: &ShardState| {
+        u64::try_from(state.db.partition().repositories().objects(repo).count()).unwrap()
+      };
+      let moved = |state: &ShardState, verbs: u64| Some(verbs + records(state));
       let head_of =
         |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
-      assert_eq!(names(state), Some(2), "the root joined and its name bound");
+      assert_eq!(
+        names(state),
+        moved(state, 2),
+        "the root joined and its name bound"
+      );
       write(state, root, b"v1", 1);
       let mut serial = 1;
       let root_head = write_until_folded(state, root, &mut serial);
-      assert_eq!((names(state), head_of(state, root)), (Some(2), root_head));
+      assert_eq!(
+        (names(state), head_of(state, root)),
+        (moved(state, 2), root_head)
+      );
       // No reader held version 1, so the root folded it: a branch there is refused before any record.
       assert!(matches!(
         refusal(branch(state, ("tree", "early", "main"), Some(1))),
         Refusal::UnknownBase { .. }
       ));
       let topic = green_of(branch(state, ("tree", "topic", "main"), None));
-      assert_eq!(names(state), Some(4));
+      assert_eq!(names(state), moved(state, 4));
       retire_and_bind_again(state, topic);
-      assert_eq!(names(state), Some(6));
+      assert_eq!(names(state), moved(state, 6));
       write(state, topic, b"t1", serial + 1);
       assert_eq!(
         (names(state), head_of(state, topic), head_of(state, root)),
-        (Some(6), 1, root_head)
+        (moved(state, 6), 1, root_head)
       );
       assert_a_lone_green_and_a_refused_bind_move_nothing(state, topic, serial + 2);
-      assert_eq!(names(state), Some(6));
+      assert_eq!(names(state), moved(state, 6));
       assert_eq!(
         state.db.partition().repositories().atomic_records().count(),
         0
