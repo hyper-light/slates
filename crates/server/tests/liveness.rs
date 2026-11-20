@@ -215,11 +215,15 @@ fn block_in_a_read(held: Duration) {
 /// late, which a bound of a window and three beats on that reading counted against the watchdog (g227 on Studio-4,
 /// 2026-11-20; on Studio-2 under 28 spinners and `taskpolicy -b`, 5 of 24 runs, before and after A-740 alike).
 fn a_blocked_shard_stops_the_beat(role: &str, name: &str, block: fn(Duration)) {
-  a_blocked_shard_stops_the_beat_while(role, name, block, None);
+  // A clear memory level in the host's place: the condition these roles drive is a block, which a host under memory
+  // pressure would have the watchdog take for a shard waiting on memory (A-336), so on such a host (this Mac under kernel
+  // memory pressure, 2026-11-20) the block was never found and the role failed for the host, not the rule.
+  a_blocked_shard_stops_the_beat_while(role, name, block, Some(false));
 }
 
 /// [`a_blocked_shard_stops_the_beat`] with the host's memory reading the watchdog takes put in its place first:
-/// `Some(true)` a host reporting a memory stall throughout (A-336), `None` the host's own.
+/// `Some(true)` a host reporting a memory stall throughout (A-336), `Some(false)` one reporting none, `None` the host's
+/// own.
 fn a_blocked_shard_stops_the_beat_while(
   role: &str,
   name: &str,
@@ -1310,6 +1314,9 @@ fn a_shard_waiting_on_a_blocked_thread_stops_the_beat_role() {
     return;
   };
   let _serving = beating(&daemon);
+  // A clear memory level in the host's place, as the blocked roles take (a_blocked_shard_stops_the_beat): the wait this
+  // role drives is on a blocked thread, not on memory.
+  assert!(daemon.inject_memory_stall(Some(false)));
   let holder: &'static std::sync::OnceLock<Option<slates_rt::registry::ThreadHandle>> =
     Box::leak(Box::default());
   let released = &*Box::leak(Box::new(AtomicBool::new(false)));

@@ -153,64 +153,32 @@ fn every_recorded_replay_is_driven_as_svnserve_drove_it() {
 }
 
 /// A-751, main's red for the replay drive ("a window in units through the same encoder, red first with the past-budget
-/// counter at 0, bytes equal to today's"). Do: over the report fixtures' repository, replay r6, where `/trunk/big.txt`
-/// (6,000 lines, several windows) is edited, and r5, where it is added, with deltas, in version 0 and in version 2
-/// with LZ4, a step a call, timing each call (a call past the budget timed again from its state before,
-/// `RETIMES`). Expect: no call past `STEP_BUDGET`; `big.txt`'s delta the stream the whole-window path made
-/// (`big_text_stream`), byte for byte. Red before the change: a window was made and given in one call, milliseconds in
-/// a debug build.
+/// counter at 0, bytes equal to today's"), held by units, which contention cannot blur. Do: over the report fixtures'
+/// repository, replay r6, where `/trunk/big.txt` (6,000 lines, several windows) is edited, and r5, where it is added,
+/// with deltas, in version 0 and in version 2 with LZ4, a step a call. Expect: no window step past `WINDOW_STEP_UNITS`
+/// units, a step for every `STEP_WORK` bytes of the text at least, and `big.txt`'s delta the stream the whole-window
+/// path made (`big_text_stream`), byte for byte. Red before the change: a window was made and given in one call.
 #[test]
 fn a_large_texts_replayed_windows_are_made_with_no_step_past_its_budget() {
-  use crate::report::drive::green::repository;
-  use crate::report::drive::tests::{RETIMES, STEP_BUDGET, big_text_stream};
-  use crate::report::drive::{Call, Sources};
+  use crate::report::drive::tests::{big_text_stream, big_texts};
+  use crate::report::drive::{Call, STEP_WORK, WINDOW_STEP_UNITS, take_most_window_units};
   use crate::svndiff::{Compression, Version};
-  use std::time::{Duration, Instant};
-  let (index, green) = repository();
-  let locks = crate::lock::LockTable::new();
-  let sources = Sources {
-    index: &index,
-    repository: &green,
-    locks: &locks,
-    now: crate::lock::AprTime(0),
-    rules: None,
-  };
-  let text_at = |revision| {
-    let text = super::super::dirent(&sources, "/trunk/big.txt", revision)
-      .unwrap()
-      .unwrap()
-      .text
-      .unwrap();
-    green.texts[&text.identity].clone()
-  };
-  for (revision, base) in [(6, Some(text_at(5))), (5, None)] {
+  let (index, green, five, six) = big_texts();
+  for (revision, base, text) in [(6, Some(five.clone()), &six), (5, None, &five)] {
     for (version, compression) in [
       (Version::Zero, Compression::Stored),
       (Version::Two, Compression::Lz4),
     ] {
-      let expected = big_text_stream(
-        (base.as_deref(), &text_at(revision)),
-        (version, compression),
-      );
+      let expected = big_text_stream((base.as_deref(), text), (version, compression));
       let mut replay = Replay::new(revision, "/", 0, true).with_encoding(version, compression);
-      let (mut past, mut longest, mut streams) = (0usize, Duration::ZERO, Vec::new());
-      let mut stream: Option<Vec<u8>> = None;
+      let (mut most, mut window_steps) = (0usize, 0usize);
+      let (mut streams, mut stream) = (Vec::new(), None::<Vec<u8>>);
+      take_most_window_units();
       loop {
-        let before = replay.clone();
-        let began = Instant::now();
         let next = replay.next_within((&index, &green), None, 1).unwrap();
-        let mut took = began.elapsed();
-        for _ in 0..RETIMES {
-          if took <= STEP_BUDGET {
-            break;
-          }
-          let mut again = before.clone();
-          let began = Instant::now();
-          let _ = again.next_within((&index, &green), None, 1).unwrap();
-          took = took.min(began.elapsed());
-        }
-        longest = longest.max(took);
-        past += usize::from(took > STEP_BUDGET);
+        let units = take_most_window_units();
+        most = most.max(units);
+        window_steps += usize::from(units > 0);
         match next {
           Stepped::Ended => break,
           Stepped::Call(Call::ApplyTextDelta { .. }) => stream = Some(Vec::new()),
@@ -226,8 +194,12 @@ fn a_large_texts_replayed_windows_are_made_with_no_step_past_its_budget() {
         "r{revision}, {version:?}: big.txt's stream"
       );
       assert_eq!(
-        past, 0,
-        "r{revision}, {version:?}: longest step {longest:?}"
+        (
+          most <= WINDOW_STEP_UNITS,
+          window_steps >= text.len() / STEP_WORK
+        ),
+        (true, true),
+        "r{revision}, {version:?}: most units {most}, window steps {window_steps}"
       );
     }
   }

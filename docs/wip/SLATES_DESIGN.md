@@ -12418,6 +12418,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > whole-window steps made several of about 3 ms. Their deltas are the whole-window path's byte for byte, and the
 > recorded svnserve sessions (replay, `get-file-revs`, svndiff 0) are unchanged. The dump exporter computes its own
 > windows (`migration::export`, `deltas_at`); its format 3 adopting the maker is w-svn's.
+> **The tests hold units, not time (same day, A-751, main's red from w-perf).** The four window tests timed each step
+> against 500 us in a debug build, and failed on main under w-perf's load. They now hold each step to its own unit
+> count, which contention cannot change. The maker counts the units its steps take (`WindowMaking::units_taken`), and a
+> step takes at most those it was given plus one block's look-up (`svndiff::STEP_OVERRUN`). A window step of the drives
+> and of `get-file-revs` takes at most `report::drive::WINDOW_STEP_UNITS` (1,088): bytes read or sent, or the maker's
+> units. Red with whole-window steps: 205,172 units in a step, and 329,608 in the maker's own test. The bound found a
+> hole: a failed block look-up went back to the walk's top unchecked, so a run of misses could fill one step; the walk
+> now checks its units there. Time stays the by-use signal, read in release: the diagnostics runs' past-budget counters,
+> and `window_step_times` (`--ignored`, release). On an M-series Mac, `big.txt` r5 to r6 took 1,310 calls; 5 were past
+> 5 us, the longest 54 us.
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -56545,10 +56555,51 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   tail without a clone and return the head hashed once; `live_ship::append_entry` reads that head. Release, 2.4 MB,
   best and median of 9: a delta 3.63 / 4.59 ms before, 1.39 / 1.63 ms after; a whole state 3.06 / 3.42 ms before,
   0.94 / 0.97 ms after (`slates-db --test live measure_the_live_append_turn`, ignored, a measurement).
-- **Owed.** Part 2: the remaining hash in quantum slices across turns (a whole build's after sealing; a large delta's as
-  a build of its own). Part 3: the body held once, by identity in the content store (A-727) or an arena handle, so the
-  retained entry and the volume's whole state name one copy.
+- **Part 2 (whole builds).** `db::live::EntryHasher`, seeded by `Shipper::entry_hasher` with the next entry's place in
+  the chain and its payload's length, is fed the payload a slice at a time; `Shipper::append_checkpoint_hashed` appends
+  with its identity, refused `Behind` when the chain moved since it was seeded or it was fed other than the payload.
+  `live_ship::hash_whole_turn` joins a whole build's sealed body once its last piece is sealed, seeds the hasher, and
+  feeds it slices sized to the quantum left at the rate it measures (`piece_bytes`, a page to an archive chunk) across
+  the build's turns; `append_ready` appends the build only once it is hashed. The queue's credit keeps the build's size
+  while it hashes. Release, 2.4 MB, best and median of 9: the append turn 0.92 / 0.94 ms before, 0.46 us after, each
+  64 KiB hashing turn 27 to 32 us; peak RSS 8.80 to 8.85 MB both (`measure_the_whole_append_turn_hashed_at_once` and
+  `_in_slices`, ignored measurements). Tests: `a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once`; the
+  fleet sealed-in-turns test holds the hashing to at least a page a turn under the cut quantum (48 turns for 3 MiB),
+  red before (0 turns: hashed in the append's turn).
+- **Part 2b (large deltas).** A delta over one archive page (`built_in_turns`), sealed or in the clear, is built in turns
+  of its own as a whole state is: the build carries `whole` and `clear`, seals its pieces when this node seals, hashes
+  in slices, waits for the delta credit (`Shipper::admits_delta`) and appends with `Shipper::append_hashed`; a whole
+  state keeps A-377's rule. Release, 2.4 MB, best and median of 9, three runs: the append turn 0.92 to 1.77 / 0.94 to
+  2.32 ms before, 0.42 to 0.88 / 0.46 to 1.46 us after; each 64 KiB hashing turn 27 to 54 / 30 to 68 us
+  (`measure_the_delta_append_turn`). Tests: `a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once`; the fleet
+  test `a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own` (a three-MiB staged write, one publication), red
+  before (no build, no hashing turn), at least 48 hashing turns after.
+- **Part 3 (the body held once).** One owner and lends, no `Arc` (R2): the payload moves into the shipper at the
+  append (no clone), `Shipper::keep` names the whole entry the owner keeps as its last whole state, `trim` moves that
+  entry to a kept slot when the retained tail lets it go, and `Shipper::payload_at` lends it from either place.
+  `LiveVolume::whole` is a `WholeState`: `InLog(head)`, lent by the shipper, or `Image(head, bytes)`, an install image
+  made beside the log, which is not an entry. The content store (A-727) was not used: a live log's payload is an
+  in-memory shipping buffer, not durable content. Release, 50 volumes' 2.4 MB whole states held at rest: peak RSS 248.9
+  to 249.0 MB before, 127.7 MB after (`measure_whole_states_held_twice` and `_once`, ignored measurements). Tests:
+  `a_kept_whole_state_is_lent_after_the_retained_tail_lets_it_go`; the fleet `live`, `whole` and `install` tests and the
+  live_chaos fresh-member flow (2/2) send installs from the lent payload.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
+
+### A-756 — A volume made on a node by materialization is found there by its name: it claims its name's alias (bug, 2026-11-20, w-fed-move, kiln goal 91; found by use: kiln's live move of an agent's captured clone, its mount refused `NOENT` on the new owner in four runs of five; §4.8 "Lookup", §4.10 "Ownership follows the writer"; A-236, A-291)
+- **Why.** A clone named for another partition than its origin's lives beside its origin and is found by name only
+  through the alias its name's partition holds (A-236). A planned move releases the old owner's alias with its copy
+  (`moves::release`), and the new owner materializes the volume in the partition its id names (`fleet::make_taken`)
+  without one, so a `MNT` of the name, routed to the name's partition (`nfs::routed`), found nothing there unless the
+  name happened to hash to the clone's partition. A takeover's successor had the same gap.
+- **Change.** `verbs::claim_name_alias`: once `make_taken` has made a volume, where its name hashes to another
+  partition, the name's shard reserves and confirms the alias for it (the clone's own two steps, `Op::NameAliasReserved`
+  then `Op::NameAliasConfirmed`): nothing when it already names the volume confirmed, refused when the name or its
+  alias is another volume's; a claim not taken is counted `names.alias_step_untaken` and left to recovery's
+  reconciliation, as an alias step is.
+- **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
+  a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
+  captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
+  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.

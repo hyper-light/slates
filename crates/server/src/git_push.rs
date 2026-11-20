@@ -301,9 +301,28 @@ struct DecidingPush {
   deciding: Deciding<Entry>,
   /// The admission of the command under way's move, a turn at a time (A-722 part 4c).
   admitting: Option<slates_git::store::Admitting>,
+  /// The push's names homed in the region before its record names them (A-724 piece 8c, [`Homing`]).
+  homing: Homing,
   /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
   #[cfg(unix)]
   then: Option<hooks::PushHooks>,
+}
+
+/// Where the homing of a push's names stands (A-724 piece 8c; main's ruling of 2026-11-20 (ii): content durable at
+/// `f + 1` in the region before the record that names it). While `crate::vcs_store::write_version_3`, the decision's
+/// first turn puts the names the record would carry as one content and asks the edge to home them
+/// ([`ReceivePack::take_homing`]); the decision waits, a turn at a time, until the edge hands back the outcome
+/// ([`ReceivePack::homed`]); homed, the record is written as version 3, else as version 2.
+#[derive(Debug)]
+enum Homing {
+  /// Not yet asked.
+  Due,
+  /// Asked: the names' rows, for the edge to take, their identity and count.
+  Asked(Vec<u8>, (slates_vcs::ContentId, u64)),
+  /// Taken by the edge, its outcome awaited.
+  Waiting((slates_vcs::ContentId, u64)),
+  /// Done, or never asked: the decision goes on.
+  Done,
 }
 
 /// Where a push's answer stands between its steps.
@@ -638,6 +657,11 @@ impl<P> ReceivePack<P> {
       verdicts,
       deciding,
       admitting: None,
+      homing: if crate::vcs_store::write_version_3() {
+        Homing::Due
+      } else {
+        Homing::Done
+      },
       #[cfg(unix)]
       then: None,
     })
@@ -652,6 +676,10 @@ impl<P> ReceivePack<P> {
     state: &mut ShardState,
     mut decision: DecidingPush,
   ) -> Result<Option<(Received, Then)>, PushFailed> {
+    if !self.homing_turn(state, &mut decision) {
+      self.answer = AnswerState::Deciding(Box::new(decision));
+      return Ok(None);
+    }
     let done = {
       let DecidingPush {
         record,
@@ -685,6 +713,79 @@ impl<P> ReceivePack<P> {
     #[cfg(not(unix))]
     let then = ();
     Ok(Some((decision.deciding.received(), then)))
+  }
+}
+
+impl<P> ReceivePack<P> {
+  /// The homing of the decision's names ([`Homing`]): whether the decision may go on. Due, the names the record would
+  /// carry are put as one content (held for the record) and asked of the edge; a push that brings no object, or whose
+  /// names are not put, goes on as version 2.
+  fn homing_turn(&mut self, state: &mut ShardState, decision: &mut DecidingPush) -> bool {
+    match core::mem::replace(&mut decision.homing, Homing::Done) {
+      Homing::Done => true,
+      Homing::Due => {
+        let names = {
+          let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+          decision.sealed.names_now(lent.stores).ok()
+        };
+        let put = names
+          .filter(|(_, count)| *count > 0)
+          .and_then(|(bytes, count)| {
+            let identity = crate::vcs_store::put_names(state, &bytes)?;
+            Some((bytes, (identity, count)))
+          });
+        match put {
+          Some((bytes, named)) => {
+            decision.homing = Homing::Asked(bytes, named);
+            false
+          }
+          None => true,
+        }
+      }
+      waiting @ (Homing::Asked(..) | Homing::Waiting(_)) => {
+        decision.homing = waiting;
+        false
+      }
+    }
+  }
+
+  /// The names a decision asks the edge to home in the region (A-724 piece 8c, [`Homing`]), once: the edge awaits
+  /// `crate::vcs_store::homes::home_in_region` off the shard's step and hands the outcome to [`Self::homed`].
+  pub(crate) fn take_homing(&mut self) -> Option<Vec<u8>> {
+    let AnswerState::Deciding(decision) = &mut self.answer else {
+      return None;
+    };
+    match core::mem::replace(&mut decision.homing, Homing::Done) {
+      Homing::Asked(bytes, named) => {
+        decision.homing = Homing::Waiting(named);
+        Some(bytes)
+      }
+      other => {
+        decision.homing = other;
+        None
+      }
+    }
+  }
+
+  /// What the region answered of the names [`Self::take_homing`] gave: homed under their identity, the record is written
+  /// as version 3; else their hold is given back and the record is version 2.
+  pub(crate) fn homed(
+    &mut self,
+    state: &mut ShardState,
+    homed: Result<slates_vcs::ContentId, crate::vcs_store::homes::HomeRefused>,
+  ) {
+    let AnswerState::Deciding(decision) = &mut self.answer else {
+      return;
+    };
+    let Homing::Waiting((identity, count)) = core::mem::replace(&mut decision.homing, Homing::Done)
+    else {
+      return;
+    };
+    if homed.as_ref().is_ok_and(|homed| *homed == identity) {
+      decision.sealed.homed_as((identity, count));
+      return;
+    }
+    crate::vcs_store::release_names(state, &identity);
   }
 }
 

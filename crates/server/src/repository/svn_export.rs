@@ -112,7 +112,15 @@ fn exporter(
     .vcs_stores
     .subversion_records(id)
     .ok_or(Refusal::ContentUnavailable)?;
-  Exporter::new(records, first, last, format).map_err(|refusal| of_export(&refusal))
+  // Each whole text a piece within the shard's copy slice at the measured digest rate (the writer checks a text's
+  // checksums as it writes it), so no unit of the export's walks runs past the slice for a large text.
+  let piece = usize::try_from(state.config.svn_text_piece_bytes())
+    .ok()
+    .and_then(std::num::NonZeroUsize::new)
+    .unwrap_or(std::num::NonZeroUsize::MIN);
+  Exporter::new(records, first, last, format)
+    .map(|exporter| exporter.with_text_piece(piece))
+    .map_err(|refusal| of_export(&refusal))
 }
 
 /// The wire's refusal for the exporter's: a range the repository does not hold in `svn_repos_dump_fs4`'s words (module

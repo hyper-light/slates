@@ -105,10 +105,10 @@ proptest! {
   /// Expect: `lz4_flex`'s block.
   #[test]
   fn a_generated_inputs_block_is_lz4_flexs(
-    input in prop_oneof![
-      proptest::collection::vec(any::<u8>(), 0..3000),
-      proptest::collection::vec(0u8..4, 0..20_000),
-    ],
+    input in proptest::strategy::Union::new([
+      proptest::collection::vec(any::<u8>(), 0..3000).boxed(),
+      proptest::collection::vec(0u8..4, 0..20_000).boxed(),
+    ]),
     work in 1usize..300,
   ) {
     let (block, _) = made(&input, work);

@@ -1847,34 +1847,13 @@ mod tests {
   /// and an object abandoned part-way leaves its store as it was.
   #[test]
   fn an_object_put_a_window_at_a_time_is_the_object_put_whole() {
-    let bytes: Vec<u8> = (0..7 * NARROW + 5).map(|at| (at * 7 % 251) as u8).collect();
+    let bytes: Vec<u8> = (0..7 * NARROW + 5)
+      .map(|at| u8::try_from(at * 7 % 251).unwrap())
+      .collect();
     for len in [0, 1, NARROW - 1, NARROW, NARROW + 1, bytes.len()] {
       let object = &bytes[..len];
       for piece in [1, 3, 61, len.max(1)] {
-        let mut whole = ContentStore::new(1 << 20, NARROW).unwrap();
-        let mut streamed = ContentStore::new(1 << 20, NARROW).unwrap();
-        let mut roots = Vec::new();
-        for _ in 0..2 {
-          let root = whole.put_object(object).unwrap();
-          let mut writing = streamed.begin_object();
-          for part in object.chunks(piece) {
-            streamed.put_window(&mut writing, part).unwrap();
-          }
-          let made = streamed.finish_object(&mut writing).unwrap();
-          roots.push((root, made));
-        }
-        assert!(
-          roots.iter().all(|(root, made)| root == made),
-          "{len} by {piece}"
-        );
-        assert_eq!(held(&whole), held(&streamed), "{len} by {piece}");
-        assert_eq!(whole.used(), streamed.used(), "{len} by {piece}");
-        let (root, _) = roots[0];
-        assert_eq!(
-          streamed.object_bytes(&root, len as u64).as_deref(),
-          Some(object),
-          "{len} by {piece}"
-        );
+        assert_put_by_pieces_is_put_whole(object, piece);
       }
     }
     let mut store = ContentStore::new(1 << 20, NARROW).unwrap();
@@ -1920,5 +1899,37 @@ mod tests {
       assert_eq!(store.object_bytes(&pure, len), None);
       assert_eq!(store.len(), 0, "window {window}: nothing left");
     }
+  }
+
+  /// `object` put into one store whole and into another `piece` bytes at a time, twice each: the same root, the same
+  /// contents and bytes used, and the object read back.
+  fn assert_put_by_pieces_is_put_whole(object: &[u8], piece: usize) {
+    let len = object.len();
+    let mut whole = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut streamed = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut roots = Vec::new();
+    for _ in 0..2 {
+      let root = whole.put_object(object).unwrap();
+      let mut writing = streamed.begin_object();
+      for part in object.chunks(piece) {
+        streamed.put_window(&mut writing, part).unwrap();
+      }
+      let made = streamed.finish_object(&mut writing).unwrap();
+      roots.push((root, made));
+    }
+    assert!(
+      roots.iter().all(|(root, made)| root == made),
+      "{len} by {piece}"
+    );
+    assert_eq!(held(&whole), held(&streamed), "{len} by {piece}");
+    assert_eq!(whole.used(), streamed.used(), "{len} by {piece}");
+    let (root, _) = roots[0];
+    assert_eq!(
+      streamed
+        .object_bytes(&root, u64::try_from(len).unwrap())
+        .as_deref(),
+      Some(object),
+      "{len} by {piece}"
+    );
   }
 }

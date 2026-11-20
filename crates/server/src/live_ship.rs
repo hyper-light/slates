@@ -219,6 +219,38 @@ struct SealedPiece {
   bytes: Vec<u8>,
 }
 
+/// A live volume's last whole state, what an install sends (A-757 part 3): the log's whole entry at its head, whose one
+/// copy the shipper keeps and lends (`Shipper::keep`, `Shipper::payload_at`); or an image made at the head beside the
+/// log ([`refresh_image`]), held here. Until A-757 part 3 the volume held its own copy of each whole entry beside the
+/// shipper's, two copies of the volume at rest and three during the append.
+#[derive(Debug)]
+enum WholeState {
+  /// The whole entry at this head, lent by the shipper.
+  InLog(Head),
+  /// An image at this head, and its bytes.
+  Image(Head, Vec<u8>),
+}
+
+impl WholeState {
+  /// The head the whole state is the state at.
+  fn head(&self) -> Head {
+    match self {
+      WholeState::InLog(head) | WholeState::Image(head, _) => *head,
+    }
+  }
+}
+
+/// `live`'s last whole state, its head and its bytes lent: from the shipper for a whole entry, else its image.
+fn whole_payload(live: &LiveVolume) -> Option<(Head, &[u8])> {
+  match live.whole.as_ref()? {
+    WholeState::InLog(head) => live
+      .shipper
+      .payload_at(head.position)
+      .map(|payload| (*head, payload)),
+    WholeState::Image(head, image) => Some((*head, image.as_slice())),
+  }
+}
+
 /// A live volume on its owner shard.
 #[derive(Debug)]
 pub(crate) struct LiveVolume {
@@ -231,7 +263,7 @@ pub(crate) struct LiveVolume {
   owes_image: bool,
   /// The last whole state's payload and its head: the last whole entry, or an image a publication's state made at its
   /// own head ([`refresh_image`]). What an install sends.
-  whole: Option<(Head, Vec<u8>)>,
+  whole: Option<WholeState>,
   /// The anchors whose copy of the volume's lineage key the last whole entry carries (`None`: its body is in the
   /// clear, which any successor opens): a successor opens the log only through its own key entry there, so the log
   /// is durable only once that entry covers every remote candidate ([`covers_candidates`]).
@@ -2176,8 +2208,8 @@ pub(crate) fn published(
   // A whole entry of more than one piece is sealed in turns of this shard (A-377): sealed here in one turn, its AEAD and
   // keyed names a byte held the shard about a second a GiB (g251's trace: a taken-over volume's first publication,
   // 1.06 s in one turn).
-  if whole && sealed_in_pieces(state, &body) {
-    begin_whole_build(state, id, body);
+  if built_in_turns(state, whole, &body) {
+    begin_whole_build(state, id, body, whole);
     return;
   }
   let Some((payload, anchors)) = sealed_payload(state, id, whole, body) else {
@@ -2234,6 +2266,30 @@ fn append_entry(
   payload: Vec<u8>,
   anchors: Option<Vec<u64>>,
 ) -> Result<(), NotAppended> {
+  append_entry_with(state, id, (whole, image_now), payload, anchors, None)
+}
+
+/// [`append_entry`] for a whole build's entry, whose identity `hashed` was hashed in the build's turns (A-757 part 2).
+fn append_entry_hashed(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  whole: bool,
+  payload: Vec<u8>,
+  anchors: Option<Vec<u64>>,
+  hashed: Option<slates_db::live::EntryHasher>,
+) -> Result<(), NotAppended> {
+  append_entry_with(state, id, (whole, false), payload, anchors, hashed)
+}
+
+/// [`append_entry`]'s body: a whole entry with `hashed` appends with that identity.
+fn append_entry_with(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  (whole, image_now): (bool, bool),
+  payload: Vec<u8>,
+  anchors: Option<Vec<u64>>,
+  hashed: Option<slates_db::live::EntryHasher>,
+) -> Result<(), NotAppended> {
   let referenced = referenced_bytes(state, id);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return Err(NotAppended::Gone);
@@ -2241,25 +2297,37 @@ fn append_entry(
   // A whole record is a checkpoint and may go one past the credit (`Shipper::append_checkpoint`); a delta waits for it.
   // The head alone back: the entry stays in the retained tail, and its identity is hashed once (w-forming,
   // 2026-11-20: asked here twice more, each a copy and a hash of the payload).
+  // The payload moves into the shipper, its one copy (A-757 part 3): a whole state is lent back from there.
+  let payload_len = payload.len();
   let appended = if whole {
-    live.shipper.append_checkpoint_kept(payload.clone())
+    match hashed {
+      Some(hashed) => live.shipper.append_checkpoint_hashed(payload, hashed),
+      None => live.shipper.append_checkpoint_kept(payload),
+    }
   } else {
-    live.shipper.append_kept(payload.clone())
+    match hashed {
+      Some(hashed) => live.shipper.append_hashed(payload, hashed),
+      None => live.shipper.append_kept(payload),
+    }
   };
   let head = appended.map_err(NotAppended::Refused)?;
+  if whole {
+    // Kept before any bound trims the tail, so the whole state is never let go while it is the last.
+    live.shipper.keep(Some(head.position));
+  }
   let published_ns = live
     .publishing_ns
     .take()
     .unwrap_or_else(slates_machine::clock::monotonic_ns);
   live.newest = Some((head.position, published_ns));
-  let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+  let shipped = u64::try_from(payload_len).unwrap_or(u64::MAX);
   if whole {
     live.owes_whole = false;
   }
   live.kept = if whole {
-    payload.len()
+    payload_len
   } else {
-    live.kept.saturating_add(payload.len())
+    live.kept.saturating_add(payload_len)
   };
   // An image is made from the volume's state only where that state is this entry's head: never in a queue's drain,
   // where later publications are captured past it (A-377); the record period makes it once the volume is clean.
@@ -2271,8 +2339,8 @@ fn append_entry(
     // record a turned-away one leads to, and shipping a laggard the entries it lacks never costs more than
     // installing it (`Bounds::of_whole`). The fixed credit of two entries had made a third publication inside one
     // round trip ship the whole volume.
-    live.shipper.set_bounds(Bounds::of_whole(payload.len()));
-    live.whole = Some((head, payload));
+    live.shipper.set_bounds(Bounds::of_whole(payload_len));
+    live.whole = Some(WholeState::InLog(head));
     live.owes_image = false;
     live.whole_anchors = anchors;
     live.whole_entry = Some(head);
@@ -2280,7 +2348,7 @@ fn append_entry(
   }
   // Every entry moves the retained tail to the volume as it is now ([`retain_bound`]); the credit stays where the last
   // whole record or image put it.
-  let last_whole = live.whole.as_ref().map_or(0, |(_, image)| image.len());
+  let last_whole = whole_payload(live).map_or(0, |(_, payload)| payload.len());
   let bounds = live.shipper.bounds();
   live.shipper.set_bounds(Bounds {
     retain: retain_bound(last_whole, referenced),
@@ -2336,6 +2404,15 @@ struct WholeBuild {
   /// The bytes sealed so far and the clock time their seals took, the rate the next piece is sized by
   /// ([`piece_bytes`]).
   seal_rate: (u64, u64),
+  /// Once every piece is sealed: the whole entry's payload, joined once, and its identity's hasher, fed a slice a turn
+  /// at the rate `hash_rate` measures ([`hash_whole_turn`], A-757 part 2).
+  hashing: Option<(Vec<u8>, slates_db::live::EntryHasher)>,
+  /// The bytes hashed so far and the clock time their hashing took.
+  hash_rate: (u64, u64),
+  /// Whether it is a whole state; else a large delta built in turns of its own (A-757 part 2b).
+  whole: bool,
+  /// Whether its body ships in the clear (this node seals nothing): nothing to seal, only to hash.
+  clear: bool,
 }
 
 impl std::fmt::Debug for WholeBuild {
@@ -2368,6 +2445,17 @@ enum Advance {
   Done,
 }
 
+/// Whether a publication of plain `body` is sealed and hashed in turns of a build of its own: a whole entry that this node
+/// seals spanning more than one piece ([`sealed_in_pieces`], A-377), or a delta over one archive page, sealed or not
+/// (A-757 part 2b: a 2.4 MB delta was sealed and hashed in the turn that published it, 1.39 ms of release CPU, 128 to
+/// 331 ms in a debug fleet under `taskpolicy -b`).
+fn built_in_turns(state: &ShardState, whole: bool, body: &[u8]) -> bool {
+  if whole {
+    return sealed_in_pieces(state, body);
+  }
+  usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES).is_ok_and(|page| body.len() > page)
+}
+
 /// Whether a whole entry of plain `body` is sealed in turns: this node seals, and the body spans more than one piece.
 fn sealed_in_pieces(state: &ShardState, body: &[u8]) -> bool {
   state.seal_root.is_some()
@@ -2395,8 +2483,13 @@ fn pending_entries(live: &LiveVolume) -> u64 {
 
 /// Begins sealing the whole entry of plain `body` in turns ([`WholeBuild`]); its first turn runs now, and a task of this
 /// shard runs the rest.
-fn begin_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId, body: Vec<u8>) {
-  begin_whole_build_with(state, id, body, (VecDeque::new(), 0));
+fn begin_whole_build(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  body: Vec<u8>,
+  whole: bool,
+) {
+  begin_whole_build_with(state, id, body, whole, (VecDeque::new(), 0));
 }
 
 /// [`begin_whole_build`] with the publications already queued behind it and their delta bytes (a queue's drain met a
@@ -2405,17 +2498,26 @@ fn begin_whole_build_with(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   body: Vec<u8>,
+  whole: bool,
   (queued, queued_bytes): (VecDeque<Queued>, usize),
 ) {
-  let Some((sealing, anchors)) = whole_sealing(state, id, true) else {
+  let clear = state.seal_root.is_none();
+  let sealed = if clear {
+    Some((None, Vec::new()))
+  } else {
+    whole_sealing(state, id, whole)
+  };
+  let Some((sealing, anchors)) = sealed else {
     drop_queue(state, id, queued.len(), "fleet.live.refused.no_payload");
     return;
   };
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return;
   };
-  // The build is the whole state the volume owed: a barrier made now waits for its position, not one after it.
-  live.owes_whole = false;
+  if whole {
+    // The build is the whole state the volume owed: a barrier made now waits for its position, not one after it.
+    live.owes_whole = false;
+  }
   live.building = Some(Box::new(WholeBuild {
     body,
     next: 0,
@@ -2426,8 +2528,19 @@ fn begin_whole_build_with(
     queued,
     queued_bytes,
     seal_rate: (0, 0),
+    hashing: None,
+    hash_rate: (0, 0),
+    whole,
+    clear,
   }));
-  state.count(LIVE_WHOLE_BUILDS, 1);
+  state.count(
+    if whole {
+      LIVE_WHOLE_BUILDS
+    } else {
+      LIVE_DELTA_BUILDS
+    },
+    1,
+  );
   if advance_whole_build(state, id) == Advance::Done {
     return;
   }
@@ -2484,11 +2597,22 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
     drop_build(state, id, LIVE_BUILD_SUPERSEDED);
     return Advance::Done;
   }
+  let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
+  let clear = state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .and_then(|live| live.building.as_ref())
+    .is_some_and(|build| build.clear);
+  if clear {
+    // A body in the clear has nothing to seal: its turns hash it ([`hash_whole_turn`]).
+    state.count(LIVE_WHOLE_BUILD_TURNS, 1);
+    return hash_then_append(state, id, slates_rt::futures::now_ns(), quantum);
+  }
   let Some((lineage, namer, segment)) = body_keys(state, id) else {
     drop_build(state, id, "fleet.live.refused.no_payload");
     return Advance::Done;
   };
-  let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
   let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES)
     .unwrap_or(usize::MAX)
     .max(1);
@@ -2544,8 +2668,112 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
   if !sealed_whole {
     return Advance::More;
   }
+  hash_then_append(state, id, began, quantum)
+}
+
+/// A sealed (or clear) build's turn past its sealing: its identity hashed this turn as far as the quantum allows
+/// ([`hash_whole_turn`]), and once every byte is, the build appended ([`append_build`]).
+fn hash_then_append(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  began: u64,
+  quantum: u64,
+) -> Advance {
+  match hash_whole_turn(state, id, began, quantum) {
+    Advance::More => return Advance::More,
+    Advance::Done => {}
+  }
   append_build(state, id);
   Advance::Done
+}
+
+/// One turn of a sealed [`WholeBuild`]'s identity (A-757 part 2): its payload joined and its hasher seeded from the
+/// shipper's next place in the turn after the last piece is sealed, then fed slices sized to the quantum left at the
+/// rate it measures ([`piece_bytes`], a page at least) until every byte is hashed. `Done` once it is (or the build is
+/// gone), so the build appends with the identity in its next step; `More` while bytes are left. Until 2026-11-20 the
+/// whole payload was hashed in the turn that appended it: 0.94 ms of release CPU for 2.4 MB against seal quanta of 14
+/// to 784 us, three times that before A-757 part 1.
+fn hash_whole_turn(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  began: u64,
+  quantum: u64,
+) -> Advance {
+  let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES)
+    .unwrap_or(usize::MAX)
+    .max(1);
+  let floor = usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES)
+    .unwrap_or(cap)
+    .clamp(1, cap);
+  let feeding = state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .and_then(|live| live.building.as_ref())
+    .is_some_and(|build| !build.appended && build.hashing.is_some());
+  if feeding {
+    state.count(LIVE_WHOLE_HASH_TURNS, 1);
+  }
+  let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
+    return Advance::Done;
+  };
+  let Some(build) = live.building.as_mut() else {
+    return Advance::Done;
+  };
+  if build.appended {
+    return Advance::Done;
+  }
+  let Some((payload, hasher)) = build.hashing.as_mut() else {
+    let kind = if build.whole { KIND_WHOLE } else { KIND_DELTA };
+    let payload = if build.clear {
+      let mut payload = vec![kind, BODY_CLEAR];
+      payload.extend_from_slice(&build.body);
+      payload
+    } else {
+      let mut payload = vec![kind, BODY_SEALED];
+      payload.extend_from_slice(
+        &SealedBody {
+          sealing: build.sealing.take(),
+          pieces: std::mem::take(&mut build.sealed),
+        }
+        .to_bytes(),
+      );
+      payload
+    };
+    build.body = Vec::new();
+    match live.shipper.entry_hasher(payload.len()) {
+      Ok(hasher) => build.hashing = Some((payload, hasher)),
+      Err(_) => {
+        drop_build(state, id, "fleet.live.refused.no_position");
+        return Advance::Done;
+      }
+    }
+    return Advance::More;
+  };
+  loop {
+    let fed = hasher.fed();
+    if fed >= payload.len() {
+      return Advance::Done;
+    }
+    let left = quantum.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    let size = piece_bytes(build.hash_rate, left, floor, cap);
+    let Some(slice) = payload.get(fed..fed.saturating_add(size).min(payload.len())) else {
+      return Advance::Done;
+    };
+    let slice_began = slates_rt::futures::now_ns();
+    hasher.feed(slice);
+    let (rate_bytes, rate_ns) = build.hash_rate;
+    build.hash_rate = (
+      rate_bytes.saturating_add(u64::try_from(slice.len()).unwrap_or(u64::MAX)),
+      rate_ns.saturating_add(slates_rt::futures::now_ns().saturating_sub(slice_began)),
+    );
+    if hasher.fed() >= payload.len() {
+      return Advance::Done;
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= quantum {
+      return Advance::More;
+    }
+  }
 }
 
 /// Appends what `id`'s [`WholeBuild`] holds ready ([`append_ready`]) and ships it.
@@ -2570,30 +2798,39 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
     let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
       return appended_any;
     };
-    let admits = live.shipper.admits_checkpoint();
+    let checkpoint_admitted = live.shipper.admits_checkpoint();
     let Some(build) = live.building.as_mut() else {
       return appended_any;
     };
+    // A whole build rides one past the credit as a checkpoint; a delta built in turns waits for the delta credit.
+    let admits = if build.whole {
+      checkpoint_admitted
+    } else {
+      build
+        .hashing
+        .as_ref()
+        .is_some_and(|(payload, _)| live.shipper.admits_delta(payload.len()))
+    };
     if !build.appended {
-      if build.next < build.body.len() {
+      // Appended only once its identity is hashed, in the build's turns ([`hash_whole_turn`]).
+      let hashed = build
+        .hashing
+        .as_ref()
+        .is_some_and(|(payload, hasher)| hasher.fed() >= payload.len());
+      if !hashed {
         return appended_any;
       }
       if !admits {
         state.count(LIVE_BUILD_WAITED, 1);
         return appended_any;
       }
-      let mut payload = vec![KIND_WHOLE, BODY_SEALED];
-      payload.extend_from_slice(
-        &SealedBody {
-          sealing: build.sealing.take(),
-          pieces: std::mem::take(&mut build.sealed),
-        }
-        .to_bytes(),
-      );
+      let Some((payload, hasher)) = build.hashing.take() else {
+        return appended_any;
+      };
       let anchors = std::mem::take(&mut build.anchors);
-      build.body = Vec::new();
+      let whole = build.whole;
       build.appended = true;
-      match append_entry(state, id, (true, false), payload, Some(anchors)) {
+      match append_entry_hashed(state, id, whole, payload, Some(anchors), Some(hasher)) {
         Ok(()) => appended_any = true,
         Err(_) => {
           drop_build(state, id, "fleet.live.refused.no_position");
@@ -2609,7 +2846,7 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
     if !next.whole {
       build.queued_bytes = build.queued_bytes.saturating_sub(next.body.len());
     }
-    if next.whole && sealed_in_pieces(state, &next.body) {
+    if built_in_turns(state, next.whole, &next.body) {
       let rest = state
         .live
         .shipping
@@ -2618,7 +2855,7 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
         .map_or((VecDeque::new(), 0), |build| {
           (build.queued, build.queued_bytes)
         });
-      begin_whole_build_with(state, id, next.body, rest);
+      begin_whole_build_with(state, id, next.body, next.whole, rest);
       return appended_any;
     }
     let sealed = sealed_payload(state, id, next.whole, next.body.clone());
@@ -2752,7 +2989,12 @@ fn queue_behind_build(
   let Some(build) = live.building.as_mut() else {
     return;
   };
-  let credit = credit.max(build.body.len());
+  // The build's size whether it is sealing (its plain body) or hashing (its sealed payload, A-757 part 2).
+  let building_bytes = build
+    .hashing
+    .as_ref()
+    .map_or(build.body.len(), |(payload, _)| payload.len());
+  let credit = credit.max(building_bytes);
   if !whole && build.queued_bytes > 0 && build.queued_bytes.saturating_add(body.len()) > credit {
     refuse(state, id, "fleet.live.refused.no_credit");
     return;
@@ -2770,6 +3012,10 @@ const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
 /// Counter: one turn of a whole entry's sealing ([`advance_whole_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_WHOLE_BUILD_TURNS: &str = "fleet.live.whole_build_turns";
+/// Counter: the large deltas sealed and hashed in turns of a build of their own (A-757 part 2b).
+const LIVE_DELTA_BUILDS: &str = "fleet.live.delta_builds";
+/// Counter: the turns a whole build hashed its entry's identity in (A-757 part 2), a slice of the payload a turn.
+const LIVE_WHOLE_HASH_TURNS: &str = "fleet.live.whole_hash_turns";
 /// Counter: a publication captured while a whole entry sealed and queued behind it ([`queue_behind_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_QUEUED: &str = "fleet.live.queued";
@@ -2908,7 +3154,9 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   };
   live.shipper.mark_checkpoint(head);
   live.shipper.set_bounds(Bounds::of_whole(image.len()));
-  live.whole = Some((head, image));
+  // The image is the whole state now, held here; the shipper keeps no entry for it.
+  live.shipper.keep(None);
+  live.whole = Some(WholeState::Image(head, image));
   // The entry's anchors stay what A-240 judges the log by (`whole_anchors`); the image's are judged beside them.
   // An image sealed under no keys (a volume shipped in the clear) has none to judge.
   live.image_anchors = anchors;
@@ -3511,7 +3759,7 @@ fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<S
   if live.owes_image {
     return (None, false);
   }
-  let Some((head, payload)) = &live.whole else {
+  let Some((head, payload)) = whole_payload(live) else {
     return (None, true);
   };
   if live
@@ -3525,8 +3773,8 @@ fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<S
     owner: live.shipper.owner(),
     object,
     epoch: live.shipper.epoch(),
-    head: *head,
-    state: payload.clone(),
+    head,
+    state: payload.to_vec(),
   };
   let send = Send {
     object,
@@ -3742,9 +3990,13 @@ fn reached_volume(s: &mut ShardState, volume: [u8; 16], holder: HostId) -> bool 
   let Some(live) = s.live.shipping.get_mut(&volume) else {
     return false;
   };
-  let behind_the_tail = live.whole.as_ref().is_some_and(|(head, _)| {
-    Some(*head) != live.shipper.head() && !live.shipper.retains_after(head.position)
-  });
+  let behind_the_tail = live
+    .whole
+    .as_ref()
+    .map(WholeState::head)
+    .is_some_and(|head| {
+      Some(head) != live.shipper.head() && !live.shipper.retains_after(head.position)
+    });
   if behind_the_tail && live.shipper.pending(holder) == Next::Install {
     live.owes_image = true;
   }
@@ -8025,7 +8277,7 @@ mod tests {
       let at_risk = holds_nothing_yet(state, clone);
       let live = state.live.shipping.get_mut(&clone.bytes)?;
       let head = live.whole_entry?;
-      let image = live.whole.as_ref().map(|(_, payload)| payload.len())?;
+      let image = whole_payload(live).map(|(_, payload)| payload.len())?;
       let _ = live.shipper.on_reply(holders[0], Ok(Some(head)));
       resolve(state, clone.bytes);
       Some((

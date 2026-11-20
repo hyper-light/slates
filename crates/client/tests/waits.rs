@@ -19,8 +19,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: the probe budget of the quick profile these tests measure (milliseconds).
 const PROBE_MS: u64 = 5;
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the part of the watchdog's window (`LIVENESS_BUDGET_NS`) a held daemon's shard is kept off the CPU: half.
 /// The watchdog calls a shard stuck only after a whole window in which it did not move (A-228,
 /// `crates/server/src/watchdog.rs`), so the daemon is alive by its own judgment throughout the hold.
@@ -90,15 +88,9 @@ fn one_shard_daemon(instance: &str) -> Daemon {
 
 /// A client of `instance` with `deadlines`, retrying the rendezvous while the daemon starts.
 fn connect(instance: &str, deadlines: Deadlines) -> Client {
-  let started = Instant::now();
   loop {
     match Client::connect(instance, deadlines) {
       Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::thread::yield_now();
-      }
       Err(e) => panic!("{e}"),
     }
   }

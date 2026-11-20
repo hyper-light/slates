@@ -78,6 +78,9 @@ pub struct Exporter {
   refused: Option<MigrationRefusal>,
   /// The revision being written, between its calls; none before its revision record.
   drive: Option<Pending>,
+  /// The most bytes of a whole text (format 2) one call writes: the caller's ([`Exporter::with_text_piece`]), a
+  /// window's room until it says ([`WINDOW_LIMIT`]). The dump's bytes are the same whatever it is.
+  text_piece: NonZeroUsize,
 }
 
 /// A revision's replay between calls of [`Exporter::export`]: its changed paths in the path driver's order, how many
@@ -168,7 +171,17 @@ impl Exporter {
       started: false,
       refused: None,
       drive: None,
+      text_piece: window_room()?,
     })
+  }
+
+  /// This export with each whole text (format 2) written `piece` bytes a call: what a caller sizes to the time its
+  /// slice may take, since the dump's writer digests every piece it writes (MD5 and SHA-1, checking the text's
+  /// checksums). The bytes are the same whatever the piece.
+  #[must_use]
+  pub fn with_text_piece(mut self, piece: NonZeroUsize) -> Self {
+    self.text_piece = piece;
+    self
   }
 
   /// Appends the next part of the range's records to `out` ([`Exporting::Wrote`]), so one call's work is one changed
@@ -276,7 +289,12 @@ impl Exporter {
     let pending = drive.as_mut().ok_or(MigrationRefusal::Corrupt)?;
     if let Some(texting) = pending.text {
       let mut stream = Stream { writer, out };
-      pending.text = write_text(repository, &mut stream, texting, &mut pending.texts)?;
+      pending.text = write_text(
+        repository,
+        &mut stream,
+        (texting, self.text_piece),
+        &mut pending.texts,
+      )?;
       return Ok(false);
     }
     if let Some(measuring) = pending.measuring {
@@ -847,7 +865,7 @@ fn bytes_of(
 fn write_text(
   repository: &Repository,
   stream: &mut Stream<'_>,
-  texting: Texting,
+  (texting, text_piece): (Texting, NonZeroUsize),
   texts: &mut Vec<(ContentIdentity, Vec<u8>)>,
 ) -> Result<Option<Texting>, MigrationRefusal> {
   let room = window_room()?;
@@ -857,7 +875,7 @@ fn write_text(
       let bytes = bytes_of(texts, text)?;
       let start = usize::try_from(sent).map_err(|_| MigrationRefusal::Corrupt)?;
       let rest = bytes.get(start..).unwrap_or_default();
-      let piece = rest.get(..room.get()).unwrap_or(rest);
+      let piece = rest.get(..text_piece.get()).unwrap_or(rest);
       if !piece.is_empty() {
         stream.event(&Event::Text(piece))?;
       }
