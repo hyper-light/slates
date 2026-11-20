@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: parked-wait bound 968c90093 (main 92bc438bf). (a) complete. NOW: svn_made copies (copy-from rows), then
+  symlinks (svn:special). Then A-697 (a)-(f), A-658 3c (briefs/g305.md, progress/g305-merge-anywhere.md). Target dir was wiped
+  clean for disk (90 GB free then).
+
 ## LANDED 2026-11-20: flaky fix 1d4aeb63d (da4dc2ff0); push storm 6ad42c7a4 (c0071e402). NOW: parked submit's wait bounded by
   the derived failover delay (state.failover_ns, as base_wait), typed refusal past it. Then svn copies, symlinks; A-697; A-658 3c.
 
