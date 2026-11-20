@@ -1316,7 +1316,11 @@ pub(crate) async fn unbundle(
 ) -> Option<PushOutcome> {
   // A-740: a shard stuck in this step names it.
   let _doing = slates_rt::futures::doing("hg_push::unbundle");
-  let fronted = crate::state::with_state(|state| front(state, repository, (heads, bundle), room));
+  let fronted = crate::state::with_state(|state| {
+    vcs_store::lent_state(state, |state| {
+      front(state, repository, (heads, bundle), room)
+    })
+  });
   let mut unbundle = match fronted.flatten()? {
     Ok(unbundle) => unbundle,
     Err(outcome) => return Some(outcome),
@@ -1565,7 +1569,10 @@ pub(crate) fn unbundle_in(
   (principal, heads, bundle): Pushing<'_>,
   room: &mut Admission,
 ) -> Option<PushOutcome> {
-  let mut unbundle = match front(state, repository, (heads, bundle), room)? {
+  let fronted = vcs_store::lent_state(state, |state| {
+    front(state, repository, (heads, bundle), room)
+  });
+  let mut unbundle = match fronted? {
     Ok(unbundle) => unbundle,
     Err(outcome) => return Some(outcome),
   };
@@ -1840,26 +1847,28 @@ pub(crate) fn prepare_whole<V: Repository>(
   room: &mut Admission,
 ) -> Result<Prepared, Box<Refused>> {
   let forked = forked_whole(state, repository, unbundle, room)?;
-  let prepared = match state.vcs_stores.mercurial_ref(repository) {
-    None => Err(abort(NO_STORE.to_vec())),
-    Some((content, store)) => {
-      let held = IndexHeld::new(
-        forked.as_ref().map_or(&store.index, |forked| &forked.fork),
-        content,
-      );
-      brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
-        prepare(
-          state,
-          repository,
-          unbundle,
-          (view, &held),
-          (&brought, &held_changesets),
-          terms,
-          room,
-        )
-      })
+  let prepared = vcs_store::lent_state(state, |state| {
+    match state.vcs_stores.mercurial_ref(repository) {
+      None => Err(abort(NO_STORE.to_vec())),
+      Some((content, store)) => {
+        let held = IndexHeld::new(
+          forked.as_ref().map_or(&store.index, |forked| &forked.fork),
+          content,
+        );
+        brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
+          prepare(
+            state,
+            repository,
+            unbundle,
+            (view, &held),
+            (&brought, &held_changesets),
+            terms,
+            room,
+          )
+        })
+      }
     }
-  };
+  });
   attach(state, prepared, forked)
 }
 
@@ -1874,25 +1883,27 @@ pub(crate) fn prepare_served(
 ) -> Result<Prepared, Box<Refused>> {
   let forked = forked_whole(state, repository, unbundle, room)?;
   let over = forked.as_ref().map(|forked| &forked.fork);
-  let prepared = hg_view::with_view_over(
-    state,
-    repository,
-    over,
-    room,
-    |view, held, content, room| {
-      brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
-        prepare(
-          state,
-          repository,
-          unbundle,
-          (view, &held),
-          (&brought, &held_changesets),
-          terms,
-          room,
-        )
-      })
-    },
-  )
+  let prepared = vcs_store::lent_state(state, |state| {
+    hg_view::with_view_over(
+      state,
+      repository,
+      over,
+      room,
+      |view, held, content, room| {
+        brought_of(forked.as_ref(), content, room).and_then(|(brought, held_changesets)| {
+          prepare(
+            state,
+            repository,
+            unbundle,
+            (view, &held),
+            (&brought, &held_changesets),
+            terms,
+            room,
+          )
+        })
+      },
+    )
+  })
   .unwrap_or_else(|| Err(abort(NO_STORE.to_vec())));
   attach(state, prepared, forked)
 }
@@ -1973,14 +1984,17 @@ fn landing(
   let judged = if moved {
     Some(Err(PushOutcome::Unprocessed(MOVED.to_vec())))
   } else {
-    judged_over(
-      state,
-      repository,
-      (principal, bundle),
-      unbundle,
-      forked.as_ref(),
-      room,
-    )
+    // Judging reads the served view's texts from the repository's windows: the shard's chunk store is lent to it.
+    vcs_store::lent_state(state, |state| {
+      judged_over(
+        state,
+        repository,
+        (principal, bundle),
+        unbundle,
+        forked.as_ref(),
+        room,
+      )
+    })
   };
   let mut prepared = match judged {
     Some(Ok(prepared)) => prepared,

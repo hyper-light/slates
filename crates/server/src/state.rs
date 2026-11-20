@@ -864,6 +864,10 @@ pub struct ShardState {
   /// and cleared by `run_recorded`: the verb's effects commit now, its completion is recorded when the
   /// deferred reply resolves, and no reply is written for it now.
   pub(crate) acceptance_deferred: bool,
+  /// The least volume counter no mint on this shard has named (`verbs::fresh_volume_id_at`): an id minted before the
+  /// record that holds it (an image's identity, a job's volume) is the shard's alone, never the next mint's too. Held in
+  /// memory alone: a restart ends every unrecorded mint's job, and the database's counter is past every recorded id.
+  pub(crate) volume_ids_minted: u64,
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
