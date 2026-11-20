@@ -41928,8 +41928,10 @@ takes the target it expects).
   Last, c lands the clone into the captured tree with an outsider's edit to `/kept`. Its plan must be the agent's
   changes since the capture alone, and the landing must write `/changed` as b left it and `/made` as c did, the
   outsider's file kept.
-- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
-  helper.
+- **Run.** Compiled and passed unchanged, with A-583's two fleet tests, on macOS arm64, local, over 3fee2f575
+  (2026-11-19, w-fed-a503): `cargo test --locked -p slates-server --test fleet -- --exact <name>`, 1 passed (22.5 s);
+  A-583's two, 2 passed (27.2 s); `cargo fmt -p slates-server -- --check` clean. No code fix was needed; the Linux
+  x86_64 lane is owed. Nothing new in the server's library needed a helper.
 
 ### A-555, third piece — A FUSE request that meets a pending base is kept off the device and dispatched again when its fetch lands (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base", §4.6 "Linux (own /dev/fuse driver)"; A-555; Linux-only, written and filed for main's build)
 Applied in the same change to: `crates/bridge-fuse` (`channel`: `dispatch_kept` beside `dispatch_ready`, both through
