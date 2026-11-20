@@ -54,7 +54,6 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{Principal, RepositoryId, VcsTool, VolumeId as DbVolumeId};
-use slates_ipc::protocol::Refusal;
 use slates_merge::engine::{Green, Increment};
 use slates_merge::ops_doc::{NODE_EXCLUSIVE, Op, OpKind, OpsDoc, REPLACE};
 use slates_svn::commit::drive::Work;
@@ -96,6 +95,10 @@ pub(crate) const DIVERGED: &str = "repository.svn.diverged";
 /// Counter: a revision the records refused at its apply after its entry was recorded: zero in every correct use, since
 /// the check in the same turn decided it; the records are made again from the log. Format: a counter name.
 pub(crate) const APPLY_REFUSED: &str = "repository.svn.apply_refused";
+
+/// Counter: a revision whose chain entry the green chains had no room for, its green checkpointed at its floor first so
+/// the entry is appended once (A-742): the non-vacuity count of that path. Format: a counter name.
+pub(crate) const CHAIN_ROOM_CHECKPOINTED: &str = "repository.svn.chain_room_checkpointed";
 
 /// Counter: a revision refused because its green version cannot be declared yet (module docs). Format: a counter name.
 pub(crate) const UNSUPPORTED: &str = "repository.svn.unsupported";
@@ -464,24 +467,26 @@ fn land(
   let growth = grown(&checked);
   crate::vcs_store::reserve_svn(state, repository, growth)
     .map_err(|available| Uncommitted::Budget { available })?;
+  // The chain entry's bound (its copies' fixes' room with it, A-626), known before the append: where the chains have
+  // less room than that, the green is checkpointed at its floor first, as a push's admission meets the cap (A-238),
+  // and the entry appended once. Before A-742 the entry was appended, refused at the cap, and appended again from a
+  // copy of its parts kept for that, a revision's bytes copied at every commit (201 MiB in a 1,000-revision import).
+  let room = state
+    .greens
+    .get(&green)
+    .map_or(0, |engine| engine.copy_entry_room(&work));
+  let bound =
+    slates_merge::chain_entry::entry_bound(work.encoded_len(), &work).saturating_add(room);
+  if state.db.partition().green_chain_room() < bound {
+    state.count(CHAIN_ROOM_CHECKPOINTED, 1);
+    crate::merge_service::checkpoint_green_when(state, green, crate::merge_service::Doubling::Now);
+  }
   let parts = EntryParts {
     objects: record,
     ..EntryParts::default()
   };
   let change = BranchChange::Update { green, work };
-  let mut appended = RepositoryLogs::append(
-    state,
-    principal,
-    repository,
-    vec![change.clone()],
-    parts.clone(),
-  );
-  if at_capacity(&appended) {
-    // The chain at the partition's cap, as a push's admission meets it (A-238): checkpoint the green at its floor at
-    // once and append again.
-    crate::merge_service::checkpoint_green_when(state, green, crate::merge_service::Doubling::Now);
-    appended = RepositoryLogs::append(state, principal, repository, vec![change], parts);
-  }
+  let appended = RepositoryLogs::append(state, principal, repository, vec![change], parts);
   match appended {
     Ok(appended) => {
       // Fold the green's chain by the merge service's doubling rule as every accepted version does (W3), so a
@@ -494,14 +499,6 @@ fn land(
       Err(Uncommitted::Append(refused))
     }
   }
-}
-
-/// Whether `appended` was refused for the partition's merge budget (`green_chains` at its cap).
-fn at_capacity<T>(appended: &Result<T, AppendRefused>) -> bool {
-  matches!(
-    appended,
-    Err(AppendRefused::Entry(Refusal::TableAtCapacity { table })) if table == "green_chains"
-  )
 }
 
 /// The records once the entry recorded the revision: applied, as the check made certain; the answer `commit-info`

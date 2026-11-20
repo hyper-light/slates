@@ -4697,15 +4697,25 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   );
 }
 
-/// AC (§4.8 "Lookup": a lookup by id routes to the volume's creator, whatever the asker's region). Three daemons in
-/// one region; a volume is created and write-attached on a. Do: through clients of b and c, ask its status, make a
-/// directory in it under b's client's own attachment of it (A-222: a forward through a's attachment is refused since
-/// 2026-11-05), and list its root. Expect: each is served by a, the directory b made is the
-/// one c lists, and a lists it too. Before 2026-10-07 only a volume homed in another region was forwarded; a client
-/// of b or c was answered `NotFound` for a's volume (found on two Docker networks, `docs/wip/GAPS.md`).
-#[test]
-fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_through_the_owner() {
-  let _serial = serialize_fleet_tests();
+/// A volume `client_a` creates on a and attaches for writing: its id and the attachment, or what refused either.
+fn created_and_write_attached(client_a: &mut Client) -> Result<(VolumeId, u64), String> {
+  let ReplyBody::Created { id } = client_a.call(&scratch("same-region")) else {
+    return Err("create on node a did not return an id".to_owned());
+  };
+  match client_a.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) {
+    ReplyBody::Attached { attachment, .. } => Ok((id, attachment)),
+    other => Err(format!("write attach on node a: {other:?}")),
+  }
+}
+
+/// Three daemons a, b and c in one region, started and formed: the daemons, their instances, and the lease on their
+/// serve ports (held while they run).
+fn three_in_one_region() -> (Vec<Daemon>, Vec<String>, PortLease) {
   let names = ["a", "b", "c"];
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
@@ -4713,7 +4723,7 @@ fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_thr
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let (serve_lease, serve) = mesh_serve_ports(n);
   let regions: std::collections::BTreeMap<HostId, RegionId> =
     hosts.iter().map(|host| (*host, RegionId(0))).collect();
   let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
@@ -4726,68 +4736,16 @@ fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_thr
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
   assert_fleet_forms(&daemons, &hosts, &names);
+  (daemons, instances, serve_lease)
+}
 
-  let mut client_a = Client::connect(&instances[0].clone());
-  let ReplyBody::Created { id } = client_a.call(&scratch("same-region")) else {
-    for daemon in daemons {
-      daemon.stop();
-    }
-    panic!("create on node a did not return an id");
-  };
-  let attachment = match client_a.call(&RequestBody::Attach {
-    volume: id,
-    snapshot: None,
-    intent: Intent::Write,
-    form: AttachRequest::Root,
-  }) {
-    ReplyBody::Attached { attachment, .. } => attachment,
-    other => {
-      for daemon in daemons {
-        daemon.stop();
-      }
-      panic!("write attach on node a: {other:?}");
-    }
-  };
-  // Another node's account reaches this volume only through a share naming it (A-237).
-  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
-  share_with_node(&mut client_a, id, &daemons[2], ALL_RIGHTS);
-  let mut client_b = Client::connect(&instances[1].clone());
-  let mut client_c = Client::connect(&instances[2].clone());
-  let (status_served, status_last) =
-    poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
-  // b's client writes under its own attachment, which a records under b's host (A-222): a forward through a's own
-  // attachment is refused, as a forward naming another host's attachment always is.
-  let _ = attachment;
-  let mut b_attachment = None;
-  let mut made = None;
-  let made_served = poll_until(
-    &daemons.iter().collect::<Vec<_>>(),
-    COUNCIL_RETIRE_DEADLINE,
-    || {
-      if b_attachment.is_none()
-        && let ReplyBody::Attached { attachment, .. } = client_b.call(&RequestBody::Attach {
-          volume: id,
-          snapshot: None,
-          intent: Intent::Write,
-          form: AttachRequest::Root,
-        })
-      {
-        b_attachment = Some(attachment);
-      }
-      let Some(attachment) = b_attachment else {
-        return Ok(false);
-      };
-      let reply = client_b.call(&RequestBody::FsMkdir {
-        volume: id,
-        attachment,
-        path: "/from-b".to_owned(),
-        mode: 0o755,
-      });
-      let done = matches!(reply, ReplyBody::FsDone { .. });
-      made = Some(reply);
-      Ok(done)
-    },
-  );
+/// Whether c's client lists `/from-b` at volume `id`'s root within the council's deadline (served, and listed), and
+/// whether a's then does.
+fn both_list_it(
+  daemons: &[Daemon],
+  (client_a, client_c): (&mut Client, &mut Client),
+  id: VolumeId,
+) -> (bool, bool, bool) {
   let lists_it = |client: &mut Client| {
     matches!(
       client.call(&RequestBody::ReadDir {
@@ -4804,11 +4762,99 @@ fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_thr
     &daemons.iter().collect::<Vec<_>>(),
     COUNCIL_RETIRE_DEADLINE,
     || {
-      c_lists = lists_it(&mut client_c);
+      c_lists = lists_it(client_c);
       Ok(c_lists)
     },
   );
-  let a_lists = lists_it(&mut client_a);
+  let a_lists = lists_it(client_a);
+  (c_served, c_lists, a_lists)
+}
+
+/// `client` attaches volume `id` for writing under its own node's attachment, waiting out the lease a's attachment
+/// left, and makes `/from-b` in it: whether it did within the council's deadline, and the last reply (what refused it,
+/// where something did).
+fn made_under_its_own_attachment(
+  daemons: &[Daemon],
+  client_b: &mut Client,
+  id: VolumeId,
+) -> (bool, Option<ReplyBody>) {
+  let mut b_attachment = None;
+  let mut made = None;
+  let made_served = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      if b_attachment.is_none() {
+        match client_b.call(&RequestBody::Attach {
+          volume: id,
+          snapshot: None,
+          intent: Intent::Write,
+          form: AttachRequest::Root,
+        }) {
+          ReplyBody::Attached { attachment, .. } => b_attachment = Some(attachment),
+          // What refused b's attach is what the failure says, not `None`.
+          refused => made = Some(refused),
+        }
+      }
+      let Some(attachment) = b_attachment else {
+        return Ok(false);
+      };
+      let reply = client_b.call(&RequestBody::FsMkdir {
+        volume: id,
+        attachment,
+        path: "/from-b".to_owned(),
+        mode: 0o755,
+      });
+      let done = matches!(reply, ReplyBody::FsDone { .. });
+      made = Some(reply);
+      Ok(done)
+    },
+  );
+  (made_served, made)
+}
+
+/// AC (§4.8 "Lookup": a lookup by id routes to the volume's creator, whatever the asker's region). Three daemons in
+/// one region; a volume is created and write-attached on a. Do: through clients of b and c, ask its status; let a's write
+/// attachment go (A-414: while it lives the write lease stays a's, and another host's attach for writing is refused
+/// `LeaseHeld`); make a directory in it under b's client's own attachment of it (A-222: a forward through a's attachment
+/// is refused since 2026-11-05), and list its root. Expect: each is served by a, the directory b made is the
+/// one c lists, and a lists it too. Before 2026-10-07 only a volume homed in another region was forwarded; a client
+/// of b or c was answered `NotFound` for a's volume (found on two Docker networks, `docs/wip/GAPS.md`).
+#[test]
+fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_through_the_owner() {
+  let _serial = serialize_fleet_tests();
+  let (daemons, instances, _serve_lease) = three_in_one_region();
+
+  let mut client_a = Client::connect(&instances[0].clone());
+  let (id, attachment) = match created_and_write_attached(&mut client_a) {
+    Ok(made) => made,
+    Err(refused) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("{refused}");
+    }
+  };
+  // Another node's account reaches this volume only through a share naming it (A-237).
+  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
+  share_with_node(&mut client_a, id, &daemons[2], ALL_RIGHTS);
+  let mut client_b = Client::connect(&instances[1].clone());
+  let mut client_c = Client::connect(&instances[2].clone());
+  let (status_served, status_last) =
+    poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
+  // b's client writes under its own attachment, which a records under b's host (A-222): a forward through a's own
+  // attachment is refused, as a forward naming another host's attachment always is. a lets its own write attachment go
+  // first: while it lives the write lease stays a's and b's attach for writing is refused `LeaseHeld` (A-414); once it
+  // has gone the lease lasts one term more, which b's attach below waits out.
+  assert!(
+    matches!(
+      client_a.call(&RequestBody::Detach { attachment }),
+      ReplyBody::Detached
+    ),
+    "a detached its write attachment"
+  );
+  let (made_served, made) = made_under_its_own_attachment(&daemons, &mut client_b, id);
+  let (c_served, c_lists, a_lists) = both_list_it(&daemons, (&mut client_a, &mut client_c), id);
   for daemon in daemons {
     daemon.stop();
   }
@@ -14521,20 +14567,36 @@ fn assert_refused_at_the_slo(first: &Result<ReplyBody, IpcError>, slo_ns: u64) {
   );
 }
 
-/// A-354 (§4.10 "Live shipping"; CLAUDE.md §2 items 8 and 9): a reply held for a live volume's durability waits through
-/// a silence but is answered at the latest at the failover delay from its hold, the total bound of the rule every
-/// transport judges a held reply by (`slates_bridge_core::durable_bound`), refused `DurabilityPending` as the request's
-/// recorded outcome; the verb sent again under a new id runs again and is answered once the log is durable. Do: three
-/// nodes at `f = 1`; both survivors refuse every register record from a (`Daemon::inject_record_refusal`), so a new
-/// live volume's head and catalog never place and nothing written to it can be durable; on a, a live-shipped volume
-/// shared with the fleet; one write, its reply awaited for at most the placement wait; the same request again; then
-/// lift the refusals and send the write under a new id. Expect the write refused `DurabilityPending` after it was held
-/// the failover delay and within a liveness budget past it, counted `fleet.live.held_gave_up`; the same request answered
-/// that same refusal (its completion, §4.9); and the write under a new id answered `FsDone`. Before, a held reply ended
-/// only durable, fenced or destroyed, so its client waited as long as its daemon lived (A-353's hang: a write through a
-/// successor whose catalog was refused for good waited 21 minutes).
+/// The root `listed` holds each of `names` once.
+fn assert_each_made_once(listed: &ReplyBody, names: &[&str]) {
+  let ReplyBody::DirPage { entries, .. } = &listed else {
+    panic!("the root was listed: {listed:?}");
+  };
+  for name in names {
+    assert_eq!(
+      entries.iter().filter(|entry| entry.name == *name).count(),
+      1,
+      "{name} was made once: {entries:?}"
+    );
+  }
+}
+
+/// A-354 (§4.10 "Live shipping"; CLAUDE.md §2 items 8 and 9) with main's ruling of 2026-11-20 (a verb never takes
+/// effect twice): a reply held for a live volume's durability is answered at the latest at the failover delay from its
+/// hold, `DurabilityPending`, and the verb's own reply is recorded as its completion, so its resend under the same id is
+/// answered that reply and never runs it again. Do: three nodes at `f = 1`; both survivors refuse every register record
+/// from a (`Daemon::inject_record_refusal`), so a new live volume's head and catalog never place and nothing written to it
+/// can be durable; on a, a live-shipped volume shared with the fleet; a directory made through the raw ring, its reply
+/// awaited for at most the placement wait, then the same request again; a second directory made through
+/// `slates_client::Client`, which sends a `DurabilityPending` request again under its id itself; then lift the refusals
+/// and list the root. Expect the first answer `DurabilityPending` after the failover delay and within a liveness budget
+/// past it, counted `fleet.live.held_gave_up`; its resend answered `FsDone`, the verb's own reply; the client's call
+/// answered `FsDone`; and each directory listed once. Before, the refusal was the recorded completion: the resend was
+/// answered `DurabilityPending` again, and a consumer told to make the call again ran the verb a second time (a
+/// directory's second making refused `AlreadyExists`, an append landed twice; g226). Before 2026-11-18 a held reply ended
+/// only durable, fenced or destroyed, so its client waited as long as its daemon lived (A-353's hang).
 #[test]
-fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again() {
+fn a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   // a's failover delay held at its estimate now (A-363), so the hold's bound cannot move under the assertion; held from
@@ -14548,38 +14610,50 @@ fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_dela
   }
   let mut client = Client::connect(daemons[0].instance());
   let (id, attachment) = live_volume_attached(&mut client, &daemons, "held-for-good");
-  let write = RequestBody::FsWrite {
+  let mkdir = |path: &str| RequestBody::FsMkdir {
     volume: id,
     attachment,
-    path: "/held".to_owned(),
-    bytes: b"held for a durability it cannot reach".to_vec(),
-    mode: 0o644,
+    path: path.to_owned(),
+    mode: 0o755,
   };
   let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap();
-  let first = client.try_call(&write, deadline_ns);
-  let same_id = client.try_retry(&write, deadline_ns);
+  let first = client.try_call(&mkdir("/raw"), deadline_ns);
+  let same_id = client.try_retry(&mkdir("/raw"), deadline_ns);
+  let deadlines =
+    slates_client::Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS)
+      .get();
+  let through_client = slates_client::Client::connect(daemons[0].instance(), deadlines)
+    .unwrap()
+    .call(&mkdir("/client"));
   let gave_up = count_of(&summed_counters(&daemons[0]), LIVE_HELD_GAVE_UP);
   for daemon in &daemons[1..] {
     daemon.inject_record_refusal(&[]).unwrap();
   }
-  let again = client.try_call(&write, deadline_ns);
+  let listed = client.call(&RequestBody::ReadDir {
+    volume: id,
+    path: "/".to_owned(),
+    at: ReadAt::Head,
+    cursor: 0,
+  });
   drop(client);
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "held for good: the write {first:?}, the same request {same_id:?}, {gave_up} given up, the write again {again:?}"
+    "held for good: the mkdir {first:?}, the same request {same_id:?}, through the client {through_client:?}, \
+     {gave_up} given up, the root {listed:?}"
   );
   assert_refused_at_the_slo(&first, slo_ns);
   assert!(gave_up >= 1, "the owner counted the reply given up");
   assert!(
-    matches!((&first, &same_id), (Ok(first), Ok(same)) if first == same),
-    "the same request was answered its recorded refusal: {same_id:?}"
+    matches!(same_id, Ok(ReplyBody::FsDone { .. })),
+    "the same request was answered the verb's own reply, not run again: {same_id:?}"
   );
   assert!(
-    matches!(again, Ok(ReplyBody::FsDone { .. })),
-    "the write under a new id was answered once the log was durable: {again:?}"
+    matches!(through_client, Ok(ReplyBody::FsDone { .. })),
+    "the client asked again under the id and handed back the verb's own reply: {through_client:?}"
   );
+  assert_each_made_once(&listed, &["raw", "client"]);
 }
 
 /// Format: a node's count of live volumes it took over from their logs (`live_ship::archive_from_live`).
@@ -20699,6 +20773,99 @@ fn green_and_work_on(instance: &str, readers: &[&Daemon]) -> (VolumeId, VolumeId
     share_with_node(&mut owner_client, work, reader, ALL_RIGHTS);
   }
   (green, work)
+}
+
+/// A-697 part a, A-247 (a work over a green another node owns is admitted by the green's owner): in a two-node `f = 1`
+/// fleet, A owns a green at version 1 shared with B's account, and another it shares with no one. Do: a client on B asks
+/// `AdmitWork` for the shared green and a work id of B's own partition, then sends the same request id again; asks it
+/// for the unshared green; a client on A asks it for the shared green. Expect: B's ask is forwarded to A and answered
+/// `WorkAdmitted` with the work and base 1, the green's head, and A records the work's floor at 1; the resend is
+/// answered the same from the forward's completion record; the unshared green is refused `NotShared` by A (named for B's
+/// account, which holds no share of it) and records no floor; A's own client is refused `Unsupported`, since a client asks for a work by `CreateWork`.
+#[test]
+fn a_holders_work_is_admitted_by_its_greens_owner_once_and_by_the_owners_rights_alone() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  let ReplyBody::GreenCreated { id: unshared } = owner.call(&RequestBody::CreateGreen {
+    name: "unshared-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create the unshared green");
+  };
+  let mut holder = Client::connect(daemon_b.instance());
+  let ReplyBody::Created { id: work } = holder.call(&RequestBody::Create {
+    name: "holders-work-id".to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("a volume of B's own partition, whose id the work takes");
+  };
+  let admit = RequestBody::AdmitWork { green, work };
+  let admitted = holder.call(&admit);
+  let again = holder.call_retry(&admit);
+  let floor = daemon_a.work_floor(green, work);
+  let refused = holder.call(&RequestBody::AdmitWork {
+    green: unshared,
+    work,
+  });
+  let unshared_floor = daemon_a.work_floor(unshared, work);
+  let local = owner.call(&admit);
+  assert!(
+    matches!(admitted, ReplyBody::WorkAdmitted { id, base: 1 } if id == work),
+    "A admitted B's work at its head: {admitted:?}"
+  );
+  assert_eq!(
+    again, admitted,
+    "the resend is answered from its completion record"
+  );
+  assert_eq!(floor, Ok(Some(1)), "A records the work's floor at its base");
+  assert!(
+    matches!(
+      refused,
+      ReplyBody::Refused {
+        refusal: Refusal::NotShared { .. }
+      }
+    ),
+    "A judges the rights from its green's record: {refused:?}"
+  );
+  assert_eq!(
+    unshared_floor,
+    Ok(None),
+    "a refused admission records no floor"
+  );
+  assert!(
+    matches!(
+      local,
+      ReplyBody::Refused {
+        refusal: Refusal::Unsupported { .. }
+      }
+    ),
+    "a client asks for a work by CreateWork: {local:?}"
+  );
 }
 
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447

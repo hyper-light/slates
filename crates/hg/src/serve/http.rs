@@ -41,7 +41,7 @@
 //! push's answer: no part a client acts on, so a reply here carries none of them, as a push over SSH here prints none.
 
 use super::Refusal;
-use super::getbundle::Store;
+use super::getbundle::{Answering, Store};
 use super::session::{self, Answer, BUNDLE2_REQUIRED, Refused, Transport, dispatch, spec_of};
 use crate::compression::{self, Engine};
 use crate::http::{self, MEDIA_TYPE_ERROR, MEDIA_TYPE_V1, MEDIA_TYPE_V2, ProtocolCaps, Request};
@@ -152,23 +152,223 @@ pub fn answer(
   compressor: &mut impl Compressor,
   admission: &mut Admission,
 ) -> Answered {
+  match begin(store, request, header_line, compressor, admission) {
+    Begun::Answered(answered) => answered,
+    Begun::Streamed(mut streamed) => {
+      let mut body = Vec::new();
+      loop {
+        match streamed.step(store, admission, &mut body) {
+          Ok(true) => {}
+          Ok(false) => {
+            return Answered {
+              media_type: streamed.media_type(),
+              body,
+              refused: None,
+            };
+          }
+          Err(refused) => return error(refused),
+        }
+      }
+    }
+  }
+}
+
+/// What [`begin`] began: an answer made whole, or a `getbundle`'s, made a slice at a time.
+pub enum Begun {
+  /// An answer made whole.
+  Answered(Answered),
+  /// A `getbundle`'s answer, streamed.
+  Streamed(Box<Streamed>),
+}
+
+/// A `getbundle`'s answer over HTTP made a slice at a time (A-745; §4.17.1 "A fetch's answer"): its media type known
+/// when it begins, its body made by [`Streamed::step`], each step lent the served view anew and a room of its own, the
+/// stream compressed as it is made ([`compression::StreamCompressor`]).
+pub struct Streamed {
+  /// The media type.
+  media_type: &'static [u8],
+  /// The body's `0.2` header, until the first step writes it.
+  head: Option<Vec<u8>>,
+  /// The stream's compressor.
+  compressor: compression::StreamCompressor,
+  /// Its engine, whose bound is charged before each slice is compressed.
+  engine: Engine,
+  /// A slice made and not yet compressed, its bound refused: compressed first by the next step, within its room.
+  pending: Option<(Vec<u8>, bool)>,
+  /// The answer.
+  answering: session::Producing,
+}
+
+impl Streamed {
+  /// The answer's media type: the reply's `Content-Type`.
+  pub fn media_type(&self) -> &'static [u8] {
+    self.media_type
+  }
+
+  /// Appends the body's next slice to `out`, what it makes charged to `room`: whether more follow. Refused, the body
+  /// cannot be finished, and its owner ends the reply unfinished.
+  pub fn step(
+    &mut self,
+    store: &impl Store,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refused> {
+    if let Some(head) = self.head.take() {
+      out.extend_from_slice(&head);
+    }
+    let (plain, more) = match self.pending.take() {
+      Some(pending) => pending,
+      None => {
+        let mut plain = Vec::new();
+        let more = self
+          .answering
+          .step(store, room, &mut plain)
+          .map_err(Refused::Serve)?;
+        (plain, more)
+      }
+    };
+    if let Err(past) = room.charge(compression::bound(self.engine, to_u64(plain.len()))) {
+      self.pending = Some((plain, more));
+      return Err(Refused::from(past));
+    }
+    self
+      .compressor
+      .put(&plain, out)
+      .map_err(Refused::Compression)?;
+    if !more {
+      self.compressor.finish(out).map_err(Refused::Compression)?;
+    }
+    Ok(more)
+  }
+}
+
+/// Answers `request` from `store` as [`answer`] does, but a `getbundle` whose answer begins is handed back to be made a
+/// slice at a time ([`Streamed`], A-745); everything held charged to `admission`.
+pub fn begin(
+  store: &impl Store,
+  request: &Request<'_>,
+  header_line: u64,
+  compressor: &mut impl Compressor,
+  admission: &mut Admission,
+) -> Begun {
   let mut buffer = Vec::new();
   let fields = match http::fields(request, admission, &mut buffer) {
     Ok(fields) => fields,
-    Err(refusal) => return error(Refused::Http(refusal)),
+    Err(refusal) => return Begun::Answered(error(Refused::Http(refusal))),
   };
   let named = fields
     .command()
     .and_then(|command| spec_of(command).map(|spec| (command, spec)));
   let Some((command, spec)) = named else {
-    return not_available();
+    return Begun::Answered(not_available());
   };
   let arguments = match fields.arguments(spec, admission) {
     Ok(arguments) => arguments,
-    Err(refusal) => return error(Refused::Http(refusal)),
+    Err(refusal) => return Begun::Answered(error(Refused::Http(refusal))),
   };
   let transport = Transport::Http { header_line };
-  let (answered, refused) = dispatch(store, transport, command, spec, &arguments, admission);
+  if command == b"stream_out" && store.revlogs().is_some() {
+    // 7.2's `streamreslegacy`: the revlogs as they are, in `application/mercurial-0.1`, never compressed.
+    return Begun::Streamed(Box::new(Streamed {
+      media_type: MEDIA_TYPE_V1,
+      head: None,
+      compressor: compression::StreamCompressor::Uncompressed,
+      engine: Engine::Uncompressed,
+      pending: None,
+      answering: session::Producing::Revlogs(Box::default()),
+    }));
+  }
+  if command == b"getbundle" {
+    let asked = session::getbundle_asked(&arguments);
+    let (answered, refused) = match Answering::begin(store, &asked, admission) {
+      Ok(answering) => {
+        let answering = session::Producing::Bundle(Box::new(answering));
+        return match streaming(answering, request, compressor, admission) {
+          Ok(streamed) => Begun::Streamed(Box::new(streamed)),
+          Err(refused) => Begun::Answered(error(refused)),
+        };
+      }
+      Err(refusal) => session::getbundle_refused(refusal, transport),
+    };
+    return Begun::Answered(answered_of(
+      (answered, refused),
+      request,
+      compressor,
+      admission,
+    ));
+  }
+  let answered = dispatch(store, transport, command, spec, &arguments, admission);
+  Begun::Answered(answered_of(answered, request, compressor, admission))
+}
+
+/// A `getbundle`'s answer begun: its media and compression chosen as [`streamed`] chooses them for a stream whose
+/// length is not known, and its `0.2` header made.
+fn streaming(
+  answering: session::Producing,
+  request: &Request<'_>,
+  compressor: &mut impl Compressor,
+  admission: &mut Admission,
+) -> Result<Streamed, Refused> {
+  let caps = http::protocol_caps(request, admission)?;
+  let unknown = u64::MAX;
+  let (media, choice) = if caps.has(READS_V2) {
+    let engines = readable(&caps, admission)?;
+    if engines.is_empty() {
+      (
+        Media::V1,
+        compressor.choose(Media::V1, &[Engine::Zlib], unknown),
+      )
+    } else {
+      let choice = compressor.choose(Media::V2, &engines, unknown);
+      if !engines.contains(&choice.engine) {
+        return Err(Refused::EngineNotRead {
+          engine: choice.engine,
+        });
+      }
+      (Media::V2, choice)
+    }
+  } else {
+    (
+      Media::V1,
+      compressor.choose(Media::V1, &[Engine::Zlib], unknown),
+    )
+  };
+  if media == Media::V1 && choice.engine != Engine::Zlib {
+    return Err(Refused::EngineNotRead {
+      engine: choice.engine,
+    });
+  }
+  let mut head = Vec::new();
+  let media_type = match media {
+    Media::V1 => MEDIA_TYPE_V1,
+    Media::V2 => {
+      http::encode_v2_header(choice.engine.wire_name(), &mut head).map_err(|_| {
+        Refused::EngineNotRead {
+          engine: choice.engine,
+        }
+      })?;
+      MEDIA_TYPE_V2
+    }
+  };
+  let compressor = compression::StreamCompressor::new(choice.engine, choice.level)
+    .map_err(Refused::Compression)?;
+  Ok(Streamed {
+    media_type,
+    head: Some(head),
+    compressor,
+    engine: choice.engine,
+    pending: None,
+    answering,
+  })
+}
+
+/// A session's answer and its refusal as an HTTP answer: a stream compressed as `compressor` chooses.
+fn answered_of(
+  (answered, refused): (Answer, Option<Refused>),
+  request: &Request<'_>,
+  compressor: &mut impl Compressor,
+  admission: &mut Admission,
+) -> Answered {
   match answered {
     Answer::Bytes(body) => Answered {
       media_type: MEDIA_TYPE_V1,

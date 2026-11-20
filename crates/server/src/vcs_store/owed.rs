@@ -82,6 +82,8 @@ impl Owed {
       .iter()
       .map(|text| text.len().saturating_add(LONG_BYTES))
       .fold(
+        // Format: the magic and the version (two words), then the green's key, its version and the second (three
+        // longs), before the texts (module docs, "The encoding").
         WORD_BYTES
           .saturating_mul(2)
           .saturating_add(LONG_BYTES.saturating_mul(3)),

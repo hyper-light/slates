@@ -209,7 +209,9 @@ fn windows(outcome: &Outcome) -> Option<Vec<(String, MergeConflictClass)>> {
         .map(|window| (window.path.clone(), window.class))
         .collect(),
     ),
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } => None,
+    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } | Outcome::CopyRefused { .. } => {
+      None
+    }
   }
 }
 
@@ -470,9 +472,10 @@ fn a_copy_is_named_for_every_path_of_its_tree_after_the_version_before_it() {
 }
 
 /// A-586 and A-626 (the verdict's refusals, each naming the destination by kind). Do: against a green holding a trunk,
-/// a hard link under `h`, a file under `taken`, a trunk changed after version 1 and a path removed after version 3,
-/// submit each refused copy: among them a second copy onto a place the first copy's tree fills, and replaces of a tree
-/// changed after the base, of a tree holding a hard link and of a link's target. Expect: each a conflict with exactly
+/// a hard link under `h`, one under `h2` naming `trunk/c`, a file under `taken`, a trunk changed after version 1 and a
+/// path removed after version 3, submit each refused copy: among them a copy of `h2` from before its link's outside node
+/// changed (main's ruling: the head no longer holds what that node held), a second copy onto a place the first copy's
+/// tree fills, and replaces of a tree changed after the base, of a tree holding a hard link and of a link's target. Expect: each a conflict with exactly
 /// its window, and the green unchanged: its head, its identity and the copies it grafted.
 #[test]
 fn a_copy_is_refused_typed_and_changes_nothing() {
@@ -481,6 +484,7 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
   work
     .create("t2/a", b"t2")
     .link("h/l", "trunk/a")
+    .link("h2/l", "trunk/c")
     .create("taken/x", b"x");
   accept(&mut green, &work, 2);
   accept(&mut green, Work::default().create("gone/x", b"g"), 3);
@@ -493,7 +497,27 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
   nested.copy("t2", "y", 5).copy("trunk", "y/a", 5);
   let mut moved = Work::exclusive();
   moved.copy("t2", "y", 4).rename("trunk/a", "y/q");
+  use crate::engine::CopyRefusal::{
+    LinkAcrossCopy, OutsideNodeChanged, PastHead, Root, SourceEmpty,
+  };
   use MergeConflictClass::{CreateCreate, DeleteModify, TypeChanged};
+  // Refused before any verdict, typed (main's ruling of 2026-11-20): none is a change a rebase could answer.
+  let refused = [
+    (one_copy("t2", "", 5), ("", Root)),
+    (one_copy("nothing", "y", 5), ("y", SourceEmpty)),
+    (one_copy("t2", "y", 6), ("y", PastHead)),
+    (one_copy("h2", "y", 2), ("y", OutsideNodeChanged)),
+    (moved, ("y/q", LinkAcrossCopy)),
+  ];
+  for (index, (work, (path, case))) in refused.into_iter().enumerate() {
+    let outcome = green.submit(&work.at(200 + index as u64, 5));
+    let expected = Outcome::CopyRefused {
+      path: path.to_owned(),
+      case,
+    };
+    assert_eq!(outcome, expected, "refused case {index}");
+    assert_eq!(green.head(), head, "refused case {index} committed");
+  }
   /// A case: the work, the version it is judged at, and the conflicts expected of it.
   type Case<'a> = (Work, u64, Vec<(&'a str, MergeConflictClass)>);
   let cases: Vec<Case<'_>> = vec![
@@ -503,14 +527,9 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
       5,
       vec![("trunk/a", CreateCreate)],
     ),
-    (one_copy("t2", "", 5), 5, vec![("", TypeChanged)]),
-    (one_copy("nothing", "y", 5), 5, vec![("y", TypeChanged)]),
-    (one_copy("t2", "y", 6), 5, vec![("y", TypeChanged)]),
-    (one_copy("h", "y", 5), 5, vec![("y", TypeChanged)]),
     (one_copy("t2", "gone", 5), 3, vec![("gone", CreateCreate)]),
     (both, 5, vec![("y", TypeChanged)]),
     (nested, 5, vec![("y/a", CreateCreate)]),
-    (moved, 5, vec![("y/q", TypeChanged)]),
     (
       replace_copy("t2", "taken", 5),
       1,
@@ -1273,7 +1292,8 @@ fn an_edit_beneath_a_copy_from_an_older_version_lands_on_the_bytes_it_brings() {
 
 /// A-626 part 2 (a copy from a version whose values are folded away). Do: fold the green's histories below version 3,
 /// then copy the trunk at version 1 (changed at 2, so its values then are needed) and at version 3 (unchanged since).
-/// Expect: the first a type conflict naming its destination, the green unchanged; the second accepted.
+/// Expect: the first refused typed, `VersionFolded`, naming its destination (main's ruling of 2026-11-20: no conflict),
+/// the green unchanged; the second accepted.
 #[test]
 fn a_copy_from_a_folded_version_is_refused_typed() {
   let mut green = trunk_changed_after_1();
@@ -1281,8 +1301,11 @@ fn a_copy_from_a_folded_version_is_refused_typed() {
   let head = green.head();
   let stale = green.submit(&one_copy("trunk", "b", 1).at(4, head));
   assert_eq!(
-    windows(&stale),
-    Some(vec![("b".to_owned(), MergeConflictClass::TypeChanged)])
+    stale,
+    Outcome::CopyRefused {
+      path: "b".to_owned(),
+      case: crate::engine::CopyRefusal::VersionFolded,
+    }
   );
   assert_eq!(green.head(), head);
   assert_eq!(
@@ -2370,4 +2393,87 @@ fn a_copy_computed_before_the_green_moved_is_judged_again_by_position() {
   assert_eq!(judged, (1, 2, own.applied()));
   owner.commit_judged(held).expect("committed at its head");
   assert_eq!(owner.content("b/a"), Some(&b"alpha"[..]));
+}
+
+/// A green at version 2 holding `outside/f` and a trunk with two hard links: `trunk/l` naming `trunk/a`, a node inside
+/// the trunk, and `trunk/o` naming `outside/f`, a node outside it.
+fn linked_trunk() -> Green {
+  let mut green = trunk();
+  let mut work = Work::default();
+  work
+    .create("outside/f", b"far")
+    .mode("outside/f", 0o600)
+    .link("trunk/l", "trunk/a");
+  accept(&mut green, &work, 2);
+  accept(&mut green, Work::default().link("trunk/o", "outside/f"), 3);
+  green
+}
+
+/// What a copy of `linked_trunk`'s trunk to `b` leaves, read alike from any green: `b/l`'s node, `b/o`'s node, the bytes
+/// and mode `b/o` holds, `b/l`'s bytes, and the source's links.
+type Linked = (
+  Option<String>,
+  Option<String>,
+  Option<Vec<u8>>,
+  Option<u32>,
+  Option<Vec<u8>>,
+  (Option<String>, Option<String>),
+);
+
+/// [`Linked`] of `green`.
+fn linked_reads(green: &Green) -> Linked {
+  let read = |path: &str| {
+    green
+      .content(green.hardlink(path).unwrap_or(path))
+      .map(<[u8]>::to_vec)
+  };
+  (
+    green.hardlink("b/l").map(str::to_owned),
+    green.hardlink("b/o").map(str::to_owned),
+    green.content("b/o").map(<[u8]>::to_vec),
+    green.mode("b/o"),
+    read("b/l"),
+    (
+      green.hardlink("trunk/l").map(str::to_owned),
+      green.hardlink("trunk/o").map(str::to_owned),
+    ),
+  )
+}
+
+/// Main's ruling of 2026-11-20 (a hard link in a copied tree; A-586 had refused one, answering `TypeChanged`). Do: over a
+/// trunk whose `l` names its own `a` and whose `o` names `outside/f`, copy the trunk to `b` at the head; replay the
+/// version on a replica; checkpoint the green at the copy's version and restore it. Expect: accepted; `b/l` names
+/// `b/a`, the copy's node, and reads its bytes; `b/o` names no node, a file of its own holding `outside/f`'s bytes and
+/// mode; the trunk's links unchanged; the identity equal to its recount; the replica and the restored green read and
+/// hash alike.
+#[test]
+fn a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns_one() {
+  let mut green = linked_trunk();
+  let mut replica = linked_trunk();
+  let increment = Work::exclusive().copy("trunk", "b", 3).at(4, 3);
+  let (outcome, applied) = green.submit_resolved(&increment);
+  assert_eq!(outcome, Outcome::Accepted { version: 4 });
+  let expected: Linked = (
+    Some("b/a".to_owned()),
+    None,
+    Some(b"far".to_vec()),
+    Some(0o600),
+    Some(b"alpha".to_vec()),
+    (Some("trunk/a".to_owned()), Some("outside/f".to_owned())),
+  );
+  assert_eq!(linked_reads(&green), expected);
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+  let applied = applied.expect("an accepted version's effects");
+  let entry = chain_entry::encode(&increment.encode(), &increment, &applied, None, None, None);
+  let decoded = chain_entry::decode(&entry).expect("the entry decodes");
+  assert_eq!(
+    replica.apply_recorded(&decoded.increment, &decoded.applied),
+    4
+  );
+  assert_eq!(linked_reads(&replica), expected);
+  assert_eq!(replica.head_identity(), green.head_identity());
+  let checkpoint = green.checkpoint(4).expect("a checkpoint");
+  let mut restored = Green::restore(Origin::default(), &checkpoint);
+  assert_eq!(linked_reads(&restored), expected);
+  assert_eq!(restored.head_identity(), green.head_identity());
 }

@@ -24,8 +24,8 @@
 //! removed at its end; `svn` reads no user's configuration and caches no credential. A slates leg mints its credential
 //! (`slates credential token|key`, the issuer's verbs) with the anchor's issuer surface, which the anchor names on macOS
 //! and Windows; on Linux the surface is a descriptor only the anchor's children hold, so those legs skip loudly there.
-//! Unix only, as `tests/cli.rs` is: the control's tunnel runs through `sh`, and the SSH leg's through OpenSSH's `ssh`.
-#![cfg(unix)]
+//! Every platform: on a host without stock Subversion 1.15 (jupiter, until Ada decides on installing it) each leg skips
+//! loudly; the control's tunnel runs through `sh`, and the SSH leg's through OpenSSH's `ssh`.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -113,7 +113,9 @@ const NO_ISSUER_SURFACE: &str = "this platform publishes no issuer surface throu
 
 /// A scratch directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a
 /// count, removed when dropped, even when an assertion fails (A-50: a test's host files live in the build output, never
-/// `/tmp`). Made by `mkdir`, as `tests/cli.rs` makes its own.
+/// `/tmp`). Its path is written with forward slashes, which every stock client on every platform reads (Git for Windows,
+/// MSYS2's OpenSSH and Mercurial's `ssh` command on Windows among them), and without Windows' `\\?\` prefix, which
+/// they do not.
 struct Scratch {
   path: String,
 }
@@ -130,24 +132,33 @@ impl Scratch {
     );
     made_directory(&raw);
     Scratch {
-      path: std::fs::canonicalize(&raw)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned(),
+      path: portable(&std::fs::canonicalize(&raw).unwrap()),
     }
   }
 }
 
 impl Drop for Scratch {
+  // The test's own scratch directory, inside the build output (R1's wall is shipped code's).
+  #[allow(clippy::disallowed_methods)]
   fn drop(&mut self) {
-    let _ = Command::new("rm").args(["-rf", &self.path]).output();
+    let _ = std::fs::remove_dir_all(&self.path);
   }
 }
 
-/// Makes directory `path` and any parent it lacks, by `mkdir -p`.
+/// Makes directory `path` and any parent it lacks, inside the test's build output.
+#[allow(clippy::disallowed_methods)]
 fn made_directory(path: &str) {
-  let made = Command::new("mkdir").args(["-p", path]).output().unwrap();
-  assert!(made.status.success(), "mkdir -p {path}: {made:?}");
+  std::fs::create_dir_all(path).unwrap_or_else(|error| panic!("making {path}: {error}"));
+}
+
+/// `path` as every stock client reads it: forward slashes, and on Windows no `\\?\` verbatim prefix, which
+/// `canonicalize` adds and Git for Windows and MSYS2's tools refuse.
+fn portable(path: &std::path::Path) -> String {
+  let text = path.to_string_lossy();
+  text
+    .strip_prefix(r"\\?\")
+    .unwrap_or(&text)
+    .replace('\\', "/")
 }
 
 /// Whether this host runs stock Subversion's `svn` of the 1.15 line ([`SVN_LINE`]).
@@ -910,11 +921,10 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
 /// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`: a repository with no pre-revprop-change hook refuses every
 /// revision property change). Do: over the svn:// listener, with revision 1 committed and no hook configured, change
 /// its `svn:log` with stock `svn propset --revprop` (ra_svn's `change-rev-prop2`). Expect it refused in svnserve's words
-/// (E165006) and the old value kept. Ignored until it can pass: by use (2026-11-20, Mac Studio) the change is taken
-/// (`property 'svn:log' set on repository revision 1`, exit 0); the server's own test sends `change-rev-prop`, which
-/// is refused, and stock svn 1.15 sends `change-rev-prop2`.
+/// (E165006) and the old value kept. Red by use (2026-11-20, Mac Studio) until the listener stopped writing a turn's
+/// trivial authentication request twice: stock svn read the second as the change's answer, a success (`property
+/// 'svn:log' set on repository revision 1`, exit 0), the refusal after it unread.
 #[test]
-#[ignore = "waits on w-svn: change-rev-prop2 with no pre-revprop-change hook is taken, where svnserve refuses E165006"]
 fn a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it() {
   let instance = format!("svn-nohook-{}", std::process::id());
   let Some((_anchor, _scratch, svn, url)) = revprop_leg(&instance) else {

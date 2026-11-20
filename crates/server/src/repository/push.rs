@@ -765,9 +765,9 @@ fn sealed_record(
       state, &refused,
     )));
   }
-  sealed
-    .record(&state.vcs_stores)
-    .map_err(|refused| AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)))
+  let recorded =
+    sealed.record(crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores).stores);
+  recorded.map_err(|refused| AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)))
 }
 
 /// Each of a git push's store moves resolved (A-662): a green of the repository keyed by its id, a new branch's by the
@@ -947,6 +947,9 @@ fn judge(
           green: to_wire_volume(green),
           version: base,
         })
+      }
+      Some(Judgment::CopyRefused { path, case }) => {
+        ChangeRefusal::Refused(crate::verbs::copy_refused(path, case))
       }
       None => ChangeRefusal::Refused(Refusal::ContentUnavailable),
     };

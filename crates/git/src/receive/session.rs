@@ -46,6 +46,14 @@ enum State<'s> {
     /// The pack as its bytes arrive.
     reader: unpack::Reader<'static, NoIndex>,
   },
+  /// The pack read whole, its waiting deltas resolved a turn at a time ([`Session::resolve_turn_into`], A-724's
+  /// starvation fix), before its checks.
+  Resolving {
+    /// The request.
+    request: Request,
+    /// The pack, whole, its deltas being resolved.
+    reader: unpack::Reader<'static, NoIndex>,
+  },
   /// The push, read whole, its checks made a turn at a time ([`Session::check_turn`], A-719).
   Checking(Checking),
   /// The push, read and checked, waiting for its verdicts.
@@ -211,7 +219,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
         }
         checked
       }
-      State::Checking(_) | State::Checked(_) | State::Done => Ok(false),
+      State::Resolving { .. } | State::Checking(_) | State::Checked(_) | State::Done => Ok(false),
     }
   }
 
@@ -322,6 +330,25 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     let State::Pack { request, reader } = core::mem::replace(&mut self.state, State::Done) else {
       return Ok(false);
     };
+    // A pack read whole resolves its waiting deltas a turn at a time from here (A-724's starvation fix: in one poll, a
+    // push's last input step took 1.4 s for git/git v1.5.0); one cut short or refused is finished now.
+    if read.is_ok() && reader.is_whole() {
+      self.state = State::Resolving { request, reader };
+      return Ok(true);
+    }
+    self.finish_pack(request, reader, read, site, admission);
+    Ok(true)
+  }
+
+  /// The pack finished into `site` (its deltas all resolved, or the read refused), and its checks begun.
+  fn finish_pack<S: Keep + Repository>(
+    &mut self,
+    request: Request,
+    reader: unpack::Reader<'static, NoIndex>,
+    read: Result<(), unpack::Refusal>,
+    site: &mut S,
+    admission: &mut Admission,
+  ) {
     let mut fscking = Fscking {
       site,
       format: self.advertised.format,
@@ -336,12 +363,47 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       (unpacked, _) => unpacked,
     };
     self.state = State::Checking(Checking::fscked(request, Some(unpacked)));
-    Ok(true)
   }
 
-  /// Whether the pack's checks are still to make.
+  /// Whether the pack's checks are still to make: its waiting deltas still resolving, or its checks under way.
   pub fn is_checking(&self) -> bool {
-    matches!(self.state, State::Checking(_))
+    matches!(self.state, State::Resolving { .. } | State::Checking(_))
+  }
+
+  /// Whether the pack's waiting deltas are still resolving ([`Session::resolve_turn_into`]).
+  pub fn is_resolving(&self) -> bool {
+    matches!(self.state, State::Resolving { .. })
+  }
+
+  /// One turn of resolving the whole pack's waiting deltas into `site` (A-724's starvation fix), for `quantum` and at
+  /// least one unit: whether they are all resolved and the pack's checks begun. Answers so at once where nothing is
+  /// resolving. A delta that cannot resolve ends the reading as a refused pack, its checks begun, as a short pack's are.
+  pub fn resolve_turn_into<S: Keep + Repository>(
+    &mut self,
+    site: &mut S,
+    admission: &mut Admission,
+    quantum: Quantum<'_>,
+  ) -> Result<bool, Refusal> {
+    let State::Resolving { reader, .. } = &mut self.state else {
+      return Ok(true);
+    };
+    let mut fscking = Fscking {
+      site: &mut *site,
+      format: self.advertised.format,
+      refused: &mut self.refused,
+    };
+    let turned = reader.resolve_turn(admission, &mut super::Thin(&mut fscking), quantum);
+    let read = match turned {
+      Ok(false) => return Ok(false),
+      Ok(true) => Ok(()),
+      Err(refusal) => Err(refusal),
+    };
+    let State::Resolving { request, reader } = core::mem::replace(&mut self.state, State::Done)
+    else {
+      return Ok(true);
+    };
+    self.finish_pack(request, reader, read, site, admission);
+    Ok(true)
   }
 
   /// One turn of the pack's checks against `repository`, the objects read back from the session's
@@ -354,7 +416,17 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     admission: &mut Admission,
     quantum: Quantum<'_>,
   ) -> Result<bool, Refusal> {
-    let held = core::mem::take(&mut self.held);
+    let mut held = core::mem::take(&mut self.held);
+    if self.is_resolving() {
+      let mut site = InMemory {
+        repository,
+        held: &mut held,
+      };
+      let resolved = self.resolve_turn_into(&mut site, admission, quantum);
+      self.held = held;
+      // A turn resolving the pack's deltas is this call's turn; its checks begin with the next.
+      return resolved.map(|_| false);
+    }
     let turned = self.check_turn_with((repository, &held), admission, quantum);
     self.held = held;
     turned

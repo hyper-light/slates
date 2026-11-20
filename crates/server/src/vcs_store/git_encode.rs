@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use slates_db::catalog::RepositoryId;
-use slates_git::store::learn::Clock;
+use slates_git::store::learn::{Clock, Exchange};
 use slates_git::store::{Encoding, Progress, StoreRefused, Turn};
 
 use slates_vcs::{Prices, Rebuildable, amount_of, choose, whole_units};
@@ -98,6 +98,19 @@ fn turn_uncounted(state: &mut ShardState, id: RepositoryId) -> (Turned, u64) {
   let mut clock = ShardClock;
   let clock: &mut dyn Clock = &mut clock;
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
+  super::lent_state(state, |state| {
+    turn_lent(state, id, clock, quantum_ns, exchange)
+  })
+}
+
+/// [`turn_uncounted`]'s work inside its lend.
+fn turn_lent(
+  state: &mut ShardState,
+  id: RepositoryId,
+  clock: &mut dyn Clock,
+  quantum_ns: u64,
+  exchange: Exchange,
+) -> (Turned, u64) {
   let stores = &mut state.vcs_stores;
   let (Some(content), Some(super::RepositoryStore::Git(store))) =
     (stores.content.as_mut(), stores.entries.get_mut(&id))
@@ -246,7 +259,8 @@ pub(crate) fn relieve(
   let mut given = 0u64;
   let mut dropped = 0u64;
   {
-    let stores = &mut state.vcs_stores;
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    let stores = &mut *lent.stores;
     if let (Some(content), Some(super::RepositoryStore::Git(store))) =
       (stores.content.as_mut(), stores.entries.get_mut(&id))
     {

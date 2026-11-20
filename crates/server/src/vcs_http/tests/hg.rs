@@ -214,6 +214,25 @@ impl Store for Empty {
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
     std::iter::empty()
   }
+
+  fn manifest_linked(&self, _position: u64) -> Option<slates_hg::serve::getbundle::Linked> {
+    None
+  }
+
+  fn file_linked_from(
+    &self,
+    _from: (&[u8], u64),
+  ) -> Option<(Vec<u8>, u64, slates_hg::serve::getbundle::Linked)> {
+    None
+  }
+
+  fn holds_manifest(&self, _node: &Node) -> bool {
+    false
+  }
+
+  fn serves_every_changeset(&self) -> bool {
+    true
+  }
 }
 
 /// The stores of this shard as the tests hold them: `hg`'s, empty; none for any other repository.
@@ -222,6 +241,20 @@ struct OneStore;
 
 impl HgStores for OneStore {
   type Store<'s> = Empty;
+  type Hold = RepositoryId;
+
+  fn hold(&mut self, id: RepositoryId, _room: &mut slates_hg::Admission) -> Option<RepositoryId> {
+    self.holds(id).then_some(id)
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    hold: &RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    self.lend(*hold, room, step)
+  }
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HG
@@ -666,6 +699,20 @@ struct Vanishing;
 
 impl HgStores for Vanishing {
   type Store<'s> = Empty;
+  type Hold = RepositoryId;
+
+  fn hold(&mut self, id: RepositoryId, _room: &mut slates_hg::Admission) -> Option<RepositoryId> {
+    self.holds(id).then_some(id)
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    hold: &RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    self.lend(*hold, room, step)
+  }
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HG

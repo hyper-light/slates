@@ -1320,6 +1320,39 @@ pub enum RequestBody {
     /// The repository's name.
     repository: String,
   },
+  /// Export revisions `first` to `last` of Subversion repository `repository` as the dump stream `svnadmin dump` writes
+  /// for the same range (§4.17.4 piece 6; A-628, A-652 part 3): format 2, or format 3 with `deltas` (`--deltas`); a
+  /// range starting after revision 0 written incrementally (`--incremental`). The dump is written into a new volume
+  /// `name` holding it as [`DUMP_FILE`] in its root, which the caller lands where it wants the file, under a grant
+  /// (§4.15, R10), or reads through a mount. Served on the partition the repository's name hashes to, for the
+  /// repository's owner; the export runs in slices on its owner shard and the request is answered when it ends:
+  /// `DumpExported`, or refused by kind (`Unsupported` for another tool's repository, `BadRequest` for a range the
+  /// repository does not hold, `AlreadyExists` for a name taken, `BudgetExceeded`). Appended.
+  ExportDump {
+    /// The repository's name.
+    repository: String,
+    /// The range's first revision.
+    first: u64,
+    /// Its last revision.
+    last: u64,
+    /// Whether texts and property changes are written as deltas (format 3).
+    deltas: bool,
+    /// The new volume's name.
+    name: String,
+  },
+  /// Admit work `work` over green `green` at the green's owner (A-247, A-697 part a): the node that will hold the work
+  /// asks the green's owner, which judges the relayed principal's rights from the green's record, records the work's
+  /// floor at the head (`WorkFloorSet`, which keeps the head's history while the work reads it), and answers
+  /// `WorkAdmitted` with the work and its base. A node's verb, never a client's: served only as a forward from another
+  /// node, under the forward's completion record (so a resent forward is answered once), and refused `Unsupported` from
+  /// a client of the green's own node. Refused as a creation is: `NotFound` for no such green, `NotShared` for a
+  /// principal of another node the green is not shared with, `Forbidden` for one without the right. Appended.
+  AdmitWork {
+    /// The green.
+    green: VolumeId,
+    /// The work, its id minted on the asking node's partition.
+    work: VolumeId,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -1553,6 +1586,10 @@ pub const IMAGE_FILE: &str = "image.ext2";
 /// Format: the name of the archive file in an archive volume's root (`ArchiveExport`, A-441): the snapshot's archive in
 /// the format of `slates_archive` (§4.11), its own magic and version inside.
 pub const ARCHIVE_FILE: &str = "snapshot.slatesarchive";
+
+/// Format: the name of the dump file in the root of a volume a Subversion repository's export makes (`ExportDump`, A-652
+/// part 3): the stream `svnadmin dump` writes, which `svnadmin load` takes.
+pub const DUMP_FILE: &str = "repository.dump";
 
 /// What an image merge did (§4.6, A-160), counted.
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2023,6 +2060,49 @@ pub struct ShardReport {
   /// This node's failover estimate (A-363): live on the control shard, which runs the coordinator; elsewhere the
   /// recovery prior alone. Appended.
   pub failover: FailoverReport,
+  /// Each repository this shard owns with an event since it was made here, and its usage (A-724 piece 1's ledger,
+  /// `slates_vcs::usage`): what the share model reads, reported so a load run can see where a shard's time went.
+  /// Appended.
+  pub repositories: Vec<RepositoryUsageReport>,
+}
+
+/// One repository's usage on its owner shard (A-724; `slates_vcs::usage::Usage`), as a shard's report carries it.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryUsageReport {
+  /// The repository's name.
+  pub name: String,
+  /// Intakes (pushes, commits) begun.
+  pub intakes_begun: u64,
+  /// Intakes answered.
+  pub intakes_answered: u64,
+  /// Intake steps run.
+  pub intake_steps: u64,
+  /// The shard clock's nanoseconds those steps ran.
+  pub intake_step_ns: u64,
+  /// Bytes the clients sent for them.
+  pub intake_bytes_in: u64,
+  /// Fetch requests begun.
+  pub fetches_begun: u64,
+  /// The shard clock's nanoseconds fetch steps ran.
+  pub fetch_step_ns: u64,
+  /// The shard clock's nanoseconds at its first event.
+  pub first_ns: u64,
+  /// The shard clock's nanoseconds at its latest event.
+  pub last_ns: u64,
+  /// The longest one intake step ran, in nanoseconds: how long an intake held its shard at once.
+  pub longest_intake_step_ns: u64,
+  /// A git push's longest step of each phase on this shard, in nanoseconds: a run of the body read, the body's end, a
+  /// turn of the pack's checks, and the answer's last step (seal, hooks, verdicts, commit, report). Zeros for others.
+  pub longest_push_phases_ns: Vec<u64>,
+  /// A git push's steps of each phase on this shard, in the phases' order above.
+  pub push_phase_steps: Vec<u64>,
+  /// The nanoseconds those steps ran, by phase.
+  pub push_phase_ns: Vec<u64>,
+  /// The nanoseconds from the repository's previous push step's end to each step's start, by the step's phase: before
+  /// a check turn or the answer, the push's wait for its shard; before an input step, that and the client's bytes.
+  pub push_phase_gap_ns: Vec<u64>,
+  /// The nanoseconds from each git push's beginning to its first step, summed.
+  pub push_first_gap_ns: u64,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last
@@ -2261,6 +2341,7 @@ impl RequestBody {
       | RequestBody::Versions { green: volume }
       | RequestBody::ChangedSince { green: volume, .. }
       | RequestBody::CreateWork { green: volume, .. }
+      | RequestBody::AdmitWork { green: volume, .. }
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
@@ -2360,7 +2441,8 @@ impl RequestBody {
       | RequestBody::RetireBranch { .. }
       | RequestBody::SetRepositoryPolicy { .. }
       | RequestBody::ImportRepository { .. }
-      | RequestBody::DescribeRepositoryPolicy { .. } => None,
+      | RequestBody::DescribeRepositoryPolicy { .. }
+      | RequestBody::ExportDump { .. } => None,
     }
   }
 
@@ -2374,6 +2456,7 @@ impl RequestBody {
         | RequestBody::CreateRepository { .. }
         | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
+        | RequestBody::AdmitWork { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
@@ -2849,6 +2932,20 @@ pub enum WorkOp {
     path: String,
     /// The metadata recorded by the declaring volume.
     node: IpcNode,
+  },
+  /// Copy `from`'s tree, as version `version` of the work's green holds it (the work's base when none), to `to`, by
+  /// reference (A-586; A-626 part 4: a copy made through a work; Subversion's copy with history): replacing what `to`
+  /// holds when `replace`, else refused where `to` holds anything. What the work does in `to`'s tree after it lands on
+  /// what the copy brings. Appended.
+  Copy {
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from; none for the work's base.
+    version: Option<u64>,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
   },
 }
 
@@ -4450,6 +4547,35 @@ pub enum Refusal {
     /// Why.
     fault: ImportFault,
   },
+  /// A copy the submitted work declares was refused before any verdict (A-586, A-626 part 4; main's ruling of
+  /// 2026-11-20): no concurrent change caused it, so it is no conflict and no rebase answers it. Appended.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyCase,
+  },
+}
+
+/// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the
+/// wire. FSFS's commit refuses the first three too; the fourth follows from what a green retains; the rest are copies
+/// slates does not make yet (owed work, A-586). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyCase {
+  /// The destination is the root.
+  Root,
+  /// The source's version is past the green's head.
+  PastHead,
+  /// Nothing stood in the source's tree at its version.
+  SourceEmpty,
+  /// The source's version's values are folded away.
+  VersionFolded,
+  /// A hard link in the source names a node outside it that changed after the version (owed).
+  OutsideNodeChanged,
+  /// The source changed after its version and a hard link stood in it then (owed).
+  ChangedSourceLink,
+  /// A rename or a hard link the work declares with an end in a copied tree (owed).
+  LinkAcrossCopy,
 }
 
 /// Why the bytes an `ArchiveImport` read make no volume ([`Refusal::ArchiveRefused`], A-453): each the class of the
@@ -5471,6 +5597,22 @@ pub enum ReplyBody {
     hooks_env: Vec<HooksEnvSection>,
     /// A git repository's keys trusted to sign its commits.
     signers: Vec<Vec<u8>>,
+  },
+  /// A Subversion repository's range of revisions exported as a dump into a new volume (`ExportDump`, A-652 part 3):
+  /// the volume, which holds it as [`DUMP_FILE`], and the dump's length in bytes. Appended.
+  DumpExported {
+    /// The new volume.
+    id: VolumeId,
+    /// The dump's length in bytes.
+    dump_bytes: u64,
+  },
+  /// A work admitted over its green at the green's owner (`AdmitWork`, A-697 part a): the work, and the green's version
+  /// it is based on, whose history the owner keeps while the work reads it. Appended.
+  WorkAdmitted {
+    /// The work.
+    id: VolumeId,
+    /// The green's version the work is based on.
+    base: u64,
   },
 }
 

@@ -254,6 +254,18 @@ impl Quarantine {
       .map(|(id, staged)| (&**id, staged.kind, staged.content, staged.len))
   }
 
+  /// The first object held whose id is after `after` (the first of all for none), as [`Quarantine::objects`] answers it:
+  /// a cursor a step at a time over the objects (A-722 part 4).
+  pub fn object_after(&self, after: Option<&[u8]>) -> Option<(&[u8], u8, ContentId, u64)> {
+    use std::ops::Bound;
+    let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+    self
+      .staged
+      .range::<[u8], _>((from, Bound::Unbounded))
+      .next()
+      .map(|(id, staged)| (&**id, staged.kind, staged.content, staged.len))
+  }
+
   /// Commits every object into `index` as one step, then gives back the quarantine's holds, leaving it empty. Refused
   /// by the index, it commits nothing and keeps every object, for the caller to abandon.
   pub fn commit(

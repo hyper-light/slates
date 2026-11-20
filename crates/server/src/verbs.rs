@@ -158,8 +158,18 @@ pub(crate) fn fresh_volume_id(state: &mut ShardState) -> Option<DbVolumeId> {
 
 /// The `offset`-th of several fresh volume ids minted before any of their volumes is recorded (A-694): an append's new
 /// branches, each its own, where [`fresh_volume_id`] would name the same id for each.
+///
+/// Each mint is the shard's alone (`ShardState::volume_ids_minted`): an id minted before the atom that records it (an
+/// image's identity at its plan, an archive's or an import's volume at its admission, A-652's export) is reserved, so a
+/// second job minting before the first records takes the next. Found by A-652's export: two exports side by side named
+/// one id and the second was refused `AlreadyExists` at its record. A mint inside the recording transaction cannot be
+/// the structural form here, since an image's identity holds its id before its volume is recorded.
 pub(crate) fn fresh_volume_id_at(state: &mut ShardState, offset: u64) -> Option<DbVolumeId> {
-  let count = state.db.volume_counter_at(offset)?;
+  let unrecorded = state.db.volume_counter_at(0)?.max(state.volume_ids_minted);
+  let count = unrecorded
+    .checked_add(offset)
+    .filter(|count| *count <= slates_db::register::MAX_OBJECT_COUNTER)?;
+  state.volume_ids_minted = state.volume_ids_minted.max(count.checked_add(1)?);
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&state.fleet.host().0.to_be_bytes());
   bytes[8..10].copy_from_slice(&state.partition.to_be_bytes());
@@ -2649,7 +2659,8 @@ pub(crate) fn route_gated(
     | RequestBody::RetireBranch { repository, .. }
     | RequestBody::SetRepositoryPolicy { repository, .. }
     | RequestBody::ImportRepository { repository, .. }
-    | RequestBody::DescribeRepositoryPolicy { repository } => {
+    | RequestBody::DescribeRepositoryPolicy { repository }
+    | RequestBody::ExportDump { repository, .. } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -4065,6 +4076,8 @@ fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
 
 /// This shard's part of the status: its counters and its health signals (§4.14 catalog).
 pub fn shard_report(state: &mut ShardState) -> ShardReport {
+  // Advanced first, mutably: the sweep of the shard's slice of the anchor content object (A-744).
+  let content_ranges = crate::content_ranges::report(state);
   let now = state.clock.monotonic_ns();
   let since_boot = now.saturating_sub(state.booted_ns);
   let ring_depth: u64 = state
@@ -4241,6 +4254,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
         }),
       )
       .chain(large_counts(state))
+      .chain(content_ranges)
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -4309,7 +4323,41 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       slates_ipc::protocol::LearnerReport::default()
     },
     failover: failover_report(state),
+    repositories: repository_usage_reports(state),
   }
+}
+
+/// Each repository's usage row this shard keeps (A-724, `ShardState::vcs_usage`), named by its record, for the shard's
+/// report.
+fn repository_usage_reports(
+  state: &ShardState,
+) -> Vec<slates_ipc::protocol::RepositoryUsageReport> {
+  let repositories = state.db.partition().repositories();
+  state
+    .vcs_usage
+    .rows()
+    .map(|(id, usage)| slates_ipc::protocol::RepositoryUsageReport {
+      name: repositories
+        .repository(*id)
+        .map(|record| record.name.clone())
+        .unwrap_or_default(),
+      intakes_begun: usage.intake.begun,
+      intakes_answered: usage.intake.answered,
+      intake_steps: usage.intake.steps,
+      intake_step_ns: usage.intake.step_ns,
+      intake_bytes_in: usage.intake.bytes_in,
+      fetches_begun: usage.fetch.begun,
+      fetch_step_ns: usage.fetch.step_ns,
+      first_ns: usage.first_ns,
+      last_ns: usage.last_ns,
+      longest_intake_step_ns: usage.intake.longest_step_ns,
+      longest_push_phases_ns: crate::git_push::phase_longest(*id).longest.to_vec(),
+      push_phase_steps: crate::git_push::phase_longest(*id).steps.to_vec(),
+      push_phase_ns: crate::git_push::phase_longest(*id).ns.to_vec(),
+      push_phase_gap_ns: crate::git_push::phase_longest(*id).gap_ns.to_vec(),
+      push_first_gap_ns: crate::git_push::phase_longest(*id).first_gap_ns,
+    })
+    .collect()
 }
 
 /// This shard's failover estimate as the wire carries it (A-363): live on the control shard, which runs the
@@ -4715,6 +4763,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::MessageRequired => "message_required",
     Refusal::IdentityRequired { .. } => "identity_required",
     Refusal::ImportRefused { .. } => "import_refused",
+    Refusal::CopyRefused { .. } => "copy_refused",
   }
 }
 
@@ -4969,6 +5018,7 @@ fn dispatch_inner(
       from,
     } => changed_since(state, principal, green, version, from),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
+    RequestBody::AdmitWork { green, work } => admit_work(state, principal, green, work),
     RequestBody::Edit {
       work,
       path,
@@ -5229,6 +5279,20 @@ fn dispatch_inner(
     RequestBody::DescribeRepositoryPolicy { repository } => {
       crate::repository::describe_policy(state, principal, &repository)
     }
+    // A Subversion repository's range of revisions exported as a dump into a new volume, answered when the export ends
+    // (A-652 part 3).
+    RequestBody::ExportDump {
+      repository,
+      first,
+      last,
+      deltas,
+      name,
+    } => crate::repository::svn_export::export_dump(
+      state,
+      principal,
+      (&repository, (first, last), deltas),
+      name,
+    ),
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {
       principal: proven,
@@ -8579,6 +8643,19 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       path: key(path),
       name,
     },
+    // A copy made through a work (A-626 part 4): of the work's base unless it names a version; the green's owner
+    // composes it against the copied tree (`merge.work.copy_composed_by_owner`).
+    WorkOp::Copy {
+      from,
+      to,
+      version,
+      replace,
+    } => VolumeOp::Copy {
+      from: key(from),
+      to: key(to),
+      version: version.unwrap_or(w.base_version),
+      replace,
+    },
   };
   // The work is charged for what the declaration adds before it changes anything (`crate::work_charge`): a moved
   // file it now holds, a removal it records, the operation itself. The base is read while its green is lent.
@@ -9617,6 +9694,9 @@ fn judge_submission(
   crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
     slates_merge::engine::Outcome::Accepted { version } => {
+      // The copies the version made, read before the increment's parts move: a Subversion green's revision names them
+      // (`vcs_store::svn_made`).
+      let copies = crate::vcs_store::svn_made::copies_of(&inc);
       // The wait goes first, in this transaction, so a version is never durable without it (A-252).
       if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
         return refused(refusal_of_db(&e));
@@ -9656,7 +9736,7 @@ fn judge_submission(
       crate::vcs_store::commits::after_submit(state, green_id, version, &policy.authorship);
       // A Subversion repository's green: the version becomes the revision the server makes of it, recorded in this
       // transaction (A-664's Subversion objects, `vcs_store::svn_made`).
-      crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship);
+      crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship, &copies);
       // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
       // transaction (A-731, `vcs_store::hg_made`).
       crate::vcs_store::hg_made::make(state, green_id, version, &policy.authorship);
@@ -9690,7 +9770,28 @@ fn judge_submission(
         version: base,
       })
     }
+    slates_merge::engine::Outcome::CopyRefused { path, case } => {
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
+      refused(copy_refused(path, case))
+    }
   }
+}
+
+/// A copy refused before any verdict on the wire (A-586; main's ruling of 2026-11-20): the engine's case named by an
+/// exhaustive match, so a case appended to the engine breaks this build until the wire names it.
+pub(crate) fn copy_refused(path: String, case: slates_merge::engine::CopyRefusal) -> Refusal {
+  use slates_ipc::protocol::CopyCase;
+  use slates_merge::engine::CopyRefusal;
+  let case = match case {
+    CopyRefusal::Root => CopyCase::Root,
+    CopyRefusal::PastHead => CopyCase::PastHead,
+    CopyRefusal::SourceEmpty => CopyCase::SourceEmpty,
+    CopyRefusal::VersionFolded => CopyCase::VersionFolded,
+    CopyRefusal::OutsideNodeChanged => CopyCase::OutsideNodeChanged,
+    CopyRefusal::ChangedSourceLink => CopyCase::ChangedSourceLink,
+    CopyRefusal::LinkAcrossCopy => CopyCase::LinkAcrossCopy,
+  };
+  Refusal::CopyRefused { path, case }
 }
 
 /// Whether green `green`'s chain can hold `record`, an increment about to be judged: checked guard-then-apply. A chain
@@ -9891,6 +9992,9 @@ fn map_rebase(
         version: base,
       }))
     }
+    slates_merge::engine::Rebased::CopyRefused { path, case } => {
+      RebaseAnswer::Reply(refused(copy_refused(path, case)))
+    }
   }
 }
 
@@ -9997,6 +10101,34 @@ pub(crate) fn owner_admit(
   )
   .map_err(|error| refusal_of_db(&error))?;
   Ok(crate::work_home::Admitted { id: work, base })
+}
+
+/// `AdmitWork` (A-697 part a): another node asks this green's owner to admit a work it will hold. Served only as a
+/// forward from another node, whose completion record (`run_forwarded`, keyed by the authenticated origin) makes a resent
+/// ask answered once; a client of this node asks for a work by `CreateWork`, so from one this is refused `Unsupported`.
+/// The relayed principal's rights are judged from the green's record and the work's floor is recorded at the head, as a
+/// work created on this node is admitted (`owner_admit`).
+fn admit_work(
+  state: &mut ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  work: VolumeId,
+) -> ReplyBody {
+  let forwarded = state
+    .current_request
+    .is_some_and(|(origin, _)| origin != state.origin_anchor.0);
+  if !forwarded {
+    return refused(Refusal::Unsupported {
+      feature: "admit_work from a client".to_owned(),
+    });
+  }
+  match owner_admit(state, principal, to_db_volume(green), to_db_volume(work)) {
+    Ok(admitted) => ReplyBody::WorkAdmitted {
+      id: to_wire_volume(admitted.id),
+      base: admitted.base,
+    },
+    Err(refusal) => refused(refusal),
+  }
 }
 
 /// The base's bytes of `paths` for a verb on a work's shard (A-247).

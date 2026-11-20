@@ -86,6 +86,8 @@ pub struct Stdio {
   /// The room a push's bundle is admitted, where its caller names one past a request's (A-711: what the repository's
   /// shard can hold).
   push_room: Option<u64>,
+  /// A `getbundle`'s answer being made a slice at a time (A-745): the session serves no other request until it ends.
+  answering: Option<session::Producing>,
 }
 
 /// A push this session took whole (the module doc's push): its `heads` argument, its bundle's bytes, and what is left of
@@ -136,6 +138,11 @@ pub enum Progress {
     /// The input bytes it took.
     consumed: usize,
   },
+  /// A slice of a `getbundle`'s answer was made (A-745); `more` while its answer goes on.
+  Streamed {
+    /// Whether more of the answer follows.
+    more: bool,
+  },
   /// A chunk of a push's bundle was taken (the module doc's push); `consumed` bytes of input, which the caller gives
   /// back to the channel's window. Once `whole`, the push waits for its caller ([`Stdio::take_push`]).
   Took {
@@ -158,6 +165,7 @@ impl Stdio {
       ended: false,
       push: Pushing::None,
       push_room: None,
+      answering: None,
     }
   }
 
@@ -201,16 +209,54 @@ impl Stdio {
     if self.input.starts_with(UNBUNDLE_LINE) {
       return self.unbundle(store, room);
     }
+    if self.answering.is_some() {
+      return self.stream(store, room);
+    }
     let mut admission = Admission::new(room);
-    match session::serve(
+    match session::begin_serving(
       store,
       &self.input,
       &mut admission,
-      &mut self.stdout,
-      &mut self.stderr,
+      (&mut self.stdout, &mut self.stderr),
+      &mut self.answering,
     ) {
       Read::Done(step, used) => self.taken(step, used),
       Read::More { needed } => self.more(needed),
+    }
+  }
+
+  /// Whether a `getbundle`'s answer is being made (A-745): [`Stdio::stream`] makes its next slice.
+  pub fn streaming(&self) -> bool {
+    self.answering.is_some()
+  }
+
+  /// Makes the next slice of the `getbundle` answer being made, within `room` (A-745), after what its standard output
+  /// holds (its caller bounds how much a turn makes): [`Progress::Streamed`], whether more follow; refused, the session
+  /// ends unfinished, as 7.2 fails mid-stream.
+  pub fn stream(&mut self, store: &impl Store, room: u64) -> Progress {
+    if self.ended {
+      return Progress::Waiting;
+    }
+    let Some(answering) = self.answering.as_mut() else {
+      return Progress::Waiting;
+    };
+    let mut admission = Admission::new(room);
+    match answering.step(store, &mut admission, &mut self.stdout) {
+      Ok(true) => Progress::Streamed { more: true },
+      Ok(false) => {
+        self.answering = None;
+        Progress::Streamed { more: false }
+      }
+      Err(refusal) => {
+        self.answering = None;
+        self.ended = true;
+        Progress::Stepped {
+          step: Step::Ended {
+            refused: Some(Refused::Serve(refusal)),
+          },
+          consumed: 0,
+        }
+      }
     }
   }
 

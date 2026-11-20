@@ -492,6 +492,26 @@ impl HgIndex {
       .filter_map(|row| first_file_row(row.key()))
   }
 
+  /// The first file revision at or after revision `rev` of `path`'s log in the file logs' order (by path, then number):
+  /// its path, its number and its row; none past the last file log. A fetch's file section walks the logs from one to
+  /// the next by it (A-745), so nothing lists them: each call costs one search of the rows and one row.
+  pub fn file_revision_from(
+    &self,
+    store: &ContentStore,
+    (path, rev): (&[u8], u32),
+  ) -> Option<(Vec<u8>, u32, RevisionRow)> {
+    let start = Log::File(path).row_key(rev);
+    let row = self.rows.iter_from(store, &start).next()?;
+    let rest = row.key().strip_prefix(&[LOG_ROW, FILE_KEY])?;
+    let (found, number) = rest.split_last_chunk::<REV_BYTES>()?;
+    let found = found.strip_suffix(&[PATH_END])?;
+    Some((
+      found.to_vec(),
+      u32::from_be_bytes(*number),
+      read_revision(&row)?,
+    ))
+  }
+
   /// The changelog's row numbered `rev`.
   pub fn changeset<'s>(&'s self, store: &'s ContentStore, rev: u32) -> Option<ChangesetRow<'s>> {
     let row = self.rows.get(store, &Log::Changelog.row_key(rev))?;

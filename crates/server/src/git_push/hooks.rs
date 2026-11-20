@@ -274,7 +274,9 @@ impl PushHooks {
     if !sealed {
       return Turn::Sealing;
     }
-    let Some(root) = presenter.present(state, &open.view) else {
+    // A presentation reads the view's files from the repository's windows, so the shard's chunk store is lent to it.
+    let shown = crate::vcs_store::lent_state(state, |state| presenter.present(state, &open.view));
+    let Some(root) = shown else {
       self.close(state, presenter);
       return Turn::NotRun(b"nothing shows its view here".to_vec());
     };
@@ -458,6 +460,7 @@ fn admitted<P>(
     principal: &push.principal,
     name: hooking.name,
     hooks: &mut HookVerdicts::default(),
+    admitting: &mut None,
   };
   judge.admitted(command).is_ok()
 }

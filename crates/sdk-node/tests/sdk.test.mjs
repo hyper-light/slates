@@ -42,7 +42,7 @@ async function connectWhenReady(slates, instance) {
   }
 }
 
-test('the addon loads and exposes the Client surface', (t) => {
+test('the addon loads and exposes the Client surface', async (t) => {
   if (!addonPath || !existsSync(addonPath)) {
     t.skip('SLATES_NODE_ADDON is not set to a built .node addon — skipped loudly');
     return;
@@ -54,11 +54,21 @@ test('the addon loads and exposes the Client surface', (t) => {
   const expected = [
     'create', 'snapshot', 'status', 'list', 'resize', 'destroy',
     'createGreen', 'createWork', 'versions', 'changedSince', 'edit', 'submit', 'rebase',
-    'unlink', 'rename', 'mkdir', 'rmdir', 'chmod', 'symlink', 'link', 'setXattr', 'removeXattr',
+    'unlink', 'rename', 'mkdir', 'rmdir', 'chmod', 'symlink', 'link', 'setXattr', 'removeXattr', 'copy',
     'clientId', 'reconnects', 'spinFor', 'parkRatio',
   ];
   for (const verb of expected) {
     assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);
+  }
+  // Every work operation the SDK offers (its exhaustive map over the wire's `WorkOp`, A-626 part 4) is a verb of the
+  // native client and of the async one, so an appended operation reaches this surface whole or breaks its build.
+  const offered = slates.workOpMethods();
+  assert.ok(offered.includes('copy'), JSON.stringify(offered));
+  const { AsyncClient } = await import('../async.mjs');
+  const asyncMethods = Object.getOwnPropertyNames(AsyncClient.prototype);
+  for (const verb of offered) {
+    assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);
+    assert.ok(asyncMethods.includes(verb), `AsyncClient.prototype has ${verb}`);
   }
   assert.equal(typeof slates.Client.connect, 'function', 'Client.connect factory is exported');
 });
@@ -221,6 +231,23 @@ test('lifecycle round trip over a live daemon', async (t) => {
     assert.equal(nsOutcome.ok, true, `the namespace ops submitted cleanly: ${JSON.stringify(nsOutcome)}`);
     const nsChanged = client.changedSince(green, nsBase);
     assert.ok(nsChanged.some((p) => p.includes('keep.txt')), JSON.stringify(nsChanged));
+
+    // a copy (A-626 part 4): a work lands `/c/x.txt`; another copies `/c`'s tree to `/e` from its base by reference
+    // and submits; the CLI reads the copied file's bytes at the green's head.
+    const source = client.createWork(green, 'w-copy-source-node');
+    client.edit(source.id, '/c/x.txt', 0, 0, Buffer.from('copied'));
+    assert.equal(client.submit(source.id).ok, true);
+    const copying = client.createWork(green, 'w-copy-node');
+    client.copy(copying.id, '/c', '/e');
+    const copied = client.submit(copying.id);
+    assert.equal(copied.ok, true, `the copy submits: ${JSON.stringify(copied)}`);
+    const read = spawnSync(daemon, ['--instance', instance, 'read', green, '/e/x.txt'], { encoding: 'utf8' });
+    assert.equal(read.status, 0, read.stderr);
+    assert.equal(read.stdout, 'copied');
+    // a copy of nothing is refused before any verdict, typed by its case (A-586).
+    const empty = client.createWork(green, 'w-copy-nothing-node');
+    client.copy(empty.id, '/nothing', '/z');
+    assert.throws(() => client.submit(empty.id), /CopyRefused.*source_empty/);
   } finally {
     await endAnchor(anchor);
   }

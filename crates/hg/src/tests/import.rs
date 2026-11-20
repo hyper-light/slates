@@ -1005,8 +1005,8 @@ const RECORDED: [&str; 7] = [
 ];
 
 /// Format: where a record's first changeset's text begins: the magic, the version, the source and the room, the groups'
-/// count, the changelog's tag and revisions' count, then the changeset's node, two parents, flags and text length.
-const FIRST_TEXT: usize = 4 + 4 + 1 + 8 + 8 + 1 + 8 + 20 * 3 + 2 + 8;
+/// count, the changelog's tag and revisions' count, then the changeset's node, two parents, flags, form and text length.
+const FIRST_TEXT: usize = 4 + 4 + 1 + 8 + 8 + 1 + 8 + 20 * 3 + 2 + 1 + 8;
 
 /// Format: where a record's groups' count lies: after the magic, the version, the source and the room.
 const GROUPS_AT: usize = 4 + 4 + 1 + 8;
@@ -1126,8 +1126,8 @@ fn t_a687_hostile_records_are_refused_by_kind() {
   let obsstore = state_fixtures::find("states/obsstore").unwrap();
   let cases: [RecordCase; 6] = [
     (with(0, b'X'), |refused| *refused == RecordRefused::Magic),
-    (with(4, 3), |refused| {
-      *refused == RecordRefused::Version { version: 3 }
+    (with(4, 4), |refused| {
+      *refused == RecordRefused::Version { version: 4 }
     }),
     (count, |refused| *refused == RecordRefused::Count),
     (trailing, |refused| *refused == RecordRefused::Trailing),
@@ -1277,6 +1277,7 @@ fn cut_record(
           link: *link,
           flags: *flags,
           text,
+          base: None,
         })
         .collect();
       (*log, given)

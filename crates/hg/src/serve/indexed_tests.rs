@@ -329,7 +329,7 @@ fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
     }
   );
   let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
-  assert_eq!(outgoing.missing, [0, 1, 2]);
+  assert_eq!(outgoing.missing.iter().collect::<Vec<_>>(), [0, 1, 2]);
   let packed = changegroup(&view, &outgoing, Version::V03, &mut room()).unwrap();
   let packed = Changegroup::decode(&packed, Version::V03, &mut room()).unwrap();
   let changesets: Vec<Node> = texts_of(&packed, &packed.changelog)
@@ -1122,4 +1122,103 @@ fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
       .collect();
   assert_eq!(sent, expected);
   assert!(sent.iter().any(|(name, _)| name == b"00changelog.i"));
+}
+
+/// Each manifest and file revision a changegroup carries, with its link, as a set: what a fetch brings, whatever the
+/// order its packer took.
+fn carried(packed: &[u8]) -> BTreeSet<(Vec<u8>, Node, Node)> {
+  let packed = Changegroup::decode(packed, Version::V03, &mut room()).unwrap();
+  let mut carried: BTreeSet<(Vec<u8>, Node, Node)> = packed
+    .group(&packed.manifests)
+    .iter()
+    .map(|revision| (Vec::new(), revision.node, revision.link))
+    .collect();
+  for group in &packed.files {
+    carried.extend(
+      packed
+        .group(&group.revisions)
+        .iter()
+        .map(|revision| (group.name.to_vec(), revision.node, revision.link)),
+    );
+  }
+  carried
+}
+
+/// A-745 (the link walk over a real index). Do: import each of `fixtures/state`'s repositories and clone each view
+/// that serves every changeset its changelog holds, by its links (`changegroup`, walking the manifest log and the file
+/// logs from row to row) and by the changesets that name each revision (`named_changegroup`, 7.2's slow path). Expect
+/// the two to carry the same revisions with the same links, and at least one view walked by its links.
+#[test]
+fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
+  let mut walked = 0;
+  for name in ["amended-root", "divergent", "states"] {
+    let (imported, store) = imported(name);
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    if !view.serves_every_changeset() {
+      continue;
+    }
+    walked += 1;
+    let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
+    let by_links = changegroup(&view, &outgoing, Version::V03, &mut room()).unwrap();
+    let named =
+      super::super::getbundle::named_changegroup(&view, &outgoing, Version::V03, &mut room())
+        .unwrap();
+    assert_eq!(carried(&by_links), carried(&named), "{name}");
+    assert!(!carried(&by_links).is_empty(), "{name}");
+  }
+  assert!(walked > 0, "no view was walked by its links");
+}
+
+/// A-745 (stream clones in slices). Do: with each of `fixtures/state`'s repositories imported and its secret roots
+/// dropped, ask `stream_out` whole within one room and a step at a time (`render::Streaming`), each step given a room of
+/// its own; find the least room each way. Expect each step to need less room than the whole answer, and the steps'
+/// bytes the whole answer's, byte for byte.
+#[test]
+fn a_stream_clone_is_sent_a_row_at_a_time_each_within_its_own_room() {
+  use super::super::stream::stream_out;
+  for name in ["amended-root", "divergent", "states"] {
+    let (imported, store) = imported(name);
+    let public: Vec<PhaseHead> = imported
+      .phase_roots
+      .iter()
+      .filter(|root| root.phase != Phase::Secret)
+      .copied()
+      .collect();
+    let state = State {
+      roots: &public,
+      ..state_of(&imported)
+    };
+    let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+    let mut whole = Vec::new();
+    stream_out(&view, &mut room(), &mut whole).unwrap();
+    let stepped = |each: u64| -> Option<Vec<u8>> {
+      let mut streaming = crate::render::Streaming::default();
+      let mut out = Vec::new();
+      while streaming
+        .step(&imported.index, &store, &mut Admission::new(each), &mut out)
+        .ok()?
+      {}
+      Some(out)
+    };
+    let least = |takes: &dyn Fn(u64) -> bool| {
+      let (mut low, mut high) = (0_u64, 1_u64 << 24);
+      while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if takes(middle) {
+          high = middle;
+        } else {
+          low = middle;
+        }
+      }
+      high
+    };
+    let whole_room =
+      least(&|each| stream_out(&view, &mut Admission::new(each), &mut Vec::new()).is_ok());
+    let step_room = least(&|each| stepped(each).is_some());
+    assert!(
+      step_room < whole_room,
+      "{name}: a step took {step_room}, the whole {whole_room}"
+    );
+    assert_eq!(stepped(step_room).unwrap(), whole, "{name}");
+  }
 }
