@@ -214,3 +214,82 @@ fn a_homed_windows_ticket_is_published_only_once_its_homes_image_is() {
   let outcome = outcome.expect("the shards answered");
   assert!(outcome.is_empty(), "{outcome:#?}");
 }
+
+/// A-724 piece 6 (N = 1; the batch forms agreed with w-perf). Do: on a four-shard daemon, home 64 windows in one batch
+/// with one of them twice, read them all back in one batch, then let them all go in one batch. Expect: every window
+/// homed and read back whole in order; fewer calls than windows (one a home shard a batch while a home's quantum holds
+/// its items, the rest the next turn); the window sent twice kept until its second let-go; all freed after.
+#[test]
+fn a_batch_of_windows_goes_to_each_home_in_one_call_a_shard() {
+  use super::{BATCH_CALLS, home_many, let_go_many, read_many};
+  let daemon = crate::daemon::audit_daemon_of(4);
+  let (sent, answered) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let origin = state.shard;
+    let shards = state.shards.clone();
+    let task = slates_rt::futures::spawn(async move {
+      let budget = crate::daemon::LIVENESS_BUDGET_NS;
+      let mut outcome: Vec<String> = Vec::new();
+      let mut windows: Vec<Vec<u8>> = (0..WINDOWS).map(window).collect();
+      windows.push(window(0));
+      let homed = home_many(origin, &shards, windows.clone(), budget).await;
+      if homed.len() != windows.len() || homed.iter().any(Result::is_err) {
+        outcome.push(format!("not every window homed: {homed:?}"));
+      }
+      let identities: Vec<ContentId> = windows.iter().map(|bytes| ContentId::of(bytes)).collect();
+      let read_back = read_many(origin, &shards, &identities, budget).await;
+      for (at, (bytes, got)) in windows.iter().zip(&read_back).enumerate() {
+        if got.as_ref() != Some(bytes) {
+          outcome.push(format!("window {at} not read back in order"));
+        }
+      }
+      let once: Vec<ContentId> = identities.iter().take(WINDOWS).copied().collect();
+      if let_go_many(origin, &shards, &once, budget)
+        .await
+        .iter()
+        .any(Result::is_err)
+      {
+        outcome.push("not every window let go".to_owned());
+      }
+      if read(origin, &shards, identities[0], budget).await.is_none() {
+        outcome.push("the window sent twice was freed at its first let-go".to_owned());
+      }
+      if let_go_many(origin, &shards, &identities[..1], budget)
+        .await
+        .iter()
+        .any(Result::is_err)
+      {
+        outcome.push("the window sent twice was not let go again".to_owned());
+      }
+      if read_many(origin, &shards, &once, budget)
+        .await
+        .iter()
+        .any(Option::is_some)
+      {
+        outcome.push("a window outlived its last let-go".to_owned());
+      }
+      let _ = sent.send(outcome);
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS));
+  let calls: u64 = (0..4)
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        state.refusals.get(BATCH_CALLS).copied().unwrap_or(0)
+      })
+    })
+    .sum();
+  daemon.stop();
+  let outcome = outcome.expect("the shards answered");
+  assert!(outcome.is_empty(), "{outcome:#?}");
+  // Five batches over 65 + 65 + 64 + 1 + 64 = 259 windows. A call works through its home's items until the home's step
+  // quantum is spent (at least one), so how many fit a call depends on the build's speed: fewer calls than windows is the
+  // property, one call a home shard a batch the case when the quantum holds them all.
+  println!("five batches of 259 windows over 4 homes: {calls} calls");
+  assert!(
+    calls < 259,
+    "a batch made a call a window or more: {calls} calls"
+  );
+}

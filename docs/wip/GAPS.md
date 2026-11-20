@@ -60,7 +60,8 @@
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
 > until it ends; a green's first submit's and one past a copy BUILT 2026-11-20 too, its commit owed durably,
-> `vcs_store::owed`, made at its build's end from what the submit staged) and a whole
+> `vcs_store::owed`, made at its build's end from what the submit staged; a push mid-build moves the build to the newest
+> head at a slice's boundary, never restarting it, BUILT 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
@@ -81,6 +82,9 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 2 (2026-11-20, w-git).** BUILT: rows carry no green or version; the landing map
+> (`Repository::bringer_of`) answers the version that brought a position.
+>
 > **A-722 part 1 (2026-11-20, w-git).** BUILT: `Index::adopt`, a fork's runs taken in whole (stale and non-fork
 > refused). Owed: rows staged per push in a fork as objects land, holes tolerated, commit rows and the seal sliced, the
 > moves' admission sliced, the landing adopting the fork, stale re-base, admission by window and post-state; then
@@ -97,12 +101,16 @@
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
 > one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
-> Designed, owed: the snapshot slot sized by its data (8) and a giant repository's index cut across partitions by
-> object id (9).
+> Piece 8a: growth past the snapshot slot refused typed before it is written (`DbError::SnapshotRoom`). Owed: the slot
+> derived and re-laid at a handoff (8b), the snapshot naming sealed index tables (8c), a giant repository's index cut
+> across partitions by object id (9).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
 > (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
 > Owed: compression of cold content.
+> Piece 5b's placement policy for A-722's intake off the owner (`vcs_share::place::intake_shard`, two choices by
+> intakes decoding) built, waiting for w-git's A-722 to call it.
+> Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -126,8 +134,11 @@
 > FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
 > resumable, its place a byte offset; `vcs_store::replay_hg_sliced`), and an import's record is written a revision a turn
 > before its landing (`record::Writer`, the import's `Stage::Writing`), where each was one step; `docs/bugs/2026-11-20-
-> a-large-mercurial-import-crash-looped-the-daemon.md`. Owed: a rebuild's replay (`vcs_store::rebuild`, one step still);
-> the record's size itself (S5, A-729: identities, no texts); w-perf's by-use rerun.
+> a-large-mercurial-import-crash-looped-the-daemon.md`. Part 2 FIXED (found by use, w-interop: a 57,035-revision push
+> over HTTP spun shard 0 at its landing): a push's record is written a part a slice before its landing
+> (`record::Writer::begin_kept`, `hg_push::record_sliced`), again after a re-base, where the landing wrote it whole.
+> Owed: a rebuild's replay (`vcs_store::rebuild`, one step still); the landing's append of an entry as large as its
+> record, and the record's size itself (S5, A-729: identities, no texts); w-perf's and w-interop's by-use reruns.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -1542,6 +1553,12 @@
 > after which the edge judges a client gone) is released at the table's next use, counted
 > (`vcs_store.dav_commits_released`). Before the edge has learned that bound none is released early; the table stays
 > bounded by one a repository and principal.
+> **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
+> `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
+> (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
+> byte-identical and the matrix passes 29 of 29 (Mac Studio, debug). Over git/git's last 2,000 commits svnsync passes
+> but `svnrdump dump` (one `replay-range` of the whole history) gets shard 0 spinning 3.6 s and the daemon killed
+> after 53 MB: 28 of 29, owed to w-svn.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -22845,6 +22862,14 @@ Goal item 4 of 2026-10-22, the leak A-148 recorded.
   release test as evidence, which a mount's own `FORGET` now settles before the mount ends (2d8eee97). A test needs a file
   kept with no `FORGET` to come: unlinked through the successor while a handle no image counted is open, then the mount
   unmounted while the handle is held (a lazy unmount) and `referenced_bytes` read back to its level before the file.
+  **Built 2026-11-20 (A-739, w-bugs; goal-83 B14), and it found a leak wider than the kept files:** the test
+  (`crates/cli/tests/cli.rs` `a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends`)
+  failed on CI's ubuntu (kernel 7.0) with and without a takeover: the mount ended (`attachments: 0`, nothing
+  `takeover_kept`) and the file's 1 MiB stayed referenced. An ordinary mount's end swept nothing its kernel held
+  (`sweep_attachment` was reached only from `FUSE_DESTROY` and virtio-fs), so a file it held open or looked up,
+  unlinked meanwhile, stayed charged for good. `end_attachment` now sweeps the attachment's references, which ends a
+  takeover holder too; with `a_file_an_ended_mount_held_is_given_back`, both tests red with the old call and green
+  with the sweep (diag-w-bugs-a739-red-2 / -green-1).
 - **Found under load afterwards, fixed by A-154 (next section but two):** a handle released after the last publication
   left its open in the image, and nothing ever gave it back.
 

@@ -54721,6 +54721,34 @@ Applied in the same change to:
   pushes, a hot repository's 19 pushes are 7.61 times slower and the small class 2.72 times: the gap A-722's intake off
   the owner shard closes, w-balance supplying its placement policy. Per-repository lanes on a shard were measured dead
   even and rejected.
+- **Piece 5b's placement policy, for A-722 (2026-11-20, main's ruling: w-git builds intake off the owner shard, w-balance
+  supplies which shard decodes a push).** `crate::vcs_share::place::intake_shard(arrived, key, shards, load)`: the
+  shorter of two queues (Mitzenmacher, IEEE TPDS 2001), the arrival shard or the shard rendezvous ranks first for the
+  push's key, by the intakes decoding on each now (`decoding_on`), the arrival shard on a tie. Each shard counts its own
+  in one word on its own cache line per registry slot, written by its shard alone and read relaxed (a statistic); a git
+  push holds a `Decoding` guard from its start (today on its owner). Tests: `vcs_share::place::tests` (19 pushes of one
+  repository over 23 shards: at most two decoding on any shard, against all 19 on the owner today; the count follows its
+  guards; a tie stays). `intake_shard` and `decoding_on` wait for A-722 to call them.
+- **Piece 6's node half, the batch forms (2026-11-20, agreed with w-perf).** `vcs_store::homes::home_many`, `read_many`
+  and `let_go_many`: a request's windows go to their homes in one cross-shard call a home shard a turn, each call
+  working through its items until the home's step quantum is spent (at least one) and answering the rest for the next
+  turn, answers in the request's order, reads checked against their names. Test:
+  `vcs_store::homes::tests::a_batch_of_windows_goes_to_each_home_in_one_call_a_shard` (five batches of 259 windows over
+  four homes: 151 calls in a debug build; every window homed, read back in order, held twice where sent twice, freed).
+  Owed: the region's half once w-fed-faults answers; the owner's rows and reads through them with w-perf's a2 and a3.
+- **Piece 8a, growth refused typed before it passes the snapshot slot (2026-11-20).** `slates_db::replay::Db`: a record's
+  projected snapshot (the last snapshot's exact bytes, every record's since, and its own) is checked against the slot
+  (`segment.geometry().snapshot_bytes`) before it is appended. Past it, the state is snapshotted at once and so measured
+  exactly: a state that fits goes on (a transaction's applied effects carried by that snapshot, as a full log's are),
+  one that cannot is refused `DbError::SnapshotRoom { needed, room }` with nothing applied (a transaction rolled back
+  with it as the cause, AUD-06's rule), counted. A snapshot too large for its slot is refused the same way before the
+  segment is touched. `Db::snapshot_room` reads the room left, for admission. On the wire `DatabaseRefusal::SnapshotRoom`
+  (appended, `wire_order.txt` 12). Tests: `replay::tests::a_record_whose_state_would_pass_the_snapshot_slot_is_refused_typed_and_one_that_fits_never_is`
+  (records three slots long over a state a fifth of the slot: none refused; a slot and a half refused, nothing applied,
+  recovered as before) and `...a_transaction_whose_state_would_pass_the_snapshot_slot_rolls_back_typed`; slates-db
+  `--lib` 176 of 176, `--test model` 26 of 26; slates-ipc `--test wire_order`. Owed: the slot derived at each snapshot
+  and grown by a re-laid segment at a handoff (8b); the snapshot naming sealed index tables by identity (8c, with A-727);
+  the room read by `vcs_share::room` as a second resource.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55244,6 +55272,55 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   the by-use proof on both architectures: with this change `slates-bridge-winfsp --lib` with WinFsp passes whole on
   x86_64 and arm64 (diag-w-bugs-lib-737, 2026-11-20), where every Windows run failed the check before.
 - **Applied in the same change to** GAPS (A-576's entry), `normalized.rs`' module docs, amendments.tsv.
+
+### A-722 part 2 — A row holds nothing known only once its push lands (2026-11-20, w-git for UI goal 93; A-722's design, point 3)
+- **Change.** `slates_git::store::rows`: an object row is its kind, length, position and (a commit's) commit-graph part;
+  the green and version that brought it are no longer in it, so a push can write its rows before it lands. The
+  repository keeps them beside the index as a landing map of position runs (`Repository::bringer_of`), written as a
+  commit lands (each fresh object's first move, consecutive positions of one pair one run) and charged to the store.
+  upload-pack's choice of a kept fragment and the hook view's cover read it there; a position no landing gave answers
+  none, so a reader passes over it.
+- **Tests.** `slates-git` `store::tests::the_landing_map_answers_the_version_that_brought_each_position`; the row and
+  commit-row tests read the landing map.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- store:: upload::
+  receive:: hook_view` 200 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- vcs_store:: git_push::
+  vcs_http::git:: git_hooks::` 91 passed and one hook test past its bound under load (load average 71), passing alone
+  (3 of 3); fmt clean.
+
+### A-664 live whole builds, the push storm — A push landing mid-build moves the build to the newest head at a slice's boundary, never starts it again (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** Part 1 started a green's whole build again from nothing at every push that landed while it ran, so under
+  a steady stream of pushes (the target is tens of thousands concurrent) a busy repository's build never ended.
+- **Change.** A push to a green whose build runs leaves it alone (`paths::advance_after_push`); at the build's next
+  slice the build moves to the green's newest head once (`whole_build::moved`): each path the change index names since
+  its version loses what was put of it and is put again from the head, where git holds a file there, and everything
+  else put stays. Only a change holding a copy (named at its destination alone) starts it again, counted
+  `vcs_store.paths.whole_build.restarted`; a move is counted `...moved`. A commit a submit owed of the version the build
+  began at is not made over the newer map (`make_owed` checks the version) and the push's own move settles it, counted
+  unmade.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::commits::tests::
+  t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build` (a 61-file first push, then fifty pushes each
+  changing `README`, a slice between each two: restarted 0, moved, built once, the last push's tree kept). `cargo test
+  --locked -p slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities::
+  --test-threads=4` 151 of 151; fmt clean.
+- **Owed.** A parked submit's wait bounded by the failover delay (next); a copy in a storm's change still restarts.
+### A-739 — A FUSE mount's end gives back every reference its kernel held (bug, 2026-11-20, w-bugs for goal 87; found by goal-83 B14's test; §4.5 references, §4.6 FUSE, U10)
+
+- **Found by use.** B14's real-mount test (a file kept for a mount that survived a takeover, the mount lazily
+  unmounted with the uncounted handle held, then closed) failed on CI's ubuntu-latest, kernel 7.0: the mount ended
+  (`slates status`: `attachments: 0`, no `takeover_kept`) and `referenced_bytes` stayed 1,048,576. The same steps with
+  no takeover failed the same way (diag-w-bugs-b14-green-2).
+- **Cause.** `Volume::sweep_attachment` gives back an attachment's references, opens and takeover hold; the FUSE path
+  reached it only through `FUSE_DESTROY`, which Linux sends to fuseblk and virtio-fs mounts alone, and the server's
+  `end_attachment` ended only the takeover holder. A lazily unmounted mount's last `RELEASE` and `FORGET`s can be lost
+  with its connection, so whatever its kernel held stayed charged to the volume for good.
+- **Change.** `verbs::end_attachment` sweeps `RefOwner::Attachment(record.id)`: however an attachment ends, its kernel
+  holds nothing of the volume any more. The counter `recovery.takeover_kept_unreleased` counts a refused sweep too.
+- **Tests.** `crates/cli/tests/cli.rs` `a_file_an_ended_mount_held_is_given_back` (no takeover) and
+  `a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends`: red with the old call
+  (diag-w-bugs-a739-red-2), green with the sweep (-green-1), CI ubuntu-latest; the neighbouring takeover and release
+  tests and the server's `--test fuse_mount` (7/7) pass in both. macOS arm64 (Mac Studio): server `--test
+  attachment_term` 4/4, `--test attach_forms` 9/9.
+- **Applied in the same change to** GAPS (U10's "release at a real mount's end" entry), amendments.tsv.
 
 ### A-738 — The FSFS view of a repository, part 1: revision and revision-property files (2026-11-20, w-reaper, UI goal 93; A-645 route A P1; §4.17.4 item 9; A-553, A-730, A-733)
 

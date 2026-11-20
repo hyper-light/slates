@@ -179,7 +179,6 @@ pub(super) struct Cover {
 /// What is left is the rest, held whole.
 pub(super) fn choose(
   repository: &Repository,
-  store: &ContentStore,
   admission: &mut Admission,
   counters: &mut ViewCounters,
 ) -> Result<Cover, ViewRefused> {
@@ -198,7 +197,7 @@ pub(super) fn choose(
   let mut rest = Vec::new();
   let mut from = 0;
   while let Some(position) = uncovered.next_from(from) {
-    if let Some((source, positions)) = bringer(repository, store, position)? {
+    if let Some((source, positions)) = bringer(repository, position)? {
       uncovered = uncovered.difference(&positions);
       admission.charge_items::<Source>(1)?;
       cover.sources.push(source);
@@ -222,23 +221,19 @@ fn bases(repository: &Repository) -> Vec<(u64, Positions)> {
   bases
 }
 
-/// The fragments of the version that brought `position` (its row's green and version), with
+/// The fragments of the version that brought `position` (the repository's landing map's), with
 /// every position they hold, when they are kept and hold it.
 fn bringer(
   repository: &Repository,
-  store: &ContentStore,
   position: u64,
 ) -> Result<Option<(Source, Positions)>, ViewRefused> {
-  let (_, row, _) = repository
-    .stored_at(store, position)
-    .map_err(ViewRefused::Store)?;
-  let Ok(version) = usize::try_from(row.version) else {
+  let Some((green, version)) = repository.bringer_of(position) else {
     return Ok(None);
   };
-  let source = Source::Version {
-    green: row.green,
-    version,
+  let Ok(version) = usize::try_from(version) else {
+    return Ok(None);
   };
+  let source = Source::Version { green, version };
   Ok(
     source
       .positions(repository)
