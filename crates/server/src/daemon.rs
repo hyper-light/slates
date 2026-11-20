@@ -4154,7 +4154,7 @@ fn build_root_group(
 
 /// Where this shard's slice of the anchor's content object starts: its partition's index times the slice's length
 /// ([`DaemonConfig::shard_content_layout`]). The shard's order in the configuration names its partition.
-fn slice_start(config: &DaemonConfig, partition: u16) -> usize {
+pub(crate) fn slice_start(config: &DaemonConfig, partition: u16) -> usize {
   usize::from(partition).saturating_mul(config.shard_content_layout().stride)
 }
 
@@ -4629,6 +4629,7 @@ async fn init_shard(
     peer_recipients: std::collections::BTreeMap::new(),
     content,
     purge_seen_allocations: 0,
+    content_sweep: crate::content_ranges::Sweep::default(),
     burst_seen: None,
     last_burst: 0,
     refill_settled: None,

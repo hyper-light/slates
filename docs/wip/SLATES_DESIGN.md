@@ -1374,6 +1374,14 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > in the same time (BENCHMARKS.md). `slates status --json` prints each shard's `retained_bytes` and `retained_versions`,
 > and the control shard's `mem.large.*` give-back counters.
 
+> **Status (2026-11-20, A-744: the anchor's memory, range by range).** `slates status --json` prints, per shard,
+> `content_ranges`: its slice of the anchor content object (write log, image slots, delta log, DAX range table, chunk
+> arena with its allocated bytes) and its partition's regions of the anchor segment (log ring, snapshot slots), each
+> with its bytes, the bytes in RAM and the bytes written where the OS says (`slates_mem::resident`, the kernel's page
+> table), swept in bounded steps a status request. After a 1,000-revision Subversion import, 584.7 MiB of the anchor's
+> written pages are the owner partition's segment log ring (355.2 MiB) and snapshot slots (225.8 MiB); the content
+> object holds 2.3 MiB (BENCHMARKS.md).
+
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
 **Data model.**
@@ -55673,3 +55681,45 @@ control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, 
   (`WorkOp 10 Copy`); fmt clean.
 - **Owed.** The SDKs' (Python, Node), MCP's and the CLI's surfaces for a copy; Subversion's copy-from rows over it
   (`vcs_store::svn_made`, next).
+
+
+### A-744 — The anchor's memory, range by range: the 581 MiB is the owner partition's durable register, not the content object; and A-742's leftovers (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.14, §4.17.1; A-64, A-420, A-626, A-727, A-742)
+
+Applied in the same change to: `crates/mem` (`resident.rs`, a mapped range's pages in RAM and written, by `mincore`;
+`SparseObject::residency`, `Region::residency`, `residency_of`; `unsafe-budget.toml` +1, named); `crates/anchor`
+(`AnchorSegment::region_residency`); `crates/server` (`content_ranges.rs`, the sweep the status report advances;
+`daemon::slice_start` visible; `repository::svn_commit::land` checkpoints first and appends once,
+`CHAIN_ROOM_CHECKPOINTED`); `crates/db` (`Partition::green_chain_room`); `crates/svn` (`Record::revision_bytes` reserved
+at its exact length); `crates/mcp` (a shard's `content_ranges`); §4.2's status; GAPS; BENCHMARKS.md.
+
+- **The question** (main's ruling): is the 581 MiB of written shared memory after the 1,000-revision import a green's
+  bytes in the content pool, so that A-64 for greens (a green's blocks in the pool) would remove a copy?
+- **The report.** For each shard, every range of its slice of the content object (write log, image slots, delta log,
+  DAX range table, chunk arena with its allocated bytes) and its partition's regions of the anchor segment (log ring,
+  snapshot slots): bytes, bytes in RAM, bytes written where the OS says (macOS's `MINCORE_MODIFIED`; Linux reports
+  residency alone; Windows is owed, a typed refusal). The kernel answers about 3 ns a page (1 GiB in 0.23 ms, 64 GiB in
+  11.9 ms on the Mac Studio), so a slice of tens of GiB of address space is past a turn: each status request advances
+  the shard's sweep for half its live step quantum, and the report is the last completed sweep with the count of sweeps.
+- **Measured** (three runs, identical): the owner shard's segment log ring 355.2 MiB written, its snapshot slots 225.8
+  MiB, 584.7 MiB with the rest of the shards' few pages; the content object's every range together 2.3 MiB; the arena
+  nothing allocated. So the 581 MiB is the durable register: the repository records and chain entries the import logged
+  (each revision's texts and increments) and the partition snapshot holding them again. A green's files are not in the
+  content object at all (A-742's design note: they are only the engine's), so A-64 for greens removes no resident copy
+  here; what it could still give is chain entries and checkpoints that name chunks instead of carrying bytes, which is
+  the same register's growth, and A-727 (w-perf: repository bytes out of the partition snapshot, records naming
+  identities) is aimed at it.
+- **The svn record** reserves its exact length (`revision_len`, `row_len`, `lock_len`, mirroring the encoder), so a
+  revision's record is one allocation, never grown.
+- **The svn commit** knows its chain entry's bound before the append (`entry_bound` of the increment's
+  `encoded_len`, with the copies' fixes' room, A-626), checkpoints the green first where the chains have less room
+  (`Partition::green_chain_room`), and appends once: the parts are moved into the entry, no copy kept for a retry.
+- **The log's decode-after-encode stays.** It is the measure of a record's replay work (A-420): timing the encode in
+  its place had let a record whose decode allocates what its encode copies (a thousand one-byte keys) replay past the
+  recovery budget. Its copy is a large temporary, which A-742's allocator returns to the OS at its free; removing the
+  copy needs a replay measure that does not decode, owed and main's call.
+- **Tests.** macOS arm64, Mac Studio, local: `slates-mem --lib resident` (written pages resident and modified, untouched
+  ones not modified), `large`; `slates-server --lib content_ranges` (a sweep completes within its bound and holds every
+  range to its bytes), `svn_commit` 13 (the chain-room checkpoint's counter moves where the merge budget is small),
+  `vcs_store::svn_import`; `slates-svn --lib commit::record` (every shape reserved at its exact length);
+  `slates-mcp --test mcp` (each shard's content ranges, none past its bytes); `cargo xtask unsafe` ok (slates-mem
+  80 of 80); fmt clean.

@@ -491,6 +491,21 @@ impl SparseObject {
   pub fn is_empty(&self) -> bool {
     self.len == 0
   }
+  /// What of `len` bytes at `offset` is in RAM, and written where the OS says ([`crate::resident::of_range`], A-744):
+  /// the kernel's page table read, no byte of the object touched. Refused `OutOfRange` past the object's end.
+  pub fn residency(
+    &self,
+    offset: usize,
+    len: usize,
+  ) -> Result<crate::resident::Residency, MemError> {
+    if offset.checked_add(len).is_none_or(|end| end > self.len) {
+      return Err(MemError::OutOfRange {
+        offset,
+        len: self.len,
+      });
+    }
+    crate::resident::of_range(self.inner.base().wrapping_add(offset), len, self.page)
+  }
 
   /// Copies the `into.len()` bytes at `offset` out (committed first); refused past the end or touching a
   /// declared word.
