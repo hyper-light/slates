@@ -135,7 +135,8 @@ pub(super) fn remove(store: &mut impl MapWrite, root: u32, name: &str) -> Option
   Some(handle)
 }
 
-/// Every entry of the map of `root` in name order: each child's path number and node-revision.
+/// Every entry of the map of `root` in name order: each child's path number and node-revision (the tests' read).
+#[cfg(test)]
 pub(super) fn entries(store: &impl MapRead, root: u32) -> Option<Vec<(usize, NodeRevisionId)>> {
   let mut out = Vec::new();
   if root == EMPTY {
@@ -156,6 +157,65 @@ pub(super) fn entries(store: &impl MapRead, root: u32) -> Option<Vec<(usize, Nod
     }
   }
   Some(out)
+}
+
+/// Up to `most` entries of the map of `root` in name order, those whose names come after `after` (all, without one),
+/// and whether more follow: a cursor's read, which descends past the subtrees at or before `after` and reads only the
+/// entries it gives, and one more.
+pub(super) fn entries_after(
+  store: &impl MapRead,
+  root: u32,
+  after: Option<&str>,
+  most: usize,
+) -> Option<(Vec<(usize, NodeRevisionId)>, bool)> {
+  let mut out = Vec::new();
+  if root != EMPTY {
+    collect_after(store, root, after, most.saturating_add(1), &mut out)?;
+  }
+  let more = out.len() > most;
+  out.truncate(most);
+  Some((out, more))
+}
+
+/// The entries of the node of `handle` after `after` into `out`, until it holds `most`.
+fn collect_after(
+  store: &impl MapRead,
+  handle: u32,
+  after: Option<&str>,
+  most: usize,
+  out: &mut Vec<(usize, NodeRevisionId)>,
+) -> Option<()> {
+  match store.map_node(handle)? {
+    MapNode::Leaf(entries) => {
+      for &(key, value) in entries {
+        if out.len() >= most {
+          break;
+        }
+        if let Some(after) = after
+          && store.key_name(key)? <= after
+        {
+          continue;
+        }
+        out.push((
+          usize::try_from(key).ok()?,
+          NodeRevisionId(usize::try_from(value).ok()?),
+        ));
+      }
+    }
+    MapNode::Inner(children) => {
+      let start = match after {
+        Some(after) => child_for(store, children, after)?,
+        None => 0,
+      };
+      for &(_, child) in children.get(start..)? {
+        if out.len() >= most {
+          break;
+        }
+        collect_after(store, child, after, most, out)?;
+      }
+    }
+  }
+  Some(())
 }
 
 /// What a removal left of a node.

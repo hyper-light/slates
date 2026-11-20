@@ -12443,8 +12443,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > are charged to the index's room. A/B (`listing_times`, release, M-series Mac, `/trunk/big` with 10,000 names over
 > 1,000 revisions): `Index::children` took 3.84 ms at r1001 (9,001 live) and r500 (4,492 live) alike, and now 0.234
 > and 0.112 ms; the drive's listing went from 5.87 and 4.86 ms to 0.98 and 0.47 ms. The index holds 65,575 entries
-> (1.6 MB) for that history, the maps about 1.2 MB of it. Owed next: the drive reads a very large directory's listing
-> through a cursor, a few entries a step (a 9,001-entry listing is about 1 ms, past the quantum in one step).
+> (1.6 MB) for that history, the maps about 1.2 MB of it. **The cursor BUILT (same day, A-759 part 2).** A 9,001-entry
+> listing was still about 1 ms in one step. `Index::listing_after(path, revision, after, most)` descends the map past
+> the subtrees at or before `after` and reads `most` entries and one more, so it says whether more follow. The update
+> drive's directory step now compares the properties, then lists each side `LIST_STEP` (16) entries a step: the
+> source's first where the working copy holds its entries, then the target's. 16 entries are about 1.7 us at the
+> measured 109 ns an entry; `listing_times` measures one step of 16 at 1.6-1.75 us whether 9,001 or 4,492 live
+> (release, M-series Mac). By test (`a_very_large_directory_is_listed_a_few_entries_a_step`, 1,801 live entries;
+> a checkout and an update from r100): no step lists more than 16, where whole listings listed 1,801 in a step. The
+> checkout adds exactly the live names in order, and the update deletes exactly those gone. The replay drive's
+> `add_subdir` still lists a copied directory whole through `Repository::entries` (now the map walk).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
