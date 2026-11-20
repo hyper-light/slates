@@ -438,6 +438,12 @@ pub struct DaemonConfig {
   /// per copy — "archived volumes compress once") and the live memory-pressure and load signals. Raw-only
   /// when the profile measured no codec.
   pub codec: slates_archive::CodecPolicy,
+  /// Derived: what git's pack encoder's work costs on this machine (main's ruling, 2026-11-20: the zlib level and the
+  /// delta window chosen from the bytes they save and these fixed rates, never a clock's per-object time, so one input
+  /// gives one output): each zlib level's nanoseconds a KiB and a delta search's, measured once a process on the
+  /// machine's clock over a seeded text corpus (`slates_git::store::learn::Rates::measure`), logged with the boot's
+  /// derivations.
+  pub git_rates: slates_git::store::learn::Rates,
   /// Derived: the spans one `Telemetry` reply carries (§4.14; `crate::telemetry::spans_per_reply`): what
   /// one bulk chunk of a client's region holds past the report's fixed part, measured from the wire
   /// encoding at boot.
@@ -974,6 +980,12 @@ impl DaemonConfig {
        [\"reserve_per_shard\", \"content.allocated_bytes\"])",
       reserve.get()
     ));
+    let git_rates = git_rates();
+    derivations.push(format!(
+      "git_rates = deflate ns a KiB by level {:?}, delta search {} ns a KiB: measured once a process over a seeded \
+       text corpus of two deflate windows on the machine's monotonic clock (anchors [\"zlib\", \"deltas\"])",
+      git_rates.deflate_ns_per_kib, git_rates.search_ns_per_kib
+    ));
     let codec = codec_policy(profile);
     derivations.push(format!(
       "codec = lz4 {}, zstd levels {:?}, byte worth {} scaled ns: the profile's measured codec points, a \
@@ -1232,6 +1244,7 @@ impl DaemonConfig {
       memcpy_bytes_per_second: memcpy_bytes_per_second.get(),
       page_fault_ns: page_fault_ns.get(),
       codec,
+      git_rates,
       telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
@@ -1844,6 +1857,24 @@ impl DaemonConfig {
     self.fleet = Some(membership);
     self.with_control_shard_noted()
   }
+}
+
+/// The machine's monotonic clock, for measuring once at boot.
+struct BootClock(std::time::Instant);
+
+impl slates_git::store::learn::Clock for BootClock {
+  fn now_ns(&mut self) -> u64 {
+    u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX)
+  }
+}
+
+/// [`DaemonConfig::git_rates`]: measured on the first derivation of the process and kept, so every configuration the
+/// process derives (a daemon's, a test's) prices the encoder alike.
+fn git_rates() -> slates_git::store::learn::Rates {
+  static RATES: std::sync::OnceLock<slates_git::store::learn::Rates> = std::sync::OnceLock::new();
+  *RATES.get_or_init(|| {
+    slates_git::store::learn::Rates::measure(&mut BootClock(std::time::Instant::now()))
+  })
 }
 
 /// The cost model's policy from the profile's measured codec points (§4.11, D-17): the `lz4` point

@@ -28,7 +28,7 @@
 //! client did not say `ofs-delta`. A version's fragments and a base pack are encoded with it an
 //! object a unit too, under the owner's quantum (`encoding`, A-653 continued (2)).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use flate2::{Compress, Compression, FlushCompress, Status};
 
@@ -36,7 +36,7 @@ use crate::entry::{self, Header, PACK_HEADER_LEN, Representation};
 use crate::object_name::{Kind, ObjectId};
 
 use super::deltas::{Search, SearchStep};
-use super::learn::{Clock, Exchange, LEVELS, Levels, Window};
+use super::learn::{Exchange, LEVELS, Levels, Window};
 
 /// An object to encode: its id, position, type and bytes, and the object its path held in the
 /// previous version, a base a REF delta may name.
@@ -100,14 +100,13 @@ pub enum FragmentRefused {
   Entry(entry::Refusal),
 }
 
-/// The encoder's learned rules, with the owner's clock and exchange.
+/// The encoder's learned rules, with the owner's exchange (its measured rates among it).
 pub(crate) struct Learning<'a> {
   pub(crate) window: &'a mut Window,
   pub(crate) levels: &'a mut Levels,
   /// The deepest chain to make; zero makes no delta.
   pub(crate) depth: u64,
   pub(crate) exchange: Exchange,
-  pub(crate) clock: &'a mut dyn Clock,
 }
 
 /// What an entry's base is.
@@ -162,8 +161,6 @@ pub(crate) struct Putting {
   object: ToEncode,
   /// Where its entry begins in its pack.
   at: u64,
-  /// Whether its kind's levels are sampled on it: the first of its kind this encoder encodes.
-  sample: bool,
   /// Whether an earlier entry is named by its offset back.
   by_offset: bool,
   /// The candidate bases, in the order they are tried.
@@ -239,14 +236,12 @@ struct Recent {
   depth: u64,
 }
 
-/// The incremental encoder (module docs): the earlier entries a delta may name, kept per kind, and
-/// the kinds a level has been sampled on.
+/// The incremental encoder (module docs): the earlier entries a delta may name, kept per kind.
 pub(crate) struct Encoder {
   /// Whether a delta names an earlier entry by its offset back, as `ofs-delta` allows, or by id.
   by_offset: bool,
   /// For each kind, the entries a delta may name, the nearest last.
   recent: BTreeMap<Kind, VecDeque<Recent>>,
-  sampled: BTreeSet<Kind>,
 }
 
 impl Encoder {
@@ -255,7 +250,6 @@ impl Encoder {
     Encoder {
       by_offset,
       recent: BTreeMap::new(),
-      sampled: BTreeSet::new(),
     }
   }
 
@@ -287,7 +281,6 @@ impl Encoder {
   /// tries them, the named base first, then the window's earlier entries of its kind, the nearest
   /// first, whose chains have room.
   pub(crate) fn begin(&mut self, object: ToEncode, at: u64, learning: &Learning<'_>) -> Putting {
-    let sample = self.sampled.insert(object.kind);
     let mut tries = Vec::new();
     if learning.depth > 0 {
       if object.named.is_some() {
@@ -301,7 +294,6 @@ impl Encoder {
     Putting {
       object,
       at,
-      sample,
       by_offset: self.by_offset,
       tries,
       trying: 0,
@@ -329,7 +321,7 @@ impl Encoder {
     let window = window.max(1);
     match putting.stage {
       PutStage::Trials => {
-        self.trial_step(putting, learning, window);
+        self.trial_step(putting, learning, window)?;
         Ok(Put::More(Vec::new()))
       }
       PutStage::Sample { level } => {
@@ -353,20 +345,24 @@ impl Encoder {
   }
 
   /// A step of the trials: a step of the current candidate's search, or, with none left, the level
-  /// chosen (sampled first where the kind was not yet sampled here or no level is learned).
-  fn trial_step(&self, putting: &mut Putting, learning: &mut Learning<'_>, window: usize) {
+  /// chosen: the one its kind's levels learned, or, where none is yet (the first object of its kind
+  /// the repository encodes), sampled first. A kind is sampled once (main's ruling, 2026-11-20: an
+  /// object compressed one way, and one input one output), its samples' times the measured rates.
+  fn trial_step(
+    &self,
+    putting: &mut Putting,
+    learning: &mut Learning<'_>,
+    window: usize,
+  ) -> Result<(), FragmentRefused> {
     let Some(candidate) = putting.tries.get(putting.trying).copied() else {
       let learned = learning
         .levels
         .level(putting.object.kind, learning.exchange);
       putting.stage = match learned {
-        Some(level) if !putting.sample => match putting.deflating(level) {
-          Ok(stage) => stage,
-          Err(_) => PutStage::Sample { level: 0 },
-        },
-        _ => PutStage::Sample { level: 0 },
+        Some(level) => putting.deflating(level)?,
+        None => PutStage::Sample { level: 0 },
       };
-      return;
+      return Ok(());
     };
     let base: &[u8] = match candidate {
       Candidate::Named => putting
@@ -380,14 +376,15 @@ impl Encoder {
         .and_then(|recent| recent.get(index))
         .map_or(&[][..], |recent| &recent.bytes),
     };
-    let start = learning.clock.now_ns();
     let step = putting.search.step(base, &putting.object.bytes, window);
-    putting.trial_ns = putting
-      .trial_ns
-      .saturating_add(learning.clock.now_ns().saturating_sub(start));
     let SearchStep::Done(delta) = step else {
-      return;
+      return Ok(());
     };
+    // The trial's time is the machine's measured rate over the bytes it searched (`Rates`), never the clock's.
+    putting.trial_ns = learning
+      .exchange
+      .rates
+      .search_ns(to_u64(base.len()), to_u64(putting.object.bytes.len()));
     let rank = putting.trying.saturating_add(1);
     let len = delta.as_ref().map_or(usize::MAX, Vec::len);
     let saved = u64::try_from(putting.best.saturating_sub(len)).unwrap_or(u64::MAX);
@@ -434,6 +431,7 @@ impl Encoder {
     putting.trying = putting.trying.saturating_add(1);
     putting.search = Search::new();
     putting.trial_ns = 0;
+    Ok(())
   }
 
   /// A step of the deflate: the entry's header first, then a window of the data; once the last is
@@ -538,9 +536,11 @@ fn sample_level(
   level: u32,
   learning: &mut Learning<'_>,
 ) -> Result<(), FragmentRefused> {
-  let start = learning.clock.now_ns();
   let output = deflate(sample, level)?;
-  let ns = learning.clock.now_ns().saturating_sub(start);
+  let ns = learning
+    .exchange
+    .rates
+    .deflate_ns(level, to_u64(sample.len()));
   learning.levels.record(
     kind,
     level,
@@ -557,9 +557,11 @@ fn sampled(
 ) -> Result<Vec<Vec<u8>>, FragmentRefused> {
   let mut outputs = Vec::new();
   for level in 0..LEVELS {
-    let start = learning.clock.now_ns();
     let output = deflate(data, level)?;
-    let ns = learning.clock.now_ns().saturating_sub(start);
+    let ns = learning
+      .exchange
+      .rates
+      .deflate_ns(level, to_u64(data.len()));
     let sizes = (to_u64(data.len()), to_u64(output.len()), ns);
     learning.levels.record(kind, level, sizes);
     outputs.push(output);

@@ -13898,7 +13898,19 @@ cooperative slices (§4.3).
 > most a window and one row, the daemon living; `vcs_store::git_encode::tests::a718_no_unit_...`, ignored, its pack
 > named by `SLATES_ENCODE_PACK`). Owed: the encoding from the push's own intake (git's pack reuse, w-git's streaming
 > intake), the base pack's rebuild, kept fragments across a recovery, the parts' bytes held between turns charged, a pair
-> of trees read whole and the parts' record made in one unit.
+> of trees read whole and the parts' record made in one unit. **The encoder's bytes one function of its input (same day,
+> w-k90-vendor; main's ruling):** the zlib level and the delta window had been chosen from each level's sample and each
+> trial timed on the shard's clock, so one snapshot's objects deflated to other bytes from run to run and replica to
+> replica (A-745 rule 4's held-answer test found two streams of one generation deflating a tag at two levels), and every
+> fragment sampled every level again. Now the owner measures what the work costs once a process
+> (`slates_git::store::learn::Rates::measure`: each level's nanoseconds a KiB over a seeded text corpus of two deflate
+> windows, and a delta search's; `DaemonConfig::git_rates`, logged with the boot's derivations), carried in the exchange;
+> a level's sample and a trial are charged those rates over their bytes, and a kind's levels are sampled once, on the
+> first object of it a repository encodes. Held: a version's fragments the same bytes under a clock ticking a nanosecond
+> a read and one jumping by large random amounts (`a_versions_fragments_are_the_same_bytes_whatever_the_owners_clock_reads`,
+> red on main: the commit's entry deflated apart); rule 4's held answer now the start generation's byte for byte. Owed:
+> the release A/B on git/git (CPU per encoded MiB and bytes out, per-object timing against the rates; main's run), and
+> one deployment's rates shared by its nodes (each node measures its own today, so two machines may choose apart).
 
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
