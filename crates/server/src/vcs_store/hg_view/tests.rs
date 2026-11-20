@@ -196,3 +196,106 @@ fn a_branch_the_owner_creates_retires_and_binds_is_a_bookmark_by_the_same_name()
     assert_eq!(retired, before);
   });
 }
+
+/// Lands `which` of `made` on repository `id` as a push of its owner lands them.
+fn pushed(
+  state: &mut ShardState,
+  id: RepositoryId,
+  made: &[crate::repository::hg_push::tests::Made],
+  which: &[usize],
+) {
+  use slates_hg::push::{Asks, Taken, Unbundle};
+  let unbundle = Unbundle {
+    parts: vec![Taken {
+      id: 0,
+      mandatory: true,
+      asks: Asks::Changegroup(crate::repository::hg_push::tests::changegroup(made, which)),
+    }],
+  };
+  let mut room = Admission::new(u64::MAX);
+  let terms = (false, [7; 32], u64::MAX);
+  let prepared = crate::repository::hg_push::prepare_served(state, id, &unbundle, terms, &mut room)
+    .expect("the push prepared");
+  let landed = crate::repository::hg_push::land(state, (&owner(), id), prepared);
+  assert!(
+    landed.answer.is_ok() && landed.released.is_ok(),
+    "{landed:?}"
+  );
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rule 4). Do: push three changesets to a Mercurial repository; answer a clone of it
+/// whole; then begin the same clone streamed, holding the generation it began on, and take one turn; land a fourth
+/// changeset and put a rebuild of the store in flight; take the clone's remaining turns over its hold. Expect the
+/// repository's own view not lent while the rebuild is in flight (a turn over it would fail the clone), and the
+/// streamed answer, every turn over the held generation, the whole answer byte for byte.
+#[test]
+fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhile() {
+  use slates_hg::serve::http::{self as hg_http, Begun, Compression, Compressor, Media};
+  struct Plain;
+  impl Compressor for Plain {
+    fn choose(&mut self, _: Media, _: &[slates_hg::compression::Engine], _: u64) -> Compression {
+      Compression {
+        engine: slates_hg::compression::Engine::Uncompressed,
+        level: 0,
+      }
+    }
+  }
+  crate::daemon::audit_on_shard(|state| {
+    let hg = created(state, "hg", VcsTool::Mercurial);
+    let made = crate::repository::hg_push::tests::history_of(&[
+      ("base", "a", b"a\n", None, "default"),
+      ("second", "b", b"b\n", Some(0), "default"),
+      ("third", "c", b"c\n", Some(1), "default"),
+      ("fourth", "d", b"d\n", Some(2), "default"),
+    ]);
+    pushed(state, hg, &made, &[0, 1, 2]);
+    let heads = crate::verbs::hex_of(&made[2].node);
+    let arguments = format!(
+      "bundlecaps=HG20%2Cbundle2%3DHG20%250Achangegroup%253D02%252C03&cg=1&common={}&heads={heads}",
+      "0".repeat(40)
+    );
+    let headers: [(&[u8], &[u8]); 2] = [
+      (b"X-HgArg-1", arguments.as_bytes()),
+      (b"X-HgProto-1", b"0.1 0.2 comp=none"),
+    ];
+    let request = slates_hg::http::Request {
+      query: b"cmd=getbundle",
+      headers: &headers,
+      body: &[],
+    };
+    let room = || Admission::new(ROOM);
+    let whole = lend_in(state, hg, &mut room(), |view, left| {
+      hg_http::answer(view, &request, 0, &mut Plain, left)
+    })
+    .expect("the whole answer");
+    assert_eq!(whole.refused, None);
+    let begun = lend_in(state, hg, &mut room(), |view, left| {
+      hg_http::begin(view, &request, 0, &mut Plain, left)
+    })
+    .expect("the answer begun");
+    let Begun::Streamed(mut streamed) = begun else {
+      panic!("a clone's answer is streamed");
+    };
+    let generation = super::hold_in(state, hg, &mut room()).expect("the generation held");
+    let mut body = Vec::new();
+    let mut turn = |state: &mut ShardState, body: &mut Vec<u8>| {
+      super::lend_held_in(state, &generation, &mut room(), |view, left| {
+        streamed.step(view, left, body)
+      })
+      .expect("a turn over the held generation")
+      .expect("a slice")
+    };
+    assert!(turn(state, &mut body));
+    pushed(state, hg, &made, &[3]);
+    state.vcs_stores.rebuilding.insert(hg);
+    let rebuilding = lend_in(state, hg, &mut room(), |_, _| ());
+    while turn(state, &mut body) {}
+    state.vcs_stores.rebuilding.remove(&hg);
+    generation.give_back(state);
+    assert_eq!(
+      rebuilding, None,
+      "the repository's view was lent mid-rebuild"
+    );
+    assert_eq!(body, whole.body);
+  });
+}
