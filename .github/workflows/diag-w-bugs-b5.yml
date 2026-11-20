@@ -1,0 +1,146 @@
+name: DIAG w-bugs -- B5, a written file's open and close on NTFS, WinFsp's memfs and slates' drive (not for main)
+
+# Goal 87 (every open slates bug): does fsx seed 1 still wedge over the WinFsp drive (B3, A-209)?
+# The job's logs need admin rights to read, so every output is published to a results branch.
+
+on:
+  push:
+    branches: ['diag-w-bugs-b5-*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
+    name: probe on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      RESULTS_BRANCH: ${{ github.ref_name }}-results-${{ github.run_id }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Publisher
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          # One commit per call on the results branch holding every file in $RUNNER_TEMP/out; never fails the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in "$RUNNER_TEMP"/out/*; do
+            [ -f "$f" ] || continue
+            b=$(tail -c 3000000 "$f" | git hash-object -w --stdin) || continue
+            entries="$entries$(printf '100644 blob %s\t%s' "$b" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push -q origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD)" > "$RUNNER_TEMP/out/status.txt"
+          "$RUNNER_TEMP/publish.sh"
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount 20 -RetryIntervalSec 60 -TimeoutSec 120
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart', 'ADDLOCAL=ALL' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build slates (release)
+        shell: bash
+        run: cargo build --release --locked -p slates-cli --bin slates > "$RUNNER_TEMP/out/build.txt" 2>&1; echo "build exit $?" >> "$RUNNER_TEMP/out/status.txt"
+      - name: Time a written file's open and close on NTFS, memfs and slates
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $out = "$env:RUNNER_TEMP\out"
+          $timing = @'
+          param([string]$Dir, [string]$Label, [string]$Out)
+          $f = Join-Path $Dir "written.bin"
+          [IO.File]::WriteAllBytes($f, (New-Object byte[] 65536))
+          $g = Join-Path $Dir "never-written.bin"
+          if (-not (Test-Path $g)) { [IO.File]::WriteAllBytes($g, (New-Object byte[] 0)) }
+          foreach ($pair in @(@("written", $f), @("empty", $g))) {
+            $times = New-Object System.Collections.Generic.List[double]
+            for ($i = 0; $i -lt 200; $i++) {
+              $sw = [Diagnostics.Stopwatch]::StartNew()
+              $h = [IO.File]::Open($pair[1], 'Open', 'Read', 'ReadWrite')
+              $h.Close()
+              $sw.Stop(); $times.Add($sw.Elapsed.TotalMilliseconds * 1000)
+            }
+            $s = $times | Sort-Object
+            "{0} {1}: open+close p50 {2:N1} us p90 {3:N1} us max {4:N1} us" -f $Label, $pair[0], $s[100], $s[180], $s[199] | Add-Content $Out
+          }
+          '@
+          Set-Content "$env:RUNNER_TEMP\timing.ps1" $timing
+          $res = "$out\timings.txt"
+          "$env:RUNNER_OS $env:PROCESSOR_ARCHITECTURE; $((cmd /c ver | Out-String).Trim())" | Add-Content $res
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\ntfs" | Out-Null
+          & "$env:RUNNER_TEMP\timing.ps1" "$env:RUNNER_TEMP\ntfs" "ntfs" $res
+          $memfs = Get-ChildItem "C:\Program Files (x86)\WinFsp\bin" -Filter "memfs-*.exe" | Where-Object { $_.Name -match ($(if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'a64' } else { 'x64' })) } | Select-Object -First 1
+          "memfs: $($memfs.FullName)" | Add-Content $res
+          if ($memfs) {
+            $p = Start-Process $memfs.FullName -ArgumentList '-i','-F','NTFS','-t','-1','-m','M:' -PassThru
+            Start-Sleep 5
+            & "$env:RUNNER_TEMP\timing.ps1" "M:\" "memfs" $res
+            Stop-Process $p -Force
+          }
+          $bin = "$env:GITHUB_WORKSPACE\target\release\slates.exe"
+          $anchor = Start-Process $bin -ArgumentList '--instance','b5','anchor','--quick','--shards','2' -PassThru -RedirectStandardError "$out\anchor.txt"
+          Start-Sleep 10
+          $vol = (& $bin --instance b5 volume create b5 --bounded 256MiB | Select-String 'id:').ToString().Split()[-1]
+          & $bin --instance b5 mount $vol S: | Out-Null
+          Start-Sleep 3
+          & "$env:RUNNER_TEMP\timing.ps1" "S:\" "slates" $res
+          & $bin --instance b5 status | Add-Content "$out\status-slates.txt"
+          & $bin --instance b5 unmount S: | Out-Null
+          Stop-Process $anchor -Force
+          "ended $((Get-Date).ToUniversalTime().ToString('o'))" | Add-Content "$out\status.txt"
+      - name: Publish
+        if: always()
+        shell: bash
+        run: bash "$RUNNER_TEMP/publish.sh"
