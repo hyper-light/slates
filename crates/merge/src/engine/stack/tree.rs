@@ -100,7 +100,7 @@ impl Green {
       let path = names.path(op.path).unwrap_or_default();
       !(is_content(op.kind) && identical.contains(path))
     });
-    Restated::Over(restated)
+    Restated::Over(Box::new(restated))
   }
 
   /// The head's node at `path`, in a tree's terms: the root always a directory, as the green holds it (A-618).

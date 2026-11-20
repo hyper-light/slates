@@ -80,7 +80,9 @@ fn named_create(path: &str, object: Identity) -> Increment {
 fn a_named_text_is_read_a_slice_a_step_then_lands_whole() {
   const TEXT: usize = 4 << 20;
   const SLICE: u64 = 64 << 10;
-  let bytes: Vec<u8> = (0..TEXT).map(|at| (at % 251) as u8).collect();
+  let bytes: Vec<u8> = (0..TEXT)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
   let mut plane = Plane::default();
   let object = plane.put(bytes.clone());
   let mut work = named_create("big", object);
@@ -89,14 +91,10 @@ fn a_named_text_is_read_a_slice_a_step_then_lands_whole() {
     green.submit(&work),
     Outcome::ContentUnread { identity: object }
   );
-  let mut steps = 0u64;
-  while !work.read_step(&plane, SLICE).unwrap() {
-    steps += 1;
-  }
-  steps += 1;
+  let steps = read_in_steps(&mut work, &plane, SLICE);
   assert_eq!(steps, (TEXT as u64).div_ceil(SLICE));
   assert!(
-    plane.largest.get() <= SLICE as usize,
+    plane.largest.get() <= usize::try_from(SLICE).unwrap(),
     "{}",
     plane.largest.get()
   );
@@ -105,10 +103,24 @@ fn a_named_text_is_read_a_slice_a_step_then_lands_whole() {
   assert!(encoded.len() < 4096, "{} bytes encoded", encoded.len());
   assert_eq!(green.submit(&work), Outcome::Accepted { version: 1 });
   assert_eq!(green.content("big"), Some(bytes.as_slice()));
-  let decoded = Increment::decode(&encoded).unwrap();
+  round_trips_by_name(&work, &encoded, object);
+}
+
+/// `encoded`, `work`'s encoding, decodes to its names alone: no post-state, the run of `object` unread again.
+fn round_trips_by_name(work: &Increment, encoded: &[u8], object: Identity) {
+  let decoded = Increment::decode(encoded).unwrap();
   assert_eq!(decoded.named, work.named);
   assert!(decoded.post_state.is_empty());
   assert_eq!(decoded.unread().map(|run| run.identity), Some(object));
+}
+
+/// Reads `work`'s unread run from `plane` `slice` bytes a step until it is read whole: the steps taken.
+fn read_in_steps(work: &mut Increment, plane: &Plane, slice: u64) -> u64 {
+  let mut steps = 1u64;
+  while !work.read_step(plane, slice).unwrap() {
+    steps += 1;
+  }
+  steps
 }
 
 /// A-760's hostile input. Do: decode a named work's encoding with its run count raised past the bytes left, and with a
