@@ -234,7 +234,8 @@
 > (the 3,000-commit clone by use over HTTP and SSH); rule 4: a fetch holds the generation it began on (a shared fork at
 > the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects);
 > `begin`'s walks in turns (`ready`'s search, the cut, `include-tag`'s scan: `begin` reads what the request names, each
-> step a unit). Owed: protocol v0 in turns, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> step a unit); protocol v0's fetch in turns (its acknowledgments, each `ready`, the cut and the choice the answer's
+> steps). Owed: scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is

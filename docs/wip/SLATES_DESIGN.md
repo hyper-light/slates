@@ -12394,7 +12394,14 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > writes nothing until they are decided (`upload::fetch::Before`), the acknowledgments alone when not ready, a refusal
 > before them answered as one refused whole. By test: over 2,000 commits and 500 tags, `begin` read 3,499 parents of
 > the graph on main (the whole search and cut), at most 4 now, and each step at most 2, the answer the one made whole.
-> Owed for git: protocol v0's fetch in turns, a plan of scattered positions (16 bytes a run); the live `git clone` rows
+> **Protocol v0's fetch in turns BUILT (same day):** a v0 or v1 request is read and checked when its answer is made,
+> then the answer's steps make it (`upload::v0::answer_in_turns`, `Opening`): its acknowledgments a have a unit, each
+> `ready` the server asks a parent a unit (`negotiation::Ready`, the stepped form of `negotiation::ready`), and its
+> negotiation (`done` taken, as a stateless v0 request's is) its cut and its choice; the head (the shallow-update, then
+> the acknowledgments) written once both are known, the pack begun from the choice. Every v0 test's exchange is answered
+> both ways and held to the same bytes, refusal and counters (git's stateless exchanges, the cut-and-flip property);
+> made, a v0 answer has decided nothing, and a pack's takes more than one step. Before it, `serve_in_turns` answered v0
+> whole as the answer was made. Owed for git: a plan of scattered positions (16 bytes a run); the live `git clone` rows
 > of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
@@ -55786,6 +55793,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed (part 4).** The seal's staging pass and the moves' admission sliced; the landing's remaining whole passes
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
+
+### A-722's keepalive while the pack is read (2026-11-20, w-git for UI goal 93; main's ruling)
+- **Found** (w-k90-vendor; reproduced on adas-mac-studio.local-2, debug, load 51 to 63, 7 of 9 failed): with the head
+  written at once the status line came in 24 ms, but a debug daemon read and decoded the long-history tests' 820 KB
+  pack for over the client's 10 s read window after the client's last byte, writing nothing.
+- **Change.** `Connection::interim`: on an AtHead route whose head is out, a run the service gives while the request's
+  body is still being read is written at once, chunked. The driver asks the exchange after each body run
+  (`Exchange::interim`, nothing by default), and receive-pack gives git's `0005\1` once the client's commands show
+  side-band-64k and the keepalive interval has passed since it last wrote (`git_keepalive_ns`, git's
+  `receive.keepAlive`).
+- **Tests.** `slates-http-edge` `connection::tests::an_at_head_route_writes_an_interim_run_while_its_body_is_read`
+  (red with the interim run dropped); `slates-http-edge --lib` 36 passed; `slates-server --lib -- vcs_http:: git_push::
+  vcs_ssh::` 162 passed; fmt clean (kiln, adas-mac-studio.local-2). The debug-load rerun is in run-requests.md. Owed:
+  the read itself measured per byte and per object (main's push-back: 820 KB should be milliseconds).
 
 ### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
 - **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
