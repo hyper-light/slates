@@ -456,6 +456,7 @@ impl<P> ReceivePack<P> {
         quarantined: intake::Quarantined {
           push: quarantine.as_ref().map(GitPush::quarantine),
           store: content,
+          repository: &git.repository,
         },
         queue: BTreeMap::new(),
       };
@@ -517,6 +518,7 @@ impl<P> ReceivePack<P> {
       let quarantined = intake::Quarantined {
         push: quarantine.as_ref().map(GitPush::quarantine),
         store: content,
+        repository: &git.repository,
       };
       let mut clock = ShardClock;
       let quantum = Quantum {
@@ -1757,6 +1759,15 @@ impl works::Greens for ShardGreens<'_, '_> {
     let (green, version) = parent
       .and_then(|parent| self.holding(parent))
       .or_else(|| self.default_head())?;
+    self.lent(green, |read| with(read, version))
+  }
+
+  fn holding_head<T>(
+    &self,
+    head: &ObjectId,
+    with: impl FnOnce(GreenRead<'_>, Version) -> T,
+  ) -> Option<T> {
+    let (green, version) = self.holding(head)?;
     self.lent(green, |read| with(read, version))
   }
 }

@@ -55662,6 +55662,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-753 — A branch created at a commit another branch holds is made from it, and a resent object is read from the index (bug, 2026-11-20, w-git for UI goal 93; found by use in A-722's proof)
+- **Found by use.** A-722's proof on the 32-core Studio (release, git/git): 100 concurrent v1.5.0 pushes to one
+  repository, each creating its own branch, answered 80 `ok` and 20 `ng refs/heads/pN failed to update ref`, twice; a
+  diagnostic build (branch agents/w-git-diag, never main) logged each as the append refused
+  `TableAtCapacity { table: "green_chains" }`.
+- **Causes.** (1) A create was made at the green its new value's first parent heads, else the default branch's head:
+  with neither, each branch made the whole tree again as its own work, and a hundred branches at one commit held it a
+  hundred times in the partition's chains (a checkpoint costs the chains what its increments did, so folding frees
+  nothing). (2) Found by the test: a push resending objects the repository indexes was refused `missing necessary
+  objects`, since the connectivity check read each pack object from the quarantine, which passes over what the index
+  holds. (3) At the chains' cap a push checkpointed only the greens it updated, so an entry of creates alone could free
+  nothing.
+- **Change.** `receive::works::Greens::holding_head`: a create is made first at the green whose head is its new value,
+  its work empty (`ShardGreens::holding`); `git_push::intake::Quarantined` reads an object the quarantine passed over
+  from the index (`Repository::stored`); `repository::push::admit` at the cap checkpoints the repository's other members
+  too.
+- **Tests.** `slates-server` `git_push::tests::t_a753_a_repository_takes_branch_creates_past_its_chain_budget` (24
+  creates under a 64 KiB chain budget, each resending its pack; red on main: every create after the first refused).
+  `slates-server --lib -- vcs_store:: git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks::
+  git_protect` 199 passed; `slates-git --lib -- receive::` 46 passed; fmt clean (macOS arm64, this Mac, local).
+
 ### A-722 part 4b's race — A staging a landing overtakes is staged again, whatever step it was in (bug, 2026-11-20, w-git; found by reading after the 100-push run)
 - **Cause.** Part 4b made the stage's fork at its rows' step and read the next position at its positions' step, so a
   push that landed during the staging's earlier turns could leave a stage that looked current (its fork made after
