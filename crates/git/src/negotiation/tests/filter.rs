@@ -79,16 +79,32 @@ fn a_spec_out_of_its_grammar_is_refused_by_kind() {
 /// blobs less deep than its depth; a combination what all send; and only the filters with no depth deciding by row.
 #[test]
 fn each_filter_admits_as_git_filters() {
+  blob_filters_admit_by_size();
+  tree_depth_admits_by_depth();
+  object_type_and_combinations_admit_as_git_does();
+  only_the_filters_with_no_depth_decide_by_row();
+}
+
+/// `blob:limit` sends blobs smaller than its limit and every other object; `blob:none` no blob.
+fn blob_filters_admit_by_size() {
   let limit = Filter::BlobLimit(10);
   assert!(limit.admits(Kind::Blob, 9, 7) && !limit.admits(Kind::Blob, 10, 0));
   assert!(limit.admits(Kind::Tree, 1000, 0) && limit.admits(Kind::Commit, 0, 0));
   let none = Filter::BlobNone;
   assert!(!none.admits(Kind::Blob, 0, 0) && none.admits(Kind::Tree, 0, 9));
+}
+
+/// `tree:` sends trees and blobs less deep than its depth, and commits and tags always.
+fn tree_depth_admits_by_depth() {
   let depth = Filter::TreeDepth(2);
   assert!(depth.admits(Kind::Tree, 0, 1) && !depth.admits(Kind::Tree, 0, 2));
   assert!(depth.admits(Kind::Blob, 0, 1) && !depth.admits(Kind::Blob, 0, 2));
   assert!(depth.admits(Kind::Commit, 0, 99) && depth.admits(Kind::Tag, 0, 99));
   assert!(!Filter::TreeDepth(0).admits(Kind::Tree, 0, 0));
+}
+
+/// `object:type` sends its type alone; a combination what all its filters send.
+fn object_type_and_combinations_admit_as_git_does() {
   let trees = Filter::ObjectType(Kind::Tree);
   assert!(
     trees.admits(Kind::Tree, 0, 5)
@@ -101,6 +117,15 @@ fn each_filter_admits_as_git_filters() {
       && !both.admits(Kind::Blob, 4, 2)
       && !both.admits(Kind::Blob, 5, 1)
   );
+}
+
+/// Only the filters with no depth decide by row; a depth filter reaches only less deep than its depth.
+fn only_the_filters_with_no_depth_decide_by_row() {
+  let limit = Filter::BlobLimit(10);
+  let none = Filter::BlobNone;
+  let depth = Filter::TreeDepth(2);
+  let trees = Filter::ObjectType(Kind::Tree);
+  let both = Filter::Combine(vec![Filter::BlobLimit(5), Filter::TreeDepth(2)]);
   assert!(none.is_per_object() && limit.is_per_object() && trees.is_per_object());
   assert!(!depth.is_per_object() && !both.is_per_object());
   assert!(depth.reaches(1) && !depth.reaches(2));

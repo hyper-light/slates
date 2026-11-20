@@ -10,7 +10,7 @@ use super::{Intake, Intaken, Refused, Stepped};
 use crate::bundle2::Bundle2;
 use crate::fixtures::CG03;
 use crate::index::{HgIndex, Log};
-use crate::push::commit::fork_with;
+use crate::push::commit::{Unindexed, fork_with};
 use crate::push::verify::{Held, Unverified, Verified, verify};
 use crate::push::{ChangegroupPart, read};
 use crate::{Admission, Node};
@@ -67,7 +67,7 @@ fn intake(
       Ok(Stepped::More) => {}
       Ok(Stepped::Done) => break,
       Err(refused) => {
-        intake.abandon(store).unwrap();
+        intake.abandon(store).map_err(Unindexed::Fork)?;
         return Err(refused);
       }
     }

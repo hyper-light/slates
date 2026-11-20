@@ -70,7 +70,7 @@ impl PackSource for Counting {
     room: usize,
   ) -> Result<bool, PackRefused> {
     let take = room.min(self.len - *at);
-    out.extend((*at..*at + take).map(|byte| byte as u8));
+    out.extend((*at..*at + take).map(|byte| byte.to_le_bytes()[0]));
     *at += take;
     Ok(*at < self.len)
   }
@@ -228,7 +228,9 @@ fn a_pack_longer_than_a_packet_goes_out_in_full_packets() {
     .collect();
   assert_eq!(
     packets.concat(),
-    (0..len).map(|byte| byte as u8).collect::<Vec<u8>>()
+    (0..len)
+      .map(|byte| byte.to_le_bytes()[0])
+      .collect::<Vec<u8>>()
   );
   let (last, full) = packets.split_last().unwrap();
   assert!(

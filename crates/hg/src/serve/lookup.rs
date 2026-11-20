@@ -147,14 +147,17 @@ fn branch_tip(
   Ok(open.or(heads.last()).copied())
 }
 
+/// Format: a node's length in hexadecimal digits, two to a byte.
+const NODE_HEX_LEN: usize = NULL_NODE.len() * 2;
+
 /// The node `prefix` (hexadecimal digits, in either case) begins, among the view's nodes and the null node.
 fn prefixed(repo: &impl Repository, prefix: &[u8]) -> Result<Resolved, Refusal> {
-  if prefix.len() > NULL_NODE.len() * 2 || !prefix.iter().all(u8::is_ascii_hexdigit) {
+  if prefix.len() > NODE_HEX_LEN || !prefix.iter().all(u8::is_ascii_hexdigit) {
     return Ok(Resolved::Unknown);
   }
   let lowered = prefix.to_ascii_lowercase();
   let mut found = None;
-  let mut hex = Vec::with_capacity(NULL_NODE.len() * 2);
+  let mut hex = Vec::with_capacity(NODE_HEX_LEN);
   let candidates =
     core::iter::once(Ok(NULL_NODE)).chain((0..repo.count()).map(|rev| node_of(repo, rev)));
   for node in candidates {

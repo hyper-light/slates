@@ -115,6 +115,12 @@
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
 >
+> **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
+> name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
+> entry's bound in bounded parts across entries (git/git's 607 MiB pack vs a 747 MB segment region); objects already
+> held left out of the pack; S2 (history's latest value = the file's block), S3 (w-git, A-722), S4 (svn texts by identity),
+> S5 (w-hg); the push bound (a streamed window per connection, admission refusal before the body); push_load re-run.
+>
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
 > room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the
@@ -1909,6 +1915,11 @@
 > answered as `svnserve` answers them: stock `svn`'s recorded `lock-bob` and `lock-a` sessions byte for byte. macOS
 > arm64, this Mac, local: slates-svn 239 of 239, server `vcs_svn::` `vcs_ssh::svn::` `repository::svn_commit::`.
 > Owed: the pre-lock and post-lock hooks; a lock's expiry set by a client (ra_svn names none).
+> A-702 part 1, 2026-11-19 (w-svn): `change-rev-prop` and `change-rev-prop2` answered as `svnserve` answers a
+> repository with no pre-revprop-change hook (165006), after its checks in its order (the previous-value refusal,
+> write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
+> revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
+> its `Record::RevisionProperties` through the owner's step, post-revprop-change.
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:

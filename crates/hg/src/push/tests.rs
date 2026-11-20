@@ -206,8 +206,12 @@ impl Repository for View {
 
 /// A fixture's request, read.
 fn read_push(push: &Push) -> Result<Unbundle, Refusal> {
-  let bundle = Bundle2::decode(push.request, &mut room()).unwrap();
-  read(&bundle, &mut room())
+  read(&decoded(push.request), &mut room())
+}
+
+/// A stream these tests made or a fixture holds, decoded: each decodes.
+fn decoded(stream: &[u8]) -> Bundle2<'_> {
+  Bundle2::decode(stream, &mut room()).unwrap()
 }
 
 /// What each part a reply stream holds means: its type as sent, its parameters as sent (the mandatory first) with how
@@ -550,7 +554,7 @@ fn stream(specs: &[Spec]) -> Vec<u8> {
 /// `specs`' stream, read.
 fn read_specs(specs: &[Spec]) -> Result<Unbundle, Refusal> {
   let bytes = stream(specs);
-  read(&Bundle2::decode(&bytes, &mut room()).unwrap(), &mut room())
+  read(&decoded(&bytes), &mut room())
 }
 
 /// A-641, AC-HG.9 (`bundle2._gethandler`). Do: send parts no push handler takes and parameters a handler does not name,
@@ -656,6 +660,18 @@ fn changegroup(mandatory: Vec<(&'static [u8], &'static [u8])>) -> Spec {
 /// target phase of public or draft taken and secret, archived or internal refused.
 #[test]
 fn a_changegroup_is_taken_once_in_versions_01_to_03_and_never_secret() {
+  changegroup_versions_01_to_03_are_taken();
+  other_changegroup_versions_are_refused();
+  assert_eq!(
+    read_specs(&[changegroup(Vec::new()), changegroup(Vec::new())]),
+    Err(Refusal::SecondChangegroup { id: 1 })
+  );
+  changegroup_numbers_are_read();
+  secret_target_phases_are_refused();
+}
+
+/// Versions 01 to 03 taken, 01 when none is named.
+fn changegroup_versions_01_to_03_are_taken() {
   let named: [(Option<&'static [u8]>, Version); 3] = [
     (None, Version::V01),
     (Some(b"02"), Version::V02),
@@ -669,6 +685,10 @@ fn a_changegroup_is_taken_once_in_versions_01_to_03_and_never_secret() {
     let taken = read_specs(&[changegroup(params)]).unwrap();
     assert_eq!(taken.changegroup().unwrap().1.version, version);
   }
+}
+
+/// 04, 05 and a version 7.2 lacks refused.
+fn other_changegroup_versions_are_refused() {
   let refused: [&'static [u8]; 4] = [b"04", b"05", b"06", b""];
   for named in refused {
     assert!(matches!(
@@ -676,10 +696,10 @@ fn a_changegroup_is_taken_once_in_versions_01_to_03_and_never_secret() {
       Err(Refusal::ChangegroupVersion { id: 0, .. })
     ));
   }
-  assert_eq!(
-    read_specs(&[changegroup(Vec::new()), changegroup(Vec::new())]),
-    Err(Refusal::SecondChangegroup { id: 1 })
-  );
+}
+
+/// A `nbchanges` or `targetphase` that is no number refused; numbers that are taken.
+fn changegroup_numbers_are_read() {
   let keys: [&'static [u8]; 2] = [b"nbchanges", b"targetphase"];
   for key in keys {
     assert!(matches!(
@@ -697,6 +717,10 @@ fn a_changegroup_is_taken_once_in_versions_01_to_03_and_never_secret() {
     (part.target_phase, part.changesets),
     (Some(Phase::Draft), Some(12))
   );
+}
+
+/// A target phase of secret, archived or internal refused.
+fn secret_target_phases_are_refused() {
   let secret: [&'static [u8]; 3] = [b"2", b"32", b"96"];
   for number in secret {
     assert!(matches!(
@@ -795,7 +819,7 @@ fn the_heads_argument_holds_as_check_heads_judges_it() {
   ];
   let view = generated(&shapes, &[]);
   let hex = |nodes: &[Node]| {
-    let items: Vec<String> = nodes.iter().map(|node| hexed(node)).collect();
+    let items: Vec<String> = nodes.iter().map(hexed).collect();
     items.join(" ")
   };
   let judge = |value: &str, view: &View, moment| {
@@ -955,7 +979,7 @@ fn oracle_bookmarks(view: &View, claimed: &[BookmarkAt]) -> Result<(), Vec<u8>> 
       .rev()
       .find(|(name, _)| *name == mark.name)
       .map(|(_, node)| *node);
-    let book = String::from_utf8(mark.name.clone()).unwrap();
+    let book = String::from_utf8_lossy(&mark.name);
     let raced = RACE_WORDS;
     let words = match (mark.node, now) {
       (saw, now) if saw == now => continue,
@@ -1033,7 +1057,8 @@ fn generated(shapes: &[Shape], marks: &[(u8, u8)]) -> View {
   let mut view = View::default();
   for (rev, (first, second, branch, closes, draft)) in shapes.iter().enumerate() {
     let pick = |choice: u8| {
-      (rev > 0 && choice % 4 != 0).then(|| Rev::try_from(usize::from(choice) % rev).unwrap())
+      (rev > 0 && !choice.is_multiple_of(4))
+        .then(|| Rev::try_from(usize::from(choice) % rev).unwrap())
     };
     let p1 = pick(*first);
     let p2 = pick(*second).filter(|p2| p1.is_some() && Some(*p2) != p1);

@@ -1,27 +1,41 @@
 //! A git push's record as its entry holds it (A-662; §4.17.1 "Durability and residency"): what a recovery replays
 //! through the repository's store to make it again, and nothing derived.
 //!
-//! **What it holds.** The deepest delta chain the push's pack carried, which the store's learned depth reads (A-614 part
-//! 2); each ref's move, in the order the store committed them, by the green's key in the store, the green's version
-//! once the entry moved it (what a later push's old value is read back to, `super::GitStore::version_of`) and the commit
-//! its new head names, or none for a delete; then every object of the push that the repository lacks when the record is
-//! written (`super::record_of`: the predicate the store's commit gives positions by), in the order they were admitted,
-//! each by its type, its content identity (`slates_vcs::ContentStore::object_id`: the BLAKE3 the content plane holds it
-//! under, over its windows when it is longer than one) and its bytes. Positions, rows, D(k), reached sets, derived
-//! values and pack fragments are computed from these again, and never recorded.
+//! **What it holds** (version 2, A-723). The deepest delta chain the push's pack carried, which the store's learned depth
+//! reads (A-614 part 2); each ref's move, in the order the store committed them, by the green's key in the store, the
+//! green's version once the entry moved it (what a later push's old value is read back to, `super::GitStore::version_of`)
+//! and the commit its new head names, or none for a delete; then every object of the push that the repository lacks when
+//! the record is written (`super::record_of`: the predicate the store's commit gives positions by), in the order they
+//! were admitted, each NAMED by its type, its content identity (`slates_vcs::ContentStore::object_id`) and its length;
+//! then the push's pack as the client sent it, compressed and with its deltas, from which a replay reads the objects
+//! again (`super::replay_git`). Positions, rows, D(k), reached sets, derived values and pack fragments are computed from
+//! these again, and never recorded.
+//!
+//! **Why the pack, not the objects.** Version 1 held each object's bytes inflated: on the Mac Studio a 3.43 MB push of
+//! git/git cut at v1.0.0 (12,232 objects) made a 63.5 MiB entry, 18 times its pack, beside the store's own inflated copy
+//! (BENCHMARKS.md, "Concurrent large pushes"). The pack is git's own durable form of the same objects, so the entry now
+//! costs the pack and 41 bytes a name (A-723: content once; a register entry names content by identity). Version 1
+//! records are still read, since a segment holds entries written by them.
 //!
 //! **Written when an append commits.** The writer notes each object as the push admits it: its type, id, identity and
-//! length, never its bytes, which the push's quarantine holds and the shard's budget is charged for once. The record is
-//! written whole when an append commits ([`RecordWriter::finish`]), each object's bytes read back from the content store
-//! then, so the push's bytes are held twice only in the record its entry takes.
+//! length; and it is handed the pack the receive session kept as it arrived (`slates_git::receive::Session::take_pack`).
+//! The record is written whole when an append commits ([`RecordWriter::finish`]); only the first append of a push that
+//! brings objects carries the pack, and an append that brings none carries no pack. Objects no client sent as a pack (the
+//! server's own commits, A-664 part 3) are written as a pack of whole objects, deflated (`slates_git::pack::of_whole`),
+//! their bytes read back from the content store, so every record is a pack and a replay reads it one way.
 //!
 //! **The encoding**, little-endian as a green's chain entry is (`slates_merge::chain_entry`): the magic and the version;
 //! the deepest chain; the moves' count, then each move's green key, the green's version, a byte that marks a head
 //! present or absent, and the head's raw id in the repository's format when present; the objects' count, then each
-//! object's type number as a pack names it, its content identity, its length and its bytes. Every count is checked
-//! against the bytes that remain before anything is allocated, an id of another length or a type git does not name is
-//! refused, and so are bytes after the last object, each typed ([`RecordRefused`]), never a panic. The identity is
-//! checked against the bytes by the replay, before it admits them (`super::replay_git`).
+//! object's type number as a pack names it, its content identity and its length; then the pack's length and its bytes
+//! (version 1: each object's type, identity, length and bytes, and no pack). Every count is checked against the bytes
+//! that remain before anything is allocated, an id of another length or a type git does not name is refused, and so are
+//! bytes after the pack, each typed ([`RecordRefused`]), never a panic. A replay checks the objects it reads from the
+//! pack against the names, in order, before the store keeps them (`super::recorded_alike`).
+//!
+//! **Owed** (GAPS' §4.17 entry). A pack past an entry's bound recorded in bounded parts across entries (git/git's whole
+//! pack is 607 MiB against a 746,962,928-byte segment region on the Studio); the objects the repository already holds
+//! left out of the recorded pack; S3's index reading the kept pack in place (w-git's A-722).
 
 use slates_git::object_name::{Kind, ObjectFormat, ObjectId};
 use slates_git::store::kind_of;
@@ -32,8 +46,11 @@ use slates_vcs::{ContentId, ContentStore};
 /// at the first word.
 const MAGIC: u32 = u32::from_le_bytes(*b"SGPR");
 
-/// Format: the record's version; a decoder refuses any other.
-const VERSION: u32 = 1;
+/// Format: the version this build writes (A-723): the objects named, then the pack as the client sent it.
+const VERSION: u32 = 2;
+
+/// Format: the first version, each object's bytes inflated: still read, since a segment holds entries written by it.
+const VERSION_INFLATED: u32 = 1;
 
 /// Format: the bytes of a word: the magic, the version.
 const WORD_BYTES: usize = size_of::<u32>();
@@ -84,11 +101,13 @@ pub(crate) enum RecordRefused {
 /// Why a record was not written. The push and the store are as they were.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteRefused {
-  /// The content store does not hold an object's bytes whole: the store and the push's quarantine disagree.
+  /// The content store does not hold an object's bytes whole, for a record that writes its pack from them.
   Unreadable {
     /// The object.
     id: ObjectId,
   },
+  /// A pack of whole objects not made (`slates_git::pack::of_whole`).
+  Whole(slates_git::pack::WholeRefused),
   /// The record's length is past what an address can hold, or the allocator refused its room.
   Allocation,
 }
@@ -124,6 +143,12 @@ pub(crate) struct RecordedObject<'a> {
 /// A record read back (module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Record<'a> {
+  /// Version 2's objects, named by type, content identity and length, in the order they were admitted; empty for
+  /// version 1, whose objects carry their bytes.
+  pub(crate) names: Vec<(Kind, ContentId, u64)>,
+  /// Version 2's pack as the client sent it, compressed and with its deltas, which a replay reads its objects from;
+  /// empty for version 1, and for a record that brought no object.
+  pub(crate) pack: &'a [u8],
   /// The deepest delta chain the push's pack carried.
   pub(crate) deepest: u64,
   /// The moves, in the order the store committed them.
@@ -136,11 +161,18 @@ pub(crate) struct Record<'a> {
 /// noted as it comes, the record written whole when an append commits ([`RecordWriter::finish`]).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RecordWriter {
+  /// The push's pack as the client sent it (A-723), written in place of the objects' bytes.
+  pack: Vec<u8>,
   /// The objects noted, in the order they were admitted.
   noted: Vec<Noted>,
 }
 
 impl RecordWriter {
+  /// Keeps the push's pack as the client sent it (A-723), which the record holds in place of its objects' bytes.
+  pub(crate) fn keep_pack(&mut self, pack: Vec<u8>) {
+    self.pack = pack;
+  }
+
   /// Notes one object as the push admits it.
   pub(crate) fn object(&mut self, noted: Noted) {
     self.noted.push(noted);
@@ -159,12 +191,23 @@ impl RecordWriter {
   /// record's room is refused.
   pub(crate) fn finish(
     &self,
-    content: &ContentStore,
+    (content, format): (&ContentStore, ObjectFormat),
     lacks: impl Fn(&ObjectId) -> bool,
     (deepest, moves): (u64, &[RecordedMove]),
   ) -> Result<Vec<u8>, WriteRefused> {
     let objects: Vec<&Noted> = self.lacked(lacks).collect();
-    let len = record_len(moves, &objects).ok_or(WriteRefused::Allocation)?;
+    // A record that brings no object (a later append of a push, a delete) carries no pack; objects no client sent as a
+    // pack (the server's own commits) are written as one, each whole, so every record is a pack.
+    let made;
+    let pack: &[u8] = if objects.is_empty() {
+      &[]
+    } else if self.pack.is_empty() {
+      made = whole_pack(content, format, &objects)?;
+      &made
+    } else {
+      &self.pack
+    };
+    let len = record_len(moves, &objects, pack.len()).ok_or(WriteRefused::Allocation)?;
     let mut out = Vec::new();
     out
       .try_reserve_exact(len)
@@ -173,24 +216,51 @@ impl RecordWriter {
     let count = u64::try_from(objects.len()).unwrap_or(u64::MAX);
     out.extend_from_slice(&count.to_le_bytes());
     for noted in objects {
-      write_object(&mut out, content, noted)?;
+      out.push(noted.kind.pack_number());
+      out.extend_from_slice(&noted.identity.0);
+      out.extend_from_slice(&noted.len.to_le_bytes());
     }
+    let pack_len = u64::try_from(pack.len()).unwrap_or(u64::MAX);
+    out.extend_from_slice(&pack_len.to_le_bytes());
+    out.extend_from_slice(pack);
     Ok(out)
   }
 }
 
 /// The bytes a record of `moves` and `objects` takes; none past what an address can hold.
-fn record_len(moves: &[RecordedMove], objects: &[&Noted]) -> Option<usize> {
+/// `objects`' bytes read back from `content`, as a pack of whole objects in `format` (A-723: what a record holds for
+/// objects no client sent as a pack).
+fn whole_pack(
+  content: &ContentStore,
+  format: ObjectFormat,
+  objects: &[&Noted],
+) -> Result<Vec<u8>, WriteRefused> {
+  let mut read = Vec::with_capacity(objects.len());
+  for noted in objects {
+    let mut bytes = Vec::new();
+    for window in content.windows(&noted.identity) {
+      bytes.extend_from_slice(window);
+    }
+    if u64::try_from(bytes.len()).ok() != Some(noted.len) {
+      return Err(WriteRefused::Unreadable { id: noted.id });
+    }
+    read.push((noted.kind, bytes));
+  }
+  slates_git::pack::of_whole(
+    format,
+    read.iter().map(|(kind, bytes)| (*kind, bytes.as_slice())),
+  )
+  .map_err(WriteRefused::Whole)
+}
+
+fn record_len(moves: &[RecordedMove], objects: &[&Noted], pack: usize) -> Option<usize> {
   let mut len = HEAD_BYTES.checked_add(LONG_BYTES)?;
   for (_, _, head) in moves {
     let head = head.map_or(0, |id| id.as_bytes().len());
     len = len.checked_add(MOVE_MIN_BYTES)?.checked_add(head)?;
   }
-  for noted in objects {
-    let bytes = usize::try_from(noted.len).ok()?;
-    len = len.checked_add(OBJECT_MIN_BYTES)?.checked_add(bytes)?;
-  }
-  Some(len)
+  len = len.checked_add(OBJECT_MIN_BYTES.checked_mul(objects.len())?)?;
+  len.checked_add(LONG_BYTES)?.checked_add(pack)
 }
 
 /// Writes the record's head and its moves.
@@ -210,28 +280,6 @@ fn write_head(out: &mut Vec<u8>, deepest: u64, moves: &[RecordedMove]) {
       }
       None => out.push(ABSENT),
     }
-  }
-}
-
-/// Writes one object: its type, identity and length, then its bytes read back from its root in `content`, refused when
-/// they are not its length.
-fn write_object(
-  out: &mut Vec<u8>,
-  content: &ContentStore,
-  noted: &Noted,
-) -> Result<(), WriteRefused> {
-  out.push(noted.kind.pack_number());
-  out.extend_from_slice(&noted.identity.0);
-  out.extend_from_slice(&noted.len.to_le_bytes());
-  let mut read = 0u64;
-  for window in content.windows(&noted.identity) {
-    out.extend_from_slice(window);
-    read = read.saturating_add(u64::try_from(window.len()).unwrap_or(u64::MAX));
-  }
-  if read == noted.len {
-    Ok(())
-  } else {
-    Err(WriteRefused::Unreadable { id: noted.id })
   }
 }
 
@@ -302,6 +350,13 @@ impl<'a> Reader<'a> {
   }
 
   /// One object.
+  fn name(&mut self) -> Result<(Kind, ContentId, u64), RecordRefused> {
+    let kind = kind_of(self.byte()?).ok_or(RecordRefused::Malformed)?;
+    let identity =
+      ContentId::from_slice(self.take(IDENTITY_BYTES)?).ok_or(RecordRefused::Truncated)?;
+    Ok((kind, identity, self.long()?))
+  }
+
   fn object(&mut self) -> Result<RecordedObject<'a>, RecordRefused> {
     let kind = kind_of(self.byte()?).ok_or(RecordRefused::Malformed)?;
     let identity =
@@ -324,7 +379,7 @@ impl<'a> Record<'a> {
       return Err(RecordRefused::Magic);
     }
     let version = reader.word()?;
-    if version != VERSION {
+    if version != VERSION && version != VERSION_INFLATED {
       return Err(RecordRefused::Version { version });
     }
     let deepest = reader.long()?;
@@ -334,14 +389,30 @@ impl<'a> Record<'a> {
       moves.push(reader.one_move(format)?);
     }
     let count = reader.count(OBJECT_MIN_BYTES)?;
-    let mut objects = Vec::with_capacity(count);
-    for _ in 0..count {
-      objects.push(reader.object()?);
+    let (mut objects, mut names) = (Vec::new(), Vec::new());
+    if version == VERSION_INFLATED {
+      objects.reserve(count);
+      for _ in 0..count {
+        objects.push(reader.object()?);
+      }
+    } else {
+      names.reserve(count);
+      for _ in 0..count {
+        names.push(reader.name()?);
+      }
     }
+    let pack = if version == VERSION_INFLATED {
+      &[][..]
+    } else {
+      let len = usize::try_from(reader.long()?).map_err(|_| RecordRefused::Count)?;
+      reader.take(len)?
+    };
     if !reader.rest.is_empty() {
       return Err(RecordRefused::Trailing);
     }
     Ok(Record {
+      names,
+      pack,
       deepest,
       moves,
       objects,
