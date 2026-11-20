@@ -9,6 +9,7 @@ use std::process::Command;
 
 use slates_svn::dump::{Admission, Uuid};
 use slates_svn::fsfs::{self, Advance, RevisionFile, View};
+use slates_svn::index::RevisionRecord;
 use slates_svn::migration::{Importer, Importing, Repository, Room};
 
 /// `svnadmin dump -q` of the vectors' repository.
@@ -291,4 +292,154 @@ fn stock_svnadmin_and_svnlook_read_the_view_as_the_repository_the_dump_was_taken
     "svnlook changed of the view:\n{}",
     String::from_utf8_lossy(&changed)
   );
+}
+
+/// The repository of `FULL`'s revisions before `revision`: the dump cut where that revision's record begins.
+fn imported_before(revision: u64) -> Repository {
+  let marker = format!("Revision-number: {revision}\n");
+  let at = find(FULL, marker.as_bytes()).unwrap();
+  imported(&FULL[..at])
+}
+
+/// The transaction each revision of `FULL` was, made again as a trial on the revision before it in a repository cut
+/// there: its name, its files, and the repository and view it was made in.
+struct Retried {
+  name: String,
+  files: fsfs::TransactionFiles,
+  before: Repository,
+  view: View,
+}
+
+/// Revision `revision`'s work of `full`, tried on the revision before it.
+fn retried(full: &Repository, revision: u64) -> Retried {
+  let before = imported_before(revision);
+  let (view, _) = laid_out(&before, usize::MAX);
+  let name = full
+    .index()
+    .transaction(revision)
+    .unwrap()
+    .unwrap()
+    .to_owned();
+  let work = RevisionRecord {
+    transaction: name.clone(),
+    changes: full.index().changes(revision).unwrap().to_vec(),
+  };
+  let trial = before.index().trial(revision - 1, &work).unwrap();
+  let properties = full.revision_properties(revision).unwrap();
+  let files = fsfs::transaction_files(
+    &view,
+    before.index(),
+    &trial,
+    &work.changes,
+    &name,
+    properties
+      .iter()
+      .map(|(name, value)| (name.as_slice(), value.as_slice()))
+      .collect(),
+    full,
+  )
+  .unwrap();
+  Retried {
+    name,
+    files,
+    before,
+    view,
+  }
+}
+
+/// A-738 part 2: every revision's work, tried as a transaction on the revision before it, makes a directory whose
+/// root is `node.0.0` and whose changed paths are the revision's, each naming a transaction node or a committed one.
+#[test]
+fn each_revisions_work_makes_a_transaction_directory_rooted_at_node_0_0() {
+  let full = imported(FULL);
+  for revision in 1..=full.youngest() {
+    let retried = retried(&full, revision);
+    let directory = fsfs::transaction_path(&retried.name);
+    let root = retried
+      .files
+      .files
+      .iter()
+      .find(|(path, _)| *path == format!("{directory}/node.0.0"))
+      .unwrap_or_else(|| panic!("r{revision}: no root"));
+    let root = String::from_utf8_lossy(&root.1).into_owned();
+    assert!(
+      root.starts_with(&format!("id: 0.0.t{}\n", retried.name)),
+      "r{revision}: {root}"
+    );
+    let changes = retried
+      .files
+      .files
+      .iter()
+      .find(|(path, _)| *path == format!("{directory}/changes"))
+      .unwrap();
+    let lines = String::from_utf8_lossy(&changes.1)
+      .lines()
+      .filter(|line| line.contains(" false ") || line.contains(" true "))
+      .count();
+    assert_eq!(
+      lines,
+      full.index().changes(revision).unwrap().len(),
+      "r{revision}"
+    );
+  }
+}
+
+/// Writes a retried transaction's directory and prototype file beneath `root`, its repository written there first.
+#[allow(clippy::disallowed_methods)]
+fn materialize_transaction(retried: &Retried, full: &Repository, root: &str) {
+  materialize(&retried.view, &retried.before, root);
+  for directory in &retried.files.directories {
+    std::fs::create_dir_all(format!("{root}/{directory}")).unwrap();
+  }
+  for (path, bytes) in &retried.files.files {
+    std::fs::write(format!("{root}/{path}"), bytes).unwrap();
+  }
+  std::fs::write(
+    format!("{root}/{}", retried.files.prototype_path),
+    read_whole(&retried.files.prototype, full),
+  )
+  .unwrap();
+}
+
+/// A-738 part 2: stock `svnlook -t` reads each revision's work, tried as a transaction on the revision before it, as
+/// `svnlook -r` reads the revision itself: its changed paths with their copies, its author, date and log, its tree, its
+/// changed directories and its diff.
+#[test]
+fn stock_svnlook_reads_each_revisions_work_as_a_transaction_as_it_reads_the_revision() {
+  if !stock_tools() {
+    eprintln!(
+      "SKIPPED: stock svnlook is not on this host, so the transaction view's stock reading is not checked"
+    );
+    return;
+  }
+  let full = imported(FULL);
+  let (view, _) = laid_out(&full, usize::MAX);
+  let scratch = Scratch::new("fsfs-transaction");
+  let committed = format!("{}/committed", scratch.path);
+  materialize(&view, &full, &committed);
+  for revision in 1..=full.youngest() {
+    let retried = retried(&full, revision);
+    let root = format!("{}/before-{revision}", scratch.path);
+    materialize_transaction(&retried, &full, &root);
+    let number = revision.to_string();
+    for command in [
+      &["changed", "--copy-info"][..],
+      &["info"],
+      &["tree"],
+      &["dirs-changed"],
+      &["diff"],
+    ] {
+      let mut asked = command.to_vec();
+      asked.extend(["-t", &retried.name, &root]);
+      let transaction = String::from_utf8_lossy(&stock("svnlook", &asked)).into_owned();
+      let mut asked = command.to_vec();
+      asked.extend(["-r", &number, &committed]);
+      let committed = String::from_utf8_lossy(&stock("svnlook", &asked)).into_owned();
+      let transaction = transaction.replace(
+        &format!("(txn {})", retried.name),
+        &format!("(rev {revision})"),
+      );
+      assert_eq!(transaction, committed, "r{revision}: svnlook {command:?}");
+    }
+  }
 }

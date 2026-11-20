@@ -102,8 +102,10 @@
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
 > one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
-> Piece 8a: growth past the snapshot slot refused typed before it is written (`DbError::SnapshotRoom`). Owed: the slot
-> derived and re-laid at a handoff (8b), the snapshot naming sealed index tables (8c), a giant repository's index cut
+> Piece 8a: growth past the snapshot slot refused typed before it is written (`DbError::SnapshotRoom`). The slot's room is
+> admission's second resource (`vcs_share::room`, `Bound::Snapshot`). Owed: the slot
+> derived and re-laid at a handoff (8b), the snapshot naming a push's names by identity (8c: the codec `slates_vcs::rows` built; record v3's switch waits
+> for A-727 a3's durable content), a giant repository's index cut
 > across partitions by object id (9: the cut and its placement built, 9a; the record, routing and split owed, 9b).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
@@ -797,17 +799,18 @@
 > the SSH edge tells a command stepping that its client has gone (`vcs_ssh::site::ClientGone`: the client's bytes taken
 > while the step runs, kept for the session, its end of stream or a reset gone), so a hook's run over SSH ends with
 > its client, git's receive-pack and the tunnel's (which then ends E210002, as `svnserve` ends where its client leaves
-> inside a command). Owed: the revprop hooks'
-> calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
+> inside a command). The revprop hooks run since A-702 part 2 (2026-11-20). Owed: DAV's commit and lock hooks; REPOS as
+> A-645's FSFS-layout view.
 > **A-733 (2026-11-20, w-reaper):** svn over http(s) runs the hooks too, where `mod_dav_svn` runs them, through A-730's
 > runner (`HookSite::Http`): start-commit at the POST, pre-commit at the MERGE, post-commit's failure in the MERGE's
 > `S:post-commit-err`, pre-lock/post-lock around a LOCK (pre-lock's token the lock's), pre-unlock/post-unlock around an
 > UNLOCK, a post-hook's failure logged, never told (`lock.c`). DAV's commit and lock hooks closed; owed still: the
-> revprop hooks' calls (A-702 part 2), the SSH edge's client-gone signal, REPOS as A-645's view (w-reaper, next).
+> SSH edge's client-gone signal, REPOS as A-645's view (w-reaper, next).
 > **A-738 (2026-11-20, w-reaper; A-645 route A P1):** `slates_svn::fsfs` derives a repository's FSFS format 6 revision
 > and revprops files from the index and the green, laid out a revision a step and generated when read; stock
 > `svnadmin verify`, `dump` (whole and `--deltas`) and `svnlook changed` read the golden repository's view as the
-> repository the dump came from. Owed: P2 (the transaction directory for `svnlook -t`), P3 (the presenter under
+> repository the dump came from. Part 2: `fsfs::transaction_files`, an open transaction's directory and
+> prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. Owed: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
@@ -2050,8 +2053,12 @@
 > A-702 part 1, 2026-11-19 (w-svn): `change-rev-prop` and `change-rev-prop2` answered as `svnserve` answers a
 > repository with no pre-revprop-change hook (165006), after its checks in its order (the previous-value refusal,
 > write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
-> revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
-> its `Record::RevisionProperties` through the owner's step, post-revprop-change.
+> revision held). **Part 2, 2026-11-20 (w-svn):** the change runs pre-revprop-change (165006 where none is configured),
+> its previous value's check (160049) and its `Record::RevisionProperties` through the owner's step with no wait between,
+> then post-revprop-change with the old value, over `svn://` and `svn+ssh://` (`vcs_svn::revision_property_hook`; tests
+> `a_revision_property_change_runs_its_hooks_and_lands_as_svnserve_does`, `..._runs_its_hooks_around_its_record`).
+> `SvnStores::land_locks` became `land_record`. Owed: a recorded stock `svn propset --revprop` session over each scheme
+> (run request for main); DAV's revprop change.
 > S4 slice 1 (with A-716), 2026-11-19 (w-svn): every Subversion text is read through a source its reader is lent:
 > `migration::TextSource` (`text(identity) -> Cow`), `reads::Repository::text` and `commit::drive::Green::text`
 > answering `Cow`, and `migration::WithTexts`, the records with their texts read from any lent source (test
