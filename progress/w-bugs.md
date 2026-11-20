@@ -137,3 +137,7 @@
 - bug-claims: junction tests (fixed 2359d2550) and Windows landing w/o link privilege (passes on jupiter) marked.
 - Next candidates (by use): six fleet tests on jupiter (line 39); B5 arm64 WinFsp open/close 4 ms; B15 triage
   (winfstest 382 entries now runnable); hangup test flake (line 87).
+- B15 ANSWERED (no code): every reviewed-list entry has a stated reason; winfstest on CI both arches (diag-w-bugs-b15-1)
+  733 cases / 351 pass / 382 fail all expected. Line 39 (six fleet tests on jupiter): load/oversubscription, already
+  handed to owners; not reproduced by me (would need whole fleet suites).
+- Next: B5 (WinFsp arm64 open/close 4-5 ms) by use on CI arm64.
