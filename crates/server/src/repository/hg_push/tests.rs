@@ -600,7 +600,7 @@ fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
     let answer = hg.push(state, &stock(fixture!("push-plain.hg")), &view);
     assert!(answer.is_ok(), "{answer:?}");
     let before = hg.changesets(state);
-    crate::vcs_store::rebuild(state, hg.repository);
+    crate::vcs_store::rebuild_whole(state, hg.repository);
     assert_eq!(hg.changesets(state), before);
     assert!([0, 1, 3].iter().all(|at| hg.holds(state, &made[*at].node)));
   });

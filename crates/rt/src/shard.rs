@@ -858,9 +858,10 @@ impl ShardContext {
       future,
       parent,
       receipt,
+      label,
     } = request;
     let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
-    let admitted = self.admit(future, parent, false);
+    let admitted = self.admit(future, parent, false, label);
     receipt.answer(match &admitted {
       Ok(task) => Admission::Admitted(*task),
       Err(refusal) => Admission::Refused(refusal.clone()),
@@ -868,9 +869,40 @@ impl ShardContext {
     admitted
   }
 
-  /// Admits a local future under `parent`, joinable.
+  /// Admits a local future under `parent`, joinable, labelled with where it was spawned (A-740).
+  #[track_caller]
   pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
-    self.admit(future, parent, true)
+    self.admit(future, parent, true, crate::label::caller())
+  }
+
+  /// Admits a local future under `parent`, joinable, labelled `label` ([`crate::label`]): what a spawn entry that
+  /// took its caller's site outside a closure admits through.
+  pub(crate) fn spawn_labelled(
+    &self,
+    future: BoxedFuture,
+    parent: Option<u32>,
+    label: u32,
+  ) -> Result<TaskId, RtError> {
+    self.admit(future, parent, true, label)
+  }
+
+  /// Labels the task being polled `label` ([`crate::label`], A-740) and answers the label it had, so a guard can give
+  /// it back ([`crate::futures::doing`]); the pulse names the new label at once, so a spin inside the labelled work is
+  /// reported under it. None outside a poll.
+  pub(crate) fn relabel(&self, label: u32) -> Option<u32> {
+    let slot = self.current_task.get()?;
+    let (previous, polls) = self
+      .with_inner(|inner| {
+        let handle = handle_at(&inner.arena, slot)?;
+        let task = inner.arena.get_mut(handle).ok()?;
+        let previous = std::mem::replace(&mut task.label, label);
+        Some((previous, task.polls))
+      })
+      .flatten()?;
+    if let Some(entry) = self.entry {
+      entry.pulse.record_polling(label, polls.saturating_add(1));
+    }
+    Some(previous)
   }
 
   /// Admits a local future, joinable, that the shard runs alone until its future ends: each step polls it and no other
@@ -879,14 +911,24 @@ impl ShardContext {
   /// steps, its pulse and its inbox go on (what a watchdog judging steps sees). Refused [`RtError::ShardHeld`] while
   /// another task holds the shard. A shard held by a task that waits on something other than itself does nothing
   /// else until that comes.
+  #[track_caller]
   pub fn spawn_alone(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
+    self.spawn_alone_labelled(future, crate::label::caller())
+  }
+
+  /// [`Self::spawn_alone`], labelled `label` ([`crate::label`]).
+  pub(crate) fn spawn_alone_labelled(
+    &self,
+    future: BoxedFuture,
+    label: u32,
+  ) -> Result<TaskId, RtError> {
     let held = self
       .with_inner(|inner| live_alone(inner).map(|handle| handle.index()))
       .ok_or(RtError::NotOnShardThread)?;
     if let Some(slot) = held {
       return Err(RtError::ShardHeld { slot });
     }
-    let id = self.admit(future, None, true)?;
+    let id = self.admit(future, None, true, label)?;
     self
       .with_inner(|inner| inner.alone = Some(handle_of(id)))
       .ok_or(RtError::NotOnShardThread)?;
@@ -905,10 +947,14 @@ impl ShardContext {
     future: BoxedFuture,
     parent: Option<u32>,
     joinable: bool,
+    label: u32,
   ) -> Result<TaskId, RtError> {
     let id = self
       .with_inner(|inner| -> Result<TaskId, RtError> {
-        let handle = match inner.arena.insert(TaskSlot::new(future, parent, joinable)) {
+        let handle = match inner
+          .arena
+          .insert(TaskSlot::new(future, parent, joinable, label))
+        {
           Ok(h) => h,
           Err(slates_mem::MemError::SlabFull { capacity }) => {
             inner.counters.admission_refused = inner.counters.admission_refused.saturating_add(1);
@@ -1935,6 +1981,7 @@ impl ShardContext {
           future,
           parent,
           receipt,
+          label,
         } = *request;
         if inner.shutting_down {
           // A shard shutting down admits nothing new — its arena drains to empty and the loop exits
@@ -1944,7 +1991,10 @@ impl ShardContext {
           return;
         }
         let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
-        match inner.arena.insert(TaskSlot::new(future, parent, false)) {
+        match inner
+          .arena
+          .insert(TaskSlot::new(future, parent, false, label))
+        {
           Ok(handle) => {
             if let Some(p) = parent {
               link_child(&mut inner.arena, p, handle.index());
@@ -2008,7 +2058,14 @@ impl ShardContext {
   fn poll_slot(&self, slot: u32) {
     self.local.clear_pending(slot);
     let taken = self.with_inner(|inner| take_future(inner, slot)).flatten();
-    let Some((mut future, generation, cancelled)) = taken else {
+    let Some(PollTaken {
+      mut future,
+      generation,
+      cancelled,
+      label,
+      polls,
+    }) = taken
+    else {
       return;
     };
     if cancelled {
@@ -2021,6 +2078,10 @@ impl ShardContext {
     let waker = waker_for(word);
     let mut cx = Context::from_waker(&waker);
     self.current_task.set(Some(slot));
+    // What the watchdog names if this poll never ends (A-740): one store on the pulse's line.
+    if let Some(entry) = self.entry {
+      entry.pulse.record_polling(label, polls.saturating_add(1));
+    }
     let start = self.now_ns();
     let poll = future.as_mut().poll(&mut cx);
     let ended = self.now_ns();
@@ -2059,20 +2120,41 @@ fn handle_at(arena: &Slab<TaskSlot>, slot: u32) -> Option<Handle<TaskSlot>> {
   arena.generation_at(slot).map(|g| Handle::from_raw(slot, g))
 }
 
-/// Takes the future out of a live slot: `(future, generation, cancelled)`.
-fn take_future(inner: &mut ShardInner, slot: u32) -> Option<(BoxedFuture, u32, bool)> {
+/// A future taken out of its slot to be polled.
+struct PollTaken {
+  /// The future.
+  future: BoxedFuture,
+  /// Its slot's generation.
+  generation: u32,
+  /// Whether its cancellation was asked: it is dropped, not polled.
+  cancelled: bool,
+  /// Its label's index ([`crate::label`]).
+  label: u32,
+  /// Its polls so far.
+  polls: u64,
+}
+
+/// Takes the future out of a live slot.
+fn take_future(inner: &mut ShardInner, slot: u32) -> Option<PollTaken> {
   let handle = handle_at(&inner.arena, slot)?;
   let task = inner.arena.get_mut(handle).ok()?;
   if matches!(task.state, State::Finishing | State::Done | State::Running) {
     return None;
   }
   let future = task.future.take()?;
-  if task.cancel_requested {
-    task.state = State::Finishing;
-    return Some((future, handle.generation(), true));
-  }
-  task.state = State::Running;
-  Some((future, handle.generation(), false))
+  let cancelled = task.cancel_requested;
+  task.state = if cancelled {
+    State::Finishing
+  } else {
+    State::Running
+  };
+  Some(PollTaken {
+    future,
+    generation: handle.generation(),
+    cancelled,
+    label: task.label,
+    polls: task.polls,
+  })
 }
 
 /// One finished poll, as `after_poll` records it.

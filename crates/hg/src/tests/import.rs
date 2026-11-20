@@ -15,13 +15,13 @@ use crate::fixtures::{
 use crate::import::{
   Clock, FileRefused, Import, ImportRefused, Imported, Progress, RepositoryFiles, Turn, import,
 };
-use crate::index::{Log, NONE, RevisionRow};
+use crate::index::{Log, NONE};
 use crate::lines::lines;
 use crate::obsmarkers;
 use crate::phases::Phase;
 use crate::revlog;
 use crate::store::RequiresRefused;
-use crate::{Admission, NULL_NODE, changeset, filerev, node};
+use crate::{Admission, NULL_NODE, changeset, node};
 use proptest::prelude::*;
 
 /// The five repositories: `fixtures/store`'s two stores, the first under a pre-share-safe `.hg/requires`, and
@@ -178,21 +178,6 @@ fn whole(store: &ContentStore, root: &ContentId) -> Vec<u8> {
     .collect()
 }
 
-/// A manifest's or a file revision's text read back: the block between its markers, when it has one, then the bytes.
-fn text_of(store: &ContentStore, row: &RevisionRow) -> Vec<u8> {
-  let bytes = whole(store, &row.bytes);
-  match row.block {
-    None => bytes,
-    Some(block) => [
-      filerev::MARKER,
-      &whole(store, &block),
-      filerev::MARKER,
-      &bytes,
-    ]
-    .concat(),
-  }
-}
-
 /// Holds the changelog's rows to 7.2's texts: each text 7.2's, its node computed from its parents and its text, its
 /// manifest the one its text names.
 fn check_changelog(imported: &Imported, store: &ContentStore) {
@@ -228,7 +213,8 @@ fn check_log(imported: &Imported, store: &ContentStore, log: Log<'_>, texts: &[&
   };
   for (rev, text) in (0_u32..).zip(texts) {
     let row = imported.index.revision(store, log, rev).unwrap();
-    assert_eq!(text_of(store, &row), *text, "{log:?} {rev}");
+    let kept = imported.index.revision_text(store, log, rev).unwrap();
+    assert_eq!(kept, *text, "{log:?} {rev}");
     let computed = node::compute(&node_of(row.p1), &node_of(row.p2), text).unwrap();
     assert_eq!(computed, row.node, "{log:?} {rev}");
   }
@@ -1244,7 +1230,7 @@ fn revisions_of(index: &HgIndex, store: &ContentStore, log: Log<'_>) -> Vec<Held
       } else {
         let row = index.revision(store, log, rev).unwrap();
         let link = index.changeset(store, row.link).unwrap().node;
-        let text = text_of(store, &row);
+        let text = index.revision_text(store, log, rev).unwrap();
         (
           row.link,
           row.node,

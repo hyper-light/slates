@@ -69,8 +69,8 @@
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_svn::commit::drive::{Due, Green, Work};
+use slates_svn::commit::record::Record;
 use slates_svn::handshake::{self, Access, Repository, Unserved as Refusal};
-use slates_svn::lock::LockEntry;
 use slates_svn::ra_svn::ItemError;
 use slates_svn::reads;
 use slates_svn::report::{self, exchange::Budget};
@@ -84,7 +84,9 @@ use crate::repository::svn_commit::{self, Committed};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::git::Repositories;
 use crate::vcs_policy::{self, Right};
-use crate::vcs_svn::{HookSite, Hooked, MERGEINFO, post_lock_hook, pre_lock_hooks, run_hook};
+use crate::vcs_svn::{
+  HookSite, Hooked, MERGEINFO, post_lock_hook, pre_lock_hooks, revision_property_hook, run_hook,
+};
 
 /// Format: the refusal count of a command the connection answered "Unknown editor command" because slates does not
 /// serve it yet (`Turn::Unserved`).
@@ -167,13 +169,14 @@ pub(crate) trait SvnStores {
     principal: &Principal,
     work: Work,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>>;
-  /// Lands the lock `entries` a lock verb by `principal` made on repository `id` through the owner's step (a
-  /// `Record::Locks`, A-693 part 2): whether they landed; none when its store is not held here.
-  fn land_locks(
+  /// Lands `record`, which moves no version, by `principal` on repository `id` through the owner's step: a lock verb's
+  /// entries (`Record::Locks`, A-693 part 2) or a revision's properties whole (`Record::RevisionProperties`, A-702 part
+  /// 2); whether it landed; none when its store is not held here.
+  fn land_record(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
-    entries: Vec<LockEntry>,
+    record: Record,
   ) -> Option<Result<(), svn_commit::Uncommitted>>;
   /// Runs `step` over repository `id`'s sources at the owner's instant; none when its store is not held here.
   fn lend<T>(
@@ -341,6 +344,13 @@ enum Received {
   CommitAsked(usize),
   /// The client asked for a lock verb.
   LockAsked(usize),
+  /// The client asked for a revision property change past its checks.
+  RevisionProperty {
+    /// The pre-hook's call.
+    call: Box<slates_svn::serve::RevisionPropertyCall>,
+    /// The bytes taken.
+    consumed: usize,
+  },
   /// The commit's drive waits for a hook.
   Hook {
     /// The hook.
@@ -380,6 +390,9 @@ impl Received {
       Turn::KeyNeeded { consumed, .. } => Received::Key(consumed),
       Turn::CommitAsked { consumed } => Received::CommitAsked(consumed),
       Turn::LockAsked { consumed } => Received::LockAsked(consumed),
+      Turn::RevisionPropertyHook { call, consumed } => {
+        Received::RevisionProperty { call, consumed }
+      }
       Turn::Hook { due, consumed } => Received::Hook { due, consumed },
       Turn::Accepted { work, consumed } => Received::Accepted { work, consumed },
     }
@@ -444,6 +457,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       }
       Received::LockAsked(consumed) => {
         self.lock_verb(gone).await;
+        consumed
+      }
+      Received::RevisionProperty { call, consumed } => {
+        self.revision_property(&call, gone).await;
         consumed
       }
       Received::Hook { due, consumed } => {
@@ -643,7 +660,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     } else if entries.is_empty() {
       Ok(())
     } else {
-      match self.stores.land_locks(id, &self.principal, entries) {
+      match self
+        .stores
+        .land_record(id, &self.principal, Record::Locks(entries))
+      {
         None => return self.not_held(),
         Some(landed) => landed.map_err(|refused| refused.failure()),
       }
@@ -660,6 +680,66 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       None => Ok(()),
     };
     let answered = self.connection.locks_finished(ended, &mut self.out);
+    self.end_if_refused(answered);
+  }
+
+  /// Runs the client's revision property change past its checks (A-702 part 2), `call` its pre-hook's, as the listener
+  /// does (`vcs_svn::revision_property`): pre-revprop-change, then the change judged over the lent sources and its
+  /// record landed through the owner's step, then post-revprop-change with the old value.
+  async fn revision_property(
+    &mut self,
+    call: &slates_svn::serve::RevisionPropertyCall,
+    gone: ClientGone<'_>,
+  ) {
+    let Some(record) = self.opened.as_ref() else {
+      return self.not_held();
+    };
+    let id = record.id;
+    let policy = record.policy.clone();
+    let hooked = Hooked::new(id, &record.name);
+    let room = self.bounds.limits.item_bytes;
+    let site = HookSite::Tunnel(&policy, gone);
+    // No verdict: the client left during a run (the module doc's hooks).
+    let pre = HookPoint::SvnPreRevpropChange;
+    let Some(verdict) = revision_property_hook(site, &hooked, room, pre, call).await else {
+      return self.client_left();
+    };
+    let judged = {
+      let Self {
+        connection,
+        stores,
+        out,
+        ..
+      } = self;
+      stores.lend(id, |sources| {
+        connection.revision_property_hooked(sources, verdict, out)
+      })
+    };
+    let record = match judged {
+      None => return self.not_held(),
+      Some(Err(refused)) => return self.end(refused),
+      Some(Ok(None)) => return,
+      Some(Ok(Some(record))) => record,
+    };
+    let landed = match self.stores.land_record(id, &self.principal, record) {
+      None => return self.not_held(),
+      Some(landed) => landed.map_err(|refused| refused.failure()),
+    };
+    let post = match self
+      .connection
+      .revision_property_landed(landed, &mut self.out)
+    {
+      Ok(Some(post)) => post,
+      Ok(None) => return,
+      Err(refused) => return self.end(refused),
+    };
+    let post_point = HookPoint::SvnPostRevpropChange;
+    let Some(ended) = revision_property_hook(site, &hooked, room, post_point, &post).await else {
+      return self.client_left();
+    };
+    let answered = self
+      .connection
+      .revision_property_finished(ended, &mut self.out);
     self.end_if_refused(answered);
   }
 

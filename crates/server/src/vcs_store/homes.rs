@@ -28,6 +28,16 @@
 //! the home (`crate::xshard::task_in_shard_time`), so the owner's request awaits it and no step ever waits. One barrier
 //! serves every window kept before it: group commit per shard, never a publication per push.
 //!
+//! **In batches** ([`home_many`], [`read_many`], [`let_go_many`]; agreed with w-perf). A request's windows go to their
+//! homes in one cross-shard call a home shard a turn, never one a window: each call works through its items until the
+//! home's step quantum (§4.3) is spent, at least one, and answers the rest to be sent in the next turn, so a batch of any
+//! size holds no home past a quantum. Answers come back in the request's order.
+//!
+//! **From the region** ([`serve_remote`], A-724 piece 6's region half). Another member's home exchange
+//! (`slates_cluster::homes`) arrives on this node's record session and is served here: kept on the node's own home
+//! shard for the window, never in `ContentHold` (w-fed-faults' answer to Q3), only where the configuration ranks this
+//! node among the window's homes, and acknowledged only once that shard's image holding it is published.
+//!
 //! **Refused** ([`HomeRefused`]): bytes past a window; a home whose content store refused (its budget); a home that did
 //! not answer within the budget; an answer naming another identity than the bytes' (never in a correct home).
 
@@ -205,8 +215,8 @@ pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<
     .vcs_stores
     .content
     .as_ref()
-    .and_then(|content| content.get(identity))
-    .map(<[u8]>::to_vec)?;
+    .and_then(|content| content.bytes_of(identity))
+    .map(std::borrow::Cow::into_owned)?;
   state.count(READ, 1);
   Some(bytes)
 }
@@ -302,6 +312,219 @@ pub(crate) async fn let_go(
   )
   .await
   .ok_or(HomeRefused::Unanswered)?
+}
+
+/// Counter: cross-shard calls the batch forms made, one a home shard a turn (module docs, "In batches"). Format: a
+/// counter name.
+pub(crate) const BATCH_CALLS: &str = "vcs_store.homes.batch_calls";
+
+/// Runs `work` on each of `items` at its identity's home among `shards` (module docs, "In batches"): one cross-shard
+/// call a home shard a turn, each working through its items until the home's step quantum is spent and answering the
+/// rest to be sent again, so no call holds a home past a quantum. Each item's answer in `items`' order; none for an item
+/// whose home did not answer within `budget_ns` of its own time.
+async fn per_home<I, O>(
+  origin: u16,
+  shards: &[u16],
+  items: Vec<(ContentId, I)>,
+  budget_ns: u64,
+  work: fn(&mut ShardState, &ContentId, I) -> O,
+) -> Vec<Option<O>>
+where
+  I: Send + 'static,
+  O: Send + 'static,
+{
+  let mut answers: Vec<Option<O>> = items.iter().map(|_| None).collect();
+  let mut by_home: std::collections::BTreeMap<u16, Vec<(usize, ContentId, I)>> =
+    std::collections::BTreeMap::new();
+  for (at, (identity, item)) in items.into_iter().enumerate() {
+    if let Some(home) = home_of(shards, &identity) {
+      by_home.entry(home).or_default().push((at, identity, item));
+    }
+  }
+  for (home, mut pending) in by_home {
+    while !pending.is_empty() {
+      let batch = core::mem::take(&mut pending);
+      let answered = crate::xshard::call_in_shard_time(
+        origin,
+        home,
+        move |state| {
+          let quantum_ns = state.config.step_quantum_ns();
+          let began = slates_rt::futures::now_ns();
+          let mut done = Vec::new();
+          let mut rest = Vec::new();
+          for (at, identity, item) in batch {
+            // At least one item a call, so a turn always progresses.
+            if !done.is_empty() && slates_rt::futures::now_ns().saturating_sub(began) >= quantum_ns
+            {
+              rest.push((at, identity, item));
+            } else {
+              done.push((at, work(state, &identity, item)));
+            }
+          }
+          state.count(BATCH_CALLS, 1);
+          (done, rest)
+        },
+        budget_ns,
+      )
+      .await;
+      let Some((done, rest)) = answered else {
+        break;
+      };
+      for (at, answer) in done {
+        if let Some(slot) = answers.get_mut(at) {
+          *slot = Some(answer);
+        }
+      }
+      pending = rest;
+      if !pending.is_empty() {
+        slates_rt::futures::yield_now().await;
+      }
+    }
+  }
+  answers
+}
+
+/// [`keep_here`] for one item of a batch: the window's bytes, checked against the identity it was sent under.
+fn keep_item(
+  state: &mut ShardState,
+  identity: &ContentId,
+  bytes: Vec<u8>,
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
+  let kept = keep_here(state, &bytes)?;
+  if kept.0 == *identity {
+    Ok(kept)
+  } else {
+    Err(HomeRefused::Misnamed)
+  }
+}
+
+/// [`read_here`] for one item of a batch.
+fn read_item(state: &mut ShardState, identity: &ContentId, (): ()) -> Option<Vec<u8>> {
+  read_here(state, identity)
+}
+
+/// [`let_go_here`] for one item of a batch.
+fn let_go_item(state: &mut ShardState, identity: &ContentId, (): ()) -> Result<(), HomeRefused> {
+  let_go_here(state, identity)
+}
+
+/// Homes every window of `windows` from shard `origin` (module docs, "In batches"): each one's identity and ticket, in
+/// order, or why not (`Unanswered` where its home did not answer within `budget_ns` of its own time).
+pub(crate) async fn home_many(
+  origin: u16,
+  shards: &[u16],
+  windows: Vec<Vec<u8>>,
+  budget_ns: u64,
+) -> Vec<Result<(ContentId, HomeTicket), HomeRefused>> {
+  let items: Vec<(ContentId, Vec<u8>)> = windows
+    .into_iter()
+    .map(|bytes| (ContentId::of(&bytes), bytes))
+    .collect();
+  per_home(origin, shards, items, budget_ns, keep_item)
+    .await
+    .into_iter()
+    .map(|answer| answer.unwrap_or(Err(HomeRefused::Unanswered)))
+    .collect()
+}
+
+/// Reads every window of `identities` from its home, from shard `origin` (module docs, "In batches"): each one's bytes,
+/// in order, checked against its name, or none.
+pub(crate) async fn read_many(
+  origin: u16,
+  shards: &[u16],
+  identities: &[ContentId],
+  budget_ns: u64,
+) -> Vec<Option<Vec<u8>>> {
+  let items: Vec<(ContentId, ())> = identities.iter().map(|identity| (*identity, ())).collect();
+  per_home(origin, shards, items, budget_ns, read_item)
+    .await
+    .into_iter()
+    .zip(identities)
+    .map(|(answer, identity)| {
+      answer
+        .flatten()
+        .filter(|bytes| ContentId::of(bytes) == *identity)
+    })
+    .collect()
+}
+
+/// Lets go one holder of every window of `identities` at its home, from shard `origin` (module docs, "In batches"):
+/// each one's answer, in order.
+pub(crate) async fn let_go_many(
+  origin: u16,
+  shards: &[u16],
+  identities: &[ContentId],
+  budget_ns: u64,
+) -> Vec<Result<(), HomeRefused>> {
+  let items: Vec<(ContentId, ())> = identities.iter().map(|identity| (*identity, ())).collect();
+  per_home(origin, shards, items, budget_ns, let_go_item)
+    .await
+    .into_iter()
+    .map(|answer| answer.unwrap_or(Err(HomeRefused::Unanswered)))
+    .collect()
+}
+
+/// Counter: home exchanges a member served from the region (module docs, "From the region"). Format: a counter name.
+pub(crate) const REMOTE_SERVED: &str = "vcs_store.homes.remote_served";
+
+/// Serves one home exchange from another member of the region on shard `origin` (module docs, "From the region";
+/// `slates_cluster::homes`): a put kept only where the configuration this node knows ranks it among the window's homes
+/// and its bytes hash to their name, on the node's own home shard for the window, and answered `Kept` only once that
+/// shard's image holding it is published ([`published`], A-727's barrier); a read answered with the bytes; a let-go
+/// answered once its holder is let go. Each wait is judged in its target's own time within `budget_ns`. Malformed bytes
+/// answer nothing, as the session's other streams do.
+pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) -> Vec<u8> {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal, admits};
+  let Ok(message) = HomeMessage::decode(request) else {
+    return Vec::new();
+  };
+  let Some((local, members, f, shards)) = crate::state::with_state(|state| {
+    state.count(REMOTE_SERVED, 1);
+    (
+      state.fleet.host(),
+      state.fleet.members().to_vec(),
+      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+      state.shards.clone(),
+    )
+  }) else {
+    return Vec::new();
+  };
+  let (identity, outcome) = match message {
+    HomeMessage::Put { identity, bytes } => {
+      let outcome = match admits(&identity, &bytes, (local, &members, f)) {
+        Err(refusal) => HomeOutcome::Refused(refusal),
+        Ok(()) => match home(origin, &shards, bytes, budget_ns).await {
+          Ok((_, ticket)) if published(origin, ticket, budget_ns).await => HomeOutcome::Kept {
+            generation: ticket.generation,
+          },
+          Ok(_) | Err(HomeRefused::Unanswered) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+          Err(HomeRefused::Misnamed | HomeRefused::PastWindow) => {
+            HomeOutcome::Refused(HomeRefusal::Misnamed)
+          }
+          Err(HomeRefused::Content(_)) => HomeOutcome::Refused(HomeRefusal::Room),
+          Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+        },
+      };
+      (identity, outcome)
+    }
+    HomeMessage::Read { identity } => {
+      let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
+        Some(bytes) => HomeOutcome::Bytes(bytes),
+        None => HomeOutcome::Refused(HomeRefusal::NotHeld),
+      };
+      (identity, outcome)
+    }
+    HomeMessage::LetGo { identity } => {
+      let outcome = match let_go(origin, &shards, ContentId(identity), budget_ns).await {
+        Ok(()) => HomeOutcome::LetGo,
+        Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+        Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+      };
+      (identity, outcome)
+    }
+    HomeMessage::Answer { .. } => return Vec::new(),
+  };
+  HomeMessage::Answer { identity, outcome }.encode()
 }
 
 #[cfg(test)]

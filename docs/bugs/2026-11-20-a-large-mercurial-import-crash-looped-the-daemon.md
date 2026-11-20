@@ -46,5 +46,13 @@ repositories were unaffected (their records are written and replayed within a st
 - Test (failing before the fix: one unit for the whole record, the record written in no turn of its own):
   `vcs_store::hg_import::tests::t_a732_a_recovery_replays_an_import_record_a_revision_a_unit`.
 
-Owed: a rebuild's replay (`vcs_store::rebuild`, used where an append is refused after its store moved) still replays in
-one step; the record's size itself, which S5 (A-729) makes identities alone.
+Part 2 (found by use, w-interop: a whole-history push spun its shard at its landing): a push's record is written a part
+a slice before its landing (`record::Writer::begin_kept`, `hg_push::record_sliced`).
+
+Part 3: a Mercurial store's rebuild (`vcs_store::rebuild`, used where a commit is refused after its store moved)
+replays its records a step a turn in a task (`replay_sliced`), the store lent to nothing while it does
+(`VcsStores::rebuilding`: the served view's `held`, a push's intake and re-base, a made changeset), its index's
+generation moved after; `rebuild_whole` keeps the one-step rebuild for git, Subversion and the tests. Test:
+`vcs_store::hg_import::tests::t_a732_a_rebuild_replays_a_mercurial_store_a_step_a_turn`.
+
+Owed: the record's size itself, which S5 (A-729 part 2) makes identities and deltas alone.

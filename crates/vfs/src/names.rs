@@ -237,22 +237,27 @@ mod tests {
     assert_eq!(NameEquivalence::Fold.fold("Stra\u{df}e"), "stra\u{df}e");
   }
 
-  /// A-576, §4.4 name policy, T-4.6. Do: compare names under `Upcase` and under `Fold`: two cases of ASCII, two cases of
-  /// `é`, final and medial sigma, a precomposed and a decomposed `é`, the Kelvin sign and `k`, and `ß`. Expect: `Upcase`
-  /// takes the cases and the sigmas for one name, with one hash, as Windows' upcase table does, and keeps the two `é`
-  /// spellings and the Kelvin sign apart, as NTFS does; `Fold` the opposite at each of the last three; `ß` kept as it is
-  /// by both. Before A-576 no policy folded as a WinFsp drive does.
+  /// A-576, A-737, §4.4 name policy, T-4.6. Do: compare names under `Upcase` and under `Fold`: two cases of ASCII, two
+  /// cases of `é`, `ɐ` and `Ɐ`, final and medial sigma, a precomposed and a decomposed `é`, the Kelvin sign and `k`, and
+  /// `ß`. Expect: `Upcase` takes the cases for one name, with one hash, as Windows' upcase table does, and keeps the
+  /// sigmas, the two `é` spellings and the Kelvin sign apart, as NTFS does; `Fold` keeps the sigmas apart too and takes
+  /// the other two pairs for one; `ß` kept as it is by both. Before A-576 no policy folded as a WinFsp drive does, and
+  /// before A-737 `Upcase` took the sigmas for one, as the exFAT table does and Windows does not.
   #[test]
   fn upcase_folds_names_as_windows_upcase_table_does() {
     use NameEquivalence::{Fold, Upcase};
     for (a, b) in [
       ("README", "readme"),
       ("CAF\u{c9}.TXT", "caf\u{e9}.txt"),
-      ("\u{3c3}.txt", "\u{3c2}.txt"),
-      ("\u{3a3}", "\u{3c2}"),
+      ("\u{250}.txt", "\u{2c6f}.TXT"),
+      ("\u{3a3}", "\u{3c3}"),
     ] {
       assert_one_name_under_upcase(a, b);
     }
+    assert!(
+      !Upcase.same("\u{3c3}.txt", "\u{3c2}.txt"),
+      "Windows' table keeps final sigma apart"
+    );
     assert!(
       !Fold.same("\u{3c3}.txt", "\u{3c2}.txt"),
       "lowercasing keeps final sigma apart"

@@ -255,6 +255,8 @@ pub(crate) struct Kept {
   block: Option<ContentId>,
   /// The text, or a file revision's bytes.
   bytes: ContentId,
+  /// A manifest kept as a delta: its text, rebuilt from its chain (A-729).
+  rebuilt: Option<Vec<u8>>,
 }
 
 /// The record of the index an import made (module docs), `room` the room it ran within: every revision it holds, the
@@ -271,9 +273,10 @@ pub fn write(index: &HgIndex, store: &ContentStore, room: u64) -> Result<Vec<u8>
 /// budget. A step writes one log's group head with its first revision, or one revision, or the markers last. The
 /// record grows as it is written, each part's room reserved before it is put, refused typed where it cannot be.
 pub struct Writer {
-  /// The logs, each its log's tag and a file log's path: the changelog, the manifest log, then each file log in its
-  /// path's order.
-  logs: Vec<(u8, Vec<u8>)>,
+  /// The logs, each its log's tag, a file log's path, and the number of the first revision the record holds of it: an
+  /// import's, the changelog, the manifest log, then each file log in its path's order, each from its first; a push's,
+  /// the logs it kept revisions in, each from its first kept.
+  logs: Vec<(u8, Vec<u8>, u32)>,
   /// The log being written, and its next revision.
   at: (usize, u32),
   /// The record so far.
@@ -285,19 +288,54 @@ pub struct Writer {
 impl Writer {
   /// Starts the record of `index` (module docs): its head written, `room` the room the import ran within.
   pub fn begin(index: &HgIndex, store: &ContentStore, room: u64) -> Result<Writer, WriteRefused> {
-    let mut logs = vec![(CHANGELOG_TAG, Vec::new()), (MANIFEST_TAG, Vec::new())];
+    let mut logs = vec![
+      (CHANGELOG_TAG, Vec::new(), 0),
+      (MANIFEST_TAG, Vec::new(), 0),
+    ];
     logs
       .try_reserve(index.file_logs(store).count())
       .map_err(|_| WriteRefused::Allocation)?;
-    logs.extend(index.file_logs(store).map(|path| (FILE_TAG, path.to_vec())));
+    logs.extend(
+      index
+        .file_logs(store)
+        .map(|path| (FILE_TAG, path.to_vec(), 0)),
+    );
+    Writer::of(logs, (Source::Import, room))
+  }
+
+  /// Starts a push's record (A-680 part 2c, A-720) of the revisions it kept in `logs` (each a log and its first kept
+  /// number in the fork), as [`write_kept`] writes it whole, `room` the room its landing runs within.
+  pub fn begin_kept(
+    logs: &[(crate::push::verify::LogOf, u32)],
+    room: u64,
+  ) -> Result<Writer, WriteRefused> {
+    use crate::push::verify::LogOf;
+    let mut kept = Vec::new();
+    kept
+      .try_reserve(logs.len())
+      .map_err(|_| WriteRefused::Allocation)?;
+    kept.extend(logs.iter().map(|(log, first)| match log {
+      LogOf::Changelog => (CHANGELOG_TAG, Vec::new(), *first),
+      LogOf::Manifests => (MANIFEST_TAG, Vec::new(), *first),
+      LogOf::File(path) => (FILE_TAG, path.clone(), *first),
+    }));
+    Writer::of(kept, (Source::Push, room))
+  }
+
+  /// A writer of `logs` from `source`'s head.
+  fn of(
+    logs: Vec<(u8, Vec<u8>, u32)>,
+    (source, room): (Source, u64),
+  ) -> Result<Writer, WriteRefused> {
     let mut out = Vec::new();
     out
       .try_reserve(HEAD_BYTES.saturating_add(LONG_BYTES))
       .map_err(|_| WriteRefused::Allocation)?;
-    write_head(&mut out, (Source::Import, room), to_u64(logs.len()));
+    write_head(&mut out, (source, room), to_u64(logs.len()));
+    let at = (0, logs.first().map_or(0, |(_, _, first)| *first));
     Ok(Writer {
       logs,
-      at: (0, 0),
+      at,
       out,
       done: false,
     })
@@ -309,14 +347,20 @@ impl Writer {
       return Ok(false);
     }
     let (at, rev) = self.at;
-    let Some((tag, path)) = self.logs.get(at) else {
+    let Some((tag, path, first)) = self.logs.get(at) else {
       let mut markers = Vec::new();
-      write_markers(&mut markers, index, store)
-        .map_err(|number| WriteRefused::UnreadableMarker { number })?;
+      if self.imports() {
+        write_markers(&mut markers, index, store)
+          .map_err(|number| WriteRefused::UnreadableMarker { number })?;
+      } else {
+        // A push's record holds no markers (its obsmarkers are not taken yet): their count, none.
+        markers.extend_from_slice(&0_u64.to_le_bytes());
+      }
       self.put(&markers)?;
       self.done = true;
       return Ok(false);
     };
+    let first = *first;
     let log = match *tag {
       CHANGELOG_TAG => Log::Changelog,
       MANIFEST_TAG => Log::Manifest,
@@ -329,8 +373,8 @@ impl Writer {
     };
     let len = index.len(store, log);
     let mut part = Vec::new();
-    if rev == 0 {
-      write_group_head(&mut part, log, u64::from(len));
+    if rev == first {
+      write_group_head(&mut part, log, u64::from(len.saturating_sub(first)));
     }
     if rev < len {
       let kept = kept(index, store, log, rev).ok_or_else(|| unreadable(&radix, rev))?;
@@ -338,10 +382,19 @@ impl Writer {
       self.at = (at, rev.saturating_add(1));
     }
     if rev.saturating_add(1) >= len {
-      self.at = (at.saturating_add(1), 0);
+      let next = at.saturating_add(1);
+      self.at = (next, self.logs.get(next).map_or(0, |(_, _, first)| *first));
     }
     self.put(&part)?;
     Ok(true)
+  }
+
+  /// Whether the record is an import's, whose markers it holds.
+  fn imports(&self) -> bool {
+    self
+      .out
+      .get(WORD_BYTES.saturating_mul(2))
+      .is_some_and(|source| *source == Source::Import.byte())
   }
 
   /// The record, once every part is written.
@@ -470,9 +523,6 @@ fn write_verified(
   write_revisions((source, room), &groups, &[])
 }
 
-/// A revision kept in the fork and its text, read back whole (as [`write_kept`] reads them).
-type KeptText = (Kept, Vec<u8>);
-
 /// A push's record (A-680 part 2c's, [`Source::Push`]) written from the fork A-720's intake kept it in: each of `logs`'
 /// revisions from its first kept number to the fork's end, in the order kept, read back from the fork's rows (texts
 /// whole, as [`write_push`] writes them); `room` the room the landing ran within. Refused, nothing is written.
@@ -482,51 +532,9 @@ pub fn write_kept(
   logs: &[(crate::push::verify::LogOf, u32)],
   room: u64,
 ) -> Result<Vec<u8>, WriteRefused> {
-  use crate::push::verify::LogOf;
-  let mut read: Vec<(Log<'_>, Vec<KeptText>)> = Vec::with_capacity(logs.len());
-  for (named, first) in logs {
-    let log = match named {
-      LogOf::Changelog => Log::Changelog,
-      LogOf::Manifests => Log::Manifest,
-      LogOf::File(path) => Log::File(path),
-    };
-    let radix: &[u8] = match named {
-      LogOf::File(path) => path,
-      _ => &[],
-    };
-    let mut revisions = Vec::new();
-    for rev in *first..fork.len(store, log) {
-      let kept = kept(fork, store, log, rev).ok_or_else(|| unreadable(radix, rev))?;
-      let mut text = Vec::new();
-      if write_text(&mut text, store, &kept) != kept.len {
-        return Err(unreadable(radix, rev));
-      }
-      revisions.push((kept, text));
-    }
-    read.push((log, revisions));
-  }
-  let revisions: Vec<Vec<Revision<'_>>> = read
-    .iter()
-    .map(|(_, revisions)| {
-      revisions
-        .iter()
-        .map(|(kept, text)| Revision {
-          node: kept.node,
-          p1: kept.p1,
-          p2: kept.p2,
-          link: kept.link.unwrap_or(NULL_NODE),
-          flags: kept.flags,
-          text,
-        })
-        .collect()
-    })
-    .collect();
-  let groups: Vec<Group<'_>> = read
-    .iter()
-    .zip(&revisions)
-    .map(|((log, _), revisions)| (*log, revisions.as_slice()))
-    .collect();
-  write_revisions((Source::Push, room), &groups, &[])
+  let mut writer = Writer::begin_kept(logs, room)?;
+  while writer.step(fork, store)? {}
+  writer.finish().ok_or(WriteRefused::Allocation)
 }
 
 /// One log's arrived revisions as a push's record holds them: flags 0, and a link only where the log has one.
@@ -630,6 +638,7 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
       len: row.len,
       block: None,
       bytes: row.text,
+      rebuilt: None,
     });
   }
   let row = index.revision(store, log, rev)?;
@@ -638,6 +647,12 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
       return Some(NULL_NODE);
     }
     index.revision(store, log, number).map(|parent| parent.node)
+  };
+  // A manifest kept as a delta (A-729): its text rebuilt from its chain, the one revision's text held.
+  let rebuilt = if row.base == NONE {
+    None
+  } else {
+    Some(index.revision_text(store, log, rev)?)
   };
   Some(Kept {
     node: row.node,
@@ -648,6 +663,7 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
     len: row.len,
     block: row.block,
     bytes: row.bytes,
+    rebuilt,
   })
 }
 
@@ -666,6 +682,10 @@ pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -
     out.extend_from_slice(bytes);
     *written = written.saturating_add(to_u64(bytes.len()));
   };
+  if let Some(text) = &kept.rebuilt {
+    put(text, &mut written);
+    return written;
+  }
   if let Some(block) = kept.block {
     put(MARKER, &mut written);
     for window in store.windows(&block) {

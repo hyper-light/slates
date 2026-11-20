@@ -4655,6 +4655,14 @@ pub enum DatabaseRefusal {
     /// The section's index among the policy's hooks-env sections.
     index: u32,
   },
+  /// The partition's state would not fit its snapshot slot (A-724 piece 8, §4.17.5): refused before anything is written
+  /// past it; nothing of the request is durable. Appended.
+  SnapshotRoom {
+    /// The encoded state's bytes.
+    needed: u64,
+    /// The slot's bytes.
+    room: u64,
+  },
 }
 
 /// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the

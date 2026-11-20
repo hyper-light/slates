@@ -153,6 +153,10 @@ fn made(
   let Some(repository) = mercurial_repository_of(state, green) else {
     return Ok(false);
   };
+  // A store being made again from its records is lent to nothing (A-732): no changeset is made over half its history.
+  if state.vcs_stores.rebuilding(repository) {
+    return Err(Unmade::NotHead);
+  }
   let user = authorship
     .identities
     .mercurial
