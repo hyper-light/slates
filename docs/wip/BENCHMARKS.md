@@ -14936,7 +14936,7 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
   A-722, is to allow). Near 1 is fair; well above 1 is starvation.
 - **The command and machine.** `multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 --steps 1,10,100`,
   and the control `... v0.99 --steps 100` (every repository small). adas-mac-studio.local-2, M3 Ultra, 32 cores, a
-  23-shard daemon; release built from main a2963b7ad's tree with the harness (branch `agents/w-balance-load5`, c291fe8be);
+  23-shard daemon; release built from bc2b042e0 (main 2963b7ad5 with the harness), the script at c291fe8be;
   load 8.8 to 10.3; one run each. v1.5.0 is left out: 19 concurrent pushes of it to one repository end the daemon on
   main (routed to w-git, A-722's by-use proof).
 
