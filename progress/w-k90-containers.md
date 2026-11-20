@@ -184,3 +184,7 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
   container + engine volume outlived the session at the check (gone a minute later); drift's Bypass session leaked its
   engine volume (removed by hand). Reported to w-k90-a520 + main. Re-run when it fixes the end.
 - Docker Desktop on the MacBook: its API answered 500 once; restarted (quit + TERM my leftovers + open); left running.
+- jupiter: WinFsp now installed; Docker Desktop's engine started from the runner (r12, 29.9.1 linux). BLOCKER for the
+  Windows leg is code, not the machine: engine_profile is Unsupported on Windows -> facts_of says Platform -> no container
+  agents on Windows. Asked w-k90-a520 (owner) how to lift it under the export route (Slates judging Desktop on Windows,
+  or kiln judging via `docker info`), and whether Slates serves its NFS export on Windows (A-184).
