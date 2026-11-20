@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: (a) push half = cd302e110 (main 777022f2a). NOW: (a) part 2, the owed commit (main's 3 requirements:
+  replay reads no clock + determinism test crash-after-staging recover-twice same ids; completion settles owed in the
+  same transaction; one owed per green, parked, typed refusal at bound). Then svn copies, symlinks. Then A-697, A-658 3c.
+
 ## (a) PUSH HALF DESIGN (in progress, worktree ~/slates-work/g261-a636p2b2, nothing committed yet for it)
 - New child module crates/server/src/vcs_store/paths/whole_build.rs (child of paths: uses Plan::Put, made_holding,
   give_back, git_file, map_path, put_file, count, BUILT). Builds(BTreeMap<green, Build>) in VcsStores.whole_builds.
