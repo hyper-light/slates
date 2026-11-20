@@ -113,6 +113,7 @@ pub(crate) mod record;
 pub(crate) mod record_names;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
+pub(crate) mod svn_texts;
 pub(crate) mod svn_view;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
@@ -2437,6 +2438,10 @@ async fn recover_repository(
     .collect();
   for green in greens {
     paths::remake_green_sliced(state, green, slices).await;
+    // A Subversion green made again holds none of its head's texts (S4 c1): every one held again, in byte order.
+    if record.tool == VcsTool::Subversion {
+      svn_texts::rehold_head(state, record.id, green);
+    }
     slices.unit_done().await;
   }
   paths::whole_build::resume_owed(state, record.id);
