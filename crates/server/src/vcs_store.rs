@@ -181,6 +181,9 @@ pub(crate) struct VcsStores {
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
+  /// Each git green's whole map built in slices after a push, between its slices ([`paths::whole_build`], A-664's live
+  /// whole builds): one a green, so bounded by the partition's greens.
+  whole_builds: paths::whole_build::Builds,
   /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
   /// transaction name, with the key of the principal that made it and the monotonic instant of its last step: at most
   /// one a repository and principal, a new POST replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the
@@ -678,6 +681,7 @@ struct Unmade;
 /// given back to the content store, then the shard's charge trued up to what remains. A refusal while giving back is
 /// counted, and the rest is given back.
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
+  paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
   svn_import::abandon(state, id);

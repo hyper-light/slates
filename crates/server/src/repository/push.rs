@@ -746,7 +746,7 @@ fn push_planned(
   if applied.is_ok() {
     // Each green the entry moved keeps its version's map of paths to git's files (A-664 part 3, `vcs_store::paths`).
     for (green, version) in moved {
-      crate::vcs_store::paths::advance(state, green, version);
+      crate::vcs_store::paths::advance_after_push(state, green, version);
     }
   }
   applied

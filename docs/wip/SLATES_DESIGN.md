@@ -52488,7 +52488,8 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (BUILT 2026-11-20 through A-636 part 2c-2: a successor's
   rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
-  `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
+  `paths::remake_green_sliced`), a push's whole build sliced by a task with submits parked until it ends (BUILT
+  2026-11-20, `paths::whole_build`), a submit's own whole build and a whole map's release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name; its copies and symbolic links owed); Mercurial's manifests by the
   same rule.
@@ -54835,3 +54836,32 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   --test-threads=4` 43 of 43; `slates-ipc --test wire_order` 2 of 2; fmt clean.
 - **Owed.** The svn:// edge's own CRAM user and this name agreeing for one principal (the edge names its CRAM user;
   main's by-use check); copies and symbolic links (next pieces).
+
+### A-664 live whole builds, part 1 — A push's whole map built in slices after its answer, the submits that need it parked (2026-11-20, w-shared for UI goal 93; main's ruling (a))
+- **Why.** A push that leaves a git green with no map of the version before (its first push, one past a copy) built
+  the whole head's map and trees in the push's own step: every file hashed as git's blob, then the map and trees. A
+  large repository's first push was one step as long as that build, which the watchdog judges a stuck shard (CLAUDE.md
+  §3 "Bounded work everywhere"). A push carries its own commits, so its answer needs no map.
+- **Change.** `paths::advance_after_push`, from the push's apply: a step that would build whole (`needs_whole`, read over
+  the change alone) begins a build instead (`paths::whole_build::start`): a record of the head's paths kept in the
+  store, one a green, driven by a task of the shard a slice at a time (each slice puts files, one a unit, lent the room
+  each brings, until the shard's step budget is spent, then yields), whose end builds the map and trees of what was put
+  (`Plan::Put`) and keeps them as the green's head. A push to the green meanwhile starts it again at the new head. A
+  submit to the green while it runs is parked (`verbs::ParkedSubmit`: an owner's step asked from a work's shard, or the
+  verb on the green's shard), its request deferred as a waiting acceptance is, a retry joining its entry, bounded by the
+  shard's client credit and refused `Overloaded` past it; the build's end runs each again in its own transaction, in
+  order, and answers it on its route (`verbs::resume_all`). Freeing the repository gives the build's holds back and
+  runs its parked submits.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::commits::tests::t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer` (answered with no map
+  and the build under way; more slices than one; the pushed tree kept, built once) and
+  `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` (a recorded submit parked during the build, the green
+  still at the pushed version; at its end, run again: version 2, its commit made over the kept map). The push tests
+  drive a push's build to its end before reading the store (`whole_build::settle`). `cargo test --locked -p
+  slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities:: --test-threads=4`
+  143 of 143; fmt clean.
+- **Owed.** Part 2: a submit's own whole build (a green's first submit, one past a copy) with its made commit owed
+  durably in the submit's transaction (main's ruling: replay reads no clock, the completion settles the owed entry,
+  one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
+  restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
+  (main's).
