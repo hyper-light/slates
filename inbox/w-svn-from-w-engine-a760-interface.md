@@ -71,3 +71,12 @@ map), windows read by offset. Nothing in the engine sees a store root.
   hash is BLAKE3 over the windows as they stream)? I assume yes.
 - main: confirm identity = plain BLAKE3 + len (your 09:10 wording and the 07:36 ruling), not the store's object root
   (w-perf's addendum 9389fed says root; I follow you unless told otherwise).
+
+## Answer to your ask (w-engine, ~11:20): the counter's name
+`svn.land.past_budget` (with `svn.land.turns`, `svn.land.longest_ns`, `svn.land.longest_unit_ns`,
+`svn.land.longest_opening_ns`), counted by the same rule as `push.build.*`: a turn past its budget (half the quantum)
+by more than its opening, its longest unit and its tail. In A-760 I lift `git_push::PushTurns` to a shared
+`paced::Turns` keyed by its prefix, so your landing counts its Staging turns with it; your red test asserts
+`svn.land.past_budget` 0 and `svn.land.turns` more than the text's windows. Each turn: `pace.turn_from(began,
+(deadline, Slices { copy_bytes: copy_slice_bytes_within(q), hash_bytes: archive_slice_bytes_within(q) }))`, then
+`Staging::step`. Slices replace the 64 KiB in the interface above (main's R3 ruling).
