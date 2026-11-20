@@ -647,3 +647,66 @@ fn s4_c2_a_reader_makes_each_window_of_a_text_once_whatever_the_pieces() {
     "no cache: a window a piece"
   );
 }
+
+/// svnsync's replay over the records (main's order of 2026-11-20: git-2000.dump replayed at 0.54 s a revision; a
+/// sample of the replay found 60% of its time in LZ4 decompression, each delta window made again for every 1,024-byte
+/// piece a step read of it). Do: commit [`FILE`] with a 512 KiB text, edit a few bytes of it in each of 31 revisions so
+/// the youngest is kept as a chain of skip deltas, then replay the youngest revision with deltas as `svnsync` asks
+/// (`replay` low water mark 0, `send-deltas`), counting the delta windows the reads ask the records for
+/// ([`Repository::windows_made`]). Expect: the stream ends, and at most two windows for each of the two texts' drive
+/// windows were made (one, or two where a drive window straddles a delta window's end): each window a reader is in made
+/// once (A-772, held by w-perf's `WindowCache`, b51f908f2). Before it, each 1,024-byte piece made its window again.
+#[test]
+fn a_replay_makes_each_delta_window_a_bounded_number_of_times() {
+  use crate::report::drive::replay::{Replay, Stepped};
+  use crate::svndiff::WINDOW_LIMIT;
+  const LEN: usize = 512 * 1024;
+  let mut bytes: Vec<u8> = (0..LEN).map(|at| (at % 251) as u8).collect();
+  let mut repository = created();
+  let mut opening = first();
+  let (alpha, _) = content(b"alpha\n");
+  opening.contents.remove(&alpha);
+  let (identity, held) = content(&bytes);
+  opening.contents.insert(identity, held);
+  if let Some(file) = opening
+    .record
+    .changes
+    .iter_mut()
+    .find(|row| row.path == FILE)
+  {
+    file.text = Some(text_of(&bytes));
+  }
+  let checked = repository.check(opening).unwrap();
+  repository.apply(checked).unwrap();
+  for head in 1..32u64 {
+    let at = usize::try_from(head).unwrap() * 4_099 % LEN;
+    bytes[at] = bytes[at].wrapping_add(1);
+    let checked = repository.check(edit(head, &bytes, Vec::new())).unwrap();
+    repository.apply(checked).unwrap();
+  }
+  let identity = *blake3::hash(&bytes).as_bytes();
+  let chain = repository.text_chain(&identity).unwrap();
+  assert!(chain >= 5, "a chain of {chain}");
+  let youngest = repository.youngest();
+  let before = repository.windows_made();
+  let mut replay = Replay::new(youngest, "/", 0, true);
+  let mut steps = 0u64;
+  loop {
+    steps += 1;
+    assert!(steps < 1 << 24, "the replay never ended");
+    match replay
+      .next_within((repository.index(), &repository), None, 1)
+      .unwrap()
+    {
+      Stepped::Ended => break,
+      _ => {}
+    }
+  }
+  let made = repository.windows_made() - before;
+  let drive_windows = u64::try_from(LEN).unwrap().div_ceil(WINDOW_LIMIT);
+  let bound = 2 * 2 * drive_windows;
+  assert!(
+    made <= bound,
+    "{made} delta windows made replaying a {LEN}-byte text with a chain of {chain}; bound {bound}"
+  );
+}

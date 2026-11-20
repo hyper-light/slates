@@ -15663,3 +15663,25 @@ alone exhausts its budget.
   lately hold (`Step::Putting`). The same push then answered in 168,761 steps, fewer than before B2 (173,409); its time,
   9.44 s, was taken while the Studio built other work, so the steps are the comparison. Its longest step, 48 ms, is
   its last: the landing (the commit's whole passes, next).
+
+## svnsync's replay over the records: before and after the per-reader WindowCache (A-772; 2026-11-20)
+
+Why: w-interop's matrix r10 replayed git-2000.dump (git/git's newest 2,000 commits, 447 MiB) through `svnsync
+synchronize` at 0.54 s a revision, ~18 min. A sample of the drive alone (release, `sample`, this Mac) put 60% of it
+in LZ4 decompression: each records delta window was made again for every 1,024-byte piece a step read (`read_piece`).
+
+Command: `cargo run --release -p slates-svn --example replay_bench -- git-2000.dump` (the dump from
+`crates/cli/bench/git_to_svn_dump.py GIT_DIR master 2000`): import, then `replay` of r1..r2000 with deltas, low water
+mark 0, a step a call (`Replay::next_within(.., 1)`), as the server drives it. Mac Studio (M-series, 18 cores, macOS
+arm64), loaded (load average 55-73 from other agents' builds); runs interleaved.
+
+| Build | Replay r1..r2000 (s), 5 runs | Best | Mean a revision | Windows made |
+| --- | --- | --- | --- | --- |
+| main before the cache (2502607c4-era, a703) | 328.39 (1 run; 39.5 s CPU by `/usr/bin/time`) | 328.39 | 164 ms | not counted |
+| w-perf's WindowCache, 41608e8d7 (landed b51f908f2) | 2.52, 1.91, 3.25, 3.14, 1.82 | 1.82 | 0.91 ms | 30,488 |
+| the cache plus w-svn's owned run kept across a window's pieces | 1.97, 2.27, 7.82, 1.99, 1.78 | 1.78 | 0.89 ms | 30,488 |
+
+Measured and rejected: the owned-run change (dead even with the cache, the same windows made); the cache stays.
+Peak RSS of the bench (import + replay): 591-597 MB against the 447 MiB dump. The remaining gap to the matrix's
+0.54 s a revision is the server's per turn: ~960 steps a revision at one step a turn (the quantum, ~3.7 us, is under
+one step), measured next through the daemon's SSH site (`measure_svnsync_replay_range_over_the_tunnel`).
