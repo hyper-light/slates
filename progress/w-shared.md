@@ -1,5 +1,8 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: svn copy-from rows 8ac39d0c0 (main 3e1fba44c). Queue item 3 next: A-697 (a)-(f) then A-658 3c
+  (briefs/g305.md; progress/g305-merge-anywhere.md).
+
 ## LANDED 2026-11-20: typed copy refusals 9ddd1fbe9 (main c2de447a8). NOW: svn_made copy-from rows (plan above: pass the
   increment's Copy ops; dest rows Add/Replace with copy_from; beneath dest compared to source at version; add_parents with
   copies). Then A-697 (a)-(f), A-658 3c.
