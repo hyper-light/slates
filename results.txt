@@ -1,0 +1,28 @@
+host runnervmnfvap Linux aarch64, 4 CPUs, Fri Nov 20 17:55:58 UTC 2026, A 998f9089a (main + flow), B 41ed11f43 (pair reverted), backlog 20000, N 4
+== build a exit 0
+== build b exit 0
+== run 1 leg a exit 124 load 2.72, 4.52, 3.35
+   1a LD-CU backlog 20000 volumes e9ae3688a0cc21a00000000000000035 e9ae3688a0cc21a0000000000000004b by shard {"0": ["e9ae3688a0cc21a00000000000000035", "e9ae3688a0cc21a0000000000000004b"], "1": ["e9ae3688a0cc21a0000100000000001a"]}
+   1a LD-CU prefill 30000 writes, 0 refused
+   1a LD-CU quiet v2 n 3922 p50 655 us p99 1069 us max 63766 us
+   1a LD-CU ahead 20000 writes, 185879913 change bytes, in 18.96316137s with the holder stopped
+== run 2 leg b exit 124 load 1.13, 1.20, 1.76
+   2b LD-CU backlog 20000 volumes 4079a67c3e8bc08d0000000000000043 4079a67c3e8bc08d0000000000000059 by shard {"0": ["4079a67c3e8bc08d0000000000000043", "4079a67c3e8bc08d0000000000000059"], "1": ["4079a67c3e8bc08d0001000000000021"]}
+   2b LD-CU prefill 30000 writes, 0 refused
+   2b LD-CU quiet v2 n 6515 p50 372 us p99 1024 us max 90644 us
+   2b LD-CU ahead 20000 writes, 188049267 change bytes, in 21.146635143s with the holder stopped
+== run 3 leg b exit 124 load 1.23, 1.19, 1.36
+   3b LD-CU backlog 20000 volumes eab08da549d1a27d00000000000000b7 eab08da549d1a27d00000000000000cd by shard {"0": ["eab08da549d1a27d00000000000000b7", "eab08da549d1a27d00000000000000cd"], "1": ["eab08da549d1a27d000100000000005b"]}
+   3b LD-CU prefill 30000 writes, 0 refused
+   3b LD-CU quiet v2 n 6639 p50 364 us p99 1111 us max 145707 us
+   3b LD-CU ahead 20000 writes, 195880958 change bytes, in 20.371180592s with the holder stopped
+== run 4 leg a exit 124 load 1.09, 1.15, 1.24
+== run 5 leg a exit 124 load 1.21, 1.17, 1.18
+== run 6 leg b exit 124 load 1.30, 1.21, 1.19
+   6b LD-CU backlog 20000 volumes 8ca95cdf6ddbd80800000000000000bd 8ca95cdf6ddbd80800000000000000d3 by shard {"0": ["8ca95cdf6ddbd80800000000000000bd", "8ca95cdf6ddbd80800000000000000d3"], "1": ["8ca95cdf6ddbd808000100000000005e"]}
+   6b LD-CU prefill 30000 writes, 0 refused
+   6b LD-CU quiet v2 n 3796 p50 658 us p99 2518 us max 58193 us
+   6b LD-CU ahead 20000 writes, 184438254 change bytes, in 22.570073922s with the holder stopped
+== run 7 leg b exit 124 load 1.19, 1.20, 1.19
+== run 8 leg a exit 124 load 1.15, 1.14, 1.17
+== done Fri Nov 20 20:52:20 UTC 2026

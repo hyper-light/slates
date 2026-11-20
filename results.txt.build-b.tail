@@ -1,0 +1,40 @@
+warning: aws-lc-sys@0.45.0: Using flag: -ffile-prefix-map=/home/runner/work/slates/b/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Using assembler flag: -Wa,--debug-prefix-map=/home/runner/work/slates/b/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/g227-target/b/release/build/aws-lc-sys-427dd49efe2825e4/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/g227-target/b/release/build/aws-lc-sys-427dd49efe2825e4/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'neon_sha3_check.c' succeeded - Ok(["/home/runner/g227-target/b/release/build/aws-lc-sys-427dd49efe2825e4/out/out-neon_sha3_check/7dfda64fdf5a526c-neon_sha3_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/g227-target/b/release/build/aws-lc-sys-427dd49efe2825e4/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling rustls-webpki v0.103.15
+   Compiling slates-transport v0.1.0 (/home/runner/work/slates/b/crates/transport)
+   Compiling slates-base v0.1.0 (/home/runner/work/slates/b/crates/base)
+   Compiling slates-seal v0.1.0 (/home/runner/work/slates/b/crates/seal)
+   Compiling libbz2-rs-sys v0.2.6
+   Compiling slates-bridge-fuse v0.1.0 (/home/runner/work/slates/b/crates/bridge-fuse)
+   Compiling bzip2 v0.6.1
+   Compiling hyper-datagram v0.1.0 (/home/runner/work/slates/b/vendor/hyper-raft/hyper-datagram)
+   Compiling hyper-seal v0.1.0 (/home/runner/work/slates/b/vendor/hyper-raft/hyper-seal)
+   Compiling hyper-swim v0.1.0 (/home/runner/work/slates/b/vendor/hyper-raft/hyper-swim)
+   Compiling time-core v0.1.9
+   Compiling num-conv v0.2.2
+   Compiling powerfmt v0.2.0
+   Compiling deranged v0.5.8
+   Compiling slates-git v0.1.0 (/home/runner/work/slates/b/crates/git)
+   Compiling slates-cluster v0.1.0 (/home/runner/work/slates/b/crates/cluster)
+   Compiling time v0.3.55
+   Compiling slates-hg v0.1.0 (/home/runner/work/slates/b/crates/hg)
+   Compiling slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/b/crates/bridge-virtiofs)
+   Compiling slates-land v0.1.0 (/home/runner/work/slates/b/crates/land)
+   Compiling slates-client v0.1.0 (/home/runner/work/slates/b/crates/client)
+   Compiling slates-http-edge v0.1.0 (/home/runner/work/slates/b/crates/http-edge)
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/b/crates/bridge-nfs)
+   Compiling slates-ssh v0.1.0 (/home/runner/work/slates/b/crates/ssh)
+   Compiling slates-svn v0.1.0 (/home/runner/work/slates/b/crates/svn)
+   Compiling slates-bridge-oci v0.1.0 (/home/runner/work/slates/b/crates/bridge-oci)
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/b/crates/server)
+   Compiling yasna v0.5.2
+   Compiling rcgen v0.13.2
+   Compiling slates-mcp v0.1.0 (/home/runner/work/slates/b/crates/mcp)
+   Compiling slates-guest-probe v0.1.0 (/home/runner/work/slates/b/crates/guest-probe)
+   Compiling slates-api v0.1.0 (/home/runner/work/slates/b/crates/api)
+   Compiling slates-cli v0.1.0 (/home/runner/work/slates/b/crates/cli)
+    Finished `release` profile [optimized] target(s) in 8m 20s
