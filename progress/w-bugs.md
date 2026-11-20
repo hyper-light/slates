@@ -122,3 +122,9 @@
   ordinary FUSE mount's end (no FUSE_DESTROY) never sweeps the attachment's restored lookup references
   (end_attachment only ends the takeover holder; sweep_attachment only from FUSE_DESTROY). diag-w-bugs-b14-green-2:
   status at the end + the same without a takeover.
+- A-737 LANDED main 2a80ea399: Windows' own upcase table (973 units), Windows check passes on both arches.
+- B14 = REAL BUG, shown by use (diag-w-bugs-b14-green-2, CI ubuntu kernel 7.0): a file unlinked while open on a FUSE
+  mount that then ends by lazy unmount + last close stays referenced forever (status: attachments 0, no takeover_kept,
+  referenced_bytes 1,048,576), WITH OR WITHOUT a takeover. Cause: nothing sweeps a FUSE attachment's references at an
+  ordinary end (no FUSE_DESTROY; only virtio-fs/NFSv4 call sweep_attachment); end_attachment only ends the takeover
+  holder. Fix: end_attachment sweeps RefOwner::Attachment(record.id) (sweep_attachment ends the holder too).
