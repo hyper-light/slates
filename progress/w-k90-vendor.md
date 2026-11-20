@@ -87,3 +87,10 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
     fetch::written does; v0 likewise; servers pass the quantum. Oracle: every upload test's bytes unchanged; a test
     serving with the quantum spent after every unit == whole. Then P3 (server: request room per slice; red by use).
     Also owed: begin's ready/cut walks and include-tag's scan in units.
+ P2b part 2 LANDED slates main cf4e9b70..9ebcfbf8: upload::serve_in_turns + Answer::write_within (Choosing state;
+    abandon -> band-3 ABORT appended to head); serve/write unchanged; upload tests' answer_of answers every exchange
+    both ways, same bytes/refusal. Main's lint round boxed Begun::Selecting (9bb1558c2): adapted.
+ NEXT P3 (server): HTTP vcs_http/git/upload.rs Upload and SSH vcs_ssh/git.rs UploadCommand call serve_in_turns and
+    write_within with their quantum (they already step write per turn); admission = the request's room (revert A-713's
+    StoreLender::room); red BY USE first: daemon_edge clone of a long history whose pack is past one request's room,
+    over HTTP and over SSH. Owed after: v0 in turns, begin's ready/cut + include-tag scan in units, rule 4 generation.
