@@ -23,6 +23,12 @@ use crate::object_name::{Kind, ObjectFormat, ObjectId};
 
 use super::naming::kind_of;
 
+/// Format: the bytes of an object row's payload but a commit's part: its type and two words (A-722's room).
+pub const OBJECT_PAYLOAD_BYTES: usize = 1 + 2 * WORD_BYTES;
+
+/// Format: the bytes of a commit's part but its parents: three words and the parents' count.
+pub const COMMIT_PART_BYTES: usize = 3 * WORD_BYTES + COUNT_BYTES;
+
 /// Format: the first byte of an object row's key, which the object's id follows.
 pub const OBJECT_KEY: u8 = b'o';
 

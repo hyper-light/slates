@@ -115,28 +115,17 @@ fn map(len: usize) -> *mut u8 {
   block
 }
 
-/// Unmaps the block [`map`] made for `len` bytes, counted.
-///
-/// # Safety
-/// `block` is a mapping [`map`] returned for `len` bytes, not yet unmapped.
-unsafe fn unmap(block: *mut u8, len: usize) {
-  let Some(span) = rounded(len) else {
-    return;
-  };
-  // SAFETY: the caller's promise: `block` is `map`'s mapping of `span` bytes, unmapped once.
-  unsafe { os::unmap(block, span) };
-  UNMAPPED.fetch_add(1, Ordering::Relaxed);
-  RETURNED_BYTES.fetch_add(u64::try_from(span).unwrap_or(u64::MAX), Ordering::Relaxed);
-}
-
 /// The global allocator (module docs, "What it does").
 #[derive(Debug, Default)]
 pub struct LargeMapped;
 
-// SAFETY: a mapped block is a fresh, page-aligned, zeroed mapping of at least the layout's size, which no other block
-// overlaps, and is unmapped only by the free of the same layout, which takes the same path (the layout decides it); a
-// block below the floor is the system allocator's throughout, which upholds `GlobalAlloc` itself.
+// A mapped block is a fresh, page-aligned, zeroed mapping of at least the layout's size, which no other block overlaps,
+// and is unmapped only by the free of the same layout, which takes the same path (the layout decides it); a block below
+// the floor is the system allocator's throughout, which upholds `GlobalAlloc` itself. The type holds no state and no
+// lock: it is `Sync` as a unit struct, and its counters are atomics.
+// SAFETY: each block is allocated and freed by one path, chosen by its layout alone, and each path upholds the trait.
 unsafe impl GlobalAlloc for LargeMapped {
+  // SAFETY: unsafe by `GlobalAlloc`'s signature; a mapped block meets the layout (page-aligned, at least its size).
   unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
     if mapped(layout) {
       return map(layout.size());
@@ -145,6 +134,7 @@ unsafe impl GlobalAlloc for LargeMapped {
     unsafe { System.alloc(layout) }
   }
 
+  // SAFETY: unsafe by `GlobalAlloc`'s signature; a fresh anonymous mapping is zeroed.
   unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
     if mapped(layout) {
       // A fresh anonymous mapping is zeroed already.
@@ -154,16 +144,24 @@ unsafe impl GlobalAlloc for LargeMapped {
     unsafe { System.alloc_zeroed(layout) }
   }
 
+  // SAFETY: unsafe by `GlobalAlloc`'s signature; the caller frees with the layout it allocated with, so the path agrees.
   unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
     if mapped(layout) {
-      // SAFETY: the layout took the mapped path when `ptr` was allocated (it decides the path), so `ptr` is `map`'s.
-      unsafe { unmap(ptr, layout.size()) };
+      let Some(span) = rounded(layout.size()) else {
+        return;
+      };
+      // The layout took the mapped path when `ptr` was allocated (it decides the path).
+      // SAFETY: so `ptr` is `map`'s mapping of `span` bytes, and the caller frees it once.
+      unsafe { os::unmap(ptr, span) };
+      UNMAPPED.fetch_add(1, Ordering::Relaxed);
+      RETURNED_BYTES.fetch_add(u64::try_from(span).unwrap_or(u64::MAX), Ordering::Relaxed);
       return;
     }
     // SAFETY: the system allocator's block, with the layout it was allocated with.
     unsafe { System.dealloc(ptr, layout) }
   }
 
+  // SAFETY: unsafe by `GlobalAlloc`'s signature; a block that changes path is moved, never handed to the other path.
   unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
     let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
       return std::ptr::null_mut();
@@ -173,8 +171,8 @@ unsafe impl GlobalAlloc for LargeMapped {
       (false, false) => unsafe { System.realloc(ptr, layout, new_size) },
       (true, true) if rounded(layout.size()) == rounded(new_size) => ptr,
       _ => {
-        // SAFETY: a new block by its own path, the bytes both hold copied (the blocks are distinct), then the old
-        // block freed by its own path.
+        // A new block by its own path, the bytes both hold copied, then the old block freed by its own path.
+        // SAFETY: the two blocks are distinct live allocations, each at least `min(len)` long, freed once.
         unsafe {
           let moved = self.alloc(new_layout);
           if !moved.is_null() {
@@ -213,8 +211,10 @@ mod os {
   ///
   /// # Safety
   /// `block` is a mapping [`map`] made of `span` bytes.
+  // SAFETY: unsafe by contract (`# Safety` above): `munmap` of a range still in use would free it under its user.
   pub(super) unsafe fn unmap(block: *mut u8, span: usize) {
-    // SAFETY: the caller's promise. A refusal (impossible for a whole mapping) leaves the pages mapped, never freed twice.
+    // A refusal (impossible for a whole mapping) leaves the pages mapped, never freed twice.
+    // SAFETY: the caller's promise: `block` is `map`'s mapping of `span` bytes, unmapped once.
     let _ = unsafe { rustix::mm::munmap(block.cast(), span) };
   }
 }
@@ -252,6 +252,7 @@ mod os {
   ///
   /// # Safety
   /// `block` is a range [`map`] made.
+  // SAFETY: unsafe by contract (`# Safety` above): releasing a range still in use would free it under its user.
   pub(super) unsafe fn unmap(block: *mut u8, _span: usize) {
     // SAFETY: the caller's promise; a release takes the whole reservation by its base and a size of 0.
     let _ = unsafe { VirtualFree(block.cast(), 0, MEM_RELEASE) };
@@ -274,7 +275,7 @@ mod tests {
     let floor = floor();
     let before = stats();
     let layout = Layout::from_size_align(floor, 8).unwrap();
-    // SAFETY (test): the layouts are valid and each block is freed once, by the layout it was last given.
+    // SAFETY: (test) the layouts are valid and each block is freed once, by the layout it was last given.
     unsafe {
       let block = allocator.alloc(layout);
       assert!(!block.is_null());
@@ -310,13 +311,27 @@ mod tests {
     );
   }
 
+  /// A-742 (main's ruling: the allocator holds no lock). Do: require `Sync` and `Send` of the allocator at compile time.
+  /// Expect: it builds. The allocator is a unit struct whose only shared state is the module's atomics, so no `Mutex`,
+  /// `RwLock` or other lock can be in it (the lint wall denies them besides).
+  #[test]
+  fn the_allocator_is_shared_without_a_lock() {
+    fn shared<T: Sync + Send + 'static>(_: &T) {}
+    shared(&LargeMapped);
+    assert_eq!(
+      size_of::<LargeMapped>(),
+      0,
+      "a unit struct: no state to lock"
+    );
+  }
+
   /// A-742. Do: allocate zeroed blocks above and below the floor. Expect: both read zero.
   #[test]
   fn zeroed_blocks_read_zero_on_both_paths() {
     let allocator = LargeMapped;
     for size in [64, floor(), floor() + 1] {
       let layout = Layout::from_size_align(size, 8).unwrap();
-      // SAFETY (test): a valid layout, freed once.
+      // SAFETY: (test) a valid layout, freed once.
       unsafe {
         let block = allocator.alloc_zeroed(layout);
         assert!(
