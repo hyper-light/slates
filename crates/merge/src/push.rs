@@ -48,12 +48,16 @@
 //! as it is made, a file's length before its bytes are read, so a push past it is refused before it is held, and a
 //! store whose trees nested without end is refused at the room.
 
+use core::future::Future;
+use core::ops::Bound;
+use core::task::Poll;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::{Green, Increment};
-use crate::increment::{DeriveError, PostStatePlan, VolumeOp, compose_volume_planned};
+use crate::increment::{Base, DeriveError, PostStatePlan, VolumeOp};
 use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::pace::{Pace, Ticks};
 use crate::special::{SpecialKind, SpecialNode};
 
 /// Format: the reserved attribute a green's root holds the branch's head in (§4.17.1 "A push is a work", item 3).
@@ -277,53 +281,25 @@ pub struct Built {
 }
 
 /// Builds `push`'s work against `green`, reading its objects from `objects`, within `room` bytes (module docs): the
-/// increment to submit, and what the walk read; or the refusal.
+/// increment to submit, and what the walk read; or the refusal. [`Building`] run to its end in one call.
 pub fn build<O: PushObjects>(
   push: &Push<'_>,
   green: &Green,
   objects: &O,
   room: u64,
 ) -> Result<Built, PushRefused> {
-  if push.base_version > green.head() {
-    return Err(PushRefused::UnknownBase {
-      base: push.base_version,
-      head: green.head(),
-    });
+  let mut building = Building::new(push, room, Pace::unbounded());
+  loop {
+    if let Some(built) = building.advance(green, objects) {
+      return built;
+    }
   }
-  let mut walk = Walk {
-    objects,
-    journal: Vec::new(),
-    contents: BTreeMap::new(),
-    nodes: BTreeMap::new(),
-    reads: Reads::default(),
-    held: 0,
-    room,
-    stack: Vec::new(),
-  };
-  if push.base_tree == Some(push.tree) {
-    walk.reads.skipped = 1;
-  } else {
-    walk.queue(Step::Compare {
-      path: ROOT.to_owned(),
-      base: push.base_tree,
-      pushed: Some(push.tree),
-    })?;
-  }
-  while let Some(step) = walk.stack.pop() {
-    walk.step(step)?;
-  }
-  if let Some(head) = push.head {
-    walk.emit(VolumeOp::SetXattr {
-      path: ROOT.to_owned(),
-      name: HEAD_ATTRIBUTE.to_owned(),
-      value: head.to_vec(),
-    })?;
-  }
-  walk.seal(push, green)
 }
 
 /// The identity of a push's work: the push's name and base, then the document and the post-state, under a context of
-/// its own (§4.16 data model, as `compose_increment` names a work volume's).
+/// its own (§4.16 data model, as `compose_increment` names a work volume's). What [`Building`] hashes a piece a unit:
+/// the tests' oracle of it.
+#[cfg(test)]
 pub(crate) fn identity(name: &[u8; 32], base: u64, doc: &OpsDoc, post_state: &[u8]) -> [u8; 32] {
   let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_CONTEXT);
   hasher.update(name);
@@ -331,6 +307,322 @@ pub(crate) fn identity(name: &[u8; 32], base: u64, doc: &OpsDoc, post_state: &[u
   hasher.update(&doc.encode());
   hasher.update(post_state);
   *hasher.finalize().as_bytes()
+}
+
+/// The bytes of a unit that copies, fills or hashes: 64 KiB.
+const UNIT_BYTES: usize = 64 * 1024;
+
+/// A push's work built a unit at a time (A-752; §4.3's step budget; the module's [`build`] in turns): the walk an entry
+/// of a tree a unit, the base a named path a unit, the deriver's composition under the same pace
+/// ([`crate::increment::compose_paced`]), the post-state an operation or 64 KiB a unit, and the identity a piece of the
+/// document or 64 KiB a unit. It owns what it has made, and borrows the green and the objects only for a turn
+/// ([`Building::advance`]), so a push's decision spans as many turns as its work needs and no turn runs past its pace.
+///
+/// The green may move between two turns: each named path's base is read at the push's base version, which no later
+/// version changes ([`Green::base_entries`]), and the append commits the work only at the position its verdict read.
+///
+/// Units that are still one object's size, owed and named: a tree's listing ([`PushObjects::tree`] gives a whole tree)
+/// and a blob's bytes ([`PushObjects::blob`] gives a whole blob, laid in one unit), the green's hard links (none in a
+/// git or Mercurial green) and a copy's tree (a push makes none).
+pub struct Building {
+  /// The push.
+  push: OwnedPush,
+  /// The room.
+  room: u64,
+  /// The pace each turn runs under.
+  pace: Pace,
+  /// Where the build is.
+  stage: Stage,
+}
+
+/// A [`Push`] owned across turns.
+struct OwnedPush {
+  name: [u8; 32],
+  base_version: u64,
+  base_tree: Option<ObjectKey>,
+  tree: ObjectKey,
+  head: Option<Vec<u8>>,
+}
+
+/// The deriver's composition in progress, owning its base and journal.
+type Composing =
+  core::pin::Pin<Box<dyn Future<Output = Result<(OpsDoc, PostStatePlan), DeriveError>> + Send>>;
+
+/// Where a [`Building`] is.
+enum Stage {
+  /// Not begun.
+  Begin,
+  /// Walking the trees.
+  Walk(Walk),
+  /// Naming the paths the journal names, an operation a unit.
+  Named {
+    walk: Walk,
+    at: usize,
+    named: BTreeSet<String>,
+  },
+  /// Reading each named path's base entries, a path a unit.
+  Entries {
+    walk: Walk,
+    named: BTreeSet<String>,
+    after: Option<String>,
+    base: Base,
+  },
+  /// Bringing each copy's tree, a copy a unit.
+  Copies { walk: Walk, at: usize, base: Base },
+  /// Composing.
+  Compose { walk: Walk, work: Composing },
+  /// Laying the post-state.
+  Post(Box<Posting>),
+  /// Hashing the identity.
+  Identity(Box<Hashing>),
+  /// Answered.
+  Done,
+}
+
+impl Building {
+  /// A build of `push` within `room` bytes, each turn under `pace`.
+  pub fn new(push: &Push<'_>, room: u64, pace: Pace) -> Building {
+    Building {
+      push: OwnedPush {
+        name: push.name,
+        base_version: push.base_version,
+        base_tree: push.base_tree,
+        tree: push.tree,
+        head: push.head.map(<[u8]>::to_vec),
+      },
+      room,
+      pace,
+      stage: Stage::Begin,
+    }
+  }
+
+  /// The pace its turns run under: its owner begins each turn on it ([`Pace::turn`]).
+  pub fn pace(&self) -> &Pace {
+    &self.pace
+  }
+
+  /// Whether it is `push`'s build: the same name, base, trees and head.
+  pub fn is_of(&self, push: &Push<'_>) -> bool {
+    let own = &self.push;
+    own.name == push.name
+      && own.base_version == push.base_version
+      && own.base_tree == push.base_tree
+      && own.tree == push.tree
+      && own.head.as_deref() == push.head
+  }
+
+  /// One turn over `green` and `objects`: units while the pace grants them. The work or the refusal once the build is
+  /// done; none while units remain, for the next turn.
+  pub fn advance<O: PushObjects>(
+    &mut self,
+    green: &Green,
+    objects: &O,
+  ) -> Option<Result<Built, PushRefused>> {
+    loop {
+      // The composition asks the pace itself, a unit at each of its own ticks; every other stage asks before a unit.
+      // So a turn whose budget is shorter than one unit still runs one unit of the composition (its first tick takes
+      // the turn's first unit), and the build always moves.
+      let composing = matches!(self.stage, Stage::Compose { .. });
+      if !composing && !self.pace.more() {
+        return None;
+      }
+      match self.unit(green, objects) {
+        Ok(None) => {}
+        Ok(Some(built)) => {
+          self.stage = Stage::Done;
+          return Some(Ok(built));
+        }
+        Err(refused) => {
+          self.stage = Stage::Done;
+          return Some(Err(refused));
+        }
+      }
+      // A composition still pending spent the turn: it asked for a unit past the deadline and was refused. Asking
+      // again would time the drive between the two asks as no unit's.
+      if composing && matches!(self.stage, Stage::Compose { .. }) {
+        return None;
+      }
+    }
+  }
+
+  /// One unit: the work once done.
+  fn unit<O: PushObjects>(
+    &mut self,
+    green: &Green,
+    objects: &O,
+  ) -> Result<Option<Built>, PushRefused> {
+    let stage = core::mem::replace(&mut self.stage, Stage::Done);
+    self.stage = match stage {
+      Stage::Begin => self.begin(green)?,
+      Stage::Walk(walk) => self.walked(walk, objects)?,
+      Stage::Named { walk, at, named } => named_unit(walk, at, named),
+      Stage::Entries {
+        walk,
+        named,
+        after,
+        base,
+      } => self.entries_unit(green, walk, (named, after), base),
+      Stage::Copies { walk, at, base } => self.copies_unit(green, walk, at, base),
+      Stage::Compose { walk, work } => self.compose_unit(walk, work)?,
+      Stage::Post(mut posting) => match posting.unit(objects, self.push.head.as_deref())? {
+        None => Stage::Post(posting),
+        Some((doc, post_state, reads)) => Stage::Identity(Box::new(Hashing::new(
+          (&self.push.name, self.push.base_version),
+          doc,
+          post_state,
+          reads,
+        ))),
+      },
+      Stage::Identity(mut hashing) => {
+        if hashing.unit() {
+          return Ok(Some(hashing.built(self.push.base_version)));
+        }
+        Stage::Identity(hashing)
+      }
+      Stage::Done => Stage::Done,
+    };
+    Ok(None)
+  }
+
+  /// A unit of the base: the next named path's entries; past the last, the hard links, and the copies begun.
+  fn entries_unit(
+    &self,
+    green: &Green,
+    walk: Walk,
+    (named, after): (BTreeSet<String>, Option<String>),
+    mut base: Base,
+  ) -> Stage {
+    let next = match &after {
+      None => named.iter().next(),
+      Some(after) => named
+        .range::<str, _>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+        .next(),
+    };
+    let Some(path) = next else {
+      base.hardlinks = green.base_links(self.push.base_version, |path| named.contains(path));
+      return Stage::Copies { walk, at: 0, base };
+    };
+    green.base_entries(self.push.base_version, path, &mut base);
+    let after = Some(path.clone());
+    Stage::Entries {
+      walk,
+      named,
+      after,
+      base,
+    }
+  }
+
+  /// A unit of the copies: the next operation's, where it is a copy; past the last, the composition begun.
+  fn copies_unit(&self, green: &Green, walk: Walk, at: usize, mut base: Base) -> Stage {
+    let Some(op) = walk.journal.get(at) else {
+      return self.composing(walk, base);
+    };
+    if let VolumeOp::Copy {
+      from, to, version, ..
+    } = op
+    {
+      green.base_copied((from, to, *version), &mut base);
+    }
+    Stage::Copies {
+      walk,
+      at: at.saturating_add(1),
+      base,
+    }
+  }
+
+  /// A turn of the composition, driven under the build's pace; once composed, the post-state begun.
+  fn compose_unit(&self, walk: Walk, mut work: Composing) -> Result<Stage, PushRefused> {
+    match self.pace.drive(work.as_mut()) {
+      Poll::Pending => Ok(Stage::Compose { walk, work }),
+      Poll::Ready(composed) => {
+        let (doc, plan) = composed.map_err(PushRefused::Compose)?;
+        Ok(Stage::Post(Box::new(Posting::new(walk, doc, plan))))
+      }
+    }
+  }
+
+  /// The first unit: the base checked against the green, and the walk begun.
+  fn begin(&self, green: &Green) -> Result<Stage, PushRefused> {
+    if self.push.base_version > green.head() {
+      return Err(PushRefused::UnknownBase {
+        base: self.push.base_version,
+        head: green.head(),
+      });
+    }
+    let mut walk = Walk {
+      journal: Vec::new(),
+      contents: BTreeMap::new(),
+      nodes: BTreeMap::new(),
+      reads: Reads::default(),
+      held: 0,
+      room: self.room,
+      stack: Vec::new(),
+      comparing: None,
+    };
+    if self.push.base_tree == Some(self.push.tree) {
+      walk.reads.skipped = 1;
+    } else {
+      walk.queue(Step::Compare {
+        path: ROOT.to_owned(),
+        base: self.push.base_tree,
+        pushed: Some(self.push.tree),
+      })?;
+    }
+    Ok(Stage::Walk(walk))
+  }
+
+  /// A unit of the walk; once it is done, the head's operation and the naming begun.
+  fn walked<O: PushObjects>(&self, walk: Walk, objects: &O) -> Result<Stage, PushRefused> {
+    let mut walker = Walker { objects, walk };
+    if walker.unit()? {
+      return Ok(Stage::Walk(walker.walk));
+    }
+    let mut walk = walker.walk;
+    if let Some(head) = &self.push.head {
+      walk.emit(VolumeOp::SetXattr {
+        path: ROOT.to_owned(),
+        name: HEAD_ATTRIBUTE.to_owned(),
+        value: head.clone(),
+      })?;
+    }
+    Ok(Stage::Named {
+      walk,
+      at: 0,
+      named: BTreeSet::new(),
+    })
+  }
+
+  /// The composition begun over the base and the journal, which it takes.
+  fn composing(&self, mut walk: Walk, base: Base) -> Stage {
+    let journal = core::mem::take(&mut walk.journal);
+    let work: Composing = Box::pin(async move {
+      let (base, journal) = (base, journal);
+      crate::increment::compose_paced(&base, &journal, &Ticks).await
+    });
+    Stage::Compose { walk, work }
+  }
+}
+
+/// A unit of the naming: the next operation's names; past the last, the base begun.
+fn named_unit(walk: Walk, at: usize, mut named: BTreeSet<String>) -> Stage {
+  let Some(op) = walk.journal.get(at) else {
+    return Stage::Entries {
+      walk,
+      named,
+      after: None,
+      base: Base::of_files(Vec::new()),
+    };
+  };
+  for name in op.names().into_iter().flatten() {
+    if !named.contains(name) {
+      named.insert(name.to_owned());
+    }
+  }
+  Stage::Named {
+    walk,
+    at: at.saturating_add(1),
+    named,
+  }
 }
 
 /// One step of the walk.
@@ -359,10 +651,41 @@ impl Step {
   }
 }
 
-/// A walk in progress: what it has made and read, and what is left.
-struct Walk<'o, O> {
-  /// The objects.
-  objects: &'o O,
+/// The trees at one path being compared, an entry a unit: the base's listing named, then the push's, then each name.
+struct Comparing {
+  /// The directory's path.
+  path: String,
+  /// The base's tree there.
+  base: Option<ObjectKey>,
+  /// The push's tree there.
+  pushed: Option<ObjectKey>,
+  /// Where the comparison is.
+  side: Side,
+  /// The listing being named.
+  listed: std::vec::IntoIter<TreeEntry>,
+  /// The base's entries by name.
+  based: BTreeMap<String, (EntryKind, ObjectKey)>,
+  /// The push's entries by name.
+  given: BTreeMap<String, (EntryKind, ObjectKey)>,
+}
+
+/// Where a [`Comparing`] is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+  /// The base's tree to read.
+  ReadBase,
+  /// The base's listing being named.
+  NameBase,
+  /// The push's tree to read.
+  ReadPushed,
+  /// The push's listing being named.
+  NamePushed,
+  /// Each name compared.
+  Entries,
+}
+
+/// A walk in progress: what it has made and read, and what is left, owned across turns.
+struct Walk {
   /// The operations made so far.
   journal: Vec<VolumeOp>,
   /// Each added or changed file's blob and its length, by path: the bytes the post-state takes.
@@ -377,9 +700,11 @@ struct Walk<'o, O> {
   room: u64,
   /// The steps left, the next on top.
   stack: Vec<Step>,
+  /// The trees being compared, before the next step.
+  comparing: Option<Comparing>,
 }
 
-impl<O: PushObjects> Walk<'_, O> {
+impl Walk {
   /// Charges `bytes` against the room.
   fn charge(&mut self, bytes: u64) -> Result<(), PushRefused> {
     self.held = self.held.saturating_add(bytes);
@@ -405,43 +730,120 @@ impl<O: PushObjects> Walk<'_, O> {
     self.stack.push(step);
     Ok(())
   }
+}
 
-  /// Takes one step.
-  fn step(&mut self, step: Step) -> Result<(), PushRefused> {
-    match step {
-      Step::Rmdir(path) => self.emit(VolumeOp::Rmdir { path }),
-      Step::Compare { path, base, pushed } => self.compare(&path, base, pushed),
+/// A walk lent the objects for a turn.
+struct Walker<'o, O> {
+  /// The objects.
+  objects: &'o O,
+  /// The walk.
+  walk: Walk,
+}
+
+impl<O> core::ops::Deref for Walker<'_, O> {
+  type Target = Walk;
+
+  fn deref(&self) -> &Walk {
+    &self.walk
+  }
+}
+
+impl<O> core::ops::DerefMut for Walker<'_, O> {
+  fn deref_mut(&mut self) -> &mut Walk {
+    &mut self.walk
+  }
+}
+
+impl<O: PushObjects> Walker<'_, O> {
+  /// One unit of the walk: an entry of the trees being compared, or the next step. Whether units remain.
+  fn unit(&mut self) -> Result<bool, PushRefused> {
+    if let Some(mut comparing) = self.walk.comparing.take() {
+      if self.compare_unit(&mut comparing)? {
+        self.walk.comparing = Some(comparing);
+      }
+      return Ok(true);
     }
+    match self.walk.stack.pop() {
+      Some(Step::Rmdir(path)) => self.emit(VolumeOp::Rmdir { path })?,
+      Some(Step::Compare { path, base, pushed }) => {
+        self.walk.comparing = Some(Comparing {
+          path,
+          base,
+          pushed,
+          side: Side::ReadBase,
+          listed: Vec::new().into_iter(),
+          based: BTreeMap::new(),
+          given: BTreeMap::new(),
+        });
+      }
+      None => return Ok(false),
+    }
+    Ok(true)
   }
 
-  /// Compares the trees at `path` entry by entry, by name.
-  fn compare(
-    &mut self,
-    path: &str,
-    base: Option<ObjectKey>,
-    pushed: Option<ObjectKey>,
-  ) -> Result<(), PushRefused> {
-    let based = self.entries(path, base)?;
-    let mut given = self.entries(path, pushed)?;
-    for (name, was) in based {
-      let now = given.remove(&name);
-      self.entry(joined(path, &name), Some(was), now)?;
+  /// One unit of a comparison, entry by entry by name: whether units of it remain.
+  fn compare_unit(&mut self, comparing: &mut Comparing) -> Result<bool, PushRefused> {
+    match comparing.side {
+      Side::ReadBase => {
+        comparing.listed = self.listing(&comparing.path, comparing.base)?;
+        comparing.side = Side::NameBase;
+      }
+      Side::ReadPushed => {
+        comparing.listed = self.listing(&comparing.path, comparing.pushed)?;
+        comparing.side = Side::NamePushed;
+      }
+      Side::NameBase | Side::NamePushed => {
+        let base_side = comparing.side == Side::NameBase;
+        match comparing.listed.next() {
+          Some(TreeEntry {
+            name,
+            kind,
+            id: named,
+          }) => {
+            let name = held_name(&comparing.path, name)?;
+            let entries = if base_side {
+              &mut comparing.based
+            } else {
+              &mut comparing.given
+            };
+            if entries.contains_key(&name) {
+              return Err(PushRefused::DuplicateName {
+                path: joined(&comparing.path, &name),
+              });
+            }
+            entries.insert(name, (kind, named));
+          }
+          None => {
+            comparing.side = if base_side {
+              Side::ReadPushed
+            } else {
+              Side::Entries
+            };
+          }
+        }
+      }
+      Side::Entries => {
+        if let Some((name, was)) = comparing.based.pop_first() {
+          let now = comparing.given.remove(&name);
+          self.entry(joined(&comparing.path, &name), Some(was), now)?;
+        } else if let Some((name, now)) = comparing.given.pop_first() {
+          self.entry(joined(&comparing.path, &name), None, Some(now))?;
+        } else {
+          return Ok(false);
+        }
+      }
     }
-    for (name, now) in given {
-      self.entry(joined(path, &name), None, Some(now))?;
-    }
-    Ok(())
+    Ok(true)
   }
 
-  /// The entries of the tree `id` at `path` by name, each name checked; none for no tree.
-  fn entries(
+  /// The listing of the tree `id` at `path`, read whole (one unit, owed: [`Building`]); none for no tree.
+  fn listing(
     &mut self,
     path: &str,
     id: Option<ObjectKey>,
-  ) -> Result<BTreeMap<String, (EntryKind, ObjectKey)>, PushRefused> {
-    let mut entries = BTreeMap::new();
+  ) -> Result<std::vec::IntoIter<TreeEntry>, PushRefused> {
     let Some(id) = id else {
-      return Ok(entries);
+      return Ok(Vec::new().into_iter());
     };
     self.reads.trees = self.reads.trees.saturating_add(1);
     let listed = self.objects.tree(id).map_err(|why| PushRefused::Object {
@@ -449,21 +851,7 @@ impl<O: PushObjects> Walk<'_, O> {
       id,
       why,
     })?;
-    for TreeEntry {
-      name,
-      kind,
-      id: named,
-    } in listed
-    {
-      let name = held_name(path, name)?;
-      if entries.contains_key(&name) {
-        return Err(PushRefused::DuplicateName {
-          path: joined(path, &name),
-        });
-      }
-      entries.insert(name, (kind, named));
-    }
-    Ok(entries)
+    Ok(listed.into_iter())
   }
 
   /// The operations for one path: what the base held there and what the push holds.
@@ -647,90 +1035,214 @@ impl<O: PushObjects> Walk<'_, O> {
         path: path.to_owned(),
       })
   }
+}
 
-  /// Composes the journal against the green's base and lays its post-state out: the work.
-  fn seal(mut self, push: &Push<'_>, green: &Green) -> Result<Built, PushRefused> {
-    let base = green.base_for(push.base_version, &self.journal);
-    let (doc, plan) = compose_volume_planned(&base, &self.journal).map_err(PushRefused::Compose)?;
-    let post_state = self.post_state(&doc, &plan, push.head.unwrap_or_default())?;
-    let id = identity(&push.name, push.base_version, &doc, &post_state);
-    Ok(Built {
+/// The post-state being laid, a unit an operation or 64 KiB of zeros.
+struct Posting {
+  /// The document.
+  doc: OpsDoc,
+  /// Where each run comes from.
+  plan: PostStatePlan,
+  /// The walk's files, links and reads.
+  walk: Walk,
+  /// The post-state so far.
+  post: Vec<u8>,
+  /// Its length once laid; none until the operations have been read for it.
+  size: Option<usize>,
+  /// The end found so far.
+  end: u64,
+  /// The next operation.
+  at: usize,
+}
+
+impl Posting {
+  /// The post-state of `doc` to lay, as `plan` places its runs, from the walk's files.
+  fn new(walk: Walk, doc: OpsDoc, plan: PostStatePlan) -> Posting {
+    Posting {
+      doc,
+      plan,
+      walk,
+      post: Vec::new(),
+      size: None,
+      end: 0,
+      at: 0,
+    }
+  }
+
+  /// One unit: the length found an operation a unit, the post-state zeroed 64 KiB a unit, then each operation's run
+  /// laid. The document, the post-state and the reads once laid. Its length was charged as the walk made the runs.
+  fn unit<O: PushObjects>(
+    &mut self,
+    objects: &O,
+    head: Option<&[u8]>,
+  ) -> Result<Option<(OpsDoc, Vec<u8>, Reads)>, PushRefused> {
+    let Some(size) = self.size else {
+      match self.doc.ops.get(self.at) {
+        Some(op) => {
+          if op.src != u64::MAX && adds_bytes(op.kind) {
+            self.end = self.end.max(op.src.saturating_add(op.len));
+          }
+          self.at = self.at.saturating_add(1);
+        }
+        None => {
+          let size = usize::try_from(self.end).map_err(|_| PushRefused::PastRoom {
+            asked: self.end,
+            room: self.walk.room,
+          })?;
+          self.size = Some(size);
+          self.post = Vec::new();
+          self
+            .post
+            .try_reserve_exact(size)
+            .map_err(|_| PushRefused::PastRoom {
+              asked: self.end,
+              room: self.walk.room,
+            })?;
+          self.at = 0;
+        }
+      }
+      return Ok(None);
+    };
+    if self.post.len() < size {
+      let to = size.min(self.post.len().saturating_add(UNIT_BYTES));
+      self.post.resize(to, 0);
+      return Ok(None);
+    }
+    let Some(op) = self.doc.ops.get(self.at).copied() else {
+      let doc = core::mem::take(&mut self.doc);
+      let post = core::mem::take(&mut self.post);
+      return Ok(Some((doc, post, self.walk.reads)));
+    };
+    self.at = self.at.saturating_add(1);
+    if op.src == u64::MAX {
+      return Ok(None);
+    }
+    let Some(path) = self.doc.paths.path(op.path) else {
+      return Ok(None);
+    };
+    let (source, from) = match op.kind {
+      OpKind::Overwrite | OpKind::Insert | OpKind::Extend => {
+        let bytes = file_bytes(&mut self.walk, objects, path)?;
+        (bytes, self.plan.get(&op.src).copied())
+      }
+      OpKind::SetXattr => (Cow::Borrowed(head.unwrap_or_default()), Some(0)),
+      OpKind::Mknod => {
+        let node = self
+          .walk
+          .nodes
+          .get(path)
+          .ok_or_else(|| PushRefused::Unplaced {
+            path: path.to_owned(),
+          })?;
+        (Cow::Owned(node.encode()), Some(0))
+      }
+      _ => return Ok(None),
+    };
+    lay(&mut self.post, &op, &source, from).ok_or_else(|| PushRefused::Unplaced {
+      path: path.to_owned(),
+    })?;
+    Ok(None)
+  }
+}
+
+/// The bytes of the blob the walk gave the file at `path`.
+fn file_bytes<'o, O: PushObjects>(
+  walk: &mut Walk,
+  objects: &'o O,
+  path: &str,
+) -> Result<Cow<'o, [u8]>, PushRefused> {
+  let (id, said) = walk
+    .contents
+    .get(path)
+    .copied()
+    .ok_or_else(|| PushRefused::Unplaced {
+      path: path.to_owned(),
+    })?;
+  walk.reads.blobs = walk.reads.blobs.saturating_add(1);
+  let refused = |why| PushRefused::Object {
+    path: path.to_owned(),
+    id,
+    why,
+  };
+  let bytes = objects.blob(id).map_err(refused)?;
+  let given = to_u64(bytes.len());
+  if given != said {
+    return Err(refused(Unavailable::LengthDiffers { said, given }));
+  }
+  Ok(bytes)
+}
+
+/// The identity being hashed, a piece of the document or 64 KiB of the post-state a unit ([`identity`]'s bytes).
+struct Hashing {
+  /// The hasher.
+  hasher: blake3::Hasher,
+  /// The document.
+  doc: OpsDoc,
+  /// The post-state.
+  post_state: Vec<u8>,
+  /// What the walk read.
+  reads: Reads,
+  /// The next piece of the document.
+  piece: usize,
+  /// The post-state's bytes hashed.
+  hashed: usize,
+  /// A piece's bytes.
+  scratch: Vec<u8>,
+}
+
+impl Hashing {
+  /// The identity of `name`'s work on `base` to hash.
+  fn new(
+    (name, base): (&[u8; 32], u64),
+    doc: OpsDoc,
+    post_state: Vec<u8>,
+    reads: Reads,
+  ) -> Hashing {
+    let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_CONTEXT);
+    hasher.update(name);
+    hasher.update(&base.to_le_bytes());
+    Hashing {
+      hasher,
+      doc,
+      post_state,
+      reads,
+      piece: 0,
+      hashed: 0,
+      scratch: Vec::new(),
+    }
+  }
+
+  /// One unit: whether the identity is hashed whole.
+  fn unit(&mut self) -> bool {
+    self.scratch.clear();
+    if self.doc.encode_piece(self.piece, &mut self.scratch) {
+      self.piece = self.piece.saturating_add(1);
+      self.hasher.update(&self.scratch);
+      return false;
+    }
+    let to = self
+      .post_state
+      .len()
+      .min(self.hashed.saturating_add(UNIT_BYTES));
+    if let Some(bytes) = self.post_state.get(self.hashed..to) {
+      self.hasher.update(bytes);
+    }
+    self.hashed = to;
+    self.hashed == self.post_state.len()
+  }
+
+  /// The work, hashed.
+  fn built(self, base: u64) -> Built {
+    Built {
       increment: Increment {
-        id,
-        base: push.base_version,
-        doc,
-        post_state,
+        id: *self.hasher.finalize().as_bytes(),
+        base,
+        doc: self.doc,
+        post_state: self.post_state,
         evidence: Vec::new(),
       },
       reads: self.reads,
-    })
-  }
-
-  /// The post-state the document's runs name: each added or changed file's bytes, and the head's value, laid where the
-  /// deriver's plan puts them (`compose_volume_planned`). Its length was charged as the walk made the runs.
-  fn post_state(
-    &mut self,
-    doc: &OpsDoc,
-    plan: &PostStatePlan,
-    head: &[u8],
-  ) -> Result<Vec<u8>, PushRefused> {
-    let end = doc
-      .ops
-      .iter()
-      .filter(|op| op.src != u64::MAX && adds_bytes(op.kind))
-      .map(|op| op.src.saturating_add(op.len))
-      .max()
-      .unwrap_or(0);
-    let size = usize::try_from(end).map_err(|_| PushRefused::PastRoom {
-      asked: end,
-      room: self.room,
-    })?;
-    let mut post = vec![0; size];
-    for op in doc.ops.iter().filter(|op| op.src != u64::MAX) {
-      let Some(path) = doc.paths.path(op.path) else {
-        continue;
-      };
-      let (source, from) = match op.kind {
-        OpKind::Overwrite | OpKind::Insert | OpKind::Extend => {
-          (self.file_bytes(path)?, plan.get(&op.src).copied())
-        }
-        OpKind::SetXattr => (Cow::Borrowed(head), Some(0)),
-        OpKind::Mknod => {
-          let node = self.nodes.get(path).ok_or_else(|| PushRefused::Unplaced {
-            path: path.to_owned(),
-          })?;
-          (Cow::Owned(node.encode()), Some(0))
-        }
-        _ => continue,
-      };
-      lay(&mut post, op, &source, from).ok_or_else(|| PushRefused::Unplaced {
-        path: path.to_owned(),
-      })?;
     }
-    Ok(post)
-  }
-
-  /// The bytes of the blob the walk gave the file at `path`.
-  fn file_bytes(&mut self, path: &str) -> Result<Cow<'_, [u8]>, PushRefused> {
-    let (id, said) = self
-      .contents
-      .get(path)
-      .copied()
-      .ok_or_else(|| PushRefused::Unplaced {
-        path: path.to_owned(),
-      })?;
-    self.reads.blobs = self.reads.blobs.saturating_add(1);
-    let refused = |why| PushRefused::Object {
-      path: path.to_owned(),
-      id,
-      why,
-    };
-    let bytes = self.objects.blob(id).map_err(refused)?;
-    let given = to_u64(bytes.len());
-    if given != said {
-      return Err(refused(Unavailable::LengthDiffers { said, given }));
-    }
-    Ok(bytes)
   }
 }
 

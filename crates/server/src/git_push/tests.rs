@@ -1665,3 +1665,169 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
   });
   compared.recv().expect("compared");
 }
+
+/// A pack of `objects`, each whole, as stock git writes one.
+fn pack_of_objects(objects: &[(slates_git::object_name::Kind, Vec<u8>)]) -> Vec<u8> {
+  use slates_git::entry::{self, Header, Representation};
+  let mut pack = Vec::new();
+  let count = u32::try_from(objects.len()).unwrap();
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, count, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  for (kind, content) in objects {
+    let header = Header {
+      representation: Representation::Whole(*kind),
+      size: u64::try_from(content.len()).unwrap(),
+    };
+    let zlib = stored_zlib(content);
+    entry::write(header, at, &mut writer).unwrap();
+    slates_git::out::Out::put(&mut writer, &zlib);
+    at += entry::written_len(header, at).unwrap() + u64::try_from(zlib.len()).unwrap();
+  }
+  writer.finish().unwrap();
+  pack
+}
+
+/// A commit of a flat tree of `files` files, each saying `word` and its number, over `parent`: its id and its objects
+/// (the commit, the tree, every blob).
+fn flat_commit(
+  files: usize,
+  word: &str,
+  parent: Option<ObjectId>,
+) -> (ObjectId, Vec<(slates_git::object_name::Kind, Vec<u8>)>) {
+  use slates_git::object_name::{Kind, name_of};
+  let mut objects = Vec::new();
+  let mut tree = Vec::new();
+  for at in 0..files {
+    let blob = format!("{word} {at}\n").into_bytes();
+    let id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
+    tree.extend_from_slice(format!("100644 f{at:05}\0").as_bytes());
+    tree.extend_from_slice(id.as_bytes());
+    objects.push((Kind::Blob, blob));
+  }
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let parent = parent
+    .map(|parent| format!("parent {parent}\n"))
+    .unwrap_or_default();
+  let commit = format!(
+    "tree {tree_id}\n{parent}author A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\n{word}\n"
+  )
+  .into_bytes();
+  let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  objects.insert(0, (Kind::Tree, tree));
+  objects.insert(0, (Kind::Commit, commit));
+  (commit_id, objects)
+}
+
+/// Shape: the files of a flat head in [`t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time`], as w-git
+/// measured (3,500); fewer in debug, where every unit is slower, to keep the test's time.
+const FLAT_FILES: usize = if cfg!(debug_assertions) { 1_500 } else { 3_500 };
+
+/// What a push driven step by step on a daemon's shard answered, and its longest step in nanoseconds; or why the drive
+/// stopped.
+type Stepped = Result<(Received, u64), String>;
+
+/// `request` pushed to `repository` by its owner by a task on the daemon's shard, a step at a time, yielding the shard
+/// between every two steps as an edge's task does (each step a poll of its own, so the watchdog sees each).
+fn pushed_in_steps(daemon: &crate::Daemon, repository: RepositoryId, request: &[u8]) -> Stepped {
+  let (sent, got) = std::sync::mpsc::channel();
+  let request = request.to_vec();
+  crate::daemon::observe_first(daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(stepped(repository, &request).await);
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("the task detached");
+  });
+  got
+    .recv_timeout(std::time::Duration::from_secs(600))
+    .unwrap_or_else(|_| Err("the push did not answer within the test's bound".to_owned()))
+}
+
+/// The push of [`pushed_in_steps`], driven.
+async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
+  use crate::state::with_state;
+  let mut longest = 0u64;
+  let mut timed = |began: std::time::Instant| {
+    longest = longest.max(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
+  };
+  let mut push = with_state(|state| {
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      false,
+      &mut Vec::new(),
+      Unpresented,
+    )
+  })
+  .ok_or("no state to start")?
+  .map_err(|failed| format!("not started: {failed:?}"))?;
+  for piece in request.chunks(4096) {
+    let began = std::time::Instant::now();
+    with_state(|state| push.input(state, piece))
+      .ok_or("no state for the request")?
+      .map_err(|failed| format!("not taken: {failed:?}"))?;
+    timed(began);
+    slates_rt::futures::yield_now().await;
+  }
+  with_state(|state| push.end(state))
+    .ok_or("no state for the end")?
+    .map_err(|failed| format!("not ended: {failed:?}"))?;
+  let mut answer = Vec::new();
+  let received = loop {
+    let began = std::time::Instant::now();
+    let step = with_state(|state| push.answer_step(state, &mut answer))
+      .ok_or("no state for a step")?
+      .map_err(|failed| format!("a step failed: {failed:?}"))?;
+    timed(began);
+    match step {
+      Answering::Answered(received) => break *received,
+      Answering::Turned => slates_rt::futures::yield_now().await,
+      #[cfg(unix)]
+      Answering::Hook(_) => return Err("no hook is configured".to_owned()),
+    }
+  };
+  Ok((received, longest))
+}
+
+/// A-752 (main's order of 2026-11-20, w-git's measure: one command bringing 3,502 objects over a flat 3,500-file tree
+/// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog). Do: create `main`
+/// at a flat tree of [`FLAT_FILES`] files, then push a commit changing every file, answering a step at a time. Expect:
+/// both `ok`; the work builds took more turns than the files they wrote (a unit at a time, before the verdicts), none
+/// past its budget by more than its longest unit and the scheduler's own overrun (`push.build.past_budget` 0).
+#[test]
+fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
+  let daemon = crate::daemon::audit_daemon();
+  let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "flat"));
+  let (first, objects) = flat_commit(FLAT_FILES, "first", None);
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack_of_objects(&objects),
+  );
+  let created = pushed_in_steps(&daemon, repository, &create);
+  let before = crate::daemon::observe_first(&daemon, |state| state.push_turns);
+  let (second, objects) = flat_commit(FLAT_FILES, "second", Some(first));
+  let update = request(
+    &[(&first.to_string(), &second.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack_of_objects(&objects),
+  );
+  let updated = pushed_in_steps(&daemon, repository, &update);
+  let after = crate::daemon::observe_first(&daemon, |state| state.push_turns);
+  daemon.stop();
+  let (created, created_longest) = created.unwrap();
+  let (updated, updated_longest) = updated.unwrap();
+  eprintln!(
+    "A-752 flat {FLAT_FILES}: create's longest step {created_longest} ns, update's {updated_longest} ns; \
+     builds before {before:?} after {after:?}"
+  );
+  assert_eq!(reasons(&created), [b"ok"]);
+  assert_eq!(reasons(&updated), [b"ok"]);
+  let turns = after.turns - before.turns;
+  assert!(
+    turns > FLAT_FILES as u64,
+    "the update's work was built in {turns} turns for {FLAT_FILES} files"
+  );
+  assert_eq!(after.past_budget, 0, "{after:?}");
+}
