@@ -60,8 +60,14 @@
   BEAT REDS (g227) LANDED main 1c59e362 (8545dd49): not A-740 (pre-740 3/12, at-740 2/12 failing under 28 spinners +
   taskpolicy -b). Tests timed the stop by their own starved sampling vs fixed W+3B; now watchdog::Turns::episode
   (last beat + look lateness, its clock), bound W+B+lateness (A-232 step 5); memory sibling too. 16/16 under load.
-  QUEUE: Windows edge-port hold (WSADuplicateSocketW per daemon pid, amend A-625 p3 decision 3 and 4.6, unsafe budget,
-  red = restart-keeps-port on Windows), then A-645 P3 when A-727 a2 lands.
+  A-748 LANDED main 8281ea29: Windows anchor holds HTTP/SSH/svn listeners, shares each per daemon pid via
+  WSADuplicateSocketW over a pipe in the explicit handle list (anchor shared_listeners, rt share_listener/from_share,
+  server held_listener windows). Test cli vcs_edge_restart: green jupiter r33 (61321-3 kept) + macOS. RED OWED: r36
+  (copy of synced tree on jupiter with api role anchor.rs reversed; script ~/.cache/w-reaper-target/red748.sh) --
+  add its numbers to A-748 as a follow-up. hg on jupiter: no installs (main), legs skip.
+  NEXT: Linux issuer surface (main's ruling): anchor prints an issuer secret on Linux; client presents it over the
+  abstract rendezvous socket + SO_PEERCRED uid; anchor hands back the issuer descriptor; PRINTS_ISSUER_SURFACE true on
+  Linux; amend issuer design; cross-process test. Then A-645 P3 when A-727 a2 lands.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
