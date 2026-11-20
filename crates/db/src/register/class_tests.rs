@@ -163,10 +163,10 @@ fn misnamed(object: ObjectId, registers: &[(RegisterClass, ObjectId)]) -> Vec<Ob
 
 /// A-636 part 2a (AUD-29-17; A-642): every register of an object names its class and leads back to its object. Do: for
 /// objects minted at four counters, the largest an id may carry among them, each register: its own, its catalog and
-/// its four state logs'; then the same for an id minted one past the largest counter. Expect: six distinct registers an
-/// object, each naming the class it was made in, leading back to its object and made again from any other; and some
-/// register of the id past the largest counter naming another class or leading elsewhere, which is why a minter
-/// refuses past it.
+/// its four state logs'; then ids minted one past the largest counter and one past the family bit. Expect: six distinct
+/// registers an object, each naming the class it was made in, leading back to its object and made again from any other;
+/// the id one past the largest counter reading as a family's (A-636 part 2b-2) and some register of the id past the
+/// family bit naming another class or leading elsewhere, which is why a minter refuses past it.
 #[test]
 fn every_register_of_an_object_names_its_class_and_leads_back_to_it() {
   for object in COUNTERS.map(minted) {
@@ -179,11 +179,18 @@ fn every_register_of_an_object_names_its_class_and_leads_back_to_it() {
     );
     assert_eq!(misnamed(object, &registers), Vec::new(), "{object:?}");
   }
+  // One past the largest counter sets the family bit (A-636 part 2b-2): the id reads as a family's, placed by its family
+  // rather than by itself; further past, a class bit, so some register of it leads elsewhere.
   let past = minted(MAX_OBJECT_COUNTER.saturating_add(1));
+  assert!(
+    past.is_family(),
+    "an id past the largest counter reads as a family's"
+  );
+  let past_class = minted(MAX_OBJECT_COUNTER.saturating_add(1) << 1);
   assert_ne!(
-    misnamed(past, &registers_of(past)),
+    misnamed(past_class, &registers_of(past_class)),
     Vec::new(),
-    "an id past the largest counter has registers that do not lead back to it"
+    "an id past the family bit has registers that do not lead back to it"
   );
 }
 

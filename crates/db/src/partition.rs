@@ -196,6 +196,10 @@ pub struct PartitionSnapshot {
   /// The least counter a volume id minted here may take: one past the highest counter of every volume created here
   /// (A-694; appended), so a recovery mints the ids the live partition would.
   pub volume_counter: u64,
+  /// The least number a family id minted here may take: one past the highest number of every family id created here,
+  /// a repository's or a green's (A-636 part 2b-2; appended), so a recovery mints the family ids the live partition
+  /// would.
+  pub family_counter: u64,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -337,6 +341,10 @@ pub struct Partition {
   /// here, advanced by each creation's apply and snapshotted, so the ids an append mints for several new volumes before
   /// any is recorded never repeat, and a recovery mints what the live partition would (`crate::Db::volume_counter_at`).
   volume_counter: u64,
+  /// The least number a family id minted here may take (A-636 part 2b-2): one past the highest number of every family
+  /// id created here, a repository's or a green's, advanced by each creation's apply and snapshotted, as
+  /// [`volume_counter`](Partition::volume_counter) is for ids of no family (`crate::Db::family_number_at`).
+  family_counter: u64,
   /// Each green volume's merge chain (§4.16): its accepted increments after its checkpoint (all of them while it holds
   /// none), encoded, in commit order, so recovery replays them to rebuild the green. Bounded by `green_chain_bytes`
   /// against the cap.
@@ -491,6 +499,7 @@ impl Partition {
       audit_received: BTreeMap::new(),
       grants_issued_through: 0,
       volume_counter: 0,
+      family_counter: 0,
       captured_bases: std::collections::BTreeSet::new(),
       carried: BTreeMap::new(),
       repositories: crate::repository::Repositories::new(),
@@ -1200,6 +1209,27 @@ impl Partition {
   /// here.
   pub fn volume_counter(&self) -> u64 {
     self.volume_counter
+  }
+
+  /// The least number a family id minted here may take (A-636 part 2b-2): one past the highest number of every family
+  /// id created here.
+  pub fn family_counter(&self) -> u64 {
+    self.family_counter
+  }
+
+  /// Moves the minting counters past `id`, a volume's or a repository's just created (A-694; A-636 part 2b-2): the
+  /// family counter past a family id's number, the volume counter past any other id's counter. Advanced whatever the
+  /// creation's insert meets, as a replay must.
+  fn minted(&mut self, id: [u8; 16]) {
+    match crate::register::ObjectId(id).family_number() {
+      Some(number) => {
+        self.family_counter = self.family_counter.max(u64::from(number).saturating_add(1));
+      }
+      None => {
+        let counter = crate::catalog::VolumeId { bytes: id }.counter();
+        self.volume_counter = self.volume_counter.max(counter.saturating_add(1));
+      }
+    }
   }
 
   /// An enrolled consumer's record (§4.13), or `None` if no such consumer was ever enrolled.
@@ -2080,10 +2110,7 @@ impl Partition {
   fn apply_op(&mut self, op: &Op) -> Result<(), DbError> {
     match op {
       Op::VolumeCreated { record } => {
-        // Advanced whatever the insert meets, as a replay must (A-694).
-        self.volume_counter = self
-          .volume_counter
-          .max(record.id.counter().saturating_add(1));
+        self.minted(record.id.bytes);
         self.insert_volume(record.clone())
       }
       Op::VolumeStateChanged { id, state } => self.update_volume(*id, |v| v.state = *state),
@@ -2165,8 +2192,11 @@ impl Partition {
         self.carried.insert(*volume, (carried.clone(), *mark));
         Ok(())
       }
-      Op::RepositoryCreated { .. }
-      | Op::RepositoryBranchAdded { .. }
+      Op::RepositoryCreated { record } => {
+        self.minted(record.id.bytes);
+        self.apply_repository(op)
+      }
+      Op::RepositoryBranchAdded { .. }
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
       | Op::RepositoryGreenJoined { .. }
@@ -2910,6 +2940,7 @@ impl Partition {
       audit_dropped: self.audit_dropped,
       grants_issued_through: self.grants_issued_through,
       volume_counter: self.volume_counter,
+      family_counter: self.family_counter,
       audit_outbox: self.audit_outbox.iter().cloned().collect(),
       audit_outbox_next: self.audit_outbox_next,
       audit_received: self
@@ -3126,6 +3157,7 @@ impl Partition {
     p.audit_next_seq = snapshot.audit_next_seq;
     p.grants_issued_through = snapshot.grants_issued_through;
     p.volume_counter = snapshot.volume_counter;
+    p.family_counter = snapshot.family_counter;
     p.audit_outbox = snapshot.audit_outbox.iter().cloned().collect();
     p.audit_outbox_next = snapshot.audit_outbox_next;
     p.audit_received = snapshot

@@ -541,8 +541,15 @@
 > see A-636 part 2b's amendment entry. Owed: a push's answer waiting for its records to commit (the barrier); a
 > candidate that joins a log's placement past parts every earlier one held (the log's state installed first, with a
 > state-log checkpoint, which also bounds the holders' copies); the parts rebuilt after the owner restarts; parts
-> batched; a destroyed repository's state-log registers forgotten; the greens placed on their repository's holders at
-> their joins (2b-2); the successor adopting a repository's logs by the rule (2c).
+> batched; a destroyed repository's state-log registers forgotten; the successor adopting a repository's logs by the
+> rule (2c).
+> **A-636 part 2b-2 (2026-11-20, w-shared; routed by id):** a repository's id and every green minted to join it carry
+> its family (`ObjectId::family`; tag, number), and rendezvous hashes the family (`ObjectId::line_key`), so a
+> repository, its state logs and its greens have one set of holders and one successor with nothing stored per green; a
+> green joins only its repository's family (`repository::in_family`); a lone green is a family of its own, which an
+> adopting repository joins. Owed: a green minted under no family (an older build's) cannot be adopted (refused
+> `Unsupported`); a repository made by an older build, whose id is of no family, can join no new green; the successor
+> adopting a repository's logs by the rule (2c).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -764,9 +771,10 @@
 > (kiln r392 and r429: both in hg's crash report), then 10 of 10, 52 of 52 and 4 of 4 (r415, r429), fmt clean. g309's
 > stock git round trip with the token as Basic's password in the URL against a real anchor (`git_interop`), its one
 > wait this piece, un-ignored as main merged it in (red there: `fatal: Authentication failed`, g309's kiln r426).
-> g083's stock-hg round trip over the anchor's edge runs un-ignored since A-680 part 2b (the hg site's pushes). Owed:
-> stock `hg identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
-> found here, main's); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
+> g083's stock-hg round trip over the anchor's edge runs un-ignored since A-680 part 2b (the hg site's pushes). Stock
+> `hg identify` resolves through `lookup` since A-705 (`serve::lookup`, 7.2's `revsymbol` order, listed over HTTP and
+> SSH; held to stock 7.2's recorded answers; both round trips run `identify -r tip`; macOS arm64, this Mac, local).
+> Owed: tags beyond `tip` in `lookup` (no `.hgtags` reading yet); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -1317,8 +1325,10 @@
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
 > `check:phases` (one position for every phase) measured under concurrent pushes before it is kept; (6) the changesets
-> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream
-> clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
+> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (rendered
+> since A-706, `render::render`: split revlog v1 generaldelta revlogs of full texts, fncache, phaseroots, bookmarks,
+> obsstore; stock 7.2 `hg verify` passes on the rendered `dot` and `states` fixtures; owed: deltas and compression,
+> rendering in slices as versions commit; then `stream_out`, `stream2`, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
 > lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
 > against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
@@ -4506,8 +4516,9 @@
 >   cohort for the object is whole and at least `f + 1` wide (`RegionalConfiguration::settled_away`,
 >   `fleet.settle.released`; kept and counted `fleet.settle.kept_outside` otherwise), its content kept while a head
 >   names it. Tests: `a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go` (red before) and
->   `a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one`. Owed: the lineage model's mirror and its
->   oracle; the content release below.
+>   `a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one`. The lineage model mirrors it (A-707,
+>   2026-11-19): such a release is held to `f + 1` other members holding a record at least as new, and the model's round
+>   waits on A-556's narrowed cohorts; 400 seeds, 72 released, 2,526 kept, no violation. The content release below.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it

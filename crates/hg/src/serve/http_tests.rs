@@ -258,7 +258,7 @@ fn check_capabilities(ours: &[u8], theirs: &[u8]) {
     }
   }
   let names: Vec<&[u8]> = ours.iter().map(|(name, _)| name).collect();
-  let expected: [&[u8]; 9] = [
+  let expected: [&[u8]; 10] = [
     b"batch",
     b"branchmap",
     b"bundle2",
@@ -267,6 +267,7 @@ fn check_capabilities(ours: &[u8], theirs: &[u8]) {
     b"httpheader",
     b"httpmediatype",
     b"known",
+    b"lookup",
     b"unbundle",
   ];
   assert_eq!(names, expected);

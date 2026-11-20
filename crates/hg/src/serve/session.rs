@@ -7,16 +7,17 @@
 //! stdout and the message then `\n-\n` on stderr). An empty line ends the session. A name 7.2's table lacks is
 //! answered with an empty string and no argument read, as 7.2 answers it. A push's `unbundle` is taken by the session's
 //! carrier before this step, since its bundle follows its request (over SSH [`super::stdio`], over HTTP
-//! `super::http::unbundle_request`). A command 7.2 serves and this server does not (`pushkey`, `lookup`, stream clones,
+//! `super::http::unbundle_request`). A command 7.2 serves and this server does not (`pushkey`, stream clones,
 //! clone bundles, `debugwireargs`) has its arguments read, so the session stays in step, and is answered with an
 //! out-of-band error. `batch` runs each call of a command that answers a string and joins
 //! the escaped answers with `;`. A `getbundle` refused where the client asked for bundle2 is answered as 7.2 answers an
 //! abort there: a bundle2 stream of one `ERROR:ABORT` part with the message; a bundle1 request is answered out of band.
 //!
 //! **What is advertised.** `hello` and `capabilities` list what is served, sorted as 7.2 sorts them: `batch`,
-//! `branchmap`, `bundle2`, `getbundle`, `known`, `protocaps` and `unbundle`. A 7.2 client asks the same `getbundle` of
+//! `branchmap`, `bundle2`, `getbundle`, `known`, `lookup` (`super::lookup`, as 7.2 always lists it), `protocaps` and
+//! `unbundle`. A 7.2 client asks the same `getbundle` of
 //! it as of a stock server (`exchange._pullbundle2` reads `phases`, `bookmarks`, `listkeys` and `obsmarkers` from it);
-//! it lacks `lookup` (a pull of a named revision is refused by the client), `pushkey` and stream clones, which later
+//! it lacks `pushkey` and stream clones, which later
 //! pieces serve. Pushes are served over both transports (over HTTP A-680 part 2b, `super::http::pushed`; over SSH
 //! A-696, `super::stdio`), so `unbundle` is listed with 7.2's value and `bundle2` holds, beside the parts a `getbundle`
 //! answer carries, what a push needs, as 7.2 lists them: `changegroup=01,02,03` (the versions a push is taken in),
@@ -36,7 +37,7 @@
 //! does not answer a string is refused (7.2 asserts).
 
 use super::getbundle::{Asked, Store, getbundle};
-use super::{Refusal, discovery, pull};
+use super::{Refusal, discovery, lookup, pull};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::decimal::Decimal;
 use crate::ssh::{self, Read};
@@ -70,12 +71,13 @@ const COMMANDS: [(&[u8], &[u8]); 21] = [
 
 /// Format: the capabilities advertised over SSH, sorted as `capabilities` sorts them; `bundle2`'s value is made from
 /// [`BUNDLE2_SERVED`], and `unbundle` is listed since pushes are served over SSH (A-696).
-const SERVED: [&[u8]; 7] = [
+const SERVED: [&[u8]; 8] = [
   b"batch",
   b"branchmap",
   b"bundle2",
   b"getbundle",
   b"known",
+  b"lookup",
   b"protocaps",
   b"unbundle",
 ];
@@ -101,7 +103,7 @@ const BUNDLE2_SERVED: [(&[u8], &[&[u8]]); 9] = [
 /// Format: the capabilities advertised over HTTP, sorted as `capabilities` sorts them: SSH's but `protocaps` (an HTTP
 /// client says what it reads in `X-HgProto`), what 7.2's `httpv1protocolhandler.addcapabilities` adds beside `batch`
 /// (`compression`, `httpheader` and `httpmediatype`), and `unbundle`, since pushes are served over HTTP (A-680 part 2b).
-const SERVED_HTTP: [&[u8]; 9] = [
+const SERVED_HTTP: [&[u8]; 10] = [
   b"batch",
   b"branchmap",
   b"bundle2",
@@ -110,6 +112,7 @@ const SERVED_HTTP: [&[u8]; 9] = [
   b"httpheader",
   b"httpmediatype",
   b"known",
+  b"lookup",
   b"unbundle",
 ];
 
@@ -391,6 +394,7 @@ fn string_answer<'a>(
     b"branches" => discovery::branches(store, need(b"nodes")?, admission, out)?,
     b"branchmap" => discovery::branchmap(store, admission, out)?,
     b"listkeys" => pull::listkeys(store, need(b"namespace")?, admission, out)?,
+    b"lookup" => lookup::lookup(store, need(b"key")?, admission, out)?,
     b"capabilities" => advertised(transport, admission, out)?,
     b"hello" => {
       let mut line = Vec::new();
