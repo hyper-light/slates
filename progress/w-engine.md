@@ -164,3 +164,7 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   (debug 1,500) recorded owed; the commit question is answered for named content by stage-then-publish.
 - A-760 claimed; interface sent: inbox/w-svn-from-w-engine-a760-interface.md (cc main), waiting for w-svn's answer
   before the build.
+- 10:35 Studio reboot: nothing lost (all landed, state pushed). LAN address now 192.168.1.88.
+- A-752 R3 LANDED 4b6d5c24b (base 89a1d6c06): UNIT_BYTES -> the turn's Slices (server's copy_slice_bytes_within /
+  archive_slice_bytes_within); RUN=16 -> the sort's own non-decreasing runs. t_a752 past_budget 0.
+- NEXT: A-760 (1b), w-svn answered (A-761 p2 28e57ac18: (BLAKE3, len) before the append, texts durable first).

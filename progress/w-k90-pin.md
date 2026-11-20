@@ -46,3 +46,24 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   says + "Slates tests" step on macos-latest/windows-11-arm/ubuntu-24.04-arm; linux job tests whatever Clippy says;
   slates_roles compile fix (Made.shared, E0063 since 6965eaf63); UI mock.
 - Local macOS lane 2 (lane2.sh, log lane2-macos.log) on the merged tree: running.
+- LANDED kiln main 9d87d2a9d..ca1a0302e (af5ae609b + merges; merge-base confirmed). Local macOS arm64 (Mac Studio 2,
+  merged tree 5ec015dc0 = af21030a8's crates): --lib workspace::slates 57 passed; slates_roles 1 passed
+  (w1_kiln_runs_its_slates_instance_...); vendored 11 passed.
+- CAUTION: ~/kiln-work/w-k90-pin-kiln's local main holds scratch commits (2898dfe42, fb5062a85, a "local:" commit):
+  never push it. Landing worktree: ~/kiln-work/w-k90-pin-land.
+- NEXT: GitHub ci.yml run on ca1a0302e (api.github.com, unauthenticated; 60/h shared): per lane Build + Slates tests.
+- Goal's test (2026-11-20, kiln origin/main 83a03cd1a): git grep over every spelling (Command::new("slates"/SLATES),
+  "slates"/"slates.exe" strings, `slates <verb>`, slates <verb>, cargo install slates, slates-cli, /bin/slates) outside
+  vendor/, docs/wip and test fixtures: NO slates CLI call. Hits are names only: place.rs SLATES_FILE_SYSTEM (fs type),
+  slates.rs/slates_e2e manifest key, slates_move refusal kind, slates_e2e CLI const + process fixtures + fake PATH binary
+  (tests proving kiln never runs it), vm_e2e runner name "slates", slates_roles' no-Slates-binary assertion,
+  vendored.rs crate->project map, agentic.md 721/884 naming Slates' own CLI beside the library call kiln makes.
+  workspace/slates.rs: "command line" only in comments/test text; `which` only for systemd-run -> replaced, not layered.
+- w-k90-win: windows (Slates tests) job in ci.yml (842cc2c2f); watching run 44784299374 (job 136462100187).
+- GitHub run 44790740630 (ca1a0302e) was cancelled before any job ran (concurrency: one pending per group; main's pushes
+  cancel the pending one). Run 44784299374 (0a17f46e5): Clippy fails on every lane -> each `build` job red regardless.
+- LANDED kiln main 83a03cd1a..715063153 (merge-base confirmed): ci.yml job `slates` (ubuntu-latest, ubuntu-24.04-arm,
+  macos-latest, windows-11-arm; no clippy): build, `--lib -- workspace::slates`, `--test vendored --test slates_roles`;
+  Slates step taken back out of `build`. Windows x86-64 = w-k90-win's windows-slates job.
+- Poller: ~/kiln-work/w-k90-pin-logs/poll2.sh 715063153 (first completed, non-cancelled main run containing it).
+- Goal on my kiln stack: 01a1fa367d4c (plan 01a1fa36 step 1): goals_done with commit + run ids per platform + base.
