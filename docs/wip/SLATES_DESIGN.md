@@ -12358,9 +12358,19 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > the answer is lent from it (`lend_held`), and the last hold's release gives the fork back. By use, a push and a new tag
 > landing after a fetch's first step: the held answer's pack is the start generation's objects in its order (each by
 > id, so byte for byte; the zlib level each is deflated at is the stream's own timed choice, §4.11). Before it, the
-> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. Owed for git: protocol v0's fetch
-> in turns, `begin`'s `ready` and cut and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a
-> run); the live `git clone` rows of the matrix (main's).
+> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. **`begin`'s walks in turns BUILT
+> (same day):** `negotiation::begin` does only what the request names (its wants, haves and shallow lines, the one-round
+> runs, `deepen-not`'s names) and answers at once only where no search could make the server ready (`wait-for-done`,
+> no common have); `ready`'s search (`ready::Readying`: a parent of the path's top a unit, its place an index into the
+> parents), the cut (`shallow::Cutting`: a commit of `deepen`'s breadth-first walk, a ref's tip of `deepen-relative`'s
+> search, a commit painted or judged of `deepen-since`/`deepen-not`'s) and `include-tag` (a run's version joined to what
+> the runs carry as runs of positions, `Graph::brought_set`; then a tag a unit, `Graph::tags_from` keeping its place by
+> the ref's index) are `Negotiating::step`'s, before the choice. The sections before the pack wait for them: the answer
+> writes nothing until they are decided (`upload::fetch::Before`), the acknowledgments alone when not ready, a refusal
+> before them answered as one refused whole. By test: over 2,000 commits and 500 tags, `begin` read 3,499 parents of
+> the graph on main (the whole search and cut), at most 4 now, and each step at most 2, the answer the one made whole.
+> Owed for git: protocol v0's fetch in turns, a plan of scattered positions (16 bytes a run); the live `git clone` rows
+> of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the

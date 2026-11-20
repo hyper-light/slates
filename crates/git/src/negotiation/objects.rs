@@ -56,7 +56,7 @@ pub(super) struct Sides<N> {
 
 /// What the selection reads of the request, owned (A-745): the filter, a `sparse:oid` filter's patterns, `thin-pack`,
 /// `include-tag`, and the haves as sent, which a thin pack in a shallow exchange lists.
-struct Asked {
+pub(super) struct Asked {
   /// The filter.
   filter: Option<Filter>,
   /// The patterns of a `sparse:oid` filter, alone (a combination holding one, or one without its patterns, was refused
@@ -72,7 +72,7 @@ struct Asked {
 
 impl Asked {
   /// What `request` asks of the selection, its haves charged as they are copied.
-  fn of(request: &Request<'_>, admission: &mut Admission) -> Result<Asked, Refusal> {
+  pub(super) fn of(request: &Request<'_>, admission: &mut Admission) -> Result<Asked, Refusal> {
     admission
       .charge_items::<ObjectId>(request.haves.len())
       .map_err(Refusal::PastAdmission)?;
@@ -116,6 +116,8 @@ pub(super) struct Selecting<N, G> {
   mark_peak: Peak,
   /// The objects chosen, and the tree walks choosing them.
   chosen: Sets<N>,
+  /// What the runs carry, for `include-tag`.
+  carried: RunsCarried,
 }
 
 /// Where a selection is (the stages of [`Selecting`]).
@@ -140,8 +142,18 @@ enum Stage {
     /// The index of the next want.
     at: usize,
   },
-  /// `include-tag`.
-  Tags,
+  /// `include-tag`'s runs: the objects version `version` of run `run` brought, joined to those the runs carry, next.
+  Carried {
+    /// The run, by its index.
+    run: usize,
+    /// The version.
+    version: u64,
+  },
+  /// `include-tag`'s scan of the tags: the ref at or after this index next.
+  Tags {
+    /// The ref's index.
+    next: usize,
+  },
   /// Done: every object chosen.
   Done,
 }
@@ -211,18 +223,17 @@ impl View<'_> {
   }
 }
 
-impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G> Selecting<N, G> {
+impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
   /// Begins the selection of what `request` asks over `sides`: the walk seeded with the wants not answered by a run (and
   /// the parents of commits a cut made whole) as wanted, and the common haves (and the commits a cut made whole, and the
   /// wants a run answers) as had.
   pub(super) fn begin<S: Graph<Node = N, Green = G>>(
     graph: &S,
-    request: &Request<'_>,
+    asked: Asked,
     sides: Sides<N>,
     runs: Vec<Run<G>>,
     admission: &mut Admission,
   ) -> Result<Selecting<N, G>, Refusal> {
-    let asked = Asked::of(request, admission)?;
     let mut paint = Paint::new();
     let walked = sides
       .wants
@@ -254,6 +265,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G> Selecting<N, G> {
       held: Held::default(),
       mark: Vec::new(),
       mark_peak: Peak::default(),
+      carried: RunsCarried::default(),
       chosen: Sets {
         objects: Held::default(),
         opened: if depth_decides {
@@ -371,19 +383,65 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G> Selecting<N, G> {
             };
             self.chosen.want(graph, &view, *want, admission, counters)?;
           }
-          None => self.stage = Stage::Tags,
+          None => {
+            self.stage = if self.asked.include_tag {
+              Stage::Carried { run: 0, version: 0 }
+            } else {
+              Stage::Done
+            };
+          }
         }
       }
-      Stage::Tags => {
-        if self.asked.include_tag {
-          let carried = carried_by_runs(graph, &self.runs, view.filter, admission)?;
-          self.chosen.tags(graph, &carried, admission)?;
-        }
-        self.stage = Stage::Done;
-      }
+      Stage::Carried { .. } | Stage::Tags { .. } => self.include_tag(graph, admission)?,
       Stage::Done => return Ok(true),
     }
     Ok(false)
+  }
+
+  /// One unit of `include-tag`: a version of a run joined to what the runs carry, or a tag judged.
+  fn include_tag<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    match self.stage {
+      Stage::Carried { run, version } => {
+        self.stage = match self.runs.get(run) {
+          None => Stage::Tags { next: 0 },
+          Some(found) => {
+            let version = version.max(found.after.saturating_add(1));
+            if version > found.through {
+              Stage::Carried {
+                run: run.saturating_add(1),
+                version: 0,
+              }
+            } else {
+              let brought = graph.brought_set(found.green, version);
+              self.carried.join(&brought, admission)?;
+              Stage::Carried {
+                run,
+                version: version.saturating_add(1),
+              }
+            }
+          }
+        };
+      }
+      Stage::Tags { next } => match graph.tags_from(next).next() {
+        None => self.stage = Stage::Done,
+        Some((at, tag)) => {
+          self.stage = Stage::Tags {
+            next: at.saturating_add(1),
+          };
+          let carried = Carried {
+            runs: &self.carried.positions,
+            filter: self.asked.filter.as_ref(),
+          };
+          self.chosen.tag(graph, tag, &carried, admission)?;
+        }
+      },
+      _ => {}
+    }
+    Ok(())
   }
 
   /// The edges of the sent commit at `position`: each had parent's tree marked held, as git leaves out the trees of
@@ -697,35 +755,34 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
     Ok(())
   }
 
-  /// `include-tag`: each annotated tag whose chain ends at an object the pack carries, with its chain.
-  fn tags<S: Graph<Node = N>>(
+  /// `include-tag`, for one annotated tag: it and its chain sent when the chain ends at an object the pack carries.
+  fn tag<S: Graph<Node = N>>(
     &mut self,
     graph: &S,
-    carried: &Held,
+    tag: N,
+    carried: &Carried<'_>,
     admission: &mut Admission,
   ) -> Result<(), Refusal> {
-    for tag in graph.tags() {
-      charge::<N>(admission)?;
-      let mut chain = vec![tag];
-      let mut current = tag;
-      let mut ends = None;
-      while graph.kind(current) == Kind::Tag {
-        let Some(next) = graph.target(current) else {
-          break;
-        };
-        if graph.kind(next) == Kind::Tag {
-          charge::<N>(admission)?;
-          chain.push(next);
-        } else {
-          ends = Some(next);
-        }
-        current = next;
+    charge::<N>(admission)?;
+    let mut chain = vec![tag];
+    let mut current = tag;
+    let mut ends = None;
+    while graph.kind(current) == Kind::Tag {
+      let Some(next) = graph.target(current) else {
+        break;
+      };
+      if graph.kind(next) == Kind::Tag {
+        charge::<N>(admission)?;
+        chain.push(next);
+      } else {
+        ends = Some(next);
       }
-      let packed = ends.is_some_and(|end| self.objects.contains(end) || carried.contains(end));
-      if packed {
-        for link in chain {
-          self.objects.insert(link, admission)?;
-        }
+      current = next;
+    }
+    let packed = ends.is_some_and(|end| self.objects.contains(end) || carried.holds(graph, end));
+    if packed {
+      for link in chain {
+        self.objects.insert(link, admission)?;
       }
     }
     Ok(())
@@ -765,30 +822,55 @@ fn listed_haves<S: Graph>(
   Ok(listed)
 }
 
-/// The objects the runs carry that the filter admits, kept only for `include-tag` to ask of.
-fn carried_by_runs<S: Graph>(
-  graph: &S,
-  runs: &[Run<S::Green>],
-  filter: Option<&Filter>,
-  admission: &mut Admission,
-) -> Result<Held, Refusal> {
-  let mut carried = Held::default();
-  for run in runs {
-    for version in run.after.saturating_add(1)..=run.through {
-      for node in graph.brought(run.green, version) {
-        let kind = graph.kind(node);
-        let size = if kind == Kind::Blob {
-          graph.size(node)
-        } else {
-          0
-        };
-        if filter.is_none_or(|filter| filter.admits(kind, size, 0)) {
-          carried.insert(node, admission)?;
-        }
-      }
+/// The objects the runs carry, as runs of positions, joined a version a unit (A-745), kept only for `include-tag` to ask
+/// of; charged a run's bytes as its runs grow.
+#[derive(Default)]
+struct RunsCarried {
+  /// The positions.
+  positions: Positions,
+  /// Its runs charged so far.
+  charged: usize,
+}
+
+impl RunsCarried {
+  /// Joins `brought` to what the runs carry.
+  fn join(&mut self, brought: &Positions, admission: &mut Admission) -> Result<(), Refusal> {
+    self.positions = self.positions.union(brought);
+    let runs = self.positions.runs();
+    if runs > self.charged {
+      admission
+        .charge_items::<(u64, u64)>(runs.saturating_sub(self.charged))
+        .map_err(Refusal::PastAdmission)?;
+      self.charged = runs;
     }
+    Ok(())
   }
-  Ok(carried)
+}
+
+/// What the runs carry as `include-tag` asks it: an object one of them brought that the filter admits.
+struct Carried<'c> {
+  /// The positions the runs brought.
+  runs: &'c Positions,
+  /// The filter.
+  filter: Option<&'c Filter>,
+}
+
+impl Carried<'_> {
+  /// Whether the runs carry `node`.
+  fn holds<S: Graph>(&self, graph: &S, node: S::Node) -> bool {
+    if !self.runs.contains(node.into()) {
+      return false;
+    }
+    let kind = graph.kind(node);
+    let size = if kind == Kind::Blob {
+      graph.size(node)
+    } else {
+      0
+    };
+    self
+      .filter
+      .is_none_or(|filter| filter.admits(kind, size, 0))
+  }
 }
 
 /// Whether a path is matched: by its own verdict, or by `inherited`, the verdict of the tree it is in, when its own is
