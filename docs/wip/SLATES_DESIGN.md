@@ -52490,7 +52490,7 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
   `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
-  (BUILT 2026-11-20, `vcs_store::svn_made`; its copies, symbolic links and author owed); Mercurial's manifests by the
+  (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name; its copies and symbolic links owed); Mercurial's manifests by the
   same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
@@ -54821,3 +54821,17 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib` 553 passed, 4 ignored;
   `cargo test --locked -p slates-server --lib -- git_push:: git_hooks:: git_protect vcs_http::git::
   vcs_http::daemon_edge:: vcs_ssh:: vcs_store::` 152 of 152 before the new test, which then passed alone; fmt clean.
+
+
+### A-664 Subversion objects, its author — A server-made revision's `svn:author` is the submitting principal's own name (2026-11-20, w-shared for UI goal 93)
+- **Change.** `ToolIdentities` gains `subversion` (appended), which a session fills on every submit from the principal
+  its channel proved, over whatever the client sent (`identities::carried`), by the svn+ssh edge's own mapping
+  (`lfs::owner_name`); `vcs_store::svn_made` writes it as the made revision's `svn:author`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `repository::svn_commit::tests::t_a664_svn_a_submitted_version_is_the_revision_the_server_makes` (revision 1's
+  `svn:author` the session's name) and `identities::tests::t_a664_a_session_reads_its_identities_once_and_its_clients_claim_never_reaches_the_green`
+  (the carried identities name the principal's Subversion name, never the client's): `cargo test --locked -p
+  slates-server --lib -- identities:: repository::svn_commit:: vcs_store::svn vcs_store::paths:: vcs_store::commits::
+  --test-threads=4` 43 of 43; `slates-ipc --test wire_order` 2 of 2; fmt clean.
+- **Owed.** The svn:// edge's own CRAM user and this name agreeing for one principal (the edge names its CRAM user;
+  main's by-use check); copies and symbolic links (next pieces).

@@ -756,8 +756,8 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
 /// no revision, so the green passed its records' youngest revision and every later commit was refused). Do: make a
 /// Subversion repository; submit a work making `/trunk/a.txt` to its green; then commit a client's revision on the
 /// youngest revision adding `/trunk/b.txt`. Expect: the submit made revision 1, its rows adding `/trunk` and
-/// `/trunk/a.txt` with the file's text; the client's revision lands as revision 2, the green at version 2 holding both
-/// files.
+/// `/trunk/a.txt` with the file's text, its author the session's Subversion name; the client's revision lands as
+/// revision 2, the green at version 2 holding both files.
 #[test]
 fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
   crate::daemon::audit_on_shard(|state| {
@@ -787,6 +787,16 @@ fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
       ("/trunk/a.txt".to_owned(), Action::Add, NodeKind::File, true),
     ];
     assert_eq!(rows, made);
+    let author = state
+      .vcs_stores
+      .subversion_records(svn)
+      .and_then(|records| records.revision_properties(1))
+      .and_then(|properties| properties.get(b"svn:author".as_slice()).cloned());
+    assert_eq!(
+      author,
+      Some(b"a-u-thor".to_vec()),
+      "the principal's own name"
+    );
     let rows = vec![file("/trunk/b.txt", Action::Add, b"beta\n")];
     let committed = commit(
       state,
