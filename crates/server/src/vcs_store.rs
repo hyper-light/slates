@@ -42,8 +42,9 @@
 //! successor, which never reads the importing host's directory (R8).
 //!
 //! **Keys.** A-614's store names a green by a `u64` ([`green_key`]): the half of its volume id that holds its partition
-//! and counter, which `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green
-//! as before.
+//! and counter, which `verbs::fresh_volume_id` and `verbs::fresh_family_id_at` make unique among the partition's volumes
+//! (a family id's family bit, tag and number in the counter's place, its number unique on the partition), so a recovery
+//! keys each green as before.
 //!
 //! **Git LFS objects** (A-629 part 3). A git repository's LFS objects live in its store's LFS index (`GitStore::lfs`,
 //! `slates_git::lfs::objects`): each object's bytes in the shared content store, one row under its oid, apart from the

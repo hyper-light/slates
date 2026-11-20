@@ -25,7 +25,7 @@ use slates_http_edge::credential::Credential;
 use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
 use super::{Fastest, HgSite, HgStores};
 use crate::repository::hg_push::Pushing;
-use crate::vcs_http::{Answer, Decided, Exchange, Failed, Site};
+use crate::vcs_http::{Answer, ClientGone, Decided, Exchange, Failed, Site};
 
 /// Shape: room enough for every request these tests send.
 const ROOM: u64 = 1 << 20;
@@ -543,7 +543,7 @@ fn exchanged<E: Exchange>(mut exchange: E, body: &[u8]) -> (Result<Fields, Faile
   if !body.is_empty() {
     ready(exchange.body(body)).unwrap();
   }
-  ready(exchange.body_end()).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
   let fields = ready(exchange.reply_fields());
   let mut reply = Vec::new();
   while ready(exchange.reply(&mut reply)).unwrap() {}
@@ -640,7 +640,7 @@ fn an_exchange_holds_nothing_past_its_room_or_its_store() {
   );
   let mut orphan = served(&mut gone, "GET", "/hg?cmd=heads", &[]);
   assert_eq!(
-    (past, ready(orphan.body_end())),
+    (past, ready(orphan.body_end(ClientGone::never()))),
     (
       Err(Failed(Status::CONTENT_TOO_LARGE)),
       Err(Failed(Status::SERVICE_UNAVAILABLE))

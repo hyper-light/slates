@@ -8632,6 +8632,20 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   as a head) and the record plane's shipments (a state log's parts are counted under their own names, their
 >   acknowledgements kept per log, never as a head's placement). A holder keeps a state log's records whole, a ledger
 >   never compacted to its newest.
+> - **A repository's family (2026-11-20, A-636 part 2b-2).** A repository's id and every green minted to join it
+>   (its root, a branch, a push's create) are family ids (`ObjectId::family`): the counter's fourth bit marks one, the
+>   next twelve bits are the family's tag (the repository's, a new family's its own number's low twelve) and the last
+>   four bytes its number, unique on the partition (`Db::family_number_at`, the partition's own counter, snapshotted).
+>   Rendezvous hashes an id's line key (`ObjectId::line_key`: a family id with its creator and number cleared), so a
+>   repository, its state logs and every green of it, whichever host minted it, have one set of holders and one
+>   successor, by computation from the id with nothing stored per green (§2 item 12), and an atomic record across a
+>   green's log and a state log is kept or dropped whole by one takeover. A green joins only its repository's family
+>   (`slates_db::repository::in_family`, both guards; else `NotFound`). A green made alone starts a family of its own, so
+>   a repository adopting it joins its family; one minted under no family is refused `Unsupported` (re-keying it would
+>   move every register it has to another id). Placement follows the family, not the successor alone: a green's
+>   successor adopts it from its own holder ledger (A-333), so it must be one of its holders. The cost: a repository's
+>   greens share their holders, so A-642's copyset spreading gives way for them. An id of no family is placed as
+>   before; a partition mints at most 2^44 − 1 of them (`MAX_OBJECT_COUNTER`).
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -12011,9 +12025,9 @@ decides the details.
 > identity and every span it moved, its greens' included (`StateLogRecord`); the record plane ships each as its log's
 > register at the position it leaves the log at, in order, committed at `f + 1`, and a holder keeps it only where it
 > continues its copy of the log, so every holder's copy is a prefix and a successor can rebuild the repository's state
-> from it and keep or drop each operation whole. Owed: the repository's greens placed on its holders at their joins
-> (A-636 part 2b-2), then the server's takeover by this rule, every log of a repository, its greens' included,
-> following one successor (2c); and the repository policy's check before the verdict (A-622's next part).
+> from it and keep or drop each operation whole. A repository's greens are of its family (A-636 part 2b-2), so every
+> log of a repository, its greens' included, is placed on one set of holders and follows one successor. Owed: the
+> server's takeover by this rule (2c); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12554,8 +12568,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    live plane's first piece (A-636 part 2a: the state logs a register class of the repository, placed and taken over as
    it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
    every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
-   operation's identity and spans (A-636 part 2b); owed: the greens placed on their repository's holders at their joins
-   (A-636 part 2b-2) and the server's takeover by the rule (2c).
+   operation's identity and spans (A-636 part 2b); and a repository's greens minted in its family, placed and taken
+   over as it is (A-636 part 2b-2); owed: the server's takeover by the rule (2c).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -13278,8 +13292,10 @@ engine: the verdict, rebase, position mapping, the register).
 > with each one's words in git's order and `post-receive` reading the moved ref in its view's `packed-refs`, a refusing
 > `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
 > with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
-> and `protected_fixtures` 49 of 49, fmt clean). Owed: the read-only attachment; the
-> edges' signal of a client gone, which ends a hook's run; the hooks' learned times; seals kept as derived data.
+> and `protected_fixtures` 49 of 49, fmt clean). The HTTP edge's signal of a client gone ends a hook's run (A-665 part
+> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended). Each hook's run
+> is held to the bound it learned on the owner shard and teaches it as it ends (A-665 part 4b, `ShardState::hook_times`).
+> Owed: the read-only attachment; the SSH edge's signal; seals kept as derived data.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -14514,6 +14530,9 @@ follow the pinned client's own writer (`revlogutils/deltas.py`), so a stream clo
 would have built, and `hg verify` on the clone is the check: the rule is the client's, not a slates tunable. A stream
 is offered only when it holds nothing the principal may not read. The same rendering is the read-only repository the
 admission hooks see and what an export lands (§4.15).
+Status (A-706, stream clones part 1): `slates_hg::render` renders the index whole into those files, each revision a full
+text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
+deltas, the rendering appended as versions commit, `stream_out` and `stream2` are later parts.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -38011,6 +38030,8 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 - **Owed.** The lineage model's mirror of the rule and its own oracle (a live owner's copy let go only while a record at
   least as new is on `f + 1` members), main's to compile and run beyond its default cases; the content release signal
   (a successor confirms once its adopted content is re-placed, a settle certifies content too); the Lineage.tla text.
+  (Status 2026-11-19: the mirror and its oracle are built, A-707; the content release signal is A-529, A-538 and A-546;
+  the text is A-518.)
 
 ### A-502 — The owner feeds a turn's changes to each replica's shard in one message after the turn's replies, and each replica acknowledges a turn once (2026-11-18, goal 87 via g083; A-273; §4.16 "Rebase off the owner"; A-457, A-465, A-473)
 
@@ -52461,6 +52482,8 @@ Applied in the same change to:
   own, so pushes to different greens land on different holders) gives way; the alternative, a commit across holder
   sets per record, is coordination on a write path (CLAUDE.md §2 item 10) and is not built. A green not bound to a
   repository keeps its own placement.
+  Corrected by A-636 part 2b-2: no home change and no configuration entry (a per-green entry is a lookup table, §2 item
+  12); a repository's greens are minted in its family and placed by it from birth, so nothing moves.
 - **Tests** (macOS arm64, Mac Studio, kiln, debug, `CARGO_BUILD_JOBS=2`).
   - The oracle: the repository model test (`every_history_of_entries_equals_the_rules_and_every_crash_recovers_it`, A-603's
     and A-635's generated histories with crashes) now builds a holder's copy of the state logs from the records the
@@ -53890,3 +53913,94 @@ and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `c
   `slates-git` `receive::tests::a_pack_past_its_room_is_refused_in_the_words_of_gits_max_input_size`.
 - **Owed.** The unpack admitting objects into the quarantine a slice at a time (the reader holds them until the pack
   ends, then the quarantine copies them); the whole git/git push and a fresh clone fscked (main's run).
+
+### A-636 part 2b-2 — Routed by id: a repository's greens are minted in its family, so every log of a repository is placed on one set of holders and taken over by one successor, with nothing stored per green (2026-11-20, w-shared for UI goal 93; main's ruling of 2026-11-20)
+- **Why.** 2c's takeover keeps or drops an atomic record whole only when every log it spans, a green's and a state
+  log's, follows one successor (A-636 part 1's rule); a green's logs were placed and taken over by its own id. Main
+  ruled out a configuration entry per green (a lookup table that grows with every branch, CLAUDE.md §2 item 12): route by
+  id, as A-636 part 2a's state logs carry their class in theirs.
+- **Change.** `slates_db::register`: a family id (`ObjectId::family`) is the creator's eight bytes, the partition's two,
+  the family bit (0x10 of byte 10, below the three class bits), a twelve-bit tag and a 32-bit number; `line_key` clears
+  its creator and number, and rendezvous hashes the line key, so placement (`candidates_for`, `copyset_for`) and the
+  successor (`RegionalConfiguration::successor`) follow the family; an id of no family's line key is its placement key,
+  placed as before. `MAX_OBJECT_COUNTER` is 2^44 − 1. The partition counts family numbers apart from volume counters
+  (`Partition::family_counter`, appended to its snapshot; `Db::family_number_at`), so a family's four billion numbers
+  are its creations, never its records. Both join guards (`Repositories::check_joined`, an entry's join) take a green
+  only of its repository's family (`repository::in_family`), else `NotFound`. The server mints family ids
+  (`verbs::fresh_family_id_at`): a repository's id a family of its own (tag = its number mod 4,096), its root, a branch
+  and a push's create in its family, each at its own offset; a green made alone a family of its own.
+- **Placement follows the family, not the successor alone.** A green's successor adopts it from its own holder ledger
+  (A-333, `green_adopt`), and `successor` ranks the survivors of the object's own recovery cohorts, so a successor by
+  the family key must also be one of the green's holders by it. A member is placed by its family from birth, so nothing
+  moves and the configuration group is never touched. The cost: a repository's greens share their holders, so A-642
+  part 1's copyset spreading gives way for them (pushes to two branches of one repository land on the same holders);
+  a lone green is a family of its own and spreads as before. Earlier retirements keep their ranking: every id minted
+  before this change is of no family, its line key its placement key.
+- **A green minted before it joins.** Every join is of a green minted for it, but for `CreateRepository` adopting an
+  existing green as its root: a green made alone starts its own family, and the repository is minted in that family, so
+  it joins. A green minted under no family (an older build's) is refused `Unsupported`: re-keying it at the join would
+  move every register it has (its chain, its catalog, its holders' ledgers) to another id, losing the id its clients
+  hold, and needs a protocol the design does not have; a repository made over a new root serves instead. A repository
+  made by an older build is of no family and joins no new green (`NotFound`).
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20: db lib 124 of 124, `--test model` 26 of 26, `--test wire_order`
+  2 of 2; server lib `repository:: git_push:: vcs_store:: green_adopt takeover:: state_log` 116 of 116 and `merge_service::
+  greens:: green_checkpoint fleet::state_log` 17 of 17; fmt clean). `slates-db` `register::family_tests` (a family minted by three creators at
+  four numbers, every register of each placed on the repository's candidates and taken over by its successor after a
+  retirement, while other families land elsewhere; each field read back; a tag past the largest refused),
+  `register::class_tests` (one past the largest counter reads as a family's), `repository::tests::a_green_joins_only_its_repositorys_family_and_family_ids_move_their_own_counter`
+  (another family's green and a familyless green refused both ways, a successor's member joining; the counters and
+  their snapshot); `slates-server` `repository::tests::a_repository_and_every_green_made_for_it_share_one_line` (a
+  repository, its root and branches on one line; an adopted lone green's repository on its own).
+- **Owed.** The server's takeover adopting a repository's logs and records whole (2c).
+
+### A-707 — The lineage model judges a live owner's settled-away copy and the narrowed round (2026-11-19, UI goal 84 (kiln d9f7a795, w-unresolved); §4.8 "Promotion and takeover"; A-508's and A-556's owed model mirror; A-272 (ii), A-309)
+
+`crates/db/tests/lineage_model.rs`, the executable counterpart of `docs/wip/models/Lineage.tla`, ran neither rule the
+server has run since A-508 and A-556: its live branch let a copy go only on a confirmation, and its round waited on
+every recovery cohort.
+- **The settle rule.** A copy routed to its live writer with no confirmation to judge, held outside all of that owner's
+  neighbourhoods, goes where `RegionalConfiguration::settled_away` holds, and is kept and counted otherwise, as
+  `takeover::settle_away` does.
+- **Its oracle.** Such a release has no adoption to make the copy stale, so A-309's oracle cannot judge it. It is held
+  to the guarantee the rule rests on, `Lineage.tla`'s `SettleKeepsFPlusOne`: where the copy's record was placed, `f + 1`
+  other members hold a record at least as new (a later adoption, or the same adoption at that sequence or after).
+- **The narrowed wait.** The round judges readiness on `readiness_cohorts` and `readiness_current_cohorts`, as the
+  server's round does, so A-556's narrowing is judged by A-309's oracle on every generated history.
+- **Non-vacuity.** Two new verdicts, `reclaimed_settled_away` and `kept_outside`, must each be reached over the fixed
+  seeds.
+
+Applied in the same change to: A-508's owed line (status), GAPS (A-272 (ii)'s A-508 line), the model's module doc.
+
+- **Evidence.** macOS arm64, this Mac, local, 2026-11-19: `cargo test --locked -p slates-db --test lineage_model` 4 of
+  4. Over the 400 fixed seeds: `reclaimed_settled_away` 72, `kept_outside` 2,526, `reclaimed_confirmed` 114,
+  `reclaimed_unasked` 2, `adopted` 764 (242 past tolerance), `completed` 638, no violation. `cargo fmt -p slates-db --
+  --check` clean.
+- **Owed (main's).** The model beyond its default cases (`PROPTEST_CASES`); clippy for the test target.
+
+### A-665 part 4a — The HTTP edge tells a hook's run its client has gone (2026-11-20, w-git for UI goal 93; §4.17.2 "Hooks, in git's terms")
+- **Change.** `Exchange::body_end` takes `vcs_http::ClientGone`, the connection's socket watched once the request's
+  body has ended: its end of stream or a reset resolves it; bytes queued there (a pipelined request, a TLS record such as
+  `close_notify`) leave it unknown and are left for the edge, nothing consumed. git's receive-pack hands it to each
+  hook's run (`git_push`'s `HookCall::run`), so a hook whose client went is ended and what it would have judged refused,
+  in place of `pending()`.
+- **Tests.** `vcs_http::tests::serve::a_service_answering_after_the_body_learns_its_client_has_gone`: quiet while the
+  client waits for its answer, resolved once it closes.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_http::tests::
+  vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, the new test named in the output; fmt clean on the changed files.
+- **Owed.** The SSH edge's signal (the channel's close); a TLS client that sends `close_notify` before it closes is not
+  seen gone; the hooks' learned times; the daemon's presenter (A-665 part 4, main's ruling: the read-only view volume).
+
+### A-665 part 4b — A git hook's run is held to the times its hook learned (2026-11-20, w-git for UI goal 93; §4.17.1 "Policy", A-622's table)
+- **Change.** `vcs_hooks::HookTimesTable` on each shard (`ShardState::hook_times`): one `HookTimes` per configured
+  hook, keyed by its repository and name, kept with the program it learned from (a hook set to run another program
+  starts unlearned); the times of hooks the repository's policy no longer configures are dropped as a run teaches.
+  git's push driver hands each hook call the bound its hook learned (none before a run finished) and teaches the run's
+  lesson as its answer comes back (`git_push`'s `PushHooks::{call, learn}`), so a hook past its learned bound is
+  ended and what it would have judged refused, `ran past its bound`.
+- **Tests.** `vcs_hooks::tests::t_a665_a_hooks_times_are_its_own_program_on_its_own_repository`;
+  `git_push::tests::t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` (each of its three
+  hooks taught one finished run).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_http::tests::
+  vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, both tests named in the output; fmt clean on the changed files.
+- **Owed.** Forgetting a removed repository's hooks (the table drops them only as one of its hooks runs); Subversion's
+  and Mercurial's callers reading and teaching the same table; the daemon's presenter (A-665 part 4).

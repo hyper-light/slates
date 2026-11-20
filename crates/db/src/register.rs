@@ -20,6 +20,8 @@ use crate::catalog::StateLog;
 
 #[cfg(test)]
 mod class_tests;
+#[cfg(test)]
+mod family_tests;
 
 /// A host in the fleet (its id; the creator host lives in a volume id's high bits, §4.8
 /// "Lookup"). One host on a laptop.
@@ -141,10 +143,11 @@ impl ObjectId {
     ObjectId(bytes)
   }
 
-  /// The object whose placement and takeover this id follows: the id with its register class's bits cleared,
-  /// so every register of one object ranks the same holders and the same successor. An id whose second
-  /// counter bit is clear (an own or catalog register's) keeps every bit below the top one as it is, so such
-  /// an id is placed exactly as before the state logs' class.
+  /// The object this id is a register of: the id with its register class's bits cleared, so every register of one
+  /// object leads back to it, and is placed and taken over by its [`line_key`](ObjectId::line_key), so every register
+  /// of one object ranks the same holders and the same successor. An id whose second counter bit is clear (an own or
+  /// catalog register's) keeps every bit below the top one as it is, so such an id is placed exactly as before the state
+  /// logs' class.
   pub const fn placement_key(&self) -> ObjectId {
     let mut bytes = self.0;
     let class = if bytes[CLASS_BYTE] & STATE_CLASS == 0 {
@@ -154,6 +157,112 @@ impl ObjectId {
     };
     bytes[CLASS_BYTE] &= !class;
     ObjectId(bytes)
+  }
+
+  /// A family id (A-636 part 2b-2): an object of a repository's family, the repository's own id or a green minted to
+  /// join it, minted by `creator` on `partition` as its `number`th family id there, under the repository's `tag`. The
+  /// family bit and the tag name the family wherever the id goes, so every object of one family is placed and taken
+  /// over as one ([`ObjectId::line_key`]), with nothing stored per object (§2 item 12: ids route to owners). `None` for
+  /// a tag past [`MAX_FAMILY_TAG`].
+  pub const fn family(creator: HostId, partition: u16, tag: u16, number: u32) -> Option<ObjectId> {
+    if tag > MAX_FAMILY_TAG {
+      return None;
+    }
+    let creator = creator.0.to_be_bytes();
+    let partition = partition.to_be_bytes();
+    let tag = tag.to_be_bytes();
+    let number = number.to_be_bytes();
+    Some(ObjectId([
+      creator[0],
+      creator[1],
+      creator[2],
+      creator[3],
+      creator[4],
+      creator[5],
+      creator[6],
+      creator[7],
+      partition[0],
+      partition[1],
+      FAMILY_BIT | tag[0],
+      tag[1],
+      number[0],
+      number[1],
+      number[2],
+      number[3],
+    ]))
+  }
+
+  /// Whether this id is a family id ([`ObjectId::family`]), of any register class.
+  pub const fn is_family(&self) -> bool {
+    self.0[CLASS_BYTE] & FAMILY_BIT != 0
+  }
+
+  /// A family id's tag, the family it names on its partition ([`ObjectId::family`]); `None` for an id of no family.
+  pub const fn family_tag(&self) -> Option<u16> {
+    if !self.is_family() {
+      return None;
+    }
+    Some(u16::from_be_bytes([
+      self.0[CLASS_BYTE] & FAMILY_TAG_HIGH,
+      self.0[FAMILY_TAG_BYTE],
+    ]))
+  }
+
+  /// A family id's number, unique among the family ids its creator minted on its partition ([`ObjectId::family`]);
+  /// `None` for an id of no family.
+  pub const fn family_number(&self) -> Option<u32> {
+    if !self.is_family() {
+      return None;
+    }
+    let [.., a, b, c, d] = self.0;
+    Some(u32::from_be_bytes([a, b, c, d]))
+  }
+
+  /// The object this id's register is placed and taken over by (A-636 part 2b-2): its placement key, but for a family
+  /// id the family itself, the placement key with its creator and its number cleared, so a repository, its registers and
+  /// every green minted to join it share one set of holders and one successor, whichever host minted each. Rendezvous
+  /// hashes it ([`candidates_for`], [`RegionalConfiguration::successor`]). An id of no family is its placement key, so
+  /// every such id is placed and taken over exactly as before.
+  pub const fn line_key(&self) -> ObjectId {
+    let key = self.placement_key();
+    if !key.is_family() {
+      return key;
+    }
+    // The family's bytes: the partition, the class byte (its class bits cleared: the family bit and the tag's high four
+    // bits) and the tag's low byte. The creator's eight and the number's four are not the family's.
+    let [
+      _,
+      _,
+      _,
+      _,
+      _,
+      _,
+      _,
+      _,
+      partition_high,
+      partition_low,
+      tag_high,
+      tag_low,
+      ..,
+    ] = key.0;
+    ObjectId([
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      partition_high,
+      partition_low,
+      tag_high,
+      tag_low,
+      0,
+      0,
+      0,
+      0,
+    ])
   }
 }
 
@@ -198,11 +307,21 @@ const STATE_LOW: u8 = 0x20;
 const OWN_CLASS: u8 = 0;
 /// Every bit a register class sets: an id minted at or below [`MAX_OBJECT_COUNTER`] carries none of them.
 const CLASS_BITS: u8 = CATALOG_CLASS | STATE_CLASS | STATE_LOW;
-/// The largest per-creator counter an object id may carry: the counter's 48 bits less the three a register
-/// class sets ([`CLASS_BITS`]: the catalog's top bit, AUD-29-17, and the state logs' two below it, A-636
-/// part 2a), so no object's own id reads as another register. An id minter refuses past it.
-/// Format: the counter is the id's last six bytes, 48 bits; the classes take its top three.
-pub const MAX_OBJECT_COUNTER: u64 = (1u64 << 45) - 1;
+/// Format: the family bit (A-636 part 2b-2), the counter's fourth bit, just below the class bits: set for a family id
+/// ([`ObjectId::family`]), whose next twelve bits are its tag and whose last four bytes are its number.
+const FAMILY_BIT: u8 = 0x10;
+/// Format: the bits of the class byte below the family bit, a family id's tag's high four bits.
+const FAMILY_TAG_HIGH: u8 = 0x0F;
+/// Format: the byte of a family id holding its tag's low eight bits, after the class byte.
+const FAMILY_TAG_BYTE: usize = 11;
+/// Format: a family's tag is twelve bits, the class byte's low four and the byte after it, so its largest is 4,095.
+pub const MAX_FAMILY_TAG: u16 = (1u16 << 12) - 1;
+/// The largest per-creator counter an object id of no family may carry: the counter's 48 bits less the three a
+/// register class sets ([`CLASS_BITS`]: the catalog's top bit, AUD-29-17, and the state logs' two below it, A-636 part
+/// 2a) and the family bit below them ([`FAMILY_BIT`], A-636 part 2b-2), so no object's own id reads as another register
+/// or as a family's. An id minter refuses past it.
+/// Format: the counter is the id's last six bytes, 48 bits; the classes take its top three and the family bit the next.
+pub const MAX_OBJECT_COUNTER: u64 = (1u64 << 44) - 1;
 
 /// The width of an encoded object id (16 bytes) — its place in every register wire layout.
 pub const OBJECT_BYTES: usize = size_of::<ObjectId>();
@@ -584,8 +703,9 @@ fn rendezvous_weight(host: u64, object: &ObjectId) -> u64 {
   /// Format: the FNV-1a 64-bit prime.
   const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
   let mut hash = FNV_OFFSET;
-  // Every register class of one object hashes as that object, so its classes share holders and successor.
-  let key = object.placement_key();
+  // Every register class of one object hashes as that object, so its classes share holders and successor; and every
+  // object of one repository's family hashes as the family (A-636 part 2b-2), so they share them too.
+  let key = object.line_key();
   for byte in host.to_le_bytes().iter().chain(key.0.iter()) {
     hash ^= u64::from(*byte);
     hash = hash.wrapping_mul(FNV_PRIME);

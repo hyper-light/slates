@@ -709,8 +709,8 @@ impl Repositories {
     }
   }
 
-  /// A green joins the lineage of a repository that exists, on that repository's partition, once; the lineage's first
-  /// member is its root and every other was made from a member of the same lineage (A-575).
+  /// A green joins the lineage of a repository that exists, of that repository's family ([`in_family`]), once; the
+  /// lineage's first member is its root and every other was made from a member of the same lineage (A-575).
   fn check_joined(
     &self,
     record: &MemberRecord,
@@ -724,7 +724,7 @@ impl Repositories {
       Held::NotGreen => return Err(DbError::NotGreen),
       Held::Green => {}
     }
-    if record.green.partition() != repository.id.partition() {
+    if !in_family(record.green, repository.id) {
       return Err(DbError::NotFound);
     }
     if self.members.contains_key(&record.green) {
@@ -1282,6 +1282,21 @@ impl Repositories {
   }
 }
 
+/// Whether `green` may join `repository`'s lineage by its id (A-636 part 2b-2): a green minted in the repository's
+/// family, so the line key that places a register and names its successor ([`ObjectId::line_key`]) is the
+/// repository's, and every register of the lineage, the green's own and its versions' as much as the repository's state
+/// logs', has one set of holders and one successor. An atomic record spanning a green's log and a state log is then kept
+/// or dropped whole by one takeover (A-636 part 1's rule), with nothing stored per green (§2 item 12). A green of another
+/// family, or of none, would be placed apart from its repository's state, so it never joins; a family's partition is its
+/// repository's, so this holds the green to the repository's partition too (A-575).
+///
+/// [`ObjectId::line_key`]: crate::register::ObjectId::line_key
+pub fn in_family(green: VolumeId, repository: RepositoryId) -> bool {
+  let green = crate::register::ObjectId(green.bytes);
+  let repository = crate::register::ObjectId(repository.bytes);
+  green.is_family() && green.line_key() == repository.line_key()
+}
+
 #[cfg(test)]
 // proptest's strategy types carry `Arc` (D-8's harness exception).
 #[allow(clippy::disallowed_types)]
@@ -1302,12 +1317,11 @@ mod tests {
   /// Shape: another partition, for a green the namespace must refuse.
   const ELSEWHERE: u16 = 4;
 
-  /// An id on `partition` with `serial` in its low byte, as the server mints them.
+  /// An id on `partition` with `serial` its number, in the one family every test id shares (tag 0), as the server mints
+  /// a repository's and its greens' (A-636 part 2b-2), so a green of the partition may join any of its repositories.
   fn id_bytes(partition: u16, serial: u8) -> [u8; 16] {
-    let mut bytes = [0u8; 16];
-    bytes[8..10].copy_from_slice(&partition.to_be_bytes());
-    bytes[15] = serial;
-    bytes
+    crate::register::ObjectId::family(crate::register::HostId(0), partition, 0, u32::from(serial))
+      .map_or([0u8; 16], |id| id.0)
   }
 
   fn repository_id(partition: u16, serial: u8) -> RepositoryId {
@@ -1580,6 +1594,79 @@ mod tests {
   }
 
   /// A green joining `repo`'s lineage as its root, or made from `from` at `version`.
+  /// The greens of [`a_green_joins_only_its_repositorys_family_and_family_ids_move_their_own_counter`], each created on
+  /// `HOME`: two of the repository's family, the second minted by another host (a successor's); one of another family;
+  /// one of no family, minted as a volume's id is.
+  fn family_and_strangers() -> [VolumeId; 4] {
+    let family = |creator: u64, tag: u16, number: u32| VolumeId {
+      bytes: crate::register::ObjectId::family(crate::register::HostId(creator), HOME, tag, number)
+        .map_or([0u8; 16], |id| id.0),
+    };
+    // Format: an id of no family, the creator's eight bytes, the partition's two, then a counter of six.
+    let ordinary =
+      crate::register::ObjectId::new(crate::register::HostId(0), u64::from(HOME) << 48 | 40);
+    [
+      family(0, 0, 21),
+      family(5, 0, 22),
+      family(0, 1, 23),
+      VolumeId { bytes: ordinary.0 },
+    ]
+  }
+
+  /// A-636 part 2b-2 (§4.8 "Promotion and takeover"; §2 item 12). Do: create greens on the repository's partition, two
+  /// of its family (one minted by another host), one of another family and one of no family; join each to the
+  /// repository by a membership record and by an entry; rebuild the partition from its snapshot. Expect: the family's two
+  /// join, whichever host minted them; the other family's and the familyless green are refused `NotFound` both ways,
+  /// nothing applied; the family counter stands one past the highest family number created (the repository's and the
+  /// greens'), the volume counter one past the familyless id's counter alone, and the snapshot keeps both.
+  #[test]
+  fn a_green_joins_only_its_repositorys_family_and_family_ids_move_their_own_counter() {
+    let mut partition = Partition::new(caps(), 0);
+    let [root, successors, stranger, familyless] = family_and_strangers();
+    for id in [root, successors, stranger, familyless] {
+      let created = Op::VolumeCreated {
+        record: volume(id, true),
+      };
+      run(&mut partition, &created).unwrap();
+    }
+    let record = repository(9, "linux");
+    let repo = record.id;
+    run(&mut partition, &Op::RepositoryCreated { record }).unwrap();
+    run(&mut partition, &joined(repo, root, MemberOrigin::Root)).unwrap();
+    let from_root = MemberOrigin::Branch {
+      from: root,
+      version: 0,
+    };
+    let before = partition.to_snapshot(0);
+    for outsider in [stranger, familyless] {
+      let refused = run(&mut partition, &joined(repo, outsider, from_root));
+      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
+      let entry = crate::catalog::RepositoryEntry {
+        repository: repo,
+        joined: vec![MemberRecord {
+          repository: repo,
+          green: outsider,
+          origin: from_root,
+        }],
+        ..crate::catalog::RepositoryEntry::default()
+      };
+      let refused = run(&mut partition, &Op::RepositoryAdvanced { entry });
+      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
+    }
+    assert_eq!(partition.to_snapshot(0), before, "a refused join applied");
+    run(&mut partition, &joined(repo, successors, from_root)).unwrap();
+    assert_eq!(
+      (partition.family_counter(), partition.volume_counter()),
+      (24, 41)
+    );
+    let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
+    assert_eq!(
+      (rebuilt.family_counter(), rebuilt.volume_counter()),
+      (24, 41)
+    );
+    assert_eq!(answers(&rebuilt), answers(&partition));
+  }
+
   fn joined(repo: RepositoryId, green: VolumeId, origin: MemberOrigin) -> Op {
     Op::RepositoryGreenJoined {
       record: MemberRecord {

@@ -64,7 +64,7 @@ use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential;
 
 use super::git::{Authenticator, Located, Repositories, Unproven};
-use super::{Answer, Decided, Exchange, Failed, Site};
+use super::{Answer, ClientGone, Decided, Exchange, Failed, Site};
 use crate::repository::hg_push::Pushing;
 use crate::vcs_policy::{self, Right};
 
@@ -487,7 +487,7 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     Ok(())
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
     let fields: Vec<(&[u8], &[u8])> = self
       .fields
       .iter()

@@ -14,19 +14,26 @@
 //! every asked member having answered (the counting rule is `crates/db/tests/takeover_model.rs`'s subject, not this
 //! one's; past tolerance it waits for every surviving member of the object's cohorts, settled and current, A-309),
 //! adopts the newest reported record under its own placement, and confirms its share only when every object it learned
-//! was adopted (A-272). A holder resolves its copies at each install as `takeover::resolve_held_objects` does:
-//! a line that names a successor moves the copy's routing to it; a line that ends at a completed takeover lets the copy
+//! was adopted (A-272). The round waits on the cohorts the server's round waits on: the departed host's own and those of
+//! the carried retirements whose round ranked the object into it ([`RegionalConfiguration::readiness_cohorts`],
+//! A-556). A holder resolves its copies at each install as `takeover::resolve_held_objects` does: a line that names a
+//! successor moves the copy's routing to it; a line that ends at a completed takeover lets the copy
 //! go when the holder took part in that takeover ([`RegionalConfiguration::settled_for`]); and a successor's
 //! confirmation lets it go when the holder is outside the successor's placement (`stale_after_confirmation`) and was
 //! asked in that round. A holder never asked lets a copy go, on either path, only where the first takeover since the
 //! copy was written, its writer's, recovered the object within tolerance with its share done, judged on that
-//! takeover's kept retirement or its completion record ([`RegionalConfiguration::copy_stale`], A-341, A-484). A holder
-//! sometimes misses installs and installs the newest configuration later, as a lagging node does.
+//! takeover's kept retirement or its completion record ([`RegionalConfiguration::copy_stale`], A-341, A-484). A copy
+//! routed to its live writer with no confirmation to judge, held outside all of that owner's neighbourhoods, goes where
+//! the owner's settled cohort for the object is whole and `f + 1` wide (`takeover::settle_away`,
+//! [`RegionalConfiguration::settled_away`], A-508). A holder sometimes misses installs and installs the newest
+//! configuration later, as a lagging node does.
 //!
 //! **The oracle** is the property A-272 and A-309 exist for: a holder lets a copy go only if its object was adopted
 //! after that copy was written (an adoption made a newer record, so the copy is stale), or the copy's record was never
-//! placed (never acknowledged as durable). And every structure stays bounded: the retirements by one per member, the
-//! completion records by one per member or the ones kept retirements still need.
+//! placed (never acknowledged as durable). A live owner's copy let go by A-508's rule has no adoption to make it stale,
+//! so its oracle is the guarantee the rule rests on (`Lineage.tla`'s `SettleKeepsFPlusOne`): where the copy's record was
+//! placed, a record at least as new stays on `f + 1` other members. And every structure stays bounded: the retirements
+//! by one per member, the completion records by one per member or the ones kept retirements still need.
 //!
 //! **What it found while A-309 was built**, each a history that broke the oracle until the rule after it:
 //! - A takeover with no survivor, or one carried into such a takeover, read settled (the minimal history below).
@@ -54,7 +61,8 @@
 //!   neighbourhoods and the hosts held through it, so a copy first judged after the takeover completed is judged too.
 //!
 //! - `a_takeover_with_no_survivor_lets_no_holder_reclaim_an_object_nobody_adopted`: the minimal history by hand.
-//! - `holders_let_go_only_of_copies_an_adoption_made_stale` (proptest): the oracle and the bounds on every history.
+//! - `holders_let_go_only_of_copies_an_adoption_made_stale` (proptest): the oracles (A-309's, and A-508's for a live
+//!   owner's copy) and the bounds on every history.
 //! - `the_generated_histories_reach_every_verdict`: the non-vacuity counts over a fixed set of seeds.
 //! - `a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record`: the record judgment (A-484) by
 //!   hand, under the oracle.
@@ -184,6 +192,11 @@ struct Counts {
   recovered_past_tolerance: u64,
   /// Takeovers completed into a record.
   completed: u64,
+  /// Copies a live owner's neighbourhood settled away from, let go on its whole settled cohort of `f + 1` (A-508).
+  reclaimed_settled_away: u64,
+  /// Copies a live owner wrote, held outside all of its neighbourhoods, kept because its settled cohort is not whole or
+  /// narrower than `f + 1` (A-508, `fleet.settle.kept_outside`).
+  kept_outside: u64,
 }
 
 impl Counts {
@@ -198,6 +211,8 @@ impl Counts {
     self.adopted += other.adopted;
     self.recovered_past_tolerance += other.recovered_past_tolerance;
     self.completed += other.completed;
+    self.reclaimed_settled_away += other.reclaimed_settled_away;
+    self.kept_outside += other.kept_outside;
   }
 
   /// The verdicts no history reached, by name: empty once every one was reached at least once.
@@ -211,6 +226,8 @@ impl Counts {
       ("adopted", self.adopted),
       ("recovered_past_tolerance", self.recovered_past_tolerance),
       ("completed", self.completed),
+      ("reclaimed_settled_away", self.reclaimed_settled_away),
+      ("kept_outside", self.kept_outside),
     ]
     .into_iter()
     .filter(|(_, count)| *count == 0)
@@ -445,8 +462,8 @@ impl World {
         named_nothing: &named_nothing,
         local: Some(successor),
       };
-      let cohorts = self.regional.recovery_cohorts(departed, object);
-      let current = self.regional.current_cohorts(departed, object);
+      let cohorts = self.regional.readiness_cohorts(departed, object);
+      let current = self.regional.readiness_current_cohorts(departed, object);
       let verdict = readiness(
         &cohorts,
         &current,
@@ -562,7 +579,7 @@ impl World {
             self.reclaim(holder, object);
           }
           Confirmed::Unasked => self.counts.kept_unasked += 1,
-          Confirmed::Not => {}
+          Confirmed::Not => self.settle_away(holder, object, &copy),
         }
         continue;
       }
@@ -640,6 +657,46 @@ impl World {
       (true, false) if self.regional.copy_stale(copy.writer, object) => Confirmed::Covered,
       (true, false) => Confirmed::Unasked,
       (false, _) => Confirmed::Not,
+    }
+  }
+
+  /// `holder`'s copy, routed to the live member `copy.owner` with no confirmation to judge, as `takeover::settle_away`
+  /// judges it (A-508): a copy that owner wrote, held outside all of its neighbourhoods, goes where its settled cohort
+  /// for the object is whole and `f + 1` wide, and is kept, counted, otherwise.
+  fn settle_away(&mut self, holder: HostId, object: ObjectId, copy: &HeldCopy) {
+    if copy.writer != copy.owner || self.regional.holds_for(copy.owner, holder) {
+      return;
+    }
+    if self.regional.settled_away(copy.owner, holder, object) {
+      self.counts.reclaimed_settled_away += 1;
+      self.reclaim_settled_away(holder, object);
+    } else {
+      self.counts.kept_outside += 1;
+    }
+  }
+
+  /// `holder` lets its copy of `object` go by A-508's rule; the oracle records it where its record was placed and fewer
+  /// than `f + 1` other members hold a record at least as new (a later adoption, or the same adoption's sequence or a
+  /// later one).
+  fn reclaim_settled_away(&mut self, holder: HostId, object: ObjectId) {
+    let members = &self.regional.members;
+    let needed = self.regional.quorum.commit();
+    let state = self.objects.get_mut(&object).unwrap();
+    let Some(copy) = state.copies.remove(&holder) else {
+      return;
+    };
+    let at_least_as_new = state
+      .copies
+      .iter()
+      .filter(|(host, other)| {
+        members.contains(host)
+          && (other.adoptions, other.sequence) >= (copy.adoptions, copy.sequence)
+      })
+      .count();
+    if copy.committed && at_least_as_new < needed {
+      self
+        .violations
+        .push((holder, object, copy.adoptions, state.adoptions));
     }
   }
 
@@ -991,8 +1048,9 @@ proptest! {
 /// can never pass as a held property. Do: run the seeds and add up what they did. Expect copies let go by a settled line
 /// and by a confirmed successor, copies kept on an unresolved or lost line and where a takeover that never asked their
 /// holder shows nothing within tolerance, copies let go by such a holder where it does (A-341), some judged on a
-/// completion record (A-484), adoptions (some past tolerance, A-309) and completed takeovers, each at least once, and no
-/// violation.
+/// completion record (A-484), adoptions (some past tolerance, A-309), completed takeovers, and a live owner's copies held
+/// outside its neighbourhoods both let go on a whole settled cohort of `f + 1` and kept (A-508), each at least once, and
+/// no violation.
 #[test]
 fn the_generated_histories_reach_every_verdict() {
   let mut total = Counts::default();

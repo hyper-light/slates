@@ -1328,3 +1328,42 @@ fn t_a687_a_push_record_appends_after_what_the_index_holds() {
   assert_eq!(index_rows(&mut index, &replay_store), held);
   assert_eq!(replay_store.used(), used);
 }
+
+/// Stream clones part 1 (A-706): do render the `dot` and `states` repositories from their imported indexes, phase roots
+/// and bookmarks (`render::render`: split revlogs, full texts, the fncache, `phaseroots`, `.hg/bookmarks`, the
+/// obsstore), then import the rendered files through the same read seam. Expect the same index row for row, every text
+/// held to its node again by the import, and the same phase roots and bookmarks.
+#[test]
+fn a_rendered_repository_imports_back_to_the_same_index() {
+  for name in ["dot", "states"] {
+    let mut store = store();
+    let mut imported = import(&mut repository(name), &mut store, room()).unwrap();
+    let bookmarks: Vec<(&[u8], crate::Node)> = imported
+      .bookmarks
+      .iter()
+      .map(|(mark, node)| (mark.as_slice(), *node))
+      .collect();
+    let files = crate::render::render(
+      &imported.index,
+      &store,
+      (&bookmarks, &imported.phase_roots),
+      &mut room(),
+    )
+    .unwrap();
+    let mut rendered = Repository {
+      files: files
+        .into_iter()
+        .map(|(path, bytes)| (path.strip_prefix(b".hg/").unwrap().to_vec(), bytes))
+        .collect(),
+      ..Repository::default()
+    };
+    let mut again = import(&mut rendered, &mut store, room()).unwrap();
+    assert_eq!(
+      rows(&mut again, &store),
+      rows(&mut imported, &store),
+      "{name}"
+    );
+    assert_eq!(again.phase_roots, imported.phase_roots, "{name}");
+    assert_eq!(again.bookmarks, imported.bookmarks, "{name}");
+  }
+}

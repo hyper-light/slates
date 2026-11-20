@@ -197,13 +197,61 @@ impl std::fmt::Display for EdgeRefused {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Failed(pub(crate) Status);
 
+/// Whether a request's client has gone, as a service waits on something of its own once the request's body has ended (a
+/// git hook's run, A-665): the connection's socket watched for the client's close while the edge reads nothing else.
+/// The body has ended and git's client sends nothing more before it reads the reply, so the socket is silent until the
+/// client closes: its end of stream (the peer's `FIN`) or a reset ends the wait. Bytes queued there instead (a pipelined
+/// request, or a TLS record such as `close_notify` ahead of the close) leave it unknown, so the wait does not end on
+/// them; nothing is consumed, so the edge reads them as before once the service answers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClientGone<'s> {
+  /// The connection's socket; none for a caller with no client (the tests' exchanges).
+  stream: Option<&'s TcpStream>,
+}
+
+impl<'s> ClientGone<'s> {
+  /// The client of the connection over `stream`.
+  pub(crate) fn watching(stream: &'s TcpStream) -> Self {
+    Self {
+      stream: Some(stream),
+    }
+  }
+
+  /// No client to watch: never gone.
+  #[cfg(test)]
+  pub(crate) fn never() -> Self {
+    Self { stream: None }
+  }
+
+  /// Resolves once the client has gone (the type's doc); never while it is there.
+  pub(crate) async fn gone(self) {
+    let Some(stream) = self.stream else {
+      return core::future::pending().await;
+    };
+    let mut peeked = [0u8; 1];
+    loop {
+      if stream.wait_readable().await.is_err() {
+        return;
+      }
+      match stream.peek_now(&mut peeked) {
+        // Its end of stream, or the socket refused (a reset).
+        Ok(Some(0)) | Err(_) => return,
+        // Bytes queued: unknown (the type's doc).
+        Ok(Some(_)) => return core::future::pending().await,
+        // Woken with nothing queued: wait again.
+        Ok(None) => {}
+      }
+    }
+  }
+}
+
 /// A service's exchange for one request: it takes the request's body a run at a time and gives its reply a run at a time,
 /// each run handed on before the next is asked (the engine writes before it reads again).
 pub(crate) trait Exchange {
   /// Takes one run of the request's body, its framing and coding removed.
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed>;
-  /// The request's body has ended.
-  async fn body_end(&mut self) -> Result<(), Failed>;
+  /// The request's body has ended; `gone` resolves if its client goes while the service answers it.
+  async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed>;
   /// The reply's status, asked once as the reply begins, after the body has ended and before the reply's fields: `200`
   /// unless the reply's outcome decides another on a route that decides it after the body ([`StatusMode::AfterBody`]):
   /// the status Git LFS's answer decided (A-629), a WebDAV `PROPFIND`'s `207` or a refusal its body explains
@@ -330,10 +378,10 @@ impl<G: Exchange, H: Exchange> Exchange for ToolExchange<G, H> {
     }
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
     match self {
-      Self::Git(exchange) => exchange.body_end().await,
-      Self::Hg(exchange) => exchange.body_end().await,
+      Self::Git(exchange) => exchange.body_end(gone).await,
+      Self::Hg(exchange) => exchange.body_end(gone).await,
     }
   }
 
@@ -1088,8 +1136,9 @@ impl<S: Site> Parts<S> {
 
   /// Tells the service the request's body ended.
   async fn body_end(&mut self, connection: &mut Connection) -> Flow {
+    let gone = ClientGone::watching(&self.socket.stream);
     let ended = match self.service.as_mut() {
-      Some(started) => started.exchange.body_end().await,
+      Some(started) => started.exchange.body_end(gone).await,
       None => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
     };
     if let Err(Failed(status)) = ended {

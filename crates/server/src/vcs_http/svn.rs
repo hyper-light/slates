@@ -59,7 +59,7 @@ use slates_svn::lock::{AprTime, LockTable};
 use slates_svn::reads::Repository;
 
 use super::git::{Authenticator, Located, Repositories, Unproven};
-use super::{Answer, Decided, Exchange, Failed, Site};
+use super::{Answer, ClientGone, Decided, Exchange, Failed, Site};
 use crate::vcs_policy::{self, Right};
 
 /// Format: the bytes an escape may not name in a repository's path: a slash, which would move a segment's boundary,
@@ -500,7 +500,7 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
     Ok(())
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
     let request = Request {
       method: &self.method,
       path: &self.path,
