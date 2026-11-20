@@ -211,7 +211,7 @@ pub(crate) fn record(
     Record::RevisionProperties { properties, .. } => {
       bytes_of(properties.iter(), core::iter::empty::<&Vec<u8>>())
     }
-    Record::Uuid(_) => 0,
+    Record::Uuid(_) | Record::Locks(_) => 0,
     Record::Created { .. } | Record::Revision(_) => return Err(corrupt()),
   };
   if !crate::vcs_store::lend_svn(state, repository, brought) {
@@ -235,6 +235,12 @@ fn record_growth(
     .ok_or(Uncommitted::NotHeld)?;
   match record {
     Record::Uuid(_) => Ok(0),
+    // A lock verb's entries, judged by the lock table as the records apply them (`check_entries`).
+    Record::Locks(entries) => records
+      .locks()
+      .check_entries(entries)
+      .map(|()| 0)
+      .map_err(|refusal| Uncommitted::Step(StepRefusal::Lock(refusal))),
     Record::RevisionProperties {
       revision,
       properties,
