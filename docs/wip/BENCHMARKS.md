@@ -15365,3 +15365,50 @@ in the logs (the CI artifact `measurer-arms-logs-ubuntu-24.04-arm`; `~/.cache/g2
   27–28, p99 42–50 → 66–72; the Mac 40–43 → 45–48. It lies in the 309 first-parent commits `f2081a3c8..a5233e228`;
   the bisect is next (g222).
 - The goal's bound is not met by any arm: the loaded p99 is milliseconds on both platforms, before W1 too.
+
+## A holder's submit and a local one, phase by phase, release: the forward's first wait was a heartbeat (A-697; main's ruling of 2026-11-20; 2026-11-20)
+
+The by-reference forward's before (main's ruling: measure before building, release, best of N with every N shown).
+Command, on the Mac Studio `d1323898` (Apple M3 Ultra, 32 cores, 96 GB, 8 to 17 GB free, load averages 5 to 13),
+rustc 1.98.1, release, tree `04966bc` (main `e261100c1` and the phase timers): `SLATES_A697_BENCH_FRESH=1
+SLATES_A697_BENCH_MIB=4,64 SLATES_A697_BENCH_RUNS=6 cargo test --release -p slates-server --test fleet bench_a697 --
+--ignored --nocapture --test-threads=1`. Two nodes at `f = 1` in one process; A owns the green, B serves works over it
+(A-697's test hook); a work on B (holder) and one on A (local) each write one new file and submit; a green of its own
+for each run (`FRESH`). Wall time of the submit as its client sees it; every phase is the submit's own counter delta
+over both daemons (`merge.submit.*`).
+
+| Size | Kind | Wall, ms, runs 0 to 5 | Best |
+|---|---|---|---|
+| 4 MiB | holder | 138.0, 145.5, 137.5, 132.7, 136.2, 136.1 | 132.7 |
+| 4 MiB | local | 37.9, 37.7, 35.3, 37.7, 38.2, 37.3 | 35.3 |
+| 64 MiB | holder | 962.2, 944.8, 1568.5, 996.8, 1100.6, 1178.2 | 944.8 |
+| 64 MiB | local | 646.7, 625.2, 636.7, 629.6, 875.8, 628.8 | 625.2 |
+
+Phases, typical (ms): 64 MiB local: compose 140 to 205, judge 25 to 79, append 147 to 178, place 223 to 331 (one
+input shipment), the holder's recompute 21 to 45. 64 MiB holder: compose 153 to 166, the forward to the owner and back
+778 to 1390, inside which the owner's judge 11 to 12, append 85 to 153, place 275 to 326 (three shipments: the inputs
+shipped back to B, which composed them). 4 MiB holder: forward 128 to 141 against the owner's judge, append and place
+of about 33.
+
+- **What it found.** The holder's forward cost about 97 ms over the owner's work at 4 MiB and about 400 at 64 MiB:
+  about 80 ms fixed, then about 5 ms a MiB. The fixed part was the forward's wait for its deferred completion: it slept
+  a heartbeat (100 ms) before its first look at the owner's completion window, then looked once a heartbeat
+  (`verbs::await_deferred_completion`), so every forwarded submit at `f >= 1` was answered at about 100 ms, whatever
+  its commit took. Fixed the same day (the next section).
+- **Corrected on record.** The first release run (tree `3c68e3c`, one shared green) showed every phase growing run to
+  run (append 5 to 44 ms at 4 MiB, 130 to 556 ms at 64 MiB), first reported to main as a cost growing with a green's
+  history. It was the bench: every run inserted its bytes at offset 0 of one shared path, so each version's file held
+  every earlier run's bytes and each increment was larger than the last. A green of its own a run is flat on every
+  phase; the bench now writes a new file a submit (`4e9284ac0`).
+- **Unexplained, owed.** The shared-green run exited 4 at its 64 MiB local run 4, the host under memory pressure
+  (`kern.memorystatus_vm_pressure_level` pressed), with no panic line: owed an explanation before the next table.
+- **Owed.** The same table after the by-reference forward, and the forward lane's throughput (about 200 MB/s on
+  loopback), which main ruled a gap to fix in the same series.
+
+## A forwarded submit answered by its commit, not by a heartbeat poll (A-697 series; AUD-11; 2026-11-20)
+
+`a_forwarded_submit_is_answered_by_its_commit_not_by_a_poll` (`crates/server/tests/fleet.rs`, two nodes at `f = 1`, a
+client on B submitting a work A owns, three times; macOS arm64, this Mac, debug, local): answered in 20.7, 4.4 and 4.9
+ms. With the waiter never attached (the red), each waited out the liveness budget: 1.018, 1.022 and 1.023 s; before the
+fix the first look alone came a heartbeat (100 ms) after the exchange began. The release bench's rerun is owed with the
+by-reference forward's.

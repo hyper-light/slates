@@ -21938,15 +21938,23 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
   assert_eq!(copied, Ok(b"hello".to_vec()), "A's green holds the copy");
 }
 
-/// Whether A (`daemons[0]`) holds no floor of `green` for any of `admitted` within the placement deadline.
+/// Whether A (`daemons[0]`) holds no floor of `green` for any of `admitted`, and B (`daemons[1]`) counted the release,
+/// within the placement deadline.
 fn floors_released(daemons: &[Daemon], green: VolumeId, admitted: &[VolumeId]) -> bool {
   let refs: Vec<&Daemon> = daemons.iter().collect();
+  // B counts the release once A's answer is back, which may be after A dropped the floor: both are waited for (the
+  // counter was read at once, and the test failed once in a batch run, 2026-11-20).
   poll_until(&refs, PLACEMENT_DEADLINE, || {
     let floors = daemons[0].work_floors_of(green)?;
+    let counted = daemons[1]
+      .refusals_on_every_shard()?
+      .get("merge.work.admission_released")
+      .is_some_and(|count| *count >= 1);
     Ok(
-      admitted
-        .iter()
-        .all(|work| floors.iter().all(|(held, _)| held != work)),
+      counted
+        && admitted
+          .iter()
+          .all(|work| floors.iter().all(|(held, _)| held != work)),
     )
   })
 }
@@ -22129,6 +22137,234 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
     (&admitted, &floors_after_loss),
     (released, &released_count),
     &made,
+  );
+}
+
+/// Shape: the bytes one bench edit carries: under the test client's request slot (4 KiB) with the request's own fields.
+const BENCH_EDIT_BYTES: usize = 3800;
+
+/// The phase counters the A-697 bench reads (`merge_service::SUBMIT_JUDGE` and its siblings, `work_home::SUBMIT_COMPOSE`
+/// and its): each pair's count and its sum.
+const BENCH_PHASES: [(&str, &str, &str); 9] = [
+  ("compose", "merge.submit.compose", "merge.submit.compose_ns"),
+  ("compute", "merge.submit.compute", "merge.submit.compute_ns"),
+  ("forward", "merge.submit.forward", "merge.submit.forward_ns"),
+  ("judge", "merge.submit.judge", "merge.submit.judge_ns"),
+  ("append", "merge.submit.append", "merge.submit.append_ns"),
+  ("place", "merge.submit.place", "merge.submit.place_ns"),
+  (
+    "recompute",
+    "merge.submit.recompute",
+    "merge.submit.recompute_ns",
+  ),
+  ("settle", "merge.submit.settle", "merge.submit.settle_ns"),
+  (
+    "shipments",
+    "merge.submit.shipped_versions",
+    "merge.submit.shipments",
+  ),
+];
+
+/// Every counter of both daemons, summed by name.
+fn bench_counters(daemons: [&Daemon; 2]) -> std::collections::BTreeMap<&'static str, u64> {
+  let mut summed = std::collections::BTreeMap::new();
+  for daemon in daemons {
+    for (name, count) in daemon.refusals_on_every_shard().unwrap() {
+      *summed.entry(name).or_insert(0u64) += count;
+    }
+  }
+  summed
+}
+
+/// A green made through `owner`, a client of A, shared with B's account and at version 1, so B replicates it: the A-697
+/// bench's green.
+fn bench_green(owner: &mut Client, daemon_b: &Daemon, name: &str) -> VolumeId {
+  let ReplyBody::GreenCreated { id: green } = owner.call(&RequestBody::CreateGreen {
+    name: name.to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("the bench's green");
+  };
+  share_with_node(owner, green, daemon_b, ALL_RIGHTS);
+  let work = bench_work(owner, green, &format!("{name}-first"), 5);
+  let first = owner.call(&RequestBody::submit(work, Vec::new()));
+  assert!(
+    matches!(
+      first,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{first:?}"
+  );
+  green
+}
+
+/// A work over `green` made through `client` holding one new file of `bytes` bytes, written an edit at a time. The file
+/// is named after the work, so every submit's increment is `bytes` whatever the green already holds: at one shared path,
+/// each run inserted before the last run's bytes, and its increment held all of them (the first release run's growth,
+/// 2026-11-20, was that).
+fn bench_work(client: &mut Client, green: VolumeId, name: &str, bytes: usize) -> VolumeId {
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: name.to_owned(),
+  }) else {
+    panic!("the bench's work");
+  };
+  let piece = vec![0x5a; BENCH_EDIT_BYTES];
+  let mut written = 0usize;
+  while written < bytes {
+    let take = (bytes - written).min(BENCH_EDIT_BYTES);
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: name.to_owned(),
+      at: u64::try_from(written).unwrap(),
+      delete_len: 0,
+      bytes: piece[..take].to_vec(),
+    });
+    assert!(matches!(edited, ReplyBody::Edited), "{written}: {edited:?}");
+    written += take;
+  }
+  work
+}
+
+/// A-697's measured breakdown (main's ruling of 2026-11-20: the by-reference forward is measured before and after,
+/// release, best of N with every N shown). Ignored: a benchmark, run by its recorded command, never by the suite. Do: in
+/// a two-node `f = 1` fleet, A owning a green at version 1 and B serving works over greens A owns (the test hook), for
+/// each size in `SLATES_A697_BENCH_MIB` (comma-separated MiB, default 4) and `SLATES_A697_BENCH_RUNS` runs (default 3):
+/// a work on B (the holder) and one on A (local) each write a file of that size and submit. Prints, a line a submit, its
+/// wall time and every phase's count and milliseconds (both daemons' counters, the submit's own delta), and asserts
+/// each submit accepted. With `SLATES_A697_BENCH_FRESH=1` every size's every run submits to a green of its own, so a
+/// cost that grows with one green's history is told from one that grows with the process.
+#[test]
+#[ignore = "a benchmark: run by its recorded command (docs/wip/BENCHMARKS.md, A-697)"]
+fn bench_a697_holder_and_local_submit_phases() {
+  let _serial = serialize_fleet_tests();
+  let sizes: Vec<usize> = std::env::var("SLATES_A697_BENCH_MIB")
+    .unwrap_or_else(|_| "4".to_owned())
+    .split(',')
+    .map(|mib| mib.trim().parse::<usize>().unwrap() << 20)
+    .collect();
+  let runs: usize = std::env::var("SLATES_A697_BENCH_RUNS")
+    .ok()
+    .and_then(|runs| runs.parse().ok())
+    .unwrap_or(3);
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let fresh = std::env::var("SLATES_A697_BENCH_FRESH").is_ok_and(|fresh| fresh == "1");
+  let mut owner = Client::connect(&instance_a);
+  let shared = bench_green(&mut owner, &daemon_b, "bench-green");
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  for bytes in sizes {
+    for run in 0..runs {
+      let green = if fresh {
+        bench_green(&mut owner, &daemon_b, &format!("bench-green-{bytes}-{run}"))
+      } else {
+        shared
+      };
+      for (kind, client) in [("holder", &mut holder), ("local", &mut owner)] {
+        let work = bench_work(client, green, &format!("bench-{kind}-{bytes}-{run}"), bytes);
+        let before = bench_counters([&daemon_a, &daemon_b]);
+        let started = Instant::now();
+        let submitted = client.call(&RequestBody::submit(work, Vec::new()));
+        let wall = started.elapsed();
+        let after = bench_counters([&daemon_a, &daemon_b]);
+        assert!(
+          matches!(
+            submitted,
+            ReplyBody::Submitted {
+              version: Some(_),
+              ..
+            }
+          ),
+          "{kind} {bytes} run {run}: {submitted:?}"
+        );
+        let delta = |name: &str| {
+          after.get(name).copied().unwrap_or(0) - before.get(name).copied().unwrap_or(0)
+        };
+        let phases: Vec<String> = BENCH_PHASES
+          .iter()
+          .map(|(label, count, sum)| {
+            if *label == "shipments" {
+              format!("{label}={}/{}", delta(sum), delta(count))
+            } else {
+              format!("{label}={:.1}ms/{}", delta(sum) as f64 / 1e6, delta(count))
+            }
+          })
+          .collect();
+        println!(
+          "A697-BENCH size_mib={} kind={kind} run={run} wall_ms={:.1} {}",
+          bytes >> 20,
+          wall.as_secs_f64() * 1e3,
+          phases.join(" ")
+        );
+      }
+    }
+  }
+  daemon_b.serve_works_on_holders(false).unwrap();
+}
+
+/// AUD-11, §4.9 (a forwarded write whose acceptance waits for its quorum commit is answered by the commit, not by a
+/// poll; found by A-697's release bench, 2026-11-20: the exchange slept a heartbeat between looks at the completion
+/// window, so a holder's 4 MiB submit took 130 ms against 33 ms of work at the owner). Do: in a two-node `f = 1` fleet,
+/// a client on B edits and submits, three times, a work A owns. Expect: each answered `Submitted`, version 1 to 3, every
+/// one through the owner's resolve of its deferred acceptance (A's attached and answered counters each moved by three),
+/// the best of the three within a heartbeat, which the poll's first sleep alone exceeded.
+#[test]
+fn a_forwarded_submit_is_answered_by_its_commit_not_by_a_poll() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (_green, work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let count = |name: &str| {
+    daemon_a
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let before = (
+    count("merge.acceptance_forward_attached"),
+    count("merge.acceptance_forward_answered"),
+  );
+  let mut client = Client::connect(daemon_b.instance());
+  let mut versions = Vec::new();
+  let mut walls = Vec::new();
+  for round in 0..3u64 {
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: format!("f{round}"),
+      at: 0,
+      delete_len: 0,
+      bytes: b"forwarded".to_vec(),
+    });
+    assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+    let started = Instant::now();
+    let submitted = client.call(&RequestBody::submit(work, Vec::new()));
+    walls.push(started.elapsed());
+    versions.push(match submitted {
+      ReplyBody::Submitted { version, .. } => version,
+      other => panic!("round {round}: {other:?}"),
+    });
+  }
+  let after = (
+    count("merge.acceptance_forward_attached"),
+    count("merge.acceptance_forward_answered"),
+  );
+  eprintln!("forwarded submits answered in {walls:?}");
+  assert_eq!(versions, [Some(1), Some(2), Some(3)]);
+  // The poll slept a heartbeat before its first look, so no answer could come sooner: the best of three must.
+  let best = walls.iter().min().copied().unwrap_or(Duration::MAX);
+  assert!(
+    best < Duration::from_nanos(HEARTBEAT_NS),
+    "answered within a heartbeat of the commit: {walls:?}"
+  );
+  assert_eq!(
+    (after.0 - before.0, after.1 - before.1),
+    (3, 3),
+    "each answered by its version's resolve"
   );
 }
 
