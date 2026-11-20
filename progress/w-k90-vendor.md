@@ -103,3 +103,11 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
     ToolServices.room; admission = min(request room, StoreLender::room); serve_in_turns + write_within with
     PackSource::turn() (new provided method; ShardPacks overrides with the shard clock + quantum); by-use tests: HTTP
     long-history clone (existing A-713 test now at the request room) + an SSH long-history clone (new).
+ P3b LANDED slates main f14562e4..562b5859: UploadServices::new(lender, room), UploadCommand::new(..., room); admission
+    = min(request room, StoreLender::room); serve_in_turns + write_within(packs.turn()); PackSource::turn (ShardPacks:
+    shard clock + step quantum); SSH dies on a refusal given while writing. By use: HTTP long-history clone (ring
+    region) + new vcs_ssh::tests::receive::a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room
+    (64 KiB). 108 server / 214 git passed.
+ A-745 git half: DONE as asked (sliced answer, slice-only admission, request room, by-use HTTP+SSH). OWED (in GAPS):
+    protocol v0's fetch in turns; begin's ready/cut walks + include-tag scan in units; plans of scattered positions
+    (16 B/run); rule 4 (a fetch held to the index generation it began on); the live git clone matrix rows (main's).
