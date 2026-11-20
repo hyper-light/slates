@@ -25,3 +25,6 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   Snapshot change on a mount = `slates advance ATTACHMENT [SNAPSHOT]`.
 ## For main to delete
 - ~/slates-work/w-realtools-scratch (my experiment tree; nothing mounted)
+- 15:35 PST: FINDING (recorded): one dead hard NFS mount stalls every NFS mount on the macOS client (READDIR/CREATE never
+  sent). Main unmounted w-forming's; root-mounted kiln-01a1f9e974cb... remains (Ada). Real-tool runs moved to another Mac
+  via kiln run (needs macos). Debug prints reverted. Experiment script: worktree .realtools/exp.sh (untracked).
