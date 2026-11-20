@@ -99,6 +99,7 @@ use crate::state::ShardState;
 
 pub(crate) mod commits;
 pub(crate) mod git_encode;
+pub(crate) mod git_replay;
 pub(crate) mod hg_import;
 pub(crate) mod hg_made;
 pub(crate) mod hg_view;
@@ -179,6 +180,9 @@ pub(crate) struct VcsStores {
   rebuild_turns: BTreeMap<RepositoryId, (u64, usize)>,
   /// The last rebuild's generation: a rebuild started again ends the turns of the one before.
   rebuild_generations: u64,
+  /// The git records whose replay is under way a turn at a time (A-722 part 4, [`git_replay`]): at most one a
+  /// repository, the record its rebuild or recovery replays now; bounded by the partition's repositories.
+  git_replays: BTreeMap<RepositoryId, Box<git_replay::GitReplay>>,
   /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
   /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
   objects_charged: BTreeMap<RepositoryId, u64>,
@@ -733,6 +737,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   if state.vcs_stores.rebuild_turns.remove(&id).is_some() {
     state.vcs_stores.rebuilding.remove(&id);
   }
+  abandon_git_replay(state, id);
   paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
@@ -1504,17 +1509,31 @@ fn recorded_alike(
   remade: &RecordWriter,
   record: &Record<'_>,
 ) -> bool {
+  if record.objects.is_empty() {
+    return names_alike(content, store, remade, &record.names);
+  }
   let admitted = remade
     .lacked(lacks(content, store))
     .map(|noted| (noted.kind, noted.identity, noted.len));
-  if record.objects.is_empty() {
-    return admitted.eq(record.names.iter().copied());
-  }
   let recorded = record.objects.iter().map(|object| {
     let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
     (object.kind, object.identity, len)
   });
   admitted.eq(recorded)
+}
+
+/// Whether the objects the replay's admission would record now are `names`, a version-2 record's, in order
+/// ([`recorded_alike`]).
+fn names_alike(
+  content: &ContentStore,
+  store: &GitStore,
+  remade: &RecordWriter,
+  names: &[(slates_git::object_name::Kind, slates_vcs::ContentId, u64)],
+) -> bool {
+  remade
+    .lacked(lacks(content, store))
+    .map(|noted| (noted.kind, noted.identity, noted.len))
+    .eq(names.iter().copied())
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.
@@ -1940,7 +1959,16 @@ pub(crate) async fn recover(
       let outcome = if record.tool == VcsTool::Mercurial {
         replay_hg_sliced(state, record.id, index, slices).await
       } else {
-        replay_record(state, record.id, index)
+        // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
+        let ns = state.config.step_quantum_ns();
+        match record_turn(state, (record.id, index), ns) {
+          Some(RecordTurn::More) => {
+            slices.unit_done().await;
+            continue;
+          }
+          Some(RecordTurn::Replayed(outcome)) => Some(outcome),
+          None => None,
+        }
       };
       let Some(outcome) = outcome else {
         break;
@@ -2030,15 +2058,29 @@ async fn rebuild_turns(id: RepositoryId, generation: u64) {
 /// One turn of repository `id`'s rebuild of `generation`: its next record replayed, or, past the last or at a refusal,
 /// the rebuild ended ([`rebuild_ended`]). Whether more turns remain; none for a rebuild ended or replaced.
 fn rebuild_turn(state: &mut ShardState, id: RepositoryId, generation: u64) -> bool {
+  let ns = state.config.step_quantum_ns();
+  rebuild_turn_within(state, (id, generation), ns)
+}
+
+/// [`rebuild_turn`] held to `ns` of the shard's clock: a git record's replay takes a turn's units at least one
+/// ([`git_replay`], A-722 part 4), any other record whole.
+fn rebuild_turn_within(
+  state: &mut ShardState,
+  (id, generation): (RepositoryId, u64),
+  ns: u64,
+) -> bool {
   let Some((current, index)) = state.vcs_stores.rebuild_turns.get(&id).copied() else {
     return false;
   };
   if current != generation {
     return false;
   }
-  if let Some(outcome) = replay_record(state, id, index)
-    && replayed(state, id, outcome)
-  {
+  let advanced = match record_turn(state, (id, index), ns) {
+    Some(RecordTurn::More) => return true,
+    Some(RecordTurn::Replayed(outcome)) => replayed(state, id, outcome),
+    None => false,
+  };
+  if advanced {
     state
       .vcs_stores
       .rebuild_turns
@@ -2047,6 +2089,102 @@ fn rebuild_turn(state: &mut ShardState, id: RepositoryId, generation: u64) -> bo
   }
   rebuild_ended(state, id);
   false
+}
+
+/// What a turn of a record's replay left.
+enum RecordTurn {
+  /// A git record's replay under way: more turns remain.
+  More,
+  /// The record replayed, or refused.
+  Replayed(Result<(), ReplayRefused>),
+}
+
+/// One turn of repository `id`'s record at `index`, held to `ns` of the shard's clock (A-722 part 4): a git record
+/// carrying a pack replayed a turn's units by its [`git_replay::GitReplay`], begun at its first turn with the room its
+/// bytes take lent, kept between turns; any other record replayed whole ([`replay_record`]). None when it has no record
+/// there.
+fn record_turn(
+  state: &mut ShardState,
+  (id, index): (RepositoryId, usize),
+  ns: u64,
+) -> Option<RecordTurn> {
+  let chunk = usize::try_from(state.config.archive_slice_bytes_within(ns)).unwrap_or(usize::MAX);
+  let deadline_ns = slates_rt::futures::now_ns().saturating_add(ns);
+  let under_way = state.vcs_stores.git_replays.remove(&id);
+  let ShardState {
+    db,
+    store,
+    vcs_stores,
+    ..
+  } = &mut *state;
+  let bytes = db.partition().repositories().object_record(id, index)?;
+  let format = match vcs_stores.entries.get(&id) {
+    Some(RepositoryStore::Git(git)) => Some(git.repository.format()),
+    _ => None,
+  };
+  let stepped =
+    under_way.is_some() || format.is_some_and(|format| git_replay::stepped(bytes, format));
+  if !stepped {
+    return replay_record(state, id, index).map(RecordTurn::Replayed);
+  }
+  let lent = if under_way.is_none() {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+  } else {
+    0
+  };
+  lend(store, vcs_stores, lent);
+  let turned = git_turn_in(vcs_stores, id, bytes, under_way, (deadline_ns, chunk));
+  if !settle_in(store, vcs_stores) {
+    state.count(CHARGE_SHORT, 1);
+  }
+  Some(match turned {
+    Ok(git_replay::Stepped::More(replay)) => {
+      state.vcs_stores.git_replays.insert(id, replay);
+      RecordTurn::More
+    }
+    Ok(git_replay::Stepped::Done(unkept)) => {
+      state.count(VALUE_UNKEPT, unkept);
+      RecordTurn::Replayed(Ok(()))
+    }
+    Err(refused) => RecordTurn::Replayed(Err(refused)),
+  })
+}
+
+/// [`record_turn`]'s turn of a git record's replay over the stores: begun where none is `under_way`.
+fn git_turn_in(
+  stores: &mut VcsStores,
+  id: RepositoryId,
+  bytes: &[u8],
+  under_way: Option<Box<git_replay::GitReplay>>,
+  (deadline_ns, chunk): (u64, usize),
+) -> Result<git_replay::Stepped, ReplayRefused> {
+  let unheld = ReplayRefused::Git(GitRefused::NoStore);
+  let content = stores.content.as_mut().ok_or(unheld.clone())?;
+  let Some(RepositoryStore::Git(store)) = stores.entries.get_mut(&id) else {
+    return Err(unheld);
+  };
+  let replay = match under_way {
+    Some(replay) => replay,
+    None => git_replay::GitReplay::begin(content, store.repository.format(), bytes)?,
+  };
+  let turn = git_replay::Turn { deadline_ns, chunk };
+  let mut now = slates_rt::futures::now_ns;
+  replay.step((content, store), bytes, (turn, &mut now))
+}
+
+/// Gives back what repository `id`'s git record's replay under way holds, where one is: its rebuild ended or replaced.
+fn abandon_git_replay(state: &mut ShardState, id: RepositoryId) {
+  let Some(replay) = state.vcs_stores.git_replays.remove(&id) else {
+    return;
+  };
+  let given = state
+    .vcs_stores
+    .content
+    .as_mut()
+    .map(|content| replay.abandon(content));
+  if !matches!(given, Some(Ok(()))) {
+    state.count(RELEASE_REFUSED, 1);
+  }
 }
 
 /// A git or Subversion rebuild's end: the store lent again, then each git green's map made again in slices by its build
@@ -2091,6 +2229,18 @@ pub(crate) fn rebuild_turn_once(state: &mut ShardState, id: RepositoryId) -> boo
     .get(&id)
     .copied()
     .is_some_and(|(generation, _)| rebuild_turn(state, id, generation))
+}
+
+/// One turn of repository `id`'s git or Subversion rebuild under way, held to `ns` of the shard's clock: whether more
+/// remain.
+#[cfg(test)]
+pub(crate) fn rebuild_turn_once_within(state: &mut ShardState, id: RepositoryId, ns: u64) -> bool {
+  state
+    .vcs_stores
+    .rebuild_turns
+    .get(&id)
+    .copied()
+    .is_some_and(|(generation, _)| rebuild_turn_within(state, (id, generation), ns))
 }
 
 /// [`rebuild`] in one step, every record replayed at once: the tests' and Mercurial's tests'.
