@@ -304,8 +304,9 @@ const CONFLICT_AT: &str = "Conflict at";
 /// What the drive reads from the green beyond the index, and how the green names what the work makes (§4.17.4 item 1:
 /// texts and property lists are content, named by their identity).
 pub trait Green {
-  /// The text held as `identity`; `None` when the green does not hold it.
-  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]>;
+  /// The text held as `identity`, borrowed where the green holds it in one piece, owned where it must copy it; `None`
+  /// when the green does not hold it.
+  fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>>;
 
   /// The property list held as `identity`, every property, in any order; `None` when the green does not hold it.
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>>;
@@ -2090,14 +2091,14 @@ impl Drive {
     let source = match delta.source {
       Some(identity) => texts
         .get(&identity)
-        .map(Vec::as_slice)
+        .map(|text| std::borrow::Cow::Borrowed(text.as_slice()))
         .or_else(|| green.text(&identity)),
-      None => Some(&[][..]),
+      None => Some(std::borrow::Cow::Borrowed(&[][..])),
     };
     let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(
       IndexRefusal::Corrupt,
     )))?;
-    read_windows(delta, source)?;
+    read_windows(delta, &source)?;
     let after = delta.pending.len().saturating_add(delta.target.len());
     let held = held.saturating_sub(before).saturating_add(after);
     if held > room {

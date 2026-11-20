@@ -101,6 +101,7 @@ pub(crate) mod commits;
 pub(crate) mod git_encode;
 pub(crate) mod hg_import;
 pub(crate) mod hg_view;
+pub(crate) mod homes;
 pub(crate) mod lfs_record;
 pub(crate) mod paths;
 pub(crate) mod record;

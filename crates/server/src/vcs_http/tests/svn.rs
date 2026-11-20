@@ -309,10 +309,12 @@ impl Repository for Repo {
     )
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     let text = self.texts.get(identity)?;
     let start = usize::try_from(offset).ok()?;
-    text.get(start..start.saturating_add(PIECE).min(text.len()))
+    text
+      .get(start..start.saturating_add(PIECE).min(text.len()))
+      .map(std::borrow::Cow::Borrowed)
   }
 }
 
@@ -612,7 +614,10 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
   };
   let fetched = stores
     .lend(id, &owner, |lent| {
-      lent.repository.text(&text.identity, 0).map(<[u8]>::to_vec)
+      lent
+        .repository
+        .text(&text.identity, 0)
+        .map(std::borrow::Cow::into_owned)
     })
     .flatten()
     .expect("the text");

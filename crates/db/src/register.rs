@@ -698,15 +698,21 @@ pub fn copyset_for(object: ObjectId, copysets: &[Vec<HostId>]) -> Option<Vec<Hos
 /// research calls for a good mixer, and this is replaced by the measured one when placement is
 /// tuned in Phase 8).
 fn rendezvous_weight(host: u64, object: &ObjectId) -> u64 {
+  // Every register class of one object hashes as that object, so its classes share holders and successor; and every
+  // object of one repository's family hashes as the family (A-636 part 2b-2), so they share them too.
+  rendezvous_weight_of(host, &object.line_key().0)
+}
+
+/// The rendezvous weight of `member` (a host, or a shard of one node) for `key`: the one hash every placement in slates
+/// ranks by, an object's line key ([`rendezvous_weight`]) or a content's identity (A-724: content homed by identity,
+/// §4.17.5, across a node's shards and a region's members alike, R8).
+pub fn rendezvous_weight_of(member: u64, key: &[u8]) -> u64 {
   /// Format: the FNV-1a 64-bit offset basis (Fowler, Noll, Vo).
   const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
   /// Format: the FNV-1a 64-bit prime.
   const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
   let mut hash = FNV_OFFSET;
-  // Every register class of one object hashes as that object, so its classes share holders and successor; and every
-  // object of one repository's family hashes as the family (A-636 part 2b-2), so they share them too.
-  let key = object.line_key();
-  for byte in host.to_le_bytes().iter().chain(key.0.iter()) {
+  for byte in member.to_le_bytes().iter().chain(key.iter()) {
     hash ^= u64::from(*byte);
     hash = hash.wrapping_mul(FNV_PRIME);
   }
@@ -747,6 +753,17 @@ pub fn rendezvous_ranked(hosts: &[HostId], object: ObjectId) -> Vec<HostId> {
     .collect();
   ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
   ranked.into_iter().map(|(_, host)| host).collect()
+}
+
+/// `members` in rendezvous order for `key` ([`rendezvous_weight_of`]): the highest weight first, the lowest member
+/// breaking a tie, as [`rendezvous_ranked`] orders hosts for an object.
+pub fn rendezvous_ranked_by_key(members: &[u64], key: &[u8]) -> Vec<u64> {
+  let mut ranked: Vec<(u64, u64)> = members
+    .iter()
+    .map(|member| (rendezvous_weight_of(*member, key), *member))
+    .collect();
+  ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+  ranked.into_iter().map(|(_, member)| member).collect()
 }
 
 /// The number of **distinct copysets** Copyset Replication lays down over `hosts` nodes at scatter width

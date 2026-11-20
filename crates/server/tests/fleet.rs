@@ -6177,6 +6177,57 @@ fn never_sealed_after_the_loss(
   }
 }
 
+/// What A-544's test held before a's loss: the first clone snapshotted, its capture record recorded, and both survivors
+/// holding the sealed head with its catalog and the never-sealed clone's catalog.
+fn assert_held_before_the_loss(snapshotted: &ReplyBody, before: &HeldBeforeTheLoss) {
+  assert!(
+    matches!(snapshotted, ReplyBody::Snapshotted { .. }),
+    "the agent's first clone was snapshotted: {snapshotted:?}"
+  );
+  assert!(
+    before.recorded,
+    "a recorded the capture record for the clone's own head (`{CARRY_RECORDED}`)"
+  );
+  assert!(
+    before.carried,
+    "both survivors held the clone's sealed head and the catalog carrying the record for it before a's loss"
+  );
+  assert!(
+    before.catalogued,
+    "both survivors held the never-sealed clone's catalog before a's loss"
+  );
+}
+
+/// A-544's never-sealed clone after a's loss: served by its successor as its creation head, an empty tree, and its
+/// landing refused `Unsupported`, nothing written.
+fn assert_the_never_sealed_clone_refused(refused: &NeverSealedAfterTheLoss, described: &str) {
+  assert!(
+    refused.served,
+    "the never-sealed clone's successor serves it (last: {:?}); {described}",
+    refused.listed
+  );
+  assert!(
+    matches!(&refused.listed, Some(ReplyBody::DirPage { entries, next: None }) if entries.is_empty()),
+    "the never-sealed clone is served as its creation head, an empty tree: {:?}",
+    refused.listed
+  );
+  assert!(
+    matches!(
+      &refused.presented,
+      Some(ReplyBody::Refused {
+        refusal: Refusal::Unsupported { .. }
+      })
+    ),
+    "the never-sealed clone's landing is refused by kind, never landed as its empty tree: {:?}",
+    refused.presented
+  );
+  assert_eq!(
+    refused.disk,
+    untouched(),
+    "nothing of the refused landing was written"
+  );
+}
+
 /// A-544's fleet test (§4.15 `capture_base` and "Plan", §4.8 "Promotion and takeover"; filed by g267 for main): a
 /// captured clone taken over after its owner's loss lands against its capture on its successor, and one never sealed is
 /// refused by kind. Three daemons at `f = 1`. Do: on a, overlay the captured tree, capture its base and clone the capture
@@ -6223,22 +6274,7 @@ fn a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture()
   for daemon in members.daemons {
     daemon.stop();
   }
-  assert!(
-    matches!(snapshotted, ReplyBody::Snapshotted { .. }),
-    "the agent's first clone was snapshotted: {snapshotted:?}"
-  );
-  assert!(
-    before.recorded,
-    "a recorded the capture record for the clone's own head (`{CARRY_RECORDED}`)"
-  );
-  assert!(
-    before.carried,
-    "both survivors held the clone's sealed head and the catalog carrying the record for it before a's loss"
-  );
-  assert!(
-    before.catalogued,
-    "both survivors held the never-sealed clone's catalog before a's loss"
-  );
+  assert_held_before_the_loss(&snapshotted, &before);
   let (landed, refused, described) = after.expect("the loss ran once its preconditions held");
   assert!(
     landed.placed,
@@ -6254,31 +6290,7 @@ fn a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture()
     .as_ref()
     .expect("the successor's landing was presented");
   assert_the_agents_changes_landed_alone(landing, &landed.disk, &landed_alone(), &described);
-  assert!(
-    refused.served,
-    "the never-sealed clone's successor serves it (last: {:?}); {described}",
-    refused.listed
-  );
-  assert!(
-    matches!(&refused.listed, Some(ReplyBody::DirPage { entries, next: None }) if entries.is_empty()),
-    "the never-sealed clone is served as its creation head, an empty tree: {:?}",
-    refused.listed
-  );
-  assert!(
-    matches!(
-      &refused.presented,
-      Some(ReplyBody::Refused {
-        refusal: Refusal::Unsupported { .. }
-      })
-    ),
-    "the never-sealed clone's landing is refused by kind, never landed as its empty tree: {:?}",
-    refused.presented
-  );
-  assert_eq!(
-    refused.disk,
-    untouched(),
-    "nothing of the refused landing was written"
-  );
+  assert_the_never_sealed_clone_refused(&refused, &described);
 }
 
 /// What A-565's test saw: the clone's live shipping, its snapshot, its capture record, its move to b and b's reading
@@ -6293,6 +6305,40 @@ struct MovedLiveClone {
   last: Option<ReplyBody>,
   landing: Option<LandingSeen>,
   disk: OnDisk,
+}
+
+/// What A-565's test expects of what it saw: the clone shipped live, snapshotted, its capture recorded, moved to b and
+/// served whole there, and b's landing the agent's changes alone.
+fn assert_the_moved_live_clone_landed(seen: &MovedLiveClone, described: &str) {
+  assert!(
+    matches!(
+      seen.shipped,
+      ReplyBody::LiveShippingSet { live_shipped: true }
+    ),
+    "the clone ships live: {:?}",
+    seen.shipped
+  );
+  assert!(
+    matches!(seen.snapshotted, ReplyBody::Snapshotted { .. }),
+    "the agent's clone was snapshotted: {:?}",
+    seen.snapshotted
+  );
+  assert!(
+    seen.recorded,
+    "a recorded the capture record for the clone's own head (`{CARRY_RECORDED}`); {described}"
+  );
+  assert!(
+    seen.moved,
+    "the clone's move to b was done (answers: {:?}); {described}",
+    seen.answers
+  );
+  assert!(
+    seen.served,
+    "b serves the agent's tree (last: {:?}); {described}",
+    seen.last
+  );
+  let landing = seen.landing.as_ref().expect("b's landing was presented");
+  assert_the_agents_changes_landed_alone(landing, &seen.disk, &landed_alone(), described);
 }
 
 /// A-565's fleet test (§4.15 `capture_base`, §4.10 "Live shipping" and "Ownership follows the writer"; filed by g267 for
@@ -6356,36 +6402,11 @@ fn a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_captur
   for daemon in members.daemons {
     daemon.stop();
   }
-  assert!(
-    matches!(
-      seen.shipped,
-      ReplyBody::LiveShippingSet { live_shipped: true }
-    ),
-    "the clone ships live: {:?}",
-    seen.shipped
-  );
-  assert!(
-    matches!(seen.snapshotted, ReplyBody::Snapshotted { .. }),
-    "the agent's clone was snapshotted: {:?}",
-    seen.snapshotted
-  );
-  assert!(
-    seen.recorded,
-    "a recorded the capture record for the clone's own head (`{CARRY_RECORDED}`); {described}"
-  );
-  assert!(
-    seen.moved,
-    "the clone's move to b was done (answers: {:?}); {described}",
-    seen.answers
-  );
-  assert!(
-    seen.served,
-    "b serves the agent's tree (last: {:?}); {described}",
-    seen.last
-  );
-  let landing = seen.landing.as_ref().expect("b's landing was presented");
-  assert_the_agents_changes_landed_alone(landing, &seen.disk, &landed_alone(), &described);
+  assert_the_moved_live_clone_landed(&seen, &described);
 }
+
+/// A file of a tree and its bytes: `(path, bytes)`.
+type Rewrite<'a> = (&'a str, &'a [u8]);
 
 /// Shape: what b rewrites `/changed` to after the first move of A-589's test: bytes a's copy never held, so an old
 /// owner that answered from its copy would show it.
@@ -6473,7 +6494,7 @@ fn moved_on(
   mover: &mut Client,
   (from, to): (usize, usize),
   volume: VolumeId,
-  (tree, rewrite): (&[(&str, &[u8])], (&str, &[u8])),
+  (tree, rewrite): (&[Rewrite<'_>], Rewrite<'_>),
   previous: &[usize],
 ) -> (MovedOn, Client) {
   let (moved, answers) = move_until_done(fleet, mover, volume, members.hosts[to]);
@@ -6546,6 +6567,18 @@ fn assert_moved_on(
     "{to} serves the volume's tree whole (last: {:?}); {described}",
     seen.last
   );
+  assert_the_new_owner_holds_its_record(seen, to, access_before, name);
+  assert_the_move_ended(seen, (from, to), current, described);
+}
+
+/// The new owner `to`'s view of the moved volume: no `/removed`, its catalog record carrying the access list a held
+/// (`access_before`), and its status naming the volume `name`.
+fn assert_the_new_owner_holds_its_record(
+  seen: &MovedOn,
+  to: &str,
+  access_before: Option<&Vec<slates_db::catalog::AccessEntry>>,
+  name: &str,
+) {
   assert!(
     matches!(
       seen.removed,
@@ -6566,6 +6599,16 @@ fn assert_moved_on(
     "{to} reports the volume as {name}: {:?}",
     seen.status
   );
+}
+
+/// How a move from `from` to `to` ended: `to` took a write and serves it, every previous owner's answer for `current`
+/// is never stale, `from` let its copy go, and the counters say `from` began it and `to` adopted it once and reported it.
+fn assert_the_move_ended(
+  seen: &MovedOn,
+  (from, to): (&str, &str),
+  current: &[u8],
+  described: &str,
+) {
   assert!(
     seen.rewrote && seen.serves_the_rewrite,
     "{to} takes a write to the moved volume and serves it; {described}"
