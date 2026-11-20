@@ -4,9 +4,13 @@ Ada's goal of 2026-11-20: one server serves toy repositories and monorepos at on
 `docs/wip/BENCHMARKS.md` records each run; the command is the contract.
 
 What it shows. Whether one daemon divides itself among many repositories so that a huge or hot repository never
-starves the others: per size class, each push's wall time to its whole answer at p50 and p99 against the same class's
-push made alone (its starvation ratio), split into connecting, sending the whole request and waiting for the answer;
-the refusals by kind; and the daemon's resident set before and at its peak.
+starves the others: per size class, each push's wall time to its whole answer at p50 and p99, split into connecting,
+sending the whole request and waiting for the answer; the refusals by kind; and the daemon's resident set before and at
+its peak. Starvation is the class's p99 over its fair-share ideal (main's ruling of 2026-11-20): under saturation no
+push can match its time alone, so each push is held to when its repository would finish if the daemon's shards were
+shared fairly among the repositories with work (`fair_share_ideal`), once with each repository on one shard (its
+intake on its owner today) and once spread over as many shards as it has pushes. A ratio near one is fair; well above
+one is starvation.
 
 The repositories. A step of R repositories gives the repository of rank i (1 to R) the pack of size class
 `classes - 1 - min(classes - 1, d(i))`, where d(1) = 0 and d(i) = floor(log10(i - 1)) + 1: rank 1 the largest, ranks
@@ -217,6 +221,48 @@ def counters(daemon: Daemon) -> dict[str, int]:
     return found
 
 
+def shard_count(daemon: Daemon) -> int:
+    """The daemon's shards, from its status report: the capacity the fair-share ideal divides (one core a shard)."""
+    out = daemon.cli("status", "--json", check=False).stdout
+    counted = len(re.findall(r'"partition"\s*:', out))
+    return counted if counted else (os.cpu_count() or 1)
+
+
+def fair_share_ideal(work: dict[str, float], parallel: dict[str, int], capacity: int) -> dict[str, float]:
+    """When each repository would finish under the fair-share ideal (A-724; main's ruling of 2026-11-20): processor
+    sharing of `capacity` cores among the repositories with work left, each given an equal part of what the capacity
+    holds (max-min fair, the single-resource case of dominant-resource fairness), at most `parallel[r]` cores
+    (the most it can use at once), from time zero. `work[r]` is its seconds of work: its pushes times its class's push
+    alone. Exact: between completions the rates are constant, so it steps from one completion to the next."""
+    left = {r: w for r, w in work.items() if w > 0}
+    done = {r: 0.0 for r in work}
+    now = 0.0
+    while left:
+        # Water-fill the capacity over the repositories left, each capped by what it can use at once.
+        rate: dict[str, float] = {}
+        room = float(capacity)
+        open_ = sorted(left, key=lambda r: parallel[r])
+        while open_:
+            even = room / len(open_)
+            r = open_[0]
+            if parallel[r] <= even:
+                rate[r] = float(parallel[r])
+                room -= rate[r]
+                open_.pop(0)
+            else:
+                for r in open_:
+                    rate[r] = even
+                open_ = []
+        step = min(left[r] / rate[r] for r in left)
+        now += step
+        for r in list(left):
+            left[r] -= rate[r] * step
+            if left[r] <= 1e-12 * max(1.0, work[r]):
+                done[r] = now
+                del left[r]
+    return done
+
+
 def fresh_daemon(slates: str, label: str) -> Daemon:
     return Daemon(slates, instance=f"w-balance-multi-{os.getpid()}-{label}")
 
@@ -281,6 +327,7 @@ def main():
                 for k in range(count):
                     branch = f"p{k}"
                     pushes.append((f"r{rank}", size, request(head, pack, branch), branch))
+            capacity = shard_count(daemon)
             results, wall, before, peak = asyncio.run(burst(daemon, pushes))
             alive = rss_kib(daemon.pid) > 0
             seen = counters(daemon) if alive else {}
@@ -291,6 +338,16 @@ def main():
             print("  counters: " + ", ".join(f"{k}={v}" for k, v in sorted(seen.items())), flush=True)
         print(f"R={repositories}: {total} pushes, wall {wall:.3f} s, rss {before / 1024:.0f} -> peak {peak / 1024:.0f} MiB, "
               f"refused {refused}, daemon {'alive' if alive else 'GONE'}", flush=True)
+        # The fair-share ideal of each push: its repository's finish under processor sharing of the daemon's shards,
+        # its repository using at most one shard (today: its whole intake on its owner) and, beside it, as many as it
+        # has pushes (what intake off the owner shard makes possible).
+        work = {f"r{rank}": counts[rank - 1] * alone[classes[rank - 1]] for rank in range(1, repositories + 1)}
+        owner_bound = fair_share_ideal(work, {r: 1 for r in work}, capacity)
+        spread = fair_share_ideal(work, {f"r{rank}": max(1, counts[rank - 1]) for rank in range(1, repositories + 1)}, capacity)
+        ideal_one = [owner_bound[name] for name, _, _, _ in pushes]
+        ideal_many = [spread[name] for name, _, _, _ in pushes]
+        print(f"  fair-share ideal over {capacity} shards: each push's repository finishing at p99 "
+              f"{quantile(ideal_one, 0.99):.3f} s (one shard a repository), {quantile(ideal_many, 0.99):.3f} s (spread)", flush=True)
         for size in range(len(packs)):
             mine = [(took, words) for got, took, words in results if got == size]
             if not mine:
@@ -304,8 +361,12 @@ def main():
             for at, name in enumerate(("connect", "send", "answer")):
                 values = [split[at] for split in parts]
                 print(f"    {name}: p50 {quantile(values, 0.5):.3f} s, p99 {quantile(values, 0.99):.3f} s", flush=True)
+            ideal_owner = quantile([i for (got, *_), i in zip(results, ideal_one) if got == size], 0.99)
+            ideal_spread = quantile([i for (got, *_), i in zip(results, ideal_many) if got == size], 0.99)
             print(f"  class {size}: {len(mine)} pushes over {classes.count(size)} repositories, "
-                  f"p50 {quantile(times, 0.5):.3f} s, p99 {p99:.3f} s, starvation {p99 / alone[size]:.1f}x alone; "
+                  f"p50 {quantile(times, 0.5):.3f} s, p99 {p99:.3f} s ({p99 / alone[size]:.1f}x alone); "
+                  f"starvation {p99 / ideal_owner:.2f}x its fair share (one shard a repository, ideal p99 {ideal_owner:.3f} s), "
+                  f"{p99 / ideal_spread:.2f}x spread (ideal {ideal_spread:.3f} s); "
                   + ", ".join(f"{k} x{v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])), flush=True)
         # Learn each class's memory a push from this step, apportioned by its share of the bytes sent.
         sent = sum(len(packs[size][0]) * count for size, count in zip(classes, counts)) or 1
