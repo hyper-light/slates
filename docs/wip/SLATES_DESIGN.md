@@ -12174,6 +12174,28 @@ is one more version, and the chain itself is never rewritten.
 
 **A push is a work.**
 
+**A push's intake (the rule for every tool's push and commit; A-719, main's ruling 2026-11-20).** Ada's target is tens
+of thousands of concurrent large pushes on one server, many of them to one repository, so an intake is held to four
+rules, which git's, Mercurial's and Subversion's intakes cite:
+1. *Its working set is bounded whatever its size.* Its objects are decoded as they arrive and each is stored once, in
+   the repository's one byte store, as it resolves; a delta is resolved against a base already stored (an offset
+   delta's lies earlier in the pack, a thin pack's reference delta's in the repository). Nothing holds the whole pack,
+   or every object verified in memory: at once an intake holds the entry being read, a delta with its base and its
+   target, the deltas still waiting for their bases, and tables of a few words an object.
+2. *Admission charges that working set.* The content a push adds is charged as it is stored (A-714's retention), and a
+   push past the shard's room is refused typed, never by one request's room (A-704, A-713).
+3. *Every pass runs a turn at a time* under the shard's step quantum (§4.3): reading, the checks, the store's admission
+   and the verdicts. No step of a push is longer than its quantum by more than one unit of work.
+4. *Intakes run concurrently, one repository's too.* Each push has its own working set (or its own fork); only its
+   landing, the verdict against the head and the ref's move, is ordered per repository, as Subversion's revision
+   assignment is the only ordered step of a commit.
+
+> **Status (2026-11-20, A-719 parts 1 and 2).** Rule 3's checks are built for git (part 1: `slates_git::receive::Checking`);
+> rule 1's reader seam is built (part 2: `slates_git::unpack::Keep`, each object handed to its keeper as it resolves,
+> with the hold its bytes took, and a delta's base read back from it). Owed: git's intake keeping into the repository's
+> store as it reads (part 3), on w-perf's byte table once it lands; admission by the working set; the store's
+> admission and the verdicts a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
+
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
 > the tool named them by, read through `PushObjects` (tree entries, a blob's length, a blob's bytes; a store implements
@@ -54244,3 +54266,20 @@ Applied in the same change to:
   delta's in the repository), no whole pack held; admission charging that working set and the content charged as it is
   stored (A-714's retention), refused typed at the shard's room; the quarantine's admission and the verdicts made a turn
   at a time; the by-use proof over w-interop's v2.0.0 cut and whole git/git.
+
+### A-719 part 2 — A pack is read into a keeper, its working set bounded whatever its size (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" item 3)
+- **Change.** `slates_git::unpack::Keep`: the reader hands its keeper each object as it resolves, with the hold
+  (`Admission::hold`) its bytes took, and reads a delta's base back from it; it keeps only what names each object
+  (`Reader::read_into`, `Reader::finish_into`, answering each object's place, `Placed`, in pack order). A keeper that
+  stores objects elsewhere gives each hold back, so the reader's admission bounds its working set (the entry being read,
+  a delta with its base and its target, the deltas waiting for their bases, its tables), not the pack. `Held`, the
+  reader's own keeper, keeps every object and its charge, so `Reader::read`, `Reader::finish`, `finish_with` and
+  `read_whole` answer and charge as before. The rule it serves is written into §4.17.1 ("A push's intake").
+- **Tests.** `slates-git` `unpack::tests::a_pack_read_into_a_keeper_that_stores_elsewhere_holds_a_bounded_working_set`
+  (the 300-deep chain read into a keeper that stores elsewhere, fed in pieces of 61 bytes, under an admission of its
+  tables and eight versions, which cannot hold a third of its targets: every object as the pack read whole makes it;
+  read into memory under the same admission, refused).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- unpack:: receive::
+  protected_fixtures store:: upload::` 224 passed, 4 ignored, the new test named; fmt clean.
+- **Owed.** Part 3: git's intake keeping into the repository's store as the pack is read (the session and the push
+  driver over a store keeper, the checks reading objects back from it), on w-perf's byte table once it lands.

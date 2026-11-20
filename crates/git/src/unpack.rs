@@ -47,13 +47,15 @@
 //! target charged. Memory is reserved with `try_reserve_exact`, so no allocation can panic. The inflater's own state is
 //! one fixed size for a reader, zlib's documented window and state, not scaled by the input, and is not charged.
 
+use std::borrow::Cow;
+
 use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::delta;
 use crate::entry::{self, PACK_HEADER_LEN, Representation};
 use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId, name_of};
 use crate::pack::{self, idx::Idx};
-use crate::{Admission, PastAdmission, to_u64};
+use crate::{Admission, Hold, PastAdmission, to_u64};
 
 /// Where the object named `id` begins in the pack being read: what an index answers, such as A-591's [`Idx`].
 pub trait Locate {
@@ -126,6 +128,105 @@ pub struct Object {
 pub struct Unpacked {
   /// Its objects, in pack order.
   pub objects: Vec<Object>,
+  /// Its trailer.
+  pub checksum: ObjectId,
+}
+
+/// Where a reader's objects go as each resolves, and where a delta's base is read back from (A-719 part 2; §4.17.1, a
+/// push's working set bounded whatever its size). The reader hands its keeper every object it resolves, with the hold
+/// on its admission that its bytes took; then it holds only what names the object. A keeper that stores an object
+/// elsewhere gives its hold back, so the reader's working set is an entry being read, a delta, its base and its
+/// target, and the deltas still waiting for their bases; one that keeps the bytes itself keeps the hold ([`Held`]).
+pub trait Keep {
+  /// Keeps `object`, the pack's object at position `at` in pack order, its bytes held on `admission` by `hold`. Objects
+  /// come as they resolve: a delta waiting for its base comes after objects later in the pack.
+  fn keep(
+    &mut self,
+    at: usize,
+    object: Object,
+    hold: Hold,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal>;
+
+  /// The content of the object kept at position `at`, named `id`, as a delta's base; `None` when none is kept there.
+  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>>;
+
+  /// The reader is done with what `hold` held of `admission` (a delta applied, its bytes dropped): given back where
+  /// the keeper bounds the reader's working set, kept charged where it charges the pack whole.
+  fn release(&mut self, hold: Hold, admission: &mut Admission);
+}
+
+/// A keeper that holds every object's bytes itself, each charged for as long as the reader's admission lasts: the pack
+/// read whole into memory ([`Reader::read`], [`Reader::finish`], [`read_whole`]).
+#[derive(Debug, Default)]
+pub struct Held {
+  /// The objects kept, by position in pack order.
+  objects: Vec<Option<Object>>,
+}
+
+impl Held {
+  /// The object kept at position `at`, taken out.
+  fn take(&mut self, at: usize) -> Option<Object> {
+    self.objects.get_mut(at).and_then(Option::take)
+  }
+}
+
+impl Keep for Held {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: Object,
+    _hold: Hold,
+    _admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    if self.objects.len() <= at {
+      let more = at.saturating_add(1).saturating_sub(self.objects.len());
+      self
+        .objects
+        .try_reserve(more)
+        .map_err(|_| Refusal::AllocationRefused {
+          bytes: to_u64(core::mem::size_of::<Option<Object>>()).saturating_mul(to_u64(more)),
+        })?;
+      self.objects.resize_with(at.saturating_add(1), || None);
+    }
+    if let Some(slot) = self.objects.get_mut(at) {
+      *slot = Some(object);
+    }
+    Ok(())
+  }
+
+  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    self
+      .objects
+      .get(at)
+      .and_then(Option::as_ref)
+      .filter(|object| object.id == *id)
+      .map(|object| Cow::Borrowed(object.content.as_slice()))
+  }
+
+  fn release(&mut self, _hold: Hold, _admission: &mut Admission) {}
+}
+
+/// An object a pack brought, as a reader that kept its bytes elsewhere names it ([`Reader::finish_into`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placed {
+  /// Where its entry begins in the pack.
+  pub offset: u64,
+  /// The bytes its entry takes in the pack.
+  pub stored: u64,
+  /// Its type.
+  pub kind: Kind,
+  /// Its name.
+  pub id: ObjectId,
+  /// For an object stored as a delta, its place in its chain.
+  pub chain: Option<Chain>,
+}
+
+/// A pack read with its objects kept elsewhere: each object's place, in pack order, and its trailer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kept {
+  /// Its objects, in pack order.
+  pub objects: Vec<Placed>,
   /// Its trailer.
   pub checksum: ObjectId,
 }
@@ -277,6 +378,8 @@ struct Data {
   content: Vec<u8>,
   /// The bytes inflated so far.
   filled: usize,
+  /// What its size holds of the admission.
+  hold: Hold,
 }
 
 /// An entry read.
@@ -297,16 +400,25 @@ enum State {
   Waiting(Waiting),
 }
 
-/// An object resolved.
+/// An object resolved: named, its bytes gone to the keeper.
+#[derive(Clone, Copy)]
 struct Resolved {
   /// Its type.
   kind: Kind,
   /// Its name.
   id: ObjectId,
-  /// Its content.
-  content: Vec<u8>,
   /// For a delta, its place in its chain.
   chain: Option<Chain>,
+}
+
+/// An object just resolved, before its keeper takes it: its name, its bytes and their hold.
+struct Made {
+  /// Its name and place.
+  named: Resolved,
+  /// Its content.
+  content: Vec<u8>,
+  /// What its content holds of the admission.
+  hold: Hold,
 }
 
 /// An object a delta is applied to: one of the pack's, or one outside it.
@@ -325,6 +437,8 @@ struct Source<'s> {
 struct Waiting {
   /// The delta, inflated.
   delta: Vec<u8>,
+  /// What the delta holds of the admission.
+  hold: Hold,
   /// Where its base is, as far as is known.
   base: Base,
   /// For a reference delta placed by an index, the base's name, which the object found there must have.
@@ -373,6 +487,8 @@ pub struct Reader<'index, L: Locate + ?Sized = NoIndex> {
   objects: Option<u32>,
   /// Every entry read, in pack order.
   entries: Vec<Record>,
+  /// The keeper of a pack read whole into memory ([`Reader::read`]).
+  held: Held,
 }
 
 impl<'index, L: Locate + ?Sized> Reader<'index, L> {
@@ -389,19 +505,35 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       remaining: 0,
       objects: None,
       entries: Vec::new(),
+      held: Held::default(),
     }
   }
 
   /// Reads `bytes`, the next bytes of the pack, as far as they go, charging what it builds to `admission`: how many it
   /// took. It takes them all until the trailer ends, and none after.
   pub fn read(&mut self, bytes: &[u8], admission: &mut Admission) -> Result<usize, Refusal> {
+    let mut held = core::mem::take(&mut self.held);
+    let read = self.read_into(bytes, admission, &mut held);
+    self.held = held;
+    read
+  }
+
+  /// [`Reader::read`], each object handed to `keep` as it resolves and its delta's base read back from it (A-719
+  /// part 2): a pack read into a keeper that stores elsewhere holds a bounded working set whatever its size. One reader
+  /// reads into one keeper, or into its own ([`Reader::read`]), never both.
+  pub fn read_into<K: Keep + ?Sized>(
+    &mut self,
+    bytes: &[u8],
+    admission: &mut Admission,
+    keep: &mut K,
+  ) -> Result<usize, Refusal> {
     let mut used = 0usize;
     loop {
       let rest = bytes.get(used..).unwrap_or_default();
       if rest.is_empty() || matches!(self.stage, Stage::Done(_)) {
         return Ok(used);
       }
-      let Some(took) = self.step(rest, admission)? else {
+      let Some(took) = self.step(rest, admission, keep)? else {
         return Ok(used);
       };
       used = used.saturating_add(took);
@@ -437,38 +569,65 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     outside: &O,
     admission: &mut Admission,
   ) -> Result<Unpacked, Refusal> {
+    let mut held = core::mem::take(&mut self.held);
+    let kept = self.finish_into(outside, admission, &mut held)?;
+    charge_items::<Object>(admission, kept.objects.len())?;
+    let mut objects = Vec::new();
+    reserve(&mut objects, kept.objects.len())?;
+    for (at, placed) in kept.objects.iter().enumerate() {
+      let object = held.take(at).ok_or(Refusal::Cycle { at: placed.offset })?;
+      objects.push(object);
+    }
+    Ok(Unpacked {
+      objects,
+      checksum: kept.checksum,
+    })
+  }
+
+  /// [`Reader::finish_with`] for a pack read into `keep` ([`Reader::read_into`]): the waiting deltas resolved into it,
+  /// and every object's place in pack order, charged to `admission` first.
+  pub fn finish_into<O: Outside + ?Sized, K: Keep + ?Sized>(
+    mut self,
+    outside: &O,
+    admission: &mut Admission,
+    keep: &mut K,
+  ) -> Result<Kept, Refusal> {
     let Stage::Done(checksum) = self.stage else {
       return Err(Refusal::Truncated { at: self.at });
     };
-    self.resolve_waiting(outside, admission)?;
+    self.resolve_waiting(outside, admission, keep)?;
     let count = self.entries.len();
-    charge_items::<Object>(admission, count)?;
+    charge_items::<Placed>(admission, count)?;
     let mut objects = Vec::new();
     reserve(&mut objects, count)?;
-    for record in self.entries {
+    for record in &self.entries {
       // `resolve_waiting` has refused every delta still waiting, so each record here is resolved.
-      let State::Resolved(resolved) = record.state else {
+      let State::Resolved(resolved) = &record.state else {
         return Err(Refusal::Cycle { at: record.offset });
       };
-      objects.push(Object {
+      objects.push(Placed {
         offset: record.offset,
         stored: record.stored,
         kind: resolved.kind,
         id: resolved.id,
-        content: resolved.content,
         chain: resolved.chain,
       });
     }
-    Ok(Unpacked { objects, checksum })
+    Ok(Kept { objects, checksum })
   }
 
   /// Reads from `rest` what the stage takes next: how many bytes it took, or `None` when it can go no further without
   /// more. A stream may end without taking a byte, its end already inflated; that is progress, so it is `Some(0)`.
-  fn step(&mut self, rest: &[u8], admission: &mut Admission) -> Result<Option<usize>, Refusal> {
+  fn step<K: Keep + ?Sized>(
+    &mut self,
+    rest: &[u8],
+    admission: &mut Admission,
+    keep: &mut K,
+  ) -> Result<Option<usize>, Refusal> {
     match self.stage {
       Stage::PackHeader => self.pack_header(rest, admission).map(Some),
       Stage::EntryHeader => self.entry_header(rest, admission).map(Some),
-      Stage::Data(_) => self.data(rest, admission),
+      Stage::Data(_) => self.data(rest, admission, keep),
       Stage::Trailer => self.trailer(rest).map(Some),
       Stage::Done(_) => Ok(None),
     }
@@ -530,7 +689,9 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     let longest = entry::longest_header(self.format);
     let take = self.gather(rest, longest.saturating_sub(begun))?;
     let began = self.at.saturating_sub(to_u64(begun));
-    let read = entry::read(&self.partial, began, self.format, admission).map_err(Refusal::Entry)?;
+    let (read, hold) = held_while(admission, |admission| {
+      entry::read(&self.partial, began, self.format, admission).map_err(Refusal::Entry)
+    })?;
     let Some((header, len)) = read else {
       self.consume(rest.get(..take).unwrap_or_default());
       return Ok(take);
@@ -549,13 +710,19 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       began,
       content,
       filled: 0,
+      hold,
     });
     Ok(mine)
   }
 
   /// An entry's data, inflated from `rest` into the room its size made; once the stream ends at exactly that size, the
   /// entry is resolved. `None` when the inflater took nothing and the stream has not ended.
-  fn data(&mut self, rest: &[u8], admission: &mut Admission) -> Result<Option<usize>, Refusal> {
+  fn data<K: Keep + ?Sized>(
+    &mut self,
+    rest: &[u8],
+    admission: &mut Admission,
+    keep: &mut K,
+  ) -> Result<Option<usize>, Refusal> {
     let Stage::Data(data) = &mut self.stage else {
       return Ok(None);
     };
@@ -571,33 +738,54 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       return Ok(Some(took));
     };
     let stored = self.at.saturating_sub(data.began);
-    let record = self.record(data, stored, admission)?;
+    let (record, made) = self.record(data, stored, admission, keep)?;
+    let at = self.entries.len();
+    let offset = record.offset;
     self.entries.push(record);
+    if let Some(made) = made {
+      self.kept(at, (offset, stored), made, admission, keep)?;
+    }
     self.remaining = self.remaining.saturating_sub(1);
     self.stage = self.after_entry();
     Ok(Some(took))
   }
 
-  /// The record of an entry whose data has ended: its object named, its delta applied, or its delta waiting.
-  fn record(&self, data: Data, stored: u64, admission: &mut Admission) -> Result<Record, Refusal> {
+  /// The record of an entry whose data has ended: its object named, its delta applied, or its delta waiting; and the
+  /// object made, for its keeper.
+  fn record<K: Keep + ?Sized>(
+    &self,
+    data: Data,
+    stored: u64,
+    admission: &mut Admission,
+    keep: &mut K,
+  ) -> Result<(Record, Option<Made>), Refusal> {
     let Data {
       header,
       began,
       content,
+      hold,
       ..
     } = data;
-    let state = match header.representation {
-      Representation::Whole(kind) => State::Resolved(Resolved {
-        kind,
-        id: name_object(self.format, kind, &content, began)?,
-        content,
-        chain: None,
-      }),
+    let (state, made) = match header.representation {
+      Representation::Whole(kind) => {
+        let named = Resolved {
+          kind,
+          id: name_object(self.format, kind, &content, began)?,
+          chain: None,
+        };
+        let made = Made {
+          named,
+          content,
+          hold,
+        };
+        (State::Resolved(named), Some(made))
+      }
       Representation::OfsDelta { base } => {
         let entry = self
           .entry_at(base)
           .ok_or(Refusal::BaseNotAnEntry { at: began, base })?;
-        self.delta_state(content, Base::Entry(entry), None, began, admission)?
+        let delta = (content, hold);
+        self.delta_state(delta, Base::Entry(entry), None, began, (admission, keep))?
       }
       Representation::RefDelta { base } => {
         let placed = self.index.offset_of(&base);
@@ -612,49 +800,81 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
           Some(offset) => Base::Offset(offset),
           None => Base::Id(base),
         };
-        self.delta_state(content, base, expected, began, admission)?
+        let delta = (content, hold);
+        self.delta_state(delta, base, expected, began, (admission, keep))?
       }
     };
-    Ok(Record {
+    let record = Record {
       offset: began,
       stored,
       state,
-    })
+    };
+    Ok((record, made))
   }
 
-  /// A delta's state: applied at once when its base is an entry already resolved, waiting otherwise.
-  fn delta_state(
+  /// Hands `made`, the object of the entry at position `at` (its offset and stored length `place`), to `keep`.
+  fn kept<K: Keep + ?Sized>(
     &self,
-    delta: Vec<u8>,
+    at: usize,
+    (offset, stored): (u64, u64),
+    made: Made,
+    admission: &mut Admission,
+    keep: &mut K,
+  ) -> Result<(), Refusal> {
+    let Made {
+      named,
+      content,
+      hold,
+    } = made;
+    let object = Object {
+      offset,
+      stored,
+      kind: named.kind,
+      id: named.id,
+      content,
+      chain: named.chain,
+    };
+    keep.keep(at, object, hold, admission)
+  }
+
+  /// A delta's state: applied at once when its base is an entry already resolved, waiting otherwise; and the object it
+  /// made, for its keeper. The delta's bytes go back to the keeper once applied.
+  fn delta_state<K: Keep + ?Sized>(
+    &self,
+    (delta, hold): (Vec<u8>, Hold),
     base: Base,
     expected: Option<ObjectId>,
     at: u64,
-    admission: &mut Admission,
-  ) -> Result<State, Refusal> {
+    (admission, keep): (&mut Admission, &mut K),
+  ) -> Result<(State, Option<Made>), Refusal> {
     if let Base::Entry(entry) = base
-      && let Some(resolved) = self.applied(entry, &delta, expected, at, admission)?
+      && let Some(made) = self.applied(entry, &delta, expected, at, (admission, &*keep))?
     {
-      return Ok(State::Resolved(resolved));
+      keep.release(hold, admission);
+      return Ok((State::Resolved(made.named), Some(made)));
     }
-    Ok(State::Waiting(Waiting {
+    let waiting = Waiting {
       delta,
+      hold,
       base,
       expected,
-    }))
+    };
+    Ok((State::Waiting(waiting), None))
   }
 
-  /// `delta` applied to the entry at `base`, or `None` when that entry is itself a delta still waiting. The object
-  /// found must have the name an index placed it by.
-  fn applied(
+  /// `delta` applied to the entry at `base`, its bytes read back from `keep`, or `None` when that entry is itself a
+  /// delta still waiting. The object found must have the name an index placed it by.
+  fn applied<K: Keep + ?Sized>(
     &self,
     base: usize,
     delta: &[u8],
     expected: Option<ObjectId>,
     at: u64,
-    admission: &mut Admission,
-  ) -> Result<Option<Resolved>, Refusal> {
+    (admission, keep): (&mut Admission, &K),
+  ) -> Result<Option<Made>, Refusal> {
     let Some(Record {
       state: State::Resolved(source),
+      offset,
       ..
     }) = self.entries.get(base)
     else {
@@ -669,34 +889,47 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         found: source.id,
       });
     }
+    let content = keep
+      .content(base, &source.id)
+      .ok_or(Refusal::DeltaBaseMissing {
+        at: *offset,
+        base: source.id,
+      })?;
     let depth = source.chain.map_or(0, |chain| chain.depth);
     let source = Source {
       kind: source.kind,
       id: source.id,
-      content: &source.content,
+      content: &content,
       depth,
     };
     self.apply_to_source(source, delta, at, admission).map(Some)
   }
 
-  /// `delta`, the entry at `at`'s, applied to `source`: the object it makes, of the source's type, one delta deeper.
+  /// `delta`, the entry at `at`'s, applied to `source`: the object it makes, of the source's type, one delta deeper,
+  /// its bytes held on `admission`.
   fn apply_to_source(
     &self,
     source: Source<'_>,
     delta: &[u8],
     at: u64,
     admission: &mut Admission,
-  ) -> Result<Resolved, Refusal> {
-    let content = delta::apply(source.content, delta, admission)
-      .map_err(|refusal| Refusal::Delta { at, refusal })?;
-    Ok(Resolved {
+  ) -> Result<Made, Refusal> {
+    let (content, hold) = held_while(admission, |admission| {
+      delta::apply(source.content, delta, admission)
+        .map_err(|refusal| Refusal::Delta { at, refusal })
+    })?;
+    let named = Resolved {
       kind: source.kind,
       id: name_object(self.format, source.kind, &content, at)?,
-      content,
       chain: Some(Chain {
         base: source.id,
         depth: source.depth.saturating_add(1),
       }),
+    };
+    Ok(Made {
+      named,
+      content,
+      hold,
     })
   }
 
@@ -729,13 +962,14 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     Ok(take)
   }
 
-  /// Resolves the waiting deltas, each once its base is: their table sorted by base, then every entry's children found
-  /// in it by the entry's position and by its name, newly resolved ones on a stack; then those whose base no object of
-  /// the pack is, from `outside`. A delta still waiting after is refused.
-  fn resolve_waiting<O: Outside + ?Sized>(
+  /// Resolves the waiting deltas into `keep`, each once its base is: their table sorted by base, then every entry's
+  /// children found in it by the entry's position and by its name, newly resolved ones on a stack; then those whose base
+  /// no object of the pack is, from `outside`. A delta still waiting after is refused.
+  fn resolve_waiting<O: Outside + ?Sized, K: Keep + ?Sized>(
     &mut self,
     outside: &O,
     admission: &mut Admission,
+    keep: &mut K,
   ) -> Result<(), Refusal> {
     let count = self
       .entries
@@ -750,12 +984,12 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     let mut stack = Vec::new();
     reserve(&mut stack, count)?;
     for entry in 0..self.entries.len() {
-      self.resolve_children(entry, &waiting, &mut stack, admission)?;
+      self.resolve_children(entry, &waiting, &mut stack, (admission, &mut *keep))?;
       while let Some(child) = stack.pop() {
-        self.resolve_children(child, &waiting, &mut stack, admission)?;
+        self.resolve_children(child, &waiting, &mut stack, (admission, &mut *keep))?;
       }
     }
-    self.resolve_outside(&waiting, &mut stack, outside, admission)?;
+    self.resolve_outside(&waiting, &mut stack, outside, (admission, keep))?;
     let first = self
       .entries
       .iter()
@@ -797,12 +1031,12 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
 
   /// Applies every waiting delta whose base is the entry at `parent`, once it is resolved, by its position and by its
   /// name; each one resolved goes on `stack`, so its own children follow.
-  fn resolve_children(
+  fn resolve_children<K: Keep + ?Sized>(
     &mut self,
     parent: usize,
     waiting: &[(Key, usize)],
     stack: &mut Vec<usize>,
-    admission: &mut Admission,
+    (admission, keep): (&mut Admission, &mut K),
   ) -> Result<(), Refusal> {
     let Some(Record {
       state: State::Resolved(resolved),
@@ -815,7 +1049,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       let start = waiting.partition_point(|(base, _)| *base < key);
       let children = waiting.get(start..).unwrap_or_default();
       for (_, child) in children.iter().take_while(|(base, _)| *base == key) {
-        if self.resolve_child(parent, *child, admission)? {
+        if self.resolve_child(parent, *child, (admission, &mut *keep))? {
           stack.push(*child);
         }
       }
@@ -825,12 +1059,12 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
 
   /// Applies the deltas still waiting for a base named outside the pack: one table group at a time, the base taken from
   /// `outside` when it holds it, each delta resolved then its own children as the pack's are.
-  fn resolve_outside<O: Outside + ?Sized>(
+  fn resolve_outside<O: Outside + ?Sized, K: Keep + ?Sized>(
     &mut self,
     waiting: &[(Key, usize)],
     stack: &mut Vec<usize>,
     outside: &O,
-    admission: &mut Admission,
+    (admission, keep): (&mut Admission, &mut K),
   ) -> Result<(), Refusal> {
     for (key, child) in waiting {
       let Key::Id(id) = key else {
@@ -845,22 +1079,23 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         content,
         depth: 0,
       };
-      if self.resolve_child_on(source, *child, admission)? {
+      if self.resolve_child_on(source, *child, (admission, &mut *keep))? {
         stack.push(*child);
         while let Some(next) = stack.pop() {
-          self.resolve_children(next, waiting, stack, admission)?;
+          self.resolve_children(next, waiting, stack, (admission, &mut *keep))?;
         }
       }
     }
     Ok(())
   }
 
-  /// Applies the delta at `child`, if still waiting, to `source`, an object outside the pack: whether it did.
-  fn resolve_child_on(
+  /// Applies the delta at `child`, if still waiting, to `source`, an object outside the pack, and hands what it makes
+  /// to `keep`: whether it did.
+  fn resolve_child_on<K: Keep + ?Sized>(
     &mut self,
     source: Source<'_>,
     child: usize,
-    admission: &mut Admission,
+    (admission, keep): (&mut Admission, &mut K),
   ) -> Result<bool, Refusal> {
     let Some(Record {
       offset,
@@ -870,19 +1105,18 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     else {
       return Ok(false);
     };
-    let resolved = self.apply_to_source(source, &waiting.delta, *offset, admission)?;
-    if let Some(record) = self.entries.get_mut(child) {
-      record.state = State::Resolved(resolved);
-    }
+    let made = self.apply_to_source(source, &waiting.delta, *offset, admission)?;
+    self.settle(child, made, (admission, keep))?;
     Ok(true)
   }
 
-  /// Applies the delta at `child`, if still waiting, to the object at `parent`: whether it did.
-  fn resolve_child(
+  /// Applies the delta at `child`, if still waiting, to the object at `parent`, and hands what it makes to `keep`:
+  /// whether it did.
+  fn resolve_child<K: Keep + ?Sized>(
     &mut self,
     parent: usize,
     child: usize,
-    admission: &mut Admission,
+    (admission, keep): (&mut Admission, &mut K),
   ) -> Result<bool, Refusal> {
     let Some(Record {
       offset,
@@ -892,15 +1126,37 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     else {
       return Ok(false);
     };
-    let Some(resolved) =
-      self.applied(parent, &waiting.delta, waiting.expected, *offset, admission)?
-    else {
+    let applied = self.applied(
+      parent,
+      &waiting.delta,
+      waiting.expected,
+      *offset,
+      (admission, &*keep),
+    )?;
+    let Some(made) = applied else {
       return Ok(false);
     };
-    if let Some(record) = self.entries.get_mut(child) {
-      record.state = State::Resolved(resolved);
-    }
+    self.settle(child, made, (admission, keep))?;
     Ok(true)
+  }
+
+  /// The waiting delta at `child` resolved as `made`: its record named, its delta's bytes given back to `keep`, and the
+  /// object handed to it.
+  fn settle<K: Keep + ?Sized>(
+    &mut self,
+    child: usize,
+    made: Made,
+    (admission, keep): (&mut Admission, &mut K),
+  ) -> Result<(), Refusal> {
+    let Some(record) = self.entries.get_mut(child) else {
+      return Ok(());
+    };
+    let place = (record.offset, record.stored);
+    let state = core::mem::replace(&mut record.state, State::Resolved(made.named));
+    if let State::Waiting(waiting) = state {
+      keep.release(waiting.hold, admission);
+    }
+    self.kept(child, place, made, admission, keep)
   }
 
   /// Why the delta at `first`, the first still waiting in pack order, never resolved: its chain walked base by base, at
@@ -993,6 +1249,19 @@ fn name_object(
   at: u64,
 ) -> Result<ObjectId, Refusal> {
   name_of(format, kind, content).map_err(|attack| Refusal::Collision { at, attack })
+}
+
+/// Runs `make` within what `admission` has left, then holds on it what `make` charged: what it made, and the hold that
+/// gives that back (A-719 part 2: a keeper that stores an object elsewhere gives its bytes back).
+fn held_while<T>(
+  admission: &mut Admission,
+  make: impl FnOnce(&mut Admission) -> Result<T, Refusal>,
+) -> Result<(T, Hold), Refusal> {
+  let mut scratch = Admission::new(admission.left());
+  let made = make(&mut scratch)?;
+  let charged = admission.left().saturating_sub(scratch.left());
+  let hold = admission.hold(charged).map_err(Refusal::PastAdmission)?;
+  Ok((made, hold))
 }
 
 /// Charges `count` values of `T` to `admission`.
