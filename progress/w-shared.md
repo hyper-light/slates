@@ -1,5 +1,8 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: git/svn sliced rebuild adb33875d (main 7efceb67b). NOW: A-626 part 4 (the WorkOp that makes a copy;
+  read GAPS' A-626 entry), then svn_made copy-from rows, then A-697, A-658 3c.
+
 ## QUEUE (main 2026-11-20): git/svn sliced rebuild (NOW) -> A-626 part 4 myself (the WorkOp that makes a copy; engine
   CopyTree parts 1-3 on main; read GAPS' A-626 entry) -> svn_made copy-from rows -> A-697 (a)-(f) -> A-658 3c.
 
