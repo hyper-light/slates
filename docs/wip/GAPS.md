@@ -12,6 +12,33 @@
 > `reserve_per_shard` = memory / shards / 3 sizes each shard's slice of the content object (write log R/4, image slots
 > 2R, delta log R, arena R: about 1.4 times the machine's memory of address space, ~220 GB on the 96 GB Studio, g226),
 > the reserve's ceiling, the DAX table, the client and fleet shares; the sweep of every sizing site follows here.
+> **The sweep (w-sizing, 2026-11-20, by reading origin/main 6337049f6; today -> what it should be):**
+> - The root: `reserve_per_shard` = min(memory.total, the OS/job/cgroup bound) / shards / 3 (`config.rs`
+>   `DaemonConfig::derive`, `slates_mem::budget::region_bytes`). Machine-derived, fixed at boot. Every size below
+>   derives from it. -> Split its two roles: an admission ceiling learned from the work and the device's pressure (the
+>   machine total only a ceiling), and address space reserved by what is stored, not by the ceiling.
+> - The content object's address space, per shard (`shard_content_layout`): write log R/4, two image slots 2R, delta
+>   log R, DAX table, arena R; about 4.25R a shard, 1.4 times memory in all (220 GB mapped on the 96 GB Studio, g226;
+>   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
+>   grown by doubling; the arena grown by pool extents (A-98) as content arrives; the write log from the measured
+>   write stream between barriers.
+> - The idle prefault reserve (A-214): the last burst, capped at R. A-765 decays it; w-hg's release run held 4,931.4
+>   MiB resident after hg's history push and faulted 3.5 GB more at idle. -> Removed unless the A/B (prefault vs none,
+>   R9 provisioning p99, RSS) shows it pays; if it does, an EWMA of the pages a turn touches.
+> - Tables from R: `table_bytes` (R x TABLE_SHARE), `max_inodes`, `max_dirs`, `max_chunks`, `metadata_class_bytes`,
+>   the volume record bound. -> Grown on demand (doubling, given back on shrink), bounded by admission, not
+>   preallocated from R.
+> - Shares of R: `clients_per_shard` (R x CLIENT_SHARE / region), the NFSv4 client share and slots, the fleet receive
+>   windows (R x FLEET_RECEIVE_SHARE), `dax_range_slots` (R / DAX_RANGE_BYTES), the quota-to-inode bound in `verbs.rs`.
+>   -> From measured concurrency (clients served now, windows a peer's measured rate x RTT), pressure-capped.
+> - Device reads: `slates_machine::facts::resident_now` is RSS on macOS, which counts given-back shared pages (above);
+>   the pressure hold's own growth reads it. -> The footprint on macOS; Linux PSI and Windows commit already watched
+>   (A-570). The pressure seam is consulted by admission only; the sizes above don't read it yet.
+> - Give-back on macOS: `MADV_FREE_REUSABLE` over the shared content object leaves RSS (probe: 513 MiB stays, not
+>   reclaimed in 10 s under pressure); a purgeable Mach memory entry set `VM_PURGABLE_EMPTY` frees at once (513 -> 1
+>   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
+> - Allocations on the idle path: `prefault_reserve` builds a `Vec` a pass, `purge_keeping` clones the region order,
+>   `pieces_against` a `Vec` a run. -> Reused per-shard scratch.
 >
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
