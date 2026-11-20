@@ -123,3 +123,22 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   its table in the shard recovery image; git record v3 = names + pack root identity; order: content in arena ->
   shard image published -> entry commits; recovery: images first, then records; replication content before record.
   Slices (a) store over arena + image, (b) record v3, (c) svn via S4, (d) replication order. Awaiting OK + A-number.
+## A-727 (claimed, ledger 5f5f1d6; main OK ~11:50Z): repository bytes as content in the anchor arena
+- Design (sent to main, approved): vcs ContentStore windows in the owner shard's chunk arena (A-64 anchor content
+  object), its table (identity -> extent ref, form, holders, lists) in the shard recovery image, recovered BEFORE the
+  partition's records; records name identities (git v3: names + pack root identity); GROUP COMMIT: entries wait on
+  the next image barrier, one barrier covers every push written before it (main's requirement; measure at load).
+  Replication: content before record.
+- Slices: (a1) slates-vcs: storage seam in ContentStore (`Box<dyn WindowStore>`-like, heap default; no generic
+  ripple into git/hg/svn which take &ContentStore). (a2) server: arena-backed window store over the shard's
+  ChunkArena (state.store owns the arena; vcs_stores separate -> access by extent handle; mirror how vfs ChunkStore
+  reads extent bytes); deferred-free rule (A-64: a block the committed image names is not reused before a newer
+  image commits). (a3) image section: vcs content table in the shard image + recovery restores ContentStore entries
+  before records replay. (b) git record v3. (c) svn via S4. (d) replication order test.
+- Facts: ContentStore today = BTreeMap<ContentId, Held{bytes: Box<[u8]>, form, holders}> (crates/vcs/src/content.rs
+  insert_new ~412); ChunkArena API crates/mem/src/arena.rs (alloc/free/give_back/lock_extent, Extent{..});
+  partition snapshot publish crates/db/src/replay.rs snapshot (~673); anchor segment publish refuses past slot
+  (crates/anchor/src/segment.rs ~1041).
+- NEXT: read vfs ChunkStore (crates/vfs/src/content.rs / chunk store) for extent read/write + how the shard image
+  (vfs recover.rs to_image / encode_image_into) lists blocks; then write the A-727 design amendment (docs) and land
+  it; then (a1).

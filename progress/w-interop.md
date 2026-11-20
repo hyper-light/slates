@@ -135,3 +135,8 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   CommitHeaders(If, X-SVN-Options, Timeout, Lock-Token, version_text), LOCK/UNLOCK via SvnStores::lock_verb
   (ServedRecords lands Record::Locks), MERGE presents lock-token-list + keep-locks; lock test un-ignored.
   Scratch agents/w-interop-locks. Files told to main (w-reaper takes blame/diff/mergeinfo reports).
+- LANDED (1): d8eabb9e8 (merge f5cbdd1b7; on main, checked). Landing-tree run: svn 136/136, server 116/116,
+  svn_interop 5/5 none ignored (HTTP lock session passes). Reported.
+- (2) next: PUT body streamed into the drive (bounded window), §4.17.1 "A push's intake". Plan: SvnExchange::body()
+  feeds each run to the transaction's open file as a TextdeltaChunk (open file at first run, close at body_end), so the
+  exchange holds no body; DavCommit gets begin_put/put_chunk/end_put; on_commit per run.
