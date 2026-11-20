@@ -13,6 +13,10 @@ use crate::state::ShardState;
 use crate::vcs_store::hg_import::{Turned, begin, land, turn};
 use crate::verbs::dispatch;
 
+/// Shape: room enough for the view of every fixture these tests import.
+const ROOM: u64 = 1 << 24;
+/// Shape: more turns than the fixture's import takes, so an import that never ends fails the test rather than hangs it.
+const TURNS_AT_MOST: u64 = 1 << 16;
 /// Shape: the changesets stock 7.2's `served` filter serves of the `states` repository (`fixtures/state/states-served.txt`,
 /// three lines): what its view serves once the import has landed its phase roots and bookmarks in the register (A-687).
 const STATES_SERVED: u32 = 3;
