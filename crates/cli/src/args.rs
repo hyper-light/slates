@@ -78,6 +78,9 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
             create a repository and its root green, a new empty one unless GREEN; FORMAT is sha1 (git's
             default) or sha256 for git, sha1 for hg, revisions for svn; BRANCH is git's (main when not
             given) or Mercurial's (default), none for svn; prints the repository and its root green's id
+  repository import NAME PATH [--json]               import a history into a new repository's empty store: PATH
+            (absolute) is a Mercurial repository's directory (its .hg) for an hg repository or a
+            Subversion dump file for an svn one; answered when the import ends, with what it took
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
   exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
@@ -546,6 +549,14 @@ pub(crate) enum Verb {
   RepositoryCreate {
     /// `CreateRepository`'s fields, each the tool's default where the command line names none.
     spec: RepositorySpec,
+  },
+  /// Import a history into a repository's empty store (`repository import NAME PATH`, A-710 over A-678's and A-652
+  /// part 3's `ImportRepository`): a Mercurial repository's directory or a Subversion dump, read by the daemon.
+  RepositoryImport {
+    /// The repository's name.
+    repository: String,
+    /// The host path the daemon reads, absolute.
+    path: String,
   },
   /// Set a principal's rights on a volume (`share ID PRINCIPAL [--read] [--write] [--admin]`).
   Share {
@@ -1558,15 +1569,40 @@ const FORMAT_NAMES: [(&str, ObjectFormat); 3] = [
   ("revisions", ObjectFormat::Revisions),
 ];
 
-/// The version-control repository verbs (§4.17.1; A-685): `repository create`.
+/// The version-control repository verbs (§4.17.1; A-685, A-710): `repository create` and `repository import`.
 fn parse_repository(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
   match words {
     ["repository", "create", name] => repository_create(taken, name).map(Some),
-    ["repository", ..] => Err(ParseError::Missing(
-      "repository create NAME --tool git|hg|svn",
-    )),
+    ["repository", "import", name, path] => repository_import(taken, name, path).map(Some),
+    ["repository", ..] => Err(ParseError::Missing(REPOSITORY_FORMS)),
     _ => Ok(None),
   }
+}
+
+/// The repository verbs' forms, named by a usage error.
+const REPOSITORY_FORMS: &str =
+  "repository create NAME --tool git|hg|svn | repository import NAME PATH";
+
+/// `repository import NAME PATH` (A-710): the daemon reads PATH, so it must be absolute, since the daemon's working
+/// directory is not the caller's; a relative one is a usage error before the daemon is asked.
+fn repository_import(taken: &Taken, name: &str, path: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &[],
+    switches: &[],
+  })?;
+  if !std::path::Path::new(path).is_absolute() {
+    return Err(ParseError::BadValue {
+      what: "PATH",
+      reason: format!("{path}: the daemon reads it, so it must be absolute"),
+    });
+  }
+  Ok(client(
+    taken,
+    Verb::RepositoryImport {
+      repository: name.to_owned(),
+      path: path.to_owned(),
+    },
+  ))
 }
 
 /// `repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]` (A-685):
@@ -3402,7 +3438,7 @@ mod tests {
   /// `--default-branch`, the volume id, and the verb's own form.
   #[test]
   fn the_grammar_refuses_a_repository_its_tool_cannot_have() {
-    let form = "repository create NAME --tool git|hg|svn";
+    let form = REPOSITORY_FORMS;
     assert_eq!(
       parse(&args("repository create shared")),
       Err(ParseError::Missing("--tool git|hg|svn"))
@@ -3440,6 +3476,34 @@ mod tests {
     assert_eq!(
       parse(&args("repository create")),
       Err(ParseError::Missing(form))
+    );
+  }
+
+  /// A-710. Do: parse `repository import` with an absolute path, with `--json`, with a relative path, and with no
+  /// path. Expect: the name and the path taken as given; a relative path refused as a bad `PATH` before the daemon is
+  /// asked, since the daemon reads it from its own working directory; no path the verbs' forms.
+  #[test]
+  fn the_grammar_parses_the_repository_import_verb() {
+    for text in [
+      "repository import hg-src /srv/hg/hg-src",
+      "repository import hg-src /srv/hg/hg-src --json",
+    ] {
+      assert_eq!(
+        client_verb(text),
+        Verb::RepositoryImport {
+          repository: "hg-src".to_owned(),
+          path: "/srv/hg/hg-src".to_owned(),
+        },
+        "{text}"
+      );
+    }
+    assert!(matches!(
+      parse(&args("repository import r dumps/git.dump")),
+      Err(ParseError::BadValue { what: "PATH", .. })
+    ));
+    assert_eq!(
+      parse(&args("repository import r")),
+      Err(ParseError::Missing(REPOSITORY_FORMS))
     );
   }
 

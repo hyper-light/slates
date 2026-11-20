@@ -703,11 +703,9 @@ fn http_leg(session: &str) -> Option<Leg> {
 /// and the token as the user and password `svn` answers CRAM-MD5 with, as A-692 proves a token's principal (the token's
 /// record keeps its CRAM-MD5 keyed contexts; `slates_server::credentials::cram_md5_key`). Expect: every step as
 /// against `svnserve` ([`stock_svn_sessions_hold_against_stock_svnserve`]). Skips loudly without stock Subversion
-/// 1.15. Ignored until it can pass: the listener (A-689, g234) answers every URL "No repository found" until its next
-/// slice looks the repository up, lends its sources, asks `cram_md5_key` for a client's key and calls A-655 part 2b's
-/// commit step.
+/// 1.15. Its waits, as they ended: the listener (A-689) answered every URL "No repository found" until A-695 looked the
+/// repository up, and its commits landed through the owner's step since 7bedc3a88.
 #[test]
-#[ignore = "waits on A-689 and its repository lookup (g234)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   if !stock_svn() {
     eprintln!("skipping stock svn over svn://: no stock Subversion 1.15 here (svn on the PATH)");

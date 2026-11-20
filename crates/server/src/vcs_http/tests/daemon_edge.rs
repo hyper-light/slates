@@ -29,7 +29,7 @@ use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 
 use crate::config::{EdgeIdentity, VcsHttpConfig};
 use crate::daemon::{Daemon, SegmentSource};
-use crate::repository::hg_push::tests::{Commit, changegroup, history_of};
+use crate::repository::hg_push::tests::{Commit, Made, changegroup, history_of};
 use crate::vcs_http::{Counts, EdgeState, here};
 
 /// Shape: the daemon's shards: two, so a repository can live on a shard other than the listener's.
@@ -1178,7 +1178,13 @@ fn wire_history_bundle() -> Vec<u8> {
     THIRD,
     "the history rebuilt is the captured server's"
   );
-  let group = changegroup(&made, &[0, 1, 2]);
+  history_bundle(&made, &[0, 1, 2])
+}
+
+/// A bundle2 as stock hg 7.2 pushes `made`'s changesets at `revs`: their changegroup (version 03), and bookmark `main`
+/// at the first.
+fn history_bundle(made: &[Made], revs: &[usize]) -> Vec<u8> {
+  let group = changegroup(made, revs);
   let mut marks = Vec::new();
   hg_bookmarks::encode(
     &[Bookmark {
@@ -1220,6 +1226,52 @@ fn wire_history_bundle() -> Vec<u8> {
   let mut out = Vec::new();
   bundle.encode(&mut out).expect("a bundle2");
   out
+}
+
+/// A-711 (found by use, 2026-11-20: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets in an 84 MiB
+/// store, answered `abort: HTTP Error 413: Content Too Large` after 7.5 s; hg's twin of A-704). Do: start a two-shard
+/// daemon whose edge serves loopback TLS, each request admitted one ring region (the edge's `Bounds::room`); create a
+/// Mercurial repository and push, as stock hg posts it, one changeset whose one file is twice that room, so the bundle
+/// and what reading it builds are each past it; then ask `heads`. Expect the push `200` in `application/mercurial-0.1`
+/// and `heads` the pushed changeset: a push is bounded by what its repository's shard can hold, never by one request's
+/// room.
+#[test]
+fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let room = super::bounds_of(&crate::DaemonConfig::derive(
+    &crate::daemon::test_profile(),
+    &instance,
+    Some(SHARDS),
+  ))
+  .room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|_| {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      state.to_be_bytes()[0]
+    })
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let heads = hg_command(edge, &name, "heads");
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[0].node);
+  assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
 }
 
 /// `bundle` pushed to Mercurial repository `name` by its owner as stock hg 7.2 pushes over HTTP: the answer's status,

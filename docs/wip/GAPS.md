@@ -72,6 +72,13 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
+> answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
+> (`HgStores::push_room`, `git_push::push_room`, A-704's rule), and a bundle past it is refused in Mercurial's words
+> (`pusherr`), never `413`. macOS arm64, this Mac, local: `slates-server --lib` daemon-edge push of a file twice one ring
+> region `200` (red first: `413`), hg site, SSH session and push driver 24 of 24. Owed: the import's room (`ImportRefused
+> PastRoom { room: 278528 }` for the same repository), the unbundle's processing in slices, and w-perf's whole push.
+>
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
 >
 > **A-654 (2026-11-19, g258; git's push end to end).** Part 1 BUILT (slates-git): a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). Part 2 BUILT: the server's driver `crates/server/src/git_push.rs`, one entry point for both edges (`ReceivePack::start`, `input`, `end`, `answer`, each one step on the owner shard): the advertisement of each branch whose green holds a git head (namespace name `N` is `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under A-622's policy hidden; input and end over A-638's index view lent the shard's room (`vcs_store::with_room`); a configured git hook refusing every command `hook not run` until A-665 part 2's view; the checked objects admitted to A-662's quarantine and sealed; each command asked of A-622's policy through A-644 part 2's check point (`git_protect`: the right its change needs, then a protected name's linear history and signed commits on what it brings) before its work is built, refused in git's words; A-654 part 1's verdicts over the shard's greens, a ref's base its green's head alone, held at the append by compare and swap; `push_sealed` per entry, or once for all under `atomic`; git's report. Part 3 BUILT: git's HTTP site serves receive-pack through the driver (`vcs_http::git::receive`: each service from its own half, each step lent the state of the shard the connection moved to, a failure before any reply a status, a command's refusal the report's), proven by stock git's `create` push over loopback TLS to a daemon. The SSH site's call BUILT (A-683: `vcs_ssh::receive`, each step lent the shard's state through the HTTP site's seam, `ShardLender`). OWED: the live `git push` over HTTPS and over SSH with stock git's binary (main's runs); the hooks run over A-665 part 2's view (`pre-receive`, `update`, `post-receive`); a push based on an older version than its green's head, refused as a ref that moved until A-664's server-made commits; a principal the policy allows who is not the owner, whom A-635's append refuses `Forbidden`; push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8); a tag of a tag; a create while the default branch is unborn and holds files no commit names (A-664's).
@@ -119,6 +126,11 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-710 (2026-11-20, w-perf, UI goal 93):** `slates repository import NAME PATH` (absolute PATH: a Mercurial
+> repository's directory or a Subversion dump) asks `ImportRepository` through `Client::import_repository` and prints
+> what it took or its typed refusal. By use (Studio, 543606da3): Mercurial's own repository is refused `PastRoom { room:
+> 278528 }`, the hg room every push past ~250 changesets also meets (413); owed to w-hg.
+>
 > **A-685 (2026-11-19, g305; piece 1's client half):** a repository is made from the command line, `slates repository
 > create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]`, through
 > `Client::create_repository`; each tool's defaults are the server crate's (`object_formats`, `root_binding`: git SHA-1
@@ -414,7 +426,7 @@
 > of 38 and 60 of 60). Owed: the lender of a Subversion store over A-662's map (the records A-655 part 2b keeps there, a
 > directory's entries from the green, the repository's `svnserve.conf` facts; the DAV site's own `SvnStores`, A-681,
 > waits for the same lender), without which the daemon's site cannot start the tunnel; the accepted work handed to A-655
-> part 2b's owner step (`repository::svn_commit::commit`); the tunnel moved to the shard of the repository its URL names
+> part 2b's owner step (built since, A-698); the tunnel moved to the shard of the repository its URL names
 > (A-651 part 4 moves a connection for a named repository); the daemon's edge (A-684, built); a configured hook run, not
 > refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve`
 > exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a
@@ -453,6 +465,26 @@
 > test runs). Stock git's live `git push` over SSH runs since 2026-11-20 (`git_interop.rs`'s
 > `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`, un-ignored by w-interop, passing; its evidence on g083's
 > stock git line).
+> **A-698 (2026-11-20, g229; commits over ra_svn):** the work A-656's connection accepts lands through A-655 part 2b's
+> step: `repository::svn_commit::commit_work`, which `svn://` and the SSH tunnel share, makes the revision at the
+> owner's instant, judges it again with the commit's locks (`Work::locks`) and lands it; `commit-info` or `close-edit`'s
+> failure answers it (the step's refusals in FSFS's words, its own under the nearest error,
+> `serve::Uncommitted::Refused`); the tunnel lands through its lender (`SvnStores::commit`). Held to the recorded
+> `mkdir` commit byte for byte through the tunnel, and on a real shard. (macOS arm64, Mac Studio, kiln r509: red 52 of
+> 55, green 55 of 55; slates-svn 115 of 115; fmt clean.) Since 2026-11-19 (w-svn) the `svn://` listener lands
+> its signed-in sessions' commits through the same step (`vcs_svn` `land`; a stock `mkdir` commit over the listener,
+> then revision 1, on a two-shard daemon; macOS arm64, this Mac, local: server `vcs_svn::` 11 of 11 with
+> `repository::svn_commit::`, `vcs_ssh` 59 of 59, slates-svn 120 of 120). Owed: the tunnel's production lender in the
+> daemon's SSH site; a configured hook run; stock `svn` over `svn://` end to end (the interop leg).
+> Fixed 2026-11-19 (w-svn, found by w-perf's use): a Subversion landing never checkpointed its green, so an import of
+> git/git's newest 5,000 commits was refused `TableAtCapacity { table: "green_chains" }` after 1,685 revisions;
+> `svn_commit::land` now folds the green by the merge service's doubling rule after each revision and, at the cap,
+> checkpoints at once and appends again, as a push does (test
+> `subversion_revisions_fold_their_greens_chain_as_they_land`, red then green; macOS arm64, this Mac, local).
+> 2026-11-19 (w-svn): the daemon's SSH site serves `svnserve -t` (A-688's `SvnServices` over
+> `svn_view::TunnelRecords`, commits through `commit_work`): stock `svn`'s recorded `mkdir` over the daemon's site
+> answered as `svnserve -t` answered it, revision 1 landed (macOS arm64, this Mac, local: `vcs_ssh::svn::`
+> `vcs_ssh::daemon_edge` 16 of 16). Owed: the tunnel's move to the repository's owner shard; live `svn+ssh://`.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -1291,6 +1323,23 @@
 > (A-696: `unbundle` over `serve --stdio` through the same driver; stock hg 7.2, macOS arm64, Mac Studio, 1 of 1).
 > Stock hg 7.2's clone over the SSH edge runs (w-interop, 2026-11-20): `stock_hg_clones_over_the_ssh_edge`, an empty
 > repository cloned and pulled, host key checked strictly (macOS arm64, Mac Studio, kiln r3: 1 of 1, fmt clean).
+> **Stock git command matrix (w-interop, 2026-11-20):** `ci/interop/git-matrix.sh SLATES GIT_REPO WORKDIR` runs 27
+> stock git 2.50.1 commands against a real anchor over both edges. On main 9f51d75 (debug build, macOS arm64, Mac Studio):
+> git/git whole (607 MiB pack) kills the daemon on either edge (shard 0 spins 3,559 ms unsliced; git hangs); cut at
+> v1.0.0 (3.4 MB) it pushes, but every non-shallow clone is refused (`upload-pack: the request needs more room than
+> the server admits`) and `fetch --deepen` reports corruption: 4 of 27 pass. Owed to w-git; re-run when they land.
+> **Stock hg command matrix (w-interop, 2026-11-20):** `ci/interop/hg-matrix.sh` (24 rows, hg's own repository): any
+> real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
+> (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
+> clone pass: 14 of 24 (main 9f51d75, debug, Mac Studio). The matrices' rows count a command that cannot start as failed.
+> **svn:// interop runs (w-interop, 2026-11-20):** `svn_interop.rs`'s svn:// round trip un-ignored: stock svn 1.15.0's
+> checkout, commits, update and log over the daemon's svn:// listener pass (main 4785858, Mac Studio). svn+ssh still
+> closes the tunnel (`E210002`), and the HTTP legs meet `'/project' path not found` (the DAV reads, A-681).
+> **Stock svn command matrix (w-interop, 2026-11-20):** `ci/interop/svn-matrix.sh` (27 rows; git/git's last 2,000
+> commits as a 458 MB dump, `repository import`ed in 21 s): over svn:// info, ls, cat, checkout, log, blame, diff,
+> export, update, commits, properties, server-side copies, switch, merge, delete and revert pass; `lock` is refused
+> (`Server doesn't support the lock command`), HTTP meets `path not found` (A-681) and the SSH edge answers
+> `svnserve -t is not served yet`: 22 of 27 (main 4785858, debug, Mac Studio).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
@@ -2881,8 +2930,9 @@
 >   rebuild from the log too; the fleet's own three-daemon tests of a takeover and of a live-shipped clone's move are
 >   written (A-583: `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` and
 >   `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture`, `crates/server/tests/fleet.rs`),
->   their first compile and run owed to main, as is A-503's own move test (A-589:
->   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c); owed
+>   and A-503's own move test (A-589:
+>   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c),
+>   all three compiled and passed unchanged on macOS arm64 (2026-11-19), the Linux lane owed; owed
 >   of it, a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
 >   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is answered only once its log
@@ -4472,6 +4522,28 @@
 > - `merge_service`'s recompute mismatch: a divergent replica, refused by design. Positive.
 > - The other `merge_service` removals and `takeover::adopt`'s acceptor: taken and reinserted, nothing freed.
 > - `Daemon::drop_held_content` and the warm-restart test's `forget_object`: test injection.
+> **Goal 84 audited clause by clause (2026-11-19, w-unresolved; main at 05e3a2ddc).** The goal: "An unresolved object
+> is recovered, not just kept (A-272 (ii), live-durability). Adoptions are kept as records, so Settled rests on one;
+> the current members run a round for an Unresolved object, so `f + 1` counts the members that exist now, here the
+> replacement holding the live log. Lineage gets its own model, read as text only." Each clause, what on main makes it
+> true, and the tests that hold it. "db", "server", "cluster" and "cli" are `crates/<name>`. Every clause is built and
+> has a test; what is still owed is runs, listed after the table.
+>
+> | Clause | Built (on main) | Held by | Where it runs |
+> |---|---|---|---|
+> | An unresolved object is recovered, not just kept | A-309: a takeover settles only on its completion record, and every object ranks a survivor, so a round learns it; past tolerance it is adopted, never counted lost. A-556: a carried takeover's cohort holds back only the objects it ranked to the carrier. A-341, A-484: an unasked holder's copy goes only where its writer's takeover recovered the object within tolerance | server `takeover.rs` `a_round_confirms_only_once_every_object_it_learned_is_adopted`; server `daemon.rs` `a_takeover_past_its_tolerance_is_recovered_by_the_members_that_exist_now`, `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance`, `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover`; db `register.rs` `a_carried_takeovers_cohort_holds_back_only_the_objects_it_ranked_to_the_carrier`; db `tests/lineage_model.rs` (A-309's oracle on generated histories: 764 adoptions, 242 past tolerance, 638 takeovers completed over 400 seeds, no copy let go stale-unproven) | every host (unit and integration) |
+> | Adoptions are kept as records, so Settled rests on one | `RegionalConfiguration::completed` (A-309, replacing `dropped_unconfirmed`); a record keeps the recovery neighbourhoods and the hosts held through the takeover (A-484, regional layout 5) and whether it certifies content (A-538, A-546, layouts 6 and 7); an id admitted again loses its old record; records bounded | db `register.rs` `an_absent_ranked_successor_settles_the_object_only_on_its_completion_record`, `a_completion_record_judges_an_object_as_its_kept_retirement_did`, `completion_records_stay_bounded_and_keep_what_a_kept_retirement_needs`, `a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved`; cluster `raft_wire.rs` `a_lying_completion_record_count_is_refused`, `a_lying_completion_record_recovery_count_is_refused`; db `tests/lineage_model.rs` `a_takeover_with_no_survivor_lets_no_holder_reclaim_an_object_nobody_adopted`, `a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record` | every host |
+> | The current members run a round for an Unresolved object, so `f + 1` counts the members that exist now | `Readiness::ReadyPastTolerance` (db `takeover::readiness`, A-309 piece 2): a cohort short of its recovery quorum is adopted once every surviving member of its cohorts, settled and current, has answered, with the newest record any holds (`fleet.takeover.recovered_past_tolerance`); the shortfall is in the volume's loss report (A-332, `CONTRACT` 21) | server `daemon.rs` `a_takeover_past_its_tolerance_is_recovered_by_the_members_that_exist_now` (the store-destroyed registers: settled cohort {owner, A, old B} with A alone left, B' in the current neighbourhood; A adopts once A and B' answered); server `verbs.rs` `a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report`; db `tests/lineage_model.rs` (`recovered_past_tolerance` must be reached) | every host |
+> | Here, the replacement holding the live log | A-309 piece 3: a live takeover's phase one past tolerance waits for every surviving recorded holder and every surviving member of the retired owner's cohorts for the volume, and adopts the greatest head (`fleet.live.taken_over_past_tolerance`); A-345 waits for a retired holder not seen restarted | db `tests/live.rs` `a_live_log_past_its_tolerance_is_taken_from_every_surviving_holder` (recorded holders {A, old B} at `f = 1`, B' holding the newest head is waited for and adopted); server `live_ship.rs` `a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted`; end to end: cli `tests/live_chaos.rs` `a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover` and server `tests/fleet.rs` `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to` | unit tests on every host; the live flow gated (`SLATES_TEST_CLI=1`, `store-destroyed`), Linux |
+> | Lineage gets its own model, read as text only | `docs/wip/models/Lineage.tla` with `MC_Lineage.tla`, `MC_Lineage.cfg` and `MC_Lineage_two.cfg` (A-309, A-518): every holder rule as an action (A-341, A-484, A-508), `ReclaimOnlyStale`, `SettleKeepsFPlusOne`, `NoLastCopyLost`, `SettledOnRecord`, `Bounded`; its executable counterpart db `tests/lineage_model.rs` mirrors every rule the server runs (A-508 and A-556 since A-707) | `MC_Lineage.cfg`: main's TLC run r140, no error (the model table, §10); the Rust model's four tests | TLC on main's runner; the Rust model on every host |
+>
+> "Read as text only" was the rule when the goal was written; Ada removed it on 2026-11-18 (CLAUDE.md §2 item 13), so
+> the model is now also checked. Still owed, all runs (main's): the store-destroyed flow on merged main, on both Linux
+> architectures, for the end-to-end evidence of the last two rows (no run of it since A-309 is recorded here or in the
+> run-request log); `MC_Lineage_two.cfg` to its end (its result is not recorded); the Rust model past its default
+> cases. Ada's: whether a volume recovered past tolerance also refuses writes until an operator acknowledges it
+> (Decisions).
+
 > **Fixed (A-272 ii) by A-309 (g250, 2026-11-18), with the residuals below:** an unresolved object was kept but
 > recovered by no one. Owed: kept adoption records, so Settled rests on one, and a round of the current members for unresolved objects,
 > so `f + 1` counts the members that exist now (here, the replacement that holds the live log).
@@ -4517,7 +4589,9 @@
 >   `a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one`. The lineage model mirrors it (A-707,
 >   2026-11-19): such a release is held to `f + 1` other members holding a record at least as new, and the model's round
 >   waits on A-556's narrowed cohorts; 400 seeds, 72 released, 2,526 kept, no violation. The content release below.
-> - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
+> - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). (Status
+>   2026-11-19: both owed parts below are built, the register copies by A-341, A-484 and A-508 and the content by A-529,
+>   A-538 and A-546; kept now only where those rules cannot prove a record at least as new elsewhere.) A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
 >   owns is placed on the new neighbourhood. **Wrong as stated (A-335, g250, 2026-11-18):** the settle report covers
@@ -9843,6 +9917,9 @@ itself (`files.delegate_write(..) == Some(delegation)`), which is stronger. One 
   request, which is the exact condition entry invalidation exists to break. Nothing is dropped.
   Write-up, with the three edits a fix would make:
   `docs/bugs/2026-10-20-the-fuse-notify-rounds-wake-was-built-and-never-wired.md`.
+  **Fixed** by `7deddf549` (2026-10-21; the daemon's mount task waits on its `ChangeSignal`,
+  `fuse.rs` `change_signal` calls `wakes_with`); the record's Status set to fixed 2026-11-19
+  (goal-83 audit B16).
 
   While there, the Linux-only module itself was linted on Linux for the first time from this
   machine: `cargo clippy -p slates-bridge-fuse --all-targets -- -D warnings` is clean on a native
@@ -11400,7 +11477,7 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/InstallInTurns.tla` | `_lazy_copy_gen.cfg`, `_lazy_fence.cfg`, `_lazy_promote_auth.cfg`: one protection removed (a copy's own generation check; every fence raise but an accepted record's; phase one's demand that the copy name the successor) | no error, each (1 min 2 s; 39 s; 2 min 6 s) | 323,141; 192,633; 858,558 distinct | 38 | 2026-11-18 |
 | `models/InstallInTurns.tla` | `_lazy_copy_gen_fence.cfg`, `_lazy_fence_promote_auth.cfg`, `_lazy_copy_gen_promote_auth.cfg`: two removed | no error, each (38 s; 1 min 14 s; 3 min 30 s) | 323,141; 858,558; 1,436,869 distinct | 38 | 2026-11-18 |
 | `models/InstallInTurns.tla` | `InstallInTurns_lazy_all.cfg`: all three removed | StaleNeverCommits violated, as it must be (non-vacuity): a stale owner's record commits on copies that answered phase one under its authority, unfenced | at the violation | 12 | 2026-11-18 |
-| `models/Lineage.tla` | `MC_Lineage.cfg` (A-518): 4 hosts, 1 object, a region formed on its creator alone, F = 1, 2 retirements and 2 records kept, 3 records an object, versions up to 8 | not yet run (written 2026-11-19; main's run, run-requests.md) | — | — | — |
+| `models/Lineage.tla` | `MC_Lineage.cfg` (A-518): 4 hosts, 1 object, a region formed on its creator alone, F = 1, 2 retirements and 2 records kept, 3 records an object, versions up to 8 | no error (main's run r140, 22 min; 510M states generated) | 30.6M distinct | 18 | 2026-11-19 |
 | `models/Lineage.tla` | `MC_Lineage_two.cfg` (A-518): the same with 2 objects of 2 founding hosts, ranked apart | not yet run | — | — | — |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
