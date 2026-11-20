@@ -18,14 +18,14 @@ blake3 = { workspace = true }
 # svndiff version 2 stores each window section as an LZ4 block (`libsvn_subr/compress_lz4.c`); the workspace's LZ4
 # codec, built with its safe encoder and decoder only.
 lz4_flex = { workspace = true }
-# CRAM-MD5's HMAC-MD5 for the ra_svn handshake (`handshake`, A-599; the workspace manifest says why these crates).
-hmac = { workspace = true }
-md-5 = { workspace = true }
 # `list`'s fold of a name, as utf8proc folds it (`reads::fold`, A-613 part 2 step 7): Unicode's canonical
 # decomposition, combining classes, marks and composition, the crate slates-vfs already takes (Unicode 17.0.0).
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
+# The oracle the handshake's MD5 (`handshake::rfc1321`, A-692) is held to beside aws-lc-rs's: RustCrypto's MD5,
+# which A-599 took for CRAM-MD5 and which keeps its chaining state private, so production no longer runs it.
+md-5 = { workspace = true }
 proptest = { workspace = true }
 slates-test-seeds = { workspace = true }
 

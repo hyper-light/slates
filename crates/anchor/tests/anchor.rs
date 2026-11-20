@@ -1208,6 +1208,39 @@ fn a_segment_from_before_logged_copies_is_refused_at_start() {
   );
 }
 
+/// A-692 (the anchor's layout 15). Do: create a segment, write layout 14 into its header's version word, and attach to
+/// it. Expect: the attach refused as a wrong layout version. Layout 15's token record keeps its CRAM-MD5 keyed contexts
+/// as a field of `CredentialKind::HttpToken`, which a token enrolled under layout 14 has none of, so its record would be
+/// misread; the layout refuses the whole segment once, typed, before anything is served. Before A-692 layout 14 was the
+/// current one, and the attach succeeded.
+#[test]
+fn a_segment_from_before_cram_md5_contexts_is_refused_at_start() {
+  use slates_anchor::layout::AT_VERSION;
+  /// Format: the layout before a token's record kept its CRAM-MD5 contexts.
+  const BEFORE_CRAM_MD5_CONTEXTS: u32 = 14;
+  let name = format!("slates-anchor-uncrammed-tokens-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let header = slates_mem::Words::new().with(slates_mem::WordRun::one(
+    slates_anchor::layout::AT_GENERATION,
+    slates_mem::Width::U64,
+  ));
+  let mut mapping = slates_mem::SparseObject::open(&handoff, len, header).unwrap();
+  mapping
+    .write(AT_VERSION, &BEFORE_CRAM_MD5_CONTEXTS.to_le_bytes())
+    .unwrap();
+  let result = AnchorSegment::attach(&handoff, len, &identity());
+  assert!(
+    matches!(
+      result,
+      Err(AnchorError::Layout {
+        reason: "wrong layout version"
+      })
+    ),
+    "a segment from before CRAM-MD5 contexts is refused at start: {result:?}"
+  );
+}
+
 /// Shape: how long the graceful stopping child keeps beating after it acknowledges a stop before it exits —
 /// its "drain", long enough that an anchor which did not wait for it would be seen not to.
 const DRAIN_MS: u64 = 100;

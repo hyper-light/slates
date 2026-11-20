@@ -179,7 +179,7 @@ impl Caller {
   fn with_key(mut self, user: &[u8], secret: &[u8]) -> Self {
     self
       .keys
-      .push((user.to_vec(), CramKey::from_secret(secret).unwrap()));
+      .push((user.to_vec(), CramKey::from_secret(secret)));
     self
   }
 }
@@ -915,7 +915,7 @@ fn hex_bytes(hex: &str) -> Vec<u8> {
 fn rfc_2195s_worked_example_authenticates_tim() {
   let challenge = b"<1896.697170952@postoffice.reston.mci.net>";
   let digest = hex_bytes("b913a602c7eda7a495b4e6e7334d3890");
-  let key = CramKey::from_secret(b"tanstaaftanstaaf").unwrap();
+  let key = CramKey::from_secret(b"tanstaaftanstaaf");
   assert_eq!(key.digest(challenge).as_slice(), digest.as_slice());
   let client = [
     stock_answer(b"svn://127.0.0.1/cram"),
@@ -988,14 +988,104 @@ fn rfc_2202s_hmac_md5_vectors() {
     ),
   ];
   for (key, data, digest) in cases {
-    let made = CramKey::from_secret(&key).unwrap().digest(&data);
+    let made = CramKey::from_secret(&key).digest(&data);
     assert_eq!(
       made.as_slice(),
       hex_bytes(digest).as_slice(),
       "key {key:02x?}"
     );
-    assert!(CramKey::from_secret(&key).unwrap().verifies(&data, &made));
+    assert!(CramKey::from_secret(&key).verifies(&data, &made));
   }
+}
+
+/// Format: RFC 1321 A.5's test suite: each message and its MD5, in hex.
+const RFC_1321_SUITE: [(&[u8], &str); 7] = [
+  (b"", "d41d8cd98f00b204e9800998ecf8427e"),
+  (b"a", "0cc175b9c0f1b6a831c399e269772661"),
+  (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+  (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+  (
+    b"abcdefghijklmnopqrstuvwxyz",
+    "c3fcd3d76192e4007dfb496cca67e13b",
+  ),
+  (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    "d174ab98d277d9f5a5611c2c9f419d9f",
+  ),
+  (
+    b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+    "57edf4a22be3c955ac49da2e2107b67a",
+  ),
+];
+
+/// A-692 (RFC 1321 A.5): take the MD5 of each message of the RFC's test suite, and of messages of
+/// each length either side of the padding's one-block bound (55 and 56 bytes) and of the block
+/// (63, 64 and 65); expect the RFC's digests, and for the rest the digests of RustCrypto's `md-5`
+/// and of aws-lc-rs.
+#[test]
+fn md5_answers_rfc_1321s_suite_and_both_libraries_at_the_padding_bounds() {
+  for (message, digest) in RFC_1321_SUITE {
+    let made = rfc1321::digest(message);
+    let text = String::from_utf8_lossy(message);
+    assert_eq!(made.as_slice(), hex_bytes(digest).as_slice(), "{text}");
+  }
+  for length in [55, 56, 63, 64, 65, 119, 120, 128] {
+    let message: Vec<u8> = (0..length)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    assert_eq!(
+      rfc1321::digest(&message),
+      libraries_md5(&message),
+      "{length}"
+    );
+  }
+}
+
+/// The MD5 of `message` by RustCrypto's `md-5`, which must equal aws-lc-rs's: the oracles of the
+/// handshake's MD5.
+fn libraries_md5(message: &[u8]) -> [u8; DIGEST_BYTES] {
+  let rust_crypto: [u8; DIGEST_BYTES] = Md5::digest(message).into();
+  let legacy = aws_lc_rs::digest::digest(&aws_lc_rs::digest::MD5_FOR_LEGACY_USE_ONLY, message);
+  assert_eq!(
+    legacy.as_ref(),
+    rust_crypto.as_slice(),
+    "the two oracles agree"
+  );
+  rust_crypto
+}
+
+/// Format: the contexts of RFC 2202's second key, `Jefe`, in Dovecot's layout (the outer MD5 state's
+/// words, then the inner's, each low-order byte first), as a separate MD5 written from RFC 1321 in
+/// Python derived them (`cram_contexts_golden.py`, run on 2026-11-19; it checks its MD5 against
+/// `hashlib.md5` and the HMAC it finishes from the contexts against `hmac`).
+const JEFE_CONTEXTS: &str = "0c67f553e3a54c4dcafa660fb72a1f78e88061cba83ea82f6c8d2743346952b9";
+
+/// Format: a token's text as `slates credential token` mints it, its random bytes 0 to 31.
+const TOKEN: &[u8] = b"slates_000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+/// Format: that token's contexts, derived by the same script: the token is 71 bytes, longer than
+/// MD5's block, so its key is its MD5.
+const TOKEN_CONTEXTS: &str = "04a91cffeaf300dd158779e9cc4a42bfec009d9bc600c554a952c03adee7256b";
+
+/// Format: Python's `hmac.new(token, b"<1.2@h>", "md5")`: the digest a client answers the challenge
+/// `<1.2@h>` with, the token its password.
+const TOKEN_DIGEST: &str = "bed5de4734b671c78ff6f12a3a8ca7b2";
+
+/// A-692 (RFC 2195 §4, Dovecot's layout): take the contexts of `Jefe` and of a minted token's text,
+/// write each as bytes and read them back, and answer the challenge `<1.2@h>` with the token's
+/// contexts read back. Expect each pair's bytes as the separate derivation wrote them, the bytes read
+/// back to the same contexts, and the digest Python's `hmac` made with the token itself.
+#[test]
+fn kept_contexts_are_dovecots_bytes_and_answer_as_the_secret() {
+  for (secret, expected) in [(b"Jefe".as_slice(), JEFE_CONTEXTS), (TOKEN, TOKEN_CONTEXTS)] {
+    let contexts = CramContexts::of_secret(secret);
+    let bytes = contexts.to_bytes();
+    assert_eq!(bytes.as_slice(), hex_bytes(expected).as_slice());
+    assert_eq!(CramContexts::from_bytes(&bytes), contexts);
+  }
+  let kept = CramContexts::from_bytes(&CramContexts::of_secret(TOKEN).to_bytes());
+  let digest = CramKey::from_contexts(kept).digest(b"<1.2@h>");
+  assert_eq!(digest.as_slice(), hex_bytes(TOKEN_DIGEST).as_slice());
 }
 
 /// The bytes `cram.c` munges a password into (`compute_digest` 85): MD5's block.
@@ -1390,9 +1480,7 @@ fn alices_response() -> Vec<u8> {
     parts.time_micros,
     parts.host.to_str().unwrap()
   );
-  let digest = CramKey::from_secret(SECRET_SHORT)
-    .unwrap()
-    .digest(challenge.as_bytes());
+  let digest = CramKey::from_secret(SECRET_SHORT).digest(challenge.as_bytes());
   let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
   string_item(format!("alice {hex}").as_bytes())
 }
@@ -1814,7 +1902,7 @@ fn an_authentication_for_one_command_offers_no_anonymous_and_ends_at_its_success
     })
   );
   written.clear();
-  let key = CramKey::from_secret(SECRET_SHORT).unwrap();
+  let key = CramKey::from_secret(SECRET_SHORT);
   assert_eq!(
     server.key(Some(&key), &mut written),
     Ok(Verdict::Established(Principal::User(b"alice".to_vec())))
@@ -1888,7 +1976,7 @@ fn an_authentication_for_one_command_writes_what_svnserve_wrote_for_lock_many() 
       consumed: client[4].len(),
     })
   );
-  let key = CramKey::from_secret(SECRET_REPORT).unwrap();
+  let key = CramKey::from_secret(SECRET_REPORT);
   let alice = Principal::User(b"alice".to_vec());
   assert_eq!(
     asking.key(Some(&key), &mut written),
@@ -1992,9 +2080,38 @@ proptest! {
     password in proptest::collection::vec(1u8..=255, 0..150),
     challenge in proptest::collection::vec(1u8..=255, 0..120),
   ) {
-    let key = CramKey::from_secret(&password).unwrap();
+    let key = CramKey::from_secret(&password);
     prop_assert_eq!(key.digest(&challenge), cram_c_digest(&password, &challenge));
     prop_assert!(key.verifies(&challenge, &cram_c_digest(&password, &challenge)));
+  }
+
+  /// A-692 (RFC 2195 §4: a key kept as its contexts): take the contexts of any password `cram.c` can
+  /// read, none to 150 bytes, either side of the 64-byte block, written as bytes and read back; take
+  /// their key's digest of any challenge, and verify that digest against the challenge with one byte
+  /// changed. Expect `cram.c`'s digest made with the password itself, verified, and the changed
+  /// challenge refused.
+  #[test]
+  fn a_key_kept_as_its_contexts_digests_as_cram_c_does_with_the_password(
+    password in proptest::collection::vec(1u8..=255, 0..150),
+    challenge in proptest::collection::vec(1u8..=255, 1..120),
+    at in any::<prop::sample::Index>(),
+  ) {
+    let kept = CramContexts::from_bytes(&CramContexts::of_secret(&password).to_bytes());
+    let key = CramKey::from_contexts(kept);
+    let expected = cram_c_digest(&password, &challenge);
+    prop_assert_eq!(key.digest(&challenge), expected);
+    prop_assert!(key.verifies(&challenge, &expected));
+    let mut changed = challenge.clone();
+    let slot = &mut changed[at.index(challenge.len())];
+    *slot = slot.wrapping_add(1);
+    prop_assert!(!key.verifies(&changed, &expected));
+  }
+
+  /// A-692 (the handshake's MD5 and its two oracles): take the MD5 of any message, none to 300
+  /// bytes; expect RustCrypto's `md-5`'s and aws-lc-rs's.
+  #[test]
+  fn md5_digests_as_both_libraries(message in proptest::collection::vec(any::<u8>(), 0..300)) {
+    prop_assert_eq!(rfc1321::digest(&message), libraries_md5(&message));
   }
 
   /// A-599 (`cram.c`'s reading of a response as the oracle): split responses made of the bytes that

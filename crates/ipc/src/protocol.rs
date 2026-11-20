@@ -90,11 +90,14 @@ pub enum CredentialMaterial {
     /// The blob.
     blob: Vec<u8>,
   },
-  /// An HTTP token, Basic's password or a bearer token, by its SHA-256 alone: the token stays with the human the issuer
-  /// showed it to, so it never crosses a channel.
+  /// A token, Basic's password or a bearer token over HTTP and CRAM-MD5's secret over `svn://` (A-692), by its SHA-256
+  /// and its CRAM-MD5 keyed contexts, which the issuer derives from it: the token stays with the human the issuer showed
+  /// it to, so it never crosses a channel.
   HttpToken {
     /// The token's SHA-256.
     id: [u8; 32],
+    /// HMAC-MD5's keyed contexts of the token, in Dovecot's layout (`slates_db::catalog::CredentialKind::HttpToken`).
+    cram_md5_contexts: [u8; 32],
   },
 }
 
@@ -1250,9 +1253,10 @@ pub enum RequestBody {
     signers: Vec<Vec<u8>>,
   },
   /// Enroll a version-control credential for `principal` (§4.13: the human surface, proving issuer authority as an
-  /// enrollment does; §4.17.2 "Access"; A-625 part 3): an SSH user key by its blob, or an HTTP token by its SHA-256, so
-  /// the token itself never crosses a channel. It proves `principal` to the HTTP and SSH edges until `expires_ns` on the
-  /// wall clock (nanoseconds since the Unix epoch) when one is given. Served on the partition the credential's id routes
+  /// enrollment does; §4.17.2 "Access"; A-625 part 3): an SSH user key by its blob, or a token by its SHA-256 and its
+  /// CRAM-MD5 keyed contexts (A-692), so the token itself never crosses a channel. It proves `principal` to the HTTP and
+  /// SSH edges, and a token to `svn://`'s CRAM-MD5, until `expires_ns` on the wall clock (nanoseconds since the Unix
+  /// epoch) when one is given. Served on the partition the credential's id routes
   /// to. Answered `CredentialEnrolled` with the id; refused `Forbidden` on a consumer's channel, `GrantIssuerUnverified`
   /// when the proof does not verify, `AlreadyExists` for an id held, `BadRequest` for a key blob that names no
   /// algorithm, and `TableAtCapacity` past the partition's table bytes. Appended.
