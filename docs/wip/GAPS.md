@@ -7177,8 +7177,11 @@
 >   anchor's log, the anchor's successor and its end after refusing a replaced image judged the same; the TLS probe's
 >   socket reads with no timeout; `kill -9` run unbounded); `cli`'s `START_CEILING` waits (the anchor's restart and
 >   serving lines judged the same; the version-control edges' HTTP, svn:// and SSH reads with no timeout, the anchor
->   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone. Owed in `cli/tests`: `cli`'s
->   `WAIT_FOR`, `FLEET_WAIT` and container waits, `live_fleet`, `vm`,
+>   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone; `cli`'s `wait_for` (polled while
+>   the instance's processes progress; the epoch tests read the kernel's refusal before waiting on what it prevents)
+>   and its `FLEET_WAIT` waits (every node's processes judged together, `StartProgress::look_all`; the fleet submit run
+>   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone. Owed in
+>   `cli/tests`: `cli`'s other `WAIT_FOR` waits and its container waits, `live_fleet`, `vm`,
 >   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module
