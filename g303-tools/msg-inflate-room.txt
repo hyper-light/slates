@@ -1,0 +1,3 @@
+hg tests: the golden inflates 7.2's zstd streams in room for their window (A-650 part 1) -- 7.2's frames name level 3's 2 MiB window and no content size, so compression::inflate charges 2,490,432 bytes before inflating any, past the 1 MiB request room the helper gave; the first run on macOS arm64 (Mac Studio, kiln r6) refused it there, 292 of 293
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

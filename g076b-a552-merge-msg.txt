@@ -1,0 +1,3 @@
+merge: origin/main into A-552 as it lands -- two conflicts: the amendment log's end (main's new entries first, A-552 last) and own_mounts.rs's `await_learned`, where A-539 typed the refusal's code (`OsCode::Errno`) and A-552 replaced the wait: A-552's wait kept, its EAGAIN and its test's expected EAGAIN typed as A-539 types them
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

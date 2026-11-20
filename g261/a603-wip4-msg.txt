@@ -1,0 +1,3 @@
+server, docs: the register's server test branches at the head after the root folded version 1; design, GAPS and amendment lines (A-603) -- WIP for the Studio run
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

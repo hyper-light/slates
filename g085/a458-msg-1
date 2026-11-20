@@ -1,0 +1,3 @@
+land: failing tests first for a file whose only change is its mode or its Windows bits (A-458) -- an overlay's chmod of a base file, a captured clone's chmod, the volume's bits beside an outsider's mode, a mode the disk already holds, and both changing a mode differently, each landed over the simulated host through the engine
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

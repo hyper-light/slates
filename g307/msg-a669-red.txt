@@ -1,0 +1,3 @@
+merge tests: a write to a file a hard link names is kept at the link or refused typed -- failing first over main's engine (A-669's red copy: the five cases and the oracle, its works no longer steering around the lost write)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

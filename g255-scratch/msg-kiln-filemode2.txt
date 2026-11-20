@@ -1,0 +1,3 @@
+workspace: the core.fileMode test moves its repository's path into the future it blocks on, as git.rs's tests do (kiln's rt::block_on takes a Send + 'static future; the borrow did not compile, E0521)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

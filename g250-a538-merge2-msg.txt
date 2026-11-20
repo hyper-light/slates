@@ -1,0 +1,3 @@
+merge: origin/main into A-538 (g250) as it lands, again -- one conflict, the amendment log's end: main's newest amendments first, A-538 after; main's change (the Mercurial crate, the api mount, docs) touches none of A-538's files
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

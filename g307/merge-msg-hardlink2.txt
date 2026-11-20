@@ -1,0 +1,3 @@
+merge: origin/main (71ebf2a74) into the hard_link_merges fix as it lands, the push having met main's newer commits -- main's commits since 3b357a256 (A-653 continued (1), git's clone answers) touch neither crates/merge nor crates/test-seeds, the manifests nor the toolchain, so the run at 472282853 (kiln r74, macOS arm64, Mac Studio: red on main's test at engine.rs:661, green 1 passed, fmt clean) stands for the merged tree
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

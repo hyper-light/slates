@@ -1,0 +1,3 @@
+lint: the literal check's own tests live beside it in its module, and slates-hg's changesets and slates-machine's notes pass clippy, the literal check and rustdoc -- two return types named (DateFields, Extras), the escape table and the octal and date splits marked as format facts, and two links to a Windows-only struct's methods made plain code, since a macOS doc build has no such items
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

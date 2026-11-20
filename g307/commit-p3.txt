@@ -1,0 +1,16 @@
+merge: a green holding a copy is checkpointed -- version 4 carries the copies' records, the copied trees' keys and the identity's sum (A-626 part 3, before its Studio run)
+
+Green::checkpoint answered None at or after any copy (copied_by), and the service kept such a green's chain whole
+(merge.checkpoint.unavailable). Version 4 of the checkpoint carries what a restore from the origin and the changed
+keys could not rebuild: every copy record made at or before the version (destination, version, source, source
+version); each copied tree's keys holding then what the copy above them gave them, read at the version as every
+reader reads it, which the restore sets with no history so each reads by its record again (left out of the changed
+tables); and the identity's running sum at the version (LtHash16's 2,048 bytes), moved there from the head as a
+branch moves it (identity_moved_to), which the restore takes as the green's, keeping what it holds beyond the
+restored state's entries (copies_before) so the recount still equals the identity. A version 3 checkpoint is refused
+BadVersion; a key or a copy record written twice is refused DuplicatePath. Golden vectors derived by an independent
+BLAKE3 written in Python from the BLAKE3 paper (2,497 bytes, 13b881c8...29251df3), which reproduces the empty input,
+the official vectors at 1 to 3,072 bytes and A-646's ops-document vector; the copy oracle restores every history's
+green from its checkpoint at every version and replays the rest.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

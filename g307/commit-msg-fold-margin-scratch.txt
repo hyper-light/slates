@@ -1,0 +1,3 @@
+scratch: g307 fold-margin piece for the Studio's focused run (lands as one commit with the final message; never merged as is)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,24 @@
+anchor, cluster, server: a laptop's failover detection is what its watchdog and its anchor measure -- the widest shard window, then the anchor's lapse bound, read at every beat on every node and fanned to every shard (A-574)
+
+A node no peer's detector judges (a laptop at f = 0, a fleet node before its detector's first period) took the liveness
+window as its detection term, set once at boot (A-405), and a laptop never refreshed its estimate at all: the fleet's
+coordinator refreshes it and the fleet's configuration fan carries it, neither of which a laptop runs.
+
+What detects a wedged laptop daemon is its watchdog, once the stuck shard's own window has passed (A-455), and then its
+anchor, once the withheld beat is its lapse bound old (A-467): the two in turn. So:
+- the anchor publishes its lapse bound in its supervision block whenever it moves (`publish_lapse_bound`,
+  `SUP_LAPSE_BOUND`);
+- `slates_cluster::failover::supervision` is the widest window plus the anchor's lapse (the window alone with no
+  anchor), and `Failover::supervise` reads it, counting its readings; `supervised` is deleted;
+- the control shard's beat reads both on every node, laptop or fleet (`fleet::refresh_supervision`), publishes the
+  delay through the one publication the coordinator's refresh uses too (`fleet::publish_failover`), and fans it to every
+  other shard where it moved (`fleet::fan_failover`, `fleet.failover_fan.sent` and `.refused`); the configuration fan
+  no longer carries it, so every node has one fan; a shard reads the same at boot;
+- `watchdog::widest_window_ns` is shared with A-552's stop.
+R8: one estimator, one sum, one beat and one fan on every node; a laptop's inputs are degenerate (no detector's term,
+no council's), never a branch. On a quiet laptop the delay at rest is about three seconds where A-405's fixed window
+gave two, and it follows the machine. The fleet formation test allows the new fan's event counter. Design A-574 and
+§4.4's status, GAPS (A-405's sentence, the class D line), docs/cli.md. Evidence (red then green on the Mac Studio) in the
+docs commit after this one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge: origin/main into agents/g085-windows-landing as A-527 lands -- one conflict, the design log's end: main's amendments first (from A-512), then A-527; the server's daemon, error and verbs merged on their own, every HostError match holding its Win32 arm after it; no marker left in any resolved file
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

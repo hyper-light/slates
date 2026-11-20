@@ -1,0 +1,3 @@
+hg, server: A-650 part 1 -- zlib's bound is the linked zlib-rs's own: its level 1 (zlib-ng's deflate_quick) writes fixed codes and never falls back to stored blocks, so stock zlib's compressBound undercharged an answer on bytes that do not compress; an oracle holds every engine's streams within the bound and a test holds the bound charged before compressing; a query past the request's room is 414 as a path past it is; the site's 414, 431 and damaged-policy 500 and the edge's late reply fields through a real connection tested; each table test judges every case before comparing
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

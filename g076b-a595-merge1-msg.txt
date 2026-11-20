@@ -1,0 +1,3 @@
+merge: origin/main into A-595 -- four conflicts, each two additions kept side by side: the workspace manifest and slates-git's (flate2 beside A-600's sha1-checked and aws-lc-rs), lib.rs's mod lines (http beside object_name), and the lockfile (crc32fast beside crypto-common; slates-git's dependencies)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+docs: A-670's GAPS entries, design entry and bug record
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

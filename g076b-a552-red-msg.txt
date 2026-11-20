@@ -1,0 +1,11 @@
+server, base, machine: five red tests for A-552's supervision waits (R3 class D, D-c) -- each states its wait's rule and runs against today's
+
+- machine log: a stop waits while its writer takes lines (a slow standard error, a line every sixth of a window) and gives up a writer a held route keeps once a window passes with none taken; `LogWriter::start_with_sink` is the test's seam (the sink a writer writes each line with). Today's stop waits one window in all.
+- base own_mounts: a crossing check waits while its daemon's shards go on finishing their learning and gives up `EAGAIN` on a still window. Today's check waits one window in all.
+- server daemon: a starved hold's whole CPU is half the window the watchdog judges its shard by (`starved_share_ns` takes that window; today's rule still reads the liveness window).
+- server anchor_answers (new, cfg-free, the Windows hold channel's estimator): an exchange's bound follows the anchor's answers this daemon measured and backs off to the failover delay; today's placeholder is the hold's fixed recovery budget and a window.
+- server direct_map: a taken-back map's claim is owed for the failover delay its shard holds now (`claim_overdue`); today's placeholder is the client's old reconnect budget.
+
+The changes follow, one commit each (A-552, UI goal 86 via g076b).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

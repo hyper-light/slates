@@ -1,0 +1,7 @@
+merge: a file a copy brought and its own increment edited replaced no file -- the failing test first (A-586 with A-612)
+
+A-612 records a rename onto a file as that file's removal (`file_removed`), and the edits a copy's own increment makes
+beneath it are recorded as a rename's edited destination is (`ContentSource::Copied`), so such a file read as removed at
+the copy's version. This commit holds the test alone; the guard follows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

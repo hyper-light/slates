@@ -1,0 +1,15 @@
+machine, server: a stop waits for its log writer while it writes lines, and gives a still one up a window after its last (A-552, D-c 2 of 5)
+
+The writer counts the lines it has written (after each write, so a writer held inside one shows no progress), and
+`LogWriter::stop(window)` waits while that count moves, a window at a time, giving the writer up at the first look a
+window after the last that finds no line written since. A slow standard error is waited for until it has every line;
+one that takes nothing, or a stuck shard's thread still holding its route with nothing to send, is left to the
+process's end as before. The daemon's stop (`stop_parts`) judges the writer by the widest window its shards are judged
+by (A-455, `watchdog::shard_window_ns`), read before the runtime stops: a host that keeps the shards off their CPUs that
+long keeps the writer's thread off its own as long.
+
+Test: `a_stop_waits_while_its_writer_takes_lines_and_gives_up_a_still_one` (crates/machine/src/log.rs; the sink seam
+is `LogWriter::start_with_sink`). Red with today's rule on the Mac Studio (kiln r53, 2026-11-19, load 13.5): "gave up
+after 601.026708ms" with lines unwritten. Design A-552, GAPS' class D line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

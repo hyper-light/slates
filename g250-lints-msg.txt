@@ -1,0 +1,3 @@
+svn tests: no Arc-backed prop_oneof! and no unwrap in a fn returning Result or Option (main's clippy findings) -- the lock oracle's strategies draw plain tuples through a weighted selector (R2), its model reads a comment's UTF-8 with `?`, and the index oracle's answers, replays and histories carry the index's refusal or a missing node as the oracle's failure instead of unwrapping; slates-svn lib 261 of 261 on the Mac Studio, the lock census meeting every rule as before
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

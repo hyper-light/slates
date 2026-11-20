@@ -1,0 +1,84 @@
+# DIAG (not for main): kiln goal 01a1ec34599974448aed2672bafaf9a2's Windows leg (W5) -- kiln's bare-metal engine runs agents on
+# slates volumes through WinFsp on Windows: workspace::bare_metal_tests (KILN_TEST_KILN = the built kiln.exe) and g266's
+# slates_e2e bare_metal:: (SLATES_E2E=1), on windows-latest with WinFsp 2.1 and MountUseMountmgrFromFSD = 1 (A-369).
+name: diag-supervisor-w5
+on:
+  push:
+    branches: ['diag-supervisor-w5-*']
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_SKIP_UI_BUILD: "1"
+  AWS_LC_SYS_PREBUILT_NASM: "1"
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - working-directory: ui
+        run: npm ci --no-audit --no-fund && npm run build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+  w5:
+    needs: ui
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+      - name: Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: WinFsp, and its Mount Manager drives for an unprivileged daemon (A-369)
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount 20 -RetryIntervalSec 60 -TimeoutSec 120
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build kiln
+        shell: bash
+        run: cargo build -p kiln --locked && ls -la target/debug/kiln.exe
+      - id: bmt
+        name: "workspace::bare_metal_tests (KILN_TEST_KILN = the built kiln.exe)"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          KILN_TEST_KILN="$PWD/target/debug/kiln.exe" cargo test -p kiln --locked --lib workspace::bare_metal_tests -- --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/bmt.txt"; exit ${PIPESTATUS[0]}
+      - id: e2e
+        name: "slates_e2e bare_metal:: (SLATES_E2E=1)"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          SLATES_E2E=1 cargo test -p kiln --locked --test slates_e2e bare_metal:: -- --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/e2e.txt"; exit ${PIPESTATUS[0]}
+      - name: Report
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          for f in bmt e2e; do echo "== $f"; grep -E "^test .* \.\.\. |test result|panicked|Error:|SKIP|still mounted|MountStays" "$RUNNER_TEMP/$f.txt" 2>/dev/null | head -40; done
+          for f in bmt e2e; do [ -f "$RUNNER_TEMP/$f.txt" ] && { echo "::notice title=$f::$(grep -E 'test result|panicked|Error:' "$RUNNER_TEMP/$f.txt" | head -5 | tr '\n' ' ')"; }; done

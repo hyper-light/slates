@@ -1,0 +1,3 @@
+docs: A-636 part 1's evidence -- red first at 76af85355 (nine new tests failing against the module stubbed), green 17 of 17 and the db lib 153 of 153 at 39dcef8e5, the model test's census over 128 histories, red eight ways; Windows x86_64, jupiter, the macOS run owed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

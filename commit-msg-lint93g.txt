@@ -1,0 +1,3 @@
+lint: the Subversion DAV module's date parsing under the complexity limit (three_fields; year_of_era and month_and_day out of civil_from_days, leap years by is_multiple_of), Mercurial's compression evidence tags and an XML namespace URL escaped for rustdoc, and an SSH IV's and a hex digit's literals marked as format facts
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

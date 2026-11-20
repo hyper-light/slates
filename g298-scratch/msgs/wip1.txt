@@ -1,0 +1,3 @@
+svn: A-627's rest with its tests, for the Studio run (WIP) -- one dav::Drive writes the update-report and the replay answers from A-616's report::drive::Call; LOCK and UNLOCK read into A-602's guards and answered as mod_dav and mod_dav_svn answer them; the lockdiscovery property; stock svn 1.15.0's LOCK and UNLOCK heads recorded as fixtures
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

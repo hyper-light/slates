@@ -1,0 +1,18 @@
+> (a segment of layout 11 refused at start, new); Linux owed. A-626 part 3, continued (1) (2026-11-19, g307; a
+> regression part 3 made, found by g258, bisected by main): version 4 wrote the identity's 2,048-byte sum into every
+> checkpoint, so the service's doubling rule waited on that many bytes of increments for every green, and slates-server's
+> `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log` met its root's first version
+> unfolded (194 bytes to fold against a 2,233-byte checkpoint, kiln r122, Mac Studio); fixed by version 5, the copies'
+> section and the sum each behind a presence byte and written beside a copy's record alone, the anchor's layout 13
+> (`docs/bugs/2026-11-19-every-checkpoint-carried-the-identitys-sum-so-a-small-green-folded-late.md`); on macOS arm64
+> (kiln r146, and r164 over main b13a6e05f) the repository test passes, its root's checkpoint at 1 now 155 bytes,
+> slates-merge lib 76 of 76 filtered
+> to the copy, checkpoint, branch, node, reanchor and stack tests, `--test checkpoint` 4 of 4, `--test chain_replay` 3
+> of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 6 of 6 (layout 12 refused at start, new); Windows and Linux
+> owed. A-626 part 4 (2026-11-19, g307): a rebase restating a copy built, the deriver's `VolumeOp::Copy` composed
+> against the copied tree `Green::base_for` puts at its destination, a file edited beneath a copy restated as edits
+> over what it brings, a work's logged journal holding a copy (`LoggedOp::Copy`, the anchor's layout 14); a work's own
+> shard composes no journal holding a copy (its fetched entries are a path's each, never a tree), so the green's owner
+> composes it, counted `merge.work.copy_composed_by_owner` (see A-626 part 4). Owed from A-626: the work model
+> resolving copies, so a rebased work's `Rebased::changed` and its reads and listing see the copied files it left
+> alone (they name only the files it changed today); a restore that grafts

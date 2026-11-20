@@ -1,0 +1,3 @@
+merge: origin/main (2dc39bd60) into A-626 part 3, continued (1) as it lands -- main's commits since 1ef718820 are slates-git's and slates-vcs's (A-640 part 4's first slice), touching nothing slates-merge, slates-anchor or slates-server builds from, so the runs at 8919290ed (kiln r164, macOS arm64, Mac Studio) stand for the merged tree
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

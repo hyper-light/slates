@@ -1,0 +1,3 @@
+server tests: a volume moved back to its creator needs every holder's copy to follow the move, A-485's rule; goal 85's bug 2 had A-485's cause -- on the quiet Mac Studio at main 3022c6894 the move back answered Moving and MoveRefused{Unplaced} in turn until its deadline, the third node refusing 8,006 of the new owner's records and 2,663 content puts Unauthorized and no node counting fleet.move.followed; the regression test installs the move through the walk as the coordinator drives it and requires the copy routed to the new owner, the new owner's next record accepted and the creator's refused (A-487)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

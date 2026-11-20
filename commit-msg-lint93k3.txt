@@ -1,0 +1,3 @@
+merge: slates-merge's test targets pass clippy -D warnings -- chain_replay's kind_of names A-626's CopyTree (the integration suite did not compile since A-626 part 1); dims/copy's root-copy and cut tests drive the module's own Maps (put_named, visited, cut) with their checks in helpers, under the complexity threshold (15 and 11 of 10 before) and checking the same things; the step generator is a weighted pick of eight in place of prop_oneof!, whose union is Arc-backed (clippy on jupiter, r1505)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+docs: goal 84 audited clause by clause against main -- each of its five clauses (an unresolved object recovered; adoptions kept as records so Settled rests on one; the current members' round counting f + 1 among the members that exist now; the replacement holding the live log; the lineage model) named with what builds it (A-309, A-341, A-484, A-508, A-538, A-546, A-556, A-707) and the tests that hold it; every clause built and tested, the owed items runs alone (the store-destroyed flow on merged main, MC_Lineage_two to its end); the model table records main's TLC r140 of MC_Lineage.cfg (no error, 30.6M distinct states, depth 18), and A-309's open unasked-holder line notes both its owed parts built
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

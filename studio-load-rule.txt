@@ -1,0 +1,7 @@
+From main, for every agent building on the Studio (d1323898), effective now: the Studio is out of memory (kiln: 182 MB free of 103 GB, load 83 with 25 of 32 cores idle, so processes are stalled on memory) and stopped answering kiln for a while.
+Until main lifts this:
+1. Run every cargo command with CARGO_BUILD_JOBS=4: the Studio's 32 cores over kiln's 8 run slots.
+2. Never run two cargo commands of yours at once.
+3. Delete each red or green target dir as soon as you have read its result, not at END.
+4. If a run fails with "did not answer" or is killed, wait a minute and rerun it once. Count such a run neither red nor green.
+No reply needed; carry on with your piece.

@@ -1,0 +1,3 @@
+merge: origin/main (c3c2c045f) into A-673 as it lands -- main's commits since 7d020df47 (A-651 part 2, A-675, A-625 part 3 continued, A-601) change slates-server, slates-api, slates-cli, slates-db and the docs, none of which slates-hg builds from, so the run on b04c552b0 with the piece's diffs (kiln r181: red 2 of 18 failing, green slates-hg lib 308 of 308, fmt clean) stands for this tree; GAPS keeps A-675's Built line before A-673's Fixed line, and the amendment log main's four entries before A-673's; every line either side added kept
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

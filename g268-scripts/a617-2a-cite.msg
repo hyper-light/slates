@@ -1,0 +1,3 @@
+svn: A-617 part 2a's citations held to the sources they name -- the edit module's and its tests' line numbers read again against Subversion's 1.14.x at d434dc14 (editorp.c 610cffcd, the same bytes as 1.15.0's; serve.c acb1cac7; marshal.c 908ccdd9): 23 corrected, the unknown command's lines among them (1127-1132, written at 1149-1174, where 1105-1110 was cited) and add_lock_tokens' (1360-1409, where 1395-1430 was); the module doc rewrapped within 120 columns; the tests' word and depth bounds say where they come from (MAX_WORD_LENGTH less one; the request's revision-property pair)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

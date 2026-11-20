@@ -1,0 +1,3 @@
+docs: A-606's amendment -- Subversion's authorization built and held to svn's own authz tests, APR's fnmatch table, the documentation's files and a naive oracle (57 of 57, the crate 110 of 110, Mac Studio); 1.14.x's four departures from its own documentation recorded, each followed by the documentation and a named test
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

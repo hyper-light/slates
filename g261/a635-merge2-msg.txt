@@ -1,0 +1,3 @@
+merge: origin/main into A-635's landing again -- one conflict, the amendment log's end (main's A-641 part 1, A-630 parts 2 and 3, A-646 part 1, A-619 part 3, A-634, A-628 and A-616's drive first, A-635 last); main's engine change is the rename rule's helpers inside the verdict, nothing the judge and commit split calls
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,19 @@
+http-edge: red tests for the HTTP edge's engine, a new crate; http: two clippy findings in A-595's tests fixed, 500 and 503 added (A-625, §4.17.2 piece 8's next part)
+
+slates-http-edge holds one connection's request loop as a state machine over bytes, no socket: each body is a stub
+here; the tests are the specification.
+- connection: a GET decided and answered in chunks and the connection kept; a body reaching the service whole at
+  every cut; a chunked gzip body inflated; 100-continue for a waiting client alone; pipelined requests in turn; HEAD's
+  head alone; HTTP/1.0 framed by the close; a bodiless refusal keeping the connection, one with its body unread and a
+  malformed head ending in stages (reply, half-close, drain); a broken chunk and a gzip bomb refused mid-stream; a
+  client leaving mid-request; a failing service refused before its reply and aborted after; the phases; and a GET over
+  TLS from a rustls client, its Basic credentials read.
+- credential: RFC 7617's and RFC 6750's own examples, every malformed form 400, unknown schemes 401, a repeated line
+  400, Basic in cleartext 401, the challenges with the realm escaped, secrets compared whole, no secret in a log.
+- tls: the handshake at TLS 1.3 and 1.2 with ALPN http/1.1, ALPN without it refused and none served, bytes not TLS
+  refused, a reply past rustls's 64 KiB buffer sealed whole, close_notify each way.
+slates-http: `read_in` no longer asserts inside a fn returning Result (a typed `Failed` instead), and the
+advertisement's head test compares one whole Head (cognitive complexity 14 of 10), main's clippy findings; Status gains
+500 and 503 for the edge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

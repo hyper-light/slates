@@ -1,0 +1,3 @@
+git: A-638 receive-pack's bases and A-618's pushed trees read through the store -- one-window objects lent as the store keeps them, longer bases assembled once into slots that never move and charged to the view's room first (a refusal named, not a missing base); holds reads the row alone; a tree's modes read as git's tree walk reads them (canon_mode: stock git 2.50.1 reads 100600/100664 as 100644, 100700/100775 as 100755, a typeless 644 as 160000)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

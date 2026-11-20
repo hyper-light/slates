@@ -1,0 +1,35 @@
+# Goal 87 A/B r100 (main, 2026-11-19 ~00:50 UTC), Mac Studio d1323898b255a3ed435eb83fa0f7b0cf, ~/.cache/g083-scripts/ab2.sh,
+# dataset linux-v7.4-rc1/fs, interleaved binaries per round (norepl = main without the A-273 replicas; repl502 =
+# agents/main-ab-a502 at 6d9115aa4, replicas with A-502's feed off the submit path), 3 rounds per size. Verdict: the
+# replicas lose everywhere but Edit p50 (0.10-0.15 vs 0.12-0.38 ms): ReadHead/Submit p50 26-57 ms vs 0.09-1.36 ms;
+# p99 110-302 ms vs 0.23-32.9 ms. A-502 did not rescue them (r406 had them 3-7x worse at p99). MEASURED AND REJECTED.
+norepl z=20000 r=1 Edit p50=0.20 p99=21.56 | repl502 p50=0.11 p99=177.61
+norepl z=20000 r=2 Edit p50=0.15 p99=0.78 | repl502 p50=0.11 p99=171.97
+norepl z=20000 r=3 Edit p50=0.38 p99=14.81 | repl502 p50=0.15 p99=159.98
+norepl z=20000 r=1 ReadHead p50=0.24 p99=23.25 | repl502 p50=30.82 p99=181.06
+norepl z=20000 r=2 ReadHead p50=0.15 p99=3.04 | repl502 p50=29.74 p99=155.00
+norepl z=20000 r=3 ReadHead p50=1.00 p99=14.14 | repl502 p50=27.40 p99=181.64
+norepl z=20000 r=1 Rebase p50=0.41 p99=32.89 | repl502 p50=0.24 p99=223.78
+norepl z=20000 r=2 Rebase p50=0.29 p99=10.22 | repl502 p50=0.22 p99=211.89
+norepl z=20000 r=3 Rebase p50=1.36 p99=24.14 | repl502 p50=0.45 p99=230.72
+norepl z=20000 r=1 SubmitAccepted p50=0.42 p99=29.21 | repl502 p50=40.04 p99=267.14
+norepl z=20000 r=2 SubmitAccepted p50=0.31 p99=2.70 | repl502 p50=40.51 p99=223.95
+norepl z=20000 r=3 SubmitAccepted p50=1.14 p99=22.92 | repl502 p50=34.27 p99=287.42
+norepl z=20000 r=1 SubmitConflict p50=0.39 p99=31.05 | repl502 p50=40.36 p99=252.63
+norepl z=20000 r=2 SubmitConflict p50=0.28 p99=6.67 | repl502 p50=38.98 p99=216.22
+norepl z=20000 r=3 SubmitConflict p50=1.27 p99=21.02 | repl502 p50=37.11 p99=301.99
+norepl z=50000 r=1 Edit p50=0.12 p99=1.15 | repl502 p50=0.10 p99=160.52
+norepl z=50000 r=2 Edit p50=0.12 p99=3.54 | repl502 p50=0.10 p99=111.66
+norepl z=50000 r=3 Edit p50=0.12 p99=0.30 | repl502 p50=0.10 p99=163.39
+norepl z=50000 r=1 ReadHead p50=0.09 p99=1.32 | repl502 p50=32.28 p99=151.84
+norepl z=50000 r=2 ReadHead p50=0.09 p99=4.13 | repl502 p50=26.32 p99=109.90
+norepl z=50000 r=3 ReadHead p50=0.09 p99=0.23 | repl502 p50=43.27 p99=151.30
+norepl z=50000 r=1 Rebase p50=0.20 p99=3.21 | repl502 p50=0.21 p99=201.76
+norepl z=50000 r=2 Rebase p50=0.21 p99=7.45 | repl502 p50=0.20 p99=133.67
+norepl z=50000 r=3 Rebase p50=0.21 p99=0.43 | repl502 p50=0.23 p99=188.24
+norepl z=50000 r=1 SubmitAccepted p50=0.23 p99=2.81 | repl502 p50=42.82 p99=272.35
+norepl z=50000 r=2 SubmitAccepted p50=0.23 p99=7.08 | repl502 p50=35.91 p99=180.42
+norepl z=50000 r=3 SubmitAccepted p50=0.23 p99=0.41 | repl502 p50=56.86 p99=242.01
+norepl z=50000 r=1 SubmitConflict p50=0.20 p99=2.83 | repl502 p50=42.39 p99=234.78
+norepl z=50000 r=2 SubmitConflict p50=0.20 p99=5.07 | repl502 p50=33.89 p99=159.03
+norepl z=50000 r=3 SubmitConflict p50=0.20 p99=0.39 | repl502 p50=56.47 p99=223.60

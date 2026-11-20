@@ -1,0 +1,18 @@
+base, server: a crossing check waits while its daemon's shards go on ending their learning, parked between looks, and gives up a window after the last end (A-552, D-c 3 of 5)
+
+The learning gate (A-227) spun one liveness window in all, so a daemon whose shards were still ending their learning,
+each in its turn, had its crossings refused EAGAIN while every shard was alive and learning. Now each learning that
+ends wakes every waiting check (the gate keeps each entered shard thread and unparks them), and a check gives up only
+once the waiting shard's own window (A-455, `watchdog::own_window_ns`, read at each look) passes with no shard ending
+its learning. Between looks it parks a beat apart (`HEARTBEAT_NS`, the watchdog's cadence), never spinning: a check
+spinning past a window of CPU would have its own shard judged spinning, and one parked past a window judged still,
+while a beat's wake shows CPU progress at every look. Bounded by the daemon's shards, each ending its learning once.
+`Gate::new(threads, window_ns, look_ns)`; nothing else parks a shard's thread (the runtime waits in its driver), so an
+unpark of a thread not waiting leaves only a token its next gate wait passes over.
+
+Test: `a_crossing_waits_while_its_daemons_shards_go_on_learning_and_gives_up_on_a_still_window`
+(crates/base/src/own_mounts.rs). Red with today's rule on the Mac Studio (kiln r53, 2026-11-19, load 13.5):
+Err(Unavailable(35)) after 601.207667ms while shards were still ending their learning. Design A-552 and §4.6's A-227
+sentence, GAPS' class D line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

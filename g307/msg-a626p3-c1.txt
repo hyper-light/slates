@@ -1,0 +1,3 @@
+merge, anchor, docs: a green holding a copy is checkpointed (A-626 part 3) -- checkpoint version 4 carries the copies' records, the copied trees' keys and the identity's sum, so a copy no longer leaves its green without a checkpoint; anchor layout 12, so an older segment is refused at adoption and no version 3 checkpoint is ever read; §4.16/§4.17.4 status, the part 3 entry, GAPS
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

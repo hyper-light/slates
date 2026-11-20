@@ -1,0 +1,14 @@
+merge tests: a rebased work's links restated where their nodes stand -- failing first (A-663)
+
+Five cases, each held to four readings that must agree: the work's own operations in their own order over the
+head with real inodes, the green that accepts the work, the restated journal replayed over the head with real
+inodes, and the green that accepts the restated journal composed again (the rebased work's next submit):
+`ln g l; mv f g` (l stays on g's old node), `mv f m; ln m l` and `ln f l; mv f m` (a link to a node the work
+renames), `ln f l; rm f` (a link to a node the work removes), and `rm h; ln f h` over the base's link h (a link
+made again where the head's stands, which the restatement made with no removal, so the deriver refused the
+rebased journal LinkOverExisting). A generated oracle over the same readings, its works kept to what the deriver
+composes as a volume replays it, with a census requiring each case: a link before a rename over its name,
+before and after its node's rename, before its node's removal, made again where the base's stood, and to a
+file the work made.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

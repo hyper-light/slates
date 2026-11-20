@@ -1,0 +1,3 @@
+lint: slates-git's and slates-http's unsafe budgets read again (slates-git's row sat above the [budget] header, so the check never saw it), slates-http's evidence tags escaped, the vcs step generator formatted, Subversion authz's three clippy findings and two byte strings fixed, wildmatch's byte set and C-locale classes and a glob range's width marked as format facts
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

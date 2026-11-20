@@ -1,0 +1,3 @@
+server: A-597's runner takes a hook's words before it finishes the run -- the Studio's build refused three double mutable borrows of the run (E0499)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

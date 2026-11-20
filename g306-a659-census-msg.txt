@@ -1,0 +1,3 @@
+merge: the stack's and the tree's oracles print their censuses for the evidence (A-659)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

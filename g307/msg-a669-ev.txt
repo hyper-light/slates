@@ -1,0 +1,3 @@
+docs: A-669's merged-tree run -- slates-merge lib 169 of 169 (main's 164 and A-669's 5) over main f6ec36df2 with A-659's stacks, on Windows x86_64 (jupiter), fmt clean; the restate oracle 153 agreed, 103 refused typed, no conflicts, the write handed on four times at a removal and once at a rename
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

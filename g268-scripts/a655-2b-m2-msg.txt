@@ -1,0 +1,3 @@
+merge: origin/main (0577ab0bd) into A-655 part 2b for its run on the Mac Studio -- one conflict, the amendment log's end (main's A-654 part 2 first, A-655 part 2b last); git_push.rs builds EntryParts::default(), and a sealed push sets its record after entry() copies the parts'
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

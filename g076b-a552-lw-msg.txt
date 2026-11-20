@@ -1,0 +1,3 @@
+server docs: learned_wait names the Windows hold channel's exchanges among the waits that learn by its rule (A-552, after A-548's list)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

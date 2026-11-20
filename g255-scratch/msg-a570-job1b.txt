@@ -1,0 +1,3 @@
+server, machine: a kernel that offers no memory-pressure report has the watch refused by kind, logged and counted, and nothing polls in its place (A-570 job 1, at main's review) -- the heartbeat's look at the measured stall and the retry-window re-sample while a hold was held are withdrawn as a second path (§2 item 7); a stall's end is a report in the kernel's own terms (macOS's return to normal, Windows' high-memory notification, and Linux's trigger silent past its window and one update interval, UPDATES_PER_WINDOW in kernel/sched/psi.c: Events::stall_ended_after_ns); counters pressure.watch_refused and pressure.watch_unsupported in the shard's status; between reports the hold stands as last sampled
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

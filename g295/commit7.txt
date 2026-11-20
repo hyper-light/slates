@@ -1,0 +1,6 @@
+merge: a path holding a copy's value reads, from the copy's version on, as a path with no history when a review comment is followed -- the comment on a copied file moves with it (A-586 with A-596)
+
+`Green::reanchor` takes the path's own content history only where no copy covers the path at the comment's version;
+otherwise the head's bytes, unchanged since the copy, decide, as for a path with no history. The A-586 entry records it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

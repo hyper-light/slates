@@ -1,0 +1,3 @@
+wip(scratch): A-662 -- push_sealed allowed dead outside tests until A-654; the Subversion arm's index read by its test
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

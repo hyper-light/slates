@@ -1,0 +1,3 @@
+ledger: a holder whose store is lost answers no read and accepts no record under its old id -- goal 81's volume failure in the register's simulation: a store lost under a replica (Cohort::lose_store) left the holder answering a takeover's read with nothing, which completed a quorum that missed a committed record at f = 2 with one store lost and one host down (red: the takeover adopted an empty log, Ok(0)); now its nothing never counts, as a fresh-id restart guarantees in the server, and NoLoss, Continuity, TotalOrder, StaleNeverCommits and Agreement are checked after it; a client leaving mid-write has its write kept or dropped whole. Unit: db ledger 3/3 (A-585)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

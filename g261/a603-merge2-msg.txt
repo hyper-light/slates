@@ -1,0 +1,3 @@
+merge: origin/main into A-603 again as it lands -- main's A-596 (review records) appended Ops 90 to 95 first, so A-603's RepositoryAdvanced takes tag 96 (published after them, no published tag moved); the snapshot carries main's review fields first, then the registers; a repository's destroy gives back its register's state and its review records; DbError keeps both sides' variants; GAPS' §4.17 entry and the amendment log take main's A-596, A-581 and A-590 first, A-603 last
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

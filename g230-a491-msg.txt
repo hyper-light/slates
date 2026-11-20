@@ -1,0 +1,3 @@
+server: an idle give-back step learns its slice from its shard thread's own CPU, not the wall clock -- a step the host descheduled read as slow by every moment it waited and cut the next slice short by as much (at load about 100 a Mac's 18 to 21 ms give-back took 2,572 to 3,042 steps; the recovery test's give-back case failed once under load on adacachy); steps are now timed on the clock the watchdog reads, those a coarse clock shows no CPU for folded into the next it shows, and the unit test drives real steps with a controlled CPU clock (A-491)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

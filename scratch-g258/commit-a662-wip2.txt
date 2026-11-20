@@ -1,0 +1,8 @@
+wip(scratch): A-662, the sealed push kept by its caller across appends -- still not compiled (Studio offline)
+
+repository::push::push_sealed takes the caller's SealedPush: its record written for each attempt, the store's commit
+between the guard and the apply, the objects part cleared only once committed; SealedPush::reseal admits the next ref's
+move, so a push without atomic appends each ref on its own and a refused ref leaves the push whole. EntryParts and lfs.rs
+back to main's. Tests: a stale ref refused with the push kept, then resealed and recorded whole.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

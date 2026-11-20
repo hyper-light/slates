@@ -1,0 +1,3 @@
+git: A-638 the store as the push path reads it, tests first -- receive-pack's thin-pack bases and connectivity from the index alone, and a push's trees and blobs above the index as A-618's PushObjects; seven tests over a real store against stubs (a base lent as kept, a long base assembled once, the room refused and named, receive-pack resolving a thin pack against the store, git's tree-walk modes as stock git 2.50.1 read them, typed refusals, and a push becoming a work through the store)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

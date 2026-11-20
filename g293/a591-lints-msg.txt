@@ -1,0 +1,3 @@
+git: A-591's index tests take u32 offsets by try_from and fold the offset_of check into its golden assertion -- read against the lint wall before ending: three u64/usize-to-u32 casts in tests trip cast_possible_truncation, which clippy.toml does not relax for tests, and the golden test reached cognitive complexity 11 against the threshold of 10 once offset_of's assertion was added (each assert_eq! counts one); now 10; what each test checks is unchanged; on the Mac Studio over main 553d3d155 with this change (the file hashed equal to this commit's, 8a5b948b...b342): cargo test --locked -p slates-git --lib 76 of 76, cargo fmt --check clean
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

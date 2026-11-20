@@ -1,0 +1,3 @@
+merge: origin/main into A-597 (g255) again as it lands -- two conflicts, each at a document's end: GAPS' §4.17 entry (main's A-603 first, A-597 last) and the amendment log (main's A-603, A-598 and A-609 first, A-597 last); main's 18 newest commits touch none of A-597's three modules nor what they import (learned_wait.rs, daemon.rs, the failover estimator, test-seeds; the catalog's new lines leave Principal and HostId alone), so the code is the tree tested green at 416619570 (slates-server lib 26 of 26, fmt clean, Mac Studio)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

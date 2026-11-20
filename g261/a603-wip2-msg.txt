@@ -1,0 +1,3 @@
+db: the register's model test counts what its histories met, and rustfmt's layout (A-603) -- WIP for the Studio run
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

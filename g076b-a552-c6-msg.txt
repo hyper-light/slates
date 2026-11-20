@@ -1,0 +1,12 @@
+bridge-core, server tests, docs: the three tests that still said failover_slo name the failover delay they test (A-552)
+
+A-525 deleted the operator's ten-second placeholder; the total bound a held reply's wait is judged by is the failover
+delay the server passes (`live_ship.rs`: `total_ns: state.failover_ns`, A-363). Renamed:
+`a_held_replys_wait_ends_at_the_failover_delay_from_its_hold` (bridge-core durable_bound, with its module doc, the
+`Spans::total_ns` doc, the `AtTheBound` reason line and the tests' `FAILOVER_NS`, which said "failover SLO"),
+`a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again` and
+`the_failover_delay_ends_a_forwards_location_budget` (server tests/fleet.rs, names and doc comments only); the design's
+four citations and GAPS' two follow. bridge-core's durable_bound lib tests run on the Mac Studio; the fleet tests are
+main's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

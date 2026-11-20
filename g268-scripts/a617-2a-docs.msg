@@ -1,0 +1,3 @@
+svn, docs: the commit's request and its editor commands read as svnserve reads them (A-617 part 2a) -- every command of seventeen stock svn 1.15.0 commits, recorded through a relay against stock svnserve 1.15.0 (four refused: E160028 twice, E160039, E160024), read and written back byte for byte and every text delta applied; vparse_tuple transcribed and equal on generated items for all 20 prototypes; malformed data (E210004) ends the connection, an unknown command (E210001) is a command failure, a NUL in a C string and a revision past svn_revnum_t refused; slates-svn lib 295 of 295 on the Mac Studio over main (8ef924a7b), red first (9 tests); §4.17.4's status, the amendment log, GAPS and the research notes' §14
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

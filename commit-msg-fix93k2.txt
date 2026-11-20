@@ -1,0 +1,3 @@
+merge: two clippy denials on main fixed -- chain_entry's take_table divides with checked_div (arithmetic_side_effects; its divisor is at least 1, and the impossible None refuses), and A-659's Landed allows large_enum_variant with its reason, as the server's Served and Outcome do: an accepted work is the common outcome, and boxing it would allocate per landed work (clippy --all-targets -D warnings on jupiter, r1454)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

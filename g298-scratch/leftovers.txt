@@ -1,0 +1,16 @@
+crates/hg/src/serve/session.rs
+crates/svn/src/migration.rs
+crates/svn/src/migration/export.rs
+crates/svn/src/migration/import.rs
+crates/svn/src/migration/paths.rs
+crates/svn/src/migration/properties.rs
+crates/svn/src/migration/records.rs
+crates/svn/src/migration/tests.rs
+crates/svn/src/migration/tests/generated.rs
+crates/svn/src/migration/tests/golden.rs
+crates/svn/src/migration/tests/refusals.rs
+crates/svn/src/migration/tests/rules.rs
+crates/svn/src/migration/tests/support.rs
+crates/svn/src/report/drive/green.rs
+crates/svn/src/report/drive/history.rs
+crates/svn/src/report/drive/tests.rs

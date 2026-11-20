@@ -1,0 +1,3 @@
+http, git: the red tests compile -- each head a test reads whole is bound before it is borrowed (nine sites dropped their request while its head was in use, E0716 on the Mac Studio, kiln run on 06231d765), one refusal named by its type; the lock as cargo resolves A-607's flate2 (zlib-rs alone: adler2, miniz_oxide and simd-adler32 leave, flate2's crc32fast edge with them) (A-595)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

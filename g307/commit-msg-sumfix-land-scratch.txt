@@ -1,0 +1,3 @@
+merge, anchor, docs: A-626 part 3, continued (1) over main b13a6e05f (scratch commit for the merged tree's Studio run; lands as one commit with the final message)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

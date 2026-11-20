@@ -1,0 +1,3 @@
+merge: a link names the node its target named when it was made, for the writes a removed file hands on (A-669) -- the first green run's oracle found `ln h l; rm h` losing l's node, resolved through the links standing at the seal; now each link's node is fixed when the journal makes it (linked_nodes)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

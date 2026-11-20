@@ -1,0 +1,3 @@
+/// 13 the copies' section and the sum each behind a presence byte, written beside a copy's record alone (checkpoint
+/// version 5, A-626 part 3, continued (1), 2026-11-19), 14 a work's logged journal may hold a copy (`LoggedOp::Copy`,
+/// A-626 part 4, 2026-11-19). An older segment is refused, never misread.

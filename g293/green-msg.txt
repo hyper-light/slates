@@ -1,0 +1,3 @@
+scratch (never merged): A-520's implementation over its unit tests, for their green run -- the code the piece commit carries, file for file
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

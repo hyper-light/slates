@@ -1,0 +1,22 @@
+svn: the Subversion commit rule as a pure function, FSFS's merge at commit on the index then the lock table's check, equal to FSFS's own code transcribed on 4,096 generated histories a run (A-592, §4.17.4 piece 5)
+
+commit::verdict judges a work, the transaction a client's drive built on base revision B, as FSFS's commit does:
+tree.c merge(target = the transaction, source = the head, ancestor = B) stated on the Subversion index, reading only
+the rows of the head's revisions since B and the nodes they reach, the work's identities made by the index's own
+builder on B (Index::trial), so a lazy copy beneath a branch conflicts as in FSFS; then, once it finds no conflict,
+the lock check the merge task hands in (A-602's LockTable::verdict), whose refusal is the verdict's and whose entries
+its accepted answer. commit::check_out_of_date is the drive's test (commit.c check_out_of_date). Every refusal typed
+and named by its Subversion error (E160028, E160006, E160024 by the check that found it, the lock check's, the
+index's).
+
+Evidence, the Mac Studio (kiln, 2026-11-19): failing first with the rule stubbed, 13 of 16 commit tests (04:01 UTC);
+with the lock check asked before the merge, 2 failed (04:18 UTC); green, cargo test --locked -p slates-svn --lib 89 of
+89 in 1.03 s, the oracle over 4,096 cases equal to merge(), compare_dir_structure, verify_locks, verify_lock and
+svn_path_compare_paths transcribed over the naive FSFS, its census meeting every conflict kind (the rarest, a file
+both sides changed, 49 times) and each lock refusal; cargo fmt clean.
+
+Found, owed to A-602 (GAPS): LockTable::verdict verifies the locks a commit meets in byte order of their paths, where
+FSFS checks changed paths in svn_path_compare_paths order, so locks at both /t/a/b and /t/a-b answer at /t/a-b where
+svnserve answers /t/a/b.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+[2m[kiln] on d1323898b255a3ed435eb83fa0f7b0cf · macos/aarch64 · 26 of 32 cores idle · 68 GB free · 1 CI jobs[0m
+[2m2026-11-20T04:06:26.008204Z[0m [32m INFO[0m already shutting down [3msignal[0m[2m=[0m15
+[2m[kiln] used memory not measured over 20 s; OOM kills not seen here[0m

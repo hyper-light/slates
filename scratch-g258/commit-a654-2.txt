@@ -1,0 +1,7 @@
+wip(scratch): A-654 step 2, a green lent to the judge for one call -- not yet compiled (Studio offline)
+
+git: receive::works' Greens runs the judge's step over a green it lends for the call (read, base_of_create), as the
+server lends one member of a lineage at a time (crate::greens' RefMut lend, A-575); Works builds each work inside the
+lend. The test fake lends the served branch the same way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

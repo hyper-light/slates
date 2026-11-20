@@ -1,0 +1,3 @@
+db: a repository's policy in its record, set whole by Op::RepositoryPolicySet (tag 97) from the version its setter read (A-622 part 1) -- WIP for the Studio run
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

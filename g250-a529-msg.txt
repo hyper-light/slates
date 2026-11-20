@@ -1,0 +1,3 @@
+takeover: a share is done only once the successor serves each volume it adopted from its own placement -- an adopted volume stays placed where the departed owner's head said, so a confirmation certified nothing about content and holders outside the successor's placement kept a stale copy's content for good (A-335); now the round waits until the head snapshot's placement names only the successor and the volume's current content candidates (red: the share read done for all three placements), and the healer replaces, rather than restores, an adopted volume's placement naming a member outside them (fleet.heal.adopted_replaced). Unit: server takeover, healer and holder tests 29/29 (A-529)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+server: a holder's copy of a moved object follows the move as the install's walk reaches it -- A-398's walk over the held copies left A-291's follow after the per-copy step's early return for a live owner, which every moved object's copy takes, so no copy ever took a move's new owner's authority: on the quiet Mac Studio at main 3022c6894 the move back to the creator answered Moving and MoveRefused{Unplaced} in turn until its deadline, the third node refusing 8,006 of the owner's records and 2,663 content puts Unauthorized and no node counting fleet.move.followed; the walk now follows a moved copy between its lineage and its authority, and the unit test fails without that one call (A-487)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

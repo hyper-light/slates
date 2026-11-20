@@ -1,0 +1,13 @@
+merge: a rebased work restates each hard link where the node it names still stands (A-663)
+
+Green::rebased_from restated the verdict's effects in the verdict's order, renames and removals first and the
+links last, so a volume with real inodes replaying the journal met each link's target after the work had moved or
+removed its node: `ln g l; mv f g` put l on f's file, and a link to a node the work renames or removes named an
+emptied name. The effects are now restated in replay order (in_replay_order): each link just before the first
+effect that moves its node away from the name it names it by or removes it there (a rename from it or over it, a
+removal; Effect::unhomes), never before an effect that frees the link's own name (Effect::frees); every other
+effect, and a link nothing moves, keeps the verdict's order, after the effect that made its node. A link made where
+the head holds another link is restated after that link's removal, since a volume refuses a held name and the
+deriver refused the rebased journal LinkOverExisting.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

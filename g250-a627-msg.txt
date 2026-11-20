@@ -1,0 +1,3 @@
+svn: list-report and file-revs-report read and answered byte for byte, PROPPATCH, LOCK's lockinfo, Timeout and Lock-Token read (A-627, piece 13's second part, in part) -- four request bodies stock svn 1.15.0 sent (ls -v, blame, propset --revprop, lock -m) decode and every cut of each is refused; a file revision's delta goes out through the crate's svndiff encoder in base64 with no line breaks, as dav_svn__make_base64_output_stream writes it; the update-report and replay drives and LOCK's answer are owed; slates-svn lib 283 of 283, red once with the delta's base64 broken into lines
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

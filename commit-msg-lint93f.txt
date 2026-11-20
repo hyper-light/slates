@@ -1,0 +1,3 @@
+lint: slates-vcs's oracle draws its steps from plain tuples and a weighted selector, never prop_oneof!'s Arc (R2), with the steps' weights kept; a byte string, the svn handshake's client strings named, an escaped version list for rustdoc, a test call formatted
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge tests: A-626 part 3's red copy for the graft fix -- the two replica tests and the copy oracle replaying seed cc ef9d3557, over part 3 as it stood (7d08dd16a), failing first
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

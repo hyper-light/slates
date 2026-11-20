@@ -1,0 +1,19 @@
+git: smart HTTP's request and response codec and git's routes, pure over bytes (A-595, §4.17.2 piece 8's first part)
+
+`slates_git::http`: `parse_head` (a request line and field lines within RFC 9112 §3's 8000 octets, at most Apache's 100
+fields, as the MCP edge holds them; Content-Length or chunked, never both; gzip or identity content coding; Git-Protocol,
+Authorization, one Host for HTTP/1.1), `decode_chunked` (RFC 9112 §7.1 with extensions and trailers, two walks, the body's
+exact size charged to the caller's Admission; declared sizes held to its room before their data arrives; every cut
+Partial), `gunzip` (flate2, inflating at most one byte past the room: a bomb stops there), `route` (`GET
+<repo>/info/refs?service=`, `POST <repo>/git-upload-pack` and `/git-receive-pack` of their request types; refusals by
+kind: 403 dumb or unknown service, 405, 411, 415, 400 a path leaving its repository, 404), `version` (Git-Protocol's last
+`version=`), and the replies: `advertisement_prelude` (`# service=` and a flush for v0 and v1, nothing for v2),
+`reply_head` (content type, `Cache-Control: no-cache`, chunked), `chunk`, `LAST_CHUNK`, `refusal_reply` (a 405 names its
+methods). The MCP edge's parser is not shared: its head is MCP's (POST alone, Content-Length required, chunked refused) and
+slates-git depends on nothing of the server's; its bounds are taken with their citations; a shared head core is owed.
+flate2 enters the lockfile with its five packages alone (cargo's re-resolve also moved windows-sys 0.60.2 users to 0.61.2;
+left as main has them).
+
+Red first on the Mac Studio (kiln r442, 2026-11-19, load 21.7): 9 of 9 failed on the stubs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

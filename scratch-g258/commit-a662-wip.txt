@@ -1,0 +1,9 @@
+wip(scratch): A-662, each repository's store on its owner shard -- written while the Studio was offline, not yet compiled
+
+server: `vcs_store` (one content store a shard, each repository's tool store with its derived values: git A-614 +
+A-647's reach sets, Mercurial A-588, Subversion A-553), made by CreateRepository, charged to the shard's budget as
+retention, a git push's record held by its entry and committed between the register's guard and the apply inside
+A-635's append, replayed by a recovery and by a rebuild after a refused record; db: `RepositoryEntry::objects` kept by
+the register for the repository's life, charged, snapshotted, released. Tests written first; the run is owed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

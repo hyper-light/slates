@@ -1,0 +1,3 @@
+db: a snapshot carries each atomic record with the positions still pointing to it, so a recovery points exactly where the live partition did -- the model test's first run found a checkpoint's folded pointer brought back by the restore (WIP for the Studio run)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

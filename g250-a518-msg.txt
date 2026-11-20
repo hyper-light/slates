@@ -1,0 +1,3 @@
+models: Lineage.tla states A-341, A-484 and A-508's holder rules as actions and checks that no let-go removes the last copy a committed record names -- the A-309 model let a copy go on a settled line or an asked confirmation only; now a copy no round asked for goes on its writer's takeover, judged on the retirement or the completion record (which keeps the recovery cohorts and held hosts), and a live owner's copy goes from a holder outside its neighbourhoods off a whole settled cohort F + 1 wide; properties ReclaimOnlyStale (rules 1-3), SettleKeepsFPlusOne (rule 4) and NoLastCopyLost (every rule), with MC_Lineage.tla and two configurations for main's TLC run; written as text, not yet run (A-518)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

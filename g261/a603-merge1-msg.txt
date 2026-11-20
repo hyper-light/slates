@@ -1,0 +1,3 @@
+merge: origin/main into A-603 as it lands -- two conflicts, both at a document's end: GAPS' §4.17 entry (main's A-582 part 3 and A-591 first, A-603 last) and the amendment log (main's A-602, A-607 and A-605 first, A-603 last); main touched none of A-603's crates, so no wire tag moved
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

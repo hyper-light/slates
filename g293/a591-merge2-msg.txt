@@ -1,0 +1,3 @@
+merge: origin/main into A-591 again as it lands -- one conflict, the amendment log's end: main's A-602 and A-607 first, A-591 last; the manifests merged clean (main's flate2 beside A-591's crc32fast, which flate2 depends on; main's lock holds neither yet, since no crate takes flate2)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge: rustfmt's layout for the Copy change; the refusal test compares windows in a list (MergeConflictClass is not Ord) (A-586)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

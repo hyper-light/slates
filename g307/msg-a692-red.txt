@@ -1,0 +1,3 @@
+RED for A-692: the contexts carry no key and the lookup keys no user (scratch, never landed)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

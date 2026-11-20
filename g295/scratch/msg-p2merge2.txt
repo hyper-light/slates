@@ -1,0 +1,3 @@
+merge: origin/main into A-626 part 2 again as it lands -- one conflict, the amendment log's end (main's newest first, A-626 part 2 last); main's newest touch no slates-merge code nor verbs.rs, so the code is the tree tested at e728908e6
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

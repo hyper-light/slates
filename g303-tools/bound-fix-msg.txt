@@ -1,0 +1,15 @@
+hg: zlib's bound is the linked zlib-rs's own compress_bound (A-650, zlib's bound) -- its level 1 (zlib-ng's deflate_quick) writes fixed codes and never falls back to stored blocks, so stock zlib's compressBound undercharged an answer on bytes that do not compress (65,536 nine-bit literals: 73,721 written, 65,569 charged); zlib-rs's bound is 73,737 there and met exactly at 4,095 and 4,096 bytes
+
+The fix after the previous commit's failing oracle: compression::bound's zlib arm is n + ceil(n/8) + 3 + 6, a byte
+more below 9 bytes and one more for none (zlib-rs 0.6.8 src/deflate.rs compress_bound; zlib-ng's compressBound).
+research/mercurial-server.md section 24 gains the bound's bullet with r92's numbers.
+
+Owed when this piece is started (main assigns its A-number; A-650 part 1's docs are final by then):
+- its own amendment entry (A-650 part 1's "Found, and left to its own piece" bullet, now fixed);
+- section 4.17.3's status: "(zlib's, stock zlib's `compressBound`, is outgrown by the linked zlib-rs's level 1 on
+  bytes that do not compress: GAPS, its own piece)" becomes ", zlib's as the linked zlib-rs states it";
+- GAPS section 4.17.3: the open item on the zlib bound closed.
+Its run: cargo test --locked -p slates-hg --lib -- compression at the previous commit (red) and here (green), and
+cargo fmt -p slates-hg -- --check. Not run yet: jupiter had no disk on 2026-11-19. rustfmt +1.98.1 --check: clean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

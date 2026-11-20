@@ -1,0 +1,3 @@
+docs, fmt: A-622 part 1 recorded -- a repository's policy held in its record and set whole by its owner from the version read (Op::RepositoryPolicySet 97, RequestBody 86, DatabaseRefusal 8-9); db repository:: 15 of 15, server repository:: 5 of 5, ipc lib, both wire_order tests 2 of 2 on the Mac Studio, red first on a mutated copy (four guarding tests failed, nothing else); §4.17.1's status and piece 7, the amendment, GAPS
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

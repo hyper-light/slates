@@ -1,0 +1,16 @@
+anchor, cluster, server: red tests for A-574 -- a laptop's failover detection read from what its watchdog and its anchor measure, the same sum as a fleet node's
+
+- anchor: the supervision block's lapse bound word (`layout::SUP_LAPSE_BOUND`, offset 232, zero where no anchor wrote
+  it) with `Supervision::record_lapse_bound` and `lapse_bound_ns`: the channel the anchor publishes its measured lapse
+  bound (A-467) on, declared among the segment's words. Nothing publishes or reads it yet.
+- cluster failover: `a_nodes_supervision_is_its_watchdogs_widest_window_then_its_anchors_lapse` (the detection where
+  no peer detects is the watchdog's widest window and then the anchor's lapse, each reading counted) and
+  `a_laptop_and_a_fleet_node_derive_their_failover_delay_by_one_sum` (R8). `supervision` and `Failover::supervise`
+  take the readings and keep today's rule: the window alone, a prior.
+- server daemon: `a_laptops_failover_delay_follows_its_watchdogs_window_and_its_anchors_lapse` (a two-shard daemon
+  with no fleet, the lapse bound published in its block: every shard's delay must come to hold it). Today a laptop's
+  delay is set at boot and never read again.
+
+The change follows (A-574, UI goal 86 via g076b).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

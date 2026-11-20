@@ -1,0 +1,10 @@
+git: red tests for smart HTTP's request and response codec and git's routes (A-595, §4.17.2 piece 8's first part)
+
+`slates_git::http` with each body a stub: a head with git's fields and its framing; heads past their bounds or
+contradicting themselves refused by kind; a chunked body whole and every cut of it partial; bad chunk sizes and framing;
+a chunked body declaring past its admission refused before its data arrives; gzip within the admission, a bomb stopped
+at it, every cut refused; the routes and their refusals by kind; `Git-Protocol`'s version; the advertisement's
+`# service=` line and flush for v0 and v1 and nothing for v2, a reply's head, chunks and refusals. flate2 enters the
+workspace (its default backend until main measures one); the lockfile follows in the change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

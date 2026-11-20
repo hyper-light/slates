@@ -1,0 +1,3 @@
+docs: A-625 part 1 -- §4.17.2's status, GAPS and the amendment log: the edge's engine built, slates-http-edge 31 of 31 and slates-http 52 of 52 on the Mac Studio, red first; part 2 (the daemon's listener, learned waits, derived bounds, git's site) owed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

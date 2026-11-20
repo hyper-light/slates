@@ -1,0 +1,9 @@
+land, vfs: a landed mode or bits change is synced through its file's own handle in its batch's barrier before it is reported (A-472) -- fsync(2) flushes the metadata of the file it names and fdatasync need not; no source says a directory's sync covers another inode's mode
+
+A metadata entry is staged in A-130's batch (stage, barrier, place): its fields set in place through its own handle,
+the handle held open (one page against the batch's room), the barrier syncing the file whole (Linux fsync, macOS fsync,
+Windows FlushFileBuffers through a handle that may write), and the entry reported and advanced after. A batch that
+ends unsynced records its metadata entries as it records its files, never advancing them. A file the landing may not
+open to set its metadata fails its entry alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+lint: a trie's tidy step reads its node with ?, slates-vcs's oracle names its pushes, slates-ssh's evidence tags escaped, and two test files laid out as rustfmt writes them
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

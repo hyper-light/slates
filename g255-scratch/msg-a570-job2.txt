@@ -1,0 +1,3 @@
+server: the NFSv4 purges a table owes go out at their own deadline, by the reaper the deadline keeper hands a round to, off the reap loop's tick (A-570 job 2, goal 86) -- each access to the table closes by noting whether it owes anything (nfs::note_purges in record_clients): a round a retry window on while it does, none once it does not; a start whose partition owes purges arms one at once; a client's own compound still sends its purges inline; the tick sent at its looks whatever the phase, so a purge refused just before a look went again at once and one refused just after waited a window, and every shard woke for it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

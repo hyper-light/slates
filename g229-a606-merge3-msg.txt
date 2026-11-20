@@ -1,0 +1,3 @@
+merge: origin/main into A-606 a third time as it lands -- one conflict, the amendment log's end: main's new entries (A-608 and those after it) first, A-606 last; main's commits since change nothing in slates-svn, so the crate's 235 of 235 on b13226f2d stands
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

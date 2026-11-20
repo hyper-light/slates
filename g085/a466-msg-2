@@ -1,0 +1,9 @@
+land: a captured clone's replacement keeps an outsider's mode change it did not make, judging its metadata field by field beside its bytes' content verdict (A-466) -- the clone's value where it changed a field and the disk still held the capture's, the disk's otherwise; a field held a third way is ModifyModify; bytes already on the disk are kept and the fields the file lacks set alone
+
+The content witness carries the capture's mode and Windows bits (content_witness_of), encoded beside its identity
+(VERSION_CONTENT 5); verdict::landed_meta decides each field; the engine's judge_replaced_meta records the decision
+(ReplacedMeta, saved across slices), stage_file stages the replacement with it, and a replacement whose bytes the
+disk already holds sets its metadata through A-458's Landing::chmod. An overlay's replacement still needs its witness
+whole (T-1.14): the sibling test shows it refused, the outsider's mode kept.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

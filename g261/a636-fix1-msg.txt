@@ -1,0 +1,3 @@
+db tests: the refused takeover's reach is built before the takeover borrows the cohort -- jupiter's first build of the tests refused the borrow (E0502)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

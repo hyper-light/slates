@@ -1,0 +1,3 @@
+merge: origin/main into agents/g085-windows-landing as A-469 lands -- one conflict, the design log's end (main's A-467, A-464 and A-465 first, then A-469), no marker left in either resolved file; GAPS merged clean, and main's commits touch none of A-469's files
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

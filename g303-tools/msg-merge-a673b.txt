@@ -1,0 +1,3 @@
+merge: origin/main (031e04337: A-677) into A-673 as it lands -- main's commit since c3c2c045f changes slates-merge's rebase (Green's node handed to a link) and its tests, which slates-hg builds from but which neither compression::bound nor its oracle calls, so the run on b04c552b0 with the piece's diffs (kiln r181) stands for what the piece changes; the amendment log keeps A-677's entry before A-673's; every line either side added kept
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

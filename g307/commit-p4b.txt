@@ -1,0 +1,3 @@
+server, anchor: a work's logged journal may hold a copy, layout 13 (A-626 part 4, server half, before its Studio run) -- LoggedOp::Copy appended last with its conversions and in the codec's round-trip list; the work's shard composes no journal holding a copy (its fetched entries are a path's each, never a tree) and fetches nothing for one, so the green's owner composes it against Green::base_for, counted merge.work.copy_composed_by_owner; a replacing copy takes the journal's declared directories and symbolic links in its destination's tree out of the work's listing
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

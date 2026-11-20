@@ -1,0 +1,17 @@
+crates/cli/tests/cli.rs
+crates/hg/src/push/mod.rs
+crates/hg/src/push/tests.rs
+crates/hg/src/serve/http.rs
+crates/hg/src/serve/http_tests.rs
+crates/hg/src/serve/mod.rs
+crates/hg/src/serve/session.rs
+crates/server/src/repository/hg_push.rs
+crates/server/src/repository/hg_push/tests.rs
+crates/server/src/vcs_http/daemon_edge.rs
+crates/server/src/vcs_http/hg.rs
+crates/server/src/vcs_http/tests/daemon_edge.rs
+crates/server/src/vcs_http/tests/hg.rs
+crates/server/src/vcs_store.rs
+crates/server/src/vcs_store/hg_view.rs
+docs/wip/GAPS.md
+docs/wip/SLATES_DESIGN.md

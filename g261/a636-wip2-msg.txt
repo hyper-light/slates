@@ -1,0 +1,3 @@
+db: A-636's protocol -- each log a ledger register of its own, a record committed whole and applied at the holders' joins, a takeover fencing every log or none and keeping a record only where every log's read holds it whole, replicas answering by position vector and refusing a split cut (WIP, unbuilt: the Studio is offline)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

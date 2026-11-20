@@ -1,0 +1,3 @@
+merge: the copy oracle compares an owned read (A-626 part 1) -- the Studio found a temporary borrowed past its statement
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

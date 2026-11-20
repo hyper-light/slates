@@ -1,0 +1,3 @@
+docs: the huge-page re-arm's evidence (A-570) -- red by mutation on the Mac Studio (the keeper's re-arm removed and the tick's put back: re-armed 484 ms after the decline, at the tick's next look), green on a36c98b (fmt clean, server 14 of 14, re-armed 1.006 s after the decline)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

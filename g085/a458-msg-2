@@ -1,0 +1,10 @@
+land: a file whose only change is its mode or its Windows bits lands, as a metadata entry judged field by field and set through the file's own handle with no byte rewritten (A-458) -- the verdict judged a replacement by its bytes alone, a captured clone's plan compared content alone, and the plan read a metadata-only copy-up's bytes from the disk, so an outsider's chmod refused the whole landing BaseDrift
+
+Action::Chmod { from, to } (§4.15's data model's Chmod), bound by the grant (tag 8 with both FileMetas); the
+verdict's meta_verdict sets a field where the disk still holds the base's value, accepts it as identical where the
+disk holds the volume's, and is a conflict where it holds a third, a field the volume kept staying the disk's; the
+engine opens the file with LandFs::open_to_chmod, judges it again by its fstat and sets each field with set_mode and
+set_windows. The plan takes a metadata-only copy-up's identity from its witness (Volume::holds_witnessed_bytes).
+PlannedAction::Chmod and ActionTally::chmod appended on the wire; the API's contract is 41.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+svn: authorization built -- the authz file read as svn_config__parse_stream reads it, its sections and entries as authz_parse.c takes them, groups and aliases resolved without expanding, and each principal's rules compiled into svn's tree and walked with its precedence (the deepest matching level, then the last rule; a later ** eclipsing; issue 4762's choice between a global and a repository rule; global rights for questions without a path) -- WIP for the Studio run (A-606)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+workspace: a review in a repository whose core.fileMode is false commits no execute bit from the volume, as git takes none (W8, kiln goal part 01a1f148ddd77732bdd00d62b2d5ed9b) -- git::file_modes reads core.fileMode (git-config(1), true unless set false) and, where false, the tracked files the index records 100755; the review then judges no mode change alone a change to commit (one git can't see, which holds its landing back), keeps a rewritten tracked file's index mode and records a new file not executable (ce_mode_from_stat, read-cache.h at git e1ec09b23); with true it commits the owner's execute bit as before; the sibling g088v reported with c22e5b720
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

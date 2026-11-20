@@ -1,0 +1,3 @@
+svn, docs: authorization's record keeps to slates' own rule at the root -- a recursive question there weighs every rule beneath it, stated and tested as slates' precedence rather than as a departure; the departures from 1.14.x's code are three (the root's segments, the suffix match, two leading slashes), renumbered with their cross-references in the module, the design, GAPS and the research notes (A-606)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

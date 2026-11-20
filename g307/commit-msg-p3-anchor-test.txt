@@ -1,0 +1,3 @@
+anchor tests: a segment of layout 11, from before version 4 checkpoints, is refused at start (A-626 part 3) -- scratch commit for the Studio run; lands folded into part 3's one commit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

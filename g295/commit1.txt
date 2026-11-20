@@ -1,0 +1,23 @@
+merge: Copy (OpKind 16) in the engine -- a tree copied by reference, recorded once at its destination, read by the latest copy above a key; the identity takes one entry a copy (A-586)
+
+The engine's Copy, A-542's second half (part 2), on part 1's maps:
+- ops_doc: OpKind::Copy = 16, appended: path the destination, src the source's path index (remapped by canonicalize),
+  at the source's version.
+- engine/copy.rs (new): the verdict (node-exclusive: a destination present or changed after the base, a source changed
+  after its version, nothing to copy, a hard link in the source, the root as destination, two or nested copies, a move
+  or link into a copied tree: each a typed conflict); operations on the copied tree in the same increment judged against
+  the copied tree and landing after the copy; the commit (every map's copy, one appearance record, one last_changed
+  entry, one change-index entry); the readers' rule (a key reads by the latest copy above it while it holds that copy's
+  value); a key's first change after a copy records the copied value at the copy's version; the identity's copy entry.
+- engine.rs: copy-aware readers, last-change lookups and seeds; an edit declared before a copy that replaced its file
+  conflicts; the chain entry's CopyTree replays; a green holding a copy is not checkpointed (owed); a rebase of a copy is
+  refused typed (owed); Green::walked, copies_grafted, copies_refused.
+- branch.rs: a branch made before a copy cuts the copy's tree and takes its entry out of the identity.
+- dims: a copy from the root (the root's own key moved to the destination's); cut_tree, holds_tree, visited.
+- ptrie: Ptrie::cut (a graft's inverse, no walk), has_prefix, Shared::len.
+- chain_entry: Applied::CopyTree, tag 18, its source version read back from the increment's Copy.
+
+Unit tests: engine::copy_tests (cases and an oracle against a reference green that copies key by key), ptrie's cut in
+its oracle plus a cost test, dims' root copy and cut. Evidence follows in its own commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

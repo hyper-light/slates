@@ -1,0 +1,3 @@
+merge: a point walks past an overwrite or a truncate starting at it and meets the insert behind it, so two inserts at one point conflict in both orders (A-668; D-27) -- `crate::map::lies_past`: the walk stops at an operation starting after the range's end, or at its end for a range that is not a point; A-659's moved walk takes the same rule (`Meets::Beside`); docs/bugs note
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

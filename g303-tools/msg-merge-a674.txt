@@ -1,0 +1,3 @@
+merge: origin/main (901be4f52: A-657 part 4, A-653 continued (3), A-656 continued (2)) into A-674 as it lands -- main's commits since 1c6ac5006 change slates-hg's push classification and hook fixtures, slates-server's hg_push and vcs_hooks, slates-git and slates-svn, none of which the hg site's route or the tests run (vcs_http::hg, slates-hg's http) reach, so the run on 66c71c0f0 (kiln r212: red 6 of 7, green 7 of 7 and 22 of 22, fmt clean) stands for this tree; the amendment log keeps main's three entries before A-674's; every line either side added kept
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

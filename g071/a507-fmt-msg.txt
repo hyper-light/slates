@@ -1,0 +1,3 @@
+api: rustfmt's reflow of A-507's table test, and A-507's evidence -- red once on the Mac Studio on a copy where EBUSY mapped to the old untyped Unmount and no request let go (the mapping and request tests failed), green at 43166ce14 with cargo test -p slates-api --lib -- mount:: contract_history 12 of 12; the Linux half, clippy, xtask and the macOS bare-metal run filed for main (A-507)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

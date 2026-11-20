@@ -1,0 +1,5 @@
+merge tests: the restatement's oracle names every reading that differs (A-663's red copy)
+
+The red branch's test file equals the fix branch's (be9199db1), over the engine before the fix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

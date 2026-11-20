@@ -1,0 +1,21 @@
+server: the Windows hold channel's exchanges wait for the anchor by a bound learned from its answers, backed off to the failover delay (A-552, D-c 4 of 5)
+
+A mount's hold, a Shards stream's resync end and DAX section holds and a record's replacement waited the recovery
+budget and a window for the anchor's answer (HOLD_BUDGET_NS), and a release a window an attempt (RELEASE_ATTEMPT_NS),
+whatever this machine's anchor took; the anchor answers as soon as its loop wakes on the channel's posted read (A-213).
+The daemon now learns its anchor's answers (`crate::anchor_answers`, cfg-free, over `learned_wait`: RFC 6298's tail of
+the exchanges answered, a refusal being an answer, plus a liveness window; an exchange given up at its bound no sample
+by Karn's rule, the next bound doubled no further than the failover delay, the ceiling A-525 gave the FUSE helpers).
+The estimator lives on the shard owning the pipe, where every exchange runs, which publishes the next bound after each
+(`ANSWER_BOUND_NS`); an exchange reads it once as it begins, so the asking shard waits for the owner in its own time
+(A-440) by the same span the owner waits for the anchor. A WinFsp detach answers its client once a release is late past
+that bound (`release_bound_ns`, which replaces RELEASE_BOUND_NS) and goes on asking as before. The three constants are
+deleted.
+
+Test: `an_exchanges_wait_follows_the_anchors_answers_and_backs_off_to_the_failover_delay`
+(crates/server/src/anchor_answers.rs). Red with today's rule on the Mac Studio (kiln r53, 2026-11-19, load 13.5): 2 s
+before any answer, where the rule gives a liveness window. The Windows wiring (anchor_hold_windows.rs, winfsp.rs) and the
+pipe test's first deadline (now the estimator's first bound) are uncompiled here, Windows-only: filed for main's build.
+Design A-552, GAPS' class D line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge: origin/main (0462bd922) into A-680 part 2a as it lands, the push having met main's newer commits -- A-664 part 3's first piece (each git green's map of paths: vcs_store's git arm and its paths module, verbs.rs's two lines, their tests) changes no Mercurial store, no edge code and nothing the lender or the sites read, so the focused run at the piece's code over 2f73eb075 (kiln r357, macOS arm64, Mac Studio: slates-server --lib vcs_http:: vcs_store::hg_view repository::hg_push::tests::names 51 of 51, fmt clean) stands for this tree; two conflicts, both unions: vcs_store's module list (hg_view beside paths) and the amendment log's end, main's A-664 part 3 first and A-680 part 2a last
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+agentic: W9 runs agents under rootless podman on Linux, whose profile Slates now holds (its A-520 third piece, contract 48; slates 8d22d1887) -- a container under it runs as the container's root, which the engine maps to the person, the one id an unshared mount admits, so the case that needs no privilege anywhere has its verdict; a rootless Docker engine, podman as root and a remote podman stay refused (UI goal 88, kiln goal 01a1f1249c5e75b5b569e52f814f3dc6)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

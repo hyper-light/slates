@@ -1,0 +1,3 @@
+merge: two inserts at one point meet in both orders, failing test first (A-668) -- a point is walked past a delta's overwrite or truncate starting at it and never meets the insert behind it, so an insert landed second is accepted ahead of a work that overwrote or truncated and inserted there, while the other order conflicts; the stack's oracle generates that shape
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

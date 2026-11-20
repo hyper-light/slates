@@ -1,0 +1,3 @@
+land: failing tests first for a captured clone's replacement over an outsider's mode change (A-466) -- the agent's bytes with the outsider's mode where the agent left the mode alone, a conflict where both changed it differently, the mode set alone where the disk already holds the agent's bytes; and the overlay's sibling, refused (T-1.14)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge: origin/main into A-586 (g295) again as it lands -- three conflicts: merge_content keeps both removal rules (a copy replacing the file after the base, A-586; a removal after the base, A-612) with the copy-aware last change, commit keeps A-612's tuple with the copies applied first, GAPS' §4.17.4 entry (main's text, its owed Copy clause replaced by A-586's) and the amendment log (main's newest first, A-586 last); no marker left
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

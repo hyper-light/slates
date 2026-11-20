@@ -1,0 +1,3 @@
+cli tests: the mid-write client flow runs bare daemons -- its candidates stay stopped through the cut, and an anchor ends a daemon whose beat lapsed and starts one holding no copy of the log, a second fault past f; every other flow that stops candidates (destroy_across_the_loss, the clients killed waiting) runs bare (A-585)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

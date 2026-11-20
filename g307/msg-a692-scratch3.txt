@@ -1,0 +1,3 @@
+server tests: the HTTP edge test derives the token's contexts before its static closure (A-692 scratch)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

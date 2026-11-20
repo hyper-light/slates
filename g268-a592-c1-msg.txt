@@ -1,0 +1,9 @@
+svn: the commit rule as a pure function, with FSFS's commit as its oracle (A-592, §4.17.4 piece 5) -- WIP for the Studio run
+
+The drive's out-of-date test (commit.c check_out_of_date), the verdict at close-edit (tree.c merge() over the index:
+the work's transaction built on its base by the index's own builder, Index::trial), and the lock read at the verdict
+through the caller's lock table (transaction.c verify_locks, lock.c verify_lock), each refusal typed and named by its
+Subversion error. Tests: one case per rule, the conflict order, the lock reads, and the oracle over the index tests'
+naive FSFS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

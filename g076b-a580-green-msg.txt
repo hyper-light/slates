@@ -1,0 +1,18 @@
+workspace, docs, tests: kiln's Slates fleet under injected faults -- the verdicts, W7's design of the multi-runner test, and the test (A-580; kiln goal 95101ef3, part 60178ceb)
+
+- `workspace::slates_faults`: `judge_move` (moved, or refused by a kind in `slates_move::KINDS` with the agent where it
+  was; never neither), `refusal_kind` (`[kind: x]`), `lost` (an acknowledged file not served byte for byte),
+  `not_reformed` (a listed runner whose node doesn't serve as a member). Red first on the Mac Studio (kiln r375,
+  2026-11-19, load 23): the three verdict tests failed on the stubs (lost [] where b.txt changed; not_reformed [] where c
+  doesn't serve; Moved where the answer was a refusal of kind target_not_serving).
+- docs/agentic.md W7, "The multi-runner test with injected faults": three runners of a test's own server, each its own
+  machine and Slates instance, listed in `[slates_fleet]` with f = 1, form kiln's Slates fleet on loopback; a runner
+  killed, partitioned, restarted, and a move's target cut off midway, each with no privilege; every flow ends with the
+  three verdicts. Linux alone (a macOS workspace is a kernel NFS mount, under which a stopped or killed daemon has
+  panicked the Mac); not the captured-clone landing tests (Slates' A-583).
+- tests/slates_fleet_faults.rs: the four flows (`w7_a_killed_runner_...`, `w7_a_partitioned_runner_...`,
+  `w7_a_restarted_runner_...`, `w7_a_move_whose_target_is_cut_off_midway_...`), gated by SLATES_FLEET_FAULTS=1, every
+  wait the fleet's own failover delay as its nodes report it. Uncompiled by its author (Linux-only, an integration test):
+  filed for the supervisor's build and run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

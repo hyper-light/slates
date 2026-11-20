@@ -1,0 +1,3 @@
+server: the push interface's answer and refusal named for its verb (Appended, BranchAppended, AppendRefused), so receive-pack's wiring takes them beside slates_git's Pushed and slates_merge's PushRefused without a clash (A-635)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge: origin/main into A-668 as it lands -- main's A-669 and A-670 (a write handed on to a hard link, and a node never handed to a link the work never saw, both in slates-merge's engine and stacks) and the GIT_PUSH_OPTION_COUNT fix; one conflict, the amendment log's end (main's A-669 and A-670 first, A-668 last); the merged tree differs from main by A-668's 7 files alone
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

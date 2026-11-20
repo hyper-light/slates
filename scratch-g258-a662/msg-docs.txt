@@ -1,0 +1,3 @@
+wip(scratch): A-662 docs -- the record written at the append, decided by the store's own predicate; findings before landing
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge: origin/main into A-610 as it lands -- four conflicts, each both sides adding at one place, main's first: lib.rs's module lines (main's http, objects, refname, store, unpack, v0, v2 beside lfs), §4.17.2's status (main's A-590 and the rest, then A-610), the amendment log's end (main's newest, A-610 last), GAPS' §4.17 entry; slates-git's manifest and lock merged clean (main's flate2, slates-http, slates-vcs beside A-610's serde_json dev-dependency)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+docs: GAPS' §4.17.4 entry without the merge's conflict markers -- the previous merge's rebuild stopped at GAPS (main had rewrapped the finding's lines) and the merge was committed with GAPS still conflicted; GAPS is now main's with A-592's finding marked fixed by A-617, matched by its text across the rewrap
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,13 @@
+server: a starved hold spins half the window the watchdog judges its shard by, not half the liveness window (A-552, D-c 1 of 5)
+
+`starved_share_ns` takes the shard's own window (A-455: the liveness window raised to the scheduler overrun the shard
+measured, within the observation budget) and `starve_this_thread` reads it as the hold begins
+(`watchdog::own_window_ns`; a hold inside one poll waits for nothing, so the shard's overrun stands for the span). The
+watchdog judges a shard spinning only past that window of CPU held to the build, so a hold spinning half of it is never
+judged spinning, and each beat still shows CPU progress. `watchdog::shard_window_ns` and `own_window_ns` are the
+windows the daemon's other supervision waits read in the commits after this one.
+
+Test: `a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by` (red with today's rule in faf5b5f93: a shard
+held two and a half windows got half the liveness window). Design A-552, GAPS' class D line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

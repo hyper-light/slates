@@ -1,0 +1,3 @@
+merge: origin/main (2410011da) into A-655 part 2b again as it lands -- main brought a lock with an expiry in svn's drive and serve tests (ba0ddb2ee), merged clean beside the piece's drive tests (the piece left Setup and the records' lock calls as they were); macOS arm64 (Mac Studio, kiln r127 on this tree): cargo fmt --check clean; `cargo test --locked -p slates-svn --lib -- commit:: migration:: serve::` 115 of 115, main's new expiry tests among them; slates-merge `engine::copy_tests::t_a655` 1 of 1; slates-server `repository:: vcs_store:: lfs:: git_push::` 55 of 55
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

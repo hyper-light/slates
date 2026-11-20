@@ -1,0 +1,19 @@
+server: a taken-back writable copy's claim is owed for the failover delay its shard holds, the term its holder's write lease runs for, not the client's old two-second reconnect budget (A-552, D-c 5 of 5)
+
+A copy a successor took back from its anchor (A-197, Linux) waits for its holder to name it in a sync or a release;
+one unclaimed within the client's reconnect budget (the recovery budget and a window, mirrored from
+`slates_client::Deadlines`), counted from the shard's start, was written back and let go with its attachment. No
+client keeps that budget any more: since A-468 a client reconnects while its anchor lives, by no clock. The map keeps
+its holder's write attachment, and with it the holder's write lease (D-16), which a silent holder keeps for the failover
+delay since A-414. So the claim is now owed for the failover delay the shard holds (`direct_map::claim_overdue`,
+cfg-free): the shard records when it took the map back (`held_copy::taken_back_ns`, replacing `claim_deadline`), and each
+reclaim judges that instant by the delay the shard holds then (A-363's estimate, fanned to every shard).
+`reconnect_budget_ns` is deleted. D-c is closed by this and the four commits before it.
+
+Test: `a_taken_back_maps_claim_is_owed_for_the_failover_delay_its_shard_holds_now` (crates/server/src/direct_map.rs).
+Red with today's rule on the Mac Studio (kiln r53, 2026-11-19, load 13.5): overdue at two and a half windows, past the
+old two seconds, with the delay at three. The Linux wiring (held_copy.rs, shards/dax_hold.rs) is uncompiled here,
+Linux-only: filed for main's build with the pmem flows (crates/cli/tests/pmem.rs, whose doc now names the delay).
+Design A-552 and A-468's note on the reclaim, GAPS' class D line and A-468's line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

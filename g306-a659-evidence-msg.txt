@@ -1,0 +1,3 @@
+docs: A-659's evidence -- red 16 of 17 against the stubs, green slates-merge --lib 158 of 158 with fmt clean, on Windows x86_64 (jupiter; the Mac Studio offline, the macOS run owed), the oracles' censuses, and the order the verdict depends on that the stack's oracle counts; the walk's finding registered as A-668
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

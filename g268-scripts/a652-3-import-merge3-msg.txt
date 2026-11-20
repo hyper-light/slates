@@ -1,0 +1,3 @@
+merge: origin/main (574185afa) into A-652 part 3 a third time as it lands, the push having met main's newer commits -- main brought A-694 (an append's new branches minted distinct volume ids), A-681 part 1's second slice (slates-svn's log report over HTTP) and A-658 part 3a (slates-merge's computed verdict's wire form); none changes the piece's files, whose appends carry a green's update or nothing and never a new branch; one conflict, the amendment log's end (main's entries first, A-652 part 3 last)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

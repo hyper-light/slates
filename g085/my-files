@@ -1,0 +1,9 @@
+crates/land/src/captured_tests.rs
+crates/land/src/chmod_tests.rs
+crates/land/src/engine.rs
+crates/land/src/manifest.rs
+crates/land/src/verdict.rs
+docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md
+docs/bugs/2026-11-18-a-files-mode-or-windows-bits-changed-alone-never-landed.md
+docs/wip/GAPS.md
+docs/wip/SLATES_DESIGN.md

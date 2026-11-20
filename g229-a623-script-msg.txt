@@ -1,0 +1,3 @@
+svn: the recording script for svnlook's and the hooks' golden vectors -- one repository built through svnserve with svnmucc (copies, a replacement, deletions, properties, binary and non-ASCII files), nine hooks recording their arguments, standard input, environment and directory (pre-commit also reading its transaction with svnlook -t), locks taken, stolen and broken, revision properties changed, fixed dates, and svnlook over every subcommand; WIP for the Studio recording (A-623)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

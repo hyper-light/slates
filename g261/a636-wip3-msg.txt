@@ -1,0 +1,3 @@
+docs: A-636 part 1 -- §4.17.1's status and piece 2, the amendment and GAPS: the fleet half's protocol built as the fenced ledger over a repository's logs, the live plane owed (WIP: the test line waits on the Studio's run)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

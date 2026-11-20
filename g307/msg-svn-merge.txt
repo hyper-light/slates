@@ -1,0 +1,3 @@
+merge: origin/main (550153532) into stock svn's interop tests as they land -- A-640 part 4's third slice (git's upload-pack serving sparse:oid: slates-git and the documents) touches nothing the new test file builds from (it imports no crate and runs the slates binary only on its ignored legs), so kiln r293's run (macOS arm64, Mac Studio, over main e25799e8c: `cargo test --locked -p slates-cli --test svn_interop` 1 passed, 4 ignored, fmt clean) stands for this tree
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

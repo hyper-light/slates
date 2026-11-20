@@ -1,0 +1,66 @@
+   Compiling libc v0.2.189
+   Compiling cfg-if v1.0.4
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling rustix v1.1.4
+   Compiling bitflags v2.13.1
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling serde_core v1.0.229
+   Compiling cc v1.4.5
+   Compiling zmij v1.0.23
+   Compiling getrandom v0.3.4
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling memchr v2.8.3
+   Compiling syn v3.0.5
+   Compiling errno v0.3.14
+   Compiling arrayvec v0.7.8
+   Compiling constant_time_eq v0.4.2
+   Compiling itoa v1.0.18
+   Compiling memmap2 v0.9.11
+   Compiling getrandom v0.4.3
+   Compiling zerocopy v0.8.56
+   Compiling rand_core v0.9.5
+   Compiling blake3 v1.8.7
+   Compiling autocfg v1.5.1
+   Compiling num-traits v0.2.19
+   Compiling syn v2.0.119
+   Compiling serde_derive v1.0.229
+   Compiling fastrand v2.5.0
+   Compiling once_cell v1.21.4
+   Compiling tempfile v3.27.0
+   Compiling wait-timeout v0.2.1
+   Compiling fnv v1.0.7
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling bit-set v0.8.0
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.5
+   Compiling unarray v0.1.4
+   Compiling regex-syntax v0.8.11
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling slates-machine v0.1.0 (/Users/adalundhe/slates-work/w-unresolved-check/crates/machine)
+   Compiling slates-wire-derive v0.1.0 (/Users/adalundhe/slates-work/w-unresolved-check/crates/wire-derive)
+   Compiling proptest v1.11.0
+   Compiling slates-mem v0.1.0 (/Users/adalundhe/slates-work/w-unresolved-check/crates/mem)
+   Compiling slates-wire v0.1.0 (/Users/adalundhe/slates-work/w-unresolved-check/crates/wire)
+   Compiling slates-anchor v0.1.0 (/Users/adalundhe/slates-work/w-unresolved-check/crates/anchor)
+   Compiling slates-rt v0.1.0 (/Users/adalundhe/slates-work/w-unresolved-check/crates/rt)
+   Compiling slates-test-seeds v0.1.0 (/Users/adalundhe/slates-work/w-unresolved-check/crates/test-seeds)
+   Compiling slates-db v0.1.0 (/Users/adalundhe/slates-work/w-unresolved-check/crates/db)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 04s
+     Running tests/lineage_model.rs (/Users/adalundhe/.cache/w-unresolved-local-target/debug/deps/lineage_model-2df5249e671fddb2)
+
+running 4 tests
+test a_takeover_with_no_survivor_lets_no_holder_reclaim_an_object_nobody_adopted ... ok
+test a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record ... ok
+test holders_let_go_only_of_copies_an_adoption_made_stale ... ok
+lineage model over 400 seeds: Counts { reclaimed_settled: 4, reclaimed_confirmed: 114, kept_unknown: 758, kept_unasked: 214, reclaimed_unasked: 2, reclaimed_unasked_record: 0, adopted: 764, recovered_past_tolerance: 242, completed: 638, reclaimed_settled_away: 72, kept_outside: 2526 }
+test the_generated_histories_reach_every_verdict ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.55s
+

@@ -1,0 +1,27 @@
+hg, http-edge, server: Mercurial over HTTP (A-650 part 1) -- serve::http answers HTTP version 1 as stock Mercurial 7.2 frames it, held to 13 exchanges of a stock 7.2 clone, pull and incoming against stock hg serve; the daemon's hg site on the shared edge judges each request in hgweb's order and names its answer's media type as its reply begins; A-569's codec reads the last cmd and getbundle judges bundle capabilities first, as 7.2 does; slates-hg lib 293 of 293, slates-http-edge lib 32 of 32 and slates-server lib vcs_http 36 of 36 on macOS arm64 (Mac Studio)
+
+Squashed from agents/g303-a650-p1-land: 929473182 (part 1 as agents/g303-a650-p1 b4020cc4c had it, replayed on
+cd84e3811), c69a246a2 (the golden's inflate room) and 58a256f4c (merge of origin/main b1926d201). This commit's tree
+is 58a256f4c's with the docs' four run tokens filled, and nothing else.
+
+Runs on macOS arm64, Mac Studio (kiln runner d1323898), 2026-11-19, CARGO_BUILD_JOBS=2:
+- r6 at 929473182: cargo test --locked -p slates-hg --lib, 292 of 293. The golden
+  every_http_exchange_is_answered_as_mercurial_meant_it failed: its helper inflated 7.2's zstd frames, which name a
+  2 MiB window and no content size (2,490,432 bytes charged for the decoder before any is inflated), in the 1 MiB
+  request room. c69a246a2 gives the helper INFLATE_ROOM (4 MiB; 7.2's streams inflate to 4,955 bytes at most).
+  slates-http-edge --lib: 32 of 32. slates-server --lib vcs_http did not compile: main's git site stub named
+  PackRefused::Stalled, which 188314131 removed (main fixed it in 93bd6e807).
+- r33 at c69a246a2: slates-hg --lib 293 of 293; cargo fmt -p slates-hg -p slates-http-edge -p slates-server --
+  --check clean.
+- r48 at 58a256f4c, the merged tree this commit carries: slates-server --lib vcs_http 36 of 36 (git's site 10,
+  Mercurial's 6, the edge's serving 11, the waits 9; main's 29 and these 7), no warnings; fmt clean. Main's commits
+  since cd84e3811 change nothing that slates-hg or slates-http-edge build from (their in-workspace closures are merge,
+  vcs and test-seeds, and http and test-seeds; merge's copy_tests is #[cfg(test)]), so r33 and r6 stand for them.
+No integration target reaches vcs_http (a module private to slates-server) or slates-hg, so no --test target ran.
+The other platforms are owed (main's); Windows from a core.autocrlf=false clone, for the fixtures' CRLF heads.
+
+Moved out to their own pieces, per main, each with its failing test first: zlib's bound as the linked zlib-rs states
+it (agents/g303-a650-zlib-bound) and a query's fields past the room answered 414 (agents/g303-a650-query-414). Both
+are recorded open in GAPS and the amendment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

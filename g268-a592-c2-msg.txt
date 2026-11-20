@@ -1,0 +1,6 @@
+svn: A-592's oracle no longer lists the root as its own entry -- the Mac Studio's first run (kiln, 2026-11-19 03:57 UTC) overflowed the oracle test's stack: the naive entries of "/" included "/" under the empty name, so the transcribed merge() went down into the root forever; the rule's own walk already dropped empty names
+
+Also rustfmt's layout from that run, the path order and skip-ancestor transcriptions without string slicing, and
+merge()'s changed-entry checks as their own function, each kept to the lint wall's complexity bound.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

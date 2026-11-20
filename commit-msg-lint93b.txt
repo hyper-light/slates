@@ -1,0 +1,3 @@
+lint: goal 93's newer code passes clippy and the literal check -- graft_at and insert_at under the complexity limit through one set_child helper, two byte strings, git's delta and type tables and a held-send record's shape marked; the literal check reads 0_usize as 0, not the literal 0_, and a tuple field's index as a position, as it reads an array index (both with tests); bridge-oci's quoted man page escaped for rustdoc
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

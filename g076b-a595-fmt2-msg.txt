@@ -1,0 +1,3 @@
+git: cargo fmt over the golden test (A-595)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

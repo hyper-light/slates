@@ -1,0 +1,32 @@
+hg, http-edge, server: Mercurial over HTTP (A-650 part 1) -- serve::http answers HTTP version 1 as stock Mercurial 7.2 frames it, held to 13 exchanges of a stock 7.2 clone, pull and incoming against stock hg serve; the daemon's hg site on the shared edge judges each request in hgweb's order (credentials by A-625 part 3's record, a request for another shard's repository moved there) and names its answer's media type as its reply begins; A-569's codec reads the last cmd and getbundle judges bundle capabilities first, as 7.2 does; slates-hg lib 306 of 306 and slates-server lib vcs_http 40 of 40 on macOS arm64 (Mac Studio, kiln r137)
+
+One commit for the piece, its tree the tested tree 11865db7f (agents/g303-a650-p1-final: part 1 as b4020cc4c had it,
+the golden's inflate room, and main merged six times) with docs and doc comments brought to main as it is now.
+
+- slates-hg: serve::http (answer, Answered, Compression, Compressor, Media, Permission, permission, command) over the
+  session's transport-neutral dispatch; compression::Engine wire names and bound; http::Fields::command reads the
+  last cmd (hgweb's multidict); getbundle judges bundle1 before what is missing (a bundle1 client was sent a bundle2
+  abort). fixtures/serve-http: 13 exchanges captured from stock 7.2 (make-http-fixtures.sh; SHA256SUMS; -text).
+- slates-http-edge: Connection::reply_fields, the head rendered with the reply's first bytes; a field no reply can
+  carry fails 500 before any of it is sent.
+- slates-server: vcs_http::hg (HgSite, HgStores, NoStores, Fastest, HgExchange) and Exchange::reply_fields. On
+  A-625 part 3's edge the site proves credentials by git's Authenticator::prove (a record that does not answer 503,
+  the rest 401) and moves a proven request for a repository another shard holds there (Answer::Move); a new test
+  holds both. slates-server depends on slates-hg (one entry, its comment naming every use).
+
+Runs, macOS arm64, Mac Studio (kiln runner d1323898), 2026-11-19, CARGO_BUILD_JOBS=2:
+- r137 on 11865db7f, the tree that lands: cargo test --locked -p slates-server --lib vcs_http 40 of 40 (daemon_edge
+  1, git 12, hg 7, serve 11, waits 9), no warnings; -p slates-hg --lib 306 of 306 (this piece's 9 among them);
+  cargo fmt -p slates-hg -p slates-http-edge -p slates-server -- --check clean.
+- r6 on 929473182: -p slates-http-edge --lib 32 of 32; its inputs (http, http-edge, test-seeds) unchanged since.
+  The same run failed the golden alone: its helper inflated 7.2's zstd frames, which name a 2 MiB window and no
+  content size (2,490,432 bytes charged for the decoder), in the 1 MiB request room; given INFLATE_ROOM (4 MiB).
+- r33, r48, r95, r107, r115, r128: the same arms green on each merge of main along the way.
+No integration target reaches vcs_http (private to slates-server) or slates-hg, so no --test target ran. The other
+platforms are main's (Windows from a core.autocrlf=false clone, for the fixtures' CRLF heads).
+
+Left to their own pieces, each with its failing test first: zlib's bound as the linked zlib-rs states it
+(agents/g303-a650-zlib-bound) and a query's fields past the room 414 (agents/g303-a650-query-414); the site handed
+A-662's stores; its refusals counted by kind as git's are. All recorded in GAPS and the amendment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+docs: A-458's amendment, bug record and evidence -- failing first on main's code (5 of 25 lib tests: Skipped(Drift), no entry planned, BaseDrift at the plan), then slates-land's lib tests 26 of 26, slates-vfs 3 of 3, slates-api 2 of 2 and the wire order 2 of 2 on the Mac Studio; red-checked once (a field judged against the disk alone: 3 of 26 failed); macOS and x86_64-pc-windows-msvc checks clean; land: A-458's lines as rustfmt lays them out there
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,5 @@
+hg: serve::indexed, a repository's served view over its index, held to 7.2's served filter (A-680 part 1)
+
+Branch commit; lands squashed with its docs and run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

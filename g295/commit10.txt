@@ -1,0 +1,3 @@
+merge: a file the version's own copy brought and its increment edited records no removal -- Green::copied_in guards A-612's rename-onto rule (A-586 with A-612)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

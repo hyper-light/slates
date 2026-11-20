@@ -1,0 +1,3 @@
+db, server: a repository's register entry commits several greens' versions, its namespace and its own state as one step (A-603) -- WIP for the Studio run
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

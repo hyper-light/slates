@@ -1,0 +1,3 @@
+merge: origin/main into A-595 -- two conflicts, each two additions kept side by side (slates-git's crc32fast beside slates-http; lib.rs's delta and entry beside http); A-595's own flate2 line dropped for A-607's one workspace entry (zlib-rs), which slates-http takes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

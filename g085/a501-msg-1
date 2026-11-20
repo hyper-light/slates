@@ -1,0 +1,3 @@
+land: failing tests first for a touch alone and a base directory's mode alone (A-501) -- an overlay's new mtime on a base file, an overlay's chmod of a base directory and a captured clone's chmod of a directory, each to land as a metadata entry synced by its batch's barrier
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

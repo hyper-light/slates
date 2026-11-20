@@ -1,0 +1,3 @@
+design: changesets in write-ahead logs, lock-free incremental commits, no global references (A-642, Ada) -- each green keeps its own log and a repository has no position every change passes through, replacing A-603's repository-wide register position; an atomic push is one entry on each green it moves, appended only while each is at the position it read; owed to g261 with A-635 and A-636
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

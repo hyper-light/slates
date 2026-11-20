@@ -1,0 +1,5 @@
+THE RULE (Ada, final): ONE piece. Implement it with its unit tests (a bug's failing test first) and its design/GAPS lines;
+run ONLY `cargo test -p <crate> --lib <filter>` and `cargo fmt` -- no clippy, no xtask, no xwin/--target checks, no doc
+builds, nothing heavier; merge yourself (fetch, merge origin/main, read `git diff --stat origin/main HEAD`, then
+`git push origin HEAD:main` as its own command; never checkout/switch/stash/reset/force/commit-tree); END: file every
+heavier check in run-requests.md, report to main in a few lines, stop. Main builds and lints everything.

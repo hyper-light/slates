@@ -1,0 +1,3 @@
+git: A-610's design entry, status and GAPS line, with its evidence -- red: the 20 LFS entry points stubbed on the Mac Studio's clone alone, 50 of 50 new tests failed; green on 77a36c9d7: cargo test --locked -p slates-git --lib 126 of 126 (batch 12, JSON 10, locks 11, pointer 11, shared 6), cargo fmt --check clean; and the batch tests' refusal table an array of its 24 cases, as clippy's useless_vec asks of a list only iterated
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

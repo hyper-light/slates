@@ -1,0 +1,3 @@
+api: rustfmt's reflow of A-490's Windows resolver lines -- four hunks cargo fmt --check named on the Mac Studio (the import list, two long string arms, the test's adapter closure), no change in behaviour (A-490)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

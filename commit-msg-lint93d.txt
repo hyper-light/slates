@@ -1,0 +1,3 @@
+lint: four Subversion index tests under the complexity limit, their assertions grouped into named helpers that say what each checks; rt's held-turn notes escape E[T^2] / E[T] for rustdoc; the literal check's test formatted
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

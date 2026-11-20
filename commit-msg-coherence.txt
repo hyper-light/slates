@@ -1,0 +1,3 @@
+bridge-fuse tests: the coherence test's rounds gather whole -- ff16bed94 gave Coherence::deliver a slicing callback before its sink, and tests/coherence.rs still passed three arguments, so the test target did not compile on main (E0593/E0061, main's workspace build on the Mac Studio, kiln r39); its rounds now pass a callback that always continues, since the slicing is bridge-core's own test
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

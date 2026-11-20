@@ -1,0 +1,3 @@
+merge: origin/main into A-668 -- A-659 landed; one conflict, the stack oracle's module docs (main's collapsed replicas kept, A-668's sentence on the shape it now generates replacing the one on its avoidance)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

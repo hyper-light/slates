@@ -1,0 +1,3 @@
+lint: Subversion's CRAM digest decoded through as_chunks, a byte string, a Windows-only refusal named in plain code so a macOS doc build reads it, wildmatch's upper-case test marked, slates-vcs's oracle layout named and its generator formatted
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

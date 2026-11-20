@@ -1,0 +1,3 @@
+unsafe-budget: slates-api 9 -> 10 for A-507's unmount(2) call -- the macOS and BSD unmount calls the kernel itself rather than running umount from the PATH, and neither rustix nor std wraps unmount(2) there; one block, the call on the mount point's C string; A-507 landed without the line (A-507)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

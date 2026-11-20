@@ -1,0 +1,3 @@
+docs: A-472's amendment, sources and evidence -- failing first (3 of 35: no barrier taken, two modes left unsynced), then slates-land's lib tests 35 of 35 and slates-vfs's 3 of 3 on the Mac Studio; red-checked once (the barrier given the temporaries alone: the same 3 failed); land: A-472's lines as rustfmt lays them out
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

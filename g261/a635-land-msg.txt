@@ -1,0 +1,19 @@
+merge, db, server: a push judges every work before any commits and records them as one entry, all or none; A-603's register rebuilt to A-642's logs -- each green its own log, a version appended only at the position the push read (refused Moved, naming the green), the repository's state in logs of its own (names, phases, markers, LFS locks), and an entry over two logs or more one atomic record each green's log points to, a holder applying it at its join and a cut splitting it refused; 128 generated histories through a database over a real anchor segment with crashes hold Agreement, StaleNeverCommits and NoLoss (181 multi-green records, 344 single-green appends interleaved, 119 stale entries refused); merge --lib 94/94, db --lib 138/138, server --lib 577 with main's known failure on the Mac Studio, red sixteen ways (A-635)
+
+- merge: `Green::judge` holds a verdict (`Judged`), `Green::commit_judged` commits it at the head it was judged at or
+  refuses `HeadMoved`; `submit_resolved` is a judgment committed at once. An oracle holds judging then committing equal
+  to a submit over 256 histories (1,977 accepts, 251 resends, 609 conflicts).
+- server: `crates/server/src/repository/push.rs`, one interface for receive-pack, unbundle and the LFS locks:
+  `RepositoryLogs::append(principal, repository, changes, parts) -> Result<Pushed, PushRefused>` on the shard's state.
+  Updates (A-618's works), creates (a new branch made at a version, moved by a work) and deletes (at the version read),
+  with checks, names and state; every rule and gate, then every work's verdict held, then the whole entry with its new
+  greens judged by `Partition::check_creating`, before anything is applied; then the verdicts commit and the new greens
+  and the entry are one log record. A refusal names every change refused and why, and gives back what it held.
+- db: no repository-wide position; `Op::RepositoryAdvanced`'s entry has no position; versions and head checks refuse
+  `Moved { green, read, at }`; `RepositoryCheck::Log`; `StateLog` {Names, Phases, Markers, Locks} positions;
+  `StateChange::{LockTaken, LockReleased}`; `AtomicRecord` with `join` and `split_by`, kept while a green's log points
+  to it, carried by the snapshot with its pointers (`AtomicHeld`); A-622's policy keeps its own version as its log's
+  position. ipc: `DatabaseRefusal::Moved` appended; `OutOfOrder` superseded and kept.
+- A member's version alone is `Op::GreenAdvanced` again (its own log's append); A-575's verbs move the names log alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

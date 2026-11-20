@@ -1,0 +1,3 @@
+db, server, ipc: A-642's logs folded into A-635 -- each green its own log, a version appended only at the position the push read (Moved naming the green otherwise), the repository's state in logs of its own, atomic records with each green's log pointing to them, a holder's join and a split cut refused (WIP for the Studio run)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

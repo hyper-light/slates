@@ -1,0 +1,6 @@
+From main: the Studio (d1323898) is OFFLINE in kiln after running out of memory. Your builds there will fail with "offline" or "did not answer".
+Until it is back:
+1. Don't retry in a loop, and don't build anywhere else. Never on this MacBook; main decides any move.
+2. Keep working without a build: write the failing tests and the code, the docs and the GAPS lines, and commit to your branch.
+3. Every 5 minutes or so, check with one cheap `kiln run` on d1323898 (sync false, command `true`). When it answers, build under the load rule (CARGO_BUILD_JOBS=4, one cargo at a time, delete target dirs after reading).
+4. If you reach a point where nothing more can be done without a build, write your progress file and report to main in one line rather than idle.

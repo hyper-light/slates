@@ -1,0 +1,3 @@
+git: the golden test's flate2 is slates-git's own dependency since A-608, so its dev-dependency line goes (A-595)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

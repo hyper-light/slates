@@ -1,0 +1,3 @@
+merge: origin/main into A-606 as it lands -- three conflicts: slates-svn's lib.rs (main's commit and handshake modules beside authz, and the crate doc's list), GAPS' §4.17.4 entry (main's A-605 and A-599 first, A-606 after, authorization off the owed list), and the design's pieces list and amendment log (main's A-602, A-607, A-605 and A-603 first, A-606 last)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

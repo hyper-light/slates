@@ -1,0 +1,3 @@
+merge tests: the restatement oracle prints its census, the works that agreed counted (A-663)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

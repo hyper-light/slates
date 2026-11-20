@@ -1,0 +1,3 @@
+superseded local copy (never pushed): A-520 as first written at contract 43, before main took 43; landed as caa42bce9 at 44
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

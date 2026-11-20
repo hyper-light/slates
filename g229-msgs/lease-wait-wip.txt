@@ -1,0 +1,5 @@
+server tests: WIP, unbuilt -- lease_wait's tests drive verbs::run_forwarded (made pub(crate)), the lease made to refuse and hold by OwnerLease::supersede and ::installed, the lapse waited out for real on a laptop audit daemon whose deadline timer is its only resolver; the isolated-owner fleet test's assertion message no longer says "on this connection"
+
+Stopped at main's redirect (2026-11-19 ~21:40Z) before any build: the predecessor's 4084f4b62 failed to compile at kiln r57 (ReplyBody::from_bytes needs slates_wire::Wire in scope, lease_wait.rs:467); this rewrite reads completions through run_forwarded instead. Owed: fmt, `cargo test --locked -p slates-server --lib lease_wait::`, then land from a fresh branch with a real message.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

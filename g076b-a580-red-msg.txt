@@ -1,0 +1,9 @@
+workspace: red tests for the verdicts of kiln's Slates fleet under injected faults (A-580; kiln goal 95101ef3, part 60178ceb)
+
+`workspace::slates_faults` (new): a move ends moved or refused by a kind a move is refused by, never neither
+(`judge_move`, `refusal_kind`); an acknowledged file not served byte for byte is lost (`lost`); the fleet re-forms once
+every listed runner serves as a member (`not_reformed`). Each verdict's body answers "nothing wrong" here, so its test
+fails; the verdicts follow. `workspace::slates_move::KINDS`, every kind a move is refused by, with
+`every_refusals_kind_is_listed_and_the_list_holds_no_other` holding it to `MoveRefused::kind`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

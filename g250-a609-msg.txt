@@ -1,0 +1,3 @@
+svn: the HTTP side's bodies as codecs, piece 13's first part (A-609) -- a bounded XML reader that refuses every DTD (a billion laughs stops at its first byte), OPTIONS, PROPFIND, MERGE and ten REPORTs decoded as mod_dav_svn reads them from 22 request bodies stock svn 1.15.0 sent on the Mac Studio, and every answer but the two editor drives written byte for byte as mod_dav_svn writes it; every cut of every captured body refused or read the same; slates-svn lib 98 of 98, red once with unknown entities read through
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+red: A-650 part 1's guards removed one by one (25 mutations, each tagged RED Rn), for the red run on jupiter; never lands
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+docs: A-586 records main's decision on the identity -- one entry a copy stays, since a Subversion copy's history is part of the repository (log and blame follow it) and it costs O(1); a Merkle identity would change A-202's format for no gain Subversion can see
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

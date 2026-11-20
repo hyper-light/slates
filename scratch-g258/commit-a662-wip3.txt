@@ -1,0 +1,8 @@
+wip(scratch): A-662, moves resolved inside the append with each green's version -- still not compiled (Studio offline)
+
+The record's moves carry the version the entry leaves each green at; GitStore keeps them per key and answers
+version_of(head) newest first; a move names a green or a new branch by name (Target), resolved inside push_sealed after
+make() mints its green; seal makes generations only and each append admits its own moves. Tests follow, with a create
+keyed by the green its append makes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

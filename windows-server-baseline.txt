@@ -1,0 +1,29 @@
+slates-server lib, Windows x86_64 (jupiter), main 6e42e7a2c, 2026-11-19 ~14:00Z, kiln r1485:
+  export PATH="/c/Users/corph/.cargo/bin:$PATH"; CARGO_BUILD_JOBS=12 AWS_LC_SYS_PREBUILT_NASM=1
+  cargo test --locked -p slates-server --lib -- --test-threads=4
+  -> 587 passed; 23 failed; 3 ignored (25.72 s). At the default 32 test threads the daemon's watchdog ends the binary
+     (Windows oversubscription, CLAUDE.md), so always pass `-- --test-threads=4` on jupiter.
+The 23 failing on main (a failure beyond these is yours):
+  daemon::tests::a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance
+  daemon::tests::a_holders_publication_carries_the_content_it_puts_not_the_whole_hold
+  deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request
+  live_ship::tests::a_holder_with_no_room_for_its_log_refuses_the_entry_and_keeps_its_copy
+  merge_origin::tests::a_holder_keeps_a_checkpoint_of_its_replica_at_the_committed_floor_its_owner_names
+  merge_origin::tests::a_holder_lets_go_of_the_records_and_inputs_its_checkpoint_stands_for
+  merge_origin::tests::a_rebuild_installs_nothing_short_of_its_records_or_off_their_identities
+  merge_origin::tests::a_rebuilt_replica_folds_where_each_record_says_its_owner_folded
+  merge_origin::tests::a_replica_is_seeded_a_unit_at_a_time_and_only_with_its_records_identity
+  merge_origin::tests::a_replica_rewinds_below_a_value_its_ledger_replaced_and_advances_to_the_new_one
+  nfs_writeback::tests::a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window
+  repository::push::tests::every_refused_change_is_named_and_nothing_is_applied
+  repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log
+  verbs::tests::a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind
+  verbs::tests::a_left_out_volumes_kept_record_keeps_the_blocks_it_names
+  verbs::tests::a_publish_leaves_out_a_volume_being_destroyed
+  verbs::tests::a_relinquished_volume_is_torn_down_without_a_tick
+  verbs::tests::a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once
+  verbs::tests::a_taken_over_archive_lands_at_its_offsets_and_an_oversized_one_is_refused
+  verbs::tests::a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed
+  verbs::tests::a_tree_laid_a_piece_a_step_is_the_tree_laid_at_once
+  verbs::tests::a_write_lease_stays_its_holders_while_the_holder_keeps_a_write_attachment
+  xshard::tests::a_bounded_wait_for_room_waits_its_period_in_time_on_a_starved_shard

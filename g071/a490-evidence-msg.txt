@@ -1,0 +1,3 @@
+docs: A-490's evidence -- on the Mac Studio the adapters test failed once on a copy where no adapter counts and passed at 963a93999 with role::fleet 11 of 11; cargo xwin check and cargo xwin clippy --no-deps of slates-api clean for x86_64-pc-windows-msvc; the unsafe budget slates-api 9 of 9; the live Windows start, Nano Server's new iphlpapi.dll import and the Linux check filed for main (A-490)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

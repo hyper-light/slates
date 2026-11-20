@@ -1,0 +1,3 @@
+merge: origin/main (e21beb606) into A-692 as it lands, the push having met main's newer commits -- A-686 (the HTTP edge takes Basic with a token as its password on loopback and offers Basic's challenge first: slates-http-edge's credential, the server's vcs_http sites and their tests, the interop tests' waits) and A-647 part 4 among them; three conflicts: svn_interop.rs's two HTTP legs now wait on A-681 alone, A-685 and A-686 both landed, and the documents (GAPS's interop paragraph keeps A-692's waits with A-686's Basic built, the design log main's entries first and A-692's last); the focused set is run over this merge's own tree before its push, and named with A-692's report
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

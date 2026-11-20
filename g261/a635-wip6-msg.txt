@@ -1,0 +1,3 @@
+server: the push reads the shard's clock through its trait (WIP for the Studio run)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

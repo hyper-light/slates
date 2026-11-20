@@ -1,0 +1,5 @@
+git: a pack's header length is A-582 part 3's entry::PACK_HEADER_LEN, which pack and pack::idx now use, and Idx::offset_of gives the id-to-offset lookup the pack reader (A-608) resolves a reference delta's base by (A-591)
+
+Part 3 landed first (3a8164117), so pack's own HEADER_LEN is gone and the one number lives in entry, as main asked (2026-11-19): pack's check and objects and every offset bound in pack::idx (the header refusal at decode, the first object at check, the writer's refusal) read entry::PACK_HEADER_LEN; the tests take it as an index through a test helper. offset_of is find then offset, held to git's listing by id in the golden test and to the model in the proptest, an absent id answering None. The docs: A-591's entry names A-607 as the deflate engine crc32fast comes with, and GAPS drops the owed HEADER_LEN item. The unit run on this commit is in the progress file and the report.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

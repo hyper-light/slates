@@ -1,0 +1,3 @@
+merge: origin/main into A-592 as it lands -- two conflicts, both appends at one place in the design: §4.17.4's status blocks (main's A-605, then A-592) and the amendment log's end (main's A-605 and after, then A-592); GAPS' §4.17.4 title now names A-605's mergeinfo too, and its owed list no longer lists mergeinfo
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge: a copy's tree is read from its graft, never below the floor (A-626 part 3) -- the identity read what a copy brought from its source's history at the source's version, which a green restored at a later checkpoint does not hold, so a replica replaying a copy from before its checkpoint hashed otherwise than its owner (the copy oracle's seed cc ef9d3557); now it reads the source at the version before the copy through the copy's fix, kept with its record and charged with the change index until the fold floor reaches the copy; the oracle replays the seed; two replica tests; docs to follow
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

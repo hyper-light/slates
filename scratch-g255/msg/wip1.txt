@@ -1,0 +1,10 @@
+server: policy by name pattern and the hooks' protocol (A-597) -- WIP for the Studio run
+
+§4.17.1 shared piece 7. wildmatch.rs: git's wildmatch with WM_PATHNAME as tokens matched by the set of reachable text
+positions (no recursion), held to git's 190 t3070 vectors and to a line-for-line transcription of dowild. vcs_policy.rs:
+git ref patterns (for-each-ref's literal-or-glob, the last rule wins as transfer.hideRefs), Mercurial branch, bookmark
+and topic names (acl's deny-then-allow), Subversion paths (authz's deepest depth, then the rule defined last), indexed,
+each held to an oracle trying every rule in order. vcs_hooks.rs: the points, their inputs in each tool's terms, each
+hook's deadline learned with LearnedWait (none before its first finished run), and the runner with typed outcomes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

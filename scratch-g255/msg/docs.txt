@@ -1,0 +1,8 @@
+docs: A-597's design, GAPS and evidence -- policy by name pattern under each tool's own precedence (git's for-each-ref coverage with the last rule winning as transfer.hideRefs; Mercurial's acl order; authz's deepest depth, then the rule defined last) and the hooks' protocol with each hook's deadline learned by LearnedWait; slates-server lib 26 of 26 on the Mac Studio (kiln, debug, load 7-11), fmt clean, red six ways on a mutated copy
+
+§4.17.1's policy paragraph gains a status and piece 7 its note; §4.17.4's hook-deadline row names the shared
+estimator (a size regression only once measurement shows a hook's run time following the commit's size); the
+amendment log gains A-597; GAPS' §4.17 entry gains A-597's paragraph; research/vcs-servers.md §6 records every source
+read with its revision, lines and sha256. Two module-doc sentences narrowed to what the sources read state.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

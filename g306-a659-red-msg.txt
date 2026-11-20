@@ -1,0 +1,12 @@
+merge: stacks of works over works, failing tests first (A-659) -- an upper restated over its lower's landing and a work over a tree, stubbed
+
+Red half of A-659 (UI goal 93, §4.17.1 shared piece 5). `slates_merge::engine::{Upper, Landed, Restated,
+RestateRefused, TreeBase, TreeNode}` and `Green::{land_stack, restate, restate_over_tree, land_over_tree}`: the stack
+lands in order with each work all or none, but `restate` and `restate_over_tree` refuse every upper, so every test
+of an upper fails here. Tests (crates/merge/src/engine/stack/): 11 worked cases (fast path, a remapped upper, an
+upper meeting a change its lower never saw, a refused bottom, a stack landed again, an upper landed after its lower,
+a lower's rename and make followed, metadata and removals judged, a change the lower made too, one it met in another
+shape, a truncate keeping an append, typed refusals); 3 tree cases; two oracles (a stack against a replica in which
+its works landed first, a work over a tree against a whole-file model) with censuses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

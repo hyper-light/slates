@@ -1,0 +1,3 @@
+merge: origin/main into A-635's landing; the amendment log keeps A-645 and appends A-635 after it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

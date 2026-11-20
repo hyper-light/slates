@@ -1,0 +1,3 @@
+merge: origin/main into A-484 (g250) as it lands -- one conflict, the amendment log's end: main's A-476 through A-497 first, A-484 after; main's takeover change (a held copy follows its move per object at the install walk, resolve_by_route) keeps the A-484 judgment in both of its paths
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

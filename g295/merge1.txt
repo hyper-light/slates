@@ -1,0 +1,3 @@
+merge: origin/main into A-586 (g295) as it lands -- three conflicts: engine.rs's module lines (copy and A-596's reanchor both kept), GAPS' §4.17.4 entry (main's text, its owed Copy clause replaced by A-586's) and the design's §4.17.4 status blocks and amendment log (main's first, A-586 last); no marker left
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

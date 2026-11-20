@@ -1,0 +1,3 @@
+merge: origin/main (a6306963e) into A-626 part 3 as it lands -- main's commits since 5c0a522f1, the run's base, touch none of the twelve workspace crates slates-merge and slates-anchor build from (anchor, archive, image, ipc, machine, mem, merge, rt, test-seeds, vfs, wire, wire-derive) nor the toolchain; Cargo.toml and Cargo.lock gain slates-hg for slates-server alone, so the run at be0348459 (kiln r40, macOS arm64, Mac Studio: slates-merge lib 73 of 73 filtered, --test checkpoint 4 of 4, --test chain_replay 3 of 3, slates-anchor layout 2 of 2 and a_segment_ 5 of 5, fmt clean) stands for the merged tree
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

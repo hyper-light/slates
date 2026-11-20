@@ -1,0 +1,3 @@
+docs: CLAUDE.md section 8 takes back the gates main added to every agent that afternoon -- an agent compiles only for its own --lib unit tests; clippy, xtask, cross-target and Windows checks and doc builds are main's (Ada, 2026-11-18: "Why are ANY of these compiling?")
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

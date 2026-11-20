@@ -1,0 +1,3 @@
+docs: CLAUDE.md section 8 adds the two light gates every agent runs before merging -- the one-crate clippy and `cargo xtask check` -- because lint and literal findings landed faster than main could clear them, which kept CI's test lanes skipped behind a red clippy step; workspace-wide clippy and the lint matrix stay main's
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

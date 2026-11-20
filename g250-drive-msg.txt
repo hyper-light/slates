@@ -1,0 +1,3 @@
+svn: the update-report's answer, the editor drive in send-all mode written as update.c writes it (A-627, continued) -- every call byte for byte against update.c's format strings (open, add with bc-url, sha1 and copy source, checked-in hrefs, delete, absent, set and remove prop, txdelta through the crate's svndiff encoder in flat base64, the md5 prop, every close), read back as well-formed XML; slates-svn lib 286 of 286, red once with a base64 property's line feed dropped
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

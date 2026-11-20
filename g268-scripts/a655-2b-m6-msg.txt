@@ -1,0 +1,3 @@
+merge: origin/main (b94ae6e90) into A-655 part 2b for its run on the Mac Studio -- two conflicts: repository.rs's module lines (A-678's import module kept beside the piece's svn_commit) and the amendment log's end (main's A-678 and A-653 continued (4) first, A-655 part 2b last)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

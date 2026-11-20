@@ -1,0 +1,3 @@
+merge: origin/main (a7b5e4292) into A-692 as it lands, the push having met main's newer commits -- A-683 (git's receive-pack on the SSH edge: vcs_ssh's receive module and its tests, the site's ToolServices with a shard lender, the daemon edge serving it with ThisShard, git_push's tests crate-visible) changes no file A-692 changes and names no credential type A-692 changes (CredentialKind::HttpToken, CredentialMaterial::HttpToken); one conflict, the design log's end, main's A-683 entry first and A-692's last (the exact union); since A-683 changes the SSH site whose tests A-692's focused set runs, that set is run again over this merge's own tree before its push, and named with A-692's report
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

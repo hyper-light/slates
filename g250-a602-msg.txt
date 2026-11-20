@@ -1,0 +1,3 @@
+svn: Subversion's locks, the lock table with its verbs' guards and the verdict's check, guarded then applied (A-602) -- the oracle transcribes FSFS's lock rules (lock.c, fs-loader.c, fs-wrap.c, transaction.c, serve.c) and the table equals it on 256 generated histories, all 15 refusals met (469 tokens drawn in the model's order, 45 steals, 8 breaks, 17 releases, 60 expired locks met by commits, 35 requests letting go of expired locks for the room); slates-svn lib 74 of 74 on the Mac Studio, red once with the verdict's owner check skipped
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

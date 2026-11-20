@@ -1,0 +1,5 @@
+git: the pack index, version 2, and a pack's header and trailer (A-591) -- code, tests and golden vectors for the Mac Studio's unit-test run; the lock and the docs follow with its evidence
+
+pack: the header read as a stream delivers it (PACK refused at its first wrong byte, versions 2 and 3, the count), a whole pack checked trailer first, and a Writer that writes git's header and computes the trailer as bytes pass, every checksum through object_name's Hasher (A-600). pack::idx: version 2 decoded in place after its own checksum is verified (fanout never down and agreeing with the ids, ids strictly ascending, the 8-byte table whole and indexed in range, no offset inside a pack's header), held to its pack as git verify-pack is short of inflating (count, trailer, offsets inside the objects, objects back to back, each CRC32 over its span through crc32fast, approved by main as flate2's own CRC crate), and written byte for byte as git 2.50.1 writes it. Golden vectors: ofs, ref, ofs-large (git index-pack --index-version=2,0x200) and sha256 packs, indexes and verify-pack listings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

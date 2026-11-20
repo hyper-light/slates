@@ -1,0 +1,9 @@
+server tests: a query's fields past the request's room are 414 as a path's are, failing first (A-650, a query's 414) -- the hg site's room test gains the query case, which part 1 answers 400
+
+requests_past_their_room_and_a_damaged_policy_are_refused asks the owner's heads by /hg?cmd=heads&pad=<300 bytes>
+of a site admitting 256 bytes a request and expects 414 (RFC 9110 section 15.5.15: a target longer than the server
+is willing to interpret), as for a path past the room and as git's routes answer a target past theirs. Expected red
+here: the test failing with the query's status 400 (route() maps every refusal of hg_http::command to 400). The next
+commit is the fix. An A-number is main's to assign; until then the test says "A-650 part 1 and a query's 414".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

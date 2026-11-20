@@ -1,0 +1,3 @@
+docs: A-595's results -- slates-http 51 of 51, slates-git 92 of 92 with the five golden tests on the Mac Studio, red first on stubs; the GAPS line reflowed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

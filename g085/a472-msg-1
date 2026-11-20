@@ -1,0 +1,3 @@
+land, vfs: failing tests first for a landed mode's durability (A-472) -- the simulated host now holds a mode or bits set in place unsynced until a barrier names the file, and a metadata entry must be in its batch's barrier; and main's lint findings in land's test files: one store fixture for the suites (test_store), the vectors' fixed inputs as named constants, a named type, and two tests split under the complexity bound
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

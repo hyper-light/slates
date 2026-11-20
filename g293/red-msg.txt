@@ -1,0 +1,3 @@
+scratch (never merged): A-520's unit tests over the library as it was, for their red run -- the container bind stubbed to answer no binding, the simulator to offer none, the source sent as given
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

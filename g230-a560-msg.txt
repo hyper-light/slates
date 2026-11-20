@@ -1,0 +1,3 @@
+winfsp: a receive worker learns its reply spin window from its own wakes, trusts it only once they agree, and never spins past the shard's step quantum -- each worker timed fifteen probe wakes once at start and spun for their median for good, unbounded and unchecked, so a noisy start on CI's arm64 runner set 143.9 and 108.1 us against wakes of 4.1 to 11.5 us; replies are now stamped at their send, every reply a worker parked for is one of its wakes, RFC 6298's estimator (its gains, seed and S + 4V band) learns from them for the worker's life, the window is zero until the deviation falls below the RFC's seed and is capped at the step quantum of the shard that started the mount (A-560)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

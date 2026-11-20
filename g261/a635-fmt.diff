@@ -1,0 +1,641 @@
+diff --git a/crates/db/src/repository.rs b/crates/db/src/repository.rs
+index e0f10fb..cac3310 100644
+--- a/crates/db/src/repository.rs
++++ b/crates/db/src/repository.rs
+@@ -859,7 +859,11 @@ impl Repositories {
+     entry: &crate::catalog::RepositoryEntry,
+     greens: Vec<LogSpan>,
+   ) -> Result<StateBytes, DbError> {
+-    let Some(before) = self.registers.get(&entry.repository).map(Register::positions) else {
++    let Some(before) = self
++      .registers
++      .get(&entry.repository)
++      .map(Register::positions)
++    else {
+       return Err(DbError::NotFound);
+     };
+     if !self.records.contains_key(&entry.repository) {
+@@ -888,7 +892,10 @@ impl Repositories {
+       }
+     }
+     let namespace = entry.joined.len().saturating_add(entry.names.len());
+-    self.names_moved(entry.repository, u64::try_from(namespace).unwrap_or(u64::MAX));
++    self.names_moved(
++      entry.repository,
++      u64::try_from(namespace).unwrap_or(u64::MAX),
++    );
+     let mut bytes = StateBytes::default();
+     let mut spans = greens;
+     if let Some(register) = self.registers.get_mut(&entry.repository) {
+@@ -958,7 +965,10 @@ impl Repositories {
+     }
+     for pointer in &held.pointers {
+       let within = held.record.spans.iter().any(|span| {
+-        span.log == LogName::Green { green: pointer.green }
++        span.log
++          == LogName::Green {
++            green: pointer.green,
++          }
+           && pointer.version > span.from
+           && pointer.version <= span.to
+       });
+diff --git a/crates/db/src/repository/entry/tests.rs b/crates/db/src/repository/entry/tests.rs
+index a54d40d..a2b39d9 100644
+--- a/crates/db/src/repository/entry/tests.rs
++++ b/crates/db/src/repository/entry/tests.rs
+@@ -359,7 +359,11 @@ fn assert_stale_and_outside_entries_are_refused(
+   for outsider in [plain, foreign, green(99)] {
+     let mut outside = at(repo);
+     outside.versions = vec![version(c, 1, b"c1"), version(outsider, 1, b"x")];
+-    assert_eq!(advance(partition, outside), Err(DbError::NotFound), "{outsider:?}");
++    assert_eq!(
++      advance(partition, outside),
++      Err(DbError::NotFound),
++      "{outsider:?}"
++    );
+   }
+   assert_eq!(
+     partition.to_snapshot(0),
+@@ -510,7 +514,11 @@ fn the_repositorys_state_moves_in_logs_of_its_own_with_its_push_or_alone() {
+   };
+   assert_eq!(partition.repositories().atomic_at(a, 1), Some(&record));
+   let mut alone = at(repo);
+-  alone.state = vec![root_removed(1, 1), root_added(1, 2), locked("x.bin", b"lock-1")];
++  alone.state = vec![
++    root_removed(1, 1),
++    root_added(1, 2),
++    locked("x.bin", b"lock-1"),
++  ];
+   advance(&mut partition, alone).unwrap();
+   assert_state_logs_read_back(&partition, repo);
+   assert_wrong_state_changes_are_refused(&mut partition, repo, a);
+@@ -540,7 +548,11 @@ fn assert_state_logs_read_back(partition: &Partition, repo: RepositoryId) {
+   assert_eq!(positions, vec![Some(6), Some(3), Some(2), Some(1)]);
+ }
+ 
+-fn assert_wrong_state_changes_are_refused(partition: &mut Partition, repo: RepositoryId, a: VolumeId) {
++fn assert_wrong_state_changes_are_refused(
++  partition: &mut Partition,
++  repo: RepositoryId,
++  a: VolumeId,
++) {
+   let before = partition.to_snapshot(0);
+   for (state, index) in [
+     (vec![root_added(1, 2)], 0),
+@@ -876,10 +888,17 @@ struct EntryStep {
+ enum Step {
+   Advance(EntryStep),
+   /// One member's version alone (`Op::GreenAdvanced`), a single-green push between the records.
+-  Single { green: u8 },
++  Single {
++    green: u8,
++  },
+   /// A member's checkpoint `back` versions below its head.
+-  Checkpoint { green: u8, back: u8 },
+-  Destroy { volume: u8 },
++  Checkpoint {
++    green: u8,
++    back: u8,
++  },
++  Destroy {
++    volume: u8,
++  },
+   Snapshot,
+   Crash,
+ }
+@@ -903,9 +922,7 @@ fn check_step() -> impl Strategy<Value = CheckStep> {
+ fn name_step() -> impl Strategy<Value = NameStep> {
+   (0..6u8, 0..=NAMES, pick(), any::<bool>()).prop_map(|(kind, name, green, some)| match kind {
+     0..=2 => NameStep::Bind { name, green },
+-    3 | 4 => NameStep::Retire {
+-      name: name % NAMES,
+-    },
++    3 | 4 => NameStep::Retire { name: name % NAMES },
+     _ => NameStep::Default {
+       name: some.then_some(name),
+     },
+@@ -917,18 +934,23 @@ fn state_step() -> impl Strategy<Value = StateStep> {
+     0 => StateStep::Add { phase, node },
+     1 => StateStep::Remove { phase, node },
+     2 => StateStep::Marker { marker: n },
+-    3 => StateStep::Lock { path: n, lock: node },
+-    _ => StateStep::Unlock { path: n, lock: node },
++    3 => StateStep::Lock {
++      path: n,
++      lock: node,
++    },
++    _ => StateStep::Unlock {
++      path: n,
++      lock: node,
++    },
+   })
+ }
+ 
+ fn entry_step() -> impl Strategy<Value = EntryStep> {
+-  let join = (0..VOLUMES, any::<u8>(), pick(), 0..4u8).prop_map(|(volume, root, from, version)| {
+-    JoinStep {
++  let join =
++    (0..VOLUMES, any::<u8>(), pick(), 0..4u8).prop_map(|(volume, root, from, version)| JoinStep {
+       volume,
+       from: (root % 10 != 0).then_some((from, version)),
+-    }
+-  });
++    });
+   (
+     proptest::bool::weighted(0.6),
+     proptest::collection::vec(check_step(), 0..3),
+@@ -948,20 +970,17 @@ fn entry_step() -> impl Strategy<Value = EntryStep> {
+ }
+ 
+ fn step() -> impl Strategy<Value = Step> {
+-  (
+-    0..20u8,
+-    entry_step(),
+-    0..VOLUMES,
+-    any::<u8>(),
+-  )
+-    .prop_map(|(kind, entry, volume, n)| match kind {
+-      0..=10 => Step::Advance(entry),
+-      11..=13 => Step::Single { green: n },
+-      14 => Step::Checkpoint { green: n, back: volume },
+-      15 => Step::Destroy { volume },
+-      16 => Step::Snapshot,
+-      _ => Step::Crash,
+-    })
++  (0..20u8, entry_step(), 0..VOLUMES, any::<u8>()).prop_map(|(kind, entry, volume, n)| match kind {
++    0..=10 => Step::Advance(entry),
++    11..=13 => Step::Single { green: n },
++    14 => Step::Checkpoint {
++      green: n,
++      back: volume,
++    },
++    15 => Step::Destroy { volume },
++    16 => Step::Snapshot,
++    _ => Step::Crash,
++  })
+ }
+ 
+ /// What an operation was answered, by kind, with what an entry's refusal names.
+@@ -1120,7 +1139,9 @@ impl Model {
+         Ok(())
+       }
+       RepositoryCheck::Names { prefix, bound } if self.under(prefix) != *bound => Err(failed),
+-      RepositoryCheck::Log { log, position } if self.state_position(*log) != *position => Err(failed),
++      RepositoryCheck::Log { log, position } if self.state_position(*log) != *position => {
++        Err(failed)
++      }
+       _ => Ok(()),
+     }
+   }
+@@ -1172,7 +1193,11 @@ impl Model {
+       spans
+         .entry(log)
+         .and_modify(|span| span.to = span.to.max(version.version))
+-        .or_insert(span(log, before.head(index_of(version.green)), version.version));
++        .or_insert(span(
++          log,
++          before.head(index_of(version.green)),
++          version.version,
++        ));
+     }
+     for log in STATE_LOGS {
+       let (from, to) = (before.state_position(log), self.state_position(log));
+@@ -1388,7 +1413,11 @@ impl Model {
+       }
+     }
+     for made in entry.versions {
+-      let next = version(made.green, scratch.head(index_of(made.green)) + 1, &made.entry);
++      let next = version(
++        made.green,
++        scratch.head(index_of(made.green)) + 1,
++        &made.entry,
++      );
+       if scratch.version(&next).is_ok() {
+         kept.versions.push(next);
+       }
+@@ -1410,7 +1439,11 @@ impl Model {
+   fn made(&self, repository: RepositoryId, step: &EntryStep) -> RepositoryEntry {
+     let mut heads: BTreeMap<u8, u64> = BTreeMap::new();
+     let mut entry = at(repository);
+-    entry.checks = step.checks.iter().map(|check| self.check_of(check)).collect();
++    entry.checks = step
++      .checks
++      .iter()
++      .map(|check| self.check_of(check))
++      .collect();
+     entry.joined = step
+       .joins
+       .iter()
+@@ -1428,13 +1461,23 @@ impl Model {
+       .collect();
+     for (green, skew) in &step.versions {
+       let green = self.picked(*green);
+-      let next = heads.get(&green).copied().unwrap_or_else(|| self.head(green)) + 1;
++      let next = heads
++        .get(&green)
++        .copied()
++        .unwrap_or_else(|| self.head(green))
++        + 1;
+       let version_made = skew.apply(next);
+       heads.insert(green, version_made);
+       let bytes = format!("{green}@{version_made}").into_bytes();
+-      entry.versions.push(version(volume_of(green), version_made, &bytes));
++      entry
++        .versions
++        .push(version(volume_of(green), version_made, &bytes));
+     }
+-    entry.names = step.names.iter().map(|change| self.name_of_step(change)).collect();
++    entry.names = step
++      .names
++      .iter()
++      .map(|change| self.name_of_step(change))
++      .collect();
+     entry.state = step.state.iter().map(state_of_step).collect();
+     entry
+   }
+@@ -1497,7 +1540,11 @@ fn state_of_step(change: &StateStep) -> StateChange {
+ /// What the partition holds of the repository, in the model's terms.
+ fn observed(partition: &Partition, repository: RepositoryId) -> Model {
+   let repositories = partition.repositories();
+-  let position = |log| repositories.log_position(repository, log).unwrap_or(u64::MAX);
++  let position = |log| {
++    repositories
++      .log_position(repository, log)
++      .unwrap_or(u64::MAX)
++  };
+   let records = repositories
+     .atomic_records()
+     .map(|record| {
+@@ -1774,7 +1821,9 @@ impl History {
+     if log.entries.is_empty() {
+       return Ok(());
+     }
+-    let version = log.head().saturating_sub(u64::from(back) % log.entries.len() as u64);
++    let version = log
++      .head()
++      .saturating_sub(u64::from(back) % log.entries.len() as u64);
+     let records = self.model.records.len();
+     self.model.checkpoint(green, version);
+     census.records_folded += u64::from(self.model.records.len() < records);
+diff --git a/crates/db/tests/wire_order.rs b/crates/db/tests/wire_order.rs
+index bcd5d5e..d86c521 100644
+--- a/crates/db/tests/wire_order.rs
++++ b/crates/db/tests/wire_order.rs
+@@ -19,7 +19,10 @@
+ mod order;
+ 
+ use slates_db::catalog::{
+-  AttachForm, AuditKind, BaseRecord, Consumer, GrantScope, GrantState, GrantSurface, HookPointName, LandingState, LogName, MemberOrigin, NameChange, NamePolicy, ObjectFormat, PlacementState, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyWho, Principal, RepositoryCheck, Role, SealKeyOwner, SizeClass, StateChange, StateLog, VcsTool, VolumeState, WriteMode,
++  AttachForm, AuditKind, BaseRecord, Consumer, GrantScope, GrantState, GrantSurface, HookPointName,
++  LandingState, LogName, MemberOrigin, NameChange, NamePolicy, ObjectFormat, PlacementState,
++  PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyWho, Principal, RepositoryCheck, Role,
++  SealKeyOwner, SizeClass, StateChange, StateLog, VcsTool, VolumeState, WriteMode,
+ };
+ use slates_db::op::Op;
+ use slates_wire::Wire;
+diff --git a/crates/server/src/repository.rs b/crates/server/src/repository.rs
+index 417f574..187f2e4 100644
+--- a/crates/server/src/repository.rs
++++ b/crates/server/src/repository.rs
+@@ -36,8 +36,8 @@
+ //! its id.
+ 
+ use slates_db::catalog::{
+-  BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy,
+-  PolicyRecord, Principal, RepositoryEntry, RepositoryId, RepositoryPolicy, RepositoryRecord, Role,
++  BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy, PolicyRecord,
++  Principal, RepositoryEntry, RepositoryId, RepositoryPolicy, RepositoryRecord, Role,
+   SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
+ };
+ use slates_db::op::Op;
+@@ -950,7 +950,8 @@ mod tests {
+           .repositories()
+           .log_position(repo, slates_db::catalog::StateLog::Names)
+       };
+-      let head_of = |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
++      let head_of =
++        |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
+       assert_eq!(names(state), Some(2), "the root joined and its name bound");
+       write(state, root, b"v1", 1);
+       write(state, root, b"v2", 2);
+@@ -965,10 +966,16 @@ mod tests {
+       retire_and_bind_again(state, topic);
+       assert_eq!(names(state), Some(6));
+       write(state, topic, b"t1", 3);
+-      assert_eq!((names(state), head_of(state, topic), head_of(state, root)), (Some(6), 1, 2));
++      assert_eq!(
++        (names(state), head_of(state, topic), head_of(state, root)),
++        (Some(6), 1, 2)
++      );
+       assert_a_lone_green_and_a_refused_bind_move_nothing(state, topic);
+       assert_eq!(names(state), Some(6));
+-      assert_eq!(state.db.partition().repositories().atomic_records().count(), 0);
++      assert_eq!(
++        state.db.partition().repositories().atomic_records().count(),
++        0
++      );
+     });
+   }
+ 
+diff --git a/crates/server/src/repository/push.rs b/crates/server/src/repository/push.rs
+index 49668e9..6c03b07 100644
+--- a/crates/server/src/repository/push.rs
++++ b/crates/server/src/repository/push.rs
+@@ -315,13 +315,20 @@ fn plan(
+   let mut refused = Vec::new();
+   for (index, change) in changes.into_iter().enumerate() {
+     let planned = match change {
+-      BranchChange::Update { green, work } => plan_update(state, record.id, (green, work), &mut greens),
++      BranchChange::Update { green, work } => {
++        plan_update(state, record.id, (green, work), &mut greens)
++      }
+       BranchChange::Create {
+         name,
+         from,
+         version,
+         work,
+-      } => plan_create(state, (record, principal), (name, from, version, work), &mut names),
++      } => plan_create(
++        state,
++        (record, principal),
++        (name, from, version, work),
++        &mut names,
++      ),
+       BranchChange::Delete { name, version } => {
+         plan_delete(state, record.id, (name, version), (&mut names, &mut greens))
+       }
+@@ -432,7 +439,8 @@ fn plan_create(
+     return Err(refused(Refusal::NotFound));
+   }
+   let version = super::branch_version(state, from, Some(version)).map_err(refused)?;
+-  let id = crate::verbs::fresh_volume_id(state).ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
++  let id =
++    crate::verbs::fresh_volume_id(state).ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
+   let named = super::member_name(&record.name, &name, id).map_err(refused)?;
+   let require_evidence = requires_evidence(state, from);
+   if require_evidence && work.as_ref().is_some_and(|work| work.evidence.is_empty()) {
+@@ -549,7 +557,11 @@ fn make(state: &mut ShardState, steps: &[Step], held: &mut Held) -> Result<(), V
+ }
+ 
+ /// Secures each work's retention on its green before the verdict (A-16), folding first to leave it room.
+-fn secure(state: &mut ShardState, steps: &[Step], held: &mut Held) -> Result<(), Vec<ChangeRefused>> {
++fn secure(
++  state: &mut ShardState,
++  steps: &[Step],
++  held: &mut Held,
++) -> Result<(), Vec<ChangeRefused>> {
+   let mut refused = Vec::new();
+   for (index, step) in steps.iter().enumerate() {
+     let Some((green, work)) = step.work() else {
+@@ -608,7 +620,10 @@ fn judge(
+       verdicts.push(None);
+       continue;
+     };
+-    let judgment = state.greens.get_mut(&green).map(|mut engine| engine.judge(work));
++    let judgment = state
++      .greens
++      .get_mut(&green)
++      .map(|mut engine| engine.judge(work));
+     let why = match judgment {
+       Some(Judgment::Accepted(judged)) => {
+         verdicts.push(Some(Verdict::Held(judged)));
+@@ -624,10 +639,12 @@ fn judge(
+         }
+         ChangeRefusal::Conflict { windows }
+       }
+-      Some(Judgment::BaseUnavailable { base, .. }) => ChangeRefusal::Refused(Refusal::UnknownBase {
+-        green: to_wire_volume(green),
+-        version: base,
+-      }),
++      Some(Judgment::BaseUnavailable { base, .. }) => {
++        ChangeRefusal::Refused(Refusal::UnknownBase {
++          green: to_wire_volume(green),
++          version: base,
++        })
++      }
+       None => ChangeRefusal::Refused(Refusal::ContentUnavailable),
+     };
+     verdicts.push(None);
+@@ -655,7 +672,11 @@ fn entry(
+   };
+   for step in steps {
+     match step {
+-      Step::Delete { name, green, version } => {
++      Step::Delete {
++        name,
++        green,
++        version,
++      } => {
+         entry.checks.push(RepositoryCheck::Head {
+           green: *green,
+           version: *version,
+@@ -800,7 +821,8 @@ fn recorded_entry(
+           .map(|mut engine| engine.head_identity())
+       })
+       .flatten();
+-    let bytes = slates_merge::chain_entry::encode(&work.encode(), work, applied, None, identity, None);
++    let bytes =
++      slates_merge::chain_entry::encode(&work.encode(), work, applied, None, identity, None);
+     versions.push(GreenVersion {
+       green,
+       version: *version,
+@@ -841,7 +863,15 @@ fn record_all(state: &mut ShardState, ops: &[Op]) -> Result<(), PushRefused> {
+ fn after(state: &mut ShardState, steps: &[Step], committed: &Committed, held: &mut Held) {
+   for (step, made) in steps.iter().zip(committed) {
+     if let Step::Create { record, .. } = step {
+-      crate::merge_service::enqueue_record(state, record.id, 0, [0u8; 32], 0, Vec::new(), (None, None));
++      crate::merge_service::enqueue_record(
++        state,
++        record.id,
++        0,
++        [0u8; 32],
++        0,
++        Vec::new(),
++        (None, None),
++      );
+     }
+     if let (Some((green, work)), Some((version, _, false))) = (step.work(), made) {
+       crate::merge_service::enqueue_record(
+diff --git a/crates/server/src/repository/push/tests.rs b/crates/server/src/repository/push/tests.rs
+index 4c018e2..fe11eb8 100644
+--- a/crates/server/src/repository/push/tests.rs
++++ b/crates/server/src/repository/push/tests.rs
+@@ -147,7 +147,10 @@ fn repository(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId)
+     panic!("no repository: {reply:?}")
+   };
+   let repositories = state.db.partition().repositories();
+-  let repo = repositories.repository_named(name).expect("the repository").id;
++  let repo = repositories
++    .repository_named(name)
++    .expect("the repository")
++    .id;
+   (repo, to_db_volume(id))
+ }
+ 
+@@ -235,9 +238,9 @@ fn kept(state: &mut ShardState, repository: RepositoryId, greens: &[DbVolumeId])
+     .iter()
+     .map(|green| {
+       let mut engine = state.greens.get_mut(green);
+-      let (engine_head, identity) = engine
+-        .as_mut()
+-        .map_or((None, None), |engine| (Some(engine.head()), Some(engine.head_identity())));
++      let (engine_head, identity) = engine.as_mut().map_or((None, None), |engine| {
++        (Some(engine.head()), Some(engine.head_identity()))
++      });
+       drop(engine);
+       (
+         state.db.partition().green_head(*green),
+@@ -360,7 +363,10 @@ fn assert_both_moved_in_one_record(
+   assert_eq!(record_at(state, topic, 1), Some(record.clone()));
+   assert_eq!(
+     logs_of(&record),
+-    vec![LogName::Green { green: main }, LogName::Green { green: topic }]
++    vec![
++      LogName::Green { green: main },
++      LogName::Green { green: topic }
++    ]
+   );
+   assert_eq!(file(state, main, "f").as_deref(), Some(&b"two"[..]));
+   assert_eq!(file(state, topic, "g").as_deref(), Some(&b"topic"[..]));
+@@ -404,7 +410,11 @@ fn assert_refused_whole(
+   };
+   let named: Vec<usize> = refused.iter().map(|refused| refused.index).collect();
+   assert_eq!(named, indexes);
+-  assert_eq!(kept(state, repo, &greens), before, "a refused push applied something");
++  assert_eq!(
++    kept(state, repo, &greens),
++    before,
++    "a refused push applied something"
++  );
+   refused
+ }
+ 
+@@ -424,7 +434,13 @@ fn a_push_creates_and_deletes_branches_in_the_same_step() {
+         name: "feature".to_owned(),
+         from: main,
+         version: 1,
+-        work: Some(work(state, main, (1, Some(one)), (featured, b"fe1"), (&store, 6))),
++        work: Some(work(
++          state,
++          main,
++          (1, Some(one)),
++          (featured, b"fe1"),
++          (&store, 6),
++        )),
+       },
+       BranchChange::Delete {
+         name: "topic".to_owned(),
+@@ -447,14 +463,20 @@ fn assert_created_deleted_and_moved(
+   pushed: &Pushed,
+   [main, topic]: [DbVolumeId; 2],
+ ) {
+-  let Some(BranchPushed::Created { green: feature, version: 1 }) = pushed.changes.first().cloned()
++  let Some(BranchPushed::Created {
++    green: feature,
++    version: 1,
++  }) = pushed.changes.first().cloned()
+   else {
+     panic!("no branch made: {pushed:?}")
+   };
+   let repositories = state.db.partition().repositories();
+   assert_eq!(repositories.branch(repo, "feature"), Some(feature));
+   assert_eq!(repositories.branch(repo, "topic"), None);
+-  assert!(repositories.member(topic).is_some(), "a deleted branch's green is kept");
++  assert!(
++    repositories.member(topic).is_some(),
++    "a deleted branch's green is kept"
++  );
+   assert_eq!(file(state, feature, "f").as_deref(), Some(&b"one"[..]));
+   assert_eq!(file(state, feature, "h").as_deref(), Some(&b"new"[..]));
+   assert_eq!(head(state, feature).as_deref(), Some(&b"fe1"[..]));
+@@ -516,7 +538,10 @@ fn every_refused_change_is_named_and_nothing_is_applied() {
+     ];
+     let refused = assert_refused_whole(state, (repo, [main, topic]), changes, &[0, 1, 2, 3, 4, 5]);
+     assert_eq!(
+-      refused.iter().map(|refused| refused.why.clone()).collect::<Vec<_>>(),
++      refused
++        .iter()
++        .map(|refused| refused.why.clone())
++        .collect::<Vec<_>>(),
+       vec![
+         ChangeRefusal::Refused(Refusal::AlreadyExists {
+           existing: crate::verbs::to_wire_volume(main)
+@@ -586,7 +611,13 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
+       name: "made".to_owned(),
+       from: main,
+       version: 1,
+-      work: Some(work(state, main, (1, Some(one)), (made, b"m1"), (store, 10))),
++      work: Some(work(
++        state,
++        main,
++        (1, Some(one)),
++        (made, b"m1"),
++        (store, 10),
++      )),
+     },
+     BranchChange::Update {
+       green: topic,
+@@ -598,7 +629,10 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
+     refused.first().map(|refused| &refused.why),
+     Some(ChangeRefusal::Conflict { windows }) if !windows.is_empty()
+   ));
+-  assert_eq!(state.db.partition().repositories().branch(repo, "made"), None);
++  assert_eq!(
++    state.db.partition().repositories().branch(repo, "made"),
++    None
++  );
+ }
+ 
+ /// A-635 (the gates every merge passes, and the entry's own refusals). Do: push a move with a check of another
+@@ -617,9 +651,7 @@ fn the_gates_and_the_entry_refuse_the_whole_push() {
+     assert_a_failed_check_refuses_the_entry(state, (repo, [main, topic]), moving.clone());
+     assert_the_state_moves_with_the_push(state, repo, main, moving);
+     assert_the_write_policy_gates_the_push(state, repo, main, &mut store);
+-    let elsewhere = RepositoryId {
+-      bytes: [0xee; 16],
+-    };
++    let elsewhere = RepositoryId { bytes: [0xee; 16] };
+     assert_eq!(
+       push(state, &stranger(), repo, Vec::new(), EntryParts::default()),
+       Err(PushRefused::Repository(Refusal::Forbidden {
+@@ -627,7 +659,13 @@ fn the_gates_and_the_entry_refuse_the_whole_push() {
+       }))
+     );
+     assert_eq!(
+-      push(state, &owner(), elsewhere, Vec::new(), EntryParts::default()),
++      push(
++        state,
++        &owner(),
++        elsewhere,
++        Vec::new(),
++        EntryParts::default()
++      ),
+       Err(PushRefused::Repository(Refusal::NotFound))
+     );
+   });
+@@ -725,7 +763,12 @@ fn assert_the_write_policy_gates_the_push(
+         },
+       }),
+     ),
+-    (WriteMode::Ask, ChangeRefusal::ApprovalRequired { identity: moving.id }),
++    (
++      WriteMode::Ask,
++      ChangeRefusal::ApprovalRequired {
++        identity: moving.id,
++      },
++    ),
+   ] {
+     let policy = Op::VolumeWritePolicySet {
+       id: main,
+@@ -735,7 +778,10 @@ fn assert_the_write_policy_gates_the_push(
+         require_signed_merges: false,
+       },
+     };
+-    state.db.mutate(&mut state.segment, &policy, 0).expect("the policy is set");
++    state
++      .db
++      .mutate(&mut state.segment, &policy, 0)
++      .expect("the policy is set");
+     let changes = vec![BranchChange::Update {
+       green: main,
+       work: moving.clone(),

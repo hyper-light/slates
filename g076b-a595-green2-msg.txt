@@ -1,0 +1,25 @@
+http, git: HTTP/1.1's request codec as its own crate, and git's smart HTTP routes over it -- a head resumed line by line and charged its bytes and index, bodies streamed as slices of their input, gzip inflated within the room; git routed as http-backend routes it (A-595, §4.17.2 piece 8's first part)
+
+slates-http (new, pure, sans I/O; shared by the git, Mercurial and Subversion servers):
+- head: HeadReader scans each byte once across reads, skips empty lines before the request line, refuses a line past
+  RFC 9112 §3's 8000 octets whole or still open (414 for the request line, 431 after), and a head that fills the
+  admission's room unended; a whole head is charged its bytes and field index before the index is built, and borrows
+  the caller's bytes. Origin, absolute (http/https, no userinfo; its authority over Host) and asterisk (OPTIONS) forms;
+  every bare CR or LF, fold, whitespace before a colon and control byte refused by kind; Host once in HTTP/1.1;
+  Content-Length digits that agree, past 64 bits 413; Content-Length with Transfer-Encoding, a transfer coding in
+  HTTP/1.0, chunked not last or twice refused 400 and another coding 501; gzip once or 415 with Accept-Encoding;
+  Expect 100-continue (ignored in HTTP/1.0) or 417; judged in one order whatever the fields' order.
+- body: BodyReader keeps only the state of the line it is in; data comes back as slices of the input; chunk sizes in
+  hex within 64 bits, extensions skipped but free of controls, trailers read to the field grammar, dropped and
+  charged; every line held to MAX_LINE.
+- gzip: Gunzip over flate2's write::MultiGzDecoder (the workspace's zlib-rs, A-607): every inflated byte charged as it
+  is made, a write past the room refused with the sink never grown past it; every member, CRC-32 and length checked;
+  never written after its end.
+- percent, reply: escapes and forms decoded, counted and compared without allocating; reply heads, refusals and chunks
+  with response splitting refused.
+slates-git::http: routes, typed refusals and replies as http-backend.c answers (services[], select_service,
+check_content_type, bad_request, hdr_nocache, daemon_avoid_alias), Git-Protocol's greatest version as protocol.c
+chooses it, the `# service=` prelude for v0 and v1 alone. The MCP edge's parser is not shared (MCP's fields, POST alone,
+no transfer coding, a runtime-bound crate); its bounds' citations are; moving it onto slates-http is owed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

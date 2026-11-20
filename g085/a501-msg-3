@@ -1,0 +1,3 @@
+vfs, land, docs: a witnessed directory is named by its own path in status, drift and rewitness, and the golden vectors carry two directory metadata entries (A-501) -- the first Studio run's recovered status named the directory `inode N`, since `path_of_inode` reads a home a directory has none of; the vectors republished from the encoder, an independent encoder agreeing byte for byte (588265a1); rustfmt's layout; §4.5, §4.15 steps 4, 5 and 8, GAPS and the bug record
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

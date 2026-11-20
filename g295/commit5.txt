@@ -1,0 +1,7 @@
+docs: A-586, the merge engine's Copy -- one record a copy at its destination, keys read by the latest copy above them, the identity one entry a copy; hard links refused by kind, the root a source and never a destination; 44 of 44 on the Mac Studio, red six ways
+
+The design (§4.16 status, the "Copies" bullet, the verdict's sentence; §4.17.4 status and piece 3; the A-542 entry's
+part 2 pointer), the A-586 entry with its settlements, owed items, tests and evidence, and GAPS (§4.17 header and
+§4.17.4 entries).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

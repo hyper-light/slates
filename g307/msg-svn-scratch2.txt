@@ -1,0 +1,3 @@
+docs: stock svn interop tests, design status and GAPS (scratch)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

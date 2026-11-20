@@ -1,0 +1,7 @@
+merge: a review comment on a copied file whose path once held a removed file is followed with the copy's bytes -- the failing test first (A-586 with A-596)
+
+`Green::reanchor` (A-596) reads a path's own content history; a path holding a copy's value has, at most, a history
+that ends in an older removal, so a comment on the copied file is refused `NotLines` where it should move. This commit
+holds the test alone; the fix follows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

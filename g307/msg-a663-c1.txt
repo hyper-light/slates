@@ -1,0 +1,3 @@
+merge: a rebased work restates each hard link where the node it names still stands (A-663) -- red on Windows x86_64 (jupiter) over main's engine: 6 of 6 failing (a link replayed onto the renamed-in file; "f names nothing" three ways; "h is held" and LinkOverExisting on the next submit; the oracle); the oracle's first run also found a write lost outside the restatement (an append to a file a link names, then its removal: the link read the head's bytes), filed open and left out of its works
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

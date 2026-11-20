@@ -1,0 +1,3 @@
+server tests: the HTTP tests' stub pack source refuses past admission -- A-640 part 3 (188314131) removed PackRefused::Stalled from slates-git, and vcs_http/tests/git.rs still returned it, so slates-server's lib tests did not compile on main (E0599, found by g304 on the Studio, kiln r21); the stub's refusal is never read, since no exchange of these tests begins a pack
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

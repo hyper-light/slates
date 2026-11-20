@@ -1,0 +1,3 @@
+merge tests: A-670's red copy -- the late-link cases, the stack's hand-over and late-link cases, and the restatement oracle's fixed histories over main's engine, failing first
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,13 @@
+# Lint habits for agents (main runs the gates; agents never run clippy/xtask)
+- Doc evidence tags escaped: `\[B\]`, `\[C\]` (rustdoc reads `[B]` as a link). Never link a cfg-gated item from docs.
+- Byte arrays as byte strings: `*b"!^"`, not `[b'!', b'^']`.
+- No `prop_oneof!` (its strategy is Arc-backed, R2): plain tuples plus a weighted selector (crates/base/src/s3/host.rs, crates/vcs/src/tests.rs `step`).
+- No unwrap/expect/assert!/panic! inside a fn returning Result or Option, tests included: use `?`, `prop_assert!`, `.get()`, `.ok_or(...)`.
+- No string slicing `&s[a..b]`: `s.get(a..b)`.
+- Cognitive complexity at most 10 per fn: each `assert_eq!` counts; group assertions in named helpers.
+- A numeric literal within 4 lines after a `Format:`, `Derived:`, `Measured:` or `Shape:` comment (a `//` comment line counts; one every 4 rows of a table).
+- `chunks_exact(N)` with a const N: `as_chunks::<N>().0`. `x % n == 0`: `x.is_multiple_of(n)`. A complex tuple/Vec type: name it with `type`.
+- A new crate: a `name = 0` row INSIDE unsafe-budget.toml's `[budget]` table (rows above the header are never read).
+- Lines at most 100 columns (rustfmt's default; rustfmt.toml sets only tab_spaces).
+- After any merge: `command grep -rnE '^(<<<<<<< |=======$|>>>>>>> )' docs crates` must print nothing before you commit (main found committed markers in GAPS twice on 2026-11-19).
+- Red and green copies must each have their own CARGO_TARGET_DIR: cargo keys a workspace member by its path from the workspace root, so a shared target reuses the red build. Check the green log says Compiling for your crate (g293, 2026-11-19).

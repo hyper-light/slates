@@ -1,0 +1,3 @@
+merge: origin/main (0c7a77bd3) into A-672 as it lands -- main's one commit since cd84e3811 changes CLAUDE.md alone, which slates-merge does not build from, so the run at c2e1cc8d2 (kiln r4, macOS arm64, Mac Studio: `cargo test --locked -p slates-merge --lib copy` 34 passed, none failed, fmt clean) stands for the merged tree
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

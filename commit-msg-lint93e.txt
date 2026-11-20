@@ -1,0 +1,3 @@
+lint: slates-vcs and the Subversion commit rule pass clippy and rustdoc -- identity lists read through as_chunks, release_one's answer named Released, blake3's context form escaped for rustdoc and svnserve's conflict message set as code; a test call formatted as rustfmt writes it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

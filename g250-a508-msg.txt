@@ -1,0 +1,3 @@
+takeover: a live owner's copy held outside all of its neighbourhoods goes once the owner's settled cohort holds it whole -- a holder an owner's neighbourhood moved away from kept the owner's copies for good (red: the plain register stayed, (true, true)); now a copy the owner wrote goes as a stale copy goes, its content kept while a head names it, where the settled cohort for the object is whole and at least f + 1 wide, and is kept (fleet.settle.kept_outside) while a member has left it, for a bootstrap's one-host cohort and for a moved object. Unit: db register 85/85, server takeover and holder tests 25/25 (A-508)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

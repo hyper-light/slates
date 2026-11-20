@@ -1,0 +1,3 @@
+svn: authorization's tests meet main's clippy pass -- the oracle's strategies are plain index and tuple strategies (no Arc-backed prop_oneof!, R2) and its token rows a named struct; the book's examples and the 1.10 notes' wildcard cases split into tests of their own (cognitive complexity was 12 and 13 of 10); no assertion changed (A-606's tests, fixed in A-623's first part)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

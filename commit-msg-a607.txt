@@ -1,0 +1,3 @@
+vcs: the version-control servers' deflate engine is zlib-rs through flate2, chosen by measurement -- at git's level 6 over slates' own 4,742 files it deflates 135.0 against miniz_oxide's 79.4 MB/s and inflates 956.4 against 497.5 MB/s, best of five interleaved on the Mac Studio, output 0.255 against 0.257; one workspace entry, no crate picks a backend (A-607)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

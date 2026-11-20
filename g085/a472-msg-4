@@ -1,0 +1,3 @@
+land, vfs: the write phase's progress boxed, as the advance's is (clippy's large_enum_variant once a batch held metadata entries too), and the captured tree's kind test read through a helper under the complexity bound
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+docs: A-574's evidence on the Mac Studio (kiln r256) -- red on the tests alone (the supervision the window alone, 1 s with no reading where the rule gives 2.2 s; the laptop daemon's delay never held the lapse in 10 s), then cluster failover 12/12, anchor 40/40, server 34/34, api role::anchor 13/13, fmt clean
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

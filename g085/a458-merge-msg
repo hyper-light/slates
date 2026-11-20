@@ -1,0 +1,3 @@
+merge: origin/main into agents/g085-windows-landing as A-458 lands -- one conflict, the design log's end (main's A-455, A-460, A-450, A-459 and A-457 first, then A-458); protocol.rs and GAPS merged clean, and main's code adds no implementor of the landing seam and no match on its actions
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge, anchor: a checkpoint carries its copies' section and the identity's sum beside a copy's record alone, version 5, layout 13 (A-626 part 3, continued (1)) -- scratch commit for the Studio run; lands folded into one commit with its docs
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

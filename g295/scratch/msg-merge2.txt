@@ -1,0 +1,3 @@
+merge: origin/main into A-626 part 1 again as it lands -- two conflicts, both documents: GAPS' §4.17.4 entry (main's newer owed list kept, A-626's sentence added to it) and the amendment log's end (main's A-633 and A-637 first, A-626 last); main's A-643 and A-637 change the engine's verdict (a link renamed over a file, rmdir and unlink by any change after the base, a submodule link's kind) and merged clean with the copies
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

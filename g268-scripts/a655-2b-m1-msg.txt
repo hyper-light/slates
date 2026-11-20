@@ -1,0 +1,3 @@
+merge: origin/main (3612d1ef9) into A-655 part 2b for its run on the Mac Studio -- one conflict, the amendment log's end (main's five entries first, A-655 part 2b's last); every code file auto-merged
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

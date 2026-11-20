@@ -1,0 +1,3 @@
+docs: A-554's evidence and what piece 5 holds -- job 4's macOS arm green (server 25 of 25 on 570664b), the merged tree c2abf6e green on the Mac Studio (fmt clean; land grant 5 of 5, cluster fleet 10 of 10, server 30 of 30); the title names the four jobs this piece moved, and the pressure hold leads piece 5, its event a watermark crossing the hosts name for themselves (PSI, XNU's memory-status level, Windows' low-memory notification), with the decision of which signal moves the hold
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,18 @@
+merge: an upper is restated over its lower's landing by moving the green's changes over the lower's operations; a work over a tree is judged by whole-value differences (A-659)
+
+Green half of A-659 (UI goal 93, §4.17.1 shared piece 5). `Green::restate` reads, path by path for the paths an
+upper names, what the green changed between each lower's base and its landing (its deltas and histories, at the cost
+of the path's own changes), and moves those changes over each lower's operations by the walk the verdict mapped the
+lower with (crate::map: an operation ending at or before another's start shifts it, the first starting at or after its
+end ends the walk), so the moved changes and the lower's landed operations come from one decision; the landed operations
+are held to the delta the green recorded (`RestateRefused::Diverged`, a guard). The upper's operations are mapped
+through the moved changes and each check the verdict makes of a work against the changes after its base is made against
+them (renames, removals in every dimension, modes, attributes, links, IPC nodes, node-exclusive paths), a value the new
+base holds as the upper sets it accepted as identical. A change the lower made too is in the upper's base (a same-span
+overwrite, a metadata value); one it met in another shape makes the file a conflict for the upper, never a guess.
+`Green::land_stack` lands a stack in order, each work all or none, an upper restated under an identity derived from its
+own and the version below it, so a stack landed again is answered each version. `Green::restate_over_tree` judges a
+work composed against a tree by whole-value differences between the tree and the head at the paths it names.
+Modules: crates/merge/src/engine/stack/{moved,levels,judge,tree}.rs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

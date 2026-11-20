@@ -1,0 +1,3 @@
+lint: goal 93's crates pass clippy, rustdoc and the literal and structural checks again -- three clippy errors in slates-hg and slates-svn fixed; the evidence tags [B] and [C] in module docs escaped, which rustdoc read as 28 unresolved links, and the ambiguous [write] links pointed at the function; the Windows upcase table's 1,748 literals covered by a Format marker every four rows and wire::MAJOR's marker brought back into its window, 1,688 literal findings to 0; the design's host-path table regenerated for slates-machine's A-570 reason
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+merge tests, docs: A-669's census shows the write handed on rather than requiring it (2 and 1 in a run of 256 works), the rule in A-646's decision, the bug record, GAPS (fixed; a sibling filed open) and the A-669 entry
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

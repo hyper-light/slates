@@ -1,0 +1,3 @@
+merge: origin/main into A-636 part 1 -- one conflict, the amendment log's end (main's A-647 parts 1 and 2, A-646 part 2b, A-629 parts 2b-i and 2b-ii, A-650 part 2, A-625 part 3's first slice, A-649 part 3a and A-655 part 1 first, A-636 part 1 last); main's change in crates/db is repository.rs alone, which A-636 does not touch
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+cli tests: a client killed mid-write leaves its write whole or absent through a takeover -- goal 81's client-disconnect fault across real processes (A-585): live_chaos streams acknowledged writes, stops both candidates, kills a writing client once the owner's fleet.live.awaited shows its write parked there (an event of the write, never a sleep), loses the owner's node and resumes the candidates; the next owner is judged as every takeover flow is: NoLoss (acknowledged writes byte for byte, the killed client's absent or whole), StaleNeverCommits, Agreement (TotalOrder), Continuity and ReadSafety. Written here, compiled and run by main (24 runs a Linux architecture)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

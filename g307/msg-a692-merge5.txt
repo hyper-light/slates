@@ -1,0 +1,3 @@
+merge: origin/main (3b392dcb1) into A-692 as it lands, the push having met main's newer commits -- A-681's lender (a Subversion repository's records as the read source on their owner shard: slates-svn's index listing and migration records, the server's vcs_store/svn_view.rs and the DAV site without its placeholder stores) changes no file A-692 changes and names no credential type A-692 changes; one conflict, the design log's end, main's A-681 lender entry first and A-692's last (the exact union; over main the piece's 23 files alone); since the lender changes slates-svn and slates-server, both in A-692's focused set, that set is run again over this merge's own tree before its push, and named with A-692's report
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

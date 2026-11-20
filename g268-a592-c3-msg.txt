@@ -1,0 +1,3 @@
+svn: the commit rule as a pure function, its lock check the lock table's -- WIP for the Studio run (A-592)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

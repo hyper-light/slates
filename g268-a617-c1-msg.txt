@@ -1,0 +1,8 @@
+svn: A-602's lock check must answer in Subversion's path order -- the failing tests first (A-617)
+
+A-592's scratch test, committed: a commit editing /t/a-b and /t/a/b, both locked by another principal, is refused at
+/t/a/b, as FSFS's verify_locks (svn_path_compare_paths order, returning at the first failing check) answers; the
+lock table answers /t/a-b. The lock oracle now accepts only the locks of the first changed path whose check fails,
+where it accepted any lock anywhere in the commit, and its census counts the commits whose answer the order decided.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

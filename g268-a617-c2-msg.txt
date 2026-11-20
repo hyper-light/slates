@@ -1,0 +1,9 @@
+svn: A-602's lock check answers the first failing lock in Subversion's path order, as FSFS's verify_locks does (A-617)
+
+LockTable::verdict met the locks a commit's changes reach in the byte order of the locks' paths, so a commit refused
+by locks at both /t/a/b and /t/a-b answered at /t/a-b where svnserve answers /t/a/b. It now meets them as
+verify_locks does: the changed paths in svn_path_compare_paths order (names compared one by one), a path beneath one
+read whole skipped, each lock once, a subtree's locks in the same order with the path's own first (FSFS's walk there
+is a hash table's order, which nothing fixes).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

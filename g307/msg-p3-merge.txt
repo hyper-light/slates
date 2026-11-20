@@ -1,0 +1,3 @@
+merge: origin/main into A-626 part 3 as it lands -- main's A-668 (two inserts at one point, map.rs and the stack oracle), A-656 and its git and svn commits since e3234e618; one conflict, the design log's tail, resolved with main's A-656 and A-668 entries first and part 3's after
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

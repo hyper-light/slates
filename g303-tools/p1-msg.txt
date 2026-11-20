@@ -1,0 +1,15 @@
+hg, http-edge, server: Mercurial over HTTP (A-650 part 1) -- serve::http answers HTTP version 1 as stock Mercurial 7.2 frames it, held to 13 exchanges of a stock 7.2 clone, pull and incoming against stock hg serve; the daemon's hg site on the shared edge judges each request in hgweb's order and names its answer's media type as its reply begins; A-569's codec reads the last cmd and getbundle judges bundle capabilities first, as 7.2 does
+
+Part 1 alone, squashed from agents/g303-a650-hg-http over origin/main bf9d39139 (that branch's WIP docs commit
+never lands). Moved out to their own pieces, per main, each with its failing test first:
+- zlib's bound as the linked zlib-rs states it (its level 1 wrote 65,536 nine-bit literals in 73,721 bytes against
+  stock zlib's compressBound of 65,569; Windows x86_64, jupiter, kiln r92): agents/g303-a650-zlib-bound;
+- a query's fields past the request's room answered 414, as a path's are (400 here): agents/g303-a650-query-414.
+Both are recorded open in GAPS and the amendment.
+
+Not landable yet: the docs' four {{RUN-...}} tokens wait for the green unit-test run on Windows x86_64 (jupiter):
+cargo test --locked -p slates-hg --lib; -p slates-http-edge --lib; -p slates-server --lib vcs_http --
+--test-threads=4; cargo fmt -p <each> -- --check. jupiter had no disk for it on 2026-11-19 (C: 100%, 1.5 GB free;
+r92 failed mid-build). rustfmt +1.98.1 --check on the changed files here: clean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

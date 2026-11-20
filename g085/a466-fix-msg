@@ -1,0 +1,3 @@
+docs: the design log's end as A-466's merge meant it -- the merge commit a3097558e kept the conflict's markers (the resolving script refused its own split, and the add went ahead); now A-458's last lines as A-466 edited them, main's A-461 and A-456, then A-466, nothing of main's removed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

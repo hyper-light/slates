@@ -1,0 +1,19 @@
+> only a floor folded past (see A-626 part 3). Its oracle found a replica hashing otherwise than its owner: a copy made
+> after the replica's checkpoint from a version before it was read through the source's history there, which a
+> restored green does not hold. Fixed in the same part without a format change: what a copy brought is read from its
+> graft, the source at the version before the copy through the copy's fix, kept with its record until the fold floor
+> reaches it (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`). Red over
+> part 3 as it stood: 3 of 25 copy tests failing, each at an identity; green `cargo test -p slates-merge --lib` 182 of
+> 183 (its one failure the copy oracle's census, met by none of 128 generated histories, which A-672's fixed history,
+> landed before this part, now meets) and `cargo test -p slates-anchor --lib` 31 of 31, on Windows x86_64 (jupiter);
+> over main 5c0a522f1 on macOS arm64 (Mac Studio, kiln r40) the focused runs green: slates-merge lib 73 of 73 filtered
+> to the copy, checkpoint, branch, node, reanchor and stack tests, the fixed history meeting all 13 census cases,
+> `--test checkpoint` 4 of 4, `--test chain_replay` 3 of 3, slates-anchor `layout` 2 of 2 and `a_segment_` 5 of 5
+> (a segment of layout 11 refused at start, new); Linux owed. A-626 part 4 (2026-11-19, g307): a rebase restating a
+> copy built, the deriver's `VolumeOp::Copy` composed against the copied tree `Green::base_for` puts at its
+> destination, a file edited beneath a copy restated as edits over what it brings, a work's logged journal holding a
+> copy (`LoggedOp::Copy`, the anchor's layout 13); a work's own shard composes no journal holding a copy (its fetched
+> entries are a path's each, never a tree), so the green's owner composes it, counted
+> `merge.work.copy_composed_by_owner` (see A-626 part 4). Owed from A-626: the work model resolving copies, so a
+> rebased work's `Rebased::changed` and its reads and listing see the copied files it left alone (they name only the
+> files it changed today); a restore that grafts

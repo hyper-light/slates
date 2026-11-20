@@ -1,0 +1,7 @@
+merge tests: the restatement's oracle names every reading that differs, not the first (A-663); docs drafted
+
+A red run now shows each reading a defect reaches (the restated journal replayed, the green that accepts it
+composed again), so the resubmitted green's wrong link is shown, not inferred. The bug record and §4.16's status
+are drafted; their evidence waits on the Mac Studio, offline since about 09:20 UTC.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

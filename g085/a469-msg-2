@@ -1,0 +1,3 @@
+land: the manifest's golden vectors hold the encoder's own identities (A-469) -- the independent encoder's every header and entry line matched the Rust encoder byte for byte on the Mac Studio; only the two pending identities differed, now the encoder's; design and GAPS lines
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

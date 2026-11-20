@@ -1,0 +1,3 @@
+merge: origin/main into A-554 (g255) as it lands -- one conflict, the amendment log's end: main's A-556, A-558, A-560, A-557 and A-563 first, then A-554; main's changes to deadlines.rs (an unused import) and reap.rs (CONTROL_BROKEN Linux's alone) meet none of A-554's lines, and the merged tree differs from main in A-554's thirteen files alone
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

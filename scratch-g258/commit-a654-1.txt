@@ -1,0 +1,7 @@
+wip(scratch): A-654 step 1, a create made at its first parent's version -- not yet compiled (Studio offline)
+
+git: receive::works' Greens names the base a create is made at (the version its new value's first parent heads, else
+the default branch's head, none while it is unborn); Entry::Create carries it and its work states the whole difference
+against that version's tree (main's ruling 1). Tests: the create test made at the served version; an orphan create.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

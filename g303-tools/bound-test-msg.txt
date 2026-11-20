@@ -1,0 +1,11 @@
+hg tests: every engine's streams held within compression::bound, failing first (A-650, zlib's bound) -- part 1 charges zlib's stock compressBound, which the linked zlib-rs's level 1 outgrows: 65,536 nine-bit literals came to 73,721 bytes against its 65,569 (Windows x86_64, jupiter, kiln r92, 2026-11-19)
+
+The oracle alone, before the fix: the_longest_codes_stay_within_every_engines_bound (every engine at every level
+checked, nine-bit literals at 0, 1, 7, 8, 9, 64, 4,095, 4,096 and 65,536 bytes) and the generated
+arbitrary_bytes_stay_within_every_engines_bound (0..1024 bytes). Expected red here, from kiln r92's run of the same
+oracle with stock zlib's bound: zlib level 1 past it at 64 (80 > 77), 4,095 (4,616 > 4,108), 4,096 (4,617 > 4,110)
+and 65,536 bytes (73,721 > 65,569); every other zlib level and zstd within their bounds (r92 held bzip2 to a
+bound lowered on purpose, so its own is unmeasured there). The next commit is
+the fix. An A-number is main's to assign; until then the tests say "A-650 (zlib's bound)".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

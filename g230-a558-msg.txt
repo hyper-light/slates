@@ -1,0 +1,3 @@
+vfs: a digest that finds another file at a clean entry's name leaves the inode on its file, as A-151 has it -- verify_current pointed the inode at the new file in place, so a handle opened on the old file read the outsider's bytes after a digest found the replacement, and the name kept the old number; the inode now leaves the name as a relist does (descriptor kept while open, listing reread, a new entry at the name), counted DigestStats::replaced, a digest by path looks once more, and an inode the listing already took from its name is no longer NotFound; the unit test lands the outsider's replacement at every seam call of a digest (A-558)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

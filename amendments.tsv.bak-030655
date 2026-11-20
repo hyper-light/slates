@@ -1,0 +1,135 @@
+# A-number registry (rebuilt 2026-11-18 ~22:10 UTC after ~/.cache was wiped by an outside cleanup at 14:04 PST).
+# Every A-number up to A-454 except A-450 is on origin/main's docs/wip/SLATES_DESIGN.md amendment log; read it there.
+# Take the next free number below, append your row, and keep this file's path: ~/.cache/slates-scratch/fanout/ links to ~/.local/state/slates-fanout/.
+# number	owner	piece	state
+A-450	g267-slates-server-federates	K4: kiln moves an agent between runners with its slates volume	landed (slates main, its amendment on the log; kiln main aba723dc5)
+A-455	g255-cross-shard-remote	D-a: the watchdog judges each shard by its own window, the liveness window raised to the scheduler overrun the shard measured (Pulse::scheduler_overrun_ns) within the observation budget, its spin window that window held to the build; published as the health signal shard.watch_window_ns	landed 2c870451a (a464fe9b8)
+A-456	g251b (g251-open-slates-bug)	C-b part 1: the client's reply waits on the reply and the daemon's death together	landed ba179ff61 (change 34e50ac18)
+A-457	g083-w1-under-1ms	A-273 step 5a: the shards hold a green's replicas	assigned
+A-458	g085-windows-unit-tests	a mode- or bits-only change lands (verdict judged metadata beside content)	landed 5e7d7250d (72ea0a770, e0aa55ffb, f2a768e8f)
+A-459	g268-slates-delivers-everything	export's archive encoded as a stream (A-441's gap)	landed aedce71d0
+A-460	g234-windows-wake-estimate	the Windows anchor's held entries handed over without the 32,767-character variable limit	landed 0049aa171 (13a3e289a)
+A-461	g255-cross-shard-remote	D-b start/stop half: a start judged by its silence until its watchdog looks, each beat a step, against the anchor's window (the liveness window raised to the anchor's own measured lateness, A-455's ceiling); a graceful stop judged in the daemon's own beating (StopBounds, stop_overdue)	landed bc6c0866b (2508b7555)
+A-462	g234-windows-wake-estimate	the Unix anchor hands held entries over without the per-string environment limit (Linux MAX_ARG_STRLEN; macOS ARG_MAX)	landed 6696fda78 (7e06d565b)
+A-463	g267-slates-server-federates	K5: a kiln workspace is a captured clone, so it moves with its agent	landed dbb7a6d4b (d2d8af180; kiln main 1ec78034d)
+A-464	g268-slates-delivers-everything	item 7 part 1: an overlay base read from S3 objects, its design (Mantle CP-T10.5)	landed b3194636f (125d07953)
+A-465	g083-w1-under-1ms	A-273 step 5b: rebases and named-version reads served from a replica on non-owner shards	assigned
+A-466	g085-windows-unit-tests	a captured clone's replacement keeps an outsider's mode change (judged by field, as A-458)	landed 552fe1f0c (d6214ef8a, dbd3085ae, c2f8eee74, a3097558e)
+A-467	g255-cross-shard-remote	D-b second half, closing D-b: the anchor's lapse bound (W + its lateness p99) takes A-455's ceiling; the observation gap is the bound less the lateness p99 and a beat, at least a beat (OBSERVATION_GAP_PARTS goes)	landed ea26f5d1a (0babd7b84)
+A-468	g251b (g251-open-slates-bug)	C-b part 2: the client's reconnect bound by its anchor's liveness	landed 485a0b6bf (change 3e93acc84)
+A-469	g085-windows-unit-tests	the landing manifest's encoding (what a grant binds) held by golden vectors per layout	landed 21e017deb (a6afeb8ef, 9ac590c0e, b3e696b5a)
+A-470	g255-cross-shard-remote	D-c part 1: log_late_beat judged against the control shard's own window (beat_is_late, A-455); the reap cadence moved to the event-driven reaper (series owed; the tick-based draft parked on agents/g255-reap-cadence, never on main); A-467's bug recorded	landed 9bc4011f2 (99109ac36)
+A-471	g268-slates-delivers-everything	item 7 part 2: the S3 network client on slates' own TCP + rustls	landed 24c90fac3 (46cea08ca; merges 39fdf37b3, c0c8d3dd5, ff0c12ea7, 24c90fac3)
+A-472	g085-windows-unit-tests	a landed chmod made durable by the file's own sync (per-filesystem rule from primary sources)	landed 1f332da55 (86b850aa1, 15dc21234, 06ae8b150, ad72aeeda)
+A-473	g083-w1-under-1ms	A-273: idle replicas given back (bounded, counted)	assigned
+A-474	g255-cross-shard-remote	the watchdog judges a wedged shard even when its own looks run a window late: A-308's reset only past the window and the watcher's own lateness p99 (watchdog::slept_past_ns, capped at A-455's ceiling); LatenessTail shared with the anchor, whose start and silent-watchdog judgments pass their own p99	landed 5ceda4847 (282deb94e)
+A-475	g255-cross-shard-remote	event-driven reaper piece 1: a dead client reclaimed on its control socket's hang-up / process exit	landed e2d1bc42b..920b8fc9c (+2c4c9bd21)
+A-476	g083-w1-under-1ms	a green's takeover successor keeps the owner's whole chain (version 1's identity lost, intermittent since at least 2a5bf7264)	assigned
+A-484	g250 (UI goal 84 d9f7a795, an unresolved object is recovered)	an unasked copy is judged by its writer's takeover (the first since it was written), on its retirement or its completion record (which keeps the recovery neighbourhoods and the hosts held through it; regional layout 5); A-341 judged the last takeover in the line	landed 3d174a1cb (858078b15)
+A-485	g079 (UI goal 85 17ad60b6, every open slates bug fixed)	bug 1: a move whose target dies at the switch is served by its successor	assigned
+A-487	g230 (UI 85)	bug 2: a volume moved back to its creator loops Moving/MoveRefused{Unplaced}	landed cd8e7bcfe (regression test f5438c6e5 + docs 55ad57cc9; bug 2 had A-485 cause, closed by A-485)
+A-488	g225 (UI 85)	bug 3: moves::seal_adopted seals twice when its answer is lost to a stopped shard	landed 7267db674 (fix 67055138c, test 9b43a1ed0)
+A-489	g229 (UI 85)	bug 4: the location round's intermittent OwnerUnreachable	landed 7e07579d8 (76fdca5d0)
+A-490	g071 (UI 85)	bug 5: a Windows fleet manifest reader without /etc/resolv.conf	landed 22f9dc88c (a8ad21db9, 963a93999, 66283c8fc)
+A-491	g230 (UI 85)	bug 6: recovery's boot give-back slice judged by the wall clock	landed c650f0b92 (e6d44b905 fix + test, 1aafdc760 test path, docs, merges)
+A-492	g232 (UI 86)	C-c part 1: shards_route OFFER_LIFE_NS and EXCHANGE_NS derived	landed cf5ff2acb
+A-493	g232 (UI 86)	C-c part 2: nfs UNMOUNT_CONFIRM_NS and the routed unmount wait derived	landed cde42c8d2
+A-494	g081 (UI 90)	the archive import decoder reads its file in bounded slices	assigned
+A-495	(free)	unused: g262 works in kiln (UI 88: a shell agent inside another agent's mount)	free
+A-496	g088v (UI 88)	kiln re-vendors slates at current main and builds it on every platform	assigned
+A-497	g261 (UI 91 51cef9f7, git)	the git server on the operations-based merge: its design and the shared mapping onto greens and works	landed 262dc8a45 (a157b075c) + 4d2176fce (5aec427cb)
+A-498	g258 (UI 85)	Mercurial's hardlinked clones and stores byte-identical on WinFsp	landed 1d2723e51 (95f1cfac2, 2d1a215f8)
+A-499	g291 (UI 91 51cef9f7, Mercurial)	the Mercurial server on the operations-based merge: its design	assigned
+A-500	g292 (UI 91 51cef9f7, Subversion)	the Subversion server on the operations-based merge: its design	landed 22168d111 (a46ee42f6, 9a0c98dbd)
+A-501	g085 (UI 88)	a touch alone and a base directory's mode alone land	landed fec67892f (fb2b2deb1, 9bf3a46f3, cb1795a52)
+A-502	g083 (UI 87)	the replicas' feed leaves the owner's submit path (A/B r406 not green: submits 3-7x worse at p99)	assigned
+A-503	g267 (UI 89)	stage 2: a workspace moved from another runner lands	landed e2d1bc42b (396bc1de2, 2b417930f, 8aba4a047; kiln main 30dcde58d)
+A-504	g229 (UI 85)	bug 4's reverse: a location refusal carries the peer's root version, so a behind asker fetches the root	landed 3ab09886c (5113f0a44)
+A-505	g225 (UI 85)	A-488's siblings, first: direct_map's send_to_client taken once when its answer is lost	landed ad0ca0f0f (c05f722d1)
+A-506	g251b (UI 86/85)	A-456's macOS look-wake counted as its own park ending (client.rs:2297 the_typed_verbs...)	landed 6cda6da37
+A-507	g071 (UI 85)	Slates unmounts without running umount by name (no PATH dependence; the unmount syscall)	landed 088d38779 (43166ce14, 17aa331ab)
+A-508	g250 (UI 84)	the settle rule for a live owner (goal 84's next step)	landed 069303a1d (5b16f4a91)
+A-509	g079 (UI 85)	Linux FUSE mount of an unrecovered volume answers by kind and ends cleanly, not ENOTCONN until unmounted by hand	assigned
+A-510	g229 (UI 85)	a daemon stops promptly on SIGTERM (a test instance kept serving ~2 min after it)	landed d63e602a7 (guard test + record; not reproduced in Slates, no product change)
+A-511	g232 (UI 86)	an unmount seen by the kernel's own event (EVFILT_FS VQ_UNMOUNT; /proc/self/mountinfo POLLPRI) ends its attachment whenever it comes	landed e2ffb916a
+A-512	g225 (UI 85)	A-488's sibling: the Shards route's take of an offer, taken once when its answer is lost	landed 9bd5e26d6 (fix 69bf76ea0, tests cb1ef73ee e5aa3aeef)
+A-513	g230 (UI 85)	A-488's sibling: recovery's rebuild_remote_works judged under section 4.16, then fixed or its acceptance written	landed d50fac5b9 (d8565bbdd fix + test, c910efd14 docs, merge d50fac5b9)
+A-514	g291 (UI 91, Mercurial)	Mercurial piece 1: the bundle2 and changegroup codecs, pure, golden vectors from stock hg 7.2	assigned
+A-515	g261 (UI 91, git)	section 4.17.1 shared piece 1, as the design orders it	landed d0779121b (7d4b15158) + f46b35bdc
+A-516	g234 (UI 90)	a Shards stream's SAVE of a live-shipped volume answers its tables only once the log is durable where the save put it (A-303's first Not here)	landed f1a7342b4 (84978f117)
+A-517	g251b (UI 86)	C-b part 3: macOS MOUNT_CALL_DEADLINE derived (no fixed deadline)	landed c80d3828b (change e8227a6d4)
+A-518	g250 (UI 84)	the Lineage.tla text for A-341, A-484 and A-508 (main runs TLC)	landed b69463eec (a1cc8f8da)
+A-519	g085 (UI 88)	a Windows read-only file's metadata entry lands (no writable handle needed)	landed e3fbf2ee0 (0a72bb2ef, 5e33c143a, 128e0ed48)
+A-520	g293 (UI 88, kiln OCI/Docker engine)	any slates-side change kiln's container engine needs	landed b03311919 (change caa42bce9; kiln d6259c547, W9 d642a7071): piece 1, the bind as a slates-api verb, CONTRACT 44; piece 2 landed c6bf19cbd (change 9332e4b1a; kiln 0ee121b1c): engine_profile + check_source in slates-api, CLI calls them, CONTRACT 47; piece 3 landed 8d22d1887 (kiln ef2812dce): rootless podman holds its profile on Linux, CONTRACT 48; piece 4 (kiln) landed d7f76c1dc (change 8251b05ac): kiln at Slates contract 48 + workspace::container first runnable step
+A-521	g294 (UI 88, kiln Kubernetes engine)	any slates-side change kiln's Kubernetes engine needs	landed ff4c98f (change 3ad777c, red bda17c0, fmt 41fae0c): piece 1, the export as a slates-api verb (Instance::export + seam + simulator), CONTRACT 50; owed: a report of the network export's address, `slates export` over the verb
+A-522	g255-cross-shard-remote (UI 86, the event-driven reaper)	reaper piece 2: the claim's pid bound to its process (macOS, Windows); staging and status-page expiry by their own event	landed ff94f8848..df30ee7f5
+A-524	g268-slates-delivers-everything (UI 90)	item 7 part 3: the S3 base's HostFs implementation over the A-471 client with parked misses, SimS3 as its oracle, and the library's naming of an S3 base	landed c8731b725 (bd40ab1d0; merges dac6f078e, c8731b725)
+A-523	g251b (UI 86)	class C: reply_ns's other users (driver tick, full-ring slot wait, delivery read, macOS route claim, CLI MCP edge)	landed 4 of 5: driver tick 830ef03fe, slot wait fba7cd888, delivery read bd1ff3ed5, route claim b2391c3f2; CLI MCP edge left for main to start
+A-525	g076b (UI 86)	D-c, the 10 s placeholder readers, and L-h removing FAILOVER_SLO_NS	landed 32e55c5bd (part 1: move overdue, telemetry horizon, anchor restart cap) and 3c9a37dd2 (part 2: FUSE helpers learned, status capture from its capture, L-h FAILOVER_SLO_NS deleted); D-c left as its own piece
+A-526	g079 (UI 85)	B7a and B7b, A-419's siblings (goal-83 audit leftovers)	assigned
+A-527	g085 (UI 88)	O4: the land seam's numbering typed (a Win32 code equal to an engine errno reads as Win32)	landed bf21a05b4 (2374db9f5, 92859c2e4, a2876f232)
+A-528	g083 (UI 87)	the A-273 replicas removed (replace, not layer), measured and rejected in BENCHMARKS with r406 and r100	assigned
+A-529	g250 (UI 84)	the content release signal: a successor confirms once adopted content is placed again; settle certifies content	landed dc8679815 (bee04aec3)
+A-530	g079 (UI 85)	B7b: Windows DAX range charged before it is committed	assigned
+A-531	g292 (UI 91, Subversion)	the ra_svn item codec, pure, hostile-input tested, golden vectors from the protocol document	landed c7302bc6f (629fecd66, 0371d2783, 8af917fc3)
+A-532	g234 (UI 90)	a clone keeps an orphan record for a nameless file it carries from its snapshot (A-303's open note)	landed d73e1652c (bc8315023)
+A-533	g225 (UI 85)	A-513's remainder: a work whose rebuild asks go unanswered twice is retried after clients are let in, answering Unpublished meanwhile	landed 20f541482 (fix a8a0ccc4a, test 627fa348a)
+A-534	g261 (UI 91, git)	shared piece 1 second half: a branch from another branch's version without walking its tree (persistent maps)	landed 53c5c77f7 (merge f8ba01f61; main b1549a81e..f8ba01f61): persistent maps, one history rule, Lineage::branch; server verbs, branch recovery and Copy owed
+A-535	g079 (UI 85)	B13 (goal-83 audit list, next in order)	assigned
+A-536	g255-cross-shard-remote (UI 86, the event-driven reaper)	reaper piece 3: leases, CLI attachments, destroys, grants, audit off the tick, each on its own event or deadline	landed c8731b725..ec57251b0 (jobs 1-3 of 5: leases, CLI attachments, destroys; grants + audit -> piece 4)
+A-540	g232 (UI 86)	the kernel's mount id kept in the attachment's durable record; a restarted daemon ends own-mount attachments whose recorded id the table no longer lists (registered by main)	landed d949ff832
+A-537	g230 (UI 85)	A-507's remainder: Linux busy unmount typed Busy by the mount table; busy refusals name their holders	landed 49455b775 (f9b638b72 change + tests, docs, merges; CONTRACT 45)
+A-538	g250 (UI 84)	content release signal, second half: holders drop a stale copy's content on a certified confirmation/completion record, under a regional layout bump	landed 26d91cc73 (4e8bf15db)
+A-539	g085 (UI 88)	landing report/volume/wire number fields carry their numbering's kind (errno or Win32); engine errnos named at the seam	landed efe8ea79c (033ecb3d0, 04e24caab, f288c4b4a, 4c28f696c, 5d6eb5899, 92362f024, 1ffe0d9f4, 92b6d2f2c, a1305d158); contract 49, wire MAJOR 3, anchor layout 11
+A-541	g234 (UI 85)	a clone's inode count starts from its snapshot's count, not its origin's current one (sweep siblings)	landed 87d606e83 (10499c270)
+A-542	g292 (UI 91, Subversion)	node-exclusive operations and Copy in the merge engine (section 4.17.4 item 3)	first half (node-exclusive ops) landed 6e5f95e56 (2f9951ce5, 13c3a4311, a5318c15c, 1bd8de2fd, f0d45a05e); Copy owed on A-534's ptrie graft; second half part 1 (Copy's maps) landed 1a42140de (354c575f4, ad6c16087); part 2 (the engine's Copy operation) owed
+A-543	g079 (UI 85)	B2 (goal-83 audit list, next in order)	landed 279af73ba (main 3cc9ce3f0); clippy unwrap follow-up 2889b917f (main 5c0e4f43b); Windows half is A-551
+A-544	g267 (UI 89)	a captured clone taken over after its runner dies lands against its capture on the successor (refused by kind if the capture was not replicated)	landed 54067060a (05fc5b9fe, bed3cabce, bfb5eff72, e44d109e4)
+A-545	g291 (UI 91, Mercurial)	piece 1's bundle2 part payloads: phase-heads, bookmarks, check parts, obsmarkers, pushkey	assigned
+A-546	g250 (UI 84)	an owner's settle certifies content (A-508's holders let go a live owner's stale content)	landed acf4dbecc (30f9bf10f)
+A-547	g225 (UI 85)	open-bug inventory into bug-claims.md, then the first unowned bug fixed	landed 3941782cf (inventory in bug-claims.md; fix c8339ba92, test db9b9f7fa: an edit after a rename)
+A-548	g232 (UI 86)	C-c rest: open_journal_reader, NFS write-back tracking, await_materialization waits on events or learned bounds	landed: part 1 e4b101b35 (main 551d6d2cd), part 2 1126e1047 (main 8bcec2c89), part 3 26d01b6a5 (main acdbf6974)
+A-549	g234 (UI 85)	a clone's admission (admit_clone's inherited inodes) and entry count (live_entries) come from its snapshot	landed 0d6fe4d4e (920405c5b; red tests 62eb831ca, split f9e15abc1; found A-561)
+A-550	g079 (UI 85)	B12 (goal-83 audit list, next in order)	part 1 landed 6703be419 (main a613562eb); part 2 (Linux-only: ledger in anchor RAM, kernel count, hold, kill run) filed for main
+A-551	g258 (UI 85)	B2's Windows half: CaseSensitiveSearch only for exact volumes, the stored path as WinFsp's normalized name, the sharing-violation test	landed 8cb6bef1a (53cbb2d32 rule + drive naming + Windows wiring + drive tests, 238c2123d evidence + rustfmt, 8a63cb478 unsafe-budget entry alone; merges cac7fff03, 8cb6bef1a; Windows build and drive tests owed to main)
+A-552	g076b (UI 86)	D-c: starved_share_ns, stop_parts drain wait, start_with_fleet mount gate, Windows anchor hold bounds, Linux held_copy reconnect budget	landed b1549a81e (main 87c1be22e..b1549a81e, 2026-11-19 ~02:10Z): starved_share_ns, LogWriter stop, learning gate, Windows anchor_answers, held_copy claim by F; failover_slo test names renamed; D-c closed
+A-553	g292 (UI 91, Subversion)	the Subversion index (section 4.17.4 piece 4)	landed 87bcb392e (18a3de6ef, ba38eed05, 1f77f675d, e10e713b5, 1fc33474d, 9bb51cc11; merges 0cf39ef9f, b6e894ac4, 87bcb392e)
+A-554	g255 (UI 86)	reaper piece 4: grants, audit, departed hosts, held copies, pressure, NFS purge, hints/delegation drain, idle seal, huge-page re-arm; then the tick deleted	assigned
+A-555	g268 (UI 90)	the server parks a request on a pending S3 base until its fetch lands; the wire's create and credential hand-off	assigned
+A-556	g250 (UI 84/85)	live-durability second failure: an object whose line never passed through an unconfirmed predecessor reads lost on a second failure in that predecessor's takeover window (GAPS:2434)	landed 01e4137be
+A-557	g225 (UI 85)	a read scatter answers complete when a shard's part was refused (docs/bugs/2026-11-05 siblings)	landed fc0d178fe (test 9892495fd, fix 619941eaa, docs 0e3624138: a read scatter's unserved part answers Overloaded naming its shard)
+A-558	g230 (UI 85)	verify_current re-points an untouched inode to another file at its name (GAPS:18090; A-151 detaches)	landed cf17cae5d (f3db4d6c5 fix + test, b37ace8d1 test relaxed, docs, merge)
+A-559	g083 (UI 87)	load_bench measures its own noise floor and attributes each latency to server and harness (reply stamped on arrival)	assigned
+A-560	g230 (UI 85)	B4: a WinFsp receive worker's spin window learned and bounded, its samples checked for agreement	landed 7608869fe (ba48ab017 rule + wiring + tests, docs, merge; Windows build owed to main)
+A-561	g234 (UI 85, after A-549)	a clone with its own snapshot that still shares a file with its origin is rebuilt at restart (SharedSource::Head resolved through the head's table or the origin rule first)	landed 49e0d61ad (5c97c983c; red test e2176302f, fix 8a5fd1074; merges 208b9b5db, 49e0d61ad)
+A-562	g230 (UI 85)	B9: the FUSE notify round and the journal gather built in bounded slices under the shard's per-iteration budget	landed cbf2038ef (ff16bed94 rule + wiring + tests, docs, merges; Linux/Windows builds and integration suites owed to main)
+A-563	g225 (UI 85)	a listing's or grants' Overloaded is never recorded as the request's completion (retry_deferred)	landed 1b2adf352 (test bed2d905f, fix c28f9dc89, docs f565539af: retry_deferred leaves a not_started reply unrecorded)
+A-564	g225 (UI 85, after A-563)	a verb forwarded to a fenced owner shard is refused by kind, never NotFound (call_in_shard_time / named_if_unshared)	landed 2514818a5 (test b1e7ca76c, fix ac6208269, docs 3f0c4d03a: a fenced owner answers ConsensusRecoveryUnavailable, a call not started Overloaded, never NotFound)
+A-565	g267 (UI 89)	a live-shipped clone's move gives its new runner the mark	landed 767a07360 (b61b968eb, afe847f25, 0e37ab9da); bug filed: docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md
+A-566	g225 (UI 85)	consensus_on_control never answers Overloaded after its operation ran (resend would repeat Recover)	landed 87c1be22e (test a58950843, fix e34b9fca6, docs c5140533b: an operation that ran answers DurabilityPending, never Overloaded)
+A-567	g083 (UI 85)	B8: a restored FUSE mount judges a dirty shared-map page held across a takeover by what the volume holds, never applied whole	assigned
+A-568	g085 (UI 88)	a Windows landing's links made under Developer Mode as CreateSymbolicLinkW allows, or a refused link fails alone by kind (r143/r212 on jupiter); os.rs:716 split	landed ae0878283 (8e122983b, 121cc896c, 4af05d1de + merges); a refused link fails alone (HostError::Unprivileged); no handle-relative Developer Mode route exists
+A-569	g291 (UI 91, Mercurial)	Mercurial piece 2 in section 4.17.3's order	assigned
+A-570	g255 (UI 86)	reaper piece 5: pressure (kernel event), NFS purge, hints/delegation drain, idle seal, huge-page re-arm; the tick deleted	assigned
+A-571	g251b (UI 86)	the CREDIT_WAIT copies (ack_release, attach_forms, shards) wait on liveness/events or learned bounds; the listen stream's keep-alive period	assigned
+A-572	g234 (UI 85)	GAPS 8c siblings: recovery counts whiteouts as live entries; a clone admitted with no entry allowance; a resize leaves the entry allowance at its creation size	landed in 3 commits: part 1 whiteouts bfb2c8208 (763bc0680), part 2 clone entry allowance 8b0a9a57e (9498bf881), part 3 resize entry allowance f24745e45 (f682405de)
+A-573	g232 (UI 85)	B10: a FUSE mount's reads after an unpublished mutation, and base lookups after the last publication, never outlive a daemon's death as data the successor never had	landed 6f0804bbd (main 1b69d5159)
+A-574	g076b (UI 86)	a laptop's failover detection term derived from measured lateness and liveness (same code at f=0)	landed 846b1271e (main 8b0a9a57e..846b1271e, 2026-11-19 ~02:50Z): laptop D = widest shard window + anchor lapse bound (SUP_LAPSE_BOUND), read every beat on every node, beat fans the delay; supervised() deleted
+A-575	g261 (UI 91, git)	piece 1 rest: the server's repository verbs over one Lineage on the owner shard (create, bind, branch at v, retire sliced), recovered from log and snapshot	assigned
+A-576	g258 (UI 85)	a folding WinFsp drive's volume folds names by Windows' own upcase table, so a name Windows folds alike (final sigma) is refused at create, never two files one node	landed 520a86184 part 1 (bc87adb03 NameEquivalence::Upcase over Microsoft's exFAT up-case table + vfs formats + server refusal + Windows check, 1774da0a2 test type fix, 1d71032f2 evidence/docs/rustfmt; merges 57f509452, 520a86184); part 2 owed: wire/catalog/CLI/SDK/MCP selection, WinFsp mount of a Fold volume
+A-577	g267 (UI 84)	a live clone is answered only once its first whole entry is durable on f+1 members (acknowledged Clone lost at f=1 today)	assigned
+A-578	g232 (UI 85)	each publication records its live inode counter beside the reserved ceiling, so a successor names a dead daemon's post-publication inode numbers	landed bdf717e12 (main 6b221866c)
+A-579	(paused: Ada 11-19 moved focus to 88-91)	the server's p99 under load (r278: server p99 9-75 ms, harness_bound 0): cause found from the pulse lines, first fix	queued
+A-580	g076b (UI 90 federation; from g225)	the multi-runner test with injected faults (kiln runners as a slates fleet: kill, partition, restart, a link lost mid-move)	assigned
+A-581	g083 (UI 91)	section 4.17.1's next shared piece (repository state + unmoved-branch checks, or the shared object store)	assigned
+A-582	g251b (UI 91, git)	git's wire codecs: pkt-line, protocol v2 (ls-refs, fetch), sideband-64k, packfile + idx v2 with OFS/REF deltas; golden vectors from stock git	assigned
+A-583	g230 (UI 89)	the three-daemon fleet test over a captured clone (takeover lands against its capture) and the moved live-shipped clone test (written; main runs)	landed d03f5a014 (cef038d11 tests + docs, merge; compile and run owed to main)
+A-584	g234 (UI 91 current: Shards/Hex/Mantle)	the next Shards-owed item from g268's list, slates side	assigned
+# next free: A-585
+A-585	g250 (UI 81 dbe13f39, chaos across real processes, failure half)	a holder whose store is lost answers no read and accepts no record under its old id (the register simulation fault + invariant checks; a client leaving mid-write)	landed c59ab83d5 (0f518a32f)
+A-586	g295 (UI 92 51cef9f7, Subversion)	A-542 part 2: the merge engine's Copy (OpKind 16), node-exclusive; one appearance record per copied prefix; identity hash, hard links and the root's copy settled	assigned
+A-587	g262 (UI 89 28e73c34, macOS microVM drive)	shards_fs::owner_word reads the negotiated setxattr head (FUSE_SETXATTR_EXT since A-378), so the run's owner word is taken again; then kiln re-vendors	assigned
+A-588	g291 (UI 92 51cef9f7, Mercurial)	Mercurial piece 3 per section 4.17.3's plan	assigned
+A-589	g230 (UI 90 95101ef3, federation across runners)	A-503's own fleet test: a captured clone moved a to b, then b to c, whole on each new owner, never stale on the old, a write after the second move at c, the move counters moved; it lands on c against its capture (written; main runs)	landed 5f4325a87 (test + docs; compile and run owed to main)
+A-590	g225 (UI 92, 51cef9f7)	slates-git §4.17.2 piece 4: tree, commit and tag parsers with git's fsck checks (pure, cfg-free; main said A-589, which g230 holds)	assigned
+# next free: A-591

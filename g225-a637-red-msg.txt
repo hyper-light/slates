@@ -1,0 +1,3 @@
+merge: A-637 a submodule's link as a special node, tests first -- its encoding (a FIFO's fields under kind 4, then the commit id's length and bytes) against bytes laid out by hand, its refusals, the earlier kinds unchanged; A-618's push landing, moving and removing a link, a path changing to or from one refused, and the generated histories with links to two commits held to the oracle and the client-fidelity check (stubs: the codec writes no id, the push refuses links as kind changes)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

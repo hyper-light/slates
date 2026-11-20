@@ -1,0 +1,16 @@
+server: the hg site answers a query past the request's room 414, as a path past it and git's routes answer a target past theirs (A-674) -- route told none of the query codec's refusals apart, so PastAdmission read 400; query_refused names every refusal: red first (the room test read 400 for the query, 6 of 7 passing), then slates-server lib vcs_http::hg 7 of 7, slates-hg lib http 22 of 22 and fmt clean on macOS arm64 (Mac Studio, kiln r212)
+
+From agents/g303-a650-query-414 (5b2f4cced, the failing case; d30cc46af, the fix), cherry-picked onto main
+1c6ac5006: the module doc's order kept as A-625 part 3 left it but step 1 (a path's or a query's fields past the room
+414), and query_refused's arms named one by one (the codec's Refusal is closed: PastAdmission 414; PostArguments,
+MissingArgument and MediaHeader 400). The test case: the owner's heads with a query past a 256-byte room, beside the
+path, header and damaged-policy cases (414, 414, 431, 500). The site's answer is already async on main, so the test
+reads it through the tests' ready as its neighbours do.
+
+Run on the Mac Studio, 2026-11-19, kiln r212, on agents/g303-a674-test (66c71c0f0, this commit's code exactly):
+red with main's hg.rs in a scratch clone, cargo test --locked -p slates-server --lib vcs_http::hg 6 passed and 1 failed
+([414, 400, 431, 500] against [414, 414, 431, 500]); green 7 of 7; cargo test --locked -p slates-hg --lib http 22 of
+22; cargo fmt -p slates-server -p slates-hg -- --check clean; no warnings. Docs: GAPS' open item closed with a Fixed
+line, and the amendment entry.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

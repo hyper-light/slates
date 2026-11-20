@@ -1,0 +1,3 @@
+docs: A-626 part 3, continued (1) recorded -- the bug record, the design entry with r146's evidence, the status blocks, GAPS (scratch commit; lands folded into one commit with the code)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

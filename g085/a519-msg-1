@@ -1,0 +1,3 @@
+land: a failing test first for a read-only file's metadata entry on Windows (A-519) -- the open such an entry makes, pure and tested on every host: a read-only file is to be opened to write its attributes alone, write-through, and left out of its batch's barrier, since NTFS refuses it a handle that writes its data (MS-FSA 2.1.5.1.2.1) and FlushFileBuffers needs one; the open as it is asks that right of every file
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

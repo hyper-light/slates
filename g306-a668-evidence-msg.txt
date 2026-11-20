@@ -1,0 +1,3 @@
+docs: A-668's evidence -- red 3 of 4 with the fix out (the map test, the verdict's both orders, and the stack oracle meeting the pair by itself), green slates-merge --lib 166 of 166 with fmt clean, on Windows x86_64 (jupiter; the macOS run owed)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

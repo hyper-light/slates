@@ -1,0 +1,12 @@
+wip(scratch): A-662 red -- the record noted at admission, written at the append; tests for two replay refusals
+
+The record writer notes each object (type, id, root, length) and writes the record at the append, reading the
+bytes back from the content store, so a push's bytes are no longer copied uncharged at admission; the versions
+map is charged; `lend` asks `Store::admittable`. Behaviour unchanged on purpose (every noted object listed, the
+replay's push at depth zero without objects): the new tests must fail here.
+
+New tests: a push appended a ref at a time from one sealed push whose pack carried deltas (its second record
+replays to another deepest chain); two pushes in flight at once (the second's record lists objects the first
+committed); the oracle generates both (split, deferred, shared) with a census; the writer's read-back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+db: a holder applies the owner's whole cut in one step, its join -- the holder-side cut was a no-op, since a holder applies only after acknowledging the owner's whole log and the owner's cut is already whole; whole_cut loses its beyond (WIP, unbuilt)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

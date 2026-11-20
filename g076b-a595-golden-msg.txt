@@ -1,0 +1,3 @@
+git: smart HTTP's golden vectors -- stock git 2.50.1's own HTTP traffic with git http-backend behind a loopback CGI host, twelve exchanges (v0, v1 and v2 advertisements, ls-refs, a gzipped fetch, a push, git's probe and two chunked requests), heads and inflated bodies only as A-607 rules, SHA-256 checked; design, GAPS and the amendment log (A-595)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

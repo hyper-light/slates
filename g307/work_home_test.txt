@@ -1,0 +1,85 @@
+
+  /// How many journals holding a copy their green's owner composed, on `state` (`COPY_COMPOSED_BY_OWNER`).
+  fn composed_by_owner(state: &crate::state::ShardState) -> u64 {
+    state
+      .refusals
+      .get(super::COPY_COMPOSED_BY_OWNER)
+      .copied()
+      .unwrap_or(0)
+  }
+
+  /// A sealed work of `green` based at version 0 declaring `journal`, its increment composed nowhere (A-247).
+  fn sealed_at_0(green: DbVolumeId, journal: Vec<super::VolumeOp>) -> super::SealedWork {
+    super::SealedWork {
+      work: DbVolumeId { bytes: [7; 16] },
+      green,
+      base_version: 0,
+      journal,
+      files: super::WorkFiles::default(),
+      composed: None,
+    }
+  }
+
+  /// Whether `answer` is a clean rebase whose restated journal holds a copy.
+  fn restates_a_copy(answer: &super::RebaseAnswer) -> bool {
+    let super::RebaseAnswer::Rebased { journal, .. } = answer else {
+      return false;
+    };
+    journal
+      .iter()
+      .any(|op| matches!(op, super::VolumeOp::Copy { .. }))
+  }
+
+  /// A-626 part 4 (main's ruling: the green's owner composes a journal holding a copy, where a refusal would answer
+  /// nothing): the owner counts each such composition, `merge.work.copy_composed_by_owner`. Do: on one shard, make a
+  /// green; hand the owner's rebase step a sealed work whose journal copies the root at version 0 to `b`, its increment
+  /// composed nowhere; then one whose journal makes a directory. Expect: the first rebases clean with its copy restated
+  /// and counts once; the second rebases clean and counts nothing more.
+  #[test]
+  fn a_journal_holding_a_copy_is_composed_by_the_owner_and_counted() {
+    let (restated, directory_rebased, counts) = crate::daemon::audit_on_shard(|state| {
+      let principal = slates_db::catalog::Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let created = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        slates_ipc::protocol::RequestBody::CreateGreen {
+          name: "copies".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      );
+      let slates_ipc::protocol::ReplyBody::GreenCreated { id } = created else {
+        panic!("no green: {created:?}")
+      };
+      let green = crate::verbs::to_db_volume(id);
+      let before = composed_by_owner(state);
+      let copy = super::VolumeOp::Copy {
+        from: String::new(),
+        to: "b".to_owned(),
+        version: 0,
+        replace: false,
+      };
+      let copied = crate::verbs::owner_rebase(state, sealed_at_0(green, vec![copy]));
+      let after_copy = composed_by_owner(state);
+      let mkdir = super::VolumeOp::Mkdir {
+        path: "d".to_owned(),
+      };
+      let made = crate::verbs::owner_rebase(state, sealed_at_0(green, vec![mkdir]));
+      (
+        restates_a_copy(&copied),
+        matches!(made, super::RebaseAnswer::Rebased { .. }),
+        [before, after_copy, composed_by_owner(state)],
+      )
+    });
+    assert!(restated, "the owner rebased the work, its copy restated");
+    assert!(directory_rebased, "the owner rebased the work making a directory");
+    assert_eq!(
+      counts,
+      [0, 1, 1],
+      "the count before, after the copy, after the directory"
+    );
+  }

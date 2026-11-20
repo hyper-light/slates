@@ -1,0 +1,3 @@
+merge: origin/main (b63f8a05d) into A-680 part 2b as it lands, main having moved again -- A-629 part 3 (durable Git LFS objects: vcs_store's LFS record and replay, ShardLfs serving every endpoint on the daemon's edge) and A-681's lender (Subversion records lent as the DAV site's read source, vcs_store/svn_view.rs) come in; two conflicts, daemon_edge.rs's module doc (A-629 part 3's LFS sentence and this piece's Mercurial pushes line, both kept) and the amendment log's end (main's A-681 and A-629 part 3 first, A-680 part 2b last, the exact union); the merged tree's focused run is in the landing's report
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,3 @@
+cli tests: stock hg's clone, pull and push round trip over the daemon's HTTP edge runs un-ignored, A-680 part 2b having built the hg site's pushes -- its one wait was `unbundle` through `hg_push`; run with --include-ignored on macOS arm64 (Mac Studio, stock hg 7.2 through uvx, kiln r2 over dfb40c810): `cargo test --locked -p slates-cli --test cli -- --exact stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge stock_hg_without_credentials_is_refused_in_its_own_words --include-ignored --test-threads=1` 2 of 2, neither skipping; the SSH round trip's ignore now names A-696 (unbundle over serve --stdio); GAPS' two lines say so
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

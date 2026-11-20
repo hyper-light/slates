@@ -1,0 +1,3 @@
+merge: origin/main into A-707 (w-unresolved) as it lands -- one conflict, the amendment log's end: main's A-636 part 2b-2 first, A-707 after; main's register.rs change (greens minted in a repository's family) is re-run under the lineage model before the push
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

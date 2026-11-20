@@ -1,0 +1,3 @@
+docs: A-635's amendment and GAPS paragraph, and rustfmt's layout from the Studio (WIP)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

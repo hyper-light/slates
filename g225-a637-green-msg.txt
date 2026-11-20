@@ -1,0 +1,3 @@
+merge: A-637 a submodule's link is a special node holding its commit -- kind 4 encodes a FIFO's fields then the id's length and bytes (one to 32), refused by kind past them; a push makes a link Mknod (moved: Unlink then Mknod, removed: Unlink), no owner, time or permission bit as git records none, and lays each node's encoding in the post-state where the deriver placed it (the build had laid only content and attribute bytes, so any Mknod would have been refused as truncated); a path changing to or from a link stays a typed kind change
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

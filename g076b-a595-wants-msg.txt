@@ -1,0 +1,3 @@
+git: the large fetch git sent wants 1401 times, 1400 commits -- it wants each ref's tip, HEAD's among them, so HEAD's commit twice, as the small clone's fetch did; the golden test said 1400 (Mac Studio, ffdd2a2da: left 1401, right 1400), and the recording host's own de-chunking gives the recorded digest (A-595)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

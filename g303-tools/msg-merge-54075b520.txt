@@ -1,0 +1,3 @@
+merge: origin/main (54075b520: A-676) into A-650 part 1 as it lands -- main's commits since e50757a1a change slates-merge's Green::node_home and its tests alone, which nothing the piece's filtered tests run calls (serve::http, the hg site, the edge), so the runs on 6fa7344d3 (slates-server --lib vcs_http 40 of 40, fmt clean, kiln r154) and 11865db7f (slates-hg --lib 306 of 306, r137) stand for this tree; the amendment log keeps A-676's entry before A-650's; every line either side added kept
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,0 +1,26 @@
+# Subagents (rebuilt 2026-11-19 ~00:40 UTC). name	agent id	UI goal	current piece	state
+g250	ac3bd86db01a0a4ee	84 d9f7a795	A-546 settle certifies content (A-538 landed 26d91cc73)	running
+g079	a9fef465d7ebb2074	85 17ad60b6	A-550 B12 (A-543 B2 first half landed 3cc9ce3f0)	running
+g230	abb5ad4f0f4b79683	85	A-537 landed 49455b775; next bug from the inventory	ended
+g225	a3405e2abbb29a993	85	A-547 open-bug inventory + first fix (A-533 landed 20f541482)	running
+g258	a4f4f27a77422c27f	85	A-551 B2 Windows half (hang fix still waits on main's VM runs)	running
+g229	a112d0134c196906b	85	A-510 guard test landed d63e602a7 (not reproduced in slates); kiln K5 fire-and-exit run is main's	ended
+g071	a803d1fff5f656d01	85	A-507 landed 088d38779 + d237f56cc	ended
+g255	a3508de3691ebc859	86 5875dc0c	A-554 reaper piece 4 (A-536 landed ec57251b0)	running
+g251b	ad427f678975023b5	86	A-523 item 5 MCP edge + client.rs split (4 of 5 landed)	running
+g232	a04383821ef183ed9	86	A-548 C-c rest (A-540 landed d949ff832)	running
+g076b	a6283dc0658faa18f	86	A-552 D-c (A-525 part 2 landed 3c9a37dd2)	running
+g083	a97c265c4c940a705	87 ce6a2d3a	A-528 landed ce9b6905e; waits on main's goal-87 profile	ended
+g085	a733238e9e4525fc5	88 28e73c34	A-568 Windows links (A-539 landed efe8ea79c)	running
+g264	a23cca350f8f98304	88	kiln unmount_patiently without rt::sleep (W8 excludes landed kiln 907d448bf)	running
+g088v	a16eee36c21ad9480	88	kiln review reads core.fileMode (exec bit landed kiln c22e5b720)	running
+g293	afc821446f68fe42e	88	kiln OCI/Docker engine: design + first step (A-520)	running
+g294	ab6bde88ede90716f	88	kiln Kubernetes engine: design + first step (A-521)	running
+g262	a44562cd1f6e5afd6	88	kiln microVM on KVM + WHP (re-vendor 42 landed kiln 70e3dcaed)	running
+g267	ac418754633ae1784	89 95101ef3	A-544 takeover clone lands (kiln fleet test fix 3b0f9ae91)	running
+g268	a59fcd55c78a33da7	90 c2e4337b	A-555 park pending S3 requests (A-524 landed c8731b725)	running
+g234	ab060ac7dd6dc0f2d	85	A-549 clone admission + entry count (A-541 landed 87d606e83)	running
+g081	a840e7795dcf83ea9	90	A-494 landed d0e39b52b	ended
+g261	afabfcf5b71067cad	91 51cef9f7 (git)	A-534 branch without tree walk (A-515 landed 7d4b15158)	running
+g291	a0e255da49a029ee3	91 (Mercurial)	A-545 bundle2 part payloads (A-514 landed c516c3494)	running
+g292	a0edb4e5359ec512d	91 (Subversion)	A-553 Subversion index (A-542 first half 6e5f95e56; Copy waits on A-534)	running

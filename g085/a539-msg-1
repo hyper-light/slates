@@ -1,0 +1,3 @@
+vfs, land, server, ipc: failing tests first for the refusal's kind carried end to end (A-539) -- OsCode (an errno or a Win32 code) and the seam's named kinds (Exists, NoSpace, Unsupported) declared; the wire's Win32 variants appended beside the errno ones (HostAnswer::Win32, LandingDegradation::CrashedWin32, TargetRefusal::HostWin32, Refusal::BaseUnavailableWin32) and published in the wire order; the tests: the Unix writer names each kind by its own errno, the Windows rule each by its Win32 code, a Win32 code reaches the wire's Win32 variants, and the new wire forms' golden vectors, not yet published
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

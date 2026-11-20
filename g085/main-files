@@ -1,0 +1,17 @@
+crates/anchor/src/lib.rs
+crates/anchor/src/supervise.rs
+crates/anchor/tests/anchor.rs
+crates/api/src/lib.rs
+crates/api/src/role/anchor.rs
+crates/cli/tests/cli.rs
+crates/client/src/client.rs
+crates/ipc/src/completion.rs
+crates/ipc/src/endpoint.rs
+crates/ipc/src/lib.rs
+crates/ipc/src/region.rs
+crates/ipc/src/rendezvous.rs
+crates/ipc/src/wake.rs
+crates/machine/src/switches.rs
+docs/wip/GAPS.md
+docs/wip/SLATES_DESIGN.md
+unsafe-budget.toml

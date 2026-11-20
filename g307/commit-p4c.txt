@@ -1,0 +1,3 @@
+merge tests: a rebase restates a copy (A-626 part 4) -- the deriver composes a copy and the edits beneath it against the copied tree, refuses an operation in its tree before it (Unsupported), and lays copies out by destination; a work copying trunk at version 1 and editing beneath it rebases to the copy and the edit; an oracle over generated works (copies of trunk, trunk/d or the root at version 1 or the head, edits and files made in the copied tree, renames out of it and links into it) holds each rebase to its submit, the restated journal composed again and submitted to the original's green, with a census of each case; the test pinning the old refusal of a rebased copy is gone with it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

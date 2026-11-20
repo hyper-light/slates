@@ -1,0 +1,3 @@
+merge: origin/main (34d10acb5) into A-655 part 2b a third time as it lands -- main brought A-636 part 2a (slates-db's state-log register class; LogName::register added, nothing the piece calls changed); one conflict, the amendment log's end (main's A-636 part 2a first, A-655 part 2b last); macOS arm64 (Mac Studio, kiln r149 on this tree): cargo fmt --check clean; `cargo test --locked -p slates-server --lib -- repository:: vcs_store:: lfs:: git_push:: --test-threads=4` 55 of 55 over the new slates-db; slates-svn `commit:: migration:: serve::` 115 of 115; slates-merge `engine::copy_tests::t_a655` 1 of 1
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

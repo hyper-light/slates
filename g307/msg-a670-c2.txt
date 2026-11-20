@@ -1,0 +1,3 @@
+merge tests: A-643's whole-state model states A-670's rule -- a removal of a file that gained a link after the work's base, none naming it there, is refused delete against modify, and a rename over one rename against rename (the model keeps every version's link homes); its first green run had shrunk to [Link(0, 0), Remove(0, 1)], refused by the engine and expected accepted by the old model
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

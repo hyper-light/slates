@@ -1,0 +1,3 @@
+merge: the stack's oracle leaves a stack unchecked where its replica refuses a work between that the green landed (A-659) -- the verdict depends on order there: two inserts at two points and a delete of the bytes between them land in the green's order, while the replica lands the delete first and the points become one (the failing case jupiter's green run generated); every work the green committed is logged for later replicas whatever the check, and the collapsed stacks are counted
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

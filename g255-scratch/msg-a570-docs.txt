@@ -1,0 +1,3 @@
+docs: A-570's evidence -- red first on main 8cb6bef (the 4 GiB fall not held within half a window; the refused purge sent again 517 ms after its round, at the tick's next look), green on 878895a on the Mac Studio (fmt clean; machine memory_pressure 1 of 1; server 39 of 39, the fall held back 1.9 ms after it, the refused purge sent again 1.0013 s after its round); base hints, the idle seal, the huge-page re-arm and the tick's deletion are left for the next piece
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

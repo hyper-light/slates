@@ -1,0 +1,3 @@
+merge: origin/main (a6306963e, A-657 part 3) into A-650 part 1 -- both make slates-server depend on slates-hg: one entry each in Cargo.toml and the server's manifest, its comment naming both uses (A-650's HTTP answers, A-657's pushes); the amendment log and the research notes keep A-657's entry and section 24 first, A-650's after (its notes now section 25); GAPS' section 4.17.3 keeps A-657's Built line, then A-650's, and one Owed list: (4) read serving from A-650's side, HTTP version 1 now built, (5) onward from main's; the section 4.17.3 statuses in the order they landed; every line main added kept but those comments and the rewrapped Owed list
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

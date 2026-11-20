@@ -1,0 +1,3 @@
+merge: Copy replaces its destination and nests in one increment (A-626 part 1, before its Studio run) -- a REPLACE flag takes the destination's tree away key by key at the copy's version, every source is held before any copy lands, a second copy or a move inside a copied tree is judged against what the outer copy brings; the oracle is now a per-version model, prop_oneof gone, with branches and replays at every version; head_identity_from_scratch split and branch.rs's lasts named (main's clippy findings)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

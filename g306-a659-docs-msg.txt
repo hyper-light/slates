@@ -1,0 +1,3 @@
+docs: A-659's entry, §4.17.1's "Works over works" status and shared piece 5, GAPS -- works over works and bases given as trees built in the engine (evidence pending the Mac Studio)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

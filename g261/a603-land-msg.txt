@@ -1,0 +1,24 @@
+db, server: a repository's register -- one entry commits several greens' versions, members joining, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence markers) as one step, all or none, its checks read at its position; 128 generated histories through a database over a real anchor segment, crashed at random points, equal the rules kept over plain maps (319 accepted entries of several greens, 625 stacks, 746 state moves, 314 recoveries from a snapshot and 90 from the log); slates-db --lib 127 of 127 and slates-server --lib repository 4 of 4 on the Mac Studio, red twelve ways (A-603)
+
+- db: `Op::RepositoryAdvanced` carries a `RepositoryEntry` (checks, members, versions, names, state). The guard
+  (`crates/db/src/repository/entry.rs`) takes the register's next position, reads its checks there before the entry's
+  own changes (a green's head: `check:heads`, `unbundle`'s heads; the exact names under a prefix), then judges each
+  item against what the items before it left, in an overlay keyed by borrows of the entry; refusals typed
+  (`OutOfOrder`, `CheckFailed`, `StateChanged`, and the lineage's and namespace's own). The apply is unconditional, so
+  a replay rebuilds the same register. Every change of a repository takes one position, whichever operation records
+  it, so one position names one state. Phase roots and markers (each by its BLAKE3 identity) are charged to the merge
+  budget with an entry's versions; the snapshot carries every register (`repository_registers`).
+- ipc: `DatabaseRefusal::{OutOfOrder, CheckFailed, StateChanged}` appended and published.
+- server: the repository verbs record one entry each, and every member's version records an entry
+  (`repository::version_record`, also the admission's judge).
+- Tests (Mac Studio, 2026-11-19): five unit tests by use of the partition, and the model test with its census; red
+  ten ways in the database (position, checks, a version's order, the state's preconditions, a member joined earlier in
+  the entry, positions, versions' bytes in the budget, a names check's last name, registers in the snapshot, the
+  restored charge) and two in the server (a member's version and a verb's entry at a wrong position); `slates-ipc
+  --lib` 74 passed, 2 ignored; `slates-server --lib` whole 533 passed with main's known status-capture failure; `cargo
+  fmt --all` clean.
+- Owed (design §4.17.1's status, GAPS): the push that judges several works before any commits and makes one entry of
+  them (with piece 4); the fleet half (the register as one ledger object, holders recomputing whole entries, takeovers
+  adopting them, the repository record replicated with it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

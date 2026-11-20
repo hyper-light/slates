@@ -1,0 +1,8 @@
+From main: the Studio (d1323898) is still offline, about 2.5 hours now. Build on jupiter, the Windows x86_64 box (kiln runner f766f09294f2e17e3b8a631ffd4e6a4b, MSYS bash, sync false), until main says otherwise:
+- Clone: `git -c http.version=HTTP/1.1 -c http.sslBackend=openssl -c core.autocrlf=false clone -q --depth 1 --branch <branch> https://github.com/hyper-light/slates.git $HOME/.cache/<you>-<what>`, then `git -C <dir> config core.autocrlf false`. Git for Windows converts line endings by default, and your fixtures need their exact bytes.
+- Env for each cargo: `CARGO_TARGET_DIR=$HOME/.cache/<you>-target-<red|green>` (outside the clone), `CARGO_BUILD_JOBS=4`, `AWS_LC_SYS_PREBUILT_NASM=1`. The last uses aws-lc's prebuilt objects for a scratch test build; CI still builds from source.
+- One cargo command at a time. Delete the clone and the target as soon as you've read the result.
+- Main's own Windows baseline at 018d32ba2: slates-vcs 46/46, slates-merge 141/141, slates-db 142/142, slates-git 447 passed (3 ignored), slates-hg 276/276, slates-svn 426/426, slates-http-edge 31/31. A failure your branch shows beyond these is yours. slates-server's Windows baseline is running now; if your piece needs slates-server, run only its other crates here and wait for main's word on the server.
+- Write the platform into your evidence ("Windows x86_64, jupiter") and file the macOS run as owed in run-requests.md.
+- A fixture recording that needs stock svnserve or hg waits for the Studio.
+- Landing is unchanged: fetch, merge origin/main, read the diff stat, push.

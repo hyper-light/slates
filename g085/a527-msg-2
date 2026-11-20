@@ -1,0 +1,3 @@
+land, base, server: the seam's numbering is typed (A-527) -- the Windows writer's rule gives a Win32 code an errno only for a kind the engine tells apart (ERROR_FILE_EXISTS and ERROR_ALREADY_EXISTS as EEXIST, ERROR_HANDLE_DISK_FULL and ERROR_DISK_FULL as ENOSPC) and keeps every other code as HostError::Win32, so ERROR_NOT_SAME_DEVICE (17), ERROR_BAD_COMMAND (22), ERROR_OUT_OF_PAPER (28), ERROR_TOO_MANY_SESS (69) and ERROR_INSUFFICIENT_BUFFER (122) never read as EEXIST, EINVAL, ENOSPC or EDQUOT; the writer's I/O errors, the Windows base host's codes and the server's barrier-thread refusals are typed the same way; §4.15 step 6 and GAPS
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

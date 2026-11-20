@@ -1,0 +1,3 @@
+vfs, land, server: a failing test first for the seam's typed numbering (A-527) -- HostError gains Win32(u32), a refusal in Win32's own numbering, which the engine reads as no errno's kind whatever its number (a write it refuses ends the landing, a metadata entry's open fails that entry alone, a removal it refuses is the target in use) and the server and the base plane pass on as their one number; the Windows writer's rule for a Win32 code, pure in windows_codes.rs and tested on every host, still passes every code it gives no kind on as a bare number, which the new test refuses
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

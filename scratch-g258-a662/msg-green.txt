@@ -1,0 +1,10 @@
+wip(scratch): A-662 green -- the record decided at the append by the commit's own predicate, every chain carried by its records
+
+record_of keeps the noted objects the repository lacks when the append commits (Repository::object, what fresh()
+positions); admit_object notes every object new to the push; the replay carries the record's deepest chain
+(Push::carried) and compares (kind, identity, length) in order instead of re-encoding the bytes. slates-git:
+Push::carried, Repository::learned_depth, a unit test. Tests: the oracle compares the learned depth; the in-flight
+test's second pack is deeper; the generator's order bit 2 shares a held push whole; the fixed history holds a
+depth-3 push back while the next shares it whole. Not yet compiled: jupiter's disk was full (1.8 GB free).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

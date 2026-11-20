@@ -1,0 +1,3 @@
+merge: origin/main into A-570 (g255) again as it lands -- one conflict, the amendment log's end: main's A-572 and A-521 first, then A-570; main's newest commits touch slates-vfs and slates-api, none of A-570's files
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
