@@ -82,7 +82,7 @@ const UUID_DASHES_BEFORE: [usize; 4] = [4, 6, 8, 10];
 
 /// The UUID a Subversion repository is made with (A-655 part 2b): its id's sixteen bytes in RFC 4122's form, in
 /// lower-case hexadecimal, so every holder and every recovery names it alike and no two repositories share one, their
-/// ids differing (`verbs::fresh_volume_id`).
+/// ids differing (`verbs::fresh_family_id_at`).
 fn svn_uuid(repository: RepositoryId) -> Option<slates_svn::dump::Uuid> {
   let mut text = String::new();
   for (at, byte) in repository.bytes.iter().enumerate() {
@@ -381,11 +381,9 @@ pub(crate) fn create_repository(
     Some(Err(refusal)) => return refused(refusal),
     None => None,
   };
-  let Some(repository) = crate::verbs::fresh_volume_id(state) else {
-    return refused(crate::verbs::ids_exhausted());
-  };
-  let repository = RepositoryId {
-    bytes: repository.bytes,
+  let repository = match repository_id(state, adopted) {
+    Ok(id) => id,
+    Err(refusal) => return refused(refusal),
   };
   match record_repository(
     state,
@@ -401,6 +399,31 @@ pub(crate) fn create_repository(
     }
     Err(refusal) => refused(refusal),
   }
+}
+
+/// A new repository's id (A-636 part 2b-2): of the adopted green's family, so the root joins it, or of a family of its
+/// own. A green minted under no family (an older build's) is never adopted: its id would place it apart from the
+/// repository's state logs, and taking it into a family would move every register it has (its chain, its catalog, its
+/// holders' ledgers) to another id, which a client holding its id would lose; so it is refused `Unsupported`, and a
+/// repository is made over a new root instead.
+fn repository_id(
+  state: &mut ShardState,
+  adopted: Option<DbVolumeId>,
+) -> Result<RepositoryId, Refusal> {
+  let family = match adopted {
+    Some(green) => {
+      Some(
+        crate::verbs::family_of(green.bytes).ok_or_else(|| Refusal::Unsupported {
+          feature: "a repository adopting a green minted under no family (A-636 part 2b-2)"
+            .to_owned(),
+        })?,
+      )
+    }
+    None => None,
+  };
+  let id = crate::verbs::fresh_family_id_at(state, family, 0)
+    .ok_or_else(crate::verbs::family_ids_exhausted)?;
+  Ok(RepositoryId { bytes: id.bytes })
 }
 
 /// The records of a new repository: its record, its root (a new green unless one is adopted), the root's membership
@@ -426,7 +449,10 @@ fn record_repository(
   let root_created = match adopted {
     Some(_) => None,
     None => {
-      let id = crate::verbs::fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
+      // In the repository's family, the number after the repository's own, which is not recorded yet.
+      let id =
+        crate::verbs::fresh_family_id_at(state, crate::verbs::family_of(repository.bytes), 1)
+          .ok_or_else(crate::verbs::family_ids_exhausted)?;
       let named = member_name(name, default_branch, id)?;
       let created = Op::VolumeCreated {
         record: member_record(state, principal, (id, named), false),
@@ -614,7 +640,8 @@ fn record_branch(
   if member.is_none_or(|member| member.repository != repository.id) {
     return Err(Refusal::NotFound);
   }
-  let id = crate::verbs::fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
+  let id = crate::verbs::fresh_family_id_at(state, crate::verbs::family_of(repository.id.bytes), 0)
+    .ok_or_else(crate::verbs::family_ids_exhausted)?;
   let named = member_name(&repository.name, name, id)?;
   let created = Op::VolumeCreated {
     record: member_record(state, principal, (id, named), require_evidence),
@@ -1153,6 +1180,86 @@ mod tests {
       );
       assert_eq!(refusal(outside), Refusal::NotFound);
       assert_eq!(state.greens.busy_lends(), 0);
+    });
+  }
+
+  /// The line key `id` is placed and taken over by (A-636 part 2b-2), and whether it is a family id.
+  fn line_of(id: [u8; 16]) -> (slates_db::register::ObjectId, bool) {
+    let id = slates_db::register::ObjectId(id);
+    (id.line_key(), id.is_family())
+  }
+
+  /// A-636 part 2b-2 (§4.8 "Promotion and takeover"; §2 item 12: ids route to owners). Do: create a repository, branch
+  /// it twice, make a green alone and create a second repository adopting it as its root, then branch that one. Expect:
+  /// every id a family id, each distinct; the first repository, its root and its branches on one line key, which places
+  /// them on one set of holders and names one successor for all of them; the second repository and its branch on the
+  /// adopted green's line, another one.
+  #[test]
+  fn a_repository_and_every_green_made_for_it_share_one_line() {
+    crate::daemon::audit_on_shard(|state| {
+      let root = green_of(create(state, "linux", "main"));
+      let topic = green_of(branch(state, ("linux", "topic", "main"), None));
+      let other = green_of(branch(state, ("linux", "other", "main"), None));
+      let repo = repository(state, "linux");
+      let alone = green_of(ask(
+        state,
+        &owner(),
+        RequestBody::CreateGreen {
+          name: "alone".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ));
+      let adopted = green_of(ask(
+        state,
+        &owner(),
+        RequestBody::CreateRepository {
+          name: "adopter".to_owned(),
+          tool: VcsTool::Git,
+          format: ObjectFormat::Sha1,
+          default_branch: "main".to_owned(),
+          green: Some(alone),
+        },
+      ));
+      assert_eq!(adopted, alone, "the adopted green is the root");
+      let late = green_of(branch(state, ("adopter", "late", "main"), None));
+      let adopter = repository(state, "adopter");
+      let first: Vec<[u8; 16]> = [root, topic, other]
+        .map(|green| to_db_volume(green).bytes)
+        .into_iter()
+        .chain([repo.bytes])
+        .collect();
+      let second: Vec<[u8; 16]> = [alone, late]
+        .map(|green| to_db_volume(green).bytes)
+        .into_iter()
+        .chain([adopter.bytes])
+        .collect();
+      let distinct: std::collections::BTreeSet<[u8; 16]> =
+        first.iter().chain(&second).copied().collect();
+      assert_eq!(
+        distinct.len(),
+        first.len() + second.len(),
+        "ids are distinct"
+      );
+      let lines = |ids: &[[u8; 16]]| {
+        ids
+          .iter()
+          .map(|id| line_of(*id))
+          .collect::<std::collections::BTreeSet<_>>()
+      };
+      let (first_lines, second_lines) = (lines(&first), lines(&second));
+      assert_eq!(first_lines.len(), 1, "{first_lines:?}");
+      assert_eq!(second_lines.len(), 1, "{second_lines:?}");
+      assert!(
+        first_lines
+          .iter()
+          .chain(&second_lines)
+          .all(|(_, family)| *family)
+      );
+      assert_ne!(
+        first_lines, second_lines,
+        "two repositories' families are told apart"
+      );
     });
   }
 

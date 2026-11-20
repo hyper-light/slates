@@ -270,7 +270,7 @@ impl<'entry> Overlay<'entry> {
   }
 
   /// A green joins the lineage (A-575's rules, at this point of the entry): of the entry's repository, a green of its
-  /// partition, not a member yet; the lineage's first member is its root and every other is made from a member of the
+  /// family (`super::in_family`, A-636 part 2b-2), not a member yet; the lineage's first member is its root and every other is made from a member of the
   /// same lineage.
   fn join(
     &mut self,
@@ -287,7 +287,7 @@ impl<'entry> Overlay<'entry> {
       Held::NotGreen => return Err(DbError::NotGreen),
       Held::Green => {}
     }
-    if member.green.partition() != record.id.partition() {
+    if !super::in_family(member.green, record.id) {
       return Err(DbError::NotFound);
     }
     if self.joined.contains_key(&member.green) || repositories.members.contains_key(&member.green) {

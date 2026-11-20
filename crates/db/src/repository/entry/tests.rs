@@ -37,12 +37,11 @@ const ELSEWHERE: u16 = 4;
 /// Shape: a merge budget no test here reaches, but the one that measures the budget.
 const ROOMY: usize = 1 << 20;
 
-/// An id on `partition` with `serial` in its low byte, as the server mints them.
+/// An id on `partition` with `serial` its number, in the one family every test id shares (tag 0), as the server mints
+/// a repository's and its greens' (A-636 part 2b-2), so a green of the partition may join any of its repositories.
 fn id_bytes(partition: u16, serial: u8) -> [u8; 16] {
-  let mut bytes = [0u8; 16];
-  bytes[8..10].copy_from_slice(&partition.to_be_bytes());
-  bytes[15] = serial;
-  bytes
+  crate::register::ObjectId::family(crate::register::HostId(0), partition, 0, u32::from(serial))
+    .map_or([0u8; 16], |id| id.0)
 }
 
 fn repository_id(serial: u8) -> RepositoryId {

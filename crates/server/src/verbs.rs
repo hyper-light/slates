@@ -167,6 +167,44 @@ pub(crate) fn fresh_volume_id_at(state: &mut ShardState, offset: u64) -> Option<
   Some(DbVolumeId { bytes })
 }
 
+/// The `offset`-th of several fresh family ids minted before any of their creations is recorded (A-636 part 2b-2): a
+/// repository's own id, a green minted to join it, or a green made alone, which a repository may later adopt as its
+/// root. The creator host and the partition as [`fresh_volume_id_at`] mints them, then the family bit, the family's
+/// tag and the id's number (`slates_db::register::ObjectId::family`), the number the database's next
+/// (`Db::family_number_at`). `family` is the tag of the family the id joins (its repository's, read from the
+/// repository's id); `None` starts a family of its own, whose tag is its own number's low twelve bits, so a
+/// partition's families spread over every tag and every placement they name. The line key every register of a family
+/// is placed and taken over by is the family's, so a repository's greens have its holders and its successor, with
+/// nothing stored per green (§2 item 12). `None` past the numbers a family id holds.
+pub(crate) fn fresh_family_id_at(
+  state: &mut ShardState,
+  family: Option<u16>,
+  offset: u64,
+) -> Option<DbVolumeId> {
+  let number = state.db.family_number_at(offset)?;
+  // Derived: a new family's tag is its number modulo the tags a family id holds, MAX_FAMILY_TAG + 1.
+  let tags = u32::from(slates_db::register::MAX_FAMILY_TAG).checked_add(1)?;
+  let tag = match family {
+    Some(tag) => tag,
+    None => u16::try_from(number.checked_rem(tags)?).ok()?,
+  };
+  slates_db::register::ObjectId::family(state.fleet.host(), state.partition, tag, number)
+    .map(|id| DbVolumeId { bytes: id.0 })
+}
+
+/// The family tag of `id`, a repository's or a green's (`slates_db::register::ObjectId::family_tag`); `None` for an id
+/// minted under no family.
+pub(crate) fn family_of(id: [u8; 16]) -> Option<u16> {
+  slates_db::register::ObjectId(id).family_tag()
+}
+
+/// The refusal of a verb that needs a fresh family id on a partition that has minted its last one (A-636 part 2b-2).
+pub(crate) fn family_ids_exhausted() -> Refusal {
+  Refusal::Unsupported {
+    feature: format!("a family id past this partition's {} numbers", u32::MAX),
+  }
+}
+
 /// The refusal of a verb that needs a fresh volume id on a partition that has minted its last one.
 pub(crate) fn ids_exhausted() -> Refusal {
   Refusal::Unsupported {
@@ -7461,8 +7499,10 @@ fn found_green(
       existing: to_wire_volume(existing.id),
     });
   }
-  let Some(id) = fresh_volume_id(state) else {
-    return refused(ids_exhausted());
+  // A green made alone starts a family of its own, so a repository that adopts it as its root joins its family
+  // (A-636 part 2b-2).
+  let Some(id) = fresh_family_id_at(state, None, 0) else {
+    return refused(family_ids_exhausted());
   };
   let held = match &seeded {
     Some(seeded) => match hold_origin_snapshot(state, seeded.base) {

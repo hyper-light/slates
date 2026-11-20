@@ -8632,6 +8632,20 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   as a head) and the record plane's shipments (a state log's parts are counted under their own names, their
 >   acknowledgements kept per log, never as a head's placement). A holder keeps a state log's records whole, a ledger
 >   never compacted to its newest.
+> - **A repository's family (2026-11-20, A-636 part 2b-2).** A repository's id and every green minted to join it
+>   (its root, a branch, a push's create) are family ids (`ObjectId::family`): the counter's fourth bit marks one, the
+>   next twelve bits are the family's tag (the repository's, a new family's its own number's low twelve) and the last
+>   four bytes its number, unique on the partition (`Db::family_number_at`, the partition's own counter, snapshotted).
+>   Rendezvous hashes an id's line key (`ObjectId::line_key`: a family id with its creator and number cleared), so a
+>   repository, its state logs and every green of it, whichever host minted it, have one set of holders and one
+>   successor, by computation from the id with nothing stored per green (§2 item 12), and an atomic record across a
+>   green's log and a state log is kept or dropped whole by one takeover. A green joins only its repository's family
+>   (`slates_db::repository::in_family`, both guards; else `NotFound`). A green made alone starts a family of its own, so
+>   a repository adopting it joins its family; one minted under no family is refused `Unsupported` (re-keying it would
+>   move every register it has to another id). Placement follows the family, not the successor alone: a green's
+>   successor adopts it from its own holder ledger (A-333), so it must be one of its holders. The cost: a repository's
+>   greens share their holders, so A-642's copyset spreading gives way for them. An id of no family is placed as
+>   before; a partition mints at most 2^44 − 1 of them (`MAX_OBJECT_COUNTER`).
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -12011,9 +12025,9 @@ decides the details.
 > identity and every span it moved, its greens' included (`StateLogRecord`); the record plane ships each as its log's
 > register at the position it leaves the log at, in order, committed at `f + 1`, and a holder keeps it only where it
 > continues its copy of the log, so every holder's copy is a prefix and a successor can rebuild the repository's state
-> from it and keep or drop each operation whole. Owed: the repository's greens placed on its holders at their joins
-> (A-636 part 2b-2), then the server's takeover by this rule, every log of a repository, its greens' included,
-> following one successor (2c); and the repository policy's check before the verdict (A-622's next part).
+> from it and keep or drop each operation whole. A repository's greens are of its family (A-636 part 2b-2), so every
+> log of a repository, its greens' included, is placed on one set of holders and follows one successor. Owed: the
+> server's takeover by this rule (2c); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12554,8 +12568,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    live plane's first piece (A-636 part 2a: the state logs a register class of the repository, placed and taken over as
    it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
    every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
-   operation's identity and spans (A-636 part 2b); owed: the greens placed on their repository's holders at their joins
-   (A-636 part 2b-2) and the server's takeover by the rule (2c).
+   operation's identity and spans (A-636 part 2b); and a repository's greens minted in its family, placed and taken
+   over as it is (A-636 part 2b-2); owed: the server's takeover by the rule (2c).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -52466,6 +52480,8 @@ Applied in the same change to:
   own, so pushes to different greens land on different holders) gives way; the alternative, a commit across holder
   sets per record, is coordination on a write path (CLAUDE.md §2 item 10) and is not built. A green not bound to a
   repository keeps its own placement.
+  Corrected by A-636 part 2b-2: no home change and no configuration entry (a per-green entry is a lookup table, §2 item
+  12); a repository's greens are minted in its family and placed by it from birth, so nothing moves.
 - **Tests** (macOS arm64, Mac Studio, kiln, debug, `CARGO_BUILD_JOBS=2`).
   - The oracle: the repository model test (`every_history_of_entries_equals_the_rules_and_every_crash_recovers_it`, A-603's
     and A-635's generated histories with crashes) now builds a holder's copy of the state logs from the records the
@@ -53895,6 +53911,45 @@ and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `c
   `slates-git` `receive::tests::a_pack_past_its_room_is_refused_in_the_words_of_gits_max_input_size`.
 - **Owed.** The unpack admitting objects into the quarantine a slice at a time (the reader holds them until the pack
   ends, then the quarantine copies them); the whole git/git push and a fresh clone fscked (main's run).
+
+### A-636 part 2b-2 — Routed by id: a repository's greens are minted in its family, so every log of a repository is placed on one set of holders and taken over by one successor, with nothing stored per green (2026-11-20, w-shared for UI goal 93; main's ruling of 2026-11-20)
+- **Why.** 2c's takeover keeps or drops an atomic record whole only when every log it spans, a green's and a state
+  log's, follows one successor (A-636 part 1's rule); a green's logs were placed and taken over by its own id. Main
+  ruled out a configuration entry per green (a lookup table that grows with every branch, CLAUDE.md §2 item 12): route by
+  id, as A-636 part 2a's state logs carry their class in theirs.
+- **Change.** `slates_db::register`: a family id (`ObjectId::family`) is the creator's eight bytes, the partition's two,
+  the family bit (0x10 of byte 10, below the three class bits), a twelve-bit tag and a 32-bit number; `line_key` clears
+  its creator and number, and rendezvous hashes the line key, so placement (`candidates_for`, `copyset_for`) and the
+  successor (`RegionalConfiguration::successor`) follow the family; an id of no family's line key is its placement key,
+  placed as before. `MAX_OBJECT_COUNTER` is 2^44 − 1. The partition counts family numbers apart from volume counters
+  (`Partition::family_counter`, appended to its snapshot; `Db::family_number_at`), so a family's four billion numbers
+  are its creations, never its records. Both join guards (`Repositories::check_joined`, an entry's join) take a green
+  only of its repository's family (`repository::in_family`), else `NotFound`. The server mints family ids
+  (`verbs::fresh_family_id_at`): a repository's id a family of its own (tag = its number mod 4,096), its root, a branch
+  and a push's create in its family, each at its own offset; a green made alone a family of its own.
+- **Placement follows the family, not the successor alone.** A green's successor adopts it from its own holder ledger
+  (A-333, `green_adopt`), and `successor` ranks the survivors of the object's own recovery cohorts, so a successor by
+  the family key must also be one of the green's holders by it. A member is placed by its family from birth, so nothing
+  moves and the configuration group is never touched. The cost: a repository's greens share their holders, so A-642
+  part 1's copyset spreading gives way for them (pushes to two branches of one repository land on the same holders);
+  a lone green is a family of its own and spreads as before. Earlier retirements keep their ranking: every id minted
+  before this change is of no family, its line key its placement key.
+- **A green minted before it joins.** Every join is of a green minted for it, but for `CreateRepository` adopting an
+  existing green as its root: a green made alone starts its own family, and the repository is minted in that family, so
+  it joins. A green minted under no family (an older build's) is refused `Unsupported`: re-keying it at the join would
+  move every register it has (its chain, its catalog, its holders' ledgers) to another id, losing the id its clients
+  hold, and needs a protocol the design does not have; a repository made over a new root serves instead. A repository
+  made by an older build is of no family and joins no new green (`NotFound`).
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20: db lib 124 of 124, `--test model` 26 of 26, `--test wire_order`
+  2 of 2; server lib `repository:: git_push:: vcs_store:: green_adopt takeover:: state_log` 116 of 116 and `merge_service::
+  greens:: green_checkpoint fleet::state_log` 17 of 17; fmt clean). `slates-db` `register::family_tests` (a family minted by three creators at
+  four numbers, every register of each placed on the repository's candidates and taken over by its successor after a
+  retirement, while other families land elsewhere; each field read back; a tag past the largest refused),
+  `register::class_tests` (one past the largest counter reads as a family's), `repository::tests::a_green_joins_only_its_repositorys_family_and_family_ids_move_their_own_counter`
+  (another family's green and a familyless green refused both ways, a successor's member joining; the counters and
+  their snapshot); `slates-server` `repository::tests::a_repository_and_every_green_made_for_it_share_one_line` (a
+  repository, its root and branches on one line; an adopted lone green's repository on its own).
+- **Owed.** The server's takeover adopting a repository's logs and records whole (2c).
 
 ### A-665 part 4a — The HTTP edge tells a hook's run its client has gone (2026-11-20, w-git for UI goal 93; §4.17.2 "Hooks, in git's terms")
 - **Change.** `Exchange::body_end` takes `vcs_http::ClientGone`, the connection's socket watched once the request's
