@@ -10,3 +10,24 @@
 - Also LANDED A-722 part 4f 061f4956a: connectivity propagation one stack step per unit (the check's 57.9 ms); red was
   create 11 turns for 3 objects.
 - Next: edge keepalive (the load-only long-history edge tests), then memory per push, then the commit passes.
+
+## 2026-11-20 ~14:45 — order fix landed; v1.5.0's landing step broken down; a routing question (w-git)
+- LANDED 47dc24b72 (confirmed on origin/main): staging puts a push's pack objects in the order the reader resolved
+  them. B2's +45% CPU on v1.5.0 is gone: 229,619 answer steps fell to 168,761 (173,409 before B2). The profile put zlib
+  inflate on top, from staging's id-order reads. BENCHMARKS has the before/after table.
+- v1.5.0's longest step is the last one, push_planned: 35.8 ms on a quiet Studio.
+  - make, secure and judge: 1.3 ms
+  - entry and record: 1.7 ms
+  - store commit: 14.0 ms (landed runs 2.6, plan's members' positions 6.2, holds' release 3.4, values 1.7)
+  - entry apply (the log append): 18.2 ms
+  - paths map: 0.3 ms
+- The apply is O(record bytes), because the record embeds the whole 9.4 MiB pack. The diag is a test build, so v3 was
+  off; in production v3 homes only the names, and the pack still rides in the entry.
+- **Question:** may I home the pack as content before the append, a window a turn as v3 homes names, with the record
+  naming it by identity? Replay already reads a pack from the content store in place (B1's PackSource). This is the
+  changeset's payload section in w-store's A-767, so: do I build it under the current record (a v4), or leave it to
+  w-store's changeset log?
+- Meanwhile I'm slicing the store commit's 14 ms: plan and landed runs precomputed in the judge's turns, keyed to the
+  stage; holds given back in turns after the commit.
+- Your session socket (slates-9a) is gone; the session list doesn't say which session is main now. Message me
+  (slates-work-1b, w-git) with your new name.
