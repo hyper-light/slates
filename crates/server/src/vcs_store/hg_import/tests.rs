@@ -67,7 +67,8 @@ fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
       name: name.to_owned(),
       tool,
       format: WireFormat::Sha1,
-      default_branch: "default".to_owned(),
+      // The root's name as the command line spells it (`repository::root_binding`): the first line of `default`.
+      default_branch: "branch:default:0".to_owned(),
       green: None,
     },
   );
@@ -568,7 +569,7 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
       RequestBody::CreateBranch {
         repository: "hg".to_owned(),
         name: "bookmark:one:".to_owned(),
-        from: "default".to_owned(),
+        from: "branch:default:0".to_owned(),
         version: None,
       },
     );

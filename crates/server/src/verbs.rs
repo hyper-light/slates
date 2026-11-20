@@ -158,8 +158,18 @@ pub(crate) fn fresh_volume_id(state: &mut ShardState) -> Option<DbVolumeId> {
 
 /// The `offset`-th of several fresh volume ids minted before any of their volumes is recorded (A-694): an append's new
 /// branches, each its own, where [`fresh_volume_id`] would name the same id for each.
+///
+/// Each mint is the shard's alone (`ShardState::volume_ids_minted`): an id minted before the atom that records it (an
+/// image's identity at its plan, an archive's or an import's volume at its admission, A-652's export) is reserved, so a
+/// second job minting before the first records takes the next. Found by A-652's export: two exports side by side named
+/// one id and the second was refused `AlreadyExists` at its record. A mint inside the recording transaction cannot be
+/// the structural form here, since an image's identity holds its id before its volume is recorded.
 pub(crate) fn fresh_volume_id_at(state: &mut ShardState, offset: u64) -> Option<DbVolumeId> {
-  let count = state.db.volume_counter_at(offset)?;
+  let unrecorded = state.db.volume_counter_at(0)?.max(state.volume_ids_minted);
+  let count = unrecorded
+    .checked_add(offset)
+    .filter(|count| *count <= slates_db::register::MAX_OBJECT_COUNTER)?;
+  state.volume_ids_minted = state.volume_ids_minted.max(count.checked_add(1)?);
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&state.fleet.host().0.to_be_bytes());
   bytes[8..10].copy_from_slice(&state.partition.to_be_bytes());
@@ -2649,7 +2659,8 @@ pub(crate) fn route_gated(
     | RequestBody::RetireBranch { repository, .. }
     | RequestBody::SetRepositoryPolicy { repository, .. }
     | RequestBody::ImportRepository { repository, .. }
-    | RequestBody::DescribeRepositoryPolicy { repository } => {
+    | RequestBody::DescribeRepositoryPolicy { repository }
+    | RequestBody::ExportDump { repository, .. } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -4065,6 +4076,8 @@ fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
 
 /// This shard's part of the status: its counters and its health signals (§4.14 catalog).
 pub fn shard_report(state: &mut ShardState) -> ShardReport {
+  // Advanced first, mutably: the sweep of the shard's slice of the anchor content object (A-744).
+  let content_ranges = crate::content_ranges::report(state);
   let now = state.clock.monotonic_ns();
   let since_boot = now.saturating_sub(state.booted_ns);
   let ring_depth: u64 = state
@@ -4241,6 +4254,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
         }),
       )
       .chain(large_counts(state))
+      .chain(content_ranges)
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -4749,6 +4763,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::MessageRequired => "message_required",
     Refusal::IdentityRequired { .. } => "identity_required",
     Refusal::ImportRefused { .. } => "import_refused",
+    Refusal::CopyRefused { .. } => "copy_refused",
   }
 }
 
@@ -5263,6 +5278,20 @@ fn dispatch_inner(
     RequestBody::DescribeRepositoryPolicy { repository } => {
       crate::repository::describe_policy(state, principal, &repository)
     }
+    // A Subversion repository's range of revisions exported as a dump into a new volume, answered when the export ends
+    // (A-652 part 3).
+    RequestBody::ExportDump {
+      repository,
+      first,
+      last,
+      deltas,
+      name,
+    } => crate::repository::svn_export::export_dump(
+      state,
+      principal,
+      (&repository, (first, last), deltas),
+      name,
+    ),
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {
       principal: proven,
@@ -8613,6 +8642,19 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       path: key(path),
       name,
     },
+    // A copy made through a work (A-626 part 4): of the work's base unless it names a version; the green's owner
+    // composes it against the copied tree (`merge.work.copy_composed_by_owner`).
+    WorkOp::Copy {
+      from,
+      to,
+      version,
+      replace,
+    } => VolumeOp::Copy {
+      from: key(from),
+      to: key(to),
+      version: version.unwrap_or(w.base_version),
+      replace,
+    },
   };
   // The work is charged for what the declaration adds before it changes anything (`crate::work_charge`): a moved
   // file it now holds, a removal it records, the operation itself. The base is read while its green is lent.
@@ -9724,7 +9766,28 @@ fn judge_submission(
         version: base,
       })
     }
+    slates_merge::engine::Outcome::CopyRefused { path, case } => {
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
+      refused(copy_refused(path, case))
+    }
   }
+}
+
+/// A copy refused before any verdict on the wire (A-586; main's ruling of 2026-11-20): the engine's case named by an
+/// exhaustive match, so a case appended to the engine breaks this build until the wire names it.
+pub(crate) fn copy_refused(path: String, case: slates_merge::engine::CopyRefusal) -> Refusal {
+  use slates_ipc::protocol::CopyCase;
+  use slates_merge::engine::CopyRefusal;
+  let case = match case {
+    CopyRefusal::Root => CopyCase::Root,
+    CopyRefusal::PastHead => CopyCase::PastHead,
+    CopyRefusal::SourceEmpty => CopyCase::SourceEmpty,
+    CopyRefusal::VersionFolded => CopyCase::VersionFolded,
+    CopyRefusal::OutsideNodeChanged => CopyCase::OutsideNodeChanged,
+    CopyRefusal::ChangedSourceLink => CopyCase::ChangedSourceLink,
+    CopyRefusal::LinkAcrossCopy => CopyCase::LinkAcrossCopy,
+  };
+  Refusal::CopyRefused { path, case }
 }
 
 /// Whether green `green`'s chain can hold `record`, an increment about to be judged: checked guard-then-apply. A chain
@@ -9924,6 +9987,9 @@ fn map_rebase(
         green: to_wire_volume(green_id),
         version: base,
       }))
+    }
+    slates_merge::engine::Rebased::CopyRefused { path, case } => {
+      RebaseAnswer::Reply(refused(copy_refused(path, case)))
     }
   }
 }

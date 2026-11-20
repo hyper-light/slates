@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::mem::size_of;
 
-use slates_vcs::{ContentId, ContentRefused, ContentStore, Index, IndexRefused, NewRow};
+use slates_vcs::{ContentId, ContentRefused, ContentStore, Index, IndexRefused};
 
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::tag::Tag;
@@ -39,6 +39,9 @@ pub(super) mod protect;
 /// walks the store as the admission does.
 #[path = "reach.rs"]
 pub(super) mod reach;
+/// A push sealed and staged a unit at a time (A-722 part 4), a child of this module so it writes the rows kept here.
+#[path = "staging.rs"]
+pub(super) mod staging;
 
 /// Shape: what one version's record costs the budget beside its set's runs. Derived from the type.
 const VERSION_BYTES: usize = size_of::<Version>();
@@ -391,13 +394,6 @@ impl Place {
       Place::Pushed { content, len, .. } => (*content, *len),
     }
   }
-}
-
-/// A row to write, owned until the batch is inserted.
-struct OwnedRow {
-  key: Vec<u8>,
-  contents: Vec<ContentId>,
-  payload: Vec<u8>,
 }
 
 /// A git repository's store (module docs).
@@ -1038,11 +1034,20 @@ impl Repository {
     self.same_format(push)?;
     let first = moves.first().ok_or(StoreRefused::NoMove)?;
     self.check_moves(moves)?;
-    let fresh = self.fresh(store, push)?;
-    let (positions, next) = self.positions_for(&fresh)?;
+    let staged = match self.adoptable_stage(store, push)? {
+      Some(staged) => staged,
+      None => {
+        self.stage(store, push)?;
+        push.take_staged().ok_or(StoreRefused::Unsealed)?
+      }
+    };
+    let fresh_ids: Vec<ObjectId> = staged.positions.keys().copied().collect();
+    let positions = staged.positions.clone();
+    let next = staged
+      .base
+      .saturating_add(u64::try_from(staged.positions.len()).unwrap_or(u64::MAX));
     let brought_by = self.brought_by(moves, first);
-    let landed = landed_runs(&fresh, &positions, &brought_by);
-    let owned = self.rows_for(store, push, &fresh, &positions)?;
+    let landed = landed_runs(&fresh_ids, &positions, &brought_by);
     let (planned, heads) = self.plan(store, moves, &positions)?;
     let before = store.used();
     let values = put_values(store, &planned)?;
@@ -1060,7 +1065,20 @@ impl Repository {
       give_back(store, &values)?;
       return Err(refused.into());
     }
-    if let Err(refused) = self.insert(store, &owned) {
+    let inserted = self
+      .index
+      .adopt(store, staged.fork)
+      .map_err(|refused| match refused {
+        slates_vcs::AdoptRefused::Refused(refused, fork) => {
+          let _ = fork.release(store);
+          StoreRefused::from(refused)
+        }
+        slates_vcs::AdoptRefused::Stale(fork) | slates_vcs::AdoptRefused::NotAFork(fork) => {
+          let _ = fork.release(store);
+          StoreRefused::Moved { green: first.green }
+        }
+      });
+    if let Err(refused) = inserted {
       store.discharge(more.saturating_add(landing_cost))?;
       give_back(store, &values)?;
       return Err(refused);
@@ -1083,7 +1101,7 @@ impl Repository {
     self.chains.extend(chains);
     self.heads = heads;
     self.next_position = next;
-    let given = u64::try_from(fresh.len()).unwrap_or(u64::MAX);
+    let given = u64::try_from(fresh_ids.len()).unwrap_or(u64::MAX);
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
     self.depth.seen(push.deepest());
     push.release_holds(store)?;
@@ -1104,43 +1122,67 @@ impl Repository {
     Ok(())
   }
 
-  /// The push's objects new to the repository, in their ids' order: id, type, root content and length.
-  fn fresh(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-  ) -> Result<Vec<(ObjectId, Kind, ContentId, u64)>, StoreRefused> {
-    let mut fresh = Vec::new();
-    for (bytes, number, content, len) in push.held() {
-      let id = ObjectId::from_bytes(self.format, bytes).ok_or(StoreRefused::ForeignPush)?;
-      if self.indexed(store, &id).is_none() {
-        let kind = kind_of(number).ok_or(StoreRefused::Malformed { id })?;
-        fresh.push((id, kind, content, len));
-      }
-    }
-    Ok(fresh)
+  /// Stages `push`, sealed, whole (A-722 part 3): each object it holds that the repository does not index given a
+  /// position after the repository's next, in order by type and then id as A-639 orders them, and its rows (its object
+  /// row with a commit's part, and its position row) written into a fork of the index made now and sealed into
+  /// tables, so the push's landing adopts them and writes none. Its positions are tentative: the landing takes them
+  /// when nothing landed since, and otherwise stages the push again. A push staged before gives its stage back first.
+  /// Every landing adopts a fork, so the repository's own index keeps no tail of rows, and a fork made at any time (a
+  /// push abandoned, another staging at once) changes nothing a store made again from the log would not make alike.
+  pub fn stage(&mut self, store: &mut ContentStore, push: &mut Push) -> Result<(), StoreRefused> {
+    let staging = self.staging(store, push)?;
+    self.stage_whole(store, push, staging)
   }
 
-  /// A position for each fresh object, the next ones in order by type and then id; and the next position after them.
-  /// By type (A-639): a push's new objects of one type take one run of positions, so a fragment's two parts, its blobs
-  /// and the rest, are a run each, and upload-pack's sets of them stay a few runs.
-  fn positions_for(
+  /// Derived: the most staging `push` could charge the store ([`Self::stage`]): each object's object row (a commit's
+  /// part and parents included) and position row with their tail slots, doubled for the tables a seal writes beside the
+  /// tail it replaces; and the fork staging makes.
+  pub fn stage_room(&self, push: &Push) -> u64 {
+    let raw = self.format.raw_len();
+    let object_row = raw
+      .saturating_add(1)
+      .saturating_add(rows::OBJECT_PAYLOAD_BYTES)
+      .saturating_add(slates_vcs::TAIL_SLOT_BYTES);
+    let position_row = raw
+      .saturating_add(1)
+      .saturating_add(size_of::<u64>())
+      .saturating_add(slates_vcs::TAIL_SLOT_BYTES);
+    let objects = bytes(
+      push.len(),
+      object_row.saturating_add(position_row).saturating_mul(2),
+    );
+    let commits = push.commits().values().fold(0_u64, |total, arrived| {
+      let part = arrived
+        .parents
+        .len()
+        .saturating_mul(size_of::<u64>())
+        .saturating_add(rows::COMMIT_PART_BYTES);
+      total.saturating_add(bytes(1, part.saturating_mul(2)))
+    });
+    objects
+      .saturating_add(commits)
+      .saturating_add(self.index.fork_room())
+  }
+
+  /// The push's staged rows when this index would adopt them as they are (A-722 part 3): no row taken in nor position
+  /// given by the repository since its fork was made. A stage this repository outran is given back, for the push to be
+  /// staged again ([`Self::stage`]).
+  fn adoptable_stage(
     &self,
-    fresh: &[(ObjectId, Kind, ContentId, u64)],
-  ) -> Result<(BTreeMap<ObjectId, u64>, u64), StoreRefused> {
-    let mut order: Vec<(Kind, ObjectId)> =
-      fresh.iter().map(|(id, kind, ..)| (*kind, *id)).collect();
-    order.sort_unstable();
-    let mut positions = BTreeMap::new();
-    let mut next = self.next_position;
-    for (_, id) in order {
-      positions.insert(id, next);
-      next = next
-        .checked_add(1)
-        .filter(|next| *next < u64::MAX)
-        .ok_or(StoreRefused::PositionsExhausted)?;
+    store: &mut ContentStore,
+    push: &mut Push,
+  ) -> Result<Option<super::push::Staged>, StoreRefused> {
+    let current = push.staged().is_some_and(|staged| {
+      staged.base == self.next_position && self.index.adoptable(&staged.fork)
+    });
+    let Some(staged) = push.take_staged() else {
+      return Ok(None);
+    };
+    if current {
+      return Ok(Some(staged));
     }
-    Ok((positions, next))
+    staged.fork.release(store)?;
+    Ok(None)
   }
 
   /// For each object a move's walk found new, the green and version that brought it: the first move in order whose D(k)
@@ -1177,43 +1219,6 @@ impl Repository {
       .ok_or(StoreRefused::Missing { id: *id })
   }
 
-  /// The rows of the fresh objects in key order: each object's row, then each position's.
-  fn rows_for(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-    fresh: &[(ObjectId, Kind, ContentId, u64)],
-    positions: &BTreeMap<ObjectId, u64>,
-  ) -> Result<Vec<OwnedRow>, StoreRefused> {
-    let mut owned = Vec::with_capacity(fresh.len().saturating_mul(2));
-    for (id, kind, content, len) in fresh {
-      let row = ObjectRow {
-        kind: *kind,
-        len: *len,
-        position: self.position_of(store, positions, id)?,
-        commit: self.commit_row(store, push, positions, id, *kind)?,
-      };
-      owned.push(OwnedRow {
-        key: rows::object_key(id),
-        contents: vec![*content],
-        payload: rows::encode(&row),
-      });
-    }
-    let mut by_position: Vec<(u64, &ObjectId)> = positions
-      .iter()
-      .map(|(id, position)| (*position, id))
-      .collect();
-    by_position.sort_unstable();
-    for (position, id) in by_position {
-      owned.push(OwnedRow {
-        key: rows::position_key(position),
-        contents: Vec::new(),
-        payload: id.as_bytes().to_vec(),
-      });
-    }
-    Ok(owned)
-  }
-
   /// A fresh commit's part of its row: its tree and parents by position, its date and generation number.
   fn commit_row(
     &self,
@@ -1241,20 +1246,6 @@ impl Repository {
       generation: arrived.generation,
       parents,
     }))
-  }
-
-  /// Inserts the rows as one step.
-  fn insert(&mut self, store: &mut ContentStore, owned: &[OwnedRow]) -> Result<(), StoreRefused> {
-    let rows: Vec<NewRow<'_>> = owned
-      .iter()
-      .map(|row| NewRow {
-        key: &row.key,
-        contents: &row.contents,
-        payload: &row.payload,
-      })
-      .collect();
-    self.index.insert_all(store, &rows)?;
-    Ok(())
   }
 
   /// The versions the moves make, their sets computed and their values not yet put, and the head map after them.
@@ -1575,13 +1566,13 @@ const LANDING_BYTES: usize = size_of::<(u64, (u64, u64, u64))>();
 /// The landing map's runs for a commit's fresh objects (`Repository::landings`): each object's position with the green
 /// and version that brought it, consecutive positions of one pair joined into one run.
 fn landed_runs(
-  fresh: &[(ObjectId, Kind, ContentId, u64)],
+  fresh: &[ObjectId],
   positions: &BTreeMap<ObjectId, u64>,
   (by, otherwise): &BroughtBy,
 ) -> Vec<(u64, (u64, u64, u64))> {
   let mut placed: Vec<(u64, (u64, u64))> = fresh
     .iter()
-    .filter_map(|(id, ..)| {
+    .filter_map(|id| {
       let position = *positions.get(id)?;
       Some((position, by.get(id).copied().unwrap_or(*otherwise)))
     })

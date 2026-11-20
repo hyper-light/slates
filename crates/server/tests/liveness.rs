@@ -206,9 +206,14 @@ fn block_in_a_read(held: Duration) {
 }
 
 /// Runs `block` for three windows as one poll on the shard that is not the control shard, noting when the block began
-/// on the shard, and holds the beat to stopping — a gap of a whole window — no later than a window and three beats after
-/// the block began. The stop is timed from the block's own start, since under load the observation reaches the shard
-/// some time after it is sent, and the beat resumes once the block ends, so only the first window-long gap counts.
+/// on the watchdog's own clock, and holds the beat to stopping no later than the shard's window, a beat and the
+/// watchdog's measured lateness after the block began: A-232 step 5's bound. The look before the one that last saw the
+/// shard move came no later than the block's start, and the verdict's look a window after it, each look up to a beat
+/// and that lateness late, so the last beat comes before then. The stop is the last beat the watchdog wrote before it
+/// withheld one, as its own record says ([`slates_server::Daemon::watchdog_episode`]), timed on its clock: the test's
+/// thread is scheduled too, and on a loaded host its own reading of the beat word ran up to hundreds of milliseconds
+/// late, which a bound of a window and three beats on that reading counted against the watchdog (g227 on Studio-4,
+/// 2026-11-20; on Studio-2 under 28 spinners and `taskpolicy -b`, 5 of 24 runs, before and after A-740 alike).
 fn a_blocked_shard_stops_the_beat(role: &str, name: &str, block: fn(Duration)) {
   a_blocked_shard_stops_the_beat_while(role, name, block, None);
 }
@@ -227,69 +232,49 @@ fn a_blocked_shard_stops_the_beat_while(
   let _serving = beating(&daemon);
   assert!(daemon.inject_memory_stall(memory_stalled));
   let held = WINDOW * 3;
-  let base = Instant::now();
-  let began_us = &*Box::leak(Box::new(AtomicU64::new(0)));
+  let before = daemon.watchdog_episode();
+  let began_ns = &*Box::leak(Box::new(AtomicU64::new(0)));
   let worker = on_shard(&daemon, other, move || {
-    began_us.store(
-      u64::try_from(base.elapsed().as_micros()).unwrap().max(1),
+    began_ns.store(
+      slates_machine::clock::monotonic_ns().max(1),
       Ordering::Release,
     );
     block(held);
   });
-  // Each beat's arrival, by the test's clock since `base`, until a whole window passes without one. The watch lasts
-  // until the block ends, timed from the block's own start: under load the observation reached the shard 1.05 s and
-  // 1.39 s after `base`, and a watch of `held` from `base` ended before the window-long gap could be seen, though the
-  // beat had stopped 0.97 s and 1.00 s after the block began (2 of 10 runs at load 126–147 on adacachy, 2026-11-07).
-  // A block that never began ends the watch once its observation has answered.
-  let mut last = beat(&daemon);
-  let mut last_seen = base.elapsed();
-  let mut stopped_at = None;
   // The held shard's window, read while it is held (A-455): the liveness window unless its host overran that.
   let mut window = WINDOW;
-  loop {
-    let answered = worker.is_finished();
-    let began = began_us.load(Ordering::Acquire);
-    let block_over = began > 0 && base.elapsed() >= Duration::from_micros(began) + held;
-    if block_over || (began == 0 && answered) {
-      break;
-    }
+  while !worker.is_finished() {
     wait(SAMPLE);
-    let now = beat(&daemon);
-    if now != last {
-      last = now;
-      last_seen = base.elapsed();
-    } else if began_us.load(Ordering::Acquire) > 0
-      && base.elapsed().saturating_sub(last_seen) >= WINDOW
-    {
-      stopped_at = Some(last_seen);
-      window = window_of(&daemon, other);
-      break;
+    if began_ns.load(Ordering::Acquire) > 0 {
+      window = window.max(window_of(&daemon, other));
     }
   }
   worker.join().unwrap();
-  let began = Duration::from_micros(began_us.load(Ordering::Acquire));
-  let stopped_at = stopped_at.unwrap_or_else(|| {
-    panic!(
-      "a wedged shard never stopped the beat for a whole window: the block began {began:?} in, the beat last advanced \
-       {last_seen:?} in, the watch ended {:?} in",
-      base.elapsed()
-    )
-  });
-  let after = stopped_at.saturating_sub(began);
+  let began = began_ns.load(Ordering::Acquire);
+  assert!(began > 0, "the block never began on the shard");
+  let episode = daemon
+    .watchdog_episode()
+    .filter(|episode| Some(*episode) != before)
+    .unwrap_or_else(|| {
+      panic!("a shard wedged for {held:?} never had the watchdog withhold the beat")
+    });
+  let after = Duration::from_nanos(episode.last_beat_ns.saturating_sub(began));
+  let late = Duration::from_nanos(episode.late_ns);
   println!(
-    "wedged shard ({name}): the block began {began:?} in, and the beat stopped {after:?} after it, judged by its \
-     {window:?} window"
+    "wedged shard ({name}): the last beat came {after:?} after the block began, judged by its {window:?} window; the \
+     watchdog's looks ran {late:?} late"
   );
   assert!(
-    after <= window + BEAT * 3,
-    "the beat stopped {after:?} after the shard wedged, past its {window:?} window and three beats"
+    after <= window + BEAT + late,
+    "the beat stopped {after:?} after the shard wedged, past its {window:?} window, a beat and the watchdog's {late:?} \
+     lateness"
   );
   daemon.stop();
 }
 
 /// A-228, §4.14. Do: on the shard that is not the control shard, block one poll with no CPU for three windows (a
-/// deadlock, or a host call that does not return). Expect: the beat stops within a window and three beats of the block.
-/// Before A-228 the control shard went on beating, so the anchor never saw the wedged shard.
+/// deadlock, or a host call that does not return). Expect: the beat stops within a window, a beat and the watchdog's
+/// own lateness of the block. Before A-228 the control shard went on beating, so the anchor never saw the wedged shard.
 #[test]
 fn a_wedged_shard_stops_the_beat() {
   common::supervised::run("a_wedged_shard_stops_the_beat_role", "liveness-wedged", 2);
@@ -307,8 +292,8 @@ fn a_wedged_shard_stops_the_beat_role() {
 }
 
 /// A-228, §4.14, the stuck extreme of starved-is-not-stuck. Do: block one poll in a real syscall, a read of a pipe nobody
-/// writes, for three windows. Expect: the beat stops within a window and three beats of the block: the scheduler never
-/// sees the thread runnable, so a shard stuck in the kernel is still found.
+/// writes, for three windows. Expect: the beat stops within a window, a beat and the watchdog's own lateness of the
+/// block: the scheduler never sees the thread runnable, so a shard stuck in the kernel is still found.
 #[test]
 fn a_shard_blocked_in_a_syscall_stops_the_beat() {
   common::supervised::run(
@@ -395,7 +380,7 @@ const MEMORY_HOLD_ROLE: &str =
 /// waiting on memory is (on Linux in the kernel past signals, `D`; elsewhere blocked off the CPU), with the host's
 /// memory reading the watchdog takes put in its place as a stall; watch three windows; then clear the reading and watch
 /// until the beat stops. Expect: the watchdog withholds no look while the host stalls, three windows of a shard that
-/// neither runs nor is runnable; the beat stops within a window and three beats of the clearing. Before, the beat
+/// neither runs nor is runnable; the beat stops within a window, a beat and the watchdog's own lateness of the clearing. Before, the beat
 /// stopped a window into the hold, and a lone daemon at a few hundred megabytes free ended itself (g231, 2026-11-17).
 #[test]
 fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after() {
@@ -428,24 +413,21 @@ fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a
   let before = daemon.watchdog_turns().unwrap();
   let (largest_while_stalled, _) = watch_beat(&daemon, WINDOW * 3);
   let during = daemon.watchdog_turns().unwrap();
+  let episode_before = daemon.watchdog_episode();
   assert!(daemon.inject_memory_stall(Some(false)));
+  // The clearing on the watchdog's own clock, which its record of the episode is timed on (A-232 step 5's bound, as
+  // [`a_blocked_shard_stops_the_beat`] holds a block to it).
+  let cleared_ns = slates_machine::clock::monotonic_ns();
   let cleared = Instant::now();
-  let mut stopped_after = None;
-  let mut last = beat(&daemon);
-  let mut last_seen = cleared.elapsed();
+  let mut episode = None;
   // The held shard's window, read while it is held (A-455): the liveness window unless its host overran that.
   let mut window = WINDOW;
-  while cleared.elapsed() < WINDOW * 3 {
+  while episode.is_none() && cleared.elapsed() < WINDOW * 30 {
     wait(SAMPLE);
-    let now = beat(&daemon);
-    if now != last {
-      last = now;
-      last_seen = cleared.elapsed();
-    } else if cleared.elapsed().saturating_sub(last_seen) >= WINDOW {
-      stopped_after = Some(last_seen);
-      window = window_of(&daemon, other);
-      break;
-    }
+    window = window.max(window_of(&daemon, other));
+    episode = daemon
+      .watchdog_episode()
+      .filter(|episode| Some(*episode) != episode_before);
   }
   let after = daemon.watchdog_turns().unwrap();
   {
@@ -454,29 +436,36 @@ fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a
   }
   worker.join().unwrap();
   let (looks, withheld) = (during.0 - before.0, during.1 - before.1);
+  let episode = episode.unwrap_or_else(|| {
+    panic!(
+      "the watchdog never withheld the beat after the stall cleared ({} withheld looks in {:?})",
+      after.1 - during.1,
+      cleared.elapsed()
+    )
+  });
+  let stopped_after = Duration::from_nanos(episode.last_beat_ns.saturating_sub(cleared_ns));
+  let late = Duration::from_nanos(episode.late_ns);
   println!(
     "a shard waiting on memory: while the host stalled the watchdog looked {looks} times and withheld the beat at \
-     {withheld}, the largest gap {largest_while_stalled:?}; after the clearing it withheld {} more, the beat stopping \
-     {stopped_after:?} in",
-    after.1 - during.1
+     {withheld}, the largest gap {largest_while_stalled:?}; after the clearing the last beat came {stopped_after:?} in, \
+     its looks {late:?} late"
   );
   assert_eq!(
     withheld, 0,
     "the beat was withheld at {withheld} of {looks} looks while the host stalled"
   );
-  let stopped_after = stopped_after.unwrap_or_else(|| {
-    panic!("the beat never stopped for a whole window after the stall cleared (last advanced {last_seen:?} in)")
-  });
   assert!(
-    stopped_after <= window + BEAT * 3,
-    "the beat stopped {stopped_after:?} after the stall cleared, past its {window:?} window and three beats"
+    stopped_after <= window + BEAT + late,
+    "the beat stopped {stopped_after:?} after the stall cleared, past its {window:?} window, a beat and the \
+     watchdog's {late:?} lateness"
   );
   daemon.stop();
 }
 
 /// A-336, §4.14, the stuck extreme where the kernel tells the wait (Linux). Do: with the host's memory reading put in
 /// its place as a stall throughout, block one poll on a channel nobody sends on, a futex sleep (`S`), for three windows.
-/// Expect: the beat stops within a window and three beats of the block: a thread whose own state says it is not waiting
+/// Expect: the beat stops within a window, a beat and the watchdog's own lateness of the block: a thread whose own state
+/// says it is not waiting
 /// on memory is not excused, however the host stalls.
 #[test]
 #[cfg(target_os = "linux")]
@@ -1261,7 +1250,9 @@ fn a_shard_waiting_on_a_starved_thread_keeps_the_beat() {
   while on_cpu.load(Ordering::Acquire) == usize::MAX {
     wait(SAMPLE);
   }
+  let waited_ns = &*Box::leak(Box::new(AtomicU64::new(0)));
   let worker = on_shard(&daemon, other, move || {
+    waited_ns.store(slates_machine::clock::monotonic_ns(), Ordering::Release);
     let _ = shard_thread.set(std::thread::current());
     let _waiting = slates_rt::registry::waiting_on(holder.get().copied().flatten());
     while !released.load(Ordering::Acquire) {
@@ -1334,7 +1325,10 @@ fn a_shard_waiting_on_a_blocked_thread_stops_the_beat_role() {
     wait(SAMPLE);
   }
   let shard_thread: &'static std::sync::OnceLock<std::thread::Thread> = Box::leak(Box::default());
+  // When the shard began to wait, on the watchdog's own clock, written before the thread is named.
+  let waited_ns = &*Box::leak(Box::new(AtomicU64::new(0)));
   let worker = on_shard(&daemon, other, move || {
+    waited_ns.store(slates_machine::clock::monotonic_ns(), Ordering::Release);
     let _ = shard_thread.set(std::thread::current());
     let _waiting = slates_rt::registry::waiting_on(holder.get().copied().flatten());
     while !released.load(Ordering::Acquire) {
@@ -1342,7 +1336,22 @@ fn a_shard_waiting_on_a_blocked_thread_stops_the_beat_role() {
     }
   });
   let before = daemon.watchdog_turns().unwrap();
-  let (largest, _) = watch_beat(&daemon, WINDOW * 3);
+  let episode_before = daemon.watchdog_episode();
+  // Watched from when the shard began to wait, not from the observation's sending, which under load reaches the shard
+  // late; past the patience a shard that never had the beat withheld fails.
+  let mut began = None;
+  let mut episode = None;
+  let started = Instant::now();
+  while episode.is_none() && started.elapsed() < WINDOW * 30 {
+    wait(SAMPLE);
+    if began.is_none() && shard_thread.get().is_some() {
+      began = Some(waited_ns.load(Ordering::Acquire));
+    }
+    episode = daemon
+      .watchdog_episode()
+      .filter(|episode| began.is_some() && Some(*episode) != episode_before);
+  }
+  let window = window_of(&daemon, other);
   let after = daemon.watchdog_turns().unwrap();
   released.store(true, Ordering::Release);
   for thread in [parked.get(), shard_thread.get()].into_iter().flatten() {
@@ -1351,14 +1360,22 @@ fn a_shard_waiting_on_a_blocked_thread_stops_the_beat_role() {
   holder_thread.join().unwrap();
   worker.join().unwrap();
   let (looks, withheld) = (after.0 - before.0, after.1 - before.1);
+  let episode = episode.unwrap_or_else(|| {
+    panic!(
+      "a shard blocked on a blocked thread was not found stuck: withheld at {withheld} of {looks} looks in {:?}",
+      started.elapsed()
+    )
+  });
+  let since = Duration::from_nanos(episode.last_beat_ns.saturating_sub(began.unwrap_or(0)));
+  let late = Duration::from_nanos(episode.late_ns);
   println!(
-    "a shard waiting on a blocked thread: the watchdog looked {looks} times and withheld the beat at {withheld}; \
-     largest beat gap {largest:?}"
+    "a shard waiting on a blocked thread: the watchdog looked {looks} times and withheld the beat at {withheld}; the \
+     last beat came {since:?} after the wait began; its looks ran {late:?} late"
   );
   assert!(
-    withheld > 0 && largest >= WINDOW,
-    "a shard blocked on a blocked thread was not found stuck: withheld at {withheld} of {looks} looks, the largest gap \
-     {largest:?}"
+    since <= window + BEAT + late,
+    "the beat stopped {since:?} after the shard began to wait, past its {window:?} window, a beat and the watchdog's \
+     {late:?} lateness"
   );
   daemon.stop();
 }

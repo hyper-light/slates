@@ -56,7 +56,7 @@ use std::borrow::Cow;
 
 use slates_vcs::{ContentId, ContentStore};
 
-use super::getbundle::{Logged, Store};
+use super::getbundle::{Linked, Logged, Store};
 use super::{Refusal, Repository, Rev};
 use crate::filerev::MARKER;
 use crate::index::{ChangesetRow, HgIndex, Log, NONE};
@@ -409,6 +409,33 @@ impl Store for Indexed<'_> {
         .into_iter()
         .flat_map(|markers| markers.iter())
     })
+  }
+
+  fn manifest_linked(&self, position: u64) -> Option<Linked> {
+    let rev = u32::try_from(position).ok()?;
+    let row = self.index.revision(self.store, Log::Manifest, rev)?;
+    Some(Linked {
+      node: row.node,
+      link: self.served_rev(row.link),
+    })
+  }
+
+  fn file_linked_from(&self, (path, position): (&[u8], u64)) -> Option<(Vec<u8>, u64, Linked)> {
+    let rev = u32::try_from(position).unwrap_or(u32::MAX);
+    let (found, number, row) = self.index.file_revision_from(self.store, (path, rev))?;
+    let linked = Linked {
+      node: row.node,
+      link: self.served_rev(row.link),
+    };
+    Some((found, u64::from(number), linked))
+  }
+
+  fn holds_manifest(&self, node: &Node) -> bool {
+    self.index.rev(self.store, Log::Manifest, node).is_some()
+  }
+
+  fn serves_every_changeset(&self) -> bool {
+    self.count() == self.index.len(self.store, Log::Changelog)
   }
 
   /// A stream is served unless a secret root the changelog holds makes a changeset secret (7.2's

@@ -52,6 +52,13 @@ Conformance 3 VerifiedSourceExport
 Conformance 4 SimulatedGuestDriver
 Conformance 5 LiveGuestWorkloads
 Conformance 6 SimulatedShardsDevice
+CopyCase 0 Root
+CopyCase 1 PastHead
+CopyCase 2 SourceEmpty
+CopyCase 3 VersionFolded
+CopyCase 4 OutsideNodeChanged
+CopyCase 5 ChangedSourceLink
+CopyCase 6 LinkAcrossCopy
 CredentialMaterial 0 SshKey
 CredentialMaterial 1 HttpToken
 DatabaseRefusal 0 Corrupt
@@ -294,6 +301,7 @@ Refusal 75 BaseUnavailableWin32
 Refusal 76 MessageRequired
 Refusal 77 IdentityRequired
 Refusal 78 ImportRefused
+Refusal 79 CopyRefused
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -374,6 +382,7 @@ ReplyBody 76 IdentitiesSet
 ReplyBody 77 RepositoryImported
 ReplyBody 78 DumpImported
 ReplyBody 79 RepositoryPolicy
+ReplyBody 80 DumpExported
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -466,6 +475,7 @@ RequestBody 88 RevokeCredential
 RequestBody 89 SetIdentities
 RequestBody 90 ImportRepository
 RequestBody 91 DescribeRepositoryPolicy
+RequestBody 92 ExportDump
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
@@ -565,6 +575,7 @@ WorkOp 6 Link
 WorkOp 7 SetXattr
 WorkOp 8 RemoveXattr
 WorkOp 9 Mknod
+WorkOp 10 Copy
 WriteAct 0 Merge
 WriteAct 1 Land
 WriteMode 0 Bypass

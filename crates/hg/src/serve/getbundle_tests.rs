@@ -15,7 +15,7 @@ use super::super::tests::{
   Changeset, History, ancestors, at, captured, hex, history, joined, node_for, room,
 };
 use super::super::{Refusal, Repository, Rev};
-use super::{Asked, Logged, Store, changegroup, getbundle};
+use super::{Asked, Linked as Walked, Logged, Store, changegroup, getbundle};
 use crate::bundle2::{Bundle2, Param, Part};
 use crate::capabilities;
 use crate::changegroup::{Changegroup, Revision, Version};
@@ -63,6 +63,9 @@ pub(crate) struct Served {
   manifests: Log,
   files: HashMap<Vec<u8>, Log>,
   markers: Vec<Vec<u8>>,
+  /// Whether its file revisions' texts are lost while their logs still list them, as an index whose content store lost
+  /// them would answer.
+  files_lost: bool,
 }
 
 impl Repository for Served {
@@ -128,6 +131,7 @@ impl Store for Served {
         .files
         .get(path)
         .and_then(|log| log.get(node))
+        .filter(|_| !self.files_lost)
         .map(Kept::logged),
     )
   }
@@ -138,6 +142,48 @@ impl Store for Served {
         .into_iter()
         .flat_map(|markers| markers.iter())
     })
+  }
+
+  fn holds_manifest(&self, node: &Node) -> bool {
+    self.manifests.contains_key(node)
+  }
+
+  fn serves_every_changeset(&self) -> bool {
+    true
+  }
+
+  fn manifest_linked(&self, position: u64) -> Option<Walked> {
+    let (node, kept) = self
+      .manifests
+      .iter()
+      .find(|(_, kept)| kept.position == position)?;
+    Some(Walked {
+      node: *node,
+      link: self.history.rev(&kept.link),
+    })
+  }
+
+  fn file_linked_from(&self, (path, position): (&[u8], u64)) -> Option<(Vec<u8>, u64, Walked)> {
+    self
+      .files
+      .iter()
+      .flat_map(|(name, log)| {
+        log
+          .iter()
+          .map(move |(node, kept)| ((name.as_slice(), kept.position), *node, kept.link))
+      })
+      .filter(|((name, at), _, _)| (*name, *at) >= (path, position))
+      .min_by(|left, right| left.0.cmp(&right.0))
+      .map(|((name, at), node, link)| {
+        (
+          name.to_vec(),
+          at,
+          Walked {
+            node,
+            link: self.history.rev(&link),
+          },
+        )
+      })
   }
 }
 
@@ -1070,6 +1116,41 @@ fn packed(
   }
 }
 
+/// What 7.2's packer sends of the manifest and file logs on its link-revision fast path (`fastpathlinkrev`, which it
+/// takes for a fetch of every head; A-745 takes it where the fetch leaves no changeset neither sent nor held), stated
+/// literally: every manifest whose log links it to a missing changeset, in the log's order; then each file log, by
+/// path, every revision its log links to a missing changeset, in the log's order; each linked to its log's link.
+fn fast_packed(served: &Served, missing: &[Rev]) -> Picked {
+  let sent = |kept: &Kept| {
+    served
+      .history
+      .rev(&kept.link)
+      .is_some_and(|rev| missing.contains(&rev))
+  };
+  let in_order = |log: &Log| {
+    let mut linked: Vec<(u64, Node, Node)> = log
+      .iter()
+      .filter(|(_, kept)| sent(kept))
+      .map(|(node, kept)| (kept.position, *node, kept.link))
+      .collect();
+    linked.sort_unstable();
+    linked
+      .into_iter()
+      .map(|(_, node, link)| (node, link))
+      .collect::<Linked>()
+  };
+  let mut paths: Vec<&Vec<u8>> = served.files.keys().collect();
+  paths.sort();
+  Picked {
+    manifests: in_order(&served.manifests),
+    files: paths
+      .into_iter()
+      .map(|path| (path.clone(), in_order(&served.files[path])))
+      .filter(|(_, sent)| !sent.is_empty())
+      .collect(),
+  }
+}
+
 /// What this module's changegroup carries of the manifest and file logs.
 fn picked(changegroup: &Changegroup<'_>) -> Picked {
   let pairs = |revisions: &[Revision<'_>]| {
@@ -1131,11 +1212,16 @@ fn both_packings(
   let outgoing = Outgoing {
     heads,
     common: common.into_iter().collect(),
-    missing: missing.clone(),
+    missing: missing.iter().map(|rev| *rev..rev + 1).collect(),
   };
   let ours = changegroup(&served, &outgoing, Version::V03, &mut room()).unwrap();
   let ours = picked(&Changegroup::decode(&ours, Version::V03, &mut room()).unwrap());
-  let oracle = packed(&served, &stored, &missing, &held);
+  let every = held.len() + missing.len() == usize::try_from(count).unwrap();
+  let oracle = if every {
+    fast_packed(&served, &missing)
+  } else {
+    packed(&served, &stored, &missing, &held)
+  };
   (
     lacking(ours, &served, &held),
     lacking(oracle, &served, &held),
@@ -1195,7 +1281,7 @@ fn mercurials_packer_resends_a_held_revision_this_module_leaves_out() {
   let outgoing = Outgoing {
     heads: vec![4],
     common: vec![2],
-    missing: missing.clone(),
+    missing: missing.iter().map(|rev| *rev..rev + 1).collect(),
   };
   let ours = changegroup(&served, &outgoing, Version::V03, &mut room()).unwrap();
   let ours = picked(&Changegroup::decode(&ours, Version::V03, &mut room()).unwrap());
@@ -1445,7 +1531,7 @@ fn a_store_that_lost_a_text_is_refused_by_kind() {
     store("a manifest revision")
   );
   assert_eq!(
-    lost(|served| served.files.clear()),
+    lost(|served| served.files_lost = true),
     store("a file revision")
   );
 }
@@ -1475,11 +1561,12 @@ fn a_short_admission_is_refused_past_it() {
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
-  /// AC-HG.2 (model), A-619: do fill generated histories with files (branches editing one path alike, merges taking a
-  /// side's revision unlisted, empty changesets reusing their parent's manifest, each manifest's delta stored against
-  /// a parent or whole) and pack the changesets missing between generated heads and common revisions. Expect every
-  /// manifest as 7.2's packer, stated literally, sends it, and every file revision the client lacks too, with its
-  /// link, in its log's order.
+  /// AC-HG.2 (model), A-619, A-745: do fill generated histories with files (branches editing one path alike, merges
+  /// taking a side's revision unlisted, empty changesets reusing their parent's manifest, each manifest's delta stored
+  /// against a parent or whole) and pack the changesets missing between generated heads and common revisions. Expect
+  /// every manifest as 7.2's packer, stated literally, sends it, and every file revision the client lacks too, with its
+  /// link, in its log's order: its link-revision fast path where the fetch leaves no changeset neither sent nor held,
+  /// its slow path otherwise.
   #[test]
   fn the_changegroup_carries_what_mercurials_packer_carries(
     history in history(),
@@ -1542,4 +1629,58 @@ proptest! {
       prop_assert!(Bundle2::decode(&out, &mut room()).is_ok());
     }
   }
+}
+
+/// The least room in `0..high` that `takes` takes: halving, `takes` assumed to hold from some room on.
+fn least_room(high: u64, takes: impl Fn(u64) -> bool) -> u64 {
+  let (mut low, mut high) = (0_u64, high);
+  while high - low > 1 {
+    let middle = low + (high - low) / 2;
+    if takes(middle) {
+      high = middle;
+    } else {
+      low = middle;
+    }
+  }
+  high
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rules 1 and 2). Do: clone the captured session's repository whole within one
+/// room, then a slice at a time (`Answering`), its beginning and each step given a room of its own, as a server lends
+/// each turn its room; find the least room each way. Expect the slices to need less room than the whole answer, the
+/// answer taken more than two steps, and the slices' bytes the whole answer's, byte for byte.
+#[test]
+fn an_answer_is_made_a_slice_at_a_time_each_slice_within_its_own_room() {
+  let served = cloned();
+  let blob = caps(CLIENT_BLOB);
+  let asked = Asked {
+    bundlecaps: &blob,
+    phases: Some(&b"1"[..]),
+    ..Asked::default()
+  };
+  let sliced = |room: u64| -> Option<(Vec<u8>, u64)> {
+    let mut answering = super::Answering::begin(&served, &asked, &mut Admission::new(room)).ok()?;
+    let (mut out, mut steps) = (Vec::new(), 1_u64);
+    while answering
+      .step(&served, &mut Admission::new(room), &mut out)
+      .ok()?
+    {
+      steps += 1;
+    }
+    Some((out, steps))
+  };
+  let high = 1 << 22;
+  let whole_room = least_room(high, |room| {
+    getbundle(&served, &asked, &mut Admission::new(room), &mut Vec::new()).is_ok()
+  });
+  let slice_room = least_room(high, |room| sliced(room).is_some());
+  assert!(
+    slice_room < whole_room,
+    "a slice took {slice_room}, the whole answer {whole_room}"
+  );
+  let mut whole = Vec::new();
+  getbundle(&served, &asked, &mut room(), &mut whole).unwrap();
+  let (out, steps) = sliced(slice_room).unwrap();
+  assert!(steps > 2, "{steps} steps");
+  assert_eq!(out, whole);
 }

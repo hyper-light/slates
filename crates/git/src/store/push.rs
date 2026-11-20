@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
-use slates_vcs::{AdmitRefused, Admitted, ContentRefused, ContentStore, Naming, Quarantine};
+use slates_vcs::{AdmitRefused, Admitted, ContentRefused, ContentStore, Index, Naming, Quarantine};
 
 use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
@@ -81,6 +81,20 @@ pub(crate) struct Arrived {
   pub(crate) generation: u64,
 }
 
+/// A sealed push's rows, written before it lands in its own fork of its repository's index (A-722 part 3;
+/// [`crate::store::Repository::stage`]): each object new to the repository given a position after the repository's
+/// next when the fork was made, tentatively, and its rows written into the fork, sealed into tables. The commit that
+/// lands the push adopts the fork whole ([`slates_vcs::Index::adopt`]).
+#[derive(Debug)]
+pub(crate) struct Staged {
+  /// The fork the rows are written into.
+  pub(crate) fork: Index,
+  /// The position each staged object was given, by id.
+  pub(crate) positions: BTreeMap<ObjectId, u64>,
+  /// The repository's next position when the fork was made, which the positions follow.
+  pub(crate) base: u64,
+}
+
 /// A push's objects (module docs).
 #[derive(Debug)]
 pub struct Push {
@@ -90,6 +104,8 @@ pub struct Push {
   sealed: bool,
   /// The deepest delta chain the push's source carried.
   deepest: u64,
+  /// The rows staged once the push was sealed (A-722 part 3).
+  staged: Option<Staged>,
 }
 
 impl Push {
@@ -101,6 +117,7 @@ impl Push {
       commits: BTreeMap::new(),
       sealed: false,
       deepest: 0,
+      staged: None,
     }
   }
 
@@ -243,15 +260,43 @@ impl Push {
     self.quarantine.objects()
   }
 
+  /// The first object held whose id is after `after` (the first for none), as [`Push::held`] answers it (A-722 part 4).
+  pub(crate) fn held_after(
+    &self,
+    after: Option<&[u8]>,
+  ) -> Option<(&[u8], u8, slates_vcs::ContentId, u64)> {
+    self.quarantine.object_after(after)
+  }
+
   /// Gives back the push's holds once its objects' rows hold them, leaving the push empty.
   pub(crate) fn release_holds(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     self.commits.clear();
     self.quarantine.abandon(store)
   }
 
-  /// Gives back every hold the push took, leaving nothing behind.
+  /// The rows staged, if the push was staged.
+  pub(crate) fn staged(&self) -> Option<&Staged> {
+    self.staged.as_ref()
+  }
+
+  /// Keeps `staged` as the push's rows (A-722 part 3).
+  pub(crate) fn set_staged(&mut self, staged: Staged) {
+    self.staged = Some(staged);
+  }
+
+  /// The rows staged, taken: a landing adopts them or gives them back.
+  pub(crate) fn take_staged(&mut self) -> Option<Staged> {
+    self.staged.take()
+  }
+
+  /// Gives back every hold the push took, its staged rows' included, leaving nothing behind.
   pub fn abandon(mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
-    self.quarantine.abandon(store)
+    let staged = self.staged.take().map(|staged| staged.fork.release(store));
+    let quarantine = self.quarantine.abandon(store);
+    match staged {
+      Some(Err(slates_vcs::IndexRefused::Content(refused))) => quarantine.and(Err(refused)),
+      _ => quarantine,
+    }
   }
 }
 
