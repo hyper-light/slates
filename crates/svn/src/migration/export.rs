@@ -44,7 +44,8 @@ use crate::svndiff::{Compression, Encoder, HEADER_LEN, Version, WINDOW_LIMIT, Wi
 /// What one call of [`Exporter::export`] wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exporting {
-  /// The records of one revision were appended, the stream's version and UUID records before the range's first.
+  /// A part of this revision's records was appended: its revision record (the stream's version and UUID records
+  /// before the range's first), one changed path's records, or the deletions its open directories wrote as they closed.
   Wrote(Revision),
   /// The range is written; nothing was appended.
   Done,
@@ -65,6 +66,22 @@ pub struct Exporter {
   started: bool,
   /// The refusal the export met, once it met one: every later call answers it.
   refused: Option<MigrationRefusal>,
+  /// The revision being written, between its calls; none before its revision record.
+  drive: Option<Pending>,
+}
+
+/// A revision's replay between calls of [`Exporter::export`]: its changed paths in the path driver's order, how many
+/// are written, and the drive's open directories and last path.
+#[derive(Clone, Debug)]
+struct Pending {
+  /// The changed paths, in `svn_path_compare_paths` order.
+  rows: Vec<ChangedPath>,
+  /// How many are written.
+  at: usize,
+  /// The directories open, the root first.
+  stack: Vec<Directory>,
+  /// The last path visited, or its directory.
+  last: Option<String>,
 }
 
 impl Exporter {
@@ -94,15 +111,17 @@ impl Exporter {
       last,
       started: false,
       refused: None,
+      drive: None,
     })
   }
 
-  /// Appends the next revision's records to `out`, the stream's version and UUID records before the first; a revision
-  /// is appended whole or not at all.
+  /// Appends the next part of the range's records to `out` ([`Exporting::Wrote`]), so one call's work is one changed
+  /// path's, never a whole revision's; the stream's version and UUID records before the first revision's.
   ///
   /// # Errors
   /// [`MigrationRefusal::Corrupt`] for records that name what the repository does not hold, and the writer's refusal
-  /// of anything it cannot write; every later call answers the same refusal.
+  /// of anything it cannot write; every later call answers the same refusal, and what the refused call appended is
+  /// no part of a stream.
   pub fn export(
     &mut self,
     repository: &Repository,
@@ -114,27 +133,36 @@ impl Exporter {
     let Some(revision) = self.next else {
       return Ok(Exporting::Done);
     };
-    let mut written = Vec::new();
-    if let Err(refusal) = self.write(repository, revision, &mut written) {
-      self.refused = Some(refusal.clone());
-      return Err(refusal);
-    }
-    out.extend_from_slice(&written);
-    self.next = if revision < self.last {
-      revision.checked_add(1)
-    } else {
-      None
+    let ended = match self.drive.is_some() {
+      true => self.step(repository, revision, out),
+      false => self.begin(repository, revision, out),
     };
-    Ok(Exporting::Wrote(revision))
+    match ended {
+      Err(refusal) => {
+        self.refused = Some(refusal.clone());
+        Err(refusal)
+      }
+      Ok(false) => Ok(Exporting::Wrote(revision)),
+      Ok(true) => {
+        self.drive = None;
+        self.next = if revision < self.last {
+          revision.checked_add(1)
+        } else {
+          None
+        };
+        Ok(Exporting::Wrote(revision))
+      }
+    }
   }
 
-  /// Writes `revision`'s records, the stream's first records before the range's first revision.
-  fn write(
+  /// Writes `revision`'s record and its properties, the stream's first records before the range's first revision, and
+  /// takes its changed paths in the path driver's order; whether the revision is written (revision 0 has no changes).
+  fn begin(
     &mut self,
     repository: &Repository,
     revision: Revision,
     out: &mut Vec<u8>,
-  ) -> Result<(), MigrationRefusal> {
+  ) -> Result<bool, MigrationRefusal> {
     let mut stream = Stream {
       writer: &mut self.writer,
       out,
@@ -153,32 +181,56 @@ impl Exporter {
     }))?;
     stream.properties(properties)?;
     if revision == 0 {
-      return Ok(());
+      return Ok(true);
     }
-    let mut rows: Vec<&ChangedPath> = repository
+    let mut rows: Vec<ChangedPath> = repository
       .index()
       .changes(revision)
       .map_err(MigrationRefusal::Index)?
-      .iter()
-      .collect();
+      .to_vec();
     rows.sort_by(|first, second| {
       compare_paths(
         relative(&first.path).as_bytes(),
         relative(&second.path).as_bytes(),
       )
     });
+    self.drive = Some(Pending {
+      rows,
+      at: 0,
+      stack: Vec::new(),
+      last: None,
+    });
+    Ok(false)
+  }
+
+  /// Writes the pending revision's next changed path through the path driver, or, past its last, closes the
+  /// directories still open; whether the revision is written.
+  fn step(
+    &mut self,
+    repository: &Repository,
+    revision: Revision,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, MigrationRefusal> {
+    let deltas = deltas_room(self.format)?;
+    let Exporter { writer, drive, .. } = self;
+    let pending = drive.as_mut().ok_or(MigrationRefusal::Corrupt)?;
     let mut drive = Drive {
       repository,
       revision,
-      deltas: deltas_room(self.format)?,
-      stream,
-      stack: Vec::new(),
-      last: None,
+      deltas,
+      stream: Stream { writer, out },
+      stack: std::mem::take(&mut pending.stack),
+      last: pending.last.take(),
     };
-    for row in rows {
-      drive.step(row)?;
-    }
-    drive.finish()
+    let Some(row) = pending.rows.get(pending.at) else {
+      drive.finish()?;
+      return Ok(true);
+    };
+    drive.step(row)?;
+    pending.at = pending.at.saturating_add(1);
+    pending.stack = drive.stack;
+    pending.last = drive.last;
+    Ok(false)
   }
 }
 
@@ -222,6 +274,7 @@ fn properties_len(properties: &Properties) -> Result<u64, MigrationRefusal> {
 type Place = (String, Revision);
 
 /// A directory the drive has open (`dump.c`'s `dir_baton`).
+#[derive(Clone, Debug)]
 struct Directory {
   /// What it is compared with when not itself in the revision before: its copy source, or the place beneath a
   /// directory copied in this revision.
