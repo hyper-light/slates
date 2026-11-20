@@ -525,6 +525,7 @@ fn t_a655_the_records_are_made_again_from_the_log() {
       .copied()
       .unwrap_or(0);
     crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
     assert_eq!(state.vcs_stores.unrecovered(svn), None);
     assert_eq!(whole(state, (svn, green)), live);
     let count = u64::try_from(logged(state, svn).len()).unwrap();
@@ -746,6 +747,7 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
       .map(|bytes| matches!(Record::decode(bytes), Ok(Record::Locks(_))))
       .collect();
     crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
     (landed, held, kinds.last().copied(), owner_of(state))
   });
   let alice = Some("alice".to_owned());

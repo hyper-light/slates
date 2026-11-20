@@ -4900,6 +4900,7 @@ async fn init_shard(
     fenced_greens: std::collections::BTreeMap::new(),
     vcs_stores: crate::vcs_store::VcsStores::default(),
     vcs_usage: slates_vcs::Ledger::new(config.clients_per_shard),
+    #[cfg(unix)]
     hook_times: crate::vcs_hooks::HookTimesTable::default(),
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),

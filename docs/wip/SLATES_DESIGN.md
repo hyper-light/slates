@@ -4596,7 +4596,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
   write the share it was given. It is read in the SETXATTR form the stream's INIT kept, the extended one where the
-  guest's kernel kept `FUSE_SETXATTR_EXT`, as the dispatch reads every other SETXATTR (A-587). It is taken from the
+  guest's kernel kept `FUSE_SETXATTR_EXT`, as the dispatch reads every other SETXATTR (A-587), each request's form read
+  from its own bytes, since one sized before INIT's reply arrived is short whatever INIT kept (A-741). It is taken from the
   guest's root on the stream's root alone, and refused otherwise
   as Shards' own server refuses it: `EPERM` from any other caller, `EINVAL` on any other node or for a value that is
   no `UID:GID`. From then on the guest is shown the owner the volume keeps for the stream's root as the run's owner,
@@ -14593,6 +14594,8 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 Status (A-729 part 1, the index's storage): a manifest is kept as its delta against the one before while its chain's
 delta bytes stay within its text's length (derived, as 7.2's `deltas.py` bounds a delta), else whole; every reader
 rebuilds it through `HgIndex::revision_text`.
+Status (A-729 part 2): a push's record is its changegroup as it arrived (`SHGR` version 2), replayed through the same
+intake; the landing appends deltas, never texts. Imports' and made changesets' records are still version 1 (texts).
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
 working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
 push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
@@ -54832,6 +54835,21 @@ Applied in the same change to:
   `vcs_store::homes::tests` 6 of 6 (region offers idempotent; a lone node's healer moves nothing; the region put
   acknowledged only after its image) and `fleet::` 33 of 33. A region home answers `Kept` only once A-727 a3 drives its
   image barrier, so until then the healer offers and keeps its own copy (no release without every home's `Kept`).
+- **Piece 9b, the cut in the record and look-ups routed by it (2026-11-20).** `RepositoryRecord::index_bits` (appended,
+  zero at creation, the whole index on the owner) moves one bit at a time by `Op::RepositoryIndexCut` (appended, `Op`
+  102), its guard refusing any other step or a cut past 32 bits `DbError::IndexCutStep { current }` (the wire's
+  `DatabaseRefusal::IndexCutStep`, 13); a partition's snapshot carries it. `crate::vcs_share::place::index_partition`
+  names the partition holding an object's index row from the record and the id alone (the owner's at a cut of zero,
+  else the range's by `range_partition`), and `index_cut_step` moves a cut one bit toward `bits_for` of the index's
+  bytes. Nothing moves a live cut yet: until a push's rows are routed to their ranges (with record v3, after A-727 a3),
+  a cut above zero would send look-ups to partitions holding no rows. Tests: `repository::tests::a_repositorys_index_cut_moves_one_bit_at_a_time_and_is_kept_by_its_snapshot`
+  and `place::tests::a_repositorys_index_rows_route_by_its_cut_and_the_cut_steps_one_bit_at_a_time`; slates-db `--lib`
+  180 of 180, `--test model` 26 of 26, both `wire_order` goldens; slates-server `repository:: takeover:: vcs_ssh::
+  vcs_http:: git_protect:: lfs:: vcs_policy:: vcs_share::` 236 of 236.
+- **Piece 7, with a hot repository's large packs (2026-11-20).** BENCHMARKS.md, "A hot repository pushing large
+  packs": with v1.5.0's 9.8 MB packs in the mix, capped at 5 or 3 pushes to one repository, the small repositories' p99
+  is 3.07 and 3.63 times their fair share (within it without large packs); the wait is daemon-wide, to be profiled. Ten
+  such pushes to one repository end the daemon (A-722's proof must hold at ten).
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55531,3 +55549,60 @@ control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, 
 - **Owed.** `Record::revision_bytes` (Subversion) and the register entry's decode-after-encode check still make
   revision-sized temporaries; the svn commit still clones its entry parts for a retry at the chain's cap; an embedding
   host must install the allocator itself; the anchor content object's 581 MiB is not yet split by range.
+
+### A-732's sibling for git and Subversion — A store made again from the log replays a record a turn, lent to nothing until it is whole (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** `vcs_store::rebuild` made a git or Subversion repository's store again in one step, every record replayed
+  and every map made at once; a large repository's rebuild held its shard past the watchdog's window, which
+  crash-looped the daemon when a recovery met it, as Mercurial's import did (A-732, whose part 3 sliced Mercurial's).
+- **Change.** `rebuild` of a git or Subversion repository (`rebuild_sliced`): the store freed and made empty, marked
+  rebuilding with a generation (`VcsStores::rebuild_turns`), and a task replays its records a record a turn
+  (`rebuild_turn`, a yield between); while it runs the store is lent to nothing (`VcsStores::git`, `git_ref`, `store`,
+  `subversion`, `subversion_records` answer none), and a rebuild started again ends the one before. At its end the store
+  is lent again and each git green's map is made again in slices by its build (`paths::whole_build::start_remade`,
+  counted `REMADE`), whose end makes any commit owed; submits to it are parked meanwhile. `rebuild_whole` stays for the
+  tests that read a store made at once.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::tests::
+  t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn` (red first: the store made whole at once and lent;
+  green: rebuilding and lent to nothing, its five records replayed one a turn, then lent again and its map made again).
+  The tests that make a store again drive its turns and builds to their end (`settle_rebuild`). `cargo test --locked -p
+  slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http:: vcs_ssh:: vcs_svn lfs:: work_home:: identities::
+  takeover:: --test-threads=4` 307 of 309, the two others failing alike without this change (`vcs_store::homes`' and
+  `vcs_http::daemon_edge`'s long history, each flaky alone, reported); fmt clean.
+- **Owed.** One git record (a large push's pack) is still one turn; a successor's rebuild (`make_whole`) is one step.
+
+### A-741 — A SETXATTR's form is the request's own: one sized before INIT was answered is short on a connection that kept the extended form (bug, 2026-11-20, w-k90-vendor, kiln goal 90; found by use: kiln's macOS microVM g266 drive refused a run's every write `EACCES`, intermittently; amends A-378 and A-587; §4.6)
+- **Why.** Linux sizes a `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c`
+  `fuse_setxattr`, lines 31-32 at master on 2026-11-20, sha256 89203290559bd37a:
+  `fc->setxattr_ext ? sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE`) and holds the request until `INIT`'s reply is in
+  (`fs/fuse/dev.c` `fuse_block_alloc`, lines 88-124, sha256 29cc467f872b1ef0; `fc->setxattr_ext` set in
+  `fs/fuse/inode.c` `process_init_reply`, line 1398). Shards' init sets its owner word (A-281) as it mounts the share,
+  often before its kernel took that reply, so the word travels in the short form on a connection that kept the
+  extended one. A Shards stream read it in the extended form alone (A-587), missed its name, and handed it to the
+  dispatch, which refused it `EOPNOTSUPP`; the run (uid 200000) was then shown its share owned by the host and refused
+  every create, append and removal `EACCES`. Recorded on the Mac Studio (kiln main 28ea7df79's vendored Slates, a
+  diagnostic of each stream request): `Init` kept `FUSE_SETXATTR_EXT`; then `SetXattr` node 1 uid 0, its body
+  `0d000000 00000000 "trusted.shards.owner\0" "200000:200000"`, errno 95; no owner word taken.
+- **Change.** `abi::setxattr_head(body, negotiated)`: on a connection that kept the extended form, the extended head is
+  read where the request's second 8 bytes are a known setter's flag (`FUSE_SETXATTR_ACL_KILL_SGID`) and a zero pad, the
+  short head otherwise: a name begins with its namespace, never a flag word and a zero word. The bridge's `SETXATTR`
+  and the stream's owner word both read through it; a body whose name ends nowhere stays `EIO`.
+- **Tests** (macOS arm64, Mac Studio, local, own target, 2026-11-20). `slates-bridge-fuse`
+  `shards_fs::tests::a741_an_owner_word_sized_before_init_was_answered_is_taken_on_a_stream_that_kept_the_extended_form`
+  (the recorded short word on an extended stream: the run named; red: left `None`) and `tests/shards_fs.rs`
+  `a741_a_setxattr_sized_before_init_was_answered_is_served_on_a_route_that_kept_the_extended_form` (a `user.` name
+  set short on an extended guest route reads back as set; red: errno 95). `--lib -- shards_fs:: bridge:: abi:: init::`
+  9 of 9, `--test shards_fs` 11 of 11 (A-378's ACL test among them), `slates-server --lib -- shards::` 11 of 11; fmt
+  clean. By use: kiln's macOS microVM g266 drive (`SLATES_E2E=1 VM_E2E=1 slates_e2e microvm::g266`, kiln main
+  28ea7df79 on the Mac Studio): without the change it failed on its first run three times running (every write
+  `EACCES`); with it vendored, six runs in a row passed (439, 355, 271, 303, 171 and 172 s).
+- **Owed.** kiln's re-vendor; the same race on slates' own FUSE mounts is closed by the same reader (a host kernel's
+  connection keeps no extended form, so its requests were never misread).
+
+- **A successor's rebuild too** (main's ruling, the same day): `takeover::rebuild_repository` makes the adopted
+  repository's store through `vcs_store::rebuild` (Mercurial's task, or this one), not `make_whole` in one step, since a
+  large repository's adoption would spin the successor's shard past the watchdog, the crash loop on another path. Its
+  test (`vcs_store::paths::tests::t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map`) asserts the
+  store rebuilding and lent to nothing after the takeover's step, then its map made by driving the turns and builds;
+  `cargo test --locked -p slates-server --lib -- takeover:: fleet::state_log_tests vcs_store:: repository:: git_push::
+  vcs_svn lfs:: --test-threads=4` 168 of 168.
+- **Owed.** One git record (a large push's pack) is still one turn (w-git, through the sliced intake).

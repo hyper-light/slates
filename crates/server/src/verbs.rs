@@ -78,7 +78,7 @@ pub(crate) fn to_db_principal(principal: &slates_ipc::protocol::Principal) -> Pr
 
 /// A catalog principal as the wire names it (A-237), host included; `None` for one a client never names (a SID, a
 /// certificate).
-fn to_wire_principal(principal: &Principal) -> Option<slates_ipc::protocol::Principal> {
+pub(crate) fn to_wire_principal(principal: &Principal) -> Option<slates_ipc::protocol::Principal> {
   match principal {
     Principal::Uid { host, uid } => Some(slates_ipc::protocol::Principal::Uid {
       host: host.0,
@@ -2648,7 +2648,8 @@ pub(crate) fn route_gated(
     | RequestBody::BindBranch { repository, .. }
     | RequestBody::RetireBranch { repository, .. }
     | RequestBody::SetRepositoryPolicy { repository, .. }
-    | RequestBody::ImportRepository { repository, .. } => {
+    | RequestBody::ImportRepository { repository, .. }
+    | RequestBody::DescribeRepositoryPolicy { repository } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -5223,6 +5224,10 @@ fn dispatch_inner(
     // (A-678, A-652 part 3).
     RequestBody::ImportRepository { repository, path } => {
       crate::repository::import::import_repository(state, principal, (&repository, &path))
+    }
+    // A repository's policy read whole by its owner (A-622; `slates repository policy`).
+    RequestBody::DescribeRepositoryPolicy { repository } => {
+      crate::repository::describe_policy(state, principal, &repository)
     }
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {
@@ -9343,6 +9348,13 @@ impl SubmitPolicy {
   }
 }
 
+/// What a submit carries besides its work: its evidence, its signature and its authorship.
+type SubmitCarried = (
+  Vec<[u8; 32]>,
+  Option<Vec<u8>>,
+  slates_ipc::protocol::Authorship,
+);
+
 /// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
 /// declared operations into the canonical document, seal the post-state, hash the identity, and run
 /// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
@@ -9353,11 +9365,7 @@ fn submit(
   state: &mut ShardState,
   principal: &Principal,
   work: VolumeId,
-  (evidence, signature, authorship): (
-    Vec<[u8; 32]>,
-    Option<Vec<u8>>,
-    slates_ipc::protocol::Authorship,
-  ),
+  (evidence, signature, authorship): SubmitCarried,
   approval: Approval,
 ) -> ReplyBody {
   let (work_id, green_id) =
@@ -10108,7 +10116,7 @@ pub(crate) fn owner_judge(
       id,
       route: Some(back),
       kind: ParkedKind::Owner {
-        sealed,
+        sealed: Box::new(sealed),
         evidence,
         policy,
       },
@@ -10183,8 +10191,8 @@ pub(crate) fn answer_overdue(state: &ShardState, parked: ParkedSubmit) -> bool {
 enum ParkedKind {
   /// Asked from a work's shard.
   Owner {
-    /// The work.
-    sealed: crate::work_home::SealedWork,
+    /// The work (boxed: it is most of a parked submit's size).
+    sealed: Box<crate::work_home::SealedWork>,
     /// Its evidence.
     evidence: Vec<[u8; 32]>,
     /// Its policy.
@@ -10246,7 +10254,7 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
         evidence,
         policy,
       } => {
-        route.and_then(|back| owner_judge(state, (origin, id), (sealed, evidence, policy), back))
+        route.and_then(|back| owner_judge(state, (origin, id), (*sealed, evidence, policy), back))
       }
       ParkedKind::Local {
         principal,
@@ -10275,15 +10283,7 @@ fn resumed_local(
   (origin, id): (u64, RequestId),
   route: Option<crate::merge_service::ReplyRoute>,
   principal: &Principal,
-  (work, carried, approval): (
-    VolumeId,
-    (
-      Vec<[u8; 32]>,
-      Option<Vec<u8>>,
-      slates_ipc::protocol::Authorship,
-    ),
-    Approval,
-  ),
+  (work, carried, approval): (VolumeId, SubmitCarried, Approval),
 ) -> Option<ReplyBody> {
   state.db.begin();
   state.current_request = Some((origin, id));

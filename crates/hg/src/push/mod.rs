@@ -239,6 +239,18 @@ impl Unbundle {
       _ => None,
     })
   }
+
+  /// The changegroup's version and bytes, moved out (A-729 part 2: the intake owns them, and gives them back for the
+  /// push's record); the part keeps its id and parameters, its payload left empty. None where the push carries none.
+  pub fn take_changegroup(&mut self) -> Option<(Version, Vec<u8>)> {
+    self
+      .parts
+      .iter_mut()
+      .find_map(|taken| match &mut taken.asks {
+        Asks::Changegroup(part) => Some((part.version, core::mem::take(&mut part.payload))),
+        _ => None,
+      })
+  }
 }
 
 /// A payload a part's codec refused.

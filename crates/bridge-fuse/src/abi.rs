@@ -236,6 +236,35 @@ pub const COMPAT_SETXATTR_IN_BYTES: usize = 2 * size_of::<u32>();
 /// filesystem's `posix_acl_update_mode` clears the bit itself.
 pub const SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
 
+/// The bytes of `fuse_setxattr_in` before its name in `body`, a `SETXATTR`'s body, and the setter's flags it carries, on
+/// a connection whose `INIT` kept [`flags::SETXATTR_EXT`] where `negotiated` (A-378): decided by the request itself,
+/// since a connection that kept the extended form still sends some requests in the short one (A-741). Linux sizes a
+/// `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c` `fuse_setxattr`:
+/// `fc->setxattr_ext ? sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE`) and holds it until `INIT`'s reply is in
+/// (`fs/fuse/dev.c` `fuse_block_alloc`), so a call made before that reply arrived travels short. The two forms differ in
+/// their second 8 bytes: the extended form's setter's flags (only [`SETXATTR_ACL_KILL_SGID`] is defined) and a zero
+/// pad; the short form's first bytes of the name, which begins with its namespace (`user.`, `trusted.`, `security.`,
+/// `system.`), never a flag word and a zero word. So the extended form is read where those bytes are a known setter's
+/// flag and a zero pad, and the short form otherwise, a body too short to hold the extended head included. Without
+/// `negotiated`, the short form alone, as the kernel sends nothing else then.
+pub fn setxattr_head(body: &[u8], negotiated: bool) -> (usize, u32) {
+  if !negotiated {
+    return (COMPAT_SETXATTR_IN_BYTES, 0);
+  }
+  let word = |at: usize| {
+    body
+      .get(at..at.saturating_add(size_of::<u32>()))
+      .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+      .map(u32::from_le_bytes)
+  };
+  let setter_at = COMPAT_SETXATTR_IN_BYTES;
+  let pad_at = setter_at.saturating_add(size_of::<u32>());
+  match (word(setter_at), word(pad_at)) {
+    (Some(setter), Some(0)) if setter & !SETXATTR_ACL_KILL_SGID == 0 => (SETXATTR_IN_BYTES, setter),
+    _ => (COMPAT_SETXATTR_IN_BYTES, 0),
+  }
+}
+
 /// The `fuse_open_out.open_flags` slates sets on an `OPEN`, `OPENDIR` or `CREATE` reply (`<linux/fuse.h>`; a kernel
 /// that does not know one ignores it).
 pub mod open {
