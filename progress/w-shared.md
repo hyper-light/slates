@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 part c = b8db5ba37 (main c729cdea5): SubmitComputed/ComputedSubmit; work_home::verdict_over_fleet,
+  computed_request; verbs::submit_computed; Green::submit_computed. Holder rebase + copies refused Unsupported (owed).
+  NEXT: part d (settle once the replica holds the version) -- ask main what (d) means precisely if unclear; then e, f.
+
 ## LANDED 2026-11-20: A-697 part b = 26454e7de (main b93699f93): MoveWorkFloor/WorkFloorMoved, verbs::move_work_floor (monotone,
   forwards_as_read), work_home::tell_floor_over_fleet, route_gated refuses it from clients. NEXT: part c (commit by
   position: holder computes increment + verdict on its replica, owner takes commit by position carrying increment +
