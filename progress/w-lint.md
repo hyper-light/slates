@@ -147,3 +147,19 @@
 - At 4c2a3aede: Windows (crates, cli, xtask) clean on jupiter; six cross targets, structural, unsafe, fmt clean.
 - Open, not mine: literals in merge pace.rs RUN = 16 and push.rs UNIT_BYTES = 64 KiB (A-752, 004f072d4) -- owner
   to derive. Red test slates-vcs the_same_bytes_from_git_and_mercurial... (w-perf).
+
+## 2026-11-20 round 6 at 53a81211d (Windows clean at 441bf83; host clean after 46a065d0d)
+- Landed: f89178c81 + 614a9b71d (svn A-759 index/children + drive tests, vcs A-727 content, hg, server
+  content_holder/daemon/vcs_store/verbs, fleet serve_peer_records restructured into helpers with a PeerRequestServed
+  value per arm; merge with A-724 8c region holds; homes.rs; svn example), 46a065d0d (Windows at 0edd12a: two
+  constants gated as their unix readers; t_a654 hook steps; dead live_ship payload; vcs_svn test scratch removal).
+- Tests: svn 36, vcs 13, hg 5, server 244 + 18 + 39, fleet integration 79 (discovery/forward/live/takeover): pass.
+- This clone's commits now carry a local user.name/email (Ada Lundhe <adalundhe@Mac.attlocal.net>, as before):
+  the hostname-derived identity stopped resolving.
+- Still red, not mine: literals in merge pace.rs RUN and push.rs UNIT_BYTES (A-752, owner).
+
+## 2026-11-20 ~11:15 main's routing
+- slates-vcs tests::the_same_bytes_from_git_and_mercurial_are_one_content_held_by_both_repositories: PASSES on
+  origin/main 85d66d9cb (cargo test --locked -p slates-vcs --lib <name>, macOS arm64, this Mac). No note to w-perf.
+- A-752 literals (merge pace.rs RUN, push.rs UNIT_BYTES): w-engine's to derive under R3; rounds report them only.
+- "wip" commits 03f872541, 7113b38e7: not rewritable (main never forced); rule now in the fleet brief.
