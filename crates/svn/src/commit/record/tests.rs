@@ -215,7 +215,8 @@ fn rows_of_every_shape() -> Revision {
 }
 
 /// A-655 part 2b (one value per record: the encoding canonical). Do: encode a revision of every row shape and an empty
-/// one, decode each, and encode what was read. Expect: each read back equal, its bytes again the same.
+/// one, decode each, and encode what was read. Expect: each read back equal, its bytes again the same, and each encoding
+/// reserved at its exact length (A-742).
 #[test]
 fn t_a655_every_shape_reads_back_and_encodes_again_the_same() {
   let empty = Revision {
@@ -230,9 +231,12 @@ fn t_a655_every_shape_reads_back_and_encodes_again_the_same() {
   };
   for record in [
     Record::Revision(rows_of_every_shape()),
+    Record::Revision(revision()),
     Record::Revision(empty),
   ] {
     let bytes = record.encode();
+    // A-742: reserved at its exact length once, never grown.
+    assert_eq!(bytes.capacity(), bytes.len());
     let read = Record::decode(&bytes);
     let again = read
       .as_ref()

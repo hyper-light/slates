@@ -148,3 +148,81 @@ fn a_version_that_changes_nothing_or_names_no_parent_makes_none() {
   );
   index.release(&mut store).unwrap();
 }
+
+/// A-729 part 2 (an import's record holds a manifest as the delta the index keeps it as). Do: make a history of 64
+/// files and then 15 changesets each changing one, kept in an index (whose manifests are kept as deltas, A-729 part 1);
+/// write its record (`record::write`) and the record of the same revisions with every text whole
+/// (`record::write_kept`); replay the first into an empty index. Expect the delta record less than half the whole one,
+/// and the replayed index the made one row for row, so the record of the next is the same bytes.
+#[test]
+fn an_imports_record_holds_its_manifests_as_deltas_and_replays_row_for_row() {
+  use crate::import::record;
+  use crate::push::verify::LogOf;
+  let mut store = ContentStore::new(1 << 26, WINDOW).unwrap();
+  let mut index = HgIndex::new();
+  let paths: Vec<Vec<u8>> = (0..64)
+    .map(|file| format!("src/file-{file:02}.rs").into_bytes())
+    .collect();
+  let added: Vec<Change<'_>> = paths
+    .iter()
+    .map(|path| Change {
+      path,
+      after: Some((b"fn main() {}\n", Flag::Regular)),
+    })
+    .collect();
+  let mut head = commit(
+    (&mut index, &mut store),
+    NULL_NODE,
+    &added,
+    (b"default", b"add"),
+  )
+  .0;
+  let bodies: Vec<Vec<u8>> = (0..15)
+    .map(|at| format!("fn main() {{ {at} }}\n").into_bytes())
+    .collect();
+  for (at, body) in bodies.iter().enumerate() {
+    let change = [Change {
+      path: &paths[at],
+      after: Some((body, Flag::Regular)),
+    }];
+    head = commit(
+      (&mut index, &mut store),
+      head,
+      &change,
+      (b"default", b"change"),
+    )
+    .0;
+  }
+  let deltas = record::write(&index, &store, u64::MAX).unwrap();
+  let mut logs = vec![(LogOf::Changelog, 0), (LogOf::Manifests, 0)];
+  logs.extend(
+    index
+      .file_logs(&store)
+      .map(|path| (LogOf::File(path.to_vec()), 0)),
+  );
+  let whole = record::write_kept(&index, &store, &logs, u64::MAX).unwrap();
+  assert!(
+    deltas.len() * 2 < whole.len(),
+    "{} bytes with deltas against {} whole",
+    deltas.len(),
+    whole.len()
+  );
+  let mut replay_store = ContentStore::new(1 << 26, WINDOW).unwrap();
+  let mut replayed = HgIndex::new();
+  let counted = record::replay(&deltas, &mut replayed, &mut replay_store).unwrap();
+  assert_eq!(counted.manifests, 16);
+  let rows = |index: &mut HgIndex, store: &ContentStore| -> Vec<(Vec<u8>, Vec<u8>)> {
+    index
+      .rows()
+      .iter(store)
+      .map(|row| (row.key().to_vec(), row.body().to_vec()))
+      .collect()
+  };
+  assert_eq!(rows(&mut replayed, &replay_store), rows(&mut index, &store));
+  assert_eq!(
+    record::write(&replayed, &replay_store, u64::MAX).unwrap(),
+    deltas
+  );
+  replayed.release(&mut replay_store).unwrap();
+  index.release(&mut store).unwrap();
+}

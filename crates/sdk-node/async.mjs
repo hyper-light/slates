@@ -151,6 +151,10 @@ export class AsyncClient {
     return this._call(() => this._c.beginSpinSetXattr(work, path, name, value), (w) => this._c.pollDeclare(w), true);
   }
 
+  copy(work, from, to, version, replace) {
+    return this._call(() => this._c.beginSpinCopy(work, from, to, version, replace), (w) => this._c.pollDeclare(w), true);
+  }
+
   removeXattr(work, path, name) {
     return this._call(() => this._c.beginSpinRemoveXattr(work, path, name), (w) => this._c.pollDeclare(w), true);
   }

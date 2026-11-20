@@ -317,13 +317,28 @@ slates-machine = 97
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 79
-# 2026-11-20 (+16, A-742, freed memory returns to the OS): `large.rs`, the slates binary's global allocator. The
-#   `GlobalAlloc` impl (1, unsafe by signature); `unmap` and each platform's `os::unmap` (2, a mapping's release is
-#   unsafe by contract); the system allocator's forwarded calls and the moving reallocation's copy (6); the anonymous
-#   map and unmap on Unix (`rustix::mm::mmap_anonymous`, `munmap`, 2) and `unmap`'s body (1); on Windows `GetSystemInfo`,
-#   `VirtualAlloc` and `VirtualFree` (3) and its `os::unmap` (1). No safe wrapper exists for any; counted by hand,
-#   `cargo xtask unsafe` to confirm.
+slates-mem = 80
+# 2026-11-20 (+1, A-744, a range's pages in RAM, main's ruling: every site named, `// SAFETY:` directly above):
+#   17. `resident.rs`, Unix `os::query`: `libc::mincore` over a page-aligned range into a vector of one byte a page (the
+#   kernel reads only the page table; rustix has no wrapper). Windows answers a typed refusal, no unsafe code.
+# 2026-11-20 (+16, A-742, freed memory returns to the OS; main's ruling: every site named, a `// SAFETY:` line directly
+#   above each; `cargo xtask unsafe` 79/79 ok): `crates/mem/src/large.rs`, the slates binary's global allocator, which
+#   holds no lock (a unit struct, `Sync`; its counters are atomics). No safe wrapper exists for any site.
+#   1. `unsafe impl GlobalAlloc for LargeMapped` (the trait is unsafe to implement);
+#   2. `alloc`: the system allocator's `alloc`, forwarded;
+#   3. `alloc_zeroed`: the system allocator's `alloc_zeroed`, forwarded;
+#   4. `dealloc`: `os::unmap` of a mapped block;
+#   5. `dealloc`: the system allocator's `dealloc`, forwarded;
+#   6. `realloc`: the system allocator's `realloc`, forwarded;
+#   7. `realloc`: a block moved across the floor (alloc, copy, dealloc);
+#   8. Unix `os::map`: `rustix::mm::mmap_anonymous`;
+#   9. Unix `os::unmap` (unsafe fn: releasing a range in use frees it under its user);
+#   10. Unix `os::unmap`: `rustix::mm::munmap`;
+#   11. Windows `os::page_size`: `GetSystemInfo`;
+#   12. Windows `os::map`: `VirtualAlloc`;
+#   13. Windows `os::unmap` (unsafe fn, as 9);
+#   14. Windows `os::unmap`: `VirtualFree`;
+#   15-16. the module's two tests driving the allocator through `GlobalAlloc` (unsafe by signature).
 # 2026-11-04 (+2, A-205, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
 #   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
 #   `Inner::discard`). The call has no safe wrapper.

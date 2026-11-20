@@ -389,6 +389,35 @@ mod tests {
   struct Client {
     child: std::process::Child,
     hangup: Hangup,
+    /// The seat's own end of the client's socket (Linux), kept to see the client's end close.
+    #[cfg(target_os = "linux")]
+    seat: std::os::fd::OwnedFd,
+  }
+
+  /// Shape: how long a test waits for a socket end it closed (or whose holder it killed) to read as closed. Every child
+  /// a test in this process spawns holds a copy of each open descriptor from its fork to its exec (CLAUDE.md, the CLI
+  /// test's gotcha), so under load the close lands a little after the test's own (2 of 30 runs at four threads beside
+  /// `hook_driver`, CI ubuntu, 2026-11-20); a wait far past any such window, never reached when the close holds.
+  #[cfg(target_os = "linux")]
+  const CLOSE_SEEN_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+  /// Waits until `socket` reads its peer's close (a peek answers zero bytes), within [`CLOSE_SEEN_WITHIN`]; answers
+  /// the last peek.
+  #[cfg(target_os = "linux")]
+  fn peer_close_seen(socket: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result<(usize, usize)> {
+    let deadline = Instant::now() + CLOSE_SEEN_WITHIN;
+    let mut byte = [0u8; 1];
+    loop {
+      let read = rustix::net::recv(
+        socket,
+        &mut byte,
+        rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+      );
+      if matches!(read, Ok((0, _))) || Instant::now() >= deadline {
+        return read;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    }
   }
 
   /// A client whose control socket's other end its child process holds as its standard input (Linux): the watch is on
@@ -409,7 +438,11 @@ mod tests {
       .spawn()
       .expect("a client process");
     let hangup = Hangup::of_socket(seat_end.as_fd()).expect("a watch on the socket");
-    Client { child, hangup }
+    Client {
+      child,
+      hangup,
+      seat: seat_end,
+    }
   }
 
   /// A client process watched by its process (macOS).
@@ -480,7 +513,9 @@ mod tests {
   #[test]
   fn a_client_killed_with_sigkill_is_seen_at_the_next_event_turn() {
     let runtime = runtime();
-    let Client { mut child, hangup } = watched_client();
+    let Client {
+      mut child, hangup, ..
+    } = watched_client();
     let (_task, answer) = start(&runtime, hangup);
     let killed = Instant::now();
     child.kill().expect("the client is killed");
@@ -504,9 +539,25 @@ mod tests {
   #[test]
   fn a_client_dead_before_its_watch_registered_is_caught_at_the_registration() {
     let runtime = runtime();
+    #[cfg(target_os = "linux")]
+    let Client {
+      mut child,
+      hangup,
+      seat,
+    } = watched_client();
+    #[cfg(not(target_os = "linux"))]
     let Client { mut child, hangup } = watched_client();
     child.kill().expect("the client is killed");
     child.wait().expect("the client is reaped");
+    // The client's end closes with its last holder: another test's child may hold a copy from its fork to its exec.
+    #[cfg(target_os = "linux")]
+    {
+      use std::os::fd::AsFd;
+      assert!(
+        matches!(peer_close_seen(seat.as_fd()), Ok((0, _))),
+        "the dead client's end closed"
+      );
+    }
     let (_task, answer) = start(&runtime, hangup);
     let answer = answer
       .try_recv()
@@ -542,12 +593,8 @@ mod tests {
       .expect("the watch is cancelled");
     runtime.run_until_idle();
     drop(seat_end);
-    let mut byte = [0u8; 1];
-    let read = rustix::net::recv(
-      &client_end,
-      &mut byte,
-      rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
-    );
+    // The seat's end closes with its last holder: another test's child may hold a copy from its fork to its exec.
+    let read = peer_close_seen(client_end.as_fd());
     let unclaimed = runtime.context().counters().interests_unclaimed;
     drop(client_end);
     settle(&runtime);
@@ -571,7 +618,9 @@ mod tests {
   #[test]
   fn a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind() {
     let runtime = runtime();
-    let Client { mut child, hangup } = watched_client();
+    let Client {
+      mut child, hangup, ..
+    } = watched_client();
     let (task, answer) = start(&runtime, hangup);
     runtime
       .context()
