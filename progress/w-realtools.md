@@ -28,3 +28,11 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
 - 15:35 PST: FINDING (recorded): one dead hard NFS mount stalls every NFS mount on the macOS client (READDIR/CREATE never
   sent). Main unmounted w-forming's; root-mounted kiln-01a1f9e974cb... remains (Ada). Real-tool runs moved to another Mac
   via kiln run (needs macos). Debug prints reverted. Experiment script: worktree .realtools/exp.sh (untracked).
+- 15:45 PST: LANDED A-781, 5d639b68e (merge d5a465908): without a birth time, an unchanged base file keeps its inode
+  number across a takeover (it was renumbered in lookup order, which breaks `#pragma once`). macOS arm64, Studio-4,
+  local: vfs base 52/52, base_identity 8/8. No inode eviction path exists in vfs (inodes are never unloaded), so
+  "eviction" has no renumbering source. Run request filed (Linux/Windows sim tests).
+- Next: the kernel-mount acceptance test (crates/cli/tests/real_tools.rs, SLATES_TEST_CLI=1): a clang/gcc `#pragma once`
+  build held mid-compile by a FIFO include across a daemon SIGKILL; then make (mtime/ctime), cargo incremental and
+  git status. The kiln run r3 (.realtools/exp.sh, needs macos) is queued; Studio-4's NFS client is stalled by a
+  root-mounted dead mount (Ada's).
