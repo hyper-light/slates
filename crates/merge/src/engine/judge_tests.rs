@@ -312,6 +312,7 @@ fn judged_and_committed(
       (Outcome::Conflict { windows }, None)
     }
     Judgment::BaseUnavailable { base, floor } => (Outcome::BaseUnavailable { base, floor }, None),
+    Judgment::CopyRefused { path, case } => (Outcome::CopyRefused { path, case }, None),
   })
 }
 

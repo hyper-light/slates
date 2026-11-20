@@ -168,7 +168,7 @@ fn abandon(push: Push, store: &mut ContentStore) {
 #[derive(Clone, Debug)]
 struct Answer {
   runs: Vec<Versions>,
-  objects: Vec<u64>,
+  objects: Positions,
   thin: bool,
   ofs: bool,
   filter: Option<Filter>,
@@ -179,7 +179,7 @@ impl Answer {
   fn objects(objects: &Positions) -> Answer {
     Answer {
       runs: Vec::new(),
-      objects: objects.iter().collect(),
+      objects: objects.clone(),
       thin: false,
       ofs: true,
       filter: None,
@@ -192,7 +192,7 @@ impl Answered for Answer {
     &self.runs
   }
 
-  fn objects(&self) -> &[u64] {
+  fn objects(&self) -> &Positions {
     &self.objects
   }
 

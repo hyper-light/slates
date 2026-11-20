@@ -536,7 +536,7 @@ impl<P> ReceivePack<P> {
       ))),
       Prepared::Sealing { sealing, name } => Ok(Begun::Sealing(Box::new(SealingAnswer {
         record,
-        sealing,
+        sealing: *sealing,
         name,
       }))),
     }
@@ -1026,8 +1026,8 @@ enum Prepared {
   Declined(Declining),
   /// The push's objects' seal begun, a turn at a time (A-722 part 4).
   Sealing {
-    /// The seal under way.
-    sealing: SealingPush,
+    /// The seal under way (boxed: it is most of a preparation's size).
+    sealing: Box<SealingPush>,
     /// The push's name (module docs).
     name: [u8; 32],
   },
@@ -1075,7 +1075,7 @@ fn prepare(
   push.keep_pack(pack);
   match push.sealing(state) {
     Ok(sealing) => Ok(Prepared::Sealing {
-      sealing,
+      sealing: Box::new(sealing),
       name: push_name(record.id, &checked.request),
     }),
     Err(refused) => Ok(Prepared::Declined(Declining::unadmitted(&refused))),

@@ -4489,6 +4489,35 @@ pub enum Refusal {
     /// Why.
     fault: ImportFault,
   },
+  /// A copy the submitted work declares was refused before any verdict (A-586, A-626 part 4; main's ruling of
+  /// 2026-11-20): no concurrent change caused it, so it is no conflict and no rebase answers it. Appended.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyCase,
+  },
+}
+
+/// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the
+/// wire. FSFS's commit refuses the first three too; the fourth follows from what a green retains; the rest are copies
+/// slates does not make yet (owed work, A-586). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyCase {
+  /// The destination is the root.
+  Root,
+  /// The source's version is past the green's head.
+  PastHead,
+  /// Nothing stood in the source's tree at its version.
+  SourceEmpty,
+  /// The source's version's values are folded away.
+  VersionFolded,
+  /// A hard link in the source names a node outside it that changed after the version (owed).
+  OutsideNodeChanged,
+  /// The source changed after its version and a hard link stood in it then (owed).
+  ChangedSourceLink,
+  /// A rename or a hard link the work declares with an end in a copied tree (owed).
+  LinkAcrossCopy,
 }
 
 /// Why the bytes an `ArchiveImport` read make no volume ([`Refusal::ArchiveRefused`], A-453): each the class of the

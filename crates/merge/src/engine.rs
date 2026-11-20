@@ -213,6 +213,14 @@ pub enum Outcome {
     /// The oldest base the green still judges.
     floor: u64,
   },
+  /// A copy the increment declares is refused before any verdict, typed ([`CopyRefusal`]; main's ruling of
+  /// 2026-11-20): no concurrent change caused it, so it is no conflict and no rebase answers it.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
+  },
 }
 
 /// A verdict reached and held, not yet committed (A-635; §4.17.1 "A push is a work"): an increment this green accepted,
@@ -283,6 +291,13 @@ pub enum Judgment {
     base: u64,
     /// The oldest base the green still judges.
     floor: u64,
+  },
+  /// A copy it declares is refused before any verdict (as [`Outcome::CopyRefused`]).
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -414,7 +429,7 @@ impl core::fmt::Debug for Computed {
 
 /// Why a green computes no verdict for an increment ([`Green::compute`], A-658), typed: it does not hold every version
 /// the increment is judged over. Neither is a verdict; the caller computes on a green that holds them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComputeRefused {
   /// The base is below the version this green was restored at from a checkpoint: the deltas it would be mapped through
   /// are folded away.
@@ -430,6 +445,13 @@ pub enum ComputeRefused {
     base: u64,
     /// This green's head.
     head: u64,
+  },
+  /// A copy the increment declares is refused before any verdict ([`CopyRefusal`]).
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -472,6 +494,14 @@ pub enum Rebased {
     base: u64,
     /// The green's head.
     head: u64,
+  },
+  /// A copy the work declares is refused, typed, as its submit refuses it ([`Outcome::CopyRefused`]): no rebase
+  /// answers it.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -1279,6 +1309,8 @@ struct Resolved {
   creates: BTreeSet<String>,
   specials: BTreeMap<String, SpecialNode>,
   invalid: BTreeSet<String>,
+  /// The renames and hard links declared with an end in a copied tree (`Green::copy_refusal`, A-586).
+  across_copies: BTreeSet<String>,
   unlinks: BTreeSet<String>,
   mkdirs: BTreeSet<String>,
   rmdirs: BTreeSet<String>,
@@ -4903,6 +4935,7 @@ impl Green {
       Judgment::AcceptedBefore { version } => (Outcome::Accepted { version }, None),
       Judgment::Conflict { windows } => (Outcome::Conflict { windows }, None),
       Judgment::BaseUnavailable { base, floor } => (Outcome::BaseUnavailable { base, floor }, None),
+      Judgment::CopyRefused { path, case } => (Outcome::CopyRefused { path, case }, None),
     }
   }
 
@@ -4938,6 +4971,9 @@ impl Green {
       });
     }
     let resolved = Green::resolve(inc);
+    if let Some((path, case)) = self.copy_refusal(&resolved) {
+      return Err(ComputeRefused::CopyRefused { path, case });
+    }
     let mut units = position::Units::first();
     self.decide_units(inc, &resolved, &mut units);
     Ok(computed(Reached::of(units.into_units().0)))
@@ -5006,6 +5042,7 @@ impl Green {
         base,
         floor: self.deltas_from,
       },
+      Err(ComputeRefused::CopyRefused { path, case }) => Judgment::CopyRefused { path, case },
     }
   }
 
@@ -5678,6 +5715,9 @@ impl Green {
       };
     }
     let resolved = Green::resolve(inc);
+    if let Some((path, case)) = self.copy_refusal(&resolved) {
+      return Rebased::CopyRefused { path, case };
+    }
     // The verdict is `submit`'s, on an immutable green; it adds to the fast-path counter (through `merge_content`),
     // which a rebase puts back, since it merges nothing.
     let fast_path_before = self.fast_path_hits.get();
@@ -6037,6 +6077,7 @@ mod branch;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 mod copy;
+pub use copy::CopyRefusal;
 
 mod copy_checkpoint;
 

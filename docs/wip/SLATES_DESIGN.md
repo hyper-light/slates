@@ -1382,6 +1382,12 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > written pages are the owner partition's segment log ring (355.2 MiB) and snapshot slots (225.8 MiB); the content
 > object holds 2.3 MiB (BENCHMARKS.md).
 
+> **Status (2026-11-20, A-746: the register by record kind).** `content_ranges` adds `register_log` (the log since the
+> last snapshot) and `register_snapshot` (the last snapshot), each by repository records, green chain entries,
+> checkpoints and the rest (`slates_db::replay::RegisterSplit`), and the arena's `prefault_reserve`. After the
+> 1,000-revision import the owner partition's register holds 222.4 MiB of repository records, 133.1 MiB of chain
+> entries and 137.4 MiB of checkpoints (BENCHMARKS.md).
+
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
 **Data model.**
@@ -12287,8 +12293,19 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > **Status (2026-11-20, A-745).** Red, by use: a clone whose answer is past one request's room is refused
 > `PastAdmission` (`vcs_http::daemon_edge`'s `a_mercurial_clone_larger_than_one_ring_region_...`, ignored until it
 > passes; w-interop's clone of Mercurial's 57,035 revisions, `asked: 228144, left: 218727`). Mercurial's `getbundle`
-> builds the whole answer, then frames it (`slates_hg::serve::getbundle`). Owed: the answer made and sent in slices
-> (Mercurial first, then its stream clone), git's upload-pack (w-git).
+> built the whole answer, then framed it. Piece 1 BUILT: `slates_hg::serve::getbundle::Answering` makes it a slice at a
+> time, each step its own room, a clone of every head walked by its links (7.2's `fastpathlinkrev`: the missing
+> changesets as ranges, the manifest log, then the file logs row to row through `HgIndex::file_revision_from`), any
+> other fetch by the changesets that name each revision (7.2's slow path, bounded by what it sends). Piece 2a BUILT:
+> HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
+> shard's room and quantum, the stream compressed as it is made; the red passes. Owed: SSH (piece 2b), the hold on the
+> generation a fetch began on (rule 4), the stream clone (piece 3), git's upload-pack (w-git).
+> **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
+> fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
+> none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
+> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). Owed for git: the walk's own
+> sets (piece 2: negotiation and plan a step at a time, `upload::Answering`), the server driving it a turn at a time
+> within a request's room (piece 3, reverting A-713's shard room).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -15022,8 +15039,15 @@ and export by landing).
 > link names its node's copy); a name whose node lies outside the copied tree gets a node of its own in the copy,
 > holding that node's bytes, mode or IPC node, its bytes named by the content they hold. Derived at the commit from the
 > head before the copies land (`Green::copy_link_effects`), as a node's moves are, so a replay and a checkpoint hold the
-> same; a copy whose outside nodes changed after its version is refused. Owed: that refusal and A-586's other "does not
-> yet copy" cases answering their own typed refusals, not `TypeChanged`.
+> same; a copy whose outside nodes changed after its version is refused.
+>
+> **Status (2026-11-20, A-586's copy refusals typed; main's ruling).** A copy this piece does not make is refused before
+> any verdict, by a submit and a rebase alike, as `Refusal::CopyRefused { path, case }` (the wire's `CopyCase`; the
+> engine's `CopyRefusal`), never a conflict: no concurrent change caused it and no rebase answers it. Refusals FSFS's
+> commit makes too: `Root` (the root as destination), `PastHead` (a source version past the head), `SourceEmpty`.
+> Following from retention: `VersionFolded` (the version's values folded away). Owed work, refused until built:
+> `OutsideNodeChanged` (a link naming an outside node changed since the version), `ChangedSourceLink` (a hard link in a
+> source changed since its version), `LinkAcrossCopy` (a rename or hard link declared across a copied tree's edge).
 >
 > **Status (2026-11-19, A-626 part 1).** Built: the engine's replace with history (`REPLACE`, a flag on `Copy`: the
 > destination's tree taken away key by key at the copy's version, judged as a removal against the base) and copies
@@ -55901,3 +55925,52 @@ shared with the export's).
   server's repro, refused `TypeChanged`), `-- t_a626_p4 vcs_store::paths:: vcs_store::commits::` 20 of 20; fmt clean.
 - **Owed.** The refusal kept, and A-586's other "does not yet copy" cases, answering their own typed refusals rather than
   `TypeChanged` (next); a copy from before an outside node changed, read from its history.
+
+
+### A-746 — The register by record kind: chain entries and checkpoints lead (270.5 MiB) over repository records (222.4 MiB), so the next content-once step is a green's bytes named, not carried (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.16, §4.17.1; A-64, A-727, A-744)
+
+Applied in the same change to: `crates/db` (`replay::RegisterSplit`, `DbStats::tail_split` and `snapshot_split`, kept
+at each append and each snapshot); `crates/server` (`content_ranges`: the register's splits and the arena's
+`prefault_reserve`; `daemon::prefault_reserve_bytes`); §4.2's status; GAPS; BENCHMARKS.md.
+
+- **The question** (main's ruling): of the 581 MiB A-744 found in the owner partition's log ring and snapshot slots,
+  how much is repository records carrying texts, green chain entries carrying file bytes, checkpoints, and the rest?
+- **The split.** The log is counted as it is appended: each record's operations by what they carry (a green's advance
+  and origin, and the chain entries a repository entry carries for its greens; a checkpoint; a repository entry's
+  objects), the rest its other bytes; reset at each snapshot. A snapshot is counted when it is taken, its repository
+  registers', chains' and checkpoints' encoded lengths (exact: derived `Wire::encoded_len`), the rest the remainder.
+- **Measured** (three runs, identical): the log since the last snapshot 267.2 MiB (repository records 87.5, chain
+  entries 87.4, checkpoints 92.2, rest 0.1); the last snapshot 225.8 MiB, exactly its slot's resident pages (repository
+  records 134.9, chain entries 45.7, checkpoints 45.2). Over both, chain entries and checkpoints 270.5 MiB, repository
+  records 222.4 MiB. The ring's other 88 MiB in RAM (355.2 resident against the 267.2 live) are pages it released at its
+  last snapshot and never gave back. The prefault reserve was 0.
+- **The decision** (main's rule): chain entries and checkpoints lead, so a green's bytes named rather than carried is
+  next (A-742's design note, items 3 to 7: Files' blocks as chunk references through one block seam, chain entries and
+  checkpoints naming chunks), on A-727's seam with w-perf, agreed before code. The repository records go to A-727 (a3)
+  and S4 (w-perf, w-svn).
+- **Tests.** macOS arm64, Mac Studio, local: `slates-db --lib replay` (a record's bytes split by what its operations
+  carry), `--test model`; `slates-server --lib content_ranges`, `svn_commit`; `slates-mcp --test mcp`; fmt clean.
+- **Owed.** The log ring's released pages given back (as the write log's are, A-105); `projected_snapshot_bytes`
+  (A-724 piece 8) encodes a whole entry to read its length, where the derived `encoded_len` would do once every
+  field's is exact.
+
+### A-586's copy refusals typed — A copy this piece does not make is refused before any verdict by its own case, never a conflict (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** Each copy the engine does not make was answered as a `TypeChanged` conflict window at its destination, which
+  misnamed it: no concurrent change caused it and no rebase answers it.
+- **Change.** `slates-merge`: `CopyRefusal` (`Root`, `PastHead`, `SourceEmpty`, `VersionFolded`, `OutsideNodeChanged`,
+  `ChangedSourceLink`, `LinkAcrossCopy`), decided before any verdict (`Green::copy_refusal`, from `compute` and `rebase`;
+  `copy_fix` now answers its own two cases; `split_copies` keeps a rename or link across a copy apart from the invalid
+  document's paths), answered as `ComputeRefused::CopyRefused`, `Judgment::CopyRefused`, `Outcome::CopyRefused`,
+  `Rebased::CopyRefused` and `Landed::CopyRefused`. The wire: `Refusal::CopyRefused { path, case }` and `CopyCase`,
+  appended (wire order published); the server maps the engine's case by an exhaustive match (`verbs::copy_refused`) for a
+  submit, a rebase and a push's held judgment; `slates-api` types it `Invalid::Copy`; the Python and Node SDKs and MCP
+  name every case by an exhaustive match (`copy_case_name`), reporting "the copy to PATH is refused: CASE".
+- **Which is which.** Refused by FSFS's commit too: `Root`, `PastHead`, `SourceEmpty`. Following from retention:
+  `VersionFolded`. Owed work, kept visible: `OutsideNodeChanged`, `ChangedSourceLink`, `LinkAcrossCopy`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-merge` lib 224 of 224 (the refusal test's
+  five typed cases, the folded version, the rebase-equals-submit oracle refusing `LinkAcrossCopy` alike), `--test
+  engine --test checkpoint` 4 and 49; `slates-server` `vcs_store::paths::tests::t_a626_p4_a_copy_of_nothing_is_refused_by_its_case`
+  and the filters `t_a626_p4 vcs_store:: work_home:: verbs:: repository::` 192 of 192; `slates-api`
+  `a_copy_refusal_is_typed_invalid_by_its_case`; by use against a real daemon, a copy of nothing refused with its case:
+  MCP's test, the Python SDK 4 of 4, the Node SDK 9 of 9, the CLI's JSON flow (`SLATES_TEST_CLI=1`); `slates-ipc
+  --test wire_order` published; fmt clean.

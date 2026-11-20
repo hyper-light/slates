@@ -77,8 +77,8 @@ enum Stage {
   },
   /// The pack read a chunk at a time.
   Reading {
-    /// Git's reader of the pack, holding what it resolved.
-    reader: Reader<'static, NoIndex>,
+    /// Git's reader of the pack, holding what it resolved (boxed: it is most of the stage's size).
+    reader: Box<Reader<'static, NoIndex>>,
     /// What the reading holds, charged within the room the content store had as the replay began.
     admission: Admission,
     /// The pack's bytes read so far.
@@ -137,7 +137,7 @@ impl GitReplay {
       moves: record.moves,
       pack_at,
       stage: Stage::Reading {
-        reader: Reader::new(format, &NO_INDEX),
+        reader: Box::new(Reader::new(format, &NO_INDEX)),
         admission: Admission::new(content.room()),
         read: 0,
       },

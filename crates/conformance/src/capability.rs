@@ -142,9 +142,9 @@ pub const LINUX_NFS_ADAPTER: Adapter = Adapter {
     export (the same serving code as macOS)",
   not_covered: concat!(
     "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane ",
-    "mounts through the NFS adapter for this suite; the workload roster, fsx and fsstress run over the FUSE mount ",
-    "itself (A-293, 2026-11-19), and the other suites over it run in the Linux container lane (`oci-linux`, ",
-    "`slates mount --shared` with `user_allow_other`)",
+    "mounts through the NFS adapter for this suite; the workload roster, fsx, fsstress (A-293, 2026-11-19) and ",
+    "pjdfstest (`slates mount --shared`, 2026-11-20) run over the FUSE mount itself, and hermeticity over it runs ",
+    "in the Linux container lane (`oci-linux`)",
   ),
 };
 
@@ -225,6 +225,17 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
     },
     // fsx and fsstress over the same mount, unprivileged: what a live-shipped volume must conform to on Linux is the
     // transport an agent uses, not an NFS adapter in front of it (goal 226, 2026-11-19).
+    // pjdfstest as root over the same mount: root reaches a user's FUSE mount only through `allow_other`, so the cell
+    // mounts with `slates mount --shared`, which the operator's `user_allow_other` grants (goal 226, 2026-11-20).
+    (Transport::NativeLinuxFuse, Suite::Pjdfstest) => Availability::Runnable {
+      on: HostOs::Linux,
+      tools: &["fusermount3", "cc", "sh", "sudo", "openssl", "dd"],
+      root: RootNeed::Required(
+        "pjdfstest's README requires root, and root reaches the user's FUSE mount only through `allow_other` \
+         (`slates mount --shared`, granted by `user_allow_other` in /etc/fuse.conf)",
+      ),
+      adapter: None,
+    },
     (Transport::NativeLinuxFuse, Suite::Fsx | Suite::Fsstress) => Availability::Runnable {
       on: HostOs::Linux,
       tools: LINUX_FUSE_SUITE_TOOLS,
@@ -377,8 +388,9 @@ mod tests {
   }
 
   /// The macOS transport runs its suites on macOS with no adapter; the Linux transport runs them
-  /// through the root NFS adapter, which names what it does not cover, except the workload roster (A-293), fsx and
-  /// fsstress (2026-11-19), which run over the daemon's own FUSE mount with neither root nor adapter.
+  /// through the root NFS adapter, which names what it does not cover, except the workload roster (A-293), fsx,
+  /// fsstress (2026-11-19) and pjdfstest (2026-11-20), which run over the daemon's own FUSE mount with no adapter, and
+  /// all but pjdfstest with no root.
   #[test]
   fn native_lanes_run_on_their_own_os() {
     for suite in [
@@ -391,7 +403,7 @@ mod tests {
       expect_runnable_on_macos_with_no_adapter(suite);
       match (suite, availability(Transport::NativeLinuxFuse, suite)) {
         (
-          Suite::Workloads | Suite::Fsx | Suite::Fsstress,
+          Suite::Workloads | Suite::Fsx | Suite::Fsstress | Suite::Pjdfstest,
           Availability::Runnable {
             on,
             tools,
@@ -400,7 +412,13 @@ mod tests {
           },
         ) => {
           assert_eq!(on, HostOs::Linux);
-          assert!(adapter.is_none() && root == RootNeed::None);
+          assert!(adapter.is_none());
+          // Only pjdfstest takes root, and root reaches the mount through `allow_other` (`--shared`).
+          assert_eq!(
+            root == RootNeed::None,
+            suite != Suite::Pjdfstest,
+            "{suite:?}"
+          );
           assert!(tools.contains(&"fusermount3"), "{tools:?}");
         }
         (_, Availability::Runnable { on, adapter, .. }) => {

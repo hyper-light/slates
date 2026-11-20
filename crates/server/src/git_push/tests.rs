@@ -1282,3 +1282,26 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
     );
   });
 }
+
+/// A-727 (holders made again; w-git's finding through main). Do: push the fixtures' `create` and `update` (a plain push
+/// making `main`, then a thin pack moving it) and make the store again from the repository's records. Expect: the store
+/// made again equal to the live one whole: its rows, `main`'s versions and every content with the holders it has, so
+/// the live store holds no content the records would not, and the rebuilt none fewer.
+#[test]
+fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "again");
+    pushed_from_the_fixtures(state, repository, &["create", "update"]);
+    let main = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repository, "main")
+      .expect("main");
+    crate::vcs_store::tests::assert_made_again_whole(
+      state,
+      repository,
+      &[crate::vcs_store::green_key(main)],
+    );
+  });
+}
