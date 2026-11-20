@@ -1000,6 +1000,13 @@ impl Repositories {
         change: change.clone(),
       });
     }
+    // A push's record rides the names log (A-724 piece 8c): shipped to the repository's candidates with the operation's
+    // identity and spans, so a successor holds it exactly when it holds the rest of the operation, and replays it.
+    if !entry.objects.is_empty() {
+      namespace.push(LoggedChange::Objects {
+        record: entry.objects.clone(),
+      });
+    }
     self.log_names(entry.repository, namespace);
     self.made_greens.clone_from(&greens);
     let mut bytes = StateBytes::default();
@@ -1017,9 +1024,9 @@ impl Repositories {
           });
         }
       }
-      // The objects ride with the entry and take no position (A-662), so they never make it an atomic record. They are
-      // the repository's content, charged by its owner shard to its memory budget, never to the merge budget
-      // ([`Repositories::objects_bytes`]).
+      // The objects are kept here for the owner's replay and take a position of the names log (above), so they ship to
+      // the candidates (A-724 piece 8c). They are the repository's content, charged by its owner shard to its memory
+      // budget, never to the merge budget ([`Repositories::objects_bytes`]).
       if !entry.objects.is_empty() {
         register.objects.push(entry.objects.clone());
       }
@@ -1308,6 +1315,8 @@ impl Repositories {
       LoggedChange::Changed { change } => {
         register.apply(change);
       }
+      // A push's record a successor takes back (A-724 piece 8c): kept as the owner kept it, for the store's replay.
+      LoggedChange::Objects { record } => register.objects.push(record.clone()),
     }
   }
 
@@ -1373,7 +1382,7 @@ impl Repositories {
             NameChange::Retire { .. } | NameChange::Default { .. } => true,
           }
       }
-      LoggedChange::Left { .. } => log == StateLog::Names,
+      LoggedChange::Left { .. } | LoggedChange::Objects { .. } => log == StateLog::Names,
       LoggedChange::Changed { change } => state_log_of(change) == log,
     }
   }

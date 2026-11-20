@@ -262,7 +262,14 @@ async fn answer_step<S: ShardLender>(
   let answering = lent(lender, |state| push.answer_step(state, &mut *out))?
     .map_err(|failed| refused(failed, name))?;
   match answering {
-    Answering::Answered(_) => Ok((Next::Exited(0), None)),
+    Answering::Answered(_) => {
+      // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c).
+      drop(turn);
+      if !crate::state_log::names_committed_within(push.repository()).await {
+        return Err(died(NOT_SERVED));
+      }
+      Ok((Next::Exited(0), None))
+    }
     Answering::Turned => Ok((Next::More, Some(turn))),
     #[cfg(unix)]
     Answering::Hook(call) => {

@@ -379,9 +379,11 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   let owner = (bootstrap + 1) % nodes.len();
   run_ready(&nodes[owner], &["repository", "create", REPOSITORY, "--tool", "git"]);
   eprintln!("V3TAKEOVER: repository created on node {owner}");
-  // Every principal may read and push its refs: an account is its host's alone (A-237), and a credential minted on the
-  // owner is not known to a survivor once the owner is gone, so a client asks the successor with a survivor's own token.
-  // Granted before the owner dies, as a volume is shared with the other nodes before (`live_fleet`'s `share_with_nodes`).
+  // WORKAROUND, until w-fed-faults' fix lands (main's ruling of 2026-11-20): a credential minted on the owner is not
+  // known to the successor once the owner is gone (401), and a survivor's own token names its own account (403, A-237).
+  // So every principal may read and push the repository's refs, granted before the owner dies, and the client asks the
+  // successor with a survivor's own token. Remove this grant, and ask with the owner's token, once credentials survive
+  // their node; this test is that fix's red too.
   {
     use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
     let mut client = slates_client::Client::connect(&nodes[owner].instance, slates_api::deadlines()).unwrap();
@@ -443,7 +445,11 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
           let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
           let counted: Vec<&str> = status
             .lines()
-            .filter(|line| line.contains("takeover") || line.contains("vcs_store") || line.contains("repositor"))
+            .filter(|line| {
+              ["takeover", "vcs_store", "repositor", "state_log", "part", "held", "record"]
+                .iter()
+                .any(|word| line.contains(word))
+            })
             .collect();
           format!("node {at}: ls-remote {code} {}{}; counted {counted:?}", out.trim(), err.trim())
         })

@@ -159,6 +159,73 @@ pub(crate) fn take_made(state: &mut ShardState) {
   }
 }
 
+/// Whether `repository`'s names log is held at `f + 1` through its current position (§4.8's commit rule; A-724 piece
+/// 8c, the takeover test's fix): the records the partition handed on taken first ([`take_made`]), so a part not yet
+/// taken never reads as held; then `f` of the log's remote candidates acknowledged at or past the position (the owner
+/// the `+ 1`), or every remote candidate where there are fewer. A log with no part owed is held: every remote candidate
+/// holds it, or it has none (a laptop's).
+pub(crate) fn names_committed(
+  state: &mut ShardState,
+  repository: slates_db::catalog::RepositoryId,
+) -> bool {
+  take_made(state);
+  let Some(position) = state
+    .db
+    .partition()
+    .repositories()
+    .log_position(repository, StateLog::Names)
+  else {
+    return true;
+  };
+  let register = slates_db::catalog::LogName::State {
+    repository,
+    log: StateLog::Names,
+  }
+  .register();
+  let local = state.fleet.host();
+  let config = state.fleet.configuration();
+  let remote = remote_candidates(config, register, local);
+  let need = usize::try_from(config.quorum.f)
+    .unwrap_or(usize::MAX)
+    .min(remote.len());
+  state.state_logs.logs.get(&register).is_none_or(|log| {
+    log
+      .acked
+      .iter()
+      .filter(|(host, at)| remote.contains(host) && **at >= position)
+      .count()
+      >= need
+  })
+}
+
+/// Waits until `repository`'s names log is held at `f + 1` through its position now ([`names_committed`]), re-asking at
+/// the record plane's poll within its exchange deadline (`crate::fleet::live_budget`): whether it was. A push is
+/// answered only then (A-724 piece 8c: a push acknowledged before its records reached `f + 1` was lost with its owner).
+pub(crate) async fn names_committed_within(repository: slates_db::catalog::RepositoryId) -> bool {
+  let budget = crate::fleet::live_budget();
+  let began = slates_rt::futures::now_ns();
+  loop {
+    if crate::state::with_state(|state| names_committed(state, repository)) != Some(false) {
+      return true;
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
+      crate::state::with_state(|state| state.count(PUSH_UNCOMMITTED, 1));
+      return false;
+    }
+    // A refused timer (no shard) ends the wait unheld: the push is answered refused, never acknowledged unheld.
+    if slates_rt::futures::sleep(budget.poll_interval_ns.max(1))
+      .await
+      .is_err()
+    {
+      return false;
+    }
+  }
+}
+
+/// Counter: pushes answered refused because their records did not reach `f + 1` within the wait (A-724 piece 8c).
+/// Format: a counter name.
+pub(crate) const PUSH_UNCOMMITTED: &str = "state_log.push_uncommitted";
+
 /// Notes `placement`'s acknowledgements of `register`'s part at `sequence` (the record plane's commit round,
 /// `crate::fleet::record_acks_in`), and lets go of the parts every remote candidate then holds.
 pub(crate) fn acknowledged(

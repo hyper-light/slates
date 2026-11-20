@@ -164,7 +164,15 @@ impl<L: ShardLender> Exchange for Receive<L> {
         .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
         .map_err(failed)?;
       match step {
-        Answering::Answered(_) => return Ok(()),
+        Answering::Answered(_) => {
+          // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): the report goes
+          // out after, or the push is refused, never lost with its owner.
+          drop(turn);
+          if !crate::state_log::names_committed_within(repository).await {
+            return Err(Failed(Status::SERVICE_UNAVAILABLE));
+          }
+          return Ok(());
+        }
         Answering::Turned => {
           turn.yield_holding().await;
           // The push's names homed in the region before its record names them (A-724 piece 8c), off the shard's step.
