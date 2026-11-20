@@ -247,6 +247,14 @@ impl Repository {
     }
   }
 
+  /// The delta text `identity` is kept as and the text it is against (S4 c2: an svndiff of version 2 against its
+  /// skip-delta base, none for a first version): what an FSFS view names as a `DELTA` representation (A-645 P3). None
+  /// for a text the records keep whole, its bytes a property list's too.
+  pub fn text_delta(&self, identity: &ContentIdentity) -> Option<(Option<ContentIdentity>, &[u8])> {
+    let kept = self.texts.get(identity)?;
+    Some((kept.base, kept.delta.as_slice()))
+  }
+
   /// The bytes the texts' deltas hold.
   pub fn text_bytes(&self) -> u64 {
     self

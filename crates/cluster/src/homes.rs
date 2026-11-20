@@ -38,6 +38,10 @@ const KIND_READ: u8 = 2;
 const KIND_LET_GO: u8 = 3;
 /// Format: the kind byte of an answer.
 const KIND_ANSWER: u8 = 4;
+/// Format: the kind byte of a part of a put (appended: an object past one message, A-724 piece 8c).
+const KIND_PUT_PART: u8 = 5;
+/// Format: the kind byte of a read of a part (appended).
+const KIND_READ_PART: u8 = 6;
 /// Format: the outcome byte of an answer that kept the window.
 const OUTCOME_KEPT: u8 = 1;
 /// Format: the outcome byte of an answer carrying the window's bytes.
@@ -46,6 +50,14 @@ const OUTCOME_BYTES: u8 = 2;
 const OUTCOME_LET_GO: u8 = 3;
 /// Format: the outcome byte of a refusal.
 const OUTCOME_REFUSED: u8 = 4;
+/// Format: the outcome byte of a put's part taken, the bytes received so far (appended).
+const OUTCOME_TAKEN: u8 = 5;
+/// Format: the outcome byte of a read's part: the object's length, then the part's bytes (appended).
+const OUTCOME_PART: u8 = 6;
+
+/// The most bytes one part carries ([`HomeMessage::PutPart`], [`HomeOutcome::Part`]): the chunk cap a message's byte
+/// string is held to. Derived: `slates_archive::format::MAX_CHUNK_BYTES`.
+pub const PART_BYTES: u64 = MAX_CHUNK_BYTES;
 /// Format: the width of a BLAKE3 identity.
 const IDENTITY_BYTES: usize = 32;
 
@@ -104,6 +116,18 @@ pub enum HomeOutcome {
   LetGo,
   /// Refused, by kind.
   Refused(HomeRefusal),
+  /// A put's part was taken: the bytes received of the object so far (appended, A-724 piece 8c).
+  Taken {
+    /// The bytes received so far.
+    received: u64,
+  },
+  /// A read's part: the object's whole length, and the part's bytes (appended).
+  Part {
+    /// The object's length.
+    total: u64,
+    /// The part's bytes.
+    bytes: Vec<u8>,
+  },
 }
 
 /// A home exchange's message (module docs).
@@ -125,6 +149,25 @@ pub enum HomeMessage {
   LetGo {
     /// Its identity.
     identity: [u8; 32],
+  },
+  /// Keep part of the object named `identity`, `total` bytes long, its bytes from `offset` (appended, A-724 piece 8c: an
+  /// object past one message, sent in order a part at a time, each at most [`PART_BYTES`]).
+  PutPart {
+    /// The object's identity: the BLAKE3 of its whole bytes.
+    identity: [u8; 32],
+    /// The object's length.
+    total: u64,
+    /// Where this part begins.
+    offset: u64,
+    /// This part's bytes.
+    bytes: Vec<u8>,
+  },
+  /// Read back the part of the object named `identity` from `offset` (appended).
+  ReadPart {
+    /// Its identity.
+    identity: [u8; 32],
+    /// Where the part begins.
+    offset: u64,
   },
   /// A member's answer about the window named `identity`.
   Answer {
@@ -183,6 +226,23 @@ impl HomeMessage {
         out.push(KIND_LET_GO);
         out.extend_from_slice(identity);
       }
+      HomeMessage::PutPart {
+        identity,
+        total,
+        offset,
+        bytes,
+      } => {
+        out.push(KIND_PUT_PART);
+        out.extend_from_slice(identity);
+        out.extend_from_slice(&total.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        put_blob(&mut out, bytes);
+      }
+      HomeMessage::ReadPart { identity, offset } => {
+        out.push(KIND_READ_PART);
+        out.extend_from_slice(identity);
+        out.extend_from_slice(&offset.to_le_bytes());
+      }
       HomeMessage::Answer { identity, outcome } => {
         out.push(KIND_ANSWER);
         out.extend_from_slice(identity);
@@ -199,6 +259,15 @@ impl HomeMessage {
           HomeOutcome::Refused(refusal) => {
             out.push(OUTCOME_REFUSED);
             out.push(refusal.byte());
+          }
+          HomeOutcome::Taken { received } => {
+            out.push(OUTCOME_TAKEN);
+            out.extend_from_slice(&received.to_le_bytes());
+          }
+          HomeOutcome::Part { total, bytes } => {
+            out.push(OUTCOME_PART);
+            out.extend_from_slice(&total.to_le_bytes());
+            put_blob(&mut out, bytes);
           }
         }
       }
@@ -218,6 +287,16 @@ impl HomeMessage {
       },
       KIND_READ => HomeMessage::Read { identity },
       KIND_LET_GO => HomeMessage::LetGo { identity },
+      KIND_PUT_PART => HomeMessage::PutPart {
+        identity,
+        total: reader.long()?,
+        offset: reader.long()?,
+        bytes: reader.blob()?,
+      },
+      KIND_READ_PART => HomeMessage::ReadPart {
+        identity,
+        offset: reader.long()?,
+      },
       KIND_ANSWER => {
         let outcome = match reader.byte()? {
           OUTCOME_KEPT => HomeOutcome::Kept {
@@ -229,6 +308,13 @@ impl HomeMessage {
             let byte = reader.byte()?;
             HomeOutcome::Refused(HomeRefusal::of(byte).ok_or(HomeWireError::Unknown { byte })?)
           }
+          OUTCOME_TAKEN => HomeOutcome::Taken {
+            received: reader.long()?,
+          },
+          OUTCOME_PART => HomeOutcome::Part {
+            total: reader.long()?,
+            bytes: reader.blob()?,
+          },
           byte => return Err(HomeWireError::Unknown { byte }),
         };
         HomeMessage::Answer { identity, outcome }
@@ -315,6 +401,29 @@ mod tests {
         .boxed(),
       identity
         .prop_map(|identity| HomeMessage::LetGo { identity })
+        .boxed(),
+      (identity, any::<u64>(), any::<u64>(), bytes.clone())
+        .prop_map(|(identity, total, offset, bytes)| HomeMessage::PutPart {
+          identity,
+          total,
+          offset,
+          bytes,
+        })
+        .boxed(),
+      (identity, any::<u64>())
+        .prop_map(|(identity, offset)| HomeMessage::ReadPart { identity, offset })
+        .boxed(),
+      (identity, any::<u64>())
+        .prop_map(|(identity, received)| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::Taken { received },
+        })
+        .boxed(),
+      (identity, any::<u64>(), bytes.clone())
+        .prop_map(|(identity, total, bytes)| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::Part { total, bytes },
+        })
         .boxed(),
       (identity, any::<u64>())
         .prop_map(|(identity, generation)| HomeMessage::Answer {

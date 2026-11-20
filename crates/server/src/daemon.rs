@@ -7662,6 +7662,172 @@ mod tests {
     }
   }
 
+  /// A-724 piece 8c (main's order of 2026-11-20: an object past one region message is homed in parts, and a home's holds
+  /// survive its restart). Do: on a daemon over a retained anchor segment, its own region's one home, push the fixtures'
+  /// `create` into a repository (so the successor's recovery frees every restored window nothing holds), then take a put
+  /// of an object two and a half region messages long as a region member sends it, a part at a time (`serve_remote`'s
+  /// `PutPart`s); stop it; start a successor over the same segment and, once it has recovered the repository, read the
+  /// object back a part at a time (`ReadPart`s). Expect: each part but the last answered taken, the last kept; the successor answering every part, the
+  /// parts making the object byte for byte. Before the parts, the object could not be sent (one message carries at most
+  /// `PART_BYTES`); before the region holds rode the shard image, the successor freed it after its replay.
+  #[test]
+  fn t_a724_an_object_past_a_region_message_is_homed_in_parts_and_read_back_after_a_restart() {
+    use slates_anchor::AnchorSegment;
+    use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
+    let profile = test_profile();
+    let instance = format!("a724-parts-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let part = usize::try_from(PART_BYTES).unwrap();
+    let object: Vec<u8> = (0..part * 5 / 2)
+      .map(|at| u8::try_from(at % 253).unwrap_or(0))
+      .collect();
+    let identity = slates_vcs::ContentId::of(&object).0;
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    let put = object.clone();
+    let (made, repository) = std::sync::mpsc::channel();
+    first
+      .observe(shard, move |state| {
+        // A repository beside the object, so the successor's recovery replays its records and then frees every restored
+        // window nothing holds (`release_unheld`): the region hold must be what keeps the object.
+        let repository = crate::git_push::tests::git_repository(state, "beside");
+        crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create"]);
+        let _ = made.send(repository);
+      })
+      .unwrap();
+    let repository = repository.recv().expect("the repository made");
+    first
+      .observe(shard, move |state| {
+        let origin = state.shard;
+        let put = put.clone();
+        let sent = sent.clone();
+        let task = slates_rt::futures::spawn(async move {
+          let total = u64::try_from(put.len()).unwrap();
+          let mut answers = Vec::new();
+          for (at, chunk) in put.chunks(part).enumerate() {
+            let request = HomeMessage::PutPart {
+              identity,
+              total,
+              offset: u64::try_from(at * part).unwrap(),
+              bytes: chunk.to_vec(),
+            }
+            .encode();
+            let reply = crate::vcs_store::homes::serve_remote(
+              origin,
+              &request,
+              crate::daemon::LIVENESS_BUDGET_NS,
+            )
+            .await;
+            answers.push(HomeMessage::decode(&reply).map(|message| match message {
+              HomeMessage::Answer { outcome, .. } => {
+                format!("{outcome:?}").chars().take(24).collect::<String>()
+              }
+              other => format!("{other:?}"),
+            }));
+          }
+          let _ = sent.send(answers);
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let answers = got.recv().expect("the parts answered");
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    let read = move |state: &mut crate::state::ShardState| {
+      let origin = state.shard;
+      let sent = sent.clone();
+      if let Ok(task) = slates_rt::futures::spawn(async move {
+        // The read only once the repository is recovered, so every restored window nothing held is freed by then.
+        loop {
+          let recovered = crate::state::with_state(|state| {
+            state.vcs_stores.unrecovered(repository).is_none()
+              && !state.vcs_stores.rebuilding(repository)
+              && state.vcs_stores.holds(repository)
+          });
+          if recovered != Some(false) {
+            break;
+          }
+          slates_rt::futures::yield_now().await;
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let outcome = loop {
+          let request = HomeMessage::ReadPart {
+            identity,
+            offset: u64::try_from(bytes.len()).unwrap(),
+          }
+          .encode();
+          let reply = crate::vcs_store::homes::serve_remote(
+            origin,
+            &request,
+            crate::daemon::LIVENESS_BUDGET_NS,
+          )
+          .await;
+          match HomeMessage::decode(&reply) {
+            Ok(HomeMessage::Answer {
+              outcome: HomeOutcome::Part { total, bytes: got },
+              ..
+            }) if !got.is_empty() => {
+              bytes.extend_from_slice(&got);
+              if u64::try_from(bytes.len()).unwrap() >= total {
+                break Ok(bytes);
+              }
+            }
+            other => break Err(format!("{other:?}")),
+          }
+        };
+        let _ = sent.send(outcome);
+      }) {
+        let _ = slates_rt::futures::detach(task);
+      }
+    };
+    let started = std::time::Instant::now();
+    let bound = std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    while second.observe(shard, read.clone()).is_err() {
+      assert!(
+        started.elapsed() < bound,
+        "the successor's shard never took the read"
+      );
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+    }
+    let read_back = got.recv().expect("the successor answered");
+    second.stop();
+    drop(segment);
+    let parts = answers.len();
+    assert_eq!(parts, 3, "{answers:?}");
+    assert!(
+      answers[..parts - 1]
+        .iter()
+        .all(|answer| answer.as_ref().is_ok_and(|a| a.starts_with("Taken"))),
+      "{answers:?}"
+    );
+    assert!(
+      answers[parts - 1]
+        .as_ref()
+        .is_ok_and(|a| a.starts_with("Kept")),
+      "{answers:?}"
+    );
+    assert_eq!(read_back.map(|bytes| bytes == object), Ok(true));
+  }
+
   /// A-727 slice b (the content plane's durability barrier; main's order of 2026-11-20). Do: on a daemon over a retained
   /// anchor segment, with version 3 on, push the fixtures' `create`: its record names its names by identity, appended only
   /// once the names are durable (`vcs_store::content_durable`, through the homing); then stop the daemon without

@@ -15412,3 +15412,29 @@ client on B submitting a work A owns, three times; macOS arm64, this Mac, debug,
 ms. With the waiter never attached (the red), each waited out the liveness budget: 1.018, 1.022 and 1.023 s; before the
 fix the first look alone came a heartbeat (100 ms) after the exchange began. The release bench's rerun is owed with the
 by-reference forward's.
+
+## The FSFS view's texts as their stored deltas: 128 and 460 times fewer bytes, reads 8 and 27 times faster (A-645 P3 ruling 3; 2026-11-20)
+
+The A/B main asked for: the hook view's revision files with every text whole (P1, FSFS format 6, `PLAIN`) against every
+text its stored delta (P3, FSFS format 8, `DELTA` over the svn records' svndiff-2 against the skip-delta base, read in
+place). Command: `cargo run --release -p slates-svn --example fsfs_view_bench -- 1000 SIZE` (a repository whose one
+file of SIZE bytes changes a line in each of 1,000 revisions; the whole view laid out, then every revision file read
+through once), the P1 binary built at main 306214c5 and the P3 one at w-reaper's tree over main 45b22689, run
+interleaved under `/usr/bin/time -l`; `... -- 1000 SIZE baseline` stops after the import, so a run's peak RSS less the
+baseline's is the view's own. Mac Studio 2 (macOS arm64, 14 cores), load 8.7 at the start, 2026-11-20 10:28 PST; all
+five runs a side shown.
+
+| SIZE | | view bytes | layout ms | read ms | peak RSS KiB (baseline) |
+|---|---|---|---|---|---|
+| 64 KiB | P1 | 66,002,863 | 4.4, 4.5, 4.4, 4.5, 4.4 | 37.2, 37.4, 35.5, 36.9, 37.5 | 71,568, 71,856, 71,792, 71,664, 71,200 |
+| 64 KiB | P3 | 516,724 | 4.7, 4.6, 4.4, 4.9, 4.8 | 4.5, 4.3, 4.3, 4.7, 4.4 | 71,504, 72,000, 72,048, 72,000, 72,016 |
+| 64 KiB | baseline | | | | 70,288, 70,720, 70,256, 70,208, 70,288 |
+| 256 KiB | P1 | 262,621,861 | 4.7, 4.8, 4.7, 4.7, 4.4 | 121.4, 116.3, 118.4, 113.6, 106.5 | 266,400, 266,048, 266,176, 267,568, 265,200 |
+| 256 KiB | P3 | 571,363 | 5.1, 4.9, 4.9, 4.9, 4.4 | 4.7, 4.4, 4.2, 4.0, 4.0 | 266,432, 397,072, 265,904, 265,888, 264,288 |
+| 256 KiB | baseline | | | | 265,200, 265,072, 266,800, 266,240, 265,072 |
+
+The view's bytes fall 128 and 460 times and its full read 8 and 27 times, since P1 makes every text from its delta chain
+to write it whole and P3 hands the stored delta through. Layout is about 0.3 ms slower in P3 (the map from a text to its
+first representation, which a delta names its base by). Both stream, so the view's own memory is a megabyte or two over
+the import either way; one P3 run (256 KiB, round 2) peaked 132 MB over its baseline, unexplained, the other four within
+a megabyte. Kept: P3. Rejected: P1's whole texts.

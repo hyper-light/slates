@@ -55959,6 +55959,16 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   its work tried as a transaction on the revision before it in a repository cut there, is read by stock `svnlook -t`
   as `svnlook -r` reads the revision: `changed --copy-info`, `info`, `tree`, `dirs-changed` and `diff` (Mac Studio 1,
   Subversion 1.15.0; `fsfs_view` 5 of 5).
+- **Part 3, its first piece (2026-11-20, main's ruling 3 for A-645 P3): FSFS format 8, every text its stored delta.**
+  The svn records keep each text as an svndiff of version 2 against its skip-delta base (S4 c2), FSFS 1.10's own
+  representation, so the view is format 8 (physical addressing, the changed paths' mergeinfo flag, the UUID file's
+  instance line) and writes each text as a `DELTA` representation naming its base's representation, its bytes read
+  where the records keep them (`fsfs::TextDeltas`, `Repository::text_delta`); a text the records keep whole is `PLAIN`
+  through the source as before, and a text that already has a representation names it. No text is made whole. Stock
+  Subversion 1.14.5 (CI ubuntu-latest, diag run 44793305924 over 5e0bfa28): `fsfs_view` 5 of 5, nothing skipped --
+  `svnadmin verify` passes the view, `svnadmin dump` and `--deltas` give `full.dump` and `deltas.dump` byte for byte,
+  `svnlook changed` gives `changed.txt`, and `svnlook -t` reads each work as `-r` reads its revision. The A/B against
+  P1's whole texts is in BENCHMARKS.md (128 and 460 times fewer view bytes, reads 8 and 27 times faster).
 - **Owed.** P3 (the presenter under SLATES_ROOT, after A-727 a2: the hook drivers handing the view's path as REPOS),
   P4, the root mount's publication.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
