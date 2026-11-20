@@ -14514,6 +14514,9 @@ follow the pinned client's own writer (`revlogutils/deltas.py`), so a stream clo
 would have built, and `hg verify` on the clone is the check: the rule is the client's, not a slates tunable. A stream
 is offered only when it holds nothing the principal may not read. The same rendering is the read-only repository the
 admission hooks see and what an export lands (§4.15).
+Status (A-706, stream clones part 1): `slates_hg::render` renders the index whole into those files, each revision a full
+text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
+deltas, the rendering appended as versions commit, `stream_out` and `stream2` are later parts.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:

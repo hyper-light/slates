@@ -94,6 +94,7 @@ pub mod push;
 pub mod pushkey;
 mod quote;
 mod read;
+pub mod render;
 pub mod revlog;
 pub mod serve;
 pub mod ssh;

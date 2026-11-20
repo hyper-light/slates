@@ -1307,8 +1307,10 @@
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
 > `check:phases` (one position for every phase) measured under concurrent pushes before it is kept; (6) the changesets
-> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream
-> clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
+> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (rendered
+> since A-706, `render::render`: split revlog v1 generaldelta revlogs of full texts, fncache, phaseroots, bookmarks,
+> obsstore; stock 7.2 `hg verify` passes on the rendered `dot` and `states` fixtures; owed: deltas and compression,
+> rendering in slices as versions commit; then `stream_out`, `stream2`, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
 > lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
 > against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
