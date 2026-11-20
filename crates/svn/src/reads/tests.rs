@@ -44,7 +44,7 @@ type GreenNode = (NodeKind, PropertyList);
 /// The green the transcripts' repository holds: every revision's tree, the property lists, the texts and the revision
 /// properties.
 #[derive(Debug, Default)]
-struct Green {
+pub(crate) struct Green {
   /// Every revision's whole tree.
   trees: Vec<BTreeMap<String, GreenNode>>,
   /// The property lists, by identity.
@@ -115,11 +115,11 @@ impl Repository for Green {
 }
 
 /// The index and the green of the transcripts' repository.
-struct Fixture {
+pub(crate) struct Fixture {
   /// The index.
-  index: Index,
+  pub(crate) index: Index,
   /// The green.
-  green: Green,
+  pub(crate) green: Green,
 }
 
 /// Bytes from hex.
@@ -148,7 +148,7 @@ fn at_or_beneath(place: &str, path: &str) -> bool {
 
 impl Fixture {
   /// The repository `repository.txt` records, rebuilt revision by revision.
-  fn new() -> Self {
+  pub(crate) fn new() -> Self {
     let mut fixture = Self {
       index: Index::new(),
       green: Green::default(),

@@ -8798,70 +8798,68 @@ mod upcase_name_tests {
     rows
   }
 
-  /// A-576, T-4.6 on a WinFsp drive's volume. Do: on a volume folding by Windows' upcase table, make `σ.txt`, then make
-  /// `ς.txt`, link `Σ.TXT` to another file, and rename that file onto `ς.txt`; make a precomposed and a decomposed `é`;
-  /// then make `σ.txt` and `ς.txt` on a `Fold` volume. Expect: under `Upcase` the make and the link refused `EEXIST`,
-  /// every spelling finding the one entry, the rename replacing that entry so one name is left, and the two `é` two
-  /// files, as on NTFS; under `Fold` two files, which a WinFsp drive takes for one name (A-551's third case).
+  /// A-576, A-737, T-4.6 on a WinFsp drive's volume. Do: on a volume folding by Windows' upcase table, make `ɐ.txt`,
+  /// then make `Ɐ.TXT`, link `Ɐ.Txt` to another file, and rename that file onto `Ɐ.txt`; make `σ.txt` and `ς.txt`, and a
+  /// precomposed and a decomposed `é`; then make the Kelvin sign's `K.txt` and `k.txt` on a `Fold` volume. Expect: under
+  /// `Upcase` the make and the link refused `EEXIST`, every spelling finding the one entry, the rename replacing that
+  /// entry so one name is left, and the sigmas and the two `é` four files, as on NTFS (Windows' table leaves final sigma
+  /// as it is, A-737); under `Fold` one name, which a WinFsp drive takes for two (A-551's third case).
   #[test]
   fn a_name_windows_folds_alike_to_an_entry_is_that_entry() {
     let mut store = store();
     let mut upcase = volume(&mut store, NameEquivalence::Upcase);
     let root = upcase.root();
-    let sigma = upcase
-      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+    let turned = upcase
+      .create_file(&mut store, root, "\u{250}.txt", MODE)
       .unwrap();
     assert_eq!(
-      upcase.create_file(&mut store, root, "\u{3c2}.txt", MODE),
+      upcase.create_file(&mut store, root, "\u{2c6f}.TXT", MODE),
       Err(VfsError::AlreadyExists)
     );
-    for spelling in ["\u{3c2}.txt", "\u{3a3}.TXT", "\u{3c3}.Txt"] {
+    for spelling in ["\u{2c6f}.txt", "\u{2c6f}.TXT", "\u{250}.Txt"] {
       assert_eq!(
         upcase
           .lookup(&store, root, spelling)
           .map(|found| found.inode),
-        Ok(sigma),
+        Ok(turned),
         "{spelling:?}"
       );
     }
     let other = upcase.create_file(&mut store, root, "other", MODE).unwrap();
     assert_eq!(
-      upcase.link(&mut store, root, "\u{3a3}.TXT", other),
+      upcase.link(&mut store, root, "\u{2c6f}.Txt", other),
       Err(VfsError::AlreadyExists)
     );
     upcase
-      .rename(&mut store, root, "other", root, "\u{3c2}.txt")
+      .rename(&mut store, root, "other", root, "\u{2c6f}.txt")
       .unwrap();
     let left = listed(&upcase, &store);
     assert_eq!(left.len(), 1, "one name is left: {left:?}");
     assert_eq!(
       upcase
-        .lookup(&store, root, "\u{3c3}.txt")
+        .lookup(&store, root, "\u{250}.txt")
         .map(|found| found.inode),
       Ok(other)
     );
-    upcase
-      .create_file(&mut store, root, "caf\u{e9}", MODE)
-      .unwrap();
-    upcase
-      .create_file(&mut store, root, "cafe\u{301}", MODE)
-      .unwrap();
-    assert_eq!(listed(&upcase, &store).len(), 3);
+    for apart in ["\u{3c3}.txt", "\u{3c2}.txt", "caf\u{e9}", "cafe\u{301}"] {
+      upcase.create_file(&mut store, root, apart, MODE).unwrap();
+    }
+    assert_eq!(listed(&upcase, &store).len(), 5);
 
     let mut store = self::store();
     let mut fold = volume(&mut store, NameEquivalence::Fold);
     let root = fold.root();
     fold
-      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .create_file(&mut store, root, "\u{212a}.txt", MODE)
       .unwrap();
-    fold
-      .create_file(&mut store, root, "\u{3c2}.txt", MODE)
-      .unwrap();
-    assert_eq!(listed(&fold, &store).len(), 2);
+    assert_eq!(
+      fold.create_file(&mut store, root, "k.txt", MODE),
+      Err(VfsError::AlreadyExists)
+    );
   }
 
-  /// A-576. Do: make `σ.txt` on a volume folding by Windows' upcase table, image it, and rebuild it in a fresh store as
-  /// a restart does; then make `ς.txt` and look `Σ.TXT` up there. Expect: the rebuilt volume folds as the table does, so
+  /// A-576, A-737. Do: make `ɐ.txt` on a volume folding by Windows' upcase table, image it, and rebuild it in a fresh
+  /// store as a restart does; then make `Ɐ.TXT` and look `Ɐ.txt` up there. Expect: the rebuilt volume folds as the table does, so
   /// the make is refused `EEXIST` and the look-up finds the file: the image keeps the policy and the rebuilt directory
   /// is ordered and found by the table's hash.
   #[test]
@@ -8870,7 +8868,7 @@ mod upcase_name_tests {
     let mut upcase = volume(&mut store, NameEquivalence::Upcase);
     let root = upcase.root();
     upcase
-      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .create_file(&mut store, root, "\u{250}.txt", MODE)
       .unwrap();
     let image = upcase.to_image(&store, None).unwrap();
     let mut fresh = self::store();
@@ -8887,9 +8885,9 @@ mod upcase_name_tests {
     let root = rebuilt.root();
     assert_eq!(rebuilt.policy(), NameEquivalence::Upcase);
     assert_eq!(
-      rebuilt.create_file(&mut fresh, root, "\u{3c2}.txt", MODE),
+      rebuilt.create_file(&mut fresh, root, "\u{2c6f}.TXT", MODE),
       Err(VfsError::AlreadyExists)
     );
-    assert!(rebuilt.lookup(&fresh, root, "\u{3a3}.TXT").is_ok());
+    assert!(rebuilt.lookup(&fresh, root, "\u{2c6f}.txt").is_ok());
   }
 }

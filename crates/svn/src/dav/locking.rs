@@ -914,7 +914,7 @@ fn malformed_token_message(token: &str) -> String {
 
 /// The status `dav_svn__convert_err` gives a Subversion error (`util.c` 140-157): its own for the codes it maps, else
 /// `status`, the one its caller suggests (the lock verbs' 500, a log-report's 400).
-pub(crate) fn convert_status(code: u32, status: u16) -> u16 {
+pub fn convert_status(code: u32, status: u16) -> u16 {
   if NOT_FOUND_CODES.contains(&code) {
     HTTP_NOT_FOUND
   } else if code == SVN_ERR_UNSUPPORTED_FEATURE {
@@ -930,7 +930,7 @@ pub(crate) fn convert_status(code: u32, status: u16) -> u16 {
 
 /// An answer with a `D:error` body as `dav_error_response_tag` and `dav_svn__error_response_tag` write one: the
 /// Subversion error's own element when `tagged`, then its code and message.
-pub(crate) fn error_answer(status: u16, tagged: bool, code: u32, message: &str) -> HttpAnswer {
+pub fn error_answer(status: u16, tagged: bool, code: u32, message: &str) -> HttpAnswer {
   let element = if tagged {
     " xmlns:C=\"svn:\">\n<C:error/>\n"
   } else {

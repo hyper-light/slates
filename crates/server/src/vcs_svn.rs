@@ -163,6 +163,9 @@ const NANOS_PER_MICRO: i64 = 1_000;
 
 /// Counter: a lock verb's entries the owner's step refused, answered in each judged path's place.
 const LOCKS_REFUSED: &str = "vcs_svn.locks_refused";
+/// Counter: a conversation's turn begun in the same poll of its shard as the turn before it, no other task run between
+/// them ([`go_on`]): a bug signal, a long answer or pipelined commands holding the shard (the git/git `svnrdump` spin).
+pub(crate) const TURNS_UNYIELDED: &str = "vcs_svn.turns_unyielded";
 
 /// Counter: a lock verb whose new token the system's generator could not draw: its landing refused.
 const TOKEN_UNDRAWN: &str = "vcs_svn.token_undrawn";
@@ -673,6 +676,14 @@ enum Next {
   },
   /// The client asked for a lock verb, its first `consumed` bytes: judge it, land its entries, answer it.
   LockAsked(usize),
+  /// The client asked for a revision property change past its checks, its first `consumed` bytes: run its hooks
+  /// around its record.
+  RevisionProperty {
+    /// The pre-hook's call.
+    call: Box<slates_svn::serve::RevisionPropertyCall>,
+    /// The bytes taken.
+    consumed: usize,
+  },
   /// The commit's drive accepted `work` at `close-edit`, its first `consumed` bytes taken: land it.
   Accepted {
     /// The work.
@@ -746,8 +757,23 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
 /// ([`migrate`]), its seat here given back as it leaves.
 async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
   let mut out = Vec::new();
+  let mut last_poll = None;
   loop {
-    match step(&stream, &mut conversation, &mut out, &seat).await {
+    // The shard's polls so far: unchanged since the last turn began, this turn follows it with nothing run between.
+    let poll = futures::polls_so_far();
+    if poll.is_some() && poll == last_poll {
+      let _ = crate::state::with_state(|state| state.count(TURNS_UNYIELDED, 1));
+    }
+    last_poll = poll;
+    let went = step(&stream, &mut conversation, &mut out, &seat).await;
+    // A turn that never waited yields before the next: a long answer (a replay-range over a whole history, a checkout)
+    // or commands pipelined in one read are many turns with no wait between, and a client that drains the socket as
+    // fast as it is written never makes a write wait either, so without the yield the shard never steps (git/git's
+    // last 2,000 commits through `svnrdump dump`: "shard 0 is spinning: 3596 ms" after 53 MB).
+    if matches!(went, Stepped::Go) && futures::polls_so_far() == poll {
+      futures::yield_now().await;
+    }
+    match went {
       Stepped::Go => {}
       Stepped::End => return,
       Stepped::Elsewhere(found, located) => {
@@ -772,7 +798,11 @@ async fn step(
   seat: &Seat,
 ) -> Stepped {
   out.clear();
-  let next = answer(conversation, out);
+  let next = {
+    // A-740: a shard stuck answering a call (a replay, a log, an update's drive) names it.
+    let _doing = slates_rt::futures::doing("vcs_svn::answer");
+    answer(conversation, out)
+  };
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
@@ -816,12 +846,17 @@ async fn follow(
       consume(conversation, consumed);
       lock(stream, conversation, out).await
     }
+    Next::RevisionProperty { call, consumed } => {
+      consume(conversation, consumed);
+      revision_property(stream, conversation, &call, out).await
+    }
     Next::Hook { due, consumed } => {
       consume(conversation, consumed);
       answer_hook(stream, conversation, &due, out).await
     }
     Next::Accepted { work, consumed } => {
       consume(conversation, consumed);
+      let _doing = slates_rt::futures::doing("vcs_svn::land");
       land(stream, conversation, *work, out).await
     }
   };
@@ -981,6 +1016,7 @@ fn next_of(
     },
     Ok(Turn::CommitAsked { consumed }) => Next::CommitAsked(consumed),
     Ok(Turn::LockAsked { consumed }) => Next::LockAsked(consumed),
+    Ok(Turn::RevisionPropertyHook { call, consumed }) => Next::RevisionProperty { call, consumed },
     Ok(Turn::Hook { due, consumed }) => Next::Hook { due, consumed },
     Ok(Turn::Accepted { work, consumed }) => Next::Accepted { work, consumed },
     Err(_) => Next::End,
@@ -1126,19 +1162,115 @@ fn land_locks(
   if entries.is_empty() {
     return Ok(());
   }
-  let id = opened.id;
-  crate::state::with_state(|state| {
-    svn_commit::record(
-      state,
-      (principal, id),
-      slates_svn::commit::record::Record::Locks(entries),
-    )
-  })
-  .unwrap_or(Err(svn_commit::Uncommitted::NotHeld))
-  .map_err(|refused| {
+  land_record(
+    (principal, opened.id),
+    slates_svn::commit::record::Record::Locks(entries),
+  )
+  .map_err(|failure| {
     crate::fleet::count_refusal(LOCKS_REFUSED);
-    refused.failure()
+    failure
   })
+}
+
+/// Lands `record` on `repository`'s logs by `principal` through the owner's step (`svn_commit::record`): `Ok`, or the
+/// step's refusal as the connection answers it.
+fn land_record(
+  (principal, repository): (&Principal, RepositoryId),
+  record: slates_svn::commit::record::Record,
+) -> Result<(), (u32, String)> {
+  crate::state::with_state(|state| svn_commit::record(state, (principal, repository), record))
+    .unwrap_or(Err(svn_commit::Uncommitted::NotHeld))
+    .map_err(|refused| refused.failure())
+}
+
+/// Runs the client's revision property change past its checks (A-702 part 2; `fs-wrap.c`
+/// `svn_repos_fs_change_rev_prop4`), `call` its pre-hook's: pre-revprop-change, whose refusal (165006 where none is
+/// configured) is the answer; then the change judged over the repository's sources and its record landed through the
+/// owner's step with no wait between (`Record::RevisionProperties`), so no other change lands in between; then
+/// post-revprop-change with the old value, its verdict the command's end. Whether the conversation goes on, the answer in
+/// `out`; a client that left while a hook ran ends it.
+async fn revision_property(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  call: &slates_svn::serve::RevisionPropertyCall,
+  out: &mut Vec<u8>,
+) -> bool {
+  let room = conversation.limits.item_bytes;
+  let Some(hooked) = conversation.opened.as_ref().map(Opened::hooked) else {
+    return false;
+  };
+  let site = HookSite::Listener(stream);
+  let Some(verdict) =
+    revision_property_hook(site, &hooked, room, HookPoint::SvnPreRevpropChange, call).await
+  else {
+    return false;
+  };
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = &mut *conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return false;
+  };
+  let judged = lent_sources(opened, principal, |sources| {
+    connection.revision_property_hooked(sources, verdict, out)
+  });
+  let record = match judged {
+    Some(Ok(Some(record))) => record,
+    Some(Ok(None)) => return true,
+    Some(Err(_)) | None => return false,
+  };
+  let landed = land_record((principal, opened.id), record);
+  let post = match connection.revision_property_landed(landed, out) {
+    Ok(Some(post)) => post,
+    Ok(None) => return true,
+    Err(_) => return false,
+  };
+  let Some(ended) =
+    revision_property_hook(site, &hooked, room, HookPoint::SvnPostRevpropChange, &post).await
+  else {
+    return false;
+  };
+  conversation
+    .connection
+    .revision_property_finished(ended, out)
+    .is_ok()
+}
+
+/// Runs the revision-property hook at `point` (pre- or post-revprop-change) for `call` (A-702 part 2): its verdict, or
+/// `None` where the client left before it ended.
+pub(crate) async fn revision_property_hook(
+  site: HookSite<'_>,
+  hooked: &Hooked,
+  words_cap: usize,
+  point: HookPoint,
+  call: &slates_svn::serve::RevisionPropertyCall,
+) -> Option<Result<(), Vec<(u32, String)>>> {
+  use slates_svn::serve::RevisionPropertyAction as Action;
+  let action = match call.action {
+    Action::Added => vcs_hooks::RevpropAction::Added,
+    Action::Modified => vcs_hooks::RevpropAction::Modified,
+    Action::Deleted => vcs_hooks::RevpropAction::Deleted,
+  };
+  let input = if point == HookPoint::SvnPreRevpropChange {
+    vcs_hooks::svn_pre_revprop_change
+  } else {
+    vcs_hooks::svn_post_revprop_change
+  };
+  run_hook(site, hooked, words_cap, point, |env, repos| {
+    let change = vcs_hooks::RevpropChange {
+      repository: repos,
+      revision: call.revision,
+      author: &call.user,
+      property: &call.name,
+      action,
+    };
+    input(CommittedView(call.revision), env, change, &call.value)
+  })
+  .await
+  .verdict
 }
 
 /// Runs the verb's pre-hook for each path in `call` in turn (A-730): each path's verdict, its refusal's chain or
@@ -1364,15 +1496,22 @@ impl Opened {
 }
 
 /// Where a hook's run is asked from (A-730): the `svn://` listener's connection, whose repository's policy is read on
-/// its owner shard and whose client's hang-up ends the run; or the `svn+ssh://` tunnel, which holds its repository's
-/// record and has no signal of its client gone yet (owed with git's on the SSH edge), so a run there ends at its learned
-/// bound or by itself.
+/// its owner shard and whose client's hang-up ends the run; the `svn+ssh://` tunnel, which holds its repository's
+/// record, its client's hang-up the SSH edge's signal (A-736); or the DAV site's exchange (A-733).
 #[derive(Clone, Copy)]
 pub(crate) enum HookSite<'a> {
   /// The listener's connection.
   Listener(&'a TcpStream),
-  /// The tunnel's repository policy.
-  Tunnel(&'a slates_db::catalog::RepositoryPolicy),
+  /// The tunnel's repository policy, and the SSH edge's signal of its client gone (A-736).
+  Tunnel(
+    &'a slates_db::catalog::RepositoryPolicy,
+    crate::vcs_ssh::site::ClientGone<'a>,
+  ),
+  /// The DAV site's exchange (A-733): its client's hang-up and its repository's policy.
+  Http(
+    crate::vcs_http::ClientGone<'a>,
+    &'a slates_db::catalog::RepositoryPolicy,
+  ),
 }
 
 /// Runs the hook `repository`'s policy configures at `point` with the input `input` builds from the policy's hooks-env
@@ -1406,17 +1545,21 @@ pub(crate) async fn run_hook(
           token: None,
         };
       };
-      run_svn_hook(&policy, repository, words_cap, point, input, Some(stream)).await
+      let gone = crate::vcs_http::ClientGone::watching(stream).gone();
+      run_svn_hook(&policy, repository, words_cap, point, input, gone).await
     }
-    HookSite::Tunnel(policy) => {
-      run_svn_hook(policy, repository, words_cap, point, input, None).await
+    HookSite::Tunnel(policy, gone) => {
+      run_svn_hook(policy, repository, words_cap, point, input, gone.gone()).await
+    }
+    HookSite::Http(client, policy) => {
+      run_svn_hook(policy, repository, words_cap, point, input, client.gone()).await
     }
   }
 }
 
 /// Runs the hook `policy` configures at `point` (`crate::svn_hooks::run`, the hook driver of A-622 with A-623's
-/// Subversion rules), held to the bound its runs taught this shard and ended if the client hangs up where `stream` names
-/// its connection, then teaches the shard what this run showed. A point with no hook answers at once, running nothing,
+/// Subversion rules), held to the bound its runs taught this shard and ended when `gone` answers (its client hung up),
+/// then teaches the shard what this run showed. A point with no hook answers at once, running nothing,
 /// as `svnserve` does.
 #[cfg(unix)]
 async fn run_svn_hook(
@@ -1425,7 +1568,7 @@ async fn run_svn_hook(
   words_cap: usize,
   point: HookPoint,
   input: impl FnOnce(&vcs_hooks::SvnHooksEnv, &str) -> vcs_hooks::HookInput,
-  stream: Option<&TcpStream>,
+  gone: impl core::future::Future<Output = ()>,
 ) -> HookAnswer {
   use crate::svn_hooks::{SvnHookSite, configured, run};
   let bound_ns = crate::state::with_state(|state| {
@@ -1438,12 +1581,6 @@ async fn run_svn_hook(
     policy,
     view_root: std::path::Path::new(HOOK_DIRECTORY),
     words_cap,
-  };
-  let gone = async {
-    match stream {
-      Some(stream) => crate::vcs_http::ClientGone::watching(stream).gone().await,
-      None => core::future::pending::<()>().await,
-    }
   };
   let ran = run(&site, &input, bound_ns, gone).await;
   if let (Some(lesson), Some(hook)) = (ran.lesson, configured(policy, point)) {
@@ -1471,7 +1608,7 @@ async fn run_svn_hook(
   _words_cap: usize,
   point: HookPoint,
   _input: impl FnOnce(&vcs_hooks::SvnHooksEnv, &str) -> vcs_hooks::HookInput,
-  _stream: Option<&TcpStream>,
+  _gone: impl core::future::Future<Output = ()>,
 ) -> HookAnswer {
   let configured = policy
     .hooks
@@ -1955,4 +2092,4 @@ async fn read_more(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

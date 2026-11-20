@@ -13,7 +13,8 @@ use slates_git::upload::{PackPlan, PackRefused, PackSource, Served};
 use slates_vcs::ContentStore;
 
 use super::super::site::{
-  Command, GIT_DIE_STATUS, Next, Refused, Service, Services, Start, Stepped, ToolServices, Unserved,
+  ClientGone, Command, GIT_DIE_STATUS, Next, Refused, Service, Services, Start, Stepped,
+  ToolServices, Unserved,
 };
 use super::UploadCommand;
 use crate::vcs_http::git::{StoreLender, ThisShard};
@@ -178,7 +179,7 @@ fn run(command: &mut UploadCommand<Lends>) -> (Vec<u8>, usize, Next) {
     let Stepped {
       consumed: took,
       next,
-    } = ready(command.step()).expect("a step");
+    } = ready(command.step(ClientGone::never())).expect("a step");
     consumed += took;
     let out = command.output().1.to_vec();
     command.sent(0, out.len());
@@ -290,7 +291,7 @@ fn the_end_of_input_inside_a_request_dies_as_gits_reader_does() {
   command.input(LS_REFS_FIRST_PACKET).expect("taken");
   let waiting = run(&mut command);
   command.input_end();
-  let ended = ready(command.step());
+  let ended = ready(command.step(ClientGone::never()));
   assert_eq!(
     (waiting, ended),
     (
@@ -306,6 +307,7 @@ fn the_end_of_input_inside_a_request_dies_as_gits_reader_does() {
 /// The git repository `id`, the owner's, with no rules.
 fn record(id: RepositoryId) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id,
     name: "r.git".to_owned(),
     tool: VcsTool::Git,

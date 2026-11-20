@@ -155,16 +155,140 @@ fn made(
     .ok_or(Unmade::Authorship)?;
   // The commit's date is the owner's instant, read once; the commit's bytes carry it, so a replay reads no clock.
   let seconds = u64::try_from(state.clock.wall_ns().div_euclid(NANOS_PER_SECOND)).unwrap_or(0);
-  let parent = parent_of(state, repository, green);
   let authored = (
     message,
     identity.name.as_str(),
     identity.email.as_str(),
     seconds,
   );
-  let objects = commit_objects(state, repository, (key, version), authored, parent)?;
-  admitted(state, repository, (key, version), objects)?;
+  made_authored(state, (repository, green, version), authored)?;
   Ok(true)
+}
+
+/// The commit of `green`'s `version` made over its kept trees as `authored`, its parent the commit before, recorded and
+/// admitted: [`made`]'s and [`made_owed`]'s last steps.
+fn made_authored(
+  state: &mut ShardState,
+  (repository, green, version): (RepositoryId, DbVolumeId, u64),
+  authored: Authored<'_>,
+) -> Result<(), Unmade> {
+  let key = green_key(green);
+  let parent = parent_of(state, repository, green);
+  let objects = commit_objects(state, repository, (key, version), authored, parent)?;
+  admitted(state, repository, (key, version), objects)
+}
+
+/// The status count of the commits owed by submits whose maps are built whole after them (A-664's live whole builds,
+/// part 2, `super::owed`).
+pub(crate) const OWED: &str = "vcs_commits.owed";
+
+/// What a submit to `green` that committed `version` on the owner leaves of git's commit (module docs; A-664's live
+/// whole builds, part 2): where the green's map of the version before is kept, the map stepped and the commit made in
+/// this step, as before; where it must be built from the whole head, the commit owed, staged in this transaction
+/// (`super::owed`), and the map built in slices after it (`super::paths::whole_build`), whose end makes the commit from
+/// what was staged. Nothing for a green of no git repository. Counted.
+pub(crate) fn after_submit(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  authorship: &Authorship,
+) {
+  let whole = super::paths::git_repository_of(state, green)
+    .filter(|repository| super::paths::needs_whole(state, (*repository, green), version));
+  let Some(repository) = whole else {
+    super::paths::advance(state, green, version);
+    make(state, green, version, authorship);
+    return;
+  };
+  match staged(state, (repository, green, version), authorship) {
+    Ok(()) => {
+      state.count(OWED, 1);
+      super::paths::whole_build::start(state, repository, green, version);
+    }
+    Err(_) => {
+      // Nothing was staged: the map is stepped here, as before, and the commit made or counted unmade.
+      state.count(UNMADE, 1);
+      super::paths::advance(state, green, version);
+    }
+  }
+}
+
+/// Stages the commit `authorship` owes of `green`'s `version` (`super::owed`): its record appended in the running
+/// transaction in an entry of the register holding it alone, the register's guard first, then kept by the store.
+fn staged(
+  state: &mut ShardState,
+  (repository, green, version): (RepositoryId, DbVolumeId, u64),
+  authorship: &Authorship,
+) -> Result<(), Unmade> {
+  let message = authorship.message.as_deref().ok_or(Unmade::Authorship)?;
+  let identity = authorship
+    .identities
+    .git
+    .as_ref()
+    .ok_or(Unmade::Authorship)?;
+  let key = green_key(green);
+  let owed = super::owed::Owed {
+    key,
+    version,
+    seconds: u64::try_from(state.clock.wall_ns().div_euclid(NANOS_PER_SECOND)).unwrap_or(0),
+    message: message.to_owned(),
+    name: identity.name.clone(),
+    email: identity.email.clone(),
+  };
+  let entry = Op::RepositoryAdvanced {
+    entry: RepositoryEntry {
+      repository,
+      objects: owed.encode(),
+      ..RepositoryEntry::default()
+    },
+  };
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .partition()
+    .check(&entry, now)
+    .map_err(|error| Unmade::Entry(refusal_of_db(&error)))?;
+  state
+    .db
+    .mutate(&mut state.segment, &entry, now)
+    .map_err(|error| Unmade::Entry(refusal_of_db(&error)))?;
+  if let Some((_, git)) = state.vcs_stores.git(repository) {
+    git.owed.insert(key, owed);
+  }
+  Ok(())
+}
+
+/// Makes the commit owed of `green` (`super::owed`), its map kept at the owed version, from what was staged and never the
+/// clock, in a transaction of its own; counted. Nothing where none is owed, or the map is of another version.
+pub(crate) fn make_owed(state: &mut ShardState, green: DbVolumeId) {
+  let Some(repository) = super::paths::git_repository_of(state, green) else {
+    return;
+  };
+  let key = green_key(green);
+  let Some(owed) = state
+    .vcs_stores
+    .git_ref(repository)
+    .and_then(|(_, git)| git.owed.get(&key).cloned())
+  else {
+    return;
+  };
+  state.db.begin();
+  let authored = (
+    owed.message.as_str(),
+    owed.name.as_str(),
+    owed.email.as_str(),
+    owed.seconds,
+  );
+  let made = made_authored(state, (repository, green, owed.version), authored);
+  match (made, state.db.commit(&mut state.segment)) {
+    (Ok(()), Ok(_)) => state.count(MADE, 1),
+    (Ok(()), Err(_)) => {
+      // The store is ahead of a log that refused the entry: made again from the log, where the commit is owed still.
+      super::rebuild(state, repository);
+      state.count(UNMADE, 1);
+    }
+    (Err(_), _) => state.count(UNMADE, 1),
+  }
 }
 
 /// Whether the store holds a version of the green keyed `key` at or past its version `version`: a commit made already.

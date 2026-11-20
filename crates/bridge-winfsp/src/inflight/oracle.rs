@@ -550,7 +550,7 @@ fn serve_with(held: &mut Held, ledger: &mut Ledger<HeldMemory>, lags: bool) -> R
   let mut scratch = Scratch::new().map_err(text)?;
   let mut copy = held.journal.clone();
   let saved_open = settle::saved_open(&mut copy).map_err(text)?;
-  ledger.settle_pending(saved_open).map_err(text)?;
+  ledger.settle_pending(&[saved_open]).map_err(text)?;
   // Once the one unconfirmed open is settled, every file the driver holds open must have a live context, but one whose
   // Close the dead daemon had taken: it may have retired the open (or torn the retiring frame, which quarantines it)
   // before it died, and the replayed Close finds it done.
@@ -614,7 +614,7 @@ fn check(held: &mut Held, scenario: &str) {
   .unwrap();
   // An open whose confirmation the shard had not applied is kept only on the journal's word, as a successor keeps it.
   let saved_open = settle::saved_open(&mut held.journal.clone()).unwrap();
-  ledger.settle_pending(saved_open).unwrap();
+  ledger.settle_pending(&[saved_open]).unwrap();
   let live: BTreeSet<u64> = ledger.live().map(|(context, _)| context).collect();
   let open: BTreeSet<u64> = driver.held.values().copied().collect();
   assert_eq!(

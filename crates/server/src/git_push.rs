@@ -201,6 +201,9 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   admission: Admission,
   /// The push counted live among its repository's intakes until it drops (A-724, `crate::vcs_share`).
   _live: crate::vcs_share::Live,
+  /// The push counted decoding on its shard until it drops (A-724, `crate::vcs_share::place`): the load the placement
+  /// of A-722's intake off the owner shard reads.
+  _decoding: crate::vcs_share::place::Decoding,
   /// What shows a hook's view at a path a hook runs in.
   #[cfg(unix)]
   presenter: P,
@@ -364,6 +367,7 @@ impl<P> ReceivePack<P> {
       session,
       admission: Admission::new(crate::vcs_share::room(state, repository).bytes),
       _live: crate::vcs_share::Live::begin(repository),
+      _decoding: crate::vcs_share::place::Decoding::begin(state.shard),
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
       #[cfg(unix)]

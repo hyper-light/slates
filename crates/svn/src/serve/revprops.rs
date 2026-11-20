@@ -1,5 +1,5 @@
 //! ra_svn's revision property changes (`serve.c` `change_rev_prop` 1266, `change_rev_prop2` 1226 and
-//! `do_change_rev_prop` 1198, `fs-wrap.c` `svn_repos_fs_change_rev_prop4`, Subversion 1.15.0; A-702 part 1):
+//! `do_change_rev_prop` 1198, `fs-wrap.c` `svn_repos_fs_change_rev_prop4`, Subversion 1.15.0; A-702 parts 1 and 2):
 //! `change-rev-prop ( rev:number name:string [ value:string ] )` and
 //! `change-rev-prop2 ( rev:number name:string ( [ value:string ] ) ( dont-care:bool [ previous-value:string ] ) )`.
 //!
@@ -13,19 +13,27 @@
 //! such revision N" (160006); then `svn_repos__validate_prop` (the commit drive's words); then, where no previous
 //! value was named, the revision must exist to read it from (160006).
 //!
-//! **Then the hook.** `svnserve` changes a revision property only where a pre-revprop-change hook allows it, and a
-//! repository with none refuses every change "Repository has not been enabled to accept revision propchanges;\nask
-//! the administrator to create a pre-revprop-change hook" (165006). No ra_svn path runs a repository's hooks yet
-//! (`crate::serve`'s commit refuses where one is configured), so every change is answered so: the change itself, its
-//! previous value's check (`SVN_ERR_FS_PROP_BASEVALUE_MISMATCH`), its record through the owner's step
-//! (`Record::RevisionProperties`) and post-revprop-change wait on the hooks running (GAPS, A-702).
+//! **Then the hooks** (A-702 part 2), handed to the caller as the lock verbs hand theirs (A-730): the change's
+//! pre-revprop-change call ([`RevisionPropertyCall`]: the revision, the user, the name, the action and the new value,
+//! the action read against the value the client expects, else the one held), on whose refusal its chain is the answer;
+//! a repository with none refuses every change 165006 in the hooks' runner (`svn_hooks`). Allowed, the change is judged
+//! at the owner's instant ([`Connection::revision_property_hooked`]): a revision not held "No such revision N"
+//! (160006), a held value other than the one expected "revprop 'NAME' has unexpected value in filesystem"
+//! (`SVN_ERR_FS_PROP_BASEVALUE_MISMATCH`, FSFS's `change_rev_prop`); else the revision's properties whole, which the
+//! caller lands through the owner's step (`Record::RevisionProperties`). Landed, post-revprop-change is handed out with
+//! the old value ([`Connection::revision_property_landed`]); its verdict ends the command, `( success ( ) )` or its
+//! chain ([`Connection::revision_property_finished`]).
 
+use super::Phase;
 use super::{
   Connection, Established, Interrupted, Refused, Sources, principal_name, write_failure,
 };
 use crate::commit::drive::{self as commit_drive, may_write, revision_property_errors};
+use crate::commit::record::Record;
 use crate::index::Revision;
+use crate::migration::Properties;
 use crate::ra_svn::{self, Value};
+use crate::reads;
 use crate::report::ReportFailure;
 
 /// `change-rev-prop`'s command word.
@@ -39,11 +47,9 @@ const INCORRECT_PARAMS: u32 = 200_004;
 const AUTHZ_UNREADABLE: u32 = 220_001;
 /// Format: `SVN_ERR_FS_NO_SUCH_REVISION` (`svn_error_codes.h`: the filesystem category's start, 160,000, plus 6).
 const NO_SUCH_REVISION: u32 = 160_006;
-/// Format: `SVN_ERR_REPOS_DISABLED_FEATURE` (`svn_error_codes.h`: the repository category's start, 165,000, plus 6).
-const DISABLED_FEATURE: u32 = 165_006;
-/// `svn_repos__hooks_pre_revprop_change`'s words for a repository with no pre-revprop-change hook (`hooks.c`).
-const NO_HOOK_WORDS: &str = "Repository has not been enabled to accept revision propchanges;\nask the administrator to \
-                             create a pre-revprop-change hook";
+/// Format: `SVN_ERR_FS_PROP_BASEVALUE_MISMATCH` (`svn_error_codes.h`: the filesystem category's start, 160,000, plus
+/// 49).
+const BASEVALUE_MISMATCH: u32 = 160_049;
 /// `change_rev_prop2`'s words for a request naming both `dont-care` and a previous value.
 const BOTH_WORDS: &str =
   "'previous-value' and 'dont-care' cannot both be set in 'change-rev-prop2' request";
@@ -67,8 +73,8 @@ struct Change {
   name: Vec<u8>,
   /// The new value; none deletes it.
   value: Option<Vec<u8>>,
-  /// Whether the client named the value it expects the property to hold (`change-rev-prop2` without `dont-care`).
-  expects: bool,
+  /// The value the client expects the property to hold, none for absent (`change-rev-prop2` without `dont-care`).
+  expected: Option<Option<Vec<u8>>>,
   /// Whether it named both `dont-care` and a previous value.
   both: bool,
 }
@@ -77,6 +83,8 @@ struct Change {
 pub(super) enum Changed {
   /// Answered here.
   Answered,
+  /// Past its checks: its pre-revprop-change call is the caller's to run (module documentation).
+  Hooking(Box<Pending>),
   /// An authentication for the command was asked: it runs, then the change again.
   Authenticating(Box<crate::handshake::Server>, Box<Interrupted>),
 }
@@ -84,7 +92,7 @@ pub(super) enum Changed {
 impl Connection {
   /// Answers the revision property change `name` with `params`, whose item is `item` (module documentation), on
   /// `established`; `authenticated_now` once the client has just authenticated for it.
-  pub(super) fn change_revision_property<R: ?Sized>(
+  pub(super) fn change_revision_property<R: reads::Repository + ?Sized>(
     &self,
     established: &mut Established,
     sources: &Sources<'_, R>,
@@ -100,6 +108,7 @@ impl Connection {
     let user = principal_name(&established.session.principal)
       .ok()
       .flatten();
+    let author = user.unwrap_or_default().to_owned();
     let kept = &established.mechanisms;
     let session = commit_drive::Session {
       base_path: &established.base,
@@ -141,36 +150,270 @@ impl Connection {
       trivial_auth(out)?;
     }
     let rules = established.compiled_read_rules(&sources.policy);
-    let refusal = judged(sources.index, rules, &change);
-    write_failure(&refusal, out)?;
-    Ok(Changed::Answered)
+    if let Some(refusal) = judged(sources.index, rules, &change) {
+      write_failure(&refusal, out)?;
+      return Ok(Changed::Answered);
+    }
+    let old = match &change.expected {
+      Some(expected) => expected.clone(),
+      None => held_value(sources.repository, change.revision, &change.name),
+    };
+    let action = match (&change.value, &old) {
+      (None, _) => RevisionPropertyAction::Deleted,
+      (Some(_), None) => RevisionPropertyAction::Added,
+      (Some(_), Some(_)) => RevisionPropertyAction::Modified,
+    };
+    let call = RevisionPropertyCall {
+      revision: change.revision,
+      user: author,
+      name: String::from_utf8_lossy(&change.name).into_owned(),
+      action,
+      value: change.value.clone().unwrap_or_default(),
+    };
+    Ok(Changed::Hooking(Box::new(Pending {
+      change,
+      old,
+      call,
+      stage: Stage::Hooking,
+    })))
+  }
+
+  /// Goes on with the revision property change whose pre-revprop-change call was handed out
+  /// ([`super::Turn::RevisionPropertyHook`]) once the hook's `verdict` is in (module documentation): the record of the
+  /// revision's properties whole, which the caller lands through the owner's step with no wait between and reports
+  /// ([`Connection::revision_property_landed`]); or none, the change answered already, the connection waiting on its
+  /// next command.
+  ///
+  /// # Errors
+  /// [`Refused::OutOfTurn`] unless a change's pre-hook was handed out; [`Refused::Item`] where an answer cannot be
+  /// written.
+  pub fn revision_property_hooked<R: reads::Repository + ?Sized>(
+    &mut self,
+    sources: &Sources<'_, R>,
+    verdict: Result<(), Vec<(u32, String)>>,
+    out: &mut Vec<u8>,
+  ) -> Result<Option<Record>, Refused> {
+    let (established, mut pending) = self.revision_property_at(Stage::Hooking)?;
+    let judged = verdict.and_then(|()| changed_properties(sources.repository, &pending.change));
+    match judged {
+      Ok(properties) => {
+        pending.stage = Stage::Landing;
+        let revision = pending.change.revision;
+        self.phase = Phase::RevisionProperty(established, pending);
+        Ok(Some(Record::RevisionProperties {
+          revision,
+          properties,
+        }))
+      }
+      Err(chain) => {
+        self.phase = Phase::Commands(established);
+        write_failure(&chain, out)?;
+        Ok(None)
+      }
+    }
+  }
+
+  /// Goes on with the revision property change whose record the caller `landed`, or failed to with the step's
+  /// failure, which is then the answer: post-revprop-change's call, the old value its input, for the caller to run and
+  /// report ([`Connection::revision_property_finished`]); or none, the change answered already.
+  ///
+  /// # Errors
+  /// [`Refused::OutOfTurn`] unless a change's record is with the caller; [`Refused::Item`] where an answer cannot be
+  /// written.
+  pub fn revision_property_landed(
+    &mut self,
+    landed: Result<(), (u32, String)>,
+    out: &mut Vec<u8>,
+  ) -> Result<Option<RevisionPropertyCall>, Refused> {
+    let (established, mut pending) = self.revision_property_at(Stage::Landing)?;
+    if let Err(failure) = landed {
+      self.phase = Phase::Commands(established);
+      write_failure(&[failure], out)?;
+      return Ok(None);
+    }
+    let mut call = pending.call.clone();
+    call.value = pending.old.clone().unwrap_or_default();
+    pending.stage = Stage::Finishing;
+    self.phase = Phase::RevisionProperty(established, pending);
+    Ok(Some(call))
+  }
+
+  /// Ends the landed revision property change with post-revprop-change's `verdict`: `( success ( ) )`, or the hook's
+  /// chain in its place, the change standing (`svn_repos_fs_change_rev_prop4` returns it after the change).
+  ///
+  /// # Errors
+  /// [`Refused::OutOfTurn`] unless a change's post-hook was handed out; [`Refused::Item`] where an answer cannot be
+  /// written.
+  pub fn revision_property_finished(
+    &mut self,
+    verdict: Result<(), Vec<(u32, String)>>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refused> {
+    let (established, _) = self.revision_property_at(Stage::Finishing)?;
+    self.phase = Phase::Commands(established);
+    match verdict {
+      Ok(()) => {
+        let success = Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]);
+        ra_svn::write(&success, out).map_err(Refused::Item)
+      }
+      Err(chain) => write_failure(&chain, out),
+    }
+  }
+
+  /// The change waiting at `stage`, taken out of the phase; the phase left as it stood where none waits there.
+  fn revision_property_at(
+    &mut self,
+    stage: Stage,
+  ) -> Result<(Box<Established>, Box<Pending>), Refused> {
+    match std::mem::replace(&mut self.phase, Phase::Ended) {
+      Phase::RevisionProperty(established, pending) if pending.stage == stage => {
+        Ok((established, pending))
+      }
+      other => {
+        self.phase = other;
+        Err(Refused::OutOfTurn)
+      }
+    }
   }
 }
 
-/// What the change is refused with (module documentation): the first check it fails, else the missing hook's.
+/// What a revision property change's hooks are run with (A-702 part 2; `hooks.c`
+/// `svn_repos__hooks_pre_revprop_change`, `_post_revprop_change`), handed to the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionPropertyCall {
+  /// The revision.
+  pub revision: Revision,
+  /// The session's user, empty for none.
+  pub user: String,
+  /// The property's name.
+  pub name: String,
+  /// What happens to the property.
+  pub action: RevisionPropertyAction,
+  /// The hook's standard input: pre-revprop-change's the new value (empty for a deletion), post-revprop-change's the
+  /// old (empty for an addition).
+  pub value: Vec<u8>,
+}
+
+/// How a revision property changes (`svn_repos_fs_change_rev_prop4`'s action: `D` with no new value, else `A` with no
+/// old one, else `M`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevisionPropertyAction {
+  /// `A`.
+  Added,
+  /// `M`.
+  Modified,
+  /// `D`.
+  Deleted,
+}
+
+/// Where a change past its checks stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+  /// Its pre-hook is with the caller.
+  Hooking,
+  /// Its record is with the caller.
+  Landing,
+  /// Its post-hook is with the caller.
+  Finishing,
+}
+
+/// A change past its checks (module documentation).
+pub(super) struct Pending {
+  /// The change.
+  change: Change,
+  /// The value its hooks are told the property held: the one expected, else the one held when it was asked.
+  old: Option<Vec<u8>>,
+  /// Its pre-revprop-change call.
+  call: RevisionPropertyCall,
+  /// Where it stands.
+  stage: Stage,
+}
+
+impl std::fmt::Debug for Pending {
+  /// The stage alone: the values are the client's.
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(formatter, "Pending({:?})", self.stage)
+  }
+}
+
+impl Pending {
+  /// Its pre-revprop-change call.
+  pub(super) fn call(&self) -> RevisionPropertyCall {
+    self.call.clone()
+  }
+}
+
+/// `name`'s value in `revision`'s properties `repository` holds, none where it holds no such property or revision.
+fn held_value<R: reads::Repository + ?Sized>(
+  repository: &R,
+  revision: Revision,
+  name: &[u8],
+) -> Option<Vec<u8>> {
+  repository
+    .revision_properties(revision)?
+    .into_iter()
+    .find(|(held, _)| *held == name)
+    .map(|(_, value)| value.to_vec())
+}
+
+/// `change`'s revision's properties once it is made (FSFS's `change_rev_prop`), or its refusal: a revision `repository`
+/// does not hold, or a held value other than the one expected.
+fn changed_properties<R: reads::Repository + ?Sized>(
+  repository: &R,
+  change: &Change,
+) -> Result<Properties, Vec<(u32, String)>> {
+  let revision = change.revision;
+  let held = repository
+    .revision_properties(revision)
+    .ok_or_else(|| vec![(NO_SUCH_REVISION, format!("No such revision {revision}"))])?;
+  let mut properties: Properties = held
+    .into_iter()
+    .map(|(name, value)| (name.to_vec(), value.to_vec()))
+    .collect();
+  if let Some(expected) = &change.expected
+    && properties.get(&change.name) != expected.as_ref()
+  {
+    let name = String::from_utf8_lossy(&change.name);
+    return Err(vec![(
+      BASEVALUE_MISMATCH,
+      format!("revprop '{name}' has unexpected value in filesystem"),
+    )]);
+  }
+  match &change.value {
+    Some(value) => properties.insert(change.name.clone(), value.clone()),
+    None => properties.remove(&change.name),
+  };
+  Ok(properties)
+}
+
+/// What the change is refused with before its hooks (module documentation): the first check it fails, none where it
+/// passes them all.
 fn judged(
   index: &crate::index::Index,
   rules: Option<&crate::authz::PrincipalRules>,
   change: &Change,
-) -> Vec<(u32, String)> {
+) -> Option<Vec<(u32, String)>> {
   let revision = change.revision;
   match crate::reads::revision_wholly_readable(index, rules, revision) {
-    Err(failure) => return vec![failure],
+    Err(failure) => return Some(vec![failure]),
     Ok(false) => {
-      return vec![(
+      return Some(vec![(
         AUTHZ_UNREADABLE,
         format!("Write denied:  not authorized to read all of revision {revision}"),
-      )];
+      )]);
     }
     Ok(true) => {}
   }
   if let Some(errors) = revision_property_errors(&change.name, change.value.as_deref()) {
-    return errors;
+    return Some(errors);
   }
-  if !change.expects && revision > index.youngest() {
-    return vec![(NO_SUCH_REVISION, format!("No such revision {revision}"))];
+  if change.expected.is_none() && revision > index.youngest() {
+    return Some(vec![(
+      NO_SUCH_REVISION,
+      format!("No such revision {revision}"),
+    )]);
   }
-  vec![(DISABLED_FEATURE, NO_HOOK_WORDS.to_owned())]
+  None
 }
 
 /// The change `name` asks with `params` (module documentation); none where a parameter is not what its prototype
@@ -187,7 +430,7 @@ fn read(name: &str, params: &[Value<'_>]) -> Option<Change> {
         revision: *revision,
         name: property.to_vec(),
         value,
-        expects: false,
+        expected: None,
         both: false,
       })
     }
@@ -207,16 +450,16 @@ fn read(name: &str, params: &[Value<'_>]) -> Option<Change> {
         _ => return None,
       };
       let (dont_care, previous) = match previous.as_slice() {
-        [Value::Word(word)] => (boolean(word)?, false),
-        [Value::Word(word), Value::String(_)] => (boolean(word)?, true),
+        [Value::Word(word)] => (boolean(word)?, None),
+        [Value::Word(word), Value::String(previous)] => (boolean(word)?, Some(previous.to_vec())),
         _ => return None,
       };
       Some(Change {
         revision: *revision,
         name: property.to_vec(),
         value,
-        expects: !dont_care,
-        both: dont_care && previous,
+        both: dont_care && previous.is_some(),
+        expected: (!dont_care).then_some(previous),
       })
     }
     _ => None,

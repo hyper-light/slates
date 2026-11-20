@@ -161,7 +161,7 @@ fn assert_rebuilt_from_the_log(
   (repository, green): (RepositoryId, DbVolumeId),
   held: [Node; 3],
 ) {
-  crate::vcs_store::rebuild(state, repository);
+  crate::vcs_store::rebuild_whole(state, repository);
   assert_eq!(
     head_of(state, green),
     Some(held[2]),

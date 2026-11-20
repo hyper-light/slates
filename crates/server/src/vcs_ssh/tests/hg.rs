@@ -36,8 +36,8 @@ use slates_ssh::command::Command as Asked;
 
 use super::super::hg::HgCommand;
 use super::super::site::{
-  Command, Dispatched, HG_ABORT_STATUS, Next, Refused, Service, Services, SshSite, Start, Stepped,
-  ToolCommand, ToolServices, ToolSite, Unserved,
+  ClientGone, Command, Dispatched, HG_ABORT_STATUS, Next, Refused, Service, Services, SshSite,
+  Start, Stepped, ToolCommand, ToolServices, ToolSite, Unserved,
 };
 use super::{
   HELD_SEED, HOLDER, Keys, ONE_SEAT, Peer, ROOM_BYTES, TICK_NS, Transcript, exec, query, send_data,
@@ -432,6 +432,7 @@ impl StoreLender for NoGit {
 /// The Mercurial repository `id`, [`HOLDER`]'s, with no rules.
 fn record(id: RepositoryId, name: &str) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id,
     name: name.to_owned(),
     tool: VcsTool::Mercurial,
@@ -523,7 +524,7 @@ impl Channel {
   async fn drive_awaiting<C: Command>(&mut self, command: &mut C) {
     while self.exited.is_none() {
       self.take(command);
-      match command.step().await {
+      match command.step(ClientGone::never()).await {
         Ok(Stepped { consumed, next }) => {
           self.consumed += consumed;
           match next {
@@ -678,7 +679,7 @@ fn input_the_session_drops_is_given_back_to_the_window() {
   let mut command = HgCommand::new(Lends::probed(), (HG, HOLDER), SMALL_ROOM, false);
   let past = command.input(&[b'x'; PAST_SMALL_ROOM]);
   command.input(TOO_LONG_REQUEST).expect("within the window");
-  let refused_whole = ready(command.step());
+  let refused_whole = ready(command.step(ClientGone::never()));
   command.input(HEADS).expect("dropped, not refused");
   let mut channel = Channel::default();
   channel.drive(&mut command);

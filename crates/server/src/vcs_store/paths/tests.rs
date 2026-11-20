@@ -116,6 +116,9 @@ pub(crate) fn version_saying(
     assert!(!matches!(reply, ReplyBody::Refused { .. }), "{reply:?}");
   }
   let submitted = ask(state, crate::identities::authored(work, message));
+  // A green's first submit owes its commit and builds its map in slices after it (A-664's live whole builds, part 2),
+  // by a task a test's step never runs: driven to its end here, so the test reads the store as the build leaves it.
+  super::whole_build::settle(state);
   let ReplyBody::Submitted {
     version: Some(version),
     ..
@@ -446,6 +449,7 @@ fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
     version(state, at.1, 1, vec![create("/f", b"one")]);
     let second = version(state, at.1, 2, vec![Op::Edit("/f", 0, 3, b"two")]);
     crate::vcs_store::rebuild(state, at.0);
+    crate::vcs_store::settle_rebuild(state, at.0);
     set(&mut model, "f", FileClass::File, b"two");
     assert_kept(state, at, second, &model);
     let third = version(state, at.1, 3, vec![create("/g", b"three")]);
@@ -620,6 +624,7 @@ fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
     assert_eq!((before, after), (true, false), "the branch's map");
     let live = held(state);
     crate::vcs_store::rebuild(state, repository);
+    crate::vcs_store::settle_rebuild(state, repository);
     assert_eq!(held(state), live, "the store made again");
     let mut model = Model::new();
     set(&mut model, "f", FileClass::File, b"root");

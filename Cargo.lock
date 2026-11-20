@@ -1594,6 +1594,7 @@ dependencies = [
  "slates-ipc",
  "slates-machine",
  "slates-mcp",
+ "slates-mem",
  "slates-rt",
  "slates-server",
  "slates-transport",

@@ -106,8 +106,10 @@ const COMMON_BYTES: usize = NODE_LEN + REV_BYTES + REV_BYTES + FLAGS_BYTES + LEN
 /// whether it closes its branch.
 const CHANGESET_BYTES: usize = COMMON_BYTES + NODE_LEN + 1;
 
-/// Format: a manifest's or file revision's row payload: the common part, the link, and whether it has a block.
-const REVISION_BYTES: usize = COMMON_BYTES + REV_BYTES + 1;
+/// Format: a manifest's or file revision's row payload: the common part, the link, whether it has a block, then its
+/// delta's base (A-729: a manifest's previous revision, [`NONE`] for a whole text), its content's length when it is a
+/// delta, and its chain's delta bytes since the whole text it rests on.
+const REVISION_BYTES: usize = COMMON_BYTES + REV_BYTES + 1 + REV_BYTES + LEN_BYTES + LEN_BYTES;
 
 /// A log of the repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,10 +237,17 @@ pub struct RevisionRow {
   pub flags: u16,
   /// The text's length, its block included.
   pub len: u64,
-  /// The text, or a file revision's bytes.
+  /// The text, or a file revision's bytes; a manifest kept as a delta, the delta (A-729: [`HgIndex::revision_text`]
+  /// reads the text).
   pub bytes: ContentId,
   /// A file revision's metadata block.
   pub block: Option<ContentId>,
+  /// The revision its content is a delta against, [`NONE`] for a whole text.
+  pub base: u32,
+  /// The delta's length, where its content is one.
+  pub stored: u64,
+  /// The delta bytes of its chain since the whole text it rests on.
+  pub chain: u64,
 }
 
 /// Why a group was refused; nothing of it was written.
@@ -256,6 +265,11 @@ pub enum Refused {
   },
   /// The log holds `u32::MAX` revisions already, the most a number can name beside [`NONE`].
   LogFull,
+  /// A manifest's text the index could not read back to keep the next one as its delta (A-729): its number.
+  Unread {
+    /// The revision.
+    rev: u32,
+  },
   /// The shared index refused (its budget, or a row it holds that differs).
   Index(IndexRefused),
   /// An object whose id is not a node's twenty bytes.
@@ -555,9 +569,60 @@ impl HgIndex {
         contents,
       });
     }
-    let (revs, planned) = (planner.revs, planner.planned);
-    self.write(store, log, &planned)?;
-    Ok(revs)
+    let (revs, mut planned) = (planner.revs, planner.planned);
+    let previous = match (log, planned.first()) {
+      (Log::Manifest, Some(first)) if first.rev > 0 => {
+        let rev = first.rev.saturating_sub(1);
+        let row = self
+          .revision(store, log, rev)
+          .ok_or(Refused::Unread { rev })?;
+        let text = self
+          .revision_text(store, log, rev)
+          .ok_or(Refused::Unread { rev })?;
+        Some((rev, text, row.chain))
+      }
+      _ => None,
+    };
+    let puts = kept_as(store, log, &mut planned, previous)?;
+    let written = self.write(store, log, &planned);
+    for put in &puts {
+      drop(store.release(put));
+    }
+    written.map(|()| revs)
+  }
+
+  /// The whole text of `log`'s revision `rev` (A-729): a manifest kept as a delta rebuilt from the whole text its chain
+  /// rests on, each delta applied in turn; a file revision's metadata block and bytes between its markers; any other
+  /// revision's bytes. `None` where the index or the store does not hold it whole.
+  pub fn revision_text(&self, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<Vec<u8>> {
+    let row = self.revision(store, log, rev)?;
+    if let Some(block) = row.block {
+      return framed_text(store, (&block, &row.bytes), row.len);
+    }
+    if row.base == NONE {
+      return store.object_bytes(&row.bytes, row.len);
+    }
+    let mut chain = vec![row];
+    let mut at = row.base;
+    // Each base is before its revision, so the walk takes at most `rev` steps.
+    while let Some(link) = self.revision(store, log, at) {
+      chain.push(link);
+      if link.base == NONE {
+        break;
+      }
+      if link.base >= at {
+        return None;
+      }
+      at = link.base;
+    }
+    let whole = chain.pop()?;
+    let mut text = store.object_bytes(&whole.bytes, whole.len)?;
+    let mut room = crate::Admission::new(u64::MAX);
+    for step in chain.iter().rev() {
+      let delta = store.object_bytes(&step.bytes, step.stored)?;
+      text = crate::delta::apply(&text, &delta, &mut room).ok()?;
+    }
+    (crate::read::to_u64(text.len()) == row.len).then_some(text)
   }
 
   /// Writes a group's planned rows, sorted by key, as one batch.
@@ -724,6 +789,83 @@ fn common_payload(node: Node, p1: u32, p2: u32, flags: u16, len: u64) -> Vec<u8>
   payload
 }
 
+/// Format: a whole text's delta fields: no base, no delta, no chain.
+const WHOLE: (u32, u64, u64) = (NONE, 0, 0);
+
+/// Each planned manifest kept as a delta against the one before it where its chain allows, else whole (A-729): the
+/// delta put as content and named in the row's place of the text, its base, length and chain added to the payload;
+/// every other row's payload given the whole text's fields. Derived: a delta is kept while its chain's delta bytes stay
+/// within the text's own length, so a text is rebuilt from at most its own length of deltas over the whole text it rests
+/// on (7.2's `deltas.py` refuses a delta longer than its text by the same bound). The puts' holds, for the caller to
+/// give back once the rows hold their contents.
+fn kept_as(
+  store: &mut ContentStore,
+  log: Log<'_>,
+  planned: &mut [Planned],
+  mut previous: Option<(u32, Vec<u8>, u64)>,
+) -> Result<Vec<ContentId>, Refused> {
+  let mut puts = Vec::new();
+  for row in planned.iter_mut() {
+    let mut fields = WHOLE;
+    if log == Log::Manifest {
+      let len = row
+        .payload
+        .get(COMMON_BYTES - LEN_BYTES..COMMON_BYTES)
+        .and_then(|len| len.try_into().ok().map(u64::from_le_bytes));
+      let text = row
+        .contents
+        .first()
+        .zip(len)
+        .and_then(|(id, len)| store.object_bytes(id, len))
+        .ok_or(Refused::Unread { rev: row.rev })?;
+      if let Some((rev, prior, chain)) = &previous
+        && rev.checked_add(1) == Some(row.rev)
+      {
+        let mut delta = Vec::new();
+        crate::delta::encode_lines(prior, &text, &mut delta)
+          .map_err(|_| Refused::Unread { rev: row.rev })?;
+        let grown = chain.saturating_add(crate::read::to_u64(delta.len()));
+        if grown <= crate::read::to_u64(text.len()) {
+          let put = store
+            .put_object(&delta)
+            .map_err(|refused| Refused::Index(IndexRefused::Content(refused)))?;
+          puts.push(put);
+          if let Some(content) = row.contents.first_mut() {
+            *content = put;
+          }
+          fields = (*rev, crate::read::to_u64(delta.len()), grown);
+        }
+      }
+      previous = Some((row.rev, text, fields.2));
+    }
+    row.payload.extend_from_slice(&fields.0.to_le_bytes());
+    row.payload.extend_from_slice(&fields.1.to_le_bytes());
+    row.payload.extend_from_slice(&fields.2.to_le_bytes());
+  }
+  Ok(puts)
+}
+
+/// A file revision's text: its metadata block and its bytes between the markers, `len` long in all.
+fn framed_text(
+  store: &ContentStore,
+  (block, bytes): (&ContentId, &ContentId),
+  len: u64,
+) -> Option<Vec<u8>> {
+  let block: Vec<u8> = store
+    .windows(block)
+    .flat_map(|window| window.into_owned())
+    .collect();
+  let markers = crate::read::to_u64(crate::filerev::MARKER.len()).checked_mul(2)?;
+  let framing = crate::read::to_u64(block.len()).checked_add(markers)?;
+  let bytes = store.object_bytes(bytes, len.checked_sub(framing)?)?;
+  let mut text = Vec::with_capacity(usize::try_from(len).ok()?);
+  text.extend_from_slice(crate::filerev::MARKER);
+  text.extend_from_slice(&block);
+  text.extend_from_slice(crate::filerev::MARKER);
+  text.extend_from_slice(&bytes);
+  Some(text)
+}
+
 /// A payload's common part, read back: the node, the parents, the flags, the length, and what follows.
 type Common<'p> = (Node, u32, u32, u16, u64, &'p [u8]);
 
@@ -774,7 +916,10 @@ fn read_revision(row: &RowRef<'_>) -> Option<RevisionRow> {
   }
   let (node, p1, p2, flags, len, rest) = read_common(row.payload())?;
   let (link, rest) = rest.split_first_chunk::<REV_BYTES>()?;
-  let (has_block, _) = rest.split_first()?;
+  let (has_block, rest) = rest.split_first()?;
+  let (base, rest) = rest.split_first_chunk::<REV_BYTES>()?;
+  let (stored, rest) = rest.split_first_chunk::<LEN_BYTES>()?;
+  let (chain, _) = rest.split_first_chunk::<LEN_BYTES>()?;
   let mut contents = row.contents();
   let bytes = contents.next()?;
   let block = contents.next();
@@ -790,5 +935,8 @@ fn read_revision(row: &RowRef<'_>) -> Option<RevisionRow> {
     len,
     bytes,
     block,
+    base: u32::from_le_bytes(*base),
+    stored: u64::from_le_bytes(*stored),
+    chain: u64::from_le_bytes(*chain),
   })
 }
