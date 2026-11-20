@@ -33,6 +33,11 @@ use crate::svndiff::{
   Version, WINDOW_LIMIT, write_instruction, write_integer,
 };
 
+/// The most units a step takes past those it was given: one source block's look-up, or one block indexed, begun
+/// with a unit to spare.
+/// Derived: a unit is a position walked or a byte compared; a look-up or an index entry compares one [`BLOCK`].
+pub const STEP_OVERRUN: usize = BLOCK;
+
 /// The source's whole blocks by their sums (`super::Blocks`), held without a borrow of the source.
 #[derive(Clone, Debug, Default)]
 struct Table {
@@ -249,6 +254,8 @@ pub struct WindowMaking {
   compressed: [Option<Vec<u8>>; 2],
   /// The window's five integers, once it is made.
   integers: Vec<u8>,
+  /// The units its steps have taken, all told: what a caller holds a step to ([`WindowMaking::units_taken`]).
+  units: u64,
 }
 
 /// A made window's encoding, in the parts `svndiff.c`'s writes take (`crate::report::editor`'s `DeltaWrites`).
@@ -318,6 +325,7 @@ impl WindowMaking {
       prefixes: [Vec::new(), Vec::new()],
       compressed: [None, None],
       integers: Vec::new(),
+      units: 0,
     })
   }
 
@@ -337,10 +345,18 @@ impl WindowMaking {
       if let Phase::Done = self.phase {
         break;
       }
-      let used = self.unit(source, target, left)?;
-      left = left.saturating_sub(used.max(1));
+      let used = self.unit(source, target, left)?.max(1);
+      self.units = self.units.saturating_add(to_u64(used));
+      left = left.saturating_sub(used);
     }
     Ok(matches!(self.phase, Phase::Done))
+  }
+
+  /// The units the making's steps have taken, all told. A step takes at most the units it was given and one source
+  /// block's look-up more ([`STEP_OVERRUN`]): the bound a caller holds each step to, which no timing under contention
+  /// can blur.
+  pub fn units_taken(&self) -> u64 {
+    self.units
   }
 
   /// The window's encoding, once it is made.
@@ -476,6 +492,12 @@ impl WindowMaking {
   fn walk(&mut self, source: &[u8], target: &[u8], left: usize) -> usize {
     let mut used = 0usize;
     loop {
+      // A failed look-up comes back here: the step's units are checked before the next position, or a run of
+      // positions whose flags may hold a block but whose look-ups miss would be walked in one step.
+      if used >= left {
+        self.phase = Phase::Walk;
+        return used;
+      }
       if self.at >= self.upper {
         self.phase = Phase::Trailer {
           start: self.pending,
