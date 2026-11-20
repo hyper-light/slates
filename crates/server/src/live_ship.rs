@@ -6010,6 +6010,16 @@ fn held_entry_in(live: &mut LiveState, owner: HostId, object: ObjectId) -> &mut 
 /// control shard's single 557 ms poll beside it. Run on its own task of the serve loop, so the turns hold no other
 /// request of the peer.
 pub(crate) async fn serve_fetch(local: HostId, peer: HostId, request: Vec<u8>) -> Vec<u8> {
+  let silenced = state::with_state(|s| {
+    let silenced = s.injected_live_silence.contains(&peer);
+    if silenced {
+      s.count(LIVE_SILENCED_BY_FAULT, 1);
+    }
+    silenced
+  });
+  if silenced == Some(true) {
+    return Vec::new();
+  }
   let begun = state::with_state(|s| begin_fetch_answer(s, local, peer, &request));
   let mut answer = match begun {
     Some(Ok(answer)) => answer,
@@ -6224,6 +6234,9 @@ const LIVE_OWN_FENCE_UNPUBLISHED: &str = "fleet.live.own_fence_unpublished";
 /// Counter: phase-one reports this candidate answered (A-240).
 /// Format: a counter name in the daemon's status report.
 const LIVE_REPORTED: &str = "fleet.live.reported";
+/// Counter: a live phase-one report or log fetch a test left unanswered (`Daemon::inject_live_silence`); zero in
+/// production.
+const LIVE_SILENCED_BY_FAULT: &str = "fleet.live.silenced_by_fault";
 
 /// This candidate's copy of `object` with its fence raised to a takeover's `epoch` (phase one): the copy it holds, or
 /// an empty one made now for `successor`. An empty report counts toward phase one's `f + 1` (a durable entry is held by
@@ -6259,6 +6272,10 @@ pub(crate) fn serve_state(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  if state.injected_live_silence.contains(&peer) {
+    state.count(LIVE_SILENCED_BY_FAULT, 1);
+    return Vec::new();
+  }
   if slates_db::live::is_report(request) {
     serve_report(state, local, peer, request)
   } else {
