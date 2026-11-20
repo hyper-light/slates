@@ -64,3 +64,17 @@
   and vcs_store: 163 passed.
 - Next: replay reads its record's pack in place (today `Unpacked` holds every object inflated while the store holds
   them again: about 600 MiB at the peak of a v1.5.0 record's recovery). The pack-homing question above still stands.
+
+## 2026-11-20 ~16:05 — replay reads its record's pack in place (w-git)
+- **LANDED 5c6327b8e.** A record's replay now reads its pack a chunk at a time into a site of its own and admits each
+  object where it lies in the push's own copy of the pack, the way a live push does. It no longer holds `Unpacked`,
+  which had every object inflated.
+- v1.5.0 store rebuild (release, Studio): the process's peak RSS grew **+189.6 MiB before, +0.1 MiB after**; the
+  content store's peak is 309 MiB either way (what lands). This is the recovery-time memory a restart pays per large
+  record.
+- Tests: slates-server --lib git and vcs_store: 163 passed.
+- Today's git landings in order: 5518fb2bc B2 in-flight, 00e6da185, 47dc24b72, 15917f29a, ccd07b58c, fc8b29c27
+  (recovery bug), 5c6327b8e.
+- Still waiting on your ruling: may I home the pack as content before the append? The entry's apply, 19 ms, is now the
+  longest step of a v1.5.0 push. Until you answer, I'll take the next memory item in my area: `upload` / clone answers
+  reading the store's objects (I'll check for whole-object copies first) unless you redirect me.

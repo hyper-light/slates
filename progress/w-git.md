@@ -262,3 +262,7 @@
 - Diag kit on the Studio: ~/.cache/w-git-diag/{v150.request, diag2.rs, phase_patch.py, phase_patch2.py}; release
   target ~/.cache/w-git-target-rel.noindex (delete when done).
 - NEXT: git_replay reads a record's pack whole (Unpacked) -> read in place as the live push does.
+- 15:35 LANDED fc8b29c27 (RECOVERY BUG: thin push record diverged on replay -> repo refs lost; names compared as
+  sets). 16:05 LANDED 5c6327b8e (replay reads its pack in place: v1.5.0 rebuild RSS +189.6 MiB -> +0.1 MiB).
+- Waiting on main: pack homing as content before the append (19 ms apply). Studio release target
+  ~/.cache/w-git-target-rel.noindex still there for diags; delete when the memory work ends.
