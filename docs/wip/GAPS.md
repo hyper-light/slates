@@ -45,7 +45,9 @@
 > shard). **Closed quiet by A-400** (a work on its client's shard): Linux arm64 accept p50 51–55 → 20–21 µs (before W1
 > 18), the Mac 155 → 40–43 (before W1 48–54); loaded on Linux main is three times lower than before W1 (p99 21.0 →
 > 4.6–7.0 ms). **Open:** (a) about 10 µs added to every quiet lone submit since A-400 (Linux accept p50 20–21 → 31–35
-> µs, conflict 17–18 → 27–28; in `f2081a3c8..a5233e228`, bisect under way); (b) the shared Mac loaded, where main is
+> µs, conflict 17–18 → 27–28; bisected over `f2081a3c8..a5233e228`: small steps, the reproducible ones in code a submit
+> never runs, so the release build's layout, not a fix to find; an instruction-count gate on the lone submit is owed
+> to hold it); (b) the shared Mac loaded, where main is
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
 >
