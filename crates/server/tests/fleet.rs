@@ -21949,6 +21949,32 @@ fn bench_counters(daemons: [&Daemon; 2]) -> std::collections::BTreeMap<&'static 
   summed
 }
 
+/// A green made through `owner`, a client of A, shared with B's account and at version 1, so B replicates it: the A-697
+/// bench's green.
+fn bench_green(owner: &mut Client, daemon_b: &Daemon, name: &str) -> VolumeId {
+  let ReplyBody::GreenCreated { id: green } = owner.call(&RequestBody::CreateGreen {
+    name: name.to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("the bench's green");
+  };
+  share_with_node(owner, green, daemon_b, ALL_RIGHTS);
+  let work = bench_work(owner, green, &format!("{name}-first"), 5);
+  let first = owner.call(&RequestBody::submit(work, Vec::new()));
+  assert!(
+    matches!(
+      first,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{first:?}"
+  );
+  green
+}
+
 /// A work over `green` made through `client` holding one file of `bytes` bytes, written an edit at a time.
 fn bench_work(client: &mut Client, green: VolumeId, name: &str, bytes: usize) -> VolumeId {
   let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
@@ -21980,7 +22006,8 @@ fn bench_work(client: &mut Client, green: VolumeId, name: &str, bytes: usize) ->
 /// each size in `SLATES_A697_BENCH_MIB` (comma-separated MiB, default 4) and `SLATES_A697_BENCH_RUNS` runs (default 3):
 /// a work on B (the holder) and one on A (local) each write a file of that size and submit. Prints, a line a submit, its
 /// wall time and every phase's count and milliseconds (both daemons' counters, the submit's own delta), and asserts
-/// each submit accepted.
+/// each submit accepted. With `SLATES_A697_BENCH_FRESH=1` every size's every run submits to a green of its own, so a
+/// cost that grows with one green's history is told from one that grows with the process.
 #[test]
 #[ignore = "a benchmark: run by its recorded command (docs/wip/BENCHMARKS.md, A-697)"]
 fn bench_a697_holder_and_local_submit_phases() {
@@ -21995,31 +22022,18 @@ fn bench_a697_holder_and_local_submit_phases() {
     .and_then(|runs| runs.parse().ok())
     .unwrap_or(3);
   let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
-  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let fresh = std::env::var("SLATES_A697_BENCH_FRESH").is_ok_and(|fresh| fresh == "1");
   let mut owner = Client::connect(&instance_a);
-  let edited = owner.call(&RequestBody::Edit {
-    work: owners_work,
-    path: "f".to_owned(),
-    at: 0,
-    delete_len: 0,
-    bytes: b"hello".to_vec(),
-  });
-  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-  let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
-  assert!(
-    matches!(
-      first,
-      ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }
-    ),
-    "{first:?}"
-  );
+  let shared = bench_green(&mut owner, &daemon_b, "bench-green");
   daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
   for bytes in sizes {
     for run in 0..runs {
+      let green = if fresh {
+        bench_green(&mut owner, &daemon_b, &format!("bench-green-{bytes}-{run}"))
+      } else {
+        shared
+      };
       for (kind, client) in [("holder", &mut holder), ("local", &mut owner)] {
         let work = bench_work(client, green, &format!("bench-{kind}-{bytes}-{run}"), bytes);
         let before = bench_counters([&daemon_a, &daemon_b]);
