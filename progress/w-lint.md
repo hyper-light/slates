@@ -157,3 +157,9 @@
 - This clone's commits now carry a local user.name/email (Ada Lundhe <adalundhe@Mac.attlocal.net>, as before):
   the hostname-derived identity stopped resolving.
 - Still red, not mine: literals in merge pace.rs RUN and push.rs UNIT_BYTES (A-752, owner).
+
+## 2026-11-20 ~11:15 main's routing
+- slates-vcs tests::the_same_bytes_from_git_and_mercurial_are_one_content_held_by_both_repositories: PASSES on
+  origin/main 85d66d9cb (cargo test --locked -p slates-vcs --lib <name>, macOS arm64, this Mac). No note to w-perf.
+- A-752 literals (merge pace.rs RUN, push.rs UNIT_BYTES): w-engine's to derive under R3; rounds report them only.
+- "wip" commits 03f872541, 7113b38e7: not rewritable (main never forced); rule now in the fleet brief.
