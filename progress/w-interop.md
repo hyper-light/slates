@@ -83,3 +83,16 @@ CARGO_TARGET_DIR ~/.cache/w-interop-target, clone ~/.cache/w-interop/src (delete
 - LANDED 78eea35b9 (merge a304ec440; on main, checked): git matrix checkout-old row + GAPS line (git 26/27 at v1.0.0
   since A-713; v2.0.0 push spins; hg 17/24 since A-711/A-696). Monitor b69za9xas on main (re-arm on expiry).
 - Gotcha: never pgrep for 'git fetch' in a wait loop: the monitor's fetch loop matches forever.
+
+## Piece 5 (main ~07:30Z): A-681's remainder -- stock svn over http(s). Handed from w-svn.
+Done when: svn_interop.rs HTTP round trip un-ignored + passes with stock svn 1.15, svn matrix HTTP rows pass.
+State on main: svn DAV site (crates/svn/src/dav/site.rs: OPTIONS, PROPFIND, GET/HEAD, REPORT log-report; others 501),
+server site crates/server/src/vcs_http/svn.rs (SvnSite, SvnStores) and lender vcs_store/svn_view.rs ServedRecords --
+but SvnSite is NOT composed into the daemon: ToolSites<G,H> (vcs_http.rs ~349) routes hg wire else git -> '/project'
+404 for svn. Sources: ~/slates-work/g297-sources/{dav-1.15.0,svn-1.15.0,httpd-2.4.66}; g297 progress lines 235+.
+Plan: A) compose: ToolSites gets svn, routed by shape (method not GET/HEAD/POST, or a `!svn` segment) and daemon_edge
+builds SvnSite over ServedRecords; B) update-report (checkout/update: request::UpdateReport -> report::drive -> dav::Drive,
+`me`/vcc resources, OPTIONS capabilities); C) commits (HTTPv2: POST me create-txn, PROPPATCH txn, PUT txr svndiff,
+MKCOL/DELETE/COPY, MERGE -> repository::svn_commit::commit_work). Each part its own landing. A-numbers: claim via
+agents/fanout-state amendments.tsv only if a design change needs one (A-681 parts are A-681's).
+Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's push fix lands.

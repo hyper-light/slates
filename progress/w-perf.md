@@ -84,3 +84,7 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   replaying a recorded receive-pack, then hg unbundle, svn commit; 1/10/100/1,000/10,000+; per-push memory,
   completions, refusals, p50/p99, footprint; sizes derived; RAM only) -> register entry objects named by identity
   (every tool; seam with w-svn).
+- A-718 LANDED main 156f4437d (checked on origin/main). Merged-tree rerun green (server 6/6, fmt). Main had reversed
+  "A-718 first" after it landed; told main. w-git's store-once intake merges over it.
+- NEXT: A-716 (svn texts held once, keyed by ContentIdentity surviving checkpoint folding; record's text bytes out of
+  the entry). Then the concurrent-push load test. Then entry objects named by identity (every tool).

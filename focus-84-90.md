@@ -957,3 +957,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   step quantum (Answering::Turned). Debug 3,000-commit push: prepare and decide still 0.3-2.7 s in one step -> next
   parts: streamed store-once intake + §4.17.1 rule, then verdicts sliced. Ruling: w-git's intake does NOT wait on
   A-718 (w-perf's T4 is behind A-716 + load test); w-perf builds T4 on the new store.
+- ~01:05 PST A-718 (T4) had already landed 156f4437d (w-perf) before the reversal: git/git cut v1.0.0, best of 3:
+  clone-again 2.766 -> 0.912 s (git daemon 0.342); blob:none 1.076 -> 0.558 s; shallow 0.154 -> 0.118 (daemon 0.119);
+  first clone after a push 2.791 -> 4.293 s (one-time encode); RSS 384-388 -> 482-513 MiB. Follow-ups (encode at
+  intake, first-clone cost) rebuilt on w-git's new store later. w-perf now: A-716, then concurrent-push load test.
