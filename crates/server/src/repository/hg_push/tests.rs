@@ -454,6 +454,12 @@ impl Hg {
       .unwrap()
   }
 
+  /// How many changesets the repository's index in its store holds.
+  fn changesets(&self, state: &ShardState) -> u32 {
+    let (content, store) = state.vcs_stores.mercurial_ref(self.repository).unwrap();
+    store.index.len(content, Log::Changelog)
+  }
+
   /// Whether the repository's index in its store holds changeset `node`.
   fn holds(&self, state: &ShardState, node: &Node) -> bool {
     let (content, store) = state.vcs_stores.mercurial_ref(self.repository).unwrap();
@@ -579,6 +585,27 @@ fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
       version,
       "a push sent again recorded"
     );
+  });
+}
+
+/// A-680 part 2c. Do: land stock `push-plain` on the rebuilt repository, then make the repository's store again from
+/// its log as a recovery does (`vcs_store::rebuild`). Expect the store's index to hold every changeset the pushes
+/// brought, the stock push's among them, as many as before: each push's entry holds its record, replayed in order.
+#[test]
+fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut hg = Hg::new(state, "replayed");
+    let made = rebuild(state, &mut hg, (&[1], 1));
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let answer = hg.push(state, &stock(fixture!("push-plain.hg")), &view);
+    assert!(answer.is_ok(), "{answer:?}");
+    let before = hg.changesets(state);
+    crate::vcs_store::rebuild(state, hg.repository);
+    assert_eq!(hg.changesets(state), before);
+    assert!([0, 1, 3].iter().all(|at| hg.holds(state, &made[*at].node)));
   });
 }
 

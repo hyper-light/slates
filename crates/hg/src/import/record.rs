@@ -315,6 +315,41 @@ pub fn write_revisions(
   Ok(out)
 }
 
+/// A push's record (A-680 part 2c; [`write_revisions`], [`Source::Push`]): the revisions `verified` brought, in the
+/// order its landing appends them (`push::commit::fork_with`: the changelog's group, the manifest log's, then each
+/// file log's in the bundle's order), each with flags 0 as the landing keeps it, a changeset's link the null node;
+/// `room` the room its landing ran within. No markers: a push's obsmarkers are not taken yet.
+pub fn write_push(verified: &crate::push::verify::Verified, room: u64) -> Result<Vec<u8>, WriteRefused> {
+  let changesets = pushed(&verified.changesets, false);
+  let manifests = pushed(&verified.manifests, true);
+  let files: Vec<(Log<'_>, Vec<Revision<'_>>)> = verified
+    .files
+    .iter()
+    .map(|(path, arrived)| (Log::File(path), pushed(arrived, true)))
+    .collect();
+  let mut groups: Vec<Group<'_>> = vec![
+    (Log::Changelog, changesets.as_slice()),
+    (Log::Manifest, manifests.as_slice()),
+  ];
+  groups.extend(files.iter().map(|(log, revisions)| (*log, revisions.as_slice())));
+  write_revisions((Source::Push, room), &groups, &[])
+}
+
+/// One log's arrived revisions as a push's record holds them: flags 0, and a link only where the log has one.
+fn pushed(arrived: &[crate::push::verify::Arrived], linked: bool) -> Vec<Revision<'_>> {
+  arrived
+    .iter()
+    .map(|revision| Revision {
+      node: revision.node,
+      p1: revision.p1,
+      p2: revision.p2,
+      link: if linked { revision.link } else { NULL_NODE },
+      flags: 0,
+      text: &revision.text,
+    })
+    .collect()
+}
+
 /// Writes the head: the magic, the version, the source, the room, and the groups' count.
 fn write_head(out: &mut Vec<u8>, (source, room): (Source, u64), groups: u64) {
   out.extend_from_slice(&MAGIC.to_le_bytes());
