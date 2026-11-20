@@ -1693,6 +1693,50 @@ fn a_pack_carries_what_the_client_lacks_and_nothing_unwanted() {
   );
 }
 
+/// A-745 (§4.17.1 "A fetch's answer", rule 3: every slice a turn at a time). Do: negotiate generated requests over
+/// generated histories (every path, deepening and filter of `every_answer_is_the_oracles`) whole, and again begun and
+/// stepped one unit a step, the quantum spent after every unit, counting the steps. Expect: the same outcome, refusals
+/// included, answer and counters alike; and some pack chosen over more than one step, so the walk is cut and resumed.
+#[test]
+fn a745_a_negotiation_stepped_a_unit_at_a_time_answers_as_one_made_whole() {
+  let most_steps = RefCell::new(0u64);
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
+    cases: 1024,
+    ..Config::default()
+  }));
+  let result = runner.run(&any_plan(), |plan| {
+    let (graph, asks) = build(&plan);
+    let request = asks.request();
+    let whole = negotiate(&graph, &request, &mut Admission::new(u64::MAX));
+    let mut admission = Admission::new(u64::MAX);
+    let stepped = match super::begin(&graph, &request, &mut admission) {
+      Err(refusal) => Err(refusal),
+      Ok(super::Begun::Answered(outcome)) => Ok(outcome),
+      Ok(super::Begun::Selecting(mut negotiating)) => {
+        let mut steps = 0u64;
+        loop {
+          steps += 1;
+          match negotiating.step(&graph, &mut admission, &mut || true) {
+            Err(refusal) => break Err(refusal),
+            Ok(Some(outcome)) => break Ok(outcome),
+            Ok(None) => {}
+          }
+        }
+        .inspect(|_| {
+          let mut most = most_steps.borrow_mut();
+          *most = (*most).max(steps);
+        })
+      }
+    };
+    prop_assert_eq!(stepped, whole);
+    Ok(())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  assert!(*most_steps.borrow() > 1, "no pack took more than one step");
+}
+
 /// A straight history, `count` commits each with its own tree and blob, and one green whose versions are its commits.
 fn straight(count: u64) -> (TestGraph, Vec<u32>) {
   let mut graph = TestGraph::default();

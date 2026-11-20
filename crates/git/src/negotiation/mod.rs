@@ -348,13 +348,84 @@ pub fn negotiate<S: Graph>(
   request: &Request<'_>,
   admission: &mut Admission,
 ) -> Result<Outcome<S::Green, S::Node>, Refusal> {
+  match begin(graph, request, admission)? {
+    Begun::Answered(outcome) => Ok(outcome),
+    Begun::Selecting(mut negotiating) => loop {
+      if let Some(outcome) = negotiating.step(graph, admission, &mut || false)? {
+        return Ok(outcome);
+      }
+    },
+  }
+}
+
+/// A negotiation begun (A-745): answered already (nothing, or the acknowledgments alone), or a pack whose objects are
+/// still being chosen, a unit at a time.
+pub enum Begun<G, N> {
+  /// Answered.
+  Answered(Outcome<G, N>),
+  /// A pack, its objects being chosen ([`Negotiating::step`]).
+  Selecting(Negotiating<G, N>),
+}
+
+/// A negotiation whose pack's objects are being chosen a unit at a time (A-745, §4.17.1 "A fetch's answer" rule 3): what
+/// its answer says besides them (the acknowledgments, the shallow-info section and the runs), how it went so far, and
+/// the walk, which keeps its place across steps and is lent the graph for each.
+pub struct Negotiating<G, N> {
+  /// The acknowledgments, `None` after `done`.
+  acknowledgments: Option<Acknowledgments>,
+  /// The shallow-info section, when one is due.
+  shallow_info: Option<ShallowInfo>,
+  /// The runs the pack carries whole.
+  runs: Vec<Run<G>>,
+  /// How it went so far.
+  counters: Counters,
+  /// The walk choosing the objects sent one by one.
+  selecting: objects::Selecting<N, G>,
+}
+
+impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
+  /// Does units of the choice until `spent` says the owner's quantum is spent, at least one (each a commit or a tree
+  /// entry): the outcome once the last object is chosen, `None` while more are left.
+  pub fn step<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Option<Outcome<G, N>>, Refusal> {
+    let Some(objects) = self
+      .selecting
+      .step(graph, admission, &mut self.counters, spent)?
+    else {
+      return Ok(None);
+    };
+    Ok(Some(Outcome {
+      answer: Answer::Pack(Pack {
+        acknowledgments: self.acknowledgments.take(),
+        shallow_info: self.shallow_info.take(),
+        runs: core::mem::take(&mut self.runs),
+        objects,
+        _node: core::marker::PhantomData,
+      }),
+      counters: self.counters,
+    }))
+  }
+}
+
+/// Begins answering `request` from `graph` (A-745): everything but the choice of the objects sent one by one, which is
+/// bounded by the request (its wants, haves and shallow lines, the one-round runs, `ready` and the cut), then the choice
+/// begun; within `admission`.
+pub fn begin<S: Graph>(
+  graph: &S,
+  request: &Request<'_>,
+  admission: &mut Admission,
+) -> Result<Begun<S::Green, S::Node>, Refusal> {
   let mut counters = Counters::default();
   let wants = ready::wants(graph, request.wants, admission)?;
   if wants.is_empty() && !request.wait_for_done {
-    return Ok(Outcome {
+    return Ok(Begun::Answered(Outcome {
       answer: Answer::Nothing,
       counters,
-    });
+    }));
   }
   let common = ready::common(graph, request.haves, admission)?;
   let client_shallow = shallow::client(graph, request.shallow, admission)?;
@@ -380,10 +451,10 @@ pub fn negotiate<S: Graph>(
       ready,
     };
     if !ready {
-      return Ok(Outcome {
+      return Ok(Begun::Answered(Outcome {
         answer: Answer::Acknowledgments(acknowledgments),
         counters,
-      });
+      }));
     }
     Some(acknowledgments)
   };
@@ -395,29 +466,29 @@ pub fn negotiate<S: Graph>(
     admission,
     &mut counters,
   )?;
-  let objects = objects::select(
+  let shallow_info = cut.info.clone();
+  admission
+    .charge_items::<Run<S::Green>>(runs.runs.len())
+    .map_err(Refusal::PastAdmission)?;
+  let selecting = objects::Selecting::begin(
     graph,
     request,
-    &objects::Sides {
-      wants: &wants,
-      one_round: &runs.wants,
-      common: &common,
-      cut: &cut,
+    objects::Sides {
+      wants,
+      one_round: runs.wants,
+      common,
+      cut,
     },
-    &runs.runs,
+    runs.runs.clone(),
     admission,
-    &mut counters,
   )?;
-  Ok(Outcome {
-    answer: Answer::Pack(Pack {
-      acknowledgments,
-      shallow_info: cut.info,
-      runs: runs.runs,
-      objects,
-      _node: core::marker::PhantomData,
-    }),
+  Ok(Begun::Selecting(Negotiating {
+    acknowledgments,
+    shallow_info,
+    runs: runs.runs,
     counters,
-  })
+    selecting,
+  }))
 }
 
 /// Whether a server whose client holds `common` is ready to send the pack (A-640 part 3: protocol v0's
