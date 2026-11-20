@@ -1,3 +1,13 @@
+# STATUS 2026-11-20 (w-forming): main's queue DONE. Landed on main: b25a5b7a6 (CPU-judged start wait), 2add29641 +
+# 897fda7bd (forming 147/148, GAPS), a1439bcb1 (run 7 not reproduced), cfca7dd22 (A-740 helper labels), 1933e6ca6
+# (FleetWait = window / cpu share), cdfbb4020 (A-755 seal pieces sized to quantum), A-757 parts 1 adacdeec8, 2 5a9a5d41e,
+# 2b b45500fbb, 3 e478356a1, 4 2d4bb1285, 5 f10d6d528 (live append, hashing, body once, holder hashing, install images in
+# turns). The 2.9 s reaper poll: descheduling (no CPU). Remaining measured (debug, taskpolicy -b, main 359da2388), new
+# findings for main to order: make_taken 38 ms one poll CPU; a forward-lane child 17 ms; owed whole-record capture 19-22 ms
+# (A-377 memcpy by design); forwarded verbs 64-73 ms wall; 32 KiB NFS writes ship ~245 KB deltas each (54 MB / 221
+# appends) -- a delta-size question for whoever owns NFS writes. Probe tree ~/slates-work/w-forming-probe (local wip,
+# never lands).
+
 # RESUME HERE (2026-11-19 ~22:00 local, relaunched on the Mac Studio; supersedes the checkpoint below)
 - Clone ~/slates-work/w-forming-repro (main); worktree ~/slates-work/w-forming-fix = agents/w-forming-repro
   (cb97f4500 WIP aid) + local merge of origin/main a7051af96. Pushed over SSH (this Mac is adas-mac-studio-4; push url git@github.com; https has no credentials
