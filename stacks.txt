@@ -1,0 +1,443 @@
+==== round 1 at 06:31:25
+
+Image Name                     PID Session Name        Session#    Mem Usage Status          User Name                                              CPU Time Window Title                                                            
+========================= ======== ================ =========== ============ =============== ================================================== ============ ========================================================================
+slates.exe                    9368 Console                    2     10,720 K Unknown         runnervmm7ud1\runneradmin                               0:00:00 N/A                                                                     
+slates.exe                    8980 Console                    2     39,340 K Unknown         runnervmm7ud1\runneradmin                               0:00:01 N/A                                                                     
+
+Image Name                     PID Session Name        Session#    Mem Usage Status          User Name                                              CPU Time Window Title                                                            
+========================= ======== ================ =========== ============ =============== ================================================== ============ ========================================================================
+fsx.exe                       7096 Console                    2      4,164 K Unknown         runnervmm7ud1\runneradmin                               0:00:00 N/A                                                                     
+==== slates.exe pid 9368 round 1
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.016 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.203 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.9457 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*
+Symbol search path is: srv*
+Executable search path is: 
+WARNING: Process 9368 is not attached as a debuggee
+         The process can be examined but debug events will not be received
+...............
+(2498.d0c): Wake debugger - code 80000007 (first chance)
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+ntdll!NtWaitForMultipleObjects+0x14:
+00007ffc`d44c2e14 c3              ret
+0:000> cdb: Reading initial command '.symfix c:\symbols; .reload; ~*kn 40; qd'
+WARNING: Whitespace at start of path element
+WARNING: Whitespace at start of path element
+WARNING: Whitespace at start of path element
+Reloading current modules
+...............
+
+************* Symbol Loading Error Summary **************
+Module name            Error
+KERNELBASE             The system cannot find the file specified
+ntdll                  The system cannot find the file specified
+
+You can troubleshoot most symbol related issues by turning on symbol loading diagnostics (!sym noisy) and repeating the command that caused symbols to be loaded.
+You should also verify that your symbol search path (.sympath) is correct.
+
+.  0  Id: 2498.d0c Suspend: 1 Teb: 0000009b`b5184000 Unfrozen "main"
+ # Child-SP          RetAddr               Call Site
+00 0000009b`b52f9a88 00007ffc`d15d38f3     ntdll!NtWaitForMultipleObjects+0x14
+01 0000009b`b52f9a90 00007ffc`d15d37c1     KERNELBASE!WaitForMultipleObjectsEx+0x123
+*** WARNING: Unable to verify checksum for D:\a\slates\slates\target\debug\slates.exe
+02 0000009b`b52f9d80 00007ff7`340dc2f0     KERNELBASE!WaitForMultipleObjects+0x11
+03 0000009b`b52f9dc0 00007ff7`306140f7     slates+0x3c5c2f0
+04 0000009b`b52f9f50 00007ff7`30615a52     slates+0x1940f7
+05 0000009b`b52f9fb0 00007ff7`30617bab     slates+0x195a52
+06 0000009b`b52faf10 00007ff7`306147e9     slates+0x197bab
+07 0000009b`b52fedc0 00007ff7`3062084b     slates+0x1947e9
+08 0000009b`b52fef40 00007ff7`304d878a     slates+0x1a084b
+09 0000009b`b52fefc0 00007ff7`305058fb     slates+0x5878a
+0a 0000009b`b52ffa20 00007ff7`304f3e6e     slates+0x858fb
+0b 0000009b`b52ffa60 00007ff7`305005d1     slates+0x73e6e
+0c 0000009b`b52ffaa0 00007ff7`343f6230     slates+0x805d1
+0d 0000009b`b52ffae0 00007ff7`304ff26a     slates+0x3f76230
+0e 0000009b`b52ffb70 00007ff7`304de839     slates+0x7f26a
+0f 0000009b`b52ffbd0 00007ff7`345fa13f     slates+0x5e839
+10 0000009b`b52ffc00 00007ffc`d27add37     slates+0x417a13f
+11 0000009b`b52ffc40 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+12 0000009b`b52ffc70 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   1  Id: 2498.1350 Suspend: 1 Teb: 0000009b`b5186000 Unfrozen
+ # Child-SP          RetAddr               Call Site
+00 0000009b`b53ff7d8 00007ffc`d43e4945     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 0000009b`b53ff7e0 00007ffc`d27add37     ntdll!RtlSetThreadSubProcessTag+0x1815
+02 0000009b`b53ffae0 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+03 0000009b`b53ffb10 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   2  Id: 2498.16b4 Suspend: 1 Teb: 0000009b`b5188000 Unfrozen
+ # Child-SP          RetAddr               Call Site
+00 0000009b`b54ffc38 00007ffc`d43e4945     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 0000009b`b54ffc40 00007ffc`d27add37     ntdll!RtlSetThreadSubProcessTag+0x1815
+02 0000009b`b54fff40 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+03 0000009b`b54fff70 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   3  Id: 2498.1538 Suspend: 1 Teb: 0000009b`b518a000 Unfrozen
+ # Child-SP          RetAddr               Call Site
+00 0000009b`b55ffb58 00007ffc`d43e4945     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 0000009b`b55ffb60 00007ffc`d27add37     ntdll!RtlSetThreadSubProcessTag+0x1815
+02 0000009b`b55ffe60 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+03 0000009b`b55ffe90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+==== slates.exe pid 8980 round 1
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.016 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.9457 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*
+Symbol search path is: srv*
+Executable search path is: 
+WARNING: Process 8980 is not attached as a debuggee
+         The process can be examined but debug events will not be received
+..................................
+(2314.854): Wake debugger - code 80000007 (first chance)
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+ntdll!NtWaitForAlertByThreadId+0x14:
+00007ffc`d44c5f14 c3              ret
+0:000> cdb: Reading initial command '.symfix c:\symbols; .reload; ~*kn 40; qd'
+WARNING: Whitespace at start of path element
+WARNING: Whitespace at start of path element
+WARNING: Whitespace at start of path element
+Reloading current modules
+..................................
+
+************* Symbol Loading Error Summary **************
+Module name            Error
+ntdll                  The system cannot find the file specified
+
+You can troubleshoot most symbol related issues by turning on symbol loading diagnostics (!sym noisy) and repeating the command that caused symbols to be loaded.
+You should also verify that your symbol search path (.sympath) is correct.
+
+.  0  Id: 2314.854 Suspend: 1 Teb: 000000c3`38cee000 Unfrozen "main"
+ # Child-SP          RetAddr               Call Site
+00 000000c3`38efb418 00007ffc`d43952e3     ntdll!ZwWaitForAlertByThreadId+0x14
+01 000000c3`38efb420 00007ffc`d167fe28     ntdll!RtlWaitOnAddress+0x213
+*** WARNING: Unable to verify checksum for D:\a\slates\slates\target\debug\slates.exe
+02 000000c3`38efb490 00007ff7`343f4c71     KERNELBASE!WaitOnAddress+0x38
+03 000000c3`38efb4d0 00007ff7`34353ea8     slates+0x3f74c71
+04 000000c3`38efb530 00007ff7`343530fb     slates+0x3ed3ea8
+05 000000c3`38efb640 00007ff7`34352180     slates+0x3ed30fb
+06 000000c3`38efb720 00007ff7`34358a1f     slates+0x3ed2180
+07 000000c3`38efb8b0 00007ff7`3434f419     slates+0x3ed8a1f
+08 000000c3`38efb950 00007ff7`343564e8     slates+0x3ecf419
+09 000000c3`38efb9d0 00007ff7`342f4aaa     slates+0x3ed64e8
+0a 000000c3`38efbab0 00007ff7`3064480e     slates+0x3e74aaa
+0b 000000c3`38efbb00 00007ff7`30610f90     slates+0x1c480e
+0c 000000c3`38efbb30 00007ff7`3063f1e8     slates+0x190f90
+0d 000000c3`38efbd10 00007ff7`3063f14f     slates+0x1bf1e8
+0e 000000c3`38efcf10 00007ff7`30620827     slates+0x1bf14f
+0f 000000c3`38efeec0 00007ff7`304d8883     slates+0x1a0827
+10 000000c3`38efef40 00007ff7`305058fb     slates+0x58883
+11 000000c3`38eff9a0 00007ff7`304f3e6e     slates+0x858fb
+12 000000c3`38eff9e0 00007ff7`305005d1     slates+0x73e6e
+13 000000c3`38effa20 00007ff7`343f6230     slates+0x805d1
+14 000000c3`38effa60 00007ff7`304ff26a     slates+0x3f76230
+15 000000c3`38effaf0 00007ff7`304de839     slates+0x7f26a
+16 000000c3`38effb50 00007ff7`345fa13f     slates+0x5e839
+17 000000c3`38effb80 00007ffc`d27add37     slates+0x417a13f
+18 000000c3`38effbc0 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+19 000000c3`38effbf0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   1  Id: 2314.2798 Suspend: 1 Teb: 000000c3`38cf0000 Unfrozen
+ # Child-SP          RetAddr               Call Site
+00 000000c3`38fff6b8 00007ffc`d43e4945     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 000000c3`38fff6c0 00007ffc`d27add37     ntdll!RtlSetThreadSubProcessTag+0x1815
+02 000000c3`38fff9c0 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+03 000000c3`38fff9f0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   2  Id: 2314.1e58 Suspend: 1 Teb: 000000c3`38cf2000 Unfrozen
+ # Child-SP          RetAddr               Call Site
+00 000000c3`390ff4c8 00007ffc`d43e4945     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 000000c3`390ff4d0 00007ffc`d27add37     ntdll!RtlSetThreadSubProcessTag+0x1815
+02 000000c3`390ff7d0 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+03 000000c3`390ff800 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   3  Id: 2314.1368 Suspend: 1 Teb: 000000c3`38cf4000 Unfrozen
+ # Child-SP          RetAddr               Call Site
+00 000000c3`391ffb78 00007ffc`d43e4945     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 000000c3`391ffb80 00007ffc`d27add37     ntdll!RtlSetThreadSubProcessTag+0x1815
+02 000000c3`391ffe80 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+03 000000c3`391ffeb0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   4  Id: 2314.239c Suspend: 1 Teb: 000000c3`38cf6000 Unfrozen "slates-log"
+ # Child-SP          RetAddr               Call Site
+00 000000c3`393ff098 00007ffc`d43952e3     ntdll!ZwWaitForAlertByThreadId+0x14
+01 000000c3`393ff0a0 00007ffc`d167fe28     ntdll!RtlWaitOnAddress+0x213
+02 000000c3`393ff110 00007ff7`343f4c71     KERNELBASE!WaitOnAddress+0x38
+03 000000c3`393ff150 00007ff7`34353ea8     slates+0x3f74c71
+04 000000c3`393ff1b0 00007ff7`343645a3     slates+0x3ed3ea8
+05 000000c3`393ff2c0 00007ff7`3434fea0     slates+0x3ee45a3
+06 000000c3`393ff3a0 00007ff7`343582cf     slates+0x3ecfea0
+07 000000c3`393ff530 00007ff7`3434ee29     slates+0x3ed82cf
+08 000000c3`393ff5d0 00007ff7`343666ef     slates+0x3ecee29
+09 000000c3`393ff650 00007ff7`342f481f     slates+0x3ee66ef
+0a 000000c3`393ff760 00007ff7`3430b2dd     slates+0x3e7481f
+0b 000000c3`393ff7f0 00007ff7`343062e8     slates+0x3e8b2dd
+0c 000000c3`393ff860 00007ff7`342e6af9     slates+0x3e862e8
+0d 000000c3`393ff960 00007ff7`3433b2bf     slates+0x3e66af9
+0e 000000c3`393ff990 00007ff7`3431c594     slates+0x3ebb2bf
+0f 000000c3`393ffa40 00007ff7`34314549     slates+0x3e9c594
+10 000000c3`393ffad0 00007ff7`3433e3d3     slates+0x3e94549
+11 000000c3`393ffb60 00007ff7`3433a3a6     slates+0x3ebe3d3
+12 000000c3`393ffbb0 00007ff7`342e081e     slates+0x3eba3a6
+13 000000c3`393ffe10 00007ff7`343fc253     slates+0x3e6081e
+14 000000c3`393ffe50 00007ffc`d27add37     slates+0x3f7c253
+15 000000c3`393fff00 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+16 000000c3`393fff30 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   5  Id: 2314.790 Suspend: 1 Teb: 000000c3`38cf8000 Unfrozen "slates-shard-0"
+ # Child-SP          RetAddr               Call Site
+00 000000c3`395fd318 00007ffc`d166549f     ntdll!NtRemoveIoCompletionEx+0x14
+01 000000c3`395fd320 00007ff7`3346cffd     KERNELBASE!GetQueuedCompletionStatusEx+0xcf
+02 000000c3`395fd3d0 00007ff7`334720f0     slates+0x2fecffd
+03 000000c3`395fd500 00007ff7`3348573a     slates+0x2ff20f0
+04 000000c3`395fd7d0 00007ff7`334819af     slates+0x300573a
+05 000000c3`395fd9c0 00007ff7`33489f96     slates+0x30019af
+06 000000c3`395fdaa0 00007ff7`33485e5e     slates+0x3009f96
+07 000000c3`395fdae0 00007ff7`3351dcb9     slates+0x3005e5e
+08 000000c3`395fdb30 00007ff7`3348b468     slates+0x309dcb9
+09 000000c3`395fdd40 00007ff7`3348b231     slates+0x300b468
+0a 000000c3`395fdeb0 00007ff7`3346f2dc     slates+0x300b231
+0b 000000c3`395fdf80 00007ff7`33469ec2     slates+0x2fef2dc
+0c 000000c3`395fe3b0 00007ff7`334fa8e1     slates+0x2fe9ec2
+0d 000000c3`395fe500 00007ff7`3345a7bb     slates+0x307a8e1
+0e 000000c3`395fe540 00007ff7`3345d4a0     slates+0x2fda7bb
+0f 000000c3`395fe6d0 00007ff7`33517d19     slates+0x2fdd4a0
+10 000000c3`395fe840 00007ff7`3345d513     slates+0x3097d19
+11 000000c3`395fed90 00007ff7`3345a120     slates+0x2fdd513
+12 000000c3`395fede0 00007ff7`3346509e     slates+0x2fda120
+13 000000c3`395ffa90 00007ff7`343fc253     slates+0x2fe509e
+14 000000c3`395ffad0 00007ffc`d27add37     slates+0x3f7c253
+15 000000c3`395ffb80 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+16 000000c3`395ffbb0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   6  Id: 2314.1f58 Suspend: 1 Teb: 000000c3`38cfa000 Unfrozen "slates-shard-1"
+ # Child-SP          RetAddr               Call Site
+00 000000c3`397fd2f8 00007ffc`d166549f     ntdll!NtRemoveIoCompletionEx+0x14
+01 000000c3`397fd300 00007ff7`3346cffd     KERNELBASE!GetQueuedCompletionStatusEx+0xcf
+02 000000c3`397fd3b0 00007ff7`334720f0     slates+0x2fecffd
+03 000000c3`397fd4e0 00007ff7`3348573a     slates+0x2ff20f0
+04 000000c3`397fd7b0 00007ff7`334819af     slates+0x300573a
+05 000000c3`397fd9a0 00007ff7`33489f96     slates+0x30019af
+06 000000c3`397fda80 00007ff7`33485e5e     slates+0x3009f96
+07 000000c3`397fdac0 00007ff7`3351dcb9     slates+0x3005e5e
+08 000000c3`397fdb10 00007ff7`3348b468     slates+0x309dcb9
+09 000000c3`397fdd20 00007ff7`3348b231     slates+0x300b468
+0a 000000c3`397fde90 00007ff7`3346f2dc     slates+0x300b231
+0b 000000c3`397fdf60 00007ff7`33469ec2     slates+0x2fef2dc
+0c 000000c3`397fe390 00007ff7`334fa8e1     slates+0x2fe9ec2
+0d 000000c3`397fe4e0 00007ff7`3345a7bb     slates+0x307a8e1
+0e 000000c3`397fe520 00007ff7`3345d4a0     slates+0x2fda7bb
+0f 000000c3`397fe6b0 00007ff7`33517d19     slates+0x2fdd4a0
+10 000000c3`397fe820 00007ff7`3345d513     slates+0x3097d19
+11 000000c3`397fed70 00007ff7`3345a120     slates+0x2fdd513
+12 000000c3`397fedc0 00007ff7`3346509e     slates+0x2fda120
+13 000000c3`397ffa70 00007ff7`343fc253     slates+0x2fe509e
+14 000000c3`397ffab0 00007ffc`d27add37     slates+0x3f7c253
+15 000000c3`397ffb60 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+16 000000c3`397ffb90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   7  Id: 2314.e50 Suspend: 1 Teb: 000000c3`38cfc000 Unfrozen "slates-doorbell"
+ # Child-SP          RetAddr               Call Site
+00 000000c3`399febb8 00007ffc`d15cd01f     ntdll!NtWaitForSingleObject+0x14
+01 000000c3`399febc0 00007ff7`341b9212     KERNELBASE!WaitForSingleObjectEx+0xaf
+02 000000c3`399fec60 00007ff7`34268278     slates+0x3d39212
+03 000000c3`399fed00 00007ff7`341cf5f0     slates+0x3de8278
+04 000000c3`399feec0 00007ff7`31dda24e     slates+0x3d4f5f0
+05 000000c3`399fef10 00007ff7`31dbc653     slates+0x195a24e
+06 000000c3`399ff1b0 00007ff7`30f7e7d9     slates+0x193c653
+07 000000c3`399ff230 00007ff7`307c80ff     slates+0xafe7d9
+08 000000c3`399ff260 00007ff7`30ff18a4     slates+0x3480ff
+09 000000c3`399ff390 00007ff7`30f9986c     slates+0xb718a4
+0a 000000c3`399ff4a0 00007ff7`30850b73     slates+0xb1986c
+0b 000000c3`399ff5b0 00007ff7`307c4c1a     slates+0x3d0b73
+0c 000000c3`399ff600 00007ff7`30dc5c0e     slates+0x344c1a
+0d 000000c3`399ffb90 00007ff7`343fc253     slates+0x945c0e
+0e 000000c3`399ffbd0 00007ffc`d27add37     slates+0x3f7c253
+0f 000000c3`399ffc80 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+10 000000c3`399ffcb0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   8  Id: 2314.10d4 Suspend: 1 Teb: 000000c3`38cfe000 Unfrozen "slates-watchdog"
+ # Child-SP          RetAddr               Call Site
+00 000000c3`39bfcf38 00007ffc`d43952e3     ntdll!ZwWaitForAlertByThreadId+0x14
+01 000000c3`39bfcf40 00007ffc`d167fe28     ntdll!RtlWaitOnAddress+0x213
+02 000000c3`39bfcfb0 00007ff7`343f4ab5     KERNELBASE!WaitOnAddress+0x38
+03 000000c3`39bfcff0 00007ff7`34353f69     slates+0x3f74ab5
+04 000000c3`39bfd030 00007ff7`34364783     slates+0x3ed3f69
+05 000000c3`39bfd140 00007ff7`343502d0     slates+0x3ee4783
+06 000000c3`39bfd220 00007ff7`343583af     slates+0x3ed02d0
+07 000000c3`39bfd3b0 00007ff7`3434eeb9     slates+0x3ed83af
+08 000000c3`39bfd450 00007ff7`34367b28     slates+0x3eceeb9
+09 000000c3`39bfd4d0 00007ff7`342f4a28     slates+0x3ee7b28
+0a 000000c3`39bfd5b0 00007ff7`342f4961     slates+0x3e74a28
+0b 000000c3`39bfd620 00007ff7`34308368     slates+0x3e74961
+0c 000000c3`39bfd6c0 00007ff7`314e385a     slates+0x3e88368
+0d 000000c3`39bfd700 00007ff7`314347cb     slates+0x106385a
+0e 000000c3`39bfe1b0 00007ff7`30f7e7c9     slates+0xfb47cb
+0f 000000c3`39bfe2c0 00007ff7`307c7f1f     slates+0xafe7c9
+10 000000c3`39bfe2f0 00007ff7`30ff1874     slates+0x347f1f
+11 000000c3`39bfe5c0 00007ff7`30f9982c     slates+0xb71874
+12 000000c3`39bfe870 00007ff7`30850b73     slates+0xb1982c
+13 000000c3`39bfeb20 00007ff7`307c481a     slates+0x3d0b73
+14 000000c3`39bfeb70 00007ff7`30dc5bee     slates+0x34481a
+15 000000c3`39bffa90 00007ff7`343fc253     slates+0x945bee
+16 000000c3`39bffad0 00007ffc`d27add37     slates+0x3f7c253
+17 000000c3`39bffb80 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+18 000000c3`39bffbb0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   9  Id: 2314.d1c Suspend: 1 Teb: 000000c3`38d00000 Unfrozen
+ # Child-SP          RetAddr               Call Site
+00 000000c3`39cff838 00007ffc`d43e4945     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 000000c3`39cff840 00007ffc`d27add37     ntdll!RtlSetThreadSubProcessTag+0x1815
+02 000000c3`39cffb40 00007ffc`d439f2bc     KERNEL32!BaseThreadInitThunk+0x17
+03 000000c3`39cffb70 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+  10  Id: 2314.23a4 Suspend: 1 Teb: 000000c3`38d02000 Unfrozen "slates-winfsp"
+ # Child-SP          RetAddr               Call Site
+00 000000c3`39ef9eb8 00007ffc`d43952e3     ntdll!ZwWaitForAlertByThreadId+0x14
+01 000000c3`39ef9ec0 00007ffc`d167fe28     ntdll!RtlWaitOnAddress+0x213
+02 000000c3`39ef9f30 00007ff7`343f4c71     KERNELBASE!WaitOnAddress+0x38
+03 000000c3`39ef9f70 00007ff7`3248e148     slates+0x3f74c71
+04 000000c3`39ef9fd0 00007ff7`324c4cbb     slates+0x200e148
+05 000000c3`39efa0e0 00007ff7`3248b900     slates+0x2044cbb
+06 000000c3`39efa1c0 00007ff7`324921cf     slates+0x200b900
+07 000000c3`39efa350 00007ff7`324858d9     slates+0x20121cf
+08 000000c3`39efa3f0 00007ff7`324c94af     slates+0x20058d9
+09 000000c3`39efa470 00007ff7`3240b6df     slates+0x20494af
+0a 000000c3`39efa5b0 00007ff7`323f2b76     slates+0x1f8b6df
+0b 000000c3`39efa670 00007ff7`32445621     slates+0x1f72b76
+0c 000000c3`39efa6b0 00007ff7`32427a6f     slates+0x1fc5621
+0d 000000c3`39efd640 00007ff7`32463a47     slates+0x1fa7a6f
+0e 000000c3`39efd980 00007ff7`324863a9     slates+0x1fe3a47
+0f 000000c3`39efdc80 00007ff7`3248d00f     slates+0x20063a9
+10 000000c3`39efdcb0 00007ff7`323eab14     slates+0x200d00f
+11 000000c3`39efdfd0 00007ff7`323f670c     slates+0x1f6ab14
+12 000000c3`39efe2d0 00007ff7`32491393     slates+0x1f7670c
+13 000000c3`39efe5d0 00007ff7`3248c520     slates+0x2011393
+14 000000c3`39efe620 00007ff7`3241732e     slates+0x200c520
+15 000000c3`39eff750 00007ff7`343fc253     slates+0x1f9732e
+16 000000c3`39eff790 00007ffc`d27add37     slates+0x3f7c253
+17 ==== fsx.exe pid 7096 round 1
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.031 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.9457 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+Unable to examine process id 7096, Win32 error 0n87
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
