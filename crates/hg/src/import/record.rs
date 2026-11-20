@@ -30,7 +30,13 @@
 //! entry its landing appends are the size of what arrived; its replay takes the changegroup again through the live
 //! push's own intake (`push::intake`), against the index as the push met it, so it keeps the same rows.
 //!
-//! **A manifest as its delta** (A-729 part 2, version 3, an import's): after a revision's flags, a form byte: 0 its
+//! **Identities** (A-729 part 2, version 4, an import's; main's ruling): an import's record names each revision's content
+//! by identity and holds none of its bytes, since the shard's image restores the content before the records are
+//! replayed (A-727 a3). A changeset is its node, parents, flags, length and its text's identity, its text read back from
+//! the store at the replay; a manifest or file revision is its row as the index stores it, replayed as it was
+//! (`HgIndex::append_stored`). A content the store does not hold refuses the replay ([`Refused::Unheld`]).
+//!
+//! **A manifest as its delta** (A-729 part 2, version 3, now a made changeset's): after a revision's flags, a form byte: 0 its
 //! length and text as below, 1 the node of its delta's base, then the delta's length and bytes, as the index keeps a
 //! manifest (A-729 part 1), never rebuilt for the record. The replay rebuilds it from the manifest replayed before it or
 //! from the fork, then keeps it as any revision.

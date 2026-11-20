@@ -195,10 +195,15 @@
 > live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
 > in place); the landing appends that, where it appended every text whole. An import's record (version 3) writes a
 > manifest the index keeps as a delta as that delta and its base's node, never rebuilt (Mercurial's own manifests:
-> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. A file revision is
-> written as one hunk against the revision before it in its log, from their common prefix to their common suffix
-> (`delta::encode_span`), where that is shorter than its text (found by use, w-perf: Mercurial's import record was
-> 4,657,833,574 bytes with file texts whole, and its landing's one-step append spun the shard). A made changeset's
+> 5.5 GB whole, 9.4 MB as deltas). An import's record now names every revision's content by identity and holds none
+> of its bytes (`SHGR` version 4, main's ruling: A-727 a3's image restores the content before the records): the row as
+> the index stores it (its delta's base and lengths, its content's and block's identities), replayed by
+> `HgIndex::append_stored` over the restored windows, a content the store lacks refused `Unheld`; the import's landing
+> commits only once its shard's image holding the content is published (A-727 slice b's `content_ticket` and
+> `content_durable`); a rebuild sets the old index aside, holding the content, until its records are in. Proven by a
+> warm restart (`daemon::tests::t_a729_an_imported_mercurial_repository_survives_a_warm_restart_by_identity`). Found by
+> use, w-perf: Mercurial's import record was 4,657,833,574 bytes with texts whole and 1,295,268,184 with one-hunk deltas
+> (de49b6bd4, superseded), and its landing spun and passed the partition's 746,950,834-byte snapshot slot. A made changeset's
 > record (version 3 too) writes its manifest as its delta against its first parent's text (`write_made`'s `parent`,
 > read from the index; replayed through the same rebuild, held by A-731's rebuild test). Owed: the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.

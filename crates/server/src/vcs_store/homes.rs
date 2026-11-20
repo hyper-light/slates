@@ -198,17 +198,6 @@ impl core::future::Future for PublishedHere {
   }
 }
 
-/// Waits, on this shard, until every window kept on it so far is in a published image of its own (module docs,
-/// "Durable before named"), publishing one where none has been since: an entry that names this shard's windows by
-/// identity, never their bytes, commits only after it (A-729 part 2, a Mercurial import's landing). Whether they are.
-pub(crate) async fn kept_here_durable(shard: u16) -> bool {
-  PublishedHere {
-    generation: ticket_here(shard).generation,
-    asked: false,
-  }
-  .await
-}
-
 /// Counter: publications a home's wait for its ticket made itself (A-724 piece 8c), nothing else having published since
 /// the window was kept. Format: a counter name.
 pub(crate) const HOME_PUBLISHED: &str = "vcs_store.homes.published_for_ticket";

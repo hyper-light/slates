@@ -896,9 +896,17 @@ pub(crate) async fn run(id: RepositoryId) -> Option<Result<Box<Finished>, Import
       Ok(Turned::More) => {}
       Ok(Turned::Done(finished)) => {
         // Its record names its contents by identity (A-729 part 2), so its landing commits only once the shard's image
-        // holding them is published (durable before named); one not published gives the import back.
-        let shard = crate::state::with_state(|state| state.shard)?;
-        if super::homes::kept_here_durable(shard).await {
+        // holding them is published (durable before named, A-727 slice b's barrier); one not published gives the import
+        // back.
+        let (shard, ticket) =
+          crate::state::with_state(|state| (state.shard, super::durable::content_ticket(state)))?;
+        let durable = super::durable::content_durable(
+          shard,
+          ticket,
+          crate::fleet::live_budget().max_deadline_ns(),
+        )
+        .await;
+        if durable.is_ok() {
           return Some(Ok(finished));
         }
         crate::state::with_state(|state| abandon(state, id))?;
