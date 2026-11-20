@@ -1,0 +1,407 @@
+==== round 1 at 06:46:24
+==== slates.exe pid 1696 round 1
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.015 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.360 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.9457 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*c:\symbols*https://msdl.microsoft.com/download/symbols
+OK                                             D:\a\slates\slates\target\debug
+OK                                             D:\a\slates\slates\target\debug\deps
+Symbol search path is: srv*c:\symbols*https://msdl.microsoft.com/download/symbols;D:\a\slates\slates\target\debug;D:\a\slates\slates\target\debug\deps
+Executable search path is: 
+WARNING: Process 1696 is not attached as a debuggee
+         The process can be examined but debug events will not be received
+...............
+(6a0.a98): Wake debugger - code 80000007 (first chance)
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+ntdll!NtWaitForMultipleObjects+0x14:
+00007ff8`be962e14 c3              ret
+0:000> cdb: Reading initial command '~*kn 50; qd'
+
+.  0  Id: 6a0.a98 Suspend: 1 Teb: 00000071`35008000 Unfrozen "main"
+ # Child-SP          RetAddr               Call Site
+00 00000071`34f39768 00007ff8`bc0438f3     ntdll!NtWaitForMultipleObjects+0x14
+01 00000071`34f39770 00007ff8`bc0437c1     KERNELBASE!WaitForMultipleObjectsEx+0x123
+*** WARNING: Unable to verify checksum for D:\a\slates\slates\target\debug\slates.exe
+02 00000071`34f39a60 00007ff7`9850c2f0     KERNELBASE!WaitForMultipleObjects+0x11
+03 00000071`34f39aa0 00007ff7`94a440f7     slates!slates_anchor::supervise::Supervisor::await_work+0x230
+04 00000071`34f39c30 00007ff7`94a45a52     slates!slates_api::role::anchor::await_observation+0x37
+05 00000071`34f39c90 00007ff7`94a47bab     slates!slates_api::role::anchor::observe+0x10e2
+06 00000071`34f3abf0 00007ff7`94a447e9     slates!slates_api::role::anchor::supervise+0x148b
+07 00000071`34f3eaa0 00007ff7`94a5084b     slates!slates_api::role::anchor::run+0xf9
+08 00000071`34f3ec20 00007ff7`9490878a     slates!slates_api::role::serve+0x7b
+09 00000071`34f3eca0 00007ff7`949358fb     slates!slates::main+0x71a
+0a 00000071`34f3f700 00007ff7`94923e6e     slates!core::ops::function::FnOnce::call_once<std::process::ExitCode (*)(),tuple$<> >+0xb
+0b 00000071`34f3f740 00007ff7`949305d1     slates!std::sys::backtrace::__rust_begin_short_backtrace<std::process::ExitCode (*)(),std::process::ExitCode>+0xe
+0c 00000071`34f3f780 00007ff7`98826230     slates!std::rt::lang_start::closure$0<std::process::ExitCode>+0x11
+0d (Inline Function) --------`--------     slates!std::rt::lang_start_internal::closure$0+0x96
+0e (Inline Function) --------`--------     slates!std::panicking::catch_unwind::do_call+0x96
+0f (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x96
+10 (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x96
+11 00000071`34f3f7c0 00007ff7`9492f26a     slates!std::rt::lang_start_internal+0xb0
+12 00000071`34f3f850 00007ff7`9490e839     slates!std::rt::lang_start<std::process::ExitCode>+0x3a
+13 00000071`34f3f8b0 00007ff7`98a2a13f     slates!main+0x19
+14 (Inline Function) --------`--------     slates!invoke_main+0x22
+15 00000071`34f3f8e0 00007ff8`bde4dd37     slates!__scrt_common_main_seh+0x10f
+16 00000071`34f3f920 00007ff8`be83f2bc     KERNEL32!BaseThreadInitThunk+0x17
+17 00000071`34f3f950 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+==== slates.exe pid 7444 round 1
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.016 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.9457 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*c:\symbols*https://msdl.microsoft.com/download/symbols
+OK                                             D:\a\slates\slates\target\debug
+OK                                             D:\a\slates\slates\target\debug\deps
+Symbol search path is: srv*c:\symbols*https://msdl.microsoft.com/download/symbols;D:\a\slates\slates\target\debug;D:\a\slates\slates\target\debug\deps
+Executable search path is: 
+WARNING: Process 7444 is not attached as a debuggee
+         The process can be examined but debug events will not be received
+..................................
+(1d14.119c): Wake debugger - code 80000007 (first chance)
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+ntdll!NtWaitForAlertByThreadId+0x14:
+00007ff8`be965f14 c3              ret
+0:000> cdb: Reading initial command '~*kn 50; qd'
+
+.  0  Id: 1d14.119c Suspend: 1 Teb: 00000037`1d737000 Unfrozen "main"
+ # Child-SP          RetAddr               Call Site
+00 00000037`1d8fb1b8 00007ff8`be8352e3     ntdll!NtWaitForAlertByThreadId+0x14
+01 00000037`1d8fb1c0 00007ff8`bc0efe28     ntdll!RtlWaitOnAddress+0x213
+*** WARNING: Unable to verify checksum for D:\a\slates\slates\target\debug\slates.exe
+02 00000037`1d8fb230 00007ff7`98824c71     KERNELBASE!WaitOnAddress+0x38
+03 (Inline Function) --------`--------     slates!std::sys::pal::windows::futex::wait_on_address+0x18
+04 (Inline Function) --------`--------     slates!std::sys::pal::windows::futex::futex_wait+0x18
+05 (Inline Function) --------`--------     slates!std::sys::sync::thread_parking::futex::Parker::park+0x5d
+06 00000037`1d8fb270 00007ff7`98783ea8     slates!std::thread::thread::Thread::park+0x71
+07 00000037`1d8fb2d0 00007ff7`987830fb     slates!std::sync::mpmc::context::Context::wait_until+0x1b8
+08 00000037`1d8fb3e0 00007ff7`98782180     slates!std::sync::mpmc::array::impl$1::recv::closure$1<tuple$<> >+0x11b
+09 (Inline Function) --------`--------     slates!std::sync::mpmc::context::impl$0::with::closure$0+0x78
+0a 00000037`1d8fb4c0 00007ff7`98788a1f     slates!std::sync::mpmc::context::impl$0::with::closure$1<std::sync::mpmc::array::impl$1::recv::closure_env$1<tuple$<> >,tuple$<> >+0x230
+0b 00000037`1d8fb650 00007ff7`9877f419     slates!std::thread::local::LocalKey<core::cell::Cell<enum2$<core::option::Option<std::sync::mpmc::context::Context> > > >::try_with<core::cell::Cell<enum2$<core::option::Option<std::sync::mpmc::context::Context> > >,std::sync::mpmc::context::impl$0::with::closure_env$1<std::sync::mpmc::array::impl$1::recv::closure_env$1<tuple$<> >,tuple$<> >,tuple$<> >+0x8f
+0c 00000037`1d8fb6f0 00007ff7`987864e8     slates!std::sync::mpmc::context::Context::with<std::sync::mpmc::array::impl$1::recv::closure_env$1<tuple$<> >,tuple$<> >+0x39
+0d 00000037`1d8fb770 00007ff7`98724aaa     slates!std::sync::mpmc::array::Channel<tuple$<> >::recv<tuple$<> >+0x138
+0e 00000037`1d8fb850 00007ff7`94a7480e     slates!std::sync::mpmc::Receiver<tuple$<> >::recv<tuple$<> >+0x4a
+0f 00000037`1d8fb8a0 00007ff7`94a40f90     slates!std::sync::mpsc::Receiver<tuple$<> >::recv<tuple$<> >+0xe
+10 00000037`1d8fb8d0 00007ff7`94a6f1e8     slates!slates_server::daemon::Daemon::wait_for_stop<slates_api::role::daemon::serve::closure_env$0>+0x1e0
+11 00000037`1d8fbab0 00007ff7`94a6f14f     slates!slates_api::role::daemon::serve+0x88
+12 00000037`1d8fccb0 00007ff7`94a50827     slates!slates_api::role::daemon::run+0x13f
+13 00000037`1d8fec60 00007ff7`94908883     slates!slates_api::role::serve+0x57
+14 00000037`1d8fece0 00007ff7`949358fb     slates!slates::main+0x813
+15 00000037`1d8ff740 00007ff7`94923e6e     slates!core::ops::function::FnOnce::call_once<std::process::ExitCode (*)(),tuple$<> >+0xb
+16 00000037`1d8ff780 00007ff7`949305d1     slates!std::sys::backtrace::__rust_begin_short_backtrace<std::process::ExitCode (*)(),std::process::ExitCode>+0xe
+17 00000037`1d8ff7c0 00007ff7`98826230     slates!std::rt::lang_start::closure$0<std::process::ExitCode>+0x11
+18 (Inline Function) --------`--------     slates!std::rt::lang_start_internal::closure$0+0x96
+19 (Inline Function) --------`--------     slates!std::panicking::catch_unwind::do_call+0x96
+1a (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x96
+1b (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x96
+1c 00000037`1d8ff800 00007ff7`9492f26a     slates!std::rt::lang_start_internal+0xb0
+1d 00000037`1d8ff890 00007ff7`9490e839     slates!std::rt::lang_start<std::process::ExitCode>+0x3a
+1e 00000037`1d8ff8f0 00007ff7`98a2a13f     slates!main+0x19
+1f (Inline Function) --------`--------     slates!invoke_main+0x22
+20 00000037`1d8ff920 00007ff8`bde4dd37     slates!__scrt_common_main_seh+0x10f
+21 00000037`1d8ff960 00007ff8`be83f2bc     KERNEL32!BaseThreadInitThunk+0x17
+22 00000037`1d8ff990 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   1  Id: 1d14.1798 Suspend: 1 Teb: 00000037`1d73f000 Unfrozen "slates-log"
+ # Child-SP          RetAddr               Call Site
+00 00000037`1ddfef58 00007ff8`be8352e3     ntdll!NtWaitForAlertByThreadId+0x14
+01 00000037`1ddfef60 00007ff8`bc0efe28     ntdll!RtlWaitOnAddress+0x213
+02 00000037`1ddfefd0 00007ff7`98824c71     KERNELBASE!WaitOnAddress+0x38
+03 (Inline Function) --------`--------     slates!std::sys::pal::windows::futex::wait_on_address+0x18
+04 (Inline Function) --------`--------     slates!std::sys::pal::windows::futex::futex_wait+0x18
+05 (Inline Function) --------`--------     slates!std::sys::sync::thread_parking::futex::Parker::park+0x5d
+06 00000037`1ddff010 00007ff7`98783ea8     slates!std::thread::thread::Thread::park+0x71
+07 00000037`1ddff070 00007ff7`987945a3     slates!std::sync::mpmc::context::Context::wait_until+0x1b8
+08 00000037`1ddff180 00007ff7`9877fea0     slates!std::sync::mpmc::list::impl$3::recv::closure$1<alloc::string::String>+0x113
+09 (Inline Function) --------`--------     slates!std::sync::mpmc::context::impl$0::with::closure$0+0x78
+0a 00000037`1ddff260 00007ff7`987882cf     slates!std::sync::mpmc::context::impl$0::with::closure$1<std::sync::mpmc::list::impl$3::recv::closure_env$1<alloc::string::String>,tuple$<> >+0x230
+0b 00000037`1ddff3f0 00007ff7`9877ee29     slates!std::thread::local::LocalKey<core::cell::Cell<enum2$<core::option::Option<std::sync::mpmc::context::Context> > > >::try_with<core::cell::Cell<enum2$<core::option::Option<std::sync::mpmc::context::Context> > >,std::sync::mpmc::context::impl$0::with::closure_env$1<std::sync::mpmc::list::impl$3::recv::closure_env$1<alloc::string::String>,tuple$<> >,tuple$<> >+0x8f
+0c 00000037`1ddff490 00007ff7`987966ef     slates!std::sync::mpmc::context::Context::with<std::sync::mpmc::list::impl$3::recv::closure_env$1<alloc::string::String>,tuple$<> >+0x39
+0d 00000037`1ddff510 00007ff7`9872481f     slates!std::sync::mpmc::list::Channel<alloc::string::String>::recv<alloc::string::String>+0x14f
+0e 00000037`1ddff620 00007ff7`9873b2dd     slates!std::sync::mpmc::Receiver<alloc::string::String>::recv<alloc::string::String>+0x7f
+0f 00000037`1ddff6b0 00007ff7`987362e8     slates!std::sync::mpsc::impl$17::next<alloc::string::String>+0x1d
+10 00000037`1ddff720 00007ff7`98716af9     slates!slates_machine::log::impl$1::start_with_sink::closure$0+0x78
+11 00000037`1ddff820 00007ff7`9876b2bf     slates!std::sys::backtrace::__rust_begin_short_backtrace<slates_machine::log::impl$1::start_with_sink::closure_env$0,tuple$<> >+0x9
+12 00000037`1ddff850 00007ff7`9874c594     slates!std::thread::lifecycle::spawn_unchecked::closure$1::closure$0<slates_machine::log::impl$1::start_with_sink::closure_env$0,tuple$<> >+0x6f
+13 00000037`1ddff900 00007ff7`98744549     slates!core::panic::unwind_safe::impl$25::call_once<tuple$<>,std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_machine::log::impl$1::start_with_sink::closure_env$0,tuple$<> > >+0x24
+14 00000037`1ddff990 00007ff7`9876e3d3     slates!std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_machine::log::impl$1::start_with_sink::closure_env$0,tuple$<> > >,tuple$<> >+0x29
+15 00000037`1ddffa20 00007ff7`9876a3a6     slates!core::iter::traits::iterator::Iterator::max<core::iter::adapters::map::Map<core::slice::iter::Iter<slates_machine::facts::CoreFacts>,slates_machine::facts::impl$2::largest_l2::closure_env$0> >+0x43
+16 (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x62
+17 (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x62
+18 00000037`1ddffa70 00007ff7`9871081e     slates!std::thread::lifecycle::spawn_unchecked::closure$1<slates_machine::log::impl$1::start_with_sink::closure_env$0,tuple$<> >+0x106
+19 00000037`1ddffcd0 00007ff7`9882c253     slates!core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::closure_env$1<slates_machine::log::impl$1::start_with_sink::closure_env$0,tuple$<> >,tuple$<> >+0xe
+1a 00000037`1ddffd10 00007ff8`bde4dd37     slates!std::sys::thread::windows::impl$0::new::thread_start+0x1e3
+1b 00000037`1ddffdc0 00007ff8`be83f2bc     KERNEL32!BaseThreadInitThunk+0x17
+1c 00000037`1ddffdf0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   2  Id: 1d14.1a48 Suspend: 1 Teb: 00000037`1d741000 Unfrozen "slates-shard-0"
+ # Child-SP          RetAddr               Call Site
+00 00000037`1dffd5a8 00007ff8`bc0d549f     ntdll!NtRemoveIoCompletionEx+0x14
+01 00000037`1dffd5b0 00007ff7`9789cffd     KERNELBASE!GetQueuedCompletionStatusEx+0xcf
+02 00000037`1dffd660 00007ff7`978a20f0     slates!slates_rt::iocp::IocpDriver::dequeue+0xdd
+03 00000037`1dffd790 00007ff7`978b573a     slates!slates_rt::iocp::impl$7::wait+0xe0
+04 00000037`1dffda60 00007ff7`978b19af     slates!slates_rt::shard::impl$13::wait_in_driver::closure$0+0x14a
+05 00000037`1dffdc50 00007ff7`978b9f96     slates!slates_rt::shard::ShardContext::with_inner<bool,slates_rt::shard::impl$13::wait_in_driver::closure_env$0>+0xcf
+06 00000037`1dffdd30 00007ff7`978b5e5e     slates!slates_rt::shard::ShardContext::wait_in_driver+0x26
+07 00000037`1dffdd70 00007ff7`9794dcb9     slates!slates_rt::shard::impl$13::park::closure$1+0x4e
+08 00000037`1dffddc0 00007ff7`978bb468     slates!slates_rt::parking::Parking::park_unless_pending<slates_rt::shard::impl$13::park::closure_env$0,slates_rt::shard::impl$13::park::closure_env$1>+0x179
+09 00000037`1dffdfd0 00007ff7`978bb231     slates!slates_rt::shard::ShardContext::park+0x138
+0a 00000037`1dffe140 00007ff7`9789f2dc     slates!slates_rt::shard::ShardContext::run+0xe1
+0b 00000037`1dffe210 00007ff7`97899ec2     slates!slates_rt::runtime::run_worker+0x1bc
+0c 00000037`1dffe640 00007ff7`9792a8e1     slates!slates_rt::runtime::impl$3::start_with_sized::closure$1+0x82
+0d 00000037`1dffe790 00007ff7`9788a7bb     slates!std::sys::backtrace::__rust_begin_short_backtrace<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >+0x11
+0e 00000037`1dffe7d0 00007ff7`9788d4a0     slates!std::thread::lifecycle::spawn_unchecked::closure$1::closure$0<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >+0x8b
+0f 00000037`1dffe960 00007ff7`97947d19     slates!core::panic::unwind_safe::impl$25::call_once<enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > >,std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > > >+0x30
+10 00000037`1dffead0 00007ff7`9788d513     slates!std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > > >,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >+0x39
+11 00000037`1dfff020 00007ff7`9788a120     slates!core::cmp::PartialEq::ne<enum2$<core::option::Option<bool> >,enum2$<core::option::Option<bool> > >+0x43
+12 (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x65
+13 (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x65
+14 00000037`1dfff070 00007ff7`9789509e     slates!std::thread::lifecycle::spawn_unchecked::closure$1<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >+0x130
+15 00000037`1dfffd20 00007ff7`9882c253     slates!core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::closure_env$1<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >,tuple$<> >+0xe
+16 00000037`1dfffd60 00007ff8`bde4dd37     slates!std::sys::thread::windows::impl$0::new::thread_start+0x1e3
+17 00000037`1dfffe10 00007ff8`be83f2bc     KERNEL32!BaseThreadInitThunk+0x17
+18 00000037`1dfffe40 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   3  Id: 1d14.2c4 Suspend: 1 Teb: 00000037`1d743000 Unfrozen "slates-shard-1"
+ # Child-SP          RetAddr               Call Site
+00 00000037`1e1fd208 00007ff8`bc0d549f     ntdll!NtRemoveIoCompletionEx+0x14
+01 00000037`1e1fd210 00007ff7`9789cffd     KERNELBASE!GetQueuedCompletionStatusEx+0xcf
+02 00000037`1e1fd2c0 00007ff7`978a20f0     slates!slates_rt::iocp::IocpDriver::dequeue+0xdd
+03 00000037`1e1fd3f0 00007ff7`978b573a     slates!slates_rt::iocp::impl$7::wait+0xe0
+04 00000037`1e1fd6c0 00007ff7`978b19af     slates!slates_rt::shard::impl$13::wait_in_driver::closure$0+0x14a
+05 00000037`1e1fd8b0 00007ff7`978b9f96     slates!slates_rt::shard::ShardContext::with_inner<bool,slates_rt::shard::impl$13::wait_in_driver::closure_env$0>+0xcf
+06 00000037`1e1fd990 00007ff7`978b5e5e     slates!slates_rt::shard::ShardContext::wait_in_driver+0x26
+07 00000037`1e1fd9d0 00007ff7`9794dcb9     slates!slates_rt::shard::impl$13::park::closure$1+0x4e
+08 00000037`1e1fda20 00007ff7`978bb468     slates!slates_rt::parking::Parking::park_unless_pending<slates_rt::shard::impl$13::park::closure_env$0,slates_rt::shard::impl$13::park::closure_env$1>+0x179
+09 00000037`1e1fdc30 00007ff7`978bb231     slates!slates_rt::shard::ShardContext::park+0x138
+0a 00000037`1e1fdda0 00007ff7`9789f2dc     slates!slates_rt::shard::ShardContext::run+0xe1
+0b 00000037`1e1fde70 00007ff7`97899ec2     slates!slates_rt::runtime::run_worker+0x1bc
+0c 00000037`1e1fe2a0 00007ff7`9792a8e1     slates!slates_rt::runtime::impl$3::start_with_sized::closure$1+0x82
+0d 00000037`1e1fe3f0 00007ff7`9788a7bb     slates!std::sys::backtrace::__rust_begin_short_backtrace<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >+0x11
+0e 00000037`1e1fe430 00007ff7`9788d4a0     slates!std::thread::lifecycle::spawn_unchecked::closure$1::closure$0<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >+0x8b
+0f 00000037`1e1fe5c0 00007ff7`97947d19     slates!core::panic::unwind_safe::impl$25::call_once<enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > >,std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > > >+0x30
+10 00000037`1e1fe730 00007ff7`9788d513     slates!std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > > >,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >+0x39
+11 00000037`1e1fec80 00007ff7`9788a120     slates!core::cmp::PartialEq::ne<enum2$<core::option::Option<bool> >,enum2$<core::option::Option<bool> > >+0x43
+12 (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x65
+13 (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x65
+14 00000037`1e1fecd0 00007ff7`9789509e     slates!std::thread::lifecycle::spawn_unchecked::closure$1<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >+0x130
+15 00000037`1e1ff980 00007ff7`9882c253     slates!core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::closure_env$1<slates_rt::runtime::impl$3::start_with_sized::closure_env$1,enum2$<core::result::Result<slates_rt::shard::Counters,enum2$<slates_rt::error::RtError> > > >,tuple$<> >+0xe
+16 00000037`1e1ff9c0 00007ff8`bde4dd37     slates!std::sys::thread::windows::impl$0::new::thread_start+0x1e3
+17 00000037`1e1ffa70 00007ff8`be83f2bc     KERNEL32!BaseThreadInitThunk+0x17
+18 00000037`1e1ffaa0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   4  Id: 1d14.23e4 Suspend: 1 Teb: 00000037`1d745000 Unfrozen "slates-doorbell"
+ # Child-SP          RetAddr               Call Site
+00 00000037`1e3fe8e8 00007ff8`bc03d01f     ntdll!NtWaitForSingleObject+0x14
+01 00000037`1e3fe8f0 00007ff7`985e9212     KERNELBASE!WaitForSingleObjectEx+0xaf
+02 00000037`1e3fe990 00007ff7`98698278     slates!slates_ipc::wake::win_event::Event::wait+0x72
+03 00000037`1e3fea30 00007ff7`985ff5f0     slates!slates_ipc::rendezvous::platform::Bell::wait+0x128
+04 00000037`1e3febf0 00007ff7`9620a24e     slates!slates_ipc::rendezvous::DoorbellWaiter::wait+0x20
+05 00000037`1e3fec40 00007ff7`961ec653     slates!slates_server::doorbell::run+0xde
+06 00000037`1e3feee0 00007ff7`953ae7d9     slates!slates_server::doorbell::impl$1::start::closure$0+0x73
+07 00000037`1e3fef60 00007ff7`94bf80ff     slates!std::sys::backtrace::__rust_begin_short_backtrace<slates_server::doorbell::impl$1::start::closure_env$0,tuple$<> >+0x9
+08 00000037`1e3fef90 00007ff7`954218a4     slates!std::thread::lifecycle::spawn_unchecked::closure$1::closure$0<slates_server::doorbell::impl$1::start::closure_env$0,tuple$<> >+0x7f
+09 00000037`1e3ff0c0 00007ff7`953c986c     slates!core::panic::unwind_safe::impl$25::call_once<tuple$<>,std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_server::doorbell::impl$1::start::closure_env$0,tuple$<> > >+0x24
+0a 00000037`1e3ff1d0 00007ff7`94c80b73     slates!std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_server::doorbell::impl$1::start::closure_env$0,tuple$<> > >,tuple$<> >+0x2c
+0b 00000037`1e3ff2e0 00007ff7`94bf4c1a     slates!slates_wire::codec::Wire::to_bytes<slates_vfs::captured::CarriedCapture>+0xb3
+0c (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x62
+0d (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x62
+0e 00000037`1e3ff330 00007ff7`951f5c0e     slates!std::thread::lifecycle::spawn_unchecked::closure$1<slates_server::doorbell::impl$1::start::closure_env$0,tuple$<> >+0x12a
+0f 00000037`1e3ff8c0 00007ff7`9882c253     slates!core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::closure_env$1<slates_server::doorbell::impl$1::start::closure_env$0,tuple$<> >,tuple$<> >+0xe
+10 00000037`1e3ff900 00007ff8`bde4dd37     slates!std::sys::thread::windows::impl$0::new::thread_start+0x1e3
+11 00000037`1e3ff9b0 00007ff8`be83f2bc     KERNEL32!BaseThreadInitThunk+0x17
+12 00000037`1e3ff9e0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   5  Id: 1d14.2dc Suspend: 1 Teb: 00000037`1d747000 Unfrozen "slates-watchdog"
+ # Child-SP          RetAddr               Call Site
+00 00000037`1e5fcf88 00007ff8`be8352e3     ntdll!NtWaitForAlertByThreadId+0x14
+01 00000037`1e5fcf90 00007ff8`bc0efe28     ntdll!RtlWaitOnAddress+0x213
+02 00000037`1e5fd000 00007ff7`98824ab5     KERNELBASE!WaitOnAddress+0x38
+03 (Inline Function) --------`--------     slates!std::sys::pal::windows::futex::wait_on_address+0x61
+04 (Inline Function) --------`--------     slates!std::sys::pal::windows::futex::futex_wait+0x61
+05 (Inline Function) --------`--------     slates!std::sys::sync::thread_parking::futex::Parker::park_timeout+0x67
+06 00000037`1e5fd040 00007ff7`98783f69     slates!std::thread::thread::Thread::park_timeout+0x75
+07 00000037`1e5fd080 00007ff7`98794783     slates!std::sync::mpmc::context::Context::wait_until+0x279
+08 00000037`1e5fd190 00007ff7`987802d0     slates!std::sync::mpmc::list::impl$3::recv::closure$1<tuple$<> >+0x113
+09 (Inline Function) --------`--------     slates!std::sync::mpmc::context::impl$0::with::closure$0+0x78
+0a 00000037`1e5fd270 00007ff7`987883af     slates!std::sync::mpmc::context::impl$0::with::closure$1<std::sync::mpmc::list::impl$3::recv::closure_env$1<tuple$<> >,tuple$<> >+0x230
+0b 00000037`1e5fd400 00007ff7`9877eeb9     slates!std::thread::local::LocalKey<core::cell::Cell<enum2$<core::option::Option<std::sync::mpmc::context::Context> > > >::try_with<core::cell::Cell<enum2$<core::option::Option<std::sync::mpmc::context::Context> > >,std::sync::mpmc::context::impl$0::with::closure_env$1<std::sync::mpmc::list::impl$3::recv::closure_env$1<tuple$<> >,tuple$<> >,tuple$<> >+0x8f
+0c 00000037`1e5fd4a0 00007ff7`98797b28     slates!std::sync::mpmc::context::Context::with<std::sync::mpmc::list::impl$3::recv::closure_env$1<tuple$<> >,tuple$<> >+0x39
+0d 00000037`1e5fd520 00007ff7`98724a28     slates!std::sync::mpmc::list::Channel<tuple$<> >::recv<tuple$<> >+0x138
+0e 00000037`1e5fd600 00007ff7`98724961     slates!std::sync::mpmc::Receiver<tuple$<> >::recv_deadline<tuple$<> >+0x78
+0f 00000037`1e5fd670 00007ff7`98738368     slates!std::sync::mpmc::Receiver<tuple$<> >::recv_timeout<tuple$<> >+0x91
+10 00000037`1e5fd710 00007ff7`9591385a     slates!std::sync::mpsc::Receiver<tuple$<> >::recv_timeout<tuple$<> >+0x18
+11 00000037`1e5fd750 00007ff7`958647cb     slates!slates_server::watchdog::run+0x19a
+12 00000037`1e5fe200 00007ff7`953ae7c9     slates!slates_server::watchdog::impl$3::start::closure$0+0xfb
+13 00000037`1e5fe310 00007ff7`94bf7f1f     slates!std::sys::backtrace::__rust_begin_short_backtrace<slates_server::watchdog::impl$3::start::closure_env$0,tuple$<> >+0x9
+14 00000037`1e5fe340 00007ff7`95421874     slates!std::thread::lifecycle::spawn_unchecked::closure$1::closure$0<slates_server::watchdog::impl$3::start::closure_env$0,tuple$<> >+0x7f
+15 00000037`1e5fe610 00007ff7`953c982c     slates!core::panic::unwind_safe::impl$25::call_once<tuple$<>,std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_server::watchdog::impl$3::start::closure_env$0,tuple$<> > >+0x24
+16 00000037`1e5fe8c0 00007ff7`94c80b73     slates!std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_server::watchdog::impl$3::start::closure_env$0,tuple$<> > >,tuple$<> >+0x2c
+17 00000037`1e5feb70 00007ff7`94bf481a     slates!slates_wire::codec::Wire::to_bytes<slates_vfs::captured::CarriedCapture>+0xb3
+18 (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x62
+19 (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x62
+1a 00000037`1e5febc0 00007ff7`951f5bee     slates!std::thread::lifecycle::spawn_unchecked::closure$1<slates_server::watchdog::impl$3::start::closure_env$0,tuple$<> >+0x12a
+1b 00000037`1e5ffae0 00007ff7`9882c253     slates!core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::closure_env$1<slates_server::watchdog::impl$3::start::closure_env$0,tuple$<> >,tuple$<> >+0xe
+1c 00000037`1e5ffb20 00007ff8`bde4dd37     slates!std::sys::thread::windows::impl$0::new::thread_start+0x1e3
+1d 00000037`1e5ffbd0 00007ff8`be83f2bc     KERNEL32!BaseThreadInitThunk+0x17
+1e 00000037`1e5ffc00 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   6  Id: 1d14.1fe0 Suspend: 1 Teb: 00000037`1d749000 Unfrozen
+ # Child-SP          RetAddr               Call Site
+00 00000037`1e6ffa48 00007ff8`be884945     ntdll!NtWaitForWorkViaWorkerFactory+0x14
+01 00000037`1e6ffa50 00007ff8`bde4dd37     ntdll!TppWorkerThread+0x375
+02 00000037`1e6ffd50 00007ff8`be83f2bc     KERNEL32!BaseThreadInitThunk+0x17
+03 00000037`1e6ffd80 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   7  Id: 1d14.1edc Suspend: 1 Teb: 00000037`1d74b000 Unfrozen "slates-winfsp"
+ # Child-SP          RetAddr               Call Site
+00 00000037`1e8fa1d8 00007ff8`be8352e3     ntdll!NtWaitForAlertByThreadId+0x14
+01 00000037`1e8fa1e0 00007ff8`bc0efe28     ntdll!RtlWaitOnAddress+0x213
+02 00000037`1e8fa250 00007ff7`98824c71     KERNELBASE!WaitOnAddress+0x38
+03 (Inline Function) --------`--------     slates!std::sys::pal::windows::futex::wait_on_address+0x18
+04 (Inline Function) --------`--------     slates!std::sys::pal::windows::futex::futex_wait+0x18
+05 (Inline Function) --------`--------     slates!std::sys::sync::thread_parking::futex::Parker::park+0x5d
+06 00000037`1e8fa290 00007ff7`968be148     slates!std::thread::thread::Thread::park+0x71
+07 00000037`1e8fa2f0 00007ff7`968f4cbb     slates!std::sync::mpmc::context::Context::wait_until+0x1b8
+08 00000037`1e8fa400 00007ff7`968bb900     slates!std::sync::mpmc::array::impl$1::recv::closure$1<enum2$<slates_bridge_winfsp::host::Command> >+0x11b
+09 (Inline Function) --------`--------     slates!std::sync::mpmc::context::impl$0::with::closure$0+0x78
+0a 00000037`1e8fa4e0 00007ff7`968c21cf     slates!std::sync::mpmc::context::impl$0::with::closure$1<std::sync::mpmc::array::impl$1::recv::closure_env$1<enum2$<slates_bridge_winfsp::host::Command> >,tuple$<> >+0x230
+0b 00000037`1e8fa670 00007ff7`968b58d9     slates!std::thread::local::LocalKey<core::cell::Cell<enum2$<core::option::Option<std::sync::mpmc::context::Context> > > >::try_with<core::cell::Cell<enum2$<core::option::Option<std::sync::mpmc::context::Context> > >,std::sync::mpmc::context::impl$0::with::closure_env$1<std::sync::mpmc::array::impl$1::recv::closure_env$1<enum2$<slates_bridge_winfsp::host::Command> >,tuple$<> >,tuple$<> >+0x8f
+0c 00000037`1e8fa710 00007ff7`968f94af     slates!std::sync::mpmc::context::Context::with<std::sync::mpmc::array::impl$1::recv::closure_env$1<enum2$<slates_bridge_winfsp::host::Command> >,tuple$<> >+0x39
+0d 00000037`1e8fa790 00007ff7`9683b6df     slates!std::sync::mpmc::array::Channel<enum2$<slates_bridge_winfsp::host::Command> >::recv<enum2$<slates_bridge_winfsp::host::Command> >+0x14f
+0e 00000037`1e8fa8d0 00007ff7`96822b76     slates!std::sync::mpmc::Receiver<enum2$<slates_bridge_winfsp::host::Command> >::recv<enum2$<slates_bridge_winfsp::host::Command> >+0x5f
+0f 00000037`1e8fa990 00007ff7`96875621     slates!std::sync::mpsc::Receiver<enum2$<slates_bridge_winfsp::host::Command> >::recv<enum2$<slates_bridge_winfsp::host::Command> >+0x16
+10 00000037`1e8fa9d0 00007ff7`96857a6f     slates!slates_bridge_winfsp::host::run_mount+0x9d1
+11 00000037`1e8fd960 00007ff7`96893a47     slates!slates_bridge_winfsp::host::impl$10::start::closure$0+0x1af
+12 00000037`1e8fdca0 00007ff7`968b63a9     slates!slates_rt::registry::spawn_waited::closure$0<tuple$<>,slates_bridge_winfsp::host::impl$10::start::closure_env$0>+0x87
+13 00000037`1e8fdfa0 00007ff7`968bd00f     slates!std::sys::backtrace::__rust_begin_short_backtrace<slates_rt::registry::spawn_waited::closure_env$0<tuple$<>,slates_bridge_winfsp::host::impl$10::start::closure_env$0>,tuple$<> >+0x9
+14 00000037`1e8fdfd0 00007ff7`9681ab14     slates!std::thread::lifecycle::spawn_unchecked::closure$1::closure$0<slates_rt::registry::spawn_waited::closure_env$0<tuple$<>,slates_bridge_winfsp::host::impl$10::start::closure_env$0>,tuple$<> >+0x7f
+15 00000037`1e8fe2f0 00007ff7`9682670c     slates!core::panic::unwind_safe::impl$25::call_once<tuple$<>,std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_rt::registry::spawn_waited::closure_env$0<tuple$<>,slates_bridge_winfsp::host::impl$10::start::closure_env$0>,tuple$<> > >+0x24
+16 00000037`1e8fe5f0 00007ff7`968c1393     slates!std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::closure$1::closure_env$0<slates_rt::registry::spawn_waited::closure_env$0<tuple$<>,slates_bridge_winfsp::host::impl$10::start::closure_env$0>,tuple$<> > >,tuple$<> >+0x2c
+17 00000037`1e8fe8f0 00007ff7`968bc520     slates!core::cmp::PartialEq::ne<slates_bridge_core::authority::ObjectId,slates_bridge_core::authority::ObjectId>+0x43
+18 (Inline Function) --------`--------     slates!std::panicking::catch_unwind+0x62
+19 (Inline Function) --------`--------     slates!std::panic::catch_unwind+0x62
+1a 00000037`1e8fe940 00007ff7`9684732e     slates!std::thread::lifecycle::spawn_unchecked::closure$1<slates_rt::registry::spawn_waited::closure_env$0<tuple$<>,slates_bridge_winfsp::host::impl$10::start::closure_env$0>,tuple$<> >+0x130
+1b 00000037`1e8ffa70 00007ff7`9882c253     ==== fsx.exe pid 8636 round 1
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.016 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.9457 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+Unable to examine process id 8636, Win32 error 0n87
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
