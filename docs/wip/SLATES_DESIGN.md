@@ -57584,6 +57584,18 @@ one waiting landing: exactly two named; the landing gone once granted and run); 
 every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
 `args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
 
+### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
+Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
+(`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),
+the bug record, GAPS.
+
+Status: built 2026-11-20.
+- Why: on macOS a shared-memory object lives while its name does, and only its creator, the anchor, removed the names.
+  Four `SIGKILL`ed anchors held 21 GB of the big Studio with no process alive.
+- The rule: when the anchor is gone, its daemon removes the names of the segment and the content object before it
+  stops. Nobody adopts them after the anchor, so their memory goes back with the daemon's own mappings. Linux and
+  Windows objects carry no name that outlives their holders.
+
 ### A-777 — An idle shard keeps nothing pre-faulted; A-214's reserve removed (2026-11-20, w-sizing; MEMORY SIZING; amends A-105, removes A-214 and A-765)
 Applied in the same change to: `crates/server/src/daemon.rs` (the purge gives every free block back; the reserve, its
 refill and the burst measure gone), `state.rs`, `config.rs` (`prefault_slice_pages`, `page_fault_ns`),
