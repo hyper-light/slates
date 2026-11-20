@@ -750,6 +750,7 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
   });
   let alice = Some("alice".to_owned());
   assert_eq!(seen, (Ok(()), alice.clone(), Some(true), alice));
+}
 
 /// A-664's Subversion objects (bug, found by reading: a version a work submits to a Subversion repository's green made
 /// no revision, so the green passed its records' youngest revision and every later commit was refused). Do: make a
