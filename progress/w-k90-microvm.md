@@ -28,3 +28,8 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   image-channel field, frozen-wire growth: Shards' owner, "shards-7f", per focus-84-90.md), then Hex's Servers returns
   both ends, then kiln passes `served.resync`. Reported to main.
 ## Piece 3: Shards microVM engine proven on KVM (adacachy), HVF; WHP BLOCKED (jupiter takes no kiln work)
+- HVF: r2 above (the same drive proves piece 1 and piece 3's macOS half).
+- KVM: r3 (kiln, on adacachy, systemd-run --user MemoryMax=30G CPUWeight=1 Nice=19, -j4), the `microvm::` drive on
+  23f066947, log ~/.cache/w-k90-microvm-kvm.log on adacachy. Queued 2026-11-19 22:55 PST (adacachy load ~29).
+- WHP: BLOCKED (jupiter 156 commits behind; kiln can't build itself for Windows).
+- 22:52 PST: this Mac's free disk fell to 17 GB (others' caches); nothing of mine to delete beyond small clones.
