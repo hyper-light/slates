@@ -1937,7 +1937,7 @@ impl Shipper {
   /// without building the entries ([`Shipper::fold_reply`]'s sibling): through `entries_after` it cloned every entry a
   /// lagging holder lacked on each write's sends.
   pub fn retains_after(&self, position: u64) -> bool {
-    self.reaches(Some(position)) != Some(false)
+    !matches!(self.entries_after(Some(position)), Next::Install)
   }
 
   /// The retained entries after `position` (all of them from position 0 when `None`), or an install when the tail no
