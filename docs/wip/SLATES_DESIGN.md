@@ -55923,6 +55923,25 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's landing step — a commit takes what a move's walk found staged, not each id in its step (2026-11-20, w-git for UI goal 93; main's queue: Repository::commit's O(objects) passes)
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic over git/git's v1.5.0, a push's last step timed by
+  phase): the push's longest step is its last, `push_planned`, 35.8 ms: make, secure and judge 1.3 ms; entry and
+  record 1.7 ms; the store's commit 14.0 ms (landed runs 2.6, the plan's members by position 6.2, the holds' release
+  3.4, values 1.7); the entry's apply 18.2 ms; the paths map 0.3 ms.
+- **Change.** A move's walk (`Admitting`, the judge's turns) notes each new object's position as the push's stage gives
+  it, with that stage (its base and how many positions it gives; `Members::staged`); a commit adopting the same stage
+  takes those positions (`members_positions`), merging sorted sets, rather than looking each id up in its step. A stage
+  made again at the same base gives the same positions (no landing since gave any), so the base and count name it. One
+  move lands one run (`landed_runs`: every fresh object is the move's, or the first move's, the same); several moves'
+  runs take the staged positions too. Before it (00e6da185), the landing's runs were kept by position, not an id map.
+- **After.** The same push's commit: landed runs 0.01 ms, plan 0.003 ms, the store's commit 5.5 ms (now the holds'
+  release, 5.2 ms); its longest step 27.8 ms, of which the entry's apply is 18.6 ms: the record carries the whole pack
+  (9.4 MiB), so the apply is O(its bytes). Owed: the pack homed as content before the append, as version 3 homes the
+  names (asked of main: w-git under the current record, or w-store's changeset payload); the holds' release in turns
+  after the commit (releasing each at its row would make a restage read every object again).
+- **Tests.** `slates-git --lib` 579 passed; `slates-server --lib -- git vcs_store` 161 passed (kiln,
+  adas-mac-studio.local-2).
+
 ### A-722's memory per push, B2's in-flight half — A push read where it lies in its pack while it is judged (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING, storage and changesets rulings)
 - **Why.** B1 measured a push of git/git's v1.5.0 (9.4 MiB pack, 34,296 objects) putting every object inflated in the
   content store as it arrived (304.6 MiB). Ada's storage ruling keeps a change in RAM while it is in flight; her
