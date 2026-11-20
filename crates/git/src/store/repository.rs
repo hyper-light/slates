@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::mem::size_of;
 
-use slates_vcs::{ContentId, ContentRefused, ContentStore, Index, IndexRefused, NewRow};
+use slates_vcs::{ContentId, ContentRefused, ContentStore, Index, IndexRefused};
 
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::tag::Tag;
@@ -39,6 +39,9 @@ pub(super) mod protect;
 /// walks the store as the admission does.
 #[path = "reach.rs"]
 pub(super) mod reach;
+/// A push sealed and staged a unit at a time (A-722 part 4), a child of this module so it writes the rows kept here.
+#[path = "staging.rs"]
+pub(super) mod staging;
 
 /// Shape: what one version's record costs the budget beside its set's runs. Derived from the type.
 const VERSION_BYTES: usize = size_of::<Version>();
@@ -391,13 +394,6 @@ impl Place {
       Place::Pushed { content, len, .. } => (*content, *len),
     }
   }
-}
-
-/// A row to write, owned until the batch is inserted.
-struct OwnedRow {
-  key: Vec<u8>,
-  contents: Vec<ContentId>,
-  payload: Vec<u8>,
 }
 
 /// A git repository's store (module docs).
@@ -1134,38 +1130,8 @@ impl Repository {
   /// Every landing adopts a fork, so the repository's own index keeps no tail of rows, and a fork made at any time (a
   /// push abandoned, another staging at once) changes nothing a store made again from the log would not make alike.
   pub fn stage(&mut self, store: &mut ContentStore, push: &mut Push) -> Result<(), StoreRefused> {
-    self.same_format(push)?;
-    if !push.is_sealed() {
-      return Err(StoreRefused::Unsealed);
-    }
-    if let Some(old) = push.take_staged() {
-      old.fork.release(store)?;
-    }
-    let fresh = self.fresh(store, push)?;
-    let (positions, _) = self.positions_for(&fresh)?;
-    let owned = self.rows_for(store, push, &fresh, &positions)?;
-    let rows: Vec<NewRow<'_>> = owned
-      .iter()
-      .map(|row| NewRow {
-        key: &row.key,
-        contents: &row.contents,
-        payload: &row.payload,
-      })
-      .collect();
-    let mut fork = self.index.fork(store)?;
-    let written = fork
-      .insert_all(store, &rows)
-      .and_then(|_| fork.seal_all(store));
-    if let Err(refused) = written {
-      fork.release(store)?;
-      return Err(refused.into());
-    }
-    push.set_staged(super::push::Staged {
-      fork,
-      positions,
-      base: self.next_position,
-    });
-    Ok(())
+    let staging = self.staging(store, push)?;
+    self.stage_whole(store, push, staging)
   }
 
   /// Derived: the most staging `push` could charge the store ([`Self::stage`]): each object's object row (a commit's
@@ -1196,82 +1162,6 @@ impl Repository {
     objects
       .saturating_add(commits)
       .saturating_add(self.index.fork_room())
-  }
-
-  /// The push's objects new to the repository, in their ids' order: id, type, root content and length.
-  fn fresh(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-  ) -> Result<Vec<(ObjectId, Kind, ContentId, u64)>, StoreRefused> {
-    let mut fresh = Vec::new();
-    for (bytes, number, content, len) in push.held() {
-      let id = ObjectId::from_bytes(self.format, bytes).ok_or(StoreRefused::ForeignPush)?;
-      if self.indexed(store, &id).is_none() {
-        let kind = kind_of(number).ok_or(StoreRefused::Malformed { id })?;
-        fresh.push((id, kind, content, len));
-      }
-    }
-    Ok(fresh)
-  }
-
-  /// A position for each fresh object, the next ones in order by type and then id; and the next position after them.
-  /// By type (A-639): a push's new objects of one type take one run of positions, so a fragment's two parts, its blobs
-  /// and the rest, are a run each, and upload-pack's sets of them stay a few runs.
-  fn positions_for(
-    &self,
-    fresh: &[(ObjectId, Kind, ContentId, u64)],
-  ) -> Result<(BTreeMap<ObjectId, u64>, u64), StoreRefused> {
-    let mut order: Vec<(Kind, ObjectId)> =
-      fresh.iter().map(|(id, kind, ..)| (*kind, *id)).collect();
-    order.sort_unstable();
-    let mut positions = BTreeMap::new();
-    let mut next = self.next_position;
-    for (_, id) in order {
-      positions.insert(id, next);
-      next = next
-        .checked_add(1)
-        .filter(|next| *next < u64::MAX)
-        .ok_or(StoreRefused::PositionsExhausted)?;
-    }
-    Ok((positions, next))
-  }
-
-  /// The rows of the fresh objects in key order: each object's row, then each position's.
-  fn rows_for(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-    fresh: &[(ObjectId, Kind, ContentId, u64)],
-    positions: &BTreeMap<ObjectId, u64>,
-  ) -> Result<Vec<OwnedRow>, StoreRefused> {
-    let mut owned = Vec::with_capacity(fresh.len().saturating_mul(2));
-    for (id, kind, content, len) in fresh {
-      let row = ObjectRow {
-        kind: *kind,
-        len: *len,
-        position: self.position_of(store, positions, id)?,
-        commit: self.commit_row(store, push, positions, id, *kind)?,
-      };
-      owned.push(OwnedRow {
-        key: rows::object_key(id),
-        contents: vec![*content],
-        payload: rows::encode(&row),
-      });
-    }
-    let mut by_position: Vec<(u64, &ObjectId)> = positions
-      .iter()
-      .map(|(id, position)| (*position, id))
-      .collect();
-    by_position.sort_unstable();
-    for (position, id) in by_position {
-      owned.push(OwnedRow {
-        key: rows::position_key(position),
-        contents: Vec::new(),
-        payload: id.as_bytes().to_vec(),
-      });
-    }
-    Ok(owned)
   }
 
   /// The push's staged rows when this index would adopt them as they are (A-722 part 3): no row taken in nor position

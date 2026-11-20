@@ -279,6 +279,69 @@ fn charge<T>(admission: &mut Admission) -> Result<(), Refusal> {
     .map_err(Refusal::PastAdmission)
 }
 
+/// A set of the graph's objects a walk keeps, by position, as runs (A-745, §4.17.1 "A fetch's answer" rule 1: a fetch's
+/// working set is a run a range of positions, never an entry an object), charged a run's bytes as its runs grow past
+/// what was charged before: a walk over one push's objects keeps one run whatever it meets.
+#[derive(Debug, Default)]
+pub(super) struct Held {
+  /// The positions held.
+  set: Positions,
+  /// The most runs it has held, each charged once.
+  charged: usize,
+}
+
+impl Held {
+  /// Adds `node`: whether it was not held, its run charged where it begins one past those charged.
+  pub(super) fn insert<N: Into<u64>>(
+    &mut self,
+    node: N,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let new = self.set.insert_new(node.into());
+    if self.set.runs() > self.charged {
+      charge::<(u64, u64)>(admission)?;
+      self.charged = self.set.runs();
+    }
+    Ok(new)
+  }
+
+  /// Whether `node` is held.
+  pub(super) fn contains<N: Into<u64>>(&self, node: N) -> bool {
+    self.set.contains(node.into())
+  }
+
+  /// The positions held.
+  pub(super) fn positions(&self) -> &Positions {
+    &self.set
+  }
+
+  /// The positions held, the set given up.
+  pub(super) fn into_positions(self) -> Positions {
+    self.set
+  }
+}
+
+/// What a walk's transient list (a stack, a queue) has cost: its most entries, each charged once as the list first grows
+/// past it (A-745: a walk's stack is charged at its deepest, never once an entry pushed over the walk).
+#[derive(Debug, Default)]
+pub(super) struct Peak {
+  /// The most entries charged.
+  charged: usize,
+}
+
+impl Peak {
+  /// Charges `len` entries of `T` past the most charged before.
+  pub(super) fn reach<T>(&mut self, len: usize, admission: &mut Admission) -> Result<(), Refusal> {
+    if len > self.charged {
+      admission
+        .charge_items::<T>(len.saturating_sub(self.charged))
+        .map_err(Refusal::PastAdmission)?;
+      self.charged = len;
+    }
+    Ok(())
+  }
+}
+
 /// Answers `request` from `graph`, keeping what it must within `admission`.
 pub fn negotiate<S: Graph>(
   graph: &S,

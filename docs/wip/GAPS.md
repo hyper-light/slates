@@ -84,6 +84,9 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 4b (2026-11-20, w-git).** BUILT: a push's seal and stage a unit at a time (`Staging`, `Index::seal_step`)
+> on the live push and in a replay. Owed: the moves' admission, the landing's whole passes and a stale restage sliced.
+>
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
@@ -148,7 +151,8 @@
 > **A-713 (2026-11-20, w-git; every clone of a long history refused for its room, found by use).** BUILT: git's
 > upload-pack, HTTP and SSH, admits each request what its repository's shard could admit (`StoreLender::room`), as A-704
 > admits a push. A-745 git piece 1 (2026-11-20, w-k90-vendor): the plan carries its objects as runs of positions, never a
-> handle an object. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> handle an object; piece 2a: the negotiation's walk keeps its sets as runs, its stacks charged at their deepest (a 3,000-
+> commit clone negotiated within 4 KiB). Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -186,8 +190,11 @@
 > lent for the turn alone, the shard's room (`vcs_share::room`) and step quantum (`HgStores::fetch_turn`), the stream
 > compressed as it is made (`compression::StreamCompressor`, each slice's engine bound charged first); a step past a
 > turn's room after others waits for the next turn's. The red is GREEN: the clone of a file twice a request's room is
-> answered whole. Owed: SSH (piece 2b); a hold on the index generation a fetch began on (rule 4: a push landing
-> mid-clone is read by the clone's later turns); the stream clone's; w-interop's matrix rerun.
+> answered whole. Piece 2b BUILT (SSH): the session begins a `getbundle` (`session::begin_serving`), the `Stdio`
+> holds its answer and makes it a slice at a time (`Stdio::stream`), the server's step streaming it within the shard's
+> room and quantum, a turn ending once a room's worth waits to be sent; an SSH clone of a file twice a request's room
+> is answered whole (test). Owed: a hold on the index generation a fetch began on (rule 4: a push landing mid-clone is
+> read by the clone's later turns; next); the stream clone's; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

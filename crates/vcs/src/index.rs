@@ -217,6 +217,15 @@ impl Visit {
   }
 }
 
+/// The tail's first table ([`Index::seal_step`]): its cut, what its rows charged as tail rows and take in tables, and
+/// the first key the tail keeps after it.
+struct FirstTable {
+  cut: Cut,
+  discharged: u64,
+  bytes: usize,
+  kept_from: Option<Box<[u8]>>,
+}
+
 /// Rows cut into one table: its bytes, its first key and its rows.
 #[derive(Debug)]
 struct Cut {
@@ -250,6 +259,9 @@ pub struct Index {
   keys_added: u64,
   /// For a fork, the runs it took from its parent (the first of its runs) and its parent's `keys_added` then.
   forked: Option<(usize, u64)>,
+  /// A seal of the whole tail under way a table at a time ([`Index::seal_step`], A-722 part 4): the runs only this index
+  /// held before its run, the last of `runs`, was begun.
+  sealing: Option<usize>,
 }
 
 /// Why a parent did not adopt a fork ([`Index::adopt`]), the fork handed back whole.
@@ -645,7 +657,118 @@ impl Index {
   /// fork does first, and what an owner does before it names the index by its tables, to a snapshot or a replica); the
   /// rows sealed. Refused, nothing changed.
   pub fn seal_all(&mut self, store: &mut ContentStore) -> Result<u64, IndexRefused> {
+    if self.sealing.is_some() {
+      let before = self.rows();
+      while !self.seal_step(store)? {}
+      return Ok(self.rows().saturating_sub(before));
+    }
     self.seal_rows(store, false)
+  }
+
+  /// One table of [`Index::seal_all`] (A-722 part 4: a large tail sealed over many turns): the tail's first rows that fit
+  /// a window, cut by the rule `seal_all` cuts by, written as the next table of one run kept as the index's newest, so
+  /// every read finds its rows meanwhile; the run's bookkeeping done once the tail is empty. A tail sealed so, step by
+  /// step, leaves the index and the store as `seal_all` leaves them. Whether the tail is sealed whole. Refused, the step
+  /// changed nothing.
+  pub fn seal_step(&mut self, store: &mut ContentStore) -> Result<bool, IndexRefused> {
+    let Some(table) = self.first_table(store.window())? else {
+      self.sealed_whole();
+      return Ok(true);
+    };
+    let fence = table
+      .cut
+      .first
+      .len()
+      .checked_add(FENCE_SLOT_BYTES)
+      .and_then(|bytes| u64::try_from(bytes).ok())
+      .ok_or(TableRefused::TooLarge)?;
+    let stored = store.put_tables(&[table.cut.bytes.as_slice()], table.discharged, fence)?;
+    let put = stored.first().ok_or(IndexRefused::LayerMissing)?;
+    let given_back = if put.fresh {
+      Ok(())
+    } else {
+      table_rows_held(store, &table.cut.bytes, false)
+    };
+    self.tail = match table.kept_from {
+      Some(first_kept) => self.tail.split_off(first_kept.as_ref()),
+      None => BTreeMap::new(),
+    };
+    self.tail_charged = self.tail_charged.saturating_sub(table.discharged);
+    self.tail_bytes = self.tail_bytes.saturating_sub(table.bytes);
+    if self.sealing.is_none() {
+      self.sealing = Some(self.compactable());
+      self.runs.push(Run {
+        fences: Vec::new(),
+        rows: 0,
+        charged: 0,
+        shared: false,
+      });
+    }
+    let rows = table.cut.rows;
+    if let Some(run) = self.runs.last_mut() {
+      run.fences.push(Fence {
+        table: put.identity,
+        first: table.cut.first,
+        rows,
+      });
+      run.rows = run.rows.saturating_add(rows);
+      run.charged = run.charged.saturating_add(fence);
+      run.shared |= !put.fresh;
+    }
+    self.counters.tables_built = self.counters.tables_built.saturating_add(1);
+    self.counters.rows_written = self.counters.rows_written.saturating_add(rows);
+    if !put.fresh {
+      self.counters.tables_deduplicated = self.counters.tables_deduplicated.saturating_add(1);
+    }
+    let whole = self.tail.is_empty();
+    if whole {
+      self.sealed_whole();
+    }
+    given_back.map(|()| whole)
+  }
+
+  /// The tail's first table as [`cut`] cuts it: its rows that fit a window, what they charged as tail rows and take
+  /// in tables, and the first key past them; none for an empty tail.
+  fn first_table(&self, window: usize) -> Result<Option<FirstTable>, IndexRefused> {
+    let mut builder = TableBuilder::new();
+    let mut first: Option<Box<[u8]>> = None;
+    let (mut discharged, mut bytes) = (0_u64, 0_usize);
+    let mut kept_from = None;
+    for row in tail_rows(&self.tail) {
+      let row_len = row_bytes(row.key(), row.body()).ok_or(TableRefused::TooLarge)?;
+      if !builder.is_empty() && builder.len().saturating_add(row_len) > window {
+        kept_from = Some(Box::from(row.key()));
+        break;
+      }
+      if builder.is_empty() {
+        first = Some(Box::from(row.key()));
+      }
+      builder.push(row.key(), row.body())?;
+      discharged = discharged.saturating_add(tail_cost(row.key(), row.body())?);
+      bytes = bytes.saturating_add(row_len);
+    }
+    if builder.is_empty() {
+      return Ok(None);
+    }
+    Ok(Some(FirstTable {
+      cut: finish(builder, first)?,
+      discharged,
+      bytes,
+      kept_from,
+    }))
+  }
+
+  /// A step-by-step seal's end ([`Index::seal_step`]): its run counted as [`Index::seal_all`]'s is, once.
+  fn sealed_whole(&mut self) {
+    let Some(compactable) = self.sealing.take() else {
+      return;
+    };
+    let own = self.runs.last().is_some_and(|run| !run.shared);
+    if own {
+      self.rule.run_added(compactable);
+      self.drop_untimed();
+    }
+    self.counters.seals = self.counters.seals.saturating_add(1);
   }
 
   /// Cuts the tail and writes its tables as one run, all of them or all but the last (`keep_last`).

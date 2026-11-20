@@ -12298,14 +12298,20 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > changesets as ranges, the manifest log, then the file logs row to row through `HgIndex::file_revision_from`), any
 > other fetch by the changesets that name each revision (7.2's slow path, bounded by what it sends). Piece 2a BUILT:
 > HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
-> shard's room and quantum, the stream compressed as it is made; the red passes. Owed: SSH (piece 2b), the hold on the
-> generation a fetch began on (rule 4), the stream clone (piece 3), git's upload-pack (w-git).
+> shard's room and quantum, the stream compressed as it is made; the red passes. Piece 2b BUILT: SSH the same
+> (`Stdio::stream`, `vcs_ssh::hg`). Owed: the hold on the generation a fetch began on (rule 4), the stream clone (piece
+> 3), git's upload-pack (w-git).
 > **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
 > fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
 > none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
-> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). Owed for git: the walk's own
-> sets (piece 2: negotiation and plan a step at a time, `upload::Answering`), the server driving it a turn at a time
-> within a request's room (piece 3, reverting A-713's shard room).
+> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). **Piece 2a BUILT (same
+> day):** the walk keeps what it meets as runs too (`negotiation::Held`: the paint's three sets, the commits sent, what
+> the client holds, the objects chosen, the trees done and opened, a `tree:` filter's depths aside), charged a run as a
+> set's runs grow, and its queue and stacks at their longest (`negotiation::Peak`), never once an entry pushed: a clone
+> of 3,000 commits pushed in one piece, 9,000 objects, is negotiated within 4 KiB (it was refused there, `PastAdmission`).
+> Positions met in no order (a set the store gave piece by piece) cost a run an object, 16 bytes against the 8 the sets
+> charged; one push's order costs a run a kind or less. Owed for git: the walk a step at a time and `upload::Answering`
+> (piece 2b), the server driving it a turn at a time within a request's room (piece 3, reverting A-713's shard room).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -55497,6 +55503,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed (part 4).** The seal's staging pass and the moves' admission sliced; the landing's remaining whole passes
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
+
+### A-722 part 4b — A push is sealed and staged a unit at a time (2026-11-20, w-git for UI goal 93; main's ruling: what a push's landing ran whole held its shard past the watchdog's window at git/git's size)
+- **Change.** `slates_git::store::Staging` (`Repository::sealing`, `staging`, `stage_turn`): the seal and stage cut into
+  units, a turn taking as many as its quantum allows and one at least: a commit's generation number; a held object
+  checked against the index (a quarantine cursor, `Quarantine::object_after`); a new object's position, by type then
+  id from per-type running counts (no sort of the push); its object and position rows inserted into the fork; one table
+  of the fork's tail sealed (`slates_vcs::Index::seal_step`, which leaves exactly what `seal_all` leaves).
+  `Repository::stage` runs the same units to their end, so a push staged in one turn or many leaves the same tables
+  and a store made again from the log equals the live one. The server seals a push a turn at a time
+  (`vcs_store::SealingPush`, `git_push::AnswerState::Sealing`, a turn an answer step at the shard's step quantum), and a
+  replayed record's seal runs the same turns (`git_replay`). A push dropped mid-seal or mid-decision gives back what it
+  holds (found by reading: one dropped while its commands were decided kept its sealed push).
+- **Tests.** `slates-vcs` `tests::a_tail_sealed_a_table_a_step_is_the_tail_sealed_at_once`; `slates-git`
+  `store::tests::a_push_sealed_and_staged_a_unit_a_turn_lands_as_one_staged_whole`; `slates-server`
+  `vcs_store::tests::t_a722_p4_a_pushs_seal_takes_many_turns_and_lands`.
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-vcs --lib` 101 passed; `slates-git --lib -- store::
+  upload:: receive:: hook_view` 203 passed, 4 ignored; `slates-server --lib -- vcs_store:: git_push:: repository::
+  vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 181 passed, 1 ignored; fmt clean. The 3,000-commit push
+  over the daemon's edge 1.5 to 1.9 s and its fetch 2.6 to 2.9 s (three runs, load average 21 to 23; main 1.9 s, 4.1 s).
+- **Owed.** The moves' admission and the landing's whole passes (members' positions, landed runs, holds' release) and
+  a stale restage sliced; the replay's thin-pack resolve on w-balance's resolve-in-turns.
 
 ### A-722 part 4a — A git record's pack is replayed a turn at a time (2026-11-20, w-git for UI goal 93; main's ruling: a large pack record's replay ran in one turn and crash-looped the daemon)
 - **Change.** `vcs_store::git_replay`: a version-2 record carrying a pack is decoded once as its replay begins (names,

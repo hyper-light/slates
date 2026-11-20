@@ -678,6 +678,71 @@ fn two_pushes_staged_at_once_both_land_and_no_position_goes_unused() {
   assert!(store.is_empty() && store.used() == 0);
 }
 
+/// A clock that moves on a nanosecond each time it is read: with a quantum of none, a turn takes one unit alone.
+struct Ticking(u64);
+
+impl Clock for Ticking {
+  fn now_ns(&mut self) -> u64 {
+    self.0 += 1;
+    self.0
+  }
+}
+
+/// A-722 part 4 (a push sealed and staged a unit at a time). Do: push the merge history into two repositories over two
+/// stores; seal and stage one whole, and the other a unit a turn, each turn's quantum none, counting the turns; land
+/// both. Expect: more turns than the push holds objects; every object's row alike in both, positions by type then id;
+/// both stores holding and charging alike; each given back whole.
+#[test]
+fn a_push_sealed_and_staged_a_unit_a_turn_lands_as_one_staged_whole() {
+  let format = ObjectFormat::Sha1;
+  let made = history(format);
+  let (mut whole_store, mut stepped_store) = (store(), store());
+  let (mut whole, mut stepped) = (Repository::new(format), Repository::new(format));
+  let push = staged_push(&mut whole, &mut whole_store, made.objects.clone());
+  land(&mut whole, &mut whole_store, push, 1, made.merge.id);
+  let mut push = Push::new(format);
+  push
+    .admit_all(
+      &mut stepped_store,
+      &stepped.naming(),
+      &mut Source::new(made.objects.clone()),
+    )
+    .unwrap();
+  let mut staging = stepped.sealing(&mut stepped_store, &mut push).unwrap();
+  let (mut clock, mut turns) = (Ticking(0), 0usize);
+  loop {
+    turns += 1;
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 0,
+    };
+    if stepped
+      .stage_turn(&mut stepped_store, &mut push, &mut staging, quantum)
+      .unwrap()
+    {
+      break;
+    }
+  }
+  assert!(staging.is_ended());
+  land(&mut stepped, &mut stepped_store, push, 1, made.merge.id);
+  assert!(turns > made.objects.len(), "{turns} turns");
+  for object in &made.objects {
+    assert_eq!(
+      stepped.object(&stepped_store, &object.id),
+      whole.object(&whole_store, &object.id),
+      "{}",
+      object.id
+    );
+  }
+  assert_eq!(
+    (stepped_store.used(), stepped_store.charged()),
+    (whole_store.used(), whole_store.charged())
+  );
+  stepped.release(&mut stepped_store).unwrap();
+  whole.release(&mut whole_store).unwrap();
+  assert!(stepped_store.is_empty() && whole_store.is_empty());
+}
+
 /// The green and version the landing map gives each position of `positions`.
 fn bringers(repository: &Repository, positions: &Positions) -> BTreeSet<Option<(u64, u64)>> {
   let mut found = BTreeSet::new();
