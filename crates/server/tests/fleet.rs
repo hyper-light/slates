@@ -842,6 +842,21 @@ fn poll_for_periods(
   daemons: &[&Daemon],
   within: Duration,
   periods: u64,
+  condition: impl FnMut() -> Result<bool, ObserveError>,
+) -> bool {
+  poll_for_live_periods(daemons, within, || periods, condition)
+}
+
+/// [`poll_for_periods`] with its budget read again at each look (`periods`): for a wait on a bound a daemon derives from
+/// an estimate it keeps measuring, such as the failover delay (A-363), which load raises while the wait runs. Read once
+/// at the wait's start, the budget fell behind the bound it waited on: `a_retired_owner_whose_takeover_gave_up_...`
+/// failed once in a loaded run of the fleet tests with the successor not yet giving up, and a successor whose estimate
+/// rose tenfold during the wait failed it every time (w-forming, 2026-11-20).
+#[track_caller]
+fn poll_for_live_periods(
+  daemons: &[&Daemon],
+  within: Duration,
+  mut periods: impl FnMut() -> u64,
   mut condition: impl FnMut() -> Result<bool, ObserveError>,
 ) -> bool {
   let mut wait = WaitTrace::begin("poll", std::panic::Location::caller(), daemons);
@@ -885,7 +900,7 @@ fn poll_for_periods(
       last_advance = Instant::now();
     }
     wait.asked(took, daemons, &advances, last_advance.elapsed());
-    if charged >= periods {
+    if charged >= periods() {
       // Every observed daemon ran a whole budget of its own periods, condition never met: a genuine
       // non-convergence (judged in daemon-time, so CPU load cannot cause it — periods, not wall-clock).
       wait.end("poll", "period budget spent", daemons, &advances);
@@ -14487,10 +14502,10 @@ fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is
   let observed: Vec<&Daemon> = daemons.iter().collect();
   // Unheard on the probe plane only once the successor adopted the registers, as the chaos flow stopped the holder.
   let adopted = silent
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || Ok(summed_count(&daemons[at], "fleet.takeover.adopted") > 0),
     );
   let away = adopted
@@ -14498,10 +14513,10 @@ fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is
       .inject_probe_deafness(&[hosts[other + 1]])
       .is_ok();
   let given_up = away
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods(&observed).saturating_mul(4),
+      || promise_wait_periods(&observed).saturating_mul(4),
       || Ok(summed_count(&daemons[at], "fleet.materialize.given_up") > 0),
     );
   let back = daemons[other].inject_live_silence(&[]).is_ok()
@@ -15486,10 +15501,10 @@ fn deaf_until_its_takeover_resolves(
   let at_retirement: Vec<String> = daemons.iter().map(configuration_view).collect();
   let before = takeover_outcomes(daemons);
   let resolved = retired
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods(&observed).saturating_mul(2),
+      || promise_wait_periods(&observed).saturating_mul(2),
       || {
         Ok(
           takeover_outcomes(daemons)
@@ -15536,20 +15551,20 @@ fn a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retir
   let adopter = if successor == hosts[1] { 1 } else { 2 };
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
   let readmitted = taken
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let after_first: Vec<String> = daemons.iter().map(configuration_view).collect();
   let through_adopter = written_through(&daemons, adopter, id, "/through-the-adopter");
   let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, adopter);
   let settled = spell.healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let at_end: Vec<String> = daemons.iter().map(configuration_view).collect();
@@ -15754,19 +15769,19 @@ fn retaken_from_its_adopter(by_creator: bool) -> Retaken {
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
   let readmitted = taken
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let through_adopter = written_through(&daemons, adopter, id, "/through-the-adopter");
   let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, adopter);
   let settled = spell.healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let owner = shipping_at_the_highest_fence(&daemons, id);
@@ -17338,11 +17353,13 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   let silenced = daemons[other].inject_takeover_silence(&[hosts[at]]);
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let cut = silenced.is_ok() && probe_plane_cut(&daemons, &hosts, true);
+  // The successor's bound is its own failover estimate's worth of periods, which load raises while it waits: the
+  // budget follows it.
   let given_up = cut
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods(&observed).saturating_mul(3),
+      || promise_wait_periods(&observed).saturating_mul(3),
       || Ok(summed_count(&daemons[at], "fleet.takeover.given_up") > 0),
     );
   let at_give_up: Vec<String> = daemons.iter().map(configuration_view).collect();
@@ -17350,10 +17367,10 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   let healed = probe_plane_cut(&daemons, &hosts, false);
   let settled = answering
     && healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let judged_afresh = summed_count(&daemons[at], "fleet.takeover.judged_afresh");
@@ -19758,10 +19775,10 @@ fn a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost() {
   drop(through_a);
   daemons.insert(0, fleet.start(0));
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let settled = poll_for_periods(
+  let settled = poll_for_live_periods(
     &observed,
     RETIREMENT_DEADLINE,
-    readmission_periods(&observed),
+    || readmission_periods(&observed),
     || settled_on_one_configuration(&daemons, &hosts),
   );
   let refused = |daemon: &Daemon| count_of(&summed_counters(daemon), RECORD_REFUSED_UNAUTHORIZED);
