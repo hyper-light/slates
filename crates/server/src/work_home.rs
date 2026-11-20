@@ -235,6 +235,29 @@ pub(crate) struct WorkHome {
   /// green's replica serves its works in its place): this node serves the works of greens another node owns
   /// ([`green_elsewhere`]). Never set from the wire; off, nothing here changes.
   pub(crate) on_holders: bool,
+  /// On the control shard, which holds the node's replicas: the submits of works on this holder node whose versions the
+  /// owner committed before the replica held them (A-697 part d), each answered once the replica does. Bounded by the
+  /// node's parked verbs: one a parked submit, each let go past its verb's bound ([`hold_until_replica`]).
+  replica_waits: Vec<ReplicaWait>,
+}
+
+/// A submit of a work on this holder node whose version its green's owner committed before this node's replica held it
+/// (A-697 part d): its answer, held until the replica holds the version, so the work it settles reads its new base here.
+struct ReplicaWait {
+  /// The green.
+  green: slates_db::register::ObjectId,
+  /// The version the owner committed.
+  version: u64,
+  /// The work's shard, where the submit is parked.
+  shard: u16,
+  /// The submit's completion key: its origin.
+  origin: u64,
+  /// … and its request.
+  id: RequestId,
+  /// The owner's answer.
+  reply: ReplyBody,
+  /// Past this instant (the host's monotonic clock) the parked submit has been answered retryable and released.
+  until_ns: u64,
 }
 
 /// What [`gate`] decided for a verb.
@@ -1301,6 +1324,15 @@ fn admit_over_fleet(
   }
 }
 
+/// Format: a submit of a work on a holder node whose version the owner committed before the node's replica held it, held
+/// until the replica does (A-697 part d), the non-vacuity count of [`hold_until_replica`].
+pub(crate) const SETTLE_AWAITS_REPLICA: &str = "merge.work.settle_awaits_replica";
+/// Format: such a submit answered once the replica held its version (A-697 part d), the non-vacuity count of
+/// [`replica_reached`].
+pub(crate) const SETTLED_ON_REPLICA: &str = "merge.work.settled_on_replica";
+/// Format: such an answer that could not be handed to the work's shard; the submit's bound answers it retryable.
+const SETTLE_UNHANDED: &str = "merge.work.settle_unhanded";
+
 /// Format: a verdict a holder computed on its replica of a green another node owns, to send its owner (A-697 part c),
 /// the non-vacuity count of [`verdict_over_fleet`].
 pub(crate) const COMPUTED_ON_HOLDER: &str = "merge.work.computed_on_holder";
@@ -1371,7 +1403,7 @@ fn verdict_over_fleet(
       move || async move {
         let built =
           state::with_state(|s| computed_request(s, (work, green), inc, (id, principal), carried));
-        match built {
+        let reply = match built {
           Some(Ok(request)) => crate::verbs::resolve_and_forward(
             crate::verbs::to_wire_volume(green),
             region,
@@ -1384,12 +1416,22 @@ fn verdict_over_fleet(
           .clone(),
           Some(Err(reply)) => reply,
           None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
-        }
+        };
+        // The work settles on its new base only once this node's replica holds it (A-697 part d).
+        let held = state::with_state(|s| {
+          hold_until_replica(s, (green, &reply), (here, origin, id), deadline)
+        })
+        .unwrap_or(false);
+        (reply, held)
       },
       deadline,
     )
     .await;
-    let _ = state::with_state_counted(|s| resolve(s, queue, verdict_over_fleet_answer(reply)));
+    let _ = state::with_state_counted(|s| match reply {
+      Some((_, true)) => defer_oldest(s, queue),
+      Some((reply, false)) => resolve(s, queue, verdict_over_fleet_answer(Some(reply))),
+      None => resolve(s, queue, None),
+    });
   });
   match asked {
     Ok(task) => {
@@ -1467,6 +1509,88 @@ fn verdict_over_fleet_answer(reply: Option<ReplyBody>) -> Option<Answered> {
         | Refusal::HomedElsewhere { .. },
     } => None,
     reply => Some(Answered::Verdict(reply)),
+  }
+}
+
+/// On the control shard: holds `reply`, the owner's acceptance of a version this node's replica of `green` does not hold
+/// yet, until it does (A-697 part d), so the submit it answers settles the work on a base this node can read; the
+/// parked submit waits under its own bound (`defer_oldest`) and is answered retryable past it, its resend answered by
+/// the owner's record. Whether it was held; expired holds are let go first, so the holds stay within the parked verbs.
+fn hold_until_replica(
+  state: &mut ShardState,
+  (green, reply): (DbVolumeId, &ReplyBody),
+  (shard, origin, id): (u16, u64, RequestId),
+  bound_ns: u64,
+) -> bool {
+  let ReplyBody::Submitted {
+    version: Some(version),
+    ..
+  } = reply
+  else {
+    return false;
+  };
+  let object = slates_db::register::ObjectId(green.bytes);
+  if state
+    .merge
+    .replicas
+    .get(&object)
+    .is_some_and(|replica| replica.head() >= *version)
+  {
+    return false;
+  }
+  let now = slates_machine::clock::monotonic_ns();
+  state
+    .work_home
+    .replica_waits
+    .retain(|wait| wait.until_ns >= now);
+  state.work_home.replica_waits.push(ReplicaWait {
+    green: object,
+    version: *version,
+    shard,
+    origin,
+    id,
+    reply: reply.clone(),
+    until_ns: now.saturating_add(bound_ns),
+  });
+  state.count(SETTLE_AWAITS_REPLICA, 1);
+  true
+}
+
+/// On the control shard, once this node's replica of `object` took a version (A-697 part d;
+/// `merge_service::recompute`): every held submit whose version the replica now holds is answered on its work's shard
+/// (`answered_late`, which finds it by its key, so one already released is not answered twice).
+pub(crate) fn replica_reached(state: &mut ShardState, object: slates_db::register::ObjectId) {
+  if state.work_home.replica_waits.is_empty() {
+    return;
+  }
+  let Some(head) = state
+    .merge
+    .replicas
+    .get(&object)
+    .map(slates_merge::engine::Green::head)
+  else {
+    return;
+  };
+  let (ready, waiting): (Vec<ReplicaWait>, Vec<ReplicaWait>) =
+    std::mem::take(&mut state.work_home.replica_waits)
+      .into_iter()
+      .partition(|wait| wait.green == object && wait.version <= head);
+  state.work_home.replica_waits = waiting;
+  for wait in ready {
+    state.count(SETTLED_ON_REPLICA, 1);
+    let ReplicaWait {
+      shard,
+      origin,
+      id,
+      reply,
+      ..
+    } = wait;
+    let handed = crate::xshard::hand_reply_home(shard, move || {
+      let _ = state::with_state_counted(|s| answered_late(s, origin, id, reply));
+    });
+    if handed.is_err() {
+      state.count(SETTLE_UNHANDED, 1);
+    }
   }
 }
 

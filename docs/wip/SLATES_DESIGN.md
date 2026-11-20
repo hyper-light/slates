@@ -22686,7 +22686,9 @@ its green's record and recording the work's floor at the head (`verbs::admit_wor
 asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. Part b
 (2026-11-20): the holder moves and drops the work's floor at the owner by `MoveWorkFloor` (`work_home::tell_floor_over_fleet`,
 `verbs::move_work_floor`). Part c (2026-11-20): a holder's submit is committed by the verdict its replica computed,
-taken by position at the owner (`work_home::verdict_over_fleet`, `SubmitComputed`, `Green::submit_computed`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+taken by position at the owner (`work_home::verdict_over_fleet`, `SubmitComputed`, `Green::submit_computed`). Part d
+(2026-11-20): the submit settles once the holder's replica holds the version (`work_home::hold_until_replica`,
+`replica_reached`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22711,8 +22713,9 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     judging the rights from its green's record and holding the base by the work's floor; and the work's base reads are
     answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
     by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
-    replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b). Its rebase, a copy it submits,
-    the settling of its versions, recovery and takeover follow in A-697's later parts. Until A-400 a work was placed on
+    replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b), the submit answered once the
+    node's replica holds the version it made. Its rebase, a copy it submits, recovery and takeover follow in A-697's
+    later parts. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -56221,3 +56224,31 @@ sentence), GAPS (A-247's step two), `crates/merge/src/engine.rs` (`Green::submit
 - **Owed.** The increment rides the forward whole, so an increment the forward lane cannot carry is refused by the lane
   (the inputs' placement before the record, A-286, would carry it by reference); a verdict computed at a replica head
   the owner has moved past is judged again by position (the engine's oracle covers it; no fleet test forces the lag).
+
+### A-697 part d — A holder's submit settles once its replica holds the version the owner committed (2026-11-20, w-shared for UI goal 93; main's plan for A-697)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/work_home.rs`, `crates/server/src/merge_service.rs` (`recompute`), `crates/server/tests/fleet.rs`.
+- **Why.** At `f = 1` over three nodes the owner commits with any one holder, so the owner's answer to a holder's
+  submit can reach the holder before its own replica takes the version. Settled at once, the work would stand on a base
+  its node cannot read: every read of an unchanged file answered retryable (`merge.work.replica_behind`) until the
+  replica caught up.
+- **Change, behind A-697's test hook.** The owner's acceptance of a version the replica lacks is held on the control
+  shard, where the replica is (`work_home::hold_until_replica`, `WorkHome::replica_waits`), and the parked submit waits
+  under its own bound (`defer_oldest`, the deferred verdict's timer). Event-driven, no polling: when the replica takes a
+  version (`merge_service::recompute`), every held answer it now covers is handed to its work's shard
+  (`work_home::replica_reached`, then `answered_late`, which finds the submit by its key, so one already released is
+  not answered twice). Past the bound the submit is answered retryable and released; its resend meets the owner's
+  completion record and is held again until the replica has it. The holds are bounded by the parked verbs: one a
+  parked submit, the expired let go at each new hold. A replica rebuilt another way (a rewind, an adoption) wakes
+  nothing; its submits meet their bound.
+- **Counters.** `merge.work.settle_awaits_replica`, `merge.work.settled_on_replica` (the test's non-vacuity counts),
+  `merge.work.settle_unhanded`.
+- **Also.** Part b's fleet test read B's counter of floor moves right after A's floor dropped, which B counts only once
+  A's answer is back: it failed once in a batch run. It now waits for both.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committed` (three nodes at `f = 1`; B withholds
+  every merge record, so A commits with C; B's held-answer counter moves while B's replica is at version 1; once B takes
+  records again the submit is answered version 2, the settled counter moved, the replica at 2, the work reads "hello
+  world"). Red with the wake removed from `recompute`: the submit answered `Overloaded` at its bound. Fleet `a_holder`
+  19 of 19, `a_forwarded_submit`, part b's test 3 of 3 after the fix; `slates-server --lib work_home` 2 of 2,
+  `merge_service::` 14 of 14, `verbs::` 62 of 62; fmt clean.
