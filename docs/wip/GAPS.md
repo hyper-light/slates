@@ -167,8 +167,9 @@
 > (`negotiation::begin`, `Negotiating::step`); part 2: `upload::serve_in_turns` and `Answer::write_within` choose them
 > within the owner's quantum, the answer the same bytes; piece 3a: sets in runs or bits, whichever is smaller, and packets
 > sized from the room (a clone within 4 KiB); piece 3b: both edges admit a fetch a request's room and answer it in turns
-> (the 3,000-commit clone by use over HTTP and SSH). Owed: protocol v0 in turns, `begin`'s walks in units, scattered
-> plans, rule 4's generation hold; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> (the 3,000-commit clone by use over HTTP and SSH); rule 4: a fetch holds the generation it began on (a shared fork at
+> the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects). Owed:
+> protocol v0 in turns, `begin`'s walks in units, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -2025,7 +2026,17 @@
 > slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs): owed, the piece and the
 > window sliced to the slice. **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
 > refused E210009 by one request's room over svn:// and DAV (rule 2), and below that room `commit::drive::Work::texts`
-> holds every new text whole (rule 1, by reading); owed, w-svn's next piece. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> holds every new text whole (rule 1, by reading); owed, w-svn's next piece. **Intake, part 1 (same day, w-svn, on w-perf's seam):**
+> the commit drive applies each svndiff window into one window's room and hands it to the caller's
+> `commit::drive::TextSink` (stage, append, seal), naming the text (BLAKE3) and checking its MD5 and SHA-1 as the
+> windows pass, so it holds the window being read and no text; `Work::texts` names identities, `Revision::of_work`
+> reads them back from the sink, and a sink's refusal is the shard's room (`NoRoom`, E160000), never a request's.
+> Every edge lends one: the listener's connection, the tunnel's session, each DAV commit (`DavCommit` owns it and hands
+> it out with the accepted work). The green's staging (`slates_merge` `Green::stage`, `append_staged`, `seal_staged`,
+> `discard_staged`) landed first. Held by `a_text_larger_than_the_request_room_is_streamed_into_the_sink_and_accepted`
+> (a 1 MB text through a 256 KB room: red E210009 before). Owed: the server's sink over the green's staged blocks
+> (w-perf; until then `HeldTexts` keeps them in memory per connection), the revision's record and log reading the held
+> texts by identity (w-perf's c2, c3), and the by-use 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -6999,11 +7010,20 @@
 >   keeps A-454's shard steps for the daemons it freezes on purpose; and a hold's start is waited on its observation,
 >   which ends by its answer or its typed refusal past the observe budget
 >   (`a_send_on_a_full_ring_whose_daemon_is_gone_ends_at_its_first_look`,
->   `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`). Owed (A-571's next part):
->   `shards.rs`'s guest windows (`Guest::await_answer`, A-65 and A-228's rule sized by `CREDIT_WAIT`), its condition
->   polls (`wait_until`, `wait_for_count`), its attach's answer and its stream reads, each still five seconds on the
->   wall; `daemon.rs`'s raw client, the same constant and the same two waits; and `common/client.rs`'s `START_WAIT`, a
->   connect retried five seconds while a daemon starts. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`). A-571's next part since
+>   2026-11-20 (g226, goal 88's last part), each wait by the rule A-468, A-571 and A-232 proved red, where each was five
+>   seconds (twenty for `TAKEN_WAIT`) on the wall: `daemon.rs`', `nfs_mount.rs`', `virtiofs.rs`' and
+>   `nfs_v4_kernel.rs`' raw clients (a connect is one claim, a full ring is waited out by `send_when_room`, a shard
+>   task's handshake is a plain `recv`, an NFS socket has no timeout, five destroy-in-slices polls wait while the daemon
+>   answers); `shards.rs`' attach answer (a plain `recv`), its guest's waits (`Guest::await_answer` waits on its stream
+>   while the daemon lives, the daemon's own watchdog ending a stuck or spinning shard, so the guest no longer judges
+>   the shards' CPU itself; an answer past the old five seconds is still counted, `Waits::extended`), its condition polls
+>   (`wait_until`, `wait_for_count`, the route's malformed count), its route and resync reads; and `common/client.rs`'s
+>   `START_WAIT` and `TAKEN_WAIT`. Not in the part, found by its sweep: the same five- to sixty-second waits under other
+>   names (`START_WAIT`, `TAKEN_WAIT`, `HOLD_START_WAIT`) in `server/tests` (`recovery`, `give_back`,
+>   `cross_shard_wait`, `consumers`, `attachment_term`, `reply_room`, `forward_retry`), `client/tests` and its
+>   examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module and `xtask`'s conformance and kind harnesses;
+>   each is a test's wait on a live daemon on the wall. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the

@@ -19,6 +19,9 @@ windows-sys = { workspace = true }
 # child-spawn helpers that hand exactly the held handles to the next daemon (`slates_ipc::win_spawn`). ipc does not
 # depend on anchor, so this edge is acyclic.
 slates-ipc = { workspace = true }
+# The version-control listeners shared with each daemon (A-748): `slates_rt::tcp::share_listener`, Winsock's explicit
+# duplicate for one process, where the rest of the workspace's Winsock lives. rt does not depend on anchor.
+slates-rt = { workspace = true }
 
 # The hold channel (A-61, A-113): a socketpair and `SCM_RIGHTS`, through rustix's safe wrappers.
 [target.'cfg(unix)'.dependencies]

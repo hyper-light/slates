@@ -57,7 +57,8 @@ impl Child {
   }
 }
 
-/// Starts the child with only the named handles, plus copies of its standard three. `job` is assigned by
+/// Starts the child with only the named handles (the handoff's and `extra`, each inheritable), plus copies of its
+/// standard three. `job` is assigned by
 /// `PROC_THREAD_ATTRIBUTE_JOB_LIST` at creation, before the child can run.
 pub(super) fn spawn(
   program: &str,
@@ -65,6 +66,7 @@ pub(super) fn spawn(
   env: &[(String, String)],
   handoff: Option<&Handoff>,
   job: HANDLE,
+  extra: &[HANDLE],
 ) -> Result<Child, slates_ipc::IpcError> {
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
   let env: Vec<(&OsStr, &OsStr)> = env
@@ -72,7 +74,8 @@ pub(super) fn spawn(
     .map(|(name, value)| (OsStr::new(name), OsStr::new(value)))
     .collect();
   let env = environment_block(&env);
-  let handles = handoff.map_or_else(Vec::new, Handoff::handles);
+  let mut handles = handoff.map_or_else(Vec::new, Handoff::handles);
+  handles.extend_from_slice(extra);
   let process_security = slates_ipc::process_access::ProcessSecurity::handle_owner()?;
   let process = slates_ipc::win_spawn::spawn(&Spawn {
     program: OsStr::new(program),
