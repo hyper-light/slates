@@ -339,7 +339,9 @@ proptest! {
     selector in 0usize..3,
   ) {
     let cipher = [None, Some(Cipher::ChaCha20Poly1305), Some(Cipher::Aes256Gcm)][selector];
-    let payload: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
+    let payload: Vec<u8> = (0..payload_len)
+      .map(|index| u8::try_from(index % 251).unwrap_or_default())
+      .collect();
     let (mut sealer, mut opener, alignment, tag) = pair(cipher);
     let mut out = Vec::new();
     prop_assert_eq!(sealer.seal(&payload, &mut Seeded::new(seed), &mut out), Ok(()));
