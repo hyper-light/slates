@@ -20,3 +20,15 @@
 - In flight: slates-git helper, slates-hg helper. Left for me: slates-server (24 literals + clippy once deps clear),
   vcs/src/share.rs literal, then the full wall again (host, 6 cross targets, xtask check incl. unsafe, fmt).
 - For main: the literal check reads a byte char like b'3' as the number 3 (doesn't strip char literals).
+
+## 2026-11-20 round 0, continued
+- More landed: 9ab4e4e4c slates-hg (29, helper); 5e9693ac7, acf28f79f, 9f46e907b slates-git (21 + 83 + 29 literals,
+  helper); f5c515f55 xtask literals: `pub(crate) mod tests` + char-literal digits (22 false hits);
+  453a40005 hg Intake::finish + land open_target_in boxed (5); 7464601e1 server literals (2);
+  986376c88 COMPILE FIX: main's slates-server didn't build (08b440739, A-724 3a, called a cfg(test) accessor).
+- In flight: slates-server clippy, 106 spots, split by file: helper A (all but vcs_*/hook_driver), helper B
+  (vcs_*, hook_driver); worktrees ~/slates-work/w-lint-srv-{a,b}. Then me: crates/server/tests, then the crates
+  behind server (cli, anchor, mcp, bridges ...) as they show up.
+- Running: 6 cross targets, `cargo xtask check`, host clippy --keep-going.
+- For main: vcs/src/share.rs:130 `f64::EPSILON * 64.0` (4bbf7f4ba, A-724 piece 2) has no stated derivation; not
+  marked by me. Skipped: land's x86_64-pc-windows-msvc cross clippy (C build scripts can't cross-build here).
