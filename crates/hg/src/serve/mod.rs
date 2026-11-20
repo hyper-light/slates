@@ -72,6 +72,12 @@ pub trait Repository {
   /// view does not hold, or with a divergent name (`crate::bookmarks::divergent`, A-690), is left out wherever
   /// bookmarks are answered, as 7.2 leaves it out.
   fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)>;
+
+  /// The repository's stored draft roots whose phase is still draft, each by node, in any order: read past the served
+  /// filter, from the whole changelog, so a hidden one is among them, as 7.2's `listphases` lists them for `listkeys
+  /// phases` (`phases.py` 1049-1058: each root of `_phaseroots[draft]` from `repo.unfiltered().changelog`, kept where
+  /// `phase(root) <= draft`; A-691).
+  fn draft_roots(&self) -> impl Iterator<Item = Node>;
 }
 
 /// Why a request was refused.
