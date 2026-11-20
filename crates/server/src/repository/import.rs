@@ -15,11 +15,15 @@
 //! **Answered when it ends.** A started import runs a turn at a time on this shard, in a task of the shard
 //! (`hg_import::run`). The request's reply is held meanwhile: the request's origin and id and the route its reply goes
 //! by ([`Answer`]) are kept in the shard's map beside the import, one an import, so bounded as the imports are, and the
-//! running verb is marked deferred, so its transaction records no completion yet. When the import ends, the task records
-//! the request's completion with its reply in one durable step, as every verb's completion is, then sends the reply
-//! where the route names: the client's ring on this shard, or its own shard's (`told::deliver_to`). A resend of the
-//! request while its import runs (its client reconnected) takes the route over, so the import's end answers the client
-//! where it is now; any other request for the repository is refused `UnderWay`.
+//! running verb is marked deferred, so its transaction records no completion yet. When a Mercurial import is done, the task
+//! lands it (`hg_import::land`, A-687: the repository's entry holding its record, its phase roots and its bookmarks'
+//! greens, the index put in the store's place) and records the request's completion with its reply in the same
+//! transaction, so the import and its answer are one durable step, as every verb's effect and completion are; then it
+//! sends the reply where the route names: the client's ring on this shard, or its own shard's (`told::deliver_to`). A
+//! transaction the database cannot make durable rolls back whole: the shard's effects are reconciled with the log and
+//! the store made again from it, and the request is answered the database's refusal. A resend of the request while its
+//! import runs (its client reconnected) takes the route over, so the import's end answers the client where it is now;
+//! any other request for the repository is refused `UnderWay`.
 //!
 //! **Refusals, by kind** ([`refusal_of`]; a Subversion dump's, [`svn_refusal_of`]). The store holding a history
 //! (`NotEmpty`); an import under way (`UnderWay`);
@@ -28,15 +32,14 @@
 //! unknown-flagged revision); a file missing, not of its format or at odds with the rest (`Damaged`, with its path
 //! under `.hg` where the refusal names one); more than an import may hold at once (`PastRoom`, with its room); a fetch
 //! still pending on an S3 base (`Pending`: ask again once it lands); the host's own refusal (`BaseUnavailable` with the
-//! directory's path); and an import given back before its end (`Abandoned`). A Subversion dump refused as `svnadmin
-//! load` refuses it is `Subversion`, with Subversion's error number, the revision being loaded and the path; a revision
-//! whose green version this build cannot declare yet is `Format`; a record the owner's step refused for the shard's
-//! budget is `BudgetExceeded`, and one its append refused is the append's refusal.
+//! directory's path); an import given back before its end (`Abandoned`); and its landing's own refusal (the register's
+//! guard, the budget, a bookmark's name the namespace refuses, or `PastRoom` for a bookmark's work past the room). A
+//! Subversion dump refused as `svnadmin load` refuses it is `Subversion`, with Subversion's error number, the revision
+//! being loaded and the path; a revision whose green version this build cannot declare yet is `Format`; a record the
+//! owner's step refused for the shard's budget is `BudgetExceeded`, and one its append refused is the append's refusal.
 //!
-//! **Owed** (GAPS' §4.17.3 entry). The import made durable: the register's first entry recording the phase roots and
-//! bookmarks it found, and a recovery that imports the directory again or replays its record. Until then a request
-//! that reached the owner from another node, whose exchange cannot be held here, is refused `Unawaited`, and a restart
-//! leaves the store empty.
+//! **Owed** (GAPS' §4.17.3 entry). A request that reached the owner from another node, whose exchange cannot be held
+//! here, is refused `Unawaited`.
 
 use slates_db::catalog::{Principal, RepositoryId, VcsTool};
 use slates_hg::import::ImportRefused;
@@ -262,32 +265,53 @@ async fn answer_at_end(id: RepositoryId, imports: Imports) {
   }
 }
 
-/// Answers the request held for repository `id`'s import with its `outcome` (the module doc): its completion recorded,
-/// and its reply with the route it goes by and this shard, for the caller to send. `None` when no request is held.
+/// Answers the request held for repository `id`'s import with its `outcome` (the module doc): a done import landed and
+/// the request's completion recorded in one transaction, and its reply with the route it goes by and this shard, for
+/// the caller to send. `None` when no request is held; a done import still lands, alone in its transaction.
 fn answer(
   state: &mut ShardState,
   id: RepositoryId,
   outcome: Outcome,
 ) -> Option<(ReplyRoute, ReplyBody, u16)> {
-  let held = state.vcs_stores.take_answer(id)?;
+  state.db.begin();
+  let outcome = match outcome {
+    Outcome::Mercurial(Some(Ok(finished))) => {
+      Outcome::Mercurial(Some(hg_import::land(state, id).map(|()| finished)))
+    }
+    other => other,
+  };
+  let landed = matches!(outcome, Outcome::Mercurial(Some(Ok(_))));
+  let Some(held) = state.vcs_stores.take_answer(id) else {
+    committed(state, (id, landed), ReplyBody::Acknowledged);
+    return None;
+  };
   let room = hg_import::room_of(state);
   let reply = match outcome {
     Outcome::Mercurial(outcome) => reply_of(&held.path, room, outcome),
     Outcome::Subversion(outcome) => svn_reply_of(&held.path, room, outcome),
   };
-  let reply = recorded(state, &held, reply);
+  let reply = crate::verbs::record_completion(state, held.origin, held.id, reply);
+  let reply = committed(state, (id, landed), reply);
   state.count(ANSWERED, 1);
   Some((held.route, reply, state.shard))
 }
 
-/// `reply` with the request's completion recorded in one durable step; the database's refusal when it cannot be.
-fn recorded(state: &mut ShardState, held: &Answer, reply: ReplyBody) -> ReplyBody {
-  state.db.begin();
-  let reply = crate::verbs::record_completion(state, held.origin, held.id, reply);
+/// `reply` once the transaction holding the landing and the completion is durable; the database's refusal when it
+/// cannot be, the partition then rolled back, the shard's effects reconciled with the log and, when the import landed,
+/// its store made again from the log (the module doc).
+fn committed(
+  state: &mut ShardState,
+  (id, landed): (RepositoryId, bool),
+  reply: ReplyBody,
+) -> ReplyBody {
   match state.db.commit(&mut state.segment) {
     Ok(_) => reply,
     Err(error) => {
       state.count(UNRECORDED, 1);
+      crate::verbs::reconcile_unpublished_effects(state);
+      if landed {
+        crate::vcs_store::rebuild(state, id);
+      }
       refused(crate::error::refusal_of_db(&error))
     }
   }
@@ -335,6 +359,7 @@ pub(crate) fn refusal_of(path: &str, room: u64, failed: ImportFailed) -> Refusal
     ImportFailed::Busy => import_refused(ImportFault::UnderWay),
     ImportFailed::Budget { available } => Refusal::BudgetExceeded { available },
     ImportFailed::Refused(refusal) => of_import(path, room, refusal),
+    ImportFailed::Landing(refusal) => refusal,
   }
 }
 

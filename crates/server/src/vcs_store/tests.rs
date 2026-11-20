@@ -1013,8 +1013,8 @@ pub(crate) fn repository(
 /// Do: create a git, a Mercurial and a Subversion repository; replay bytes that are no record into the Mercurial and
 /// Subversion stores; take the Mercurial one's refusal as a recovery takes it; free all three. Expect: each store made
 /// on the owner shard as its tool's arm, git's in its record's format, Subversion's records at revision 0 from its
-/// creation's record; Mercurial's replay refused `Owed`, its replay being its own push piece's, and Subversion's
-/// refused by the record's kind; the refused store given back and named unrecovered with why; after the frees no store
+/// creation's record; Mercurial's replay refused by its record's magic (A-687: an import's record replays there),
+/// and Subversion's refused by the record's kind; the refused store given back and named unrecovered with why; after the frees no store
 /// is held, none unrecovered, and nothing is charged.
 #[test]
 fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
@@ -1043,7 +1043,10 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
       .map(|records| records.youngest());
     assert_eq!(youngest, Some(0));
     let refused = [
-      (hg, ReplayRefused::Owed),
+      (
+        hg,
+        ReplayRefused::Mercurial(slates_hg::import::record::Refused::Magic),
+      ),
       (
         svn,
         ReplayRefused::SvnRecord(slates_svn::commit::record::RecordRefused::Magic),
@@ -1059,9 +1062,12 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
         Err(why)
       );
     }
-    assert!(!super::replayed(state, hg, Err(ReplayRefused::Owed)));
+    assert!(!super::replayed(state, hg, Err(ReplayRefused::Diverged)));
     assert!(!state.vcs_stores.holds(hg));
-    assert_eq!(state.vcs_stores.unrecovered(hg), Some(&ReplayRefused::Owed));
+    assert_eq!(
+      state.vcs_stores.unrecovered(hg),
+      Some(&ReplayRefused::Diverged)
+    );
     for repository in [git, hg, svn] {
       super::free(state, repository);
       assert!(!state.vcs_stores.holds(repository));

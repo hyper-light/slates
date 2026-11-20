@@ -468,6 +468,16 @@ impl HgIndex {
     self.len(store, log) == 0
   }
 
+  /// The path of every file log that holds a revision, in its path's order: the path its first row names (A-687, an
+  /// import's record walks the logs by them). One pass over the rows, since the shared index answers lookups by key
+  /// and keeps no list of the logs apart from their rows.
+  pub fn file_logs<'s>(&'s self, store: &'s ContentStore) -> impl Iterator<Item = &'s [u8]> + 's {
+    self
+      .rows
+      .iter(store)
+      .filter_map(|row| first_file_row(row.key()))
+  }
+
   /// The changelog's row numbered `rev`.
   pub fn changeset<'s>(&'s self, store: &'s ContentStore, rev: u32) -> Option<ChangesetRow<'s>> {
     let row = self.rows.get(store, &Log::Changelog.row_key(rev))?;
@@ -677,6 +687,14 @@ fn first_missing(ceiling: u64, held: impl Fn(u64) -> bool) -> u64 {
     }
   }
   high
+}
+
+/// The path a file log's first row's key names (`L`, `f`, the path, a NUL and revision 0); `None` for any other key.
+fn first_file_row(key: &[u8]) -> Option<&[u8]> {
+  let rest = key.strip_prefix(&[LOG_ROW, FILE_KEY])?;
+  let (path, rev) = rest.split_last_chunk::<REV_BYTES>()?;
+  let path = path.strip_suffix(&[PATH_END])?;
+  (u32::from_be_bytes(*rev) == 0).then_some(path)
 }
 
 /// The key of the marker numbered `number`.

@@ -6,15 +6,19 @@ use std::time::{Duration, Instant};
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_hg::Admission;
+use slates_hg::Node;
 use slates_hg::import::{self, Clock, Imported};
-use slates_ipc::protocol::{ObjectFormat as WireFormat, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{ObjectFormat as WireFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 use slates_vcs::ContentStore;
 
 use super::{
-  ABANDONED, DONE, Finished, ImportFailed, REFUSED, STARTED, TURNS, Turned, begin, run, turn,
+  ABANDONED, DONE, Finished, ImportFailed, LANDED, LANDING_REFUSED, REFUSED, STARTED, TURNS,
+  Turned, begin, land, run, turn,
 };
 use crate::hg_base::HgBase;
 use crate::hg_base::tests::{Files, STATES, laid_out};
+use crate::repository::hg_push::BOOKMARK_TAG;
 use crate::state::ShardState;
 use crate::verbs::dispatch;
 
@@ -181,10 +185,10 @@ fn check_settled(state: &ShardState, id: RepositoryId) {
 }
 
 /// A-675 (the oracle): do import the `states` repository 7.2 kept, laid out on the simulated host, into a Mercurial
-/// repository's store on its owner shard, a unit a turn; and again in one call through the same adapter. Expect more
-/// than one turn, the store's index equal to the one call's row for row with what it found beside (counts, phase roots,
-/// bookmarks), no import under way after, the shard's charge settled to what the content store holds, and each turn
-/// and the import's start and end counted.
+/// repository's store on its owner shard, a unit a turn, and land it (A-687); and again in one call through the same
+/// adapter. Expect more than one turn, the store's index equal to the one call's row for row with what it found beside
+/// (counts, phase roots, bookmarks), no import under way after, the shard's charge settled to what the content store
+/// holds, and each turn, the import's start and end and its landing counted.
 #[test]
 fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_imports_it() {
   crate::daemon::audit_on_shard(|state| {
@@ -199,6 +203,7 @@ fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_import
       "{turns} turns, {finished:?}"
     );
     assert!(!expected_rows.is_empty());
+    assert_eq!(land(state, id), Ok(()));
     assert_eq!(rows_of(state, id), expected_rows);
     check_found(&finished, &expected);
     check_settled(state, id);
@@ -206,8 +211,9 @@ fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_import
       count(state, STARTED),
       count(state, DONE),
       count(state, TURNS),
+      count(state, LANDED),
     ];
-    assert_eq!(counted, [1, 1, turns]);
+    assert_eq!(counted, [1, 1, turns, 1]);
   });
 }
 
@@ -248,9 +254,10 @@ fn t_a675_an_import_refused_midway_gives_back_everything_it_held() {
 }
 
 /// A-675 (one empty Mercurial store, one import at a time): do ask a git repository's store for an import; start one
-/// into a Mercurial repository and ask for a second; import another to its end and ask it for one more. Expect `NoStore`,
-/// `Busy` and `NotEmpty`, each leaving the store as it was: the first import still under way, the imported store's
-/// rows unchanged.
+/// into a Mercurial repository and ask for a second; import another to its end, ask for one more before and after it
+/// lands, and land it twice. Expect `NoStore`, `Busy`, `Busy` while it waits to land, `NotEmpty` once it landed and
+/// `NoStore` for a second landing, each leaving the store as it was: the first import still under way, the imported
+/// store's rows unchanged.
 #[test]
 fn t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time() {
   crate::daemon::audit_on_shard(|state| {
@@ -275,19 +282,25 @@ fn t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time() {
       Ok(())
     );
     assert!(to_its_end(state, full).1.is_ok());
+    assert_eq!(
+      begin(state, full, directory(STATES.iter().copied())),
+      Err(ImportFailed::Busy)
+    );
+    assert_eq!(land(state, full), Ok(()));
     let rows = rows_of(state, full);
     assert_eq!(
       begin(state, full, directory(STATES.iter().copied())),
       Err(ImportFailed::NotEmpty)
     );
+    assert_eq!(land(state, full), Err(ImportFailed::NoStore));
     assert_eq!(rows_of(state, full), rows);
   });
 }
 
 /// A-675 (cancellation): do start an import, run it a unit a turn until the content store holds some of it, then free
-/// the repository; and start one into another repository and run it to its end before freeing that one too. Expect the
-/// freed import given back (no import under way, counted abandoned) and, with both repositories freed, nothing charged
-/// and the shard's retention charge what it was before either import.
+/// the repository; and start one into another repository and run it to its end, then free that one too while it waits
+/// to land. Expect each freed import given back (no import under way, counted abandoned) and, with both repositories
+/// freed, nothing charged and the shard's retention charge what it was before either import.
 #[test]
 fn t_a675_a_repository_freed_midway_gives_its_import_back() {
   crate::daemon::audit_on_shard(|state| {
@@ -311,6 +324,8 @@ fn t_a675_a_repository_freed_midway_gives_its_import_back() {
     );
     assert!(to_its_end(state, whole).1.is_ok());
     super::super::free(state, whole);
+    assert!(!state.vcs_stores.importing(whole));
+    assert_eq!(count(state, ABANDONED), 2);
     assert_eq!(
       (state.vcs_stores.charged(), state.store.budget.retained()),
       (0, retained)
@@ -319,8 +334,9 @@ fn t_a675_a_repository_freed_midway_gives_its_import_back() {
 }
 
 /// A-675 (the shard's task): do start an import of the `states` repository on a running shard and hand it to a task of
-/// the shard ([`run`]), then wait for the import to end. Expect it ended within the wait, its index the one-call
-/// import's row for row, counted done once, over at least one turn of the shard's own quantum and clock.
+/// the shard ([`run`]) that lands it once done, then wait for the import to end. Expect it ended within the wait, its
+/// index the one-call import's row for row, counted done once, over at least one turn of the shard's own quantum and
+/// clock.
 #[test]
 fn t_a675_the_shards_task_runs_an_import_to_its_end() {
   let daemon = crate::daemon::audit_daemon();
@@ -328,7 +344,9 @@ fn t_a675_the_shards_task_runs_an_import_to_its_end() {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let task = slates_rt::futures::spawn(async move {
-      drop(run(id).await);
+      if run(id).await.is_some_and(|ended| ended.is_ok()) {
+        drop(crate::state::with_state(|state| land(state, id)));
+      }
     });
     task
       .and_then(slates_rt::futures::detach)
@@ -356,4 +374,124 @@ fn t_a675_the_shards_task_runs_an_import_to_its_end() {
   assert_eq!(done, 1);
   assert!(turns >= 1);
   assert_eq!(rows, expected_rows);
+}
+
+/// The names bound under `prefix` in repository `id`, each with its green's head changeset.
+fn heads_under(state: &ShardState, id: RepositoryId, prefix: &str) -> Vec<(String, Option<Node>)> {
+  state
+    .db
+    .partition()
+    .repositories()
+    .branches(id, prefix)
+    .map(|(name, green)| {
+      let head = state.greens.get(&green).and_then(|engine| {
+        engine
+          .xattr(ROOT, HEAD_ATTRIBUTE)
+          .and_then(|bytes| Node::try_from(bytes).ok())
+      });
+      (name.to_owned(), head)
+    })
+    .collect()
+}
+
+/// Repository `id`'s phase roots in its register, each its phase and node.
+fn roots_of(state: &ShardState, id: RepositoryId) -> Vec<(u8, Vec<u8>)> {
+  state
+    .db
+    .partition()
+    .repositories()
+    .phase_roots(id)
+    .map(|(phase, node)| (phase, node.to_vec()))
+    .collect()
+}
+
+/// The phase roots an import found, as the register keeps them.
+fn as_kept(roots: &[slates_hg::phases::PhaseHead]) -> Vec<(u8, Vec<u8>)> {
+  let mut kept: Vec<(u8, Vec<u8>)> = roots
+    .iter()
+    .map(|root| {
+      let phase = u8::try_from(root.phase.number()).expect("a phase's number");
+      (phase, root.node.to_vec())
+    })
+    .collect();
+  kept.sort();
+  kept
+}
+
+/// A-687 (§4.17.3 piece 3, decisions 2 and 3; A-635's append): do import the `states` repository a unit a turn and land
+/// it. Expect one entry holding the import's record as the repository's one object record, the register's phase roots
+/// the ones the import found, each bookmark bound to `bookmark:<label>:` and its green's head the bookmark's changeset,
+/// counted landed, and no landing refused.
+#[test]
+fn t_a687_an_import_lands_its_record_phase_roots_and_bookmarks_in_one_entry() {
+  crate::daemon::audit_on_shard(|state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    let (_, expected) = in_one_call(state, STATES);
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    assert!(to_its_end(state, id).1.is_ok());
+    assert!(roots_of(state, id).is_empty());
+    assert_eq!(land(state, id), Ok(()));
+    let records = state.db.partition().repositories().objects(id).count();
+    assert_eq!(records, 1);
+    assert!(!expected.phase_roots.is_empty());
+    let mut roots = roots_of(state, id);
+    roots.sort();
+    assert_eq!(roots, as_kept(&expected.phase_roots));
+    let wanted: Vec<(String, Option<Node>)> = expected
+      .bookmarks
+      .iter()
+      .map(|(name, node)| (crate::repository::hg_push::bookmark_name(name), Some(*node)))
+      .collect();
+    assert_eq!(wanted.len(), 3);
+    assert_eq!(heads_under(state, id, BOOKMARK_TAG), wanted);
+    assert_eq!(
+      (count(state, LANDED), count(state, LANDING_REFUSED)),
+      (1, 0)
+    );
+  });
+}
+
+/// A-687 (a landing refused gives everything back): do bind `bookmark:one:` in a Mercurial repository through the
+/// branch verb, then import the `states` repository, whose bookmark `one` the landing's entry would bind, and land it.
+/// Expect the landing refused `AlreadyExists` naming the green that holds the name, counted; nothing recorded (no object
+/// record, no phase root); the store's index empty, no import under way, and the shard's charge what its content store
+/// holds, as it was before the import.
+#[test]
+fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
+  crate::daemon::audit_on_shard(|state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    let reply = dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateBranch {
+        repository: "hg".to_owned(),
+        name: "bookmark:one:".to_owned(),
+        from: "default".to_owned(),
+        version: None,
+      },
+    );
+    let ReplyBody::GreenCreated { id: taken } = reply else {
+      panic!("no branch: {reply:?}")
+    };
+    let (held, retained) = (used(state), state.store.budget.retained());
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    assert!(to_its_end(state, id).1.is_ok());
+    let refused = land(state, id);
+    assert_eq!(
+      refused,
+      Err(ImportFailed::Landing(Refusal::AlreadyExists {
+        existing: taken
+      }))
+    );
+    assert_eq!(state.db.partition().repositories().objects(id).count(), 0);
+    assert!(roots_of(state, id).is_empty());
+    assert!(rows_of(state, id).is_empty());
+    assert_eq!(
+      (used(state), state.store.budget.retained()),
+      (held, retained)
+    );
+    check_settled(state, id);
+    assert_eq!(count(state, LANDING_REFUSED), 1);
+  });
 }

@@ -37,7 +37,9 @@
 //! objects are not the contents it names or whose admission would record other objects. That is guard then apply, as
 //! `slates_db::partition` replays its log, so the store after a recovery equals the store before. A commit whose entry
 //! was then not made durable leaves the store ahead of the log, so the store is made again from the log the same way
-//! ([`rebuild`]).
+//! ([`rebuild`]). A Mercurial import's entry (A-687, [`hg_import`]) holds its record, every revision it kept, whole,
+//! and its markers: replayed through the import's own steps into the same index ([`replay_hg`]), on this node or a
+//! successor, which never reads the importing host's directory (R8).
 //!
 //! **Keys.** A-614's store names a green by a `u64` ([`green_key`]): the half of its volume id that holds its partition
 //! and counter, which `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green
@@ -65,9 +67,9 @@
 //!
 //! **Owed** (each in GAPS' §4.17 entry). A snapshot carrying each store's sealed tables by identity, so a recovery
 //! replays only the log's suffix; the replay and a rebuild sliced a unit at a time within a record (a record is one unit
-//! today, as a commit is one step); Mercurial's records and their replay (A-687 makes the import's record kind; A-680
-//! part 2c records each push's objects with it; a push lands into the arm today, `repository::hg_push::land`), which a
-//! recovery refuses typed until then; the Subversion index charged by the bytes it holds, once
+//! today, as a commit is one step); a Mercurial push's record and its replay (A-680 part 2c: an import's replays
+//! since A-687, [`replay_hg`]; a push lands into the arm, `repository::hg_push::land`, its entry holding none yet); the
+//! Subversion index charged by the bytes it holds, once
 //! slates-svn measures them (its entries are bounded meanwhile); a version's pack fragments encoded again after a
 //! recovery, off the answer's path as a live version's are (A-654); and the fleet half, holders replaying the same
 //! records (A-636).
@@ -283,8 +285,11 @@ pub(crate) enum ReplayRefused {
   SvnStep(StepRefusal),
   /// A Subversion record out of its order: a creation once the records are made, or a revision before them.
   SvnOrder,
-  /// A record of a tool whose replay is owed: Mercurial's (A-687, A-680 part 2c).
-  Owed,
+  /// A Mercurial import's record refused by its replay (A-687): its bytes, a text not its node's, or the import's own
+  /// step.
+  Mercurial(slates_hg::import::record::Refused),
+  /// The index a replayed one took the place of was not given back whole: the content store's count of holds is off.
+  Released,
   /// An LFS object's record's bytes (A-629 part 3).
   LfsRecord(LfsRecordRefused),
   /// An LFS object the repository's LFS index refused again: bytes that are not their oid's, or past the budget.
@@ -1248,8 +1253,28 @@ fn replay_into(
     Some(RepositoryStore::Subversion(store)) => {
       replay_svn(store, bytes, svn_room.ok_or(unheld)?).map(|()| 0)
     }
-    Some(RepositoryStore::Mercurial(_)) => Err(ReplayRefused::Owed),
+    Some(RepositoryStore::Mercurial(store)) => replay_hg(content, store, bytes),
     None => Err(unheld),
+  }
+}
+
+/// Replays a Mercurial record into `store` (A-687; module docs): its revisions appended to the store's index through
+/// the import's own steps, in a fork that takes the index's place once the whole record is in
+/// (`slates_hg::import::record::replay`, the one entry point for an import's record and a push's); an import's record
+/// replays only into an empty index, as the live landing takes only an empty store. Refused, the store is as it was;
+/// the index replaced not given back whole is refused too, the content store's count of holds being off. No derived
+/// value is kept with it.
+fn replay_hg(
+  content: &mut ContentStore,
+  store: &mut HgStore,
+  bytes: &[u8],
+) -> Result<u64, ReplayRefused> {
+  let replayed = slates_hg::import::record::replay(bytes, &mut store.index, content)
+    .map_err(ReplayRefused::Mercurial)?;
+  if replayed.whole {
+    Ok(0)
+  } else {
+    Err(ReplayRefused::Released)
   }
 }
 

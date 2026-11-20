@@ -10,16 +10,16 @@ use slates_ipc::protocol::{ObjectFormat as WireFormat, ReplyBody, RequestBody, V
 use super::{UNMADE, lend_in};
 use crate::hg_base::tests::{STATES, laid_out};
 use crate::state::ShardState;
-use crate::vcs_store::hg_import::{Turned, begin, turn};
+use crate::vcs_store::hg_import::{Turned, begin, land, turn};
 use crate::verbs::dispatch;
 
 /// Shape: room enough for the view of every fixture these tests import.
 const ROOM: u64 = 1 << 24;
 /// Shape: more turns than the fixture's import takes, so an import that never ends fails the test rather than hangs it.
 const TURNS_AT_MOST: u64 = 1 << 16;
-/// Shape: the changesets `fixtures/state`'s `states` repository holds, every one served while the register holds no
-/// phase root (the import's roots are recorded by A-687).
-const STATES_CHANGESETS: u32 = 5;
+/// Shape: the changesets stock 7.2's `served` filter serves of the `states` repository (`fixtures/state/states-served.txt`,
+/// three lines): what its view serves once the import has landed its phase roots and bookmarks in the register (A-687).
+const STATES_SERVED: u32 = 3;
 
 /// A clock one nanosecond on at each reading, so every turn of an import passes its quantum of one nanosecond.
 struct Ticking(u64);
@@ -67,7 +67,10 @@ fn imported(state: &mut ShardState, id: RepositoryId) {
   for _ in 0..TURNS_AT_MOST {
     match turn(state, id, (&mut clock, 1)) {
       Some(Ok(Turned::More)) => {}
-      Some(Ok(Turned::Done(_))) => return,
+      Some(Ok(Turned::Done(_))) => {
+        assert_eq!(land(state, id), Ok(()));
+        return;
+      }
       other => panic!("the import did not end: {other:?}"),
     }
   }
@@ -82,8 +85,8 @@ fn lent_count(state: &mut ShardState, id: RepositoryId, room: u64) -> Option<u32
 /// A-680 part 2. Do: on one shard create a Mercurial repository and a git one; begin importing `fixtures/state`'s
 /// `states` repository into the Mercurial one and ask for its view, then run the import to its end and ask again, then
 /// ask for the git repository's, for an id no repository has, and for the Mercurial one's within a room of one byte.
-/// Expect: nothing lent while the import fills the store; then the view of the imported history, every changeset served
-/// (the register holds no phase root yet); nothing for the git repository and the unknown id, which count nothing; and
+/// Expect: nothing lent while the import fills the store; then, the import landed, the view of the imported history,
+/// the changesets stock 7.2 serves (the register holds the phase roots and bookmarks the import found, A-687); nothing for the git repository and the unknown id, which count nothing; and
 /// nothing past the room, counted as a view not made.
 #[test]
 fn t_a680_a_view_is_lent_from_the_store_or_not_at_all() {
@@ -110,7 +113,7 @@ fn t_a680_a_view_is_lent_from_the_store_or_not_at_all() {
     let past_room = lent_count(state, hg, 1);
     assert_eq!(
       (while_importing, lent, others, past_room),
-      (None, Some(STATES_CHANGESETS), (None, None), None)
+      (None, Some(STATES_SERVED), (None, None), None)
     );
     assert_eq!(unmade(state), before.saturating_add(1));
   });

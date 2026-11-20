@@ -1118,9 +1118,8 @@
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
 > import, with later pieces: a unit a host's pending read refused retried at the next turn rather than ending the
 > import; the listing and the obsstore read in slices too; a manifest's file nodes held to the file logs (a whole
-> `verify`); and the import made durable (A-675 built the import, A-678 the verb that asks for one):
-> the register's first entry recording the phase roots and bookmarks it answers, and a recovery that imports the
-> directory again or replays its record (until then an import is not served, and a restart leaves its store empty).
+> `verify`); the import made durable is built (A-687, below); an imported repository's branch heads as lines (decision
+> 1) are owed.
 > **Built (A-619 part 3):**
 > `slates hg serve --stdio`'s session, one SSH
 > version 1 request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
@@ -1203,6 +1202,15 @@
 > `phases.publish`. `slates-server --lib` filtered 51 of 51 and fmt clean on macOS arm64 (Mac Studio, kiln r357,
 > 2026-11-19): a daemon's edge answers `capabilities` and `heads` of a repository on another shard holding
 > `fixtures/state`'s `states` by an import; the other platforms owed.
+> **Built (A-687):** the import made durable: a done import lands as one entry of A-635's append
+> (`repository::push::push_imported`) in the transaction that records its request's completion: its objects the
+> import's record (`slates-hg`'s `import::record`: every revision it kept, whole, in its order, then its markers, and the
+> room it ran within), its state the phase roots it found, each bookmark a green bound to `bookmark:<label>:` made from
+> the root and moved by A-618's work; the index put in the store's place between the register's guard and the apply; a
+> recovery replays the record through the import's own steps into the same index, on any node (R8). Proven on macOS
+> arm64 (Mac Studio, kiln, 2026-11-20 00:20-00:23Z: slates-hg import 28 of 28, the server's 61 of 61, fmt clean; red first). Owed: an imported repository's branch heads as lines (decision 1; a push after
+> an import finds the root as its first line); a forwarded request answered from its record; the record, the bookmarks'
+> works and the replay in slices for a large repository, and the snapshot carrying the store's tables.
 > **Built (A-680 part 2b):** Mercurial's pushes over HTTP: the site reads `unbundle`'s `heads` argument and bundle and
 > hands them to the lender's driver (`repository::hg_push::unbundle`), one step on the owner shard in 7.2's order
 > (`heads` judged against the served view, `pusherr` for a race; the bundle read as 7.2's `unbundle` reads it,
@@ -1214,7 +1222,7 @@
 > of 64 and fmt clean on macOS arm64 (Mac Studio, kiln r467 and r480, 2026-11-19): stock 7.2's own HTTP push over a
 > two-shard daemon's TLS edge answered with 7.2's reply but its progress words, `heads` the pushed changeset after it;
 > the other platforms owed.
-> **Open (A-680 part 2b): a push's revisions are not durable.** Its entry records its moves and phase roots and no
+> **Open (A-680 part 2c): a push's revisions are not durable.** Its entry records its moves and phase roots and no
 > record of its revisions, and a recovery replays no Mercurial record, so after a restart the store lacks what pushes
 > brought while the register keeps their moves: `heads` answered from a store that no longer holds them. A-687 makes
 > Mercurial's record kind (the import's); A-680 part 2c records each push's objects with it and replays them.
@@ -1273,9 +1281,9 @@
 > step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes (A-657 part 4
 > built the policy before the verdict in `acl`'s words and the `pretxnchangegroup` and `changegroup` hooks through
 > the driver): the principal's Mercurial identity in `acl`'s words (§4.13); each push's record and its replay at
-> recovery (A-680 part 2c, with A-687's record kind; A-662 refuses a Mercurial record `Owed` until then; the landing
-> into the store's Mercurial arm and the HTTP site's pushes are built, A-680 part 2b); the SSH edge's pushes through the
-> same driver (`unbundle` in `serve --stdio`'s session, which A-679 serves for reads alone);
+> recovery (A-680 part 2c, with A-687's record kind, whose import records replay since A-687; the landing into the
+> store's Mercurial arm and the HTTP site's pushes are built, A-680 part 2b); the SSH edge's pushes through the same
+> driver (`unbundle` in `serve --stdio`'s session, which A-679 serves for reads alone);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
