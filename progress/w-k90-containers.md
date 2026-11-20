@@ -119,3 +119,8 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - r24 (live W9 test on adacachy, rootful docker 29.9.0 only) queued; container_live_tests.rs still UNCOMMITTED
   (+ workspace/mod.rs line) -> commit after r24 reports.
 ## NEXT: Windows items (jupiter unblocked): W9 measurement (Docker Desktop WSL2 9P reaching a WinFsp drive) / W5-ish.
+
+## LANDED 2026-11-20: 234f8c211 (stale k8s test w02_r06 fixed: ci.yaml:rust on bare metal since aa98b33d6),
+   2b5a3d559 (k8s node tlshd cert: POST /api/kubernetes/node-certificates, kind k8s-node refused on link).
+## W10 code done except the KIND proof (main's). Open: r24 live W9 (adacachy), r30 Windows cargo check (jupiter),
+   W9 Windows measurement (person: WinFsp, console session, Docker Desktop). container_live_tests.rs uncommitted.
