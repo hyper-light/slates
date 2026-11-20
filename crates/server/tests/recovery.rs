@@ -3832,6 +3832,7 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
 
 /// The content arena's allocated and resident bytes for the status report (A-744), read from a sweep that completed
 /// after this call began, so the figures are of now.
+#[cfg(target_os = "linux")]
 fn arena_figures(client: &mut Client) -> (u64, u64) {
   let completed = counter(client, "content_range.sweep.completed");
   let started = Instant::now();
@@ -3893,7 +3894,7 @@ fn a_burst_leaves_nothing_resident_behind_it_but_its_data() {
   let ticks = idle_ticks(&mut client);
   let started = Instant::now();
   while idle_ticks(&mut client) < ticks + 2 && started.elapsed() < IDLE_WAIT {
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::yield_now();
   }
   let (allocated, resident) = arena_figures(&mut client);
   let read_back = client

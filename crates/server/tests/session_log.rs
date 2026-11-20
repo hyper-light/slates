@@ -12,7 +12,9 @@
   clippy::unwrap_in_result
 )]
 
-use slates_client::{Filter, GrantScope, Landing, NeedsYou, Submitted, WorkMark};
+use slates_client::{
+  Client, Filter, GrantScope, Landing, NeedsYou, SessionLog, Submitted, VolumeId, WorkMark,
+};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -42,21 +44,11 @@ fn daemon(tag: &str) -> (Daemon, String) {
   (daemon, instance)
 }
 
-/// Do: on a two-shard daemon, seed a green with `/shared.txt` (version 1); make ten works at version 1; eight submit
-/// disjoint new files and the ninth rewrites `/shared.txt`, all accepted; the tenth rewrites the same span differently
-/// and collides. Present a landing of a plain volume and leave it ungranted. Expect: the log lists all ten works with
-/// base and outcome, the green's head, and names exactly two items as needing the human: the collided work (its path)
-/// and the landing awaiting its grant (its manifest).
-#[test]
-fn ten_works_one_collision_one_pending_landing_names_exactly_those_two() {
-  let (daemon, instance) = daemon("ten");
-  let mut client = connect(&instance);
-  let green = client.create_green("watched", false).unwrap();
-  let (seed, _) = client.create_work(green, "seed").unwrap();
-  client.edit(seed, "/shared.txt", 0, 0, b"base\n").unwrap();
-  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
-
-  let works: Vec<_> = (0..WORKS)
+/// [`WORKS`] works made on `green` at version 1: all but the last two submit disjoint new files, the ninth rewrites
+/// `/shared.txt` and the tenth the same span differently, every one accepted but the tenth, which collides. The works,
+/// and the tenth.
+fn works_submitted(client: &mut Client, green: VolumeId) -> (Vec<VolumeId>, VolumeId) {
+  let works: Vec<VolumeId> = (0..WORKS)
     .map(|i| {
       let (work, base) = client.create_work(green, &format!("agent-{i}")).unwrap();
       assert_eq!(base, 1, "every work starts from version 1");
@@ -84,6 +76,115 @@ fn ten_works_one_collision_one_pending_landing_names_exactly_those_two() {
     client.submit(theirs).unwrap(),
     Submitted::Conflict(_)
   ));
+  (works, theirs)
+}
+
+/// Every one of `works` listed once on `green`, with where it started and how its last submission ended: `theirs`
+/// collided on `shared.txt` at version 1, every other accepted and reset onto its version.
+fn each_work_listed(log: &SessionLog, works: &[VolumeId], green: VolumeId, theirs: VolumeId) {
+  let listed: Vec<_> = log.works.iter().filter(|w| works.contains(&w.id)).collect();
+  assert_eq!(listed.len(), WORKS, "every work once: {:?}", log.works);
+  for line in &listed {
+    assert_eq!(line.green, green);
+    if line.id == theirs {
+      assert_eq!(line.base, 1, "the collided work still stands on version 1");
+      let WorkMark::Collided { first, windows, .. } = &line.mark else {
+        panic!("the tenth work collided: {line:?}");
+      };
+      assert!(*windows >= 1);
+      assert_eq!(first.as_ref().map(|w| w.path.as_str()), Some("shared.txt"));
+    } else {
+      let WorkMark::Accepted { version } = line.mark else {
+        panic!("an accepted work: {line:?}");
+      };
+      assert_eq!(
+        line.base, version,
+        "an accepted work is reset onto its version"
+      );
+    }
+  }
+}
+
+/// The log names exactly two items as needing the human: `theirs`, collided on `shared.txt` with its green `head - 1`
+/// past it, and the plain volume's landing awaiting its grant by manifest.
+fn needs_exactly_two(
+  log: &SessionLog,
+  (theirs, head): (VolumeId, u64),
+  (landing, manifest, plain): (u64, [u8; 32], VolumeId),
+) {
+  let needs = log.needs_you();
+  assert_eq!(
+    needs.len(),
+    2,
+    "exactly the collision and the landing: {needs:?}"
+  );
+  assert!(
+    needs.iter().any(
+      |n| matches!(n, NeedsYou::Collided { work, path, behind, .. }
+    if *work == theirs && path == "shared.txt" && *behind == head - 1)
+    ),
+    "the collided work, its path and how far its green moved past it: {needs:?}"
+  );
+  assert!(
+    needs.iter().any(
+      |n| matches!(n, NeedsYou::AwaitingGrant { landing: l, manifest: m, volume, .. }
+    if *l == landing && *m == manifest && *volume == plain)
+    ),
+    "the landing awaiting its grant, by manifest: {needs:?}"
+  );
+}
+
+/// The landing granted under the issuer's proof and run into `path`: it no longer awaits.
+fn granted_and_run(
+  daemon: &Daemon,
+  client: &mut Client,
+  (landing, manifest, plain): (u64, [u8; 32], VolumeId),
+  path: &str,
+) {
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let proof = slates_server::landing::grant_proof(
+    &secret,
+    landing,
+    &manifest,
+    GrantScope::Once,
+    common::landing::GRANT_TERM_NS,
+  );
+  let granted = client
+    .grant(
+      landing,
+      manifest,
+      GrantScope::Once,
+      common::landing::GRANT_TERM_NS,
+      proof,
+    )
+    .unwrap();
+  client
+    .land(plain, None, path, Filter::default(), Some(granted))
+    .unwrap();
+  let after = client.session_log().unwrap().needs_you();
+  assert!(
+    !after
+      .iter()
+      .any(|n| matches!(n, NeedsYou::AwaitingGrant { landing: l, .. } if *l == landing)),
+    "a landing granted and run no longer awaits: {after:?}"
+  );
+}
+
+/// Do: on a two-shard daemon, seed a green with `/shared.txt` (version 1); make ten works at version 1; eight submit
+/// disjoint new files and the ninth rewrites `/shared.txt`, all accepted; the tenth rewrites the same span differently
+/// and collides. Present a landing of a plain volume and leave it ungranted. Expect: the log lists all ten works with
+/// base and outcome, the green's head, and names exactly two items as needing the human: the collided work (its path)
+/// and the landing awaiting its grant (its manifest).
+#[test]
+fn ten_works_one_collision_one_pending_landing_names_exactly_those_two() {
+  let (daemon, instance) = daemon("ten");
+  let mut client = connect(&instance);
+  let green = client.create_green("watched", false).unwrap();
+  let (seed, _) = client.create_work(green, "seed").unwrap();
+  client.edit(seed, "/shared.txt", 0, 0, b"base\n").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+
+  let (works, theirs) = works_submitted(&mut client, green);
 
   let target = target_dir();
   let plain = client.create(&scratch("landed")).unwrap();
@@ -106,77 +207,17 @@ fn ten_works_one_collision_one_pending_landing_names_exactly_those_two() {
   );
 
   // Every work is listed once, with where it started and how its last submission ended.
-  let listed: Vec<_> = log.works.iter().filter(|w| works.contains(&w.id)).collect();
-  assert_eq!(listed.len(), WORKS, "every work once: {:?}", log.works);
-  for line in &listed {
-    assert_eq!(line.green, green);
-    if line.id == theirs {
-      assert_eq!(line.base, 1, "the collided work still stands on version 1");
-      let WorkMark::Collided { first, windows, .. } = &line.mark else {
-        panic!("the tenth work collided: {line:?}");
-      };
-      assert!(*windows >= 1);
-      assert_eq!(first.as_ref().map(|w| w.path.as_str()), Some("shared.txt"));
-    } else {
-      let WorkMark::Accepted { version } = line.mark else {
-        panic!("an accepted work: {line:?}");
-      };
-      assert_eq!(
-        line.base, version,
-        "an accepted work is reset onto its version"
-      );
-    }
-  }
+  each_work_listed(&log, &works, green, theirs);
 
-  let needs = log.needs_you();
-  assert_eq!(
-    needs.len(),
-    2,
-    "exactly the collision and the landing: {needs:?}"
-  );
-  assert!(
-    needs.iter().any(
-      |n| matches!(n, NeedsYou::Collided { work, path, behind, .. }
-      if *work == theirs && path == "shared.txt" && *behind == head - 1)
-    ),
-    "the collided work, its path and how far its green moved past it: {needs:?}"
-  );
-  assert!(
-    needs.iter().any(
-      |n| matches!(n, NeedsYou::AwaitingGrant { landing: l, manifest: m, volume, .. }
-      if *l == landing && *m == manifest && *volume == plain)
-    ),
-    "the landing awaiting its grant, by manifest: {needs:?}"
-  );
+  needs_exactly_two(&log, (theirs, head), (landing, manifest, plain));
 
   // Rebasing does not resolve the collision (the same span changed), granting is not this view's verb (R10): the log
   // only shows them. Once the landing is granted and run it no longer needs the human.
-  let secret = daemon.segment().issuer_secret().unwrap();
-  let proof = slates_server::landing::grant_proof(
-    &secret,
-    landing,
-    &manifest,
-    GrantScope::Once,
-    common::landing::GRANT_TERM_NS,
-  );
-  let granted = client
-    .grant(
-      landing,
-      manifest,
-      GrantScope::Once,
-      common::landing::GRANT_TERM_NS,
-      proof,
-    )
-    .unwrap();
-  client
-    .land(plain, None, &target.path, Filter::default(), Some(granted))
-    .unwrap();
-  let after = client.session_log().unwrap().needs_you();
-  assert!(
-    !after
-      .iter()
-      .any(|n| matches!(n, NeedsYou::AwaitingGrant { landing: l, .. } if *l == landing)),
-    "a landing granted and run no longer awaits: {after:?}"
+  granted_and_run(
+    &daemon,
+    &mut client,
+    (landing, manifest, plain),
+    &target.path,
   );
   drop(client);
   daemon.stop();
