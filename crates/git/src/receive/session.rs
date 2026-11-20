@@ -61,6 +61,10 @@ pub struct Session<'s, H> {
   hidden: H,
   /// What comes next.
   state: State<'s>,
+  /// The pack's bytes as the client sent them, compressed and with its deltas, charged to the admission as they arrive
+  /// (A-723): what the push's record keeps durably in place of its objects inflated, taken once by the caller
+  /// ([`Session::take_pack`]).
+  pack: Vec<u8>,
 }
 
 impl<'s, H: HiddenRefs> Session<'s, H> {
@@ -70,6 +74,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       advertised: *advertised,
       hidden,
       state: State::Request(RequestReader::new(advertised)),
+      pack: Vec::new(),
     }
   }
 
@@ -125,6 +130,10 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     let State::Pack { reader, .. } = &mut self.state else {
       return Ok(false);
     };
+    admission
+      .charge(crate::to_u64(rest.len()))
+      .map_err(Refusal::PastAdmission)?;
+    self.pack.extend_from_slice(rest);
     let read = reader.read(rest, admission).map(|_| ());
     if read.is_ok() && !reader.is_whole() {
       return Ok(false);
@@ -195,6 +204,12 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       return Ok(None);
     };
     decide(checked, judge, admission).map(Some)
+  }
+
+  /// The pack's bytes as the client sent them (A-723), taken once: the caller's record keeps them durably, compressed and
+  /// with their deltas, so a push's objects are never recorded inflated. Empty when no pack was sent, or once taken.
+  pub fn take_pack(&mut self) -> Vec<u8> {
+    core::mem::take(&mut self.pack)
   }
 
   /// Whether the push is answered, or was refused.

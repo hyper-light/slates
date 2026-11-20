@@ -48,7 +48,7 @@ struct Green {
   /// Every revision's whole tree.
   trees: Vec<BTreeMap<String, GreenNode>>,
   /// The property lists, by identity.
-  lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  lists: BTreeMap<ContentIdentity, PropertyPairs>,
   /// The texts, by identity.
   texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// Every revision's properties.
@@ -522,7 +522,7 @@ fn file_revs_normalized(items: &[Value<'_>]) -> Vec<String> {
   let mut delta: Vec<&[u8]> = Vec::new();
   for item in items {
     match item {
-      Value::String(bytes) if bytes.is_empty() => {
+      Value::String([]) => {
         normalized_items.push(delta_normalized(&delta));
         delta.clear();
       }

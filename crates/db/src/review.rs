@@ -590,6 +590,55 @@ mod tests {
     )
   }
 
+  /// After the first approval was made stale at 4: approving again behind is refused `Behind` and at 4 replaces it;
+  /// staling the replacement at its own version is refused `NotAfter`; a change at 6 makes all three stale, one at 7
+  /// none, and staling a stale approval is refused `Stale`.
+  fn assert_approving_again_and_staling(
+    partition: &mut Partition,
+    repo: RepositoryId,
+    request: VolumeId,
+  ) {
+    let again = |approver, version| Op::ReviewApproved {
+      record: approval(0, 0, approver, version),
+    };
+    assert_eq!(
+      run(partition, &again(1, 3)),
+      Err(DbError::Review(ReviewRefusal::Behind))
+    );
+    run(partition, &again(1, 4)).unwrap();
+    assert_eq!(partition.reviews().standing(repo, request).count(), 3);
+    assert_eq!(
+      run(partition, &again(2, 1)),
+      Err(DbError::Review(ReviewRefusal::Behind))
+    );
+    let staled = |approver, version| Op::ReviewApprovalStaled {
+      repository: repo,
+      request,
+      approver: person(approver),
+      version,
+    };
+    assert_eq!(
+      run(partition, &staled(1, 4)),
+      Err(DbError::Review(ReviewRefusal::NotAfter))
+    );
+    let every = partition.reviews().staled_by(repo, request, 6, |_| true);
+    assert_eq!(every.len(), 3);
+    for op in &every {
+      run(partition, op).unwrap();
+    }
+    assert_eq!(partition.reviews().standing(repo, request).count(), 0);
+    assert!(
+      partition
+        .reviews()
+        .staled_by(repo, request, 7, |_| true)
+        .is_empty()
+    );
+    assert_eq!(
+      run(partition, &staled(2, 7)),
+      Err(DbError::Review(ReviewRefusal::Stale))
+    );
+  }
+
   /// A-596 (§4.17.1 shared piece 6). Do: approve a request by three people at versions 2, 3 and 5; ask which a change
   /// at version 4 makes stale under a policy naming the first and third; apply that; then approve again behind and
   /// ahead, stale twice, and ask for every approval at version 6 and 7. Expect: only the first is made stale (the third
@@ -632,47 +681,49 @@ mod tests {
       .map(|held| held.approver.clone())
       .collect();
     assert_eq!(standing, vec![person(2), person(3)]);
-    let again = |approver, version| Op::ReviewApproved {
-      record: approval(0, 0, approver, version),
-    };
-    assert_eq!(
-      run(&mut partition, &again(1, 3)),
-      Err(DbError::Review(ReviewRefusal::Behind))
-    );
-    run(&mut partition, &again(1, 4)).unwrap();
-    assert_eq!(partition.reviews().standing(repo, request).count(), 3);
-    assert_eq!(
-      run(&mut partition, &again(2, 1)),
-      Err(DbError::Review(ReviewRefusal::Behind))
-    );
-    let staled = |approver, version| Op::ReviewApprovalStaled {
-      repository: repo,
-      request,
-      approver: person(approver),
-      version,
-    };
-    assert_eq!(
-      run(&mut partition, &staled(1, 4)),
-      Err(DbError::Review(ReviewRefusal::NotAfter))
-    );
-    let every = partition.reviews().staled_by(repo, request, 6, |_| true);
-    assert_eq!(every.len(), 3);
-    for op in &every {
-      run(&mut partition, op).unwrap();
-    }
-    assert_eq!(partition.reviews().standing(repo, request).count(), 0);
-    assert!(
-      partition
-        .reviews()
-        .staled_by(repo, request, 7, |_| true)
-        .is_empty()
-    );
-    assert_eq!(
-      run(&mut partition, &staled(2, 7)),
-      Err(DbError::Review(ReviewRefusal::Stale))
-    );
+    assert_approving_again_and_staling(&mut partition, repo, request);
     let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
     assert_eq!(records(&rebuilt), records(&partition));
+  }
+
+  /// New comments refused: already outdated `Ended`, an empty path and one holding a NUL `InvalidName`, no bytes
+  /// `Empty` (twice), a number taken `AlreadyExists`, and another repository's `NotFound`.
+  fn assert_new_comments_refused(partition: &mut Partition, request: VolumeId) {
+    let review = |rule| Err(DbError::Review(rule));
+    let mut ended = comment(0, 0, 2, 2, 5, 4);
+    ended.outdated_at = Some(3);
+    let mut unnamed = comment(0, 0, 2, 2, 5, 4);
+    unnamed.path = String::new();
+    let mut nul = comment(0, 0, 2, 2, 5, 4);
+    nul.path = "src/\0".to_owned();
+    for (record, answer) in [
+      (ended, review(ReviewRefusal::Ended)),
+      (unnamed, Err(DbError::InvalidName)),
+      (nul, Err(DbError::InvalidName)),
+      (comment(0, 0, 2, 2, 5, 0), review(ReviewRefusal::Empty)),
+      (
+        comment(0, 0, 2, 2, u64::MAX, 2),
+        review(ReviewRefusal::Empty),
+      ),
+      (
+        comment(0, 0, 1, 2, 5, 4),
+        Err(DbError::AlreadyExists {
+          existing: request.bytes,
+        }),
+      ),
+      (comment(1, 0, 2, 2, 5, 4), Err(DbError::NotFound)),
+    ] {
+      assert_eq!(
+        run(
+          partition,
+          &Op::ReviewCommented {
+            record: record.clone()
+          }
+        ),
+        answer,
+        "{record:?}"
+      );
+    }
   }
 
   /// A-596 (§4.17.1 "Works over works"). Do: write comment 1 at version 2, then move it to version 1, to version 3, to
@@ -736,40 +787,7 @@ mod tests {
       run(&mut partition, &outdated(5)),
       review(ReviewRefusal::Outdated)
     );
-    let mut ended = comment(0, 0, 2, 2, 5, 4);
-    ended.outdated_at = Some(3);
-    let mut unnamed = comment(0, 0, 2, 2, 5, 4);
-    unnamed.path = String::new();
-    let mut nul = comment(0, 0, 2, 2, 5, 4);
-    nul.path = "src/\0".to_owned();
-    for (record, answer) in [
-      (ended, review(ReviewRefusal::Ended)),
-      (unnamed, Err(DbError::InvalidName)),
-      (nul, Err(DbError::InvalidName)),
-      (comment(0, 0, 2, 2, 5, 0), review(ReviewRefusal::Empty)),
-      (
-        comment(0, 0, 2, 2, u64::MAX, 2),
-        review(ReviewRefusal::Empty),
-      ),
-      (
-        comment(0, 0, 1, 2, 5, 4),
-        Err(DbError::AlreadyExists {
-          existing: request.bytes,
-        }),
-      ),
-      (comment(1, 0, 2, 2, 5, 4), Err(DbError::NotFound)),
-    ] {
-      assert_eq!(
-        run(
-          &mut partition,
-          &Op::ReviewCommented {
-            record: record.clone()
-          }
-        ),
-        answer,
-        "{record:?}"
-      );
-    }
+    assert_new_comments_refused(&mut partition, request);
     assert_eq!(partition.reviews().next_comment(repo, request), Some(2));
     let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
     assert_eq!(records(&rebuilt), records(&partition));

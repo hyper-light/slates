@@ -342,6 +342,9 @@ pub fn write_push(
   write_revisions((Source::Push, room), &groups, &[])
 }
 
+/// A revision kept in the fork and its text, read back whole (as [`write_kept`] reads them).
+type KeptText = (Kept, Vec<u8>);
+
 /// A push's record (A-680 part 2c's, [`Source::Push`]) written from the fork A-720's intake kept it in: each of `logs`'
 /// revisions from its first kept number to the fork's end, in the order kept, read back from the fork's rows (texts
 /// whole, as [`write_push`] writes them); `room` the room the landing ran within. Refused, nothing is written.
@@ -352,7 +355,7 @@ pub fn write_kept(
   room: u64,
 ) -> Result<Vec<u8>, WriteRefused> {
   use crate::push::verify::LogOf;
-  let mut read: Vec<(Log<'_>, Vec<(Kept, Vec<u8>)>)> = Vec::with_capacity(logs.len());
+  let mut read: Vec<(Log<'_>, Vec<KeptText>)> = Vec::with_capacity(logs.len());
   for (named, first) in logs {
     let log = match named {
       LogOf::Changelog => Log::Changelog,

@@ -65,7 +65,9 @@
 
 use crate::authz::{PrincipalRules, may_read};
 use crate::handshake::ClientCapabilities;
-use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
+use crate::index::{
+  ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, PropertyPairs, Revision,
+};
 use crate::lock::{AprTime, LockTable};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
 use crate::ra_svn::{ItemError, Value, write};
@@ -515,6 +517,57 @@ pub fn answer_lock_read<R: Repository + ?Sized>(
   } else {
     reads.get_locks(params, locks, now)
   })
+}
+
+/// `svn_repos_check_revision_access` (`repos.c`): how much of `revision` a session reading by `authz` may read. Without
+/// rules, or for a revision that changed nothing, all of it; else from each changed path and, for one a copy added, its
+/// source, until one of each kind is found.
+fn revision_access_in(
+  index: &Index,
+  authz: Option<&PrincipalRules>,
+  revision: Revision,
+) -> Result<RevisionAccess, Failure> {
+  if authz.is_none() {
+    return Ok(RevisionAccess::Full);
+  }
+  let changes = index
+    .changes(revision)
+    .map_err(|refusal| Failure::of_index(&refusal))?;
+  if changes.is_empty() {
+    return Ok(RevisionAccess::Full);
+  }
+  let (mut found_readable, mut found_unreadable) = (false, false);
+  for change in changes {
+    if may_read(authz, &change.path) {
+      found_readable = true;
+    } else {
+      found_unreadable = true;
+    }
+    if change
+      .copy_from
+      .as_ref()
+      .is_some_and(|source| !may_read(authz, &source.path))
+    {
+      found_unreadable = true;
+    }
+    if found_readable && found_unreadable {
+      break;
+    }
+  }
+  Ok(RevisionAccess::of(found_readable, found_unreadable))
+}
+
+/// Whether a session reading by `authz` may read all of `revision` (`svn_repos_check_revision_access`'s
+/// `svn_repos_revision_access_full`), what a revision property's change asks first (A-702); refused with the error
+/// number and words of a revision the index does not hold.
+pub(crate) fn revision_wholly_readable(
+  index: &Index,
+  authz: Option<&PrincipalRules>,
+  revision: Revision,
+) -> Result<bool, (u32, String)> {
+  revision_access_in(index, authz, revision)
+    .map(|access| matches!(access, RevisionAccess::Full))
+    .map_err(|failure| (failure.code, failure.message))
 }
 
 /// A refusal as `svnserve` writes it: Subversion's error number and its message.
@@ -1033,11 +1086,7 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
 
   /// A node's properties and the entry properties `get_props` adds: its committed revision, that revision's date and
   /// author as stored, and the repository's UUID.
-  fn node_properties(
-    &self,
-    path: &str,
-    revision: Revision,
-  ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Failure> {
+  fn node_properties(&self, path: &str, revision: Revision) -> Result<PropertyPairs, Failure> {
     let node = self
       .node(path, revision)?
       .ok_or_else(|| Failure::not_found(path, revision))?;
@@ -1354,39 +1403,9 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     Ok(Some(Outcome::Answered))
   }
 
-  /// `svn_repos_check_revision_access`: how much of `revision` the session may read. Without rules, or for a
-  /// revision that changed nothing, all of it; else from each changed path and, for one a copy added, its source, until
-  /// one of each kind is found.
+  /// `svn_repos_check_revision_access`: how much of `revision` the session may read ([`revision_access_in`]).
   fn revision_access(&self, revision: Revision) -> Result<RevisionAccess, Failure> {
-    if self.authz.is_none() {
-      return Ok(RevisionAccess::Full);
-    }
-    let changes = self
-      .index
-      .changes(revision)
-      .map_err(|refusal| Failure::of_index(&refusal))?;
-    if changes.is_empty() {
-      return Ok(RevisionAccess::Full);
-    }
-    let (mut found_readable, mut found_unreadable) = (false, false);
-    for change in changes {
-      if self.readable(&change.path) {
-        found_readable = true;
-      } else {
-        found_unreadable = true;
-      }
-      if change
-        .copy_from
-        .as_ref()
-        .is_some_and(|source| !self.readable(&source.path))
-      {
-        found_unreadable = true;
-      }
-      if found_readable && found_unreadable {
-        break;
-      }
-    }
-    Ok(RevisionAccess::of(found_readable, found_unreadable))
+    revision_access_in(self.index, self.authz, revision)
   }
 
   /// `trivial_auth_request`: `( success ( ( ) 0: ) )`.
@@ -1514,11 +1533,14 @@ impl DirectoryRequest {
   /// `svn_ra_svn__parse_tuple(params, "c(?r)bb?l?B")`.
   fn parse(params: &[Value<'_>], base: &str) -> Option<Self> {
     let (path, revision) = path_and_revision(params, base)?;
+    // Format: `"c(?r)bb?l?B"` is path 0, revision 1, want-props 2, want-contents 3, dirent fields 4
+    // and inherited-props 5 (`serve.c` `get_dir`).
     let fields = match params.get(4) {
       None => Fields::all(),
       Some(Value::List(words)) => Fields::of(words)?,
       Some(_) => return None,
     };
+    // Format: `"c(?r)bb?l?B"`'s sixth item, inherited-props.
     let inherited = match params.get(5) {
       None => false,
       some => boolean(some)?,
@@ -1527,6 +1549,7 @@ impl DirectoryRequest {
       path,
       revision,
       properties: boolean(params.get(2))?,
+      // Format: `"c(?r)bb?l?B"`'s want-contents, its fourth item.
       contents: boolean(params.get(3))?,
       fields,
       inherited,
@@ -1698,6 +1721,7 @@ impl MergeinfoRequest {
       paths,
       revision,
       inheritance: MergeinfoInheritance::from_word(word.as_bytes()),
+      // Format: `"l(?r)wb"`'s fourth item, include-descendants (`serve.c` `get_mergeinfo`).
       descendants: boolean(params.get(3))?,
     })
   }
@@ -1756,7 +1780,7 @@ fn path_and_revision(params: &[Value<'_>], base: &str) -> Option<(String, Option
 
 /// The session's base joined with a relative path made canonical (`svn_relpath_canonicalize_safe`,
 /// `svn_fspath__join`): empty and `.` names dropped, every other name kept, `..` among them.
-fn full_path(base: &str, relative: &[u8]) -> String {
+pub(crate) fn full_path(base: &str, relative: &[u8]) -> String {
   let relative = String::from_utf8_lossy(relative);
   let names: Vec<&str> = relative
     .split(SEPARATOR)
@@ -1958,7 +1982,7 @@ mod file_revs;
 mod fold;
 mod history;
 mod list;
-mod locks;
+pub(crate) mod locks;
 mod log;
 mod segments;
 mod stream;

@@ -55,6 +55,7 @@ const LETTERED: [(u8, u8); 9] = [
   (0x08, b'b'),
   (b'\t', b't'),
   (b'\n', b'n'),
+  // Format: VT, 0x0b, and FF, 0x0c (`cq_lookup`).
   (0x0b, b'v'),
   (0x0c, b'f'),
   (b'\r', b'r'),

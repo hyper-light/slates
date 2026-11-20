@@ -1560,7 +1560,7 @@ fn read_bookmarks(bytes: &[u8], index: &HgIndex, store: &ContentStore) -> ReadBo
     let parted = line.iter().position(|byte| *byte == SPACE).and_then(|at| {
       let hex = line.get(..at)?;
       let hexadecimal = hex.len().is_multiple_of(2) && hex.iter().all(u8::is_ascii_hexdigit);
-      Some((hex, line.get(at.saturating_add(1)..)?)).filter(|_| hexadecimal)
+      hexadecimal.then_some((hex, line.get(at.saturating_add(1)..)?))
     });
     let Some((hex, name)) = parted else {
       read.malformed = read.malformed.saturating_add(1);

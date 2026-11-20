@@ -654,13 +654,16 @@ fn count_into(census: &mut Census, this: &Walked) {
   *count = count.saturating_add(1);
 }
 
+/// The view's tail, the changesets left out (each with its number), and the census.
+type Filtered = (Vec<Kept>, Vec<(u32, LeftOut)>, Census);
+
 /// The view's tail, the changesets left out, and the census, from the walked changesets once the walk back has
 /// revealed what it reaches: what is neither hidden nor secret is served. Both lists are charged before they are made.
 fn filter(
   mut walked: Vec<Walked>,
   (first, len): (u32, u32),
   room: &mut Admission,
-) -> Result<(Vec<Kept>, Vec<(u32, LeftOut)>, Census), Refusal> {
+) -> Result<Filtered, Refusal> {
   reveal(&mut walked, first);
   let left = walked
     .iter()

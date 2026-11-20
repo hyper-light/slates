@@ -280,6 +280,52 @@ impl<O: Out> Out for Writer<'_, O> {
   }
 }
 
+/// Why a pack of whole objects was not made ([`of_whole`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WholeRefused {
+  /// More objects than a pack's header can count.
+  Count,
+  /// An entry's header refused (a size past what git reads).
+  Entry(crate::entry::Refusal),
+  /// The compressor refused.
+  Deflate,
+  /// The trailer's hash met a collision attack.
+  Collision(CollisionAttack),
+}
+
+/// A pack of `objects`, each whole and deflated at zlib's fastest level, in order (A-723): what a push's record holds
+/// for objects no client sent as a pack (the server's own commits, A-664 part 3), so every record is a pack a replay
+/// reads through one reader. git's own `pack-objects` writes whole objects this way where it finds no delta.
+///
+/// # Errors
+/// [`WholeRefused`].
+pub fn of_whole<'b>(
+  format: ObjectFormat,
+  objects: impl ExactSizeIterator<Item = (crate::object_name::Kind, &'b [u8])>,
+) -> Result<Vec<u8>, WholeRefused> {
+  let count = u32::try_from(objects.len()).map_err(|_| WholeRefused::Count)?;
+  let mut out = Vec::new();
+  let mut writer = Writer::new(format, count, &mut out);
+  let mut at = PACK_HEADER_LEN;
+  for (kind, bytes) in objects {
+    let mut head = Vec::new();
+    let header = crate::entry::Header {
+      representation: crate::entry::Representation::Whole(kind),
+      size: to_u64(bytes.len()),
+    };
+    crate::entry::write(header, at, &mut head).map_err(WholeRefused::Entry)?;
+    let data = crate::store::fragment::deflate(bytes, flate2::Compression::fast().level())
+      .map_err(|_| WholeRefused::Deflate)?;
+    writer.put(&head);
+    writer.put(&data);
+    at = at
+      .saturating_add(to_u64(head.len()))
+      .saturating_add(to_u64(data.len()));
+  }
+  writer.finish().map_err(WholeRefused::Collision)?;
+  Ok(out)
+}
+
 #[cfg(test)]
 #[path = "tests/pack.rs"]
 pub(crate) mod tests;

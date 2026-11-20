@@ -120,6 +120,7 @@ use slates_git::unpack::Object;
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::Increment;
 use slates_vcs::ContentStore;
+use slates_vcs::Work;
 
 use crate::git_protect::{StoreBrings, declined, right_of};
 use crate::repository::push::{
@@ -196,6 +197,8 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   session: Session<'static, PolicyHidden>,
   /// The push's room: its request and pack, and what reading and answering them builds.
   admission: Admission,
+  /// The push counted live among its repository's intakes until it drops (A-724, `crate::vcs_share`).
+  _live: crate::vcs_share::Live,
   /// What shows a hook's view at a path a hook runs in.
   presenter: P,
   /// Where its answer stands between the edge's steps (module docs, "A step at a time").
@@ -298,7 +301,7 @@ pub(crate) enum HookAnswer {}
 
 impl<P> ReceivePack<P> {
   /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what
-  /// reading them builds admitted [`push_room`], its hooks' views shown by `presenter`; writes the
+  /// reading them builds admitted [`crate::vcs_share::room`], its hooks' views shown by `presenter`; writes the
   /// advertisement to `out` when `advertise`. Refused for a repository not here or not git's, a
   /// store not held, or a policy git's matcher cannot read.
   pub(crate) fn start(
@@ -337,11 +340,19 @@ impl<P> ReceivePack<P> {
         .advertise(&listed, out)
         .map_err(PushFailed::Exchange)?;
     }
+    // A-724 piece 1: the push is counted on its repository's row as it begins.
+    state.vcs_usage.begun(
+      &repository,
+      principal,
+      Work::Intake,
+      slates_rt::futures::now_ns(),
+    );
     Ok(ReceivePack {
       repository,
       principal: principal.clone(),
       session,
-      admission: Admission::new(push_room(state)),
+      admission: Admission::new(crate::vcs_share::room(state, repository).bytes),
+      _live: crate::vcs_share::Live::begin(repository),
       presenter,
       answer: AnswerState::Unbegun,
     })
@@ -350,13 +361,14 @@ impl<P> ReceivePack<P> {
   /// Hands the push the client's next `bytes`: whether it is now read whole and checked, waiting for its answer. A
   /// refusal of the exchange ends the push.
   pub(crate) fn input(&mut self, state: &mut ShardState, bytes: &[u8]) -> Result<bool, PushFailed> {
+    let began = slates_rt::futures::now_ns();
     let Self {
       repository,
       session,
       admission,
       ..
     } = self;
-    with_room(state, |state| {
+    let read = with_room(state, |state| {
       let (content, git) = state
         .vcs_stores
         .git_ref(*repository)
@@ -365,19 +377,23 @@ impl<P> ReceivePack<P> {
       session
         .input(bytes, &indexed, admission)
         .map_err(PushFailed::Exchange)
-    })
+    });
+    let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    charge_step(state, *repository, began, bytes_in);
+    read
   }
 
   /// The client's bytes have ended: whether the push is now checked. A request cut short ends the push; a pack cut
   /// short is checked as git answers a short pack.
   pub(crate) fn end(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
+    let began = slates_rt::futures::now_ns();
     let Self {
       repository,
       session,
       admission,
       ..
     } = self;
-    with_room(state, |state| {
+    let ended = with_room(state, |state| {
       let (content, git) = state
         .vcs_stores
         .git_ref(*repository)
@@ -386,7 +402,9 @@ impl<P> ReceivePack<P> {
       session
         .end(&indexed, admission)
         .map_err(PushFailed::Exchange)
-    })
+    });
+    charge_step(state, *repository, began, 0);
+    ended
   }
 
   /// One turn of the pack's checks (A-719), for the shard's step quantum and at least one object,
@@ -432,6 +450,7 @@ impl<P> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Begun, PushFailed> {
     let record = record_of(state, self.repository)?;
+    let pack = self.session.take_pack();
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     #[cfg(unix)]
     let hooked = git_hook(&record).is_some();
@@ -439,7 +458,7 @@ impl<P> ReceivePack<P> {
       let answering = self.declined(&mut Declining::hook(hook), out)?;
       return Ok(Begun::Answering(answering));
     }
-    match prepare(state, &record, checked)? {
+    match prepare(state, &record, checked, pack)? {
       Prepared::Declined(mut declining) => {
         Ok(Begun::Answering(self.declined(&mut declining, out)?))
       }
@@ -515,6 +534,18 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
     state: &mut ShardState,
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let stepped = self.answer_turn(state, out);
+    charge_answer(state, self.repository, began, &stepped);
+    stepped
+  }
+
+  /// One step of the answer, uncounted ([`Self::answer_step`] counts it).
+  fn answer_turn(
+    &mut self,
+    state: &mut ShardState,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
     match core::mem::replace(&mut self.answer, AnswerState::Done) {
       AnswerState::Unbegun if !self.check_turn(state)? => {
         self.answer = AnswerState::Unbegun;
@@ -563,6 +594,18 @@ impl<P> ReceivePack<P> {
   /// Refused for a push not yet checked or answered already, a repository gone, a store not held,
   /// or a report git's protocol cannot carry.
   pub(crate) fn answer_step(
+    &mut self,
+    state: &mut ShardState,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let stepped = self.answer_turn(state, out);
+    charge_answer(state, self.repository, began, &stepped);
+    stepped
+  }
+
+  /// One step of the answer, uncounted ([`Self::answer_step`] counts it).
+  fn answer_turn(
     &mut self,
     state: &mut ShardState,
     out: &mut impl Out,
@@ -755,8 +798,10 @@ fn prepare(
   state: &mut ShardState,
   record: &RepositoryRecord,
   checked: &Checked,
+  pack: Vec<u8>,
 ) -> Result<Prepared, PushFailed> {
   let mut push = GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?;
+  push.keep_pack(pack);
   let judged = checked.early.iter().any(Option::is_none);
   let objects = if judged { checked.objects() } else { &[] };
   let incoming: Vec<Incoming<'_>> = objects.iter().map(incoming_of).collect();
@@ -773,12 +818,32 @@ fn prepare(
   }
 }
 
-/// Derived: the room a push is admitted (A-704): what the repository's owner shard could admit now, its arena's
-/// capacity and what its pool could still lend (`Store::admittable`), since the pushed objects land in that shard's
-/// store. Never one request's room: a pack longer than a ring region is a push like any other, and one past what the
-/// shard can hold is refused in git's `receive.maxInputSize` words.
-pub(crate) fn push_room(state: &ShardState) -> u64 {
-  state.store.admittable()
+/// Counts a step of a push of `repository`'s that began at `began` on the shard's clock and read `bytes_in` of the
+/// client's bytes on the repository's usage row (A-724 piece 1, `slates_vcs::usage`).
+fn charge_step(state: &mut ShardState, repository: RepositoryId, began: u64, bytes_in: u64) {
+  let now = slates_rt::futures::now_ns();
+  state.vcs_usage.stepped(
+    &repository,
+    Work::Intake,
+    (now.saturating_sub(began), bytes_in),
+    now,
+  );
+}
+
+/// Counts a step of a push's answer that began at `began` (A-724 piece 1), and the push as answered when the step
+/// answered it whole.
+fn charge_answer(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  began: u64,
+  stepped: &Result<Answering, PushFailed>,
+) {
+  charge_step(state, repository, began, 0);
+  if let Ok(Answering::Answered(_)) = stepped {
+    state
+      .vcs_usage
+      .answered(&repository, Work::Intake, slates_rt::futures::now_ns());
+  }
 }
 
 /// The first git hook `record`'s policy configures, if any (A-622 part 1: one hook a git point).

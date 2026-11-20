@@ -523,6 +523,25 @@ impl SvnStores for Lends {
     )
   }
 
+  fn land_locks(
+    &mut self,
+    id: RepositoryId,
+    _principal: &Principal,
+    entries: Vec<slates_svn::lock::LockEntry>,
+  ) -> Option<Result<(), Unlanded>> {
+    if !self.holds(id) {
+      return None;
+    }
+    let mut next = self.created.current.get().clone();
+    Some(match next.apply_lock_entries(&entries) {
+      Ok(()) => {
+        self.created.current.set(Box::leak(Box::new(next)));
+        Ok(())
+      }
+      Err(refusal) => Err(Unlanded::Step(refusal)),
+    })
+  }
+
   fn lend<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Sources<'_, View>) -> T) -> Option<T> {
     if !self.holds(id) {
       return None;

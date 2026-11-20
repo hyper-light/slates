@@ -12,8 +12,12 @@
 //! - `update`, `switch`, `status` and `diff`: the reporter's exchange (A-616's [`Exchange`]), its
 //!   drive written within the caller's room and steps;
 //! - `commit`: A-655's entry point and drive (**A commit**, below);
-//! - every other command of `svnserve`'s set, until its piece lands (`lock`, `unlock` and their
-//!   `-many` forms, `replay`, `replay-range`, `change-rev-prop`): answered as a command `svnserve`
+//! - `lock`, `lock-many`, `unlock` and `unlock-many` (A-693 part 2, [`locks`]): judged against the
+//!   lock table, their entries landed by the caller through the owner's step, then answered;
+//! - `change-rev-prop` and `change-rev-prop2` (A-702, [`revprops`]): answered as `svnserve`
+//!   answers a repository with no pre-revprop-change hook, after its checks;
+//! - every other command of `svnserve`'s set, until its piece lands (`replay`, `replay-range`):
+//!   answered as a command `svnserve`
 //!   does not know, "Unknown editor command '…'" (210001), which a stock client reads as a server
 //!   without it, and counted
 //!   ([`Turn::Unserved`]); the connection goes on;
@@ -78,6 +82,8 @@
 //!
 //! No I/O, no clock, no randomness, no panic.
 
+mod locks;
+mod revprops;
 #[cfg(test)]
 mod tests;
 
@@ -311,6 +317,13 @@ pub enum Turn<'a> {
     /// The bytes taken.
     consumed: usize,
   },
+  /// The client asked for a lock verb, `consumed` bytes (A-693 part 2): the caller judges it
+  /// ([`Connection::lock_verb`]), lands its entries, and reports their landing
+  /// ([`Connection::locks_landed`]).
+  LockAsked {
+    /// The bytes taken.
+    consumed: usize,
+  },
   /// The client asked for a command of `svnserve`'s set slates does not serve yet: it was answered
   /// "Unknown editor command" (210001), and the connection goes on.
   Unserved {
@@ -538,6 +551,16 @@ enum Interrupted {
     /// The item.
     command: Vec<u8>,
   },
+  /// A lock verb (A-693 part 2): its item.
+  Lock {
+    /// The item.
+    command: Vec<u8>,
+  },
+  /// A revision property's change (A-702): its item.
+  RevisionProperty {
+    /// The item.
+    command: Vec<u8>,
+  },
 }
 
 /// Where the connection stands.
@@ -565,6 +588,12 @@ enum Phase {
   /// A commit's work was refused at `close-edit`: the client's commands are dropped until its
   /// `abort-edit` or `success`.
   Dropping(Box<Established>),
+  /// A lock verb was read, its item kept, and whether the client has just authenticated for it: the
+  /// caller's judging is awaited ([`Connection::lock_verb`]).
+  LockAsked(Box<Established>, Vec<u8>, bool),
+  /// A lock verb was judged, its entries with the caller: their landing is awaited
+  /// ([`Connection::locks_landed`]).
+  Locking(Box<Established>, Box<locks::Pending>),
   /// The connection has ended.
   Ended,
 }
@@ -584,6 +613,8 @@ impl std::fmt::Debug for Phase {
       Self::Hooked(..) => "Hooked",
       Self::Accepted(_) => "Accepted",
       Self::Dropping(_) => "Dropping",
+      Self::LockAsked(..) => "LockAsked",
+      Self::Locking(..) => "Locking",
       Self::Ended => "Ended",
     })
   }
@@ -626,7 +657,9 @@ impl Connection {
       | Phase::CommitAsked(..)
       | Phase::Resuming(..)
       | Phase::Hooked(..)
-      | Phase::Accepted(_) => Waiting::Writing,
+      | Phase::Accepted(_)
+      | Phase::LockAsked(..)
+      | Phase::Locking(..) => Waiting::Writing,
       Phase::Reporting(_, exchange) => match exchange.awaiting() {
         Awaiting::Report => Waiting::Report,
         Awaiting::Drive => Waiting::Writing,
@@ -650,7 +683,9 @@ impl Connection {
       | Phase::Committing(established, _)
       | Phase::Hooked(established, _)
       | Phase::Accepted(established)
-      | Phase::Dropping(established) => Some(&established.session),
+      | Phase::Dropping(established)
+      | Phase::LockAsked(established, _, _)
+      | Phase::Locking(established, _) => Some(&established.session),
       Phase::Handshake(_) | Phase::Ended => None,
     }
   }
@@ -674,7 +709,12 @@ impl Connection {
   {
     if matches!(
       self.phase,
-      Phase::CommitAsked(..) | Phase::Hooked(..) | Phase::Accepted(_) | Phase::Ended
+      Phase::CommitAsked(..)
+        | Phase::Hooked(..)
+        | Phase::Accepted(_)
+        | Phase::LockAsked(..)
+        | Phase::Locking(..)
+        | Phase::Ended
     ) {
       return Err(Refused::OutOfTurn);
     }
@@ -967,6 +1007,8 @@ impl Connection {
       | Phase::CommitAsked(..)
       | Phase::Hooked(..)
       | Phase::Accepted(_)
+      | Phase::LockAsked(..)
+      | Phase::Locking(..)
       | Phase::Ended => Err(Refused::OutOfTurn),
     }
   }
@@ -1118,6 +1160,10 @@ impl Connection {
             self.phase = Phase::CommitAsked(established, item.to_vec());
             Turn::CommitAsked { consumed }
           }
+          Answered::LockAsked => {
+            self.phase = Phase::LockAsked(established, item.to_vec(), false);
+            Turn::LockAsked { consumed }
+          }
           Answered::Unserved => {
             self.phase = Phase::Commands(established);
             Turn::Unserved {
@@ -1150,6 +1196,19 @@ impl Connection {
     }
     if name == COMMIT {
       return Ok(Answered::CommitAsked);
+    }
+    if locks::is_lock_verb(name) {
+      return Ok(Answered::LockAsked);
+    }
+    if revprops::is_revision_property_change(name) {
+      let changed =
+        self.change_revision_property(established, sources, (name, params, item), false, out)?;
+      return Ok(match changed {
+        revprops::Changed::Answered => Answered::Here,
+        revprops::Changed::Authenticating(server, interrupted) => {
+          Answered::Authenticating(server, interrupted)
+        }
+      });
     }
     let Some(kind) = RequestKind::of(name) else {
       ReportFailure::UnknownCommand {
@@ -1301,6 +1360,17 @@ impl Connection {
   {
     match interrupted {
       Interrupted::Read { command } => self.read_again(established, &command, sources, out)?,
+      Interrupted::Lock { command } => {
+        self.phase = Phase::LockAsked(established, command, true);
+        return Ok(Turn::LockAsked { consumed: 0 });
+      }
+      Interrupted::RevisionProperty { command } => {
+        let value = self.whole_item(&command)?;
+        let (name, params) = command_of(&value).ok_or(Refused::Malformed)?;
+        let asked = (name, params, command.as_slice());
+        self.change_revision_property(&mut established, sources, asked, true, out)?;
+        self.phase = Phase::Commands(established);
+      }
       Interrupted::Commit { command, start } => {
         self.begin_commit(established, command, start, true, &sources.policy, out)?;
       }
@@ -1602,6 +1672,8 @@ enum Answered {
   Authenticating(Box<handshake::Server>, Box<Interrupted>),
   /// `commit`: the caller's start is awaited.
   CommitAsked,
+  /// A lock verb: the caller's judging is awaited.
+  LockAsked,
   /// As a command not served yet.
   Unserved,
 }

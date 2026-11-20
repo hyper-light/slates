@@ -38,6 +38,9 @@ const HEX_RADIX: u32 = 16;
 /// Format: the bits one hexadecimal digit carries.
 const HEX_DIGIT_BITS: u32 = 4;
 
+/// Format: the bytes of a `%XX` escape: `%` and two hexadecimal digits (RFC 3986 §2.1).
+const ESCAPE_LEN: usize = 3;
+
 /// A field of a locks request, as a refusal names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
@@ -349,7 +352,7 @@ fn decoded(raw: &[u8]) -> impl Iterator<Item = (usize, u8)> + '_ {
       b'%' => {
         let high = char::from(*raw.get(at.saturating_add(1))?).to_digit(HEX_RADIX)?;
         let low = char::from(*raw.get(at.saturating_add(2))?).to_digit(HEX_RADIX)?;
-        at = at.saturating_add(3);
+        at = at.saturating_add(ESCAPE_LEN);
         u8::try_from(high.checked_shl(HEX_DIGIT_BITS)? | low)
           .ok()
           .map(|value| (start, value))
@@ -409,11 +412,16 @@ fn check_component(raw: &[u8], offset: usize) -> Result<(), QueryRefusal> {
   let (mut held, mut needed, mut began) = (0usize, 0usize, 0usize);
   let mut seen = 0usize;
   for (place, byte) in decoded(raw) {
-    seen = place.saturating_add(if raw.get(place) == Some(&b'%') { 3 } else { 1 });
+    seen = place.saturating_add(if raw.get(place) == Some(&b'%') {
+      ESCAPE_LEN
+    } else {
+      1
+    });
     if held == 0 {
       began = place;
       needed = match byte.leading_ones() {
         0 => 1,
+        // Format: a lead byte's leading ones count its sequence's bytes, two to four (RFC 3629 §3).
         2..=4 => usize::try_from(byte.leading_ones()).unwrap_or(1),
         _ => return Err(QueryRefusal::NotUtf8 { at: at(place) }),
       };
@@ -490,6 +498,7 @@ fn store<'a>(
     0 => list.path = Some(value),
     1 => list.id = Some(value),
     2 => list.cursor = Some(value),
+    // Format: `limit`'s place in `LIST_KEYS`, after `path`, `id` and `cursor`.
     3 => list.limit = Some(query_limit(value).ok_or(QueryRefusal::Limit { at: to_u64(at) })?),
     _ => list.refspec = Some(value),
   }

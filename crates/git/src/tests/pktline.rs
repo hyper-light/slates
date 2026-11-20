@@ -91,46 +91,64 @@ fn every_stream_stock_git_wrote_decodes_and_encodes_back_to_its_bytes() {
 fn every_cut_of_every_stream_is_whole_or_truncated_and_a_reader_waits_for_the_rest() {
   for (name, stream) in STREAMS {
     let packets = decode(stream, &mut room(stream)).unwrap();
-    let mut boundaries = vec![0usize];
-    let mut at = 0usize;
-    while let Some((_, took)) = read(&stream[at..], to_u64(at)).unwrap() {
-      at += took;
-      boundaries.push(at);
-      if at == stream.len() {
-        break;
-      }
-    }
+    let boundaries = boundaries(stream);
     assert_eq!(boundaries.len(), packets.len() + 1, "{name}");
     for cut in 0..=stream.len() {
-      let prefix = &stream[..cut];
-      match decode(prefix, &mut room(prefix)) {
-        Ok(whole) => {
-          let index = boundaries.iter().position(|boundary| *boundary == cut);
-          assert_eq!(
-            index.map(|count| &packets[..count]),
-            Some(&whole[..]),
-            "{name} cut at {cut}"
-          );
-        }
-        Err(Refusal::Truncated { at, left, needed }) => {
-          assert!(
-            !boundaries.contains(&cut),
-            "{name} cut at {cut} is a boundary"
-          );
-          let start = usize::try_from(at).unwrap();
-          assert!(
-            boundaries.contains(&start),
-            "{name} truncated at {at}, not a packet's start"
-          );
-          assert!(
-            left < needed,
-            "{name} cut at {cut}: {left} left of {needed}"
-          );
-          assert_eq!(read(&prefix[start..], at), Ok(None), "{name} cut at {cut}");
-        }
-        Err(other) => panic!("{name} cut at {cut}: {other:?}"),
-      }
+      cut_is_whole_or_truncated(name, stream, &packets, &boundaries, cut);
     }
+  }
+}
+
+/// Where each packet of `stream` begins, and its end, as a reader reads them one by one.
+fn boundaries(stream: &[u8]) -> Vec<usize> {
+  let mut boundaries = vec![0usize];
+  let mut at = 0usize;
+  while let Some((_, took)) = read(&stream[at..], to_u64(at)).unwrap() {
+    at += took;
+    boundaries.push(at);
+    if at == stream.len() {
+      break;
+    }
+  }
+  boundaries
+}
+
+/// Holds `stream` cut at `cut` to decoding to that many of its `packets` on a boundary, and otherwise to `Truncated`
+/// where a reader says `None`.
+fn cut_is_whole_or_truncated(
+  name: &str,
+  stream: &[u8],
+  packets: &[Packet<'_>],
+  boundaries: &[usize],
+  cut: usize,
+) {
+  let prefix = &stream[..cut];
+  match decode(prefix, &mut room(prefix)) {
+    Ok(whole) => {
+      let index = boundaries.iter().position(|boundary| *boundary == cut);
+      assert_eq!(
+        index.map(|count| &packets[..count]),
+        Some(&whole[..]),
+        "{name} cut at {cut}"
+      );
+    }
+    Err(Refusal::Truncated { at, left, needed }) => {
+      assert!(
+        !boundaries.contains(&cut),
+        "{name} cut at {cut} is a boundary"
+      );
+      let start = usize::try_from(at).unwrap();
+      assert!(
+        boundaries.contains(&start),
+        "{name} truncated at {at}, not a packet's start"
+      );
+      assert!(
+        left < needed,
+        "{name} cut at {cut}: {left} left of {needed}"
+      );
+      assert_eq!(read(&prefix[start..], at), Ok(None), "{name} cut at {cut}");
+    }
+    Err(other) => panic!("{name} cut at {cut}: {other:?}"),
   }
 }
 
@@ -185,6 +203,13 @@ fn every_bit_flip_of_every_stream_is_refused_by_kind_or_read_as_its_length_says(
 /// all arrived; upper case read as git's `hexval` reads it; and the long write refused with nothing written.
 #[test]
 fn lengths_at_and_past_the_caps_and_digits_that_are_none_are_refused_by_kind() {
+  lengths_at_and_past_the_caps_read_as_git_reads_them();
+  digits_that_are_none_are_refused_at_their_place();
+  data_past_the_cap_is_refused_with_nothing_written();
+}
+
+/// The longest packet read whole; `TooLong` naming each length past 65520; `ShorterThanHeader` for `0003`.
+fn lengths_at_and_past_the_caps_read_as_git_reads_them() {
   let mut longest = b"fff0".to_vec();
   longest.extend(std::iter::repeat_n(b'x', MAX_DATA));
   assert_eq!(
@@ -195,6 +220,11 @@ fn lengths_at_and_past_the_caps_and_digits_that_are_none_are_refused_by_kind() {
     assert_eq!(read(header, 7), Err(Refusal::TooLong { at: 7, len }));
   }
   assert_eq!(read(b"0003", 9), Err(Refusal::ShorterThanHeader { at: 9 }));
+}
+
+/// `NotHex` at the digit's own place, even before the four digits have all arrived; upper case read as git's `hexval`
+/// reads it.
+fn digits_that_are_none_are_refused_at_their_place() {
   for place in 0..HEADER_LEN {
     let mut header = *b"0010";
     header[place] = b'g';
@@ -211,6 +241,10 @@ fn lengths_at_and_past_the_caps_and_digits_that_are_none_are_refused_by_kind() {
     read(b"000A123456", 0),
     Ok(Some((Packet::Data(b"123456"), 10)))
   );
+}
+
+/// Data one byte past the most a packet carries refused, with nothing written.
+fn data_past_the_cap_is_refused_with_nothing_written() {
   let too_long = vec![b'y'; MAX_DATA + 1];
   let mut out = Vec::new();
   assert_eq!(
@@ -279,16 +313,23 @@ fn a_measured_encode_takes_exactly_what_it_writes() {
   }
 }
 
-/// A packet for the round trip: data of any length up to the cap (most short, some at it), or a special packet.
+/// Shape: the kinds of packet `any_packet` chooses among, one each: short data, data at the cap, a special packet.
+const PACKET_KINDS: u8 = 3;
+
+/// A packet for the round trip: data of any length up to the cap (most short, some at it), or a special packet,
+/// chosen by a selector over parts made for every kind (no `prop_oneof!`, whose strategy is reference-counted, R2).
 fn any_packet() -> impl Strategy<Value = (u8, Vec<u8>)> {
-  prop_oneof![
-    (Just(0u8), proptest::collection::vec(any::<u8>(), 0..300)),
-    (
-      Just(0u8),
-      proptest::collection::vec(any::<u8>(), MAX_DATA - 2..=MAX_DATA)
-    ),
-    (1u8..4, Just(Vec::new())),
-  ]
+  (
+    0..PACKET_KINDS,
+    proptest::collection::vec(any::<u8>(), 0..300),
+    proptest::collection::vec(any::<u8>(), MAX_DATA - 2..=MAX_DATA),
+    1u8..4,
+  )
+    .prop_map(|(kind, short, at_cap, special)| match kind {
+      0 => (0, short),
+      1 => (0, at_cap),
+      _ => (special, Vec::new()),
+    })
 }
 
 proptest! {

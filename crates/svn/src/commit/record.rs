@@ -12,13 +12,14 @@
 //! import sets that no revision carries (A-652 part 3), each in an entry that moves no green: [`Record::Uuid`], the
 //! repository named by its stream's UUID record (`svn_fs_set_uuid`, `load-fs-vtable.c` `uuid_record`); and
 //! [`Record::RevisionProperties`], a revision's properties set whole (`svn_fs_change_rev_prop2` for each difference),
-//! as an import sets revision 0's to its stream's (`close_revision`).
+//! as an import sets revision 0's to its stream's (`close_revision`); and [`Record::Locks`], the lock entries a lock verb
+//! made (`lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2).
 //!
 //! **The encoding**, little-endian as a green's chain entry and A-662's git record are: the magic, the version and a
 //! kind byte; a creation's UUID, its 36 bytes, and its date; a revision's head, its transaction, its rows, its
 //! properties, its contents and its lock entries, each list as a count and its items, each string as a length and its
 //! bytes, each optional part after a byte that marks it present or absent; a UUID's 36 bytes; a revision's number and
-//! its properties, written as a revision's are. A row is its path, its action, its kind,
+//! its properties, written as a revision's are; a lock verb's lock entries, a count and each (A-693 part 2). A row is its path, its action, its kind,
 //! its copy source, its text (identity, MD5, SHA-1, size), its property list (none, empty, or held by identity with its
 //! mergeinfo mark) and its mergeinfo mark. A lock entry is a tag, then a set lock whole (path, token, owner, comment,
 //! the DAV comment's mark, creation and expiry) or a removal (path, token).
@@ -60,6 +61,8 @@ const UUID_SET: u8 = 2;
 
 /// Format: the kind byte of a revision's properties set whole (A-652 part 3).
 const PROPERTIES_SET: u8 = 3;
+/// Format: the kind byte of lock entries made by a lock verb alone, no revision with them (A-693 part 2).
+const LOCKS_SET: u8 = 4;
 
 /// Format: the byte that marks an optional part absent, and a mark unset.
 const ABSENT: u8 = 0;
@@ -136,6 +139,9 @@ pub enum Record {
     /// Its properties, whole.
     properties: Properties,
   },
+  /// Lock entries a lock verb made, in the order they are applied, no revision with them (`svn_fs_lock_many`,
+  /// `svn_fs_unlock_many` through `lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2).
+  Locks(Vec<LockEntry>),
 }
 
 /// Why bytes were refused as a record. A refused record replays nothing.
@@ -196,6 +202,14 @@ impl Record {
         put_properties(&mut out, properties);
         out
       }
+      Self::Locks(entries) => {
+        let mut out = header(LOCKS_SET);
+        put_count(&mut out, entries.len());
+        for entry in entries {
+          put_lock_entry(&mut out, entry);
+        }
+        out
+      }
     }
   }
 
@@ -228,6 +242,7 @@ impl Record {
         revision: reader.long()?,
         properties: properties(&mut reader)?,
       },
+      LOCKS_SET => Self::Locks(lock_entries(&mut reader)?),
       byte => return Err(RecordRefused::Tag { byte }),
     };
     if !reader.rest.is_empty() {
@@ -474,11 +489,7 @@ fn revision(reader: &mut Reader<'_>) -> Result<Revision, RecordRefused> {
   }
   let properties = properties(reader)?;
   let contents = contents(reader)?;
-  let entries = reader.count(LOCK_ENTRY_FEWEST)?;
-  let mut lock_entries = Vec::with_capacity(entries);
-  for _ in 0..entries {
-    lock_entries.push(lock_entry(reader)?);
-  }
+  let lock_entries = lock_entries(reader)?;
   Ok(Revision {
     head,
     record: RevisionRecord {
@@ -581,6 +592,16 @@ fn contents(reader: &mut Reader<'_>) -> Result<BTreeMap<ContentIdentity, Vec<u8>
     contents.insert(identity, bytes);
   }
   Ok(contents)
+}
+
+/// A list of lock entries: its count, then each.
+fn lock_entries(reader: &mut Reader<'_>) -> Result<Vec<LockEntry>, RecordRefused> {
+  let entries = reader.count(LOCK_ENTRY_FEWEST)?;
+  let mut lock_entries = Vec::with_capacity(entries);
+  for _ in 0..entries {
+    lock_entries.push(lock_entry(reader)?);
+  }
+  Ok(lock_entries)
 }
 
 /// A lock entry.

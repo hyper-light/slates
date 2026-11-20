@@ -15307,7 +15307,14 @@ and export by landing).
 > **Status (2026-11-19, A-693 part 1: ra_svn's lock reads).** `get-lock` and `get-locks` are answered from the
 > repository's lock table at the call's instant (`slates_svn::reads::answer_lock_read`, `serve.c` 3366-3446): a held
 > lock as `write_lock` writes it, an expired one and one on an unreadable path left out, a depth `get_locks` refuses in
-> its words. Owed: `lock`, `lock-many`, `unlock`, `unlock-many` through the owner's step.
+> its words. Part 2 (2026-11-19): `lock`, `lock-many`, `unlock` and `unlock-many` judged against the table
+> (`slates_svn::serve::locks`), their entries landed through the owner's step as a `Record::Locks`, then answered as
+> `svnserve` answers them, over `svn://` and `svn+ssh://`. Owed: the pre-lock and post-lock hooks.
+>
+> **Status (2026-11-19, A-702 part 1).** `change-rev-prop` and `change-rev-prop2` are answered as `svnserve` answers a
+> repository with no pre-revprop-change hook ("Repository has not been enabled to accept revision propchanges",
+> 165006), after its checks in its order (`slates_svn::serve::revprops`). The change itself waits on ra_svn running a
+> repository's hooks.
 >
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
@@ -15931,6 +15938,84 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
+
+#### 4.17.5 Many repositories on one server, balanced by learned usage (A-724)
+
+> **Status (2026-11-20, A-724 piece 1).** Designed below; piece 1 built: each repository's usage counted on its owner
+> shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
+> order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
+> dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3; its room built, below), the cold trigger (4), intake off the owner
+> shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
+> amends §4.10's content placement), and the many-repository load proof (7).
+
+> **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
+> the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
+> push. It replaces A-704's `git_push::push_room`. A repository alone in taking new room gets all the shard can admit
+> (the fast path, counted `vcs_share.fast`); while others have intakes under way (each push counted live by a guard
+> until it drops), the contested room (what the shard can admit plus what those repositories hold) is divided by
+> `share::divide`, the asker claiming all of it and each other claiming what it holds plus its answered intakes' mean
+> bytes for each intake under way, and the asker's room is its grant less what it holds (`vcs_share.narrowed` when it
+> binds). Owed: A-722's reservation checking this room and its typed refusal carrying the bound, with git's, Mercurial's
+> and Subversion's words for a share (the seam proposed to w-git); Mercurial's and Subversion's intakes counted live;
+> backpressure before refusal; a fetch's room as a claim of its own.
+
+**Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
+several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
+agents and clients actually do (Ada, 2026-11-20). No repository has a fixed share: every share is a stated formula
+over measured inputs, logged with them (D-11), and learned online (§4.17.1 "Every tunable is learned online").
+
+**What a repository costs, counted** (piece 1). Each owner shard keeps one row a repository it owns, touched only by its
+own steps (no lock, no atomic on the path): for its intakes (pushes, commits) and its fetches (fetches, clones), the
+works begun and answered, the shard steps they took, the shard clock's time those steps ran and the bytes the clients
+sent; its first and latest activity; and its principals in a Space-Saving summary [A: Metwally et al., ICDT 2005] of
+`clients_per_shard` slots, so any principal with more than one client seat's share of the repository's work is named
+with bounded error, at bounded cost. A row is dropped with its repository. Its bytes are A-662's and A-714's charges,
+read where they are kept.
+
+**Hot, warm and cold.** A repository's bytes are *hot* (its heads' trees, its works under way, its live intakes),
+*warm* (recent history, as much as its memory share holds) or *cold* (the rest, and every index that can be rebuilt).
+RAM only (R1): there is no disk tier, so cold means compressed, held only on peers, or both.
+
+**Learned demand** (piece 2). For each repository and each principal: decayed rates of works and bytes, their decay set
+by the repository's own measured inter-arrival times; and its working set as a miss-ratio curve built by spatially
+sampled reuse distances [A: Waldspurger et al., "Efficient MRC Construction with SHARDS", FAST 2015], its sampling rate
+derived from the row's memory. A first value is the first work's own size at the rate this machine was just measured
+to do that work, never a literal.
+
+**Shares** (piece 2). Memory: the shard's admittable room (§4.2) split by marginal utility over the repositories' curves
+[A: Qureshi and Patt, "Utility-Based Cache Partitioning", MICRO 2006; A: Beckmann and Sanchez, "Talus", HPCA 2015],
+above a floor of the room over the repositories served now (A-188's share), so a small repository always fits. CPU:
+the shard's step quanta (§4.3) by weighted fair queuing among repositories with runnable work, memory and CPU together
+by dominant-resource fairness [A: Ghodsi et al., NSDI 2011], each weight its learned demand capped at its measured use.
+Every share is work-conserving: room a repository leaves unused is lent, and taken back first from the borrower's own
+cold bytes. Shares are published to the shard's siblings as an immutable snapshot at the learning cadence (D-8), never
+asked for per request.
+
+**Admission and backpressure** (piece 3). A work is admitted against its repository's share, else the room nobody's
+share is using. A work within the floor passes on one counter check (R9's fast path, counted). Past it, the reader is
+paused (the TCP window, the ring's credit) while the projected drain fits the client's deadline; past that, a typed,
+retryable `ShareExceeded { repository, asked, share }` in each tool's words (git's `receive.maxInputSize` line and
+`ERR`, Mercurial's `pusherr`, Subversion's error code). Never an out-of-memory end, and a hot repository never takes
+another's floor.
+
+**The cold trigger** (piece 4). §4.11's cost model, with `value_of_byte` raised by the repository's overrun of its memory
+share, chooses in cost order: drop derived values and caches (pack fragments, reach sets, A-718's deltas: rebuild cost
+times predicted reads against their bytes); compress cold content; hold cold content only at its f+1 holders (§4.10),
+fetched by identity when read.
+
+**Giant repositories** (pieces 5, 6). Load never moves ownership (§4.10). The owner keeps the repository's register (its
+refs and the ordered landing, §4.17.1 intake rule 4), its indexes' tails and fences and its hot set; everything else
+spreads. An intake's decoding, hashing and checks run on the shard its connection arrived at, and only its landing on
+the owner, so one hot repository uses every core. Content is homed by its identity: rendezvous over the content id
+across a node's shards (N=1) and across the region's members (a fleet), one rule (R8). Index tables are content
+(A-581), so a monorepo's cold runs live where their identities home. Nothing is looked up in a catalog (§2 ban 12):
+an id routes to its home.
+
+**Laptop degenerate.** One node, f = 0: the same rows, the same formulas; with one repository its share is the whole room.
+
+**Proof** (piece 7). w-perf's `push_load.py` over many repositories of Zipf-distributed sizes and activity, toy to
+giant: per class p50 and p99 latency, resident memory and refusals per repository; no starvation means a small
+repository's p99 stays within a derived bound of its p99 alone.
 
 ---
 
@@ -54352,3 +54437,87 @@ Applied in the same change to:
   (a push's, a green's first submit's, one past a copy), whose version's made commit needs the trees in the version's
   own transaction; a whole map's release (`ContentStore::release`'s cascade) a unit at a time; recovery's timing over a
   large repository (main's).
+
+### A-724 — Many repositories on one server, balanced by learned usage; piece 1: each repository's usage counted on its owner shard (2026-11-20, w-balance; Ada's goal of 2026-11-20; §4.17.5, §4.17.1 "Every tunable is learned online", D-11, D-28)
+- **Why.** One server must serve toy repositories and several Google- or Meta-size monorepos at once, dividing memory,
+  CPU, admission and placement by what agents and clients do, never by fixed shares. w-perf measured 100 concurrent
+  pushes into 100 repositories holding 28 GB, nothing dividing it (release 7b46fbdcd, Mac Studio).
+- **Design.** §4.17.5, new: costs hot, warm and cold; learned demand (decayed rates, SHARDS miss-ratio curves); shares
+  by utility-based partitioning and dominant-resource fairness, work-conserving; admission by share with backpressure
+  and a typed refusal; §4.11's cost model as the cold trigger; a giant repository's intake and content spread by
+  identity while its ownership stays. Evidence: Metwally ICDT 2005, Waldspurger FAST 2015, Qureshi MICRO 2006, Beckmann
+  HPCA 2015, Ghodsi NSDI 2011 (all A).
+- **Change (piece 1).** `slates_vcs::usage`: a `Ledger` of one `Usage` row a repository (intakes and fetches begun,
+  answered, steps, step time, bytes in; first and latest activity; principals in a Space-Saving summary of `k` slots).
+  The server keeps one on each shard (`ShardState::vcs_usage`, `k` = `clients_per_shard`); git's `ReceivePack` counts
+  a push as it starts, each input, end and answer step with its time, and the push answered; `vcs_store::upload::lend_on`
+  counts a fetch request and every lent step; `vcs_store::free` drops the row.
+- **Tests.** `slates-vcs` `usage::tests` (an oracle over 300 generated histories: rows equal an exact model, rows
+  dropped with their repository, and the summary within Space-Saving's bounds, every principal past `begun / k` named;
+  a heavy principal named exactly; rows apart); `slates-server`
+  `git_push::tests::t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row` (stock git's fixture pushes counted
+  on the pushed repository's row, bytes exact, its owner named for each; an idle repository has none).
+- **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
+- **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
+  Subversion's intakes and reads counted; the rows in `slates status`.
+- **Piece 2, the division (2026-11-20).** `slates_vcs::share::divide`: a shard's capacity of each resource divided among
+  repositories' claims (a measured demand vector and a weight) by weighted DRF with demands as caps [A: Ghodsi et al.,
+  NSDI 2011]; each pass finds exactly the largest level no resource overflows by walking the claims' breakpoints
+  `δ_i / w_i`, settles the claims that are whole or use a full resource, and goes on (at most one pass a resource).
+  Tests: `share::tests` (an oracle over 500 generated divisions of two resources among up to twelve weighted claims
+  against a serial bisection reference, with capacity, cap, work-conservation and the paper's sharing incentive held;
+  the paper's own 9-CPU, 18-GB example; a monorepo beside a toy; degenerate claims never not-a-number). The oracle's
+  first runs found a resource with no room left that the remaining claims never use stopping them at level zero, fixed.
+  Owed: the demands read from the usage rows and the weights learned (piece 2's other half), feeding admission (3).
+- **Piece 3a, one room (2026-11-20).** `crate::vcs_share::room` replaces `git_push::push_room` at every caller (git's
+  push, git's fetch over HTTP and SSH through `StoreLender::room`, which now names the repository, and Mercurial's
+  `HgStores::push_room`); a `vcs_share::Live` guard counts a push live from `ReceivePack::start` until it drops. Tests:
+  `slates-server` `vcs_share::tests` (alone: all the shard admits by the fast path; beside a monorepo with no history:
+  an equal half, bound by the share; once the monorepo's intakes are known small: all but that; a real push live from
+  its start to its drop), with `git_push::` and `vcs_store::upload::` 16 of 16 and `vcs_http::git:: vcs_http::hg
+  vcs_ssh::` 84 of 85; the one failure, `vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it`
+  ("a step that waits"), fails alike on main b0655e8a3 and is reported.
+
+### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
+
+Applied in the same change to: `crates/git` (`receive::Session::take_pack`: the pack's bytes kept as they arrive,
+charged to the session's admission); `crates/server` (`vcs_store/record.rs`, version 2; `vcs_store.rs`'s replay of a
+version-2 record through git's own reader, `StoreBases`, `ReplayRefused::Pack`, `GitPush::keep_pack`; `slates_git::pack::of_whole`; `git_push.rs`'s
+`prepare`); §4.17.1's status; GAPS (§4.17); BENCHMARKS.md's concurrent-push entry, which measured the cost.
+
+- **The end state** (main's convergence plan, approved 2026-11-20). One copy of every file byte, in the greens' files,
+  deduplicated by identity (§4.11; §4.17.1 row "Objects"); each tool's own objects an index by the tool's id over
+  content identities, small; a push a work whose post-state carries what it brings, judged by §4.16's verdict, durable
+  when its merge record commits (§4.17 "Role"); fragments and packs derived and charged to the shard. A repository then
+  costs about one to two times its compressed pack. Today it costs far more: one 3.43 MB push of git/git cut at v1.0.0
+  kept 229 MiB (the store's inflated objects 69.1 MiB, the register entry's copy 63.5 MiB, the arena grown for them
+  63.7 MiB), and a Subversion text was held four times (BENCHMARKS.md).
+- **The push bound.** A push streams: per connection the server holds the window it is decoding (one ring region's
+  worth, derived) and a delta's base, and the rest of the pack waits in the client's socket, so TCP's flow control is
+  the backpressure, never the server's memory. Admission charges each push's window and post-state to its owner
+  shard's budget, and a push past it is refused typed before its body is read (git's `unpacker error`, HTTP 503 with a
+  retry), never by running out of memory. A work is cheap to make (R9), so ten thousand concurrent pushes cost ten
+  thousand windows plus what they bring, once.
+- **The steps.** S1 (w-perf, this entry): a register entry holds no inflated copy. S2 (w-perf): the content history's
+  latest value names the file's block, so a green holds a changed file once; A-716's identity table stays as the
+  green's identity -> block index, and its hold by bytes goes once S3 and S5 land bytes as work operations. S3 (w-git,
+  A-722): git's streaming intake lands blobs as the push work's file operations and keeps the store as an index with
+  the client's deltas. S4 (w-svn and w-perf, A-716 slices 2 and 3): Subversion's records name texts by identity. S5
+  (w-hg): Mercurial's filelog texts as green files by identity, its changelogs and manifests as deltas in its index.
+- **What remains duplicated, said plainly.** A head version's blobs exist raw in the green (what a checkout mounts) and
+  compressed in the recorded pack (what a recovery replays): the hot and cold copies §4.11's cost model would choose
+  between, kept until S3's index reads the pack in place.
+- **S1, built.** A git push's record (version 2) names each object the repository lacked by its type, content identity
+  and length (41 bytes), then holds the push's pack as the client sent it, compressed and with its deltas; only the
+  first append of a push that brings objects carries it. The receive session keeps the pack's bytes as they arrive,
+  charged to its admission (`Session::take_pack`). A replay reads the objects back through git's own reader, a
+  reference delta's base from the pack or the store, admits each as a live push does, and refuses a pack whose objects
+  are not the names, in order (`Diverged`), or one git's reader refuses (`Pack`). Objects no client sent as a pack (the
+  server's own commits, A-664 part 3) are recorded as a pack of whole objects, deflated
+  (`slates_git::pack::of_whole`), so every record is a pack and a replay has one path. Version-1 records, each object inflated, are still read: a segment
+  holds entries written by them. For the measured push the entry goes from 63.5 MiB to about the pack's 3.4 MB.
+- **Owed.** A pack past an entry's bound recorded in bounded parts across entries (git/git's whole pack is 607 MiB
+  against the Studio's 746,962,928-byte segment region, the wall a 5,000-revision Subversion import met at revision
+  3,540); the objects the repository already holds left out of the recorded pack; the push_load re-run at N = 1, 10 and
+  100 once S1 and S3 are in, against today's 229 MiB a push.
+

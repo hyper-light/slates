@@ -62,9 +62,10 @@ impl Oid {
       return None;
     }
     let mut bytes = [0u8; OID_LEN];
-    for (slot, pair) in bytes.iter_mut().zip(hex.chunks_exact(2)) {
-      let high = lower_hex_value(*pair.first()?)?;
-      let low = lower_hex_value(*pair.get(1)?)?;
+    for (slot, pair) in bytes.iter_mut().zip(hex.as_chunks::<2>().0) {
+      let [high, low] = *pair;
+      let high = lower_hex_value(high)?;
+      let low = lower_hex_value(low)?;
       *slot = high.checked_shl(HEX_DIGIT_BITS)? | low;
     }
     Some(Oid(bytes))
@@ -457,6 +458,7 @@ fn is_header_name(name: &str) -> bool {
 /// Whether `value` is an HTTP field value a client can send as it is: no control character but a tab, so no line
 /// ending can split it into a second field (RFC 9110 §5.5).
 fn is_header_value(value: &str) -> bool {
+  // Format: DEL, 0x7f, is a control character, outside `field-vchar` (RFC 9110 §5.5).
   value
     .bytes()
     .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))

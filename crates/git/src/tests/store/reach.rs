@@ -45,8 +45,13 @@ fn read_to_end(
       Err(refused) => break Err(refused),
     }
   };
-  fill.release(store).unwrap();
+  released(fill.release(store));
   answer
+}
+
+/// Holds a fill's release to succeeding, as a test's store always lets one go: a refusal is the test's own failure.
+fn released<E: std::fmt::Debug>(release: Result<(), E>) {
+  release.unwrap();
 }
 
 /// What the store's walks have met: objects walked, and objects met already reached.
