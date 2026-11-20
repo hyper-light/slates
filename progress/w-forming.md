@@ -51,6 +51,17 @@
 - rp3 so far: run 3 (formed, replacement start wait), run 9 (start wait of an initial node BEFORE forming) -- both the start-wait test bug now fixed on main.
 - rp3 DONE 52/55 (fails 3, 9, 36 = old 30 s start wait). Formed+settled: sw48c 48/48 + rp2 40/40 + rp3 54/55 = 142/143; the one exception (rp3 run 9) never reached forming (initial daemon start wait). rp4: 5 runs on main cf4e9b703 (with b25a5b7a6) to complete 143.
 - DONE forming evidence: rp4 5/5; combined 147/148 formed+settled (rp3 run 9 never reached forming); GAPS landed 897fda7bd (verified). Told main.
+- main's new order (~14:00 PST): (1) 2,933 ms poll: bound it; (2) derive FLEET_WAIT; (3) A-740 helper labels; run 7 -> GAPS not reproduced.
+  LANDED: (3) cfca7dd22 (spawn_detached #[track_caller]; task_within/task_in_shard_time #[track_caller] + rt futures::spawn_at; tests red 7034/1092);
+  run-7 GAPS a1439bcb1.
+  (2) IN PROGRESS, uncommitted in ~/slates-work/w-forming-repro: FleetWait (wall window FLEET_WAIT, then extend while a node
+  is runnable for the CPU the busiest node has not run; roots in thread_local FLEET_ROOTS; runnable via pti_numrunning /
+  /proc task R), 14 deadline sites + 10 elapsed sites + FrozenWindow + wait_in_fleet_time_or_kill converted; unit test
+  ok. PROBLEM: fw1 run 1 passed in 519 s (normal ~60-90): waits expected to run out in a passing run now extend. Added an
+  extension log (site); fw2 (1 run) running to name them, then make those sites keep the plain window.
+  (1) held-poll marker (watchdog probe) fired 7x in pr4: verbs.rs:3299 forwarded request poll 1 (255-515 ms CPU),
+  live_ship.rs:2430 whole build poll 2 (255-367 ms), serve loop. Sampler too slow to catch. Now timing whole-build parts
+  (body_keys / one piece seal / append_build) in the probe build; pr4 continues with it.
 - Queue after sw48c: run-7 stall chase; then run-25 spin (main 2026-11-20: name the unsliced task, fix failing-test
   first or hand main its location). Tool: ~/.cache/w-forming-scripts/spin-sampler.sh <runs-dir> samples every chaos
   daemon on a >=300 ms poll line; use with repro loops only, never during evidence runs.
