@@ -12300,6 +12300,12 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
 > shard's room and quantum, the stream compressed as it is made; the red passes. Owed: SSH (piece 2b), the hold on the
 > generation a fetch began on (rule 4), the stream clone (piece 3), git's upload-pack (w-git).
+> **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
+> fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
+> none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
+> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). Owed for git: the walk's own
+> sets (piece 2: negotiation and plan a step at a time, `upload::Answering`), the server driving it a turn at a time
+> within a request's room (piece 3, reverting A-713's shard room).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids

@@ -106,7 +106,7 @@ impl PackSource for WholeObjects<'_> {
 /// Every object `plan` puts in the pack, by position: each run's versions' objects its filter admits, and each single
 /// object.
 pub(super) fn positions(graph: &StoreGraph<'_>, plan: &PackPlan<'_>) -> BTreeSet<u64> {
-  let mut positions: BTreeSet<u64> = plan.objects.iter().copied().collect();
+  let mut positions: BTreeSet<u64> = plan.objects.iter().collect();
   for run in plan.runs {
     for version in run.after + 1..=run.through {
       positions.extend(graph.brought(run.green, version).filter(|node| {

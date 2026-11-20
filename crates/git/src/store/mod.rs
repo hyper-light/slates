@@ -84,7 +84,7 @@ pub(crate) mod fragment;
 pub mod hook_view;
 pub mod learn;
 mod naming;
-mod positions;
+use crate::positions;
 mod push;
 mod repository;
 pub mod rows;
