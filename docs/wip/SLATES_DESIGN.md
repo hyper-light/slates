@@ -15190,6 +15190,11 @@ and export by landing).
 > once a mechanism exists; `svn_uri_canonicalize` before the lookup (a stock client's URL
 > is already canonical); the tunnel's own move to the owner (A-688's site, which finds repositories on its shard
 > alone).
+>
+> **Status (2026-11-19, A-693 part 1: ra_svn's lock reads).** `get-lock` and `get-locks` are answered from the
+> repository's lock table at the call's instant (`slates_svn::reads::answer_lock_read`, `serve.c` 3366-3446): a held
+> lock as `write_lock` writes it, an expired one and one on an unreadable path left out, a depth `get_locks` refuses in
+> its words. Owed: `lock`, `lock-many`, `unlock`, `unlock-many` through the owner's step.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -53648,6 +53653,8 @@ alone), GAPS (the §4.17.3 entry).
   `t_a664_p3_an_executable_file_moved_is_100755_in_its_commit` written for this piece, failing at its first submit).
   With the `chmod` and the `mv` in two versions the move lands and drops the mode (part 3's first piece's finding), so
   the commit lists `x/a` `100644`. Both follow from the green keeping a mode at its path (A-618).
+  **Status (2026-11-20): FIXED** -- `increment::compose_modes` moves a file's mode with its `Rename` (a mode set before it,
+  or the base file's own), declared at the new path; docs/bugs/2026-11-20-a-files-mode-was-lost-when-it-was-renamed.md.
 - **Found by reading, reported to main and not chased.** `verbs::reconcile_unpublished_effects` rebuilds no
   repository's store when a verb's publication fails at `Db::commit`, so a push or a made commit inside that verb's
   transaction leaves the store ahead of the rolled-back log, as the green's engine is left ahead of it; a branch
