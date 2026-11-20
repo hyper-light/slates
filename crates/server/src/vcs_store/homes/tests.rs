@@ -532,3 +532,62 @@ fn a_committed_publication_publishes_the_tickets_of_windows_kept_before_it() {
     );
   });
 }
+
+/// A-724 piece 8c (main's ruling (ii): a record names its names only once they are durable at `f + 1` in the region).
+/// Do: on a lone node (its own region, so it is the object's one home), home an object in the region with no publication
+/// within a short budget, then again while a publication commits on its home shard. Expect: the first refused
+/// `Unanswered` (never durable, so no record may name it); the second the object's BLAKE3, held for the region at its
+/// home shard and counted.
+#[test]
+fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
+  use super::{HOMED_IN_REGION, home_in_region, publication_committed, region_held_here};
+  let daemon = crate::daemon::audit_daemon_of(2);
+  let (sent, answered) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let origin = state.shard;
+    let shards = state.shards.clone();
+    let task = slates_rt::futures::spawn(async move {
+      let budget = crate::daemon::LIVENESS_BUDGET_NS;
+      let mut outcome: Vec<String> = Vec::new();
+      let bytes = window(7);
+      let identity = ContentId::of(&bytes);
+      let home = home_of(&shards, &identity).unwrap();
+      let short = slates_cluster::CommitBudget::hard(budget / 50, (budget / 500).max(1));
+      if home_in_region(origin, &shards, bytes.clone(), short)
+        .await
+        .is_ok()
+      {
+        outcome.push("homed before any publication".to_owned());
+      }
+      let publisher = slates_rt::futures::spawn(async move {
+        let _ =
+          crate::xshard::call_in_shard_time(origin, home, |_| publication_committed(), budget)
+            .await;
+      })
+      .unwrap();
+      slates_rt::futures::detach(publisher).unwrap();
+      let full = slates_cluster::CommitBudget::hard(budget, (budget / 100).max(1));
+      match home_in_region(origin, &shards, bytes, full).await {
+        Ok(homed) if homed == identity => {}
+        other => outcome.push(format!("not homed after the publication: {other:?}")),
+      }
+      let held = crate::xshard::call_in_shard_time(origin, home, |_| region_held_here(), budget)
+        .await
+        .unwrap_or_default();
+      if !held.contains(&identity) {
+        outcome.push("not held for the region at its home".to_owned());
+      }
+      let counted =
+        crate::state::with_state(|state| state.refusals.get(HOMED_IN_REGION).copied().unwrap_or(0))
+          .unwrap_or(0);
+      if counted == 0 {
+        outcome.push("not counted".to_owned());
+      }
+      let _ = sent.send(outcome);
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let outcome = answered.recv().unwrap();
+  assert!(outcome.is_empty(), "{outcome:?}");
+}
