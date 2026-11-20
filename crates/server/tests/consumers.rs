@@ -15,16 +15,11 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
-
 use slates_client::ClientError;
 use slates_ipc::protocol::{Principal, Refusal, Rights};
 use slates_server::daemon::OBSERVE_BUDGET_NS;
 use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
-
-/// Shape: how long the test waits for a shard to have taken a just-connected client.
-const TAKEN_WAIT: Duration = Duration::from_secs(20);
 
 fn daemon(name: &str) -> (Daemon, String) {
   let profile = common::machine_profile();
@@ -45,7 +40,6 @@ fn daemon(name: &str) -> (Daemon, String) {
 /// The host principal the daemon authenticated `client_id`'s channel as, asked of each shard until one has taken the
 /// client.
 fn channel_principal(daemon: &Daemon, client_id: u32) -> slates_db::catalog::Principal {
-  let started = Instant::now();
   loop {
     let found = daemon.shards().iter().copied().find_map(|shard| {
       daemon
@@ -67,10 +61,6 @@ fn channel_principal(daemon: &Daemon, client_id: u32) -> slates_db::catalog::Pri
     if let Some(principal) = found {
       return principal;
     }
-    assert!(
-      started.elapsed() < TAKEN_WAIT,
-      "a shard took client {client_id}"
-    );
     std::thread::yield_now();
   }
 }

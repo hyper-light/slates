@@ -54,7 +54,14 @@ const SLEEP_REFUSED: &str = "runtime.sleep_refused";
 /// `daemon.alive`): the liveness window over the election margin, `W / ELECTION_MARGIN` (A-129 item 1, the leader beats
 /// ten times per election timeout, and item 2, the death-confirmation window is the election timeout; A-359), so nine
 /// beats fit inside a window. 100 ms.
-pub const HEARTBEAT_NS: u64 = LIVENESS_BUDGET_NS / slates_cluster::timing::ELECTION_MARGIN;
+pub const HEARTBEAT_NS: u64 = heartbeat_of(LIVENESS_BUDGET_NS);
+
+/// The heartbeat's rule over a liveness window of `liveness_budget_ns`: `W / ELECTION_MARGIN`, so nine beats fit inside
+/// the window ([`HEARTBEAT_NS`] at the daemon's own window). Shared by every beat that shows a peer it is alive within
+/// that peer's patience: the anchor's, and a quiet MCP listen stream's keep-alive (`slates_mcp::http`).
+pub const fn heartbeat_of(liveness_budget_ns: u64) -> u64 {
+  liveness_budget_ns / slates_cluster::timing::ELECTION_MARGIN
+}
 /// Derived: the liveness window `W` (A-228, A-359): how long a daemon, a shard or a peer may show no progress before it
 /// is judged stuck or silent and its recovery begins. It is the recovery budget `T`
 /// (`slates_db::replay::RECOVERY_BUDGET_NS`, ratified, GAPS §5): the verdict starts a recovery that costs `T`, so

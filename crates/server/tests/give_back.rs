@@ -30,8 +30,6 @@ const ROUNDS: u8 = 2;
 const AT_LEAST_PERCENT: u64 = 90;
 /// Shape: a body's repeating unit, a prime, so no two chunks of a file start alike.
 const PATTERN_BYTES: usize = 4093;
-/// Shape: how long a client retries the rendezvous while a daemon starts, as `crates/server/tests/recovery.rs` does.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: how long the idle purge may take to reach the file's pages on a loaded runner: many sweep passes (`slates_server::idle_sweep`).
 const PURGE_WAIT: Duration = Duration::from_secs(120);
 /// Shape: the first part of a wait reported on its own. Windows trims a working set unasked: with every discard refused,
@@ -46,18 +44,9 @@ fn connect(instance: &str) -> Client {
     slates_db::replay::RECOVERY_BUDGET_NS,
   )
   .get();
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::hint::spin_loop();
-      }
-      Err(e) => panic!("{e}"),
-    }
-  }
+  // The claim waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait
+  // (until 2026-11-20 a five-second retry, `START_WAIT`).
+  Client::connect(instance, deadlines).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn working_set() -> u64 {
