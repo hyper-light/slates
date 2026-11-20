@@ -16,9 +16,10 @@
   answer_hook + land async; svn Pending::lock_tokens). Tests vcs_svn 7/7 (+2), svn_hooks/vcs_hooks/hook_driver/vcs_svn
   58/58, svn commit::/serve:: 90/90. Test hook scripts are warmed once (macOS assesses a new executable 0.16-0.29 s at
   its first exec -- NOT a driver latency; an earlier "finding" withdrawn).
-  NEXT part 2: svn:// lock hooks: pre-lock per path (token from stdout), post-lock once; pre-unlock per path,
-  post-unlock once -- split serve/locks.rs lock_verb/locks_landed so the server can run hooks between judging and
-  answering. Then part 3: svn+ssh:// (vcs_ssh/svn.rs). Worktree ~/slates-work/w-reaper-a730 (branch w-reaper-a730).
+  A-730 PART 2 LANDED: main 25494f2 (merged 8096c3b): svn:// lock/unlock hooks; svn serve lock verb = 4 calls
+  (lock_verb -> LockHookCall, lock_judged(PreHooked), locks_landed -> post call, locks_finished). vcs_svn 10/10.
+  NEXT part 3: svn+ssh:// (vcs_ssh/svn.rs: answer_hook refuses configured; lock_verb passes Ok(None)); needs async
+  hook runs in the tunnel + its client-gone signal. Worktree ~/slates-work/w-reaper-a730 (branch w-reaper-a730).
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
