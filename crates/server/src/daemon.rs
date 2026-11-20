@@ -3139,6 +3139,30 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
   }
 
+  /// Every floor `green`'s owner partition keeps for its works, as (work, base) (A-247; A-697: a holder's works among
+  /// them, whose ids name the holder), for a test. The typed refusal when the shard could not be observed.
+  pub fn work_floors_of(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<Vec<(slates_ipc::protocol::VolumeId, u64)>, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db
+        .partition()
+        .work_floors()
+        .filter(|floor| floor.green.bytes == green.bytes)
+        .map(|floor| {
+          (
+            slates_ipc::protocol::VolumeId {
+              bytes: floor.work.bytes,
+            },
+            floor.base,
+          )
+        })
+        .collect()
+    })
+  }
+
   /// Test support (A-697, until its last piece puts the rule in its place; never reachable from the wire): with `on`,
   /// every shard of this node serves the works of greens another node owns (`work_home::green_elsewhere`): a creation is
   /// made on its client's partition and admitted by the green's owner over the fleet, and the work's base reads are
@@ -6169,12 +6193,15 @@ async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
       origin,
       shard.0,
       |s| {
-        let names: Vec<String> = s
-          .db
-          .partition()
-          .pending_creations()
-          .map(|pending| pending.name.clone())
-          .collect();
+        let pendings: Vec<slates_db::catalog::PendingCreationRecord> =
+          s.db.partition().pending_creations().cloned().collect();
+        let mut names = Vec::new();
+        for pending in pendings {
+          // A holder's creation is released at its green's owner before it is dropped (A-697 part e2).
+          if !crate::work_home::hold_for_release(s, &pending) {
+            names.push(pending.name);
+          }
+        }
         for name in names {
           s.db.begin();
           let settled = crate::verbs::settle_creation(s, &name);

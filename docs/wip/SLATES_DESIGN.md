@@ -12358,9 +12358,19 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > the answer is lent from it (`lend_held`), and the last hold's release gives the fork back. By use, a push and a new tag
 > landing after a fetch's first step: the held answer's pack is the start generation's objects in its order (each by
 > id, so byte for byte; the zlib level each is deflated at is the stream's own timed choice, §4.11). Before it, the
-> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. Owed for git: protocol v0's fetch
-> in turns, `begin`'s `ready` and cut and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a
-> run); the live `git clone` rows of the matrix (main's).
+> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. **`begin`'s walks in turns BUILT
+> (same day):** `negotiation::begin` does only what the request names (its wants, haves and shallow lines, the one-round
+> runs, `deepen-not`'s names) and answers at once only where no search could make the server ready (`wait-for-done`,
+> no common have); `ready`'s search (`ready::Readying`: a parent of the path's top a unit, its place an index into the
+> parents), the cut (`shallow::Cutting`: a commit of `deepen`'s breadth-first walk, a ref's tip of `deepen-relative`'s
+> search, a commit painted or judged of `deepen-since`/`deepen-not`'s) and `include-tag` (a run's version joined to what
+> the runs carry as runs of positions, `Graph::brought_set`; then a tag a unit, `Graph::tags_from` keeping its place by
+> the ref's index) are `Negotiating::step`'s, before the choice. The sections before the pack wait for them: the answer
+> writes nothing until they are decided (`upload::fetch::Before`), the acknowledgments alone when not ready, a refusal
+> before them answered as one refused whole. By test: over 2,000 commits and 500 tags, `begin` read 3,499 parents of
+> the graph on main (the whole search and cut), at most 4 now, and each step at most 2, the answer the one made whole.
+> Owed for git: protocol v0's fetch in turns, a plan of scattered positions (16 bytes a run); the live `git clone` rows
+> of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
@@ -56399,9 +56409,8 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   install so (the work answered `Unpublished` for good; the test's first run, by use).
 - **Counters.** `merge.work.replay_awaits_replica`, `merge.work.replayed_on_replica` (the test's non-vacuity count),
   `merge.work.replay_ask_unhanded`.
-- **Owed.** A creation a restart caught waiting for the owner's admission is dropped here (`drop_pending_creations`),
-  and the floor the owner may have recorded for it stays there, since the pending record does not name the green: it
-  keeps more history, not less. Recovering a holder's pending submit is the existing path: the work's next verb runs it
+- **Owed (closed the same day, part e2 below).** A creation a restart caught waiting for the owner's admission was
+  dropped here (`drop_pending_creations`), and the floor the owner may have recorded for it stayed there. Recovering a holder's pending submit is the existing path: the work's next verb runs it
   again under its key, and the owner's completion record answers it.
 - **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
   a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_restart` (three nodes at `f = 1` keeping
@@ -56495,3 +56504,31 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   content's bytes over a page in turns under the cut quantum (48 for 3 MiB), red before (8 turns); `--test fleet whole`
   5/5, `--test fleet live` 20/20, `--lib live_ship::` 24/24.
 - **Applied in the same change to** A-377's doc lines in `live_ship.rs`, GAPS (the one-turn walks entry), amendments.tsv.
+
+### A-697 part e2 — A holder creation a restart caught waiting for its admission releases the owner's floor before it is dropped (2026-11-20, w-shared for UI goal 93; main's order: performance gaps up front, held history the same waste as A-742's)
+Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's step two), `crates/db/src/catalog.rs`
+(`PendingCreationRecord::green`), `crates/db/tests/alias.rs`, `crates/server/src/work_home.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/verbs.rs`, `crates/server/tests/fleet.rs`.
+- **What was there.** A restart drops every creation it catches waiting for its green's owner (`drop_pending_creations`):
+  its name and id go back, and the client's resend makes the work afresh. For a holder's creation (part a2) the owner
+  may already have admitted it and recorded its floor, which then held the green's history at that version for a work
+  never made, for good.
+- **Change.** The pending record names its green (`PendingCreationRecord::green`; a field of a record, so the log's
+  schema hash moves as an appended variant would move it, `record.rs`). At recovery a pending creation over a green
+  another node owns is not dropped (`work_home::hold_for_release`): its record stays, holding its name and id, and its
+  resend is answered retryable. Its release is asked as clients are let in (`verbs::ask_owners_to_replay` →
+  `work_home::release_admissions`) and again at each resend: `MoveWorkFloor` with no base, from the control shard, which
+  the owner applies monotonically (a floor never recorded stays none). On `WorkFloorMoved` the creation is settled, its
+  name and id given back, and the next resend makes the work afresh. One release is out at a time a creation; one
+  unanswered is asked again at the next resend or the next start (no timer, A-533's pattern), and the record survives
+  a restart between, so the release is never lost.
+- **Counters.** `merge.work.admission_held_for_release`, `merge.work.admission_released` (the test's non-vacuity count),
+  `merge.work.admission_release_unanswered`.
+- **Test seam.** `Daemon::lose_next_owner_answer` now loses an admission over the fleet too (`admit_over_fleet`), as it
+  loses one between shards; `Daemon::work_floors_of` lists a green's floors at its owner.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner` (three nodes at `f = 1` keeping their state; B
+  loses a creation's admission answer after A recorded the work's floor, restarts over its own segment: A's floor for
+  that work released, B's counter moved, the name made again at a new id). Red with the creation dropped as before: A's
+  floor never released (the poll gave up). Fleet `a_holder` 23 of 23; `slates-server --lib work_home verbs::
+  takeover::`, `slates-db --lib` and `--test alias`; fmt clean.

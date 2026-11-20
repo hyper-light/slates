@@ -1032,10 +1032,13 @@ impl<S: SvnStores> SvnExchange<S> {
       Merged::Refused(refused) => return refused,
     };
     let transaction = work.record.transaction.clone();
-    match self
+    // A-740: a shard stuck landing a revision names it.
+    let landing = slates_rt::futures::doing("vcs_http::svn::land");
+    let landed = self
       .stores
-      .land(self.repository, &self.principal, *work, &*texts)
-    {
+      .land(self.repository, &self.principal, *work, &*texts);
+    drop(landing);
+    match landed {
       Some(Ok(committed)) => {
         // post-commit, once the revision stands: its failure is the MERGE response's `S:post-commit-err` (A-733).
         let revision = committed.revision;

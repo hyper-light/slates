@@ -300,6 +300,23 @@ impl Held {
   }
 }
 
+/// An object being put a window at a time ([`ContentStore::begin_object`]): the bytes short of a window, and the
+/// identities of the windows (later, of the lists) kept so far, each holding one count.
+#[derive(Debug, Default)]
+pub struct Writing {
+  /// The bytes of the window being filled.
+  pending: Vec<u8>,
+  /// The identities kept so far, in order.
+  windows: Vec<ContentId>,
+}
+
+impl Writing {
+  /// The windows kept so far.
+  pub fn windows_kept(&self) -> usize {
+    self.windows.len()
+  }
+}
+
 /// The content store (module docs).
 #[derive(Debug)]
 pub struct ContentStore {
@@ -604,6 +621,88 @@ impl ContentStore {
     self.admit(need, 0)?;
     self.keep_tree(&tree, top)?;
     Ok(root)
+  }
+
+  /// Starts an object put a window at a time ([`ContentStore::put_window`], [`ContentStore::finish_object`]): what an
+  /// intake streams, its bytes arriving in pieces it never holds whole (§4.17.1 "A push's intake", rule 1; Subversion's
+  /// commit texts, A-727 slice c). The same object [`ContentStore::put_object`] keeps, the same root, its windows kept as
+  /// each fills.
+  pub fn begin_object(&self) -> Writing {
+    Writing::default()
+  }
+
+  /// Takes `bytes`, the object's next piece of any length: every window it fills is kept at once (one holder, which the
+  /// list naming it takes over), the rest held for the next piece, so the writer holds less than a window. Refused (the
+  /// budget, the storage), what the object kept so far stays held by `writing`, for [`ContentStore::abandon_object`].
+  ///
+  /// # Errors
+  /// [`ContentStore::put`]'s.
+  pub fn put_window(&mut self, writing: &mut Writing, bytes: &[u8]) -> Result<(), ContentRefused> {
+    let window = self.window.get();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+      let room = window.saturating_sub(writing.pending.len());
+      let (taken, left) = rest.split_at(room.min(rest.len()));
+      writing.pending.extend_from_slice(taken);
+      rest = left;
+      if writing.pending.len() == window {
+        let identity = self.put(&writing.pending)?;
+        writing.windows.push(identity);
+        writing.pending.clear();
+      }
+    }
+    Ok(())
+  }
+
+  /// Ends the object: its last window kept, then the lists naming its windows, `fanout` a list, level by level, as
+  /// [`ContentStore::put_object`] plans them; the root, held once more by the caller. A list the store holds already is
+  /// held once more and gives back the holds its pieces took, as `put_object` holds a node found held.
+  ///
+  /// # Errors
+  /// [`ContentStore::put`]'s; refused, what was kept stays held by `writing`'s identities, which the caller abandons.
+  pub fn finish_object(&mut self, writing: &mut Writing) -> Result<ContentId, ContentRefused> {
+    if !writing.pending.is_empty() || writing.windows.is_empty() {
+      let identity = self.put(&writing.pending)?;
+      writing.windows.push(identity);
+      writing.pending.clear();
+    }
+    let mut level = std::mem::take(&mut writing.windows);
+    while level.len() > 1 {
+      let mut above = Vec::with_capacity(level.len().div_ceil(self.fanout.get()));
+      for (at, group) in level.chunks(self.fanout.get()).enumerate() {
+        let mut bytes = Vec::with_capacity(group.len().saturating_mul(IDENTITY_BYTES));
+        for identity in group {
+          bytes.extend_from_slice(&identity.0);
+        }
+        let stored = match self.keep(Form::List, &bytes) {
+          Ok(stored) => stored,
+          Err(refused) => {
+            // The lists made so far hold their pieces; the pieces no list names yet hold themselves.
+            let unlisted = level
+              .get(at.saturating_mul(self.fanout.get())..)
+              .unwrap_or_default();
+            above.extend_from_slice(unlisted);
+            writing.windows = above;
+            return Err(refused);
+          }
+        };
+        if !stored.fresh {
+          for identity in group {
+            self.release(identity)?;
+          }
+        }
+        above.push(stored.identity);
+      }
+      level = above;
+    }
+    level.pop().ok_or(ContentRefused::NotHeld)
+  }
+
+  /// Gives back what an unfinished object kept: its windows' and lists' holds, its pending bytes dropped.
+  pub fn abandon_object(&mut self, writing: Writing) {
+    for identity in &writing.windows {
+      let _ = self.release(identity);
+    }
   }
 
   /// The bytes of the nodes of `tree` that the store holds none of, reached from the root through new nodes alone, each
@@ -1651,5 +1750,60 @@ mod tests {
       Some(vec![fresh]),
       "only the new window is named, by its identity"
     );
+  }
+
+  /// Every identity `store` holds, with its holders and its form.
+  fn held(store: &ContentStore) -> Vec<(ContentId, u64, Option<Form>)> {
+    store
+      .identities()
+      .map(|identity| (*identity, store.holders(identity), store.form(identity)))
+      .collect()
+  }
+
+  /// A-727 slice c (an object put a window at a time: §4.17.1 "A push's intake", rule 1). Do: for objects of 0, 1, a
+  /// window less one, a window, a window and one, and seven windows and five bytes, put each into one store whole
+  /// (`put_object`) and into another a piece at a time (pieces of 1, 3 and 61 bytes, and whole), each twice. Expect the
+  /// same root, the same contents with the same holders and forms, the same bytes used, the object's bytes read back;
+  /// and an object abandoned part-way leaves its store as it was.
+  #[test]
+  fn an_object_put_a_window_at_a_time_is_the_object_put_whole() {
+    let bytes: Vec<u8> = (0..7 * NARROW + 5).map(|at| (at * 7 % 251) as u8).collect();
+    for len in [0, 1, NARROW - 1, NARROW, NARROW + 1, bytes.len()] {
+      let object = &bytes[..len];
+      for piece in [1, 3, 61, len.max(1)] {
+        let mut whole = ContentStore::new(1 << 20, NARROW).unwrap();
+        let mut streamed = ContentStore::new(1 << 20, NARROW).unwrap();
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+          let root = whole.put_object(object).unwrap();
+          let mut writing = streamed.begin_object();
+          for part in object.chunks(piece) {
+            streamed.put_window(&mut writing, part).unwrap();
+          }
+          let made = streamed.finish_object(&mut writing).unwrap();
+          roots.push((root, made));
+        }
+        assert!(
+          roots.iter().all(|(root, made)| root == made),
+          "{len} by {piece}"
+        );
+        assert_eq!(held(&whole), held(&streamed), "{len} by {piece}");
+        assert_eq!(whole.used(), streamed.used(), "{len} by {piece}");
+        let (root, _) = roots[0];
+        assert_eq!(
+          streamed.object_bytes(&root, len as u64).as_deref(),
+          Some(object),
+          "{len} by {piece}"
+        );
+      }
+    }
+    let mut store = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut writing = store.begin_object();
+    store
+      .put_window(&mut writing, &bytes[..3 * NARROW + 2])
+      .unwrap();
+    assert_eq!(writing.windows_kept(), 3);
+    store.abandon_object(writing);
+    assert_eq!((store.len(), store.used()), (0, 0));
   }
 }

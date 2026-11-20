@@ -291,6 +291,91 @@ impl Graph for TestGraph {
   fn brought(&self, green: u32, version: u64) -> impl Iterator<Item = u32> {
     self.brought_set(green, version).into_iter()
   }
+
+  fn tips_from(&self, from: usize) -> impl Iterator<Item = (usize, u32)> {
+    self.tips.iter().copied().enumerate().skip(from)
+  }
+
+  fn tags_from(&self, from: usize) -> impl Iterator<Item = (usize, u32)> {
+    self.tags.iter().copied().enumerate().skip(from)
+  }
+}
+
+/// A test graph that counts what a walk reads of it: each commit's parents asked, each tag's target, each ref's tip or
+/// tag met (A-745: how much of the graph a step of the negotiation reads).
+struct Counted<'g> {
+  graph: &'g TestGraph,
+  reads: std::cell::Cell<u64>,
+}
+
+impl Counted<'_> {
+  fn read(&self) {
+    self.reads.set(self.reads.get() + 1);
+  }
+
+  /// The reads so far, the count begun again.
+  fn taken(&self) -> u64 {
+    self.reads.replace(0)
+  }
+}
+
+impl Graph for Counted<'_> {
+  type Node = u32;
+  type Green = u32;
+
+  fn node(&self, id: &ObjectId) -> Option<u32> {
+    self.graph.node(id)
+  }
+  fn id(&self, node: u32) -> ObjectId {
+    self.graph.id(node)
+  }
+  fn kind(&self, node: u32) -> Kind {
+    self.graph.kind(node)
+  }
+  fn commit(&self, node: u32) -> Option<CommitRow<u32>> {
+    self.graph.commit(node)
+  }
+  fn parents(&self, commit: u32) -> impl Iterator<Item = u32> {
+    self.read();
+    self.graph.parents(commit)
+  }
+  fn entries(&self, tree: u32) -> impl Iterator<Item = u32> {
+    self.graph.entries(tree)
+  }
+  fn named_entries(&self, tree: u32) -> impl Iterator<Item = (u32, Vec<u8>)> {
+    self.graph.named_entries(tree)
+  }
+  fn size(&self, blob: u32) -> u64 {
+    self.graph.size(blob)
+  }
+  fn target(&self, tag: u32) -> Option<u32> {
+    self.read();
+    self.graph.target(tag)
+  }
+  fn tips(&self) -> impl Iterator<Item = u32> {
+    self.graph.tips().inspect(|_| self.read())
+  }
+  fn tags(&self) -> impl Iterator<Item = u32> {
+    self.graph.tags().inspect(|_| self.read())
+  }
+  fn greens_at(&self, head: u32) -> impl Iterator<Item = (u32, u64)> {
+    self.graph.greens_at(head)
+  }
+  fn versions_at(&self, green: u32, head: u32) -> impl Iterator<Item = u64> {
+    self.graph.versions_at(green, head)
+  }
+  fn fast_forward(&self, green: u32, version: u64) -> bool {
+    self.graph.fast_forward(green, version)
+  }
+  fn brought(&self, green: u32, version: u64) -> impl Iterator<Item = u32> {
+    self.graph.brought(green, version)
+  }
+  fn tips_from(&self, from: usize) -> impl Iterator<Item = (usize, u32)> {
+    self.graph.tips_from(from).inspect(|_| self.read())
+  }
+  fn tags_from(&self, from: usize) -> impl Iterator<Item = (usize, u32)> {
+    self.graph.tags_from(from).inspect(|_| self.read())
+  }
 }
 
 /// The name the test graph gives object `index`: scrambled, so name order is not handle order.
@@ -2166,5 +2251,88 @@ proptest! {
     }
     prop_assert_eq!(held.iter().collect::<Vec<_>>(), model.iter().copied().collect::<Vec<_>>());
     prop_assert_eq!(held.into_positions(), Positions::of(model.into_iter().collect()));
+  }
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rule 3: every slice a turn at a time), `begin`'s walks. Do: over a 2,000-commit
+/// history (no green, so no run answers it in one round) with a tag on each of its newest 500 commits, ask the tip with
+/// `include-tag` (a) with a have at the root, without `done`, deepened 1,500 (`ready`'s search down the whole history,
+/// then the cut's walk), (b) `deepen-relative` from a client shallow at the 1,000th commit, (c) `deepen-since` the
+/// 1,000th commit's date; begin each and step it a unit a step, counting what each reads of the graph (parents asked,
+/// tags' targets, refs met). Expect: `begin` reads what the request names (a have's parents) and no more, at most 4;
+/// every step at most 2; and the answer the one made whole.
+#[test]
+fn a745_begin_reads_what_the_request_names_and_each_step_one_unit_of_ready_the_cut_and_the_tags() {
+  const COMMITS: u64 = 2_000;
+  let mut graph = TestGraph::default();
+  let mut commits = Vec::new();
+  for index in 0..COMMITS {
+    let blob = graph.new_blob(index);
+    let tree = graph.new_tree(&[blob]);
+    let parents: Vec<u32> = commits.last().copied().into_iter().collect();
+    commits.push(graph.new_commit(&parents, tree, index * 10));
+  }
+  let tip = *commits.last().unwrap();
+  graph.tips.push(tip);
+  for commit in &commits[commits.len() - 500..] {
+    let tag = graph.new_tag(*commit);
+    graph.tags.push(tag);
+  }
+  let id = |node: u32| object_id(at(node));
+  let asks = |haves: Vec<ObjectId>, done, shallow: Vec<ObjectId>, deepen| Asks {
+    wants: vec![id(tip)],
+    haves,
+    done,
+    wait_for_done: false,
+    shallow,
+    deepen: Some(deepen),
+    filter: None,
+    include_tag: true,
+    thin: false,
+    sparse: None,
+  };
+  let cases = [
+    asks(
+      vec![id(commits[0])],
+      false,
+      vec![],
+      OwnedDeepen::Depth(1_500, false),
+    ),
+    asks(
+      vec![],
+      true,
+      vec![id(commits[999])],
+      OwnedDeepen::Depth(10, true),
+    ),
+    asks(vec![], true, vec![], OwnedDeepen::Cut(Some(9_990), vec![])),
+  ];
+  for (case, asked) in cases.iter().enumerate() {
+    let request = asked.request();
+    let whole = negotiate(&graph, &request, &mut Admission::new(u64::MAX));
+    let counted = Counted {
+      graph: &graph,
+      reads: std::cell::Cell::new(0),
+    };
+    let mut admission = Admission::new(u64::MAX);
+    let begun = super::begin(&counted, &request, &mut admission);
+    let at_begin = counted.taken();
+    assert!(at_begin <= 4, "case {case}: begin read {at_begin}");
+    let Ok(super::Begun::Selecting(mut negotiating)) = begun else {
+      panic!("case {case}: answered at begin");
+    };
+    let (mut steps, mut most) = (0u64, 0u64);
+    let stepped = loop {
+      steps += 1;
+      let step = negotiating.step(&counted, &mut admission, &mut || true);
+      most = most.max(counted.taken());
+      match step {
+        Err(refusal) => break Err(refusal),
+        Ok(Some(outcome)) => break Ok(outcome),
+        Ok(None) => {}
+      }
+    };
+    assert!(most <= 2, "case {case}: a step read {most}");
+    assert!(steps > 500, "case {case}: {steps} steps");
+    assert_eq!(stepped, whole, "case {case}");
   }
 }

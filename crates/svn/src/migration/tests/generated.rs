@@ -401,8 +401,9 @@ fn holds_the_node(
   };
   let text = found
     .text()
-    .and_then(|text| repository.content(&text.identity))
+    .and_then(|text| repository.text(&text.identity))
     .unwrap_or_default();
+  let text: &[u8] = &text;
   let held = repository.properties(found.properties()).map_err(failed)?;
   prop_assert_eq!(
     (found.kind(), text, &held),

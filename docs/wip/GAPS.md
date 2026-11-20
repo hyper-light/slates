@@ -168,8 +168,9 @@
 > within the owner's quantum, the answer the same bytes; piece 3a: sets in runs or bits, whichever is smaller, and packets
 > sized from the room (a clone within 4 KiB); piece 3b: both edges admit a fetch a request's room and answer it in turns
 > (the 3,000-commit clone by use over HTTP and SSH); rule 4: a fetch holds the generation it began on (a shared fork at
-> the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects). Owed:
-> protocol v0 in turns, `begin`'s walks in units, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects);
+> `begin`'s walks in turns (`ready`'s search, the cut, `include-tag`'s scan: `begin` reads what the request names, each
+> step a unit). Owed: protocol v0 in turns, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -4747,7 +4748,10 @@
 > holder's submit committed by the verdict its replica computed, taken by position at the owner, `SubmitComputed`);
 > part d built (the submit settles once the holder's replica holds the version); part e built (a holder's work comes
 > back from its log over the holder's replica after a restart); a holder work's rebase and copies built over the
-> replica; an increment too large for the forward lane, the floor of a creation a restart dropped, and part f (takeover and the routing flip) are open.
+> replica; a creation a restart caught releases its floor at the owner (part e2); the increment carried by reference
+> to placed content, one copy of each byte (main's ruling: the forward carries a 4 MiB increment, but at f = 1 a 4 MiB
+> holder submit took 3.5-4.8 s and a local one 2.8-3.4 s in a debug build, with the inputs shipped back to the holder
+> that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's

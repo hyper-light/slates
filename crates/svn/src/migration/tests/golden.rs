@@ -408,9 +408,9 @@ fn a_view_reads_texts_from_its_lent_source_alone() {
     .find_map(|change| change.text.map(|text| (text.identity, change.properties)))
     .expect("a revision names a text");
   let bytes = repository
-    .content(&identity)
+    .text(&identity)
     .expect("the records hold it")
-    .to_vec();
+    .into_owned();
   let held = HeldApart(std::collections::BTreeMap::from([(
     identity,
     bytes.clone(),
