@@ -156,3 +156,11 @@
   Ledger edits now from ~/slates-work/w-svn-ledger (shared checkout had another agent's staged state).
 - NEXT: DeltaV v1 for pre-1.7 clients (MKACTIVITY/CHECKOUT/MERGE; review piece 14); w-interop piece 5 done, no overlap.
   Owed: Linux daemon:: run on kiln (r36 never started, no room); 500 MB commit re-measured after w-engine 1b.
+- DeltaV v1 (pre-1.7 / no-v2 serf clients) PLAN, sources in ~/slates-work/g234-svn-src/dav-1.14 (1.14.x mod_dav_svn +
+  ra_serf commit.c): OPTIONS activity-collection-set -> `!svn/act/`; MKACTIVITY act/UUID 201; discover_vcc PROPFIND;
+  checked-in -> `!svn/ver/REV/PATH`; CHECKOUT vcc (body activity-set href) -> 201 Location `!svn/wbl/ACT/REV`;
+  PROPPATCH wbl = revprops; CHECKOUT ver/REV/path -> 201 Location `!svn/wrk/ACT/path` (out-of-date check by rev);
+  PUT/MKCOL/DELETE/COPY/PROPPATCH under wrk == txr; MERGE source=activity href; DELETE act. Map onto DavCommit: an
+  activity = a transaction begun lazily (revprops from the wbl PROPPATCH) and wrk/ACT/path == txr/TXN/path.
+  Part 1 slates-svn sans-io (URIs, CHECKOUT body/answer, activity state), part 2 server site, part 3 by-use (stock
+  svn 1.15 against a no-v2 OPTIONS test hook, on a machine with svn).
