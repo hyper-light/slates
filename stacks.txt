@@ -441,3 +441,46 @@ NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x6
 NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
 NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
 NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+==== round 2 at 06:37:41
+INFO: No tasks are running which match the specified criteria.
+INFO: No tasks are running which match the specified criteria.
+==== slates.exe pid INFO: round 2
+cdb: bad pid 'INFO:'
+==== slates.exe pid No round 2
+cdb: bad pid 'No'
+==== slates.exe pid tasks round 2
+cdb: bad pid 'tasks'
+==== slates.exe pid are round 2
+cdb: bad pid 'are'
+==== slates.exe pid running round 2
+cdb: bad pid 'running'
+==== slates.exe pid which round 2
+cdb: bad pid 'which'
+==== slates.exe pid match round 2
+cdb: bad pid 'match'
+==== slates.exe pid the round 2
+cdb: bad pid 'the'
+==== slates.exe pid specified round 2
+cdb: bad pid 'specified'
+==== slates.exe pid criteria. round 2
+cdb: bad pid 'criteria.'
+==== fsx.exe pid INFO: round 2
+cdb: bad pid 'INFO:'
+==== fsx.exe pid No round 2
+cdb: bad pid 'No'
+==== fsx.exe pid tasks round 2
+cdb: bad pid 'tasks'
+==== fsx.exe pid are round 2
+cdb: bad pid 'are'
+==== fsx.exe pid running round 2
+cdb: bad pid 'running'
+==== fsx.exe pid which round 2
+cdb: bad pid 'which'
+==== fsx.exe pid match round 2
+cdb: bad pid 'match'
+==== fsx.exe pid the round 2
+cdb: bad pid 'the'
+==== fsx.exe pid specified round 2
+cdb: bad pid 'specified'
+==== fsx.exe pid criteria. round 2
+cdb: bad pid 'criteria.'
