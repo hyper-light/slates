@@ -1039,6 +1039,57 @@ fn stock_hg_lists_and_moves_keys_over_the_ssh_edge() {
   );
 }
 
+/// Runs `hg -R r serve --stdio` over the SSH edge at loopback `port` with stock OpenSSH (`key` alone, trusting the host
+/// keys in `known_hosts`, as [`ssh_command`]), `input` on its standard input, in `dir`: its exit code and both outputs.
+fn ssh_fed(
+  dir: &str,
+  (key, known_hosts, port): (&str, &str, u16),
+  input: &str,
+) -> (i32, String, String) {
+  let known = format!("UserKnownHostsFile={known_hosts}");
+  let mut child = Command::new("ssh")
+    .args([
+      "-F",
+      "/dev/null",
+      "-i",
+      key,
+      "-o",
+      "IdentitiesOnly=yes",
+      "-o",
+      "BatchMode=yes",
+    ])
+    .args([
+      "-o",
+      "StrictHostKeyChecking=yes",
+      "-o",
+      &known,
+      "-o",
+      "GlobalKnownHostsFile=/dev/null",
+    ])
+    .args([
+      "-p",
+      &port.to_string(),
+      &format!("{HG_USER}@127.0.0.1"),
+      "hg -R r serve --stdio",
+    ])
+    .current_dir(dir)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(input.as_bytes())
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let code = exit_within(&mut child, &format!("ssh serve --stdio in {dir}"));
+  (code, out.join().unwrap(), err.join().unwrap())
+}
+
 /// Runs stock hg as [`hg_in`] does with `input` on its standard input: its exit code and both outputs.
 fn hg_fed(hg: &[String], dir: &str, args: &[&str], input: &str) -> (i32, String, String) {
   let (program, leading) = hg.split_first().expect("a command");
@@ -1067,12 +1118,18 @@ fn hg_fed(hg: &[String], dir: &str, args: &[&str], input: &str) -> (i32, String,
 }
 
 /// Stock hg's batched `pushkey` through slates at `url`, `config` its `--config` words: two changesets pushed, bookmark
-/// `batched-bm` made at the first by `hg debugpushkey`, then one `batch` sent by `hg debugwireproto` (`batchbegin`,
-/// `batchsubmit`: 7.2's batching peer) of `listkeys bookmarks`, a `pushkey` moving `batched-bm` from the first
-/// changeset to the second, and `listkeys bookmarks` again. Fails the test unless the batch is answered and the server
-/// then lists `batched-bm` at the second changeset.
+/// `batched-bm` made at the first by `hg debugpushkey`, then one `batch` sent by `send` (given the working copy and the
+/// two changesets) moving `batched-bm` from the first changeset to the second by a `pushkey` call among its calls.
+/// Fails the test unless the batch is answered, its answer holding `expected` (given the second changeset), and the
+/// server then lists `batched-bm` at the second changeset.
 #[allow(clippy::disallowed_methods)]
-fn batch_legs(hg: &[String], scratch: &str, url: &str, config: &[String]) {
+fn batch_legs(
+  hg: &[String],
+  scratch: &str,
+  (url, config): (&str, &[String]),
+  send: impl Fn(&str, &str, &str) -> (i32, String, String),
+  expected: impl Fn(&str) -> String,
+) {
   let local = format!("{scratch}/local");
   hg_ok(hg, scratch, &["init", &local]);
   std::fs::write(format!("{local}/file"), "first\n").unwrap();
@@ -1091,16 +1148,7 @@ fn batch_legs(hg: &[String], scratch: &str, url: &str, config: &[String]) {
   hg_ok(hg, &local, &["commit", "--message", "second"]);
   hg_ok(hg, &local, &with_config(&["push", url], config));
   let second = hg_nodes(hg, &local).into_iter().next().unwrap_or_default();
-  let script = format!(
-    "batchbegin\ncommand listkeys\n    namespace bookmarks\ncommand pushkey\n    namespace bookmarks\n    key \
-     batched-bm\n    old {first}\n    new {second}\ncommand listkeys\n    namespace bookmarks\nbatchsubmit\n"
-  );
-  let batched = hg_fed(
-    hg,
-    &local,
-    &with_config(&["debugwireproto", url], config),
-    &script,
-  );
+  let batched = send(&local, &first, &second);
   let listed = hg_in(
     hg,
     &local,
@@ -1110,9 +1158,10 @@ fn batch_legs(hg: &[String], scratch: &str, url: &str, config: &[String]) {
     (
       made.0,
       batched.0,
+      batched.1.contains(&expected(&second)),
       listed.1.contains(&format!("batched-bm\t{second}"))
     ),
-    (0, 0, true),
+    (0, 0, true, true),
     "debugpushkey: {made:?}; the batch: {batched:?}; the bookmarks after it: {listed:?}"
   );
 }
@@ -1149,7 +1198,22 @@ fn stock_hg_batches_a_pushkey_over_the_vcs_http_edge() {
   .flat_map(|item| ["--config".to_owned(), item])
   .collect();
   let scratch = Scratch::new("hg-batch-http");
-  batch_legs(&hg, &scratch.path, &format!("{prefix}r"), &config);
+  let url = format!("{prefix}r");
+  // 7.2's batching peer (`hg debugwireproto`'s `batchbegin` and `batchsubmit`): `listkeys`, the `pushkey`, `listkeys`.
+  let send = |local: &str, first: &str, second: &str| {
+    let script = format!(
+      "batchbegin\ncommand listkeys\n    namespace bookmarks\ncommand pushkey\n    namespace bookmarks\n    key \
+       batched-bm\n    old {first}\n    new {second}\ncommand listkeys\n    namespace bookmarks\nbatchsubmit\n"
+    );
+    hg_fed(
+      &hg,
+      local,
+      &with_config(&["debugwireproto", &url], &config),
+      &script,
+    )
+  };
+  let expected = |_: &str| "sending batch with 3 sub-commands".to_owned();
+  batch_legs(&hg, &scratch.path, (&url, &config), send, expected);
 }
 
 /// A-758 (a batched `pushkey` over `hg serve --stdio`, the SSH edge). Do: a fresh key enrolled for the repository's
@@ -1185,10 +1249,17 @@ fn stock_hg_batches_a_pushkey_over_the_ssh_edge() {
   let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
   assert_eq!(code, 0, "credential key: {out}{err}");
   let config = vec!["--config".to_owned(), ssh_command(&key, &known_hosts)];
-  batch_legs(
-    &hg,
-    &scratch.path,
-    &format!("ssh://{HG_USER}@127.0.0.1:{port}/r"),
-    &config,
-  );
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
+  // 7.2's `debugwireproto` reaches no `ssh://` peer, so the batch goes as 7.2's SSH peer frames one (`batch`, its
+  // dictionary, its `cmds`), through stock OpenSSH to `hg -R r serve --stdio`: the `pushkey`, then `listkeys`.
+  let send = |local: &str, first: &str, second: &str| {
+    let cmds = format!(
+      "pushkey namespace=bookmarks,key=batched-bm,old={first},new={second};listkeys namespace=bookmarks"
+    );
+    let request = format!("batch\n* 0\ncmds {}\n{cmds}\n", cmds.len());
+    ssh_fed(local, (&key, &known_hosts, port), &request)
+  };
+  // The `listkeys` after the `pushkey` lists the move: the calls ran in order.
+  let expected = |second: &str| format!("1\n;batched-bm\t{second}");
+  batch_legs(&hg, &scratch.path, (&url, &config), send, expected);
 }
