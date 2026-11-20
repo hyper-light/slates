@@ -215,6 +215,8 @@
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
+> f + 1; `crates/cli/tests/v3_takeover.rs`). Owed: credentials surviving their node (w-fed-faults), the v3 switch.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
