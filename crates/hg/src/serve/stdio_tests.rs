@@ -60,6 +60,7 @@ fn drive(stdio: &mut Stdio, served: &Served, taken: &mut Taken) {
         taken.consumed += consumed;
         taken.took.push(whole);
       }
+      Progress::Streamed { .. } => {}
     }
   }
 }

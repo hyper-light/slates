@@ -12300,8 +12300,9 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > changesets as ranges, the manifest log, then the file logs row to row through `HgIndex::file_revision_from`), any
 > other fetch by the changesets that name each revision (7.2's slow path, bounded by what it sends). Piece 2a BUILT:
 > HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
-> shard's room and quantum, the stream compressed as it is made; the red passes. Owed: SSH (piece 2b), the hold on the
-> generation a fetch began on (rule 4), the stream clone (piece 3), git's upload-pack (w-git).
+> shard's room and quantum, the stream compressed as it is made; the red passes. Piece 2b BUILT: SSH the same
+> (`Stdio::stream`, `vcs_ssh::hg`). Owed: the hold on the generation a fetch began on (rule 4), the stream clone (piece
+> 3), git's upload-pack (w-git).
 > **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
 > fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
 > none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
