@@ -31,6 +31,11 @@ use crate::vcs_http::git::Located;
 #[path = "receive.rs"]
 mod receive;
 
+/// Mercurial's `serve --stdio` behind the edge (A-679): its command's tests, and its sessions over the edge with these
+/// tests' client.
+#[path = "hg.rs"]
+mod hg;
+
 /// Shape: one seat: the edge of a shard that seats one client.
 const ONE_SEAT: usize = 1;
 /// Shape: two seats: a connection, and the one that needs the other's seat.

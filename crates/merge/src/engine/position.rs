@@ -62,6 +62,17 @@ pub(super) struct Placed {
 }
 
 impl Placed {
+  /// Where the op stood: its range and its first byte, each as mapped (a computed verdict's wire form writes them,
+  /// `computed_wire`, A-658 part 3a).
+  pub(super) fn parts(&self) -> (Mapped, Mapped) {
+    (self.range, self.point)
+  }
+
+  /// A placement read back from its parts ([`Placed::parts`]).
+  pub(super) fn from_parts(range: Mapped, point: Mapped) -> Placed {
+    Placed { range, point }
+  }
+
   /// `op` mapped from the work's base through `deltas`, the ops each version since the base applied to its path, oldest
   /// first.
   pub(super) fn of(op: &Op, deltas: &[&[Op]]) -> Placed {
