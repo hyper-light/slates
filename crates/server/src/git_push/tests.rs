@@ -805,6 +805,7 @@ fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
 
 /// Shape: the pushes [`t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append`] answers at
 /// once, a step of each in turn.
+#[cfg(unix)]
 const INTERLEAVED: usize = 12;
 
 /// A-722 part 4e (the answer's longest step at 100 concurrent pushes to one repository: a commit staging again whole a
