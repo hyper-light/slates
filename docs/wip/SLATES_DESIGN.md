@@ -12658,9 +12658,9 @@ engine: the verdict, rebase, position mapping, the register).
 > connection tasks on the control shard under the shard's seats, an edge state kept on every shard so a connection moves
 > to its repository's owner (A-651 part 4), keys proved by the credential record (A-651 part 3), and the services as
 > the server has them: git's upload-pack from each repository's store through A-682's lender (`ShardStores`) and
-> Mercurial's `serve --stdio` from its served view (`ServedViews`, A-679); receive-pack (A-683) and Subversion's tunnel
-> (A-688's `SvnServices`, which awaits a lender of its stores) refused as not served. Any
-> IPv4 address is taken: SSH encrypts every connection. The host key, on main's ruling: a fleet node presents its own
+> Mercurial's `serve --stdio` from its served view (`ServedViews`, A-679), and git's receive-pack through the push
+> driver on the owner shard since A-683 (`ThisShard` lending its state); Subversion's tunnel (A-688's `SvnServices`,
+> which awaits a lender of its stores) refused as not served. Any IPv4 address is taken: SSH encrypts every connection. The host key, on main's ruling: a fleet node presents its own
 > key from its plan when the key is Ed25519, the edge's one host key algorithm, and starts no SSH edge otherwise,
 > logged; any other anchor makes an Ed25519 key from the system's generator at its start and keeps its seed in the
 > segment's supervision block, on the page it locks (`SUP_SSH_HOST_SEED`), beside the listener it binds once and hands
@@ -12705,8 +12705,8 @@ engine: the verdict, rebase, position mapping, the register).
 >
 > **Status (2026-11-19, A-679: Mercurial's `serve --stdio` behind the SSH edge).** `vcs_ssh::hg` runs A-650 part 2's
 > `serve::stdio` for `hg -R <path> serve --stdio`, which `ToolServices` starts beside upload-pack over the store the
-> HTTP site's Mercurial lender holds (`ToolCommand` is either); the site refuses a repository argument starting `--`
-> in 7.2's words before anything is looked up. §4.17.3's status says what it answers and how it is proven.
+> HTTP site's Mercurial lender holds (`ToolCommand` is one of the three, git's receive-pack the third since A-683); the
+> site refuses a repository argument starting `--` in 7.2's words before anything is looked up. §4.17.3's status says what it answers and how it is proven.
 >
 > **Status (2026-11-19, A-651: piece 9's edge built).** `crates/server`'s `vcs_ssh` serves SSH on the runtime's TCP,
 > the HTTP edge's counterpart: one connection a task under seats derived from the shard's clients, each driving
@@ -12714,8 +12714,8 @@ engine: the verdict, rebase, position mapping, the register).
 > (`NoKeyRecord`) until the one record of principals' credentials landed, and reads that record since A-651 part 3
 > (main's ruling under §4.13; no key file, no default key). Each `exec` is dispatched by its tool and refused in the tool's own words and exit status where it cannot run: a
 > missing repository, the repository's policy, and, for now, all four services as not served (git's upload-pack and
-> Mercurial's `serve --stdio` have landed and wait for their stores, A-662; receive-pack's and Subversion's entry
-> points, A-654 and A-656). Waits keep the HTTP edge's rule: RFC 6298's first RTO of the connection's own round trip
+> Mercurial's `serve --stdio` have landed and wait for their stores, A-662; Subversion's entry point, A-656), but
+> git's receive-pack, which runs A-654's driver over the shard's own store since A-683. Waits keep the HTTP edge's rule: RFC 6298's first RTO of the connection's own round trip
 > before a phase learns; a wait past its bound only marks its seat overdue, and the most overdue is reaped only for a new
 > connection with every seat taken, since an SSH connection waits on people (a key's passphrase after `PK_OK`, a host
 > key's confirmation) and on a push's compression. The key time is fed by authenticated connections' lifetimes. The
@@ -12752,7 +12752,8 @@ engine: the verdict, rebase, position mapping, the register).
 > **Status (2026-11-19, A-625 part 1: the edge's engine built).** `crates/http-edge` (`slates-http-edge`) holds one
 > connection's request loop as a state machine over bytes, shared by the three tools' HTTP: HTTPS through rustls over
 > aws-lc-rs (TLS 1.3 and 1.2, ALPN `http/1.1`, no client certificate, no resumption; one configuration per connection,
-> D-8 exception 2), Basic credentials over TLS alone and Bearer, `100 Continue` to a waiting client, keep-alive and
+> D-8 exception 2), Basic credentials over TLS alone (on the loopback edge too since A-686) and Bearer, `100 Continue`
+> to a waiting client, keep-alive and
 > pipelining, bodies streamed to the service as slices of the input or inflated runs (never a whole push held), replies
 > chunked to HTTP/1.1 and framed by the close to HTTP/1.0, and typed refusals: a refusal leaving no body unread keeps
 > the connection, any other ends it in stages (the reply, `close_notify`, a half-close, the client's bytes drained;
@@ -12778,7 +12779,8 @@ engine: the verdict, rebase, position mapping, the register).
 > while seats are free; no connection is answered `503` at the bound, since over HTTPS only a handshake could carry it.
 > Only a connection whose credentials proved a principal teaches the bounds: its waits before the proof are folded in
 > at the proof, each phase's longest, and a stranger's reap backs nothing off. git's site routes as `http-backend` routes (A-595), then answers `401` with the
-> challenges the connection accepts, `404` for no git repository of that name, `403` when the repository's policy lets
+> challenges the connection accepts (since A-686 Basic's and then Bearer's on every connection), `404` for no git
+> repository of that name, `403` when the repository's policy lets
 > the principal reach it for none of the service's rights (`vcs_policy::reaches`, A-597, A-622), and `503` while the
 > service's server half has not landed, which today is both (upload-pack, A-615; receive-pack's commit, A-620 part 2).
 > `slates-git` gives a smart reply's and a refused route's fields as data and writes its replies from them. Owed: the
@@ -12861,7 +12863,7 @@ engine: the verdict, rebase, position mapping, the register).
 > daemon, pushes to it and fetches from it over the HTTP edge, the token a bearer credential
 > (`crates/cli/tests/git_interop.rs`), each step held to what git's own server answers the same round trip over
 > `file://`, and git with no credential is refused in its own words. The round trip with the token as Basic's password
-> waits on A-686, and over the SSH edge on A-684 and A-683; each is ignored naming them.
+> runs since A-686, its one wait; over the SSH edge it waits on A-684 and A-683, ignored naming them.
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
@@ -13272,8 +13274,9 @@ engine: the verdict, rebase, position mapping, the register).
 > all in one under `atomic`), and writes git's report. A ref's base is its green's head alone, held at the append by
 > compare and swap, until A-664's server-made commits; a create is made at its first parent's version, or from the
 > default branch's empty green while that branch is unborn. Six pushes stock git 2.50.1 made are answered with git's
-> bytes. Owed: the edges' calls, the hooks' runs, older bases (A-664), the policy's principals other than the owner at
-> A-635's append, push options, review requests, the new versions' fragments off the answer's path.
+> bytes. Owed: the hooks' runs, older bases (A-664), the policy's principals other than the owner at A-635's append,
+> push options, review requests, the new versions' fragments off the answer's path. Both edges call it: the HTTP
+> site (A-654 part 3) and the SSH site (A-683).
 >
 > **Status (2026-11-19, A-654 part 3: receive-pack on git's HTTP site).** `crates/server` (`vcs_http::git::receive`)
 > serves `git-receive-pack` through the push driver: the advertisement on `GET info/refs` (the site's `# service=`
@@ -13284,8 +13287,23 @@ engine: the verdict, rebase, position mapping, the register).
 > lent, receive-pack's `ReceiveServices`). A step that fails before any reply is answered with a status (`400`, `413`,
 > `404`, `500`, `503`); a command's own refusal is the report's, `200`. Proven end to end: stock git 2.50.1's `create`
 > push posted over loopback TLS to a two-shard daemon is answered with git's very report and `main` advertised at its
-> commit after, and a delete under a policy denying it refused `deletion prohibited`. Owed: the SSH channel's call
-> (g294); the live `git push` over HTTPS with stock git's binary (main's run).
+> commit after, and a delete under a policy denying it refused `deletion prohibited`. Owed: the live `git push` over
+> HTTPS with stock git's binary (main's run). The SSH site's call is A-683's (below).
+>
+> **Status (2026-11-19, A-683: git's receive-pack on the SSH edge).** `crates/server` (`vcs_ssh::receive`) runs the push
+> driver for the SSH site's `git-receive-pack '<repo>'`: `ToolServices` starts it for a repository the site found on the
+> connection's shard, with no store lender (the driver reads the store the shard holds, A-662), and each step is lent
+> the shard's state afresh through the HTTP site's seam (`ShardLender`; in the daemon `ThisShard`, over `with_state`),
+> so a push holds nothing of its shard across the edge's awaits. The advertisement is written as the command starts,
+> after `version 1` for a v1 client, a v2 client answered at v0 as git's receive-pack answers one; the client's bytes go
+> to the driver as they arrive; the checked push is answered with git's report and exit 0, a flush alone, a push of
+> nothing, with nothing; a refusal ends the session in git's `die` words with 128, a shard not lent in the site's
+> not-served words; the answer is the driver's a step at a time (A-665 part 3), as the HTTP site steps it. Stock git
+> 2.50.1's `create` push, sent over a real SSH session to the production site on an audit daemon's shard, is answered
+> with git's bytes, and `main` holds its tree. A connection reaches the repository's owner shard by A-651 part 4's move
+> before the command is made there. Owed: a push over a moved connection (a two-shard daemon, as the HTTP site's push
+> test runs), and a live `git push` over SSH with stock git's binary (main's run: `git_interop.rs`'s
+> `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`, its ignore lifted).
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -13328,6 +13346,17 @@ engine: the verdict, rebase, position mapping, the register).
 > makes one after another go out together in 128-byte reads, and writes with an object read between them apart
 > (`answer::Said`), as git's recordings show. Held byte for byte to stock git 2.50.1's fourteen new v2 recordings and
 > one v0. Still refused by kind: `~`, `^`, `^{...}`, `@{...}` and `:/<text>`; and `sparse:oid` within `combine:`.
+
+> **Status (2026-11-19, A-686: Basic on the loopback edge, and Basic's challenge first).** The shared edge takes Basic
+> with the token as the password on its loopback cleartext edge as over TLS (`slates_http_edge::credential::credential`
+> reads either scheme on every connection; `--vcs-http` serves cleartext on loopback alone, where Bearer was already
+> taken, so a token crosses no network either way), and every `401` offers Basic's challenge first and Bearer's after
+> it, on both kinds of connection (`challenges`). Stock Mercurial 7.2 reads the first challenge alone and crashed on a
+> Bearer first; stock git and Subversion send Basic alone, so a lone anchor's edge, which is cleartext, took none of
+> their credentials. Proven with stock hg 7.2 against a daemon's loopback cleartext edge (`hg debugcapabilities` by
+> Basic, answered from the repository's store) and against a real anchor (a clone with no credentials refused in hg's
+> own words), and over a daemon's loopback cleartext edge, where the owner's token as Basic's password is answered with
+> receive-pack's advertisement.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -13511,9 +13540,10 @@ other byte, with its SHA-256 name an index row and the bytes checked against it 
 pointer files git holds [B: git-lfs `docs/spec.md`]. Partial clone with `blob:limit`, git's own answer to large files,
 is served as well. Mercurial's `lfs` extension speaks this same batch API, so one store serves both tools (§4.17.3).
 
-**Access.** HTTP: Basic with a token as the password, or a bearer token, over TLS; SSH: the user's public key. Each
-proves a principal of §4.13, and the capabilities of §4.17.1 decide `git-upload-pack` (read) and `git-receive-pack`
-(write) per repository and per ref. Hidden refs are policy, as git's `receive.hideRefs` is.
+**Access.** HTTP: Basic with a token as the password, or a bearer token, over TLS or on a loopback edge in cleartext,
+where the two carry the same token, and a `401` offers Basic's challenge first, then Bearer's (A-686); SSH: the user's
+public key. Each proves a principal of §4.13, and the capabilities of §4.17.1 decide `git-upload-pack` (read) and
+`git-receive-pack` (write) per repository and per ref. Hidden refs are policy, as git's `receive.hideRefs` is.
 
 **Protected branches, in git's terms.** Refuse a non-fast-forward; refuse a delete; require linear history (no merge
 commit in the pushed range); require signed commits, checking SSH-format commit signatures with A-321's verifier
@@ -14081,8 +14111,8 @@ signature verification).
 > repository on the other shard whose store took `fixtures/state`'s `states` by an import, `heads` equal to its
 > history's heads read from the index, while a git repository asked as Mercurial asks is `404` and git's own request
 > still git's; the lender lends nothing while an import fills a store, for a git repository or an unknown one, or past
-> the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and the stock `hg` interop run over
-> the edge once a repository can be made from the CLI (A-685) and the edge offers hg's client Basic first (A-686).
+> the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and with them the stock `hg` round
+> trip over the edge (a repository made from the CLI, A-685, and Basic offered first, A-686, are built since).
 >
 > **Status (2026-11-19, A-690: divergent bookmarks left out where bookmarks are served).**
 > `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part both read, leaves out
@@ -44873,9 +44903,11 @@ Applied in the same change to:
   configuration (TLS 1.3 and 1.2, ALPN `http/1.1` alone, no client certificate, no tickets, no session cache), its `Arc`
   owned by that connection (D-8 exception 2). `HttpsSession` hands rustls plaintext in the pieces it takes and moves the
   sealed records out between them, the network export's lesson.
-- **Credentials.** Basic (RFC 7617) decoded strictly and refused in cleartext; Bearer (RFC 6750) a `b64token`; a
-  repeated or malformed line 400, another scheme 401; the challenges offer Basic over TLS alone, each naming a quoted
-  realm; secrets compared to their end. A credential's debug form never shows its secret.
+- **Credentials.** Basic (RFC 7617) decoded strictly; Bearer (RFC 6750) a `b64token`; a repeated or malformed line 400,
+  another scheme 401; the challenges each name a quoted realm; secrets compared to their end. A credential's debug form
+  never shows its secret. Basic was refused in cleartext and offered over TLS alone until A-686 (2026-11-19): since,
+  both schemes are read on every connection (the server serves cleartext on loopback alone) and Basic's challenge comes
+  first, then Bearer's.
 - **Refusals.** The head's, the body's framing and coding (400, 413, 501 and the rest), the credentials', the site's and
   a failing service's, each with its status. A refusal whose request leaves no body unread keeps the connection (a 401
   to a client's first request is the common case); any other ends in stages: the reply with `Connection: close`,
@@ -46190,8 +46222,9 @@ Applied in the same change to:
   yields after each body run, each reply run and each drained read, so a large push or clone never holds the shard.
   A staged refusal is counted as it is decided, before the client can read the connection's end.
 - **git's site** (`vcs_http::git`). The route first, as `http-backend` refuses it whoever asks; then the credentials
-  (none, another scheme, Basic in cleartext or one that proves no principal: `401` with the connection's challenges; a
-  repeated or malformed `Authorization`: `400`); then the repository by its exact name (`404` for none, or another
+  (none, another scheme or one that proves no principal: `401` with the challenges, Basic's first and Bearer's after it
+  on every connection since A-686, where Basic in cleartext was refused and offered Bearer alone; a repeated or
+  malformed `Authorization`: `400`); then the repository by its exact name (`404` for none, or another
   tool's); then the policy's gate (`403`: no rule lets the principal reach it for the service's rights, read for
   upload-pack, submit, rewrite or delete for receive-pack, its advertisement too); then the service (`503` while its
   server half has not landed: `Unserved` today). A served advertisement's body is the `# service=` prelude for v0 and v1,
@@ -49482,8 +49515,11 @@ credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`
   NFS export moves a mount's connection. Credentials are enrolled, never minted per start: a human enrolls them through
   the CLI's control channel (§4.13), kept in the metadata database, tokens as their hash with an expiry and SSH keys by
   fingerprint, one record both edges read (g294 kept none, so this is the one). HTTP takes Basic with the token as the
-  password, never in cleartext, or Bearer, and the authenticator hands a bearer token's expiry with its principal. The
-  edge's certificate and key come from where the RPC-with-TLS export's do, handed in by the operator.
+  password, or Bearer, over TLS or on the loopback cleartext edge (revised 2026-11-19, A-686, from "Basic never in
+  cleartext": `--vcs-http` allows cleartext on loopback alone, where Bearer was already taken, so the exposure is the
+  same; Basic's challenge first on every connection, TLS included, then Bearer's), and the authenticator hands a bearer
+  token's expiry with its principal. The edge's certificate and key come from where the RPC-with-TLS export's do,
+  handed in by the operator.
 - **The record** (`slates_db::credentials`). Keyed by the SHA-256 of what a client presents, so a lookup is one map read
   on the partition the id routes to (its first eight bytes over the partitions; D-14, no global index). Guard then
   apply: an id held is `AlreadyExists`, a revocation of one not held `NotFound`; each record's bytes (the record, a
@@ -53130,6 +53166,190 @@ tests' empty store and the SSH tests' probed repository), GAPS (a fixed entry),
   `crates/git/src/tests/store/reach.rs` (the storage test, format 3's hostile values, the type declared with the
   window); `crates/server/src/vcs_store.rs` (`GitStore::new` takes the content store's window) and its tests;
   §4.17.2's status; A-645's entry; GAPS' A-645 line.
+
+### A-686 — Basic with the token as the password on the loopback cleartext edge as over TLS, and Basic's challenge first on every connection, so stock Mercurial 7.2 reads a `401` (2026-11-19, g258 for UI goal 93; §4.17.2 "Access" and "Transports" item 1; §4.17.3 "Access"; main's ruling of 2026-11-19, revising A-625 part 3's "never in cleartext"; A-625 parts 1 to 3, A-650 part 1)
+
+- **What was there.** `slates_http_edge::credential::challenges(realm, secure)` offered Basic over TLS alone and Bearer
+  after it, and `credential(head, secure)` refused Basic on a cleartext connection (`BasicInCleartext`, the git site's
+  `Refused::CleartextBasic`, counted `vcs_http.git.cleartext_basic`). A daemon that is no fleet node serves its edge in
+  cleartext, on loopback alone (`slates_api::role::vcs_http_address`), so a lone anchor's `401` offered Bearer alone.
+  Stock Mercurial 7.2 crashed on it: its opener hands a `401` to urllib's digest handler before its Basic one
+  (`handler_order` 490 against `BaseHandler`'s 500, Python 3.12.16's `urllib/request.py` lines 1243 and 602), and that
+  handler reads the first `WWW-Authenticate` field alone (`headers.get`, line 1113) and raises `ValueError` on any
+  scheme but Digest and Basic (line 1129), through hg's `url.py` line 418: "** unknown exception", with or without
+  `auth.*` credentials (g083's probe against a stub; this piece's red run against the edge itself). And the cleartext
+  edge took no credential stock git or Subversion sends: both send a token as Basic's password (serf sends no Bearer
+  at all, main's brief).
+- **The decision** (main's ruling, 2026-11-19). (1) Basic with the token as the password is taken on the loopback
+  cleartext edge as over TLS. `--vcs-http` allows cleartext on loopback alone (the grammar above; the daemon's start
+  and the edge's `serve` refuse it elsewhere, `CleartextOffLoopback`), where Bearer was already taken, so the same
+  token crosses the same loopback either way: the exposure RFC 7617 §4 and RFC 6750 §5.3 warn of is a network's, and
+  none is crossed. So the reading takes no connection: `credential(head)` reads Basic or Bearer, and
+  `BasicInCleartext`, `Refused::CleartextBasic` and its counter are gone, replaced rather than kept beside the new rule.
+  (2) Every `401` offers Basic's challenge first, with its charset, then Bearer's, on both kinds of connection
+  (`challenges(realm)`): a client that reads the first challenge alone reads Basic, and urllib's Basic handler reads
+  every field (`get_all`, line 998), so it takes Basic in either place. (3) The sites (`vcs_http::git`, `vcs_http::hg`)
+  decide without the connection's kind; `Site::decide` keeps it, the scheme a site writing absolute URLs needs (LFS's
+  call takes it for its hrefs, A-629 part 2b-ii).
+- **Tests.** `slates-http-edge`: `challenges_offer_basic_first_then_bearer_each_naming_the_realm` (red as
+  `challenges_offer_basic_first_then_bearer_on_either_connection` and
+  `basic_reads_alike_over_tls_and_on_a_loopback_cleartext_connection`, both failing on cleartext; once the reading takes
+  no connection the second is `basic_reads_rfc_7617s_own_example`). git's site:
+  `a_request_without_credentials_is_401_with_basics_challenge_first_on_either_connection`,
+  `basic_proves_its_principal_on_a_loopback_cleartext_connection_as_over_tls`, and
+  `credentials_that_prove_no_principal_are_401_and_a_repeated_line_400` (a Basic token that proves no one on cleartext,
+  the challenges whole and in order). Mercurial's site: `each_step_of_hgwebs_order_refuses_with_its_status` (the owner's
+  `heads` by Basic on cleartext served) and `refusals_name_what_the_client_may_do_instead` (Basic's challenge first).
+  The daemon's edge: `a_daemons_edge_challenges_basic_first_then_bearer_over_tls_and_in_cleartext` (a daemon whose edge
+  serves TLS and one whose edge serves cleartext, each realm its instance's) and
+  `basic_proves_its_principal_on_a_daemons_loopback_cleartext_edge` (the owner's token as Basic's password over plain
+  TCP, moved to the repository's shard and answered with receive-pack's advertisement through the push driver). Stock hg
+  7.2 against a daemon (A-680 part 2a put Mercurial's site on its edge):
+  `stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic` (a two-shard daemon whose edge serves
+  loopback cleartext, a Mercurial repository made from `fixtures/state`'s `states` and the owner's token enrolled; `hg
+  debugcapabilities` with the token as Basic's password in the URL exits 0, `getbundle` among the capabilities it lists
+  (`hg identify` gets as far, then stops: the site advertises no `lookup`, a finding of its own for main); it skips
+  loudly without stock hg 7.2, `SLATES_TEST_HG`); until main put that site on the daemon's edge, the same stock hg ran
+  against the edge serving Mercurial's site with no store (the red run's
+  `vcs_http::tests::stock_hg_meets_basic_first_on_a_loopback_edge_and_reaches_the_hg_site`, `503` once past the `401`),
+  replaced by this one. `slates-cli`: `an_anchors_vcs_http_flag_starts_its_daemons_edge` (a real anchor's cleartext edge
+  answers Basic's challenge, then Bearer's) and g083's `stock_hg_without_credentials_is_refused_in_its_own_words`,
+  un-ignored, its last wait this piece (stock hg 7.2's clone with no credentials against a real anchor refused in hg's
+  own words, exit 255).
+- **Evidence** (macOS arm64, Mac Studio, debug, `CARGO_BUILD_JOBS=2`, 2026-11-19; stock Mercurial 7.2 through `uvx
+  --quiet --python 3.12 --from mercurial==7.2 hg`, Python 3.12.16; the Windows x86_64 and Linux runs owed). Red first,
+  the tests over main b94ae6e90's code (kiln r295 at 7b8ac8402): `cargo test --locked -p slates-http-edge --lib
+  credential` 9 passed and the 2 new failed; `-p slates-server --lib -- vcs_http:: --test-threads=4` 38 passed and the 8
+  new or changed failed, stock hg ending in its crash report (`** unknown exception encountered`, exit 1, its traceback
+  through `urllib/request.py` line 1247, hg's `url.py` line 418 and line 1129's `ValueError`), the cleartext daemon
+  answering Basic `401` with Bearer's challenge alone; `-p slates-cli --test cli vcs_http` 1 passed and the anchor's
+  edge test failed on Bearer alone. Green over main 770ae8826 (kiln r325 at 4d2493b2f, and the http-edge filter again at
+  59229e97a once the TLS connection test read its credential without a connection argument): 10 of 10
+  (`slates-http-edge`, that test among them), 46 of 46 (`slates-server`'s `vcs_http`: git's, Mercurial's, the daemon
+  edge's and the edge's tests; stock hg 7.2 ran, no skip, and ended `abort: HTTP Error 503: Service Unavailable`), 2 of
+  2 with g083's ignored HTTP test listed (`slates-cli`); `cargo fmt --all -- --check` clean; no warning in this piece's
+  lines (a non-test build of `slates-server` warns 21 times, LFS's unreached call and an unused `UploadServices` import,
+  alike in the red run over main's tree). Over main 693bc8feb as it lands (kiln r361, at e338ae715, with A-681 part 1's
+  Subversion site deciding without the connection's kind too): `slates-http-edge --lib credential` 10 of 10,
+  `slates-server --lib vcs_http::` 51 of 51 (Subversion's site's five among them, its stock svn read over HTTPS; stock
+  hg ran again and reached the site), `slates-cli --test cli vcs_http` 2 of 2, `--test svn_interop -- --list` compiled
+  (5 tests), fmt clean. Over main b288b412e, with Mercurial's site on the daemon's edge (A-680 part 2a), red first again
+  over main's own code (this piece's test files alone, kiln r392 and r429): `-p slates-server --lib --
+  vcs_http::daemon_edge::` 4 passed and 3 failed (the two daemon tests above, and stock hg against the daemon in its
+  crash report, `ValueError: AbstractDigestAuthHandler does not support the following scheme: 'Bearer'`, as `hg
+  identify` and as `hg debugcapabilities`); `-p slates-cli --test cli -- vcs_http stock_hg_without_credentials` 2
+  passed, 2 failed (the anchor's edge test on Bearer alone; g083's clone with no credentials, un-ignored, `stock hg
+  crashed on the edge's refusal`), the round trip ignored. Then on this tree (kiln r415 at 1435ec4bb, r429 at
+  209a11479): `slates-http-edge --lib credential` 10 of 10, `slates-server --lib vcs_http::` 52 of 52 (stock hg 7.2's
+  `hg debugcapabilities` by Basic exits 0 listing `getbundle`, no skip), `slates-cli --test cli -- vcs_http
+  stock_hg_without_credentials` 4 of 4 with the round trip ignored (stock hg's clone with no credentials refused against
+  a real anchor in its own words, exit 255; A-685's `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge`
+  among them), `--test svn_interop -- --list` compiled (5 tests), fmt clean.
+- **Not changed, on purpose.** g083's stock-hg HTTP round trip stays ignored on the hg site's pushes (A-680 part 2b),
+  and the stock-svn interop tests' two HTTP legs on A-681's later parts and A-685, A-686 dropped from their reasons.
+- **Owed.** Stock hg's round trip over a running anchor, once the hg site takes pushes (A-680 part 2b); stock svn over
+  the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
+- **Applied in the same change to:** `crates/http-edge/src/credential.rs` (`credential`, `challenges`,
+  `CredentialRefused`, the module doc), `lib.rs` (the crate doc's credentials), `tests/credential.rs` and
+  `tests/connection.rs` (the TLS test's read); `crates/server/src/vcs_http.rs` (`Site::decide`'s doc); `vcs_http/git.rs`
+  (the module doc's step 2, `Refused`, the site's steps without the connection's kind); `vcs_http/hg.rs` and
+  `vcs_http/svn.rs` (each module doc's step 2, the site's steps); `vcs_http/tests/git.rs`, `tests/hg.rs`, `tests/svn.rs`
+  and `tests/daemon_edge.rs` (`daemon_named`, the cleartext client, stock hg's helpers and the three tests);
+  `crates/cli/tests/cli.rs` (the anchor's edge test; g083's no-credentials test un-ignored and the round trip's wait)
+  and `tests/svn_interop.rs` (two HTTP legs' waits); §4.17.2 "Access" and its status list (A-625 part 1's and part 2's
+  lines, and A-686's); A-625 part 1's "Credentials", part 2's "git's site" and part 3's "Main's rulings"; GAPS (A-625
+  part 1's and part 2's lines, g083's §4.17.3 line, Subversion's site's owed list and its interop record, the A-686
+  entry).
+
+### A-683 — git's receive-pack on the SSH edge (2026-11-19, g302, UI goal 93; §4.17.2 "A push" items 1 to 7 and "Transports" item 2; A-651, A-654 parts 2 and 3, A-662)
+
+- **What was there.** A-654 part 2's driver (`git_push::ReceivePack`: `start`, `input`, `end`, `answer`, each one step
+  on the owner shard) had one caller, the HTTP site (A-654 part 3: `vcs_http::git`'s `receive`, each step lent the
+  shard's state through its `ShardLender`, `ThisShard` in the daemon). The SSH site's services (`ToolServices`, A-651
+  part 2) ran upload-pack alone and answered `git-receive-pack` `fatal: git-receive-pack is not served yet` with 128.
+- **The decision.** (1) A sans-io `Command` over the driver, `vcs_ssh::receive::ReceiveCommand`, which the services
+  start for `git-receive-pack` with no store lender: the driver reads the repository's store on its owner shard (A-662),
+  so receive-pack is served wherever the site finds the repository, while upload-pack is lent its store by a store
+  lender (A-682's `ShardStores` in the daemon) and Mercurial's `serve --stdio` its served view by A-679's lender. The
+  services' command, `ToolCommand`, gains receive-pack as a third variant beside upload-pack's and Mercurial's, boxed so
+  its push's session (A-620's) does not set the size every connection's command takes (clippy's `large_enum_variant` is
+  denied). (2) The shard is lent a step at a time through the HTTP site's own seam: the command is generic over
+  `ShardLender` (now re-exported by `vcs_http::git`), and `ToolServices` carries one beside its stores' lenders,
+  `ThisShard` (over `with_state`) in the daemon as on the HTTP site, so both edges reach a push's shard one way. A push
+  holds nothing of the shard across the edge's awaits, the driver stays outside each lend, and a state not lent (no
+  state on the thread, the shard fenced, its state lent already) is refused in the site's not-served words, where the
+  HTTP site answers `503`. A first draft (7f2c9c791) borrowed the state through `with_state_counted` directly; the seam
+  replaced it before landing, so one rule holds for both edges and a test lends the state it holds. (3) The session as
+  git v2.50.1's `cmd_receive_pack` runs it over SSH (`builtin/receive-pack.c` lines 2558-2649, the copy §5.9 of
+  `research/vcs-servers.md` pins, sha256 `6e3cec699acf968d…`): the advertisement first, after `version 1` for a v1
+  client (line 2571), a v2 client answered at v0 ("push support for protocol v2 has not been implemented yet, so ignore
+  the request to use v2 and fallback to using v0"); exit 0 whatever each command's outcome (the report says a refusal;
+  line 2649 returns 0), and a flush alone answered with nothing (no command read, so no report). (4) Each step hands the
+  driver every byte held, a channel's window at most, and the window is given back; a command that finds input already
+  held when it has advertised steps again at once, since a client may send its request before it reads the advertisement
+  and would otherwise wait on a command that waits on it. (5) Refusals end the session in git's `die` words with 128: a
+  repository gone since the site found it as git's own after `enter_repo` (line 2547); a store not held, and a shard not
+  lent, as the site's not-served; a policy git's matcher cannot read as the site's; an exchange in git's own words where
+  git dies with fixed ones (`pkt-line.c` at v2.50.1, sha256 `a8a3cf58e3026ddd…`, lines 158, 371, 433, 450 and 458;
+  `receive-pack.c` lines 2052, 2111, 2143 and 2164), without the bytes git quotes after some, which the driver has read
+  and the command no longer holds, and in slates' words where git has none (a push past its room, refused memory). A
+  refusal sends nothing of the command's own output: the edge drops the command with what it had not sent, so a v1
+  client refused at the start reads no `version 1` line, as git dies before writing one. (6) The answer a step at a
+  time, as A-665 part 3 (landed beside this piece) made the driver's and the HTTP site answers it: each of the command's
+  steps is one `answer_step`, `Answered` exiting 0, `Sealing` (a turn of a hook's view sealed) another step with the
+  shard yielded between, and `Hook` a hook run off the shard's step, what it answered handed back through `hook_ran` in
+  a lend of its own; the push starts with the daemon's presenter, `Unpresented`, which shows no view, so a configured
+  hook is refused `hook not run`, and the signal of a client gone that ends a hook's run is owed with the presenter that
+  shows one, on both edges.
+- **Tests** (`crates/server/src/vcs_ssh/tests/receive.rs`, a child of the edge's serve tests over their SSH client): on
+  an audit daemon's shard, an empty git repository and the SSH edge served with the production site (`ToolSite` over
+  `ShardRepositories` and `ToolServices` with A-682's `ShardStores`, A-680 part 2a's `ServedViews` and `ThisShard`, as
+  the daemon's sites compose them); the owner's key runs `git-receive-pack '/pushed'` and sends stock git 2.50.1's
+  `create` push (`make-push-fixtures.sh`) 97 bytes at a time before reading the advertisement: standard output the
+  driver's advertisement and then the very report `git receive-pack` wrote, nothing on standard error, exit 0, EOF and
+  close in order, the connection ended, and `main` holding the fixture's first text; then three sessions asking v0, v1
+  and v2, each sending a flush alone: each exits 0 after the advertisement, `version 1` before it for v1 alone, nothing
+  after it, nothing landed. Two refusals before a push starts, driving the command's first step: a lender that lends no
+  state (`fatal: git-receive-pack is not served yet`, 128), and on an audit daemon's shard, its state lent, a repository
+  its partition does not hold (`fatal: 'gone' does not appear to be a git repository`, 128). The services' own test now
+  starts receive-pack over a held and an unheld store alike.
+- **Evidence** (macOS arm64, Mac Studio, debug, 2026-11-19; the Linux and Windows runs owed to main). Red first
+  (954ed792e on agents/g302-ssh-receive-red, over main 2410011da, kiln r163): `cargo test --locked -p slates-server
+  --lib -- vcs_ssh git_push --test-threads=4` 28 passed and the 2 new failed, each session answered `fatal:
+  git-receive-pack is not served yet` with 128 where the advertisement was expected; fmt clean. The first draft
+  (7f2c9c791, r187): 30 of 30. The seam over main b94ae6e90 (a00f47d7c on agents/g302-ssh-receive-land, kiln r286):
+  `cargo test --locked -p slates-server --lib -- vcs_ssh git_push vcs_http --test-threads=4` 74 of 74, the four A-683
+  tests, the services' test, the driver's three and the HTTP site's daemon push among them; `cargo fmt -p slates-server
+  -- --check` clean. Then merged as main moved, the same filters over each merge's very tree (a side branch's commit on
+  agents/g302-ssh-receive-land), fmt clean each time: over 770ae8826, whose A-651 part 3 changed the SSH site and its
+  tests' harness (0041eb501, kiln r313), 77 of 77; over 693bc8feb (288566d81, r354), 82 of 82; over 2f73eb075, whose
+  A-651 part 4 moves a connection to its repository's owner shard (002fe9d0a, r375), 84 of 84; over f1fbd2c44, whose
+  A-664 part 3 advances a green's map of paths at each push's append (1c4cfa019, r403), 85 of 85; over 5206419be, whose
+  A-682 lends upload-pack's stores (`ShardStores`, now the receive test's store lender too, and its own SSH session test
+  building the services with `ThisShard`), with `vcs_store::upload` added to the filters (2ce314437, r454), 92 of 92;
+  over be892650b, whose A-679 serves Mercurial's `serve --stdio` from the same services (three lenders now; its start
+  test names receive-pack's command, which r482 found left out, E0004) (4e16156e7, r492), 106 of 106; over 0b0c8e12e,
+  whose A-665 part 3 answers a push a step at a time with hooks run off the shard's step and A-688 serves Subversion's
+  tunnel beside the services (0264fa090, r512), 119 of 119; and the landed tree, over 20ae700a7, whose A-684 starts the
+  daemon's SSH edge, its site now serving receive-pack with `ThisShard` (a61f5282e, tree e58212107, r530), 124 of 124,
+  A-684's daemon-edge tests among them. No integration target runs either edge's receive-pack yet: the HTTP site's push
+  test is a lib test, and `crates/cli/tests/git_interop.rs`'s `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`
+  (stock git over OpenSSH to the daemon's SSH edge, A-684's) is ignored, waiting on A-684 and this piece; lifting its
+  ignore and running it is main's.
+- **Owed.** A push over a connection A-651 part 4 moved to its repository's owner shard (it landed beside this piece,
+  and its own tests move connections running other commands): a two-shard daemon, as the HTTP site's push test runs;
+  main's live stock `git push` over SSH; every item A-654 part 2 owes (the hooks, older bases, the policy's principals
+  other than the owner at the append, push options, review requests).
+- **Applied in the same change to:** `crates/server/src/vcs_ssh/receive.rs` (new), `vcs_ssh/site.rs` (`ToolServices`
+  with its shard lender beside A-682's and A-679's lenders, `ToolCommand`'s receive-pack, the module docs' step 3),
+  `vcs_ssh.rs` (the module, the daemon's edge's note and the owed list), `vcs_ssh/daemon_edge.rs` (A-684's daemon site
+  serving receive-pack with `ThisShard`), `vcs_ssh/tests/receive.rs` (new), `vcs_ssh/tests/serve.rs` (its child),
+  `vcs_ssh/tests/git.rs` (the services' test), `vcs_http/git.rs` (`ShardLender` re-exported), `vcs_http/git/receive.rs`
+  (the trait's doc names its SSH caller), `git_push.rs` (its tests crate-visible; its callers), `git_push/tests.rs` (the
+  fixtures crate-visible), `lib.rs` (the modules' notes), `vcs_store/upload/tests.rs` (A-682's SSH session) and
+  `vcs_ssh/tests/hg.rs` (A-679's site and its start test, which names receive-pack's command too) building the services
+  with `ThisShard`; §4.17.2's status (A-654 part 2's and part 3's owed calls, A-651's, A-679's and A-684's lines on
+  receive-pack, A-683's status); GAPS (A-654's and A-684's entries, the A-683 entry).
 
 ### A-680 part 2b — Mercurial's pushes over HTTP: `unbundle` read as 7.2 reads it, landed through `hg_push` into the repository's store on its owner shard, answered as 7.2 frames `unbundle`'s answers (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Push" steps 1 to 7, "Hooks" and pieces 4 and 5; A-641, A-657, A-662, A-680 parts 1 and 2a)
 Applied in the same change to: §4.17.3 (a status block, pieces 4's and 5's lines), `crates/hg` (`push`: `read_bundle`,

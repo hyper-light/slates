@@ -25,8 +25,9 @@
 //! (`super::site::ToolServices`), each from the lender the HTTP edge's sites use: git's upload-pack from each
 //! repository's store (`crate::vcs_store::upload::ShardStores`, A-682) and Mercurial's `serve --stdio` from each
 //! repository's served view (`crate::vcs_store::hg_view::ServedViews`, A-680 part 2a, A-679), lent on the owner's shard,
-//! each request admitted the edge's room; receive-pack and Subversion's tunnel refused as not served until their entry
-//! points land (A-683, A-688).
+//! and git's receive-pack through the push driver on the owner's shard, its state lent a step at a time as the HTTP
+//! edge's git site lends it (`crate::vcs_http::git::ThisShard`, A-683), each request and each push admitted the edge's
+//! room; Subversion's tunnel refused as not served until its stores' lender lands (A-688).
 //!
 //! Each reason the edge cannot start (no host key, an address that does not bind, a listener held elsewhere) leaves the
 //! daemon serving everything else, logged, as the HTTP edge's does.
@@ -42,6 +43,7 @@ use super::{EdgeState, HostSeed, keep_here, serve};
 use crate::config::{DaemonConfig, VcsSshConfig};
 use crate::daemon::VcsSshEdge;
 use crate::vcs_http::ShardRepositories;
+use crate::vcs_http::git::ThisShard;
 use crate::vcs_store::hg_view::ServedViews;
 use crate::vcs_store::upload::ShardStores;
 
@@ -52,7 +54,7 @@ const NOT_KEPT: &str = "vcs_ssh.not_kept";
 
 /// The SSH site as the daemon serves it (the module doc, "What it serves").
 pub(crate) type DaemonSite =
-  ToolSite<RecordKeys, ShardRepositories, ToolServices<ShardStores, ServedViews>>;
+  ToolSite<RecordKeys, ShardRepositories, ToolServices<ShardStores, ServedViews, ThisShard>>;
 
 /// Starts the SSH edge `config` names, if it names one (the module doc): every shard of `shards` keeps its edge state and
 /// the `control` shard serves the listener, its host key read from `segment` where the anchor published one. The edge's
@@ -120,7 +122,7 @@ pub(crate) fn start(
         DaemonSite::new(
           RecordKeys,
           ShardRepositories,
-          ToolServices::new(ShardStores, ServedViews, room),
+          ToolServices::new(ShardStores, ServedViews, ThisShard, room),
         )
       })
       .await

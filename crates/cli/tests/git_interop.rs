@@ -672,9 +672,9 @@ fn stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_a_bearer_toke
 /// first): the round trip as [`stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_a_bearer_token`] runs
 /// it, the token given as Basic's password in the URL (`http://git:TOKEN@127.0.0.1:PORT/project`), as a user gives a
 /// password to stock git, which sends it once the edge's `401` offers Basic. Expect every step as [`round_trip`]
-/// states. Skips loudly as that test does.
+/// states. Skips loudly as that test does. Its one wait ended with A-686: before it the cleartext edge's `401` offered
+/// Bearer alone, and stock git answered `fatal: Authentication failed` (g309's kiln r426).
 #[test]
-#[ignore = "waits on A-686 (g258: Basic with the token as password on the loopback edge, Basic's challenge first)"]
 fn stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_basic() {
   let Some(program) = stock_git() else {
     eprintln!(

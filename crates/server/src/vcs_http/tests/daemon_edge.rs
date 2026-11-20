@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream as ClientStream;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -79,6 +80,12 @@ fn identity() -> (EdgeIdentity, CertificateDer<'static>) {
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`.
 fn daemon(identity: EdgeIdentity) -> Daemon {
+  daemon_named(Some(identity)).0
+}
+
+/// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`, or serving
+/// cleartext without one, and its instance's name, which its edge's realm names (`slates <instance>`).
+fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -89,14 +96,20 @@ fn daemon(identity: EdgeIdentity) -> Daemon {
   let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
   config.vcs_http = Some(VcsHttpConfig {
     address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
-    identity: Some(identity),
+    identity,
   });
-  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance })
-    .expect("the daemon starts");
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: instance.clone(),
+    },
+  )
+  .expect("the daemon starts");
   daemon
     .bootstrap(true)
     .expect("the daemon creates its initial group");
-  daemon
+  (daemon, instance)
 }
 
 /// A git repository's name that routes to [`REPOSITORY`]'s partition, not the listener's.
@@ -1021,6 +1034,41 @@ fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<
     .collect()
 }
 
+/// A plain connection to the edge on loopback `port`, its reads waiting [`PATIENCE_NS`].
+fn cleartext_client(port: u16) -> ClientStream {
+  let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    .expect("the edge's listener takes the connection");
+  socket
+    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .expect("a read timeout");
+  socket
+}
+
+/// The head and the body of the answer to `request`, sent whole on `stream`.
+fn head_and_body(stream: &mut (impl Read + Write), request: &[u8]) -> (String, Vec<u8>) {
+  stream.write_all(request).expect("the request is sent");
+  let mut head = Vec::new();
+  while !head.ends_with(b"\r\n\r\n") {
+    head.extend(line_of(stream));
+  }
+  let head = String::from_utf8_lossy(&head).into_owned();
+  let body = body_of(stream, &head);
+  (head, body)
+}
+
+/// The values of `head`'s `WWW-Authenticate` fields, in the order its answer gives them.
+fn challenges_in(head: &str) -> Vec<String> {
+  head
+    .lines()
+    .filter_map(|line| {
+      let (name, value) = line.split_once(':')?;
+      name
+        .eq_ignore_ascii_case("WWW-Authenticate")
+        .then(|| value.trim().to_owned())
+    })
+    .collect()
+}
+
 /// A-680 part 2b (main's ruling, 2026-11-19: a stock `hg push` over HTTP lands on its repository's owner shard; golden:
 /// stock 7.2's push over HTTP, `crates/hg/fixtures/wire`'s `http-push`). Do: start a two-shard daemon whose edge serves
 /// loopback TLS; create an empty Mercurial repository on the second shard's partition and enroll its owner's token;
@@ -1069,4 +1117,173 @@ fn a_stock_mercurial_push_over_the_daemons_edge_lands_on_its_repositorys_shard()
   );
   assert_eq!(heads, (200, format!("{FOURTH}\n").into_bytes()));
   assert_eq!(phases, (200, HG_PHASES_AFTER.to_vec()));
+}
+
+/// The status the answer `head` heads names, if its status line names one.
+fn status_in(head: &str) -> Option<u16> {
+  head.split(' ').nth(1)?.parse().ok()
+}
+
+/// The status and the challenges of the answer `head` heads.
+fn status_and_challenges(head: &str) -> (Option<u16>, Vec<String>) {
+  (status_in(head), challenges_in(head))
+}
+
+/// The status and the challenges an edge whose realm names `instance` answers a request with no credentials: `401`,
+/// Basic's challenge with its charset first and Bearer's second (A-686).
+fn challenged(instance: &str) -> (Option<u16>, Vec<String>) {
+  (
+    Some(401),
+    vec![
+      format!("Basic realm=\"slates {instance}\", charset=\"UTF-8\""),
+      format!("Bearer realm=\"slates {instance}\""),
+    ],
+  )
+}
+
+/// Format: a request for a git repository's refs that carries no credentials.
+const BARE_REQUEST: &[u8] =
+  b"GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+/// A-686 (main's ruling, 2026-11-19: Basic's challenge first on every connection, TLS included). Do: start a daemon
+/// whose edge serves loopback TLS and ask it for a repository's refs with no credentials; then one whose edge serves
+/// loopback cleartext (no identity) and ask it the same. Expect: both answer `401` with two challenges, Basic's with
+/// its charset first and Bearer's second, each naming its daemon's realm (`slates <instance>`), so stock Mercurial 7.2,
+/// whose urllib reads the first challenge alone, reads Basic from either edge.
+#[test]
+fn a_daemons_edge_challenges_basic_first_then_bearer_over_tls_and_in_cleartext() {
+  let (identity, certificate) = identity();
+  let (daemon, over_tls) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let (tls_head, _) = head_and_body(&mut tls_client(port, &certificate), BARE_REQUEST);
+  daemon.stop();
+  let (daemon, in_cleartext) = daemon_named(None);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let (cleartext_head, _) = head_and_body(&mut cleartext_client(port), BARE_REQUEST);
+  daemon.stop();
+  assert_eq!(
+    (
+      status_and_challenges(&tls_head),
+      status_and_challenges(&cleartext_head)
+    ),
+    (challenged(&over_tls), challenged(&in_cleartext))
+  );
+}
+
+/// A-686 (main's ruling, 2026-11-19: Basic with the token as the password is taken on the loopback cleartext edge as
+/// over TLS). Do: start a two-shard daemon whose edge serves loopback cleartext (no identity); create a git repository
+/// on the second shard's partition and enroll its owner's token; then, each on a new plain connection, ask for
+/// receive-pack's advertisement with the owner's token as Basic's password (`git:<token>`, the only credential stock
+/// git sends), and with no credentials. Expect: the Basic request proven, moved to the repository's shard and answered
+/// `200` with the push driver's advertisement (the prelude, then no ref), the bare one `401`, and the listener's shard
+/// counting the one move.
+#[test]
+fn basic_proves_its_principal_on_a_daemons_loopback_cleartext_edge() {
+  let (daemon, _) = daemon_named(None);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let advertise = |credentials: &str| {
+    format!(
+      "GET /{name}/info/refs?service=git-receive-pack HTTP/1.1\r\nHost: localhost\r\n\
+       {credentials}\r\n"
+    )
+  };
+  let basic = advertise(&format!("{OWNER_BASIC}\r\n"));
+  let (basic_head, basic_body) = head_and_body(&mut cleartext_client(port), basic.as_bytes());
+  let (bare_head, _) = head_and_body(&mut cleartext_client(port), advertise("").as_bytes());
+  let moved = counts_on(&daemon, LISTENER).moved;
+  daemon.stop();
+  assert_eq!(
+    (
+      status_in(&basic_head),
+      basic_body,
+      status_in(&bare_head),
+      moved
+    ),
+    (Some(200), served_advertisement(&[]), Some(401), 1),
+    "{basic_head}"
+  );
+}
+
+/// Shape: the variable naming the command that runs stock Mercurial 7.2, its words split at spaces: on the Mac Studio
+/// `uvx --quiet --python 3.12 --from mercurial==7.2 hg`, as `crates/hg/fixtures/make-fixtures.sh` runs it. Unset, `hg`
+/// on the path.
+const STOCK_HG: &str = "SLATES_TEST_HG";
+
+/// Stock Mercurial 7.2's command, its words as [`STOCK_HG`] names them, or `None` when this host runs none, which the
+/// caller skips loudly: the command must answer `--version` with 7.2's line.
+fn stock_hg() -> Option<Vec<String>> {
+  let line = std::env::var(STOCK_HG).unwrap_or_else(|_| "hg".to_owned());
+  let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+  let (program, leading) = words.split_first()?;
+  let version = Command::new(program)
+    .args(leading)
+    .arg("--version")
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .stdin(Stdio::null())
+    .output()
+    .ok()?;
+  let said = String::from_utf8_lossy(&version.stdout);
+  (version.status.success() && said.contains("(version 7.2")).then_some(words)
+}
+
+/// Runs stock hg (its command's `words`) with `args`, outside any user's configuration (`HGRCPATH` empty), in its plain
+/// words (`HGPLAIN`), with no terminal to prompt on and each of its socket's waits bounded by [`PATIENCE_NS`]
+/// (`http.timeout`): its exit code and both outputs.
+fn hg_run(words: &[String], args: &[&str]) -> (Option<i32>, String, String) {
+  let (program, leading) = words.split_first().expect("a command");
+  let timeout = format!(
+    "http.timeout={}",
+    Duration::from_nanos(PATIENCE_NS).as_secs_f64()
+  );
+  let output = Command::new(program)
+    .args(leading)
+    .args(["--config", &timeout])
+    .args(args)
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .stdin(Stdio::null())
+    .output()
+    .expect("stock hg runs");
+  (
+    output.status.code(),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
+/// A-686 with A-680 part 2a (main's ruling, 2026-11-19: Basic with the token as the password taken on the loopback
+/// cleartext edge as over TLS, Basic's challenge first). Do: start a two-shard daemon whose edge serves loopback
+/// cleartext (no identity); on the second shard's partition create a Mercurial repository from `fixtures/state`'s
+/// `states` and enroll its owner's token; run stock Mercurial 7.2's `hg debugcapabilities` against the repository with
+/// the token as Basic's password in the URL. Expect: hg reads the edge's `401`, whose first challenge is Basic's, sends
+/// Basic, which the loopback edge takes, and is answered by Mercurial's site from the repository's store on its owner
+/// shard: exit 0, `getbundle` among the capabilities it lists. Before A-686 the cleartext edge's `401` offered Bearer
+/// alone, on which 7.2's urllib digest handler, reading the first challenge alone, raised (`** unknown exception`, exit
+/// 1). Skips loudly without stock hg 7.2 ([`STOCK_HG`]).
+#[test]
+fn stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg against the daemon's edge: no Mercurial 7.2 here \
+       (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let (daemon, _) = daemon_named(None);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_hg_from_states(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let url = format!("http://hg:{OWNER_TOKEN}@127.0.0.1:{port}/{name}");
+  let (code, out, err) = hg_run(&hg, &["debugcapabilities", &url]);
+  daemon.stop();
+  assert_eq!(
+    (code, out.lines().any(|line| line.trim() == "getbundle")),
+    (Some(0), true),
+    "{out}{err}"
+  );
 }
