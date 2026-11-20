@@ -159,3 +159,12 @@
   (main with A-725) vs -old-1 (main just before A-725), 3 runs each, both arches. Patch: ~/.cache/w-bugs-msg/race.patch.
 - B-list for main: B6 has no record anywhere (state, repo, bug-claims); g079's rebuilt list (2026-11-19) lacked it with
   B1/B7 (landed) -- likely closed before the wipe, unverifiable here.
+- Disk (main 2026-11-20): deleted ~/.cache/w-bugs-target; ~/.cache/w-bugs-target-land kept without incremental/; builds now CARGO_INCREMENTAL=0. ~/.cache/slates-work-target-g227-* is not mine.
+- A-747 LANDED main 4e9c31aba (14c95642f): main's red route::hostile_claims_... -- not A-735 (fails at its parent and
+  back to d576a383a, which added the silent-connection step: never passed on macOS). Cause: XNU setsockopt(SO_NOSIGPIPE)
+  EINVAL on an accepted socket whose client already closed -> Listener::accept Err -> route_failed. Fix: Accepted::
+  {Connection, Departed}; serve counts Departed as route_malformed.
+- Windows items (CI both arches): A-551 red-checked (folding test FAILS with CaseSensitiveSearch forced; green passes);
+  A-576 drive test (ɐ/Ɐ one file, ς/σ two) green, red with the same forced flag; workloads (git/hg/svn) pass on stock
+  WinFsp; A-498 hang REPRODUCED on pre-A-725 main x86_64 (2 of 3 runs: one 10 s timeout at round 7, one process hang
+  at round 43) and gone with A-725 (6/6). To land: the race test + A-576 drive test (patches in ~/.cache/w-bugs-msg).
