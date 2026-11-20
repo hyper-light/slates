@@ -92,3 +92,11 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   after A-722 lands.
 - P4a LANDED fbb5d5f8b; P4b LANDED 87edaacb6 (merge d6673b719). Questions for P6 in inbox/goal91-w-shared-from-w-balance.md.
 - NEXT: P5 (intake work off the owner shard; content homed by identity across a node's shards, N=1).
+- Cleared ~/.cache/w-balance-target/debug/incremental (7.6 GB) per main.
+- P5a LANDED 129cd0d1b: vcs_store::homes (home_of, keep_here/read_here/let_go_here, async home/read/let_go),
+  db register rendezvous_weight_of + rendezvous_ranked_by_key (outputs unchanged, register:: 93/93).
+- Main's answers: Q2 yes (move moves register + hot set; cold stays at identity homes); Q4 agreed (no coordination).
+  Q1 (w-shared), Q3 (w-fed-faults): no reply in inbox yet.
+- NEXT: P5b = cold lever 3 (move a repository's cold windows to homes; stores read through) needs a read-through seam
+  in ContentStore/git store (crates w-perf/w-git own) -> propose seam; intake decode on ingress shard waits on A-722.
+  Meanwhile P7 harness (push_load.py many repos) can proceed.
