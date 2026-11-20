@@ -192,3 +192,47 @@ sparse ambiguous-commits 67fd
 sparse ambiguous-commits-path 67fd:dir/file
 sparse ambiguous-tags 2188
 git config --unset uploadpack.allowFilter
+# Revision suffixes (A-640 part 4, fifth slice): parents and ancestors, peels, and `@{...}` in a repository that keeps
+# no reflog, as a served one keeps none, with git's branch marks; `67fd~1` reads the alike commits' abbreviation for a
+# commit.
+git config uploadpack.allowFilter true
+while read -r name blob_ish; do sparse "$name" "$blob_ish"; done <<'NAMES'
+ancestor main~1:dir/file
+ancestor-bare main~:dir/file
+parent main^:dir/file
+parent-zero main^0:dir/file
+parent-second main^2:dir/file
+ancestor-past main~3
+ancestor-pathless main~2:dir/file
+ancestor-huge main~2147483648
+ancestor-head @~1:dir/file
+parent-tag v1^0:dir/file
+ancestor-blob 4cdb2265d30204be5463b38174b2e8e717982405~1
+ancestor-ambiguous 67fd~1:dir/file
+peel-tree main^{tree}:dir/file
+peel-commit main^{commit}:dir/file
+peel-deref v1^{}:dir/file
+peel-tag v1^{tag}
+peel-blob-mismatch main^{blob}
+peel-blob 4cdb^{blob}
+peel-object main^{object}
+peel-unknown main^{foo}
+peel-trailing main^{commit}x}
+peel-search-empty main^{/}:dir/file
+reflog-branch main@{1}:dir/file
+reflog-head-zero @{0}:dir/file
+reflog-head-one @{1}
+reflog-head-date @{yesterday}
+reflog-head-word @{garbage}
+reflog-head-month @{jan}
+reflog-named-head HEAD@{0}:dir/file
+prior @{-1}:dir/file
+prior-late main@{-1}
+upstream main@{upstream}
+upstream-short @{u}
+upstream-nosuch nosuch@{u}
+upstream-path main@{upstream}:dir/file
+push main@{push}
+push-nosuch nosuch@{push}
+NAMES
+git config --unset uploadpack.allowFilter
