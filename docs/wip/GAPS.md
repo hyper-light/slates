@@ -719,6 +719,11 @@
 > its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
 > exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
 > the daemon's edge is built since (stock git's interop tests, next).
+> **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
+> stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
+> commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
+> A-704), git-http-backend, Gitaly, mod_dav_svn, the Linux kernel dataset, server CPU and memory, concurrent clients.
+>
 > **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
 > (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
 > first commit pushed to an empty repository, cloned, an edit pushed from the clone and fetched back into the first
@@ -755,9 +760,10 @@
 > (kiln r392 and r429: both in hg's crash report), then 10 of 10, 52 of 52 and 4 of 4 (r415, r429), fmt clean. g309's
 > stock git round trip with the token as Basic's password in the URL against a real anchor (`git_interop`), its one
 > wait this piece, un-ignored as main merged it in (red there: `fatal: Authentication failed`, g309's kiln r426).
-> g083's stock-hg round trip over the anchor's edge runs un-ignored since A-680 part 2b (the hg site's pushes). Owed:
-> stock `hg identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
-> found here, main's); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
+> g083's stock-hg round trip over the anchor's edge runs un-ignored since A-680 part 2b (the hg site's pushes). Stock
+> `hg identify` resolves through `lookup` since A-705 (`serve::lookup`, 7.2's `revsymbol` order, listed over HTTP and
+> SSH; held to stock 7.2's recorded answers; both round trips run `identify -r tip`; macOS arm64, this Mac, local).
+> Owed: tags beyond `tip` in `lookup` (no `.hgtags` reading yet); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -1272,9 +1278,8 @@
 > offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
 > first challenge alone), until A-686 put Basic's challenge first and took Basic with the token as password on the
 > loopback edge. The HTTP round trip passes since the hg site's pushes (A-680 part 2b: stock hg 7.2, macOS arm64, Mac
-> Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one waits on the pushes
-> over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
-> (A-679, built) reads as the HTTP site does (A-680).
+> Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one too since its pushes
+> (A-696: `unbundle` over `serve --stdio` through the same driver; stock hg 7.2, macOS arm64, Mac Studio, 1 of 1).
 > Stock hg 7.2's clone over the SSH edge runs (w-interop, 2026-11-20): `stock_hg_clones_over_the_ssh_edge`, an empty
 > repository cloned and pulled, host key checked strictly (macOS arm64, Mac Studio, kiln r3: 1 of 1, fmt clean).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
@@ -1304,14 +1309,15 @@
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
 > step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes (A-657 part 4
 > built the policy before the verdict in `acl`'s words and the `pretxnchangegroup` and `changegroup` hooks through
-> the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the SSH edge's pushes through the same
-> driver (`unbundle` in `serve --stdio`'s session, which A-679 serves for reads alone);
+> the driver): the principal's Mercurial identity in `acl`'s words (§4.13);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
 > `check:phases` (one position for every phase) measured under concurrent pushes before it is kept; (6) the changesets
-> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream
-> clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
+> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (rendered
+> since A-706, `render::render`: split revlog v1 generaldelta revlogs of full texts, fncache, phaseroots, bookmarks,
+> obsstore; stock 7.2 `hg verify` passes on the rendered `dot` and `states` fixtures; owed: deltas and compression,
+> rendering in slices as versions commit; then `stream_out`, `stream2`, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
 > lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
 > against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
@@ -1744,6 +1750,10 @@
 > A-693 part 1, 2026-11-19 (w-svn): `get-lock` and `get-locks` answered from the lock table (stock `svnserve`'s
 > recorded `info`/`ls` sessions now replayed with them; a held, an expired and a hidden lock; the depth refusal).
 > Owed: the four lock-changing verbs through the owner's step (A-693 part 2).
+> A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
+> (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
+> access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
+> server `vcs_svn::` 9 of 9) signs in on either shard and reads. Owed: commits (A-698), the interop leg.
 > A-692 (2026-11-19, g307): `svn://`'s CRAM-MD5 against enrolled tokens. A token's credential record keeps HMAC-MD5's
 > keyed contexts beside its hash (`CredentialKind::HttpToken`'s `cram_md5_contexts`, Dovecot's layout), derived by the
 > CLI's issuer as it mints the token, so the daemon holds neither the token nor anything that gives it back; a client

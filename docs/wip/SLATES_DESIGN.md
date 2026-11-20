@@ -12496,6 +12496,9 @@ A-363's failover estimate is the pattern: its estimators keep learning from the 
 **The order-of-magnitude method.** Main measures and records it in `BENCHMARKS.md` under the rule of the project's
 §5: release builds, the hardware, the dataset's commit, the date, the load discipline, and the best of N with all N
 shown.
+> **Status (A-699, 2026-11-20, w-perf):** the stock baselines are recorded (`crates/cli/bench/{git,hg,svn}_scale.sh`,
+> BENCHMARKS.md): git/git, Mercurial's repository and git/git's newest 5,000 commits as svn, over `git daemon`,
+> `hg serve` and `svnserve`; slates' side and the remaining competitors and measures are owed.
 - Competitors: `git-http-backend` and Gitaly for git; `hg serve` for Mercurial; `svnserve` and `mod_dav_svn` for
   Subversion.
 - Dataset: the Linux kernel tree the load tests already hold, as a git repository, and its conversions to Mercurial
@@ -14421,6 +14424,8 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 **Pull and clone.**
 1. Discovery (`heads`, `known`, `branchmap`, `lookup`, `listkeys`, and the legacy `between` and `branches`) reads the
    index in RAM at one register position (§4.17.1 "Reads"): one consistent cut of every line, bookmark and phase.
+   Status (A-705): `lookup` served over both transports in 7.2's `revsymbol` order (`serve::lookup`); tags beyond `tip`
+   owed.
 2. `getbundle` with `common` and `heads`: the missing changesets are the ancestors of `heads` that are not ancestors of
    `common`, in the served view (no secret and no hidden changeset), walked over revision numbers as Mercurial's own
    outgoing computation walks them [C: `exchange._computeoutgoing`].
@@ -14523,6 +14528,9 @@ follow the pinned client's own writer (`revlogutils/deltas.py`), so a stream clo
 would have built, and `hg verify` on the clone is the check: the rule is the client's, not a slates tunable. A stream
 is offered only when it holds nothing the principal may not read. The same rendering is the read-only repository the
 admission hooks see and what an export lands (§4.15).
+Status (A-706, stream clones part 1): `slates_hg::render` renders the index whole into those files, each revision a full
+text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
+deltas, the rendering appended as versions commit, `stream_out` and `stream2` are later parts.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -14681,8 +14689,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
    index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
-   owed: the process around the stdio session, the learned response compression (the first value until then), and the
-   SSH edge's pushes (`unbundle` in the stdio session, through the same driver). Built (A-680 part 2a,
+   owed: the process around the stdio session and the learned response compression (the first value until then).
+   Built (A-696): the SSH edge's pushes, `unbundle` in the stdio session through the same driver. Built (A-680 part 2a,
    `vcs_http::ToolSites`, `vcs_store::hg_view`): the site on the daemon's edge, each repository's served view lent from
    its store on its owner shard; and its pushes (A-680 part 2b), `unbundle` through `hg_push::unbundle`. Built (A-679,
    `crates/server` `vcs_ssh::hg`): the stdio session behind the daemon's SSH edge, over the same lender; the daemon
@@ -15209,6 +15217,11 @@ and export by landing).
 > repository's lock table at the call's instant (`slates_svn::reads::answer_lock_read`, `serve.c` 3366-3446): a held
 > lock as `write_lock` writes it, an expired one and one on an unreadable path left out, a depth `get_locks` refuses in
 > its words. Owed: `lock`, `lock-many`, `unlock`, `unlock-many` through the owner's step.
+>
+> **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
+> UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
+> token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's
+> principal writing where the repository's policy reaches it. Owed: commits through the owner's step (A-698).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),

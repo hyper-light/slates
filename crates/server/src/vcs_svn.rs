@@ -46,28 +46,33 @@
 //! **Opened.** On the owner, no Subversion repository of the name is "No repository found in '…'" (210005). Its records
 //! are read as the shared Subversion lender lends them there (`crate::vcs_store::svn_view::lend_in`, A-681): a
 //! repository whose records the shard does not hold closes the connection, counted. Otherwise the repository is opened
-//! with its UUID (also its realm, `svnserve`'s default), its root URL as `find_repos` derives it, and the mechanisms it
-//! allows: none yet, since a client that has not authenticated is no principal (§4.13), so no repository reads
-//! anonymously, and CRAM-MD5 waits on the keyed contexts of enrolled credentials (A-692). A repository that allows no
-//! one is answered as `svnserve` answers one, "No access allowed to this repository" (170001), and the connection ends.
-//! The authenticated session, each call's sources lent afresh by the same lender, follows once a mechanism does (GAPS,
-//! A-656).
+//! with its UUID (also its realm, `svnserve`'s default), its root URL as `find_repos` derives it, and CRAM-MD5 alone: a
+//! client that has not authenticated is no principal (§4.13), so no repository reads anonymously. The client names an
+//! enrolled token by its id in hex and answers the challenge with the token as its password; the key is the one the
+//! token's record keeps (A-692, `crate::credentials::cram_md5_key`), the session's principal the token's, and a user no
+//! live token's record keys is answered as `svnserve` answers a user it has no password for. From there each call is
+//! handed the repository's sources, lent afresh on the owner, with the principal's access: write where the repository's
+//! policy lets it reach the repository at all, nothing where not (`vcs_policy::reaches`). A commit ends the connection
+//! until it is handed to the owner's step (GAPS, A-656).
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::task::{Poll, Waker};
 
-use slates_db::catalog::VcsTool;
+use slates_db::catalog::{Principal, RepositoryId, VcsTool};
 use slates_rt::futures::{cancel, detach, now_ns, spawn_child};
 use slates_rt::shard::Kept;
 use slates_rt::tcp::{OwnedStream, SocketAddrV4, TcpListener, TcpStream};
 use slates_rt::{RtError, Runtime, ShardId, TaskId, futures};
 use slates_svn::dump::Uuid;
 use slates_svn::find::{Found, find_repository};
+use slates_svn::handshake::Verdict;
 use slates_svn::handshake::{Access, Unserved};
 use slates_svn::index::{ContentIdentity, Revision};
 use slates_svn::report::exchange::Budget;
-use slates_svn::serve::{Connection, Limits, Sources, Turn};
+use slates_svn::serve::{Connection, Limits, Policy, Sources, Turn};
+
+use slates_vfs::clock::Clock;
 
 use crate::config::DaemonConfig;
 use crate::vcs_http::waits::first_rto_ns;
@@ -121,18 +126,36 @@ const SVN_READ_PAGES: usize = 4;
 /// (`SVN_RA_SVN__READBUF_SIZE`), so a read takes what one of `svnserve`'s would. A connection holds it beside its items.
 const READ_BYTES: usize = SVN_READ_PAGES * SVN_PAGE_BYTES;
 
-/// Derived: the nodes a drive holds open in the repository a connection resolves (`Limits::most_open`: the deepest path
-/// it holds, in names, and its root): the root alone, since no drive runs before a session is authenticated, which none
-/// is yet (the module doc); the authenticated session takes the repository's own.
-const ROOT_ALONE: usize = 1;
+/// Format: the fewest bytes a path spends on one of its names: a name of one byte and its `/`.
+const NAME_BYTES: usize = 2;
+
+/// The rights some name of a repository must grant an authenticated principal for its session to write: any of the four,
+/// each command then judged by the session, as the `svn+ssh://` tunnel opens one.
+const SESSION_RIGHTS: [crate::vcs_policy::Right; 4] = [
+  crate::vcs_policy::Right::Read,
+  crate::vcs_policy::Right::Submit,
+  crate::vcs_policy::Right::Rewrite,
+  crate::vcs_policy::Right::Delete,
+];
 
 /// Whether a repository lets a client read without authenticating (`svnserve`'s `anon-access`): none does, since every
 /// request is a principal's and a client that has not authenticated is none (§4.13).
 const ANONYMOUS_READS: bool = false;
 
-/// Whether a repository's users may authenticate with CRAM-MD5: not until the keyed contexts of enrolled credentials
-/// are held (A-692), so no mechanism is offered and a repository answers as `svnserve` answers one that allows no one.
-const CRAM_MD5_KEYS: bool = false;
+/// Whether a repository's users may authenticate with CRAM-MD5: every repository's, a user naming an enrolled token by
+/// its id, the key the token's record keeps (A-692, `crate::credentials::cram_md5_key`).
+const CRAM_MD5_KEYS: bool = true;
+
+/// The host a CRAM-MD5 challenge names (`cram.c` `make_nonce`'s `<nonce.time@host>`): any text a client echoes back
+/// in its digest; `svnserve` writes its own host name, which a client never reads.
+const CHALLENGE_HOST: &std::ffi::CStr = c"slates";
+
+/// Format: nanoseconds in a microsecond, the unit of the challenge's time (`apr_time_now`).
+const NANOS_PER_MICRO: i64 = 1_000;
+
+/// Counter: a CRAM-MD5 response naming no key a token's record holds: answered as `svnserve` answers a user it has
+/// no password for.
+const UNKEYED: &str = "vcs_svn.unkeyed";
 
 /// Whether `repos-info` announces mergeinfo: every repository keeps it, as an FSFS repository of a format that records
 /// mergeinfo announces it (`svn_repos_has_capability`; the recorded `anonymous` session's `( mergeinfo )`).
@@ -443,7 +466,9 @@ pub(crate) fn start(
   let limits = Limits {
     item_bytes: room,
     report_room: room,
-    most_open: ROOT_ALONE,
+    // Derived: the nodes a drive holds open (`Limits::most_open`), the deepest path the repository holds and its
+    // root: no path a client names or a commit adds holds more names than one item can carry.
+    most_open: (room / NAME_BYTES).saturating_add(1),
   };
   let listener = match crate::daemon::held_or_bound_listener(
     slates_anchor::ENV_VCS_SVN,
@@ -587,6 +612,15 @@ enum Next {
     /// The bytes the answer took.
     consumed: usize,
   },
+  /// The client chose CRAM-MD5, its first `consumed` bytes: challenge it.
+  Challenge(usize),
+  /// The client's CRAM-MD5 response named `user`, its first `consumed` bytes: answer with that user's key.
+  Key {
+    /// The user, a token's id in hex.
+    user: Vec<u8>,
+    /// The bytes the response took.
+    consumed: usize,
+  },
   /// End the connection.
   End,
 }
@@ -601,6 +635,18 @@ struct Conversation {
   limits: Limits,
   /// When a wait on the client becomes overdue.
   deadline_ns: u64,
+  /// The repository opened, once it is, on its owner shard.
+  opened: Option<Opened>,
+  /// The principal the client's token proved, once it authenticated.
+  principal: Option<Principal>,
+}
+
+/// The repository a conversation opened: its id and name on the owner shard.
+struct Opened {
+  /// Its id.
+  id: RepositoryId,
+  /// Its name, which its green goes by in FSFS's messages.
+  name: String,
 }
 
 /// What one step of a conversation leads to ([`step`]).
@@ -628,6 +674,8 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     input: Vec::new(),
     limits,
     deadline_ns: now_ns().saturating_add(bound_ns),
+    opened: None,
+    principal: None,
   };
   go_on(stream, conversation, seat).await;
 }
@@ -662,12 +710,7 @@ async fn step(
   seat: &Seat,
 ) -> Stepped {
   out.clear();
-  let next = answer(
-    &mut conversation.connection,
-    &conversation.input,
-    out,
-    conversation.limits,
-  );
+  let next = answer(conversation, out);
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
@@ -691,6 +734,18 @@ async fn step(
     }
     Next::Again => Stepped::Go,
     Next::End => Stepped::End,
+    Next::Challenge(consumed) => {
+      conversation
+        .input
+        .drain(..consumed.min(conversation.input.len()));
+      challenge(stream, &mut conversation.connection, out).await
+    }
+    Next::Key { user, consumed } => {
+      conversation
+        .input
+        .drain(..consumed.min(conversation.input.len()));
+      keyed(stream, conversation, &user, out).await
+    }
     Next::Locate { found, consumed } => {
       conversation
         .input
@@ -699,17 +754,8 @@ async fn step(
         Location::Found(located) if Some(located.shard) != this_shard() => {
           Stepped::Elsewhere(found, located)
         }
-        Location::Found(located) => {
-          opened(
-            stream,
-            &mut conversation.connection,
-            &found,
-            Some(&located),
-            out,
-          )
-          .await
-        }
-        Location::Nowhere => opened(stream, &mut conversation.connection, &found, None, out).await,
+        Location::Found(located) => opened(stream, conversation, &found, Some(&located), out).await,
+        Location::Nowhere => opened(stream, conversation, &found, None, out).await,
         Location::Unanswered => {
           crate::fleet::count_refusal(LOOKUP_UNANSWERED);
           Stepped::End
@@ -719,17 +765,91 @@ async fn step(
   }
 }
 
-/// What `connection` makes of the client's bytes `input`, its output appended to `out` (the module doc): before a
-/// session is established the handshake asks for more bytes or hands over the client's answer, whose URL is resolved;
-/// any other turn, and any refusal, ends the connection, the refusal's words already in `out`.
-fn answer(connection: &mut Connection, input: &[u8], out: &mut Vec<u8>, limits: Limits) -> Next {
+/// What the conversation's connection makes of the client's bytes, its output appended to `out` (the module doc):
+/// before a session is established the handshake asks for more bytes, hands over the client's answer, whose URL is
+/// resolved, or asks for a CRAM-MD5 challenge or key; once the client authenticated, each call is handed its
+/// repository's sources, lent afresh on the owner ([`lend_in`]). A commit, and any refusal, ends the connection, the
+/// refusal's words already in `out`.
+fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
   let budget = Budget {
-    room: limits.item_bytes,
-    steps: limits.most_open,
+    room: conversation.limits.item_bytes,
+    steps: conversation.limits.most_open,
   };
-  match connection.receive(None::<&Sources<'_, Unresolved>>, input, out, budget) {
+  let Conversation {
+    connection,
+    input,
+    opened,
+    principal,
+    ..
+  } = conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    let turn = connection.receive(None::<&Sources<'_, Unresolved>>, input, out, budget);
+    return next_of(connection, turn, out);
+  };
+  let lent = crate::state::with_state(|state| {
+    let authenticated = authenticated_access(state, &opened.name, principal);
+    lend_in(state, opened.id, |lent| {
+      let sources = Sources {
+        index: lent.index,
+        repository: lent.repository,
+        locks: lent.locks,
+        now: lent.now,
+        policy: Policy {
+          anonymous: slates_svn::authz::Access::None,
+          authenticated,
+          authz: None,
+          filesystem: &opened.name,
+        },
+      };
+      let turn = connection.receive(Some(&sources), input, out, budget);
+      next_of(connection, turn, out)
+    })
+  });
+  lent.flatten().unwrap_or_else(|| {
+    crate::fleet::count_refusal(STORE_MISSING);
+    Next::End
+  })
+}
+
+/// What an authenticated `principal` may do in repository `name` (`svnserve`'s `auth-access`): write where the
+/// repository's policy lets it reach the repository at all (A-597's `vcs_policy::reaches`; each command then judged by
+/// the session and, for a commit, by the owner's step), nothing where it does not.
+fn authenticated_access(
+  state: &crate::state::ShardState,
+  name: &str,
+  principal: &Principal,
+) -> slates_svn::authz::Access {
+  let reaches = state
+    .db
+    .partition()
+    .repositories()
+    .repository_named(name)
+    .is_some_and(|record| {
+      matches!(
+        crate::vcs_policy::reaches(record, principal, &SESSION_RIGHTS),
+        Ok(true)
+      )
+    });
+  if reaches {
+    slates_svn::authz::Access::Write
+  } else {
+    slates_svn::authz::Access::None
+  }
+}
+
+/// What one of the connection's turns leads to (the module doc).
+fn next_of(
+  connection: &mut Connection,
+  turn: Result<Turn<'_>, slates_svn::serve::Refused>,
+  out: &mut Vec<u8>,
+) -> Next {
+  match turn {
     Ok(Turn::NeedMore { .. }) => Next::Read,
-    Ok(Turn::Took { consumed }) => Next::Consume(consumed),
+    Ok(
+      Turn::Took { consumed }
+      | Turn::Established { consumed, .. }
+      | Turn::Unserved { consumed, .. },
+    ) => Next::Consume(consumed),
     Ok(Turn::Wrote) => Next::Again,
     Ok(Turn::Opened { open, consumed }) => match find_repository(open.url) {
       Ok(found) => Next::Locate { found, consumed },
@@ -738,8 +858,60 @@ fn answer(connection: &mut Connection, input: &[u8], out: &mut Vec<u8>, limits: 
         Next::End
       }
     },
+    Ok(Turn::ChallengeNeeded { consumed }) => Next::Challenge(consumed),
+    Ok(Turn::KeyNeeded { user, consumed }) => Next::Key {
+      user: user.to_vec(),
+      consumed,
+    },
     Ok(_) | Err(_) => Next::End,
   }
+}
+
+/// Challenges the client's CRAM-MD5 (`cram.c` `make_nonce`): a random number, the owner's wall clock in microseconds
+/// and [`CHALLENGE_HOST`], the challenge written to `stream`.
+async fn challenge(stream: &TcpStream, connection: &mut Connection, out: &mut Vec<u8>) -> Stepped {
+  out.clear();
+  let mut nonce = [0u8; 8];
+  let micros = crate::state::with_state(|state| state.clock.wall_ns() / NANOS_PER_MICRO);
+  let (Ok(()), Some(micros)) = (aws_lc_rs::rand::fill(&mut nonce), micros) else {
+    return Stepped::End;
+  };
+  if connection
+    .challenge(u64::from_le_bytes(nonce), micros, CHALLENGE_HOST, out)
+    .is_err()
+    || stream.write_all(out).await.is_err()
+  {
+    return Stepped::End;
+  }
+  Stepped::Go
+}
+
+/// Answers the client's CRAM-MD5 response naming `user` with the key its token's record keeps
+/// ([`crate::credentials::cram_md5_key`]), or none, answered as `svnserve` answers a user it has no password for; an
+/// established session's principal is the token's.
+async fn keyed(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  user: &[u8],
+  out: &mut Vec<u8>,
+) -> Stepped {
+  out.clear();
+  let found = crate::credentials::cram_md5_key(user).await;
+  if found.is_err() {
+    crate::fleet::count_refusal(UNKEYED);
+  }
+  let key = found.as_ref().ok().map(|found| &found.key);
+  match conversation.connection.key(key, out) {
+    Ok(Verdict::Established(_)) => {
+      conversation.principal = found.ok().map(|found| found.principal);
+    }
+    Ok(_) => {}
+    Err(_) => return Stepped::End,
+  }
+  if !out.is_empty() && stream.write_all(out).await.is_err() {
+    return Stepped::End;
+  }
+  Stepped::Go
 }
 
 /// Answers the client's URL with `unserved`, in `svnserve`'s words, appended to `out`; the connection ends.
@@ -832,8 +1004,8 @@ fn this_shard() -> Option<u16> {
 
 /// What this shard holds of the repository a name names.
 enum Held {
-  /// A Subversion repository, its store's UUID.
-  Repository(Uuid),
+  /// A Subversion repository: its id and its store's UUID.
+  Repository(RepositoryId, Uuid),
   /// A Subversion repository whose store this shard does not hold.
   NoStore,
   /// No Subversion repository of the name.
@@ -855,7 +1027,7 @@ fn held(name: &str) -> Held {
     };
     // The records as the shared lender lends them on their owner (`vcs_store::svn_view`), the UUID its text.
     match lend_in(state, id, |lent| Uuid::parse(lent.uuid.as_bytes())).flatten() {
-      Some(uuid) => Held::Repository(uuid),
+      Some(uuid) => Held::Repository(id, uuid),
       None => Held::NoStore,
     }
   })
@@ -868,14 +1040,24 @@ fn held(name: &str) -> Held {
 /// client's mechanism is awaited.
 async fn opened(
   stream: &TcpStream,
-  connection: &mut Connection,
+  conversation: &mut Conversation,
   found: &Found,
   located: Option<&Located>,
   out: &mut Vec<u8>,
 ) -> Stepped {
   out.clear();
+  let connection = &mut conversation.connection;
   let go = match located.map(|located| (located, held(&located.name))) {
-    Some((located, Held::Repository(uuid))) => open(connection, found, located.depth, uuid, out),
+    Some((located, Held::Repository(id, uuid))) => {
+      let asked = open(connection, found, located.depth, uuid, out);
+      if asked {
+        conversation.opened = Some(Opened {
+          id,
+          name: located.name.clone(),
+        });
+      }
+      asked
+    }
     Some((_, Held::NoStore)) => {
       crate::fleet::count_refusal(STORE_MISSING);
       false
@@ -1006,14 +1188,7 @@ async fn serve_arrival(
     let _ = state.with(|state| state.set_task(slot, task));
   }
   let mut out = Vec::new();
-  let stepped = opened(
-    &stream,
-    &mut conversation.connection,
-    &found,
-    Some(&located),
-    &mut out,
-  )
-  .await;
+  let stepped = opened(&stream, &mut conversation, &found, Some(&located), &mut out).await;
   if matches!(stepped, Stepped::Go) {
     go_on(stream, conversation, seat).await;
   }

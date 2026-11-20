@@ -31,6 +31,7 @@ pub mod discovery;
 pub mod getbundle;
 pub mod http;
 pub mod indexed;
+pub mod lookup;
 pub mod pull;
 pub mod session;
 pub mod stdio;
