@@ -56011,8 +56011,31 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   hook_driver, vcs_hooks 227 of 228, the one failure `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_
   lands_a_stock_commit` ("The commit's texts were not made durable: Unanswered"), which fails alike on main 359da238
   without this change.
-- **Owed.** P3's presenter (the view a hook runs in, under the root mount, once the vfs's referenced file is agreed with
-  w-perf, main's ruling 2), P4, the root mount's publication (A-645 (a)).
+- **Part 3, its third piece (2026-11-20, main's ruling 2): a read-only file of content-store references, the vfs side.**
+  `slates_vfs::referenced`: a file kind (`Body::Referenced`) whose content is an ordered list of pieces, each a whole
+  content-store object by identity and length (`Piece::Content`) or a few bytes the presenter made (`Piece::Made`: an
+  FSFS header, an entry list, a trailer); its length is the pieces' sum, set at creation, so a stat reads nothing. A
+  read (`Volume::read_referenced`) takes the store's run at each offset through a seam (`ReferencedContent::run_at`) and
+  copies it into the caller's buffer, so no object is assembled; the plain read, lent no store, serves made bytes and
+  refuses content `ReferenceUnresolved` (EIO), never zeros. `Volume::create_referenced` holds every identity through a
+  second seam (`ReferencedHolds`, so a read borrows the store shared) before the file exists, and the volume's ledger
+  keeps the holds until `Volume::release_references`; a destroy or a clone before that is refused `ReferencesHeld`
+  (EBUSY), and a refused hold or create gives back what it took. Every write, truncate, allocation and edit is refused
+  `EROFS`. A recovery image carries the pieces (`BodyImage::Referenced`, appended), and a recovered volume owes its holds
+  to its successor's store (`Volume::hold_owed_references`). The non-vacuity counters `ReferencedCounts` (`bytes_read`,
+  `bytes_copied`, a run the store copied rather than lent) hold a view of 64 texts read whole at zero bytes copied and
+  its whole length read, and the same view over a store that only copies at every content byte. The server's seam
+  (`vcs_store::referenced`, `Lent` and `Holding`) reads through `ContentStore::window_at`, which resolves the identity
+  (9010c5630), and holds and releases through `hold` and `release`. The store keeps no object's length, so the length
+  is the record's; the seam refuses one the store can tell is wrong (a one-window object's other length, a tree's of
+  one window or less). Deviation from the proposal to w-perf, which w-perf reviews and amends: the holds belong to the
+  volume, not the inode, since an inode is copied on write and kept by snapshots, and a piece shows a whole object,
+  since a prefix's length would find another tree. Red first: the tests did not compile against main 051bf8f4, where the
+  API did not exist. macOS arm64, merged main 051bf8f4: `slates-vfs --test referenced` 6 of 6, `--lib`, `--test recover`,
+  `--test image`, `--test special` 167 of 167; `slates-server --lib vcs_store::referenced` 2 of 2; `slates-api --lib
+  volume_core` 3 of 3.
+- **Owed.** P3's presenter (the view a hook runs in, under the root mount, made of referenced files), P4, the root mount's
+  publication (A-645 (a)), and the presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
