@@ -1,0 +1,2 @@
+started 2026-11-20T05:44:24Z at 1e9c53c87ea1b9e166d7b4f8603a342123924039; 4 CPUs; 7.0.0-1019-azure
+build exit 0
