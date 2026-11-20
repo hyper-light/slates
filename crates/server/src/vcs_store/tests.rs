@@ -166,10 +166,9 @@ fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   let (content, noted) = holding(Kind::Blob, b"hi");
   let mut writer = RecordWriter::default();
   writer.object(noted);
-  writer.keep_pack(b"PACK-bytes".to_vec());
   let moves: Vec<RecordedMove> = vec![(7, 4, None), (9, 5, Some(head))];
   let bytes = writer
-    .finish((&content, FORMAT), |_| true, (3, &moves))
+    .finish((&content, FORMAT, b"PACK-bytes"), |_| true, (3, &moves))
     .expect("written");
   let mut head_bytes = Vec::new();
   head_bytes.extend_from_slice(b"SGPR");
@@ -233,7 +232,6 @@ fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
   let (mut content, noted) = holding(Kind::Blob, b"hi");
   let mut writer = RecordWriter::default();
   writer.object(noted);
-  writer.keep_pack(b"PACK-bytes".to_vec());
   let moves: Vec<RecordedMove> = vec![(9, 5, Some(head))];
   let names = writer.names_of(|_| true);
   let (identity, count) =
@@ -248,7 +246,12 @@ fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
     "the names' identity is the BLAKE3 of their rows"
   );
   let bytes = writer
-    .finish_named((&content, FORMAT), |_| true, (3, &moves), (identity, count))
+    .finish_named(
+      (&content, FORMAT, b"PACK-bytes"),
+      |_| true,
+      (3, &moves),
+      (identity, count),
+    )
     .expect("written");
   let mut expected = Vec::new();
   expected.extend_from_slice(b"SGPR");
@@ -286,7 +289,6 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
   let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
   let long: Vec<u8> = (0..=u8::MAX).cycle().take(WINDOW * 3 + 5).collect();
   let mut writer = RecordWriter::default();
-  writer.keep_pack(b"the pack".to_vec());
   let mut identities = Vec::new();
   for bytes in [&b"one"[..], b"two", &long] {
     let identity = content.put_object(bytes).expect("held");
@@ -302,7 +304,7 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
   }
   let (held, _) = blob(b"two");
   let bytes = writer
-    .finish((&content, FORMAT), |id| *id != held, (0, &[]))
+    .finish((&content, FORMAT, b"the pack"), |id| *id != held, (0, &[]))
     .expect("written");
   let read = Record::decode(&bytes, FORMAT).expect("read back");
   let long_len = u64::try_from(long.len()).expect("a length");
@@ -317,7 +319,7 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
     )
   );
   let none = writer
-    .finish((&content, FORMAT), |_| false, (0, &[]))
+    .finish((&content, FORMAT, b"the pack"), |_| false, (0, &[]))
     .expect("written");
   let read = Record::decode(&none, FORMAT).expect("read back");
   assert_eq!((read.names.len(), read.pack), (0, &[][..]));
@@ -330,7 +332,7 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
     len: 12,
   });
   assert_eq!(
-    unpacked.finish((&content, FORMAT), |_| true, (0, &[])),
+    unpacked.finish((&content, FORMAT, &[]), |_| true, (0, &[])),
     Err(WriteRefused::Unreadable { id: ghost })
   );
   let (one, _) = blob(b"one");
@@ -342,7 +344,7 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
     len: 3,
   });
   let made = sent_none
-    .finish((&content, FORMAT), |_| true, (0, &[]))
+    .finish((&content, FORMAT, &[]), |_| true, (0, &[]))
     .expect("written");
   let read = Record::decode(&made, FORMAT).expect("read back");
   assert!(read.pack.starts_with(b"PACK"), "{:?}", read.pack);
@@ -358,9 +360,12 @@ fn t_a662_hostile_records_are_refused_by_kind() {
   let (content, noted) = holding(Kind::Commit, b"commit");
   let mut writer = RecordWriter::default();
   writer.object(noted);
-  writer.keep_pack(b"a pack".to_vec());
   let bytes = writer
-    .finish((&content, FORMAT), |_| true, (0, &[(1, 1, Some(head))]))
+    .finish(
+      (&content, FORMAT, b"a pack"),
+      |_| true,
+      (0, &[(1, 1, Some(head))]),
+    )
     .expect("written");
   for cut in 0..bytes.len() {
     let read = Record::decode(bytes.get(..cut).expect("a prefix"), FORMAT);
@@ -489,7 +494,7 @@ impl Live {
         &mut self.content,
         &self.store,
         (&mut push, &mut writer),
-        arriving,
+        (arriving, None),
       )?;
     }
     Ok(Pending {
@@ -542,7 +547,7 @@ impl Live {
     let record = record_of(
       &self.content,
       &self.store,
-      (&pending.writer, deepest),
+      (&pending.writer, deepest, &[]),
       moves,
     )?;
     commit_moves(
@@ -1154,7 +1159,7 @@ fn assert_a_head_nobody_sent_is_refused_and_leaves_nothing(store: &mut Live, bef
   let nobody = ObjectId::from_bytes(FORMAT, &[0x5a; 20]).expect("an id");
   let missing = RecordWriter::default()
     .finish(
-      (&store.content, FORMAT),
+      (&store.content, FORMAT, &[]),
       |_| true,
       (0, &[(1, 1, Some(nobody))]),
     )
@@ -1369,7 +1374,8 @@ fn begun_at(
   depth: u64,
 ) -> GitPush {
   let mut push = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
-  push.keep_pack(pack_of(objects));
+  let pack = pack_of(objects);
+  push.keep_pack_to(u64::try_from(pack.len()).expect("a length"), &pack);
   let arriving: Vec<Incoming<'_>> = objects
     .iter()
     .map(|brought| incoming(brought, depth))

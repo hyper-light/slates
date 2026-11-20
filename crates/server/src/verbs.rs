@@ -2698,6 +2698,9 @@ pub(crate) fn route_gated(
   if let RequestBody::Grants { after } = body {
     return scatter_grants(state, client.index(), request, principal, after);
   }
+  if let RequestBody::SessionLog { after } = body {
+    return scatter_session_log(state, client.index(), request, principal, after);
+  }
   if matches!(
     &body,
     RequestBody::Bootstrap { .. } | RequestBody::RecoveryPlan { .. } | RequestBody::Recover { .. }
@@ -3814,6 +3817,78 @@ fn gather_grants(
   }
 }
 
+/// The session log (A-773) is a scatter-gather like the grants: each shard holds its works and the landings presented
+/// on it, so every shard reports its part and the origin folds them into one page ([`crate::session_log`]).
+fn scatter_session_log(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  principal: Principal,
+  after: Option<slates_ipc::protocol::LogCursor>,
+) -> Served {
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|s| *s != state.shard)
+    .collect();
+  let mine = crate::session_log::part(state, &principal, after);
+  if others.is_empty() {
+    return Served::Reply(crate::session_log::page(vec![mine]));
+  }
+  state
+    .log_scatters
+    .insert(request, (client_index, others.len(), vec![mine]));
+  let origin = state.shard;
+  for shard in others {
+    let principal = principal.clone();
+    let task = SpawnRequest::new(
+      Box::pin(async move {
+        let part = crate::state::with_state(|s| crate::session_log::part(s, &principal, after));
+        crate::xshard::send_reply_home(origin, move || {
+          gather_session_log(request, shard, part);
+        });
+      }),
+      None,
+    );
+    if let Some(reply) = send_part(state, shard, task, ScatterKind::SessionLog, request) {
+      return Served::Reply(reply);
+    }
+  }
+  Served::Forwarded
+}
+
+/// Folds one shard's part of a session log page into the scatter and, on the last part, delivers the merged page; a
+/// part `shard` did not serve is settled refused ([`settle_unserved`]).
+fn gather_session_log(
+  request: u64,
+  shard: u16,
+  part: Option<PagePart<slates_ipc::protocol::LogLine>>,
+) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::SessionLog, request, shard);
+    return;
+  };
+  let done = crate::state::with_state(|s| {
+    let entry = s.log_scatters.get_mut(&request)?;
+    entry.2.push(part);
+    entry.1 = entry.1.saturating_sub(1);
+    if entry.1 == 0 {
+      let refused_for = s.scatter_refusals.remove(&request);
+      s.log_scatters
+        .remove(&request)
+        .map(|entry| (entry, refused_for.map(|shard| part_unsent(s, shard))))
+    } else {
+      None
+    }
+  })
+  .flatten();
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| crate::session_log::page(parts));
+    crate::state::deliver(client_index, request, reply, false);
+  }
+}
+
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
 /// the origin assembles the daemon's view (§4.14 `slates.status`). An unserved report refuses the status, as a
 /// listing's part does.
@@ -3856,6 +3931,8 @@ enum ScatterKind {
   List,
   /// `scatter_grants`, in [`ShardState::grant_scatters`].
   Grants,
+  /// `scatter_session_log`, in [`ShardState::log_scatters`] (A-773).
+  SessionLog,
   /// `scatter_status`, in [`ShardState::status_scatters`].
   Status,
   /// `scatter_acknowledge`, in [`ShardState::ack_scatters`] (A-216).
@@ -3941,6 +4018,7 @@ fn settle_refused(
     }
     ScatterKind::List => (count_down(&mut state.scatters, request), false),
     ScatterKind::Grants => (count_down(&mut state.grant_scatters, request), false),
+    ScatterKind::SessionLog => (count_down(&mut state.log_scatters, request), false),
     ScatterKind::Status => (count_down(&mut state.status_scatters, request), true),
   };
   let first = *state.scatter_refusals.entry(request).or_insert(shard);
@@ -3987,6 +4065,9 @@ fn settle_gone(state: &mut ShardState, kind: ScatterKind, request: u64) {
     }
     ScatterKind::Grants => {
       state.grant_scatters.remove(&request);
+    }
+    ScatterKind::SessionLog => {
+      state.log_scatters.remove(&request);
     }
     ScatterKind::Status => {
       state.status_scatters.remove(&request);
@@ -5615,6 +5696,9 @@ fn dispatch_inner(
     ),
     RequestBody::Grants { after } => {
       crate::landing::grants_page(vec![crate::landing::grants_part(state, principal, after)])
+    }
+    RequestBody::SessionLog { after } => {
+      crate::session_log::page(vec![crate::session_log::part(state, principal, after)])
     }
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to, owed } => acknowledge(state, client_id, up_to, &owed),
@@ -8391,6 +8475,7 @@ fn create_work_here(
       charged,
       entries: std::collections::BTreeMap::new(),
       verdict: None,
+      accepted: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -9779,6 +9864,10 @@ fn settle_submit(
     return refused(refusal_of_db(&e));
   }
   reset_accepted_work(state, work_id, version);
+  // The session log's mark (A-773): the version the work's last submission made, which it now stands on.
+  if let Some(work) = state.works.get_mut(&work_id) {
+    work.accepted = Some(version);
+  }
   crate::work_home::tell_floor(state, green_id, work_id, Some(version));
   reply
 }
@@ -17891,6 +17980,8 @@ enum GreenReplayPhase {
     next: usize,
     replayed: Vec<crate::merge_service::ReplayedVersion>,
     head_check: Option<(u64, [u8; 32])>,
+    /// The next entry while its named runs are read from the content plane, a copy slice a step (A-760).
+    reading: Option<Box<slates_merge::chain_entry::ChainEntry>>,
   },
 }
 
@@ -17989,7 +18080,16 @@ impl GreenReplay {
         next,
         replayed,
         head_check,
-      } => return replay_chain_entry(state, id, green, (*held, *head_check), next, replayed),
+        reading,
+      } => {
+        return replay_chain_entry(
+          state,
+          (id, green),
+          (*held, *head_check),
+          (next, reading),
+          replayed,
+        );
+      }
     };
     match seeded {
       // The origin is seeded: the engine is restored at its checkpoint and the chain's replay begins.
@@ -18054,24 +18154,54 @@ impl GreenReplay {
 /// it, with the head identity the green has at that version; true once no entry is left.
 fn replay_chain_entry(
   state: &ShardState,
-  id: DbVolumeId,
-  green: &mut slates_merge::engine::Green,
+  (id, green): (DbVolumeId, &mut slates_merge::engine::Green),
   (held, head_check): (u64, Option<(u64, [u8; 32])>),
-  next: &mut usize,
+  (next, reading): (
+    &mut usize,
+    &mut Option<Box<slates_merge::chain_entry::ChainEntry>>,
+  ),
   replayed: &mut Vec<crate::merge_service::ReplayedVersion>,
 ) -> Result<bool, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
-  let Some(bytes) = state.db.partition().green_chain(id).get(*next) else {
-    return Ok(true);
-  };
   let version = u64::try_from(*next)
     .unwrap_or(u64::MAX)
     .saturating_add(held)
     .saturating_add(1);
   // Applied as the verdict resolved it (A-257): a checkpoint's position cannot refuse it. A replay that does not reach an
   // identity recorded for this version, by the entry or by the checkpoint at its head, is fenced.
-  let entry =
-    slates_merge::chain_entry::decode(bytes).map_err(|_| GreenFence::EntryCorrupt { version })?;
+  let mut entry = match reading.take() {
+    Some(entry) => entry,
+    None => {
+      let Some(bytes) = state.db.partition().green_chain(id).get(*next) else {
+        return Ok(true);
+      };
+      Box::new(
+        slates_merge::chain_entry::decode(bytes)
+          .map_err(|_| GreenFence::EntryCorrupt { version })?,
+      )
+    }
+  };
+  // An entry naming its content (A-760) reads it from the content plane first, a copy slice a step, so no step reads
+  // a large text whole: the step ends with the entry kept for the next.
+  if entry.increment.unread().is_some() {
+    let store = state
+      .vcs_stores
+      .content()
+      .ok_or(GreenFence::ContentMissing { version })?;
+    let objects = crate::vcs_store::named_objects::PlaneObjects {
+      store,
+      kept_in: &state.store.content,
+    };
+    let read = entry
+      .increment
+      .read_step(&objects, state.config.copy_slice_bytes().max(1))
+      .map_err(|_| GreenFence::ContentMissing { version })?;
+    if !read {
+      *reading = Some(entry);
+      return Ok(false);
+    }
+  }
+  let entry = *entry;
   let accepted = green.apply_recorded(&entry.increment, &entry.applied);
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
@@ -18179,6 +18309,7 @@ fn chain_phase_or_back(
     next: 0,
     replayed,
     head_check,
+    reading: None,
   })
 }
 
@@ -18444,6 +18575,7 @@ fn install_rebuilt_work(
       charged,
       entries: std::collections::BTreeMap::new(),
       verdict: None,
+      accepted: None,
     },
   );
 }

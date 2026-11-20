@@ -942,6 +942,15 @@ async fn let_go_region_at_home(
   .ok_or(HomeRefused::Unanswered)?
 }
 
+/// Counter: a push's names asked to be homed that no edge took by the next turn: the record written as version 2
+/// (A-724 piece 8c). Format: a counter name.
+pub(crate) const HOMING_UNTAKEN: &str = "vcs_store.homes.homing_untaken";
+
+/// Counts a homing no edge took ([`HOMING_UNTAKEN`]).
+pub(crate) fn count_untaken(state: &mut crate::state::ShardState) {
+  state.count(HOMING_UNTAKEN, 1);
+}
+
 /// Counter: objects homed in the region at `f + 1` before a record names them (A-724 piece 8c). Format: a counter name.
 pub(crate) const HOMED_IN_REGION: &str = "vcs_store.homes.homed_in_region";
 /// Counter: homings in the region that fell short of `f + 1` within their budget. Format: a counter name.

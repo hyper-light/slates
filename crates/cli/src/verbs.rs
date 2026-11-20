@@ -1419,6 +1419,19 @@ fn emit_captured(client: &mut Client, volume: VolumeId, json: bool) -> Result<()
   Ok(())
 }
 
+/// `log` (A-773): the session log, as text lines or one JSON object (`crate::log_view`).
+fn emit_log(client: &mut Client, json: bool) -> Result<(), ClientError> {
+  let log = client.session_log()?;
+  if json {
+    slates_machine::out_line!("{}", crate::log_view::json(&log));
+  } else {
+    for line in crate::log_view::text_lines(&log) {
+      slates_machine::out_line!("{line}");
+    }
+  }
+  Ok(())
+}
+
 /// `grants`: every grant, one per text line or a JSON array of [`grant_json`] objects (the shape a
 /// script iterates, matching `volume list`'s array of objects).
 fn emit_grants(client: &mut Client, json: bool) -> Result<(), ClientError> {
@@ -1705,6 +1718,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       json,
     ),
     Verb::Grants => emit_grants(client, json)?,
+    Verb::Log => emit_log(client, json)?,
     Verb::Audit { since } => emit_audit(client, *since, json)?,
     Verb::Share {
       volume,

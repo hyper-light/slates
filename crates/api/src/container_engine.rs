@@ -382,6 +382,7 @@ fn ask(runtime: &str, args: &[&str]) -> Result<Vec<u8>, EngineFault> {
 #[cfg(not(unix))]
 fn ask(runtime: &str, args: &[&str]) -> Result<Vec<u8>, EngineFault> {
   use std::io::Read as _;
+  // Shape: one page, 4 KiB on Windows (x86_64 and arm64), as [`answer_cap`] is a page on Unix.
   const CAP: usize = 4096;
   let unreachable = |why: String| EngineFault::Unreachable(Note::new(why));
   let mut child = std::process::Command::new(runtime)
@@ -391,43 +392,61 @@ fn ask(runtime: &str, args: &[&str]) -> Result<Vec<u8>, EngineFault> {
     .stderr(std::process::Stdio::piped())
     .spawn()
     .map_err(|e| unreachable(format!("{runtime}: {e}")))?;
-  let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+  // Each pipe is read to its end (or the cap and one byte more) on a thread of its own, which sends what it read, by
+  // which pipe (0 the answer, 1 the complaint), when the pipe closes: the condition this thread waits on, under the
+  // budget, as `Command::output` reads both pipes to their ends before it waits on the child.
+  let (said, heard) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+  let read = |which: usize, pipe: Option<Box<dyn std::io::Read + Send>>| {
+    let said = said.clone();
     std::thread::spawn(move || {
-      let mut said = Vec::new();
+      let mut bytes = Vec::new();
       if let Some(pipe) = pipe {
         let _ = pipe
-          .take(u64::try_from(CAP + 1).unwrap_or(u64::MAX))
-          .read_to_end(&mut said);
+          .take(u64::try_from(CAP.saturating_add(1)).unwrap_or(u64::MAX))
+          .read_to_end(&mut bytes);
       }
-      said
+      let _ = said.send((which, bytes));
     })
   };
-  let out = read(
-    child
-      .stdout
-      .take()
-      .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-  );
-  let err = read(
-    child
-      .stderr
-      .take()
-      .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-  );
+  let readers = [
+    read(
+      0,
+      child
+        .stdout
+        .take()
+        .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    ),
+    read(
+      1,
+      child
+        .stderr
+        .take()
+        .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    ),
+  ];
+  drop(said);
   let budget = std::time::Duration::from_nanos(slates_server::daemon::OBSERVE_BUDGET_NS);
   let began = std::time::Instant::now();
+  let (mut answer, mut complaint) = (Vec::new(), Vec::new());
   let mut overran = false;
-  while !matches!(child.try_wait(), Ok(Some(_))) {
-    if began.elapsed() >= budget {
-      let _ = child.kill();
-      overran = true;
-      break;
+  for _ in 0..readers.len() {
+    match heard.recv_timeout(budget.saturating_sub(began.elapsed())) {
+      Ok((0, bytes)) => answer = bytes,
+      Ok((_, bytes)) => complaint = bytes,
+      Err(_) => {
+        overran = true;
+        break;
+      }
     }
-    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+  // Past the budget, or past the cap (its reader stopped reading, so the child may wait on a full pipe): stopped.
+  if overran || answer.len() > CAP {
+    let _ = child.kill();
   }
   let _ = child.wait();
-  let answer = out.join().unwrap_or_default();
-  let complaint = err.join().unwrap_or_default();
+  for reader in readers {
+    let _ = reader.join();
+  }
   if overran {
     return Err(unreachable(format!(
       "{runtime} did not answer within {budget:?}"
