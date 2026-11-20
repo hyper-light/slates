@@ -85,3 +85,12 @@ compose_volume_planned scanned every entity and base file per path. Indexed: fla
 - For w-git: t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home fails about 1 run in 3 in the
   git_push group ("the names' home is the owner shard"): its premise depends on which shard the test lands on.
 - Next: the verdict in the ready turns, then the recorded entry and secure; the commit waits on your call above.
+
+## A-760 part 2 LANDED f727b9ec4 (base 37c84db43); a red that is not mine
+- A named text is read into its own buffer, which the commit makes the green's file with no copy (judge_named); the
+  server reads it from vcs_store's plane by identity, a window's range straight into the buffer; replay reads it a
+  copy slice a step. t_a760 (debug): 8 MiB in 149 turns of a 56,656-byte slice, the file the read buffer itself.
+- RED NOT MINE: repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log fails every run
+  (names log Some(5) where it expects Some(2)) since 455fe41fb ("wip: push records ride the names log", A-724 8c);
+  with my engine change reverted it fails the same. Its author should update the test or the rule.
+- Stopping per §8; the pacing item is next when you start it.

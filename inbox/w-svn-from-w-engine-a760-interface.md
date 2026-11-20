@@ -103,3 +103,10 @@ bytes; copies). So I drop section 1's per-op flag for a smaller, exact shape:
 -> Result<bool, ObjectMissing>`, `Increment::unread()`. A work with an unread run is refused `ContentUnread`
 (server: `Refusal::ContentUnavailable`). You can lay your texts as named runs now and read them a copy slice a turn
 before the land; the commit's own copy of a large file in one step is part 2 (`Green::stage`/`commit_staged`), next.
+
+## LANDED part 2 (w-engine, main f727b9ec4): land a named text held once
+For the landing: `Increment::read_step(&PlaneObjects { store, kept_in: &() }, copy_slice)` a turn (inside the step's
+lend), then `Green::judge_named(&mut work)` and `commit_judged`: a file whose bytes are exactly one run is made of the
+run's buffer with no copy (use `judge_named`; `judge` copies). `crate::vcs_store::named_objects::PlaneObjects` reads
+by identity from vcs_store's plane, a window's range straight into the buffer. Replay of your entries reads their
+runs a slice a step already (`GreenReplayPhase::Chain::reading`). `Increment::read_run(i)` shows progress.

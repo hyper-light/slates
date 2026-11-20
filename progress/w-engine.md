@@ -195,3 +195,12 @@ Build order:
    unit only for a partial splice (staged too); commit O(files).
 6. Server: Objects over vcs_store's plane (identity -> object root map); land turns; replay reads runs first.
 Red: a focused server test landing a large named text: no step past the quantum, RSS growth <= file + slice.
+- A-760 part 2 LANDED f727b9ec4 (tip d6ee7bede, base 37c84db43): runs read into own buffers (named::Read), engine reads
+  via named::Post; judge_named + commit make a whole-text file of the run's buffer (no copy); creates' bytes at the
+  commit; server PlaneObjects (window_range_in: range reads straight into the buffer); replay reads runs a copy slice a
+  step (ContentMissing fence). Tests: merge 410/410; vcs content 13; server t_a760 (8 MiB: 149 turns of 56,656 B, file
+  = read buffer), vcs_store:: 96, git_push:: 19, replay 16, rebuild 12, merge_service 14.
+- NOT MINE, for main: repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log fails
+  deterministically (names log Some(5), expected Some(2)) since 455fe41fb "wip: push records ride the names log"
+  (A-724 piece 8c); a probe with my engine change reverted fails the same.
+- NEXT (main starts it): the pacing item (steps fill the quantum, per-unit-kind EWMA).
