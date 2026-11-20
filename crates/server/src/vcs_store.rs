@@ -2149,7 +2149,8 @@ fn replay_push(
 }
 
 /// Whether the objects the replay's admission would record now, by the predicate the live append wrote its record by
-/// ([`record_of`]), are the record's, in order, by type, content identity and length. Each identity was checked
+/// ([`record_of`]), are the record's, by type, content identity and length: in order for a version-1 record, whose
+/// objects are admitted in its order; as sets for a pack's ([`names_alike`]). Each identity was checked
 /// against the record's bytes before the object was admitted, so this compares the record written again without
 /// copying its bytes: a recomputation that differs is refused (§4.16).
 fn recorded_alike(
@@ -2175,18 +2176,32 @@ fn recorded_alike(
   admitted.eq(recorded)
 }
 
-/// Whether the objects the replay's admission would record now are `names`, a version-2 record's, in order
-/// ([`recorded_alike`]).
+/// Whether the objects the replay's admission would record now are `names`, a pack record's ([`recorded_alike`]), as
+/// sets: the live push admitted its pack's objects as they resolved (those read whole or from a base already read in
+/// pack order as the client's bytes arrived, a thin pack's waiting deltas once the pack was whole, in the turns that
+/// resolved them), and a replay resolves them in turns of its own, so the same objects can come in another order (A-722:
+/// a thin pack whose waiting delta came first was refused as diverged, and its repository's store with it). A push
+/// holds an object once, so each name is once on each side. The two lists are kept to sort them: one name an object.
 fn names_alike(
   content: &ContentStore,
   store: &GitStore,
   remade: &RecordWriter,
   names: &[(slates_git::object_name::Kind, slates_vcs::ContentId, u64)],
 ) -> bool {
-  remade
+  let mut made: Vec<(u8, slates_vcs::ContentId, u64)> = remade
     .lacked(lacks(content, store))
-    .map(|noted| (noted.kind, noted.identity, noted.len))
-    .eq(names.iter().copied())
+    .map(|noted| (noted.kind.pack_number(), noted.identity, noted.len))
+    .collect();
+  if made.len() != names.len() {
+    return false;
+  }
+  let mut named: Vec<(u8, slates_vcs::ContentId, u64)> = names
+    .iter()
+    .map(|(kind, identity, len)| (kind.pack_number(), *identity, *len))
+    .collect();
+  made.sort_unstable();
+  named.sort_unstable();
+  made == named
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.
