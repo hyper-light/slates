@@ -57,12 +57,13 @@ use crate::special::SpecialNode;
 /// Format: the checkpoint encoding's magic, "GCKP" little-endian, so a chain entry of another kind (an increment, an
 /// origin) is refused at the first word rather than misread.
 const MAGIC: u32 = u32::from_le_bytes(*b"GCKP");
-/// Format: the checkpoint encoding's version; a decoder refuses any other. 3 since A-321 added the signed versions'
-/// verdicts beside the accepted identities; 4 since A-626 part 3 added the copies' records, their trees' keys and the
-/// identity's sum; 5 since the copies' section and the sum each sit behind a presence byte, written beside a copy's
-/// record alone (A-626 part 3, continued (1)). An older checkpoint is refused (`BadVersion`), never read under version
-/// 5's layout: replaced, not layered; and a segment that holds one is refused at adoption (the anchor's layout 13), so
-/// none is ever met.
+/// The checkpoint encoding's version: 3 since A-321 added the signed versions' verdicts beside the accepted
+/// identities; 4 since A-626 part 3 added the copies' records, their trees' keys and the identity's sum; 5 since the
+/// copies' section and the sum each sit behind a presence byte, written beside a copy's record alone (A-626 part 3,
+/// continued (1)). An older checkpoint is refused (`BadVersion`), never read under version 5's layout: replaced, not
+/// layered; and a segment that holds one is refused at adoption (the anchor's layout 13), so none is ever met.
+///
+/// Format: the checkpoint encoding's version; a decoder refuses any other.
 const VERSION: u32 = 5;
 /// Format: a signature verdict's fingerprint, a SHA-256 hash (`crate::chain_entry::Signature::fingerprint`).
 const FINGERPRINT_BYTES: usize = 32;

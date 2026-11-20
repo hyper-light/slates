@@ -155,7 +155,7 @@ enum Entry<'a> {
 /// A held deletion and the record after it: one replacement, or two records.
 enum Fold {
   Folded(Record),
-  Apart(NodeHeader, Record),
+  Apart(NodeHeader, Box<Record>),
 }
 
 impl Reader {
@@ -361,7 +361,7 @@ impl Reader {
     match fold(deletion, record) {
       Fold::Folded(record) => self.begin(record),
       Fold::Apart(deletion, record) => {
-        self.queued = Some(record);
+        self.queued = Some(*record);
         self.state = State::Gap;
         Ok(Step::Event(Event::Node(deletion)))
       }
@@ -586,7 +586,7 @@ fn fold(deletion: NodeHeader, record: Record) -> Fold {
       header.action = NodeAction::Replace;
       Fold::Folded(Record::Node { header, rest })
     }
-    record => Fold::Apart(deletion, record),
+    record => Fold::Apart(deletion, Box::new(record)),
   }
 }
 

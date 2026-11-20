@@ -2,8 +2,7 @@ use std::io::{Read as _, Write as _};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls::ClientConnection;
 use slates_http::head::Head;
 use slates_http::reply::Status;
 
@@ -46,7 +45,7 @@ fn drive(connection: &mut Connection, pieces: &[&[u8]], script: &Script<'_>) -> 
   let mut pieces = pieces.iter();
   let (mut body, mut replies) = (Vec::new(), script.reply.iter());
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => seen.written.extend(connection.take_output()),
       Next::Read => match pieces.next() {
         Some(piece) => connection.receive(piece),
@@ -459,7 +458,7 @@ fn fail_after(runs: usize, status: Status) -> (Vec<u8>, Option<Ended>) {
   let mut written = Vec::new();
   let mut sent = 0;
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Decide => connection.decide(serve(&connection.head().unwrap())),
       Next::Reply if sent == runs => connection.fail(status),
@@ -491,7 +490,7 @@ fn a_failing_service_is_refused_before_its_reply_and_aborted_after() {
 
 /// What `connection` needs next, as its debug text, and its phase once it has said so.
 fn step(connection: &mut Connection) -> (String, Phase) {
-  let next = format!("{:?}", connection.next());
+  let next = format!("{:?}", connection.next_step());
   (next, connection.phase())
 }
 
@@ -532,27 +531,12 @@ fn the_phase_follows_the_exchange() {
   assert_eq!(seen, expected);
 }
 
-/// A self-signed identity for `localhost`, and a client trusting it offering `http/1.1`.
+/// A self-signed identity for `localhost`, and a client trusting it offering `http/1.1` (the TLS tests' own, whose
+/// module holds rustls's `Arc` under D-8 exception 2).
 fn tls_pair() -> (ServingIdentity, ClientConnection) {
-  let key = rcgen::KeyPair::generate().unwrap();
-  let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-    .unwrap()
-    .self_signed(&key)
-    .unwrap();
-  let private = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-  let identity = ServingIdentity::new(vec![cert.der().clone()], private).unwrap();
-  let mut roots = RootCertStore::empty();
-  roots.add(cert.der().clone()).unwrap();
-  let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-  let mut config = ClientConfig::builder_with_provider(provider)
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-  config.alpn_protocols = vec![ALPN_HTTP_1_1.to_vec()];
-  let name = ServerName::try_from("localhost").unwrap();
-  let client = ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
-  (identity, client)
+  let (identity, cert) = crate::tls::tests::identity();
+  let peer = crate::tls::tests::client(&cert, &[ALPN_HTTP_1_1], rustls::DEFAULT_VERSIONS);
+  (identity, peer.connection)
 }
 
 /// Drives `connection` against `client` until the client has read a reply's last chunk: the client's request is
@@ -566,7 +550,7 @@ fn drive_tls(
   client.writer().write_all(request).unwrap();
   let (mut read, mut seen_credential, mut replies) = (Vec::new(), None, RUNS.iter());
   while !read.ends_with(b"0\r\n\r\n") {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => {
         let output = connection.take_output();
         let mut rest = output.as_slice();
@@ -634,7 +618,7 @@ fn served_with_late_fields(late: Fields, after_first: bool) -> String {
   let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
   let mut late = Some(late);
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {
@@ -723,7 +707,7 @@ fn served_after_body((mode, named, after_first): Naming) -> String {
   let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
   let mut named = named;
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {
@@ -769,8 +753,9 @@ fn after_body_reply(status: &str) -> String {
 /// POST with a body on a route that decides its status after the body, its service naming `201` as its reply begins;
 /// naming none; naming `204`; naming `205`; then on a streamed route naming `201`, and naming `200`, its own; then on
 /// the first route naming `201` after its first run. Expect the first reply's head to carry `201`; the second `200`;
-/// the third, the fourth and the fifth refused `500` in stages, nothing of a reply written; the sixth's head `200`; and
-/// the seventh's head `200`, the late status never written.
+/// the third `204`, its head alone with no framing field and its run dropped (A-681); the fourth and the fifth refused
+/// `500` in stages, nothing of a reply written; the sixth's head `200`; and the seventh's head `200`, the late status
+/// never written.
 #[test]
 fn a_route_deciding_its_status_after_the_body_carries_the_status_its_service_names() {
   let refused =
@@ -788,7 +773,7 @@ fn a_route_deciding_its_status_after_the_body_carries_the_status_its_service_nam
     [
       after_body_reply("201 Created"),
       after_body_reply("200 OK"),
-      refused.to_owned(),
+      String::from("HTTP/1.1 204 No Content\r\nContent-Type: application/vnd.git-lfs+json\r\n\r\n"),
       refused.to_owned(),
       refused.to_owned(),
       after_body_reply("200 OK"),
@@ -811,7 +796,7 @@ fn served_with_status(status: Status, after_first: bool) -> String {
   let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
   let mut status = Some(status);
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {
@@ -859,4 +844,50 @@ fn a_service_names_its_reply_status_as_its_reply_begins() {
     ),
     (named, late)
   );
+}
+
+/// A-681 (RFC 9110 §15.3.5, §8.6; RFC 9112 §6.1): do serve a request whose service names `204 No Content` as its reply
+/// begins (a WebDAV `DELETE`'s or an updating `PUT`'s answer, which stock svn requires), the service writing nothing,
+/// then one request more on the connection. Expect the head `204` with neither `Content-Length` nor
+/// `Transfer-Encoding`, no body or last chunk after it, and the connection kept for the next request.
+#[test]
+fn a_service_may_answer_no_content_with_no_framing_and_no_body() {
+  let no_content = Status {
+    code: 204,
+    reason: "No Content",
+  };
+  let mut connection = Connection::clear(ROOM);
+  let (mut written, mut fed, mut asked) = (Vec::new(), 0, 0);
+  let mut named = false;
+  let written = loop {
+    match connection.next_step() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Read if fed == 2 => connection.peer_closed(),
+      Next::Read => {
+        fed += 1;
+        connection.receive(b"DELETE /repo/!svn/txr/1-2/a HTTP/1.1\r\nHost: h\r\n\r\n");
+      }
+      Next::Decide => {
+        asked += 1;
+        connection.decide(Decision::Serve {
+          fields: Fields::new(),
+          head_only: false,
+          status: StatusMode::AfterBody,
+        });
+        named = false;
+      }
+      Next::Body(_) => connection.body_taken(),
+      Next::BodyEnd => {}
+      Next::Reply if !named => {
+        named = true;
+        connection.reply_status(no_content);
+      }
+      Next::Reply => connection.reply_end(),
+      Next::CloseWrite | Next::Drain | Next::Close => {
+        break String::from_utf8_lossy(&written).into_owned();
+      }
+    }
+  };
+  let one = "HTTP/1.1 204 No Content\r\n\r\n";
+  assert_eq!((written, asked), (format!("{one}{one}"), 2));
 }
