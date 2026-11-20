@@ -1114,6 +1114,9 @@ fn markers_only(markers: &[&[u8]]) -> Vec<u8> {
   bytes
 }
 
+/// A record's bytes, and the test its refusal passes.
+type RecordCase = (Vec<u8>, fn(&RecordRefused) -> bool);
+
 /// A-687, AC-HG.9 (hostile records): do replay the `states` record with a foreign magic, another version, a count past
 /// its bytes, a byte after its end, its first changeset's text changed by a bit, and a record whose one marker entry
 /// holds 7.2's whole obsstore of two. Expect each refused by kind (`Magic`, `Version`, `Count`, `Trailing`, `Node` naming
@@ -1132,7 +1135,7 @@ fn t_a687_hostile_records_are_refused_by_kind() {
   let mut count = bytes.clone();
   count[GROUPS_AT..GROUPS_AT + 8].copy_from_slice(&u64::MAX.to_le_bytes());
   let obsstore = state_fixtures::find("states/obsstore").unwrap();
-  let cases: [(Vec<u8>, fn(&RecordRefused) -> bool); 6] = [
+  let cases: [RecordCase; 6] = [
     (with(0, b'X'), |refused| *refused == RecordRefused::Magic),
     (with(4, 2), |refused| {
       *refused == RecordRefused::Version { version: 2 }

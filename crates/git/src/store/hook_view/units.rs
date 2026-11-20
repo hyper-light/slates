@@ -508,6 +508,8 @@ impl Unit {
       let within = (at.saturating_sub(start), upto.saturating_sub(start));
       match segment {
         Segment::Header => {
+          // Format: a pack's header is three 32-bit words: `PACK`, the version and the object
+          // count (gitformat-pack).
           let mut header = Vec::with_capacity(size_of::<[u32; 3]>());
           pack::put_header(self.count, &mut header);
           copy(&header, within, out);

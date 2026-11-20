@@ -21,6 +21,13 @@ fn listed<'a>(advertisement: &Advertisement<'a>) -> Vec<(&'a [u8], Option<&'a [u
 #[test]
 fn stock_gits_advertisements_decode_to_their_capabilities_and_encode_back() {
   let plain = decode(ADVERTISEMENT, &mut room()).unwrap();
+  the_plain_advertisement_lists_its_capabilities_as_git_did(&plain);
+  the_plain_advertisement_answers_lookups_as_gits_client_does(&plain);
+  the_advertisement_allowing_sideband_all_and_packfile_uris_reads_and_encodes_back();
+}
+
+/// `version 2` and each capability as git listed it, every line ending with an LF.
+fn the_plain_advertisement_lists_its_capabilities_as_git_did(plain: &Advertisement<'_>) {
   assert_eq!(plain.version, Ending::Lf);
   let expected: [(&[u8], Option<&[u8]>); 5] = [
     (b"agent", Some(b"git/2.50.1-Darwin")),
@@ -29,13 +36,17 @@ fn stock_gits_advertisements_decode_to_their_capabilities_and_encode_back() {
     (b"server-option", None),
     (b"object-format", Some(b"sha1")),
   ];
-  assert_eq!(listed(&plain), expected);
+  assert_eq!(listed(plain), expected);
   assert!(
     plain
       .capabilities
       .iter()
       .all(|line| line.ending == Ending::Lf)
   );
+}
+
+/// The lookups answering as git's client does, and the stream's own bytes back.
+fn the_plain_advertisement_answers_lookups_as_gits_client_does(plain: &Advertisement<'_>) {
   assert!(plain.supports(b"fetch", b"shallow"));
   assert!(plain.supports(b"fetch", b"ref-in-want"));
   assert!(!plain.supports(b"fetch", b"sideband-all"));
@@ -45,9 +56,13 @@ fn stock_gits_advertisements_decode_to_their_capabilities_and_encode_back() {
   assert_eq!(plain.get(b"object-info"), None);
   assert_eq!(plain.object_format(), Some(ObjectFormat::Sha1));
   let mut out = Vec::new();
-  encode(&plain, &mut out).unwrap();
+  encode(plain, &mut out).unwrap();
   assert_eq!(out, ADVERTISEMENT);
+}
 
+/// The advertisement allowing `sideband-all` and `packfile-uris`: its `fetch` value as git listed it, both features
+/// found, and the stream's own bytes back.
+fn the_advertisement_allowing_sideband_all_and_packfile_uris_reads_and_encodes_back() {
   let uris = decode(ADVERTISEMENT_URIS, &mut room()).unwrap();
   assert_eq!(
     uris.get(b"fetch"),

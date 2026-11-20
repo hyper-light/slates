@@ -53,6 +53,7 @@ const SHORT_STEMS: [&[u8]; 2] = [b"HG", b"HG8B6C"];
 /// Format: the UTF-8 of the code points HFS+ ignores, which `encoding.hfsignoreclean` removes before a name is compared
 /// (U+200C to U+200F, U+202A to U+202E, U+206A to U+206F, U+FEFF; `encoding.py` `_ignore`).
 const HFS_IGNORED: [[u8; 3]; 16] = [
+  // Format: U+200C to U+200E.
   [0xe2, 0x80, 0x8c],
   [0xe2, 0x80, 0x8d],
   [0xe2, 0x80, 0x8e],

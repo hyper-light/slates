@@ -109,7 +109,6 @@ impl Served {
     };
     let objects = PushedObjects::new(&repository, &store, &push);
     let built = work::build(&first, &green, &objects, ROOM).unwrap();
-    drop(objects);
     let verdict = green.submit(&built.increment);
     assert!(
       matches!(verdict, Verdict::Accepted { version: 1 }),

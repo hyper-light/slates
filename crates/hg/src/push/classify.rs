@@ -546,9 +546,7 @@ impl<'v, V: Repository> Graph<'v, V> {
     } else {
       Phase::Draft
     };
-    for slot in &mut self.phases {
-      *slot = phase;
-    }
+    self.phases.fill(phase);
     if !publishing {
       return Ok(());
     }
@@ -987,19 +985,8 @@ fn new_heads<V: Repository>(
   admission: &mut Admission,
 ) -> Result<BTreeMap<usize, Vec<usize>>, PastAdmission> {
   let count = graph.brought.len();
-  admission.charge_items::<Vec<usize>>(count)?;
+  let children = brought_children(graph, admission)?;
   admission.charge_items::<BTreeSet<usize>>(count)?;
-  let mut children: Vec<Vec<usize>> = vec![Vec::new(); count];
-  for (index, brought) in graph.brought.iter().enumerate() {
-    for parent in brought.parents.into_iter().flatten() {
-      if let At::New(parent) = parent
-        && let Some(slot) = children.get_mut(parent)
-      {
-        admission.charge_items::<usize>(1)?;
-        slot.push(index);
-      }
-    }
-  }
   // Each brought changeset's branches among it and its brought descendants, children before parents.
   let mut below: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); count];
   let mut heads: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -1027,6 +1014,27 @@ fn new_heads<V: Repository>(
     heads.reverse();
   }
   Ok(heads)
+}
+
+/// Each brought changeset's brought children, in arrival order (for [`new_heads`]), charged as they are made.
+fn brought_children<V: Repository>(
+  graph: &Graph<'_, V>,
+  admission: &mut Admission,
+) -> Result<Vec<Vec<usize>>, PastAdmission> {
+  let count = graph.brought.len();
+  admission.charge_items::<Vec<usize>>(count)?;
+  let mut children: Vec<Vec<usize>> = vec![Vec::new(); count];
+  for (index, brought) in graph.brought.iter().enumerate() {
+    for parent in brought.parents.into_iter().flatten() {
+      if let At::New(parent) = parent
+        && let Some(slot) = children.get_mut(parent)
+      {
+        admission.charge_items::<usize>(1)?;
+        slot.push(index);
+      }
+    }
+  }
+  Ok(children)
 }
 
 /// One branch's placement: the moves and retirements of its lines, and the lines made.

@@ -271,6 +271,7 @@ fn step(
 fn scalar_end(input: &[u8], at: usize, byte: u8) -> Result<usize, Refusal> {
   match byte {
     b'"' => string_end(input, at),
+    // Format: a number begins with `-` or a digit, `0` to `9` (RFC 8259 §6).
     b'-' | b'0'..=b'9' => number_end(input, at),
     b't' => literal_end(input, at, b"true"),
     b'f' => literal_end(input, at, b"false"),
@@ -331,6 +332,7 @@ fn number_end(input: &[u8], at: usize) -> Result<usize, Refusal> {
         return Err(Refusal::Number { at: to_u64(at) });
       }
     }
+    // Format: `int = zero / ( digit1-9 *DIGIT )`, a nonzero lead digit `1` to `9` (RFC 8259 §6).
     Some(b'1'..=b'9') => end = digits_end(input, end, at)?,
     Some(_) => return Err(Refusal::Number { at: to_u64(at) }),
   }
@@ -349,6 +351,7 @@ fn number_end(input: &[u8], at: usize) -> Result<usize, Refusal> {
 
 /// The value of one hexadecimal digit of either case.
 fn hex_value(byte: u8) -> Option<u32> {
+  // Format: a `\uXXXX` escape's digits are hexadecimal, base 16 (RFC 8259 §7).
   char::from(byte).to_digit(16)
 }
 
@@ -381,6 +384,7 @@ fn escape_end(input: &[u8], at: usize) -> Result<(usize, char), Refusal> {
     b'"' => Some('"'),
     b'\\' => Some('\\'),
     b'/' => Some('/'),
+    // Format: `\b` is backspace, U+0008, and `\f` form feed, U+000C (RFC 8259 §7).
     b'b' => Some('\u{8}'),
     b'f' => Some('\u{c}'),
     b'n' => Some('\n'),
@@ -531,6 +535,7 @@ impl<'a> JsonStr<'a> {
 /// The bytes of the UTF-8 sequence a lead byte begins (1 for ASCII and for a byte no sequence begins with).
 fn utf8_width(lead: u8) -> usize {
   match lead.leading_ones() {
+    // Format: a lead byte's leading ones count its sequence's bytes, two to four (RFC 3629 §3).
     2 => 2,
     3 => 3,
     4 => 4,
@@ -646,6 +651,7 @@ impl<'a> Cursor<'a> {
       b'{' => Some(Kind::Object),
       b'[' => Some(Kind::Array),
       b'"' => Some(Kind::String),
+      // Format: a number begins with `-` or a digit, `0` to `9` (RFC 8259 §6).
       b'-' | b'0'..=b'9' => Some(Kind::Number),
       b't' | b'f' => Some(Kind::Bool),
       b'n' => Some(Kind::Null),
@@ -735,6 +741,7 @@ impl<'a> Cursor<'a> {
   /// The number that is the next value.
   pub fn number(&mut self) -> Result<JsonNumber<'a>, Shape> {
     let start = skip_whitespace(self.input, self.at);
+    // Format: a number begins with `-` or a digit, `0` to `9` (RFC 8259 §6).
     if !matches!(self.input.get(start), Some(b'-' | b'0'..=b'9')) {
       return Err(self.shape());
     }
@@ -808,6 +815,7 @@ pub fn put_str(out: &mut impl Out, text: &str) {
       b'\n' => Some(b"\\n"),
       b'\r' => Some(b"\\r"),
       b'\t' => Some(b"\\t"),
+      // Format: backspace, 0x08, and form feed, 0x0c, have two-character escapes (RFC 8259 §7).
       0x08 => Some(b"\\b"),
       0x0c => Some(b"\\f"),
       _ if *byte < FIRST_UNESCAPED => None,
@@ -817,6 +825,8 @@ pub fn put_str(out: &mut impl Out, text: &str) {
     match escape {
       Some(named) => out.put(named),
       None => {
+        // Format: `\u00` then the byte's high and low hexadecimal digits, the low one its bits
+        // under 0x0f (RFC 8259 §7).
         let high = LOWER_HEX.get(usize::from(byte.checked_shr(HEX_DIGIT_BITS).unwrap_or(0)));
         let low = LOWER_HEX.get(usize::from(byte & 0x0f));
         out.put(b"\\u00");
