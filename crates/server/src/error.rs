@@ -287,6 +287,10 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::PolicyHooksEnvMalformed { index } => {
       database(DatabaseRefusal::PolicyHooksEnvMalformed { index: *index })
     }
+    DbError::SnapshotRoom { needed, room } => database(DatabaseRefusal::SnapshotRoom {
+      needed: *needed,
+      room: *room,
+    }),
   }
 }
 
