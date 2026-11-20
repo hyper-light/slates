@@ -148,6 +148,8 @@ pub(crate) struct VcsStores {
   unrecovered: BTreeMap<RepositoryId, ReplayRefused>,
   /// What the content store holds of the shard's budget, charged as retention.
   charged: u64,
+  /// The last generation a Mercurial store's index was given ([`HgStore::generation`]); counts up.
+  generations: u64,
   /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
   /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
   objects_charged: BTreeMap<RepositoryId, u64>,
@@ -270,6 +272,9 @@ pub(crate) enum Target {
 pub(crate) struct HgStore {
   /// The index.
   pub(crate) index: HgIndex,
+  /// The index's generation (A-720): a number of the shard's, taken afresh whenever the store is made or its index
+  /// replaced, so a push's fork made from one index is known stale once another landed ([`VcsStores::generation_of`]).
+  pub(crate) generation: u64,
   /// Its derived values.
   pub(crate) derivations: Derivations,
 }
@@ -341,6 +346,28 @@ fn content_refused(refused: ContentRefused) -> GitRefused {
 }
 
 impl VcsStores {
+  /// The shard's next generation for a Mercurial store's index (A-720).
+  fn next_generation(&mut self) -> u64 {
+    self.generations = self.generations.saturating_add(1);
+    self.generations
+  }
+
+  /// Repository `id`'s Mercurial index's generation, while its store is held here (A-720).
+  pub(crate) fn generation_of(&self, id: RepositoryId) -> Option<u64> {
+    match self.entries.get(&id) {
+      Some(RepositoryStore::Mercurial(store)) => Some(store.generation),
+      _ => None,
+    }
+  }
+
+  /// Notes that repository `id`'s Mercurial index was replaced: a fork made from the one before is stale (A-720).
+  pub(crate) fn index_changed(&mut self, id: RepositoryId) {
+    let generation = self.next_generation();
+    if let Some(RepositoryStore::Mercurial(store)) = self.entries.get_mut(&id) {
+      store.generation = generation;
+    }
+  }
+
   /// Whether repository `id`'s store is held here.
   pub(crate) fn holds(&self, id: RepositoryId) -> bool {
     self.entries.contains_key(&id)
@@ -508,7 +535,10 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
       git.commits = Some(commits::declare(format, window));
       RepositoryStore::Git(git)
     }
-    VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore::default()),
+    VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore {
+      generation: stores.next_generation(),
+      ..HgStore::default()
+    }),
     VcsTool::Subversion => RepositoryStore::Subversion(SvnStore::default()),
   };
   stores.entries.entry(record.id).or_insert(store);
@@ -530,6 +560,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
     state.store.budget.credit_retention(charged);
   }
   state.vcs_stores.unrecovered.remove(&id);
+  state.vcs_usage.forget(&id);
   if !release_charged(state, id) {
     state.count(RELEASE_REFUSED, 1);
   }

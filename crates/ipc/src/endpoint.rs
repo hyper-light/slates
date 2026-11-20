@@ -1440,7 +1440,8 @@ mod judged {
   }
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+#[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod departure {
   use std::time::{Duration, Instant};
 

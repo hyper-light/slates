@@ -144,6 +144,21 @@ const SVN_ERR_FS_CORRUPT: u32 = 160_004;
 const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
 
 impl Uncommitted {
+  /// The refusal's Subversion error number and words, as a command's failure carries them (a lock verb's whose
+  /// entries the step refused, A-693 part 2).
+  pub(crate) fn failure(&self) -> (u32, String) {
+    match self.answered() {
+      slates_svn::serve::Uncommitted::Step(refusal) => {
+        (refusal.subversion_code(), refusal.message())
+      }
+      slates_svn::serve::Uncommitted::Refused { code, message } => (code, message),
+      slates_svn::serve::Uncommitted::NotServed => (
+        SVN_ERR_UNSUPPORTED_FEATURE,
+        "This server does not make commits yet".to_owned(),
+      ),
+    }
+  }
+
   /// The refusal as an ra_svn connection answers `close-edit` with it (module docs, "A client's work"): the step's in
   /// its own words; the others, which no FSFS commit meets, in slates' words under Subversion's nearest error.
   pub(crate) fn answered(&self) -> slates_svn::serve::Uncommitted {
@@ -211,7 +226,7 @@ pub(crate) fn record(
     Record::RevisionProperties { properties, .. } => {
       bytes_of(properties.iter(), core::iter::empty::<&Vec<u8>>())
     }
-    Record::Uuid(_) => 0,
+    Record::Uuid(_) | Record::Locks(_) => 0,
     Record::Created { .. } | Record::Revision(_) => return Err(corrupt()),
   };
   if !crate::vcs_store::lend_svn(state, repository, brought) {
@@ -235,6 +250,12 @@ fn record_growth(
     .ok_or(Uncommitted::NotHeld)?;
   match record {
     Record::Uuid(_) => Ok(0),
+    // A lock verb's entries, judged by the lock table as the records apply them (`check_entries`).
+    Record::Locks(entries) => records
+      .locks()
+      .check_entries(entries)
+      .map(|()| 0)
+      .map_err(|refusal| Uncommitted::Step(StepRefusal::Lock(refusal))),
     Record::RevisionProperties {
       revision,
       properties,

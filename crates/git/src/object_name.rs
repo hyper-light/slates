@@ -371,7 +371,7 @@ impl ObjectId {
       });
     }
     let mut name = [0u8; MAX_RAW_LEN];
-    for (index, (slot, pair)) in name.iter_mut().zip(hex.chunks_exact(2)).enumerate() {
+    for (index, (slot, pair)) in name.iter_mut().zip(hex.as_chunks::<2>().0).enumerate() {
       let at = index.saturating_mul(2);
       let high = hex_value(pair.first().copied()).ok_or(HexRefusal::NotHex { at: to_u64(at) })?;
       let low = hex_value(pair.get(1).copied()).ok_or(HexRefusal::NotHex {

@@ -12,7 +12,6 @@ use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
 use slates_hg::index::Log;
 use slates_hg::phases::{Phase, PhaseHead};
 use slates_hg::push::check::HeadsArgument;
-use slates_hg::push::held::IndexHeld;
 use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::{Asks, BookmarkAt, ChangegroupPart, Outcome, Taken, Unbundle, read};
 use slates_hg::serve::{Repository, Rev};
@@ -22,7 +21,7 @@ use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 
 use super::{
   BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, bookmark_of, branch_prefix, land,
-  line_name, line_of, prepare, transaction_id,
+  line_name, line_of, transaction_id,
 };
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
@@ -383,20 +382,15 @@ impl Hg {
 
   fn prepare(
     &self,
-    state: &ShardState,
+    state: &mut ShardState,
     unbundle: &Unbundle,
     view: &View,
   ) -> Result<Prepared, Refused> {
-    let (content, store) = state
-      .vcs_stores
-      .mercurial_ref(self.repository)
-      .expect("the repository's store, made with its record");
-    let held = IndexHeld::new(&store.index, content);
-    prepare(
+    super::prepare_whole(
       state,
       self.repository,
       unbundle,
-      (view, &held),
+      view,
       (false, NAME, ROOM),
       &mut room(),
     )
@@ -975,7 +969,7 @@ fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits(
     let (principal, heads) = (owner(), HeadsArgument::Force);
     let pushing = (&principal, &heads, &fixture!("push-plain.hg")[..]);
     let version = state.db.partition().green_head(hooked.root);
-    let refused = super::unbundle(state, hooked.repository, pushing, &mut room());
+    let refused = super::unbundle_in(state, hooked.repository, pushing, &mut room());
     let message = b"the repository's pretxnchangegroup.check hook cannot run here yet: its view of the push is \
                     not served"
       .to_vec();
@@ -988,7 +982,7 @@ fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits(
     );
     assert_eq!(state.db.partition().green_head(hooked.root), version);
     assert!(!hooked.holds(state, &made[3].node));
-    let accepted = super::unbundle(state, driven.repository, pushing, &mut room());
+    let accepted = super::unbundle_in(state, driven.repository, pushing, &mut room());
     let Some(Outcome::Accepted(reply)) = accepted else {
       panic!("not accepted: {accepted:?}");
     };

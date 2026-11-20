@@ -95,6 +95,15 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
   }
 }
 
+/// `lock` as `write_lock` writes it, handed to `with` as one value (A-693 part 2's lock verbs answer with it).
+pub(crate) fn with_lock_value<T>(lock: &Lock, with: impl FnOnce(Value<'_>) -> T) -> T {
+  let dates = (
+    super::format_time(lock.created.0),
+    lock.expires.map(|at| super::format_time(at.0)),
+  );
+  with(lock_value(lock, &dates))
+}
+
 /// One lock as `write_lock` writes it: `( path token owner ( [comment] ) created ( [expires] ) )`.
 fn lock_value<'v>(lock: &'v Lock, (created, expires): &'v LockDates) -> Value<'v> {
   Value::List(vec![

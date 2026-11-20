@@ -283,6 +283,7 @@ fn named(record: &Record) -> String {
     Record::Uuid(_) => "the UUID".to_owned(),
     Record::RevisionProperties { revision, .. } => format!("revision {revision}'s properties"),
     Record::Revision(revision) => format!("revision {}", revision.head + 1),
+    Record::Locks(_) => "lock entries".to_owned(),
   }
 }
 

@@ -77,6 +77,12 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-724 piece 1 (2026-11-20, w-balance; many repositories balanced by learned usage, §4.17.5).** BUILT: each
+> repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
+> steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
+> demands and weights read from the rows (2), admission by share (3), the cold trigger (4), intake off the owner and
+> content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
+>
 > **A-719 part 2 (2026-11-20, w-git).** BUILT: the pack reader's keeper seam (`unpack::Keep`): each object handed to its
 > keeper as it resolves and a delta's base read back from it, so a keeper that stores elsewhere bounds the reader's
 > working set; §4.17.1's intake rule written. Owed: part 3, git's intake keeping into the store as it reads.
@@ -97,9 +103,14 @@
 > set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
 > push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
 > log reads it, kept once), then the manifests' and files' presence a step each; the same fork as `verify` then
-> `fork_with`, row for row, within less room. Owed: part 2, the server driving it in slices within the shard's step
-> budget (the push driver still verifies whole); part 3, the import's room per repository; the store w-perf's table
-> gives (main's ruling).
+> `fork_with`, row for row, within less room. Part 2a BUILT (server): the push driver (`repository::hg_push::unbundle`,
+> async, both edges through `HgStores::push`) judges `heads`, reads the bundle, takes its changegroup into the push's own
+> fork a slice at a time within the shard's quantum with a yield between (pushes to one repository taken side by side),
+> then in one step judges it over the view as it is at landing (the race checks there), classifies it from the fork's
+> rows and lands the fork, the record written from it (`record::write_kept`); a connection that ends mid-intake gives
+> its fork back. Owed: part 2b, a fork made from an index another push replaced since is refused (`MOVED`) where it
+> should be re-based by node at landing; part 3, the import's room per repository; S5 (main's convergence plan): file
+> texts as the work's green files by identity, changelog and manifests as deltas, rows naming content by identity.
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
 > (`HgStores::push_room`, `git_push::push_room`, A-704's rule), and a bundle past it is refused in Mercurial's words
@@ -1890,7 +1901,12 @@
 > (A-688 looks on its own shard alone) and its test over the SSH site; `svn_uri_canonicalize`.
 > A-693 part 1, 2026-11-19 (w-svn): `get-lock` and `get-locks` answered from the lock table (stock `svnserve`'s
 > recorded `info`/`ls` sessions now replayed with them; a held, an expired and a hidden lock; the depth refusal).
-> Owed: the four lock-changing verbs through the owner's step (A-693 part 2).
+> Part 2, 2026-11-19 (w-svn): `lock`, `lock-many`, `unlock` and `unlock-many` served over `svn://` and `svn+ssh://`:
+> judged against the lock table by `serve::locks` (an anonymous session asked to authenticate for the command), their
+> entries landed through the owner's step as a `Record::Locks` (durable as a revision, replayed by a rebuild), then
+> answered as `svnserve` answers them: stock `svn`'s recorded `lock-bob` and `lock-a` sessions byte for byte. macOS
+> arm64, this Mac, local: slates-svn 239 of 239, server `vcs_svn::` `vcs_ssh::svn::` `repository::svn_commit::`.
+> Owed: the pre-lock and post-lock hooks; a lock's expiry set by a client (ra_svn names none).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
@@ -3327,6 +3343,12 @@
 > - A second system worker held one resource exclusive and a second one on its own stack.
 >
 > **The mechanism the source gives (a hypothesis that fits every waiter; not proven).**
+> **Shown for fsx's wedge (2026-11-20, goal 87, w-bugs; goal-83 B3):** on CI's windows-latest the receive worker began
+> sending a shrink's SetInformation answer and that `DeviceIoControl` never returned (about 59 s, then the run's end);
+> every earlier send returned within 481 µs and no request was received after it (diagnostics branch
+> `diag-w-bugs-b3-9`; record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`, "Shown
+> 2026-11-20"). SetInformation's completion runs `CcSetFileSizes` on the sender (`fileinfo.c` 1407, `file.c` 1852), so
+> the one receiver waits on the drive it alone receives for. The fix (a receive never waits on a send) is owed.
 > - WinFsp completes an answered IRP inline, on the thread that sent the answer. `FspVolumeTransact`
 >   (`src/sys/volume.c:1089-1102`) calls `FspIopDispatchComplete` for each answer, and the kind's `FSP_LEAVE_IOC`
 >   (`src/sys/driver.h:289-306`) ends in `IoCompleteRequest` (`src/sys/iop.c:321`).

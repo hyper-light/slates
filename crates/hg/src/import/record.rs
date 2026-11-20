@@ -342,6 +342,62 @@ pub fn write_push(
   write_revisions((Source::Push, room), &groups, &[])
 }
 
+/// A push's record (A-680 part 2c's, [`Source::Push`]) written from the fork A-720's intake kept it in: each of `logs`'
+/// revisions from its first kept number to the fork's end, in the order kept, read back from the fork's rows (texts
+/// whole, as [`write_push`] writes them); `room` the room the landing ran within. Refused, nothing is written.
+pub fn write_kept(
+  fork: &HgIndex,
+  store: &ContentStore,
+  logs: &[(crate::push::verify::LogOf, u32)],
+  room: u64,
+) -> Result<Vec<u8>, WriteRefused> {
+  use crate::push::verify::LogOf;
+  let mut read: Vec<(Log<'_>, Vec<(Kept, Vec<u8>)>)> = Vec::with_capacity(logs.len());
+  for (named, first) in logs {
+    let log = match named {
+      LogOf::Changelog => Log::Changelog,
+      LogOf::Manifests => Log::Manifest,
+      LogOf::File(path) => Log::File(path),
+    };
+    let radix: &[u8] = match named {
+      LogOf::File(path) => path,
+      _ => &[],
+    };
+    let mut revisions = Vec::new();
+    for rev in *first..fork.len(store, log) {
+      let kept = kept(fork, store, log, rev).ok_or_else(|| unreadable(radix, rev))?;
+      let mut text = Vec::new();
+      if write_text(&mut text, store, &kept) != kept.len {
+        return Err(unreadable(radix, rev));
+      }
+      revisions.push((kept, text));
+    }
+    read.push((log, revisions));
+  }
+  let revisions: Vec<Vec<Revision<'_>>> = read
+    .iter()
+    .map(|(_, revisions)| {
+      revisions
+        .iter()
+        .map(|(kept, text)| Revision {
+          node: kept.node,
+          p1: kept.p1,
+          p2: kept.p2,
+          link: kept.link.unwrap_or(NULL_NODE),
+          flags: kept.flags,
+          text,
+        })
+        .collect()
+    })
+    .collect();
+  let groups: Vec<Group<'_>> = read
+    .iter()
+    .zip(&revisions)
+    .map(|((log, _), revisions)| (*log, revisions.as_slice()))
+    .collect();
+  write_revisions((Source::Push, room), &groups, &[])
+}
+
 /// One log's arrived revisions as a push's record holds them: flags 0, and a link only where the log has one.
 fn pushed(arrived: &[crate::push::verify::Arrived], linked: bool) -> Vec<Revision<'_>> {
   arrived

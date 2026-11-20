@@ -24,7 +24,6 @@ use crate::commit::revision::Revision as RevisionToCommit;
 use crate::dav::request::svn_time;
 use crate::dump::Uuid;
 use crate::index::{Action, ContentIdentity, NodeKind};
-use crate::lock::{HeadView, LockRequest, LockTarget};
 use crate::mergeinfo::Contents;
 use crate::migration::{Repository as Records, Room};
 use crate::report::recorded::{command, items, value_of};
@@ -68,8 +67,8 @@ const RECORDINGS: [Recording; 17] = [
 /// Bob's commit that `svnserve` took while alice's `conflict` drive was held at `close-edit`.
 const RACE: Recording = recording!("race-commit", b"bob");
 
-/// The commit connections replayed: every recording but bob's lock, and bob's race.
-const REPLAYED: usize = 17;
+/// The connections replayed: every recording, bob's lock among them (A-693 part 2), and bob's race.
+const REPLAYED: usize = 18;
 
 /// The youngest revision once every recorded commit is made (`sessions.txt`: thirteen commits).
 const YOUNGEST: Revision = 13;
@@ -85,10 +84,6 @@ const ROOT: &[u8] = b"svn+fixture://fixture/repo";
 
 /// The repository's identity, which is also its realm (`make-fixtures.py` `UUID`).
 const IDENTITY: &[u8] = b"00000000-0000-4000-8000-00000000a617";
-
-/// The file bob locks (`make-fixtures.py`'s `lock-bob` step,
-/// `svn lock -m bob's WORK/wc-bob/a.txt`).
-const LOCKED: &str = "/trunk/project/a.txt";
 
 /// The prefix of a lock token (`lock.c`'s `opaquelocktoken:` URI).
 const TOKEN_PREFIX: &str = "opaquelocktoken:";
@@ -283,20 +278,6 @@ impl commit_drive::Green for View<'_> {
   }
 }
 
-/// The head as the lock guard reads it.
-struct Head<'i>(&'i Index);
-
-impl HeadView for Head<'_> {
-  fn youngest(&self) -> Revision {
-    self.0.youngest()
-  }
-
-  fn node(&self, path: &str) -> Option<(NodeKind, Revision)> {
-    let node = self.0.node(path, self.0.youngest()).ok()??;
-    Some((node.kind(), node.created_revision()))
-  }
-}
-
 /// The repository the replay builds: the owner's records (index, contents, lock table), the reads'
 /// view of them, and the transactions begun.
 struct Replay {
@@ -470,6 +451,22 @@ fn replay_connection(
         let recorded = recorded_date(server).unwrap();
         make(replay, &mut connection, *work, &recorded, &mut out);
       }
+      Ok(Turn::LockAsked { consumed }) => {
+        held.drain(..consumed);
+        let (drawn, date) = recorded_lock(server);
+        let entries = {
+          let view = replay.view();
+          let given = Sources {
+            now: svn_time(&date).unwrap(),
+            ..sources(&view)
+          };
+          let mut draw = || drawn;
+          let judged = connection.lock_verb(&given, &mut draw, ROOM, &mut out);
+          judged.unwrap().unwrap()
+        };
+        replay.records.apply_lock_entries(&entries).unwrap();
+        connection.locks_landed(Ok(()), &mut out).unwrap();
+      }
       other => panic!("{name}: {other:?}"),
     }
   }
@@ -504,70 +501,46 @@ fn assert_as_svnserve(name: &str, ours: &[u8], server: &[u8]) -> usize {
   in_hash_order
 }
 
-/// Takes bob's lock as `svnserve` did, with the token it drew (A-602's guard over the token's
-/// UUID).
-fn take_lock(replay: &mut Replay, server: &[u8]) {
-  let token = items(server)
+/// The token's UUID bytes and the creation date of the lock `svnserve` answered a recorded `lock-many` with
+/// (`write_lock`'s `( path token owner ( comment ) created ( expires ) )`), so the replay draws that token at that
+/// instant.
+pub(super) fn recorded_lock(server: &[u8]) -> ([u8; crate::lock::UUID_BYTES], String) {
+  let (token, date) = items(server)
     .into_iter()
-    .find_map(|item| find_token(&value_of(item)))
+    .find_map(|item| match value_of(item) {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::Word("success"), Value::List(lock)] => match lock.as_slice() {
+          [
+            Value::String(_),
+            Value::String(token),
+            Value::String(_),
+            Value::List(_),
+            Value::String(date),
+            Value::List(_),
+          ] if token.starts_with(TOKEN_PREFIX.as_bytes()) => Some((token.to_vec(), date.to_vec())),
+          _ => None,
+        },
+        _ => None,
+      },
+      _ => None,
+    })
     .unwrap();
-  let uuid: Vec<u8> = token
-    .strip_prefix(TOKEN_PREFIX)
-    .unwrap()
-    .bytes()
+  let hex: Vec<u8> = token[TOKEN_PREFIX.len()..]
+    .iter()
+    .copied()
     .filter(|byte| *byte != b'-')
     .collect();
-  let drawn: Vec<u8> = uuid
+  let drawn: Vec<u8> = hex
     .chunks(2)
     .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
     .collect();
-  let mut draw = || drawn.clone().try_into().unwrap();
-  let request = LockRequest {
-    user: Some("bob".to_owned()),
-    comment: Some(b"bob's".to_vec()),
-    targets: BTreeMap::from([(
-      LOCKED.to_owned(),
-      LockTarget {
-        current: None,
-        token: None,
-      },
-    )]),
-    ..LockRequest::default()
-  };
-  let decision = replay
-    .records
-    .locks()
-    .lock(
-      &request,
-      &Head(replay.records.index()),
-      AprTime(0),
-      ROOM,
-      &mut draw,
-    )
-    .unwrap();
-  replay
-    .records
-    .apply_lock_entries(&decision.entries)
-    .unwrap();
-  let held = replay.records.locks().get_lock(LOCKED, AprTime(0)).unwrap();
-  assert_eq!(held.token.as_str(), token, "the recorded token");
-}
-
-/// The first lock token in `value`.
-fn find_token(value: &Value<'_>) -> Option<String> {
-  match value {
-    Value::String(bytes) if bytes.starts_with(TOKEN_PREFIX.as_bytes()) => {
-      String::from_utf8(bytes.to_vec()).ok()
-    }
-    Value::List(parts) => parts.iter().find_map(find_token),
-    _ => None,
-  }
+  (drawn.try_into().unwrap(), String::from_utf8(date).unwrap())
 }
 
 /// A-656 with A-655 (`serve.c` `commit` over A-655's drive through `svnserve -t`; stock `svnserve`
 /// 1.15.0's recorded commits): replay every recorded commit connection from its first byte through
-/// a connection tunnelled as its user (`EXTERNAL`), in the recorder's order, bob's lock taken as
-/// `svnserve` took it and bob's race replayed just before alice's `close-edit`, each accepted work
+/// a connection tunnelled as its user (`EXTERNAL`), in the recorder's order, bob's `lock-many` served by
+/// the connection (A-693 part 2) and bob's race replayed just before alice's `close-edit`, each accepted work
 /// made as the owner makes it; expect every connection to write what `svnserve` wrote, its greeting
 /// less `svndiff1` and every item byte for byte (the property lists `svnserve` wrote in hash order
 /// as sets, counted): thirteen commits answered with their revisions, the stale root and the stale
@@ -579,10 +552,6 @@ fn every_recorded_commit_is_answered_as_svnserve_answered_it() {
   let mut replay = Replay::new();
   let mut replayed = 0;
   for recording in RECORDINGS {
-    if recording.0 == "lock-bob" {
-      take_lock(&mut replay, recording.3);
-      continue;
-    }
     let race = (recording.0 == "conflict").then_some(RACE);
     let out = replay_connection(&mut replay, recording, race);
     replay.in_hash_order += assert_as_svnserve(recording.0, &out, recording.3);

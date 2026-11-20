@@ -627,10 +627,10 @@ impl World {
     if fresh {
       self.issue_next(epoch);
     }
-    if fresh || resend {
-      if let Some(record) = self.owners[&epoch].pending.clone() {
-        self.send_to_holders(host, &Body::Record(record));
-      }
+    if (fresh || resend)
+      && let Some(record) = self.owners[&epoch].pending.clone()
+    {
+      self.send_to_holders(host, &Body::Record(record));
     }
   }
 
