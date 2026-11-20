@@ -330,7 +330,9 @@
 > (`PushObjects::listing`), the longest build unit 1.12 -> 0.22 ms (flat 1,500 files, debug). OWED: units still one
 > object's size: a blob read and laid whole, a tree's bytes copied once, the green's hard links (none in git or
 > Mercurial greens), a copy's tree (a push makes none); Mercurial's trees still listed whole. OWED (part 3): the
-> entry apply (`apply_planned`: the engine's verdict and commit, the record) in one step, 92 ms for 1,500 files debug.
+> entry apply in one step: part 3a moved the paths map's step after a push into slices (94 -> 42 ms, 1,500 files
+> debug); left: the engine's verdict (8.3 ms) and commit (10.9), the recorded entry (4.7), retention's secure (5.0),
+> and the git store's record and commit (11.5, w-git's A-722).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's

@@ -23,6 +23,14 @@
 //! version the build began at is then not made over the newer map (`super::super::commits::make_owed` checks its
 //! version) and is settled by the push's own move, counted unmade.
 //!
+//! **A push's change, too** (A-752 part 3; main's order of 2026-11-20: a push changing every file of a 1,500-file head
+//! stepped its map in its answer's step, 52 ms debug). Where the green keeps the map of the version before, a push's
+//! step over its change is a build of its own ([`start_change`]): the paths the change names, each put from the head a
+//! unit or noted removed where the map before holds a file and the head none, then the change applied to the map and
+//! trees before at its end (`super::Plan::PutChange`), as `super::advance`'s step applies it. Its first path is put in
+//! the push's own step, so a one-file change ends there; it moves with a push meanwhile, parks the submits that need
+//! it, and is counted, as a whole build is ([`CHANGE_BEGUN`]; `super::DERIVED` at its end).
+//!
 //! **The submits that need it wait, parked.** A submit to a green whose build is under way would build the map whole
 //! in its own step, the cost this module moves off the shard's steps: so it is parked ([`park`]), its verb's inputs and
 //! its reply's route kept with the build, its request deferred as an acceptance that waits is (no completion, no
@@ -58,6 +66,9 @@ use crate::verbs::ParkedSubmit;
 
 /// Counter: a whole build begun after a push. Format: a counter name in the daemon's status report.
 pub(crate) const BEGUN: &str = "vcs_store.paths.whole_build.begun";
+/// Counter: a change build begun after a push (A-752 part 3, [`start_change`]). Format: a counter name in the daemon's
+/// status report.
+pub(crate) const CHANGE_BEGUN: &str = "vcs_store.paths.whole_build.change_begun";
 /// Counter: a whole build's slices. Format: a counter name in the daemon's status report.
 pub(crate) const SLICES: &str = "vcs_store.paths.whole_build.slices";
 /// Counter: a build moved to its green's newest head at a slice's boundary, a push having landed meanwhile. Format: a
@@ -111,6 +122,10 @@ struct Build {
   /// Whether it makes a map again after a store was made again from the log (`super::super::rebuild`): counted
   /// `paths::REMADE` at its end, as a recovery's remake is, not `paths::BUILT`.
   remade: bool,
+  /// For a change build ([`start_change`]): the map and trees it derives from, which its end applies the change to.
+  before: Option<super::Head>,
+  /// For a change build: the paths the change removes, which the map before holds a file at and the head none.
+  removed: std::collections::BTreeSet<Vec<u8>>,
 }
 
 /// Whether `green`'s map is being built whole: a submit to it is parked ([`park`]).
@@ -159,9 +174,49 @@ pub(crate) fn start(
     task,
     kept,
     remade: false,
+    before: None,
+    removed: std::collections::BTreeSet::new(),
   };
   state.vcs_stores.whole_builds.0.insert(green, build);
   state.count(BEGUN, 1);
+}
+
+/// Begins `green`'s step to `version`, its head, over the change since the map `before` (A-752 part 3): each path
+/// `named` put from the head a unit, or noted removed where `before` holds a file and the head none, and the end
+/// applies the change to `before`'s map and trees (`super::Plan::PutChange`). It moves with a push meanwhile as a whole
+/// build does. Its first slice, one path, runs at once, so a one-file change ends here; a green with a build under way
+/// is not asked.
+pub(crate) fn start_change(
+  state: &mut ShardState,
+  (repository, green, version): (RepositoryId, DbVolumeId, u64),
+  (before, named): (super::Head, std::collections::BTreeSet<String>),
+) {
+  let paths: Vec<String> = named
+    .into_iter()
+    .filter(|path| !map_path(path).is_empty())
+    .collect();
+  let task = slates_rt::futures::spawn(drive(green)).ok();
+  if let Some(task) = task {
+    let _ = slates_rt::futures::detach(task);
+  }
+  let build = Build {
+    repository,
+    version,
+    paths,
+    at: 0,
+    entries: BTreeMap::new(),
+    held: Vec::new(),
+    parked: Vec::new(),
+    task,
+    kept: false,
+    remade: false,
+    before: Some(before),
+    removed: std::collections::BTreeSet::new(),
+  };
+  state.vcs_stores.whole_builds.0.insert(green, build);
+  state.count(CHANGE_BEGUN, 1);
+  // The push's step has spent its budget already: one path here, so a one-file change ends in it; the task the rest.
+  slice(state, green, 0);
 }
 
 /// [`start`] for a map made again after `repository`'s store was made again from the log (`super::super::rebuild`):
@@ -307,7 +362,10 @@ fn moved(state: &mut ShardState, green: DbVolumeId, build: &mut Build, head: u64
   };
   for path in changed {
     build.entries.remove(map_path(&path));
-    if !map_path(&path).is_empty() && super::git_file(&engine, &path).is_some() {
+    build.removed.remove(map_path(&path));
+    // A change build puts or removes every path the change names; a whole build puts the head's files alone.
+    let named = build.before.is_some() || super::git_file(&engine, &path).is_some();
+    if !map_path(&path).is_empty() && named {
       build.paths.push(path);
     }
   }
@@ -345,6 +403,25 @@ fn put_some(
   let mut answer = Ok(());
   while let Some(path) = build.paths.get(build.at) {
     let Some(file) = super::git_file(&engine, path) else {
+      // A change build notes a path its map before holds a file at as removed.
+      if let Some(before) = build.before {
+        let name = map_path(path);
+        let held = vcs_stores
+          .git_ref(build.repository)
+          .and_then(|(content, git)| Some((content, git.paths.as_ref()?)))
+          .ok_or(StepRefused::NoMap)
+          .and_then(|(content, paths)| super::held_before(content, paths, before.root, name));
+        match held {
+          Ok(true) => {
+            build.removed.insert(name.to_vec());
+          }
+          Ok(false) => {}
+          Err(refused) => {
+            answer = Err(refused);
+            break;
+          }
+        }
+      }
       build.at = build.at.saturating_add(1);
       continue;
     };
@@ -357,6 +434,7 @@ fn put_some(
       .and_then(|(content, _)| super::put_file(content, &file, &mut build.held));
     match put {
       Ok(entry) => {
+        build.removed.remove(map_path(path));
         build.entries.insert(map_path(path).to_vec(), entry);
         build.at = build.at.saturating_add(1);
       }
@@ -389,6 +467,8 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
     parked,
     kept,
     remade,
+    before,
+    removed,
     ..
   } = build;
   if !kept {
@@ -398,7 +478,18 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
       super::super::Lent::new(&mut state.store, &mut state.vcs_stores).stores,
       repository,
       (key, version),
-      Plan::Put(entries),
+      match before {
+        // A change build's end: the change applied to the map and trees before.
+        Some(before) => Plan::PutChange(
+          before,
+          entries
+            .into_iter()
+            .map(|(name, entry)| (name, Some(entry)))
+            .chain(removed.into_iter().map(|name| (name, None)))
+            .collect(),
+        ),
+        None => Plan::Put(entries),
+      },
       held,
     );
     if !super::super::settle_in(&mut state.store, &mut state.vcs_stores) {
