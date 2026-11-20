@@ -186,8 +186,11 @@
 > lent for the turn alone, the shard's room (`vcs_share::room`) and step quantum (`HgStores::fetch_turn`), the stream
 > compressed as it is made (`compression::StreamCompressor`, each slice's engine bound charged first); a step past a
 > turn's room after others waits for the next turn's. The red is GREEN: the clone of a file twice a request's room is
-> answered whole. Owed: SSH (piece 2b); a hold on the index generation a fetch began on (rule 4: a push landing
-> mid-clone is read by the clone's later turns); the stream clone's; w-interop's matrix rerun.
+> answered whole. Piece 2b BUILT (SSH): the session begins a `getbundle` (`session::begin_serving`), the `Stdio`
+> holds its answer and makes it a slice at a time (`Stdio::stream`), the server's step streaming it within the shard's
+> room and quantum, a turn ending once a room's worth waits to be sent; an SSH clone of a file twice a request's room
+> is answered whole (test). Owed: a hold on the index generation a fetch began on (rule 4: a push landing mid-clone is
+> read by the clone's later turns; next); the stream clone's; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
