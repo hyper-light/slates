@@ -22,7 +22,12 @@
   HookSite::Tunnel; pre_lock_hooks/post_lock_hook shared). 135/135 focused. A-730 DONE; told main so w-svn can build
   A-702 part 2 (revprop change) on vcs_svn::run_hook (HookSite, Hooked::new, svn_pre/post_revprop_change builders).
   Owed (GAPS): SSH edge client-gone signal for a hook run; DAV's hooks; REPOS as A-645's FSFS view.
-  Goal 93 queue for w-reaper DONE. Worktree ~/slates-work/w-reaper-a730 kept for follow-ups.
+  NEW QUEUE (main): (1) DAV hooks -> A-733 LANDED main bad0841 (merged 431b110): DavCommit begin_hooked/resume_begin,
+  merge_hooked/resume_merge; SvnStores::begin_commit returns Due; exchange POST/MERGE/LOCK/UNLOCK async with
+  HookSite::Http(ClientGone, policy); post-lock/unlock failure counted, never told. Tests daemon_edge a_dav_* 3/3,
+  focused 101/101 + svn 171/171, stock svn HTTP on Studio-1 4/4.
+  (2) NEXT: A-645 hook view (route A: read-only slates volume presented to the hook; svnlook + git hooks read REPOS).
+  (3) Linux run of hook tests on adacachy when it has room.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
