@@ -239,6 +239,9 @@
 > (`Session::blocked` now reads on while `ServerTransport::is_rekeying`); every rekey is logged with its trigger
 > (`docs/bugs/2026-11-20-an-ssh-clone-stalled-at-a-rekey-with-its-outbox-full.md`). An answer refused past its
 > stream's start ends the SSH session as an abort, 255 and its words on stderr (it exited 0).
+> Rekeys follow RFC 4253 §9 (main's ruling): after a gigabyte of packets either way (`keylife::REKEY_BYTES`, a rekey
+> point, never a limit) or an hour (`RECOMMENDED_KEY_TIME_NS`), plus any the client asks; A-594's key time learned from
+> earlier connections' lifetimes is gone (one short session had set it to 31 ms, measured: the red).
 > `stream2` as stock 7.2 writes it (read 2026-11-20 from Homebrew's 7.2, `hg bundle --type 'none-v2;stream=v2'` of two
 > public changesets): one mandatory part with `bytecount`, `filecount` and the quoted `requirements`; each entry its
 > vfs byte (`s` store, `c` cache), the name's and the data's lengths as uvarints, the name, the data; small revlogs
@@ -2036,8 +2039,11 @@
 > lock (both its lock calls pass expiration 0); only a DAV `LOCK` with a `Timeout` does, so the case needs a timed DAV
 > lock and a commit spanning its expiry, off the scale path.
 > **Measured 2026-11-20 (the big Studio, release; BENCHMARKS):** the export's text calls run 12 to 20 times the copy
-> slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs): owed, the piece and the
-> window sliced to the slice. **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
+> slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs). Format 2's piece is now the
+> bytes the shard's copy slice digests at the machine's measured MD5 and SHA-1 rate (`DaemonConfig::
+> svn_text_piece_bytes`, `Exporter::with_text_piece`; the rate measured at the daemon's derivation through aws-lc-rs,
+> as the writer digests); its release numbers are owed with the big Studio back. Format 3's window made in parts is
+> w-bugs' shared encoder (main's routing). **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
 > refused E210009 by one request's room over svn:// and DAV (rule 2), and below that room `commit::drive::Work::texts`
 > holds every new text whole (rule 1, by reading); owed, w-svn's next piece. **Intake, part 1 (same day, w-svn, on w-perf's seam):**
 > the commit drive applies each svndiff window into one window's room and hands it to the caller's
@@ -2991,8 +2997,10 @@
 >   append turn 0.92 to 0.94 ms before, about 0.46 us after, each hashing turn at most 27 to 32 us; peak RSS unchanged
 >   (8.8 MB). **A-757 part 2b (2026-11-20):** a delta over one archive page, sealed or in the clear, is sealed and hashed
 >   by a build of its own in turns, queued behind like a whole build: 2.4 MB in release, the append turn 0.92 to 2.32 ms
->   before, 0.42 to 1.46 us after, each 64 KiB hashing turn 27 to 68 us. **Owed:** the body is held twice (A-757 part
->   3)); and, after A-347's open, the takeover's
+>   before, 0.42 to 1.46 us after, each 64 KiB hashing turn 27 to 68 us. **A-757 part 3 (2026-11-20):** a whole entry's
+>   payload is held once, by the shipper, which keeps it past the retained tail and lends it for installs; the volume
+>   holds its own bytes only for an install image: 50 volumes' 2.4 MB whole states at rest, peak RSS 249 MB before, 128
+>   MB after (release)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is

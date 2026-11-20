@@ -56574,8 +56574,15 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   (`measure_the_delta_append_turn`). Tests: `a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once`; the fleet
   test `a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own` (a three-MiB staged write, one publication), red
   before (no build, no hashing turn), at least 48 hashing turns after.
-- **Owed.** Part 3: the body held once, by identity in the content store (A-727) or an arena handle, so the retained
-  entry and the volume's whole state name one copy.
+- **Part 3 (the body held once).** One owner and lends, no `Arc` (R2): the payload moves into the shipper at the
+  append (no clone), `Shipper::keep` names the whole entry the owner keeps as its last whole state, `trim` moves that
+  entry to a kept slot when the retained tail lets it go, and `Shipper::payload_at` lends it from either place.
+  `LiveVolume::whole` is a `WholeState`: `InLog(head)`, lent by the shipper, or `Image(head, bytes)`, an install image
+  made beside the log, which is not an entry. The content store (A-727) was not used: a live log's payload is an
+  in-memory shipping buffer, not durable content. Release, 50 volumes' 2.4 MB whole states held at rest: peak RSS 248.9
+  to 249.0 MB before, 127.7 MB after (`measure_whole_states_held_twice` and `_once`, ignored measurements). Tests:
+  `a_kept_whole_state_is_lent_after_the_retained_tail_lets_it_go`; the fleet `live`, `whole` and `install` tests and the
+  live_chaos fresh-member flow (2/2) send installs from the lent payload.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither

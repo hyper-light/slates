@@ -219,6 +219,38 @@ struct SealedPiece {
   bytes: Vec<u8>,
 }
 
+/// A live volume's last whole state, what an install sends (A-757 part 3): the log's whole entry at its head, whose one
+/// copy the shipper keeps and lends (`Shipper::keep`, `Shipper::payload_at`); or an image made at the head beside the
+/// log ([`refresh_image`]), held here. Until A-757 part 3 the volume held its own copy of each whole entry beside the
+/// shipper's, two copies of the volume at rest and three during the append.
+#[derive(Debug)]
+enum WholeState {
+  /// The whole entry at this head, lent by the shipper.
+  InLog(Head),
+  /// An image at this head, and its bytes.
+  Image(Head, Vec<u8>),
+}
+
+impl WholeState {
+  /// The head the whole state is the state at.
+  fn head(&self) -> Head {
+    match self {
+      WholeState::InLog(head) | WholeState::Image(head, _) => *head,
+    }
+  }
+}
+
+/// `live`'s last whole state, its head and its bytes lent: from the shipper for a whole entry, else its image.
+fn whole_payload(live: &LiveVolume) -> Option<(Head, &[u8])> {
+  match live.whole.as_ref()? {
+    WholeState::InLog(head) => live
+      .shipper
+      .payload_at(head.position)
+      .map(|payload| (*head, payload)),
+    WholeState::Image(head, image) => Some((*head, image.as_slice())),
+  }
+}
+
 /// A live volume on its owner shard.
 #[derive(Debug)]
 pub(crate) struct LiveVolume {
@@ -231,7 +263,7 @@ pub(crate) struct LiveVolume {
   owes_image: bool,
   /// The last whole state's payload and its head: the last whole entry, or an image a publication's state made at its
   /// own head ([`refresh_image`]). What an install sends.
-  whole: Option<(Head, Vec<u8>)>,
+  whole: Option<WholeState>,
   /// The anchors whose copy of the volume's lineage key the last whole entry carries (`None`: its body is in the
   /// clear, which any successor opens): a successor opens the log only through its own key entry there, so the log
   /// is durable only once that entry covers every remote candidate ([`covers_candidates`]).
@@ -2265,33 +2297,37 @@ fn append_entry_with(
   // A whole record is a checkpoint and may go one past the credit (`Shipper::append_checkpoint`); a delta waits for it.
   // The head alone back: the entry stays in the retained tail, and its identity is hashed once (w-forming,
   // 2026-11-20: asked here twice more, each a copy and a hash of the payload).
+  // The payload moves into the shipper, its one copy (A-757 part 3): a whole state is lent back from there.
+  let payload_len = payload.len();
   let appended = if whole {
     match hashed {
-      Some(hashed) => live
-        .shipper
-        .append_checkpoint_hashed(payload.clone(), hashed),
-      None => live.shipper.append_checkpoint_kept(payload.clone()),
+      Some(hashed) => live.shipper.append_checkpoint_hashed(payload, hashed),
+      None => live.shipper.append_checkpoint_kept(payload),
     }
   } else {
     match hashed {
-      Some(hashed) => live.shipper.append_hashed(payload.clone(), hashed),
-      None => live.shipper.append_kept(payload.clone()),
+      Some(hashed) => live.shipper.append_hashed(payload, hashed),
+      None => live.shipper.append_kept(payload),
     }
   };
   let head = appended.map_err(NotAppended::Refused)?;
+  if whole {
+    // Kept before any bound trims the tail, so the whole state is never let go while it is the last.
+    live.shipper.keep(Some(head.position));
+  }
   let published_ns = live
     .publishing_ns
     .take()
     .unwrap_or_else(slates_machine::clock::monotonic_ns);
   live.newest = Some((head.position, published_ns));
-  let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+  let shipped = u64::try_from(payload_len).unwrap_or(u64::MAX);
   if whole {
     live.owes_whole = false;
   }
   live.kept = if whole {
-    payload.len()
+    payload_len
   } else {
-    live.kept.saturating_add(payload.len())
+    live.kept.saturating_add(payload_len)
   };
   // An image is made from the volume's state only where that state is this entry's head: never in a queue's drain,
   // where later publications are captured past it (A-377); the record period makes it once the volume is clean.
@@ -2303,8 +2339,8 @@ fn append_entry_with(
     // record a turned-away one leads to, and shipping a laggard the entries it lacks never costs more than
     // installing it (`Bounds::of_whole`). The fixed credit of two entries had made a third publication inside one
     // round trip ship the whole volume.
-    live.shipper.set_bounds(Bounds::of_whole(payload.len()));
-    live.whole = Some((head, payload));
+    live.shipper.set_bounds(Bounds::of_whole(payload_len));
+    live.whole = Some(WholeState::InLog(head));
     live.owes_image = false;
     live.whole_anchors = anchors;
     live.whole_entry = Some(head);
@@ -2312,7 +2348,7 @@ fn append_entry_with(
   }
   // Every entry moves the retained tail to the volume as it is now ([`retain_bound`]); the credit stays where the last
   // whole record or image put it.
-  let last_whole = live.whole.as_ref().map_or(0, |(_, image)| image.len());
+  let last_whole = whole_payload(live).map_or(0, |(_, payload)| payload.len());
   let bounds = live.shipper.bounds();
   live.shipper.set_bounds(Bounds {
     retain: retain_bound(last_whole, referenced),
@@ -3118,7 +3154,9 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   };
   live.shipper.mark_checkpoint(head);
   live.shipper.set_bounds(Bounds::of_whole(image.len()));
-  live.whole = Some((head, image));
+  // The image is the whole state now, held here; the shipper keeps no entry for it.
+  live.shipper.keep(None);
+  live.whole = Some(WholeState::Image(head, image));
   // The entry's anchors stay what A-240 judges the log by (`whole_anchors`); the image's are judged beside them.
   // An image sealed under no keys (a volume shipped in the clear) has none to judge.
   live.image_anchors = anchors;
@@ -3721,7 +3759,7 @@ fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<S
   if live.owes_image {
     return (None, false);
   }
-  let Some((head, payload)) = &live.whole else {
+  let Some((head, payload)) = whole_payload(live) else {
     return (None, true);
   };
   if live
@@ -3735,8 +3773,8 @@ fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<S
     owner: live.shipper.owner(),
     object,
     epoch: live.shipper.epoch(),
-    head: *head,
-    state: payload.clone(),
+    head,
+    state: payload.to_vec(),
   };
   let send = Send {
     object,
@@ -3952,9 +3990,13 @@ fn reached_volume(s: &mut ShardState, volume: [u8; 16], holder: HostId) -> bool 
   let Some(live) = s.live.shipping.get_mut(&volume) else {
     return false;
   };
-  let behind_the_tail = live.whole.as_ref().is_some_and(|(head, _)| {
-    Some(*head) != live.shipper.head() && !live.shipper.retains_after(head.position)
-  });
+  let behind_the_tail = live
+    .whole
+    .as_ref()
+    .map(WholeState::head)
+    .is_some_and(|head| {
+      Some(head) != live.shipper.head() && !live.shipper.retains_after(head.position)
+    });
   if behind_the_tail && live.shipper.pending(holder) == Next::Install {
     live.owes_image = true;
   }
@@ -8235,7 +8277,7 @@ mod tests {
       let at_risk = holds_nothing_yet(state, clone);
       let live = state.live.shipping.get_mut(&clone.bytes)?;
       let head = live.whole_entry?;
-      let image = live.whole.as_ref().map(|(_, payload)| payload.len())?;
+      let image = whole_payload(live).map(|(_, payload)| payload.len())?;
       let _ = live.shipper.on_reply(holders[0], Ok(Some(head)));
       resolve(state, clone.bytes);
       Some((
