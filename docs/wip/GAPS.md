@@ -220,6 +220,12 @@
 > answer is (`session::Producing`); its bytes are `render::revlogs`' byte for byte (test), a step's least room below the
 > whole answer's (test), and a stream clone of a file twice a request's room is answered through the daemon's edge
 > (test). Owed: `stream2` (bundle2's stream part) and stock `hg clone --stream` by use; w-interop's matrix rerun.
+> `stream2` as stock 7.2 writes it (read 2026-11-20 from Homebrew's 7.2, `hg bundle --type 'none-v2;stream=v2'` of two
+> public changesets): one mandatory part with `bytecount`, `filecount` and the quoted `requirements`; each entry its
+> vfs byte (`s` store, `c` cache), the name's and the data's lengths as uvarints, the name, the data; small revlogs
+> inline (`data/a.i` alone), the changelog's `.d` before its `.i`, cache files (`branch2-served`, `rbc-names-v2`,
+> `rbc-revs-v2`, `tags2`) after; an empty `phaseroots` left out. Open before it is served: which store files a draft
+> repository's stream carries (`phaseroots`, `obsstore`), and the requirements a server without zstd revlogs names.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
