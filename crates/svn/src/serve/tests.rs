@@ -24,7 +24,7 @@ use crate::report::drive::green::texts_by_md5;
 use crate::report::drive::green::{AUTHZ, Green, NOW, locks_of, normalize, repository};
 use crate::report::recorded::{
   ROOT_URL, Recorded, SESSIONS, UUID, command, drive_items, finished_report, items, read_drive,
-  value_of,
+  value_of, whole_items,
 };
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -161,7 +161,7 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
   let mut challenges = 0;
   loop {
     let given = established.then_some(&sources);
-    let before = items(&out).len();
+    let before = whole_items(&out);
     match connection.receive(given, &held, &mut out, budget) {
       Ok(Turn::NeedMore { .. }) => match next.next() {
         Some(item) => deliver(recorded, item, &mut next, &mut held),

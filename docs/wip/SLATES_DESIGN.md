@@ -12351,9 +12351,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > it in turns, the pack source's `turn` the shard's step quantum on the shard's clock (`ShardPacks`); an SSH session
 > dies as git's does on a refusal the answer gives as it is written. By use: the 3,000-commit clone over the daemon's
 > HTTP edge, each request one ring region, and the same history pushed and cloned over the SSH edge, each request 64
-> KiB, its pack far larger, each answered whole. Owed for git: protocol v0's fetch in turns, `begin`'s `ready` and cut
-> and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a run), and a fetch held to the index
-> generation it began on (rule 4); the live `git clone` rows of the matrix (main's).
+> KiB, its pack far larger, each answered whole. **Rule 4 BUILT (same day):** a fetch's request takes a hold on its
+> repository's generation (`StoreLender::hold`, `vcs_store::upload::GitGeneration`): a fork of the store's repository at
+> its stamp (`Repository::fork`, `Repository::stamp`: the positions given and the versions its greens have, both only
+> growing), shared by every fetch that begins at that stamp, with the refs and `HEAD` as they stood; every later step of
+> the answer is lent from it (`lend_held`), and the last hold's release gives the fork back. By use, a push and a new tag
+> landing after a fetch's first step: the held answer's pack is the start generation's objects in its order (each by
+> id, so byte for byte; the zlib level each is deflated at is the stream's own timed choice, §4.11). Before it, the
+> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. Owed for git: protocol v0's fetch
+> in turns, `begin`'s `ready` and cut and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a
+> run); the live `git clone` rows of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
@@ -12370,6 +12377,26 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > working copies match svnadmin's over both edges after a checkout, an update back 500 revisions and the update forward.
 > The largest slice is 99,424 B on svn:// and 136,865 B on DAV. Rule 3 is still owed: one drive step, a text window's
 > delta, takes up to 4.7 ms on svn:// and 6.5 ms on DAV, so a window must be made in pieces (`report::drive`).
+> **The window encoder BUILT (2026-11-20, A-751, w-bugs; Ada's rule: performance gaps are addressed upfront).** One
+> shared encoder makes a window in units: `svndiff::WindowMaking`, which takes a unit a target position walked, a byte
+> compared or copied, a source block indexed, or an instruction encoded, at least one a step. It keeps its place between
+> steps and never borrows the texts. Each phase is `compute_delta`'s, cut at its loops, and the sections are the
+> encoder's. Version 2's LZ4 block is made in parts by `svndiff::lz4`, a port of `lz4_flex` 0.11.6's block compressor
+> that makes its bytes. The oracle is the whole window, which `deltas` makes and `Encoder::window` encodes: every
+> window, made under every unit size in versions 0 and 2, stored and LZ4, is the same bytes. Red, by main's test: a
+> 102,400-byte window made whole took 6.0 to 7.7 ms in one step (debug, M-series Mac). At 256 units a step, no step
+> passes 500 us. **The update report's drive BUILT (same day, A-751 part 2).** The drive makes each window a step at a
+> time (`report::drive`'s `WindowWork`): its target and source pieces are read 1,024 bytes a step, the window is made
+> 1,024 units a step, and its writes, as `svndiff.c` makes them, are sent 1,024 bytes a piece (`Call::DeltaPiece`).
+> 1,024 units are about 1.5 us of an M-series Mac's release build, under half the ~3.7 us quantum. Each consumer frames
+> the pieces as before: svn:// sends a write's pieces as its one `textdelta-chunk` string, the head of which carries
+> the write's whole length (`ra_svn::write_string_head`); DAV base64s them. The drive encodes in its consumer's
+> version (`Drive::with_encoding`, svn://'s `editor::encoding_of`). By test: `/trunk/big.txt` (6,000 lines) driven a
+> step a call, edited and added, in version 0 and version 2 with LZ4: before, 4 steps of 2.8-3.0 ms each run (debug);
+> now none past 500 us, and its stream is the whole-window path's byte for byte. The recorded svnserve sessions are
+> unchanged. Owed: the replay drive (`report::drive::replay`, svn://'s `replay`/`replay-range` and the dump exporter's
+> source) and `get-file-revs` (`reads::file_revs`) still make a window whole; the dump exporter's format 3 adopts the
+> maker (w-svn).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
