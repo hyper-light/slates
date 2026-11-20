@@ -8,14 +8,17 @@
 //! again by a recovery holds none (the table is not in its checkpoint, A-716 slice 1c), so the recovery holds every
 //! file of the head, in byte order, once the records are replayed ([`rehold_head`]): the same table every time.
 //!
-//! **Reading.** [`HeadTexts`] is the Subversion sources' text source (`slates_svn::migration::TextSource`): a text the
-//! green holds is read from it, borrowed; any other from the records. The records still hold every text's bytes until
-//! step c3; the read through the records goes with them, in the same series (main's condition), and until then it is
-//! named in GAPS.
+//! **Reading** (c3). [`HeadTexts`] is the Subversion sources' text source (`slates_svn::migration::TextSource`). A text
+//! of the head is read from the green, which holds it (borrowed, no copy-out). Any other text is read from the one place
+//! the records say it is kept, never tried in turn: a text a commit stored (main's ruling (B)) from the content store by
+//! its identity, its length the records'; a text the records keep themselves (an import's or a made revision's, as a
+//! skip-delta svndiff, c2) from the records. A text kept in neither is no text. A read takes a piece at a time
+//! (`text_at`): the green's bytes from the offset, the store's window holding it, or the records' delta window holding
+//! it, its source view made window by window down the chain; nothing is made whole.
 //!
 //! **Room.** The table's entries are bounded by what the shard could admit, an entry its identity, its block and its
-//! count: [`set_room`] derives it before each hold, so a hold past it is refused typed, counted, and the text read from
-//! the records.
+//! count: [`set_room`] derives it before each hold, so a hold past it is refused typed and counted, and the text read
+//! from where the records keep it.
 
 use std::borrow::Cow;
 
@@ -49,19 +52,47 @@ pub(crate) struct HeadTexts<'a> {
 }
 
 impl TextSource for HeadTexts<'_> {
-  /// The green's held text, then the content store's (a text a commit stored, read whole through its root), then the
-  /// records' (until c3 removes that arm).
+  /// The head's text from the green; any other from where the records keep it (module docs, "Reading").
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
       return Some(Cow::Borrowed(bytes));
     }
-    if let (Some(store), Some(len)) = (self.store, self.records.stored_len(identity)) {
-      let id = slates_vcs::ContentId(*identity);
-      if let Some(bytes) = store.object_bytes(&store.root_of(&id), len) {
-        return Some(Cow::Owned(bytes));
+    match self.records.stored_len(identity) {
+      Some(len) => {
+        let store = self.store?;
+        let id = slates_vcs::ContentId(*identity);
+        store.object_bytes(&store.root_of(&id), len).map(Cow::Owned)
       }
+      None => self.records.text(identity),
     }
-    TextSource::text(self.records, identity)
+  }
+
+  /// The text from `offset`, a piece at a time (a fetch's read, main's order after w-bugs' runs 10/11): from the green,
+  /// borrowed to the text's end; else the content store's window holding `offset`; else the records' delta window
+  /// holding it. Nothing is made whole.
+  fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
+    if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
+      return bytes
+        .get(usize::try_from(offset).ok()?..)
+        .map(Cow::Borrowed);
+    }
+    match self.records.stored_len(identity) {
+      Some(len) => {
+        if offset >= len {
+          return (offset == len).then_some(Cow::Borrowed(&[]));
+        }
+        let store = self.store?;
+        let root = store.root_of(&slates_vcs::ContentId(*identity));
+        let window = u64::try_from(store.window()).ok()?;
+        let piece = store.window_at(&root, len, offset.checked_div(window)?)?;
+        let from = usize::try_from(offset.checked_rem(window)?).ok()?;
+        match piece {
+          Cow::Borrowed(bytes) => bytes.get(from..).map(Cow::Borrowed),
+          Cow::Owned(bytes) => bytes.get(from..).map(|rest| Cow::Owned(rest.to_vec())),
+        }
+      }
+      None => self.records.text_at(identity, offset).map(Cow::Owned),
+    }
   }
 
   /// A step of the same order: the green's held text a window's room copied, the content store's a window of the
@@ -71,21 +102,22 @@ impl TextSource for HeadTexts<'_> {
     if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
       return Some(reading.copy_step(bytes));
     }
-    if let (Some(store), Some(len)) = (self.store, self.records.stored_len(identity)) {
-      let root = store.root_of(&slates_vcs::ContentId(*identity));
-      let window = u64::try_from(store.window()).ok()?;
-      let read = reading.read();
-      if read >= len {
-        return Some(true);
-      }
-      if let Some(piece) = store.window_at(&root, len, read.checked_div(window)?) {
-        let skip = usize::try_from(read.checked_rem(window)?).ok()?;
-        let wanted = usize::try_from(len.saturating_sub(read)).ok()?;
-        let rest = piece.get(skip..)?;
-        return Some(reading.append(rest.get(..wanted).unwrap_or(rest), len));
-      }
+    let Some(len) = self.records.stored_len(identity) else {
+      return TextSource::read_step(self.records, identity, reading);
+    };
+    // A stored text is read from the content store alone (c3: one place a text, no arm after another).
+    let store = self.store?;
+    let root = store.root_of(&slates_vcs::ContentId(*identity));
+    let window = u64::try_from(store.window()).ok()?;
+    let read = reading.read();
+    if read >= len {
+      return Some(true);
     }
-    TextSource::read_step(self.records, identity, reading)
+    let piece = store.window_at(&root, len, read.checked_div(window)?)?;
+    let skip = usize::try_from(read.checked_rem(window)?).ok()?;
+    let wanted = usize::try_from(len.saturating_sub(read)).ok()?;
+    let rest = piece.get(skip..)?;
+    Some(reading.append(rest.get(..wanted).unwrap_or(rest), len))
   }
 }
 
