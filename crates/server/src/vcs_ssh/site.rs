@@ -35,12 +35,14 @@
 //!    hands this site both lenders once it starts the SSH edge (A-684). git's receive-pack runs A-654 part 2's driver
 //!    over the repository's store on its owner shard, the shard's own (A-662), so it needs no store lender: each of its
 //!    steps is lent the shard's state, as the HTTP site's are (A-654 part 3's [`ShardLender`]; `super::receive`,
-//!    A-683). Subversion's tunnel (A-656) waits for its entry point. Each becomes a [`Command`] behind [`Services`] as
-//!    it can run, and the not-served answer goes with the last of them.
+//!    A-683). Each becomes a [`Command`] behind [`Services`] as it can run, and the not-served answer goes with the last
+//!    of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
-//! begin `svnserve: ` and exit `EXIT_FAILURE` [C: `svnserve.c` at `d434dc14`]).
+//! begin `svnserve: ` and exit `EXIT_FAILURE` [C: `svnserve.c` at `d434dc14`]). The tunnel runs as a service of its own
+//! beside the others (`super::svn`'s `SvnServices`, A-688): A-656's connection over the channel, the repository found
+//! and judged when its URL comes, its store lent as git's is, and refused as not served where it is not held here.
 
 use slates_db::catalog::{CredentialKind, CredentialRecord, Principal, RepositoryRecord, VcsTool};
 use slates_ssh::command::Command as Asked;
@@ -305,9 +307,9 @@ pub(crate) struct NotYet;
 /// The services the server runs today: git's upload-pack from the stores `lender` lends (`super::git`, A-651 part 2),
 /// Mercurial's `serve --stdio` from the stores `hg` lends (`super::hg`, A-679), and git's receive-pack through A-654
 /// part 2's driver on the repository's owner shard, whose state `shard` lends a step at a time as it lends the HTTP
-/// site's (`super::receive`, A-683), each request and each push admitted `room` bytes; Subversion's tunnel not yet, as
-/// its entry point (A-656) has not landed. A repository whose store its tool's lender does not hold is not served
-/// upload-pack or `serve --stdio`.
+/// site's (`super::receive`, A-683), each request and each push admitted `room` bytes; Subversion's tunnel is served
+/// beside these by `super::svn`'s `SvnServices` (A-688). A repository whose store its tool's lender does not hold is not
+/// served upload-pack or `serve --stdio`.
 #[derive(Clone, Debug)]
 pub(crate) struct ToolServices<L, H, S> {
   /// Where git's stores are lent.
@@ -543,7 +545,8 @@ fn repository_name(path: &[u8]) -> Option<&str> {
 }
 
 /// The words a service the server cannot start ends with, in its tool's words (the module doc, step 3); a session whose
-/// store goes away mid-way ends in them too.
+/// store goes away mid-way ends in them too, and so does a Subversion tunnel whose client names a repository not served
+/// here (`super::svn`).
 pub(crate) fn not_served(service: Service) -> Refused {
   Tool::of(service).refused(&format!("{} is not served yet", service.name()))
 }

@@ -60,16 +60,17 @@
 //! (`slates_ssh::keylife::key_time_limit_ns`). Only a connection that ended as its client ended it is a sample.
 //!
 //! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the host key's keeping, an edge state
-//! kept on every shard); the stores' lenders over A-662's map, which git's upload-pack (A-651 part 2) and Mercurial's
-//! `serve --stdio` (A-679) are served from and without which each is refused as not served, and the shard's state lent
-//! to git's receive-pack (A-683, A-654 part 2's driver, already served wherever the site finds the repository);
-//! Subversion's tunnel, refused so until its server half lands (§4.17.4 piece 12), and moved to the shard of the
-//! repository its greeting names; the live `git clone`, `git push` and `hg clone` over SSH (main's runs).
+//! kept on every shard); the stores' lenders over A-662's map, which git's upload-pack (A-651 part 2), Mercurial's
+//! `serve --stdio` (A-679) and Subversion's tunnel (`svn`, A-688) are served from and without which each is refused as
+//! not served, and the shard's state lent to git's receive-pack (A-683, A-654 part 2's driver, already served wherever
+//! the site finds the repository); Subversion's tunnel moved to the shard of the repository its greeting names; the
+//! live `git clone`, `git push`, `hg clone` and `svn checkout svn+ssh://` over SSH (main's runs).
 
 mod git;
 mod hg;
 mod receive;
 pub(crate) mod site;
+mod svn;
 mod waits;
 
 use std::cell::{Cell, RefCell};

@@ -17,7 +17,10 @@
 //! (a copy from the revision the dump names, a replacement a deletion and an addition), the properties set whole or
 //! changed, the text set whole or a delta applied to its base, every checksum the stream carries checked (the text's,
 //! a delta's base's, a copy source's), then the transaction's changed paths committed as one revision with the
-//! stream's revision properties, through the commit step a client's commit takes ([`Repository::commit`], A-655). The
+//! stream's revision properties, through the commit step a client's commit takes (A-655). The import hands each record
+//! it makes to its caller's step and reads on once it is committed (A-652 part 3): a revision, the UUID, revision 0's
+//! properties, each a record of `crate::commit::record` that a caller holding the records alone commits through
+//! [`Repository::commit_record`] and the server's owner logs before it applies it. The
 //! history keeps its revision numbers: a stream continues the repository's
 //! history (revision 0 into an empty repository, else the revision after the youngest), so a dump made in parts loads
 //! part after part; the UUID record names the repository, set into one that holds no revision and refused when it

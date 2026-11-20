@@ -20,6 +20,13 @@
 //! as git's is. The client's end of input checks a push whose pack was cut short, which the report answers with git's
 //! `unpack` words; the end of a request cut short is refused, as git's reader refuses it.
 //!
+//! **The answer, a step at a time** (A-665 part 3), as the HTTP site answers it: each of the command's steps is one of
+//! the driver's answer steps, so a turn of a hook's view sealed is a step and the edge yields the shard between steps,
+//! and a hook runs off the shard's step, what it answered handed back in a lend of its own. The daemon's presenter shows
+//! no hook's view yet (`crate::git_push::Unpresented`), so a push whose repository configures a git hook is refused
+//! `hook not run`; owed with the presenter that shows one: this edge's signal of its client gone, which ends a hook's
+//! run.
+//!
 //! **Refusals**, each on standard error with git's `die` status, as git's receive-pack dies: a repository gone since
 //! the site found it, in the site's words for a missing one (git's own after `enter_repo`, line 2547); a store not
 //! held here, or a shard whose state is not lent (no state on this thread, the shard fenced, or its state lent
@@ -47,7 +54,7 @@ use slates_git::pktline::{self, HEADER_LEN, Packet};
 use slates_git::receive::Refusal;
 
 use super::site::{Command, GIT_DIE_STATUS, Next, Refused, Stepped};
-use crate::git_push::{PushFailed, ReceivePack};
+use crate::git_push::{Answering, PushFailed, ReceivePack, Unpresented};
 use crate::state::ShardState;
 use crate::vcs_http::git::ShardLender;
 
@@ -128,7 +135,13 @@ impl<S: ShardLender> ReceiveCommand<S> {
       ..
     } = self;
     let started = lent(lender, |state| {
-      ReceivePack::start(state, (&*principal, *repository), (*room, true), out)
+      ReceivePack::start(
+        state,
+        (&*principal, *repository),
+        (*room, true),
+        out,
+        Unpresented,
+      )
     })?;
     self.push = Some(started.map_err(|failed| refused(failed, &self.name))?);
     Ok(Stepped {
@@ -168,12 +181,8 @@ impl<S: ShardLender> Command for ReceiveCommand<S> {
       return self.start();
     };
     if self.checked {
-      lent(&mut self.lender, |state| push.answer(state, &mut self.out))?
-        .map_err(|failed| refused(failed, &self.name))?;
-      return Ok(Stepped {
-        consumed: 0,
-        next: Next::Exited(0),
-      });
+      let next = answer_step(&mut self.lender, push, &mut self.out, &self.name).await?;
+      return Ok(Stepped { consumed: 0, next });
     }
     if !self.input.is_empty() {
       let consumed = self.input.len();
@@ -214,6 +223,29 @@ fn lent<S: ShardLender, R>(
   step: impl FnOnce(&mut ShardState) -> R,
 ) -> Result<R, Refused> {
   lender.lend(step).ok_or_else(|| died(NOT_SERVED))
+}
+
+/// One step of the checked push's answer (the module doc's answer): exited 0 once it is answered whole; another step
+/// after a turn of a hook's view sealed, the edge yielding the shard between its steps; another step after a hook run off
+/// the shard's step, with no signal of the client gone (owed, as on the HTTP site), and what it answered handed back.
+async fn answer_step<S: ShardLender>(
+  lender: &mut S,
+  push: &mut ReceivePack,
+  out: &mut Vec<u8>,
+  name: &str,
+) -> Result<Next, Refused> {
+  let answering = lent(lender, |state| push.answer_step(state, &mut *out))?
+    .map_err(|failed| refused(failed, name))?;
+  match answering {
+    Answering::Answered(_) => Ok(Next::Exited(0)),
+    Answering::Sealing => Ok(Next::More),
+    Answering::Hook(call) => {
+      let answer = call.run(core::future::pending()).await;
+      lent(lender, |state| push.hook_ran(state, answer, &mut *out))?
+        .map_err(|failed| refused(failed, name))?;
+      Ok(Next::More)
+    }
+  }
 }
 
 /// The client's input ended before the push was checked: checked now (a pack cut short, which the report answers), or

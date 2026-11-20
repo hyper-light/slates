@@ -42,6 +42,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::iter::Peekable;
 use std::mem::{size_of, take};
+use std::ops::Bound;
 
 use crate::content::{ContentId, ContentRefused, ContentStore, Stored};
 use crate::rule::Compaction;
@@ -169,6 +170,34 @@ impl Run {
       .iter()
       .filter_map(move |fence| view(store, &fence.table))
       .flat_map(|table| table.iter())
+  }
+
+  /// Every row whose key is not before `start`, in key order: the table that may hold `start` read from `start` on,
+  /// then each table after it whole, since a run's tables do not meet.
+  fn rows_from<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    start: &[u8],
+  ) -> impl Iterator<Item = RowRef<'s>> + use<'s> {
+    let first = self
+      .fences
+      .partition_point(|fence| fence.first.as_ref() <= start)
+      .saturating_sub(1);
+    let first_rows = self
+      .fences
+      .get(first)
+      .and_then(|fence| view(store, &fence.table))
+      .map(|table| table.iter_from(start))
+      .into_iter()
+      .flatten();
+    let later = self
+      .fences
+      .get(first.saturating_add(1)..)
+      .unwrap_or_default()
+      .iter()
+      .filter_map(move |fence| view(store, &fence.table))
+      .flat_map(|table| table.iter());
+    first_rows.chain(later)
   }
 }
 
@@ -836,6 +865,29 @@ impl Index {
     let mut sources: Vec<Source<'s>> = vec![tail.peekable()];
     for run in &self.runs {
       let rows: Box<dyn Iterator<Item = RowRef<'s>> + 's> = Box::new(run.rows(store));
+      sources.push(rows.peekable());
+    }
+    Merged { sources }
+  }
+
+  /// Every row whose key is not before `start`, in key order, so the rows whose keys begin with a prefix are the run
+  /// from it (A-640 part 4: an abbreviated object name's objects): the tail's from `start` on and each run's from the
+  /// table that may hold `start`, merged as [`Index::iter`] merges them. Reading a run costs one search of its fences
+  /// and one of its first table's rows, then a row a step.
+  pub fn iter_from<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    start: &[u8],
+  ) -> impl Iterator<Item = RowRef<'s>> + use<'s> {
+    let tail: Box<dyn Iterator<Item = RowRef<'s>> + 's> = Box::new(
+      self
+        .tail
+        .range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
+        .filter_map(|(key, body)| RowRef::new(key, body)),
+    );
+    let mut sources: Vec<Source<'s>> = vec![tail.peekable()];
+    for run in &self.runs {
+      let rows: Box<dyn Iterator<Item = RowRef<'s>> + 's> = Box::new(run.rows_from(store, start));
       sources.push(rows.peekable());
     }
     Merged { sources }

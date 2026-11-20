@@ -21,6 +21,10 @@ use super::push::Push;
 use super::rows::{self, CommitRow, ObjectRow};
 use reach::Sets;
 
+/// Objects by an abbreviated name (A-640 part 4), a child of this module so it reads the index kept here.
+#[path = "abbrev.rs"]
+pub(super) mod abbrev;
+
 /// The store read as upload-pack's commit graph (A-640), a child of this module so it reads the rows and chains kept
 /// here.
 #[path = "graph.rs"]

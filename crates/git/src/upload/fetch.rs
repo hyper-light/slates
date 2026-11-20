@@ -20,7 +20,7 @@
 //! refs were wanted by name, then the packfile section's header; the pack follows as the answer is stepped, or, when
 //! the request's `sparse:oid` filter's blob was not resolved or read, git's words for it (the `answer` module).
 
-use super::answer::{Answer, Framing};
+use super::answer::{Answer, Framing, Said};
 use super::sparse;
 use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
 use crate::Admission;
@@ -156,7 +156,7 @@ pub(super) fn answer<P: PackSource>(
   };
   let outcome = negotiation::negotiate(graph, &request, admission)
     .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?;
-  let answer = written(served, &asked, outcome, packs, sparse.dies, admission).map_err(refused)?;
+  let answer = written(served, &asked, outcome, packs, sparse, admission).map_err(refused)?;
   match graph.fault() {
     Some(fault) => Err(refused(Refusal::Store(fault))),
     None => Ok(answer),
@@ -253,15 +253,28 @@ fn once_each(wanted: &[WantedRef<'_>], admission: &mut Admission) -> Result<(), 
   }
 }
 
-/// The answer to `outcome`: its sections encoded, and its pack begun from `packs`; or, when its `sparse:oid` filter's
-/// blob `dies` unread, the pack answered as git answers it (A-640 part 4), the packfile section's header left out where
-/// git leaves it to the pack's start, which never comes: under `sideband-all` with `packfile-uris` (`upload_pack_v2`).
+/// Where the packfile section's header goes (`upload_pack_v2`, `relay_pack_data`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Header {
+  /// Before `pack-objects` begins, so before what it writes to its error stream.
+  First,
+  /// Once the pack begins, after what `pack-objects` wrote before it: under `sideband-all` with `packfile-uris`.
+  AtThePack,
+  /// Never: under `sideband-all` with `packfile-uris`, a pack that never begins.
+  Never,
+}
+
+/// The answer to `outcome`: its sections encoded, what git's `pack-objects` wrote to its error stream as it read a
+/// `sparse:oid` filter's name relayed on band 2 (A-640 part 4), and its pack begun from `packs`; or, when the filter's
+/// blob dies unread, the pack answered as git answers it. git writes the packfile section's header before
+/// `pack-objects` begins, but under `sideband-all` with `packfile-uris` (`upload_pack_v2`) at the pack's start, after
+/// what `pack-objects` wrote before it, and never for a pack that never begins.
 fn written<P: PackSource>(
   served: &Served<'_>,
   asked: &Asked<'_>,
   outcome: Outcome<u64, u64>,
   packs: &mut P,
-  dies: Option<Refusal>,
+  sparse: sparse::Read,
   admission: &mut Admission,
 ) -> Result<Answer<P::Pack>, Refusal> {
   let format = served.repository.format();
@@ -278,12 +291,25 @@ fn written<P: PackSource>(
       Ok(Answer::whole(bytes).counted(outcome.counters))
     }
     negotiation::Answer::Pack(pack) => {
-      if let Some(refusal) = dies {
-        let header = !(multiplexed && asked.flags.uris);
+      let at_the_pack = multiplexed && asked.flags.uris;
+      if let Some(refusal) = sparse.dies {
+        let header = if at_the_pack {
+          Header::Never
+        } else {
+          Header::First
+        };
         let (bytes, _) = charged(admission, |out| {
-          before_pack(&pack, &asked.wanted, format, multiplexed, header, out)
+          before_pack(
+            &pack,
+            &asked.wanted,
+            format,
+            multiplexed,
+            header,
+            &Said::default(),
+            out,
+          )
         })?;
-        return Answer::died(bytes, refusal, true, admission)
+        return Answer::died(bytes, sparse.said, refusal, true, admission)
           .map(|answer| answer.counted(outcome.counters));
       }
       let plan = PackPlan {
@@ -296,8 +322,14 @@ fn written<P: PackSource>(
       let source = packs
         .begin(served, &plan, admission)
         .map_err(Refusal::Pack)?;
+      let header = if at_the_pack {
+        Header::AtThePack
+      } else {
+        Header::First
+      };
       let (bytes, (response, at)) = charged(admission, |out| {
-        before_pack(&pack, &asked.wanted, format, multiplexed, true, out)
+        let said = &sparse.said;
+        before_pack(&pack, &asked.wanted, format, multiplexed, header, said, out)
       })?;
       Answer::streaming(bytes, Framing::V2(response), at, source, admission)
         .map(|answer| answer.counted(outcome.counters))
@@ -305,14 +337,16 @@ fn written<P: PackSource>(
   }
 }
 
-/// Writes the sections before a pack, and the packfile section's header where `header` asks for it: the response's
+/// Writes the sections before a pack, then the packfile section's header and what `pack-objects` wrote to its error
+/// stream before its pack (`said`, relayed on band 2 a read a packet), in the order `header` says: the response's
 /// grammar after them, and how many bytes they took.
 fn before_pack(
   pack: &Pack<u64, u64>,
   wanted: &[WantedRef<'_>],
   format: ObjectFormat,
   multiplexed: bool,
-  header: bool,
+  header: Header,
+  said: &Said,
   out: &mut Sink<'_>,
 ) -> Result<(Response, u64), Refusal> {
   let mut writer = Writer::new(format, multiplexed, out);
@@ -326,7 +360,13 @@ fn before_pack(
   if !wanted.is_empty() {
     writer.wanted_refs(wanted)?;
   }
-  if header {
+  if header == Header::First {
+    writer.event(&Event::Header(Line::lf(Section::Packfile)))?;
+  }
+  for read in said.reads() {
+    writer.event(&Event::Progress(read))?;
+  }
+  if header == Header::AtThePack {
     writer.event(&Event::Header(Line::lf(Section::Packfile)))?;
   }
   Ok(writer.finish())
