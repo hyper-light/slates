@@ -136,6 +136,9 @@ enum Ending {
 /// Replays a recorded session's client bytes through a connection, an item at a time, each handed
 /// over when the connection asks for more (with the item that answered a drive early when the
 /// session's client sent it so).
+/// Shape: the locks a replayed session's table may hold: past anything a recording holds.
+const LOCK_ROOM: usize = 1 << 10;
+
 fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, Ending) {
   let locks = session_locks(recorded);
   let sources = fixture.sources_with(&locks);
@@ -181,6 +184,19 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
         let key = CramKey::from_secret(recorded_secret(user));
         held.drain(..consumed);
         connection.key(Some(&key), &mut out).unwrap();
+      }
+      Ok(Turn::LockAsked { consumed }) => {
+        held.drain(..consumed);
+        let (drawn, date) = commit::recorded_lock(recorded.server);
+        let given = Sources {
+          now: crate::dav::request::svn_time(&date).unwrap(),
+          ..fixture.sources_with(&locks)
+        };
+        let mut draw = || drawn;
+        let judged = connection.lock_verb(&given, &mut draw, LOCK_ROOM, &mut out);
+        if judged.unwrap().is_some() {
+          connection.locks_landed(Ok(()), &mut out).unwrap();
+        }
       }
       Ok(Turn::Unserved { .. }) => return (out, Ending::Unserved(before)),
       Ok(other) => panic!("{}: {other:?}", recorded.name),

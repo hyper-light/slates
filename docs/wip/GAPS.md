@@ -1896,7 +1896,12 @@
 > (A-688 looks on its own shard alone) and its test over the SSH site; `svn_uri_canonicalize`.
 > A-693 part 1, 2026-11-19 (w-svn): `get-lock` and `get-locks` answered from the lock table (stock `svnserve`'s
 > recorded `info`/`ls` sessions now replayed with them; a held, an expired and a hidden lock; the depth refusal).
-> Owed: the four lock-changing verbs through the owner's step (A-693 part 2).
+> Part 2, 2026-11-19 (w-svn): `lock`, `lock-many`, `unlock` and `unlock-many` served over `svn://` and `svn+ssh://`:
+> judged against the lock table by `serve::locks` (an anonymous session asked to authenticate for the command), their
+> entries landed through the owner's step as a `Record::Locks` (durable as a revision, replayed by a rebuild), then
+> answered as `svnserve` answers them: stock `svn`'s recorded `lock-bob` and `lock-a` sessions byte for byte. macOS
+> arm64, this Mac, local: slates-svn 239 of 239, server `vcs_svn::` `vcs_ssh::svn::` `repository::svn_commit::`.
+> Owed: the pre-lock and post-lock hooks; a lock's expiry set by a client (ra_svn names none).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:

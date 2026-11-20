@@ -456,3 +456,57 @@ fn a_stock_commit_over_svn_lands_through_the_owners_step() {
   assert!(committed.ends_with(" ) ( ) ) "), "{committed}");
   assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 1 ) ) ");
 }
+
+/// A-693 part 2 over the listener (`serve.c` `lock_many`). Do: on a daemon of two shards, sign in to a Subversion
+/// repository on the other shard's partition, commit stock `svn`'s recorded `mkdir` of `/trunk`, then ask `lock-many`
+/// for `trunk`, a directory, and `get-lock` of it. Expect: the verb answered as `svnserve` answers one path refused: the
+/// trivial authentication request, the path's failure in FSFS's words ("is not a file"), `done`, then success; and no
+/// lock held. Before A-693 part 2 the listener answered `lock-many` "Unknown editor command" (210001), which stock `svn
+/// lock` reports as E170003.
+#[test]
+fn a_lock_over_svn_is_judged_and_answered_as_svnserve_answers_it() {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  let root = format!("svn://127.0.0.1:{port}/{name}");
+  let mut signed = sign_in(port, &greeting, &root);
+  let commit_at = MKDIR_COMMIT
+    .windows(COMMIT_START.len())
+    .position(|window| window == COMMIT_START)
+    .expect("the recorded commit");
+  let committed = asked(&mut signed.stream, &MKDIR_COMMIT[commit_at..], 5);
+  assert!(committed.ends_with(" ) ( ) ) "), "{committed}");
+  let locked = asked(
+    &mut signed.stream,
+    b"( lock-many ( ( 4:held ) false ( ( 5:trunk ( ) ) ) ) ) ",
+    2,
+  );
+  let done = read_items_or_word(&mut signed.stream);
+  let held = asked(&mut signed.stream, b"( get-lock ( 5:trunk ) ) ", 2);
+  assert!(
+    locked.starts_with("( success ( ( ) 0: ) ) ( failure ( ( ") && locked.contains("is not a file"),
+    "{locked}"
+  );
+  assert_eq!(done, "done ( success ( ) ) ");
+  assert_eq!(held, "( success ( ( ) 0: ) ) ( success ( ( ) ) ) ");
+}
+
+/// What `stream` reads through `lock-many`'s end: the bare word `done`, then one item.
+fn read_items_or_word(stream: &mut ClientStream) -> String {
+  let mut word = Vec::new();
+  let mut byte = [0u8; 1];
+  while word.len() < "done ".len() {
+    match stream.read(&mut byte) {
+      Ok(1) => word.push(byte[0]),
+      _ => break,
+    }
+  }
+  format!("{}{}", text(&word), read_items(stream, 1))
+}

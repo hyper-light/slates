@@ -943,7 +943,7 @@ fn presented_locks(
 /// `lookup_access` for a write (`serve.c` 760-791): the session's level from `svnserve.conf`, then the rules, at
 /// `path` or, for none, anywhere in the repository (`svn_repos_authz_check_access` with no path), then a name when
 /// one is needed.
-fn may_write(session: &Session<'_>, path: Option<&str>, needs_username: bool) -> bool {
+pub(crate) fn may_write(session: &Session<'_>, path: Option<&str>, needs_username: bool) -> bool {
   let level = if session.user.is_some() {
     session.authenticated
   } else {
