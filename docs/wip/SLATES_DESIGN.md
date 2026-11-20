@@ -9692,8 +9692,10 @@ server, not inferred from command names.
 > acknowledged once `f + 1` members hold it, a revocation only once every member has let it go (a member that kept it
 > would go on proving a revoked credential); short of that each is refused `CredentialUnreplicated` and asked again
 > reaches the rest. At each configuration change every member offers what it holds, so one that joined holds what the
-> region holds. Owed: a member partitioned through a revocation and back with its state keeps the record until the
-> revocation is asked again; a revocation's tombstone would close it (GAPS).
+> region holds. A revocation leaves a tombstone on every member that applies it (`CredentialTombstoned`, appended), which
+> the healer offers too, so a revoked credential is never enrolled again: not by a member that missed its revocation
+> and rejoins with the record (it lets the record go), and not by that member's offer of it (refused where the
+> tombstone is). Tombstones are charged to the credentials' table byte budget and carried in the partition's snapshot.
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -11109,6 +11111,15 @@ Applying or replicating an increment cannot import a live endpoint from the work
 such kind with its number (A-294): the number is part of its canonical identity, so two works making one path with two
 numbers conflict, and the same node made twice converges.
 
+> **Status (2026-11-20, A-773: the session log).** `slates log [--json]` shows a supervisor what needs them and
+> nothing else, as Sapling's Smartlog does: each work's base, how far its green moved past it and how its last
+> submission ended (open, accepted as a version, or collided where), and the landings awaiting a grant (§4.15), the
+> collided works and those landings named first. A read (`RequestBody::SessionLog`), a scatter over the shards like
+> `grants`, each shard reading its works and its partition's waiting-landing index, never the landing history; it
+> shows a pending grant and never makes one (R10). Owed: an identical submission told from an accepted one (the engine
+> commits an identical increment as a version, so telling it apart needs the submit's reply to say so), the MCP tool
+> and the SDKs' read.
+
 > **Status (2026-09-20, A-26).** Origin format 2 captures IPC kind, owner, group and four
 > timestamps; modes remain independent. `Mknod` carries fixed canonical metadata in the
 > increment's post-state, with no content operations. The engine preserves it through identity,
@@ -11183,6 +11194,18 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > shuttle form: sixteen agents through one green's owner, 200 seeded schedules, the commit order
 > linearizable and the fast-path counter equal to the oracle's disjoint count
 > (`crates/merge/tests/shuttle_green.rs`).
+
+> **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
+> (`crates/server/src/mounted_work.rs`; GAP-A9-14): a work's first attach or mount makes a slot under its own id
+> holding its files over its base, served by every bridge, and snapshotted as the mount's base; a submit first
+> declares what the mount changed since that base (the deriver names the touched paths, each file declared as the one
+> splice between the work's bytes and the mount's, so an editor's temp-and-rename save is the span it changed), then
+> runs as any submit. `land` of a green lands its head through a store-backed view under the green's id, presented
+> and granted as any volume's landing (R10). By use (`crates/server/tests/mounted_work.rs`): ten editors on ten
+> mounted works over one green, saving by temp file and rename over the daemon's NFS, submit with no declaration:
+> accepted, identical and conflict as the edits call for; a grant lands the head, equal to the oracle. Owed: the
+> mount's seed copies the work's files (copy-on-write base, w-work-cow), the slot and unsubmitted mount writes do not
+> survive a restart, a mount is not refreshed when its work's base moves, several spans a file (D-O17, w-rewrite-ops).
 
 > **Status (2026-09-13).** The pure core is a green-volume *service* (`crates/server/src/merge_service.rs`;
 > GAP-A9-14): every verb enforces the catalog role — an edit, declaration, write attachment, snapshot or
@@ -11532,7 +11555,16 @@ splits; a truncate cancels operations beyond the new length; a rename maps the p
 operations; a create followed by an unlink cancels; a whole-file rewrite (truncate to zero and
 write, or write-and-rename) composes to one `Delete` of the base length and one `Insert` of the
 new bytes. Composition of declared operations is arithmetic on facts; comparing file states to
-reconstruct operations is inference and does not exist in slates. The same journal yields the
+reconstruct operations is inference and does not exist in slates. One step at the seal reads bytes, and it is not
+that inference (A-776, D-O17): a path whose composed ops are exactly a replacement of its whole base content (any route:
+truncate and write, a rewrite in place, write-and-rename, an SDK `edit` of the whole file) is recovered as the edit the
+writer made, the minimal token-grain ranges in which the file it wrote differs from the base it was given
+(`slates_merge::refine`: a trim of the common prefix and suffix, Myers' linear-space search over tokens, and, when Myers
+alone runs out of its budget, anchors on tokens unique to both files with Myers between them; the cost bounded linear
+in the file). It compares the writer's own two states, never a third: no other agent's bytes are read and nothing is
+merged, the ranges are judged by the same verdict, two edits to one token still conflict, and applying them to the
+base yields the writer's file byte for byte (the property test). A path with namespace ops, node-exclusive flags, or a
+base the sealing shard cannot read keeps its whole replacement. The same journal yields the
 same ops document on every platform (its identity is the test). Paths under the work volume's
 excluded subtrees are left out; the filter id is part of the increment identity. The composition
 needs every record since the base: when the journal's retention has dropped any of them, the
@@ -11747,6 +11779,13 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
 > by the owner's answer (`crates/server/src/work_home.rs`). Each work's base is held by a durable floor on the green's
 > partition. Across nodes (a work on the creating client's node) is not built.
+>
+> **Measured (2026-11-20, w-work-cow): a work costs its divergence, never its green.** A work starts as an empty delta
+> over its green's pinned base and copies a file only when it changes it (`crate::work_files`). 16 works over a 64 MiB
+> green (1,024 files of 64 KiB), each requested, reading one file and editing it, added 1.2 MB resident (74 KiB per
+> work: the 64 KiB file it changed plus about 10 KiB) in 0.58 ms mean per work. With a copy of the green per work put
+> back, the same run added 975 MB in 4.46 ms. Release, macOS arm64, Mac Studio. Held by
+> `crates/server/tests/work_cow.rs`: N x (64 KiB + file) + 8 MiB, below one copy of the green.
 
 > **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
 > recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
@@ -17345,7 +17384,8 @@ committed across hosts, holder recomputation on other nodes, submission across h
   increment has a new identity; conflicts leave the work volume unchanged (catches: rebase
   corruption).
 - AC-6.10 The deriver never diffs: an architecture test proves no code path compares file
-  states to produce operations; whole-file tool rewrites produce one delete plus one insert
+  states to produce operations; whole-file tool rewrites compose to one delete plus one insert, which the seal
+  recovers as the writer's own token-grain edit against its base (A-776; never a third state, never a merge)
   (catches: the banned inference returning).
 - AC-6.11 Merge-path latency: verdict p99 and seal-to-reply p99 on the reference laptop are
   recorded and ratcheted; the fast path stays within one ring round trip plus the seal
@@ -17390,7 +17430,9 @@ recorded; the merge oracle runs in CI with shrinking.
 
 **Risks and fallbacks.** Whole-file rewrites by tools inflate the conflict rate on shared files:
 measured by source, mitigated by `edit` in the skills and by streaming; a high measured rate
-reopens the ergonomics (D-O17). The size budget for increments is derived from measured cost;
+reopens the ergonomics (D-O17). Since A-776 (2026-11-20) the seal recovers a whole-file rewrite as the edit it was: on
+the A/B's corpus no pair of rewrites of different lines or tokens, or a formatter pass beside an edit, conflicts, and
+every pair editing one token still does. The size budget for increments is derived from measured cost;
 if real increments routinely exceed it, the SDK's per-path split is the fallback.
 
 **A-9 required acceptance and regression cases (open; 2026-09-05).**
@@ -21010,7 +21052,9 @@ Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
   back.
 - Amended by A-214 (2026-11-05): an idle shard keeps its last write burst's net growth of free pages pre-faulted, and
   the purge gives back every free block beyond it.
-- Amended by A-765 (2026-11-20, w-sizing): that reserve decays. It is the burst whole for one sweep interval after the
+- Amended by A-777 (2026-11-20, w-sizing): the reserve is removed; the purge gives every free block back and nothing is
+  kept pre-faulted (BENCHMARKS, "The idle prefault reserve against none").
+- Amended by A-765 (2026-11-20, w-sizing), superseded by A-777: that reserve decays. It is the burst whole for one sweep interval after the
   pass that closed it, then halved each interval (`daemon::decayed_reserve`), and the sweep stays armed while a
   reserve is held, so an idle shard gives a burst's pages back within log2(burst / discard size) intervals.
 - Owed:
@@ -23476,6 +23520,11 @@ Status: built 2026-11-06.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
+> **Status (2026-11-20): removed by A-777.** Measured against none on the big Studio, the reserve bought about 5% on
+> writes landing right after idle and nothing on the provisioning p99, for 512 MiB more peak RSS in the NFS bench; after
+> hg's history push it held the whole 4,931.4 MiB burst resident (w-hg). Ada's MEMORY SIZING rule: a burst leaves
+> nothing resident behind it.
+>
 > **Status (2026-11-05): reverted from main, then re-landed on `agents/nfs-write` with two fixes.** Main CI 42119714654
 > found its reserve keeping deleted files' pages resident, against A-205's give-back on both Windows lanes, and its
 > arena test failing under Miri.
@@ -55874,6 +55923,41 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's memory per push, B2's in-flight half — A push read where it lies in its pack while it is judged (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING, storage and changesets rulings)
+- **Why.** B1 measured a push of git/git's v1.5.0 (9.4 MiB pack, 34,296 objects) putting every object inflated in the
+  content store as it arrived (304.6 MiB). Ada's storage ruling keeps a change in RAM while it is in flight; her
+  changesets ruling makes what lands changesets, git's packs and objects derived. B2's in-flight half: the quarantine
+  holds the pack the client sent and where each object lies in it, never the objects inflated beside it.
+- **Change.** `slates_git::store::Push` keeps the client's pack (`extend_pack`: the server hands it each call's pack
+  bytes, which the receive session no longer copies; `Session::pack_len`) and each pack object's place, type, length
+  and content identity (`admit_placed`: named, checked and read as a commit from the reader's bytes, nothing put). An
+  object is read through the push (`Push::bytes`: `packed::read` over the push as a `PackSource`, a REF_DELTA's base an
+  entry of the pack, an object the push holds, or the repository's, `IndexBases`), so the pack's checks, the
+  connectivity walk, the verdicts' pushed-tree reads (`PushedObjects`) and a commit's tree and tag reads
+  (`Repository::bytes_of`) read it in place. A chain is resolved from the objects read lately
+  (`packed::Recent`, git's delta base cache): each object the reader resolves is kept there taken whole, each object a
+  read builds copied in, held to the pack's length, so a push's resident is at most twice its pack. Staging puts each
+  object new to the repository in the content store before its census, an object a unit, in the order the pack's reader
+  resolved them (`Push::placed_in_order`, `Step::Putting`), each read just after its base so the objects read lately
+  hold its chain (`Push::put_placed`; in its name's order each was its whole chain again, +45% CPU on v1.5.0),
+  and the hook view's pushed pack is made from those. The record writes the push's own pack (`RecordWriter::finish`'s
+  `pack`), as before byte for byte. Objects no pack brought (the server's own commits, a replay's) are held in the
+  content store as before.
+- **Measured** (adas-mac-studio.local-2, 2026-11-20). Before: a push held each object inflated in the content store as
+  it arrived (B1's run: git/git's v1.5.0, 9.4 MiB of pack, left 309 MiB). After: held in place, the store grows by
+  nothing until staging; the bound test's 64 objects of 64 KiB (4,194,304 bytes inflated, a 41,568-byte pack) hold
+  4,194,304 bytes in the store before and 41,568 bytes, the pack, after. The v1.5.0 rerun of B1's diagnostic is owed
+  in BENCHMARKS.md.
+- **Owed.** The landed half (w-store: the changesets a clone's pack is derived from; rows naming a pack place in place
+  of an inflated content); a replay reading its record's pack whole (`git_replay`'s `Unpacked`) and holding its objects
+  in the store, as the live push did before.
+- **Tests.** `slates-git` `store::tests::packed::b2_every_object_of_a_push_read_where_it_lies_in_its_pack_is_the_object_read_whole`
+  (six captured pushes, their packs handed seven bytes a call, thin bases among them; the store holds nothing more) and
+  `b2_an_in_flight_push_holds_its_pack_and_not_its_objects_inflated` (64 blobs of 64 KiB: held in the store 4,194,304
+  bytes, held in place 41,568, the pack; bound: twice the pack).; `slates-git --lib` 579
+  passed; `slates-server --lib -- git vcs_store vcs_http` 218 passed; check clean; clippy clean on the changed crates
+  (one finding on main outside them, `live_ship.rs`); fmt clean (kiln, adas-mac-studio.local-2).
+
 ### A-722's head at once — A git service's reply head is written before its body is read (2026-11-20, w-git for UI goal 93; main's ruling)
 - **Why.** The edge's engine wrote a reply's status and headers only once the service's reply began, after the whole
   request body was read. A long push's pack is decoded as its body is read, so after the client's last byte the
@@ -57186,10 +57270,19 @@ install, refresh and removals, `take_campaign_sessions`), `crates/server/src/for
   owner's token used throughout: before, both survivors answered 401; after, each survivor counts
   `credential.fleet.applied` and the successor authenticates the owner's token (`ls-remote` exit 0). The test's own
   verdict still fails on the refs a takeover loses, w-balance's half. macOS arm64, Mac Studio, local.
-- **Owed.** A member partitioned through a revocation that comes back with its state keeps the record until the
-  revocation is asked again: a revocation's tombstone, kept and offered as enrollments are, closes it. The healer
-  offers every credential at each configuration version, idempotent but repeated while a fleet forms (13 and 14 offers
-  in the test's run).
+- **Tombstones (the same day, w-fed-faults).** As first landed (51a061d), the healer would have brought a revoked
+  credential back: a member partitioned through a revocation rejoins holding the record and offers it, and every other
+  member, holding nothing under its id, enrolled it again. A revocation now leaves a tombstone (`Op::CredentialRevoked`
+  keeps the id; `Op::CredentialTombstoned`, appended, wire tag 103, keeps it for a revocation from elsewhere, held or
+  not); an enrollment of a tombstoned id is refused (`AlreadyExists` at the guard; answered not held to a member, counted
+  `credential.fleet.revoked_refused`), and the healer offers tombstones as revocations, so the rejoining member lets its
+  record go. A tombstone charges its id's 32 bytes to the table byte budget, so a revocation gives back a record's room
+  less that, and the snapshot carries them (`credential_tombstones`, appended). Red first:
+  `slates-db --lib a764_a_revoked_credential_is_never_enrolled_again` (a revoked id enrolled again); the model test
+  states the rule (`the_credentials_equal_the_rules_over_every_history`, a tombstone step drawn), and
+  `slates-server --lib a764_a_member_never_brings_back_a_credential_revoked_here`. The healer still offers every
+  credential and tombstone at each configuration version, idempotent but repeated while a fleet forms (13 and 14 offers
+  in the takeover test's run).
 
 
 ### A-767 — One unit, the changeset: changes in RAM, the repository's history an append-only changeset log on disk, everything else derived, metadata in Mantle's K/V engine (2026-11-20, w-store; Ada's storage ruling ~12:40 PST, her changeset ruling ~13:35 PST, her memory-sizing ruling ~12:15 PST; §4.17.1 "Objects", "Durability and residency"; R1, R10; CLAUDE.md §2 item 3; A-581, A-645, A-647, A-662, A-716, A-765)
@@ -57432,6 +57525,100 @@ Applied in the same change to: GAPS (the live owner's long-turn line), `crates/c
   same archive, every chunk verified against its identity; 27 and 64 steps, at least a page each. Red: one call a
   payload; with the payload stepped and the archive hashed whole, 6 steps for 16 pages). The server fleet tests'
   live takeovers and rebuilds (32 passed).
+
+### A-773 — The session log: what needs the human, named first, read from what it shows (2026-11-20, w-sessionlog; Ada's dispatch after the Slates-vs-Sapling comparison; §4.16, §4.15; R10)
+Ten agents over one green left their supervisor cross-referencing volume ids, `versions`, a conflict's JSON and the
+audit to find the one decision that was theirs. `slates log` is that view: a collided work and a landing awaiting its
+grant are named first; every work follows with its base, how far behind its green it is and its last submission's end.
+The daemon answers `SessionLog` a page at a time, each shard's part its works (`WorkState::accepted` is the version its
+last accepted submission made) merged in key order with its landings in `AwaitingGrant`, which the partition indexes
+(`Partition::awaiting_grant_from`, kept by `apply` and rebuilt at restore), so a page costs its lines. The client joins
+each named green's head once (`Client::session_log`, `SessionLog::needs_you`); the CLI prints it as text or one JSON
+object (`needs_you`, `greens`, `awaiting_grant`). The view never grants (R10).
+Applied in the same change to: §4.16 (a status line), GAPS (the owed items), `docs/cli.md`, `crates/ipc` (the verb,
+`LogLine`, `WorkMark`, `LogCursor`, published tags), `crates/db` (the index and its model check), `crates/server`
+(`session_log`, the scatter), `crates/client` (`session_log`), `crates/cli` (`log`, `log_view`).
+Evidence: `cargo test --locked -p slates-server --test session_log` 1 passed (two shards, ten works, one collision,
+one waiting landing: exactly two named; the landing gone once granted and run); `-p slates-db --test model
+every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
+`args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
+
+### A-777 — An idle shard keeps nothing pre-faulted; A-214's reserve removed (2026-11-20, w-sizing; MEMORY SIZING; amends A-105, removes A-214 and A-765)
+Applied in the same change to: `crates/server/src/daemon.rs` (the purge gives every free block back; the reserve, its
+refill and the burst measure gone), `state.rs`, `config.rs` (`prefault_slice_pages`, `page_fault_ns`),
+`content_ranges.rs` (the `arena.prefault_reserve` row), `crates/mem/src/arena.rs` (`prefault`, `upcoming`, `KeptRun`, the
+purge's keep set), `buddy.rs` (`upcoming`), the tests (`a_burst_leaves_nothing_resident_behind_it_but_its_data`; A-214's
+own removed), `crates/cli/examples/nfs_large_write.rs`, BENCHMARKS, GAPS.
+
+Status: built 2026-11-20.
+- Why: after a push of hg's history the reserve held the whole last burst, 4,931.4 MiB, and faulted 3.5 GB more in at
+  idle (w-hg, release 1d4909821). A-765's decay still held a burst whole for a sweep interval.
+- Measured (BENCHMARKS, "The idle prefault reserve against none"): the provisioning p99 is the same with and without it;
+  the NFS bench's peak RSS fell 1,137-1,139 to 625-627 MiB; writes landing right after idle ran about 5% slower.
+- The rule now: an idle shard gives every free block back (A-105); a burst after idle faults its own pages.
+
+### A-776 — A whole-file rewrite is judged as the edit it was (2026-11-20, w-rewrite-ops; main's brief on the Slates-vs-Sapling comparison, gap D-O17; §4.16 "Composition at seal", AC-6.10, D-27)
+
+- **The gap.** An editor saves by writing a temporary file and renaming it over the original; formatters and codemods
+  write the whole file. The deriver composes every route into one `Delete` of the base length and one `Insert`, so a
+  one-token change judged beside any concurrent edit of the file was an `Overlap` conflict over the whole file. Ordinary
+  tools could not merge as precisely as SDK `edit`s.
+- **The change.** At the seal (`compose_increment` in `crates/server/src/verbs.rs`, shared by submit and rebase), a path
+  whose ops are exactly a whole-base replacement is rewritten by `slates_merge::refine::refine_rewrites` into the
+  canonical ops of the ranges the writer changed, at token grain (runs of word bytes, runs of blanks, every other byte
+  alone), and the post-state is relaid compactly. The increment's identity covers the refined document.
+- **Why this is not the banned inference (D-27, CLAUDE.md §2 item 11).** It compares two states of one writer, the base
+  it was handed and the file it wrote; no third state is read and nothing is merged. The result is a set of declared
+  ranges the verdict judges unchanged, and its application to the base is the writer's file byte for byte.
+  AC-6.10's "one delete plus one insert" now describes the composition before the seal's recovery.
+- **The shape, settled by A/B** (`crates/merge/examples/rewrite_ab.rs`, BENCHMARKS "Whole-file rewrites recovered"):
+  1,920 rewrite pairs over the merge crate's own sources (462 KiB), four workloads, judged by the real green. Token grain
+  is the only arm with no false conflict on different lines, different tokens of one line, or a formatter pass beside
+  an edit, and no silent merge when both change one token. Byte grain accepted all 240 one-token clashes (a word neither
+  wrote). Line grain (and so patience and histogram, which anchor on lines) conflicted all 240 same-line pairs. Myers
+  alone kept 148 of 240 formatter passes whole at its budget, so the search anchors on unique tokens when Myers alone
+  runs out: 0 of 240.
+- **Bounds.** The trim allocates nothing. The units of the differing middle (4 bytes each) and, when anchoring, a
+  table of distinct units are scratch dropped with the submit: measured 2.6 bytes of scratch a file byte on the corpus,
+  5.3 at most in the tests. Search steps are charged against budgets linear in the middle's units; a gap past them is
+  kept as one range. Cost a save (M3 Ultra, release): median 0.48 µs/KiB, p99 51 µs/KiB (a formatter pass over a
+  275 KiB file). `git diff --no-index` of that same pass takes 10 to 40 ms a process at line grain.
+- **Applied in the same change to:** §4.16 "Composition at seal"; AC-6.10; Phase 6 "Risks and fallbacks"; GAPS D-O17;
+  BENCHMARKS; `crates/merge/src/refine.rs` (new), `crates/server/src/verbs.rs`, `crates/server/src/work_files.rs`.
+- **Tests.** Red first: `two_whole_file_rewrites_of_different_lines_merge_as_their_edits`
+  (`crates/server/tests/green_post_state.rs`) failed with the seal's recovery disabled. The editor's save was
+  `Conflict([MergeWindow { path: "f", at: 0, len: 7580, .. }])`. Green with it: `cargo test --locked -p slates-server
+  --test green_post_state` 6 passed; `cargo test --locked -p slates-merge --lib refine` 8 passed (the reproduction
+  property at three grains and anchored; one token; a re-indent anchored and only blanks with scratch bounded; the
+  budget's fallback counted; different lines, different tokens and a formatter beside an edit accepted through the real
+  green; one token clashing still a conflict; unknown bytes keep the replacement). macOS arm64, this Mac, local.
+- **Owed (main's, §8):** clippy over the new module; the Linux and Windows runs of the two filters above. A mounted Work
+  reaches the seal through w-work-mount's journal (A-774), which this serves unchanged.
+
+### A-775 — A taken-over volume given up while its cohorts' members were away is judged afresh once one is heard again (2026-11-20, w-forming; main's order, item (b): the takeover stall with no survivor serving; §4.8 "Promotion and takeover", §4.10; the 2026-11-18 bound, A-304's fresh judgement)
+Applied in the same change to: §4.8's promise-wait paragraph (by this entry: a given-up volume is also judged afresh
+when a cohort member is heard again), GAPS, `docs/bugs/2026-11-20-a-live-volume-given-up-while-its-holder-was-away-was-never-served.md`,
+`crates/server/src/fleet.rs` (`judge_given_up_afresh`, `VolumeWait::waits_on_members`, `give_up_taken_over` keeps the
+volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardState::given_up_volumes`,
+`injected_live_silence`), `crates/server/src/daemon.rs` (`Daemon::inject_live_silence`), `crates/server/src/live_ship.rs`
+(a silenced report or fetch, `fleet.live.silenced_by_fault`), `crates/server/tests/fleet.rs`.
+- **What was there.** Past the failover SLO's worth of attempts without progress a taken-over volume was given up,
+  recorded unrecovered and dropped with its adopted catalog register; only a new configuration judged it afresh. A
+  holder of its log paused about the failover SLO (`live_chaos`'s fresh-member flow stops it 3 s against a 30-period
+  bound) left the volume `NotRecovered` for good once the holder came back with every acknowledged write.
+- **The change.** A volume given up while it waited on its takeover cohorts' members (its live log's holders, its
+  catalog register's or that register's placement's, its content's) keeps its pending record, its adopted catalog
+  register and the incarnation each cohort member was heard at. A member heard alive at a later incarnation has it
+  judged afresh at the next period: its owner shard's `TakeoverIncomplete` record goes, so the verbs on it wait for its
+  materialization again (A-548), and it is pending again with its catalog and its attempts from zero, counted
+  `fleet.materialize.judged_afresh`. A record gone another way (the volume destroyed) or a volume adopted again by a new
+  configuration's round is not taken up. Bounded as the round's own fresh judgement is: once per member's later
+  incarnation, each with the failover SLO's worth of attempts. A green given up is unchanged (its siblings' note in the
+  bug record).
+- **Tests.** `fleet` `a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is_heard_again` (red on
+  main: given up after 23 attempts waiting on its live, unserved through the serve deadline; after: judged afresh once,
+  served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
+  fleet tests unchanged.
 
 ### §4.8 amended — A dispatch's stragglers are waited for by their own reports' wakes, never a tick or a poll interval at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family two of three)
 Applied in the same change to: §4.8 "Lookup" (a location round's stragglers), GAPS (the sweep's line),

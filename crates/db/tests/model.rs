@@ -1169,13 +1169,36 @@ fn every_recovery_equals_the_live_partition_under(
     }
   }
   let live = db.partition().to_snapshot(0);
+  awaiting_index_matches(db.partition())?;
   let seq = db.next_seq();
   drop(db);
   let (recovered, _) = recover(&mut seg, 0, caps(), now_ns).map_err(failed)?;
   prop_assert_eq!(recovered.partition().to_snapshot(0), live);
+  awaiting_index_matches(recovered.partition())?;
   prop_assert_eq!(recovered.next_seq(), seq);
   prop_assert!(usize::try_from(seq).map_err(failed)? >= applied);
   routes_match_their_records(&recovered)?;
+  Ok(())
+}
+
+/// A-773: the landings the session log reads as awaiting a grant (`Partition::awaiting_grant_from`) are exactly the
+/// landings whose state is `AwaitingGrant`, by volume then id, live and after a recovery.
+fn awaiting_index_matches(
+  partition: &slates_db::partition::Partition,
+) -> Result<(), TestCaseError> {
+  let mut expected: Vec<(VolumeId, u64)> = partition
+    .to_snapshot(0)
+    .landings
+    .iter()
+    .filter(|l| l.state == LandingState::AwaitingGrant)
+    .map(|l| (l.volume, l.id))
+    .collect();
+  expected.sort();
+  let indexed: Vec<(VolumeId, u64)> = partition
+    .awaiting_grant_from(std::ops::Bound::Unbounded)
+    .map(|l| (l.volume, l.id))
+    .collect();
+  prop_assert_eq!(indexed, expected);
   Ok(())
 }
 

@@ -2698,6 +2698,9 @@ pub(crate) fn route_gated(
   if let RequestBody::Grants { after } = body {
     return scatter_grants(state, client.index(), request, principal, after);
   }
+  if let RequestBody::SessionLog { after } = body {
+    return scatter_session_log(state, client.index(), request, principal, after);
+  }
   if matches!(
     &body,
     RequestBody::Bootstrap { .. } | RequestBody::RecoveryPlan { .. } | RequestBody::Recover { .. }
@@ -3814,6 +3817,78 @@ fn gather_grants(
   }
 }
 
+/// The session log (A-773) is a scatter-gather like the grants: each shard holds its works and the landings presented
+/// on it, so every shard reports its part and the origin folds them into one page ([`crate::session_log`]).
+fn scatter_session_log(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  principal: Principal,
+  after: Option<slates_ipc::protocol::LogCursor>,
+) -> Served {
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|s| *s != state.shard)
+    .collect();
+  let mine = crate::session_log::part(state, &principal, after);
+  if others.is_empty() {
+    return Served::Reply(crate::session_log::page(vec![mine]));
+  }
+  state
+    .log_scatters
+    .insert(request, (client_index, others.len(), vec![mine]));
+  let origin = state.shard;
+  for shard in others {
+    let principal = principal.clone();
+    let task = SpawnRequest::new(
+      Box::pin(async move {
+        let part = crate::state::with_state(|s| crate::session_log::part(s, &principal, after));
+        crate::xshard::send_reply_home(origin, move || {
+          gather_session_log(request, shard, part);
+        });
+      }),
+      None,
+    );
+    if let Some(reply) = send_part(state, shard, task, ScatterKind::SessionLog, request) {
+      return Served::Reply(reply);
+    }
+  }
+  Served::Forwarded
+}
+
+/// Folds one shard's part of a session log page into the scatter and, on the last part, delivers the merged page; a
+/// part `shard` did not serve is settled refused ([`settle_unserved`]).
+fn gather_session_log(
+  request: u64,
+  shard: u16,
+  part: Option<PagePart<slates_ipc::protocol::LogLine>>,
+) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::SessionLog, request, shard);
+    return;
+  };
+  let done = crate::state::with_state(|s| {
+    let entry = s.log_scatters.get_mut(&request)?;
+    entry.2.push(part);
+    entry.1 = entry.1.saturating_sub(1);
+    if entry.1 == 0 {
+      let refused_for = s.scatter_refusals.remove(&request);
+      s.log_scatters
+        .remove(&request)
+        .map(|entry| (entry, refused_for.map(|shard| part_unsent(s, shard))))
+    } else {
+      None
+    }
+  })
+  .flatten();
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| crate::session_log::page(parts));
+    crate::state::deliver(client_index, request, reply, false);
+  }
+}
+
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
 /// the origin assembles the daemon's view (§4.14 `slates.status`). An unserved report refuses the status, as a
 /// listing's part does.
@@ -3856,6 +3931,8 @@ enum ScatterKind {
   List,
   /// `scatter_grants`, in [`ShardState::grant_scatters`].
   Grants,
+  /// `scatter_session_log`, in [`ShardState::log_scatters`] (A-773).
+  SessionLog,
   /// `scatter_status`, in [`ShardState::status_scatters`].
   Status,
   /// `scatter_acknowledge`, in [`ShardState::ack_scatters`] (A-216).
@@ -3941,6 +4018,7 @@ fn settle_refused(
     }
     ScatterKind::List => (count_down(&mut state.scatters, request), false),
     ScatterKind::Grants => (count_down(&mut state.grant_scatters, request), false),
+    ScatterKind::SessionLog => (count_down(&mut state.log_scatters, request), false),
     ScatterKind::Status => (count_down(&mut state.status_scatters, request), true),
   };
   let first = *state.scatter_refusals.entry(request).or_insert(shard);
@@ -3987,6 +4065,9 @@ fn settle_gone(state: &mut ShardState, kind: ScatterKind, request: u64) {
     }
     ScatterKind::Grants => {
       state.grant_scatters.remove(&request);
+    }
+    ScatterKind::SessionLog => {
+      state.log_scatters.remove(&request);
     }
     ScatterKind::Status => {
       state.status_scatters.remove(&request);
@@ -5615,6 +5696,9 @@ fn dispatch_inner(
     ),
     RequestBody::Grants { after } => {
       crate::landing::grants_page(vec![crate::landing::grants_part(state, principal, after)])
+    }
+    RequestBody::SessionLog { after } => {
+      crate::session_log::page(vec![crate::session_log::part(state, principal, after)])
     }
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to, owed } => acknowledge(state, client_id, up_to, &owed),
@@ -8391,6 +8475,7 @@ fn create_work_here(
       charged,
       entries: std::collections::BTreeMap::new(),
       verdict: None,
+      accepted: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -8724,6 +8809,28 @@ fn edit(
   w.revision = w.revision.wrapping_add(1);
   crate::work_charge::shrink(state, work_id, removed);
   ReplyBody::Edited
+}
+
+/// [`edit`] for a mounted work's declaration (A-774, `crate::mounted_work`): the splice `(at, delete_len)` with `bytes`.
+pub(crate) fn edit_op(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  path: &str,
+  (at, delete_len): (u64, u64),
+  bytes: &[u8],
+) -> ReplyBody {
+  edit(state, principal, work, path, at, delete_len, bytes)
+}
+
+/// [`declare`] for a mounted work's declaration (A-774, `crate::mounted_work`).
+pub(crate) fn declare_op(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  op: WorkOp,
+) -> ReplyBody {
+  declare(state, principal, work, op)
 }
 
 /// Records a change to `work` in its log, in the verb's transaction (A-207; D-18: an acknowledged change survives a
@@ -9071,7 +9178,7 @@ pub(crate) fn compose_increment(
   journal: &[VolumeOp],
   evidence: Vec<[u8; 32]>,
 ) -> Result<slates_merge::engine::Increment, Refusal> {
-  let (doc, plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
+  let (mut doc, mut plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
     Ok(planned) => planned,
     Err(e) => {
       return Err(Refusal::BadRequest {
@@ -9079,6 +9186,21 @@ pub(crate) fn compose_increment(
       });
     }
   };
+  // A file the work replaced whole (an editor's write-and-rename, a formatter's or a codemod's rewrite) is judged as
+  // the edit it was, not a replacement of the file (D-O17, A-776; `slates_merge::refine`): the base bytes it was given
+  // and the bytes it wrote, both already held here, give the ranges it changed. A base this shard cannot read (a work
+  // off the green's shard whose base the owner did not send, A-247) keeps the replacement. The refiner's scratch is
+  // sized by the files it compares and dropped with this submit, so nothing stays resident between submits.
+  slates_merge::refine::refine_rewrites(
+    &mut doc,
+    &mut plan,
+    &mut slates_merge::refine::Refiner::new(),
+    &mut |path| {
+      let before = files_base.file(path).ok().flatten()?;
+      let after = files.get(files_base, path).ok().flatten()?;
+      Some((before, after))
+    },
+  );
   let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal);
   // The identity names the work and its base before the post-state and the document (§4.16 data model:
   // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
@@ -9661,6 +9783,10 @@ fn submit(
       Ok((record, green)) => (record.id, green),
       Err(refusal) => return refused(refusal),
     };
+  // A mounted work's journal is its changeset: what its mount changed is declared first (A-774).
+  if let Err(refusal) = crate::mounted_work::declare_mount(state, principal, work) {
+    return refused(refusal);
+  }
   let reply = match state.work_home.verdict.take() {
     Some(reply) => {
       // The owner's verdict on a submit the work recorded as pending (A-247): settled here, in this transaction.
@@ -9764,6 +9890,10 @@ fn settle_submit(
     return refused(refusal_of_db(&e));
   }
   reset_accepted_work(state, work_id, version);
+  // The session log's mark (A-773): the version the work's last submission made, which it now stands on.
+  if let Some(work) = state.works.get_mut(&work_id) {
+    work.accepted = Some(version);
+  }
   crate::work_home::tell_floor(state, green_id, work_id, Some(version));
   reply
 }
@@ -11701,6 +11831,14 @@ fn attach(
   }
   if matches!(record.policy.role, Role::Green { .. }) {
     return crate::merge_service::attach_green(state, client_id, principal, &record, intent, &form);
+  }
+  // A work mounts like any volume (A-774): its slot is made here, so every bridge (FUSE, NFS, WinFsp) serves it.
+  if matches!(record.policy.role, Role::Work { .. })
+    && !crate::mounted_work::ensure_slot(state, record.id)
+  {
+    return refused(Refusal::Unsupported {
+      feature: "a mount of a work whose green's base this shard cannot read".to_owned(),
+    });
   }
   let rights = rights_of(&record, principal);
   if !permits(rights, intent) {
@@ -13701,7 +13839,7 @@ fn record_unrecovered_destroy(
 /// teardown): its byte reservation, a bounded claim's inode allowance or a dynamic volume's version
 /// hold (so the version slab is never over-offered; A-342), its records' metadata reservation, and the
 /// growth a dynamic volume acquired from the shard budget as it wrote.
-fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
+pub(crate) fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
   // The volume's hold on its seal key goes with it (A-208); its sealed chunks hold the key while any of them lives.
   if !crate::content_cipher::release_seal_key(&mut state.store, slot.volume.seal_key()) {
     state.count(crate::content_cipher::KEY_RELEASE_REFUSED, 1);
@@ -18471,6 +18609,7 @@ fn install_rebuilt_work(
       charged,
       entries: std::collections::BTreeMap::new(),
       verdict: None,
+      accepted: None,
     },
   );
 }

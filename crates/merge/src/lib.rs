@@ -48,6 +48,7 @@ pub mod pace;
 pub mod ptrie;
 pub mod push;
 pub mod range;
+pub mod refine;
 pub mod review;
 pub mod splice;
 pub mod verdict;

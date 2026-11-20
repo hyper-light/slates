@@ -1449,7 +1449,7 @@ impl SealedPush {
       return self
         .objects
         .finish_named(
-          (content, store.repository.format()),
+          (content, store.repository.format(), self.push.pack()),
           lacks(content, store),
           (self.push.deepest(), &self.keyed),
           (identity, count),
@@ -1459,7 +1459,7 @@ impl SealedPush {
     record_of(
       content,
       store,
-      (&self.objects, self.push.deepest()),
+      (&self.objects, self.push.deepest(), self.push.pack()),
       &self.keyed,
     )
   }
@@ -1624,10 +1624,45 @@ impl GitPush {
     &self.push
   }
 
-  /// Keeps the push's pack as the client sent it (A-723), which the push's first record holds in place of its objects'
-  /// bytes.
-  pub(crate) fn keep_pack(&mut self, pack: Vec<u8>) {
-    self.record.keep_pack(pack);
+  /// Keeps the pack the client sent as far as `sent` bytes, the push's objects' one copy (`Push::extend_pack`): what it
+  /// lacks of it is the end of `input`, the bytes of the call that brought them. The push's first record holds it in
+  /// place of its objects' bytes (A-723).
+  pub(crate) fn keep_pack_to(&mut self, sent: u64, input: &[u8]) {
+    let kept = u64::try_from(self.push.pack().len()).unwrap_or(u64::MAX);
+    let owed = usize::try_from(sent.saturating_sub(kept)).unwrap_or(usize::MAX);
+    let from = input.len().saturating_sub(owed);
+    self.push.extend_pack(input.get(from..).unwrap_or_default());
+  }
+
+  /// Admits `objects`, a pack's as its reader resolved them, each held where its entry lies in the push's pack
+  /// ([`GitPush::keep_pack_to`]): its bytes named and checked, then kept only as read lately (`Push::keep_read`, taken
+  /// whole). Refused at the first object refused; the push keeps what it admitted before, for its caller to abandon.
+  pub(crate) fn admit_placed_all(
+    &mut self,
+    state: &mut ShardState,
+    objects: Vec<slates_git::unpack::Object>,
+  ) -> Result<(), GitRefused> {
+    within_budget(state, 0, |stores| {
+      let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
+      for object in objects {
+        let incoming = Incoming {
+          kind: object.kind,
+          claimed: Some(object.id),
+          content: &object.content,
+          depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
+        };
+        admit_object(
+          content,
+          store,
+          (&mut self.push, &mut self.record),
+          (incoming, Some(object.offset)),
+        )?;
+        self
+          .push
+          .keep_read(object.offset, object.kind, object.content);
+      }
+      Ok(())
+    })
   }
 
   /// Admits `objects`, in the order the push brought them, with the room their bytes take lent for the step. Refused at
@@ -1648,7 +1683,7 @@ impl GitPush {
           content,
           store,
           (&mut self.push, &mut self.record),
-          *incoming,
+          (*incoming, None),
         )?;
       }
       Ok(())
@@ -1815,7 +1850,7 @@ fn admit_object(
   content: &mut ContentStore,
   store: &GitStore,
   (push, record): (&mut Push, &mut RecordWriter),
-  incoming: Incoming<'_>,
+  (incoming, offset): (Incoming<'_>, Option<u64>),
 ) -> Result<(), GitRefused> {
   if let Some(claimed) = incoming.claimed
     && store.repository.object(content, &claimed).is_some()
@@ -1823,18 +1858,22 @@ fn admit_object(
     return Ok(());
   }
   let naming = store.repository.naming();
-  let (id, admitted) = push
-    .admit::<_, Infallible>(content, &naming, incoming)
-    .map_err(GitRefused::Object)?;
+  // An object of the push's own pack is held where it lies there (`slates_git::store::Push::admit_placed`); one no pack
+  // brought (the server's own commits, a replay's) in the content store.
+  let (id, admitted) = match offset {
+    Some(offset) => push.admit_placed::<_, Infallible>(content, &naming, (incoming, offset)),
+    None => push.admit::<_, Infallible>(content, &naming, incoming),
+  }
+  .map_err(GitRefused::Object)?;
   if admitted == Admitted::New {
-    let (_, identity, len) = push
+    let held = push
       .object(&id)
       .ok_or(GitRefused::Store(StoreRefused::Unreadable { id }))?;
     record.object(Noted {
       kind: incoming.kind,
       id,
-      identity,
-      len,
+      identity: held.identity,
+      len: held.len,
     });
   }
   Ok(())
@@ -1848,12 +1887,12 @@ fn admit_object(
 pub(crate) fn record_of(
   content: &ContentStore,
   store: &GitStore,
-  (writer, deepest): (&RecordWriter, u64),
+  (writer, deepest, pack): (&RecordWriter, u64, &[u8]),
   moves: &[RecordedMove],
 ) -> Result<Vec<u8>, GitRefused> {
   writer
     .finish(
-      (content, store.repository.format()),
+      (content, store.repository.format(), pack),
       lacks(content, store),
       (deepest, moves),
     )
@@ -2175,7 +2214,7 @@ fn replay_objects(
       content: object.content,
       depth: record.deepest,
     };
-    admit_object(content, store, (&mut *push, &mut *remade), incoming)
+    admit_object(content, store, (&mut *push, &mut *remade), (incoming, None))
       .map_err(ReplayRefused::Git)?;
   }
   Ok(())
@@ -2214,7 +2253,7 @@ fn replay_pack(
       content: &object.content,
       depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
     };
-    admit_object(content, store, (&mut *push, &mut *remade), incoming)
+    admit_object(content, store, (&mut *push, &mut *remade), (incoming, None))
       .map_err(ReplayRefused::Git)?;
   }
   Ok(())
