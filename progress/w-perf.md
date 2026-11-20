@@ -66,3 +66,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - LANDED fdef525e3 (on main, checked): git row at cut v1.0.0 (release 82d3538b0): clone 2.816 vs 0.300 (9.4x slower),
   blob:none 1.092 vs 0.180, push 0.665 vs 0.310; sample: 72% of clone CPU in slates_git::store::deltas::Search::step.
   T4 (reuse deltas) proposed to main; awaiting ruling (w-git's area). A-716 seam awaiting w-svn's reply.
+- A-716 seam agreed with w-svn (~07:40Z) with a change: green history IS trimmed (checkpoint_green folds below the
+  floor, f37a96515), so texts are keyed by ContentIdentity in a store surviving folding, not (path, revision). The
+  record's text bytes leaving the log entry also shrinks apply_advanced's ~245 KB/rev (w-svn hands that to A-716).
+  A-714 touches db repository.rs + repository/entry.rs, server repository/push.rs, svn_commit.rs, vcs_store.rs.
+## A-718 (main's ruling ~07:35Z; A-717 was w-git's): git deltas computed once and kept; clone streams stored deltas
+- Done when: clone --mirror, blob:none, shallow re-measured vs git daemon on the Studio (cut v1.0.0), memory before
+  and after, recorded. Ask w-git: can its sliced intake (A-717) record each pushed object's delta as it arrives?
