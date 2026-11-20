@@ -43,7 +43,8 @@ use crate::vcs_http::{Exchange, Failed};
 /// (`receive-pack.c`, `cmd_receive_pack`).
 const VERSION_1: &[u8] = b"version 1\n";
 
-/// Where receive-pack is lent its repository's owner shard's state, afresh for each step of a push (the module doc).
+/// Where receive-pack is lent its repository's owner shard's state, afresh for each step of a push (the module doc); the
+/// SSH site's receive-pack is lent it the same way (`crate::vcs_ssh`'s `receive`, A-683).
 pub(crate) trait ShardLender {
   /// Runs `step` over the shard's state; none when it is not lent (no state on this thread, the shard fenced, or its
   /// state lent already).

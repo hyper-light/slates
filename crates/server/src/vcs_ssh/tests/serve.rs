@@ -28,6 +28,10 @@ use crate::daemon::{Daemon, LIVENESS_BUDGET_NS};
 use crate::vcs_http::ShardRepositories;
 use crate::vcs_http::git::Located;
 
+/// A-683: git's receive-pack over this edge, through these tests' client (`receive.rs`).
+#[path = "receive.rs"]
+mod receive;
+
 /// Mercurial's `serve --stdio` behind the edge (A-679): its command's tests, and its sessions over the edge with these
 /// tests' client.
 #[path = "hg.rs"]

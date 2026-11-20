@@ -21,9 +21,9 @@
 //! the connection kept; any other ends it in stages (RFC 9112 §9.6; A-183's lesson): the reply, a half-close, then the
 //! client's remaining bytes read and dropped, so the client reads the refusal rather than a reset that discards it.
 //!
-//! **Credentials** ([`credential`]): Basic (RFC 7617), a token as its password, over TLS alone; Bearer (RFC 6750) over
-//! TLS or a loopback listener. Each ends in a principal of §4.13 by the site's authenticator; a request without them is
-//! answered 401 with the challenges this connection accepts.
+//! **Credentials** ([`credential`]): Basic (RFC 7617), a token as its password, and Bearer (RFC 6750), each over TLS or
+//! a loopback listener, the only cleartext one the server serves (A-686). Each ends in a principal of §4.13 by the
+//! site's authenticator; a request without them is answered 401 with Basic's challenge first, then Bearer's.
 //!
 //! **Bounds, none of them a tunable.** Each request has the admission the listener derives from its shard's budget: the
 //! head's bytes and index and every inflated byte are charged to it. The engine reads only when it has handed on what it
