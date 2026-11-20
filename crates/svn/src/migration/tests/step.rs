@@ -323,3 +323,53 @@ fn t_a655_the_steps_check_of_a_work_verifies_the_locks_as_they_stand() {
   assert_eq!(checked.lock_entries(), release().as_slice());
   assert_eq!(repository.apply(checked), Ok(2));
 }
+
+/// S4 slice 2 c2 (texts kept as skip-delta svndiffs, records.rs "Texts"). Do: commit revision 1, then 40 edits of
+/// [`FILE`], each a 4 KiB text that changes one line of the one before. Expect: every revision's text read back whole
+/// from the records; no read applying more deltas than the node's predecessor count has bits, plus one (FSFS's skip-delta
+/// bound); and the deltas holding under a quarter of the texts' bytes.
+#[test]
+fn s4_c2_a_file_changed_many_times_reads_back_through_a_logarithmic_chain_of_deltas() {
+  let mut repository = created();
+  repository.commit(first()).unwrap();
+  let line =
+    |at: usize, version: usize| format!("{at:04} line of the file, version {version:04}\n");
+  let version = |n: usize| -> Vec<u8> {
+    (0..64)
+      .map(|at| line(at, if at == n % 64 { n } else { 0 }))
+      .collect::<String>()
+      .into_bytes()
+  };
+  let mut texts = vec![b"alpha\n".to_vec()];
+  for n in 1..=40usize {
+    let bytes = version(n);
+    repository
+      .commit(edit(u64::try_from(n).unwrap(), &bytes, Vec::new()))
+      .unwrap();
+    texts.push(bytes);
+  }
+  let mut whole = 0u64;
+  for (n, bytes) in texts.iter().enumerate() {
+    let identity = *blake3::hash(bytes).as_bytes();
+    assert_eq!(
+      repository.text(&identity).as_deref(),
+      Some(bytes.as_slice()),
+      "revision {}",
+      n + 1
+    );
+    let count = u64::try_from(n).unwrap();
+    let bound = usize::try_from(u64::BITS - count.leading_zeros()).unwrap() + 1;
+    let applied = repository.text_chain(&identity).unwrap();
+    assert!(
+      applied <= bound,
+      "revision {}: {applied} deltas, bound {bound}",
+      n + 1
+    );
+    whole += u64::try_from(bytes.len()).unwrap();
+  }
+  assert!(
+    repository.text_bytes() * 4 < whole,
+    "the deltas hold {} of {whole} bytes",
+    repository.text_bytes()
+  );
+}

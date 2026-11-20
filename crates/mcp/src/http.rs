@@ -44,8 +44,8 @@
 //! A-523 every one of these waits ran to the client's reply deadline (`Deadlines::reply_ns`, the anchor's liveness
 //! budget, a fixed second): a silent local sender held a slot for that second, and a token holder's kept-alive
 //! connection was closed once idle that long. Owed: an honest client cut off before its bearer arrived looks like any
-//! other sender, so its cut-off teaches the bound nothing (the prior's share guards the first arrivals); and a listen
-//! stream's keep-alive period still comes from the reply deadline ([`listen_keep_alive_ns`]).
+//! other sender, so its cut-off teaches the bound nothing (the prior's share guards the first arrivals). A listen
+//! stream's keep-alive beats at its caller's heartbeat over the liveness budget ([`HttpEdge::keep_alive_ns`]).
 //!
 //! A refusal ends its connection in stages (RFC 9112 §9.6): the response, a half-close, then the client's remaining
 //! bytes read and dropped until the connection's own end (above), so the client reads the refusal rather than a reset.
@@ -122,19 +122,12 @@ pub struct HttpEdge {
   /// `max(wake.mean, 100 × timer overhead)`): the finest wait its timers keep, so the least granularity `G` of the
   /// learned bound ([`Arrivals::bound_ns`]).
   pub tick_ns: u64,
-  /// The period a quiet `subscriptions/listen` stream sends its keep-alive comment at, nanoseconds
-  /// ([`listen_keep_alive_ns`]).
+  /// The period a quiet `subscriptions/listen` stream sends its keep-alive comment at, nanoseconds: its caller's
+  /// heartbeat over the liveness budget (`slates_server::daemon::heartbeat_of`, the anchor's beat's rule), so a beat
+  /// lands inside each liveness window (the CLI's `listen_keep_alive_ns`, R3, goal 88's class C).
   pub keep_alive_ns: u64,
   /// The connections served at once.
   pub connections: usize,
-}
-
-/// Derived: the period a quiet listen stream sends its keep-alive comment at, from the client's reply deadline
-/// (`Deadlines::reply_ns`): half of it, the idle bound this edge kept on every connection until A-523, so a party that
-/// closes a connection idle that long sees a comment first. Owed (R3, GAPS): a period learned from what closes this
-/// edge's quiet connections, since the edge itself no longer closes a token holder's.
-pub fn listen_keep_alive_ns(reply_ns: u64) -> u64 {
-  (reply_ns / 2).max(1)
 }
 
 /// What the edge has learned of how long an honest client takes to show its bearer (the module doc's rule): RFC 6298
@@ -954,7 +947,7 @@ const KEEP_ALIVE: &[u8] = b":\r\n";
 /// Serves a `subscriptions/listen` over Streamable HTTP: an SSE response whose first event is `acknowledgement`, held
 /// open until the client closes it, which is the request's cancellation (the specification's "Cancellation": nothing
 /// is sent after). Nothing the server publishes changes while it runs, so the only further bytes are keep-alive
-/// comments, one each [`HttpEdge::keep_alive_ns`] ([`listen_keep_alive_ns`]): a party that closes a connection once it
+/// comments, one each [`HttpEdge::keep_alive_ns`]: a party that closes a connection once it
 /// has been idle longer than that sees one first. Bytes from the client end the stream: a listen takes none.
 async fn stream_listen(stream: &TcpStream, acknowledgement: &Value, edge: &HttpEdge) {
   let event = format!("data: {acknowledgement}\n\n");

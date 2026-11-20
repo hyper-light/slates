@@ -369,6 +369,7 @@ fn a_name_pending_a_works_admission_and_an_alias_exclude_each_other() {
       origin: 1,
       client: 1,
       sequence: u32::try_from(n).unwrap(),
+      green: vid(NAME_PARTITION, 0),
     },
   };
   let reserve = |name: &str, n: u64| Op::NameAliasReserved {

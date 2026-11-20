@@ -629,9 +629,7 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
   };
   let fetched = stores
     .lend(id, &owner, |lent| {
-      lent
-        .repository
-        .text(&text.identity, 0)
+      slates_svn::reads::Repository::text(lent.repository, &text.identity, 0)
         .map(std::borrow::Cow::into_owned)
     })
     .flatten()

@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::paint::{HAVE, Paint, WANT};
 use super::ready::peel;
-use super::{Counters, Deepen, Graph, INFINITE_DEPTH, Refusal, Request, ShallowInfo, charge};
+use super::{Counters, Deepen, Graph, INFINITE_DEPTH, Peak, Refusal, Request, ShallowInfo, charge};
 use crate::Admission;
 use crate::object_name::ObjectId;
 
@@ -67,7 +67,48 @@ pub(super) fn client<S: Graph>(
   Ok(commits)
 }
 
-/// The cut a request makes.
+/// A request's deepening, owned so the cut outlives every lending of the graph (A-745): its `deepen-not` objects resolved
+/// as the request named them, a name the store does not hold kept to be refused when the cut begins.
+#[derive(Clone, Debug)]
+pub(super) enum Deepening<N> {
+  /// `deepen <depth>`, `deepen-relative`.
+  Depth {
+    /// The depth.
+    depth: u32,
+    /// `deepen-relative`.
+    relative: bool,
+  },
+  /// `deepen-since`, `deepen-not`.
+  Cut {
+    /// `deepen-since <time>`.
+    since: Option<u64>,
+    /// Each `deepen-not`'s object, or the name the store does not hold.
+    not: Vec<Result<N, ObjectId>>,
+  },
+}
+
+impl<N> Deepening<N> {
+  /// `request`'s deepening, if any, its `deepen-not` names looked up and charged.
+  pub(super) fn of<S: Graph<Node = N>>(
+    graph: &S,
+    request: &Request<'_>,
+    admission: &mut Admission,
+  ) -> Result<Option<Deepening<N>>, Refusal> {
+    Ok(match request.deepen {
+      None => None,
+      Some(Deepen::Depth { depth, relative }) => Some(Deepening::Depth { depth, relative }),
+      Some(Deepen::Cut { since, not }) => {
+        admission
+          .charge_items::<Result<N, ObjectId>>(not.len())
+          .map_err(Refusal::PastAdmission)?;
+        let not = not.iter().map(|id| graph.node(id).ok_or(*id)).collect();
+        Some(Deepening::Cut { since, not })
+      }
+    })
+  }
+}
+
+/// The cut a request makes, made whole ([`Cutting`] stepped to its end).
 pub(super) fn cut<S: Graph>(
   graph: &S,
   request: &Request<'_>,
@@ -76,28 +117,302 @@ pub(super) fn cut<S: Graph>(
   admission: &mut Admission,
   counters: &mut Counters,
 ) -> Result<Cut<S::Node>, Refusal> {
-  let grafts: BTreeSet<S::Node> = client.iter().copied().collect();
-  let Some(deepen) = request.deepen else {
-    let info = (!client.is_empty()).then(ShallowInfo::default);
-    return Ok(Cut {
-      info,
-      grafts,
-      wants: Vec::new(),
-      haves: Vec::new(),
-    });
-  };
-  let (shallow, whole) = match deepen {
-    Deepen::Depth { depth: 0, .. } => return Err(Refusal::ZeroDepth),
-    Deepen::Depth {
-      depth: INFINITE_DEPTH,
-      ..
-    } => (BTreeSet::new(), grafts.clone()),
-    Deepen::Depth { depth, relative } => {
-      by_depth(graph, wants, client, depth, relative, admission)?
+  let deepening = Deepening::of(graph, request, admission)?;
+  let mut cutting = Cutting::begin(graph, deepening, wants, client, admission)?;
+  loop {
+    if let Some(cut) = cutting.unit(graph, client, admission, counters)? {
+      return Ok(cut);
     }
-    Deepen::Cut { since, not } => by_rev_list(graph, wants, since, not, admission, counters)?,
-  };
-  finish(graph, client, grafts, shallow, &whole, admission)
+  }
+}
+
+/// The cut being made a unit at a time (A-745, §4.17.1 "A fetch's answer" rule 3): a commit of the deepening's walk a
+/// unit, or a ref's tip, the walk keeping its place across steps, each lent the graph anew.
+pub(super) struct Cutting<N> {
+  /// The client's shallow commits, the walk's grafts.
+  grafts: BTreeSet<N>,
+  /// Where the cut is.
+  walk: Walk<N>,
+}
+
+/// Where a cut is.
+enum Walk<N> {
+  /// Made: its sections and grafts known.
+  Made(Option<Cut<N>>),
+  /// `deepen-relative`: the client's shallow commits the refs reach, searched from each ref's tip down to the least
+  /// generation among them.
+  Tips {
+    /// The depth asked.
+    depth: u32,
+    /// The ref whose tip is taken next, by its index among the refs.
+    next: usize,
+    /// The least generation among the client's shallow commits.
+    floor: u64,
+    /// The commits met.
+    seen: BTreeSet<N>,
+    /// The commits to search.
+    stack: Vec<N>,
+    /// That stack's cost: its deepest.
+    stack_peak: Peak,
+  },
+  /// `deepen <depth>`: breadth first from the roots, each commit's least depth.
+  Depth {
+    /// The depth at which a commit is shallow.
+    limit: u32,
+    /// Each commit met's least depth.
+    depths: BTreeMap<N, u32>,
+    /// The commits to take.
+    queue: VecDeque<N>,
+    /// That queue's cost: its longest.
+    queue_peak: Peak,
+    /// The shallow commits and those kept whole.
+    found: ShallowAndWhole<N>,
+  },
+  /// `deepen-since`, `deepen-not`: the walk painting what `rev-list` selects.
+  Paint {
+    /// The walk.
+    paint: Paint<N>,
+    /// `deepen-since <time>`.
+    since: Option<u64>,
+  },
+  /// The selected commits judged, shallow or whole: the taken commit at or after `next` next.
+  Select {
+    /// The walk.
+    paint: Paint<N>,
+    /// The next position looked at.
+    next: u64,
+    /// Whether any commit was selected.
+    any: bool,
+    /// The shallow commits and those kept whole.
+    found: ShallowAndWhole<N>,
+  },
+  /// The walk done: the sections made from what it found.
+  Finish(ShallowAndWhole<N>),
+}
+
+impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
+  /// The cut `deepening` makes of the walk from `wants`, a client holding `client` shallow, begun: everything the
+  /// request bounds (the roots, the `deepen-not` objects painted), the walk left to [`Cutting::unit`].
+  pub(super) fn begin<S: Graph<Node = N>>(
+    graph: &S,
+    deepening: Option<Deepening<N>>,
+    wants: &[N],
+    client: &[N],
+    admission: &mut Admission,
+  ) -> Result<Cutting<N>, Refusal> {
+    let grafts: BTreeSet<N> = client.iter().copied().collect();
+    let walk = match deepening {
+      None => {
+        let info = (!client.is_empty()).then(ShallowInfo::default);
+        Walk::Made(Some(Cut {
+          info,
+          grafts: grafts.clone(),
+          wants: Vec::new(),
+          haves: Vec::new(),
+        }))
+      }
+      Some(Deepening::Depth { depth: 0, .. }) => return Err(Refusal::ZeroDepth),
+      Some(Deepening::Depth {
+        depth: INFINITE_DEPTH,
+        ..
+      }) => Walk::Finish((BTreeSet::new(), grafts.clone())),
+      Some(Deepening::Depth {
+        depth,
+        relative: true,
+      }) => Walk::Tips {
+        depth,
+        next: 0,
+        floor: client
+          .iter()
+          .map(|node| super::ready::generation(graph, *node))
+          .min()
+          .unwrap_or(u64::MAX),
+        seen: BTreeSet::new(),
+        stack: Vec::new(),
+        stack_peak: Peak::default(),
+      },
+      Some(Deepening::Depth {
+        depth,
+        relative: false,
+      }) => {
+        let roots: Vec<N> = wants
+          .iter()
+          .filter_map(|want| peel(graph, *want))
+          .filter(|node| graph.commit(*node).is_some())
+          .collect();
+        by_depth(roots, depth, admission)?
+      }
+      Some(Deepening::Cut { since, not }) => {
+        let mut paint = Paint::new();
+        for want in wants.iter().filter_map(|want| peel(graph, *want)) {
+          if graph.commit(want).is_some() {
+            paint.paint(graph, want, WANT, admission)?;
+          }
+        }
+        for node in not {
+          let node = node.map_err(|id| Refusal::DeepenNotHeld { id })?;
+          if let Some(commit) = peel(graph, node).filter(|node| graph.commit(*node).is_some()) {
+            paint.paint(graph, commit, HAVE, admission)?;
+          }
+        }
+        Walk::Paint { paint, since }
+      }
+    };
+    Ok(Cutting { grafts, walk })
+  }
+
+  /// One unit of the cut: the cut once it is made, `None` while it is not.
+  pub(super) fn unit<S: Graph<Node = N>>(
+    &mut self,
+    graph: &S,
+    client: &[N],
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<Option<Cut<N>>, Refusal> {
+    match &mut self.walk {
+      Walk::Made(cut) => return Ok(cut.take()),
+      Walk::Tips {
+        depth,
+        next,
+        floor,
+        seen,
+        stack,
+        stack_peak,
+      } => {
+        if let Some(commit) = stack.pop() {
+          if super::ready::generation(graph, commit) >= *floor && seen.insert(commit) {
+            charge::<N>(admission)?;
+            stack.extend(graph.parents(commit));
+            stack_peak.reach::<N>(stack.len(), admission)?;
+          }
+          return Ok(None);
+        }
+        if let Some((at, tip)) = graph.tips_from(*next).next() {
+          *next = at.saturating_add(1);
+          if let Some(commit) = peel(graph, tip).filter(|node| graph.commit(*node).is_some()) {
+            stack.push(commit);
+            stack_peak.reach::<N>(stack.len(), admission)?;
+          }
+          return Ok(None);
+        }
+        let roots: Vec<N> = client
+          .iter()
+          .copied()
+          .filter(|node| seen.contains(node))
+          .collect();
+        self.walk = by_depth(roots, depth.saturating_add(1), admission)?;
+      }
+      Walk::Depth {
+        limit,
+        depths,
+        queue,
+        queue_peak,
+        found,
+      } => {
+        let Some(commit) = queue.pop_front() else {
+          let found = core::mem::take(found);
+          self.walk = Walk::Finish(found);
+          return Ok(None);
+        };
+        let at = depths.get(&commit).copied().unwrap_or(*limit);
+        charge::<N>(admission)?;
+        if at >= *limit {
+          found.0.insert(commit);
+          return Ok(None);
+        }
+        found.1.insert(commit);
+        for parent in graph.parents(commit) {
+          if let Entry::Vacant(slot) = depths.entry(parent) {
+            charge::<(N, u32)>(admission)?;
+            slot.insert(at.saturating_add(1));
+            queue.push_back(parent);
+          }
+        }
+        queue_peak.reach::<N>(queue.len(), admission)?;
+      }
+      Walk::Paint { paint, since } => {
+        let since = *since;
+        let old = |commit| {
+          since.is_some_and(|time| graph.commit(commit).is_some_and(|row| row.date < time))
+        };
+        if !paint.step(graph, &BTreeSet::new(), &old, admission, counters)? {
+          let paint = core::mem::replace(paint, Paint::new());
+          self.walk = Walk::Select {
+            paint,
+            next: 0,
+            any: false,
+            found: (BTreeSet::new(), BTreeSet::new()),
+          };
+        }
+      }
+      Walk::Select {
+        paint,
+        next,
+        any,
+        found,
+      } => {
+        let Some(position) = paint.taken_from(*next) else {
+          if !*any {
+            return Err(Refusal::NothingSelected);
+          }
+          let found = core::mem::take(found);
+          self.walk = Walk::Finish(found);
+          return Ok(None);
+        };
+        *next = position.saturating_add(1);
+        let Ok(commit) = N::try_from(position) else {
+          return Ok(None);
+        };
+        if !paint.is_chosen(position) {
+          return Ok(None);
+        }
+        *any = true;
+        charge::<(N, N)>(admission)?;
+        if graph
+          .parents(commit)
+          .any(|parent| !paint.is_chosen(parent.into()))
+        {
+          found.0.insert(commit);
+        } else {
+          found.1.insert(commit);
+        }
+      }
+      Walk::Finish(found) => {
+        let (shallow, whole) = core::mem::take(found);
+        let grafts = core::mem::take(&mut self.grafts);
+        let cut = finish(graph, client, grafts, shallow, &whole, admission)?;
+        self.walk = Walk::Made(None);
+        return Ok(Some(cut));
+      }
+    }
+    Ok(None)
+  }
+}
+
+/// `deepen <depth>` (or `deepen-relative`'s `depth + 1`) from `roots`, begun: each root at depth 1.
+fn by_depth<N: Copy + Ord>(
+  roots: Vec<N>,
+  limit: u32,
+  admission: &mut Admission,
+) -> Result<Walk<N>, Refusal> {
+  let mut depths: BTreeMap<N, u32> = BTreeMap::new();
+  let mut queue = VecDeque::new();
+  for root in roots {
+    if let Entry::Vacant(slot) = depths.entry(root) {
+      charge::<(N, u32)>(admission)?;
+      slot.insert(1);
+      queue.push_back(root);
+    }
+  }
+  let mut queue_peak = Peak::default();
+  queue_peak.reach::<N>(queue.len(), admission)?;
+  Ok(Walk::Depth {
+    limit,
+    depths,
+    queue,
+    queue_peak,
+    found: (BTreeSet::new(), BTreeSet::new()),
+  })
 }
 
 /// The cut's sections and grafts, from the new shallow commits and the commits the cut keeps whole.
@@ -140,137 +455,4 @@ fn finish<S: Graph>(
     wants,
     haves: made_whole,
   })
-}
-
-/// `deepen <depth>`, or `deepen-relative`: the shallow commits, and the commits above them, kept whole.
-fn by_depth<S: Graph>(
-  graph: &S,
-  wants: &[S::Node],
-  client: &[S::Node],
-  depth: u32,
-  relative: bool,
-  admission: &mut Admission,
-) -> Result<ShallowAndWhole<S::Node>, Refusal> {
-  let (roots, limit) = if relative {
-    (
-      reached_from_tips(graph, client, admission)?,
-      depth.saturating_add(1),
-    )
-  } else {
-    let roots = wants
-      .iter()
-      .filter_map(|want| peel(graph, *want))
-      .filter(|node| graph.commit(*node).is_some())
-      .collect();
-    (roots, depth)
-  };
-  let mut depths: BTreeMap<S::Node, u32> = BTreeMap::new();
-  let mut queue = VecDeque::new();
-  for root in roots {
-    if let Entry::Vacant(slot) = depths.entry(root) {
-      charge::<(S::Node, u32)>(admission)?;
-      slot.insert(1);
-      queue.push_back(root);
-    }
-  }
-  let (mut shallow, mut whole) = (BTreeSet::new(), BTreeSet::new());
-  while let Some(commit) = queue.pop_front() {
-    let at = depths.get(&commit).copied().unwrap_or(limit);
-    charge::<S::Node>(admission)?;
-    if at >= limit {
-      shallow.insert(commit);
-      continue;
-    }
-    whole.insert(commit);
-    for parent in graph.parents(commit) {
-      if let Entry::Vacant(slot) = depths.entry(parent) {
-        charge::<(S::Node, u32)>(admission)?;
-        slot.insert(at.saturating_add(1));
-        queue.push_back(parent);
-      }
-    }
-  }
-  Ok((shallow, whole))
-}
-
-/// The client's shallow commits that some ref reaches, searched from the refs down to the least generation among them.
-fn reached_from_tips<S: Graph>(
-  graph: &S,
-  client: &[S::Node],
-  admission: &mut Admission,
-) -> Result<Vec<S::Node>, Refusal> {
-  let floor = client
-    .iter()
-    .map(|node| super::ready::generation(graph, *node))
-    .min()
-    .unwrap_or(u64::MAX);
-  let mut seen = BTreeSet::new();
-  let mut stack: Vec<S::Node> = graph
-    .tips()
-    .filter_map(|tip| peel(graph, tip))
-    .filter(|node| graph.commit(*node).is_some())
-    .collect();
-  while let Some(commit) = stack.pop() {
-    if super::ready::generation(graph, commit) < floor || !seen.insert(commit) {
-      continue;
-    }
-    charge::<S::Node>(admission)?;
-    for parent in graph.parents(commit) {
-      charge::<S::Node>(admission)?;
-      stack.push(parent);
-    }
-  }
-  Ok(
-    client
-      .iter()
-      .copied()
-      .filter(|node| seen.contains(node))
-      .collect(),
-  )
-}
-
-/// `deepen-since` and `deepen-not`: the shallow commits, and the selected commits kept whole.
-fn by_rev_list<S: Graph>(
-  graph: &S,
-  wants: &[S::Node],
-  since: Option<u64>,
-  not: &[ObjectId],
-  admission: &mut Admission,
-  counters: &mut Counters,
-) -> Result<ShallowAndWhole<S::Node>, Refusal> {
-  let mut paint = Paint::new();
-  for want in wants.iter().filter_map(|want| peel(graph, *want)) {
-    if graph.commit(want).is_some() {
-      paint.paint(graph, want, WANT, admission)?;
-    }
-  }
-  for id in not {
-    let node = graph.node(id).ok_or(Refusal::DeepenNotHeld { id: *id })?;
-    if let Some(commit) = peel(graph, node).filter(|node| graph.commit(*node).is_some()) {
-      paint.paint(graph, commit, HAVE, admission)?;
-    }
-  }
-  let old =
-    |commit| since.is_some_and(|time| graph.commit(commit).is_some_and(|row| row.date < time));
-  paint.run(graph, &BTreeSet::new(), old, admission, counters)?;
-  let selected = paint.chosen(admission)?;
-  if selected.is_empty() {
-    return Err(Refusal::NothingSelected);
-  }
-  let (mut shallow, mut whole) = (BTreeSet::new(), BTreeSet::new());
-  for commit in selected
-    .iter()
-    .filter_map(|position| S::Node::try_from(position).ok())
-  {
-    charge::<(S::Node, S::Node)>(admission)?;
-    if graph
-      .parents(commit)
-      .any(|parent| !selected.contains(parent))
-    {
-      shallow.insert(commit);
-    } else {
-      whole.insert(commit);
-    }
-  }
-  Ok((shallow, whole))
 }

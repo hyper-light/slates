@@ -42,8 +42,6 @@ const HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 2);
 /// its channel took it, and that is the machine's speed, not the forward's wait. 41,125 tasks took 64 ms to 4.33 s under
 /// 36 spinners (2026-11-17, 30 runs), and a budget from the hold's end failed 8 of 30 runs at load 35.
 const ANSWER_WAIT: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
-/// Shape: how long the test waits for the hold to begin.
-const HOLD_START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: names tried for one the other shard owns.
 const NAME_TRIES: usize = 64;
 
@@ -100,9 +98,17 @@ fn hold(
     })
     .unwrap();
   let waiter = std::thread::spawn(move || observation.wait().unwrap());
-  let started = Instant::now();
+  // The hold begins when the shard runs the observation, which ends otherwise by its own answer or its typed refusal past
+  // the daemon's observe budget (A-571's rule; until 2026-11-20 five seconds, `HOLD_START_WAIT`).
   while !held.load(Ordering::Acquire) {
-    assert!(started.elapsed() < HOLD_START_WAIT, "the hold began");
+    if waiter.is_finished() {
+      // The flag is set before the observation ends, so a hold that began and ended since the first read shows here.
+      assert!(
+        held.load(Ordering::Acquire),
+        "the hold's observation ended before the hold began"
+      );
+      break;
+    }
     std::thread::yield_now();
   }
   waiter

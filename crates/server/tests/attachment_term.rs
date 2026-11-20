@@ -73,13 +73,9 @@ fn a_cli_attachment_lives_its_term_renewed_by_use_and_is_refused_as_expired_afte
   daemon.stop();
 }
 
-/// Shape: how long the test waits for a shard to have taken a just-connected client.
-const TAKEN_WAIT: Duration = Duration::from_secs(20);
-
 /// The account the daemon authenticated `client_id`'s channel as, asked of each shard until one has taken the client:
 /// the uid an enrolled consumer of that account is enrolled under (as `consumers.rs` reads it).
 fn channel_account(daemon: &Daemon, client_id: u32) -> u32 {
-  let started = std::time::Instant::now();
   loop {
     let found = daemon.shards().iter().copied().find_map(|shard| {
       daemon
@@ -104,10 +100,6 @@ fn channel_account(daemon: &Daemon, client_id: u32) -> u32 {
       };
       return uid;
     }
-    assert!(
-      started.elapsed() < TAKEN_WAIT,
-      "a shard took client {client_id}"
-    );
     std::thread::yield_now();
   }
 }

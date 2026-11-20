@@ -3381,3 +3381,94 @@ fn a_live_log_past_its_tolerance_is_taken_from_every_surviving_holder() {
     "nobody holds any of the log: nothing to adopt"
   );
 }
+
+/// Shape: the measured append's payload: the 2.4 MB the live_chaos probes measured a delta and a whole entry at
+/// (w-forming, 2026-11-20).
+const MEASURED_APPEND_BYTES: usize = 2_400_000;
+/// Shape: the appends each measurement takes the best of.
+const MEASURED_APPENDS: usize = 9;
+
+/// A measurement, not a check (run with `--release -- --ignored --nocapture`; w-forming's A/B for the live append
+/// turn, 2026-11-20): the wall time of one append of [`MEASURED_APPEND_BYTES`] as `live_ship::append_entry` makes it,
+/// a delta and a whole state, best and median of [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_live_append_turn() {
+  for whole in [false, true] {
+    let mut times = Vec::new();
+    for _ in 0..MEASURED_APPENDS {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+      let began = std::time::Instant::now();
+      let head = live_append(&mut shipper, &payload, whole);
+      times.push(began.elapsed());
+      assert_eq!(head.position, 0);
+    }
+    times.sort_unstable();
+    println!(
+      "LIVE_APPEND_TURN path=returned whole={whole} bytes={MEASURED_APPEND_BYTES} best={:?} median={:?}",
+      times[0],
+      times[MEASURED_APPENDS / 2]
+    );
+    let mut kept_times = Vec::new();
+    for _ in 0..MEASURED_APPENDS {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+      let began = std::time::Instant::now();
+      let head = if whole {
+        let head = shipper.append_checkpoint_kept(payload.clone()).unwrap();
+        shipper.mark_checkpoint(head);
+        head
+      } else {
+        shipper.append_kept(payload.clone()).unwrap()
+      };
+      kept_times.push(began.elapsed());
+      assert_eq!(head.position, 0);
+    }
+    kept_times.sort_unstable();
+    println!(
+      "LIVE_APPEND_TURN path=kept whole={whole} bytes={MEASURED_APPEND_BYTES} best={:?} median={:?}",
+      kept_times[0],
+      kept_times[MEASURED_APPENDS / 2]
+    );
+  }
+}
+
+/// Golden equivalence (w-forming, 2026-11-20): an entry's identity, now hashed as its fields stream, is the BLAKE3 of
+/// its canonical bytes, as every host computes it. Do: hash entries with empty, one-byte, page and multi-MiB payloads at
+/// several places in a chain. Expect each identity equal to `blake3(encode())`.
+#[test]
+fn an_entrys_identity_is_the_blake3_of_its_canonical_bytes() {
+  for (position, size) in [(0_u64, 0_usize), (1, 1), (7, 4096), (u64::MAX, 3 << 20)] {
+    let entry = Entry {
+      owner: HostId(0x0102_0304_0506_0708),
+      object: OBJECT,
+      position,
+      epoch: HostEpoch(9),
+      previous: [0xab; 32],
+      payload: (0..size)
+        .map(|at| u8::try_from(at % 251).unwrap())
+        .collect(),
+    };
+    assert_eq!(
+      entry.identity(),
+      *blake3::hash(&entry.encode()).as_bytes(),
+      "position {position}, {size} bytes"
+    );
+  }
+}
+
+/// The append as `live_ship::append_entry` makes it: the payload cloned into the shipper, then the entry's head read
+/// for the volume's newest position and, on a whole state, its checkpoint.
+fn live_append(shipper: &mut Shipper, payload: &[u8], whole: bool) -> Head {
+  let entry = if whole {
+    shipper.append_checkpoint(payload.to_vec()).unwrap()
+  } else {
+    shipper.append(payload.to_vec()).unwrap()
+  };
+  let newest = entry.head();
+  if whole {
+    shipper.mark_checkpoint(entry.head());
+  }
+  newest
+}

@@ -120,20 +120,6 @@ impl<N: Copy + Ord + Into<u64>> Paint<N> {
     Ok(())
   }
 
-  /// Walks until no queued commit is painted [`WANT`] alone. A commit in `grafts` passes nothing to its parents; a commit
-  /// for which `cut` says so is painted [`HAVE`] as it is taken.
-  pub(super) fn run<S: Graph<Node = N>>(
-    &mut self,
-    graph: &S,
-    grafts: &BTreeSet<N>,
-    cut: impl Fn(N) -> bool,
-    admission: &mut Admission,
-    counters: &mut Counters,
-  ) -> Result<(), Refusal> {
-    while self.step(graph, grafts, &cut, admission, counters)? {}
-    Ok(())
-  }
-
   /// Takes the next commit from the queue and passes its paint on (A-745: the walk a unit at a time, its owner choosing
   /// how many a turn): whether the walk goes on, false once no queued commit is painted [`WANT`] alone.
   pub(super) fn step<S: Graph<Node = N>>(
@@ -166,6 +152,16 @@ impl<N: Copy + Ord + Into<u64>> Paint<N> {
       return Ok(self.pending > 0);
     }
     Ok(false)
+  }
+
+  /// The next commit taken at or after `from`, by position.
+  pub(super) fn taken_from(&self, from: u64) -> Option<u64> {
+    self.taken.next_from(from)
+  }
+
+  /// Whether the commit at `position` is reached from a want and from no have.
+  pub(super) fn is_chosen(&self, position: u64) -> bool {
+    self.want.contains(position) && !self.have.contains(position)
   }
 
   /// The commits taken painted [`WANT`] alone: reached from a want and from no have, kept as [`Held`] keeps a set and

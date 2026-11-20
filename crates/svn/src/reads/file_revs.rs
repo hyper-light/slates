@@ -32,10 +32,12 @@
 //! match: `svnserve` gathers them in its hash's seeded order and sorts them with `qsort`, which keeps no order among
 //! equals; slates sends them as they are found, by source path and range.
 //!
-//! The revisions to send are found before the first is sent, as Subversion finds them, and sent a revision a step. A
-//! revision's text and the previous one's are held whole while its delta is made: the deltifier reads a source and a
-//! target piece of a window at a time, but takes them as whole texts, so reading the green's pieces a window at a time
-//! is owed (§4.17.4 item 11, GAPS).
+//! The revisions to send are found before the first is sent, as Subversion finds them. Each is sent over many steps
+//! (A-751): its tuple or its element's start, then its delta a unit a step through the update drive's window step
+//! (`report::drive::window_unit`: a window's pieces read from the green, the window made by
+//! `svndiff::WindowMaking`, its writes written a piece at a time), then its end. A slice stops at the first step past its
+//! budget's quantum, so no step holds a shard past one window's unit, and no text is held whole: a window's two pieces
+//! at most.
 
 use super::history::skip_ancestor;
 use super::log::dav::DavLogProgress;
@@ -47,16 +49,18 @@ use super::{
 };
 use crate::authz::PrincipalRules;
 use crate::dav::listing::{
-  FILE_REVS_END, FILE_REVS_START, FileRev, FileRevsReport, file_rev_element,
+  FILE_REV_END, FILE_REVS_END, FILE_REVS_START, FileRev, FileRevsReport, TXDELTA_END,
+  TXDELTA_START, file_rev_head,
 };
+use crate::dav::xml::Base64Stream;
 use crate::handshake::ClientCapabilities;
 use crate::index::{Node, NodeKind, PropertyList, Revision, Text};
 use crate::mergeinfo::{Compare, Mergeinfo, MergeinfoInheritance, mergeinfo_at};
 use crate::ra_svn::{ItemError, Value, write};
-use crate::report::editor::DeltaWrites;
-use crate::svndiff::{Compression, Version, WINDOW_LIMIT, Window, deltas};
+use crate::report::drive::{Delta, WindowWork, window_unit};
+use crate::report::exchange::{Budget, Slice};
+use crate::svndiff::{Compression, Encoder, Version};
 use std::collections::{BTreeSet, VecDeque};
-use std::num::NonZeroUsize;
 
 /// `SVN_ERR_FS_NOT_FILE`, the refusal of a path that is no file in the end revision.
 /// Format: the filesystem category's start, 160,000, plus 17 (`svn_error_codes.h`); recorded (fixture `get-file-revs`).
@@ -156,6 +160,7 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       last: None,
       ended: false,
       writer: RevsWriter::Items,
+      sending: None,
     })))
   }
 }
@@ -195,7 +200,48 @@ pub(super) struct FileRevsStream {
   ended: bool,
   /// Where the revisions are written.
   writer: RevsWriter,
+  /// The revision whose delta is being sent, a step at a time (A-751).
+  sending: Option<Box<RevDelta>>,
 }
+
+/// A revision's delta being sent a step at a time (A-751): its source and target texts, how far its windows are sent,
+/// whether its svndiff header is out, the window in the making ([`window_unit`]), and for DAV the base64 so far.
+#[derive(Clone, Debug)]
+struct RevDelta {
+  /// The previous revision's text; none for the first revision.
+  source: Option<Text>,
+  /// This revision's text; none for a file without one.
+  target: Option<Text>,
+  /// The target bytes the windows have sent.
+  sent: u64,
+  /// Whether the delta's svndiff header is written.
+  header_sent: bool,
+  /// The window in the making, between its steps.
+  window: Option<Box<WindowWork>>,
+  /// The DAV answer's base64 of the svndiff stream, less a group not yet whole.
+  base64: Base64Stream,
+}
+
+impl PartialEq for RevDelta {
+  /// The same delta: its texts and how far it is sent (a window in the making is that place's).
+  fn eq(&self, other: &Self) -> bool {
+    (
+      self.source,
+      self.target,
+      self.sent,
+      self.header_sent,
+      &self.base64,
+    ) == (
+      other.source,
+      other.target,
+      other.sent,
+      other.header_sent,
+      &other.base64,
+    )
+  }
+}
+
+impl Eq for RevDelta {}
 
 impl FileRevsStream {
   /// Sends revisions until the bytes written and the revisions sent reach `room`, at least one step, or until the
@@ -203,8 +249,10 @@ impl FileRevsStream {
   pub(super) fn resume<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
-    room: usize,
+    budget: Budget,
   ) -> Result<Progress, ItemError> {
+    let room = budget.room;
+    let slice = Slice::begin(budget.quantum);
     let start = reads.out.len();
     let mut steps = 0_usize;
     while !self.ended {
@@ -222,7 +270,8 @@ impl FileRevsStream {
       }
       steps = steps.saturating_add(1);
       let spent = reads.out.len().saturating_sub(start).saturating_add(steps);
-      if !self.ended && spent >= room {
+      // A-751: a timed slice ends at the first step past its quantum, at least one step.
+      if !self.ended && (spent >= room || slice.spent()) {
         return Ok(Progress::More);
       }
     }
@@ -234,6 +283,9 @@ impl FileRevsStream {
   /// its connection's buffer before it walks, and the process aborts before the buffer is flushed, so its client reads
   /// nothing for the command (the `locked-file-revs-abort` recording).
   fn step<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>) -> Result<(), Stop> {
+    if let Some(delta) = self.sending.take() {
+      return self.delta_unit(reads, delta);
+    }
     let Some(pending) = self.pending.as_mut() else {
       let found = reads.file_revisions_to_send(&self.request);
       if !matches!(found, Err(Stop::Aborted)) && self.writer == RevsWriter::Items {
@@ -285,33 +337,35 @@ impl FileRevsStream {
         Value::Word(super::bool_word(revision.merged)),
       ]);
       write(&item, reads.out)?;
-      if changed {
-        self.delta(reads, &node)?;
+      if !changed {
+        write(&Value::String(b""), reads.out)?;
       }
-      write(&Value::String(b""), reads.out)?;
     } else {
-      let delta = if changed {
-        Some(self.windows(reads, &node)?)
-      } else {
-        None
-      };
-      let element = file_rev_element(
-        &FileRev {
-          path: revision.path.clone(),
-          revision: revision.revision,
-          rev_props: owned_names(&revision_properties),
-          props: diffs
-            .iter()
-            .map(|(name, value)| (lossy(name), value.map(<[u8]>::to_vec)))
-            .collect(),
-          merged: revision.merged,
-          delta,
-        },
-        DAV_SVNDIFF,
-      )
-      .map_err(|_| Failure::corrupt())?;
+      let element = file_rev_head(&FileRev {
+        path: revision.path.clone(),
+        revision: revision.revision,
+        rev_props: owned_names(&revision_properties),
+        props: diffs
+          .iter()
+          .map(|(name, value)| (lossy(name), value.map(<[u8]>::to_vec)))
+          .collect(),
+        merged: revision.merged,
+        delta: None,
+      });
       self.dav_header(reads.out);
       reads.out.extend_from_slice(element.as_bytes());
+      let tail: &[u8] = if changed { TXDELTA_START } else { FILE_REV_END };
+      reads.out.extend_from_slice(tail);
+    }
+    if changed {
+      self.sending = Some(Box::new(RevDelta {
+        source: self.last.as_ref().and_then(|last| last.text),
+        target: node.text(),
+        sent: 0,
+        header_sent: false,
+        window: None,
+        base64: Base64Stream::new(),
+      }));
     }
     self.last = Some(Last {
       path: revision.path.clone(),
@@ -323,49 +377,68 @@ impl FileRevsStream {
     Ok(())
   }
 
-  /// The delta from the previous revision's text (none for the first) to `node`'s, a string for each write
-  /// `svn_txdelta_to_svndiff3` makes (`serve.c` `svndiff_handler`), the writes the report editor's `DeltaWrites` makes,
-  /// the one writer of them (A-616 continued (7)).
-  fn delta<R: Repository + ?Sized>(
-    &self,
+  /// One step of a revision's delta from the previous revision's text (none for the first) to its own (A-751): a unit
+  /// of its next window ([`window_unit`], Subversion's windows, the update drive's), each piece of a write
+  /// `svn_txdelta_to_svndiff3` makes (`serve.c` `svndiff_handler`; the report editor's `DeltaWrites`' writes, A-616
+  /// continued (7)) written as it comes: a string of its own for `svnserve`'s writer, base64 for DAV's. At the text's
+  /// end, the header alone where no window wrote it, then the end: the empty string, or the DAV element's close.
+  fn delta_unit<R: Repository + ?Sized>(
+    &mut self,
     reads: &mut Reads<'_, R>,
-    node: &Node<'_>,
+    mut delta: Box<RevDelta>,
   ) -> Result<(), Stop> {
-    let mut writes = DeltaWrites::new(self.version);
-    let mut encoded = Vec::new();
-    for window in self.windows(reads, node)? {
-      let window_writes = writes
-        .window(&window, self.compression, &mut encoded)
-        .map_err(|_| Failure::corrupt())?;
-      for piece in window_writes.iter() {
-        write(&Value::String(piece), reads.out)?;
+    let items = self.writer == RevsWriter::Items;
+    let RevDelta {
+      source,
+      target,
+      sent,
+      header_sent,
+      window,
+      base64,
+    } = &mut *delta;
+    let out = &mut *reads.out;
+    let mut sink = |write: usize, at: usize, piece: Vec<u8>| {
+      if !items {
+        out.extend_from_slice(base64.push(&piece).as_bytes());
+        return;
       }
-    }
-    if let Some(header) = writes.end() {
-      write(&Value::String(&header), reads.out)?;
-    }
-    Ok(())
-  }
-
-  /// The windows of the delta from the previous revision's text (none for the first) to `node`'s: Subversion's
-  /// (A-652's deltifier).
-  fn windows<R: Repository + ?Sized>(
-    &self,
-    reads: &Reads<'_, R>,
-    node: &Node<'_>,
-  ) -> Result<Vec<Window>, Failure> {
-    let source = match &self.last {
-      Some(last) => reads.whole_text(last.text)?,
-      None => Vec::new(),
+      if at == 0 {
+        crate::ra_svn::write_string_head(u64::try_from(write).unwrap_or(u64::MAX), out);
+      }
+      out.extend_from_slice(&piece);
+      if at.saturating_add(piece.len()) >= write {
+        out.push(crate::ra_svn::ITEM_END);
+      }
     };
-    let target = reads.whole_text(node.text())?;
-    let room = NonZeroUsize::new(usize::try_from(WINDOW_LIMIT).map_err(|_| Failure::corrupt())?)
-      .ok_or_else(Failure::corrupt)?;
-    Ok(
-      deltas(&source, &target, room)
-        .map_err(|_| Failure::corrupt())?
-        .collect(),
+    let Some(text) = target.filter(|text| *sent < text.size) else {
+      if !*header_sent {
+        let header = Encoder::new(self.version).header();
+        sink(header.len(), 0, header.to_vec());
+      }
+      if items {
+        write(&Value::String(b""), reads.out)?;
+      } else {
+        let rest = std::mem::take(base64).finish();
+        reads.out.extend_from_slice(rest.as_bytes());
+        reads.out.extend_from_slice(TXDELTA_END);
+      }
+      return Ok(());
+    };
+    let unit = Delta {
+      text,
+      source: *source,
+      sent,
+      header_sent,
+    };
+    window_unit(
+      window,
+      unit,
+      ((self.version, self.compression), reads.repository),
+      &mut sink,
     )
+    .map_err(|_| Failure::corrupt())?;
+    self.sending = Some(delta);
+    Ok(())
   }
 
   /// `maybe_send_header`: the DAV answer's start, once, before its first revision or its end.
@@ -582,26 +655,6 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
         .collect(),
     }
   }
-
-  /// A text whole, gathered from the green's pieces; refused as corrupt when the green does not hold it.
-  fn whole_text(&self, text: Option<Text>) -> Result<Vec<u8>, Failure> {
-    let Some(text) = text else {
-      return Ok(Vec::new());
-    };
-    let size = usize::try_from(text.size).map_err(|_| Failure::corrupt())?;
-    let mut whole = Vec::with_capacity(size);
-    while whole.len() < size {
-      let offset = u64::try_from(whole.len()).map_err(|_| Failure::corrupt())?;
-      let piece = self
-        .repository
-        .text(&text.identity, offset)
-        .filter(|piece| !piece.is_empty())
-        .ok_or_else(Failure::corrupt)?;
-      let take = piece.len().min(size.saturating_sub(whole.len()));
-      whole.extend_from_slice(piece.get(..take).ok_or_else(Failure::corrupt)?);
-    }
-    Ok(whole)
-  }
 }
 
 /// How `find_interesting_revisions` walks: whether merged revisions are included, and whether what it finds is marked
@@ -769,6 +822,7 @@ impl DavFileRevs {
           refused: None,
           aborted: false,
         },
+        sending: None,
       },
     }
   }
@@ -782,7 +836,7 @@ impl DavFileRevs {
     repository: &R,
     rules: Option<&PrincipalRules>,
     out: &mut Vec<u8>,
-    room: usize,
+    budget: Budget,
   ) -> DavLogProgress {
     let mut reads = Reads {
       index,
@@ -793,7 +847,7 @@ impl DavFileRevs {
       authentication: Authentication::Settled,
       out,
     };
-    match self.stream.resume(&mut reads, room) {
+    match self.stream.resume(&mut reads, budget) {
       Ok(Progress::More) => DavLogProgress::More,
       Ok(Progress::Done | Progress::Close) => match &self.stream.writer {
         RevsWriter::Dav {

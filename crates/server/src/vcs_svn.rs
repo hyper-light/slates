@@ -1698,6 +1698,9 @@ async fn land(
   work: Work,
   out: &mut Vec<u8>,
 ) -> bool {
+  // A-740: a shard stuck landing a revision names it, wherever the landing was reached from (`close-edit`'s pre-commit
+  // answer, or an accepted work).
+  let _doing = slates_rt::futures::doing("vcs_svn::land");
   let (Some(opened), Some(principal)) = (
     conversation.opened.as_ref(),
     conversation.principal.as_ref(),
