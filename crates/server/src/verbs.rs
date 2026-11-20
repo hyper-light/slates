@@ -4985,6 +4985,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::ImportRefused { .. } => "import_refused",
     Refusal::CopyRefused { .. } => "copy_refused",
     Refusal::CredentialUnreplicated { .. } => "credential_unreplicated",
+    Refusal::LandingSuperseded { .. } => "landing_superseded",
   }
 }
 

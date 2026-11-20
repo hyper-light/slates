@@ -10157,6 +10157,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
 
+> **Status (2026-11-20, A-779: a newer presentation supersedes the older).** A presentation of a volume into a target,
+> by any client, supersedes every earlier one of that volume and target still awaiting its grant: each leaves
+> `AwaitingGrant` for `Superseded`, naming the newer (`Op::LandingSuperseded`), drops off the session log (A-773), and a
+> grant of it is refused `LandingSuperseded { newer }`, so an older state never lands over a newer one. Nothing expires
+> on a clock (R3). A granted landing's presentation kept for its resume is not superseded. The session log lists only
+> the presentations a grant can still take, read from the shard's held presentations.
+
 **Special names (A-26).** A landing containing FIFO/socket creation refuses before its
 first host write. The current grant authorizes filesystem content, not new host IPC endpoints.
 No copy-up, hashing, archive or landing step opens a host special file as regular content. A landing containing a
@@ -57587,6 +57594,18 @@ one waiting landing: exactly two named; the landing gone once granted and run); 
 every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
 `args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
 
+### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
+Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
+(`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),
+the bug record, GAPS.
+
+Status: built 2026-11-20.
+- Why: on macOS a shared-memory object lives while its name does, and only its creator, the anchor, removed the names.
+  Four `SIGKILL`ed anchors held 21 GB of the big Studio with no process alive.
+- The rule: when the anchor is gone, its daemon removes the names of the segment and the content object before it
+  stops. Nobody adopts them after the anchor, so their memory goes back with the daemon's own mappings. Linux and
+  Windows objects carry no name that outlives their holders.
+
 ### A-777 — An idle shard keeps nothing pre-faulted; A-214's reserve removed (2026-11-20, w-sizing; MEMORY SIZING; amends A-105, removes A-214 and A-765)
 Applied in the same change to: `crates/server/src/daemon.rs` (the purge gives every free block back; the reserve, its
 refill and the burst measure gone), `state.rs`, `config.rs` (`prefault_slice_pages`, `page_fault_ns`),
@@ -57663,6 +57682,43 @@ volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardSt
   main: given up after 23 attempts waiting on its live, unserved through the serve deadline; after: judged afresh once,
   served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
   fleet tests unchanged.
+
+### §4.8 amended — A dispatch's stragglers are waited for by their own reports' wakes, never a tick or a poll interval at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family two of three)
+Applied in the same change to: §4.8 "Lookup" (a location round's stragglers), GAPS (the sweep's line),
+`crates/cluster/src/lib.rs` (`Stragglers::reported`, `waits`, `settle`, the collector kept), `crates/cluster/tests/live.rs`,
+`crates/server/src/owner_location.rs` (`ask`).
+- **What was there.** A dispatch's reply channel already wakes its collector, the task that dispatched, at every send
+  (`ReplyTx::send`), but the waits for its stragglers did not use it: `Stragglers::settle`, which a live lane runs
+  before its task ends, looked once a timer tick; a location round's straggler loop looked once a poll interval (a
+  tenth of a period, 10 ms), so a report landing just after a look waited out the rest of it.
+- **Change.** `Stragglers` keeps its collector's task, read where the dispatch made it. `Stragglers::reported(left)` waits
+  until a straggler may have reported: in the collector, until its next send wakes it (`futures::idle` within `left`);
+  in any other task, which the sends do not wake, one timer tick, as before. `settle` and the location round wait so;
+  the round stops once its span is spent. `Stragglers::waits` counts the waits each way, the test's non-vacuity count.
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20). `slates-cluster --test live
+  a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back` now holds the settle to its reports' wakes (woken
+  at least once, ticked never) as well as every session back; `slates-cluster --lib` 247 of 247. The server's
+  `owner_location` lib tests, fmt and the red (the collector's wake disabled: the lane test must fail on its ticks) ran
+  on a kiln runner, this Mac being at 7 GiB free; their results are in the landing's commit.
+
+
+### A-779 — A newer presentation of a volume into a target supersedes the older, whose grant is refused by kind (2026-11-20, w-sessionlog; main's ruling 15:20 PST; §4.15 steps 2–3; AUD-29-07, A-773, R3, R10)
+Until A-779 only the same client's re-presentation replaced its earlier one, in the shard's memory alone: the earlier
+record still read `AwaitingGrant` (so the session log listed it), and another client's re-presentation left it
+grantable. Now any presentation of the same volume into the same target supersedes the earlier ones awaiting a grant:
+`Op::LandingSuperseded { id, by }` moves each record to `LandingState::Superseded` with `superseded_by` (both
+appended), the partition's waiting index drops it, and `grant` answers `Refusal::LandingSuperseded { newer }`
+(`slates_api::Stale::Superseded`). The session log reads the shard's held presentations, which are exactly the
+grantable ones (an abandoned one, AUD-29-07, is not there either). No clock expires a presentation (R3).
+Applied in the same change to: §4.15 (a status line), GAPS (A-773's owed presentation item closed), `crates/db`
+(`Superseded`, `superseded_by`, `Op::LandingSuperseded`, its model step), `crates/ipc` (`LandingStage::Superseded`,
+`Refusal::LandingSuperseded`, tags published), `crates/api` (`Stale::Superseded`, `LandingStage::Superseded`),
+`crates/server` (`superseded_by_presentation`, the grant's refusal, the log's source), `crates/server/tests/
+presentations.rs` (the replaced presentation is refused by kind).
+Evidence: `cargo test --locked -p slates-server --test session_log` 2 passed, the new
+`a_newer_presentation_supersedes_the_older_whose_grant_is_refused` red with the supersede disabled (`Refused(NotFound)`)
+and green with it; `--test presentations` 10 passed; `-p slates-db --test model every_recovery` 2 and `--test
+wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe` 2 (macOS arm64, this Mac, local).
 
 ### A-781 — Without a birth time, an unchanged base file keeps its number across a takeover (2026-11-20, w-realtools; Ada's dispatch after the Slates-vs-Sapling comparison; amends A-151)
 - **What it answers.** EdenFS's own record (`eden/fs/docs/InodeStorage.md`): unstable inode numbers broke C++

@@ -1267,6 +1267,57 @@ fn kill_anchor_and_wait_for_the_daemon_to_leave(instance: &str, anchor: AnchorPr
   }
 }
 
+/// MEMORY SIZING (w-sizing; found by use on the big Studio, 2026-11-20: four anchors killed with `SIGKILL` held 21 GB
+/// with no process alive). Do: start an anchor, read its issuer surface for the names of its segment and its content
+/// object, `SIGKILL` the anchor and wait for its daemon to leave. Expect both names gone (`shm_open` answers `ENOENT`),
+/// so the objects and every page written into them go back to the system with their last holder. Before, nothing
+/// removed them: macOS keeps a shared-memory object while its name exists, and only the creator, the killed anchor,
+/// removed the name. Any name the test finds left is removed at the end, so a red run leaks nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_killed_anchors_segment_and_content_go_with_its_daemon() {
+  use rustix::fs::Mode;
+  use rustix::shm::OFlags;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("skipping the killed anchor's objects flow: set SLATES_TEST_CLI=1 to run it");
+    return;
+  }
+  let instance = format!("cli-objects-{}", std::process::id());
+  let (anchor, exports) = start_anchor_with_issuer_surface(&instance);
+  let exports = exports.expect("macOS prints the issuer surface");
+  let names: Vec<String> = exports
+    .iter()
+    .filter(|(name, _)| {
+      name == slates_anchor::segment::ENV_HANDOFF || name == slates_anchor::segment::ENV_CONTENT
+    })
+    .map(|(_, value)| value.clone())
+    .collect();
+  assert_eq!(
+    names.len(),
+    2,
+    "the segment's and the content's names: {exports:?}"
+  );
+  let present = |name: &str| rustix::shm::open(name, OFlags::RDONLY, Mode::empty()).is_ok();
+  assert!(
+    names.iter().all(|name| present(name)),
+    "both objects exist while the anchor lives"
+  );
+  kill_anchor_and_wait_for_the_daemon_to_leave(&instance, anchor);
+  let mut progress = process_wait::InstanceWait::new();
+  while !process_wait::instance_processes(&instance).is_empty() {
+    progress.check(&instance, "the daemon's process ended");
+    pause();
+  }
+  let left: Vec<&String> = names.iter().filter(|name| present(name)).collect();
+  for name in &left {
+    let _ = rustix::shm::unlink(name.as_str());
+  }
+  assert!(
+    left.is_empty(),
+    "the killed anchor's objects outlived every holder: {left:?}"
+  );
+}
+
 /// The whole flow through the binary: up, the verbs, the refusals, down with the anchor.
 /// The first five minutes, adversarially (a user who never read the docs): do start a fresh node and create a
 /// volume before bootstrapping it. Expect the create refused (exit 1) with the refusal's name, as scripts match it,
