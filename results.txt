@@ -1,0 +1,11 @@
+svn:// 35173, http 43717
+slates: refused: ConsensusNotInitialized: this node has no consensus group yet. Create it once with `slates bootstrap root`, or, on a fleet node, wait for it to import the groups.
+slates: refused: NotFound
+import exit 1 .005556117 s
+svn-checkout exit 1 .012171978 s
+svn youngest , files 0
+svn-update-500 exit 1 .010871779 s
+http-checkout exit 1 .011663057 s
+http youngest , files 0
+http-update-500 exit 1 .011069378 s
+1
