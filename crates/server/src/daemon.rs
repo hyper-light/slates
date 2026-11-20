@@ -4901,6 +4901,7 @@ async fn init_shard(
     vcs_stores: crate::vcs_store::VcsStores::default(),
     hook_times: crate::vcs_hooks::HookTimesTable::default(),
     pending_green_materializations: std::collections::BTreeMap::new(),
+    pending_repositories: std::collections::BTreeMap::new(),
   };
   // The mounts a predecessor kept that this partition's catalog names, recorded as this daemon's own before anything
   // below reacquires a base or resumes a landing (A-227); then this shard's learning ends, and the process's crossing

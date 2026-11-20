@@ -14701,3 +14701,43 @@ What stops the larger datasets (each found by use, reported to its owner, and ow
   `slates repository import` of the same repository is refused `PastRoom { room: 278528 }` (w-hg).
 - Subversion 5,000-revision dump: the import stops at 1,685 revisions, `TableAtCapacity { table: "green_chains" }`,
   with the daemon at 3,390 MiB (main 9ea6e1311; w-svn).
+
+## Where the svn server's time and memory go, ranked (A-699 piece 3; UI goal 93; 2026-11-20)
+
+Mac Studio (as above), release main bc2803d66, git/git's newest 250 and 1,000 first-parent commits as dumps (85 and
+223 MiB). Time: `/usr/bin/time -p` on the client and the server process's CPU before and after (`ps -o time`;
+`svnserve -T`, one process). Memory: `footprint`, and the live heap by allocation stack (`MallocStackLogging=1` on the
+anchor, which the daemon inherits; `malloc_history PID -allBySize` after the import). `slates status` has no memory
+counters.
+
+**Time: checkout, commit and update are client-bound.** A 1,000-revision trunk checkout (4,872 files) takes about
+4.2 s of wall time against either server: the client spends 0.48 s in user time and 2.78 s in the kernel writing its
+working copy. The server's share is 0.12 s of slates CPU against 0.56 s of `svnserve` CPU, 4.7 times less. A whole
+`log -q` costs neither server measurable CPU (0.00 against 0.02 s). Ten times at the client's wall clock is out of
+reach on these operations; the server's share is what slates is measured on there.
+
+**Memory: footprint after the import.** 250 revisions: about 920 MB. 500: about 2,060 MB. 1,000: about 2,430 MB
+(MALLOC_LARGE 867, MALLOC_SMALL 842, VM_ALLOCATE 585, MALLOC_REALLOC 136 MB). Live heap by stack, 250 to 1,000
+revisions:
+
+| Holder | 250 | 1,000 | Shape |
+|---|---|---|---|
+| svn records' texts (`Repository.contents`, allocated in `Importer::import`) | 120.1 MiB | 305.6 MiB | 1.37x the dump; every text whole |
+| register's repository records (`Repositories::apply_advanced`) | 86.5 MiB | 244.7 MiB | ~245 KB a revision |
+| merge engine, svn commits (`Green::commit`) | 67.1 MiB | 234.8 MiB | ~235 KB a revision |
+| merge history (`Value::whole`) | 51.9 MiB | 50.3 MiB | flat |
+| green checkpoint (`apply_green_checkpoint`, 2 allocations) | 46.8 MiB | 46.5 MiB | flat |
+| `Partition::apply_repository` | 39.7 MiB | 45.2 MiB | flat |
+
+Virtual only (reserved, not dirty): the timer wheels, 898 MiB (39 MiB a shard); the segment's and content pool's maps.
+The content pool's dirty pages are the files the greens hold: 222 MB at 250 revisions and 585 MB at 1,000.
+
+Ranked plan, each owed:
+- M1, the register's ~245 KB a revision. Linear, not quadratic; it is data for w-svn's charging of a repository's
+  content to its shard, and needs no separate fix.
+- M2, every svn text held twice: whole in the svn records (`crates/svn/src/migration/records.rs`, `contents`) and
+  again as the green's files in the content pool. One store would save about 1.4 times the dump's bytes. Main's ruling
+  is owed.
+- M3, the merge engine's ~235 KB a revision under `Green::commit`, likely retention of work already durable.
+- M4, the green checkpoint's whole-green copy (47 MiB in two allocations).
+- M5, fixed per daemon: the timer wheels' 898 MiB reservation, the segment's 43 MiB unit set, 47 MiB of thread stacks.

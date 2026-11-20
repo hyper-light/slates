@@ -1337,6 +1337,11 @@ pub struct ShardState {
   /// held inputs. Each carries the attempts made, which `fleet::materialize_pending_greens` bounds. Bounded by the
   /// objects this node owns; empty on a laptop.
   pub pending_green_materializations: BTreeMap<ObjectId, PendingGreen>,
+  /// The repositories this node took over whose records it adopted (A-636 part 2c-1): each repository's own register,
+  /// with the sequence adopted and the record it held, kept until the repository is rebuilt from it and its state logs
+  /// (part 2c-2). Bounded by the repositories this node owns, at most a partition's volume capacity a partition; empty
+  /// on a laptop.
+  pub pending_repositories: BTreeMap<ObjectId, (u64, slates_db::catalog::RepositoryRecord)>,
   /// Taken-over volumes whose register this node adopted as a **tombstone** (AUD-29-43), each with the tombstone's
   /// sequence and the attempts to record it: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where
   /// the record plane ships the tombstone's remaining stages. Never materialized. One given up on past the failover
