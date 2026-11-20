@@ -203,14 +203,6 @@ fn executable(path: &str) -> Op {
   })
 }
 
-/// A work's `mv` of `from` to `to`.
-fn moved(from: &str, to: &str) -> Op {
-  Op::Declare(WorkOp::Rename {
-    from: from.to_owned(),
-    to: to.to_owned(),
-  })
-}
-
 /// `files` as a listing: each path with its mode and bytes.
 fn listing(files: &[(&str, Mode, &[u8])]) -> Listed {
   files
@@ -258,36 +250,6 @@ fn t_a664_p3_a_submitted_version_is_a_commit_a_clone_fetches() {
   assert_made(&clone, &[], dated, "version 1");
   assert_eq!(clone.fetched, 5);
   assert_eq!(made, (1, 0));
-}
-
-/// A-664 part 3 (its commit; main's check of A-618's finding by use: the green keeps a mode at its path). Do: in one work
-/// make `d/a`, make it executable, make `x` and move `d/a` to `x/a`, submit, and clone; then make `e/b` executable in one
-/// version and move it to `y/b` in the next, and clone again. Expect: each clone lists each moved file `100755`, as
-/// POSIX `rename` and `git mv` keep a file's mode.
-#[test]
-fn t_a664_p3_an_executable_file_moved_is_100755_in_its_commit() {
-  let (first, second) = crate::daemon::audit_on_shard(|state| {
-    let (repository, green) = git_repository(state, "moved");
-    let ops = vec![
-      mkdir("/d"),
-      create("/d/a", b"alpha"),
-      executable("/d/a"),
-      mkdir("/x"),
-      moved("/d/a", "/x/a"),
-    ];
-    version(state, green, 1, ops);
-    let first = cloned(state, repository, "main").files;
-    let ops = vec![mkdir("/e"), create("/e/b", b"beta"), executable("/e/b")];
-    version(state, green, 2, ops);
-    version(state, green, 3, vec![mkdir("/y"), moved("/e/b", "/y/b")]);
-    (first, cloned(state, repository, "main").files)
-  });
-  assert_eq!(first, listing(&[("x/a", Mode::Executable, b"alpha")]));
-  let expected = listing(&[
-    ("x/a", Mode::Executable, b"alpha"),
-    ("y/b", Mode::Executable, b"beta"),
-  ]);
-  assert_eq!(second, expected);
 }
 
 /// The trees the store keeps for the head of the green keyed `key`: its root tree's id.

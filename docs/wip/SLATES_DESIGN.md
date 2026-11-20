@@ -12173,6 +12173,20 @@ is one more version, and the chain itself is never rewritten.
 > from the head by a recovery, so the store after a recovery equals the store before (A-662). Owed: the commit derived
 > from these maps, recorded with the version and admitted to the git store (part 3's commit), Mercurial's and
 > Subversion's.
+>
+> **Status (2026-11-19, A-664 part 3, its commit: item 3's commit made, recorded and admitted).** Each version a work
+> submits to a git repository's green becomes the commit the server makes (`crates/server/src/vcs_store/commits.rs`), in
+> the submit's own step on the owner, after its verdict: over the version's git trees, which the green keeps beside its
+> map, made in the same step over the same change (`vcs_store::paths`); its parent the commit of the version before as
+> git's history reads it (the green's newest commit, pushed or made; for a branch `CreateBranch` made, the commit it was
+> made at); the session's git identity as author and committer, dated at the owner's instant in UTC; the submit's
+> message. Its objects are admitted to the repository's store through a push's own steps and recorded by a push's
+> record, in an entry of the repository's register holding the record alone, appended in the version's own transaction,
+> so the version and its commit are one durable atom and a recovery makes every made commit again (A-662). The green's
+> ref names it, so a stock client's clone fetches native work (A-682's lender). A commit git would refuse (a NUL in the
+> message) or the budget refuses is not made and is counted; the version stands, and its successor's commit holds both.
+> Owed: the holders' commits (the merge record carrying the message, the identity and the time), a submit refused
+> before its verdict when git cannot hold its message or its post-state, Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -12921,6 +12935,13 @@ engine: the verdict, rebase, position mapping, the register).
 > the change between two kept maps. Part 1 is built too (A-664 part 1). Owed: the trees and the commit made from these
 > maps, admitted with the green's head moved and recorded with the version.
 >
+> **Status (2026-11-19, A-664 part 3, its commit: piece 13's made commits in the store).** Built: each git green keeps
+> its head's `Trees` value beside its map, made in the same step over the same change; a submitted version's commit made
+> over it (`Commits`), its objects the repository lacks admitted to A-614's store through a push's steps and recorded by
+> A-662's record in an entry of the register holding it alone, the green's ref moved to it in the store
+> (`vcs_store::commits`, §4.17.1's status), so upload-pack lends it. Owed: Mercurial's changesets and Subversion's
+> revisions by the same rule; the holders' commits.
+>
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
 > (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
@@ -13556,7 +13577,8 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
     A-664: part 2 built, a version's trees and commit as derived types; part 1 built, the principal's identities and
     `MessageRequired` and `IdentityRequired` at submit; part 3's first piece built, each green's map of paths to git's
-    files kept at its head (`vcs_store::paths`); the made commit recorded and admitted, owed.)
+    files kept at its head (`vcs_store::paths`); part 3's commit built, each submitted version's commit made over its
+    git trees, recorded as a push's objects are and admitted (`vcs_store::commits`); the holders' commits owed.)
 14. A v0 and v1 fetch for older clients; `packfile-uris` and `bundle-uri`.
 15. Import of a bare repository on disk as a base (its loose objects, packs and indexes, read-only, §4.15); export by
     landing.
