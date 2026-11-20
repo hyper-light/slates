@@ -55,6 +55,17 @@ pub(crate) struct Sweep {
   done: Option<[Residency; RANGES.len()]>,
   /// Sweeps completed.
   sweeps: u64,
+  /// What a page cost the last step past its fixed part, nanoseconds (zero until a step is measured).
+  ns_per_page: u64,
+  /// A step's fixed cost, nanoseconds: the cheapest step seen; zero until measured.
+  ns_fixed: u64,
+  /// Advances that crossed their budget on a step of more than one page: the sizing's failure, zero in every correct
+  /// use (a one-page step that alone outlasts the budget is the least step, not a failure).
+  past_budget: u64,
+  /// The longest advance, nanoseconds.
+  longest_ns: u64,
+  /// The longest single step, nanoseconds: what an advance may pass its budget by at most.
+  longest_step_ns: u64,
 }
 
 /// One mapped range the sweep walks: a range of the content object, or a region of the arena.
@@ -164,21 +175,21 @@ fn residency(
       .region(*id)?
       .residency_of(offset, len)
       .ok(),
-    // A segment region is measured whole in one step: the segment answers by region, and its regions are the
-    // partition's log ring and snapshot slots, each a fraction of the content slice.
-    Target::Segment { kind, .. } if offset == 0 => state.segment.region_residency(*kind).ok(),
-    Target::Segment { .. } => None,
+    Target::Segment { kind, .. } => state.segment.region_residency_of(*kind, offset, len).ok(),
   }
 }
 
 /// Advances the sweep for at most half the shard's step quantum (module docs, "Bounded"); at most one sweep completes.
 fn advance(state: &mut ShardState) {
   let budget = state.config.step_quantum_ns() / 2;
-  let began = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
   let page = state.config.page.max(1);
-  // Derived: a vector page of pages a call to the kernel ([`slates_mem::resident::of_range`]'s own batch).
-  let step = page.saturating_mul(page);
+  // Derived: at most a vector page of pages a step ([`slates_mem::resident::of_range`]'s own batch), and fewer: a step
+  // costs a fixed part (the cheapest step seen: a kernel call and two clock reads) and a part a page, so it walks as many
+  // pages as the budget left holds past the fixed part (one while nothing is measured).
+  let most = page;
+  // The targets first: a handful, built in constant time; the budget's clock starts at the first step.
   let targets = targets(state);
+  let began = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
   loop {
     let (index, offset) = state.content_sweep.at;
     let Some(target) = targets.get(index) else {
@@ -188,14 +199,30 @@ fn advance(state: &mut ShardState) {
       sweep.at = (0, 0);
       return;
     };
-    // A segment region is one step whole (the segment answers by region); the object's ranges and the arena's regions
-    // a vector page of pages at a time.
-    let len = match target {
-      Target::Segment { .. } => target.len().saturating_sub(offset),
-      _ => target.len().saturating_sub(offset).min(step),
+    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    let left = budget.saturating_sub(now.saturating_sub(began));
+    let fixed = state.content_sweep.ns_fixed;
+    let pages = match state.content_sweep.ns_per_page {
+      0 => 1,
+      cost => usize::try_from(left.saturating_sub(fixed) / cost)
+        .unwrap_or(usize::MAX)
+        .clamp(1, most),
     };
+    let len = target
+      .len()
+      .saturating_sub(offset)
+      .min(pages.saturating_mul(page));
     let found = residency(state, target, (offset, len));
+    let after = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
     let sweep = &mut state.content_sweep;
+    let walked = u64::try_from(len.div_ceil(page).max(1)).unwrap_or(u64::MAX);
+    let took = after.saturating_sub(now);
+    sweep.longest_step_ns = sweep.longest_step_ns.max(took);
+    sweep.ns_fixed = match sweep.ns_fixed {
+      0 => took,
+      seen => seen.min(took),
+    };
+    sweep.ns_per_page = (took.saturating_sub(sweep.ns_fixed) / walked).max(1);
     if let (Some(found), Some(sum)) = (found, sweep.partial.get_mut(target.range())) {
       *sum = if sum.bytes == 0 && sum.modified.is_none() {
         found
@@ -209,8 +236,24 @@ fn advance(state: &mut ShardState) {
     } else {
       (index, next)
     };
-    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
-    if now.saturating_sub(began) >= budget {
+    let elapsed = after.saturating_sub(began);
+    sweep.longest_ns = sweep.longest_ns.max(elapsed);
+    if elapsed >= budget {
+      // The budget is checked after every step, so an advance passes it by at most the step that crossed it, and a step
+      // is at most one kernel batch: past by more than a whole batch's cost at the measured rates is the bound broken.
+      let batch = sweep.ns_fixed.saturating_add(
+        sweep
+          .ns_per_page
+          .saturating_mul(u64::try_from(most).unwrap_or(u64::MAX)),
+      );
+      // The host's scheduling noise allowed for, as the runtime measures it (its timer overrun): a thread preempted
+      // between two steps is the host's time, not the sweep's.
+      let noise =
+        slates_rt::registry::with_current(|context| context.counters().scheduler_overrun_ns)
+          .unwrap_or(0);
+      if elapsed.saturating_sub(budget) > batch.max(sweep.longest_step_ns).saturating_add(noise) {
+        sweep.past_budget = sweep.past_budget.saturating_add(1);
+      }
       return;
     }
   }
@@ -259,6 +302,14 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
     format!("{PREFIX}sweep.completed"),
     state.content_sweep.sweeps,
   ));
+  rows.push((
+    format!("{PREFIX}sweep.past_budget"),
+    state.content_sweep.past_budget,
+  ));
+  rows.push((
+    format!("{PREFIX}sweep.longest_ns"),
+    state.content_sweep.longest_ns,
+  ));
   rows
     .into_iter()
     .map(|(kind, count)| RefusalCount { kind, count })
@@ -271,42 +322,48 @@ mod tests {
 
   use super::*;
 
-  /// Shape: a shard reserve small enough that its slice sweeps in a few steps.
-  const SMALL_SLICE_RESERVE: u64 = 64 << 20;
-
-  /// A-744. Do: on a shard with a small reserve, ask the report again and again until a sweep completes (a bounded number of times: the
-  /// slice's bytes over one step each, plus one). Expect: a sweep completes; the arena's measured bytes are its regions'
-  /// lengths; every range's resident and written bytes are within its own bytes; the counter of sweeps moved.
+  /// A-744 (main's ruling: bounded a step at a time). Do: on a running daemon, ask the shard's report once a poll, as
+  /// status requests do, until a sweep completes (at most one request a page of the slice, plus one per target).
+  /// Expect: a sweep completes within that bound; the arena's measured bytes are its regions' lengths; every range's
+  /// resident and written bytes are within its own bytes; no advance crossed its budget on a step larger than one page
+  /// (the sweep's `past_budget` at 0: each step sized to the budget left); and the longest advance far inside the
+  /// watchdog's window. Before, the test asked every report inside one poll, a step was a fixed batch of 16,384 pages and
+  /// a segment region one step whole: a debug shard spun 3.2 s in one poll (w-perf); with one report a poll but a fixed
+  /// batch, every advance ran past its budget. (The runtime's `long_steps` is no measure here: the debug audit daemon's
+  /// live quantum is 3.2 us, which no status report's own rows fit; 200 no-op observes counted 6, 200 reports 200.)
   #[test]
   fn a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes() {
-    // A small slice, so the whole sweep is a few steps even in a debug build: the test asks again and again inside one
-    // closure on the shard, and a slice the size of the machine's share spun a debug shard past its liveness window.
-    let found = crate::daemon::audit_on_shard_configured(
-      |state| {
-        let page = state.config.page.max(1);
-        let step = page.saturating_mul(page);
-        let total: usize = targets(state).iter().map(Target::len).sum();
-        let bound = total / step + targets(state).len() + 1;
-        let mut asked = 0;
-        while state.content_sweep.sweeps == 0 && asked < bound {
-          report(state);
-          asked += 1;
-        }
-        let arena_len: usize = targets(state)
-          .iter()
-          .filter(|target| target.range() == ARENA)
-          .map(Target::len)
-          .sum();
-        (
-          state.content_sweep.sweeps,
-          state.content_sweep.done,
-          arena_len,
-        )
-      },
-      |config| config.reserve_per_shard = SMALL_SLICE_RESERVE,
-    );
-    let (sweeps, done, arena_len) = found;
-    assert!(sweeps > 0, "no sweep completed within its bound");
+    let daemon = crate::daemon::audit_daemon();
+    let (bound, arena_len) = crate::daemon::observe_first(&daemon, |state| {
+      let page = state.config.page.max(1);
+      let targets = targets(state);
+      // The worst case: a step of one page a request (each step is sized to the budget left).
+      let total: usize = targets
+        .iter()
+        .map(|target| target.len().div_ceil(page))
+        .sum();
+      let arena_len: usize = targets
+        .iter()
+        .filter(|target| target.range() == ARENA)
+        .map(Target::len)
+        .sum();
+      (total + targets.len() + 1, arena_len)
+    });
+    let mut asked = 0;
+    let mut sweeps = 0;
+    while sweeps == 0 && asked < bound {
+      sweeps = crate::daemon::observe_first(&daemon, |state| {
+        report(state);
+        state.content_sweep.sweeps
+      });
+      asked += 1;
+    }
+    let (done, past_budget, longest_ns) = crate::daemon::observe_first(&daemon, |state| {
+      let sweep = &state.content_sweep;
+      (sweep.done, sweep.past_budget, sweep.longest_ns)
+    });
+    daemon.stop();
+    assert!(sweeps > 0, "no sweep completed within {bound} requests");
     let done = done.unwrap();
     assert_eq!(done[ARENA].bytes, u64::try_from(arena_len).unwrap());
     for found in done {
@@ -318,5 +375,13 @@ mod tests {
         "{found:?}"
       );
     }
+    assert_eq!(
+      past_budget, 0,
+      "an advance's step was sized past its budget"
+    );
+    assert!(
+      longest_ns < crate::daemon::LIVENESS_BUDGET_NS,
+      "an advance held the shard {longest_ns} ns, past the watchdog's window"
+    );
   }
 }
