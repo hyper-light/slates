@@ -86,3 +86,9 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   record, split by doubling, push rows committed by owner's landing record). LANDED docs 3471c18a2. Note: config.rs
   snapshot_bytes = 2 x table_bytes is the current boot derivation.
 - Queue: P3b (after w-git), P4 cold trigger, P5, P6 (ruling), P7, P8, P9.
+- Main's rulings: P6 approved (owner keeps register/landing/tails/fences/hot set; cold content homed by identity,
+  f+1, fetched by id, durable before naming record; amend §4.10 same change; agree replication with w-fed-move,
+  w-fed-faults, w-shared via main FIRST). Seam approved and sent to w-git; bound+words in admission.rs/report.rs
+  after A-722 lands.
+- P4a LANDED fbb5d5f8b; P4b LANDED 87edaacb6 (merge d6673b719). Questions for P6 in inbox/goal91-w-shared-from-w-balance.md.
+- NEXT: P5 (intake work off the owner shard; content homed by identity across a node's shards, N=1).
