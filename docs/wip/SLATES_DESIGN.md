@@ -11283,6 +11283,15 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
 >   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
 
+> **Status (2026-11-20, A-728 part 1: the history's latest value names the file's block).** A content history chunk
+> is owned bytes or a file's block of the files' arena, holding one holder of it (`crates/merge/src/history.rs`,
+> `Source`). A value stored whole (a path's first change, its bytes before its first recorded change, a checkpoint's
+> restored file, and a change that shares no run with the value before it, which every push and import is) names the
+> file's block instead of copying it, so a changed file is held once; the file map letting the block go at the next
+> change leaves it held as the earlier version's bytes, nothing copied. A retired lineage member gives its chunks' holds
+> back a chunk a step (`Release`). Counted: `Green::history_blocks_named`. Owed (part 2): a splice's added runs named
+> in the new block too, copied out only when the value is superseded.
+
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
 > which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
@@ -54520,3 +54529,37 @@ version-2 record through git's own reader, `StoreBases`, `ReplayRefused::Pack`, 
   3,540); the objects the repository already holds left out of the recorded pack; the push_load re-run at N = 1, 10 and
   100 once S1 and S3 are in, against today's 229 MiB a push.
 
+
+### A-728 — A green's content history names the file's block: a changed file's bytes held once (2026-11-20, w-engine; step S2 of A-723's content-once plan; §4.16 "The history" (A-242's status), D-28, §4.11; A-242, A-534, A-575, A-716, A-723)
+
+Applied in the same change to: `crates/merge` (`history.rs`: a chunk's `Source`, `Value::named`, `spliced` answering
+`None` for a value stored whole, every read taking the blocks; `dims.rs`: `Files::blocks`, `blocks_mut`;
+`engine.rs`: `set_file` stores the file before its value, `seed_content`, `restore_file` and `content_value` name the
+block, `Green::history_blocks_named`, `history_owned_bytes`; `engine/branch.rs`: `Release` gives the history's chunks
+back a step at a time); §4.16's status; GAPS (§4.17, A-723).
+
+- **Why.** A green held a changed file's bytes twice: in the file's block, which the green's maps name, and in its
+  content history's chunk, which the next change splices from. A whole replace (every git and Mercurial push, every
+  Subversion import) copied the whole file; a Subversion import of 1,000 revisions held 234.8 MiB of chunks beside
+  about 585 MB of blocks (A-723, w-perf).
+- **The rule.** Reads at a path's latest version are the head's already (`content_read`), so the history's latest value
+  is only the base the next change shares runs of and the verdict's head value. A value stored whole names the file's
+  block as its one chunk, holding one holder of it in the same counts the maps and the identity table (A-716) use. When
+  a later change replaces the file, the map lets the block go and the history's hold keeps it, now the earlier
+  version's bytes: what the old file was is what that version is, so nothing is copied either way. A splice keeps
+  sharing runs; its added bytes are still copied into a chunk of its own (part 2 names them in the new block).
+- **Lifetimes.** The blocks are the lineage's arena, lent with a member; the chunks are the green's. A member is read
+  and written only while lent, so a block a chunk names is in the arena at hand. A branch starts with no history. A
+  fold drops values and their chunks let their blocks go into the same arena. A retired member's chunks go into its
+  `Release` and are given back a chunk a step before its maps' nodes, so a lineage with every member retired holds no
+  block (the branch oracle's check).
+- **Recovery and replication.** Nothing new is persisted: a checkpoint materializes its values as before, a restore
+  names the file it placed, and a replay rebuilds the history through `set_file`. Reads stay contiguous: a file is its
+  block; an earlier version is materialized from its pieces.
+- **Evidence.** macOS arm64, Mac Studio, local: `slates-merge --lib` 221 of 221, with
+  `a_whole_value_names_the_files_block_and_the_history_owns_no_copy` (a create and a whole replace name two blocks,
+  128 KiB, and the history owns no byte; a small overwrite owns its 8 bytes; every version reads back; the running
+  totals equal their recount) and `a_value_named_by_a_files_block_copies_nothing_and_keeps_the_block_while_named`;
+  integration `engine`, `checkpoint`, `chain_replay`, `rebase`, `splice`, `verdict`, `base_for` green; fmt clean.
+- **Owed.** Part 2: a splice's added runs named in the new block, copied out when the value is superseded. Part 3: the
+  1,000-revision Subversion profile (`crates/cli/bench/svn_scale.sh`) before and after, in BENCHMARKS.md.
