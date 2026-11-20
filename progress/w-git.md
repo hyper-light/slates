@@ -54,3 +54,38 @@
   Main: no hold_bytes, no new store; keeping client deltas compressed in the EXISTING ContentStore is OK; convergence
   plan from w-perf decides blobs later. Next: part 3 = session/driver keep straight into the quarantine as the pack is
   read (removes reader + Checked in-RAM copies; admit_all gone), checks reading objects back from the store.
+- S3 claimed A-722 (ledger c112181). Plan sent to main: (1) A-719 part 3 now, (2) verdicts+seal sliced, (3) S3 after
+  w-perf's S2 (blob-before-tree: keep compressed entry in index charged to window, typed refusal past it).
+- PART 3 DESIGN (in progress, worktree w-git-pushspin, branch agents/w-git-pushspin):
+  slates-git: unpack: split `Contents` (content(at,id)) out of `Keep`; receive: `Pushed{objects:&[Placed], by_id,
+  contents:&dyn Contents}`, object() -> (Kind, Cow); Checked/Received.unpacked = Option<Result<Kept,PackRefused>>;
+  check()/decide() take contents; Checking fsck + Walk read via contents; Session takes a combined site
+  (Keep+Contents+Repository) in *_into variants, old methods use session's own Held; receive() uses Held.
+  server: git_push keeper over (&mut ContentStore, &GitStore, &mut GitPush) implementing Keep+Contents+Repository
+  (+Outside via Bases); GitPush held from pack start; prepare = seal only; abandon when all refused.
+- Part 3 slates-git side done (local wip commit on agents/w-git-pushspin, not pushed): Contents/Keep split,
+  finish_into(K: Keep+Outside), Unpacked::into_kept, Pushed{objects:&[Placed],contents:Option<&dyn Contents>},
+  Checked/Received.unpacked = Kept, Session input_into/end_into/check_turn_with/decide_with/answer_with + kept(),
+  works::PushedBytes (PushedObjects impl). slates-git --lib all green. Next: server git_push queue keeper.
+  Land: fresh worktree from origin/main + cherry-pick -n + real message (wip must not reach main).
+- Part 3 squashed as 3105843fe on agents/w-git-a719p3-land (worktree ~/slates-work/w-git-land), merged origin/main
+  (conflicts with A-723 S1 session pack retention + A-724 vcs_share room/Live: both kept; prepare keeps the pack on the
+  sealed push). Merged tree: git 159/159; server focused 153 pass, my t_a719 bound fixed for A-723's kept pack (passes),
+  vcs_ssh::tests::hg::stock_7_2s_push_over_ssh fails "a step that waits" -> checking on clean origin/main (worktree
+  w-git-maincheck, log msgs/w-git-maincheck-hg.log). Merge commit not yet made (changes staged in w-git-land).
+- main/w-balance seam for A-722 accepted: vcs_share::room(state, repo) -> Room{bytes,bound}; keep vcs_share::Live.
+- A-719 part 3 LANDED main baf0fd76a (3105843fe + merges). Worktrees: w-git-land (landed, clean); w-git-pushspin
+  removed. Target trimmed to 20G (incremental + stale .rcgu.o). Reported: hg ssh push test fails on clean main.
+  NEXT: verdicts + seal sliced (A-719 part 4), then S3 (A-722) on main/w-balance's vcs_share::room seam.
+- Measured append (9k objects debug): commit 159ms, moves admit 54ms, seal 26ms, verdict 2ms. Main APPROVED folding
+  into A-722: done = index rows staged in slices as objects land (append only makes visible), moves' admission + seal
+  sliced, landing O(changes), push on vcs_share::room seam. Proof: w-interop v2.0.0 cut (36,430 commits, 56MB) then
+  git/git, no watchdog kill, RSS per push. Design note (~20 lines) to main after the read (Explore agent surveying
+  merge push/work + git store APIs). Worktree ~/slates-work/w-git-land at origin/main 2fb7d49b3 (clean).
+- S3 survey (Explore): blockers for "blobs only in the green": (1) upload-pack/encoding/sparse/hook views read blob
+  bytes via ContentStore::object_bytes(row ContentId); (2) Repository::commit/locate/fresh need every object in Push
+  quarantine; (3) merge has no op setting a path from a held identity (w-perf slice 1b owed); build copies blob bytes
+  into Increment.post_state; one work per ref, not per commit; (4) held table not checkpointed (1c owed); (5) recovery
+  replays recorded pack into ContentStore; paths::put_file copies blobs into ContentStore. Design note owed to main.
+- TOP PRIORITY (main): git/git push spin. Doing: slates-git receive::Deciding (one command a step; decide() = same
+  machine whole) DONE (builds); next server AnswerState::Deciding + hooks path; then seal sliced; then staged commit.

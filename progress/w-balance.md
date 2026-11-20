@@ -65,3 +65,64 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   forgets); docs §4.17.5 + A-724 log entry + GAPS line. Target ~/.cache/w-balance-target. Clone ~/slates-work/w-balance.
 - NEXT: P2 share model (pure module in slates-vcs: decayed rates, SHARDS MRC, utility split + floor, DRF weights) with
   a serial reference-allocator oracle.
+- P2 division LANDED main 4bbf7f4ba (merge abc2722e0), merge-base checked: crates/vcs/src/share.rs (divide, Claim,
+  Granted). share tests 4/4 (oracle 500). Found+fixed: zero-room unused resource stopped claims at level 0.
+- NEXT (P2b+P3): server side. Per shard: claims from vcs_usage rows + held bytes (objects_charged, store) -> divide
+  over [admittable room, step-ns per period]; admission by share in git_push::push_room / upload room; typed
+  ShareExceeded in git's words; floor fast path counted.
+- P3a LANDED main 08b440739 (merge-base checked; pushed as f2a3a04fa after re-running focused tests on the merged
+  tree, since the merge touched git_push.rs). crate::vcs_share (room, Live, Bound, Room; counters vcs_share.fast /
+  divided / narrowed). Seam proposal to w-git: inbox/w-git-from-w-balance.md (A-722 checks vcs_share::room, carries
+  Bound into its typed refusal; share words). Found (pre-existing on main b0655e8a3, reported, not chased):
+  vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it panics "a step
+  that waits".
+- Gotcha: a second worktree built into my target dir left stale slates-vcs artifacts (E0432 on new exports); touching
+  the crate's files fixed it. Prefer not to share the target across worktrees.
+- NEXT: P3b (once w-git answers or A-722 lands): share words per tool; hg/svn intakes Live; backpressure. Meanwhile P4
+  cold trigger design.
+- Main's input (w-perf): snapshot slot 746,962,928 B fixed at boot; ~41 B/object after A-727. Designed P8 (snapshot
+  names sealed index tables by identity; slot derived per snapshot, grown by re-laid segment at handoff, typed
+  SnapshotRoom refusal) and P9 (index cut into 2^b ranges by object id, rendezvous over (family, range), b in the
+  record, split by doubling, push rows committed by owner's landing record). LANDED docs 3471c18a2. Note: config.rs
+  snapshot_bytes = 2 x table_bytes is the current boot derivation.
+- Queue: P3b (after w-git), P4 cold trigger, P5, P6 (ruling), P7, P8, P9.
+- Main's rulings: P6 approved (owner keeps register/landing/tails/fences/hot set; cold content homed by identity,
+  f+1, fetched by id, durable before naming record; amend §4.10 same change; agree replication with w-fed-move,
+  w-fed-faults, w-shared via main FIRST). Seam approved and sent to w-git; bound+words in admission.rs/report.rs
+  after A-722 lands.
+- P4a LANDED fbb5d5f8b; P4b LANDED 87edaacb6 (merge d6673b719). Questions for P6 in inbox/goal91-w-shared-from-w-balance.md.
+- NEXT: P5 (intake work off the owner shard; content homed by identity across a node's shards, N=1).
+- Cleared ~/.cache/w-balance-target/debug/incremental (7.6 GB) per main.
+- P5a LANDED 129cd0d1b: vcs_store::homes (home_of, keep_here/read_here/let_go_here, async home/read/let_go),
+  db register rendezvous_weight_of + rendezvous_ranked_by_key (outputs unchanged, register:: 93/93).
+- Main's answers: Q2 yes (move moves register + hot set; cold stays at identity homes); Q4 agreed (no coordination).
+  Q1 (w-shared), Q3 (w-fed-faults): no reply in inbox yet.
+- NEXT: P5b = cold lever 3 (move a repository's cold windows to homes; stores read through) needs a read-through seam
+  in ContentStore/git store (crates w-perf/w-git own) -> propose seam; intake decode on ingress shard waits on A-722.
+  Meanwhile P7 harness (push_load.py many repos) can proceed.
+- dcb6a0406 LANDED: §4.10 amended (content homed by identity), from worktree ~/slates-work/w-balance-land (clean
+  origin/main) since local w-balance main holds wip bench commit 1e84630b1 (branch agents/w-balance-load; must be
+  re-landed via fresh worktree with real message).
+- P7: harness crates/cli/bench/multi_repo_load.py on agents/w-balance-load; release built on .local-2 at
+  ~/.cache/w-balance-target/release/slates (src ~/.cache/w-balance/src). run1: alone 0.228/0.705/3.174 s for
+  v0.99/v1.0.0/v1.5.0 holding 70/183/777 MiB; v2.0.0 push KILLS the daemon (run-requests). run2 (3 classes) r7 running.
+- w-perf seam proposal sent via agents_send (id 01a1f722b428761c9ae0225a84cc3b41) + inbox/w-perf-from-w-balance.md;
+  w-perf replies in inbox/w-perf-w-balance-homes.md.
+- P7 LANDED 489398c9a (harness + BENCHMARKS row + design log line), from worktree ~/slates-work/w-balance-land.
+  run3 (.local-2, release 1e84630b1): R=1/10/100 all ok; R=100 small p99 14.1x alone, medium 6.8x, hot 11.3x;
+  R=1000 estimate 202 GB > 30 GB free. Logs on .local-2 ~/.cache/w-balance/run{1,2,3}.log.
+- RULE FOR ME NOW: ~/slates-work/w-balance's local main holds wip commits 1e84630b1 + 7614bfe (bench, landed by content
+  in 489398c9a). NEVER push from that clone's HEAD. Work only in ~/slates-work/w-balance-land (worktree, detached,
+  fast-forward it from origin/main before each piece).
+- NEXT: P3c CPU share: each shard's step quanta scheduled fairly by repository (WFQ / DRF CPU dimension), proven by
+  rerunning multi_repo_load R=100 (target: small class p99 near alone). Then P5b/A-727 seam with w-perf, P6 region
+  half (Q3), P8, P9.
+- 9e9cfbd58 LANDED (from worktree ~/slates-work/w-balance-land2): homes ticket/published; share tolerance from
+  Higham gamma_k (w-lint item done); P3c fair turns rejected (BENCHMARKS "Fair turns by repository on a shard"):
+  branch agents/w-balance-cpu fdfcf2421 holds the rejected code. run4 log on .local-2 ~/.cache/w-balance/run4.log.
+- w-perf agreed seam (kiln message): ticket+published first (DONE, told it), batch forms after its a3.
+- Worktrees now: ~/slates-work/w-balance (local main has wip commits: never push from it), ~/slates-work/w-balance-land2
+  (detached at 9e9cfbd58; fast-forward from origin/main before each piece).
+- NEXT: profile the R=100 step to find why toys wait 14x (sample the daemon on .local-2 during the burst: `sample`
+  per shard, or a slates status counter dump), then fix by evidence. Then batch forms (after a3), P6 region half
+  (Q3), P8, P9.

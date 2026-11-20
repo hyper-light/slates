@@ -105,3 +105,51 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   control as backpressure.
 - NEXT: S1: read crates/server/src/vcs_store/record.rs (RecordWriter, record_of) + repository/push.rs + db entry.rs;
   git entry record: keep moves + non-blob objects; blobs named by id, bytes in store; replay path reads them.
+- A-723 S1 LANDED main de50bf0f5 (claimed on ledger 9f52804): git record v2 = names + pack as sent (Session::take_pack;
+  pack::of_whole for server commits); replay via unpack reader (StoreBases, ReplayRefused::Pack); v1 still read.
+  Tests local: server vcs_store:: git_push 58/58 on landed tree; git receive:: 46/46. Amendment written (end state,
+  push bound, S1-S5, hot/cold duplication, owed: bounded parts across entries; held objects left out).
+- S4 split with w-svn: its slates-svn slice 1 (TextSource trait, records name texts) now; my server slice 2 after
+  (TextSource over Green::held, svn_commit drops text bytes from record, rebuild replays green first, held table
+  in checkpoint or re-held at rebuild).
+- NEXT: S2 (merge engine: content history's latest value names the file's block instead of a chunk copy). Then
+  S4 server slice. Then bounded parts across entries. push_load re-run after S3 (w-git A-722).
+- Worktree: ~/slates-work/w-perf-a723 (agents/w-perf-a723). Disk this Mac ~44 GB free now.
+- ~11:30Z: found the 747 MB wall = partition SNAPSHOT (db replay.rs snapshot -> anchor publish Snapshot slot), the
+  sum of all retained records; "bounded parts across entries" would not help -> not built. Main ruling (option 2):
+  repository bytes leave the snapshot, become content in the anchor's content regions, entries name identities.
+- S2 handed to w-engine; my notes at progress/w-engine-notes.md (state branch 87a26ad).
+- Design draft sent to main ~11:40Z: vcs ContentStore windows in the shard's chunk arena (A-64 anchor content object),
+  its table in the shard recovery image; git record v3 = names + pack root identity; order: content in arena ->
+  shard image published -> entry commits; recovery: images first, then records; replication content before record.
+  Slices (a) store over arena + image, (b) record v3, (c) svn via S4, (d) replication order. Awaiting OK + A-number.
+## A-727 (claimed, ledger 5f5f1d6; main OK ~11:50Z): repository bytes as content in the anchor arena
+- Design (sent to main, approved): vcs ContentStore windows in the owner shard's chunk arena (A-64 anchor content
+  object), its table (identity -> extent ref, form, holders, lists) in the shard recovery image, recovered BEFORE the
+  partition's records; records name identities (git v3: names + pack root identity); GROUP COMMIT: entries wait on
+  the next image barrier, one barrier covers every push written before it (main's requirement; measure at load).
+  Replication: content before record.
+- Slices: (a1) slates-vcs: storage seam in ContentStore (`Box<dyn WindowStore>`-like, heap default; no generic
+  ripple into git/hg/svn which take &ContentStore). (a2) server: arena-backed window store over the shard's
+  ChunkArena (state.store owns the arena; vcs_stores separate -> access by extent handle; mirror how vfs ChunkStore
+  reads extent bytes); deferred-free rule (A-64: a block the committed image names is not reused before a newer
+  image commits). (a3) image section: vcs content table in the shard image + recovery restores ContentStore entries
+  before records replay. (b) git record v3. (c) svn via S4. (d) replication order test.
+- Facts: ContentStore today = BTreeMap<ContentId, Held{bytes: Box<[u8]>, form, holders}> (crates/vcs/src/content.rs
+  insert_new ~412); ChunkArena API crates/mem/src/arena.rs (alloc/free/give_back/lock_extent, Extent{..});
+  partition snapshot publish crates/db/src/replay.rs snapshot (~673); anchor segment publish refuses past slot
+  (crates/anchor/src/segment.rs ~1041).
+- NEXT: read vfs ChunkStore (crates/vfs/src/content.rs / chunk store) for extent read/write + how the shard image
+  (vfs recover.rs to_image / encode_image_into) lists blocks; then write the A-727 design amendment (docs) and land
+  it; then (a1).
+- A-727 design LANDED main 41f183ce6 (docs only). Build slices next: (a1) read seam in slates-vcs ContentStore::windows
+  (9 production readers in git/hg/svn/server) -> copy-out read_into / Cow; heap storage behind a seam. Then (a2) arena
+  storage via vfs ChunkStore (open/write_open/seal/read_extent_into/claim_chunk_blocks/adopt_chunk), (a3) image
+  table + recovery before records, (b) git v3, (c) svn, (d) replication. Group commit for image barrier per push.
+- A-727 (a1) in progress, worktree ~/slates-work/w-perf-a723 (agents/w-perf-a723): ContentStore::windows and
+  window_at answer Cow<[u8]> (get stays &[u8]: lists/tables are the store's own metadata, kept in memory); readers
+  adapted: git derived/tree.rs, store/upload.rs (868 &first, 917, 951 Cow::Borrowed(made_window), 1377, 1599),
+  store/views.rs as_kept -> Option<Cow> (a borrowed window lent, an owned one kept like assembled); hg import/record.rs,
+  push/held.rs, render.rs, serve/indexed.rs (copied generic over AsRef, framed chains Cow MARKER, lend counts borrow);
+  server commits.rs, record.rs; vcs blame.rs; tests oracle.rs, hg tests/import.rs, vcs content tests. Compiles.
+  Focused tests running (vcs content/derived, git store/derived/upload, hg serve/import/push/render, server vcs_store/git_push).
