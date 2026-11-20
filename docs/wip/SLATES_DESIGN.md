@@ -54749,6 +54749,16 @@ Applied in the same change to:
   `--lib` 176 of 176, `--test model` 26 of 26; slates-ipc `--test wire_order`. Owed: the slot derived at each snapshot
   and grown by a re-laid segment at a handoff (8b); the snapshot naming sealed index tables by identity (8c, with A-727);
   the room read by `vcs_share::room` as a second resource.
+- **Piece 9a, the cut and its placement (2026-11-20).** `slates_vcs::cut`: an index cut into `2^b` ranges by its
+  objects' ids' leading bits (`range_of`), `b` the least that fits each range's room (`bits_for`,
+  `ceil(log2(bytes / room))`), a split due when a measured range passes the room (`split_due`), each row then moving to
+  one of its range's two children (`child_of`; Fagin et al. 1979). `crate::vcs_share::place::range_partition`: a range
+  held on the partition rendezvous ranks first for the repository's family key and the range. Tests: `cut::tests`
+  (300 generated cuts: one range an id, a split's children holding exactly the parent's ids; the derived cut the least
+  that fits; git/git whole, the kernel at 2 bits against a quarter slot, a billion objects cut; hostile ids total) and
+  `place::tests::a_repositorys_index_ranges_spread_over_the_partitions_by_rendezvous`. Owed (9b): `b` in the repository's
+  record; a push's rows sent to their ranges' partitions and committed by the owner's landing record (needs 8c's names
+  by identity, proposed to w-perf); look-ups routed by range; the split's moves.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
