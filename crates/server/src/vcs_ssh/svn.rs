@@ -485,7 +485,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
 
   /// The connection's call over the input held: with the repository's sources once the session is established.
   fn received(&mut self) -> Received {
-    let budget = self.bounds.budget;
+    let budget = crate::vcs_svn::timed(self.bounds.budget);
     let Self {
       connection,
       stores,

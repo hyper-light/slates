@@ -12336,6 +12336,19 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > `the request needs more room than the server admits`. Owed for git: the servers admitting a request's room and
 > answering in turns (piece 3b, by use over HTTP and SSH), protocol v0's fetch in turns, `begin`'s `ready` and cut and
 > `include-tag`'s scan in units, a scattered plan's runs, and a fetch held to the index generation it began on (rule 4).
+> **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
+> newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
+> both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
+> 278,528 B room. DAV's ran to 8.3 ms and 410,243 B. Each slice stopped only once its bytes had reached the room, so its
+> last call (a whole text window) went past it, and the drive was handed the room, or the nodes it may hold open, as one
+> call's step allowance. Now each slice of the editor drive (`report::exchange::Exchange::receive` for svn:// and
+> svn+ssh, `dav::update::UpdateWalk::resume` for a REPORT) stays within its room except for one call larger than the
+> room alone. A call that would pass the room after others is held whole and written first by the next slice. A slice
+> takes the drive a step at a time until the shard's quantum has run (`Budget::quantum`, the caller's clock). Rule 4: a
+> report, or a read streamed over many calls, holds its records' generation (`svn_view::SvnHold`). A rebuild or
+> removal meanwhile keeps those records aside, still charged, until the last hold drops (`vcs_store::keep_held_svn`).
+> The oracle is the whole room's bytes (stock `svnserve`'s, `update.c`'s): every room's slices make the same bytes. CI
+> also checks working copies against `svnadmin load`'s over `file://`.
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids

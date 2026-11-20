@@ -8,7 +8,10 @@
 //!
 //! What it holds to:
 //! - **The drive under the caller's budget.** Each call writes calls until the output has grown by
-//!   the room given or the drive's steps are spent, then hands the turn back ([`Turn::Wrote`]).
+//!   the room given, the drive's steps are spent or the budget's quantum has run, then hands the
+//!   turn back ([`Turn::Wrote`]). A call that would take the output past the room after others is
+//!   held whole and written first by the next turn, so a turn passes its room only by a call that
+//!   alone is larger (A-749: §4.17.1 "A fetch's answer", rule 2, for the svn:// edge).
 //! - **An early answer.** `editorp.c` looks for the client's answer before every editor command but
 //!   `close-edit` and `abort-edit` (`check_for_error`): one there means the client gave up. The
 //!   exchange then writes `abort-edit`, reads that answer, and fails the command: with "Successful
@@ -34,7 +37,7 @@
 //! - an error the client sent without a message is written back without one, where `svnserve`
 //!   writes Subversion's own text for its number (`svn_strerror`).
 //!
-//! No I/O, no clock, no randomness, no panic.
+//! No I/O, no randomness, no panic, and no clock but the one a budget's [`Quantum`] names.
 
 #[cfg(test)]
 mod tests;
@@ -110,15 +113,66 @@ const MALFORMED_ERROR_LIST: &str = "Malformed error list";
 /// Format: `marshal.c` `vparse_tuple`'s refusal.
 const MALFORMED_DATA: &str = "Malformed network data";
 
-/// What one call may do: the bytes it may add to the output and the steps it gives the drive. A
-/// call writes at least one of the drive's calls and gives it at least one step, so an exchange
-/// always ends.
+/// What one call may do: the bytes it may add to the output, the steps it gives the drive and the
+/// time it may run. A call writes at least one of the drive's calls and gives it at least one step,
+/// so an exchange always ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
   /// The bytes the output may grow by before the call hands the turn back.
   pub room: usize,
   /// The steps the drive takes for each call it makes ([`Drive::next`]).
   pub steps: usize,
+  /// The time the call may run, where the caller names one: the drive's steps are then taken until
+  /// it has run, and spent steps alone end no turn.
+  pub quantum: Option<Quantum>,
+}
+
+/// The time one call of a fetch's answer may run (A-749, §4.17.1 "A fetch's answer" rule 3): the
+/// caller's clock and its step quantum. A call stops at the first boundary between the drive's
+/// steps after the quantum has run, having taken at least one.
+#[derive(Clone, Copy, Debug)]
+pub struct Quantum {
+  /// The caller's clock, in nanoseconds.
+  pub now_ns: fn() -> u64,
+  /// The nanoseconds a call may run.
+  pub ns: u64,
+}
+
+impl PartialEq for Quantum {
+  /// The same clock, by its address, and the same nanoseconds.
+  fn eq(&self, other: &Self) -> bool {
+    std::ptr::fn_addr_eq(self.now_ns, other.now_ns) && self.ns == other.ns
+  }
+}
+
+impl Eq for Quantum {}
+
+/// One call's time, from its start ([`Quantum`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Slice {
+  /// The quantum and the instant the call began, where a budget names one.
+  timed: Option<(Quantum, u64)>,
+}
+
+impl Slice {
+  /// A call's time, begun now.
+  pub(crate) fn begin(quantum: Option<Quantum>) -> Self {
+    Self {
+      timed: quantum.map(|quantum| (quantum, (quantum.now_ns)())),
+    }
+  }
+
+  /// Whether the call is timed: spent steps then end no turn.
+  pub(crate) fn timed(&self) -> bool {
+    self.timed.is_some()
+  }
+
+  /// Whether the call's quantum has run; never for an untimed call.
+  pub(crate) fn spent(&self) -> bool {
+    self
+      .timed
+      .is_some_and(|(quantum, start)| (quantum.now_ns)().saturating_sub(start) >= quantum.ns)
+  }
 }
 
 /// What [`Exchange::begin`] made of a command.
@@ -247,6 +301,9 @@ pub struct Exchange {
   item_bytes: usize,
   /// The most nodes the drive holds open at once.
   most_open: usize,
+  /// A call's bytes that would have taken the last turn past its room after others: written first
+  /// by the next.
+  held: Vec<u8>,
 }
 
 impl Exchange {
@@ -267,6 +324,7 @@ impl Exchange {
         uuid: context.session.uuid.clone(),
         item_bytes: context.item_bytes,
         most_open: context.most_open,
+        held: Vec::new(),
       })),
       Begun::Failed(failure) => Opened::Failed(failure),
     })
@@ -274,6 +332,9 @@ impl Exchange {
 
   /// What the exchange waits on its client for now.
   pub fn awaiting(&self) -> Awaiting {
+    if !self.held.is_empty() {
+      return Awaiting::Drive;
+    }
     match self.phase {
       Phase::Reporting(_) => Awaiting::Report,
       Phase::Driving(..) => Awaiting::Drive,
@@ -295,9 +356,21 @@ impl Exchange {
     out: &mut Vec<u8>,
     budget: Budget,
   ) -> Result<Turn, Refused> {
+    let start = out.len();
+    let held = !self.held.is_empty();
+    out.append(&mut self.held);
     match std::mem::replace(&mut self.phase, Phase::Answered) {
       Phase::Reporting(reporter) => self.report(reporter, input, out),
-      Phase::Driving(drive, writer) => self.drive(drive, writer, sources, input, out, budget),
+      Phase::Driving(drive, writer) => {
+        let slice = Slice::begin(budget.quantum);
+        self.drive(
+          (drive, writer),
+          sources,
+          input,
+          (out, start, held),
+          (budget, slice),
+        )
+      }
       Phase::Closing(writer) => self.closing(writer, input, out),
       Phase::Aborting(abort) => self.aborting(abort, input, out),
       Phase::Answered => Err(Refused::OutOfTurn),
@@ -332,23 +405,29 @@ impl Exchange {
     }
   }
 
-  /// The drive's calls written until the room or the steps are spent, an early answer met, or the
-  /// edit closed or aborted.
+  /// The drive's calls written from `start` until the room, the steps or the quantum are spent, an
+  /// early answer met, or the edit closed or aborted; `taken` when a call held from the last turn
+  /// begins this one. A call that takes the turn past its room after others is held for the next
+  /// ([`Exchange::held`]).
   fn drive<R: Repository + ?Sized>(
     &mut self,
-    mut drive: Box<Drive>,
-    mut writer: EditorWriter,
+    (mut drive, mut writer): (Box<Drive>, EditorWriter),
     sources: &Sources<'_, R>,
     input: &[u8],
-    out: &mut Vec<u8>,
-    budget: Budget,
+    (out, start, mut taken): (&mut Vec<u8>, usize, bool),
+    (budget, slice): (Budget, Slice),
   ) -> Result<Turn, Refused> {
-    let start = out.len();
     let steps = budget.steps.max(1);
     loop {
+      if taken && slice.spent() {
+        self.phase = Phase::Driving(drive, writer);
+        return Ok(Turn::Wrote);
+      }
       let next = drive.next(sources, steps);
+      taken = true;
       let call = match next {
         Next::Call(call) => call,
+        Next::Paused if slice.timed() => continue,
         Next::Paused => {
           self.phase = Phase::Driving(drive, writer);
           return Ok(Turn::Wrote);
@@ -359,19 +438,32 @@ impl Exchange {
         write_call(&mut writer, &Call::AbortEdit, out)?;
         return self.aborting(Abort::Early, input, out);
       }
+      let before = out.len();
       write_call(&mut writer, &call, out)?;
+      let past = out.len().saturating_sub(start) > budget.room && before > start;
+      if past {
+        self.held = out.split_off(before);
+      }
       match call {
+        Call::CloseEdit if past => {
+          self.phase = Phase::Closing(writer);
+          return Ok(Turn::Wrote);
+        }
         Call::CloseEdit => return self.closing(writer, input, out),
         Call::AbortEdit => {
           let failure = drive
             .failure()
             .cloned()
             .ok_or(Refused::Editor(EditorRefused::OutOfOrder))?;
+          if past {
+            self.phase = Phase::Aborting(Abort::Refused(failure));
+            return Ok(Turn::Wrote);
+          }
           return self.aborting(Abort::Refused(failure), input, out);
         }
         _ => {}
       }
-      if out.len().saturating_sub(start) >= budget.room {
+      if past || out.len().saturating_sub(start) >= budget.room {
         self.phase = Phase::Driving(drive, writer);
         return Ok(Turn::Wrote);
       }
