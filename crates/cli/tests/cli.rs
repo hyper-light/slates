@@ -9126,6 +9126,83 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
   drop(anchor);
 }
 
+/// A file kept for a mount that survived a takeover is given back when that mount ends (U10; goal-83 B14; A-61). Do:
+/// write a file through a mount; publish it by an unlink's barrier on another file; open the file, a handle no image
+/// counts; `SIGKILL` the daemon and wait for the anchor's successor; unlink the file through the mount, whose successor
+/// keeps it for the mount (the open handle is one it never heard of); lazily unmount with the handle held, then close it.
+/// Expect `referenced_bytes` to count the file after the unlink and to come back to where it was before the file once
+/// the mount has ended: the server's `end_attachment` releases what the volume kept for the mount
+/// (`Volume::end_takeover_holder`). Nothing else releases it, since the kernel sends no `FORGET` for a file it held
+/// through an uncounted handle when the mount goes. Linux only, to a kernel that can resend (6.9+).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-kept-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "kept", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "a volume: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let referenced = || -> u64 {
+    let (code, out, err) = run(&instance, &["status", &id]);
+    assert_eq!(code, 0, "status: {err}");
+    value_of(&out, "referenced_bytes").parse().unwrap()
+  };
+  let before = referenced();
+  let path = format!("{}/kept.bin", mount.path);
+  let barrier = format!("{}/barrier.bin", mount.path);
+  // The test's own files, written and unlinked through the slates mount: RAM, not disk.
+  #[allow(clippy::disallowed_methods)]
+  std::fs::write(&path, vec![0x5Au8; HELD_FILE_BYTES]).unwrap();
+  #[allow(clippy::disallowed_methods)]
+  std::fs::write(&barrier, b"publish").unwrap();
+  #[allow(clippy::disallowed_methods)]
+  std::fs::remove_file(&barrier).unwrap();
+  let uncounted = std::fs::File::open(&path).unwrap();
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
+  std::fs::remove_file(&path).unwrap();
+  let held = u64::try_from(HELD_FILE_BYTES).unwrap();
+  assert!(
+    referenced() >= before + held,
+    "the unlinked file is kept for the mount that may hold it through a handle no image counted"
+  );
+  let lazily = Command::new("fusermount3")
+    .args(["-u", "-z"])
+    .arg(&mount.path)
+    .output()
+    .unwrap();
+  assert!(lazily.status.success(), "the lazy unmount: {lazily:?}");
+  drop(uncounted);
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut now = referenced();
+  while now > before && Instant::now() < deadline {
+    pause();
+    now = referenced();
+  }
+  assert_eq!(
+    now, before,
+    "the kept file's bytes come back once the mount that survived the takeover has ended"
+  );
+  drop(mount);
+  drop(anchor);
+}
+
 /// The lookups the kernel gave back after its daemon's last publication are given back through the successor too (GAPS,
 /// A-154's sibling; A-61, A-63). Do: write a file through a mount and unlink it there, so the unlink's barrier publishes
 /// the unlinked file still held by the kernel's lookup; wait until the kernel's `FORGET` has let it go and the volume's
