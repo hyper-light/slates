@@ -133,3 +133,15 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
     Then main's push-back: deterministic zlib level (inbox note to w-perf sent: inbox/w-perf-from-w-k90-vendor-zlib-level.md,
     state 19fde05); replaceable shard clock so rule 4's test compares packs byte for byte; A/B release on git/git.
     Then items 3 (v0 in turns), 4 (bounded scattered plans).
+ SSH red (main, first): LANDED c21abe3c via e5f171a9 (base 26e125ad). a745 long-history SSH test: not a hang; the
+    test client's fixed 4 s patience. Efficiency cores (taskpolicy -c background) red 2/2 -> green 2/2; push exits 0 in
+    6.07 s, clone 18.07 s there. Peer::connect_patient (reads again on timeout; server phase waits still close a stuck
+    session). Sibling likely: HTTP daemon_edge long-history push test (w-perf calls it flaky) -- not checked.
+ A-718 encode poll: LANDED 67dd4ef4 via 982ea33d (tested on base dbd497bb). Red (debug, git/git v2.0.0 pack 55.9 MB,
+    ~/.cache/w-k90-vendor-gitgit-v2.0.0.pack, head = v2.0.0^{commit}): watchdog ended the process twice, 3,508 / 3,541 ms
+    in one encode unit (an object's whole trials + 10 level samples), gather unit 32,768 rows / 315 ms. Green: daemon
+    lives, 164,487 objects, units <= 262,144 B and 1 row, longest unit 132 ms / turn 187 ms debug (1,492 s run).
+    Encoder::begin/step + Putting (fragment.rs), Current/Reading + windowed Keep (encoding.rs), keep_version/keep_base
+    take put roots. Owed: tree pair whole, parts' record one unit. Test: vcs_store::git_encode::tests::a718_no_unit_...
+    (ignored; SLATES_ENCODE_PACK/HEAD). Note: CLAUDE.md §8 -- no clippy by agents (ran it twice earlier; stopped).
+ NEXT: deterministic zlib level (w-perf no reply yet) + replaceable shard clock; then items 3 (v0) and 4 (plans).
