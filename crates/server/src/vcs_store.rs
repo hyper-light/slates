@@ -97,6 +97,7 @@ use slates_vfs::volume::Store;
 
 use crate::state::ShardState;
 
+pub(crate) mod arena_windows;
 pub(crate) mod commits;
 pub(crate) mod git_encode;
 pub(crate) mod hg_import;
@@ -180,6 +181,9 @@ pub(crate) struct VcsStores {
   /// The request each import's end answers, by repository (A-678; `crate::repository::import`): one an import, so
   /// bounded as the imports are.
   answers: BTreeMap<RepositoryId, crate::repository::import::Answer>,
+  /// Where the content store keeps its windows once it is made (A-727 slice a2): the shard's repository arena, given by
+  /// the shard's start; none in a test's stores, whose content store keeps them in memory.
+  window_storage: Option<Box<dyn slates_vcs::WindowStorage>>,
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -400,6 +404,15 @@ fn content_refused(refused: ContentRefused) -> GitRefused {
 }
 
 impl VcsStores {
+  /// Stores whose content store, once made, keeps its windows in `storage` (A-727 slice a2: the shard's repository
+  /// arena).
+  pub(crate) fn with_windows(storage: Box<dyn slates_vcs::WindowStorage>) -> VcsStores {
+    VcsStores {
+      window_storage: Some(storage),
+      ..VcsStores::default()
+    }
+  }
+
   /// The shard's next generation for a Mercurial store's index (A-720).
   fn next_generation(&mut self) -> u64 {
     self.generations = self.generations.saturating_add(1);
@@ -660,7 +673,11 @@ pub(crate) fn make(state: &mut ShardState, record: &RepositoryRecord) {
 /// [`make`]'s step over the stores, the content store made at the first repository with the content plane's `window`.
 fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Result<(), Unmade> {
   if stores.content.is_none() {
-    let content = ContentStore::new(stores.charged, window).map_err(|_| Unmade)?;
+    let content = match stores.window_storage.take() {
+      Some(storage) => ContentStore::with_storage(stores.charged, window, storage),
+      None => ContentStore::new(stores.charged, window),
+    }
+    .map_err(|_| Unmade)?;
     stores.content = Some(content);
   }
   let window = stores.content.as_ref().map_or(window, ContentStore::window);
