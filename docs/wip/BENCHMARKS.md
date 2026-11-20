@@ -15619,6 +15619,56 @@ What it says:
   also carry node-revisions and changed-path lists.
 - Owed: N=3 on a quiet machine.
 
+## A changeset's stored form: the raw payload against normalized per-path edits or wholes by identity, across tools and forks (A-767 item 7, phase 1; main's order of 2026-11-20; w-store; 2026-11-20)
+
+**What it is.** Main's A/B for A-767: (a) the bytes a client sent, kept unchanged, plus a work index; (b) each touched
+path's new text held once by identity (plain hash of the text), as the smaller of its zstd-3 whole and its zstd-3 line
+delta against p1's text (Mercurial's `mdiff.textdiff`), a whole wherever its chain would pass the bound K (a
+checkpoint), plus each changeset's own record (message, author, date). Every corpus feeds one shared identity store,
+so a second tool's or a fork's push adds only what the store does not yet hold. Phase 1 counts bytes and chains;
+release timings of the same layouts are w-hg's and w-svn's sections above.
+
+**Command.** `scratch-w-store/ab/run-phase1-local.sh` on the state branch (`changeset_ab.py` under
+`uv run --python 3.12 --with mercurial==7.2 --with zstandard python -I`; `run-phase1b.sh` for the stock rows).
+Machine: Adas-Mac-Studio-2.local (Apple M-series, 14 cores, 36 GiB, macOS), 2026-11-20 14:40 to 16:30 PST, kiln's
+runners unreachable from it, so run here; load 2 to 4. Data: Mercurial's repository cloned from mercurial-scm.org
+(57,053 revisions, `.hg/store` 77.6 MB); the same history as git through `hg fastexport` and `git fast-import` (authors
+rewritten, every file byte kept; 57,048 commits on `default`), repacked with `git repack -a -d -f`; git/git from GitHub,
+v2.0.0 (36,430 commits) then v2.1.0 (37,387) as two repositories of one project.
+
+| Corpus, in this order into one store | (a) payload as received | (b) texts K=16 / 64 / 256 / unbounded | (b) changeset records, each / as one stream | work index (raw) |
+|---|---|---|---|---|
+| hg's history, by hg | 162.1 MB changegroup (44.6 MB as hg's zstd bundle) | 103.7 / 51.6 / 38.5 / 35.7 MB | 15.1 / 5.9 MB | 6.7 MB |
+| the same history again, by git | +85.2 MB pack (1,038 MB from fast-import's own pack, unrepacked) | **+0 / 0 / 0 / 0** (alone: 103.7 / 51.6 / 38.5 / 35.7) | 12.4 / 5.1 MB | 9.0 MB |
+| git v2.0.0 | 55.9 MB pack | 45.3 / 26.3 / 21.2 / 20.4 MB | 11.1 / 4.6 MB | 6.0 MB |
+| git v2.1.0, a second repository of the same project | +57.9 MB pack | **+1.27 / 0.63 / 0.49 / 0.38 MB** (alone: 46.6 / 26.9 / 21.7 / 20.8) | 11.4 / 4.7 MB (shared commits again; held once by identity in a store) | 6.1 MB |
+
+Chain depth a read applies, p50 / p99 / max: hg K=256 37 / 247 / 256, unbounded 45 / 2,383 / 3,499; git v2.0.0 K=256
+19 / 233 / 256, unbounded 19 / 591 / 1,004. The bound K=256 costs 7.7 % (hg) and 3.7 % (git) over unbounded; K=64
+costs 44 % and 29 %. Normalizing in Python (hashing, diffing, compressing every touched path for four bounds): hg
+164.8 s CPU for 57,054 changesets; git v2.0.0 104.4 s for 36,430 (an upper bound: the Rust landing is w-git's and
+w-hg's to time). Peak RSS of the run over both git repositories 409 MB (Python, every identity of both held).
+
+**Stock rows, best of 3 (all 3 shown).** git v2.0.0's full pack reusing stored deltas (serving a landed pack as
+received): 1.59, 0.94, 0.94 s, 364 to 380 MiB; recomputing every object and delta (serving from normalized content with
+no cached pack): 6.33, 9.70, 6.60 s, 489 to 548 MiB. hg's whole bundle from its revlogs: 5.95, 5.83, 8.48 s, 107 MiB.
+An old version read whole (git: every blob of the tree; hg: `archive`) at the history's first, middle and last tenth:
+git 0.02, 0.04, 0.07 s; hg 0.47, 1.00, 1.87 s.
+
+What it says:
+- **For one tool, the bytes do not decide it** (w-hg's and w-svn's sections agree): (b) at K=256 with its records is
+  about 46 MB for hg's history against 44.6 MB for hg's own zstd bundle and 77.6 MB for hg's store.
+- **Across tools and forks they do.** The same history arriving by a second tool adds 85.2 MB under (a) and no text
+  bytes under (b); a second repository of one project adds 57.9 MB under (a) and 0.49 MB under (b). Content once on
+  arrival (A-64, A-727) holds only under (b).
+- **(b)'s cost is serving.** A pack computed from normalized content is 6.3 s against 0.94 s reused for git v2.0.0, so
+  derived packs are cached by identity, and the received pack seeds that cache.
+- **Chains need checkpoints**, which K=256 (or w-hg's rule, a whole once a path's chain passes its length) gives for
+  under 8 % more bytes.
+- Owed: the Rust landing cost of git's normalization (w-git: the names are already computed on arrival since B2, so the
+  added work is the line delta against p1); a cross-tool clone served from the other tool's landing; N=3 on a quiet
+  machine.
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built

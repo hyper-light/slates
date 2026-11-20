@@ -57461,6 +57461,27 @@ Measured: import time; RSS, peak and idle; disk bytes; clone throughput; an old 
 history's first, middle and last tenth, cold and warm); checkpoint spacing as learned and its disk cost. Beside them the
 stock servers' numbers (`hg serve`, `git daemon`, `svnserve` over FSFS). The numbers go in BENCHMARKS and this entry.
 
+> **Status (2026-11-20, item 7's phase 1 measured; proposed to w-hg, w-git and w-svn, not yet agreed; BENCHMARKS "A
+> changeset's stored form").** Main's A/B (raw payload plus a work index, against normalized per-path edits or wholes
+> held once by identity) over hg's history, the same history by git, and git v2.0.0 with v2.1.0 as a second
+> repository, in one store. One tool alone: equal (about 46 MB for hg's history normalized at K=256, 44.6 MB as hg's
+> zstd bundle; w-hg's and w-svn's release arms: 0 to 5 % apart). Across tools: the second tool's push adds 85.2 MB raw
+> and **no text bytes** normalized. Across repositories of one project: 57.9 MB raw against **0.49 MB**. Serving: a git
+> pack computed from normalized content 6.3 s against 0.94 s reusing a stored one (git v2.0.0). Proposed, on that data:
+> - **On disk the changeset is normalized:** its `record` (the tool's own bytes), its `work`, and for each touched path
+>   the edit against p1's text, or a whole held once by identity where the path is new or its chain since its last
+>   whole would pass its length (w-hg's rule; K=256 measured at +7.7 % for hg, +3.7 % for git); a changeset record is
+>   itself held by identity, so forks share theirs. The received `payload` is not kept on disk.
+> - **The hybrid on the push's path:** in flight the payload stays as received and is read in place (w-git's B1,
+>   w-svn's `TextSource`); landing normalizes it in bounded slices, using the tool's own deltas where they are already
+>   against p1 (hg: no diff at the server), and is acknowledged once the normalized changeset is durable (item 4).
+> - **Wire forms are derived, cached by identity:** the received pack or bundle seeds the cache, so the first clone
+>   after a push reuses it; an evicted one is computed again from the changesets.
+> - **Layout:** changeset order, with the `O` rows naming each path's text by (changeset, offset) and a decoded-segment
+>   cache sized from a clone's working set, since changeset order decodes 6 (svn) to 10 (hg) times the segments a
+>   per-file order does (w-svn, w-hg).
+> - Owed before building: git's normalization timed in Rust (w-git), and agreement from w-hg, w-git and w-svn.
+
 **8. RAM: the change in flight and a bounded, learned cache (Ada's memory-sizing ruling).**
 - **In flight:** held as received, so a push of N bytes holds at most k·N + B, with k and B derived (k about 2: the
   received bytes and one decode window). An import holds one slice.
