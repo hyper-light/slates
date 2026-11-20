@@ -37,3 +37,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   harness SERVERS="stock slates" RUNS=3 KEEP_LOGS=..., record rows.
 - Meanwhile piece 3 (profile slowest working paths -> ranked plan to main): svn checkout/commit (client-bound?),
   import memory (2.5 GB for 1,000 revisions).
+## Piece 3: profile -> ranked plan (started ~06:30Z 2026-11-20), Studio, release bc2803d66
+- svn checkout (1,000 revs): wall ~4.2 s both; client user 0.48 sys 2.78 (client-bound); server CPU slates 0.12 s vs
+  svnserve 0.56 s. log: server CPU ~0 both.
+- Footprint after import: 250 revs (85 MiB dump) ~920 MB; 500 (144 MiB) ~2,060 MB; 1,000 (223 MiB) ~2,430 MB
+  (MALLOC_LARGE/SMALL ~2/3, VM_ALLOCATE (content pool) the rest). `status --json` has no memory counters.
+- malloc_history (MallocStackLogging=1 on the anchor; daemon inherits), 250 revs, live heap 577 MiB:
+  Importer::import 118.7; Repositories::apply_advanced 86.5 (259 allocs, ~334 KB/revision); merge history
+  Value::whole 51.9; Partition::apply_green_checkpoint 46.8 (2 allocs); Green::commit 43.9; UnitSet::whole 42.7
+  (segment, fixed); apply_repository 39.7 (257); merge engine apply 31.5+20.5; thread stacks 47 (fixed).
+  Virtual only: timer Wheel::new 898 MiB (39 MiB a shard), segment/content-pool maps.
+- Plan sent to main ~06:45Z; awaiting its pick.

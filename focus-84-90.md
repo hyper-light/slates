@@ -890,3 +890,10 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   36478561d (win clippy anchor lib red->clean from the Mac). Lint wall red in slates-db + slates-vcs -> new lint keeper
   w-lint (briefs/w-lint.md). w-bugs told to re-cut its Windows diag from >= 36478561d.
 - Stopped duplicate w-fed-a583 on Studio-2 (01a1f7744305737c8650cfbb776d54a0); kept the big Studio's (01a1f7749cc7...).
+- ~23:00 PST w-perf piece 3 ranked plan (release bc2803d66, MallocStackLogging on a 250-rev svn import, 85 MiB dump,
+  577 MiB live heap; footprint 920 MB @250, 2,060 @500, 2,430 @1,000 revs): M1 register repository records ~0.5 MB/rev
+  (apply_advanced 86.5 + apply_repository 39.7 MiB), maybe quadratic; M2 svn Importer::import buffers 118.7 MiB (1.4x
+  dump); M3 merge history whole-value copies 148 MiB; M4 green checkpoint whole copies 46.8 MiB; M5 virtual only
+  (timer wheels 898 MiB reserved). T2 svn checkout/commit/update client-bound: server CPU per checkout 0.12 s vs
+  svnserve 0.56 s. RULINGS: M1 measure slope only (w-svn is in that code), hand to w-svn; M2 w-perf now (bound);
+  T2 recorded client-bound with the server's share; M3-M5 recorded as owed.
