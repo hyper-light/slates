@@ -3071,7 +3071,9 @@
 >   more than one piece is now captured at the head, sealed in turns of an `ImageBuild` and made the image if the head
 >   has not moved (else dropped, still owed). **Still measured, debug under `taskpolicy -b` on main 359da2388:** a
 >   takeover's `make_taken` 38 ms of one poll's CPU; a forward-lane child 17 ms; the record period's capture of an owed
->   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall); and, after A-347's open, the takeover's
+>   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall. **A-763 (2026-11-20):** a live write ships the
+>   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
+>   309,760 after)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -7206,11 +7208,31 @@
 >   waits for an unmount to show in Linux's mount table wait on the table's own notification (`POLLPRI` on
 >   `/proc/self/mountinfo`) within the observation budget (`MOUNT_TABLE_WAIT`), no poll and no CPU budget (main's
 >   ruling: the waiter spends none); `shards_reader` reads its handed end without a timeout. Owed
->   in `cli/tests`: `cli`'s container waits (`CONTAINER_WAIT`, `DOCKER_INFO_WAIT`, on Docker), `live_fleet`, `vm`,
->   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
+>   in `cli/tests`: `live_fleet` since 2026-11-20 (its start, formation, catch-up, takeover, restart, transient-write
+>   and v4-commit waits judged over the nodes' processes with the judgment `cli`'s `StartProgress` was, now
+>   `process_wait::InstanceWait`; its NFS reads with no timeout; a stop awaited on the kernel's report, `waitid` for a
+>   stopped child, within the observation budget; `FLEET_WAIT` and `START_WAIT` gone; the fenced owner's
+>   `STALE_WRITE_WAIT` kept as the deadline that test proves). `cli`'s container waits (`CONTAINER_WAIT`,
+>   `DOCKER_INFO_WAIT`) stay: they wait on Docker Desktop's VM, no process of the test's tree. `vcs_edge_restart` since
+>   2026-11-20: its anchor's lines judged in the anchor's process tree (`process_wait::Judged`, which Windows builds too),
+>   its listeners' first answers read without a timeout, `PATIENCE` gone. `fs_server` since 2026-11-20: `eventually`, the
+>   enroll's wait for the node's groups, the path-estimate wait and the retired host's attachments judged over the nodes'
+>   processes, an anchor's stop on drop judged in its tree; `FLEET_WAIT` and `RETIREMENT_WAIT` gone; the silent holder's
+>   bound, the heal's give-up and the cut's length kept as what those tests prove, and `DOCKER_WAIT` on Docker. `live_chaos`
+>   since 2026-11-20: its waits were already judged (`wait_answers` in CPU, `FleetWait` over the box's CPU share,
+>   b25a5b7a6); its successor wait now judged over the instance's processes and its NFS barrier read without a timeout.
+>   `support/relay` keeps its bounds: they wait on the test's own relay thread and loopback datagrams, no slates process,
+>   and its absence waits are what its tests prove. The interop suites (`git_interop`, `hg_interop`, `svn_interop`,
+>   `svn_http_reports`) and `issuer_surface` since 2026-11-20: a daemon's settling and the anchor's lines judged in the
+>   anchor's tree (`process_wait::Judged`, which every platform builds; `Judged::of_all` judges several trees together);
+>   their stock clients' `exit_within` keeps `PATIENCE`, owed: a client waiting on a stock server has no slates tree to
+>   judge beside it. `load_scale` since 2026-11-20: its `eventually` and its wait for an anchor's daemon judged the
+>   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
+>   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `vm`, `start_judgment`
+>   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
+>   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
->   own platforms), `cli/src/verbs.rs`' test module
->   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
+>   own platforms), `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
 >   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or

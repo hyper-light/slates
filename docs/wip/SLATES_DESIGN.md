@@ -55739,6 +55739,21 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722's head at once — A git service's reply head is written before its body is read (2026-11-20, w-git for UI goal 93; main's ruling)
+- **Why.** The edge's engine wrote a reply's status and headers only once the service's reply began, after the whole
+  request body was read. A long push's pack is decoded as its body is read, so after the client's last byte the
+  connection was silent until the push was answered, and the long-history edge tests' client gave up reading at a load
+  of 40 to 67. git's `http-backend` writes its head (`200`, the result's media type, chunked) before it runs the
+  service.
+- **Change.** `slates_http_edge::connection::StatusMode::AtHead`: a route whose head is all known at its decision has
+  `200` and the decision's fields written at once, after any `100 Continue` and before any of its body is read; the
+  reply then streams from it, and a failure after it ends the connection short of the reply's end, as a cut git answer
+  does. git's smart services (`vcs_http::git`, upload-pack's and receive-pack's results and advertisements) take it.
+  Mercurial's commands stay `Streamed` (their media type is named as the reply begins) and Subversion's site `AfterBody`;
+  w-hg and w-svn were told.
+- **Tests.** `slates-http-edge` `connection::tests::an_at_head_routes_reply_head_is_written_before_its_body_is_read` (red
+  with the head written at the reply: no head before the body's end).
+
 ### A-722's keepalive — A long push's answer writes git's keepalive while it is made (2026-11-20, w-git for UI goal 93; main's order: the two load-only edge tests)
 - **Why.** Over the HTTP edge a push's answer was made whole in the exchange's `body_end` and written only after it, so a
   long push wrote nothing until its report: at a load of 56 to 67 the long-history edge tests' client gave up reading
@@ -55750,10 +55765,7 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   going (`ClientGone`) as `body_end` is, so a hook run in the reply's turns ends with its client. A push without
   side-band is answered whole as before, and a refusal before any reply still answers with a status. The edge tests'
   long-history requests now ask stock git's capabilities (`report-status-v2 side-band-64k ...`).
-- **Owed.** The silence before the reply begins: the edge's engine writes the status only once the body is read, while
-  git's `http-backend` writes its head before it reads the body, so a long pack's decode after the client's last byte
-  is silent (the two long-history tests still meet their 10 s read wait at a load of 40 to 50). The status written at
-  the head on a streamed route is an `http-edge` change (proposed to main).
+- **The silence before the reply begins** is A-722's head at once (the section above).
 - **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`
   (a daemon whose interval is none: the answer begins with `0005\1`, its report whole after the keepalives);
   `slates-server --lib -- vcs_http:: git_push:: vcs_ssh::` 156 passed, the two long-history tests (owed above) and
@@ -56929,3 +56941,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
 - Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read; red before) and
   `a_stored_text_is_read_a_store_window_a_step`.
 - **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.
+
+### A-763 — A live write ships the bytes it changed (2026-11-20, w-forming; main's order, item 1; found by use: 32 KiB NFS writes to a 3 MiB live file shipped about 245 KB of delta each, 54 MB over 221 appends; §4.10 "Live shipping"; A-126, A-200)
+
+- **Cause.** A live delta's content runs (`live_ship::content_runs`) carried every extent of each patched file's image,
+  and a patch's image carries every extent in the windows its writes touched (A-126's `Dirty::windows`, the write's
+  window and the open extent's): a page written into a 3 MiB file shipped about 313 KB.
+- **The change.** The volume keeps the byte ranges each publication's writes changed (`Dirty::writes`, from the old end
+  of the file when a write grows it, since the zeros it opens are new; cleared into `Dirty::published_writes` at
+  `mark_published`, read through `Volume::published_writes`); a patched file's runs are those ranges clipped to its
+  extents (`clipped_to_writes`), a file changed otherwise ships its extents as before. A successor's rebuild overlays
+  the runs by byte range per inode (`overlay_run`: the later bytes over the earlier, the rest kept) and reads each
+  extent from them (`run_bytes`, refused where a byte is missing, as before), so a window's unwritten bytes come from the
+  entries before it. The delta record's format is unchanged.
+- **Tests.** `slates-cli` live_fleet `a_live_write_ships_the_bytes_it_changed_not_its_window` (64 page writes spread over
+  a 3 MiB live file, the delta bytes held within the bytes written and a page a publication): red before (20,063,216
+  bytes shipped for 262,144 written in 64 appends), 309,760 after (bytes, not time: the same in a release build).
+  `live_ship::tests::overlaid_runs_read_back_the_latest_bytes_and_refuse_a_gap` (a byte-array oracle) and
+  `a_patched_files_spans_are_clipped_to_its_writes`; the takeover flows that serve written volumes from a successor's
+  rebuild (live_fleet's warm-restart, no-copy and stopped-successor takeovers; the live_chaos fresh-member flow).

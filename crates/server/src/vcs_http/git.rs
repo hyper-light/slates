@@ -787,7 +787,8 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
       answer: Answer::Serve {
         fields: owned(&http::reply_fields(reply)),
         head_only: asked.head_only,
-        status: StatusMode::Streamed,
+        // git's smart services write their head before the body is read, as `http-backend` does (A-722).
+        status: StatusMode::AtHead,
         exchange: SiteExchange::Git(GitExchange { prelude, service }),
       },
       proven: true,

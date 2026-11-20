@@ -6686,7 +6686,12 @@ impl Volume {
     // What a publication may patch (A-126): the windows this write can change, or, for a body that is not chunked,
     // nothing (the inode is imaged whole).
     let written_no = store.inodes.get(handle)?.no.0;
-    self.dirty.written(written_no, touched);
+    // The bytes the write changes: from the old end of the file when it grows it, since the zeros it opens are new too.
+    let old_size = store.inodes.get(handle)?.attrs.size;
+    let write_end = off.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    self
+      .dirty
+      .written(written_no, touched, (off.min(old_size), write_end));
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let landed = self.write_body(store, body, off, bytes);
     let inode = store.inodes.get_mut(handle)?;

@@ -22,6 +22,8 @@ mod nfs;
 #[path = "../../server/tests/common/nfs4.rs"]
 #[allow(dead_code)]
 mod nfs4;
+#[path = "support/process_wait.rs"]
+mod process_wait;
 // The vhost-user front end a VMM speaks, over the guest driver it rides (`super::guest`), for the virtio-fs flow.
 #[cfg(target_os = "linux")]
 #[path = "../../server/tests/common/guest.rs"]
@@ -35,10 +37,6 @@ mod vhost_front_end;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Shape: how long a fleet step may take on a loaded box: the formation wait of the process flows.
-const FLEET_WAIT: Duration = Duration::from_secs(40);
-/// Shape: how long a daemon may take to answer once started.
-const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the pause between polls.
 const POLL_MS: u64 = 20;
 /// Shape: shards per daemon: two, so a volume's owner shard need not be the control shard, where the sessions are.
@@ -244,13 +242,12 @@ fn start_fleet_daemon(
   FleetProcess { child }
 }
 
+/// Waits until the daemon at `instance` answers, while its processes progress ([`process_wait::InstanceWait`]; until
+/// 2026-11-20 within `START_WAIT`, 20 s of the wall).
 fn wait_answers(instance: &str) {
-  let started = Instant::now();
+  let mut progress = process_wait::InstanceWait::new();
   while run(instance, &["volume", "list"]).0 != 0 {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the daemon at {instance} came up"
-    );
+    progress.check(instance, "the daemon came up");
     pause();
   }
 }
@@ -270,7 +267,8 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
 
 /// Waits until every node holds all three members alive with both peers probed; returns their member ids.
 fn wait_formed(instances: &[String]) -> Vec<String> {
-  let deadline = Instant::now() + FLEET_WAIT;
+  // While every node's processes progress (until 2026-11-20 within the fleet wait).
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let views: Vec<_> = instances
       .iter()
@@ -283,7 +281,7 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    assert!(Instant::now() < deadline, "the fleet formed: {views:?}");
+    progress.check_all(instances, &format!("the fleet formed: {views:?}"));
     pause();
   }
 }
@@ -296,7 +294,8 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
 /// under load) or find no session to a candidate: under load at 36–46 a killed owner left a council of two voters that
 /// never elected again, and an owner found no session to its only reachable candidate (2026-11-05, `live_fleet`).
 fn wait_settled(instances: &[String]) {
-  let deadline = Instant::now() + FLEET_WAIT;
+  // While every node's processes progress (until 2026-11-20 within the fleet wait).
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let views: Vec<(String, String, usize, u64)> = instances
       .iter()
@@ -330,9 +329,11 @@ fn wait_settled(instances: &[String]) {
     if whole {
       return;
     }
-    assert!(
-      Instant::now() < deadline,
-      "the fleet settled (council voters, configuration members, record sessions, pairs served): {views:?}"
+    progress.check_all(
+      instances,
+      &format!(
+        "the fleet settled (council voters, configuration members, record sessions, pairs served): {views:?}"
+      ),
     );
     pause();
   }
@@ -370,13 +371,14 @@ fn counter(instance: &str, kind: &str) -> u64 {
     .sum()
 }
 
-/// Runs `args` on `instance` until it is not refused for an unready consensus (a fresh learner's window), within the
-/// fleet wait; the output of the run that was not.
+/// Runs `args` on `instance` until it is not refused for an unready consensus (a fresh learner's window), while its
+/// processes progress (until 2026-11-20 within the fleet wait); the output of the run that was not.
 fn run_ready(instance: &str, args: &[&str]) -> String {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, out, err) = run(instance, args);
-    if code == 1 && err.contains("ConsensusNotInitialized") && Instant::now() < deadline {
+    if code == 1 && err.contains("ConsensusNotInitialized") {
+      progress.check(instance, &format!("{args:?} not refused: {err}"));
       pause();
       continue;
     }
@@ -506,13 +508,17 @@ fn write_live_volume(owner: &str, files: usize) -> String {
 }
 
 /// The owner's live line and each candidate's, once the owner's log is durable at its head with nothing owed and every
-/// candidate holds that head, or at the fleet wait; and whether that happened.
+/// candidate holds that head, or once their processes stall, leave or spend their CPU budget
+/// ([`process_wait::InstanceWait`]; until 2026-11-20 at the fleet wait); and whether that happened.
 fn wait_caught_up(
   owner: &str,
   others: &[&String],
   volume: &str,
 ) -> (bool, Option<LiveLine>, Vec<Option<LiveLine>>) {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut progress = process_wait::InstanceWait::new();
+  let nodes: Vec<&str> = std::iter::once(owner)
+    .chain(others.iter().map(|other| other.as_str()))
+    .collect();
   loop {
     let shipping = live_line(owner, "shipping", volume);
     let held: Vec<_> = others
@@ -527,7 +533,7 @@ fn wait_caught_up(
           .iter()
           .all(|kept| kept.as_ref().is_some_and(|(kept, _, _)| kept == head))
     });
-    if caught_up || Instant::now() >= deadline {
+    if caught_up || !progress.look_all(&nodes) {
       return (caught_up, shipping, held);
     }
     pause();
@@ -652,7 +658,8 @@ fn a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it() {
   let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
   let mut stream =
     std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
-  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  // Read without a timeout: a live daemon answers while it lives, and its end closes the stream (A-232); until
+  // 2026-11-20 each read waited the fleet wait.
   let root = nfs::mount(&mut stream, &path, 1);
   let file = nfs::create(&mut stream, &root, "stable", 2);
   let mut lines = Vec::new();
@@ -690,10 +697,11 @@ fn live_body(file: usize) -> String {
 }
 
 /// Waits until a survivor serves `volume` with every file `write_live_volume` wrote, byte for byte; that survivor and
-/// how long it took from now. Fails, showing every survivor's status, at the fleet wait.
+/// how long it took from now. Fails, showing every survivor's status, once the survivors' processes stall, leave or spend
+/// their CPU budget ([`process_wait::InstanceWait`]; until 2026-11-20 at the fleet wait).
 fn wait_served_whole(survivors: &[&String], volume: &str, files: usize) -> (String, Duration) {
   let began = Instant::now();
-  let deadline = began + FLEET_WAIT;
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     for survivor in survivors {
       let (code, listed, _) = run(survivor, &["volume", "list"]);
@@ -708,7 +716,7 @@ fn wait_served_whole(survivors: &[&String], volume: &str, files: usize) -> (Stri
         return ((*survivor).clone(), began.elapsed());
       }
     }
-    if Instant::now() >= deadline {
+    if !progress.look_all(survivors) {
       let states: Vec<String> = survivors
         .iter()
         .map(|survivor| {
@@ -793,28 +801,38 @@ fn signal(process: &FleetProcess, signal: rustix::process::Signal) {
   }
 }
 
-/// Waits, within the fleet wait, until `pid` is shown stopped (`ps`'s state `T`). `kill` returns as soon as a stop is
-/// sent, and the process runs on until it is delivered: under load a "stopped" candidate went on to acknowledge the
-/// entry written next, so a FUSE `fsync` made after both candidates were stopped answered success in 0.28–3 ms with a
-/// candidate truly holding it (3 of 40 loaded runs, CI x86_64, `diag-live-durability-26`), and the flow read it as a
-/// false claim of durability.
+/// Derived: how long the kernel may take to deliver a stop: the observation budget
+/// (`slates_server::daemon::OBSERVE_BUDGET_NS`, ten liveness budgets), the longest any party here goes unobserved. No CPU
+/// budget: the waiting test spends none, and the delivery is the kernel's work (main's ruling, 2026-11-20).
+const STOP_DELIVERY_WAIT: Duration = Duration::from_nanos(slates_server::daemon::OBSERVE_BUDGET_NS);
+
+/// Waits until the child `pid` has stopped, on the kernel's own report of it (`waitid` for a stopped child, leaving it
+/// waitable, on a thread of its own), within [`STOP_DELIVERY_WAIT`]. `kill` returns as soon as a stop is sent, and the
+/// process runs on until it is delivered: under load a "stopped" candidate went on to acknowledge the entry written
+/// next, so a FUSE `fsync` made after both candidates were stopped answered success in 0.28–3 ms with a candidate truly
+/// holding it (3 of 40 loaded runs, CI x86_64, `diag-live-durability-26`), and the flow read it as a false claim of
+/// durability. Until 2026-11-20 this polled `ps` for the state `T` within the fleet wait.
 fn wait_stopped(pid: u32) {
-  let deadline = Instant::now() + FLEET_WAIT;
-  loop {
-    let state = Command::new("ps")
-      .args(["-o", "stat=", "-p", &pid.to_string()])
-      .output()
-      .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-      .unwrap_or_default();
-    if state.starts_with('T') {
-      return;
-    }
-    assert!(
-      Instant::now() < deadline,
-      "process {pid} shown stopped within the fleet wait: state {state:?}"
+  let child = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+  let (told, reported) = std::sync::mpsc::channel();
+  let watcher = std::thread::spawn(move || {
+    let status = rustix::process::waitid(
+      rustix::process::WaitId::Pid(child),
+      rustix::process::WaitIdOptions::STOPPED
+        | rustix::process::WaitIdOptions::EXITED
+        | rustix::process::WaitIdOptions::NOWAIT,
     );
-    pause();
-  }
+    let _ = told.send(status.map(|status| status.is_some_and(|status| status.stopped())));
+  });
+  let stopped = reported
+    .recv_timeout(STOP_DELIVERY_WAIT)
+    .unwrap_or_else(|_| panic!("process {pid} stopped within {STOP_DELIVERY_WAIT:?}"));
+  watcher.join().unwrap();
+  assert_eq!(
+    stopped.map_err(|error| error.to_string()),
+    Ok(true),
+    "process {pid} stopped, not ended"
+  );
 }
 
 /// Creates a live-shipped volume on `owner`: its id.
@@ -1330,13 +1348,14 @@ fn a_destroyed_live_volumes_copies_are_let_go_by_its_candidates() {
   assert!(caught_up, "both candidates held the log before the destroy");
   let (code, _, err) = run(owner, &["volume", "destroy", &id]);
   assert_eq!(code, 0, "destroy: {err}");
-  let deadline = Instant::now() + FLEET_WAIT;
+  // While the candidates' processes progress (until 2026-11-20 within the fleet wait).
+  let mut progress = process_wait::InstanceWait::new();
   let held = loop {
     let held: Vec<Option<LiveLine>> = others
       .iter()
       .map(|other| live_line(other, "held", &id))
       .collect();
-    if held.iter().all(Option::is_none) || Instant::now() >= deadline {
+    if held.iter().all(Option::is_none) || !progress.look_all(&others) {
       break held;
     }
     pause();
@@ -1426,8 +1445,10 @@ fn clients_cut_off_mid_write_leave_the_live_log_whole() {
 /// wait: the fence dropped its shipper with the write still waiting on it.
 #[test]
 fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
-  /// Shape: how long the resumed owner's write is given before it counts as not acknowledged: the fleet wait.
-  const STALE_WRITE_WAIT: Duration = FLEET_WAIT;
+  /// Shape: how long the resumed owner's write is given before it counts as left unanswered: 40 s, the fleet wait it was
+  /// until 2026-11-20. A deadline this test proves, kept as `start.rs`' `NOBODY_WAIT` is: the bug it holds out was a live,
+  /// idle owner holding the write for good, which no judgment of the owner's CPU could end.
+  const STALE_WRITE_WAIT: Duration = Duration::from_secs(40);
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
     eprintln!(
       "skipping the live-shipping fencing flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
@@ -1725,6 +1746,77 @@ fn a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_seal
   assert_eq!(of("refused"), 0, "no write was refused: {counters:?}");
 }
 
+/// A live write ships what it changed (w-forming, 2026-11-20; found by use: 32 KiB NFS writes to a 3 MiB live file
+/// shipped about 245 KB of delta each, 54 MB over 221 appends, since a delta carried every content window a write
+/// touched). Do fill a live volume's file to three MiB with stable NFS writes of 32 KiB, then make [`PAGE_WRITES`] page
+/// writes spread over it. Expect the delta bytes the owner shipped for them (`fleet.live.change_bytes`) within the bytes
+/// written plus a page of record a publication. Before, each page write shipped its whole window.
+#[test]
+fn a_live_write_ships_the_bytes_it_changed_not_its_window() {
+  /// Shape: the fill's writes, 32 KiB each, three MiB in all.
+  const FILL_WRITES: u64 = 96;
+  /// Shape: the fill's write bytes.
+  const FILL_BYTES: usize = 32 << 10;
+  /// Shape: the measured writes, one page each.
+  const PAGE_WRITES: u64 = 64;
+  /// Shape: a measured write's bytes.
+  const PAGE_BYTES: usize = 4096;
+  /// Shape: what a publication carries beside the bytes it changed (its volume record, the patched inode's image, the
+  /// payload's framing), allowed per publication: a page.
+  const RECORD_ALLOWANCE: u64 = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live write-amplification flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-write-bytes");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let (mut live, file, _id) = stable_session(owner, "write-bytes", true);
+  let fill = vec![0x3c_u8; FILL_BYTES];
+  let page = vec![0xc3_u8; PAGE_BYTES];
+  let mut xid = 100;
+  let fill_step = u64::try_from(FILL_BYTES).unwrap();
+  for index in 0..FILL_WRITES {
+    xid += 1;
+    let status = nfs::write_at_status(&mut live, &file, index * fill_step, &fill, xid);
+    assert_eq!(status, 0, "the fill write at {index} was answered");
+  }
+  let before = live_counters(owner);
+  let span = FILL_WRITES * fill_step / PAGE_WRITES;
+  for index in 0..PAGE_WRITES {
+    xid += 1;
+    let status = nfs::write_at_status(&mut live, &file, index * span + 512, &page, xid);
+    assert_eq!(status, 0, "the page write at {index} was answered");
+  }
+  let after = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  let grew = |name: &str| {
+    after
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+      .saturating_sub(before.get(name).copied().unwrap_or(0))
+  };
+  let (shipped, appended) = (grew("change_bytes"), grew("appended"));
+  let written = PAGE_WRITES * u64::try_from(PAGE_BYTES).unwrap();
+  let bound = written + appended * RECORD_ALLOWANCE;
+  eprintln!(
+    "live write bytes: {PAGE_WRITES} page writes, {written} bytes written; {appended} appended, {shipped} bytes shipped \
+     (bound {bound}); whole {}",
+    grew("whole")
+  );
+  assert!(appended >= 1, "the writes were shipped: {after:?}");
+  assert!(
+    shipped <= bound,
+    "the deltas shipped what the writes changed: {shipped} bytes for {written} written in {appended} appends, bound \
+     {bound}"
+  );
+}
+
 /// A-200, AC-8.9: a candidate's copy of a live log stays within its bound however long the writer runs. Do make stable
 /// NFS writes to a live volume bounded at 1 MiB until the changes shipped are three times its size. Expect every write
 /// answered, no candidate refusing an entry for its bound, and whole records shipped as the changes grow: a candidate
@@ -1807,7 +1899,8 @@ fn stable_session_of(
   let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
   let mut stream =
     std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
-  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  // Read without a timeout: a live daemon answers while it lives, and its end closes the stream (A-232); until
+  // 2026-11-20 each read waited the fleet wait.
   stream.set_nodelay(true).unwrap();
   let root = nfs::mount(&mut stream, &path, 1);
   let file = nfs::create(&mut stream, &root, "timed", 2);
@@ -2199,7 +2292,7 @@ fn a_successor_that_holds_no_copy_still_takes_a_live_volume_over() {
     &fleet.daemons[successor_index],
     rustix::process::Signal::STOP,
   );
-  // The writes are durable on the owner and the other candidate; given the fleet wait, so a candidate that refuses
+  // The writes are durable on the owner and the other candidate; waited for while the fleet progresses, so a candidate that refuses
   // the owner fails the test with its counters rather than hanging it (one run hung 58 minutes, 2026-11-05).
   let (done_tx, done_rx) = std::sync::mpsc::channel();
   let written = std::thread::scope(|scope| {
@@ -2208,7 +2301,7 @@ fn a_successor_that_holds_no_copy_still_takes_a_live_volume_over() {
       write_files(&owner, &id, 0..FILES);
       let _ = done_tx.send(());
     });
-    let written = done_rx.recv_timeout(FLEET_WAIT).is_ok();
+    let written = recv_while_progressing(&done_rx, &fleet.instances).is_some();
     if !written {
       let counters: Vec<_> = fleet
         .instances
@@ -2274,9 +2367,30 @@ fn signal_pid(pid: &str, flag: &str) {
   assert!(sent.success(), "kill {flag} {pid}");
 }
 
-/// Waits until `a` and `b` each hold the other a live member (`fleet_members`), within the fleet wait.
+/// The next message on `received`, waited for while the processes of `nodes` progress ([`process_wait::InstanceWait`]);
+/// `None` once they stalled, left or spent their CPU budget first. Until 2026-11-20 these waits ended at the fleet wait.
+fn recv_while_progressing<T>(
+  received: &std::sync::mpsc::Receiver<T>,
+  nodes: &[impl AsRef<str>],
+) -> Option<T> {
+  let mut progress = process_wait::InstanceWait::new();
+  loop {
+    match received.recv_timeout(Duration::from_millis(POLL_MS)) {
+      Ok(message) => return Some(message),
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        if !progress.look_all(nodes) {
+          return None;
+        }
+      }
+    }
+  }
+}
+
+/// Waits until `a` and `b` each hold the other a live member (`fleet_members`), while their processes progress (until
+/// 2026-11-20 within the fleet wait).
 fn wait_see_each_other(a: &str, b: &str) {
-  let started = Instant::now();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let host_of = |instance: &str| value_of(&run_ready(instance, &["status"]), "fleet_host");
     let members_of = |instance: &str| value_of(&run_ready(instance, &["status"]), "fleet_members");
@@ -2290,10 +2404,7 @@ fn wait_see_each_other(a: &str, b: &str) {
     {
       return;
     }
-    assert!(
-      started.elapsed() < FLEET_WAIT,
-      "{a} and {b} saw each other again"
-    );
+    progress.check_all(&[a, b], "the two saw each other again");
     pause();
   }
 }
@@ -2304,16 +2415,14 @@ fn restart_warm(instance: &str) {
   let pid = value_of(&run_ready(instance, &["status"]), "pid");
   let killed = Command::new("kill").args(["-KILL", &pid]).status().unwrap();
   assert!(killed.success(), "kill {instance}'s daemon {pid}");
-  let started = Instant::now();
+  // While the instance's processes progress (until 2026-11-20 within the fleet wait).
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, out, _) = run(instance, &["status"]);
     if code == 0 && value_of(&out, "pid") != pid {
       return;
     }
-    assert!(
-      started.elapsed() < FLEET_WAIT,
-      "the anchor replaced {instance}'s daemon"
-    );
+    progress.check(instance, "the anchor replaced the daemon");
     pause();
   }
 }
@@ -2542,7 +2651,8 @@ fn a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor() {
 const TRANSIENT_REFUSALS: [&str; 1] = ["LeaseUnconfirmed"];
 
 /// [`write_files`] through an owner whose daemon just restarted: each file's attach and write are made again while they
-/// are refused for now ([`TRANSIENT_REFUSALS`]), within the fleet wait; every refusal met, in order.
+/// are refused for now ([`TRANSIENT_REFUSALS`]), while the owner's processes progress (until 2026-11-20 within the fleet
+/// wait); every refusal met, in order.
 fn write_files_through_transient(
   owner: &str,
   id: &str,
@@ -2550,7 +2660,7 @@ fn write_files_through_transient(
 ) -> Vec<String> {
   let mut refusals = Vec::new();
   for file in files {
-    let deadline = Instant::now() + FLEET_WAIT;
+    let mut progress = process_wait::InstanceWait::new();
     loop {
       let (code, out, err) = run(owner, &["attach", id, "--write"]);
       let transient = |err: &str| {
@@ -2559,25 +2669,23 @@ fn write_files_through_transient(
           .any(|refusal| err.contains(refusal))
       };
       if code != 0 {
-        assert!(
-          transient(&err) && Instant::now() < deadline,
-          "attach for /file-{file}: {err}"
-        );
+        assert!(transient(&err), "attach for /file-{file}: {err}");
+        progress.check(owner, &format!("attach for /file-{file}: {err}"));
         refusals.push(err.trim().to_owned());
         pause();
         continue;
       }
       let attachment = value_of(&out, "attachment");
       let path = format!("/file-{file}");
-      let answered = run_with_stdin_within(
+      let answered = run_with_stdin_while_progressing(
         owner,
         &["write", id, &attachment, &path],
         live_body(file).as_bytes(),
-        FLEET_WAIT,
       );
       let Some((code, err)) = answered else {
         panic!(
-          "a write of {path} through the restarted owner was never answered within {FLEET_WAIT:?}: {:?}",
+          "a write of {path} through the restarted owner was never answered before its processes stalled, left or \
+           spent their CPU budget: {:?}",
           live_line(owner, "shipping", id)
         );
       };
@@ -2589,10 +2697,8 @@ fn write_files_through_transient(
       if code == 0 {
         break;
       }
-      assert!(
-        transient(&err) && Instant::now() < deadline,
-        "write {path}: {err}"
-      );
+      assert!(transient(&err), "write {path}: {err}");
+      progress.check(owner, &format!("write {path}: {err}"));
       refusals.push(err.trim().to_owned());
       pause();
     }
@@ -2600,24 +2706,24 @@ fn write_files_through_transient(
   refusals
 }
 
-/// [`run_with_stdin`] given `within` to exit: its exit code and standard error, or `None` once `within` has passed, the
-/// command then killed and reaped, so a reply the daemon never sends fails the flow rather than holding it for good (a
-/// restarted owner's log begun again at genesis held its first write past 23 minutes, the red run of 2026-11-18).
-fn run_with_stdin_within(
+/// [`run_with_stdin`] while `instance`'s processes progress ([`process_wait::InstanceWait`]): its exit code and standard
+/// error, or `None` once they stalled, left or spent their CPU budget, the command then killed and reaped, so a reply
+/// the daemon never sends fails the flow rather than holding it for good (a restarted owner's log begun again at genesis
+/// held its first write past 23 minutes, the red run of 2026-11-18). Until 2026-11-20 it was given the fleet wait.
+fn run_with_stdin_while_progressing(
   instance: &str,
   args: &[&str],
   input: &[u8],
-  within: Duration,
 ) -> Option<(i32, String)> {
   let mut child = spawned_with_stdin(instance, args, input, Stdio::null());
-  let deadline = Instant::now() + within;
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     match child.try_wait() {
       Ok(Some(status)) => return Some((status.code().unwrap_or(-1), stderr_of(&mut child))),
       Ok(None) => {}
       Err(error) => panic!("waiting on `slates {}`: {error}", args.join(" ")),
     }
-    if Instant::now() >= deadline {
+    if !progress.look(instance) {
       let _ = child.kill();
       let _ = child.wait();
       return None;
@@ -2767,7 +2873,8 @@ fn shards_fsyncer() {
   // SAFETY: `slates shards` placed the stream end at this number before the exec; nothing in this process opened it,
   // so this is its one owner.
   let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(number) };
-  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  // Read without a timeout: a live daemon answers while it lives, and its end closes the stream (A-232); until
+  // 2026-11-20 each read waited the fleet wait.
   let mut device = ShardsDevice { stream, unique: 0 };
   let mut init = Vec::new();
   for word in [FUSE_MAJOR, FUSE_MINOR, READAHEAD, 0] {
@@ -2973,7 +3080,7 @@ fn a_writable_maps_sync_on_a_live_volume_answers_only_once_a_candidate_holds_it(
     }
     let resumed = alone
       .is_none()
-      .then(|| synced_rx.recv_timeout(FLEET_WAIT).ok())
+      .then(|| recv_while_progressing(&synced_rx, &fleet.instances))
       .flatten();
     (
       alone,
@@ -3104,7 +3211,7 @@ fn a_checkout_into_a_live_volume_answers_only_once_a_candidate_holds_it() {
     }
     let resumed = alone
       .is_none()
-      .then(|| done_rx.recv_timeout(FLEET_WAIT).ok())
+      .then(|| recv_while_progressing(&done_rx, &fleet.instances))
       .flatten();
     (alone, resumed)
   });
@@ -3176,17 +3283,19 @@ fn signal_candidates(fleet: &Fleet, owner_index: usize, sent: rustix::process::S
   }
 }
 
-/// A `COMMIT` retried while it is told to try again, within the fleet wait, as a v4 client retries `NFS4ERR_DELAY`:
+/// A `COMMIT` retried while it is told to try again and `owner`'s processes progress (until 2026-11-20 within the fleet
+/// wait), as a v4 client retries `NFS4ERR_DELAY`:
 /// resumed, the owner's lease is confirmed again within a heartbeat or two, and until then every call is told to try
 /// again (the live-tree fence, AUD-29-83). The last answer.
 fn v4_commit_once_served(
+  owner: &str,
   session: &mut nfs4::Session,
   file: (&str, &str),
 ) -> (Result<Vec<u8>, u32>, Duration) {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let committed = v4_commit(session, file);
-    if committed.0 != Err(NFS4ERR_DELAY) || Instant::now() >= deadline {
+    if committed.0 != Err(NFS4ERR_DELAY) || !progress.look(owner) {
       return committed;
     }
     pause();
@@ -3217,7 +3326,8 @@ fn an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candida
   let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
   let port = port.parse::<u16>().unwrap();
   let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  // Read without a timeout: a live daemon answers while it lives, and its end closes the stream (A-232); until
+  // 2026-11-20 each read waited the fleet wait.
   let root = nfs::mount(&mut stream, &path, 1);
   nfs::create(&mut stream, &root, "v4", 2);
   let mut session =
@@ -3231,7 +3341,7 @@ fn an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candida
   let stable = v4_write(&mut session, file, (35, FILE_SYNC4), b", nor this");
   let late = counter(&owner, "fleet.live.durable_late");
   signal_candidates(&fleet, owner_index, rustix::process::Signal::CONT);
-  let resumed = v4_commit_once_served(&mut session, file);
+  let resumed = v4_commit_once_served(&owner, &mut session, file);
   let counters = live_counters(&owner);
   drop(stream);
   drop(fleet.daemons);
@@ -3626,11 +3736,12 @@ fn an_owner_killed_while_its_fleet_still_forms_is_taken_over() {
   );
   share_with_nodes(&anchors, &owner, &id);
   // The catalog and the head, placed on the owner and the bootstrap node (`f + 1`): a takeover can find the volume.
-  let deadline = Instant::now() + FLEET_WAIT;
+  // While the owner's and the bootstrap node's processes progress (until 2026-11-20 within the fleet wait).
+  let mut progress = process_wait::InstanceWait::new();
   while held_records(&bootstrap) < 2 {
-    assert!(
-      Instant::now() < deadline,
-      "the bootstrap node holds the volume's catalog and head"
+    progress.check_all(
+      &[&owner, &bootstrap],
+      "the bootstrap node holds the volume's catalog and head",
     );
     pause();
   }
@@ -3744,8 +3855,7 @@ fn a_live_volume_made_while_its_successor_was_stopped_is_served_by_it() {
   let returned_while_stopped = receiver.recv_timeout(STOPPED_HOLD).is_ok();
   signal(&fleet.daemons[stopped_index], rustix::process::Signal::CONT);
   if !returned_while_stopped {
-    receiver
-      .recv_timeout(FLEET_WAIT)
+    recv_while_progressing(&receiver, &fleet.instances)
       .expect("the writes return once the candidate is back");
   }
   drop(fleet.daemons.remove(owner_index));
@@ -3891,10 +4001,8 @@ fn a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates() {
       sender.send(id).unwrap();
     });
   }
-  let id = receiver
-    .recv_timeout(FLEET_WAIT)
-    .expect("the live volume was made");
-  let written = receiver.recv_timeout(FLEET_WAIT).is_ok();
+  let id = recv_while_progressing(&receiver, &fleet.instances).expect("the live volume was made");
+  let written = recv_while_progressing(&receiver, &fleet.instances).is_some();
   let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
   let counters: Vec<_> = fleet
     .instances
