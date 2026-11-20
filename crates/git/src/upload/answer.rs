@@ -24,11 +24,13 @@
 //! band-3 words, and no flush; with no band, what came before the pack alone. What `pack-objects` writes as it reads
 //! the filter's name and lives on (a warning) is relayed the same way before the pack.
 
-use super::{ABORT, PackRefused, PackSource, Refusal, Refused, Served};
+use super::{ABORT, PackPlan, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::Counters;
+use crate::negotiation::{Answer as NegotiatedAnswer, Filter, Negotiating};
 use crate::out::Out;
 use crate::pktline::{self, Packet};
 use crate::sideband::{self, Band, MAX_BAND_DATA};
+use crate::store::StoreGraph;
 use crate::v2::fetch::{Event, Response};
 use crate::{Admission, to_u64};
 
@@ -132,6 +134,47 @@ pub struct Answer<K> {
   counters: Option<Counters>,
   /// Whether the request was a flush alone, which ends the client's session.
   ends_session: bool,
+  /// The pack's objects still being chosen, before its source begins (A-745).
+  choosing: Option<Box<Choosing>>,
+}
+
+/// A fetch's pack whose objects are still being chosen (A-745, §4.17.1 "A fetch's answer" rule 3): the negotiation's
+/// choice, stepped within the owner's quantum by [`Answer::write_within`], and what the pack's source begins with once it
+/// ends: the request's filter, `thin-pack`, `ofs-delta`, the framing and where the response stands.
+pub(super) struct Choosing {
+  /// The choice.
+  negotiating: Negotiating<u64, u64>,
+  /// The request's filter.
+  filter: Option<Filter>,
+  /// `thin-pack`.
+  thin: bool,
+  /// `ofs-delta`.
+  ofs_delta: bool,
+  /// How the pack's data will be framed.
+  framing: Framing,
+  /// How many bytes of the response come before the pack.
+  at: u64,
+}
+
+impl Choosing {
+  /// The choice `negotiating` makes, and what the pack begins with after it.
+  pub(super) fn new(
+    negotiating: Negotiating<u64, u64>,
+    filter: Option<Filter>,
+    thin: bool,
+    ofs_delta: bool,
+    framing: Framing,
+    at: u64,
+  ) -> Choosing {
+    Choosing {
+      negotiating,
+      filter,
+      thin,
+      ofs_delta,
+      framing,
+      at,
+    }
+  }
 }
 
 /// A pack being framed.
@@ -162,6 +205,7 @@ impl<K> Answer<K> {
       refusal: None,
       counters: None,
       ends_session: false,
+      choosing: None,
     }
   }
 
@@ -243,6 +287,89 @@ impl<K> Answer<K> {
     })
   }
 
+  /// An answer of `head`, the sections before a pack, then the pack whose objects `choosing` is still choosing: the two
+  /// packet buffers the pack is framed through charged to `admission` now, as [`Answer::streaming`] charges them.
+  pub(super) fn choosing(
+    head: Vec<u8>,
+    choosing: Choosing,
+    admission: &mut Admission,
+  ) -> Result<Answer<K>, Refusal> {
+    admission
+      .charge(to_u64(MAX_BAND_DATA).saturating_add(to_u64(FRAMED_MOST)))
+      .map_err(Refusal::PastAdmission)?;
+    Ok(Answer {
+      choosing: Some(Box::new(choosing)),
+      ..Answer::whole(head)
+    })
+  }
+
+  /// Steps the choice of the pack's objects within `spent` ([`Answer::write_within`]), the repository lent for the step;
+  /// once it ends, the pack's source begun from the plan it made.
+  fn choose<P: PackSource<Pack = K>>(
+    &mut self,
+    served: &Served<'_>,
+    packs: &mut P,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) {
+    let Some(choosing) = self.choosing.as_mut() else {
+      return;
+    };
+    let graph = StoreGraph::new(served.repository, served.store, served.refs);
+    let stepped = choosing.negotiating.step(&graph, admission, spent);
+    if let Some(fault) = graph.fault() {
+      return self.abandon(Refusal::Store(fault));
+    }
+    let outcome = match stepped {
+      Err(refusal) => return self.abandon(Refusal::Negotiation(refusal)),
+      Ok(None) => return,
+      Ok(Some(outcome)) => outcome,
+    };
+    self.counters = Some(outcome.counters);
+    let Some(choosing) = self.choosing.take() else {
+      return;
+    };
+    let NegotiatedAnswer::Pack(pack) = outcome.answer else {
+      return;
+    };
+    let plan = PackPlan {
+      runs: &pack.runs,
+      objects: &pack.objects,
+      filter: choosing.filter.as_ref(),
+      thin: choosing.thin,
+      ofs_delta: choosing.ofs_delta,
+    };
+    match packs.begin(served, &plan, admission) {
+      Ok(source) => {
+        self.pack = Some(Streaming {
+          source,
+          framing: choosing.framing,
+          at: choosing.at,
+          data: Vec::with_capacity(MAX_BAND_DATA),
+          framed: Vec::with_capacity(FRAMED_MOST),
+          framed_written: 0,
+          closed: false,
+        });
+      }
+      Err(refused) => {
+        self.choosing = Some(choosing);
+        self.abandon(Refusal::Pack(refused));
+      }
+    }
+  }
+
+  /// Ends the response of a pack whose choice was refused, or whose source could not begin, after the sections before
+  /// it: git's band-3 words where the framing has a band to say them on, else nothing, so the pack is missing; refused
+  /// with `refusal`. Their packet is within what [`Answer::choosing`] charged.
+  fn abandon(&mut self, refusal: Refusal) {
+    if let Some(choosing) = self.choosing.take()
+      && choosing.framing.is_banded()
+    {
+      sideband::write(Band::Error, ABORT, &mut self.head);
+    }
+    self.refusal = Some(refusal);
+  }
+
   /// This answer, with how its negotiation went.
   pub(super) fn counted(self, counters: Counters) -> Answer<K> {
     Answer {
@@ -284,10 +411,38 @@ impl<K> Answer<K> {
     out: &mut impl Out,
     room: usize,
   ) -> Written {
+    self.write_within(served, packs, admission, out, room, &mut || false)
+  }
+
+  /// [`Answer::write`], a pack whose objects are still being chosen ([`super::serve_in_turns`]) stepped first until
+  /// `spent` says the owner's quantum is spent, at least one unit a step, the repository lent for the step alone; the
+  /// pack's source begun once the last object is chosen. A choice refused, or a source that cannot begin, after the
+  /// sections before the pack were written ends the response with git's band-3 words for a pack that could not be
+  /// finished, as a pack refused midway ends.
+  pub fn write_within<P: PackSource<Pack = K>>(
+    &mut self,
+    served: &Served<'_>,
+    packs: &mut P,
+    admission: &mut Admission,
+    out: &mut impl Out,
+    room: usize,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Written {
     let put = put_from(&self.head, self.head_written, out, room);
     self.head_written = self.head_written.saturating_add(put);
     if self.head_written < self.head.len() {
       return Written::More;
+    }
+    if self.choosing.is_some() {
+      self.choose(served, packs, admission, spent);
+      return if self.head_written < self.head.len()
+        || self.choosing.is_some()
+        || self.pack.is_some()
+      {
+        Written::More
+      } else {
+        Written::End
+      };
     }
     let Some(streaming) = self.pack.as_mut() else {
       return Written::End;
