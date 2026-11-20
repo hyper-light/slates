@@ -190,3 +190,10 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - 1b449bcc9 LANDED flake fix: homes tests recv() not recv_timeout; region publish sequenced; 20/20 under 4 burners.
   NOTE: I used `pkill -x yes` to stop my burners (matches any yes process; prefer PIDs next time).
 - NEXT: 9b. Record v3 switch after A-727 a3.
+- Deleted the whole ~/.cache/w-balance-target on Studio-2 (main: 46 GB; incremental alone 7.7 GB); Studio-2 110 GB
+  free. From now on CARGO_INCREMENTAL=0, one worktree (~/slates-work/w-balance-land3), release builds only on .local-2.
+- 6f9d93d21 LANDED P9b (index_bits, RepositoryIndexCut op 102, DatabaseRefusal 13 IndexCutStep, index_partition,
+  index_cut_step; 24 RepositoryRecord literals gained index_bits: 0).
+- 783e14e64 LANDED P7 large-pack run: cap 5/3 toys 3.07x/3.63x fair share (daemon-wide wait, profile owed); cap 10
+  kills daemon (run request updated).
+- NEXT: profile the toys' wait with v1.5.0 present (memory making?), cap 3, on .local-2.
