@@ -762,6 +762,8 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
 thread_local! {
   /// DIAG (w-bugs): the last conversation's room, for its end line.
   static DIAG_ROOM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  /// DIAG (w-bugs): the conversation's slices: the longest (ns), the most bytes, how many, how many past the quantum.
+  static DIAG_SLICE: std::cell::Cell<(u64, usize, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
 }
 
 /// DIAG (w-bugs): the room the last stepped conversation was given.
@@ -777,11 +779,16 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
   // DIAG (w-bugs, never for main): the shard's long polls and longest poll across this conversation, its turns and
   // the most bytes a turn wrote, against the step quantum and the room.
   let diag_before = slates_rt::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
+  DIAG_SLICE.set((0, 0, 0, 0));
   let (mut diag_turns, mut diag_most, mut diag_bytes) = (0u64, 0usize, 0u64);
   let diag_end = |turns: u64, most: usize, bytes: u64| {
     let after = slates_rt::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
     slates_machine::log_line!(
-      "diag-svnfetch svn:// conversation: turns {turns}, bytes {bytes}, most a turn {most}, room {}, quantum_ns {}, long_steps +{}, longest_step_ns {}",
+      "diag-svnfetch svn:// conversation: slices {} (past the quantum {}), longest slice_ns {}, most a slice {} bytes, turns {turns}, bytes {bytes}, most a turn {most}, room {}, quantum_ns {}, long_steps +{}, longest_step_ns {}",
+      DIAG_SLICE.get().2,
+      DIAG_SLICE.get().3,
+      DIAG_SLICE.get().0,
+      DIAG_SLICE.get().1,
       conversation_room_hint(),
       slates_rt::futures::step_budget_ns().unwrap_or(0),
       after.long_steps.saturating_sub(diag_before.long_steps),
@@ -840,7 +847,21 @@ async fn step(
   let next = {
     // A-740: a shard stuck answering a call (a replay, a log, an update's drive) names it.
     let _doing = slates_rt::futures::doing("vcs_svn::answer");
-    answer(conversation, out)
+    let began = std::time::Instant::now();
+    let next = answer(conversation, out);
+    // DIAG (w-bugs): this slice's own time and bytes.
+    let took = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    DIAG_SLICE.set({
+      let (most_ns, most_bytes, slices, past) = DIAG_SLICE.get();
+      let quantum = slates_rt::futures::step_budget_ns().unwrap_or(0);
+      (
+        most_ns.max(took),
+        most_bytes.max(out.len()),
+        slices + 1,
+        past + u64::from(took > quantum),
+      )
+    });
+    next
   };
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
