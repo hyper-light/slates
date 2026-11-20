@@ -17,5 +17,13 @@ sync:true of the kiln repo to that machine hung (r7, never synced). Runner e3018
    variants boxed, needless borrows, tests'/bench's net::Spec revoked_serials). w10_ proto::tests wire:: 266 passed on
    the merged tree; clippy -p kiln --lib --tests --benches clean.
 4. slates_e2e bare_metal on Windows: code ALREADY ON main (b7720ebca, bare_metal cfg(any(unix, windows))).
-   Windows run BLOCKED: jupiter takes no kiln work; kiln's GitHub CI windows legs build only (no slates_e2e, no WinFsp).
+   2026-11-20 on jupiter (kiln main fa96bcc47, clone C:\Users\corph\.cache\w-k90-vendor-kiln, target
+   C:\Users\corph\.cache\w-k90-vendor-target): `cargo test --locked -p kiln --test slates_e2e --no-run` built (66 min
+   cold); --list holds both bare_metal::g266_* tests. Python 3.13.17 + py launcher installed per-user (winget
+   Python.Python.3.13 --scope user). `SLATES_E2E=1 slates_e2e.exe bare_metal:: --test-threads=1`: 0 passed, 2 failed, both
+   at kiln's runner's own refusal "cannot mount here: WinFsp is not installed: winfsp-x64.dll did not load".
+   BLOCKED (Ada): WinFsp (a machine-wide kernel file-system driver) is not installed on jupiter; not installed by me.
+   To finish once it is: same binary, PATH with the Python Launcher, SLATES_E2E=1, bare_metal:: --test-threads=1.
+   Finding (read, not mine): crates/kiln/src/os/tree.rs:101 `is_fuse` is dead code on Windows (a warning there; a
+   Windows clippy -D warnings would fail).
 Owed (main's): Linux/Windows clippy + tests of items 2-3 (gate), the Windows bare_metal drive once jupiter takes kiln work.
