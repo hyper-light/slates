@@ -217,3 +217,15 @@ slates' CLAUDE.md §8 (Ada, 2026-11-18, "binding on every agent and subagent, fo
 - **The one addition, from Ada 2026-11-20 ("make your agents do A|B testing and back their decisions with data"):** a
   design decision between competing shapes is settled by the agent's own A/B: release builds, interleaved, all N
   shown, built as a measured example where possible (w-hg's changeset_ab.rs).
+
+## CLOSE THE OPEN ITEMS (ADA 2026-11-20 ~16:05 PST; binding, supersedes main's side assignments of the afternoon)
+Ada: "stop FUCKING doing that and ensure they close the existing fucking items." Main had let UI parts gain new open
+items as fast as old ones closed, and handed agents side pieces; only one UI part closed between 07:20 and 16:00.
+- **Your queue is your UI part's listed items, nothing else** (briefs/close-list.md names each agent's items, in order).
+  Land what is in flight only if it lands within 30 minutes; otherwise park it on a branch and move.
+- **A new finding** (a bug, a gap, a faster shape) goes to docs/wip/GAPS.md and your progress file. It is not worked,
+  and it is not added to any UI part, unless it blocks one of your listed items.
+- **When an item closes**, write inbox/main-from-<you>-close.md: the item, the commit on origin/main, the test or the
+  measurement. Main marks the part met the same check.
+- Main adds no new open items to UI parts. Performance items already listed are closed as listed (Ada's "performance
+  gaps upfront" still holds for them).
