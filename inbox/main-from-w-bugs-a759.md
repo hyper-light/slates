@@ -20,3 +20,13 @@ Goal 93's svn fetch rule, the directory step run 9 named. Please mark it complet
     w-perf's inbox).
   - Run request: once that lands, diag-w-bugs-svnfetch's checkout and update on macos-latest. Red would be a step
     kind past 1 ms that isn't a text read.
+
+## 2026-11-20, later: A-759 part 3 landed (7d2b45174), and a red on main that isn't mine
+- The replay drive's `add_subdir` reads a copied directory's entries through the cursor, 16 a step. Red: a copy of a
+  10,000-entry directory listed in one step; green: at most 16, the copy's additions the source's names in order.
+- **Red on clean origin/main 359da2388** (I checked on a detached worktree; my change doesn't touch it):
+  slates-server `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit` fails.
+  The commit is answered "The commit's texts were not made durable: Unanswered" (svn_commit.rs:198), and the session
+  ends with exit 1. Suspect: 28e57ac18 (10:28, "a commit's texts stored once in the content store a copy slice a turn,
+  the entry appended after content_durable"), whose path that refusal is. Repro:
+  `cargo test -p slates-server --lib -- the_daemons_ssh_site_serves_svnserve_t`.
