@@ -53,3 +53,27 @@
 - PAUSED for main's TOP PRIORITY: hg push of Mercurial's own repo (57k changesets, 84 MiB) -> 413 (unbundle body past
   the request's room, vcs_http/hg.rs). Fix as A-704 did for git, sliced; failing tests first; proof w-perf's
   crates/cli/bench/hg_scale.sh (branch agents/w-perf-p2); tell w-perf (slates-work-89) when landed.
+- A-711 (hg push room = shard's admittable, HTTP+SSH; past it pusherr) LANDED main bc2803d66 (worktree
+  ~/slates-work/w-hg-a711). Local 24/24 incl. new daemon_edge large push test (red 413 first). Told w-perf to rerun
+  hg_scale.sh. A-712 claimed for stream part 2 (commit ed54ff9b1 on agents/g083-hg-stream-p1; the A-711 commit there
+  too, cherry-picked to main -- re-merge before landing).
+- NOW: import room (ImportRefused PastRoom{278528} on Mercurial's repo; hg_import::room_of = one region, reserved as
+  retention at begin). Derive per repository, sliced (the import is already turn-sliced).
+- 2026-11-20: w-perf rerun of A-711: 413 gone; 57k push trips watchdog (1152 ms). Measured hg repo manifests: 57,007
+  revs, 9.4 MB deltas, 5.5 GB full texts -> slates' full-text storage (index content, push Verified, SHGR records) is
+  the blocker. Sent main a 4-piece proposal (delta storage, delta records, sliced intake, per-repo import room);
+  awaiting word; starting (4)/(3) meanwhile. One-off import least-room measurement running (bg task byk42vq42).
+- A-712 stream part 2 (`stream_out`, streamreqs) LANDED main 7405f9508 (piece f78ff53f0; worktree ~/slates-work/w-hg-a712).
+  Local hg serve:: import 96/96. Owed: stock `hg clone --stream` over the edge (part 3 with stream2).
+- 503 tests fixed (helper lands the import; heads = stock served heads) LANDED main (piece 3a59b5776); daemon_edge 13/13.
+- Main's order: (3) sliced intake + (4) per-repo import room, BUILT with content-once: decode each revision as it
+  arrives, rebuild against a stored base, check node, store once; file texts named by the green's ContentIdentity;
+  working set bounded independent of push size; admission reserves only the working set, content charged as stored
+  (A-714 retention); cite w-git's §4.17.1 rule. Then (1)+(2) manifest/changelog deltas + SHGR v2. Numbers: claim by
+  pushing amendments.tsv on agents/fanout-state (next free A-720 at last word). One-off import-room measurement was
+  killed at 30 min (release build + 5.5 GB of manifest texts); not rerun.
+- A-720 claimed (ledger pushed). Part 1 (slates-hg push::intake, sliced engine) LANDED main (piece 56952183f). Local push:: 41/41.
+  Note: ran `git checkout -b agents/w-hg-a720` in ~/slates-work/w-hg-a712 by mistake (rule breach; no files changed).
+- NEXT part 2: server drives Intake in slices (with_state per slice, yield between, quantum = step_budget_ns), one
+  intake per repository at a time, prepare/classify/tree over IndexHeld(fork), land with the fork, record from fork.
+  Storage: point at w-perf's identity table when it lands (crates/merge slice 1); no second store meanwhile.

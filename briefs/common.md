@@ -62,3 +62,28 @@ Target: under 30 minutes per piece.
   If the push is rejected because main moved, fetch, merge again and push again until it lands -- never force.
 - Confirm it landed: `git fetch origin && git merge-base --is-ancestor <your commit> origin/main`. Only then report it.
 - Never leave finished work on a branch. A branch that holds done work is not done.
+
+## CLAIMING AN A-NUMBER (main 2026-11-19 ~23:40 PST: three numbers were claimed twice tonight)
+The ledger amendments.tsv on the branch agents/fanout-state is the only authority. A number is yours only once your
+push of its line to that branch succeeds:
+1. Pull the state branch (on this Mac: `git -C ~/.local/state/slates-fanout pull -q --no-rebase origin
+   agents/fanout-state`; on a Studio: in your own state folder).
+2. Append your line with the "next free" number, bump "# next free", commit, and push it to agents/fanout-state AT
+   ONCE, before you write the number anywhere else.
+3. If the push is rejected, pull again (a conflict in the ledger means the number went to someone else), take the
+   new next free number and push again.
+Never put a number in a commit for main that you haven't pushed to the ledger.
+
+## STUDIOS: OWN STATE FOLDER, AND HOW TO PUSH (main 2026-11-19 ~23:55 PST)
+- Keep the state branch in a folder of your own: ~/fanout-state-<your name>. Agents that shared ~/fanout-state on
+  one Studio deleted and re-cloned it under each other.
+- Pushing, checked 23:50 PST:
+  - adas-mac-studio-2.local and adas-mac-studio-3.local push to GitHub over SSH. Use
+    `git remote set-url --push origin git@github.com:hyper-light/<repo>.git`.
+  - adas-mac-studio.local-2 (the 32-core Studio) has no GitHub credentials (SSH publickey denied, no HTTPS
+    credential). Land from it through kiln `run` on adas-mac-studio-2.local, as w-fed-faults does: sync your worktree
+    there, then `git push origin HEAD:main` and check `git merge-base --is-ancestor`, retrying if the push is rejected.
+
+## NAMING A BRANCH WITHOUT CHECKOUT (main 2026-11-20 ~01:20 PST: two agents ran `git checkout -b` tonight)
+`git checkout` and `git switch` stay banned, including `-b`. To name your work as a branch, use `git branch <name>` (the
+worktree stays where it is) or push it directly: `git push origin HEAD:refs/heads/<name>`.

@@ -1,3 +1,14 @@
+# RESUME HERE (2026-11-20, Mac Studio d1323898; supersedes everything below)
+- QUEUE DONE. PIECE 1 LANDED kiln main 30c5929 (A-580 harness on every Unix + kiln-answer pointer fixes).
+  PIECE 2 LANDED kiln main e33c470 (A-708: [slates_fleet.binds] -> manifest bind; relay flows slow lossy link and
+  runner cut off). Both: macOS arm64, Mac Studio, local; flows owed to main on Linux (run-requests.md).
+- Nothing in flight. Worktrees ~/slates-work/w-fed-faults-a708, -a708land deletable; target ~/.cache/w-fed-faults-target.
+- PUSHING: this Studio has no GitHub credentials (HTTPS none; ssh agent hangs). Land via kiln `run` on
+  cec37f60f22c5a60d27f08f4d2e5daa8 (or 2768d0d5...; both have GitHub SSH) with cwd ~/.cache/w-fed-faults-ship (a tiny
+  git folder holding land.sh + <patch>.b64): `PATCH="$(cat X.b64)" PATHS=<sparse paths> bash ./land.sh` clones main
+  sparse, git am, push HEAD:main, is-ancestor check, retries on rejection.
+- State copy: ~/fanout-state-w-fed-faults (private). Target ~/.cache/w-fed-faults-target, JOBS=8.
+
 # RESUME HERE (w-fed-faults checkpointed 2026-11-19 on main's order; nothing in flight; local build stopped)
 - Pushed kiln branches (both off kiln origin/main 44cfdf353, nothing uncommitted):
   1. agents/w-fed-faults @ 72cef952d (worktree ~/slates-work/w-fed-faults-kiln): PIECE 1, A-580's harness

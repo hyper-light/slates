@@ -42,3 +42,11 @@
   run-requests line filed. Next: TOP PRIORITY push-spin bug (main: stock git push of git/git all refs, 607 MiB pack,
   shard spins ~4 min in; repro ci/interop/git-matrix.sh on agents/w-interop-matrix, row push-all), then 2d SSH gone,
   then route A presenter (draft ~/slates-work/w-git-drafts/view_host.rs).
+- A-713 (clone room bug) LANDED main 03dc601a5 (a2f0fb970 + merge). Worktree ~/slates-work/w-git-pushspin
+  (branch agents/w-git-pushspin). Found while there: a 1,200-commit fetch's serve step ran >1 s in debug (upload-pack
+  negotiation+plan unsliced) and a 3,000-commit push answered after 1.7 s (push-spin candidates). Next: push spin.
+- A-719 part 1 (push checks sliced: receive::Checking, Session::check_turn, Answering::Turned) LANDED main 20ffba05f.
+  Main's ruling: A-719 = whole streaming intake (store each object once on arrival in the content store, deltas
+  against stored bases, bounded working set, admission by working set, §4.17.1 rule in the amendment); prove with
+  w-interop's v2.0.0 cut then git/git. Coordinate with w-perf (A-718 lands first; tell w-perf before changing how a
+  fragment's bytes are held; keep pushed deltas for pack reuse). Also owed: quarantine admission + verdicts sliced.

@@ -1,3 +1,16 @@
+# RESUME HERE (2026-11-19 ~22:00 local, relaunched on the Mac Studio; supersedes the checkpoint below)
+- Clone ~/slates-work/w-forming-repro (main); worktree ~/slates-work/w-forming-fix = agents/w-forming-repro
+  (cb97f4500 WIP aid) + local merge of origin/main a7051af96. Pushed over SSH (this Mac is adas-mac-studio-4; push url git@github.com; https has no credentials
+  ).
+- BLOCKED: disk here 7.4 GB free (others' use; guard 20 GB; nothing of mine to delete) -> no local build.
+  kiln run r1 (build live_chaos + 12 runs of the fresh-member flow; needs macos/arm64 disk=60g; target
+  ~/.cache/w-forming-target, logs ~/.cache/w-forming-runs/fm1 on whichever Mac takes it) is QUEUED, unplaced:
+  4 runners link down, no other macOS runner with cargo. Left queued; it starts by itself.
+- Nothing finished, so nothing to land on main.
+- State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
+- Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
+  test, fix, land (needs a machine that can push). No failure -> report count to slates-7a.
+
 # RESUME HERE (checkpoint 2026-11-19 ~23:50Z, ended on main's order "move every agent into kiln")
 - Role: implementer for goal 01a1af515 "A forming fleet reaches every candidate at start (live-fixes)"; supervisor
   slates-7a. Target (main): 48 of 48 forming runs reaching every candidate at one CPU, B10's harness = live_chaos's

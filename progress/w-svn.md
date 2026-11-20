@@ -62,3 +62,28 @@
 - Import memory: svn_import is already sliced per turn and charged as retention; the 3.9 GiB RSS was probably the
   unfolded chain (not verified: w-perf's svn_scale.sh repro is main's to run).
 - NEXT in queue: A-693 part 2 (held by main), then DAV pieces (g297 brief).
+
+## svn+ssh in the daemon's SSH site -- LANDED main a14635977 (commit fc79d36ae, verified ancestor of origin/main)
+- svn_view::TunnelRecords (vcs_ssh::svn::SvnStores), daemon_edge::daemon_site. Test the_daemons_ssh_site_serves_
+  svnserve_t_and_lands_a_stock_commit; local 16/16.
+- NOW: green_chains import bug NOT fixed by f37a96515 (w-perf rerun on 9ea6e1311: still refused at revision 1,685,
+  RSS 3.4 GiB). Suspect: the repository log entries (each revision's record + contents, EntryParts.objects) are
+  charged to the partition's merge budget (green_chain_bytes) and never fold. Investigating.
+
+## A-714 content charged per repository to the shard -- LANDED main b705a24c5 (commit 5ddb7e09b, verified on origin/main)
+- db: objects no longer charged to the merge budget (Repositories::objects_bytes); server: vcs_store::settle_objects
+  (after append, at make/recovery, credited at free), admit_objects for svn revisions only. Local: server 105/105 then
+  61/61 after merge, db 29/29, fmt clean. A-716 (w-perf) takes svn texts held once.
+- Ledger rule now: A-number is mine only after pushing its line on agents/fanout-state (next free A-720).
+- NEXT: A-693 part 2 (svn:// lock verbs; interop E170003), then DAV pieces (g297 brief: the two HTTP rows, A-681).
+
+## A-693 part 2 PARKED (main: the wedge bug first) -- branch agents/w-svn-a693p2-wip (pushed), worktree w-svn-a714
+- Written, unbuilt: commit/record.rs Record::Locks (tag 4) + records.rs commit_record applies it; svn_commit record
+  step handles Locks (check_entries); serve/locks.rs (lock_verb/locks_landed, Pending, words, read, answer);
+  reads/locks.rs with_lock_value; may_write, full_path, lock_error_message made pub(crate).
+- TODO: serve.rs: `mod locks;`, Phase::LockAsked/Locking (+Debug, waiting, session, receive out-of-turn, established
+  arms), Turn::LockAsked, Answered::LockAsked in elsewhere/command; vcs_svn Next::LockAsked -> lock_verb + record +
+  locks_landed; tunnel: answer LockAsked as unserved (210001); tests vs commit/lock-bob session.
+
+## NOW: wedge bug (main): green advanced but svn record rolled back ("record 3560 not published ... profile exceeds
+## region"), then every commit E160004 Diverged. Fix: one atom. Worktree ~/slates-work/w-svn-atom from origin/main.

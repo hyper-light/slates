@@ -35,3 +35,43 @@
   outputs committed to <branch>-results-<run>-<runner> (status.txt, clippy.txt, fsx.txt, records). Run 1
   (diag-w-bugs-b3-1, 44682281003): steps under bash -e ended before publishing; fixed (set +e) -> diag-w-bugs-b3-2.
 - B3 question: does fsx seed 1 still wedge over the WinFsp drive on main's tree (efa2266be's parent = main 9ea6e1311)?
+- B11 run 1 (diag-w-bugs-b11-1, ubuntu-latest 4 CPUs, unloaded): 30/30 pass, real mount (3 seeds, conflicts/unknown/
+  direct reads counted). Run 2 (b11-2): 50 runs beside 2 spinners/CPU, in flight.
+- B3 run 2 (b3-2, run 44682893059): main's Windows build FAILS: crates/anchor/src/supervise.rs:381 E0560 (9abe7e9a2,
+  A-689, `vcs_svn_listener: None` without #[cfg(unix)]). fsx never ran (exit 1). Fix = commit 88a96c97c on local main
+  in ~/slates-work/w-bugs-main (not pushed yet); diag-w-bugs-b3-3 (2f47f0e0b = main + fix + workflow) proving Windows
+  compiles; land the fix on its green.
+- Main fixed the Windows build itself (36478561d); my identical fix 88a96c97c stays local and unpushed (dropped).
+- B11 run 2 (b11-2, run 44683374880): 50/50 pass beside 8 spinners on 4 CPUs. B11 NOT reproduced by use (80/80 total).
+  Per Ada's rule not chased further; reported to main.
+- B3 run 3 (b3-3, main + the cfg fix): Windows builds; clippy fails on slates-db repository.rs:940 apply_advanced
+  (complexity 13/10) and slates-vfs recover.rs:2853 rebuild_snapshot_tree (11/10) -> main's lint keeper, not mine.
+  fsx did NOT run: xtask "the daemon did not come up within 60s (last exit 4)" though the anchor log shows the daemon
+  serving on 2 shards. `slates volume list` exits 4 (EXIT_FAILED) on Windows every try. Run 4 (diag-w-bugs-b3-4, from
+  main ea05b2ad6 past 36478561d, worktree ~/slates-work/w-bugs-b3 branch agents/w-bugs-b3 = diag only) captures
+  volume list's stderr against an anchor started as xtask does.
+- B3 run 4 (b3-4, run 44684243854, main ea05b2ad6): `slates volume list` against a live Windows anchor exits 4
+  every try: "channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord". Cause: rendezvous.rs
+  Windows unanswered_end/holder_lives copy the whole 64-byte bootstrap header (28c4f3839, 3e93acc84); bytes 8-24 are
+  declared words -> refused. = A-717 (claimed in amendments.tsv).
+- A-717 fix: marks_image copies bytes 24..48 only. RED on macOS arm64 Mac Studio: new test
+  a_claim_reads_the_process_marks_of_a_published_bootstrap_object failed LayoutRefused{0,64,TouchesWord} with the
+  whole-header copy; GREEN: `cargo test --locked -p slates-ipc --lib rendezvous::platform` 15/15, fmt clean.
+  Branch agents/w-bugs-claim-marks (worktree ~/slates-work/w-bugs-land): 072f36427 fix + 584f4d776 wip docs (bug
+  record docs/bugs/2026-11-20-every-windows-client-connect-was-refused-touchesword.md, GAPS line). Windows proof:
+  diag-w-bugs-b3-5 (048dbaf9b = fix + workflow) running. LAND as ONE commit from a fresh worktree off origin/main.
+- Slip: one command ended in `git checkout -b diag-w-bugs-b3-5-local` in ~/slates-work/w-bugs-fix (same commit,
+  nothing lost); no further checkouts.
+- State folder moved to ~/fanout-state-w-bugs (main's rule, 4d39b11). Numbers: claim only by a successful push.
+- A-717 LANDED main 721f4ff97 (one commit, fast-forward; files: crates/ipc/src/rendezvous.rs, the bug record, GAPS).
+  Windows proof by use: diag-w-bugs-b3-5 (run 44685574660): `slates volume list` against a live anchor exit 0 (was 4).
+  Run requests for main: Windows clippy of slates-ipc (marks_image is cfg(any(windows,test))); the Windows lanes'
+  WinFsp suites now reachable.
+- Next: B3's answer from b3-5's fsx leg (running).
+- B3 REPRODUCED by use on main+A-717 (diag-w-bugs-b3-5, windows-latest x86_64): fsx seed 1 wedged after op 45
+  (TRUNCATE DOWN 0x3ced0 -> 0xde10, after a write past a hole / shrink / extend), ended at its 300 s bound; matches the
+  reviewed expected-failure line. Hypothesis (g258's GAPS "A delete racing a coherent purge"): WinFsp completes an
+  answered IRP on the sending thread; SetInformation's completion runs CcSetFileSizes there; a page fault/paging read
+  it needs can be received only by slates' single receive worker (A-198), which is the one sending -> deadlock.
+  Run 6 (diag-w-bugs-b3-6, worktree ~/slates-work/w-bugs-b3s, branch agents/w-bugs-b3-stacks = diag only): user-mode
+  stacks of every slates.exe/fsx.exe thread (cdb -pv) at 90/180/270 s into the wedge.
