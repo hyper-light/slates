@@ -55244,3 +55244,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   the by-use proof on both architectures: with this change `slates-bridge-winfsp --lib` with WinFsp passes whole on
   x86_64 and arm64 (diag-w-bugs-lib-737, 2026-11-20), where every Windows run failed the check before.
 - **Applied in the same change to** GAPS (A-576's entry), `normalized.rs`' module docs, amendments.tsv.
+
+### A-738 — The FSFS view of a repository, part 1: revision and revision-property files (2026-11-20, w-reaper, UI goal 93; A-645 route A P1; §4.17.4 item 9; A-553, A-730, A-733)
+
+- **Why.** A hook is handed REPOS and reads it with `svnlook`, which opens an FSFS directory; slates holds a
+  repository as one green (§4.17.1), so REPOS has been `/<name>` (A-730). Main's ruling for A-645 route A: present a
+  read-only FSFS view, derived data generated lazily and sliced; P1 the revision and revprops files, P2 the
+  transaction directory for `svnlook -t`, P3 the presenter under SLATES_ROOT after A-727 a2 (referencing the same
+  blocks, never a copy), P4 git's, then the daemon publishing its root mount.
+- **Change.** `slates_svn::fsfs`: FSFS format 6 (sharded 1000, physical addressing, `PLAIN` representations) written
+  from the index and the green as `libsvn_fs_fs` writes it (`low_level.c`, `id.c`, `structure`; module docs). A
+  `View` keeps only each node-revision's offset and where its representations lie, laid out a revision a call under the
+  caller's node-revision budget (`View::advance`); a revision's file is generated when read (`View::revision_file`),
+  its texts read from the green in runs (`RevisionFile::read`), never copied. A text or property list equal to its
+  predecessor's is the predecessor's representation; a directory's entries list is new exactly when a child was
+  created or deleted beneath it in the revision. `Index::created_in` answers a revision's node-revisions (one run of
+  rows). Revision properties, the fixed files (`format`, `db/format`, `uuid`, `current`, …) and the directories are
+  answered beside it.
+- **Tests.** `crates/svn/tests/fsfs_view.rs`: revision 0 is `svnadmin create`'s file byte for byte; laid out one
+  node-revision a call, the layout takes one call a revision and every file equals the unsliced one, its trailer naming
+  the root's header and the changed paths and each header naming its own offset; and against stock Subversion 1.15.0,
+  the golden dump's repository written out as the view is passed by `svnadmin verify`, dumps back to `full.dump` and
+  `deltas.dump` byte for byte, and `svnlook changed --copy-info` gives `changed.txt` for every revision (macOS arm64,
+  Mac Studio 1, 3 of 3; the stock leg skips loudly where Subversion is absent).
+- **Owed.** P2 (the transaction directory), P3 (the presenter under SLATES_ROOT), P4, the root mount's publication.
+- **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
