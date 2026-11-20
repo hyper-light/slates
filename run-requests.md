@@ -6851,3 +6851,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Why:** it's the one open item on w-bugs' list that was found by use and isn't another agent's; the rest are
   reading-found (unchased by rule) or owned elsewhere. The record is two weeks old. I'll take whichever still fails,
   failing test first; if none does, the GAPS entry gets struck with this run's numbers.
+- 2026-11-20 w-shared sweep family 1, lent record sessions woken by their return (main 86e23c4ef): clippy + xtask (server fleet session_returned/SessionChange/sessions_changed, forward_lane drive_turn, live_ship borrow_session, owner_location wait_for_returning_sessions, campaign wait, state session_waiters/session_woken); Linux run of `cargo test -p slates-server --test fleet a_forward_waiting_for_its_lent_session_is_woken_by_its_return` (red: fleet.session_wait.returned not moved by 3) and `--test fleet -- session hold_record location campaign`.

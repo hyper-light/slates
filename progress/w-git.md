@@ -191,3 +191,21 @@
 - NEXT: memory per push (attribution: pack buffer, fork, index rows, objects; identical objects stored once by
   identity across concurrent pushes; bounded per-push working set), then Repository::commit O(objects) passes, then
   t_a665 derived deadline.
+- ~12:40 LOAD CONFIRM sent: long-history edge tests 12/12 at load 55-59 (release, .local-2, 60 PID burners).
+- MEMORY PER PUSH (Ada's MEMORY SIZING rule, briefs/common.md): ATTRIBUTION (diag branch agents/w-git-memdiag, test
+  git_push::tests::diag_memory_of_one_push, request file ~/.cache/w-git-runs/v150.req on .local-2): v1.5.0 push 9.4 MiB
+  -> admission peak 34.4 MiB transient; ContentStore 309 MiB after = every object inflated (git: 304.6 MiB inflated:
+  blobs 231, trees 69, commits 4.5). Plan = ruling B, sent to main:
+  B1 rows name object by (pack ContentId, entry offset, kind, len); pushed pack held once by identity.
+  B2 reads (Place::Indexed, IndexedObjects, bytes_of, PushedObjects, hook_view text, graph, sparse, revision, derived
+     trees/commits, paths) inflate from the pack in place; delta bases via a per-shard scratch sized by EWMA of the
+     working set, given back idle; no per-object alloc; turned read for long chains.
+  B3 quarantine keeps entry places, not inflated objects (intake admit_queued -> GitPush::admit_all -> admit_object
+     -> Push::admit -> Quarantine::admit put windows).
+  B4 remove object_bytes/put_object inflated copies (upload/encoding/sparse read the pack). No hold_bytes, no new store.
+  Red per step: resident <= k*pack + base, k derived. Worktree ~/slates-work/w-git-packed (from origin/main 86e23c4ef).
+- ~13:20 LANDED memory B1 ea5f0d6da (main a011645e6): store::packed (PackSource seam, read in place, Scratch). Seam note
+  to w-store sent. Builds/tests: kiln run with `on: adas-mac-studio.local-2`, sync false, clone ~/.cache/w-git-clone,
+  worktree ~/.cache/w-git-wt, CARGO_TARGET_DIR=~/.cache/w-git-target.noindex CARGO_INCREMENTAL=0 (kiln once placed a
+  needs-only run on this Mac: never again). NEXT: B2 rows by (pack, offset) + all readers via packed::read; B3
+  quarantine by entry place; B4 drop inflated copies; red: resident <= k*pack + base.
