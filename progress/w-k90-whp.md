@@ -113,6 +113,15 @@ every profile name a run leaves behind here; no other admin steps or installs.
 - Baseline before r26 (HKCU ...\AppContainer\Mappings monikers, C:\Users\corph\w-k90-whp\appcontainers-before.txt):
   164 profiles, 2 of them Shards' and not mine: shards.pipes-s0.41940.0, shards.pipes-s0.48268.0.
 
+## 2026-11-20 15:55 PST: WHP piece DONE (main recorded it); cleanup done by me
+- Deleted: jupiter C:\Users\corph\w-k90-whp\target (9.9G) and \kiln (645M) (logs + AppContainer lists kept there, 60 KB);
+  adas-mac-studio-3 and adas-mac-studio.local-2: ~/.cache/w-k90-whp-clone, ~/.cache/w-k90-whp-target.noindex (11.6G each);
+  this MacBook: ~/kiln-work/w-k90-whp.
+
+## NEXT (main 15:52): goal 92's two open parts (ownerless since g268)
+1. A-555 parts 2 and 3: server parks a request on a pending S3 base, answers when the fetch lands (no EIO/fault);
+   then the wire's create + credential hand-off. Red first each; land on slates main, focused tests.
+2. "The Shards-owed items done with Shards' side": list from g268's progress + cited Shards plans; build/test; GAPS.
+
 ## For main to delete
-- jupiter: C:\Users\corph\w-k90-whp\target (my kiln build) and C:\Users\corph\w-k90-whp\kiln (my clone), once the
-  goal is marked; adas-mac-studio-3 and adas-mac-studio.local-2: ~/.cache/w-k90-whp-clone, ~/.cache/w-k90-whp-target.noindex.
+- (none)
