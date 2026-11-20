@@ -36,6 +36,9 @@ use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, WAIT_OBJECT_0, WAI
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
+/// Shape: the relief receiver's beat in these drive tests (A-725), as the daemon's watchdog beat (100 ms).
+const RELIEF_BEAT: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Shape: what the anchor holds in these fixtures: one WinFsp drive's handles and no Shards DAX section, as the
 /// anchor's own tests bound a mount-only hold (`held_windows`'s `attachments(1)`; A-448 split the one bound in two).
 const ONE_MOUNT: HoldBounds = HoldBounds {
@@ -425,7 +428,10 @@ fn serve(role: &str, drive: &str) -> ! {
     (true, NameSearch::CaseSensitive),
     send,
     Waker::noop().clone(),
-    slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+    (
+      slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+      RELIEF_BEAT,
+    ),
     inherited,
   )
   .unwrap();
@@ -1174,7 +1180,10 @@ fn purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_ti
     (false, NameSearch::CaseSensitive),
     send,
     Waker::noop().clone(),
-    slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+    (
+      slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+      RELIEF_BEAT,
+    ),
     None,
   )
   .unwrap();
