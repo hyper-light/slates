@@ -163,7 +163,7 @@ pub(super) fn answer<P: PackSource>(
         written(served, &asked, outcome, packs, sparse, admission)
       }
       negotiation::Begun::Selecting(negotiating) => {
-        choosing(served, &asked, negotiating, sparse, admission)
+        choosing(served, &asked, *negotiating, sparse, admission)
       }
     }
     .map_err(refused)?
