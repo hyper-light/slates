@@ -55,6 +55,7 @@ path = "src/main.rs"
 # dead in every build, measured 2026-10-20. Asking for it here restores it for the product and
 # leaves the library crates' cross-lint C-free, since `slates-cli` is not in those graphs.
 slates-machine = { workspace = true, features = ["codecs"] }
+slates-mem = { workspace = true }
 slates-anchor = { workspace = true }
 slates-db = { workspace = true }
 slates-ipc = { workspace = true }

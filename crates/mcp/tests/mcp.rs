@@ -714,7 +714,8 @@ fn refused_file_calls_change_nothing(server: &mut McpServer, (volume, writer): (
 /// text form's definition, not a subset). Expect: two shard blocks; a measured `catalog.volumes` as a
 /// number with its absence meaning; the nine chokepoints in roster order; `shard.op` fresh on some
 /// shard after the lifecycle verbs; `archive.chunk` typed absent (`unknown`), never reported, with no
-/// producer on this host; and a span carrying the request, trace, span and cause identities distinctly.
+/// producer on this host; a span carrying the request, trace, span and cause identities distinctly; and each shard's
+/// retained bytes and versions, the retained bytes within its committed bytes.
 fn assert_status_exports_the_registries(status: &Value) {
   let shards = status["shards"]
     .as_array()
@@ -731,6 +732,17 @@ fn assert_status_exports_the_registries(status: &Value) {
   assert_chokepoint_registry(shards);
   assert_span_identities(shards);
   for shard in shards {
+    // The budget's retention (§4.2): what freed heads' snapshots pin and greens' histories hold, part of the committed
+    // bytes (A-742: the JSON printed it nowhere, so a retention charge was invisible).
+    let (retained, committed) = (&shard["retained_bytes"], &shard["committed_bytes"]);
+    assert!(
+      retained.is_u64() && shard["retained_versions"].is_u64(),
+      "{shard}"
+    );
+    assert!(
+      retained.as_u64() <= committed.as_u64(),
+      "retention is part of the committed bytes: {shard}"
+    );
     let drain = &shard["telemetry"];
     assert!(drain["shed_before"].is_u64() && drain["dropped_total"].is_u64());
     assert!(drain["remaining"].is_u64() && drain["missing_links"].is_u64());
