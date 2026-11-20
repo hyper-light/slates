@@ -1,1 +1,4 @@
 started 2026-11-20T11:18:33Z at afd363f891b65bd6e8bb58d4461e9156dfbeb098
+every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows exit 0 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.67s
+an_exact_drive_keeps_two_spellings_two_files exit 0 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.61s
+names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two exit 0 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.62s
