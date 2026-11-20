@@ -3647,6 +3647,13 @@
 >   none on arm64), which is a filter's pattern.
 > - Unproven: which IRP the worker's answer completed, and which filter waited. The worker's stack ends at FltMgr's
 >   first frame, because FltMgr's symbols were not loaded.
+> - **Cured by A-725, shown by use on WinFsp as released (2026-11-20, w-bugs, goal 87):** the race with an outside
+>   writer in place of the link (`crates/cli/tests/winfsp.rs`
+>   `a_delete_racing_a_coherent_purge_returns_and_removes_the_file`: 60 rounds of an SDK write, a held open through the
+>   drive, an SDK rewrite whose round purges it, then the close and delete at once). On main just before A-725, on CI's
+>   x86_64 runner, 2 of 3 runs hung: one deleter past 10 s at round 7, one test process stuck at round 43 until the
+>   step's 900 s bound (diag-w-bugs-race-old-1); with A-725's relief receiver 6 of 6 runs passed whole on x86_64 and
+>   arm64 (diag-w-bugs-race-new-1). The VM race on the patched driver is not rerun (no VM here).
 > - **The fix, once confirmed, is slates':** a receive must never wait for a send's completion. One way is a second
 >   receiver, WinFsp's own posture; A-198's capture-and-settle order assumes one, so this is a design amendment.
 >   Another way is to send from a thread that does not receive.
@@ -3696,6 +3703,13 @@
 >   `the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames`, `inflight::tests`'s
 >   `a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response`, `held::tests`'s
 >   `the_mount_record_keeps_how_its_drive_compares_names`).
+> - **Run and red-checked (2026-11-20, w-bugs, goal 87; CI windows-latest and windows-11-arm):** A-551's two drive
+>   tests pass on both architectures; with `CaseSensitiveSearch` declared for every volume (the rule before A-551)
+>   `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` fails and the exact one still passes
+>   (diag-w-bugs-win-green-1 / -red-1). A-576's case, held by use under Windows' own table (A-737):
+>   `names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two` (`ɐ`/`Ɐ` one file, `ς`/`σ` two,
+>   as on NTFS) passes, and fails with the same forced flag. The roster's git, Mercurial and Subversion workloads pass
+>   over the drive on both (WinFsp as released makes no hard link, so the stated hard-link lines apply).
 > - **Owed (main, filed in run-requests.md):** the Windows build of A-551 (`host.rs`, the server's `winfsp.rs`) and the
 >   drive tests `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` (red before: `a.txt` opened beside
 >   an unshared `A.TXT`, final path `a.txt`) and `an_exact_drive_keeps_two_spellings_two_files`
