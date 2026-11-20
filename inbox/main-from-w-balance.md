@@ -61,3 +61,8 @@ it and I'll write the test (in-crate, the gate on for the test's shards). If not
 ships push records, and I'll take that work if you assign it.
 Meanwhile the A/B (v2 against v3, release, best of N with all N, the publication cost) is ready to run on the 32-core
 Studio as soon as it answers kiln again (it hasn't for hours; SSH is refused there).
+
+### 2026-11-20 ~09:15: the durability barrier lands ALONE within the hour (ETA ~10:15 PST)
+Shape in inbox/w-svn-from-w-balance.md: `vcs_store::content_ticket(&state)` and `vcs_store::content_durable(origin,
+ticket, budget)`, group commit over the barrier already driven by committed publications. Red test: a crash between a
+put and its entry's append loses nothing named. Then back to v3 at f+1.
