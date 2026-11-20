@@ -197,7 +197,7 @@ async def burst(daemon: Daemon, pushes: list[tuple[str, int, bytes, str]]) -> tu
 
 # Format: the daemon's counters a step reports (A-724: where a starved push waits on the server): the HTTP edge's seats,
 # arrivals, overdue marks and reaps, and the share model's own.
-WATCHED_COUNTERS = re.compile(r"vcs_http|seat|arriv|overdue|reap|vcs_share|lane|turn|mem\\.large")
+WATCHED_COUNTERS = re.compile(r"vcs_http|seat|arriv|overdue|reap|vcs_share|lane|turn|mem\.large")
 
 
 def counters(daemon: Daemon) -> dict[str, int]:
@@ -211,6 +211,10 @@ def counters(daemon: Daemon) -> dict[str, int]:
 
     def walk(value):
         if isinstance(value, dict):
+            # A refusal or event counter is reported as {"kind": name, "count": n}.
+            kind, count = value.get("kind"), value.get("count")
+            if isinstance(kind, str) and isinstance(count, int) and WATCHED_COUNTERS.search(kind):
+                found[kind] = found.get(kind, 0) + count
             for key, inner in value.items():
                 if isinstance(inner, int) and not isinstance(inner, bool) and WATCHED_COUNTERS.search(key):
                     found[key] = found.get(key, 0) + inner
@@ -313,7 +317,7 @@ def usage_rows(daemon: Daemon) -> dict[str, dict]:
                 if key == "repositories" and isinstance(inner, list):
                     for row in inner:
                         if isinstance(row, dict) and row.get("name"):
-                            rows[row["name"]] = row
+                            rows[row["name"]] = dict(row, partition=value.get("partition"))
                 else:
                     walk(inner)
         elif isinstance(value, list):
@@ -451,6 +455,22 @@ def main():
                     spans.append((row.get("last_ns", 0) - row.get("first_ns", 0)) / 1e9)
                     queued.append(max(0.0, wall[0] - serve))
             if served:
+                # Each shard's step time spent on the repositories it owns (A-724), and beside each slow one-push
+                # repository the step time the others on its shard spent: a wait its shard's queue explains tracks it.
+                by_shard: dict = {}
+                for name, row in rows.items():
+                    by_shard[row.get("partition")] = by_shard.get(row.get("partition"), 0) + row.get("intake_step_ns", 0)
+                slow = sorted(
+                    ((row.get("last_ns", 0) - row.get("first_ns", 0)) / 1e9, rank, row)
+                    for rank in single
+                    if (row := rows.get(f"r{rank}"))
+                )[-5:]
+                for span, rank, row in slow:
+                    others = (by_shard.get(row.get("partition"), 0) - row.get("intake_step_ns", 0)) / 1e9
+                    print(f"    r{rank} on shard {row.get('partition')}: span {span:.3f} s, served "
+                          f"{row.get('intake_step_ns', 0) / 1e9:.3f} s, others' steps on its shard {others:.3f} s", flush=True)
+                busiest = sorted(by_shard.items(), key=lambda item: -item[1])[:3]
+                print("    busiest shards by step time: " + ", ".join(f"{part}: {ns / 1e9:.2f} s" for part, ns in busiest), flush=True)
                 print(f"    {len(served)} one-push repositories: served p50 {quantile(served, 0.5):.3f} s p99 "
                       f"{quantile(served, 0.99):.3f} s; server span p99 {quantile(spans, 0.99):.3f} s; "
                       f"queued p50 {quantile(queued, 0.5):.3f} s p99 {quantile(queued, 0.99):.3f} s", flush=True)
