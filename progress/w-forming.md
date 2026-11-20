@@ -62,6 +62,7 @@
   (1) held-poll marker (watchdog probe) fired 7x in pr4: verbs.rs:3299 forwarded request poll 1 (255-515 ms CPU),
   live_ship.rs:2430 whole build poll 2 (255-367 ms), serve loop. Sampler too slow to catch. Now timing whole-build parts
   (body_keys / one piece seal / append_build) in the probe build; pr4 continues with it.
+- (1) MEASURED (probe, pr4, throttled debug): live_ship whole build seals >=1 piece/turn: 1 MiB sealed in 87-302 ms vs quantum 14-784 us; append_build one turn 223-308 ms (append_ready 223: shipper.append_checkpoint of 1.79 MB 64 ms + ~159 ms more inside append_ready; ship_appended 0). Reported to main with a proposal; the 2,933 ms reaper poll still unnamed.
 - Queue after sw48c: run-7 stall chase; then run-25 spin (main 2026-11-20: name the unsliced task, fix failing-test
   first or hand main its location). Tool: ~/.cache/w-forming-scripts/spin-sampler.sh <runs-dir> samples every chaos
   daemon on a >=300 ms poll line; use with repro loops only, never during evidence runs.
