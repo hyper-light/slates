@@ -773,6 +773,20 @@ pub(crate) fn keep_here(state: EdgeState) -> Result<Kept<EdgeState>, RtError> {
   Ok(kept)
 }
 
+/// How long a client of this shard's edge may stay idle between its requests before its connection is overdue: the
+/// idle phase's learned bound ([`waits::PhaseWaits::bound_ns`]); none before an idle wait has completed here, or with no
+/// edge kept here. An HTTP commit's transaction idle past it is released (A-681; `crate::vcs_store`'s `dav_commits`).
+pub(crate) fn idle_bound_ns() -> Option<u64> {
+  here()?
+    .with(|state| {
+      state
+        .waits
+        .borrow()
+        .bound_ns(slates_http_edge::connection::Phase::Idle)
+    })
+    .flatten()
+}
+
 /// This shard's edge state, if one was kept here.
 fn here() -> Option<Kept<EdgeState>> {
   HERE.with(Cell::get)

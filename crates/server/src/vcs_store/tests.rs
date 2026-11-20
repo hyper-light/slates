@@ -1684,3 +1684,60 @@ fn t_a664_p3_a_pushs_version_keeps_its_map_of_gits_files() {
     );
   });
 }
+
+/// A-681 (§4.17.2's reaping, applied to an HTTP commit's transaction). Do: keep a transaction begun at instant 1,000,
+/// release idle ones at 1,500 against a bound of 1,000, take it and put it back then, release at 2,400, then at 2,600.
+/// Expect it kept through the first two releases (its last step at 1,500 is within the bound at 2,400) and released by
+/// the third, after which no take finds it.
+#[test]
+fn an_http_commit_idle_past_the_edges_idle_bound_is_released() {
+  use slates_svn::commit::drive::Setup;
+  use slates_svn::dav::commit::{DavCommit, World};
+  use slates_svn::dump::Uuid;
+  use slates_svn::lock::{AprTime, CommitLocks};
+  use slates_svn::migration::{Repository, Room};
+
+  let room = Room {
+    entries: 1 << 20,
+    bytes: 1 << 30,
+  };
+  let uuid = Uuid::parse(b"00000000-0000-4000-8000-000000000681").unwrap();
+  let records = Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", room).unwrap();
+  let world = World {
+    index: records.index(),
+    green: &records,
+    locks: records.locks(),
+  };
+  let setup = Setup {
+    base_path: String::from("/"),
+    repository_url: String::from("/project"),
+    filesystem: String::from("project"),
+    transaction: String::from("0-1"),
+    locks: CommitLocks {
+      user: Some(String::from("alice")),
+      presented: BTreeMap::new(),
+      keep: false,
+    },
+    now: AprTime(1),
+    room: 1 << 20,
+    rules: None,
+    revision_properties: Vec::new(),
+  };
+  let commit = DavCommit::begin(setup, &world, &|_| Ok(())).unwrap();
+  let id = RepositoryId { bytes: [6; 16] };
+  let mut stores = VcsStores::default();
+  stores.begin_dav_commit(id, b"alice", String::from("0-1"), (commit, 1_000));
+  stores.release_idle_dav_commits(1_500, Some(1_000));
+  let taken = stores.take_dav_commit(id, b"alice", ("0-1", 1_500));
+  let found = taken.is_some();
+  if let Some(commit) = taken {
+    stores.keep_dav_commit(id, b"alice", "0-1", (commit, 1_500));
+  }
+  stores.release_idle_dav_commits(2_400, Some(1_000));
+  let kept = stores.dav_commits.len();
+  stores.release_idle_dav_commits(2_600, Some(1_000));
+  let after = stores
+    .take_dav_commit(id, b"alice", ("0-1", 2_600))
+    .is_some();
+  assert_eq!((found, kept, after), (true, 1, false));
+}
