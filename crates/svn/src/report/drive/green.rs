@@ -133,16 +133,21 @@ impl Repository for Green {
     )
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     let text = self.texts.get(identity)?;
     let start = usize::try_from(offset).ok()?;
-    text.get(start..start.saturating_add(PIECE).min(text.len()))
+    text
+      .get(start..start.saturating_add(PIECE).min(text.len()))
+      .map(std::borrow::Cow::Borrowed)
   }
 }
 
 impl crate::commit::drive::Green for Green {
-  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
-    self.texts.get(identity).map(Vec::as_slice)
+  fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self
+      .texts
+      .get(identity)
+      .map(|text| std::borrow::Cow::Borrowed(text.as_slice()))
   }
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {

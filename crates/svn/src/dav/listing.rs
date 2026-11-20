@@ -122,7 +122,11 @@ fn ask(fields: &mut DirentFields, name: &str) {
 
 /// Reads a `file-revs-report`; a path is required ("Not all parameters passed").
 pub fn file_revs_report(body: &[u8], bounds: &Bounds) -> Result<FileRevsReport, DavRefusal> {
-  let root = svn_root(body, bounds, "file-revs-report")?;
+  file_revs_from(&svn_root(body, bounds, "file-revs-report")?)
+}
+
+/// Reads a `file-revs-report` whose root is read already (`request::report`'s dispatch, A-726).
+pub(crate) fn file_revs_from(root: &Element) -> Result<FileRevsReport, DavRefusal> {
   let mut path = None;
   let (mut start, mut end, mut include_merged_revisions) = (None, None, false);
   for child in root.elements().filter(|child| child.namespace == SVN) {
@@ -270,36 +274,50 @@ pub fn file_revs(
   room: usize,
 ) -> Result<Vec<u8>, DavRefusal> {
   let mut body = Body::new(room);
-  body.push(XML_HEADER)?;
-  body.push("<S:file-revs-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n")?;
+  body.push(FILE_REVS_START)?;
   for file_rev in revisions {
-    body.push(&format!(
-      "<S:file-rev path=\"{}\" rev=\"{}\">\n",
-      quote(&file_rev.path, true),
-      file_rev.revision
-    ))?;
-    for (name, value) in &file_rev.rev_props {
-      body.push(&prop("rev-prop", name, value))?;
-    }
-    for (name, value) in &file_rev.props {
-      body.push(&match value {
-        Some(value) => prop("set-prop", name, value),
-        None => format!("<S:remove-prop name=\"{}\"/>\n", quote(name, true)),
-      })?;
-    }
-    if file_rev.merged {
-      body.push("<S:merged-revision/>")?;
-    }
-    match &file_rev.delta {
-      Some(windows) => body.push(&format!(
-        "<S:txdelta>{}</S:txdelta></S:file-rev>\n",
-        delta(windows, version)?
-      ))?,
-      None => body.push("</S:file-rev>\n")?,
-    }
+    body.push(&file_rev_element(file_rev, version)?)?;
   }
-  body.push("</S:file-revs-report>\n")?;
+  body.push(FILE_REVS_END)?;
   Ok(body.into_bytes())
+}
+
+/// The start of a `file-revs-report`'s answer, `maybe_send_header`'s: the XML declaration and the report's element.
+/// Format: `file-revs.c` `maybe_send_header` (Subversion 1.15.0), `DEBUG_CR` a line feed.
+pub(crate) const FILE_REVS_START: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<S:file-revs-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n";
+
+/// The end of a `file-revs-report`'s answer.
+/// Format: `dav_svn__file_revs_report`'s last write (Subversion 1.15.0).
+pub(crate) const FILE_REVS_END: &str = "</S:file-revs-report>\n";
+
+/// One revision's `S:file-rev` element, as `file_rev_handler` and `delta_window_handler` write it (`file-revs.c`), its
+/// delta written in `version`.
+pub(crate) fn file_rev_element(file_rev: &FileRev, version: Version) -> Result<String, DavRefusal> {
+  let mut element = format!(
+    "<S:file-rev path=\"{}\" rev=\"{}\">\n",
+    quote(&file_rev.path, true),
+    file_rev.revision
+  );
+  for (name, value) in &file_rev.rev_props {
+    element.push_str(&prop("rev-prop", name, value));
+  }
+  for (name, value) in &file_rev.props {
+    element.push_str(&match value {
+      Some(value) => prop("set-prop", name, value),
+      None => format!("<S:remove-prop name=\"{}\"/>\n", quote(name, true)),
+    });
+  }
+  if file_rev.merged {
+    element.push_str("<S:merged-revision/>");
+  }
+  match &file_rev.delta {
+    Some(windows) => element.push_str(&format!(
+      "<S:txdelta>{}</S:txdelta></S:file-rev>\n",
+      delta(windows, version)?
+    )),
+    None => element.push_str("</S:file-rev>\n"),
+  }
+  Ok(element)
 }
 
 /// One property as `send_prop` writes it: escaped as `svn_xml_escape_cdata_string` escapes, or base64 with line breaks.

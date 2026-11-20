@@ -82,9 +82,10 @@ impl SvnStores for ServedRecords {
       let begun = DavCommit::begin(setup_of(name.clone(), now), &world, hooks);
       Some(begun.map(|commit| {
         let key = principal.key();
+        let now_ns = state.clock.monotonic_ns();
         state
           .vcs_stores
-          .begin_dav_commit(id, &key, name.clone(), commit);
+          .begin_dav_commit(id, &key, name.clone(), (commit, now_ns));
         name
       }))
     })
@@ -101,7 +102,8 @@ impl SvnStores for ServedRecords {
     crate::state::with_state(|state| {
       let key = principal.key();
       state.vcs_stores.subversion_records(id)?;
-      let Some(mut commit) = state.vcs_stores.take_dav_commit(id, &key, name) else {
+      let now_ns = state.clock.monotonic_ns();
+      let Some(mut commit) = state.vcs_stores.take_dav_commit(id, &key, (name, now_ns)) else {
         return Some(None);
       };
       let records = state.vcs_stores.subversion_records(id)?;
@@ -111,7 +113,10 @@ impl SvnStores for ServedRecords {
         locks: records.locks(),
       };
       let stepped = step(&mut commit, &world);
-      state.vcs_stores.keep_dav_commit(id, &key, name, commit);
+      let now_ns = state.clock.monotonic_ns();
+      state
+        .vcs_stores
+        .keep_dav_commit(id, &key, name, (commit, now_ns));
       Some(Some(stepped))
     })
     .flatten()

@@ -253,8 +253,8 @@ impl crate::git_hooks::PresentView for Unpresented {
 
 /// What the answer's first step left.
 enum Begun {
-  /// The answer, written.
-  Answering(Answering),
+  /// The answer, written; boxed, as the hooks' state is, since a received push is far larger.
+  Answering(Box<Answering>),
   /// The push sealed, its hooks before the verdicts due.
   #[cfg(unix)]
   Hooking(Box<hooks::Hooking>),
@@ -456,12 +456,12 @@ impl<P> ReceivePack<P> {
     let hooked = git_hook(&record).is_some();
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       let answering = self.declined(&mut Declining::hook(hook), out)?;
-      return Ok(Begun::Answering(answering));
+      return Ok(Begun::Answering(Box::new(answering)));
     }
     match prepare(state, &record, checked, pack)? {
-      Prepared::Declined(mut declining) => {
-        Ok(Begun::Answering(self.declined(&mut declining, out)?))
-      }
+      Prepared::Declined(mut declining) => Ok(Begun::Answering(Box::new(
+        self.declined(&mut declining, out)?,
+      ))),
       Prepared::Sealed { sealed, name } => {
         #[cfg(unix)]
         if hooked {
@@ -470,7 +470,7 @@ impl<P> ReceivePack<P> {
         }
         let received = self.decide(state, (&record, sealed, name), HookVerdicts::default())?;
         write_report(&received, out).map_err(PushFailed::Exchange)?;
-        Ok(Begun::Answering(Answering::Answered(received)))
+        Ok(Begun::Answering(Box::new(Answering::Answered(received))))
       }
     }
   }
@@ -554,7 +554,7 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
       AnswerState::Unbegun => {
         let can_present = self.presenter.can_present();
         match self.begin(state, can_present, out)? {
-          Begun::Answering(answering) => Ok(answering),
+          Begun::Answering(answering) => Ok(*answering),
           Begun::Hooking(hooking) => self.hooking(state, *hooking, out),
         }
       }
@@ -617,7 +617,7 @@ impl<P> ReceivePack<P> {
       }
       AnswerState::Unbegun => {
         let Begun::Answering(answering) = self.begin(state, false, out)?;
-        Ok(answering)
+        Ok(*answering)
       }
       AnswerState::Done => Err(PushFailed::Unchecked),
     }

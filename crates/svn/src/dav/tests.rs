@@ -405,14 +405,15 @@ fn the_captured_merge_names_its_transaction_and_a_lock_token_list_pairs_its_lock
   );
 }
 
-/// A-609 (each handler's refusals): do send a report with no `svn:` root, an unknown report, a get-locations without
-/// its peg revision, a log path out of canonical form, a revision of garbage, a get-locks depth of `exclude`, a replay
+/// A-609 (each handler's refusals): do send a report with no `svn:` root, an unknown report, a file-revs-report without
+/// its path (served since A-726: `file-revs.c`'s "Not all parameters passed"), a get-locations without its peg revision, a log path out of canonical form, a revision of garbage, a get-locks depth of `exclude`, a replay
 /// with two revisions, and an update-report without its source; expect each refused by kind, the unknown report 501.
 #[test]
 fn a_report_missing_what_its_handler_requires_is_refused_by_kind() {
   let refused = |body: &str| request::report(body.as_bytes(), &ROOMY).unwrap_err();
   let statuses: Vec<u16> = [
     "<D:log-report xmlns:D=\"DAV:\"/>",
+    "<S:no-such-report xmlns:S=\"svn:\"/>",
     "<S:file-revs-report xmlns:S=\"svn:\"/>",
     "<S:get-locations xmlns:S=\"svn:\"><S:path></S:path></S:get-locations>",
     "<S:log-report xmlns:S=\"svn:\"><S:path>a//b</S:path></S:log-report>",
@@ -424,7 +425,7 @@ fn a_report_missing_what_its_handler_requires_is_refused_by_kind() {
   .iter()
   .map(|body| refused(body).http_status())
   .collect();
-  assert_eq!(statuses, vec![501, 501, 400, 400, 400, 400, 400, 400]);
+  assert_eq!(statuses, vec![501, 501, 400, 400, 400, 400, 400, 400, 400]);
 }
 
 /// A-609 (no DTD, ever): do send a billion laughs, an external entity, and a reference to an undeclared entity; expect

@@ -182,45 +182,15 @@ pub(crate) async fn reaper() {
   }
   let mut deferred: VecDeque<(Handle<ClientSlot>, u32)> = VecDeque::new();
   loop {
-    // A host the fleet no longer counts a member has its clients' attachments ended on every shard (A-222), looked at
-    // when the members or their anchors changed, or again a retry window after a look some shard did not answer
-    // (A-554).
-    let Some(departures) = state::with_state(|state| std::mem::take(&mut state.departures_owed))
-    else {
+    if serve_owed_looks().await.is_none() {
       return;
-    };
-    if departures {
-      crate::remote_attach::sweep_departed().await;
-    }
-    // A taken-back map no holder claimed within the reconnect budget is reclaimed as a dead client's maps are (A-197),
-    // owed by the keeper at its claim's deadline (A-554). Linux alone takes such maps back.
-    #[cfg(target_os = "linux")]
-    let _reclaimed = crate::held_copy::reclaim_owed().await;
-    // A purge round the NFSv4 table owes its owners, handed over by the keeper at its deadline (A-570).
-    let Some(purges) = state::with_state(|state| std::mem::take(&mut state.nfs_purge_owed)) else {
-      return;
-    };
-    if purges {
-      crate::nfs::purge_owed_here().await;
     }
     let Some(round) = state::with_state(take_round) else {
       return;
     };
     let Some(round) = round else {
-      if deferred.is_empty() {
-        slates_rt::futures::idle().await;
-      } else {
-        let window = crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns());
-        if slates_rt::futures::within(window, slates_rt::futures::idle())
-          .await
-          .is_err()
-        {
-          return;
-        }
-        let again = std::mem::take(&mut deferred);
-        if state::with_state(|state| state.dead_clients.extend(again)).is_none() {
-          return;
-        }
+      if idle_until_owed(&mut deferred).await.is_none() {
+        return;
       }
       continue;
     };
@@ -231,6 +201,43 @@ pub(crate) async fn reaper() {
     }
     slates_rt::futures::yield_now().await;
   }
+}
+
+/// The reaper's looks owed besides its rounds: the departed hosts', the taken-back maps' and the NFSv4 purges'. None
+/// when the shard's state is gone.
+async fn serve_owed_looks() -> Option<()> {
+  // A host the fleet no longer counts a member has its clients' attachments ended on every shard (A-222), looked at
+  // when the members or their anchors changed, or again a retry window after a look some shard did not answer
+  // (A-554).
+  let departures = state::with_state(|state| std::mem::take(&mut state.departures_owed))?;
+  if departures {
+    crate::remote_attach::sweep_departed().await;
+  }
+  // A taken-back map no holder claimed within the reconnect budget is reclaimed as a dead client's maps are (A-197),
+  // owed by the keeper at its claim's deadline (A-554). Linux alone takes such maps back.
+  #[cfg(target_os = "linux")]
+  let _reclaimed = crate::held_copy::reclaim_owed().await;
+  // A purge round the NFSv4 table owes its owners, handed over by the keeper at its deadline (A-570).
+  let purges = state::with_state(|state| std::mem::take(&mut state.nfs_purge_owed))?;
+  if purges {
+    crate::nfs::purge_owed_here().await;
+  }
+  Some(())
+}
+
+/// With no round owed: idles until the next report, or, with retirements `deferred`, a window (the shard's own, A-455)
+/// at most, then owes them again. None when the shard's state is gone or its wait could not be timed.
+async fn idle_until_owed(deferred: &mut VecDeque<(Handle<ClientSlot>, u32)>) -> Option<()> {
+  if deferred.is_empty() {
+    slates_rt::futures::idle().await;
+    return Some(());
+  }
+  let window = crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns());
+  slates_rt::futures::within(window, slates_rt::futures::idle())
+    .await
+    .ok()?;
+  let again = std::mem::take(deferred);
+  state::with_state(|state| state.dead_clients.extend(again))
 }
 
 /// Retires the client `client_id` in `seat` at every owner, then gives its seat back: whether done (a deferral is tried

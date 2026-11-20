@@ -56,7 +56,7 @@ mod tests;
 
 pub use export::{Exporter, Exporting};
 pub use import::{Importer, Importing};
-pub use records::{Before, Checked, Properties, Repository, Room, before};
+pub use records::{Before, Checked, Properties, Repository, Room, TextSource, WithTexts, before};
 
 use crate::commit::revision::StepRefusal;
 use crate::dump::{Digest, DumpError, Uuid};

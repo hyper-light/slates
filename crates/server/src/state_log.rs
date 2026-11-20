@@ -118,7 +118,8 @@ impl StateLogs {
       .map(|(register, log)| (*register, &log.parts, &log.acked))
   }
 
-  /// The bytes of every part held.
+  /// The bytes of every part held; only the tests read it.
+  #[cfg(test)]
   pub(crate) fn bytes(&self) -> usize {
     self.bytes
   }
