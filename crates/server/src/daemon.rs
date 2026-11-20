@@ -4764,6 +4764,7 @@ async fn init_shard(
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
+    volume_ids_minted: 0,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
     base_waits: crate::base_wait::BaseWaits::default(),
@@ -5501,21 +5502,29 @@ fn refill_slice() -> bool {
 /// free blocks the next allocations of a chunk window would take (`ChunkArena::upcoming`): the burst bounded by the
 /// shard's memory share and by what its arena holds free.
 fn prefault_reserve(s: &ShardState) -> Vec<slates_mem::arena::KeptRun> {
+  let bytes = prefault_reserve_bytes(s);
+  if bytes == 0 {
+    return Vec::new();
+  }
+  s.store
+    .content
+    .arena()
+    .upcoming(s.store.content.chunk_bytes(), bytes)
+}
+
+/// The bytes of [`prefault_reserve`]: what an idle shard keeps pre-faulted (A-214), also reported per shard by the
+/// status's content ranges (A-745).
+pub(crate) fn prefault_reserve_bytes(s: &ShardState) -> usize {
   let arena = s.store.content.arena();
   // The busy period under way counts as soon as it has grown past the last one: an idle moment inside it, or right
   // after it, comes before the sweep pass that closes it.
   let running = s.burst_seen.map_or(0, |(_, before)| {
     arena.allocated_bytes().saturating_sub(before)
   });
-  let bytes = s
-    .last_burst
+  s.last_burst
     .max(running)
     .min(usize::try_from(s.config.reserve_per_shard).unwrap_or(usize::MAX))
-    .min(arena.free_bytes());
-  if bytes == 0 {
-    return Vec::new();
-  }
-  arena.upcoming(s.store.content.chunk_bytes(), bytes)
+    .min(arena.free_bytes())
 }
 
 /// The pressure hold across a daemon's shards (§4.2, admission.md §5.5), from the host's free memory at the daemon's

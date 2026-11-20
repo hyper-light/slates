@@ -4,6 +4,14 @@
 //! gives back `full.dump` and `deltas.dump` byte for byte, and `svnlook changed --copy-info` gives back `changed.txt`,
 //! the stock tools' own accounts recorded when the vectors were made (`fixtures/dump/make-fixtures.sh`, Subversion
 //! 1.15.0). Hosts without stock Subversion skip that leg loudly; the layout's own laws run everywhere.
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::string_slice
+)]
 
 use std::process::Command;
 
@@ -134,43 +142,54 @@ fn a_budget_slices_the_layout_by_revision_and_every_header_names_its_own_place()
       "r{revision}"
     );
     assert_eq!(sliced.revision_length(revision), Some(bytes.len() as u64));
-    let text = String::from_utf8_lossy(&bytes);
-    let body = text.strip_suffix('\n').unwrap();
-    let (_, trailer) = body.rsplit_once('\n').unwrap();
-    let (root, changes) = trailer.split_once(' ').unwrap();
-    let root: usize = root.parse().unwrap();
-    let changes: usize = changes.parse().unwrap();
-    let root_header = &bytes[root..];
-    assert!(
-      root_header.starts_with(b"id: "),
-      "r{revision}: the root's header at {root}"
-    );
-    let root_line =
-      String::from_utf8_lossy(root_header.split(|byte| *byte == b'\n').next().unwrap())
-        .into_owned();
-    assert!(
-      root_line.ends_with(&format!(".r{revision}/{root}")),
-      "r{revision}: {root_line}"
-    );
-    assert!(root_header.windows(8).any(|window| window == b"cpath: /"));
-    assert!(
-      changes <= bytes.len() && bytes[..changes].ends_with(b"\n\n"),
-      "r{revision}"
-    );
-    let mut headers = 0;
-    let mut start = 0;
-    while let Some(found) = find(&bytes[start..], b"\nid: ") {
-      let at = start + found + 1;
-      let line = String::from_utf8_lossy(bytes[at..].split(|byte| *byte == b'\n').next().unwrap())
-        .into_owned();
-      if line.contains(&format!(".r{revision}/")) && !line.ends_with(&format!("/{at}")) {
-        panic!("r{revision}: {line} lies at {at}");
-      }
-      headers += 1;
-      start = at;
-    }
-    assert!(headers >= 1, "r{revision}: no header");
+    assert_the_trailer_names_the_root_and_the_changes(&bytes, revision);
+    assert_every_header_names_its_own_place(&bytes, revision);
   }
+}
+
+/// Revision `revision`'s file `bytes`: its trailer names the root's header (an ID naming this revision and offset, its
+/// `cpath` the root) and where the changed paths end.
+fn assert_the_trailer_names_the_root_and_the_changes(bytes: &[u8], revision: u64) {
+  let text = String::from_utf8_lossy(bytes);
+  let body = text.strip_suffix('\n').unwrap();
+  let (_, trailer) = body.rsplit_once('\n').unwrap();
+  let (root, changes) = trailer.split_once(' ').unwrap();
+  let root: usize = root.parse().unwrap();
+  let changes: usize = changes.parse().unwrap();
+  let root_header = &bytes[root..];
+  assert!(
+    root_header.starts_with(b"id: "),
+    "r{revision}: the root's header at {root}"
+  );
+  let root_line =
+    String::from_utf8_lossy(root_header.split(|byte| *byte == b'\n').next().unwrap()).into_owned();
+  assert!(
+    root_line.ends_with(&format!(".r{revision}/{root}")),
+    "r{revision}: {root_line}"
+  );
+  assert!(root_header.windows(8).any(|window| window == b"cpath: /"));
+  assert!(
+    changes <= bytes.len() && bytes[..changes].ends_with(b"\n\n"),
+    "r{revision}"
+  );
+}
+
+/// Every node-revision header in revision `revision`'s file `bytes` whose ID names this revision names its own offset;
+/// there is at least one.
+fn assert_every_header_names_its_own_place(bytes: &[u8], revision: u64) {
+  let mut headers = 0;
+  let mut start = 0;
+  while let Some(found) = find(&bytes[start..], b"\nid: ") {
+    let at = start + found + 1;
+    let line = String::from_utf8_lossy(bytes[at..].split(|byte| *byte == b'\n').next().unwrap())
+      .into_owned();
+    if line.contains(&format!(".r{revision}/")) && !line.ends_with(&format!("/{at}")) {
+      panic!("r{revision}: {line} lies at {at}");
+    }
+    headers += 1;
+    start = at;
+  }
+  assert!(headers >= 1, "r{revision}: no header");
 }
 
 /// Where `needle` first lies in `haystack`.

@@ -4,6 +4,10 @@
 //! runs however many objects it holds. These are the run containers of a compressed bitmap [A: Lemire, Ssi-Yan-Kai and
 //! Kaser, "Consistently faster and smaller compressed bitmaps with Roaring", Software: Practice and Experience 46,
 //! 2016], kept alone because this data is runs. A position is below `u64::MAX`, which the repository never gives.
+//!
+//! It is the crate's, not the store's: the negotiation's answer and the pack's plan carry the objects they send as
+//! positions too (A-745: a fetch holds what it sends as runs, never an object at a time), and the negotiation names no
+//! store.
 
 /// A set of positions as runs (module docs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

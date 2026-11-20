@@ -1987,9 +1987,8 @@ fn json_merge_queries(instance: &str) {
   merge_copy(instance, &green);
 }
 
-/// A copy through the CLI (A-626 part 4): a work lands `/c/x.txt`; another declares `copy WORK /c /e` from its base and
-/// submits; a read of `/e/x.txt` at the green's head streams the copied bytes.
-fn merge_copy(instance: &str, green: &str) {
+/// The copy's source: a work lands `/c/x.txt` holding `copied` on `green`.
+fn land_the_copys_source(instance: &str, green: &str) {
   let (code, out, err) = run(instance, &["work", green, "worksource"]);
   assert_eq!(code, 0, "{err}");
   let work = value_of(&out, "id");
@@ -1998,6 +1997,12 @@ fn merge_copy(instance: &str, green: &str) {
   let (code, out, err) = run(instance, &["submit", &work, "--json"]);
   assert_eq!(code, 0, "{err}");
   assert!(out.contains("\"accepted\":true"), "the source lands: {out}");
+}
+
+/// A copy through the CLI (A-626 part 4): a work lands `/c/x.txt`; another declares `copy WORK /c /e` from its base and
+/// submits; a read of `/e/x.txt` at the green's head streams the copied bytes.
+fn merge_copy(instance: &str, green: &str) {
+  land_the_copys_source(instance, green);
   let (code, out, err) = run(instance, &["work", green, "workcopy"]);
   assert_eq!(code, 0, "{err}");
   let work = value_of(&out, "id");

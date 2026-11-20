@@ -117,8 +117,8 @@ pub struct Versions {
 pub trait Answered {
   /// The runs of versions the pack carries from their fragments, in order.
   fn runs(&self) -> &[Versions];
-  /// The objects the pack carries one by one, by position, each once, in ascending order.
-  fn objects(&self) -> &[u64];
+  /// The objects the pack carries one by one, by position, as runs (A-745).
+  fn objects(&self) -> &Positions;
   /// Whether the client said `thin-pack`: a delta may name a base the client holds.
   fn thin(&self) -> bool;
   /// Whether the client said `ofs-delta`: a delta may name its base by its offset back.
@@ -509,15 +509,16 @@ impl<A: Answered> Upload<A> {
     }
   }
 
-  /// Reads a window's worth of the answer's objects into the wanted set, a handle `size_of::<u64>()` bytes.
+  /// Reads a window's worth of the answer's runs of objects into the wanted set, a run `size_of::<(u64, u64)>()` bytes
+  /// (A-745: the answer carries its objects as runs, so a clone's few runs are read at once whatever it holds).
   fn read_objects(&mut self, cx: &Context<'_>, next: usize) -> Result<Stage, StoreRefused> {
     let handles = handles(cx.store);
-    let objects = self.answer.objects();
-    let end = next.saturating_add(handles).min(objects.len());
-    for position in objects.get(next..end).unwrap_or_default() {
-      self.wanted.insert(*position);
-    }
-    if end < objects.len() {
+    let runs = self.answer.objects().run_pairs();
+    let end = next.saturating_add(handles).min(runs.len());
+    let window =
+      Positions::from_runs(runs.get(next..end).unwrap_or_default().to_vec()).unwrap_or_default();
+    self.wanted = self.wanted.union(&window);
+    if end < runs.len() {
       return Ok(Stage::Objects { next: end });
     }
     self.gather_from(0)

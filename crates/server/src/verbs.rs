@@ -158,8 +158,18 @@ pub(crate) fn fresh_volume_id(state: &mut ShardState) -> Option<DbVolumeId> {
 
 /// The `offset`-th of several fresh volume ids minted before any of their volumes is recorded (A-694): an append's new
 /// branches, each its own, where [`fresh_volume_id`] would name the same id for each.
+///
+/// Each mint is the shard's alone (`ShardState::volume_ids_minted`): an id minted before the atom that records it (an
+/// image's identity at its plan, an archive's or an import's volume at its admission, A-652's export) is reserved, so a
+/// second job minting before the first records takes the next. Found by A-652's export: two exports side by side named
+/// one id and the second was refused `AlreadyExists` at its record. A mint inside the recording transaction cannot be
+/// the structural form here, since an image's identity holds its id before its volume is recorded.
 pub(crate) fn fresh_volume_id_at(state: &mut ShardState, offset: u64) -> Option<DbVolumeId> {
-  let count = state.db.volume_counter_at(offset)?;
+  let unrecorded = state.db.volume_counter_at(0)?.max(state.volume_ids_minted);
+  let count = unrecorded
+    .checked_add(offset)
+    .filter(|count| *count <= slates_db::register::MAX_OBJECT_COUNTER)?;
+  state.volume_ids_minted = state.volume_ids_minted.max(count.checked_add(1)?);
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&state.fleet.host().0.to_be_bytes());
   bytes[8..10].copy_from_slice(&state.partition.to_be_bytes());

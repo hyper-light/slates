@@ -1382,6 +1382,12 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > written pages are the owner partition's segment log ring (355.2 MiB) and snapshot slots (225.8 MiB); the content
 > object holds 2.3 MiB (BENCHMARKS.md).
 
+> **Status (2026-11-20, A-746: the register by record kind).** `content_ranges` adds `register_log` (the log since the
+> last snapshot) and `register_snapshot` (the last snapshot), each by repository records, green chain entries,
+> checkpoints and the rest (`slates_db::replay::RegisterSplit`), and the arena's `prefault_reserve`. After the
+> 1,000-revision import the owner partition's register holds 222.4 MiB of repository records, 133.1 MiB of chain
+> entries and 137.4 MiB of checkpoints (BENCHMARKS.md).
+
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
 **Data model.**
@@ -12287,8 +12293,17 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > **Status (2026-11-20, A-745).** Red, by use: a clone whose answer is past one request's room is refused
 > `PastAdmission` (`vcs_http::daemon_edge`'s `a_mercurial_clone_larger_than_one_ring_region_...`, ignored until it
 > passes; w-interop's clone of Mercurial's 57,035 revisions, `asked: 228144, left: 218727`). Mercurial's `getbundle`
-> builds the whole answer, then frames it (`slates_hg::serve::getbundle`). Owed: the answer made and sent in slices
-> (Mercurial first, then its stream clone), git's upload-pack (w-git).
+> built the whole answer, then framed it. Piece 1 BUILT: `slates_hg::serve::getbundle::Answering` makes it a slice at a
+> time, each step its own room, a clone of every head walked by its links (7.2's `fastpathlinkrev`: the missing
+> changesets as ranges, the manifest log, then the file logs row to row through `HgIndex::file_revision_from`), any
+> other fetch by the changesets that name each revision (7.2's slow path, bounded by what it sends). Owed: the server
+> driving it a turn at a time (piece 2), the stream clone (piece 3), git's upload-pack (w-git).
+> **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
+> fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
+> none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
+> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). Owed for git: the walk's own
+> sets (piece 2: negotiation and plan a step at a time, `upload::Answering`), the server driving it a turn at a time
+> within a request's room (piece 3, reverting A-713's shard room).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -55481,6 +55496,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4a — A git record's pack is replayed a turn at a time (2026-11-20, w-git for UI goal 93; main's ruling: a large pack record's replay ran in one turn and crash-looped the daemon)
+- **Change.** `vcs_store::git_replay`: a version-2 record carrying a pack is decoded once as its replay begins (names,
+  moves and the pack's place in the record kept), then read a chunk at a time (`DaemonConfig::archive_slice_bytes_within`
+  of the turn) and its objects admitted one at a time, each turn held to the shard's step quantum and taking one unit
+  at least; the names compared, the seal, the moves and the commit at its end. A rebuild's turn and a recovery's unit
+  step it (`record_turn`); a replay under way is kept on the stores and given back if its rebuild is replaced. Owed,
+  sliced in turn: a thin pack's resolve of outside bases (`Reader::finish_with`, after w-balance's receive resolve
+  slicing lands), the seal's staging pass, the moves' admission and the landing's whole passes.
+- **Tests.** `slates-server` `vcs_store::tests::t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns`
+  (one record of 66 objects; red before: replayed in one turn); `t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn`
+  now a turn a record at least.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge` 165 passed, 1 ignored; fmt clean.
+
 ### A-743 — Every name the namespace binds is a ref git's site serves (bug, 2026-11-20, w-git for UI goal 93; main's ruling; found by use by w-interop)
 - **Found by use.** Stock git 2.50.1 over the HTTP edge: a branch made with `slates repository branch create project
   topic --from main` never showed in `git ls-remote --heads`. The advertisement listed each bound name whose green held a
@@ -55873,6 +55902,34 @@ shared with the export's).
   server's repro, refused `TypeChanged`), `-- t_a626_p4 vcs_store::paths:: vcs_store::commits::` 20 of 20; fmt clean.
 - **Owed.** The refusal kept, and A-586's other "does not yet copy" cases, answering their own typed refusals rather than
   `TypeChanged` (next); a copy from before an outside node changed, read from its history.
+
+
+### A-746 — The register by record kind: chain entries and checkpoints lead (270.5 MiB) over repository records (222.4 MiB), so the next content-once step is a green's bytes named, not carried (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.16, §4.17.1; A-64, A-727, A-744)
+
+Applied in the same change to: `crates/db` (`replay::RegisterSplit`, `DbStats::tail_split` and `snapshot_split`, kept
+at each append and each snapshot); `crates/server` (`content_ranges`: the register's splits and the arena's
+`prefault_reserve`; `daemon::prefault_reserve_bytes`); §4.2's status; GAPS; BENCHMARKS.md.
+
+- **The question** (main's ruling): of the 581 MiB A-744 found in the owner partition's log ring and snapshot slots,
+  how much is repository records carrying texts, green chain entries carrying file bytes, checkpoints, and the rest?
+- **The split.** The log is counted as it is appended: each record's operations by what they carry (a green's advance
+  and origin, and the chain entries a repository entry carries for its greens; a checkpoint; a repository entry's
+  objects), the rest its other bytes; reset at each snapshot. A snapshot is counted when it is taken, its repository
+  registers', chains' and checkpoints' encoded lengths (exact: derived `Wire::encoded_len`), the rest the remainder.
+- **Measured** (three runs, identical): the log since the last snapshot 267.2 MiB (repository records 87.5, chain
+  entries 87.4, checkpoints 92.2, rest 0.1); the last snapshot 225.8 MiB, exactly its slot's resident pages (repository
+  records 134.9, chain entries 45.7, checkpoints 45.2). Over both, chain entries and checkpoints 270.5 MiB, repository
+  records 222.4 MiB. The ring's other 88 MiB in RAM (355.2 resident against the 267.2 live) are pages it released at its
+  last snapshot and never gave back. The prefault reserve was 0.
+- **The decision** (main's rule): chain entries and checkpoints lead, so a green's bytes named rather than carried is
+  next (A-742's design note, items 3 to 7: Files' blocks as chunk references through one block seam, chain entries and
+  checkpoints naming chunks), on A-727's seam with w-perf, agreed before code. The repository records go to A-727 (a3)
+  and S4 (w-perf, w-svn).
+- **Tests.** macOS arm64, Mac Studio, local: `slates-db --lib replay` (a record's bytes split by what its operations
+  carry), `--test model`; `slates-server --lib content_ranges`, `svn_commit`; `slates-mcp --test mcp`; fmt clean.
+- **Owed.** The log ring's released pages given back (as the write log's are, A-105); `projected_snapshot_bytes`
+  (A-724 piece 8) encodes a whole entry to read its length, where the derived `encoded_len` would do once every
+  field's is exact.
 
 ### A-586's copy refusals typed — A copy this piece does not make is refused before any verdict by its own case, never a conflict (2026-11-20, w-shared for UI goal 93; main's ruling)
 - **Why.** Each copy the engine does not make was answered as a `TypeChanged` conflict window at its destination, which
