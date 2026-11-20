@@ -14862,3 +14862,38 @@ Where one push's 229 MiB goes (`MallocStackLogging=1`, `malloc_history -allBySiz
 the content store's arena regions grown for them. Owed, and what the next run measures: the intake keeping the
 client's deltas compressed and naming blobs in the green's identity table (w-git's streaming intake; A-716 slice 1a's
 `Green::hold_bytes`), and the register entries naming objects by identity rather than holding them.
+
+## Many repositories of mixed sizes and skewed activity on one daemon: every push lands, and the toys are starved 14 times over while one hot repository pushes (A-724 piece 7; Ada's goal of 2026-11-20; 2026-11-20)
+
+- **The command:** `crates/cli/bench/multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0
+  --steps 1,10,100,1000`. Size classes are git/git's packs at v0.99 (4,507 objects, 1,180,907 bytes), v1.0.0
+  (12,232 objects, 3,434,408 bytes) and v1.5.0 (34,296 objects, 9,871,550 bytes). By rank, a step of R repositories
+  gives rank 1 the largest class, ranks 2 to 10 the next and the rest the smallest. It sends about R pushes at once,
+  repository i taking its Zipf (s = 1) share, each push a new branch. Every step runs on a fresh daemon. Each class's
+  baseline is one push alone on its own daemon. The script's docstring states the bounds.
+- **The machine and build:** adas-mac-studio.local-2, Apple M3 Ultra, 32 cores, 96 GiB; release `slates` built from
+  1e84630b1 (main 129cd0d1b with the script); dataset `~/.cache/g309-scale/src.git` (git/git, w-perf's); load 5.2 at
+  the start; 44,675 MiB free. One run (N = 1) of each step: every figure below is that run's.
+
+| Step | Pushes | Wall | Peak RSS | Class | Pushes (repositories) | p50 | p99 | p99 / alone |
+|---|---|---|---|---|---|---|---|---|
+| alone | 1 each | | 73 / 195 / 808 MiB held | 0 / 1 / 2 | 1 (1) each | 0.180 / 0.640 / 2.677 s | | 1 |
+| R = 1 | 1 | 2.748 s | 965 MiB | 2 | 1 (1) | 2.744 s | 2.744 s | 1.0 |
+| R = 10 | 9 | 5.587 s | 2,252 MiB | 1 | 6 (9) | 0.812 s | 1.116 s | 1.7 |
+| | | | | 2 | 3 (1) | 5.530 s | 5.583 s | 2.1 |
+| R = 100 | 86 | 30.136 s | 9,417 MiB | 0 | 30 (90) | 0.516 s | 2.534 s | **14.1** |
+| | | | | 1 | 37 (9) | 2.538 s | 4.322 s | 6.8 |
+| | | | | 2 | 19 (1) | 29.575 s | 30.132 s | 11.3 |
+| R = 1,000 | not run | | | | | | | |
+
+- **What it says.** Every push landed and none was refused (A-724 piece 3's room never refused one). But at R = 100,
+  the small repositories' p99 was 14.1 times their push alone while one hot repository's 19 pushes ran for 30 s. Piece
+  3 divides memory room, not the shard's CPU: a toy whose shard also serves the hot repository waits behind its steps.
+  So the next piece is the CPU half of §4.17.5's shares, the shard's step quanta scheduled fairly by repository.
+- **What stopped it.** R = 1,000 was not run. Its memory, estimated from the memory each class's push held in the steps
+  before, was 202,091 MiB against 30,107 MiB free. A push still holds about 70 to 80 times its pack (the section above;
+  w-perf's A-723 and A-727 bring that to one copy a byte), so the thousand-repository step waits on them.
+- **Found by use.** One push of git/git v2.0.0 (164,487 objects, a 55,889,275-byte pack) ended the daemon: an empty
+  HTTP answer and the daemon gone after 2.6 to 5.0 s, peak RSS about 1.5 GiB, alone and at R = 1 (the first run, with
+  v2.0.0 as a fourth class). Reported to main as a run request; the giant class waits on its fix.
+

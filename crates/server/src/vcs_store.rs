@@ -101,10 +101,12 @@ pub(crate) mod commits;
 pub(crate) mod git_encode;
 pub(crate) mod hg_import;
 pub(crate) mod hg_view;
+pub(crate) mod homes;
 pub(crate) mod lfs_record;
 pub(crate) mod paths;
 pub(crate) mod record;
 pub(crate) mod svn_import;
+pub(crate) mod svn_made;
 pub(crate) mod svn_view;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
@@ -136,6 +138,20 @@ pub(crate) const REBUILT: &str = "vcs_store.rebuilt";
 /// zero in every correct use. Format: a counter name.
 pub(crate) const COMMIT_REFUSED: &str = "vcs_store.commit_refused";
 
+/// Counter: an HTTP commit's transaction released idle past the edge's learned idle bound (A-681).
+const DAV_COMMITS_RELEASED: &str = "vcs_store.dav_commits_released";
+
+/// An HTTP commit kept between its requests: who made it, the monotonic instant of its last step, and its drive.
+#[derive(Debug)]
+pub(crate) struct DavHeld {
+  /// The key of the principal that made it.
+  principal: Vec<u8>,
+  /// The monotonic instant of its last step.
+  last_ns: u64,
+  /// Its drive.
+  commit: DavCommit,
+}
+
 /// The stores of every repository on this shard's partition (module docs).
 #[derive(Debug, Default)]
 pub(crate) struct VcsStores {
@@ -166,9 +182,11 @@ pub(crate) struct VcsStores {
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
   /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
-  /// transaction name, with the key of the principal that made it: at most one a repository and principal, a new POST
-  /// replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the partition's repositories and principals.
-  dav_commits: BTreeMap<(RepositoryId, String), (Vec<u8>, DavCommit)>,
+  /// transaction name, with the key of the principal that made it and the monotonic instant of its last step: at most
+  /// one a repository and principal, a new POST replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the
+  /// partition's repositories and principals; and one idle past the edge's learned idle bound is released at the
+  /// table's next use ([`VcsStores::release_idle_dav_commits`]).
+  dav_commits: BTreeMap<(RepositoryId, String), DavHeld>,
   /// The HTTP transactions this shard has named, which a transaction's name counts.
   dav_named: u64,
 }
@@ -176,12 +194,12 @@ pub(crate) struct VcsStores {
 /// One repository's store, by its tool (module docs).
 #[derive(Debug)]
 pub(crate) enum RepositoryStore {
-  /// git's.
-  Git(GitStore),
+  /// git's. Each arm is boxed: their stores differ in size by hundreds of bytes.
+  Git(Box<GitStore>),
   /// Mercurial's.
-  Mercurial(HgStore),
+  Mercurial(Box<HgStore>),
   /// Subversion's.
-  Subversion(SvnStore),
+  Subversion(Box<SvnStore>),
 }
 
 /// A git repository's store: A-614's store and the values derived from it (A-647).
@@ -510,14 +528,37 @@ impl VcsStores {
     id: RepositoryId,
     principal: &[u8],
     name: String,
-    commit: DavCommit,
+    (commit, now_ns): (DavCommit, u64),
   ) {
+    self.release_idle_dav_commits(now_ns, crate::vcs_http::idle_bound_ns());
     self
       .dav_commits
-      .retain(|(repository, _), (key, _)| !(*repository == id && key.as_slice() == principal));
+      .retain(|(repository, _), held| !(*repository == id && held.principal == principal));
+    self.dav_commits.insert(
+      (id, name),
+      DavHeld {
+        principal: principal.to_vec(),
+        last_ns: now_ns,
+        commit,
+      },
+    );
+  }
+
+  /// Releases every HTTP commit idle past `idle_ns` at `now_ns`, the edge's learned idle bound (§4.17.2's reaping, a
+  /// client's silence between requests): its client has lost the connection it committed over, as the edge judges a
+  /// silence that long, and nothing it made has landed. With no bound learned yet, none is released. Each release is
+  /// counted ([`DAV_COMMITS_RELEASED`]).
+  pub(crate) fn release_idle_dav_commits(&mut self, now_ns: u64, idle_ns: Option<u64>) {
+    let Some(idle_ns) = idle_ns else {
+      return;
+    };
+    let before = self.dav_commits.len();
     self
       .dav_commits
-      .insert((id, name), (principal.to_vec(), commit));
+      .retain(|_, held| now_ns.saturating_sub(held.last_ns) <= idle_ns);
+    for _ in self.dav_commits.len()..before {
+      crate::fleet::count_refusal(DAV_COMMITS_RELEASED);
+    }
   }
 
   /// Takes out repository `id`'s transaction `name`, made by the principal keyed `principal`; none for another's.
@@ -525,17 +566,18 @@ impl VcsStores {
     &mut self,
     id: RepositoryId,
     principal: &[u8],
-    name: &str,
+    (name, now_ns): (&str, u64),
   ) -> Option<DavCommit> {
+    self.release_idle_dav_commits(now_ns, crate::vcs_http::idle_bound_ns());
     let key = (id, name.to_owned());
     if self
       .dav_commits
       .get(&key)
-      .is_none_or(|(maker, _)| maker.as_slice() != principal)
+      .is_none_or(|held| held.principal != principal)
     {
       return None;
     }
-    self.dav_commits.remove(&key).map(|(_, commit)| commit)
+    self.dav_commits.remove(&key).map(|held| held.commit)
   }
 
   /// Puts back what [`VcsStores::take_dav_commit`] took, unless it has ended.
@@ -544,12 +586,17 @@ impl VcsStores {
     id: RepositoryId,
     principal: &[u8],
     name: &str,
-    commit: DavCommit,
+    (commit, now_ns): (DavCommit, u64),
   ) {
     if !commit.over() {
-      self
-        .dav_commits
-        .insert((id, name.to_owned()), (principal.to_vec(), commit));
+      self.dav_commits.insert(
+        (id, name.to_owned()),
+        DavHeld {
+          principal: principal.to_vec(),
+          last_ns: now_ns,
+          commit,
+        },
+      );
     }
   }
 
@@ -611,13 +658,13 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
       git.paths = paths::declare(window);
       git.trees = paths::declare_trees(format, window);
       git.commits = Some(commits::declare(format, window));
-      RepositoryStore::Git(git)
+      RepositoryStore::Git(Box::new(git))
     }
-    VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore {
+    VcsTool::Mercurial => RepositoryStore::Mercurial(Box::new(HgStore {
       generation: stores.next_generation(),
       ..HgStore::default()
-    }),
-    VcsTool::Subversion => RepositoryStore::Subversion(SvnStore::default()),
+    })),
+    VcsTool::Subversion => RepositoryStore::Subversion(Box::default()),
   };
   stores.entries.entry(record.id).or_insert(store);
   Ok(())
@@ -659,11 +706,19 @@ pub(crate) fn settle_objects(state: &mut ShardState, id: RepositoryId) {
     .copied()
     .unwrap_or(0);
   if held > charged {
-    if state.store.budget.charge_retention(held - charged).is_err() {
+    if state
+      .store
+      .budget
+      .charge_retention(held.saturating_sub(charged))
+      .is_err()
+    {
       state.count(CHARGE_SHORT, 1);
     }
   } else {
-    state.store.budget.credit_retention(charged - held);
+    state
+      .store
+      .budget
+      .credit_retention(charged.saturating_sub(held));
   }
   if held == 0 {
     state.vcs_stores.objects_charged.remove(&id);
@@ -707,9 +762,11 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
     RepositoryStore::Git(store) => {
       let versions = content.discharge(store.charged).is_ok();
       let values = store.derivations.release(content).is_ok();
-      let maps = store.heads.values().fold(true, |whole, head| {
-        paths::release_head(content, head) && whole
-      });
+      // Every head's map is released, whichever fails: no short circuit.
+      let mut maps = true;
+      for head in store.heads.values() {
+        maps &= paths::release_head(content, head);
+      }
       let lfs = store.lfs.release(content).is_ok();
       store.repository.release(content).is_ok() && values && versions && maps && lfs
     }
@@ -1005,6 +1062,12 @@ impl GitPush {
       push: Push::new(store.repository.format()),
       record: RecordWriter::default(),
     })
+  }
+
+  /// The objects admitted so far, in quarantine, read only: what a pack being read reads a delta's base back from and a
+  /// push's checks read its objects from (A-719 part 3).
+  pub(crate) fn quarantine(&self) -> &Push {
+    &self.push
   }
 
   /// Keeps the push's pack as the client sent it (A-723), which the push's first record holds in place of its objects'

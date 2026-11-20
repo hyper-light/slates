@@ -526,7 +526,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
   /// Answers the client's `url` (the module doc's session): the repository it names opened, or the URL refused.
   fn open(&mut self, url: &[u8]) {
     let (record, root) = match found(&self.repositories, url) {
-      Found::Repository { record, root } => (record, root),
+      Found::Repository { record, root } => (*record, root),
       Found::BadUrl => return self.refuse_url(Refusal::BadUrl { url }),
       Found::BadPath => return self.refuse_url(Refusal::BadPath),
       Found::NoRepository => return self.refuse_url(Refusal::NoRepository { url }),
@@ -800,8 +800,8 @@ fn exited(status: u32) -> Stepped {
 enum Found {
   /// To this repository, whose root URL is the URL's first `root` bytes.
   Repository {
-    /// The repository.
-    record: RepositoryRecord,
+    /// The repository, boxed: no other answer carries anything.
+    record: Box<RepositoryRecord>,
     /// Where its root URL ends in the client's URL.
     root: usize,
   },
@@ -834,7 +834,10 @@ fn found<R: Repositories>(repositories: &R, url: &[u8]) -> Found {
         .find(&name)
         .filter(|record| record.tool == VcsTool::Subversion)?;
       let root = names.last().map(|(_, end)| *end)?;
-      Some(Found::Repository { record, root })
+      Some(Found::Repository {
+        record: Box::new(record),
+        root,
+      })
     })
     .unwrap_or(Found::NoRepository)
 }

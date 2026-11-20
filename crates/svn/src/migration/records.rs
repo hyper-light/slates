@@ -20,6 +20,7 @@
 //! A repository is also the drive's [`Green`] (A-617): it reads the texts and property lists it holds and names new
 //! ones as it keeps them, so a client's drive and its commit run over one set of records.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::MigrationRefusal;
@@ -611,15 +612,93 @@ impl ReadSource for Repository {
     self.content(identity).and_then(entries)
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
-    let text = self.content(identity)?;
-    text.get(usize::try_from(offset).ok()?..)
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
+    from_offset(TextSource::text(self, identity)?, offset)
+  }
+}
+
+/// Where a repository's texts are read (S4, with A-716: a text held once, by the green's content-identity index, the
+/// records naming it by identity): the reads, the report drive, the commit drive, the export and the import read a
+/// text through a source their caller lends them, never assuming the records hold its bytes.
+pub trait TextSource {
+  /// The text held under `identity`, whole: borrowed where the source holds it in one piece, owned where it must copy
+  /// it; none where the source holds no such text.
+  fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>>;
+}
+
+/// The records hold their own texts until the green's content index serves them (S4's second slice, A-716): a text
+/// is the bytes held under its identity.
+impl TextSource for Repository {
+  fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
+    self.content(identity).map(Cow::Borrowed)
+  }
+}
+
+/// `text` from `offset` to its end: none past it, as a read's source answers.
+fn from_offset(text: Cow<'_, [u8]>, offset: u64) -> Option<Cow<'_, [u8]>> {
+  let offset = usize::try_from(offset).ok()?;
+  match text {
+    Cow::Borrowed(bytes) => bytes.get(offset..).map(Cow::Borrowed),
+    Cow::Owned(bytes) => bytes.get(offset..).map(|rest| Cow::Owned(rest.to_vec())),
+  }
+}
+
+/// The records with their texts read from `texts` (S4): what a lender hands the reads, the report drive and the commit
+/// drive once the records hold no text bytes of their own. Every property list, revision property, entry and lock is
+/// the records'; every text is the source's.
+#[derive(Clone, Copy)]
+pub struct WithTexts<'a, T: ?Sized> {
+  /// The records.
+  pub records: &'a Repository,
+  /// Where their texts are read.
+  pub texts: &'a T,
+}
+
+impl<T: TextSource + ?Sized> Contents for WithTexts<'_, T> {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    self.records.entries(directory, revision)
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self.records.mergeinfo_value(properties)
+  }
+}
+
+impl<T: TextSource + ?Sized> ReadSource for WithTexts<'_, T> {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    ReadSource::revision_properties(self.records, revision)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    ReadSource::properties(self.records, identity)
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
+    from_offset(self.texts.text(identity)?, offset)
+  }
+}
+
+impl<T: TextSource + ?Sized> Green for WithTexts<'_, T> {
+  fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
+    self.texts.text(identity)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    Green::properties(self.records, identity)
+  }
+
+  fn name_text(&self, text: &[u8]) -> ContentIdentity {
+    self.records.name_text(text)
+  }
+
+  fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
+    self.records.name_properties(properties)
   }
 }
 
 impl Green for Repository {
-  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
-    self.content(identity)
+  fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
+    TextSource::text(self, identity)
   }
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {

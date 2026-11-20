@@ -96,8 +96,8 @@ pub enum EngineFault {
   Untested {
     /// The endpoint the runtime's command line reaches, as it named it.
     endpoint: String,
-    /// The profile the engine's statement established.
-    profile: RuntimeProfile,
+    /// The profile the engine's statement established (boxed: it is most of the fault's size).
+    profile: Box<RuntimeProfile>,
     /// The judge's refusal of it.
     refusal: ProfileRefusal,
   },
@@ -153,6 +153,10 @@ pub fn engine_profile(_runtime: &str) -> Result<EngineProfile, EngineFault> {
   })
 }
 
+/// What one query of the runtime's command line answers: its output, or the fault.
+#[cfg(any(unix, test))]
+type Answer = Result<Vec<u8>, EngineFault>;
+
 /// The profile `runtime`'s engine establishes on `host`, in the module's order: the runtime's interface by its name;
 /// for the Docker CLI the endpoint, `named` when the environment names one, else its context's (asked), then the
 /// engine's statement (asked); for podman its own statement alone (asked: it states whether its service is remote);
@@ -164,7 +168,7 @@ fn profile_of(
   runtime: &str,
   named: Option<String>,
   host: slates_bridge_oci::runtime::Host,
-  ask: &mut dyn FnMut(&[&str]) -> Result<Vec<u8>, EngineFault>,
+  ask: &mut dyn FnMut(&[&str]) -> Answer,
 ) -> Result<EngineProfile, EngineFault> {
   let interface =
     slates_bridge_oci::runtime::runtime_interface(runtime).map_err(EngineFault::Refused)?;
@@ -200,7 +204,7 @@ fn judged(
     }),
     Err(refusal) => Err(EngineFault::Untested {
       endpoint,
-      profile,
+      profile: Box::new(profile),
       refusal,
     }),
   }

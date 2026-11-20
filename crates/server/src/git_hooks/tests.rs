@@ -484,12 +484,13 @@ fn as_role(mut input: HookInput) -> HookInput {
 }
 
 /// Runs `input`'s hook under `policy` in `presented`, as the role, with no learned bound and a
-/// client that stays; the test gives up past [`TEST_BOUND_NS`].
+/// client that stays; the test gives up past [`TEST_BOUND_NS`]. None when the run's task could not
+/// be spawned or the run did not answer within the bound: the test fails on it.
 fn ran(
   presented: &Presented,
   policy: &RepositoryPolicy,
   input: HookInput,
-) -> Result<GitHookRan, GitHookRefused> {
+) -> Option<Result<GitHookRan, GitHookRefused>> {
   let runtime = runtime();
   let (sent, got) = channel();
   let (presented, policy, input) = (presented.clone(), policy.clone(), as_role(input));
@@ -504,13 +505,9 @@ fn ran(
       let answered = slates_rt::futures::within(TEST_BOUND_NS, running).await;
       let _ = sent.send(answered.ok().flatten());
     })
-    .expect("the run's task");
+    .ok()?;
   runtime.run_until_idle();
-  got
-    .recv()
-    .ok()
-    .flatten()
-    .expect("the run answered within the test's bound")
+  got.recv().ok().flatten()
 }
 
 /// The lines an accepted hook's role wrote, its tag stripped, in order. libtest writes a test's
@@ -649,17 +646,29 @@ fn a_git_hook_runs_in_its_view_at_each_of_receive_packs_points() {
     name: "refs/heads/main".to_owned(),
   };
   let input = git_pre_receive(PendingView(0), std::slice::from_ref(&moved), None);
-  let pre = lines_of(&ran(&scene.pre_receive.presented, &policy, input).expect("ran"));
+  let pre = lines_of(
+    &ran(&scene.pre_receive.presented, &policy, input)
+      .expect("the run answered within the test's bound")
+      .expect("ran"),
+  );
   assert_in_view(&pre, &scene.pre_receive.dir.path, &scene.old);
   assert_quarantined(&pre, &scene.pre_receive.dir.path);
   assert_stock_git(&pre, &scene.new, &scene.old);
   let input = git_update(PendingView(0), &moved);
-  let update = lines_of(&ran(&scene.update.presented, &policy, input).expect("ran"));
+  let update = lines_of(
+    &ran(&scene.update.presented, &policy, input)
+      .expect("the run answered within the test's bound")
+      .expect("ran"),
+  );
   assert_in_view(&update, &scene.update.dir.path, &scene.old);
   assert_unquarantined(&update, UNSET, 2);
   assert_stock_git(&update, &scene.new, &scene.old);
   let input = git_post_receive(CommittedView(0), std::slice::from_ref(&moved), None);
-  let post = lines_of(&ran(&scene.post_receive.presented, &policy, input).expect("ran"));
+  let post = lines_of(
+    &ran(&scene.post_receive.presented, &policy, input)
+      .expect("the run answered within the test's bound")
+      .expect("ran"),
+  );
   assert_in_view(&post, &scene.post_receive.dir.path, &scene.new);
   assert_unquarantined(&post, "0", 1);
   assert_stock_git(&post, &scene.new, &scene.new);
@@ -755,21 +764,21 @@ fn a_view_is_handed_only_to_a_point_that_sees_it_so() {
   for (shows, input, point) in cases {
     assert_eq!(
       ran(&presented(shows), &policy(), input),
-      Err(GitHookRefused::ViewForAnotherPoint { point, shows })
+      Some(Err(GitHookRefused::ViewForAnotherPoint { point, shows }))
     );
   }
   assert_eq!(
     ran(&presented(Shows::NoPush), &policy(), subversion),
-    Err(GitHookRefused::NotGits {
+    Some(Err(GitHookRefused::NotGits {
       point: HookPoint::SvnPreCommit
-    })
+    }))
   );
   let unconfigured = RepositoryPolicy::default();
   assert_eq!(
     ran(&presented(Shows::Quarantined), &unconfigured, pre),
-    Ok(GitHookRan {
+    Some(Ok(GitHookRan {
       outcome: None,
       lesson: None,
-    })
+    }))
   );
 }

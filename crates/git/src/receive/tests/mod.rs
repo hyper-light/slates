@@ -236,13 +236,13 @@ impl GitPolicy<'_> {
         continue;
       }
       let content = match pushed.object(&id) {
-        Some(object) => object.content.as_slice(),
+        Some((_, content)) => content,
         None => match self.repository.object(&id) {
-          Some((_, content)) => content,
+          Some((_, content)) => std::borrow::Cow::Borrowed(content),
           None => continue,
         },
       };
-      let commit = Commit::parse(content, &mut unbounded()).unwrap();
+      let commit = Commit::parse(&content, &mut unbounded()).unwrap();
       next.extend(commit.parents(ObjectFormat::Sha1));
     }
     false
@@ -1268,8 +1268,20 @@ fn connectivity_is_complete_against_the_server_and_missing_against_nothing() {
   let update = scenario("update");
   let repository = Repo::from_pack(update.before_pack);
   let received = received(&update, &repository);
-  let unpacked = received.unpacked.as_ref().unwrap().as_ref().unwrap();
-  let pushed = Pushed::new(&unpacked.objects, &mut unbounded()).unwrap();
+  let mut session = super::Session::new(&ADVERTISED, &HIDDEN);
+  let read = session.input(update.request, &repository, &mut unbounded());
+  assert_eq!(read, Ok(true));
+  assert_eq!(checked_in_turns(&mut session, &repository).1, Ok(true));
+  let objects = session.checked().unwrap().objects();
+  assert_eq!(
+    Some(objects),
+    received
+      .unpacked
+      .as_ref()
+      .and_then(|unpacked| unpacked.as_ref().ok())
+      .map(|kept| kept.objects.as_slice())
+  );
+  let pushed = Pushed::new(objects, Some(session.kept()), &mut unbounded()).unwrap();
   let against_server =
     connectivity(&received.request, &pushed, &repository, &mut unbounded()).unwrap();
   assert_eq!(against_server, [Connected::Complete]);

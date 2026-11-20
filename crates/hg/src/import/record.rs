@@ -226,11 +226,11 @@ pub(crate) struct Kept {
   /// The node.
   pub(crate) node: Node,
   /// The first parent's node.
-  p1: Node,
+  pub(crate) p1: Node,
   /// The second parent's node.
-  p2: Node,
+  pub(crate) p2: Node,
   /// The link's node, a manifest's or file revision's.
-  link: Option<Node>,
+  pub(crate) link: Option<Node>,
   /// 7.2's index flags.
   pub(crate) flags: u16,
   /// The text's length, a file revision's block and its markers included.
@@ -615,12 +615,12 @@ pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -
   if let Some(block) = kept.block {
     put(MARKER, &mut written);
     for window in store.windows(&block) {
-      put(window, &mut written);
+      put(&window, &mut written);
     }
     put(MARKER, &mut written);
   }
   for window in store.windows(&kept.bytes) {
-    put(window, &mut written);
+    put(&window, &mut written);
   }
   written
 }
@@ -633,7 +633,7 @@ fn write_markers(out: &mut Vec<u8>, index: &HgIndex, store: &ContentStore) -> Re
     let marker = index.marker(store, number).ok_or(number)?;
     out.extend_from_slice(&window_bytes(store, &marker).to_le_bytes());
     for window in store.windows(&marker) {
-      out.extend_from_slice(window);
+      out.extend_from_slice(&window);
     }
   }
   Ok(())

@@ -359,9 +359,11 @@ mod tests {
   /// Format: the identity the tests name a clone's sealed head by, as the seal's archive would.
   const IDENTITY: [u8; 32] = [7; 32];
   /// Shape: how many looks at the shard a carry is given to be recorded, each after the shard's own turns.
-  const LOOKS: usize = 500;
+  const LOOKS: u32 = 500;
   /// Shape: the pause between two looks.
   const LOOK_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+  /// Derived: the wait a carry is given to be recorded, `LOOKS` looks `LOOK_EVERY` apart.
+  const RECORD_WAIT: std::time::Duration = LOOK_EVERY.saturating_mul(LOOKS);
 
   /// The principal the tests' volumes are made for.
   fn owner() -> slates_db::catalog::Principal {
@@ -472,7 +474,8 @@ mod tests {
     clone: DbVolumeId,
     head: DbSnapshotId,
   ) -> Option<Recorded> {
-    for _ in 0..LOOKS {
+    let deadline = std::time::Instant::now() + RECORD_WAIT;
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
       let looked = crate::daemon::observe_first(daemon, move |state| {
         step(state, clone);
         let record = state
@@ -494,7 +497,8 @@ mod tests {
       {
         return Some(found);
       }
-      std::thread::sleep(LOOK_EVERY);
+      // The shard's turns between two looks: woken early, the next look comes sooner and the deadline still bounds it.
+      std::thread::park_timeout(LOOK_EVERY.min(left));
     }
     None
   }

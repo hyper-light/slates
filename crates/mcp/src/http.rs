@@ -1475,9 +1475,13 @@ mod tests {
   #[derive(Debug)]
   struct EdgeSaw {
     proof: Proof,
-    request: Option<Result<Option<(Head, Vec<u8>)>, Refused>>,
+    request: Option<FirstRequest>,
     ended_ns: u64,
   }
+
+  /// What reading a test connection's first request gave: its head and body, nothing (the connection ended), or the
+  /// refusal.
+  type FirstRequest = Result<Option<(Head, Vec<u8>)>, Refused>;
 
   /// What a test's client saw: the bytes it dribbled after its start, and the bytes the edge answered before its end.
   #[derive(Debug)]
@@ -1558,6 +1562,30 @@ mod tests {
     dribbled
   }
 
+  /// The token holder's connection, as the edge saw it: its bearer shown inside the bound, its request read whole,
+  /// and the connection waited for past the bound while it lived.
+  fn assert_the_token_holder_was_waited_for(edge_saw: &EdgeSaw, bound_ns: u64) {
+    let Proof::Shown { arrival_ns } = edge_saw.proof else {
+      panic!("the token holder showed its bearer: {:?}", edge_saw);
+    };
+    assert!(
+      arrival_ns < bound_ns,
+      "its bearer inside the bound: {arrival_ns} ns"
+    );
+    let Some(Ok(Some((head, body)))) = &edge_saw.request else {
+      panic!("its request read whole: {:?}", edge_saw);
+    };
+    assert_eq!(
+      (head.method.as_str(), body.as_slice()),
+      ("POST", &b"{}"[..])
+    );
+    assert!(
+      edge_saw.ended_ns > bound_ns,
+      "waited for past the bound, while it lived: {:?}",
+      edge_saw
+    );
+  }
+
   /// A-523 over real sockets. Do: with an edge that has learned nine honest arrivals of 1 ms, accept a connection that
   /// sends nothing; one that sends a head without the bearer a byte at a time, steadily, and never ends it; and one
   /// that sends its head through its bearer line, then the rest of its request twice the bound later. Expect: the first
@@ -1632,24 +1660,6 @@ mod tests {
       "the dribbling sender kept sending: {:?}",
       clients[1]
     );
-    let Proof::Shown { arrival_ns } = edges[2].proof else {
-      panic!("the token holder showed its bearer: {:?}", edges[2]);
-    };
-    assert!(
-      arrival_ns < bound_ns,
-      "its bearer inside the bound: {arrival_ns} ns"
-    );
-    let Some(Ok(Some((head, body)))) = &edges[2].request else {
-      panic!("its request read whole: {:?}", edges[2]);
-    };
-    assert_eq!(
-      (head.method.as_str(), body.as_slice()),
-      ("POST", &b"{}"[..])
-    );
-    assert!(
-      edges[2].ended_ns > bound_ns,
-      "waited for past the bound, while it lived: {:?}",
-      edges[2]
-    );
+    assert_the_token_holder_was_waited_for(&edges[2], bound_ns);
   }
 }

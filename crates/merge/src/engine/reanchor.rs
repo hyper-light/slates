@@ -167,7 +167,11 @@ impl Green {
     let byte = |at: u64| {
       let at = usize::try_from(at).ok()?;
       value
-        .read(&self.chunks, at, at.saturating_add(1))
+        .read(
+          (&self.chunks, self.content.blocks()),
+          at,
+          at.saturating_add(1),
+        )
         .first()
         .copied()
     };

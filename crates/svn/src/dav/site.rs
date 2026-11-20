@@ -23,9 +23,9 @@
 //! **Methods.**
 //! - OPTIONS: `200`, the `DAV` lines and, when the body asks for the activity collection, the HTTPv2 headers
 //!   (`version.c` `get_option`, A-609's writer), listing only what this site serves: of `mod_dav_svn`'s capabilities
-//!   (each names a report or a commit's form) `log-revprops` alone, and `SVN-Repository-MergeInfo: no`, since a
-//!   `mergeinfo-report` is not served; so a stock client lists a directory by PROPFIND and asks no report it would be
-//!   refused.
+//!   (each names a report or a commit's form) `log-revprops` and `mergeinfo`, and `SVN-Repository-MergeInfo: yes`,
+//!   since the `mergeinfo-report` is served (A-726 part 2); so a stock client lists a directory by PROPFIND and asks
+//!   no report it would be refused.
 //! - PROPFIND (`mod_dav.c` `dav_method_propfind`, `props.c` `dav_get_allprops` and `dav_get_props`): `207`, one response
 //!   for the resource and, at depth 1 on a directory, one for each child the principal may read, in name order; a
 //!   collection's href ends in a slash, as `mod_dav_svn`'s walker writes it. `allprop` is the node's own properties
@@ -42,8 +42,10 @@
 //!   run ([`Report`]): a walk refused before its first byte is answered with its error, `dav_svn__convert_err`'s status
 //!   and the error in `D:error`, and one refused after it ends the connection. An `update-report` on HTTPv2's `me`
 //!   resource (`!svn/me`, where a stock client sends it) or a node's URL is answered from A-616's drive by A-627's
-//!   writer, streamed the same way ([`super::update`]; checkout, update, switch and export). Every other report is
-//!   `501` in `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
+//!   writer, streamed the same way ([`super::update`]; checkout, update, switch and export). A `file-revs-report`
+//!   (`svn blame`) is streamed the same way ([`super::report_file_revs`]) and `get-locations` answered whole
+//!   ([`super::report_locations`]; A-726). Every other report is `501` in `mod_dav_svn`'s words for one it does not
+//!   know ("The requested report is unknown"), until it is served.
 //! - An HTTPv2 commit's methods (POST to `!svn/me`, PUT, MKCOL, DELETE, COPY and PROPPATCH under `!svn/txr/`, MERGE)
 //!   are the caller's, which holds each transaction between its requests and drives it through [`super::commit`].
 //! - Every other method: `501`, `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
@@ -181,9 +183,10 @@ const EPOCH_WEEKDAY: u64 = 4;
 const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
 
 /// The capabilities this site serves, which its OPTIONS answer lists: `log-revprops`, a `log-report`'s revision
-/// properties named or all of them, which a client asks for only where it is listed.
+/// properties named or all of them, which a client asks for only where it is listed; and `mergeinfo`, the
+/// `mergeinfo-report` (A-726 part 2), which a client asks only where the repository's `SVN-Repository-MergeInfo` is `yes`.
 /// Format: `version.c` `get_vsn_options`' names (`svn_dav.h`), those whose report or form is served here.
-const SERVED_CAPABILITIES: [Capability; 1] = [Capability::LogRevprops];
+const SERVED_CAPABILITIES: [Capability; 2] = [Capability::LogRevprops, Capability::Mergeinfo];
 
 /// The status a `log-report` refused before its first byte is answered with, where `dav_svn__convert_err` maps the
 /// error to none of its own.
@@ -251,11 +254,13 @@ pub struct Report {
   walk: Walk,
 }
 
-/// The walk a REPORT's answer is: a `log-report`'s or an `update-report`'s.
+/// The walk a REPORT's answer is: a `log-report`'s, a `file-revs-report`'s or an `update-report`'s.
 #[derive(Debug)]
 enum Walk {
   /// A `log-report`'s.
   Log(Box<DavLog>),
+  /// A `file-revs-report`'s (`svn blame`; A-726), boxed beside the update.
+  FileRevs(Box<super::report_file_revs::FileRevsWalk>),
   /// An `update-report`'s ([`super::update`]).
   Update(Box<UpdateWalk>),
 }
@@ -290,6 +295,7 @@ impl Report {
   ) -> ReportProgress {
     let log = match &mut self.walk {
       Walk::Log(log) => log,
+      Walk::FileRevs(revisions) => return revisions.resume(served, out, room),
       Walk::Update(walk) => {
         let walked = Walked {
           index: served.index,
@@ -502,7 +508,7 @@ fn options<R: ?Sized>(
     special: SPECIAL.to_owned(),
     youngest: Some(served.index.youngest()),
     uuid: Some(served.uuid.to_owned()),
-    mergeinfo: Some(false),
+    mergeinfo: Some(true),
     bulk_updates: BulkUpdates::Prefer,
     served: SERVED_CAPABILITIES.to_vec(),
   };
@@ -611,6 +617,23 @@ fn report<R: Repository + ?Sized>(
       }),
       None => Answer::Whole(bare(HTTP_BAD_REQUEST)),
     },
+    Asked::Mergeinfo(mergeinfo) => Answer::Whole(super::report_mergeinfo::answer(
+      served,
+      &mergeinfo,
+      &place.path,
+      room,
+    )),
+    Asked::GetLocations(locations) => Answer::Whole(super::report_locations::answer(
+      served,
+      &locations,
+      &place.path,
+    )),
+    Asked::FileRevs(revisions) => Answer::Report(Report {
+      walk: Walk::FileRevs(Box::new(super::report_file_revs::FileRevsWalk::new(
+        &revisions,
+        &place.path,
+      ))),
+    }),
     _ => Answer::Whole(unserved_method("REPORT")),
   }
 }

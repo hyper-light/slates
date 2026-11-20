@@ -584,18 +584,35 @@ fn pushed() -> Transcript {
   }
 }
 
+/// Lets `ns` pass on the runtime's timer, on a runtime of the client's own: the pause is the test's input, the time a
+/// slow client takes between two steps, so nothing else could stand in for it.
+fn pause(ns: u64) {
+  if ns == 0 {
+    return;
+  }
+  let runtime = runtime();
+  runtime
+    .spawn(async move {
+      slates_rt::futures::sleep(ns)
+        .await
+        .expect("the client's pause on its runtime's timer");
+    })
+    .expect("the pause's task");
+  runtime.run_until_idle();
+}
+
 /// A whole session with the held key: authenticate (pausing `auth_pause_ns` between the server's `PK_OK` and the
 /// signature), run `git-receive-pack`, read [`READY`], pause `push_pause_ns`, send [`PACK`], and read to the end.
 fn session(address: SocketAddrV4, auth_pause_ns: u64, push_pause_ns: u64) -> Option<Transcript> {
   let mut peer = Peer::connect(address)?;
   (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
-  std::thread::sleep(Duration::from_nanos(auth_pause_ns));
+  pause(auth_pause_ns);
   (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
   exec(&mut peer, b"git-receive-pack '/r.git'").then_some(())?;
   let ready = peer.next(&[94])?;
   let mut at = 5;
   (read_string(&ready, &mut at) == READY).then_some(())?;
-  std::thread::sleep(Duration::from_nanos(push_pause_ns));
+  pause(push_pause_ns);
   send_data(&mut peer, PACK);
   let mut transcript = transcript(&mut peer);
   transcript.out.splice(0..0, READY.iter().copied());

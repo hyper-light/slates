@@ -381,7 +381,7 @@ impl Lacked<'_> {
     };
     let mut bytes = Vec::new();
     for window in self.content.windows(&file.content) {
-      bytes.extend_from_slice(window);
+      bytes.extend_from_slice(&window);
     }
     self.objects.push((Kind::Blob, id, bytes));
     Ok(())
