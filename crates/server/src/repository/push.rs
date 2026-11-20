@@ -94,7 +94,8 @@ pub(crate) struct EntryParts {
   /// The repository's own state moved (Mercurial's phase roots and markers).
   pub(crate) state: Vec<StateChange>,
   /// The tool's record the entry holds (A-662's `RepositoryEntry::objects`): a Subversion revision's (A-655 part 2b,
-  /// `slates_svn::commit::record`); a git push's is its sealed push's own ([`push_sealed`]).
+  /// `slates_svn::commit::record`), or a Subversion repository's UUID or revision properties, which an entry may hold
+  /// alone (A-652 part 3); a git push's is its sealed push's own ([`push_sealed`]).
   pub(crate) objects: Vec<u8>,
 }
 
@@ -375,6 +376,8 @@ fn plan(
   let mut names = BTreeSet::new();
   let mut steps = Vec::new();
   let mut refused = Vec::new();
+  // Each new branch's id is minted at its own offset, since none is recorded before the entry (A-694).
+  let mut minted = 0u64;
   for (index, change) in changes.into_iter().enumerate() {
     let planned = match change {
       BranchChange::Update { green, work } => {
@@ -385,12 +388,18 @@ fn plan(
         from,
         version,
         work,
-      } => plan_create(
-        state,
-        (record, principal),
-        (name, from, version, work),
-        &mut names,
-      ),
+      } => {
+        let planned = plan_create(
+          state,
+          (record, principal),
+          (name, from, version, work),
+          (&mut names, minted),
+        );
+        if planned.is_ok() {
+          minted = minted.saturating_add(1);
+        }
+        planned
+      }
       BranchChange::Delete { name, version } => {
         plan_delete(state, record.id, (name, version), (&mut names, &mut greens))
       }
@@ -484,13 +493,13 @@ fn requires_evidence(state: &ShardState, green: DbVolumeId) -> bool {
 }
 
 /// A create's rules: a valid name the repository does not hold and the push names once; a member to make it from, at a
-/// version it can be made at; a new id and a member name a listing holds; and evidence where the new green, which keeps
-/// its source's requirement, requires it.
+/// version it can be made at; a new id, minted at `minted`, the count of creates planned before it (A-694), and a member
+/// name a listing holds; and evidence where the new green, which keeps its source's requirement, requires it.
 fn plan_create(
   state: &mut ShardState,
   (record, principal): (&RepositoryRecord, &Principal),
   (name, from, version, work): (String, DbVolumeId, u64, Option<Increment>),
-  names: &mut BTreeSet<String>,
+  (names, minted): (&mut BTreeSet<String>, u64),
 ) -> Result<Step, ChangeRefusal> {
   let refused = ChangeRefusal::Refused;
   super::free_name(state, record.id, &name).map_err(refused)?;
@@ -501,8 +510,8 @@ fn plan_create(
     return Err(refused(Refusal::NotFound));
   }
   let version = super::branch_version(state, from, Some(version)).map_err(refused)?;
-  let id =
-    crate::verbs::fresh_volume_id(state).ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
+  let id = crate::verbs::fresh_volume_id_at(state, minted)
+    .ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
   let named = super::member_name(&record.name, &name, id).map_err(refused)?;
   let require_evidence = requires_evidence(state, from);
   if require_evidence && work.as_ref().is_some_and(|work| work.evidence.is_empty()) {
@@ -567,6 +576,10 @@ fn push_planned(
     })
     .collect();
   let mut entry = entry(record.id, (&steps, &verdicts), parts);
+  // An entry of no change whose caller brings a record records that record alone: a Subversion repository's UUID or a
+  // revision's properties (A-652 part 3), which move no green. A sealed push's objects, set below, and a revision's
+  // record ride with the changes they came with.
+  let brings_a_record = steps.is_empty() && !entry.objects.is_empty();
   if let Some((sealed, moves)) = sealed.as_mut() {
     let resolved = resolve(state, (&steps, &entry), moves)?;
     if let Err(refused) = sealed.admit((&mut state.store, &mut state.vcs_stores), resolved) {
@@ -583,10 +596,11 @@ fn push_planned(
       }
     }
   }
-  let changes_anything = !(entry.joined.is_empty()
-    && entry.versions.is_empty()
-    && entry.names.is_empty()
-    && entry.state.is_empty());
+  let changes_anything = brings_a_record
+    || !(entry.joined.is_empty()
+      && entry.versions.is_empty()
+      && entry.names.is_empty()
+      && entry.state.is_empty());
   admit(state, &made, &entry, &steps)?;
   if !changes_anything {
     // Every work was sent before and nothing else changes: nothing is recorded, and what was secured is given back.

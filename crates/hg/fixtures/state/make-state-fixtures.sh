@@ -12,6 +12,9 @@
 # changeset made on `feature` in the clone and another here, and the clone pulled back, so 7.2 keeps the clone's
 # `feature` as `feature@1` (`bookmarks._diverge`: the pulled path has no alias, so the first free number); then `@` on
 # the root, whose `@` is its last byte, so it is no divergent name.
+# And `amended-root` (A-691): a root made public; a draft on it amended (a marker from the old changeset to the new, the
+# old one hidden), so both are draft roots 7.2 keeps; and another draft on the root made secret afterwards, so it stays
+# among the draft roots 7.2 keeps though its phase is secret.
 # For each repository R:
 #   R/<path>            every file of .hg/store as stored (but `undo*` and `*.bck`): `phaseroots`, `obsstore` and, in
 #                       states-store, `bookmarks` among them
@@ -51,8 +54,17 @@ divergence() {
   hg pull -q "$WORK/$repo-clone"
   hg bookmark -q -r 0 @
 }
+amendedroot() {
+  printf 'a\n' > a; hg add -q a; hg commit -q -m 'public root'
+  hg phase -q --public -r .
+  printf 'b\n' > b; hg add -q b; hg commit -q -m 'draft root'
+  printf 'b amended\n' > b; hg commit -q --amend -m 'draft root, amended'
+  hg update -q -r 0
+  printf 'c\n' > c; hg add -q c; hg commit -q -m 'draft root made secret'
+  hg phase -q --secret --force -r .
+}
 hg version -q
-REPOS=(states states-store divergent)
+REPOS=(states states-store divergent amended-root)
 if [ $# -gt 1 ]; then shift; REPOS=("$@"); fi
 for repo in "${REPOS[@]}"; do
   MAKE=history
@@ -60,6 +72,7 @@ for repo in "${REPOS[@]}"; do
     states) EXTRA=() ;;
     states-store) EXTRA=(--config format.bookmarks-in-store=yes) ;;
     divergent) EXTRA=(); MAKE=divergence ;;
+    amended-root) EXTRA=(); MAKE=amendedroot ;;
     *) echo "make-state-fixtures.sh: no repository named $repo" >&2; exit 2 ;;
   esac
   export HGTEST_UUIDFILE="$WORK/uuid-$repo"

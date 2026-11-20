@@ -14,8 +14,9 @@
 //! **Names a `fetch` gives.** A `want-ref` is a ref's full name, `HEAD` read through to the default branch
 //! (`refs_read_ref`). A `deepen-not` is tried, as `expand_ref` tries it, as each of git's patterns (the name itself, then
 //! under `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, and `refs/remotes/<name>/HEAD`), and must name exactly
-//! one ref. A `sparse:oid` filter's revision is the first ref those patterns find, as `repo_dwim_ref` takes it (A-640
-//! part 4). A ref whose green has no version names nothing, as no git ref does.
+//! one ref. A `sparse:oid` filter's revision is the first ref those patterns find, as `repo_dwim_ref` takes it, with
+//! how many find one, which git warns of past one (A-640 part 4). A ref whose green has no version names nothing, as no
+//! git ref does.
 
 use core::cmp::Ordering;
 
@@ -92,13 +93,27 @@ pub(super) fn deepen_not(
   }
 }
 
-/// What the ref a short name names, by position (A-640 part 4, a `sparse:oid` filter's revision): the ref the first of
-/// git's patterns finds (`repo_dwim_ref`, which takes the first and warns of the rest), `HEAD` read through to the
-/// default branch; `None` when no pattern finds one.
-pub(super) fn dwim(graph: &StoreGraph<'_>, served: &Served<'_>, rev: &[u8]) -> Option<u64> {
-  REV_PARSE_RULES
+/// What git's patterns find for a short name (`expand_ref`): what the first that finds a ref names, and how many find
+/// one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Dwim {
+  /// What the ref the first pattern finds names, by position: `None` when no pattern finds one.
+  pub(super) first: Option<u64>,
+  /// How many of git's patterns find a ref, which git warns of past one.
+  pub(super) found: usize,
+}
+
+/// What git's patterns find for the short name `rev` (A-640 part 4, a `sparse:oid` filter's revision; `repo_dwim_ref`,
+/// which takes the first and counts them all): `HEAD` read through to the default branch.
+pub(super) fn dwim(graph: &StoreGraph<'_>, served: &Served<'_>, rev: &[u8]) -> Dwim {
+  let mut found = REV_PARSE_RULES
     .iter()
-    .find_map(|&(before, after)| resolved(graph, served, [before, rev, after]))
+    .filter_map(|&(before, after)| resolved(graph, served, [before, rev, after]));
+  let first = found.next();
+  Dwim {
+    first,
+    found: usize::from(first.is_some()).saturating_add(found.count()),
+  }
 }
 
 /// What the ref whose name `parts` make up, in order, names: `HEAD` read through to the default branch.

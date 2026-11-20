@@ -152,6 +152,23 @@ impl Repository for View {
       .iter()
       .map(|(name, node)| (name.as_slice(), *node))
   }
+
+  /// The view hides nothing, so the roots its register would keep are its draft changesets none of whose parents is
+  /// draft.
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    self
+      .changesets
+      .iter()
+      .filter(|held| {
+        held.3 == Phase::Draft
+          && held
+            .1
+            .iter()
+            .flatten()
+            .all(|parent| self.phase(*parent) == Phase::Public)
+      })
+      .map(|held| held.0)
+  }
 }
 
 /// A changeset of the fixtures' repository as `make-push-fixtures.sh` made it with stock 7.2 (user `test`, date `0
@@ -1360,4 +1377,36 @@ mod hooks {
       .collect();
     assert_eq!(named, [Some(PART), Some(PART)]);
   }
+}
+
+/// A-694 (bug: an append's new greens were minted one id). Do: on the rebuilt repository, push a `bookmarks` part
+/// making bookmarks `left` and `right` at `second`, the changeset `default`'s line and bookmark `main` hold. Expect the
+/// push accepted, each new bookmark a green of its own whose head is `second`, and the three bookmarks' greens
+/// different. Before, the second new green was minted the first's id and the push was answered `error:abort`.
+#[test]
+fn t_a694_a_push_making_two_bookmarks_makes_two_greens() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut hg = Hg::new(state, "marks");
+    let made = rebuild(state, &mut hg, (&[1], 1));
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let at = |name: &[u8]| BookmarkAt {
+      name: name.to_vec(),
+      node: Some(made[1].node),
+    };
+    let unbundle = Unbundle {
+      parts: vec![taken(0, Asks::Bookmarks(vec![at(b"left"), at(b"right")]))],
+    };
+    let answer = hg.push(state, &unbundle, &view);
+    assert!(answer.is_ok(), "{answer:?}");
+    let bound = |name: &[u8]| hg.bound(state, &bookmark_name(name));
+    let (main, left, right) = (bound(b"main"), bound(b"left"), bound(b"right"));
+    let greens: BTreeSet<DbVolumeId> = [main, left, right].into_iter().flatten().collect();
+    assert_eq!(greens.len(), 3, "{main:?} {left:?} {right:?}");
+    for green in [left, right].into_iter().flatten() {
+      assert_eq!(head(state, green), Some(made[1].node));
+    }
+  });
 }

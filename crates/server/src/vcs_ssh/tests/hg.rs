@@ -258,6 +258,23 @@ impl Repository for Probed {
       .iter()
       .map(|(name, node)| (name.as_slice(), *node))
   }
+
+  /// The repository is the served changesets a probe listed and hides nothing, so the roots its register would keep
+  /// are its draft changesets none of whose parents is draft (A-691).
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    self
+      .changesets
+      .iter()
+      .filter(|changeset| {
+        changeset.phase == Phase::Draft
+          && changeset
+            .parents
+            .iter()
+            .flatten()
+            .all(|parent| self.phase(*parent) == Phase::Public)
+      })
+      .map(|changeset| changeset.node)
+  }
 }
 
 impl Store for Probed {

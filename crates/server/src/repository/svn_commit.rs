@@ -15,6 +15,11 @@
 //!    revision's record (`slates_svn::commit::record`) as one durable step (item 3.5);
 //! 6. the apply (`Repository::apply`), which the check in the same turn made certain; the charge trued up.
 //!
+//! **A record that moves no version** ([`record`], A-652 part 3): the repository's UUID, or a revision's properties set
+//! whole, as an import names a repository that holds no revision but 0 by its stream's UUID and sets revision 0's
+//! properties to its stream's. Checked against the records first (a revision they hold, the room), its growth charged,
+//! one entry holding the record alone and moving no green, then applied.
+//!
 //! A refusal before the append leaves the records, the green and the logs as they were, and gives back what was
 //! charged. Once the entry is recorded the revision is the repository's: should the green answer another version or
 //! the records refuse the apply (neither met in a correct use, each counted), the records are made again from the log,
@@ -36,9 +41,8 @@
 //! whose tree no public read of the engine lists at that version; and a replacement without history that changes a
 //! node's kind, which the engine refuses as `TypeChanged` (GAPS §8f).
 //!
-//! **Owed**: the svn:// connection task's call of the step (A-656 part 2) and the import's (A-652 part 3); the lock
-//! verbs' entries recorded as the commits' are; the records' texts read from the green's content rather than held
-//! beside it and in the record.
+//! **Owed**: the svn:// connection task's call of the step (A-656 part 2); the lock verbs' entries recorded as the
+//! commits' are; the records' texts read from the green's content rather than held beside it and in the record.
 
 use std::collections::BTreeMap;
 
@@ -127,8 +131,95 @@ fn corrupt() -> Uncommitted {
   Uncommitted::Step(StepRefusal::Corrupt)
 }
 
+/// The step for a record that moves no version (module docs; A-652 part 3): `record`, the repository's UUID or a
+/// revision's properties set whole, committed on `repository`'s logs by `principal`, its owner. A creation or a revision
+/// is refused `Corrupt`: a creation is made once, by `CreateRepository`, and a revision moves the green ([`commit`]).
+pub(crate) fn record(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  record: Record,
+) -> Result<(), Uncommitted> {
+  green_of(state, repository)?;
+  let brought = match &record {
+    Record::RevisionProperties { properties, .. } => {
+      bytes_of(properties.iter(), core::iter::empty::<&Vec<u8>>())
+    }
+    Record::Uuid(_) => 0,
+    Record::Created { .. } | Record::Revision(_) => return Err(corrupt()),
+  };
+  if !crate::vcs_store::lend_svn(state, repository, brought) {
+    return Err(Uncommitted::NotHeld);
+  }
+  let landed = record_growth(state, repository, &record)
+    .and_then(|growth| land_record(state, (principal, repository), record, growth));
+  crate::vcs_store::settle_svn(state, repository);
+  landed
+}
+
+/// The bytes `record` adds to the records once applied, checked against them as its apply checks it: none for a UUID.
+fn record_growth(
+  state: &ShardState,
+  repository: RepositoryId,
+  record: &Record,
+) -> Result<u64, Uncommitted> {
+  let records = state
+    .vcs_stores
+    .subversion_records(repository)
+    .ok_or(Uncommitted::NotHeld)?;
+  match record {
+    Record::Uuid(_) => Ok(0),
+    Record::RevisionProperties {
+      revision,
+      properties,
+    } => records
+      .check_revision_properties(*revision, properties)
+      .map_err(Uncommitted::Step),
+    Record::Created { .. } | Record::Revision(_) => Err(corrupt()),
+  }
+}
+
+/// Appends `record` alone through A-635's append, its `growth` charged first; then applies it. An append that records
+/// nothing is answered `Diverged`, counted, since the entry holds a record and so is always recorded; an apply refused
+/// once the entry recorded it is counted and the records are made again from the log.
+fn land_record(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  record: Record,
+  growth: u64,
+) -> Result<(), Uncommitted> {
+  crate::vcs_store::reserve_svn(state, repository, growth)
+    .map_err(|available| Uncommitted::Budget { available })?;
+  let parts = EntryParts {
+    objects: record.encode(),
+    ..EntryParts::default()
+  };
+  match RepositoryLogs::append(state, principal, repository, Vec::new(), parts) {
+    Ok(appended) if appended.recorded => {}
+    Ok(_) => {
+      crate::vcs_store::unreserve_svn(state, repository, growth);
+      state.count(DIVERGED, 1);
+      return Err(Uncommitted::Diverged);
+    }
+    Err(refused) => {
+      crate::vcs_store::unreserve_svn(state, repository, growth);
+      return Err(Uncommitted::Append(refused));
+    }
+  }
+  let applied = state
+    .vcs_stores
+    .subversion(repository)
+    .and_then(|svn| svn.records.as_mut())
+    .map(|records| records.commit_record(record));
+  if applied != Some(Ok(())) {
+    state.count(APPLY_REFUSED, 1);
+    crate::vcs_store::rebuild(state, repository);
+  }
+  Ok(())
+}
+
 /// The step (module docs): `revision` committed on `repository`'s logs by `principal`, its owner; a client's work
-/// judged again with its commit's locks at the owner's instant (`judged`), an imported revision (`None`) as made.
+/// judged again with its commit's locks at the owner's instant (`judged`), an imported revision (`None`) as made (A-652
+/// part 3's import, `crate::vcs_store::svn_import`).
 pub(crate) fn commit(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),

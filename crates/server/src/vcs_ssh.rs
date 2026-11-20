@@ -59,17 +59,24 @@
 //! lifetimes this edge's authenticated connections lived (RFC 6298's estimator), the hour before any
 //! (`slates_ssh::keylife::key_time_limit_ns`). Only a connection that ended as its client ended it is a sample.
 //!
-//! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the host key's keeping, an edge state
-//! kept on every shard); the stores' lenders over A-662's map, which git's upload-pack (A-651 part 2) and Mercurial's
-//! `serve --stdio` (A-679) are served from and without which each is refused as not served; the two services whose
-//! server halves have not landed, each refused so until it does (receive-pack, A-620; Subversion's tunnel, §4.17.4
-//! piece 12); Subversion's tunnel moved to the shard of the repository its greeting names; the live `git clone` and
-//! `hg clone` over SSH (main's runs).
+//! **The daemon's edge** ([`daemon_edge`], A-684): `--vcs-ssh ADDRESS` starts it, its listener on the control shard and
+//! an edge state kept on every shard, so a connection moves to its repository's owner; its listener and host key held
+//! by the anchor across daemon restarts (the fleet node's own key on a fleet node); and the daemon's log names its
+//! address and its host key's fingerprint.
+//!
+//! **Owed** (GAPS, the §4.17 entry): Subversion's tunnel in the daemon's site (A-688's `SvnServices`), which awaits a
+//! lender of its stores over A-662's map, and is refused as not served until it lands; receive-pack's server half,
+//! refused so until it lands (A-620, A-683); Subversion's tunnel moved to the shard of the repository its greeting
+//! names; the live `git clone`, `hg clone` and `svn checkout svn+ssh://` over SSH (main's runs).
 
+mod daemon_edge;
 mod git;
 mod hg;
 pub(crate) mod site;
+mod svn;
 mod waits;
+
+pub(crate) use daemon_edge::{bind, start};
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -155,7 +162,8 @@ impl std::fmt::Display for EdgeRefused {
   }
 }
 
-/// The host key's seed, overwritten with zeros when dropped (as `slates_ssh::kex::Secret` is).
+/// The host key's seed, overwritten with zeros when dropped (as `slates_ssh::kex::Secret` is): the edge's own, and each
+/// copy the daemon's start holds on its way there ([`daemon_edge`]).
 struct HostSeed([u8; ED25519_SEED_LEN]);
 
 impl Drop for HostSeed {

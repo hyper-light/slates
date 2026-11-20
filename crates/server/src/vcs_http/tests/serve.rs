@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-use slates_http::head::Head;
+use slates_http::head::{Head, Target};
 use slates_http::reply::Status;
-use slates_http_edge::connection::{Fields, Phase};
+use slates_http_edge::connection::{Fields, Phase, StatusMode};
 use slates_http_edge::tls::ServingIdentity;
 use slates_rt::control::Control;
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
@@ -56,19 +56,27 @@ const HANDSHAKE: usize = 0;
 /// Shape: idleness's place in [`PHASES`].
 const IDLE: usize = 1;
 
-/// A site that serves a request carrying [`PROOF`] (its credentials proved) with an exchange echoing its body, and refuses
-/// any other `401`, unproven.
+/// A site that serves a request carrying [`PROOF`] (its credentials proved) with an exchange echoing its body, its status
+/// decided after the body on [`AFTER_PATH`] and at its head elsewhere, and refuses any other `401`, unproven.
 struct Echoes;
+
+/// Shape: the path whose route decides its reply's status after the body.
+const AFTER_PATH: &[u8] = b"/after";
 
 impl Site for Echoes {
   type Exchange = Echo;
 
   async fn decide(&mut self, head: &Head<'_>, _secure: bool) -> Decided<Echo> {
     let proven = head.field(b"authorization").ok().flatten() == Some(PROOF);
+    let status = match head.target {
+      Target::Path { path, .. } if path == AFTER_PATH => StatusMode::AfterBody,
+      _ => StatusMode::Streamed,
+    };
     let answer = if proven {
       Answer::Serve {
         fields: Vec::new(),
         head_only: false,
+        status,
         exchange: Echo::default(),
       }
     } else {
@@ -88,6 +96,20 @@ const TYPED: &[u8] = b"typed";
 const FAILS_AS_IT_BEGINS: &[u8] = b"fails";
 /// Shape: the media type [`Echo`] names for [`TYPED`].
 const ECHO_TYPE: &[u8] = b"text/x-echo";
+/// Shape: a body [`Echo`] names `201 Created` for as its reply begins, as Git LFS names a lock it created (A-629).
+const NAMES_CREATED: &[u8] = b"created";
+/// Shape: a body [`Echo`] names `204 No Content` for, a status no served reply may carry.
+const NAMES_NO_CONTENT: &[u8] = b"empty";
+/// Shape: `201 Created`.
+const CREATED: Status = Status {
+  code: 201,
+  reason: "Created",
+};
+/// Shape: `204 No Content`.
+const NO_CONTENT: Status = Status {
+  code: 204,
+  reason: "No Content",
+};
 
 /// An exchange replying `echo:` and the body it took, in one run; naming its reply's fields, or failing as its reply
 /// begins, for the bodies [`TYPED`] and [`FAILS_AS_IT_BEGINS`].
@@ -109,6 +131,14 @@ impl Exchange for Echo {
 
   async fn body_end(&mut self) -> Result<(), Failed> {
     Ok(())
+  }
+
+  fn reply_status(&self) -> Status {
+    match self.body.as_slice() {
+      NAMES_CREATED => CREATED,
+      NAMES_NO_CONTENT => NO_CONTENT,
+      _ => Status::OK,
+    }
   }
 
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
@@ -280,8 +310,13 @@ fn read_to_end(stream: &mut impl Read) -> (Vec<u8>, bool) {
 
 /// A POST of `body`, carrying [`PROOF`] when `proven`.
 fn post(body: &[u8], proven: bool) -> Vec<u8> {
+  post_to("/echo", body, proven)
+}
+
+/// A POST of `body` to `path`, carrying [`PROOF`] when `proven`.
+fn post_to(path: &str, body: &[u8], proven: bool) -> Vec<u8> {
   let mut head = format!(
-    "POST /echo HTTP/1.1\r\nHost: edge\r\nContent-Length: {}\r\n",
+    "POST {path} HTTP/1.1\r\nHost: edge\r\nContent-Length: {}\r\n",
     body.len()
   );
   if proven {
@@ -640,6 +675,58 @@ fn a_service_names_its_reply_fields_once_and_a_failure_there_is_the_status() {
     ),
     (
       String::from_utf8_lossy(&whole),
+      String::from_utf8_lossy(refused.as_bytes()),
+      true
+    )
+  );
+}
+
+/// A-629 part 2c (main's ruling, 2026-11-19: a route decides its status at its head or after its body). Do: on one
+/// connection send a proven POST to a route deciding its status after the body, whose exchange names `201`; on a second,
+/// one whose exchange names `204`; on a third, a POST naming `201` to a streamed route. Expect: the first reply's head
+/// carrying `201`, the reply whole; the second and the third answered `500` in stages, nothing of a reply sent, and each
+/// connection ended cleanly.
+#[test]
+fn a_status_named_after_the_body_heads_the_reply_and_one_no_reply_may_carry_fails_it() {
+  let ((created, empty, streamed), _) = served(TWO_SEATS, None, |address| {
+    let mut stream = connect(address);
+    stream
+      .write_all(&post_to("/after", NAMES_CREATED, true))
+      .expect("the request answered 201");
+    let created = read_until(&mut stream, LAST_CHUNK);
+    drop(stream);
+    let mut stream = connect(address);
+    stream
+      .write_all(&post_to("/after", NAMES_NO_CONTENT, true))
+      .expect("the request naming 204");
+    let empty = read_to_end(&mut stream);
+    drop(stream);
+    let mut stream = connect(address);
+    stream
+      .write_all(&post(NAMES_CREATED, true))
+      .expect("the streamed request naming 201");
+    (created, empty, read_to_end(&mut stream))
+  });
+  let data = [b"echo:", NAMES_CREATED].concat();
+  let head = format!(
+    "HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+    data.len()
+  );
+  let whole = [head.as_bytes(), &data, b"\r\n", LAST_CHUNK].concat();
+  let refused =
+    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  assert_eq!(
+    (
+      String::from_utf8_lossy(&created),
+      String::from_utf8_lossy(&empty.0),
+      empty.1,
+      String::from_utf8_lossy(&streamed.0),
+      streamed.1
+    ),
+    (
+      String::from_utf8_lossy(&whole),
+      String::from_utf8_lossy(refused.as_bytes()),
+      true,
       String::from_utf8_lossy(refused.as_bytes()),
       true
     )

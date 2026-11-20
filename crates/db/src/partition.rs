@@ -193,6 +193,9 @@ pub struct PartitionSnapshot {
   pub identities: Vec<IdentityRecord>,
   /// The version-control credentials this partition holds (§4.13, §4.17.2 "Access"; A-625 part 3; appended), by id.
   pub credentials: Vec<crate::catalog::CredentialRecord>,
+  /// The least counter a volume id minted here may take: one past the highest counter of every volume created here
+  /// (A-694; appended), so a recovery mints the ids the live partition would.
+  pub volume_counter: u64,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -330,6 +333,10 @@ pub struct Partition {
   /// The highest grant id ever issued here (A-266): the table holds live grants only, so this mark, snapshotted, is
   /// what keeps an ended grant's id from being issued again after a restart.
   grants_issued_through: u64,
+  /// The least counter a volume id minted here may take (A-694): one past the highest counter of every volume created
+  /// here, advanced by each creation's apply and snapshotted, so the ids an append mints for several new volumes before
+  /// any is recorded never repeat, and a recovery mints what the live partition would (`crate::Db::volume_counter_at`).
+  volume_counter: u64,
   /// Each green volume's merge chain (§4.16): its accepted increments after its checkpoint (all of them while it holds
   /// none), encoded, in commit order, so recovery replays them to rebuild the green. Bounded by `green_chain_bytes`
   /// against the cap.
@@ -483,6 +490,7 @@ impl Partition {
       audit_outbox_next: 0,
       audit_received: BTreeMap::new(),
       grants_issued_through: 0,
+      volume_counter: 0,
       captured_bases: std::collections::BTreeSet::new(),
       carried: BTreeMap::new(),
       repositories: crate::repository::Repositories::new(),
@@ -1186,6 +1194,12 @@ impl Partition {
   /// The highest grant id ever issued here (A-266), whatever grants have since ended and left the table.
   pub fn grants_issued_through(&self) -> u64 {
     self.grants_issued_through
+  }
+
+  /// The least counter a volume id minted here may take (A-694): one past the highest counter of every volume created
+  /// here.
+  pub fn volume_counter(&self) -> u64 {
+    self.volume_counter
   }
 
   /// An enrolled consumer's record (§4.13), or `None` if no such consumer was ever enrolled.
@@ -2065,7 +2079,13 @@ impl Partition {
   /// [`Partition::apply`]'s operation itself.
   fn apply_op(&mut self, op: &Op) -> Result<(), DbError> {
     match op {
-      Op::VolumeCreated { record } => self.insert_volume(record.clone()),
+      Op::VolumeCreated { record } => {
+        // Advanced whatever the insert meets, as a replay must (A-694).
+        self.volume_counter = self
+          .volume_counter
+          .max(record.id.counter().saturating_add(1));
+        self.insert_volume(record.clone())
+      }
       Op::VolumeStateChanged { id, state } => self.update_volume(*id, |v| v.state = *state),
       Op::VolumeResized { id, size } => self.update_volume(*id, |v| {
         v.policy.size = *size;
@@ -2889,6 +2909,7 @@ impl Partition {
       audit_next_seq: self.audit_next_seq,
       audit_dropped: self.audit_dropped,
       grants_issued_through: self.grants_issued_through,
+      volume_counter: self.volume_counter,
       audit_outbox: self.audit_outbox.iter().cloned().collect(),
       audit_outbox_next: self.audit_outbox_next,
       audit_received: self
@@ -3104,6 +3125,7 @@ impl Partition {
     p.audit_dropped = snapshot.audit_dropped;
     p.audit_next_seq = snapshot.audit_next_seq;
     p.grants_issued_through = snapshot.grants_issued_through;
+    p.volume_counter = snapshot.volume_counter;
     p.audit_outbox = snapshot.audit_outbox.iter().cloned().collect();
     p.audit_outbox_next = snapshot.audit_outbox_next;
     p.audit_received = snapshot

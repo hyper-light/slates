@@ -124,5 +124,12 @@ up < "$OUT/sparse-missing-v0.request.bin" > "$OUT/sparse-missing-v0.response.bin
 { pkt "want $TIP ofs-delta no-progress filter"$'\n'; pkt $'filter sparse:oid=main:missing\n'; printf 0000
   pkt $'done\n'; } > "$OUT/sparse-bare-v0.request.bin"
 up < "$OUT/sparse-bare-v0.request.bin" > "$OUT/sparse-bare-v0.response.bin" 2> /dev/null || true
+# Two of git's patterns find a ref named `main`, a tag made for this capture alone: git warns on band 2 after the
+# `NAK`, then sends the pack (A-640 part 4, fourth slice).
+git update-ref refs/tags/main "$TIP"
+{ pkt "want $TIP side-band-64k ofs-delta no-progress filter"$'\n'; pkt $'filter sparse:oid=main:a\n'; printf 0000
+  pkt $'done\n'; } > "$OUT/sparse-warn-v0.request.bin"
+up < "$OUT/sparse-warn-v0.request.bin" > "$OUT/sparse-warn-v0.response.bin"
+git update-ref -d refs/tags/main
 cd "$OUT"
 find . -type f ! -name SHA256SUMS ! -name make-v0-fixtures.sh | LC_ALL=C sort | sed 's|^\./||' | xargs shasum -a 256 > SHA256SUMS

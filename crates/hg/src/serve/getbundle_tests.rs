@@ -93,6 +93,9 @@ impl Repository for Served {
   fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
     self.history.bookmarks()
   }
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    self.history.draft_roots()
+  }
 }
 
 impl Store for Served {
