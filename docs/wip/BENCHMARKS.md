@@ -14863,3 +14863,23 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
   HTTP answer and the daemon gone after 2.6 to 5.0 s, peak RSS about 1.5 GiB, alone and at R = 1 (the first run, with
   v2.0.0 as a fourth class). Reported to main as a run request; the giant class waits on its fix.
 
+## Fair turns by repository on a shard: measured and rejected, the toys slower and the daemon ended (A-724 piece 3c; 2026-11-20)
+
+- **The experiment:** start-time fair queuing of a shard's git push steps by repository (Goyal, Vin and Cheng,
+  SIGCOMM 1996). Each repository's tag advanced by its steps' measured time; a step started only while its repository's
+  tag was within one step quantum of the least tag among the repositories waiting, else it yielded the shard. Built at
+  fdfcf2421 (branch `agents/w-balance-cpu`), never on main.
+- **The command and machine:** as the section above (`multi_repo_load.py ... v0.99 v1.0.0 v1.5.0 --steps 1,10,100`,
+  adas-mac-studio.local-2, M3 Ultra, 32 cores), release built from fdfcf2421, load 9.9 at the start, one run.
+
+| R = 100 | Without (main, the section above) | With fair turns |
+|---|---|---|
+| small class p99 / alone | 14.1 (2.534 s) | 22.8 (4.462 s) |
+| medium class p99 / alone | 6.8 | 7.1 |
+| hot repository's 19 pushes | all ok, 30.1 s | none ok: 12 connections reset, 7 empty answers; the daemon gone |
+
+- **Why it lost.** A step that waits its turn re-polls by yielding, so a shard with many waiting pushes polls without
+  stepping, and the watchdog ended the daemon. And the toys grew slower, not faster, so their wait was not the owner
+  shard's CPU taken by the hot repository's steps. Rejected. The cause of the toys' p99 is to be found by profiling the
+  R = 100 step (owed, A-724), not guessed.
+
