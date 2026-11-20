@@ -20735,6 +20735,99 @@ fn green_and_work_on(instance: &str, readers: &[&Daemon]) -> (VolumeId, VolumeId
   (green, work)
 }
 
+/// A-697 part a, A-247 (a work over a green another node owns is admitted by the green's owner): in a two-node `f = 1`
+/// fleet, A owns a green at version 1 shared with B's account, and another it shares with no one. Do: a client on B asks
+/// `AdmitWork` for the shared green and a work id of B's own partition, then sends the same request id again; asks it
+/// for the unshared green; a client on A asks it for the shared green. Expect: B's ask is forwarded to A and answered
+/// `WorkAdmitted` with the work and base 1, the green's head, and A records the work's floor at 1; the resend is
+/// answered the same from the forward's completion record; the unshared green is refused `NotShared` by A (named for B's
+/// account, which holds no share of it) and records no floor; A's own client is refused `Unsupported`, since a client asks for a work by `CreateWork`.
+#[test]
+fn a_holders_work_is_admitted_by_its_greens_owner_once_and_by_the_owners_rights_alone() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  let ReplyBody::GreenCreated { id: unshared } = owner.call(&RequestBody::CreateGreen {
+    name: "unshared-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create the unshared green");
+  };
+  let mut holder = Client::connect(daemon_b.instance());
+  let ReplyBody::Created { id: work } = holder.call(&RequestBody::Create {
+    name: "holders-work-id".to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("a volume of B's own partition, whose id the work takes");
+  };
+  let admit = RequestBody::AdmitWork { green, work };
+  let admitted = holder.call(&admit);
+  let again = holder.call_retry(&admit);
+  let floor = daemon_a.work_floor(green, work);
+  let refused = holder.call(&RequestBody::AdmitWork {
+    green: unshared,
+    work,
+  });
+  let unshared_floor = daemon_a.work_floor(unshared, work);
+  let local = owner.call(&admit);
+  assert!(
+    matches!(admitted, ReplyBody::WorkAdmitted { id, base: 1 } if id == work),
+    "A admitted B's work at its head: {admitted:?}"
+  );
+  assert_eq!(
+    again, admitted,
+    "the resend is answered from its completion record"
+  );
+  assert_eq!(floor, Ok(Some(1)), "A records the work's floor at its base");
+  assert!(
+    matches!(
+      refused,
+      ReplyBody::Refused {
+        refusal: Refusal::NotShared { .. }
+      }
+    ),
+    "A judges the rights from its green's record: {refused:?}"
+  );
+  assert_eq!(
+    unshared_floor,
+    Ok(None),
+    "a refused admission records no floor"
+  );
+  assert!(
+    matches!(
+      local,
+      ReplyBody::Refused {
+        refusal: Refusal::Unsupported { .. }
+      }
+    ),
+    "a client asks for a work by CreateWork: {local:?}"
+  );
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the

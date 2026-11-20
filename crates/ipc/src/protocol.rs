@@ -1340,6 +1340,19 @@ pub enum RequestBody {
     /// The new volume's name.
     name: String,
   },
+  /// Admit work `work` over green `green` at the green's owner (A-247, A-697 part a): the node that will hold the work
+  /// asks the green's owner, which judges the relayed principal's rights from the green's record, records the work's
+  /// floor at the head (`WorkFloorSet`, which keeps the head's history while the work reads it), and answers
+  /// `WorkAdmitted` with the work and its base. A node's verb, never a client's: served only as a forward from another
+  /// node, under the forward's completion record (so a resent forward is answered once), and refused `Unsupported` from
+  /// a client of the green's own node. Refused as a creation is: `NotFound` for no such green, `NotShared` for a
+  /// principal of another node the green is not shared with, `Forbidden` for one without the right. Appended.
+  AdmitWork {
+    /// The green.
+    green: VolumeId,
+    /// The work, its id minted on the asking node's partition.
+    work: VolumeId,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2328,6 +2341,7 @@ impl RequestBody {
       | RequestBody::Versions { green: volume }
       | RequestBody::ChangedSince { green: volume, .. }
       | RequestBody::CreateWork { green: volume, .. }
+      | RequestBody::AdmitWork { green: volume, .. }
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
@@ -2442,6 +2456,7 @@ impl RequestBody {
         | RequestBody::CreateRepository { .. }
         | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
+        | RequestBody::AdmitWork { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
@@ -5590,6 +5605,14 @@ pub enum ReplyBody {
     id: VolumeId,
     /// The dump's length in bytes.
     dump_bytes: u64,
+  },
+  /// A work admitted over its green at the green's owner (`AdmitWork`, A-697 part a): the work, and the green's version
+  /// it is based on, whose history the owner keeps while the work reads it. Appended.
+  WorkAdmitted {
+    /// The work.
+    id: VolumeId,
+    /// The green's version the work is based on.
+    base: u64,
   },
 }
 
