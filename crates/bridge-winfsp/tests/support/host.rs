@@ -18,9 +18,11 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
 use slates_anchor::handles::{
-  ENV_HANDLES, HandleMessage, HoldBounds, WHAT_WINFSP_MOUNT, parse_env,
+  ENV_HANDLES, HandleMessage, HoldBounds, WHAT_WINFSP_MOUNT, parse_env, parse_handoff,
 };
-use slates_anchor::held_windows::{Channel, Held, channel, handle_from_value, handle_value};
+use slates_anchor::held_windows::{
+  Channel, Held, channel, handle_from_value, handle_value, read_table,
+};
 use slates_bridge_core::{Attachments, Rights, View, VolumeBridge};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_ipc::win_spawn::{
@@ -386,7 +388,11 @@ fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
     let value = u64::from_str_radix(&std::env::var(CHANNEL).unwrap(), 16).unwrap();
     (Channel::adopt(inherited_handle(value)), None)
   } else {
-    let (channel, mut entries) = parse_env(&std::env::var(ENV_HANDLES).unwrap(), 1).unwrap();
+    // ENV_HANDLES names the inherited section the handoff table is in (A-460), read as the daemon reads it
+    // (`slates_server::anchor_hold_windows::handed_table`).
+    let (section, len) = parse_handoff(&std::env::var(ENV_HANDLES).unwrap(), 1).unwrap();
+    let table = read_table(inherited_handle(section), len).unwrap();
+    let (channel, mut entries) = parse_env(&table, 1).unwrap();
     let entry = entries.pop().unwrap();
     assert_eq!(entry.id, ENTRY);
     let mut values = entry.values.into_iter();
