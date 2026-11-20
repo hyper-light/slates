@@ -33,6 +33,11 @@
 //! home's step quantum (§4.3) is spent, at least one, and answers the rest to be sent in the next turn, so a batch of any
 //! size holds no home past a quantum. Answers come back in the request's order.
 //!
+//! **From the region** ([`serve_remote`], A-724 piece 6's region half). Another member's home exchange
+//! (`slates_cluster::homes`) arrives on this node's record session and is served here: kept on the node's own home
+//! shard for the window, never in `ContentHold` (w-fed-faults' answer to Q3), only where the configuration ranks this
+//! node among the window's homes, and acknowledged only once that shard's image holding it is published.
+//!
 //! **Refused** ([`HomeRefused`]): bytes past a window; a home whose content store refused (its budget); a home that did
 //! not answer within the budget; an answer naming another identity than the bytes' (never in a correct home).
 
@@ -457,6 +462,69 @@ pub(crate) async fn let_go_many(
     .into_iter()
     .map(|answer| answer.unwrap_or(Err(HomeRefused::Unanswered)))
     .collect()
+}
+
+/// Counter: home exchanges a member served from the region (module docs, "From the region"). Format: a counter name.
+pub(crate) const REMOTE_SERVED: &str = "vcs_store.homes.remote_served";
+
+/// Serves one home exchange from another member of the region on shard `origin` (module docs, "From the region";
+/// `slates_cluster::homes`): a put kept only where the configuration this node knows ranks it among the window's homes
+/// and its bytes hash to their name, on the node's own home shard for the window, and answered `Kept` only once that
+/// shard's image holding it is published ([`published`], A-727's barrier); a read answered with the bytes; a let-go
+/// answered once its holder is let go. Each wait is judged in its target's own time within `budget_ns`. Malformed bytes
+/// answer nothing, as the session's other streams do.
+pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) -> Vec<u8> {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal, admits};
+  let Ok(message) = HomeMessage::decode(request) else {
+    return Vec::new();
+  };
+  let Some((local, members, f, shards)) = crate::state::with_state(|state| {
+    state.count(REMOTE_SERVED, 1);
+    (
+      state.fleet.host(),
+      state.fleet.members().to_vec(),
+      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+      state.shards.clone(),
+    )
+  }) else {
+    return Vec::new();
+  };
+  let (identity, outcome) = match message {
+    HomeMessage::Put { identity, bytes } => {
+      let outcome = match admits(&identity, &bytes, (local, &members, f)) {
+        Err(refusal) => HomeOutcome::Refused(refusal),
+        Ok(()) => match home(origin, &shards, bytes, budget_ns).await {
+          Ok((_, ticket)) if published(origin, ticket, budget_ns).await => HomeOutcome::Kept {
+            generation: ticket.generation,
+          },
+          Ok(_) | Err(HomeRefused::Unanswered) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+          Err(HomeRefused::Misnamed | HomeRefused::PastWindow) => {
+            HomeOutcome::Refused(HomeRefusal::Misnamed)
+          }
+          Err(HomeRefused::Content(_)) => HomeOutcome::Refused(HomeRefusal::Room),
+          Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+        },
+      };
+      (identity, outcome)
+    }
+    HomeMessage::Read { identity } => {
+      let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
+        Some(bytes) => HomeOutcome::Bytes(bytes),
+        None => HomeOutcome::Refused(HomeRefusal::NotHeld),
+      };
+      (identity, outcome)
+    }
+    HomeMessage::LetGo { identity } => {
+      let outcome = match let_go(origin, &shards, ContentId(identity), budget_ns).await {
+        Ok(()) => HomeOutcome::LetGo,
+        Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+        Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+      };
+      (identity, outcome)
+    }
+    HomeMessage::Answer { .. } => return Vec::new(),
+  };
+  HomeMessage::Answer { identity, outcome }.encode()
 }
 
 #[cfg(test)]
