@@ -154,3 +154,17 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    inbox/w-k90-a520-from-w-k90-containers.md (+ agents_send), inbox/w-k90-win-from-w-k90-containers.md (r33 findings).
 ## MINE NEXT: proof by use of the OCI/Docker engine through the NEW route on Linux (adacachy), macOS (Docker Desktop),
    Windows (jupiter, once w-k90-win's build + WinFsp) -- after w-k90-a520 lands the route.
+
+## 2026-11-20 ~11:00 PST: restarted after the big Studio's reboot (10:35). Nothing lost: kiln clone clean (fa86489f5 on
+   main), now merged to origin/main da441f112. Unpushed state commit (hand-off notes + progress) pushed via the MacBook (r1).
+   GitHub https from this Studio times out since the reboot.
+## GOAL (plan 01a1fa36 step 2): OCI/Docker engine proven by use through the EXPORT route on adacachy, a Mac with Docker
+   Desktop, and jupiter: kiln starts an agent with the container engine, it writes in its volume, review/drift/landing
+   under a grant, landed files byte-equal, no host copy.
+- w-k90-a520 (01a1f9c04dbb...) built the route on branch agents/w-k90-a520 (4d6bbc7a9 slates_e2e container drive,
+  1f928c612 route, d9adef305 A/B, 4004e6a91 docs); not on main yet. Its goal also says "proven on adacachy": asked it
+  to split (me: Mac + Windows, or it hands adacachy to me) and pointed out its bind-side hang was a /private/var/folders
+  workspace (Desktop shares /Users; my green r70 used ~/.cache).
+- PLAN once it lands: run `cargo test -p kiln --test slates_e2e container::...` (its drive covers review, drift,
+  landing by mode, byte-equality) on a Mac with Docker Desktop (bin over LAN as before), adacachy (TMPDIR off /tmp,
+  sized needs), jupiter (needs WinFsp + Docker Desktop + a console-session runner: a person; w-k90-win owns the build).
