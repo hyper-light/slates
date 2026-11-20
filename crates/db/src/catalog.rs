@@ -1503,6 +1503,11 @@ pub struct RepositoryRecord {
   pub owner: Principal,
   /// Its policy (A-622): empty at creation, then set whole by `Op::RepositoryPolicySet`. Appended.
   pub policy: RepositoryPolicy,
+  /// Its index's cut (A-724 piece 9, §4.17.5 "A giant repository's metadata across partitions"): the leading bits of an
+  /// object's id that name the range its index row is held in (`slates_vcs::cut`), each range on the partition
+  /// rendezvous ranks first for the repository's family and the range. Zero at creation, the whole index on the owner;
+  /// moved a bit at a time by `Op::RepositoryIndexCut`. Appended.
+  pub index_bits: u8,
 }
 
 /// A repository's policy (§4.17.1 "Policy: protected branches, access and hooks"; A-597's matcher, A-622's record): its

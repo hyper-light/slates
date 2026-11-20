@@ -13416,6 +13416,7 @@ mod state_log_tests {
         assert!(Ack::decode(&reply).is_ok());
       }
       let record = slates_db::catalog::RepositoryRecord {
+        index_bits: 0,
         id: repo,
         name: "linux".to_owned(),
         tool: slates_db::catalog::VcsTool::Git,

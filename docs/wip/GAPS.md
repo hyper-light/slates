@@ -107,7 +107,8 @@
 > admission's second resource (`vcs_share::room`, `Bound::Snapshot`). Owed: the slot
 > derived and re-laid at a handoff (8b), the snapshot naming a push's names by identity (8c: the codec `slates_vcs::rows` built; record v3's switch waits
 > for A-727 a3's durable content), a giant repository's index cut
-> across partitions by object id (9: the cut and its placement built, 9a; the record, routing and split owed, 9b).
+> across partitions by object id (9: the cut and its placement, 9a; the cut in the record, its one-bit op and look-up routing, 9b; the rows'
+> routing and the split's moves wait for record v3, after A-727 a3).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
 > (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
