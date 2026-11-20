@@ -693,8 +693,8 @@ pub(crate) fn long_directory_history(revisions: usize, per_revision: usize) -> S
 /// A-751 follow-up's A/B (main's: "listing time ... before and after, on a large directory with a long history"), in
 /// release (`cargo test --release -p slates-svn --lib -- --ignored listing_times --nocapture`): `/trunk/big` after
 /// 1,000 revisions of 10 files each (9,001 live, 10,000 named), listed at the youngest revision and at the middle one.
-/// Printed for each: `Index::children`; a dirent for every child listed (`history::present`, as the drive's `entries`
-/// makes one); and the two together, the server's listing. Measured, not asserted.
+/// Printed for each: `Index::children`; a dirent resolved for every child listed (`history::present`, as the drive's
+/// `entries` made one before A-759); and the drive's `entries` as it is now. Measured, not asserted.
 #[test]
 #[ignore = "a measurement, run in release"]
 fn listing_times() {
@@ -708,6 +708,12 @@ fn listing_times() {
     rules: None,
   };
   let youngest = index.youngest();
+  eprintln!(
+    "listing_times: the index holds {} entries of {} bytes ({} bytes), the children maps' bytes among them",
+    index.entries(),
+    Index::ENTRY_BYTES,
+    index.entries() * Index::ENTRY_BYTES
+  );
   for revision in [youngest, youngest / 2] {
     let best = |run: &dyn Fn() -> usize| {
       (0..5)
@@ -737,9 +743,81 @@ fn listing_times() {
         })
         .count()
     });
+    let made = |after: Option<&str>, most: usize| {
+      let (listed, _) = index
+        .listing_after("/trunk/big", revision, after, most)
+        .unwrap()
+        .unwrap();
+      listed
+        .into_iter()
+        .map(|(name, id)| (name, Dirent::of(&index.node_revision(id).unwrap())))
+        .collect::<BTreeMap<_, _>>()
+        .len()
+    };
+    let (whole, _) = best(&|| made(None, usize::MAX));
+    let middle = names[names.len() / 2].clone();
+    let (step, _) = best(&|| made(Some(&middle), LIST_STEP));
     eprintln!(
-      "listing_times r{revision}: {live} live; children {children:?}; dirents {dirents:?}; listing {:?}",
-      children + dirents
+      "listing_times r{revision}: {live} live; children {children:?}; dirents resolved {dirents:?}; entries made \
+       from the listing whole {whole:?}; one cursor step of {LIST_STEP} {step:?}"
     );
+  }
+}
+
+/// A-759, the listing's red: a very large directory read through the index's cursor, held by entries per step, which
+/// contention cannot blur. Do: over `/trunk/big` after 200 revisions of 10 files (1,801 live), drive a checkout of
+/// `/trunk` (start empty) and an update from r100, a step a call. Expect: no step lists more than [`LIST_STEP`]
+/// entries; the checkout adds exactly the directory's live names in order, and the update deletes exactly the names
+/// r100 held that r201 does not. Red before the change: a directory's whole listing, both sides, was one step.
+#[test]
+fn a_very_large_directory_is_listed_a_few_entries_a_step() {
+  let (index, green) = green::repository_from(&long_directory_history(200, 10));
+  let locks = LockTable::new();
+  let sources = Sources {
+    index: &index,
+    repository: &green,
+    locks: &locks,
+    now: NOW,
+    rules: None,
+  };
+  let youngest = index.youngest();
+  let names_at = |revision| index.children("/trunk/big", revision).unwrap().unwrap();
+  for (from, start_empty) in [(youngest, true), (100, false)] {
+    let mut report = trunk_report(from, youngest, false);
+    report.target_info.start_empty = start_empty;
+    let mut drive = Drive::new(report, b"u");
+    let (mut most, mut added, mut deleted) = (0usize, Vec::new(), Vec::new());
+    let mut inside_big = false;
+    take_most_listed();
+    loop {
+      let next = drive.next(&sources, 1);
+      most = most.max(take_most_listed());
+      match next {
+        Next::Ended => break,
+        Next::Call(Call::Add { path, .. }) if path == "big" => inside_big = true,
+        Next::Call(Call::Open { path, .. }) if path == "big" => inside_big = true,
+        Next::Call(Call::Add { path, .. }) if inside_big => added.push(path.to_owned()),
+        Next::Call(Call::Delete { path, .. }) if inside_big => deleted.push(path.to_owned()),
+        Next::Call(Call::CloseDirectory) => inside_big = false,
+        _ => {}
+      }
+    }
+    assert!(most <= LIST_STEP, "r{from}: a step listed {most}");
+    let now: Vec<String> = names_at(youngest)
+      .iter()
+      .map(|name| format!("big/{name}"))
+      .collect();
+    if start_empty {
+      assert_eq!(added, now, "a checkout's additions");
+    } else {
+      let gone: Vec<String> = names_at(100)
+        .iter()
+        .map(|name| format!("big/{name}"))
+        .filter(|path| !now.contains(path))
+        .collect();
+      let mut sorted = deleted.clone();
+      sorted.sort();
+      assert_eq!(sorted, gone, "an update's deletions");
+    }
   }
 }

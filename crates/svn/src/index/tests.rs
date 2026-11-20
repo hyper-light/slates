@@ -1040,18 +1040,25 @@ fn a_transaction_name_outside_what_svn_fs_h_promises_is_refused() {
   assert_eq!(index.transaction(2).unwrap(), Some("41-Zz.9"));
 }
 
-/// A-553 (§2 ban 8: every structure has a bound and a typed refusal at it): a revision that would take the index past
-/// the room its caller gives, by one entry, is refused and changes nothing; the same revision with exactly the room
-/// it needs is accepted. The edit makes four node-revisions: the file, its two directories and the root.
+/// A-553 (§2 ban 8: every structure has a bound and a typed refusal at it), with A-759's maps charged: a revision
+/// that would take the index past the room its caller gives, by one entry, is refused and changes nothing; the same
+/// revision with exactly the room it needs is accepted. The edit makes four node-revisions (the file, its two
+/// directories and the root) and changes the three directories' children maps, whose bytes are charged too, so it
+/// needs more than four entries; so does a deletion, which changes its parent's map.
 #[test]
 fn an_index_that_would_outgrow_its_room_is_refused_one_entry_past_it() {
   let mut index = trunk();
-  let needed = index.entries() + 4;
-  let before = format!("{index:?}");
+  let needed_by = |index: &Index, record: RevisionRecord| match index.plan(record, 0).unwrap_err() {
+    IndexRefusal::Room { needed, .. } => needed,
+    other => panic!("{other:?}"),
+  };
   let record = || RevisionRecord {
     transaction: TRANSACTION.to_owned(),
     changes: vec![edit("/trunk/lib/a.c", 3)],
   };
+  let needed = needed_by(&index, record());
+  assert!(needed > index.entries() + 4, "the maps uncharged: {needed}");
+  let before = format!("{index:?}");
   let refusal = index.append(record(), needed - 1).unwrap_err();
   assert_eq!(
     refusal,
@@ -1068,7 +1075,11 @@ fn an_index_that_would_outgrow_its_room_is_refused_one_entry_past_it() {
     transaction: TRANSACTION.to_owned(),
     changes: vec![deleted("/trunk/README", NodeKind::File)],
   };
-  let after_deletion = needed + 2 + 1;
+  let after_deletion = needed_by(&index, deletion.clone());
+  assert!(
+    after_deletion > needed + 2 + 1,
+    "the maps uncharged: {after_deletion}"
+  );
   assert_eq!(
     index
       .append(deletion.clone(), after_deletion - 1)
@@ -1079,6 +1090,7 @@ fn an_index_that_would_outgrow_its_room_is_refused_one_entry_past_it() {
     }
   );
   assert_eq!(index.append(deletion, after_deletion).unwrap(), 3);
+  assert_eq!(index.entries(), after_deletion);
 }
 
 /// A-553: a node-revision another index made, or none made, is refused as `SVN_ERR_FS_ID_NOT_FOUND`; a relation to
@@ -2120,6 +2132,28 @@ fn same_listings(
       return Err(format!(
         "{path}@{revision}: listed {listed:?}, naive {expected:?}"
       ));
+    }
+    // A-759: each child's node-revision in the listing is the one its own path resolves to.
+    for (name, id) in index
+      .listing(path, revision)
+      .map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))?
+      .into_iter()
+      .flatten()
+    {
+      let child = if path == "/" {
+        format!("/{name}")
+      } else {
+        format!("{path}/{name}")
+      };
+      let resolved = index
+        .node(&child, revision)
+        .map_err(|refusal| format!("{child}@{revision}: {refusal:?}"))?
+        .map(|node| node.id());
+      if resolved != Some(id) {
+        return Err(format!(
+          "{child}@{revision}: listed {id:?}, resolved {resolved:?}"
+        ));
+      }
     }
     let through_copy = listed.iter().flatten().any(|name| {
       let child = if path == "/" {

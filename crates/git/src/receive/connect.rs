@@ -42,7 +42,7 @@ pub enum Connected {
 }
 
 /// Where a walk of one pushed object stands.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mark {
   /// Not reached.
   New,
@@ -122,6 +122,11 @@ pub(crate) struct Walk {
   pass: Pass,
   /// The next object of the pass.
   at: usize,
+  /// The propagation's stack (A-722 part 4, the check's longest step at 100 concurrent pushes: the propagation ran whole
+  /// in one unit): each open object and its next edge.
+  stack: Vec<(usize, usize)>,
+  /// Where each object's propagation stands; empty until the propagation begins.
+  marks: Vec<Mark>,
 }
 
 impl Walk {
@@ -147,6 +152,8 @@ impl Walk {
       targets: Vec::new(),
       pass: Pass::States,
       at: 0,
+      stack: Vec::new(),
+      marks: Vec::new(),
     })
   }
 
@@ -187,7 +194,68 @@ impl Walk {
     }
   }
 
-  /// One unit of the walk: one object of a pass, a pass's end, or the propagation whole.
+  /// The propagation's tables charged and made: the stack and the marks, an object each.
+  fn propagation_begun(&mut self, admission: &mut Admission) -> Result<(), Refusal> {
+    let count = self.states.len();
+    admission
+      .charge_items::<(usize, usize)>(count)
+      .map_err(Refusal::PastAdmission)?;
+    admission
+      .charge_items::<Mark>(count)
+      .map_err(Refusal::PastAdmission)?;
+    reserve(&mut self.stack, count)?;
+    reserve(&mut self.marks, count)?;
+    self.marks.resize(count, Mark::New);
+    Ok(())
+  }
+
+  /// One unit of the propagation, carrying the worst state back over the edges with an explicit stack, each object
+  /// finished once: the open object's next edge followed, or the object finished once its edges are; with none open,
+  /// the next object not reached opened (`at` the next root); with none left, the propagation done and its tables
+  /// given back.
+  fn propagation_unit(&mut self) {
+    let Self {
+      states,
+      offsets,
+      targets,
+      stack,
+      marks,
+      ..
+    } = self;
+    if let Some(&(node, cursor)) = stack.last() {
+      let end = offsets
+        .get(node.saturating_add(1))
+        .copied()
+        .unwrap_or(cursor);
+      if cursor < end {
+        if let Some(top) = stack.last_mut() {
+          top.1 = cursor.saturating_add(1);
+        }
+        if let Some(&child) = targets.get(cursor)
+          && marks.get(child) == Some(&Mark::New)
+        {
+          open(child, offsets, marks, stack);
+        }
+        return;
+      }
+      stack.pop();
+      finish(node, states, offsets, targets, marks);
+      return;
+    }
+    let root = self.at;
+    if root >= self.states.len() {
+      self.stack = Vec::new();
+      self.marks = Vec::new();
+      self.pass = Pass::Done;
+      return;
+    }
+    if self.marks.get(root) == Some(&Mark::New) {
+      open(root, &self.offsets, &mut self.marks, &mut self.stack);
+    }
+    self.at = root.saturating_add(1);
+  }
+
+  /// One unit of the walk: one object of a pass, a pass's end, or a unit of the propagation.
   fn unit<R: Repository + ?Sized>(
     &mut self,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
@@ -198,11 +266,12 @@ impl Walk {
       (Pass::States, Some(object)) => self.judge(object, (request, pushed, repository))?,
       (Pass::States, None) => self.begin_edges(pushed.objects().len(), admission)?,
       (Pass::Edges, Some(object)) => self.keep_edges(object, request.format, pushed)?,
-      (Pass::Edges, None) => self.pass = Pass::Propagate,
-      (Pass::Propagate, _) => {
-        propagate(&mut self.states, &self.offsets, &self.targets, admission)?;
-        self.pass = Pass::Done;
+      (Pass::Edges, None) => {
+        self.propagation_begun(admission)?;
+        self.pass = Pass::Propagate;
+        self.at = 0;
       }
+      (Pass::Propagate, _) => self.propagation_unit(),
       (Pass::Done, _) => {}
     }
     Ok(())
@@ -368,55 +437,6 @@ fn tree_edges(
     }
   }
   whole
-}
-
-/// Makes each object's state the worst of its own and of every object it reaches, by an explicit
-/// stack of objects and the next edge of each, every object finished once. An edge back to an
-/// object on the stack, which object names cannot make, is passed over.
-fn propagate(
-  states: &mut [Connected],
-  offsets: &[usize],
-  targets: &[usize],
-  admission: &mut Admission,
-) -> Result<(), Refusal> {
-  let count = states.len();
-  admission
-    .charge_items::<(usize, usize)>(count)
-    .map_err(Refusal::PastAdmission)?;
-  admission
-    .charge_items::<Mark>(count)
-    .map_err(Refusal::PastAdmission)?;
-  let mut stack: Vec<(usize, usize)> = Vec::new();
-  reserve(&mut stack, count)?;
-  let mut marks = Vec::new();
-  reserve(&mut marks, count)?;
-  marks.resize(count, Mark::New);
-  for root in 0..count {
-    if marks.get(root) != Some(&Mark::New) {
-      continue;
-    }
-    open(root, offsets, &mut marks, &mut stack);
-    while let Some(&(node, cursor)) = stack.last() {
-      let end = offsets
-        .get(node.saturating_add(1))
-        .copied()
-        .unwrap_or(cursor);
-      if cursor < end {
-        if let Some(top) = stack.last_mut() {
-          top.1 = cursor.saturating_add(1);
-        }
-        if let Some(&child) = targets.get(cursor)
-          && marks.get(child) == Some(&Mark::New)
-        {
-          open(child, offsets, &mut marks, &mut stack);
-        }
-        continue;
-      }
-      stack.pop();
-      finish(node, states, offsets, targets, &mut marks);
-    }
-  }
-  Ok(())
 }
 
 /// Puts `node` on the stack, its walk at its first edge.

@@ -5175,6 +5175,8 @@
 > 0.16–0.40 s (main 1.16–1.85 s); the catch-up itself slower, 3.95–6.09 s on x86 and 9.38–13.34 s on arm (main
 > 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). Open: the arm catch-up time, and this flow on
 > today's main, whose byte bounds (`Bounds::of_whole`) the measured trees predate.
+> The flow is on main since 2026-11-20 (`a_resumed_holders_catch_up_beside_a_busy_volume`, command in BENCHMARKS),
+> and its interleaved A/B against the pair reverted is in main's run-request queue.
 
 > **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
 > predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement
@@ -7139,7 +7141,15 @@
 >   place), and its examples (`load_bench`'s stamp tests and `map_read_ab`, one claim each). In `api/tests` (`api.rs`) since 2026-11-20 (g226): the attach is one
 >   claim, its host reactor waits until the signal and through a live daemon's deadlines, its listings and attachment
 >   counts are waited for and its stream ends read without a timeout, its daemon in-process (A-232); `start.rs`'
->   `NOBODY_WAIT` is the deadline its test proves, and stays. Owed: `cli/tests`, `cli/src/verbs.rs`' test module
+>   `NOBODY_WAIT` is the deadline its test proves, and stays. In `cli/tests` since 2026-11-20 (g226), judged in the waited-on processes' own CPU
+>   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone or stalled
+>   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`; `recovered::await_recovered_while_alive`):
+>   `held_rendezvous`, `merge_kill` (its killer's wait for the client's submit ends too at the client's end),
+>   `nfs_v4_restart` (Linux's, compiled here) and `nfs_held` (its NFS sockets read without a timeout, the anchor holding
+>   them across a restart, A-113). Owed in `cli/tests`: `cli`, `live_fleet`, `vm`,
+>   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
+>   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
+>   own platforms), `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
 >   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the

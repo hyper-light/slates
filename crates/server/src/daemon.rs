@@ -7710,51 +7710,65 @@ mod tests {
         slates_rt::futures::detach(task).unwrap();
       })
       .unwrap();
-    let (repository, answered) = got
-      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
-      .expect("the push answered");
+    let (repository, answered) = got.recv().expect("the push answered");
     answered.expect("the push homed its names and answered");
     // The crash: nothing more published.
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     let shard = second.shards.first().copied();
-    let read = || {
-      second
-        .observe(shard, move |state| {
-          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-          let recovered = state.vcs_stores.unrecovered(repository).is_none()
-            && !state.vcs_stores.rebuilding(repository)
-            && state.vcs_stores.holds(repository);
-          let main = state
-            .db
-            .partition()
-            .repositories()
-            .branch(repository, "main");
-          let versions: Vec<u32> = crate::vcs_store::tests::records(state, repository)
-            .iter()
-            .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
-            .collect();
-          (
-            recovered,
-            main.is_some(),
-            count(crate::vcs_store::REPLAY_REFUSED),
-            count(crate::vcs_store::NAMES_UNFETCHED),
-            versions,
-          )
-        })
-        .ok()
+    // The successor's recovery of the repository, waited for on its shard: its event (recovered, or a replay refused),
+    // not a time. The watch is asked again while the successor's shard is still starting (`ShardGone`), within a bound
+    // derived from the liveness budget.
+    let (sent, got) = std::sync::mpsc::channel();
+    let watch = move |_: &mut crate::state::ShardState| {
+      let sent = sent.clone();
+      let task = slates_rt::futures::spawn(async move {
+        loop {
+          let seen = crate::state::with_state(|state| {
+            let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+            let recovered = state.vcs_stores.unrecovered(repository).is_none()
+              && !state.vcs_stores.rebuilding(repository)
+              && state.vcs_stores.holds(repository);
+            let main = state
+              .db
+              .partition()
+              .repositories()
+              .branch(repository, "main");
+            let versions: Vec<u32> = crate::vcs_store::tests::records(state, repository)
+              .iter()
+              .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
+              .collect();
+            (
+              recovered,
+              main.is_some(),
+              count(crate::vcs_store::REPLAY_REFUSED),
+              count(crate::vcs_store::NAMES_UNFETCHED),
+              versions,
+            )
+          });
+          if let Some(seen) = seen
+            && (seen.0 || seen.2 > 0 || seen.3 > 0)
+          {
+            let _ = sent.send(seen);
+            break;
+          }
+          slates_rt::futures::yield_now().await;
+        }
+      });
+      if let Ok(task) = task {
+        let _ = slates_rt::futures::detach(task);
+      }
     };
-    let deadline =
-      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
-    let mut seen = read();
-    while std::time::Instant::now() < deadline
-      && !seen
-        .as_ref()
-        .is_some_and(|seen| seen.0 || seen.2 > 0 || seen.3 > 0)
-    {
+    let started = std::time::Instant::now();
+    let bound = std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    while second.observe(shard, watch.clone()).is_err() {
+      assert!(
+        started.elapsed() < bound,
+        "the successor's shard never took the watch"
+      );
       std::thread::park_timeout(std::time::Duration::from_millis(50));
-      seen = read();
     }
+    let seen = got.recv().ok();
     second.stop();
     drop(segment);
     assert_eq!(seen, Some((true, true, 0, 0, vec![3])));
