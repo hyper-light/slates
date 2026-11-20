@@ -12360,6 +12360,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > working copies match svnadmin's over both edges after a checkout, an update back 500 revisions and the update forward.
 > The largest slice is 99,424 B on svn:// and 136,865 B on DAV. Rule 3 is still owed: one drive step, a text window's
 > delta, takes up to 4.7 ms on svn:// and 6.5 ms on DAV, so a window must be made in pieces (`report::drive`).
+> **The window encoder BUILT (2026-11-20, A-751, w-bugs; Ada's rule: performance gaps are addressed upfront).** One
+> shared encoder makes a window in units: `svndiff::WindowMaking`, which takes a unit a target position walked, a byte
+> compared or copied, a source block indexed, or an instruction encoded, at least one a step. It keeps its place between
+> steps and never borrows the texts. Each phase is `compute_delta`'s, cut at its loops, and the sections are the
+> encoder's. Version 2's LZ4 block is made in parts by `svndiff::lz4`, a port of `lz4_flex` 0.11.6's block compressor
+> that makes its bytes. The oracle is the whole window, which `deltas` makes and `Encoder::window` encodes: every
+> window, made under every unit size in versions 0 and 2, stored and LZ4, is the same bytes. Red, by main's test: a
+> 102,400-byte window made whole took 6.0 to 7.7 ms in one step (debug, M-series Mac). At 256 units a step, no step
+> passes 500 us. Owed next: the update report's drive making its windows through it, and the svn:// and DAV writers
+> writing a window in parts (w-bugs); the dump exporter's format 3 adopting it (w-svn).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
