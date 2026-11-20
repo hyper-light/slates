@@ -1,5 +1,12 @@
 # w-fed-a583 progress (kiln goal A-583, three-daemon fleet test over a captured clone; supervisor slates-7a)
 
+## RESUME HERE (2026-11-19 relaunch on the Mac Studio, session w-fed-a583 under Ada's key)
+- Predecessor's worktree was on the MacBook and does not exist here. Fresh clone: ~/slates-work/w-fed-a583-docs
+  (Studio, blob-filtered clone of origin/main).
+- Studio disk: 23 GB free (floor 20 GB), so no slates-server build here; the docs landing below cites the
+  predecessor's green run (macOS arm64, MacBook, local, at 3fee2f575, test names in output).
+- Doing: the docs-only landing (steps 1-5 of the section below).
+
 ## RESUME HERE (checkpointed 2026-11-19 ~21:25 local on main's order to move agents into kiln)
 - Branch agents/w-fed-a583 (pushed; == origin/main 3fee2f575, NO commits of mine, nothing uncommitted).
   Worktree ~/slates-work/w-fed-a583. No run in flight.

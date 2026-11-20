@@ -41,3 +41,12 @@
   A-689, `vcs_svn_listener: None` without #[cfg(unix)]). fsx never ran (exit 1). Fix = commit 88a96c97c on local main
   in ~/slates-work/w-bugs-main (not pushed yet); diag-w-bugs-b3-3 (2f47f0e0b = main + fix + workflow) proving Windows
   compiles; land the fix on its green.
+- Main fixed the Windows build itself (36478561d); my identical fix 88a96c97c stays local and unpushed (dropped).
+- B11 run 2 (b11-2, run 44683374880): 50/50 pass beside 8 spinners on 4 CPUs. B11 NOT reproduced by use (80/80 total).
+  Per Ada's rule not chased further; reported to main.
+- B3 run 3 (b3-3, main + the cfg fix): Windows builds; clippy fails on slates-db repository.rs:940 apply_advanced
+  (complexity 13/10) and slates-vfs recover.rs:2853 rebuild_snapshot_tree (11/10) -> main's lint keeper, not mine.
+  fsx did NOT run: xtask "the daemon did not come up within 60s (last exit 4)" though the anchor log shows the daemon
+  serving on 2 shards. `slates volume list` exits 4 (EXIT_FAILED) on Windows every try. Run 4 (diag-w-bugs-b3-4, from
+  main ea05b2ad6 past 36478561d, worktree ~/slates-work/w-bugs-b3 branch agents/w-bugs-b3 = diag only) captures
+  volume list's stderr against an anchor started as xtask does.
