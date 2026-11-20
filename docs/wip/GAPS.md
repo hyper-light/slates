@@ -1482,8 +1482,10 @@
 > site (`dav::report_file_revs`, `dav::report_locations`; the svn:// walks with `mod_dav_svn`'s writers); `svn diff`
 > needed nothing new (the update-report's diff form). Stock svn 1.15's `blame`, `blame -r 2`, `diff -r 1:3`, `diff -c
 > 2`, `diff --summarize`, a two-peg URL diff and `cat -r 1` over HTTP match `svnserve -t`'s byte for byte but for the
-> author (`tests/svn_http_reports.rs`). Owed: part 2, the `mergeinfo-report` and OPTIONS' `SVN-Repository-MergeInfo:
-> yes` (`svn blame -g` is refused by the client until then, and `svn merge`); deltas in svndiff 0 whatever
+> author (`tests/svn_http_reports.rs`). **Part 2:** the `mergeinfo-report` (`dav::report_mergeinfo`, the svn://
+> catalog) and OPTIONS' `SVN-Repository-MergeInfo: yes` with the `mergeinfo` capability: stock svn 1.15's `svn merge
+> ^/branch`, `svn blame -g`, `svn mergeinfo` and `propget svn:mergeinfo` over HTTP match `svnserve -t`'s. Owed: a
+> catalog with descendants written whole within the reply's room (streamed is owed); deltas in svndiff 0 whatever
 > `Accept-Encoding` prefers; the copied interop harness folded into one module with `tests/svn_interop.rs`.
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the

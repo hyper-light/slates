@@ -518,6 +518,53 @@ fn history_answers(svn: &Svn, url: &str) -> Vec<String> {
   .collect()
 }
 
+/// Writes `text` as working copy `copy`'s file `name`, inside the scratch directory the test removes (R1's wall is
+/// shipped code's).
+#[allow(clippy::disallowed_methods)]
+fn put_named(copy: &str, name: &str, text: &str) {
+  std::fs::write(format!("{copy}/{name}"), text).unwrap();
+}
+
+/// The merge session, run as `svn` against `url`, a fresh repository: [`FILE`] added as revision 1; copied by URL to
+/// `branch` as revision 2; `branch` edited as revision 3; then `svn merge ^/branch` into [`FILE`] committed as revision
+/// 4. What stock `svn` answers, each with `url` written `URL`, each blame's lines as revision and text alone: the
+/// merge's own report, `svn blame -g` of the file (merged revisions asked for: the `mergeinfo-report`, then the
+/// `file-revs-report` with them), `svn mergeinfo` of the branch into the file, and `svn propget svn:mergeinfo` of the
+/// file.
+fn merge_answers(svn: &Svn, url: &str) -> Vec<String> {
+  let copy = svn.copy("merge");
+  svn.ok(&svn.scratch, &["checkout", url, &copy]);
+  put(&copy, "one\ntwo\n");
+  svn.ok(&copy, &["add", FILE]);
+  svn.ok(&copy, &["commit", "--message", "one"]);
+  let (file, branch) = (format!("{url}/{FILE}"), format!("{url}/branch"));
+  svn.ok(
+    &svn.scratch,
+    &["copy", &file, &branch, "--message", "branch"],
+  );
+  svn.ok(&copy, &["update"]);
+  put_named(&copy, "branch", "one\nTWO\n");
+  svn.ok(&copy, &["commit", "--message", "on the branch"]);
+  let merged = svn.ok(&copy, &["merge", "^/branch", FILE]);
+  svn.ok(&copy, &["commit", "--message", "merged"]);
+  let author = author_of_head(svn, url);
+  vec![
+    merged,
+    blamed_lines(
+      &svn
+        .ok(&svn.scratch, &["blame", "-g", &file])
+        .replace(url, "URL"),
+      &author,
+    ),
+    svn
+      .ok(&svn.scratch, &["mergeinfo", &branch, &file])
+      .replace(url, "URL"),
+    svn
+      .ok(&svn.scratch, &["propget", "svn:mergeinfo", &file])
+      .replace(url, "URL"),
+  ]
+}
+
 /// `svn blame`'s answer with each line's author checked and dropped (`%6ld %10s %s`: the author cut to its column's
 /// ten characters, or padded to them): each line as its revision and its text. Fails the test unless every line names
 /// the start of `author`.
@@ -525,13 +572,18 @@ fn blamed_lines(answer: &str, author: &str) -> String {
   answer
     .lines()
     .map(|line| {
+      // `svn blame -g` marks a merged line `G` before its revision.
+      let (merged, line) = match line.strip_prefix('G') {
+        Some(rest) => ("G ", rest),
+        None => ("", line),
+      };
       let (revision, rest) = line.trim_start().split_once(' ').unwrap();
       let (named, text) = rest.trim_start().split_once(' ').unwrap();
       assert!(
         author.starts_with(named),
         "the blamed line's author: {line:?}"
       );
-      format!("{revision} {text}\n")
+      format!("{merged}{revision} {text}\n")
     })
     .collect()
 }
@@ -574,5 +626,44 @@ fn stock_svn_blames_and_diffs_over_the_vcs_http_edge_as_against_svnserve() {
   assert_eq!(
     answered, expected,
     "blame and diff over HTTP as against svnserve"
+  );
+}
+
+/// UI goal 93's merged blame over `http://` (A-726 part 2: the `mergeinfo-report`). Do: run the merge session
+/// ([`merge_answers`]) as stock `svn` 1.15 against a stock FSFS repository through stock `svnserve -t`, and again
+/// against the HTTP leg. Expect: every answer the same, byte for byte, but for the author's name. Skips loudly without
+/// stock Subversion 1.15.
+#[test]
+fn stock_svn_blames_merged_revisions_over_the_vcs_http_edge_as_against_svnserve() {
+  if !stock_svn() || !stock_svnserve() {
+    eprintln!(
+      "skipping merged blame over HTTP: no stock Subversion 1.15 here (svn, svnadmin and svnserve on the PATH)"
+    );
+    return;
+  }
+  let scratch = Scratch::new("svn-merge-control");
+  let root = format!("{}/repositories", scratch.path);
+  made_directory(&root);
+  let made = Command::new("svnadmin")
+    .args(["create", &format!("{root}/merge")])
+    .output()
+    .unwrap();
+  assert!(made.status.success(), "svnadmin create merge: {made:?}");
+  let tunnel = vec![
+    "--config-option".to_owned(),
+    format!(
+      "config:tunnels:{CONTROL_TUNNEL}=sh -c 'exec svnserve -t -r {root} --tunnel-user={TUNNEL_USER}'"
+    ),
+  ];
+  let control = Svn::new(&scratch, "merge", tunnel);
+  let control_url = format!("svn+{CONTROL_TUNNEL}://localhost/merge");
+  let expected = merge_answers(&control, &control_url);
+  let Some(leg) = http_leg("merge") else {
+    return;
+  };
+  let answered = merge_answers(&leg.svn, &leg.url);
+  assert_eq!(
+    answered, expected,
+    "merged blame over HTTP as against svnserve"
   );
 }
