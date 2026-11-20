@@ -97,7 +97,9 @@ impl SvnStores for ServedRecords {
         green: records,
         locks: records.locks(),
       };
-      let begun = DavCommit::begin_hooked(setup_of(name.clone(), now), &world);
+      // The commit's sink: in memory until the green's staged blocks take its texts (w-perf's wiring of A-716).
+      let texts = Box::new(slates_svn::commit::drive::HeldTexts::new());
+      let begun = DavCommit::begin_hooked(setup_of(name.clone(), now), &world, texts);
       Some(begun.map(|(commit, due)| {
         let key = principal.key();
         let now_ns = state.clock.monotonic_ns();
@@ -145,10 +147,11 @@ impl SvnStores for ServedRecords {
     id: RepositoryId,
     principal: &Principal,
     work: Work,
+    texts: &dyn slates_svn::commit::drive::TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>> {
     crate::state::with_state(|state| {
       let now = AprTime::from_wall_ns(state.clock.wall_ns());
-      svn_commit::commit_work(state, (principal, id), work, now)
+      svn_commit::commit_work(state, (principal, id), work, now, texts)
     })
   }
   fn lock_verb(
@@ -307,6 +310,7 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
   fn lend<T>(
     &mut self,
     id: RepositoryId,
+    texts: &dyn slates_svn::commit::drive::TextSink,
     step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
   ) -> Option<T> {
     crate::state::with_state(|state| {
@@ -329,6 +333,7 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
             authz: None,
             filesystem: &name,
           },
+          texts,
         })
       })
     })
@@ -340,10 +345,11 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     id: RepositoryId,
     principal: &Principal,
     work: Work,
+    texts: &dyn slates_svn::commit::drive::TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>> {
     crate::state::with_state(|state| {
       let now = AprTime::from_wall_ns(state.clock.wall_ns());
-      svn_commit::commit_work(state, (principal, id), work, now)
+      svn_commit::commit_work(state, (principal, id), work, now, texts)
     })
   }
 

@@ -724,6 +724,10 @@ struct Opened {
   id: RepositoryId,
   /// Its name, which its green goes by in FSFS's messages.
   name: String,
+  /// Where its commits' new texts go (`slates_svn::commit::drive::TextSink`): kept in memory per connection until the
+  /// green's staged blocks take them (w-perf's wiring of A-716's `Green::stage`); given back at each commit's start and
+  /// after its landing.
+  texts: slates_svn::commit::drive::HeldTexts,
 }
 
 /// What one step of a conversation leads to ([`step`]).
@@ -1000,6 +1004,7 @@ fn held_sources<T>(
           authz: None,
           filesystem: &opened.name,
         },
+        texts: &opened.texts,
       })
     };
     match held {
@@ -1094,6 +1099,8 @@ fn begin_commit(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
   let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
     return false;
   };
+  // A drive that ended without landing (an abort, a refusal) leaves its texts: given back as the next commit starts.
+  opened.texts.clear();
   let begun = lent_sources(opened, principal, |sources| {
     let start = CommitStart {
       transaction: crate::vcs_ssh::svn::transaction_name(sources.index.youngest(), commits),
@@ -1702,8 +1709,9 @@ async fn land(
   let transaction = work.record.transaction.clone();
   let landed = crate::state::with_state(|state| {
     let now = AprTime::from_wall_ns(state.clock.wall_ns());
-    svn_commit::commit_work(state, (principal, id), work, now)
+    svn_commit::commit_work(state, (principal, id), work, now, &opened.texts)
   });
+  opened.texts.clear();
   let Some(landed) = landed else {
     return false;
   };
@@ -1934,6 +1942,7 @@ async fn opened(
         conversation.opened = Some(Opened {
           id,
           name: located.name.clone(),
+          texts: slates_svn::commit::drive::HeldTexts::new(),
         });
       }
       asked

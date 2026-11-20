@@ -12385,8 +12385,18 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > that makes its bytes. The oracle is the whole window, which `deltas` makes and `Encoder::window` encodes: every
 > window, made under every unit size in versions 0 and 2, stored and LZ4, is the same bytes. Red, by main's test: a
 > 102,400-byte window made whole took 6.0 to 7.7 ms in one step (debug, M-series Mac). At 256 units a step, no step
-> passes 500 us. Owed next: the update report's drive making its windows through it, and the svn:// and DAV writers
-> writing a window in parts (w-bugs); the dump exporter's format 3 adopting it (w-svn).
+> passes 500 us. **The update report's drive BUILT (same day, A-751 part 2).** The drive makes each window a step at a
+> time (`report::drive`'s `WindowWork`): its target and source pieces are read 1,024 bytes a step, the window is made
+> 1,024 units a step, and its writes, as `svndiff.c` makes them, are sent 1,024 bytes a piece (`Call::DeltaPiece`).
+> 1,024 units are about 1.5 us of an M-series Mac's release build, under half the ~3.7 us quantum. Each consumer frames
+> the pieces as before: svn:// sends a write's pieces as its one `textdelta-chunk` string, the head of which carries
+> the write's whole length (`ra_svn::write_string_head`); DAV base64s them. The drive encodes in its consumer's
+> version (`Drive::with_encoding`, svn://'s `editor::encoding_of`). By test: `/trunk/big.txt` (6,000 lines) driven a
+> step a call, edited and added, in version 0 and version 2 with LZ4: before, 4 steps of 2.8-3.0 ms each run (debug);
+> now none past 500 us, and its stream is the whole-window path's byte for byte. The recorded svnserve sessions are
+> unchanged. Owed: the replay drive (`report::drive::replay`, svn://'s `replay`/`replay-range` and the dump exporter's
+> source) and `get-file-revs` (`reads::file_revs`) still make a window whole; the dump exporter's format 3 adopts the
+> maker (w-svn).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids

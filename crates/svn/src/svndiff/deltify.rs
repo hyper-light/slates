@@ -595,7 +595,7 @@ fn take_match(ops: &mut Ops, source: &[u8], target: &[u8], found: Match, pending
   to.saturating_add(length)
 }
 
-pub mod making;
+pub(super) mod making;
 
 #[cfg(test)]
 mod tests;
