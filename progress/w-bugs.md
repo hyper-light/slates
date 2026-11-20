@@ -181,3 +181,9 @@
   update-report of a large repo over svn:// and DAV (past-budget counter, admitted sizes); if past budget or whole-answer
   admission, slice the editor drive on both edges, red first (checkout larger than a request's room), svnadmin-identical
   bytes as oracle, generation hold test. w-svn owns the svn crates: inbox note first.
+- svn fetch (goal 93) in flight: reading says both edges already slice (svn:// report exchange writes calls until the
+  turn's room or steps are spent, yields between turns; DAV REPORT a room-sized slice a reply run, store lent each run;
+  drive steps are bounded). Measuring by use: diag-w-bugs-svnfetch-1 (ubuntu, release, git/git 1,000 commits as svn,
+  checkout + update across 500 revs over svn:// and DAV), instrumented (diag-only) with per-conversation shard
+  long_steps/longest_step_ns, the most bytes a turn wrote vs the room. Worktree ~/slates-work/w-bugs-svn (branch has
+  the diag commit; a real change starts fresh from origin/main). Inbox note left for w-svn.
