@@ -14801,3 +14801,30 @@ with `git daemon`. The first clone after a push now pays the version's whole enc
 what no part covered. A second clone is still 2.7 times `git daemon`'s. Owed, measured next: where the first clone's
 encoding and the second clone's 0.91 s go; the encoding moved to the push's own intake (the deltas the client sent kept,
 git's pack reuse; w-git's streaming intake), so no fetch pays it; and the arena's 100 to 125 MiB more for a 3.5 MiB pack.
+
+## Concurrent large pushes into one daemon: every push keeps about 67 times its pack, so 1,000 cannot fit (UI goal 93; Ada's tens-of-thousands requirement; 2026-11-20)
+
+- **Machine and build:** Mac Studio (as above), 2026-11-20 ~09:30 UTC, load average 5.1 to 7.1. slates: release build
+  of main 7b46fbdcd (`slates anchor --vcs-http 127.0.0.1:0`, 23 shards derived).
+- **The client:** `crates/cli/bench/push_load.py SLATES cut-1.0.git 'v1.0.0^{commit}' --max 100`. It is a slim
+  smart-HTTP client, since stock git cannot run thousands of pushes on one box. It makes git's receive-pack request
+  once in memory: a create of `refs/heads/main` with `report-status`, then a pack from `git pack-objects --revs
+  --stdout` (3,434,551 bytes, 12,232 objects of git/git cut at v1.0.0). It sends N of them at once, each to its own
+  fresh repository, and reads every answer whole. The steps are powers of ten up to the client's open-file room, less a
+  tenth (derived from the machine; 221,184 here, capped at 100 for this run).
+
+| N | ok | wall | p50 | p99 | daemon RSS before → peak | per push |
+|---|---|---|---|---|---|---|
+| 1 | 1/1 | 0.792 s | 0.789 s | 0.789 s | 85 → 386 MiB | 300.8 MiB |
+| 10 | 10/10 | 0.955 s | 0.919 s | 0.952 s | 386 → 3,285 MiB | 289.9 MiB |
+| 100 | 100/100 | 4.795 s | 2.825 s | 4.790 s | 3,286 → 28,164 MiB | 248.8 MiB |
+
+None of it goes back once a push completes (each step starts at the last one's peak), so 1,000 pushes would need about
+250 GB, past the box's 96 GiB; the 1,000 and 10,000 steps were not run on the shared machine.
+
+Where one push's 229 MiB goes (`MallocStackLogging=1`, `malloc_history -allBySize`, `footprint` before and after):
+69.1 MiB in `slates_vcs::ContentStore::put_object` (every object kept inflated and whole: about 20 times the pack);
+63.5 MiB in `slates_db::Partition::apply_repository` (the register entry's copy of the push's objects); 63.7 MiB of
+the content store's arena regions grown for them. Owed, and what the next run measures: the intake keeping the
+client's deltas compressed and naming blobs in the green's identity table (w-git's streaming intake; A-716 slice 1a's
+`Green::hold_bytes`), and the register entries naming objects by identity rather than holding them.
