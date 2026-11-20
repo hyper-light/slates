@@ -292,6 +292,14 @@
 > import's landing appends its whole record as one entry in one step (w-perf, 2026-11-20: 4.66 GB spun shard 9 past
 > its window; the record is now cut by file deltas, but its append is still unbounded: parts across entries, or
 > identity-only records once A-727 a3 lands, main's ruling asked); w-perf's and w-interop's by-use reruns.
+> Part 4 FIXED (found by use, w-hg's r2, big Studio, release: a restart's replay of hg's own history ran 130 s of CPU
+> in 259,321 slices, its longest 265 to 277 ms): a push's intake keeps a revision a step, so each manifest's append
+> rebuilt its predecessor's whole text from its delta chain (up to its length of deltas, each applied over a copy of the
+> text), the replay's and the live push's alike. The intake now hands each append the text it kept last
+> (`HgIndex::append_revisions_after`, borrowed, no copy); a predecessor is rebuilt only where the caller holds none.
+> Red first: `push::intake::tests::the_intake_hands_each_manifest_its_predecessors_text_never_rebuilding_it` (6
+> rebuilds of stock 7.2's bundle before, 0 after). Owed: the restart's replay of hg's history measured again, its
+> longest step against the quantum and the per-step lend and settle (0.5 ms a slice).
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
