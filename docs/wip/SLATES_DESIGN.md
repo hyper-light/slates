@@ -22705,7 +22705,8 @@ asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its
 taken by position at the owner (`work_home::verdict_over_fleet`, `SubmitComputed`, `Green::submit_computed`). Part d
 (2026-11-20): the submit settles once the holder's replica holds the version (`work_home::hold_until_replica`,
 `replica_reached`). Part e (2026-11-20): a holder's work is recovered from its log over the holder's replica
-(`work_home::holder_replay`, `Unbuilt::holder`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+(`work_home::holder_replay`, `Unbuilt::holder`). A holder's work rebases over the replica, and a copy it declares is
+composed over the replica (`verbs::replica_rebase`, `verbs::compose_on_replica`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22731,8 +22732,9 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
     by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
     replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b), the submit answered once the
-    node's replica holds the version it made; after a restart it comes back from its log over the node's replica.
-    Its rebase, a copy it submits, and takeover follow in A-697's later parts. Until A-400 a work was placed on
+    node's replica holds the version it made; after a restart it comes back from its log over the node's replica; it
+    rebases over the replica, and a copy it declares is composed over the replica. Takeover follows in A-697's last
+    part. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -56334,3 +56336,25 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   2). Its first run, before the same-step install, answered `Unpublished` for the poll's whole deadline (the red). Fleet
   `a_holder` 20 of 20 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62,
   `merge_origin::` 17 of 17, `merge_service::` 14 of 14, `takeover::` 18 of 18; fmt clean.
+
+### A-697, rebase and copies — A holder's work rebases over the holder's replica, and a copy it declares is composed there (2026-11-20, w-shared for UI goal 93; main's order: before the routing flip, which would otherwise refuse both)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/verbs.rs` (`replica_rebase`, `compose_on_replica`, `rebase_answer` shared with `map_rebase`),
+`crates/server/src/work_home.rs`, `crates/server/tests/fleet.rs`.
+- **Rebase.** A rebase is a pure function of the versions it maps through (A-658: `Green::rebase` reads the green and
+  changes nothing), so a holder's replica answers the owner's rebase. A holder's work's rebase goes to the node's control
+  shard (`work_home::answer_on_owner`) and is mapped over the replica onto its head (`verbs::replica_rebase`), a version
+  the owner committed; the work settles as any rebase does, and its floor rises at the owner (part b). A replica without
+  the work's base answers retryable. The answer's mapping is one function for the owner and the holder
+  (`verbs::rebase_answer`).
+- **Copies.** A work holding a copy leaves its increment to be composed where the green's bytes are, since the copy's
+  source is the green's (`work_home::holds_copy`, A-626). For a holder's work that is the replica: the submit composes it
+  on the control shard before computing its verdict (`work_home::computed_request`), and the rebase before mapping it,
+  by the owner's composition over the replica (`verbs::compose_on_replica`, as `build_increment`), counted
+  `merge.work.composed_on_replica`. The gate's two `Unsupported` refusals (part c) are gone.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows` (two nodes at `f = 1`: B's work writes `g`, A
+  commits version 2, B's work rebases: `Rebased` at 2, mapped on B's replica once, reads `f` as version 2 holds it and
+  keeps `g`; A's floor rose to 2) and `a_holders_work_submits_a_copy_composed_over_the_holders_replica` (B's work copies
+  `f` to `f2` and submits: version 2, composed on B's replica, A's green reads `f2` "hello"). Fleet `a_holder` 22 of 22;
+  `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62, `merge_service::` 14 of 14; fmt clean.

@@ -1623,6 +1623,64 @@ impl Green {
     Ok(())
   }
 
+  /// Starts a text staged a piece at a time (A-716; [`crate::held`]): a new block named by no path, empty, which
+  /// [`Green::append_staged`] fills and [`Green::seal_staged`] names or [`Green::discard_staged`] gives back.
+  pub fn stage(&mut self) -> crate::held::Staged {
+    crate::held::Staged {
+      block: self.content.add_unnamed_block(Vec::new()),
+      length: 0,
+    }
+  }
+
+  /// Appends `bytes` to the staged text: a commit's svndiff window, applied, as it arrives.
+  pub fn append_staged(&mut self, staged: &mut crate::held::Staged, bytes: &[u8]) {
+    self.content.append_to_block(staged.block, bytes);
+    let added = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    staged.length = staged.length.saturating_add(added);
+  }
+
+  /// Names the staged text `identity` (the caller names its bytes, as [`Green::hold_bytes`]'s caller does): held, one
+  /// holder; or, where `identity` is held already, one more holder of that block and the staged block given back.
+  /// Refused typed, the staged block given back and nothing held: the table at its room, or the identity's holders at
+  /// the most a count holds.
+  ///
+  /// # Errors
+  /// [`crate::held::HeldRefused`].
+  pub fn seal_staged(
+    &mut self,
+    staged: crate::held::Staged,
+    identity: crate::held::Identity,
+  ) -> Result<(), crate::held::HeldRefused> {
+    let crate::held::Staged { block, .. } = staged;
+    let held = match self.held.hold_again(&identity) {
+      Ok(true) => Ok(true),
+      Ok(false) => self.held.room_for_one().map(|()| false),
+      Err(refused) => Err(refused),
+    };
+    match held {
+      Ok(false) => {
+        self
+          .held
+          .entries
+          .insert(identity, crate::held::Entry { block, holders: 1 });
+        Ok(())
+      }
+      Ok(true) => {
+        self.content.release_block(block);
+        Ok(())
+      }
+      Err(refused) => {
+        self.content.release_block(block);
+        Err(refused)
+      }
+    }
+  }
+
+  /// Gives a staged text's block back: its commit aborted or was refused.
+  pub fn discard_staged(&mut self, staged: crate::held::Staged) {
+    self.content.release_block(staged.block);
+  }
+
   /// Holds `bytes` under `identity` with no path naming them (A-716; [`crate::held`]): an intake's object before any
   /// tree names it. Kept once: an identity already held gains a holder and its block stays. Refused typed, nothing held:
   /// the table at its room, or the identity's holders at the most a count holds.
