@@ -946,3 +946,64 @@ fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
     assert_eq!(committed, answered(3));
   });
 }
+
+/// What a fetch's hold on `svn`'s records reads: their youngest revision and `/trunk/a.txt`'s text; none when they are
+/// gone.
+fn read_held(
+  state: &mut ShardState,
+  hold: &crate::vcs_store::svn_view::SvnHold,
+) -> Option<(u64, Option<Vec<u8>>)> {
+  use slates_svn::reads::Repository as _;
+  crate::vcs_store::svn_view::lend_held_in(state, hold, |lent| {
+    let text = lent
+      .repository
+      .text(&identity(b"alpha\n"), 0)
+      .map(std::borrow::Cow::into_owned);
+    (lent.index.youngest(), text)
+  })
+}
+
+/// A-749 rule 4 (§4.17.1 "A fetch's answer": fetches run over the index generation they began on), for Subversion's
+/// records. Do: commit revision 1; hold the records as a fetch's answer does when it begins; make the store again from
+/// the log (a rebuild: the store freed, made empty and lent to nothing until its records are replayed, a turn each);
+/// read through the hold while it is lent to nothing and again once it is whole; give the hold back. Expect: the hold
+/// reads revision 1 and `/trunk/a.txt`'s text throughout; the records kept for it charged until it is given back, and
+/// then the shard charged for the store made again alone, as before the rebuild; a hold taken after reads the store made
+/// again. Red before the change: the hold read nothing once the store was freed.
+#[test]
+fn t_a745_a_fetchs_hold_reads_the_records_it_began_on_across_a_rebuild() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, _) = subversion(state, "held");
+    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+    let (_, _, charged) = kept(state, svn);
+    let retained = state.store.budget.retained();
+    let hold = crate::vcs_store::svn_view::hold_in(state, svn).expect("the records held");
+    crate::vcs_store::rebuild(state, svn);
+    let lent_to_nothing = state.vcs_stores.subversion_records(svn).is_none();
+    let during = read_held(state, &hold);
+    while crate::vcs_store::rebuild_turn_once(state, svn) {}
+    let made_again = kept(state, svn);
+    let both = state.store.budget.retained();
+    let after = read_held(state, &hold);
+    hold.give_back(state);
+    let given_back = state.store.budget.retained();
+    let again = crate::vcs_store::svn_view::hold_in(state, svn).expect("the store made again held");
+    let fresh = read_held(state, &again);
+    again.give_back(state);
+    let alpha = Some((1, Some(b"alpha\n".to_vec())));
+    assert_eq!(
+      (lent_to_nothing, during, after, fresh),
+      (true, alpha.clone(), alpha.clone(), alpha)
+    );
+    assert_eq!(made_again.0, 1);
+    assert_eq!(
+      (both, given_back),
+      (
+        retained.saturating_add(made_again.2),
+        retained
+          .saturating_sub(charged)
+          .saturating_add(made_again.2)
+      )
+    );
+  });
+}

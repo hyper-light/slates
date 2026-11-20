@@ -48,6 +48,25 @@ pub(crate) struct ServedRecords;
 impl SvnStores for ServedRecords {
   type Repository = SvnRecords;
 
+  type Hold = SvnHold;
+
+  fn fetch_quantum(&self) -> Option<u64> {
+    crate::state::with_state(|state| crate::vcs_store::hg_import::quantum_of(state))
+  }
+
+  fn hold(&mut self, id: RepositoryId) -> Option<SvnHold> {
+    crate::state::with_state(|state| hold_in(state, id)).flatten()
+  }
+
+  fn lend_held<T>(
+    &mut self,
+    hold: &SvnHold,
+    _principal: &Principal,
+    step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
+  ) -> Option<T> {
+    crate::state::with_state(|state| lend_held_in(state, hold, step)).flatten()
+  }
+
   fn holds(&self, id: RepositoryId) -> bool {
     crate::state::with_state(|state| state.vcs_stores.subversion_records(id).is_some())
       .unwrap_or(false)
@@ -180,6 +199,65 @@ pub(crate) fn lend_in<T>(
 ) -> Option<T> {
   let now = AprTime::from_wall_ns(state.clock.wall_ns());
   let records = state.vcs_stores.subversion_records(id)?;
+  lent_of(records, now, step)
+}
+
+/// A fetch's hold on the generation of a Subversion repository's records it began on (A-749, §4.17.1 "A fetch's answer"
+/// rule 4, `super::hold_svn`): every slice of its answer reads those records, whatever rebuilds or removes the store
+/// meanwhile. Given back by its drop, on the shard that holds the store.
+#[derive(Debug)]
+pub(crate) struct SvnHold {
+  /// The repository.
+  id: RepositoryId,
+  /// The generation held, until it is given back.
+  generation: Option<u64>,
+}
+
+impl SvnHold {
+  /// Gives the hold back on `state`, for a caller that holds the shard's state (the tests), which its drop cannot reach.
+  #[cfg(test)]
+  pub(crate) fn give_back(mut self, state: &mut ShardState) {
+    if let Some(generation) = self.generation.take() {
+      super::release_svn_hold(state, generation);
+    }
+  }
+}
+
+impl Drop for SvnHold {
+  fn drop(&mut self) {
+    if let Some(generation) = self.generation.take() {
+      crate::state::with_state(|state| super::release_svn_hold(state, generation))
+        .unwrap_or_default();
+    }
+  }
+}
+
+/// Holds repository `id`'s records as `state` holds them now ([`SvnHold`]); none when they are not lent here.
+pub(crate) fn hold_in(state: &mut ShardState, id: RepositoryId) -> Option<SvnHold> {
+  let generation = super::hold_svn(&mut state.vcs_stores, id)?;
+  Some(SvnHold {
+    id,
+    generation: Some(generation),
+  })
+}
+
+/// Runs `step` over the records `hold` holds, as [`lend_in`] lends a repository's own; none when they are gone.
+pub(crate) fn lend_held_in<T>(
+  state: &mut ShardState,
+  hold: &SvnHold,
+  step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
+) -> Option<T> {
+  let now = AprTime::from_wall_ns(state.clock.wall_ns());
+  let records = super::held_svn_records(&state.vcs_stores, hold.id, hold.generation?)?;
+  lent_of(records, now, step)
+}
+
+/// Runs `step` over `records` lent at `now`.
+fn lent_of<T>(
+  records: &SvnRecords,
+  now: AprTime,
+  step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
+) -> Option<T> {
   let uuid = records.uuid();
   // A record's UUID is RFC 4122's text, ASCII alone (`Uuid::parse`), so it always reads as UTF-8.
   let uuid = std::str::from_utf8(uuid.as_bytes()).ok()?;

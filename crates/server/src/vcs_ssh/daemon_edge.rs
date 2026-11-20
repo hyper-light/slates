@@ -84,6 +84,7 @@ pub(crate) fn daemon_site(room: u64) -> DaemonSite {
     budget: Budget {
       room: bytes,
       steps: most_open,
+      quantum: None,
     },
     commit_room: bytes,
   };
