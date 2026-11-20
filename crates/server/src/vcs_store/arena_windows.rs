@@ -36,6 +36,15 @@
 //! freed once the records are replayed (`ContentStore::release_unheld`). A window kept after the last publication is
 //! not in the image: the replay puts it again from its record, which still holds its bytes.
 //!
+//! **Lists and names too** (A-727 slice a3b; the identity rule). An object past one window is its windows under lists
+//! in the content store's own memory, named by the BLAKE3 of its bytes through a node-local name to its root. Both ride
+//! the shard image beside the windows (`content_holder`, kinds 12 and 13: a list by its identity with its bytes, a name
+//! by the object's identity with its root), whole at a checkpoint and by their changes in a delta
+//! (`ContentStore::changes`). A recovery hands them to the content store made over the restored windows
+//! (`ContentStore::restore_nodes`): each list held by no one and holding again the nodes it names, each name whose root
+//! is held; the replay holds them again by identity, and what no record names is freed with what it names. So a record
+//! naming an object past a window by its identity alone finds it after a restart.
+//!
 //! **Owed.** The records naming identities only (slice b; w-balance's name rows, `slates_vcs::rows`), which needs the
 //! window durable in a committed image before the entry naming it (w-balance's `homes` tickets). A window homed for
 //! another shard (`homes::keep_here`) is restored held by no one and freed after the replay until its holders are

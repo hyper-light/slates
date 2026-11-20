@@ -14040,6 +14040,8 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
 
 /// Format: the builds a large delta was sealed and hashed in (A-757 part 2b).
 const LIVE_DELTA_BUILDS: &str = "fleet.live.delta_builds";
+/// Format: the turns a holder hashed a large entry's identity in before it took the entry (A-757 part 4).
+const LIVE_HELD_HASH_TURNS: &str = "fleet.live.held_hash_turns";
 /// Shape: the staged file the large-delta test writes in one verb: three MiB, as the whole-entry test's content, so its
 /// delta spans [`BUILT_PIECES`] pages at least.
 const STAGED_DELTA_BYTES: usize = BUILT_VOLUME_FILES * BURST_VOLUME_FILE_BYTES;
@@ -14125,7 +14127,16 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
   let counts = |daemon: &Daemon| {
     [LIVE_DELTA_BUILDS, LIVE_WHOLE_HASH_TURNS].map(|kind| refusal_count(daemon, kind).unwrap())
   };
-  daemons[0].inject_seal_walk_quantum(Some(0)).unwrap();
+  for daemon in &daemons {
+    daemon.inject_seal_walk_quantum(Some(0)).unwrap();
+  }
+  let held_turns = |daemons: &[Daemon]| -> u64 {
+    daemons[1..]
+      .iter()
+      .map(|daemon| refusal_count(daemon, LIVE_HELD_HASH_TURNS).unwrap())
+      .sum()
+  };
+  let held_before = held_turns(&daemons);
   let before = counts(&daemons[0]);
   let written = client.call(&RequestBody::FsWriteStaged {
     volume: id,
@@ -14135,7 +14146,6 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
     mode: 0o644,
   });
   let after = counts(&daemons[0]);
-  daemons[0].inject_seal_walk_quantum(None).unwrap();
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let settled = poll_until(&observed, PLACEMENT_DEADLINE, || {
     let line = owned_live_line(&mut client, id);
@@ -14145,6 +14155,10 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
         && holds_every_head(&mut client, &daemons[2], &[id]),
     )
   });
+  let held_hash_turns = held_turns(&daemons).saturating_sub(held_before);
+  for daemon in &daemons {
+    daemon.inject_seal_walk_quantum(None).unwrap();
+  }
   let line = owned_live_line(&mut client, id);
   drop(observed);
   drop(client);
@@ -14153,8 +14167,8 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
   }
   let [builds, hash_turns] = [0, 1].map(|kind| after[kind].saturating_sub(before[kind]));
   eprintln!(
-    "a large delta: written {written:?}; delta builds {builds}, hash turns {hash_turns}; a's log {line:?}, settled \
-     {settled}"
+    "a large delta: written {written:?}; delta builds {builds}, hash turns {hash_turns}, holders' hash turns \
+     {held_hash_turns}; a's log {line:?}, settled {settled}"
   );
   assert!(
     matches!(written, ReplyBody::FsDone { .. }),
@@ -14165,6 +14179,11 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
     hash_turns >= BUILT_PIECES,
     "the large delta's identity was hashed a page a turn under the cut quantum: {hash_turns} turns for at least \
      {BUILT_PIECES} pages"
+  );
+  assert!(
+    held_hash_turns >= BUILT_PIECES,
+    "the holders hashed the large entry a page a turn under the cut quantum before taking it (A-757 part 4): \
+     {held_hash_turns} turns for at least {BUILT_PIECES} pages; before, in the one turn that took it"
   );
   assert!(
     settled,

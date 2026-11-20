@@ -199,6 +199,31 @@ const KIND_REPLICA_CHECKPOINT: u8 = 10;
 /// its handle (`vcs_store::arena_windows`).
 const KIND_VCS_WINDOW: u8 = 11;
 
+/// Format: the piece kind of a list of the shard's repository content store (A-727 slice a3b), keyed by its identity's
+/// first 24 bytes; its bytes the identity, then the list's.
+const KIND_VCS_LIST: u8 = 12;
+
+/// Format: the piece kind of an object's name in the shard's repository content store (A-727 slice a3b; the identity
+/// rule), keyed by the identity's first 24 bytes; its bytes the identity (BLAKE3 of the object), then the root.
+const KIND_VCS_NAME: u8 = 13;
+
+/// The key of a repository content store's piece of `kind` for `identity`: its first 24 bytes, as a held chunk's is.
+fn vcs_node_key(kind: u8, identity: &slates_vcs::ContentId) -> PieceKey {
+  let object: [u8; 16] = identity.0[..16].try_into().unwrap_or_default();
+  let position = identity.0[16..24].try_into().map_or(0, u64::from_be_bytes);
+  piece_key(kind, object, position)
+}
+
+/// A list's piece bytes: its identity, then its bytes.
+fn vcs_list_bytes(identity: &slates_vcs::ContentId, bytes: &[u8]) -> Vec<u8> {
+  [identity.0.as_slice(), bytes].concat()
+}
+
+/// A name's piece bytes: the object's identity, then its root.
+fn vcs_name_bytes(identity: &slates_vcs::ContentId, root: &slates_vcs::ContentId) -> Vec<u8> {
+  [identity.0.as_slice(), root.0.as_slice()].concat()
+}
+
 /// A held piece's key: what [`slates_vfs::recover::HELD_PIECE_KEY_BYTES`] says.
 type PieceKey = [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES];
 
@@ -316,6 +341,21 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
         bytes,
       }
     }));
+  }
+  // The repository content store's lists and names, so an object past a window is whole after a restart (a3b).
+  if let Some(content) = state.vcs_stores.content() {
+    for (identity, bytes) in content.lists() {
+      pieces.push(slates_vfs::recover::HeldPiece {
+        key: vcs_node_key(KIND_VCS_LIST, &identity),
+        bytes: vcs_list_bytes(&identity, bytes),
+      });
+    }
+    for (identity, root) in content.names() {
+      pieces.push(slates_vfs::recover::HeldPiece {
+        key: vcs_node_key(KIND_VCS_NAME, &identity),
+        bytes: vcs_name_bytes(&identity, &root),
+      });
+    }
   }
   pieces
 }
@@ -623,6 +663,30 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
       }
     }
   }
+  // The repository content store's lists and names kept or let go since then (a3b).
+  if let Some(content) = state.vcs_stores.content() {
+    let (lists, names) = content.changes();
+    for (identity, bytes) in lists {
+      let key = vcs_node_key(KIND_VCS_LIST, &identity);
+      match bytes {
+        Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
+          key,
+          bytes: vcs_list_bytes(&identity, bytes),
+        }),
+        None => removed.push(key),
+      }
+    }
+    for (identity, root) in names {
+      let key = vcs_node_key(KIND_VCS_NAME, &identity);
+      match root {
+        Some(root) => put.push(slates_vfs::recover::HeldPiece {
+          key,
+          bytes: vcs_name_bytes(&identity, &root),
+        }),
+        None => removed.push(key),
+      }
+    }
+  }
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -705,6 +769,9 @@ pub(crate) fn held_committed(
   state.merge.checkpoints_changed.clear();
   if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
     windows.clear_changes();
+  }
+  if let Some(content) = state.vcs_stores.content_mut() {
+    content.clear_changes();
   }
   // The windows this publication carried are durable: every homes ticket kept before it answers so (A-724 with A-727 a3).
   crate::vcs_store::homes::publication_committed();
@@ -810,6 +877,10 @@ pub(crate) struct RecoveredHeld {
   checkpoints: Vec<(ObjectId, crate::merge_service::HeldCheckpoint)>,
   /// The repository windows kept as chunks of the shard's chunk store, each piece by handle (A-727 slice a3).
   pub(crate) windows: Vec<(u64, Vec<u8>)>,
+  /// The repository content store's lists, each by identity with its bytes (a3b).
+  pub(crate) lists: Vec<(slates_vcs::ContentId, Vec<u8>)>,
+  /// The repository content store's names: an object's identity, then its root (a3b).
+  pub(crate) names: Vec<(slates_vcs::ContentId, slates_vcs::ContentId)>,
 }
 
 /// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
@@ -884,6 +955,8 @@ pub(crate) fn split_held(
     owned: Vec::new(),
     checkpoints: Vec::new(),
     windows: Vec::new(),
+    lists: Vec::new(),
+    names: Vec::new(),
   };
   let mut heads: BTreeMap<[u8; 16], crate::live_ship::HeldLive> = BTreeMap::new();
   let mut entries: BTreeMap<[u8; 16], Vec<(u64, Vec<u8>)>> = BTreeMap::new();
@@ -931,6 +1004,25 @@ pub(crate) fn split_held(
           .ok_or(HeldRefused::Checkpoint(object))?,
       )),
       KIND_VCS_WINDOW => held.windows.push((slot, piece.bytes.clone())),
+      KIND_VCS_LIST => {
+        let (identity, bytes) = piece
+          .bytes
+          .split_at_checked(32)
+          .ok_or(HeldRefused::UnknownKind(kind))?;
+        let identity =
+          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+        held.lists.push((identity, bytes.to_vec()));
+      }
+      KIND_VCS_NAME => {
+        let (identity, root) = piece
+          .bytes
+          .split_at_checked(32)
+          .ok_or(HeldRefused::UnknownKind(kind))?;
+        let identity =
+          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+        let root = slates_vcs::ContentId::from_slice(root).ok_or(HeldRefused::UnknownKind(kind))?;
+        held.names.push((identity, root));
+      }
       other => return Err(HeldRefused::UnknownKind(other)),
     }
   }
