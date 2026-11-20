@@ -14568,8 +14568,9 @@ signature verification).
 > over the Mercurial arm), each step over the store lent the shard's room and settled after. The push's name is hashed
 > from its repository and its bundle, so a push sent again makes the same works. Its answer is framed as 7.2 frames
 > `unbundle`'s (`serve::http::pushed`): a bundle2 reply in `application/mercurial-0.1`, uncompressed; `pusherr` in
-> `0.1`; a bundle1 out of band. HTTP's capabilities list `unbundle` and the bundle2 capabilities a push needs as 7.2
-> lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
+> `0.1`; a bundle1 out of band. A `pushkey` command is landed as a push of one advisory `pushkey` part through the same
+> driver and answered `1` or `0` (A-758, `serve::keys`). HTTP's capabilities list `pushkey`, `unbundle` and the bundle2
+> capabilities a push needs as 7.2 lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
 > `pushkey`). Differs from 7.2 on purpose: the `output` parts in which 7.2 captures its own progress words over HTTP
 > (`adding changesets`, `added 1 changesets with 1 changes to 1 files`) are not sent; they are no part a client acts on.
 > Not yet durable: a push's entry records its lines', bookmarks' and phase roots' moves and no record of its revisions,
