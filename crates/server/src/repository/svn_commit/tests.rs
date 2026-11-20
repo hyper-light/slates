@@ -627,7 +627,8 @@ const QUARTER_TEXT: usize = SMALL_MERGE_BUDGET / 4;
 /// [`SMALL_MERGE_BUDGET`], land revision 1, then eight revisions each bringing a text a quarter of that budget. Expect:
 /// every revision lands, the register's objects hold more than the merge budget, and the shard's budget charges them:
 /// a repository's content is bounded by what its owner shard can hold (A-662, `vcs_store::settle_objects`), never by
-/// the merge budget the partition's chains share. Before the fix each revision's record was charged to the merge
+/// the merge budget the partition's chains share; and a revision whose entry the chains had no room for checkpointed
+/// its green first and was appended once (A-742's counter moved). Before the fix each revision's record was charged to the merge
 /// budget, so the repository's whole content had to fit in it.
 #[test]
 fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget() {
@@ -647,16 +648,22 @@ fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget
       }
       let held = state.db.partition().repositories().objects_bytes(svn);
       let charged = state.vcs_stores.objects_charged(svn);
+      let checkpointed_first = state
+        .refusals
+        .get(super::CHAIN_ROOM_CHECKPOINTED)
+        .copied()
+        .unwrap_or(0);
       (
         answers,
         held > SMALL_MERGE_BUDGET,
         charged == u64::try_from(held).unwrap_or(0),
+        checkpointed_first > 0,
       )
     },
     |config| config.caps.green_chain_bytes = SMALL_MERGE_BUDGET,
   );
   let expected: Vec<_> = (1..10).map(answered).collect();
-  assert_eq!(landed, (expected, true, true));
+  assert_eq!(landed, (expected, true, true, true));
 }
 
 /// Found by use (w-perf, 2026-11-19, release b705a24c5: a 5,000-revision import's record 3,560 refused `Unpublished`,

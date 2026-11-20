@@ -65,7 +65,7 @@
 > 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
-> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test BUILT 2026-11-20 (`WorkOp::Copy`, A-626 part 4's work verb; the SDKs', MCP's and the CLI's surfaces for it owed);
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test BUILT 2026-11-20 (`WorkOp::Copy`, A-626 part 4's work verb, on every surface: the CLI's `copy`, the Python and Node SDKs' `copy`, MCP's `copy` kind, each proven by use against a real daemon);
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
@@ -168,6 +168,11 @@
 > replays its records a step a turn in a task, the store lent to nothing meanwhile (`VcsStores::rebuilding`), its
 > generation moved after. The landing's append is now the size of the push's changegroup (A-729 part 2). Owed:
 > w-perf's and w-interop's by-use reruns.
+> **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
+> history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
+> one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
+> lands ignored. Owed: `getbundle`'s answer made and sent in slices, each charged and let go; the stream clone's; then
+> w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -226,8 +231,10 @@
 >
 > **A-742 (2026-11-20, w-engine; main's ruling):** BUILT: large allocations mapped directly and unmapped when freed
 > (`slates_mem::large`), large temporaries cut (`Wire::encoded_len`, `Db::mutate_owned`, `Checkpoint::into_encoded`);
-> svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. OWED: `Record::revision_bytes`'s growth, the
-> log's decode-after-encode copy, the svn commit's retry clone, the anchor content object's 581 MiB split by range.
+> svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. A-744 closed the record's growth, the retry
+> clone and the split (the 581 MiB is the owner partition's segment log ring and snapshot slots; the content object
+> 2.3 MiB). OWED: a replay measure that does not decode (A-420), so the log's decode-after-encode copy can go; Windows'
+> residency (`QueryWorkingSetEx`).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1610,6 +1617,11 @@
 > `bind_branch`, `retire_branch`). Found by use: a branch the namespace binds is not among the refs git's site serves
 > (`git ls-remote` lists `main` alone after `branch create topic --from main`); `git_interop.rs` holds the by-use test
 > ignored for w-git.
+> Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
+> verbs named `topic` was no bookmark and `--from one` was refused `NotFound`. In a Mercurial repository the three verbs
+> now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
+> (`hg_push::owner_name`); `hg_view`'s test creates `topic` from `one`, retires and binds it, listed as a bookmark at
+> `one`'s node, gone, and back. Owed (main's lane): the same with stock hg through the CLI (`hg pull`, `hg bookmarks`).
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -4855,6 +4867,23 @@
 > So a mixed fleet stops typed, but by accident of length: a later change that keeps the length, or appends a field
 > whose absence parses, would be read with the field defaulted. Owed: a version in the encoding, refused by name on
 > mismatch.
+
+> **Fixed (live-durability, 2026-11-11): a live volume kept a laggard's entries only up to its first whole record's size,
+> so a holder a few entries behind was installed whole.** The retained tail's byte bound was set only at a whole record
+> or an install image, and a whole record comes only once the log reaches the volume's quota (`kept_reaches_size`):
+> 215,997 bytes at head 16,526, so a holder 12 entries behind fell past the tail and drew a whole install, its 195 to
+> 219 MB image built on the owner's shard, 2 to 6 times in every resumed holder's catch-up (diag-live-durability-81 and
+> -82). Every publication now bounds the tail by what installing the volume would send now, the larger of its referenced
+> bytes and its last whole record or image (`live_ship::retain_bound`, red with the referenced bytes ignored).
+> Landed only with the reply fold's fix (g227, 2026-11-19): every reply of a lagging holder had cloned each retained
+> entry it lacked (21 allocations a reply 16 behind, 1,035 at 1,024; 1.4 ms a reply 1,000 behind), so the tail alone
+> left the owner's shard spending itself on those replies, and the holder never caught up within 90 s (diag-84, 8 of 8).
+> `Shipper::fold_reply` names what the holder lacks and builds nothing, and `retains_after`, which each write's sends ask
+> per holder, no longer builds the entries either (`a_lagging_holders_reply_costs_its_owner_the_same_whatever_it_lacks`,
+> red first). Together, at 20,000 behind: 0 installs in 7 of 8 runs (main 1 to 5), the neighbour volume's worst write
+> 0.16–0.40 s (main 1.16–1.85 s); the catch-up itself slower, 3.95–6.09 s on x86 and 9.38–13.34 s on arm (main
+> 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). Open: the arm catch-up time, and this flow on
+> today's main, whose byte bounds (`Bounds::of_whole`) the measured trees predate.
 
 > **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
 > predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement

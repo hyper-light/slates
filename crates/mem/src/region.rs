@@ -129,6 +129,26 @@ impl Region {
     self.backing.bytes().as_ptr()
   }
 
+  /// What of the region is in RAM, and written where the OS says ([`crate::resident::of_range`], A-744).
+  pub fn residency(&self) -> Result<crate::resident::Residency, MemError> {
+    crate::resident::of_range(self.base(), self.len(), self.page)
+  }
+
+  /// [`Region::residency`] of `len` bytes at `offset`; refused `OutOfRange` past the region's end.
+  pub fn residency_of(
+    &self,
+    offset: usize,
+    len: usize,
+  ) -> Result<crate::resident::Residency, MemError> {
+    if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+      return Err(MemError::OutOfRange {
+        offset,
+        len: self.len(),
+      });
+    }
+    crate::resident::of_range(self.base().wrapping_add(offset), len, self.page)
+  }
+
   /// Length in bytes.
   pub fn len(&self) -> usize {
     self.backing.bytes().len()
