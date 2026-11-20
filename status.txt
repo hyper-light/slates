@@ -1,0 +1,21 @@
+started 2026-11-20T11:58:22Z at ad729462edf42f88a5c494b559e0fc2235561a54; 7.0.0-1020-azure; 4 cpus; load 1.90 0.50 0.17
+build exit 0
+fsx plain exit 0 142s load 3.02 2.24 1.20
+conformance: native-linux-fuse × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-20; Ubuntu 26.04.1 LTS)
+fsx live exit 0 21s load 3.19 2.33 1.26
+conformance: native-linux-fuse × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-20; Ubuntu 26.04.1 LTS)
+fsstress plain exit 0 9s load 3.33 2.37 1.28
+conformance: native-linux-fuse × fsstress: RAN(500 operations × 4 processes, seed 1, 2000 logged: passed; 2026-11-20; Ubuntu 26.04.1 LTS)
+fsstress live exit 0 15s load 3.20 2.39 1.30
+conformance: native-linux-fuse × fsstress: RAN(500 operations × 4 processes, seed 1, 2000 logged: passed; 2026-11-20; Ubuntu 26.04.1 LTS)
+pjdfstest plain exit 0 195s load 1.05 1.60 1.18
+conformance: native-linux-fuse × pjdfstest: RAN(238 files, 8798 cases: 8770 passed, 0 failed (0 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-20; Ubuntu 26.04.1 LTS)
+pjdfstest live exit 0 206s load 1.13 1.43 1.20
+conformance: native-linux-fuse × pjdfstest: RAN(238 files, 8798 cases: 8770 passed, 0 failed (0 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-20; Ubuntu 26.04.1 LTS)
+compare exit 0
+compare: native-linux-fuse pjdfstest-output: 8798 cases plain, 8798 live, 0 differing
+compare: record native-linux-fuse.fsstress.json: the same outcome
+compare: record native-linux-fuse.fsx.json: the same outcome
+compare: record native-linux-fuse.pjdfstest.json: the same outcome
+compare: the live-shipped run conforms exactly as the plain one does
+ended 2026-11-20T12:14:02Z

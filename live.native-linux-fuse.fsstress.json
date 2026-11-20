@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "suite": "fsstress",
+  "transport": "native-linux-fuse",
+  "host": {
+    "os": "Ubuntu 26.04.1 LTS",
+    "kernel": "Linux 7.0.0-1020-azure",
+    "arch": "x86_64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-11-20",
+  "command": "<scratch>/tools/ltp/fsstress -d <mount>/conformance-<pid>/fsstress -n 500 -p 4 -s 1 -v",
+  "bound": "500 operations per process × 4 processes, seed 1",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "fsstress",
+      "operations": 500,
+      "processes": 4,
+      "seed": 1,
+      "logged_operations": 2000,
+      "disabled_operations": [],
+      "ok": true
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 15018,
+  "notes": [
+    "fsstress: linux-test-project/ltp@6af38cf testcases/kernel/fs/fsstress/fsstress.c (GPL-2.0), sha256 9a80bbe1f1ad933845b9272b5057776e74923503bbb6f392bf1e135c1744d644, built `cc -O2 -w -DNO_XFS -D_GNU_SOURCE -include shim/config.h` over the harness's shim config.h",
+    "the daemon answered `volume list` after the run: true",
+    "live-shipped (A-200) on an f = 1 fleet, the owner and 2 candidate anchors, mounted through node a: the owner's log Some(LiveLine { head: \"2100\", durable: \"2100\", owed: \"false\" }), the candidates holding [Some(LiveLine { head: \"2100\", durable: \"none\", owed: \"false\" }), Some(LiveLine { head: \"2100\", durable: \"none\", owed: \"false\" })]; durable at its head and held by both candidates; the fleet.live counters: conf-fsstress-a-10814 {\"appended\": 2101, \"batched\": 2583, \"batches\": 542, \"build_waited\": 81, \"change_bytes\": 126353093, \"durable\": 742, \"held_back.placement\": 4, \"held_back.whole\": 361, \"hold.answer\": 238, \"hold.declined\": 44, \"hold.dispatches\": 441, \"hold.exchange\": 1362, \"holders_activated\": 1, \"holders_recorded\": 2, \"holders_transition\": 1, \"hop.build\": 63, \"hop.build_ns\": 2071857960, \"hop.exchange\": 63, \"hop.exchange_ns\": 4201574516, \"hop.lane\": 63, \"hop.lane_ns\": 182697705, \"hop.round\": 63, \"hop.round_ns\": 6891027871, \"hop.to_control\": 63, \"hop.to_control_ns\": 431230576, \"hop.to_owner\": 63, \"hop.to_owner_ns\": 3667114, \"install_built\": 49, \"install_image\": 1, \"no_session\": 63, \"period_slices\": 278, \"periods\": 206, \"queue_waited\": 12, \"queued\": 328, \"reached_slices\": 8, \"refused\": 85, \"refused.no_credit\": 85, \"whole\": 45, \"whole_build_turns\": 285, \"whole_builds\": 43, \"whole_bytes\": 286017664}; conf-fsstress-b-10814 {\"claim_admitted\": 1, \"held\": 1592, \"hold.entries\": 571, \"hop.holder\": 603, \"hop.holder_ns\": 1335402627, \"install_taken\": 15, \"period_slices\": 254, \"periods\": 254, \"reached_slices\": 8}; conf-fsstress-c-10814 {\"claim_admitted\": 1, \"held\": 1813, \"hold.declined\": 1, \"hold.entries\": 676, \"hop.holder\": 712, \"hop.holder_ns\": 911017840, \"install_taken\": 34, \"period_slices\": 244, \"periods\": 244, \"reached_slices\": 8}"
+  ]
+}

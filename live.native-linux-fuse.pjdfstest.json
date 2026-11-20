@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "suite": "pjdfstest",
+  "transport": "native-linux-fuse",
+  "host": {
+    "os": "Ubuntu 26.04.1 LTS",
+    "kernel": "Linux 7.0.0-1020-azure",
+    "arch": "x86_64",
+    "privilege": "root"
+  },
+  "date": "2026-11-20",
+  "command": "sudo -n sh <each of 238 tests/**/*.t of pjd/pjdfstest@85a8aea> in a directory inside the mount that root owns (owner and group 0); binary <scratch>/tools/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7/pjdfstest",
+  "bound": "every test file at the pinned commit (238 files), 300s per file",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "pjdfstest",
+      "files": 238,
+      "cases": 8798,
+      "passed": 8770,
+      "failed": 0,
+      "needs_root": 0,
+      "todo": 28,
+      "expected_failures": 0,
+      "unexpected_failures": 0,
+      "listed_now_passing": 0
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-linux-fuse.pjdfstest.txt",
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "entries": 0
+  },
+  "duration_ms": 206066,
+  "notes": [
+    "pjdfstest: pjd/pjdfstest@85a8aea (BSD-2-Clause), tarball sha256 2005cdd83b76204177cf136792b1f2058a7418b4fc5b203f51274a698547d754, built `cc -O2 -w -I. pjdfstest.c` over a config.h the harness probed (HAVE_: FACCESSAT FCHMODAT FCHOWNAT FSTATAT LCHMOD LINKAT MKDIRAT MKFIFOAT MKNODAT OPENAT POSIX_FALLOCATE READLINKAT RENAMEAT SYMLINKAT UTIMENSAT SYS_SYSMACROS_H STRUCT_STAT_ST_ATIM STRUCT_STAT_ST_CTIM STRUCT_STAT_ST_MTIM)",
+    "0 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
+    "live-shipped (A-200) on an f = 1 fleet, the owner and 2 candidate anchors, mounted through node a: the owner's log Some(LiveLine { head: \"6311\", durable: \"6311\", owed: \"false\" }), the candidates holding [Some(LiveLine { head: \"6311\", durable: \"none\", owed: \"false\" }), Some(LiveLine { head: \"6311\", durable: \"none\", owed: \"false\" })]; durable at its head and held by both candidates; the fleet.live counters: conf-pjdfstest-a-79269 {\"appended\": 6312, \"batched\": 2059, \"batches\": 965, \"change_bytes\": 4079433, \"durable\": 5885, \"held_back.placement\": 3, \"held_back.whole\": 18, \"hold.declined\": 14721, \"hold.dispatches\": 6506, \"hold.exchange\": 11511, \"holders_recorded\": 1, \"hop.build\": 4837, \"hop.build_ns\": 1469726674, \"hop.exchange\": 4837, \"hop.exchange_ns\": 4619469032, \"hop.lane\": 4837, \"hop.lane_ns\": 187809327, \"hop.round\": 4837, \"hop.round_ns\": 7754035949, \"hop.to_control\": 4837, \"hop.to_control_ns\": 1315756656, \"hop.to_owner\": 4837, \"hop.to_owner_ns\": 161274260, \"install_built\": 19, \"no_session\": 10, \"period_slices\": 5946, \"periods\": 3974, \"reached_slices\": 8, \"refused\": 13, \"refused.no_credit\": 13, \"ship_unanswered\": 1, \"whole\": 12, \"whole_bytes\": 75574}; conf-pjdfstest-b-79269 {\"claim_admitted\": 1, \"claim_ask_admitted\": 1, \"held\": 6304, \"hold.declined\": 4434, \"hold.entries\": 5596, \"hop.holder\": 5747, \"hop.holder_ns\": 1144708944, \"install_taken\": 11, \"period_slices\": 3948, \"periods\": 3948, \"reached_slices\": 8}; conf-pjdfstest-c-79269 {\"claim_admitted\": 1, \"held\": 6303, \"hold.declined\": 5416, \"hold.entries\": 5595, \"hop.holder\": 5747, \"hop.holder_ns\": 1206341049, \"install_taken\": 8, \"period_slices\": 3976, \"periods\": 3976, \"reached_slices\": 8}"
+  ]
+}

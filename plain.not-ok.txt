@@ -1,0 +1,9 @@
+tests__chown__00.t.txt:not ok 650 # TODO Linux doesn't clear the SGID/SUID bits for directories, despite the description noted
+tests__chown__00.t.txt:not ok 654 # TODO Linux doesn't clear the SGID/SUID bits for directories, despite the description noted
+tests__chown__00.t.txt:not ok 665 # TODO Linux doesn't clear the SGID/SUID bits for directories, despite the description noted
+tests__chown__00.t.txt:not ok 666 # TODO Linux doesn't clear the SGID/SUID bits for directories, despite the description noted
+tests__chown__00.t.txt:not ok 671 # TODO Linux doesn't clear the SGID/SUID bits for directories, despite the description noted
+tests__chown__00.t.txt:not ok 672 # TODO Linux doesn't clear the SGID/SUID bits for directories, despite the description noted
+tests__chown__00.t.txt:not ok 686 # TODO Linux doesn't clear the SGID/SUID bits for directories, despite the description noted
+tests__chown__00.t.txt:not ok 690 # TODO Linux doesn't clear the SGID/SUID bits for directories, despite the description noted
+tests__unlink__08.t.txt:not ok 2 # TODO According to POSIX: EPERM - The file named by path is a directory, and either the calling process does not have appropriate privileges, or the implementation prohibits using unlink() on directories.
