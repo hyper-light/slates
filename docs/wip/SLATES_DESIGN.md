@@ -20950,6 +20950,9 @@ Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
   back.
 - Amended by A-214 (2026-11-05): an idle shard keeps its last write burst's net growth of free pages pre-faulted, and
   the purge gives back every free block beyond it.
+- Amended by A-765 (2026-11-20, w-sizing): that reserve decays. It is the burst whole for one sweep interval after the
+  pass that closed it, then halved each interval (`daemon::decayed_reserve`), and the sweep stays armed while a
+  reserve is held, so an idle shard gives a burst's pages back within log2(burst / discard size) intervals.
 - Owed:
   - macOS: built by A-110 (2026-10-06).
   - Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.

@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
+> buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
+> only a ceiling. **A-765 BUILT:** an idle shard's prefault reserve (A-214) decays: the last burst whole for one sweep
+> interval, then halved each interval (`daemon::decayed_reserve`); before, the burst was held whole for as long as the
+> shard stayed idle (macOS arm64, Studio-4: a 64 MiB burst still reserved whole after 20 s idle; after, 0 and 234 MB
+> given back). **Measure the footprint on macOS, not RSS:** a given-back page of a shared object leaves the footprint
+> but stays in RSS and vmmap's resident until the kernel wants it (a 64 MiB `shm_open` probe: footprint 64 -> 0 MiB,
+> RSS 64 -> 64); `slates_machine::facts::resident_now`, which the pressure hold's own growth reads, is RSS (open).
+> **Open, by size:**
+> `reserve_per_shard` = memory / shards / 3 sizes each shard's slice of the content object (write log R/4, image slots
+> 2R, delta log R, arena R: about 1.4 times the machine's memory of address space, ~220 GB on the 96 GB Studio, g226),
+> the reserve's ceiling, the DAX table, the client and fleet shares; the sweep of every sizing site follows here.
+>
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
 > shard). **Closed quiet by A-400** (a work on its client's shard): Linux arm64 accept p50 51–55 → 20–21 µs (before W1
