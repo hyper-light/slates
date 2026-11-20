@@ -246,6 +246,10 @@ pub(crate) struct WorkHome {
   /// (A-697 part e), each with the shards whose works wait; once the replica is installed each shard asks again
   /// ([`replica_reached`]). Bounded by the greens this node replicates times its shards.
   replays_owed: BTreeMap<slates_db::register::ObjectId, BTreeSet<u16>>,
+  /// The holder creations a restart caught waiting for their admission (A-697 part e2), by name: each keeps its pending
+  /// record, so its name and id stay held, until its green's owner has released the floor it may have recorded for the
+  /// work ([`release_admissions`]); `true` while a release is out. Bounded by the partition's pending creations.
+  pub(crate) releasing: BTreeMap<String, bool>,
 }
 
 /// A submit of a work on this holder node whose version its green's owner committed before this node's replica held it
@@ -795,6 +799,15 @@ fn create_need(
   // This request's own creation: its name reserved now, or an answer lost or its daemon restarted, asked again under
   // the same id (the reservation is answered again for the id it holds).
   if let Some(pending) = state.db.partition().pending_creation(name) {
+    // A creation a restart caught waiting for a holder's admission is released at the owner first (A-697 part e2): its
+    // resend is answered retryable meanwhile, and asks for the release again.
+    if state.work_home.releasing.contains_key(name) {
+      let pending = pending.clone();
+      start_release(state, pending);
+      return Err(Refusal::Overloaded {
+        shard: state.partition,
+      });
+    }
     if (pending.origin, pending.client, pending.sequence) != key {
       return Ok(None);
     }
@@ -825,6 +838,7 @@ fn create_need(
     origin,
     client: id.client,
     sequence: id.sequence,
+    green,
   };
   let now = state.clock.monotonic_ns();
   state
@@ -1320,7 +1334,16 @@ fn admit_over_fleet(
       deadline,
     )
     .await;
-    let _ = state::with_state_counted(|s| resolve(s, queue, admitted_over_fleet(reply)));
+    let _ = state::with_state_counted(|s| {
+      // Test support (`Daemon::lose_next_owner_answer`): the admission is lost, as a crash between the owner's step and
+      // this one would lose it.
+      let answer = if std::mem::take(&mut s.work_home.lose_next_answer) {
+        None
+      } else {
+        admitted_over_fleet(reply)
+      };
+      resolve(s, queue, answer);
+    });
   });
   match asked {
     Ok(task) => {
@@ -1668,6 +1691,143 @@ fn replays_resumed(state: &mut ShardState, object: slates_db::register::ObjectId
       state.count(REPLAY_ASK_UNHANDED, 1);
     }
   }
+}
+
+/// Format: a holder creation a restart caught waiting for its admission, held until its admission is released at the
+/// green's owner (A-697 part e2), the non-vacuity count of [`hold_for_release`].
+pub(crate) const ADMISSION_HELD_FOR_RELEASE: &str = "merge.work.admission_held_for_release";
+/// Format: such an admission released at the owner and its creation settled here (A-697 part e2).
+pub(crate) const ADMISSION_RELEASED: &str = "merge.work.admission_released";
+/// Format: a release the owner did not answer `WorkFloorMoved`; asked again at the creation's resend or the next start.
+const ADMISSION_RELEASE_UNANSWERED: &str = "merge.work.admission_release_unanswered";
+
+/// At recovery, on a work's shard (A-697 part e2): whether the pending creation `pending` is a holder's, whose green
+/// another node owns and whose owner may have recorded a floor for the work at its admission. Such a creation is not
+/// dropped as another is: it keeps its record, so its name and id stay held, and is released at the owner first
+/// ([`release_admissions`]); dropped, the floor at the owner would hold its green's history for a work never made.
+pub(crate) fn hold_for_release(
+  state: &mut ShardState,
+  pending: &slates_db::catalog::PendingCreationRecord,
+) -> bool {
+  if !owned_elsewhere(state, pending.green) {
+    return false;
+  }
+  state
+    .work_home
+    .releasing
+    .insert(pending.name.clone(), false);
+  state.count(ADMISSION_HELD_FOR_RELEASE, 1);
+  true
+}
+
+/// As clients are let in (A-697 part e2; as A-533 asks for unbuilt works): every holder creation held for its release
+/// asks the green's owner to drop the floor its admission may have recorded.
+pub(crate) fn release_admissions(state: &mut ShardState) {
+  let held: Vec<slates_db::catalog::PendingCreationRecord> = state
+    .work_home
+    .releasing
+    .keys()
+    .filter_map(|name| state.db.partition().pending_creation(name).cloned())
+    .collect();
+  for pending in held {
+    start_release(state, pending);
+  }
+}
+
+/// Asks the green's owner on another node to drop `pending`'s work's floor (`MoveWorkFloor` with no base, monotone
+/// there: a floor never recorded stays none), from the control shard; on `WorkFloorMoved` the creation is settled here,
+/// its name and id given back, and the client's resend makes the work afresh. One release out at a time a creation; one
+/// unanswered is asked again at the creation's next resend or the next start (no timer; A-533's pattern).
+fn start_release(state: &mut ShardState, pending: slates_db::catalog::PendingCreationRecord) {
+  match state.work_home.releasing.get_mut(&pending.name) {
+    Some(out) if !*out => *out = true,
+    _ => return,
+  }
+  let (Some(here), Some(control)) = (
+    crate::verbs::shard_of_partition(state, state.partition),
+    state.shards.first().copied(),
+  ) else {
+    return;
+  };
+  let region = state
+    .node_regions
+    .get(&state.fleet.host())
+    .map_or(0, |region| region.0);
+  let principal = Principal::Uid {
+    host: state.origin_anchor,
+    uid: 0,
+  };
+  let wire_green = crate::verbs::to_wire_volume(pending.green);
+  let request = crate::verbs::forwarded_request(
+    state,
+    0,
+    principal,
+    RequestBody::MoveWorkFloor {
+      green: wire_green,
+      work: crate::verbs::to_wire_volume(pending.work),
+      base: None,
+    },
+  );
+  let deadline = park_bound_ns(state);
+  let (name, work) = (pending.name, pending.work);
+  let answered_name = name.clone();
+  let spawned = slates_rt::futures::spawn(async move {
+    let reply = crate::xshard::task_within(
+      here,
+      control,
+      move || async move {
+        crate::verbs::resolve_and_forward(wire_green, region, None, vec![request])
+          .await
+          .0
+          .first()
+          .clone()
+      },
+      deadline,
+    )
+    .await;
+    let _ = state::with_state_counted(|s| released(s, (&answered_name, work), reply.as_ref()));
+  });
+  match spawned {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+    }
+    Err(_) => {
+      if let Some(out) = state.work_home.releasing.get_mut(&name) {
+        *out = false;
+      }
+      state.count(ADMISSION_RELEASE_UNANSWERED, 1);
+    }
+  }
+}
+
+/// A release's answer, on the creation's shard: the creation settled once the owner dropped the floor.
+fn released(state: &mut ShardState, (name, work): (&str, DbVolumeId), reply: Option<&ReplyBody>) {
+  let still = state
+    .db
+    .partition()
+    .pending_creation(name)
+    .is_some_and(|pending| pending.work == work);
+  if !matches!(reply, Some(ReplyBody::WorkFloorMoved)) || !still {
+    if let Some(out) = state.work_home.releasing.get_mut(name) {
+      *out = false;
+    }
+    if still {
+      state.count(ADMISSION_RELEASE_UNANSWERED, 1);
+    }
+    return;
+  }
+  state.db.begin();
+  let settled = crate::verbs::settle_creation(state, name);
+  if settled.is_err() || state.db.commit(&mut state.segment).is_err() {
+    crate::verbs::reconcile_unpublished_effects(state);
+    if let Some(out) = state.work_home.releasing.get_mut(name) {
+      *out = false;
+    }
+    state.count(ADMISSION_RELEASE_UNANSWERED, 1);
+    return;
+  }
+  state.work_home.releasing.remove(name);
+  state.count(ADMISSION_RELEASED, 1);
 }
 
 /// What the green's owner on another node answered an `AdmitWork` (A-697 part a): the admission, or the refusal it gave;

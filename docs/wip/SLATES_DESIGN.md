@@ -56336,9 +56336,8 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   install so (the work answered `Unpublished` for good; the test's first run, by use).
 - **Counters.** `merge.work.replay_awaits_replica`, `merge.work.replayed_on_replica` (the test's non-vacuity count),
   `merge.work.replay_ask_unhanded`.
-- **Owed.** A creation a restart caught waiting for the owner's admission is dropped here (`drop_pending_creations`),
-  and the floor the owner may have recorded for it stays there, since the pending record does not name the green: it
-  keeps more history, not less. Recovering a holder's pending submit is the existing path: the work's next verb runs it
+- **Owed (closed the same day, part e2 below).** A creation a restart caught waiting for the owner's admission was
+  dropped here (`drop_pending_creations`), and the floor the owner may have recorded for it stayed there. Recovering a holder's pending submit is the existing path: the work's next verb runs it
   again under its key, and the owner's completion record answers it.
 - **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
   a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_restart` (three nodes at `f = 1` keeping
@@ -56384,3 +56383,31 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   `Forbidden` and the floor kept). Red with the check removed: the second floor dropped. Fleet `a_holder` 22 of 22 (the
   admissions, floor moves and computed submits of every holder test pass the check); `verbs::` 63 of 63, `work_home` 2
   of 2; fmt clean.
+
+### A-697 part e2 — A holder creation a restart caught waiting for its admission releases the owner's floor before it is dropped (2026-11-20, w-shared for UI goal 93; main's order: performance gaps up front, held history the same waste as A-742's)
+Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's step two), `crates/db/src/catalog.rs`
+(`PendingCreationRecord::green`), `crates/db/tests/alias.rs`, `crates/server/src/work_home.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/verbs.rs`, `crates/server/tests/fleet.rs`.
+- **What was there.** A restart drops every creation it catches waiting for its green's owner (`drop_pending_creations`):
+  its name and id go back, and the client's resend makes the work afresh. For a holder's creation (part a2) the owner
+  may already have admitted it and recorded its floor, which then held the green's history at that version for a work
+  never made, for good.
+- **Change.** The pending record names its green (`PendingCreationRecord::green`; a field of a record, so the log's
+  schema hash moves as an appended variant would move it, `record.rs`). At recovery a pending creation over a green
+  another node owns is not dropped (`work_home::hold_for_release`): its record stays, holding its name and id, and its
+  resend is answered retryable. Its release is asked as clients are let in (`verbs::ask_owners_to_replay` →
+  `work_home::release_admissions`) and again at each resend: `MoveWorkFloor` with no base, from the control shard, which
+  the owner applies monotonically (a floor never recorded stays none). On `WorkFloorMoved` the creation is settled, its
+  name and id given back, and the next resend makes the work afresh. One release is out at a time a creation; one
+  unanswered is asked again at the next resend or the next start (no timer, A-533's pattern), and the record survives
+  a restart between, so the release is never lost.
+- **Counters.** `merge.work.admission_held_for_release`, `merge.work.admission_released` (the test's non-vacuity count),
+  `merge.work.admission_release_unanswered`.
+- **Test seam.** `Daemon::lose_next_owner_answer` now loses an admission over the fleet too (`admit_over_fleet`), as it
+  loses one between shards; `Daemon::work_floors_of` lists a green's floors at its owner.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner` (three nodes at `f = 1` keeping their state; B
+  loses a creation's admission answer after A recorded the work's floor, restarts over its own segment: A's floor for
+  that work released, B's counter moved, the name made again at a new id). Red with the creation dropped as before: A's
+  floor never released (the poll gave up). Fleet `a_holder` 23 of 23; `slates-server --lib work_home verbs::
+  takeover::`, `slates-db --lib` and `--test alias`; fmt clean.
