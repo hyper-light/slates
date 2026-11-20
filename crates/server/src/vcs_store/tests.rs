@@ -1233,7 +1233,7 @@ fn created_green(made: &Appended) -> DbVolumeId {
 }
 
 /// `repository`'s records, in the order its register received them.
-fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u8>> {
+pub(crate) fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u8>> {
   state
     .db
     .partition()
@@ -1245,7 +1245,11 @@ fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u8>> {
 
 /// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one
 /// whole over the refs keyed `greens`, every record replayed and none refused.
-fn assert_made_again_whole(state: &mut ShardState, repository: RepositoryId, greens: &[u64]) {
+pub(crate) fn assert_made_again_whole(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  greens: &[u64],
+) {
   let live = {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     facts(content, store, greens)
