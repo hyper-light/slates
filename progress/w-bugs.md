@@ -26,3 +26,12 @@
 - Push: this Studio has no HTTPS GitHub credentials; SSH works (`git remote set-url --push origin
   git@github.com:hyper-light/slates.git`).
 - Next: B4 (WinFsp reply spin, crates/bridge-winfsp/src/reply.rs SAMPLES).
+- B4: already fixed on main by A-560 (ba48ab017, 2026-11-18); bug-claims marked. Nothing to land.
+- B8, B9: reading findings ("not reproduced"/"not measured"); per Ada 22:45Z not chased until use shows them. Need
+  a Linux FUSE mount (not this Mac).
+- Main's CI (2026-11-20 ~05:30Z) is red on every Windows step after "Clippy the Windows-buildable crates" (all lanes),
+  fmt fails on macOS/ubuntu. Job logs need admin rights (unauthenticated here), so I read Windows through a results
+  branch: workflow .github/workflows/diag-w-bugs.yml on diag-w-bugs-<bug>-<n> (worktree ~/slates-work/w-bugs-diag),
+  outputs committed to <branch>-results-<run>-<runner> (status.txt, clippy.txt, fsx.txt, records). Run 1
+  (diag-w-bugs-b3-1, 44682281003): steps under bash -e ended before publishing; fixed (set +e) -> diag-w-bugs-b3-2.
+- B3 question: does fsx seed 1 still wedge over the WinFsp drive on main's tree (efa2266be's parent = main 9ea6e1311)?
