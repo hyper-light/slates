@@ -170,3 +170,10 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
 - Revprop row (A-702 p2) BLOCKED: no CLI verb sends SetRepositoryPolicy; proposed `slates repository hooks NAME --hook
   POINT=PROGRAM` to main; will start it after r57 unless told otherwise.
 - svnrdump spin: w-svn fixing (listener never yields while client drains); re-run row when it lands.
+- svnrdump row green (r58, main 0f756ec7 w/ a469a6b85): 72 MB in 14 s, matrix 29/29. Reported.
+- Policy verb (piece 8, owner main): scratch agents/w-interop-policy (ac5b63c03): ipc DescribeRepositoryPolicy +
+  ReplyBody::RepositoryPolicy (appended; wire_order publish pending r59), server repository::describe_policy +
+  wire_* converters + test a_repositorys_policy_is_read_and_set_by_its_owner_alone, client describe/set +
+  RepositoryPolicy type, cli `repository policy NAME [--hook POINT=PROGRAM]...` + grammar test, svn_interop test
+  a_repository_policys_hook_lets_stock_svn_change_a_revision_property. NEXT: apply wire_order.txt diff from r59, land,
+  then revprop matrix row (svn:// + svn+ssh), then branch verbs.
