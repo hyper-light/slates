@@ -991,3 +991,14 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - ~02:05 PST ADA: "a single server should be able to facilitate numerous repositories ... balance consumption and usage
   between them based upon agent, usage patterns. Dispatch an agent ... toy repos to Google's or Meta's *in multiple*."
   -> w-balance (briefs/w-balance.md): design first (outline before code), then pieces, proven by a multi-repo push_load.
+- ~02:15 PST CONVERGENCE PLAN APPROVED (w-perf): today a 3.43 MB git push = inflated store 69.1 + entry 63.5 + arena
+  63.7 MiB (+ A-718 fragments 100-125 MiB later); svn text held ~4x (records 305.6, entries 244.7, history chunks
+  234.8 MiB, blocks ~585 MB @1,000 revs). Steps: S1 (w-perf, REVISED) the entry holds the pack as sent (compressed,
+  deltified, minus held objects) + moves, replay re-indexes; bounded parts past an entry's bound; S2 (w-perf) history's
+  latest value names the block, held.rs stays as identity->block, hold_bytes goes after S3/S5; S3 (w-git) store = index
+  oid->identity over the record's pack, blobs land as the push work's file ops, fragments from intake; S4 (w-svn +
+  w-perf) records name texts by identity; S5 (w-hg) filelogs as green files by identity, changelog/manifest deltas.
+  Push bound: streamed window per connection, TCP backpressure, admission charges window + post-state, typed refusal
+  before body; 10,000 x 256 KiB = 2.5 GiB.
+- w-git A-719 p2 landed 183150ab8 (569868917): unpack::Keep (objects handed to a keeper as resolved; bounded working
+  set); §4.17.1 "A push's intake" rule written. Next p3: keep into quarantine as read; admit_all goes.
