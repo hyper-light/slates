@@ -201,7 +201,12 @@
 > fork of the index and the register's roots and bookmarks as they stood, taken in the turn the answer began, given
 > back by its drop), and every later turn lends a view over it (`HgStores::lend_held`, HTTP and SSH); a clone across a
 > landing and a rebuild in flight answers the start generation's bytes, byte for byte (test; without the hold the
-> rebuild's turn is lent nothing). Owed: the stream clone's (piece 3); w-interop's matrix rerun.
+> rebuild's turn is lent nothing). Piece 3 BUILT: `stream_out` is sent a row at a time (`render::Streaming`: a first
+> walk counts the files and bytes its head names from the rows alone, then each revlog's index entries and data chunks
+> a row a step, the data file's size known from the offsets the index file kept), over HTTP and SSH as `getbundle`'s
+> answer is (`session::Producing`); its bytes are `render::revlogs`' byte for byte (test), a step's least room below the
+> whole answer's (test), and a stream clone of a file twice a request's room is answered through the daemon's edge
+> (test). Owed: `stream2` (bundle2's stream part) and stock `hg clone --stream` by use; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

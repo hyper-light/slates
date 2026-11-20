@@ -40,6 +40,8 @@ const DATA: &[u8] = b"data/";
 pub const STREAM_REQUIREMENTS: &[u8] = b"generaldelta,revlogv1,sparserevlog";
 /// Format: `.hg/requires`, sorted as 7.2 writes it.
 const REQUIRES: &[u8] = b"dotencode\nfncache\ngeneraldelta\nrevlogv1\nsparserevlog\nstore\n";
+/// Format: the most bytes a count takes as decimal text (`u64::MAX`'s 20 digits).
+const DECIMAL_BYTES: u64 = 20;
 /// Format: the index header: revlog version 1 with generaldelta (`FLAG_GENERALDELTA`, bit 17), big-endian.
 const HEADER: [u8; 4] = [0, 2, 0, 1];
 /// Format: a version 1 index entry's bytes: the node's field is 32 bytes, its last 12 zero.
@@ -228,6 +230,330 @@ fn revlog(
     header.copy_from_slice(&HEADER);
   }
   Ok((entries, data))
+}
+
+/// One log of the walk a stream makes (A-745): a file log by its path, the manifest log, then the changelog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Walked {
+  /// A file log.
+  File(Vec<u8>),
+  /// The manifest log.
+  Manifest,
+  /// The changelog.
+  Changelog,
+}
+
+impl Walked {
+  /// The index's name of the log.
+  fn log(&self) -> Log<'_> {
+    match self {
+      Walked::File(path) => Log::File(path),
+      Walked::Manifest => Log::Manifest,
+      Walked::Changelog => Log::Changelog,
+    }
+  }
+
+  /// Its store path's radix before encoding (`data/<path>`, `00manifest`, `00changelog`).
+  fn radix(&self) -> Vec<u8> {
+    match self {
+      Walked::File(path) => [DATA, path.as_slice()].concat(),
+      Walked::Manifest => b"00manifest".to_vec(),
+      Walked::Changelog => b"00changelog".to_vec(),
+    }
+  }
+}
+
+/// Where a streamed `stream_out` stands (A-745).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Stage {
+  /// Counting the files and their bytes, which the answer's head names first: the log and its revision next.
+  Counting(Walked, u32),
+  /// The head: `0`, then the files' count and bytes.
+  Head,
+  /// A log's index file: its next revision, and its data file's bytes before it.
+  Index(Walked, u32, u64),
+  /// A log's data file: its next revision.
+  Data(Walked, u32),
+  /// Ended.
+  Done,
+}
+
+/// `stream_out`'s answer made a row at a time (A-745; §4.17.1 "A fetch's answer"): what [`revlogs`] renders whole,
+/// written as it is made. The answer names its files' count and bytes first, so a first walk counts them from the
+/// index's rows alone (a revision's chunk is its text's length and, unless the text is empty or begins with a NUL, the
+/// one byte of `u`), a row a step; then each log in [`revlogs`]' order is written, its index file's entries a row a
+/// step (each chunk's offset kept as the walk goes, so the data file's size is known when its line is due), then its
+/// data file's chunks a row a step, a data file with no bytes left out as 7.2 leaves an empty file out. What the walk
+/// holds is its place and two counts; a step holds one revision's text.
+#[derive(Debug)]
+pub struct Streaming {
+  /// Where it stands.
+  stage: Stage,
+  /// The files counted, and their bytes.
+  counted: (u64, u64),
+  /// A log's index file bytes and data file bytes, as the count walks it.
+  walking: (u64, u64),
+}
+
+impl Default for Streaming {
+  fn default() -> Self {
+    Streaming {
+      stage: Stage::Counting(Walked::File(Vec::new()), 0),
+      counted: (0, 0),
+      walking: (0, 0),
+    }
+  }
+}
+
+impl Streaming {
+  /// Appends the answer's next part to `out`, what a step holds charged to `admission`: whether more follow. A refused
+  /// step leaves the walk where it was.
+  pub fn step(
+    &mut self,
+    index: &HgIndex,
+    store: &ContentStore,
+    admission: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refused> {
+    let stage = self.stage.clone();
+    self.stage = match stage {
+      Stage::Counting(log, rev) => self.count(index, store, (log, rev))?,
+      Stage::Head => {
+        admission.charge(DECIMAL_BYTES.saturating_mul(2).saturating_add(4))?;
+        out.extend_from_slice(b"0\n");
+        out.extend_from_slice(crate::decimal::Decimal::unsigned(self.counted.0).as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(crate::decimal::Decimal::unsigned(self.counted.1).as_bytes());
+        out.push(b'\n');
+        first_log(index, store).map_or(Stage::Done, |log| Stage::Index(log, 0, 0))
+      }
+      Stage::Index(log, rev, offset) => {
+        index_entry(index, store, (log, rev, offset), admission, out)?
+      }
+      Stage::Data(log, rev) => data_chunk(index, store, (log, rev), admission, out)?,
+      Stage::Done => return Ok(false),
+    };
+    Ok(self.stage != Stage::Done)
+  }
+
+  /// One row of the count, or a log's end: its files and bytes counted.
+  fn count(
+    &mut self,
+    index: &HgIndex,
+    store: &ContentStore,
+    (log, rev): (Walked, u32),
+  ) -> Result<Stage, Refused> {
+    let row = match &log {
+      Walked::File(path) => index
+        .file_revision_from(store, (path, rev))
+        .map(|(found, number, _)| (Walked::File(found), number)),
+      Walked::Manifest | Walked::Changelog => {
+        (rev < index.len(store, log.log())).then(|| (log.clone(), rev))
+      }
+    };
+    let (found, number) = match row {
+      Some((found, number)) if found == log || rev == 0 => (found, number),
+      _ => {
+        self.close_count();
+        return Ok(
+          next_log(&log, index, store).map_or(Stage::Head, |next| Stage::Counting(next, 0)),
+        );
+      }
+    };
+    if found != log {
+      // A file log after the one counted: the one counted ends here.
+      self.close_count();
+      return Ok(Stage::Counting(found, 0));
+    }
+    let chunk = chunk_len(index, store, (found.log(), number)).ok_or(Refused::Unreadable {
+      log: unreadable_name(&found),
+      rev: number,
+    })?;
+    self.walking.0 = self.walking.0.saturating_add(to_u64(ENTRY_BYTES));
+    self.walking.1 = self.walking.1.saturating_add(chunk);
+    Ok(Stage::Counting(found, number.saturating_add(1)))
+  }
+
+  /// A log's count ended: its index file, and its data file where it has bytes.
+  fn close_count(&mut self) {
+    let (entries, data) = core::mem::take(&mut self.walking);
+    for bytes in [entries, data] {
+      if bytes > 0 {
+        self.counted.0 = self.counted.0.saturating_add(1);
+        self.counted.1 = self.counted.1.saturating_add(bytes);
+      }
+    }
+  }
+}
+
+/// The first log the walk writes: the first file log, else the manifest log, else the changelog; none for an empty
+/// repository.
+fn first_log(index: &HgIndex, store: &ContentStore) -> Option<Walked> {
+  match index.file_revision_from(store, (&[], 0)) {
+    Some((path, _, _)) => Some(Walked::File(path)),
+    None => next_log(&Walked::File(Vec::new()), index, store),
+  }
+}
+
+/// The log after `log` in the walk's order that holds a revision.
+fn next_log(log: &Walked, index: &HgIndex, store: &ContentStore) -> Option<Walked> {
+  let after = match log {
+    Walked::File(path) => match index.file_revision_from(store, (path, u32::MAX)) {
+      Some((found, _, _)) if found != *path => return Some(Walked::File(found)),
+      _ => Walked::Manifest,
+    },
+    Walked::Manifest => Walked::Changelog,
+    Walked::Changelog => return None,
+  };
+  if index.len(store, after.log()) > 0 {
+    Some(after)
+  } else {
+    next_log(&after, index, store)
+  }
+}
+
+/// The log's name in a refusal: a file log's path, the manifest log's one byte, the changelog's none.
+fn unreadable_name(log: &Walked) -> Vec<u8> {
+  match log {
+    Walked::File(path) => path.clone(),
+    Walked::Manifest => vec![0],
+    Walked::Changelog => Vec::new(),
+  }
+}
+
+/// A revision's chunk length in its data file, from its row alone: its text's length, and one byte more for the `u`
+/// that marks a text stored as it is, unless the text is empty or begins with a NUL. A changeset's text begins with its
+/// manifest's hexadecimal node, a manifest's with a path, and a file revision's with a metadata block's marker where it
+/// has one, none of them a NUL; a file revision's bytes otherwise begin as the store's first window of them does.
+fn chunk_len(index: &HgIndex, store: &ContentStore, (log, rev): (Log<'_>, u32)) -> Option<u64> {
+  let (len, leading) = match log {
+    Log::Changelog => (index.changeset(store, rev)?.len, None),
+    Log::Manifest => (index.revision(store, log, rev)?.len, None),
+    Log::File(_) => {
+      let row = index.revision(store, log, rev)?;
+      let leading = match row.block {
+        Some(_) => None,
+        None => store
+          .windows(&row.bytes)
+          .next()
+          .and_then(|window| window.first().copied()),
+      };
+      (row.len, leading)
+    }
+  };
+  let marked = len > 0 && leading != Some(0);
+  Some(len.saturating_add(u64::from(marked)))
+}
+
+/// A file's line in the answer: its store path through `encodedir`, a NUL, its size and a line end.
+fn file_line(
+  name: &[u8],
+  size: u64,
+  admission: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
+  let line = encode_dir(name);
+  admission.charge(
+    to_u64(line.len())
+      .saturating_add(DECIMAL_BYTES)
+      .saturating_add(2),
+  )?;
+  out.extend_from_slice(&line);
+  out.push(0);
+  out.extend_from_slice(crate::decimal::Decimal::unsigned(size).as_bytes());
+  out.push(b'\n');
+  Ok(())
+}
+
+/// The index file's next entry (its line first, at its first), or the index file's end and the data file next.
+fn index_entry(
+  index: &HgIndex,
+  store: &ContentStore,
+  (log, rev, offset): (Walked, u32, u64),
+  admission: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<Stage, Refused> {
+  let count = index.len(store, log.log());
+  if rev >= count {
+    if offset == 0 {
+      return Ok(next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)));
+    }
+    let name = [log.radix().as_slice(), b".d"].concat();
+    file_line(&name, offset, admission, out)?;
+    return Ok(Stage::Data(log, 0));
+  }
+  let unreadable = || Refused::Unreadable {
+    log: unreadable_name(&log),
+    rev,
+  };
+  if rev == 0 {
+    let name = [log.radix().as_slice(), b".i"].concat();
+    let size = u64::from(count).saturating_mul(to_u64(ENTRY_BYTES));
+    file_line(&name, size, admission, out)?;
+  }
+  admission.charge(to_u64(ENTRY_BYTES))?;
+  let (parents, link) = numbers(index, store, log.log(), rev).ok_or_else(unreadable)?;
+  let chunk = chunk_len(index, store, (log.log(), rev)).ok_or_else(unreadable)?;
+  let (node, flags, text) = match log.log() {
+    Log::Changelog => {
+      let row = index.changeset(store, rev).ok_or_else(unreadable)?;
+      (row.node, row.flags, row.len)
+    }
+    other => {
+      let row = index.revision(store, other, rev).ok_or_else(unreadable)?;
+      (row.node, row.flags, row.len)
+    }
+  };
+  let entry = Entry {
+    offset,
+    flags,
+    chunk: usize::try_from(chunk).map_err(|_| Refused::TooLong)?,
+    text: usize::try_from(text).map_err(|_| Refused::TooLong)?,
+    rev,
+    link,
+    parents,
+    node,
+  };
+  let at = out.len();
+  entry.write(out)?;
+  if rev == 0
+    && let Some(header) = out.get_mut(at..at.saturating_add(HEADER.len()))
+  {
+    header.copy_from_slice(&HEADER);
+  }
+  Ok(Stage::Index(
+    log,
+    rev.saturating_add(1),
+    offset.saturating_add(chunk),
+  ))
+}
+
+/// The data file's next chunk, or the log's end and the next log's index file.
+fn data_chunk(
+  index: &HgIndex,
+  store: &ContentStore,
+  (log, rev): (Walked, u32),
+  admission: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<Stage, Refused> {
+  if rev >= index.len(store, log.log()) {
+    return Ok(next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)));
+  }
+  let unreadable = || Refused::Unreadable {
+    log: unreadable_name(&log),
+    rev,
+  };
+  let kept = kept(index, store, log.log(), rev, true).ok_or_else(unreadable)?;
+  admission.charge(kept.len.saturating_add(1))?;
+  let mut text = Vec::new();
+  if write_text(&mut text, store, &kept) != kept.len {
+    return Err(unreadable());
+  }
+  if text.first().is_some_and(|first| *first != 0) {
+    out.push(UNCOMPRESSED);
+  }
+  out.extend_from_slice(&text);
+  Ok(Stage::Data(log, rev.saturating_add(1)))
 }
 
 /// A revision's parents' numbers in its log and its link (a changeset's own number), `None` where the index lacks it.
