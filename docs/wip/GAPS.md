@@ -1343,7 +1343,13 @@
 > slices (a refusal before its first byte answered with its error, one after it ending the connection); held to the
 > ra_svn walk entry for entry over nine requests and to stock `svn log` and `svn log -v` (see A-681 part 1, second
 > slice). Owed from it: (1) a negative `S:limit`, refused where `svn_repos_get_logs5` reads two limits; (2) the other
-> REPORTs and the update-report. A-531 (2026-11-19): the ra_svn item codec, its
+> REPORTs and the update-report. A-681, the lender (2026-11-19, g297): a Subversion repository's records lent as the
+> read source on its owner shard (`reads::Repository` and `Contents` over `slates_svn::migration::Repository`, the
+> index's directory listing `Index::children`, `slates-server`'s `vcs_store::svn_view::ServedRecords` and `lend_in`
+> for the svn:// listener); held to the index's oracle and to committed records read back through the DAV site on a
+> daemon's shard (see A-681, the lender). Owed from it: (1) a repository's Subversion authorization file and a
+> principal's Subversion user have no home in its record, so the lender gives no read rules; (2) the site routed into
+> the daemon's `ToolSites`. A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its

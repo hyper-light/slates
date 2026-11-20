@@ -16,7 +16,8 @@
 //! 3. The repository's shard. A repository another shard holds moves the connection there whole (`Answer::Move`).
 //! 4. The repository. None of that name, or one of another tool, is `404`.
 //! 5. The policy. A principal the policy lets read none of the repository is `403`, for every request.
-//! 6. The store. A repository whose store this shard does not hold is `503` (the daemon lends none yet: [`NoSvnStores`]).
+//! 6. The store. A repository whose store this shard does not hold is `503` (the daemon's lender:
+//!    `crate::vcs_store::svn_view::ServedRecords`, the records of the repositories this shard's map holds).
 //!
 //! A served request's body is read whole within the request's room (`413` past it), then answered at its end from the
 //! store as `slates_svn::dav::site` decides: its status, which the reply names as it begins (`207` for a PROPFIND; the
@@ -126,56 +127,6 @@ pub(crate) trait SvnStores {
     principal: &Principal,
     step: impl FnOnce(&Lent<'_, Self::Repository>) -> T,
   ) -> Option<T>;
-}
-
-/// The stores as the daemon has them until the site is handed Subversion's (each repository's index and green on its
-/// owner shard, its lock table, its authorization file and a principal's Subversion user): none, so every Subversion
-/// request a principal may make is `503`.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct NoSvnStores;
-
-/// The green no repository has yet: no value has this type.
-pub(crate) enum NoGreen {}
-
-impl slates_svn::mergeinfo::Contents for NoGreen {
-  fn entries(&self, _directory: &str, _revision: u64) -> Option<Vec<String>> {
-    match *self {}
-  }
-
-  fn mergeinfo_value(&self, _properties: &[u8; 32]) -> Option<&[u8]> {
-    match *self {}
-  }
-}
-
-impl Repository for NoGreen {
-  fn revision_properties(&self, _revision: u64) -> Option<Vec<(&[u8], &[u8])>> {
-    match *self {}
-  }
-
-  fn properties(&self, _identity: &[u8; 32]) -> Option<Vec<(&[u8], &[u8])>> {
-    match *self {}
-  }
-
-  fn text(&self, _identity: &[u8; 32], _offset: u64) -> Option<&[u8]> {
-    match *self {}
-  }
-}
-
-impl SvnStores for NoSvnStores {
-  type Repository = NoGreen;
-
-  fn holds(&self, _id: RepositoryId) -> bool {
-    false
-  }
-
-  fn lend<T>(
-    &mut self,
-    _id: RepositoryId,
-    _principal: &Principal,
-    _step: impl FnOnce(&Lent<'_, NoGreen>) -> T,
-  ) -> Option<T> {
-    None
-  }
 }
 
 /// What a routed head names: its repository, and the path below its root.

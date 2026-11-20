@@ -70,7 +70,7 @@
 mod daemon_edge;
 pub(crate) mod git;
 pub(crate) mod hg;
-mod svn;
+pub(crate) mod svn;
 pub(crate) mod waits;
 
 pub(crate) use daemon_edge::{ShardRepositories, bind, start};
