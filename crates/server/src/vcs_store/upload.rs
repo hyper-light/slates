@@ -93,9 +93,10 @@ impl StoreLender for ShardStores {
   }
 
   /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
-  /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]).
+  /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]); waited for
+  /// at most one liveness window, past which the answer begins and a task finishes the encoding behind it.
   async fn encode(&mut self, id: RepositoryId) {
-    super::git_encode::settle_encodings(id).await;
+    super::git_encode::encode_for_fetch(id).await;
   }
 }
 

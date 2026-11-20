@@ -706,6 +706,8 @@ pub(crate) fn held_committed(
   if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
     windows.clear_changes();
   }
+  // The windows this publication carried are durable: every homes ticket kept before it answers so (A-724 with A-727 a3).
+  crate::vcs_store::homes::publication_committed();
 }
 
 /// Adopts what a committed publication carried of the held registers (A-367): each register's published positions as

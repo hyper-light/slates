@@ -434,6 +434,13 @@ pub(crate) struct MadeCopy {
   replace: bool,
 }
 
+impl MadeCopy {
+  /// Its destination and its source, as paths of the green with no leading `/` (A-731: a Mercurial changeset's copy).
+  pub(crate) fn green_paths(&self) -> (&str, &str) {
+    (self.to.trim_matches('/'), self.from.trim_matches('/'))
+  }
+}
+
 /// The copies `inc` declares ([`MadeCopy`]), in its document's order.
 pub(crate) fn copies_of(inc: &slates_merge::engine::Increment) -> Vec<MadeCopy> {
   inc

@@ -223,7 +223,11 @@
 > branch): kept in an index fork and recorded as a push's are (`Source::Made`, the green's key and the version beside
 > the revisions) in the submit's own transaction; a line's or bookmark's head is the made changeset while its version
 > is the green's head, else the one a push named (`hg_made::head_of`), and a recovery puts the made node back from the
-> record. Owed: copies as file revisions naming their source; merges' second parents; the holders' changesets.
+> record. Copies BUILT: a path a work copied (A-626 part 4's `WorkOp::Copy`, a file or under a copied directory) is a
+> file revision whose block names its source and the source's node (`copy`, `copyrev`) with a null first parent,
+> held to stock 7.2's nodes for `hg cp` unchanged and changed (`push::made`'s test) and through a submit (`hg_made`'s).
+> Owed: merges' second parents; the holders' changesets; a directory copy's paths as files (the version names the
+> tree at its destination alone).
 > **A-720 (2026-11-20, w-hg; main's ruling after w-perf's 57,036-changeset push tripped the watchdog: a push's working
 > set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
 > push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
