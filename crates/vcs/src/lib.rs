@@ -69,6 +69,7 @@
 pub mod arrival;
 pub mod cold;
 pub mod content;
+pub mod cut;
 pub mod derived;
 pub mod index;
 pub mod rule;
