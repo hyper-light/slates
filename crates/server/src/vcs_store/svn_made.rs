@@ -60,7 +60,6 @@ const MERGEINFO: &[u8] = b"svn:mergeinfo";
 const NANOS_PER_MICRO: i64 = 1_000;
 
 /// Why no revision was made of a version (module docs).
-#[derive(Debug)]
 enum Unmade {
   /// The version is not the one after the records' youngest revision, or not the green's head.
   NotNext,
@@ -74,6 +73,21 @@ enum Unmade {
   Digest,
   /// The step refused it.
   Step(Uncommitted),
+}
+
+/// Written out rather than derived, as a derived `Debug` is all that reads the step's refusal and dead-code analysis
+/// ignores derived impls; the output is the derived one's.
+impl std::fmt::Debug for Unmade {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Unmade::NotNext => formatter.write_str("NotNext"),
+      Unmade::Copy => formatter.write_str("Copy"),
+      Unmade::Special => formatter.write_str("Special"),
+      Unmade::Unreadable => formatter.write_str("Unreadable"),
+      Unmade::Digest => formatter.write_str("Digest"),
+      Unmade::Step(refused) => formatter.debug_tuple("Step").field(refused).finish(),
+    }
+  }
 }
 
 /// Makes the revision of `green`'s `version`, where `green` is a Subversion repository's (module docs); counted.

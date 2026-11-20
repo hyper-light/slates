@@ -113,6 +113,25 @@ fn encoded(state: &mut ShardState, id: RepositoryId) {
   while turn(state, id) == Turned::More {}
 }
 
+/// Encodes repository `id`'s versions and expects the encodings' time and bytes learned on its usage row and the room
+/// it holds counted with its fragments: the bytes of the fragments kept.
+fn encoded_and_learned(state: &mut ShardState, id: RepositoryId) -> u64 {
+  use crate::vcs_store::git_encode::kept_bytes;
+  encoded(state, id);
+  let row = state.vcs_usage.usage(&id).expect("a row");
+  assert!(
+    row.derive_ns > 0 && row.derive_bytes > 0,
+    "the encodings learned: {row:?}"
+  );
+  let kept = kept_bytes(state, id);
+  assert!(kept > 0, "fragments kept");
+  assert_eq!(
+    super::held_by(state, id),
+    state.vcs_stores.objects_charged(id) + kept
+  );
+  kept
+}
+
 /// A-724 piece 4 (§4.17.5 "The cold trigger"). Do: push stock git's fixtures into a repository and encode its versions
 /// (as its first fetch would), then ask it to give back more than it holds of fragments, at a pressure, with no fetch
 /// ever seen; then the same once its fetches outnumber its pushes a thousandfold. Expect: the encodings' time and bytes
@@ -126,18 +145,7 @@ fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_cost
   crate::daemon::audit_on_shard(|state| {
     let pushed = git_repository(state, "pushed");
     crate::git_push::tests::pushed_from_the_fixtures(state, pushed, &["create", "update"]);
-    encoded(state, pushed);
-    let row = state.vcs_usage.usage(&pushed).expect("a row");
-    assert!(
-      row.derive_ns > 0 && row.derive_bytes > 0,
-      "the encodings learned: {row:?}"
-    );
-    let kept = kept_bytes(state, pushed);
-    assert!(kept > 0, "fragments kept");
-    assert_eq!(
-      super::held_by(state, pushed),
-      state.vcs_stores.objects_charged(pushed) + kept
-    );
+    let kept = encoded_and_learned(state, pushed);
     let given = relieve(state, pushed, kept.saturating_mul(2), 2.0);
     assert_eq!(given, kept, "every version's fragments given back, exactly");
     assert_eq!(kept_bytes(state, pushed), 0);

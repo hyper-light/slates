@@ -403,10 +403,15 @@ struct Pending {
   brought: Vec<Brought>,
 }
 
+/// An empty content store of the tests' budget and window.
+fn empty_content() -> ContentStore {
+  ContentStore::new(BUDGET, WINDOW).expect("a content store")
+}
+
 impl Live {
   fn new() -> Live {
     Live {
-      content: ContentStore::new(BUDGET, WINDOW).expect("a content store"),
+      content: empty_content(),
       store: GitStore::new(FORMAT, WINDOW),
       records: Vec::new(),
       heads: BTreeMap::new(),
@@ -532,7 +537,7 @@ impl Live {
 
   /// The store made again from the records alone, as a recovery makes it.
   fn recovered(&self) -> Result<Live, ReplayRefused> {
-    let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
+    let mut content = empty_content();
     let mut store = GitStore::new(FORMAT, WINDOW);
     for record in &self.records {
       replay_git(&mut content, &mut store, record)?;
@@ -1017,6 +1022,12 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
     Err(ReplayRefused::Diverged)
   ));
   assert_eq!(store.facts(), before);
+  assert_a_head_nobody_sent_is_refused_and_leaves_nothing(&mut store, &before);
+}
+
+/// The last case of [`t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing`]: a record whose head names a
+/// commit nobody sent is refused by the store as `Missing`, and leaves `store`'s facts `before`.
+fn assert_a_head_nobody_sent_is_refused_and_leaves_nothing(store: &mut Live, before: &Facts) {
   let nobody = ObjectId::from_bytes(FORMAT, &[0x5a; 20]).expect("an id");
   let missing = RecordWriter::default()
     .finish(
@@ -1029,7 +1040,7 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
     replay_git(&mut store.content, &mut store.store, &missing),
     Err(ReplayRefused::Git(GitRefused::Store(_)))
   ));
-  assert_eq!(store.facts(), before);
+  assert_eq!(&store.facts(), before);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1082,46 +1093,8 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
     let (git, _) = repository(state, "git", VcsTool::Git);
     let (hg, _) = repository(state, "hg", VcsTool::Mercurial);
     let (svn, _) = repository(state, "svn", VcsTool::Subversion);
-    let stores = &state.vcs_stores;
-    assert!(matches!(
-      stores.store(git),
-      Some(RepositoryStore::Git(store)) if store.repository.format() == FORMAT
-    ));
-    assert!(matches!(
-      stores.store(hg),
-      Some(RepositoryStore::Mercurial(_))
-    ));
-    assert!(matches!(
-      stores.store(svn),
-      Some(RepositoryStore::Subversion(_))
-    ));
-    assert!(state.vcs_stores.mercurial(hg).is_some());
-    // Made with its record: Subversion's revision 0, an empty root.
-    let youngest = state
-      .vcs_stores
-      .subversion_records(svn)
-      .map(|records| records.youngest());
-    assert_eq!(youngest, Some(0));
-    let refused = [
-      (
-        hg,
-        ReplayRefused::Mercurial(slates_hg::import::record::Refused::Magic),
-      ),
-      (
-        svn,
-        ReplayRefused::SvnRecord(slates_svn::commit::record::RecordRefused::Magic),
-      ),
-    ];
-    for (repository, why) in refused {
-      let room = slates_svn::migration::Room {
-        entries: 0,
-        bytes: 0,
-      };
-      assert_eq!(
-        replay_into(&mut state.vcs_stores, repository, b"a record", Some(room)),
-        Err(why)
-      );
-    }
+    assert_each_tool_has_its_arm(state, [git, hg, svn]);
+    assert_bytes_that_are_no_record_are_refused(state, hg, svn);
     assert!(!super::replayed(state, hg, Err(ReplayRefused::Diverged)));
     assert!(!state.vcs_stores.holds(hg));
     assert_eq!(
@@ -1135,6 +1108,60 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
     }
     assert_eq!(state.vcs_stores.charged(), 0);
   });
+}
+
+/// The stores of [`t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it`]: each its tool's arm, git's
+/// in its record's format, Subversion's records at revision 0.
+fn assert_each_tool_has_its_arm(state: &mut ShardState, [git, hg, svn]: [RepositoryId; 3]) {
+  let stores = &state.vcs_stores;
+  assert!(matches!(
+    stores.store(git),
+    Some(RepositoryStore::Git(store)) if store.repository.format() == FORMAT
+  ));
+  assert!(matches!(
+    stores.store(hg),
+    Some(RepositoryStore::Mercurial(_))
+  ));
+  assert!(matches!(
+    stores.store(svn),
+    Some(RepositoryStore::Subversion(_))
+  ));
+  assert!(state.vcs_stores.mercurial(hg).is_some());
+  // Made with its record: Subversion's revision 0, an empty root.
+  let youngest = state
+    .vcs_stores
+    .subversion_records(svn)
+    .map(|records| records.youngest());
+  assert_eq!(youngest, Some(0));
+}
+
+/// The replays of [`t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it`]: bytes that are no record,
+/// refused by the Mercurial record's magic and by the Subversion record's kind.
+fn assert_bytes_that_are_no_record_are_refused(
+  state: &mut ShardState,
+  hg: RepositoryId,
+  svn: RepositoryId,
+) {
+  let refused = [
+    (
+      hg,
+      ReplayRefused::Mercurial(slates_hg::import::record::Refused::Magic),
+    ),
+    (
+      svn,
+      ReplayRefused::SvnRecord(slates_svn::commit::record::RecordRefused::Magic),
+    ),
+  ];
+  for (repository, why) in refused {
+    let room = slates_svn::migration::Room {
+      entries: 0,
+      bytes: 0,
+    };
+    assert_eq!(
+      replay_into(&mut state.vcs_stores, repository, b"a record", Some(room)),
+      Err(why)
+    );
+  }
 }
 
 /// A-662 (the wire's words for a store's refusal). Do: map a store's budget refusal, a record whose room the allocator
@@ -1524,13 +1551,7 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
     let (repository, root) = repository(state, "kernel", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
-    let mut abandoned = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
-    let arriving: Vec<Incoming<'_>> = first.iter().map(|brought| incoming(brought, 0)).collect();
-    abandoned.admit_all(state, &arriving).expect("admitted");
-    assert!(state.vcs_stores.charged() > 0);
-    abandoned.abandon(state);
-    assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
-    assert_eq!(state.vcs_stores.charged(), 0);
+    assert_an_abandoned_push_leaves_nothing(state, repository, &first);
     let first_tree = tree_of(&first);
     assert_eq!(
       push_through(state, (repository, root), &first, (None, one, first_tree)),
@@ -1562,6 +1583,21 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
     assert_eq!(state.vcs_stores.charged(), 0);
     assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
   });
+}
+
+/// A push of `objects` to `repository` admitted and abandoned leaves nothing held or charged.
+fn assert_an_abandoned_push_leaves_nothing(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  objects: &[Brought],
+) {
+  let mut abandoned = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
+  let arriving: Vec<Incoming<'_>> = objects.iter().map(|brought| incoming(brought, 0)).collect();
+  abandoned.admit_all(state, &arriving).expect("admitted");
+  assert!(state.vcs_stores.charged() > 0);
+  abandoned.abandon(state);
+  assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
+  assert_eq!(state.vcs_stores.charged(), 0);
 }
 
 /// The register holds one record a push, the second holding only what the first did not bring, and the store's

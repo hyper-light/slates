@@ -1242,6 +1242,35 @@ impl<S: Site> Parts<S> {
       }
     }
   }
+
+  /// The module doc's loop: takes `connection`'s steps until it ends or moves to another shard.
+  async fn serve(&mut self, connection: &mut Connection) -> Exit {
+    loop {
+      match self.step(connection).await {
+        Flow::Go => {}
+        Flow::End(why) => return Exit::Ended(why),
+        Flow::Move(shard) => return Exit::Moved(shard),
+      }
+    }
+  }
+
+  /// Takes `connection`'s next step.
+  async fn step(&mut self, connection: &mut Connection) -> Flow {
+    match connection.next_step() {
+      Next::Write => self.write(connection).await,
+      Next::Read => self.read(connection).await,
+      Next::Decide => self.decide(connection).await,
+      Next::Body(run) => {
+        let taken = self.take_body(run).await;
+        self.body_taken(connection, taken).await
+      }
+      Next::BodyEnd => self.body_end(connection).await,
+      Next::Reply => self.reply(connection).await,
+      Next::CloseWrite => self.close_write(),
+      Next::Drain => Flow::End(self.drain().await),
+      Next::Close => Flow::End(Why::Closed),
+    }
+  }
 }
 
 /// How a connection's loop left: it ended, or its connection moves to another shard.
@@ -1277,28 +1306,7 @@ async fn drive<S, M>(
     service: None,
     reply: Vec::new(),
   };
-  let exit = loop {
-    let flow = match connection.next_step() {
-      Next::Write => parts.write(&mut connection).await,
-      Next::Read => parts.read(&mut connection).await,
-      Next::Decide => parts.decide(&mut connection).await,
-      Next::Body(run) => {
-        let taken = parts.take_body(run).await;
-        parts.body_taken(&mut connection, taken).await
-      }
-      Next::BodyEnd => parts.body_end(&mut connection).await,
-      Next::Reply => parts.reply(&mut connection).await,
-      Next::CloseWrite => parts.close_write(),
-      Next::Drain => Flow::End(parts.drain().await),
-      Next::Close => Flow::End(Why::Closed),
-    };
-    match flow {
-      Flow::Go => {}
-      Flow::End(why) => break Exit::Ended(why),
-      Flow::Move(shard) => break Exit::Moved(shard),
-    }
-  };
-  match exit {
+  match parts.serve(&mut connection).await {
     Exit::Ended(why) => {
       count_end(parts.state, why, connection.ended());
       drop(seat);
