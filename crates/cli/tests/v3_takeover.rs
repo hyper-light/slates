@@ -421,23 +421,6 @@ fn repository_url(node: &Node) -> String {
   format!("https://127.0.0.1:{}/{REPOSITORY}", node.port)
 }
 
-/// Every principal may read and push the repository's refs on `node` (the takeover test's workaround, there).
-fn grant_every_principal_refs(node: &Node) {
-  use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
-  let mut client = slates_client::Client::connect(&node.instance, slates_api::deadlines()).unwrap();
-  let mut policy = client.describe_repository_policy(REPOSITORY).unwrap();
-  for right in [PolicyRight::Read, PolicyRight::Submit] {
-    policy.rules.push(PolicyRule {
-      names: PolicyNames::Refs,
-      pattern: "refs/".to_owned(),
-      right,
-      effect: PolicyEffect::Allow,
-      who: PolicyWho::Anyone,
-    });
-  }
-  client.set_repository_policy(REPOSITORY, &policy).unwrap();
-}
-
 /// [`PUSHES`] commits made in `work` and pushed to `url` one by one, each acknowledged: their ids, in push order.
 fn pushed_acknowledged(work: &str, token: &str, url: &str) -> Vec<String> {
   let mut acknowledged = Vec::new();
@@ -456,30 +439,20 @@ fn pushed_acknowledged(work: &str, token: &str, url: &str) -> Vec<String> {
 fn survivor_serving(
   nodes: &[Node],
   survivors: &[usize],
-  work: &str,
+  (work, token): (&str, &str),
 ) -> Option<(usize, String, String)> {
   survivors.iter().find_map(|at| {
-    let node = &nodes[*at];
-    let token = value_of(
-      &slates(&node.instance, &node.issuer, &["credential", "token"]).1,
-      "token",
-    )?;
-    remote_main(work, &token, &repository_url(node)).map(|head| (*at, head, token))
+    remote_main(work, token, &repository_url(&nodes[*at])).map(|head| (*at, head, token.to_owned()))
   })
 }
 
 /// What each of `survivors` answers, and what its takeover counted, so a failure names its cause.
-fn survivors_seen(nodes: &[Node], survivors: &[usize], work: &str) -> Vec<String> {
+fn survivors_seen(nodes: &[Node], survivors: &[usize], (work, token): (&str, &str)) -> Vec<String> {
   survivors
     .iter()
     .map(|at| {
       let node = &nodes[*at];
-      let own = value_of(
-        &slates(&node.instance, &node.issuer, &["credential", "token"]).1,
-        "token",
-      )
-      .unwrap_or_default();
-      let (code, out, err) = git(work, &own, &["ls-remote", &repository_url(node)]);
+      let (code, out, err) = git(work, token, &["ls-remote", &repository_url(node)]);
       let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
       let counted: Vec<&str> = status
         .lines()
@@ -508,17 +481,21 @@ fn survivors_seen(nodes: &[Node], survivors: &[usize], work: &str) -> Vec<String
 
 /// The survivor that serves the repository once the owner is gone, waited for under [`FLEET_WAIT`] three times over: its
 /// place, `main` there and its own token. Fails naming what each survivor answered.
-fn successor_after(nodes: &[Node], survivors: &[usize], work: &str) -> (usize, String, String) {
+fn successor_after(
+  nodes: &[Node],
+  survivors: &[usize],
+  (work, token): (&str, &str),
+) -> (usize, String, String) {
   let deadline = Instant::now() + FLEET_WAIT * 3;
   loop {
-    // A survivor's own credential (the owner's is gone with it), the repository's policy letting every principal in.
-    let found = survivor_serving(nodes, survivors, work);
+    // The client's own credential, minted on the owner: a credential is fleet state (A-764), so the successor knows it.
+    let found = survivor_serving(nodes, survivors, (work, token));
     if let Some((at, head, token)) = found {
       return (at, head, token);
     }
     if Instant::now() >= deadline {
       // What each survivor answers, and what its takeover counted, so a failure names its cause.
-      let seen = survivors_seen(nodes, survivors, work);
+      let seen = survivors_seen(nodes, survivors, (work, token));
       panic!("no survivor served the repository: {seen:#?}");
     }
     pause();
@@ -595,12 +572,8 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
     &["repository", "create", REPOSITORY, "--tool", "git"],
   );
   eprintln!("V3TAKEOVER: repository created on node {owner}");
-  // WORKAROUND, until w-fed-faults' fix lands (main's ruling of 2026-11-20): a credential minted on the owner is not
-  // known to the successor once the owner is gone (401), and a survivor's own token names its own account (403, A-237).
-  // So every principal may read and push the repository's refs, granted before the owner dies, and the client asks the
-  // successor with a survivor's own token. Remove this grant, and ask with the owner's token, once credentials survive
-  // their node; this test is that fix's red too.
-  grant_every_principal_refs(&nodes[owner]);
+  // The client's own credential, minted where it created the repository, is used on the successor too: a credential is
+  // fleet state since A-764 (w-fed-faults), so it survives its node's death (this test was that fix's red).
   let token =
     value_of(&run_ready(&nodes[owner], &["credential", "token"]), "token").expect("a token");
   // A fleet node's edge presents the node's own certificate (self-signed here): git is told not to verify it.
@@ -633,7 +606,7 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   eprintln!("V3TAKEOVER: owner killed, in-flight push answered {flight_code}");
   let survivors: Vec<usize> = (0..nodes.len()).filter(|at| *at != owner).collect();
   // The successor: the survivor whose edge answers `main` for the repository.
-  let (at, head, successor_token) = successor_after(&nodes, &survivors, &work);
+  let (at, head, successor_token) = successor_after(&nodes, &survivors, (&work, &token));
   eprintln!("V3TAKEOVER: node {at} serves main at {head}");
   let last = acknowledged.last().cloned().unwrap();
   assert!(
