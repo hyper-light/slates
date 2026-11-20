@@ -882,7 +882,10 @@ impl<S: SvnStores> SvnExchange<S> {
           Ok(plan) => plan,
           Err(refused) => return (Vec::new(), refused.answer()),
         };
-        let decision = match lent.locks.lock(&plan.request, &head, lent.now, room, draw) {
+        let decision = match lent
+          .locks
+          .lock(&plan.request, &head, lent.now, room, &mut || draw())
+        {
           Ok(decision) => decision,
           Err(refused) => {
             return (
