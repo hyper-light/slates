@@ -238,6 +238,136 @@ pub(crate) fn instance_processes(instance: &str) -> Vec<u32> {
   pids
 }
 
+/// Derived: how long a wait on the kernel's mount table may take to show a change: the observation budget, the longest
+/// any party here goes unobserved (one source, `slates_machine::budgets`). No CPU budget: the waiting process spends
+/// none, and the mount or unmount is the kernel's work (main's ruling, 2026-11-20).
+pub(crate) const MOUNT_TABLE_WAIT: Duration = STALL;
+
+/// Waits until `holds` (a reading of the mount table) holds, woken by the kernel's own word that the table changed,
+/// within [`MOUNT_TABLE_WAIT`], never by a poll (main's ruling, 2026-11-20): macOS's `EVFILT_FS` on a kqueue, raised at
+/// every mount, unmount and update [B: XNU `bsd/vfs/vfs_subr.c`, `filt_fsevent`]; Linux's `POLLPRI` on
+/// `/proc/self/mountinfo`, raised at each mount or unmount in the namespace, the file read to its end again after each to
+/// rearm it [B: man 5 proc_pid_mountinfo]. The table is read again after each word, and once registered, so a change
+/// between the first reading and the registration is not missed. Whether it held. Elsewhere (Windows, no table a user
+/// lists) `holds` is asked once.
+pub(crate) fn await_mount_table(mut holds: impl FnMut() -> bool) -> bool {
+  let deadline = Instant::now() + MOUNT_TABLE_WAIT;
+  let mut table = MountTableWord::new();
+  loop {
+    if holds() {
+      return true;
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() || !table.as_mut().is_some_and(|table| table.wait(left)) {
+      return holds();
+    }
+  }
+}
+
+/// The kernel's word that the mount table changed ([`await_mount_table`]).
+#[cfg(target_os = "macos")]
+struct MountTableWord(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "macos")]
+impl MountTableWord {
+  /// A kqueue with `EVFILT_FS` registered (cleared at each delivery); `None` where the kernel refuses one.
+  fn new() -> Option<MountTableWord> {
+    use std::os::fd::AsRawFd;
+    let queue = rustix::event::kqueue::kqueue().ok()?;
+    // SAFETY: an all-zero `kevent` is a valid value of the C struct (integers and a null pointer).
+    let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+    change.filter = libc::EVFILT_FS;
+    change.flags = libc::EV_ADD | libc::EV_CLEAR;
+    // SAFETY: `queue` is a live kqueue; one change of this frame's own is read and nothing is written back (no event
+    // buffer, a zero timeout).
+    let registered = unsafe {
+      libc::kevent(
+        queue.as_raw_fd(),
+        &raw const change,
+        1,
+        std::ptr::null_mut(),
+        0,
+        &libc::timespec {
+          tv_sec: 0,
+          tv_nsec: 0,
+        },
+      )
+    };
+    (registered == 0).then_some(MountTableWord(queue))
+  }
+
+  /// Waits up to `left` for the next change; whether the wait itself worked (a timeout is no failure).
+  fn wait(&mut self, left: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: an all-zero `kevent` is a valid value of the C struct.
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    let timeout = libc::timespec {
+      tv_sec: libc::time_t::try_from(left.as_secs()).unwrap_or(libc::time_t::MAX),
+      tv_nsec: libc::c_long::from(left.subsec_nanos()),
+    };
+    // SAFETY: `self.0` is a live kqueue; no change is passed and at most one event is written into this frame's own
+    // `event`, of the type the call writes.
+    let got = unsafe {
+      libc::kevent(
+        self.0.as_raw_fd(),
+        std::ptr::null(),
+        0,
+        &raw mut event,
+        1,
+        &raw const timeout,
+      )
+    };
+    got >= 0
+  }
+}
+
+/// The kernel's word that the mount table changed ([`await_mount_table`]).
+#[cfg(target_os = "linux")]
+struct MountTableWord(std::fs::File);
+
+#[cfg(target_os = "linux")]
+impl MountTableWord {
+  /// `/proc/self/mountinfo` opened and read to its end, armed; `None` where it cannot be read.
+  fn new() -> Option<MountTableWord> {
+    let mut word = MountTableWord(std::fs::File::open("/proc/self/mountinfo").ok()?);
+    word.rearm().then_some(word)
+  }
+
+  /// Reads the table to its end again, so the next change raises `POLLPRI`; whether it read.
+  fn rearm(&mut self) -> bool {
+    use std::io::{Read, Seek};
+    let mut drained = Vec::new();
+    self.0.rewind().is_ok() && self.0.read_to_end(&mut drained).is_ok()
+  }
+
+  /// Waits up to `left` for the next change, then rearms; whether the wait itself worked (a timeout is no failure).
+  fn wait(&mut self, left: Duration) -> bool {
+    let Ok(timeout) = rustix::time::Timespec::try_from(left) else {
+      return false;
+    };
+    let mut fds = [rustix::event::PollFd::new(
+      &self.0,
+      rustix::event::PollFlags::PRI,
+    )];
+    rustix::event::poll(&mut fds, Some(&timeout)).is_ok() && self.rearm()
+  }
+}
+
+/// No mount table word here (module docs of [`await_mount_table`]).
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+struct MountTableWord;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+impl MountTableWord {
+  fn new() -> Option<MountTableWord> {
+    None
+  }
+
+  fn wait(&mut self, _left: Duration) -> bool {
+    false
+  }
+}
+
 /// [`Judged::look`]'s rule, apart from the clocks it reads: the tree's CPU at the last progress (`then`) and now, how
 /// long since that progress, and the CPU it spent since the wait began.
 pub(crate) fn verdict(
@@ -371,3 +501,42 @@ fn a_tree_is_waited_on_while_it_gains_cpu_and_given_up_stalled_gone_or_spent() {
     "a tree that spent the wait's CPU budget without the answer is given up"
   );
 }
+
+/// The mount-table wait (main's ruling of 2026-11-20: a wait on the kernel waits on the kernel's own event, within a
+/// deadline from the liveness budget, never a poll). Do: wait on a reading that holds at once; then wait on one that
+/// never holds, counting its readings. Expect the first answered true with one reading; the second false, no sooner
+/// than [`MOUNT_TABLE_WAIT`], after at most [`MOUNT_TABLE_READINGS`] readings: the table is read again only at the
+/// kernel's word, where a poll at a harness's 20 ms pace reads it 500 times in that span.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_mount_table_wait_reads_the_table_at_the_kernels_word_not_on_a_poll() {
+  let mut readings = 0u32;
+  assert!(await_mount_table(|| {
+    readings += 1;
+    true
+  }));
+  assert_eq!(readings, 1, "a table that holds is answered at once");
+  let began = Instant::now();
+  let mut readings = 0u32;
+  let held = await_mount_table(|| {
+    readings += 1;
+    false
+  });
+  assert!(!held);
+  assert!(
+    began.elapsed() >= MOUNT_TABLE_WAIT,
+    "given up only at the deadline: {:?}",
+    began.elapsed()
+  );
+  assert!(
+    readings <= MOUNT_TABLE_READINGS,
+    "read {readings} times in {:?}: a poll, not the kernel's word",
+    began.elapsed()
+  );
+}
+
+/// Shape: the most readings a never-holding mount-table wait may take ([`a_mount_table_wait_reads_the_table_at_the_kernels_word_not_on_a_poll`]):
+/// the first and the last, and room for the mounts and unmounts other processes on a busy development machine make in
+/// the wait (each one word), far under a poll's hundreds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MOUNT_TABLE_READINGS: u32 = 20;

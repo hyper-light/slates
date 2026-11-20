@@ -816,15 +816,14 @@ pub(crate) fn mount_volume(
       mount
     }
   };
-  let started = Instant::now();
-  while !is_mounted(&mount.path) {
-    if started.elapsed() > MOUNT_WAIT {
-      return Err(Failure(format!(
-        "{} is not in the mount table after {MOUNT_WAIT:?}",
-        mount.path.display()
-      )));
-    }
-    pause();
+  // Awaited on the kernel's word that the table changed, never a poll (`process_wait::await_mount_table`, main's ruling
+  // of 2026-11-20), within the observation budget; until then polled within `MOUNT_WAIT`.
+  if !process_wait::await_mount_table(|| is_mounted(&mount.path)) {
+    return Err(Failure(format!(
+      "{} is not in the mount table after {:?}",
+      mount.path.display(),
+      process_wait::MOUNT_TABLE_WAIT
+    )));
   }
   Ok(mount)
 }
