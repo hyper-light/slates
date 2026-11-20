@@ -168,3 +168,9 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - A-752 R3 LANDED 4b6d5c24b (base 89a1d6c06): UNIT_BYTES -> the turn's Slices (server's copy_slice_bytes_within /
   archive_slice_bytes_within); RUN=16 -> the sort's own non-decreasing runs. t_a752 past_budget 0.
 - NEXT: A-760 (1b), w-svn answered (A-761 p2 28e57ac18: (BLAKE3, len) before the append, texts durable first).
+- A-760 part 1 LANDED b0f181da2 (tip 2e65566c5, base 990c83e77): Increment::named (BLAKE3+len runs in the post-state's
+  one address space), push_named / read_step (a copy slice a step via named::Objects) / unread; ContentUnread refused
+  before any verdict (server: ContentUnavailable); encoding carries names only when named (old encodings unchanged).
+  Tests: merge 408/408 incl. named_tests (4 MiB in 64 steps of <= 64 KiB, encoded < 4 KiB); server repository::,
+  work_home, vcs_store::, git_push:: green. NEXT part 2: commit's file blocks a slice a unit, published in one step;
+  server Objects over vcs_store's plane; replay reads runs first.
