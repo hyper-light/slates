@@ -13903,7 +13903,7 @@ signature verification).
 > closing read from its text, each kept and appended numbered its log's next, the markers in one batch) into a fork of
 > the index that takes its place whole, so the same index, on this node or a successor, which never reads the importing
 > host's directory (R8); an import's record only into an empty index. Proven on macOS arm64 (Mac
-> Studio, RUN-PENDING-STATUS). Owed: an imported repository's branch heads as lines (decision 1; a push after an import
+> Studio, kiln, 2026-11-20 00:20-00:23Z over main 574185afa merged: `slates-hg --lib import` 28 of 28, `slates-server --lib -- vcs_store:: repository::import repository::push repository::hg_push git_push` 61 of 61, fmt clean; red first, the recovery test failing with the Mercurial replay refused). Owed: an imported repository's branch heads as lines (decision 1; a push after an import
 > finds the root as its first line); a request forwarded from another node answered from its record; for a large
 > repository, the record and the bookmarks' works made in slices and the snapshot carrying the store's tables.
 
@@ -52483,7 +52483,20 @@ completion in one transaction; their tests), GAPS (the §4.17.3 entry).
   the markers log's state changes: they are facts the index keeps as rows (A-649), the served view reads them there,
   and the markers log is a push's (piece 7). Lines for the imported branch heads (decision 1) in this piece: the
   brief's scope was the record, the phase roots and the bookmarks; owed below.
-- **Tests** (RUN-PENDING-TESTS).
+- **Tests** (macOS arm64, Mac Studio, rustc 1.98.1): slates-hg's record tests (seven stores' records replayed row for
+  row and written again byte for byte, the `states` record's markers, hostile records by kind, every cut refused, any
+  byte changed never a panic, a push's record appended after an import's equal to the whole import, an import's record
+  refused `NotEmpty` before anything is made); the server's `t_a687_an_import_lands_its_record_phase_roots_and_bookmarks_in_one_entry`,
+  `t_a687_a_refused_landing_records_nothing_and_gives_back_everything` and
+  `t_a687_an_import_and_a_recovery_serve_the_same_repository` (the verb's import, then every green rebuilt and the store
+  made again from the log alone: the same rows, texts, phase roots and bookmarks' heads and identities); A-675's tests
+  landing their imports; A-680 part 2's view test serving the three changesets stock 7.2 serves once the import's roots
+  and bookmarks are in the register. Red first (kiln r496, `agents/g300-a687-red`, the Mercurial replay refused):
+  `--lib -- t_a687` 2 passed, 1 failed, the recovery test. Green (kiln, 2026-11-20 00:20-00:23Z, a04f48e7e over main
+  574185afa merged): `cargo test --locked -p slates-hg --lib import` 28 of 28, `-p slates-server --lib -- vcs_store::
+  repository::import repository::push repository::hg_push git_push --test-threads=4` 61 of 61, `cargo fmt --check`
+  clean. The first build (r333) found A-694's bug, fixed apart first. Main's: clippy, `xtask check`, the doc gates and
+  the other platforms.
 - **Owed.** An imported repository's branch heads as lines (decision 1): until then a push after an import finds the
   root as its first line, empty, and each bookmark's green holds its tree from the root's version, never shared with a
   line's; a request forwarded from another node answered from its record; for a large repository, the record and the

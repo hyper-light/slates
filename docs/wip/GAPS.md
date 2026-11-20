@@ -1071,7 +1071,7 @@
 > room it ran within), its state the phase roots it found, each bookmark a green bound to `bookmark:<label>:` made from
 > the root and moved by A-618's work; the index put in the store's place between the register's guard and the apply; a
 > recovery replays the record through the import's own steps into the same index, on any node (R8). Proven on macOS
-> arm64 (Mac Studio, RUN-PENDING-GAPS). Owed: an imported repository's branch heads as lines (decision 1; a push after
+> arm64 (Mac Studio, kiln, 2026-11-20 00:20-00:23Z: slates-hg import 28 of 28, the server's 61 of 61, fmt clean; red first). Owed: an imported repository's branch heads as lines (decision 1; a push after
 > an import finds the root as its first line); a forwarded request answered from its record; the record, the bookmarks'
 > works and the replay in slices for a large repository, and the snapshot carrying the store's tables.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
