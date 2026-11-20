@@ -1685,10 +1685,11 @@
 > Part 2, second slice, 2026-11-19 (A-695): where a URL leads. `slates_svn::find` ports `find_repos` (BadUrl, BadPath
 > after decoding, the root NoRepository); the repository is the longest run of the path's segments naming one, each
 > candidate asked of its name's shard, every shard once (`vcs_svn::locate`); one another shard owns moves the connection
-> there; every repository answers "No access allowed" until a mechanism exists. Red then green on macOS arm64 (Mac
+> there, where its records are read through the landed lender (`vcs_store::svn_view::lend_in`, A-681); every
+> repository answers "No access allowed" until a mechanism exists. Red then green on macOS arm64 (Mac
 > Studio, kiln r477, r508): svn find 21 of 21, server 9 of 9 (a two-shard daemon answering `svnserve`'s recorded
 > `no-access` session for repositories on both shards, one name with a `/`), cli 2 of 2. Owed: the authenticated
-> session's per-call sources through g297's shared lender (after A-692's CRAM-MD5); the tunnel's move to the owner
+> session's per-call sources through the same lender (after A-692's CRAM-MD5); the tunnel's move to the owner
 > (A-688 looks on its own shard alone) and its test over the SSH site; `svn_uri_canonicalize`.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos

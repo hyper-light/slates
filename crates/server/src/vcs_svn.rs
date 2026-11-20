@@ -43,14 +43,15 @@
 //! bounded by the seats ([`seat_arrival`]). So a repository is found and served on the shard whose partition holds its
 //! record and its store, read with no crossing.
 //!
-//! **Opened.** On the owner, no Subversion repository of the name is "No repository found in '…'" (210005). A
-//! repository whose store the shard does not hold closes the connection, counted. Otherwise the repository is opened
+//! **Opened.** On the owner, no Subversion repository of the name is "No repository found in '…'" (210005). Its records
+//! are read as the shared Subversion lender lends them there (`crate::vcs_store::svn_view::lend_in`, A-681): a
+//! repository whose records the shard does not hold closes the connection, counted. Otherwise the repository is opened
 //! with its UUID (also its realm, `svnserve`'s default), its root URL as `find_repos` derives it, and the mechanisms it
 //! allows: none yet, since a client that has not authenticated is no principal (§4.13), so no repository reads
 //! anonymously, and CRAM-MD5 waits on the keyed contexts of enrolled credentials (A-692). A repository that allows no
 //! one is answered as `svnserve` answers one, "No access allowed to this repository" (170001), and the connection ends.
-//! The authenticated session, each call's sources lent by the repository's store on its owner (the shared Subversion
-//! lender, g297's), follows once a mechanism does (GAPS, A-656).
+//! The authenticated session, each call's sources lent afresh by the same lender, follows once a mechanism does (GAPS,
+//! A-656).
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -71,6 +72,7 @@ use slates_svn::serve::{Connection, Limits, Sources, Turn};
 use crate::config::DaemonConfig;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
+use crate::vcs_store::svn_view::lend_in;
 
 /// Counter: a listener the control shard could not keep the state of, or whose task its arena refused.
 const NOT_STARTED: &str = "vcs_svn.not_started";
@@ -851,8 +853,9 @@ fn held(name: &str) -> Held {
     else {
       return Held::None;
     };
-    match state.vcs_stores.subversion_records(id) {
-      Some(records) => Held::Repository(records.uuid()),
+    // The records as the shared lender lends them on their owner (`vcs_store::svn_view`), the UUID its text.
+    match lend_in(state, id, |lent| Uuid::parse(lent.uuid.as_bytes())).flatten() {
+      Some(uuid) => Held::Repository(uuid),
       None => Held::NoStore,
     }
   })

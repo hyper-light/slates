@@ -15100,12 +15100,13 @@ and export by landing).
 > can call too), and a repository another shard owns moves the connection there whole (the socket's handle, the
 > connection with its answer read, its unread bytes and deadline), where it takes a seat as a new connection would
 > (every shard keeps the listener's seats). On the owner a name no Subversion repository has is "No repository
-> found"; a repository is opened with its UUID, its root URL (the client's URL less the components beneath the
+> found"; its records are read as the shared lender lends them there (`vcs_store::svn_view::lend_in`, A-681), and a
+> repository is opened with its UUID, its root URL (the client's URL less the components beneath the
 > repository) and the mechanisms it allows, none yet: a client that has not authenticated is no principal (§4.13), and
 > CRAM-MD5 waits on the keyed contexts of enrolled credentials (A-692), so every repository answers as `svnserve`
 > answers one that allows no one. Proven on a two-shard daemon against stock `svnserve` 1.15.0's recorded `no-access`
-> session, a repository on each shard. Owed: the authenticated session's sources, read each call through the shared
-> Subversion lender (g297's) once a mechanism exists; `svn_uri_canonicalize` before the lookup (a stock client's URL
+> session, a repository on each shard. Owed: the authenticated session's sources, read each call through the same lender
+> once a mechanism exists; `svn_uri_canonicalize` before the lookup (a stock client's URL
 > is already canonical); the tunnel's own move to the owner (A-688's site, which finds repositories on its shard
 > alone).
 
@@ -53457,8 +53458,9 @@ shard); `docs/cli.md`.
   handle, the connection with its answer read, its unread bytes and its deadline, one spawn on the owner's control
   channel; its seat here is given back as it leaves, and there it takes a seat as a new connection would (every shard
   keeps the listener's seats; arrivals waiting are bounded by the seats).
-- **Opened.** On the owner the record and the store are read again (a repository gone meanwhile is "No repository
-  found"; a store not held closes the connection, counted), and the repository is opened with its UUID, also its realm,
+- **Opened.** On the owner the record is read again and the store through the shared lender
+  (`vcs_store::svn_view::lend_in`, A-681, the records as it lends them to the DAV site; a repository gone meanwhile is
+  "No repository found"; records not held close the connection, counted), and the repository is opened with its UUID, also its realm,
   and the mechanisms it allows: none yet, since a client that has not authenticated is no principal (§4.13) and
   CRAM-MD5 waits on A-692's keyed contexts, so every repository answers "No access allowed to this repository", as
   `svnserve` answers one that allows no one.
@@ -53471,6 +53473,6 @@ shard); `docs/cli.md`.
   on the other shard and one there whose name holds a `/`, named through a path beneath it; `-p slates-cli --test cli
   -- vcs_svn svn_listeners` 2 of 2; `cargo fmt -p slates-svn -p slates-server -- --check` clean once rustfmt's three
   rewraps were applied as it wrote them.
-- **Owed.** The authenticated session's sources, read each call through the shared Subversion lender (g297's) once a
-  mechanism exists (A-692); the tunnel calling `locate` and moving its SSH connection to the owner, with its test over
+- **Owed.** The authenticated session's sources, read each call through the same lender once a mechanism exists
+  (A-692); the tunnel calling `locate` and moving its SSH connection to the owner, with its test over
   the SSH site; `svn_uri_canonicalize` before the lookup; the other platforms' runs (main's).
