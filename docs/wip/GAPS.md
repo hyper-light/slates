@@ -1583,6 +1583,14 @@
 > byte-identical and the matrix passes 29 of 29 (Mac Studio, debug). Over git/git's last 2,000 commits svnsync passes
 > but `svnrdump dump` (one `replay-range` of the whole history) gets shard 0 spinning 3.6 s and the daemon killed
 > after 53 MB: 28 of 29, owed to w-svn.
+> Since a469a6b85 (the listener yields while its client drains) `svnrdump dump` of that history finishes, 72 MB in 14 s:
+> 29 of 29.
+> **`slates repository policy` (w-interop, 2026-11-20; A-622, A-685's owed words):** the owner reads a repository's
+> policy (`DescribeRepositoryPolicy`, appended; `RepositoryPolicy` reply) and sets it from the version read, each
+> `--hook POINT=PROGRAM` replacing that point's hooks and every other part kept; a stranger's read or set is
+> `Forbidden`, a stale set `PolicyChanged`. By use: a pre-revprop-change hook set this way lets stock svn 1.15 change
+> a revision property over svn://. Found by use: with no hook such a change is taken (`change-rev-prop2`), where
+> svnserve refuses E165006; `svn_interop.rs` holds that test ignored for w-svn.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -2297,6 +2305,13 @@
 > entry the leader lacks (the integrator's diag-green-44269355181 arm64 run 7: leader at last log 6, follower at 7, same
 > term 1, no stuck dial), and the Windows two-region root whose new voters reported no committed root voter set (run
 > 44298844583, no stuck dial).
+> **Sweep (2026-11-20, w-forming; macOS arm64, Mac Studio adas-mac-studio-4, local, origin/main 69d1f2ec3 with A-735):**
+> the live_chaos fresh-member flow `a_member_that_never_held_the_log_never_stands_in_for_its_holder` 48 times under
+> `taskpolicy -b` (the one-CPU stand-in), nothing else of the worker's beside it: the fleet formed and settled in 48 of
+> 48 and the replaced member rejoined in 48 of 48; none of the three shapes above recurred. The test passed 47 of 48;
+> run 21 failed after forming, a successor owner's shard 0 spinning 5.6 s without a step right after its takeover
+> (watchdog exit 4; owed, w-forming's queue). An earlier sweep on the build before A-735 hung twice on a replaced
+> member's client claim (A-735).
 
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
@@ -2989,6 +3004,13 @@
 > in each form (`crates/bridge-fuse/src/shards_fs.rs`), and a daemon's stream taking it after an INIT that kept the
 > extended form, its root then shown as the run's (`crates/server/src/shards.rs`). Swept: no other intercept of the
 > stream reads a negotiated form. Owed: kiln's re-vendor and its macOS microVM drive (main's run).
+> **Fixed since (A-741, 2026-11-20, w-k90-vendor):** a connection that kept the extended form still sends a SETXATTR
+> its kernel sized before INIT's reply arrived in the short form (Linux `fuse_setxattr` sizes by `fc->setxattr_ext`
+> at the call; `fuse_block_alloc` holds it until the reply), and Shards' init sets the owner word just then: read in the
+> extended form alone, the word fell to the dispatch (`EOPNOTSUPP`) and kiln's macOS microVM g266 drive was refused
+> every write `EACCES`, intermittently (recorded on the Mac Studio: `SetXattr` node 1 from uid 0, `setxattr_ext=true`,
+> an 8-byte `fuse_setxattr_in`). The form is the request's own now (`abi::setxattr_head`), for the word and the
+> dispatch alike. Owed: kiln's re-vendor (with its drive's run).
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto

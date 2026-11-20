@@ -1663,6 +1663,17 @@ fn extended_setxattr_body(name: &[u8], value: &[u8], setter: u32) -> Vec<u8> {
   body
 }
 
+/// A SETXATTR of `name` set to `value` in the short form (`FUSE_COMPAT_SETXATTR_IN_SIZE`: size and flags, then the name
+/// and its NUL, then the value), as a kernel sends one it sized before its INIT's reply arrived (A-741).
+fn short_setxattr_body(name: &[u8], value: &[u8]) -> Vec<u8> {
+  let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  body.extend_from_slice(name);
+  body.push(0);
+  body.extend_from_slice(value);
+  body
+}
+
 /// Sends `bridge` the INIT a Linux guest's kernel sends, offering `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT`, and reads
 /// back whether its reply kept the extended form, as a transport reads its kernel's form of SETXATTR from the reply.
 fn init_keeps_the_extended_setxattr(bridge: &mut VolumeBridge<'_>, cx: &OpContext) -> bool {
@@ -1770,4 +1781,61 @@ fn a_guests_acl_set_from_outside_the_files_group_clears_its_set_group_id_bit() {
   }
   let short = ask(Opcode::SetXattr, flagged, &[0u8; 8]);
   assert_eq!(errno(&short), EIO, "a request short of the extended head");
+}
+
+/// A-741 (kiln goal 90). Linux sizes a `SETXATTR` by the form its connection holds when the call is made and sends it
+/// once `INIT`'s reply is in (`fs/fuse/xattr.c` `fuse_setxattr`, `fs/fuse/dev.c` `fuse_block_alloc`), so a call made
+/// before that reply arrived travels in the short form on a connection that kept the extended one. Do: over a guest's
+/// route that kept `FUSE_SETXATTR_EXT`, set `user.shards.note` in the short form, then `user.other` in the extended
+/// form. Expect each served and read back as set: the short one's name found at its own head, not 8 bytes in.
+#[test]
+fn a741_a_setxattr_sized_before_init_was_answered_is_served_on_a_route_that_kept_the_extended_form()
+{
+  let mut store = store();
+  let mut vol = owned_volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol
+    .create_file_no(&mut store, root, "noted.txt", 0o644)
+    .unwrap();
+  vol.chown(&mut store, file, RUN.0, RUN.1).unwrap();
+  let cx = test_cx();
+  let mut guest =
+    VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store).serving_a_guest();
+  let extended = init_keeps_the_extended_setxattr(&mut guest, &cx);
+  assert!(extended, "a guest's kernel is asked for the extended form");
+  {
+    use slates_bridge_core::Bridge as _;
+    guest.set_setxattr_ext(extended);
+  }
+  let mut unique = 1u64;
+  let mut ask = |opcode: Opcode, nodeid: u64, body: &[u8]| {
+    unique += 1;
+    exchange(
+      &mut guest,
+      &cx,
+      &message_as(opcode as u32, unique, nodeid, RUN, body),
+    )
+  };
+  let short = ask(
+    Opcode::SetXattr,
+    file.0,
+    &short_setxattr_body(b"user.shards.note", b"sized early"),
+  );
+  assert_eq!(errno(&short), 0, "the short form is served");
+  assert_eq!(
+    attribute_of(&mut ask, file.0, b"user.shards.note"),
+    Some(b"sized early".to_vec()),
+    "and its attribute reads back as set"
+  );
+  let long = ask(
+    Opcode::SetXattr,
+    file.0,
+    &extended_setxattr_body(b"user.other", b"sized late", 0),
+  );
+  assert_eq!(errno(&long), 0, "the extended form is served");
+  assert_eq!(
+    attribute_of(&mut ask, file.0, b"user.other"),
+    Some(b"sized late".to_vec()),
+    "and its attribute reads back as set"
+  );
 }
