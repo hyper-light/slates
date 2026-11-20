@@ -767,6 +767,12 @@ pub enum Op {
     /// The cut's bits after the change.
     bits: u8,
   },
+  /// A version-control credential was revoked elsewhere in the region (A-764): its record leaves if held, and its id is
+  /// held as revoked, so it is never enrolled again. Appended.
+  CredentialTombstoned {
+    /// The credential's id.
+    id: [u8; 32],
+  },
 }
 
 impl Op {
@@ -875,6 +881,7 @@ impl Op {
       Op::IdentitiesSet { .. } => "identities_set",
       Op::CredentialEnrolled { .. } => "credential_enrolled",
       Op::CredentialRevoked { .. } => "credential_revoked",
+      Op::CredentialTombstoned { .. } => "credential_tombstoned",
       Op::RepositoryRebuilt { .. } => "repository_rebuilt",
     }
   }

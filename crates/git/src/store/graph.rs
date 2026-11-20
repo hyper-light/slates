@@ -192,8 +192,8 @@ impl<'r> StoreGraph<'r> {
     }
     admission.charge(row.len)?;
     let place = Place::Indexed { row, content };
-    match Repository::bytes_of(self.store, id, &place) {
-      Ok(bytes) => Ok(Some(bytes)),
+    match self.repository.bytes_of(self.store, id, &place) {
+      Ok(bytes) => Ok(Some(bytes.into_owned())),
       Err(refused) => {
         self.failed(GraphFault::Store(refused));
         Ok(None)

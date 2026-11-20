@@ -1213,13 +1213,13 @@ impl Green {
     for path in &copied.creates {
       let ops = copied.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
       let (brought, at) = from(path);
-      let verdict = Green::copied_create(path, (&brought, at.as_str()), ops, &inc.post_state);
+      let verdict = Green::copied_create(path, (&brought, at.as_str()), ops, inc.post());
       record(effects, windows, verdict);
     }
     for (path, ops) in &copied.content {
       if !copied.creates.contains(path) {
         let (brought, at) = from(path);
-        let verdict = Green::copied_edit(path, (&brought, at.as_str()), ops, &inc.post_state);
+        let verdict = Green::copied_edit(path, (&brought, at.as_str()), ops, inc.post());
         record(effects, windows, verdict);
       }
     }
@@ -1341,7 +1341,7 @@ impl Green {
     path: &str,
     (brought, from): (&SourceAt<'_>, &str),
     ops: &[Op],
-    post_state: &[u8],
+    post_state: crate::named::Post<'_>,
   ) -> Result<Option<Effect>, ConflictWindow> {
     if brought.holds_node(from) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
@@ -1363,7 +1363,7 @@ impl Green {
     path: &str,
     (brought, from): (&SourceAt<'_>, &str),
     ops: &[Op],
-    post_state: &[u8],
+    post_state: crate::named::Post<'_>,
   ) -> Result<Option<Effect>, ConflictWindow> {
     let Some(source) = brought.content(from) else {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
@@ -1439,7 +1439,7 @@ impl Green {
     let Some(copied) = r.copied.as_deref() else {
       return Vec::new();
     };
-    let post_len = u64::try_from(inc.post_state.len()).unwrap_or(u64::MAX);
+    let post_len = inc.post().len();
     copied
       .content
       .iter()

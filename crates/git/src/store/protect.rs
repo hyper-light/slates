@@ -222,7 +222,7 @@ impl Repository {
     let place = self
       .locate(store, push, id)
       .ok_or(StoreRefused::Missing { id: *id })?;
-    let bytes = Repository::bytes_of(store, id, &place)?;
+    let bytes = self.bytes_of(store, id, &place)?;
     let commit = Commit::parse(&bytes, &mut Admission::new(store.room()))
       .map_err(|_| StoreRefused::Malformed { id: *id })?;
     let mut signature = Vec::new();

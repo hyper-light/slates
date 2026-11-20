@@ -10,21 +10,20 @@
 //! from the repository's index.
 //!
 //! **Checked from the quarantine** ([`Quarantined`]): the pack's checks and a verdict read each
-//! object's bytes back from the store, by name.
+//! object's bytes back by name, where it lies in the push's pack (main's ruling B part 2: the pack is
+//! kept as the client sent it, its objects never inflated beside it).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use slates_git::object_name::{Kind, ObjectId};
 use slates_git::receive::Repository;
-use slates_git::store::kind_of;
 use slates_git::store::views::IndexedObjects;
-use slates_git::store::{Push, Repository as GitRepository};
+use slates_git::store::{IndexBases, Push, Repository as GitRepository, stored_bytes};
 use slates_git::unpack::{self, Contents, Keep, Object};
 use slates_git::{Admission, Hold};
 use slates_vcs::ContentStore;
 
-use super::incoming_of;
 use crate::state::ShardState;
 use crate::vcs_store::{GitPush, GitRefused};
 
@@ -86,36 +85,28 @@ pub(super) struct Quarantined<'s> {
 
 impl Contents for Quarantined<'_> {
   fn content(&self, _at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    // The push's object is read where it is: in the store, lent with no copy where it is one window there (A-727 a1), or
+    // where it lies in the push's pack (`Push::bytes`, main's ruling B part 2), a REF_DELTA's base outside the push read
+    // from the index.
+    if let Some(push) = self.push {
+      let outside = IndexBases {
+        repository: self.repository,
+        store: self.store,
+      };
+      if let Some(read) = push.bytes(self.store, &outside, id) {
+        return read.ok();
+      }
+    }
     // An object the repository indexed already is passed over by the quarantine as it arrives (`admit_object`): a pack
     // that resends it is read back from the index (A-753; git's receive-pack takes such a pack).
-    let held = self
-      .push
-      .and_then(|push| push.object(id))
-      .and_then(|(number, content, len)| {
-        kind_of(number)?;
-        Some((content, len))
-      });
-    let (content, len) = match held {
-      Some(held) => held,
-      None => {
-        let (_, content, len) = self.repository.stored(self.store, id)?;
-        (content, len)
-      }
-    };
-    // An object of one window is that window in the store: lent with no copy where the store lends it (A-727 a1).
-    let mut windows = self.store.windows(&content);
-    if let (Some(window), None) = (windows.next(), windows.next())
-      && u64::try_from(window.len()).ok() == Some(len)
-    {
-      return Some(window);
-    }
-    self.store.object_bytes(&content, len).map(Cow::Owned)
+    let (_, content, len) = self.repository.stored(self.store, id)?;
+    stored_bytes(self.store, &content, len)
   }
 }
 
-/// Admits `queue`, the objects a session call resolved, to `quarantine` on the shard's state, then
-/// gives each one's hold back to `admission` (the module docs). Refused at the first object the
-/// store does not admit; every hold is given back whatever the outcome.
+/// Admits `queue`, the objects a session call resolved, to `quarantine` on the shard's state, each held where it lies in
+/// the push's pack ([`GitPush::admit_placed_all`]), then gives each one's hold back to `admission` (the module docs).
+/// Refused at the first object the store does not admit; every hold is given back whatever the outcome.
 pub(super) fn admit_queued(
   state: &mut ShardState,
   quarantine: &mut GitPush,
@@ -123,8 +114,7 @@ pub(super) fn admit_queued(
   admission: &mut Admission,
 ) -> Result<(), GitRefused> {
   let (objects, holds): (Vec<Object>, Vec<Hold>) = queue.into_values().unzip();
-  let incoming: Vec<_> = objects.iter().map(incoming_of).collect();
-  let admitted = quarantine.admit_all(state, &incoming);
+  let admitted = quarantine.admit_placed_all(state, objects);
   for hold in holds {
     admission.release(hold);
   }

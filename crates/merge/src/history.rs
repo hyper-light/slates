@@ -461,10 +461,11 @@ impl Value {
   pub(crate) fn applied_equals(
     &self,
     (chunks, blocks): (&Chunks, &Blocks),
-    (ops, post_state): (&[Op], &[u8]),
+    (ops, post_state): (&[Op], crate::named::Post<'_>),
     other: &Value,
   ) -> bool {
-    let Some(runs) = self.applied_runs(ops, post_state.len()) else {
+    let post_len = usize::try_from(post_state.len()).unwrap_or(usize::MAX);
+    let Some(runs) = self.applied_runs(ops, post_len) else {
       return false;
     };
     let len = runs
@@ -493,8 +494,11 @@ impl Value {
                 == chunks.bytes_of(blocks, &Piece { len: step, ..piece })
           }
           Applied::Post { src, .. } => {
-            post_state.get(src..src.saturating_add(step))
-              == Some(chunks.bytes_of(blocks, &Piece { len: step, ..piece }))
+            let added = post_state.span(
+              u64::try_from(src).unwrap_or(u64::MAX),
+              u64::try_from(step).unwrap_or(u64::MAX),
+            );
+            added.len() == step && *added == *chunks.bytes_of(blocks, &Piece { len: step, ..piece })
           }
         };
         if !same {
@@ -934,7 +938,11 @@ mod tests {
         ops_over(base_bytes.len() as u64, &raw)
       };
       let expected = apply(base_bytes, &ops, &post) == *head_bytes;
-      prop_assert_eq!(base.applied_equals((&chunks, files.blocks()), (&ops, &post), head), expected);
+      prop_assert_eq!(base.applied_equals(
+        (&chunks, files.blocks()),
+        (&ops, crate::named::Post::of(&post, &[])),
+        head,
+      ), expected);
     }
   }
 

@@ -1886,6 +1886,11 @@ pub enum GreenFence {
     /// The version the entry was acknowledged as.
     version: u64,
   },
+  /// The chain entry for `version` names content (A-760) the shard's content plane does not hold.
+  ContentMissing {
+    /// The version the entry was acknowledged as.
+    version: u64,
+  },
   /// Replaying the chain entry for `version` did not reach the head identity the entry recorded (A-257).
   IdentityDiverged {
     /// The version the entry was acknowledged as.
