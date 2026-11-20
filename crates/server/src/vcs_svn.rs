@@ -806,6 +806,10 @@ async fn step(
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
+  // Written: what follows (a revision property change's hooks, a commit's hook or landing, a lock verb) writes its own
+  // answer after it, never this again (a revision property change once wrote its trivial authentication request twice,
+  // which stock svn read as the change's success).
+  out.clear();
   follow(stream, conversation, next, out, seat).await
 }
 
@@ -1594,7 +1598,8 @@ async fn run_svn_hook(
 }
 
 /// No hook runs on Windows yet (the hook driver is Unix's alone, A-622 part 3): a point where the repository configures
-/// one refuses its change in the not-run words, as before A-730, and a point with none lets it go on.
+/// one refuses its change in the not-run words, as before A-730, and a point with none answers as `svnserve` does with
+/// none (`vcs_hooks::svn_told_unconfigured`): pre-revprop-change refuses every change (E165006), the rest go on.
 #[cfg(not(unix))]
 async fn run_svn_hook(
   policy: &slates_db::catalog::RepositoryPolicy,
@@ -1608,11 +1613,20 @@ async fn run_svn_hook(
     .hooks
     .iter()
     .any(|hook| HookPoint::of(hook.point) == point);
+  let unconfigured = match vcs_hooks::svn_told_unconfigured(point) {
+    Some(vcs_hooks::SvnTold::Failure(chain)) => Err(
+      chain
+        .into_iter()
+        .map(|error| (error.code, error.message))
+        .collect(),
+    ),
+    _ => Ok(()),
+  };
   HookAnswer {
     verdict: Some(if configured {
       Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
     } else {
-      Ok(())
+      unconfigured
     }),
     post_commit_error: None,
     token: None,
