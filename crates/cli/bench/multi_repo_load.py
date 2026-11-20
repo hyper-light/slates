@@ -224,7 +224,8 @@ def counters(daemon: Daemon) -> dict[str, int]:
 def shard_count(daemon: Daemon) -> int:
     """The daemon's shards, from its status report: the capacity the fair-share ideal divides (one core a shard)."""
     out = daemon.cli("status", "--json", check=False).stdout
-    counted = len(re.findall(r'"partition"\s*:', out))
+    # The report names each shard's partition more than once (its report and its signals), so count distinct ones.
+    counted = len(set(re.findall(r'"partition"\s*:\s*(\d+)', out)))
     return counted if counted else (os.cpu_count() or 1)
 
 
