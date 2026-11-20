@@ -33,6 +33,9 @@
 //! the entries put so far, a version's files at most. The parked submits of a green are bounded by the shard's client
 //! credit (`clients_per_shard × slots`, the bound `crate::base_wait` keeps), every request that can be in flight; a
 //! submit past it is refused `Overloaded`, counted ([`PARK_REFUSED`]), and a retry of a parked request joins its entry.
+//! A parked submit waits at most the node's failover delay (`ShardState::failover_ns`, the most a reply is held, the
+//! bound `crate::base_wait` keeps): at each slice one that has waited longer is answered `Overloaded`, unrecorded, so its
+//! retry runs, counted ([`OVERDUE`]).
 //!
 //! **Cancellation.** The build lives in the store's map, keyed by its green, and its task holds the key alone: a task
 //! cancelled between slices leaks nothing, and freeing the repository gives back every hold the build took and runs its
@@ -65,6 +68,12 @@ pub(crate) const MOVED: &str = "vcs_store.paths.whole_build.moved";
 pub(crate) const RESTARTED: &str = "vcs_store.paths.whole_build.restarted";
 /// Counter: a submit parked behind a whole build. Format: a counter name in the daemon's status report.
 pub(crate) const PARKED: &str = "vcs_store.paths.whole_build.parked";
+/// Counter: a parked submit answered `Overloaded` once it waited past the node's failover delay; zero is the healthy
+/// reading. Format: a counter name in the daemon's status report.
+pub(crate) const OVERDUE: &str = "vcs_store.paths.whole_build.overdue";
+/// Counter: an overdue submit's answer not handed on (its route's shard did not take it). Format: a counter name in the
+/// daemon's status report.
+const UNDELIVERED: &str = "vcs_store.paths.whole_build.overdue_undelivered";
 /// Counter: a submit refused at the parked bound. Format: a counter name in the daemon's status report.
 pub(crate) const PARK_REFUSED: &str = "vcs_store.paths.whole_build.park_refused";
 
@@ -225,6 +234,8 @@ fn slice(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
     return false;
   };
   state.count(SLICES, 1);
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  answer_overdue(state, &mut build, (now, state.failover_ns));
   let head = state.greens.get(&green).map(|engine| engine.head());
   match head {
     Some(head) if head == build.version => {}
@@ -381,6 +392,22 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
   crate::verbs::resume_all(state, parked);
 }
 
+/// Answers each submit parked behind `build` that has waited past `bound_ns` at `now_ns` (module docs, "Bounds"):
+/// `Overloaded`, unrecorded, so its retry runs; counted ([`OVERDUE`]).
+fn answer_overdue(state: &mut ShardState, build: &mut Build, (now_ns, bound_ns): (u64, u64)) {
+  let (overdue, waiting): (Vec<ParkedSubmit>, Vec<ParkedSubmit>) =
+    std::mem::take(&mut build.parked)
+      .into_iter()
+      .partition(|parked| parked.overdue(now_ns, bound_ns));
+  build.parked = waiting;
+  for parked in overdue {
+    state.count(OVERDUE, 1);
+    if !crate::verbs::answer_overdue(state, parked) {
+      state.count(UNDELIVERED, 1);
+    }
+  }
+}
+
 /// Parks `submit` behind `green`'s build (module docs): a retry of a parked request joins its entry, taking its route.
 /// `Overloaded` past the shard's client credit, or for a green with no build under way.
 pub(crate) fn park(
@@ -461,5 +488,18 @@ pub(crate) fn step_once(state: &mut ShardState) {
   let greens: Vec<DbVolumeId> = state.vcs_stores.whole_builds.0.keys().copied().collect();
   for green in greens {
     slice(state, green, 0);
+  }
+}
+
+/// Answers the submits parked behind each build of the shard that, at `now_ns`, have waited past `bound_ns`: what a
+/// test that cannot wait out a failover delay runs.
+#[cfg(test)]
+pub(crate) fn answer_overdue_at(state: &mut ShardState, (now_ns, bound_ns): (u64, u64)) {
+  let greens: Vec<DbVolumeId> = state.vcs_stores.whole_builds.0.keys().copied().collect();
+  for green in greens {
+    if let Some(mut build) = state.vcs_stores.whole_builds.0.remove(&green) {
+      answer_overdue(state, &mut build, (now_ns, bound_ns));
+      state.vcs_stores.whole_builds.0.insert(green, build);
+    }
   }
 }
