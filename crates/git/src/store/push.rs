@@ -168,6 +168,11 @@ pub struct Push {
   pack: Vec<u8>,
   /// The objects of `pack`, by name. One entry an object: what names it to where it lies.
   placed: BTreeMap<ObjectId, Placed>,
+  /// The pack's objects whose rows landed, their holds still to give back a unit at a time ([`Push::give_back_turn`]):
+  /// none unless the push gives back in turns.
+  set_aside: BTreeMap<ObjectId, Placed>,
+  /// Whether the pack's holds are given back in turns after the landing ([`Push::give_back_in_turns`]).
+  in_turns: bool,
   /// The objects of `pack` in the order they were admitted: the order the pack's reader resolved them, each delta after
   /// its base. Kept so staging reads each object just after its base, which the objects read lately then hold, rather
   /// than its whole chain again in its name's order (git/git's v1.5.0: chains 12.6 deep on average); one name an
@@ -191,6 +196,8 @@ impl Push {
       pack: Vec::new(),
       placed: BTreeMap::new(),
       order: Vec::new(),
+      set_aside: BTreeMap::new(),
+      in_turns: false,
       reading: RefCell::new(Scratch::default()),
     }
   }
@@ -549,25 +556,79 @@ impl Push {
     }
   }
 
-  /// Gives back the push's holds once its objects' rows hold them, leaving the push empty.
+  /// Gives back the push's holds once its objects' rows hold them, leaving the push empty. A push that gives back in
+  /// turns ([`Push::give_back_in_turns`]) sets its pack's holds aside instead, for [`Push::give_back_turn`].
   pub(crate) fn release_holds(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     self.commits.clear();
-    let placed = self.release_placed(store);
+    let placed = if self.in_turns {
+      self.put_aside();
+      Ok(())
+    } else {
+      self.release_placed(store)
+    };
     self.quarantine.abandon(store).and(placed)
   }
 
-  /// Gives back the holds of the pack's entries put in the content store, and the pack, leaving no object of it held.
+  /// Gives back the pack's holds a unit at a time once its objects land ([`Push::give_back_turn`]) rather than in the
+  /// landing's step: what its owner asks that turns them (a live push's answer, A-722's landing step).
+  pub fn give_back_in_turns(&mut self) {
+    self.in_turns = true;
+  }
+
+  /// One turn of giving back the holds set aside at the landing: a unit at least, then units until `quantum` is spent.
+  /// Whether none is left.
+  pub fn give_back_turn(
+    &mut self,
+    store: &mut ContentStore,
+    quantum: super::hook_view::Quantum<'_>,
+  ) -> Result<bool, ContentRefused> {
+    let deadline = quantum.clock.now_ns().saturating_add(quantum.ns);
+    loop {
+      let Some((_, placed)) = self.set_aside.pop_first() else {
+        return Ok(true);
+      };
+      if let Some(root) = placed.stored {
+        store.release(&root)?;
+      }
+      if quantum.clock.now_ns() >= deadline {
+        return Ok(self.set_aside.is_empty());
+      }
+    }
+  }
+
+  /// The pack's objects set aside, their holds to give back in turns; the pack and its reading let go.
+  fn put_aside(&mut self) {
+    let placed = core::mem::take(&mut self.placed);
+    if self.set_aside.is_empty() {
+      self.set_aside = placed;
+    } else {
+      self.set_aside.extend(placed);
+    }
+    self.let_go();
+  }
+
+  /// Gives back the holds of the pack's entries put in the content store, those set aside included, and the pack,
+  /// leaving no object of it held.
   fn release_placed(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     let mut first = Ok(());
-    for placed in core::mem::take(&mut self.placed).into_values() {
+    let set_aside = core::mem::take(&mut self.set_aside);
+    for placed in core::mem::take(&mut self.placed)
+      .into_values()
+      .chain(set_aside.into_values())
+    {
       if let Some(root) = placed.stored {
         first = first.and(store.release(&root).map(drop));
       }
     }
+    self.let_go();
+    first
+  }
+
+  /// Lets go of the pack, its order and its reading.
+  fn let_go(&mut self) {
     self.pack = Vec::new();
     self.order = Vec::new();
     *self.reading.get_mut() = Scratch::default();
-    first
   }
 
   /// The rows staged, if the push was staged.
