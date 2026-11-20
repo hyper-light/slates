@@ -148,7 +148,9 @@
 > shard's chunk arena of the anchor's content object, its table in the shard image recovered before the records, records
 > naming identities (git v3: names + the pack's root identity), entries waiting on the next image barrier (group commit).
 > (a1) BUILT: `ContentStore::windows`/`window_at` answer `Cow` (a sealed arena window is copied out), every reader in
-> git, hg, the server and vcs moved over; lists and tables stay lent (`get`). OWED: (a2) arena storage, (a3) image table
+> git, hg, the server and vcs moved over; lists and tables stay lent (`get`). (a2) step 1 BUILT: windows kept through a
+> `WindowStorage` seam (`HeapWindows` for tests and tools; `ContentStore::with_storage`), read by `bytes_of`, sized by `len_of`.
+> OWED: (a2) step 2 the daemon's arena storage (a repository chunk store per home shard, own pool owner-tag range), (a3) image table
 > + recovery order, (b) git v3, (c) svn, (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
