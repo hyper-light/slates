@@ -83,6 +83,7 @@ fn replay_repository() -> Repository<'static> {
 fn served(fixture: &Fixture, client: &[u8], budget: Budget) -> Vec<u8> {
   let green = Served(&fixture.green);
   let locks = LockTable::new();
+  let texts = crate::commit::drive::HeldTexts::new();
   let sources = Sources {
     index: &fixture.index,
     repository: &green,
@@ -94,6 +95,7 @@ fn served(fixture: &Fixture, client: &[u8], budget: Budget) -> Vec<u8> {
       authz: None,
       filesystem: "repo",
     },
+    texts: &texts,
   };
   let mut out = Vec::new();
   let mut connection = Connection::new(LIMITS, &mut out).unwrap();

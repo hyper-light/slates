@@ -185,6 +185,8 @@ struct Replay {
   repository: Repository,
   transactions: u64,
   dates: BTreeMap<u64, String>,
+  /// Where its drives' new texts go (`commit::drive::TextSink`).
+  texts: crate::commit::drive::HeldTexts,
 }
 
 impl Replay {
@@ -195,6 +197,7 @@ impl Replay {
       repository: Repository::new(uuid, CREATED, RECORDS_ROOM).unwrap(),
       transactions: 0,
       dates: BTreeMap::new(),
+      texts: crate::commit::drive::HeldTexts::new(),
     }
   }
 
@@ -202,7 +205,14 @@ impl Replay {
   fn command(&self, drive: &mut Drive, item: &Value<'_>, out: &mut Vec<u8>) -> Step {
     let records = &self.repository;
     let step = drive
-      .command(records.index(), records, records.locks(), item, out)
+      .command(
+        records.index(),
+        records,
+        records.locks(),
+        &self.texts,
+        item,
+        out,
+      )
       .unwrap();
     match step {
       Step::Hook(_) => self.resume(drive, Ok(()), out),
@@ -219,7 +229,14 @@ impl Replay {
   ) -> Step {
     let records = &self.repository;
     drive
-      .resume(records.index(), records, records.locks(), answer, out)
+      .resume(
+        records.index(),
+        records,
+        records.locks(),
+        &self.texts,
+        answer,
+        out,
+      )
       .unwrap()
   }
 }
@@ -296,7 +313,7 @@ fn recorded_date(server: &[Read<'_>]) -> String {
 /// as the revision whole.
 fn commit_work(replay: &mut Replay, work: Work, date: &str, out: &mut Vec<u8>) {
   let now = crate::dav::request::svn_time(date).unwrap();
-  let revision = RevisionToCommit::of_work(work, now).unwrap();
+  let revision = RevisionToCommit::of_work(work, now, &replay.texts).unwrap();
   let record = crate::commit::record::Record::Revision(revision.clone());
   assert_eq!(
     crate::commit::record::Record::decode(&record.encode()),
@@ -341,7 +358,14 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
   for (item, _) in &client[at + 1..] {
     let records = &replay.repository;
     let mut step = drive
-      .command(records.index(), records, records.locks(), item, &mut out)
+      .command(
+        records.index(),
+        records,
+        records.locks(),
+        &replay.texts,
+        item,
+        &mut out,
+      )
       .unwrap();
     if let Step::Hook(due) = step {
       if let (Due::PreCommit { .. }, Some(race)) = (due, race) {
@@ -1338,7 +1362,14 @@ fn hooks_met(
   for (item, _) in items(commands) {
     let records = &replay.repository;
     let mut step = drive
-      .command(records.index(), records, records.locks(), &item, out)
+      .command(
+        records.index(),
+        records,
+        records.locks(),
+        &replay.texts,
+        &item,
+        out,
+      )
       .unwrap();
     if let Step::Hook(due) = step {
       dues.push(due);
@@ -1392,7 +1423,14 @@ fn refused_by_hook(replay: &Replay, refused: &str) -> (Option<Vec<(u64, String)>
   {
     let records = &replay.repository;
     let mut step = drive
-      .command(records.index(), records, records.locks(), &item, &mut out)
+      .command(
+        records.index(),
+        records,
+        records.locks(),
+        &replay.texts,
+        &item,
+        &mut out,
+      )
       .unwrap();
     if let Step::Hook(due) = step {
       let hook = match due {
@@ -1466,7 +1504,14 @@ fn opened_with(
   for (item, _) in items(b"( open-root ( ( 3 ) 2:d0 ) ) ") {
     let records = &replay.repository;
     let step = drive
-      .command(records.index(), records, records.locks(), &item, &mut out)
+      .command(
+        records.index(),
+        records,
+        records.locks(),
+        &replay.texts,
+        &item,
+        &mut out,
+      )
       .unwrap();
     last = kind_of(&step);
   }
@@ -1519,7 +1564,14 @@ fn an_item_while_a_hook_is_due_or_a_resume_with_none_ends_the_drive() {
   let mut out = Vec::new();
   let mut steps = Vec::new();
   for (item, _) in items(DIRECTORY_PROPERTY).into_iter().take(2) {
-    let step = drive.command(records.index(), records, records.locks(), &item, &mut out);
+    let step = drive.command(
+      records.index(),
+      records,
+      records.locks(),
+      &replay.texts,
+      &item,
+      &mut out,
+    );
     steps.push(kind_of(&step.unwrap()));
   }
   let mut idle = Drive::new(alice_setup("/trunk/project", Vec::new()));
@@ -1555,9 +1607,9 @@ fn a_revision_judged_at_a_moved_head_is_refused_by_the_records() {
   let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let second = accepted_work(&replay, "/trunk/project/sub", DIRECTORY_PROPERTY);
   let now = AprTime(1_795_073_195_123_456);
-  let second = RevisionToCommit::of_work(second, now).unwrap();
+  let second = RevisionToCommit::of_work(second, now, &replay.texts).unwrap();
   assert_eq!(replay.repository.commit(second), Ok(4));
-  let first = RevisionToCommit::of_work(first, now).unwrap();
+  let first = RevisionToCommit::of_work(first, now, &replay.texts).unwrap();
   let refusal = replay.repository.commit(first).unwrap_err();
   let answered = (refusal.subversion_code(), refusal.message());
   assert_eq!(answered, (160_028, "Transaction out of date".to_owned()));
@@ -1599,9 +1651,9 @@ fn t_a655_a_work_judged_at_a_moved_head_is_merged_again_and_lands() {
   let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let second = accepted_work(&replay, "/trunk/project/sub", DIRECTORY_PROPERTY);
   let now = AprTime(1_795_073_195_123_456);
-  let second = RevisionToCommit::of_work(second, now).unwrap();
+  let second = RevisionToCommit::of_work(second, now, &replay.texts).unwrap();
   assert_eq!(replay.repository.commit(second), Ok(4));
-  let first = RevisionToCommit::of_work(first, now).unwrap();
+  let first = RevisionToCommit::of_work(first, now, &replay.texts).unwrap();
   let rows = first.record.changes.clone();
   let checked = replay
     .repository
@@ -1625,9 +1677,9 @@ fn t_a655_a_moved_work_that_conflicts_is_refused_in_the_verdicts_words() {
   let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let second = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let now = AprTime(1_795_073_195_123_456);
-  let second = RevisionToCommit::of_work(second, now).unwrap();
+  let second = RevisionToCommit::of_work(second, now, &replay.texts).unwrap();
   assert_eq!(replay.repository.commit(second), Ok(4));
-  let first = RevisionToCommit::of_work(first, now).unwrap();
+  let first = RevisionToCommit::of_work(first, now, &replay.texts).unwrap();
   let refusal = replay
     .repository
     .check_work(first, &alices_locks(), now)
@@ -1669,7 +1721,14 @@ fn read_at_pre_commit(
   for (item, _) in items(commands) {
     let records = &replay.repository;
     let mut step = drive
-      .command(records.index(), records, records.locks(), &item, &mut out)
+      .command(
+        records.index(),
+        records,
+        records.locks(),
+        &replay.texts,
+        &item,
+        &mut out,
+      )
       .unwrap();
     if let Step::Hook(due) = step {
       if let Due::PreCommit { .. } = due {
@@ -1723,7 +1782,11 @@ fn pre_commits_lock_tokens_name_each_path_as_the_client_sent_it() {
   .into_iter()
   .map(|(path, token)| (path.to_owned(), token.to_owned()))
   .collect();
-  let (rows, texts, property_lists) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+  let (rows, texts, property_lists) = (
+    BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+    BTreeMap::new(),
+  );
   let pending = |base_path| Pending {
     transaction: "0-0",
     base: 0,
@@ -1749,4 +1812,80 @@ fn pre_commits_lock_tokens_name_each_path_as_the_client_sent_it() {
       pair("trunk/with space/sub/c.txt", "opaquelocktoken:c")
     ]
   );
+}
+
+/// Shape: the request room of the large-text test's drive, far below its text: room for the window being read (a
+/// window's svndiff arrives whole before it is applied, at most about [`crate::svndiff::WINDOW_LIMIT`] of new data and
+/// its instructions) with a chunk of the next, a quarter of the text.
+const SMALL_ROOM: usize = 256 << 10;
+
+/// Shape: the large-text test's text, in deltifier windows (`SVN_DELTA_WINDOW_SIZE`): 1 MB, four times the room.
+const LARGE_TEXT_WINDOWS: usize = 10;
+
+/// Shape: the bytes of svndiff one `textdelta-chunk` carries in the large-text test, as a client splits a delta.
+const CHUNK: usize = 16 << 10;
+
+/// §4.17.1 "A push's intake", rules 1 and 2 (main's order of 2026-11-20: stock svn's 500 MB commit was refused E210009
+/// by one request's room, its texts held whole). Do: over an empty repository, with a drive whose request room is
+/// [`SMALL_ROOM`], add a file whose [`LARGE_TEXT_WINDOWS`]-window text of noisy bytes arrives as svndiff in [`CHUNK`]
+/// pieces, then close the edit. Expect: the work accepted, its one text named by the bytes' BLAKE3 and sealed in the
+/// sink whole, no text left staged; the drive never held more than the room. Before, the drive held the text and was
+/// refused `Room` (E210009) as the text passed the room.
+#[test]
+fn a_text_larger_than_the_request_room_is_streamed_into_the_sink_and_accepted() {
+  use crate::svndiff::{Compression, Encoder, Version, WINDOW_LIMIT, deltas};
+  let replay = Replay::new();
+  let window = usize::try_from(WINDOW_LIMIT).unwrap();
+  let mut state = 7u64;
+  let text: Vec<u8> = (0..LARGE_TEXT_WINDOWS * window)
+    .map(|_| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state.to_le_bytes()[0]
+    })
+    .collect();
+  let mut encoder = Encoder::new(Version::Zero);
+  let mut svndiff = encoder.header().to_vec();
+  let room = std::num::NonZeroUsize::new(window).unwrap();
+  for made in deltas(&[], &text, room).unwrap() {
+    encoder
+      .window(&made, Compression::Stored, &mut svndiff)
+      .unwrap();
+  }
+  let mut commands = b"( open-root ( ( 0 ) 2:d0 ) ) ( add-file ( 7:big.bin 2:d0 2:c1 ( ) ) ) \
+( apply-textdelta ( 2:c1 ( ) ) ) "
+    .to_vec();
+  for piece in svndiff.chunks(CHUNK) {
+    commands.extend_from_slice(format!("( textdelta-chunk ( 2:c1 {}:", piece.len()).as_bytes());
+    commands.extend_from_slice(piece);
+    commands.extend_from_slice(b" ) ) ");
+  }
+  commands.extend_from_slice(
+    b"( textdelta-end ( 2:c1 ) ) ( close-file ( 2:c1 ( ) ) ) ( close-dir ( 2:d0 ) ) ( close-edit ( ) ) ",
+  );
+  let mut setup = alice_setup("/", Vec::new());
+  setup.room = SMALL_ROOM;
+  let mut drive = Drive::new(setup);
+  let mut out = Vec::new();
+  let mut accepted = None;
+  for (item, _) in items(&commands) {
+    match replay.command(&mut drive, &item, &mut out) {
+      Step::Accepted(work) => accepted = Some(*work),
+      Step::Refused => panic!("refused: {}", String::from_utf8_lossy(&out)),
+      _ => {}
+    }
+  }
+  let work = accepted.expect("the work accepted");
+  let identity = *blake3::hash(&text).as_bytes();
+  assert_eq!(
+    work.texts.iter().copied().collect::<Vec<_>>(),
+    vec![identity]
+  );
+  let sealed = TextSink::sealed(&replay.texts, &identity).map(|bytes| bytes.into_owned());
+  assert!(
+    sealed.as_deref() == Some(text.as_slice()),
+    "the text sealed whole"
+  );
+  assert_eq!(replay.texts.staged_count(), 0);
 }

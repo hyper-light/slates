@@ -99,6 +99,8 @@ pub struct World<'a, G: ?Sized> {
   pub green: &'a G,
   /// The locks.
   pub locks: &'a LockTable,
+  /// Where the commit's new texts go, a window at a time (§4.17.1 rule 1).
+  pub texts: &'a dyn crate::commit::drive::TextSink,
 }
 
 /// The caller's answer to a hook due: passed, or its errors, outermost first.
@@ -939,7 +941,7 @@ impl DavCommit {
     }
     let edited = self
       .drive
-      .edit(world.index, world.green, world.locks, command);
+      .edit(world.index, world.green, world.locks, world.texts, command);
     self.edit_step(edited)
   }
 
@@ -954,7 +956,7 @@ impl DavCommit {
     }
     let edited = self
       .drive
-      .resume_edit(world.index, world.green, world.locks, answer);
+      .resume_edit(world.index, world.green, world.locks, world.texts, answer);
     self.edit_step(edited)
   }
 

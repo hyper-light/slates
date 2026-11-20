@@ -106,10 +106,12 @@ fn a_posts_skel_names_the_revision_properties_the_principal_authors() {
 fn a_commit_over_http_adds_a_directory_and_a_file_and_lands_as_revision_one() {
   let mut repository = empty();
   let hooks: Hooks<'_> = &passed;
+  let sink = crate::commit::drive::HeldTexts::new();
   let world = World {
     index: repository.index(),
     green: &repository,
     locks: repository.locks(),
+    texts: &sink,
   };
   let mut commit = DavCommit::begin(setup(&repository), &world, hooks).unwrap();
   let made = commit.mkcol(&world, hooks, "/trunk").status;
@@ -131,13 +133,20 @@ fn a_commit_over_http_adds_a_directory_and_a_file_and_lands_as_revision_one() {
     .iter()
     .map(|row| row.path.clone())
     .collect();
-  let texts: Vec<Vec<u8>> = work.texts.values().cloned().collect();
+  let texts: Vec<Vec<u8>> = work
+    .texts
+    .iter()
+    .filter_map(|identity| {
+      use crate::commit::drive::TextSink;
+      sink.sealed(identity).map(|bytes| bytes.into_owned())
+    })
+    .collect();
   let log = work
     .revision_properties
     .iter()
     .find(|(name, _)| name.as_slice() == b"svn:log")
     .map(|(_, value)| value.clone());
-  let committed = repository.commit(RevisionToCommit::of_work(*work, NOW).unwrap());
+  let committed = repository.commit(RevisionToCommit::of_work(*work, NOW, &sink).unwrap());
   assert_eq!(
     (
       made,
@@ -171,10 +180,12 @@ fn a_commit_over_http_adds_a_directory_and_a_file_and_lands_as_revision_one() {
 fn a_refused_request_ends_its_transaction() {
   let repository = empty();
   let hooks: Hooks<'_> = &passed;
+  let sink = crate::commit::drive::HeldTexts::new();
   let world = World {
     index: repository.index(),
     green: &repository,
     locks: repository.locks(),
+    texts: &sink,
   };
   let mut commit = DavCommit::begin(setup(&repository), &world, hooks).unwrap();
   let put = Put {
@@ -226,10 +237,12 @@ fn an_if_header_presents_its_lock_tokens_and_no_resource_tag() {
 fn a_puts_body_taken_a_byte_at_a_time_makes_the_text_it_makes_whole() {
   let repository = empty();
   let hooks: Hooks<'_> = &passed;
+  let sink = crate::commit::drive::HeldTexts::new();
   let world = World {
     index: repository.index(),
     green: &repository,
     locks: repository.locks(),
+    texts: &sink,
   };
   let mut commit = DavCommit::begin(setup(&repository), &world, hooks).unwrap();
   let start = PutStart {
@@ -247,7 +260,14 @@ fn a_puts_body_taken_a_byte_at_a_time_makes_the_text_it_makes_whole() {
   let Merged::Accepted(work) = commit.merge(&world, hooks) else {
     panic!("the MERGE was refused");
   };
-  let texts: Vec<Vec<u8>> = work.texts.values().cloned().collect();
+  let texts: Vec<Vec<u8>> = work
+    .texts
+    .iter()
+    .filter_map(|identity| {
+      use crate::commit::drive::TextSink;
+      sink.sealed(identity).map(|bytes| bytes.into_owned())
+    })
+    .collect();
   assert_eq!(
     (taken, ended, texts),
     (true, 201, vec![b"hello\n".to_vec()])
