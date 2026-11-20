@@ -6423,7 +6423,11 @@
 >   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
 >   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a
 >   process handle keeps no object the process named, so neither the bootstrap name nor the owner's token outlives the
->   daemon and no successor's takeover is refused (A-176). The macOS region fetch since A-452 (2026-11-18, g251): it
+>   daemon and no successor's takeover is refused (A-176). That claim read the marks by copying the whole 64-byte header,
+  whose declared words (doorbell, claim mark, start stamp) a copy may not touch, so from 28c4f3839 every Windows
+  client's connect was refused `TouchesWord` (exit 4) and no WinFsp suite ran; since A-717 (2026-11-20, w-bugs) it
+  copies the marks' bytes alone (`a_claim_reads_the_process_marks_of_a_published_bootstrap_object`;
+  `docs/bugs/2026-11-20-every-windows-client-connect-was-refused-touchesword.md`). The macOS region fetch since A-452 (2026-11-18, g251): it
 >   waited a fixed second to send and again to receive, so an owner alive and slow to answer was reported gone and one
 >   that went away was reported keeping nothing; now neither has a timeout, a dead owner's port refuses the send and the
 >   kernel's send-once notification ends the receive (`a_fetch_answered_past_the_claim_wait_is_served`,
