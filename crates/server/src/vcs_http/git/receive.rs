@@ -235,7 +235,15 @@ impl<L: ShardLender> Receive<L> {
         .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
         .map_err(failed)?;
       match step {
-        Answering::Answered(_) => return Ok(true),
+        Answering::Answered(_) => {
+          // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): the report goes
+          // out after, or the push is refused, never lost with its owner.
+          drop(turn);
+          if !crate::state_log::names_committed_within(repository).await {
+            return Err(Failed(Status::SERVICE_UNAVAILABLE));
+          }
+          return Ok(true);
+        }
         Answering::Turned => {
           let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
           if due || *sent < given.len() && silent_until.is_some() {

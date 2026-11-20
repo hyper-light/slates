@@ -12406,8 +12406,14 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > the acknowledgments) written once both are known, the pack begun from the choice. Every v0 test's exchange is answered
 > both ways and held to the same bytes, refusal and counters (git's stateless exchanges, the cut-and-flip property);
 > made, a v0 answer has decided nothing, and a pack's takes more than one step. Before it, `serve_in_turns` answered v0
-> whole as the answer was made. Owed for git: a plan of scattered positions (16 bytes a run); the live `git clone` rows
-> of the matrix (main's).
+> whole as the answer was made. **Scattered plans bounded BUILT (same day):** `Positions` keeps whichever of three forms
+> costs least (Roaring's choice per container): runs, 16 bytes a run; a sorted list, 8 bytes a position; or a bit table
+> over its span, 8 bytes a 64; chosen as a set is made whole (`of`, a union, an intersection, a difference, a decoded
+> set), an insert keeping its form, equality by what a set holds, and its encoding its runs whatever its form, so what is
+> kept as content is unchanged. The negotiation's bit table is handed to the plan as it is (it had been turned back into
+> a run a position). So a plan costs at most 8 bytes an object, the handle it replaced: 3,000 positions every third
+> apart, 1,128 bytes where their runs cost 48,000 (`positions::tests`, an oracle against an ordered set over every
+> operation and form). Owed for git: the live `git clone` rows of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
@@ -55226,6 +55232,22 @@ Applied in the same change to:
   `vcs_share::turns::tests::a_repositorys_pushes_share_one_turn_a_round_of_the_shard` (three pushes of one repository
   took 3 turns between the small one's, now at most 1). Tests: slates-server `vcs_share:: git_push:: vcs_http::git
   vcs_ssh::` 106 of 106. The cap-3 and cap-10 by-use proof follows in BENCHMARKS.md.
+- **Acknowledged pushes lost at a takeover, found and fixed (2026-11-20; main's order: top item, A-636's author gone).**
+  `crates/cli/tests/v3_takeover.rs` (three `slates anchor --fleet` processes at f = 1, stock git over their HTTPS edges,
+  the owner SIGKILLed with a push in flight) was red on version-2 records: the successor adopted and rebuilt the
+  repository (`fleet.takeover.repository_adopted`, `repository_rebuilt`) and served it with no refs at all. The counters
+  named the cause: no record replayed (`vcs_store.replayed` absent, `repository_records` 0 on every partition). A push's
+  records were kept only in the owner partition's register ("the objects take no position", A-662), so nothing shipped
+  them. Fixed: a push's record is a change of the names log (`LoggedChange::Objects`, appended; db wire order pinned),
+  so it ships to the repository's candidates with the operation's identity and spans, a takeover keeps or drops the push
+  whole, and the successor's adoption puts the record back for the store's replay. A first run of the fix kept only the
+  first push: pushes acknowledged before their parts shipped were lost, so a push is now answered only once its names
+  log is held at f + 1 (`state_log::names_committed_within`, §4.8's commit rule; the HTTP and SSH edges wait on it before
+  the report). The test passes, 3 of 3 runs: every acknowledged push on the successor, in order, its clone whole by
+  `git fsck`. The test grants every principal read and push before the kill, a workaround until w-fed-faults' fix:
+  a credential minted on the owner is unknown to the successor (401) and a survivor's own token names its own account
+  (403). Tests: slates-db 18 suites; slates-server `takeover state_log vcs_store:: git_push:: vcs_http::git vcs_ssh::`
+  236 of 236.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -57294,3 +57316,37 @@ its RSS red test.
 
 **Applied in the same change to:** this entry; §4.17.1 "Objects" and "Durability and residency" (status lines); R1's
 reading (a status line); GAPS' §4.17 entry; `research/vcs-store-prior-art.md` (new).
+
+### A-768 — A live log's whole capture is read in turns from pinned chunks (2026-11-20, w-forming; main's order: slice the whole-record capture; §4.10 "Live shipping"; A-377, A-757, A-763)
+Applied in the same change to: GAPS (the live owner's long-turn line), `crates/vfs/src/content.rs` (`Chunk::pins`,
+`Pins`, `ChunkStore::pin_chunk`, `unpin_chunk`, `unpin_extents`, `pinned`, `freed_while_pinned`; `free_chunk` waits for
+the last pin), `crates/vfs/src/volume.rs` (`Volume::pin_extents`, `PinnedFile`), `crates/vfs/src/recover.rs` and
+`crates/server/src/vcs_store/arena_windows.rs` (a chunk record made unpinned), `crates/server/src/live_ship.rs`
+(`Capture`, `begin_capture`, `start_capture`, `advance_capture`, `pinned_capture`, `read_capture`, `finish_capture`,
+`release_capture`, `publish_body`, `whole_image`; `WholeBuild::capture`; `drop_build`, `forget` and a volume no longer
+live let a capture's pins go), `crates/vfs/tests/pinned_chunks.rs`.
+- **What was there.** A whole publication of a live volume (its first, a checkpoint, one owed after a refusal) read
+  every byte of the volume in the publication's own turn (`content_runs` over the whole record): 4.5 to 6 ms of a debug
+  owner's CPU for 0.56 to 1.25 MB of body, beside 2.0 to 3.0 ms for the image itself (w-forming's probe, `taskpolicy -b`,
+  base 51a061d36; seal quanta are 14 to 784 us), and it was most of the takeover's `published_before_served` turn (21 ms).
+- **The change.** The image is taken in the publication's turn, and with it each chunked file's sealed extents, every
+  chunk pinned (`Volume::pin_extents`), and a copy of its open extent, which the next write changes in place. A pin is a
+  count in the chunk record itself, so it allocates nothing; a chunk freed while pinned (a write replaced it, a
+  publication or the deadlist walk let it go) stays readable and is freed when its last pin goes. The runs are then read
+  from the pinned extents a quantum a turn (`config::wrap_slice_ns` of the seal quantum, pieces sized by the measured
+  rate, an archive page at least: `piece_bytes`), as the volume's build (`WholeBuild::capture`), so the publications made
+  meanwhile queue behind it as they do behind a sealing build. They are the runs `content_runs` reads, in its order, so a
+  successor rebuilds the same state. Read whole within the first turn's quantum, the entry is made at once as before;
+  otherwise, at its last turn its pins go and its body heads the build's queue, made into its entry as the queue is (a
+  body of more than one piece sealed in turns, A-377), its install image not refreshed, since the volume has moved on.
+  The pins are bounded by the record and let go at the capture's last turn or wherever its build ends unread
+  (`drop_build`, `forget`, a volume no longer live-shipped).
+- **Still in one turn.** The image itself (`to_standalone_image`, 2.0 to 3.0 ms debug for 30 to 57 KB of record), a whole
+  publication made while a build runs (`queue_behind_build` captures it in its own turn), and a large delta's runs
+  (3.3 ms debug for a 1.25 MB body, the same probe).
+- **Tests.** `live_ship::tests::a_whole_capture_read_in_turns_reads_the_head_it_began_on` (the oracle: the body read in
+  turns at a zero quantum, the first file overwritten and the second unlinked after its first turn, equals the one-turn
+  read at the same head byte for byte; at most one 64 KiB piece a turn: 9 turns for 524,288 sealed bytes; red with the
+  read in one turn: 1 turn), `a_whole_capture_in_turns_queues_what_publishes_behind_it_and_lets_its_pins_go` (red: the
+  first turn `Done`), `a_capture_dropped_or_forgotten_leaks_no_pin`; `slates-vfs` `pinned_chunks` (red with a pin that
+  holds nothing: the overwrite freed the pinned chunk at once).
