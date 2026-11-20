@@ -141,3 +141,6 @@
   733 cases / 351 pass / 382 fail all expected. Line 39 (six fleet tests on jupiter): load/oversubscription, already
   handed to owners; not reproduced by me (would need whole fleet suites).
 - Next: B5 (WinFsp arm64 open/close 4-5 ms) by use on CI arm64.
+- B5 in flight: diag-w-bugs-b5-1 (both arches): a written file's open+close via PowerShell: arm64 NTFS 73 us, WinFsp
+  memfs 190 us (no 4 ms on the platform's own sample FS); x86_64 NTFS 51 us, memfs 123 us. The slates half failed
+  before timing (unknown step); b5-2 logs each slates step.
