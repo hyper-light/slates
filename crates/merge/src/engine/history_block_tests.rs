@@ -116,8 +116,10 @@ fn created_then_replaced_whole(green: &mut Green, first: &[u8], second: &[u8]) {
 #[test]
 fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
   const LEN: usize = 64 * 1024;
-  let first: Vec<u8> = (0..LEN).map(|n| (n % 251) as u8).collect();
-  let second: Vec<u8> = (0..LEN).map(|n| (n % 241) as u8 ^ 0x5a).collect();
+  let first: Vec<u8> = (0..LEN).map(|n| u8::try_from(n % 251).unwrap()).collect();
+  let second: Vec<u8> = (0..LEN)
+    .map(|n| u8::try_from(n % 241).unwrap() ^ 0x5a)
+    .collect();
   let mut green = Green::new();
   created_then_replaced_whole(&mut green, &first, &second);
 

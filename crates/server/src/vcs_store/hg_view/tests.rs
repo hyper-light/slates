@@ -148,7 +148,7 @@ fn a_branch_the_owner_creates_retires_and_binds_is_a_bookmark_by_the_same_name()
       .find(|(name, _)| name.as_slice() == b"one")
       .map(|(_, node)| *node)
       .expect("states' bookmark one");
-    let mut ask = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
+    let ask = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
     let made = ask(
       state,
       RequestBody::CreateBranch {

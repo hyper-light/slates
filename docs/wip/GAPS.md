@@ -178,8 +178,10 @@
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
-> lands ignored. Owed: `getbundle`'s answer made and sent in slices, each charged and let go; the stream clone's; then
-> w-interop's matrix rerun.
+> lands ignored. Piece 1 BUILT: `getbundle::Answering`, the answer a slice at a time, a clone of every head walked by
+> its links (the request holds ranges and a place), its least room a slice less than the whole answer's (test), the
+> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Owed: the server driving it
+> a turn at a time over HTTP and SSH (piece 2, which turns the red green); the stream clone's; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -240,8 +242,12 @@
 > (`slates_mem::large`), large temporaries cut (`Wire::encoded_len`, `Db::mutate_owned`, `Checkpoint::into_encoded`);
 > svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. A-744 closed the record's growth, the retry
 > clone and the split (the 581 MiB is the owner partition's segment log ring and snapshot slots; the content object
-> 2.3 MiB). OWED: a replay measure that does not decode (A-420), so the log's decode-after-encode copy can go; Windows'
-> residency (`QueryWorkingSetEx`).
+> 2.3 MiB). The log's decode-after-encode stays (main's
+> call: A-420's measure and guard). OWED: Windows' residency (`QueryWorkingSetEx`).
+>
+> **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
+> records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
+> the log ring's released pages given back (88 MiB resident past the live tail); `projected_snapshot_bytes`'s encode.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
