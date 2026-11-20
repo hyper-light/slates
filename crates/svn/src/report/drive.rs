@@ -58,7 +58,7 @@ pub(crate) mod green;
 pub(crate) mod history;
 pub mod replay;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use super::{Depth, PathInfo, Report, join_fspath, join_relpath};
 use crate::authz::{PrincipalRules, may_read};

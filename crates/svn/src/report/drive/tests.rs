@@ -523,16 +523,16 @@ fn a_changed_text_is_sent_as_a_delta_against_its_base() {
 
 /// The time no drive step may take: far past one of [`STEP_WORK`] units even in a debug build, far short of a whole
 /// window's making there (milliseconds).
-pub(super) const STEP_BUDGET: std::time::Duration = std::time::Duration::from_micros(500);
+pub(crate) const STEP_BUDGET: std::time::Duration = std::time::Duration::from_micros(500);
 
 /// How many more times a step past [`STEP_BUDGET`] is timed again from its state before it: a step's time is the least
 /// of its timings, so time the machine took away from the test (a preemption, measured up to 3.6 ms under the suite's
 /// load) is not charged to it, while a step whose own work is past the budget stays past it every time.
-pub(super) const RETIMES: usize = 2;
+pub(crate) const RETIMES: usize = 2;
 
 /// The svndiff stream the whole-window path made of `/trunk/big.txt` from its text at `from` to its text at `to`
 /// (`read_window`, `window_of`, `Encoder::window`): the bytes a drive's pieces must make.
-pub(super) fn big_text_stream(
+pub(crate) fn big_text_stream(
   (from, to): (Option<&[u8]>, &[u8]),
   (version, compression): (Version, Compression),
 ) -> Vec<u8> {
@@ -622,4 +622,30 @@ fn a_large_texts_windows_are_driven_with_no_step_past_its_budget() {
       assert_eq!(past, 0, "r{from}, {encoding:?}: longest step {longest:?}");
     }
   }
+}
+
+/// The report fixtures' repository and `/trunk/big.txt`'s text where it is added (r5) and where it is edited (r6), for
+/// the window tests of the other readers (A-751).
+pub(crate) fn big_texts() -> (Index, Green, Vec<u8>, Vec<u8>) {
+  let (index, green) = repository();
+  let locks = LockTable::new();
+  let (five, six) = {
+    let sources = Sources {
+      index: &index,
+      repository: &green,
+      locks: &locks,
+      now: NOW,
+      rules: None,
+    };
+    let text_at = |revision: Revision| {
+      let text = dirent(&sources, "/trunk/big.txt", revision)
+        .unwrap()
+        .unwrap()
+        .text
+        .unwrap();
+      green.texts[&text.identity].clone()
+    };
+    (text_at(5), text_at(6))
+  };
+  (index, green, five, six)
 }

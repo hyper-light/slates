@@ -12394,9 +12394,20 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > version (`Drive::with_encoding`, svn://'s `editor::encoding_of`). By test: `/trunk/big.txt` (6,000 lines) driven a
 > step a call, edited and added, in version 0 and version 2 with LZ4: before, 4 steps of 2.8-3.0 ms each run (debug);
 > now none past 500 us, and its stream is the whole-window path's byte for byte. The recorded svnserve sessions are
-> unchanged. Owed: the replay drive (`report::drive::replay`, svn://'s `replay`/`replay-range` and the dump exporter's
-> source) and `get-file-revs` (`reads::file_revs`) still make a window whole; the dump exporter's format 3 adopts the
-> maker (w-svn).
+> unchanged. **The replay drive and `get-file-revs` BUILT (same day, A-751 part 3).** Both make every window through
+> the same step (`report::drive::window_unit`, which hands each piece to its caller's sink). The replay drive
+> (`report::drive::replay`, svn://'s `replay` and `replay-range`) gives a window's pieces as the update drive does, a
+> step at a time (`Replay::next_within`). Its svn:// turn ends at the first step past the budget's quantum, as the
+> report exchange's does, where it was one whole call a step. `get-file-revs` (`reads::file_revs`) sends a revision as
+> its tuple, or its DAV element's head (`dav::listing::file_rev_head`), then its delta a step at a time: a string a
+> write over svn://, streamed base64 over DAV. It holds a window's two pieces at most, where it held both texts whole
+> and made the revision whole in one step. `Stream::resume` and the DAV file-revs report take the budget, so a slice
+> stops at its quantum. By test, `big.txt` (6,000 lines; added at r5, edited at r6), a step a call, a step over budget
+> timed again from its state before (a preemption under the suite's load reached 3.6 ms, past a whole window's 3.0 ms):
+> the replay of r6 and r5 and `get-file-revs` 5:6 over svn:// (svndiff 0 and 2) and DAV made no step past 500 us, where
+> whole-window steps made several of about 3 ms. Their deltas are the whole-window path's byte for byte, and the
+> recorded svnserve sessions (replay, `get-file-revs`, svndiff 0) are unchanged. The dump exporter computes its own
+> windows (`migration::export`, `deltas_at`); its format 3 adopting the maker is w-svn's.
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
