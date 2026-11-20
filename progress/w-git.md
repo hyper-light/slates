@@ -106,3 +106,9 @@
   object arrives + readers tolerating holes (hook_view units.rs cover, text.rs depth loop, any 0..next_position user);
   then part 3: rows staged into a per-push fork at keep time (git store Push/Repository API), commit rows + generations
   sliced after the pack; part 4: moves' admission sliced; part 5: landing adopts fork (O(changes)) + stale re-base.
+- Main additions to A-722: (1) after part 3, intake on the ARRIVAL shard (fork there; decode/hash/check there; only
+  the landing's adopt on the owner via cross-shard message); placement-policy fn from w-balance (kiln id
+  01a1f7b42ec27702a195501719d3f919 / inbox) — agree the seam. (2) Concurrency proof: 19 then 100 concurrent pushes to
+  one repository (v1.5.0 cut kills daemon at 19 today; run-requests.md), no watchdog kill, every push answered.
+- A-722 part 2 in progress (w-git-land, uncommitted): rows lose green/version; Repository::landings map +
+  bringer_of(position); upload + hook_view units switched; store tests fixed. Running git tests.
