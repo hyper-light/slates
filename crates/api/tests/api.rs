@@ -57,8 +57,6 @@ const TEST_SHARDS: u16 = 1;
 /// machine, so each shard's reserve is a sixth of the machine's memory (three memory classes) while kiln's volume asks
 /// a quarter.
 const KILN_SHARDS: u16 = 2;
-/// Shape: how long a test waits for its daemon's rendezvous to answer after the start.
-const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: a scratch volume's quota and an overlay's growth bound: room for the few small files a test writes.
 const ROOM: u64 = 4 << 20;
 /// Shape: the permission bits of a file a test writes.
@@ -118,16 +116,10 @@ fn daemon_with(
     },
   )
   .unwrap();
-  let started = Instant::now();
-  let attached = loop {
-    match Instance::attach(&instance) {
-      Ok(attached) => break attached,
-      Err(error) if error.is_unavailable() && started.elapsed() < START_WAIT => {
-        std::thread::yield_now();
-      }
-      Err(error) => panic!("attaching {instance}: {error}"),
-    }
-  };
+  // The claim waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait (until
+  // 2026-11-20 a twenty-second retry, `START_WAIT`).
+  let attached =
+    Instance::attach(&instance).unwrap_or_else(|error| panic!("attaching {instance}: {error}"));
   (daemon, attached)
 }
 
@@ -306,7 +298,6 @@ fn a_volume_is_provisioned_snapshotted_cloned_and_destroyed() {
   names.sort();
   assert_eq!(names, ["clone", "origin"]);
   instance.destroy(clone).unwrap();
-  let started = Instant::now();
   loop {
     let names: Vec<String> = instance
       .list()
@@ -317,10 +308,6 @@ fn a_volume_is_provisioned_snapshotted_cloned_and_destroyed() {
     if names == ["origin"] {
       break;
     }
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the clone leaves the list: {names:?}"
-    );
     std::thread::yield_now();
   }
   assert_eq!(
@@ -2245,9 +2232,8 @@ mod shards {
   /// The handed end as a [`Wire`].
   #[cfg(unix)]
   fn wire(end: slates_api::StreamEnd) -> Wire {
-    let stream = std::os::unix::net::UnixStream::from(end);
-    stream.set_read_timeout(Some(START_WAIT)).unwrap();
-    stream
+    // No read timeout: its reads wait while the daemon lives, its end the stream's (until 2026-11-20 `START_WAIT`).
+    std::os::unix::net::UnixStream::from(end)
   }
 
   /// The handed end as a [`Wire`].
@@ -2393,15 +2379,11 @@ fn through_vhost(
   driver.reply_of(head, len)
 }
 
-/// Waits within the suite's wait until `volume` holds `count` attachments: a device's ends after its end closes.
+/// Waits, while the daemon lives (A-232's rule), until `volume` holds `count` attachments: a device's ends after its end
+/// closes.
 #[cfg(target_os = "linux")]
 fn wait_for_attachments(instance: &mut Instance, volume: VolumeId, count: u32) {
-  let started = Instant::now();
   while instance.status(volume).unwrap().attachments != count {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the attachments never came to {count}"
-    );
     std::thread::yield_now();
   }
 }
@@ -2578,13 +2560,14 @@ mod asynchronous_form {
   const ROUNDS_PER_DROP: usize = 4;
 
   /// Whether `completion` became readable within `bound`, this thread blocked in `poll(2)` until it did or the bound
-  /// passed. The instance's client keeps the descriptor open while the call that waits here borrows the instance.
+  /// passed; with no bound, until it did. The instance's client keeps the descriptor open while the call that waits here
+  /// borrows the instance.
   #[cfg(unix)]
-  fn readable_within(completion: Completion, bound: Duration) -> std::io::Result<bool> {
+  fn readable_within(completion: Completion, bound: Option<Duration>) -> std::io::Result<bool> {
     // SAFETY: `completion` is the waiting instance's completion descriptor, which its client keeps open for as long
     // as the instance lives, and the call that waits here borrows the instance.
     let descriptor = unsafe { std::os::fd::BorrowedFd::borrow_raw(completion) };
-    let timeout = rustix::event::Timespec::try_from(bound).ok();
+    let timeout = bound.and_then(|bound| rustix::event::Timespec::try_from(bound).ok());
     let mut interest = [rustix::event::PollFd::new(
       &descriptor,
       rustix::event::PollFlags::IN,
@@ -2598,13 +2581,16 @@ mod asynchronous_form {
   /// did or the bound passed, in whole milliseconds rounded up so a short bound never spins. The instance's client
   /// keeps the socket open while the call that waits here borrows the instance.
   #[cfg(windows)]
-  fn readable_within(completion: Completion, bound: Duration) -> std::io::Result<bool> {
+  fn readable_within(completion: Completion, bound: Option<Duration>) -> std::io::Result<bool> {
     use windows_sys::Win32::Networking::WinSock::{
       POLLRDNORM, SOCKET, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
     };
     /// Format: the nanoseconds of the millisecond `WSAPoll` counts its timeout in.
     const NANOS_PER_MILLI: u128 = 1_000_000;
-    let millis = i32::try_from(bound.as_nanos().div_ceil(NANOS_PER_MILLI)).unwrap_or(i32::MAX);
+    // `WSAPoll` waits without end for a negative timeout: no bound.
+    let millis = bound.map_or(-1, |bound| {
+      i32::try_from(bound.as_nanos().div_ceil(NANOS_PER_MILLI)).unwrap_or(i32::MAX)
+    });
     let mut interest = [WSAPOLLFD {
       fd: SOCKET::try_from(completion).unwrap(),
       events: POLLRDNORM,
@@ -2620,49 +2606,29 @@ mod asynchronous_form {
   }
 
   /// A host's reactor in miniature: its wait blocks this thread ([`readable_within`]) until the completion signal is
-  /// readable or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A call
-  /// that would wait for good fails the test instead of hanging it: a wait with no timeout is bounded by the suite's
-  /// wait, and so are the waits a call times out one after another with no signal between them (a live daemon's call
-  /// goes on waiting through its deadlines, A-232, so only the host bounds it). It counts how its waits ended, the
-  /// evidence a test prints: a wait that timed out is the driver's deadline, not a reply's signal.
+  /// readable or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A
+  /// wait with no timeout waits until the signal, and the waits a call times out one after another are waited through: a
+  /// live daemon's call goes on waiting through its deadlines (A-232), and this suite's daemon is in this process, its
+  /// watchdog ending a stuck one (until 2026-11-20 both were bounded by the suite's wait, `START_WAIT`). It counts how its
+  /// waits ended, the evidence a test prints: a wait that timed out is the driver's deadline, not a reply's signal.
   #[derive(Default)]
   struct Blocking {
     /// Waits the completion signal ended.
     readable: Cell<u64>,
     /// Waits the timeout ended.
     timed_out: Cell<u64>,
-    /// How long the waits since the last signal timed out, in all.
-    unsignalled: Cell<Duration>,
   }
 
   impl Reactor for Blocking {
     fn wait(&self, completion: Completion, timeout_ns: Option<u64>) -> Waiting<'_> {
-      let bound = timeout_ns.map_or(START_WAIT, Duration::from_nanos);
-      let woke = match readable_within(completion, bound) {
-        Ok(false) if timeout_ns.is_none() => Err(std::io::Error::new(
-          std::io::ErrorKind::TimedOut,
-          "nothing landed within the suite's wait",
-        )),
+      let woke = match readable_within(completion, timeout_ns.map(Duration::from_nanos)) {
         Ok(false) => Ok(Woke::TimedOut),
         Ok(true) => Ok(Woke::Readable),
         Err(error) => Err(error),
       };
       let counted = match woke {
-        Ok(Woke::Readable) => {
-          self.unsignalled.set(Duration::ZERO);
-          &self.readable
-        }
-        Ok(Woke::TimedOut) => {
-          let unsignalled = self.unsignalled.get().saturating_add(bound);
-          self.unsignalled.set(unsignalled);
-          if unsignalled > START_WAIT {
-            return Box::pin(std::future::ready(Err(std::io::Error::new(
-              std::io::ErrorKind::TimedOut,
-              "no reply was signalled within the suite's wait",
-            ))));
-          }
-          &self.timed_out
-        }
+        Ok(Woke::Readable) => &self.readable,
+        Ok(Woke::TimedOut) => &self.timed_out,
         Err(_) => return Box::pin(std::future::ready(woke)),
       };
       counted.set(counted.get().saturating_add(1));
@@ -2959,17 +2925,15 @@ fn names_of<V: Volumes>(seam: &mut V) -> Vec<String> {
   names
 }
 
-/// A stream end made ready for [`reads_its_end`] while its attachment still lives: on Unix a socket whose read waits at
-/// most the suite's wait. The wait is set before the detach, since macOS refuses `SO_RCVTIMEO` (`EINVAL`) on a socket
-/// whose peer has gone.
+/// A stream end made ready for [`reads_its_end`] while its attachment still lives: on Unix the socket as it came, whose
+/// read waits for the stream's end.
 #[cfg(unix)]
 fn awaiting(end: slates_api::StreamEnd) -> std::os::unix::net::UnixStream {
-  let socket = std::os::unix::net::UnixStream::from(end);
-  socket.set_read_timeout(Some(START_WAIT)).unwrap();
-  socket
+  // No read timeout: the read waits for the stream's end, the event it is for (until 2026-11-20 `START_WAIT`).
+  std::os::unix::net::UnixStream::from(end)
 }
 
-/// Whether the peer of a stream end reads its end within the suite's wait: the attachment it reached has ended.
+/// Whether the peer of a stream end reads its end, waited for: the attachment it reached has ended.
 #[cfg(unix)]
 fn reads_its_end(socket: &std::os::unix::net::UnixStream) -> bool {
   let mut byte = [0u8; 1];
@@ -2982,10 +2946,9 @@ fn awaiting(end: slates_api::StreamEnd) -> slates_api::StreamEnd {
   end
 }
 
-/// Whether the peer of a stream end reads its end within the suite's wait: the attachment it reached has ended. A
-/// Windows end is an overlapped pipe handle whose waited read (`slates_ipc::stream::read_waiting`, zero once the peer
-/// has gone) takes no bound of its own, so a duplicate of the handle is read on a thread of the test's and its answer
-/// waited for within the suite's wait: an end that never comes fails the check instead of hanging the suite. Until
+/// Whether the peer of a stream end reads its end, waited for: the attachment it reached has ended. A Windows end is an
+/// overlapped pipe handle whose waited read (`slates_ipc::stream::read_waiting`, zero once the peer has gone) takes no
+/// bound of its own, so a duplicate of the handle is read on a thread of the test's and its answer waited for. Until
 /// 2026-11-18 this answered `true` without reading.
 #[cfg(windows)]
 fn reads_its_end(end: &slates_api::StreamEnd) -> bool {
@@ -2997,7 +2960,8 @@ fn reads_its_end(end: &slates_api::StreamEnd) -> bool {
     let read = slates_ipc::stream::read_waiting(reader.as_handle(), &mut byte).ok();
     let _ = answer.send(read);
   });
-  let ended = matches!(answered.recv_timeout(START_WAIT), Ok(Some(0)));
+  // The read's answer, waited for: it ends at the stream's end (until 2026-11-20 within `START_WAIT`).
+  let ended = matches!(answered.recv(), Ok(Some(0)));
   if ended {
     reading.join().unwrap();
   }
@@ -3040,9 +3004,7 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   let unpinned = seam.snapshot(origin).unwrap();
   assert_eq!(seam.destroy_snapshot(origin, unpinned), Ok(()));
   seam.destroy(clone).unwrap();
-  let started = Instant::now();
   while names_of(seam).contains(&"seam-clone".to_owned()) {
-    assert!(started.elapsed() < START_WAIT, "the clone leaves the list");
     std::thread::yield_now();
   }
   assert_eq!(
