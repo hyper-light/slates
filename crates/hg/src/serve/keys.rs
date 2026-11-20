@@ -86,18 +86,20 @@ pub(crate) fn request<'a>(
   arguments: &Arguments<'a>,
   spec: Spec<'_>,
 ) -> Result<Request<'a>, Refused> {
-  let [namespace, key, old, new] = pushkey::PARAMETERS.map(|name| arguments.get(spec, name));
-  let need = |value: Option<&'a [u8]>, at: usize| {
-    value.ok_or(Refused::MissingArgument {
-      name: pushkey::PARAMETERS.get(at).copied().unwrap_or(COMMAND),
-    })
-  };
+  request_by(|name| arguments.get(spec, name))
+}
+
+/// The request whose arguments `argument` finds by name (a batch's call, A-569); refused naming the first it lacks.
+pub(crate) fn request_by<'a>(
+  argument: impl Fn(&[u8]) -> Option<&'a [u8]>,
+) -> Result<Request<'a>, Refused> {
+  let [namespace, key, old, new] =
+    pushkey::PARAMETERS.map(|name| argument(name).ok_or(Refused::MissingArgument { name }));
   Ok(Request {
-    namespace: need(namespace, 0)?,
-    key: need(key, 1)?,
-    old: need(old, 2)?,
-    // Format: each parameter by its index in pushkey's order (namespace, key, old, new).
-    new: need(new, 3)?,
+    namespace: namespace?,
+    key: key?,
+    old: old?,
+    new: new?,
   })
 }
 
