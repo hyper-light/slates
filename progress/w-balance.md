@@ -197,3 +197,9 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - 783e14e64 LANDED P7 large-pack run: cap 5/3 toys 3.07x/3.63x fair share (daemon-wide wait, profile owed); cap 10
   kills daemon (run request updated).
 - NEXT: profile the toys' wait with v1.5.0 present (memory making?), cap 3, on .local-2.
+- PROFILE (quiet runs on .local-2): small repos' wait = server-side between their steps (served 0.19 s, span 1.8 s);
+  span tracks others' step time on the shard. Longest steps by phase: input up to 1,435.7 ms (resolve_waiting at pack
+  end in one call), answer up to 247 ms; mean 0.04 ms. Kill at cap 10: shard spinning in task vcs_http.rs:1404, poll 595.
+- FIX (branch agents/w-balance-fix1 76070d077, NOT LANDED per main's rule): resolve in turns. Input longest 1.1 ms, cap 10
+  alive, v1.5.0 alone 423 MiB, but toys still 3.34x fair share -> resolve is NOT the toys' wait. Inbox note to w-git
+  written. Awaiting main's ruling. NEXT: profile the answer step (213-247 ms) and per-step round cost.

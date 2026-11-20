@@ -6816,5 +6816,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-shared A-626 part 4 work verb (main 9e8e489d6): clippy + xtask (ipc WorkOp appended); the SDK/MCP/CLI builds (they match WorkOp by name, none exhaustively)
 - 2026-11-20 w-git A-722 part 3 (main 7b93d68c3): w-perf push_load.py / git_scale.sh rerun (push intake changed: rows staged at the seal into an index fork)
 - 2026-11-20 w-shared copy surfaces (main 807a6f3c0): clippy + xtask over cli/mcp/sdk-python/sdk-node; the SDK lane (maturin wheel + napi pack) on Linux/macOS/Windows; Windows CLI JSON flow
+
+- w-balance (2026-11-20, CAUSE of the 10-push kill): `shard 20 is spinning: 1019 ms of CPU without a step ... in task spawned at crates/server/src/vcs_http.rs:1404, at its poll 595` (anchor kills naming the same). The poll is the input step that brings the pack's trailer: `slates_git::unpack::Reader::finish_into` -> `resolve_waiting` resolves every waiting delta in one call (1,435.7 ms for v1.5.0). A fix (resolve in turns) is on branch agents/w-balance-fix1 76070d077, not landed (see inbox/w-git-from-w-balance.md); with it cap 10 survives, 10/10 ok. Beside A-722.
 - 2026-11-20 w-shared hard-link copy (main 95044a373): clippy + xtask; slates-merge whole lib + its copy proptest at a high case count; Linux/Windows
 - 2026-11-20 w-bugs A-747 (main 4e9c31aba): owed (main): clippy ipc/server; Linux run of slates-ipc --lib route:: (accept on Linux: departed path).
