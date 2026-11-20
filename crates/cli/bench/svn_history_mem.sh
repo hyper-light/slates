@@ -14,11 +14,14 @@ set -u
 S=$1; D=$2; L=$3; I=svn-history-mem-$L
 MallocStackLogging=1 "$S" --instance "$I" anchor --vcs-svn 127.0.0.1:0 > /dev/null 2> "anchor-$L.log" & A=$!
 for _ in $(seq 1 600); do grep -q 'serving on' "anchor-$L.log" && break; sleep 0.1; done
-DP=$(sed -n 's/^slates anchor: instance .* up; daemon pid \([0-9]*\);.*/\1/p' "anchor-$L.log" | head -1)
+# The anchor's and the daemon's lines interleave on stderr, so the pid is matched anywhere, not by a whole line.
+DP=$(grep -o 'daemon pid [0-9]*' "anchor-$L.log" | head -1 | awk '{print $3}')
 n=0; for _ in $(seq 1 600); do "$S" --instance "$I" volume list > /dev/null 2>&1 && n=$((n+1)) || n=0; [ $n -ge 10 ] && break; sleep 0.1; done
 "$S" --instance "$I" bootstrap root > /dev/null
 "$S" --instance "$I" repository create project --tool svn > /dev/null
 "$S" --instance "$I" repository import project "$D" | tr '\n' ' '; echo
+# First and alone: malloc_history suspends the daemon, and past the liveness window (about 1 s) the anchor restarts
+# it; vmmap and heap do too, so they are not run.
 malloc_history "$DP" -allBySize > "mh-$L.txt" 2> /dev/null
 kill -9 "$A" "$DP" 2>/dev/null
 grep -m1 '^Physical footprint:' "mh-$L.txt"
