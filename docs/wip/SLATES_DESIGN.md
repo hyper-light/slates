@@ -12293,6 +12293,7 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
 > landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
 > revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
+> The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
 mirrored).** One server serves tens of thousands of concurrent clones, many of one repository, so an answer is held to
@@ -56857,3 +56858,15 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   4.9 ms, the best within a heartbeat). Red with the waiter never attached: each waited out the liveness budget, about
   1.02 s. Fleet `a_forwarded_submit` and `a_holder`; `slates-server --lib merge_service:: verbs:: xshard:: work_home`;
   fmt clean.
+
+### A-762 — The dump exporter reads a text a bounded step a call (2026-11-20, w-svn for UI goal 93; main's item 2; §4.17.1 "A fetch's answer", rule 3)
+
+- Found by reading: c2's exporter `load` rebuilt a text through its whole delta chain in one call. Measured (debug): a
+  512 KiB text with a chain of 6, the longest export call 6.18 ms against a whole read of 6.04 ms.
+- `TextSource::read_step` with `migration::TextReading`: the records rebuild a chain one svndiff window a step, its
+  first delta first; `svn_texts::HeadTexts` reads a stored text a store window a step (`ContentStore::window_at`) and a
+  green's held text a window's room a step. The exporter's call whose texts are not whole takes one step and writes
+  nothing; its cache holds a delta's two texts and the one being read.
+- Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read; red before) and
+  `a_stored_text_is_read_a_store_window_a_step`.
+- **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.

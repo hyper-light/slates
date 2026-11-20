@@ -2102,7 +2102,13 @@
 > durable (`vcs_store::content_durable`, A-727 slice b), a refusal giving every put text back (`NotDurable`); reads
 > find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity and
 > refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
-> Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. **The export's text
+> read sliced (A-762, same day, w-svn, main's item 2; found by reading):** the exporter rebuilt a text through its whole delta
+> chain in one call (512 KiB, a chain of 6: the longest call 6.18 ms against a whole read of 6.04 ms, debug). Now a text
+> is read a bounded step a call (`TextSource::read_step`, `migration::TextReading`): a chain one svndiff window a step,
+> a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
+> writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
+> and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the

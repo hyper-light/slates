@@ -393,6 +393,17 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
       }
       TextSource::text(self.0, identity)
     }
+
+    fn read_step(
+      &self,
+      identity: &ContentIdentity,
+      reading: &mut crate::migration::TextReading,
+    ) -> Option<bool> {
+      if *identity == (self.1).0 {
+        return Some(reading.copy_step(&(self.1).1));
+      }
+      TextSource::read_step(self.0, identity, reading)
+    }
   }
   let exported = |repository: &Repository, texts: &dyn TextSource, format: Format| {
     let mut exporter = Exporter::new(repository, 0, repository.youngest(), format)?;
@@ -422,5 +433,82 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
   assert_eq!(
     exported(&stored, &stored, Format::Two),
     Err(MigrationRefusal::Corrupt)
+  );
+}
+
+/// c2's exporter text rebuild sliced (main's item 2 of 2026-11-20; Ada's rule: a performance gap is fixed first). Do:
+/// commit [`FILE`] with a 512 KiB text, then edit a few of its bytes in each of 31 revisions, so the youngest text is
+/// read through a chain of skip deltas; export the youngest revision alone in format 2, timing each call (best of three
+/// exports), and time one whole read of the text (best of three). Expect: the dump carries the text, and no call costs
+/// a quarter of the whole read: the chain is rebuilt a window a call. Before, the call that wrote the text's first piece
+/// rebuilt the whole chain.
+#[test]
+fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
+  use crate::dump::Format;
+  use crate::migration::{Exporter, Exporting};
+  use std::time::{Duration, Instant};
+  const LEN: usize = 512 * 1024;
+  let mut bytes: Vec<u8> = (0..LEN).map(|at| (at % 251) as u8).collect();
+  let mut repository = created();
+  let mut opening = first();
+  let (alpha, _) = content(b"alpha\n");
+  opening.contents.remove(&alpha);
+  let (identity, held) = content(&bytes);
+  opening.contents.insert(identity, held);
+  if let Some(file) = opening
+    .record
+    .changes
+    .iter_mut()
+    .find(|row| row.path == FILE)
+  {
+    file.text = Some(text_of(&bytes));
+  }
+  let checked = repository.check(opening).unwrap();
+  repository.apply(checked).unwrap();
+  for head in 1..32u64 {
+    let at = usize::try_from(head).unwrap() * 4_099 % LEN;
+    bytes[at] = bytes[at].wrapping_add(1);
+    let checked = repository.check(edit(head, &bytes, Vec::new())).unwrap();
+    repository.apply(checked).unwrap();
+  }
+  let youngest = repository.youngest();
+  let identity = *blake3::hash(&bytes).as_bytes();
+  assert!(repository.text_chain(&identity).unwrap() >= 5);
+  let whole = (0..3)
+    .map(|_| {
+      let began = Instant::now();
+      assert_eq!(
+        repository.text(&identity).as_deref(),
+        Some(bytes.as_slice())
+      );
+      began.elapsed()
+    })
+    .min()
+    .unwrap();
+  let mut longest = Duration::MAX;
+  let mut dump = Vec::new();
+  for _ in 0..3 {
+    let mut exporter = Exporter::new(&repository, youngest, youngest, Format::Two).unwrap();
+    let mut out = Vec::new();
+    let mut slowest = Duration::ZERO;
+    loop {
+      let began = Instant::now();
+      let exported = exporter.export(&repository, &repository, &mut out).unwrap();
+      slowest = slowest.max(began.elapsed());
+      if exported == Exporting::Done {
+        break;
+      }
+    }
+    longest = longest.min(slowest);
+    dump = out;
+  }
+  assert!(
+    dump
+      .windows(bytes.len())
+      .any(|window| window == bytes.as_slice())
+  );
+  assert!(
+    longest.saturating_mul(4) < whole,
+    "longest call {longest:?} against a whole read of {whole:?}"
   );
 }
