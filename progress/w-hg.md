@@ -98,3 +98,8 @@
 - NOW: S5 = A-729 (claimed): content once by identity (main's 6-point spec: file texts by identity homed via homes.rs,
   read via A-727 Cow seam; manifests/changelogs as revlog-shaped deltas, snapshot interval derived; SHGR names
   identities only; intake rebuilds against stored base; replay re-indexes by identity; proof w-perf's import).
+- A-732 crash-loop fix (record::Replay + record::Writer; recovery replays hg records a revision a unit; import's
+  Stage::Writing) LANDED main (piece 165bcd2a7, merge e7353d339). Bug record docs/bugs/2026-11-20-a-large-mercurial-
+  import-crash-looped-the-daemon.md. Local hg 74/74, server 131/131 (+ flaky git test t_a664_live... passes alone).
+- NEXT (main's order): (2) the whole 57k push over HTTP still spins shard 0 ~183 s in (w-interop, release 1533d52b,
+  RSS 13.9 GB): find the unsliced step (landing/record write/classify), failing test first; then (3) S5 (A-729).
