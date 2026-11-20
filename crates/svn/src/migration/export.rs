@@ -30,8 +30,9 @@
 //! path's records up to its text, or one window of that text (a whole text's next [`WINDOW_LIMIT`] bytes, or the
 //! deltifier's next window, taken up again from [`DeltasAt`]), or the closing of the revision's open directories. A
 //! record's header names its text's length first: a whole text's is its own (`index::Text::size`), so it is walked once;
-//! a delta's is its svndiff's, which nothing keeps, so a first walk measures it keeping no window, in the record's call
-//! (owed: that walk resumable too), and a second writes it.
+//! a delta's is its svndiff's, which nothing keeps, so a first walk measures it a window a call keeping no window,
+//! before the record's call (the changed path's step run first on copies, its writes dropped, to learn which delta its
+//! record carries), and a second writes it.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
@@ -47,7 +48,7 @@ use crate::dump::{
 };
 use crate::index::{Action, ChangedPath, NodeKind, Revision, Text};
 use crate::svndiff::{
-  Compression, DeltasAt, Encoder, HEADER_LEN, Version, WINDOW_LIMIT, Window, deltas, deltas_at,
+  Compression, DeltasAt, Encoder, HEADER_LEN, Version, WINDOW_LIMIT, deltas, deltas_at,
 };
 
 /// What one call of [`Exporter::export`] wrote.
@@ -93,6 +94,24 @@ struct Pending {
   last: Option<String>,
   /// The text of the record written last, while it is being written a window a call.
   text: Option<Texting>,
+  /// The next changed path's delta being measured a window a call (format 3), before its record is written.
+  measuring: Option<Measuring>,
+  /// The next changed path's delta's svndiff length, once measured.
+  measured: Option<u64>,
+}
+
+/// A delta's svndiff length being measured a window a call, no window kept: its texts, where the deltifier stands, and
+/// the length so far (the svndiff header's and each window's made).
+#[derive(Clone, Copy, Debug)]
+struct Measuring {
+  /// The comparison's text; none for the empty text.
+  source: Option<Text>,
+  /// The record's text; none for the empty text.
+  target: Option<Text>,
+  /// The deltifier's position; none before its first window.
+  at: Option<DeltasAt>,
+  /// The length so far.
+  length: u64,
 }
 
 /// A record's text being written a window a call (the module documentation): its header and property section are
@@ -234,6 +253,8 @@ impl Exporter {
       stack: Vec::new(),
       last: None,
       text: None,
+      measuring: None,
+      measured: None,
     });
     Ok(false)
   }
@@ -254,6 +275,48 @@ impl Exporter {
       pending.text = write_text(repository, &mut stream, texting)?;
       return Ok(false);
     }
+    if let Some(measuring) = pending.measuring {
+      match measure_window(repository, measuring)? {
+        Some(more) => pending.measuring = Some(more),
+        None => {
+          pending.measuring = None;
+          pending.measured = Some(measuring.length);
+        }
+      }
+      return Ok(false);
+    }
+    let row = pending.rows.get(pending.at).cloned();
+    // Format 3: the changed path's step run first on copies, its writes dropped, to learn whether its record carries a
+    // delta, whose svndiff length its header names first; that length is measured by the calls after this one.
+    if let (Some(row), Some(_), None) = (&row, deltas, pending.measured) {
+      let mut copy = writer.clone();
+      let mut dropped = Vec::new();
+      let mut dry = Drive {
+        repository,
+        revision,
+        deltas,
+        stream: Stream {
+          writer: &mut copy,
+          out: &mut dropped,
+        },
+        stack: pending.stack.clone(),
+        last: pending.last.clone(),
+        text: None,
+        measured: Measure::Wanted(std::cell::Cell::new(None)),
+      };
+      dry.step(row)?;
+      if let Measure::Wanted(wanted) = &dry.measured
+        && let Some((source, target)) = wanted.get()
+      {
+        pending.measuring = Some(Measuring {
+          source,
+          target,
+          at: None,
+          length: u64::try_from(HEADER_LEN).map_err(|_| MigrationRefusal::Corrupt)?,
+        });
+        return Ok(false);
+      }
+    }
     let mut drive = Drive {
       repository,
       revision,
@@ -262,12 +325,13 @@ impl Exporter {
       stack: std::mem::take(&mut pending.stack),
       last: pending.last.take(),
       text: None,
+      measured: Measure::Given(pending.measured.take()),
     };
-    let Some(row) = pending.rows.get(pending.at) else {
+    let Some(row) = row else {
       drive.finish()?;
       return Ok(true);
     };
-    drive.step(row)?;
+    drive.step(&row)?;
     pending.at = pending.at.saturating_add(1);
     pending.stack = drive.stack;
     pending.last = drive.last;
@@ -343,6 +407,17 @@ struct Drive<'a> {
   last: Option<String>,
   /// The text the record it wrote last owes, written by the calls after it.
   text: Option<Texting>,
+  /// A delta's svndiff length: given, measured by the calls before this step; or wanted, by a step run only to learn
+  /// which delta its record carries.
+  measured: Measure,
+}
+
+/// A changed path's delta length, for its record's header (format 3).
+enum Measure {
+  /// Measured before the step, none where the step writes no delta.
+  Given(Option<u64>),
+  /// The step is run to learn it: the texts of the delta it writes, set once it plans one.
+  Wanted(std::cell::Cell<Option<(Option<Text>, Option<Text>)>>),
 }
 
 impl<'a> Drive<'a> {
@@ -603,18 +678,22 @@ impl<'a> Drive<'a> {
 
   /// A text section: the node's whole text, its length the record's (one walk, the writing); or (format 3) the
   /// deltifier's windows against `before`'s text, the empty text when there is no comparison or it has none
-  /// (`store_delta`), their svndiff's length measured by a walk that keeps no window (the first of two).
+  /// (`store_delta`), their svndiff's length measured before the step by calls of their own (the first of two walks).
   fn text_plan(&self, before: Option<&Facts>, now: &Facts) -> Result<TextPlan, MigrationRefusal> {
-    let Some(room) = self.deltas else {
+    if self.deltas.is_none() {
       return Ok(TextPlan::Whole(now.text));
-    };
-    let target = self.text_bytes(now)?;
+    }
     let base_text = before.and_then(|before| before.text);
-    let source = match before {
-      Some(before) => self.text_bytes(before)?,
-      None => &[],
+    let length = match &self.measured {
+      Measure::Given(Some(length)) => *length,
+      // A stand-in its writes take (the svndiff header the record writes before its windows), dropped with them.
+      Measure::Wanted(wanted) => {
+        wanted.set(Some((base_text, now.text)));
+        u64::try_from(HEADER_LEN).map_err(|_| MigrationRefusal::Corrupt)?
+      }
+      // Every format 3 step is run first to learn its delta, which is measured before it.
+      Measure::Given(None) => return Err(MigrationRefusal::Corrupt),
     };
-    let length = encoded_len(deltas(source, target, room).map_err(MigrationRefusal::Delta)?)?;
     Ok(TextPlan::Delta {
       base: DeltaBase {
         md5: base_text.map(|text| text.md5),
@@ -624,17 +703,6 @@ impl<'a> Drive<'a> {
       source: base_text,
       target: now.text,
     })
-  }
-
-  /// The bytes of a node's text: none for a node without one.
-  fn text_bytes(&self, facts: &Facts) -> Result<&'a [u8], MigrationRefusal> {
-    match facts.text {
-      Some(text) => self
-        .repository
-        .content(&text.identity)
-        .ok_or(MigrationRefusal::Corrupt),
-      None => Ok(&[]),
-    }
   }
 
   /// Writes a node record and its sections: its property entries, then its text whole or as its delta's windows.
@@ -794,20 +862,38 @@ fn write_text(
   }
 }
 
-/// The svndiff length of `windows`: the header and each window as svndiff version 0 writes it, none of them kept.
-fn encoded_len(windows: impl Iterator<Item = Window>) -> Result<u64, MigrationRefusal> {
-  let mut encoder = Encoder::new(Version::Zero);
-  let mut scratch = Vec::new();
-  let mut length = u64::try_from(HEADER_LEN).map_err(|_| MigrationRefusal::Corrupt)?;
-  for window in windows {
-    scratch.clear();
-    encoder
-      .window(&window, Compression::Stored, &mut scratch)
-      .map_err(MigrationRefusal::Delta)?;
-    let bytes = u64::try_from(scratch.len()).map_err(|_| MigrationRefusal::Corrupt)?;
-    length = length.checked_add(bytes).ok_or(MigrationRefusal::Corrupt)?;
+/// Measures the next window of a delta, adding its length as svndiff version 0 writes it, keeping no window: the
+/// measuring still owed, none once the deltifier has made its last window.
+fn measure_window(
+  repository: &Repository,
+  measuring: Measuring,
+) -> Result<Option<Measuring>, MigrationRefusal> {
+  let room = window_room()?;
+  let (from, to) = (
+    bytes_of(repository, measuring.source)?,
+    bytes_of(repository, measuring.target)?,
+  );
+  let mut made = match measuring.at {
+    Some(at) => deltas_at(from, to, room, at),
+    None => deltas(from, to, room),
   }
-  Ok(length)
+  .map_err(MigrationRefusal::Delta)?;
+  let Some(window) = made.next() else {
+    return Ok(None);
+  };
+  let mut scratch = Vec::new();
+  Encoder::new(Version::Zero)
+    .window(&window, Compression::Stored, &mut scratch)
+    .map_err(MigrationRefusal::Delta)?;
+  let bytes = u64::try_from(scratch.len()).map_err(|_| MigrationRefusal::Corrupt)?;
+  Ok(Some(Measuring {
+    at: Some(made.at()),
+    length: measuring
+      .length
+      .checked_add(bytes)
+      .ok_or(MigrationRefusal::Corrupt)?,
+    ..measuring
+  }))
 }
 
 /// What changed from `base` to `list`, as `svn_hash_write_incremental` writes it (`hash.c` 266-315): every property
