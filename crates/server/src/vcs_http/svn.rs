@@ -37,7 +37,8 @@
 //! with the new revision. A hook the repository configures at start-commit or pre-commit refuses the commit, as the
 //! svn+ssh tunnel refuses it, until hooks run. A commit presents its lock tokens as a stock client sends them: each
 //! request's `If` header, then the MERGE's `S:lock-token-list` with `X-SVN-Options: keep-locks` deciding whether the
-//! verdict releases them. An abandoned transaction is kept until its principal begins another.
+//! verdict releases them. A transaction idle past the edge's learned idle bound (`super::idle_bound_ns`) is released
+//! at the table's next use, as are any its principal left when it begins another.
 //!
 //! **Locks** (A-681, over A-627's `slates_svn::dav::locking` and A-602's lock table): a LOCK or an UNLOCK of a public
 //! path is read, judged by the repository's lock table at the owner's instant with a token drawn from the system's

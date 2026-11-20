@@ -1470,6 +1470,11 @@
 > handed to its transaction's drive a body run at a time (`DavCommit::begin_put`, `put_chunk`, `end_put`; the exchange's
 > `Streamed`), never held: a commit holds the drive's window and the texts it makes, bounded by its room. svn matrix
 > over HTTP 24 of 27 (lock passes; blame, diff and merge wait on w-reaper's reports).
+> **A-681, an abandoned HTTP transaction released (w-interop, 2026-11-20):** each kept transaction records its last
+> step's monotonic instant; one idle past the edge's learned idle bound (the idle phase's RFC 6298 bound, the silence
+> after which the edge judges a client gone) is released at the table's next use, counted
+> (`vcs_store.dav_commits_released`). Before the edge has learned that bound none is released early; the table stays
+> bounded by one a repository and principal.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
