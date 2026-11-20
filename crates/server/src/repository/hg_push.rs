@@ -74,7 +74,7 @@ use slates_hg::push::commit::{self, Unindexed};
 use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::tree::{self, Move};
 use slates_hg::push::verify::{self, Held, Unverified, Verified};
-use slates_hg::push::{Asks, Outcome, Unbundle, read_bundle};
+use slates_hg::push::{Asks, Outcome as PushOutcome, Unbundle, read_bundle};
 use slates_hg::serve::Repository;
 use slates_hg::{Admission, Node};
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
@@ -1260,7 +1260,7 @@ pub(crate) fn unbundle(
   repository: RepositoryId,
   pushing: Pushing<'_>,
   room: &mut Admission,
-) -> Option<Outcome> {
+) -> Option<PushOutcome> {
   let (principal, ..) = pushing;
   let prepared = match judged(state, repository, pushing, room)? {
     Ok(prepared) => prepared,
@@ -1271,8 +1271,8 @@ pub(crate) fn unbundle(
     state.count(vcs_store::RELEASE_REFUSED, 1);
   }
   Some(match landed.answer {
-    Ok(reply) => Outcome::Accepted(reply),
-    Err(refused) => Outcome::refused(&refused),
+    Ok(reply) => PushOutcome::Accepted(reply),
+    Err(refused) => PushOutcome::refused(&refused),
   })
 }
 
@@ -1283,17 +1283,17 @@ fn judged(
   repository: RepositoryId,
   (principal, heads, bundle): Pushing<'_>,
   room: &mut Admission,
-) -> Option<Result<Prepared, Outcome>> {
+) -> Option<Result<Prepared, PushOutcome>> {
   hg_view::with_view(state, repository, room, |view, held, room| {
     heads_hold(heads, view, room)?;
     let unbundle = read_bundle(bundle, room)?;
     let terms = (PUBLISHING, push_name(repository, bundle), room.left());
     let prepared = prepare(state, repository, &unbundle, (view, &held), terms, room)
-      .map_err(|refused| Outcome::refused(&refused))?;
+      .map_err(|refused| PushOutcome::refused(&refused))?;
     admitted(state, (principal, repository), &prepared)
-      .map_err(|refused| Outcome::refused(&refused))?;
+      .map_err(|refused| PushOutcome::refused(&refused))?;
     match hook_refused(state, repository) {
-      Some(refused) => Err(Outcome::refused(&refused)),
+      Some(refused) => Err(PushOutcome::refused(&refused)),
       None => Ok(prepared),
     }
   })
@@ -1305,11 +1305,11 @@ fn heads_hold(
   heads: &HeadsArgument,
   view: &impl Repository,
   room: &mut Admission,
-) -> Result<(), Outcome> {
+) -> Result<(), PushOutcome> {
   check::judge_heads_argument(heads, view, Moment::Preparing, room).map_err(|refused| match refused
   {
-    CheckRefusal::Raced { words } => Outcome::Unprocessed(words),
-    CheckRefusal::View(_) => Outcome::Unprocessed(VIEW_REFUSED.to_vec()),
+    CheckRefusal::Raced { words } => PushOutcome::Unprocessed(words),
+    CheckRefusal::View(_) => PushOutcome::Unprocessed(VIEW_REFUSED.to_vec()),
   })
 }
 
