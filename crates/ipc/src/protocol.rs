@@ -1312,7 +1312,14 @@ pub enum RequestBody {
     /// The host directory that holds a Mercurial repository's `.hg`, or the host file that holds a Subversion dump.
     path: String,
   },
-<<<<<<< HEAD
+  /// Read repository `repository`'s policy (§4.17.1 "Policy"; A-622), on the partition its name hashes to: its owner's
+  /// verb, as setting it is, so a setter can change one part and keep the rest (`slates repository policy`). Answered
+  /// `RepositoryPolicy` with its version and every part; refused `NotFound` for no such repository, `Forbidden` for
+  /// any principal but its owner, and `BadRequest` for a rule naming a principal the wire cannot carry. Appended.
+  DescribeRepositoryPolicy {
+    /// The repository's name.
+    repository: String,
+  },
   /// Export revisions `first` to `last` of Subversion repository `repository` as the dump stream `svnadmin dump` writes
   /// for the same range (§4.17.4 piece 6; A-628, A-652 part 3): format 2, or format 3 with `deltas` (`--deltas`); a
   /// range starting after revision 0 written incrementally (`--incremental`). The dump is written into a new volume
@@ -1332,15 +1339,6 @@ pub enum RequestBody {
     deltas: bool,
     /// The new volume's name.
     name: String,
-=======
-  /// Read repository `repository`'s policy (§4.17.1 "Policy"; A-622), on the partition its name hashes to: its owner's
-  /// verb, as setting it is, so a setter can change one part and keep the rest (`slates repository policy`). Answered
-  /// `RepositoryPolicy` with its version and every part; refused `NotFound` for no such repository, `Forbidden` for
-  /// any principal but its owner, and `BadRequest` for a rule naming a principal the wire cannot carry. Appended.
-  DescribeRepositoryPolicy {
-    /// The repository's name.
-    repository: String,
->>>>>>> origin/main
   },
 }
 
@@ -2386,11 +2384,8 @@ impl RequestBody {
       | RequestBody::RetireBranch { .. }
       | RequestBody::SetRepositoryPolicy { .. }
       | RequestBody::ImportRepository { .. }
-<<<<<<< HEAD
+      | RequestBody::DescribeRepositoryPolicy { .. }
       | RequestBody::ExportDump { .. } => None,
-=======
-      | RequestBody::DescribeRepositoryPolicy { .. } => None,
->>>>>>> origin/main
     }
   }
 
@@ -5502,15 +5497,6 @@ pub enum ReplyBody {
     /// The youngest revision.
     youngest: u64,
   },
-<<<<<<< HEAD
-  /// A Subversion repository's range of revisions exported as a dump into a new volume (`ExportDump`, A-652 part 3):
-  /// the volume, which holds it as [`DUMP_FILE`], and the dump's length in bytes. Appended.
-  DumpExported {
-    /// The new volume.
-    id: VolumeId,
-    /// The dump's length in bytes.
-    dump_bytes: u64,
-=======
   /// A repository's policy (`DescribeRepositoryPolicy`): its version (0 for one never set) and every part, as
   /// `SetRepositoryPolicy` gives them. Appended.
   RepositoryPolicy {
@@ -5524,7 +5510,14 @@ pub enum ReplyBody {
     hooks_env: Vec<HooksEnvSection>,
     /// A git repository's keys trusted to sign its commits.
     signers: Vec<Vec<u8>>,
->>>>>>> origin/main
+  },
+  /// A Subversion repository's range of revisions exported as a dump into a new volume (`ExportDump`, A-652 part 3):
+  /// the volume, which holds it as [`DUMP_FILE`], and the dump's length in bytes. Appended.
+  DumpExported {
+    /// The new volume.
+    id: VolumeId,
+    /// The dump's length in bytes.
+    dump_bytes: u64,
   },
 }
 

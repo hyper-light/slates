@@ -373,11 +373,8 @@ ReplyBody 75 CredentialRevoked
 ReplyBody 76 IdentitiesSet
 ReplyBody 77 RepositoryImported
 ReplyBody 78 DumpImported
-<<<<<<< HEAD
-ReplyBody 79 DumpExported
-=======
 ReplyBody 79 RepositoryPolicy
->>>>>>> origin/main
+ReplyBody 80 DumpExported
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -469,11 +466,8 @@ RequestBody 87 EnrollCredential
 RequestBody 88 RevokeCredential
 RequestBody 89 SetIdentities
 RequestBody 90 ImportRepository
-<<<<<<< HEAD
-RequestBody 91 ExportDump
-=======
 RequestBody 91 DescribeRepositoryPolicy
->>>>>>> origin/main
+RequestBody 92 ExportDump
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

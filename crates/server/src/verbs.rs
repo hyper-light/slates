@@ -2649,11 +2649,8 @@ pub(crate) fn route_gated(
     | RequestBody::RetireBranch { repository, .. }
     | RequestBody::SetRepositoryPolicy { repository, .. }
     | RequestBody::ImportRepository { repository, .. }
-<<<<<<< HEAD
+    | RequestBody::DescribeRepositoryPolicy { repository }
     | RequestBody::ExportDump { repository, .. } => {
-=======
-    | RequestBody::DescribeRepositoryPolicy { repository } => {
->>>>>>> origin/main
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -5229,7 +5226,10 @@ fn dispatch_inner(
     RequestBody::ImportRepository { repository, path } => {
       crate::repository::import::import_repository(state, principal, (&repository, &path))
     }
-<<<<<<< HEAD
+    // A repository's policy read whole by its owner (A-622; `slates repository policy`).
+    RequestBody::DescribeRepositoryPolicy { repository } => {
+      crate::repository::describe_policy(state, principal, &repository)
+    }
     // A Subversion repository's range of revisions exported as a dump into a new volume, answered when the export ends
     // (A-652 part 3).
     RequestBody::ExportDump {
@@ -5244,12 +5244,6 @@ fn dispatch_inner(
       (&repository, (first, last), deltas),
       name,
     ),
-=======
-    // A repository's policy read whole by its owner (A-622; `slates repository policy`).
-    RequestBody::DescribeRepositoryPolicy { repository } => {
-      crate::repository::describe_policy(state, principal, &repository)
-    }
->>>>>>> origin/main
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {
       principal: proven,

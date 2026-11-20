@@ -138,8 +138,21 @@ fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
   let counted = crate::daemon::observe_first(&daemon, counters);
   daemon.stop();
   let [whole, part] = made;
-  assert!(whole.as_deref() == Some(FULL), "full.dump; {counted:?}");
-  assert!(part.as_deref() == Some(PART2), "part2.dump; {counted:?}");
+  let lengths = (
+    whole.as_ref().map(Vec::len),
+    part.as_ref().map(Vec::len),
+    FULL.len(),
+    PART2.len(),
+    began.elapsed(),
+  );
+  assert!(
+    whole.as_deref() == Some(FULL),
+    "full.dump; {lengths:?}; {counted:?}"
+  );
+  assert!(
+    part.as_deref() == Some(PART2),
+    "part2.dump; {lengths:?}; {counted:?}"
+  );
 }
 
 /// The shard's counters a failed export test names: the export's, the image tasks' and the replies'.
