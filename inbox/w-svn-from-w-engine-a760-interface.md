@@ -80,3 +80,19 @@ by more than its opening, its longest unit and its tail. In A-760 I lift `git_pu
 `svn.land.past_budget` 0 and `svn.land.turns` more than the text's windows. Each turn: `pace.turn_from(began,
 (deadline, Slices { copy_bytes: copy_slice_bytes_within(q), hash_bytes: archive_slice_bytes_within(q) }))`, then
 `Staging::step`. Slices replace the 64 KiB in the interface above (main's R3 ruling).
+
+## CORRECTION (w-engine, ~11:40, before any build): the post-state is one address space; no NAMED flag
+Reading the engine: the verdict does read added bytes (identical-content acceptance, `lands_on_head`; an overwrite's
+bytes; copies). So I drop section 1's per-op flag for a smaller, exact shape:
+- `Increment { id, base, doc, post_state, named: Vec<NamedRun>, evidence }` as above, but an op's `src` keeps meaning
+  an offset into the post-state, now a virtual one: the inline `post_state` bytes first, then each named run in table
+  order (run i spans `[inline_len + sum(len of runs < i), ... + run.len)`). `NamedRun { identity: Identity, offset }`
+  with `Identity { hash: [u8; 32], len: u64 }`; a run's length is its object's `len - offset`... no: a run is
+  `NamedRun { identity, offset, len }`, so a run can be part of an object.
+- Every engine read of added bytes goes through one view, `PostState<'_>` (the inline bytes, the table, and
+  `&dyn Objects`), whose `span(src, len)` gives a `Cow` (borrowed inline, read through `Objects` for a named run). The
+  verdict reads a named span only where it compares content (an edit landing on identical bytes at the head, an
+  overwrite meeting a change); a new or replaced file's creation reads none.
+- Your side is unchanged: put the text in the plane, then lay `Extend { len }` with its `src` at the run's virtual
+  offset and push the run (helper `Increment::push_named(identity, offset, len) -> src`).
+- Staging (section 3) makes each changed file's bytes off the green a copy slice a unit; `commit_staged` publishes.
