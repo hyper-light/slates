@@ -2423,6 +2423,10 @@
 > run 21 failed after forming, a successor owner's shard 0 spinning 5.6 s without a step right after its takeover
 > (watchdog exit 4; owed, w-forming's queue). An earlier sweep on the build before A-735 hung twice on a replaced
 > member's client claim (A-735).
+> **Combined (2026-11-20, w-forming, same box and flow under `taskpolicy -b`, main with A-735):** 147 of 148 runs
+> formed and settled (sw48c 48/48, rp2 40/40, rp3 54/55, rp4 5/5 with the CPU-judged start wait), past the 143 at which
+> a 1-in-48 stall shows with 95% odds; the one other run (rp3 run 9) never reached forming, an initial daemon starved
+> past the old 30 s wall start wait (fixed in b25a5b7a6). No stall of membership in any run.
 > **Start waits under load (2026-11-20, w-forming; same box):** at load 29 to 31 on its 14 CPUs (other agents' builds,
 > Spotlight indexing cargo targets, a VM), the fleet daemons' control shards went 8 to 12 s between heartbeat turns
 > ("the control shard's beat task ran 12053 ms after its last turn", against windows of 1 to 4.2 s, with 4 to 35 long
