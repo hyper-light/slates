@@ -404,6 +404,12 @@
 > debug); left: the engine's verdict (8.3 ms) and commit (10.9), the recorded entry (4.7), retention's secure (5.0),
 > and the git store's record and commit (11.5, w-git's A-722).
 >
+> **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
+> (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
+> `ContentUnread` while unread. OWED: part 2, the commit's file blocks built a slice a unit and published in one step;
+> the server's `Objects` over vcs_store's plane and the svn landing's turns (w-svn); replay reading a chain entry's
+> runs first; items 3-7 (the green's block naming the plane's object, no copy).
+>
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
 > room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the
@@ -7306,12 +7312,14 @@
 >   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
 >   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `vm`, `start_judgment`
 >   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
->   are not listed yet), `winfsp`, `pmem`, `load_fleet` and the rest
+>   are not listed yet), `winfsp`, `live_winfsp` and `winfsp_semantics`
 >   (`recovered::await_recovered`'s wall form goes with `winfsp`, which runs only on Windows); the VM harness `vm` and
 >   its suites (`guest_dax`, `guest_image`, `guest_vhost`) since 2026-11-20: the guest's boot, replies, console lines
 >   and power-off waited for while the VM's process tree gains CPU (`process_wait::Judged`; `BOOT_WAIT`, `REPLY_WAIT` and
 >   the start wait gone, `QUIT_WAIT` left bounding only the read of a VMM's last words after its exit), a daemon's
->   restart and steadiness judged as `cli`'s are; written on macOS, compiled by w-lint on Linux, and `xtask`'s remaining `MOUNT_WAIT` uses (its tracers' bounds and the NFS attribute cache's
+>   restart and steadiness judged as `cli`'s are; `pmem` (its launcher's lines and end judged in its tree, its file's
+>   readback over the instance, its VMM's death awaited on a pidfd, `process_wait::await_exit_of`) and `load_fleet`
+>   (as `load_scale`); all written on macOS and compiled by w-lint on Linux, and `xtask`'s remaining `MOUNT_WAIT` uses (its tracers' bounds and the NFS attribute cache's
 >   `visible`, waits on other parties' work). Since 2026-11-20 a wait on the kernel's mount table, in the tests and in
 >   `xtask`'s mount, is `process_wait::await_mount_table`: woken by the kernel's own word (macOS `EVFILT_FS`, Linux
 >   `POLLPRI` on `/proc/self/mountinfo`), within the observation budget, never a poll (main's ruling). `xtask`'s conformance harness since 2026-11-20:

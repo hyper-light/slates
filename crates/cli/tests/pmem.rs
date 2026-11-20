@@ -28,7 +28,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsFd;
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::time::{Duration, Instant};
 
 use slates_client::{Client, Intent, VolumeId};
 use vm::{Anchor, created_volume, run, start_anchor};
@@ -41,8 +40,6 @@ const GRANULE: u64 = 2 << 20;
 const FILE: &str = "image.bin";
 /// Format: the descriptor number the VMM finds its copy at.
 const COPY_FD: &str = "3";
-/// Shape: how long a line from the launcher or its VMM, a sync, or a process's end may take.
-const WAIT: Duration = Duration::from_secs(20);
 /// Format: the environment variables the role reads: the copy's name and length, as the launcher wrote them into the
 /// VMM's arguments.
 const ROLE_PATH: &str = "SLATES_TEST_PMEM_PATH";
@@ -199,22 +196,28 @@ impl Launch {
     }
   }
 
-  /// The next line holding `words`, within [`WAIT`]; every line read is kept for a failure's report.
+  /// The next line holding `words`, waited for while the launcher's process tree (it and its VMM) gains CPU
+  /// (`vm::Judged`; until 2026-11-20 within a 20 s `WAIT`); every line read is kept for a failure's report.
   fn expect(&mut self, words: &str) -> String {
-    let deadline = Instant::now() + WAIT;
+    let mut judged = vm::Judged::of(self.launcher.id());
     loop {
-      match self
-        .lines
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-      {
+      match self.lines.recv_timeout(vm::POLL) {
         Ok(line) => {
           self.seen.push(line.clone());
           if line.contains(words) {
             return line;
           }
         }
-        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
-          "no line holding `{words}` within {WAIT:?}; the lines so far:\n{}",
+        Err(RecvTimeoutError::Timeout) => {
+          let verdict = judged.judge();
+          assert!(
+            matches!(verdict, vm::Verdict::Waiting { .. }),
+            "no line holding `{words}`: the launcher's processes are {verdict:?}; the lines so far:\n{}",
+            self.seen.join("\n")
+          );
+        }
+        Err(RecvTimeoutError::Disconnected) => panic!(
+          "no line holding `{words}`: the launcher's lines ended; the lines so far:\n{}",
           self.seen.join("\n")
         ),
       }
@@ -243,16 +246,18 @@ impl Launch {
       .unwrap();
   }
 
-  /// Waits for the launcher to end, within [`WAIT`]: its exit code, or the signal that ended it.
+  /// Waits for the launcher to end, while its tree gains CPU (until 2026-11-20 within `WAIT`): its exit code, or the
+  /// signal that ended it.
   fn ended(&mut self) -> std::process::ExitStatus {
-    let started = Instant::now();
+    let mut judged = vm::Judged::of(self.launcher.id());
     loop {
       if let Some(status) = self.launcher.try_wait().unwrap() {
         return status;
       }
+      let verdict = judged.judge();
       assert!(
-        started.elapsed() < WAIT,
-        "the launcher ended within {WAIT:?}; its lines:\n{}",
+        matches!(verdict, vm::Verdict::Waiting { .. } | vm::Verdict::Gone),
+        "the launcher ended: its processes are {verdict:?}; its lines:\n{}",
         self.seen.join("\n")
       );
       vm::pause();
@@ -315,10 +320,11 @@ impl Rig {
       .unwrap_or_else(|err| panic!("slates read: {err}"))
   }
 
-  /// Waits, within [`WAIT`], until the file holds `byte` over `[at, at + count)`. A write landing during a read is
+  /// Waits, while the instance's processes progress (`vm::InstanceWait`; until 2026-11-20 within `WAIT`), until the file
+  /// holds `byte` over `[at, at + count)`. A write landing during a read is
   /// refused by `slates read` (`READ_CHANGED`, "changed while it was read"), which here is a read to make again.
   fn holds_eventually(&self, (at, byte, count): (usize, u8, usize), what: &str) {
-    let started = Instant::now();
+    let mut progress = vm::InstanceWait::new();
     loop {
       match self.read() {
         Ok(held) if held[at..at + count].iter().all(|seen| *seen == byte) => return,
@@ -326,7 +332,7 @@ impl Rig {
         Err(err) if err.contains(READ_CHANGED) => {}
         Err(err) => panic!("slates read: {err}"),
       }
-      assert!(started.elapsed() < WAIT, "{what} within {WAIT:?}");
+      progress.check(&self.instance, what);
       vm::pause();
     }
   }
@@ -430,14 +436,11 @@ fn a_pmem_launchers_death_ends_its_vmm() {
   launch.store(0, FIRST, u64::try_from(page).unwrap());
   launch.signal(rustix::process::Signal::KILL);
   let _ = launch.ended();
-  let started = Instant::now();
-  while std::path::Path::new(&format!("/proc/{vmm}")).exists() {
-    assert!(
-      started.elapsed() < WAIT,
-      "the VMM (process {vmm}) ended with its launcher within {WAIT:?}"
-    );
-    vm::pause();
-  }
+  // On the kernel's own word, a pidfd readable at the exit (until 2026-11-20 a poll of /proc within `WAIT`).
+  assert!(
+    vm::await_exit_of(u32::try_from(vmm).unwrap()),
+    "the VMM (process {vmm}) ended with its launcher"
+  );
   rig.holds_eventually(
     (0, FIRST, page),
     "the daemon's reap of the launcher's client compared the copy back",
@@ -552,12 +555,10 @@ fn a_copy_no_holder_claims_after_a_takeover_is_written_back_and_let_go() {
   .unwrap();
   launch.signal(rustix::process::Signal::KILL);
   let _ = launch.ended();
-  let started = Instant::now();
+  // While the anchor's tree gains CPU (until 2026-11-20 within `WAIT`).
+  let mut judged = vm::Judged::of(rig.anchor.child.id());
   while vm::daemon_of(&rig.anchor).is_none_or(|pid| pid == old) {
-    assert!(
-      started.elapsed() < WAIT,
-      "the anchor restarted its daemon within {WAIT:?}"
-    );
+    judged.look("the anchor restarted its daemon");
     vm::pause();
   }
   vm::await_steady(&rig.instance);

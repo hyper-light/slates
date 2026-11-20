@@ -280,6 +280,7 @@ fn oracle(store: &Store, green: &Green, push: &Push<'_>) -> Expected {
       doc,
       post_state: post,
       evidence: Vec::new(),
+      named: Default::default(),
     }),
     laying.reads,
   )
@@ -879,6 +880,7 @@ fn an_attribute_and_a_mode_on_the_root_compose_and_land() {
     doc,
     post_state: post,
     evidence: Vec::new(),
+    named: Default::default(),
   };
   assert_eq!(green.submit(&increment), Outcome::Accepted { version: 1 });
   assert_eq!(green.xattr(ROOT, "user.note"), Some(&b"root"[..]));
@@ -916,6 +918,7 @@ fn a_removed_file_and_directory_take_their_mode_and_attributes_with_them() {
       doc,
       post_state: post,
       evidence: Vec::new(),
+      named: Default::default(),
     };
     assert_eq!(green.submit(&increment), Outcome::Accepted { version });
   };

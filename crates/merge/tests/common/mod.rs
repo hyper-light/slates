@@ -214,6 +214,7 @@ impl Build {
       doc: self.doc.clone(),
       post_state: self.post.clone(),
       evidence: Vec::new(),
+      named: Default::default(),
     }
   }
 }

@@ -74,6 +74,7 @@ fn work(id: u8, ops: &[(OpKind, u64, &[u8], u64)]) -> Increment {
     doc,
     post_state: post,
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 

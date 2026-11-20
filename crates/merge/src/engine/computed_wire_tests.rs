@@ -27,6 +27,7 @@ fn bare() -> Increment {
     doc: OpsDoc::new(),
     post_state: Vec::new(),
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 

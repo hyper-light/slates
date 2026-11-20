@@ -104,6 +104,7 @@ impl Work {
       doc: self.doc.clone(),
       post_state: self.post.clone(),
       evidence: Vec::new(),
+      named: Default::default(),
     }
   }
 }
@@ -130,9 +131,10 @@ fn conflicted(outcome: &Outcome) -> Option<BTreeSet<String>> {
     Outcome::Conflict { windows } => {
       Some(windows.iter().map(|window| window.path.clone()).collect())
     }
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } | Outcome::CopyRefused { .. } => {
-      None
-    }
+    Outcome::Accepted { .. }
+    | Outcome::BaseUnavailable { .. }
+    | Outcome::CopyRefused { .. }
+    | Outcome::ContentUnread { .. } => None,
   }
 }
 
@@ -144,9 +146,10 @@ fn classes_on(outcome: &Outcome, path: &str) -> Vec<MergeConflictClass> {
       .filter(|window| window.path == path)
       .map(|window| window.class)
       .collect(),
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } | Outcome::CopyRefused { .. } => {
-      Vec::new()
-    }
+    Outcome::Accepted { .. }
+    | Outcome::BaseUnavailable { .. }
+    | Outcome::CopyRefused { .. }
+    | Outcome::ContentUnread { .. } => Vec::new(),
   }
 }
 

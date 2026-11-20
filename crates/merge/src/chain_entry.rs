@@ -1039,6 +1039,7 @@ mod tests {
       doc,
       post_state: b"x".to_vec(),
       evidence: Vec::new(),
+      named: Default::default(),
     };
     let applied: Vec<Applied> = increment
       .doc
@@ -1093,6 +1094,7 @@ mod tests {
       doc,
       post_state: b"x".to_vec(),
       evidence: Vec::new(),
+      named: Default::default(),
     };
     let mapped = Op {
       at: 5,

@@ -85,6 +85,9 @@ pub struct Increment {
   pub post_state: Vec<u8>,
   /// The evidence references (BLAKE3 identities, opaque here) the submitter attached.
   pub evidence: Vec<[u8; 32]>,
+  /// The runs of the post-state named by identity rather than carried (A-760, `crate::named`): the post-state holds
+  /// their bytes only once they are read ([`Increment::read_step`]).
+  pub named: crate::named::Named,
 }
 
 /// Format: the width of one evidence reference (a BLAKE3 identity) in the increment encoding — the
@@ -104,13 +107,111 @@ impl Increment {
     out.extend_from_slice(&self.base.to_le_bytes());
     out.extend_from_slice(&(doc.len() as u64).to_le_bytes());
     out.extend_from_slice(&doc);
-    out.extend_from_slice(&(self.post_state.len() as u64).to_le_bytes());
-    out.extend_from_slice(&self.post_state);
+    let inline = self.inline_post_state();
+    out.extend_from_slice(&(inline.len() as u64).to_le_bytes());
+    out.extend_from_slice(inline);
     out.extend_from_slice(&(self.evidence.len() as u64).to_le_bytes());
     for reference in &self.evidence {
       out.extend_from_slice(reference);
     }
+    // The named runs (A-760) follow only when there are any, so a work naming none encodes as before.
+    if !self.named.is_empty() {
+      out.extend_from_slice(&(self.named.runs.len() as u64).to_le_bytes());
+      for run in &self.named.runs {
+        out.extend_from_slice(&run.identity.hash);
+        out.extend_from_slice(&run.identity.len.to_le_bytes());
+        out.extend_from_slice(&run.offset.to_le_bytes());
+        out.extend_from_slice(&run.len.to_le_bytes());
+      }
+    }
     out
+  }
+
+  /// The post-state's inline bytes: all of it while no run is named, else those before the first run (A-760).
+  fn inline_post_state(&self) -> &[u8] {
+    if self.named.is_empty() {
+      return &self.post_state;
+    }
+    let inline = usize::try_from(self.named.inline_len).unwrap_or(usize::MAX);
+    self.post_state.get(..inline).unwrap_or(&self.post_state)
+  }
+
+  /// Names `run` as the post-state's next bytes (A-760): the offset an op's `src` gives them. Refused (none) once any
+  /// named byte is read, since a run is placed after those named before it.
+  pub fn push_named(&mut self, run: crate::named::NamedRun) -> Option<u64> {
+    if self.named.is_empty() {
+      self.named.inline_len = u64::try_from(self.post_state.len()).ok()?;
+    }
+    if u64::try_from(self.post_state.len()).ok()? != self.named.inline_len {
+      return None;
+    }
+    let src = self.named.inline_len.checked_add(self.named.len())?;
+    self.named.runs.push(run);
+    Some(src)
+  }
+
+  /// The first named run whose bytes are not all read yet (A-760): none once the post-state is whole.
+  pub fn unread(&self) -> Option<&crate::named::NamedRun> {
+    let read = u64::try_from(self.post_state.len())
+      .unwrap_or(u64::MAX)
+      .saturating_sub(self.named.inline_len);
+    let mut start = 0u64;
+    for run in &self.named.runs {
+      let end = start.saturating_add(run.len);
+      if read < end {
+        return Some(run);
+      }
+      start = end;
+    }
+    None
+  }
+
+  /// Reads the next at most `slice` bytes of the named runs from `objects` onto the post-state (A-760; a step of the
+  /// owner's, its copy slice): whether every run is read. The post-state is reserved once at its whole length.
+  pub fn read_step(
+    &mut self,
+    objects: &impl crate::named::Objects,
+    slice: u64,
+  ) -> Result<bool, crate::named::ObjectMissing> {
+    let whole = self.named.inline_len.saturating_add(self.named.len());
+    let held = u64::try_from(self.post_state.len()).unwrap_or(u64::MAX);
+    // The run the bytes read so far end in, and where it starts in the post-state.
+    let mut start = self.named.inline_len;
+    let mut next = None;
+    for run in &self.named.runs {
+      let end = start.saturating_add(run.len);
+      if held < end {
+        next = Some(*run);
+        break;
+      }
+      start = end;
+    }
+    let Some(run) = next else {
+      return Ok(true);
+    };
+    let missing = crate::named::ObjectMissing {
+      identity: run.identity,
+    };
+    if held == self.named.inline_len {
+      let more = usize::try_from(whole.saturating_sub(held)).map_err(|_| missing)?;
+      self
+        .post_state
+        .try_reserve_exact(more)
+        .map_err(|_| missing)?;
+    }
+    let done = held.saturating_sub(start);
+    let take = run.len.saturating_sub(done).min(slice.max(1));
+    let from = usize::try_from(held).map_err(|_| missing)?;
+    let to = from
+      .checked_add(usize::try_from(take).map_err(|_| missing)?)
+      .ok_or(missing)?;
+    self.post_state.resize(to, 0);
+    let into = self.post_state.get_mut(from..to).ok_or(missing)?;
+    if let Err(refused) = objects.read(&run.identity, run.offset.saturating_add(done), into) {
+      self.post_state.truncate(from);
+      return Err(refused);
+    }
+    Ok(self.unread().is_none())
   }
 
   /// The length of [`Increment::encode`]'s bytes, without making them: what a caller sizing an entry by it needs (A-728
@@ -129,8 +230,19 @@ impl Increment {
       size_of::<u64>(), // the post-state's length
       size_of::<u64>(), // the evidence count
       doc,
-      self.post_state.len(),
+      self.inline_post_state().len(),
       self.evidence.len().saturating_mul(EVIDENCE_BYTES),
+      if self.named.is_empty() {
+        0
+      } else {
+        size_of::<u64>().saturating_add(
+          self
+            .named
+            .runs
+            .len()
+            .saturating_mul(crate::named::RUN_BYTES),
+        )
+      },
     ]
     .into_iter()
     .fold(0, usize::saturating_add)
@@ -164,6 +276,7 @@ impl Increment {
       reference.copy_from_slice(reader.bytes(EVIDENCE_BYTES)?);
       evidence.push(reference);
     }
+    let named = decode_named(&mut reader, post_state.len())?;
     if !reader.is_empty() {
       return Err(DocDecodeError::TrailingBytes);
     }
@@ -173,8 +286,51 @@ impl Increment {
       doc,
       post_state,
       evidence,
+      named,
     })
   }
+}
+
+/// The named runs after an increment's evidence (A-760), none where the bytes end there; each run's count checked
+/// against the bytes left before its table is reserved.
+fn decode_named(
+  reader: &mut crate::ops_doc::Reader<'_>,
+  inline: usize,
+) -> Result<crate::named::Named, crate::ops_doc::DocDecodeError> {
+  use crate::named::{Identity, Named, NamedRun, RUN_BYTES};
+  use crate::ops_doc::DocDecodeError;
+  if reader.is_empty() {
+    return Ok(Named::default());
+  }
+  // Fewer bytes than a count are no table: trailing bytes, as before runs were named.
+  if reader.remaining() < size_of::<u64>() {
+    return Err(DocDecodeError::TrailingBytes);
+  }
+  let count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
+  if count == 0 || count > reader.remaining() / RUN_BYTES {
+    return Err(DocDecodeError::Truncated);
+  }
+  let mut runs = Vec::with_capacity(count);
+  for _ in 0..count {
+    let mut hash = [0u8; 32];
+    let hash_len = hash.len();
+    hash.copy_from_slice(reader.bytes(hash_len)?);
+    let len = reader.u64()?;
+    let offset = reader.u64()?;
+    let run_len = reader.u64()?;
+    if offset.checked_add(run_len).is_none_or(|end| end > len) {
+      return Err(DocDecodeError::Truncated);
+    }
+    runs.push(NamedRun {
+      identity: Identity { hash, len },
+      offset,
+      len: run_len,
+    });
+  }
+  Ok(Named {
+    inline_len: u64::try_from(inline).map_err(|_| DocDecodeError::Truncated)?,
+    runs,
+  })
 }
 
 /// A conflict window: the file, the range (base coordinates) that met an intervening change, and
@@ -220,6 +376,12 @@ pub enum Outcome {
     path: String,
     /// Why.
     case: CopyRefusal,
+  },
+  /// A named run of the work's post-state is not read yet (A-760, `crate::named`): refused before any verdict, typed,
+  /// never judged over missing bytes; its owner reads the runs first ([`Increment::read_step`]).
+  ContentUnread {
+    /// The run's object.
+    identity: crate::named::Identity,
   },
 }
 
@@ -298,6 +460,12 @@ pub enum Judgment {
     path: String,
     /// Why.
     case: CopyRefusal,
+  },
+  /// A named run of the work's post-state is not read yet (A-760, `crate::named`): refused before any verdict, typed,
+  /// never judged over missing bytes; its owner reads the runs first ([`Increment::read_step`]).
+  ContentUnread {
+    /// The run's object.
+    identity: crate::named::Identity,
   },
 }
 
@@ -453,6 +621,12 @@ pub enum ComputeRefused {
     /// Why.
     case: CopyRefusal,
   },
+  /// A named run of the work's post-state is not read yet (A-760, `crate::named`): refused before any verdict, typed,
+  /// never judged over missing bytes; its owner reads the runs first ([`Increment::read_step`]).
+  ContentUnread {
+    /// The run's object.
+    identity: crate::named::Identity,
+  },
 }
 
 /// The result of a rebase (§4.16 "Rebase, the only corrective path"). The green is never changed by
@@ -502,6 +676,12 @@ pub enum Rebased {
     path: String,
     /// Why.
     case: CopyRefusal,
+  },
+  /// A named run of the work's post-state is not read yet (A-760, `crate::named`): refused before any verdict, typed,
+  /// never judged over missing bytes; its owner reads the runs first ([`Increment::read_step`]).
+  ContentUnread {
+    /// The run's object.
+    identity: crate::named::Identity,
   },
 }
 
@@ -5033,6 +5213,7 @@ impl Green {
       Judgment::Conflict { windows } => (Outcome::Conflict { windows }, None),
       Judgment::BaseUnavailable { base, floor } => (Outcome::BaseUnavailable { base, floor }, None),
       Judgment::CopyRefused { path, case } => (Outcome::CopyRefused { path, case }, None),
+      Judgment::ContentUnread { identity } => (Outcome::ContentUnread { identity }, None),
     }
   }
 
@@ -5065,6 +5246,11 @@ impl Green {
       return Err(ComputeRefused::BaseAhead {
         base: inc.base,
         head: at,
+      });
+    }
+    if let Some(run) = inc.unread() {
+      return Err(ComputeRefused::ContentUnread {
+        identity: run.identity,
       });
     }
     let resolved = Green::resolve(inc);
@@ -5140,6 +5326,7 @@ impl Green {
         floor: self.deltas_from,
       },
       Err(ComputeRefused::CopyRefused { path, case }) => Judgment::CopyRefused { path, case },
+      Err(ComputeRefused::ContentUnread { identity }) => Judgment::ContentUnread { identity },
     }
   }
 
@@ -5280,6 +5467,11 @@ impl Green {
     // increment twice is corrupt, and its caller sees the version differ from the one the entry was recorded as.
     if let Some(version) = self.accepted.get(&inc.id) {
       return *version;
+    }
+    // A named run not read yet (A-760) is never applied as zeros: nothing commits, and the head answered differs from
+    // the version the entry was recorded as, which its caller refuses as it refuses any chain that disagrees.
+    if inc.unread().is_some() {
+      return self.head();
     }
     let copies = copy::EntryCopies::of(applied);
     let effects = applied
@@ -5811,6 +6003,11 @@ impl Green {
         head: to,
       };
     }
+    if let Some(run) = inc.unread() {
+      return Rebased::ContentUnread {
+        identity: run.identity,
+      };
+    }
     let resolved = Green::resolve(inc);
     if let Some((path, case)) = self.copy_refusal(&resolved) {
       return Rebased::CopyRefused { path, case };
@@ -6182,6 +6379,8 @@ mod copy_restate;
 
 #[cfg(test)]
 mod copy_tests;
+#[cfg(test)]
+mod named_tests;
 
 mod reanchor;
 pub use reanchor::{ReanchorRefused, Reanchored};
@@ -6292,6 +6491,7 @@ mod tests {
         doc: self.doc,
         post_state: self.post,
         evidence: Vec::new(),
+        named: Default::default(),
       }
     }
   }

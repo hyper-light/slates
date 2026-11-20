@@ -303,6 +303,7 @@ fn increment(draft: Draft, base: u64, id: u64) -> Increment {
     doc: draft.doc,
     post_state: draft.post,
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 
@@ -489,6 +490,9 @@ fn same_verdict(
     ))),
     Judgment::CopyRefused { path, case } => Err(TestCaseError::fail(format!(
       "the owner refused the copy to {path}: {case:?}"
+    ))),
+    Judgment::ContentUnread { identity } => Err(TestCaseError::fail(format!(
+      "the owner refused an unread run of {identity:?}"
     ))),
   }
 }
@@ -751,7 +755,9 @@ fn judged_answer(judgment: &Judgment) -> Answer {
     Judgment::Accepted(_) => Answer::Accepted,
     Judgment::AcceptedBefore { .. } => Answer::Before,
     Judgment::Conflict { .. } => Answer::Conflict,
-    Judgment::BaseUnavailable { .. } | Judgment::CopyRefused { .. } => Answer::Unknown,
+    Judgment::BaseUnavailable { .. }
+    | Judgment::CopyRefused { .. }
+    | Judgment::ContentUnread { .. } => Answer::Unknown,
   }
 }
 
