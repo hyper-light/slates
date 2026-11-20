@@ -4927,6 +4927,12 @@ pub enum VolumeRefusal {
   /// retained version or bytes, or the volume is at its retention allowance. Not the volume's quota: destroying a
   /// snapshot frees it. Appended (2026-11-18; until then it reached a client as `NoSpace`).
   RetentionExceeded,
+  /// A referenced file's content identity was not answered by the shard's content store (A-645 P3 ruling 2): the view's
+  /// bytes are not there to read. Appended.
+  ReferenceUnresolved,
+  /// The volume's referenced files still hold content identities, so it is neither destroyed nor cloned until its owner
+  /// releases them (A-645 P3 ruling 2). Appended.
+  ReferencesHeld,
 }
 
 /// Why a planned move was refused ([`Refusal::MoveRefused`], A-291): each names what the caller can change. Append-only.

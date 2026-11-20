@@ -191,6 +191,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       found: *found,
       expected: *expected,
     }),
+    VfsError::ReferenceUnresolved => volume(VolumeRefusal::ReferenceUnresolved),
+    VfsError::ReferencesHeld => volume(VolumeRefusal::ReferencesHeld),
   }
 }
 

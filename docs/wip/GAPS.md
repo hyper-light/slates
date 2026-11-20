@@ -966,7 +966,10 @@
 > and revprops files from the index and the green, laid out a revision a step and generated when read; stock
 > `svnadmin verify`, `dump` (whole and `--deltas`) and `svnlook changed` read the golden repository's view as the
 > repository the dump came from. Part 2: `fsfs::transaction_files`, an open transaction's directory and
-> prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. Owed: P3 (the presenter under
+> prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. P3's
+> referenced file BUILT (2026-11-20, main's ruling 2): `slates_vfs::referenced`, a read-only file of content-store
+> identities read through the store's seam (zero bytes copied over a view of 64 texts), held by its volume until
+> released, `EROFS` to every change; the server's seam over `ContentStore`. Owed: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on

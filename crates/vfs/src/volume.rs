@@ -28,6 +28,9 @@ use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind, SpecialNode};
 use crate::journal::{Op, OpLog};
 use crate::names::{self, NameEquivalence};
 use crate::quota::{Accounting, Quota};
+use crate::referenced::{
+  self, Identity, Piece, ReferencedBody, ReferencedContent, ReferencedCounts, ReferencedHolds,
+};
 use crate::snapshot::{Dead, Deadlist, Snapshot};
 use crate::trie::{self, TrieNode};
 
@@ -438,6 +441,9 @@ pub struct Volume {
   pub(crate) idle_pending: std::collections::BTreeSet<InodeNo>,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
+  /// The content identities this volume's referenced files hold, one entry per hold (A-645 P3 ruling 2,
+  /// [`crate::referenced`]), and the counts of its referenced reads.
+  pub(crate) referenced: ReferencedLedger,
   /// Open and lookup references per inode number (§4.6 lifetime; the inode-addressed-io design):
   /// an inode's content and table entry survive `unlink` while any reference is held, so a file
   /// unlinked while open keeps serving until the last reference drops. Bounded by referenced
@@ -651,6 +657,53 @@ impl Leaf {
   }
 }
 
+/// Gives back one hold of each of `ids` through `content`, every one even past a refusal: the first refusal.
+fn release_all<'a>(
+  content: &mut dyn ReferencedHolds,
+  ids: impl Iterator<Item = &'a Identity>,
+) -> Result<(), VfsError> {
+  let mut first = Ok(());
+  for id in ids {
+    let released = content.release(id);
+    first = first.and(released);
+  }
+  first
+}
+
+/// A volume's referenced-file ledger (A-645 P3 ruling 2, [`crate::referenced`]): the identities held for its files, one
+/// entry per hold, and the counts of its referenced reads. Bounded by the content pieces its files name.
+#[derive(Debug, Default)]
+pub(crate) struct ReferencedLedger {
+  /// One entry per hold taken (or, when `owed`, to be taken) through the store's seam.
+  pub(crate) holds: Vec<Identity>,
+  /// Whether a recovery rebuilt `holds` from an image, so this daemon's store has not taken them.
+  pub(crate) owed: bool,
+  /// What referenced reads have returned and copied; a cell, since a read borrows the volume shared.
+  pub(crate) counts: std::cell::Cell<ReferencedCounts>,
+}
+
+impl ReferencedLedger {
+  /// Adds one read's counts.
+  fn count(&self, read: ReferencedCounts) {
+    let mut counts = self.counts.get();
+    counts.bytes_read = counts.bytes_read.saturating_add(read.bytes_read);
+    counts.bytes_copied = counts.bytes_copied.saturating_add(read.bytes_copied);
+    self.counts.set(counts);
+  }
+
+  /// Notes the identities a recovered body holds, owed to this daemon's store.
+  pub(crate) fn recovered(&mut self, body: &Body) {
+    if let Body::Referenced(body) = body {
+      for piece in body.pieces() {
+        if let Piece::Content { id, .. } = piece {
+          self.holds.push(*id);
+          self.owed = true;
+        }
+      }
+    }
+  }
+}
+
 /// A `readdir` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirRow<'a> {
@@ -774,6 +827,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       attachment_opens: BTreeMap::new(),
@@ -845,6 +899,11 @@ impl Volume {
     if config.names != origin.policy {
       return Err(VfsError::PolicyMismatch);
     }
+    // A referenced file's identities are held by its volume, not its inode (A-645 P3 ruling 2): a clone would share the
+    // inodes and hold nothing, so its reads would outlive the origin's release. A view is regenerated, never cloned.
+    if !origin.referenced.holds.is_empty() {
+      return Err(VfsError::ReferencesHeld);
+    }
     let snap = origin
       .snapshots
       .get_mut(snapshot_handle(snapshot))
@@ -902,6 +961,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       attachment_opens: BTreeMap::new(),
@@ -1010,6 +1070,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       attachment_opens: BTreeMap::new(),
@@ -1688,6 +1749,26 @@ impl Volume {
     self.read_body(store, no, off, buf)
   }
 
+  /// Reads up to `buf.len()` bytes at `off` of file `no`, a referenced file's content pieces through `content` (A-645
+  /// P3 ruling 2, [`crate::referenced`]); any other file reads as [`Volume::read`] reads it. Counted in
+  /// [`Volume::referenced_counts`].
+  pub fn read_referenced(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+    content: &dyn ReferencedContent,
+  ) -> Result<usize, VfsError> {
+    self.namespace_inode(store, no)?;
+    self.read_body_with(store, no, off, buf, Some(content))
+  }
+
+  /// What this volume's referenced reads have returned, and how much of it the store copied rather than lent.
+  pub fn referenced_counts(&self) -> ReferencedCounts {
+    self.referenced.counts.get()
+  }
+
   /// Reads any file-bodied inode, an attribute inode included: the attribute verbs' read.
   pub(crate) fn read_body(
     &self,
@@ -1695,6 +1776,17 @@ impl Volume {
     no: InodeNo,
     off: u64,
     buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
+    self.read_body_with(store, no, off, buf, None)
+  }
+
+  fn read_body_with(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+    content: Option<&dyn ReferencedContent>,
   ) -> Result<usize, VfsError> {
     let inode = self.inode(store, no)?;
     if inode.kind.is_special() {
@@ -1748,6 +1840,11 @@ impl Volume {
         for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
+      }
+      // Its content pieces need the store: `read_referenced` lends it, and a read without one is refused.
+      Body::Referenced(body) => {
+        let read = referenced::read_into(body, content, off, out)?;
+        self.referenced.count(read);
       }
       Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
     }
@@ -1830,7 +1927,7 @@ impl Volume {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
-    self.create_leaf(store, dir, name, mode, Leaf::File)
+    self.create_leaf(store, dir, name, mode, Leaf::File, None)
   }
 
   /// Creates a name with no content (A-26, A-294): a FIFO or socket name without a stream or listener, or a device
@@ -1844,7 +1941,7 @@ impl Volume {
     node: SpecialNode,
   ) -> Result<InodeNo, VfsError> {
     let dir = self.entry_dir(store, dir_no)?;
-    self.create_leaf(store, dir, name, mode, Leaf::Special(node))
+    self.create_leaf(store, dir, name, mode, Leaf::Special(node), None)
   }
 
   fn create_leaf(
@@ -1854,6 +1951,7 @@ impl Volume {
     name: &str,
     mode: u32,
     leaf: Leaf,
+    referenced: Option<Box<ReferencedBody>>,
   ) -> Result<InodeNo, VfsError> {
     let kind = leaf.kind();
     self.live()?;
@@ -1872,9 +1970,14 @@ impl Volume {
     let parent = store.dirs.get(dir)?.inode;
     let no = self.next_no(store)?;
     let now = self.clock.wall_ns();
-    let body = match leaf {
-      Leaf::Special(node) => node.body(),
-      Leaf::File => Body::Inline(Vec::new()),
+    // A referenced file's length is its pieces' sum, known now; its bytes are the content store's, charged to no volume.
+    let (body, size) = match (leaf, referenced) {
+      (Leaf::Special(node), _) => (node.body(), 0),
+      (Leaf::File, None) => (Body::Inline(Vec::new()), 0),
+      (Leaf::File, Some(body)) => {
+        let size = body.len();
+        (Body::Referenced(body), size)
+      }
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Home::new(parent, self.policy.hash(name));
@@ -1882,6 +1985,7 @@ impl Volume {
       inode.windows = crate::inode::WindowsAttributes::new_file();
     }
     stamp_all(&mut inode.attrs, now);
+    inode.attrs.size = size;
     let handle = self.install(store, no, inode)?;
     let child = leaf.child(no);
     // Publication: the name is the one step a client sees.
@@ -2522,6 +2626,7 @@ impl Volume {
     if kind == Kind::Symlink {
       return Err(VfsError::Invalid);
     }
+    self.refuse_referenced(store, no)?;
     if bytes.is_empty() {
       return Ok(0);
     }
@@ -2671,12 +2776,102 @@ impl Volume {
     Ok(())
   }
 
+  /// Refuses any change to a referenced file's content, `EROFS` (A-645 P3 ruling 2): its bytes are the content store's,
+  /// shared by identity, and a view is regenerated, never edited.
+  fn refuse_referenced(&self, store: &Store, no: InodeNo) -> Result<(), VfsError> {
+    match self.inode(store, no)?.body {
+      Body::Referenced(_) => Err(VfsError::ReadOnly),
+      _ => Ok(()),
+    }
+  }
+
+  /// Creates a read-only referenced file named `name` in the directory named by `dir_no` (A-645 P3 ruling 2,
+  /// [`crate::referenced`]): its content is `pieces`, in order, and its length their sum. Every content piece's identity
+  /// is held through `content` before the file exists, one hold a piece, and kept in the volume's ledger until
+  /// [`Volume::release_references`]; a hold refused, or the create refused, lets go of every hold it took.
+  pub fn create_referenced(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+    pieces: Vec<Piece>,
+    content: &mut dyn ReferencedHolds,
+  ) -> Result<InodeNo, VfsError> {
+    let body = ReferencedBody::new(pieces)?;
+    let ids: Vec<Identity> = body
+      .pieces()
+      .iter()
+      .filter_map(|piece| match piece {
+        Piece::Content { id, .. } => Some(*id),
+        Piece::Made(_) => None,
+      })
+      .collect();
+    let mut held = 0usize;
+    for id in &ids {
+      if let Err(refusal) = content.hold(id) {
+        return Err(refusal.after_undo(release_all(content, ids.iter().take(held))));
+      }
+      held = held.saturating_add(1);
+    }
+    let made = self
+      .entry_dir(store, dir_no)
+      .and_then(|dir| self.create_leaf(store, dir, name, mode, Leaf::File, Some(Box::new(body))));
+    match made {
+      Ok(no) => {
+        self.referenced.holds.extend(ids);
+        Ok(no)
+      }
+      Err(refusal) => Err(refusal.after_undo(release_all(content, ids.iter()))),
+    }
+  }
+
+  /// Lets go of every content identity this volume's referenced files hold, through `content`, the store that took
+  /// them (A-645 P3 ruling 2): the presenter's last step before it destroys the volume, which refuses while any is
+  /// held. A ledger a recovery rebuilt was never held by this daemon's store ([`Volume::references_owed`]), so it is
+  /// dropped without releasing. Every hold is given back even past a refusal, and the first refusal is the answer; the
+  /// ledger is empty either way, so a destroy can follow.
+  pub fn release_references(&mut self, content: &mut dyn ReferencedHolds) -> Result<(), VfsError> {
+    let holds = std::mem::take(&mut self.referenced.holds);
+    if std::mem::take(&mut self.referenced.owed) {
+      return Ok(());
+    }
+    release_all(content, holds.iter())
+  }
+
+  /// Whether this volume's ledger came from a recovery image and its store has not held it yet
+  /// ([`Volume::hold_owed_references`]).
+  pub fn references_owed(&self) -> bool {
+    self.referenced.owed
+  }
+
+  /// Takes the holds a recovered volume's ledger names through `content`, the successor's store (A-645 P3 ruling 2): a
+  /// refused hold lets go of those taken and leaves the ledger owed.
+  pub fn hold_owed_references(
+    &mut self,
+    content: &mut dyn ReferencedHolds,
+  ) -> Result<(), VfsError> {
+    if !self.referenced.owed {
+      return Ok(());
+    }
+    for (taken, id) in self.referenced.holds.iter().enumerate() {
+      if let Err(refusal) = content.hold(id) {
+        return Err(refusal.after_undo(release_all(
+          content,
+          self.referenced.holds.iter().take(taken),
+        )));
+      }
+    }
+    self.referenced.owed = false;
+    Ok(())
+  }
+
   /// Refuses an allocation of anything but a regular file, as a write is refused: a directory is
   /// `IsDirectory`, an IPC name `SpecialFileOperation`, and a symlink `Invalid` (POSIX `EINVAL` — a symlink is
   /// reached through `readlink`, never allocated as content; the `_ => Ok` arm formerly admitted it).
   fn allocatable(&self, store: &Store, no: InodeNo) -> Result<(), VfsError> {
     match self.kind(store, no)? {
-      Kind::File => Ok(()),
+      Kind::File => self.refuse_referenced(store, no),
       Kind::Dir => Err(VfsError::IsDirectory),
       Kind::Symlink => Err(VfsError::Invalid),
       Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
@@ -2769,6 +2964,7 @@ impl Volume {
     if kind == Kind::Symlink {
       return Err(VfsError::Invalid);
     }
+    self.refuse_referenced(store, no)?;
     // The windows a truncate cuts away retain their chunks when a snapshot pins them (§4.2
     // retention): secured before anything changes.
     let retention = self.retention_of_truncate(store, no, len)?;
@@ -3327,6 +3523,7 @@ impl Volume {
     if self.kind(store, no)? == Kind::Symlink {
       return Err(VfsError::Invalid);
     }
+    self.refuse_referenced(store, no)?;
     let size = self.inode(store, no)?.attrs.size;
     if at > size {
       return Err(VfsError::Invalid);
@@ -3791,6 +3988,10 @@ impl Volume {
   pub fn destroy(&mut self, store: &mut Store) -> Result<(), VfsError> {
     if self.state == VolumeState::Destroyed {
       return Err(VfsError::Destroying);
+    }
+    // Its referenced files' holds leave first, through the store that took them ([`Volume::release_references`]).
+    if !self.referenced.holds.is_empty() {
+      return Err(VfsError::ReferencesHeld);
     }
     self.state = VolumeState::Destroying;
     // The whole volume's retention returns to the shard budgets (§4.2): settled here, at destroy,
@@ -7367,6 +7568,11 @@ pub(crate) fn read_frozen_body(
         store.content.read_extent_into(e, off, out)?;
       }
     }
+    // A referenced file as the snapshot froze it: its made pieces serve, and a content piece, which needs the store a
+    // snapshot read is not lent, is refused `ReferenceUnresolved`, never zeros presented as content.
+    Body::Referenced(body) => {
+      referenced::read_into(body, None, off, out)?;
+    }
     Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
   }
   Ok(want)
@@ -7793,7 +7999,7 @@ fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
       chunk_ranges(sealed, &mut ranges);
       ranges.push((open.off, open.off.saturating_add(open.len)));
     }
-    Body::Base(_) => ranges.push((0, size)),
+    Body::Base(_) | Body::Referenced(_) => ranges.push((0, size)),
     Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
   }
   ranges.sort_unstable();
