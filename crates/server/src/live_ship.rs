@@ -2239,11 +2239,19 @@ fn append_entry(
     return Err(NotAppended::Gone);
   };
   // A whole record is a checkpoint and may go one past the credit (`Shipper::append_checkpoint`); a delta waits for it.
+  let probe = std::time::Instant::now();
+  let probe_len = payload.len();
   let appended = if whole {
     live.shipper.append_checkpoint(payload.clone())
   } else {
     live.shipper.append(payload.clone())
   };
+  if probe.elapsed() >= std::time::Duration::from_millis(20) {
+    eprintln!(
+      "W_FORMING_PROBE append_entry: shipper append of {probe_len} bytes (whole {whole}) {} ms",
+      probe.elapsed().as_millis()
+    );
+  }
   let entry = appended.map_err(NotAppended::Refused)?;
   let published_ns = live
     .publishing_ns
@@ -2461,10 +2469,14 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
     drop_build(state, id, LIVE_BUILD_SUPERSEDED);
     return Advance::Done;
   }
+  let probe_keys = std::time::Instant::now();
   let Some((lineage, namer, segment)) = body_keys(state, id) else {
     drop_build(state, id, "fleet.live.refused.no_payload");
     return Advance::Done;
   };
+  if probe_keys.elapsed() >= std::time::Duration::from_millis(50) {
+    eprintln!("W_FORMING_PROBE whole build: body_keys {} ms", probe_keys.elapsed().as_millis());
+  }
   let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
   let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES)
     .unwrap_or(usize::MAX)
@@ -2485,11 +2497,20 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
     .get(build.next..build.next.saturating_add(cap).min(build.body.len()))
     .filter(|piece| !piece.is_empty())
   {
+    let probe_piece = std::time::Instant::now();
+    let probe_len = piece.len();
     let chunk = slates_archive::Archive::raw_chunk(piece.to_vec());
     let Ok(sealed) = slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, segment) else {
       refused = true;
       break;
     };
+    if probe_piece.elapsed() >= std::time::Duration::from_millis(50) {
+      eprintln!(
+        "W_FORMING_PROBE whole build: one piece of {probe_len} bytes sealed in {} ms (quantum {} us)",
+        probe_piece.elapsed().as_millis(),
+        quantum / 1_000
+      );
+    }
     build.next = build.next.saturating_add(piece.len());
     build.sealed.push(SealedPiece {
       name: sealed.name.to_vec(),
@@ -2507,14 +2528,27 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
   if !sealed_whole {
     return Advance::More;
   }
+  let probe_append = std::time::Instant::now();
   append_build(state, id);
+  if probe_append.elapsed() >= std::time::Duration::from_millis(50) {
+    eprintln!("W_FORMING_PROBE whole build: append_build {} ms", probe_append.elapsed().as_millis());
+  }
   Advance::Done
 }
 
 /// Appends what `id`'s [`WholeBuild`] holds ready ([`append_ready`]) and ships it.
 fn append_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
-  if append_ready(state, id) {
+  let probe = std::time::Instant::now();
+  let ready = append_ready(state, id);
+  let appended_ms = probe.elapsed().as_millis();
+  if ready {
     ship_appended(state, id);
+  }
+  if probe.elapsed() >= std::time::Duration::from_millis(50) {
+    eprintln!(
+      "W_FORMING_PROBE append_build parts: append_ready {appended_ms} ms, ship_appended {} ms",
+      probe.elapsed().as_millis() - appended_ms
+    );
   }
 }
 
