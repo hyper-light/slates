@@ -169,7 +169,7 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       RecordedCredentials,
       ShardRepositories,
       Halves::new(
-        UploadServices::new(ShardStores),
+        UploadServices::new(ShardStores, room),
         ReceiveServices::new(ThisShard),
       ),
     )
@@ -290,4 +290,4 @@ pub(crate) fn bind(config: &DaemonConfig, address: SocketAddrV4) -> Result<TcpLi
 
 #[cfg(test)]
 #[path = "tests/daemon_edge.rs"]
-mod tests;
+pub(crate) mod tests;

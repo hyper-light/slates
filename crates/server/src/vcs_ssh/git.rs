@@ -22,8 +22,9 @@
 //! once and its haves round by round, so a stateless answer to its second round would have lost its wants. That session
 //! is owed (GAPS).
 //!
-//! **Bounds.** Each request is admitted what the repository's shard could admit when it began (the lender's `room`,
-//! A-713), as the HTTP edge admits one. An answer is written
+//! **Bounds.** Each request is admitted the edge's request room, or what the repository's shard could admit when it began
+//! where that is less (the lender's `room`, A-713), as the HTTP edge admits one, and answered in turns as it does (A-745:
+//! a fetch's pack's objects chosen within the shard's step quantum as the answer is written). An answer is written
 //! one whole pkt-line's room a step (`pktline::MAX_LEN`, the format's own limit), and the edge steps the command again only
 //! once that step's bytes have gone to the channel, so the output held is a packet at most. The input held is at most the
 //! channel's window, which the session refuses to exceed; what a request consumed is given back to it.
@@ -99,17 +100,21 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   answer: Option<Answer<<L::Packs as PackSource>::Pack>>,
   /// The admission of the request it answers, lent to each step of its writing (A-653 continued (4)).
   admission: Admission,
+  /// The room one request may hold: the edge's (A-745, §4.17.1 "A fetch's answer" rule 2: a request's room bounds a
+  /// slice, never a repository).
+  room: u64,
   /// What follows it.
   after: After,
 }
 
 impl<L: StoreLender> UploadCommand<L> {
   /// A session of `reader` over the store of `repository` that `lender` lends, at protocol `version`, each request
-  /// admitted the room its stores' shard could admit when it began.
+  /// admitted `room`, the edge's request room, or what its stores' shard could admit when it began where that is less.
   pub(crate) fn new(
     lender: L,
     (repository, reader): (RepositoryId, Principal),
     version: Version,
+    room: u64,
   ) -> Self {
     Self {
       lender,
@@ -122,11 +127,13 @@ impl<L: StoreLender> UploadCommand<L> {
       advertised: false,
       answer: None,
       admission: Admission::new(0),
+      room,
       after: After::Next,
     }
   }
 
-  /// Answers `asked` over the lent store, within a fresh admission of the room its shard could admit now, kept for the
+  /// Answers `asked` over the lent store in turns (A-745: a fetch's pack's objects chosen as the answer is written),
+  /// within a fresh admission of the request's room, or what its shard could admit now where that is less, kept for the
   /// answer's writing; refused when the store is no longer held.
   fn serve(&mut self, asked: Asked<'_>) -> Result<(), Refused> {
     let Self {
@@ -136,19 +143,19 @@ impl<L: StoreLender> UploadCommand<L> {
       version,
       answer,
       admission,
+      room,
       after,
       ..
     } = self;
-    *admission = Admission::new(lender.room(*repository).ok_or_else(unheld)?);
+    let shard = lender.room(*repository).ok_or_else(unheld)?;
+    *admission = Admission::new((*room).min(shard));
     let made = lender
       .lend((*repository, reader), |served, packs| {
-        upload::serve(served, *version, asked, packs, admission)
+        upload::serve_in_turns(served, *version, asked, packs, admission)
       })
       .ok_or_else(unheld)?;
     *after = if made.ends_session() {
       After::End
-    } else if made.refusal().is_some() {
-      After::Die
     } else {
       After::Next
     };
@@ -172,11 +179,17 @@ impl<L: StoreLender> UploadCommand<L> {
     };
     let written = lender
       .lend_objects(*repository, |served, packs| {
-        made.write(served, packs, admission, out, MAX_LEN)
+        let mut spent = packs.turn();
+        made.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
       })
       .ok_or_else(unheld)?;
     if written == Written::More {
       return Ok(Next::More);
+    }
+    // A refusal is the answer's to say, as it is made or as it is written (a pack's choice refused midway): its session
+    // dies as git's upload-pack dies.
+    if made.refusal().is_some() && matches!(after, After::Next) {
+      *after = After::Die;
     }
     *answer = None;
     Ok(match after {

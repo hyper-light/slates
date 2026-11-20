@@ -765,11 +765,11 @@ fn a_push_whose_pack_is_larger_than_one_ring_region_lands_through_the_daemons_ed
 
 /// Shape: the commits of [`long_history`]: as many as git/git's history to v1.0.0 (2,930), whose every clone was refused
 /// for its room.
-const LONG_HISTORY: usize = 3_000;
+pub(crate) const LONG_HISTORY: usize = 3_000;
 
 /// Stock git's request creating `main` at the last of `commits` commits in one line, each changing the one file, and that
 /// commit: three objects a commit.
-fn long_history(commits: usize) -> (Vec<u8>, ObjectId) {
+pub(crate) fn long_history(commits: usize) -> (Vec<u8>, ObjectId) {
   let (request, made) = long_history_refs(commits, 0);
   (request, made.last().copied().expect("a commit"))
 }
@@ -845,7 +845,7 @@ fn a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemon
 }
 
 /// A v2 `fetch` of `want` with `done` and no progress, as `git clone` asks for a branch's commit.
-fn fetch_of(want: ObjectId) -> Vec<u8> {
+pub(crate) fn fetch_of(want: ObjectId) -> Vec<u8> {
   let mut request = Vec::new();
   pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
   pktline::write(Packet::Delim, &mut request).expect("the delimiter");
@@ -902,7 +902,7 @@ const PACK_ROOM: u64 = 1 << 26;
 
 /// The data packets of `bytes` from `at` to the first flush, each whole, and where that flush ends; bytes that end
 /// before one fail the test.
-fn packets_from(bytes: &[u8], mut at: usize) -> (Vec<Vec<u8>>, usize) {
+pub(crate) fn packets_from(bytes: &[u8], mut at: usize) -> (Vec<Vec<u8>>, usize) {
   let mut lines = Vec::new();
   loop {
     let rest = bytes.get(at..).unwrap_or_default();
@@ -918,7 +918,7 @@ fn packets_from(bytes: &[u8], mut at: usize) -> (Vec<Vec<u8>>, usize) {
 }
 
 /// The ids of the objects `pack` holds, read whole as git's index-pack reads one, in name order.
-fn ids_in(pack: &[u8]) -> Vec<String> {
+pub(crate) fn ids_in(pack: &[u8]) -> Vec<String> {
   let mut admission = Admission::new(PACK_ROOM);
   let unpacked = unpack::read_whole(pack, GitFormat::Sha1, &NoIndex, &mut admission);
   let unpacked = unpacked.expect("a whole pack");
@@ -932,7 +932,7 @@ fn ids_in(pack: &[u8]) -> Vec<String> {
 }
 
 /// The pack a protocol v2 `fetch` answer carries: its `packfile` section's band-1 data, joined.
-fn fetched_pack(answer: &[u8]) -> Vec<u8> {
+pub(crate) fn fetched_pack(answer: &[u8]) -> Vec<u8> {
   let (lines, _) = packets_from(answer, 0);
   let (section, packets) = lines.split_first().expect("a section");
   assert_eq!(section.as_slice(), b"packfile\n", "{answer:?}");

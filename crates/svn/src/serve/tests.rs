@@ -36,10 +36,15 @@ mod replay;
 const PLENTY: Budget = Budget {
   room: 1 << 24,
   steps: 1 << 20,
+  quantum: None,
 };
 
 /// The smallest budget: one byte and one step a call.
-const SMALLEST: Budget = Budget { room: 1, steps: 1 };
+const SMALLEST: Budget = Budget {
+  room: 1,
+  steps: 1,
+  quantum: None,
+};
 
 /// Limits past anything the fixtures hold.
 const LIMITS: Limits = Limits {

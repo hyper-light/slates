@@ -743,6 +743,85 @@ fn a_push_sealed_and_staged_a_unit_a_turn_lands_as_one_staged_whole() {
   assert!(stepped_store.is_empty() && whole_store.is_empty());
 }
 
+/// A-722 part 4b's race (found by reading after the 100-push run): a staging that a landing overtakes must be staged
+/// again, whatever step it was in. Do: push the merge history and stage it a unit a turn until it has given two of its
+/// positions; meanwhile land a push of its first commit (with its tree and blob) and the wide history's first version;
+/// finish the staging and land it. Expect: every object of the three pushes at a position of its own, each position
+/// naming its object back, and one row a key.
+#[test]
+fn a_push_landed_while_another_is_staged_takes_no_position_of_the_others() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let made = history(format);
+  let (first, _, c1, _) = wide(format);
+  let shared: Vec<Made> = made
+    .objects
+    .iter()
+    .filter(|object| {
+      [made.c1.id, made.t1.id].contains(&object.id)
+        || (object.kind == Kind::Blob && object.content == b"a\n")
+    })
+    .cloned()
+    .collect();
+  let mut push = Push::new(format);
+  push
+    .admit_all(
+      &mut store,
+      &repository.naming(),
+      &mut Source::new(made.objects.clone()),
+    )
+    .unwrap();
+  let mut staging = repository.sealing(&mut store, &mut push).unwrap();
+  let mut clock = Ticking(0);
+  let mut turn = |repository: &mut Repository, store: &mut ContentStore, push: &mut Push| {
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 0,
+    };
+    repository
+      .stage_turn(store, push, &mut staging, quantum)
+      .unwrap()
+  };
+  // Four commits numbered and the push sealed; eight objects checked and the positions begun; two positions given.
+  for _ in 0..(4 + 1 + 8 + 1 + 2) {
+    assert!(!turn(&mut repository, &mut store, &mut push));
+  }
+  push_and_move(
+    &mut repository,
+    &mut store,
+    shared.clone(),
+    &[(3, Some(made.c1.id))],
+  )
+  .unwrap();
+  push_and_move(
+    &mut repository,
+    &mut store,
+    first.clone(),
+    &[(2, Some(c1.id))],
+  )
+  .unwrap();
+  while !turn(&mut repository, &mut store, &mut push) {}
+  land(&mut repository, &mut store, push, 1, made.merge.id);
+  let mut positions = BTreeSet::new();
+  for object in made.objects.iter().chain(&first) {
+    let position = repository.object(&store, &object.id).unwrap().position;
+    assert_eq!(
+      repository.id_at(&store, position),
+      Some(object.id),
+      "{}",
+      object.id
+    );
+    positions.insert(position);
+  }
+  assert_eq!(positions.len(), made.objects.len() + first.len());
+  assert_eq!(
+    repository.next_position(),
+    u64::try_from(positions.len()).unwrap()
+  );
+  repository.release(&mut store).unwrap();
+}
+
 /// `green`'s move to `to` admitted a unit a turn, each turn's quantum none: the move, and the turns it took.
 fn admitted_in_turns(
   repository: &Repository,

@@ -221,6 +221,13 @@ pub(crate) struct VcsStores {
   dav_commits: BTreeMap<(RepositoryId, String), DavHeld>,
   /// The HTTP transactions this shard has named, which a transaction's name counts.
   dav_named: u64,
+  /// How many fetches hold each Subversion store's generation (A-749, §4.17.1 "A fetch's answer" rule 4,
+  /// [`hold_svn`]): bounded by the fetches in flight.
+  svn_holders: BTreeMap<u64, usize>,
+  /// The records of each Subversion store freed while a fetch held its generation ([`free`]), by that generation, with
+  /// their repository and what they hold of the shard's budget, until the last hold is given back
+  /// ([`release_svn_hold`]): bounded by the fetches in flight.
+  svn_held: BTreeMap<u64, (RepositoryId, SvnRecords, u64)>,
 }
 
 /// One repository's store, by its tool (module docs).
@@ -346,6 +353,9 @@ pub(crate) struct HgStore {
 /// A Subversion repository's store: its records, beside its one green (A-655 part 2b; module docs, "Subversion").
 #[derive(Debug, Default)]
 pub(crate) struct SvnStore {
+  /// The generation the store was made as: a store made again (a rebuild) is another, which a fetch's hold on this one
+  /// never reads (A-749 rule 4, [`hold_svn`]).
+  pub(crate) generation: u64,
   /// The records: none until the creation's record is replayed.
   pub(crate) records: Option<SvnRecords>,
   /// What the records hold of the shard's budget, charged as retention.
@@ -737,7 +747,10 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
       generation: stores.next_generation(),
       ..HgStore::default()
     })),
-    VcsTool::Subversion => RepositoryStore::Subversion(Box::default()),
+    VcsTool::Subversion => RepositoryStore::Subversion(Box::new(SvnStore {
+      generation: stores.next_generation(),
+      ..SvnStore::default()
+    })),
   };
   stores.entries.entry(record.id).or_insert(store);
   Ok(())
@@ -765,6 +778,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   }
   state.vcs_stores.unrecovered.remove(&id);
   state.vcs_usage.forget(&id);
+  keep_held_svn(&mut state.vcs_stores, id);
   if !release_charged(state, id) {
     state.count(RELEASE_REFUSED, 1);
   }
@@ -821,6 +835,70 @@ pub(crate) fn admit_objects(state: &ShardState, bytes: usize) -> Result<(), u64>
     return Err(room);
   }
   Ok(())
+}
+
+/// Subversion repository `id`'s records kept aside with their charge as its store is freed, where a fetch holds their
+/// generation (A-749, §4.17.1 "A fetch's answer" rule 4): the fetch ends on the records it began on, whatever rebuilds
+/// or removes the store meanwhile, and the last hold's release gives them and their charge back ([`release_svn_hold`]).
+fn keep_held_svn(stores: &mut VcsStores, id: RepositoryId) {
+  let Some(RepositoryStore::Subversion(store)) = stores.entries.get_mut(&id) else {
+    return;
+  };
+  if !stores.svn_holders.contains_key(&store.generation) {
+    return;
+  }
+  if let Some(records) = store.records.take() {
+    let charged = core::mem::take(&mut store.charged);
+    stores
+      .svn_held
+      .insert(store.generation, (id, records, charged));
+  }
+}
+
+/// A fetch's hold on Subversion repository `id`'s store as it is now (A-749 rule 4): its generation, counted held;
+/// none when its records are not lent here.
+pub(crate) fn hold_svn(stores: &mut VcsStores, id: RepositoryId) -> Option<u64> {
+  stores.subversion_records(id)?;
+  let generation = stores.subversion(id)?.generation;
+  let holders = stores.svn_holders.entry(generation).or_insert(0);
+  *holders = holders.saturating_add(1);
+  Some(generation)
+}
+
+/// Gives back one hold on `generation` ([`hold_svn`]): at the last, the records kept aside for it, if its store was
+/// freed meanwhile, are dropped and their charge given back to the shard's budget.
+pub(crate) fn release_svn_hold(state: &mut ShardState, generation: u64) {
+  let stores = &mut state.vcs_stores;
+  match stores.svn_holders.get_mut(&generation) {
+    Some(holders) if *holders > 1 => {
+      *holders = holders.saturating_sub(1);
+      return;
+    }
+    Some(_) => {
+      stores.svn_holders.remove(&generation);
+    }
+    None => return,
+  }
+  if let Some((_, _, charged)) = stores.svn_held.remove(&generation) {
+    state.store.budget.credit_retention(charged);
+  }
+}
+
+/// The records a fetch's hold on repository `id`'s `generation` reads (A-749 rule 4): those kept aside when its store
+/// was freed, else the store's own while it is that generation and lent; none otherwise.
+pub(crate) fn held_svn_records(
+  stores: &VcsStores,
+  id: RepositoryId,
+  generation: u64,
+) -> Option<&SvnRecords> {
+  if let Some((held, records, _)) = stores.svn_held.get(&generation) {
+    return (*held == id).then_some(records);
+  }
+  let records = stores.subversion_records(id)?;
+  match stores.entries.get(&id)? {
+    RepositoryStore::Subversion(store) if store.generation == generation => Some(records),
+    _ => None,
+  }
 }
 
 /// [`release`], the Subversion records' charge given back to the shard's budget first (A-655 part 2b).

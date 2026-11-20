@@ -11685,7 +11685,10 @@ never the whole work. A verdict crosses from the copy that computed it to the ow
 `Computed::encode`): the units in the order the work's are visited, each its effects as the chain entry records them
 (content by reference to the increment's post-state), its windows and where its content ops stood; the owner reads it
 back against the increment it judged (`Green::computed_from`), each effect rebuilt as a replay rebuilds it, a splice left
-unmade for the commit to make.
+unmade for the commit to make. Its route (A-658 part 3b, built by A-697 part c, behind A-697's test hook until its last
+piece): a holder's work composes its increment, the holder's replica computes its verdict, and `SubmitComputed`
+carries both to the owner, which commits it by `Green::submit_computed` (`judge_computed`, then `commit_judged` at once)
+inside the submit's own step.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -12333,9 +12336,30 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > four times over, so the two packets it is framed through fit a request's room (they had cost two whole pkt-lines,
 > 128 KiB, past one ring region). A-582's clone is answered whole within 4 KiB, the same pack in more packets; with
 > each request held to 64 KiB, the 3,000-commit clone over the daemon's edge is answered whole, where it was refused
-> `the request needs more room than the server admits`. Owed for git: the servers admitting a request's room and
-> answering in turns (piece 3b, by use over HTTP and SSH), protocol v0's fetch in turns, `begin`'s `ready` and cut and
-> `include-tag`'s scan in units, a scattered plan's runs, and a fetch held to the index generation it began on (rule 4).
+> `the request needs more room than the server admits`. **Piece 3b BUILT (same day):** both edges admit a fetch the
+> edge's request room (or the shard's, where less: A-713's `StoreLender::room` now bounds it, never sets it) and answer
+> it in turns, the pack source's `turn` the shard's step quantum on the shard's clock (`ShardPacks`); an SSH session
+> dies as git's does on a refusal the answer gives as it is written. By use: the 3,000-commit clone over the daemon's
+> HTTP edge, each request one ring region, and the same history pushed and cloned over the SSH edge, each request 64
+> KiB, its pack far larger, each answered whole. Owed for git: protocol v0's fetch in turns, `begin`'s `ready` and cut
+> and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a run), and a fetch held to the index
+> generation it began on (rule 4); the live `git clone` rows of the matrix (main's).
+> **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
+> newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
+> both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
+> 278,528 B room. DAV's ran to 8.3 ms and 410,243 B. Each slice stopped only once its bytes had reached the room, so its
+> last call (a whole text window) went past it, and the drive was handed the room, or the nodes it may hold open, as one
+> call's step allowance. Now each slice of the editor drive (`report::exchange::Exchange::receive` for svn:// and
+> svn+ssh, `dav::update::UpdateWalk::resume` for a REPORT) stays within its room except for one call larger than the
+> room alone. A call that would pass the room after others is held whole and written first by the next slice. A slice
+> takes the drive a step at a time until the shard's quantum has run (`Budget::quantum`, the caller's clock). Rule 4: a
+> report, or a read streamed over many calls, holds its records' generation (`svn_view::SvnHold`). A rebuild or
+> removal meanwhile keeps those records aside, still charged, until the last hold drops (`vcs_store::keep_held_svn`).
+> The oracle is the whole room's bytes (stock `svnserve`'s, `update.c`'s): every room's slices make the same bytes. CI
+> also checks working copies against `svnadmin load`'s over `file://`. By use after (`diag-w-bugs-svnfetch-6`), the
+> working copies match svnadmin's over both edges after a checkout, an update back 500 revisions and the update forward.
+> The largest slice is 99,424 B on svn:// and 136,865 B on DAV. Rule 3 is still owed: one drive step, a text window's
+> delta, takes up to 4.7 ms on svn:// and 6.5 ms on DAV, so a window must be made in pieces (`report::drive`).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -22675,7 +22699,13 @@ Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on
 owner admits a work another node will hold by `AdmitWork`, a forwarded verb, judging the relayed principal's rights from
 its green's record and recording the work's floor at the head (`verbs::admit_work`, `verbs::owner_admit`). Part a2
 (2026-11-20, behind the test hook `Daemon::serve_works_on_holders`): a holder makes the work on its client's partition,
-asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. Part b
+(2026-11-20): the holder moves and drops the work's floor at the owner by `MoveWorkFloor` (`work_home::tell_floor_over_fleet`,
+`verbs::move_work_floor`). Part c (2026-11-20): a holder's submit is committed by the verdict its replica computed,
+taken by position at the owner (`work_home::verdict_over_fleet`, `SubmitComputed`, `Green::submit_computed`). Part d
+(2026-11-20): the submit settles once the holder's replica holds the version (`work_home::hold_until_replica`,
+`replica_reached`). Part e (2026-11-20): a holder's work is recovered from its log over the holder's replica
+(`work_home::holder_replay`, `Unbuilt::holder`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22698,8 +22728,11 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     in force behind a test hook until its last piece): a node holding the green's replica makes the work itself, on
     its client's partition, so the work's id names that node; the green's owner admits it by `AdmitWork`, forwarded,
     judging the rights from its green's record and holding the base by the work's floor; and the work's base reads are
-    answered by the node's replica, byte for byte the owner's. Its verdict, its floors' moves, recovery and takeover
-    follow in A-697's later parts. Until A-400 a work was placed on
+    answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
+    by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
+    replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b), the submit answered once the
+    node's replica holds the version it made; after a restart it comes back from its log over the node's replica.
+    Its rebase, a copy it submits, and takeover follow in A-697's later parts. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -55573,6 +55606,18 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4b's race — A staging a landing overtakes is staged again, whatever step it was in (bug, 2026-11-20, w-git; found by reading after the 100-push run)
+- **Cause.** Part 4b made the stage's fork at its rows' step and read the next position at its positions' step, so a
+  push that landed during the staging's earlier turns could leave a stage that looked current (its fork made after
+  the landing) with positions or rows the landing had taken: a shared object's row met as `RowDiffers`, or two objects
+  at one position.
+- **Change.** The staging's first unit makes its fork and reads the next position (`Step::Forking`); every later step
+  carries them, and the stage records that base, so any landing in between leaves it stale and the commit stages it
+  again.
+- **Tests.** `slates-git` `store::tests::a_push_landed_while_another_is_staged_takes_no_position_of_the_others` (red:
+  `Index(RowDiffers)`); `slates-git --lib -- store:: receive::` 139 passed, 4 ignored; `slates-server --lib --
+  vcs_store:: git_push:: repository:: vcs_http::git` 170 passed; fmt clean (macOS arm64, this Mac, local).
+
 ### A-722 part 4d — A replayed record's thin pack resolves its deltas a delta a unit (2026-11-20, w-git for UI goal 93)
 - **Change.** `slates_git::unpack::Reader::resolve_turn_with`: w-balance's resolution in turns (032617278) over the
   reader's own keeper, a thin pack's outside bases read from the store; a git record's replay (`git_replay`) resolves
@@ -56143,3 +56188,129 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   name `AlreadyExists` naming the work; the unshared green `NotShared` from A). Red with the hook off: the work's id
   named A. The fleet filter `a_holder` 16 of 16 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2,
   `verbs::` 62 of 62; fmt clean.
+
+### A-697 part b — A holder's work moves and drops its floor at its green's owner, by a monotone forwarded verb (2026-11-20, w-shared for UI goal 93; main's plan for A-697)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/ipc/src/protocol.rs`, `crates/server/src/verbs.rs`, `crates/server/src/work_home.rs`,
+`crates/server/tests/fleet.rs`.
+- **Change.** `RequestBody::MoveWorkFloor { green, work, base: Option<u64> }` and `ReplyBody::WorkFloorMoved`,
+  appended (wire order published). Where a work on a holder node moves its floor (its base rises) or drops it (the
+  work is destroyed, or its creation lost its name after the admission), `work_home::tell_floor` hands the change to
+  `tell_floor_over_fleet`: once the verb's transaction has committed and its change took, `MoveWorkFloor` is forwarded
+  from the control shard to the green's owner. Part a2 had counted such a change owed and left the floor at the owner.
+- **Why it needs no completion record.** The owner's rule is monotone (`verbs::move_work_floor`): a floor only rises, so a
+  lower or equal base is a no-op; a drop is final; and a work with no floor there (never admitted, or dropped) is left
+  without one, so a late, repeated or reordered move changes nothing. So it forwards as a read does (`forwards_as_read`,
+  its doc amended), and a lost one only keeps more history, as a lost floor message between shards does (A-247).
+- **Who may send it.** A node's verb: the owner serves it only from another node (the relayed principal names another
+  node's anchor) and only for a work another node made (the id's creator); a client of the holder is refused at its
+  channel (`route_gated`), a client of the owner by the owner's check, both `Unsupported`. The owner cannot yet tell
+  which node made the work from the anchor alone (an id names a member id, which is derived from the anchor and the
+  boot's nonce), so any other member may move such a floor; members are mutually authenticated.
+- **Counters.** `merge.work.floor_told_owner_node` (the test's non-vacuity count), `merge.work.floor_not_sent`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed` (two nodes at `f = 1`, B with the hook:
+  A's floor 1 after the creation; B's and A's clients refused `Unsupported`, the floor still 1; after B's destroy, A's
+  floor gone and B's counter moved). Red with the forward removed: A's floor never dropped (the poll gave up). Fleet
+  `a_holder_makes_a_work`, `a_holders_work_is_admitted`, `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2,
+  `verbs::` 62 of 62; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2 of 2; fmt clean.
+
+### A-697 part c — A holder's submit is committed by the verdict its replica computed, taken by position at the owner (2026-11-20, w-shared for UI goal 93; main's plan for A-697; A-658 part 3b's route; A-645 "Merges computed anywhere, committed by position")
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status; "The verdict"'s wire-form
+sentence), GAPS (A-247's step two), `crates/merge/src/engine.rs` (`Green::submit_computed`, `commit_judgment`),
+`crates/merge/src/engine/compute_tests.rs`, `crates/ipc/src/protocol.rs`, `crates/server/src/verbs.rs`,
+`crates/server/src/work_home.rs`, `crates/server/src/landing.rs` (`wire_mode`, `db_mode` crate-visible),
+`crates/server/tests/fleet.rs`.
+- **Change, behind A-697's test hook.** A submit of a work on a holder node (`work_home::green_elsewhere`) composes its
+  increment on the work's shard as every work off its green's shard does (A-247), its base entries read from the
+  replica (part a2). Once its pending record is committed, the node's control shard computes the verdict on its replica
+  (`Green::compute`) and forwards `SubmitComputed { work, green, increment, computed, carried }` to the owner under the
+  submit's own request id (`work_home::verdict_over_fleet`): the increment as `Increment::encode` writes it, the verdict
+  in its wire form (A-658 part 3a), and `ComputedSubmit`, the policy the holder read where the work's record is (its
+  merge mode, the approval, the signature and the work's signers, the authorship). The owner (`verbs::submit_computed`,
+  a node's verb, refused `Unsupported` from a client of either node) runs `judge_submission` as for a submit asked
+  from a work's shard, with one difference: the verdict is read back (`Green::computed_from`) and taken by position
+  (`Green::submit_computed`: `judge_computed`, then `commit_judged` at once), counted `merge.verdict.taken_by_position`;
+  a form that does not read back, or a verdict not taken, is refused `BadRequest`, the retention it secured settled
+  first. The answer comes back over the forward (deferred to the quorum's commit at `f > 0`, as a forwarded submit's
+  is) and settles the submit on the holder, whose floor then rises at the owner (part b).
+- **Without a computed verdict.** The replica lacking the work's base (`BaseAhead`), or no replica: answered retryable,
+  `merge.work.replica_behind`; a base below the replica's restored floor: `UnknownBase`, as the owner answers; a copy the
+  verdict refuses: `CopyRefused` by its case. A copy the owner composes (a work holding one, `holds_copy`) and a rebase
+  of a work on a holder node are refused `Unsupported`, not built yet.
+- **Engine.** `Green::submit_computed` is `submit_resolved` with the verdict taken by position; the two share
+  `commit_judgment`, so the outcome and the chain's record are the same at the same head.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_position_at_the_owner` (two nodes at
+  `f = 1`, B with the hook: B's work edits `f` and submits, answered version 2; B's `computed_on_holder` and A's
+  `taken_by_position` each moved by one; A's green and B's work read "hello world"; A's floor for the work rose to 2).
+  `slates-merge` `engine::compute_tests::a_verdict_computed_on_a_copy_commits_through_its_wire_form_as_the_serial_submit`
+  (computed on a copy at version 50, the owner moved to 51, through the wire form: the outcome and the record equal the
+  serial submit's, both greens read alike, a second take answered version 52 with nothing committed); `slates-merge
+  --lib engine::` 151 of 151. Fleet `a_holder` 18 of 18 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of
+  2, `verbs::` 62 of 62, `landing::` 14 of 14; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2
+  of 2; fmt clean.
+- **Owed.** The increment rides the forward whole, so an increment the forward lane cannot carry is refused by the lane
+  (the inputs' placement before the record, A-286, would carry it by reference); a verdict computed at a replica head
+  the owner has moved past is judged again by position (the engine's oracle covers it; no fleet test forces the lag).
+
+### A-697 part d — A holder's submit settles once its replica holds the version the owner committed (2026-11-20, w-shared for UI goal 93; main's plan for A-697)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/work_home.rs`, `crates/server/src/merge_service.rs` (`recompute`), `crates/server/tests/fleet.rs`.
+- **Why.** At `f = 1` over three nodes the owner commits with any one holder, so the owner's answer to a holder's
+  submit can reach the holder before its own replica takes the version. Settled at once, the work would stand on a base
+  its node cannot read: every read of an unchanged file answered retryable (`merge.work.replica_behind`) until the
+  replica caught up.
+- **Change, behind A-697's test hook.** The owner's acceptance of a version the replica lacks is held on the control
+  shard, where the replica is (`work_home::hold_until_replica`, `WorkHome::replica_waits`), and the parked submit waits
+  under its own bound (`defer_oldest`, the deferred verdict's timer). Event-driven, no polling: when the replica takes a
+  version (`merge_service::recompute`), every held answer it now covers is handed to its work's shard
+  (`work_home::replica_reached`, then `answered_late`, which finds the submit by its key, so one already released is
+  not answered twice). Past the bound the submit is answered retryable and released; its resend meets the owner's
+  completion record and is held again until the replica has it. The holds are bounded by the parked verbs: one a
+  parked submit, the expired let go at each new hold. A replica rebuilt another way (a rewind, an adoption) wakes
+  nothing; its submits meet their bound.
+- **Counters.** `merge.work.settle_awaits_replica`, `merge.work.settled_on_replica` (the test's non-vacuity counts),
+  `merge.work.settle_unhanded`.
+- **Also.** Part b's fleet test read B's counter of floor moves right after A's floor dropped, which B counts only once
+  A's answer is back: it failed once in a batch run. It now waits for both.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committed` (three nodes at `f = 1`; B withholds
+  every merge record, so A commits with C; B's held-answer counter moves while B's replica is at version 1; once B takes
+  records again the submit is answered version 2, the settled counter moved, the replica at 2, the work reads "hello
+  world"). Red with the wake removed from `recompute`: the submit answered `Overloaded` at its bound. Fleet `a_holder`
+  19 of 19, `a_forwarded_submit`, part b's test 3 of 3 after the fix; `slates-server --lib work_home` 2 of 2,
+  `merge_service::` 14 of 14, `verbs::` 62 of 62; fmt clean.
+
+### A-697 part e — A holder's work comes back from its log over the holder's replica after a restart (2026-11-20, w-shared for UI goal 93; main's plan for A-697; A-207, A-313, A-513, A-533)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/work_home.rs`, `crates/server/src/verbs.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/merge_origin.rs`, `crates/server/tests/fleet.rs`.
+- **What was there.** A restarted node recovers each work from its log (A-207); a work whose green is on another
+  partition is replayed through that partition's owner shard (A-247, `daemon::rebuild_remote_works`). A holder's work's
+  green is no partition's here: its replay was asked of a shard without the green and refused, the work's records
+  dropped from the unbuilt list, so every edit it had acknowledged was out of reach; and one whose green's partition
+  number was its own shard's was skipped outright.
+- **Change.** Whether a green is another node's is now asked apart from the test hook (`work_home::owned_elsewhere`;
+  `green_elsewhere` is it with the hook on), since a restart starts with the hook off. A recovered work over such a green
+  is recorded unbuilt as a holder's (`Unbuilt::holder`), and its log is replayed on the control shard over the node's
+  replica of the green (`work_home::holder_replay`; from the recovery pass, `daemon::rebuild_remote_work`, and from the
+  ask as clients are let in, `verbs::ask_holder_replay`). A restart leaves the replica to be rebuilt from the records
+  the node holds (A-313), lazily: the replay starts that rebuild, and while it runs the work stays recorded, answering
+  `Unpublished` (A-533), and its shard is asked again once the replica is installed (`replica_reached` from
+  `merge_origin`'s install as from `recompute`). On a node whose work shard is its control shard the outcome is installed
+  in the same step: a message to its own shard ran inline and met the step's borrow, and the first run lost every
+  install so (the work answered `Unpublished` for good; the test's first run, by use).
+- **Counters.** `merge.work.replay_awaits_replica`, `merge.work.replayed_on_replica` (the test's non-vacuity count),
+  `merge.work.replay_ask_unhanded`.
+- **Owed.** A creation a restart caught waiting for the owner's admission is dropped here (`drop_pending_creations`),
+  and the floor the owner may have recorded for it stays there, since the pending record does not name the green: it
+  keeps more history, not less. Recovering a holder's pending submit is the existing path: the work's next verb runs it
+  again under its key, and the owner's completion record answers it.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_restart` (three nodes at `f = 1` keeping
+  their state across a restart; B makes a work over A's green and edits `f`, restarts over its own segment, turns the
+  hook on again: the work is served again reading "hello world", B's replay counter moved, its submit answered version
+  2). Its first run, before the same-step install, answered `Unpublished` for the poll's whole deadline (the red). Fleet
+  `a_holder` 20 of 20 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62,
+  `merge_origin::` 17 of 17, `merge_service::` 14 of 14, `takeover::` 18 of 18; fmt clean.
