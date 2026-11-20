@@ -14595,7 +14595,8 @@ Status (A-729 part 1, the index's storage): a manifest is kept as its delta agai
 delta bytes stay within its text's length (derived, as 7.2's `deltas.py` bounds a delta), else whole; every reader
 rebuilds it through `HgIndex::revision_text`.
 Status (A-729 part 2): a push's record is its changegroup as it arrived (`SHGR` version 2), replayed through the same
-intake; the landing appends deltas, never texts. Imports' and made changesets' records are still version 1 (texts).
+intake; the landing appends deltas, never texts. An import's record (version 3) writes each delta-kept manifest as its
+delta and base; a made changeset's record is still version 1 (texts).
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
 working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
 push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
@@ -55393,6 +55394,23 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   receive:: hook_view` 200 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- vcs_store:: git_push::
   vcs_http::git:: git_hooks::` 91 passed and one hook test past its bound under load (load average 71), passing alone
   (3 of 3); fmt clean.
+
+### A-722 part 3 — A push's rows are written before its landing, which only makes them visible (2026-11-20, w-git for UI goal 93; A-722's design, point 1)
+- **Change.** The seal stages the whole push (`Repository::stage`): its fresh objects' positions by type then id from
+  the repository's next position (A-639's runs kept), their rows written into a fork of the index
+  (`Index::fork`, `insert_all`, `seal_all`), held by the push (`push::Staged`), the rooms lent (`stage_room`). The
+  landing adopts the fork (`Index::adopt`) when no other landing moved the next position or the index since; otherwise
+  it stages again and adopts that. Every landing adopts a fork, so the index's tables never depend on when a fork was
+  made and a store made again from the log equals the live one (replay stages at its seal too).
+- **Tests.** `slates-git` `store::tests::a_staged_push_lands_the_rows_it_wrote_before_its_landing`,
+  `two_pushes_staged_at_once_both_land_and_no_position_goes_unused`; the store's recovery tests (remade = live).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- store:: upload::
+  receive:: hook_view` 202 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- vcs_store:: git_push::
+  vcs_http::git:: vcs_http::daemon_edge:: git_hooks:: git_protect` 119 of 119; fmt clean. The 3,000-commit push over
+  the daemon's edge 2.0 s, its fetch 3.7 s (main 1.9 s, 4.1 s; load average 43).
+- **Owed (part 4).** The seal's staging pass and the moves' admission sliced; the landing's remaining whole passes
+  (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
+  intake.
 
 ### A-664 live whole builds, the push storm — A push landing mid-build moves the build to the newest head at a slice's boundary, never starts it again (2026-11-20, w-shared for UI goal 93; main's ruling)
 - **Why.** Part 1 started a green's whole build again from nothing at every push that landed while it ran, so under

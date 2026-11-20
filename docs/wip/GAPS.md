@@ -84,6 +84,10 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 3 (2026-11-20, w-git).** BUILT: the seal writes a push's rows into a fork of the index
+> (`Repository::stage`), the landing adopts it (or stages again when stale). Owed (part 4): the staging pass, the
+> moves' admission, the landing's whole passes and a stale restage sliced; record replay through the sliced intake.
+>
 > **A-722 part 2 (2026-11-20, w-git).** BUILT: rows carry no green or version; the landing map
 > (`Repository::bringer_of`) answers the version that brought a position.
 >
@@ -148,8 +152,10 @@
 > the head, the room the intake began within, the changegroup's version and bytes; deltas, never texts), written a
 > mean revision's bytes a step (`record::ChangegroupWriter`) and replayed by taking the changegroup again through the
 > live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
-> in place); the landing appends that, where it appended every text whole. Owed: an import's and a made changeset's
-> records still hold texts (version 1); the names list (the changegroup names every node, so none is written yet);
+> in place); the landing appends that, where it appended every text whole. An import's record (version 3) writes a
+> manifest the index keeps as a delta as that delta and its base's node, never rebuilt (Mercurial's own manifests:
+> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. Owed: a made
+> changeset's record still holds its manifest whole (version 1); the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.
 > **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
 > FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
