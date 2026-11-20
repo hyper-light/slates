@@ -14667,8 +14667,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
    index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
-   owed: the process around the stdio session, the learned response compression (the first value until then), and the
-   SSH edge's pushes (`unbundle` in the stdio session, through the same driver). Built (A-680 part 2a,
+   owed: the process around the stdio session and the learned response compression (the first value until then).
+   Built (A-696): the SSH edge's pushes, `unbundle` in the stdio session through the same driver. Built (A-680 part 2a,
    `vcs_http::ToolSites`, `vcs_store::hg_view`): the site on the daemon's edge, each repository's served view lent from
    its store on its owner shard; and its pushes (A-680 part 2b), `unbundle` through `hg_push::unbundle`. Built (A-679,
    `crates/server` `vcs_ssh::hg`): the stdio session behind the daemon's SSH edge, over the same lender; the daemon

@@ -1031,7 +1031,7 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
 /// Stock 7.2's client bytes of `ssh-push` sent to `record`'s repository as the SSH site starts `serve --stdio` over the
 /// daemon's lenders for its owner, a kilobyte at a time, then the end of its input: what its channel took.
 fn stock_push_session(record: &RepositoryRecord) -> Result<Channel, String> {
-  let mut services = ToolServices::new(ShardStores, ServedViews, room());
+  let mut services = ToolServices::new(ShardStores, ServedViews, ThisShard, room());
   let principal = owner();
   let start = Start {
     service: Service::Mercurial { hidden: false },
@@ -1124,10 +1124,8 @@ fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it
       .partition()
       .repositories()
       .branch(id, &line_name(b"default", 0))?;
-    let head = state
-      .greens
-      .get(&green)?
-      .xattr(slates_merge::push::ROOT, slates_merge::push::HEAD_ATTRIBUTE)?;
+    let engine = state.greens.get(&green)?;
+    let head = engine.xattr(slates_merge::push::ROOT, slates_merge::push::HEAD_ATTRIBUTE)?;
     Some(crate::verbs::hex_of(&Node::try_from(head).ok()?))
   });
   daemon.stop();

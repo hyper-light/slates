@@ -359,8 +359,9 @@ fn a_bundle_past_its_room_ends_the_session_out_of_band() {
       ..
     }
   );
+  let taken = stdio.take_push();
   assert_eq!(
-    (asked, send_it, ended, stdio.stdout(), stdio.take_push()),
+    (asked, send_it, ended, stdio.stdout(), taken),
     (
       Progress::Stepped {
         step: Step::Answered { refused: None },
