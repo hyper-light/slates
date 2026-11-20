@@ -75,3 +75,7 @@ CARGO_TARGET_DIR ~/.cache/w-interop-target, clone ~/.cache/w-interop/src (delete
 - LANDED 168ddfa96 (on main, checked): svn+ssh round trip un-ignored (passed --ignored at main a146359, r21); svn
   matrix 24/27 (lock E170003, HTTP A-681 remain). Reported.
 - r22: git matrix re-run for A-713 (a2f0fb970) with cuts v1.0.0 and v2.0.0. NEXT: GAPS line + report.
+- Rule (main): an A-number is mine only after my push of its amendments.tsv line on agents/fanout-state succeeds
+  (pull, append next free, bump "# next free", commit, push; on reject repeat). My pieces so far need none.
+- r22 v1.0.0 cut on main 168ddfa: git matrix 26/27 (A-713 fixed clones); checkout-tag fails only because the cut push
+  has no tags (script) -> change row to check out an old commit.
