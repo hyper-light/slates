@@ -195,7 +195,7 @@ fn to_u64(count: usize) -> u64 {
 }
 
 /// A window's instructions and new data as they are chosen (`svn_txdelta__ops_baton_t`).
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct Ops {
   /// The instructions.
   instructions: Vec<Instruction>,
@@ -594,6 +594,8 @@ fn take_match(ops: &mut Ops, source: &[u8], target: &[u8], found: Match, pending
   ops.source_copy(from, length);
   to.saturating_add(length)
 }
+
+pub mod making;
 
 #[cfg(test)]
 mod tests;
