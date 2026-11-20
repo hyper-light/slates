@@ -844,3 +844,22 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - hg room bug widened: import refused PastRoom 278,528 B too (w-perf A-710 verb) -> w-hg.
 - WATCH: kiln-queued copies on this Mac (7 from ~21:15 + w-shared x2) -> stop on sight.
 - Handoffs complete: w-shared (2c-1 on agents/w-shared-a636p2c1 1c91eaac2) and w-fed-faults (agents/w-fed-faults 72cef952d, agents/w-fed-faults-a708 473a560ed) -> fanout-state re-pushed; Studio instances told to pull. A-710 landed (main 5c6eb940d, w-perf): `slates repository import NAME PATH`.
+- ~21:55 PST Ada: agent for goal 87 (every open bug) -> jupiter can't take kiln work (kiln 156 commits behind; kiln can't
+  build itself for Windows) -> w-bugs on adas-mac-studio-3 (01a1f76df3567435a347b36a1cf4290e): A-498, A-551, A-576,
+  goal-83 B2-B16; Windows/WinFsp tests via CI's Windows runner (diag-* branch) as g258 did.
+- Ada: three agents for goal 90 (kiln vendors slates) -> w-k90-containers 01a1f76ef417710e8c3842fcd4e46700 (studio),
+  w-k90-microvm 01a1f76f015c7274a2234c6793fae2ea (studio-2), w-k90-vendor 01a1f76f1e037405bd1f4e5ecf82ff1d (studio.local-2).
+  Briefs briefs/w-k90-*.md (kiln repo rules AGENTS.md/CLAUDE.md; Shards policy if touched; WHP + Windows e2e BLOCKED on jupiter).
+- svn by use (w-perf -> w-svn): import of 5,000-commit dump refused TableAtCapacity{green_chains} at 1,685 revisions,
+  RSS 3,969 MiB; svn commit over svn:// E210002 (expected until A-698).
+- ~22:05 PST API KEY INSTALLED on all 4 Studios (d1323898 Studio, b24c5c95 Studio-2, cec37f60 Studio-3, 2768d0d5 Studio-4) via kiln reach sync of a 600 key.env + install.sh: ~/.zshrc line, ~/.config/anthropic/key.env (600), ~/.claude/settings.json apiKeyHelper reading it; synced copies deleted; local copy deleted. Studios 3 and 4 show low free memory (650 MB / 315 MB).
+- SVN INTEROP OVER svn:// PROVEN: w-interop piece 3 landed 41c2e662e: svn_interop.rs svn:// round trip un-ignored, passes
+  with stock svn 1.15.0 (Studio). Still ignored: svn+ssh (E210002) and HTTP legs (E160013, waits on DAV reads).
+- A-698 ra_svn commits landed (main ddbd387a2, w-svn). A-589 docs landed 8eeb004bd (w-fed-a503: A-503 move test).
+- ~22:10 PST Studio agents restarted on the API key (idle ones had never started: unauthorized): w-shared
+  01a1f77364c772dab1252645daa3af52, w-fed-faults 01a1f7737a28722880bddaff84f71abc, w-fed-move 01a1f773926977aeb252ecae312154a2,
+  w-k90-containers 01a1f773ff6874e8a4691fe653779c97, w-k90-vendor 01a1f77457e2739c8efc838b63fdbd97, w-fed-a583 (big Studio
+  d1323898); w-reaper 01a1f773af777640876754d96d34dc0a, w-k90-microvm 01a1f774356a77b6af7969d2cd2ac702 (Studio-2 b24c5c95).
+  Kept running: w-forming, w-bugs (Studio-4 2768d0d5, 10 GB disk free there). w-fed-a503 done (idle). A queued
+  w-fed-a583 on Studio-2 (link down) may start later -> stop it.
+- green_chains import fix landed f37a96515 (main 9ea6e1311, w-svn): Subversion landings (import, svn://, tunnel via svn_commit::land) checkpoint their green by the doubling rule, Doubling::Now at the cap; red first. w-perf asked to rerun svn_scale.sh (import, RSS, commit, timings).

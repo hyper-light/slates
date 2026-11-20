@@ -49,3 +49,16 @@
 - NEXT: A-698 ra_svn commits through repository::svn_commit::commit (g229's agents/g229-svn-commit-land 54603a1d4 has
   the tunnel half; the svn:// listener's CommitAsked/Hook/Accepted turns still end the connection), then un-ignore the
   svn:// interop leg in crates/cli/tests/svn_interop.rs if it passes.
+
+## A-698 ra_svn commits -- LANDED main ddbd387a2 (one commit 7bedc3a88 + merges); svn:// listener lands via commit_work
+- Test vcs_svn::tests::a_stock_commit_over_svn_lands_through_the_owners_step. Local own target 21/21.
+- NEXT (main): w-perf's import bug: `slates repository import` of git-5000.dump refused TableAtCapacity green_chains
+  after 1,685 revisions (RSS 3.9 GiB): derive the table bound per repository, bound the import's memory per slice;
+  failing test first. Then re-check w-perf's svn commit repro (svn_scale.sh, branch agents/w-perf-svn).
+
+## green_chains import bug -- LANDED main 9ea6e1311 (commit f37a96515)
+- svn_commit::land: checkpoint_green after each revision; at the cap, Doubling::Now + append again. Test
+  subversion_revisions_fold_their_greens_chain_as_they_land red (no checkpoint after 256) then green; local 12/12.
+- Import memory: svn_import is already sliced per turn and charged as retention; the 3.9 GiB RSS was probably the
+  unfolded chain (not verified: w-perf's svn_scale.sh repro is main's to run).
+- NEXT in queue: A-693 part 2 (held by main), then DAV pieces (g297 brief).

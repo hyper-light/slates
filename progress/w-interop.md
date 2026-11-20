@@ -46,3 +46,17 @@ CARGO_TARGET_DIR ~/.cache/w-interop-target, clone ~/.cache/w-interop/src (delete
 - 4b: ci/interop/hg-matrix.sh (25 rows) on branch agents/w-interop-matrix-hg (b6e76c1d0, in worktree
   ~/slates-work/w-interop-matrix-land, over main 003936b3e). r14 on the Studio: hg's own repo (~/.cache/w-interop/hg-src)
   cut at 1.0, then whole, binary at main 9f51d75. NEXT: land script + GAPS line, report failures; then svn matrix.
+- LANDED 4b: 478585893 (hg-matrix.sh + exec-failure fix in both scripts + GAPS line). Went in as 3 branch commits
+  (b6e76c1d0 "(scratch)", ca4e8a157, the landing) plus merge -- not squashed; told main.
+- hg findings (main 9f51d75): HTTP push 413 from 189 changesets; no `lookup` (identify URL, clone -r); SSH push waits A-696.
+- NEXT (piece 4c): svn matrix (ci/interop/svn-matrix.sh) run on the Studio (no svn on this Mac; not installing without
+  Ada): svn:// is refused E170001 (reported), so HTTP/DAV legs + svnserve control; then re-run git/hg matrices as
+  w-git/w-hg fixes land (A-704 follow-ups, 413s, lookup, A-696). Worktree ~/slates-work/w-interop-matrix-land.
+- Studio state: clone ~/.cache/w-interop/src, wt ~/.cache/w-interop/wt (main 9f51d75), target ~/.cache/w-interop-target,
+  sources git-git.git, git-src, hg-src; matrices' scratch matrix-git, matrix-hg*. Delete at END of goal.
+- 2026-11-20 ~06:00Z: never END for context (common.md). Main has 7bedc3a88 (ra_svn commits, svn:// + svn+ssh) and
+  5c6eb940d (`slates repository import NAME PATH`). Running svn_interop ignored legs --ignored on the Studio (piece 3).
+- LANDED piece 3 part: 41c2e662e svn:// round trip un-ignored (passed --ignored at main 4785858, r17). svn+ssh
+  E210002 closed; HTTP legs '/project' path not found (A-681 DAV reads) -> stay ignored; reported.
+- 4c: ci/interop/svn-matrix.sh written (uncommitted in w-interop-matrix-land), seeds by `repository import` of a
+  git_to_svn_dump.py dump of git/git (LIMIT 2000). NEXT: push branch, run on the Studio, land with a GAPS line.
