@@ -12463,6 +12463,13 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-19, A-714, w-svn, found by use: a 5,000-revision Subversion import refused `green_chains` at 1,685).** An
+> entry's objects are the repository's content: the register keeps them as before, but the owner shard charges them to
+> its memory budget as retention with the tool store (`vcs_store::settle_objects`: trued up after each append and at a
+> recovery, given back with the repository; a push's own admission bounds it, a Subversion revision asks
+> `admit_objects` first), never to the partition's merge budget, so a
+> repository's bound is what its shard can hold. This replaces A-662's "charged to the merge budget" below.
+>
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
 > (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each

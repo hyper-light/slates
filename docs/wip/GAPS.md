@@ -485,6 +485,15 @@
 > `svn_view::TunnelRecords`, commits through `commit_work`): stock `svn`'s recorded `mkdir` over the daemon's site
 > answered as `svnserve -t` answered it, revision 1 landed (macOS arm64, this Mac, local: `vcs_ssh::svn::`
 > `vcs_ssh::daemon_edge` 16 of 16). Owed: the tunnel's move to the repository's owner shard; live `svn+ssh://`.
+> Fixed 2026-11-19 (w-svn; the import's `green_chains` refusal, second cause): a repository entry's objects (each
+> revision's record, each push's objects) were charged to the partition's merge budget, so a repository's content had
+> to fit the budget every green's chain shares; they are now charged to the owner shard's memory budget per repository
+> (`vcs_store::settle_objects`). Test `a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget`;
+> macOS arm64, this Mac, local (A-714). Owed: content held once (A-64): the register and the tool store each hold it,
+> both charged honestly (w-perf: 2.57 GB held after a 223 MiB import, main bc2803d66). A Subversion text is held three
+> times: the svn records' `Repository.contents`, the green's content pool (A-716, w-perf: the records name the green's
+> content by identity) and the register's entry objects, each revision's record with its texts (~245 KB a revision
+> under `apply_advanced`, w-perf); A-716's record without text bytes takes the third with it.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
