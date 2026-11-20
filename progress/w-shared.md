@@ -1,5 +1,12 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 part e2 = c0710afca (main e261100c1; tests on base f2421b5f3, fleet a_holder 23/23 re-run on
+  e261100c1). Target now ~/.cache/w-shared-local-target.noindex with CARGO_INCREMENTAL=0. Removed landed worktrees
+  g261-a497/a515/a534/a575/a603-land/a635-land/a636/git-mercurial-subversion-a275; kept g261-a603, g261-a635,
+  g261-a636-red (commits not on main). NEXT: by-reference increment route (main's ruling (b)): release A/B on the big
+  Studio via kiln run BEFORE building (4 MiB + 64 MiB, holder + local, best of N all shown, phase breakdown), then build,
+  then measure again; fix record-plane input shipping if slow for its own reason; BENCHMARKS tables. Then part f.
+
 ## LANDED 2026-11-20: A-697 node-verb authority = 43160e726 (main b0ececd09). NEXT (main's order): (2) increment too large
   for the forward lane in bounded parts; (3) dropped creation's floor released at recovery; (4) f.
 
