@@ -744,7 +744,7 @@ async fn run_build(mut job: BuildJob, alias: Option<NameAlias>) {
 /// A volume an image verb makes under a name another partition holds (A-236, `slates_db::alias::CLONE_STEPS`): the
 /// volume lives here beside its source, for copy-on-write, and the name's partition holds an alias of it, reserved
 /// before the volume is made and confirmed (or released) before the reply, as a clone's is.
-struct NameAlias {
+pub(crate) struct NameAlias {
   /// This shard, which asks.
   this: u16,
   /// The name's shard.
@@ -757,7 +757,7 @@ struct NameAlias {
 
 /// The alias an image verb's `name` needs and the id it names, or neither when the name is this partition's (`None`,
 /// `None`). Refused when the name's partition has no shard here or the volume ids are spent.
-fn name_alias(
+pub(crate) fn name_alias(
   state: &mut ShardState,
   name: &str,
 ) -> Result<(Option<NameAlias>, Option<DbVolumeId>), Refusal> {
@@ -781,7 +781,7 @@ fn name_alias(
 
 /// Reserves `alias` at its name's partition: the name held there from now, resolving nothing until confirmed. `Ok` for
 /// a verb whose name is its own partition's.
-async fn reserve(alias: Option<&NameAlias>) -> Result<(), Refusal> {
+pub(crate) async fn reserve(alias: Option<&NameAlias>) -> Result<(), Refusal> {
   let Some(alias) = alias else {
     return Ok(());
   };
@@ -809,7 +809,7 @@ async fn reserve(alias: Option<&NameAlias>) -> Result<(), Refusal> {
 /// Confirms a reserved `alias` when its volume was made (`made`), else releases it; nothing for a verb whose name is its
 /// own partition's or whose reservation was refused. A step the name's shard does not take is counted, and the next
 /// recovery's to settle.
-async fn settle(alias: Option<NameAlias>, reserved: Result<(), Refusal>, made: bool) {
+pub(crate) async fn settle(alias: Option<NameAlias>, reserved: Result<(), Refusal>, made: bool) {
   let Some(alias) = alias else {
     return;
   };

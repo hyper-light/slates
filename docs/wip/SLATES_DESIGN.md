@@ -15220,7 +15220,20 @@ and export by landing).
 > Subversion's error number, the revision being loaded and the path; the end answers `DumpImported`. Held to
 > `part1.dump` exported again byte for byte after its import through the daemon and after a rebuild from the log, and
 > to `part1.dump` then `part2.dump` exporting `full.dump`. Owed: the export verb (a range written as a dump into a
-> volume and landed under a grant); an import resumed across a restart.
+> volume and landed under a grant; built since, below); an import resumed across a restart.
+>
+> **Status (2026-11-20, A-652, part 3 continued: the export verb).** Built: a range of a Subversion repository's
+> revisions written by the daemon as the dump `svnadmin dump` writes for it (`slates-server`'s
+> `repository::svn_export`; A-628's exporter). `ExportDump { repository, first, last, deltas, name }`, for the
+> repository's owner, writes format 2, or format 3 with `deltas`, a range starting after revision 0 incrementally, into
+> a new volume `name` holding it as `DUMP_FILE` in its root, which the caller lands under a grant (§4.15, R10) or reads
+> through a mount. A task of the owner shard walks the range twice, a revision a unit within the shard's slice: the
+> first measures, so the volume is admitted exactly; the second writes a copy slice at a time, so no dump is ever held
+> whole, and a second walk that made other bytes than the first is refused, nothing kept; the volume's record, its
+> publication and the request's completion one atom. Refused by kind first: another tool's repository
+> (`Unsupported`), a range the repository does not hold (`BadRequest`, `svn_repos_dump_fs4`'s words), a name taken
+> (`AlreadyExists`). Held to `full.dump`, `part2.dump` (format 3, revisions 4 to 13) and `deltas.dump` written again
+> byte for byte from a history imported through the daemon. Owed: the CLI's and the SDKs' words for both verbs.
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -16095,8 +16108,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
    as its history, and a history exported as a dump for migration, each a server verb over the index and the records
    with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
-   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the import's wiring built,
-   A-652 part 3; the export's owed).
+   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the import's and the
+   export's wiring built, A-652 part 3).
    `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
    property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
@@ -55578,8 +55591,6 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `svn:special` list, which the records hold). `cargo test --locked -p slates-server --lib -- repository::svn_commit::
   vcs_svn vcs_store:: identities:: --test-threads=4` 102 of 102; fmt clean.
 
-
-
 ### A-742 — Freed memory returns to the OS, never by allocator luck: large allocations mapped directly, large temporaries made fewer and once (2026-11-20, w-engine; main's ruling; §4.2, D-12; A-723, A-728)
 
 Applied in the same change to: `crates/mem` (`large.rs`, the global allocator, its counters; `unsafe-budget.toml` +16);
@@ -55699,7 +55710,6 @@ control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, 
 - **Owed.** The SDKs' (Python, Node), MCP's and the CLI's surfaces for a copy; Subversion's copy-from rows over it
   (`vcs_store::svn_made`, next).
 
-
 ### A-744 — The anchor's memory, range by range: the 581 MiB is the owner partition's durable register, not the content object; and A-742's leftovers (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.14, §4.17.1; A-64, A-420, A-626, A-727, A-742)
 
 Applied in the same change to: `crates/mem` (`resident.rs`, a mapped range's pages in RAM and written, by `mincore`;
@@ -55762,3 +55772,56 @@ at its exact length); `crates/mcp` (a shard's `content_ranges`); §4.2's status;
 - **Found by use** (reported, next piece): a copy of a tree holding a hard link is refused as a `TypeChanged` conflict at
   its destination (A-586's "does not yet copy" case answering the wrong kind); the surfaces' tests copy a tree without
   one.
+
+### A-652 part 3, continued — A Subversion repository's range of revisions exported by the daemon as a dump into a new volume, walked twice and never held whole (2026-11-20, g268 for UI goal 93 (kiln 51cef9f7); §4.17.4 piece 6; §4.15; R10; A-628, A-441, A-459)
+Applied in the same change to: §4.17.4 (a status block, piece 6's line, the import's status), GAPS (the §4.17.4
+entry), `crates/ipc` (`RequestBody::ExportDump` and `ReplyBody::DumpExported`, appended; `DUMP_FILE`; the routing of a
+repository's verbs; `tests/wire_order.txt`), `crates/server` (`repository/svn_export.rs` and its tests, new;
+`repository.rs`: the module's line; `verbs.rs`: the verb's route and dispatch; `image.rs`: `NameAlias`, `name_alias`,
+`reserve` and `settle` shared with the export; `vcs_store/svn_import.rs` and its tests: the import's test helpers
+shared with the export's).
+- **What was there.** A-628's exporter wrote a range of a repository's records as `svnadmin dump` writes it, in format
+  2 and, since A-652, format 3; only slates-svn's tests called it, over records they held themselves. The import's half
+  of part 3 brought a dump's history into a daemon's repository; nothing took one out.
+- **The verb.** `ExportDump { repository, first, last, deltas, name }` is served on the partition the repository's
+  name hashes to, for the repository's owner (`NotFound`, `Forbidden`). Refused by kind before anything is made: a
+  repository of another tool (`Unsupported`); a range the repository does not hold, in `svn_repos_dump_fs4`'s words
+  (`BadRequest`: "Start revision F is greater than end revision L", "End revision L is invalid (youngest revision is
+  Y)", `dump.c` 2072-2080 of Subversion's 1.15.x branch, read 2026-11-20); a name a volume, an alias or a work holds
+  (`AlreadyExists`); a request outside a recorded one (`Unsupported`). Where another partition holds the name, an
+  alias of it is reserved there before the volume is made and confirmed or released before the reply, as an archive's
+  is (A-236).
+- **The dump and its volume.** Format 2, or format 3 with `deltas` (`--deltas`), a range starting after revision 0
+  incrementally (`--incremental`), as A-628 writes it; written into a new plain volume `name`, bounded at the dump's
+  length rounded up to whole chunks (a write is charged its chunk window, §4.5), as the file `DUMP_FILE`
+  (`repository.dump`), readable and writable by its owner alone, owned as the root is. The disk is written only by the
+  caller's granted landing of the volume (§4.15, R10), or the file is read through a mount.
+- **Two walks, sliced, never held whole** (as A-459's archive). A task of the owner shard runs the export in slices of
+  the shard (`crate::image::sliced`), a revision a unit, a yield between slices: the first walk measures each
+  revision's records, hashes them (BLAKE3) and drops them, so the volume is admitted exactly; the second walks the range
+  again and writes each revision's records into the file a copy slice at a time (`DaemonConfig::copy_slice_bytes`),
+  hashing them as it goes. So the export holds one revision's records at most. A second walk that made other bytes than
+  the first measured (the revisions changed under it, as an import setting revision 0's properties does) is refused
+  `Unpublished` ("ask again"), counted (`repository.svn_export.walks_differed`), and the volume is given back. The
+  volume's record, its publication and the request's completion are one atom (`crate::image::complete`); the reply
+  `DumpExported { id, dump_bytes }` names the volume and the dump's length.
+- **Not taken (decided by the design, not measured).** One walk staging the whole dump before the volume is admitted:
+  it holds the whole history in memory once more, where two walks hold a revision. A volume that grows as the dump is
+  written (a dynamic volume): its admission could refuse midway, after work the exact admission refuses before.
+- **Tests** (`crates/server/src/repository/svn_export/tests.rs`). On a running shard, a history imported from
+  `part1.dump` and `part2.dump`, then revisions 0 to 13 in format 2 and 4 to 13 in format 3 asked under two requests:
+  both held, then both volumes published, their dump files `full.dump` and `part2.dump` byte for byte. Through the
+  job's two walks, a slice at a time: revisions 0 to 3 in format 2 as `part1.dump` and the whole range in format 3 as
+  `deltas.dump`, byte for byte. Revision 0's properties set through the owner's step between the walks: the second
+  walk refused `Unpublished`, counted once, the volume given back. Refused by kind: a repository nobody made, another
+  principal, a git repository, the two ranges in Subversion's words, the green's own name, and a request outside a
+  recorded one.
+- **Evidence** (w-svn, local, macOS arm64 MacBook, debug, 2026-11-20, over main 57839dd54): `cargo test -p
+  slates-server --lib -- repository::svn_export vcs_store::svn_import` 11 of 11, the two exports side by side byte for
+  byte (`full.dump` 223,752 bytes, `part2.dump` 112,741). Red first: the whole history's export refused
+  `AlreadyExists` naming the part's volume (both minted one fresh id at their walks' end), fixed by minting in the
+  publishing atom. Measured and owed: a unit is a whole revision (60 µs for 195 bytes, 2.4 ms for a 107 KB text,
+  against a 14 µs slice; `image.units_past_budget` 87), so the exporter must resume inside a revision (GAPS).
+- **Owed.** The CLI's and the SDKs' words for the import and the export; the export's volume landed by `slates land`
+  as any volume is (no new verb needed); main's runs (clippy, `xtask check`, the doc gate, Linux and Windows builds,
+  the mutation red-checks).

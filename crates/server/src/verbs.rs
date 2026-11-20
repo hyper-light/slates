@@ -2649,7 +2649,8 @@ pub(crate) fn route_gated(
     | RequestBody::RetireBranch { repository, .. }
     | RequestBody::SetRepositoryPolicy { repository, .. }
     | RequestBody::ImportRepository { repository, .. }
-    | RequestBody::DescribeRepositoryPolicy { repository } => {
+    | RequestBody::DescribeRepositoryPolicy { repository }
+    | RequestBody::ExportDump { repository, .. } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -5232,6 +5233,20 @@ fn dispatch_inner(
     RequestBody::DescribeRepositoryPolicy { repository } => {
       crate::repository::describe_policy(state, principal, &repository)
     }
+    // A Subversion repository's range of revisions exported as a dump into a new volume, answered when the export ends
+    // (A-652 part 3).
+    RequestBody::ExportDump {
+      repository,
+      first,
+      last,
+      deltas,
+      name,
+    } => crate::repository::svn_export::export_dump(
+      state,
+      principal,
+      (&repository, (first, last), deltas),
+      name,
+    ),
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {
       principal: proven,

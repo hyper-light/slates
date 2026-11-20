@@ -75,6 +75,8 @@ pub(crate) mod svn_commit;
 // The import verb (A-678): a Mercurial repository's directory imported into the repository's store through
 // `vcs_store::hg_import`, the request answered when the import ends.
 pub(crate) mod import;
+// The export verb (A-652 part 3): a Subversion repository's range of revisions written as a dump into a new volume.
+pub(crate) mod svn_export;
 
 /// Format: where RFC 4122's form puts a `-` among a UUID's sixteen bytes, written as two hexadecimal digits each:
 /// before bytes 4, 6, 8 and 10 (8-4-4-4-12 digits).
