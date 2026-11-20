@@ -200,9 +200,10 @@ pub(crate) fn commit_work(
   (principal, repository): (&Principal, RepositoryId),
   work: Work,
   now: AprTime,
+  texts: &dyn slates_svn::commit::drive::TextSink,
 ) -> Result<Committed, Uncommitted> {
   let locks = work.locks.clone();
-  let revision = Revision::of_work(work, now).map_err(Uncommitted::Step)?;
+  let revision = Revision::of_work(work, now, texts).map_err(Uncommitted::Step)?;
   commit(
     state,
     (principal, repository),

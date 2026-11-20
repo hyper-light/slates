@@ -473,9 +473,14 @@ impl Lends {
 }
 
 /// `work` landed on the next version of `records` at `now`, as the owner's step checks and applies it.
-fn landed(records: &Records, work: Work, now: AprTime) -> Result<(Records, Committed), Unlanded> {
+fn landed(
+  records: &Records,
+  work: Work,
+  now: AprTime,
+  texts: &dyn slates_svn::commit::drive::TextSink,
+) -> Result<(Records, Committed), Unlanded> {
   let locks = work.locks.clone();
-  let revision = RevisionToCommit::of_work(work, now).map_err(Unlanded::Step)?;
+  let revision = RevisionToCommit::of_work(work, now, texts).map_err(Unlanded::Step)?;
   let (date, author) = (
     revision.date().map(str::to_owned),
     revision.author().map(str::to_owned),
@@ -509,6 +514,7 @@ impl SvnStores for Lends {
     id: RepositoryId,
     _principal: &Principal,
     work: Work,
+    texts: &dyn slates_svn::commit::drive::TextSink,
   ) -> Option<Result<Committed, Unlanded>> {
     if !self.holds(id) {
       return None;
@@ -519,7 +525,7 @@ impl SvnStores for Lends {
       return Some(Err(Unlanded::Budget { available: 0 }));
     }
     Some(
-      landed(created.current.get(), work, NOW).map(|(next, committed)| {
+      landed(created.current.get(), work, NOW, texts).map(|(next, committed)| {
         created.current.set(Box::leak(Box::new(next)));
         committed
       }),
@@ -545,7 +551,12 @@ impl SvnStores for Lends {
     })
   }
 
-  fn lend<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Sources<'_, View>) -> T) -> Option<T> {
+  fn lend<T>(
+    &mut self,
+    id: RepositoryId,
+    texts: &dyn slates_svn::commit::drive::TextSink,
+    step: impl FnOnce(&Sources<'_, View>) -> T,
+  ) -> Option<T> {
     if !self.holds(id) {
       return None;
     }
@@ -556,6 +567,7 @@ impl SvnStores for Lends {
       locks: records.locks(),
       now: NOW,
       policy: POLICY,
+      texts,
     }))
   }
 }

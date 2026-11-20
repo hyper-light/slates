@@ -98,7 +98,10 @@ Each of these blocks several functions below, so it comes first.
    made non-inheritable and exclusive: done, A-183. The network export on Windows: done, A-184; owed there, a real
    Linux kernel client mounting it (Docker Desktop's machine or WSL2).
 2. **Holding a restarted daemon's sockets and mounts on Windows** (gap 2): the fleet's serve sockets and the NFS
-   listener. The WinFsp mount that outlives its daemon is done (A-198, 2026-11-02).
+   listener. The WinFsp mount that outlives its daemon is done (A-198, 2026-11-02), and the version-control listeners
+   (the HTTP edge's, the SSH edge's, svn://'s) are held since A-748 (2026-11-20): the anchor shares each with every
+   daemon as an explicit `WSADuplicateSocketW` duplicate made for its process, so a restart keeps their ports; the same
+   mechanism is the way for the NFS listener and the serve sockets.
 3. **The anchor's restart from its own image** (A-145) on macOS, and its check on Windows; crash dumps on Windows
    once Ada decides `8a-win-dumps`.
 4. **`slates exec` on macOS and Windows**, and `oci-runtime`/`oci-check` on Windows.

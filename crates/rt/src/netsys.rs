@@ -1735,6 +1735,66 @@ mod imp {
     unsafe { std::os::windows::io::OwnedSocket::from_raw_socket(raw) }
   }
 
+  /// A listener's share with process `process` (A-748): Winsock's protocol record of an explicit duplicate of the
+  /// listening socket made for that process alone (`WSADuplicateSocketW`), in [`super::share::encode`]'s bytes. The
+  /// listener stays the caller's; the share names a duplicate that process makes into its own socket with
+  /// [`adopt_share`], never an inherited handle (A-183: no Windows socket is inherited or shared by inheritance).
+  pub(crate) fn share_listener(owned: &OwnedStream, process: u32) -> Result<Vec<u8>, RtError> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSADuplicateSocketW, WSAPROTOCOL_INFOW};
+    ensure_started()?;
+    let Ok(raw) = SOCKET::try_from(owned.as_raw_socket()) else {
+      return Err(RtError::DriverRefused {
+        call: "WSADuplicateSocketW(SOCKET)",
+        code: None,
+      });
+    };
+    let mut record = WSAPROTOCOL_INFOW::default();
+    // SAFETY: `raw` is the caller's live socket, borrowed for the call; `record` is a plain-data record this frame
+    // owns, which the call fills; a refusal is checked before it is read.
+    if unsafe { WSADuplicateSocketW(raw, process, &raw mut record) } == SOCKET_ERROR {
+      return Err(last("WSADuplicateSocketW"));
+    }
+    Ok(super::share::encode(&record))
+  }
+
+  /// The listener a share names ([`share_listener`], made for this process): its socket made from the protocol record
+  /// (`WSASocketW` with `FROM_PROTOCOL_INFO`), kept from this process's children, non-blocking, as an adopted listener
+  /// is. A share made for another process, or one already made into a socket, is refused by Winsock, typed.
+  pub(crate) fn adopt_share(share: &[u8]) -> Result<Socket, RtError> {
+    use windows_sys::Win32::Networking::WinSock::FROM_PROTOCOL_INFO;
+    ensure_started()?;
+    let record = super::share::decode(share).ok_or(RtError::DriverRefused {
+      call: "adopt(listener share)",
+      code: None,
+    })?;
+    // SAFETY: `record` is a whole protocol record this frame owns, borrowed for the call; Winsock reads it and makes a
+    // new socket, checked against INVALID_SOCKET.
+    let raw = unsafe {
+      WSASocketW(
+        FROM_PROTOCOL_INFO,
+        FROM_PROTOCOL_INFO,
+        FROM_PROTOCOL_INFO,
+        &raw const record,
+        0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+      )
+    };
+    if raw == INVALID_SOCKET {
+      return Err(last("WSASocketW(FROM_PROTOCOL_INFO)"));
+    }
+    let socket = Socket { socket: raw };
+    let kind = int_option(&socket, SO_TYPE, "getsockopt(SO_TYPE)")?;
+    if kind != SOCK_STREAM {
+      return Err(RtError::DriverRefused {
+        call: "adopt(SO_TYPE)",
+        code: Some(kind),
+      });
+    }
+    set_nonblocking(&socket)?;
+    Ok(socket)
+  }
+
   /// A send Windows took nothing of without blocking: the stream can take no more (`WSAESHUTDOWN`, Winsock's nearest
   /// to `EPIPE`).
   pub(crate) fn broken_pipe(call: &'static str) -> RtError {
@@ -1773,3 +1833,179 @@ pub(crate) use imp::{
 pub(crate) use imp::{
   adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,
 };
+#[cfg(windows)]
+pub(crate) use imp::{adopt_share, share_listener};
+
+/// Winsock's protocol record of a duplicated socket (`WSAPROTOCOL_INFOW`, A-748) as bytes and back, field by field in
+/// its declared order, each little-endian: 628 bytes. What a supervisor hands the daemon it spawned for each listener
+/// it holds, so the record crosses a pipe as plain bytes and is read back whole or refused.
+#[cfg(windows)]
+mod share {
+  use windows_sys::Win32::Networking::WinSock::{WSAPROTOCOL_INFOW, WSAPROTOCOLCHAIN};
+  use windows_sys::core::GUID;
+
+  /// Format: the record's length: five words, a GUID (16), a word, the protocol chain (a length and seven entries, 32),
+  /// nine signed words, two words and the protocol's name in 256 UTF-16 units (`ws2spi.h`, `WSAPROTOCOL_INFOW`).
+  pub(super) const RECORD_BYTES: usize = 628;
+
+  /// `record`'s bytes.
+  pub(super) fn encode(record: &WSAPROTOCOL_INFOW) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RECORD_BYTES);
+    for word in [
+      record.dwServiceFlags1,
+      record.dwServiceFlags2,
+      record.dwServiceFlags3,
+      record.dwServiceFlags4,
+      record.dwProviderFlags,
+    ] {
+      bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes.extend_from_slice(&record.ProviderId.data1.to_le_bytes());
+    bytes.extend_from_slice(&record.ProviderId.data2.to_le_bytes());
+    bytes.extend_from_slice(&record.ProviderId.data3.to_le_bytes());
+    bytes.extend_from_slice(&record.ProviderId.data4);
+    bytes.extend_from_slice(&record.dwCatalogEntryId.to_le_bytes());
+    bytes.extend_from_slice(&record.ProtocolChain.ChainLen.to_le_bytes());
+    for entry in record.ProtocolChain.ChainEntries {
+      bytes.extend_from_slice(&entry.to_le_bytes());
+    }
+    for signed in [
+      record.iVersion,
+      record.iAddressFamily,
+      record.iMaxSockAddr,
+      record.iMinSockAddr,
+      record.iSocketType,
+      record.iProtocol,
+      record.iProtocolMaxOffset,
+      record.iNetworkByteOrder,
+      record.iSecurityScheme,
+    ] {
+      bytes.extend_from_slice(&signed.to_le_bytes());
+    }
+    bytes.extend_from_slice(&record.dwMessageSize.to_le_bytes());
+    bytes.extend_from_slice(&record.dwProviderReserved.to_le_bytes());
+    for unit in record.szProtocol {
+      bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+  }
+
+  /// Reads fixed-width little-endian values off the front of a record's bytes.
+  struct Reader<'a>(&'a [u8]);
+
+  impl Reader<'_> {
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+      let (head, rest) = self.0.split_first_chunk::<N>()?;
+      self.0 = rest;
+      Some(*head)
+    }
+    fn word(&mut self) -> Option<u32> {
+      self.take().map(u32::from_le_bytes)
+    }
+    fn signed(&mut self) -> Option<i32> {
+      self.take().map(i32::from_le_bytes)
+    }
+    fn half(&mut self) -> Option<u16> {
+      self.take().map(u16::from_le_bytes)
+    }
+  }
+
+  /// The record `bytes` hold, none unless they are exactly one record's length.
+  pub(super) fn decode(bytes: &[u8]) -> Option<WSAPROTOCOL_INFOW> {
+    if bytes.len() != RECORD_BYTES {
+      return None;
+    }
+    let mut reader = Reader(bytes);
+    let mut record = WSAPROTOCOL_INFOW {
+      dwServiceFlags1: reader.word()?,
+      dwServiceFlags2: reader.word()?,
+      dwServiceFlags3: reader.word()?,
+      dwServiceFlags4: reader.word()?,
+      dwProviderFlags: reader.word()?,
+      ProviderId: GUID {
+        data1: reader.word()?,
+        data2: reader.half()?,
+        data3: reader.half()?,
+        data4: reader.take()?,
+      },
+      dwCatalogEntryId: reader.word()?,
+      ProtocolChain: WSAPROTOCOLCHAIN {
+        ChainLen: reader.signed()?,
+        ChainEntries: [0; 7],
+      },
+      ..WSAPROTOCOL_INFOW::default()
+    };
+    for entry in &mut record.ProtocolChain.ChainEntries {
+      *entry = reader.word()?;
+    }
+    for signed in [
+      &mut record.iVersion,
+      &mut record.iAddressFamily,
+      &mut record.iMaxSockAddr,
+      &mut record.iMinSockAddr,
+      &mut record.iSocketType,
+      &mut record.iProtocol,
+      &mut record.iProtocolMaxOffset,
+      &mut record.iNetworkByteOrder,
+      &mut record.iSecurityScheme,
+    ] {
+      *signed = reader.signed()?;
+    }
+    record.dwMessageSize = reader.word()?;
+    record.dwProviderReserved = reader.word()?;
+    for unit in &mut record.szProtocol {
+      *unit = reader.half()?;
+    }
+    Some(record)
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+
+    /// A-748. Do: encode a record whose every field differs, and decode it; decode a byte short and a byte long.
+    /// Expect: the record back field for field, at 628 bytes; both wrong lengths refused.
+    #[test]
+    fn a_protocol_record_crosses_as_bytes_whole_or_not_at_all() {
+      let mut record = WSAPROTOCOL_INFOW {
+        dwServiceFlags1: 1,
+        dwServiceFlags2: 2,
+        dwServiceFlags3: 3,
+        dwServiceFlags4: 4,
+        dwProviderFlags: 5,
+        ProviderId: GUID {
+          data1: 6,
+          data2: 7,
+          data3: 8,
+          data4: [9, 10, 11, 12, 13, 14, 15, 16],
+        },
+        dwCatalogEntryId: 17,
+        ProtocolChain: WSAPROTOCOLCHAIN {
+          ChainLen: -18,
+          ChainEntries: [19, 20, 21, 22, 23, 24, 25],
+        },
+        iVersion: 26,
+        iAddressFamily: 27,
+        iMaxSockAddr: 28,
+        iMinSockAddr: 29,
+        iSocketType: 30,
+        iProtocol: 31,
+        iProtocolMaxOffset: 32,
+        iNetworkByteOrder: 33,
+        iSecurityScheme: 34,
+        dwMessageSize: 35,
+        dwProviderReserved: 36,
+        ..WSAPROTOCOL_INFOW::default()
+      };
+      record.szProtocol[0] = u16::from(b'T');
+      record.szProtocol[255] = 0xffff;
+      let bytes = encode(&record);
+      assert_eq!(bytes.len(), RECORD_BYTES);
+      assert_eq!(encode(&decode(&bytes).unwrap()), bytes);
+      assert!(decode(&bytes[1..]).is_none());
+      let mut long = bytes.clone();
+      long.push(0);
+      assert!(decode(&long).is_none());
+    }
+  }
+}
