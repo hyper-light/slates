@@ -6868,6 +6868,16 @@ version.
 > `a_forward_is_never_refused_below_its_paths_floor` (a 1 s SLO, below any path's silence window: answered after 2.04 s,
 > refused at 1.004 s with the floor removed;
 > `docs/bugs/2026-11-18-a-starved-forward-lane-was-judged-on-the-wall.md`).
+>
+> **Status (2026-11-20, a lane's floor said once).** A lane is kept while it is idle, so what it measured of its path
+> outlives a forward; idle lanes of peers no longer in the council's configuration are pruned as forwards are queued
+> (`ForwardLanes::prune_idle`), which bounds the lanes by the members and the lanes in use. A lane's floor is said in
+> the log only where what the log last said of the lane differs from what is so now, at most once a window, the longer
+> of the failover delay and the floor (one forward's whole life), and each line tells the crossings since the last
+> (`forward_lane::note_floor`, counted `fleet.forward.floor_logged`). Before, a lane left with nothing was dropped and
+> the next forward made it afresh, its floor measured from nothing, so every forward crossed the delay again and logged:
+> about a million lines, 260 MB, in one of w-fed-faults' flows (CLAUDE.md §2 item 8). Test:
+> `a_lane_measured_past_the_failover_delay_logs_it_once`.
 
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
@@ -32842,8 +32852,8 @@ Applied in the same change to:
   stall budget), the link's redial pace, and four probe timeouts (the stall budget's tail, the replacement's handshake,
   its first discovery page, and the forward's exchange). Each driving turn measures it on the session it borrowed. The
   floor never lowers a forward's bound: a replacement's fresh estimator measures a shorter one than the silent session
-  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log once a crossing
-  and counts it (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
+  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log, at most once a
+  window since 2026-11-20 (§4.8's status of that day), and counts each crossing (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
   as A-129 runs the fleet's timers at their measured floors and reports the overrun.
 - **Why the floor and not a longer SLO.** The SLO is the operator's; the floor is the path's, and only the path knows
   it. On loopback, quiet, the floor is about 3.1 s (the window floored at three initial probe timeouts, about 2 s), inside
@@ -55819,6 +55829,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   back that label, the shard and the pid. Red first: with the record not written the test fails ("the watchdog recorded
   no stuck task"); green, the line reads "shard 1 is spinning: 3198 ms of CPU … in task liveness::spinner, at its
   poll 1" (macOS arm64, Mac Studio 2).
+- **Follow-up (2026-11-20, w-forming; found by use: a 2,933 ms poll and every fleet loop's long poll were named by
+  lines inside helpers).** Work spawned through a helper is labelled with the helper's caller: `fleet::spawn_detached`
+  is `#[track_caller]`, and `xshard::task_within` and `task_in_shard_time` are `#[track_caller]` functions that take
+  their caller's site and spawn the work with `slates_rt::futures::spawn_at` (the call is made when the helper is
+  called, its answer awaited after). Tests: `fleet::spawn_label_tests::a_fleet_loops_label_names_the_line_that_spawned_it`
+  and `xshard::tests::a_cross_shard_tasks_label_names_the_line_that_asked_for_it`, red before (named `fleet.rs:7034`
+  and `xshard.rs:1092`).
 - **Applied in the same change to** the watchdog's module docs, amendments.tsv.
 
 ### A-664 Subversion objects, symbolic links — A submitted symbolic link is a file of `link ` and its target whose list is `svn:special` (2026-11-20, w-shared for UI goal 93; main's ruling)

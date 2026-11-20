@@ -8669,6 +8669,83 @@ fn a_forward_is_never_refused_below_its_paths_floor() {
   assert_answered_at_the_paths_floor(&answer, (took, slo), &counters);
 }
 
+/// Shape: the forwards [`a_lane_measured_past_the_failover_delay_logs_it_once`] makes through b, one after another: enough
+/// that a line a forward (the flood's rate) and a line a lane are told apart many times over.
+const FLOOR_FORWARDS: u64 = 40;
+
+/// Format: b's count of its lanes' floors crossing past the failover delay (`forward_lane::note_floor`).
+const FLOOR_PAST_SLO: &str = "fleet.forward.floor_past_slo";
+/// Format: b's count of the log lines it wrote about its lanes' floors (`forward_lane::note_floor`).
+const FLOOR_LOGGED: &str = "fleet.forward.floor_logged";
+
+/// CLAUDE.md §2 item 8 (no unbounded log), found by w-fed-faults' flows (2026-11-20): a lane whose path's floor is past the
+/// failover delay says so once, not once a forward. Do: three nodes whose failover delay is held at one liveness budget
+/// (injected, A-363), below the path's floor on loopback (about 2 to 3 s); a volume on a; through b, [`FLOOR_FORWARDS`]
+/// status reads of it, one after another, each a forward to a on its own lane turn. Expect b to count the floor crossing
+/// past the delay once and one line about it (`fleet.forward.floor_past_slo`, `fleet.forward.floor_logged`). Before, a
+/// lane left with nothing was dropped and the next forward made it afresh, its floor measured from nothing, so every
+/// forward crossed the delay again and logged a line: about a million lines, 260 MB, in one flow.
+#[test]
+fn a_lane_measured_past_the_failover_delay_logs_it_once() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  for daemon in &daemons {
+    daemon
+      .inject_failover(Some(LIVENESS_BUDGET_NS))
+      .expect("the failover delay is held on each node");
+  }
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "floor-once", &daemons);
+  let mut router = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut router, volume, COUNCIL_RETIRE_DEADLINE);
+  let before = summed_counters(&daemons[1]);
+  let answered = (0..FLOOR_FORWARDS)
+    .filter(|_| {
+      matches!(
+        router.call(&RequestBody::Status { volume }),
+        ReplyBody::Status { .. }
+      )
+    })
+    .count();
+  let after = summed_counters(&daemons[1]);
+  drop(router);
+  drop(owner);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let grew = |name: &str| count_of(&after, name).saturating_sub(count_of(&before, name));
+  let (crossed, logged) = (
+    count_of(&after, FLOOR_PAST_SLO),
+    count_of(&after, FLOOR_LOGGED),
+  );
+  eprintln!(
+    "{answered} of {FLOOR_FORWARDS} reads answered through b; b's floor crossed past the delay {crossed} times ({} in \
+     the reads), {logged} lines ({} in the reads)",
+    grew(FLOOR_PAST_SLO),
+    grew(FLOOR_LOGGED)
+  );
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert_eq!(
+    u64::try_from(answered).unwrap(),
+    FLOOR_FORWARDS,
+    "every read was answered"
+  );
+  assert_eq!(crossed, 1, "the lane's floor crossed past the delay once");
+  assert_eq!(logged, 1, "one line said so");
+}
+
 /// The probe through b's deaf session: answered on the replacement session, never refused below its path's floor;
 /// answered past its failover SLO `slo`, so the floor is what held it; and b's `counters` show the deaf session dropped
 /// and the probe's bound held at the path's measured floor.

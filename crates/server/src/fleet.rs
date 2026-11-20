@@ -7030,6 +7030,9 @@ const LOOP_SPAWN_REFUSED: &str = "fleet.loop_spawn";
 /// would hold the shard's shutdown); a spawn the arena refuses is counted under `refused` — a refusal is
 /// counted, never swallowed (§4.14, banned item 9). Before this every fleet loop's spawn was `if let Ok`,
 /// so a refused loop left a node silently without a plane, a peer link or its coordinator.
+/// The loop is labelled with the line that called this (A-740: `#[track_caller]` carries the caller's site into
+/// `futures::spawn`), so a shard found stuck in a fleet loop names that loop, not this helper.
+#[track_caller]
 fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static, refused: &'static str) {
   match futures::spawn(future) {
     Ok(task) => {
@@ -11685,6 +11688,48 @@ pub(crate) async fn forward_batch_over_leader_session(
   place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
   crate::forward_lane::forward_batch(peer, requests, stall_ns, bound, place).await
+}
+
+#[cfg(test)]
+mod spawn_label_tests {
+  /// A-740's labels through the fleet's loop spawner (w-forming, 2026-11-20; found by use: every fleet loop's long poll
+  /// was named by the one `fleet.rs` line inside `spawn_detached`). Do: on a shard, spawn a loop through
+  /// `spawn_detached` whose future reads the task the shard's pulse says it is polling. Expect it named by the line of
+  /// this test that spawned it. Before, by the line in `spawn_detached` that called `futures::spawn`.
+  #[test]
+  // The test thread waits off-shard for what the shard's task reports.
+  #[allow(clippy::disallowed_methods)]
+  fn a_fleet_loops_label_names_the_line_that_spawned_it() {
+    /// Shape: how long the test thread waits for the report.
+    const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    let daemon = crate::daemon::audit_daemon();
+    let (seen, label) = std::sync::mpsc::sync_channel::<(u32, Option<u32>)>(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let home = state.shard;
+      let spawned_at = line!() + 1;
+      super::spawn_detached(
+        async move {
+          let named = slates_rt::registry::with_entry(home, |entry| entry.pulse.polling().label)
+            .flatten()
+            .and_then(|label| match label {
+              slates_rt::label::TaskLabel::Site(site) if site.file().ends_with("fleet.rs") => {
+                Some(site.line())
+              }
+              _ => None,
+            });
+          let _ = seen.try_send((spawned_at, named));
+        },
+        "test.loop_spawn",
+      );
+    });
+    let (spawned_at, named) = label.recv_timeout(REPORT_WAIT).unwrap();
+    assert_eq!(
+      named,
+      Some(spawned_at),
+      "the loop is named by the line that spawned it"
+    );
+    daemon.stop();
+  }
 }
 
 #[cfg(test)]
