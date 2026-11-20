@@ -580,3 +580,37 @@ fn t_a698_a_clients_accepted_work_lands_through_the_step() {
     assert_eq!(second, Some(Ok(Record::Revision(made))));
   });
 }
+
+/// Shape: the most revisions the folding test lands before it expects a checkpoint: far more than the doubling rule
+/// needs for increments of a few hundred bytes against revision 1's checkpoint, and few enough to run at once.
+const FOLD_WITHIN: u64 = 256;
+
+/// Found by use (w-perf, 2026-11-19: `slates repository import` of git/git's newest 5,000 commits as a dump refused
+/// `TableAtCapacity { table: "green_chains" }` after 1,685 revisions). Do: land revision 1, then revisions changing
+/// `/trunk/a.txt`, one at a time, no reader holding any version. Expect: the repository's green is checkpointed as
+/// they land (its checkpoint floor rises past 0), as the merge service folds every other green's chain by its doubling
+/// rule, so a Subversion repository's chain stays bounded however many revisions it takes. Before the fix no
+/// Subversion landing checkpointed its green, so every revision's increment stayed in the partition's chain until the
+/// cap refused the next.
+#[test]
+fn subversion_revisions_fold_their_greens_chain_as_they_land() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+    let mut head = 1;
+    while state.db.partition().green_floor(green) == 0 && head < FOLD_WITHIN {
+      let bytes = format!("alpha {head}\n").into_bytes();
+      let rows = vec![file("/trunk/a.txt", Action::Modify, &bytes)];
+      let next = revision(head, rows, &[&bytes]);
+      assert_eq!(
+        commit(state, (&owner(), svn), next, None),
+        answered(head + 1)
+      );
+      head += 1;
+    }
+    assert!(
+      state.db.partition().green_floor(green) > 0,
+      "no checkpoint after {head} revisions"
+    );
+  });
+}
